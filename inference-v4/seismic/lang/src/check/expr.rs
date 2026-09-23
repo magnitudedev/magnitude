@@ -318,8 +318,8 @@ impl<'a> Checker<'a> {
                     }
                 }
                 // L31: `0 <= lo <= hi` over the endpoints' one symbol each.
-                let lo_sym = self.position_symbol(&lo)?;
-                let hi_sym = self.position_symbol(&hi)?;
+                let (lo, lo_sym) = self.position_value(lo)?;
+                let (hi, hi_sym) = self.position_value(hi)?;
                 let bound = match expected {
                     Some(ValueType::Range { bound }) => *bound,
                     _ => hi_sym,
@@ -570,7 +570,7 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
-        Some(i)
+        Some(self.word_value(i))
     }
 
     /// Check the indices of one selection against `ty`, returning the root, the
@@ -861,14 +861,8 @@ impl<'a> Checker<'a> {
         for dim in shape {
             let d = self.index_value(dim, "a tensor extent")?;
             // L31: an extent position proves `w >= 0` over the word's one symbol.
-            let sym = self.position_symbol(&d)?;
-            if !super::prove::nonneg(&self.arena, &self.facts, sym) {
-                let text = self.text(d.span).to_owned();
-                self.error(
-                    DiagnosticRule::Type,
-                    d.span,
-                    format!("tensor extent may be negative: cannot prove `{text} >= 0`"),
-                );
+            let (d, sym) = self.position_value(d)?;
+            if !self.require_position_nonneg(&d, sym, "tensor extent may be negative") {
                 return None;
             }
             axes.push(sym);
@@ -891,19 +885,19 @@ impl<'a> Checker<'a> {
         Some(self.primitive_expr(PrimitiveId::TensorAlloc, operands, ty, None, span))
     }
 
-    /// The one symbol an integer value has at a quantity position (I-90).
-    /// A value with no exact symbol has no provable range.
-    pub fn position_symbol(&mut self, value: &CheckedExpr) -> Option<IntExpr> {
+    /// The one symbol an integer value has at a quantity position (I-90): a
+    /// word's `word_value` symbol, or a quantity's exact symbol. A quantity
+    /// with no exact symbol has no provable range.
+    pub fn position_value(&mut self, value: CheckedExpr) -> Option<(CheckedExpr, IntExpr)> {
+        let value = self.word_value(value);
         match value.sym {
-            Some(sym) => Some(sym),
+            Some(sym) => Some((value, sym)),
             None => {
                 let text = self.text(value.span).to_owned();
                 self.error(
                     DiagnosticRule::Type,
                     value.span,
-                    format!(
-                        "`{text}` has no exact integer value here; bind it with `let` and prove its range in scope, e.g. with `if`"
-                    ),
+                    format!("the quantity `{text}` has no exact value here, so its range cannot be proved"),
                 );
                 None
             }
@@ -1127,26 +1121,15 @@ impl<'a> Checker<'a> {
                 );
             }
         }
-        let sym = inner.sym.filter(|_| axes.is_none()).and_then(|value| {
-            let dtype = inner.ty.scalar_dtype()?;
-            dtype.is_int().then(|| self.arena.scalar_integer(
-                ScalarOp::Unary(op),
-                &[(dtype, value)],
-            ))
-        });
         // An element-parameter tensor operand reads as its decoded f32 value.
         let inner = match operand_dtype(&inner.ty) {
             Some(dtype) if matches!(&inner.ty, ValueType::Tensor(t) if matches!(t.elem, Elem::Param(_))) => {
                 self.promote_operands(vec![inner], dtype).remove(0)
             }
-            _ => inner,
+            _ => self.word_value(inner),
         };
-        let mut out =
-            self.elementwise_primitive(PrimitiveId::Unary(op), vec![inner], axes, span)?;
-        if out.ty.scalar_dtype().is_some_and(DType::is_int) {
-            out.sym = sym;
-        }
-        Some(out)
+        let out = self.elementwise_primitive(PrimitiveId::Unary(op), vec![inner], axes, span)?;
+        Some(self.word_value(out))
     }
 
     fn binary(
@@ -1229,6 +1212,10 @@ impl<'a> Checker<'a> {
         let is_logic = matches!(op, BinaryOp::And | BinaryOp::Or);
         let is_shift = matches!(op, BinaryOp::Shl | BinaryOp::Shr);
         let is_bit = matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor);
+        // L31 (I-90): word operands (comparison operands included, which
+        // `Checker::assume` turns into guard facts) carry their one symbol.
+        let l = self.word_value(l);
+        let r = self.word_value(r);
         let (axes, dtypes) = self.broadcast(&[&l, &r], &format!("`{}`", op.text()), span)?;
         let (a, b) = (dtypes[0], dtypes[1]);
         let mut target = None;
@@ -1299,56 +1286,178 @@ impl<'a> Checker<'a> {
             }
             target = Some(d);
         }
-        let sym = match (l.sym, r.sym) {
-            (Some(x), Some(y)) if axes.is_none() && a.is_int() && b.is_int() && !is_cmp => {
-                Some(self.arena.scalar_integer(ScalarOp::Binary(op), &[(a, x), (b, y)]))
-            }
-            _ => None,
-        };
         let operands = match target {
             Some(target) => self.promote_operands(vec![l, r], target),
             None => vec![l, r],
         };
-        let mut out = self.elementwise_primitive(PrimitiveId::Binary(op), operands, axes, span)?;
-        if !is_cmp && !is_logic && out.ty.scalar_dtype().is_some_and(DType::is_int) {
-            out.sym = sym;
-        }
-        Some(out)
+        let out = self.elementwise_primitive(PrimitiveId::Binary(op), operands, axes, span)?;
+        Some(self.word_value(out))
     }
 
-    /// The word projection of a quantity. The word keeps the quantity as its
-    /// symbol only where the quantity is proved in the word's range; otherwise
-    /// its symbol is the wrapped value.
+    /// The word projection of a quantity. Its symbol is the word's one
+    /// symbol (`word_value`): the quantity where it is proved in the word's
+    /// range, otherwise the wrapped value.
     pub fn quantity_to_word(&mut self, value: CheckedExpr, dtype: DType) -> CheckedExpr {
         if !quantity(&value.ty) {
             return value;
         }
-        let sym = value.sym.map(|integer| {
-            let (lower, upper) = match dtype {
-                DType::I32 => (i64::from(i32::MIN), i64::from(i32::MAX)),
-                DType::U32 => (0, i64::from(u32::MAX)),
-                _ => unreachable!("a quantity projects only to an integer word"),
-            };
-            let lower = self.arena.int(lower);
-            let upper = self.arena.int(upper);
-            let above = self.arena.int_sub(integer, lower);
-            let below = self.arena.int_sub(upper, integer);
-            if super::prove::nonneg(&self.arena, &self.facts, above)
-                && super::prove::nonneg(&self.arena, &self.facts, below)
-            {
-                integer
-            } else {
-                self.arena.scalar_integer(ScalarOp::Cast(dtype), &[(dtype, integer)])
-            }
-        });
         let span = value.span;
-        self.primitive_expr(
+        let word = self.primitive_expr(
             PrimitiveId::Cast(dtype),
             vec![value],
             ValueType::Scalar(dtype),
-            sym,
+            None,
             span,
-        )
+        );
+        self.word_value(word)
+    }
+
+    /// L31: prove a quantity position `value >= 0` over its one symbol `sym`.
+    /// The goal is reported in the source spelling of `value`: an inline
+    /// element read has a symbol of its own that no name renders.
+    pub fn require_position_nonneg(&mut self, value: &CheckedExpr, sym: IntExpr, what: &str) -> bool {
+        if super::prove::nonneg(&self.arena, &self.facts, sym) {
+            return true;
+        }
+        let text = self.text(value.span).to_owned();
+        self.error(
+            DiagnosticRule::Type,
+            value.span,
+            format!("{what}: cannot prove `{text} >= 0`"),
+        );
+        false
+    }
+
+    /// L31 (I-90): the one checker symbol of a word (`i32`/`u32`) value.
+    /// A word that already has a symbol (a literal, a parameter, an element
+    /// read, a local) keeps it. Otherwise its symbol is its exact integer
+    /// expression where one exists: an operation or cast over constants,
+    /// folded by its scalar recipe; `a + b`, `a - b`, `a * b` and `-a` when
+    /// the result is proved in the dtype's range; `a / b` and `a % b` when
+    /// `a >= 0` and `b >= 1` are proved; a word cast of a word or quantity
+    /// proved in the target's range. Every other word (a float → word cast,
+    /// a bit or shift operation, a call result, a possibly wrapping result)
+    /// is one fresh runtime variable carrying the dtype's range. Every
+    /// position proves over this symbol, so a guard on the word reaches all
+    /// of them alike. Non-word values are returned unchanged.
+    pub fn word_value(&mut self, mut expr: CheckedExpr) -> CheckedExpr {
+        let ValueType::Scalar(dtype @ (DType::I32 | DType::U32)) = expr.ty else {
+            return expr;
+        };
+        if expr.sym.is_some() {
+            return expr;
+        }
+        let exact = match &mut expr.kind {
+            CheckedExprKind::Primitive { id, operands, .. } => {
+                let taken = std::mem::take(operands);
+                *operands = taken.into_iter().map(|operand| self.word_value(operand)).collect();
+                self.exact_word(id, operands, dtype)
+            }
+            _ => None,
+        };
+        let sym = match exact {
+            Some(exact) => exact,
+            None => {
+                let symbol = self.fresh_data_symbol();
+                self.facts.assume_type(&mut self.arena, symbol, &expr.ty);
+                self.arena.int_symbol(symbol)
+            }
+        };
+        expr.sym = Some(sym);
+        expr
+    }
+
+    /// The exact integer expression of a word operation, if it has one
+    /// (`word_value`'s table).
+    fn exact_word(&mut self, id: &PrimitiveId, operands: &[CheckedExpr], dtype: DType) -> Option<IntExpr> {
+        if let Some(value) = self.folded_word(id, operands) {
+            return Some(value);
+        }
+        let symbols = operands.iter().map(|operand| operand.sym).collect::<Option<Vec<_>>>()?;
+        match (id, symbols.as_slice()) {
+            (PrimitiveId::Binary(op @ (BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)), &[a, b]) => {
+                let value = match op {
+                    BinaryOp::Add => self.arena.int_add(a, b),
+                    BinaryOp::Sub => self.arena.int_sub(a, b),
+                    _ => self.arena.int_mul(a, b),
+                };
+                self.in_word_range(value, dtype).then_some(value)
+            }
+            (PrimitiveId::Binary(op @ (BinaryOp::Div | BinaryOp::Rem)), &[a, b]) => {
+                let one = self.arena.int(1);
+                let positive = self.arena.int_sub(b, one);
+                let defined = super::prove::nonneg(&self.arena, &self.facts, a)
+                    && super::prove::nonneg(&self.arena, &self.facts, positive);
+                defined.then(|| match op {
+                    BinaryOp::Div => self.arena.int_div(a, b),
+                    _ => self.arena.int_rem(a, b),
+                })
+            }
+            (PrimitiveId::Unary(UnaryOp::Neg), &[a]) => {
+                let zero = self.arena.int(0);
+                let value = self.arena.int_sub(zero, a);
+                self.in_word_range(value, dtype).then_some(value)
+            }
+            (PrimitiveId::Cast(_), &[a])
+                if word(&operands[0].ty) || quantity(&operands[0].ty) =>
+            {
+                self.in_word_range(a, dtype).then_some(a)
+            }
+            _ => None,
+        }
+    }
+
+    /// A word operation or cast whose operands are all constants: the
+    /// constant its scalar recipe yields, wrapping included. A quantity
+    /// constant projects to the word modulo 2^32.
+    fn folded_word(&mut self, id: &PrimitiveId, operands: &[CheckedExpr]) -> Option<IntExpr> {
+        let operation = reference_math::scalar_operation(id)?;
+        let mut inputs = Vec::with_capacity(operands.len());
+        for operand in operands {
+            let input = match (&operand.kind, &operand.ty) {
+                (CheckedExprKind::Literal(value), _) => *value,
+                (_, ValueType::Scalar(dtype @ (DType::I32 | DType::U32))) => reference_math::integer_literal(
+                    *dtype,
+                    i128::from(super::prove::constant(&self.arena, operand.sym?)?),
+                ),
+                (_, ty) if quantity(ty) => {
+                    let ScalarOp::Cast(dtype) = operation else {
+                        return None;
+                    };
+                    let value = super::prove::constant(&self.arena, operand.sym?)?;
+                    // Two's-complement wrapping to the 32-bit word.
+                    let bits = value as u32;
+                    return Some(self.arena.int(match dtype {
+                        DType::I32 => i64::from(bits as i32),
+                        _ => i64::from(bits),
+                    }));
+                }
+                _ => return None,
+            };
+            inputs.push(input);
+        }
+        let types = inputs.iter().map(|input| input.dtype()).collect::<Vec<_>>();
+        let recipe = reference_math::scalar_recipe(operation, &types);
+        match reference_math::evaluate(&recipe, &inputs).ok()? {
+            ReferenceScalar::I32(value) => Some(self.arena.int(i64::from(value))),
+            ReferenceScalar::U32(value) => Some(self.arena.int(i64::from(value))),
+            other => unreachable!("a word operation yielded {other:?}"),
+        }
+    }
+
+    /// Whether `value` is proved in the range of word `dtype`.
+    fn in_word_range(&mut self, value: IntExpr, dtype: DType) -> bool {
+        let (lower, upper) = match dtype {
+            DType::I32 => (i64::from(i32::MIN), i64::from(i32::MAX)),
+            DType::U32 => (0, i64::from(u32::MAX)),
+            _ => unreachable!("a word is an i32 or u32"),
+        };
+        let lower = self.arena.int(lower);
+        let upper = self.arena.int(upper);
+        let above = self.arena.int_sub(value, lower);
+        let below = self.arena.int_sub(upper, value);
+        super::prove::nonneg(&self.arena, &self.facts, above)
+            && super::prove::nonneg(&self.arena, &self.facts, below)
     }
 
     // ---- attributes ----
@@ -1573,7 +1682,7 @@ impl<'a> Checker<'a> {
                 span,
             ));
         }
-        let Some(from) = inner.ty.scalar_dtype() else {
+        if inner.ty.scalar_dtype().is_none() {
             self.error(
                 DiagnosticRule::Type,
                 span,
@@ -1584,19 +1693,9 @@ impl<'a> Checker<'a> {
                 ),
             );
             return None;
-        };
-        let sym = if dtype.is_int() && from.is_int() {
-            inner.sym.map(|value| self.arena.scalar_integer(
-                ScalarOp::Cast(dtype),
-                &[(from, value)],
-            ))
-        } else {
-            None
-        };
-        let mut out =
-            self.elementwise_primitive(PrimitiveId::Cast(dtype), vec![inner], None, span)?;
-        out.sym = sym;
-        Some(out)
+        }
+        let out = self.elementwise_primitive(PrimitiveId::Cast(dtype), vec![inner], None, span)?;
+        Some(self.word_value(out))
     }
 
     /// L31: a data word (or quantity) at an `index[bound]` position. Proves
@@ -1607,7 +1706,7 @@ impl<'a> Checker<'a> {
         bound: IntExpr,
         span: Span,
     ) -> Option<CheckedExpr> {
-        let sym = self.position_symbol(&value)?;
+        let (value, sym) = self.position_value(value)?;
         let one = self.arena.int(1);
         let last = self.arena.int_sub(bound, one);
         let headroom = self.arena.int_sub(last, sym);
@@ -1704,5 +1803,111 @@ mod literal_tests {
             };
             assert_eq!(actual, expected, "reference {dtype} {token}");
         }
+    }
+}
+
+/// L31 (I-90): every word value has one checker symbol, and every position
+/// proves over it.
+#[cfg(test)]
+mod word_value_tests {
+    use crate::checked::{check_source, CheckedModule, SourceFile, SourceSet};
+    use crate::entry::ElementBindings;
+    use crate::interp::{Arg, Interpreter, OutcomeValue, TensorData};
+    use crate::reference_math::ReferenceScalar;
+    use crate::types::DType;
+
+    fn check(source: &str) -> Result<CheckedModule, String> {
+        check_source(SourceSet::new(vec![SourceFile {
+            path: "word-value.seismic".into(),
+            text: source.into(),
+        }]))
+        .map_err(|error| error.to_string())
+    }
+
+    /// Runs `probe(input, out)` over three rows and returns `out`.
+    fn rows(source: &str, input: TensorData) -> Vec<f64> {
+        let module = check(source).unwrap_or_else(|error| panic!("{source}\n{error}"));
+        let entry = module
+            .entry(module.entry_named("probe").unwrap(), &ElementBindings::default())
+            .unwrap();
+        let mut interpreter = Interpreter::new(&entry);
+        let input = interpreter.add_tensor(input);
+        let out = interpreter.add_tensor(TensorData::dense(DType::F32, vec![3], vec![0.0; 3]));
+        let outcome = interpreter.run(&[Arg::Tensor(input), Arg::Tensor(out)]).unwrap();
+        let out = outcome.inputs().nth(1).unwrap();
+        (0..3).map(|row| out.tensor().read(row).unwrap()).collect()
+    }
+
+    const COUNT_ALLOCATED: &str = "            let mut t = tensor[w] f32\n            t[:] = ones_like(t)\n            out[r] = reduce(t, 0, sum)\n";
+    const COUNT_LOOP: &str = "            let mut s = 0.0\n            for i in 0..w:\n                s = s + 1.0\n            out[r] = s\n";
+
+    #[test]
+    fn a_guarded_computed_word_reaches_extents_and_loop_bounds() {
+        let lens = || TensorData::dense(DType::I32, vec![3], vec![2.0, -5.0, 6.0]);
+        let scaled = || TensorData::dense(DType::F32, vec![3], vec![1.0, -1.0, 0.7]);
+        let computed = "fn probe[R](lens: &tensor[R] i32, out: &mut tensor[R] f32):\n    parallel for r in 0..R:\n        let w = lens[r] + 1\n        if w >= 0:\n";
+        let converted = "fn probe[R](x: &tensor[R] f32, out: &mut tensor[R] f32):\n    parallel for r in 0..R:\n        let w = i32(x[r] * 3.0)\n        if w >= 0:\n";
+        // X1 r6 w19d, w19, w08b, w19b.
+        assert_eq!(rows(&format!("{computed}{COUNT_ALLOCATED}"), lens()), [3.0, 0.0, 7.0]);
+        assert_eq!(rows(&format!("{computed}{COUNT_LOOP}"), lens()), [3.0, 0.0, 7.0]);
+        assert_eq!(rows(&format!("{converted}{COUNT_ALLOCATED}"), scaled()), [3.0, 0.0, 2.0]);
+        assert_eq!(rows(&format!("{converted}{COUNT_LOOP}"), scaled()), [3.0, 0.0, 2.0]);
+        // X1 r6 w06a: an inline word remainder is exact under `0 <= n`.
+        let remainder = "fn probe[R](lens: &tensor[R] i32, out: &mut tensor[R] f32):\n    parallel for r in 0..R:\n        let n = lens[r]\n        if n >= 0:\n            if n < 8:\n                let mut t = tensor[n % 8] f32\n                t[:] = ones_like(t)\n                out[r] = reduce(t, 0, sum)\n";
+        assert_eq!(rows(remainder, lens()), [2.0, 0.0, 6.0]);
+    }
+
+    #[test]
+    fn an_unguarded_word_position_names_its_conjunct() {
+        for (body, conjunct) in [
+            ("        let w = lens[r] + 1\n        let mut t = tensor[w] f32\n", "`w >= 0`"),
+            ("        let n = lens[r]\n        let mut t = tensor[n % 8] f32\n", "`n % 8 >= 0`"),
+            ("        let w = i32(lens[r] * 3)\n        for i in 0..w:\n            out[r] = 1.0\n", "`0 <= w`"),
+            // An inline element read has a symbol of its own, so a guard on an
+            // earlier read does not reach it; the goal names the read.
+            ("        if lens[r] >= 1:\n            let j = index[lens[r]](0)\n", "an index bound may be negative: cannot prove `lens[r] >= 0`"),
+            ("        if lens[r] >= 0:\n            let y = reshape(lens, (lens[r], 1))\n", "reshape extent may be negative: cannot prove `lens[r] >= 0`"),
+        ] {
+            let source = format!(
+                "fn probe[R](lens: &tensor[R] i32, out: &mut tensor[R] f32):\n    parallel for r in 0..R:\n{body}"
+            );
+            let error = check(&source).expect_err(body);
+            assert!(error.contains(conjunct), "{body}: {error}");
+        }
+    }
+
+    #[test]
+    fn index_conversion_proves_over_the_word_symbol() {
+        let guarded = "fn probe(lens: &tensor[1] i32, y: &tensor[8] f32) -> f32:\n    let n = lens[0]\n    let mut r = 0.0\n    if n >= 0:\n        if n < 8:\n            let j = index[8](n)\n            r = y[j]\n    return r\n";
+        let module = check(guarded).unwrap();
+        let entry = module
+            .entry(module.entry_named("probe").unwrap(), &ElementBindings::default())
+            .unwrap();
+        let mut interpreter = Interpreter::new(&entry);
+        let lens = interpreter.add_tensor(TensorData::dense(DType::I32, vec![1], vec![5.0]));
+        let y = interpreter.add_tensor(TensorData::dense(
+            DType::F32,
+            vec![8],
+            (0..8).map(f64::from).collect(),
+        ));
+        let outcome = interpreter.run(&[Arg::Tensor(lens), Arg::Tensor(y)]).unwrap();
+        assert!(matches!(
+            outcome.results().next().unwrap().value(),
+            OutcomeValue::Scalar(ReferenceScalar::F32(bits)) if f32::from_bits(bits) == 5.0
+        ));
+
+        let unguarded = "fn probe(lens: &tensor[1] i32, y: &tensor[8] f32) -> f32:\n    let n = lens[0]\n    let j = index[8](n)\n    return y[j]\n";
+        let error = check(unguarded).unwrap_err();
+        assert!(error.contains("prove `0 <= n` and `n <= 7`"), "{error}");
+        let unbounded = "fn probe(x: &tensor[8] i32, y: &tensor[8] f32) -> f32:\n    let r = index(x[0])\n    return y[r]\n";
+        let error = check(unbounded).unwrap_err();
+        assert!(error.contains("`index` needs its bound: `index[B](w)`"), "{error}");
+    }
+
+    #[test]
+    fn a_constant_word_operation_folds_with_wrapping() {
+        let error = check("fn probe() -> f32:\n    let w = 2147483647 + 1\n    let t = tensor[w] f32\n    return 0.0\n").unwrap_err();
+        assert!(error.contains("tensor extent may be negative"), "{error}");
+        check("fn probe() -> f32:\n    let w = (7 * 3) % 8\n    let mut t = tensor[w] f32\n    t[:] = ones_like(t)\n    return reduce(t, 0, sum)\n").unwrap();
     }
 }

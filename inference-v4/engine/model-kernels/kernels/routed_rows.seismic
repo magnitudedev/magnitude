@@ -41,7 +41,7 @@ fn qwen_routed_rows[M, H, E, K, F, S](residual: &tensor[M, H] f32,
             for expert in 0..E:
                 candidates[expert] = -1
                 if probabilities[expert] == best:
-                    candidates[expert] = expert
+                    candidates[expert] = i32(expert)
             let winner = reduce(i32(candidates), 0, max)
             routes[row, K - 1 - rank] = winner
             scores[row, K - 1 - rank] = best
@@ -123,7 +123,7 @@ fn qwen_routed_select[O, E, K](logits: &tensor[O, E] f32, selected: i32,
             for expert in 0..E:
                 candidates[expert] = -1
                 if probabilities[expert] == best:
-                    candidates[expert] = expert
+                    candidates[expert] = i32(expert)
             let winner = reduce(i32(candidates), 0, max)
             routes[row, K - 1 - rank] = winner
             scores[row, K - 1 - rank] = best

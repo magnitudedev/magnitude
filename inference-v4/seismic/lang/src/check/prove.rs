@@ -16,6 +16,7 @@
 
 use crate::expr::poly::{intern, normalize_int, single_atom_of, Atom, Poly};
 use crate::expr::{AnyExpr, ExprArena, IntExpr, SymbolId};
+use crate::types::{DType, ValueType};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
@@ -77,12 +78,6 @@ pub(crate) fn recompose_address(arena: &mut ExprArena, e: IntExpr) -> IntExpr {
     } else {
         e
     }
-}
-
-/// `e / c` when every coefficient is divisible by `c`.
-pub(crate) fn div_exact(arena: &mut ExprArena, e: IntExpr, c: i64) -> Option<IntExpr> {
-    let p = normalize_int(arena, e).div_exact(c)?;
-    Some(intern(arena, &p))
 }
 
 /// `e / d` when `d` is a nonzero constant or monomial that divides every term
@@ -309,10 +304,6 @@ impl Facts {
             })
     }
 
-    pub(crate) fn upper_of(&self, symbol: SymbolId) -> Option<IntExpr> {
-        self.upper.get(&symbol).copied()
-    }
-
     /// A path condition `symbol <= hi`.
     pub(crate) fn add_upper(&mut self, symbol: SymbolId, hi: IntExpr) {
         self.changed().extra_upper.push((symbol, hi));
@@ -321,6 +312,26 @@ impl Facts {
     /// A path condition `symbol >= lo`.
     pub(crate) fn add_lower(&mut self, symbol: SymbolId, lo: IntExpr) {
         self.changed().extra_lower.push((symbol, lo));
+    }
+
+    /// The bounds of a value of type `ty` held by `symbol` (L32 (a)):
+    /// `index[B]` is `0 <= v <= B - 1`, an `i32` word is its two's-complement
+    /// range and a `u32` word `0 <= v <= 2^32 - 1`. Every other type states
+    /// nothing.
+    pub(crate) fn assume_type(&mut self, arena: &mut ExprArena, symbol: SymbolId, ty: &ValueType) {
+        let (lo, hi) = match ty {
+            ValueType::Index { bound } => {
+                let one = arena.int(1);
+                (arena.int(0), arena.int_sub(*bound, one))
+            }
+            ValueType::Scalar(DType::I32) => (
+                arena.int(i64::from(i32::MIN)),
+                arena.int(i64::from(i32::MAX)),
+            ),
+            ValueType::Scalar(DType::U32) => (arena.int(0), arena.int(i64::from(u32::MAX))),
+            _ => return,
+        };
+        self.set_range(symbol, lo, hi);
     }
 
     /// The bounds of a joined value `joined`, which equals `value` of one of

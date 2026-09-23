@@ -112,6 +112,7 @@ where
             AnalyticalEvaluationContext<T>,
             seismic_compiler::errors::TargetError,
         >,
+        memory: Arc<MemoryDomain>,
     ) -> Self {
         Self {
             identity: DeviceIdentity(NEXT_DEVICE.fetch_add(1, Ordering::Relaxed)),
@@ -122,7 +123,7 @@ where
             analytical: std::sync::OnceLock::new(),
             analytical_loader,
             cache: Mutex::new(HashMap::new()),
-            memory: MemoryDomain::new(),
+            memory,
             admission: AdmissionDomain::new(),
         }
     }
@@ -168,7 +169,7 @@ where
     pub(crate) fn set_memory_limit(
         &self,
         limit: Option<u64>,
-    ) -> Result<(), crate::api::MemoryLimitError> {
+    ) -> Result<(), crate::memory::MemoryLimitError> {
         self.memory.set_limit(limit)
     }
     pub(crate) fn allocate_storage(
@@ -2273,7 +2274,7 @@ mod physical_slot_tests {
 
     #[test]
     fn admitted_slot_owns_backing_charge_and_exclusive_access() {
-        let memory = MemoryDomain::new();
+        let memory = MemoryDomain::new(crate::memory::PoolLedger::new());
         let mut reservation = memory.reserve(16).unwrap();
         let allocation = Allocation::new(1, 16, reservation.take(16), Box::new(EmptyStorage));
         let weak = Arc::downgrade(&allocation);
@@ -2290,10 +2291,9 @@ mod physical_slot_tests {
 
     #[test]
     fn native_allocation_owner_enforces_target_limits_without_leaking_reservation() {
-        let catalog = crate::api::catalog::Catalog::discover().unwrap();
-        let info = catalog.devices().iter().find(|device| device.backend == registry::BackendName::Cpu).unwrap();
-        let device = catalog.open(info.id).unwrap();
-        let crate::backends::DeviceKind::Cpu(opened) = &device.kind else { unreachable!() };
+        let catalog = crate::devices::Catalog::discover().unwrap();
+        let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
+        let crate::backends::OpenedKind::Cpu(opened) = &device.kind else { unreachable!() };
         let baseline = opened.memory_usage().charged;
         let maximum = opened.device_description().limits().max_allocation_bytes;
         let error = opened.allocate_storage(maximum.checked_add(1).unwrap(), 4).err().expect("target limit is enforced before allocating");
@@ -2305,7 +2305,7 @@ mod physical_slot_tests {
 
     #[test]
     fn reached_slots_release_dead_capacity_and_preserve_live_permits_on_refusal() {
-        let memory = MemoryDomain::new();
+        let memory = MemoryDomain::new(crate::memory::PoolLedger::new());
         let mut resources = AdmittedResources::new(memory.reserve(0).unwrap(), vec![]);
         resources.set_reached_budget(24);
         resources.declare_private(100);
@@ -2334,7 +2334,7 @@ mod physical_slot_tests {
 
     #[test]
     fn completed_dead_bank_releases_device_capacity_without_releasing_live_bank() {
-        let memory = MemoryDomain::new();
+        let memory = MemoryDomain::new(crate::memory::PoolLedger::new());
         memory.set_limit(Some(24)).unwrap();
         let mut resources = AdmittedResources::new(memory.reserve(0).unwrap(), vec![]);
         resources.set_reached_budget(24);
@@ -2371,7 +2371,7 @@ mod physical_slot_tests {
 
     #[test]
     fn published_backing_survives_slot_release_without_retaining_its_permit() {
-        let memory = MemoryDomain::new();
+        let memory = MemoryDomain::new(crate::memory::PoolLedger::new());
         let mut reservation = memory.reserve(16).unwrap();
         let allocation = Allocation::new(1, 16, reservation.take(16), Box::new(EmptyStorage));
         let resources = AdmittedResources::new(reservation, vec![allocation.acquire(true)]);

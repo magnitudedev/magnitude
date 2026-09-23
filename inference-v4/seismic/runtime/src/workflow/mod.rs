@@ -179,10 +179,10 @@ pub(crate) enum ArgumentBinding {
         result: OutputRef,
         view: TensorView,
     },
-    LeadingSlice {
+    /// A producer result seen through ordered view operations.
+    ResultView {
         result: OutputRef,
-        start: u64,
-        end: u64,
+        operations: Vec<crate::api::kernel::ViewOperation>,
     },
 }
 
@@ -281,6 +281,11 @@ pub(crate) enum PlanError<E> {
     HostBoundaryRequired(OutputRef),
     ViewOfScalar(OutputRef),
     InvalidView(OutputRef),
+    /// A view operation over a producer result is not a view of it.
+    ResultView {
+        result: OutputRef,
+        error: crate::api::TensorError,
+    },
     InvalidPolicyDescription(&'static str),
     Policy(E),
 }
@@ -417,7 +422,7 @@ impl<S, E> WorkflowPlanDraft<S, E> {
         bindings.iter().all(|binding| match binding {
             ArgumentBinding::External(_) => true,
             ArgumentBinding::Result(result) | ArgumentBinding::View { result, .. }
-            | ArgumentBinding::LeadingSlice { result, .. } => matches!(
+            | ArgumentBinding::ResultView { result, .. } => matches!(
                 self.resolve_result(*result),
                 Ok(ValueDescriptor::Tensor(_)) | Ok(ValueDescriptor::Scalar(ScalarDescriptor::HostReady(_)))
             ),
@@ -454,7 +459,7 @@ impl<S, E> WorkflowPlanDraft<S, E> {
             let producer = match binding {
                 ArgumentBinding::Result(result)
                 | ArgumentBinding::View { result, .. }
-                | ArgumentBinding::LeadingSlice { result, .. } => Some(result.node),
+                | ArgumentBinding::ResultView { result, .. } => Some(result.node),
                 ArgumentBinding::External(_) => None,
             };
             if let Some(producer) = producer {
@@ -805,37 +810,34 @@ impl<S, E> WorkflowPlanDraft<S, E> {
                 validate_tensor(&descriptor)?;
                 Ok(ValueDescriptor::Tensor(descriptor))
             }
-            ArgumentBinding::LeadingSlice { result, start, end } => {
+            ArgumentBinding::ResultView { result, operations } => {
                 let source = self.resolve_result(result)?.clone();
-                let ValueDescriptor::Tensor(source) = source else {
+                let ValueDescriptor::Tensor(mut descriptor) = source else {
                     return Err(PlanError::ViewOfScalar(result));
                 };
-                let Some(view) = crate::layout::leading_slice(
-                    source.representation,
-                    &source.extents,
-                    &source.strides,
-                    start,
-                    end,
-                ) else {
-                    return Err(PlanError::InvalidView(result));
-                };
-                let offset = source
-                    .range
-                    .offset
-                    .checked_add(view.relative_offset)
-                    .ok_or(PlanError::InvalidView(result))?;
-                extend_lifetime(&mut self.lifetimes, source.resource, consumer)?;
-                let descriptor = TensorDescriptor {
-                    device: source.device,
-                    resource: source.resource,
-                    representation: source.representation,
-                    extents: view.extents,
-                    strides: view.strides,
-                    range: ByteRange {
-                        offset,
-                        len: view.byte_len,
-                    },
-                };
+                for operation in operations {
+                    let view = crate::layout::apply_view(
+                        descriptor.representation,
+                        crate::layout::ViewGeometry {
+                            extents: descriptor.extents,
+                            strides: descriptor.strides,
+                            byte_offset: descriptor.range.offset,
+                            byte_len: descriptor.range.len,
+                        },
+                        &operation,
+                    )
+                    .map_err(|error| PlanError::ResultView { result, error })?;
+                    descriptor = TensorDescriptor {
+                        extents: view.extents,
+                        strides: view.strides,
+                        range: ByteRange {
+                            offset: view.byte_offset,
+                            len: view.byte_len,
+                        },
+                        ..descriptor
+                    };
+                }
+                extend_lifetime(&mut self.lifetimes, descriptor.resource, consumer)?;
                 validate_tensor(&descriptor)?;
                 Ok(ValueDescriptor::Tensor(descriptor))
             }

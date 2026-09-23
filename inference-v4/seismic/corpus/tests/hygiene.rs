@@ -19,7 +19,7 @@ const TREES: &[&str] = &[
     "seismic-std",
     "engine/src",
     "engine/tests",
-    "engine/build.rs",
+    "engine/model-kernels",
 ];
 
 /// Every `.rs` file of the scanned trees, excluding `target/` directories.

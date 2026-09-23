@@ -8,6 +8,7 @@ mod hygiene;
 mod library;
 mod matrix;
 mod resources;
+mod source_tracking;
 mod workflows;
 
 include!(concat!(env!("OUT_DIR"), "/generated_public.rs"));

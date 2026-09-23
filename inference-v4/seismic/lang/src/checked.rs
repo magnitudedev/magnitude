@@ -859,7 +859,7 @@ mod native_tests {
             ),
             (
                 "native scale for cpu from \"scale.c\":\n    threadgroups (1, 1, 1)\n    threads_per_threadgroup (1, 1, 1)\n",
-                "currently support only `metal`",
+                "backend `cpu` has no direct native route",
             ),
         ];
 
@@ -995,14 +995,33 @@ mod diagnostic_tests {
         assert_eq!(item.location.line, 4);
         assert!(item.message.contains("parameter names differ"), "{names}");
 
-        for builtin in [
-            "max", "exp_fast", "index", "range", "f32", "to_owned", "load", "clone", "decode",
-            "valid", "capacity", "coord",
-        ] {
+        for builtin in ["max", "index", "range", "f32", "to_owned"] {
             let error = rejected(&format!("fn {builtin}(a: f32) -> f32:\n    return a\n"));
             let item = single(&error);
             assert_eq!(item.rule, DiagnosticRule::Resolution, "{error}");
             assert!(item.message.contains("names a builtin operation"), "{error}");
+        }
+        // L20: each recursion is one diagnostic and hides no other definition.
+        let recursions = rejected(
+            "fn a(x: i32) -> i32:\n    return b(x)\n\nfn b(x: i32) -> i32:\n    return a(x)\n\nfn c(x: i32) -> i32:\n    return c(x)\n\nfn d(x: i32) -> i32:\n    return a(x)\n\nfn e(x: i32) -> i32:\n    return x + true\n",
+        );
+        let items = recursions.diagnostics().items();
+        let rules = items.iter().map(|item| item.rule).collect::<Vec<_>>();
+        assert_eq!(
+            rules,
+            [DiagnosticRule::Recursion, DiagnosticRule::Recursion, DiagnosticRule::Type],
+            "{recursions}"
+        );
+        assert!(items[0].message.contains("`a` -> `b` -> `a`"), "{recursions}");
+        assert!(items[1].message.contains("`c` -> `c`"), "{recursions}");
+
+        // L8: retired spellings are ordinary names.
+        for retired in ["exp_fast", "load", "clone", "decode", "valid", "capacity", "coord"] {
+            check_source(SourceSet::new(vec![SourceFile {
+                path: "probe.seismic".into(),
+                text: format!("fn {retired}(a: f32) -> f32:\n    return a\n"),
+            }]))
+            .unwrap_or_else(|error| panic!("`{retired}` is an ordinary name: {error}"));
         }
     }
 

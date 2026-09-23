@@ -129,7 +129,7 @@ def _dtype(value) -> Element:
 class DeviceInfo:
     selector: str
     name: str
-    memory_bytes: int
+    backend: str
 
 
 class Device:
@@ -149,8 +149,10 @@ class Device:
         return tuple(self._inner.capabilities)
 
     def memory_usage(self):
-        charged, limit = self._inner.memory_usage()
-        return MappingProxyType({"charged": charged, "limit": limit})
+        charged, limit, pool_charged = self._inner.memory_usage()
+        return MappingProxyType(
+            {"charged": charged, "limit": limit, "pool_charged": pool_charged}
+        )
 
     def set_memory_limit(self, value):
         if value is not None:

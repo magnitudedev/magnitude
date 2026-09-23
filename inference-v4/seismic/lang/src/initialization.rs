@@ -180,6 +180,11 @@ pub(crate) trait RegionOps {
     /// A fresh integer variable of this arena: a proof variable in a
     /// definition arena, a region binder in an entry arena.
     fn fresh_variable(&mut self) -> SymbolId;
+    /// The integer value of a domain symbol. A domain binds `Int` symbols it
+    /// mints and the region binders its caller supplies, which may be `Nat`.
+    fn symbol_value(&mut self, symbol: SymbolId) -> IntExpr {
+        crate::expr::poly::intern_atom(self.arena(), &crate::expr::poly::Atom::Symbol(symbol))
+    }
     fn substitute(&mut self, value: IntExpr, map: &HashMap<SymbolId, IntExpr>) -> IntExpr {
         prove::substitute(self.arena(), value, &|s| map.get(&s).copied())
     }
@@ -367,7 +372,7 @@ pub(crate) trait RegionOps {
             if !self.same(start, other.start) || !self.same(end, other.end) {
                 return false;
             }
-            let renamed = self.arena().int_symbol(other.symbol);
+            let renamed = self.symbol_value(other.symbol);
             map.insert(bound.symbol, renamed);
         }
         coordinates.iter().zip(other_coordinates).all(|(x, y)| {
@@ -478,7 +483,7 @@ pub(crate) trait RegionOps {
                         _ => self.fresh_integer().0,
                     };
                     kept.push(Bound { symbol, start, end });
-                    axes.push(self.arena().int_symbol(symbol));
+                    axes.push(self.symbol_value(symbol));
                 }
                 None => {
                     kept.extend(own);
@@ -910,7 +915,7 @@ pub(crate) trait RegionOps {
             ) if a.len() == b.len() => {
                 let mut map = HashMap::new();
                 for (a, b) in a.iter().zip(b) {
-                    map.insert(a.symbol, self.arena().int_symbol(b.symbol));
+                    map.insert(a.symbol, self.symbol_value(b.symbol));
                     if !self.same(a.start, b.start) || !self.same(a.end, b.end) {
                         return false;
                     }
@@ -2666,5 +2671,27 @@ mod tests {
         );
         let again = context.normalize(normalized.clone(), &facts);
         assert_eq!(again, normalized);
+    }
+
+    #[test]
+    fn a_natural_region_binder_is_a_domain_symbol() {
+        // A completed loop's binder may be a `Nat` symbol of the caller's
+        // arena. Its image `n` over `n in [0, 4)` is already normal and stays
+        // the identical region.
+        let mut arena = ExprArena::new();
+        let (_, n, natural) = arena.nat_loop_binder();
+        let n_value = arena.int_from_nat(natural);
+        let (zero, four) = (arena.int(0), arena.int(4));
+        let facts = prove::Facts::new();
+        let mut context = InitializationContext::new(&mut arena);
+        let image = Region::Image {
+            domain: vec![Bound {
+                symbol: n,
+                start: zero,
+                end: four,
+            }],
+            coordinates: vec![n_value],
+        };
+        assert_eq!(context.normalize(image.clone(), &facts), image);
     }
 }

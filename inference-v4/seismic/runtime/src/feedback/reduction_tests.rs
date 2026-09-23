@@ -5,13 +5,8 @@ use seismic_lang::checked::{check_source, SourceFile, SourceSet};
 use seismic_lang::entry::ElementBindings;
 
 fn scalar_reductions(backend: registry::BackendName) {
-    let catalog = crate::api::catalog::Catalog::discover().unwrap();
-    let info = catalog
-        .devices()
-        .iter()
-        .find(|device| device.backend == backend)
-        .unwrap();
-    let device = catalog.open(info.id).unwrap();
+    let catalog = crate::devices::Catalog::discover().unwrap();
+    let device = catalog.open_backend(backend).unwrap();
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "scalar-reduction.seismic".into(),
         text: "fn first[N](x: &tensor[N] f32) -> f32:\n    return x[0]\n\nfn dependent[N](x: &tensor[N] f32) -> f32 where N >= 2:\n    return x[0] + x[1] + x[0] * 2.0\n\nfn total[N](x: &tensor[N] f32) -> f32 where N >= 0:\n    return reduce(x, 0, sum)\n\nfn expression[N](x: &tensor[N] f32) -> f32 where N >= 0:\n    return reduce(x + x, 0, sum)\n\nfn snapshot[N](x: &mut tensor[N] f32) -> f32:\n    let a = x + x\n    parallel for i in 0..N:\n        x[i] = 0.0\n    return reduce(a, 0, sum)\n\nfn narrow[N](x: &tensor[N] f32) -> f32:\n    return reduce(f32(f16(x)), 0, sum)\n\nfn transformed(x: &tensor[4] f32) -> f32:\n    let a = reshape(x + x, (2, 2))\n    return reduce(reduce(a, 1, sum), 0, sum)\n\nfn nested(x: &tensor[2,3] f32) -> f32:\n    return reduce(reduce(x, 1, sum), 0, sum)\n".into(),
@@ -83,13 +78,8 @@ fn metal_scalar_reductions_publish_scalar_slots_and_empty_sum_identity() {
 }
 
 fn range_endpoints(backend: registry::BackendName) {
-    let catalog = crate::api::catalog::Catalog::discover().unwrap();
-    let info = catalog
-        .devices()
-        .iter()
-        .find(|device| device.backend == backend)
-        .unwrap();
-    let device = catalog.open(info.id).unwrap();
+    let catalog = crate::devices::Catalog::discover().unwrap();
+    let device = catalog.open_backend(backend).unwrap();
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "range-endpoints.seismic".into(),
         text: "fn probe(x: &tensor[4] f32, times: range[4]) -> f32:\n    return sum_range(x, times)\n\nfn element(x: &tensor[4] f32, i: index[4]) -> f32:\n    return x[i]\n\nfn sum_range(x: &tensor[4] f32, times: range[4]) -> f32:\n    let mut total = 0.0\n    for i in times:\n        total = total + element(x, i)\n    return total\n".into(),

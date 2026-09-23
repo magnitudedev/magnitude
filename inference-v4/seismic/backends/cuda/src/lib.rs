@@ -17,10 +17,11 @@ pub use buffer::Buffer;
 pub use capability::CudaIntrinsic;
 pub use command::{CompiledKernel, OccupancyRelation};
 pub use compile::NativeCandidate;
-pub use executor::{Device, Executor};
+pub use executor::{Device, Executor, MemoryInfo};
 pub use open::{open, open_analytical, OpenedCuda};
 pub use profile::{
-    describe, device_count, ComputeCapability, CudaFacts, CudaKernelAbi, DeviceDescriptor,
+    describe, device_count, max_allocation_bytes, ComputeCapability, CudaFacts, CudaKernelAbi,
+    DeviceDescriptor,
     DriverApiVersion, PtxFeatureSet, PtxTarget, TensorMemory, BACKEND_REVISION,
 };
 pub use registry::registry;

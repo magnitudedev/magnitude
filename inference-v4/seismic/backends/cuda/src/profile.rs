@@ -311,10 +311,18 @@ mod attr {
     pub const MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: i32 = 97;
     pub const COOPERATIVE_LAUNCH: i32 = 99;
     pub const MAX_BLOCKS_PER_MULTIPROCESSOR: i32 = 106;
+    pub const INTEGRATED: i32 = 18;
 }
 
 fn unavailable(error: DriverError) -> TargetError {
     TargetError::DeviceUnavailable(error.to_string())
+}
+
+/// The single-allocation limit of a CUDA device: one `cuMemAlloc` can at
+/// most cover the device's total memory. This is the `TargetLimits` value and
+/// the catalog's published allocation limit; it is not available memory.
+pub fn max_allocation_bytes(total_memory_bytes: u64) -> u64 {
+    total_memory_bytes
 }
 
 /// Cheap unopened catalog identity. Constructing this value does not retain
@@ -322,8 +330,14 @@ fn unavailable(error: DriverError) -> TargetError {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DeviceDescriptor {
     pub ordinal: u32,
+    /// `cuDeviceGetUuid_v2`: the exposed device or MIG partition, never
+    /// merely its parent GPU.
+    pub uuid: [u8; 16],
     pub name: String,
-    pub memory_bytes: u64,
+    /// `cuDeviceTotalMem`: memory of the exposed device or partition.
+    pub total_memory_bytes: u64,
+    /// `CU_DEVICE_ATTRIBUTE_INTEGRATED`: the device shares host memory.
+    pub integrated: bool,
 }
 
 /// Number of CUDA devices the driver reports; zero (or no driver) is
@@ -345,9 +359,16 @@ pub fn describe(ordinal: u32) -> Result<DeviceDescriptor, TargetError> {
     let device = c_int::try_from(ordinal).map_err(|_| {
         TargetError::DeviceUnavailable(format!("ordinal {ordinal} exceeds the driver ABI"))
     })?;
+    let device_uuid_v2 = driver.device_uuid_v2.ok_or_else(|| {
+        TargetError::UnsupportedDriver(
+            "the CUDA driver lacks cuDeviceGetUuid_v2 (driver API 11.4); exposed-device identity cannot be established"
+                .into(),
+        )
+    })?;
     let mut handle = 0;
     let mut name = [0 as std::ffi::c_char; 256];
     let mut memory = 0usize;
+    let mut uuid = [0u8; 16];
     unsafe {
         driver
             .check((driver.device_get)(&mut handle, device), "device selection")
@@ -364,13 +385,22 @@ pub fn describe(ordinal: u32) -> Result<DeviceDescriptor, TargetError> {
                 "total device memory",
             )
             .map_err(unavailable)?;
+        driver
+            .check(device_uuid_v2(&mut uuid, device), "device UUID")
+            .map_err(unavailable)?;
     }
+    let integrated = driver
+        .attribute(attr::INTEGRATED, device)
+        .map_err(unavailable)?
+        != 0;
     Ok(DeviceDescriptor {
         ordinal,
+        uuid,
         name: unsafe { CStr::from_ptr(name.as_ptr()) }
             .to_string_lossy()
             .into_owned(),
-        memory_bytes: memory as u64,
+        total_memory_bytes: memory as u64,
+        integrated,
     })
 }
 
@@ -516,7 +546,7 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
             ))
         })?,
         max_argument_bytes: kernel_parameter_bytes,
-        max_allocation_bytes: global_memory_bytes,
+        max_allocation_bytes: max_allocation_bytes(global_memory_bytes),
         max_allocation_alignment: ALLOCATION_ALIGNMENT,
         // Kernel index registers are 64-bit (`.address_size 64`).
         max_index_bits: 64,

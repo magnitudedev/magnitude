@@ -85,7 +85,7 @@ fn exact_program_subject_distinguishes_element_instantiations() {
     use crate::types::DType;
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "polymorphic.seismic".into(),
-        text: "fn probe(x: &tensor[2] T) -> tensor[2] T:\n    return load(x)\n".into(),
+        text: "fn probe(x: &tensor[2] T) -> tensor[2] T:\n    return to_owned(x)\n".into(),
     }]))
     .unwrap();
     let id = module.entry_named("probe").unwrap();

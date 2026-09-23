@@ -252,9 +252,47 @@ mod result_schema_tests {
         }])).unwrap()
     }
 
+    /// A1 §2.3.6 (1): a `T` element read carries the binding's decoded
+    /// dtype, and one exact `Cast(F32)` gives the checked `f32` value.
+    #[test]
+    fn generic_element_read_decodes_then_widens_exactly() {
+        let module = module("fn probe(x: &tensor[2] T) -> f32:\n    return x[1]\n");
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let bindings = ElementBindings::new().bind("T", crate::registry::dense(dtype));
+            let entry = module.entry(module.entry_named("probe").unwrap(), &bindings).unwrap();
+            let program = entry.program();
+            let function = program.function(program.family(program.root()).reference().function());
+            let nodes = function.nodes(function.root()).collect::<Vec<_>>();
+            let read = nodes
+                .iter()
+                .find_map(|(_, node)| match node.view() {
+                    SemanticNodeView::ElementRead { output, .. } => Some(output),
+                    _ => None,
+                })
+                .expect("the element read is present");
+            assert_eq!(function.value(read).ty, SemanticType::Scalar(dtype));
+            let widened = nodes.iter().find_map(|(_, node)| match node.view() {
+                SemanticNodeView::Primitive {
+                    primitive: PrimitiveId::Cast(DType::F32),
+                    inputs,
+                    output,
+                } if inputs == [read] => Some(output),
+                _ => None,
+            });
+            assert_eq!(widened.is_some(), dtype != DType::F32, "{dtype:?}");
+            let mut interpreter = Interpreter::new(&entry);
+            let x = interpreter.add_tensor(TensorData::dense(dtype, vec![2], vec![0.0, 1.5]));
+            let outcome = interpreter.run(&[Arg::Tensor(x)]).unwrap();
+            assert!(matches!(
+                outcome.results().next().unwrap().value(),
+                OutcomeValue::Scalar(ReferenceScalar::F32(bits)) if f32::from_bits(bits) == 1.5
+            ));
+        }
+    }
+
     #[test]
     fn declared_result_paths_survive_semantic_leaf_flattening() {
-        let module = module("fn probe(x: &tensor[1] f32, pair: (f32, range[4])) -> (tensor[1] f32, (f32, range[4])):\n    return (load(x), pair)\n");
+        let module = module("fn probe(x: &tensor[1] f32, pair: (f32, range[4])) -> (tensor[1] f32, (f32, range[4])):\n    return (to_owned(x), pair)\n");
         let entry = module.entry(module.entry_named("probe").unwrap(), &ElementBindings::default()).unwrap();
         let paths = entry.schema().results().iter().map(|result| result.path.clone()).collect::<Vec<_>>();
         assert_eq!(paths, vec![vec![0], vec![1, 0], vec![1, 1]]);
@@ -262,7 +300,7 @@ mod result_schema_tests {
 
     #[test]
     fn declared_result_geometry_does_not_capture_body_runtime_values() {
-        let module = module("fn probe(x: &tensor[2,3] f32) -> tensor[2,3] f32:\n    let mut y = load(x)\n    for i in 0..2:\n        y = reshape(y.T, (2,3))\n    return y\n");
+        let module = module("fn probe(x: &tensor[2,3] f32) -> tensor[2,3] f32:\n    let mut y = to_owned(x)\n    for i in 0..2:\n        y = reshape(y.T, (2,3))\n    return y\n");
         let entry = module.entry(module.entry_named("probe").unwrap(), &ElementBindings::default()).unwrap();
         let ResultKind::Tensor { axes, .. } = &entry.schema().results()[0].kind else { panic!("tensor result") };
         for axis in axes {
@@ -272,7 +310,7 @@ mod result_schema_tests {
 
     #[test]
     fn return_rounding_is_an_ordered_semantic_producer() {
-        let module = module("fn scalar(x: f32) -> f16:\n    return x\n\nfn tensor(x: &tensor[2] f32) -> tensor[2] f16:\n    return load(x)\n");
+        let module = module("fn scalar(x: f32) -> f16:\n    return x\n\nfn tensor(x: &tensor[2] f32) -> tensor[2] f16:\n    return to_owned(x)\n");
         for (name, expected) in [("scalar", SemanticType::Scalar(DType::F16)), ("tensor", SemanticType::Tensor(TensorSemantics { representation: crate::registry::dense(DType::F16), axes: vec![], storage: TensorStorage::Computed }))] {
             let entry = module.entry(module.entry_named(name).unwrap(), &ElementBindings::default()).unwrap();
             let candidate = entry.program().family(entry.program().root()).candidates().iter().find(|candidate| candidate.numerical == NumericalRole::Reference).unwrap();
@@ -289,16 +327,16 @@ mod result_schema_tests {
 
     #[test]
     fn declared_shape_error_and_concrete_conversion_error_keep_return_position() {
-        let shape_source = "fn probe(x: &tensor[2] f32) -> tensor[3] f32:\n    return load(x)\n";
+        let shape_source = "fn probe(x: &tensor[2] f32) -> tensor[3] f32:\n    return to_owned(x)\n";
         let errors = check_source(SourceSet::new(vec![SourceFile {
             path: "bad-result-shape.seismic".into(),
             text: shape_source.into(),
         }])).unwrap_err();
         let error = &errors.diagnostics().items()[0];
         assert_eq!(error.location.path, "bad-result-shape.seismic");
-        assert!(error.location.span.start >= shape_source.find("load(x)").unwrap() as u32);
+        assert!(error.location.span.start >= shape_source.find("to_owned(x)").unwrap() as u32);
 
-        let conversion_source = "fn probe(x: &tensor[1] U) -> tensor[1] T:\n    return load(x)\n";
+        let conversion_source = "fn probe(x: &tensor[1] U) -> tensor[1] T:\n    return to_owned(x)\n";
         let module = module(conversion_source);
         let bindings = ElementBindings::new()
             .bind("U", crate::registry::dense(DType::I32))
@@ -306,7 +344,7 @@ mod result_schema_tests {
         let errors = module.entry(module.entry_named("probe").unwrap(), &bindings).unwrap_err();
         let error = &errors.diagnostics().items()[0];
         assert!(error.message.contains("no defined source installation conversion"));
-        assert!(error.location.span.start >= conversion_source.find("load(x)").unwrap() as u32);
+        assert!(error.location.span.start >= conversion_source.find("to_owned(x)").unwrap() as u32);
     }
 
     #[test]
@@ -328,9 +366,26 @@ mod result_schema_tests {
         assert_eq!(tensor.canonical_bytes().unwrap().unwrap(), &0x3c01u16.to_le_bytes());
     }
 
+    /// The first diagnostic the checker reports for `source`, a `Type` one.
+    fn type_error(source: &str) -> String {
+        let errors = check_source(SourceSet::new(vec![SourceFile {
+            path: "result-schema.seismic".into(),
+            text: source.into(),
+        }])).unwrap_err();
+        let first = &errors.diagnostics().items()[0];
+        assert_eq!(first.rule, crate::checked::DiagnosticRule::Type);
+        first.message.clone()
+    }
+
     #[test]
-    fn tensor_assignment_and_store_install_the_destination_element_type() {
-        let module = module("fn assigned(x: &tensor[2] f32) -> tensor[2] f16:\n    let mut y = tensor[2] f16\n    y = load(x)\n    return y\n\nfn stored(x: &tensor[2] f32) -> tensor[2] f16:\n    let mut y = tensor[2] f16\n    y[0:2] = load(x)\n    return y\n");
+    fn tensor_assignment_keeps_the_declared_type_and_store_installs_the_destination_element_type() {
+        // L23 (a): a reassigned local keeps its declared element; the
+        // conversion is written explicitly.
+        assert_eq!(
+            type_error("fn assigned(x: &tensor[2] f32) -> tensor[2] f16:\n    let mut y = tensor[2] f16\n    y = to_owned(x)\n    return y\n"),
+            "`y` has type tensor[2] f16 but the value has type tensor[2] f32"
+        );
+        let module = module("fn assigned(x: &tensor[2] f32) -> tensor[2] f16:\n    let mut y = tensor[2] f16\n    y = f16(x)\n    return y\n\nfn stored(x: &tensor[2] f32) -> tensor[2] f16:\n    let mut y = tensor[2] f16\n    y[0:2] = to_owned(x)\n    return y\n");
         for name in ["assigned", "stored"] {
             let entry = module.entry(module.entry_named(name).unwrap(), &ElementBindings::default()).unwrap();
             let mut interpreter = Interpreter::new(&entry);
@@ -364,21 +419,28 @@ mod result_schema_tests {
 
     #[test]
     fn generic_assignment_store_and_explicit_cast_use_concrete_rules() {
-        let source = "fn assigned(x: tensor[64] T, y: tensor[64] U) -> tensor[64] T:\n    let mut z = x\n    z = y\n    return z\n\nfn stored(x: tensor[64] T, y: tensor[64] U) -> tensor[64] T:\n    let mut z = x\n    z[0:64] = y\n    return z\n\nfn casted(x: &tensor[64] U) -> tensor[64] f16:\n    return f16(x)\n\nfn decoded(x: &tensor[64] U) -> tensor[64] f32:\n    return f32(x)\n";
+        // L23 (a): a reassigned `T` local takes only a `T` value, whatever
+        // the bindings; storing a `U` value into it is the installation.
+        assert_eq!(
+            type_error("fn assigned(x: tensor[64] T, y: tensor[64] U) -> tensor[64] T:\n    let mut z = x\n    z = y\n    return z\n"),
+            "`z` has type tensor[64] T but the value has type tensor[64] U"
+        );
+        let source = "fn assigned(x: tensor[64] T, y: tensor[64] T) -> tensor[64] T:\n    let mut z = x\n    z = y\n    return z\n\nfn stored(x: tensor[64] T, y: tensor[64] U) -> tensor[64] T:\n    let mut z = x\n    z[0:64] = y\n    return z\n\nfn casted(x: &tensor[64] U) -> tensor[64] f16:\n    return f16(x)\n\nfn decoded(x: &tensor[64] U) -> tensor[64] f32:\n    return f32(x)\n";
         let module = module(source);
         let packed = crate::registry::representation("q4g64").unwrap();
         let dense = ElementBindings::new()
             .bind("T", crate::registry::dense(DType::F16))
             .bind("U", crate::registry::dense(DType::F32));
-        for name in ["assigned", "stored"] {
-            module.entry(module.entry_named(name).unwrap(), &dense).expect("dense float installation");
-        }
+        module.entry(module.entry_named("stored").unwrap(), &dense).expect("dense float installation");
+        let dense_t = ElementBindings::new().bind("T", crate::registry::dense(DType::F16));
+        module.entry(module.entry_named("assigned").unwrap(), &dense_t).expect("dense whole assignment");
+        let packed_t = ElementBindings::new().bind("T", packed);
+        module.entry(module.entry_named("assigned").unwrap(), &packed_t).expect("equal packed whole assignment");
         let same_packed = ElementBindings::new().bind("T", packed).bind("U", packed);
-        module.entry(module.entry_named("assigned").unwrap(), &same_packed).expect("equal packed whole assignment");
         let error = module.entry(module.entry_named("stored").unwrap(), &same_packed).unwrap_err();
         assert!(error.diagnostics().items().iter().any(|item| item.message.contains("decode-only")));
         let mixed = ElementBindings::new().bind("T", crate::registry::dense(DType::F32)).bind("U", packed);
-        let error = module.entry(module.entry_named("assigned").unwrap(), &mixed).unwrap_err();
+        let error = module.entry(module.entry_named("stored").unwrap(), &mixed).unwrap_err();
         assert!(error.diagnostics().items().iter().any(|item| item.message.contains("no defined source installation conversion")));
         let bound = ElementBindings::new().bind("U", packed);
         let error = module.entry(module.entry_named("casted").unwrap(), &bound).unwrap_err();
@@ -396,11 +458,21 @@ mod result_schema_tests {
 
     #[test]
     fn generic_packed_compound_target_has_no_implicit_encoding() {
-        let module = module("fn probe(x: tensor[64] U) -> tensor[64] U:\n    let mut y = x\n    y += y\n    return y\n");
+        // `y += y` is `y = y + y`, whose value is decoded `f32`: L23 (a)
+        // rejects it for every binding of `U`, so no encoding is implied.
+        assert_eq!(
+            type_error("fn probe(x: tensor[64] U) -> tensor[64] U:\n    let mut y = x\n    y += y\n    return y\n"),
+            "`y` has type tensor[64] U but the value has type tensor[64] f32"
+        );
+        // The explicit store installs into `U`: defined for a dense float
+        // binding, never an encoding into packed storage.
+        let module = module("fn probe(x: tensor[64] U) -> tensor[64] U:\n    let mut y = x\n    y[:] = y + y\n    return y\n");
+        let entry = module.entry_named("probe").unwrap();
+        module.entry(entry, &ElementBindings::new().bind("U", crate::registry::dense(DType::F16)))
+            .expect("dense float store installation");
         let packed = crate::registry::representation("q4g64").unwrap();
-        let bindings = ElementBindings::new().bind("U", packed);
-        let error = module.entry(module.entry_named("probe").unwrap(), &bindings).unwrap_err();
-        assert!(error.diagnostics().items().iter().any(|item| item.message.contains("no defined source installation conversion")));
+        let error = module.entry(entry, &ElementBindings::new().bind("U", packed)).unwrap_err();
+        assert!(error.diagnostics().items().iter().any(|item| item.message.contains("decode-only")), "{error:?}");
     }
 
     #[test]
@@ -510,7 +582,7 @@ mod result_schema_tests {
     }
 }
 
-use super::{ir, xfer};
+use super::{dimensions, ir, xfer};
 use crate::checked::{internals::Module, SourceDiagnostic};
 use crate::entry::*;
 use crate::expr::{
@@ -520,9 +592,8 @@ use crate::expr::{
 use crate::ids::*;
 use crate::intrinsics::PrimitiveId;
 use crate::reference_math::ReferenceScalar;
-use crate::syntax::ast::{AssignOp, BinaryOp};
+use crate::syntax::ast::BinaryOp;
 use crate::types::{DType, Elem, ValueType};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub(crate) fn build_entry(
@@ -586,7 +657,6 @@ pub(crate) fn build_entry(
     let (parameters, aliases, domain_terms) = build_schema_parameters(
         &mut builder.arena,
         schema_id,
-        contract,
         root_semantic,
         &shape_values,
         &element_bindings,
@@ -860,15 +930,12 @@ fn instantiate_family(
             capture_dimensions,
         )?;
         let kind = match definition.kind {
-            ir::DefKind::Body { target: None } => CandidateKind::Portable,
-            ir::DefKind::Body {
-                target: Some(backend),
-            } => CandidateKind::Helper { backend },
+            ir::DefKind::Body => CandidateKind::Portable,
             ir::DefKind::Lower { target } => CandidateKind::Lowering { backend: target },
         };
         let numerical = if spec.definition == family.contract {
             assert!(
-                definition.kind.is_portable_body(),
+                matches!(definition.kind, ir::DefKind::Body),
                 "checked family contract is not a portable body"
             );
             assert!(
@@ -937,15 +1004,15 @@ fn applicability(
         let lower = builder.arena.int(if dimension.admits_zero { 0 } else { 1 });
         terms.push(builder.arena.int_cmp(CmpOp::Ge, shapes[ordinal], lower));
     }
-    for predicate in &definition.predicates {
+    for conjunct in &definition.predicates {
         let expression = transfer_template_int(
             &mut builder.arena,
             definition,
             shapes,
-            predicate.expression(),
+            conjunct.predicate.expression(),
         );
         let zero = builder.arena.int(0);
-        terms.push(match predicate {
+        terms.push(match conjunct.predicate {
             ir::Predicate::NonNegative(_) => builder.arena.int_cmp(CmpOp::Ge, expression, zero),
             ir::Predicate::Zero(_) => builder.arena.int_cmp(CmpOp::Eq, expression, zero),
             ir::Predicate::NonZero(_) => builder.arena.int_cmp(CmpOp::Ne, expression, zero),
@@ -953,17 +1020,6 @@ fn applicability(
     }
     let predicate = builder.arena.all(&terms);
     TargetPredicate::new(&builder.arena, predicate).ok()
-}
-
-trait PredicateExpr {
-    fn expression(&self) -> IntExpr;
-}
-impl PredicateExpr for ir::Predicate {
-    fn expression(&self) -> IntExpr {
-        match *self {
-            Self::NonNegative(e) | Self::Zero(e) | Self::NonZero(e) => e,
-        }
-    }
 }
 
 fn transfer_template_int(
@@ -1000,7 +1056,6 @@ fn source_error(
 fn build_schema_parameters(
     arena: &mut ExprArena,
     schema: SchemaId,
-    definition: &ir::Definition,
     function: &SemanticFunction,
     _shapes: &[IntExpr],
     _elements: &BTreeMap<String, RepresentationId>,
@@ -1073,46 +1128,11 @@ fn build_schema_parameters(
             value: semantic.value,
         });
     }
-    let aliases = definition
-        .aliases
-        .iter()
-        .flat_map(|(left, right)| {
-            let left = function
-                .parameters()
-                .iter()
-                .enumerate()
-                .filter_map(move |(ordinal, parameter)| {
-                    matches!(&parameter.origin, FunctionParameterOrigin::Source { ordinal: source, .. } if *source as usize == *left).then_some(ordinal)
-                })
-                .collect::<Vec<_>>();
-            let right = function
-                .parameters()
-                .iter()
-                .enumerate()
-                .filter_map(move |(ordinal, parameter)| {
-                    matches!(&parameter.origin, FunctionParameterOrigin::Source { ordinal: source, .. } if *source as usize == *right).then_some(ordinal)
-                })
-                .collect::<Vec<_>>();
-            left.into_iter()
-                .flat_map(move |left| right.clone().into_iter().map(move |right| (left, right)))
-        })
-        .map(|(left, right)| AliasRule::MayOverlap(parameters[left].id, parameters[right].id))
-        .collect();
-    // All tensor pairs not explicitly admitted to alias are disjoint whenever
-    // either side is mutable/owned. Shared/shared pairs may overlap.
-    let mut aliases: Vec<AliasRule> = aliases;
+    // Tensor pairs are disjoint whenever either side is mutable/owned.
+    // Shared/shared pairs may overlap.
+    let mut aliases = Vec::new();
     for left in 0..parameters.len() {
         for right in left + 1..parameters.len() {
-            let FunctionParameterOrigin::Source { ordinal: left_source, .. } = &function.parameters()[left].origin else { unreachable!() };
-            let FunctionParameterOrigin::Source { ordinal: right_source, .. } = &function.parameters()[right].origin else { unreachable!() };
-            let left_source = *left_source as usize;
-            let right_source = *right_source as usize;
-            if definition.aliases.iter().any(|(a, b)| {
-                (*a == left_source && *b == right_source)
-                    || (*a == right_source && *b == left_source)
-            }) {
-                continue;
-            }
             let tensor =
                 |parameter: &Parameter| matches!(parameter.kind, ParameterKind::Tensor { .. });
             let shared = |parameter: &Parameter| {
@@ -1198,11 +1218,11 @@ fn predicate_terms(
     definition
         .predicates
         .iter()
-        .map(|predicate| {
+        .map(|conjunct| {
             let expression =
-                transfer_template_int(arena, definition, shapes, predicate.expression());
+                transfer_template_int(arena, definition, shapes, conjunct.predicate.expression());
             let zero = arena.int(0);
-            match predicate {
+            match conjunct.predicate {
                 ir::Predicate::NonNegative(_) => arena.int_cmp(CmpOp::Ge, expression, zero),
                 ir::Predicate::Zero(_) => arena.int_cmp(CmpOp::Eq, expression, zero),
                 ir::Predicate::NonZero(_) => arena.int_cmp(CmpOp::Ne, expression, zero),
@@ -1354,8 +1374,14 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             .iter()
             .map(|parameter| parameter.value)
             .collect();
-        let block = self.definition.body.root.clone();
-        let results = self.lower_block(root, &block)?;
+        let definition = self.definition;
+        let body = &definition.body;
+        self.lower_block(root, &body.root)?;
+        let mut results = Vec::new();
+        for value in &body.result {
+            let value = self.lower_expr(root, value)?;
+            self.flatten_value(root, value, &mut results);
+        }
         let declared = super::result_leaves(&self.definition.result)
             .into_iter()
             .map(|(_, ty)| ty.clone())
@@ -2035,6 +2061,39 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         expression
     }
 
+    /// A1 §2.3.6 (1): the element read of a tensor yields its representation's
+    /// decoded dtype. Where the checked value is another dtype (an element
+    /// parameter reads as `f32`), one exact `Cast` to it follows, and that
+    /// cast's value is what the checked expression denotes.
+    fn element_read(
+        &mut self,
+        region: RegionId,
+        kind: NodeKind,
+        inputs: Vec<SemanticValueId>,
+        checked: SemanticType,
+        span: crate::span::Span,
+    ) -> SemanticValueId {
+        let representation = self
+            .tensor_representation(inputs[0])
+            .unwrap_or_else(|| panic!("checked element read base is not a tensor"));
+        let decoded =
+            SemanticType::Scalar(crate::registry::representation_info(representation).decoded);
+        let read = self.emit(region, kind, inputs, vec![decoded.clone()], span)[0];
+        if decoded == checked {
+            return read;
+        }
+        let SemanticType::Scalar(dtype) = checked else {
+            panic!("checked element read is not a scalar")
+        };
+        self.emit(
+            region,
+            NodeKind::Primitive(PrimitiveId::Cast(dtype)),
+            vec![read],
+            vec![checked],
+            span,
+        )[0]
+    }
+
     /// Install an already evaluated value at a source-owned destination.
     /// Generic elements have been resolved here, so the operation either has
     /// its concrete source meaning or receives a source specialization error.
@@ -2111,126 +2170,24 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         }
     }
 
-    fn promote_operand(
-        &mut self,
-        region: RegionId,
-        value: SemanticValueId,
-        dtype: DType,
-        span: crate::span::Span,
-    ) -> Result<SemanticValueId, SourceDiagnostic> {
-        let actual = self.values[value.index()].ty.clone();
-        match actual {
-            SemanticType::Scalar(from) if from == dtype => Ok(value),
-            SemanticType::Scalar(from) if from.is_float() && dtype.is_float() => Ok(self.emit(
-                region, NodeKind::Primitive(PrimitiveId::Cast(dtype)), vec![value],
-                vec![SemanticType::Scalar(dtype)], span,
-            )[0]),
-            SemanticType::Tensor(tensor) => {
-                let target = crate::registry::dense(dtype);
-                if tensor.representation == target { return Ok(value); }
-                let info = crate::registry::representation_info(tensor.representation);
-                let permitted = match info.kind {
-                    crate::registry::RepresentationKind::Dense(from) => from.is_float() && dtype.is_float(),
-                    crate::registry::RepresentationKind::Packed(_) => dtype == DType::F32
-                        && crate::registry::decode_recipe(tensor.representation, dtype).is_some(),
-                    crate::registry::RepresentationKind::External(_) => false,
-                };
-                if permitted {
-                    Ok(self.emit(region, NodeKind::Elementwise(PrimitiveId::Cast(dtype)), vec![value],
-                        vec![SemanticType::Tensor(TensorSemantics {
-                            representation: target, axes: tensor.axes, storage: TensorStorage::Computed,
-                        })], span)[0])
-                } else {
-                    Err(source_error(self.module, self.definition.file, span,
-                        "this element binding has no defined arithmetic operand conversion"))
-                }
-            }
-            _ => Err(source_error(self.module, self.definition.file, span,
-                "this source arithmetic has no compatible operand conversion")),
-        }
-    }
-
-    fn compound_value(
-        &mut self,
-        region: RegionId,
-        old: SemanticValueId,
-        rhs: SemanticValueId,
-        op: AssignOp,
-        span: crate::span::Span,
-    ) -> Result<SemanticValueId, SourceDiagnostic> {
-        let binary = match op {
-            AssignOp::Add => BinaryOp::Add,
-            AssignOp::Sub => BinaryOp::Sub,
-            AssignOp::Mul => BinaryOp::Mul,
-            AssignOp::Assign => unreachable!(),
-        };
-        let target = self.values[old.index()].ty.clone();
-        let rhs_ty = self.values[rhs.index()].ty.clone();
-        if let (SemanticType::Scalar(dtype @ (DType::I32 | DType::U32)),
-            SemanticType::Integer | SemanticType::Index { .. }) = (&target, &rhs_ty) {
-            let projected = self.emit(region, NodeKind::Primitive(PrimitiveId::Cast(*dtype)),
-                vec![rhs], vec![SemanticType::Scalar(*dtype)], span)[0];
-            return Ok(self.emit(region, NodeKind::Primitive(PrimitiveId::Binary(binary)),
-                vec![old, projected], vec![target], span)[0]);
-        }
-        let dtype = |ty: &SemanticType| match ty {
-            SemanticType::Scalar(dtype) => Some(*dtype),
-            SemanticType::Tensor(tensor) => Some(crate::registry::representation_info(tensor.representation).decoded),
-            _ => None,
-        };
-        let (Some(left), Some(right)) = (dtype(&target), dtype(&rhs_ty)) else {
-            return Err(source_error(self.module, self.definition.file, span,
-                "this source compound arithmetic has no compatible operands"));
-        };
-        let working = DType::promote(left, right).ok_or_else(|| source_error(
-            self.module, self.definition.file, span,
-            "this element binding has no defined compound arithmetic promotion",
-        ))?;
-        let left = self.promote_operand(region, old, working, span)?;
-        let right = self.promote_operand(region, rhs, working, span)?;
-        let result_type = match &target {
-            SemanticType::Scalar(_) => SemanticType::Scalar(working),
-            SemanticType::Tensor(tensor) => SemanticType::Tensor(TensorSemantics {
-                representation: crate::registry::dense(working),
-                axes: tensor.axes.clone(), storage: TensorStorage::Computed,
-            }),
-            _ => unreachable!("numeric compound destination has no scalar or tensor type"),
-        };
-        let result = self.emit(region,
-            self.primitive_kind(&PrimitiveId::Binary(binary), &result_type),
-            vec![left, right], vec![result_type], span)[0];
-        self.install_value(region, result, &target, span)
-    }
-
     fn lower_block(
         &mut self,
         region: RegionId,
         block: &ir::Block,
-    ) -> Result<Vec<SemanticValueId>, SourceDiagnostic> {
+    ) -> Result<(), SourceDiagnostic> {
         for statement in &block.statements {
             self.lower_stmt(region, statement)?;
         }
-        Ok(match &block.terminator {
-            ir::Terminator::Continue => Vec::new(),
-            ir::Terminator::Return(values) => {
-                let mut out = Vec::new();
-                for value in values {
-                    let value = self.lower_expr(region, value)?;
-                    self.flatten_value(region, value, value, &mut out, block)?;
-                }
-                out
-            }
-        })
+        Ok(())
     }
 
+    /// The result leaves of one evaluated result value, in canonical order.
     fn flatten_value(
         &mut self,
         region: RegionId,
         value: SemanticValueId,
-        _root: SemanticValueId,
         output: &mut Vec<SemanticValueId>,
-        block: &ir::Block,
-    ) -> Result<(), SourceDiagnostic> {
+    ) {
         let ty = self.values[value.index()].ty.clone();
         match ty {
             SemanticType::Tuple(items) => {
@@ -2245,13 +2202,12 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                         vec![item],
                         self.values[value.index()].span,
                     )[0];
-                    self.flatten_value(region, projected, projected, output, block)?;
+                    self.flatten_value(region, projected, output);
                 }
             }
             SemanticType::Void => {}
             _ => output.push(value),
         }
-        Ok(())
     }
 
     fn lower_stmt(
@@ -2267,7 +2223,6 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             }
             ir::Stmt::Assign {
                 place,
-                op,
                 value,
                 value_symbols,
                 authorities,
@@ -2301,7 +2256,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 }
                 let span = value.span;
                 let value = self.lower_expr(region, value)?;
-                self.assign(region, place, *op, value, authorities, span)?;
+                self.assign(region, place, value, authorities, span)?;
                 for (local, symbol) in value_symbols {
                     let value = self.local(*local);
                     let actual = self.runtime_int(value);
@@ -2326,6 +2281,8 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 body,
                 value_symbols,
                 initialization,
+                // Loop independence is not yet part of the entry graph.
+                separation: _,
             } => self.lower_loop(region, *kind, *binder, start, end, body, value_symbols, initialization)?,
         }
         Ok(())
@@ -2473,25 +2430,18 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         &mut self,
         region: RegionId,
         place: &ir::Place,
-        op: AssignOp,
         value: SemanticValueId,
         authorities: &[ir::ExclusiveWriteCapability],
         span: crate::span::Span,
     ) -> Result<(), SourceDiagnostic> {
         match place {
             ir::Place::Local(local) => {
-                let value = if op == AssignOp::Assign {
-                    let target = self.local_place(region, local, span);
-                    let expected = self.values[target.index()].ty.clone();
-                    self.install_value(region, value, &expected, span)?
-                } else {
-                    let old = self.local_place(region, local, span);
-                    self.compound_value(region, old, value, op, span)?
-                };
+                let target = self.local_place(region, local, span);
+                let expected = self.values[target.index()].ty.clone();
+                let value = self.install_value(region, value, &expected, span)?;
                 self.replace_local_place(region, local, value, span);
             }
             ir::Place::Tuple(places) => {
-                assert_eq!(op, AssignOp::Assign, "checked tuple assignment only uses `=`");
                 let target = self.assignment_place_type(place);
                 // Convert the complete RHS before installing any tuple leaf.
                 let value = self.install_value(region, value, &target, span)?;
@@ -2514,7 +2464,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                         vec![ty],
                         span,
                     )[0];
-                    self.assign(region, place, op, component, authorities, span)?;
+                    self.assign(region, place, component, authorities, span)?;
                 }
             }
             ir::Place::Element { root, indices } => {
@@ -2581,6 +2531,8 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                             check_start,
                             check_order,
                             check_end,
+                            // L24 width checks are not emitted yet.
+                            check_width: _,
                         } => {
                             let start_value = match start {
                                 Some(start) => Some(self.lower_expr(region, start)?),
@@ -2617,44 +2569,24 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                                 }
                             });
                         }
+                        ir::Index::Full => slice_axes.push(SliceAxis::Full),
                     }
                 }
-                let stored_value = if op == AssignOp::Assign {
-                    let SemanticType::Tensor(base_tensor) = &self.values[base.index()].ty else {
-                        panic!("checked element place has a non-tensor root")
-                    };
-                    let expected = match &self.values[value.index()].ty {
-                        SemanticType::Tensor(tensor) => SemanticType::Tensor(TensorSemantics {
-                            representation: base_tensor.representation,
-                            axes: tensor.axes.clone(),
-                            storage: TensorStorage::Computed,
-                        }),
-                        SemanticType::Scalar(_) => SemanticType::Scalar(
-                            crate::registry::representation_info(base_tensor.representation).decoded,
-                        ),
-                        _ => panic!("checked tensor store value is not numerical"),
-                    };
-                    self.install_value(region, value, &expected, span)?
-                } else {
-                    let representation = match &self.values[base.index()].ty {
-                        SemanticType::Tensor(tensor) => tensor.representation,
-                        _ => panic!("checked element place has a non-tensor root"),
-                    };
-                    let dtype = crate::registry::representation_info(representation).decoded;
-                    let whole_tensor = indices.is_empty();
-                    let old = if whole_tensor {
-                        base
-                    } else {
-                        self.emit(
-                            region,
-                            NodeKind::ElementRead,
-                            inputs.clone(),
-                            vec![SemanticType::Scalar(dtype)],
-                            span,
-                        )[0]
-                    };
-                    self.compound_value(region, old, value, op, span)?
+                let SemanticType::Tensor(base_tensor) = &self.values[base.index()].ty else {
+                    panic!("checked element place has a non-tensor root")
                 };
+                let expected = match &self.values[value.index()].ty {
+                    SemanticType::Tensor(tensor) => SemanticType::Tensor(TensorSemantics {
+                        representation: base_tensor.representation,
+                        axes: tensor.axes.clone(),
+                        storage: TensorStorage::Computed,
+                    }),
+                    SemanticType::Scalar(_) => SemanticType::Scalar(
+                        crate::registry::representation_info(base_tensor.representation).decoded,
+                    ),
+                    _ => panic!("checked tensor store value is not numerical"),
+                };
+                let stored_value = self.install_value(region, value, &expected, span)?;
                 let tensor_store = matches!(
                     self.values[stored_value.index()].ty,
                     SemanticType::Tensor(_)
@@ -2981,7 +2913,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         region: RegionId,
         expression: &ir::Expr,
     ) -> Result<SemanticValueId, SourceDiagnostic> {
-        match &expression.kind {
+        let value = match &expression.kind {
             ir::ExprKind::Local(local) => Ok(self.local(*local)),
             ir::ExprKind::Literal(literal) => {
                 let ty = self.semantic_type(&expression.ty);
@@ -3022,7 +2954,8 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                     expression.span,
                 )[0])
             }
-            ir::ExprKind::Primitive { id, operands } => {
+            // The failure proof is not yet carried by semantic nodes.
+            ir::ExprKind::Primitive { id, operands, failure: _ } => {
                 self.lower_primitive(region, id, operands, expression)
             }
             ir::ExprKind::Atomic {
@@ -3032,9 +2965,6 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 value,
                 authority,
             } => {
-                let ir::ExprKind::Local(binding) = &place.kind else {
-                    panic!("checked atomic authority is not bound to a local place")
-                };
                 let ir::Place::Element {
                     root: expected_root,
                     indices: expected_indices,
@@ -3042,17 +2972,11 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 else {
                     panic!("checked atomic authority is not bound to an element region")
                 };
-                let expected_points = expected_indices
-                    .iter()
-                    .map(|index| match index {
-                        ir::Index::Point { value, .. } => value,
-                        ir::Index::Range { .. } => {
-                            panic!("checked atomic authority contains a range region")
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                assert!(expected_points.into_iter().eq(indices.iter()));
-                let actual = self.local(*binding);
+                assert_eq!(
+                    expected_indices, indices,
+                    "checked atomic authority names a different element"
+                );
+                let actual = self.local_place(region, place, expression.span);
                 let expected = self.local_place(region, expected_root, expression.span);
                 if self.region_storage_origin(region, actual, &mut BTreeSet::new())
                     != self.region_storage_origin(region, expected, &mut BTreeSet::new())
@@ -3125,10 +3049,16 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 };
                 let mut inputs = vec![actual];
                 let mut semantic_indices = Vec::with_capacity(indices.len());
-                for index in indices {
-                    let index = self.lower_expr(region, index)?;
-                    semantic_indices.push(index);
-                    inputs.push(index);
+                for (axis, index) in indices.iter().enumerate() {
+                    let ir::Index::Point { value: point, runtime_check } = index else {
+                        panic!("checked atomic place selects a range")
+                    };
+                    let point = self.lower_expr(region, point)?;
+                    if *runtime_check {
+                        self.emit_point_check(region, actual, axis, point, expression.span);
+                    }
+                    semantic_indices.push(point);
+                    inputs.push(point);
                 }
                 let capability = AtomicCapability::checked(
                     actual,
@@ -3149,8 +3079,13 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                     expression.span,
                 )[0])
             }
-            ir::ExprKind::Intrinsic { id, args } => {
-                let signature = crate::registry::intrinsic_signature(*id);
+            ir::ExprKind::Intrinsic { overload, args } => {
+                let mut inputs = Vec::new();
+                for argument in args {
+                    inputs.push(self.lower_expr(region, argument)?);
+                }
+                let id = self.resolve_intrinsic(overload, &inputs);
+                let signature = crate::registry::intrinsic_signature(id);
                 match signature.execution {
                     crate::registry::IntrinsicExecution::WithinEnclosingParallel
                         if self.parallel_depth == 0 =>
@@ -3181,21 +3116,96 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                     crate::registry::IntrinsicExecution::WithinEnclosingParallel
                     | crate::registry::IntrinsicExecution::WholeTensor { .. } => {}
                 }
-                let mut inputs = Vec::new();
-                for argument in args {
-                    inputs.push(self.lower_expr(region, argument)?);
-                }
                 let ty = self.semantic_type(&expression.ty);
                 Ok(self.emit(
                     region,
-                    NodeKind::Intrinsic(*id),
+                    NodeKind::Intrinsic(id),
                     inputs,
                     vec![ty],
                     expression.span,
                 )[0])
             }
             ir::ExprKind::Call { call, args } => self.lower_call(region, call, args, expression),
+            ir::ExprKind::IndexPosition(word) => {
+                let word = self.lower_expr(region, word)?;
+                let exact = self.runtime_int(word);
+                Ok(self.loop_index(region, word, exact, expression.span))
+            }
+        }?;
+        // L31: a checker-minted word symbol stands for this node's reached
+        // value.
+        if let Some(sym) = expression.sym {
+            if let NodeView::Symbol(symbol) = self.definition.arena.view(sym.into()) {
+                if matches!(
+                    self.definition.arena.symbol_kind(symbol),
+                    crate::expr::SymbolKind::ProofVariable(_)
+                ) && !self.symbols.contains_key(&symbol)
+                {
+                    let runtime = self.runtime_int(value);
+                    self.symbols.insert(symbol, runtime);
+                }
+            }
         }
+        Ok(value)
+    }
+
+    /// The one row of a checked intrinsic overload whose operand categories
+    /// admit the specialized operands.
+    fn resolve_intrinsic(
+        &self,
+        overload: &ir::IntrinsicOverload,
+        inputs: &[SemanticValueId],
+    ) -> IntrinsicId {
+        use crate::registry::OperandCategory;
+        let admits = |category: &OperandCategory, ty: &SemanticType| match (category, ty) {
+            (
+                OperandCategory::Scalar(expected) | OperandCategory::Constant(expected),
+                SemanticType::Scalar(actual),
+            ) => expected == actual,
+            (
+                OperandCategory::Readable {
+                    representation,
+                    rank,
+                }
+                | OperandCategory::Writable {
+                    representation,
+                    rank,
+                },
+                SemanticType::Tensor(tensor),
+            ) => {
+                tensor.representation == *representation
+                    && u32::try_from(tensor.axes.len()).ok() == Some(*rank)
+            }
+            (
+                OperandCategory::Opaque { capability, name },
+                SemanticType::Opaque {
+                    capability: actual,
+                    name: actual_name,
+                },
+            ) => capability == actual && name == actual_name,
+            _ => false,
+        };
+        let mut rows = overload.rows.iter().copied().filter(|row| {
+            let signature = crate::registry::intrinsic_signature(*row);
+            signature.arguments.len() == inputs.len()
+                && signature
+                    .arguments
+                    .iter()
+                    .zip(inputs)
+                    .all(|(argument, input)| admits(&argument.category, &self.values[input.index()].ty))
+        });
+        let row = rows.next().unwrap_or_else(|| {
+            panic!(
+                "no row of checked intrinsic `{}` admits its specialized operands",
+                overload.name
+            )
+        });
+        assert!(
+            rows.next().is_none(),
+            "more than one row of checked intrinsic `{}` admits its specialized operands",
+            overload.name
+        );
+        row
     }
 
     fn lower_primitive(
@@ -3595,7 +3605,11 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         } else {
             inputs
         };
-        let value = self.emit(region, kind, node_inputs, vec![ty], expression.span)[0];
+        let value = if matches!(primitive, PrimitiveId::ElementRead { .. }) {
+            self.element_read(region, kind, node_inputs, ty, expression.span)
+        } else {
+            self.emit(region, kind, node_inputs, vec![ty], expression.span)[0]
+        };
         if matches!(primitive, PrimitiveId::RangeStart | PrimitiveId::RangeEnd | PrimitiveId::ElementRead { .. }) {
             // A checked integer projection denotes this one reached value.
             // Bounds and guards are proof facts; neither the tensor read nor
@@ -3618,83 +3632,100 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         args: &[ir::Expr],
         expression: &ir::Expr,
     ) -> Result<SemanticValueId, SourceDiagnostic> {
-        // Explicit shape bindings precede ordinary arguments in source order.
-        // A scalar binding's exact quantity is projected from the one value
-        // just evaluated; its authored arithmetic is never replayed.
-        let mut explicit_shapes = Vec::with_capacity(call.explicit_shapes.len());
-        for (_, binding) in &call.explicit_shapes {
-            let value = self.lower_expr(region, binding)?;
+        // Seeds precede ordinary arguments in source order. A seed's exact
+        // quantity is projected from the one value just evaluated; its
+        // authored arithmetic is never replayed.
+        let mut seeds = HashMap::with_capacity(call.seeds.len());
+        for (dimension, seed) in &call.seeds {
+            let value = self.lower_expr(region, seed)?;
             let value = if matches!(self.values[value.index()].ty, SemanticType::Integer) {
                 value
             } else {
                 let exact = self.runtime_int(value);
                 self.emit(region, NodeKind::Primitive(PrimitiveId::Symbolic(exact)),
-                    Vec::new(), vec![SemanticType::Integer], binding.span)[0]
+                    Vec::new(), vec![SemanticType::Integer], seed.span)[0]
             };
-            explicit_shapes.push(value);
+            seeds.insert(*dimension, value);
         }
         let mut evaluated = Vec::with_capacity(args.len());
         for argument in args {
             evaluated.push(self.lower_expr(region, argument)?);
         }
-        let contract = self.module.families[call.family.index()].contract;
-        let checked_reference = call.candidates.iter()
-            .find(|candidate| candidate.definition == contract)
-            .expect("checked call has no portable reference binding");
-        let order = &checked_reference.arg_order;
-        let definition = &self.module.definitions[contract.index()];
-        let mut captured_shapes = vec![None; definition.dimensions.len()];
-        for (ordinal, plan) in &checked_reference.shape_plan {
-            let ordinal = *ordinal as usize;
-            let value = match plan {
-                ir::ShapeBindingPlan::Explicit { binding } => explicit_shapes[*binding],
-                ir::ShapeBindingPlan::Inferred { observation, formal_axis, coefficient, prior_dimensions } => {
-                    let ir::ShapeObservation::TensorAxis { argument, path, axis, .. } = observation;
-                    let mut tensor = evaluated[*argument];
-                    let span = args[*argument].span;
-                    for &index in path {
-                        let SemanticType::Tuple(parts) = &self.values[tensor.index()].ty else {
-                            panic!("checked shape observation lost its tuple path")
+        let order = &call.arg_order;
+        let source_family = &self.module.families[call.family.index()];
+        let contract = &self.module.definitions[source_family.contract.index()];
+        // L16: replay the family's dimension plan from the evaluated
+        // arguments. The checker proved every exact division.
+        let mut captured_shapes: Vec<Option<SemanticValueId>> = vec![None; contract.dimensions.len()];
+        for (dimension, value) in &seeds {
+            captured_shapes[*dimension as usize] = Some(*value);
+        }
+        for step in source_family.dimension_plan.steps() {
+            let ordinal = step.dimension as usize;
+            if captured_shapes[ordinal].is_some() {
+                continue;
+            }
+            let span = args[order[step.observation.parameter as usize]].span;
+            let observed_value = self.observe_axis(region, &evaluated, order, &step.observation, span);
+            if step.operations.is_empty() {
+                captured_shapes[ordinal] = Some(observed_value);
+                continue;
+            }
+            let mut value = self.runtime_int(observed_value);
+            for operation in &step.operations {
+                let (dimensions::InverseOp::Add(known)
+                | dimensions::InverseOp::Subtract(known)
+                | dimensions::InverseOp::ReverseSubtract(known)
+                | dimensions::InverseOp::DivideExact(known)) = operation;
+                let known = match known {
+                    dimensions::Known::Observation(axis) => {
+                        let observed = self.observe_axis(region, &evaluated, order, axis, span);
+                        self.runtime_int(observed)
+                    }
+                    dimensions::Known::Dimension(dimension) => {
+                        let solved = captured_shapes[*dimension as usize]
+                            .expect("dimension plan uses a dimension before its step");
+                        self.runtime_int(solved)
+                    }
+                    dimensions::Known::Constant(constant) => self.builder.arena.int(*constant),
+                    dimensions::Known::Expression(expression) => {
+                        let mut known = HashMap::new();
+                        for (dimension, solved) in contract.dimensions.iter().zip(&captured_shapes) {
+                            if let Some(solved) = solved {
+                                known.insert(dimension.symbol, self.runtime_int(*solved));
+                            }
+                        }
+                        let mut map = |symbol: SymbolId, _: &mut ExprArena| {
+                            AnyExpr::Int(*known.get(&symbol).expect(
+                                "dimension plan expression uses a dimension before its step",
+                            ))
                         };
-                        let ty = parts[index as usize].clone();
-                        tensor = self.emit(region, NodeKind::TupleGet { index }, vec![tensor], vec![ty], span)[0];
+                        xfer::transfer_int(&contract.arena, *expression, &mut self.builder.arena, &mut map)
                     }
-                    let observed_value = self.emit(region, NodeKind::Extent { axis: *axis }, vec![tensor],
-                        vec![SemanticType::Integer], span)[0];
-                    let observed = self.runtime_int(observed_value);
-                    let mut known = HashMap::new();
-                    for &index in prior_dimensions {
-                        let dimension = &definition.dimensions[index as usize];
-                        let value = captured_shapes[index as usize]
-                            .expect("checked shape inverse dependency was not captured first");
-                        known.insert(dimension.symbol, self.runtime_int(value));
-                    }
-                    let unknown = definition.dimensions[ordinal].symbol;
-                    let zero = self.builder.arena.int(0);
-                    let mut map = |symbol: SymbolId, _: &mut ExprArena| {
-                        AnyExpr::Int(if symbol == unknown { zero } else {
-                            *known.get(&symbol).expect("checked shape inverse depends on uncaptured dimension")
-                        })
-                    };
-                    let offset = xfer::transfer_int(&definition.arena, *formal_axis,
-                        &mut self.builder.arena, &mut map);
-                    if *coefficient == 1 && matches!(self.builder.arena.view(offset.into()), NodeView::IntConst(0)) {
-                        captured_shapes[ordinal] = Some(observed_value);
-                        continue;
-                    }
-                    let difference = self.builder.arena.int_sub(observed, offset);
-                    let inverse = if *coefficient == 1 { difference } else {
-                        let divisor = self.builder.arena.int(*coefficient);
-                        self.builder.arena.int_div(difference, divisor)
-                    };
-                    self.emit(region, NodeKind::Primitive(PrimitiveId::Symbolic(inverse)),
-                        Vec::new(), vec![SemanticType::Integer], span)[0]
-                }
-            };
-            captured_shapes[ordinal] = Some(value);
+                };
+                value = match operation {
+                    dimensions::InverseOp::Add(_) => self.builder.arena.int_add(value, known),
+                    dimensions::InverseOp::Subtract(_) => self.builder.arena.int_sub(value, known),
+                    dimensions::InverseOp::ReverseSubtract(_) => self.builder.arena.int_sub(known, value),
+                    dimensions::InverseOp::DivideExact(_) => self.builder.arena.int_div(value, known),
+                };
+            }
+            captured_shapes[ordinal] = Some(self.emit(
+                region,
+                NodeKind::Primitive(PrimitiveId::Symbolic(value)),
+                Vec::new(),
+                vec![SemanticType::Integer],
+                span,
+            )[0]);
         }
         let captured_shapes = captured_shapes.into_iter()
-            .map(|value| value.expect("checked call omitted a dimension binding"))
+            .map(|value| value.expect("the family dimension plan solves every dimension"))
+            .collect::<Vec<_>>();
+        // Every member shares the family's dimension ordinals.
+        let shape_args = call
+            .dimensions
+            .iter()
+            .map(|shape| self.transfer_int(*shape))
             .collect::<Vec<_>>();
         let mut specs = Vec::new();
         for candidate in &call.candidates {
@@ -3708,24 +3739,17 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             {
                 continue;
             }
-            let shape_args = candidate
-                .shape_args
-                .iter()
-                .map(|shape| self.transfer_int(*shape))
-                .collect();
             let mut elements = self.elements.clone();
             for (name, elem) in &candidate.elem_args {
                 elements.insert(name.clone(), self.resolve_elem(elem));
             }
             specs.push(CandidateSpec {
                 definition: candidate.definition,
-                shape_args,
+                shape_args: shape_args.clone(),
                 elements,
-                call_site_proved: candidate.applicability_proven,
+                // The checker proved the contract's precondition at this call.
+                call_site_proved: candidate.definition == source_family.contract,
             });
-            // Every candidate in a checked family has the same canonical
-            // parameter order. The first candidate supplies the call's
-            // argument permutation below.
         }
         let family = instantiate_family(self.builder, self.module, call.family.index(), specs, true)?;
         let reference = self.builder.families[family.index()]
@@ -3778,6 +3802,32 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             "checked call result reconstruction left an unbound contract leaf"
         );
         Ok(value)
+    }
+
+    /// The extent of one observed axis of an evaluated call argument.
+    fn observe_axis(
+        &mut self,
+        region: RegionId,
+        evaluated: &[SemanticValueId],
+        order: &[usize],
+        observation: &dimensions::ObservedAxis,
+        span: crate::span::Span,
+    ) -> SemanticValueId {
+        let mut tensor = evaluated[order[observation.parameter as usize]];
+        for &index in &observation.path {
+            let SemanticType::Tuple(parts) = &self.values[tensor.index()].ty else {
+                panic!("checked axis observation lost its tuple path")
+            };
+            let ty = parts[index as usize].clone();
+            tensor = self.emit(region, NodeKind::TupleGet { index }, vec![tensor], vec![ty], span)[0];
+        }
+        self.emit(
+            region,
+            NodeKind::Extent { axis: observation.axis },
+            vec![tensor],
+            vec![SemanticType::Integer],
+            span,
+        )[0]
     }
 
     fn flatten_call_argument(
@@ -3963,11 +4013,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         }
         self.formals = then_formals;
         self.locals = then_locals;
-        let then_result = self.lower_block(then_region, then_body)?;
-        assert!(
-            then_result.is_empty(),
-            "checked branch contains an early return"
-        );
+        self.lower_block(then_region, then_body)?;
         let then_after = self.locals.clone();
 
         self.symbols = parent_symbols.clone();
@@ -3979,11 +4025,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         }
         self.formals = else_formals;
         self.locals = else_locals;
-        let else_result = self.lower_block(else_region, else_body)?;
-        assert!(
-            else_result.is_empty(),
-            "checked branch contains an early return"
-        );
+        self.lower_block(else_region, else_body)?;
         let else_after = self.locals.clone();
         self.symbols = parent_symbols;
         self.formals = parent_formals;
@@ -4246,7 +4288,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 .insert(binder, participant)
                 .is_none());
         }
-        let returned = self.lower_block(body_region, body);
+        let lowered = self.lower_block(body_region, body);
         if parallel {
             let popped = self
                 .parallel_participants
@@ -4259,12 +4301,8 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             );
             self.parallel_depth -= 1;
         }
-        let returned = returned?;
+        lowered?;
         self.symbols = parent_symbols;
-        assert!(
-            returned.is_empty(),
-            "checked loop body contains an early return"
-        );
         let after = self.locals.clone();
         self.formals = parent_formals;
         let mut carries = Vec::new();

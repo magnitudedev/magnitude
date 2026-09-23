@@ -1,7 +1,7 @@
 //! Ownership of the existing checked value product. Expression projections
 //! refer back to local places; only local products hold mutable move state.
 use super::{ir, Checker, LocalKind, ValueClass};
-use crate::intrinsics::PrimitiveId;
+use crate::intrinsics::{PrimitiveFailure, PrimitiveId};
 use crate::types::ValueType;
 use std::collections::BTreeSet;
 
@@ -101,6 +101,7 @@ impl Checker<'_> {
             ir::ExprKind::Primitive {
                 id: PrimitiveId::TupleGet(index),
                 operands,
+                ..
             } => {
                 let mut place = self.value_place(&operands[0])?;
                 place.path.push(*index as usize);
@@ -120,14 +121,17 @@ impl Checker<'_> {
             ir::ExprKind::Primitive {
                 id: PrimitiveId::TuplePack,
                 operands,
+                ..
             } => ValueOwnership::Tuple(operands.iter().map(|v| self.ownership(v)).collect()),
             ir::ExprKind::Primitive {
                 id: PrimitiveId::TupleGet(index),
                 operands,
+                ..
             } => self.ownership(&operands[0]).at(&[*index as usize]).clone(),
             ir::ExprKind::Primitive {
                 id: PrimitiveId::SliceView { .. } | PrimitiveId::Transpose | PrimitiveId::Reshape,
                 operands,
+                ..
             } => match self.borrow_owner(&operands[0]) {
                 Some(owner) => ValueOwnership::Tensor(TensorOwnership::Borrowed {
                     owner,
@@ -398,6 +402,7 @@ impl Checker<'_> {
         if let ir::ExprKind::Primitive {
             id: PrimitiveId::TuplePack,
             operands,
+            ..
         } = &value.kind
         {
             let mut parts = Vec::new();
@@ -430,6 +435,7 @@ pub(crate) fn project(value: &ir::Expr, index: usize) -> ir::Expr {
     if let ir::ExprKind::Primitive {
         id: PrimitiveId::TuplePack,
         operands,
+        ..
     } = &value.kind
     {
         return operands[index].clone();
@@ -438,6 +444,8 @@ pub(crate) fn project(value: &ir::Expr, index: usize) -> ir::Expr {
         ir::ExprKind::Primitive {
             id: PrimitiveId::TupleGet(index as u32),
             operands: vec![value.clone()],
+            // A tuple projection has no scalar recipe, so no failure output.
+            failure: PrimitiveFailure::ProvedAbsent,
         },
         parts.as_slice()[index].clone(),
         None,
@@ -562,6 +570,7 @@ impl Checker<'_> {
             } else if let ir::ExprKind::Primitive {
                 id: PrimitiveId::TuplePack,
                 operands,
+                ..
             } = &value.kind
             {
                 for operand in operands {

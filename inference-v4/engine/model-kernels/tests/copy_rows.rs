@@ -73,7 +73,7 @@ fn portable_copy_moves_only_the_indexed_dense_rows() {
     let dst = interpreter.add_tensor(TensorData::dense(DType::U32, vec![4, 2, 3], vec![99.0; 24]));
     let from = interpreter.add_tensor(TensorData::dense(DType::I32, vec![2], vec![3.0, 1.0]));
     let to = interpreter.add_tensor(TensorData::dense(DType::I32, vec![2], vec![0.0, 2.0]));
-    interpreter
+    let outcome = interpreter
         .run(&[
             Arg::Tensor(src),
             Arg::Tensor(dst),
@@ -81,9 +81,11 @@ fn portable_copy_moves_only_the_indexed_dense_rows() {
             Arg::Tensor(to),
         ])
         .unwrap();
-    let TensorData::Dense { data, .. } = &interpreter.tensors[dst] else {
-        panic!()
-    };
+    let dst_input = outcome.inputs().nth(1).unwrap();
+    let dst = dst_input.tensor();
+    let data = (0..dst.element_count())
+        .map(|index| dst.read(index).unwrap())
+        .collect::<Vec<_>>();
     assert_eq!(&data[0..6], &[18.0, 19.0, 20.0, 21.0, 22.0, 23.0]);
     assert_eq!(&data[6..12], &[99.0; 6]);
     assert_eq!(&data[12..18], &[6.0, 7.0, 8.0, 9.0, 10.0, 11.0]);
@@ -96,7 +98,11 @@ fn generated_surface_exposes_native_and_planned_dense_plane_bindings() {
         device: &seismic::Device,
         elements: copy_rows::Elements,
     ) -> Result<seismic::Kernel<copy_rows::Entry>, seismic::LoadError> {
-        copy_rows::for_device_with(device, seismic::PrecisionPolicy::Exact, elements)
+        copy_rows::for_device_with(
+            device,
+            seismic::PreparationOptions::analytical(seismic::PrecisionPolicy::Exact),
+            elements,
+        )
     }
     fn native(
         device: &seismic::Device,

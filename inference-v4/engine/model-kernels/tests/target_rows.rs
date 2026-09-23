@@ -273,7 +273,9 @@ fn checked_portable_partition_executes_every_new_entry_in_the_interpreter() {
     use seismic_lang::{
         checked::{check_source, SourceFile},
         entry::ElementBindings,
-        interp::{Arg, Interpreter, OracleOutcome, TensorData},
+        failure::SourceTermination,
+        interp::{Arg, Interpreter, TensorData},
+        reference_math::ReferenceScalar,
         registry,
         types::DType,
     };
@@ -297,8 +299,7 @@ fn checked_portable_partition_executes_every_new_entry_in_the_interpreter() {
     let weight = (0..V * D)
         .map(|index| index as f32 * 0.03 - 0.2)
         .collect::<Vec<_>>();
-    let mut blocked = Vec::new();
-    let mut run = |name: &str,
+    let run = |name: &str,
                    bindings: Vec<(&str, _)>,
                    tensors: Vec<(DType, Vec<usize>, Vec<f64>)>,
                    scalars: Vec<f32>| {
@@ -320,16 +321,22 @@ fn checked_portable_partition_executes_every_new_entry_in_the_interpreter() {
         args.extend(
             scalars
                 .into_iter()
-                .map(|value| Arg::Scalar(DType::F32, f64::from(value))),
+                .map(|value| Arg::Scalar(ReferenceScalar::F32(value.to_bits()))),
         );
-        let outcome =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| interpreter.run(&args)));
-        match outcome {
-            Ok(Ok(OracleOutcome::Deterministic(values))) => assert!(!values.is_empty()),
-            Ok(Ok(OracleOutcome::Allowed { .. })) => panic!("{name} must be deterministic"),
-            Ok(Err(error)) if error.contains("Unbound") => blocked.push(name.to_owned()),
-            Ok(Err(error)) => panic!("{name} interpreter error: {error}"),
-            Err(_) => blocked.push(name.to_owned()),
+        let outcome = interpreter
+            .run(&args)
+            .unwrap_or_else(|error| panic!("{name} interpreter error: {error}"));
+        // Deterministic: no reassociation is allowed. An entered parallel
+        // region only describes failure prefixes, and this outcome returns.
+        assert!(
+            outcome
+                .relation()
+                .is_none_or(|relation| relation.associations().is_empty()),
+            "{name} must be deterministic"
+        );
+        match outcome.termination() {
+            SourceTermination::Returned(_) => assert!(outcome.results().len() > 0),
+            SourceTermination::Failed(failure) => panic!("{name} failed: {failure}"),
         }
     };
     let floats = |shape: Vec<usize>, values: &[f32]| {
@@ -424,17 +431,6 @@ fn checked_portable_partition_executes_every_new_entry_in_the_interpreter() {
             vec![EPSILON],
         );
     }
-    assert_eq!(
-        blocked,
-        [
-            "qwen_dense_rows",
-            "qwen_dense_rows_demanded",
-            "qwen_selected_rows",
-            "qwen_dense_rows_demanded",
-            "qwen_selected_rows",
-        ],
-        "update the pinned interpreter blocker inventory when Seismic's closed cast evaluator changes"
-    );
 }
 
 #[cfg(target_os = "macos")]

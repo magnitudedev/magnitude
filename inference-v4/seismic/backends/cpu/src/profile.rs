@@ -28,6 +28,10 @@ use std::time::Instant;
 pub const BACKEND_REVISION: &str = "seismic-cpu-v10";
 pub(crate) const SCRATCH_ALIGNMENT: u64 = 4096;
 
+/// The host address-size limit on one allocation, aligned to the scratch
+/// granule. This is the `TargetLimits` allocation limit, not RAM capacity.
+pub const MAX_ALLOCATION_BYTES: u64 = (isize::MAX as u64) & !(SCRATCH_ALIGNMENT - 1);
+
 /// The heap-backed launch-local policy. These are hard representability
 /// limits, not guessed cache or stack capacities: CPU launch locals never
 /// occupy the native thread stack.
@@ -140,7 +144,7 @@ pub(crate) fn device_for_workers(
             "the opened CPU worker pool is empty".into(),
         ));
     }
-    let address_limit = (isize::MAX as u64) & !(SCRATCH_ALIGNMENT - 1);
+    let address_limit = MAX_ALLOCATION_BYTES;
     let scratch = ScratchPolicy {
         workgroup_bytes: address_limit,
         participant_bytes: address_limit,

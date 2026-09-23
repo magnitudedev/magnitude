@@ -35,7 +35,7 @@ def element(name: str) -> Element: ...
 class DeviceInfo:
     selector: str
     name: str
-    memory_bytes: int
+    backend: str
 
 class Device:
     @property

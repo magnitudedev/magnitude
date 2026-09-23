@@ -1,13 +1,14 @@
 # Dense plane row movement used by state compaction. Packed codecs bind their
 # individual dense planes to this entry; packed logical representations are not
-# accepted by the native implementation.
+# accepted by the native implementation. Each row moves as one same-element
+# tensor store, so every plane element (integer planes included) is copied
+# bit for bit rather than decoded and re-encoded.
 fn copy_rows[N, TS, TD, KV, W](src: &tensor[TS, KV, W] A,
     dst: &mut tensor[TD, KV, W] A, from: &tensor[N] i32,
     to: &tensor[N] i32):
     for item in 0..N:
         parallel for head in 0..KV:
-            for column in 0..W:
-                dst[to[item], head, column] = src[from[item], head, column]
+            dst[to[item], head, :] = src[from[item], head, :]
 
 native copy_rows for metal from "metal/copy_rows.metal":
     threadgroups (ceil_div(N * KV * W, 256), 1, 1)

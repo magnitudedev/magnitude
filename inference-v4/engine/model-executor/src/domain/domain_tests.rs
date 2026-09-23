@@ -22,7 +22,6 @@ use magnitude_model_contracts::{
     WeightDescriptor,
 };
 use magnitude_model_state::KvCodec;
-use seismic::BackendName;
 use std::marker::PhantomData;
 use std::sync::{
     Arc, Mutex,
@@ -146,14 +145,13 @@ fn tiny_manifest(definition: &ModelDefinition) -> PackageManifest {
 }
 
 fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>> {
-    let discovery = platform::discover().ok()?;
-    let endpoint = discovery
-        .topology()
-        .endpoints
-        .iter()
-        .find(|item| item.backend == BackendName::Metal && item.is_available())?
-        .clone();
-    let device = Rc::new(discovery.open(&endpoint).unwrap());
+    let catalog = seismic::DeviceCatalog::discover().ok()?;
+    let selected = platform::select_device(&catalog, ExecutionPath::NativeMetal).ok()?;
+    let device = Rc::new(
+        catalog
+            .open(catalog.resolve(selected.info.selector).unwrap())
+            .unwrap(),
+    );
     let definition = Rc::new(tiny_definition());
     let manifest = tiny_manifest(&definition);
     let limits = ResourceLimits {
@@ -165,12 +163,12 @@ fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>
         max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
     };
     let budget = ResourceBudget {
-        storage_bytes: endpoint.facts.memory_bytes.min(512 * 1024 * 1024),
+        storage_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
         retention_bytes: 64 * 1024,
         safety_reserve_bytes: 16 * 1024 * 1024,
     };
     let draft = ExecutionPlanner::prepare(
-        &endpoint,
+        &selected,
         &manifest,
         &definition,
         ComponentSelection {

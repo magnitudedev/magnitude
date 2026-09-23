@@ -6,7 +6,7 @@
 use super::dimensions::{self, DimensionCallError};
 use super::ir::{
     Call as CheckedCall, CallContext, Candidate, Expr as CheckedExpr,
-    ExprKind as CheckedExprKind, Index as CheckedIndex, IntrinsicOverload, LocalId,
+    ExprKind as CheckedExprKind, IntrinsicOverload, LocalId,
     Ownership as ParamOwnership, Predicate,
 };
 use super::resolve::SigParam;
@@ -404,8 +404,8 @@ impl<'a> Checker<'a> {
             return None;
         };
         let bound = self.expr(bound, Some(&ValueType::Integer))?;
-        let bound = self.position_symbol(&bound)?;
-        if !self.require_nonneg(DiagnosticRule::Type, bound, span, "an index bound may be negative") {
+        let (bound_value, bound) = self.position_value(bound)?;
+        if !self.require_position_nonneg(&bound_value, bound, "an index bound may be negative") {
             return None;
         }
         let value = self.expr(value, None)?;
@@ -939,8 +939,8 @@ impl<'a> Checker<'a> {
         let mut target = self.arena.int(1);
         for dimension in dimensions {
             let d = self.expr(dimension, Some(&ValueType::Integer))?;
-            let extent = self.position_symbol(&d)?;
-            if !self.require_nonneg(DiagnosticRule::Type, extent, d.span, "reshape extent may be negative") {
+            let (d, extent) = self.position_value(d)?;
+            if !self.require_position_nonneg(&d, extent, "reshape extent may be negative") {
                 return None;
             }
             target = self.arena.int_mul(target, extent);
@@ -1520,7 +1520,7 @@ impl<'a> Checker<'a> {
                 );
                 return None;
             }
-            self.position_symbol(&value)?;
+            let (value, _) = self.position_value(value)?;
             seeds.push((parameter.clone(), value));
         }
         // Arguments are checked once, with scalar hints and write positions

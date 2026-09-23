@@ -45,7 +45,7 @@ fn accepts_partial_writes_views_and_helper_sequences() {
 
 #[test]
 fn complete_owned_carry_survives_rectangular_transpose_reshape() {
-    check("fn probe(x: &tensor[2,3] f32) -> tensor[2,3] f32:\n    let mut y = load(x)\n    for i in 0..2:\n        y = reshape(y.T, (2,3))\n        y[0,1] = 17.0\n    return y\n").unwrap();
+    check("fn probe(x: &tensor[2,3] f32) -> tensor[2,3] f32:\n    let mut y = to_owned(x)\n    for i in 0..2:\n        y = reshape(y.T, (2,3))\n        y[0,1] = 17.0\n    return y\n").unwrap();
 }
 
 #[test]
@@ -57,7 +57,7 @@ fn initialized_point_survives_rectangular_transpose_reshape_carry() {
 
 #[test]
 fn partial_owned_carry_is_not_promoted_through_transpose_reshape() {
-    let error = check("fn probe(x: &tensor[2,3] f32) -> tensor[2,3] f32:\n    let mut y = tensor[2,3] f32\n    y[0,0] = x[0,0]\n    for i in 0..2:\n        y = reshape(y.T, (2,3))\n        let missing = y[0,1]\n    return load(x)\n").unwrap_err();
+    let error = check("fn probe(x: &tensor[2,3] f32) -> tensor[2,3] f32:\n    let mut y = tensor[2,3] f32\n    y[0,0] = x[0,0]\n    for i in 0..2:\n        y = reshape(y.T, (2,3))\n        let missing = y[0,1]\n    return to_owned(x)\n").unwrap_err();
     assert!(error.contains("initialization"), "{error}");
     let error = check("fn probe(x: &tensor[2,3] f32, choose: bool) -> f32:\n    let mut y = tensor[2,3] f32\n    y[0,0] = x[0,0]\n    for i in 0..2:\n        if choose:\n            y = reshape(y.T, (2,3))\n        else:\n            y = tensor[2,3] f32\n    return y[0,0]\n").unwrap_err();
     assert!(error.contains("initializ"), "{error}");
@@ -179,8 +179,11 @@ fn negative_mutable_quantity_cannot_be_assumed_to_be_a_shape() {
 }
 
 #[test]
-fn target_collective_control_can_depend_on_participant_local_quantity() {
-    check("fn probe(flag: &tensor[32] bool, x: &tensor[32] f32, out: &mut tensor[32] f32):\n    parallel for i in 0..32:\n        out[i] = x[i]\n\nlower probe(flag: &tensor[32] bool, x: &tensor[32] f32, out: &mut tensor[32] f32)\n    for metal requires metal.subgroup:\n    parallel for i in 0..32:\n        let mut q = i - 1\n        if flag[i]:\n            q = i + 1\n        if q >= 0:\n            out[i] = metal.subgroup.simd_sum(x[i])\n        else:\n            out[i] = x[i]\n").unwrap();
+fn participant_local_quantities_join_and_divergent_cohorts_are_rejected() {
+    // L13/L14: a cohort intrinsic under participant-divergent control.
+    let error = check("fn probe(flag: &tensor[32] bool, x: &tensor[32] f32, out: &mut tensor[32] f32):\n    parallel for i in 0..32:\n        out[i] = x[i]\n\nlower probe(flag: &tensor[32] bool, x: &tensor[32] f32, out: &mut tensor[32] f32)\n    for metal requires metal.subgroup:\n    parallel for i in 0..32:\n        let mut q = i - 1\n        if flag[i]:\n            q = i + 1\n        if q >= 0:\n            out[i] = metal.subgroup.simd_sum(x[i])\n        else:\n            out[i] = x[i]\n").unwrap_err();
+    assert!(error.contains("Placement"), "{error}");
+    assert!(error.contains("differs between participants"), "{error}");
 
     check("fn probe(flag: &tensor[32] bool, x: &tensor[32] f32, out: &mut tensor[32] f32):\n    parallel for i in 0..32:\n        out[i] = x[i]\n\nlower probe(flag: &tensor[32] bool, x: &tensor[32] f32, out: &mut tensor[32] f32)\n    for metal requires metal.subgroup:\n    parallel for i in 0..32:\n        let mut selector = i - i\n        if flag[i]:\n            selector = i + 0\n        out[i] = metal.subgroup.shuffle(x[i], i32(selector))\n").unwrap();
 }
@@ -217,7 +220,7 @@ fn loop_carried_predicate_does_not_reuse_its_initial_value() {
 }
 #[test]
 fn mutable_view_reads_its_current_initialized_region() {
-    check("fn probe() -> tensor[2] f32:\n    let mut a = tensor[2] f32\n    let mut view = a[:]\n    view[0] = 1.0\n    let current = view[0]\n    view[1] = current\n    return load(view)\n").unwrap();
+    check("fn probe() -> tensor[2] f32:\n    let mut a = tensor[2] f32\n    let mut view = a[:]\n    view[0] = 1.0\n    let current = view[0]\n    view[1] = current\n    return to_owned(view)\n").unwrap();
 }
 
 #[test]

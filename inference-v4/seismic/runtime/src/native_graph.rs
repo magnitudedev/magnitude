@@ -19,7 +19,6 @@ use crate::layout;
 use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::prepared::{ArgumentValue, DeviceIdentity, TensorDescriptor};
 use seismic_lang::ids::RepresentationId;
-use seismic_lang::registry::{RepresentationKind, representation_info};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -376,77 +375,27 @@ fn describe_arguments(
 }
 
 fn apply_view_descriptor(
-    mut descriptor: TensorDescriptor,
+    descriptor: TensorDescriptor,
     operation: &ViewOperation,
 ) -> Result<TensorDescriptor, CallError> {
-    match operation {
-        ViewOperation::Reshape { extents } => {
-            let layout =
-                layout::canonical(descriptor.representation, extents).map_err(|error| {
-                    CallError::Workflow(WorkflowError::TensorView(TensorError::Execution(error)))
-                })?;
-            if layout.byte_len != descriptor.byte_len {
-                return Err(CallError::Workflow(WorkflowError::TensorView(
-                    TensorError::ReshapeStorage {
-                        current_bytes: descriptor.byte_len,
-                        requested_bytes: layout.byte_len,
-                    },
-                )));
-            }
-            descriptor.extents = extents.clone();
-            descriptor.strides = layout.strides;
-        }
-        ViewOperation::LeadingSlice { start, end } => {
-            let leading = descriptor.extents.first().copied().unwrap_or(0);
-            if start > end || *end > leading {
-                return Err(CallError::Workflow(WorkflowError::TensorView(
-                    TensorError::SliceOutOfBounds {
-                        extent: leading,
-                        start: *start,
-                        end: *end,
-                    },
-                )));
-            }
-            if descriptor.extents.len() == 1 {
-                let group = match &representation_info(descriptor.representation).kind {
-                    RepresentationKind::Packed(packet) => Some(packet.group),
-                    RepresentationKind::External(packet) => Some(packet.logical_group),
-                    RepresentationKind::Dense(_) => None,
-                };
-                if let Some(group) = group {
-                    if start % u64::from(group) != 0
-                        || (*end != leading && end % u64::from(group) != 0)
-                    {
-                        return Err(CallError::Workflow(WorkflowError::TensorView(
-                            TensorError::UnalignedPacketSlice {
-                                group,
-                                start: *start,
-                                end: *end,
-                            },
-                        )));
-                    }
-                }
-            }
-            let mut prefix = descriptor.extents.clone();
-            prefix[0] = *start;
-            let relative = layout::canonical(descriptor.representation, &prefix)
-                .map_err(|error| {
-                    CallError::Workflow(WorkflowError::TensorView(TensorError::Execution(error)))
-                })?
-                .byte_len;
-            let mut sliced = descriptor.extents.clone();
-            sliced[0] = end - start;
-            let length = layout::canonical(descriptor.representation, &sliced)
-                .map_err(|error| {
-                    CallError::Workflow(WorkflowError::TensorView(TensorError::Execution(error)))
-                })?
-                .byte_len;
-            descriptor.byte_offset += relative;
-            descriptor.byte_len = length;
-            descriptor.extents = sliced;
-        }
-    }
-    Ok(descriptor)
+    let view = layout::apply_view(
+        descriptor.representation,
+        layout::ViewGeometry {
+            extents: descriptor.extents,
+            strides: descriptor.strides,
+            byte_offset: descriptor.byte_offset,
+            byte_len: descriptor.byte_len,
+        },
+        operation,
+    )
+    .map_err(|error| CallError::Workflow(WorkflowError::TensorView(error)))?;
+    Ok(TensorDescriptor {
+        extents: view.extents,
+        strides: view.strides,
+        byte_offset: view.byte_offset,
+        byte_len: view.byte_len,
+        ..descriptor
+    })
 }
 
 fn describe_reference(

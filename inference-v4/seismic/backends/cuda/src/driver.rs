@@ -23,8 +23,18 @@ pub type Handle = *mut c_void;
 type ResultCode = c_int;
 
 macro_rules! driver {
-    ($( $field:ident: $ty:ty => $symbol:literal ),* $(,)?) => {
-        pub(crate) struct Driver { $(pub $field:$ty,)* _library: Library }
+    (
+        $( $field:ident: $ty:ty => $symbol:literal ),* $(,)?;
+        optional { $( $optional:ident: $optional_ty:ty => $optional_symbol:literal ),* $(,)? }
+    ) => {
+        /// Required symbols fail driver loading. Optional symbols belong to
+        /// newer driver API versions; their absence is reported by the one
+        /// operation that needs them.
+        pub(crate) struct Driver {
+            $(pub $field:$ty,)*
+            $(pub $optional: Option<$optional_ty>,)*
+            _library: Library,
+        }
         impl Driver {
             fn load_library() -> Result<Self, String> {
                 #[cfg(target_os = "windows")]
@@ -46,7 +56,11 @@ macro_rules! driver {
                         $(let $field: $ty = *library
                             .get(concat!($symbol, "\0").as_bytes())
                             .map_err(|e| format!("CUDA driver symbol {}: {e}", $symbol))?;)*
-                        let driver = Self { $($field,)* _library: library };
+                        $(let $optional: Option<$optional_ty> = library
+                            .get::<$optional_ty>(concat!($optional_symbol, "\0").as_bytes())
+                            .ok()
+                            .map(|symbol| *symbol);)*
+                        let driver = Self { $($field,)* $($optional,)* _library: library };
                         driver.check((driver.init)(0), "initialization").map_err(|e| e.to_string())?;
                         return Ok(driver);
                     }
@@ -64,6 +78,7 @@ driver! {
     device_name: unsafe extern "system" fn(*mut c_char, c_int, c_int) -> ResultCode => "cuDeviceGetName",
     device_attribute: unsafe extern "system" fn(*mut c_int, c_int, c_int) -> ResultCode => "cuDeviceGetAttribute",
     device_total_memory: unsafe extern "system" fn(*mut usize, c_int) -> ResultCode => "cuDeviceTotalMem_v2",
+    memory_info: unsafe extern "system" fn(*mut usize, *mut usize) -> ResultCode => "cuMemGetInfo_v2",
     driver_version: unsafe extern "system" fn(*mut c_int) -> ResultCode => "cuDriverGetVersion",
     primary_context_retain: unsafe extern "system" fn(*mut Handle, c_int) -> ResultCode => "cuDevicePrimaryCtxRetain",
     primary_context_release: unsafe extern "system" fn(c_int) -> ResultCode => "cuDevicePrimaryCtxRelease_v2",
@@ -100,7 +115,12 @@ driver! {
     occupancy_max_active_blocks: unsafe extern "system" fn(*mut c_int, Handle, c_int, usize) -> ResultCode => "cuOccupancyMaxActiveBlocksPerMultiprocessor",
     launch: unsafe extern "system" fn(Handle, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, Handle, *mut *mut c_void, *mut *mut c_void) -> ResultCode => "cuLaunchKernel",
     launch_cooperative: unsafe extern "system" fn(Handle, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, Handle, *mut *mut c_void, *mut *mut c_void) -> ResultCode => "cuLaunchCooperativeKernel",
-    error_string: unsafe extern "system" fn(ResultCode, *mut *const c_char) -> ResultCode => "cuGetErrorString",
+    error_string: unsafe extern "system" fn(ResultCode, *mut *const c_char) -> ResultCode => "cuGetErrorString";
+    optional {
+        // Driver API 11.4+: identifies the exposed device, including a MIG
+        // partition, rather than its parent GPU.
+        device_uuid_v2: unsafe extern "system" fn(*mut [u8; 16], c_int) -> ResultCode => "cuDeviceGetUuid_v2",
+    }
 }
 
 // The driver's function pointers and the loaded library are plain data; the

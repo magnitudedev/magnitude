@@ -1002,7 +1002,7 @@ where
         }
     }
 
-    /// Realizes every kernel of the member; all of them are active.
+    /// Realizes every kernel the member launches.
     /// Reconciliation is the sole post-reflection eligibility transition:
     /// returning Rejected caches that deterministic result, while every
     /// native infrastructure error returns before the candidate cache changes.

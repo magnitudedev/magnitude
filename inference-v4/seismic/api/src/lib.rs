@@ -23,9 +23,14 @@ pub use seismic_lang::precision::PrecisionPolicy;
 pub use seismic_lang::expr::{BigInt, BigUint};
 pub use seismic_lang::registry::BackendName;
 pub use seismic_lang::types::DType;
-pub use seismic_runtime::api::{
-    CallError, DeviceId, DeviceInfo, MemoryLimitError, MemoryUsage, OutputError, TensorError,
-    WorkflowError,
+pub use seismic_runtime::api::{CallError, OutputError, TensorError, WorkflowError};
+pub use seismic_runtime::devices::{
+    Availability, CapacityBasis, DeviceId, DeviceInfo, DeviceKind, DeviceMeasurements,
+    DeviceMemory, DeviceMemoryInfo, DeviceMemoryStatus, DeviceSelector, DeviceTopology,
+    DiscoveryDiagnostic, DiscoveryError, HeadroomBasis, HeadroomEstimate, HostMeasurements,
+    HostMemoryStatus, LimitVisibility, MemoryLimitError, MemoryPoolId, MemoryPoolInfo,
+    MemoryPoolKind, MemoryUsage, ObservationError, OpenError, ProcessLimitKind,
+    ProcessMemoryLimit, ResolveError, SelectorParseError,
 };
 
 use seismic_compiler::prepared::ArgumentValue;
@@ -37,43 +42,46 @@ use std::sync::Arc;
 // Devices
 // ---------------------------------------------------------------------------
 
+/// The one device inventory: host RAM and backend devices, their memory
+/// pools and identities, scoped observations, and device opening.
 pub struct DeviceCatalog {
-    inner: seismic_runtime::api::catalog::Catalog,
+    inner: seismic_runtime::devices::Catalog,
 }
 
 impl DeviceCatalog {
-    pub fn discover() -> Result<Self, TargetError> {
-        seismic_runtime::api::catalog::Catalog::discover().map(|inner| Self { inner })
+    pub fn discover() -> Result<Self, DiscoveryError> {
+        seismic_runtime::devices::Catalog::discover().map(|inner| Self { inner })
     }
-    pub fn devices(&self) -> &[DeviceInfo] {
-        self.inner.devices()
+    /// The current immutable inventory snapshot.
+    pub fn topology(&self) -> Arc<DeviceTopology> {
+        self.inner.topology()
     }
-    pub fn open(&self, id: DeviceId) -> Result<Device, TargetError> {
+    /// Re-enumerates; identifiers stay valid unless the inventory changed.
+    pub fn refresh(&self) -> Result<Arc<DeviceTopology>, DiscoveryError> {
+        self.inner.refresh()
+    }
+    /// Resolves a same-machine selector, rejecting missing or ambiguous
+    /// matches. Never substitutes another device.
+    pub fn resolve(&self, selector: DeviceSelector) -> Result<DeviceId, ResolveError> {
+        self.inner.resolve(selector)
+    }
+    pub fn open(&self, id: DeviceId) -> Result<Device, OpenError> {
         self.inner.open(id).map(|inner| Device { inner })
     }
-    /// Opens the first discovered device for a backend. Discovery order is
-    /// stable within one catalog; callers that care about a particular
-    /// physical device use `devices()` and `open()` instead.
-    pub fn open_backend(&self, backend: BackendName) -> Result<Device, TargetError> {
-        let id = self
-            .devices()
-            .iter()
-            .find(|device| device.backend == backend)
-            .map(|device| device.id)
-            .ok_or_else(|| {
-                TargetError::UnsupportedDevice(format!(
-                    "no {} device was discovered",
-                    backend.as_str()
-                ))
-            })?;
-        self.open(id)
+    /// Low-level control: opens the first discovered device of a backend.
+    /// Managed callers select by requirements and open by identity.
+    pub fn open_backend(&self, backend: BackendName) -> Result<Device, OpenError> {
+        self.inner.open_backend(backend).map(|inner| Device { inner })
+    }
+    pub fn host_memory_status(&self) -> Result<HostMemoryStatus, ObservationError> {
+        self.inner.host_memory_status()
     }
 }
 
 impl fmt::Debug for DeviceCatalog {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeviceCatalog")
-            .field("devices", &self.devices())
+            .field("topology", &self.topology())
             .finish()
     }
 }
@@ -105,11 +113,17 @@ impl Device {
             inner: seismic_runtime::native_graph::NativeGraphDraft::new(&self.inner),
         }
     }
+    /// Seismic-owned charges and limits for this device and its pool.
     pub fn memory_usage(&self) -> MemoryUsage {
         self.inner.memory_usage()
     }
+    /// Enforce a requested allocation budget on this device's allocations.
     pub fn set_memory_limit(&self, limit: Option<u64>) -> Result<(), MemoryLimitError> {
         self.inner.set_memory_limit(limit)
+    }
+    /// Samples this device's backend memory observation.
+    pub fn memory_status(&self) -> Result<DeviceMemoryStatus, ObservationError> {
+        self.inner.memory_status()
     }
     pub fn workflow(&self) -> WorkflowDraft {
         WorkflowDraft {

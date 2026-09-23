@@ -508,9 +508,7 @@ impl AttestedPrograms {
                 outcome: "native program factory requires the planned Metal path".into(),
             });
         }
-        if planned_device.backend() != device.backend()
-            || planned_device.name() != device.info().name
-        {
+        if planned_device.selector() != device.info().selector {
             return Err(CatalogError::Preparation {
                 path: ExecutionPath::NativeMetal,
                 entry: "program_factory",

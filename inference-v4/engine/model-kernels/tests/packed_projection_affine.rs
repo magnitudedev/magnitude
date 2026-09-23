@@ -217,7 +217,10 @@ fn native_projection_stages_decode_q4k_and_q5k_affine_packets() {
 
         let recurrent_output = qwen_recurrent_output::native_for_device_with(
             &device,
-            qwen_recurrent_output::Elements { OW: element },
+            qwen_recurrent_output::Elements {
+                OW: element,
+                A: Element::f32(),
+            },
         )
         .unwrap()
         .call(qwen_recurrent_output::Args {

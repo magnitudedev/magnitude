@@ -31,7 +31,7 @@ fn tuple_moves_consume_owned_tensor_leaves() {
 #[test]
 fn tuple_signatures_keep_each_tensor_access_mode() {
     use crate::checked::{SignatureType, TensorAccess};
-    let module=check_source(SourceSet::new(vec![SourceFile{path:"tuple-parameters.seismic".into(),text:"fn probe(pair: (&tensor[2] f32, &mut tensor[2] f32)):\n    let (source, destination) = pair\n    destination[:] = load(source)\n".into()}])).unwrap();
+    let module=check_source(SourceSet::new(vec![SourceFile{path:"tuple-parameters.seismic".into(),text:"fn probe(pair: (&tensor[2] f32, &mut tensor[2] f32)):\n    let (source, destination) = pair\n    destination[:] = to_owned(source)\n".into()}])).unwrap();
     let info = module
         .entries()
         .iter()
@@ -59,7 +59,7 @@ fn tuple_signatures_keep_each_tensor_access_mode() {
 #[test]
 fn owned_view_transfer_and_branch_loop_moves_preserve_authority() {
     check("fn probe(x: tensor[2,2] f32) -> tensor[2,2] f32:\n    return x.T\n").unwrap();
-    check("fn probe(x: &tensor[2,2] f32) -> f32:\n    let mut y = load(x)\n    for i in 0..3:\n        y = y.T\n    return y[0,1]\n").unwrap();
+    check("fn probe(x: &tensor[2,2] f32) -> f32:\n    let mut y = to_owned(x)\n    for i in 0..3:\n        y = y.T\n    return y[0,1]\n").unwrap();
     for source in [
         "fn probe(choose: bool) -> f32:\n    let mut a = tensor[2] f32\n    a[:] = zeros_like(a)\n    if choose:\n        let pair = (a, 1)\n    return a[0]\n",
         "fn probe() -> f32:\n    let mut a = tensor[2] f32\n    a[:] = zeros_like(a)\n    for i in 0..2:\n        let pair = (a, 1)\n    return 0.0\n",

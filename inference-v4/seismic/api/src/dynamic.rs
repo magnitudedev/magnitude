@@ -35,6 +35,7 @@ impl From<CallError> for Error {
     fn from(e: CallError) -> Self {
         let kind = match &e {
             CallError::Invocation(_) => "InvocationError",
+            CallError::Output(_) => "OutputError",
             CallError::Execution(_) => "ExecutionError",
             CallError::Workflow(_) => "WorkflowError",
         };

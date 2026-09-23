@@ -1042,13 +1042,8 @@ mod tests {
     #[test]
     #[ignore = "requires Metal for complete-entry numerical corpus execution"]
     fn metal_validation_collects_complete_mutated_input_state() {
-        let catalog = crate::api::catalog::Catalog::discover().unwrap();
-        let info = catalog
-            .devices()
-            .iter()
-            .find(|device| device.backend == registry::BackendName::Metal)
-            .unwrap();
-        let device = catalog.open(info.id).unwrap();
+        let catalog = crate::devices::Catalog::discover().unwrap();
+        let device = catalog.open_backend(registry::BackendName::Metal).unwrap();
         let module = check_source(SourceSet::new(vec![SourceFile {
             path: "validation-state.seismic".into(),
             text: "fn update[N](x: &tensor[N] f32, output: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        output[i] = x[i] + 1.0\n".into(),
@@ -1176,13 +1171,8 @@ mod tests {
     #[test]
     #[ignore = "requires Metal for participant-local portable calls"]
     fn metal_feedback_inlines_portable_reference_calls_in_parallel_segments() {
-        let catalog = crate::api::catalog::Catalog::discover().unwrap();
-        let info = catalog
-            .devices()
-            .iter()
-            .find(|device| device.backend == registry::BackendName::Metal)
-            .unwrap();
-        let device = catalog.open(info.id).unwrap();
+        let catalog = crate::devices::Catalog::discover().unwrap();
+        let device = catalog.open_backend(registry::BackendName::Metal).unwrap();
         let module = check_source(SourceSet::new(vec![SourceFile {
             path: "feedback-reduce.seismic".into(),
             text: "fn sum_values[W](row: tensor[W] f32) -> f32:\n    return reduce(row, 0, sum)\n\nfn row_sums[N,W](x: &tensor[N,W] f32) -> (tensor[N] f32, tensor[N,W] bf16):\n    let mut result = tensor[N] f32\n    let mut copied = tensor[N,W] bf16\n    parallel for row in 0..N:\n        let mut local = to_owned(x[row])\n        let mut total = f32(0.0)\n        for column in 0..W:\n            if local[column] > 0.0:\n                total = total + local[column]\n            else:\n                total = total - local[column]\n            local[column] = local[column] + 1.0\n        copied[row] = local\n        result[row] = sum_values(local) + total\n    return result, copied\n".into(),
@@ -1226,13 +1216,8 @@ mod tests {
     #[test]
     #[ignore = "requires Metal to validate many source checks within its argument limit"]
     fn metal_feedback_shares_status_storage_without_dropping_checks() {
-        let catalog = crate::api::catalog::Catalog::discover().unwrap();
-        let info = catalog
-            .devices()
-            .iter()
-            .find(|device| device.backend == registry::BackendName::Metal)
-            .unwrap();
-        let device = catalog.open(info.id).unwrap();
+        let catalog = crate::devices::Catalog::discover().unwrap();
+        let device = catalog.open_backend(registry::BackendName::Metal).unwrap();
         let mut source = "fn checked_sum[N,W](x: &tensor[N,W] f32, indices: &tensor[N] i32) -> tensor[N] f32:\n    let mut result = tensor[N] f32\n    parallel for row in 0..N:\n        let mut total = f32(0.0)\n".to_string();
         for offset in 0..40 {
             source.push_str(&format!(
@@ -1309,13 +1294,8 @@ mod tests {
     #[test]
     #[ignore = "requires Metal for complete-entry packed gather replay"]
     fn metal_feedback_observes_checked_content_addressing_of_packed_inputs() {
-        let catalog = crate::api::catalog::Catalog::discover().unwrap();
-        let info = catalog
-            .devices()
-            .iter()
-            .find(|device| device.backend == registry::BackendName::Metal)
-            .unwrap();
-        let device = catalog.open(info.id).unwrap();
+        let catalog = crate::devices::Catalog::discover().unwrap();
+        let device = catalog.open_backend(registry::BackendName::Metal).unwrap();
         let module = check_source(SourceSet::new(vec![SourceFile {
             path: "feedback-gather.seismic".into(),
             text: "fn gather[M,V,D](table: &tensor[V,D] Q, indices: &tensor[M] i32) -> tensor[M,D] f32:\n    let mut result = tensor[M,D] f32\n    parallel for row in 0..M:\n        parallel for col in 0..D:\n            result[row,col] = f32(table[indices[row],col])\n    return result\n".into(),
@@ -1369,20 +1349,10 @@ mod tests {
     #[test]
     #[ignore = "requires CPU native compilation"]
     fn ordinary_and_trial_binding_preserve_tensor_device_identity() {
-        let catalog = crate::api::catalog::Catalog::discover().unwrap();
-        let info = catalog
-            .devices()
-            .iter()
-            .find(|device| device.backend == registry::BackendName::Cpu)
-            .unwrap();
-        let device = catalog.open(info.id).unwrap();
-        let foreign_catalog = crate::api::catalog::Catalog::discover().unwrap();
-        let foreign_info = foreign_catalog
-            .devices()
-            .iter()
-            .find(|device| device.backend == registry::BackendName::Cpu)
-            .unwrap();
-        let foreign = foreign_catalog.open(foreign_info.id).unwrap();
+        let catalog = crate::devices::Catalog::discover().unwrap();
+        let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
+        let foreign_catalog = crate::devices::Catalog::discover().unwrap();
+        let foreign = foreign_catalog.open_backend(registry::BackendName::Cpu).unwrap();
         assert_ne!(device.kind.identity(), foreign.kind.identity());
         let module = check_source(SourceSet::new(vec![SourceFile {
             path: "binding-device.seismic".into(),
@@ -1450,17 +1420,14 @@ mod tests {
     }
 
     fn measures_without_profile(backend: registry::BackendName, continuation: bool) {
-        let catalog = crate::api::catalog::Catalog::discover().unwrap();
-        let info = catalog
-            .devices()
-            .iter()
-            .find(|device| device.backend == backend)
+        let catalog = crate::devices::Catalog::discover().unwrap();
+        let device = catalog
+            .open_backend(backend)
             .expect("hardware qualification needs the requested backend");
-        let device = catalog.open(info.id).unwrap();
         let profile_is_absent = || match &device.kind {
-            crate::backends::DeviceKind::Metal(opened) => opened.analytical.get().is_none(),
-            crate::backends::DeviceKind::Cpu(opened) => opened.analytical.get().is_none(),
-            crate::backends::DeviceKind::Cuda(opened) => opened.analytical.get().is_none(),
+            crate::backends::OpenedKind::Metal(opened) => opened.analytical.get().is_none(),
+            crate::backends::OpenedKind::Cpu(opened) => opened.analytical.get().is_none(),
+            crate::backends::OpenedKind::Cuda(opened) => opened.analytical.get().is_none(),
         };
         assert!(profile_is_absent());
         let module = check_source(SourceSet::new(vec![SourceFile {

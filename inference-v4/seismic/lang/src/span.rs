@@ -45,8 +45,4 @@ impl Diagnostic {
             message: message.into(),
         }
     }
-
-    pub(crate) fn new(span: Span, message: impl Into<String>) -> Diagnostic {
-        Diagnostic::with_rule(DiagnosticRule::Type, span, message)
-    }
 }

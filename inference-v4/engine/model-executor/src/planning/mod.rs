@@ -226,16 +226,12 @@ mod tests {
     /// Build actual checked Seismic graph families. The engine may choose how
     /// many slots to reserve, but no test supplies intermediate tensor shapes.
     fn prepared_resource_plan() -> Option<ResourcePlan> {
-        let discovery = crate::platform::discover().ok()?;
-        let endpoint = discovery
-            .topology()
-            .endpoints
-            .iter()
-            .find(|endpoint| {
-                endpoint.backend == seismic::BackendName::Metal && endpoint.is_available()
-            })?
-            .clone();
-        let device = discovery.open(&endpoint).unwrap();
+        let catalog = seismic::DeviceCatalog::discover().ok()?;
+        let selected =
+            crate::platform::select_device(&catalog, crate::ExecutionPath::NativeMetal).ok()?;
+        let device = catalog
+            .open(catalog.resolve(selected.info.selector).unwrap())
+            .unwrap();
         let definition = fixture_definition();
         let manifest = fixture_manifest(&definition);
         let limits = ResourceLimits {
@@ -247,12 +243,12 @@ mod tests {
             max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
         };
         let budget = ResourceBudget {
-            storage_bytes: endpoint.facts.memory_bytes.min(512 * 1024 * 1024),
+            storage_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
             retention_bytes: 64 * 1024,
             safety_reserve_bytes: 16 * 1024 * 1024,
         };
         let draft = ExecutionPlanner::prepare(
-            &endpoint,
+            &selected,
             &manifest,
             &definition,
             ComponentSelection {

@@ -4,6 +4,7 @@
 //! walker through `lower_semantic`; there is no second backend-local typed
 //! lowering path.
 
+use crate::facts::MetalFacts;
 use crate::Metal;
 use seismic_compiler::target::{CapabilityRegistration, IntrinsicImplementation};
 use seismic_ir::kernel::ops::IntrinsicResources;

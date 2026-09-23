@@ -336,45 +336,123 @@ impl NameCallGraph {
         Self { callees }
     }
 
-    /// Every definition after all of its callees.
-    pub(crate) fn bottom_up_order(&self) -> Result<Vec<usize>, RecursionCycle> {
-        fn visit(
-            graph: &NameCallGraph,
-            definition: usize,
-            state: &mut [u8],
-            stack: &mut Vec<usize>,
-            order: &mut Vec<usize>,
-        ) -> Result<(), RecursionCycle> {
-            match state[definition] {
-                2 => return Ok(()),
-                1 => {
-                    let start = stack
-                        .iter()
-                        .position(|&member| member == definition)
-                        .expect("a definition on the visit stack is in progress");
-                    return Err(RecursionCycle {
-                        definitions: stack[start..].to_vec(),
-                    });
-                }
-                _ => {}
-            }
-            state[definition] = 1;
-            stack.push(definition);
-            for &callee in &graph.callees[definition] {
-                visit(graph, callee, state, stack, order)?;
-            }
-            stack.pop();
-            state[definition] = 2;
-            order.push(definition);
-            Ok(())
-        }
-        let mut state = vec![0u8; self.callees.len()];
-        let mut stack = Vec::new();
+    /// The bottom-up order of every definition that reaches no cycle (each
+    /// after all of its callees), and one cycle of every recursive strongly
+    /// connected component (L20). A recursion therefore never hides the
+    /// definitions outside it.
+    pub(crate) fn bottom_up_order(&self) -> (Vec<usize>, Vec<RecursionCycle>) {
+        let components = self.components();
+        let mut blocked = vec![false; self.callees.len()];
         let mut order = Vec::with_capacity(self.callees.len());
-        for definition in 0..self.callees.len() {
-            visit(self, definition, &mut state, &mut stack, &mut order)?;
+        let mut cycles = Vec::new();
+        // Components come callees first, so a component's callees outside
+        // it are decided before it.
+        for component in components {
+            let recursive = component.len() > 1 || self.callees[component[0]].contains(&component[0]);
+            if recursive {
+                cycles.push(self.cycle_through(&component));
+                for &definition in &component {
+                    blocked[definition] = true;
+                }
+            } else if self.callees[component[0]].iter().any(|&callee| blocked[callee]) {
+                blocked[component[0]] = true;
+            } else {
+                order.push(component[0]);
+            }
         }
-        Ok(order)
+        (order, cycles)
+    }
+
+    /// The strongly connected components, callees first (Tarjan).
+    fn components(&self) -> Vec<Vec<usize>> {
+        struct Search<'g> {
+            graph: &'g NameCallGraph,
+            next: usize,
+            index: Vec<Option<usize>>,
+            low: Vec<usize>,
+            stack: Vec<usize>,
+            on_stack: Vec<bool>,
+            components: Vec<Vec<usize>>,
+        }
+        impl Search<'_> {
+            fn visit(&mut self, definition: usize) {
+                self.index[definition] = Some(self.next);
+                self.low[definition] = self.next;
+                self.next += 1;
+                self.stack.push(definition);
+                self.on_stack[definition] = true;
+                for &callee in &self.graph.callees[definition] {
+                    match self.index[callee] {
+                        None => {
+                            self.visit(callee);
+                            self.low[definition] = self.low[definition].min(self.low[callee]);
+                        }
+                        Some(index) if self.on_stack[callee] => {
+                            self.low[definition] = self.low[definition].min(index);
+                        }
+                        Some(_) => {}
+                    }
+                }
+                if Some(self.low[definition]) == self.index[definition] {
+                    let mut component = Vec::new();
+                    loop {
+                        let member = self.stack.pop().expect("a component is on the stack");
+                        self.on_stack[member] = false;
+                        component.push(member);
+                        if member == definition {
+                            break;
+                        }
+                    }
+                    component.sort_unstable();
+                    self.components.push(component);
+                }
+            }
+        }
+        let count = self.callees.len();
+        let mut search = Search {
+            graph: self,
+            next: 0,
+            index: vec![None; count],
+            low: vec![0; count],
+            stack: Vec::new(),
+            on_stack: vec![false; count],
+            components: Vec::new(),
+        };
+        for definition in 0..count {
+            if search.index[definition].is_none() {
+                search.visit(definition);
+            }
+        }
+        search.components
+    }
+
+    /// One call cycle through the least member of a recursive component, in
+    /// call order: the shortest path from it back to itself.
+    fn cycle_through(&self, component: &[usize]) -> RecursionCycle {
+        let start = component[0];
+        let mut previous: HashMap<usize, usize> = HashMap::new();
+        let mut frontier = std::collections::VecDeque::from([start]);
+        while let Some(definition) = frontier.pop_front() {
+            for &callee in &self.callees[definition] {
+                if callee == start {
+                    // `previous` leads back to `start`, which has no entry.
+                    let mut definitions = vec![definition];
+                    while let Some(&caller) = previous.get(&definitions[definitions.len() - 1]) {
+                        definitions.push(caller);
+                    }
+                    definitions.reverse();
+                    return RecursionCycle { definitions };
+                }
+                if component.binary_search(&callee).is_ok()
+                    && callee != start
+                    && !previous.contains_key(&callee)
+                {
+                    previous.insert(callee, definition);
+                    frontier.push_back(callee);
+                }
+            }
+        }
+        unreachable!("a recursive component has a cycle through each member")
     }
 }
 

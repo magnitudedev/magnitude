@@ -778,6 +778,12 @@ impl Interpreter<'_> {
             PrimitiveId::Cast(dtype) => {
                 let value = frame.value(inputs[0]);
                 Ok(Value::Scalar(match value {
+                    // C1-19: a quantity converts to a float by one exact
+                    // RNE rounding of the mathematical integer, and to a
+                    // word by its two's-complement projection.
+                    Value::Integer(_) | Value::Index(_) if dtype.is_float() => {
+                        crate::reference_math::integer_to_float(*dtype, &value.as_integer())
+                    }
                     Value::Integer(_) | Value::Index(_) => {
                         word_literal(*dtype, &value.as_integer())
                     }

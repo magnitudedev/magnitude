@@ -93,12 +93,12 @@ fn discover_device(device: &MetalDevice) -> Result<DeviceDescription<Metal>, Tar
             .operatingSystemVersionString()
             .to_string(),
         registry_id: handle.registry_id(),
-        unified_memory: raw.hasUnifiedMemory(),
+        unified_memory: handle.has_unified_memory(),
         families: observed_families(raw),
         language,
         max_threads_per_threadgroup: [size.width as u64, size.height as u64, size.depth as u64],
         max_threadgroup_bytes: raw.maxThreadgroupMemoryLength() as u64,
-        max_buffer_bytes: raw.maxBufferLength() as u64,
+        max_buffer_bytes: handle.max_allocation_bytes(),
         buffer_alignment: raw
             .heapBufferSizeAndAlignWithLength_options(
                 1,

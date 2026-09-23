@@ -38,7 +38,7 @@ fn attention_update[M, K, W](qt: &tensor[M, W] A, kt: &tensor[K, W] A, vt: &tens
 # logical window `visible[row] = [lo, hi)` of the history, independent of compiler
 # partitioning. An empty window has no update effect.
 fn attention[Q, T, H, KV, W](q: &tensor[Q, H, W] A, k: &tensor[T, KV, W] A, v: &tensor[T, KV, W] A,
-                             visible: &tensor[Q, 2] i32, result: &mut tensor[Q, H, W] A, scale: f32):
+                             visible: &tensor[Q, 2] i32, result: &mut tensor[Q, H, W] A, scale: f32) where H >= KV:
     parallel for rows in 0..Q:
         parallel for kv_heads in 0..KV:
             let qt = q[rows, kv_heads * (H / KV) : (kv_heads + 1) * (H / KV)]

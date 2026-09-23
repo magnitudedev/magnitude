@@ -316,7 +316,10 @@ fn encode_workflow(
             let result = refs[p.node][p.leaf];
             if matches!(p.ty, SignatureType::Tensor { .. }) {
                 if let Some((start, end)) = p.slice {
-                    out.push_result_tensor_leading_slice(result, start, end)
+                    out.push_result_tensor_view(
+                        result,
+                        vec![runtime::ViewOperation::LeadingSlice { start, end }],
+                    )
                 } else {
                     out.push_result_tensor(result)
                 }

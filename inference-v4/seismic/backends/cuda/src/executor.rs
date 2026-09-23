@@ -23,6 +23,13 @@ pub struct Device {
     stream: Arc<Stream>,
 }
 
+/// One `cuMemGetInfo` sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryInfo {
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+}
+
 impl Device {
     pub fn open(ordinal: u32) -> Result<Self, ExecutionError> {
         let driver = Driver::load().map_err(ExecutionError::SubmissionFailed)?;
@@ -35,6 +42,24 @@ impl Device {
     }
     pub fn ordinal(&self) -> u32 {
         self.context.ordinal() as u32
+    }
+
+    /// `cuMemGetInfo` on this opened context: device-wide free memory (other
+    /// processes' and this process's allocations already excluded) and the
+    /// total memory of the exposed device.
+    pub fn memory_info(&self) -> Result<MemoryInfo, ExecutionError> {
+        let _current = self.context.enter().map_err(submission_error)?;
+        let driver = &self.context.driver;
+        let (mut free, mut total) = (0usize, 0usize);
+        unsafe {
+            driver
+                .check((driver.memory_info)(&mut free, &mut total), "memory info")
+                .map_err(submission_error)?;
+        }
+        Ok(MemoryInfo {
+            free_bytes: free as u64,
+            total_bytes: total as u64,
+        })
     }
 
     pub(crate) fn context(&self) -> &Arc<Context> {

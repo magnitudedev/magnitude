@@ -39,7 +39,9 @@ pub use command::CompiledKernel;
 pub use compile::NativeCandidate;
 pub use executor::{Device, Executor};
 pub use open::{open_host, OpenedCpu};
-pub use profile::{HostFacts, HostKernelAbi, ScratchPolicy, SimdTier, BACKEND_REVISION};
+pub use profile::{
+    HostFacts, HostKernelAbi, ScratchPolicy, SimdTier, BACKEND_REVISION, MAX_ALLOCATION_BYTES,
+};
 pub use registry::registry;
 pub use workers::Workers;
 

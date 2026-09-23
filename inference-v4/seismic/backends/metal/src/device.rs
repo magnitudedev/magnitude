@@ -52,10 +52,29 @@ impl DeviceHandle {
         self.device.name().to_string()
     }
 
-    /// Cheap catalog memory figure. This is Metal's directly queried maximum
-    /// buffer length, not a profiled or inferred capacity.
-    pub fn memory_bytes(&self) -> u64 {
+    /// `MTLDevice.maxBufferLength`: the single-allocation limit. It is neither
+    /// memory capacity nor availability.
+    pub fn max_allocation_bytes(&self) -> u64 {
         self.device.maxBufferLength() as u64
+    }
+
+    /// `MTLDevice.hasUnifiedMemory`: CPU and GPU share one memory. Whether
+    /// that memory is the whole host RAM pool is a platform qualification,
+    /// not implied by this flag alone.
+    pub fn has_unified_memory(&self) -> bool {
+        self.device.hasUnifiedMemory()
+    }
+
+    /// `MTLDevice.recommendedMaxWorkingSetSize`: Metal's advisory ceiling for
+    /// this device's working set. Advice, not physical capacity.
+    pub fn recommended_working_set_bytes(&self) -> u64 {
+        self.device.recommendedMaxWorkingSetSize()
+    }
+
+    /// `MTLDevice.currentAllocatedSize`: bytes of resources this process has
+    /// allocated on the device, including resources Seismic does not own.
+    pub fn current_allocated_bytes(&self) -> u64 {
+        self.device.currentAllocatedSize() as u64
     }
 
     pub(crate) fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {

@@ -23,13 +23,8 @@ fn result_bits(result: ArgumentValue) -> u32 {
 }
 
 fn payload_transport(backend: registry::BackendName) {
-    let catalog = crate::api::catalog::Catalog::discover().unwrap();
-    let info = catalog
-        .devices()
-        .iter()
-        .find(|device| device.backend == backend)
-        .unwrap();
-    let device = catalog.open(info.id).unwrap();
+    let catalog = crate::devices::Catalog::discover().unwrap();
+    let device = catalog.open_backend(backend).unwrap();
     for (dtype, words) in [
         (
             DType::F16,
@@ -179,13 +174,8 @@ fn metal_payloads_survive_load_helper_join_carry_store_and_result() {
 }
 
 fn arithmetic_payloads(backend: registry::BackendName) {
-    let catalog = crate::api::catalog::Catalog::discover().unwrap();
-    let info = catalog
-        .devices()
-        .iter()
-        .find(|device| device.backend == backend)
-        .unwrap();
-    let device = catalog.open(info.id).unwrap();
+    let catalog = crate::devices::Catalog::discover().unwrap();
+    let device = catalog.open_backend(backend).unwrap();
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "arithmetic-payload.seismic".into(),
         text: r#"fn fused(a: bf16, b: bf16, c: bf16) -> bf16:
@@ -253,13 +243,8 @@ fn metal_arithmetic_uses_typed_scalar_recipes() {
 }
 
 fn computed_tensor_recipes(backend: registry::BackendName) {
-    let catalog = crate::api::catalog::Catalog::discover().unwrap();
-    let info = catalog
-        .devices()
-        .iter()
-        .find(|device| device.backend == backend)
-        .unwrap();
-    let device = catalog.open(info.id).unwrap();
+    let catalog = crate::devices::Catalog::discover().unwrap();
+    let device = catalog.open_backend(backend).unwrap();
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "computed-tensor-recipes.seismic".into(),
         text: r#"fn fused(a: &tensor[1] bf16, b: &tensor[1] bf16, c: &tensor[1] bf16) -> tensor[1] bf16:
@@ -354,13 +339,8 @@ fn metal_computed_tensor_recipes_preserve_fma_rounding_and_maximum_bits() {
 }
 
 fn packed_reference_boundary(backend: registry::BackendName) {
-    let catalog = crate::api::catalog::Catalog::discover().unwrap();
-    let info = catalog
-        .devices()
-        .iter()
-        .find(|device| device.backend == backend)
-        .unwrap();
-    let device = catalog.open(info.id).unwrap();
+    let catalog = crate::devices::Catalog::discover().unwrap();
+    let device = catalog.open_backend(backend).unwrap();
     let module=check_source(SourceSet::new(vec![SourceFile{path:"packed-outcome-boundary.seismic".into(),text:
         "fn probe(a: &tensor[128] bf16, w: &tensor[128] q4g64) -> f32:\n    let first = fma(f32(a[63]), w[63], 0.0)\n    return fma(f32(a[64]), w[64], first)\n".into()}])).unwrap();
     let kernel = Arc::new(
@@ -431,13 +411,8 @@ fn metal_packed_reference_crosses_packet_boundary_with_signed_coefficients() {
 
 fn source_cast_payloads(backend: registry::BackendName, store: bool) {
     use seismic_lang::reference_math::{evaluate, scalar_recipe, ReferenceScalar, ScalarOp};
-    let catalog = crate::api::catalog::Catalog::discover().unwrap();
-    let info = catalog
-        .devices()
-        .iter()
-        .find(|device| device.backend == backend)
-        .unwrap();
-    let device = catalog.open(info.id).unwrap();
+    let catalog = crate::devices::Catalog::discover().unwrap();
+    let device = catalog.open_backend(backend).unwrap();
     for (from, to, samples) in [
         (
             DType::F16,

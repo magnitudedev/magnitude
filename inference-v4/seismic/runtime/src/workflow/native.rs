@@ -497,7 +497,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> WorkflowGraphDraft<T, E> {
             let reference = match argument {
                 EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::Result(reference))
                 | EncodedWorkflowArgument::ScalarResult(reference) => Some(reference),
-                EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::ResultLeadingSlice {
+                EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::ResultView {
                     result,
                     ..
                 }) => Some(result),
@@ -552,11 +552,10 @@ impl<T: TargetFamily, E: NativeExecutor<T>> WorkflowGraphDraft<T, E> {
                         ArgumentBinding::Result(output_ref(reference))
                     }
                     EncodedWorkflowArgument::Tensor(
-                        WorkflowTensorArgument::ResultLeadingSlice { result, start, end },
-                    ) => ArgumentBinding::LeadingSlice {
+                        WorkflowTensorArgument::ResultView { result, operations },
+                    ) => ArgumentBinding::ResultView {
                         result: output_ref(result),
-                        start,
-                        end,
+                        operations,
                     },
                     EncodedWorkflowArgument::Scalar(value) => {
                         ArgumentBinding::External(crate::driver::workflow::ValueDescriptor::Scalar(
@@ -706,6 +705,9 @@ fn plan_error(error: PlanError<CallError>) -> CallError {
         }
         PlanError::ViewOfScalar(_) | PlanError::InvalidView(_) => {
             CallError::Workflow(crate::api::WorkflowError::MissingProducerResult)
+        }
+        PlanError::ResultView { error, .. } => {
+            CallError::Workflow(crate::api::WorkflowError::TensorView(error))
         }
         PlanError::InvalidPolicyDescription(message) => CallError::Execution(
             ExecutionError::AllocationFailed(format!("invalid bound workflow: {message}")),
@@ -875,10 +877,9 @@ mod preclaim_tests {
 
     #[test]
     fn opposite_graph_key_orders_preclaim_without_deadlock_or_unused_capacity() {
-        let catalog = crate::api::catalog::Catalog::discover().unwrap();
-        let info = catalog.devices().iter().find(|device| device.backend == registry::BackendName::Cpu).unwrap();
-        let device = catalog.open(info.id).unwrap();
-        let crate::backends::DeviceKind::Cpu(opened) = &device.kind else { unreachable!() };
+        let catalog = crate::devices::Catalog::discover().unwrap();
+        let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
+        let crate::backends::OpenedKind::Cpu(opened) = &device.kind else { unreachable!() };
         let first = opened.allocate_storage(16, 4).unwrap();
         let second = opened.allocate_storage(16, 4).unwrap();
         let table = Arc::new(PersistentTable::new());

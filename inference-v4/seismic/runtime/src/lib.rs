@@ -1,10 +1,12 @@
 //! Generic device, tensor, and prepared-kernel machinery over the frozen
 //! backend contracts (spec §2.3, §12, §24.1 R9). No planning lives here.
 //!
-//! The public surface is [`api`]: the device catalog, the opened device,
-//! the tensor, and the call driver the public `seismic` crate composes.
+//! The public surface is [`devices`] (the one device catalog, identities,
+//! memory pools and scoped observations) and [`api`] (the opened device, the
+//! tensor, and the call driver) which the public `seismic` crate composes.
 //! Everything else is private:
 //!
+//! - `memory`: per-pool allocation ledgers and per-device limits.
 //! - `driver`: the backend-generic opened device, preparation cache, authored
 //!   native route, and the narrow primitive that issues one already-admitted
 //!   node.
@@ -27,6 +29,7 @@
 //! interprets the portable body.
 
 pub mod api;
+pub mod devices;
 
 mod backends;
 mod driver;

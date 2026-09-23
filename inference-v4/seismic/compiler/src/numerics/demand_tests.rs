@@ -14,7 +14,7 @@ const RMS_NORM: &str = include_str!("../../../../seismic-std/lib/kernels/rms_nor
 const LINEAR: &str = include_str!("../../../../seismic-std/lib/kernels/linear.seismic");
 const ELEMENTWISE: &str = include_str!("../../../../seismic-std/lib/kernels/elementwise.seismic");
 const MATMUL: &str = include_str!("../../../../seismic-std/lib/constructs/matmul.seismic");
-const ROUTED_SUFFIX: &str = include_str!("../../../../engine/lib/routed_suffix.seismic");
+const ROUTED_SUFFIX: &str = include_str!("fixtures/routed_suffix.seismic");
 
 struct Analyzed {
     program: SemanticProgram,

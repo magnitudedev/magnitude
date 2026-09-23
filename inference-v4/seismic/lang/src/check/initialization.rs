@@ -5,14 +5,15 @@ use super::{ir, prove, xfer, CheckedOutcome, Checker};
 use crate::expr::{AnyExpr, ExprArena, IntExpr, SymbolId};
 pub(super) use crate::initialization::InitializationContract as Contract;
 use crate::initialization::RegionMapping;
+use crate::checked::DiagnosticRule;
 use crate::initialization::{
     Bound, Condition, Exit, InitializationView, ParameterAccess, ParameterPart, ParameterPath,
-    Path, Region, RegionOps, Requirement,
+    Path, Region, RegionOps, Requirement, VisitSeparation,
 };
 use crate::intrinsics::{AtomicOp, IndexSlot, PrimitiveId};
 use crate::reference_math::ReferenceScalar;
-use crate::span::{Diagnostic, Span};
-use crate::syntax::ast::{AssignOp, BinaryOp, UnaryOp};
+use crate::span::Span;
+use crate::syntax::ast::{BinaryOp, UnaryOp};
 use crate::types::{DType, ValueType};
 use std::collections::{BTreeSet, HashMap};
 
@@ -89,7 +90,6 @@ struct World {
     deferred: Vec<Read>,
     accesses: Vec<Access>,
     defer_depth: usize,
-    returned: bool,
 }
 #[derive(Clone)]
 struct Read {
@@ -138,9 +138,12 @@ struct VisitOverlap {
     left: Span,
     right: Span,
 }
+/// Check the body `block` followed by its one exit `result` (L5), and build
+/// the definition's initialization contract.
 pub(super) fn check(
     checker: &mut Checker<'_>,
     block: &mut ir::Block,
+    result: &mut [ir::Expr],
     facts: prove::Facts,
 ) -> Contract {
     let mut owner = Initialization {
@@ -160,7 +163,6 @@ pub(super) fn check(
         deferred: vec![],
         accesses: vec![],
         defer_depth: 0,
-        returned: false,
     };
     let params = owner.checker.sig.params.clone();
     for (ordinal, parameter) in params.iter().enumerate() {
@@ -173,14 +175,20 @@ pub(super) fn check(
         );
         initial.values.insert(local, value);
     }
-    let worlds = owner.block(vec![initial], block);
-    let mut result = Contract {
+    let mut worlds = owner.block(vec![initial], block);
+    for world in &mut worlds {
+        for expression in result.iter_mut() {
+            let value = owner.expression(world, expression);
+            owner.consume(world, &value, expression.span);
+        }
+    }
+    let mut contract = Contract {
         symbols: owner.symbols.clone(),
         ..Contract::empty()
     };
     for world in worlds {
-        result.requirements.extend(world.requirements);
-        result
+        contract.requirements.extend(world.requirements);
+        contract
             .accesses
             .extend(world.accesses.iter().filter_map(|access| {
                 world
@@ -196,7 +204,7 @@ pub(super) fn check(
                         atomic: access.atomic,
                     })
             }));
-        result.exits.push(Exit {
+        contract.exits.push(Exit {
             path: world.path,
             written: world
                 .roots
@@ -205,7 +213,7 @@ pub(super) fn check(
                 .collect(),
         });
     }
-    owner.close_contract(result)
+    owner.close_contract(contract)
 }
 
 struct Initialization<'a, 'env> {
@@ -444,8 +452,7 @@ impl Initialization<'_, '_> {
             )
         };
         self.checker
-            .diagnostics
-            .push(Diagnostic::new(span, message));
+            .error(DiagnosticRule::Initialization, span, message);
     }
     fn access(
         &mut self,
@@ -528,7 +535,7 @@ impl Initialization<'_, '_> {
                 integer: expression.sym,
                 ..Default::default()
             }),
-            ir::ExprKind::Primitive { id, operands } => {
+            ir::ExprKind::Primitive { id, operands, .. } => {
                 let values = operands
                     .iter_mut()
                     .map(|e| self.expression(world, e))
@@ -747,17 +754,11 @@ impl Initialization<'_, '_> {
                 value,
                 ..
             } => {
-                let place = self.expression(world, place);
-                let indices = indices
-                    .iter_mut()
-                    .map(|e| {
-                        let v = self.expression(world, e);
-                        (Some(self.integer(&v)), None, true)
-                    })
-                    .collect::<Vec<_>>();
+                let place = Self::local_place(world, place);
+                let indices = self.selection(world, indices);
                 let value = self.expression(world, value);
                 self.consume(world, &value, expression.span);
-                if let Value::Tensor(place) = place {
+                if let Some(place) = place {
                     let place = self.select(&place, &indices);
                     let region = self.region(&place);
                     self.require(world, place.root, region.clone(), expression.span);
@@ -774,23 +775,37 @@ impl Initialization<'_, '_> {
                 Value::Void
             }
             ir::ExprKind::PlaneView { base, .. } => self.expression(world, base),
-            ir::ExprKind::Intrinsic { id, args } => {
+            ir::ExprKind::Intrinsic { overload, args } => {
                 let values = args
                     .iter_mut()
                     .map(|e| self.expression(world, e))
                     .collect::<Vec<_>>();
-                let signature = crate::registry::intrinsic_signature(*id);
-                for (argument, value) in signature.arguments.iter().zip(&values) {
-                    if matches!(
-                        argument.category,
-                        crate::registry::OperandCategory::Readable { .. }
-                            | crate::registry::OperandCategory::Writable { .. }
-                    ) {
+                // Entry construction resolves one row of the overload, so an
+                // operand is read when some row reads it and written when some
+                // row writes it.
+                let signatures = overload
+                    .rows
+                    .iter()
+                    .map(|row| crate::registry::intrinsic_signature(*row))
+                    .collect::<Vec<_>>();
+                for (ordinal, value) in values.iter().enumerate() {
+                    let read = signatures.iter().any(|signature| {
+                        matches!(
+                            signature.arguments[ordinal].category,
+                            crate::registry::OperandCategory::Readable { .. }
+                                | crate::registry::OperandCategory::Writable { .. }
+                        )
+                    });
+                    if read {
                         self.consume(world, value, expression.span);
                     }
                 }
-                for ordinal in signature.effects.writes.iter().copied() {
-                    if let Some(Value::Tensor(place)) = values.get(ordinal as usize) {
+                let written = signatures
+                    .iter()
+                    .flat_map(|signature| signature.effects.writes.iter().copied())
+                    .collect::<BTreeSet<_>>();
+                for ordinal in written {
+                    if let Value::Tensor(place) = &values[ordinal as usize] {
                         let region = self.region(place);
                         self.access(world, place.root, region, expression.span, true, None);
                     }
@@ -799,8 +814,22 @@ impl Initialization<'_, '_> {
                 // the intrinsic explicitly describes a complete destination.
                 self.result(world, &expression.ty, true)
             }
+            // L31: the quantity is the word's value.
+            ir::ExprKind::IndexPosition(word) => match self.expression(world, word) {
+                Value::Scalar(Scalar {
+                    integer: Some(integer),
+                    ..
+                }) => Value::Scalar(Scalar {
+                    integer: Some(integer),
+                    ..Default::default()
+                }),
+                _ => Value::Scalar(Scalar {
+                    integer: expression.sym,
+                    ..Default::default()
+                }),
+            },
             ir::ExprKind::Call { call, args } => {
-                for (_, value) in &mut call.explicit_shapes {
+                for (_, value) in &mut call.seeds {
                     self.expression(world, value);
                 }
                 let values = args
@@ -831,99 +860,71 @@ impl Initialization<'_, '_> {
             _ => {}
         }
     }
-    fn place(&mut self, world: &mut World, place: &mut ir::Place) -> Option<Place> {
-        match place {
-            ir::Place::Local(local) => match world
-                .values
-                .get(&local.local)
-                .map(|value| value.at(&local.path))
-            {
-                Some(Value::Tensor(place)) => Some(place.clone()),
-                _ => None,
-            },
-            ir::Place::Element { root, indices } => {
-                let Some(Value::Tensor(place)) = world
-                    .values
-                    .get(&root.local)
-                    .map(|value| value.at(&root.path).clone())
-                else {
-                    return None;
-                };
-                let mut selected = vec![];
-                for index in indices {
-                    match index {
-                        ir::Index::Point { value, .. } => {
-                            let value = self.expression(world, value);
-                            selected.push((Some(self.integer(&value)), None, true));
-                        }
-                        ir::Index::Range { start, end, .. } => {
-                            let start = start.as_mut().map(|e| {
-                                let v = self.expression(world, e);
-                                self.integer(&v)
-                            });
-                            let end = end.as_mut().map(|e| {
-                                let v = self.expression(world, e);
-                                self.integer(&v)
-                            });
-                            selected.push((start, end, false));
-                        }
-                    }
-                }
-                Some(self.select(&place, &selected))
-            }
-            ir::Place::Tuple(_) => None,
+    /// The tensor a local place currently holds.
+    fn local_place(world: &World, place: &super::ownership::LocalPlace) -> Option<Place> {
+        match world
+            .values
+            .get(&place.local)
+            .map(|value| value.at(&place.path))
+        {
+            Some(Value::Tensor(place)) => Some(place.clone()),
+            _ => None,
         }
     }
-    fn target(&mut self, world: &mut World, place: &mut ir::Place, op: AssignOp) -> Target {
-        match place {
-            ir::Place::Tuple(places) => Target::Tuple(
-                places
-                    .iter_mut()
-                    .map(|p| self.target(world, p, op))
-                    .collect(),
-            ),
-            ir::Place::Local(local) => {
-                let local = local.clone();
-                if op != AssignOp::Assign {
-                    if let Some(place) = self.place(world, place) {
-                        return Target::Tensor(place);
-                    }
-                }
-                Target::Binding(local)
-            }
-            ir::Place::Element { .. } => Target::Tensor(
-                self.place(world, place)
-                    .expect("checked element target has a tensor binding"),
-            ),
-        }
-    }
-    fn assign(
+    /// The per-axis selection of checked indices, evaluated in order.
+    fn selection(
         &mut self,
         world: &mut World,
-        target: Target,
-        op: AssignOp,
-        value: Value,
-        span: Span,
-    ) {
+        indices: &mut [ir::Index],
+    ) -> Vec<(Option<IntExpr>, Option<IntExpr>, bool)> {
+        let mut selected = vec![];
+        for index in indices {
+            match index {
+                ir::Index::Point { value, .. } => {
+                    let value = self.expression(world, value);
+                    selected.push((Some(self.integer(&value)), None, true));
+                }
+                ir::Index::Range { start, end, .. } => {
+                    let start = start.as_mut().map(|e| {
+                        let v = self.expression(world, e);
+                        self.integer(&v)
+                    });
+                    let end = end.as_mut().map(|e| {
+                        let v = self.expression(world, e);
+                        self.integer(&v)
+                    });
+                    selected.push((start, end, false));
+                }
+                ir::Index::Full => selected.push((None, None, false)),
+            }
+        }
+        selected
+    }
+    fn target(&mut self, world: &mut World, place: &mut ir::Place) -> Target {
+        match place {
+            ir::Place::Tuple(places) => {
+                Target::Tuple(places.iter_mut().map(|p| self.target(world, p)).collect())
+            }
+            ir::Place::Local(local) => Target::Binding(local.clone()),
+            ir::Place::Element { root, indices } => {
+                let place = Self::local_place(world, root)
+                    .expect("checked element target has a tensor binding");
+                let selected = self.selection(world, indices);
+                Target::Tensor(self.select(&place, &selected))
+            }
+        }
+    }
+    fn assign(&mut self, world: &mut World, target: Target, value: Value, span: Span) {
         match target {
             Target::Tuple(targets) => {
                 let Value::Tuple(values) = value else {
                     panic!("checked tuple assignment has a tuple value");
                 };
                 for (target, value) in targets.into_iter().zip(values) {
-                    self.assign(world, target, op, value, span);
+                    self.assign(world, target, value, span);
                 }
             }
             Target::Binding(local) => {
-                let value = if op == AssignOp::Assign {
-                    value
-                } else {
-                    // A scalar compound update defines a new value version.
-                    Value::Scalar(Scalar {
-                        condition: Some(self.fresh_condition()),
-                        ..Default::default()
-                    })
-                };
                 *world
                     .values
                     .get_mut(&local.local)
@@ -933,9 +934,6 @@ impl Initialization<'_, '_> {
             Target::Tensor(place) => {
                 self.consume(world, &value, span);
                 let region = self.region(&place);
-                if op != AssignOp::Assign {
-                    self.read(world, place.root, region.clone(), span);
-                }
                 self.access(world, place.root, region.clone(), span, true, None);
                 self.write_region(world, place.root, region);
             }
@@ -972,42 +970,33 @@ impl Initialization<'_, '_> {
     fn call(&mut self, world: &mut World, call: &mut ir::Call, arguments: &[Value], span: Span) {
         let env = self.checker.env;
         let reference = env.resolved.families[call.family.index()].contract;
-        let Some(candidate) = call
-            .candidates
-            .iter()
-            .find(|c| c.definition == reference)
-            .cloned()
-        else {
-            self.checker.error(
-                span,
-                "cannot establish initialization: the fixed reference call contract is unavailable",
-            );
-            return;
-        };
         let Some(Some(source)) = env.checked.get(reference.index()) else {
-            self.checker.error(
-                span,
-                "recursive call cycle prevents construction of its initialization contract",
-            );
-            return;
+            unreachable!("a callee is checked before its caller (L20)")
         };
+        let arguments = ordered_arguments(&call.arg_order, arguments);
         let Some(contract) = available_contract(source) else {
             // Cascade suppression: the callee's own diagnostics explain the
             // call. No requirement is recorded; every `&mut` argument is
             // written in full.
-            let arguments = ordered_arguments(&candidate, arguments);
             for (parameter, argument) in source.signature.params.iter().zip(&arguments) {
                 self.write_exclusive(world, &parameter.ownership, argument);
             }
             return;
         };
-        let site = self.call_site(world, source, contract, &candidate, arguments, span);
+        let site = self.call_site(world, source, contract, &call.dimensions, &arguments, span);
         if self.record_loops {
             let mut applicable = Vec::with_capacity(call.candidates.len());
             for alternative in &call.candidates {
                 applicable.push(
                     alternative.definition == reference
-                        || self.alternative_applicable(world, &site, alternative, arguments, span),
+                        || self.alternative_applicable(
+                            world,
+                            &site,
+                            alternative,
+                            &call.dimensions,
+                            &arguments,
+                            span,
+                        ),
                 );
             }
             let mut applicable = applicable.into_iter();
@@ -1045,35 +1034,31 @@ impl Initialization<'_, '_> {
             self.write_region(world, root, region);
         }
     }
-    /// Instantiate one candidate's checked contract at this call, in the
-    /// caller's roots, coordinates and conditions.
+    /// Instantiate one member's checked contract at this call, in the
+    /// caller's roots, coordinates and conditions. `dimensions` are the
+    /// family's dimensions at the call, which every member shares by ordinal;
+    /// `arguments` are in the family's parameter order.
     fn call_site(
         &mut self,
         world: &World,
         source: &CheckedOutcome,
         contract: &Contract,
-        candidate: &ir::Candidate,
+        dimensions: &[IntExpr],
         arguments: &[Value],
         span: Span,
     ) -> CallSite {
-        let arguments = ordered_arguments(candidate, arguments);
         let mut transfer = Transfer {
             source,
-            arguments: &arguments,
+            arguments,
             symbols: HashMap::new(),
         };
-        for (&symbol, &value) in source
-            .signature
-            .shape_symbols
-            .iter()
-            .zip(&candidate.shape_args)
-        {
-            transfer.symbols.insert(symbol, value);
+        for (dimension, &value) in source.signature.dimensions.iter().zip(dimensions) {
+            transfer.symbols.insert(dimension.symbol, value);
         }
         for (symbol, part) in &contract.symbols {
             let value = match part {
-                ParameterPart::Integer(p) => self.integer(argument(&arguments, p)),
-                ParameterPart::Start(p) | ParameterPart::End(p) => match argument(&arguments, p) {
+                ParameterPart::Integer(p) => self.integer(argument(arguments, p)),
+                ParameterPart::Start(p) | ParameterPart::End(p) => match argument(arguments, p) {
                     Value::Scalar(Scalar {
                         range: Some((a, b)),
                         ..
@@ -1145,17 +1130,18 @@ impl Initialization<'_, '_> {
         world: &World,
         reference: &CallSite,
         alternative: &ir::Candidate,
+        dimensions: &[IntExpr],
         arguments: &[Value],
         span: Span,
     ) -> bool {
         let env = self.checker.env;
         let Some(Some(source)) = env.checked.get(alternative.definition.index()) else {
-            return false;
+            unreachable!("a family member is checked before its callers (L20)")
         };
         let Some(contract) = available_contract(source) else {
             return false;
         };
-        let site = self.call_site(world, source, contract, alternative, arguments, span);
+        let site = self.call_site(world, source, contract, dimensions, arguments, span);
         self.applicable_at(world, reference, &site)
     }
     /// Whether an alternative's contract applies where the reference's does:
@@ -1216,29 +1202,22 @@ impl Initialization<'_, '_> {
     }
 
     fn block(&mut self, mut worlds: Vec<World>, block: &mut ir::Block) -> Vec<World> {
-        let mut returned = vec![];
         for statement in &mut block.statements {
             let mut next = vec![];
             for mut world in worlds {
-                if world.returned {
-                    returned.push(world);
-                    continue;
-                }
                 match statement {
-                    ir::Stmt::Let { pattern, value, .. } => {
+                    ir::Stmt::Let { pattern, value } => {
                         let value = self.expression(&mut world, value);
                         self.bind(&mut world, pattern, value);
                         next.push(world);
                     }
-                    ir::Stmt::Assign {
-                        place, op, value, ..
-                    } => {
+                    ir::Stmt::Assign { place, value, .. } => {
                         // Checked addresses and right-hand values precede the
                         // store; element address expressions may themselves read.
-                        let target = self.target(&mut world, place, *op);
+                        let target = self.target(&mut world, place);
                         let span = value.span;
                         let value = self.expression(&mut world, value);
-                        self.assign(&mut world, target, *op, value, span);
+                        self.assign(&mut world, target, value, span);
                         next.push(world);
                     }
                     ir::Stmt::Evaluate(expression) => {
@@ -1267,14 +1246,7 @@ impl Initialization<'_, '_> {
                             ) {
                                 continue;
                             }
-                            let outcomes = self.block(vec![branch], body);
-                            for outcome in outcomes {
-                                if outcome.returned {
-                                    returned.push(outcome);
-                                } else {
-                                    arms[arm].push(outcome);
-                                }
-                            }
+                            arms[arm] = self.block(vec![branch], body);
                         }
                         let [then_worlds, else_worlds] = arms;
                         next.extend(self.join(
@@ -1292,6 +1264,7 @@ impl Initialization<'_, '_> {
                         end,
                         body,
                         initialization,
+                        separation,
                         ..
                     } => next.extend(self.loop_body(
                         world,
@@ -1301,22 +1274,13 @@ impl Initialization<'_, '_> {
                         end,
                         body,
                         initialization,
+                        separation,
                     )),
                 }
             }
             worlds = next;
         }
-        if let ir::Terminator::Return(values) = &mut block.terminator {
-            for world in &mut worlds {
-                for expression in values.iter_mut() {
-                    let value = self.expression(world, expression);
-                    self.consume(world, &value, expression.span);
-                }
-                world.returned = true;
-            }
-        }
-        returned.extend(worlds);
-        returned
+        worlds
     }
     /// L30: the worlds after a two-way control join on `condition`, from the
     /// `entry` world both sides started from: `then_worlds` continue where it
@@ -1362,7 +1326,6 @@ impl Initialization<'_, '_> {
             deferred: entry.deferred.clone(),
             accesses: entry.accesses.clone(),
             defer_depth: entry.defer_depth,
-            returned: false,
         };
         for local in entry.values.keys() {
             let symbol = join_symbols
@@ -1512,10 +1475,9 @@ fn available_contract(source: &CheckedOutcome) -> Option<&Contract> {
         .then_some(&source.initialization)
 }
 
-/// Call argument values in the candidate's parameter order.
-fn ordered_arguments(candidate: &ir::Candidate, arguments: &[Value]) -> Vec<Value> {
-    candidate
-        .arg_order
+/// Call argument values in the family's parameter order (L3).
+fn ordered_arguments(order: &[usize], arguments: &[Value]) -> Vec<Value> {
+    order
         .iter()
         .map(|&i| arguments[i].clone())
         .collect()
@@ -1644,13 +1606,7 @@ impl Initialization<'_, '_> {
                 Value::Tensor(_) | Value::Void => {}
             }
         }
-        let mut symbols = self
-            .checker
-            .sig
-            .shape_symbols
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
+        let mut symbols = self.dimension_symbols().into_iter().collect::<BTreeSet<_>>();
         symbols.extend(self.binders.iter().copied());
         for value in entry.values.values() {
             value_symbols(value, self.arena_ref(), &mut symbols);
@@ -1670,28 +1626,6 @@ impl Initialization<'_, '_> {
         !a.iter().any(|(condition, value)| {
             b.iter()
                 .any(|(other, other_value)| condition == other && value != other_value)
-        })
-    }
-    fn may_share_root(&self, world: &World, left: usize, right: usize) -> bool {
-        if left == right {
-            return true;
-        }
-        let Some(a) = world
-            .roots
-            .get(&left)
-            .and_then(|root| root.parameter.as_ref())
-        else {
-            return false;
-        };
-        let Some(b) = world
-            .roots
-            .get(&right)
-            .and_then(|root| root.parameter.as_ref())
-        else {
-            return false;
-        };
-        self.checker.sig.aliases.iter().any(|&(x, y)| {
-            (x == a.parameter && y == b.parameter) || (y == a.parameter && x == b.parameter)
         })
     }
     fn distinct_visit_accesses_separate(
@@ -1794,7 +1728,8 @@ impl Initialization<'_, '_> {
                 if (!left.write && !right.write) || commuting {
                     continue;
                 }
-                if !self.may_share_root(entry, left.root, right.root) {
+                // Distinct roots are distinct storage: parameters never alias.
+                if left.root != right.root {
                     continue;
                 }
                 let overlap = VisitOverlap {
@@ -1805,19 +1740,10 @@ impl Initialization<'_, '_> {
                 if kind == ir::LoopKind::Ordered && atomic {
                     return Err(overlap);
                 }
-                // May-alias parameters have no checked relative base offset.
-                // Their individual logical coordinates cannot establish
-                // physical disjointness, even when the numbers differ.
-                let mut left_region = left.clone();
-                let mut right_region = right.clone();
-                if left.root != right.root {
-                    left_region.region = Region::Full;
-                    right_region.region = Region::Full;
-                }
                 let extents = entry.roots[&left.root].axes.clone();
                 if !self.distinct_visit_accesses_separate(
-                    &left_region,
-                    &right_region,
+                    left,
+                    right,
                     symbol,
                     start,
                     end,
@@ -2006,7 +1932,7 @@ impl Initialization<'_, '_> {
                 }
             }
         }
-        let mut allowed = self.checker.sig.shape_symbols.clone();
+        let mut allowed = self.dimension_symbols();
         allowed.extend(metadata.transfer.symbols.iter().map(|(symbol, _)| *symbol));
         allowed.extend(self.binders.iter().copied());
         let mut written = Vec::new();
@@ -2063,6 +1989,7 @@ impl Initialization<'_, '_> {
         end: &mut ir::Expr,
         body: &mut ir::Block,
         metadata: &mut crate::initialization::LoopInitialization,
+        separation: &mut VisitSeparation,
     ) -> Vec<World> {
         let loop_span = start.span;
         let start_value = self.expression(&mut entry, start);
@@ -2139,7 +2066,7 @@ impl Initialization<'_, '_> {
         let outcomes = if carries.is_empty() || single {
             self.block(vec![iteration], body)
         } else {
-            let mut allowed = self.checker.sig.shape_symbols.clone();
+            let mut allowed = self.dimension_symbols();
             allowed.extend(self.symbols.iter().map(|(symbol, _)| *symbol));
             allowed.extend(self.binders.iter().copied().filter(|s| *s != symbol));
             for value in entry.values.values() {
@@ -2248,7 +2175,11 @@ impl Initialization<'_, '_> {
                     };
                     let actual = self.carried_region(outcome, &next);
                     if !self.carries_region(outcome, &next, invariant) {
-                        self.checker.error(loop_span,"cannot establish an inductive initialized region for this tensor carry");
+                        self.checker.error(
+                            DiagnosticRule::Initialization,
+                            loop_span,
+                            "cannot establish an inductive initialized region for this tensor carry",
+                        );
                     }
                     // Loop-private coordinates cannot escape as the final
                     // value's initialized set. Keep the verified invariant
@@ -2265,25 +2196,49 @@ impl Initialization<'_, '_> {
             verified
         };
         self.binders.pop();
-        if kind == ir::LoopKind::Independent {
-            if let Err(overlap) = self.visits_separated(
-                kind,
-                &entry,
-                &outcomes,
-                access_start,
-                symbol,
-                start,
-                end,
-                &access_facts,
-            ) {
-                let root = &entry.roots[&overlap.root].name;
-                self.checker.error(
-                    overlap.right,
-                    format!(
-                        "parallel for cannot establish independent visits: ordinary accesses to `{root}` at source offsets {} and {} may overlap across distinct visits",
-                        overlap.left.start, overlap.right.start,
-                    ),
-                );
+        match kind {
+            ir::LoopKind::Ordered if self.record_loops => {
+                // L25: (I2) no local live at loop entry is rebound, and
+                // (I1)/(I3) distinct visits touch separated storage.
+                let separated = reassigned
+                    .iter()
+                    .all(|local| !entry.values.contains_key(&local.local))
+                    && self
+                        .visits_separated(
+                            kind,
+                            &entry,
+                            &outcomes,
+                            access_start,
+                            symbol,
+                            start,
+                            end,
+                            &access_facts,
+                        )
+                        .is_ok();
+                separation.record(separated);
+            }
+            ir::LoopKind::Ordered => {}
+            ir::LoopKind::Independent => {
+                if let Err(overlap) = self.visits_separated(
+                    kind,
+                    &entry,
+                    &outcomes,
+                    access_start,
+                    symbol,
+                    start,
+                    end,
+                    &access_facts,
+                ) {
+                    let root = &entry.roots[&overlap.root].name;
+                    self.checker.error(
+                        DiagnosticRule::Independence,
+                        overlap.right,
+                        format!(
+                            "parallel for cannot establish independent visits: ordinary accesses to `{root}` at source offsets {} and {} may overlap across distinct visits",
+                            overlap.left.start, overlap.right.start,
+                        ),
+                    );
+                }
             }
         }
         let mut exits = vec![];
@@ -2422,10 +2377,7 @@ impl Initialization<'_, '_> {
             exits.push(exit);
         }
         // Loop exits join like `if` arms, on whether the loop ran at all.
-        let (mut result, exits): (Vec<_>, Vec<_>) =
-            exits.into_iter().partition(|exit| exit.returned);
-        result.extend(self.join(&entry, &nonempty, exits, empty.into_iter().collect(), &[]));
-        result
+        self.join(&entry, &nonempty, exits, empty.into_iter().collect(), &[])
     }
 }
 
@@ -2486,8 +2438,17 @@ fn argument<'a>(arguments: &'a [Value], path: &ParameterPath) -> &'a Value {
 }
 
 impl Initialization<'_, '_> {
+    /// The symbols of the definition's dimensions.
+    fn dimension_symbols(&self) -> Vec<SymbolId> {
+        self.checker
+            .sig
+            .dimensions
+            .iter()
+            .map(|dimension| dimension.symbol)
+            .collect()
+    }
     fn close_contract(&mut self, contract: Contract) -> Contract {
-        let mut allowed = self.checker.sig.shape_symbols.clone();
+        let mut allowed = self.dimension_symbols();
         allowed.extend(contract.symbols.iter().map(|(symbol, _)| *symbol));
         self.close_transfer(contract, &allowed)
     }

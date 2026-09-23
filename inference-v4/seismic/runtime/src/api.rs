@@ -6,62 +6,6 @@ use seismic_compiler::errors::{ExecutionError, InvocationError};
 use seismic_lang::registry::BackendName;
 use std::fmt;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct DeviceId(pub(crate) usize);
-
-#[derive(Clone)]
-pub struct DeviceInfo {
-    pub id: DeviceId,
-    pub backend: BackendName,
-    pub name: String,
-    pub memory_bytes: u64,
-    pub(crate) descriptor: std::sync::Arc<crate::backends::Descriptor>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MemoryUsage {
-    pub charged: u64,
-    pub limit: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MemoryLimitError {
-    pub limit: u64,
-    pub charged: u64,
-}
-
-impl fmt::Display for MemoryLimitError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "memory limit {} is below {} retained bytes",
-            self.limit, self.charged
-        )
-    }
-}
-impl std::error::Error for MemoryLimitError {}
-
-impl fmt::Debug for DeviceInfo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DeviceInfo")
-            .field("id", &self.id)
-            .field("backend", &self.backend)
-            .field("name", &self.name)
-            .field("memory_bytes", &self.memory_bytes)
-            .finish()
-    }
-}
-
-impl PartialEq for DeviceInfo {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-            && self.backend == other.backend
-            && self.name == other.name
-            && self.memory_bytes == other.memory_bytes
-    }
-}
-impl Eq for DeviceInfo {}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CallError {
     Invocation(InvocationError),
@@ -191,6 +135,11 @@ pub enum TensorError {
         current_bytes: u64,
         requested_bytes: u64,
     },
+    /// A reshape of a view whose storage is not contiguous row-major.
+    ReshapeLayout {
+        extents: Vec<u64>,
+        strides: Vec<u64>,
+    },
     Execution(ExecutionError),
 }
 impl fmt::Display for TensorError {
@@ -221,6 +170,10 @@ impl fmt::Display for TensorError {
                 f,
                 "reshape requires {requested_bytes} bytes but the tensor view contains {current_bytes}"
             ),
+            Self::ReshapeLayout { extents, strides } => write!(
+                f,
+                "reshape requires contiguous storage, but the view of extents {extents:?} has strides {strides:?}"
+            ),
             Self::Execution(error) => write!(f, "{error}"),
         }
     }
@@ -232,58 +185,21 @@ impl From<ExecutionError> for TensorError {
     }
 }
 
-pub mod catalog {
-    use super::{DeviceId, DeviceInfo};
-    use crate::api::device::DeviceInner;
-    use crate::backends;
-    use seismic_compiler::errors::TargetError;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex, Weak};
-
-    pub struct Catalog {
-        pub(crate) infos: Vec<DeviceInfo>,
-        opened: Mutex<HashMap<DeviceId, Weak<DeviceInner>>>,
-    }
-    impl Catalog {
-        pub fn discover() -> Result<Self, TargetError> {
-            Ok(Self {
-                infos: backends::discover()?,
-                opened: Mutex::new(HashMap::new()),
-            })
-        }
-        pub fn devices(&self) -> &[DeviceInfo] {
-            &self.infos
-        }
-        pub fn open(&self, id: DeviceId) -> Result<Arc<DeviceInner>, TargetError> {
-            // Holding this lock through acquisition makes opening atomic: two
-            // callers cannot create independent services or profiles for the
-            // same catalog descriptor. A dropped device may be opened and
-            // profiled again; a live one is always shared.
-            let mut opened = self
-                .opened
-                .lock()
-                .expect("device catalog open-cache lock poisoned while acquiring a private device");
-            if let Some(device) = opened.get(&id).and_then(Weak::upgrade) {
-                return Ok(device);
-            }
-            let device = backends::open(&self.infos, id)?;
-            opened.insert(id, Arc::downgrade(&device));
-            Ok(device)
-        }
-    }
-}
-
 pub mod device {
-    use super::DeviceInfo;
-    use crate::backends::DeviceKind;
+    use crate::backends::OpenedKind;
+    use crate::devices::{
+        DeviceInfo, DeviceMemoryStatus, MemoryLimitError, MemoryUsage, ObservationError,
+    };
     use crate::driver::Allocation;
     use seismic_compiler::errors::ExecutionError;
     use std::sync::Arc;
 
+    /// One opened catalog device: its immutable description, execution
+    /// resources and accounting scope.
     pub struct DeviceInner {
         pub(crate) info: DeviceInfo,
         pub(crate) capabilities: std::sync::OnceLock<Vec<String>>,
-        pub(crate) kind: DeviceKind,
+        pub(crate) kind: OpenedKind,
     }
     impl DeviceInner {
         pub fn info(&self) -> &DeviceInfo {
@@ -307,17 +223,16 @@ pub mod device {
         ) -> bool {
             self.kind.supports_representation(representation)
         }
-        #[doc(hidden)]
-        pub fn memory_usage(&self) -> super::MemoryUsage {
-            let usage = self.kind.memory_usage();
-            super::MemoryUsage {
-                charged: usage.charged,
-                limit: usage.limit,
-            }
+        pub fn memory_usage(&self) -> MemoryUsage {
+            self.kind.memory_usage()
         }
-        #[doc(hidden)]
-        pub fn set_memory_limit(&self, limit: Option<u64>) -> Result<(), super::MemoryLimitError> {
+        /// Bounds allocations made through this device. Charges already made
+        /// count against the limit; they are never charged twice.
+        pub fn set_memory_limit(&self, limit: Option<u64>) -> Result<(), MemoryLimitError> {
             self.kind.set_memory_limit(limit)
+        }
+        pub fn memory_status(&self) -> Result<DeviceMemoryStatus, ObservationError> {
+            self.kind.memory_status()
         }
     }
 }
@@ -329,7 +244,7 @@ pub mod tensor {
     use seismic_compiler::errors::ExecutionError;
     use seismic_compiler::prepared::TensorDescriptor;
     use seismic_lang::ids::RepresentationId;
-    use seismic_lang::registry::{representation_info, RepresentationKind};
+    use seismic_lang::registry::representation_info;
     use std::sync::Arc;
 
     pub struct TensorInner {
@@ -567,142 +482,33 @@ pub mod tensor {
                 })
         }
         pub fn slice_leading(&self, start: u64, end: u64) -> Result<Self, TensorError> {
-            let Some(&leading) = self.extents.first() else {
-                return Err(TensorError::SliceOutOfBounds {
-                    extent: 0,
-                    start,
-                    end,
-                });
-            };
-            if start > end || end > leading {
-                return Err(TensorError::SliceOutOfBounds {
-                    extent: leading,
-                    start,
-                    end,
-                });
-            }
-            let mut extents = self.extents.clone();
-            extents[0] = end - start;
-            let (relative, byte_len) = match &representation_info(self.representation).kind {
-                RepresentationKind::Dense(dtype) => {
-                    let unit = u64::from(dtype.bytes());
-                    let row = self.strides[0]
-                        .checked_mul(unit)
-                        .expect("canonical tensor row bytes overflowed");
-                    (
-                        start
-                            .checked_mul(row)
-                            .expect("validated leading slice offset overflowed"),
-                        (end - start)
-                            .checked_mul(row)
-                            .expect("validated leading slice length overflowed"),
-                    )
-                }
-                RepresentationKind::Packed(packet) if self.extents.len() == 1 => {
-                    let group = u64::from(packet.group);
-                    if start % group != 0 || (end != leading && end % group != 0) {
-                        return Err(TensorError::UnalignedPacketSlice {
-                            group: packet.group,
-                            start,
-                            end,
-                        });
-                    }
-                    let first = start / group;
-                    let last = end
-                        .checked_add(group - 1)
-                        .and_then(|v| v.checked_div(group))
-                        .expect("validated packed slice packet bound overflowed");
-                    let packet_bytes = u64::from(packet.packet_size);
-                    (
-                        first
-                            .checked_mul(packet_bytes)
-                            .expect("packed slice offset overflowed"),
-                        (last - first)
-                            .checked_mul(packet_bytes)
-                            .expect("packed slice length overflowed"),
-                    )
-                }
-                RepresentationKind::Packed(packet) => {
-                    let row = self.strides[0]
-                        .checked_mul(u64::from(packet.packet_size))
-                        .expect("canonical packed row bytes overflowed");
-                    (
-                        start
-                            .checked_mul(row)
-                            .expect("validated leading slice offset overflowed"),
-                        (end - start)
-                            .checked_mul(row)
-                            .expect("validated leading slice length overflowed"),
-                    )
-                }
-                RepresentationKind::External(packet) if self.extents.len() == 1 => {
-                    let group = u64::from(packet.logical_group);
-                    if start % group != 0 || (end != leading && end % group != 0) {
-                        return Err(TensorError::UnalignedPacketSlice {
-                            group: packet.logical_group,
-                            start,
-                            end,
-                        });
-                    }
-                    let first = start / group;
-                    let last = end
-                        .checked_add(group - 1)
-                        .and_then(|value| value.checked_div(group))
-                        .expect("validated external slice packet bound overflowed");
-                    let packet_bytes = u64::from(packet.packet_size);
-                    (
-                        first
-                            .checked_mul(packet_bytes)
-                            .expect("external slice offset overflowed"),
-                        (last - first)
-                            .checked_mul(packet_bytes)
-                            .expect("external slice length overflowed"),
-                    )
-                }
-                RepresentationKind::External(packet) => {
-                    let row = self.strides[0]
-                        .checked_mul(u64::from(packet.packet_size))
-                        .expect("canonical external row bytes overflowed");
-                    (
-                        start
-                            .checked_mul(row)
-                            .expect("validated leading slice offset overflowed"),
-                        (end - start)
-                            .checked_mul(row)
-                            .expect("validated leading slice length overflowed"),
-                    )
-                }
-            };
-            let byte_offset = self
-                .byte_offset
-                .checked_add(relative)
-                .expect("validated leading slice base overflowed");
-            Ok(Self::new_view(
-                self.device.clone(),
-                self.allocation.clone(),
-                byte_offset,
-                byte_len,
-                self.representation,
-                extents,
-                self.strides.clone(),
-            ))
+            self.view(&crate::api::kernel::ViewOperation::LeadingSlice { start, end })
         }
         pub fn reshape(&self, extents: &[u64]) -> Result<Self, TensorError> {
-            let layout = layout::canonical(self.representation, extents)?;
-            if layout.byte_len != self.byte_len {
-                return Err(TensorError::ReshapeStorage {
-                    current_bytes: self.byte_len,
-                    requested_bytes: layout.byte_len,
-                });
-            }
+            self.view(&crate::api::kernel::ViewOperation::Reshape {
+                extents: extents.to_vec(),
+            })
+        }
+        /// This tensor seen through one view operation (`layout::apply_view`).
+        fn view(&self, operation: &crate::api::kernel::ViewOperation) -> Result<Self, TensorError> {
+            let view = layout::apply_view(
+                self.representation,
+                layout::ViewGeometry {
+                    extents: self.extents.clone(),
+                    strides: self.strides.clone(),
+                    byte_offset: self.byte_offset,
+                    byte_len: self.byte_len,
+                },
+                operation,
+            )?;
             Ok(Self::new_view(
                 self.device.clone(),
                 self.allocation.clone(),
-                self.byte_offset,
-                self.byte_len,
+                view.byte_offset,
+                view.byte_len,
                 self.representation,
-                extents.to_vec(),
-                layout.strides,
+                view.extents,
+                view.strides,
             ))
         }
         pub fn descriptor(&self) -> TensorDescriptor {
@@ -816,7 +622,7 @@ pub mod kernel {
         ScalarResult(WorkflowResultRef),
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum ViewOperation {
         LeadingSlice { start: u64, end: u64 },
         Reshape { extents: Vec<u64> },
@@ -919,7 +725,6 @@ pub mod kernel {
         }
     }
 
-    #[derive(Clone)]
     #[doc(hidden)]
     pub use crate::driver::workflow::ScalarValue as EncodedScalar;
     impl EncodedScalar {

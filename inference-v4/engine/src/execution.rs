@@ -13,7 +13,7 @@ use magnitude_model_executor::{
 };
 use magnitude_model_state::CodecIdentity;
 use magnitude_service::retention::{RetentionKey, TokenizerIdentity};
-use seismic::BackendName;
+use seismic::DeviceCatalog;
 use std::rc::Rc;
 
 pub(crate) fn start(configuration: ResolvedEngineConfiguration) -> Result<ReadyEngine, String> {
@@ -65,9 +65,11 @@ fn build_native_domain(
             "service policy requires {max_batch_rows} rows but the execution contract admits at most {MAX_CLASS_ROWS}"
         ));
     }
-    let discovery = platform::discover().map_err(|error| error.to_string())?;
-    let endpoint = platform::select(discovery.topology(), Some(BackendName::Metal))
-        .map_err(|error| error.to_string())?;
+    // This runs inside the numerical worker: its own Seismic catalog and its
+    // own process-scoped observations decide selection and admission.
+    let catalog = DeviceCatalog::discover().map_err(|error| error.to_string())?;
+    let selected =
+        platform::select_device(&catalog, manifest.path).map_err(|error| error.to_string())?;
     let method = match manifest.model.method {
         crate::options::ResolvedMethod::Plain => PlannedMethod::Plain,
         crate::options::ResolvedMethod::Mtp {
@@ -95,7 +97,7 @@ fn build_native_domain(
         safety_reserve_bytes: manifest.storage.safety_reserve_bytes,
     };
     let draft = ExecutionPlanner::prepare(
-        &endpoint,
+        &selected,
         &manifest.package,
         &manifest.definition,
         selection,
@@ -114,13 +116,11 @@ fn build_native_domain(
         budget,
     )?;
     let opened = platform::open_selected(
-        &discovery,
-        endpoint,
+        &catalog,
+        draft.device().selector(),
         PlatformConfig {
             path: manifest.path,
-            requested_backend: Some(BackendName::Metal),
-            storage_bytes: Some(manifest.storage.storage_bytes),
-            requirements: platform::MemoryRequirements::default(),
+            storage_bytes: manifest.storage.storage_bytes,
         },
     )
     .map_err(|error| error.to_string())?;
@@ -147,17 +147,14 @@ fn build_native_domain(
     let execution_plan = draft.admit(resources).map_err(|error| error.to_string())?;
     let plan = execution_plan.resources().clone();
     let qualified = opened
-        .admit(&discovery, plan.memory_requirements(), programs)
+        .admit(plan.memory_requirements(), programs)
         .map_err(|error| error.to_string())?;
-    if qualified.plan.endpoint.backend != execution_plan.device().backend()
-        || qualified.plan.endpoint.ordinal != execution_plan.device().ordinal()
-        || qualified.plan.endpoint.name != execution_plan.device().name()
-    {
+    if qualified.selector != execution_plan.device().selector() {
         return Err("qualified device differs from the selected execution plan".into());
     }
     let resource_identity = ResourceDomainId::new(format!(
-        "{}:{}:{}",
-        manifest.package.identity, qualified.plan.endpoint.name, qualified.plan.endpoint.ordinal,
+        "{}:{}",
+        manifest.package.identity, qualified.selector,
     ))?;
     let device = Rc::new(qualified.device);
     let programs = Rc::new(qualified.programs);

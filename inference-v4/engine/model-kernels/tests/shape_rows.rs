@@ -167,7 +167,7 @@ fn portable_shaping_matches_the_ordered_host_reference() {
         vec![ROWS, VOCABULARY],
         vec![0.0; ROWS * VOCABULARY],
     ));
-    interpreter
+    let outcome = interpreter
         .run(&[
             Arg::Tensor(logits),
             Arg::Tensor(params),
@@ -175,20 +175,21 @@ fn portable_shaping_matches_the_ordered_host_reference() {
             Arg::Tensor(out),
         ])
         .unwrap();
-    let TensorData::Dense { data, .. } = &interpreter.tensors[out] else {
-        panic!("shape output must be dense")
-    };
-    let actual = data.iter().map(|value| *value as f32).collect::<Vec<_>>();
+    let out_input = outcome.inputs().nth(3).unwrap();
+    let out = out_input.tensor();
+    let actual = (0..out.element_count())
+        .map(|index| out.read(index).unwrap() as f32)
+        .collect::<Vec<_>>();
     assert_values(&actual, &expected);
     assert_eq!(&actual[..VOCABULARY], &[3.0, 2.0, 1.0, 0.0, -1.0, -2.0]);
 }
 
 #[test]
 fn generated_surface_exposes_planned_and_native_preparation() {
-    let planned: fn(&seismic::Device, seismic::PrecisionPolicy) -> _ = shape_rows::for_device;
+    let planned: fn(&seismic::Device, seismic::PreparationOptions) -> _ = shape_rows::for_device;
     let native: fn(&seismic::Device) -> _ = shape_rows::native_for_device;
     let _ = (planned, native);
-    let planned_sample: fn(&seismic::Device, seismic::PrecisionPolicy) -> _ =
+    let planned_sample: fn(&seismic::Device, seismic::PreparationOptions) -> _ =
         sample_rows::for_device;
     let native_sample: fn(&seismic::Device) -> _ = sample_rows::native_for_device;
     let _ = (planned_sample, native_sample);

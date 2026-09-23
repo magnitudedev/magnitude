@@ -770,6 +770,7 @@ fn inverse_operations(
 #[cfg(test)]
 mod dimension_inference_tests {
     use super::*;
+    use crate::entry::CallSchema;
     use crate::expr::NatExpr;
 
     fn dimensions<'a>(

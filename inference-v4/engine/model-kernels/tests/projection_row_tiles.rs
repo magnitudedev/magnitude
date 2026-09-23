@@ -206,7 +206,7 @@ fn metal_projection_tiles_match_independent_nine_row_host_matmuls() {
     assert_close(&recurrent, &expected_recurrent, "recurrent projection");
     let recurrent_output = qwen_recurrent_output::native_for_device_with(
         &device,
-        qwen_recurrent_output::Elements { OW: f32e },
+        qwen_recurrent_output::Elements { OW: f32e, A: f32e },
     )
     .unwrap()
     .call(qwen_recurrent_output::Args {

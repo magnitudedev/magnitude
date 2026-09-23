@@ -29,9 +29,8 @@ pub(crate) mod xfer;
 pub(crate) use entry_build::build_entry;
 
 use self::ir::{
-    Block as CheckedBlock, Body as CheckedBody, DefKind, Expr as CheckedExpr,
-    ExprKind as CheckedExprKind, Local as CheckedLocal, LocalId, Ownership as ParamOwnership,
-    Placement, Predicate,
+    Block as CheckedBlock, Body as CheckedBody, Expr as CheckedExpr, Local as CheckedLocal,
+    LocalId, Ownership as ParamOwnership, Placement, Predicate,
 };
 use crate::checked::{DiagnosticRule, EntryInfo};
 use crate::expr::{ExprArena, IntExpr, SymbolId, SymbolSort};
@@ -82,7 +81,6 @@ pub(crate) struct Checker<'a> {
     pub env: &'a Env<'a>,
     pub def: usize,
     pub sig: BodySig,
-    pub kind: DefKind,
     /// The target whose forms this body may name: a lowering target.
     pub target: Option<crate::registry::BackendName>,
     pub requires: Vec<(CapabilityId, Span)>,
@@ -125,7 +123,6 @@ impl<'a> Checker<'a> {
             env,
             def,
             sig,
-            kind: declared.kind,
             target,
             requires: declared.requires.clone(),
             used_capabilities: BTreeSet::new(),
@@ -724,13 +721,10 @@ pub(crate) fn check_program(
 ) -> Option<(Vec<ir::Definition>, Vec<ir::Family>)> {
     let resolved = resolve::resolve(files, program, diagnostics);
     let count = resolved.declared.len();
-    let order = match resolved.call_graph.bottom_up_order() {
-        Ok(order) => order,
-        Err(cycle) => {
-            diagnostics.push(cycle.diagnostic(&resolved.declared));
-            return None;
-        }
-    };
+    // L20: every recursion is one diagnostic, and every definition that
+    // reaches no recursion is still checked.
+    let (order, cycles) = resolved.call_graph.bottom_up_order();
+    diagnostics.extend(cycles.iter().map(|cycle| cycle.diagnostic(&resolved.declared)));
     let mut outcomes: Vec<Option<CheckedOutcome>> = (0..count).map(|_| None).collect();
     for def in order {
         let env = Env {
@@ -741,21 +735,22 @@ pub(crate) fn check_program(
         let checked = check_definition(&env, def);
         outcomes[def] = Some(checked);
     }
-    let mut outcomes = outcomes
-        .into_iter()
-        .map(|outcome| outcome.expect("definition checking order omitted a body"))
-        .collect::<Vec<_>>();
     let mut clean = diagnostics.is_empty();
     for (outcome, declared) in outcomes.iter_mut().zip(&resolved.declared) {
-        clean &= outcome.diagnostics.is_empty();
-        diagnostics.extend(outcome.diagnostics.drain(..).map(|diagnostic| Located {
-            file: declared.file,
-            diagnostic,
-        }));
+        if let Some(outcome) = outcome {
+            clean &= outcome.diagnostics.is_empty();
+            diagnostics.extend(outcome.diagnostics.drain(..).map(|diagnostic| Located {
+                file: declared.file,
+                diagnostic,
+            }));
+        }
     }
     if !clean {
         return None;
     }
+    // Without a recursion, the order holds every definition.
+    let mut outcomes = outcomes.into_iter().flatten().collect::<Vec<_>>();
+    assert_eq!(outcomes.len(), count, "definition checking order omitted a body");
     let families = resolved
         .families
         .iter()

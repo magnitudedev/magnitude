@@ -246,21 +246,6 @@ impl Poly {
         }
     }
 
-    /// `self / c` when every coefficient is divisible by `c`.
-    pub(crate) fn div_exact(&self, c: i64) -> Option<Poly> {
-        if !self.valid || c == 0 {
-            return None;
-        }
-        let mut out = Poly::default();
-        for (m, k) in &self.terms {
-            if k % c != 0 {
-                return None;
-            }
-            out.terms.insert(m.clone(), k / c);
-        }
-        Some(out)
-    }
-
     /// Euclidean quotient. Sign-dependent rewrites belong to the prover,
     /// which can establish a divisor's sign on the atom's defined path.
     pub(crate) fn quot(&self, den: &Poly) -> Poly {

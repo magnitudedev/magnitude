@@ -578,8 +578,9 @@ mod tests {
 
     #[test]
     fn abort_recovers_source_and_releases_tentative_capacity() {
-        let Ok(device) =
-            DeviceCatalog::discover().and_then(|catalog| catalog.open_backend(BackendName::Cpu))
+        let Some(device) = DeviceCatalog::discover()
+            .ok()
+            .and_then(|catalog| catalog.open_backend(BackendName::Cpu).ok())
         else {
             return;
         };
@@ -617,8 +618,9 @@ mod tests {
 
     #[test]
     fn codec_conversion_reserves_and_publishes_only_after_completion() {
-        let Ok(device) =
-            DeviceCatalog::discover().and_then(|catalog| catalog.open_backend(BackendName::Cpu))
+        let Some(device) = DeviceCatalog::discover()
+            .ok()
+            .and_then(|catalog| catalog.open_backend(BackendName::Cpu).ok())
         else {
             return;
         };
@@ -690,8 +692,9 @@ mod tests {
 
     #[test]
     fn recurrent_interior_prefix_remains_unpublished_until_repair() {
-        let Ok(device) =
-            DeviceCatalog::discover().and_then(|catalog| catalog.open_backend(BackendName::Cpu))
+        let Some(device) = DeviceCatalog::discover()
+            .ok()
+            .and_then(|catalog| catalog.open_backend(BackendName::Cpu).ok())
         else {
             return;
         };

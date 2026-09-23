@@ -629,6 +629,23 @@ mod budget_tests {
             )
             .unwrap()
     }
+    /// C1-19: a quantity converts to a float by one RNE rounding of the
+    /// mathematical integer.
+    #[test]
+    fn quantity_to_float_rounds_the_mathematical_integer_once() {
+        let entry = entry("fn probe[N](x: &tensor[N] f32) -> (f32, f16):\n    return f32(N), f16(N)\n");
+        for (n, single, half) in [(5, 5f32.to_bits(), 0x4500), (2049, 2049f32.to_bits(), 0x6800), (65520, 65520f32.to_bits(), 0x7c00)] {
+            let mut interpreter = Interpreter::new(&entry);
+            let x = interpreter.add_tensor(TensorData::dense(DType::F32, vec![n], vec![0.0; n]));
+            let outcome = interpreter.run(&[Arg::Tensor(x)]).unwrap();
+            let values = outcome.results().map(|result| match result.value() {
+                OutcomeValue::Scalar(value) => value,
+                _ => panic!("scalar results"),
+            }).collect::<Vec<_>>();
+            assert_eq!(values, [ReferenceScalar::F32(single), ReferenceScalar::F16(half)], "N = {n}");
+        }
+    }
+
     #[test]
     fn large_allocation_stops_before_materializing_elements() {
         let entry = entry("fn probe() -> tensor[1000000000] f32:\n    let mut output = tensor[1000000000] f32\n    parallel for i in 0..1000000000:\n        output[i] = 1.0\n    return output\n");

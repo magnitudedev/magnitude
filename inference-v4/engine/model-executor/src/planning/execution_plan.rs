@@ -7,37 +7,40 @@ use super::{
 };
 use crate::{
     error::{CapacityError, PlanError, ResourceKind},
-    platform::Endpoint,
+    platform::SelectedDevice,
     ExecutionPath,
 };
 use magnitude_artifacts::PackageManifest;
 use magnitude_model_contracts::ModelDefinition;
 use magnitude_model_state::KvCodec;
-use seismic::BackendName;
+use seismic::{BackendName, DeviceSelector};
 
+/// The planned device by Seismic identity. The selector, not a name or
+/// ordinal, is what the executing process resolves and opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlannedDevice {
+    selector: DeviceSelector,
     backend: BackendName,
-    ordinal: u32,
     name: String,
-    physical_memory_bytes: u64,
+    assessment_capacity_bytes: u64,
 }
 
 impl PlannedDevice {
-    pub fn backend(&self) -> BackendName {
-        self.backend
+    pub fn selector(&self) -> DeviceSelector {
+        self.selector
     }
 
-    pub fn ordinal(&self) -> u32 {
-        self.ordinal
+    pub fn backend(&self) -> BackendName {
+        self.backend
     }
 
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    pub fn physical_memory_bytes(&self) -> u64 {
-        self.physical_memory_bytes
+    /// Stable capacity minus the planning reserve at planning time.
+    pub fn assessment_capacity_bytes(&self) -> u64 {
+        self.assessment_capacity_bytes
     }
 }
 
@@ -188,7 +191,7 @@ pub struct ExecutionPlanner;
 
 impl ExecutionPlanner {
     pub fn prepare(
-        endpoint: &Endpoint,
+        device: &SelectedDevice,
         manifest: &PackageManifest,
         definition: &ModelDefinition,
         selection: ComponentSelection,
@@ -198,25 +201,19 @@ impl ExecutionPlanner {
         limits: ResourceLimits,
         budget: ResourceBudget,
     ) -> Result<ExecutionPlanDraft, PlanError> {
-        if !endpoint.is_available() {
-            return Err(PlanError::Unsupported("selected device"));
-        }
-        if endpoint.facts.memory_bytes == 0 {
-            return Err(PlanError::Unsupported("selected device memory facts"));
-        }
         if path == ExecutionPath::NativeMetal {
-            if endpoint.backend != BackendName::Metal {
+            if device.info.backend != BackendName::Metal {
                 return Err(PlanError::Unsupported("native Metal on selected backend"));
             }
             if codec != KvCodec::Dense {
                 return Err(PlanError::Unsupported("native Metal KV codec"));
             }
         }
-        if budget.storage_bytes > endpoint.facts.memory_bytes {
+        if budget.storage_bytes > device.assessment_capacity_bytes {
             return Err(PlanError::Resource(CapacityError {
                 resource: ResourceKind::DeviceMemory,
                 required: budget.storage_bytes,
-                available: endpoint.facts.memory_bytes,
+                available: device.assessment_capacity_bytes,
             }));
         }
         if selection.head != matches!(method, PlannedMethod::Mtp { .. }) {
@@ -293,10 +290,10 @@ impl ExecutionPlanner {
         }
         Ok(ExecutionPlanDraft {
             device: PlannedDevice {
-                backend: endpoint.backend,
-                ordinal: endpoint.ordinal,
-                name: endpoint.name.clone(),
-                physical_memory_bytes: endpoint.facts.memory_bytes,
+                selector: device.info.selector,
+                backend: device.info.backend,
+                name: device.info.name.clone(),
+                assessment_capacity_bytes: device.assessment_capacity_bytes,
             },
             components: ComponentPlan {
                 target,

@@ -2095,6 +2095,7 @@ dependencies = [
 name = "seismic-runtime"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "opentelemetry",
  "seismic-compiler",
  "seismic-cpu",
@@ -2103,6 +2104,8 @@ dependencies = [
  "seismic-lang",
  "seismic-metal",
  "seismic-target",
+ "serde",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

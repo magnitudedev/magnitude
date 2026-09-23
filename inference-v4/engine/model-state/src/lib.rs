@@ -836,9 +836,9 @@ mod tests {
 
     fn cpu_device() -> Option<Rc<Device>> {
         DeviceCatalog::discover()
-            .and_then(|catalog| catalog.open_backend(BackendName::Cpu))
-            .map(Rc::new)
             .ok()
+            .and_then(|catalog| catalog.open_backend(BackendName::Cpu).ok())
+            .map(Rc::new)
     }
 
     fn dense_component(width: usize) -> ComponentDescriptor {

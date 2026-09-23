@@ -3403,8 +3403,8 @@ mod dimension_inference_tests {
 
         let mut values = InvocationValues::new();
         plan.infer(&[5, 2], &mut values).unwrap();
-        assert_eq!(values.get(x_symbol), Some(SymbolValue::Nat(3)));
-        assert_eq!(values.get(y_symbol), Some(SymbolValue::Nat(2)));
+        assert_eq!(values.get(x_symbol), Some(SymbolValue::Nat(BigUint::from(3u32))));
+        assert_eq!(values.get(y_symbol), Some(SymbolValue::Nat(BigUint::from(2u32))));
     }
 
     #[test]

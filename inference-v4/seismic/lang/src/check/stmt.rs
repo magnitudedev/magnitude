@@ -51,16 +51,20 @@ impl RegionOps for Conditions<'_> {
 
 impl<'a> Checker<'a> {
     /// A new version of a mutable quantity or word local, carrying its
-    /// declared type's bounds (L32 (a)).
-    fn fresh_integer_version(&mut self, local: LocalId) -> SymbolId {
+    /// declared type's bounds (L32 (a)). The path that reaches a version
+    /// (an assignment, an `if` arm, a loop visit) decides its value at run
+    /// time, so a bound its facts do not prove is checked where it is used.
+    /// A version made by binding or assigning a value with a symbol equals
+    /// that symbol (L31, I-90), so the value's facts hold for the local.
+    fn fresh_integer_version(&mut self, local: LocalId, assigned: Option<IntExpr>) -> SymbolId {
         let ty = self.locals[local.index()].ty.clone();
-        let symbol = if matches!(ty, ValueType::Scalar(_)) {
-            self.fresh_data_symbol()
-        } else {
-            self.fresh_symbol()
-        };
+        let symbol = self.fresh_data_symbol();
         self.facts.assume_type(&mut self.arena, symbol, &ty);
         let value = self.arena.int_symbol(symbol);
+        if let Some(assigned) = assigned {
+            let difference = self.arena.int_sub(value, assigned);
+            self.assume_zero(difference);
+        }
         self.scalar_symbols.insert(local, value);
         symbol
     }
@@ -104,7 +108,7 @@ impl<'a> Checker<'a> {
                         ),
                     );
                 }
-                Vec::new()
+                Some(Vec::new())
             }
         };
         (root, result.unwrap_or_default())
@@ -203,7 +207,9 @@ impl<'a> Checker<'a> {
         value: &ast::Expr,
         state: bool,
     ) -> Option<CheckedStmt> {
+        // L31 (I-90): a bound word is its value's one symbol.
         let value = self.expr(value, None)?;
+        let value = self.word_value(value);
         if value.ty.is_void() {
             self.error(DiagnosticRule::Type, value.span, "cannot bind a call that returns nothing");
             return None;
@@ -295,7 +301,7 @@ impl<'a> Checker<'a> {
                 install(&mut ownership, state, &|root| self.writable_place(root));
                 self.locals[id.index()].ownership = ownership;
                 if state && Self::integer_value_type(ty) {
-                    let symbol = self.fresh_integer_version(id);
+                    let symbol = self.fresh_integer_version(id, value.sym);
                     self.locals[id.index()].symbol = Some(symbol);
                 } else if !state && ty.scalar_dtype().is_some_and(DType::is_int) {
                     // I-90: a word local is one symbol, its runtime value.
@@ -562,7 +568,7 @@ impl<'a> Checker<'a> {
                     .iter()
                     .filter_map(|(place, ty)| match place {
                         CheckedPlace::Local(root) if Self::integer_value_type(ty) => {
-                            Some((root.local, self.fresh_integer_version(root.local)))
+                            Some((root.local, self.fresh_integer_version(root.local, None)))
                         }
                         _ => None,
                     })
@@ -605,7 +611,7 @@ impl<'a> Checker<'a> {
                 }
                 let authorities = self.exclusive_write_authority(root, &place);
                 let value_symbols = Self::integer_value_type(&ty)
-                    .then(|| (root, self.fresh_integer_version(root)))
+                    .then(|| (root, self.fresh_integer_version(root, value.sym)))
                     .into_iter()
                     .collect();
                 Some(CheckedStmt::Assign {
@@ -973,7 +979,7 @@ impl<'a> Checker<'a> {
             let then_value = symbols_then.get(&id).copied().unwrap_or(before);
             let else_value = symbols_else.get(&id).copied().unwrap_or(before);
             if then_value != before || else_value != before {
-                let joined = self.fresh_integer_version(id);
+                let joined = self.fresh_integer_version(id, None);
                 // L32 (b): the bounds common to both arms.
                 let scope = self.scope_symbols();
                 self.facts.join_bounds(
@@ -1154,7 +1160,7 @@ impl<'a> Checker<'a> {
                 && self.locals[ordinal].mutable
                 && Self::integer_value_type(&self.locals[ordinal].ty)
             {
-                let header = self.fresh_integer_version(id);
+                let header = self.fresh_integer_version(id, None);
                 value_symbols.push((id, header, header));
             }
         }
@@ -1198,7 +1204,7 @@ impl<'a> Checker<'a> {
         self.facts = facts_before;
         self.scalar_symbols = symbols_before;
         for (id, _, exit) in &mut value_symbols {
-            *exit = self.fresh_integer_version(*id);
+            *exit = self.fresh_integer_version(*id, None);
         }
         let kind = if parallel {
             LoopKind::Independent

@@ -43,9 +43,9 @@ impl Device {
     fn capabilities(&self) -> Vec<String> {
         self.inner.capabilities().to_vec()
     }
-    fn memory_usage(&self) -> (u64, Option<u64>) {
+    fn memory_usage(&self) -> (u64, Option<u64>, u64) {
         let m = self.inner.memory_usage();
-        (m.charged, m.limit)
+        (m.charged, m.limit, m.pool_charged)
     }
     fn set_memory_limit(&self, bytes: Option<u64>) -> PyResult<()> {
         self.inner
@@ -57,36 +57,44 @@ impl Device {
     }
 }
 #[pyfunction]
-fn devices() -> PyResult<Vec<(String, String, u64)>> {
+fn devices() -> PyResult<Vec<(String, String, String)>> {
     let c = catalog()?.lock().unwrap();
-    let mut counts = BTreeMap::new();
-    Ok(c.devices()
+    Ok(c.topology()
+        .devices()
         .iter()
         .map(|i| {
-            let b = i.backend.as_str();
-            let n = counts.entry(b).or_insert(0);
-            let selector = format!("{b}:{n}");
-            *n += 1;
-            (selector, i.name.clone(), i.memory_bytes)
+            (
+                i.selector.to_string(),
+                i.name.clone(),
+                i.backend.as_str().to_owned(),
+            )
         })
         .collect())
 }
+/// Opens an exact device selector (`host-cpu`, `metal:…`, `cuda:…`), or,
+/// for low-level use, the first device of a backend name (`cpu`, `metal`).
 #[pyfunction]
 fn device(py: Python<'_>, selector: &str) -> PyResult<Device> {
-    let (backend, index) = selector.split_once(':').unwrap_or((selector, "0"));
-    let index: usize = index
-        .parse()
-        .map_err(|_| pyo3::exceptions::PyValueError::new_err("invalid device index"))?;
-    let backend = backend.to_owned();
+    let selector = selector.to_owned();
     py.detach(move || {
         let c = catalog()?.lock().unwrap();
-        let id = c
-            .devices()
-            .iter()
-            .filter(|i| i.backend.as_str() == backend)
-            .nth(index)
-            .map(|i| i.id)
-            .ok_or_else(|| error(d::Error::new("TargetError", "device was not discovered")))?;
+        let id = match selector.parse::<seismic::DeviceSelector>() {
+            Ok(exact) => c
+                .resolve(exact)
+                .map_err(|e| error(d::Error::new("TargetError", e)))?,
+            Err(_) => c
+                .topology()
+                .devices()
+                .iter()
+                .find(|i| i.backend.as_str() == selector)
+                .map(|i| i.id)
+                .ok_or_else(|| {
+                    error(d::Error::new(
+                        "TargetError",
+                        format!("no device matches `{selector}`"),
+                    ))
+                })?,
+        };
         Ok(Device {
             inner: c
                 .open(id)

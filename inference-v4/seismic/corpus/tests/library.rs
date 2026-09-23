@@ -1,4 +1,4 @@
-//! The standard library and `engine/lib` entries through the public API
+//! The standard library and `engine/model-kernels/kernels` entries through the public API
 //! (design A10 §2.8; `engine.invocations` is A9's Tier 0).
 use crate::common::{check_call, corpus_path, device, element_named, policy_name, prepare, Selection};
 use seismic::dynamic::Module;
@@ -13,14 +13,14 @@ fn std_module() -> Module {
 }
 
 fn engine_module() -> Module {
-    let directory = corpus_path("../../engine/lib");
+    let directory = corpus_path("../../engine/model-kernels/kernels");
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&directory)
         .unwrap_or_else(|e| panic!("{}: {e}", directory.display()))
-        .map(|entry| entry.expect("engine/lib entry").path())
+        .map(|entry| entry.expect("engine kernels entry").path())
         .filter(|path| path.extension().is_some_and(|extension| extension == "seismic"))
         .collect();
     paths.sort();
-    Module::load(&paths, true).unwrap_or_else(|e| panic!("engine/lib loads: {e}"))
+    Module::load(&paths, true).unwrap_or_else(|e| panic!("engine kernels load: {e}"))
 }
 
 fn names(module: &Module) -> BTreeSet<String> {

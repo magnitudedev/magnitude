@@ -4,13 +4,8 @@ use seismic_lang::checked::{check_source, SourceFile, SourceSet};
 use seismic_lang::entry::ElementBindings;
 
 fn packed_reads(backend: registry::BackendName) {
-    let catalog = crate::api::catalog::Catalog::discover().unwrap();
-    let info = catalog
-        .devices()
-        .iter()
-        .find(|d| d.backend == backend)
-        .unwrap();
-    let device = catalog.open(info.id).unwrap();
+    let catalog = crate::devices::Catalog::discover().unwrap();
+    let device = catalog.open_backend(backend).unwrap();
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "packed-field-read.seismic".into(),
         text: "fn probe[N](x: &tensor[N] Q) -> tensor[N] f32:\n    let mut result = tensor[N] f32\n    parallel for i in 0..N:\n        result[i] = f32(x[i])\n    return result\n".into(),
