@@ -380,6 +380,62 @@ struct HardwareEnvironment {
     physical_cores: Option<usize>,
     logical_cores: usize,
     system_memory: HardwareSystemMemory,
+    integrated_carveout: IntegratedCarveout,
+}
+
+/// Memory that an integrated GPU reserves outside OS-visible RAM, such as the BIOS frame buffer
+/// on AMD APUs. The OS never reports it, so the shared domain has to add it explicitly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct IntegratedCarveout {
+    total_bytes: u64,
+    free_bytes: u64,
+}
+
+const PCI_DEVICES_ROOT: &str = "/sys/bus/pci/devices";
+
+/// Samples the carve-out of the integrated GPUs with the given PCI ids. Only amdgpu exposes
+/// `mem_info_vram_*` for an APU; Intel iGPUs allocate from system RAM and have no such files,
+/// so they add nothing.
+fn sample_integrated_carveout<'a>(
+    platform: &str,
+    integrated_gpu_pci_ids: impl IntoIterator<Item = &'a str>,
+) -> IntegratedCarveout {
+    if platform != "linux" {
+        return IntegratedCarveout::default();
+    }
+    read_integrated_carveout(Path::new(PCI_DEVICES_ROOT), integrated_gpu_pci_ids)
+}
+
+fn read_integrated_carveout<'a>(
+    pci_devices: &Path,
+    integrated_gpu_pci_ids: impl IntoIterator<Item = &'a str>,
+) -> IntegratedCarveout {
+    // One iGPU can be listed by several backends; count each PCI device once.
+    let pci_ids = integrated_gpu_pci_ids.into_iter().collect::<BTreeSet<_>>();
+    pci_ids
+        .into_iter()
+        .filter_map(|pci_id| read_amdgpu_vram(&pci_devices.join(pci_id)))
+        .fold(IntegratedCarveout::default(), |sum, carveout| {
+            IntegratedCarveout {
+                total_bytes: sum.total_bytes.saturating_add(carveout.total_bytes),
+                free_bytes: sum.free_bytes.saturating_add(carveout.free_bytes),
+            }
+        })
+}
+
+fn read_amdgpu_vram(device: &Path) -> Option<IntegratedCarveout> {
+    let read = |name: &str| {
+        std::fs::read_to_string(device.join(name))
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    };
+    let total_bytes = read("mem_info_vram_total")?;
+    // Without a usage reading, treat the carve-out as fully used rather than guess.
+    let free_bytes = read("mem_info_vram_used").map_or(0, |used| total_bytes.saturating_sub(used));
+    Some(IntegratedCarveout {
+        total_bytes,
+        free_bytes,
+    })
 }
 
 impl Default for CapacityPolicy {
@@ -440,6 +496,13 @@ pub fn discover_hardware(
         system_memory.assess_reserve_bytes = thresholds.assess_reserve_bytes;
         system_memory.abort_reserve_bytes = thresholds.abort_reserve_bytes;
     }
+    let integrated_carveout = sample_integrated_carveout(
+        std::env::consts::OS,
+        devices
+            .iter()
+            .filter(|device| device.kind == HardwareDeviceKind::IntegratedGpu)
+            .filter_map(|device| device.physical_id.as_deref()),
+    );
     hardware_snapshot_from_devices(
         devices,
         policy,
@@ -452,6 +515,7 @@ pub fn discover_hardware(
             physical_cores: cpu_topology::physical_cores(),
             logical_cores: std::thread::available_parallelism().map_or(1, |value| value.get()),
             system_memory,
+            integrated_carveout,
         },
     )
 }
@@ -503,8 +567,12 @@ fn hardware_snapshot_from_devices(
             .map(|device| device.total_bytes)
             .max()
             .unwrap_or(0);
+        let carveout = environment.integrated_carveout;
         let total = if environment.system_memory.physical_capacity_bytes > 0 {
-            environment.system_memory.physical_capacity_bytes
+            environment
+                .system_memory
+                .physical_capacity_bytes
+                .saturating_add(carveout.total_bytes)
         } else {
             backend_total
         };
@@ -522,7 +590,12 @@ fn hardware_snapshot_from_devices(
             total_capacity_bytes: total,
             stable_capacity_bytes: total
                 .saturating_sub(policy.reserve_for_domain(&MemoryDomainId::system())),
-            current_free_bytes: Some(environment.system_memory.physical_available_bytes),
+            current_free_bytes: Some(
+                environment
+                    .system_memory
+                    .physical_available_bytes
+                    .saturating_add(carveout.free_bytes),
+            ),
             shares_system_memory: true,
             devices: shared
                 .into_iter()
@@ -666,13 +739,27 @@ pub fn with_system_memory_observation(
         assess_reserve_bytes: thresholds.assess_reserve_bytes,
         abort_reserve_bytes: thresholds.abort_reserve_bytes,
     };
+    let platform = snapshot.platform.clone();
     for domain in &mut snapshot.memory_domains {
         if domain.id.is_system() {
-            domain.total_capacity_bytes = observation.physical_capacity_bytes;
-            domain.stable_capacity_bytes = observation
+            let carveout = sample_integrated_carveout(
+                &platform,
+                domain
+                    .devices
+                    .iter()
+                    .filter(|device| device.kind == HardwareDeviceKind::IntegratedGpu)
+                    .filter_map(|device| device.physical_id.as_deref()),
+            );
+            let total = observation
                 .physical_capacity_bytes
-                .saturating_sub(thresholds.assess_reserve_bytes);
-            domain.current_free_bytes = Some(observation.physical_available_bytes);
+                .saturating_add(carveout.total_bytes);
+            domain.total_capacity_bytes = total;
+            domain.stable_capacity_bytes = total.saturating_sub(thresholds.assess_reserve_bytes);
+            domain.current_free_bytes = Some(
+                observation
+                    .physical_available_bytes
+                    .saturating_add(carveout.free_bytes),
+            );
         }
     }
     snapshot.topology_fingerprint = topology_fingerprint(&snapshot.memory_domains);
@@ -2910,9 +2997,105 @@ mod tests {
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
+                integrated_carveout: IntegratedCarveout::default(),
             },
         );
         MemoryTopology::from_snapshot(&snapshot).expect("valid test memory topology")
+    }
+
+    #[test]
+    fn amd_apu_carveout_counts_toward_the_shared_memory_domain() {
+        // Strix Halo from #44: 96 GiB reserved for the iGPU, about 33 GiB left visible to the OS.
+        let gib = 1024 * 1024 * 1024;
+        let mut igpu = discovered_device(
+            "Vulkan",
+            "Radeon 8060S Graphics",
+            "Radeon 8060S Graphics",
+            HardwareDeviceKind::IntegratedGpu,
+            96 * gib,
+            90 * gib,
+        );
+        igpu.native_index = 1;
+        igpu.physical_id = Some("0000:c3:00.0".to_owned());
+        let snapshot = hardware_snapshot_from_devices(
+            vec![
+                discovered_device(
+                    "CPU",
+                    "CPU",
+                    "CPU",
+                    HardwareDeviceKind::Cpu,
+                    33 * gib,
+                    30 * gib,
+                ),
+                igpu,
+            ],
+            CapacityPolicy::default(),
+            HardwareEnvironment {
+                native_build: "test".to_owned(),
+                enabled_backends: Vec::new(),
+                platform: "linux".to_owned(),
+                architecture: "x86_64".to_owned(),
+                system_product_name: None,
+                physical_cores: Some(16),
+                logical_cores: 32,
+                system_memory: HardwareSystemMemory {
+                    physical_capacity_bytes: 33 * gib,
+                    physical_available_bytes: 30 * gib,
+                    allocation_capacity_bytes: 33 * gib,
+                    allocation_headroom_bytes: 30 * gib,
+                    assess_reserve_bytes: 0,
+                    abort_reserve_bytes: 0,
+                },
+                integrated_carveout: IntegratedCarveout {
+                    total_bytes: 96 * gib,
+                    free_bytes: 90 * gib,
+                },
+            },
+        );
+
+        assert_eq!(snapshot.memory_domains.len(), 1);
+        let domain = &snapshot.memory_domains[0];
+        assert_eq!(domain.kind, HardwareMemoryDomainKind::UnifiedMemory);
+        assert_eq!(domain.total_capacity_bytes, 129 * gib);
+        assert_eq!(domain.current_free_bytes, Some(120 * gib));
+        // The OS-level view is unchanged; only the shared domain gains the carve-out.
+        assert_eq!(snapshot.system_memory.physical_capacity_bytes, 33 * gib);
+    }
+
+    #[test]
+    fn integrated_carveout_counts_each_amdgpu_device_once() {
+        let gib: u64 = 1024 * 1024 * 1024;
+        let root = std::env::temp_dir().join(format!("icn-carveout-{}", std::process::id()));
+        let write = |pci_id: &str, total: u64, used: u64| {
+            let device = root.join(pci_id);
+            std::fs::create_dir_all(&device).unwrap();
+            std::fs::write(device.join("mem_info_vram_total"), format!("{total}\n")).unwrap();
+            std::fs::write(device.join("mem_info_vram_used"), format!("{used}\n")).unwrap();
+        };
+        write("0000:c3:00.0", 96 * gib, 6 * gib);
+        std::fs::create_dir_all(root.join("0000:00:02.0")).unwrap();
+
+        let carveout = read_integrated_carveout(
+            &root,
+            [
+                // AMD APU, listed twice as if exposed by two backends.
+                "0000:c3:00.0",
+                "0000:c3:00.0",
+                // Intel iGPU: no amdgpu files, allocates from system RAM.
+                "0000:00:02.0",
+                // Not present at all.
+                "0000:07:00.0",
+            ],
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(
+            carveout,
+            IntegratedCarveout {
+                total_bytes: 96 * gib,
+                free_bytes: 90 * gib,
+            }
+        );
     }
 
     #[test]
@@ -2985,6 +3168,7 @@ mod tests {
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
+                integrated_carveout: IntegratedCarveout::default(),
             },
         );
         assert_eq!(snapshot.memory_domains.len(), 3);
@@ -3070,6 +3254,7 @@ mod tests {
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
+                integrated_carveout: IntegratedCarveout::default(),
             },
         );
 
@@ -3129,6 +3314,7 @@ mod tests {
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
+                integrated_carveout: IntegratedCarveout::default(),
             },
         );
         let mut changed = devices.into_iter().rev().collect::<Vec<_>>();
@@ -3155,6 +3341,7 @@ mod tests {
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
+                integrated_carveout: IntegratedCarveout::default(),
             },
         );
         assert_eq!(first.topology_fingerprint, second.topology_fingerprint);
@@ -3224,6 +3411,7 @@ mod tests {
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
+                integrated_carveout: IntegratedCarveout::default(),
             },
         );
         let original_fingerprint = snapshot.topology_fingerprint.clone();
@@ -3303,6 +3491,7 @@ mod tests {
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
+                integrated_carveout: IntegratedCarveout::default(),
             },
         );
         assert_eq!(snapshot.memory_domains.len(), 2);
@@ -3786,6 +3975,7 @@ mod tests {
                     assess_reserve_bytes: 0,
                     abort_reserve_bytes: 0,
                 },
+                integrated_carveout: IntegratedCarveout::default(),
             },
         );
         let topology =
