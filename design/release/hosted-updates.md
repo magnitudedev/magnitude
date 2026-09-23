@@ -41,6 +41,23 @@ sealed application identifier and release version. The caller retains exclusive 
 through verification and publication. A successful signature check is not installation admission,
 archive containment validation or notarization acceptance; those remain separate transaction gates.
 
+macOS archive extraction operates in an empty private staging directory, separately from the live
+installation. It permits only one application root, bounded entries and expanded bytes, ordinary
+files, directories and contained relative links. It cannot create special files, hard links or
+privilege-bearing modes, write through archive-created symlinks, or overwrite duplicate entries.
+Framework version links, executable permissions and macOS resource metadata survive extraction.
+Dangling or cyclic links fail staging. No partially extracted tree authorizes installation; the
+transaction still authenticates the retained archive and verifies the resulting signed bundle.
+
+Native macOS transaction filesystem capabilities retain directory descriptors and revalidate their
+identities before access. Private journal directories and records cannot carry broader permissions,
+extended access grants, symlinks or hard links. A record is bounded, written completely to a new private
+file, synchronized, atomically published and synchronized with its parent before acknowledging success.
+Bundle exchange is descriptor-relative and requires both expected directory identities; stale requests
+cannot exchange the bundles again. An exchange error may occur after namespace mutation and requires
+identity reconciliation, never blind retry. These capabilities belong to the finite installer process;
+they neither acquire installation exclusion nor authorize mutation on their own.
+
 Application binaries are distributed through GitHub Releases. Downloads must resolve to trusted
 release assets, and interrupted or invalid transfers must not publish a prepared installer.
 

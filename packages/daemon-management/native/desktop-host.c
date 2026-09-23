@@ -28,6 +28,7 @@ void magnitude_register_application_memory(napi_env env, napi_value exports);
 void magnitude_register_machine_identity(napi_env env, napi_value exports);
 #ifdef __APPLE__
 void magnitude_register_mac_updates(napi_env env, napi_value exports);
+void magnitude_register_mac_update_filesystem(napi_env env, napi_value exports);
 #endif
 
 typedef struct {
@@ -427,6 +428,7 @@ static napi_value init(napi_env env, napi_value exports) {
   magnitude_register_machine_identity(env, exports);
   #ifdef __APPLE__
   magnitude_register_mac_updates(env, exports);
+  magnitude_register_mac_update_filesystem(env, exports);
   #endif
   return exports;
 }

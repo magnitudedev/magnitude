@@ -613,3 +613,56 @@ remote execution remains pending. Production signed replacement, notarization/Ga
 private extraction, exclusion, recovery and continuation integration remain open. Desktop compilation
 must provide publisher identity when the new service is integrated; the existing CLI release compiler
 already supplies that build constant. No existing desktop update backend was switched in this checkpoint.
+
+### Phase 6 work in progress: private macOS archive extraction
+
+At parent `7a5b9869`, added a standalone extraction helper using the operating system archive engine.
+Public API headers are pinned with source, checksums and retained license notices. It extracts only
+into an empty current-user private directory and confines paths to one application root. Entries and
+expanded output are bounded; unsafe paths, parent-relative/absolute link targets, duplicate entries,
+privilege modes, writes through links, dangling links and cycles fail. Normal framework version links,
+executable modes and macOS metadata survive. The system ZIP reader may interpret unsupported special
+mode attributes as ordinary files; the helper never creates device nodes, FIFOs or other special files.
+
+Local evidence:
+- Warnings-as-errors build and Clang static analysis passed with macOS 13 deployment target.
+- Fifteen native extraction fixtures passed, then passed again with address and undefined-behavior
+  sanitizers. Cases include corrupted content checksums, truncated ZIPs, path/type conflicts, duplicate
+  writes, private/empty-directory admission and a real `ditto` extended-attribute round-trip.
+- Read the installed signed 0.1.5 application, archived it with the production ZIP flags, and extracted
+  into `/tmp/magnitude-signed-extraction.qvvQKB/stage`. Recursive content comparison, strict nested
+  signature verification and the new native publisher/version verifier all passed on the copy.
+  The installed application was not modified or launched.
+- Added the extraction build/fixtures to the macOS native workflow; remote execution remains pending.
+
+This helper is not yet assembled into releases or invoked by startup. The transaction must authenticate
+and retain the archive, retain installation exclusion, own staging cleanup and durability, verify the
+extracted bundle, and authorize replacement. Cancellation/parent-loss containment and inherited native
+capability integration remain open. Release assembly must include the vendored header license notices
+when adding the helper. The deployment flag is not a substitute for actual macOS 13 execution.
+
+### Phase 6 checkpoint: staging and durable filesystem primitives
+
+Parent source `7a5b9869`. Added native retained directory capabilities, an Effect filesystem service,
+bounded private record reads, durable atomic record publication and identity-checked bundle exchange.
+These synchronous bounded operations are for the finite installer process, not the desktop event loop.
+Capabilities revalidate parent identity and permissions; private directories additionally reject
+extended ACL grants. Record replacement refuses symlinks, hard links and unsafe existing objects.
+Record publication syncs contents before rename and the parent after rename, with full filesystem
+flushes. Exchange verifies both expected identities, uses descriptor-relative atomic exchange, checks
+the resulting identities and syncs both parents. Callers must reconcile an exchange error because it
+may follow a successful namespace mutation. No exchange retries are hidden inside the primitive.
+
+Native build and Clang static analysis passed. Nine actual native filesystem tests cover record
+replacement, identity-preserving exchange, stale replay refusal, parent substitution, missing versus
+unsafe entries, extended ACL grants, changed permissions, hard links, size limits and capability
+tagging/release. Initial execution exposed the no-ACL `ENOENT` result from the native ACL API; that
+case is accepted, while actual grants and other observation errors fail. Full daemon-management
+regression passed: 324 tests, 11 platform/integration skips. Targeted package typecheck exited 0.
+The extraction fixtures and sanitizer results from the preceding entry are included in this checkpoint.
+The macOS workflow runs both native filesystem and signature tests; its YAML parsed locally.
+
+These primitives do not yet implement the schema-validated transaction journal, recovery state
+machine, rollback decisions, installation-wide exclusion, staged-tree durability or startup execution.
+Production transaction fault injection and power-loss acceptance remain open; the earlier mechanical
+probe does not prove those future integrations. No automatic replacement has been enabled.

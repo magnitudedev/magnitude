@@ -38,7 +38,8 @@ const build = Effect.gen(function* () {
   const args = ["-std=c11", "-D_GNU_SOURCE", "-DNAPI_VERSION=8", "-O2", "-Wall", "-Wextra", "-Werror", "-fPIC", "-shared", "-pthread",
     ...(process.platform === "darwin" ? ["-undefined", "dynamic_lookup", "-mmacosx-version-min=13.0",
       "-framework", "Security", "-framework", "CoreFoundation",
-      resolve(root, "native/mac-update-validation.c"), resolve(root, "native/mac-update-napi.c")] : []),
+      resolve(root, "native/mac-update-validation.c"), resolve(root, "native/mac-update-napi.c"),
+      resolve(root, "native/mac-update-filesystem.c")] : []),
     "-I", headers, resolve(root, "native/desktop-host.c"), resolve(root, "native/application-memory.c"), resolve(root, "native/machine-identity.c"), "-o", output]
   yield* Effect.async<void, NativeBuildFailed>(resume => {
     const child = spawn(process.env.CC ?? "cc", args, { stdio: "inherit" })

@@ -54,13 +54,20 @@ jobs:
             packages/daemon-management/native/test/mac-update-primitives.c \
             -o "$RUNNER_TEMP/mac-update-primitives"
           "$RUNNER_TEMP/mac-update-primitives"
+      - name: Exercise private archive extraction and metadata preservation
+        run: |
+          cc -std=c11 -D_DARWIN_C_SOURCE -Wall -Wextra -Werror -O2 \
+            -mmacosx-version-min=13.0 \
+            packages/daemon-management/native/mac-update-extract.c -larchive \
+            -o "$RUNNER_TEMP/mac-update-extract"
+          python3 packages/daemon-management/native/test/mac-update-extract.py "$RUNNER_TEMP/mac-update-extract"
       - name: Build native bundle verification
         run: |
           bun install --frozen-lockfile --ignore-scripts
           bun packages/daemon-management/scripts/build-native.ts
       - name: Exercise sealed bundle and nested signature verification
         working-directory: packages/daemon-management
-        run: bunx --bun vitest run src/desktop-native/mac-update-validation.test.ts
+        run: bunx --bun vitest run src/desktop-native/mac-update-validation.test.ts src/desktop-native/mac-update-filesystem.test.ts
 
   linux-native-ownership:
     strategy:
