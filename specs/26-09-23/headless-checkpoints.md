@@ -31,13 +31,13 @@ This amendment defines future tests; it does not claim those UI scenarios have a
 | Phase | Status | Commit / receipt |
 | --- | --- | --- |
 | Planning | Complete | This documentation checkpoint |
-| 0: baseline and harness | In progress | Local native build and baseline suites executed; desktop shell probe failure under investigation |
-| 1: Windows preparation repair | Implemented; packaged acceptance pending | Windows native, staging, and transfer regression gates passed in this checkpoint |
-| 2: native continuation/admission proof | In progress | Windows mapped-parent probe requires external launcher; Mac/Linux gates pending |
-| 3: shared owner extraction | Pending | — |
-| 4: serve and takeover | Pending | — |
-| 5: CLI cutover | Pending | — |
-| 6: shared updater/macOS transaction | Pending | — |
+| 0: baseline and harness | Baselines recorded; final regression gates remain | Native/source baselines and live desktop checks recorded below |
+| 1: Windows preparation repair | Implemented; final hosted acceptance pending | `f9b148d7`, `fdcd30a2`; native staging, cache repair and retained-update removal exercised |
+| 2: native continuation/admission proof | In progress | `f3762f0b`, `16f27d52`; repeated Windows replacement passed; macOS mechanical probe passed, production integration open |
+| 3: shared owner extraction | Implemented; packaged regression carried forward | `18345064` |
+| 4: serve and takeover | Implemented; full packaged race acceptance carried forward | `cadd4bdd`; real foreground serving on three platforms and live Mac takeover |
+| 5: CLI cutover | Implemented; final packaged regression carried forward | `41ec9f6b`; 97 CLI tests passed on each platform, live Mac desktop-owned CLI exercised |
+| 6: shared updater/macOS transaction | In progress | `c2906a6c`; shared preparation extracted, native macOS transaction still open |
 | 7: startup updates/maintenance | Pending | — |
 | 8: install scripts | Pending | — |
 | 9: packaged/remote acceptance | Pending | — |
@@ -556,3 +556,60 @@ are validated.
 
 Full daemon-management regression passed: 303 tests, 11 platform/integration skips. This is a
 shared-update extraction checkpoint within Phase 6; native macOS and full installation gates remain open.
+
+### Phase 6 work in progress: macOS transaction mechanics
+
+At parent `c2906a6c`, added an isolated native macOS fixture and a dedicated native-workflow job.
+The fixture compiled locally with warnings treated as errors and a macOS 13.0 deployment floor,
+then exited 0. It copies its own executable into temporary directories; it does not modify an
+installed application or authorize production installation.
+
+Observed checks:
+- Process loss at four journal/exchange boundaries preserves distinguishable old/new directory
+  identities. Repeated reconciliation does not reverse an exchange.
+- Missing, symlinked, substituted and ambiguous directory identities refuse reconciliation.
+- Execution through the replaced path retains the same PID, Unicode arguments, environment,
+  working directory and open standard descriptors.
+- The deliberately inherited installation lock excludes an independently opened contender until
+  release; a separate close-on-exec descriptor is not inherited.
+
+The CI job is configured but has not been executed remotely. Local output is reproducible by the
+compile/run commands in that job. These are mechanical checks, not signed application acceptance:
+archive containment, publisher validation, native production capability adoption, cross-user
+admission, cancellation, sync failures and power-loss durability remain open. The current local
+keychain reports no valid code-signing identities, so production signed-bundle validation requires
+the protected signing path; no trust fallback was added. The prototype is included in the native
+bundle-verification checkpoint below.
+
+### Phase 6 checkpoint: native macOS bundle verification
+
+Parent source `c2906a6c`. Added a Security.framework verifier with an asynchronous Node-API boundary
+and an Effect service. Production service construction requires the compiled publisher; no runtime
+environment or update-response field chooses trust. Verification checks the signed bundle identity,
+sealed version, application package type, Mach-O executable, requested architecture, nested code,
+resources and all architecture slices. The caller must retain exclusive staging ownership throughout
+verification and publication. This check is not yet wired into a production installation transaction.
+
+The universal-binary fixture exposed a native API distinction: creating a code object with an explicit
+architecture restricted verification even with the all-architectures flag. The verifier now validates
+an unqualified code object and separately requires the intended architecture. A universal fixture with
+one correct slice and one incorrectly identified slice now fails; both correct slices pass.
+
+Validation on the local Mac with pinned Bun 1.4.2:
+- Native build passed with warnings treated as errors and macOS 13.0 deployment target.
+- Twelve focused tests passed, including sealed framework version symlinks, damaged nested code,
+  changed resources, absent signatures, incorrect identity/version/architecture, embedded NUL,
+  universal slices, and refusal to construct production trust without a compiled publisher.
+- Full daemon-management regression: 315 tests passed, 11 platform/integration skips.
+- Daemon-management, CLI and Desktop targeted typechecks exited 0.
+- Mechanical exchange/recovery/foreground probe passed again; workflow YAML parsed successfully.
+- Node independently verified the actual installed signed 0.1.5 bundle using its observed publisher
+  requirement, then rejected a deliberately incorrect publisher. This was read-only; no installation
+  or running application was changed. It verifies native signed-input behavior, not release provenance
+  or an installed update transaction.
+
+The native workflow now builds and runs bundle-verification fixtures as well as the mechanical probe;
+remote execution remains pending. Production signed replacement, notarization/Gatekeeper behavior,
+private extraction, exclusion, recovery and continuation integration remain open. Desktop compilation
+must provide publisher identity when the new service is integrated; the existing CLI release compiler
+already supplies that build constant. No existing desktop update backend was switched in this checkpoint.

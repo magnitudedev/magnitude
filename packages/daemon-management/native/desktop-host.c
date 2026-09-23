@@ -26,6 +26,9 @@ void magnitude_register_windows_updates(napi_env env, napi_value exports);
 
 void magnitude_register_application_memory(napi_env env, napi_value exports);
 void magnitude_register_machine_identity(napi_env env, napi_value exports);
+#ifdef __APPLE__
+void magnitude_register_mac_updates(napi_env env, napi_value exports);
+#endif
 
 typedef struct {
 #ifdef _WIN32
@@ -422,6 +425,9 @@ static napi_value init(napi_env env, napi_value exports) {
   #endif
   magnitude_register_application_memory(env, exports);
   magnitude_register_machine_identity(env, exports);
+  #ifdef __APPLE__
+  magnitude_register_mac_updates(env, exports);
+  #endif
   return exports;
 }
 NAPI_MODULE(NODE_GYP_MODULE_NAME, init)

@@ -6,6 +6,7 @@ applies_to:
   - desktop/src/*update*
   - packages/daemon-management/src/desktop-native/*update*
   - packages/daemon-management/src/application-update/**
+  - packages/daemon-management/native/mac-update-*
   - cli/src/startup/*update*
   - packages/client-common/src/desktop/update.ts
   - packages/sdk/src/desktop-update.ts
@@ -32,6 +33,13 @@ until explicit retry or discard. Observation never initiates a check or transfer
 Updates must match the application platform and release channel. The client verifies release
 signatures, downloaded file integrity, and applicable native publisher signatures before
 installation. Failed checks or verification must not be reported as successful updates.
+
+macOS staged-bundle verification uses the publisher identity compiled into the installed application;
+missing publisher configuration cannot become identifier-only update trust. Native verification checks
+sealed resources, nested code, every architecture slice, the required executable architecture, and the
+sealed application identifier and release version. The caller retains exclusive staging ownership
+through verification and publication. A successful signature check is not installation admission,
+archive containment validation or notarization acceptance; those remain separate transaction gates.
 
 Application binaries are distributed through GitHub Releases. Downloads must resolve to trusted
 release assets, and interrupted or invalid transfers must not publish a prepared installer.

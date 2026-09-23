@@ -39,6 +39,29 @@ permissions:
   contents: read
 
 jobs:
+  macos-update-primitives:
+    runs-on: blacksmith-12vcpu-macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+      - name: Exercise isolated exchange, recovery and foreground continuation
+        run: |
+          cc -std=c11 -D_DARWIN_C_SOURCE -Wall -Wextra -Werror -O2 \
+            -mmacosx-version-min=13.0 \
+            packages/daemon-management/native/test/mac-update-primitives.c \
+            -o "$RUNNER_TEMP/mac-update-primitives"
+          "$RUNNER_TEMP/mac-update-primitives"
+      - name: Build native bundle verification
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          bun packages/daemon-management/scripts/build-native.ts
+      - name: Exercise sealed bundle and nested signature verification
+        working-directory: packages/daemon-management
+        run: bunx --bun vitest run src/desktop-native/mac-update-validation.test.ts
+
   linux-native-ownership:
     strategy:
       fail-fast: false
