@@ -383,6 +383,72 @@ them or state the specific external blocker. Validate documented commands in dis
 package assets and update policy agree. Ledger identifies the final commit and exact accepted hashes.
 **Commit:** `docs: document headless operation and finalize release readiness`.
 
+## Mandatory existing-product regression lane
+
+Headless acceptance is additive. A working `serve` does not compensate for breaking ordinary desktop
+use or CLI use against a desktop-owned service. These regressions are checkpoint gates, not optional
+final polish. Establish baseline observations in Phase 0 and retain comparable evidence.
+
+### Drive the actual desktop with computer use
+
+Use the computer-use tool's native app/browser controls, screenshots and visual inspection to operate
+the installed macOS app. Click/type through real user entry points, including native menus and tray;
+do not substitute direct RPCs, injected JavaScript or synthetic state for the user interaction being
+tested. Accessibility/DOM automation and Playwright remain useful complementary tools. Use isolated
+test profiles and artifacts, preserving the user's ordinary running app and data.
+
+On Windows, use the visible Parallels guest desktop through computer use where possible; confirm
+guest focus, normal-user session and app identity before interacting. For Linux, provision a disposable
+graphical guest with a visible display or screen-sharing connection when needed. Xvfb/Playwright
+checks remain automated coverage, but are not a claim of visually driving an otherwise unseen native
+desktop. A missing VM GUI transport is recorded as missing coverage, not a successful visual test.
+Use the same computer-use entry points for screenshots; do not use the voice-only screen-context API.
+
+| ID | Real-user scenario | Required evidence |
+| --- | --- | --- |
+| R1 | Launch installed Desktop normally, navigate Discover/Models, Status/Usage and Settings | Usable rendered screens, no stuck loading/error state, one Desktop owner and one ACN |
+| R2 | Select/load a small compatible model through UI, perform a real inference request through an existing supported client, observe live UI state, stop/unload through UI | Model and usage displays agree with authoritative results; cancellation/unload completes |
+| R3 | Close the window, reopen through native tray/menu/Dock, use `app open`, then Quit and reopen | Expected visibility/focus, no duplicate owner, complete descendant retirement on Quit |
+| R4 | Change an ordinary setting and update preference; exercise desktop-only login-startup preference in a disposable user and restore it | Setting persists after relaunch; native startup registration matches UI; headless work has not removed desktop capabilities |
+| R5 | Check/download/update using actual Settings or tray controls, then use the updated desktop | Visible Available/Ready/error states are accurate, restart is explicitly initiated, model/session/config state remains usable |
+| R6 | Start Headless, open Desktop for takeover, then use the UI and CLI normally | Single owner transition; working model operations and visible UI after takeover, not merely a passing health endpoint |
+
+Record screenshots at meaningful before/after states, action steps, app/artifact version, process
+identities, logs and authoritative service observations. Check visual problems such as blank windows,
+disabled controls, stale state and misleading status. Screenshots alone do not prove backend behavior;
+backend calls alone do not prove a working UI. Review relevant renderer/main-process errors.
+
+### CLI without a headless owner
+
+Run a dedicated lane in which `serve` is never launched:
+
+- Start Desktop normally, then use packaged CLI `status`, hardware/catalog/model observations and
+  connection commands against its service. Exercise a supported model mutation and see the desktop
+  reflect the change; perform the inverse UI mutation and confirm CLI observations update.
+- Exercise CLI update check/download/status while Desktop owns the service; verify the shared state
+  in Settings. Exercise explicit desktop update installation in the update cohort lane.
+- Verify commands leave the same owner/service alive, open no extra window, and create no additional
+  service. `app open` must focus/reopen the existing Desktop rather than duplicate it.
+- Quit Desktop: passive help/version/status still work without starting anything. Service-backed
+  commands give the new connect-only guidance. This absence behavior is an intentional change;
+  successful CLI operation with an already-running Desktop is a required preserved behavior.
+- Repeat after a packaged update and after a Desktop takeover. Preserve protocol-mismatch diagnosis
+  and distinguish observation failure from an empty result.
+
+### When this lane blocks a checkpoint
+
+- Phase 0: baseline R1–R4 and desktop-owned CLI lane; capture existing issues separately.
+- Phase 3: rerun R1–R4 and desktop-owned CLI lane after shared bootstrap extraction.
+- Phases 4–5: add R6, native reopen/focus and all connect-only/desktop-owned CLI cases.
+- Phases 6–7: add R5 and repeat desktop-owned CLI and UI operations after A→B→C updates.
+- Phase 8: R1/R3 and desktop-owned CLI against script-installed packages.
+- Phase 9/final: full R1–R6 and CLI lane on final artifacts, with actual visual operation on Mac and
+  Windows, and Linux visible-GUI coverage or an explicitly outstanding coverage gap.
+
+Each checkpoint receipt records these scenario IDs and results. UI failures caused by the change
+block the checkpoint even when headless/native tests pass. Repeat the affected scenario after fixes;
+do not rerun unrelated expensive scenarios without a reason.
+
 ## Test commands and evidence rules
 
 Use package-targeted checks, not project-wide `tsc -b` or bare `bun vitest`:
@@ -420,3 +486,5 @@ on the updated version without losing foreground/service-manager ownership. This
 supported packaged platforms, with the documented authorization exception on Linux. The Windows
 updater defect must be fixed for existing affected state, not only a fresh test profile. Every phase
 has a tested commit and a reproducible receipt; no production publication is implied by completion.
+Ordinary desktop operation and CLI use with a desktop-owned service must also pass the mandatory
+regression lane, including real UI interaction and post-update use.

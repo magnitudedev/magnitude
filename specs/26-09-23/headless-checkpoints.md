@@ -23,6 +23,11 @@ Environment observations:
 
 ## Phase ledger
 
+Planning amendment: existing-product regression is a mandatory lane. The full plan now assigns R1–R6
+real desktop scenarios and a desktop-owned CLI lane to the relevant checkpoints. Native computer use
+and visual inspection on Mac/visible VM desktops complement automated API and process assertions.
+This amendment defines future tests; it does not claim those UI scenarios have already been run.
+
 | Phase | Status | Commit / receipt |
 | --- | --- | --- |
 | Planning | Complete | This documentation checkpoint |
@@ -43,6 +48,8 @@ Environment observations:
 - Commit identity and changed behavior; record the parent source identity used for test builds.
 - Exact commands, runtime/compiler/OS/architecture and artifact hashes/versions.
 - Passing scenarios; failed scenarios with diagnosis; skipped scenarios and missing infrastructure.
+- Desktop R1–R6 scenarios applicable to this phase, desktop-owned CLI results, and visual interaction
+  evidence; explicitly identify VM GUI coverage that was not exercised.
 - Evidence directory/CI receipt and owned-resource cleanup result.
 - Decisions resolved (particularly Phase 2) and remaining gates affecting later phases.
 - Next phase and its entry prerequisites.
