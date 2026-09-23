@@ -3,10 +3,10 @@ import { Effect, Stream } from "effect"
 import { randomUUID } from "node:crypto"
 import { join } from "node:path"
 import { PreparedUpdateStore, PrivateFilePermissions, MacUpdateHandoff } from "@magnitudedev/daemon-management/desktop-native"
-import { ApplicationUpdateFailed } from "./application-update"
+import { ApplicationUpdateFailed } from "@magnitudedev/daemon-management/application-update"
 import { NativeMacUpdate, stageMacUpdateArchive } from "./mac-update-stage"
-import { PreparedUpdateInstaller } from "./prepared-update-installation"
-import { hostedUpdateSource, type HostedUpdateSourceOptions } from "./hosted-update-source"
+import { PreparedUpdateInstaller } from "@magnitudedev/daemon-management/application-update"
+import { hostedUpdateSource, type HostedUpdateSourceOptions } from "@magnitudedev/daemon-management/application-update"
 
 export const macUpdateSource = (options: HostedUpdateSourceOptions & {
   readonly stateDirectory: string
@@ -26,12 +26,14 @@ export const macUpdateSource = (options: HostedUpdateSourceOptions & {
     }
   }
   return {
-    source: hostedUpdateSource(options, (archive, release) => store.prepare(archive, release).pipe(
+    source: yield* hostedUpdateSource(options, (archive, release) => store.prepare(archive, release).pipe(
       Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })),
     )),
     installer: PreparedUpdateInstaller.of({
       requiresAuthorization: false,
-      install: (archive, _release, showWindow) => Effect.scoped(Effect.gen(function* () {
+      install: (archive, _release, continuation) => Effect.scoped(Effect.gen(function* () {
+        if (continuation._tag !== "Desktop") return yield* new ApplicationUpdateFailed({ message: "Foreground application installation is unavailable in this build." })
+        const showWindow = continuation.showWindow
         yield* permissions.prepareDirectory(parent)
         const helperDirectory = join(parent, `helper-${randomUUID()}`)
         yield* permissions.prepareDirectory(helperDirectory)

@@ -1,5 +1,5 @@
 import { FileSystem } from "@effect/platform"
-import { NodeContext } from "@effect/platform-node"
+import { BunContext } from "@effect/platform-bun"
 import { Effect, Schema } from "effect"
 import { createHash, generateKeyPairSync } from "node:crypto"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
@@ -8,9 +8,9 @@ import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { describe, expect, it } from "vitest"
 import { makePreparedUpdateStore, PreparedUpdateStore, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory, WindowsInstallerVerifier } from "@magnitudedev/daemon-management/desktop-native"
-import { WindowsInstallerSignatureFailed } from "../../packages/daemon-management/src/desktop-native/windows-update-signature"
+import { WindowsInstallerSignatureFailed } from "../desktop-native/windows-update-signature"
 import { UpdateClientMetadata, UpdateManifest } from "@magnitudedev/release/hosted-update"
-import { PublisherKeyId, signUpdateManifest } from "../../packages/release/src/hosted-update/manifest"
+import { PublisherKeyId, signUpdateManifest } from "../../../release/src/hosted-update/manifest"
 import { makeWindowsUpdateSource } from "./windows-update-source"
 
 // Exercise the real private-file adapter; native publisher verification has separate executable tests.
@@ -32,7 +32,7 @@ describe.skipIf(process.platform !== "win32")("Windows installer staging", () =>
     try {
       await Effect.runPromise(Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem
-        const addon = fileURLToPath(new URL("../../packages/daemon-management/dist/native/win32-x64/desktop-host.node", import.meta.url))
+        const addon = fileURLToPath(new URL("../../dist/native/win32-x64/desktop-host.node", import.meta.url))
         const permissions = windowsPrivateFilePermissions(addon)
         if (scenario === "inherited") yield* fs.makeDirectory(join(directory, "updates"), { mode: 0o700 })
         expect(yield* recoverWindowsUpdateDirectory(addon, directory)).toBe(scenario === "inherited")
@@ -57,7 +57,7 @@ describe.skipIf(process.platform !== "win32")("Windows installer staging", () =>
           expect(yield* fs.readFileString(join(directory, "updates", "magnitude-setup.exe"))).toBe(bytes.toString())
           expect(yield* fs.exists(join(directory, "update-helpers"))).toBe(false)
         }
-      }).pipe(Effect.provide(NodeContext.layer)))
+      }).pipe(Effect.provide(BunContext.layer)))
     } finally { await rm(directory, { recursive: true, force: true }) }
   })
 })

@@ -1,5 +1,5 @@
 import { FileSystem } from "@effect/platform"
-import { NodeContext } from "@effect/platform-node"
+import { BunContext } from "@effect/platform-bun"
 import { Effect, Schema } from "effect"
 import { mkdtemp, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -26,16 +26,17 @@ describe("hosted update transfer storage", () => {
     const root = await mkdtemp(join(tmpdir(), "hosted-update-transfer-"))
     const metadata = Schema.decodeUnknownSync(UpdateClientMetadata)({ version: "1.0.0", os: "windows", os_version: "11", arch: "x64", package: "windows-exe" })
     const release = Schema.decodeUnknownSync(UpdateRelease)({ version: "2.0.0", bytes: 25, sha256: "a".repeat(64), signature: "A".repeat(86) + "==" })
-    const source = hostedUpdateSource({ origin: "https://example.com", metadata, dataDirectory: root,
-      userAgent: "fixture", sign: () => Effect.succeed("unused"), trustedPublishers: new Map() }, () => Effect.void)
+
     try {
       await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+        const source = yield* hostedUpdateSource({ origin: "https://example.com", metadata, dataDirectory: root,
+          userAgent: "fixture", sign: () => Effect.succeed("unused"), trustedPublishers: new Map() }, () => Effect.void)
         const fs = yield* FileSystem.FileSystem
         const archive = yield* source.download(release, () => Effect.void)
         expect(dirname(dirname(archive))).toBe(join(root, "update-downloads"))
         expect(yield* fs.exists(join(root, "updates"))).toBe(false)
         expect(yield* fs.readFileString(archive)).toBe("verified transfer fixture")
-      })).pipe(Effect.provide(NodeContext.layer)))
+      })).pipe(Effect.provide(BunContext.layer)))
       expect(await readdir(join(root, "update-downloads"))).toEqual([])
       expect(await readdir(root)).toEqual(["update-downloads"])
     } finally { await rm(root, { recursive: true, force: true }) }

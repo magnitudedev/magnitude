@@ -1,3 +1,4 @@
+import { UpdateContinuation } from "../application-update/update-continuation"
 import { Command, CommandExecutor } from "@effect/platform"
 import { Effect, Option, Schema } from "effect"
 import { spawn } from "node:child_process"
@@ -13,7 +14,7 @@ export const WindowsUpdateHandoffRequest = Schema.Struct({
   applicationPath: absolutePath,
   dataDirectory: absolutePath,
   release: UpdateRelease,
-  showWindow: Schema.Boolean,
+  continuation: UpdateContinuation,
 }).pipe(Schema.filter(request => win32.dirname(request.helperDirectory) === win32.join(request.stateDirectory, "update-helpers")
   && /^helper-[a-f0-9-]{36}$/.test(win32.basename(request.helperDirectory))
   && win32.basename(request.applicationPath) === "Magnitude.exe"))
@@ -68,10 +69,14 @@ export const completeWindowsUpdateHandoff = (request: WindowsUpdateHandoffReques
 }).pipe(Effect.mapError(failed))
 
 /** Called only after the helper releases its native installation lease. */
-export const relaunchWindowsAfterUpdate = (request: WindowsUpdateHandoffRequest) => Effect.async<void, WindowsUpdateHandoffFailed>(resume => {
-    const application = spawn(request.applicationPath, request.showWindow ? [] : ["--background"], {
+export const relaunchWindowsAfterUpdate = (request: WindowsUpdateHandoffRequest) => {
+  const continuation = request.continuation
+  if (continuation._tag === "Caller") return Effect.void
+  return Effect.async<void, WindowsUpdateHandoffFailed>(resume => {
+    const application = spawn(request.applicationPath, continuation.showWindow ? [] : ["--background"], {
       cwd: win32.dirname(request.applicationPath), detached: true, windowsHide: true, stdio: "ignore",
     })
     application.once("error", () => resume(Effect.fail(failed())))
     application.once("spawn", () => { application.unref(); resume(Effect.void) })
 })
+}

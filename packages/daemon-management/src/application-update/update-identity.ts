@@ -3,15 +3,15 @@ import { Context, Effect, Schema } from "effect"
 import { createPrivateKey, generateKeyPairSync } from "node:crypto"
 import { join } from "node:path"
 import { signUpdateRequest, type UpdateSigningFailed } from "@magnitudedev/release/hosted-update"
-import { PrivateFilePermissions } from "@magnitudedev/daemon-management/private-files"
+import { PrivateFilePermissions } from "../desktop-native/private-files"
 
 export class UpdateIdentityFailed extends Schema.TaggedError<UpdateIdentityFailed>()("UpdateIdentityFailed", {}) {}
 export interface UpdateIdentity {
   readonly sign: (url: URL) => Effect.Effect<string, UpdateSigningFailed>
 }
-export const UpdateIdentity = Context.GenericTag<UpdateIdentity>("desktop/UpdateIdentity")
+export const UpdateIdentity = Context.GenericTag<UpdateIdentity>("@magnitudedev/daemon-management/UpdateIdentity")
 
-/** Called after native application ownership. Only the desktop owner creates this installation key. */
+/** Called after native application ownership. Only the admitted application owner creates this installation key. */
 export const makeUpdateIdentity = (clientStateDirectory: string) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const permissions = yield* PrivateFilePermissions

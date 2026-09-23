@@ -26,13 +26,13 @@ export const makeWindowsUpdateSource = (options: HostedUpdateSourceOptions & {
     }
   }
   return {
-    source: hostedUpdateSource(options, (archive, release) => verifier.verify(archive).pipe(
+    source: yield* hostedUpdateSource(options, (archive, release) => verifier.verify(archive).pipe(
       Effect.zipRight(store.prepare(archive, release)),
       Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })),
     )),
     installer: PreparedUpdateInstaller.of({
       requiresAuthorization: false,
-      install: (archive, release, showWindow) => Effect.gen(function* () {
+      install: (archive, release, continuation) => Effect.gen(function* () {
         yield* verifier.verify(archive)
         yield* permissions.prepareDirectory(parent)
         const helperDirectory = win32.join(parent, `helper-${randomUUID()}`)
@@ -46,7 +46,7 @@ export const makeWindowsUpdateSource = (options: HostedUpdateSourceOptions & {
             yield* permissions.protectFile(destination)
           }
           yield* startWindowsUpdateHandoff({ helperDirectory, dataDirectory: options.dataDirectory,
-            stateDirectory: options.stateDirectory, applicationPath: options.applicationPath, release, showWindow })
+            stateDirectory: options.stateDirectory, applicationPath: options.applicationPath, release, continuation })
         }).pipe(Effect.onError(() => fs.remove(helperDirectory, { recursive: true, force: true }).pipe(Effect.ignore)))
       }).pipe(Effect.mapError(() => new ApplicationUpdateFailed({ message: "Could not verify and start the Windows application installer." }))),
     }),

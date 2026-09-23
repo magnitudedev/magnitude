@@ -9,13 +9,13 @@ export const makeLinuxUpdateSource = (options: HostedUpdateSourceOptions & {
 }) => Effect.gen(function* () {
   const store = yield* PreparedUpdateStore
   return {
-    source: hostedUpdateSource(options, (archive, release) => store.prepare(archive, release).pipe(
+    source: yield* hostedUpdateSource(options, (archive, release) => store.prepare(archive, release).pipe(
       Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })),
     )),
     installer: PreparedUpdateInstaller.of({
       requiresAuthorization: true,
-      install: (_archive, release, showWindow) => startLinuxUpdateHandoff({
-        dataDirectory: options.dataDirectory, stateDirectory: options.stateDirectory, release, showWindow,
+      install: (_archive, release, continuation) => startLinuxUpdateHandoff({
+        dataDirectory: options.dataDirectory, stateDirectory: options.stateDirectory, release, continuation,
       }).pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message }))),
     }),
   }

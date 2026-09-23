@@ -9,10 +9,10 @@ import { UpdateClientMetadata, signUpdateRequest } from "@magnitudedev/release/h
 import { UpdateManifest, PublisherKeyId, signUpdateManifest } from "../../packages/release/src/hosted-update/manifest"
 import { MacUpdateHandoff, UpdatePreferences, makePreparedUpdateStore, PreparedUpdateStore, unixPrivateFilePermissions } from "@magnitudedev/daemon-management/desktop-native"
 import { describe, expect, it } from "vitest"
-import { ApplicationUpdateSource, makeApplicationUpdate } from "./application-update"
+import { ApplicationUpdateSource, makeApplicationUpdate } from "@magnitudedev/daemon-management/application-update"
 import { NativeMacUpdate } from "./mac-update-stage"
 import { macUpdateSource } from "./mac-update-source"
-import { installPreparedUpdate, PreparedUpdateInstaller } from "./prepared-update-installation"
+import { installPreparedUpdate, PreparedUpdateInstaller } from "@magnitudedev/daemon-management/application-update"
 
 describe("Mac update acquisition and native handoff", () => {
   it.each([false, true])("verifies downloaded bytes before native staging (corrupt=%s)", async corrupt => {
@@ -63,7 +63,7 @@ describe("Mac update acquisition and native handoff", () => {
         yield* owner.close
         if (!corrupt) {
           expect((yield* store.read)._tag).toBe("Some")
-          yield* installPreparedUpdate({ showWindow: true, allowAuthorizationPrompt: true }).pipe(Effect.provideService(PreparedUpdateStore, store), Effect.provideService(PreparedUpdateInstaller, platform.installer))
+          yield* installPreparedUpdate({ continuation: { _tag: "Desktop", showWindow: true }, allowAuthorizationPrompt: true }).pipe(Effect.provideService(PreparedUpdateStore, store), Effect.provideService(PreparedUpdateInstaller, platform.installer))
         }
       })).pipe(Effect.provide(unixPrivateFilePermissions.pipe(Layer.provideMerge(NodeContext.layer))), Effect.provideService(UpdatePreferences, { read: Effect.succeed(false), write: () => Effect.void }), Effect.provideService(FetchHttpClient.Fetch, fetchArtifact), Effect.timeout("5 seconds")))
       expect(staged).toBe(!corrupt)

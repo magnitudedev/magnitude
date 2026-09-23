@@ -7,18 +7,13 @@ import { resolveQuitFailure } from "./quit-failure"
 import { buildApplicationMenu } from "./application-menu"
 import { buildTrayMenu } from "./tray-menu"
 import { initializeLoginStartup, makeLoginStartup, WINDOWS_APPLICATION_ID } from "./login-startup"
-import { ApplicationUpdateFailed, ApplicationUpdateSource, makeApplicationUpdate, unavailableApplicationUpdate } from "./application-update"
+import { ApplicationUpdateFailed, ApplicationUpdateSource, makeApplicationUpdate, unavailableApplicationUpdate, readLinuxUpdateMetadata, makeUpdateIdentity, makeUpdateSchedule, makeLinuxUpdateSource, makeWindowsUpdateSource } from "@magnitudedev/daemon-management/application-update"
 import { macUpdateSource } from "./mac-update-source"
-import { makeLinuxUpdateSource } from "./linux-update-source"
-import { makeWindowsUpdateSource } from "./windows-update-source"
-import { readLinuxUpdateMetadata } from "./update-metadata"
 import { NativeMacUpdate, nativeMacUpdate } from "./mac-update-stage"
-import { PreparedUpdateInstaller, reconcilePreparedUpdate, installPreparedUpdate, type UpdateInstallationIntent } from "./prepared-update-installation"
+import { PreparedUpdateInstaller, reconcilePreparedUpdate, installPreparedUpdate, type UpdateInstallationIntent } from "@magnitudedev/daemon-management/application-update"
 import { isNewerVersion } from "@magnitudedev/release"
 import { ReleaseTarget, UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
-import { makeUpdateIdentity } from "./update-identity"
 import { makeAppearancePreferences, makeModelStoragePreferences, makeNetworkPreferences, listNetworkInterfaces, networkAccessEquals, LOOPBACK_ONLY, makeUpdatePreferences, UpdatePreferences } from "@magnitudedev/daemon-management/desktop-native"
-import { makeUpdateSchedule } from "./update-schedule"
 import { readUpdateConfiguration, isUpdateAcceptanceBuild } from "./update-config"
 import { NativeTrayFactory, NativeTrayFailed, TrayOwner, TrayOwnerLive } from "./tray-owner"
 import { CommandExecutor, FetchHttpClient } from "@effect/platform"
@@ -169,7 +164,7 @@ const program = Effect.scoped(Effect.gen(function* () {
               Effect.provide([nativeWindowsInstallerVerifier(addonPath, publisher.value), privateFiles]))
         }
         return yield* macUpdateSource({ ...options, bundle: dirname(dirname(dirname(process.execPath))), cliPath: join(process.resourcesPath, "magnitude"), addonPath }).pipe(Effect.provideService(NativeMacUpdate, nativeMacUpdate(autoUpdater)), Effect.provideService(MacUpdateHandoff, { start: startMacUpdateHandoff }), Effect.provide(privateFiles))
-      }).pipe(Effect.provideService(PreparedUpdateStore, store))
+      }).pipe(Effect.provideService(PreparedUpdateStore, store), Effect.provide(NodeContext.layer))
       restartPreparedUpdate = intent => installPreparedUpdate(intent).pipe(
         Effect.provideService(PreparedUpdateStore, store), Effect.provideService(PreparedUpdateInstaller, platform.installer))
       const saved = yield* store.read
@@ -180,7 +175,7 @@ const program = Effect.scoped(Effect.gen(function* () {
       }
       let pending = yield* reconcilePreparedUpdate(app.getVersion()).pipe(Effect.provideService(PreparedUpdateStore, store))
       if (Option.isSome(pending) && pending.value.installation._tag === "Unattempted" && !earlyQuitRequested) {
-        const attempted = yield* restartPreparedUpdate({ showWindow: !background, allowAuthorizationPrompt: !background }).pipe(Effect.either)
+        const attempted = yield* restartPreparedUpdate({ continuation: { _tag: "Desktop", showWindow: !background }, allowAuthorizationPrompt: !background }).pipe(Effect.either)
         startupUpdateStarted = attempted._tag === "Right" && attempted.right === "Started"
         pending = yield* store.read
       }
@@ -422,7 +417,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     if (stopped._tag === "Right") {
       if (systemShutdownRequested || intent === "Quit") return "Quit" as const
       if (intent === "Relaunch" || !restartPreparedUpdate) return "Relaunch" as const
-      const installation = yield* restartPreparedUpdate({ showWindow: reopenAfterUpdate, allowAuthorizationPrompt: true }).pipe(Effect.either)
+      const installation = yield* restartPreparedUpdate({ continuation: { _tag: "Desktop", showWindow: reopenAfterUpdate }, allowAuthorizationPrompt: true }).pipe(Effect.either)
       if (installation._tag === "Left") yield* Effect.logError(installation.left.message)
       return installation._tag === "Right" && installation.right === "Started" ? "RestartUpdate" as const : "Relaunch" as const
     }

@@ -1,6 +1,6 @@
 import { generateKeyPairSync } from 'node:crypto'
 import { Deferred, Effect, Option, Ref, Schema, Scope, Stream } from "effect"
-import { UpdateManifest, PublisherKeyId, signUpdateManifest } from "../../packages/release/src/hosted-update/manifest"
+import { UpdateManifest, PublisherKeyId, signUpdateManifest } from "../../../release/src/hosted-update/manifest"
 import { PreparedUpdateStore, PreparedUpdateFailed, UpdatePreferences, UpdatePreferencesFailed } from "@magnitudedev/daemon-management/desktop-native"
 import { describe, expect, it } from "vitest"
 import { ApplicationUpdateFailed, ApplicationUpdateSource, makeApplicationUpdate, type ApplicationUpdate } from "./application-update"

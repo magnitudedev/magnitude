@@ -28,6 +28,17 @@ const harness = (installation: PreparedUpdate["installation"] = { _tag: "Unattem
 }
 
 describe("prepared update installation", () => {
+  it("passes caller continuation through the verified durable attempt barrier", async () => {
+    const h = harness()
+    expect(await h.run(installPreparedUpdate({ continuation: { _tag: "Caller" }, allowAuthorizationPrompt: false }), {}, {
+      install: (_archive, _release, continuation) => Effect.sync(() => {
+        expect(continuation).toEqual({ _tag: "Caller" })
+        expect(Option.getOrThrow(h.pending()).installation._tag).toBe("Attempted")
+        h.events.push("install")
+      }),
+    })).toBe("Started")
+    expect(h.events).toEqual(["verify", "attempt", "install"])
+  })
   it.each(["Unattempted", "Attempted", "Failed"] as const)("cleans a completed %s update based on installed version", async tag => {
     const h = harness(tag === "Failed" ? { _tag: tag, reason: "previous failure" } : { _tag: tag })
     expect(Option.isNone(await h.run(reconcilePreparedUpdate("3.0.0")))).toBe(true)
@@ -41,22 +52,22 @@ describe("prepared update installation", () => {
   })
   it.each(["Unattempted", "Attempted", "Failed"] as const)("uses the same retained bytes and attempt barrier for explicit %s installation", async tag => {
     const h = harness(tag === "Failed" ? { _tag: tag, reason: "cancelled" } : { _tag: tag })
-    expect(await h.run(installPreparedUpdate({ showWindow: true, allowAuthorizationPrompt: true }))).toBe("Started")
+    expect(await h.run(installPreparedUpdate({ continuation: { _tag: "Desktop", showWindow: true }, allowAuthorizationPrompt: true }))).toBe("Started")
     expect(h.events).toEqual(["verify", "attempt", "install"])
     expect(Option.getOrThrow(h.pending()).installation).toEqual({ _tag: "Attempted" })
   })
   it("defers a background launch before verification, attempting or showing authorization", async () => {
     const h = harness()
-    expect(await h.run(installPreparedUpdate({ showWindow: false, allowAuthorizationPrompt: false }), {}, { requiresAuthorization: true })).toBe("Deferred")
+    expect(await h.run(installPreparedUpdate({ continuation: { _tag: "Desktop", showWindow: false }, allowAuthorizationPrompt: false }), {}, { requiresAuthorization: true })).toBe("Deferred")
     expect(h.events).toEqual([])
     expect(Option.getOrThrow(h.pending()).installation._tag).toBe("Unattempted")
   })
   it("allows an explicit tray action to authorize installation while preserving a hidden window", async () => {
     const h = harness()
-    expect(await h.run(installPreparedUpdate({ showWindow: false, allowAuthorizationPrompt: true }), {}, {
+    expect(await h.run(installPreparedUpdate({ continuation: { _tag: "Desktop", showWindow: false }, allowAuthorizationPrompt: true }), {}, {
       requiresAuthorization: true,
-      install: (_archive, _release, showWindow) => Effect.sync(() => {
-        expect(showWindow).toBe(false)
+      install: (_archive, _release, continuation) => Effect.sync(() => {
+        expect(continuation).toEqual({ _tag: "Desktop", showWindow: false })
         expect(Option.getOrThrow(h.pending()).installation._tag).toBe("Attempted")
         h.events.push("install")
       }),
@@ -66,7 +77,7 @@ describe("prepared update installation", () => {
   it("never invokes an installer after failed verification or an unsuccessful attempt write", async () => {
     for (const operation of ["verify", "recordAttempt"] as const) {
       const h = harness()
-      expect((await h.run(installPreparedUpdate({ showWindow: true, allowAuthorizationPrompt: true }).pipe(Effect.either), { [operation]: () => new PreparedUpdateFailed({ message: "injected failure" }) }))._tag).toBe("Left")
+      expect((await h.run(installPreparedUpdate({ continuation: { _tag: "Desktop", showWindow: true }, allowAuthorizationPrompt: true }).pipe(Effect.either), { [operation]: () => new PreparedUpdateFailed({ message: "injected failure" }) }))._tag).toBe("Left")
       expect(h.events).not.toContain("install")
       if (operation === "verify") expect(h.events).toContain("failure")
       else expect(h.events).not.toContain("failure")
@@ -74,7 +85,7 @@ describe("prepared update installation", () => {
   })
   it("persists a known invocation failure against the same release", async () => {
     const h = harness()
-    expect((await h.run(installPreparedUpdate({ showWindow: true, allowAuthorizationPrompt: true }).pipe(Effect.either), {}, { install: () => new ApplicationUpdateFailed({ message: "System authorization was cancelled" }) }))._tag).toBe("Left")
+    expect((await h.run(installPreparedUpdate({ continuation: { _tag: "Desktop", showWindow: true }, allowAuthorizationPrompt: true }).pipe(Effect.either), {}, { install: () => new ApplicationUpdateFailed({ message: "System authorization was cancelled" }) }))._tag).toBe("Left")
     expect(h.events).toEqual(["verify", "attempt", "failure"])
     expect(Option.getOrThrow(h.pending()).installation).toEqual({ _tag: "Failed", reason: "System authorization was cancelled" })
   })

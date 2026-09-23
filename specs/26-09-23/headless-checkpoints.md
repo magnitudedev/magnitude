@@ -513,3 +513,46 @@ against the final matched packages; they are not certified by syntax checks or s
 packaged regression, real model serving and login acceptance remain tracked by the later gates.
 
 Final targeted client-common and Desktop typechecks also exited 0.
+
+
+### Phase 6 work in progress: shared preparation
+
+Moved the application update engine, schedule, installation identity, hosted transfer source and
+Linux metadata reader from Desktop into daemon-management's application-update export. Their
+existing tests moved with them. The preparation engine consumes the SDK state contract directly,
+without depending on client-common. Hosted transfers capture injected filesystem/path services;
+Desktop supplies NodeContext and the moved tests run with BunContext. No Electron dependency or
+implicit application launch is present in the shared preparation modules.
+
+The existing state machine and durable store remain authoritative: one admitted transfer, scoped
+cancellation cleanup, preserved prepared bytes, failed-attempt visibility and separate scheduling.
+Updated the governing update design and applicability. Native platform installation adapters still
+live in Desktop pending the installation-intent and native transaction work.
+
+Pinned Bun Mac validation: shared updater 17 tests passed; Desktop preparation/platform/preference
+15 tests passed. Daemon-management and Desktop targeted typechecks exited 0 after wiring the host
+filesystem/path capabilities at composition. Custom macOS replacement, installer outcomes, headless
+startup application, finite maintenance and full platform acceptance remain unfinished.
+
+Desktop production-mode local build, including native adapter and renderer, exited 0 after extraction.
+
+
+Shared installation extraction now includes the prepared-attempt barrier and Linux/Windows adapters.
+Installation intent is a Schema separating authorization from Desktop visibility or Caller continuation.
+Windows/Linux helper relaunch paths return without spawning an application for Caller. This is an
+explicit continuation boundary, not completed headless update integration: foreground lifetime,
+completion observation, new-version execution and cancellation still need their Phase 7 wiring.
+The existing macOS adapter explicitly refuses non-Desktop intent pending its native replacement.
+
+Mac targeted validation: 30 shared update tests passed (four Windows-only skips), 17 Linux/Windows
+handoff tests passed, and six remaining Desktop macOS/preference tests passed. Windows VM ran the
+13 engine and 12 prepared-installation tests successfully, then all four native private-file staging
+cases passed after correcting moved fixture imports and the native addon path. Those fixtures use
+real ACL handling but do not claim hosted download or publisher-signature end-to-end acceptance.
+Daemon-management, Desktop and CLI targeted typechecks exited 0. Desktop build exited 0 with shared
+adapters and continuation intent. No running service now performs automatic installation; that
+integration remains deliberately unfinished until native transactions and foreground continuation
+are validated.
+
+Full daemon-management regression passed: 303 tests, 11 platform/integration skips. This is a
+shared-update extraction checkpoint within Phase 6; native macOS and full installation gates remain open.

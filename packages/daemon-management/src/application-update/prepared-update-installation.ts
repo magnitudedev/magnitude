@@ -1,19 +1,21 @@
-import { Context, Effect, Option } from "effect"
+import { Context, Effect, Option, Schema } from "effect"
 import { isNewerVersion, isValidVersion } from "@magnitudedev/release"
 import type { UpdateRelease } from "@magnitudedev/release/hosted-update"
 import { PreparedUpdateStore, type PreparedUpdate } from "@magnitudedev/daemon-management/desktop-native"
+import { UpdateContinuation } from "./update-continuation"
 import { ApplicationUpdateFailed } from "./application-update"
 
 export interface PreparedUpdateInstaller {
   readonly requiresAuthorization: boolean
   /** Returns after the native handoff is admitted; the retiring owner then exits. */
-  readonly install: (archive: string, release: UpdateRelease, showWindow: boolean) => Effect.Effect<void, ApplicationUpdateFailed>
+  readonly install: (archive: string, release: UpdateRelease, continuation: UpdateContinuation) => Effect.Effect<void, ApplicationUpdateFailed>
 }
-export interface UpdateInstallationIntent {
-  readonly showWindow: boolean
-  readonly allowAuthorizationPrompt: boolean
-}
-export const PreparedUpdateInstaller = Context.GenericTag<PreparedUpdateInstaller>("desktop/PreparedUpdateInstaller")
+export const UpdateInstallationIntent = Schema.Struct({
+  continuation: UpdateContinuation,
+  allowAuthorizationPrompt: Schema.Boolean,
+})
+export type UpdateInstallationIntent = typeof UpdateInstallationIntent.Type
+export const PreparedUpdateInstaller = Context.GenericTag<PreparedUpdateInstaller>("@magnitudedev/daemon-management/PreparedUpdateInstaller")
 
 export const preparedUpdateFailure = (record: PreparedUpdate): Option.Option<string> => {
   switch (record.installation._tag) {
@@ -50,7 +52,7 @@ export const installPreparedUpdate = (intent: UpdateInstallationIntent) => Effec
   )
   // No native invocation is possible if this write fails, including an uncertain fsync result.
   yield* store.recordAttempt(release)
-  yield* installer.install(archive, release, intent.showWindow).pipe(
+  yield* installer.install(archive, release, intent.continuation).pipe(
     Effect.catchAllDefect(() => new ApplicationUpdateFailed({ message: "The update installer could not be started." })),
     Effect.tapError(error => store.recordFailure(release, error.message)),
   )

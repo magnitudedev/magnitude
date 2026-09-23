@@ -10,9 +10,9 @@ export interface UpdatePreferences {
   readonly read: Effect.Effect<boolean, UpdatePreferencesFailed>
   readonly write: (autoDownload: boolean) => Effect.Effect<void, UpdatePreferencesFailed>
 }
-export const UpdatePreferences = Context.GenericTag<UpdatePreferences>("desktop/UpdatePreferences")
+export const UpdatePreferences = Context.GenericTag<UpdatePreferences>("@magnitudedev/daemon-management/UpdatePreferences")
 
-/** Desktop owns the preference, using the same canonical config schema and atomic writer as other settings. */
+/** The application owns the preference, using the same canonical config schema and atomic writer as other settings. */
 export const makeUpdatePreferences = (clientDataDirectory: string) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const storage = makeGlobalStorage({ root: clientDataDirectory })

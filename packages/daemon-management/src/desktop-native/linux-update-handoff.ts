@@ -1,3 +1,4 @@
+import { UpdateContinuation } from "../application-update/update-continuation"
 import { Command, CommandExecutor } from "@effect/platform"
 import { Effect, Option, Schema } from "effect"
 import { spawn } from "node:child_process"
@@ -12,7 +13,7 @@ export const LinuxUpdateHandoffRequest = Schema.Struct({
   dataDirectory: Schema.NonEmptyString,
   stateDirectory: Schema.NonEmptyString,
   release: UpdateRelease,
-  showWindow: Schema.Boolean,
+  continuation: UpdateContinuation,
 }).pipe(Schema.filter(request => [request.dataDirectory, request.stateDirectory].every(path =>
   isAbsolute(path) && resolve(path) === path && !path.includes("\0"))))
 export type LinuxUpdateHandoffRequest = typeof LinuxUpdateHandoffRequest.Type
@@ -64,8 +65,12 @@ export const completeLinuxUpdateHandoff = (request: LinuxUpdateHandoffRequest) =
 }).pipe(Effect.mapError(failed))
 
 /** Called only after the helper releases its native installation lease. */
-export const relaunchLinuxAfterUpdate = (request: LinuxUpdateHandoffRequest) => Effect.async<void, LinuxPackageUpdateFailed>(resume => {
-    const application = spawn(LINUX_DESKTOP_EXECUTABLE_PATH, request.showWindow ? [] : ["--background"], { detached: true, stdio: "ignore" })
+export const relaunchLinuxAfterUpdate = (request: LinuxUpdateHandoffRequest) => {
+  const continuation = request.continuation
+  if (continuation._tag === "Caller") return Effect.void
+  return Effect.async<void, LinuxPackageUpdateFailed>(resume => {
+    const application = spawn(LINUX_DESKTOP_EXECUTABLE_PATH, continuation.showWindow ? [] : ["--background"], { detached: true, stdio: "ignore" })
     application.once("error", () => resume(Effect.fail(failed())))
     application.once("spawn", () => { application.unref(); resume(Effect.void) })
 })
+}

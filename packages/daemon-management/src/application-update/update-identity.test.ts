@@ -1,4 +1,4 @@
-import { NodeContext } from "@effect/platform-node"
+import { BunContext } from "@effect/platform-bun"
 import { Effect, Either, Layer } from "effect"
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -10,7 +10,7 @@ import { unixPrivateFilePermissions } from "@magnitudedev/daemon-management/priv
 describe("desktop installation identity", () => {
   it("persists one private identity across launches and refuses to reset a corrupt key", async () => {
     const root = await mkdtemp(join(tmpdir(), "magnitude-update-identity-"))
-    const identity = makeUpdateIdentity(root).pipe(Effect.provide(unixPrivateFilePermissions.pipe(Layer.provideMerge(NodeContext.layer))))
+    const identity = makeUpdateIdentity(root).pipe(Effect.provide(unixPrivateFilePermissions.pipe(Layer.provideMerge(BunContext.layer))))
     const make = () => Effect.runPromise(identity)
     const url = new URL("https://magnitude.dev/api/update?ts=1&nonce=test")
     try {

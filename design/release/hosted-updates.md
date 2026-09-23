@@ -5,6 +5,7 @@ applies_to:
   - packages/release/scripts/publish-hosted.ts
   - desktop/src/*update*
   - packages/daemon-management/src/desktop-native/*update*
+  - packages/daemon-management/src/application-update/**
   - cli/src/startup/*update*
   - packages/client-common/src/desktop/update.ts
   - packages/sdk/src/desktop-update.ts
@@ -13,7 +14,20 @@ applies_to:
 # Application updates
 
 Magnitude checks for compatible application updates and supports automatic downloads and manual
-checks. The desktop application owns download, installation, and relaunch.
+checks. Shared application update services own preparation, scheduling, installation identity and
+verified transfer independently of Electron. The admitted application owner supplies filesystem
+capabilities and retains the update workers for its lifetime. Desktop composes native installation
+and relaunch; preparation itself never restarts the application or its service. Installation intent
+separates authorization permission from continuation: Desktop retains its visibility choice, while
+Caller leaves continuation to the invoking foreground or finite command. Helpers must never launch
+Desktop for Caller intent. Handoff admission is distinct from completed installation; the caller
+must verify replacement before continuing startup.
+
+One schedule belongs to each owner. Manual checks reset its deadline; resume wakes the same timer.
+Automatic-download preference changes are persisted before they affect transfers. Disabling automatic
+downloads cancels an automatic transfer and waits for scoped scratch cleanup before another transfer
+can begin. A retained prepared update survives owner exit; a recorded failed attempt remains failed
+until explicit retry or discard. Observation never initiates a check or transfer.
 
 Updates must match the application platform and release channel. The client verifies release
 signatures, downloaded file integrity, and applicable native publisher signatures before

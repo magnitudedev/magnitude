@@ -1,15 +1,15 @@
-import { NodeContext } from "@effect/platform-node"
+import { BunContext } from "@effect/platform-bun"
 import { Effect, Layer, Option, Schema } from "effect"
 import { createHash, generateKeyPairSync } from "node:crypto"
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
-import { signUpdateRelease } from "../../packages/release/src/hosted-update/release"
+import { signUpdateRelease } from "../../../release/src/hosted-update/release"
 import { UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
 import { makePreparedUpdateStore, PreparedUpdateStore, unixPrivateFilePermissions } from "@magnitudedev/daemon-management/desktop-native"
 import { makeLinuxUpdateSource } from "./linux-update-source"
-import { installPreparedUpdate, PreparedUpdateInstaller } from "./prepared-update-installation"
+import { installPreparedUpdate, PreparedUpdateInstaller } from "./index"
 
 describe("Linux prepared update", () => {
   it("retains one signed package across owner exit and defers background authorization", async () => {
@@ -30,14 +30,14 @@ describe("Linux prepared update", () => {
           sign: () => Effect.succeed("unused"), userAgent: "fixture", dataDirectory: directory,
           stateDirectory: join(directory, "state") }).pipe(Effect.provideService(PreparedUpdateStore, store))
         yield* linux.source.stage(archive, release)
-        expect(yield* installPreparedUpdate({ showWindow: false, allowAuthorizationPrompt: false }).pipe(Effect.provideService(PreparedUpdateStore, store),
+        expect(yield* installPreparedUpdate({ continuation: { _tag: "Desktop", showWindow: false }, allowAuthorizationPrompt: false }).pipe(Effect.provideService(PreparedUpdateStore, store),
           Effect.provideService(PreparedUpdateInstaller, linux.installer))).toBe("Deferred")
         expect(Option.getOrThrow(yield* store.read).installation._tag).toBe("Unattempted")
-      })).pipe(Effect.provide(unixPrivateFilePermissions.pipe(Layer.provideMerge(NodeContext.layer)))))
+      })).pipe(Effect.provide(unixPrivateFilePermissions.pipe(Layer.provideMerge(BunContext.layer)))))
       expect((await readdir(join(directory, "updates"))).sort()).toEqual(["magnitude.deb", "update.json"])
       expect(await readFile(join(directory, "updates", "magnitude.deb"))).toEqual(bytes)
       const pending = await Effect.runPromise(makePreparedUpdateStore(options).pipe(Effect.flatMap(store => store.read),
-        Effect.provide(unixPrivateFilePermissions.pipe(Layer.provideMerge(NodeContext.layer)))))
+        Effect.provide(unixPrivateFilePermissions.pipe(Layer.provideMerge(BunContext.layer)))))
       expect(Option.getOrThrow(pending)).toEqual({ release, installation: { _tag: "Unattempted" } })
     } finally { await rm(directory, { recursive: true, force: true }) }
   })

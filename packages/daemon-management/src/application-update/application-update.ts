@@ -1,7 +1,8 @@
 import { Clock, Context, Effect, ExecutionStrategy, Exit, Fiber, Option, Schema, Scope, Stream, SubscriptionRef } from "effect"
 import { UpdateRelease } from "@magnitudedev/release/hosted-update"
-import type { DesktopUpdateState } from "@magnitudedev/client-common"
-import { UpdatePreferences, PreparedUpdateStore, type PreparedUpdate } from "@magnitudedev/daemon-management/desktop-native"
+import type { DesktopUpdateState } from "@magnitudedev/sdk/desktop-host"
+import { UpdatePreferences } from "../desktop-native/update-preferences"
+import { PreparedUpdateStore, type PreparedUpdate } from "../desktop-native/prepared-update"
 
 export class ApplicationUpdateFailed extends Schema.TaggedError<ApplicationUpdateFailed>()("ApplicationUpdateFailed", {
   message: Schema.String,
@@ -12,7 +13,7 @@ export interface ApplicationUpdateSource {
   readonly download: (candidate: Candidate, progress: (completed: number) => Effect.Effect<void>) => Effect.Effect<string, ApplicationUpdateFailed, Scope.Scope>
   readonly stage: (archive: string, candidate: Candidate) => Effect.Effect<void, ApplicationUpdateFailed>
 }
-export const ApplicationUpdateSource = Context.GenericTag<ApplicationUpdateSource>("desktop/ApplicationUpdateSource")
+export const ApplicationUpdateSource = Context.GenericTag<ApplicationUpdateSource>("@magnitudedev/daemon-management/ApplicationUpdateSource")
 
 const Transfer = Schema.Union(
   Schema.TaggedStruct("Idle", {}),
@@ -47,9 +48,9 @@ export interface ApplicationUpdate {
   readonly requireReady: Effect.Effect<void, ApplicationUpdateFailed>
   readonly close: Effect.Effect<void>
 }
-export const ApplicationUpdate = Context.GenericTag<ApplicationUpdate>("desktop/ApplicationUpdate")
+export const ApplicationUpdate = Context.GenericTag<ApplicationUpdate>("@magnitudedev/daemon-management/ApplicationUpdate")
 
-/** Checks and transfers have independent admission; workers belong to the desktop owner. */
+/** Checks and transfers have independent admission; workers belong to the application owner. */
 export const makeApplicationUpdate = (pending: Option.Option<PreparedUpdate> = Option.none()) => Effect.gen(function* () {
   const source = yield* ApplicationUpdateSource
   const store = yield* PreparedUpdateStore
