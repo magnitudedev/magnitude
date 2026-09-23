@@ -7,12 +7,14 @@ export class MacUpdateFilesystemFailed extends Schema.TaggedError<MacUpdateFiles
 const handle = Symbol("MacUpdateDirectory")
 export interface MacUpdateDirectory {
   readonly identity: MacFileIdentity
+  readonly path: string
   readonly [handle]: object
 }
 export interface MacUpdateFilesystem {
   readonly open: (path: string, privateDirectory: boolean) => Effect.Effect<MacUpdateDirectory, MacUpdateFilesystemFailed, Scope.Scope>
   readonly inspect: (directory: MacUpdateDirectory, name: string) => Effect.Effect<Option.Option<MacFileIdentity>, MacUpdateFilesystemFailed>
   readonly readRecord: (directory: MacUpdateDirectory) => Effect.Effect<Option.Option<Uint8Array>, MacUpdateFilesystemFailed>
+  readonly sync: (directory: MacUpdateDirectory) => Effect.Effect<void, MacUpdateFilesystemFailed>
   readonly writeRecord: (directory: MacUpdateDirectory, bytes: Uint8Array) => Effect.Effect<void, MacUpdateFilesystemFailed>
   readonly exchange: (installed: MacUpdateDirectory, installedName: string, previous: MacFileIdentity,
     staging: MacUpdateDirectory, stagedName: string, replacement: MacFileIdentity) => Effect.Effect<void, MacUpdateFilesystemFailed>
@@ -20,8 +22,9 @@ export interface MacUpdateFilesystem {
 export const MacUpdateFilesystem = Context.GenericTag<MacUpdateFilesystem>("@magnitudedev/daemon-management/MacUpdateFilesystem")
 
 interface Bindings {
-  readonly openMacUpdateDirectory: (path: string, privateDirectory: boolean) => { readonly identity: unknown }
+  readonly openMacUpdateDirectory: (path: string, privateDirectory: boolean) => { readonly identity: unknown; readonly path: unknown }
   readonly closeMacUpdateDirectory: (directory: object) => void
+  readonly syncMacUpdateDirectory: (directory: object) => void
   readonly inspectMacUpdateDirectory: (directory: object, name: string) => unknown
   readonly readMacUpdateRecord: (directory: object) => Uint8Array | null
   readonly writeMacUpdateRecord: (directory: object, bytes: Buffer) => void
@@ -38,12 +41,14 @@ export const nativeMacUpdateFilesystem = (addonPath: string) => Layer.effect(Mac
       const retained = yield* Effect.acquireRelease(attempt(() => native.openMacUpdateDirectory(path, privateDirectory)),
         directory => Effect.sync(() => native.closeMacUpdateDirectory(directory)))
       const identity = yield* Schema.decodeUnknown(MacFileIdentity)(retained.identity).pipe(Effect.mapError(() => new MacUpdateFilesystemFailed()))
-      return { identity, [handle]: retained }
+      const canonicalPath = yield* Schema.decodeUnknown(Schema.String.pipe(Schema.startsWith("/")))(retained.path).pipe(Effect.mapError(() => new MacUpdateFilesystemFailed()))
+      return { identity, path: canonicalPath, [handle]: retained }
     }),
     inspect: (directory, name) => attempt(() => native.inspectMacUpdateDirectory(directory[handle], name)).pipe(
       Effect.flatMap(Schema.decodeUnknown(Schema.OptionFromNullOr(MacFileIdentity))),
       Effect.mapError(() => new MacUpdateFilesystemFailed())),
     readRecord: directory => attempt(() => Option.fromNullable(native.readMacUpdateRecord(directory[handle]))),
+    sync: directory => attempt(() => native.syncMacUpdateDirectory(directory[handle])),
     writeRecord: (directory, bytes) => attempt(() => native.writeMacUpdateRecord(directory[handle], Buffer.from(bytes))),
     exchange: (installed, installedName, previous, staging, stagedName, replacement) =>
       attempt(() => native.exchangeMacUpdateDirectories(installed[handle], installedName, previous, staging[handle], stagedName, replacement)),

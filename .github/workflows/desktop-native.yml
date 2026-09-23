@@ -67,7 +67,7 @@ jobs:
           bun packages/daemon-management/scripts/build-native.ts
       - name: Exercise sealed bundle and nested signature verification
         working-directory: packages/daemon-management
-        run: bunx --bun vitest run src/desktop-native/mac-update-validation.test.ts src/desktop-native/mac-update-filesystem.test.ts
+        run: bunx --bun vitest run src/desktop-native/mac-update-validation.test.ts src/desktop-native/mac-update-filesystem.test.ts src/desktop-native/mac-update-recovery.test.ts
 
   linux-native-ownership:
     strategy:

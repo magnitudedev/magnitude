@@ -79,12 +79,15 @@ static napi_value acquire(napi_env env, napi_callback_info info) {
       (directory->identity.st_mode & S_IWOTH)) goto failed;
   if (private_directory && (directory->identity.st_uid != geteuid() ||
       (directory->identity.st_mode & 077) || !no_extended_acl(directory->fd))) goto failed;
-  char identity[64]; napi_value encoded;
+  char identity[64]; napi_value encoded, encoded_path;
   identity_text(directory->identity, identity);
-  napi_property_descriptor property = {"identity", NULL, NULL, NULL, NULL, NULL, napi_default, NULL};
-  if (napi_create_string_utf8(env, identity, NAPI_AUTO_LENGTH, &encoded) != napi_ok) goto failed;
-  property.value = encoded;
-  if (napi_create_object(env, &result) != napi_ok || napi_define_properties(env, result, 1, &property) != napi_ok ||
+  if (napi_create_string_utf8(env, identity, NAPI_AUTO_LENGTH, &encoded) != napi_ok ||
+      napi_create_string_utf8(env, directory->path, NAPI_AUTO_LENGTH, &encoded_path) != napi_ok) goto failed;
+  napi_property_descriptor properties[] = {
+    {"identity", NULL, NULL, NULL, NULL, encoded, napi_default, NULL},
+    {"path", NULL, NULL, NULL, NULL, encoded_path, napi_default, NULL},
+  };
+  if (napi_create_object(env, &result) != napi_ok || napi_define_properties(env, result, 2, properties) != napi_ok ||
       napi_type_tag_object(env, result, &directory_tag) != napi_ok ||
       napi_wrap(env, result, directory, finalize, NULL, NULL) != napi_ok) goto failed;
   return result;
@@ -97,6 +100,13 @@ static napi_value close_directory(napi_env env, napi_callback_info info) {
   update_directory *directory = unwrap(env, arg, 0);
   if (!directory) return fail(env);
   release(directory); return nothing(env);
+}
+static napi_value sync_directory(napi_env env, napi_callback_info info) {
+  napi_value arg; size_t argc = 1;
+  if (napi_get_cb_info(env, info, &argc, &arg, NULL, NULL) != napi_ok || argc != 1) return fail(env);
+  update_directory *directory = unwrap(env, arg, 1);
+  if (!directory || fsync(directory->fd)) return fail(env);
+  return nothing(env);
 }
 static napi_value inspect(napi_env env, napi_callback_info info) {
   napi_value args[2], result; size_t argc = 2;
@@ -197,6 +207,7 @@ void magnitude_register_mac_update_filesystem(napi_env env, napi_value exports) 
   napi_property_descriptor methods[] = {
     {"openMacUpdateDirectory", NULL, acquire, NULL, NULL, NULL, napi_default, NULL},
     {"closeMacUpdateDirectory", NULL, close_directory, NULL, NULL, NULL, napi_default, NULL},
+    {"syncMacUpdateDirectory", NULL, sync_directory, NULL, NULL, NULL, napi_default, NULL},
     {"inspectMacUpdateDirectory", NULL, inspect, NULL, NULL, NULL, napi_default, NULL},
     {"readMacUpdateRecord", NULL, read_record, NULL, NULL, NULL, napi_default, NULL},
     {"writeMacUpdateRecord", NULL, write_record, NULL, NULL, NULL, napi_default, NULL},

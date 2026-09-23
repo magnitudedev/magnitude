@@ -666,3 +666,33 @@ These primitives do not yet implement the schema-validated transaction journal, 
 machine, rollback decisions, installation-wide exclusion, staged-tree durability or startup execution.
 Production transaction fault injection and power-loss acceptance remain open; the earlier mechanical
 probe does not prove those future integrations. No automatic replacement has been enabled.
+
+### Phase 6 checkpoint: interrupted exchange recovery
+
+Parent source `145dcb7d`. Added the schema-validated, identity-bound transaction journal and recovery
+state machine. Exchange intent can become committed, abandoned, or restoration intent; restoration
+intent can become restored. Terminal states cannot authorize another forward exchange. Recovery
+verifies the installed bundle before declaring it usable, verifies the displaced old bundle before
+rollback, and never rolls back a committed replacement. Unknown identities, malformed records and
+failed reconciliation return a repair-required error. Native directory capabilities now expose their
+canonical path and explicit parent synchronization for post-crash namespace durability.
+
+Evidence on the local Mac:
+- Forty-five recovery tests passed, covering all twenty journal-state/observed-layout combinations,
+  replay, missing/unknown identities, parent/name binding, invalid UTF-8 and malformed journals,
+  invalid replacement and invalid rollback bundle, and completion sync/record failures.
+- Five fixture subprocesses were actually terminated with SIGKILL after intent publication, forward
+  exchange, commit publication, restoration-intent publication and restoration exchange. The native
+  filesystem operations and durable record writes were real; parent recovery then ran twice and
+  preserved the expected version without toggling the exchange.
+- Recovery fixtures inject bundle-verification decisions to isolate state transitions. Actual
+  signature verification has separate native evidence above; these tests do not claim an integrated
+  signed updater transaction. Injected operation failures before/after mutation likewise do not
+  substitute for filesystem or VM power-loss testing.
+- Full daemon-management regression: 369 passed, 11 platform/integration skips. Targeted package
+  typecheck, native build, Clang static analysis and workflow YAML validation passed.
+
+Recovery still requires caller-held installation exclusion. Initial preparation, staged-tree sync,
+archive authentication/capability transfer, transaction cleanup, fresh-install publication, foreground
+execution and startup integration remain unfinished. This checkpoint does not enable automatic
+replacement or authorize service startup through an uncertain transaction.

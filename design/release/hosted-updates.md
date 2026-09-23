@@ -58,6 +58,15 @@ cannot exchange the bundles again. An exchange error may occur after namespace m
 identity reconciliation, never blind retry. These capabilities belong to the finite installer process;
 they neither acquire installation exclusion nor authorize mutation on their own.
 
+macOS recovery validates a bounded, schema-checked journal bound to both retained parent identities
+and the installation name. Observed bundle identities determine the result: an unexecuted exchange is
+abandoned for explicit retry, while an observed valid replacement completes commit without another
+exchange. An invalid uncommitted replacement permits rollback only after the displaced old bundle is
+verified and restoration intent is durable. Recovery can resume that restoration before or after its
+exchange. A committed update never rolls back. Unknown identities, malformed records, failed validation
+or incomplete durability require repair before service startup. Completed cleanup may remove the
+displaced bundle only after a terminal journal state; recovery itself preserves transaction contents.
+
 Application binaries are distributed through GitHub Releases. Downloads must resolve to trusted
 release assets, and interrupted or invalid transfers must not publish a prepared installer.
 
