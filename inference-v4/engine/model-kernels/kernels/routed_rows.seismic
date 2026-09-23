@@ -1,0 +1,227 @@
+# Complete routed feed-forward oracle. Production execution uses the staged
+# entries below so each expensive projection is computed once and retained.
+fn qwen_routed_rows[M, H, E, K, F, S](residual: &tensor[M, H] f32,
+    norm: &tensor[H] NW, router: &tensor[E, H] RW,
+    shared_router: &tensor[H] f32,
+    expert_gate: &tensor[E, F, H] EGW, expert_up: &tensor[E, F, H] EUW,
+    expert_down: &tensor[E, H, F] EDW,
+    shared_gate: &tensor[S, H] SGW, shared_up: &tensor[S, H] SUW,
+    shared_down: &tensor[H, S] SDW, routes: &mut tensor[M, K] i32,
+    scores: &mut tensor[M, K] f32, eps: f32, normalize: i32)
+    -> tensor[M, H] f32:
+    let mut normalized = tensor[M, H] A
+    let mut logits = tensor[M, E] f32
+    let mut expert_product = tensor[M, K, F] A
+    let mut expert_output = tensor[M, K, H] A
+    let mut shared_gate_output = tensor[M, S] A
+    let mut shared_up_output = tensor[M, S] A
+    let mut shared_activated = tensor[M, S] A
+    let mut shared_product = tensor[M, S] A
+    let mut shared_output = tensor[M, H] A
+    let mut shared_coefficient = tensor[M, 1] A
+    let mut result = tensor[M, H] f32
+    for row in 0..M:
+        shared_coefficient[row, 0] = 0.0
+        for column in 0..H:
+            result[row, column] = 0.0
+    rms_norm(residual, norm, normalized, eps)
+    linear(normalized, router, logits)
+    for row in 0..M:
+        let values = f32(logits[row])
+        let maximum = reduce(values, 0, max)
+        let mut probabilities = exp(values - maximum)
+        let total = reduce(probabilities, 0, sum)
+        probabilities = probabilities / total
+        for choice in 0..K:
+            routes[row, choice] = 0
+            scores[row, choice] = 0.0
+        for rank in 0..K:
+            let best = reduce(probabilities, 0, max)
+            let mut candidates = tensor[E] i32
+            for expert in 0..E:
+                candidates[expert] = -1
+                if probabilities[expert] == best:
+                    candidates[expert] = expert
+            let winner = reduce(i32(candidates), 0, max)
+            routes[row, K - 1 - rank] = winner
+            scores[row, K - 1 - rank] = best
+            probabilities[winner] = -inf
+        if normalize != 0:
+            let denominator = reduce(f32(scores[row]), 0, sum)
+            for choice in 0..K:
+                scores[row, choice] = scores[row, choice] / denominator
+        for choice in 0..K:
+            let expert = routes[row, choice]
+            for feature in 0..F:
+                let mut gate = f32(0.0)
+                let mut up = f32(0.0)
+                for source in 0..H:
+                    gate = fma(f32(normalized[row, source]), f32(expert_gate[expert, feature, source]), gate)
+                    up = fma(f32(normalized[row, source]), f32(expert_up[expert, feature, source]), up)
+                expert_product[row, choice, feature] = (gate / (1.0 + exp(-gate))) * up
+            for column in 0..H:
+                let mut projected = f32(0.0)
+                for feature in 0..F:
+                    projected = fma(f32(expert_product[row, choice, feature]), f32(expert_down[expert, column, feature]), projected)
+                expert_output[row, choice, column] = projected
+    linear(normalized, shared_gate, shared_gate_output)
+    linear(normalized, shared_up, shared_up_output)
+    silu(shared_gate_output, shared_activated)
+    multiply(shared_activated, shared_up_output, shared_product)
+    linear(shared_product, shared_down, shared_output)
+    for row in 0..M:
+        let coefficient = reduce(f32(normalized[row]) * f32(shared_router), 0, sum)
+        shared_coefficient[row, 0] = 1.0 / (1.0 + exp(-coefficient))
+        for column in 0..H:
+            let mut selected = f32(0.0)
+            for choice in 0..K:
+                selected = fma(scores[row, choice], f32(expert_output[row, choice, column]), selected)
+            result[row, column] = residual[row, column] + selected + f32(shared_output[row, column]) * f32(shared_coefficient[row, 0])
+    return result
+
+fn qwen_routed_normalize[M, O, H](residual: &tensor[M, H] f32,
+    norm: &tensor[H] NW, source_rows: &tensor[O] i32, eps: f32)
+    -> tensor[O, H] A:
+    let mut selected = tensor[O, H] f32
+    for row in 0..O:
+        for column in 0..H:
+            selected[row, column] = residual[source_rows[row], column]
+    let mut normalized = tensor[O, H] A
+    rms_norm(selected, norm, normalized, eps)
+    return normalized
+
+native qwen_routed_normalize for metal from "metal/qwen_routed_normalize.metal":
+    threadgroups (ceil_div(O * H, 8), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+fn qwen_routed_logits[O, H, E](normalized: &tensor[O, H] A,
+    router_weight: &tensor[E, H] RW) -> tensor[O, E] f32:
+    let mut logits = tensor[O, E] f32
+    linear(normalized, router_weight, logits)
+    return logits
+
+native qwen_routed_logits for metal from "metal/qwen_routed_logits.metal":
+    threadgroups (ceil_div(O * E, 8), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+fn qwen_routed_select[O, E, K](logits: &tensor[O, E] f32, selected: i32,
+    routes: &mut tensor[O, K] i32, scores: &mut tensor[O, K] f32):
+    for row in 0..O:
+        for choice in 0..K:
+            routes[row, choice] = 0
+            scores[row, choice] = 0.0
+        let values = f32(logits[row])
+        let maximum = reduce(values, 0, max)
+        let mut probabilities = exp(values - maximum)
+        let total = reduce(probabilities, 0, sum)
+        probabilities = probabilities / total
+        for rank in 0..K:
+            let best = reduce(probabilities, 0, max)
+            let mut candidates = tensor[E] i32
+            for expert in 0..E:
+                candidates[expert] = -1
+                if probabilities[expert] == best:
+                    candidates[expert] = expert
+            let winner = reduce(i32(candidates), 0, max)
+            routes[row, K - 1 - rank] = winner
+            scores[row, K - 1 - rank] = best
+            probabilities[winner] = -inf
+        if selected != 0:
+            let denominator = reduce(f32(scores[row]), 0, sum)
+            for choice in 0..K:
+                scores[row, choice] = scores[row, choice] / denominator
+native qwen_routed_select for metal from "metal/qwen_routed_select.metal":
+    threadgroups (ceil_div(O, 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+fn qwen_routed_expand[O, H, E, K, F, S](normalized: &tensor[O, H] A,
+    expert_gate: &tensor[E, F, H] EGW, expert_up: &tensor[E, F, H] EUW,
+    shared_gate: &tensor[S, H] SGW, shared_up: &tensor[S, H] SUW,
+    shared_control: &tensor[H] f32, routes: &tensor[O, K] i32)
+    -> (tensor[O, K, F] A, tensor[O, S] A, tensor[O, 1] A):
+    let mut expert_gate_output = tensor[O * K, F] A
+    let mut expert_up_output = tensor[O * K, F] A
+    let mut expert_activated = tensor[O * K, F] A
+    let mut expert_product = tensor[O * K, F] A
+    let mut shared_gate_output = tensor[O, S] A
+    let mut shared_up_output = tensor[O, S] A
+    let mut shared_activated = tensor[O, S] A
+    let mut shared_product = tensor[O, S] A
+    let mut shared_coefficient = tensor[O, 1] A
+    for expert_row in 0..O * K:
+        for feature in 0..F:
+            expert_gate_output[expert_row, feature] = 0.0
+            expert_up_output[expert_row, feature] = 0.0
+            expert_activated[expert_row, feature] = 0.0
+            expert_product[expert_row, feature] = 0.0
+    for row in 0..O:
+        shared_coefficient[row, 0] = 0.0
+        for feature in 0..S:
+            shared_gate_output[row, feature] = 0.0
+            shared_up_output[row, feature] = 0.0
+            shared_activated[row, feature] = 0.0
+            shared_product[row, feature] = 0.0
+        for choice in 0..K:
+            let expert = routes[row, choice]
+            for feature in 0..F:
+                let mut gate = f32(0.0)
+                let mut up = f32(0.0)
+                for source in 0..H:
+                    gate = fma(f32(normalized[row, source]), f32(expert_gate[expert, feature, source]), gate)
+                    up = fma(f32(normalized[row, source]), f32(expert_up[expert, feature, source]), up)
+                expert_gate_output[row * K + choice, feature] = gate
+                expert_up_output[row * K + choice, feature] = up
+    silu(expert_gate_output, expert_activated)
+    multiply(expert_activated, expert_up_output, expert_product)
+    linear(normalized, shared_gate, shared_gate_output)
+    linear(normalized, shared_up, shared_up_output)
+    silu(shared_gate_output, shared_activated)
+    multiply(shared_activated, shared_up_output, shared_product)
+    for row in 0..O:
+        let coefficient = reduce(f32(normalized[row]) * f32(shared_control), 0, sum)
+        shared_coefficient[row, 0] = 1.0 / (1.0 + exp(-coefficient))
+    return (reshape(expert_product, (O, K, F)), shared_product, shared_coefficient)
+
+native qwen_routed_expand for metal from "metal/qwen_routed_expand.metal":
+    threadgroups (ceil_div(O * (K * F + S + 1), 8), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+fn qwen_routed_output[M, O, H, E, K, F, S](residual: &tensor[M, H] f32,
+    source_rows: &tensor[O] i32, expert_product: &tensor[O, K, F] A,
+    shared_product: &tensor[O, S] A, shared_coefficient: &tensor[O, 1] A,
+    expert_down: &tensor[E, H, F] EDW, shared_down: &tensor[H, S] SDW,
+    routes: &tensor[O, K] i32, scores: &tensor[O, K] f32)
+    -> tensor[O, H] f32:
+    let mut expert_output = tensor[O * K, H] A
+    let mut shared_output = tensor[O, H] A
+    let mut value = tensor[O, H] f32
+    for expert_row in 0..O * K:
+        for column in 0..H:
+            expert_output[expert_row, column] = 0.0
+    for row in 0..O:
+        for column in 0..H:
+            value[row, column] = 0.0
+            shared_output[row, column] = 0.0
+            for choice in 0..K:
+                let expert = routes[row, choice]
+                let mut projected = f32(0.0)
+                for feature in 0..F:
+                    projected = fma(f32(expert_product[row, choice, feature]), f32(expert_down[expert, column, feature]), projected)
+                expert_output[row * K + choice, column] = projected
+            let mut shared = f32(0.0)
+            for feature in 0..S:
+                shared = fma(f32(shared_product[row, feature]), f32(shared_down[column, feature]), shared)
+            shared_output[row, column] = shared
+            let mut selected = f32(0.0)
+            for choice in 0..K:
+                selected = fma(scores[row, choice], f32(expert_output[row * K + choice, column]), selected)
+            value[row, column] = residual[source_rows[row], column] + selected + f32(shared_output[row, column]) * f32(shared_coefficient[row, 0])
+    return value
+
+native qwen_routed_output for metal from "metal/qwen_routed_output.metal":
+    threadgroups (ceil_div(O * H, 8), 1, 1)
+    threads_per_threadgroup (256, 1, 1)

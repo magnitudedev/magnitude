@@ -2170,10 +2170,12 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         match elem {
             Elem::Dtype(dtype) => crate::registry::dense(*dtype),
             Elem::Repr(representation) => *representation,
-            Elem::Param(name) => *self
-                .elements
-                .get(name)
-                .unwrap_or_else(|| panic!("unbound element parameter in monomorphization")),
+            Elem::Param(name) => *self.elements.get(name).unwrap_or_else(|| {
+                panic!(
+                    "unbound element parameter `{name}` while monomorphizing `{}`",
+                    self.definition.name
+                )
+            }),
         }
     }
 

@@ -1,10 +1,24 @@
-use magnitude_engine::{
-    models::qwen35::{gguf::inspect, FeedForwardWeights, HeadMapping, MixerWeights},
-    weights::{
-        descriptor::ArtifactIdentity,
-        gguf::{ByteOrder, Directory, Encoding, Metadata, Scalar, Tensor, Value},
-    },
+use magnitude_artifacts::{
+    gguf::{ByteOrder, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
+    ArtifactIdentity, PackageIdentity,
 };
+use magnitude_model_contracts::{
+    FeedForwardGeometry, FeedForwardWeights, MixerGeometry, MixerWeights, RecurrentHeadMapping,
+};
+use magnitude_model_qwen35::inspect_components;
+fn inspect(
+    directory: &Directory,
+    identity: ArtifactIdentity,
+) -> Result<magnitude_model_contracts::ModelDefinition, magnitude_model_qwen35::Error> {
+    inspect_components(
+        directory,
+        None,
+        PackageIdentity {
+            target: identity,
+            projector: None,
+        },
+    )
+}
 fn directory(routed: bool) -> Directory {
     let architecture = if routed { "qwen35moe" } else { "qwen35" };
     let mut metadata = vec![Metadata {
@@ -57,7 +71,7 @@ fn directory(routed: bool) -> Directory {
     });
     let mut tensors = Vec::new();
     let mut add = |name: String, shape: &[u64]| {
-        tensors.push(Tensor {
+        tensors.push(TensorDescriptor {
             name,
             shape: shape.into(),
             encoding: Encoding::F32,
@@ -137,13 +151,23 @@ fn dense_and_routed_roles_preserve_geometry_and_tied_output() {
     for routed in [false, true] {
         let d = directory(routed);
         let model = inspect(&d, ArtifactIdentity([0; 32])).unwrap();
-        assert_eq!(model.geometry.recurrent_channels().unwrap(), 16);
-        assert_eq!(model.geometry.recurrent_head_mapping, HeadMapping::Tiled);
+        let MixerGeometry::Recurrent(recurrent) = &model.geometry.blocks[0].mixer else {
+            panic!("first block must be recurrent")
+        };
+        assert_eq!(recurrent.channels().unwrap(), 16);
+        assert_eq!(recurrent.head_mapping, RecurrentHeadMapping::Tiled);
         assert_eq!(model.output, model.embedding);
         assert!(matches!(&model.blocks[0].mixer, MixerWeights::Recurrent(_)));
         assert!(matches!(&model.blocks[1].mixer, MixerWeights::Attention(_)));
         assert_eq!(
             matches!(&model.blocks[0].feedforward, FeedForwardWeights::Routed(_)),
+            routed
+        );
+        assert_eq!(
+            matches!(
+                &model.geometry.blocks[0].feedforward,
+                FeedForwardGeometry::Routed(_)
+            ),
             routed
         );
     }
@@ -217,8 +241,7 @@ fn explicit_mixer_flags_and_speculative_blocks_keep_main_layer_order() {
 fn local_gguf_loading_shares_artifact_identity_with_tokenizer_and_templates() {
     use magnitude_engine::{
         chat::{ChatRequest, PreparedChat, TemplateSelection},
-        inputs::ByteBpeTokenizer,
-        models::qwen35::loading::Model,
+        composition::LoadedArtifacts,
     };
     fn string(out: &mut Vec<u8>, value: &str) {
         out.extend_from_slice(&(value.len() as u64).to_le_bytes());
@@ -347,20 +370,24 @@ fn local_gguf_loading_shares_artifact_identity_with_tokenizer_and_templates() {
     }
     let temp = Temp(path);
     std::fs::write(&temp.0, bytes).unwrap();
-    let model = Model::open(&temp.0).unwrap();
-    assert_eq!(model.description().geometry.vocabulary, 257);
-    assert_eq!(model.description().output, model.description().embedding);
-    let identity = model.description().artifact_identity.to_string();
+    let directory_error = LoadedArtifacts::open(temp.0.parent().unwrap())
+        .err()
+        .unwrap();
+    assert!(directory_error.contains("regular GGUF file"));
+    let model = LoadedArtifacts::open(&temp.0).unwrap();
+    assert_eq!(model.definition().geometry.vocabulary, 257);
+    assert_eq!(model.definition().output, model.definition().embedding);
+    let identity = model.definition().artifact_identity.to_string();
     // GGUF interpretation is retained; later pathname replacement cannot alter
     // its tokenizer/template metadata or the open weight source.
     let replacement = temp.0.with_extension("replacement");
     std::fs::write(&replacement, b"invalid replacement").unwrap();
     std::fs::rename(&replacement, &temp.0).unwrap();
-    let tokenizer = ByteBpeTokenizer::new(model.tokenizer_config().unwrap()).unwrap();
+    let tokenizer = model.tokenizer();
     assert_eq!(tokenizer.artifact_identity(), identity);
     let prepared = PreparedChat::prepare(
-        &model.templates().unwrap(),
-        &tokenizer,
+        model.templates(),
+        tokenizer,
         &ChatRequest::new(
             vec![serde_json::json!({"role":"user","content":"hello"})],
             0,
@@ -370,5 +397,5 @@ fn local_gguf_loading_shares_artifact_identity_with_tokenizer_and_templates() {
     .unwrap();
     assert_eq!(prepared.prompt(), "hello");
     assert_eq!(prepared.prompt_tokens(), 5);
-    assert!(Model::open(&temp.0).is_err());
+    assert!(LoadedArtifacts::open(&temp.0).is_err());
 }

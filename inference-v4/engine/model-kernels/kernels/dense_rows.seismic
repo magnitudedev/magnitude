@@ -1,0 +1,133 @@
+# Packed target feed-forward stage. Its checked body remains the semantic
+# oracle while the native route computes one complete output coordinate per
+# owner with reductions ordered by ascending source coordinate.
+fn qwen_dense_rows[M, H, F](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
+                            gate_weight: &tensor[F, H] GW, up_weight: &tensor[F, H] UW,
+                            down_weight: &tensor[H, F] DW, eps: f32) -> tensor[M, H] f32:
+    let mut normalized = tensor[M, H] A
+    let mut gate = tensor[M, F] A
+    let mut up = tensor[M, F] A
+    let mut activated = tensor[M, F] A
+    let mut product = tensor[M, F] A
+    let mut projected = tensor[M, H] A
+    let mut result = tensor[M, H] f32
+    rms_norm(residual, norm, normalized, eps)
+    linear(normalized, gate_weight, gate)
+    linear(normalized, up_weight, up)
+    silu(gate, activated)
+    multiply(activated, up, product)
+    linear(product, down_weight, projected)
+    add(residual, projected, result)
+    return result
+
+native qwen_dense_rows for metal from "metal/qwen_dense_rows.metal":
+    threadgroups (ceil_div(M * H, 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+# The final target block only advances rows with feature/logit demand.
+fn qwen_dense_rows_demanded[M, O, H, F](residual: &tensor[M, H] f32,
+    norm: &tensor[H] NW, gate_weight: &tensor[F, H] GW,
+    up_weight: &tensor[F, H] UW, down_weight: &tensor[H, F] DW,
+    out_rows: &tensor[O] i32, eps: f32) -> tensor[O, H] f32:
+    let mut selected = tensor[O, H] f32
+    parallel for row in 0..O:
+        parallel for col in 0..H:
+            selected[row, col] = residual[out_rows[row], col]
+    let mut normalized = tensor[O, H] A
+    let mut gate = tensor[O, F] A
+    let mut up = tensor[O, F] A
+    let mut activated = tensor[O, F] A
+    let mut product = tensor[O, F] A
+    let mut projected = tensor[O, H] A
+    let mut result = tensor[O, H] f32
+    rms_norm(selected, norm, normalized, eps)
+    linear(normalized, gate_weight, gate)
+    linear(normalized, up_weight, up)
+    silu(gate, activated)
+    multiply(activated, up, product)
+    linear(product, down_weight, projected)
+    add(selected, projected, result)
+    return result
+
+native qwen_dense_rows_demanded for metal from "metal/qwen_dense_rows_demanded.metal":
+    threadgroups (ceil_div(O * H, 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+# Native dense execution stages the activation product because it is shared
+# by every output column. This preserves the semantic entry above while
+# avoiding H identical gate/up projections per row and feature.
+fn qwen_dense_expand[M, H, F](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
+    gate_weight: &tensor[F, H] GW, up_weight: &tensor[F, H] UW, eps: f32)
+    -> tensor[M, F] A:
+    let mut normalized = tensor[M, H] A
+    let mut gate = tensor[M, F] A
+    let mut up = tensor[M, F] A
+    let mut activated = tensor[M, F] A
+    let mut product = tensor[M, F] A
+    rms_norm(residual, norm, normalized, eps)
+    linear(normalized, gate_weight, gate)
+    linear(normalized, up_weight, up)
+    silu(gate, activated)
+    multiply(activated, up, product)
+    return product
+
+native qwen_dense_expand for metal from "metal/qwen_dense_expand.metal":
+    threadgroups (ceil_div(M * F, 8), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+fn qwen_dense_output[M, H, F](residual: &tensor[M, H] f32,
+    product: &tensor[M, F] A, down_weight: &tensor[H, F] DW)
+    -> tensor[M, H] f32:
+    let mut projected = tensor[M, H] A
+    let mut result = tensor[M, H] f32
+    linear(product, down_weight, projected)
+    add(residual, projected, result)
+    return result
+
+native qwen_dense_output for metal from "metal/qwen_dense_output.metal":
+    threadgroups (ceil_div(M * H, 8), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+fn qwen_dense_expand_demanded[M, O, H, F](residual: &tensor[M, H] f32,
+    norm: &tensor[H] NW, gate_weight: &tensor[F, H] GW,
+    up_weight: &tensor[F, H] UW, out_rows: &tensor[O] i32, eps: f32)
+    -> tensor[O, F] A:
+    let mut selected = tensor[O, H] f32
+    parallel for row in 0..O:
+        parallel for col in 0..H:
+            selected[row, col] = residual[out_rows[row], col]
+    let mut normalized = tensor[O, H] A
+    let mut gate = tensor[O, F] A
+    let mut up = tensor[O, F] A
+    let mut activated = tensor[O, F] A
+    let mut product = tensor[O, F] A
+    rms_norm(selected, norm, normalized, eps)
+    linear(normalized, gate_weight, gate)
+    linear(normalized, up_weight, up)
+    silu(gate, activated)
+    multiply(activated, up, product)
+    return product
+
+native qwen_dense_expand_demanded for metal from "metal/qwen_dense_expand_demanded.metal":
+    threadgroups (ceil_div(O * F, 8), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+fn qwen_dense_output_demanded[M, O, H, F](residual: &tensor[M, H] f32,
+    product: &tensor[O, F] A, down_weight: &tensor[H, F] DW,
+    out_rows: &tensor[O] i32) -> tensor[O, H] f32:
+    let mut projected = tensor[O, H] A
+    let mut result = tensor[O, H] f32
+    linear(product, down_weight, projected)
+    parallel for row in 0..O:
+        parallel for col in 0..H:
+            result[row, col] = residual[out_rows[row], col] + f32(projected[row, col])
+    return result
+
+native qwen_dense_output_demanded for metal from "metal/qwen_dense_output_demanded.metal":
+    threadgroups (ceil_div(O * H, 8), 1, 1)
+    threads_per_threadgroup (256, 1, 1)

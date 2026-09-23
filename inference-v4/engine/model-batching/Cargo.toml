@@ -1,0 +1,9 @@
+[package]
+name = "magnitude-model-batching"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+magnitude-model-contracts = { path = "../model-contracts" }
+magnitude-model-state = { path = "../model-state" }

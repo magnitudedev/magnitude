@@ -5,6 +5,7 @@ applies_to:
   - inference-v2/pyproject.toml
   - inference-v2/session-bench.md
   - inference-v2/session-bench-runtimes/**
+  - inference-v4/validation/v4_sessionbench.py
 ---
 
 # Session bench
@@ -47,6 +48,10 @@ Sampling is greedy, seed 42 where supported, and model-selected thinking is disa
 Adapters own engine preparation, launch, readiness and cleanup; shared code owns session scheduling,
 HTTP/SSE, semantic validation and reporting. Preparation installs frozen dependencies and obtains
 artifacts before timed work. Measurement is offline with verified source, artifact and runtime identity.
+An adapter that can configure serving context must set it to the context of the launched block and
+require readiness to report that exact value. Host-only fixture and prompt counting may inspect larger
+rendered inputs within artifact capability without causing the numerical engine to allocate the
+artifact's maximum context.
 Only one benchmark owns the machine's managed benchmark process lifetime at once. Targets run
 sequentially, with balanced fresh-process passes and cache-disjoint warmup. Within a target, requests
 follow the declared dependency graph and release schedule. Prefix policy is recorded and verified;

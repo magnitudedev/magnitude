@@ -4,8 +4,8 @@
 //! walker through `lower_semantic`; there is no second backend-local typed
 //! lowering path.
 
-use crate::facts::MetalFacts;
 use crate::Metal;
+use crate::facts::MetalFacts;
 use seismic_compiler::kernel::ops::{IntrinsicResources, LogicalTensorMap};
 use seismic_compiler::target::{CapabilityRegistration, DataTypeSupport, TargetLimits};
 use seismic_lang::expr::{ExprArena, NatExpr};
@@ -47,23 +47,38 @@ pub(crate) fn lower_semantic(
     use seismic_compiler::kernel::ops::SemanticIntrinsicOperand as Operand;
     match call.signature.name {
         "lane_index" => {
-            sink.emit(MetalIntrinsic::LaneIndex, IntrinsicResources {
-                requires_subgroup: true, ..IntrinsicResources::default()
-            }, call.destination.clone());
+            sink.emit(
+                MetalIntrinsic::LaneIndex,
+                IntrinsicResources {
+                    requires_subgroup: true,
+                    ..IntrinsicResources::default()
+                },
+                call.destination.clone(),
+            );
         }
         "shuffle" => {
-            let dtype = collective_dtype(call.signature).expect("registered shuffle has a scalar dtype");
-            sink.emit(MetalIntrinsic::Shuffle { dtype }, subgroup_resources(), call.destination.clone());
+            let dtype =
+                collective_dtype(call.signature).expect("registered shuffle has a scalar dtype");
+            sink.emit(
+                MetalIntrinsic::Shuffle { dtype },
+                subgroup_resources(),
+                call.destination.clone(),
+            );
         }
         "simd_sum" | "simd_max" | "simd_min" => {
-            let dtype = collective_dtype(call.signature).expect("registered collective has a scalar dtype");
+            let dtype =
+                collective_dtype(call.signature).expect("registered collective has a scalar dtype");
             let op = match call.signature.name {
                 "simd_sum" => ReduceOp::Sum,
                 "simd_max" => ReduceOp::Max,
                 "simd_min" => ReduceOp::Min,
                 _ => unreachable!(),
             };
-            sink.emit(MetalIntrinsic::SubgroupReduce { op, dtype }, subgroup_resources(), call.destination.clone());
+            sink.emit(
+                MetalIntrinsic::SubgroupReduce { op, dtype },
+                subgroup_resources(),
+                call.destination.clone(),
+            );
         }
         "matmul" | "matmul_add" => {
             let left = sink.readable(call.operands[0].clone());
@@ -88,7 +103,8 @@ pub(crate) fn lower_semantic(
             let eight = sink.nat(8);
             let scratch_left = sink.workgroup_tensor(left_representation, vec![eight, eight]);
             let scratch_right = sink.workgroup_tensor(right_representation, vec![eight, eight]);
-            let scratch_accumulator = sink.workgroup_tensor(output_representation, vec![eight, eight]);
+            let scratch_accumulator =
+                sink.workgroup_tensor(output_representation, vec![eight, eight]);
             sink.emit(
                 MetalIntrinsic::Matrix {
                     left,
@@ -109,7 +125,9 @@ pub(crate) fn lower_semantic(
                 Some(destination),
             );
         }
-        name => panic!("Metal registry advertised intrinsic `{name}` without an exhaustive semantic dispatcher arm"),
+        name => panic!(
+            "Metal registry advertised intrinsic `{name}` without an exhaustive semantic dispatcher arm"
+        ),
     }
 }
 

@@ -1,7 +1,5 @@
 //! Logical input boundaries and tokenization, independent of physical pages.
-pub mod artifacts;
-mod layout;
-pub mod media;
-mod tokenizer;
-pub use layout::{BoundaryRule, InputLayout, InputSpan};
-pub use tokenizer::{BpeConfig, ByteBpeTokenizer, PieceKind, SpecialTokens, TokenDecoder, TokenId};
+pub use magnitude_artifacts::media;
+pub use magnitude_artifacts::{BoundaryRule, InputLayout, InputSpan, TokenId};
+pub use magnitude_chat::artifacts;
+pub use magnitude_chat::{BpeConfig, ByteBpeTokenizer, PieceKind, SpecialTokens, TokenDecoder};

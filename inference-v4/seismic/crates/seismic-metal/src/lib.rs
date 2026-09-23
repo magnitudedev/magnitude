@@ -44,7 +44,7 @@ use std::time::Instant;
 pub use command::Pipeline;
 pub use compile::NativeCandidate;
 pub use device::{DeviceHandle, MetalBuffer, MetalDevice};
-pub use direct::DirectPipeline;
+pub use direct::{DirectBatch, DirectPipeline};
 pub use executor::MetalExecutor;
 pub use facts::MetalFacts;
 pub use intrinsic::MetalIntrinsic;

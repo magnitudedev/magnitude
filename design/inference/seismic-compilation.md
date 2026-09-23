@@ -33,19 +33,30 @@ implementation. Private algorithms may normalize, infer, schedule, or emit,
 but they never introduce a public or cross-crate artifact that restates the
 program.
 
-An explicitly selected top-level native implementation is a separate terminal route, not another
+An explicitly selected top-level native implementation is a separate compilation route, not another
 compiler progression:
 
 ```text
 CheckedModule -> LogicalEntry -> InvocationContract
              + embedded native source + authored launch
-             -> NativeKernel<Entry> -> direct synchronous Metal completion
+             -> NativeKernel<Entry> -> PreparedNativeWorkflow
+             -> BoundNativeWorkflowRun -> Metal completion
 ```
 
 This route reuses the checked entry contract and public tensor runtime but constructs none of
-`ImplementationDraft`, compiler kernel IR, `PlanSpace`, `FrozenPlan`, `ExecutableVariant`,
-`PreparedKernel`, or workflow artifacts. It has no tuning, solving, duration model, candidate
-selection, retry, or fallback. The distinct public handle makes direct-only use structural.
+`ImplementationDraft`, compiler kernel IR, `PlanSpace`, `FrozenPlan`, `ExecutableVariant`, or
+`PreparedKernel`. It has no tuning, solving, duration model, candidate selection, retry, or
+fallback. A native workflow composes checked native entries, owns the shapes and lifetimes of
+its graph-local mutable tensors, host-uploaded input tensors, intermediate results, and exported
+outputs, and reports its exact storage charge. Compatible workflow variants may share a bounded
+physical scratch arena. They are prepared for admitted model dimensions and physical launch
+classes before the engine becomes ready. Request-dependent external state and resident tensors
+are joined to checked ports while constructing an owned run, before submission. A submitted run
+does not discover an absent tensor, incompatible shape, representation, or alias.
+Direct native workflow nodes execute in their checked dependency order within one Metal command
+buffer per workflow submission. Their invocation arguments are fixed independently for each node
+before encoding, and the workflow holds all referenced storage through the single completion.
+Standalone native calls retain their own submission boundary.
 
 ## Principles
 
@@ -274,6 +285,15 @@ model execution prepares at least one complete decoder-step workflow. Runtime
 never infers placement, repairs a plan, retries selection after execution, or
 interprets the portable body.
 
+The explicit native route has the same constructional boundary. Its reusable workflows are built
+from generated entry arguments, results, and checked shape expressions. Seismic derives graph-local
+scratch, host-uploaded inputs, intermediate and exported output storage; validates external port
+descriptors and alias rules; and owns bounded concurrent slots. An engine may orchestrate ordered
+decoder-block workflows and state transactions without authoring numerical storage between their
+checked boundaries. It supplies model topology, resident tensors, owned state claims, and request
+values, but does not restate numerical tensor shapes in a separate scratch recipe or resolve named
+intermediate buffers during submission.
+
 ## Public integration
 
 `seismic-build` checks sources at build time, emits a versioned checked
@@ -326,6 +346,9 @@ execution; it carries no legality fact back into planning.
   resource/launch behavior comes from each native-kernel contract.
 - Only an admitted workflow can submit, and its selected variants,
   reservations, buffers, and native objects have one owned lifetime.
+- A prepared native workflow is complete for its admitted model geometry and launch classes;
+  submitting it cannot fail for a missing intermediate, incompatible tensor shape, or storage
+  capacity that was already reserved.
 - Backend crates contain one native schedule type instance and no plan
   mirror; runtime crates contain no compiler-consistency branch.
 - The engine imports only `seismic` and its generated bindings.

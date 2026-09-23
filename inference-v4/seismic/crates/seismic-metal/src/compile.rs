@@ -1,7 +1,7 @@
 //! Closed typed-kernel to Metal pipeline compilation.
 
 use crate::command::Pipeline;
-use crate::{render, Metal};
+use crate::{Metal, render};
 use objc2_foundation::NSString;
 use objc2_metal::{MTLDevice, MTLLibrary};
 use seismic_compiler::errors::NativeCompilationError;

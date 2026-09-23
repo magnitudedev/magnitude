@@ -1,0 +1,19 @@
+# Dense import between every qualified dense source/destination representation.
+fn import_dense[N](source: &tensor[N] E) -> tensor[N] U:
+    let mut destination = tensor[N] U
+    parallel for index in 0..N:
+        destination[index] = f32(source[index])
+    return destination
+
+native import_dense for metal from "metal/import_dense.metal":
+    threadgroups (ceil_div(N, 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+# Exact external GGUF packet conversion into one canonical resident packet.
+fn repack_weight[N](source: &tensor[N] E) -> tensor[N] U:
+    return repack[U = U](source)
+
+native repack_weight for metal from "metal/repack_weight.metal":
+    threadgroups (ceil_div(N, 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)

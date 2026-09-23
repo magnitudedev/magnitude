@@ -56,7 +56,9 @@ selected native implementation to an ordinary portable function. It does not cre
 computation, repeat the function signature, participate in static calls, or become an
 implementation candidate. The portable function remains the complete type, ownership, effect,
 shape, and reference-semantic contract. Generated callers select this distinct path with
-`native_for_device`; its `NativeKernel` can be called directly but cannot enter a workflow.
+`native_for_device`. A native kernel may be called directly or composed into a prepared native
+workflow through the same checked entry contract. Native workflow composition does not make the
+native implementation a portable compiler candidate.
 
 Direct Metal source receives a generated ABI prefix after element parameters are bound. The
 prefix derives representation descriptors exclusively from the semantic registry for every bound
@@ -103,9 +105,11 @@ retains its logical tuple path. The root ABI is created once from the entry
 interface and the canonical leaf traversal; it is the only ABI. Nested call
 boundaries resolve directly to caller transports and never own public
 allocations. The runtime allocates result planes by path, retains them
-through synchronous native completion, and returns the path-labelled result
-planes to the caller. Backends consume this complete ABI without exposing
-destination parameters or storage planes in Seismic source.
+through native completion, and returns the path-labelled result planes to the caller. A prepared
+native workflow derives intermediate storage lifetimes from the checked root ABIs and reuses
+compatible storage after its last consumer. Results exported beyond workflow completion have
+distinct ownership and capacity from reusable scratch. Backends consume this complete ABI without
+exposing destination parameters or storage planes in Seismic source.
 
 A result-bearing capability intrinsic produces one fresh owned logical value. The compiler
 preserves that operation atomically through checked and logical IR with a distinct owned

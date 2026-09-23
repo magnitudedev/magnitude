@@ -1,0 +1,15 @@
+[package]
+name = "magnitude-model-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+seismic.workspace = true
+
+[build-dependencies]
+seismic-build.workspace = true
+
+[dev-dependencies]
+seismic-lang.workspace = true
+seismic-std.workspace = true

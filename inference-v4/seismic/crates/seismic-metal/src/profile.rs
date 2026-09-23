@@ -7,10 +7,10 @@
 
 use crate::device::MetalDevice;
 use crate::facts::{
-    LanguageVersion, MatrixCombination, MetalFacts, MetalFamily, ARGUMENT_TABLE_ENTRIES,
-    MSL_GRID_INDEX_MAX, RESERVED_ARGUMENT_ENTRIES,
+    ARGUMENT_TABLE_ENTRIES, LanguageVersion, MSL_GRID_INDEX_MAX, MatrixCombination, MetalFacts,
+    MetalFamily, RESERVED_ARGUMENT_ENTRIES,
 };
-use crate::{Metal, BACKEND_REVISION};
+use crate::{BACKEND_REVISION, Metal};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSProcessInfo, NSString};
 use objc2_metal::{
@@ -25,7 +25,7 @@ use seismic_compiler::target::{
     LocalRealizationPolicy, NumericalEnvironment, ProfileAcquisitionMetrics, TargetLimits,
     VectorSupport,
 };
-use seismic_lang::registry::{self, BackendName, RepresentationKind, REGISTRY_REVISION};
+use seismic_lang::registry::{self, BackendName, REGISTRY_REVISION, RepresentationKind};
 use seismic_lang::types::DType;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;

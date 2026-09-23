@@ -3,18 +3,19 @@
 //! evaluates a selected executable, owns storage, and executes its typed schedule.
 
 use crate::api::kernel::{
-    DecodedResults, DecodedValue, EncodedArgs, EncodedWorkflowArgs, EncodedWorkflowArgument,
-    NativeDefinition, NativeExpr, PendingWorkflowResults, PrepareError, WorkflowCompletionAny,
-    WorkflowTensorArgument,
+    DecodedResults, DecodedValue, EncodedArgs, EncodedOutputs, EncodedWorkflowArgs,
+    EncodedWorkflowArgument, NativeDefinition, NativeExpr, PendingWorkflowResults, PrepareError,
+    WorkflowCompletionAny, WorkflowTensorArgument,
 };
 use crate::api::tensor::TensorInner;
-use crate::api::CallError;
-use crate::telemetry::{self, hex, key_bool, key_str, key_u64, Timed};
+use crate::api::{CallError, OutputError};
+use crate::telemetry::{self, Timed, hex, key_bool, key_str, key_u64};
 use opentelemetry::KeyValue;
+use seismic_compiler::PreparationBudget;
 use seismic_compiler::errors::{ExecutionError, InvocationError};
 use seismic_compiler::executable::{
-    execute_schedule, DeviceService, ExecutableResultBinding, ExecutionEnvironment,
-    NativeExecution, NativeExecutor, NativeSubmission, RuntimeBuffer,
+    DeviceService, ExecutableResultBinding, ExecutionEnvironment, NativeExecution, NativeExecutor,
+    NativeSubmission, RuntimeBuffer, execute_schedule,
 };
 use seismic_compiler::executable::{
     ExecutableAllocationKind, ExecutableGlobalAllocationKind, ExecutableScalarResultKind,
@@ -23,16 +24,15 @@ use seismic_compiler::numerics::{EvidenceCatalog, PolicyIdentity};
 use seismic_compiler::plan_space::plan_space;
 use seismic_compiler::portfolio::prepare_kernel;
 use seismic_compiler::prepared::{
-    validate_invocation, ArgumentValue, DeviceIdentity, InvocationContract, PreparedKernel,
+    ArgumentValue, DeviceIdentity, InvocationContract, PreparedKernel, validate_invocation,
 };
 use seismic_compiler::target::{Backend, DeviceContract, ExecutionProfile};
-use seismic_compiler::PreparationBudget;
 use seismic_lang::checked::CheckedModule;
 use seismic_lang::entry::{
     CallSchema, ElementBindings, LogicalEntry, ParameterKind, ResultKind, TensorAccess,
 };
-use seismic_lang::expr::compiled::{CompiledNat, InvocationValues};
 use seismic_lang::expr::SymbolValue;
+use seismic_lang::expr::compiled::{CompiledNat, InvocationValues};
 use seismic_lang::ids::{EntryId, ModuleHash, RepresentationId, StableEntryId};
 use seismic_lang::precision::PrecisionPolicy;
 use seismic_lang::registry;
@@ -634,6 +634,16 @@ enum NativeResult {
     Range,
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+pub(crate) struct NativeTensorSpec {
+    pub(crate) representation: RepresentationId,
+    pub(crate) extents: Vec<u64>,
+    pub(crate) strides: Vec<u64>,
+    pub(crate) byte_len: u64,
+    pub(crate) alignment: u64,
+}
+
 /// A direct Metal entry point. It deliberately has no `PreparedKernel`,
 /// plan space, precision policy, portfolio, or workflow representation.
 #[cfg(target_os = "macos")]
@@ -645,6 +655,111 @@ pub(crate) struct NativePreparedMetal {
     pipeline: seismic_metal::DirectPipeline,
     definition: NativeDefinition,
     results: Vec<NativeResult>,
+    invocation_storage: Mutex<NativeInvocationStorage>,
+    invocation_workspace_bytes: u64,
+}
+
+#[cfg(target_os = "macos")]
+struct NativeInvocationStorage {
+    words: Arc<Allocation>,
+    scalars: Arc<Allocation>,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) struct NativeBoundCall {
+    kernel: Arc<NativePreparedMetal>,
+    args: EncodedArgs,
+    tensor_results: Vec<Arc<TensorInner>>,
+    word_bytes: Vec<u8>,
+    threadgroups: [u64; 3],
+    threads: [u64; 3],
+}
+
+#[cfg(target_os = "macos")]
+impl NativeBoundCall {
+    pub(crate) fn run(self) -> Result<DecodedResults, CallError> {
+        let kernel = self.kernel.clone();
+        kernel.execute_bound(self)
+    }
+}
+
+/// Run already-bound graph nodes in one ordered Metal command buffer. The
+/// union permit excludes host mutation for the complete dependency chain.
+#[cfg(target_os = "macos")]
+pub(crate) fn run_native_graph_batch(calls: Vec<NativeBoundCall>) -> Result<(), CallError> {
+    let Some(first) = calls.first() else {
+        return Ok(());
+    };
+    let mut kernels = BTreeMap::new();
+    let mut access = Vec::new();
+    for call in &calls {
+        kernels.insert(Arc::as_ptr(&call.kernel) as usize, call.kernel.clone());
+        access.extend(collect_access(call.kernel.logical.schema(), &call.args));
+        access.extend(
+            call.tensor_results
+                .iter()
+                .map(|tensor| (tensor.allocation().clone(), true)),
+        );
+    }
+    // The standalone native route also locks invocation storage before tensor
+    // access. Lock each distinct prepared kernel once, in a stable order.
+    let guards = kernels
+        .values()
+        .map(|kernel| {
+            kernel
+                .invocation_storage
+                .lock()
+                .expect("native invocation workspace lock poisoned")
+        })
+        .collect::<Vec<_>>();
+    let scalar_allocations = kernels
+        .keys()
+        .copied()
+        .zip(guards.iter().map(|guard| guard.scalars.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let _permits = acquire_access(&access);
+    let mut batch = seismic_metal::DirectBatch::new(&first.kernel.opened.service)
+        .map_err(CallError::Execution)?;
+    for call in &calls {
+        let mut buffers = Vec::new();
+        for (ordinal, parameter) in call.kernel.logical.schema().parameters().iter().enumerate() {
+            if matches!(parameter.kind, ParameterKind::Tensor { .. }) {
+                let tensor = call
+                    .args
+                    .tensor(ordinal)
+                    .expect("validated native graph tensor argument disappeared");
+                buffers.push((
+                    typed_buffer::<seismic_metal::Metal>(tensor.allocation()),
+                    tensor.byte_offset(),
+                ));
+            }
+        }
+        for tensor in &call.tensor_results {
+            buffers.push((
+                typed_buffer::<seismic_metal::Metal>(tensor.allocation()),
+                tensor.byte_offset(),
+            ));
+        }
+        let borrowed = buffers
+            .iter()
+            .map(|(buffer, offset)| (buffer, *offset))
+            .collect::<Vec<_>>();
+        let scalar = scalar_allocations
+            .get(&(Arc::as_ptr(&call.kernel) as usize))
+            .expect("native graph scalar workspace is absent");
+        let scalar_buffer = typed_buffer::<seismic_metal::Metal>(scalar);
+        batch
+            .encode(
+                &call.kernel.pipeline,
+                &borrowed,
+                &call.word_bytes,
+                &scalar_buffer,
+                call.threadgroups,
+                call.threads,
+            )
+            .map_err(CallError::Execution)?;
+    }
+    batch.commit_wait().map_err(CallError::Execution)
 }
 
 #[cfg(target_os = "macos")]
@@ -680,6 +795,58 @@ pub(crate) fn prepare_native_metal(
             ResultKind::Range { .. } => NativeResult::Range,
         })
         .collect();
+    let word_count = logical.schema().dimensions().len()
+        + logical
+            .schema()
+            .parameters()
+            .iter()
+            .map(|parameter| match &parameter.kind {
+                ParameterKind::Tensor { axes, .. } => axes.len() * 2,
+                ParameterKind::Range { .. } => 2,
+                ParameterKind::Scalar { .. } | ParameterKind::Index { .. } => 1,
+            })
+            .sum::<usize>()
+        + logical
+            .schema()
+            .results()
+            .iter()
+            .map(|result| match &result.kind {
+                ResultKind::Tensor { axes, .. } => axes.len() * 2,
+                ResultKind::Range { .. } | ResultKind::Scalar(_) | ResultKind::Index { .. } => 0,
+            })
+            .sum::<usize>();
+    let scalar_count = logical
+        .schema()
+        .results()
+        .iter()
+        .map(|result| match &result.kind {
+            ResultKind::Range { .. } => 2,
+            ResultKind::Scalar(_) | ResultKind::Index { .. } => 1,
+            ResultKind::Tensor { .. } => 0,
+        })
+        .sum::<usize>();
+    let word_bytes = u64::try_from(word_count)
+        .ok()
+        .and_then(|count| count.checked_mul(8))
+        .ok_or_else(|| {
+            PrepareError::Preparation(
+                seismic_compiler::errors::PreparationError::NativeWorkspaceAllocation(
+                    "native argument word count overflow".into(),
+                ),
+            )
+        })?
+        .max(1);
+    let scalar_bytes = u64::try_from(scalar_count)
+        .ok()
+        .and_then(|count| count.checked_mul(8))
+        .ok_or_else(|| {
+            PrepareError::Preparation(
+                seismic_compiler::errors::PreparationError::NativeWorkspaceAllocation(
+                    "native scalar result count overflow".into(),
+                ),
+            )
+        })?
+        .max(1);
     let source = render_native_source(logical.schema(), &bindings, definition.source);
     let pipeline =
         seismic_metal::DirectPipeline::compile(&opened.service, &source, definition.entry)
@@ -688,6 +855,19 @@ pub(crate) fn prepare_native_metal(
                     seismic_compiler::errors::PreparationError::NativeCompilation(error),
                 )
             })?;
+    let allocation_error = |error: ExecutionError| {
+        PrepareError::Preparation(
+            seismic_compiler::errors::PreparationError::NativeWorkspaceAllocation(
+                error.to_string(),
+            ),
+        )
+    };
+    let words = opened
+        .allocate_storage(word_bytes, 8)
+        .map_err(allocation_error)?;
+    let scalars = opened
+        .allocate_storage(scalar_bytes, 8)
+        .map_err(allocation_error)?;
     Ok(Arc::new(NativePreparedMetal {
         opened: opened.clone(),
         public_device: public_device.clone(),
@@ -696,19 +876,131 @@ pub(crate) fn prepare_native_metal(
         pipeline,
         definition,
         results,
+        invocation_storage: Mutex::new(NativeInvocationStorage { words, scalars }),
+        invocation_workspace_bytes: word_bytes + scalar_bytes,
     }))
 }
 
 #[cfg(target_os = "macos")]
 impl NativePreparedMetal {
-    pub(crate) fn call(&self, args: EncodedArgs) -> Result<DecodedResults, CallError> {
-        let schema = self.logical.schema();
-        let arguments = args.values();
-        let values =
-            validate_invocation(schema, &self.invocation, self.opened.identity(), &arguments)
-                .map_err(CallError::Invocation)?;
+    pub(crate) fn validate_graph_batch(&self, device: DeviceIdentity) -> Result<(), CallError> {
+        if self.opened.identity() != device {
+            return Err(CallError::Workflow(
+                crate::api::WorkflowError::NativeGraphSlotMismatch,
+            ));
+        }
+        if self
+            .results
+            .iter()
+            .any(|result| !matches!(result, NativeResult::Tensor { .. }))
+        {
+            return Err(CallError::Workflow(
+                crate::api::WorkflowError::HostBoundaryRequired,
+            ));
+        }
+        let words = self
+            .invocation_storage
+            .lock()
+            .expect("native invocation workspace lock poisoned")
+            .words
+            .bytes();
+        if words > 4096 {
+            return Err(CallError::Execution(ExecutionError::SubmissionFailed(
+                "native graph ABI words exceed Metal setBytes limit".into(),
+            )));
+        }
+        Ok(())
+    }
 
-        let mut tensor_results = Vec::new();
+    pub(crate) fn result_count(&self) -> u32 {
+        u32::try_from(self.results.len()).expect("native result ordinal space exhausted")
+    }
+
+    pub(crate) fn tensor_parameter_spec(
+        &self,
+        name: &str,
+        dimensions: &[(&str, u64)],
+    ) -> Result<NativeTensorSpec, CallError> {
+        let schema = self.logical.schema();
+        let parameter = schema
+            .parameters()
+            .iter()
+            .find(|parameter| parameter.name == name)
+            .ok_or_else(|| {
+                CallError::Execution(ExecutionError::SubmissionFailed(format!(
+                    "checked native entry has no tensor parameter `{name}`"
+                )))
+            })?;
+        let ParameterKind::Tensor {
+            representation,
+            axes,
+            ..
+        } = &parameter.kind
+        else {
+            return Err(CallError::Execution(ExecutionError::SubmissionFailed(
+                format!("checked native parameter `{name}` is not a tensor"),
+            )));
+        };
+        let mut values = InvocationValues::new();
+        for dimension in schema.dimensions() {
+            let value = dimensions
+                .iter()
+                .find(|(candidate, _)| *candidate == dimension.name)
+                .map(|(_, value)| *value)
+                .ok_or_else(|| {
+                    CallError::Execution(ExecutionError::SubmissionFailed(format!(
+                        "native graph omitted dimension `{}` for `{name}`",
+                        dimension.name
+                    )))
+                })?;
+            values.bind(dimension.symbol, SymbolValue::Nat(value));
+        }
+        let extents = axes
+            .iter()
+            .map(|axis| native_eval_compiled(&self.logical.arena().compile_nat(*axis), &values))
+            .collect::<Result<Vec<_>, _>>()?;
+        let layout =
+            crate::layout::canonical(*representation, &extents).map_err(CallError::Execution)?;
+        Ok(NativeTensorSpec {
+            representation: *representation,
+            extents,
+            strides: layout.strides,
+            byte_len: layout.byte_len,
+            alignment: layout.alignment,
+        })
+    }
+    pub(crate) fn invocation_workspace_bytes(&self) -> u64 {
+        self.invocation_workspace_bytes
+    }
+
+    /// Describe a native node without allocating or dispatching it. The
+    /// checked entry schema alone determines every result representation and
+    /// extent. Graph planning feeds descriptors, including virtual result
+    /// edges, through the same invocation contract as a direct call.
+    pub(crate) fn describe_results(
+        &self,
+        arguments: &[ArgumentValue],
+    ) -> Result<Vec<Option<NativeTensorSpec>>, CallError> {
+        let values = validate_invocation(
+            self.logical.schema(),
+            &self.invocation,
+            self.opened.identity(),
+            arguments,
+        )
+        .map_err(CallError::Invocation)?;
+        collect_native_geometry(
+            self.definition
+                .threadgroups
+                .each_ref()
+                .map(|expr| native_eval_launch(expr, self.logical.schema(), &values)),
+        )?;
+        collect_native_geometry(
+            self.definition
+                .threads_per_threadgroup
+                .each_ref()
+                .map(|expr| native_eval_launch(expr, self.logical.schema(), &values)),
+        )?;
+        let mut results = Vec::with_capacity(self.results.len());
         for result in &self.results {
             match result {
                 NativeResult::Tensor {
@@ -719,10 +1011,201 @@ impl NativePreparedMetal {
                         .iter()
                         .map(|axis| native_eval_compiled(axis, &values))
                         .collect::<Result<Vec<_>, _>>()?;
-                    let tensor = Arc::new(
-                        TensorInner::zeros(&self.public_device, *representation, &extents)
-                            .map_err(native_tensor_error)?,
-                    );
+                    let layout = crate::layout::canonical(*representation, &extents)
+                        .map_err(CallError::Execution)?;
+                    results.push(Some(NativeTensorSpec {
+                        representation: *representation,
+                        extents,
+                        strides: layout.strides,
+                        byte_len: layout.byte_len,
+                        alignment: layout.alignment,
+                    }));
+                }
+                NativeResult::Scalar(_) | NativeResult::Index | NativeResult::Range => {
+                    results.push(None);
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Check a fully attached graph node before it becomes executable. No
+    /// command is encoded or submitted here; a later native call sees these
+    /// same immutable tensor descriptors and result storage.
+    pub(crate) fn validate_bound(
+        &self,
+        args: &EncodedArgs,
+        outputs: &[Arc<TensorInner>],
+    ) -> Result<(), CallError> {
+        let arguments = args.values();
+        let values = validate_invocation(
+            self.logical.schema(),
+            &self.invocation,
+            self.opened.identity(),
+            &arguments,
+        )
+        .map_err(CallError::Invocation)?;
+        let expected = self.results.iter().filter_map(|result| match result {
+            NativeResult::Tensor {
+                representation,
+                axes,
+            } => Some((representation, axes)),
+            _ => None,
+        });
+        let mut prior = Vec::with_capacity(outputs.len());
+        let mut count = 0;
+        for (representation, axes) in expected {
+            let extents = axes
+                .iter()
+                .map(|axis| native_eval_compiled(axis, &values))
+                .collect::<Result<Vec<_>, _>>()?;
+            let tensor = outputs
+                .get(count)
+                .ok_or(CallError::Output(OutputError::Count {
+                    expected: count + 1,
+                    actual: outputs.len(),
+                }))?;
+            validate_native_output(
+                count,
+                tensor,
+                self.opened.identity(),
+                *representation,
+                &extents,
+                args,
+                &prior,
+            )?;
+            prior.push(tensor.clone());
+            count += 1;
+        }
+        if count != outputs.len() {
+            return Err(CallError::Output(OutputError::Count {
+                expected: count,
+                actual: outputs.len(),
+            }));
+        }
+        native_words(self.logical.schema(), args, outputs, &values)?;
+        Ok(())
+    }
+
+    /// Produce a call whose ABI words, launch geometry, tensor descriptors,
+    /// and aliases have all been checked before the execution boundary.
+    pub(crate) fn bind(
+        self: &Arc<Self>,
+        args: EncodedArgs,
+        outputs: Vec<Arc<TensorInner>>,
+    ) -> Result<NativeBoundCall, CallError> {
+        self.validate_bound(&args, &outputs)?;
+        let values = validate_invocation(
+            self.logical.schema(),
+            &self.invocation,
+            self.opened.identity(),
+            &args.values(),
+        )
+        .map_err(CallError::Invocation)?;
+        self.seal_bound(args, outputs, &values)
+    }
+
+    fn seal_bound(
+        self: &Arc<Self>,
+        args: EncodedArgs,
+        tensor_results: Vec<Arc<TensorInner>>,
+        values: &InvocationValues,
+    ) -> Result<NativeBoundCall, CallError> {
+        let schema = self.logical.schema();
+        let words = native_words(schema, &args, &tensor_results, values)?;
+        let word_bytes = words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        let threadgroups = collect_native_geometry(
+            self.definition
+                .threadgroups
+                .each_ref()
+                .map(|expression| native_eval_launch(expression, schema, values)),
+        )?;
+        let threads = collect_native_geometry(
+            self.definition
+                .threads_per_threadgroup
+                .each_ref()
+                .map(|expression| native_eval_launch(expression, schema, values)),
+        )?;
+        Ok(NativeBoundCall {
+            kernel: self.clone(),
+            args,
+            tensor_results,
+            word_bytes,
+            threadgroups,
+            threads,
+        })
+    }
+
+    pub(crate) fn call(self: &Arc<Self>, args: EncodedArgs) -> Result<DecodedResults, CallError> {
+        self.call_with_outputs(args, None)
+    }
+
+    pub(crate) fn call_into(
+        self: &Arc<Self>,
+        args: EncodedArgs,
+        outputs: EncodedOutputs,
+    ) -> Result<DecodedResults, CallError> {
+        self.call_with_outputs(args, Some(outputs))
+    }
+
+    fn call_with_outputs(
+        self: &Arc<Self>,
+        args: EncodedArgs,
+        outputs: Option<EncodedOutputs>,
+    ) -> Result<DecodedResults, CallError> {
+        let schema = self.logical.schema();
+        let arguments = args.values();
+        let values =
+            validate_invocation(schema, &self.invocation, self.opened.identity(), &arguments)
+                .map_err(CallError::Invocation)?;
+
+        let supplied = outputs.map(EncodedOutputs::into_tensors);
+        let expected_count = self
+            .results
+            .iter()
+            .filter(|result| matches!(result, NativeResult::Tensor { .. }))
+            .count();
+        if let Some(outputs) = &supplied {
+            if outputs.len() != expected_count {
+                return Err(CallError::Output(OutputError::Count {
+                    expected: expected_count,
+                    actual: outputs.len(),
+                }));
+            }
+        }
+        let mut tensor_results = Vec::with_capacity(expected_count);
+        for result in &self.results {
+            match result {
+                NativeResult::Tensor {
+                    representation,
+                    axes,
+                } => {
+                    let extents = axes
+                        .iter()
+                        .map(|axis| native_eval_compiled(axis, &values))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let tensor = if let Some(outputs) = &supplied {
+                        let index = tensor_results.len();
+                        let tensor = outputs[index].clone();
+                        validate_native_output(
+                            index,
+                            &tensor,
+                            self.opened.identity(),
+                            *representation,
+                            &extents,
+                            &args,
+                            &tensor_results,
+                        )?;
+                        tensor
+                    } else {
+                        Arc::new(
+                            TensorInner::zeros(&self.public_device, *representation, &extents)
+                                .map_err(native_tensor_error)?,
+                        )
+                    };
                     tensor_results.push(tensor);
                 }
                 NativeResult::Scalar(_) | NativeResult::Index | NativeResult::Range => {
@@ -731,15 +1214,25 @@ impl NativePreparedMetal {
             }
         }
 
-        let words = native_words(schema, &args, &tensor_results, &values)?;
-        let word_bytes = words
-            .iter()
-            .flat_map(|word| word.to_le_bytes())
-            .collect::<Vec<_>>();
-        let word_allocation = self
-            .opened
-            .allocate_storage(word_bytes.len().max(1) as u64, 8)
-            .map_err(CallError::Execution)?;
+        self.seal_bound(args, tensor_results, &values)?.run()
+    }
+    fn execute_bound(&self, bound: NativeBoundCall) -> Result<DecodedResults, CallError> {
+        let NativeBoundCall {
+            kernel: _,
+            args,
+            tensor_results,
+            word_bytes,
+            threadgroups,
+            threads,
+        } = bound;
+        let schema = self.logical.schema();
+        // This lock covers upload, dispatch and readback. The prepared entry
+        // owns its fixed-size native ABI storage for its entire callable life.
+        let invocation = self
+            .invocation_storage
+            .lock()
+            .expect("native invocation workspace lock poisoned");
+        let word_allocation = &invocation.words;
         word_allocation
             .storage()
             .write(0, &word_bytes)
@@ -753,10 +1246,7 @@ impl NativePreparedMetal {
                 NativeResult::Tensor { .. } => 0,
             })
             .sum::<usize>();
-        let scalar_allocation = self
-            .opened
-            .allocate_storage((scalar_words * 8).max(1) as u64, 8)
-            .map_err(CallError::Execution)?;
+        let scalar_allocation = &invocation.scalars;
         write_zeros(
             scalar_allocation.storage(),
             (scalar_words * 8).max(1) as u64,
@@ -795,18 +1285,6 @@ impl NativePreparedMetal {
             .iter()
             .map(|(buffer, offset)| (buffer, *offset))
             .collect::<Vec<_>>();
-        let threadgroups = self
-            .definition
-            .threadgroups
-            .each_ref()
-            .map(|expression| native_eval_launch(expression, schema, &values));
-        let threads = self
-            .definition
-            .threads_per_threadgroup
-            .each_ref()
-            .map(|expression| native_eval_launch(expression, schema, &values));
-        let threadgroups = collect_native_geometry(threadgroups)?;
-        let threads = collect_native_geometry(threads)?;
         self.pipeline
             .dispatch(&self.opened.service, &borrowed, threadgroups, threads)
             .map_err(CallError::Execution)?;
@@ -844,6 +1322,59 @@ impl NativePreparedMetal {
         }
         Ok(DecodedResults::new(final_values))
     }
+}
+
+#[cfg(target_os = "macos")]
+fn validate_native_output(
+    result: usize,
+    tensor: &Arc<TensorInner>,
+    device: DeviceIdentity,
+    representation: RepresentationId,
+    extents: &[u64],
+    args: &EncodedArgs,
+    prior_outputs: &[Arc<TensorInner>],
+) -> Result<(), CallError> {
+    let descriptor = tensor.descriptor();
+    if descriptor.device != device {
+        return Err(CallError::Output(OutputError::WrongDevice { result }));
+    }
+    if descriptor.representation != representation {
+        return Err(CallError::Output(OutputError::WrongRepresentation {
+            result,
+        }));
+    }
+    if descriptor.extents.len() != extents.len() {
+        return Err(CallError::Output(OutputError::ShapeMismatch {
+            result,
+            axis: descriptor.extents.len().min(extents.len()),
+        }));
+    }
+    for (axis, (actual, expected)) in descriptor.extents.iter().zip(extents).enumerate() {
+        if actual != expected {
+            return Err(CallError::Output(OutputError::ShapeMismatch {
+                result,
+                axis,
+            }));
+        }
+    }
+    let layout = crate::layout::canonical(representation, extents).map_err(CallError::Execution)?;
+    if descriptor.strides != layout.strides || descriptor.byte_len != layout.byte_len {
+        return Err(CallError::Output(OutputError::NoncanonicalLayout {
+            result,
+        }));
+    }
+    let overlaps = |other: &Arc<TensorInner>| {
+        let other = other.descriptor();
+        descriptor.allocation == other.allocation
+            && descriptor.byte_offset < other.byte_offset.saturating_add(other.byte_len)
+            && other.byte_offset < descriptor.byte_offset.saturating_add(descriptor.byte_len)
+    };
+    if args.tensors().flatten().any(|other| overlaps(other))
+        || prior_outputs.iter().any(|other| overlaps(other))
+    {
+        return Err(CallError::Output(OutputError::IllegalAliasing { result }));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1277,7 +1808,7 @@ fn render_native_code_interpretation(
 #[cfg(test)]
 mod native_abi_tests {
     use super::*;
-    use seismic_lang::checked::{check_source, SourceFile, SourceSet};
+    use seismic_lang::checked::{SourceFile, SourceSet, check_source};
 
     fn render_for(representation: &str) -> String {
         let module = check_source(SourceSet::new(vec![SourceFile {
@@ -1551,7 +2082,7 @@ impl<B: Backend> WorkflowGraphDraft<B> {
             let reference = match argument {
                 EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::Result(reference))
                 | EncodedWorkflowArgument::ScalarResult(reference) => Some(reference),
-                EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::ResultLeadingSlice {
+                EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::ResultView {
                     result,
                     ..
                 }) => Some(result),
@@ -1597,9 +2128,10 @@ impl<B: Backend> WorkflowGraphDraft<B> {
                             ))?;
                         args.push_tensor(tensor);
                     }
-                    EncodedWorkflowArgument::Tensor(
-                        WorkflowTensorArgument::ResultLeadingSlice { result, start, end },
-                    ) => {
+                    EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::ResultView {
+                        result,
+                        operations,
+                    }) => {
                         let tensor = tensor_results
                             .get(result.node as usize)
                             .and_then(|results| results.get(result.result as usize))
@@ -1607,11 +2139,23 @@ impl<B: Backend> WorkflowGraphDraft<B> {
                             .ok_or(CallError::Workflow(
                                 crate::api::WorkflowError::MissingProducerResult,
                             ))?;
-                        let view = tensor
-                            .slice_leading(start, end)
-                            .map_err(crate::api::WorkflowError::TensorView)
-                            .map_err(CallError::Workflow)?;
-                        args.push_tensor(Arc::new(view));
+                        let mut view = tensor;
+                        for operation in operations {
+                            view = Arc::new(
+                                match operation {
+                                    crate::api::kernel::ViewOperation::LeadingSlice {
+                                        start,
+                                        end,
+                                    } => view.slice_leading(start, end),
+                                    crate::api::kernel::ViewOperation::Reshape { extents } => {
+                                        view.reshape(&extents)
+                                    }
+                                }
+                                .map_err(crate::api::WorkflowError::TensorView)
+                                .map_err(CallError::Workflow)?,
+                            );
+                        }
+                        args.push_tensor(view);
                     }
                     EncodedWorkflowArgument::Scalar(value) => args.push_scalar(value),
                     EncodedWorkflowArgument::ScalarResult(_) => {
@@ -2198,9 +2742,16 @@ fn collect_access(schema: &CallSchema, args: &EncodedArgs) -> Vec<(Arc<Allocatio
 }
 
 fn acquire_access(access: &[(Arc<Allocation>, bool)]) -> Vec<AllocationPermit> {
-    access
-        .iter()
-        .map(|(allocation, write)| allocation.acquire(*write))
+    let mut unique: BTreeMap<u64, (Arc<Allocation>, bool)> = BTreeMap::new();
+    for (allocation, write) in access {
+        unique
+            .entry(allocation.identity())
+            .and_modify(|(_, existing)| *existing |= *write)
+            .or_insert_with(|| (allocation.clone(), *write));
+    }
+    unique
+        .into_values()
+        .map(|(allocation, write)| allocation.acquire(write))
         .collect()
 }
 

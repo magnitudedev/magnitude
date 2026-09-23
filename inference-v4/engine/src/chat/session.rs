@@ -1,44 +1,68 @@
-//! Host-local semantic stream over a scheduled request. Native parser handles
-//! remain in this context; only prepared input and token publications cross it.
-use super::{CompleteResponse, Event, PreparedChat, SseResponse, TokenChatStream, Usage};
-use crate::{
-    generation::{FinishReason, Options},
-    inputs::ByteBpeTokenizer,
-    service::{
-        owner::Executor,
-        runtime::{Client, Request},
-    },
-};
+//! Host-local semantic stream over one scheduled request.
 
-pub struct ChatPublication {
-    /// Present on terminal publication after the execution owner acknowledges stop.
-    pub usage: Option<Usage>,
-    pub events: Vec<Event>,
-    /// Accepted content may accompany a terminal execution failure.
-    pub error: Option<String>,
-}
-pub struct Session<'a, E: Executor + 'static> {
-    request: Option<Request<E>>,
+use super::{
+    wire::PreparedGeneration, ByteBpeTokenizer, ChatPublication, CompleteResponse, SseResponse,
+    TokenChatStream, Vocabulary,
+};
+use crate::service::{EngineClient, EngineRequest};
+use magnitude_generation::FinishReason;
+use magnitude_generation::GenerationSeed;
+use magnitude_model_contracts::PreparedModelInput;
+
+pub struct Session<'a> {
+    request: Option<EngineRequest>,
     parser: TokenChatStream<'a>,
     terminal: bool,
 }
-impl<'a, E: Executor + 'static> Session<'a, E> {
+
+impl<'a> Session<'a> {
     pub async fn open(
-        client: &Client<E>,
-        prepared: &PreparedChat,
+        client: &EngineClient,
+        prepared: &PreparedGeneration,
+        input: PreparedModelInput,
         tokenizer: &'a ByteBpeTokenizer,
-        options: Options,
+        vocabulary: &mut Vocabulary,
         stops: Vec<String>,
         max_output_bytes: usize,
     ) -> Result<Self, String> {
-        let parser = TokenChatStream::new(prepared, tokenizer, stops, max_output_bytes)?;
-        let request = client.admit(prepared.input().clone(), options).await?;
+        let seed = vocabulary.prepare_generation_for_input(
+            prepared.chat.input(),
+            prepared.options.clone(),
+            &input,
+        )?;
+        Self::open_seed(
+            client,
+            prepared,
+            input,
+            tokenizer,
+            seed,
+            stops,
+            max_output_bytes,
+        )
+        .await
+    }
+
+    /// Open from device-free generation intent bound by the host vocabulary. This keeps
+    /// mutable grammar-cache access outside the asynchronous admission wait.
+    pub async fn open_seed(
+        client: &EngineClient,
+        prepared: &PreparedGeneration,
+        input: PreparedModelInput,
+        tokenizer: &'a ByteBpeTokenizer,
+        seed: GenerationSeed,
+        stops: Vec<String>,
+        max_output_bytes: usize,
+    ) -> Result<Self, String> {
+        let parser = TokenChatStream::new(&prepared.chat, tokenizer, stops, max_output_bytes)?;
+        let capacity = prepared.options.output_capacity;
+        let request = client.admit(seed, input, capacity).await?;
         Ok(Self {
             request: Some(request),
             parser,
             terminal: false,
         })
     }
+
     pub async fn next(&mut self) -> Result<Option<ChatPublication>, String> {
         if self.terminal {
             return Ok(None);
@@ -50,7 +74,7 @@ impl<'a, E: Executor + 'static> Session<'a, E> {
         }
         result.map(Some)
     }
-    /// Collect a nonstream response without changing generation or parsing.
+
     pub async fn complete(&mut self, mut response: CompleteResponse) -> Result<Vec<u8>, String> {
         let result = async {
             while let Some(publication) = self.next().await? {
@@ -67,8 +91,7 @@ impl<'a, E: Executor + 'static> Session<'a, E> {
         }
         result
     }
-    /// Frame the same semantic session for streaming transport. Framing failure
-    /// releases its request; native parser and service state never cross threads.
+
     pub async fn next_sse(
         &mut self,
         response: &mut SseResponse,
@@ -85,14 +108,10 @@ impl<'a, E: Executor + 'static> Session<'a, E> {
             }
         }
     }
+
     async fn next_impl(&mut self) -> Result<ChatPublication, String> {
         loop {
-            let mut publication = match self
-                .request
-                .as_mut()
-                .expect("live session")
-                .receive(32)
-                .await
+            let mut publication = match self.request.as_mut().expect("live session").receive().await
             {
                 Ok(publication) => publication,
                 Err(error) => {
@@ -101,6 +120,8 @@ impl<'a, E: Executor + 'static> Session<'a, E> {
                         events: self.parser.finish(FinishReason::Failed)?,
                         error: Some(error),
                         usage: None,
+                        method: None,
+                        timings: None,
                     });
                 }
             };
@@ -122,16 +143,10 @@ impl<'a, E: Executor + 'static> Session<'a, E> {
             if !events.is_empty() || self.terminal {
                 return Ok(ChatPublication {
                     events,
-                    usage: if self.terminal {
-                        publication.usage
-                    } else {
-                        None
-                    },
-                    error: if self.terminal {
-                        publication.error
-                    } else {
-                        None
-                    },
+                    usage: self.terminal.then_some(publication.usage).flatten(),
+                    method: self.terminal.then_some(publication.method).flatten(),
+                    timings: self.terminal.then_some(publication.timings).flatten(),
+                    error: self.terminal.then_some(publication.error).flatten(),
                 });
             }
         }

@@ -1,14 +1,12 @@
-//! Rust inference engine. Artifact interpretation and model policy retain V3
-//! semantics; numerical execution belongs to Seismic, not this loading layer.
+//! Inference V4 composition facade. Common crates own artifacts, model state,
+//! execution, generation, service, chat, and templates; this crate only binds
+//! them into a host-facing engine.
 pub mod chat;
-pub mod error;
+pub mod composition;
+mod execution;
 pub mod generation;
 pub mod inputs;
-pub mod kernels;
-pub mod models;
+pub mod options;
 pub mod service;
 pub mod serving;
-pub mod state;
 pub mod telemetry;
-pub mod weights;
-pub use error::Error;

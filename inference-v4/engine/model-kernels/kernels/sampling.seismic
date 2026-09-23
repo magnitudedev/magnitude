@@ -1,0 +1,74 @@
+# Per-row sampling shaping. Penalties, temperature, top-k, min-p, and top-p
+# are deliberately staged in specification order. Equal top-k cutoff values
+# are all retained; top-p ties use ascending token index as the stable order.
+# The portable body is the semantic oracle. The Metal entry performs the same
+# stages cooperatively, using radix selection rather than vocabulary-pair scans.
+fn shape_rows[Sx, V, Hn](logits: &tensor[Sx, V] f32,
+    params: &tensor[Sx, 8] f32, history: &tensor[Sx, Hn] i32,
+    out: &mut tensor[Sx, V] f32):
+    # Sequential staging keeps the reference program executable while each row
+    # owns scratch tensors. The attached native implementation dispatches rows
+    # independently on Metal.
+    for row in 0..Sx:
+        let temperature = params[row, 0]
+        let top_k = i32(params[row, 1])
+        let top_p = params[row, 2]
+        let min_p = params[row, 3]
+        let repetition = params[row, 4]
+        let presence = params[row, 5]
+        let frequency = params[row, 6]
+        let mut penalized = tensor[V] f32
+        let mut tempered = tensor[V] f32
+        let mut topk = tensor[V] f32
+        let mut minp = tensor[V] f32
+        for token in 0..V:
+            let mut count = i32(0)
+            for h in 0..Hn:
+                if history[row, h] == i32(token):
+                    count = count + 1
+            let mut value = logits[row, token]
+            if count > 0:
+                if value < 0.0:
+                    value = value * repetition
+                else:
+                    value = value / repetition
+                value = value - presence - frequency * f32(count)
+            penalized[token] = value
+            tempered[token] = value
+        if temperature == 0.0:
+            for token in 0..V:
+                out[row, token] = penalized[token]
+        else:
+            for token in 0..V:
+                tempered[token] = tempered[token] / temperature
+            for token in 0..V:
+                let mut greater = i32(0)
+                for other in 0..V:
+                    if tempered[other] > tempered[token]:
+                        greater = greater + 1
+                topk[token] = tempered[token]
+                if top_k > 0 and greater >= top_k:
+                    topk[token] = -inf
+            let maximum = reduce(topk, 0, max)
+            for token in 0..V:
+                minp[token] = topk[token]
+                if min_p > 0.0 and exp(topk[token] - maximum) < min_p:
+                    minp[token] = -inf
+            let shifted = exp(minp - reduce(minp, 0, max))
+            let denominator = reduce(shifted, 0, sum)
+            for token in 0..V:
+                let mut preceding = f32(0.0)
+                for other in 0..V:
+                    if minp[other] > minp[token] or (minp[other] == minp[token] and other < token):
+                        preceding = preceding + shifted[other] / denominator
+                out[row, token] = minp[token]
+                if top_p < 1.0 and preceding >= top_p:
+                    out[row, token] = -inf
+
+native shape_rows for metal from "metal/shape_rows.metal":
+    threadgroups (Sx, 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+native sample_rows for metal from "metal/sample_rows.metal":
+    threadgroups (M, 1, 1)
+    threads_per_threadgroup (256, 1, 1)

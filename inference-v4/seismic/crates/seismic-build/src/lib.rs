@@ -32,6 +32,9 @@
 //!         pub value: seismic::Tensor,     // single non-tuple result
 //!         pub r0: ..., pub r1_2: ...,     // tuple leaves: `r<path joined by _>`
 //!     }
+//!     pub struct OutputArgs<'a> {         // tensor result leaves only, in checked order
+//!         pub value: &'a mut seismic::Tensor,
+//!     }
 //!     pub struct Elements { pub <ELEM>: seismic::Element, .. }   // polymorphic entries only
 //!     pub struct Entry;                   // impl seismic::Entry
 //!     pub fn for_device(device: &seismic::Device, precision: seismic::PrecisionPolicy)
@@ -43,8 +46,8 @@
 //! }
 //! ```
 //!
-//! Scalar results are `f32|i32|u32|bool|u64|(u64,u64)` by kind. Nothing
-//! else is generated; consumers never see schema internals.
+//! Scalar results are `f32|i32|u32|bool|u64|(u64,u64)` by kind. Consumers
+//! never see schema internals.
 
 use seismic_lang::checked::SourceError;
 use seismic_lang::checked::{
@@ -61,6 +64,15 @@ pub enum BuildError {
     Io(std::io::Error),
     /// `OUT_DIR` or a source path is missing.
     Environment(String),
+    /// A direct Metal implementation references a symbol outside the ABI
+    /// generated for its checked entry.
+    NativeAbi {
+        entry: String,
+        path: PathBuf,
+        line: usize,
+        column: usize,
+        symbol: String,
+    },
 }
 
 impl std::fmt::Display for BuildError {
@@ -69,6 +81,17 @@ impl std::fmt::Display for BuildError {
             Self::Source(e) => write!(f, "{e}"),
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Environment(s) => write!(f, "build environment: {s}"),
+            Self::NativeAbi {
+                entry,
+                path,
+                line,
+                column,
+                symbol,
+            } => write!(
+                f,
+                "native Metal ABI for `{entry}`: {}:{line}:{column}: `{symbol}` is not generated for this entry",
+                path.display()
+            ),
         }
     }
 }
@@ -140,6 +163,9 @@ pub struct Artifacts {
 
 mod internals {
     use super::*;
+    use seismic_lang::checked::ElementSummary;
+    use seismic_lang::registry::{self, CodeInterpretation, PlaneEncoding, RepresentationInfo};
+    use std::collections::HashSet;
     use std::ffi::OsStr;
     use std::fs;
 
@@ -247,12 +273,13 @@ mod internals {
             let path = path.canonicalize().map_err(BuildError::Io)?;
             println!("cargo:rerun-if-changed={}", path.display());
             let source = fs::read(&path).map_err(BuildError::Io)?;
-            std::str::from_utf8(&source).map_err(|_| {
+            let text = std::str::from_utf8(&source).map_err(|_| {
                 BuildError::Environment(format!(
                     "native Metal source `{}` is not UTF-8",
                     path.display()
                 ))
             })?;
+            validate_native_metal_abi(entry, &path, text)?;
             assets.push(NativeAsset {
                 definition,
                 path,
@@ -260,6 +287,308 @@ mod internals {
             });
         }
         Ok(assets)
+    }
+
+    fn validate_native_metal_abi(
+        entry: &EntryInfo,
+        path: &std::path::Path,
+        source: &str,
+    ) -> Result<(), BuildError> {
+        let allowed = native_abi_symbols(entry);
+        for (symbol, offset) in seismic_identifiers(source) {
+            if allowed.contains(symbol) {
+                continue;
+            }
+            let prefix = &source[..offset];
+            let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+            let column = prefix
+                .rsplit_once('\n')
+                .map_or(prefix.len() + 1, |(_, tail)| tail.len() + 1);
+            return Err(BuildError::NativeAbi {
+                entry: entry.name.clone(),
+                path: path.to_path_buf(),
+                line,
+                column,
+                symbol: symbol.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn native_abi_symbols(entry: &EntryInfo) -> HashSet<String> {
+        let mut symbols = HashSet::new();
+        symbols.insert("SEISMIC_BUFFER_WORDS".to_owned());
+        symbols.insert("SEISMIC_BUFFER_SCALAR_RESULTS".to_owned());
+        for dimension in &entry.dimensions {
+            symbols.insert(format!("SEISMIC_DIM_{}", native_macro(dimension)));
+        }
+        for element in &entry.element_parameters {
+            add_representation_symbols(
+                &mut symbols,
+                &format!("SEISMIC_ELEMENT_{}", native_macro(element)),
+                registry::representations().iter(),
+            );
+        }
+
+        for (ordinal, parameter) in entry.parameters.iter().enumerate() {
+            let unique = entry
+                .parameters
+                .iter()
+                .filter(|candidate| candidate.name == parameter.name)
+                .count()
+                == 1;
+            let name = native_macro(&parameter.name);
+            match &parameter.kind {
+                ParameterSummaryKind::Tensor { rank, element, .. } => {
+                    let ordinal_prefix = format!("SEISMIC_PARAM_{ordinal}");
+                    symbols.insert(format!("{ordinal_prefix}_BUFFER"));
+                    if unique {
+                        symbols.insert(format!("SEISMIC_BUFFER_{name}"));
+                    }
+                    for axis in 0..*rank {
+                        symbols.insert(format!("{ordinal_prefix}_EXTENT_{axis}"));
+                        symbols.insert(format!("{ordinal_prefix}_STRIDE_{axis}"));
+                        if unique {
+                            symbols.insert(format!("SEISMIC_{name}_EXTENT_{axis}"));
+                            symbols.insert(format!("SEISMIC_{name}_STRIDE_{axis}"));
+                        }
+                    }
+                    add_element_representation_symbols(&mut symbols, &ordinal_prefix, element);
+                    if unique {
+                        add_element_representation_symbols(
+                            &mut symbols,
+                            &format!("SEISMIC_{name}"),
+                            element,
+                        );
+                    }
+                }
+                ParameterSummaryKind::Scalar(_) | ParameterSummaryKind::Index => {
+                    symbols.insert(format!("SEISMIC_PARAM_{ordinal}"));
+                    if unique {
+                        symbols.insert(format!("SEISMIC_PARAM_{name}"));
+                    }
+                }
+                ParameterSummaryKind::Range => {
+                    symbols.insert(format!("SEISMIC_PARAM_{ordinal}_START"));
+                    symbols.insert(format!("SEISMIC_PARAM_{ordinal}_END"));
+                    if unique {
+                        symbols.insert(format!("SEISMIC_PARAM_{name}_START"));
+                        symbols.insert(format!("SEISMIC_PARAM_{name}_END"));
+                    }
+                }
+            }
+        }
+
+        for (ordinal, result) in entry.results.iter().enumerate() {
+            match &result.kind {
+                ResultSummaryKind::Tensor { rank, element } => {
+                    let prefix = format!("SEISMIC_RESULT_{ordinal}");
+                    symbols.insert(format!("{prefix}_BUFFER"));
+                    for axis in 0..*rank {
+                        symbols.insert(format!("{prefix}_EXTENT_{axis}"));
+                        symbols.insert(format!("{prefix}_STRIDE_{axis}"));
+                    }
+                    add_element_representation_symbols(&mut symbols, &prefix, element);
+                }
+                ResultSummaryKind::Scalar(_)
+                | ResultSummaryKind::Index
+                | ResultSummaryKind::Range => {
+                    symbols.insert(format!("SEISMIC_RESULT_{ordinal}_WORD"));
+                }
+            }
+        }
+        symbols
+    }
+
+    fn add_element_representation_symbols(
+        symbols: &mut HashSet<String>,
+        prefix: &str,
+        element: &ElementSummary,
+    ) {
+        match element {
+            ElementSummary::Fixed(name) => {
+                if let Some(id) = registry::representation(name) {
+                    add_representation_symbols(
+                        symbols,
+                        prefix,
+                        std::iter::once(registry::representation_info(id)),
+                    );
+                }
+            }
+            ElementSummary::Parameter(_) => {
+                add_representation_symbols(symbols, prefix, registry::representations().iter());
+            }
+        }
+    }
+
+    fn add_representation_symbols<'a>(
+        symbols: &mut HashSet<String>,
+        prefix: &str,
+        representations: impl Iterator<Item = &'a RepresentationInfo>,
+    ) {
+        // Authored helper macros commonly receive the ABI family prefix and
+        // token-paste suffixes such as `_PACKET_SIZE` onto it.
+        symbols.insert(prefix.to_owned());
+        for representation in representations {
+            symbols.insert(format!(
+                "{prefix}_REPRESENTATION_{}",
+                native_macro(representation.name)
+            ));
+            symbols.insert(format!(
+                "{prefix}_DECODED_{}",
+                native_macro(representation.decoded.name())
+            ));
+            symbols.insert(format!("{prefix}_PACKET_SIZE"));
+            symbols.insert(format!("{prefix}_PACKET_ALIGNMENT"));
+            symbols.insert(format!("{prefix}_LOGICAL_GROUP"));
+            symbols.insert(format!("{prefix}_PLANE_COUNT"));
+            match &representation.kind {
+                registry::RepresentationKind::Dense(_) => {
+                    symbols.insert(format!("{prefix}_KIND_DENSE"));
+                }
+                registry::RepresentationKind::External(_) => {
+                    symbols.insert(format!("{prefix}_KIND_EXTERNAL"));
+                }
+                registry::RepresentationKind::Packed(layout) => {
+                    symbols.insert(format!("{prefix}_KIND_PACKED"));
+                    for (ordinal, plane) in layout.planes.iter().enumerate() {
+                        let plane_prefix = format!("{prefix}_PLANE_{ordinal}");
+                        symbols.insert(format!("{plane_prefix}_NAME_{}", native_macro(plane.name)));
+                        for suffix in [
+                            "OFFSET",
+                            "BYTES_PER_GROUP",
+                            "ALIGNMENT",
+                            "GROUP",
+                            "FIELDS",
+                            "ENTRY_BITS",
+                        ] {
+                            symbols.insert(format!("{plane_prefix}_{suffix}"));
+                        }
+                        symbols.insert(format!(
+                            "{plane_prefix}_STORAGE_{}",
+                            native_macro(plane.storage_dtype.name())
+                        ));
+                        match &plane.encoding {
+                            PlaneEncoding::Dense(dtype) => {
+                                symbols.insert(format!("{plane_prefix}_ENCODING_DENSE"));
+                                symbols.insert(format!(
+                                    "{plane_prefix}_ENCODING_DTYPE_{}",
+                                    native_macro(dtype.name())
+                                ));
+                            }
+                            PlaneEncoding::Packed { interpretation, .. } => {
+                                symbols.insert(format!("{plane_prefix}_ENCODING_PACKED"));
+                                symbols.insert(format!("{plane_prefix}_ENCODING_BITS"));
+                                add_code_symbols(symbols, &plane_prefix, interpretation);
+                            }
+                            PlaneEncoding::FloatCode { format } => {
+                                symbols.insert(format!("{plane_prefix}_ENCODING_FLOAT_CODE"));
+                                let format = match format {
+                                    registry::FloatCodeFormat::E2M1 => "E2M1",
+                                    registry::FloatCodeFormat::E4M3 => "E4M3",
+                                    registry::FloatCodeFormat::UE4M3 => "UE4M3",
+                                };
+                                symbols
+                                    .insert(format!("{plane_prefix}_ENCODING_FLOAT_CODE_{format}"));
+                                symbols.insert(format!("{plane_prefix}_ENCODING_BITS"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn add_code_symbols(
+        symbols: &mut HashSet<String>,
+        prefix: &str,
+        interpretation: &CodeInterpretation,
+    ) {
+        match interpretation {
+            CodeInterpretation::Unsigned => {
+                symbols.insert(format!("{prefix}_CODE_UNSIGNED"));
+            }
+            CodeInterpretation::TwosComplement => {
+                symbols.insert(format!("{prefix}_CODE_TWOS_COMPLEMENT"));
+            }
+            CodeInterpretation::Offset(_) => {
+                symbols.insert(format!("{prefix}_CODE_OFFSET"));
+                symbols.insert(format!("{prefix}_CODE_OFFSET_VALUE"));
+            }
+            CodeInterpretation::Table(values) => {
+                symbols.insert(format!("{prefix}_CODE_TABLE"));
+                symbols.insert(format!("{prefix}_CODE_TABLE_COUNT"));
+                for ordinal in 0..values.len() {
+                    symbols.insert(format!("{prefix}_CODE_TABLE_{ordinal}"));
+                }
+            }
+        }
+    }
+
+    fn seismic_identifiers(source: &str) -> Vec<(&str, usize)> {
+        let bytes = source.as_bytes();
+        let mut identifiers = Vec::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                    index += 2;
+                    while index < bytes.len() && bytes[index] != b'\n' {
+                        index += 1;
+                    }
+                }
+                b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                    index += 2;
+                    while index + 1 < bytes.len()
+                        && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                    {
+                        index += 1;
+                    }
+                    index = (index + 2).min(bytes.len());
+                }
+                b'"' | b'\'' => {
+                    let quote = bytes[index];
+                    index += 1;
+                    while index < bytes.len() {
+                        if bytes[index] == b'\\' {
+                            index = (index + 2).min(bytes.len());
+                        } else if bytes[index] == quote {
+                            index += 1;
+                            break;
+                        } else {
+                            index += 1;
+                        }
+                    }
+                }
+                byte if byte == b'_' || byte.is_ascii_alphabetic() => {
+                    let start = index;
+                    index += 1;
+                    while index < bytes.len()
+                        && (bytes[index] == b'_' || bytes[index].is_ascii_alphanumeric())
+                    {
+                        index += 1;
+                    }
+                    let identifier = &source[start..index];
+                    if identifier.starts_with("SEISMIC_") {
+                        identifiers.push((identifier, start));
+                    }
+                }
+                _ => index += 1,
+            }
+        }
+        identifiers
+    }
+
+    fn native_macro(name: &str) -> String {
+        name.chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect()
     }
 
     fn source_label(path: &std::path::Path) -> String {
@@ -390,6 +719,24 @@ mod internals {
         }
         out.push_str("  }\n");
 
+        let tensor_results = entry
+            .results
+            .iter()
+            .filter(|result| matches!(&result.kind, ResultSummaryKind::Tensor { .. }))
+            .collect::<Vec<_>>();
+        if tensor_results.is_empty() {
+            out.push_str("  pub struct OutputArgs;\n");
+        } else {
+            out.push_str("  pub struct OutputArgs<'a> {\n");
+            for result in &tensor_results {
+                out.push_str(&format!(
+                    "    pub {}: &'a mut seismic::Tensor,\n",
+                    result_name(&result.path)
+                ));
+            }
+            out.push_str("  }\n");
+        }
+
         out.push_str("  #[derive(Clone)]\n  pub struct WorkflowResults {\n");
         for result in &entry.results {
             out.push_str(&format!(
@@ -419,6 +766,11 @@ mod internals {
             out.push_str("    type Args<'a> = Args;\n");
         }
         out.push_str("    type Results = Results;\n");
+        if tensor_results.is_empty() {
+            out.push_str("    type OutputArgs<'a> = OutputArgs;\n");
+        } else {
+            out.push_str("    type OutputArgs<'a> = OutputArgs<'a>;\n");
+        }
         if workflow_borrowed {
             out.push_str("    type WorkflowArgs<'a> = WorkflowArgs<'a>;\n");
         } else {
@@ -428,6 +780,39 @@ mod internals {
         out.push_str(&format!(
             "    const NAME: &'static str = {:?};\n",
             entry.name
+        ));
+        let argument_words = entry.dimensions.len() as u64
+            + entry
+                .parameters
+                .iter()
+                .map(|parameter| match &parameter.kind {
+                    ParameterSummaryKind::Tensor { rank, .. } => u64::from(*rank) * 2,
+                    ParameterSummaryKind::Range => 2,
+                    ParameterSummaryKind::Scalar(_) | ParameterSummaryKind::Index => 1,
+                })
+                .sum::<u64>()
+            + entry
+                .results
+                .iter()
+                .map(|result| match &result.kind {
+                    ResultSummaryKind::Tensor { rank, .. } => u64::from(*rank) * 2,
+                    ResultSummaryKind::Range
+                    | ResultSummaryKind::Scalar(_)
+                    | ResultSummaryKind::Index => 0,
+                })
+                .sum::<u64>();
+        let scalar_words = entry
+            .results
+            .iter()
+            .map(|result| match &result.kind {
+                ResultSummaryKind::Range => 2,
+                ResultSummaryKind::Scalar(_) | ResultSummaryKind::Index => 1,
+                ResultSummaryKind::Tensor { .. } => 0,
+            })
+            .sum::<u64>();
+        let invocation_workspace_bytes = (argument_words * 8).max(1) + (scalar_words * 8).max(1);
+        out.push_str(&format!(
+            "    const NATIVE_INVOCATION_WORKSPACE_BYTES: u64 = {invocation_workspace_bytes};\n"
         ));
         out.push_str("    fn module() -> Result<&'static seismic::generated::Module, seismic::CheckedBundleError> { super::module() }\n");
         out.push_str(&format!(
@@ -461,6 +846,18 @@ mod internals {
                     }
                 }
             }
+        }
+        out.push_str("      encoder.finish()\n    }\n");
+        out.push_str("    fn encode_outputs(outputs: Self::OutputArgs<'_>) -> seismic::generated::EncodedOutputs {\n");
+        out.push_str("      let mut encoder = seismic::generated::OutputArgsEncoder::new();\n");
+        for result in &tensor_results {
+            out.push_str(&format!(
+                "      encoder.tensor(outputs.{});\n",
+                result_name(&result.path)
+            ));
+        }
+        if tensor_results.is_empty() {
+            out.push_str("      let _ = outputs;\n");
         }
         out.push_str("      encoder.finish()\n    }\n");
         out.push_str("    fn decode(mut results: seismic::generated::DecodedResults) -> Results { Results {\n");
@@ -923,6 +1320,87 @@ mod native_tests {
             .run()
             .expect("second build");
         assert_ne!(first.identity, second.identity);
+        fs::remove_dir_all(&root).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn native_asset_rejects_dimension_macro_not_generated_for_entry() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "seismic-native-abi-build-{}-{unique}",
+            std::process::id()
+        ));
+        let output = root.join("out");
+        fs::create_dir_all(root.join("native")).expect("fixture directories");
+        let source = root.join("ops.seismic");
+        let metal = root.join("native/scale.metal");
+        fs::write(
+            &source,
+            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for metal from \"native/scale.metal\":\n    threadgroups (ceil_div(N, 256), 1, 1)\n    threads_per_threadgroup (256, 1, 1)\n",
+        )
+        .expect("Seismic fixture");
+        fs::write(
+            &metal,
+            "kernel void scale(uint index [[thread_position_in_grid]]) { if (index < SEISMIC_DIM_W) {} }\n",
+        )
+        .expect("Metal fixture");
+
+        let error = Build::new("fixture")
+            .source(&source)
+            .std(false)
+            .out_dir(&output)
+            .run()
+            .expect_err("unknown entry ABI symbol must fail the consumer build");
+        match error {
+            BuildError::NativeAbi {
+                entry,
+                line,
+                symbol,
+                ..
+            } => {
+                assert_eq!(entry, "scale");
+                assert_eq!(line, 1);
+                assert_eq!(symbol, "SEISMIC_DIM_W");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        fs::remove_dir_all(&root).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn native_asset_accepts_exact_generated_tensor_and_result_symbols() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "seismic-native-abi-valid-build-{}-{unique}",
+            std::process::id()
+        ));
+        let output = root.join("out");
+        fs::create_dir_all(root.join("native")).expect("fixture directories");
+        let source = root.join("ops.seismic");
+        let metal = root.join("native/scale.metal");
+        fs::write(
+            &source,
+            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for metal from \"native/scale.metal\":\n    threadgroups (ceil_div(N, 256), 1, 1)\n    threads_per_threadgroup (256, 1, 1)\n",
+        )
+        .expect("Seismic fixture");
+        fs::write(
+            &metal,
+            "// SEISMIC_DIM_NOT_AN_ABI_SYMBOL inside a comment is inert.\n#define PACKET_SIZE(PREFIX) PREFIX##_PACKET_SIZE\nkernel void scale(device const float *x [[buffer(SEISMIC_BUFFER_X)]], device float *output [[buffer(SEISMIC_RESULT_0_BUFFER)]], constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]], uint index [[thread_position_in_grid]]) {\n#if defined(SEISMIC_X_REPRESENTATION_F32) && defined(SEISMIC_RESULT_0_KIND_DENSE)\n    ulong packet_size = PACKET_SIZE(SEISMIC_X);\n    if (packet_size > 0 && index < SEISMIC_DIM_N) output[index * SEISMIC_RESULT_0_STRIDE_0] = x[index * SEISMIC_X_STRIDE_0];\n#endif\n}\n",
+        )
+        .expect("Metal fixture");
+
+        Build::new("fixture")
+            .source(&source)
+            .std(false)
+            .out_dir(&output)
+            .run()
+            .expect("exact entry ABI symbols must pass the consumer build");
         fs::remove_dir_all(&root).expect("remove fixture directory");
     }
 }

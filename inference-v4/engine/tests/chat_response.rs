@@ -1,4 +1,6 @@
-use magnitude_engine::chat::{ChatPublication, Event, SseResponse, TerminalCause, Usage};
+use magnitude_engine::chat::{
+    ChatPublication, DetailedUsage, Event, ExecutionTimings, SseResponse, TerminalCause,
+};
 use serde_json::{json, Value};
 fn response(usage: bool) -> SseResponse {
     SseResponse::new("chatcmpl-fixture".into(), "model".into(), 123, usage, 8192).unwrap()
@@ -14,12 +16,29 @@ fn decode(frame: &[u8]) -> Value {
     )
     .unwrap()
 }
+fn usage(prompt_tokens: usize, completion_tokens: usize) -> DetailedUsage {
+    DetailedUsage {
+        prompt_tokens,
+        completion_tokens,
+        cached_tokens: 0,
+        draft_n: 0,
+        draft_n_accepted: 0,
+    }
+}
 #[test]
 fn tool_reasoning_and_content_frames_preserve_json_boundaries_and_usage() {
     let publication = ChatPublication {
-        usage: Some(Usage {
+        usage: Some(DetailedUsage {
             prompt_tokens: 5,
             completion_tokens: 3,
+            cached_tokens: 2,
+            draft_n: 4,
+            draft_n_accepted: 3,
+        }),
+        method: Some("mtp".into()),
+        timings: Some(ExecutionTimings {
+            prompt_ns: 12_500_000,
+            predicted_ns: 25_000_000,
         }),
         events: vec![
             Event::Reasoning {
@@ -61,6 +80,15 @@ fn tool_reasoning_and_content_frames_preserve_json_boundaries_and_usage() {
     assert_eq!(values[5]["choices"][0]["finish_reason"], "tool_calls");
     assert_eq!(values[6]["choices"], json!([]));
     assert_eq!(values[6]["usage"]["total_tokens"], 8);
+    assert_eq!(
+        values[6]["usage"]["prompt_tokens_details"]["cached_tokens"],
+        2
+    );
+    assert_eq!(values[6]["timings"]["draft_n"], 4);
+    assert_eq!(values[6]["timings"]["draft_n_accepted"], 3);
+    assert_eq!(values[6]["timings"]["speculative_backend"], "mtp");
+    assert_eq!(values[6]["timings"]["prompt_ms"], 12.5);
+    assert_eq!(values[6]["timings"]["predicted_ms"], 25.0);
     assert!(response.feed(&publication).is_err());
 }
 #[test]
@@ -72,6 +100,8 @@ fn truncation_and_failure_do_not_report_completed_tool_calls() {
     ] {
         let publication = ChatPublication {
             usage: None,
+            method: None,
+            timings: None,
             events: vec![
                 Event::ToolStart {
                     index: 0,
@@ -99,6 +129,8 @@ fn truncation_and_failure_do_not_report_completed_tool_calls() {
 fn limits_invalid_event_order_and_missing_usage_fail_closed() {
     let terminal = ChatPublication {
         usage: None,
+        method: None,
+        timings: None,
         events: vec![Event::Finish {
             cause: TerminalCause::Natural,
         }],
@@ -110,6 +142,8 @@ fn limits_invalid_event_order_and_missing_usage_fail_closed() {
     assert!(limited.feed(&terminal).is_err());
     let invalid = ChatPublication {
         usage: None,
+        method: None,
+        timings: None,
         events: vec![Event::ToolArguments {
             index: 0,
             text: "x".into(),
@@ -128,6 +162,8 @@ fn nonstream_assembly_preserves_chunked_reasoning_tools_and_terminal_usage() {
     let publications = [
         ChatPublication {
             usage: None,
+            method: None,
+            timings: None,
             error: None,
             events: vec![
                 Event::Reasoning {
@@ -148,9 +184,11 @@ fn nonstream_assembly_preserves_chunked_reasoning_tools_and_terminal_usage() {
             ],
         },
         ChatPublication {
-            usage: Some(Usage {
-                prompt_tokens: 5,
-                completion_tokens: 7,
+            usage: Some(usage(5, 7)),
+            method: Some("plain".into()),
+            timings: Some(ExecutionTimings {
+                prompt_ns: 1_000_000,
+                predicted_ns: 2_000_000,
             }),
             error: None,
             events: vec![
@@ -212,9 +250,11 @@ fn nonstream_truncation_failure_and_bounds_never_fabricate_success() {
         TerminalCause::Cancelled,
     ] {
         let publication = ChatPublication {
-            usage: Some(Usage {
-                prompt_tokens: 1,
-                completion_tokens: 2,
+            usage: Some(usage(1, 2)),
+            method: Some("plain".into()),
+            timings: Some(ExecutionTimings {
+                prompt_ns: 1_000_000,
+                predicted_ns: 2_000_000,
             }),
             error: None,
             events: vec![
@@ -248,6 +288,8 @@ fn nonstream_truncation_failure_and_bounds_never_fabricate_success() {
     }
     let missing = ChatPublication {
         usage: None,
+        method: None,
+        timings: None,
         error: None,
         events: vec![Event::Finish {
             cause: TerminalCause::Natural,
@@ -256,6 +298,8 @@ fn nonstream_truncation_failure_and_bounds_never_fabricate_success() {
     assert!(create(8192).feed(&missing).is_err());
     let content = ChatPublication {
         usage: None,
+        method: None,
+        timings: None,
         error: None,
         events: vec![Event::Content {
             text: "x".repeat(33),
@@ -266,6 +310,8 @@ fn nonstream_truncation_failure_and_bounds_never_fabricate_success() {
     assert!(small.feed(&missing).is_err());
     let error = ChatPublication {
         usage: None,
+        method: None,
+        timings: None,
         error: Some("device failed".into()),
         events: vec![
             Event::Content {
@@ -278,9 +324,11 @@ fn nonstream_truncation_failure_and_bounds_never_fabricate_success() {
     };
     assert_eq!(create(8192).feed(&error).unwrap_err(), "device failed");
     let after_terminal = ChatPublication {
-        usage: Some(Usage {
-            prompt_tokens: 1,
-            completion_tokens: 0,
+        usage: Some(usage(1, 0)),
+        method: Some("plain".into()),
+        timings: Some(ExecutionTimings {
+            prompt_ns: 1_000_000,
+            predicted_ns: 2_000_000,
         }),
         error: None,
         events: vec![

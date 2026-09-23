@@ -1,0 +1,10 @@
+[package]
+name = "magnitude-artifacts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+image = { version = "=0.25.8", default-features = false, features = ["jpeg", "png", "webp"] }
+serde.workspace = true
+sha2 = "=0.11.0"

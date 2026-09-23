@@ -394,6 +394,7 @@ pub(crate) mod internals {
 #[cfg(test)]
 mod native_tests {
     use super::*;
+    use crate::registry;
 
     fn source(native: &str) -> SourceSet {
         let mut sources = SourceSet::default();
@@ -459,5 +460,55 @@ mod native_tests {
                 "expected diagnostic containing {expected:?}, got {error}"
             );
         }
+    }
+
+    #[test]
+    fn equivalent_family_bodies_propagate_renamed_element_bindings() {
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "repack.seismic".to_owned(),
+            text: "fn repack_weight[N](source: &tensor[N] E) -> tensor[N] U:\n    return repack[U = U](source)\n\nfn repack_weight[N](source: &tensor[N] T) -> tensor[N] V:\n    return repack[U = V](source)\n"
+                .to_owned(),
+        }]))
+        .expect("equivalent generic spellings form one checked family");
+        let entry = module.entry_named("repack_weight").unwrap();
+        let bindings = ElementBindings::new()
+            .bind("E", registry::representation("gguf_q8_0").unwrap())
+            .bind("U", registry::representation("q8g32s").unwrap());
+        let logical = module
+            .entry(entry, &bindings)
+            .expect("every family body inherits the contract element binding");
+        assert_eq!(
+            logical
+                .program()
+                .family(logical.program().root())
+                .candidates()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn equivalent_family_bodies_propagate_renamed_tuple_result_bindings() {
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "repack_tuple.seismic".to_owned(),
+            text: "fn repack_pair[N](source: &tensor[N] E) -> (tensor[N] U, f32):\n    return (repack[U = U](source), f32(0.0))\n\nfn repack_pair[N](source: &tensor[N] T) -> (tensor[N] V, f32):\n    return (repack[U = V](source), f32(0.0))\n"
+                .to_owned(),
+        }]))
+        .expect("equivalent tuple result generics form one checked family");
+        let entry = module.entry_named("repack_pair").unwrap();
+        let bindings = ElementBindings::new()
+            .bind("E", registry::representation("gguf_q8_0").unwrap())
+            .bind("U", registry::representation("q8g32s").unwrap());
+        let logical = module
+            .entry(entry, &bindings)
+            .expect("tuple result generic binding reaches every family body");
+        assert_eq!(
+            logical
+                .program()
+                .family(logical.program().root())
+                .candidates()
+                .len(),
+            2
+        );
     }
 }

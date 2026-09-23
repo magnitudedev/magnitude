@@ -1,0 +1,122 @@
+--- a/common/chat.h
++++ b/common/chat.h
+@@ -252,7 +252,7 @@
+     common_chat_tool_choice               tool_choice         = COMMON_CHAT_TOOL_CHOICE_AUTO;
+     bool                                  parallel_tool_calls = false;
+     common_reasoning_format               reasoning_format    = COMMON_REASONING_FORMAT_NONE; // TODO: refactor this to "bool enable_thinking"
+-    bool                                  enable_thinking     = true;
++    std::optional<bool>                   enable_thinking     = std::nullopt;
+     std::chrono::system_clock::time_point now                 = std::chrono::system_clock::now();
+     std::map<std::string, std::string>    chat_template_kwargs;
+     bool                                  add_bos = false;
+@@ -382,3 +382,6 @@
+ common_chat_prompt_preset common_chat_get_asr_prompt(const common_chat_templates * chat_templates);
+ 
+ common_chat_msg_delimiters common_chat_msg_delimiters_parse(const common_json & delimiters);
++
++// Selected source access for the standalone semantic ABI.
++const common_chat_template & common_chat_templates_get_default(const common_chat_templates *);
+--- a/common/chat-auto-parser.h
++++ b/common/chat-auto-parser.h
+@@ -63,7 +63,7 @@
+     bool                                  add_generation_prompt  = false;
+     common_chat_continuation              continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
+     common_chat_msg                       continue_msg;
+-    bool                                  enable_thinking        = true;
++    std::optional<bool>                   enable_thinking        = std::nullopt;
+     std::chrono::system_clock::time_point now                    = std::chrono::system_clock::now();
+     json                                  extra_context;
+     bool                                  add_bos       = false;
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -780,6 +780,7 @@
+     const std::optional<json> & tools_override,
+     const std::optional<json> & additional_context) {
+     jinja::context ctx(tmpl.source());
++    ctx.current_time = std::chrono::system_clock::to_time_t(inputs.now);
+ 
+     // messages_override is already built for this template, do not touch its content parts
+     json inp = json{
+@@ -788,8 +789,10 @@
+             : messages_inp_normalizer(tmpl.original_caps()).normalize(inputs.messages)},
+         {"bos_token", tmpl.bos_token()},
+         {"eos_token", tmpl.eos_token()},
+-        {"enable_thinking", inputs.enable_thinking},
+     };
++    if (inputs.enable_thinking.has_value()) {
++        inp["enable_thinking"] = *inputs.enable_thinking;
++    }
+     if (tools_override.has_value() || !inputs.tools.empty()) {
+         inp["tools"] = tools_override.has_value() ? *tools_override : inputs.tools;
+     }
+@@ -948,9 +951,8 @@
+ 
+ }
+ 
+-static json common_chat_extra_context() {
++static json common_chat_extra_context(const std::chrono::system_clock::time_point & now) {
+     json ctx = json::object();
+-    std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
+     std::string datetime_str = format_time(now, "%b %d %Y");
+     std::string date_str = format_time(now, "%d %b %Y");
+     ctx["datetime"] = datetime_str;
+@@ -1151,7 +1153,7 @@
+         workaround::func_args_not_string(params.messages);
+     }
+ 
+-    params.extra_context = common_chat_extra_context();
++    params.extra_context = common_chat_extra_context(inputs.now);
+     for (auto el : inputs.chat_template_kwargs) {
+         params.extra_context[el.first] = json::parse(el.second);
+     }
+@@ -1326,3 +1328,8 @@
+     }
+     return chat_templates->template_default->caps.to_map();
+ }
++
++const common_chat_template & common_chat_templates_get_default(const common_chat_templates * templates) {
++    if (!templates || !templates->template_default) { throw std::invalid_argument("Invalid template"); }
++    return *templates->template_default;
++}
+--- a/common/chat-auto-parser-helpers.cpp
++++ b/common/chat-auto-parser-helpers.cpp
+@@ -311,6 +311,7 @@
+ 
+ std::string apply_template(const common_chat_template & tmpl, const template_params & params) {
+     generation_params tmpl_params;
++    tmpl_params.now = std::chrono::system_clock::from_time_t(946684800);
+     tmpl_params.messages              = params.messages;
+     tmpl_params.tools                 = params.tools;
+     tmpl_params.add_generation_prompt = params.add_generation_prompt;
+--- a/common/jinja/caps.cpp
++++ b/common/jinja/caps.cpp
+@@ -38,6 +38,7 @@
+                              const caps_json_fn & tools_fn,
+                              const caps_analyze_fn & analyze_fn) {
+     context ctx;
++    ctx.current_time = 946684800; // Frozen capability inspection context.
+     ctx.is_get_stats = true;
+     jinja::global_from_json(ctx, json{
+         {"messages", messages_fn()},
+--- a/common/parsers/deepseek.cpp
++++ b/common/parsers/deepseek.cpp
+@@ -216,7 +216,7 @@
+             tool_calls = p.optional(tool_calls);
+         }
+ 
+-        if (extract_reasoning && inputs.enable_thinking) {
++        if (extract_reasoning && inputs.enable_thinking.value_or(true)) {
+             reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
+             reasoning_with_tc = THINK_START +
+                 p.reasoning(p.until_one_of({ TC_SEPARATOR + FC_START, FC_START, THINK_END })) +
+--- a/common/parsers/minimax-m3.cpp
++++ b/common/parsers/minimax-m3.cpp
+@@ -62,7 +62,7 @@
+ 
+         auto reasoning = p.eps();
+         if (extract_reasoning) {
+-            auto block = inputs.enable_thinking
++            auto block = inputs.enable_thinking.value_or(true)
+                              ? p.literal(THINK_START) + p.space() +
+                                    p.ac(p.reasoning(p.until(THINK_END)) + p.literal(THINK_END), THINK_END)
+                              : p.literal(THINK_START) + p.ac(p.until(THINK_END) + p.literal(THINK_END), THINK_END);

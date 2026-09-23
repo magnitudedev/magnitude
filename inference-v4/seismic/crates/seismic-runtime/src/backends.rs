@@ -6,12 +6,12 @@
 //! API.  It does not reproduce target facts or planning policy.
 
 use crate::api::{
+    CallError, DeviceId, DeviceInfo, WorkflowError,
     device::DeviceInner,
     kernel::{
-        DecodedResults, EncodedArgs, EncodedWorkflowArgs, NativeDefinition, PendingWorkflowResults,
-        WorkflowCompletionAny, WorkflowResultRef,
+        DecodedResults, EncodedArgs, EncodedOutputs, EncodedWorkflowArgs, NativeDefinition,
+        PendingWorkflowResults, WorkflowCompletionAny, WorkflowResultRef,
     },
-    CallError, DeviceId, DeviceInfo, WorkflowError,
 };
 use crate::driver::{self, Opened, PreparedHandle};
 use seismic_compiler::errors::{ExecutionError, TargetError};
@@ -59,11 +59,124 @@ pub(crate) enum NativePreparedKind {
     Unsupported,
 }
 
+pub(crate) enum NativeBoundKind {
+    #[cfg(target_os = "macos")]
+    Metal(driver::NativeBoundCall),
+    #[cfg(not(target_os = "macos"))]
+    Unsupported,
+}
+
+impl NativeBoundKind {
+    pub(crate) fn run_graph(calls: Vec<Self>) -> Result<(), CallError> {
+        #[cfg(target_os = "macos")]
+        {
+            let calls = calls
+                .into_iter()
+                .map(|call| match call {
+                    Self::Metal(call) => call,
+                })
+                .collect();
+            return driver::run_native_graph_batch(calls);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = calls;
+            unreachable!("unsupported native graph cannot be prepared")
+        }
+    }
+
+    pub(crate) fn run(self) -> Result<DecodedResults, CallError> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Metal(call) => call.run(),
+            #[cfg(not(target_os = "macos"))]
+            Self::Unsupported => unreachable!("unsupported native kernel cannot be prepared"),
+        }
+    }
+}
+
 impl NativePreparedKind {
+    pub(crate) fn validate_graph_batch(
+        &self,
+        device: seismic_compiler::prepared::DeviceIdentity,
+    ) -> Result<(), CallError> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Metal(kernel) => kernel.validate_graph_batch(device),
+            #[cfg(not(target_os = "macos"))]
+            Self::Unsupported => unreachable!("unsupported native kernel cannot be prepared"),
+        }
+    }
+    pub(crate) fn bind(
+        &self,
+        args: EncodedArgs,
+        outputs: Vec<Arc<crate::api::tensor::TensorInner>>,
+    ) -> Result<NativeBoundKind, CallError> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Metal(kernel) => kernel.bind(args, outputs).map(NativeBoundKind::Metal),
+            #[cfg(not(target_os = "macos"))]
+            Self::Unsupported => unreachable!("unsupported native kernel cannot be prepared"),
+        }
+    }
+    pub(crate) fn tensor_parameter_spec(
+        &self,
+        name: &str,
+        dimensions: &[(&str, u64)],
+    ) -> Result<driver::NativeTensorSpec, CallError> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Metal(kernel) => kernel.tensor_parameter_spec(name, dimensions),
+            #[cfg(not(target_os = "macos"))]
+            Self::Unsupported => unreachable!("unsupported native kernel cannot be prepared"),
+        }
+    }
+    pub(crate) fn result_count(&self) -> u32 {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Metal(kernel) => kernel.result_count(),
+            #[cfg(not(target_os = "macos"))]
+            Self::Unsupported => unreachable!("unsupported native kernel cannot be prepared"),
+        }
+    }
+    pub(crate) fn describe_results(
+        &self,
+        arguments: &[seismic_compiler::prepared::ArgumentValue],
+    ) -> Result<Vec<Option<driver::NativeTensorSpec>>, CallError> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Metal(kernel) => kernel.describe_results(arguments),
+            #[cfg(not(target_os = "macos"))]
+            Self::Unsupported => unreachable!("unsupported native kernel cannot be prepared"),
+        }
+    }
+
+    pub(crate) fn invocation_workspace_bytes(&self) -> u64 {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Metal(kernel) => kernel.invocation_workspace_bytes(),
+            #[cfg(not(target_os = "macos"))]
+            Self::Unsupported => unreachable!("unsupported native kernel cannot be prepared"),
+        }
+    }
+
     pub(crate) fn call(&self, args: EncodedArgs) -> Result<DecodedResults, CallError> {
         match self {
             #[cfg(target_os = "macos")]
             Self::Metal(kernel) => kernel.call(args),
+            #[cfg(not(target_os = "macos"))]
+            Self::Unsupported => unreachable!("unsupported native kernel cannot be prepared"),
+        }
+    }
+
+    pub(crate) fn call_into(
+        &self,
+        args: EncodedArgs,
+        outputs: EncodedOutputs,
+    ) -> Result<DecodedResults, CallError> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Metal(kernel) => kernel.call_into(args, outputs),
             #[cfg(not(target_os = "macos"))]
             Self::Unsupported => unreachable!("unsupported native kernel cannot be prepared"),
         }

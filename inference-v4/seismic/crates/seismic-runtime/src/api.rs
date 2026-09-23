@@ -65,8 +65,20 @@ impl Eq for DeviceInfo {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CallError {
     Invocation(InvocationError),
+    Output(OutputError),
     Execution(ExecutionError),
     Workflow(WorkflowError),
+}
+
+/// A caller-supplied native result does not match the checked entry contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutputError {
+    Count { expected: usize, actual: usize },
+    WrongDevice { result: usize },
+    WrongRepresentation { result: usize },
+    ShapeMismatch { result: usize, axis: usize },
+    NoncanonicalLayout { result: usize },
+    IllegalAliasing { result: usize },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,11 +88,24 @@ pub enum WorkflowError {
     MissingProducerResult,
     HostBoundaryRequired,
     TensorView(TensorError),
+    NativePortUnbound { port: usize },
+    NativePortMismatch { port: usize },
+    NativePortAlreadyBound { port: usize },
+    NativeGraphSlotMismatch,
+    NativeOutputLeaseConsumed,
+    NativeExportStillLive,
 }
+impl fmt::Display for WorkflowError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", CallError::Workflow(self.clone()))
+    }
+}
+impl std::error::Error for WorkflowError {}
 impl fmt::Display for CallError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invocation(e) => write!(f, "{e}"),
+            Self::Output(e) => write!(f, "{e}"),
             Self::Execution(e) => write!(f, "{e}"),
             Self::Workflow(WorkflowError::CrossWorkflowResult) => {
                 f.write_str("workflow result belongs to another workflow")
@@ -93,10 +118,52 @@ impl fmt::Display for CallError {
                 f.write_str("a scalar workflow dependency requires an explicit host boundary")
             }
             Self::Workflow(WorkflowError::TensorView(error)) => write!(f, "{error}"),
+            Self::Workflow(WorkflowError::NativePortUnbound { port }) => {
+                write!(f, "native graph port {port} is unbound")
+            }
+            Self::Workflow(WorkflowError::NativePortMismatch { port }) => {
+                write!(f, "native graph port {port} has an incompatible tensor")
+            }
+            Self::Workflow(WorkflowError::NativePortAlreadyBound { port }) => {
+                write!(f, "native graph port {port} was bound twice")
+            }
+            Self::Workflow(WorkflowError::NativeGraphSlotMismatch) => {
+                f.write_str("native graph slot belongs to another graph")
+            }
+            Self::Workflow(WorkflowError::NativeOutputLeaseConsumed) => {
+                f.write_str("native graph output lease was already used")
+            }
+            Self::Workflow(WorkflowError::NativeExportStillLive) => {
+                f.write_str("native graph export is still retained")
+            }
         }
     }
 }
 impl std::error::Error for CallError {}
+
+impl fmt::Display for OutputError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Count { expected, actual } => {
+                write!(f, "expected {expected} tensor results, received {actual}")
+            }
+            Self::WrongDevice { result } => write!(f, "result {result} is on the wrong device"),
+            Self::WrongRepresentation { result } => {
+                write!(f, "result {result} has the wrong representation")
+            }
+            Self::ShapeMismatch { result, axis } => {
+                write!(f, "result {result} has the wrong extent on axis {axis}")
+            }
+            Self::NoncanonicalLayout { result } => {
+                write!(f, "result {result} does not have canonical storage layout")
+            }
+            Self::IllegalAliasing { result } => {
+                write!(f, "result {result} overlaps another call tensor")
+            }
+        }
+    }
+}
+impl std::error::Error for OutputError {}
 
 /// Real failures of public tensor construction/view creation. These cannot
 /// carry a schema parameter id and therefore are not invocation failures.
@@ -276,6 +343,15 @@ pub mod tensor {
     }
 
     impl TensorInner {
+        /// Exact canonical storage charge for a representation and logical
+        /// shape, without allocating a device tensor.
+        pub fn canonical_byte_len(
+            representation: RepresentationId,
+            extents: &[u64],
+        ) -> Result<u64, TensorError> {
+            Ok(layout::canonical(representation, extents)?.byte_len)
+        }
+
         pub fn zeros(
             device: &Arc<DeviceInner>,
             representation: RepresentationId,
@@ -683,6 +759,13 @@ pub mod kernel {
         pub(crate) inner: crate::backends::NativePreparedKind,
     }
 
+    impl NativePreparedAny {
+        pub fn invocation_workspace_bytes(&self) -> u64 {
+            self.inner.invocation_workspace_bytes()
+        }
+    }
+
+    #[derive(Clone)]
     enum EncodedArgument {
         Tensor(Arc<TensorInner>),
         Scalar(EncodedScalar),
@@ -697,25 +780,33 @@ pub mod kernel {
         pub(crate) result: u32,
     }
 
+    #[derive(Clone)]
     pub(crate) enum EncodedWorkflowArgument {
         Tensor(WorkflowTensorArgument),
         Scalar(EncodedScalar),
         ScalarResult(WorkflowResultRef),
     }
 
+    #[derive(Clone)]
+    pub enum ViewOperation {
+        LeadingSlice { start: u64, end: u64 },
+        Reshape { extents: Vec<u64> },
+    }
+
+    #[derive(Clone)]
     pub(crate) enum WorkflowTensorArgument {
         External(Arc<TensorInner>),
         Result(WorkflowResultRef),
-        ResultLeadingSlice {
+        ResultView {
             result: WorkflowResultRef,
-            start: u64,
-            end: u64,
+            operations: Vec<ViewOperation>,
         },
     }
 
     /// Generated workflow arguments retain symbolic producer edges until
     /// whole-workflow binding resolves them. They cannot be passed to the
     /// one-node call path.
+    #[derive(Clone)]
     pub struct EncodedWorkflowArgs {
         arguments: Vec<EncodedWorkflowArgument>,
     }
@@ -740,14 +831,13 @@ pub mod kernel {
             ));
         }
         #[doc(hidden)]
-        pub fn push_result_tensor_leading_slice(
+        pub fn push_result_tensor_view(
             &mut self,
             result: WorkflowResultRef,
-            start: u64,
-            end: u64,
+            operations: Vec<ViewOperation>,
         ) {
             self.arguments.push(EncodedWorkflowArgument::Tensor(
-                WorkflowTensorArgument::ResultLeadingSlice { result, start, end },
+                WorkflowTensorArgument::ResultView { result, operations },
             ));
         }
         #[doc(hidden)]
@@ -800,6 +890,7 @@ pub mod kernel {
         }
     }
 
+    #[derive(Clone)]
     #[doc(hidden)]
     pub enum EncodedScalar {
         F32(f32),
@@ -812,7 +903,7 @@ pub mod kernel {
         Range { start: u64, end: u64 },
     }
     impl EncodedScalar {
-        fn value(&self) -> ArgumentValue {
+        pub(crate) fn value(&self) -> ArgumentValue {
             match *self {
                 Self::F32(value) => ArgumentValue::F32(value),
                 Self::F16(value) => ArgumentValue::F16(value),
@@ -829,6 +920,7 @@ pub mod kernel {
     /// Generated call arguments. Each tensor descriptor and the allocation
     /// keepalive it describes are one value, never parallel vectors joined by
     /// ordinal at runtime.
+    #[derive(Clone)]
     pub struct EncodedArgs {
         arguments: Vec<EncodedArgument>,
     }
@@ -876,6 +968,26 @@ pub mod kernel {
                     EncodedArgument::Scalar(_) => None,
                 })
                 .collect()
+        }
+    }
+
+    /// Tensor result storage supplied by generated native entry bindings.
+    pub struct EncodedOutputs {
+        tensors: Vec<Arc<TensorInner>>,
+    }
+    impl EncodedOutputs {
+        #[doc(hidden)]
+        pub fn new() -> Self {
+            Self {
+                tensors: Vec::new(),
+            }
+        }
+        #[doc(hidden)]
+        pub fn push_tensor(&mut self, tensor: Arc<TensorInner>) {
+            self.tensors.push(tensor);
+        }
+        pub(crate) fn into_tensors(self) -> Vec<Arc<TensorInner>> {
+            self.tensors
         }
     }
 
@@ -1111,6 +1223,14 @@ pub mod kernel {
         args: EncodedArgs,
     ) -> Result<DecodedResults, CallError> {
         kernel.inner.call(args)
+    }
+
+    pub fn call_native_into(
+        kernel: &Arc<NativePreparedAny>,
+        args: EncodedArgs,
+        outputs: EncodedOutputs,
+    ) -> Result<DecodedResults, CallError> {
+        kernel.inner.call_into(args, outputs)
     }
 
     #[cfg(test)]

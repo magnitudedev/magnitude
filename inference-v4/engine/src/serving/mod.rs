@@ -1,17 +1,13 @@
 //! HTTP adapts the shared service. Run on a Tokio LocalSet: native templates and
 //! parsers remain host-local while the numerical worker owns model execution.
-pub mod startup;
-
 use crate::{
     chat::{
-        wire::{ModelLimits, Request as WireRequest},
+        wire::{MethodPolicy, ModelLimits, PreparedGeneration, Request as WireRequest},
         CompleteResponse, Session, SseResponse, TemplateBundle, TemplateSelection, TemplateVariant,
+        Vocabulary,
     },
     inputs::ByteBpeTokenizer,
-    service::{
-        owner::Executor,
-        runtime::{Client, Service},
-    },
+    service::{EngineClient, EngineService},
 };
 use bytes::Bytes;
 use hyper::{
@@ -21,6 +17,7 @@ use hyper::{
     Method, Request, Response, StatusCode,
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
+use magnitude_model_contracts::PreparedModelInput;
 use serde_json::json;
 use std::{
     convert::Infallible,
@@ -42,6 +39,7 @@ pub struct Config {
     pub vocabulary: usize,
     pub output_capacity: usize,
     pub forced_quantum: usize,
+    pub method: MethodPolicy,
     pub template_variant: Option<String>,
     pub template_override: Option<TemplateVariant>,
     pub max_body_bytes: usize,
@@ -79,26 +77,50 @@ impl Config {
         Ok(())
     }
 }
-struct Host<E: Executor + 'static> {
-    client: Client<E>,
+pub type InputPreparer = Rc<dyn Fn(&PreparedGeneration) -> Result<PreparedModelInput, String>>;
+
+/// Host-only sizing authority for `/v1/count`. Counting may inspect an input
+/// up to the artifact capability without allocating numerical state at that
+/// size; generation remains bounded by `Config::context_tokens`.
+pub struct CountInput {
+    pub context_tokens: usize,
+    pub prepare: InputPreparer,
+}
+
+struct Host {
+    client: EngineClient,
     tokenizer: Arc<ByteBpeTokenizer>,
     templates: TemplateBundle,
+    vocabulary: std::cell::RefCell<Vocabulary>,
+    prepare_input: InputPreparer,
+    count_input: CountInput,
     config: Config,
     identity: String,
     next: std::cell::Cell<u64>,
 }
-pub struct Server<E: Executor + 'static> {
-    service: Service<E>,
-    host: Rc<Host<E>>,
+pub struct Server {
+    service: EngineService,
+    host: Rc<Host>,
 }
-impl<E: Executor + 'static> Server<E> {
+impl Server {
     pub fn new(
-        service: Service<E>,
+        service: EngineService,
         tokenizer: Arc<ByteBpeTokenizer>,
         templates: TemplateBundle,
+        vocabulary: Vocabulary,
+        prepare_input: InputPreparer,
+        count_input: CountInput,
         config: Config,
     ) -> Result<Self, String> {
         config.validate(&tokenizer, &templates)?;
+        if count_input.context_tokens < config.context_tokens
+            || count_input.context_tokens > i32::MAX as usize
+        {
+            return Err("counting context is outside the model domain".into());
+        }
+        config
+            .method
+            .validate_method(service.client().method_identity())?;
         static NEXT_SERVER: AtomicU64 = AtomicU64::new(0);
         let server = NEXT_SERVER
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
@@ -110,6 +132,9 @@ impl<E: Executor + 'static> Server<E> {
             client: service.client(),
             tokenizer,
             templates,
+            vocabulary: std::cell::RefCell::new(vocabulary),
+            prepare_input,
+            count_input,
             config,
             identity: format!("{:x}-{}-{server}", time.as_nanos(), std::process::id()),
             next: std::cell::Cell::new(0),
@@ -159,7 +184,7 @@ impl<E: Executor + 'static> Server<E> {
         result
     }
 }
-impl<E: Executor + 'static> Host<E> {
+impl Host {
     async fn route(self: Rc<Self>, request: Request<Incoming>) -> Response<ResponseBody> {
         let limit = self.config.max_response_bytes;
         let response = self.route_inner(request).await;
@@ -174,6 +199,7 @@ impl<E: Executor + 'static> Host<E> {
         response
     }
     async fn route_inner(self: Rc<Self>, request: Request<Incoming>) -> Response<ResponseBody> {
+        let count_only = request.method() == Method::POST && request.uri().path() == "/v1/count";
         match (request.method(), request.uri().path()) {
             (&Method::GET, "/health") => {
                 return match self.client.check().await {
@@ -195,7 +221,8 @@ impl<E: Executor + 'static> Host<E> {
                 )
             }
             (&Method::POST, "/v1/chat/completions") => {}
-            (_, "/health" | "/v1/models" | "/v1/chat/completions") => {
+            (&Method::POST, "/v1/count") => {}
+            (_, "/health" | "/v1/models" | "/v1/chat/completions" | "/v1/count") => {
                 return error_response(
                     StatusCode::METHOD_NOT_ALLOWED,
                     "method not allowed",
@@ -271,10 +298,15 @@ impl<E: Executor + 'static> Host<E> {
         };
         let limits = ModelLimits {
             model: &self.config.model,
-            context_tokens: self.config.context_tokens,
+            context_tokens: if count_only {
+                self.count_input.context_tokens
+            } else {
+                self.config.context_tokens
+            },
             vocabulary: self.config.vocabulary,
             output_capacity: self.config.output_capacity,
             forced_quantum: self.config.forced_quantum,
+            method: self.config.method,
         };
         let selection = TemplateSelection {
             variant: self.config.template_variant.as_deref(),
@@ -287,6 +319,30 @@ impl<E: Executor + 'static> Host<E> {
                     return error_response(StatusCode::BAD_REQUEST, &error, "invalid_request_error")
                 }
             };
+        let prepare_input = if count_only {
+            &self.count_input.prepare
+        } else {
+            &self.prepare_input
+        };
+        let input = match prepare_input(&prepared) {
+            Ok(input) => input,
+            Err(error) => {
+                return error_response(StatusCode::BAD_REQUEST, &error, "invalid_request_error")
+            }
+        };
+        if count_only {
+            return json_response(StatusCode::OK, count_value(&input));
+        }
+        let generation = match self.vocabulary.borrow_mut().prepare_generation_for_input(
+            prepared.chat.input(),
+            prepared.options.clone(),
+            &input,
+        ) {
+            Ok(generation) => generation,
+            Err(error) => {
+                return error_response(StatusCode::BAD_REQUEST, &error, "invalid_request_error")
+            }
+        };
         let next = self.next.get();
         let Some(following) = next.checked_add(1) else {
             return error_response(
@@ -310,11 +366,12 @@ impl<E: Executor + 'static> Host<E> {
                         body.include_usage(),
                         host.config.max_response_bytes,
                     )?;
-                    let mut session = Session::open(
+                    let mut session = Session::open_seed(
                         &host.client,
-                        &prepared.chat,
+                        &prepared,
+                        input,
                         &host.tokenizer,
-                        prepared.options,
+                        generation,
                         body.stops().to_vec(),
                         host.config.max_response_bytes,
                     )
@@ -360,11 +417,12 @@ impl<E: Executor + 'static> Host<E> {
                 .unwrap()
         } else {
             let result: Result<Vec<u8>, String> = async {
-                let mut session = Session::open(
+                let mut session = Session::open_seed(
                     &self.client,
-                    &prepared.chat,
+                    &prepared,
+                    input,
                     &self.tokenizer,
-                    prepared.options,
+                    generation,
                     body.stops().to_vec(),
                     self.config.max_response_bytes,
                 )
@@ -387,6 +445,11 @@ impl<E: Executor + 'static> Host<E> {
         }
     }
 }
+
+fn count_value(input: &PreparedModelInput) -> serde_json::Value {
+    json!({"prompt_tokens": input.tokens().len()})
+}
+
 async fn read_body(mut body: Incoming, limit: usize) -> Result<Vec<u8>, (StatusCode, String)> {
     let mut bytes = Vec::new();
     while let Some(frame) = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {

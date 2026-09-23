@@ -1,0 +1,13 @@
+[package]
+name = "magnitude-model-executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+magnitude-artifacts = { path = "../artifacts" }
+magnitude-model-batching = { path = "../model-batching" }
+magnitude-model-contracts = { path = "../model-contracts" }
+magnitude-model-kernels = { path = "../model-kernels" }
+magnitude-model-state = { path = "../model-state" }
+seismic.workspace = true

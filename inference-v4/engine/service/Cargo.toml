@@ -1,0 +1,12 @@
+[package]
+name = "magnitude-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+magnitude-artifacts = { path = "../artifacts" }
+magnitude-generation = { path = "../generation" }
+magnitude-model-contracts = { path = "../model-contracts" }
+magnitude-model-executor = { path = "../model-executor" }
+magnitude-model-state = { path = "../model-state" }

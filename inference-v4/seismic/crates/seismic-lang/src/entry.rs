@@ -470,6 +470,12 @@ impl CompiledDimensionInferencePlan {
                 }
             }
             values.bind(step.dimension, SymbolValue::Nat(value));
+        }
+        // A step may isolate its dimension using an observed axis that names
+        // another dimension not yet bound by this plan. Validate the complete
+        // authored equations only after every dimension has a value.
+        for step in &self.steps {
+            let actual = observations[step.observation];
             if step.axis.evaluate(values).ok() != Some(actual) {
                 return Err(DimensionInferenceFailure {
                     observation: step.observation,
@@ -3048,6 +3054,35 @@ pub(crate) mod internals {
 #[cfg(test)]
 mod dimension_inference_tests {
     use super::*;
+
+    #[test]
+    fn observed_known_axis_can_precede_its_dimension_binding() {
+        let mut arena = ExprArena::new();
+        let schema = CallSchema::fresh_id();
+        let (x_symbol, x) = arena.call_dimension(CallSchema::dimension_id(schema, 0));
+        let (y_symbol, y) = arena.call_dimension(CallSchema::dimension_id(schema, 1));
+        let sum = arena.nat_add(x, y);
+        let plan = DimensionInferencePlan::new(
+            2,
+            vec![
+                (
+                    x_symbol,
+                    0,
+                    sum,
+                    vec![DimensionInferenceOp::Subtract(
+                        DimensionInferenceKnown::Observation(1),
+                    )],
+                ),
+                (y_symbol, 1, y, Vec::new()),
+            ],
+        )
+        .compile(&arena, &PartialAssignment::new());
+
+        let mut values = InvocationValues::new();
+        plan.infer(&[5, 2], &mut values).unwrap();
+        assert_eq!(values.get(x_symbol), Some(SymbolValue::Nat(3)));
+        assert_eq!(values.get(y_symbol), Some(SymbolValue::Nat(2)));
+    }
 
     #[test]
     fn sealed_plan_rejects_inexact_and_zero_division() {

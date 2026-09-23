@@ -27,4 +27,6 @@ pub mod api;
 mod backends;
 mod driver;
 mod layout;
+#[cfg(target_os = "macos")]
+pub mod native_graph;
 mod telemetry;

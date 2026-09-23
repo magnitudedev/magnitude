@@ -5,18 +5,18 @@
 //! definition for each class before a plan can be constructed.
 
 use crate::render::{
-    scalar_binary_emission_family, scalar_comparison_emission_family,
-    scalar_conversion_emission_family, scalar_fma_emission_family, ScalarEmissionFamily,
+    ScalarEmissionFamily, scalar_binary_emission_family, scalar_comparison_emission_family,
+    scalar_conversion_emission_family, scalar_fma_emission_family,
 };
 use crate::{Metal, MetalIntrinsic};
 use seismic_compiler::kernel::ops::{ClosedOpView, ClosedPlaceKind, ValueType};
 use seismic_compiler::target::{
     CompositionQualificationCase, CompositionQualificationParts, ConcreteExecutionDemand,
     DemandMode, DemandScope, DeviceContract, DurationInterval, ExecutionDemand, FactProvenance,
-    KernelEmissionLayout, MeasurementBatch, MeasurementSeries, ResourceTopology,
+    KernelEmissionLayout, MeasurementBatch, MeasurementSeries, ResourceTopology, SERVICE_COPY,
+    SERVICE_DATA_CHECK, SERVICE_FILL, SERVICE_SCALAR_MOVE, SERVICE_SCALAR_READ, SERVICE_SUBMISSION,
     ServiceAccuracyClass, ServiceClassId, ServiceCorrelationId, ServiceCurve, ServiceCurveRegime,
-    ServiceDefinition, ServiceQualificationDomain, SERVICE_COPY, SERVICE_DATA_CHECK, SERVICE_FILL,
-    SERVICE_SCALAR_MOVE, SERVICE_SCALAR_READ, SERVICE_SUBMISSION,
+    ServiceDefinition, ServiceQualificationDomain,
 };
 use seismic_lang::expr::{ExprArena, NatExpr};
 use seismic_lang::types::DType;
@@ -469,8 +469,7 @@ pub(crate) fn execution_demand(
 // Fixed opened-device probe suite
 // ---------------------------------------------------------------------------
 
-const PROBE_METHOD: &str =
-    "adjacent-count-v23-closed-helper-service-single-op-integer-selective-matched-contrast-fixed-three-round-pooled-operation-units-bounded-counterbalanced-steady-queue-paired-95pct-confidence/gpu-command-buffer-time";
+const PROBE_METHOD: &str = "adjacent-count-v23-closed-helper-service-single-op-integer-selective-matched-contrast-fixed-three-round-pooled-operation-units-bounded-counterbalanced-steady-queue-paired-95pct-confidence/gpu-command-buffer-time";
 const HOST_METHOD: &str = "adjacent-count-v5-bounded-confidence95/host-monotonic-time";
 const THREAD_METHOD: &str =
     "adjacent-count-v4-fixed-eight-round-blocked-confidence95/thread-cpu-time";
@@ -2423,11 +2422,11 @@ fn probe_source(include_bfloat: bool, include_matrix: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        confidence_interval, emission_class, is_qualified, paired_batch_mean_confidence_interval,
-        paired_difference_confidence_interval, paired_matched_confidence_interval,
-        paired_measurement_batch, probe_source, DurationInterval, F16_TO_F32, F32_COMPARE,
-        F32_DIVIDE, F32_FMA, F32_MIN_MAX, F32_MULTIPLY, F32_REMAINDER, F32_TO_BF16, F32_TO_F16,
-        F32_TO_INTEGER, INTEGER, INTEGER_TO_F32, PROBE_METHOD,
+        DurationInterval, F16_TO_F32, F32_COMPARE, F32_DIVIDE, F32_FMA, F32_MIN_MAX, F32_MULTIPLY,
+        F32_REMAINDER, F32_TO_BF16, F32_TO_F16, F32_TO_INTEGER, INTEGER, INTEGER_TO_F32,
+        PROBE_METHOD, confidence_interval, emission_class, is_qualified,
+        paired_batch_mean_confidence_interval, paired_difference_confidence_interval,
+        paired_matched_confidence_interval, paired_measurement_batch, probe_source,
     };
     use crate::render::ScalarEmissionFamily;
 
@@ -2464,9 +2463,11 @@ mod tests {
     fn paired_gpu_confidence_rejects_a_nonpositive_round_mean() {
         let small = [1_200; 4];
         let large = [1_000; 4];
-        assert!(paired_difference_confidence_interval(&small, &large, 10, 0)
-            .unwrap()
-            .is_none());
+        assert!(
+            paired_difference_confidence_interval(&small, &large, 10, 0)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

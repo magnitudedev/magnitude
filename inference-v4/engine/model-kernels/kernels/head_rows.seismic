@@ -1,0 +1,44 @@
+# Draft-head input publication. Attention, dense feed-forward, and final norm
+# reuse the identical checked decoder entries; this entry owns the only
+# head-specific equation: normalized successor embedding + normalized target
+# feature followed by the 2D -> D combining projection.
+fn qwen_head_rows[M, V, D](tokens: &tensor[M] i32, table: &tensor[V, D] EW,
+    conditioning: &tensor[M, D] A, embedding_norm: &tensor[D] EN,
+    hidden_norm: &tensor[D] HN, combine: &tensor[D, 2 * D] CW,
+    epsilon: f32) -> tensor[M, D] f32:
+    let mut embedded = tensor[M, D] A
+    let mut normalized_embedding = tensor[M, D] A
+    let mut normalized_hidden = tensor[M, D] A
+    let mut joined = tensor[M, 2 * D] A
+    let mut result = tensor[M, D] f32
+    for row in 0..M:
+        for column in 0..2 * D:
+            joined[row, column] = 0.0
+        for column in 0..D:
+            result[row, column] = 0.0
+    parallel for row in 0..M:
+        parallel for column in 0..D:
+            embedded[row, column] = f32(table[tokens[row], column])
+    rms_norm(embedded, embedding_norm, normalized_embedding, epsilon)
+    rms_norm(conditioning, hidden_norm, normalized_hidden, epsilon)
+    parallel for row in 0..M:
+        parallel for column in 0..D:
+            joined[row, column] = normalized_embedding[row, column]
+            joined[row, D + column] = normalized_hidden[row, column]
+    linear(joined, combine, result)
+    return result
+
+native qwen_head_rows for metal from "metal/qwen_head_rows.metal":
+    threadgroups (ceil_div(M * D, 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+fn head_logits_rows[O, V, D](features: &tensor[O, D] A,
+    weight: &tensor[V, D] OW) -> tensor[O, V] f32:
+    let mut logits = tensor[O, V] f32
+    linear(features, weight, logits)
+    return logits
+
+native head_logits_rows for metal from "metal/head_logits_rows.metal":
+    threadgroups (ceil_div(O * V, 8), 1, 1)
+    threads_per_threadgroup (256, 1, 1)

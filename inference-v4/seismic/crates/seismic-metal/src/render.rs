@@ -15,8 +15,8 @@
 //! then the side block (status word + result slots), then one
 //! `[[threadgroup(k)]]` pointer per workgroup local.
 
-use crate::intrinsic::MetalIntrinsic;
 use crate::Metal;
+use crate::intrinsic::MetalIntrinsic;
 use seismic_compiler::kernel::ops::{
     BarrierScope, BinaryOp, BitOp, Block, ClosedOpView, ClosedPlace, ClosedPlaceKind, ClosedValue,
     CmpOp, ConstantValue, ErasedValue, GeometryValue, LogicOp, LogicalSliceAxis, LogicalTensorMap,
@@ -509,9 +509,24 @@ impl<'a> Renderer<'a> {
                 ));
             }
             let (address, space) = match local.kind {
-                LaunchLocalKind::Workgroup => (format!("seismic_workgroup + seismic_lo{index}"), "threadgroup"),
-                LaunchLocalKind::Participant => (format!("seismic_participant + seismic_participant_linear * seismic_params[{}] + seismic_lo{index}", self.shape.words.local_total_first + 1), "device"),
-                LaunchLocalKind::Register => (format!("seismic_register + seismic_participant_linear * seismic_params[{}] + seismic_lo{index}", self.shape.words.local_total_first + 2), "device"),
+                LaunchLocalKind::Workgroup => (
+                    format!("seismic_workgroup + seismic_lo{index}"),
+                    "threadgroup",
+                ),
+                LaunchLocalKind::Participant => (
+                    format!(
+                        "seismic_participant + seismic_participant_linear * seismic_params[{}] + seismic_lo{index}",
+                        self.shape.words.local_total_first + 1
+                    ),
+                    "device",
+                ),
+                LaunchLocalKind::Register => (
+                    format!(
+                        "seismic_register + seismic_participant_linear * seismic_params[{}] + seismic_lo{index}",
+                        self.shape.words.local_total_first + 2
+                    ),
+                    "device",
+                ),
             };
             let LocalStorage::Pointer { pointer } = &self.locals[index].storage;
             body.push(format!(
@@ -853,7 +868,9 @@ impl<'a> Renderer<'a> {
                 } else {
                     format!("{}u", (1u32 << bits) - 1)
                 };
-                format!("((reinterpret_cast<const device uint*>({base})[({bit}) / 32ul] >> uint(({bit}) % 32ul)) & {mask})")
+                format!(
+                    "((reinterpret_cast<const device uint*>({base})[({bit}) / 32ul] >> uint(({bit}) % 32ul)) & {mask})"
+                )
             }
             PlaneEncoding::FloatCode { format } => {
                 let bits = format.bits();
@@ -975,7 +992,9 @@ impl<'a> Renderer<'a> {
             | ClosedOpView::VectorReduceAdd { .. }
             | ClosedOpView::VectorRead { .. }
             | ClosedOpView::VectorWrite { .. } => {
-                panic!("closed Metal kernel contains a vector operation although the target profile advertises an empty VectorSupport")
+                panic!(
+                    "closed Metal kernel contains a vector operation although the target profile advertises an empty VectorSupport"
+                )
             }
             ClosedOpView::ApproximateMath { op, out, a } => {
                 let expression = math_expr(op, &a.ty, self.name(raw(a)));
@@ -1409,7 +1428,9 @@ impl<'a> Renderer<'a> {
                     ReduceOp::Max => "simd_max",
                     ReduceOp::Min => "simd_min",
                     ReduceOp::Argmax => {
-                        unreachable!("the registry has no argmax subgroup collective (argmax never reassociates)")
+                        unreachable!(
+                            "the registry has no argmax subgroup collective (argmax never reassociates)"
+                        )
                     }
                 };
                 let expression = format!("{collective}({})", self.name(args[0]));
@@ -1768,7 +1789,7 @@ fn math_expr(op: MathOp, ty: &ValueType, a: &str) -> String {
             return match scalar_kind(ty) {
                 Kind::Float => format!("fabs({a})"),
                 Kind::Int | Kind::Bool => format!("abs({a})"),
-            }
+            };
         }
         MathOp::Fma | MathOp::Max | MathOp::Min => unreachable!(
             "`{:?}` is a multi-operand op the builder lowers through `Fma`/`Binary`, never `Math`",
@@ -1802,17 +1823,17 @@ fn cast_expr(from: &ValueType, to: &ValueType, a: &str) -> String {
                     format!("uint(clamp(trunc(float({a})), 0.0f, 4294967295.0f))")
                 }
                 _ => unreachable!("F32-to-integer emission has an integer destination"),
-            }
+            };
         }
         Some(ScalarEmissionFamily::IntegerToF32) => return format!("{to_name}({a})"),
         _ => {}
     }
     match (from, to) {
         (ValueType::Scalar(DType::F16), ValueType::Scalar(DType::BF16)) => {
-            return format!("seismic_bf16_narrow(f16_to_f32({a}))")
+            return format!("seismic_bf16_narrow(f16_to_f32({a}))");
         }
         (ValueType::Scalar(DType::BF16), ValueType::Scalar(DType::F16)) => {
-            return format!("f32_to_f16(seismic_bf16_widen({a}))")
+            return format!("f32_to_f16(seismic_bf16_widen({a}))");
         }
         _ => {}
     }

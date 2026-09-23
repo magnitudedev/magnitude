@@ -4,7 +4,10 @@
 # Output pairs are (token, status): 0 success, 1 empty, 2 nonfinite source.
 fn sample_rows[M, V](logits: &tensor[M, V] f32, mask: &tensor[M, (V + 31) / 32] u32,
     draws: &tensor[M, 6] u32, result: &mut tensor[M, 2] i32):
-    parallel for rows in 0..M:
+    # Row-local reductions are whole-tensor intrinsics, which Seismic cannot
+    # currently lower inside a parallel loop. The native Metal implementation
+    # dispatches rows independently.
+    for rows in 0..M:
         let mut scores = tensor[V] f32
         let mut invalid = tensor[V] i32
         for token in 0..V:

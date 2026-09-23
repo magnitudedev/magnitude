@@ -1,0 +1,125 @@
+# Native attention is explicitly staged so normalization, Q/K/V projection,
+# stable softmax, and output projection are each computed once. History is
+# committed only by the final stage, after all visible and fresh reads finish.
+fn qwen_attention_normalize[M, D](hidden: &tensor[M, D] f32,
+    input_norm: &tensor[D] NW, epsilon: f32) -> tensor[M, D] A:
+    let mut normalized = tensor[M, D] A
+    rms_norm(hidden, input_norm, normalized, epsilon)
+    return normalized
+
+native qwen_attention_normalize for metal from "metal/qwen_attention_normalize.metal":
+    threadgroups (ceil_div(M, 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+# query_norm fixes W for the checked flattened KV*G*W projection shape.
+# It is a real model tensor consumed numerically by qwen_attention_prepare.
+fn qwen_attention_project[M, D, KV, G, W](normalized: &tensor[M, D] A,
+    query_norm: &tensor[W] f32, query_gate_weight: &tensor[KV * G * 2 * W, D] QW,
+    key_weight: &tensor[KV * W, D] KW, value_weight: &tensor[KV * W, D] VW)
+    -> (tensor[M, KV * G * 2 * W] A, tensor[M, KV * W] A, tensor[M, KV * W] A):
+    let mut query_gate = tensor[M, KV * G * 2 * W] A
+    let mut key = tensor[M, KV * W] A
+    let mut value = tensor[M, KV * W] A
+    linear(normalized, query_gate_weight, query_gate)
+    linear(normalized, key_weight, key)
+    linear(normalized, value_weight, value)
+    return query_gate, key, value
+
+native qwen_attention_project for metal from "metal/qwen_attention_project.metal":
+    threadgroups (ceil_div(ceil_div(M, 8) * (KV * G * 2 * W + KV * W * 2), 8), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+fn qwen_attention_prepare[M, KV, G, P, S](query_gate: &tensor[M, KV * G * 2 * (2 * P + S)] A,
+    key: &tensor[M, KV * (2 * P + S)] A, query_norm: &tensor[2 * P + S] f32,
+    key_norm: &tensor[2 * P + S] f32, coordinates: &tensor[M, 4] i32,
+    rotary_components: &tensor[P] i32, base: f32, epsilon: f32)
+    -> (tensor[M, KV * G, 2 * P + S] A, tensor[M, KV, 2 * P + S] A,
+        tensor[M, KV * G, 2 * P + S] A):
+    let mut query = tensor[M, KV * G, 2 * P + S] A
+    let mut prepared_key = tensor[M, KV, 2 * P + S] A
+    let mut gate = tensor[M, KV * G, 2 * P + S] A
+    rotary_prepare(query_gate, key, query_norm, key_norm, coordinates, query,
+        prepared_key, reshape(gate, (M, KV * G * (2 * P + S))), rotary_components,
+        base, epsilon)
+    return query, prepared_key, gate
+
+native qwen_attention_prepare for metal from "metal/qwen_attention_prepare.metal":
+    threadgroups (ceil_div(M * (KV * G + KV), 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+fn qwen_attention_attend[M, T, KV, G, W, R](query: &tensor[M, KV * G, W] A,
+    prepared_key: &tensor[M, KV, W] A, value: &tensor[M, KV * W] A,
+    gate: &tensor[M, KV * G, W] A, visible: &tensor[M, R, 2] i32,
+    fresh: &tensor[M, 2] i32, history_key: &tensor[T, KV, W] A,
+    history_value: &tensor[T, KV, W] A,
+    accumulator: &mut tensor[M, KV * G, W] f32, scale: f32)
+    -> tensor[M, KV * G, W] A:
+    let mut attended = tensor[M, KV * G, W] A
+    let mut activated = tensor[M, KV * G * W] A
+    let mut gated = tensor[M, KV * G * W] A
+    for row in 0..M:
+        for head in 0..KV * G:
+            for column in 0..W:
+                attended[row, head, column] = 0.0
+        for column in 0..KV * G * W:
+            gated[row, column] = 0.0
+        for kv_head in 0..KV:
+            let qt = query[row, kv_head * G : (kv_head + 1) * G]
+            let mut maximum = tensor[G] f32
+            let mut denominator = tensor[G] f32
+            for head in 0..G:
+                maximum[head] = -inf
+                denominator[head] = 0.0
+                for column in 0..W:
+                    accumulator[row, kv_head * G + head, column] = 0.0
+            for span in 0..R:
+                let lo = visible[row, span, 0]
+                let hi = visible[row, span, 1]
+                if hi > lo:
+                    attention_update(qt, history_key[lo : hi, kv_head],
+                        history_value[lo : hi, kv_head], maximum, denominator,
+                        accumulator[row, kv_head * G : (kv_head + 1) * G], scale)
+            let fresh_lo = fresh[row, 0]
+            let fresh_hi = fresh[row, 1]
+            if fresh_hi > fresh_lo:
+                attention_update(qt, prepared_key[fresh_lo : fresh_hi, kv_head],
+                    reshape(value, (M, KV, W))[fresh_lo : fresh_hi, kv_head],
+                    maximum, denominator,
+                    accumulator[row, kv_head * G : (kv_head + 1) * G], scale)
+            for head in 0..G:
+                for column in 0..W:
+                    let mut a = 0.0
+                    if denominator[head] > 0.0:
+                        a = accumulator[row, kv_head * G + head, column] / denominator[head]
+                    attended[row, kv_head * G + head, column] = a
+    sigmoid(reshape(gate, (M, KV * G * W)), activated)
+    multiply(reshape(attended, (M, KV * G * W)), activated, gated)
+    return reshape(gated, (M, KV * G, W))
+
+native qwen_attention_attend for metal from "metal/qwen_attention_attend.metal":
+    threadgroups (KV * G, ceil_div(M, 8), 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+fn qwen_attention_output[M, D, T, KV, G, W](hidden: &tensor[M, D] f32,
+    gated: &tensor[M, KV * G, W] A, prepared_key: &tensor[M, KV, W] A,
+    value: &tensor[M, KV * W] A, output_weight: &tensor[D, KV * G * W] OW,
+    destinations: &tensor[M] i32, history_key: &mut tensor[T, KV, W] A,
+    history_value: &mut tensor[T, KV, W] A) -> tensor[M, D] f32:
+    let mut projected = tensor[M, D] A
+    let mut result = tensor[M, D] f32
+    linear(reshape(gated, (M, KV * G * W)), output_weight, projected)
+    add(hidden, projected, result)
+    for row in 0..M:
+        if destinations[row] >= 0:
+            for head in 0..KV:
+                history_key[destinations[row], head] = prepared_key[row, head]
+                history_value[destinations[row], head] = reshape(value, (M, KV, W))[row, head]
+    return result
+
+native qwen_attention_output for metal from "metal/qwen_attention_output.metal":
+    threadgroups (ceil_div(ceil_div(M, 8) * D, 8) + ceil_div(M * KV * W, 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)

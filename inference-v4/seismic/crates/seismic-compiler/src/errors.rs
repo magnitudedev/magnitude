@@ -48,6 +48,8 @@ pub enum PreparationError {
     TargetDomainUnrepresentable(String),
     SolverResourceExhausted(SolverBudgetReport),
     NativeCompilation(NativeCompilationError),
+    /// A direct native entry could not reserve its fixed invocation storage.
+    NativeWorkspaceAllocation(String),
     /// The checked reference implementation could not establish total
     /// post-native legality and duration coverage over the target domain.
     UniversalClosure(String),
@@ -172,6 +174,7 @@ impl fmt::Display for PreparationError {
                 r.phase, r.work_units
             ),
             Self::NativeCompilation(e) => write!(f, "native compilation failed: {e}"),
+            Self::NativeWorkspaceAllocation(s) => write!(f, "native invocation workspace: {s}"),
             Self::UniversalClosure(s) => write!(f, "universal implementation is not total: {s}"),
         }
     }

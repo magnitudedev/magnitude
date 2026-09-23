@@ -96,6 +96,10 @@ flowchart TD
 The scheduler is an injected engine component. Generation methods define what a
 step means; executors expose compatibility, cost, and resource requirements.
 Models, kernels, and streaming implementations introduce no scheduler branches.
+The service owner is generic over the numerical program family; it observes the same typed
+completion and reconciliation lifecycle whether that family returns ready or pending submissions.
+The root closes the family type at worker construction, leaving the host command interface
+non-generic.
 Prompt processing exposes ordinary causal model operations too. Shared device
 completion precedes each request's prompt-feature publication and checkpointing.
 Phase feedback counts physical service once; per-request metrics include the

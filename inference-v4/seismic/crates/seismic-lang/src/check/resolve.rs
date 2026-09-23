@@ -932,20 +932,43 @@ fn contract_mismatch(a: &Sig, b: &Sig) -> Option<String> {
     None
 }
 
-/// Concrete elements a lowering fixes where the matched contract has an element parameter.
+/// Element names or concrete elements an implementation binds relative to
+/// its family's contract. Generic element names are lexical to one
+/// declaration, so two equivalent implementations may spell them differently.
 fn elem_bindings(contract: &Sig, lowering: &Sig) -> Vec<(String, Elem)> {
-    let mut out: Vec<(String, Elem)> = Vec::new();
-    for (c, l) in contract.params.iter().zip(&lowering.params) {
-        if let (Some(cs), Some(ls)) = (c.ty.shaped(), l.ty.shaped()) {
-            if let (Elem::Param(p), concrete @ (Elem::Dtype(_) | Elem::Repr(_))) =
-                (&cs.elem, &ls.elem)
-            {
-                if !out.iter().any(|(n, _)| n == p) {
-                    out.push((p.clone(), concrete.clone()));
+    fn collect(contract: &ValueType, lowering: &ValueType, out: &mut Vec<(String, Elem)>) {
+        match (contract, lowering) {
+            (ValueType::Tuple(contract), ValueType::Tuple(lowering)) => {
+                for (contract, lowering) in contract.iter().zip(lowering.iter()) {
+                    collect(contract, lowering, out);
                 }
             }
+            (ValueType::Tensor(cs), ValueType::Tensor(ls)) => {
+                if let Elem::Param(contract_name) = &cs.elem {
+                    let implementation = &ls.elem;
+                    if let Elem::Param(implementation_name) = implementation {
+                        if contract_name != implementation_name
+                            && !out.iter().any(|(name, _)| name == implementation_name)
+                        {
+                            out.push((
+                                implementation_name.clone(),
+                                Elem::Param(contract_name.clone()),
+                            ));
+                        }
+                    } else if !out.iter().any(|(name, _)| name == contract_name) {
+                        out.push((contract_name.clone(), implementation.clone()));
+                    }
+                }
+            }
+            _ => {}
         }
     }
+
+    let mut out: Vec<(String, Elem)> = Vec::new();
+    for (contract, lowering) in contract.params.iter().zip(&lowering.params) {
+        collect(&contract.ty, &lowering.ty, &mut out);
+    }
+    collect(&contract.result, &lowering.result, &mut out);
     out
 }
 
@@ -1072,6 +1095,15 @@ pub(crate) fn resolve<'a>(
             u32::try_from(i).expect("module has more than u32::MAX definitions"),
         );
         families[family].bodies.push(id);
+    }
+    for family in &families {
+        let contract = family.contract.index();
+        for body in &family.bodies {
+            if body.index() != contract {
+                declared[body.index()].elem_bindings =
+                    elem_bindings(&declared[contract].sig, &declared[body.index()].sig);
+            }
+        }
     }
 
     // Lowerings attach to the portable family their restated signature overlaps.

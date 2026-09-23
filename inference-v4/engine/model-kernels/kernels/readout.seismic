@@ -1,0 +1,61 @@
+# Packed target readout variants. Rows are selected explicitly so a mixed
+# launch never publishes state-only rows to the host-facing generation path.
+fn qwen_readout_rows[M, O, V, D](hidden: &tensor[M, D] f32,
+    norm: &tensor[D] NW, weight: &tensor[V, D] OW,
+    out_rows: &tensor[O] i32, epsilon: f32)
+    -> (tensor[O, D] A, tensor[O, V] f32):
+    let mut selected = tensor[O, D] f32
+    let mut features = tensor[O, D] A
+    let mut logits = tensor[O, V] f32
+    parallel for row in 0..O:
+        parallel for col in 0..D:
+            selected[row, col] = hidden[out_rows[row], col]
+    rms_norm(selected, norm, features, epsilon)
+    linear(features, weight, logits)
+    return features, logits
+
+native qwen_readout_rows for metal from "metal/qwen_readout_rows.metal":
+    threadgroups (ceil_div(O * (D + V), 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+fn qwen_features_rows[M, O, D](hidden: &tensor[M, D] f32,
+    norm: &tensor[D] NW, out_rows: &tensor[O] i32,
+    epsilon: f32) -> tensor[O, D] A:
+    let mut selected = tensor[O, D] f32
+    let mut features = tensor[O, D] A
+    parallel for row in 0..O:
+        parallel for col in 0..D:
+            selected[row, col] = hidden[out_rows[row], col]
+    rms_norm(selected, norm, features, epsilon)
+    return features
+
+native qwen_features_rows for metal from "metal/qwen_features_rows.metal":
+    threadgroups (ceil_div(O, 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+fn qwen_selected_rows[M, O, V, D, Sv](hidden: &tensor[M, D] f32,
+    norm: &tensor[D] NW, weight: &tensor[V, D] OW,
+    out_rows: &tensor[O] i32, selected: &tensor[Sv] i32,
+    epsilon: f32) -> (tensor[O, D] A, tensor[O, Sv] f32):
+    let mut demanded = tensor[O, D] f32
+    let mut features = tensor[O, D] A
+    let mut logits = tensor[O, Sv] f32
+    parallel for row in 0..O:
+        parallel for col in 0..D:
+            demanded[row, col] = hidden[out_rows[row], col]
+    rms_norm(demanded, norm, features, epsilon)
+    parallel for row in 0..O:
+        parallel for col in 0..Sv:
+            let acc = matmul(
+                features[row : row + 1],
+                f32(weight[selected[col] : selected[col] + 1]),
+                zeros_like(logits[row : row + 1, col : col + 1], dtype=f32),
+            )
+            logits[row, col] = acc[0, 0]
+    return features, logits
+
+native qwen_selected_rows for metal from "metal/qwen_selected_rows.metal":
+    threadgroups (ceil_div(O * (D + Sv), 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)

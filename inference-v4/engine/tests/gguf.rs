@@ -1,5 +1,8 @@
 //! Cases mirror V3 tests/weights/test_gguf.py, including its source byte layout.
-use magnitude_engine::weights::gguf::{self, ByteOrder, Encoding, Scalar, Value};
+use magnitude_artifacts::{
+    gguf::{self, ByteOrder, Encoding, Scalar, Value},
+    Error,
+};
 use std::io::{Cursor, Read, Seek, SeekFrom};
 struct Bytes {
     value: Vec<u8>,
@@ -67,7 +70,7 @@ fn container(
 fn entry() -> Entry<'static> {
     ("weight", vec![256, 2], Encoding::Q4K as u32, 0)
 }
-fn read(bytes: Vec<u8>) -> Result<gguf::Directory, magnitude_engine::weights::Error> {
+fn read(bytes: Vec<u8>) -> Result<gguf::Directory, Error> {
     gguf::read_directory(&mut Cursor::new(bytes), gguf::DEFAULT_HEADER_LIMIT)
 }
 #[test]
@@ -230,38 +233,22 @@ fn declaration_order_does_not_depend_on_physical_order() {
 
 #[test]
 fn artifact_pins_validated_source_and_codec_descriptions() {
-    use magnitude_engine::weights::descriptor::{Stored, Transform, WeightDescriptor};
     let root = std::env::temp_dir().join(format!("seismic-gguf-artifact-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("model.gguf");
     let original = container(false, &[entry()], &[], 32);
     std::fs::write(&path, &original).unwrap();
     let artifact = gguf::GgufArtifact::open(&path).unwrap();
-    let descriptor = WeightDescriptor {
-        name: "weight".into(),
-        shape: vec![2, 256],
-        transform: Transform::Identity,
-    };
-    let stored = artifact.stored(&descriptor).unwrap();
+    let stored = artifact.tensor("weight").unwrap();
     // Replacing the pathname cannot redirect stored reads to a different inode.
     let replacement = root.join("replacement.gguf");
     std::fs::write(&replacement, vec![0xa5; original.len()]).unwrap();
     std::fs::rename(&replacement, &path).unwrap();
-    let Stored::GgmlBlocks {
-        source,
-        offset,
-        nbytes,
-        shape,
-        encoding,
-    } = stored
-    else {
-        panic!()
-    };
-    assert_eq!(shape, [2, 256]);
-    assert_eq!(encoding, Encoding::Q4K);
-    assert_eq!(nbytes, 288);
+    assert_eq!(stored.shape, [2, 256]);
+    assert_eq!(stored.encoding, Encoding::Q4K);
+    assert_eq!(stored.nbytes, 288);
     drop(artifact);
-    assert_eq!(source.read(offset, nbytes as usize).unwrap(), vec![0; 288]);
+    assert_eq!(stored.read().unwrap(), vec![0; 288]);
     std::fs::write(&path, container(true, &[entry()], &[], 32)).unwrap();
     assert!(gguf::GgufArtifact::open(&path).is_err());
     std::fs::remove_dir_all(root).unwrap();

@@ -1,6 +1,6 @@
 use magnitude_engine::{
     chat::{
-        wire::{ModelLimits, Request},
+        wire::{MethodPolicy, ModelLimits, Request},
         TemplateBundle, TemplateSelection, TemplateVariant,
     },
     generation::Sampling,
@@ -56,14 +56,14 @@ fn preparation() -> (TemplateBundle, ByteBpeTokenizer) {
 #[test]
 fn unsupported_and_malformed_wire_policies_fail_before_preparation() {
     for (field, value) in [
-        ("temperature", json!(0.5)),
+        ("temperature", json!(-0.5)),
         ("temperature", json!("1")),
-        ("top_p", json!(0.9)),
-        ("top_k", json!(1)),
-        ("min_p", json!(0.1)),
-        ("repetition_penalty", json!(1.1)),
-        ("presence_penalty", json!(-1)),
-        ("frequency_penalty", json!(1)),
+        ("top_p", json!(0.0)),
+        ("top_k", json!(u64::from(u32::MAX) + 1)),
+        ("min_p", json!(1.1)),
+        ("repetition_penalty", json!(0.0)),
+        ("presence_penalty", json!(1e300)),
+        ("frequency_penalty", json!(-1e300)),
         ("seed", json!(-1)),
         ("seed", json!(1.5)),
         ("n", json!(2)),
@@ -110,6 +110,7 @@ fn aliases_defaults_unicode_stops_and_context_limits_follow_v3() {
         vocabulary: 257,
         output_capacity: 4,
         forced_quantum: 2,
+        method: MethodPolicy::Plain,
     };
     let default = parse(&body()).unwrap();
     assert_eq!(default.output_limit(), 512);
@@ -127,6 +128,31 @@ fn aliases_defaults_unicode_stops_and_context_limits_follow_v3() {
     assert_eq!(prepared.chat.prompt_tokens(), 5);
     assert_eq!(prepared.options.max_tokens, 4);
     assert_eq!(prepared.options.sampling, Sampling::Categorical);
+    assert_eq!(
+        prepared.options.method,
+        magnitude_engine::generation::MethodChoice::Plain
+    );
+    let mtp_limits = ModelLimits {
+        method: MethodPolicy::Mtp {
+            greedy_proposals: 3,
+            sampled_proposals: 1,
+        },
+        ..limits
+    };
+    assert_eq!(
+        default
+            .prepare(
+                &bundle,
+                &tokenizer,
+                &TemplateSelection::default(),
+                0,
+                &mtp_limits,
+            )
+            .unwrap()
+            .options
+            .method,
+        magnitude_engine::generation::MethodChoice::Mtp { proposals: 1 }
+    );
     let mut raw = body();
     raw["max_tokens"] = json!(0);
     raw["max_completion_tokens"] = json!(0);
@@ -215,6 +241,7 @@ fn tool_schema_policy_and_unconnected_media_are_explicit() {
         vocabulary: 257,
         output_capacity: 4,
         forced_quantum: 0,
+        method: MethodPolicy::Plain,
     };
     let structured = parse(&schema)
         .unwrap()
@@ -237,6 +264,7 @@ fn tool_schema_policy_and_unconnected_media_are_explicit() {
         vocabulary: 257,
         output_capacity: 4,
         forced_quantum: 0,
+        method: MethodPolicy::Plain,
     };
     assert!(request
         .prepare(

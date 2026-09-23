@@ -1,0 +1,28 @@
+# Dense plane row movement used by state compaction. Packed codecs bind their
+# individual dense planes to this entry; packed logical representations are not
+# accepted by the native implementation.
+fn copy_rows[N, TS, TD, KV, W](src: &tensor[TS, KV, W] A,
+    dst: &mut tensor[TD, KV, W] A, from: &tensor[N] i32,
+    to: &tensor[N] i32):
+    for item in 0..N:
+        parallel for head in 0..KV:
+            for column in 0..W:
+                dst[to[item], head, column] = src[from[item], head, column]
+
+native copy_rows for metal from "metal/copy_rows.metal":
+    threadgroups (ceil_div(N * KV * W, 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+# Dense row gather used to compact arbitrary demanded logits before shaping.
+fn gather_rows[M, O, D](source: &tensor[M, D] f32,
+    rows: &tensor[O] i32) -> tensor[O, D] f32:
+    let mut result = tensor[O, D] f32
+    parallel for row in 0..O:
+        parallel for col in 0..D:
+            result[row, col] = source[rows[row], col]
+    return result
+
+native gather_rows for metal from "metal/gather_rows.metal":
+    threadgroups (ceil_div(O * D, 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)

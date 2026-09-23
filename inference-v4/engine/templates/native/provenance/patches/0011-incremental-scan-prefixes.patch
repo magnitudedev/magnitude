@@ -1,0 +1,113 @@
+--- a/common/peg-parser.h
++++ b/common/peg-parser.h
+@@ -4,6 +4,7 @@
+ #include "json.h"
+ 
+ #include <memory>
++#include <map>
+ #include <set>
+ #include <unordered_map>
+ #include <string>
+@@ -171,6 +172,19 @@
+     common_peg_ast_arena ast;
+ 
+     int parse_depth;
++
++    // Opt-in only for an immutable arena and an append-only input. Cache complete
++    // scanner prefixes, never PEG choices/results or provisional delimiters.
++    bool append_only = false;
++    struct scan_progress { size_t position; int count; };
++    std::map<std::pair<common_peg_parser_id, size_t>, scan_progress> scans;
++    scan_progress * scan(common_peg_parser_id parser, size_t start) {
++        if (!append_only) { return nullptr; }
++        const auto key = std::make_pair(parser, start);
++        if (auto found = scans.find(key); found != scans.end()) { return &found->second; }
++        if (scans.size() >= 65536) { scans.clear(); }
++        return &scans.emplace(key, scan_progress{start, 0}).first->second;
++    }
+ 
+     common_peg_parse_context(common_peg_parse_flags flags = COMMON_PEG_PARSE_FLAG_NONE)
+         : flags(flags), parse_depth(0) {}
+--- a/common/peg-parser.cpp
++++ b/common/peg-parser.cpp
+@@ -207,9 +207,10 @@
+     const common_peg_arena & arena;
+     common_peg_parse_context & ctx;
+     size_t start_pos;
+-
+-    parser_executor(const common_peg_arena & arena, common_peg_parse_context & ctx, size_t start)
+-        : arena(arena), ctx(ctx), start_pos(start) {}
++    common_peg_parser_id parser_id;
++
++    parser_executor(const common_peg_arena & arena, common_peg_parse_context & ctx, size_t start, common_peg_parser_id id)
++        : arena(arena), ctx(ctx), start_pos(start), parser_id(id) {}
+ 
+     std::string debug_indent() const { return std::string(ctx.parse_depth * 2, ' '); }
+ 
+@@ -505,8 +506,9 @@
+     }
+ 
+     common_peg_parse_result operator()(const common_peg_chars_parser & p) const {
+-        auto pos = start_pos;
+-        int match_count = 0;
++        auto progress = ctx.scan(parser_id, start_pos);
++        auto pos = progress ? progress->position : start_pos;
++        int match_count = progress ? progress->count : 0;
+ 
+         // Try to match up to max_count times (or unlimited if max_count is -1)
+         while (p.max_count == -1 || match_count < p.max_count) {
+@@ -551,6 +553,7 @@
+             if (matches) {
+                 pos += result.bytes_consumed;
+                 ++match_count;
++                if (progress) { *progress = {pos, match_count}; }
+             } else {
+                 // Character doesn't match, stop matching
+                 break;
+@@ -617,7 +620,8 @@
+     }
+ 
+     common_peg_parse_result operator()(const common_peg_string_parser & p) {
+-        auto pos = start_pos;
++        auto progress = ctx.scan(parser_id, start_pos);
++        auto pos = progress ? progress->position : start_pos;
+ 
+         // Parse string content (without quotes)
+         while (pos < ctx.input.size()) {
+@@ -649,6 +653,7 @@
+ 
+                 pos += utf8_result.bytes_consumed;
+             }
++            if (progress) { progress->position = pos; }
+         }
+ 
+         // Reached end without finding closing quote
+@@ -662,8 +667,9 @@
+         common_trie matcher(p.delimiters);
+ 
+         // Scan input and check for delimiters
+-        size_t pos = start_pos;
+-        size_t last_valid_pos = start_pos;
++        auto progress = ctx.scan(parser_id, start_pos);
++        size_t pos = progress ? progress->position : start_pos;
++        size_t last_valid_pos = pos;
+ 
+         while (pos < ctx.input.size()) {
+             auto utf8_result = common_parse_utf8_codepoint(ctx.input, pos);
+@@ -698,6 +704,7 @@
+ 
+             pos += utf8_result.bytes_consumed;
+             last_valid_pos = pos;
++            if (progress) { progress->position = pos; }
+         }
+ 
+         if (last_valid_pos == ctx.input.size() && ctx.is_lenient()) {
+@@ -799,7 +806,7 @@
+ common_peg_parse_result common_peg_arena::parse(common_peg_parser_id id, common_peg_parse_context & ctx, size_t start) const {
+     // Execute parser
+     const auto & parser = parsers_.at(id);
+-    parser_executor exec(*this, ctx, start);
++    parser_executor exec(*this, ctx, start, id);
+     return std::visit(exec, parser);
+ }
+ 

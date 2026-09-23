@@ -1,0 +1,183 @@
+# Checked vision entries; model definitions supply family geometry and weights.
+fn qwen_vision_position_add[M, H, L](projected: &tensor[M, H] A,
+    table: &tensor[H, L] PE, indices: &tensor[M, 4] i32,
+    coefficients: &tensor[M, 4] f32, out: &mut tensor[M, H] A):
+    parallel for row in 0..M:
+        let mut rounded = tensor[4] A
+        for i in 0..4:
+            rounded[i] = coefficients[row, i]
+        let mut a = tensor[H] A
+        let mut b = tensor[H] A
+        let mut c = tensor[H] A
+        let mut d = tensor[H] A
+        let mut blended = tensor[H] A
+        for i in 0..H:
+            a[i] = f32(table[i, indices[row, 0]]) * f32(rounded[0])
+            b[i] = f32(table[i, indices[row, 1]]) * f32(rounded[1])
+            c[i] = f32(table[i, indices[row, 2]]) * f32(rounded[2])
+            d[i] = f32(table[i, indices[row, 3]]) * f32(rounded[3])
+            blended[i] = f32(a[i]) + f32(b[i])
+            blended[i] = f32(blended[i]) + f32(c[i])
+            blended[i] = f32(blended[i]) + f32(d[i])
+            out[row, i] = f32(projected[row, i]) + f32(blended[i])
+
+
+fn qwen_vision_stem[M, C, P, H, L](pixels: &tensor[M, C, 2, P, P] f32,
+    temporal_weight_0: &tensor[P, P, C, H] W0,
+    temporal_weight_1: &tensor[P, P, C, H] W1, bias: &tensor[H] B,
+    table: &tensor[H, L] PE, indices: &tensor[M, 4] i32,
+    coefficients: &tensor[M, 4] f32) -> tensor[M, H] A:
+    let mut projected = tensor[M, H] A
+    let mut result = tensor[M, H] A
+    parallel for row in 0..M:
+        parallel for output in 0..H:
+            let mut value = f32(bias[output])
+            for y in 0..P:
+                for x in 0..P:
+                    for channel in 0..C:
+                        value = fma(pixels[row, channel, 0, y, x], f32(temporal_weight_0[y, x, channel, output]), value)
+                        value = fma(pixels[row, channel, 1, y, x], f32(temporal_weight_1[y, x, channel, output]), value)
+            projected[row, output] = value
+    qwen_vision_position_add(projected, table, indices, coefficients, result)
+    return result
+
+native qwen_vision_stem for metal from "metal/qwen_vision_stem.metal":
+    threadgroups (ceil_div(M * H, 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+# Projector GGUF matrices are admitted in source-major layout. Keep that
+# resident layout and transpose logically while multiplying.
+fn qwen_vision_linear_bias_transposed[M, K, N](x: &tensor[M, K] T,
+    weight: &tensor[K, N] W, bias: &tensor[N] B, y: &mut tensor[M, N] V):
+    parallel for row in 0..M:
+        parallel for output in 0..N:
+            let mut value = f32(bias[output])
+            for source in 0..K:
+                value = fma(f32(x[row, source]), f32(weight[source, output]), value)
+            y[row, output] = value
+
+
+fn qwen_vision_rotate[P](source: &tensor[4 * P] A, coordinates: &tensor[2] i32,
+    rotated: &mut tensor[4 * P] f32):
+    for i in 0..4 * P:
+        let pair = i % (2 * P)
+        let spatial_axis = pair / P
+        let frequency = pair % P
+        let angle = f32(coordinates[spatial_axis]) * exp(-log(10000.0) * f32(frequency) / f32(P))
+        if i < 2 * P:
+            rotated[i] = f32(source[i]) * cos(angle) - f32(source[i + 2 * P]) * sin(angle)
+        else:
+            rotated[i] = f32(source[i]) * cos(angle) + f32(source[i - 2 * P]) * sin(angle)
+
+
+fn qwen_vision_qkv[M, H, P](projected: &tensor[M, 3, H, 4 * P] A,
+    coordinates: &tensor[M, 2] i32, query: &mut tensor[M, H, 4 * P] A,
+    key: &mut tensor[M, H, 4 * P] A, value: &mut tensor[M, H, 4 * P] A):
+    parallel for row in 0..M:
+        parallel for head in 0..H:
+            let mut rq = tensor[4 * P] f32
+            let mut rk = tensor[4 * P] f32
+            qwen_vision_rotate[P = P](projected[row, 0, head], coordinates[row], rq)
+            qwen_vision_rotate[P = P](projected[row, 1, head], coordinates[row], rk)
+            query[row, head] = rq
+            key[row, head] = rk
+            value[row, head] = projected[row, 2, head]
+
+
+fn qwen_vision_full_attention[M, H, W](query: &tensor[M, H, W] A,
+    key: &tensor[M, H, W] A, value: &tensor[M, H, W] A,
+    out: &mut tensor[M, H, W] A):
+    parallel for row in 0..M:
+        parallel for head in 0..H:
+            let mut maximum = tensor[1] f32
+            let mut denominator = tensor[1] f32
+            let mut acc = tensor[1, W] f32
+            for i in 0..1:
+                maximum[i] = -inf
+                denominator[i] = 0.0
+                for j in 0..W:
+                    acc[i, j] = 0.0
+            attention_update(query[row:row + 1, head], key[0:M, head], value[0:M, head], maximum, denominator, acc, rsqrt(f32(W)))
+            for j in 0..W:
+                acc[0, j] = acc[0, j] / denominator[0]
+                out[row, head, j] = acc[0, j]
+
+
+fn qwen_vision_attention[M, H, P](projected: &tensor[M, 3, H, 4 * P] A,
+    coordinates: &tensor[M, 2] i32, out: &mut tensor[M, H, 4 * P] A):
+    let mut query = tensor[M, H, 4 * P] A
+    let mut key = tensor[M, H, 4 * P] A
+    let mut value = tensor[M, H, 4 * P] A
+    qwen_vision_qkv[M = M, H = H, P = P](projected, coordinates, query, key, value)
+    qwen_vision_full_attention(query, key, value, out)
+
+
+fn qwen_vision_block[M, H, P, F](hidden: &tensor[M, H, 4, P] A,
+    coordinates: &tensor[M, 2] i32,
+    norm1_weight: &tensor[H * 4 * P] N1W, norm1_bias: &tensor[H * 4 * P] N1B,
+    qkv_weight: &tensor[H * 4 * P, 3 * H * 4 * P] QW,
+    qkv_bias: &tensor[3 * H * 4 * P] QB,
+    projection_weight: &tensor[H * 4 * P, H * 4 * P] PW,
+    projection_bias: &tensor[H * 4 * P] PB,
+    norm2_weight: &tensor[H * 4 * P] N2W, norm2_bias: &tensor[H * 4 * P] N2B,
+    up_weight: &tensor[H * 4 * P, F] UW, up_bias: &tensor[F] UB,
+    down_weight: &tensor[F, H * 4 * P] DW, down_bias: &tensor[H * 4 * P] DB,
+    epsilon: f32) -> tensor[M, H * 4 * P] A:
+    let mut normalized = tensor[M, H * 4 * P] A
+    let mut projected = tensor[M, 3 * H * 4 * P] A
+    let mut attended = tensor[M, H, 4 * P] A
+    let mut mixed = tensor[M, H * 4 * P] A
+    let mut residual = tensor[M, H * 4 * P] A
+    let mut normalized2 = tensor[M, H * 4 * P] A
+    let mut up = tensor[M, F] A
+    let mut activated = tensor[M, F] A
+    let mut down = tensor[M, H * 4 * P] A
+    let mut result = tensor[M, H * 4 * P] A
+    layer_norm(reshape(hidden, (M, H * 4 * P)), norm1_weight, norm1_bias, normalized, epsilon)
+    qwen_vision_linear_bias_transposed(normalized, qkv_weight, qkv_bias, projected)
+    qwen_vision_attention[M = M, H = H, P = P](reshape(projected, (M, 3, H, 4 * P)), coordinates, attended)
+    qwen_vision_linear_bias_transposed(reshape(attended, (M, H * 4 * P)), projection_weight, projection_bias, mixed)
+    add(reshape(hidden, (M, H * 4 * P)), mixed, residual)
+    layer_norm(residual, norm2_weight, norm2_bias, normalized2, epsilon)
+    qwen_vision_linear_bias_transposed(normalized2, up_weight, up_bias, up)
+    gelu_tanh(up, activated)
+    qwen_vision_linear_bias_transposed(activated, down_weight, down_bias, down)
+    add(residual, down, result)
+    return result
+
+native qwen_vision_block for metal from "metal/qwen_vision_block.metal":
+    threadgroups (ceil_div(M * H * 4 * P, 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+fn qwen_vision_merger[M, G, H, D](hidden: &tensor[M * G, H] A,
+    norm_weight: &tensor[H] NW, norm_bias: &tensor[H] NB,
+    up_weight: &tensor[G * H, G * H] UW, up_bias: &tensor[G * H] UB,
+    down_weight: &tensor[G * H, D] DW, down_bias: &tensor[D] DB,
+    epsilon: f32) -> tensor[M, D] A:
+    let mut normalized = tensor[M * G, H] A
+    let mut up = tensor[M, G * H] A
+    let mut activated = tensor[M, G * H] A
+    let mut result = tensor[M, D] A
+    layer_norm(hidden, norm_weight, norm_bias, normalized, epsilon)
+    qwen_vision_linear_bias_transposed(reshape(normalized, (M, G * H)), up_weight, up_bias, up)
+    gelu(up, activated)
+    qwen_vision_linear_bias_transposed(activated, down_weight, down_bias, result)
+    return result
+
+native qwen_vision_merger for metal from "metal/qwen_vision_merger.metal":
+    threadgroups (ceil_div(M * D, 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+fn qwen_vision_feature_output[M, D](source: &tensor[M, D] A) -> tensor[M, D] f32:
+    let mut result = tensor[M, D] f32
+    parallel for row in 0..M:
+        parallel for col in 0..D:
+            result[row, col] = source[row, col]
+    return result
+
+native qwen_vision_feature_output for metal from "metal/qwen_vision_feature_output.metal":
+    threadgroups (ceil_div(M * D, 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)

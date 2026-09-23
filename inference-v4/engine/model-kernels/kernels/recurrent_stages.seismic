@@ -1,0 +1,212 @@
+# Recurrent block execution is divided at the data dependencies. Projected
+# activations are computed once per row; the state scan is sequential only in
+# time and parallel across independent state rows.
+
+fn qwen_recurrent_normalize[M, H](hidden: &tensor[M, H] f32,
+    input_norm: &tensor[H] NW, epsilon: f32) -> tensor[M, H] A:
+    let mut normalized = tensor[M, H] A
+    rms_norm(hidden, input_norm, normalized, epsilon)
+    return normalized
+
+native qwen_recurrent_normalize for metal from "metal/qwen_recurrent_normalize.metal":
+    threadgroups (ceil_div(M, 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+fn qwen_recurrent_project[M, H, NK, NV, W](normalized: &tensor[M, H] A, qkv_weight: &tensor[(2 * NK + NV) * W, H] QW,
+    gate_weight: &tensor[NV * W, H] GW, alpha_weight: &tensor[NV, H] AW,
+    beta_weight: &tensor[NV, H] BW)
+    -> tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A:
+    let mut projection = tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A
+    for row in 0..M:
+        for column in 0..(2 * NK + NV) * W + NV * W + 2 * NV:
+            projection[row, column] = 0.0
+    for row in 0..M:
+        for output in 0..(2 * NK + NV) * W:
+            let mut sum = f32(0.0)
+            for source in 0..H:
+                sum = fma(f32(normalized[row, source]), f32(qkv_weight[output, source]), sum)
+            projection[row, output] = sum
+        for output in 0..NV * W:
+            let mut sum = f32(0.0)
+            for source in 0..H:
+                sum = fma(f32(normalized[row, source]), f32(gate_weight[output, source]), sum)
+            projection[row, (2 * NK + NV) * W + output] = sum
+        for output in 0..NV:
+            let mut alpha = f32(0.0)
+            let mut beta = f32(0.0)
+            for source in 0..H:
+                let value = f32(normalized[row, source])
+                alpha = fma(value, f32(alpha_weight[output, source]), alpha)
+                beta = fma(value, f32(beta_weight[output, source]), beta)
+            projection[row, (2 * NK + NV) * W + NV * W + output] = alpha
+            projection[row, (2 * NK + NV) * W + NV * W + NV + output] = beta
+    return projection
+
+native qwen_recurrent_project for metal from "metal/qwen_recurrent_project.metal":
+    threadgroups (ceil_div(ceil_div(M, 8) * ((2 * NK + NV) * W + NV * W + 2 * NV), 8), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+# recurrent_norm fixes W for checked recurrent projection geometry.
+# Its values are consumed numerically by qwen_recurrent_mix.
+fn qwen_recurrent_prepare[M, B, NK, NV, W, C](projection: &tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A,
+    convolution: &tensor[(2 * NK + NV) * W, C] f32,
+    rate: &tensor[NV] f32, time_bias: &tensor[NV] f32,
+    recurrent_norm: &tensor[W] RN,
+    segments: &tensor[B + 1, 2] i32,
+    window: &tensor[B, C - 1, (2 * NK + NV) * W] A,
+    preparation_epsilon: f32)
+    -> (tensor[B, C - 1, (2 * NK + NV) * W] A, tensor[M, (2 * NK + NV) * W + NV] A,
+        tensor[M, NV] f32):
+    let mut next_window = tensor[B, C - 1, (2 * NK + NV) * W] A
+    let mut prepared = tensor[M, (2 * NK + NV) * W + NV] A
+    let mut decay = tensor[M, NV] f32
+    for row in 0..M:
+        for column in 0..(2 * NK + NV) * W + NV:
+            prepared[row, column] = 0.0
+        for head in 0..NV:
+            decay[row, head] = 0.0
+    for slot in 0..B:
+        let lo = segments[slot, 0]
+        let hi = segments[slot, 1]
+        for row in 0..M:
+            if row >= lo and row < hi:
+                let local = row - lo
+                for head in 0..2 * NK + NV:
+                    let mut vector = tensor[W] f32
+                    let mut squares = f32(0.0)
+                    for column in 0..W:
+                        let source_column = head * W + column
+                        let mut sum = convolution[source_column, C - 1] * f32(projection[row, source_column])
+                        for tap in 0..C - 1:
+                            let mut previous = f32(0.0)
+                            if local + tap < C - 1:
+                                previous = f32(window[slot, local + tap, source_column])
+                            else:
+                                previous = f32(projection[lo + local + tap - (C - 1), source_column])
+                            sum = fma(convolution[source_column, tap], previous, sum)
+                        let value = sum / (1.0 + exp(-sum))
+                        vector[column] = value
+                        squares = fma(value, value, squares)
+                    let mut inverse = f32(1.0)
+                    if head < 2 * NK:
+                        inverse = rsqrt(squares + preparation_epsilon)
+                        if head < NK:
+                            inverse = inverse * rsqrt(f32(W))
+                    for column in 0..W:
+                        prepared[row, head * W + column] = vector[column] * inverse
+                for value_head in 0..NV:
+                    let alpha = f32(projection[row, (2 * NK + NV) * W + NV * W + value_head])
+                    let beta_input = f32(projection[row, (2 * NK + NV) * W + NV * W + NV + value_head])
+                    prepared[row, (2 * NK + NV) * W + value_head] = 1.0 / (1.0 + exp(-beta_input))
+                    let shifted = alpha + time_bias[value_head]
+                    let softplus = max(shifted, 0.0) + log(1.0 + exp(-abs(shifted)))
+                    decay[row, value_head] = exp(rate[value_head] * softplus)
+        for tap in 0..C - 1:
+            for column in 0..(2 * NK + NV) * W:
+                if hi - lo + tap < C - 1:
+                    next_window[slot, tap, column] = window[slot, hi - lo + tap, column]
+                else:
+                    next_window[slot, tap, column] = projection[hi + tap - (C - 1), column]
+    return next_window, prepared, decay
+
+native qwen_recurrent_prepare for metal from "metal/qwen_recurrent_prepare.metal":
+    threadgroups (ceil_div(M * (2 * NK + NV + NV) + B * (C - 1) * (2 * NK + NV) * W, 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+fn qwen_recurrent_scan[M, B, NK, NV, W](prepared: &tensor[M, (2 * NK + NV) * W + NV] A,
+    decay: &tensor[M, NV] f32,
+    segments: &tensor[B + 1, 2] i32,
+    delta: &tensor[B, NV, W, W] f32, grouped: bool)
+    -> (tensor[B, NV, W, W] f32, tensor[M, NV, W] A):
+    let mut next_delta = tensor[B, NV, W, W] f32
+    let mut mixed = tensor[M, NV, W] A
+    for row in 0..M:
+        for value_head in 0..NV:
+            for state_row in 0..W:
+                mixed[row, value_head, state_row] = 0.0
+    for slot in 0..B:
+        let lo = segments[slot, 0]
+        let hi = segments[slot, 1]
+        for value_head in 0..NV:
+            let mut key_head = value_head % NK
+            if grouped:
+                key_head = value_head * NK / NV
+            for state_row in 0..W:
+                let mut state = to_owned(delta[slot, value_head, state_row])
+                for row in 0..M:
+                    if row >= lo and row < hi:
+                        let factor = decay[row, value_head]
+                        let beta = f32(prepared[row, (2 * NK + NV) * W + value_head])
+                        let mut remembered = f32(0.0)
+                        for column in 0..W:
+                            remembered = fma(state[column] * factor,
+                                f32(prepared[row, (NK + key_head) * W + column]), remembered)
+                        let residual = (f32(prepared[row, (2 * NK + value_head) * W + state_row]) - remembered) * beta
+                        let mut output = f32(0.0)
+                        for column in 0..W:
+                            let key = f32(prepared[row, (NK + key_head) * W + column])
+                            state[column] = fma(residual, key, state[column] * factor)
+                            output = fma(state[column], f32(prepared[row, key_head * W + column]), output)
+                        mixed[row, value_head, state_row] = output
+                next_delta[slot, value_head, state_row] = state
+    return next_delta, mixed
+
+native qwen_recurrent_scan for metal from "metal/qwen_recurrent_scan.metal":
+    threadgroups (ceil_div(NV * W, 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+fn qwen_recurrent_mix[M, NK, NV, W](projection: &tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A,
+    mixed: &tensor[M, NV, W] A,
+    recurrent_norm: &tensor[W] RN, epsilon: f32)
+    -> tensor[M, NV * W] A:
+    let mut normalized = tensor[M, NV * W] A
+    let mut activated = tensor[M, NV * W] A
+    let mut gated = tensor[M, NV * W] A
+    for row in 0..M:
+        for column in 0..NV * W:
+            normalized[row, column] = 0.0
+            activated[row, column] = 0.0
+            gated[row, column] = 0.0
+    for row in 0..M:
+        for value_head in 0..NV:
+            let mut squares = f32(0.0)
+            for column in 0..W:
+                squares = fma(f32(mixed[row, value_head, column]), f32(mixed[row, value_head, column]), squares)
+            let inverse = rsqrt(squares / f32(W) + epsilon)
+            for column in 0..W:
+                let flat = value_head * W + column
+                let gate = f32(projection[row, (2 * NK + NV) * W + flat])
+                normalized[row, flat] = f32(mixed[row, value_head, column]) * inverse * f32(recurrent_norm[column])
+                activated[row, flat] = gate / (1.0 + exp(-gate))
+                gated[row, flat] = f32(normalized[row, flat]) * f32(activated[row, flat])
+    return gated
+
+native qwen_recurrent_mix for metal from "metal/qwen_recurrent_mix.metal":
+    threadgroups (ceil_div(M * NV * W, 256), 1, 1)
+    threads_per_threadgroup (256, 1, 1)
+
+
+fn qwen_recurrent_output[M, H, G](hidden: &tensor[M, H] f32,
+    gated: &tensor[M, G] A,
+    output_weight: &tensor[H, G] OW) -> tensor[M, H] f32:
+    let mut result = tensor[M, H] f32
+    let mut projected = tensor[M, H] A
+    for row in 0..M:
+        for output in 0..H:
+            projected[row, output] = 0.0
+    for row in 0..M:
+        for output in 0..H:
+            let mut sum = f32(0.0)
+            for source in 0..G:
+                sum = fma(f32(gated[row, source]), f32(output_weight[output, source]), sum)
+            projected[row, output] = sum
+            result[row, output] = hidden[row, output] + f32(projected[row, output])
+    return result
+
+native qwen_recurrent_output for metal from "metal/qwen_recurrent_output.metal":
+    threadgroups (ceil_div(ceil_div(M, 8) * H, 8), 1, 1)
+    threads_per_threadgroup (256, 1, 1)

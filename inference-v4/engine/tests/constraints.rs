@@ -1,14 +1,25 @@
+use magnitude_artifacts::InputLayout;
 use magnitude_engine::{
     chat::ConstraintPlan,
+    chat::{CacheLimits, Vocabulary},
     generation::{
-        constraints::{CacheLimits, Vocabulary},
         grammar::{to_lark, CONVERTER_IDENTITY},
         Constraint,
     },
     inputs::{BpeConfig, ByteBpeTokenizer, PieceKind, SpecialTokens, TokenId},
 };
+use magnitude_model_contracts::{PreparedModelInput, TokenPlan};
 use serde_json::json;
 use std::{collections::BTreeSet, sync::Arc};
+
+fn text_input(tokens: Vec<TokenId>) -> PreparedModelInput {
+    let coordinates = (0..tokens.len())
+        .map(|position| [position as i32; 3])
+        .collect();
+    let layout = InputLayout::new(tokens.len(), Vec::new()).unwrap();
+    PreparedModelInput::from_text_coordinates(TokenPlan::new(tokens, layout).unwrap(), coordinates)
+        .unwrap()
+}
 
 fn tokenizer() -> Arc<ByteBpeTokenizer> {
     // Independent byte alphabet fixture: IDs 0..255 are exactly their byte value.
@@ -212,10 +223,10 @@ fn native_qwen_grammars_enforce_required_tool_names_and_argument_schemas() {
     let tokenizer = tokenizer();
     let mut vocab = vocabulary(tokenizer.clone());
     for (source,valid,invalid) in [
-        (include_str!("../../../inference-v3/native/templates/upstream/models/templates/Qwen-Qwen3-0.6B.jinja"),
+        (include_str!("../templates/tests/assets/Qwen-Qwen3-0.6B.jinja"),
          "<tool_call>\n{\"name\":\"search\",\"arguments\":{\"query\":\"héllo 世界\"}}\n</tool_call>",
          "<tool_call>\n{\"name\":\"other\",\"arguments\":{\"query\":\"x\"}}\n</tool_call>"),
-        (include_str!("../../../inference-v3/native/templates/upstream/models/templates/Qwen3.5-4B.jinja"),
+        (include_str!("../templates/tests/assets/Qwen3.5-4B.jinja"),
          "<tool_call>\n<function=search>\n<parameter=query>\nhéllo 世界\n</parameter>\n</function>\n</tool_call>",
          "<tool_call>\n<function=other>\n<parameter=query>\nx\n</parameter>\n</function>\n</tool_call>"),
     ] {
@@ -239,97 +250,22 @@ fn native_qwen_grammars_enforce_required_tool_names_and_argument_schemas() {
 }
 
 #[test]
-fn real_constraint_is_installed_only_after_numerical_commit() {
-    use magnitude_engine::{
-        generation::{Generation, Options, Readiness, Sampling},
-        inputs::InputLayout,
-        models::sequence::Advance,
-    };
-    use std::{cell::Cell, rc::Rc};
-    struct Row {
-        fail: bool,
-        committed: Rc<Cell<bool>>,
-    }
-    impl Advance for Row {
-        fn is_complete(&self) -> bool {
-            true
-        }
-        fn selected(&mut self) -> Result<Option<TokenId>, String> {
-            Ok(Some(TokenId(97)))
-        }
-        fn commit(&mut self) -> Result<(), String> {
-            if self.fail {
-                return Err("numerical commit failed".into());
-            }
-            self.committed.set(true);
-            Ok(())
-        }
-    }
-    let tokenizer = tokenizer();
-    let mut vocab = vocabulary(tokenizer.clone());
-    for fail in [true, false] {
-        let constraint = vocab
-            .bind(&plan(&tokenizer, "root ::= \"ab\" | \"cd\"", ""))
-            .unwrap();
-        let mut g = Generation::new(
-            vec![TokenId(42)],
-            InputLayout::new(1, vec![]).unwrap(),
-            Options {
-                max_tokens: 8,
-                output_capacity: 8,
-                context_limit: 32,
-                vocabulary: 272,
-                stop_tokens: tokenizer.stop_tokens().clone(),
-                sampling: Sampling::Greedy,
-                seed: 7,
-                forced_quantum: 0,
-            },
-            Some(Box::new(constraint)),
-        )
-        .unwrap();
-        let before = g.selection_mask().unwrap().unwrap();
-        assert!(allowed(&before, 97));
-        assert!(allowed(&before, 99));
-        let Readiness::Ready(proposal) = g.ready(1).unwrap() else {
-            panic!("expected prefill")
-        };
-        assert!(proposal.needs_sample());
-        let committed = Rc::new(Cell::new(false));
-        g.attach(
-            proposal,
-            Box::new(Row {
-                fail,
-                committed: committed.clone(),
-            }),
-        )
-        .unwrap();
-        assert_eq!(g.reconcile().is_err(), fail);
-        assert_eq!(committed.get(), !fail);
-        assert_eq!(g.constraint_position(), Some(usize::from(!fail)));
-        let after = g.selection_mask().unwrap().unwrap();
-        if fail {
-            assert_eq!(before, after);
-            assert!(g.generated().is_empty());
-        } else {
-            assert!(!allowed(&after, 97));
-            assert!(allowed(&after, 98));
-            assert_eq!(g.generated(), &[TokenId(97)]);
-        }
-    }
-}
-
-#[test]
 fn host_preparation_binds_before_generation_and_rejects_identity_mismatches() {
     use magnitude_engine::{
         chat::{ChatRequest, PreparedChat, TemplateBundle, TemplateSelection, TemplateVariant},
-        generation::{Options, Sampling},
+        generation::{MethodChoice, Options, Sampling, Shaping},
     };
     let tokenizer = tokenizer();
-    let bundle = TemplateBundle::new(vec![TemplateVariant {
-        name: "default".into(),
-        source: include_str!("../../../inference-v3/native/templates/upstream/models/templates/Qwen-Qwen3-0.6B.jinja").into(),
-        provenance: "fixture".into(),
-    }], "default".into(), Default::default()).unwrap();
+    let bundle = TemplateBundle::new(
+        vec![TemplateVariant {
+            name: "default".into(),
+            source: include_str!("../templates/tests/assets/Qwen-Qwen3-0.6B.jinja").into(),
+            provenance: "fixture".into(),
+        }],
+        "default".into(),
+        Default::default(),
+    )
+    .unwrap();
     let mut request = ChatRequest::new(vec![json!({"role":"user","content":"say hello"})], 0);
     request.json_schema = Some(
         json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false}),
@@ -346,138 +282,67 @@ fn host_preparation_binds_before_generation_and_rejects_identity_mismatches() {
         vocabulary: 272,
         stop_tokens: tokenizer.stop_tokens().clone(),
         sampling: Sampling::Greedy,
+        shaping: Shaping {
+            temperature: 0.0,
+            ..Default::default()
+        },
         seed: 0,
         forced_quantum: 16,
+        method: magnitude_engine::generation::MethodChoice::Plain,
     };
     let generation = vocabulary
-        .prepare_generation(prepared.input(), options.clone())
+        .prepare_generation_for_input(
+            prepared.input(),
+            options.clone(),
+            &text_input(prepared.input().tokens.clone()),
+        )
         .unwrap();
     assert_eq!(generation.constraint_position(), Some(0));
     assert!(generation.selection_mask().unwrap().is_some());
+    let mut interpreted_tokens = prepared.input().tokens.clone();
+    interpreted_tokens.push(prepared.input().tokens[0]);
+    let interpreted = text_input(interpreted_tokens.clone());
+    let interpreted_generation = vocabulary
+        .prepare_generation_for_input(prepared.input(), options.clone(), &interpreted)
+        .unwrap();
+    assert_eq!(interpreted_generation.prompt(), interpreted_tokens);
     let mut bad = prepared.input().clone();
     bad.tokenizer_identity = "another tokenizer".into();
     assert!(vocabulary
-        .prepare_generation(&bad, options.clone())
+        .prepare_generation_for_input(&bad, options.clone(), &text_input(bad.tokens.clone()),)
         .is_err());
     bad = prepared.input().clone();
     bad.constraint.as_mut().unwrap().gbnf = "root ::= missing".into();
     assert!(vocabulary
-        .prepare_generation(&bad, options.clone())
+        .prepare_generation_for_input(&bad, options.clone(), &text_input(bad.tokens.clone()),)
         .is_err());
-    let mut bad_options = options;
+    let mut bad_options = options.clone();
     bad_options.stop_tokens.clear();
     assert!(vocabulary
-        .prepare_generation(prepared.input(), bad_options)
+        .prepare_generation_for_input(
+            prepared.input(),
+            bad_options,
+            &text_input(prepared.input().tokens.clone()),
+        )
         .is_err());
-}
 
-#[test]
-#[ignore = "requires a Metal device"]
-fn generation_checkpoint_forks_matcher_output_and_numerical_continuation_together() {
-    use magnitude_engine::{
-        generation::{FinishReason, Generation, Options, Readiness, Sampling},
-        inputs::InputLayout,
-        models::sequence::OwnedSequence,
-        state::{ComponentSpec, StateStore},
-    };
-    use seismic::{BackendName, DType, DeviceCatalog};
-    use std::rc::Rc;
-    fn advance(g: &mut Generation, sequence: &OwnedSequence, token: u32) {
-        let Readiness::Ready(proposal) = g.ready(8).unwrap() else {
-            panic!("ready")
-        };
-        let row = sequence
-            .prepare_completed(proposal.position(), proposal.tokens().len(), |state| {
-                let mut next = state.begin(proposal.tokens().len())?;
-                next.execute(|b| {
-                    let mut value = b.following[0].clone();
-                    value
-                        .write_from_host(&(token as f32).to_le_bytes())
-                        .map_err(Into::into)
-                })?;
-                next.commit()?;
-                Ok(Some(TokenId(token)))
-            })
-            .unwrap();
-        g.attach(proposal, row).unwrap();
-        g.reconcile().unwrap();
-    }
-    fn value(sequence: &OwnedSequence) -> f32 {
-        let state = sequence.checkpoint().unwrap().fork();
-        let bytes = state.values()[0].read_to_host().unwrap();
-        f32::from_le_bytes(bytes.try_into().unwrap())
-    }
-    let tokenizer = tokenizer();
-    let grammar = vocabulary(tokenizer.clone())
-        .bind(&plan(&tokenizer, "root ::= \"ab\" (\"c\" | \"d\")", ""))
-        .unwrap();
-    let mut generation = Generation::new(
-        vec![TokenId(1), TokenId(2)],
-        InputLayout::new(2, vec![]).unwrap(),
-        Options {
-            max_tokens: 8,
-            output_capacity: 4,
-            context_limit: 16,
-            vocabulary: 272,
-            stop_tokens: tokenizer.stop_tokens().clone(),
-            sampling: Sampling::Categorical,
-            seed: 42,
-            forced_quantum: 0,
+    let mut mtp_options = options;
+    mtp_options.method = MethodChoice::Mtp { proposals: 2 };
+    let mut mtp_vocabulary = Vocabulary::new(
+        tokenizer,
+        272,
+        CacheLimits {
+            entries: 2,
+            bytes: 1024 * 1024,
         },
-        Some(Box::new(grammar)),
     )
     .unwrap();
-    let store = StateStore::new(
-        Rc::new(
-            DeviceCatalog::discover()
-                .unwrap()
-                .open_backend(BackendName::Metal)
-                .unwrap(),
-        ),
-        16,
-        64,
-        vec![ComponentSpec {
-            shape: vec![4],
-            dtype: DType::F32,
-        }],
-        vec![ComponentSpec {
-            shape: vec![1],
-            dtype: DType::F32,
-        }],
-    )
-    .unwrap();
-    let sequence = OwnedSequence::new(store.create().unwrap());
-    advance(&mut generation, &sequence, 97);
-    assert_eq!(generation.take(1).unwrap()[0].index, 0);
-    advance(&mut generation, &sequence, 98);
-    let checkpoint = generation.checkpoint(&sequence).unwrap();
-    assert_eq!(checkpoint.position(), 3);
-    let (mut left, left_state) = checkpoint.fork().unwrap();
-    let (mut right, right_state) = checkpoint.fork().unwrap();
-    drop(generation);
-    drop(sequence);
-    assert_eq!(left.take(1).unwrap()[0].index, 1);
-    assert_eq!(right.output_len(), 1);
-    assert_eq!(right.take(1).unwrap()[0].token, TokenId(98));
-    advance(&mut left, &left_state, 99);
-    assert_eq!(value(&left_state), 99.0);
-    assert_eq!(value(&right_state), 98.0);
-    let mask = right.selection_mask().unwrap().unwrap();
-    assert!(allowed(&mask, 99) && allowed(&mask, 100));
-    advance(&mut right, &right_state, 100);
-    assert_eq!(left.take(1).unwrap()[0].index, 2);
-    assert_eq!(right.take(1).unwrap()[0].token, TokenId(100));
-    assert_eq!(left.generated(), &[TokenId(97), TokenId(98), TokenId(99)]);
-    assert_eq!(right.generated(), &[TokenId(97), TokenId(98), TokenId(100)]);
-    advance(&mut left, &left_state, 256);
-    assert_eq!(left.finish_reason(), Some(FinishReason::Stop));
-    let terminal = left.checkpoint(&left_state).unwrap();
-    let (stopped, _) = terminal.fork().unwrap();
-    assert_eq!(stopped.finish_reason(), Some(FinishReason::Stop));
-    assert_eq!(stopped.constraint_position(), Some(4));
-    // The original immutable checkpoint still has the old output and matcher.
-    let (mut again, state) = checkpoint.fork().unwrap();
-    assert_eq!(again.take(1).unwrap()[0].index, 1);
-    assert_eq!(again.constraint_position(), Some(2));
-    assert_eq!(value(&state), 98.0);
+    let mtp = mtp_vocabulary
+        .prepare_generation_for_input(
+            prepared.input(),
+            mtp_options,
+            &text_input(prepared.input().tokens.clone()),
+        )
+        .unwrap();
+    assert_eq!(mtp.method(), MethodChoice::Mtp { proposals: 2 });
 }

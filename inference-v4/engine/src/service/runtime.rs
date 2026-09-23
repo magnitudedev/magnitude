@@ -1,500 +1,385 @@
-//! Prepared-input admission and event-driven publication over the execution owner.
-use super::{
-    owner::{Executor, InputExecutor, Owner, Status},
-    policy::{Limits, RequestId},
-    worker::{self, CompletionWake, Drive, Driven, Worker},
-};
-use crate::{
-    chat::PreparedInput,
-    generation::{constraints::Vocabulary, FinishReason, Options, OutputToken, Usage},
-};
-use std::{
-    collections::{BTreeMap, VecDeque},
-    future::Future,
-    pin::Pin,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
-    task::{Context, Poll, Waker},
-};
+//! Concrete root facade over the family-neutral execution owner.
 
-struct Closed {
-    usage: Option<Usage>,
-    tokens: VecDeque<OutputToken>,
-    finish: FinishReason,
-    error: Option<String>,
-}
-#[derive(Default)]
-struct Notice {
-    revision: u64,
-    closed: Option<Closed>,
-    waker: Option<Waker>,
-}
-#[derive(Default)]
-struct Signal(Mutex<Notice>);
-impl Signal {
-    fn revision(&self) -> u64 {
-        self.0.lock().unwrap().revision
-    }
-    fn is_closed(&self) -> bool {
-        self.0.lock().unwrap().closed.is_some()
-    }
-    fn take_closed(&self, count: usize) -> Option<Publication> {
-        let mut notice = self.0.lock().unwrap();
-        let closed = notice.closed.as_mut()?;
-        let tokens = closed
-            .tokens
-            .drain(..count.min(closed.tokens.len()))
-            .collect();
-        Some(Publication {
-            tokens,
-            finish: closed.tokens.is_empty().then_some(closed.finish),
-            error: closed.error.clone(),
-            usage: closed.usage,
-        })
-    }
-    fn notify(&self) {
-        let waker = {
-            let mut notice = self.0.lock().unwrap();
-            notice.revision = notice.revision.wrapping_add(1);
-            notice.waker.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-    fn close(
-        &self,
-        tokens: Vec<OutputToken>,
-        finish: FinishReason,
-        error: Option<String>,
-        usage: Option<Usage>,
-    ) {
-        let waker = {
-            let mut notice = self.0.lock().unwrap();
-            notice.closed.get_or_insert(Closed {
-                usage,
-                tokens: tokens.into(),
-                finish,
-                error,
-            });
-            notice.waker.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-}
-struct Changed<'a> {
-    signal: &'a Signal,
-    revision: u64,
-}
-impl Future for Changed<'_> {
-    type Output = ();
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut notice = self.signal.0.lock().unwrap();
-        if notice.closed.is_some() || notice.revision != self.revision {
-            return Poll::Ready(());
-        }
-        notice.waker = Some(cx.waker().clone());
-        Poll::Pending
-    }
-}
-impl Drop for Changed<'_> {
-    fn drop(&mut self) {
-        self.signal.0.lock().unwrap().waker.take();
-    }
-}
+use magnitude_generation::{DetailedUsage, FinishReason, Method, OutputToken};
+use magnitude_model_contracts::PreparedModelInput;
+use magnitude_model_executor::{ExecutorDomain, ProgramFamily, RequestId, ResourcePlan};
+use magnitude_service::{
+    owner::{Owner, Status},
+    protocol::{AdmitRequest, CapacityStatus, WorkerCommand, WorkerReply},
+    publication::{Publication, PublicationQueue, PublicationReceiver, PublicationWake},
+    retention::{RetentionKey, RetentionRequest},
+    worker::{self, CompletionWake, Drive, Driven, Worker, WorkerWakeHandle},
+};
+use std::future::poll_fn;
+use std::sync::Arc;
 
-pub struct Runtime<E: Executor> {
-    owner: Owner<E>,
-    vocabulary: Vocabulary,
-    signals: BTreeMap<RequestId, Arc<Signal>>,
-}
-struct Admitted {
-    id: RequestId,
-    signal: Arc<Signal>,
-}
-#[derive(Debug)]
-pub struct Publication {
-    pub usage: Option<Usage>,
+use crate::options::{ExecutionManifest, ReadyInfo, ResourcePlanSummary};
+
+pub struct OutputBatch {
     pub tokens: Vec<OutputToken>,
-    /// Terminal only after all retained output has been collected.
     pub finish: Option<FinishReason>,
+    pub usage: Option<DetailedUsage>,
+    pub method: Option<String>,
+    pub timings: Option<magnitude_chat::ExecutionTimings>,
     pub error: Option<String>,
 }
-impl<E: Executor> Runtime<E> {
-    pub fn new(executor: E, vocabulary: Vocabulary, limits: Limits) -> Result<Self, String> {
-        Ok(Self {
-            owner: Owner::new(executor, limits)?,
-            vocabulary,
-            signals: BTreeMap::new(),
-        })
-    }
-    fn admit_input<I>(
-        &mut self,
-        input: &PreparedInput,
-        source: I,
-        options: Options,
-        now: u64,
-    ) -> Result<Admitted, String>
-    where
-        E: InputExecutor<I>,
-    {
-        let layout = self.owner.input_layout(&source, &input.tokens)?;
-        let generation = self
-            .vocabulary
-            .prepare_generation_with_layout(input, options, layout)?;
-        let id = self.owner.admit_input(generation, source, now)?;
-        Ok(self.register(id))
-    }
-    fn register(&mut self, id: RequestId) -> Admitted {
-        let signal = Arc::new(Signal::default());
-        self.signals.insert(id, signal.clone());
-        Admitted { id, signal }
-    }
-    fn admit(
-        &mut self,
-        input: &PreparedInput,
-        options: Options,
-        now: u64,
-    ) -> Result<Admitted, String> {
-        let generation = self.vocabulary.prepare_generation(input, options)?;
-        let id = self.owner.admit(generation, now)?;
-        Ok(self.register(id))
-    }
-    fn fork_checkpoint(
-        &mut self,
-        checkpoint: super::owner::CheckpointId,
-        now: u64,
-    ) -> Result<Admitted, String> {
-        let id = self.owner.fork_checkpoint(checkpoint, now)?;
-        let signal = Arc::new(Signal::default());
-        self.signals.insert(id, signal.clone());
-        Ok(Admitted { id, signal })
-    }
-    fn release(&mut self, id: RequestId) -> Result<(), String> {
-        let Some(signal) = self.signals.remove(&id) else {
-            return self.owner.release(id);
-        };
-        let usage = self.owner.usage(id).ok();
-        let finish = match self.owner.status(id) {
-            Ok(Status::Terminal(reason)) => reason,
-            _ => FinishReason::Cancelled,
-        };
-        let error = self.owner.error(id).map(str::to_string);
-        let result = self.owner.release(id);
-        match &result {
-            Ok(()) => signal.close(Vec::new(), finish, error, usage),
-            Err(error) => {
-                signal.close(Vec::new(), FinishReason::Failed, Some(error.clone()), usage)
-            }
-        }
-        result
-    }
-    fn receive(&mut self, id: RequestId, count: usize) -> Result<Publication, String> {
-        let tokens = self.owner.take(id, count)?;
-        let finish = match self.owner.status(id)? {
-            Status::Terminal(reason) if self.owner.output_len(id)? == 0 => Some(reason),
-            _ => None,
-        };
-        Ok(Publication {
-            tokens,
-            finish,
-            error: self.owner.error(id).map(str::to_string),
-            usage: Some(self.owner.usage(id)?),
-        })
-    }
-    fn close_publication(&mut self, fallback: FinishReason, error: Option<String>) {
-        for (&id, signal) in &self.signals {
-            if signal.is_closed() {
-                continue;
-            }
-            let finish = match self.owner.status(id) {
-                Ok(Status::Terminal(reason)) => reason,
-                _ => fallback,
-            };
-            let error = if finish == FinishReason::Failed {
-                self.owner
-                    .error(id)
-                    .map(str::to_string)
-                    .or_else(|| error.clone())
-            } else {
-                None
-            };
-            match self.owner.take(id, usize::MAX) {
-                Ok(tokens) => signal.close(tokens, finish, error, self.owner.usage(id).ok()),
-                Err(error) => signal.close(
-                    Vec::new(),
-                    FinishReason::Failed,
-                    Some(error),
-                    self.owner.usage(id).ok(),
-                ),
-            }
-        }
-    }
-    fn publish(&self) {
-        for (&id, signal) in &self.signals {
-            if self.owner.output_len(id).unwrap_or(0) > 0
-                || matches!(self.owner.status(id), Ok(Status::Terminal(_)))
-            {
-                signal.notify();
-            }
-        }
-    }
+
+struct ExecutionOwner<F: ProgramFamily> {
+    owner: Owner<F>,
+    method: Arc<dyn Method>,
+    wakes: Option<WorkerWakeHandle>,
 }
-impl<E: Executor> Driven for Runtime<E> {
+impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
+    fn install_wake_handle(&mut self, wakes: WorkerWakeHandle) {
+        self.wakes = Some(wakes);
+    }
+    fn publication_wake(
+        &mut self,
+        request: RequestId,
+        wake: PublicationWake,
+        _now: u64,
+    ) -> Result<(), String> {
+        self.owner.publication_wake(request, wake)
+    }
+    fn command(&mut self, command: WorkerCommand, now: u64) -> Result<WorkerReply, String> {
+        match command {
+            WorkerCommand::Check => match self.owner.fatal_error() {
+                Some(error) => Err(error.to_owned()),
+                None => Ok(WorkerReply::Acknowledged),
+            },
+            WorkerCommand::Admit(AdmitRequest {
+                seed,
+                input,
+                retention,
+                output_capacity,
+            }) => {
+                if output_capacity == 0 {
+                    return Err("request output capacity must be positive".into());
+                }
+                if seed.prompt() != input.tokens() || seed.layout() != input.layout() {
+                    return Err("generation seed does not match prepared input".into());
+                }
+                let generation = seed.into_generation(self.method.clone())?;
+                let request = match retention {
+                    Some(retention) => self.owner.admit_retained_with(
+                        generation,
+                        retention,
+                        now,
+                        move |domain, request, _, hit| match hit {
+                            Some(_) => domain.install_retained_input(request, input),
+                            None => domain.install_input(request, input),
+                        },
+                    )?,
+                    None => self
+                        .owner
+                        .admit_with(generation, now, move |domain, request, _| {
+                            domain.install_input(request, input)
+                        })?,
+                };
+                let wakes = self
+                    .wakes
+                    .as_ref()
+                    .ok_or("publication wake handle was not installed")?
+                    .clone();
+                let (sender, receiver) = PublicationQueue::bounded(output_capacity, move |wake| {
+                    wakes.publication(request, wake);
+                })?;
+                self.owner
+                    .attach_publication(request, sender, output_capacity)?;
+                Ok(WorkerReply::Admitted { request, receiver })
+            }
+            WorkerCommand::Stop { request } => {
+                self.owner.stop(request)?;
+                Ok(WorkerReply::Acknowledged)
+            }
+            WorkerCommand::Cancel { request } => {
+                self.owner.release(request)?;
+                Ok(WorkerReply::Acknowledged)
+            }
+            WorkerCommand::Status { request } => {
+                Ok(WorkerReply::Status(self.owner.status(request)?))
+            }
+            WorkerCommand::Capacity => {
+                let (active, limit) = self.owner.request_capacity();
+                Ok(WorkerReply::Capacity(CapacityStatus { active, limit }))
+            }
+            WorkerCommand::Close => {
+                Err("worker lifecycle command reached the execution domain".into())
+            }
+        }
+    }
     fn advance(&mut self, now: u64, wake: CompletionWake) -> Result<Drive, String> {
-        let result = self.owner.advance(now, wake);
-        self.publish();
-        result
+        <Owner<F> as Driven>::advance(&mut self.owner, now, wake)
     }
     fn failed(&mut self, error: &str) {
-        self.owner.failed(error);
-        self.close_publication(FinishReason::Failed, Some(error.into()));
+        <Owner<F> as Driven>::failed(&mut self.owner, error);
     }
     fn failure(&self) -> Option<&str> {
-        self.owner.failure()
+        <Owner<F> as Driven>::failure(&self.owner)
     }
     fn shutdown(&mut self) -> Result<bool, String> {
-        let error = self.owner.failure().map(str::to_string);
-        let reason = if error.is_some() {
-            FinishReason::Failed
-        } else {
-            FinishReason::Cancelled
-        };
-        self.close_publication(reason, error);
-        self.owner.shutdown()
+        <Owner<F> as Driven>::shutdown(&mut self.owner)
     }
 }
 
-/// Host composition root: the factory loads the vocabulary/executor on its
-/// owning thread. Cloned clients never own or join that thread.
-pub struct Service<E: Executor + 'static>(Worker<Runtime<E>>);
-impl<E: Executor + 'static> Service<E> {
-    pub fn spawn(
-        factory: impl FnOnce() -> Result<Runtime<E>, String> + Send + 'static,
+/// Owns the numerical worker. Its executor types are erased at this boundary.
+pub struct EngineService {
+    worker: Worker,
+    retention: Option<RetentionKey>,
+    method_identity: String,
+}
+impl EngineService {
+    /// Production construction seam. The same immutable plan is handed to the
+    /// numerical factory for every physical allocation and to the service
+    /// owner for retention/capacity limits before readiness is published.
+    pub(crate) fn spawn_planned_domain<F: ProgramFamily + 'static>(
+        factory: impl FnOnce(&ExecutionManifest) -> Result<(ExecutorDomain<F>, ResourcePlan), String>
+            + Send
+            + 'static,
+        manifest: ExecutionManifest,
+        method: Arc<dyn Method>,
         control_capacity: usize,
-    ) -> Result<Self, String> {
-        Ok(Self(Worker::spawn(factory, control_capacity)?))
+        retention: Option<RetentionKey>,
+    ) -> Result<(Self, ReadyInfo), String> {
+        let method_identity = method.identity().to_owned();
+        let (worker, ready) = Worker::spawn_ready(
+            move || {
+                let (domain, plan) = factory(&manifest)?;
+                if plan.storage_bytes() != manifest.storage.storage_bytes
+                    || plan.retention_budget_bytes() != manifest.storage.retention_bytes
+                    || plan.bytes().safety_reserve != manifest.storage.safety_reserve_bytes
+                {
+                    return Err(
+                        "resource plan differs from the execution manifest storage policy".into(),
+                    );
+                }
+                if domain.execution_path() != manifest.path {
+                    return Err("executor domain differs from the planned execution path".into());
+                }
+                let mut owner = Owner::with_resource_plan(domain, manifest.service.clone(), &plan)?;
+                let ready = ReadyInfo {
+                    package: manifest.package.identity.clone(),
+                    model: manifest.model.clone(),
+                    service: manifest.service.clone(),
+                    resources: ResourcePlanSummary::from_plan(&plan)?,
+                    path: manifest.path,
+                };
+                Ok((
+                    Box::new(ExecutionOwner {
+                        owner,
+                        method,
+                        wakes: None,
+                    }) as Box<dyn Driven>,
+                    ready,
+                ))
+            },
+            control_capacity,
+        )?;
+        let service = Self {
+            worker,
+            retention,
+            method_identity,
+        };
+        Ok((service, ready))
     }
-    pub fn client(&self) -> Client<E> {
-        Client(self.0.client())
+
+    pub fn client(&self) -> EngineClient {
+        EngineClient {
+            worker: self.worker.client(),
+            retention: self.retention.clone(),
+            method_identity: self.method_identity.clone(),
+        }
     }
     pub fn close(&mut self) {
-        self.0.close();
+        self.worker.close();
     }
 }
-pub struct Client<E: Executor + 'static>(worker::Client<Runtime<E>>);
-impl<E: Executor + 'static> Clone for Client<E> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
+
+#[derive(Clone)]
+pub struct EngineClient {
+    worker: worker::Client,
+    retention: Option<RetentionKey>,
+    method_identity: String,
 }
-impl<E: Executor + 'static> Client<E> {
+impl EngineClient {
+    pub fn method_identity(&self) -> &str {
+        &self.method_identity
+    }
     pub async fn check(&self) -> Result<(), String> {
-        self.0
-            .call(|runtime, _| match runtime.owner.fatal_error() {
-                Some(error) => Err(error.to_string()),
-                None => Ok(()),
-            })?
-            .await
+        match self.worker.dispatch(WorkerCommand::Check)?.await? {
+            WorkerReply::Acknowledged => Ok(()),
+            _ => Err("execution worker returned an invalid health reply".into()),
+        }
     }
-    /// Only immutable, Send host preparation crosses this boundary. Encoder,
-    /// feature, matcher, and sequence owners are created on the service worker.
-    pub async fn admit_input<I: Send + 'static>(
-        &self,
-        input: PreparedInput,
-        source: I,
-        options: Options,
-    ) -> Result<Request<E>, String>
-    where
-        E: InputExecutor<I>,
-    {
-        let admitted = self
-            .0
-            .call_with_cleanup(
-                move |runtime, now| runtime.admit_input(&input, source, options, now),
-                |runtime, admitted| runtime.release(admitted.id),
-            )?
-            .await?;
-        Ok(Request {
-            client: self.0.clone(),
-            admitted,
-            released: Arc::new(AtomicBool::new(false)),
-        })
+    pub async fn capacity(&self) -> Result<CapacityStatus, String> {
+        match self.worker.dispatch(WorkerCommand::Capacity)?.await? {
+            WorkerReply::Capacity(capacity) => Ok(capacity),
+            _ => Err("execution worker returned an invalid capacity reply".into()),
+        }
     }
     pub async fn admit(
         &self,
-        input: PreparedInput,
-        options: Options,
-    ) -> Result<Request<E>, String> {
-        let admitted = self
-            .0
-            .call_with_cleanup(
-                move |runtime, now| runtime.admit(&input, options, now),
-                |runtime, admitted| runtime.release(admitted.id),
-            )?
+        seed: magnitude_generation::GenerationSeed,
+        input: PreparedModelInput,
+        output_capacity: usize,
+    ) -> Result<EngineRequest, String> {
+        let retention = self
+            .retention
+            .as_ref()
+            .map(|key| RetentionRequest::new(key.clone(), &input))
+            .transpose()?;
+        self.admit_inner(seed, input, retention, output_capacity)
+            .await
+    }
+    pub async fn admit_retained(
+        &self,
+        seed: magnitude_generation::GenerationSeed,
+        input: PreparedModelInput,
+        retention: RetentionRequest,
+        output_capacity: usize,
+    ) -> Result<EngineRequest, String> {
+        self.admit_inner(seed, input, Some(retention), output_capacity)
+            .await
+    }
+    async fn admit_inner(
+        &self,
+        seed: magnitude_generation::GenerationSeed,
+        input: PreparedModelInput,
+        retention: Option<RetentionRequest>,
+        output_capacity: usize,
+    ) -> Result<EngineRequest, String> {
+        if output_capacity == 0 {
+            return Err("request output capacity must be positive".into());
+        }
+        if seed.prompt() != input.tokens() || seed.layout() != input.layout() {
+            return Err("generation seed does not match prepared input".into());
+        }
+        let reply = self
+            .worker
+            .dispatch(WorkerCommand::Admit(AdmitRequest {
+                seed,
+                input,
+                retention,
+                output_capacity,
+            }))?
             .await?;
-        Ok(Request {
-            client: self.0.clone(),
-            admitted,
-            released: Arc::new(AtomicBool::new(false)),
-        })
-    }
-}
-/// Unique publication receiver. Dropping it releases the request through a
-/// reserved lifecycle path, including when the control queue is saturated.
-pub struct Request<E: Executor + 'static> {
-    client: worker::Client<Runtime<E>>,
-    admitted: Admitted,
-    released: Arc<AtomicBool>,
-}
-impl<E: Executor + 'static> Request<E> {
-    pub fn id(&self) -> RequestId {
-        self.admitted.id
-    }
-    /// Capture only reconciled resident state. A pending numerical advance is
-    /// rejected rather than implicitly waiting or changing publication credit.
-    pub async fn checkpoint(&self) -> Result<Checkpoint<E>, String> {
-        if self.released.load(Ordering::Acquire) {
-            return Err("request released".into());
-        }
-        let request = self.admitted.id;
-        let id = self
-            .client
-            .call_with_cleanup(
-                move |runtime, _| runtime.owner.checkpoint(request),
-                |runtime, id| runtime.owner.release_checkpoint(id),
-            )?
-            .await?;
-        Ok(Checkpoint {
-            client: self.client.clone(),
-            id,
-        })
-    }
-    /// Stop through reserved lifecycle delivery and await the owner's final
-    /// accepted-token snapshot. Pending native work remains owned but cannot
-    /// accept additional output after the acknowledgement.
-    pub async fn stop(&mut self) -> Result<Publication, String> {
-        if !self.released.swap(true, Ordering::AcqRel) {
-            let id = self.admitted.id;
-            self.client.release(move |runtime| runtime.release(id));
-        }
-        loop {
-            let revision = self.admitted.signal.revision();
-            if let Some(mut publication) = self.admitted.signal.take_closed(usize::MAX) {
-                publication.tokens.clear();
-                return Ok(publication);
-            }
-            Changed {
-                signal: &self.admitted.signal,
-                revision,
-            }
-            .await;
-        }
-    }
-    /// Cancelling this future cancels the request; accepted output then has an
-    /// explicit discard owner rather than becoming an unclaimed control result.
-    pub async fn receive(&mut self, count: usize) -> Result<Publication, String> {
-        if count == 0 {
-            return Err("publication count must be positive".into());
-        }
-        if self.released.load(Ordering::Acquire) {
-            return Err("request released".into());
-        }
-        let id = self.admitted.id;
-        let mut guard = ReceiveGuard {
-            client: self.client.clone(),
-            id,
-            armed: true,
-            released: self.released.clone(),
+        let WorkerReply::Admitted {
+            request: id,
+            receiver,
+        } = reply
+        else {
+            return Err("execution worker returned an invalid admission reply".into());
         };
-        loop {
-            let revision = self.admitted.signal.revision();
-            if let Some(publication) = self.admitted.signal.take_closed(count) {
-                guard.armed = false;
-                return Ok(publication);
-            }
-            let result = match self
-                .client
-                .call(move |runtime, _| runtime.receive(id, count))
-            {
-                Ok(call) => call.await,
-                Err(error) => Err(error),
-            };
-            match result {
-                Ok(publication)
-                    if !publication.tokens.is_empty() || publication.finish.is_some() =>
-                {
-                    guard.armed = false;
-                    return Ok(publication);
-                }
-                Ok(_) => {}
-                // Closing rejects queued controls before the owner can publish
-                // retained output. Await that publication instead of losing it.
-                Err(_) if self.client.is_closed() => {}
-                Err(error) => return Err(error),
-            }
-            Changed {
-                signal: &self.admitted.signal,
-                revision,
-            }
-            .await;
-        }
-    }
-}
-/// Opaque owner-scoped snapshot. Live matcher and numerical objects remain on
-/// the worker. Dropping the handle schedules reserved snapshot release.
-pub struct Checkpoint<E: Executor + 'static> {
-    client: worker::Client<Runtime<E>>,
-    id: super::owner::CheckpointId,
-}
-impl<E: Executor + 'static> Checkpoint<E> {
-    pub async fn fork(&self) -> Result<Request<E>, String> {
-        let id = self.id;
-        let admitted = self
-            .client
-            .call_with_cleanup(
-                move |runtime, now| runtime.fork_checkpoint(id, now),
-                |runtime, admitted| runtime.release(admitted.id),
-            )?
-            .await?;
-        Ok(Request {
-            client: self.client.clone(),
-            admitted,
-            released: Arc::new(AtomicBool::new(false)),
+        Ok(EngineRequest {
+            client: self.worker.clone(),
+            id,
+            output_capacity,
+            receiver,
+            released: false,
         })
     }
 }
-impl<E: Executor + 'static> Drop for Checkpoint<E> {
-    fn drop(&mut self) {
-        let id = self.id;
-        self.client
-            .release(move |runtime| runtime.owner.release_checkpoint(id));
-    }
-}
-struct ReceiveGuard<E: Executor + 'static> {
-    client: worker::Client<Runtime<E>>,
+
+/// Unique host receiver for a bounded worker publication stream.
+pub struct EngineRequest {
+    client: worker::Client,
     id: RequestId,
-    armed: bool,
-    released: Arc<AtomicBool>,
+    output_capacity: usize,
+    receiver: PublicationReceiver,
+    released: bool,
 }
-impl<E: Executor + 'static> Drop for ReceiveGuard<E> {
-    fn drop(&mut self) {
-        if self.armed && !self.released.swap(true, Ordering::AcqRel) {
-            let id = self.id;
-            self.client.release(move |runtime| runtime.release(id));
+
+impl EngineRequest {
+    pub const fn id(&self) -> RequestId {
+        self.id
+    }
+    pub const fn output_capacity(&self) -> usize {
+        self.output_capacity
+    }
+
+    pub async fn status(&self) -> Result<Status, String> {
+        if self.released {
+            return Err("request released".into());
+        }
+        match self
+            .client
+            .dispatch(WorkerCommand::Status { request: self.id })?
+            .await?
+        {
+            WorkerReply::Status(status) => Ok(status),
+            _ => Err("execution worker returned an invalid status reply".into()),
         }
     }
-}
-impl<E: Executor + 'static> Drop for Request<E> {
-    fn drop(&mut self) {
-        if self.released.swap(true, Ordering::AcqRel) {
-            return;
+
+    pub async fn receive(&mut self) -> Result<OutputBatch, String> {
+        if self.released {
+            return Err("request released".into());
         }
-        let id = self.admitted.id;
-        self.client.release(move |runtime| runtime.release(id));
+        let publication = poll_fn(|cx| self.receiver.poll_next(cx))
+            .await
+            .ok_or("worker publication stream ended without a terminal event")?;
+        let batch = match publication {
+            Publication::Output(tokens) => OutputBatch {
+                tokens,
+                finish: None,
+                usage: None,
+                method: None,
+                timings: None,
+                error: None,
+            },
+            Publication::Completed {
+                finish,
+                usage,
+                method,
+                timings,
+            } => {
+                self.released = true;
+                OutputBatch {
+                    tokens: Vec::new(),
+                    finish: Some(finish),
+                    usage: Some(usage),
+                    method: Some(method),
+                    error: None,
+                    timings: Some(magnitude_chat::ExecutionTimings {
+                        prompt_ns: timings.prompt_ns,
+                        predicted_ns: timings.predicted_ns,
+                    }),
+                }
+            }
+            Publication::Failed(error) => {
+                self.released = true;
+                OutputBatch {
+                    tokens: Vec::new(),
+                    finish: Some(FinishReason::Failed),
+                    usage: None,
+                    method: None,
+                    timings: None,
+                    error: Some(format!("{error:?}")),
+                }
+            }
+        };
+        Ok(batch)
+    }
+
+    /// Request a normal ordered stop, then drain any accepted output before
+    /// returning its terminal metadata to the host parser.
+    pub async fn stop(&mut self) -> Result<OutputBatch, String> {
+        if self.released {
+            return Err("request released".into());
+        }
+        match self
+            .client
+            .dispatch(WorkerCommand::Stop { request: self.id })?
+            .await?
+        {
+            WorkerReply::Acknowledged => {}
+            _ => return Err("execution worker returned an invalid stop reply".into()),
+        }
+        loop {
+            let batch = self.receive().await?;
+            if batch.finish.is_some() {
+                return Ok(batch);
+            }
+        }
     }
 }
