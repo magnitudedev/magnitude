@@ -25,16 +25,20 @@ Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e2b-it-qat:gguf:q4`
 
 ## Configuration
 
-Default configuration files:
+**Connect** writes `~/.hermes/config.yaml`. Location overrides: `HERMES_HOME`.
 
-- `~/.hermes/config.yaml`
+Write the configuration yourself only when the agent runs where Connections cannot reach it, such as another device or WSL; see [Other devices](/api/other-devices) for `ADDRESS` and `API_KEY`.
 
-On Windows, `~` means your user profile directory.
+`~/.hermes/config.yaml`:
 
-Supported location overrides: `HERMES_HOME`. The paths displayed in Connections show which files Magnitude is actually checking.
-
-## Repair or disconnect
-
-If Connections shows **Connection needs repair**, click **Repair connection**. To stop using the integration, click **Disconnect**, then restart the agent.
-
-See [connection states](/integrations/overview#connection-states) if the agent is not detected or its configuration cannot be verified.
+```yaml
+providers:
+  magnitude:
+    name: Magnitude
+    base_url: http://ADDRESS:10100/inference/v1
+    api_key: API_KEY
+    transport: chat_completions
+model:
+  provider: custom:magnitude
+  default: MODEL_ID
+```

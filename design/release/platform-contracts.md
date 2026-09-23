@@ -33,7 +33,7 @@ Every supported host must provide:
 - a writable per-user data directory that supports atomic rename and execution of installed native
   files;
 - ordinary child-process creation and a long-lived background ACN process;
-- local loopback TCP sockets for client, ACN, and ICN communication; and
+- local loopback TCP sockets for client, ACN, and ICN communication, plus an optional additional ACN listener on a network interface when the user enables network access; and
 - DNS, trusted certificate roots, and outbound HTTPS for initial artifact acquisition and repair.
 
 Once a complete installation is cached, release acquisition does not require network access. Model

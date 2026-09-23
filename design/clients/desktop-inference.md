@@ -3,11 +3,9 @@ applies_to:
   - assets/hardware/**
   - desktop/test/hardware/**
   - desktop/src/*.ts
-  - desktop/src/renderer*
   - desktop/src/*.tsx
-  - desktop/src/desktop-rpc.ts
-  - desktop/src/electron-rpc.ts
-  - desktop/src/login-startup.ts
+  - packages/daemon-management/src/desktop-native/*-preferences.ts
+  - packages/storage/src/types/config.ts
   - packages/sdk/src/desktop-host.ts
   - packages/client-common/src/desktop/**
   - packages/harness-connections/**
@@ -45,7 +43,7 @@ readiness; it never substitutes a hardcoded version or the service protocol vers
 Main owns scheduled Magnitude-hosted update checks, automatic downloads and explicit Settings actions
 independently of the renderer and service readiness. The automatic-download preference does not
 disable checks. Window Close and observer loss cannot cancel admitted work. Magnitude-owned user data
-lives under the shared `.magnitude` root: canonical config owns the automatic-download preference,
+lives under the shared `.magnitude` root: canonical config owns appearance and the automatic-download preference,
 root identity.pem owns request identity, electron/ owns Electron userData and sessionData configured
 before profile initialization, state/ owns application coordination, and updates/ owns one installer
 and one update.json. Isolated development/test roots preserve the same layout.
@@ -169,7 +167,41 @@ action through the observed acquisition state. Catalog and My Models retain load
 Discover has no separate connection link or hint.
 
 The inference rewrite preserves the existing desktop/web visual identity. Reuse the existing
-appearance initializer and `magnitude.appearance` preference, with System, Light, and Dark choices.
+appearance initializer, with System, Light, and Dark choices. Desktop appearance is owned by the
+client host and persisted as `appearance` in its canonical config. Absence means System. Main reads
+it before window creation; the renderer reads it through the host bridge before its first render.
+Successful saves update native and renderer appearance; failed saves retain the previous appearance
+and surface an error. Desktop preference writes are serialized so appearance and update choices do
+not overwrite each other. Appearance reads never rewrite malformed configuration; existing general config recovery may
+preserve a corrupt backup and restore defaults. A failed startup appearance read uses
+System and reports the unavailable preference. Browser storage is not a desktop settings authority,
+and no old browser preference is imported. Renderer reloads reread the host preference independently
+of ACN readiness. The browser client retains its own persistence adapter around shared appearance
+rendering.
+
+Settings is a flat list of rows in two groups, General and About, each row a label with its
+control on the right and a one-line hint only when the state needs explaining: Theme (segmented
+control), Launch at login (switch), Model storage, and Automatic updates (switch), then one About row
+with the application version, update status, and the single update action for the current state.
+The version comes from the packaged bundle, or from the generated Magnitude version when unpackaged.
+
+Model storage is persisted as `modelsDirectory` in the canonical `config.json` that the service reads
+when it spawns the engine. The row shows the current path, marks the default, offers a native folder
+chooser and a return to the default, rejects relative paths, and re-reads the file whenever Settings
+opens so hand edits appear. Main records the folder in effect at launch; while the saved folder
+differs, a persistent toast in the window's bottom-right corner on every page states that a restart
+is required, offers Restart Magnitude, which relaunches the application through the ordinary quit
+path, and shows a copyable platform-specific command that moves the previous store into the new
+folder. Magnitude never moves model files itself.
+
+Network access is a General row with a switch, off by default, persisted as `network` in the same
+`config.json` that the service reads when it binds. Turning it on generates an API key once and
+reveals nested rows: Address (all interfaces or one detected IPv4 address, physical networks first,
+then Tailscale, then virtual adapters), API key (the key with the copy control, Regenerate, and a
+Require key switch that is on by default), and Reachable at (one OpenAI-compatible base URL for the
+chosen address, or the first physical address when all interfaces are selected). Main records the
+resolved settings in effect at launch; when the saved settings resolve differently the same restart
+toast appears, naming network settings. Connections shows harnesses only.
 The initializer installs the canonical client-common palette variables; importing Tailwind alone
 does not initialize that palette. Native window appearance follows the same selected preference. macOS integrates native traffic
 lights beside the collapse toggle in the sidebar’s top row, with branding below and no separate title bar. The sidebar border and main content extend to the window’s top edge. Collapsing slides the sidebar fully away while retaining the native controls and a background-free expand toggle. Content keeps the same width in both states and is centered in the remaining area; closing the sidebar adds margins instead of reflowing content. Reduced-motion settings disable the transition, and hidden navigation is inert. The toggle is pinned to the sidebar’s right edge when expanded and uses the same sidebar icon in both states. Windows integrates native caption controls

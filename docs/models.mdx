@@ -33,10 +33,24 @@ Click **Download** for the selected model. **My Models** shows downloaded models
 - **Stop model** unloads it without deleting the download. A later request can load it again.
 - **Remove** deletes the installed model files to recover disk space.
 
-Downloading and loading are different steps. A downloaded model uses disk space even while stopped; a loaded model also uses inference memory.
+Downloading and loading are different steps. A downloaded model uses disk space even while stopped; a loaded model also uses inference memory. Magnitude loads a model on demand when an agent requests it and unloads it when idle or memory is tight, so the first response after a while takes longer. Supported models use speculative decoding (MTP, DFlash, or DSpark) and prompt caching automatically.
+
+Models are stored in `~/.magnitude/models`. To use another folder, see [Settings](/settings#model-storage).
 
 ## Change your agent's model
 
 Choose a downloaded Magnitude model in your agent's model selector. If it isn't listed, reconnect the agent from **Connections**, then reload or restart it as described in its [integration guide](/integrations/overview).
 
 For terminal control, see [CLI reference](/reference).
+
+## Usage
+
+**Usage** shows local inference activity by model for **Today** or **All time**.
+
+| Metric | Meaning |
+| --- | --- |
+| Input tokens | Prompt and conversation tokens, including cached input. |
+| Cached input | Tokens reused from cache; a subset of input tokens. |
+| Output tokens | Generated tokens. |
+| Generation speed | Output tokens per second. |
+| Time to first token | Time before the response starts. Loading and prompt processing can delay it even when generation is fast. |

@@ -17,7 +17,8 @@ applies_to:
 
 The retained browser client consumes local model services. The inference-focused desktop has its
 own shell, specified in `desktop-inference.md`, and shares the established appearance system and UI
-primitives. Onboarding belongs exclusively to that desktop shell.
+primitives. Appearance rendering is independent of persistence: the browser adapter uses localStorage,
+while desktop preferences belong to its client host and canonical config. Onboarding belongs exclusively to that desktop shell.
 
 ## Authority and boundaries
 

@@ -1,3 +1,4 @@
+import { setBrowserAppearancePreference } from "../stores/browser-appearance"
 import { useMemo, useState, type ReactNode } from "react"
 import {
   ArrowLeftIcon,
@@ -44,7 +45,7 @@ import {
 } from "../state/web-atoms"
 import { SidebarEmptyState, SidebarLoadingState } from "./sidebar-states"
 import { ProjectFormDialog, RemoveProjectDialog } from "./project-dialogs"
-import { setAppearancePreference, useAppearancePreference } from "../stores/appearance-store"
+import { useAppearancePreference } from "../stores/appearance-store"
 import { Button } from "@/components/ui/button"
 import {
   DropdownMenu,
@@ -168,7 +169,7 @@ function SettingsNavigation({
               variant="unstyled"
               size="unstyled"
               type="button"
-              onClick={() => setAppearancePreference(nextAppearance)}
+              onClick={() => setBrowserAppearancePreference(nextAppearance)}
               className="flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-slate-150 dark:text-slate-400 dark:hover:bg-slate-800"
               aria-label={`Theme: ${appearance}`}
             >

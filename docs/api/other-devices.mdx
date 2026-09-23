@@ -1,0 +1,72 @@
+---
+title: "Other devices"
+description: "Use Magnitude from another computer, a tailnet, or a container."
+---
+
+By default the API is available only on the computer running Magnitude. Network access makes it available to other devices for inference. The app and model management stay on this computer.
+
+## Turn on network access
+
+1. Open **Settings → Network access** and turn it on.
+2. Choose an **Address**. **All interfaces** serves every network this computer is on. Choosing one address serves only that network.
+3. Copy the **API key**. Other devices send it with every request.
+4. Copy the **Reachable at** URL.
+5. Restart Magnitude when the **Restart required** notice appears.
+
+The first time the service listens on a network, macOS or Windows may ask whether to allow incoming connections. Allow them.
+
+## Another computer on your network
+
+Use the **Reachable at** URL as the base URL and the API key as the key. The address is the one this computer has on your Wi-Fi or Ethernet network, such as `http://192.168.1.20:10100/inference/v1`. It can change when the computer joins a different network.
+
+## Tailscale
+
+Choose the Tailscale address under **Address** to serve only your tailnet. Other devices on the tailnet use `http://100.x.y.z:10100/inference/v1`. Magnitude also accepts its MagicDNS name, ending in `.ts.net`, so `tailscale serve` works without extra configuration.
+
+## Containers
+
+From a container on this computer, use `http://host.docker.internal:10100/inference/v1` with the API key. Network access must be on, because the container connects from its own address.
+
+## Windows with WSL
+
+An agent inside WSL reaches Magnitude either through loopback, with mirrored networking, or through the Windows host address, with network access on. See [Windows and WSL](/api/windows-wsl).
+
+## Configure the app or agent
+
+Use the **Reachable at** URL as the base URL and the API key as the key. For an app that is not a supported agent, the settings are the same as in [Other apps](/api/other-apps) with the network address in place of `127.0.0.1`.
+
+**Connections** cannot configure a supported agent on another device, so write its configuration yourself. Each agent page shows the exact block under **Configuration**. Replace `ADDRESS` with the **Reachable at** address, `API_KEY` with the API key, and `MODEL_ID` with the model's exact ID; take the context window and output limit from the model's **Details**.
+
+- [Pi](/integrations/pi#configuration)
+- [OpenCode](/integrations/opencode#configuration)
+- [Hermes](/integrations/hermes#configuration)
+- [OpenClaw](/integrations/openclaw#configuration)
+- [Codex](/integrations/codex#configuration)
+- [Claude Code](/integrations/claude-code#configuration)
+- [Oh My Pi](/integrations/oh-my-pi#configuration)
+- [Cline](/integrations/cline#configuration)
+
+Codex and Claude Code route hosted models through Magnitude's gateway. From another device, only local models are available to them.
+
+## Check the connection
+
+From the other device:
+
+```sh
+curl -H "Authorization: Bearer API_KEY" http://ADDRESS:10100/inference/v1/models
+```
+
+A model list means the connection works.
+
+## Custom hostnames
+
+Magnitude accepts requests addressed to its IP addresses, `localhost`, `host.docker.internal`, and `.ts.net` names. To reach it by another name, such as a reverse proxy or a LAN hostname, list the name under `network.allowedHosts` in the [configuration file](/reference/configuration-file).
+
+## Troubleshooting
+
+| Response | Meaning |
+| --- | --- |
+| Connection refused | Network access is off, Magnitude is not running, or the chosen address does not include the network you are on. |
+| `401` | The request did not include the API key, or the key changed. Copy it again from Settings. |
+| `403` on `/rpc` | Application control is never available from other devices. Only inference is. |
+| `421 Invalid Host header` | The request used a hostname Magnitude does not accept. Use an IP address or add the name to `network.allowedHosts`. |

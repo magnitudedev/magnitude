@@ -6,7 +6,9 @@ import type { MagnitudeHealthResponse } from "@magnitudedev/acn-protocol"
 import { FetchHttpClient, HttpBody, HttpClient, HttpClientRequest, HttpServer, HttpServerRequest, HttpServerResponse } from "@effect/platform"
 import * as HttpLayerRouter from "@effect/platform/HttpLayerRouter"
 import { Rpc, RpcGroup, RpcSerialization, RpcServer } from "@effect/rpc"
-import { Cause, Context, Effect, Layer, Schema, Stream } from "effect"
+import { Cause, Context, Effect, Layer, Option, Schema, Stream } from "effect"
+import { networkInterfaces } from "node:os"
+import type { NetworkAccess } from "@magnitudedev/storage"
 import { IcnBinaryNotFound } from "@magnitudedev/icn"
 import { describe, expect, it, vi } from "vitest"
 import { ACN_INSTANCE_ID } from "./identity"
@@ -57,15 +59,18 @@ const TestRpcs = RpcGroup.make(
   Rpc.make("Watch", { success: Schema.String, stream: true }),
 )
 
-const listen = (router: HttpLayerRouter.HttpRouter, port: number) => Effect.gen(function* () {
+const listen = (router: HttpLayerRouter.HttpRouter, port: number, hostname = "127.0.0.1") => Effect.gen(function* () {
   const infrastructure = yield* Layer.build(BunHttpServer.layer({
-    hostname: "127.0.0.1", port, idleTimeout: 0,
+    hostname, port, idleTimeout: 0,
   }))
   const server = Context.get(infrastructure, HttpServer.HttpServer)
   yield* server.serve(router.asHttpEffect()).pipe(Effect.provide(infrastructure))
   if (server.address._tag !== "TcpAddress") return yield* Effect.dieMessage("Expected TCP")
-  return `http://127.0.0.1:${server.address.port}`
+  return server.address.port
 })
+const loopbackOrigin = (port: number) => `http://127.0.0.1:${port}`
+const externalAddress = () => Object.values(networkInterfaces()).flat()
+  .find(entry => entry !== undefined && entry.family === "IPv4" && !entry.internal)?.address
 
 describe("ACN public HTTP listener", () => {
   it("serves fenced RPC and inference with shared lifecycle health, without a shutdown listener", async () => {
@@ -78,15 +83,16 @@ describe("ACN public HTTP listener", () => {
         expect(request.headers.authorization).toBe("Bearer private-icn")
         return HttpServerResponse.text("inference models")
       }))
-      const icnOrigin = yield* listen(icn, 0)
+      const icnOrigin = loopbackOrigin(yield* listen(icn, 0))
       const publicRouter = yield* HttpLayerRouter.make
       yield* installAcnHealthRoutes(publicRouter, lifecycle)
       yield* installAcnPublicRoutes(publicRouter, lifecycle, {
         origin: new URL(icnOrigin),
         clientOptions: { headers: { authorization: "Bearer private-icn" } },
       })
-      const origin = yield* listen(publicRouter, 0)
+      const origin = loopbackOrigin(yield* listen(publicRouter, 0))
       expect(ACN_PUBLIC_PORT).toBe(10100)
+      expect(yield* (yield* http.get(`${origin}/`)).text).toContain("/inference/v1")
 
       const rpc = (base: string, id: string | undefined, tag = "Ping") => http.execute(
         HttpClientRequest.post(`${base}/rpc`, {
@@ -138,6 +144,74 @@ describe("ACN public HTTP listener", () => {
       expect((yield* http.get(`${origin}/health`)).status).toBe(503)
       expect((yield* rpc(origin, ACN_INSTANCE_ID)).status).toBe(503)
       expect(dispatched).toBe(1)
+    })).pipe(Effect.provide(FetchHttpClient.layer)))
+  })
+})
+
+describe("ACN network access", () => {
+  const network: NetworkAccess = {
+    enabled: true, bind: "0.0.0.0", apiKey: Option.some("mag-test-key"), requireApiKey: true, allowedHosts: ["my-mac.local"], warning: Option.none(),
+  }
+  it("keeps loopback callers unchanged and gates remote callers by key, host, and route", async () => {
+    const external = externalAddress()
+    if (external === undefined) return
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const http = yield* HttpClient.HttpClient
+      const lifecycle = yield* makeAcnServiceLifecycle()
+      const icn = yield* HttpLayerRouter.make
+      yield* icn.add("GET", "/v1/models", Effect.succeed(HttpServerResponse.text("inference models")))
+      const icnOrigin = loopbackOrigin(yield* listen(icn, 0))
+      const publicRouter = yield* HttpLayerRouter.make
+      yield* installAcnHealthRoutes(publicRouter, lifecycle, network)
+      yield* installAcnPublicRoutes(publicRouter, lifecycle, { origin: new URL(icnOrigin), clientOptions: { headers: {} } })
+      const port = yield* listen(publicRouter, 0, "0.0.0.0")
+      const rpcRouter = yield* HttpLayerRouter.make
+      yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie))
+      const local = loopbackOrigin(port)
+      const remote = `http://${external}:${port}`
+      const get = (url: string, headers: Record<string, string> = {}) => http.execute(HttpClientRequest.get(url, { headers }))
+      const rpc = (base: string) => http.execute(HttpClientRequest.post(`${base}/rpc`, { headers: { "x-magnitude-acn-id": ACN_INSTANCE_ID }, body: HttpBody.text("{}\n", "application/ndjson") }))
+
+      const localHealth = yield* get(`${local}/health`)
+      expect(localHealth.status).toBe(200)
+      expect(yield* localHealth.text).toContain('"id"')
+      expect((yield* get(`${local}/inference/v1/models`)).status).toBe(200)
+      expect((yield* rpc(local)).status).not.toBe(403)
+
+      const remoteHealth = yield* get(`${remote}/health`)
+      expect(remoteHealth.status).toBe(200)
+      expect(yield* remoteHealth.text).not.toContain('"id"')
+      expect((yield* rpc(remote)).status).toBe(403)
+      const unauthenticated = yield* get(`${remote}/inference/v1/models`)
+      expect(unauthenticated.status).toBe(401)
+      expect(unauthenticated.headers["www-authenticate"]).toContain("Bearer")
+      expect((yield* get(`${remote}/inference/v1/models`, { authorization: "Bearer magnitude-local" })).status).toBe(401)
+      const bearer = yield* get(`${remote}/inference/v1/models`, { authorization: "Bearer mag-test-key" })
+      expect(bearer.status).toBe(200)
+      expect(yield* bearer.text).toBe("inference models")
+      expect((yield* get(`${remote}/inference/v1/models`, { "x-api-key": "mag-test-key" })).status).toBe(200)
+
+      const preflight = yield* http.execute(HttpClientRequest.options(`${remote}/inference/v1/models`, { headers: { origin: "http://localhost:3000" } }))
+      expect(preflight.status).toBe(204)
+      expect(preflight.headers["access-control-allow-origin"]).toBe("http://localhost:3000")
+      expect((yield* http.execute(HttpClientRequest.options(`${remote}/inference/v1/models`, { headers: { origin: "http://evil.com" } }))).status).toBe(403)
+      expect((yield* get(`${remote}/health`, { host: "evil.com" })).status).toBe(421)
+      expect((yield* get(`${remote}/health`, { host: "my-mac.local:1" })).status).toBe(200)
+      expect((yield* get(`${remote}/health`, { host: "host.docker.internal:1" })).status).toBe(200)
+      expect((yield* get(`${remote}/health`, { host: "mac.tail1234.ts.net" })).status).toBe(200)
+    })).pipe(Effect.provide(FetchHttpClient.layer)))
+  })
+  it("refuses non-local hosts and never gates while loopback only", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const http = yield* HttpClient.HttpClient
+      const lifecycle = yield* makeAcnServiceLifecycle()
+      const publicRouter = yield* HttpLayerRouter.make
+      yield* installAcnHealthRoutes(publicRouter, lifecycle)
+      const origin = loopbackOrigin(yield* listen(publicRouter, 0))
+      const get = (headers: Record<string, string>) => http.execute(HttpClientRequest.get(`${origin}/health`, { headers }))
+      expect((yield* get({ host: "192.168.1.2:1" })).status).toBe(421)
+      expect((yield* get({ host: "host.docker.internal" })).status).toBe(421)
+      expect((yield* get({ host: "localhost:1" })).status).toBe(503)
     })).pipe(Effect.provide(FetchHttpClient.layer)))
   })
 })

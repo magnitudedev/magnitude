@@ -3,6 +3,38 @@ import { Schema } from "effect"
 import { DesktopUpdateState } from "./desktop-update"
 export { DesktopUpdateState } from "./desktop-update"
 
+export const AppearancePreference = Schema.Literal("system", "light", "dark")
+export type AppearancePreference = typeof AppearancePreference.Type
+
+/** Where downloaded models are stored. The engine reads the folder once at service start. */
+export const ModelStorageSettings = Schema.Struct({
+  active: Schema.String,
+  path: Schema.String,
+  source: Schema.Literal("Default", "Configured"),
+  defaultPath: Schema.String,
+  warning: Schema.NullOr(Schema.String),
+})
+export type ModelStorageSettings = typeof ModelStorageSettings.Type
+
+export const NetworkInterfaceAddress = Schema.Struct({ name: Schema.String, address: Schema.String, kind: Schema.Literal("lan", "tailscale", "virtual") })
+export const NetworkAccessSettings = Schema.Struct({
+  enabled: Schema.Boolean,
+  bind: Schema.NullOr(Schema.String),
+  requireApiKey: Schema.Boolean,
+  apiKey: Schema.NullOr(Schema.String),
+  interfaces: Schema.Array(NetworkInterfaceAddress),
+  port: Schema.Int,
+  pending: Schema.Boolean,
+  warning: Schema.NullOr(Schema.String),
+})
+export type NetworkAccessSettings = typeof NetworkAccessSettings.Type
+export const NetworkAccessChange = Schema.Struct({
+  enabled: Schema.optional(Schema.Boolean),
+  bind: Schema.optional(Schema.NullOr(Schema.String)),
+  requireApiKey: Schema.optional(Schema.Boolean),
+})
+export type NetworkAccessChange = typeof NetworkAccessChange.Type
+
 export const ApplicationUpdateAction = Schema.Literal("status", "check", "download", "install", "discard")
 export type ApplicationUpdateAction = typeof ApplicationUpdateAction.Type
 export class ApplicationUpdateControlFailed extends Schema.TaggedError<ApplicationUpdateControlFailed>()("ApplicationUpdateControlFailed", { message: Schema.String }) {}

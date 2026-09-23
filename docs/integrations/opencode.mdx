@@ -25,16 +25,23 @@ Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e2b-it-qat:gguf:q4`
 
 ## Configuration
 
-Default configuration files:
+**Connect** writes `~/.config/opencode/opencode.json`. Location overrides: `OPENCODE_CONFIG` and `XDG_CONFIG_HOME`.
 
-- `~/.config/opencode/opencode.json`
+Write the configuration yourself only when the agent runs where Connections cannot reach it, such as another device or WSL; see [Other devices](/api/other-devices) for `ADDRESS` and `API_KEY`.
 
-On Windows, `~` means your user profile directory.
+`~/.config/opencode/opencode.json`:
 
-Supported location overrides: `OPENCODE_CONFIG`, `XDG_CONFIG_HOME`. The paths displayed in Connections show which files Magnitude is actually checking.
-
-## Repair or disconnect
-
-If Connections shows **Connection needs repair**, click **Repair connection**. To stop using the integration, click **Disconnect**, then restart the agent.
-
-See [connection states](/integrations/overview#connection-states) if the agent is not detected or its configuration cannot be verified.
+```json
+{
+  "provider": {
+    "magnitude": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Magnitude",
+      "options": { "baseURL": "http://ADDRESS:10100/inference/v1", "apiKey": "API_KEY" },
+      "models": {
+        "MODEL_ID": { "name": "MODEL_ID", "limit": { "context": 32768, "output": 8192 } }
+      }
+    }
+  }
+}
+```

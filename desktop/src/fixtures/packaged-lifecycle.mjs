@@ -163,7 +163,7 @@ try {
     await theme.getByRole('button', { name: preference === 'light' ? 'Light' : 'Dark', exact: true }).click();
     await eventually(() => window.evaluate(() => document.documentElement.dataset.theme), preference);
     await eventually(() => app.evaluate(({ nativeTheme }) => nativeTheme.themeSource), preference);
-    assert.equal(await window.evaluate(() => localStorage.getItem('magnitude.appearance')), preference);
+    assert.equal(JSON.parse(await readFile(join(profile, 'config.json'), 'utf8')).appearance, preference);
   }
   await window.reload();
   await eventually(() => window.evaluate(() => document.documentElement.dataset.theme), 'dark');
@@ -171,7 +171,7 @@ try {
   assert.equal(await theme.getByRole('button', { name: 'Dark', exact: true }).getAttribute('aria-pressed'), 'true');
   await theme.getByRole('button', { name: 'System', exact: true }).click();
   await eventually(() => app.evaluate(({ nativeTheme }) => nativeTheme.themeSource), 'system');
-  assert.equal(await window.evaluate(() => localStorage.getItem('magnitude.appearance')), null);
+  assert.equal(JSON.parse(await readFile(join(profile, 'config.json'), 'utf8')).appearance, 'system');
   await eventually(() => window.evaluate(() => document.documentElement.dataset.theme === (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')), true);
   console.log('Appearance preference persists across reload and synchronizes the native theme');
   // Native macOS role invocation is covered by CUA with a separate passive visibility observer.

@@ -33,6 +33,15 @@ import {
   makeGlobalStorage,
   ProjectStorageLiveFromCwd,
   VersionLive,
+  MagnitudeConfigSchema,
+  readStructuredFile,
+  resolveNetworkAccess,
+  isAllowedHostHeader,
+  isLoopbackAddress,
+  authorizesRemoteInference,
+  LOOPBACK_ONLY,
+  ALL_INTERFACES_BIND,
+  type NetworkAccess,
 } from "@magnitudedev/storage"
 import type { JsonLineChannelFailed } from "@magnitudedev/utils/json-line-channel"
 import {
@@ -132,7 +141,6 @@ const CORS_ALLOWED_HEADERS =
   "Accept, Authorization, Content-Type, Content-Length, Magnitude-Include-Progress, anthropic-version, anthropic-beta, x-api-key, x-magnitude-acn-id, traceparent, tracestate, baggage, b3, x-b3-traceid, x-b3-spanid, x-b3-parentspanid, x-b3-sampled, x-b3-flags"
 const LOCAL_HTTP_ORIGIN =
   /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/
-const LOCAL_HTTP_HOST = /^(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/
 
 const closeApplication = (scope: Scope.CloseableScope) =>
   Scope.close(scope, Exit.void).pipe(
@@ -159,10 +167,10 @@ export const acnStartupFailureDetail = (cause: Cause.Cause<unknown>): string => 
   return "Magnitude service could not start. See diagnostics for details."
 }
 
+const DESKTOP_APP_ORIGIN = "magnitude://app"
+
 function isAllowedCorsOrigin(origin: string): boolean {
-  return (
-    LOCAL_HTTP_ORIGIN.test(origin) || origin === "file://" || origin === "null"
-  )
+  return LOCAL_HTTP_ORIGIN.test(origin) || origin === DESKTOP_APP_ORIGIN
 }
 
 function corsHeadersFor(
@@ -405,9 +413,27 @@ const AcnDebugServicesLayer = (dataDir: string) => {
   )
 }
 
+/**
+ * The listener binds once, so network access is read from config.json here at startup; a change
+ * applies at the next service start. Anything unreadable means loopback only.
+ */
+export const readNetworkAccess = (dataDir: string) =>
+  readStructuredFile(makeGlobalStorage({ root: dataDir }).paths.configFile, MagnitudeConfigSchema.pick("network")).pipe(
+    Effect.map((result) => result._tag === "Invalid" || result._tag === "Missing" ? LOOPBACK_ONLY : resolveNetworkAccess(result.value.network)),
+    Effect.tapError((error) => Effect.logWarning("Could not read network access from config.json; listening on loopback only").pipe(
+      Effect.annotateLogs({ cause: error.message }),
+    )),
+    Effect.orElseSucceed(() => LOOPBACK_ONLY),
+    Effect.tap((network) => Option.isSome(network.warning) ? Effect.logWarning(network.warning.value) : Effect.void),
+    Effect.tap((network) => Effect.logInfo("Network access resolved").pipe(
+      Effect.annotateLogs({ bind: network.bind, requireApiKey: network.requireApiKey }),
+    )),
+  )
+
 const makeAcnInfrastructure = (
   options: AcnServerOptions,
   lifecycle: AcnServiceLifecycleApi,
+  bind: string,
 ) => {
   const dataDir = options.dataDir ?? defaultDataDir()
   return Layer.mergeAll(
@@ -422,7 +448,7 @@ const makeAcnInfrastructure = (
     FetchHttpClient.layer,
     BunHttpServer.layer({
       port: options.port ?? ACN_PUBLIC_PORT,
-      hostname: "127.0.0.1",
+      hostname: bind,
       idleTimeout: 0,
     }),
     HttpLayerRouter.layer,
@@ -540,6 +566,10 @@ const makeInferenceProxy = (
       return HttpServerResponse.text("Unsupported request transport", { status: 500 })
     }
     if (protocol === "codex" && source.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      const upgradeOrigin = source.headers.get("origin")
+      if (upgradeOrigin !== null && !isAllowedCorsOrigin(upgradeOrigin)) {
+        return HttpServerResponse.empty({ status: 403 })
+      }
       return yield* makeCodexWebSocketProxy(request, source, icn, usage)
     }
     const response = anthropicGateway !== undefined
@@ -581,27 +611,66 @@ const makeInferenceProxy = (
   })
 }
 
+const ROOT_BODY = [
+  "Magnitude local service.",
+  "",
+  "OpenAI-compatible API:     /inference/v1",
+  "Anthropic-compatible API:  /inference/anthropic",
+  "Available models:          /inference/v1/models",
+  "",
+  "Documentation: https://docs.magnitude.dev/integrations/custom-apps",
+  "",
+].join("\n")
+
+const invalidHostMessage = (network: NetworkAccess) => network.enabled
+  ? "Invalid Host header. Magnitude accepts local names, IP addresses, host.docker.internal, *.ts.net, and names listed under network.allowedHosts in config.json."
+  : "Invalid Host header. Network access is off; turn it on in Magnitude Settings to reach this service from other devices."
+
+/** Whether the request comes from this machine. With loopback binding every caller is local. */
+const isLocalCaller = (request: HttpServerRequest.HttpServerRequest, network: NetworkAccess) => Option.match(request.remoteAddress, {
+  onNone: () => !network.enabled,
+  onSome: isLoopbackAddress,
+})
+
 export const installAcnHealthRoutes = (
   router: HttpLayerRouter.HttpRouter,
   lifecycle: AcnServiceLifecycleApi,
+  network: NetworkAccess = LOOPBACK_ONLY,
 ) => Effect.gen(function* () {
   yield* router.addGlobalMiddleware((responseEffect) => Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest
-    const host = request.headers.host
-    if (host === undefined || !LOCAL_HTTP_HOST.test(host)) {
-      return HttpServerResponse.text("Invalid Host header", { status: 421 })
+    if (!isAllowedHostHeader(request.headers.host, network)) {
+      return HttpServerResponse.text(invalidHostMessage(network), { status: 421 })
+    }
+    if (!isLocalCaller(request, network)) {
+      const path = new URL(request.url, "http://magnitude").pathname
+      // Application control (files, sessions, agents) never leaves this machine, whatever the bind.
+      if (path === "/rpc" || path.startsWith("/rpc/")) {
+        return HttpServerResponse.text("Magnitude application control is available only on the machine running Magnitude.", { status: 403 })
+      }
+      // Preflight carries no credentials by design; the request that follows is checked.
+      if (path.startsWith("/inference/") && request.method !== "OPTIONS" && !authorizesRemoteInference({ authorization: request.headers.authorization, "x-api-key": request.headers["x-api-key"] }, network)) {
+        return HttpServerResponse.unsafeJson({ error: {
+          message: "A Magnitude API key is required from other devices. Copy it from Settings → Network access and send it as a Bearer token.",
+          type: "authentication_error",
+        } }, { status: 401, headers: { "www-authenticate": "Bearer realm=\"magnitude\"" } })
+      }
     }
     return withCors(yield* responseEffect, request)
   }))
   yield* router.add("OPTIONS", "/*", OptionsRouteHandler)
-  yield* router.add("GET", "/health", lifecycle.state.pipe(
-    Effect.flatMap((state) => encodeHealthResponse(makeHealthResponse(ACN_VERSION, state)).pipe(
-      Effect.flatMap((body) => HttpServerResponse.json(body, {
-        status: state._tag === "Ready" ? 200 : 503,
-      })),
-    )),
-    Effect.orDie,
-  ))
+  yield* router.add("GET", "/", Effect.succeed(HttpServerResponse.text(ROOT_BODY)))
+  yield* router.add("GET", "/health", Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest
+    const state = yield* lifecycle.state
+    const status = state._tag === "Ready" ? 200 : 503
+    // Remote callers learn readiness only; the instance identity fences local RPC clients.
+    if (!isLocalCaller(request, network)) {
+      return HttpServerResponse.unsafeJson({ service: "magnitude-acn", version: ACN_VERSION, state: { _tag: state._tag } }, { status })
+    }
+    const body = yield* encodeHealthResponse(makeHealthResponse(ACN_VERSION, state))
+    return yield* HttpServerResponse.json(body, { status })
+  }).pipe(Effect.orDie))
 })
 
 export const installAcnPublicRoutes = (
@@ -656,14 +725,26 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
       Effect.ensuring(closeApplication(applicationScope)),
     ))
     yield* Effect.addFinalizer(() => closeApplicationScope)
+    const network = yield* readNetworkAccess(dataDir).pipe(Effect.provide(BunFileSystem.layer))
+    // Loopback always listens; all-interfaces subsumes it, any other address is added beside it.
+    const primaryBind = network.bind === ALL_INTERFACES_BIND ? ALL_INTERFACES_BIND : "127.0.0.1"
     const infrastructure = yield* Layer.buildWithScope(
-      makeAcnInfrastructure(options, lifecycle),
+      makeAcnInfrastructure(options, lifecycle, primaryBind),
       applicationScope,
     )
     const router = Context.get(infrastructure, HttpLayerRouter.HttpRouter)
     const server = Context.get(infrastructure, HttpServer.HttpServer)
-    yield* installAcnHealthRoutes(router, lifecycle)
+    yield* installAcnHealthRoutes(router, lifecycle, network)
     yield* server.serve(router.asHttpEffect()).pipe(Effect.provide(infrastructure))
+    if (network.enabled && network.bind !== primaryBind) {
+      const additional = yield* Layer.buildWithScope(BunHttpServer.layer({
+        port: options.port ?? ACN_PUBLIC_PORT,
+        hostname: network.bind,
+        idleTimeout: 0,
+      }), applicationScope)
+      const additionalServer = Context.get(additional, HttpServer.HttpServer)
+      yield* additionalServer.serve(router.asHttpEffect()).pipe(Effect.provide(Context.merge(infrastructure, additional)))
+    }
     yield* owner.awaitShutdown.pipe(
       Effect.zipRight(lifecycle.beginStopping({ reason: "administrative" })),
       Effect.catchAll(error => lifecycle.beginStopping({ reason: "fatal", detail: error.message })),

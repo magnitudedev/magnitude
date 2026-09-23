@@ -1,0 +1,51 @@
+---
+title: "Settings"
+description: "What each setting does and where it is saved."
+---
+
+Open **Settings** in the sidebar. Every setting is a key in `config.json`; editing the file and using Settings are equivalent. See [Configuration file](/reference/configuration-file).
+
+## Theme
+
+System, Light, or Dark. Applies immediately.
+
+## Launch at login
+
+Starts Magnitude in the background with its tray icon when you log in. The window stays closed. On macOS, the first enable may ask you to allow Magnitude under **System Settings → General → Login Items**.
+
+## Model storage
+
+Downloaded models are kept in `~/.magnitude/models`, or `%USERPROFILE%\.magnitude\models` on Windows. Click **Change…** to choose another folder, or **Use default** to return to it. The new folder is used after Magnitude restarts; a **Restart required** notice appears until then.
+
+Changing the folder does not move models. Models in the previous folder stay there and are not listed until you move them. To move them, quit Magnitude, run the command shown in the notice, then open Magnitude again:
+
+<Tabs>
+<Tab title="macOS / Linux">
+```sh
+mv "PREVIOUS_FOLDER/"* "NEW_FOLDER/"
+```
+</Tab>
+<Tab title="Windows">
+```powershell
+robocopy "PREVIOUS_FOLDER" "NEW_FOLDER" /E /MOVE
+```
+</Tab>
+</Tabs>
+
+The folder must be on a volume that supports symbolic links and file permissions, such as APFS, ext4, or NTFS. exFAT and FAT32 volumes are not supported. If the folder is itself a symbolic link, Magnitude uses the folder it points to.
+
+## Network access
+
+Off by default. When on, other devices can use Magnitude for inference. Nothing else is exposed: model management and the app stay on this computer.
+
+| Setting | Meaning |
+| --- | --- |
+| Address | **All interfaces** accepts connections on every address this computer has. Choosing one address, such as a Tailscale address, accepts connections only on that network. |
+| API key | Generated once. Other devices send it with every request. Turn off **Require key** only on a network you trust. **Regenerate** replaces it. |
+| Reachable at | The base URL to use on other devices. |
+
+Changes apply after Magnitude restarts. For how to connect from another computer, a tailnet, a container, or WSL, see [Other devices](/api/other-devices).
+
+## Automatic updates
+
+Downloads updates in the background when they are available. Installing an update still requires **Restart to update**.

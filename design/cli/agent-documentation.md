@@ -26,6 +26,9 @@ parallel CLI onboarding procedure or built-in Magnitude harness. Agents may perf
 model and connection operations through the documented commands; documentation does not create
 another interactive product flow.
 
+The `remote-access` topic tells an agent how to reach the inference API from another device, a
+container, or WSL: the base URLs, the API key rule, and the meaning of each refusal.
+
 The `speculative-methods` topic owns the self-contained user-facing explanation of the acceleration
 methods reported by Magnitude. It defines their practical typical ordering, explains the mechanism
 behind each method, and states that Magnitude acquires, validates, and activates reviewed draft

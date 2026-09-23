@@ -1,0 +1,40 @@
+---
+title: "Overview"
+description: "Base URLs, keys, and model IDs for the local inference API."
+---
+
+Magnitude serves an HTTP API on port `10100` while it is running. **Connections** uses it to configure supported agents. Any other OpenAI-compatible or Anthropic-compatible client can use it directly.
+
+## Base URLs
+
+| Client type | Base URL |
+| --- | --- |
+| OpenAI-compatible | `http://127.0.0.1:10100/inference/v1` |
+| Anthropic-compatible | `http://127.0.0.1:10100/inference/anthropic` |
+
+Clients append their own paths, such as `/chat/completions` or `/v1/messages`. If a client asks for a full endpoint URL instead, use the paths in [Endpoints](/api/endpoints).
+
+From another device, replace `127.0.0.1` with the address shown under **Reachable at** in **Settings → Network access**. See [Other devices](/api/other-devices).
+
+## API keys
+
+| Caller | Key |
+| --- | --- |
+| This computer | None required. If the client insists on a value, any value works. |
+| Other devices | The key from **Settings → Network access**, sent as `Authorization: Bearer KEY` or `x-api-key: KEY`. |
+
+## Model IDs
+
+List the models available for inference:
+
+```sh
+curl http://127.0.0.1:10100/inference/v1/models
+```
+
+Use the exact `id` from the response as the model name in requests. Display names are not accepted. Magnitude loads the model on the first request, which takes longer than later requests.
+
+## Scope
+
+The API provides inference only: listing models and generating text. Downloading models, managing them, and the Magnitude app itself are not available over the API.
+
+Opening `http://127.0.0.1:10100` in a browser shows a short text summary of these paths.

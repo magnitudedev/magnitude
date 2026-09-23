@@ -61,7 +61,7 @@
     },
     "pages": [
       {
-        "group": "Installation",
+        "group": "Get started",
         "pages": [
           "introduction",
           "get-started",
@@ -69,11 +69,12 @@
           "installation/windows",
           "installation/linux",
           "hardware",
-          "models"
+          "models",
+          "settings"
         ]
       },
       {
-        "group": "Integrations",
+        "group": "Connect your agent",
         "pages": [
           "integrations/overview",
           "integrations/pi",
@@ -83,15 +84,24 @@
           "integrations/codex",
           "integrations/claude-code",
           "integrations/oh-my-pi",
-          "integrations/cline",
-          "integrations/custom-apps"
+          "integrations/cline"
         ]
       },
       {
-        "group": "More Info",
+        "group": "API",
         "pages": [
-          "inference",
+          "api/overview",
+          "api/endpoints",
+          "api/other-apps",
+          "api/other-devices",
+          "api/windows-wsl"
+        ]
+      },
+      {
+        "group": "Reference",
+        "pages": [
           "reference",
+          "reference/configuration-file",
           "troubleshooting",
           "faq"
         ]

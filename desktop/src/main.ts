@@ -17,7 +17,7 @@ import { PreparedUpdateInstaller, reconcilePreparedUpdate, installPreparedUpdate
 import { isNewerVersion } from "@magnitudedev/release"
 import { ReleaseTarget, UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
 import { makeUpdateIdentity } from "./update-identity"
-import { makeUpdatePreferences, UpdatePreferences } from "@magnitudedev/daemon-management/desktop-native"
+import { makeAppearancePreferences, makeModelStoragePreferences, makeNetworkPreferences, listNetworkInterfaces, networkAccessEquals, LOOPBACK_ONLY, makeUpdatePreferences, UpdatePreferences } from "@magnitudedev/daemon-management/desktop-native"
 import { makeUpdateSchedule } from "./update-schedule"
 import { readUpdateConfiguration, isUpdateAcceptanceBuild } from "./update-config"
 import { NativeTrayFactory, NativeTrayFailed, TrayOwner, TrayOwnerLive } from "./tray-owner"
@@ -27,6 +27,7 @@ import { NodeSqliteDriverLayer } from "@magnitudedev/daemon-management/node"
 import { makeHarnessConnectionService, resolveHarnessConnectionPaths, harnessExecutableSearchPath } from "@magnitudedev/harness-connections"
 import { HttpsUrlSchema, MAGNITUDE_RPC_VERSION } from "@magnitudedev/sdk"
 import { slate } from "@magnitudedev/client-common"
+import { DESKTOP_APP_ORIGIN, handleAppProtocol, resolveRendererDir } from "./app-protocol"
 import { app, autoUpdater, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, powerMonitor, shell, Tray } from "electron"
 import { join, resolve, dirname } from "node:path"
 import { homedir } from "node:os"
@@ -49,6 +50,7 @@ import { type ApplicationSnapshot, type OwnedServiceState } from "@magnitudedev/
 import { HostError, ApplicationAction, InferenceHostRpcs, type Page } from "./desktop-rpc"
 import { makeElectronRpcServerLayer } from "./electron-rpc"
 import { resolveHarnessEnvironment, harnessCommandExecutor } from "./shell-env"
+import { MAGNITUDE_VERSION } from "@magnitudedev/version"
 
 app.setName("Magnitude")
 if (process.platform === "win32") app.setAppUserModelId(WINDOWS_APPLICATION_ID)
@@ -100,6 +102,20 @@ const program = Effect.scoped(Effect.gen(function* () {
     }).pipe(Effect.provide(NativeMacApplicationInstallation))
   }
   yield* Effect.promise(() => app.whenReady())
+  yield* Effect.sync(() => handleAppProtocol(resolveRendererDir(here)))
+  const preferenceWrites = yield* Effect.makeSemaphore(1)
+  const appearance = yield* makeAppearancePreferences(dataDir).pipe(Effect.provide(NodeContext.layer))
+  const initialAppearance = yield* appearance.read.pipe(Effect.catchAll(error =>
+    Effect.logWarning(error.message).pipe(Effect.as("system" as const))))
+  nativeTheme.themeSource = initialAppearance
+  const modelStorage = yield* makeModelStoragePreferences(dataDir).pipe(Effect.provide(NodeContext.layer))
+  // The service reads the same setting when it spawns the engine; this is what the running service uses.
+  const activeModelStorage = yield* modelStorage.read.pipe(Effect.map(settings => settings.path), Effect.catchAll(error =>
+    Effect.logWarning(error.message).pipe(Effect.as(modelStorage.defaultPath))))
+  const networkPreferences = yield* makeNetworkPreferences(dataDir).pipe(Effect.provide(NodeContext.layer))
+  // The service resolves the same setting when it binds; this is what the running service listens on.
+  const activeNetwork = yield* networkPreferences.read.pipe(Effect.map(settings => settings.resolved), Effect.catchAll(error =>
+    Effect.logWarning(error.message).pipe(Effect.as(LOOPBACK_ONLY))))
   // A system shutdown can end our process before asynchronous cleanup finishes.
   // Never veto it; native lifetime containment remains the hard fallback.
   if (process.platform !== "win32") {
@@ -111,7 +127,7 @@ const program = Effect.scoped(Effect.gen(function* () {
   yield* initializeLoginStartup(loginStartup, stateDir, isolatedProfile).pipe(Effect.provide(NodeContext.layer), Effect.catchAll(error => Effect.logWarning(error.message)))
   const rendererRecovery = yield* makeRendererRecovery
   const actions = yield* PubSub.unbounded<typeof ApplicationAction.Type>()
-  const quit = yield* Queue.sliding<"Quit" | "RestartUpdate">(1)
+  const quit = yield* Queue.sliding<"Quit" | "RestartUpdate" | "Relaunch">(1)
   const state = yield* Ref.make<OwnedServiceState | null>(null)
   const model = yield* Ref.make({ label: "Model status unavailable", canStop: false })
   const runtime = yield* Effect.runtime<never>()
@@ -190,7 +206,7 @@ const program = Effect.scoped(Effect.gen(function* () {
   let wantsWindow = !background
   const loadRenderer = () => Effect.tryPromise(() => process.env.ELECTRON_RENDERER_URL
     ? window.loadURL(process.env.ELECTRON_RENDERER_URL)
-    : window.loadFile(join(here, "../renderer/index.html"))).pipe(
+    : window.loadURL(`${DESKTOP_APP_ORIGIN}/index.html`)).pipe(
       Effect.catchAll(error => rendererRecovery.loadFailed.pipe(Effect.zipRight(Effect.logError(error)))),
     )
   const show = (page?: Page) => Ref.get(state).pipe(Effect.flatMap(current => current?._tag === "Stopping" || current?._tag === "Stopped" ? Effect.void : Effect.gen(function* () {
@@ -273,9 +289,10 @@ const program = Effect.scoped(Effect.gen(function* () {
   const handlers = InferenceHostRpcs.toLayer({
     MachineIdentity: () => machineIdentity,
     Memory: () => observeApplicationMemory(memory, () => !!window && !window.isDestroyed() && window.isVisible()),
-    ApplicationInfo: () => Effect.sync(() => ({ version: app.getVersion() })),
+    // Unpackaged runs report Electron's own version; the generated Magnitude version is the truth there.
+    ApplicationInfo: () => Effect.sync(() => ({ version: app.isPackaged ? app.getVersion() : MAGNITUDE_VERSION })),
     Updates: () => updates.changes,
-    SetAutoDownload: ({ enabled }) => updates.setAutoDownload(enabled).pipe(Effect.mapError(connectionError), Effect.as({})),
+    SetAutoDownload: ({ enabled }) => preferenceWrites.withPermits(1)(updates.setAutoDownload(enabled)).pipe(Effect.mapError(connectionError), Effect.as({})),
     CheckUpdate: () => updateSchedule.check.pipe(Effect.mapError(connectionError), Effect.as({})),
     DownloadUpdate: () => updates.download.pipe(Effect.mapError(connectionError), Effect.as({})),
     DiscardUpdate: () => updates.discard.pipe(Effect.mapError(connectionError), Effect.as({})),
@@ -289,7 +306,33 @@ const program = Effect.scoped(Effect.gen(function* () {
     Observe: () => snapshots,
     Actions: () => Stream.concat(Stream.succeed({ _tag: "Navigate" as const, page: pendingPage }), Stream.fromPubSub(actions)),
     PresentModel: value => Ref.set(model, value).pipe(Effect.zipRight(refreshTray), Effect.as({})),
-    Appearance: ({ preference }) => Effect.sync(() => { nativeTheme.themeSource = preference; window?.setBackgroundColor(nativeTheme.shouldUseDarkColors ? slate[925] : slate[50]); return {} }),
+    GetAppearance: () => appearance.read.pipe(Effect.tapError(() => Effect.sync(() => { nativeTheme.themeSource = "system" })),
+      Effect.mapError(connectionError), Effect.tap(preference =>
+      Effect.sync(() => { nativeTheme.themeSource = preference }))),
+    SetAppearance: ({ preference }) => preferenceWrites.withPermits(1)(appearance.write(preference)).pipe(Effect.mapError(connectionError),
+      Effect.tap(() => Effect.sync(() => { nativeTheme.themeSource = preference })), Effect.as({})),
+    GetModelStorage: () => modelStorage.read.pipe(Effect.mapError(connectionError), Effect.map(settings =>
+      ({ active: activeModelStorage, path: settings.path, source: settings.source, defaultPath: settings.defaultPath, warning: Option.getOrNull(settings.warning) }))),
+    SetModelStorage: ({ path }) => preferenceWrites.withPermits(1)(modelStorage.write(Option.fromNullable(path))).pipe(Effect.mapError(connectionError), Effect.as({})),
+    ChooseModelStorageDirectory: () => Effect.tryPromise({
+      try: () => window && !window.isDestroyed()
+        ? dialog.showOpenDialog(window, { title: "Choose a folder for downloaded models", buttonLabel: "Choose", properties: ["openDirectory", "createDirectory"] })
+        : dialog.showOpenDialog({ title: "Choose a folder for downloaded models", buttonLabel: "Choose", properties: ["openDirectory", "createDirectory"] }),
+      catch: () => new HostError({ message: "The folder chooser could not be opened." }),
+    }).pipe(Effect.map(result => ({ path: result.canceled ? null : result.filePaths[0] ?? null }))),
+    Relaunch: () => Queue.offer(quit, "Relaunch").pipe(Effect.as({})),
+    GetNetworkAccess: () => networkPreferences.read.pipe(Effect.mapError(connectionError), Effect.map(({ saved, resolved }) => ({
+      enabled: resolved.enabled,
+      bind: Option.isSome(saved) && saved.value.bind !== undefined ? saved.value.bind : null,
+      requireApiKey: Option.isSome(saved) ? saved.value.requireApiKey : true,
+      apiKey: Option.isSome(saved) ? saved.value.apiKey ?? null : null,
+      interfaces: listNetworkInterfaces(),
+      port,
+      pending: !networkAccessEquals(resolved, activeNetwork),
+      warning: Option.getOrNull(resolved.warning),
+    }))),
+    SetNetworkAccess: change => preferenceWrites.withPermits(1)(networkPreferences.update(change)).pipe(Effect.mapError(connectionError), Effect.as({})),
+    RegenerateNetworkApiKey: () => preferenceWrites.withPermits(1)(networkPreferences.regenerateApiKey).pipe(Effect.mapError(connectionError), Effect.as({})),
     LoginStartup: () => Stream.repeatEffectWithSchedule(loginStartup.read.pipe(Effect.catchAll(error => Effect.succeed({ _tag: "Unavailable" as const, message: error.message }))), Schedule.spaced("2 seconds")).pipe(Stream.mapError(connectionError)),
     SetLoginStartup: ({ enabled }) => loginStartup.set(enabled).pipe(Effect.mapError(connectionError), Effect.as({})),
     Connections: () => Stream.concat(Stream.succeed(undefined), Stream.merge(Stream.fromPubSub(connectionChanges), Stream.fromSchedule(Schedule.spaced("2 seconds")))).pipe(Stream.mapEffect(() => connections.pipe(Effect.flatMap(service => service.inspect), Effect.map(connections => ({ _tag: "Ready" as const, connections })), Effect.catchAll(error => Effect.succeed({ _tag: "Unavailable" as const, message: error.message }))))),
@@ -383,7 +426,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     const stopped = yield* service.shutdown.pipe(Effect.either)
     if (stopped._tag === "Right") {
       if (systemShutdownRequested || intent === "Quit") return "Quit" as const
-      if (!restartPreparedUpdate) return "Relaunch" as const
+      if (intent === "Relaunch" || !restartPreparedUpdate) return "Relaunch" as const
       const installation = yield* restartPreparedUpdate({ showWindow: reopenAfterUpdate, allowAuthorizationPrompt: true }).pipe(Effect.either)
       if (installation._tag === "Left") yield* Effect.logError(installation.left.message)
       return installation._tag === "Right" && installation.right === "Started" ? "RestartUpdate" as const : "Relaunch" as const
@@ -401,7 +444,8 @@ const program = Effect.scoped(Effect.gen(function* () {
 Effect.runPromiseExit(program).then(Exit.match({
   onSuccess: intent => {
     exiting = true
-    if (intent === "Relaunch") app.relaunch({ args: reopenAfterUpdate ? [] : ["--background"] })
+    // `args` replaces the argument list, so keep the original ones (the app directory in development).
+    if (intent === "Relaunch") app.relaunch({ args: [...process.argv.slice(1).filter(argument => argument !== "--background"), ...(reopenAfterUpdate ? [] : ["--background"])] })
     // Native staging happens only during installation. Squirrel applies on ordinary exit;
     // the admitted helper preserves profile and window intent when relaunching afterward.
     app.quit()

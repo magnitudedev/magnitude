@@ -1,0 +1,54 @@
+---
+title: "Endpoints"
+description: "OpenAI-compatible and Anthropic-compatible routes with examples."
+---
+
+All paths are relative to `http://127.0.0.1:10100`. From another device, use the address from **Settings → Network access** and send the API key; see [Other devices](/api/other-devices).
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/health` | Returns `200` when the service is ready. |
+| `GET` | `/inference/v1/models` | List models available for inference. |
+| `POST` | `/inference/v1/chat/completions` | OpenAI Chat Completions, JSON or streaming. |
+| `POST` | `/inference/v1/responses` | OpenAI Responses, JSON or streaming. |
+| `POST` | `/inference/anthropic/v1/messages` | Anthropic Messages. `max_tokens` is required. |
+| `POST` | `/inference/anthropic/v1/messages/count_tokens` | Count input tokens for an Anthropic-format request. |
+
+Supported inputs and features depend on the model. Your application keeps the conversation history and executes any tools the model requests.
+
+## Chat completion
+
+Replace `MODEL_ID` with an ID from the models endpoint:
+
+```sh
+curl http://127.0.0.1:10100/inference/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "MODEL_ID",
+    "messages": [{"role": "user", "content": "Explain prompt caching in one paragraph."}],
+    "max_tokens": 256
+  }'
+```
+
+The generated text is in `choices[0].message.content`.
+
+## Streaming
+
+Add `"stream": true` to the request body. Responses arrive as server-sent events. With curl, add `-N` to print events as they arrive.
+
+## Anthropic Messages
+
+```sh
+curl http://127.0.0.1:10100/inference/anthropic/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{
+    "model": "MODEL_ID",
+    "max_tokens": 256,
+    "messages": [{"role": "user", "content": "Explain prompt caching in one paragraph."}]
+  }'
+```
+
+The generated text is in `content[0].text`.
+
+These examples use macOS and Linux quoting. On Windows, use `curl.exe` with quoting appropriate for your shell, or send the same JSON from your application.

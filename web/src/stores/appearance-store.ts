@@ -1,31 +1,15 @@
-import { Either, Schema } from "effect"
+import { AppearancePreference as AppearancePreferenceSchema } from "@magnitudedev/sdk/desktop-host"
+export { AppearancePreferenceSchema }
 import { useSyncExternalStore } from "react"
 import { injectPaletteCssVars } from "../styles/palette-css-vars"
 
-export const AppearancePreferenceSchema = Schema.Literal(
-  "system",
-  "light",
-  "dark"
-)
 export type AppearancePreference = typeof AppearancePreferenceSchema.Type
 export type ResolvedAppearance = Exclude<AppearancePreference, "system">
 
-const STORAGE_KEY = "magnitude.appearance"
 const listeners = new Set<() => void>()
 let preference: AppearancePreference = "system"
 let initialized = false
 let mediaQuery: MediaQueryList | null = null
-
-const readStoredPreference = (): AppearancePreference => {
-  try {
-    const decoded = Schema.decodeUnknownEither(AppearancePreferenceSchema)(
-      localStorage.getItem(STORAGE_KEY)
-    )
-    return Either.isRight(decoded) ? decoded.right : "system"
-  } catch {
-    return "system"
-  }
-}
 
 export const getResolvedAppearance = (): ResolvedAppearance => {
   if (preference !== "system") return preference
@@ -47,11 +31,11 @@ const publish = (): void => {
   listeners.forEach((listener) => listener())
 }
 
-export const initializeAppearance = (): void => {
+export const initializeAppearance = (initial: AppearancePreference = "system"): void => {
   if (initialized) return
   initialized = true
   injectPaletteCssVars()
-  preference = readStoredPreference()
+  preference = initial
   mediaQuery = matchMedia("(prefers-color-scheme: dark)")
   mediaQuery.addEventListener("change", () => {
     if (preference === "system") publish()
@@ -62,13 +46,6 @@ export const initializeAppearance = (): void => {
 export const setAppearancePreference = (next: AppearancePreference): void => {
   if (preference === next) return
   preference = next
-  try {
-    if (next === "system") localStorage.removeItem(STORAGE_KEY)
-    else localStorage.setItem(STORAGE_KEY, next)
-  } catch {
-    // Storage can be unavailable in privacy-restricted browser contexts. The
-    // live preference remains valid for the current renderer session.
-  }
   publish()
 }
 

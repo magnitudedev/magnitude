@@ -9,13 +9,13 @@ description: "Install Magnitude on Windows."
 - An x64 system for the native Windows build.
 - Free disk space for the app and downloaded models.
 
-The current Windows build supports CPU inference and compatible NVIDIA CUDA or Vulkan GPUs on Windows. A ROCm backend and native Windows ARM64 build are not available. See [Hardware](/hardware).
+The current Windows build supports CPU inference and compatible NVIDIA CUDA or Vulkan GPUs on Windows. See [Hardware](/hardware).
 
 ## Download and install
 
 1. Download the Windows installer from [Download Magnitude](https://magnitude.dev/download).
 2. Run the `.exe` and complete installation.
-3. Open Magnitude and follow [Get started](/get-started).
+3. Open Magnitude and follow [Quick start](/get-started).
 
 The installer installs for your user account under `%LOCALAPPDATA%\Programs\Magnitude`.
 
@@ -24,3 +24,5 @@ The installer installs for your user account under `%LOCALAPPDATA%\Programs\Magn
 Use **Settings → Application updates** to check for updates. **Restart to update** stops local inference while the application is replaced.
 
 Uninstall Magnitude through Windows **Settings → Apps**. Downloaded models and settings are stored separately in `%USERPROFILE%\.magnitude`; keep them if you intend to reinstall.
+
+Agents installed inside WSL need a small amount of configuration; see [Windows and WSL](/api/windows-wsl).

@@ -23,6 +23,14 @@ const command = (select: (client: InferenceHostClient) => Effect.Effect<unknown,
       ? failure.value.message : "Magnitude could not complete this action. Try again or check Status.")
   },
 }))
+const query = <A>(select: (client: InferenceHostClient) => Effect.Effect<A, unknown>) => runtime.runPromiseExit(Effect.flatMap(HostClient, select)).then(Exit.match({
+  onSuccess: value => value,
+  onFailure: cause => {
+    const failure = Cause.failureOption(cause)
+    throw new Error(Option.isSome(failure) && Schema.is(HostError)(failure.value)
+      ? failure.value.message : "Magnitude could not complete this action. Try again or check Status.")
+  },
+}))
 const api: DesktopApi = {
   memory: (value, error) => observe(client => client.Memory({}), value, error),
   machineIdentity: () => runtime.runPromise(Effect.flatMap(HostClient, client => client.MachineIdentity({}))),
@@ -37,7 +45,15 @@ const api: DesktopApi = {
   observe: (value, error) => observe(client => client.Observe({}), state => value(Schema.encodeSync(ApplicationSnapshot)(state)), error),
   actions: value => observe(client => client.Actions({}), value, message => console.error(message)),
   presentModel: value => command(client => client.PresentModel(value)),
-  appearance: preference => command(client => client.Appearance({ preference })),
+  getAppearance: () => runtime.runPromise(Effect.flatMap(HostClient, client => client.GetAppearance({}))),
+  setAppearance: preference => command(client => client.SetAppearance({ preference })),
+  getModelStorage: () => query(client => client.GetModelStorage({})),
+  setModelStorage: path => command(client => client.SetModelStorage({ path })),
+  chooseModelStorageDirectory: () => query(client => client.ChooseModelStorageDirectory({})).then(result => result.path),
+  relaunch: () => command(client => client.Relaunch({})),
+  getNetworkAccess: () => query(client => client.GetNetworkAccess({})),
+  setNetworkAccess: change => command(client => client.SetNetworkAccess(change)),
+  regenerateNetworkApiKey: () => command(client => client.RegenerateNetworkApiKey({})),
   loginStartup: (value, error) => observe(client => client.LoginStartup({}), value, error),
   setLoginStartup: enabled => command(client => client.SetLoginStartup({ enabled })),
   connections: (value, error) => observe(client => client.Connections({}), rows => value(Schema.encodeSync(DesktopConnectionsSnapshot)(rows)), error),

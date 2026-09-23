@@ -5,6 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { nativeWindowsJobOwnerLayer, nativeWindowsPrivatePipesLayer } from "@magnitudedev/utils/windows-native";
 import { WindowsIcnChildSpawner } from "./windows-child";
 import { Duration, Effect, Layer, Option, Ref } from "effect";
+import { MagnitudeStorage, resolveModelStoreLocation } from "@magnitudedev/storage";
 import {
   type AcnInstallationPlan,
   type AcnStartupProgress,
@@ -80,7 +81,31 @@ const binarySource = (dataDir: string) => {
   };
 };
 
-const makeProcess = (dataDir: string) =>
+/**
+ * The engine receives its store root once, at spawn. The configured `modelsDirectory` is read
+ * here so a Settings change or a hand edit of config.json applies at the next service start.
+ */
+const resolveModelStore = (dataDir: string) =>
+  Effect.gen(function* () {
+    const storage = yield* MagnitudeStorage;
+    const configured = yield* storage.config.load().pipe(
+      Effect.map((config) => config.modelsDirectory),
+      Effect.tapError((error) =>
+        Effect.logWarning("Could not read modelsDirectory from config.json; using the default model store").pipe(
+          Effect.annotateLogs({ cause: error.message })
+        )
+      ),
+      Effect.orElseSucceed(() => Option.none<string>())
+    );
+    const location = yield* resolveModelStoreLocation(dataDir, configured);
+    if (Option.isSome(location.warning)) yield* Effect.logWarning(location.warning.value);
+    yield* Effect.logInfo("Model store resolved").pipe(
+      Effect.annotateLogs({ root: location.root, source: location.source })
+    );
+    return location.root;
+  });
+
+const makeProcess = (dataDir: string, modelStore: string) =>
   makeIcnProcess(
     new IcnLifecycleConfig({
       binary: new IcnBinaryResolutionConfig({
@@ -100,7 +125,7 @@ const makeProcess = (dataDir: string) =>
         probeTimeout: Duration.seconds(10),
       }),
       storage: new IcnStorageConfig({
-        modelStore: Option.some(join(dataDir, "models")),
+        modelStore: Option.some(modelStore),
         cacheRoot: Option.some(join(dataDir, "cache")),
         huggingFaceCaches: resolveHuggingFaceCacheRoots(),
       }),
@@ -220,7 +245,11 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
       };
     })
   );
-  const process = makeProcess(dataDir).pipe(Layer.provide(preparation));
+  const process = Layer.unwrapEffect(
+    resolveModelStore(dataDir).pipe(
+      Effect.map((modelStore) => makeProcess(dataDir, modelStore).pipe(Layer.provide(preparation)))
+    )
+  );
   const supervisedProcess = Layer.provideMerge(makeSupervision(), process);
   const withClient = Layer.provideMerge(makeIcnClient(), supervisedProcess);
   const withEvents = Layer.provideMerge(makeIcnEvents(), withClient);

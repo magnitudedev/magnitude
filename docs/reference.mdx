@@ -87,17 +87,6 @@ Downloading is asynchronous; check `magnitude update status` for progress. Insta
 
 Use `--help` after any command to see its options. `magnitude --version` prints the installed CLI version. `magnitude docs` lists documentation bundled with the CLI, and `magnitude docs cli` prints its command guide.
 
-## Environment variables
+## Configuration
 
-For integration configuration overrides, see your [agent guide](/integrations/overview). For model storage and cached downloads, see the [files and directories](#files-and-directories).
-
-## Files and directories
-
-Magnitude uses `.magnitude` in your home directory: `~/.magnitude` on macOS/Linux, or `%USERPROFILE%\.magnitude` on Windows.
-
-- `models/`: downloaded Magnitude models.
-- `config.json`: user configuration.
-- `cache/`: cached and derived data.
-- `harness-connections.json`: connection management records.
-
-Do not delete the whole directory to troubleshoot a single issue. Removing the app and removing your model data are different actions.
+Settings are stored in `~/.magnitude/config.json`. See [Configuration file](/reference/configuration-file).

@@ -61,11 +61,11 @@ try {
   })
   let page = await app.firstWindow()
   await page.getByRole('button', { name: 'Settings', exact: true }).click()
-  const automatic = page.getByRole('checkbox', { name: 'Auto-download updates' })
+  const automatic = page.getByRole('switch', { name: 'Automatic updates' })
   const preferencesPath = join(data, 'updates/preferences.json')
   for (const enabled of [false, true, false]) {
     await automatic.click()
-    await automatic.and(page.locator(enabled ? ':checked' : ':not(:checked)')).waitFor({ timeout: 10000 })
+    await automatic.and(page.locator(`[aria-checked="${enabled}"]`)).waitFor({ timeout: 10000 })
     assert.equal(JSON.parse(await readFile(preferencesPath, 'utf8')).autoDownload, enabled)
   }
   const keyPath = join(data, 'updates/installation-key.pem')
@@ -119,7 +119,7 @@ try {
   app = await electron.launch({ executablePath, env, timeout: 30000 })
   page = await app.firstWindow()
   await page.getByRole('button', { name: 'Settings', exact: true }).click()
-  assert.equal(await page.getByRole('checkbox', { name: 'Auto-download updates' }).isChecked(), false)
+  assert.equal(await page.getByRole('switch', { name: 'Automatic updates' }).getAttribute('aria-checked'), 'false')
   await page.getByRole('button', { name: 'Check for updates', exact: true }).click()
   await page.getByText('You’re up to date.', { exact: true }).waitFor({ timeout: 30000 })
   await page.screenshot({ path: join(evidence, 'updated-settings.png'), fullPage: true })

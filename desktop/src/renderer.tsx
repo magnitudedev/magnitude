@@ -1,10 +1,11 @@
-import { LoadingRegion, SkeletonLine, ModelsSkeleton, RecommendationsSkeleton, ConnectionsSkeleton, LoginSkeleton, UpdatesSkeleton } from "./page-skeletons"
+import { LoadingRegion, SkeletonLine, ModelsSkeleton, RecommendationsSkeleton, ConnectionsSkeleton } from "./page-skeletons"
 import { pageLayout } from "./page-layout"
 import { RecommendationPreference } from "./model-preference-slider"
 import { ServingUsage } from "./serving-usage"
-import { initializeAppearance, setAppearancePreference, useAppearancePreference, subscribeAppearance, getAppearancePreference } from "../../web/src/stores/appearance-store"
+import { initializeAppearance, setAppearancePreference, useAppearancePreference, type AppearancePreference } from "../../web/src/stores/appearance-store"
 import { ActionTooltip, TooltipProvider } from "../../web/src/components/ui/tooltip"
 import { Button } from "../../web/src/components/ui/button"
+import { Switch } from "../../web/src/components/ui/switch"
 import { Input } from "../../web/src/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../web/src/components/ui/select"
 import { Progress } from "../../web/src/components/ui/progress"
@@ -31,14 +32,16 @@ import {
   MonitorIcon,
   SunIcon,
   MoonIcon,
+  FolderOpenIcon,
 } from "@phosphor-icons/react"
+import { CopyCommand } from "./copy-command"
 import { createRoot } from "react-dom/client"
-import { useId, useMemo, useState, type ReactNode } from "react"
-import { Atom, RegistryProvider, Result, useAtomValue, useAtomSet } from "@effect-atom/atom-react"
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react"
+import { Atom, RegistryProvider, Result, useAtomValue, useAtomSet, useAtomRefresh } from "@effect-atom/atom-react"
 import { Cause, Effect, Exit, Layer, Option, Runtime, Schema, Scope, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
 import { MagnitudeClient, ProviderModelIdSchema, type ProviderModelId, type CatalogLocalModel } from "@magnitudedev/sdk"
-import { ApplicationSnapshot, LoginStartupState } from "@magnitudedev/sdk/desktop-host"
+import { ApplicationSnapshot, LoginStartupState, type NetworkAccessChange } from "@magnitudedev/sdk/desktop-host"
 import {
   DesktopApplicationInfo, DesktopUpdateState, DesktopConnectRequest, DesktopHostUnavailable, DesktopSession, DesktopConnectionsSnapshot, activeLocalModel, modelDownloadFailureMessage,
   createAgentClient, AgentClientProvider, useAgentClient, makeFirstPartyConnection,
@@ -53,11 +56,10 @@ import { ModelLogo } from "./model-logo"
 import type { DesktopApi, Page } from "./desktop-rpc"
 import "@web-styles/tailwind.css"
 
-initializeAppearance()
 document.documentElement.dataset.desktopPlatform = window.__magnitudeDesktop.platform
 const host = window.__magnitudeDesktop
 class DesktopHostFailed extends Schema.TaggedError<DesktopHostFailed>()("DesktopHostFailed", { message: Schema.String }) {}
-const hostCommand = (action: () => Promise<void>) => Effect.tryPromise({ try: action, catch: error => {
+const hostCommand = <A,>(action: () => Promise<A>) => Effect.tryPromise({ try: action, catch: error => {
   const decoded = Schema.decodeUnknownEither(Schema.Struct({ message: Schema.String }))(error)
   return new DesktopHostFailed({ message: decoded._tag === "Right" ? decoded.right.message : "Magnitude could not complete this action. Try again or check Status." })
 } })
@@ -66,6 +68,27 @@ const hostFailureMessage = (cause: Cause.Cause<unknown>) => {
   return Option.isSome(failure) && Schema.is(DesktopHostFailed)(failure.value)
     ? failure.value.message : "Magnitude could not complete this action. Try again or check Status."
 }
+
+// The host owns persistence; this store is only the renderer's applied appearance.
+const appearanceReadError = Atom.keepAlive(Atom.make<string | null>(null))
+const saveAppearance = Atom.fn((preference: AppearancePreference, context) => hostCommand(() => host.setAppearance(preference)).pipe(
+  Effect.tap(() => Effect.sync(() => { context.set(appearanceReadError, null); setAppearancePreference(preference) })),
+))
+
+const modelStorageSettings = Atom.keepAlive(Atom.make(hostCommand(() => host.getModelStorage())))
+const chooseModelStorage = Atom.fn((_: void) => hostCommand(() => host.chooseModelStorageDirectory()).pipe(
+  Effect.flatMap(path => path === null ? Effect.void : hostCommand(() => host.setModelStorage(path)))))
+const resetModelStorage = Atom.fn((_: void) => hostCommand(() => host.setModelStorage(null)))
+const relaunchApplication = Atom.fn((_: void) => hostCommand(() => host.relaunch()))
+const networkAccessSettings = Atom.keepAlive(Atom.make(hostCommand(() => host.getNetworkAccess())))
+const updateNetworkAccess = Atom.fn((change: NetworkAccessChange) => hostCommand(() => host.setNetworkAccess(change)))
+const regenerateNetworkApiKey = Atom.fn((_: void) => hostCommand(() => host.regenerateNetworkApiKey()))
+const ALL_INTERFACES = "all"
+const inferenceUrl = (address: string, port: number) => `http://${address}:${port}/inference/v1`
+/** The exact command that moves an existing store; the root holds only hub/, locks/ and one JSON file. */
+const moveModelsCommand = (platform: string, from: string, to: string) => platform === "win32"
+  ? `robocopy "${from}" "${to}" /E /MOVE`
+  : `mv "${from}/"* "${to}/"`
 
 const observation = Stream.asyncPush<typeof ApplicationSnapshot.Type, DesktopHostFailed>(emit => Effect.acquireRelease(
   Effect.sync(() => host.observe(encoded => {
@@ -410,94 +433,209 @@ function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null
     <section className={pageLayout.card}><div className="flex items-center gap-3"><PlugIcon className="size-5 text-blue-600 dark:text-blue-400" /><h2 className="font-heading text-lg">Local connection</h2></div><p className="mt-2 text-sm text-slate-500">Your tools connect to Magnitude on this machine.</p><p className="mt-4 break-all rounded-lg bg-slate-50 p-4 font-mono text-sm dark:bg-slate-900">{snapshot?.endpoint ?? <SkeletonLine className="h-5 text-sm" width="200px" />}</p><div className="mt-5 flex items-start gap-3"><span className={`mt-1 size-2 shrink-0 rounded-full ${snapshot?.tray._tag === "Registered" ? "bg-blue-500" : "bg-slate-400"}`} /><div><p className="text-sm font-medium">Background activity</p><p className="mt-1 text-sm text-slate-500">{snapshot?.tray._tag === "Registered" ? "Magnitude keeps running when you close the window." : snapshot?.tray._tag === "Unavailable" ? snapshot.tray.message : snapshot?.tray._tag === "Closed" ? "Magnitude is quitting." : <SkeletonLine className="h-5 w-72 text-sm" />}</p></div></div></section>
   </div>
 }
-function ApplicationSettings() {
+type UpdateTransfer = (typeof DesktopUpdateState.Type)["transfer"]
+const firstFailure = (results: ReadonlyArray<Result.Result<unknown, unknown>>) => results.find((result): result is Result.Failure<unknown, unknown> => Result.isFailure(result))
+function useUpdateSnapshot() {
+  const client = useAgentClient()
+  const session = useMemo(() => client.runtime.atom(DesktopSession), [client])
+  const service = useAtomValue(session)
+  return Result.isSuccess(service) ? service.value : null
+}
+function SettingsGroup({ label, children }: { label: string; children: ReactNode }) {
+  return <section aria-label={label} className="mt-7">
+    <h2 className="mb-2 px-1 text-xs font-medium uppercase tracking-wide text-slate-500">{label}</h2>
+    <div className="divide-y divide-slate-200 rounded-lg border border-slate-300 bg-white dark:divide-slate-800 dark:border-slate-750 dark:bg-slate-850">{children}</div>
+  </section>
+}
+function SettingsRow({ label, hint, alert, control, children, nested = false }: { label: ReactNode; hint?: ReactNode; alert?: ReactNode; control?: ReactNode; children?: ReactNode; nested?: boolean }) {
+  return <div className={nested ? "bg-slate-50 py-2.5 pl-10 pr-4 dark:bg-slate-900/40" : "px-4 py-3"}>
+    <div className="flex items-center justify-between gap-6">
+      <div className="min-w-0"><p className={nested ? "text-[13px] font-medium" : "text-sm font-medium"}>{label}</p>
+        {hint && <div className="mt-0.5 text-xs text-slate-500">{hint}</div>}
+        {alert && <p role="alert" className="mt-0.5 text-xs">{alert}</p>}
+      </div>
+      {control && <div className="flex shrink-0 items-center gap-2">{control}</div>}
+    </div>
+    {children}
+  </div>
+}
+function ThemeRow() {
+  const appearance = useAppearancePreference()
+  const save = useAtomSet(saveAppearance)
+  const saving = useAtomValue(saveAppearance)
+  const readError = useAtomValue(appearanceReadError)
+  return <SettingsRow label="Theme" alert={readError ?? (Result.isFailure(saving) ? hostFailureMessage(saving.cause) : undefined)} control={
+    <div className="inline-flex rounded-md border border-slate-300 p-0.5 dark:border-slate-700" role="group" aria-label="Theme">
+      {(["system", "light", "dark"] as const).map(value => { const Icon = value === "system" ? MonitorIcon : value === "light" ? SunIcon : MoonIcon
+        return <Button key={value} size="sm" variant={appearance === value ? "secondary" : "ghost"} aria-pressed={appearance === value} disabled={saving.waiting} onClick={() => save(value)}><Icon />{value[0]!.toUpperCase() + value.slice(1)}</Button> })}
+    </div>} />
+}
+function LaunchAtLoginRow() {
+  const service = useUpdateSnapshot()
+  if (!service) return <SettingsRow label="Launch at login" hint={<SkeletonLine className="h-4 text-xs" width="160px" />} />
+  return <LaunchAtLoginRowView service={service} />
+}
+function LaunchAtLoginRowView({ service }: { service: DesktopSession }) {
+  const state = useAtomValue(service.loginStartup)
+  const set = useAtomSet(service.setLoginStartup)
+  const change = useAtomValue(service.setLoginStartup)
+  const current = Result.isSuccess(state) ? state.value : null
+  const enabled = current?._tag === "Enabled" || current?._tag === "RequiresApproval"
+  const hint = current?._tag === "Unavailable" ? current.message
+    : current?._tag === "RequiresApproval" ? "Allow Magnitude in your system login settings to finish enabling startup."
+    : "Starts in the background with its tray icon."
+  const alert = Result.isFailure(state) ? `Could not read login startup. ${hostFailureMessage(state.cause)}` : Result.isFailure(change) ? hostFailureMessage(change.cause) : undefined
+  return <SettingsRow label="Launch at login" hint={Result.isInitial(state) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : hint} alert={alert}
+    control={<Switch aria-label="Launch at login" checked={enabled} disabled={!current || current._tag === "Unavailable" || change.waiting} onCheckedChange={checked => set(checked)} />} />
+}
+function ModelStorageRow() {
+  const settings = useAtomValue(modelStorageSettings)
+  const refresh = useAtomRefresh(modelStorageSettings)
+  const choose = useAtomSet(chooseModelStorage)
+  const choosing = useAtomValue(chooseModelStorage)
+  const reset = useAtomSet(resetModelStorage)
+  const resetting = useAtomValue(resetModelStorage)
+  const busy = choosing.waiting || resetting.waiting
+  const current = Result.isSuccess(settings) ? settings.value : null
+  const failure = firstFailure([settings, choosing, resetting])
+  return <>
+    <SettingsRow label="Model storage" alert={current?.warning ?? (failure ? hostFailureMessage(failure.cause) : undefined)}
+      hint={current ? <span className="block truncate" title={current.path}>Current path is <span className="text-slate-700 dark:text-slate-300" data-testid="model-storage-path">{current.path}</span>{current.source === "Default" && " (default)"}</span> : <SkeletonLine className="h-4 text-xs" width="220px" />}
+      control={<>
+        {current?.source === "Configured" && <Button size="sm" variant="ghost" disabled={busy} onClick={() => { reset(); }}>Use default</Button>}
+        <Button size="sm" variant="outline" disabled={!current || busy} onClick={() => { choose(); }}><FolderOpenIcon />Change…</Button>
+      </>} />
+    <RefreshAfter refresh={refresh} results={[choosing, resetting]} />
+  </>
+}
+// Re-reads config.json when Settings opens and after each host write; the toast shares the atoms.
+function RefreshAfter({ refresh, results }: { refresh: () => void; results: ReadonlyArray<Result.Result<unknown, unknown>> }) {
+  const key = results.map(result => Result.isSuccess(result) && !result.waiting ? "done" : Result.isFailure(result) ? "failed" : "idle").join(",")
+  const previous = useRef(key)
+  useEffect(() => { refresh() }, [refresh])
+  useEffect(() => { if (previous.current !== key) { previous.current = key; refresh() } }, [key, refresh])
+  return null
+}
+function RestartRequiredToast() {
+  const storage = useAtomValue(modelStorageSettings)
+  const network = useAtomValue(networkAccessSettings)
+  const relaunch = useAtomSet(relaunchApplication)
+  const relaunching = useAtomValue(relaunchApplication)
+  const storageValue = Result.isSuccess(storage) ? storage.value : null
+  const storagePending = storageValue !== null && storageValue.path !== storageValue.active
+  const networkPending = Result.isSuccess(network) && network.value.pending
+  if (!storagePending && !networkPending) return null
+  const reason = storagePending && networkPending ? "Magnitude is still using the previous model folder and network settings."
+    : storagePending ? "Magnitude is still using the previous model folder." : "Magnitude is still using the previous network settings."
+  return <div role="status" className="fixed bottom-4 right-4 z-50 w-[30rem] max-w-[calc(100vw-2rem)] rounded-lg border border-slate-300 bg-white p-4 text-sm text-slate-900 shadow-md dark:border-slate-600 dark:bg-slate-750 dark:text-slate-100">
+    <div className="flex items-center justify-between gap-4">
+      <div><p className="font-medium">Restart required</p><p className="mt-0.5 text-slate-600 dark:text-slate-400">{reason}</p>
+        {Result.isFailure(relaunching) && <p role="alert" className="mt-1">{hostFailureMessage(relaunching.cause)}</p>}</div>
+      <Button size="sm" disabled={relaunching.waiting} onClick={() => { relaunch(); }}>Restart Magnitude</Button>
+    </div>
+    {storagePending && storageValue && <>
+      <p className="mt-3 text-xs text-slate-600 dark:text-slate-400">Downloaded models stay in the previous folder. To move them too, quit Magnitude, run this, then open it again.</p>
+      <div className="mt-1.5"><CopyCommand command={moveModelsCommand(window.__magnitudeDesktop.platform, storageValue.active, storageValue.path)} label="Copy move command" /></div>
+    </>}
+  </div>
+}
+function NetworkAccessRows() {
+  const settings = useAtomValue(networkAccessSettings)
+  const refresh = useAtomRefresh(networkAccessSettings)
+  const update = useAtomSet(updateNetworkAccess)
+  const updating = useAtomValue(updateNetworkAccess)
+  const regenerate = useAtomSet(regenerateNetworkApiKey)
+  const regenerating = useAtomValue(regenerateNetworkApiKey)
+  const busy = updating.waiting || regenerating.waiting
+  const current = Result.isSuccess(settings) ? settings.value : null
+  const failure = firstFailure([settings, updating, regenerating])
+  const reachable = current?.enabled ? (current.bind ?? current.interfaces[0]?.address) : undefined
+  return <>
+    <SettingsRow label="Network access" hint={current ? "Let other devices on your network use Magnitude for inference." : <SkeletonLine className="h-4 text-xs" width="240px" />}
+      alert={current?.warning ?? (failure ? hostFailureMessage(failure.cause) : undefined)}
+      control={<Switch aria-label="Network access" checked={current?.enabled ?? false} disabled={!current || busy} onCheckedChange={checked => update({ enabled: checked })} />} />
+    {current?.enabled && <>
+      <SettingsRow nested label="Address" hint={current.interfaces.length === 0 ? "No network interfaces were found." : "Which of this computer's addresses accepts connections."}
+        control={<Select items={[{ value: ALL_INTERFACES, label: "All interfaces" }, ...current.interfaces.map(entry => ({ value: entry.address, label: `${entry.address} (${entry.kind === "tailscale" ? "Tailscale" : entry.name})` }))]}
+          value={current.bind ?? ALL_INTERFACES} onValueChange={value => update({ bind: value === ALL_INTERFACES || value === null ? null : value })}>
+          <SelectTrigger aria-label="Network address" className="min-w-56"><SelectValue /></SelectTrigger>
+          <SelectContent>{[<SelectItem key={ALL_INTERFACES} value={ALL_INTERFACES}>All interfaces</SelectItem>, ...current.interfaces.map(entry => <SelectItem key={entry.address} value={entry.address}>{entry.address} ({entry.kind === "tailscale" ? "Tailscale" : entry.name})</SelectItem>)]}</SelectContent>
+        </Select>} />
+      <SettingsRow nested label="API key" hint={current.requireApiKey ? "Other devices must send this key as a Bearer token." : "Other devices can connect without a key. Only do this on a network you trust."}
+        control={<><Button size="sm" variant="ghost" disabled={busy} onClick={() => { regenerate(); }}>Regenerate</Button><Switch aria-label="Require API key" checked={current.requireApiKey} disabled={busy} onCheckedChange={checked => update({ requireApiKey: checked })} /></>}>
+        {current.apiKey && current.requireApiKey && <div className="mt-2"><CopyCommand command={current.apiKey} label="Copy API key" /></div>}
+      </SettingsRow>
+      {reachable && <SettingsRow nested label="Reachable at" hint={`Use this as the OpenAI-compatible base URL on other devices${current.requireApiKey ? ", with the API key above" : ""}. Anthropic-compatible apps use /inference/anthropic on the same address.`}>
+        <div className="mt-2"><CopyCommand command={inferenceUrl(reachable, current.port)} label="Copy base URL" /></div>
+      </SettingsRow>}
+    </>}
+    <RefreshAfter refresh={refresh} results={[updating, regenerating]} />
+  </>
+}
+function AutomaticUpdatesRow() {
+  const service = useUpdateSnapshot()
+  if (!service) return <SettingsRow label="Automatic updates" hint={<SkeletonLine className="h-4 text-xs" width="200px" />} />
+  return <AutomaticUpdatesRowView service={service} />
+}
+function AutomaticUpdatesRowView({ service }: { service: DesktopSession }) {
+  const observation = useAtomValue(service.updates)
+  const setAutoDownload = useAtomSet(service.setAutoDownload)
+  const saving = useAtomValue(service.setAutoDownload)
+  const snapshot = Result.isSuccess(observation) ? observation.value : null
+  const preference = snapshot?.preference
+  const closed = snapshot?.transfer._tag === "Closed"
+  return <SettingsRow label="Automatic updates"
+    hint={!snapshot ? (Result.isFailure(observation) ? "Update status unavailable." : <SkeletonLine className="h-4 text-xs" width="200px" />) : preference?._tag === "Unavailable" ? preference.message : "Download updates in the background when they are available."}
+    alert={Result.isFailure(saving) ? hostFailureMessage(saving.cause) : undefined}
+    control={<Switch aria-label="Automatic updates" checked={preference?._tag === "Known" && preference.autoDownload} disabled={preference?._tag !== "Known" || saving.waiting || closed} onCheckedChange={checked => setAutoDownload(checked)} />} />
+}
+function AboutRow() {
   const client = useAgentClient()
   const session = useMemo(() => client.runtime.atom(DesktopSession), [client])
   const service = useAtomValue(session)
   const info = useAtomValue(useMemo(() => Atom.make(get => Result.flatMap(get(session), value => get(value.applicationInfo))), [session]))
-  return <section className={pageLayout.settingsCard}>
-    <h2 className="font-heading text-lg">About Magnitude</h2>
-    <p className="mt-2 text-sm text-slate-500">{Result.isSuccess(info) ? `Version ${info.value.version}` : Result.isFailure(info) ? "Version unavailable" : <SkeletonLine className="h-5 text-sm" width="96px" />}</p>
-    {Result.isSuccess(service) ? <UpdateSettingsView service={service.value} /> : Result.isFailure(service) ? <p role="alert">Update settings unavailable.</p> : <UpdatesSkeleton />}
-  </section>
+  const version = Result.isSuccess(info) ? `Magnitude ${info.value.version}` : Result.isFailure(info) ? "Magnitude" : <SkeletonLine className="h-5 text-sm" width="120px" />
+  if (!Result.isSuccess(service)) return <SettingsRow label={version} hint={Result.isFailure(service) ? "Update status unavailable." : <SkeletonLine className="h-4 text-xs" width="160px" />} />
+  return <AboutRowView service={service.value} version={version} />
 }
-function UpdateSettingsView({ service }: { service: DesktopSession }) {
+function AboutRowView({ service, version }: { service: DesktopSession; version: ReactNode }) {
   const observation = useAtomValue(service.updates)
   const check = useAtomSet(service.checkUpdate)
   const discard = useAtomSet(service.discardUpdate)
   const discarding = useAtomValue(service.discardUpdate)
   const download = useAtomSet(service.downloadUpdate)
   const restart = useAtomSet(service.restartUpdate)
-  const setAutoDownload = useAtomSet(service.setAutoDownload)
   const checking = useAtomValue(service.checkUpdate)
   const downloading = useAtomValue(service.downloadUpdate)
   const restarting = useAtomValue(service.restartUpdate)
-  const saving = useAtomValue(service.setAutoDownload)
   const snapshot = Result.isSuccess(observation) ? observation.value : null
-  const current = snapshot?.transfer
+  const current: UpdateTransfer | undefined = snapshot?.transfer
   const pending = downloading.waiting || restarting.waiting || discarding.waiting
   const message = !current ? Result.isFailure(observation) ? "Update status unavailable." : "Reading update status…"
-    : current._tag === "Idle" ? snapshot?.check._tag === "Succeeded" ? "You’re up to date." : "Magnitude checks for updates automatically."
+    : current._tag === "Idle" ? snapshot?.check._tag === "Succeeded" ? "You’re up to date." : "Checks for updates automatically."
     : current._tag === "Available" ? `Version ${current.version} is available · ${formatStorageSize(current.bytes)}`
     : current._tag === "Downloading" ? `Downloading version ${current.version} · ${formatStorageSize(current.completed)} of ${formatStorageSize(current.total)}`
     : current._tag === "Cancelling" ? "Stopping automatic download…"
     : current._tag === "Staging" ? `Preparing version ${current.version}…`
-    : current._tag === "Ready" ? `Version ${current.version} is ready to install. Restart Magnitude to update.`
+    : current._tag === "Ready" ? `Version ${current.version} is ready. Restarting stops the running model and service.`
     : current._tag === "Closed" ? "Magnitude is quitting…" : current.message
-  if (Result.isInitial(observation)) return <UpdatesSkeleton />
-  return <div className="mt-5 border-t border-slate-200 pt-5 dark:border-slate-750">
-    <h3 className="font-medium">Application updates</h3>
-    {snapshot?.preference._tag === "Known" && <label className="mt-3 flex items-center gap-3 text-sm">
-      <input type="checkbox" className="size-4 accent-sky-500" checked={snapshot.preference.autoDownload} disabled={saving.waiting || current?._tag === "Closed"} onChange={event => setAutoDownload(event.target.checked)} />
-      Auto-download updates
-    </label>}
-    {snapshot?.preference._tag === "Unavailable" && current?._tag !== "Unavailable" && <div className="mt-2">
-      <p role="alert" className="text-sm">{snapshot.preference.message}</p>
-      <div className="mt-2 flex gap-2"><Button variant="outline" disabled={saving.waiting} onClick={() => setAutoDownload(true)}>Enable automatic downloads</Button>
-        <Button variant="outline" disabled={saving.waiting} onClick={() => setAutoDownload(false)}>Use manual downloads</Button></div>
-    </div>}
-    <p className="mt-3 text-sm text-slate-500" role="status">{message}</p>
-    {snapshot?.check._tag === "Failed" && <p className="mt-2 text-sm" role="alert">{snapshot.check.message}</p>}
-    <div className="mt-3 flex flex-wrap gap-2">
-      {current && !["Unavailable", "Closed"].includes(current._tag) && <Button variant="outline" disabled={checking.waiting || snapshot?.check._tag === "Checking"} onClick={() => check()}>{snapshot?.check._tag === "Checking" ? "Checking…" : "Check for updates"}</Button>}
-      {current?._tag === "Available" && <Button disabled={pending} onClick={() => download()}>Download update</Button>}
-      {(current?._tag === "Ready" || current?._tag === "InstallationFailed") && <Button disabled={pending} onClick={() => restart()}>{current._tag === "InstallationFailed" ? "Retry update" : "Restart to update"}</Button>}
-      {(current?._tag === "Ready" || current?._tag === "InstallationFailed") && <Button variant="outline" disabled={pending} onClick={() => discard()}>Discard download</Button>}
-    </div>
-    {current?._tag === "Ready" && <p className="mt-2 text-sm text-slate-500">Restarting stops the running model and service.</p>}
-    {[checking, downloading, restarting, discarding, saving].map((result, index) => Result.isFailure(result) ? <p key={index} role="alert" className="mt-2 text-sm">{hostFailureMessage(result.cause)}</p> : null)}
-  </div>
+  const failure = snapshot?.check._tag === "Failed" ? snapshot.check.message : firstFailure([checking, downloading, restarting, discarding])
+  const installable = current?._tag === "Ready" || current?._tag === "InstallationFailed"
+  return <SettingsRow label={version} hint={Result.isInitial(observation) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : message}
+    alert={typeof failure === "string" ? failure : failure ? hostFailureMessage(failure.cause) : undefined}
+    control={<>
+      {installable && <Button size="sm" variant="ghost" disabled={pending} onClick={() => discard()}>Discard download</Button>}
+      {installable ? <Button size="sm" disabled={pending} onClick={() => restart()}>{current._tag === "InstallationFailed" ? "Retry update" : "Restart to update"}</Button>
+        : current?._tag === "Available" ? <Button size="sm" disabled={pending} onClick={() => download()}>Download update</Button>
+        : current && !["Unavailable", "Closed"].includes(current._tag) ? <Button size="sm" variant="outline" disabled={checking.waiting || snapshot?.check._tag === "Checking"} onClick={() => check()}>{snapshot?.check._tag === "Checking" ? "Checking…" : "Check for updates"}</Button>
+        : null}
+    </>} />
 }
-function AppearanceSettings() {
-  const appearance = useAppearancePreference()
-  return <section aria-labelledby="appearance-heading" className="mt-8 overflow-hidden rounded-lg border border-slate-300 bg-white dark:border-slate-750 dark:bg-slate-850">
-    <header className="border-b border-slate-200 px-5 py-4 dark:border-slate-800"><h2 id="appearance-heading" className="font-heading text-lg">Appearance</h2></header>
-    <div className="flex flex-wrap items-center justify-between gap-6 px-5 py-5"><div><p className="font-medium">Theme</p><p className="mt-1 text-sm text-slate-500">Use your system appearance or choose a theme.</p></div>
-      <div className="flex gap-2" role="group" aria-label="Theme">{(["system", "light", "dark"] as const).map(value => { const Icon = value === "system" ? MonitorIcon : value === "light" ? SunIcon : MoonIcon; return <Button key={value} variant={appearance === value ? "default" : "outline"} aria-pressed={appearance === value} onClick={() => setAppearancePreference(value)}><Icon />{value[0]!.toUpperCase() + value.slice(1)}</Button> })}</div>
-    </div>
-  </section>
-}
-function LoginSettings() {
-  const client = useAgentClient()
-  const session = useMemo(() => client.runtime.atom(DesktopSession), [client])
-  const service = useAtomValue(session)
-  return Result.isSuccess(service) ? <LoginSettingsView service={service.value} /> : Result.isFailure(service) ? <p role="alert" className="mt-6">Login settings unavailable.</p> : <LoginSkeleton />
-}
-function LoginSettingsView({ service }: { service: DesktopSession }) {
-  const state = useAtomValue(service.loginStartup)
-  const set = useAtomSet(service.setLoginStartup)
-  const change = useAtomValue(service.setLoginStartup)
-  const current = Result.isSuccess(state) ? state.value : null
-  if (Result.isInitial(state)) return <LoginSkeleton />
-  const enabled = current?._tag === "Enabled" || current?._tag === "RequiresApproval"
-  return <section className={pageLayout.settingsCard}>
-    <div className="flex items-center justify-between gap-6"><div><h2 className="font-heading text-lg">Launch at login</h2><p className="mt-2 text-sm text-slate-500">Start Magnitude in the background with its tray icon. The window stays closed.</p></div>
-    <Button variant="outline" disabled={!current || current._tag === "Unavailable" || change.waiting} aria-pressed={enabled} onClick={() => set(!enabled)}>{enabled ? "Disable" : "Enable"}</Button></div>
-    {current?._tag === "Unavailable" && <p className="mt-3 text-sm text-slate-500">{current.message}</p>}
-    {current?._tag === "RequiresApproval" && <p className="mt-3 text-sm">Allow Magnitude in your system login settings to finish enabling startup.</p>}
-    {Result.isFailure(state) && <p role="alert" className="mt-3 text-sm">Could not read login startup. {hostFailureMessage(state.cause)}</p>}
-    {Result.isFailure(change) && <p role="alert" className="mt-3 text-sm">{hostFailureMessage(change.cause)}</p>}
-  </section>
+function SettingsPage() {
+  return <>
+    <SettingsGroup label="General"><ThemeRow /><LaunchAtLoginRow /><ModelStorageRow /><NetworkAccessRows /><AutomaticUpdatesRow /></SettingsGroup>
+    <SettingsGroup label="About"><AboutRow /></SettingsGroup>
+  </>
 }
 function App() {
   const state = useAtomValue(hostState)
@@ -508,15 +646,15 @@ function App() {
   const pageResult = useAtomValue(pageAtom)
   const page = Result.isSuccess(pageResult) ? pageResult.value : "discover"
   const service = Result.isSuccess(state) ? state.value.service : null
-  return <DesktopShell page={page} navigate={navigate}>
+  return <><RestartRequiredToast /><DesktopShell page={page} navigate={navigate}>
       {page === "status" ? Result.isFailure(state) ? <p role="alert" className="mt-7">{hostFailureMessage(state.cause)}</p> : <Status snapshot={Result.isSuccess(state) ? state.value : null} />
       : page === "usage" ? <ServingUsage />
-      : page === "settings" ? <><AppearanceSettings /><LoginSettings /><ApplicationSettings /></>
+      : page === "settings" ? <SettingsPage />
       : page === "connections" ? <Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} />
       : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(state) ? <>{page !== "discover" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<p role="alert" className="mt-8">The service needs attention. Open Status for details.</p></> : <ModelsSkeleton page={page} />)
       : page === "discover" || page === "catalog" || page === "models" ? <Models page={page} />
       : null}
-  </DesktopShell>
+  </DesktopShell></>
 }
 function DesktopShell({ page, navigate, children }: { page: Page; navigate?: (page: Page) => void; children: ReactNode }) {
   const platform = window.__magnitudeDesktop.platform
@@ -555,14 +693,12 @@ function DesktopShell({ page, navigate, children }: { page: Page; navigate?: (pa
 }
 
 const root = createRoot(document.getElementById("root")!)
-root.render(<DesktopShell page="discover"><ModelsSkeleton page="discover" /></DesktopShell>)
 const boot = Effect.gen(function* () {
+  const appearance = yield* Effect.tryPromise(() => host.getAppearance()).pipe(Effect.either)
+  initializeAppearance(appearance._tag === "Right" ? appearance.right : "system")
+  root.render(<DesktopShell page="discover"><ModelsSkeleton page="discover" /></DesktopShell>)
   const initial = yield* observation.pipe(Stream.take(1), Stream.runHead, Effect.flatMap(value => value._tag === "Some" ? Effect.succeed(value.value) : Effect.fail(new DesktopHostUnavailable())))
   const scope = yield* Scope.make()
-  const updateNativeTheme = () => { void host.appearance(getAppearancePreference()).catch(console.error) }
-  updateNativeTheme()
-  const unsubscribeAppearance = subscribeAppearance(updateNativeTheme)
-  yield* Scope.addFinalizer(scope, Effect.sync(unsubscribeAppearance))
   const runtime = yield* Effect.runtime<never>()
   window.addEventListener("beforeunload", () => { Runtime.runFork(runtime)(Scope.close(scope, Exit.void)) }, { once: true })
   const connection = yield* makeFirstPartyConnection(MagnitudeClient.layer({ origin: initial.endpoint, autoStart: false }).pipe(Layer.provide(FetchHttpClient.layer))).pipe(Effect.provideService(Scope.Scope, scope))
@@ -596,6 +732,6 @@ const boot = Effect.gen(function* () {
     actions: Stream.asyncPush(emit => Effect.acquireRelease(Effect.sync(() => host.actions(action => emit.single(action))), unsubscribe => Effect.sync(unsubscribe)).pipe(Effect.asVoid)),
     presentModel: value => Effect.tryPromise(() => host.presentModel(value)),
   } })
-  root.render(<RegistryProvider><AgentClientProvider tag={client}><App /></AgentClientProvider></RegistryProvider>)
+  root.render(<RegistryProvider initialValues={[[appearanceReadError, appearance._tag === "Left" ? "The saved appearance could not be read. Using System appearance." : null]]}><AgentClientProvider tag={client}><App /></AgentClientProvider></RegistryProvider>)
 })
 Effect.runPromise(boot).catch(error => root.render(<p role="alert">Unable to open Magnitude: {String(error)}</p>))

@@ -39,7 +39,8 @@ describe("appearance preference", () => {
     }))
 
     const appearance = await import("./appearance-store")
-    appearance.initializeAppearance()
+    const browser = await import("./browser-appearance")
+    browser.initializeBrowserAppearance()
     expect(appearance.getAppearancePreference()).toBe("system")
     expect(appearance.getResolvedAppearance()).toBe("dark")
     expect(attributes.get("theme")).toBe("dark")
@@ -50,15 +51,20 @@ describe("appearance preference", () => {
     expect(style.get("--magnitude-slate-900")).toBeDefined()
     expect(style.get("--magnitude-blue-700")).toBeDefined()
 
-    appearance.setAppearancePreference("dark")
+    browser.setBrowserAppearancePreference("dark")
     expect(storage.get("magnitude.appearance")).toBe("dark")
     dark = false
     changeListeners[0]?.()
     expect(appearance.getResolvedAppearance()).toBe("dark")
 
-    appearance.setAppearancePreference("system")
+    browser.setBrowserAppearancePreference("system")
     expect(storage.has("magnitude.appearance")).toBe(false)
     expect(appearance.getResolvedAppearance()).toBe("light")
+
+    // Applying host-owned state must not read or write browser persistence.
+    appearance.setAppearancePreference("dark")
+    expect(storage.has("magnitude.appearance")).toBe(false)
+    expect(appearance.getResolvedAppearance()).toBe("dark")
   })
 })
 

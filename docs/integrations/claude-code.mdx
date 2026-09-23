@@ -25,16 +25,21 @@ Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e2b-it-qat:gguf:q4`
 
 ## Configuration
 
-Default configuration files:
+**Connect** writes `~/.claude/settings.json`. Location overrides: `CLAUDE_CONFIG_DIR`.
 
-- `~/.claude/settings.json`
+Write the configuration yourself only when the agent runs where Connections cannot reach it, such as another device or WSL; see [Other devices](/api/other-devices) for `ADDRESS` and `API_KEY`.
 
-On Windows, `~` means your user profile directory.
+`~/.claude/settings.json`:
 
-Supported location overrides: `CLAUDE_CONFIG_DIR`. The paths displayed in Connections show which files Magnitude is actually checking.
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://ADDRESS:10100/inference/anthropic/proxies/claude-code",
+    "ANTHROPIC_AUTH_TOKEN": "API_KEY",
+    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"
+  },
+  "model": "anthropic-local/MODEL_ID"
+}
+```
 
-## Repair or disconnect
-
-If Connections shows **Connection needs repair**, click **Repair connection**. To stop using the integration, click **Disconnect**, then restart the agent.
-
-See [connection states](/integrations/overview#connection-states) if the agent is not detected or its configuration cannot be verified.
+Only local models are available from another device.
