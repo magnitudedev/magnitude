@@ -626,6 +626,12 @@ const invalidHostMessage = (network: NetworkAccess) => network.enabled
   ? "Invalid Host header. Magnitude accepts local names, IP addresses, host.docker.internal, *.ts.net, and names listed under network.allowedHosts in config.json."
   : "Invalid Host header. Network access is off; turn it on in Magnitude Settings to reach this service from other devices."
 
+/**
+ * The path as the router matches it. The router ignores case and repeated slashes, so the
+ * remote-caller gates must too, or `/INFERENCE/v1/models` reaches inference without a key.
+ */
+const routedPath = (url: string) => url.split(/[?#]/, 1)[0]!.replace(/\/{2,}/g, "/").toLowerCase()
+
 /** Whether the request comes from this machine. With loopback binding every caller is local. */
 const isLocalCaller = (request: HttpServerRequest.HttpServerRequest, network: NetworkAccess) => Option.match(request.remoteAddress, {
   onNone: () => !network.enabled,
@@ -643,7 +649,7 @@ export const installAcnHealthRoutes = (
       return HttpServerResponse.text(invalidHostMessage(network), { status: 421 })
     }
     if (!isLocalCaller(request, network)) {
-      const path = new URL(request.url, "http://magnitude").pathname
+      const path = routedPath(request.url)
       // Application control (files, sessions, agents) never leaves this machine, whatever the bind.
       if (path === "/rpc" || path.startsWith("/rpc/")) {
         return HttpServerResponse.text("Magnitude application control is available only on the machine running Magnitude.", { status: 403 })
