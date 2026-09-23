@@ -33,7 +33,7 @@ This amendment defines future tests; it does not claim those UI scenarios have a
 | Planning | Complete | This documentation checkpoint |
 | 0: baseline and harness | In progress | Local native build and baseline suites executed; desktop shell probe failure under investigation |
 | 1: Windows preparation repair | Implemented; packaged acceptance pending | Windows native, staging, and transfer regression gates passed in this checkpoint |
-| 2: native continuation/admission proof | Pending | — |
+| 2: native continuation/admission proof | In progress | Windows mapped-parent probe requires external launcher; Mac/Linux gates pending |
 | 3: shared owner extraction | Pending | — |
 | 4: serve and takeover | Pending | — |
 | 5: CLI cutover | Pending | — |
@@ -125,3 +125,39 @@ and rename-race acceptance, native x64 Windows lane, desktop R1–R6/desktop-own
 Phase 1's implementation checkpoint does not claim those broader acceptance gates have passed.
 Next: foreground startup continuation/admission proof, alongside completion of baseline GUI and
 process-channel regression work.
+
+## Native continuation investigation, 2026-09-23
+
+Parent: `f9b148d7`. User authorized replacement of the existing test installations in Windows and
+Ubuntu VMs. The Windows desktop was stopped through its installed CLI and uninstalled normally;
+its model/profile data was not removed. A temporary acceptance account created during isolation
+setup was removed without using it for installation.
+
+The new continuation fixture builds the production NSIS installer with a compiled Bun 1.4.2 CLI
+probe and the actual x64 native addon. Under the ordinary Windows user, with the foreground process's
+working directory outside the application, it records:
+
+| Operation | Installer exit | Installed version |
+| --- | --- | --- |
+| Install initial A | 0 | 1.2.3 |
+| A→B while A CLI and addon stay mapped | 0 | 1.2.4 |
+| B→C while that original process remains mapped | 1 | 1.2.4 |
+| Retry C after the original process exits | 0 | 1.2.5 |
+
+This falsifies repeated replacement with a waiting original CLI. Phase 2 now selects the external
+native foreground launcher fallback. The fixture is an observation tool, not a passing assertion
+that foreground continuation is implemented. It does not contain ACN/ICN, test production signing,
+or establish signal/job behavior. Those gates remain required for the actual launcher.
+
+Evidence: `continuation/foreground-continuation.json` in the isolated Windows testing directory
+recorded above. The probe's finally block released its exact child and uninstalled its inert payload;
+subsequent checks confirmed the installation directory and uninstall registration were absent.
+MSVC helper/probe compilation, three production NSIS packages, compiled-runtime/addon loading, and
+the dedicated fixture typecheck passed. Build artifacts remain available for the next experiments.
+
+Mac installed 0.1.5 baseline: real computer-use navigation Status→Catalog, catalog search reducing
+55 entries to 5, restoring search, and returning to Status all worked. A screenshot confirmed Ready.
+The bundled CLI's `service status`, `models status`, and `hardware` succeeded without `serve`.
+Closing the real window retained Ready service and CLI model access; `app open` restored the same
+Status page. Model acquisition/loading, full Quit, branch-build UI, and R1–R6 coverage remain pending.
+This records baseline behavior of the installed app, not acceptance of changed branch binaries.

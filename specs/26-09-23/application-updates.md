@@ -122,20 +122,20 @@ of an inherited update capability if needed, not general inheritance of owner lo
 Validate cancellation at every phase; cancellation may prevent serving but cannot abandon a
 half-completed transaction or launch a background server.
 
-**Windows:** first validate a waiting original process with a copied installer helper. Current NSIS
-replacement renames old/new trees, and `FinishReplacement` permits retaining old files when cleanup
-fails. This makes deferred cleanup while the old CLI image remains loaded plausible, not proven.
-The old process must release application ownership/installation-directory handles, use a working
-directory outside the target, stop reading resources from the old path, and supervise the new owner
-after installation. Its retained lifetime must propagate console cancellation, exit status and
-service-manager termination; native jobs and process handles must preserve descendant cleanup.
-Test repeated updates while an earlier CLI image remains mapped. Do not assume Windows cannot
-rename a loaded installation, and do not promise it can based only on source inspection.
+**Windows:** a native NSIS probe established that a mapped original CLI/addon allows the first
+replacement but prevents the next replacement until that original process exits. Use a small native
+foreground launcher outside the replaceable application payload. It owns an atomic kill-on-close
+job for the compiled CLI, preserves arguments, working directory, standard streams and exit status,
+and permits one explicit startup continuation after the old CLI and its descendants have retired.
+It never downloads updates or owns ACN directly. A continuation cannot restart after cancellation,
+and must observe a changed installed executable before relaunch.
 
-If this fails native acceptance, a launcher outside the replaceable payload is the fallback. That
-changes PATH registration/packaging and needs a minimal stable launcher protocol and its own update
-policy. It is an explicit architectural decision, not something to hide inside the macOS installer.
-Do not declare seamless Windows startup updates complete until this gate is passed.
+The launcher has a separate, minimal protocol version. Packaging must define registration, owned
+file validation, removal, and launcher replacement while it is running. Ordinary payload updates
+must not require replacing an active launcher. Changes incompatible with the installed launcher
+must defer before payload mutation and provide an explicit upgrade path; no mixed unsupported
+installation may serve. Native console, SSH and service-manager cancellation, repeated upgrades,
+and launcher maintenance remain acceptance gates before enabling this architecture.
 
 **Linux:** release shared installation admission only within installer exclusion, run the existing
 package transaction through explicit root authorization, then reacquire admission before execution.

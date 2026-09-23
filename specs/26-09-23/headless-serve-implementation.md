@@ -159,7 +159,7 @@ owned fixtures. Check that test configuration cannot point at production update 
 
 **Gate:** working per-user Windows execution, Linux toolchain, artifact transfer, baseline report and
 fresh/poisoned profile reproduction. Known release failure is recorded, not papered over.
-**Commit:** `test: establish headless lifecycle acceptance harness`.
+**Commit:** `Establish headless lifecycle acceptance harness`.
 
 ## Phase 1 — Repair Windows update preparation (checkpoint 1)
 
@@ -180,7 +180,7 @@ app, then B→C. Check installed CLI/service version, profile preservation and p
 **Gate:** native Windows update works for fresh and previously affected profiles, including the second
 update. Packaged signed test certificates prove the configured test publisher only; production signer
 validation is retained for final acceptance.
-**Commit:** `fix: restore Windows application update preparation` (independently releasable).
+**Commit:** `Restore Windows application update preparation` (independently releasable).
 
 ## Phase 2 — Resolve native installation/startup risks (checkpoint 2)
 
@@ -206,13 +206,21 @@ If Windows refuses replacement, implement an external stable launcher in a separ
 including PATH, exact child launch, console/job lifetime and launcher-update policy, then rerun the
 same tests. Do not silently settle for exit-and-hope or require another manual command after startup.
 
+**Windows decision (native probe, 2026-09-23):** A→B succeeds while the original compiled runtime
+and addon remain mapped; B→C returns installer exit 1 and stays at B. Releasing the original process
+allows C to install successfully. The fallback is therefore selected: a small foreground launcher
+outside the application payload, with a separate minimal protocol and explicit maintenance policy.
+The waiting-original-CLI approach does not meet repeated-update acceptance. The probe uses the
+production NSIS transaction with an inert application payload; it is not signed-runtime or inference
+acceptance.
+
 **Verify Linux:** installation helper vs application/shared installation locks; authorized and denied
 sudo flows with the actual deb transaction; helper lifetime under systemd cgroup cleanup. Preserve the
 invoking user for resumed service. No background password prompt and no root inference server.
 
 **Gate:** record the chosen continuation mechanism per OS and its executed evidence. If infrastructure
 blocks proof, finish independent phases but do not implement dependent claims as established facts.
-**Commit:** `feat: add verified application installation handoffs` (or separate OS commits if large).
+**Commit:** `Add verified application installation handoffs` (or separate OS commits if large).
 
 ## Phase 3 — Extract shared application ownership (checkpoint 3)
 
@@ -228,7 +236,7 @@ bound under heavy stdout/stderr; sink failure cannot bypass retirement; child cr
 failure. Native parent death removes descendants on all three OSes. Desktop GUI/tray/login still work.
 
 **Gate:** behavior-preserving extraction with native smoke evidence and targeted typechecks.
-**Commit:** `refactor: share owned application bootstrap`.
+**Commit:** `Share owned application bootstrap`.
 
 ## Phase 4 — Two owners, foreground serve and takeover (checkpoint 4)
 
@@ -254,7 +262,7 @@ over the full event timeline, not only at final observation. Unresponsive owner 
 
 **Gate:** real packaged `serve` on Mac, normal-user Windows and display-free Lima; native takeover on
 Mac/Windows and Xvfb Linux; no process leaks, no inherited installation lock in ACN.
-**Commit:** `feat: add foreground serve with cooperative desktop takeover`.
+**Commit:** `Add foreground serve with cooperative desktop takeover`.
 
 ## Phase 5 — CLI cutover and connect-only clients (checkpoint 5)
 
@@ -271,7 +279,7 @@ one cooperative takeover; against Desktop focuses the existing app. Pi typecheck
 deleted starter references. Scan executable code/workflows/docs for obsolete public commands.
 
 **Gate:** targeted CLI/SDK/Pi/client-common/desktop checks; native passive-command no-mutation evidence.
-**Commit:** `feat: make CLI clients connect only and replace service commands`.
+**Commit:** `Make CLI clients connect only and replace service commands`.
 
 ## Phase 6 — Shared updater and macOS installer (checkpoint 6)
 
@@ -291,7 +299,7 @@ mutation. Repeat Windows Phase 1 acceptance after extraction; Linux authorizatio
 
 **Gate:** signed packaged Desktop A→B→C with CLI and ACN matching on Mac and Windows; Linux package
 transaction acceptance. Test-specific publisher evidence is distinguished from production signing.
-**Commit:** `feat: share update preparation and replace Electron macOS installation`.
+**Commit:** `Share update preparation and replace Electron macOS installation`.
 
 ## Phase 7 — Headless startup updates and CLI maintenance (checkpoint 7)
 
@@ -312,7 +320,7 @@ refuses without changing the live service. Mac/Windows/Linux foreground and serv
 
 **Gate:** A→B→C headless startup updates, including long-lived old executable cases on Windows, with
 no detached server, duplicate owner, retry loop or corrupted profile. Linux deferred state is explicit.
-**Commit:** `feat: apply prepared updates before headless startup`.
+**Commit:** `Apply prepared updates before headless startup`.
 
 ## Phase 8 — Full-install scripts and command registration (checkpoint 8)
 
@@ -332,7 +340,7 @@ shell files. Native DEB and RPM dependency/install/upgrade/refusal/abort-repair/
 their actual OS families. Windows current-shell PATH and uninstall retain unrelated entries.
 
 **Gate:** script install → `serve` → CLI query works without ever launching Desktop on each OS.
-**Commit:** `feat: install complete Magnitude applications from shell scripts`.
+**Commit:** `Install complete Magnitude applications from shell scripts`.
 Publishing script URLs/website changes remain a separate release action; local/acceptance hosting is
 sufficient for implementation tests.
 
@@ -362,7 +370,7 @@ from the final code; an earlier phase's binary is not final acceptance evidence.
 **Gate:** scenario receipts on all available local machines plus native x64 CI; real inference on Mac
 and Sparky and a small CPU model on Windows/Linux. Missing signing, architecture or RPM coverage is
 reported as incomplete, not downgraded to a mocked substitute.
-**Commit:** `test: verify packaged headless lifecycle and startup updates across platforms`.
+**Commit:** `Verify packaged headless lifecycle and startup updates across platforms`.
 
 ## Phase 10 — Documentation, release readiness and final checkpoint
 
@@ -381,7 +389,7 @@ them or state the specific external blocker. Validate documented commands in dis
 
 **Gate:** no known feature-related red tests; no claimed unsupported coverage; code, docs, commands,
 package assets and update policy agree. Ledger identifies the final commit and exact accepted hashes.
-**Commit:** `docs: document headless operation and finalize release readiness`.
+**Commit:** `Document headless operation and finalize release readiness`.
 
 ## Mandatory existing-product regression lane
 
