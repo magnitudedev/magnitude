@@ -25,7 +25,7 @@ import { CommandExecutor, FetchHttpClient } from "@effect/platform"
 import { NodeContext } from "@effect/platform-node"
 import { NodeSqliteDriverLayer } from "@magnitudedev/daemon-management/node"
 import { makeHarnessConnectionService, resolveHarnessConnectionPaths, harnessExecutableSearchPath } from "@magnitudedev/harness-connections"
-import { HttpsUrlSchema, MAGNITUDE_RPC_VERSION } from "@magnitudedev/sdk"
+import { HttpsUrlSchema } from "@magnitudedev/sdk"
 import { slate } from "@magnitudedev/client-common"
 import { DESKTOP_APP_ORIGIN, handleAppProtocol, resolveRendererDir } from "./app-protocol"
 import { app, autoUpdater, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, powerMonitor, shell, Tray } from "electron"
@@ -35,8 +35,9 @@ import { fileURLToPath } from "node:url"
 import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, PubSub, Queue, Ref, Runtime, Schema, Schedule, Scope, Stream } from "effect"
 import { RpcServer } from "@effect/rpc"
 import {
-  previousInstallationUpgrade, acquireApplicationOwner, applicationStateDirectory, isUpdateInstallationActive, makeOwnedService, makeUnixOwnedChildSpawner, makeWindowsOwnedChildSpawner, requireServicePort, NativeHost, nativeHostLayer,
-  OwnedChildSpawner, OwnedChildSpawnFailed, serveApplicationControl, serveWindowsApplicationControl, type ApplicationControlOptions,
+  acquireApplicationOwner, applicationStateDirectory, isUpdateInstallationActive, NativeHost, nativeHostLayer,
+  resolveApplicationProfile, applicationNativeHostPath, makeApplicationService, type ApplicationRuntime,
+  serveApplicationControl, serveWindowsApplicationControl, type ApplicationControlOptions,
   LinuxTrayHost, linuxTrayHostLayer, guardedCommandLayer,
   unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory,
   nativeWindowsInstallerVerifier,
@@ -45,7 +46,7 @@ import {
 } from "@magnitudedev/daemon-management/desktop-native"
 import { ProcessGroupController } from "@magnitudedev/utils/process-groups"
 import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native"
-import { nativeWindowsPrivatePipesLayer, nativeWindowsJobOwnerLayer, WindowsPipeName } from "@magnitudedev/utils/windows-native"
+import { nativeWindowsPrivatePipesLayer, WindowsPipeName } from "@magnitudedev/utils/windows-native"
 import { type ApplicationSnapshot, type OwnedServiceState } from "@magnitudedev/sdk/desktop-host"
 import { HostError, ApplicationAction, InferenceHostRpcs, type Page } from "./desktop-rpc"
 import { makeElectronRpcServerLayer } from "./electron-rpc"
@@ -57,16 +58,18 @@ if (process.platform === "win32") app.setAppUserModelId(WINDOWS_APPLICATION_ID)
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, "../../..")
 const background = process.argv.includes("--background") || (process.platform === "darwin" && app.isPackaged && app.getLoginItemSettings({ type: "mainAppService" }).wasOpenedAtLogin)
-const isolatedProfile = isUpdateAcceptanceBuild || !app.isPackaged || process.env.MAGNITUDE_DEV_DATA_DIR !== undefined
-const dataDir = process.env.MAGNITUDE_DEV_DATA_DIR ?? join(homedir(), isUpdateAcceptanceBuild ? ".magnitude-update-acceptance" : app.isPackaged ? ".magnitude" : ".magnitude-desktop-dev")
+const applicationRuntime: ApplicationRuntime = app.isPackaged
+  ? { _tag: "Installed", resourcesDirectory: process.resourcesPath }
+  : { _tag: "Development", repository: root }
+const profile = resolveApplicationProfile({ runtime: applicationRuntime, home: homedir(), platform: process.platform,
+  acceptance: isUpdateAcceptanceBuild, environment: process.env })
+const { isolated: isolatedProfile, dataDirectory: dataDir, port, endpoint } = profile
 const stateOverride = process.env.MAGNITUDE_DESKTOP_STATE_DIR
 // Chromium can create its profile before native ownership is acquired. Keep it outside the
 // protected Windows ownership leaf, which only native acquisition may create.
 app.setPath("userData", join(dataDir, "electron"))
 app.setPath("sessionData", join(dataDir, "electron"))
-const port = isolatedProfile ? Number(process.env.MAGNITUDE_DEV_PORT ?? (isUpdateAcceptanceBuild ? 11143 : 11101)) : 10100
-const endpoint = `http://127.0.0.1:${port}`
-const addonPath = app.isPackaged ? join(process.resourcesPath, "desktop-host.node") : join(root, `packages/daemon-management/dist/native/${process.platform}-${process.arch}/desktop-host.node`)
+const addonPath = applicationNativeHostPath(applicationRuntime, process.platform, process.arch)
 let exiting = false
 let canPresentErrors = process.platform !== "win32"
 let systemShutdownRequested = false
@@ -163,7 +166,7 @@ const program = Effect.scoped(Effect.gen(function* () {
           if (Option.isNone(publisher)) return yield* new ApplicationUpdateFailed({ message: "The Windows update publisher is missing." })
           return yield* makeWindowsUpdateSource({ ...options, applicationPath: process.execPath,
             cliPath: join(process.resourcesPath, "magnitude.exe"), addonPath }).pipe(
-              Effect.provide(nativeWindowsInstallerVerifier(addonPath, publisher.value)), Effect.provide(privateFiles))
+              Effect.provide([nativeWindowsInstallerVerifier(addonPath, publisher.value), privateFiles]))
         }
         return yield* macUpdateSource({ ...options, bundle: dirname(dirname(dirname(process.execPath))), cliPath: join(process.resourcesPath, "magnitude"), addonPath }).pipe(Effect.provideService(NativeMacUpdate, nativeMacUpdate(autoUpdater)), Effect.provideService(MacUpdateHandoff, { start: startMacUpdateHandoff }), Effect.provide(privateFiles))
       }).pipe(Effect.provideService(PreparedUpdateStore, store))
@@ -249,23 +252,8 @@ const program = Effect.scoped(Effect.gen(function* () {
     yield* trayHost.changes.pipe(Stream.runForEach(tray.observeHost), Effect.forkScoped)
   }
   const harnessEnvironment = yield* resolveHarnessEnvironment().pipe(Effect.provide(guardedCommandLayer(join(dirname(addonPath), "magnitude-command"))), Effect.forkScoped)
-  const spawner = process.platform === "win32" ? yield* Effect.gen(function* () {
-    const pipes = yield* Layer.build(nativeWindowsPrivatePipesLayer(addonPath))
-    const jobs = yield* Layer.build(nativeWindowsJobOwnerLayer(addonPath))
-    return yield* makeWindowsOwnedChildSpawner.pipe(Effect.provide(pipes), Effect.provide(jobs))
-  }) : yield* makeUnixOwnedChildSpawner
-  const upgrade: Effect.Effect<void, { readonly message: string }> = app.isPackaged && !isolatedProfile && process.platform !== "win32"
-    ? yield* previousInstallationUpgrade({ home: homedir(), dataDirectory: dataDir, stateDirectory: stateDir }).pipe(Effect.provide(NodeSqliteDriverLayer))
-    : Effect.void
-  const portCheckedSpawner = yield* requireServicePort(port).pipe(Effect.provideService(OwnedChildSpawner, spawner))
-  const admittedSpawner = OwnedChildSpawner.of({ spawn: command => upgrade.pipe(
-    Effect.mapError(error => new OwnedChildSpawnFailed({ executable: command.executable, message: error.message })),
-    Effect.zipRight(portCheckedSpawner.spawn(command))) })
-  const service = yield* makeOwnedService({
-    executable: app.isPackaged ? join(process.resourcesPath, process.platform === "win32" ? "magnitude-service.exe" : "magnitude-service") : process.env.MAGNITUDE_BUN_PATH ?? "bun",
-    arguments: [...(app.isPackaged ? [] : [join(root, "packages/acn/src/binary.ts")]), "serve", "--data-dir", dataDir, "--port", String(port)],
-    environment: { ...process.env, MAGNITUDE_NATIVE_HOST: addonPath, ...(app.isPackaged || process.env.MAGNITUDE_ICN_PATH ? {} : { MAGNITUDE_ICN_PATH: join(root, "inference/target/development/installation.json") }) },
-  }, MAGNITUDE_RPC_VERSION).pipe(Effect.provideService(OwnedChildSpawner, admittedSpawner))
+  const service = yield* makeApplicationService({ output: "DiagnosticTail", runtime: applicationRuntime, profile,
+    stateDirectory: stateDir, home: homedir(), environment: process.env }).pipe(Effect.provide(NodeSqliteDriverLayer))
   const snapshot = Effect.all({ service: service.state, tray: tray.state }).pipe(Effect.map(value => ({ version: 1 as const, pid: process.pid, endpoint, ...value })))
   const snapshots = Stream.zipLatest(service.changes, tray.changes).pipe(Stream.map(([service, tray]) => ({ version: 1 as const, pid: process.pid, endpoint, service, tray })))
   yield* service.changes.pipe(Stream.runForEach(current => Ref.set(state, current).pipe(Effect.zipRight(refreshTray))), Effect.forkScoped)

@@ -1,8 +1,8 @@
 ---
 applies_to:
   - packages/daemon-management/src/desktop-native/owned-service.ts
-  - packages/acn-protocol/src/acn-identity.ts
-  - packages/acn-protocol/src/acn-revision.ts
+  - packages/acn-protocol/src/acn-*.ts
+  - packages/daemon-management/src/desktop-native/application-bootstrap.ts
   - packages/acn/src/server.ts
   - packages/acn/src/icn/**
   - packages/version/scripts/generate-version.ts
@@ -26,6 +26,15 @@ A kernel-held application lock excludes concurrent owners without killing a stal
 A losing launch forwards background Ensure or explicit Open intent over per-user local IPC, or
 returns a bounded owner-unavailable result. Background demand never shows or focuses a window.
 The SDK remains portable and receives a starter capability rather than OS process authority.
+
+Application bootstrap selects one installed resource directory or one development checkout and
+constructs the service command from that selection. Profile selection, native adapter location,
+previous-installation retirement and per-attempt port preflight are shared host composition in
+daemon-management. Installed service and adapter paths always come from the same resource directory.
+Bundled CLI resource selection resolves the executing payload through filesystem symlinks and
+requires the installed layout; it never substitutes a different installation found through PATH.
+Development runtime and engine overrides remain explicit. Selection itself never creates state,
+acquires ownership, or spawns a child; the retained owner admits supervised startup.
 
 ## Child supervision
 

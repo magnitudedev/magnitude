@@ -38,3 +38,5 @@ export { ModelStoragePreferences, ModelStoragePreferencesFailed, makeModelStorag
 export { NetworkPreferences, NetworkPreferencesFailed, makeNetworkPreferences, listNetworkInterfaces, networkAccessEquals, LOOPBACK_ONLY, type NetworkAccess, type NetworkAccessChange, type NetworkInterfaceAddress, type NetworkInterfaceKind } from "./network-preferences"
 
 export { recoverWindowsUpdateDirectory, WindowsUpdateDirectoryFailed } from "./windows-update-directory"
+
+export { ApplicationRuntime, ApplicationProfile, ApplicationRuntimeUnavailable, resolveInstalledApplicationRuntime, resolveApplicationProfile, applicationNativeHostPath, applicationServiceCommand, makeApplicationService } from "./application-bootstrap"

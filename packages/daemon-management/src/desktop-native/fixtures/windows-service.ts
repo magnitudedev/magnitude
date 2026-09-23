@@ -18,6 +18,7 @@ const run = Effect.acquireUseRelease(
   root => Effect.scoped(Effect.gen(function* () {
     const spawner = yield* makeWindowsOwnedChildSpawner
     const child = yield* spawner.spawn({
+      output: "DiagnosticTail",
       executable: service, arguments: ["serve", "--data-dir", root, "--port", "0"],
       environment: { ...process.env, MAGNITUDE_NATIVE_HOST: addon, MAGNITUDE_ICN_PATH: join(root, "absent-engine.json") },
     })

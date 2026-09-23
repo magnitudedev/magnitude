@@ -252,3 +252,64 @@ Linux now has a separate source checkout of the prior checkpoint under
 `/home/trg.guest/magnitude-headless.uAol17lC/checkout`; dependency setup is underway independently of
 the running installed baseline. Next implementation work can extract shared bootstrap while remaining
 platform update admission and launcher packaging gates continue to be exercised.
+
+### Phase 3 work in progress — shared bootstrap and output
+
+Extracted application profile, matched resources/service command and supervised startup composition
+from desktop main into daemon-management. Desktop retains its existing ownership, UI and lifecycle.
+Added explicit diagnostic-only versus foreground child output on both native spawners. Collection
+retains the last 16 KiB; terminal forwarding allows one bounded outstanding write and cannot hold
+shutdown open. Added installed payload canonicalization and a real filesystem symlink-chain test.
+These changes are not yet a completed phase checkpoint.
+
+Evidence on Mac with pinned Bun 1.4.2:
+
+- The focused bootstrap/output/Unix-child/Windows-composition/supervisor/port suite passed 26 tests;
+  the subsequent symlink-resolution addition passed all six bootstrap tests.
+- A real owned child and its worker retired after a deliberately failing foreground stderr sink.
+  Blocked writes, late asynchronous terminal errors, synchronous write errors and bounded diagnostics
+  passed. Windows composition initially rejected the new extra command field; explicit native command
+  construction corrected that and all three composition tests passed.
+- Daemon-management and desktop targeted typechecks passed after output integration. The later
+  canonicalization addition still needs its final typecheck.
+- The extraction's built Electron app ran against isolated profile
+  `/tmp/magnitude-headless-bootstrap.9kK09M`, port 11163. Real GUI Status showed Ready; source CLI
+  service status and models status succeeded without serve. CLI app open succeeded and the UI
+  remained Ready. A close-button action was performed, but accessibility immediately showed a
+  window again, so this run does not independently establish a hidden-window interval.
+- Explicit CLI service stop completed; the retained Electron execution session exited 0 and no
+  processes with that profile/port remained. The personal installed application was not replaced.
+
+Remaining Phase 3 gates include native Linux/Windows execution of the extraction, stronger window
+close/reopen observation, final builds/typechecks, and resolving the existing full-suite shell-probe
+failure. The Windows launcher still needs release packaging; cross-platform update admission and
+packaged end-to-end tests remain open. No foreground serve command is implemented yet.
+
+Follow-up verification: daemon-management typecheck also passed after canonicalization. Synced the
+current extraction into the separate Ubuntu ARM64 checkout, rebuilt its native addon, and passed
+all 27 focused tests there, including actual Unix child/worker retirement and the failing-terminal
+case. This is native Linux process coverage, not packaged Linux desktop acceptance.
+
+### Shared bootstrap checkpoint verification
+
+Corrected a test-runtime attribution error: adding the pinned Bun directory to PATH did not replace
+`bunx`, because that directory originally contained only `bun`. The resolved `bunx` was a symlink to
+the user's Bun 1.3.14. Earlier Mac test claims of Bun 1.4.2 based only on that PATH override were
+incorrect. Their observed results stand, but those runtime labels are superseded by this verification.
+Windows and Linux commands that explicitly invoked the pinned `bun x --bun` were unaffected.
+
+Created a local bunx symlink beside the isolated pinned runtime and verified it reports 1.4.2.
+The previously failing shell-probe suite passes all seven tests on that runtime; temporary
+instrumentation was removed and no shell-probe implementation or test was changed. Full reruns:
+
+- Mac desktop: 256 passed, six platform/integration skips; all 32 executed files passed.
+- Mac daemon-management: 263 passed, seven platform skips; all 37 files passed.
+- Desktop targeted typecheck and production bundle/native build passed after the final changes.
+- Windows focused suite: 21 passed, one Unix symlink test skipped. Native compiled ACN was then
+  exercised by both Node 24.21.0 and Bun 1.4.2 owners using the changed Windows spawner; both received
+  final startup-failure health, acknowledged it, observed exit and retired the native job.
+
+This is a tested implementation checkpoint for shared bootstrap extraction, not a claim that the
+full Phase 3 visual/package matrix has passed. Actual model interaction, settings persistence/login
+registration in a disposable desktop profile, stronger close/reopen observation, and packaged
+three-platform acceptance remain explicit gates alongside subsequent ownership integration.

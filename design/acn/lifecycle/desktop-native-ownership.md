@@ -188,6 +188,12 @@ Service failure presentation uses ACN's safe detail or a concise typed error mes
 stacks and stderr remain in logs instead of becoming the ordinary Status label.
 Failed child attempts retain bounded diagnostics in logs even when control-channel closure is
 observed before process exit; diagnostic visibility cannot depend on which failure wins that race.
+Each service attempt retains the final 16 KiB of output. Desktop ownership collects diagnostics
+without forwarding them to the terminal. Foreground ownership additionally forwards output to parent
+stderr, with at most one 16 KiB write outstanding. Slow terminals may lose live output; diagnostic
+collection continues independently. Terminal errors disable forwarding and cannot fail service
+admission, prevent process-tree retirement, or make shutdown wait for the terminal. Child ownership
+never closes the parent's terminal stream.
 
 On macOS and Linux, production startup automatically retires a verified previous standalone Magnitude installation
 before spawning its bundled service, while holding the application lock. This bounded upgrade is
