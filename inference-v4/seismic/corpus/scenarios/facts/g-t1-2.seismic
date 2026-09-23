@@ -1,0 +1,8 @@
+# origin: C18:G-T1-2
+# invoke: f32[4]=1,2,3,4
+# pin: result = f32[]=80
+fn probe(x: &tensor[4] f32) -> f32:
+    let mut t = to_owned(x)
+    for k in 0..3:
+        t = t * 2.0
+    return reduce(t, 0, sum)

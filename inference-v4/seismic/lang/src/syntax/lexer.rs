@@ -4,6 +4,7 @@
 //! `Int(0) DotDot Name`: a `.` continues a number only when a digit follows it.
 
 use super::token::{Kw, Op, Tok, Token};
+use crate::checked::DiagnosticRule;
 use crate::span::{Diagnostic, Span};
 
 pub fn lex(text: &str) -> Result<Vec<Token>, Diagnostic> {
@@ -40,7 +41,8 @@ impl<'a> Lexer<'a> {
             match c {
                 b' ' => self.pos += 1,
                 b'\t' => {
-                    return Err(Diagnostic::new(
+                    return Err(Diagnostic::with_rule(
+                        DiagnosticRule::Syntax,
                         Span::new(self.pos, self.pos + 1),
                         "tabs are not allowed; use spaces",
                     ));
@@ -61,7 +63,8 @@ impl<'a> Lexer<'a> {
             }
         }
         if self.depth != 0 {
-            return Err(Diagnostic::new(
+            return Err(Diagnostic::with_rule(
+                DiagnosticRule::Syntax,
                 Span::new(self.pos, self.pos),
                 "unclosed bracket at end of file",
             ));
@@ -106,7 +109,8 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                 }
                 b'\t' => {
-                    return Err(Diagnostic::new(
+                    return Err(Diagnostic::with_rule(
+                        DiagnosticRule::Syntax,
                         Span::new(self.pos, self.pos + 1),
                         "tabs are not allowed; use spaces",
                     ));
@@ -149,7 +153,8 @@ impl<'a> Lexer<'a> {
                 });
             }
             if width != self.indent() {
-                return Err(Diagnostic::new(
+                return Err(Diagnostic::with_rule(
+                    DiagnosticRule::Syntax,
                     Span::new(start, self.pos),
                     "indentation does not match any enclosing block",
                 ));
@@ -187,7 +192,11 @@ impl<'a> Lexer<'a> {
                 .filter(|c| *c != '_')
                 .collect();
             let value = u64::from_str_radix(&s, 16).map_err(|_| {
-                Diagnostic::new(Span::new(start, self.pos), "invalid hexadecimal literal")
+                Diagnostic::with_rule(
+                    DiagnosticRule::Syntax,
+                    Span::new(start, self.pos),
+                    "invalid hexadecimal literal",
+                )
             })?;
             self.tokens.push(Token {
                 tok: Tok::Int(value),
@@ -237,20 +246,24 @@ impl<'a> Lexer<'a> {
             .collect();
         let span = Span::new(start, self.pos);
         if is_float {
-            let value: f64 = s
-                .parse()
-                .map_err(|_| Diagnostic::new(span, "invalid number literal"))?;
+            let value: f64 = s.parse().map_err(|_| {
+                Diagnostic::with_rule(DiagnosticRule::Syntax, span, "invalid number literal")
+            })?;
             if !value.is_finite() {
-                return Err(Diagnostic::new(span, "number literal out of range"));
+                return Err(Diagnostic::with_rule(
+                    DiagnosticRule::Syntax,
+                    span,
+                    "number literal out of range",
+                ));
             }
             self.tokens.push(Token {
                 tok: Tok::Float(value),
                 span,
             });
         } else {
-            let value: u64 = s
-                .parse()
-                .map_err(|_| Diagnostic::new(span, "integer literal out of range"))?;
+            let value: u64 = s.parse().map_err(|_| {
+                Diagnostic::with_rule(DiagnosticRule::Syntax, span, "integer literal out of range")
+            })?;
             self.tokens.push(Token {
                 tok: Tok::Int(value),
                 span,
@@ -303,7 +316,8 @@ impl<'a> Lexer<'a> {
                         b'r' => '\r',
                         b't' => '\t',
                         other => {
-                            return Err(Diagnostic::new(
+                            return Err(Diagnostic::with_rule(
+                                DiagnosticRule::Syntax,
                                 Span::new(self.pos - 1, self.pos + 1),
                                 format!("unsupported string escape `\\{}`", other as char),
                             ));
@@ -313,7 +327,8 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                 }
                 b'\n' | b'\r' => {
-                    return Err(Diagnostic::new(
+                    return Err(Diagnostic::with_rule(
+                        DiagnosticRule::Syntax,
                         Span::new(start, self.pos),
                         "string literals cannot contain a newline",
                     ));
@@ -328,7 +343,8 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
-        Err(Diagnostic::new(
+        Err(Diagnostic::with_rule(
+            DiagnosticRule::Syntax,
             Span::new(start, self.pos),
             "unterminated string literal",
         ))
@@ -387,7 +403,8 @@ impl<'a> Lexer<'a> {
                         .chars()
                         .next()
                         .unwrap_or(other as char);
-                    return Err(Diagnostic::new(
+                    return Err(Diagnostic::with_rule(
+                        DiagnosticRule::Syntax,
                         Span::new(start, start + ch.len_utf8()),
                         format!("unexpected character `{ch}`"),
                     ));
@@ -399,7 +416,8 @@ impl<'a> Lexer<'a> {
             Op::LParen | Op::LBracket => self.depth += 1,
             Op::RParen | Op::RBracket => {
                 if self.depth == 0 {
-                    return Err(Diagnostic::new(
+                    return Err(Diagnostic::with_rule(
+                        DiagnosticRule::Syntax,
                         Span::new(start, start + 1),
                         format!("unmatched `{}`", op.text()),
                     ));

@@ -1,0 +1,18 @@
+# origin: test:validation:programs/scalar-semantics.seismic:reduction_extrema
+# invoke reduction_extrema: f32[3,65]=rand(130) ; f32[3]=zero ; f32[3]=zero ; i32[3]=zero
+fn reduction_extrema(x: &tensor[3, 65] f32, minima: tensor[3] f32, maxima: tensor[3] f32, indices: tensor[3] i32) -> (tensor[3] f32, tensor[3] f32, tensor[3] i32):
+    let mut low = minima
+    let mut high = maxima
+    let mut at = indices
+    for row in 0..3:
+        low[row] = f32(inf)
+        high[row] = f32(-inf)
+        at[row] = 0
+        for col in 0..65:
+            let value = x[row, col]
+            if value < low[row]:
+                low[row] = value
+            if value > high[row]:
+                high[row] = value
+                at[row] = i32(col)
+    return low, high, at

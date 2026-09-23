@@ -1,0 +1,13 @@
+# origin: test:validation:corpus/effects.seismic:carried_scalar
+# invoke carried_scalar: f32[6]=1,5,2,7,3,7 ; f32[6]=zero
+fn carried_scalar[N](x: &tensor[N] f32, prefix: &mut tensor[N] f32) -> (f32, i32):
+    let mut running = f32(0.0)
+    let mut best = f32(-inf)
+    let mut at = i32(0)
+    for i in 0..N:
+        running = running + x[i]
+        prefix[i] = running
+        if x[i] > best:
+            best = x[i]
+            at = i32(i)
+    return best, at

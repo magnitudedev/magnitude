@@ -1,0 +1,8 @@
+# origin: C14:s19
+# rejected: "does not permit exclusive writes"
+fn probe[N](x: &tensor[N] f32, c: bool, out: &mut tensor[N] f32):
+    let mut t = x[0:N]
+    if c:
+        t = x[0:N]
+    for i in 0..N:
+        out[i] = t[i]

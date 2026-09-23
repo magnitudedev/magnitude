@@ -1,0 +1,5 @@
+# origin: C11:s_range_return
+# cell: value-range/exit
+# invoke: range:2..5
+fn probe(r: range[10]) -> range[10]:
+    return r

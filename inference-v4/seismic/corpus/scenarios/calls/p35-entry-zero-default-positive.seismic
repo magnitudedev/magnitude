@@ -1,0 +1,5 @@
+# origin: C13:p35
+# invoke: i32[0]=seq
+# expect: invalid-invocation
+fn probe[N](x: &tensor[N] i32) -> i32:
+    return i32(N) + 100

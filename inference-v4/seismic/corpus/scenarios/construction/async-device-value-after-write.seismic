@@ -1,0 +1,7 @@
+# origin: C11:async_device_value_after_write
+# invoke: i32[2]=3,0
+fn probe(x: &mut tensor[2] i32) -> i32:
+    let a = x[0]
+    x[0] = a + 1
+    let b = x[0]
+    return a + b

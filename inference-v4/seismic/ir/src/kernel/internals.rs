@@ -1,39 +1,29 @@
-//! W4-owned kernel builder and arena internals. The public builder in
-//! `kernel/mod.rs` is frozen; these signatures serve every public method.
+//! Kernel builder and arena internals. `PortableBuilder` is the only kernel
+//! constructor.
 //!
 //! Construction facts established here and never re-checked downstream:
 //! - every `ErasedValue` of a closed kernel is dense and typed;
 //! - every operand of an op is defined in the op's block or a dominating
 //!   block (lexical scoping, §7.2);
-//! - every join/carry has one typed schema (by the `KernelValues` type of
-//!   the branch/repeat call);
+//! - every join/carry has one schema (the arms' yielded value types);
 //! - every read/write index has the rank of its place;
 //! - every declared result slot is written on every path;
 //! - every intrinsic's resources and actual selected operation are retained.
 //!
-//! The only panics are factory authoring bugs against the private builder
+//! The only panics are construction bugs against the private builder
 //! (a handle of another kernel, a value used outside its scope, a rank
 //! mismatch, an unwritten result slot, an unsupported plane) and are
 //! §13.3.2 (private arena id) / §13.3.1 (registry) categories.
 
 use super::ops::{
     self, BarrierScope, BinaryOp, Binding, BindingAccess, BitOp, Block, CmpOp, ErasedValue,
-    GeometryValue, IntrinsicResources, IntrinsicSink, KernelInterface, LogicOp, MathPrecision,
+    GeometryValue, IntrinsicResources, KernelInterface, LogicOp, MathPrecision,
     Op, PlaceRef, ResourceFacts, UnaryOp, ValueSchema, ValueType,
 };
-use super::{
-    BindingSlot, BlockId, Kernel, KernelArena, KernelBuilder, KernelId, KernelValues, PlaneId,
-    ReadablePlaceId, ScalarId, TypedIntrinsic, VectorId, WritablePlaceId, WritableScalar,
-};
+use super::{BindingSlot, BlockId, Kernel, KernelArena, KernelId};
 use crate::identity::OwnerToken;
-use crate::repr::{
-    constant_of, value_type_of, Bool, Idx, Representation, ScalarType, VectorElement,
-    WritableRepresentation, U32,
-};
 use crate::schedule::AnyScalarSlot;
-use crate::storage::{
-    BufferViewId, LaunchLocalId, LaunchLocalKind, LocalAllocation,
-};
+use crate::storage::{LaunchLocalKind, LocalAllocation};
 use crate::target::PhysicalDialect;
 use seismic_lang::expr::{ExprArena, NatExpr, SymbolId};
 use seismic_lang::ids::{IntrinsicId, RepresentationId};
@@ -42,7 +32,6 @@ use seismic_lang::registry::{
     self, IntrinsicResultType, IntrinsicUniformity, RepresentationKind,
 };
 use seismic_lang::types::DType;
-use std::marker::PhantomData;
 
 // ---------------------------------------------------------------------------
 // Per-kernel construction state
@@ -105,7 +94,6 @@ pub(crate) struct KernelState<B: PhysicalDialect> {
     blocks: Vec<BlockData<B>>,
     values: Vec<ValueEntry>,
     places: Vec<PlaceEntry>,
-    planes: Vec<(u32, u32)>,
     bindings: Vec<Binding>,
     nat_args: Vec<NatExpr>,
     scalar_args: Vec<(SymbolId, crate::repr::ScalarKind)>,
@@ -139,7 +127,6 @@ impl<B: PhysicalDialect> KernelState<B> {
             blocks: Vec::new(),
             values: Vec::new(),
             places: Vec::new(),
-            planes: Vec::new(),
             bindings: Vec::new(),
             nat_args: Vec::new(),
             scalar_args: Vec::new(),
@@ -171,48 +158,7 @@ pub(crate) struct Builder<'a, B: PhysicalDialect> {
     block: BlockId,
 }
 
-/// Opens a kernel builder over the implementation builder's tables. The
-/// root block is created here; `close` pushes the kernel onto `kernels`.
-pub(crate) fn open<'a, B: PhysicalDialect>(
-    owner: OwnerToken,
-    expr: &'a mut ExprArena,
-    storage: &'a crate::storage::TopologyBuilder,
-    schedule: &'a crate::schedule::ScheduleConstruction<B>,
-    kernels: &'a mut Vec<Kernel<B>>,
-    state: &'a mut KernelState<B>,
-    target_facts: &'a B::Facts,
-    resource_classes: &'a [crate::target::AddressableResourceClass],
-    vector_support: &'a crate::target::VectorSupport,
-) -> KernelBuilder<'a, B> {
-    state.assert_closed();
-    let kernel = kernels.len() as u32;
-    let zero = expr.nat(0);
-    let one = expr.nat(1);
-    *state = KernelState::new(owner, kernel, zero, resource_classes.len());
-    state.blocks.push(BlockData {
-        ops: Vec::new(),
-        parent: None,
-        multiplicity: Some(one),
-        control_uniformity: Uniformity::Workgroup,
-    });
-    KernelBuilder {
-        inner: Builder {
-            expr,
-            storage,
-            schedule,
-            kernels,
-            state,
-            target_facts,
-            resource_classes,
-            vector_support,
-            block: BlockId::new(owner, kernel, 0),
-        },
-    }
-}
-
-/// Core-only erased construction used by the universal semantic lowering.
-/// It remains inside kernel internals: factories and backends can only use
-/// the typed `KernelBuilder` surface.
+/// A value of the source-directed kernel builder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PortableValue {
     pub(crate) raw: ErasedValue,
@@ -638,9 +584,8 @@ impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
         PortableValue { raw: out, ty }
     }
     fn geometry(&mut self, kind: GeometryValue) -> PortableValue {
-        let value = self.inner.geometry(kind);
         PortableValue {
-            raw: ErasedValue::new(value.owner(), value.kernel(), value.block(), value.index()),
+            raw: self.inner.geometry(kind),
             ty: ValueType::Index,
         }
     }
@@ -1106,29 +1051,6 @@ impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
             field,
             index: indices,
         });
-        PortableValue { raw: out, ty }
-    }
-    fn vector_from_lanes(&mut self, lanes: &[PortableValue]) -> PortableValue {
-        let first = lanes.first().expect("vector has at least one lane");
-        let dtype = match first.ty {
-            ValueType::Scalar(dtype) => dtype,
-            ValueType::Bool => DType::Bool,
-            _ => panic!("vector lanes must be source scalars"),
-        };
-        let raw = lanes
-            .iter()
-            .map(|lane| {
-                assert_eq!(lane.ty, first.ty, "vector lane types differ");
-                self.inner.use_value(lane.raw, &first.ty)
-            })
-            .collect::<Vec<_>>();
-        let ty = ValueType::Vector {
-            dtype,
-            lanes: lanes.len().try_into().expect("vector lane count"),
-        };
-        let uniformity = self.inner.combined_uniformity(raw.iter().copied());
-        let out = self.inner.define_with(ty, None, uniformity);
-        self.inner.emit(Op::VectorFromLanes { out, lanes: raw });
         PortableValue { raw: out, ty }
     }
     pub fn write(&mut self, place: PortablePlace, index: &[PortableValue], value: PortableValue) {
@@ -2106,14 +2028,6 @@ impl<'a, B: PhysicalDialect> Builder<'a, B> {
 
     // ----- values ------------------------------------------------------------
 
-    fn define(&mut self, ty: ValueType) -> ErasedValue {
-        self.define_with(ty, None, Uniformity::Varying)
-    }
-
-    fn define_nat(&mut self, ty: ValueType, nat: Option<NatExpr>) -> ErasedValue {
-        self.define_with(ty, nat, Uniformity::Varying)
-    }
-
     fn define_with(
         &mut self,
         ty: ValueType,
@@ -2169,42 +2083,6 @@ impl<'a, B: PhysicalDialect> Builder<'a, B> {
             );
         }
         value
-    }
-
-    fn use_scalar<T: ScalarType>(&mut self, value: ScalarId<T>) -> ErasedValue {
-        self.assert_kernel(value.owner(), value.kernel());
-        assert_eq!(
-            value.block(),
-            self.entry(ErasedValue::new(
-                value.owner(),
-                value.kernel(),
-                value.block(),
-                value.index()
-            ))
-            .block,
-            "typed value carries the wrong defining block"
-        );
-        self.use_value(
-            ErasedValue::new(value.owner(), value.kernel(), value.block(), value.index()),
-            &value_type_of::<T>(),
-        )
-    }
-
-    fn use_vector<T: VectorElement, const LANES: u16>(
-        &mut self,
-        value: VectorId<T, LANES>,
-    ) -> ErasedValue {
-        self.assert_kernel(value.owner, value.kernel);
-        assert_eq!(
-            value.block,
-            self.entry(value.erased()).block,
-            "typed vector carries the wrong defining block"
-        );
-        self.use_value(value.erased(), &VectorId::<T, LANES>::value_type())
-    }
-
-    fn use_index_list(&mut self, index: &[ScalarId<Idx>]) -> Vec<ErasedValue> {
-        index.iter().map(|i| self.use_scalar(*i)).collect()
     }
 
     fn nat_of(&self, value: ErasedValue) -> Option<NatExpr> {
@@ -2281,63 +2159,7 @@ impl<'a, B: PhysicalDialect> Builder<'a, B> {
         self.state.blocks[self.block.index() as usize].ops.push(op);
     }
 
-    fn scalar_out<T: ScalarType>(&mut self) -> (ErasedValue, ScalarId<T>) {
-        self.scalar_out_with(Uniformity::Varying)
-    }
-
-    fn scalar_out_with<T: ScalarType>(
-        &mut self,
-        uniformity: Uniformity,
-    ) -> (ErasedValue, ScalarId<T>) {
-        let out = self.define_with(value_type_of::<T>(), None, uniformity);
-        (
-            out,
-            ScalarId::new(out.owner, out.kernel, out.block, out.index()),
-        )
-    }
-
-    fn vector_out<T: VectorElement, const LANES: u16>(
-        &mut self,
-        uniformity: Uniformity,
-    ) -> (ErasedValue, VectorId<T, LANES>) {
-        let out = self.define_with(VectorId::<T, LANES>::value_type(), None, uniformity);
-        (
-            out,
-            VectorId::new(out.owner, out.kernel, out.block, out.index()),
-        )
-    }
-
-    fn index_out(&mut self, nat: Option<NatExpr>) -> (ErasedValue, ScalarId<Idx>) {
-        self.index_out_with(nat, Uniformity::Varying)
-    }
-
-    fn index_out_with(
-        &mut self,
-        nat: Option<NatExpr>,
-        uniformity: Uniformity,
-    ) -> (ErasedValue, ScalarId<Idx>) {
-        let out = self.define_with(ValueType::Index, nat, uniformity);
-        (
-            out,
-            ScalarId::new(out.owner, out.kernel, out.block, out.index()),
-        )
-    }
-
     // ----- places ------------------------------------------------------------
-
-    fn place(&self, owner: OwnerToken, kernel: u32, block: BlockId, index: u32) -> PlaceEntry {
-        self.assert_kernel(owner, kernel);
-        if !self.dominates(block, self.block) {
-            panic!(
-                "kernel builder: place #{index} defined in {block:?} is not visible in {:?}",
-                self.block
-            );
-        }
-        match self.state.places.get(index as usize) {
-            Some(place) => *place,
-            None => panic!("kernel builder: place #{index} is not a place of the open kernel"),
-        }
-    }
 
     fn push_place(&mut self, place: PlaceRef, representation: RepresentationId, rank: u32) -> u32 {
         let index = self.state.places.len() as u32;
@@ -2381,109 +2203,7 @@ impl<'a, B: PhysicalDialect> Builder<'a, B> {
         (slot, rank)
     }
 
-    fn checked_index(&mut self, place: PlaceEntry, index: &[ScalarId<Idx>]) -> Vec<ErasedValue> {
-        if index.len() as u32 != place.rank {
-            panic!(
-                "kernel builder: access with {} indices to a place of rank {}",
-                index.len(),
-                place.rank
-            );
-        }
-        self.use_index_list(index)
-    }
-
-    // ----- public-method servers ---------------------------------------------
-
-    pub(super) fn arg_readable<R: Representation>(
-        &mut self,
-        v: BufferViewId<R>,
-    ) -> ReadablePlaceId<R> {
-        let (slot, rank) = self.bind_view(v.erase(), BindingAccess::Read);
-        let index = self.push_place(PlaceRef::Global { slot }, R::id(), rank);
-        ReadablePlaceId::new(self.owner(), self.kernel_index(), self.block, index)
-    }
-    pub(super) fn arg_writable<R: WritableRepresentation>(
-        &mut self,
-        v: BufferViewId<R>,
-    ) -> WritablePlaceId<R> {
-        let (slot, rank) = self.bind_view(v.erase(), BindingAccess::Write);
-        let index = self.push_place(PlaceRef::Global { slot }, R::id(), rank);
-        WritablePlaceId::new(self.owner(), self.kernel_index(), self.block, index)
-    }
-    pub(super) fn arg_nat(&mut self, e: NatExpr) -> ScalarId<Idx> {
-        let index = self.state.nat_args.len() as u32;
-        self.state.nat_args.push(e);
-        let (out, id) = self.index_out_with(Some(e), Uniformity::Workgroup);
-        self.emit(Op::NatArg { out, index });
-        id
-    }
-    pub(super) fn arg_scalar<T: ScalarType>(&mut self, s: SymbolId) -> ScalarId<T> {
-        let index = self.state.scalar_args.len() as u32;
-        self.state.scalar_args.push((s, T::KIND));
-        let (out, id) = self.scalar_out_with::<T>(Uniformity::Workgroup);
-        self.emit(Op::ScalarArg { out, index });
-        id
-    }
-    pub(super) fn result_slot<T: ScalarType>(
-        &mut self,
-        s: crate::schedule::ScalarSlotId<T>,
-    ) -> WritableScalar<T> {
-        assert_eq!(
-            s.erase().owner(),
-            self.owner(),
-            "result slot belongs to another implementation"
-        );
-        let index = self.state.result_slots.len() as u32;
-        self.state.result_slots.push(s.erase());
-        WritableScalar {
-            owner: self.owner(),
-            kernel: self.kernel_index(),
-            index,
-            marker: PhantomData,
-        }
-    }
-    pub(super) fn local<R: Representation>(
-        &mut self,
-        k: LaunchLocalKind,
-        e: Vec<NatExpr>,
-    ) -> LaunchLocalId<R> {
-        let index = self.state.locals.len() as u32;
-        self.state.locals.push(LocalAllocation {
-            kind: k,
-            representation: R::id(),
-            extents: e,
-            alignment: representation_alignment(R::id()),
-        });
-        LaunchLocalId::new(self.owner(), self.kernel_index(), index)
-    }
-    fn local_place<R: Representation>(&mut self, l: LaunchLocalId<R>) -> u32 {
-        self.assert_kernel(l.owner(), l.kernel());
-        let rank = self.state.locals[l.index() as usize].extents.len() as u32;
-        self.push_place(PlaceRef::Local { index: l.index() }, R::id(), rank)
-    }
-    pub(super) fn local_readable<R: Representation>(
-        &mut self,
-        l: LaunchLocalId<R>,
-    ) -> ReadablePlaceId<R> {
-        let index = self.local_place(l);
-        ReadablePlaceId::new(self.owner(), self.kernel_index(), self.block, index)
-    }
-    pub(super) fn local_writable<R: WritableRepresentation>(
-        &mut self,
-        l: LaunchLocalId<R>,
-    ) -> WritablePlaceId<R> {
-        let index = self.local_place(l);
-        WritablePlaceId::new(self.owner(), self.kernel_index(), self.block, index)
-    }
-    pub(super) fn as_readable<R: Representation>(
-        &mut self,
-        p: WritablePlaceId<R>,
-    ) -> ReadablePlaceId<R> {
-        let _ = self.place(p.owner(), p.kernel(), p.block(), p.index());
-        ReadablePlaceId::new(p.owner(), p.kernel(), p.block(), p.index())
-    }
-
-    fn geometry(&mut self, kind: GeometryValue) -> ScalarId<Idx> {
+    fn geometry(&mut self, kind: GeometryValue) -> ErasedValue {
         let uniformity = match kind {
             GeometryValue::WorkgroupId(_)
             | GeometryValue::WorkgroupSize(_)
@@ -2494,59 +2214,11 @@ impl<'a, B: PhysicalDialect> Builder<'a, B> {
             | GeometryValue::GlobalId(_)
             | GeometryValue::SubgroupLane => Uniformity::Varying,
         };
-        let (out, id) = self.index_out_with(None, uniformity);
+        let out = self.define_with(ValueType::Index, None, uniformity);
         self.emit(Op::Geometry { out, kind });
-        id
+        out
     }
-    pub(super) fn workgroup_id(&mut self, a: u8) -> ScalarId<Idx> {
-        self.geometry(GeometryValue::WorkgroupId(a))
-    }
-    pub(super) fn local_id(&mut self, a: u8) -> ScalarId<Idx> {
-        self.geometry(GeometryValue::LocalId(a))
-    }
-    pub(super) fn global_id(&mut self, a: u8) -> ScalarId<Idx> {
-        self.geometry(GeometryValue::GlobalId(a))
-    }
-    pub(super) fn workgroup_size(&mut self, a: u8) -> ScalarId<Idx> {
-        self.geometry(GeometryValue::WorkgroupSize(a))
-    }
-    pub(super) fn grid_size(&mut self, a: u8) -> ScalarId<Idx> {
-        self.geometry(GeometryValue::GridSize(a))
-    }
-    pub(super) fn subgroup_lane(&mut self) -> ScalarId<Idx> {
-        self.state.uses_subgroup = true;
-        self.geometry(GeometryValue::SubgroupLane)
-    }
-    pub(super) fn subgroup_ordinal(&mut self) -> ScalarId<Idx> {
-        self.state.uses_subgroup = true;
-        self.geometry(GeometryValue::SubgroupOrdinal)
-    }
-    pub(super) fn subgroup_size(&mut self) -> ScalarId<Idx> {
-        self.state.uses_subgroup = true;
-        self.geometry(GeometryValue::SubgroupSize)
-    }
-
-    pub(super) fn constant<T: ScalarType>(&mut self, v: T::Value) -> ScalarId<T> {
-        let value = constant_of::<T>(v);
-        let nat = match value {
-            ops::ConstantValue::Index(n) => Some(self.expr.nat(n)),
-            _ => None,
-        };
-        let out = self.define_with(value_type_of::<T>(), nat, Uniformity::Workgroup);
-        self.emit(Op::Constant { out, value });
-        ScalarId::new(out.owner, out.kernel, out.block, out.index())
-    }
-    pub(super) fn binary<T: ScalarType>(
-        &mut self,
-        op: BinaryOp,
-        a: ScalarId<T>,
-        b: ScalarId<T>,
-    ) -> ScalarId<T> {
-        let (a, b) = (self.use_scalar(a), self.use_scalar(b));
-        let out = self.binary_value(op, value_type_of::<T>(), a, b);
-        ScalarId::new(out.owner, out.kernel, out.block, out.index())
-    }
-    /// One physical binary constructor for typed and portable callers.
+    /// The physical binary constructor.
     fn binary_value(
         &mut self,
         op: BinaryOp,
@@ -2586,484 +2258,6 @@ impl<'a, B: PhysicalDialect> Builder<'a, B> {
         self.emit(Op::Binary { op, out, a, b });
         out
     }
-    pub(super) fn unary<T: ScalarType>(&mut self, op: UnaryOp, a: ScalarId<T>) -> ScalarId<T> {
-        let a = self.use_scalar(a);
-        let (out, id) = self.scalar_out_with::<T>(self.uniformity_of(a));
-        self.emit(Op::Unary { op, out, a });
-        id
-    }
-    pub(super) fn bit<T: ScalarType>(
-        &mut self,
-        op: BitOp,
-        a: ScalarId<T>,
-        b: ScalarId<T>,
-    ) -> ScalarId<T> {
-        let (a, b) = (self.use_scalar(a), self.use_scalar(b));
-        let (out, id) = self.scalar_out_with::<T>(self.combined_uniformity([a, b]));
-        self.emit(Op::Bit { op, out, a, b });
-        id
-    }
-    pub(super) fn fma<T: ScalarType>(
-        &mut self,
-        a: ScalarId<T>,
-        b: ScalarId<T>,
-        c: ScalarId<T>,
-    ) -> ScalarId<T> {
-        let (a, b, c) = (self.use_scalar(a), self.use_scalar(b), self.use_scalar(c));
-        let (out, id) = self.scalar_out_with::<T>(self.combined_uniformity([a, b, c]));
-        self.emit(Op::Fma { out, a, b, c });
-        id
-    }
-    pub(super) fn math<T: ScalarType>(
-        &mut self,
-        op: MathOp,
-        a: ScalarId<T>,
-        p: MathPrecision,
-    ) -> ScalarId<T> {
-        if p == MathPrecision::Exact {
-            let a = self.use_scalar(a);
-            let mut portable = PortableBuilder {
-                inner: self.reborrow(),
-            };
-            let out = super::reference_math::expand(
-                &mut portable,
-                op,
-                PortableValue {
-                    raw: a,
-                    ty: value_type_of::<T>(),
-                },
-            );
-            return ScalarId::new(
-                out.raw.owner,
-                out.raw.kernel,
-                out.raw.block,
-                out.raw.index(),
-            );
-        }
-        let a = self.use_scalar(a);
-        let (out, id) = self.scalar_out_with::<T>(self.uniformity_of(a));
-        self.emit(Op::Math {
-            op,
-            precision: p,
-            out,
-            a,
-        });
-        id
-    }
-    pub(super) fn cast<F: ScalarType, T: ScalarType>(&mut self, a: ScalarId<F>) -> ScalarId<T> {
-        let a = self.use_scalar(a);
-        let to = value_type_of::<T>();
-        let (out, id) = self.scalar_out_with::<T>(self.uniformity_of(a));
-        self.emit(Op::Cast { out, a, to });
-        id
-    }
-    pub(super) fn cmp<T: ScalarType>(
-        &mut self,
-        op: CmpOp,
-        a: ScalarId<T>,
-        b: ScalarId<T>,
-    ) -> ScalarId<Bool> {
-        let (a, b) = (self.use_scalar(a), self.use_scalar(b));
-        let (out, id) = self.scalar_out_with::<Bool>(self.combined_uniformity([a, b]));
-        self.emit(Op::Cmp { op, out, a, b });
-        id
-    }
-    pub(super) fn select<T: ScalarType>(
-        &mut self,
-        c: ScalarId<Bool>,
-        a: ScalarId<T>,
-        b: ScalarId<T>,
-    ) -> ScalarId<T> {
-        let cond = self.use_scalar(c);
-        let (a, b) = (self.use_scalar(a), self.use_scalar(b));
-        let (out, id) = self.scalar_out_with::<T>(self.combined_uniformity([cond, a, b]));
-        self.emit(Op::Select { out, cond, a, b });
-        id
-    }
-    pub(super) fn logic(
-        &mut self,
-        op: LogicOp,
-        a: ScalarId<Bool>,
-        b: ScalarId<Bool>,
-    ) -> ScalarId<Bool> {
-        let (a, b) = (self.use_scalar(a), self.use_scalar(b));
-        let (out, id) = self.scalar_out_with::<Bool>(self.combined_uniformity([a, b]));
-        self.emit(Op::Logic { op, out, a, b });
-        id
-    }
-    pub(super) fn not(&mut self, a: ScalarId<Bool>) -> ScalarId<Bool> {
-        let a = self.use_scalar(a);
-        let (out, id) = self.scalar_out_with::<Bool>(self.uniformity_of(a));
-        self.emit(Op::Not { out, a });
-        id
-    }
-    fn require_vector<T: VectorElement, const LANES: u16>(
-        &self,
-        operation: crate::target::VectorOperationClass,
-    ) {
-        assert!(
-            self.vector_support.supports(T::DTYPE, LANES, operation),
-            "constructor emitted a vector operation absent from DeviceDescription vector support"
-        );
-    }
-    pub(super) fn vector_splat<T: VectorElement, const LANES: u16>(
-        &mut self,
-        value: ScalarId<T>,
-    ) -> VectorId<T, LANES> {
-        self.require_vector::<T, LANES>(crate::target::VectorOperationClass::Splat);
-        let value = self.use_scalar(value);
-        let (out, id) = self.vector_out::<T, LANES>(self.uniformity_of(value));
-        self.emit(Op::VectorSplat { out, value });
-        id
-    }
-    pub(super) fn vector_binary<T: VectorElement, const LANES: u16>(
-        &mut self,
-        op: BinaryOp,
-        a: VectorId<T, LANES>,
-        b: VectorId<T, LANES>,
-    ) -> VectorId<T, LANES> {
-        self.require_vector::<T, LANES>(crate::target::VectorOperationClass::Binary(op));
-        let (a, b) = (self.use_vector(a), self.use_vector(b));
-        let (out, id) = self.vector_out::<T, LANES>(self.combined_uniformity([a, b]));
-        self.emit(Op::VectorBinary { op, out, a, b });
-        id
-    }
-    pub(super) fn vector_unary<T: VectorElement, const LANES: u16>(
-        &mut self,
-        op: UnaryOp,
-        value: VectorId<T, LANES>,
-    ) -> VectorId<T, LANES> {
-        self.require_vector::<T, LANES>(crate::target::VectorOperationClass::Unary(op));
-        let value = self.use_vector(value);
-        let (out, id) = self.vector_out::<T, LANES>(self.uniformity_of(value));
-        self.emit(Op::VectorUnary { op, out, a: value });
-        id
-    }
-    pub(super) fn vector_bit<T: VectorElement, const LANES: u16>(
-        &mut self,
-        op: BitOp,
-        a: VectorId<T, LANES>,
-        b: VectorId<T, LANES>,
-    ) -> VectorId<T, LANES> {
-        self.require_vector::<T, LANES>(crate::target::VectorOperationClass::Bit(op));
-        let (a, b) = (self.use_vector(a), self.use_vector(b));
-        let (out, id) = self.vector_out::<T, LANES>(self.combined_uniformity([a, b]));
-        self.emit(Op::VectorBit { op, out, a, b });
-        id
-    }
-    pub(super) fn vector_fma<T: VectorElement, const LANES: u16>(
-        &mut self,
-        a: VectorId<T, LANES>,
-        b: VectorId<T, LANES>,
-        c: VectorId<T, LANES>,
-    ) -> VectorId<T, LANES> {
-        self.require_vector::<T, LANES>(crate::target::VectorOperationClass::Fma);
-        let (a, b, c) = (self.use_vector(a), self.use_vector(b), self.use_vector(c));
-        let (out, id) = self.vector_out::<T, LANES>(self.combined_uniformity([a, b, c]));
-        self.emit(Op::VectorFma { out, a, b, c });
-        id
-    }
-    pub(super) fn vector_cast<From: VectorElement, To: VectorElement, const LANES: u16>(
-        &mut self,
-        value: VectorId<From, LANES>,
-    ) -> VectorId<To, LANES> {
-        self.require_vector::<From, LANES>(crate::target::VectorOperationClass::Cast {
-            to: To::DTYPE,
-        });
-        let value = self.use_vector(value);
-        let to = VectorId::<To, LANES>::value_type();
-        let (out, id) = self.vector_out::<To, LANES>(self.uniformity_of(value));
-        self.emit(Op::VectorCast { out, a: value, to });
-        id
-    }
-    pub(super) fn vector_lane<T: VectorElement, const LANES: u16>(
-        &mut self,
-        vector: VectorId<T, LANES>,
-        lane: u16,
-    ) -> ScalarId<T> {
-        self.require_vector::<T, LANES>(crate::target::VectorOperationClass::Lane);
-        assert!(lane < LANES, "vector lane is outside its fixed width");
-        let vector = self.use_vector(vector);
-        let (out, id) = self.scalar_out_with::<T>(self.uniformity_of(vector));
-        self.emit(Op::VectorLane { out, vector, lane });
-        id
-    }
-    pub(super) fn vector_reduce_add<T: VectorElement, const LANES: u16>(
-        &mut self,
-        vector: VectorId<T, LANES>,
-    ) -> ScalarId<T> {
-        self.require_vector::<T, LANES>(crate::target::VectorOperationClass::ReduceAdd);
-        let vector = self.use_vector(vector);
-        let (out, id) = self.scalar_out_with::<T>(self.uniformity_of(vector));
-        self.emit(Op::VectorReduceAdd { out, vector });
-        id
-    }
-    pub(super) fn read<R: Representation>(
-        &mut self,
-        p: ReadablePlaceId<R>,
-        i: &[ScalarId<Idx>],
-    ) -> ScalarId<R::Element> {
-        let place = self.place(p.owner(), p.kernel(), p.block(), p.index());
-        let index = self
-            .checked_index(place, i)
-            .into_iter()
-            .map(|raw| PortableValue {
-                raw,
-                ty: ValueType::Index,
-            })
-            .collect::<Vec<_>>();
-        let mut portable = PortableBuilder {
-            inner: self.reborrow(),
-        };
-        let out = portable.read_entry(place, &index);
-        assert_eq!(out.ty, value_type_of::<R::Element>());
-        ScalarId::new(
-            out.raw.owner,
-            out.raw.kernel,
-            out.raw.block,
-            out.raw.index(),
-        )
-    }
-    pub(super) fn vector_read<R: Representation, const LANES: u16>(
-        &mut self,
-        p: ReadablePlaceId<R>,
-        i: &[ScalarId<Idx>],
-        axis: u32,
-        active: ScalarId<Idx>,
-    ) -> VectorId<R::Element, LANES> {
-        self.require_vector::<R::Element, LANES>(crate::target::VectorOperationClass::Read {
-            representation: R::id(),
-        });
-        let place = self.place(p.owner(), p.kernel(), p.block(), p.index());
-        assert!(
-            axis < place.rank,
-            "vector read axis is outside the place rank"
-        );
-        let index = self.checked_index(place, i);
-        let active = self.use_scalar(active);
-        if matches!(
-            registry::representation_info(place.representation).kind,
-            RepresentationKind::Packed(_)
-        ) {
-            let index = index
-                .into_iter()
-                .map(|raw| PortableValue {
-                    raw,
-                    ty: ValueType::Index,
-                })
-                .collect::<Vec<_>>();
-            let active = PortableValue {
-                raw: active,
-                ty: ValueType::Index,
-            };
-            let mut portable = PortableBuilder {
-                inner: self.reborrow(),
-            };
-            let mut lanes = Vec::with_capacity(LANES as usize);
-            for lane in 0..LANES {
-                let lane = portable.index_constant(u64::from(lane));
-                let enabled = portable.cmp(CmpOp::Lt, lane, active);
-                let result = portable.branch(
-                    enabled,
-                    |b| {
-                        let mut coordinates = index.clone();
-                        coordinates[axis as usize] =
-                            b.binary(BinaryOp::Add, coordinates[axis as usize], lane);
-                        vec![b.read_entry(place, &coordinates)]
-                    },
-                    |b| {
-                        vec![b.constant(
-                            ops::ConstantValue::from_scalar(
-                                seismic_lang::reference_math::ReferenceScalar::from_bits(
-                                    registry::representation_info(place.representation).decoded,
-                                    0,
-                                ),
-                            ),
-                            value_type_of::<R::Element>(),
-                        )]
-                    },
-                );
-                lanes.push(result[0]);
-            }
-            let out = portable.vector_from_lanes(&lanes);
-            return VectorId::new(
-                out.raw.owner,
-                out.raw.kernel,
-                out.raw.block,
-                out.raw.index(),
-            );
-        }
-        let uniformity = self.read_uniformity(place.place, index.iter().copied().chain([active]));
-        let (out, id) = self.vector_out::<R::Element, LANES>(uniformity);
-        self.emit(Op::VectorRead {
-            out,
-            place: place.place,
-            representation: place.representation,
-            index,
-            axis,
-            active,
-        });
-        id
-    }
-    pub(super) fn vector_write<R: WritableRepresentation, const LANES: u16>(
-        &mut self,
-        p: WritablePlaceId<R>,
-        i: &[ScalarId<Idx>],
-        axis: u32,
-        active: ScalarId<Idx>,
-        value: VectorId<R::Element, LANES>,
-    ) {
-        self.require_vector::<R::Element, LANES>(crate::target::VectorOperationClass::Write {
-            representation: R::id(),
-        });
-        let place = self.place(p.owner(), p.kernel(), p.block(), p.index());
-        assert!(
-            axis < place.rank,
-            "vector write axis is outside the place rank"
-        );
-        let index = self.checked_index(place, i);
-        let active = self.use_scalar(active);
-        let value = self.use_vector(value);
-        self.emit(Op::VectorWrite {
-            place: place.place,
-            representation: place.representation,
-            index,
-            axis,
-            active,
-            value,
-        });
-    }
-    pub(super) fn write<R: WritableRepresentation>(
-        &mut self,
-        p: WritablePlaceId<R>,
-        i: &[ScalarId<Idx>],
-        v: ScalarId<R::Element>,
-    ) {
-        let place = self.place(p.owner(), p.kernel(), p.block(), p.index());
-        let index = self.checked_index(place, i);
-        let value = self.use_scalar(v);
-        self.emit(Op::Write {
-            place: place.place,
-            representation: place.representation,
-            index,
-            value,
-        });
-    }
-    pub(super) fn read_plane<R: Representation>(
-        &mut self,
-        p: PlaneId<R>,
-        i: &[ScalarId<Idx>],
-    ) -> ScalarId<U32> {
-        self.assert_kernel(p.owner(), p.kernel());
-        if !self.dominates(p.block(), self.block) {
-            panic!("kernel builder: {p:?} is not visible in {:?}", self.block);
-        }
-        let (place_index, plane) = match self.state.planes.get(p.index() as usize) {
-            Some(entry) => *entry,
-            None => panic!("kernel builder: {p:?} is not a plane of the open kernel"),
-        };
-        let place = self.place(p.owner(), p.kernel(), p.block(), place_index);
-        let index = self
-            .checked_index(place, i)
-            .into_iter()
-            .map(|raw| PortableValue {
-                raw,
-                ty: ValueType::Index,
-            })
-            .collect::<Vec<_>>();
-        let mut portable = PortableBuilder {
-            inner: self.reborrow(),
-        };
-        let (index, element) =
-            portable.plane_coordinates(place, plane, place.rank as usize - 1, index);
-        let value = portable.read_plane_storage(place, plane, &index, element);
-        let out = portable.scalar_bits(value);
-        ScalarId::new(
-            out.raw.owner,
-            out.raw.kernel,
-            out.raw.block,
-            out.raw.index(),
-        )
-    }
-    pub(super) fn plane<R: Representation>(&mut self, p: ReadablePlaceId<R>, n: u32) -> PlaneId<R> {
-        let _ = self.place(p.owner(), p.kernel(), p.block(), p.index());
-        if n >= R::PLANES {
-            panic!(
-                "kernel builder: representation `{}` has {} planes, plane {n} requested",
-                R::NAME,
-                R::PLANES
-            );
-        }
-        let index = self.state.planes.len() as u32;
-        self.state.planes.push((p.index(), n));
-        PlaneId::new(self.owner(), self.kernel_index(), self.block, index)
-    }
-    pub(super) fn extent<R: Representation>(
-        &mut self,
-        p: ReadablePlaceId<R>,
-        a: u32,
-    ) -> ScalarId<Idx> {
-        let place = self.place(p.owner(), p.kernel(), p.block(), p.index());
-        if a >= place.rank {
-            panic!(
-                "kernel builder: extent of axis {a} of a place of rank {}",
-                place.rank
-            );
-        }
-        let nat = match place.place {
-            PlaceRef::Global { slot } => {
-                self.assert_kernel(slot.owner(), slot.kernel());
-                let view = self.state.bindings[slot.index() as usize].view;
-                Some(self.storage.views()[view.index as usize].extents[a as usize])
-            }
-            PlaceRef::Local { index } => {
-                Some(self.state.locals[index as usize].extents[a as usize])
-            }
-        };
-        let (out, id) = self.index_out_with(nat, Uniformity::Workgroup);
-        self.emit(Op::Extent {
-            out,
-            place: place.place,
-            axis: a,
-        });
-        id
-    }
-    pub(super) fn atomic<R: WritableRepresentation>(
-        &mut self,
-        op: AtomicOp,
-        p: WritablePlaceId<R>,
-        i: &[ScalarId<Idx>],
-        v: ScalarId<R::Element>,
-    ) {
-        let place = self.place(p.owner(), p.kernel(), p.block(), p.index());
-        let index = self.checked_index(place, i);
-        let value = self.use_scalar(v);
-        self.emit(Op::Atomic {
-            op,
-            place: place.place,
-            representation: place.representation,
-            index,
-            value,
-        });
-    }
-    pub(super) fn store_slot<T: ScalarType>(&mut self, s: WritableScalar<T>, v: ScalarId<T>) {
-        self.assert_kernel(s.owner, s.kernel);
-        if s.index as usize >= self.state.result_slots.len() {
-            panic!("kernel builder: {s:?} is not a result slot of the open kernel");
-        }
-        let raw = ErasedValue::new(v.owner(), v.kernel(), v.block(), v.index());
-        assert_eq!(
-            self.uniformity_of(raw),
-            Uniformity::Workgroup,
-            "only workgroup-uniform values may cross a kernel/schedule cut"
-        );
-        let value = self.use_scalar(v);
-        self.emit(Op::StoreSlot {
-            slot: s.index,
-            value,
-            election: ops::StoreElection::GlobalLeader,
-        });
-    }
     pub(super) fn barrier(&mut self, s: BarrierScope) {
         let control = self.state.blocks[self.block.index() as usize].control_uniformity;
         let legal = match s {
@@ -3080,28 +2274,6 @@ impl<'a, B: PhysicalDialect> Builder<'a, B> {
         }
         self.emit(Op::Barrier(s));
     }
-    pub(super) fn intrinsic<I: TypedIntrinsic<B>>(&mut self, args: I::Args) -> I::Result {
-        let id = I::id();
-        let resources = I::resources(&args, self.expr);
-        if resources.requires_subgroup {
-            self.state.uses_subgroup = true;
-        }
-        self.state.intrinsic_resources.push(resources);
-        self.state.intrinsics_used.push(id);
-        let result_uniformity = match registry::intrinsic_signature(id).effects.result_uniformity {
-            registry::IntrinsicUniformity::Workgroup => Uniformity::Workgroup,
-            registry::IntrinsicUniformity::Subgroup => Uniformity::Subgroup,
-            registry::IntrinsicUniformity::Varying => Uniformity::Varying,
-        };
-        let mut sub = self.reborrow();
-        let mut sink = IntrinsicSink {
-            builder: &mut sub,
-            intrinsic: id,
-            result_uniformity,
-        };
-        I::lower(&args, &mut sink)
-    }
-
     fn new_block(
         &mut self,
         multiplicity: Option<NatExpr>,
@@ -3134,140 +2306,6 @@ impl<'a, B: PhysicalDialect> Builder<'a, B> {
             .map(|(v, ty)| sub.use_value(*v, ty))
             .collect();
         sub.emit(Op::Yield { values });
-    }
-
-    fn define_schema(&mut self, schema: &ValueSchema) -> Vec<ErasedValue> {
-        schema
-            .values()
-            .iter()
-            .map(|ty| self.define(ty.clone()))
-            .collect()
-    }
-
-    pub(super) fn branch<V: KernelValues>(
-        &mut self,
-        c: ScalarId<Bool>,
-        t: impl FnOnce(&mut KernelBuilder<'_, B>) -> V,
-        e: impl FnOnce(&mut KernelBuilder<'_, B>) -> V,
-    ) -> V {
-        let cond = self.use_scalar(c);
-        let control_uniformity = self.state.blocks[self.block.index() as usize]
-            .control_uniformity
-            .combine(self.uniformity_of(cond));
-        let schema = V::schema();
-        let multiplicity = self.state.blocks[self.block.index() as usize].multiplicity;
-        let then = self.new_block(multiplicity, control_uniformity);
-        let then_values = {
-            let mut sub = KernelBuilder {
-                inner: self.in_block(then),
-            };
-            t(&mut sub).erase()
-        };
-        self.yield_values(then, &then_values, &schema);
-        let otherwise = self.new_block(multiplicity, control_uniformity);
-        let else_values = {
-            let mut sub = KernelBuilder {
-                inner: self.in_block(otherwise),
-            };
-            e(&mut sub).erase()
-        };
-        self.yield_values(otherwise, &else_values, &schema);
-        let outs = schema
-            .values()
-            .iter()
-            .enumerate()
-            .map(|(index, ty)| {
-                let uniformity = control_uniformity
-                    .combine(self.uniformity_of(then_values[index]))
-                    .combine(self.uniformity_of(else_values[index]));
-                self.define_with(ty.clone(), None, uniformity)
-            })
-            .collect::<Vec<_>>();
-        self.emit(Op::Branch {
-            cond,
-            then,
-            otherwise,
-            outs: outs.clone(),
-        });
-        V::restore(&outs)
-    }
-
-    pub(super) fn repeat<V: KernelValues>(
-        &mut self,
-        s: ScalarId<Idx>,
-        e: ScalarId<Idx>,
-        init: V,
-        recurrence: &[IntrinsicUniformity],
-        body: impl FnOnce(&mut KernelBuilder<'_, B>, ScalarId<Idx>, V) -> V,
-    ) -> V {
-        let (start, end) = (self.use_scalar(s), self.use_scalar(e));
-        let range_uniformity = self.uniformity_of(start).combine(self.uniformity_of(end));
-        let control_uniformity = self.state.blocks[self.block.index() as usize]
-            .control_uniformity
-            .combine(range_uniformity);
-        let schema = V::schema();
-        let init_values = init.erase();
-        assert_eq!(
-            init_values.len(),
-            schema.len(),
-            "repeat initial carry count differs from its typed schema"
-        );
-        let carries_in: Vec<ErasedValue> = init_values
-            .into_iter()
-            .zip(schema.values().iter())
-            .map(|(v, ty)| self.use_value(v, ty))
-            .collect();
-        let trip = match (self.nat_of(start), self.nat_of(end)) {
-            (Some(a), Some(b)) => {
-                let m = self.expr.nat_max(b, a);
-                Some(self.expr.nat_sub(m, a))
-            }
-            _ => None,
-        };
-        let multiplicity = match (
-            self.state.blocks[self.block.index() as usize].multiplicity,
-            trip,
-        ) {
-            (Some(m), Some(t)) => Some(self.expr.nat_mul(m, t)),
-            _ => None,
-        };
-        let recurrence = self.recurrence_uniformities(&carries_in, recurrence, control_uniformity);
-        let block = self.new_block(multiplicity, control_uniformity);
-        let (binder, params, next) = {
-            let mut sub = self.in_block(block);
-            let binder = sub.define_with(ValueType::Index, None, range_uniformity);
-            let params = recurrence
-                .iter()
-                .zip(schema.values())
-                .map(|(uniformity, ty)| sub.define_with(ty.clone(), None, *uniformity))
-                .collect::<Vec<_>>();
-            let carried = V::restore(&params);
-            let mut builder = KernelBuilder { inner: sub };
-            let next = body(
-                &mut builder,
-                ScalarId::new(binder.owner, binder.kernel, binder.block, binder.index()),
-                carried,
-            )
-            .erase();
-            (binder, params, next)
-        };
-        self.check_recurrence_yields(&next, &recurrence);
-        self.yield_values(block, &next, &schema);
-        let outs = recurrence
-            .iter()
-            .zip(schema.values())
-            .map(|(uniformity, ty)| self.define_with(ty.clone(), None, *uniformity))
-            .collect::<Vec<_>>();
-        self.emit(Op::Repeat {
-            start,
-            end,
-            binder,
-            carries_in,
-            carry_params: params,
-            body: block,
-            outs: outs.clone(),
-        });
-        V::restore(&outs)
     }
 
     pub(super) fn close(self) -> KernelId {
@@ -3378,76 +2416,6 @@ fn representation_alignment(id: RepresentationId) -> u64 {
         RepresentationKind::Dense(dtype) => dtype.bytes() as u64,
         RepresentationKind::Packed(layout) => u64::from(layout.packet_alignment),
         RepresentationKind::External(layout) => u64::from(layout.packet_alignment),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The intrinsic sink (backend-facing surface of the builder inside a typed
-// intrinsic lowering)
-// ---------------------------------------------------------------------------
-
-impl<'a, B: PhysicalDialect> IntrinsicSink<'a, B> {
-    pub fn addressable_resource(
-        &mut self,
-        class: crate::target::ResourceClassId,
-        units: NatExpr,
-        alignment_units: u64,
-        lifetime: crate::target::ResourceLifetime,
-    ) -> ops::AddressableResourceHandle {
-        self.builder
-            .allocate_addressable_resource(class, units, alignment_units, lifetime)
-    }
-    /// The kernel builder, for lowerings that expand into ordinary ops.
-    pub fn kernel(&mut self) -> KernelBuilder<'_, B> {
-        KernelBuilder {
-            inner: self.builder.reborrow(),
-        }
-    }
-    /// Erases a typed scalar argument for the intrinsic op.
-    pub fn scalar<T: ScalarType>(&mut self, value: ScalarId<T>) -> ErasedValue {
-        self.builder.use_scalar(value)
-    }
-    /// The place a readable argument addresses.
-    pub fn readable<R: Representation>(&self, place: ReadablePlaceId<R>) -> PlaceRef {
-        self.builder
-            .place(place.owner(), place.kernel(), place.block(), place.index())
-            .place
-    }
-    /// The place a writable argument addresses.
-    pub fn writable<R: Representation>(&self, place: WritablePlaceId<R>) -> PlaceRef {
-        self.builder
-            .place(place.owner(), place.kernel(), place.block(), place.index())
-            .place
-    }
-    /// Emits the backend intrinsic op with typed results, returning one
-    /// erased value per declared result type.
-    pub fn emit(
-        &mut self,
-        op: B::Intrinsic,
-        args: Vec<ErasedValue>,
-        results: &[ValueType],
-    ) -> Vec<ErasedValue> {
-        let outs: Vec<ErasedValue> = results
-            .iter()
-            .map(|ty| {
-                self.builder
-                    .define_with(ty.clone(), None, self.result_uniformity)
-            })
-            .collect();
-        self.builder.emit(Op::Intrinsic {
-            intrinsic: self.intrinsic,
-            op,
-            outs: outs.clone(),
-            args,
-            mapping_dependencies: Vec::new(),
-        });
-        outs
-    }
-    /// Types an erased result as a scalar handle. The value must have been
-    /// declared with the scalar's value type.
-    pub fn result<T: ScalarType>(&mut self, value: ErasedValue) -> ScalarId<T> {
-        self.builder.use_value(value, &value_type_of::<T>());
-        ScalarId::new(value.owner, value.kernel, value.block, value.index())
     }
 }
 
@@ -3705,89 +2673,6 @@ impl<'s, 'k, B: PhysicalDialect> ops::SemanticIntrinsicSink<'s, 'k, B> {
 }
 
 // ---------------------------------------------------------------------------
-// KernelValues
-// ---------------------------------------------------------------------------
-
-impl super::values_sealed::Sealed for () {}
-impl KernelValues for () {
-    fn schema() -> ValueSchema {
-        ValueSchema::new(Vec::new())
-    }
-    fn erase(&self) -> Vec<ErasedValue> {
-        Vec::new()
-    }
-    fn restore(_values: &[ErasedValue]) -> Self {}
-}
-
-impl<T: ScalarType> super::values_sealed::Sealed for ScalarId<T> {}
-impl<T: ScalarType> KernelValues for ScalarId<T> {
-    fn schema() -> ValueSchema {
-        ValueSchema::new(vec![value_type_of::<T>()])
-    }
-    fn erase(&self) -> Vec<ErasedValue> {
-        vec![ErasedValue::new(
-            self.owner(),
-            self.kernel(),
-            self.block(),
-            self.index(),
-        )]
-    }
-    fn restore(values: &[ErasedValue]) -> Self {
-        assert_eq!(values.len(), 1, "scalar schema restores exactly one value");
-        ScalarId::new(
-            values[0].owner,
-            values[0].kernel,
-            values[0].block,
-            values[0].index(),
-        )
-    }
-}
-
-macro_rules! tuple_values {
-    ($($name:ident),+) => {
-        impl<$($name: KernelValues),+> super::values_sealed::Sealed for ($($name,)+) {}
-        impl<$($name: KernelValues),+> KernelValues for ($($name,)+) {
-            fn schema() -> ValueSchema {
-                let mut schema = Vec::new();
-                $(schema.extend_from_slice($name::schema().values());)+
-                ValueSchema::new(schema)
-            }
-            fn erase(&self) -> Vec<ErasedValue> {
-                #[allow(non_snake_case)]
-                let ($($name,)+) = self;
-                let mut values = Vec::new();
-                $(values.extend($name.erase());)+
-                values
-            }
-            fn restore(values: &[ErasedValue]) -> Self {
-                assert_eq!(values.len(), Self::schema().len(), "tuple schema restore length mismatch");
-                let mut offset = 0usize;
-                $(
-                    #[allow(non_snake_case)]
-                    let $name = {
-                        let len = $name::schema().len();
-                        let v = $name::restore(&values[offset..offset + len]);
-                        offset += len;
-                        v
-                    };
-                )+
-                let _ = offset;
-                ($($name,)+)
-            }
-        }
-    };
-}
-
-tuple_values!(A);
-tuple_values!(A, C);
-tuple_values!(A, C, D);
-tuple_values!(A, C, D, E);
-tuple_values!(A, C, D, E, F);
-tuple_values!(A, C, D, E, F, G);
-tuple_values!(A, C, D, E, F, G, H);
-tuple_values!(A, C, D, E, F, G, H, I);
-
-// ---------------------------------------------------------------------------
 // Closed kernels
 // ---------------------------------------------------------------------------
 
@@ -3969,17 +2854,6 @@ impl<B: PhysicalDialect> KernelData<B> {
     pub(crate) fn value_types(&self) -> impl ExactSizeIterator<Item = &ValueType> {
         self.values.iter().map(|value| &value.ty)
     }
-    /// Rewrites view indices of every binding (used when a spliced child's
-    /// kernels join the parent's arena).
-    pub(crate) fn remap_views(
-        &mut self,
-        map: impl Fn(crate::storage::AnyBufferView) -> crate::storage::AnyBufferView,
-    ) {
-        for binding in &mut self.interface.bindings {
-            binding.view = map(binding.view);
-        }
-    }
-
     /// Imports a closed child kernel into another implementation. All
     /// owner-qualified references are rewritten together in this one local
     /// operation; no durable old-to-new side table survives it.

@@ -1,0 +1,10 @@
+# origin: test:validation:programs/scalar-semantics.seismic:large_snapshot
+# invoke large_snapshot: f32[65]=seq ; f32[65]=zero
+fn large_snapshot(x: tensor[65] f32, result: tensor[65] f32) -> (tensor[65] f32, tensor[65] f32):
+    let snapshot = to_owned(x)
+    let mut source = x
+    let mut output = result
+    for i in 0..65:
+        source[i] = 0.0
+        output[i] = snapshot[64 - i]
+    return source, output

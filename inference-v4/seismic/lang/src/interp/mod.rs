@@ -35,6 +35,7 @@ pub enum Arg {
 /// A reference execution of exactly one monomorphized entry.
 pub struct Interpreter<'a> {
     entry: LogicalEntryView<'a>,
+    runtime_symbols: oracle::RuntimeSymbols,
     tensors: Vec<TensorData>,
     work: Option<WorkBudget>,
     memory: Option<std::rc::Rc<MemoryBudget>>,
@@ -95,19 +96,9 @@ impl std::fmt::Display for OracleError {
 }
 impl std::error::Error for OracleError {}
 
-impl From<String> for OracleError {
-    fn from(reason: String) -> Self {
-        Self::InterpreterDefect(reason)
-    }
-}
-impl From<&str> for OracleError {
-    fn from(reason: &str) -> Self {
-        Self::InterpreterDefect(reason.into())
-    }
-}
-
 /// Typed propagation inside source evaluation. Recipe failures acquire their
 /// checked event at the operation dispatcher, before crossing a call boundary.
+/// A contradiction of the checked entry graph is a panic, never a value here.
 #[derive(Debug)]
 pub(super) enum EvalError {
     Source(SourceFailure),
@@ -117,16 +108,6 @@ pub(super) enum EvalError {
 impl From<OracleError> for EvalError {
     fn from(error: OracleError) -> Self {
         Self::Service(error)
-    }
-}
-impl From<String> for EvalError {
-    fn from(reason: String) -> Self {
-        OracleError::InterpreterDefect(reason).into()
-    }
-}
-impl From<&str> for EvalError {
-    fn from(reason: &str) -> Self {
-        reason.to_owned().into()
     }
 }
 impl From<crate::reference_math::ScalarFailure> for EvalError {
@@ -236,7 +217,7 @@ impl TensorReader<'_> {
             return Err("tensor index outside logical shape".into());
         }
         let flat = self.view.map(|v| v.positions[index]).unwrap_or(index);
-        self.storage().read(flat)
+        Ok(self.storage().read(flat))
     }
     /// Borrow canonical storage when this reader covers the complete backing.
     /// Views with a different logical order are inspected elementwise instead.
@@ -371,6 +352,7 @@ impl<'a> Interpreter<'a> {
     pub fn from_view(entry: LogicalEntryView<'a>) -> Self {
         Self {
             entry,
+            runtime_symbols: oracle::runtime_symbols(entry.arena()),
             tensors: Vec::new(),
             work: None,
             memory: None,
@@ -403,7 +385,7 @@ impl<'a> Interpreter<'a> {
         }));
         for tensor in &self.tensors {
             self.metadata_reservations
-                .push(self.reserve_memory(tensor.storage_bytes()?)?);
+                .push(self.reserve_memory(tensor.storage_bytes())?);
         }
         let termination = match self.run_reference(arguments) {
             Ok(values) => SourceTermination::Returned(values),
@@ -587,10 +569,15 @@ impl<'a> Interpreter<'a> {
     }
 
     fn charge_tensor(&self, shape: &[usize]) -> Result<(), OracleError> {
-        let count = shape
+        let Some(count) = shape
             .iter()
             .try_fold(1u64, |count, extent| count.checked_mul(*extent as u64))
-            .ok_or("reference tensor geometry overflows its work domain")?;
+        else {
+            // No work budget admits more than u64::MAX units.
+            return Err(OracleError::WorkLimit {
+                limit: self.work.as_ref().map_or(u64::MAX, |budget| budget.initial),
+            });
+        };
         self.charge_work(count)
     }
 

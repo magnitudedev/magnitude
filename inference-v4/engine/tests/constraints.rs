@@ -372,7 +372,7 @@ fn host_preparation_binds_before_generation_and_rejects_identity_mismatches() {
 }
 
 #[test]
-#[ignore = "requires a Metal device"]
+#[cfg(target_os = "macos")]
 fn generation_checkpoint_forks_matcher_output_and_numerical_continuation_together() {
     use magnitude_engine::{
         generation::{FinishReason, Generation, Options, Readiness, Sampling},

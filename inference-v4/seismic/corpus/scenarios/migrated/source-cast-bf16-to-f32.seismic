@@ -1,0 +1,16 @@
+# origin: test:seismic-runtime:runtime/src/feedback/payload_tests.rs:source_cast_payloads
+# invoke cast_value: bf16:0x0
+# invoke cast_value: bf16:0x8000
+# invoke cast_value: bf16:0x1
+# invoke cast_value: bf16:0x8001
+# invoke cast_value: bf16:0x7f
+# invoke cast_value: bf16:0x80
+# invoke cast_value: bf16:0x7f7f
+# invoke cast_value: bf16:0x7f80
+# invoke cast_value: bf16:0xff80
+# invoke cast_value: bf16:0x7f81
+# invoke cast_value: bf16:0xff81
+# invoke cast_value: bf16:0x7fc5
+# invoke cast_value: bf16:0xffc5
+fn cast_value(a: bf16) -> f32:
+    return f32(a)

@@ -31,29 +31,11 @@ fn int_of(src: &ExprArena, node: AnyExpr, dst: &mut ExprArena, map: &mut SymbolM
     }
 }
 
-pub(crate) fn transfer_nat(
-    src: &ExprArena,
-    node: NatExpr,
-    dst: &mut ExprArena,
-    map: &mut SymbolMap<'_>,
-) -> NatExpr {
-    nat_of(src, AnyExpr::Nat(node), dst, map)
-}
-
 fn nat_of(src: &ExprArena, node: AnyExpr, dst: &mut ExprArena, map: &mut SymbolMap<'_>) -> NatExpr {
     match transfer(src, node, dst, map) {
         AnyExpr::Nat(n) => n,
         _ => panic!("expression transfer changed a Nat expression's sort"),
     }
-}
-
-pub(crate) fn transfer_bool(
-    src: &ExprArena,
-    node: BoolExpr,
-    dst: &mut ExprArena,
-    map: &mut SymbolMap<'_>,
-) -> BoolExpr {
-    bool_of(src, AnyExpr::Bool(node), dst, map)
 }
 
 fn bool_of(

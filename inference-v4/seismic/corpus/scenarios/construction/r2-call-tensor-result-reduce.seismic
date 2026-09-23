@@ -1,0 +1,7 @@
+# origin: C11:r2_call_tensor_result_reduce
+# invoke: f32[4]=1,1,1,1
+fn helper[N](a: &tensor[N] f32) -> tensor[N] f32:
+    return a * 2.0
+
+fn probe[N](x: &tensor[N] f32) -> f32:
+    return reduce(helper(x), 0, sum)

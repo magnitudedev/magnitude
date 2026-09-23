@@ -1,0 +1,10 @@
+# cell: quantity-carry/ordered
+# invoke: f32[2,3]=1,2,3,4,5,6 ; f32[2]=zero
+# pin: out = f32[2]=0,3
+fn probe[M, N](x: &tensor[M, N] f32, out: &mut tensor[M] f32):
+    for i in 0..M:
+        let mut k = 0
+        for j in 0..N:
+            if x[i, j] > 3.0:
+                k = k + 1
+        out[i] = f32(k)

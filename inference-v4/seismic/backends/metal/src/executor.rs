@@ -454,6 +454,7 @@ fn complete_all<T>(
 #[cfg(test)]
 mod completion_tests {
     use super::*;
+    use crate::test_support::metal_device;
 
     fn capture_pipeline(
         device: &MetalDevice,
@@ -519,9 +520,8 @@ mod completion_tests {
     }
 
     #[test]
-    #[ignore = "requires Metal device"]
     fn repeated_launches_preserve_each_word_table_version_until_its_native_read() {
-        let device = MetalDevice::open(crate::DeviceHandle::system_default().unwrap()).unwrap();
+        let device = metal_device();
         let pipeline = capture_pipeline(&device);
         let output = device.allocate_bytes(64 * 8).unwrap();
         device.write(&output, 0, &vec![0xff; 64 * 8]).unwrap();
@@ -558,9 +558,8 @@ mod completion_tests {
     }
 
     #[test]
-    #[ignore = "requires Metal device"]
     fn host_word_write_completes_overlapping_ranges_and_retains_independent_readers() {
-        let device = MetalDevice::open(crate::DeviceHandle::system_default().unwrap()).unwrap();
+        let device = metal_device();
         let pipeline = capture_pipeline(&device);
         let output = device.allocate_bytes(3 * 8).unwrap();
         let shared = device.allocate_bytes(32).unwrap();

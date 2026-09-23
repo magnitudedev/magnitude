@@ -687,27 +687,39 @@ impl LogicalEntry {
                     });
                 }
                 ParameterKind::Scalar { dtype, symbol } => {
-                    assert!(matches!(
+                    assert_eq!(
                         arena.symbol_kind(*symbol),
-                        crate::expr::SymbolKind::CallScalar(id) if id == parameter.id
-                    ));
+                        crate::expr::SymbolKind::CallScalar(crate::expr::ScalarArgument {
+                            parameter: parameter.id,
+                            component: crate::expr::ScalarComponent::Value,
+                        })
+                    );
                     assert_eq!(arena.symbol_sort(*symbol), crate::expr::SymbolSort::Scalar(*dtype),
                         "call scalar must retain its declared source word sort");
                 }
                 ParameterKind::Index { bound, symbol } => {
                     let _ = arena.view(AnyExpr::Nat(*bound));
-                    assert!(matches!(
+                    assert_eq!(
                         arena.symbol_kind(*symbol),
-                        crate::expr::SymbolKind::CallScalar(id) if id == parameter.id
-                    ));
+                        crate::expr::SymbolKind::CallScalar(crate::expr::ScalarArgument {
+                            parameter: parameter.id,
+                            component: crate::expr::ScalarComponent::Value,
+                        })
+                    );
                 }
                 ParameterKind::Range { bound, start, end } => {
                     let _ = arena.view(AnyExpr::Nat(*bound));
-                    for symbol in [start, end] {
-                        assert!(matches!(
+                    for (symbol, component) in [
+                        (start, crate::expr::ScalarComponent::RangeStart),
+                        (end, crate::expr::ScalarComponent::RangeEnd),
+                    ] {
+                        assert_eq!(
                             arena.symbol_kind(*symbol),
-                            crate::expr::SymbolKind::CallScalar(id) if id == parameter.id
-                        ));
+                            crate::expr::SymbolKind::CallScalar(crate::expr::ScalarArgument {
+                                parameter: parameter.id,
+                                component,
+                            })
+                        );
                     }
                 }
             }

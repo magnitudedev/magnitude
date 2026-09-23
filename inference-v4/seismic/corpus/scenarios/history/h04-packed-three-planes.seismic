@@ -1,0 +1,7 @@
+# origin: H-4
+# invoke: q4k[2,256]=rand(4) ; f32[2,256]=zero
+# invoke: q4k[2,256]=bits(4) ; f32[2,256]=zero
+fn probe[R, K](w: &tensor[R, K] q4k, y: &mut tensor[R, K] f32) where K % 256 == 0:
+    parallel for r in 0..R:
+        for k in 0..K:
+            y[r, k] = f32(w[r, k])

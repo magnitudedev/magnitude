@@ -44,7 +44,9 @@ fn signed_quantity_division_and_remainder_fail_at_their_source_position() {
         let mut interpreter = Interpreter::new(&entry);
         let shape = interpreter.add_tensor(TensorData::dense(DType::F32, vec![1], vec![0.0]));
         let dst = interpreter.add_tensor(TensorData::dense(DType::I32, vec![2], vec![2.0, 3.0]));
-        let outcome = interpreter.run(&[Arg::Tensor(shape), Arg::Tensor(dst)]).unwrap();
+        let outcome = interpreter
+            .run(&[Arg::Tensor(shape), Arg::Tensor(dst)])
+            .unwrap();
         assert!(matches!(
             outcome.results().next().unwrap().value(),
             OutcomeValue::Scalar(ReferenceScalar::I32(value)) if value == expected
@@ -53,7 +55,9 @@ fn signed_quantity_division_and_remainder_fail_at_their_source_position() {
         let mut interpreter = Interpreter::new(&entry);
         let shape = interpreter.add_tensor(TensorData::dense(DType::F32, vec![2], vec![0.0; 2]));
         let dst = interpreter.add_tensor(TensorData::dense(DType::I32, vec![2], vec![2.0, 3.0]));
-        let outcome = interpreter.run(&[Arg::Tensor(shape), Arg::Tensor(dst)]).unwrap();
+        let outcome = interpreter
+            .run(&[Arg::Tensor(shape), Arg::Tensor(dst)])
+            .unwrap();
         assert_eq!(
             failure(&outcome).cause,
             SourceFailureCause::Scalar(ScalarFailure::IntegerDivisionByZero)
@@ -71,7 +75,11 @@ fn guarded_quantity_loop_uses_joined_actual_value_without_visiting_false_arm() {
     let mut interpreter = Interpreter::new(&entry);
     let flag = interpreter.add_tensor(TensorData::dense(DType::Bool, vec![1], vec![0.0]));
     let outcome = interpreter
-        .run(&[Arg::Tensor(flag), Arg::Index(2u8.into()), Arg::Range(0u8.into(), 1_000_000_000u64.into())])
+        .run(&[
+            Arg::Tensor(flag),
+            Arg::Index(2u8.into()),
+            Arg::Range(0u8.into(), 1_000_000_000u64.into()),
+        ])
         .expect("false branch does not execute the wide loop");
     assert!(matches!(
         outcome.results().next().unwrap().value(),
@@ -80,7 +88,11 @@ fn guarded_quantity_loop_uses_joined_actual_value_without_visiting_false_arm() {
     let mut interpreter = Interpreter::new(&entry);
     let flag = interpreter.add_tensor(TensorData::dense(DType::Bool, vec![1], vec![1.0]));
     let outcome = interpreter
-        .run(&[Arg::Tensor(flag), Arg::Index(2u8.into()), Arg::Range(0u8.into(), 3u8.into())])
+        .run(&[
+            Arg::Tensor(flag),
+            Arg::Index(2u8.into()),
+            Arg::Range(0u8.into(), 3u8.into()),
+        ])
         .expect("loop carry advances the actual quantity each visit");
     assert!(matches!(
         outcome.results().next().unwrap().value(),
@@ -181,4 +193,83 @@ fn invocation_and_service_failures_are_not_source_stops() {
             matches!(result, Err(OracleError::WorkLimit { .. }))
         });
     }
+}
+
+fn reduced(source: &str, input: TensorData) -> ReferenceScalar {
+    let entry = entry(source);
+    let mut interpreter = Interpreter::new(&entry);
+    let input = interpreter.add_tensor(input);
+    let outcome = interpreter.run(&[Arg::Tensor(input)]).unwrap();
+    let OutcomeValue::Scalar(value) = outcome.results().next().unwrap().value() else {
+        panic!("scalar reduction result")
+    };
+    value
+}
+
+#[test]
+fn argmax_compares_in_the_input_dtype() {
+    let argmax = "fn probe[N](x: &tensor[N] f32) -> i32:\n    return reduce(x, 0, argmax)\n";
+    for (values, expected) in [
+        (vec![0.3, 0.7], 1),
+        (vec![0.7, 0.3], 0),
+        (vec![0.5, 0.5], 0),
+        (vec![-2.5, -2.25, -2.75], 1),
+    ] {
+        let input = TensorData::dense(DType::F32, vec![values.len()], values);
+        assert_eq!(reduced(argmax, input), ReferenceScalar::I32(expected));
+    }
+    let argmax = "fn probe[N](x: &tensor[N] f16) -> i32:\n    return reduce(x, 0, argmax)\n";
+    let input = TensorData::dense(DType::F16, vec![3], vec![0.25, 0.75, 0.5]);
+    assert_eq!(reduced(argmax, input), ReferenceScalar::I32(1));
+}
+
+#[test]
+fn extremum_reductions_fold_from_the_first_element() {
+    let nan = f32::from_bits(0x7fc0_0000) as f64;
+    let max = "fn probe[N](x: &tensor[N] f32) -> f32:\n    return reduce(x, 0, max)\n";
+    let input = TensorData::dense(DType::F32, vec![2], vec![nan, nan]);
+    assert_eq!(reduced(max, input), ReferenceScalar::F32(0x7fc0_0000));
+    let argmax = "fn probe[N](x: &tensor[N] f32) -> i32:\n    return reduce(x, 0, argmax)\n";
+    let input = TensorData::dense(DType::F32, vec![2], vec![nan, 1.0]);
+    assert_eq!(reduced(argmax, input), ReferenceScalar::I32(0));
+    let min = "fn probe[N](x: &tensor[N] i32) -> i32:\n    return reduce(x, 0, min)\n";
+    let input = TensorData::dense(DType::I32, vec![3], vec![4.0, -7.0, 2.0]);
+    assert_eq!(reduced(min, input), ReferenceScalar::I32(-7));
+}
+
+#[test]
+fn callee_dimension_extents_bind_in_the_callee_frame() {
+    let single = entry("fn twice[N](x: &tensor[N] i32) -> tensor[N] i32:\n    return x + x\n\nfn probe(input: &tensor[4] i32) -> tensor[4] i32:\n    return twice(input * 1)\n");
+    let mut interpreter = Interpreter::new(&single);
+    let input =
+        interpreter.add_tensor(TensorData::dense(DType::I32, vec![4], vec![0., 1., 2., 3.]));
+    let outcome = interpreter.run(&[Arg::Tensor(input)]).unwrap();
+    let result = outcome.results().next().unwrap();
+    let OutcomeValue::Tensor(result) = result.value() else {
+        panic!("tensor result")
+    };
+    assert_eq!(
+        (0..4).map(|i| result.read(i).unwrap()).collect::<Vec<_>>(),
+        [0., 2., 4., 6.]
+    );
+
+    // One family, two call sites with different actual dimensions: each call
+    // frame binds its own formal.
+    let two_sites = entry("fn twice[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return x + x\n\nfn probe[N, M](a: &tensor[N] f32, b: &tensor[M] f32) -> (tensor[N] f32, tensor[M] f32):\n    return (twice(a * 1.0), twice(b * 1.0))\n");
+    let mut interpreter = Interpreter::new(&two_sites);
+    let a = interpreter.add_tensor(TensorData::dense(DType::F32, vec![2], vec![1., 2.]));
+    let b = interpreter.add_tensor(TensorData::dense(DType::F32, vec![3], vec![3., 4., 5.]));
+    let outcome = interpreter.run(&[Arg::Tensor(a), Arg::Tensor(b)]).unwrap();
+    let results = outcome
+        .results()
+        .map(|result| {
+            let OutcomeValue::Tensor(tensor) = result.value() else {
+                panic!("tensor result")
+            };
+            (0..tensor.element_count())
+                .map(|i| tensor.read(i).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(results, [vec![2., 4.], vec![6., 8., 10.]]);
 }

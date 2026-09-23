@@ -1,7 +1,5 @@
 //! Qwen 3.5 dense and routed architecture contracts, ported from V3.
-pub mod baseline;
 pub mod decoder;
-pub mod dense;
 pub mod gguf;
 pub mod inputs;
 pub mod loading;

@@ -1,6 +1,5 @@
 use super::*;
 use crate::candidate_domain::construct_candidate_domain;
-use crate::preparation_budget::PreparationBudget;
 use seismic_lang::checked::{check_source, SourceFile, SourceSet};
 use seismic_lang::entry::ElementBindings;
 use seismic_lang::expr::Assignment;
@@ -34,13 +33,12 @@ fn reservations(source: &str) -> Result<Vec<Vec<u64>>, crate::errors::Preparatio
     description.limits.max_workgroup_bytes = 65536;
     description.limits.max_grid = [65536; 3];
     let device = seismic_target::DeviceDescription::new(description).unwrap();
-    let registry = crate::evaluation_session::boundary_tests::registry();
+    let registry = crate::realization::demand_driven_tests::registry();
     let domain = construct_candidate_domain(
         entry,
         &device,
         &registry,
         &PrecisionPolicy::Exact,
-        &PreparationBudget::default(),
     )?;
     let parts = domain.into_parts();
     Ok(parts

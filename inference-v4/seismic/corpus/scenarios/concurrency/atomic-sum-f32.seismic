@@ -1,0 +1,6 @@
+# origin: C17:atomic_sum_f32
+# undecided: reassociated
+# invoke: f32[4096]=rand(61) ; f32[1]=zero
+fn probe[N](x: &tensor[N] f32, out: &mut tensor[1] f32):
+    parallel for i in 0..N:
+        atomic(add, out[0], x[i])

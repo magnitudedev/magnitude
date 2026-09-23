@@ -498,8 +498,7 @@ mod tests {
     }
     #[test]
     fn matrix_demand_uses_actual_value_extents_and_reports_device_extents() {
-        use seismic_ir::kernel::{KernelValues, ops::{LogicalTensorMap, PlaceRef}};
-        use seismic_ir::repr::{DenseF32, Idx};
+        use seismic_ir::kernel::ops::{LogicalTensorMap, PlaceRef};
         use seismic_ir::storage::LaunchLocalKind;
         use seismic_lang::{registry, expr::Assignment};
         let capability = registry::capability(registry::BackendName::Metal, "matrix").unwrap();
@@ -508,12 +507,16 @@ mod tests {
         let capacity = arena.nat(32);
         let mut construction = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
         let vectors = VectorSupport::default();
-        let mut builder = construction.kernel(&mut arena, &(), &[], &vectors);
-        builder.local::<DenseF32>(LaunchLocalKind::Workgroup, vec![capacity, capacity]);
-        let rows = builder.constant::<Idx>(9).erase()[0];
-        let inner = builder.constant::<Idx>(8).erase()[0];
-        let columns = builder.constant::<Idx>(16).erase()[0];
-        let device_rows = builder.local_id(0).erase()[0];
+        let mut builder = construction.portable_kernel(&mut arena, &(), &[], &vectors);
+        builder.local_tensor(
+            LaunchLocalKind::Workgroup,
+            registry::dense(DType::F32),
+            vec![capacity, capacity],
+        );
+        let rows = builder.index_constant(9).raw();
+        let inner = builder.index_constant(8).raw();
+        let columns = builder.index_constant(16).raw();
+        let device_rows = builder.local_id(0).raw();
         builder.close();
         let kernel = &construction.kernels()[0];
         let map = |extents| LogicalTensorMap {

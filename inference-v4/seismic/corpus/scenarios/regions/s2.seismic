@@ -1,0 +1,11 @@
+# origin: C14:s2
+# invoke: f32[5]=rand(50) ; bool:true ; f32[5]=zero
+# invoke: f32[5]=rand(50) ; bool:false ; f32[5]=zero
+fn probe[N](x: &tensor[N] f32, c: bool, out: &mut tensor[N] f32) -> f32:
+    let mut t = x + x
+    if c:
+        t = x * x
+    parallel for i in 0..N:
+        out[i] = t[i] + 1.0
+    let u = t + x
+    return reduce(u, 0, sum)

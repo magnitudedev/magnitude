@@ -641,20 +641,6 @@ fn probe_matrix_combinations(
     combinations
 }
 
-/// Compiles one library from full MSL source with the production options.
-pub(crate) fn compile_library(
-    device: &ProtocolObject<dyn MTLDevice>,
-    language: LanguageVersion,
-    source: &str,
-) -> Result<objc2::rc::Retained<ProtocolObject<dyn MTLLibrary>>, String> {
-    device
-        .newLibraryWithSource_options_error(
-            &NSString::from_str(source),
-            Some(&compile_options(language)),
-        )
-        .map_err(|error| error.localizedDescription().to_string())
-}
-
 /// Pure target assembly from a complete immutable description. No device
 /// opening, native compilation, or timing acquisition occurs here.
 pub fn device_description_from_facts(

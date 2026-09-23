@@ -30,7 +30,6 @@ pub enum ResourceOwnershipScope {
     Participant,
     Subgroup,
     Workgroup,
-    CooperativeGrid,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

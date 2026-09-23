@@ -1,0 +1,7 @@
+# origin: C11:r2_call_tensor_result_fixed
+# invoke: f32[4]=1,1,1,1
+fn helper(a: &tensor[4] f32) -> tensor[4] f32:
+    return a * 2.0
+
+fn probe(x: &tensor[4] f32) -> tensor[4] f32:
+    return helper(x)

@@ -1,0 +1,9 @@
+# origin: X1:r2-w01
+# invoke: f32[4]=1,2,3,4 ; f32[4]=zero
+# pin: out = f32[4]=3,4,5,6
+fn first(x: &tensor[4] f32) -> f32:
+    return x[0] * 2.0
+fn probe(x: &tensor[4] f32, out: &mut tensor[4] f32):
+    let s = first(x)
+    parallel for i in 0..4:
+        out[i] = x[i] + s

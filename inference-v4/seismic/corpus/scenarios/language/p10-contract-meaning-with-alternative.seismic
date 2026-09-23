@@ -1,0 +1,11 @@
+# origin: C1:p10
+# cell: call-alternatives/sl
+# invoke g: f32[5]=seq
+# pin: result = f32[]=100
+# invoke g: f32[3]=seq
+# pin: result = f32[]=100
+fn g[N](x: &tensor[N] f32) -> f32:
+    return x[0] + 100.0
+
+fn g[N](x: &tensor[N] f32) -> f32 where N >= 4:
+    return x[0] + 200.0

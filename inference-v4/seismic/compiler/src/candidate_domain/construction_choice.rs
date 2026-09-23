@@ -52,7 +52,7 @@ impl BodySelection {
 /// A checked source node instantiated during physical construction. The
 /// occurrence distinguishes construction under different selected input arms;
 /// runtime repeat visits execute one closed body and do not create occurrences.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CallLocation {
     pub body: StableFunctionId,
     pub source_definition: u64,
@@ -60,7 +60,7 @@ pub struct CallLocation {
     pub occurrence: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CallPath(pub Vec<CallLocation>);
 
 #[derive(Clone, Debug)]

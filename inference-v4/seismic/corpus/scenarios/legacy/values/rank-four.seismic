@@ -1,0 +1,8 @@
+# origin: test:validation:corpus/values.seismic:rank_four
+# invoke rank_four: f32[2,2,2,3]=seq ; f32[2,2,2,3]=zero
+fn rank_four[A, B, C, D](x: &tensor[A, B, C, D] f32, y: &mut tensor[A, B, C, D] f32):
+    parallel for a in 0..A:
+        parallel for b in 0..B:
+            parallel for c in 0..C:
+                parallel for d in 0..D:
+                    y[a, b, c, d] = x[a, b, c, d] + 1.0

@@ -35,6 +35,7 @@ impl fmt::Debug for ArenaId {
 }
 
 pub mod compiled;
+pub(crate) mod poly;
 
 /// A typed handle to one interned node.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -99,9 +100,12 @@ pub enum SymbolKind {
     /// A call-schema dimension: symbolic at compile time, bound by tensors at
     /// invocation.
     CallDimension(DimensionId),
-    /// A semantic scalar parameter of the call schema (`Nat`, `Int`, or a
-    /// scalar dtype).
-    CallScalar(ParameterId),
+    /// A scalar or range parameter component of the call schema (`Nat`,
+    /// `Int`, or a scalar dtype).
+    CallScalar(ScalarArgument),
+    /// Element stride of axis `u32` of root tensor parameter leaf `ParameterId`; bound by
+    /// `validate_invocation` from the argument's `TensorLayout::strides()`.
+    CallStride(ParameterId, u32),
     /// A runtime scalar SSA value in a monomorphized semantic function.
     /// Checker-private and rejected by entry/target predicates.
     RuntimeValue(crate::ids::SemanticValueId),
@@ -115,6 +119,38 @@ pub enum SymbolKind {
     /// runtime and rebound before any dependent predicate or range is
     /// evaluated. Indexed by the owning schedule's slot ordinal.
     ScheduleSlot(u32),
+    /// A checker-internal fresh variable. Never in an entry arena;
+    /// `is_invocation() == false`.
+    ProofVariable(u32),
+}
+
+/// One scalar component of a call-schema parameter: the value of a scalar or
+/// `index` parameter, or one endpoint of a `range` parameter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ScalarArgument {
+    pub parameter: ParameterId,
+    pub component: ScalarComponent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ScalarComponent {
+    Value,
+    RangeStart,
+    RangeEnd,
+}
+
+impl SymbolKind {
+    /// Single owner of "evaluable from the invocation and fixed target/member facts".
+    pub fn is_invocation(self) -> bool {
+        matches!(
+            self,
+            Self::CallDimension(_)
+                | Self::CallScalar(_)
+                | Self::CallStride(..)
+                | Self::TargetConstant(_)
+                | Self::Decision(_)
+        )
+    }
 }
 
 /// A target-profile constant symbol, allocated by the compiler when a profile
@@ -223,8 +259,19 @@ impl ExprArena {
         self.inner.runtime_value(value)
     }
 
-    pub fn call_scalar(&mut self, parameter: ParameterId, sort: SymbolSort) -> SymbolId {
-        self.inner.call_scalar(parameter, sort)
+    pub fn call_scalar(&mut self, argument: ScalarArgument, sort: SymbolSort) -> SymbolId {
+        self.inner.call_scalar(argument, sort)
+    }
+
+    /// A fresh checker-internal proof variable.
+    pub(crate) fn proof_variable(&mut self, sort: SymbolSort) -> SymbolId {
+        self.inner.proof_variable(sort)
+    }
+
+    /// The `Nat` symbol for the element stride of `axis` of root tensor
+    /// parameter leaf `parameter`. Interned: one symbol per `(parameter, axis)`.
+    pub fn call_stride_symbol(&mut self, parameter: ParameterId, axis: u32) -> SymbolId {
+        self.inner.call_stride_symbol(parameter, axis)
     }
 
     /// Allocates one target-profile constant and its symbol in this arena.
@@ -301,6 +348,9 @@ impl ExprArena {
     /// `a - b` under the side condition `b <= a`, recorded as a side
     /// condition of the node.
     pub fn nat_sub(&mut self, a: NatExpr, b: NatExpr) -> NatExpr {
+        if let Some(difference) = poly::natural_difference(self, a, b) {
+            return difference;
+        }
         self.inner.nat_sub(a, b)
     }
     /// Floor division; records `b != 0`.
@@ -390,10 +440,20 @@ impl ExprArena {
     pub(crate) fn scalar_integer_defined(&mut self, value: IntExpr) -> BoolExpr {
         self.inner.scalar_integer_defined(value)
     }
+    /// `a + b`, rebuilt in the one polynomial normal form when both operands
+    /// are total (`poly::integer_sum`).
     pub fn int_add(&mut self, a: IntExpr, b: IntExpr) -> IntExpr {
+        if let Some(sum) = poly::integer_sum(self, a, b, false) {
+            return sum;
+        }
         self.inner.int_add(a, b)
     }
+    /// `a - b`, rebuilt in the one polynomial normal form when both operands
+    /// are total (`poly::integer_sum`).
     pub fn int_sub(&mut self, a: IntExpr, b: IntExpr) -> IntExpr {
+        if let Some(difference) = poly::integer_sum(self, a, b, true) {
+            return difference;
+        }
         self.inner.int_sub(a, b)
     }
     pub fn int_mul(&mut self, a: IntExpr, b: IntExpr) -> IntExpr {
@@ -587,6 +647,20 @@ impl ExprArena {
         values: &[(crate::ids::SemanticValueId, IntExpr)],
     ) -> IntExpr {
         self.inner.resolve_runtime_values(node, values)
+    }
+
+    /// The `NatExpr` counterpart of [`ExprArena::resolve_runtime_values`].
+    pub fn resolve_runtime_nat(
+        &mut self,
+        node: NatExpr,
+        values: &[(crate::ids::SemanticValueId, IntExpr)],
+    ) -> NatExpr {
+        self.inner.resolve_runtime_values(node, values)
+    }
+
+    /// True iff evaluation cannot fail for any assignment of its free symbols.
+    pub fn is_total(&self, expression: AnyExpr) -> bool {
+        self.inner.expression_total(expression)
     }
 
     /// Total evaluation under a complete assignment.
@@ -1293,6 +1367,23 @@ impl TargetPredicate {
     }
 }
 
+/// Invocation-level guard: every free symbol is evaluable from the invocation
+/// and fixed target/member facts ([`SymbolKind::is_invocation`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct InvocationPredicate {
+    node: BoolExpr,
+}
+
+impl InvocationPredicate {
+    /// The only constructor. Err iff some free symbol has `is_invocation() == false`.
+    pub fn new(arena: &ExprArena, node: BoolExpr) -> Result<Self, PredicateLevelError> {
+        predicate(arena, node, SymbolKind::is_invocation).map(|()| Self { node })
+    }
+    pub fn node(self) -> BoolExpr {
+        self.node
+    }
+}
+
 /// Runtime structured-control predicate. Decisions are forbidden because
 /// freezing must resolve them; call scalars, lexical binders, and mutable
 /// schedule slots are legitimate runtime inputs evaluated by the schedule.
@@ -1381,6 +1472,104 @@ mod exact_value_tests {
         let negative = arena.int_exact(-(BigInt::from(1u32) << 100usize));
         let invalid = arena.nat_from_int(negative);
         assert_eq!(arena.eval_nat(invalid, &Assignment::new()), Err(EvalError::NegativeNat));
+    }
+}
+
+#[cfg(test)]
+mod invocation_tests {
+    use super::*;
+    use crate::ids::{FunctionId, ProgramId, SchemaId, SemanticValueId};
+
+    #[test]
+    fn call_stride_symbols_are_interned_nat_invocation_symbols() {
+        let mut arena = ExprArena::new();
+        let schema = SchemaId::fresh();
+        let parameter = ParameterId::new(schema, 0);
+        let other = ParameterId::new(schema, 1);
+        let stride = arena.call_stride_symbol(parameter, 1);
+        assert_eq!(arena.call_stride_symbol(parameter, 1), stride);
+        assert_ne!(arena.call_stride_symbol(parameter, 0), stride);
+        assert_ne!(arena.call_stride_symbol(other, 1), stride);
+        assert_eq!(arena.symbol_kind(stride), SymbolKind::CallStride(parameter, 1));
+        assert_eq!(arena.symbol_sort(stride), SymbolSort::Nat);
+        assert!(arena.symbol_kind(stride).is_invocation());
+
+        let axis0 = arena.call_stride_symbol(parameter, 0);
+        let first = arena.nat_symbol(stride);
+        let second = arena.nat_symbol(axis0);
+        let first_root = arena.root(RootName::ViewStride { view: 0, axis: 0 }, first.into());
+        let second_root = arena.root(RootName::ViewStride { view: 0, axis: 0 }, second.into());
+        assert_ne!(
+            arena.canonical_digest(&[first_root]),
+            arena.canonical_digest(&[second_root])
+        );
+    }
+
+    #[test]
+    fn invocation_predicate_admits_exactly_invocation_symbols() {
+        let mut arena = ExprArena::new();
+        let schema = SchemaId::fresh();
+        let (_, dimension) = arena.call_dimension(DimensionId::new(schema, 0));
+        let stride = arena.call_stride_symbol(ParameterId::new(schema, 0), 0);
+        let stride = arena.nat_symbol(stride);
+        let scalar = arena.call_scalar(
+            ScalarArgument { parameter: ParameterId::new(schema, 1), component: ScalarComponent::Value },
+            SymbolSort::Nat,
+        );
+        let scalar = arena.nat_symbol(scalar);
+        let (_, constant) = arena.target_constant(SymbolSort::Nat);
+        let constant = arena.nat_symbol(constant);
+        let decision = arena.decision(FiniteDomain::new(vec![1, 2]).unwrap());
+        let chosen = arena.decision_is(decision, 2);
+        let product = arena.nat_mul(dimension, stride);
+        let bounded = arena.nat_cmp(CmpOp::Le, product, constant);
+        let with_scalar = arena.nat_cmp(CmpOp::Lt, scalar, dimension);
+        let admitted = arena.all(&[bounded, with_scalar, chosen]);
+        let predicate = InvocationPredicate::new(&arena, admitted).unwrap();
+        assert_eq!(predicate.node(), admitted);
+
+        let (_, binder, _) = arena.nat_loop_binder();
+        let slot = arena.schedule_slot(0, SymbolSort::Nat);
+        let function = FunctionId::new(ProgramId::fresh(), 0);
+        let (runtime, _) = arena.runtime_value(SemanticValueId::new(function, 0));
+        let (template, _) = arena.template_dimension(0);
+        for forbidden in [binder, slot, runtime, template] {
+            assert!(!arena.symbol_kind(forbidden).is_invocation());
+            let term = match arena.symbol_sort(forbidden) {
+                SymbolSort::Nat => arena.nat_symbol(forbidden),
+                _ => {
+                    let value = arena.int_symbol(forbidden);
+                    arena.nat_from_int(value)
+                }
+            };
+            let condition = arena.nat_cmp(CmpOp::Lt, term, dimension);
+            let condition = arena.and(admitted, condition);
+            assert_eq!(
+                InvocationPredicate::new(&arena, condition),
+                Err(PredicateLevelError::ForbiddenSymbol(forbidden))
+            );
+        }
+    }
+
+    #[test]
+    fn totality_and_runtime_nat_resolution_are_public() {
+        let mut arena = ExprArena::new();
+        let (_, dimension) = arena.call_dimension(DimensionId::new(SchemaId::fresh(), 0));
+        let one = arena.nat(1);
+        let total = arena.nat_add(dimension, one);
+        let partial = arena.nat_div(one, dimension);
+        assert!(arena.is_total(total.into()));
+        assert!(!arena.is_total(partial.into()));
+
+        let function = FunctionId::new(ProgramId::fresh(), 0);
+        let value = SemanticValueId::new(function, 0);
+        let (_, runtime) = arena.runtime_value(value);
+        let node = arena.nat_from_int(runtime);
+        let node = arena.nat_add(node, one);
+        let five = arena.int(5);
+        let resolved = arena.resolve_runtime_nat(node, &[(value, five)]);
+        assert!(arena.free_symbols(resolved.into()).is_empty());
+        assert_eq!(arena.eval_nat_u64(resolved, &Assignment::new()).unwrap(), 6);
     }
 }
 

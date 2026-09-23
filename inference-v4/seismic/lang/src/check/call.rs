@@ -1,69 +1,180 @@
 //! Calls: casts, toolchain operations, capability intrinsics, and calls of
-//! contract families with one candidate binding per definition that unifies
-//! with the arguments.
+//! contract families. A family call is checked once against its contract:
+//! the family's dimension plan solves the callee dimensions from the actual
+//! axes (L16), and the members that apply at the call are recorded.
 
+use super::dimensions::{self, DimensionCallError};
 use super::ir::{
-    Call as CheckedCall, Candidate as CandidateBinding, DefKind, Expr as CheckedExpr,
-    ExprKind as CheckedExprKind, Index as CheckedIndex, LocalId, Ownership as ParamOwnership,
-    ShapeBindingPlan, ShapeObservation,
+    Call as CheckedCall, CallContext, Candidate, Expr as CheckedExpr,
+    ExprKind as CheckedExprKind, Index as CheckedIndex, IntrinsicOverload, LocalId,
+    Ownership as ParamOwnership, Predicate,
 };
-use super::resolve::Sig;
+use super::resolve::SigParam;
 use super::{Checker, ValueClass};
-use crate::expr::{AnyExpr, IntExpr, SymbolId};
-use crate::intrinsics::{
-    self, primitive, reduction_result, MathOp, PrimitiveId, RepresentationTarget,
+use crate::checked::{DiagnosticRule, ElementTarget};
+use crate::expr::{AnyExpr, ExprArena, IntExpr, SymbolId};
+use crate::intrinsics::{self, primitive, reduction_result, MathOp, PrimitiveId, RepresentationTarget};
+use crate::registry::{
+    IntrinsicExecution, IntrinsicParticipation, IntrinsicResultType, IntrinsicSignature,
+    OperandCategory, RepresentationKind,
 };
 use crate::span::Span;
 use crate::syntax::ast::{self, ExprKind as A};
 use crate::types::{DType, Elem, TensorType, ValueType};
 use std::collections::HashMap;
 
-fn math_of(name: &str) -> Option<(MathOp, usize)> {
-    Some(match name {
-        "fma" => (MathOp::Fma, 3),
-        // Both accepted spellings have the same source meaning. A physical
-        // approximation is an implementation choice under the caller's policy.
-        "exp" | "exp_fast" => (MathOp::Exp, 1),
-        "rsqrt" => (MathOp::Rsqrt, 1),
-        "sqrt" => (MathOp::Sqrt, 1),
-        "log" => (MathOp::Log, 1),
-        "sin" => (MathOp::Sin, 1),
-        "cos" => (MathOp::Cos, 1),
-        "abs" => (MathOp::Abs, 1),
-        "max" => (MathOp::Max, 2),
-        "min" => (MathOp::Min, 2),
-        _ => return None,
-    })
-}
-
-/// Shape and element arguments of one candidate under construction.
+/// Element bindings of one family member at a call.
 #[derive(Default)]
-struct Binding {
-    shapes: HashMap<String, IntExpr>,
-    elems: HashMap<String, Elem>,
-    /// Caller element parameters this candidate requires to be a concrete element.
+struct Elements {
+    /// Member element parameter -> element (possibly a caller parameter).
+    arguments: HashMap<String, Elem>,
+    /// Caller element parameters this member requires to be a concrete element.
     requires: Vec<(String, Elem)>,
-    /// Actual tensor geometry observed at this call, in argument order.
-    observations: Vec<(IntExpr, ShapeObservation)>,
-    /// A construction order for reached callee dimension values.
-    shape_plan: Vec<(u32, ShapeBindingPlan)>,
 }
 
-fn single_dimension(
-    arena: &crate::expr::ExprArena,
-    names: &[String],
-    symbols: &[SymbolId],
+impl Elements {
+    /// Unify one formal element with one actual element.
+    fn unify(&mut self, formal: &Elem, actual: &Elem) -> bool {
+        match (formal, actual) {
+            (Elem::Param(name), actual) => match self.arguments.get(name) {
+                Some(bound) => bound == actual,
+                None => {
+                    let admitted = !matches!(actual, Elem::Dtype(d) if !d.is_float());
+                    if admitted {
+                        self.arguments.insert(name.clone(), actual.clone());
+                    }
+                    admitted
+                }
+            },
+            // A concrete member element against a caller element parameter
+            // applies where that parameter is this element.
+            (concrete, Elem::Param(own)) => match self.requires.iter().find(|(p, _)| p == own) {
+                Some((_, required)) => required == concrete,
+                None => {
+                    self.requires.push((own.clone(), concrete.clone()));
+                    true
+                }
+            },
+            (x, y) => x == y,
+        }
+    }
+
+    /// Unify every tensor element of a formal type with the actual type.
+    fn unify_type(&mut self, formal: &ValueType, actual: &ValueType) -> bool {
+        match (formal, actual) {
+            (ValueType::Tensor(f), ValueType::Tensor(a)) => self.unify(&f.elem, &a.elem),
+            (ValueType::Tuple(f), ValueType::Tuple(a)) if f.len() == a.len() => {
+                f.iter().zip(a.iter()).all(|(f, a)| self.unify_type(f, a))
+            }
+            _ => true,
+        }
+    }
+}
+
+/// The member's formal types mention only its dimensions; map them to the
+/// call's dimension values in the caller's arena.
+fn substitute(
+    member: &ExprArena,
+    dimensions: &[SymbolId],
+    values: &[IntExpr],
+    caller: &mut ExprArena,
     expression: IntExpr,
-) -> Option<String> {
-    let mentioned = super::prove::symbols(arena, expression);
-    let [symbol] = mentioned.as_slice() else {
-        return None;
+) -> IntExpr {
+    let mut map = |symbol: SymbolId, _: &mut ExprArena| {
+        let ordinal = dimensions
+            .iter()
+            .position(|candidate| *candidate == symbol)
+            .unwrap_or_else(|| panic!("a signature expression mentions a non-dimension symbol"));
+        AnyExpr::Int(values[ordinal])
     };
-    let ordinal = symbols.iter().position(|candidate| candidate == symbol)?;
-    let direct = arena.view(AnyExpr::Int(expression));
-    match direct {
-        crate::expr::NodeView::Symbol(found) if found == *symbol => Some(names[ordinal].clone()),
-        _ => None,
+    super::xfer::transfer_int(member, expression, caller, &mut map)
+}
+
+fn substitute_type(
+    member: &ExprArena,
+    dimensions: &[SymbolId],
+    values: &[IntExpr],
+    elements: &HashMap<String, Elem>,
+    caller: &mut ExprArena,
+    ty: &ValueType,
+) -> ValueType {
+    match ty {
+        ValueType::Tensor(tensor) => ValueType::Tensor(TensorType::new(
+            tensor
+                .axes
+                .iter()
+                .map(|axis| substitute(member, dimensions, values, caller, *axis))
+                .collect(),
+            match &tensor.elem {
+                Elem::Param(name) => elements
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| Elem::Param(name.clone())),
+                other => other.clone(),
+            },
+        )),
+        ValueType::Index { bound } => ValueType::Index {
+            bound: substitute(member, dimensions, values, caller, *bound),
+        },
+        ValueType::Range { bound } => ValueType::Range {
+            bound: substitute(member, dimensions, values, caller, *bound),
+        },
+        ValueType::Tuple(items) => ValueType::Tuple(
+            crate::types::NonEmpty::new(
+                items
+                    .iter()
+                    .map(|item| substitute_type(member, dimensions, values, elements, caller, item))
+                    .collect(),
+            )
+            .expect("a checked tuple is nonempty"),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Whether an intrinsic row's argument category admits an argument, for
+/// some admissible binding of an element parameter.
+fn category_admits(category: &OperandCategory, argument: &ValueType) -> bool {
+    match (category, argument) {
+        (OperandCategory::Scalar(expected) | OperandCategory::Constant(expected), ValueType::Scalar(actual)) => {
+            expected == actual
+        }
+        (
+            OperandCategory::Readable {
+                representation,
+                rank,
+            }
+            | OperandCategory::Writable {
+                representation,
+                rank,
+            },
+            ValueType::Tensor(tensor),
+        ) => {
+            u32::try_from(tensor.rank()).ok() == Some(*rank)
+                && match &tensor.elem {
+                    Elem::Dtype(dtype) => crate::registry::dense(*dtype) == *representation,
+                    Elem::Repr(actual) => actual == representation,
+                    Elem::Param(_) => crate::registry::representation_info(*representation)
+                        .decoded
+                        .is_float(),
+                }
+        }
+        (
+            OperandCategory::Opaque { capability, name },
+            ValueType::Opaque {
+                capability: actual,
+                name: actual_name,
+            },
+        ) => capability == actual && name == actual_name,
+        _ => false,
+    }
+}
+
+/// The element of a tensor of one representation.
+fn representation_element(representation: crate::ids::RepresentationId) -> Elem {
+    match crate::registry::representation_info(representation).kind {
+        RepresentationKind::Dense(dtype) => Elem::Dtype(dtype),
+        RepresentationKind::Packed(_) | RepresentationKind::External(_) => Elem::Repr(representation),
     }
 }
 
@@ -89,6 +200,7 @@ impl<'a> Checker<'a> {
                         }
                         _ => {
                             self.error(
+                                DiagnosticRule::Resolution,
                                 callee.span,
                                 "capability intrinsics use `<backend>.<capability>.<operation>`",
                             );
@@ -97,6 +209,7 @@ impl<'a> Checker<'a> {
                     },
                     _ => {
                         self.error(
+                            DiagnosticRule::Resolution,
                             callee.span,
                             "capability intrinsics use `<backend>.<capability>.<operation>`",
                         );
@@ -105,44 +218,31 @@ impl<'a> Checker<'a> {
                 };
                 return self.intrinsic(backend, capability, name, args, span);
             }
+            // L31: `index[B](w)`.
+            A::Index { base, indices } if matches!(&base.kind, A::Name(n) if n.name == "index") => {
+                return self.index_conversion(indices, bindings, args, span);
+            }
             _ => {
-                self.error(callee.span, "only named functions can be called; functions and operations resolve statically");
+                self.error(
+                    DiagnosticRule::Type,
+                    callee.span,
+                    "only named functions can be called; functions and operations resolve statically",
+                );
                 return None;
             }
         };
         if self.lookup(&name.name).is_some() {
             self.error(
+                DiagnosticRule::Type,
                 name.span,
                 format!("`{}` is a value, not a function", name.name),
             );
             return None;
-        };
-        let toolchain = DType::from_name(&name.name).is_some()
-            || math_of(&name.name).is_some()
-            || matches!(
-                name.name.as_str(),
-                "load"
-                    | "to_owned"
-                    | "clone"
-                    | "decode"
-                    | "zeros_like"
-                    | "ones_like"
-                    | "select"
-                    | "reduce"
-                    | "reshape"
-                    | "extent"
-                    | "coord"
-                    | "capacity"
-                    | "valid"
-                    | "atomic"
-                    | "owned"
-                    | "axis"
-                    | "lanes"
-                    | "full"
-                    | "repack"
-            );
-        if toolchain && name.name != "repack" && !bindings.is_empty() {
+        }
+        let builtin = super::resolve::is_builtin_name(&name.name);
+        if builtin && name.name != "repack" && !bindings.is_empty() {
             self.error(
+                DiagnosticRule::Type,
                 span,
                 format!(
                     "`{}` is a toolchain operation and takes no shape bindings",
@@ -150,17 +250,18 @@ impl<'a> Checker<'a> {
                 ),
             );
             return None;
-        };
+        }
         if let Some(dtype) = DType::from_name(&name.name) {
             return self.cast(dtype, args, span);
         }
-        if let Some((op, arity)) = math_of(&name.name) {
-            return self.math(op, arity, &name.name, args, expected, span);
+        if let Some(op) = MathOp::parse(&name.name) {
+            return self.math(op, &name.name, args, expected, span);
         }
         let positional = |c: &mut Checker, n: usize| -> bool {
             let ok = args.len() == n && args.iter().all(|a| a.name.is_none());
             if !ok {
                 c.error(
+                    DiagnosticRule::Type,
                     span,
                     format!("`{}` takes {n} positional argument(s)", name.name),
                 );
@@ -168,297 +269,35 @@ impl<'a> Checker<'a> {
             ok
         };
         match name.name.as_str() {
+            "index" => {
+                self.error(
+                    DiagnosticRule::Type,
+                    span,
+                    "`index` needs its bound: `index[B](w)`",
+                );
+                None
+            }
+            "range" => {
+                self.error(
+                    DiagnosticRule::Type,
+                    span,
+                    "`range` is a type, not a conversion; write `lo..hi`",
+                );
+                None
+            }
             "repack" => {
                 if !positional(self, 1) {
                     return None;
                 }
-                let source = self.expr(&args[0].value, None)?;
-                let ValueType::Tensor(source_tensor) = &source.ty else {
-                    self.error(source.span, "`repack` requires a tensor source");
-                    return None;
-                };
-                if matches!(source_tensor.elem, Elem::Dtype(_)) {
-                    self.error(
-                        source.span,
-                        "`repack` requires a registered external representation source",
-                    );
-                    return None;
-                }
-                let explicit = if bindings.is_empty() {
-                    None
-                } else {
-                    let [(parameter, value)] = bindings else {
-                        self.error(
-                            span,
-                            "`repack` accepts only the element binding `U = representation`",
-                        );
-                        return None;
-                    };
-                    if parameter.name != "U" {
-                        self.error(parameter.span, "`repack` destination binding is named `U`");
-                        return None;
-                    }
-                    let A::Name(representation) = &value.kind else {
-                        self.error(
-                            value.span,
-                            "`repack` destination must name a representation",
-                        );
-                        return None;
-                    };
-                    if let Some(representation) =
-                        crate::registry::representation(&representation.name)
-                    {
-                        Some(RepresentationTarget::Concrete(representation))
-                    } else if self.sig.elem_params.contains(&representation.name) {
-                        Some(RepresentationTarget::Parameter(representation.name.clone()))
-                    } else {
-                        self.error(
-                            value.span,
-                            format!(
-                                "unknown representation or element parameter `{}`",
-                                representation.name
-                            ),
-                        );
-                        return None;
-                    }
-                };
-                let inferred = expected.and_then(|expected| match expected {
-                    ValueType::Tensor(tensor) => match &tensor.elem {
-                        Elem::Repr(representation) => {
-                            Some(RepresentationTarget::Concrete(*representation))
-                        }
-                        Elem::Param(parameter) => {
-                            Some(RepresentationTarget::Parameter(parameter.clone()))
-                        }
-                        _ => None,
-                    },
-                    _ => None,
-                });
-                let Some(destination) = explicit.or(inferred) else {
-                    self.error(span, "`repack` needs `U = representation` or a representation-typed result context");
-                    return None;
-                };
-                if let (Elem::Repr(source), RepresentationTarget::Concrete(destination)) =
-                    (&source_tensor.elem, &destination)
-                {
-                    if crate::registry::representation_conversion(*source, *destination).is_none() {
-                        self.error(
-                            span,
-                            format!(
-                                "no exact representation conversion is registered from `{}` to `{}`",
-                                crate::registry::representation_info(*source).name,
-                                crate::registry::representation_info(*destination).name,
-                            ),
-                        );
-                        return None;
-                    }
-                }
-                let destination_elem = match &destination {
-                    RepresentationTarget::Concrete(representation) => Elem::Repr(*representation),
-                    RepresentationTarget::Parameter(parameter) => Elem::Param(parameter.clone()),
-                };
-                let ty = ValueType::Tensor(TensorType::new(
-                    source_tensor.axes.clone(),
-                    destination_elem,
-                ));
-                Some(CheckedExpr::new(
-                    CheckedExprKind::Primitive {
-                        id: PrimitiveId::RepresentationConvert(destination),
-                        operands: vec![source],
-                    },
-                    ty,
-                    None,
-                    span,
-                ))
+                self.repack(bindings, &args[0].value, expected, span)
             }
             "to_owned" => {
                 if !positional(self, 1) {
                     return None;
                 }
-                let value = self.expr(&args[0].value, None)?;
-                // Ownership conversion is idempotent. An already-owned value
-                // needs neither a diagnostic nor a second allocation.
-                if matches!(self.class_of(&value), ValueClass::Owned) {
-                    return Some(value);
-                }
-                if !matches!(
-                    self.class_of(&value),
-                    ValueClass::Borrowed | ValueClass::Computed
-                ) {
-                    self.error(
-                        value.span,
-                        format!(
-                            "`to_owned` materializes a borrowed or computed tensor value, found {}",
-                            value.ty
-                        ),
-                    );
-                    return None;
-                }
-                if !primitive(&PrimitiveId::Materialize).accepts(&[value.ty.clone()]) {
-                    self.error(
-                        value.span,
-                        format!("`to_owned` is not defined on {}", value.ty),
-                    );
-                    return None;
-                }
-                let ty = value.ty.clone();
-                Some(CheckedExpr::new(
-                    CheckedExprKind::Primitive {
-                        id: PrimitiveId::Materialize,
-                        operands: vec![value],
-                    },
-                    ty,
-                    None,
-                    span,
-                ))
+                self.to_owned(&args[0].value, span)
             }
-            "clone" => {
-                if !positional(self, 1) {
-                    return None;
-                }
-                let value = self.expr(&args[0].value, None)?;
-                if !matches!(self.class_of(&value), ValueClass::Owned) {
-                    self.error(
-                        value.span,
-                        format!("`clone` duplicates an owned tensor, found {}", value.ty),
-                    );
-                    return None;
-                }
-                if !primitive(&PrimitiveId::Clone).accepts(&[value.ty.clone()]) {
-                    self.error(
-                        value.span,
-                        format!("`clone` is not defined on {}", value.ty),
-                    );
-                    return None;
-                }
-                let ty = value.ty.clone();
-                Some(CheckedExpr::new(
-                    CheckedExprKind::Primitive {
-                        id: PrimitiveId::Clone,
-                        operands: vec![value],
-                    },
-                    ty,
-                    None,
-                    span,
-                ))
-            }
-            "load" => {
-                if !positional(self, 1) {
-                    return None;
-                }
-                let v = self.expr(&args[0].value, None)?;
-                if !matches!(self.class_of(&v), ValueClass::Borrowed | ValueClass::Owned) {
-                    self.error(
-                        v.span,
-                        format!(
-                            "`load` snapshots borrowed or owned storage in its own representation, found {}",
-                            v.ty
-                        ),
-                    );
-                    return None;
-                }
-                if !primitive(&PrimitiveId::Load).accepts(&[v.ty.clone()]) {
-                    self.error(v.span, format!("`load` is not defined on {}", v.ty));
-                    return None;
-                }
-                let ty = v.ty.clone();
-                Some(CheckedExpr::new(
-                    CheckedExprKind::Primitive {
-                        id: PrimitiveId::Load,
-                        operands: vec![v],
-                    },
-                    ty,
-                    None,
-                    span,
-                ))
-            }
-            "decode" => {
-                if !positional(self, 1) {
-                    return None;
-                }
-                let v = self.expr(&args[0].value, None)?;
-                let Some(s) = v.ty.shaped().filter(|s| !matches!(s.elem, Elem::Dtype(_))) else {
-                    self.error(v.span, format!("`decode` produces the dense `f32` value of a packed view, found {}; convert dense values with a cast", v.ty));
-                    return None;
-                };
-                let ty =
-                    ValueType::Tensor(TensorType::new(s.axes.clone(), Elem::Dtype(DType::F32)));
-                Some(CheckedExpr::new(
-                    CheckedExprKind::Primitive {
-                        id: PrimitiveId::Decode,
-                        operands: vec![v],
-                    },
-                    ty,
-                    None,
-                    span,
-                ))
-            }
-            "zeros_like" | "ones_like" => {
-                let (Some(like), dtype) = (args.first().filter(|a| a.name.is_none()), args.get(1))
-                else {
-                    self.error(
-                        span,
-                        format!(
-                            "`{}(v, dtype=f32)` takes a shaped value and an optional dtype",
-                            name.name
-                        ),
-                    );
-                    return None;
-                };
-                if args.len() > 2 {
-                    self.error(
-                        span,
-                        format!(
-                            "`{}(v, dtype=f32)` takes a shaped value and an optional dtype",
-                            name.name
-                        ),
-                    );
-                    return None;
-                }
-                // Only the shape is used; the value is not read.
-                let like = self.expr_inner(&like.value, None, true)?;
-                let Some(s) = like.ty.shaped().cloned() else {
-                    self.error(
-                        like.span,
-                        format!(
-                            "`{}` takes the shape of a tensor, view or tile, found {}",
-                            name.name, like.ty
-                        ),
-                    );
-                    return None;
-                };
-                let dtype = match dtype {
-                    Some(ast::Arg {
-                        name: Some(label),
-                        value,
-                    }) if label.name == "dtype" => match &value.kind {
-                        A::Name(n) => DType::from_name(&n.name),
-                        _ => None,
-                    },
-                    Some(_) => None,
-                    None => Some(s.elem.read_dtype()),
-                };
-                let Some(dtype) = dtype else {
-                    self.error(span, "the second argument is `dtype=<dtype name>`");
-                    return None;
-                };
-                let ty = ValueType::Tensor(TensorType::new(s.axes, Elem::Dtype(dtype)));
-                let value = if name.name == "zeros_like" {
-                    crate::intrinsics::FillConstant::Zero
-                } else {
-                    crate::intrinsics::FillConstant::One
-                };
-                let id = PrimitiveId::Fill(value);
-                Some(CheckedExpr::new(
-                    CheckedExprKind::Primitive {
-                        id,
-                        operands: vec![like],
-                    },
-                    ty,
-                    None,
-                    span,
-                ))
-            }
+            "zeros_like" | "ones_like" => self.fill(&name.name, args, span),
             "select" => {
                 if !positional(self, 3) {
                     return None;
@@ -469,6 +308,7 @@ impl<'a> Checker<'a> {
                 let (axes, dtypes) = self.broadcast(&[&cond, &then, &els], "`select`", span)?;
                 if dtypes[0] != DType::Bool {
                     self.error(
+                        DiagnosticRule::Type,
                         cond.span,
                         format!(
                             "the first operand of `select` is a mask (`bool`), found {}",
@@ -477,8 +317,9 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
-                if DType::promote(dtypes[1], dtypes[2]).is_none() {
+                let Some(target) = DType::promote(dtypes[1], dtypes[2]) else {
                     self.error(
+                        DiagnosticRule::Type,
                         span,
                         format!(
                             "`select` between {} and {} needs an explicit cast",
@@ -487,7 +328,9 @@ impl<'a> Checker<'a> {
                         ),
                     );
                     return None;
-                }
+                };
+                let mut branches = self.promote_operands(vec![then, els], target).into_iter();
+                let (then, els) = (branches.next()?, branches.next()?);
                 self.elementwise_primitive(PrimitiveId::Select, vec![cond, then, els], axes, span)
             }
             "reduce" => {
@@ -506,7 +349,7 @@ impl<'a> Checker<'a> {
                 let Some(unordered) = unordered
                     .filter(|_| args.len() >= 3 && args[..3].iter().all(|a| a.name.is_none()))
                 else {
-                    self.error(span, "`reduce(tile, axis, op)` takes three positional arguments and an optional `unordered=true|false`");
+                    self.error(DiagnosticRule::Type, span, "`reduce(tile, axis, op)` takes three positional arguments and an optional `unordered=true|false`");
                     return None;
                 };
                 self.reduce(args, unordered, span)
@@ -517,70 +360,388 @@ impl<'a> Checker<'a> {
                 }
                 self.reshape(args, span)
             }
-            "extent" | "valid" => {
+            "extent" => {
                 if !positional(self, 2) {
-                    return None;
-                }
-                if name.name == "valid" && !self.target_form(span, "`valid`", None) {
                     return None;
                 }
                 let base = self.expr_inner(&args[0].value, None, true)?;
                 let Some(s) = base.ty.shaped().cloned() else {
+                    let shown = self.shown(&base.ty);
                     self.error(
+                        DiagnosticRule::Type,
                         base.span,
-                        format!(
-                            "`{}` needs a tensor, view or tile, found {}",
-                            name.name, base.ty
-                        ),
+                        format!("`extent` needs a tensor, view or tile, found {shown}"),
                     );
                     return None;
                 };
                 let axis = self.constant_axis(&args[1].value, s.rank())?;
                 let sym = s.axes[axis];
-                self.numeric_use(sym);
-                if name.name == "valid" {
-                    self.error(span, "`valid` exposed physical capacity in source; use the logical `extent` and let realization choose capacity");
-                    return None;
-                }
-                let id = PrimitiveId::Extent { axis: axis as u32 };
-                Some(self.scalar_expr(
-                    CheckedExprKind::Primitive {
-                        id,
-                        operands: vec![base],
-                    },
-                    DType::I32,
+                Some(self.primitive_expr(
+                    PrimitiveId::Extent { axis: axis as u32 },
+                    vec![base],
+                    ValueType::Scalar(DType::I32),
                     Some(sym),
                     span,
                 ))
             }
-            "capacity" => {
-                self.error(
-                    span,
-                    "`capacity` was removed: capacity is a planning resource bound, never a source value",
-                );
-                None
-            }
-            "coord" => {
-                self.error(
-                    span,
-                    "`coord(i)` was removed with tile coordinates; iterate a bounded range",
-                );
-                None
-            }
             "atomic" => self.atomic(args, span),
-            "owned" | "axis" | "lanes" => {
-                self.error(
-                    span,
-                    format!("`{}` is an iterator and appears only in `for`", name.name),
-                );
-                None
-            }
-            "full" => {
-                self.error(span, "`full(X)` was removed with structural slices");
-                None
-            }
             _ => self.user_call(name, bindings, args, span),
         }
+    }
+
+    /// L31: `index[B](w)` converts a word (or quantity) proved in
+    /// `0 <= w <= B - 1`.
+    fn index_conversion(
+        &mut self,
+        indices: &[ast::Index],
+        bindings: &[(ast::Ident, ast::Expr)],
+        args: &[ast::Arg],
+        span: Span,
+    ) -> Option<CheckedExpr> {
+        let ([ast::Index::Expr(bound)], [], [ast::Arg { name: None, value }]) = (indices, bindings, args)
+        else {
+            self.error(DiagnosticRule::Type, span, "`index[B](w)` takes one bound and one argument");
+            return None;
+        };
+        let bound = self.expr(bound, Some(&ValueType::Integer))?;
+        let bound = self.position_symbol(&bound)?;
+        if !self.require_nonneg(DiagnosticRule::Type, bound, span, "an index bound may be negative") {
+            return None;
+        }
+        let value = self.expr(value, None)?;
+        if !matches!(
+            value.ty,
+            ValueType::Integer | ValueType::Index { .. } | ValueType::Scalar(DType::I32 | DType::U32)
+        ) {
+            let shown = self.shown(&value.ty);
+            self.error(
+                DiagnosticRule::Type,
+                value.span,
+                format!("`index[B](w)` converts an integer, found {shown}"),
+            );
+            return None;
+        }
+        self.index_position(value, bound, span)
+    }
+
+    fn repack(
+        &mut self,
+        bindings: &[(ast::Ident, ast::Expr)],
+        source: &ast::Expr,
+        expected: Option<&ValueType>,
+        span: Span,
+    ) -> Option<CheckedExpr> {
+        let source = self.expr(source, None)?;
+        let ValueType::Tensor(source_tensor) = source.ty.clone() else {
+            self.error(DiagnosticRule::Type, source.span, "`repack` requires a tensor source");
+            return None;
+        };
+        if matches!(source_tensor.elem, Elem::Dtype(_)) {
+            self.error(
+                DiagnosticRule::Type,
+                source.span,
+                "`repack` requires a registered external representation source",
+            );
+            return None;
+        }
+        let explicit = if bindings.is_empty() {
+            None
+        } else {
+            let [(parameter, value)] = bindings else {
+                self.error(
+                    DiagnosticRule::Type,
+                    span,
+                    "`repack` accepts only the element binding `U = representation`",
+                );
+                return None;
+            };
+            if parameter.name != "U" {
+                self.error(DiagnosticRule::Type, parameter.span, "`repack` destination binding is named `U`");
+                return None;
+            }
+            let A::Name(representation) = &value.kind else {
+                self.error(
+                    DiagnosticRule::Type,
+                    value.span,
+                    "`repack` destination must name a representation",
+                );
+                return None;
+            };
+            if let Some(representation) = crate::registry::representation(&representation.name) {
+                Some(RepresentationTarget::Concrete(representation))
+            } else if self.sig.elem_params.contains(&representation.name) {
+                Some(RepresentationTarget::Parameter(representation.name.clone()))
+            } else {
+                self.error(
+                    DiagnosticRule::Resolution,
+                    value.span,
+                    format!(
+                        "unknown representation or element parameter `{}`",
+                        representation.name
+                    ),
+                );
+                return None;
+            }
+        };
+        let inferred = expected.and_then(|expected| match expected {
+            ValueType::Tensor(tensor) => match &tensor.elem {
+                Elem::Repr(representation) => Some(RepresentationTarget::Concrete(*representation)),
+                Elem::Param(parameter) => Some(RepresentationTarget::Parameter(parameter.clone())),
+                _ => None,
+            },
+            _ => None,
+        });
+        let Some(destination) = explicit.or(inferred) else {
+            self.error(
+                DiagnosticRule::Type,
+                span,
+                "`repack` needs `U = representation` or a representation-typed result context",
+            );
+            return None;
+        };
+        if let (Elem::Repr(source), RepresentationTarget::Concrete(destination)) =
+            (&source_tensor.elem, &destination)
+        {
+            if crate::registry::representation_conversion(*source, *destination).is_none() {
+                self.error(
+                    DiagnosticRule::Type,
+                    span,
+                    format!(
+                        "no exact representation conversion is registered from `{}` to `{}`",
+                        crate::registry::representation_info(*source).name,
+                        crate::registry::representation_info(*destination).name,
+                    ),
+                );
+                return None;
+            }
+        }
+        self.elements.conversion(
+            &source_tensor.elem,
+            match &destination {
+                RepresentationTarget::Concrete(representation) => {
+                    ElementTarget::Concrete(*representation)
+                }
+                RepresentationTarget::Parameter(parameter) => {
+                    ElementTarget::Parameter(parameter.clone())
+                }
+            },
+        );
+        let destination_elem = match &destination {
+            RepresentationTarget::Concrete(representation) => Elem::Repr(*representation),
+            RepresentationTarget::Parameter(parameter) => Elem::Param(parameter.clone()),
+        };
+        let ty = ValueType::Tensor(TensorType::new(source_tensor.axes, destination_elem));
+        Some(self.primitive_expr(
+            PrimitiveId::RepresentationConvert(destination),
+            vec![source],
+            ty,
+            None,
+            span,
+        ))
+    }
+
+    /// L22: whether a copied view selects whole packets on its packing axis:
+    /// the axis is not selected, or a range whose start and length are
+    /// multiples of the packet's logical group.
+    fn packet_aligned(&mut self, value: &CheckedExpr, group: i64) -> bool {
+        match &value.kind {
+            CheckedExprKind::Primitive {
+                id: PrimitiveId::SliceView { indices },
+                operands,
+                ..
+            } => {
+                let base = &operands[0];
+                let Some(tensor) = base.ty.shaped() else {
+                    return false;
+                };
+                let Some(packing) = tensor.packed_axis else {
+                    return true;
+                };
+                let extent = tensor.axes[packing];
+                let mut operand = 1;
+                let mut aligned = true;
+                for (axis, slot) in indices.iter().enumerate() {
+                    match *slot {
+                        intrinsics::IndexSlot::Point { .. } => {
+                            aligned &= axis != packing;
+                            operand += 1;
+                        }
+                        intrinsics::IndexSlot::Full => {}
+                        intrinsics::IndexSlot::Range { start, end, .. } => {
+                            let lo = start.then(|| {
+                                let value = operands[operand].sym;
+                                operand += 1;
+                                value
+                            });
+                            let hi = end.then(|| {
+                                let value = operands[operand].sym;
+                                operand += 1;
+                                value
+                            });
+                            if axis != packing {
+                                continue;
+                            }
+                            let zero = self.arena.int(0);
+                            let (Some(lo), Some(hi)) = (lo.unwrap_or(Some(zero)), hi.unwrap_or(Some(extent)))
+                            else {
+                                aligned = false;
+                                continue;
+                            };
+                            let length = self.arena.int_sub(hi, lo);
+                            let group = self.arena.int(group);
+                            aligned &= super::prove::divide_exact(&mut self.arena, lo, group).is_some()
+                                && super::prove::divide_exact(&mut self.arena, length, group).is_some();
+                        }
+                    }
+                }
+                aligned && self.packet_aligned(base, group)
+            }
+            CheckedExprKind::Primitive {
+                id: PrimitiveId::Transpose | PrimitiveId::Reshape,
+                operands,
+                ..
+            } => self.packet_aligned(&operands[0], group),
+            _ => true,
+        }
+    }
+
+    /// Whether a copied view selects its whole last axis (for an element
+    /// parameter, whose packing is not known until binding).
+    fn whole_last_axis(value: &CheckedExpr) -> bool {
+        match &value.kind {
+            CheckedExprKind::Primitive {
+                id: PrimitiveId::SliceView { indices },
+                operands,
+                ..
+            } => {
+                let last = operands[0].ty.shaped().map_or(0, |t| t.rank()).saturating_sub(1);
+                matches!(
+                    indices.get(last),
+                    Some(intrinsics::IndexSlot::Full)
+                        | Some(intrinsics::IndexSlot::Range {
+                            start: false,
+                            end: false,
+                            ..
+                        })
+                ) && Self::whole_last_axis(&operands[0])
+            }
+            CheckedExprKind::Primitive {
+                id: PrimitiveId::Transpose | PrimitiveId::Reshape,
+                ..
+            } => false,
+            _ => true,
+        }
+    }
+
+    fn to_owned(&mut self, value: &ast::Expr, span: Span) -> Option<CheckedExpr> {
+        let value = self.expr(value, None)?;
+        // Ownership conversion is idempotent. An already-owned value needs
+        // neither a diagnostic nor a second allocation.
+        if matches!(self.class_of(&value), ValueClass::Owned) {
+            return Some(value);
+        }
+        if !matches!(self.class_of(&value), ValueClass::Borrowed | ValueClass::Computed) {
+            let shown = self.shown(&value.ty);
+            self.error(
+                DiagnosticRule::Type,
+                value.span,
+                format!("`to_owned` materializes a borrowed or computed tensor value, found {shown}"),
+            );
+            return None;
+        }
+        if !primitive(&PrimitiveId::Copy).accepts(&[value.ty.clone()]) {
+            let shown = self.shown(&value.ty);
+            self.error(
+                DiagnosticRule::Type,
+                value.span,
+                format!("`to_owned` is not defined on {shown}"),
+            );
+            return None;
+        }
+        if let Some(tensor) = value.ty.shaped() {
+            match &tensor.elem {
+                Elem::Repr(representation) => {
+                    let info = crate::registry::representation_info(*representation);
+                    let group = match &info.kind {
+                        RepresentationKind::Packed(layout) => Some(layout.group),
+                        RepresentationKind::External(layout) => Some(layout.logical_group),
+                        RepresentationKind::Dense(_) => None,
+                    };
+                    if let Some(group) = group {
+                        if !self.packet_aligned(&value, i64::from(group)) {
+                            self.error(
+                                DiagnosticRule::Type,
+                                value.span,
+                                format!(
+                                    "copying a `{}` view requires a packet-aligned selection on its packing axis",
+                                    info.name
+                                ),
+                            );
+                            return None;
+                        }
+                    }
+                }
+                Elem::Param(_) if !Self::whole_last_axis(&value) => {
+                    let element = tensor.elem.clone();
+                    self.elements.partial_copy(&element);
+                }
+                _ => {}
+            }
+        }
+        let ty = value.ty.clone();
+        Some(self.primitive_expr(PrimitiveId::Copy, vec![value], ty, None, span))
+    }
+
+    fn fill(&mut self, name: &str, args: &[ast::Arg], span: Span) -> Option<CheckedExpr> {
+        let (Some(like), dtype) = (args.first().filter(|a| a.name.is_none()), args.get(1)) else {
+            self.error(
+                DiagnosticRule::Type,
+                span,
+                format!("`{name}(v, dtype=f32)` takes a shaped value and an optional dtype"),
+            );
+            return None;
+        };
+        if args.len() > 2 {
+            self.error(
+                DiagnosticRule::Type,
+                span,
+                format!("`{name}(v, dtype=f32)` takes a shaped value and an optional dtype"),
+            );
+            return None;
+        }
+        // Only the shape is used; the value is not read.
+        let like = self.expr_inner(&like.value, None, true)?;
+        let Some(s) = like.ty.shaped().cloned() else {
+            let shown = self.shown(&like.ty);
+            self.error(
+                DiagnosticRule::Type,
+                like.span,
+                format!("`{name}` takes the shape of a tensor, view or tile, found {shown}"),
+            );
+            return None;
+        };
+        let dtype = match dtype {
+            Some(ast::Arg {
+                name: Some(label),
+                value,
+            }) if label.name == "dtype" => match &value.kind {
+                A::Name(n) => DType::from_name(&n.name),
+                _ => None,
+            },
+            Some(_) => None,
+            None => Some(s.elem.read_dtype()),
+        };
+        let Some(dtype) = dtype else {
+            self.error(DiagnosticRule::Type, span, "the second argument is `dtype=<dtype name>`");
+            return None;
+        };
+        let ty = ValueType::Tensor(TensorType::new(s.axes, Elem::Dtype(dtype)));
+        let value = if name == "zeros_like" {
+            intrinsics::FillConstant::Zero
+        } else {
+            intrinsics::FillConstant::One
+        };
+        Some(self.primitive_expr(PrimitiveId::Fill(value), vec![like], ty, None, span))
     }
 
     fn constant_axis(&mut self, e: &ast::Expr, rank: usize) -> Option<usize> {
@@ -589,7 +750,7 @@ impl<'a> Checker<'a> {
             _ => None,
         };
         if axis.is_none() {
-            self.error(e.span, format!("the axis is a constant below rank {rank}"));
+            self.error(DiagnosticRule::Type, e.span, format!("the axis is a constant below rank {rank}"));
         }
         axis
     }
@@ -597,14 +758,15 @@ impl<'a> Checker<'a> {
     fn math(
         &mut self,
         op: MathOp,
-        arity: usize,
         name: &str,
         args: &[ast::Arg],
         expected: Option<&ValueType>,
         span: Span,
     ) -> Option<CheckedExpr> {
+        let arity = op.arity();
         if args.len() != arity || args.iter().any(|a| a.name.is_some()) {
             self.error(
+                DiagnosticRule::Type,
                 span,
                 format!("`{name}` takes {arity} positional argument(s)"),
             );
@@ -635,6 +797,7 @@ impl<'a> Checker<'a> {
                 Some(p) => dtype = p,
                 None => {
                     self.error(
+                        DiagnosticRule::Type,
                         span,
                         format!(
                             "`{name}` between {} and {} needs an explicit cast",
@@ -652,6 +815,7 @@ impl<'a> Checker<'a> {
             !dtype.is_numeric()
         } {
             self.error(
+                DiagnosticRule::Type,
                 span,
                 format!(
                     "`{name}` needs {} operands, found {}",
@@ -661,103 +825,106 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
-        self.elementwise_primitive(PrimitiveId::Math(op), out, axes, span)
+        let operands = self.promote_operands(out, dtype);
+        self.elementwise_primitive(PrimitiveId::Math(op), operands, axes, span)
     }
 
     fn reduce(&mut self, args: &[ast::Arg], unordered: bool, span: Span) -> Option<CheckedExpr> {
         let t = self.expr(&args[0].value, None)?;
-        let Some(s) = t.ty.shaped() else {
+        let Some(s) = t.ty.shaped().cloned() else {
+            let shown = self.shown(&t.ty);
             self.error(
+                DiagnosticRule::Type,
                 t.span,
-                format!("`reduce` reduces a dense tensor value, found {}", t.ty),
+                format!("`reduce` reduces a dense tensor value, found {shown}"),
             );
             return None;
         };
-        // Storage realization is not part of reduction syntax. A computed
-        // operand is a legitimate value without logical storage.
-        let Some(dtype) = (match &s.elem {
-            Elem::Dtype(d) => Some(*d),
-            Elem::Param(_) => Some(DType::F32),
-            Elem::Repr(_) => None,
-        }) else {
+        // L9: a reduction folds dense numeric (non-bool) elements.
+        let Some(dtype) = s.elem.dense_dtype() else {
             self.error(
+                DiagnosticRule::Type,
                 t.span,
                 "`reduce` reduces a dense tile; decode packed values first",
             );
             return None;
         };
+        if dtype == DType::Bool {
+            self.error(
+                DiagnosticRule::Type,
+                t.span,
+                "`reduce` folds numeric elements; convert a mask with `i32(mask)` first",
+            );
+            return None;
+        }
         let axis = self.constant_axis(&args[1].value, s.rank())?;
         let op = match &args[2].value.kind {
-            A::Name(n) => match n.name.as_str() {
-                "sum" => Some(intrinsics::ReduceOp::Sum),
-                "max" => Some(intrinsics::ReduceOp::Max),
-                "min" => Some(intrinsics::ReduceOp::Min),
-                "argmax" => Some(intrinsics::ReduceOp::Argmax),
-                _ => None,
-            },
+            A::Name(n) => intrinsics::ReduceOp::parse(&n.name),
             _ => None,
         };
         let Some(op) = op else {
             self.error(
+                DiagnosticRule::Type,
                 args[2].value.span,
                 "`reduce` needs an operation: sum, max, min or argmax",
             );
             return None;
         };
         if unordered && op == intrinsics::ReduceOp::Argmax {
-            self.error(span, "`argmax` has one defined winner (ties go to the smaller index) and never accepts `unordered`");
+            self.error(
+                DiagnosticRule::Type,
+                span,
+                "`argmax` has one defined winner (ties go to the smaller index) and never accepts `unordered`",
+            );
             return None;
         }
-        if let Some(extent) = s.axes.get(axis) {
-            if let Some(p) = single_dimension(
-                &self.arena,
-                &self.sig.shape_params,
-                &self.sig.shape_symbols,
-                *extent,
-            ) {
-                self.summary.reduces.insert(p);
-            }
-        }
-        let _ = dtype;
+        self.elements.decoded_read(&s.elem);
+        // §2.3.6 (2): an element-parameter operand reads as its decoded f32.
+        let t = if matches!(s.elem, Elem::Param(_)) {
+            self.promote_operands(vec![t], DType::F32).remove(0)
+        } else {
+            t
+        };
+        let check_nonempty = op != intrinsics::ReduceOp::Sum && {
+            let one = self.arena.int(1);
+            let slack = self.arena.int_sub(s.axes[axis], one);
+            !super::prove::nonneg(&self.arena, &self.facts, slack)
+        };
         let id = PrimitiveId::Reduce {
             op,
             axis: axis as u32,
             unordered,
+            check_nonempty,
         };
-        let ty = reduction_result(&t.ty, op, axis as u32)
-            .ok_or_else(|| {
-                self.error(
-                    t.span,
-                    "`reduce` reduces a dense tile; decode packed values first",
-                );
-            })
-            .ok()?;
-        Some(CheckedExpr::new(
-            CheckedExprKind::Primitive {
-                id,
-                operands: vec![t],
-            },
-            ty,
-            None,
-            span,
-        ))
+        let Some(ty) = reduction_result(&t.ty, op, axis as u32) else {
+            self.error(
+                DiagnosticRule::Type,
+                t.span,
+                "`reduce` reduces a dense tile; decode packed values first",
+            );
+            return None;
+        };
+        Some(self.primitive_expr(id, vec![t], ty, None, span))
     }
 
     fn reshape(&mut self, args: &[ast::Arg], span: Span) -> Option<CheckedExpr> {
         let base = self.expr_inner(&args[0].value, None, true)?;
         let Some(s) = base.ty.shaped().cloned() else {
+            let shown = self.shown(&base.ty);
             self.error(
+                DiagnosticRule::Type,
                 base.span,
-                format!("`reshape` needs a tensor, view or tile, found {}", base.ty),
+                format!("`reshape` needs a tensor, view or tile, found {shown}"),
             );
             return None;
         };
         if matches!(s.elem, Elem::Repr(_)) {
-            self.error(span, "`reshape` requires dense storage: packets run along the last axis of a packed value");
+            self.error(DiagnosticRule::Type, span, "`reshape` requires dense storage: packets run along the last axis of a packed value");
             return None;
         }
         let A::Tuple(dimensions) = &args[1].value.kind else {
             self.error(
+                DiagnosticRule::Type,
                 args[1].value.span,
                 "the `reshape` target is a tuple of shape expressions",
             );
@@ -772,12 +939,10 @@ impl<'a> Checker<'a> {
         let mut target = self.arena.int(1);
         for dimension in dimensions {
             let d = self.expr(dimension, Some(&ValueType::Integer))?;
-            let Some(extent) = d.sym else {
-                self.error(d.span, "`reshape` extents are symbolic integer expressions");
+            let extent = self.position_symbol(&d)?;
+            if !self.require_nonneg(DiagnosticRule::Type, extent, d.span, "reshape extent may be negative") {
                 return None;
-            };
-            self.require_nonneg(extent, d.span, "reshape extent may be negative");
-            self.numeric_use(extent);
+            }
             target = self.arena.int_mul(target, extent);
             axes.push(extent);
             operands.push(d);
@@ -785,31 +950,22 @@ impl<'a> Checker<'a> {
         let difference = self.arena.int_sub(target, source);
         if axes.is_empty() || !super::prove::zero(&self.arena, &self.facts, difference) {
             self.error(
+                DiagnosticRule::Type,
                 span,
                 "`reshape` must provably preserve element correspondence",
             );
             return None;
         }
-        let shaped = TensorType::new(axes, s.elem);
-        let ty = ValueType::Tensor(shaped);
-        Some(CheckedExpr::new(
-            CheckedExprKind::Primitive {
-                id: PrimitiveId::Reshape,
-                operands,
-            },
-            ty,
-            None,
-            span,
-        ))
+        let ty = ValueType::Tensor(TensorType::new(axes, s.elem));
+        Some(self.primitive_expr(PrimitiveId::Reshape, operands, ty, None, span))
     }
 
-    /// `atomic(add|max|min, place, value)`: one registry primitive with an
-    /// atomic effect, portable in every body. Defined for f32/f16/bf16/i32/u32
-    /// elements; bool is rejected because bool arithmetic is undefined, and
-    /// packed planes are not writable.
+    /// `atomic(add|max|min, t[i], value)` (L12): the place is one element of
+    /// a `&mut` tensor parameter or of a `let mut` tensor.
     fn atomic(&mut self, args: &[ast::Arg], span: Span) -> Option<CheckedExpr> {
-        if !positional_3(args) {
+        if !(args.len() == 3 && args.iter().all(|a| a.name.is_none())) {
             self.error(
+                DiagnosticRule::Atomic,
                 span,
                 "`atomic(op, place, value)` takes three positional arguments",
             );
@@ -820,6 +976,7 @@ impl<'a> Checker<'a> {
                 Some(op) => op,
                 None => {
                     self.error(
+                        DiagnosticRule::Atomic,
                         n.span,
                         format!("`atomic({}, …)`: the operation is add, max or min", n.name),
                     );
@@ -828,38 +985,34 @@ impl<'a> Checker<'a> {
             },
             _ => {
                 self.error(
+                    DiagnosticRule::Atomic,
                     args[0].value.span,
                     "`atomic` needs an operation name: add, max or min",
                 );
                 return None;
             }
         };
-        let (root, indices, selected) = match &args[1].value.kind {
-            A::Name(name) => {
-                let Some(id) = self.lookup(&name.name) else {
-                    self.error(name.span, format!("`{}` is not declared", name.name));
-                    return None;
-                };
-                (id, Vec::new(), self.locals[id.index()].ty.clone())
-            }
-            A::Index { .. } => self.place(&args[1].value)?,
-            _ => {
-                self.error(
-                    args[1].value.span,
-                    "the `atomic` place is a tensor element: `atomic(add, t[i], v)`",
-                );
-                return None;
-            }
-        };
-        let ValueType::Scalar(dtype) = selected else {
+        let A::Index { base, .. } = &args[1].value.kind else {
             self.error(
+                DiagnosticRule::Atomic,
                 args[1].value.span,
-                format!("the `atomic` place selects one element, found {}", selected),
+                "the `atomic` place is an element of a `&mut` tensor or a `let mut` tensor: `atomic(add, t[i], v)`",
+            );
+            return None;
+        };
+        let (root, indices, selected) = self.place(&args[1].value)?;
+        let ValueType::Scalar(dtype) = selected else {
+            let shown = self.shown(&selected);
+            self.error(
+                DiagnosticRule::Atomic,
+                args[1].value.span,
+                format!("the `atomic` place selects one element, found {shown}"),
             );
             return None;
         };
         if !intrinsics::atomic_dtype(dtype) {
             self.error(
+                DiagnosticRule::Atomic,
                 span,
                 format!(
                     "`atomic(add, …)` is defined for f32, f16, bf16, i32 and u32 elements, not {}",
@@ -872,6 +1025,7 @@ impl<'a> Checker<'a> {
         if let Some(shaped) = self.locals[root.index()].ty.shaped() {
             if matches!(shaped.elem, Elem::Repr(_)) {
                 self.error(
+                    DiagnosticRule::Type,
                     span,
                     "packed representations are readable and decodable but not writable",
                 );
@@ -880,32 +1034,24 @@ impl<'a> Checker<'a> {
         }
         let value = self.expr(&args[2].value, Some(&ValueType::Scalar(dtype)))?;
         if value.ty.scalar_dtype() != Some(dtype) {
+            let shown = self.shown(&value.ty);
             self.error(
+                DiagnosticRule::Atomic,
                 value.span,
-                format!(
-                    "the `atomic` value must be {}, found {}",
-                    dtype.name(),
-                    value.ty
-                ),
+                format!("the `atomic` value must be {}, found {shown}", dtype.name()),
             );
             return None;
         }
-        let binding = match &args[1].value.kind {
-            A::Name(name) => self.lookup(&name.name),
-            A::Index { base, .. } => match &base.kind {
-                A::Name(name) => self.lookup(&name.name),
-                _ => None,
-            },
-            _ => None,
+        let A::Name(name) = &base.kind else {
+            unreachable!("a checked element place indexes a named tensor")
         };
-        let Some(binding) = binding else {
-            self.error(span, "the `atomic` place does not name a binding");
-            return None;
-        };
-        if !self.writable_root(self.root_var_local(binding)) && !self.writable_root(root) {
+        let binding = self.lookup(&name.name).expect("a checked place names a local");
+        let storage_root = self.root_var_local(binding);
+        if !self.writable_root(storage_root) || !self.writable_root(binding) {
             self.error(
+                DiagnosticRule::Atomic,
                 span,
-                "an `atomic` place is a `&mut tensor` parameter or local `let mut` state",
+                "an `atomic` place is an element of a `&mut tensor` parameter or of a `let mut` tensor",
             );
             return None;
         }
@@ -914,31 +1060,13 @@ impl<'a> Checker<'a> {
             .iter()
             .any(|(borrow, borrowed, _)| borrowed.local == root && borrow.local != binding)
         {
+            let name = self.locals[root.index()].name.clone();
             self.error(
+                DiagnosticRule::Ownership,
                 span,
-                format!(
-                    "cannot update `{}` atomically while a tensor borrow is live",
-                    self.locals[root.index()].name
-                ),
+                format!("cannot update `{name}` atomically while a tensor borrow is live"),
             );
             return None;
-        }
-        let storage_root = self.root_var_local(binding);
-        self.mutated.push(storage_root);
-        let place = CheckedExpr::new(
-            CheckedExprKind::Local(binding),
-            self.locals[binding.index()].ty.clone(),
-            None,
-            span,
-        );
-        let mut checked_indices = Vec::new();
-        for index in &indices {
-            match index {
-                CheckedIndex::Point { value, .. } => checked_indices.push(value.clone()),
-                CheckedIndex::Range { start, end, .. } => {
-                    checked_indices.extend(start.iter().chain(end).cloned());
-                }
-            }
         }
         let participants = self
             .logical_parallel
@@ -965,8 +1093,8 @@ impl<'a> Checker<'a> {
         Some(CheckedExpr::new(
             CheckedExprKind::Atomic {
                 op,
-                place: Box::new(place),
-                indices: checked_indices,
+                place: super::ownership::LocalPlace::root(binding),
+                indices,
                 value: Box::new(value),
                 authority,
             },
@@ -993,6 +1121,7 @@ impl<'a> Checker<'a> {
     ) -> Option<CheckedExpr> {
         let Some(backend_id) = crate::registry::BackendName::parse(&backend.name) else {
             self.error(
+                DiagnosticRule::Resolution,
                 backend.span,
                 format!("`{}` is not a value or a backend namespace", backend.name),
             );
@@ -1000,6 +1129,7 @@ impl<'a> Checker<'a> {
         };
         let Some(capability_id) = crate::registry::capability(backend_id, &capability.name) else {
             self.error(
+                DiagnosticRule::Resolution,
                 capability.span,
                 format!(
                     "`{}.{}` is not a known capability namespace",
@@ -1015,17 +1145,18 @@ impl<'a> Checker<'a> {
         ) {
             return None;
         }
-        let Some(intrinsic_id) = crate::registry::intrinsic(capability_id, &name.name) else {
+        let overload = crate::registry::intrinsic_overloads(capability_id, &name.name);
+        if overload.is_empty() {
             self.error(
+                DiagnosticRule::Resolution,
                 name.span,
                 format!(
-                    "capability `{}` has no intrinsic `{}`",
-                    format!("{}.{}", backend.name, capability.name),
-                    name.name
+                    "capability `{}.{}` has no intrinsic `{}`",
+                    backend.name, capability.name, name.name
                 ),
             );
             return None;
-        };
+        }
         self.use_capability(
             &capability_id,
             span,
@@ -1034,230 +1165,222 @@ impl<'a> Checker<'a> {
                 backend.name, capability.name, name.name
             ),
         );
-        self.intrinsic_call(
-            crate::registry::intrinsic_signature(intrinsic_id),
-            args,
-            span,
-        )
-    }
-
-    fn intrinsic_call(
-        &mut self,
-        signature: &crate::registry::IntrinsicSignature,
-        args: &[ast::Arg],
-        span: Span,
-    ) -> Option<CheckedExpr> {
-        // Logical matrix intrinsics carry an `accumulation=` named argument.
-        if matches!(
-            crate::registry::internals::semantics(signature.id),
-            intrinsics::CapabilitySemantics::MatrixMatmul
-                | intrinsics::CapabilitySemantics::MatrixMatmulAdd
-        ) {
-            return self.matrix_intrinsic(signature, args, span);
-        }
         let mut checked = Vec::new();
         for arg in args {
             if arg.name.is_some() {
                 self.error(
+                    DiagnosticRule::Type,
                     arg.value.span,
-                    format!("`{}` takes positional arguments only", signature.name),
+                    format!("`{}` takes positional arguments only", name.name),
                 );
                 return None;
             }
-            let e = self.expr(&arg.value, None)?;
-            checked.push(e);
+            checked.push(self.expr(&arg.value, None)?);
         }
-        if signature.arguments.len() != checked.len()
-            || !signature
-                .arguments
+        // C1-3: the rows compatible with some admissible binding.
+        let rows = overload
+            .iter()
+            .copied()
+            .filter(|row| {
+                let signature = crate::registry::intrinsic_signature(*row);
+                signature.arguments.len() == checked.len()
+                    && signature
+                        .arguments
+                        .iter()
+                        .zip(&checked)
+                        .all(|(parameter, argument)| category_admits(&parameter.category, &argument.ty))
+            })
+            .collect::<Vec<_>>();
+        let Some(first) = rows.first().copied() else {
+            let types = checked
                 .iter()
-                .zip(&checked)
-                .all(|(parameter, argument)| {
-                    capability_argument_matches(&parameter.category, &argument.ty)
-                })
-        {
+                .map(|argument| self.shown(&argument.ty))
+                .collect::<Vec<_>>()
+                .join(", ");
             self.error(
+                DiagnosticRule::Type,
                 span,
-                format!(
-                    "`{}` takes {} argument(s) of its declared types; {} given",
-                    signature.name,
-                    signature.arguments.len(),
-                    checked.len()
-                ),
+                format!("no row of `{}` takes arguments ({types})", name.name),
             );
             return None;
+        };
+        let signature = crate::registry::intrinsic_signature(first);
+        let result = self.intrinsic_result(signature, &checked, span)?;
+        for row in &rows[1..] {
+            let other = self.intrinsic_result(crate::registry::intrinsic_signature(*row), &checked, span)?;
+            if !self.same_ty(&result, &other) {
+                self.error(
+                    DiagnosticRule::Type,
+                    span,
+                    format!("the rows of `{}` admitted by these arguments disagree on the result type", name.name),
+                );
+                return None;
+            }
         }
-        let id = signature.id;
-        let result = intrinsic_result_type(&signature.result);
+        for (parameter, argument) in signature.arguments.iter().zip(&checked) {
+            if let ValueType::Tensor(tensor) = &argument.ty {
+                match parameter.category {
+                    OperandCategory::Writable { .. } => self.elements.stored(&tensor.elem),
+                    _ => self.elements.decoded_read(&tensor.elem),
+                }
+            }
+        }
+        self.intrinsic_placement(signature, span)?;
         Some(CheckedExpr::new(
-            CheckedExprKind::Intrinsic { id, args: checked },
+            CheckedExprKind::Intrinsic {
+                overload: IntrinsicOverload {
+                    capability: capability_id,
+                    name: signature.name,
+                    rows,
+                },
+                args: checked,
+            },
             result,
             None,
             span,
         ))
     }
 
-    fn matrix_intrinsic(
-        &mut self,
-        signature: &crate::registry::IntrinsicSignature,
-        args: &[ast::Arg],
-        span: Span,
-    ) -> Option<CheckedExpr> {
-        let matmul = matches!(
-            crate::registry::internals::semantics(signature.id),
-            intrinsics::CapabilitySemantics::MatrixMatmul
-        );
-        let mut positional = Vec::new();
-        let mut accumulation: Option<DType> = None;
-        for argument in args {
-            match argument.name.as_ref().map(|name| name.name.as_str()) {
-                None => positional.push(&argument.value),
-                Some("accumulation") if matmul => {
-                    let dtype = match &argument.value.kind {
-                        A::Name(name) => DType::from_name(&name.name),
-                        _ => None,
-                    };
-                    let Some(dtype) = dtype.filter(|dtype| dtype.is_numeric()) else {
-                        self.error(
-                            argument.value.span,
-                            "matrix accumulation must name a numeric dtype",
-                        );
-                        return None;
-                    };
-                    if accumulation.replace(dtype).is_some() {
-                        self.error(
-                            argument.value.span,
-                            "`accumulation` is supplied more than once",
-                        );
-                        return None;
-                    }
+    /// L13: where a capability intrinsic may execute relative to the
+    /// participants of the enclosing `parallel for`.
+    fn intrinsic_placement(&mut self, signature: &IntrinsicSignature, span: Span) -> Option<()> {
+        let local_parallel = !self.logical_parallel.is_empty();
+        match signature.execution {
+            IntrinsicExecution::WithinEnclosingParallel => {
+                if !local_parallel {
+                    self.placement.requires_enclosing_parallel = true;
                 }
-                Some(name) => {
+            }
+            IntrinsicExecution::WholeTensor { .. } => {
+                if local_parallel {
                     self.error(
-                        argument.value.span,
-                        format!("`{}` has no named argument `{name}`", signature.name),
+                        DiagnosticRule::Placement,
+                        span,
+                        format!(
+                            "whole-tensor intrinsic `{}` cannot appear under a `parallel for`",
+                            signature.name
+                        ),
                     );
                     return None;
                 }
+                self.placement.forbids_enclosing_parallel = true;
             }
         }
-        let expected = if matmul { 2 } else { 3 };
-        if positional.len() != expected {
-            self.error(
-                span,
-                format!(
-                    "`{}` takes {expected} positional argument(s)",
-                    signature.name
-                ),
-            );
-            return None;
-        }
-        if matmul && accumulation.is_none() {
-            self.error(
-                span,
-                "`matrix.matmul` requires the named argument `accumulation=<dtype>`",
-            );
-            return None;
-        }
-        let mut checked = Vec::new();
-        for operand in positional {
-            let expression = self.expr(operand, None)?;
-            if !matches!(&expression.ty, ValueType::Tensor(shape) if shape.rank() == 2) {
+        if matches!(
+            signature.effects.participation,
+            IntrinsicParticipation::FullSubgroup
+                | IntrinsicParticipation::FullWorkgroup
+                | IntrinsicParticipation::FixedWorkgroup(_)
+        ) {
+            if !self.participant_uniform() {
                 self.error(
-                    expression.span,
+                    DiagnosticRule::Placement,
+                    span,
                     format!(
-                        "`{}` needs rank-two logical tensor operands, found {}",
-                        signature.name, expression.ty
-                    ),
-                );
-                return None;
-            }
-            checked.push(expression);
-        }
-        let left = checked[0].ty.shaped().expect("checked rank-two operand");
-        let right = checked[1].ty.shaped().expect("checked rank-two operand");
-        if !self.same_extent(left.axes[1], right.axes[0]) {
-            self.error(
-                span,
-                format!(
-                    "`{}` inner axes differ: {:?} versus {:?}",
-                    signature.name, left.axes[1], right.axes[0]
-                ),
-            );
-            return None;
-        }
-        let crate::registry::IntrinsicResultType::Owned { axes, .. } = &signature.result else {
-            unreachable!("matrix result is an owned tensor")
-        };
-        let projected_axes = axes.iter().map(|projection| {
-            checked[projection.argument as usize].ty.shaped()
-                .expect("result projection selects a checked tensor argument").axes[projection.axis as usize]
-        }).collect::<Vec<_>>();
-        let (element, result_axes) = if matmul {
-            (
-                Elem::Dtype(accumulation.expect("checked above")),
-                projected_axes.clone(),
-            )
-        } else {
-            let accumulator = checked[2]
-                .ty
-                .shaped()
-                .expect("checked rank-two accumulator");
-            let expected_axes = projected_axes.iter();
-            if accumulator
-                .axes
-                .iter()
-                .zip(expected_axes)
-                .any(|(actual, expected)| !self.same_extent(*actual, *expected))
-            {
-                self.error(
-                    checked[2].span,
-                    format!(
-                        "`{}` accumulator shape does not match the matrix product",
+                        "cohort intrinsic `{}` needs every participant of its cohort; it is under control that differs between participants",
                         signature.name
                     ),
                 );
                 return None;
             }
-            (accumulator.elem.clone(), projected_axes)
-        };
-        let id = signature.id;
-        let result = ValueType::Tensor(TensorType::new(result_axes, element));
-        Some(CheckedExpr::new(
-            CheckedExprKind::Intrinsic { id, args: checked },
-            result,
-            None,
-            span,
-        ))
+            if !local_parallel {
+                self.placement.requires_uniform_call_site = true;
+            }
+        }
+        Some(())
+    }
+
+    /// The checked result type of one intrinsic row applied to `args`.
+    fn intrinsic_result(
+        &mut self,
+        signature: &IntrinsicSignature,
+        args: &[CheckedExpr],
+        span: Span,
+    ) -> Option<ValueType> {
+        match &signature.result {
+            IntrinsicResultType::Void => Some(ValueType::Void),
+            IntrinsicResultType::Scalar(dtype) => Some(ValueType::Scalar(*dtype)),
+            IntrinsicResultType::Opaque { capability, name } => Some(ValueType::Opaque {
+                capability: *capability,
+                name,
+            }),
+            IntrinsicResultType::Owned {
+                representation,
+                axes,
+            } => {
+                let projected = axes
+                    .iter()
+                    .map(|projection| {
+                        args[projection.argument as usize]
+                            .ty
+                            .shaped()
+                            .expect("a result projection selects a tensor argument")
+                            .axes[projection.axis as usize]
+                    })
+                    .collect::<Vec<_>>();
+                if let crate::registry::IntrinsicDenotation::MatrixProduct { accumulate } =
+                    crate::registry::intrinsic_denotation(signature.id)
+                {
+                    let left = args[0].ty.shaped().expect("a matrix operand is a tensor");
+                    let right = args[1].ty.shaped().expect("a matrix operand is a tensor");
+                    if !self.same_extent(left.axes[1], right.axes[0]) {
+                        let (left, right) = (self.render(left.axes[1]), self.render(right.axes[0]));
+                        self.error(
+                            DiagnosticRule::Type,
+                            span,
+                            format!("`{}` inner axes differ: `{left}` versus `{right}`", signature.name),
+                        );
+                        return None;
+                    }
+                    if accumulate {
+                        let accumulator = args[2].ty.shaped().expect("a matrix accumulator is a tensor");
+                        if accumulator
+                            .axes
+                            .iter()
+                            .zip(&projected)
+                            .any(|(actual, expected)| !self.same_extent(*actual, *expected))
+                        {
+                            self.error(
+                                DiagnosticRule::Type,
+                                args[2].span,
+                                format!(
+                                    "`{}` accumulator shape does not match the matrix product",
+                                    signature.name
+                                ),
+                            );
+                            return None;
+                        }
+                    }
+                }
+                Some(ValueType::Tensor(TensorType::new(
+                    projected,
+                    representation_element(*representation),
+                )))
+            }
+        }
     }
 
     // ---- contract families ----
 
-    /// Parameter ordinal -> argument ordinal. `into=` binds the one remaining
-    /// `inout` parameter when no parameter is named `into`.
-    fn arg_order(sig: &Sig, args: &[ast::Arg]) -> Result<Vec<usize>, String> {
-        if args.len() != sig.params.len() {
+    /// Parameter ordinal -> argument ordinal (L3: one order for every member).
+    fn arg_order(params: &[SigParam], args: &[ast::Arg]) -> Result<Vec<usize>, String> {
+        if args.len() != params.len() {
             return Err(format!(
                 "takes {} arguments, {} given",
-                sig.params.len(),
+                params.len(),
                 args.len()
             ));
         }
-        let mut order: Vec<Option<usize>> = vec![None; sig.params.len()];
+        let mut order: Vec<Option<usize>> = vec![None; params.len()];
         let mut positional = 0;
-        let mut into = None;
         for (ordinal, arg) in args.iter().enumerate() {
             let slot = match &arg.name {
                 None => {
                     positional += 1;
                     positional - 1
                 }
-                Some(label) => match sig.params.iter().position(|p| p.name == label.name) {
+                Some(label) => match params.iter().position(|p| p.name == label.name) {
                     Some(slot) => slot,
-                    None if label.name == "into" && into.is_none() => {
-                        into = Some(ordinal);
-                        continue;
-                    }
                     None => return Err(format!("has no parameter `{}`", label.name)),
                 },
             };
@@ -1266,224 +1389,27 @@ impl<'a> Checker<'a> {
             }
             order[slot] = Some(ordinal);
         }
-        if let Some(ordinal) = into {
-            let open: Vec<usize> = (0..order.len())
-                .filter(|i| {
-                    order[*i].is_none() && sig.params[*i].ownership == ParamOwnership::Exclusive
-                })
-                .collect();
-            let [slot] = open.as_slice() else {
-                return Err("`into=` binds the one unbound `inout` parameter".to_string());
-            };
-            order[*slot] = Some(ordinal);
-        }
         order
             .into_iter()
             .collect::<Option<Vec<usize>>>()
             .ok_or_else(|| "leaves a parameter unbound".to_string())
     }
 
-    /// Substitute a candidate's bound shape parameters into one symbolic extent.
-    fn substitute(
-        &mut self,
-        sig: &Sig,
-        expression: IntExpr,
-        binding: &Binding,
-    ) -> Result<IntExpr, String> {
-        let mut map = |symbol: SymbolId, _: &mut crate::expr::ExprArena| {
-            let ordinal = sig
-                .shape_symbols
-                .iter()
-                .position(|candidate| *candidate == symbol)
-                .unwrap_or_else(|| {
-                    panic!("checked signature expression mentions a non-template symbol")
-                });
-            let name = &sig.shape_params[ordinal];
-            AnyExpr::Int(*binding.shapes.get(name).unwrap_or_else(|| {
-                panic!("substitution invoked before every template dimension was bound")
-            }))
-        };
-        for symbol in super::prove::symbols(&sig.arena, expression) {
-            let ordinal = sig
-                .shape_symbols
-                .iter()
-                .position(|candidate| *candidate == symbol)
-                .ok_or_else(|| "signature expression contains a non-dimension symbol".to_owned())?;
-            if !binding.shapes.contains_key(&sig.shape_params[ordinal]) {
-                return Err(format!(
-                    "shape parameter `{}` is not determined by the arguments",
-                    sig.shape_params[ordinal]
-                ));
-            }
-        }
-        Ok(super::xfer::transfer_int(
-            &sig.arena,
-            expression,
-            &mut self.arena,
-            &mut map,
-        ))
-    }
-
-    fn substitute_ty(
-        &mut self,
-        sig: &Sig,
-        ty: &ValueType,
-        binding: &Binding,
-    ) -> Result<ValueType, String> {
-        let mut shaped = |s: &TensorType| -> Result<TensorType, String> {
-            let mut axes = Vec::new();
-            for axis in &s.axes {
-                axes.push(self.substitute(sig, *axis, binding)?);
-            }
-            let elem = match &s.elem {
-                Elem::Param(p) => binding.elems.get(p).cloned().ok_or_else(|| {
-                    format!("element parameter `{p}` is not determined by the arguments")
-                })?,
-                other => other.clone(),
-            };
-            Ok(TensorType::new(axes, elem))
-        };
-        Ok(match ty {
-            ValueType::Tensor(s) => ValueType::Tensor(shaped(s)?),
-            ValueType::Index { bound } => ValueType::Index {
-                bound: self.substitute(sig, *bound, binding)?,
-            },
-            ValueType::Range { bound } => ValueType::Range {
-                bound: self.substitute(sig, *bound, binding)?,
-            },
-            ValueType::Tuple(items) => ValueType::Tuple(
-                crate::types::NonEmpty::new(
-                    items
-                        .iter()
-                        .map(|t| self.substitute_ty(sig, t, binding))
-                        .collect::<Result<Vec<_>, _>>()?,
-                )
-                .ok_or("empty tuple")?,
-            ),
-            other => other.clone(),
-        })
-    }
-
-    fn unify(
-        &mut self,
-        sig: &Sig,
-        param: &ValueType,
-        arg: &ValueType,
-        arg_class: ValueClass,
-        binding: &mut Binding,
-        compound: &mut Vec<(IntExpr, IntExpr)>,
-        argument: usize,
-        parameter: usize,
-        path: &mut Vec<u32>,
-    ) -> Result<(), String> {
-        let mismatch = || Err(format!("expects {param} but was given {arg}"));
-        match (param, arg) {
-            (ValueType::Scalar(a), _) => match arg.scalar_dtype() {
-                Some(b) if *a == b || (a.is_float() && b.is_float()) => Ok(()),
-                _ => mismatch(),
-            },
-            (ValueType::Index { bound: p }, ValueType::Index { bound: a }) => {
-                match single_dimension(&sig.arena, &sig.shape_params, &sig.shape_symbols, *p) {
-                    Some(name) => match binding.shapes.get(&name) {
-                        Some(bound) if !super::prove::same(&self.arena, *bound, *a) => mismatch(),
-                        Some(_) => Ok(()),
-                        None => {
-                            binding.shapes.insert(name, *a);
-                            Ok(())
-                        }
-                    },
-                    None => {
-                        compound.push((*p, *a));
-                        Ok(())
-                    }
-                }
-            }
-            (ValueType::Range { bound: p }, ValueType::Range { bound: a }) => {
-                match single_dimension(&sig.arena, &sig.shape_params, &sig.shape_symbols, *p) {
-                    Some(name) => match binding.shapes.get(&name) {
-                        Some(bound) if !super::prove::same(&self.arena, *bound, *a) => mismatch(),
-                        Some(_) => Ok(()),
-                        None => {
-                            binding.shapes.insert(name, *a);
-                            Ok(())
-                        }
-                    },
-                    None => {
-                        compound.push((*p, *a));
-                        Ok(())
-                    }
-                }
-            }
+    /// Structure of one argument against its formal: kinds, ranks, tuple
+    /// shapes and ownership admission. Dimensions are solved separately.
+    fn admits_structure(&self, formal: &ValueType, actual: &ValueType) -> bool {
+        match (formal, actual) {
+            (ValueType::Scalar(a), ValueType::Scalar(b)) => a == b || (a.is_float() && b.is_float()),
+            (ValueType::Index { .. }, ValueType::Index { .. } | ValueType::Integer)
+            | (ValueType::Index { .. }, ValueType::Scalar(DType::I32 | DType::U32))
+            | (ValueType::Range { .. }, ValueType::Range { .. }) => true,
             (ValueType::Tensor(p), ValueType::Tensor(a)) => {
-                // Ownership determines which argument classes a tensor parameter
-                // accepts; the type itself is canonical.
-                if p.rank() != a.rank() {
-                    return mismatch();
-                }
-                for (axis, (pd, ad)) in p.axes.iter().zip(&a.axes).enumerate() {
-                    binding.observations.push((*pd, ShapeObservation::TensorAxis {
-                        parameter,
-                        argument,
-                        path: path.clone(),
-                        axis: axis as u32,
-                    }));
-                    match single_dimension(&sig.arena, &sig.shape_params, &sig.shape_symbols, *pd) {
-                        Some(name) => match binding.shapes.get(&name) {
-                            Some(bound) if !super::prove::same(&self.arena, *bound, *ad) => {
-                                return Err(format!(
-                                    "binds shape parameter `{name}` inconsistently"
-                                ));
-                            }
-                            Some(_) => {}
-                            None => {
-                                binding.shapes.insert(name, *ad);
-                            }
-                        },
-                        None => compound.push((*pd, *ad)),
-                    }
-                }
-                let ok = match (&p.elem, &a.elem) {
-                    (Elem::Param(name), actual) => match binding.elems.get(name) {
-                        Some(bound) => bound == actual,
-                        None => {
-                            let admitted = !matches!(actual, Elem::Dtype(d) if !d.is_float());
-                            if admitted {
-                                binding.elems.insert(name.clone(), actual.clone());
-                            }
-                            admitted
-                        }
-                    },
-                    // A concrete callee element against a caller element parameter unifies
-                    // provisionally: the candidate applies where that parameter is this element.
-                    (concrete, Elem::Param(own)) => {
-                        match binding.requires.iter().find(|(p, _)| p == own) {
-                            Some((_, required)) => required == concrete,
-                            None => {
-                                binding.requires.push((own.clone(), concrete.clone()));
-                                true
-                            }
-                        }
-                    }
-                    (x, y) => x == y,
-                };
-                let packets_aligned = !matches!(a.elem, Elem::Repr(_))
-                    || a.rank()
-                        .checked_sub(1)
-                        .is_some_and(|last| a.packed_axis == Some(last));
-                if ok && packets_aligned {
-                    Ok(())
-                } else {
-                    mismatch()
-                }
+                p.rank() == a.rank()
+                    && (!matches!(a.elem, Elem::Repr(_))
+                        || a.rank().checked_sub(1).is_some_and(|last| a.packed_axis == Some(last)))
             }
-            (ValueType::Tuple(p), ValueType::Tuple(a)) if p.len() == a.len() => {
-                for (index, (p, a)) in p.iter().zip(a.iter()).enumerate() {
-                    path.push(index as u32);
-                    let result = self.unify(sig, p, a, arg_class, binding, compound, argument, parameter, path);
-                    path.pop();
-                    result?;
-                }
-                Ok(())
+            (ValueType::Tuple(p), ValueType::Tuple(a)) => {
+                p.len() == a.len() && p.iter().zip(a.iter()).all(|(p, a)| self.admits_structure(p, a))
             }
             (
                 ValueType::Opaque {
@@ -1494,287 +1420,72 @@ impl<'a> Checker<'a> {
                     capability: ac,
                     name: an,
                 },
-            ) if pc == ac && pn == an => Ok(()),
-            _ => mismatch(),
+            ) => pc == ac && pn == an,
+            _ => false,
         }
     }
 
-    /// Bind one candidate definition to the checked arguments.
-    fn bind_candidate(
+    /// The contract of the family of `name` these arguments bind: its
+    /// argument order and element bindings.
+    fn select_family(
         &mut self,
-        sig: &Sig,
-        enforce_precondition: bool,
-        explicit: &[(String, IntExpr)],
+        name: &ast::Ident,
+        families: &[usize],
         ast_args: &[ast::Arg],
         args: &[CheckedExpr],
-    ) -> Result<(Vec<usize>, Binding, bool), String> {
-        let order = Self::arg_order(sig, ast_args)?;
-        let mut binding = Binding::default();
-        for (name, extent) in explicit {
-            if !sig.shape_params.contains(name) {
-                return Err(format!("has no shape parameter `{name}`"));
-            }
-            binding.shapes.insert(name.clone(), *extent);
-        }
-        let mut compound = Vec::new();
-        for (parameter, (param, ordinal)) in sig.params.iter().zip(&order).enumerate() {
-            let argument = &args[*ordinal];
-            let arg_class = self.class_of(argument);
-            // Ownership admission before type unification.
-            match param.ownership {
-                // A computed tensor is a valid owned logical argument. The
-                // compiler realizes storage if the selected callee needs it;
-                // source authors never insert materialization to appease the
-                // checker.
-                ParamOwnership::Owned => {}
-                ParamOwnership::Exclusive
-                    if !matches!(arg_class, ValueClass::Owned | ValueClass::Borrowed) =>
+    ) -> Result<(usize, Vec<usize>, Elements), Vec<String>> {
+        let resolved = self.env.resolved;
+        let mut reasons = Vec::new();
+        for family in families {
+            let contract = resolved.families[*family].contract.index();
+            let Some(Some(outcome)) = self.env.checked.get(contract) else {
+                unreachable!("a callee is checked before its caller (L20)")
+            };
+            let params = &outcome.signature.params;
+            let order = match Self::arg_order(params, ast_args) {
+                Ok(order) => order,
+                Err(reason) => {
+                    reasons.push(format!("`{}` {reason}", name.name));
+                    continue;
+                }
+            };
+            let mut elements = Elements::default();
+            let mut mismatch = None;
+            for (parameter, ordinal) in params.iter().zip(&order) {
+                let argument = &args[*ordinal];
+                if !self.admits_structure(&parameter.ty, &argument.ty)
+                    || !elements.unify_type(&parameter.ty, &argument.ty)
                 {
-                    return Err(format!(
-                        "parameter `{}` requires a tensor place for exclusive access",
-                        param.name
+                    mismatch = Some(format!(
+                        "parameter `{}` expects {} but was given {}",
+                        parameter.name,
+                        parameter.ty.with_shapes(&outcome.arena, &|symbol| {
+                            outcome
+                                .signature
+                                .dimension_of(symbol)
+                                .map(|ordinal| outcome.signature.dimensions[ordinal].name.clone())
+                                .unwrap_or_else(|| "?".to_owned())
+                        }),
+                        self.shown(&argument.ty)
                     ));
+                    break;
                 }
-                _ => {}
-            }
-            self.unify(
-                sig,
-                &param.ty,
-                &argument.ty,
-                arg_class,
-                &mut binding,
-                &mut compound,
-                *ordinal,
-                parameter,
-                &mut Vec::new(),
-            )
-            .map_err(|e| format!("parameter `{}` {e}", param.name))?;
-        }
-        // Compound extents with one unknown, linear in it, determine that parameter.
-        loop {
-            let mut changed = false;
-            for (pd, ad) in &compound {
-                let unknown: Vec<String> = super::prove::symbols(&sig.arena, *pd)
-                    .into_iter()
-                    .filter_map(|symbol| {
-                        sig.shape_symbols
-                            .iter()
-                            .position(|candidate| *candidate == symbol)
-                            .map(|ordinal| sig.shape_params[ordinal].clone())
-                    })
-                    .filter(|name| !binding.shapes.contains_key(name))
-                    .collect();
-                let [u] = unknown.as_slice() else { continue };
-                let (_, hole, hole_value) = self.arena.loop_binder();
-                let mut complete = true;
-                let mut map = |symbol: SymbolId, _: &mut crate::expr::ExprArena| {
-                    let ordinal = sig
-                        .shape_symbols
-                        .iter()
-                        .position(|candidate| *candidate == symbol)
-                        .unwrap_or_else(|| {
-                            panic!("signature expression mentions non-template symbol")
-                        });
-                    let name = &sig.shape_params[ordinal];
-                    if name == u {
-                        AnyExpr::Int(hole_value)
-                    } else if let Some(value) = binding.shapes.get(name) {
-                        AnyExpr::Int(*value)
-                    } else {
-                        complete = false;
-                        AnyExpr::Int(hole_value)
-                    }
-                };
-                let e = super::xfer::transfer_int(&sig.arena, *pd, &mut self.arena, &mut map);
-                if !complete {
-                    continue;
-                }
-                let Some((c, rest)) = super::prove::linear_in(&mut self.arena, e, hole) else {
-                    continue;
-                };
-                if super::prove::mentions(&self.arena, rest, hole) {
-                    continue;
-                }
-                let difference = self.arena.int_sub(*ad, rest);
-                let value = match c {
-                    1 => Some(difference),
-                    -1 => {
-                        let zero = self.arena.int(0);
-                        Some(self.arena.int_sub(zero, difference))
-                    }
-                    c => super::prove::div_exact(&mut self.arena, difference, c),
-                };
-                if let Some(value) = value {
-                    binding.shapes.insert(u.clone(), value);
-                    changed = true;
+                if parameter.ownership == ParamOwnership::Exclusive
+                    && !matches!(self.class_of(argument), ValueClass::Owned | ValueClass::Borrowed)
+                {
+                    mismatch = Some(format!(
+                        "parameter `{}` requires a tensor place for exclusive access",
+                        parameter.name
+                    ));
+                    break;
                 }
             }
-            if !changed {
-                break;
+            match mismatch {
+                Some(reason) => reasons.push(reason),
+                None => return Ok((*family, order, elements)),
             }
         }
-        if let Some(p) = sig
-            .shape_params
-            .iter()
-            .find(|p| !binding.shapes.contains_key(*p))
-        {
-            return Err(format!(
-                "shape parameter `{p}` is not determined by the arguments; bind it with `{}[{p} = …](…)`",
-                sig.name
-            ));
-        }
-        for (pd, ad) in &compound {
-            let expected = self.substitute(sig, *pd, &binding)?;
-            if !super::prove::same(&self.arena, expected, *ad) {
-                return Err(
-                    "a compound extent does not match under the inferred shape binding".to_owned(),
-                );
-            }
-        }
-        if enforce_precondition {
-            // A call instantiates the callee's dimension domain, not merely
-            // the equations in its tensor types. The same implicit lower
-            // bound used to check the callee body must hold for each inferred
-            // or explicitly bound dimension at this source call.
-            for (ordinal, name) in sig.shape_params.iter().enumerate() {
-                let symbol = sig.shape_symbols[ordinal];
-                let admits_zero = sig.predicates.iter().any(|predicate| {
-                    matches!(predicate, super::ir::Predicate::NonNegative(value)
-                        if matches!(sig.arena.view((*value).into()),
-                            crate::expr::NodeView::Symbol(found) if found == symbol))
-                });
-                let lower = self.arena.int(if admits_zero { 0 } else { 1 });
-                let actual = binding.shapes[name];
-                if !super::prove::le(&mut self.arena, &self.facts, lower, actual) {
-                    return Err(format!("shape parameter `{name}` does not prove its required lower bound at this call"));
-                }
-            }
-        }
-        // A dimension is a callee formal value. Construct it from the one
-        // completed argument descriptor observed by the checker, rather than
-        // replaying an expression in the caller's symbolic arena.
-        let mut available = std::collections::HashSet::new();
-        for (index, (name, _)) in explicit.iter().enumerate() {
-            let ordinal = sig.shape_params.iter().position(|parameter| parameter == name)
-                .expect("validated explicit dimension");
-            if available.insert(ordinal) {
-                binding.shape_plan.push((ordinal as u32, ShapeBindingPlan::Explicit { binding: index }));
-            }
-        }
-        for (formal_extent, observation) in &binding.observations {
-            let Some(name) = single_dimension(&sig.arena, &sig.shape_params,
-                &sig.shape_symbols, *formal_extent) else { continue };
-            let ordinal = sig.shape_params.iter().position(|parameter| parameter == &name)
-                .expect("single dimension belongs to signature");
-            if available.insert(ordinal) {
-                binding.shape_plan.push((ordinal as u32, ShapeBindingPlan::Inferred {
-                    observation: observation.clone(),
-                    formal_axis: *formal_extent,
-                    coefficient: 1,
-                    prior_dimensions: Vec::new(),
-                }));
-            }
-        }
-        loop {
-            let mut changed = false;
-            for (formal_extent, observation) in &binding.observations {
-                let missing = super::prove::symbols(&sig.arena, *formal_extent)
-                    .into_iter()
-                    .filter_map(|symbol| sig.shape_symbols.iter().position(|candidate| *candidate == symbol))
-                    .filter(|ordinal| !available.contains(ordinal))
-                    .collect::<Vec<_>>();
-                let [ordinal] = missing.as_slice() else { continue };
-                let mut arena = crate::expr::ExprArena::new();
-                let mapped = sig.shape_symbols.iter().map(|source| {
-                    let (_, symbol, value) = arena.loop_binder();
-                    (*source, symbol, value)
-                }).collect::<Vec<_>>();
-                let mut map = |symbol: SymbolId, _: &mut crate::expr::ExprArena| {
-                    AnyExpr::Int(mapped.iter().find(|(source, _, _)| *source == symbol)
-                        .expect("signature extent contains an undeclared dimension").2)
-                };
-                let expression = super::xfer::transfer_int(&sig.arena, *formal_extent, &mut arena, &mut map);
-                let symbol = mapped[*ordinal].1;
-                let Some((coefficient, rest)) = super::prove::linear_in(&mut arena, expression, symbol)
-                    else { continue };
-                if coefficient == 0 || super::prove::mentions(&arena, rest, symbol) {
-                    continue;
-                }
-                let prior_dimensions = super::prove::symbols(&sig.arena, *formal_extent)
-                    .into_iter()
-                    .filter_map(|symbol| sig.shape_symbols.iter().position(|candidate| *candidate == symbol))
-                    .filter(|other| other != ordinal)
-                    .map(|other| other as u32)
-                    .collect();
-                if available.insert(*ordinal) {
-                    binding.shape_plan.push((*ordinal as u32, ShapeBindingPlan::Inferred {
-                        observation: observation.clone(),
-                        formal_axis: *formal_extent,
-                        coefficient,
-                        prior_dimensions,
-                    }));
-                    changed = true;
-                }
-            }
-            if !changed { break; }
-        }
-        if let Some((_, name)) = sig.shape_params.iter().enumerate()
-            .find(|(ordinal, _)| !available.contains(ordinal)) {
-            return Err(format!("shape parameter `{name}` needs an explicit binding or an observed tensor axis"));
-        }
-        // Index parameters: symbolic arguments are proved inside the bound; data-dependent
-        // arguments keep a runtime obligation.
-        for (param, ordinal) in sig.params.iter().zip(&order) {
-            let (ValueType::Index { bound }, Some(value)) = (&param.ty, &args[*ordinal].sym) else {
-                continue;
-            };
-            let bound = self.substitute(sig, *bound, &binding)?;
-            let data_dependent = super::prove::symbols(&self.arena, *value)
-                .iter()
-                .any(|symbol| {
-                    !self.sig.shape_symbols.contains(symbol)
-                        && self.facts.upper_of(*symbol).is_none()
-                });
-            let zero = self.arena.int(0);
-            let proved = super::prove::le(&mut self.arena, &self.facts, zero, *value)
-                && super::prove::lt(&mut self.arena, &self.facts, *value, bound);
-            if !proved && !data_dependent {
-                return Err(format!(
-                    "parameter `{}` has an index bound that is not provable here",
-                    param.name
-                ));
-            }
-        }
-        let mut applicability_proven = true;
-        for predicate in &sig.predicates {
-            let expression = match predicate {
-                super::ir::Predicate::NonNegative(expression)
-                | super::ir::Predicate::Zero(expression)
-                | super::ir::Predicate::NonZero(expression) => {
-                    self.substitute(sig, *expression, &binding)?
-                }
-            };
-            let proved = match predicate {
-                super::ir::Predicate::NonNegative(_) => {
-                    super::prove::nonneg(&self.arena, &self.facts, expression)
-                }
-                super::ir::Predicate::Zero(_) => {
-                    super::prove::zero(&self.arena, &self.facts, expression)
-                }
-                super::ir::Predicate::NonZero(_) => {
-                    let zero = self.arena.int(0);
-                    super::prove::lt(&mut self.arena, &self.facts, zero, expression)
-                        || super::prove::lt(&mut self.arena, &self.facts, expression, zero)
-                }
-            };
-            if !proved {
-                applicability_proven = false;
-                if enforce_precondition {
-                    return Err("has a `where` precondition that is not provable at this call site; guard the call explicitly".into());
-                }
-            }
-        }
-        Ok((order, binding, applicability_proven))
+        Err(reasons)
     }
 
     fn user_call(
@@ -1786,106 +1497,48 @@ impl<'a> Checker<'a> {
     ) -> Option<CheckedExpr> {
         let resolved = self.env.resolved;
         let Some(families) = resolved.by_name.get(&name.name) else {
-            self.error(name.span, format!("`{}` is not declared", name.name));
-            return None;
-        };
-        let caller_target = self.target;
-        let mut definitions: Vec<usize> = families
-            .iter()
-            .flat_map(|f| {
-                let family = &resolved.families[*f];
-                let has_portable = family.bodies.iter().any(|id| {
-                    matches!(
-                        resolved.declared[id.index()].kind,
-                        DefKind::Body { target: None }
-                    )
-                });
-                let bodies = family.bodies.iter().filter(move |id| {
-                    match &resolved.declared[id.index()].kind {
-                        DefKind::Body { target: None } => has_portable,
-                        DefKind::Body {
-                            target: Some(target),
-                        } => !has_portable && caller_target == Some(*target),
-                        DefKind::Lower { .. } => false,
-                    }
-                });
-                bodies
-                    .chain(family.lowerings.iter().filter(move |_| has_portable))
-                    .map(|id| id.index())
-            })
-            .collect();
-        definitions.sort_unstable();
-        // The semantic call product is defined by a portable reference body.
-        // A target-only family has no such contract, so it cannot be spliced
-        // as a source helper until it owns a complete call contract.
-        definitions.retain(|definition| {
-            let family = &resolved.families[resolved.declared[*definition].family.index()];
-            family.bodies.iter().any(|body| {
-                matches!(resolved.declared[body.index()].kind, DefKind::Body { target: None })
-            })
-        });
-        if definitions.is_empty() {
-            let available: Vec<&str> = families
-                .iter()
-                .flat_map(|f| resolved.families[*f].bodies.iter())
-                .filter_map(|id| resolved.declared[id.index()].kind.target())
-                .map(|target| target.as_str())
-                .collect();
-            let context = self
-                .target
-                .map(|target| target.as_str())
-                .unwrap_or("portable");
-            self.error(span, format!("`{}` has no portable reference contract callable from {context} code; backend-specific implementations are available for {}", name.name, available.join(", ")));
-            return None;
-        }
-        if matches!(self.kind, DefKind::Lower { .. })
-            && families.contains(&resolved.declared[self.def].family.index())
-        {
             self.error(
-                span,
-                format!(
-                    "a lowering of `{}` cannot recursively call the function it implements",
-                    name.name
-                ),
+                DiagnosticRule::Resolution,
+                name.span,
+                format!("`{}` is not declared", name.name),
             );
             return None;
+        };
+        // Seeds execute before the value arguments.
+        let mut seeds = Vec::new();
+        for (parameter, value) in bindings {
+            let value = self.expr(value, Some(&ValueType::Integer))?;
+            if !matches!(
+                value.ty,
+                ValueType::Integer | ValueType::Index { .. } | ValueType::Scalar(DType::I32 | DType::U32)
+            ) {
+                let shown = self.shown(&value.ty);
+                self.error(
+                    DiagnosticRule::Dimension,
+                    value.span,
+                    format!("a dimension binding is an integer, found {shown}"),
+                );
+                return None;
+            }
+            self.position_symbol(&value)?;
+            seeds.push((parameter.clone(), value));
         }
-
-        // Explicit shape bindings execute before the value arguments. Retain
-        // their checked producers as well as the symbolic unification values.
-        let mut explicit: Vec<(String, IntExpr)> = Vec::new();
-        let mut explicit_shapes = Vec::new();
-        for (param, value) in bindings {
-            let value = self.expr(value, Some(&ValueType::Scalar(DType::I32)))?;
-            let extent = match value.sym {
-                Some(sym) => sym,
-                None => {
-                    self.error(value.span, "a shape binding is a symbolic integer expression");
-                    return None;
-                }
-            };
-            self.numeric_use(extent);
-            explicit.push((param.name.clone(), extent));
-            explicit_shapes.push((param.name.clone(), value));
-        }
-
-        // Arguments are checked once, with scalar hints and write positions from
-        // the first definition whose parameter list the call can bind.
-        let guide = definitions
-            .iter()
-            .map(|d| &resolved.declared[*d].sig)
-            .find_map(|sig| {
-                Self::arg_order(sig, ast_args)
-                    .ok()
-                    .map(|order| (sig, order))
-            });
+        // Arguments are checked once, with scalar hints and write positions
+        // from the first family whose contract the call can bind.
+        let guide = families.iter().find_map(|family| {
+            let contract = resolved.families[*family].contract.index();
+            let outcome = self.env.checked.get(contract)?.as_ref()?;
+            Self::arg_order(&outcome.signature.params, ast_args)
+                .ok()
+                .map(|order| (outcome, order))
+        });
         let mut args = Vec::new();
         for (ordinal, arg) in ast_args.iter().enumerate() {
-            let param = guide.as_ref().and_then(|(sig, order)| {
+            let param = guide.as_ref().and_then(|(outcome, order)| {
                 order
                     .iter()
                     .position(|o| *o == ordinal)
-                    .map(|slot| &sig.params[slot])
+                    .map(|slot| &outcome.signature.params[slot])
             });
             let hint = param
                 .and_then(|p| p.ty.scalar_dtype())
@@ -1894,75 +1547,220 @@ impl<'a> Checker<'a> {
                 param.is_some_and(|p| p.ownership == ParamOwnership::Exclusive);
             args.push(self.expr_inner(&arg.value, hint.as_ref(), write_only_candidate)?);
         }
-
-        let mut candidates: Vec<(usize, Vec<usize>, Binding, bool)> = Vec::new();
-        let mut reasons: Vec<String> = Vec::new();
-        for d in &definitions {
-            let family = &resolved.families[resolved.declared[*d].family.index()];
-            let enforce_precondition = family.contract.index() == *d;
-            match self.bind_candidate(
-                &resolved.declared[*d].sig,
-                enforce_precondition,
-                &explicit,
-                ast_args,
-                &args,
-            ) {
-                Ok((order, binding, proved)) => candidates.push((*d, order, binding, proved)),
-                Err(reason) => reasons.push(reason),
-            }
-        }
-        let Some(family) = candidates
-            .first()
-            .map(|(d, _, _, _)| resolved.declared[*d].family)
-        else {
-            reasons.dedup();
-            self.error(
-                span,
-                format!(
-                    "no definition of `{}` accepts these arguments: {}",
-                    name.name,
-                    reasons.join("; ")
-                ),
-            );
-            return None;
-        };
-        candidates.retain(|(d, _, _, _)| resolved.declared[*d].family == family);
-
-        let Some((first, first_order, first_binding, _)) = candidates.first() else {
-            self.error(
-                span,
-                format!(
-                    "no definition of `{}` remains applicable to these arguments",
-                    name.name
-                ),
-            );
-            return None;
-        };
-        let first_sig = &resolved.declared[*first].sig;
-        let result = match self.substitute_ty(first_sig, &first_sig.result, first_binding) {
-            Ok(ty) => ty,
-            Err(reason) => {
+        let (family, order, elements) = match self.select_family(name, families, ast_args, &args) {
+            Ok(selected) => selected,
+            Err(mut reasons) => {
+                reasons.dedup();
                 self.error(
+                    DiagnosticRule::Type,
                     span,
                     format!(
-                        "the result of `{}` is not expressible at this call: {reason}",
-                        name.name
+                        "no definition of `{}` accepts these arguments: {}",
+                        name.name,
+                        reasons.join("; ")
                     ),
                 );
                 return None;
             }
         };
-
-        // Logical ownership is checked at the static call boundary. Borrows end
-        // with the call in this foundation; `let`-bound view borrows are tracked
-        // separately by the body checker.
-        let mut arguments = Vec::new();
-        for (parameter, ordinal) in first_sig.params.iter().zip(first_order) {
-            super::ownership::argument_leaves(
-                &parameter.ownership,
-                &args[*ordinal],
-                &mut arguments,
+        let contract = resolved.families[family].contract.index();
+        let Some(Some(outcome)) = self.env.checked.get(contract) else {
+            unreachable!("a callee is checked before its caller (L20)")
+        };
+        // Cascade suppression: a contract whose own check failed has its
+        // diagnostics; its call is not checked further.
+        if !outcome.diagnostics.is_empty() {
+            return None;
+        }
+        let plan = outcome
+            .plan
+            .as_ref()
+            .expect("a family contract without diagnostics has its dimension plan");
+        let dimension_symbols = outcome
+            .signature
+            .dimensions
+            .iter()
+            .map(|dimension| dimension.symbol)
+            .collect::<Vec<_>>();
+        let mut seeded = Vec::new();
+        for (parameter, value) in &seeds {
+            let Some(ordinal) = outcome
+                .signature
+                .dimensions
+                .iter()
+                .position(|dimension| dimension.name == parameter.name)
+            else {
+                self.error(
+                    DiagnosticRule::Dimension,
+                    parameter.span,
+                    format!("`{}` has no dimension `{}`", name.name, parameter.name),
+                );
+                return None;
+            };
+            let value = value.sym.expect("a checked seed has its symbol");
+            seeded.push((u32::try_from(ordinal).expect("dimension ordinal fits u32"), value));
+        }
+        // L16: the family plan solves every dimension from the actual axes.
+        let actual_axes = |axis: &dimensions::ObservedAxis| {
+            let mut ty = &args[order[axis.parameter as usize]].ty;
+            for &index in &axis.path {
+                let ValueType::Tuple(parts) = ty else {
+                    unreachable!("an observed axis path selects tuple components")
+                };
+                ty = &parts.as_slice()[index as usize];
+            }
+            ty.shaped().expect("an observed axis is a tensor axis").axes[axis.axis as usize]
+        };
+        let values = match dimensions::apply_at_call(
+            plan,
+            &outcome.arena,
+            &mut self.arena,
+            &actual_axes,
+            &seeded,
+        ) {
+            Ok(values) => values,
+            Err(DimensionCallError::InexactDivision { dimension }) => {
+                let dimension = outcome.signature.dimensions[dimension as usize].name.clone();
+                self.error(
+                    DiagnosticRule::Dimension,
+                    span,
+                    format!(
+                        "dimension `{dimension}` of `{}` is not an exact quotient of these argument axes; bind it with `{}[{dimension} = …](…)`",
+                        name.name, name.name
+                    ),
+                );
+                return None;
+            }
+        };
+        let seed_ordinals = seeded.iter().map(|(ordinal, _)| *ordinal).collect::<Vec<_>>();
+        // Every formal axis equals its actual axis under the solved dimensions.
+        let params = outcome.signature.params.clone();
+        for (parameter_ordinal, parameter) in params.iter().enumerate() {
+            let formal_axes = dimensions::tensor_axes(parameter_ordinal as u32, &parameter.ty);
+            for (axis, formal) in formal_axes {
+                let expected = substitute(&outcome.arena, &dimension_symbols, &values, &mut self.arena, formal);
+                let actual = actual_axes(&axis);
+                if !self.same_extent(expected, actual) {
+                    let (expected, actual) = (self.render(expected), self.render(actual));
+                    let seeded_here = super::prove::symbols(&outcome.arena, formal)
+                        .into_iter()
+                        .filter_map(|symbol| outcome.signature.dimension_of(symbol))
+                        .any(|ordinal| seed_ordinals.contains(&(ordinal as u32)));
+                    let cause = if seeded_here { "the dimension binding" } else { "the other arguments" };
+                    self.error(
+                        DiagnosticRule::Dimension,
+                        args[order[parameter_ordinal]].span,
+                        format!(
+                            "argument `{}` of `{}` needs axis `{expected}` from {cause}, found `{actual}`",
+                            parameter.name, name.name
+                        ),
+                    );
+                    return None;
+                }
+            }
+        }
+        // Positivity and the contract's `where` at this call (L2).
+        for (ordinal, dimension) in outcome.signature.dimensions.iter().enumerate() {
+            let lower = self.arena.int(if dimension.admits_zero { 0 } else { 1 });
+            let slack = self.arena.int_sub(values[ordinal], lower);
+            if !super::prove::nonneg(&self.arena, &self.facts, slack) {
+                let rendered = self.render(values[ordinal]);
+                self.error(
+                    DiagnosticRule::CallContract,
+                    span,
+                    format!(
+                        "`{}` requires dimension `{}` = `{rendered}` to be at least {} at this call; guard the call",
+                        name.name,
+                        dimension.name,
+                        if dimension.admits_zero { 0 } else { 1 }
+                    ),
+                );
+                return None;
+            }
+        }
+        for conjunct in outcome.signature.predicates.clone() {
+            let expression = substitute(
+                &outcome.arena,
+                &dimension_symbols,
+                &values,
+                &mut self.arena,
+                conjunct.predicate.expression(),
             );
+            let proved = match conjunct.predicate {
+                Predicate::NonNegative(_) => super::prove::nonneg(&self.arena, &self.facts, expression),
+                Predicate::Zero(_) => super::prove::zero(&self.arena, &self.facts, expression),
+                Predicate::NonZero(_) => self.facts.nonzero(&mut self.arena, expression),
+            };
+            if !proved {
+                let file = resolved.declared[contract].file;
+                let text = &self.env.texts[file]
+                    [conjunct.span.start as usize..conjunct.span.end as usize];
+                self.error(
+                    DiagnosticRule::CallContract,
+                    span,
+                    format!("`{}` requires `{text}` at this call; guard the call", name.name),
+                );
+                return None;
+            }
+        }
+        // L17, L31: index and range arguments by subsumption or position proof.
+        for (parameter, ordinal) in params.iter().zip(&order) {
+            let formal = substitute_type(
+                &outcome.arena,
+                &dimension_symbols,
+                &values,
+                &elements.arguments,
+                &mut self.arena,
+                &parameter.ty,
+            );
+            let argument = args[*ordinal].clone();
+            let checked = match (&formal, &argument.ty) {
+                (ValueType::Index { bound }, ValueType::Index { bound: actual }) => {
+                    let slack = self.arena.int_sub(*bound, *actual);
+                    if super::prove::nonneg(&self.arena, &self.facts, slack) {
+                        argument
+                    } else {
+                        let span = argument.span;
+                        self.index_position(argument, *bound, span)?
+                    }
+                }
+                (ValueType::Index { bound }, _) => {
+                    let span = argument.span;
+                    self.index_position(argument, *bound, span)?
+                }
+                (ValueType::Range { bound }, ValueType::Range { bound: actual }) => {
+                    let slack = self.arena.int_sub(*bound, *actual);
+                    if !super::prove::nonneg(&self.arena, &self.facts, slack) {
+                        let (formal, actual) = (self.render(*bound), self.render(*actual));
+                        self.error(
+                            DiagnosticRule::Type,
+                            argument.span,
+                            format!(
+                                "parameter `{}` takes `range[{formal}]`; this range ends at `{actual}`; prove `{actual} <= {formal}` in scope",
+                                parameter.name
+                            ),
+                        );
+                        return None;
+                    }
+                    self.range_endpoints(argument, *bound)?
+                }
+                _ => argument,
+            };
+            args[*ordinal] = checked;
+        }
+        let result = substitute_type(
+            &outcome.arena,
+            &dimension_symbols,
+            &values,
+            &elements.arguments,
+            &mut self.arena,
+            &outcome.signature.result,
+        );
+
+        // Logical ownership is checked at the static call boundary.
+        let mut arguments = Vec::new();
+        for (parameter, ordinal) in params.iter().zip(&order) {
+            super::ownership::argument_leaves(&parameter.ownership, &args[*ordinal], &mut arguments);
         }
         let mut accesses: Vec<(super::ownership::LocalPlace, ParamOwnership)> = Vec::new();
         let mut moves = std::collections::BTreeSet::new();
@@ -1974,13 +1772,14 @@ impl<'a> Checker<'a> {
                 let (_, taken) = match self.owned_consumption(argument) {
                     Ok(value) => value,
                     Err(error) => {
-                        self.error(argument.span, error);
+                        self.error(DiagnosticRule::Ownership, argument.span, error);
                         return None;
                     }
                 };
                 for place in taken {
                     if !moves.insert(place.clone()) {
                         self.error(
+                            DiagnosticRule::Ownership,
                             argument.span,
                             "owned tensor leaf is moved into multiple arguments",
                         );
@@ -1998,6 +1797,7 @@ impl<'a> Checker<'a> {
                     continue;
                 }
                 self.error(
+                    DiagnosticRule::Ownership,
                     argument.span,
                     "tensor parameter requires an actual tensor place",
                 );
@@ -2005,6 +1805,7 @@ impl<'a> Checker<'a> {
             };
             if *ownership == ParamOwnership::Exclusive && !self.writable_place(&root) {
                 self.error(
+                    DiagnosticRule::Ownership,
                     argument.span,
                     "tensor place does not permit exclusive access",
                 );
@@ -2015,6 +1816,7 @@ impl<'a> Checker<'a> {
                     && !(*mode == ParamOwnership::Shared && *ownership == ParamOwnership::Shared)
             }) {
                 self.error(
+                    DiagnosticRule::Ownership,
                     argument.span,
                     "overlapping tensor arguments cannot combine owned or exclusive access",
                 );
@@ -2025,34 +1827,7 @@ impl<'a> Checker<'a> {
         for place in moves {
             self.consume_place(&place);
         }
-
-        // Calling a backend-specific helper is itself a use of every capability
-        // promised by that helper. The caller must therefore declare a superset;
-        // portable family calls do not inherit requirements from selectable lowerings.
-        let helper_requirements: Vec<_> = candidates
-            .iter()
-            .filter(|(definition, _, _, _)| {
-                matches!(
-                    resolved.declared[*definition].kind,
-                    DefKind::Body { target: Some(_) }
-                )
-            })
-            .flat_map(|(definition, _, _, _)| {
-                resolved.declared[*definition]
-                    .requires
-                    .iter()
-                    .map(|(capability, _)| capability.clone())
-            })
-            .collect();
-        for capability in helper_requirements {
-            self.use_capability(
-                &capability,
-                span,
-                &format!("backend-specific helper `{}`", name.name),
-            );
-        }
-
-        // Validate mutations of `inout` parameters.
+        // Mutations of `&mut` parameters.
         for (mode, arg) in arguments {
             if mode != ParamOwnership::Exclusive {
                 continue;
@@ -2064,16 +1839,17 @@ impl<'a> Checker<'a> {
             let binding_local = match &arg.kind {
                 CheckedExprKind::Local(v) => Some(*v),
                 CheckedExprKind::Primitive {
-                    id:
-                        PrimitiveId::SliceView { .. } | PrimitiveId::Reshape | PrimitiveId::Transpose,
+                    id: PrimitiveId::SliceView { .. } | PrimitiveId::Reshape | PrimitiveId::Transpose,
                     operands,
+                    ..
                 } => base_local(operands),
                 _ => self.value_place(&arg).map(|place| place.local),
             };
             let Some(binding_local) = binding_local else {
                 self.error(
+                    DiagnosticRule::Ownership,
                     arg.span,
-                    "an `inout` argument must name a tensor binding or a selection of one",
+                    "a `&mut` argument must name a tensor binding or a selection of one",
                 );
                 return None;
             };
@@ -2081,69 +1857,66 @@ impl<'a> Checker<'a> {
             self.write(storage_root, binding_local, arg.span)?;
         }
 
-        let mut site = Vec::new();
-        for (d, order, binding, applicability_proven) in &candidates {
-            let sig = &resolved.declared[*d].sig;
-            let summary = &self.env.summaries[*d];
-            let mut shape_args = Vec::new();
-            for p in &sig.shape_params {
-                let Some(extent) = binding.shapes.get(p) else {
-                    continue;
-                };
-                if let Some(own) = single_dimension(
-                    &self.arena,
-                    &self.sig.shape_params,
-                    &self.sig.shape_symbols,
-                    *extent,
-                ) {
-                    self.summary.passes.push((*d, p.clone(), own));
-                }
-                shape_args.push(*extent);
-            }
-            let elem_args = sig
-                .elem_params
+        // The members that apply at this call: the contract, then every
+        // member whose elements unify and whose placement this call site
+        // does not exclude. Initialization applicability is decided by the
+        // initialization pass.
+        let context = CallContext {
+            enclosing_parallel: !self.logical_parallel.is_empty(),
+            participant_uniform: self.participant_uniform(),
+        };
+        let callee_domain = outcome.element_domain.clone();
+        let contract_arguments = elements
+            .arguments
+            .iter()
+            .map(|(name, element)| (name.clone(), element.clone()))
+            .collect::<Vec<_>>();
+        self.elements.call(&callee_domain, &contract_arguments);
+        let members = &resolved.families[family];
+        let mut candidates = Vec::new();
+        for member in std::iter::once(members.contract)
+            .chain(members.bodies.iter().copied().filter(|body| *body != members.contract))
+            .chain(members.lowerings.iter().copied())
+        {
+            let Some(Some(member_outcome)) = self.env.checked.get(member.index()) else {
+                unreachable!("a family member is checked before its callers (L20)")
+            };
+            let mut member_elements = Elements::default();
+            let unified = member_outcome
+                .signature
+                .params
                 .iter()
-                .filter_map(|p| binding.elems.get(p).map(|e| (p.clone(), e.clone())))
-                .collect();
-            let mut shape_plan = binding.shape_plan.clone();
-            if let Some(checked) = self.env.checked.get(*d).and_then(Option::as_ref) {
-                for (_, step) in &mut shape_plan {
-                    let ShapeBindingPlan::Inferred { observation, formal_axis, .. } = step else {
-                        continue;
-                    };
-                    let ShapeObservation::TensorAxis { parameter, path, axis, .. } = observation;
-                    let mut ty = &checked.signature.params[*parameter].ty;
-                    for &index in path.iter() {
-                        let ValueType::Tuple(parts) = ty else {
-                            unreachable!("checked shape plan names a non-tuple formal path")
-                        };
-                        ty = parts.iter().nth(index as usize)
-                            .expect("checked shape plan tuple path is in bounds");
-                    }
-                    let ValueType::Tensor(tensor) = ty else {
-                        unreachable!("checked shape plan names a non-tensor formal")
-                    };
-                    *formal_axis = tensor.axes[*axis as usize];
-                }
+                .zip(&order)
+                .all(|(parameter, ordinal)| member_elements.unify_type(&parameter.ty, &args[*ordinal].ty));
+            if !unified {
+                continue;
             }
-            site.push(CandidateBinding {
-                definition: crate::ids::FunctionId::new(
-                    resolved.declared[*d].family.program(),
-                    u32::try_from(*d).expect("definition ordinal exceeds u32::MAX"),
-                ),
-                shape_args,
-                shape_plan,
+            if member != members.contract && member_outcome.placement.excluded_by(context) {
+                continue;
+            }
+            let mut elem_args = member_elements
+                .arguments
+                .into_iter()
+                .collect::<Vec<_>>();
+            elem_args.sort_by(|a, b| a.0.cmp(&b.0));
+            candidates.push(Candidate {
+                definition: member,
                 elem_args,
-                arg_order: order.clone(),
-                requires_elems: binding.requires.clone(),
-                applicability_proven: *applicability_proven,
+                requires_elems: member_elements.requires,
             });
-            let _ = summary;
         }
+        let seeds = seeds
+            .into_iter()
+            .zip(&seeded)
+            .map(|((_, value), (ordinal, _))| (*ordinal, value))
+            .collect();
         let call = CheckedCall {
-            family,
-            explicit_shapes,
-            candidates: site,
+            family: resolved.declared[contract].family,
+            seeds,
+            arg_order: order,
+            dimensions: values,
+            context,
+            candidates,
             span,
         };
         Some(CheckedExpr::new(
@@ -2156,160 +1929,67 @@ impl<'a> Checker<'a> {
             span,
         ))
     }
-}
 
-fn positional_3(args: &[ast::Arg]) -> bool {
-    args.len() == 3 && args.iter().all(|a| a.name.is_none())
-}
-
-/// Whether an argument type satisfies one declared capability argument.
-/// A rank-two tensor argument matches a rank-two symbolic-axes declaration;
-/// scalars match exactly up to the shared float widening of one call.
-fn capability_argument_matches(param: &crate::registry::OperandCategory, arg: &ValueType) -> bool {
-    match (param, arg) {
-        (crate::registry::OperandCategory::Scalar(expected), ValueType::Scalar(actual)) => {
-            expected == actual
+    /// A `range[bound]` argument built as `lo..hi` from words: each word
+    /// endpoint is marked at its position (L31); the endpoints were proved in
+    /// `0 <= lo <= hi` and the bound by subsumption.
+    fn range_endpoints(&mut self, argument: CheckedExpr, bound: IntExpr) -> Option<CheckedExpr> {
+        let CheckedExpr {
+            kind:
+                CheckedExprKind::Primitive {
+                    id: PrimitiveId::RangeMake,
+                    operands,
+                    failure,
+                },
+            ty,
+            sym,
+            span,
+        } = argument
+        else {
+            return Some(argument);
+        };
+        let one = self.arena.int(1);
+        let past = self.arena.int_add(bound, one);
+        let mut marked = Vec::new();
+        for endpoint in operands {
+            if matches!(endpoint.ty, ValueType::Scalar(DType::I32 | DType::U32)) {
+                let span = endpoint.span;
+                // An endpoint lies in `0..=bound`: an index of `bound + 1`.
+                marked.push(self.index_position(endpoint, past, span)?);
+            } else {
+                marked.push(endpoint);
+            }
         }
-        (
-            crate::registry::OperandCategory::Readable {
-                representation,
-                rank,
+        Some(CheckedExpr::new(
+            CheckedExprKind::Primitive {
+                id: PrimitiveId::RangeMake,
+                operands: marked,
+                failure,
             },
-            ValueType::Tensor(tensor),
-        )
-        | (
-            crate::registry::OperandCategory::Writable {
-                representation,
-                rank,
-            },
-            ValueType::Tensor(tensor),
-        ) => {
-            u32::try_from(tensor.rank()).ok() == Some(*rank)
-                && match tensor.elem {
-                    Elem::Dtype(dtype) => crate::registry::dense(dtype) == *representation,
-                    Elem::Repr(actual) => actual == *representation,
-                    Elem::Param(_) => false,
-                }
-        }
-        (
-            crate::registry::OperandCategory::Opaque { capability, name },
-            ValueType::Opaque {
-                capability: actual,
-                name: actual_name,
-            },
-        ) => capability == actual && name == actual_name,
-        (crate::registry::OperandCategory::Constant(dtype), ValueType::Scalar(actual)) => {
-            dtype == actual
-        }
-        _ => false,
-    }
-}
-
-fn intrinsic_result_type(result: &crate::registry::IntrinsicResultType) -> ValueType {
-    match result {
-        crate::registry::IntrinsicResultType::Void => ValueType::Void,
-        crate::registry::IntrinsicResultType::Scalar(dtype) => ValueType::Scalar(*dtype),
-        crate::registry::IntrinsicResultType::Opaque { capability, name } => ValueType::Opaque {
-            capability: *capability,
-            name,
-        },
-        crate::registry::IntrinsicResultType::Owned { .. } => {
-            panic!("shape-producing intrinsic requires a semantic-specific checker rule")
-        }
+            ty,
+            sym,
+            span,
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::checked::{check_source, SourceFile, SourceSet};
-    use crate::entry::{ElementBindings, SemanticNodeView};
-    use crate::interp::{Arg, Interpreter, OutcomeValue, TensorData};
-    use crate::intrinsics::{MathOp, PrimitiveId};
-    use crate::types::DType;
 
     #[test]
-    fn exp_fast_spelling_has_the_checked_and_reference_meaning_of_exp() {
-        for (dtype, words) in [
-            (
-                DType::F32,
-                vec![
-                    0,
-                    0x8000_0000,
-                    1,
-                    0x8000_0001,
-                    0x3f80_0000,
-                    0xbf80_0000,
-                    0x42aa_0000,
-                    0xc2c8_0000,
-                    0x7f80_0000,
-                    0xff80_0000,
-                    0x7f80_0001,
-                    0xffc0_1234,
-                ],
-            ),
-            (
-                DType::F16,
-                vec![
-                    0, 0x8000, 1, 0x8001, 0x3c00, 0xbc00, 0x7c00, 0xfc00, 0x7c01, 0xfe23,
-                ],
-            ),
-            (
-                DType::BF16,
-                vec![
-                    0, 0x8000, 1, 0x8001, 0x3f80, 0xbf80, 0x7f80, 0xff80, 0x7f81, 0xffe3,
-                ],
-            ),
-        ] {
-            let bytes: Vec<_> = words
-                .iter()
-                .flat_map(|word: &u32| word.to_le_bytes().into_iter().take(dtype.bytes() as usize))
-                .collect();
-            let mut results = Vec::new();
-            for spelling in ["exp", "exp_fast"] {
-                let module = check_source(SourceSet::new(vec![SourceFile {
-                    path: "exponential.seismic".into(),
-                    text: format!(
-                        "fn probe[N](x: &tensor[N] {dtype}) -> tensor[N] {dtype}:\n    return {spelling}(x)\n"
-                    ),
-                }]))
-                .unwrap();
-                let entry = module
-                    .entry(
-                        module.entry_named("probe").unwrap(),
-                        &ElementBindings::default(),
-                    )
-                    .unwrap();
-                let program = entry.program();
-                let body = program.function(program.family(program.root()).reference().function());
-                let math: Vec<_> = body
-                    .nodes(body.root())
-                    .filter_map(|(_, node)| match node.view() {
-                        SemanticNodeView::Primitive {
-                            primitive: PrimitiveId::Math(op),
-                            ..
-                        }
-                        | SemanticNodeView::Elementwise {
-                            primitive: PrimitiveId::Math(op),
-                            ..
-                        } => Some(*op),
-                        _ => None,
-                    })
-                    .collect();
-                assert_eq!(math, [MathOp::Exp]);
-                let mut interpreter = Interpreter::new(&entry);
-                let input = interpreter.add_tensor(
-                    TensorData::dense_from_bytes(dtype, vec![words.len()], bytes.clone()).unwrap(),
-                );
-                let outcome = interpreter.run(&[Arg::Tensor(input)]).unwrap();
-                let result = outcome.results().next().unwrap();
-                let OutcomeValue::Tensor(value) = result.value() else {
-                    panic!("tensor result")
-                };
-                results.push(value.canonical_bytes().unwrap().unwrap().to_vec());
-            }
-            assert_eq!(
-                results[0], results[1],
-                "{dtype} source spelling changed reference bits"
+    fn retired_spellings_are_unknown_names() {
+        for spelling in ["exp_fast", "load", "clone", "decode"] {
+            let error = check_source(SourceSet::new(vec![SourceFile {
+                path: "retired.seismic".into(),
+                text: format!(
+                    "fn probe[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return {spelling}(x)\n"
+                ),
+            }]))
+            .expect_err("a retired spelling is not a builtin");
+            assert!(
+                error.to_string().contains(&format!("`{spelling}` is not declared")),
+                "{spelling}: {error}"
             );
         }
     }

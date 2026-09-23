@@ -1,0 +1,22 @@
+# origin: test:seismic-runtime:runtime/src/feedback/reduction_tests.rs:range_endpoints
+# invoke: f32[4]=1,2,3,4 ; range:0..0
+# pin: result = f32[]=0
+# invoke: f32[4]=1,2,3,4 ; range:2..2
+# pin: result = f32[]=0
+# invoke: f32[4]=1,2,3,4 ; range:0..1
+# pin: result = f32[]=1
+# invoke: f32[4]=1,2,3,4 ; range:1..3
+# pin: result = f32[]=5
+# invoke: f32[4]=1,2,3,4 ; range:0..4
+# pin: result = f32[]=10
+fn probe(x: &tensor[4] f32, times: range[4]) -> f32:
+    return sum_range(x, times)
+
+fn element(x: &tensor[4] f32, i: index[4]) -> f32:
+    return x[i]
+
+fn sum_range(x: &tensor[4] f32, times: range[4]) -> f32:
+    let mut total = 0.0
+    for i in times:
+        total = total + element(x, i)
+    return total

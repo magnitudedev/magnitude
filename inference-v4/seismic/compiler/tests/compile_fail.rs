@@ -22,7 +22,7 @@ const CASES: &[Case] = &[
     },
     Case {
         name: "checked_module_literal",
-        diagnostic: "cannot construct `CheckedModule` with struct literal syntax",
+        diagnostic: "cannot construct `CheckedModule` with struct literal syntax due to private fields",
     },
     Case {
         name: "planning_authority",
@@ -30,7 +30,7 @@ const CASES: &[Case] = &[
     },
     Case {
         name: "kernel_handle_literal",
-        diagnostic: "of struct `ScalarId` are private",
+        diagnostic: "cannot construct `PortableValue` with struct literal syntax due to private fields",
     },
     Case {
         name: "raw_assignment_freeze",
@@ -46,7 +46,7 @@ const CASES: &[Case] = &[
     },
     Case {
         name: "implementation_builder_literal",
-        diagnostic: "field `inner` of struct `ImplementationBuilder` is private",
+        diagnostic: "struct `ImplementationBuilder` is private",
     },
     Case {
         name: "executable_kernel_enumeration",
@@ -58,12 +58,12 @@ const CASES: &[Case] = &[
     },
     Case {
         name: "execution_environment_literal",
-        diagnostic: "of struct `ExecutionEnvironment` are private",
+        diagnostic:
+            "cannot construct `ExecutionEnvironment<'_, _, _, _>` with struct literal syntax due to private fields",
     },
     Case {
         name: "selection_function_literal",
-        diagnostic:
-            "fields `program` and `retained_bytes` of struct `SelectionFunction` are private",
+        diagnostic: "cannot construct `SelectionFunction` with struct literal syntax due to private fields",
     },
     Case {
         name: "candidate_index_literal",
@@ -71,16 +71,7 @@ const CASES: &[Case] = &[
     },
     Case {
         name: "selection_policy_literal",
-        diagnostic:
-            "fields `candidates` and `selection_function` of struct `SelectionPolicy` are private",
-    },
-    Case {
-        name: "candidate_evaluator_boundary",
-        diagnostic: "trait `CandidateEvaluator` is private",
-    },
-    Case {
-        name: "evaluation_session_boundary",
-        diagnostic: "struct `EvaluationSession` is private",
+        diagnostic: "cannot construct `SelectionPolicy` with struct literal syntax due to private fields",
     },
 ];
 
@@ -104,14 +95,29 @@ fn invalid_public_transitions_do_not_compile() {
     }
     fs::create_dir_all(&root).expect("create compile-fail directory");
 
-    for case in CASES {
-        run_case(&root, &compiler, &lang, &target, case);
-    }
+    let mismatches: Vec<String> = CASES
+        .iter()
+        .filter_map(|case| run_case(&root, &compiler, &lang, &target, case))
+        .collect();
 
     fs::remove_dir_all(&root).expect("remove compile-fail directory");
+    assert!(
+        mismatches.is_empty(),
+        "{} of {} compile-fail fixtures mismatched:\n\n{}",
+        mismatches.len(),
+        CASES.len(),
+        mismatches.join("\n\n")
+    );
 }
 
-fn run_case(root: &Path, compiler: &Path, lang: &Path, target: &Path, case: &Case) {
+/// Checks one fixture against the shared target directory and describes the mismatch, if any.
+fn run_case(
+    root: &Path,
+    compiler: &Path,
+    lang: &Path,
+    target: &Path,
+    case: &Case,
+) -> Option<String> {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("ui")
@@ -136,16 +142,17 @@ fn run_case(root: &Path, compiler: &Path, lang: &Path, target: &Path, case: &Cas
         .output()
         .expect("run fixture cargo check");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "compile-fail fixture `{}` unexpectedly compiled",
-        case.name
-    );
-    assert!(
-        stderr.contains(case.diagnostic),
-        "compile-fail fixture `{}` failed for the wrong reason; expected {:?}\n{}",
-        case.name,
-        case.diagnostic,
-        stderr
-    );
+    if output.status.success() {
+        Some(format!(
+            "compile-fail fixture `{}` unexpectedly compiled",
+            case.name
+        ))
+    } else if !stderr.contains(case.diagnostic) {
+        Some(format!(
+            "compile-fail fixture `{}` failed for the wrong reason; expected {:?}\n{}",
+            case.name, case.diagnostic, stderr
+        ))
+    } else {
+        None
+    }
 }

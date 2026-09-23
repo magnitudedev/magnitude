@@ -1,0 +1,10 @@
+# origin: X1:r2-d1
+# invoke: i32:-2147483648 ; i32:-1
+# expect: failed
+# invoke: i32:1 ; i32:0
+# expect: failed
+# invoke: i32:7 ; i32:2
+# expect: returned
+# pin: result = i32[]=3
+fn probe(a: i32, b: i32) -> i32:
+    return a / b

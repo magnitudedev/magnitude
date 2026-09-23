@@ -20,7 +20,6 @@ pub use materialization::{
 use crate::errors::PreparationError;
 use crate::expression::PlanningExpr;
 use crate::numerics::StructuralNumericalObligation;
-use crate::preparation_budget::PreparationBudget;
 use crate::refinement::{ChoiceDeclaration, ConstructedCandidate};
 use crate::target::{CompilerRegistry, TargetConstants};
 use seismic_lang::entry::{
@@ -852,12 +851,11 @@ pub fn construct_candidate_domain<'ctx, T>(
     device: &'ctx DeviceDescription<T>,
     registry: &'ctx CompilerRegistry<T>,
     precision: &PrecisionPolicy,
-    budget: &PreparationBudget,
 ) -> Result<CandidateDomain<'ctx, T>, PreparationError>
 where
     T: seismic_target::TargetFamily,
 {
-    internals::candidate_domain(entry, device, registry, precision, budget)
+    internals::candidate_domain(entry, device, registry, precision)
 }
 
 pub(crate) mod internals {
@@ -870,7 +868,6 @@ pub(crate) mod internals {
         target: &'ctx DeviceDescription<T>,
         registry: &'ctx CompilerRegistry<T>,
         precision: &PrecisionPolicy,
-        _budget: &PreparationBudget,
     ) -> Result<CandidateDomain<'ctx, T>, PreparationError>
     where
         T: seismic_target::TargetFamily,
@@ -1150,7 +1147,7 @@ mod candidate_domain_tests {
 
     #[test]
     fn family_definitions_do_not_depend_on_optional_construction_allowance() {
-        use crate::evaluation_session::boundary_tests::registry;
+        use crate::realization::demand_driven_tests::registry;
         use crate::realization::demand_driven_tests::device;
         use seismic_lang::checked::{check_source, SourceFile, SourceSet};
         use seismic_lang::entry::ElementBindings;
@@ -1161,21 +1158,18 @@ mod candidate_domain_tests {
         .unwrap();
         let target = device();
         let registry = registry();
-        let build = |budget: PreparationBudget| {
+        let build = || {
             let entry = module
                 .entry(
                     module.entry_named("probe").unwrap(),
                     &ElementBindings::default(),
                 )
                 .unwrap();
-            construct_candidate_domain(entry, &target, &registry, &PrecisionPolicy::Exact, &budget)
+            construct_candidate_domain(entry, &target, &registry, &PrecisionPolicy::Exact)
                 .unwrap()
         };
-        let unvisited = build(PreparationBudget {
-            construction_work_units: 0,
-            ..PreparationBudget::default()
-        });
-        let mut visited = build(PreparationBudget::default());
+        let unvisited = build();
+        let mut visited = build();
         let selected = visited
             .root_selections()
             .into_iter()
@@ -1208,7 +1202,7 @@ mod candidate_domain_tests {
 
     #[test]
     fn equal_body_labels_cannot_select_a_different_checked_source() {
-        use crate::evaluation_session::boundary_tests::registry;
+        use crate::realization::demand_driven_tests::registry;
         use crate::realization::demand_driven_tests::device;
         use seismic_lang::checked::{check_source, SourceFile, SourceSet};
         use seismic_lang::entry::ElementBindings;
@@ -1225,14 +1219,8 @@ mod candidate_domain_tests {
             let entry = module
                 .entry(module.entry_named("probe").unwrap(), &ElementBindings::default())
                 .unwrap();
-            construct_candidate_domain(
-                entry,
-                &target,
-                &registry,
-                &PrecisionPolicy::Exact,
-                &PreparationBudget::default(),
-            )
-            .unwrap()
+            construct_candidate_domain(entry, &target, &registry, &PrecisionPolicy::Exact)
+                .unwrap()
         };
         let left = build("1.0");
         let mut right = build("2.0");
@@ -1258,7 +1246,7 @@ mod candidate_domain_tests {
 
     #[test]
     fn suspended_construction_restart_and_general_route_have_stable_coordinates() {
-        use crate::evaluation_session::boundary_tests::registry;
+        use crate::realization::demand_driven_tests::registry;
         use crate::realization::demand_driven_tests::{device, FakeTarget};
         use seismic_lang::checked::{check_source, SourceFile, SourceSet};
         use seismic_lang::entry::ElementBindings;
@@ -1276,14 +1264,8 @@ mod candidate_domain_tests {
                     &ElementBindings::default(),
                 )
                 .unwrap();
-            construct_candidate_domain(
-                entry,
-                &target,
-                &registry,
-                &PrecisionPolicy::Exact,
-                &PreparationBudget::default(),
-            )
-            .unwrap()
+            construct_candidate_domain(entry, &target, &registry, &PrecisionPolicy::Exact)
+                .unwrap()
         };
         fn finish(
             domain: &mut CandidateDomain<'_, FakeTarget>,
@@ -1404,7 +1386,8 @@ mod candidate_domain_tests {
 
     #[test]
     fn constructed_handle_pins_data_and_expressions_after_cache_eviction() {
-        use crate::evaluation_session::boundary_tests::{domain_with_optional, registry};
+        use crate::evaluation_session::boundary_tests::domain_with_optional;
+        use crate::realization::demand_driven_tests::registry;
         use crate::realization::demand_driven_tests::device;
         let target = device();
         let registry = registry();

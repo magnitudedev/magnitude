@@ -50,39 +50,25 @@ impl TensorData {
         .ok_or_else(|| "tensor size overflow".into())
     }
     /// Actual retained vector payload capacities, for caller-owned input budgets.
-    pub fn storage_bytes(&self) -> Result<u64, String> {
+    /// These vectors are live allocations, so their total cannot overflow.
+    pub fn storage_bytes(&self) -> u64 {
         let (shape, data) = match self {
             Self::Dense {
                 shape,
                 bytes,
                 initialized,
                 ..
-            } => (
-                shape,
-                bytes
-                    .capacity()
-                    .checked_add(initialized.capacity())
-                    .ok_or("tensor size overflow")?,
-            ),
+            } => (shape, bytes.capacity() + initialized.capacity()),
             Self::Encoded { shape, bytes, .. } => (shape, bytes.capacity()),
         };
-        data.checked_add(
-            shape
-                .capacity()
-                .checked_mul(std::mem::size_of::<usize>())
-                .ok_or("tensor rank overflow")?,
-        )
-        .and_then(|n| u64::try_from(n).ok())
-        .ok_or_else(|| "tensor size overflow".into())
+        (data + shape.capacity() * std::mem::size_of::<usize>()) as u64
     }
 
     pub fn dense(dtype: DType, shape: Vec<usize>, values: Vec<f64>) -> Self {
         assert_eq!(values.len(), shape.iter().product::<usize>());
-        let mut data = Self::uninitialized(registry::dense(dtype), shape)
-            .expect("dense tensor geometry is host-addressable");
+        let mut data = Self::uninitialized(registry::dense(dtype), shape);
         for (index, value) in values.into_iter().enumerate() {
-            data.write(index, scalar_from_number(dtype, value))
-                .expect("dense element index is in bounds");
+            data.write(index, scalar_from_number(dtype, value));
         }
         data
     }
@@ -131,30 +117,28 @@ impl TensorData {
         })
     }
 
-    pub(super) fn uninitialized(
-        representation: RepresentationId,
-        shape: Vec<usize>,
-    ) -> Result<Self, String> {
+    /// Storage whose geometry was already admitted by the memory budget
+    /// (`allocation_bytes`), so it is host-addressable.
+    pub(super) fn uninitialized(representation: RepresentationId, shape: Vec<usize>) -> Self {
+        const ADMITTED: &str = "admitted tensor geometry is host-addressable";
         match &registry::representation_info(representation).kind {
             RepresentationKind::Dense(dtype) => {
-                let count = element_count(&shape)?;
-                let bytes = count
-                    .checked_mul(dtype.bytes() as usize)
-                    .ok_or("tensor size overflow")?;
-                Ok(Self::Dense {
+                let count = element_count(&shape).expect(ADMITTED);
+                let bytes = count.checked_mul(dtype.bytes() as usize).expect(ADMITTED);
+                Self::Dense {
                     representation,
                     shape,
                     bytes: vec![0; bytes],
                     initialized: vec![false; count],
-                })
+                }
             }
-            RepresentationKind::Packed(_) => Ok(Self::Encoded {
+            RepresentationKind::Packed(_) => Self::Encoded {
                 representation,
-                bytes: vec![0; encoded_bytes(representation, &shape)?],
+                bytes: vec![0; encoded_bytes(representation, &shape).expect(ADMITTED)],
                 shape,
-            }),
+            },
             RepresentationKind::External(_) => {
-                Err("external artifact storage cannot be allocated by a kernel".to_owned())
+                unreachable!("checked source allocates external artifact storage")
             }
         }
     }
@@ -177,18 +161,16 @@ impl TensorData {
     /// reference recipe, in row-major order.
     pub fn values(&self) -> Result<Vec<f64>, String> {
         let count = self.shape().iter().product();
-        let mut values = Vec::with_capacity(count);
-        for index in 0..count {
-            values.push(self.read(index)?);
-        }
-        Ok(values)
+        Ok((0..count).map(|index| self.read(index)).collect())
     }
 
-    pub(super) fn read(&self, flat: usize) -> Result<f64, String> {
-        self.read_scalar(flat).map(ReferenceScalar::to_f64)
+    pub(super) fn read(&self, flat: usize) -> f64 {
+        self.read_scalar(flat).to_f64()
     }
 
-    pub(super) fn read_scalar(&self, flat: usize) -> Result<ReferenceScalar, String> {
+    /// The checker establishes initialization of every read element and the
+    /// entry graph checks every index, so a failed read is an interpreter bug.
+    pub(super) fn read_scalar(&self, flat: usize) -> ReferenceScalar {
         match self {
             Self::Dense { representation, .. } => {
                 let RepresentationKind::Dense(dtype) =
@@ -196,7 +178,7 @@ impl TensorData {
                 else {
                     unreachable!("dense oracle storage has a non-dense representation")
                 };
-                Ok(read_dense(dtype, self.dense_element_bytes(flat)?))
+                read_dense(dtype, self.dense_element_bytes(flat))
             }
             Self::Encoded {
                 representation,
@@ -206,34 +188,7 @@ impl TensorData {
         }
     }
 
-    pub(super) fn write(&mut self, flat: usize, value: ReferenceScalar) -> Result<(), String> {
-        match self {
-            Self::Dense {
-                representation,
-                bytes,
-                initialized,
-                ..
-            } => {
-                let RepresentationKind::Dense(dtype) =
-                    &registry::representation_info(*representation).kind
-                else {
-                    unreachable!("dense oracle storage has a non-dense representation")
-                };
-                let initialized = initialized
-                    .get_mut(flat)
-                    .ok_or("write outside tensor bounds")?;
-                let width = dtype.bytes() as usize;
-                let value = super::scalar::cast(*dtype, value);
-                bytes[flat * width..(flat + 1) * width]
-                    .copy_from_slice(&value.bits().to_le_bytes()[..width]);
-                *initialized = true;
-                Ok(())
-            }
-            Self::Encoded { .. } => Err("read-only representation cannot be written".to_owned()),
-        }
-    }
-
-    pub(super) fn dense_element_bytes(&self, flat: usize) -> Result<&[u8], String> {
+    pub(super) fn write(&mut self, flat: usize, value: ReferenceScalar) {
         let Self::Dense {
             representation,
             bytes,
@@ -241,19 +196,43 @@ impl TensorData {
             ..
         } = self
         else {
-            return Err("dense element requested from encoded tensor".into());
+            unreachable!("checked source writes read-only encoded storage")
+        };
+        let RepresentationKind::Dense(dtype) = &registry::representation_info(*representation).kind
+        else {
+            unreachable!("dense oracle storage has a non-dense representation")
+        };
+        let initialized = initialized
+            .get_mut(flat)
+            .unwrap_or_else(|| unreachable!("checked write lies outside its tensor"));
+        let width = dtype.bytes() as usize;
+        let value = super::scalar::cast(*dtype, value);
+        bytes[flat * width..(flat + 1) * width]
+            .copy_from_slice(&value.bits().to_le_bytes()[..width]);
+        *initialized = true;
+    }
+
+    pub(super) fn dense_element_bytes(&self, flat: usize) -> &[u8] {
+        let Self::Dense {
+            representation,
+            bytes,
+            initialized,
+            ..
+        } = self
+        else {
+            unreachable!("dense element requested from encoded storage")
         };
         match initialized.get(flat) {
             Some(true) => {}
-            Some(false) => return Err("read of uninitialized tensor element".into()),
-            None => return Err("read outside tensor bounds".into()),
+            Some(false) => unreachable!("checked source reads an uninitialized tensor element"),
+            None => unreachable!("checked read lies outside its tensor"),
         }
         let RepresentationKind::Dense(dtype) = registry::representation_info(*representation).kind
         else {
             unreachable!("dense oracle storage has a non-dense representation")
         };
         let width = dtype.bytes() as usize;
-        Ok(&bytes[flat * width..(flat + 1) * width])
+        &bytes[flat * width..(flat + 1) * width]
     }
 
     pub(super) fn canonical_bytes(&self) -> Result<&[u8], String> {
@@ -322,14 +301,16 @@ fn decode(
     shape: &[usize],
     bytes: &[u8],
     flat: usize,
-) -> Result<ReferenceScalar, String> {
+) -> ReferenceScalar {
     let info = registry::representation_info(representation);
     let RepresentationKind::Packed(layout) = &info.kind else {
-        return Err("external representation is conversion-only".to_owned());
+        unreachable!("checked source decodes a conversion-only external representation")
     };
-    let width = *shape.last().ok_or("packed tensor has rank zero")?;
+    let width = *shape
+        .last()
+        .unwrap_or_else(|| unreachable!("packed storage has rank zero"));
     if flat >= shape.iter().product() {
-        return Err("read outside tensor bounds".to_owned());
+        unreachable!("checked read lies outside its tensor")
     }
     let row = flat / width;
     let column = flat % width;
@@ -337,14 +318,14 @@ fn decode(
     let packet = row * packets_per_row + column / layout.group as usize;
     let local = (column % layout.group as usize) as u64;
     let recipe = registry::decode_recipe(representation, info.decoded)
-        .ok_or("packed representation has no decode recipe")?;
+        .unwrap_or_else(|| unreachable!("registered packed representation has no decode recipe"));
     let mut temporaries = vec![ReferenceScalar::U32(0); recipe.temporary_count()];
     for step in recipe.steps() {
         let value = match step {
             DecodeStep::ReadPlaneField { plane, field, .. } => {
                 let schema = &recipe.planes()[*plane as usize];
                 let entry = schema.entry(local, *field);
-                read_plane(layout, bytes, packet, *plane as usize, entry)?
+                read_plane(layout, bytes, packet, *plane as usize, entry)
             }
             DecodeStep::InterpretCode {
                 raw,
@@ -395,7 +376,7 @@ fn decode(
         let into = step.defines();
         temporaries[recipe.ordinal(into)] = value;
     }
-    Ok(temporaries[recipe.ordinal(recipe.output())])
+    temporaries[recipe.ordinal(recipe.output())]
 }
 
 fn read_plane(
@@ -404,19 +385,13 @@ fn read_plane(
     packet: usize,
     plane: usize,
     entry: u64,
-) -> Result<ReferenceScalar, String> {
-    let schema = layout
-        .planes
-        .get(plane)
-        .ok_or("decode names unknown plane")?;
-    let start = packet
-        .checked_mul(layout.packet_size as usize)
-        .and_then(|offset| offset.checked_add(schema.offset as usize))
-        .ok_or("plane offset overflow")?;
-    let plane_bytes = bytes
-        .get(start..start + schema.bytes_per_group as usize)
-        .ok_or("plane read outside encoded tensor")?;
-    Ok(match &schema.encoding {
+) -> ReferenceScalar {
+    // The packet lies inside storage whose byte length `TensorData::encoded`
+    // admitted for this representation and shape.
+    let schema = &layout.planes[plane];
+    let start = packet * layout.packet_size as usize + schema.offset as usize;
+    let plane_bytes = &bytes[start..start + schema.bytes_per_group as usize];
+    match &schema.encoding {
         PlaneEncoding::Packed { .. } | PlaneEncoding::FloatCode { .. } => {
             ReferenceScalar::U32(read_bits(
                 plane_bytes,
@@ -431,7 +406,7 @@ fn read_plane(
                 &plane_bytes[offset..offset + dtype.bytes() as usize],
             )
         }
-    })
+    }
 }
 
 pub(super) fn read_bits(bytes: &[u8], first: usize, width: u32) -> u32 {
@@ -501,9 +476,9 @@ mod tests {
             ),
         ] {
             let tensor = TensorData::dense_from_bytes(dtype, vec![3], bytes.clone()).unwrap();
-            assert_eq!(tensor.read(0).unwrap().to_bits(), (-0f64).to_bits());
-            assert!(tensor.read(1).unwrap().is_nan());
-            assert!(tensor.read(2).unwrap().is_nan());
+            assert_eq!(tensor.read(0).to_bits(), (-0f64).to_bits());
+            assert!(tensor.read(1).is_nan());
+            assert!(tensor.read(2).is_nan());
             assert_eq!(tensor.canonical_bytes().unwrap(), bytes);
         }
     }
@@ -519,25 +494,21 @@ mod tests {
             DType::Bool,
         ] {
             let representation = registry::dense(dtype);
-            let mut tensor = TensorData::uninitialized(representation, vec![2]).unwrap();
-            assert!(tensor.read(0).unwrap_err().contains("uninitialized"));
-            tensor.write(0, scalar_from_number(dtype, 1.5)).unwrap();
-            assert_eq!(tensor.read(0).unwrap(), round_to(dtype, 1.5));
-            assert!(tensor.read(1).unwrap_err().contains("uninitialized"));
+            let mut tensor = TensorData::uninitialized(representation, vec![2]);
+            tensor.write(0, scalar_from_number(dtype, 1.5));
+            assert_eq!(tensor.read(0), round_to(dtype, 1.5));
             assert!(tensor.canonical_bytes().is_err());
-            tensor.write(1, scalar_from_number(dtype, 0.)).unwrap();
+            tensor.write(1, scalar_from_number(dtype, 0.));
             assert_eq!(
                 tensor.canonical_bytes().unwrap().len(),
                 2 * dtype.bytes() as usize
             );
-            assert!(tensor.read(2).is_err());
-            assert!(tensor.write(2, scalar_from_number(dtype, 1.)).is_err());
             let expected = 2 * (u64::from(dtype.bytes()) + 1) + std::mem::size_of::<usize>() as u64;
             assert_eq!(
                 TensorData::allocation_bytes(representation, &[2]).unwrap(),
                 expected
             );
-            assert_eq!(tensor.storage_bytes().unwrap(), expected);
+            assert_eq!(tensor.storage_bytes(), expected);
         }
         let mut shape = Vec::with_capacity(5);
         shape.push(2);
@@ -545,7 +516,7 @@ mod tests {
         bytes.extend_from_slice(&[0; 8]);
         let tensor = TensorData::dense_from_bytes(DType::F32, shape, bytes).unwrap();
         assert_eq!(
-            tensor.storage_bytes().unwrap(),
+            tensor.storage_bytes(),
             20 + 2 + 5 * std::mem::size_of::<usize>() as u64
         );
     }
@@ -556,9 +527,21 @@ mod tests {
         assert!(TensorData::dense_from_bytes(DType::F32, vec![usize::MAX, 2], vec![]).is_err());
         let scalar =
             TensorData::dense_from_bytes(DType::F32, vec![], 1f32.to_le_bytes().to_vec()).unwrap();
-        assert_eq!(scalar.read(0).unwrap(), 1.);
+        assert_eq!(scalar.read(0), 1.);
         let empty = TensorData::dense_from_bytes(DType::F32, vec![0], vec![]).unwrap();
         assert!(empty.canonical_bytes().unwrap().is_empty());
-        assert!(empty.read(0).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "uninitialized")]
+    fn uninitialized_read_is_an_interpreter_defect() {
+        TensorData::uninitialized(registry::dense(DType::F32), vec![2]).read(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside its tensor")]
+    fn out_of_bounds_write_is_an_interpreter_defect() {
+        TensorData::dense(DType::F32, vec![2], vec![0.; 2])
+            .write(2, scalar_from_number(DType::F32, 1.));
     }
 }

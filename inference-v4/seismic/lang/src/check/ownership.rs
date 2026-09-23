@@ -147,8 +147,7 @@ impl Checker<'_> {
                 id:
                     PrimitiveId::TensorAlloc
                     | PrimitiveId::Fill(_)
-                    | PrimitiveId::Materialize
-                    | PrimitiveId::Clone
+                    | PrimitiveId::Copy
                     | PrimitiveId::RepresentationConvert(_),
                 ..
             } => ValueOwnership::shape(&value.ty, &|| TensorOwnership::Owned { moved: false }),

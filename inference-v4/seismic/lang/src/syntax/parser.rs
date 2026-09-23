@@ -2,9 +2,10 @@
 use super::ast::*;
 use super::lexer::lex;
 use super::token::{Kw, Op, Tok, Token};
+use crate::checked::DiagnosticRule;
 use crate::span::{Diagnostic, Span};
 
-pub fn parse(text: &str) -> Result<File, Diagnostic> {
+pub(crate) fn parse(text: &str) -> Result<File, Diagnostic> {
     let tokens = lex(text)?;
     Parser { tokens, pos: 0 }.file()
 }
@@ -183,7 +184,7 @@ impl Parser {
     }
 
     fn error(&self, message: String) -> Diagnostic {
-        Diagnostic::new(self.span(), message)
+        Diagnostic::with_rule(DiagnosticRule::Syntax, self.span(), message)
     }
 
     /// `item ("," item)*`
@@ -231,11 +232,11 @@ impl Parser {
         let mut continued = false;
         let mut signature = self.signature(&mut continued, true)?;
         self.continue_header(&mut continued, true);
-        let target = if self.eat_kw(Kw::For) {
-            Some(self.expect_name()?)
-        } else {
-            None
-        };
+        if self.at_kw(Kw::For) {
+            return Err(self.error(
+                "backend code is written as `lower NAME … for BACKEND`; a `fn` is portable".into(),
+            ));
+        }
         let requires = self.requires_clause(&mut continued)?;
         signature.predicates = self.where_clause(&mut continued, true)?;
         self.expect_op(Op::Colon)?;
@@ -243,7 +244,6 @@ impl Parser {
         Ok(FnDecl {
             signature,
             name,
-            target,
             requires,
             body,
             span: start.to(self.prev_span()),
@@ -393,10 +393,6 @@ impl Parser {
         }
         self.expect_op(Op::RParen)?;
         self.continue_header(continued, lower);
-        if self.at_word("alias") {
-            return Err(self.error("`alias` clauses are no longer part of Seismic source".into()));
-        }
-        self.continue_header(continued, lower);
         let mut result = None;
         if self.eat_op(Op::Arrow) {
             let ty = self.type_expr()?;
@@ -441,13 +437,6 @@ impl Parser {
     }
 
     fn param(&mut self) -> PResult<Param> {
-        if matches!((self.peek(), self.peek_at(1)), (Tok::Name(mode), Tok::Name(_)) if mode == "out" || mode == "inout")
-        {
-            return Err(self.error(
-                "`out` and `inout` parameter modes were removed; use an owned return or `&mut tensor`"
-                    .into(),
-            ));
-        }
         let name = self.expect_name()?;
         self.expect_op(Op::Colon)?;
         let ty = self.type_expr()?;
@@ -462,7 +451,8 @@ impl Parser {
                 let mutable = self.eat_kw(Kw::Mut);
                 let tensor = self.expect_name()?;
                 if tensor.name != "tensor" || !self.at_op(Op::LBracket) {
-                    return Err(Diagnostic::new(
+                    return Err(Diagnostic::with_rule(
+                        DiagnosticRule::Syntax,
                         tensor.span,
                         "a borrow type is `&tensor[...] T` or `&mut tensor[...] T`",
                     ));
@@ -477,12 +467,6 @@ impl Parser {
                 self.bump();
                 TypeKind::Void
             }
-            Tok::Kw(Kw::Tile) => {
-                return Err(self.error(
-                    "`tile` is compiler-internal; source types use `tensor` and tensor borrows"
-                        .into(),
-                ));
-            }
             Tok::Op(Op::LParen) => {
                 self.bump();
                 let mut items = self.comma_list(Self::type_expr)?;
@@ -496,12 +480,6 @@ impl Parser {
                 let name = self.expect_name()?;
                 match self.peek() {
                     Tok::Op(Op::LBracket) if word == "tensor" => self.shaped(ShapedHead::Tensor)?,
-                    Tok::Op(Op::LBracket) if word == "view" => {
-                        return Err(Diagnostic::new(
-                            name.span,
-                            "`view` was removed; use `&tensor` or `&mut tensor`",
-                        ));
-                    }
                     Tok::Op(Op::LBracket) if word == "index" => {
                         self.bump();
                         let bound = self.expr()?;
@@ -520,7 +498,8 @@ impl Parser {
                         )));
                     }
                     Tok::Op(Op::Dot) => {
-                        return Err(Diagnostic::new(
+                        return Err(Diagnostic::with_rule(
+                            DiagnosticRule::Syntax,
                             name.span,
                             "backend-native types are compiler-internal and cannot appear in source",
                         ));
@@ -624,12 +603,6 @@ impl Parser {
                 self.logical_for(true)?
             }
             Tok::Kw(Kw::If) => self.if_stmt()?,
-            Tok::Kw(Kw::Parallel | Kw::Ordered | Kw::Pipeline | Kw::Stage | Kw::Merge) => {
-                return Err(self.error(
-                    "legacy region, stage, and merge syntax was removed; use `for` or `parallel for`"
-                        .into(),
-                ));
-            }
             Tok::Kw(Kw::Else) => return Err(self.error("`else` without a matching `if`".into())),
             Tok::Indent => return Err(self.error("unexpected indentation".into())),
             _ => return self.simple_statements(out),
@@ -730,12 +703,6 @@ impl Parser {
                     value,
                 }
             }
-            Tok::Kw(Kw::Publish | Kw::Yield) => {
-                return Err(self.error(
-                    "`publish` and `yield` were removed; assign values or return owned results"
-                        .into(),
-                ));
-            }
             Tok::Kw(Kw::Return) => {
                 self.bump();
                 let values = if self.at_line_end() || self.at_op(Op::Semi) {
@@ -757,7 +724,8 @@ impl Parser {
                 match op {
                     Some(op) => {
                         if !is_place(&target) {
-                            return Err(Diagnostic::new(
+                            return Err(Diagnostic::with_rule(
+                            DiagnosticRule::Syntax,
                                 target.span,
                                 "cannot assign to this expression; a target is a name, an indexed place or a tuple of them",
                             ));
@@ -973,19 +941,7 @@ impl Parser {
                     span: span.to(self.prev_span()),
                 });
             }
-            Tok::Name(name)
-                if name == "owned" && matches!(self.peek_at(1), Tok::Op(Op::LParen)) =>
-            {
-                return Err(self.error(
-                    "`owned(...)` traversal was removed; iterate a bounded range with `for`".into(),
-                ));
-            }
             Tok::Name(name) => ExprKind::Name(Ident { name, span }),
-            Tok::Kw(Kw::Tile) => {
-                return Err(self.error(
-                    "`tile` allocation is compiler-internal; allocate a logical `tensor`".into(),
-                ));
-            }
             Tok::Op(Op::LParen) => {
                 self.bump();
                 if self.at_op(Op::RParen) {
@@ -1009,12 +965,6 @@ impl Parser {
                     kind: ExprKind::Tuple(items),
                     span: span.to(end),
                 });
-            }
-            Tok::Kw(Kw::Parallel | Kw::Ordered | Kw::Pipeline) => {
-                return Err(self.error(
-                    "a region is a statement, or the whole value of `let`, `yield` or `return`"
-                        .into(),
-                ));
             }
             other => {
                 return Err(self.error(format!(
@@ -1047,10 +997,9 @@ mod tests {
     }
 
     fn round_trip(text: &str) -> File {
-        let file = parse(text).unwrap_or_else(|d| panic!("{}", d.render("source", text)));
+        let file = parse(text).unwrap_or_else(|d| panic!("{d:?}\n{text}"));
         let printed = print(&file);
-        let again = parse(&printed)
-            .unwrap_or_else(|d| panic!("{}\n{printed}", d.render("printed", &printed)));
+        let again = parse(&printed).unwrap_or_else(|d| panic!("{d:?}\n{printed}"));
         assert_eq!(shape(&file), shape(&again), "printed:\n{printed}");
         assert_eq!(print(&again), printed);
         file
@@ -1072,7 +1021,6 @@ mod tests {
         let Decl::Fn(function) = &file.decls[0] else {
             panic!("expected fn")
         };
-        assert!(function.target.is_none());
         assert!(matches!(
             function.signature.params[0].ty.kind,
             TypeKind::Shaped {
@@ -1108,7 +1056,7 @@ mod tests {
              lower row_dot[N](x: tensor[N] f32, w: tensor[N] f32) -> f32\n    for cpu where N >= 1:\n    return row_dot_cpu(x, w)\n\n\
              fn update[M](a: &tensor[M, M] f32,\n             acc: tensor[M, M] f32) -> tensor[M, M] f32:\n    let mut result = acc\n    for i in 0..M:\n        for j in 0..M:\n            result[i, j] = result[i, j] + a[i, j]\n    return result\n\n\
              lower update[M](a: &tensor[M, M] f32, acc: tensor[M, M] f32) -> tensor[M, M] f32\n    for metal\n    requires metal.matrix\n    where M == 8 and full(M):\n    return metal.matrix.matmul(a, acc, accumulation=f32)\n\n\
-             fn prepare[R, K](x: &tensor[R, K] bf16, pos: index[K])\n    -> tensor[R, K] f32 for metal requires metal.matrix:\n    return metal.matrix.matmul(x, x, accumulation=f32)\n",
+             fn prepare[R, K](x: &tensor[R, K] bf16, pos: index[K])\n    -> tensor[R, K] f32 requires metal.matrix:\n    return metal.matrix.matmul(x, x, accumulation=f32)\n",
         );
         assert_eq!(file.decls.len(), 5);
         let Decl::Fn(f) = &file.decls[0] else {
@@ -1153,7 +1101,6 @@ mod tests {
             "fn f[M](owned: tensor[M] f32, shared: &tensor[M] f32, exclusive: &mut tensor[M] f32, to: f32) -> tensor[M] f32:\n    exclusive[0] = shared[0] + to\n    return owned\n",
         );
         let f = only_fn(&file);
-        assert!(f.target.is_none());
         assert!(matches!(
             f.signature.params[0].ty.kind,
             TypeKind::Shaped {
@@ -1286,16 +1233,25 @@ mod tests {
                 )
         );
 
-        let text = "fn f(x: f32):\n    let tile = x\n";
+        let text = "fn f(x: f32):\n    let for = x\n";
         let err = parse(text).unwrap_err();
-        assert_eq!(
-            &text[err.span.start as usize..err.span.end as usize],
-            "tile"
-        );
+        assert_eq!(&text[err.span.start as usize..err.span.end as usize], "for");
+        assert_eq!(err.rule, DiagnosticRule::Syntax);
         assert!(parse("fn f():\n    a..b..c\n").is_err());
         assert!(parse("fn f():\n    f(x) = 1\n").is_err());
         assert!(parse("lower f for cpu:\n    g()\n").is_err());
         assert!(parse("fn f(x: f32) -> f32\n    where x > 0 = portable\n").is_err());
+    }
+
+    #[test]
+    fn backend_functions_are_written_as_lowerings() {
+        let text = "fn h(x: f32) -> f32 for cpu:\n    return x\n";
+        let err = parse(text).unwrap_err();
+        assert_eq!(err.rule, DiagnosticRule::Syntax);
+        assert_eq!(&text[err.span.start as usize..err.span.end as usize], "for");
+        assert!(err
+            .message
+            .contains("written as `lower NAME … for BACKEND`"));
     }
 
     #[test]

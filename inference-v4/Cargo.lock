@@ -1763,6 +1763,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "seismic-corpus"
+version = "0.1.0"
+dependencies = [
+ "seismic",
+ "seismic-lang",
+ "seismic-std",
+]
+
+[[package]]
 name = "seismic-cpu"
 version = "0.1.0"
 dependencies = [

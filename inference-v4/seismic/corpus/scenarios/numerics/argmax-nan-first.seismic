@@ -1,0 +1,4 @@
+# origin: C12:G-C12-2
+# invoke: f32[2]=nan,1
+fn probe(x: &tensor[2] f32) -> i32:
+    return reduce(x, 0, argmax)

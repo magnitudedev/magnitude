@@ -1,0 +1,5 @@
+# origin: C12:recipe-table
+# invoke: i32:7 ; i32:4
+# pin: result = i32[]=3
+fn probe(a: i32, b: i32) -> i32:
+    return a % b

@@ -2,10 +2,9 @@
 //!
 //! Owns exactly: Metal target discovery and profile parts, the Metal
 //! capability registrations (`metal.subgroup`, `metal.matrix`) with their
-//! typed intrinsic lowerings and resource rules, the Metal structural
-//! implementation factories, native compilation of core-owned closed
-//! kernels, and the device service and executor the core-owned executable
-//! schedule drives.
+//! semantic intrinsic lowerings and resource rules, native compilation of
+//! core-owned closed kernels, and the device service and executor the
+//! core-owned executable schedule drives.
 //!
 //! There is no schedule mirror, fallback, retry, or source accommodation.
 //! Device-wide legality lives in `MetalFacts`/`TargetLimits`; concrete
@@ -32,7 +31,7 @@ mod render;
 mod services;
 
 #[cfg(test)]
-mod native_arithmetic_tests;
+mod test_support;
 
 use objc2_metal::MTLComputePipelineState;
 use seismic_ir::target::IntrinsicIdentityBuilder;
@@ -54,8 +53,8 @@ pub use facts::MetalFacts;
 use seismic_ir::metal::MetalIntrinsic;
 
 /// Revision of this backend's implementation: every change to a lowering,
-/// an emission rule, a factory, a resource rule, or an execution-service rule
-/// changes this string and with it every cache identity (§15.1).
+/// an emission rule, a resource rule, or an execution-service rule changes
+/// this string and with it every cache identity (§15.1).
 pub const BACKEND_REVISION: &str = "seismic-metal-v10";
 
 /// The Metal backend.
@@ -264,9 +263,6 @@ impl seismic_target::NativeCompiler<Metal> for MetalNativeCompiler {
         ))
     }
 }
-
-#[cfg(test)]
-mod isolation;
 
 impl seismic_ir::identity::CanonicalIdentity for MetalLaunchMode {
     fn encode_identity(&self, out: &mut seismic_ir::identity::StructureDigest) {

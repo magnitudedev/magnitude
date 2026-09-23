@@ -1,11 +1,10 @@
-//! Type-level scalar types and representations for the typed kernel IR
-//! (spec §7.1).
+//! Scalar and representation marker types (spec §7.1).
 //!
-//! Every registry representation has one marker type. Kernel handles are
-//! parameterized by these markers so a mismatch between a place's
-//! representation and an access is a compile error in the factory, not a
-//! runtime match. Runtime `RepresentationId` values are dispatched into the
-//! typed world exactly once, through [`with_representation`].
+//! Owns: the [`ScalarKind`] transported by a kernel/schedule ABI word, one
+//! marker type per registry scalar dtype and per registry representation,
+//! the dispatch of a runtime `RepresentationId` or `DType` onto those
+//! markers through [`with_representation`] and [`with_scalar`], and the
+//! constant and fill values derived from a scalar marker.
 
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::registry;
@@ -117,7 +116,7 @@ macro_rules! scalar {
     };
 }
 
-use crate::kernel::ops::{ConstantValue, ValueType};
+use crate::kernel::ops::ConstantValue;
 
 scalar!(
     F32,
@@ -189,11 +188,6 @@ impl ScalarType for Idx {
 impl IntegerType for Idx {}
 impl NumericType for Idx {}
 
-/// The erased value type of one scalar marker.
-pub(crate) fn value_type_of<T: ScalarType>() -> ValueType {
-    T::KIND.value_type()
-}
-
 /// The kernel constant of one host value.
 pub(crate) fn constant_of<T: ScalarType>(value: T::Value) -> ConstantValue {
     <T as sealed::KernelScalar>::kernel_constant(value)
@@ -213,15 +207,6 @@ pub(crate) fn fill_value_of<T: VectorElement>(value: T::Value) -> crate::schedul
         1 => crate::schedule::FillValue::U8([bytes[0]]),
         2 => crate::schedule::FillValue::U16([bytes[0], bytes[1]]),
         4 => crate::schedule::FillValue::U32(bytes),
-        _ => panic!("registered scalar dtype has unsupported fill width"),
-    }
-}
-
-pub(crate) fn zero_fill_of<T: VectorElement>() -> crate::schedule::FillValue {
-    match T::DTYPE.bytes() {
-        1 => crate::schedule::FillValue::U8([0]),
-        2 => crate::schedule::FillValue::U16([0; 2]),
-        4 => crate::schedule::FillValue::U32([0; 4]),
         _ => panic!("registered scalar dtype has unsupported fill width"),
     }
 }
@@ -363,6 +348,7 @@ pub fn with_scalar<V: ScalarVisitor>(dtype: DType, visitor: V) -> V::Output {
 #[cfg(test)]
 mod scalar_kind_tests {
     use super::*;
+    use crate::kernel::ops::ValueType;
     use seismic_lang::expr::SymbolValue;
 
     #[test]

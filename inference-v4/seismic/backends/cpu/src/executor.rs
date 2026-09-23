@@ -9,7 +9,7 @@ use seismic_compiler::executable::{
     ExecutableCommand, ExecutionEnvironment, NativeExecution, NativeExecutor, NativeSubmission,
 };
 use seismic_ir::schedule::FillValue;
-use seismic_lang::expr::compiled::{Compiled, InvocationValues};
+use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::SymbolValue;
 use std::sync::{Arc, Mutex};
 

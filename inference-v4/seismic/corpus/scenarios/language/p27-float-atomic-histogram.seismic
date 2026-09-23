@@ -1,0 +1,7 @@
+# origin: C1:p27
+# undecided: reassociated
+# invoke hist: i32[8]=seq ; f32[4]=zero
+# pin: h = f32[4]=3,3,3,3
+fn hist[N](x: &tensor[N] i32, h: &mut tensor[4] f32):
+    parallel for i in 0..N:
+        atomic(add, h[x[i] % 4], 1.5)

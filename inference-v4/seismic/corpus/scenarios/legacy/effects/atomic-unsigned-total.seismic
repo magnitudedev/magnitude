@@ -1,0 +1,5 @@
+# origin: test:validation:corpus/effects.seismic:atomic_unsigned_total
+# invoke atomic_unsigned_total: u32[6]=1,2,3,4,5,6 ; i32[6]=0,1,0,2,1,0 ; u32[3]=zero
+fn atomic_unsigned_total[N, E](weights: &tensor[N] u32, routes: &tensor[N] i32, totals: &mut tensor[E] u32):
+    parallel for i in 0..N:
+        atomic(add, totals[routes[i]], weights[i])

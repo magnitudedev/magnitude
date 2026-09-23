@@ -60,30 +60,6 @@ pub enum MathPrecision {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum UnaryMathOp {
-    Exp,
-    Rsqrt,
-    Sqrt,
-    Log,
-    Sin,
-    Cos,
-    Abs,
-}
-impl UnaryMathOp {
-    pub(crate) fn primitive(self) -> MathOp {
-        match self {
-            Self::Exp => MathOp::Exp,
-            Self::Rsqrt => MathOp::Rsqrt,
-            Self::Sqrt => MathOp::Sqrt,
-            Self::Log => MathOp::Log,
-            Self::Sin => MathOp::Sin,
-            Self::Cos => MathOp::Cos,
-            Self::Abs => MathOp::Abs,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BarrierScope {
     Workgroup,
     Subgroup,
@@ -897,13 +873,6 @@ pub struct ResourceFacts {
     pub barriers: u32,
     pub uses_subgroup: bool,
     pub binding_count: u32,
-}
-
-/// The sink a typed intrinsic lowers into.
-pub struct IntrinsicSink<'a, B: PhysicalDialect> {
-    pub(crate) builder: &'a mut super::internals::Builder<'a, B>,
-    pub(crate) intrinsic: IntrinsicId,
-    pub(crate) result_uniformity: super::internals::Uniformity,
 }
 
 /// Launch-local resources one intrinsic lowering requires.

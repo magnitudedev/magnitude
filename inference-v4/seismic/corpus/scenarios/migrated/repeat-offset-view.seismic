@@ -1,0 +1,10 @@
+# origin: test:seismic-runtime:runtime/src/feedback/binding_tests.rs:cpu_repeat_uses_nonzero_offset_and_rectangular_transpose_composition
+# invoke main: f32[3,4]=1,2,3,4,5,6,7,8,9,10,11,12
+# pin: result = f32[]=30
+fn main(x: &tensor[3,4] f32) -> f32:
+    let y = x[1:3,0:3]
+    let mut total = 0.0
+    for i in 0..3:
+        let view = y.T.T
+        total += view[1,i]
+    return total

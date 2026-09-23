@@ -9,14 +9,14 @@ use crate::initialization::{
     Bound, Condition, Exit, InitializationView, ParameterAccess, ParameterPart, ParameterPath,
     Path, Region, RegionOps, Requirement,
 };
-use crate::intrinsics::{IndexSlot, PrimitiveId};
+use crate::intrinsics::{AtomicOp, IndexSlot, PrimitiveId};
 use crate::reference_math::ReferenceScalar;
 use crate::span::{Diagnostic, Span};
 use crate::syntax::ast::{AssignOp, BinaryOp, UnaryOp};
 use crate::types::{DType, ValueType};
 use std::collections::{BTreeSet, HashMap};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Place {
     root: usize,
     view: InitializationView,
@@ -32,7 +32,7 @@ impl std::ops::DerefMut for Place {
         &mut self.view
     }
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct Scalar {
     integer: Option<IntExpr>,
     condition: Option<Condition>,
@@ -44,7 +44,7 @@ enum Target {
     Tensor(Place),
     Tuple(Vec<Target>),
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum Value {
     Scalar(Scalar),
     Tensor(Place),
@@ -74,7 +74,7 @@ impl Value {
 #[derive(Clone, Debug)]
 struct Root {
     name: String,
-    elements: IntExpr,
+    axes: Vec<IntExpr>,
     parameter: Option<ParameterPath>,
     written: Region,
     incoming: Region,
@@ -107,7 +107,36 @@ struct Access {
     path: Path,
     span: Span,
     write: bool,
-    atomic: bool,
+    atomic: Option<AtomicOp>,
+}
+impl Access {
+    /// Two accesses the separation proof cannot tell apart.
+    fn same_footprint(&self, other: &Access) -> bool {
+        self.root == other.root
+            && self.write == other.write
+            && self.atomic == other.atomic
+            && self.path == other.path
+            && self.region == other.region
+    }
+}
+impl World {
+    /// Record a may-access once per distinct footprint, so independence
+    /// compares each distinct pair once.
+    fn record_access(&mut self, access: Access) {
+        if !self
+            .accesses
+            .iter()
+            .any(|recorded| recorded.same_footprint(&access))
+        {
+            self.accesses.push(access);
+        }
+    }
+}
+/// The first pair of accesses whose distinct visits may overlap.
+struct VisitOverlap {
+    root: usize,
+    left: Span,
+    right: Span,
 }
 pub(super) fn check(
     checker: &mut Checker<'_>,
@@ -193,10 +222,6 @@ impl Initialization<'_, '_> {
         self.next_version += 1;
         Condition::Version(id, self.binders.clone())
     }
-    fn product(&mut self, axes: &[IntExpr]) -> IntExpr {
-        axes.iter()
-            .fold(self.arena().int(1), |p, a| self.arena().int_mul(p, *a))
-    }
     fn fresh_place(
         &mut self,
         world: &mut World,
@@ -207,12 +232,11 @@ impl Initialization<'_, '_> {
     ) -> Place {
         let root = self.next_root;
         self.next_root += 1;
-        let elements = self.product(axes);
         world.roots.insert(
             root,
             Root {
                 name,
-                elements,
+                axes: axes.to_vec(),
                 parameter,
                 written: if initialized {
                     Region::Full
@@ -329,17 +353,18 @@ impl Initialization<'_, '_> {
             view: self.reshape_view(&place.view, axes),
         }
     }
-    fn root_domain(&mut self, root: &Root) -> Region {
-        let zero = self.arena().int(0);
-        Region::Interval(zero, root.elements)
-    }
     fn write_region(&mut self, world: &mut World, root: usize, region: Region) {
         let Some(data) = world.roots.get(&root).cloned() else {
             return;
         };
-        let domain = self.root_domain(&data);
         let written = self.normalize(data.written.union(region), &world.facts);
-        let written = if self.covered(&written, &domain, &world.path, &world.facts) {
+        let written = if self.covered(
+            &written,
+            &Region::Full,
+            &world.path,
+            &world.facts,
+            &data.axes,
+        ) {
             Region::Full
         } else {
             written
@@ -348,17 +373,23 @@ impl Initialization<'_, '_> {
     }
     fn require(&mut self, world: &mut World, root: usize, region: Region, span: Span) {
         let data = world.roots[&root].clone();
-        let domain = self.root_domain(&data);
-        if self.covered(&Region::Empty, &domain, &world.path, &world.facts) {
+        let axes = &data.axes;
+        if self.covered(
+            &Region::Empty,
+            &Region::Full,
+            &world.path,
+            &world.facts,
+            axes,
+        ) {
             return;
         }
         let available = data.written.clone().union(data.incoming.clone());
-        if self.covered(&available, &region, &world.path, &world.facts) {
+        if self.covered(&available, &region, &world.path, &world.facts, axes) {
             // Reads supplied by an abstract incoming parameter remain call
             // requirements. Invariant inference may provisionally supply that
             // incoming set, but cannot turn it into a produced write.
             if let Some(parameter) = data.parameter.clone() {
-                if !self.covered(&data.written, &region, &world.path, &world.facts) {
+                if !self.covered(&data.written, &region, &world.path, &world.facts, axes) {
                     world.requirements.push(Requirement {
                         parameter,
                         region: region.clone(),
@@ -395,7 +426,10 @@ impl Initialization<'_, '_> {
         let demonstrated = matches!(available, Region::Empty)
             && match region {
                 Region::Full => true,
-                Region::Interval(a, b) => self.lt(&world.facts, a, b),
+                Region::Linear(a, b) => self.lt(&world.facts, a, b),
+                Region::Image { domain, .. } => domain
+                    .iter()
+                    .all(|bound| self.lt(&world.facts, bound.start, bound.end)),
                 _ => false,
             };
         let message = if demonstrated {
@@ -420,19 +454,20 @@ impl Initialization<'_, '_> {
         region: Region,
         span: Span,
         write: bool,
-        atomic: bool,
+        atomic: Option<AtomicOp>,
     ) {
-        world.accesses.push(Access {
+        let path = world.path.clone();
+        world.record_access(Access {
             root,
             region,
-            path: world.path.clone(),
+            path,
             span,
             write,
             atomic,
         });
     }
     fn read(&mut self, world: &mut World, root: usize, region: Region, span: Span) {
-        self.access(world, root, region.clone(), span, false, false);
+        self.access(world, root, region.clone(), span, false, None);
         self.require(world, root, region, span);
     }
     fn consume(&mut self, world: &mut World, value: &Value, span: Span) {
@@ -466,8 +501,10 @@ impl Initialization<'_, '_> {
             _ => self.fresh_condition(),
         }
     }
-    fn expression(&mut self, world: &mut World, expression: &ir::Expr) -> Value {
-        match &expression.kind {
+    /// Mutable because a call keeps only the alternatives whose contracts
+    /// apply at it.
+    fn expression(&mut self, world: &mut World, expression: &mut ir::Expr) -> Value {
+        match &mut expression.kind {
             ir::ExprKind::Local(local) => world
                 .values
                 .get(local)
@@ -493,7 +530,7 @@ impl Initialization<'_, '_> {
             }),
             ir::ExprKind::Primitive { id, operands } => {
                 let values = operands
-                    .iter()
+                    .iter_mut()
                     .map(|e| self.expression(world, e))
                     .collect::<Vec<_>>();
                 match id {
@@ -522,16 +559,17 @@ impl Initialization<'_, '_> {
                         let mut selected = vec![];
                         for index in indices {
                             match index {
-                                IndexSlot::Point => selected.push((
+                                IndexSlot::Point { .. } => selected.push((
                                     Some(self.integer(rest.next().unwrap())),
                                     None,
                                     true,
                                 )),
-                                IndexSlot::Range { start, end } => selected.push((
+                                IndexSlot::Range { start, end, .. } => selected.push((
                                     start.then(|| self.integer(rest.next().unwrap())),
                                     end.then(|| self.integer(rest.next().unwrap())),
                                     false,
                                 )),
+                                IndexSlot::Full => selected.push((None, None, false)),
                             }
                         }
                         Value::Tensor(self.select(place, &selected))
@@ -687,11 +725,8 @@ impl Initialization<'_, '_> {
                         }
                         result
                     }
-                    PrimitiveId::Materialize
-                    | PrimitiveId::Clone
-                    | PrimitiveId::Load
+                    PrimitiveId::Copy
                     | PrimitiveId::RepresentationConvert(_)
-                    | PrimitiveId::Decode
                     | PrimitiveId::Math(_)
                     | PrimitiveId::Select
                     | PrimitiveId::Reduce { .. } => {
@@ -706,6 +741,7 @@ impl Initialization<'_, '_> {
                 }
             }
             ir::ExprKind::Atomic {
+                op,
                 place,
                 indices,
                 value,
@@ -713,7 +749,7 @@ impl Initialization<'_, '_> {
             } => {
                 let place = self.expression(world, place);
                 let indices = indices
-                    .iter()
+                    .iter_mut()
                     .map(|e| {
                         let v = self.expression(world, e);
                         (Some(self.integer(&v)), None, true)
@@ -731,7 +767,7 @@ impl Initialization<'_, '_> {
                         region.clone(),
                         expression.span,
                         true,
-                        true,
+                        Some(*op),
                     );
                     self.write_region(world, place.root, region);
                 }
@@ -740,7 +776,7 @@ impl Initialization<'_, '_> {
             ir::ExprKind::PlaneView { base, .. } => self.expression(world, base),
             ir::ExprKind::Intrinsic { id, args } => {
                 let values = args
-                    .iter()
+                    .iter_mut()
                     .map(|e| self.expression(world, e))
                     .collect::<Vec<_>>();
                 let signature = crate::registry::intrinsic_signature(*id);
@@ -756,7 +792,7 @@ impl Initialization<'_, '_> {
                 for ordinal in signature.effects.writes.iter().copied() {
                     if let Some(Value::Tensor(place)) = values.get(ordinal as usize) {
                         let region = self.region(place);
-                        self.access(world, place.root, region, expression.span, true, false);
+                        self.access(world, place.root, region, expression.span, true, None);
                     }
                 }
                 // Writable intrinsic operands retain their incoming state unless
@@ -764,11 +800,11 @@ impl Initialization<'_, '_> {
                 self.result(world, &expression.ty, true)
             }
             ir::ExprKind::Call { call, args } => {
-                for (_, value) in &call.explicit_shapes {
+                for (_, value) in &mut call.explicit_shapes {
                     self.expression(world, value);
                 }
                 let values = args
-                    .iter()
+                    .iter_mut()
                     .map(|e| self.expression(world, e))
                     .collect::<Vec<_>>();
                 self.call(world, call, &values, expression.span);
@@ -795,7 +831,7 @@ impl Initialization<'_, '_> {
             _ => {}
         }
     }
-    fn place(&mut self, world: &mut World, place: &ir::Place) -> Option<Place> {
+    fn place(&mut self, world: &mut World, place: &mut ir::Place) -> Option<Place> {
         match place {
             ir::Place::Local(local) => match world
                 .values
@@ -821,11 +857,11 @@ impl Initialization<'_, '_> {
                             selected.push((Some(self.integer(&value)), None, true));
                         }
                         ir::Index::Range { start, end, .. } => {
-                            let start = start.as_ref().map(|e| {
+                            let start = start.as_mut().map(|e| {
                                 let v = self.expression(world, e);
                                 self.integer(&v)
                             });
-                            let end = end.as_ref().map(|e| {
+                            let end = end.as_mut().map(|e| {
                                 let v = self.expression(world, e);
                                 self.integer(&v)
                             });
@@ -838,18 +874,22 @@ impl Initialization<'_, '_> {
             ir::Place::Tuple(_) => None,
         }
     }
-    fn target(&mut self, world: &mut World, place: &ir::Place, op: AssignOp) -> Target {
+    fn target(&mut self, world: &mut World, place: &mut ir::Place, op: AssignOp) -> Target {
         match place {
-            ir::Place::Tuple(places) => {
-                Target::Tuple(places.iter().map(|p| self.target(world, p, op)).collect())
-            }
+            ir::Place::Tuple(places) => Target::Tuple(
+                places
+                    .iter_mut()
+                    .map(|p| self.target(world, p, op))
+                    .collect(),
+            ),
             ir::Place::Local(local) => {
+                let local = local.clone();
                 if op != AssignOp::Assign {
                     if let Some(place) = self.place(world, place) {
                         return Target::Tensor(place);
                     }
                 }
-                Target::Binding(local.clone())
+                Target::Binding(local)
             }
             ir::Place::Element { .. } => Target::Tensor(
                 self.place(world, place)
@@ -896,7 +936,7 @@ impl Initialization<'_, '_> {
                 if op != AssignOp::Assign {
                     self.read(world, place.root, region.clone(), span);
                 }
-                self.access(world, place.root, region.clone(), span, true, false);
+                self.access(world, place.root, region.clone(), span, true, None);
                 self.write_region(world, place.root, region);
             }
         }
@@ -907,7 +947,7 @@ impl Initialization<'_, '_> {
         let symbols = &mut transfer.symbols;
         xfer::transfer_int(source, value, self.arena(), &mut |symbol, arena| {
             AnyExpr::Int(*symbols.entry(symbol).or_insert_with(|| {
-                let s = arena.loop_binder().1;
+                let s = arena.proof_variable(crate::expr::SymbolSort::Int);
                 arena.int_symbol(s)
             }))
         })
@@ -929,28 +969,94 @@ impl Initialization<'_, '_> {
     fn map_region(&mut self, region: Region, place: &Place) -> Region {
         self.map_view_region(region, &place.view)
     }
-    fn call(&mut self, world: &mut World, call: &ir::Call, arguments: &[Value], span: Span) {
+    fn call(&mut self, world: &mut World, call: &mut ir::Call, arguments: &[Value], span: Span) {
         let env = self.checker.env;
-        let contract = env.resolved.families[call.family.index()].contract;
-        let Some(candidate) = call.candidates.iter().find(|c| c.definition == contract) else {
+        let reference = env.resolved.families[call.family.index()].contract;
+        let Some(candidate) = call
+            .candidates
+            .iter()
+            .find(|c| c.definition == reference)
+            .cloned()
+        else {
             self.checker.error(
                 span,
                 "cannot establish initialization: the fixed reference call contract is unavailable",
             );
             return;
         };
-        let Some(Some(source)) = env.checked.get(contract.index()) else {
+        let Some(Some(source)) = env.checked.get(reference.index()) else {
             self.checker.error(
                 span,
                 "recursive call cycle prevents construction of its initialization contract",
             );
             return;
         };
-        let arguments = candidate
-            .arg_order
-            .iter()
-            .map(|&i| arguments[i].clone())
-            .collect::<Vec<_>>();
+        let Some(contract) = available_contract(source) else {
+            // Cascade suppression: the callee's own diagnostics explain the
+            // call. No requirement is recorded; every `&mut` argument is
+            // written in full.
+            let arguments = ordered_arguments(&candidate, arguments);
+            for (parameter, argument) in source.signature.params.iter().zip(&arguments) {
+                self.write_exclusive(world, &parameter.ownership, argument);
+            }
+            return;
+        };
+        let site = self.call_site(world, source, contract, &candidate, arguments, span);
+        if self.record_loops {
+            let mut applicable = Vec::with_capacity(call.candidates.len());
+            for alternative in &call.candidates {
+                applicable.push(
+                    alternative.definition == reference
+                        || self.alternative_applicable(world, &site, alternative, arguments, span),
+                );
+            }
+            let mut applicable = applicable.into_iter();
+            call.candidates.retain(|_| applicable.next().unwrap());
+        }
+        for access in site.accesses {
+            world.record_access(access);
+        }
+        for (root, path, region) in site.requirements {
+            let mut checked = world.clone();
+            let before = checked.requirements.len();
+            let deferred = checked.deferred.len();
+            if !path
+                .iter()
+                .all(|(c, v)| self.assume(&mut checked.path, &mut checked.facts, c.clone(), *v))
+            {
+                continue;
+            }
+            self.require(&mut checked, root, region.clone(), span);
+            world
+                .requirements
+                .extend(checked.requirements.into_iter().skip(before));
+            world
+                .deferred
+                .extend(checked.deferred.into_iter().skip(deferred));
+            if world.roots[&root].parameter.is_some() {
+                let incoming = world.roots[&root]
+                    .incoming
+                    .clone()
+                    .union(Region::Guard(path, Box::new(region)));
+                world.roots.get_mut(&root).unwrap().incoming = incoming;
+            }
+        }
+        for (root, region) in site.writes {
+            self.write_region(world, root, region);
+        }
+    }
+    /// Instantiate one candidate's checked contract at this call, in the
+    /// caller's roots, coordinates and conditions.
+    fn call_site(
+        &mut self,
+        world: &World,
+        source: &CheckedOutcome,
+        contract: &Contract,
+        candidate: &ir::Candidate,
+        arguments: &[Value],
+        span: Span,
+    ) -> CallSite {
+        let arguments = ordered_arguments(candidate, arguments);
         let mut transfer = Transfer {
             source,
             arguments: &arguments,
@@ -964,7 +1070,7 @@ impl Initialization<'_, '_> {
         {
             transfer.symbols.insert(symbol, value);
         }
-        for (symbol, part) in &source.initialization.symbols {
+        for (symbol, part) in &contract.symbols {
             let value = match part {
                 ParameterPart::Integer(p) => self.integer(argument(&arguments, p)),
                 ParameterPart::Start(p) | ParameterPart::End(p) => match argument(&arguments, p) {
@@ -983,7 +1089,12 @@ impl Initialization<'_, '_> {
             };
             transfer.symbols.insert(*symbol, value);
         }
-        for access in &source.initialization.accesses {
+        let mut site = CallSite {
+            accesses: vec![],
+            requirements: vec![],
+            writes: vec![],
+        };
+        for access in &contract.accesses {
             let Value::Tensor(place) = argument(&arguments, &access.parameter) else {
                 continue;
             };
@@ -997,7 +1108,7 @@ impl Initialization<'_, '_> {
             }
             let region = self.import_region(&mut transfer, &access.region);
             let region = self.map_region(region, place);
-            world.accesses.push(Access {
+            site.accesses.push(Access {
                 root: place.root,
                 region,
                 path,
@@ -1006,52 +1117,101 @@ impl Initialization<'_, '_> {
                 atomic: access.atomic,
             });
         }
-        for requirement in &source.initialization.requirements {
-            let Some(Value::Tensor(place)) = Some(argument(&arguments, &requirement.parameter))
-            else {
+        for requirement in &contract.requirements {
+            let Value::Tensor(place) = argument(&arguments, &requirement.parameter) else {
                 continue;
             };
             let path = self.import_path(&mut transfer, &requirement.path);
             let region = self.import_region(&mut transfer, &requirement.region);
             let region = self.map_region(region, place);
-            let mut checked = world.clone();
-            let before = checked.requirements.len();
-            let deferred = checked.deferred.len();
-            if !path
-                .iter()
-                .all(|(c, v)| self.assume(&mut checked.path, &mut checked.facts, c.clone(), *v))
-            {
-                continue;
-            }
-            self.require(&mut checked, place.root, region.clone(), span);
-            world
-                .requirements
-                .extend(checked.requirements.into_iter().skip(before));
-            world
-                .deferred
-                .extend(checked.deferred.into_iter().skip(deferred));
-            if world.roots[&place.root].parameter.is_some() {
-                let incoming = world.roots[&place.root]
-                    .incoming
-                    .clone()
-                    .union(Region::Guard(path, Box::new(region)));
-                world.roots.get_mut(&place.root).unwrap().incoming = incoming;
-            }
+            site.requirements.push((place.root, path, region));
         }
-        for exit in &source.initialization.exits {
+        for exit in &contract.exits {
             let path = self.import_path(&mut transfer, &exit.path);
             for (parameter, written) in &exit.written {
-                let Some(Value::Tensor(place)) = Some(argument(&arguments, parameter)) else {
+                let Value::Tensor(place) = argument(&arguments, parameter) else {
                     continue;
                 };
                 let region = self.import_region(&mut transfer, written);
                 let region = self.map_region(region, place);
-                self.write_region(
-                    world,
-                    place.root,
-                    Region::Guard(path.clone(), Box::new(region)),
-                );
+                site.writes
+                    .push((place.root, Region::Guard(path.clone(), Box::new(region))));
             }
+        }
+        site
+    }
+    fn alternative_applicable(
+        &mut self,
+        world: &World,
+        reference: &CallSite,
+        alternative: &ir::Candidate,
+        arguments: &[Value],
+        span: Span,
+    ) -> bool {
+        let env = self.checker.env;
+        let Some(Some(source)) = env.checked.get(alternative.definition.index()) else {
+            return false;
+        };
+        let Some(contract) = available_contract(source) else {
+            return false;
+        };
+        let site = self.call_site(world, source, contract, alternative, arguments, span);
+        self.applicable_at(world, reference, &site)
+    }
+    /// Whether an alternative's contract applies where the reference's does:
+    /// it requires nothing beyond the reference's requirements and what is
+    /// already written, and its guaranteed writes include the reference's.
+    fn applicable_at(
+        &mut self,
+        world: &World,
+        reference: &CallSite,
+        alternative: &CallSite,
+    ) -> bool {
+        for (root, path, region) in &alternative.requirements {
+            let data = &world.roots[root];
+            let available = reference
+                .requirements
+                .iter()
+                .filter(|(required, _, _)| required == root)
+                .fold(
+                    data.written.clone().union(data.incoming.clone()),
+                    |available, (_, path, region)| {
+                        available.union(Region::Guard(path.clone(), Box::new(region.clone())))
+                    },
+                );
+            let required = Region::Guard(path.clone(), Box::new(region.clone()));
+            if !self.covered(&available, &required, &world.path, &world.facts, &data.axes) {
+                return false;
+            }
+        }
+        for (root, region) in &reference.writes {
+            let data = &world.roots[root];
+            let available = alternative
+                .writes
+                .iter()
+                .filter(|(written, _)| written == root)
+                .fold(data.written.clone(), |available, (_, region)| {
+                    available.union(region.clone())
+                });
+            if !self.covered(&available, region, &world.path, &world.facts, &data.axes) {
+                return false;
+            }
+        }
+        true
+    }
+    /// A call whose contract is unavailable writes every exclusive borrow.
+    fn write_exclusive(&mut self, world: &mut World, ownership: &ir::Ownership, value: &Value) {
+        match (ownership, value) {
+            (ir::Ownership::Tuple(parts), Value::Tuple(values)) => {
+                for (ownership, value) in parts.iter().zip(values) {
+                    self.write_exclusive(world, ownership, value);
+                }
+            }
+            (ir::Ownership::Exclusive, Value::Tensor(place)) => {
+                let region = self.region(place);
+                self.write_region(world, place.root, region);
+            }
+            _ => {}
         }
     }
 
@@ -1089,11 +1249,15 @@ impl Initialization<'_, '_> {
                         condition,
                         then_body,
                         else_body,
+                        join_symbols,
                         ..
                     } => {
                         let value = self.expression(&mut world, condition);
                         let condition = self.boolean(&value);
-                        for (truth, body) in [(true, &mut *then_body), (false, &mut *else_body)] {
+                        let mut arms = [vec![], vec![]];
+                        for (arm, truth, body) in
+                            [(0, true, &mut *then_body), (1, false, &mut *else_body)]
+                        {
                             let mut branch = world.clone();
                             if !self.assume(
                                 &mut branch.path,
@@ -1108,10 +1272,18 @@ impl Initialization<'_, '_> {
                                 if outcome.returned {
                                     returned.push(outcome);
                                 } else {
-                                    next.push(outcome);
+                                    arms[arm].push(outcome);
                                 }
                             }
                         }
+                        let [then_worlds, else_worlds] = arms;
+                        next.extend(self.join(
+                            &world,
+                            &condition,
+                            then_worlds,
+                            else_worlds,
+                            join_symbols,
+                        ));
                     }
                     ir::Stmt::Loop {
                         kind,
@@ -1134,9 +1306,9 @@ impl Initialization<'_, '_> {
             }
             worlds = next;
         }
-        if let ir::Terminator::Return(values) = &block.terminator {
+        if let ir::Terminator::Return(values) = &mut block.terminator {
             for world in &mut worlds {
-                for expression in values {
+                for expression in values.iter_mut() {
                     let value = self.expression(world, expression);
                     self.consume(world, &value, expression.span);
                 }
@@ -1146,12 +1318,207 @@ impl Initialization<'_, '_> {
         returned.extend(worlds);
         returned
     }
+    /// L30: the worlds after a two-way control join on `condition`, from the
+    /// `entry` world both sides started from: `then_worlds` continue where it
+    /// held and `else_worlds` where it did not. One world on each side merges
+    /// into one world. Arms that bind a tensor local to different places stay
+    /// separate worlds.
+    fn join(
+        &mut self,
+        entry: &World,
+        condition: &Condition,
+        then_worlds: Vec<World>,
+        else_worlds: Vec<World>,
+        join_symbols: &[(ir::LocalId, SymbolId)],
+    ) -> Vec<World> {
+        if let ([then], [els]) = (then_worlds.as_slice(), else_worlds.as_slice()) {
+            if let Some(joined) = self.join_worlds(entry, condition, then, els, join_symbols) {
+                return vec![joined];
+            }
+        }
+        then_worlds.into_iter().chain(else_worlds).collect()
+    }
+    /// One world for both arms: unchanged values stay, a changed integer
+    /// becomes its join symbol with the bounds both arms prove, initialized
+    /// regions are guarded by the arm that wrote them, and the records each
+    /// arm added are kept with their own paths. Path facts learned inside an
+    /// arm do not survive. `None` when the arms bind a tensor local to
+    /// different places.
+    fn join_worlds(
+        &mut self,
+        entry: &World,
+        condition: &Condition,
+        then: &World,
+        els: &World,
+        join_symbols: &[(ir::LocalId, SymbolId)],
+    ) -> Option<World> {
+        let scope = self.scope_symbols(entry);
+        let mut joined = World {
+            values: HashMap::new(),
+            roots: HashMap::new(),
+            path: entry.path.clone(),
+            facts: entry.facts.clone(),
+            requirements: entry.requirements.clone(),
+            deferred: entry.deferred.clone(),
+            accesses: entry.accesses.clone(),
+            defer_depth: entry.defer_depth,
+            returned: false,
+        };
+        for local in entry.values.keys() {
+            let symbol = join_symbols
+                .iter()
+                .find(|(changed, _)| changed == local)
+                .map(|(_, symbol)| *symbol);
+            let value = self.join_value(
+                &mut joined.facts,
+                [then, els],
+                &then.values[local],
+                &els.values[local],
+                symbol,
+                &scope,
+            )?;
+            joined.values.insert(*local, value);
+        }
+        for (id, root) in &then.roots {
+            let root = match els.roots.get(id) {
+                Some(other) => Root {
+                    written: Region::branch(condition, root.written.clone(), other.written.clone()),
+                    incoming: Region::branch(
+                        condition,
+                        root.incoming.clone(),
+                        other.incoming.clone(),
+                    ),
+                    ..root.clone()
+                },
+                None => root.clone(),
+            };
+            joined.roots.insert(*id, root);
+        }
+        for (id, root) in &els.roots {
+            joined.roots.entry(*id).or_insert_with(|| root.clone());
+        }
+        for arm in [then, els] {
+            joined
+                .requirements
+                .extend_from_slice(&arm.requirements[entry.requirements.len()..]);
+            joined
+                .deferred
+                .extend_from_slice(&arm.deferred[entry.deferred.len()..]);
+            for access in &arm.accesses[entry.accesses.len()..] {
+                joined.record_access(access.clone());
+            }
+        }
+        Some(joined)
+    }
+    /// The value of one local after a join. `symbol` is the checker's join
+    /// symbol of a changed integer local.
+    fn join_value(
+        &mut self,
+        facts: &mut prove::Facts,
+        arms: [&World; 2],
+        then_value: &Value,
+        else_value: &Value,
+        symbol: Option<SymbolId>,
+        scope: &BTreeSet<SymbolId>,
+    ) -> Option<Value> {
+        if then_value == else_value {
+            return Some(then_value.clone());
+        }
+        match (then_value, else_value) {
+            (Value::Scalar(a), Value::Scalar(b)) => {
+                let integer = match (a.integer, b.integer, symbol) {
+                    (Some(x), Some(y), _) if x == y => Some(x),
+                    (Some(x), Some(y), symbol) => {
+                        Some(self.join_integer(facts, arms, [x, y], symbol, scope))
+                    }
+                    (_, _, Some(symbol)) => Some(self.arena().int_symbol(symbol)),
+                    (_, _, None) => None,
+                };
+                let condition = match (&a.condition, &b.condition) {
+                    (Some(x), Some(y)) if x == y => Some(x.clone()),
+                    (Some(_), Some(_)) => Some(self.fresh_condition()),
+                    _ => None,
+                };
+                let range = match (a.range, b.range) {
+                    (Some(x), Some(y)) if x == y => Some(x),
+                    (Some((then_start, then_end)), Some((else_start, else_end))) => Some((
+                        self.join_integer(facts, arms, [then_start, else_start], None, scope),
+                        self.join_integer(facts, arms, [then_end, else_end], None, scope),
+                    )),
+                    _ => None,
+                };
+                Some(Value::Scalar(Scalar {
+                    integer,
+                    condition,
+                    range,
+                }))
+            }
+            (Value::Tuple(a), Value::Tuple(b)) => a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| self.join_value(facts, arms, x, y, None, scope))
+                .collect::<Option<Vec<_>>>()
+                .map(Value::Tuple),
+            (Value::Tensor(_), Value::Tensor(_)) => None,
+            _ => panic!("checked join arms bind one value kind"),
+        }
+    }
+    /// A joined integer: `symbol` (or a fresh one) bounded by exactly the
+    /// bounds both arm values prove (`Facts::join_bounds`).
+    fn join_integer(
+        &mut self,
+        facts: &mut prove::Facts,
+        arms: [&World; 2],
+        values: [IntExpr; 2],
+        symbol: Option<SymbolId>,
+        scope: &BTreeSet<SymbolId>,
+    ) -> IntExpr {
+        let (symbol, value) = match symbol {
+            Some(symbol) => (symbol, self.arena().int_symbol(symbol)),
+            None => self.fresh_integer(),
+        };
+        facts.join_bounds(
+            self.arena(),
+            symbol,
+            [(&arms[0].facts, values[0]), (&arms[1].facts, values[1])],
+            &|candidate| scope.contains(&candidate),
+        );
+        value
+    }
 }
 
 struct Transfer<'a> {
     source: &'a CheckedOutcome,
     arguments: &'a [Value],
     symbols: HashMap<SymbolId, IntExpr>,
+}
+
+/// One candidate's contract instantiated at one call: its accesses, its
+/// requirements `(root, path, region)` and its guaranteed writes
+/// `(root, region)`, all in the caller.
+struct CallSite {
+    accesses: Vec<Access>,
+    requirements: Vec<(usize, Path, Region)>,
+    writes: Vec<(usize, Region)>,
+}
+
+/// A callee's initialization contract. It is unavailable when the callee's
+/// own check produced diagnostics; a call site then records nothing against
+/// it (cascade suppression).
+fn available_contract(source: &CheckedOutcome) -> Option<&Contract> {
+    source
+        .diagnostics
+        .is_empty()
+        .then_some(&source.initialization)
+}
+
+/// Call argument values in the candidate's parameter order.
+fn ordered_arguments(candidate: &ir::Candidate, arguments: &[Value]) -> Vec<Value> {
+    candidate
+        .arg_order
+        .iter()
+        .map(|&i| arguments[i].clone())
+        .collect()
 }
 
 struct CallMapping<'borrow, 'checker, 'env, 'source> {
@@ -1203,17 +1570,22 @@ impl Initialization<'_, '_> {
     }
     fn region_symbols(&self, region: &Region, symbols: &mut BTreeSet<SymbolId>) {
         match region {
-            Region::Interval(start, end) => {
+            Region::Linear(start, end) => {
                 symbols.extend(prove::symbols(self.arena_ref(), *start));
                 symbols.extend(prove::symbols(self.arena_ref(), *end));
             }
-            Region::Image { domain, address } => {
-                symbols.extend(prove::symbols(self.arena_ref(), *address));
-                for bound in domain {
-                    symbols.insert(bound.symbol);
-                    symbols.extend(prove::symbols(self.arena_ref(), bound.start));
-                    symbols.extend(prove::symbols(self.arena_ref(), bound.end));
+            Region::Image {
+                domain,
+                coordinates,
+            } => {
+                for coordinate in coordinates {
+                    symbols.extend(prove::symbols(self.arena_ref(), *coordinate));
                 }
+                self.domain_symbols(domain, symbols);
+            }
+            Region::LinearImage { domain, address } => {
+                symbols.extend(prove::symbols(self.arena_ref(), *address));
+                self.domain_symbols(domain, symbols);
             }
             Region::Union(parts) | Region::Intersection(parts) => {
                 for part in parts {
@@ -1235,7 +1607,24 @@ impl Initialization<'_, '_> {
             Region::Empty | Region::Full => {}
         }
     }
+    fn domain_symbols(&self, domain: &[Bound], symbols: &mut BTreeSet<SymbolId>) {
+        for bound in domain {
+            symbols.insert(bound.symbol);
+            symbols.extend(prove::symbols(self.arena_ref(), bound.start));
+            symbols.extend(prove::symbols(self.arena_ref(), bound.end));
+        }
+    }
+    /// Symbols shared by distinct visits of a loop over `[start, end)`.
     fn captured_symbols(&self, entry: &World, start: IntExpr, end: IntExpr) -> BTreeSet<SymbolId> {
+        let mut symbols = self.scope_symbols(entry);
+        symbols.extend(prove::symbols(self.arena_ref(), start));
+        symbols.extend(prove::symbols(self.arena_ref(), end));
+        symbols
+    }
+    /// Symbols that denote the same value everywhere after `entry`: shape
+    /// symbols, enclosing loop binders, the values of its locals and its
+    /// path conditions.
+    fn scope_symbols(&self, entry: &World) -> BTreeSet<SymbolId> {
         fn value_symbols(value: &Value, arena: &ExprArena, symbols: &mut BTreeSet<SymbolId>) {
             match value {
                 Value::Scalar(scalar) => {
@@ -1255,9 +1644,14 @@ impl Initialization<'_, '_> {
                 Value::Tensor(_) | Value::Void => {}
             }
         }
-        let mut symbols = self.checker.sig.shape_symbols.iter().copied().collect::<BTreeSet<_>>();
-        symbols.extend(prove::symbols(self.arena_ref(), start));
-        symbols.extend(prove::symbols(self.arena_ref(), end));
+        let mut symbols = self
+            .checker
+            .sig
+            .shape_symbols
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        symbols.extend(self.binders.iter().copied());
         for value in entry.values.values() {
             value_symbols(value, self.arena_ref(), &mut symbols);
         }
@@ -1300,33 +1694,6 @@ impl Initialization<'_, '_> {
             (x == a.parameter && y == b.parameter) || (y == a.parameter && x == b.parameter)
         })
     }
-    fn separated_regions(&mut self, left: Region, right: Region, facts: &prove::Facts) -> bool {
-        let left = self.normalize(left, facts);
-        let right = self.normalize(right, facts);
-        match (left, right) {
-            (Region::Empty, _) | (_, Region::Empty) => true,
-            (Region::Union(parts), right) => parts
-                .into_iter()
-                .all(|part| self.separated_regions(part, right.clone(), facts)),
-            (left, Region::Union(parts)) => parts
-                .into_iter()
-                .all(|part| self.separated_regions(left.clone(), part, facts)),
-            (Region::Intersection(parts), right) => parts
-                .into_iter()
-                .any(|part| self.separated_regions(part, right.clone(), facts)),
-            (left, Region::Intersection(parts)) => parts
-                .into_iter()
-                .any(|part| self.separated_regions(left.clone(), part, facts)),
-            (Region::Guard(_, inner), right) => self.separated_regions(*inner, right, facts),
-            (left, Region::Guard(_, inner)) => self.separated_regions(left, *inner, facts),
-            (Region::Interval(a, b), Region::Interval(c, d)) => {
-                self.le(facts, b, c) || self.le(facts, d, a)
-            }
-            // Unsupported images cannot be called independent. Normalization
-            // above handles contiguous views and exact point selections.
-            _ => false,
-        }
-    }
     fn distinct_visit_accesses_separate(
         &mut self,
         left: &Access,
@@ -1336,6 +1703,7 @@ impl Initialization<'_, '_> {
         end: IntExpr,
         facts: &prove::Facts,
         captured: &BTreeSet<SymbolId>,
+        extents: &[IntExpr],
     ) -> bool {
         let (other_symbol, other) = self.fresh_integer();
         let mut symbols = BTreeSet::new();
@@ -1379,14 +1747,26 @@ impl Initialization<'_, '_> {
             {
                 continue;
             }
-            if !self.separated_regions(left.region.clone(), other_region.clone(), &orientation) {
+            if !self.separated_regions(
+                left.region.clone(),
+                other_region.clone(),
+                &orientation,
+                extents,
+            ) {
                 return false;
             }
         }
         true
     }
-    fn independent_accesses(
+    /// The proof that distinct visits of a loop over `symbol in [start, end)`
+    /// touch separated elements of storage live at loop entry whenever one of
+    /// them writes, including accesses imported from callee contracts. Two
+    /// `parallel for` atomic accesses with one operation commute and need no
+    /// separation (L12); an ordered loop has no atomic access at all (L25 I3).
+    /// `Err` names the first pair that may overlap.
+    fn visits_separated(
         &mut self,
+        kind: ir::LoopKind,
         entry: &World,
         outcomes: &[World],
         access_start: usize,
@@ -1394,7 +1774,7 @@ impl Initialization<'_, '_> {
         start: IntExpr,
         end: IntExpr,
         facts: &prove::Facts,
-    ) {
+    ) -> Result<(), VisitOverlap> {
         let captured = self.captured_symbols(entry, start, end);
         let accesses = outcomes
             .iter()
@@ -1404,11 +1784,26 @@ impl Initialization<'_, '_> {
             .collect::<Vec<_>>();
         for (left_index, left) in accesses.iter().enumerate() {
             for right in accesses.iter().skip(left_index) {
-                if (!left.write && !right.write) || (left.atomic && right.atomic) {
+                let commuting = match kind {
+                    ir::LoopKind::Independent => {
+                        left.atomic.is_some() && left.atomic == right.atomic
+                    }
+                    ir::LoopKind::Ordered => false,
+                };
+                let atomic = left.atomic.is_some() || right.atomic.is_some();
+                if (!left.write && !right.write) || commuting {
                     continue;
                 }
                 if !self.may_share_root(entry, left.root, right.root) {
                     continue;
+                }
+                let overlap = VisitOverlap {
+                    root: left.root,
+                    left: left.span,
+                    right: right.span,
+                };
+                if kind == ir::LoopKind::Ordered && atomic {
+                    return Err(overlap);
                 }
                 // May-alias parameters have no checked relative base offset.
                 // Their individual logical coordinates cannot establish
@@ -1419,6 +1814,7 @@ impl Initialization<'_, '_> {
                     left_region.region = Region::Full;
                     right_region.region = Region::Full;
                 }
+                let extents = entry.roots[&left.root].axes.clone();
                 if !self.distinct_visit_accesses_separate(
                     &left_region,
                     &right_region,
@@ -1427,50 +1823,41 @@ impl Initialization<'_, '_> {
                     end,
                     facts,
                     &captured,
+                    &extents,
                 ) {
-                    let root = &entry.roots[&left.root].name;
-                    self.checker.error(
-                        right.span,
-                        format!(
-                            "parallel for cannot establish independent visits: ordinary accesses to `{root}` at source offsets {} and {} may overlap across distinct visits",
-                            left.span.start, right.span.start,
-                        ),
-                    );
-                    return;
+                    return Err(overlap);
                 }
             }
         }
+        Ok(())
     }
     fn rename_region(&mut self, region: &Region, map: &HashMap<SymbolId, IntExpr>) -> Region {
         match region {
             Region::Empty => Region::Empty,
             Region::Full => Region::Full,
-            Region::Interval(a, b) => {
-                Region::Interval(self.substitute(*a, &map), self.substitute(*b, &map))
+            Region::Linear(a, b) => {
+                Region::Linear(self.substitute(*a, map), self.substitute(*b, map))
             }
-            Region::Image { domain, address } => Region::Image {
-                domain: domain
+            Region::Image {
+                domain,
+                coordinates,
+            } => Region::Image {
+                domain: self.rename_domain(domain, map),
+                coordinates: coordinates
                     .iter()
-                    .map(|d| Bound {
-                        symbol: self.renamed_bound(d.symbol, map),
-                        start: self.substitute(d.start, &map),
-                        end: self.substitute(d.end, &map),
-                    })
+                    .map(|c| self.substitute(*c, map))
                     .collect(),
-                address: self.substitute(*address, &map),
             },
-            Region::Union(parts) => Region::Union(
-                parts
-                    .iter()
-                    .map(|p| self.rename_region(p, map))
-                    .collect(),
-            ),
-            Region::Intersection(parts) => Region::Intersection(
-                parts
-                    .iter()
-                    .map(|p| self.rename_region(p, map))
-                    .collect(),
-            ),
+            Region::LinearImage { domain, address } => Region::LinearImage {
+                domain: self.rename_domain(domain, map),
+                address: self.substitute(*address, map),
+            },
+            Region::Union(parts) => {
+                Region::Union(parts.iter().map(|p| self.rename_region(p, map)).collect())
+            }
+            Region::Intersection(parts) => {
+                Region::Intersection(parts.iter().map(|p| self.rename_region(p, map)).collect())
+            }
             Region::Bind(bound, inner) => Region::Bind(
                 Bound {
                     symbol: self.renamed_bound(bound.symbol, map),
@@ -1486,6 +1873,16 @@ impl Initialization<'_, '_> {
                 Box::new(self.rename_region(inner, map)),
             ),
         }
+    }
+    fn rename_domain(&mut self, domain: &[Bound], map: &HashMap<SymbolId, IntExpr>) -> Vec<Bound> {
+        domain
+            .iter()
+            .map(|d| Bound {
+                symbol: self.renamed_bound(d.symbol, map),
+                start: self.substitute(d.start, map),
+                end: self.substitute(d.end, map),
+            })
+            .collect()
     }
     fn renamed_bound(&self, symbol: SymbolId, map: &HashMap<SymbolId, IntExpr>) -> SymbolId {
         let Some(value) = map.get(&symbol) else {
@@ -1655,15 +2052,15 @@ impl Initialization<'_, '_> {
         let root = &world.roots[&place.root];
         let available = root.written.clone().union(root.incoming.clone());
         let required = self.map_region(region.clone(), place);
-        self.covered(&available, &required, &world.path, &world.facts)
+        self.covered(&available, &required, &world.path, &world.facts, &root.axes)
     }
     fn loop_body(
         &mut self,
         mut entry: World,
         kind: ir::LoopKind,
         binder: ir::LocalId,
-        start: &ir::Expr,
-        end: &ir::Expr,
+        start: &mut ir::Expr,
+        end: &mut ir::Expr,
         body: &mut ir::Block,
         metadata: &mut crate::initialization::LoopInitialization,
     ) -> Vec<World> {
@@ -1673,11 +2070,10 @@ impl Initialization<'_, '_> {
         let end_value = self.expression(&mut entry, end);
         let end = self.integer(&end_value);
         let nonempty = Condition::Compare(BinaryOp::Lt, start, end);
-        let mut result = vec![];
         let mut empty = entry.clone();
-        if self.assume(&mut empty.path, &mut empty.facts, nonempty.clone(), false) {
-            result.push(empty);
-        }
+        let empty = self
+            .assume(&mut empty.path, &mut empty.facts, nonempty.clone(), false)
+            .then_some(empty);
         let mut iteration = entry.clone();
         if !self.assume(
             &mut iteration.path,
@@ -1685,7 +2081,7 @@ impl Initialization<'_, '_> {
             nonempty.clone(),
             true,
         ) {
-            return result;
+            return empty.into_iter().collect();
         }
         let symbol = self.checker.locals[binder.index()]
             .symbol
@@ -1827,7 +2223,11 @@ impl Initialization<'_, '_> {
                 } else {
                     self.map_region(invariant.clone(), &abstract_place)
                 };
-                iteration.roots.get_mut(&abstract_place.root).unwrap().written = written;
+                iteration
+                    .roots
+                    .get_mut(&abstract_place.root)
+                    .unwrap()
+                    .written = written;
                 *iteration
                     .values
                     .get_mut(&local.local)
@@ -1866,7 +2266,8 @@ impl Initialization<'_, '_> {
         };
         self.binders.pop();
         if kind == ir::LoopKind::Independent {
-            self.independent_accesses(
+            if let Err(overlap) = self.visits_separated(
+                kind,
                 &entry,
                 &outcomes,
                 access_start,
@@ -1874,8 +2275,18 @@ impl Initialization<'_, '_> {
                 start,
                 end,
                 &access_facts,
-            );
+            ) {
+                let root = &entry.roots[&overlap.root].name;
+                self.checker.error(
+                    overlap.right,
+                    format!(
+                        "parallel for cannot establish independent visits: ordinary accesses to `{root}` at source offsets {} and {} may overlap across distinct visits",
+                        overlap.left.start, overlap.right.start,
+                    ),
+                );
+            }
         }
+        let mut exits = vec![];
         for outcome in &outcomes {
             let path = self.independent_path(&outcome.path, symbol);
             let matching = outcomes
@@ -1918,10 +2329,12 @@ impl Initialization<'_, '_> {
                     Bound { symbol, start, end },
                     Box::new(access.region.clone()),
                 );
-                exit.accesses.push(Access {
+                let region = self.normalize(region, &entry.facts);
+                let path = self.independent_path(&access.path, symbol);
+                exit.record_access(Access {
                     root: access.root,
-                    region: self.normalize(region, &entry.facts),
-                    path: self.independent_path(&access.path, symbol),
+                    region,
+                    path,
                     span: access.span,
                     write: access.write,
                     atomic: access.atomic,
@@ -1959,7 +2372,8 @@ impl Initialization<'_, '_> {
                         available = available.union(self.normalize(prefix, &read.facts));
                     }
                 }
-                if self.covered(&available, &read.region, &read.path, &read.facts) {
+                let axes = &outcome.roots[&read.root].axes;
+                if self.covered(&available, &read.region, &read.path, &read.facts, axes) {
                     continue;
                 }
                 let region =
@@ -2005,8 +2419,12 @@ impl Initialization<'_, '_> {
             }
             exit.values
                 .retain(|local, _| entry.values.contains_key(local));
-            result.push(exit);
+            exits.push(exit);
         }
+        // Loop exits join like `if` arms, on whether the loop ran at all.
+        let (mut result, exits): (Vec<_>, Vec<_>) =
+            exits.into_iter().partition(|exit| exit.returned);
+        result.extend(self.join(&entry, &nonempty, exits, empty.into_iter().collect(), &[]));
         result
     }
 }
@@ -2050,6 +2468,9 @@ impl RegionOps for Initialization<'_, '_> {
     }
     fn arena_ref(&self) -> &ExprArena {
         &self.checker.arena
+    }
+    fn fresh_variable(&mut self) -> SymbolId {
+        self.checker.arena.proof_variable(crate::expr::SymbolSort::Int)
     }
 }
 

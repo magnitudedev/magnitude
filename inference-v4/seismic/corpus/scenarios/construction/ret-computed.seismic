@@ -1,0 +1,5 @@
+# origin: C11:ret_computed
+# cell: value-computed-tensor/exit
+# invoke: f32[4]=1,2,3,4
+fn probe(x: &tensor[4] f32) -> tensor[4] f32:
+    return x + x

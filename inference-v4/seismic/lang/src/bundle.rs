@@ -17,7 +17,7 @@ use crate::checked::{check_source, CheckedModule, SourceFile, SourceSet};
 use sha2::{Digest, Sha256};
 
 /// Format version of the bundle wire schema. Bumped on any wire change.
-pub const BUNDLE_FORMAT_VERSION: u32 = 2;
+pub const BUNDLE_FORMAT_VERSION: u32 = 3;
 
 /// Semantic version of the checker whose output this crate can decode.
 /// Bundles produced under a different semantic version are incompatible.
@@ -49,8 +49,9 @@ impl std::error::Error for CheckedBundleError {}
 pub fn encode_checked_bundle(module: &CheckedModule) -> Vec<u8> {
     let mut bytes = internals::encode(module.internal());
     bytes.extend_from_slice(&(module.assets.len() as u32).to_le_bytes());
-    for (name, source) in &module.assets {
-        internals::string(&mut bytes, name);
+    for ((entry, backend), source) in &module.assets {
+        internals::string(&mut bytes, &module.entries()[entry.index()].name);
+        internals::string(&mut bytes, backend.as_str());
         internals::string(&mut bytes, source);
     }
     let digest = Sha256::digest(&bytes);
@@ -129,9 +130,11 @@ mod internals {
         }
         let mut assets = std::collections::BTreeMap::new();
         for _ in 0..asset_count {
-            let key = reader.string()?.to_owned();
+            let entry = reader.string()?.to_owned();
+            let backend = crate::registry::BackendName::parse(reader.string()?)
+                .ok_or(CheckedBundleError::Corrupt)?;
             let value = reader.string()?.to_owned();
-            if assets.insert(key, value).is_some() { return Err(CheckedBundleError::Corrupt); }
+            if assets.insert((entry, backend), value).is_some() { return Err(CheckedBundleError::Corrupt); }
         }
         if reader.offset != bytes.len() {
             return Err(CheckedBundleError::Corrupt);
@@ -151,8 +154,9 @@ mod internals {
         if rebuilt.semantic_hash().digest() != &expected_semantic_hash {
             return Err(CheckedBundleError::HashMismatch);
         }
-        for (name, source) in assets {
-            rebuilt.capture_native_asset(&name, source).map_err(|_| CheckedBundleError::Corrupt)?;
+        for ((name, backend), source) in assets {
+            let entry = rebuilt.entry_named(&name).ok_or(CheckedBundleError::Corrupt)?;
+            rebuilt.capture_native_asset(entry, backend, source).map_err(|_| CheckedBundleError::Corrupt)?;
         }
         Ok(rebuilt)
     }
@@ -214,6 +218,7 @@ mod internals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::BackendName;
     fn checked() -> CheckedModule {
         check_source(SourceSet::new(vec![SourceFile {
             path: "snapshot.seismic".into(),
@@ -223,14 +228,16 @@ mod tests {
     #[test]
     fn snapshot_assets_roundtrip_and_affect_identity() {
         let mut module=checked();
-        module.capture_native_asset("twice","kernel version one".into()).unwrap();
+        let twice=module.entry_named("twice").unwrap();
+        module.capture_native_asset(twice,BackendName::Metal,"kernel version one".into()).unwrap();
         let first=encode_checked_bundle(&module);
         let restored=decode_checked_bundle(&first).unwrap();
-        assert_eq!(restored.native_asset("twice"),Some("kernel version one"));
+        let restored_twice=restored.entry_named("twice").unwrap();
+        assert_eq!(restored.native_asset(restored_twice,BackendName::Metal),Some("kernel version one"));
         assert_eq!(restored.entries()[0].stable,module.entries()[0].stable);
         assert_eq!(restored.entries()[0].parameter_types,module.entries()[0].parameter_types);
         assert_eq!(encode_checked_bundle(&restored),first);
-        module.capture_native_asset("twice","kernel version two".into()).unwrap();
+        module.capture_native_asset(twice,BackendName::Metal,"kernel version two".into()).unwrap();
         assert_ne!(first,encode_checked_bundle(&module));
     }
     #[test]

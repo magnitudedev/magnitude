@@ -1,0 +1,11 @@
+# origin: C11:call_in_if
+# cell: call-portable/if-arm
+# invoke: f32[4]=1,2,3,4 ; bool:true
+fn helper[N](a: &tensor[N] f32) -> tensor[N] f32:
+    return to_owned(a)
+
+fn probe[N](x: &tensor[N] f32, c: bool) -> tensor[N] f32:
+    let mut t = to_owned(x)
+    if c:
+        t = helper(x) * 3.0
+    return t

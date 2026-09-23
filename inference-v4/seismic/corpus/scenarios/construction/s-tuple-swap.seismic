@@ -1,0 +1,11 @@
+# origin: C11:s_tuple_swap
+# cell: assign-tuple/sl
+# cell: tuple-pack-get/sl
+# cell: value-tuple/exit
+# invoke: f32:1 ; f32:2
+fn probe(x: f32, y: f32) -> (f32, f32):
+    let mut a = x
+    let mut b = y
+    (a, b) = (b, a)
+    let (p, q) = (a, b)
+    return (p, q)

@@ -1,0 +1,6 @@
+# origin: C11:s_owned_param_return
+# invoke: f32[4]=1,2,3,4
+fn probe(x: tensor[4] f32) -> tensor[4] f32:
+    let mut y = x
+    y[0] = 9.0
+    return y

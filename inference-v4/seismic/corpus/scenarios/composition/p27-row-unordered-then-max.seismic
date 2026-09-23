@@ -1,0 +1,8 @@
+# origin: X1:P27
+# undecided: reassociated
+# invoke: f32[3,6]=1,2,3,4,5,6,7,1,2,3,4,5,6,7,1,2,3,4 ; f32[3]=zero
+# pin: result = f32[]=23
+fn probe[R, W](x: &tensor[R, W] f32, out: &mut tensor[R] f32) -> f32:
+    parallel for r in 0..R:
+        out[r] = reduce(x[r], 0, sum, unordered=true)
+    return reduce(out, 0, max)

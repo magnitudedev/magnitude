@@ -1,0 +1,8 @@
+# origin: test:seismic-metal:src/native_arithmetic_tests.rs:typed_i32_division_and_remainder_are_euclidean_at_word_extremes
+# invoke: i32[7]=-2147483648,-2147483648,-2147483648,-1,2147483647,-7,-7 ; i32[7]=3,-3,-2147483648,-2147483648,-2147483648,3,-3 ; i32[7]=zero ; i32[7]=zero
+# pin: q = i32[7]=-715827883,715827883,1,1,0,-3,3
+# pin: r = i32[7]=1,1,0,2147483647,2147483647,2,2
+fn probe[N](x: &tensor[N] i32, y: &tensor[N] i32, q: &mut tensor[N] i32, r: &mut tensor[N] i32):
+    parallel for i in 0..N:
+        q[i] = x[i] / y[i]
+        r[i] = x[i] % y[i]

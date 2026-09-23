@@ -1281,7 +1281,8 @@ impl<T: TargetFamily, C: NativeCompiler<T>, O: ControlledObserver<T, C::Handle>>
 mod tests {
     use super::super::{InvocationParameter, InvocationScope};
     use super::*;
-    use crate::evaluation_session::boundary_tests::{domain_with_optional, registry};
+    use crate::evaluation_session::boundary_tests::domain_with_optional;
+    use crate::realization::demand_driven_tests::registry;
     use crate::preparation_budget::{PlanningBudget, PreparationBudget};
     use crate::realization::demand_driven_tests::{device, CountingCompiler, FakeTarget};
     use seismic_lang::expr::{compiled::InvocationValues, SymbolValue};

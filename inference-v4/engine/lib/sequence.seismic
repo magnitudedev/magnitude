@@ -78,7 +78,7 @@ fn qwen_attention_sequence[M, D, T, G, KV, P, S, R](hidden: &tensor[M, D] f32,
     linear(normalized, key_weight, key)
     linear(normalized, value_weight, value)
     rotary_prepare(query_gate, key, query_norm, key_norm, coordinates, query, prepared_key, gate, rotary_components, base, epsilon)
-    attention_append[G = G](query, history_key, history_value, prepared_key, reshape(value, (M, KV, 2 * P + S)), visible, attended, scale)
+    attention_append_partitioned(reshape(query, (M, KV, G, 2 * P + S)), history_key, history_value, prepared_key, reshape(value, (M, KV, 2 * P + S)), visible, reshape(attended, (M, KV, G, 2 * P + S)), scale)
     qwen_append_rows(prepared_key, reshape(value, (M, KV, 2 * P + S)), history_key, history_value, destinations)
     sigmoid(gate, activated)
     multiply(reshape(attended, (M, KV * G * (2 * P + S))), activated, gated)

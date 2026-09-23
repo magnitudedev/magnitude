@@ -270,7 +270,7 @@ impl Function {
         let source = self
             .module
             .checked
-            .native_asset(self.name())
+            .native_asset(self.info().id, device.backend())
             .ok_or_else(|| {
                 Error::new(
                     "SourceError",
@@ -280,8 +280,8 @@ impl Function {
         let definition = runtime::NativeDefinition {
             source: source.to_owned().into(),
             entry: self.name().to_owned().into(),
-            threadgroups: def.threadgroups.each_ref().map(native_expr),
-            threads_per_threadgroup: def.threads_per_threadgroup.each_ref().map(native_expr),
+            threadgroups: def.launch.groups.each_ref().map(native_expr),
+            threads_per_threadgroup: def.launch.group_extent.each_ref().map(native_expr),
         };
         let prepared = runtime::prepare_native(
             &self.module.checked,

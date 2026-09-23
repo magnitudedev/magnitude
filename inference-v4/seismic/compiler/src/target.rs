@@ -571,7 +571,6 @@ mod internals {
                 ResourceOwnershipScope::Participant => 0,
                 ResourceOwnershipScope::Subgroup => 1,
                 ResourceOwnershipScope::Workgroup => 2,
-                ResourceOwnershipScope::CooperativeGrid => 3,
             }]);
             fingerprint.update(class.capacity_units.to_le_bytes());
             fingerprint.update(class.alignment_units.to_le_bytes());

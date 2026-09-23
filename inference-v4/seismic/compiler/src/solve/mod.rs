@@ -387,13 +387,16 @@ mod internals {
                         SymbolKind::Decision(_) => panic!(
                             "implementation expression references a decision it did not declare"
                         ),
-                        SymbolKind::CallDimension(_) | SymbolKind::CallScalar(_) => {
+                        SymbolKind::CallDimension(_)
+                        | SymbolKind::CallScalar(_)
+                        | SymbolKind::CallStride(..) => {
                             panic!("planning expression contains an invocation symbol")
                         }
                         SymbolKind::RuntimeValue(_)
                         | SymbolKind::TemplateDimension(_)
                         | SymbolKind::LoopBinder(_)
-                        | SymbolKind::ScheduleSlot(_) => {
+                        | SymbolKind::ScheduleSlot(_)
+                        | SymbolKind::ProofVariable(_) => {
                             panic!("planning expression contains a non-planning symbol")
                         }
                     }

@@ -1,0 +1,9 @@
+# origin: X1:r3-t19
+# invoke: i32[3]=1,2,3 ; f32[3]=1,2,3 ; f32[3]=zero
+# pin: out = f32[3]=2,3,4
+fn probe[R](lens: &tensor[R] i32, x: &tensor[R] f32, out: &mut tensor[R] f32):
+    parallel for r in 0..R:
+        let n = lens[r]
+        if n >= 0:
+            let t = to_owned(x[0:1])
+            out[r] = t[0] + f32(n)

@@ -325,31 +325,6 @@ pub fn estimate<B: PhysicalDialect, M: ExecutionModel<B> + ?Sized>(
                     }
                     body
                 }
-                seismic_ir::schedule::ScheduleStep::Choose { decision, options } => {
-                    let value = arena.decision_value(*decision);
-                    let mut options = options.iter().rev();
-                    let (last_expected, last_steps) = options
-                        .next()
-                        .expect("closed schedule choice has no options");
-                    let last_expected = arena.int(*last_expected);
-                    let last_guard =
-                        arena.int_cmp(seismic_lang::expr::CmpOp::Eq, value, last_expected);
-                    let mut selected = sequence(profile, arena, launches, last_steps)?;
-                    selected.guard_evidence(arena, last_guard);
-                    for (expected, branch) in options {
-                        let expected = arena.int(*expected);
-                        let condition =
-                            arena.int_cmp(seismic_lang::expr::CmpOp::Eq, value, expected);
-                        let mut branch = sequence(profile, arena, launches, branch)?;
-                        branch.guard_evidence(arena, condition);
-                        let duration =
-                            arena.duration_select(condition, branch.duration, selected.duration);
-                        branch.duration = duration;
-                        branch.contributions.extend(selected.contributions);
-                        selected = branch;
-                    }
-                    selected
-                }
             };
             result.append(arena, item);
         }
@@ -492,7 +467,9 @@ mod tests {
             let mut arena = ExprArena::default();
             let mut construction = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
             let vectors = VectorSupport::default();
-            let kernel = construction.kernel(&mut arena, &(), &[], &vectors).close();
+            let kernel = construction
+                .portable_kernel(&mut arena, &(), &[], &vectors)
+                .close();
             let one = arena.nat(1);
             let start = arena.nat(2);
             let end = arena.nat(2 + trips);
@@ -582,7 +559,9 @@ mod tests {
 
         let mut construction = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
         let vectors = VectorSupport::default();
-        let complete_kernel = construction.kernel(&mut arena, &(), &[], &vectors).close();
+        let complete_kernel = construction
+            .portable_kernel(&mut arena, &(), &[], &vectors)
+            .close();
         let mut incomplete_kernel = construction.portable_kernel(&mut arena, &(), &[], &vectors);
         incomplete_kernel.constant(ConstantValue::U32(1), ValueType::Scalar(DType::U32));
         let incomplete_kernel = incomplete_kernel.close();

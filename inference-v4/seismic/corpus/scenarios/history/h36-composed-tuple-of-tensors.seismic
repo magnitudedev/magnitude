@@ -1,0 +1,27 @@
+# origin: H-36
+# invoke: f32[2,3]=rand(12) ; f32[4,3]=rand(13) ; f32[2,4]=rand(14)
+fn dense[M, K, N](x: &tensor[M, K] f32, w: &tensor[N, K] f32) -> tensor[M, N] f32:
+    let mut y = tensor[M, N] f32
+    parallel for m in 0..M:
+        for n in 0..N:
+            let mut acc = 0.0
+            for k in 0..K:
+                acc = acc + x[m, k] * w[n, k]
+            y[m, n] = acc
+    return y
+
+fn relu[M, N](x: &tensor[M, N] f32) -> tensor[M, N] f32:
+    let mut y = tensor[M, N] f32
+    parallel for m in 0..M:
+        for n in 0..N:
+            let v = x[m, n]
+            if v > 0.0:
+                y[m, n] = v
+            else:
+                y[m, n] = 0.0
+    return y
+
+fn probe[M, K, H, N](x: &tensor[M, K] f32, w1: &tensor[H, K] f32, w2: &tensor[N, H] f32) -> (tensor[M, H] f32, tensor[M, N] f32):
+    let hidden = relu(dense(x, w1))
+    let logits = dense(hidden, w2)
+    return hidden, logits

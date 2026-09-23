@@ -2,6 +2,7 @@
 //! used here: even checker-time quantization evaluates the generated bit graph.
 use super::*;
 use ast::{BinaryOp as SourceBinary, UnaryOp as SourceUnary};
+use num_bigint::{BigInt, BigUint, Sign};
 
 type Wide = Vec<V>;
 
@@ -204,16 +205,28 @@ fn wide_divide(b: &Recipe, n: &[V], d: &[V]) -> (Wide, Wide) {
     (quotient, rem)
 }
 fn multiply_words(b: &Recipe, a: V, c: V, bits: u32) -> Wide {
-    let mut result = vec![b.u(0); 2];
-    let left = wide(b, a, 2);
+    wide_multiply(b, &[a], &[c], bits as usize)
+}
+/// Exact product of limb vectors, where only the low `bits` of `c` may be set.
+/// A constant multiplier contributes only its set bits.
+fn wide_multiply(b: &Recipe, a: &[V], c: &[V], bits: usize) -> Wide {
+    assert!(bits <= c.len() * 32);
+    let width = a.len() + c.len();
+    let mut left = a.to_vec();
+    left.resize(width, b.u(0));
+    let mut result = vec![b.u(0); width];
     for bit in 0..bits {
-        let term = wide_shl_const(b, &left, bit as usize);
-        result = wide_select(
-            b,
-            b.nonzero(b.mask(c, 1 << bit)),
-            &wide_add(b, &result, &term),
-            &result,
-        );
+        let set = b.nonzero(b.mask(c[bit / 32], 1 << (bit % 32)));
+        let known = b.builder.borrow().constant(set);
+        if known == Some(ReferenceScalar::Bool(false)) {
+            continue;
+        }
+        let sum = wide_add(b, &result, &wide_shl_const(b, &left, bit));
+        result = if known == Some(ReferenceScalar::Bool(true)) {
+            sum
+        } else {
+            wide_select(b, set, &sum, &result)
+        };
     }
     result
 }
@@ -586,6 +599,179 @@ fn float_divide(b: &Recipe, a: V, c: V, remainder: bool) -> V {
     b.typed(canonical(b, invalid, result, f), dtype)
 }
 
+/// IEEE squareRoot: the exact integer root of the scaled significand, rounded once
+/// with the remainder as sticky bit. Subnormal operands and results are exact.
+fn square_root(b: &Recipe, a: V) -> V {
+    let dtype = a.ty;
+    let f = Format::of(dtype);
+    let x = decode(b, a);
+    // Scale the significand to 2(p+2) or 2(p+2)-1 bits with an even exponent, so
+    // its root has p+2 bits: the precision, a round bit and one more bit.
+    let root_bits = f.fraction + 3;
+    let radicand_bits = 2 * root_bits;
+    let scale = b.sub(b.u(radicand_bits), word_bit_length(b, x.magnitude));
+    let odd = b.nonzero(b.mask(b.sub(x.exponent, scale), 1));
+    let scale = b.sub(scale, b.unsigned(odd));
+    let radicand = wide_shift(
+        b,
+        &wide(b, x.magnitude, (radicand_bits as usize).div_ceil(32)),
+        scale,
+        true,
+    );
+    // Digit-by-digit root: the remainder stays below 2*root+1 < 2^(p+3).
+    let mut root = b.u(0);
+    let mut remainder = b.u(0);
+    for digit in (0..root_bits as usize).rev() {
+        let pair = b.mask(b.shr(radicand[2 * digit / 32], (2 * digit % 32) as u32), 3);
+        remainder = b.union(b.shl(remainder, 2), pair);
+        let trial = b.union(b.shl(root, 2), b.u(1));
+        let fits = b.not(b.lt(remainder, trial));
+        remainder = b.select(fits, b.sub(remainder, trial), remainder);
+        root = b.union(b.shl(root, 1), b.unsigned(fits));
+    }
+    let even = b.sub(x.exponent, scale);
+    let half = b.union(b.shr(even, 1), b.mask(even, 0x8000_0000));
+    let rounded = pack(
+        b,
+        &[b.union(b.shl(root, 1), b.unsigned(b.nonzero(remainder)))],
+        b.sub(half, b.u(1)),
+        b.boolean(false),
+        f,
+    );
+    let result = b.select(b.or(x.zero, x.infinity), x.bits, rounded);
+    let invalid = b.or(x.nan, b.and(x.sign, b.not(x.zero)));
+    b.typed(canonical(b, invalid, result, f), dtype)
+}
+/// `rsqrt(x)` is `1 / sqrt(x)` in the operand dtype: two roundings.
+fn reciprocal_square_root(b: &Recipe, a: V) -> V {
+    let f = Format::of(a.ty);
+    let one = b.typed(b.u((f.bias() as u32) << f.fraction), a.ty);
+    float_divide(b, one, square_root(b, a), false)
+}
+
+// floor((2/pi) * 2^256), little-endian 32-bit limbs.
+const TWO_OVER_PI: [u32; 8] = [
+    0xdebb_c561,
+    0xfe51_63ab,
+    0x3c43_9041,
+    0xdb62_9599,
+    0xf534_ddc0,
+    0xfc27_57d1,
+    0x4e44_1529,
+    0xa2f9_836e,
+];
+// round((pi/2) * 2^62)
+const HALF_PI_Q62: u64 = 0x6487_ed51_10b4_611a;
+const ONE_Q63: u64 = 1 << 63;
+// FreeBSD __kernel_sindf and __kernel_cosdf coefficient magnitudes in Q63, from
+// the msun double literals (rounded to nearest where they have finer bits).
+// sin r = r(1 - z(S1 - z(S2 - z(S3 - z S4)))) and
+// cos r = 1 - z(C0 - z(C1 - z(C2 - z C3))), with z = r^2 and alternating signs.
+const SIN_Q63: [u64; 4] = [
+    0x15_5555_54cb_ac77 << 8,          // S1 = -0x15555554cbac77.0p-55
+    0x11_1110_896e_fbb2 << 4,          // S2 =  0x111110896efbb2.0p-59
+    0x1a_00f9_e2ca_e774 >> 2,          // S3 = -0x1a00f9e2cae774.0p-65
+    (0x16_cd87_8c3b_46a7 + 0x80) >> 8, // S4 = 0x16cd878c3b46a7.0p-71
+];
+const COS_Q63: [u64; 4] = [
+    0x1f_ffff_fd0c_5e81 << 9, // C0 = -0x1ffffffd0c5e81.0p-54
+    0x15_5553_e105_3a42 << 6, // C1 =  0x155553e1053a42.0p-57
+    0x16_c087_e80f_1e27 << 1, // C2 = -0x16c087e80f1e27.0p-62
+    0x19_9342_e0ee_5069 >> 5, // C3 =  0x199342e0ee5069.0p-68
+];
+
+fn wide_constant(b: &Recipe, x: u64) -> Wide {
+    vec![b.u(x as u32), b.u((x >> 32) as u32)]
+}
+/// Unsigned Q63 product of two 64-bit fixed-point values, truncated.
+fn fixed_multiply(b: &Recipe, a: &[V], c: &[V]) -> Wide {
+    let product = wide_multiply(b, a, c, 64);
+    wide_shr_const(b, &product, 63)[..2].to_vec()
+}
+/// Horner evaluation of `ONE - z(k0 - z(k1 - z(k2 - z k3)))` on magnitudes. Each
+/// subtraction is positive for |r| <= pi/4, which fixes the alternating signs.
+fn fixed_polynomial(b: &Recipe, z: &[V], coefficients: [u64; 4]) -> Wide {
+    let mut value = wide_constant(b, coefficients[3]);
+    for &k in coefficients[..3].iter().rev().chain([ONE_Q63].iter()) {
+        value = wide_sub(b, &wide_constant(b, k), &fixed_multiply(b, z, &value));
+    }
+    value
+}
+fn boolean_xor(b: &Recipe, a: V, c: V) -> V {
+    b.not(b.eq(b.unsigned(a), b.unsigned(c)))
+}
+
+/// F32 sine or cosine. The argument is reduced by Payne-Hanek to a quadrant and a
+/// fraction of pi/2 normalized to 64 significant bits, multiplied by pi/2 in Q62,
+/// and the FreeBSD kernels are evaluated in 64-bit fixed point. The only
+/// rounding is the final nearest-even packing to F32.
+pub(super) fn sine_or_cosine(b: &Recipe, a: V, cosine: bool) -> V {
+    assert_eq!(a.ty, DType::F32);
+    let f = Format::of(DType::F32);
+    let x = decode(b, a);
+    let finite = b.not(b.or(x.nan, x.infinity));
+    // |x| <= pi/4 (0x3f490fda) is its own reduced argument.
+    let direct = b.lt(b.mask(x.bits, 0x7fff_ffff), b.u(0x3f49_0fdb));
+
+    // |x| * 2/pi = m * C * 2^(E-256). Shifting by E+24 >= 0 puts the binary point
+    // at bit 280; C's truncation error stays below 2^-128 there.
+    let product = wide_multiply(b, &TWO_OVER_PI.map(|w| b.u(w)), &[x.magnitude], 24);
+    let aligned = wide_shift(b, &product, b.add(x.exponent, b.u(24)), true);
+    let quotient = b.mask(b.shr(aligned[8], 24), 3);
+    let rounds_up = b.nonzero(b.mask(aligned[8], 1 << 23));
+    let mut fraction = aligned.clone();
+    fraction[8] = b.mask(aligned[8], 0x00ff_ffff);
+    let mut one = vec![b.u(0); 9];
+    one[8] = b.u(1 << 24);
+    let fraction = wide_select(b, rounds_up, &wide_sub(b, &one, &fraction), &fraction);
+    let quadrant = b.mask(b.add(quotient, b.unsigned(rounds_up)), 3);
+    // Over every F32 above pi/4 the fraction is at least 2^-30 (least at
+    // 16367173 * 2^72, by exhaustive search), so the 64 bits from its leading one
+    // lie far above the constant's truncation error.
+    let length = wide_bit_length(b, &fraction);
+    let normalized = wide_shift(b, &fraction, b.sub(b.u(288), length), true);
+    let reduced = wide_multiply(b, &normalized[7..], &wide_constant(b, HALF_PI_Q62), 64);
+    let reduced_exponent = b.sub(length, b.u(342));
+
+    // r = R * 2^e with R in [2^61, 2^63).
+    let direct_shift = b.sub(b.u(63), word_bit_length(b, x.magnitude));
+    let direct_r = wide_shift(b, &wide(b, x.magnitude, 2), direct_shift, true);
+    let r = wide_select(b, direct, &direct_r, &reduced[2..]);
+    let exponent = b.select(direct, b.sub(x.exponent, direct_shift), reduced_exponent);
+    let quadrant = b.select(direct, b.u(0), quadrant);
+    let r_negative = b.and(b.not(direct), rounds_up);
+
+    // z = r^2 in Q63.
+    let square = wide_multiply(b, &r, &r, 64);
+    let z_shift = b.negate_word(b.add(b.add(exponent, exponent), b.u(63)));
+    let z = wide_shift(b, &square, z_shift, false)[..2].to_vec();
+    let sine = wide_multiply(b, &r, &fixed_polynomial(b, &z, SIN_Q63), 64);
+    let mut cosine_value = fixed_polynomial(b, &z, COS_Q63);
+    cosine_value.resize(4, b.u(0));
+
+    let odd = b.nonzero(b.mask(quadrant, 1));
+    let high = b.nonzero(b.mask(quadrant, 2));
+    let (uses_sine, negative) = if cosine {
+        (
+            odd,
+            b.select(odd, boolean_xor(b, r_negative, b.not(high)), high),
+        )
+    } else {
+        (
+            b.not(odd),
+            boolean_xor(
+                b,
+                x.sign,
+                b.select(odd, high, boolean_xor(b, r_negative, high)),
+            ),
+        )
+    };
+    let magnitude = wide_select(b, uses_sine, &sine, &cosine_value);
+    let scale = b.select(uses_sine, b.sub(exponent, b.u(63)), b.u((-63i32) as u32));
+    let result = pack(b, &magnitude, scale, negative, f);
+    b.typed(canonical(b, b.not(finite), result, f), DType::F32)
+}
+
 pub(super) fn compare(b: &Recipe, op: CmpOp, a: V, c: V) -> V {
     assert_eq!(a.ty, c.ty);
     let dtype = a.ty;
@@ -869,13 +1055,24 @@ pub(super) fn cast(b: &Recipe, a: V, to: DType) -> V {
     b.typed(b.select(a.nan, b.u(0), result), to)
 }
 
+/// The word realization of `integer_to_float`: the two's-complement value
+/// `high·2^32 + low` as sign and magnitude, packed by the same rounding.
+fn word_integer_to_float(b: &Recipe, low: V, high: V, to: DType) -> V {
+    let words = [b.bits(low), b.bits(high)];
+    let sign = b.sign(words[1], 31);
+    let negated = wide_sub(b, &[b.u(0), b.u(0)], &words);
+    let magnitude = wide_select(b, sign, &negated, &words);
+    let f = Format::of(to);
+    b.typed(pack(b, &magnitude, b.u(0), sign, f), to)
+}
+
 pub(super) fn operation(b: &Recipe, op: ScalarOp, args: &[V]) -> V {
     // These are construction defects, never invocation rejection: checked
     // source has already established the operation's closed scalar signature.
     let arity = match op {
-        ScalarOp::Binary(_) => 2,
+        ScalarOp::Binary(_) | ScalarOp::IntegerToFloat(_) => 2,
         ScalarOp::Math(op) => op.arity(),
-        _ => 1,
+        ScalarOp::Unary(_) | ScalarOp::Cast(_) => 1,
     };
     assert_eq!(args.len(), arity, "scalar recipe operand arity");
     match op {
@@ -893,7 +1090,14 @@ pub(super) fn operation(b: &Recipe, op: ScalarOp, args: &[V]) -> V {
         ScalarOp::Unary(SourceUnary::Not) => assert_eq!(args[0].ty, DType::Bool),
         ScalarOp::Unary(SourceUnary::BitNot) => assert!(args[0].ty.is_int()),
         ScalarOp::Unary(SourceUnary::Neg) => assert!(args[0].ty.is_numeric()),
-        _ => {}
+        ScalarOp::IntegerToFloat(to) => {
+            assert!(to.is_float(), "integer_to_float target must be a float dtype");
+            assert!(
+                args.iter().all(|a| a.ty == DType::U32),
+                "integer_to_float operands are U32 words"
+            );
+        }
+        ScalarOp::Binary(_) | ScalarOp::Cast(_) => {}
     }
     match op {
         ScalarOp::Binary(op) => {
@@ -912,6 +1116,7 @@ pub(super) fn operation(b: &Recipe, op: ScalarOp, args: &[V]) -> V {
             assert_eq!(args.len(), 1);
             cast(b, args[0], to)
         }
+        ScalarOp::IntegerToFloat(to) => word_integer_to_float(b, args[0], args[1], to),
         ScalarOp::Math(op) => {
             assert_eq!(args.len(), op.arity());
             match op {
@@ -919,6 +1124,8 @@ pub(super) fn operation(b: &Recipe, op: ScalarOp, args: &[V]) -> V {
                 MathOp::Min => minmax(b, args[0], args[1], false),
                 MathOp::Max => minmax(b, args[0], args[1], true),
                 MathOp::Fma => float_multiply(b, args[0], args[1], Some(args[2])),
+                MathOp::Sqrt => square_root(b, args[0]),
+                MathOp::Rsqrt => reciprocal_square_root(b, args[0]),
                 _ => transcendental(b, op, args[0]),
             }
         }
@@ -961,15 +1168,21 @@ pub(super) fn integer_literal(dtype: DType, value: i128) -> ReferenceScalar {
     if !dtype.is_float() {
         return ReferenceScalar::from_bits(dtype, value as u32);
     }
+    integer_to_float(dtype, &BigInt::from(value))
+}
+/// The exact integer rounded once to nearest-even. Every magnitude of at least
+/// 2^(emax+2) overflows, so that bound stands for all of them.
+pub(super) fn integer_to_float(dtype: DType, value: &BigInt) -> ReferenceScalar {
+    let f = Format::of(dtype);
+    let bound = BigUint::from(1u32) << (f.emax + 2) as u32;
+    let magnitude = value.magnitude().min(&bound);
     let b = Recipe::default();
-    let magnitude = value.unsigned_abs();
-    let words = [
-        b.u(magnitude as u32),
-        b.u((magnitude >> 32) as u32),
-        b.u((magnitude >> 64) as u32),
-        b.u((magnitude >> 96) as u32),
-    ];
-    let bits = pack(&b, &words, b.u(0), b.boolean(value < 0), Format::of(dtype));
+    let mut words: Vec<V> = magnitude.iter_u32_digits().map(|w| b.u(w)).collect();
+    if words.is_empty() {
+        words.push(b.u(0));
+    }
+    let negative = value.sign() == Sign::Minus;
+    let bits = pack(&b, &words, b.u(0), b.boolean(negative), f);
     let output = b.typed(bits, dtype);
     evaluate(&b.finish(output), &[]).unwrap()
 }

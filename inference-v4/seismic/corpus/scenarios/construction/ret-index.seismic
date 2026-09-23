@@ -1,0 +1,4 @@
+# origin: C11:ret_index
+# invoke: index:3
+fn probe(i: index[10]) -> index[10]:
+    return i

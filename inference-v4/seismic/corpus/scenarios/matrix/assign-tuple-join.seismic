@@ -1,0 +1,11 @@
+# cell: assign-tuple/join
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; bool:true
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; bool:false
+fn probe(x: &tensor[4, 8] f32, out: &mut tensor[4] f32, c: bool):
+    let mut a = 0.0
+    let mut b = 0.0
+    if c:
+        (a, b) = (x[0, 0], x[0, 1])
+    else:
+        (a, b) = (1.0, 2.0)
+    out[0] = a * b

@@ -306,15 +306,13 @@ mod tests {
                     DenseF32::id(),
                     vec![length],
                 );
-                let view = construction.view(index, DenseF32::id());
-                construction.typed_view::<DenseF32>(view)
+                construction.view(index, DenseF32::id())
             })
             .collect::<Vec<_>>();
         let mut schedule = construction.schedule(&mut arena, 0);
-        schedule.fill_zero(views[0]);
-        schedule.fill_zero(views[1]);
-        schedule.fill_zero(views[0]);
-        schedule.fill_zero(views[2]);
+        for view in [views[0], views[1], views[0], views[2]] {
+            schedule.fill_constant_any(view, seismic_lang::intrinsics::FillConstant::Zero);
+        }
         let closed = schedule.close();
         let analyzed = construction
             .close(closed)

@@ -1,0 +1,6 @@
+# origin: C20:G-T3-1
+# invoke: f32[7]=seq ; f32[7]=zero
+# pin: dst = f32[7]=0,2,4,6,8,10,12
+fn probe[N](x: &tensor[N] f32, dst: &mut tensor[N] f32):
+    parallel for k in 0..N:
+        dst[k] = x[k] * 2.0

@@ -1,8 +1,8 @@
 //! The CPU backend (spec §2.3, §24.1 R9): host target discovery and
-//! profile, the CPU capability registry (no capability intrinsics;
-//! structural factories only), the Cranelift native compiler that consumes
-//! closed typed kernels, and the executor that runs the core-owned command
-//! vocabulary over host buffers and the worker pool.
+//! profile, the CPU capability registry (no capability intrinsics), the
+//! Cranelift native compiler that consumes closed kernels, and the executor
+//! that runs the core-owned command vocabulary over host buffers and the
+//! worker pool.
 //!
 //! Execution model. A launch is a grid of workgroups. The worker pool is
 //! split into teams of `workgroup threads` workers (the profile bounds a

@@ -1,0 +1,5 @@
+# origin: test:validation:corpus/shape.seismic:flat_product
+# invoke flat_product: f32[2,3]=seq ; f32[6]=zero
+fn flat_product[M, N](x: &tensor[M, N] f32, y: &mut tensor[M * N] f32):
+    parallel for i in 0..M:
+        y[i * N : (i + 1) * N] = x[i]

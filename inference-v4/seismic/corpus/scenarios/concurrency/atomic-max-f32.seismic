@@ -1,0 +1,5 @@
+# origin: C17:atomic_max_f32
+# invoke: f32[4096]=rand(62) ; f32[1]=-10
+fn probe[N](x: &tensor[N] f32, out: &mut tensor[1] f32):
+    parallel for i in 0..N:
+        atomic(max, out[0], x[i])

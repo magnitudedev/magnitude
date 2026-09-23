@@ -8,7 +8,7 @@
 //! Ownership (owned tensor / shared borrow / exclusive borrow) is a signature
 //! property carried next to the type, never a type variant.
 
-use crate::expr::IntExpr;
+use crate::expr::{ExprArena, IntExpr, SymbolId};
 use crate::ids::{CapabilityId, RepresentationId};
 use std::fmt;
 
@@ -266,27 +266,80 @@ impl ValueType {
     }
 }
 
-impl fmt::Display for ValueType {
+impl ValueType {
+    /// The type with its shape expressions, in source spelling: for example
+    /// `tensor[N - 1] f32` or `index[B]` (L23 c). `name` names the arena's
+    /// symbols.
+    pub(crate) fn with_shapes<'a>(
+        &'a self,
+        arena: &'a ExprArena,
+        name: &'a dyn Fn(SymbolId) -> String,
+    ) -> ShapedValueType<'a> {
+        ShapedValueType {
+            ty: self,
+            extents: Some((arena, name)),
+        }
+    }
+}
+
+/// A `ValueType` rendered in source spelling. Without an arena, every shape
+/// expression is written `_`.
+pub(crate) struct ShapedValueType<'a> {
+    ty: &'a ValueType,
+    extents: Option<(&'a ExprArena, &'a dyn Fn(SymbolId) -> String)>,
+}
+
+impl ShapedValueType<'_> {
+    fn extent(&self, extent: IntExpr) -> String {
+        match self.extents {
+            Some((arena, name)) => crate::check::prove::display(arena, extent, name),
+            None => "_".to_string(),
+        }
+    }
+}
+
+impl fmt::Display for ShapedValueType<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Scalar(dtype) => write!(f, "{dtype}"),
-            Self::Integer => f.write_str("integer"),
-            Self::Index { .. } => f.write_str("index"),
-            Self::Range { .. } => f.write_str("range"),
-            Self::Tensor(tensor) => write!(f, "tensor<{:?}; rank {}>", tensor.elem, tensor.rank()),
-            Self::Tuple(items) => {
+        match self.ty {
+            ValueType::Scalar(dtype) => write!(f, "{dtype}"),
+            ValueType::Integer => f.write_str("integer"),
+            ValueType::Index { bound } => write!(f, "index[{}]", self.extent(*bound)),
+            ValueType::Range { bound } => write!(f, "range[{}]", self.extent(*bound)),
+            ValueType::Tensor(tensor) => {
+                let axes = tensor
+                    .axes
+                    .iter()
+                    .map(|axis| self.extent(*axis))
+                    .collect::<Vec<_>>();
+                write!(f, "tensor[{}] {}", axes.join(", "), tensor.elem)
+            }
+            ValueType::Tuple(items) => {
                 f.write_str("(")?;
                 for (index, item) in items.iter().enumerate() {
                     if index != 0 {
                         f.write_str(", ")?;
                     }
+                    let item = ShapedValueType {
+                        ty: item,
+                        extents: self.extents,
+                    };
                     write!(f, "{item}")?;
                 }
                 f.write_str(")")
             }
-            Self::Opaque { name, .. } => write!(f, "opaque<{name}>"),
-            Self::Void => f.write_str("void"),
+            ValueType::Opaque { name, .. } => write!(f, "opaque<{name}>"),
+            ValueType::Void => f.write_str("void"),
         }
+    }
+}
+
+impl fmt::Display for ValueType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        ShapedValueType {
+            ty: self,
+            extents: None,
+        }
+        .fmt(f)
     }
 }
 
@@ -342,4 +395,28 @@ pub(crate) fn canonical_leaves(ty: &ValueType) -> Option<Vec<(ValuePath, Leaf<'_
     let mut out = Vec::new();
     walk(ty, &ValuePath::default(), &mut out)?;
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn types_render_with_their_shape_expressions() {
+        let mut arena = ExprArena::new();
+        let (n, n_expr) = arena.template_dimension(0);
+        let one = arena.int(1);
+        let shorter = arena.int_sub(n_expr, one);
+        let name = |symbol: SymbolId| if symbol == n { "N".to_string() } else { format!("{symbol:?}") };
+        let tensor = |axis| ValueType::Tensor(TensorType::new(vec![axis], Elem::Dtype(DType::F32)));
+        assert_eq!(tensor(n_expr).with_shapes(&arena, &name).to_string(), "tensor[N] f32");
+        // Extents print in the prover's normal form, as every shape diagnostic does.
+        assert_eq!(tensor(shorter).with_shapes(&arena, &name).to_string(), "tensor[-1 + N] f32");
+        assert_eq!(
+            ValueType::Index { bound: n_expr }.with_shapes(&arena, &name).to_string(),
+            "index[N]"
+        );
+        assert_eq!(tensor(shorter).to_string(), "tensor[_] f32");
+        assert_eq!(ValueType::Scalar(DType::I32).to_string(), "i32");
+    }
 }

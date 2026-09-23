@@ -1,0 +1,9 @@
+# std: yes
+# origin: C28:G-T11-3
+# invoke: f16[3,8]=rand(161) ; f16[5,8]=rand(162)
+fn probe[M, N, K](a: &tensor[M, K] f16, b: &tensor[N, K] f16) -> tensor[M, N] f32:
+    let mut seed = tensor[M, N] f32
+    for i in 0..M:
+        for j in 0..N:
+            seed[i, j] = 0.0
+    return matmul(a, b, seed)

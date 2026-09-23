@@ -1,0 +1,5 @@
+# origin: C11:s_mut_slice_store
+# cell: store-slice/sl
+# invoke: f32[4]=0,0,0,0 ; f32[4]=1,2,3,4
+fn probe[N](dst: &mut tensor[N] f32, src: &tensor[N] f32):
+    dst[0:N] = src * 2.0

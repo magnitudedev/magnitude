@@ -42,12 +42,21 @@ impl BackendName {
             BackendName::Cuda => "cuda",
         }
     }
+
+    /// Whether source may declare a direct `native … for` implementation on
+    /// this backend (the explicitly selected direct-native route, D6).
+    pub fn supports_direct_native(self) -> bool {
+        match self {
+            BackendName::Metal => true,
+            BackendName::Cpu | BackendName::Cuda => false,
+        }
+    }
 }
 
 /// Revision of the whole registry. Any semantic change to a primitive,
 /// capability, intrinsic, or representation changes this string, and with it
 /// every cache identity.
-pub const REGISTRY_REVISION: &str = "seismic-registry-v13";
+pub const REGISTRY_REVISION: &str = "seismic-registry-v14";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapabilityInfo {
@@ -112,6 +121,32 @@ pub enum OperandCategory {
     Constant(DType),
 }
 
+impl OperandCategory {
+    fn admits(&self, operand: &OperandElement) -> bool {
+        match (self, operand) {
+            (OperandCategory::Scalar(dtype), OperandElement::Scalar(actual)) => dtype == actual,
+            (
+                OperandCategory::Readable {
+                    representation,
+                    rank,
+                },
+                OperandElement::Tensor {
+                    representation: actual,
+                    rank: actual_rank,
+                },
+            ) => representation == actual && rank == actual_rank,
+            (OperandCategory::Scalar(_), OperandElement::Tensor { .. })
+            | (OperandCategory::Readable { .. }, OperandElement::Scalar(_)) => false,
+            (
+                OperandCategory::Writable { .. }
+                | OperandCategory::Opaque { .. }
+                | OperandCategory::Constant(_),
+                _,
+            ) => unreachable!("intrinsic rows declare only scalar and readable operands"),
+        }
+    }
+}
+
 /// One result axis projected from an actual tensor argument. The ordered
 /// projections define result rank as well as geometry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,6 +188,35 @@ pub enum IntrinsicParticipation {
     Independent,
     FullSubgroup,
     FullWorkgroup,
+    /// A full workgroup of exactly this many participants. A placement fact
+    /// like `FullWorkgroup`; the size is consumed by physical construction.
+    FixedWorkgroup(u32),
+}
+
+/// Language meaning of one intrinsic row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IntrinsicDenotation {
+    /// Lane index within the cohort of the enclosing parallel loop.
+    ParticipantIndex,
+    /// Value of the named cohort member.
+    Exchange,
+    /// Fold over the cohort; association unspecified for `Sum`, exact for
+    /// `Max`/`Min`.
+    CohortFold { op: crate::intrinsics::ReduceOp },
+    /// `out[i, j] = (acc[i, j] +) sum_k a[i, k] * b[k, j]`, association
+    /// unspecified.
+    MatrixProduct { accumulate: bool },
+}
+
+/// The element category of one actual intrinsic operand, as overload
+/// resolution compares it against a row's `OperandCategory`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OperandElement {
+    Scalar(DType),
+    Tensor {
+        representation: RepresentationId,
+        rank: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -320,6 +384,93 @@ impl PackedPacketLayout {
     pub fn bytes(&self, outer_rows: u64, logical_extent: u64) -> Option<u64> {
         outer_rows.checked_mul(self.row_bytes(logical_extent)?)
     }
+
+    /// Canonical packets of `rows` rows of `logical_extent` elements, assembled
+    /// from plane-separated bytes. `planes` names every plane of this layout
+    /// exactly once, in any order. Plane `p` supplies
+    /// `rows × packet_extent(logical_extent) × p.bytes_per_group` bytes ordered
+    /// by (row, packet); each packet's slice is exactly the bytes that plane
+    /// occupies inside one canonical packet. Packet bytes no plane occupies
+    /// are zero.
+    ///
+    /// The caller has established that `bytes(rows, logical_extent)` exists
+    /// (the canonical byte count of the tensor fits `u64`); geometry that
+    /// overflows is a caller contradiction and panics.
+    pub fn packets_from_planes(
+        &self,
+        rows: u64,
+        logical_extent: u64,
+        planes: &[(&str, &[u8])],
+    ) -> Result<Vec<u8>, PlaneAssemblyError> {
+        let total = self
+            .bytes(rows, logical_extent)
+            .expect("packed tensor geometry has a canonical byte count");
+        let packets = rows
+            .checked_mul(self.packet_extent(logical_extent))
+            .expect("packet count of a tensor with a canonical byte count fits u64");
+        if planes.len() != self.planes.len()
+            || !self
+                .planes
+                .iter()
+                .all(|plane| planes.iter().filter(|(name, _)| *name == plane.name).count() == 1)
+        {
+            return Err(PlaneAssemblyError::PlaneSet);
+        }
+        let supplied: Vec<&[u8]> = self
+            .planes
+            .iter()
+            .map(|plane| {
+                let bytes = planes
+                    .iter()
+                    .find(|(name, _)| *name == plane.name)
+                    .expect("every layout plane is supplied exactly once")
+                    .1;
+                let expected = packets
+                    .checked_mul(u64::from(plane.bytes_per_group))
+                    .expect("plane bytes of a tensor with a canonical byte count fit u64");
+                let actual = bytes.len() as u64;
+                if actual == expected {
+                    Ok(bytes)
+                } else {
+                    Err(PlaneAssemblyError::PlaneByteLength {
+                        plane: plane.name,
+                        expected,
+                        actual,
+                    })
+                }
+            })
+            .collect::<Result<_, _>>()?;
+        let mut canonical = vec![
+            0u8;
+            usize::try_from(total).expect("canonical packet bytes fit the host address space")
+        ];
+        let packet_size = self.packet_size as usize;
+        for (plane, bytes) in self.planes.iter().zip(supplied) {
+            let width = plane.bytes_per_group as usize;
+            let offset = plane.offset as usize;
+            for (packet, source) in canonical
+                .chunks_exact_mut(packet_size)
+                .zip(bytes.chunks_exact(width))
+            {
+                packet[offset..offset + width].copy_from_slice(source);
+            }
+        }
+        Ok(canonical)
+    }
+}
+
+/// Plane-separated bytes that do not form a packed layout's planes
+/// (`PackedPacketLayout::packets_from_planes`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlaneAssemblyError {
+    /// The supplied plane names are not exactly the layout's plane names.
+    PlaneSet,
+    /// A plane's byte length differs from its canonical length.
+    PlaneByteLength {
+        plane: &'static str,
+        expected: u64,
+        actual: u64,
+    },
 }
 
 pub fn capability(backend: BackendName, name: &str) -> Option<CapabilityId> {
@@ -331,8 +482,30 @@ pub fn capability_info(id: CapabilityId) -> &'static CapabilityInfo {
 pub fn capabilities(backend: BackendName) -> &'static [CapabilityInfo] {
     internals::capabilities(backend)
 }
-pub fn intrinsic(capability: CapabilityId, name: &str) -> Option<IntrinsicId> {
-    internals::intrinsic(capability, name)
+/// Every row of `capability` named `name`, in declaration order. Empty when
+/// the capability has no intrinsic of that name.
+pub fn intrinsic_overloads(capability: CapabilityId, name: &str) -> &'static [IntrinsicId] {
+    internals::intrinsic_overloads(capability, name)
+}
+/// The row of `overload` whose declared arguments are exactly `operands`.
+/// Rows of one overload have pairwise distinct argument lists (the table is
+/// built that way), so at most one row matches.
+pub fn resolve_intrinsic(
+    overload: &[IntrinsicId],
+    operands: &[OperandElement],
+) -> Option<IntrinsicId> {
+    overload.iter().copied().find(|id| {
+        let arguments = &intrinsic_signature(*id).arguments;
+        arguments.len() == operands.len()
+            && arguments
+                .iter()
+                .zip(operands)
+                .all(|(argument, operand)| argument.category.admits(operand))
+    })
+}
+/// The language meaning of one intrinsic row.
+pub fn intrinsic_denotation(id: IntrinsicId) -> IntrinsicDenotation {
+    internals::intrinsic_denotation(id)
 }
 pub fn intrinsic_signature(id: IntrinsicId) -> &'static IntrinsicSignature {
     internals::intrinsic_signature(id)
@@ -360,9 +533,59 @@ pub fn representation_conversion_info(
 ) -> &'static RepresentationConversion {
     internals::representation_conversion_info(id)
 }
+/// The unique registered conversion whose source is `source`: the resident
+/// form of an external representation. `None` for dense and packed
+/// representations. The table build asserts at most one conversion per source.
+pub fn resident_conversion(source: RepresentationId) -> Option<&'static RepresentationConversion> {
+    internals::resident_conversion(source)
+}
+/// Canonical storage bytes of a contiguous tensor with `extents` in
+/// representation `id`: dense = elements × dtype bytes; packed and external =
+/// rows × ceil(last / group) × packet bytes, where rows is the product of the
+/// leading extents. `None` when `extents` is empty for a packed or external
+/// representation, or when the count overflows `u64`.
+pub fn canonical_bytes(id: RepresentationId, extents: &[u64]) -> Option<u64> {
+    let rows_and_last = || {
+        let (last, leading) = extents.split_last()?;
+        let rows = leading
+            .iter()
+            .try_fold(1u64, |rows, extent| rows.checked_mul(*extent))?;
+        Some((rows, *last))
+    };
+    match &representation_info(id).kind {
+        RepresentationKind::Dense(dtype) => extents
+            .iter()
+            .try_fold(u64::from(dtype.bytes()), |bytes, extent| bytes.checked_mul(*extent)),
+        RepresentationKind::Packed(layout) => {
+            let (rows, last) = rows_and_last()?;
+            layout.bytes(rows, last)
+        }
+        RepresentationKind::External(layout) => {
+            let (rows, last) = rows_and_last()?;
+            rows.checked_mul(last.div_ceil(u64::from(layout.logical_group)))?
+                .checked_mul(u64::from(layout.packet_size))
+        }
+    }
+}
 /// The dense representation of a dtype.
 pub fn dense(dtype: DType) -> RepresentationId {
     internals::dense(dtype)
+}
+
+/// Storage dtype of one element of the plane view `t.<plane>` of a packed
+/// representation (`PlaneInfo::storage_dtype`). The checker resolved both the
+/// representation and the plane name, so either being unknown panics.
+pub fn plane_element_dtype(representation: RepresentationId, plane: &str) -> DType {
+    let info = representation_info(representation);
+    let RepresentationKind::Packed(layout) = &info.kind else {
+        panic!("plane view of the non-packed representation `{}`", info.name)
+    };
+    layout
+        .planes
+        .iter()
+        .find(|candidate| candidate.name == plane)
+        .unwrap_or_else(|| panic!("`{}` has no plane `{plane}`", info.name))
+        .storage_dtype
 }
 
 /// Canonical typed decode recipe for a packed representation. Dense
@@ -460,7 +683,7 @@ pub(crate) mod internals {
     //! capability so backend/capability slices are direct sub-slices.
 
     use super::*;
-    use crate::intrinsics::{capability_rows, CapabilitySemantics, RowOperand, RowResult};
+    use crate::intrinsics::{capability_rows, RowOperand, RowResult};
     use crate::repr::{Coefficients, PlaneEncoding, Repr, REPRS};
     use std::sync::OnceLock;
 
@@ -469,9 +692,11 @@ pub(crate) mod internals {
         /// `[start, end)` into `capabilities` per backend, in `BackendName::ALL` order.
         capability_ranges: Vec<(usize, usize)>,
         intrinsics: Vec<IntrinsicSignature>,
-        semantics: Vec<CapabilitySemantics>,
+        denotations: Vec<IntrinsicDenotation>,
         /// `[start, end)` into `intrinsics` per capability.
         intrinsic_ranges: Vec<(usize, usize)>,
+        /// Every row of one capability sharing one name, in declaration order.
+        overloads: Vec<(CapabilityId, &'static str, Vec<IntrinsicId>)>,
         representations: Vec<RepresentationInfo>,
         conversions: Vec<RepresentationConversion>,
     }
@@ -541,6 +766,12 @@ pub(crate) mod internals {
                 layout,
                 &recipe,
             );
+            assert!(
+                conversions
+                    .iter()
+                    .all(|conversion: &RepresentationConversion| conversion.source != source),
+                "external representation `{source_name}` has more than one resident conversion"
+            );
             conversions.push(RepresentationConversion {
                 id: RepresentationConversionId::new(conversions.len() as u32),
                 source,
@@ -554,8 +785,9 @@ pub(crate) mod internals {
         let mut capabilities: Vec<CapabilityInfo> = Vec::new();
         let mut capability_ranges = Vec::new();
         let mut intrinsics = Vec::new();
-        let mut semantics = Vec::new();
+        let mut denotations = Vec::new();
         let mut intrinsic_ranges = Vec::new();
+        let mut overloads: Vec<(CapabilityId, &'static str, Vec<IntrinsicId>)> = Vec::new();
         for backend in BackendName::ALL {
             let start = capabilities.len();
             for row in rows.iter().filter(|row| row.backend == backend) {
@@ -639,8 +871,28 @@ pub(crate) mod internals {
                     },
                     numerical: row.numerics.clone(),
                 });
-                semantics.push(row.semantics);
+                denotations.push(row.denotation);
                 intrinsic_ranges[capability.index()].1 = intrinsics.len();
+                match overloads
+                    .iter_mut()
+                    .find(|(owner, name, _)| *owner == capability && *name == row.name)
+                {
+                    Some((_, _, rows)) => {
+                        let categories = |row: IntrinsicId| {
+                            intrinsics[row.index()]
+                                .arguments
+                                .iter()
+                                .map(|argument| &argument.category)
+                                .collect::<Vec<_>>()
+                        };
+                        assert!(
+                            rows.iter().all(|other| categories(*other) != categories(id)),
+                            "two rows of one intrinsic overload declare the same operands"
+                        );
+                        rows.push(id);
+                    }
+                    None => overloads.push((capability, row.name, vec![id])),
+                }
             }
             capability_ranges.push((start, capabilities.len()));
         }
@@ -648,8 +900,9 @@ pub(crate) mod internals {
             capabilities,
             capability_ranges,
             intrinsics,
-            semantics,
+            denotations,
             intrinsic_ranges,
+            overloads,
             representations,
             conversions,
         }
@@ -1012,11 +1265,12 @@ pub(crate) mod internals {
         let (start, end) = t.capability_ranges[backend as usize];
         &t.capabilities[start..end]
     }
-    pub(super) fn intrinsic(capability: CapabilityId, name: &str) -> Option<IntrinsicId> {
-        intrinsics(capability)
+    pub(super) fn intrinsic_overloads(capability: CapabilityId, name: &str) -> &'static [IntrinsicId] {
+        tables()
+            .overloads
             .iter()
-            .find(|s| s.name == name)
-            .map(|s| s.id)
+            .find(|(owner, member, _)| *owner == capability && *member == name)
+            .map_or(&[], |(_, _, rows)| rows.as_slice())
     }
     pub(super) fn intrinsic_signature(id: IntrinsicId) -> &'static IntrinsicSignature {
         tables().intrinsics.get(id.index()).unwrap_or_else(|| {
@@ -1058,6 +1312,14 @@ pub(crate) mod internals {
             .iter()
             .find(|conversion| conversion.source == source && conversion.destination == destination)
     }
+    pub(super) fn resident_conversion(
+        source: RepresentationId,
+    ) -> Option<&'static RepresentationConversion> {
+        tables()
+            .conversions
+            .iter()
+            .find(|conversion| conversion.source == source)
+    }
     pub(super) fn representation_conversion_info(
         id: RepresentationConversionId,
     ) -> &'static RepresentationConversion {
@@ -1069,14 +1331,13 @@ pub(crate) mod internals {
         RepresentationId::new(u32::from(dtype.ordinal()))
     }
 
-    // ----- crate-private views -------------------------------------------
-
-    /// The reference meaning of one intrinsic.
-    pub(crate) fn semantics(id: IntrinsicId) -> CapabilitySemantics {
-        *tables().semantics.get(id.index()).unwrap_or_else(|| {
-            panic!("StaticRegistry produced an IntrinsicId outside its semantic table (§13.3.1)")
+    pub(super) fn intrinsic_denotation(id: IntrinsicId) -> IntrinsicDenotation {
+        *tables().denotations.get(id.index()).unwrap_or_else(|| {
+            panic!("StaticRegistry produced an IntrinsicId outside its denotation table (§13.3.1)")
         })
     }
+
+    // ----- crate-private views -------------------------------------------
 
     /// Every intrinsic signature, in id order.
     pub(crate) fn all_intrinsics() -> &'static [IntrinsicSignature] {
@@ -1170,6 +1431,94 @@ mod tests {
     }
 
     #[test]
+    fn overloads_resolve_each_row_by_its_operands() {
+        for backend in BackendName::ALL {
+            for info in capabilities(backend) {
+                for signature in intrinsics(info.id) {
+                    let overload = intrinsic_overloads(info.id, signature.name);
+                    assert!(overload.contains(&signature.id));
+                    assert!(overload.windows(2).all(|pair| pair[0] < pair[1]));
+                    let operands = signature
+                        .arguments
+                        .iter()
+                        .map(|argument| match argument.category {
+                            OperandCategory::Scalar(dtype) => OperandElement::Scalar(dtype),
+                            OperandCategory::Readable {
+                                representation,
+                                rank,
+                            } => OperandElement::Tensor {
+                                representation,
+                                rank,
+                            },
+                            _ => panic!("row declares a non-readable operand"),
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(resolve_intrinsic(overload, &operands), Some(signature.id));
+                }
+                assert!(intrinsic_overloads(info.id, "no_such_intrinsic").is_empty());
+            }
+        }
+        let matrix = capability(BackendName::Metal, "matrix").unwrap();
+        let matmul = intrinsic_overloads(matrix, "matmul");
+        assert!(matmul.len() > 1);
+        let f16 = OperandElement::Tensor {
+            representation: dense(DType::F16),
+            rank: 2,
+        };
+        let resolved = resolve_intrinsic(matmul, &[f16, f16]).unwrap();
+        assert_eq!(
+            intrinsic_denotation(resolved),
+            IntrinsicDenotation::MatrixProduct { accumulate: false }
+        );
+        assert_eq!(resolve_intrinsic(matmul, &[f16]), None);
+        assert_eq!(
+            resolve_intrinsic(matmul, &[OperandElement::Scalar(DType::F16), f16]),
+            None
+        );
+    }
+
+    #[test]
+    fn denotations_and_participation_follow_the_rows() {
+        let subgroup = capability(BackendName::Metal, "subgroup").unwrap();
+        let sum = intrinsic_overloads(subgroup, "simd_sum")[0];
+        assert_eq!(
+            intrinsic_denotation(sum),
+            IntrinsicDenotation::CohortFold {
+                op: crate::intrinsics::ReduceOp::Sum
+            }
+        );
+        let lane = intrinsic_overloads(subgroup, "lane_index")[0];
+        assert_eq!(intrinsic_denotation(lane), IntrinsicDenotation::ParticipantIndex);
+        let cuda_matrix = capability(BackendName::Cuda, "matrix").unwrap();
+        for name in ["nvfp4_matmul", "nvfp4_matmul_add"] {
+            for id in intrinsic_overloads(cuda_matrix, name) {
+                assert_eq!(
+                    intrinsic_signature(*id).effects.participation,
+                    IntrinsicParticipation::FixedWorkgroup(128)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plane_element_dtype_is_the_plane_storage_dtype() {
+        for info in representations() {
+            if let RepresentationKind::Packed(layout) = &info.kind {
+                for plane in &layout.planes {
+                    assert_eq!(plane_element_dtype(info.id, plane.name), plane.storage_dtype);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_native_is_metal_only() {
+        assert!(BackendName::Metal.supports_direct_native());
+        assert!(!BackendName::Cpu.supports_direct_native());
+        assert!(!BackendName::Cuda.supports_direct_native());
+    }
+
+    #[test]
     fn narrow_float_encodings_cover_subnormals_and_finite_roundtrips() {
         assert_eq!(f16_to_f32(1), 2.0f32.powi(-24));
         assert_eq!(f16_to_f32(0x03ff), 1023.0 * 2.0f32.powi(-24));
@@ -1190,5 +1539,137 @@ mod tests {
             assert_eq!(rounded.to_bits() & 0xffff, 0);
             assert!(f16_to_f32(f16_bits(value)).is_nan());
         }
+    }
+
+    fn packed_layout(name: &str) -> &'static PackedPacketLayout {
+        let RepresentationKind::Packed(layout) =
+            &representation_info(representation(name).unwrap()).kind
+        else {
+            panic!("`{name}` is packed")
+        };
+        layout
+    }
+
+    #[test]
+    fn resident_conversion_is_the_unique_conversion_of_an_external_source() {
+        let q4k = representation_conversion_info(
+            resident_conversion(representation("gguf_q4_k").unwrap()).unwrap().id,
+        );
+        assert_eq!(q4k.destination, representation("q4k").unwrap());
+        for info in representations() {
+            let conversion = resident_conversion(info.id);
+            match info.kind {
+                RepresentationKind::External(_) => {
+                    let conversion = conversion.unwrap();
+                    assert_eq!(conversion.source, info.id);
+                    assert_eq!(
+                        representation_conversion(info.id, conversion.destination),
+                        Some(conversion)
+                    );
+                }
+                RepresentationKind::Dense(_) | RepresentationKind::Packed(_) => {
+                    assert_eq!(conversion, None)
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_bytes_follow_the_representation_layout() {
+        let q4g64 = representation("q4g64").unwrap();
+        let q4_k = representation("gguf_q4_k").unwrap();
+        assert_eq!(canonical_bytes(dense(DType::F32), &[3, 5]), Some(60));
+        assert_eq!(canonical_bytes(dense(DType::BF16), &[]), Some(2));
+        assert_eq!(canonical_bytes(dense(DType::F32), &[0, 5]), Some(0));
+        assert_eq!(canonical_bytes(q4g64, &[3, 128]), Some(3 * 2 * 36));
+        assert_eq!(canonical_bytes(q4g64, &[2, 3, 65]), Some(6 * 2 * 36));
+        assert_eq!(canonical_bytes(q4_k, &[512]), Some(288));
+        assert_eq!(canonical_bytes(q4_k, &[2, 257]), Some(2 * 2 * 144));
+        assert_eq!(canonical_bytes(q4g64, &[]), None);
+        assert_eq!(canonical_bytes(q4_k, &[]), None);
+        assert_eq!(canonical_bytes(dense(DType::F32), &[u64::MAX, 2]), None);
+        assert_eq!(canonical_bytes(q4g64, &[u64::MAX, 64]), None);
+    }
+
+    #[test]
+    fn packets_from_planes_places_each_plane_at_its_packet_offset() {
+        for info in representations() {
+            let RepresentationKind::Packed(layout) = &info.kind else {
+                continue;
+            };
+            let (rows, extent) = (2, u64::from(layout.group) * 2 - 1);
+            let packets = (rows * layout.packet_extent(extent)) as usize;
+            let supplied: Vec<(&str, Vec<u8>)> = layout
+                .planes
+                .iter()
+                .enumerate()
+                .map(|(index, plane)| {
+                    let bytes = (0..packets * plane.bytes_per_group as usize)
+                        .map(|byte| (byte * 7 + index * 31 + 1) as u8)
+                        .collect();
+                    (plane.name, bytes)
+                })
+                .collect();
+            let reversed: Vec<(&str, &[u8])> = supplied
+                .iter()
+                .rev()
+                .map(|(name, bytes)| (*name, bytes.as_slice()))
+                .collect();
+            let canonical = layout.packets_from_planes(rows, extent, &reversed).unwrap();
+            assert_eq!(Some(canonical.len() as u64), layout.bytes(rows, extent));
+            let mut occupied = vec![false; canonical.len()];
+            for (index, (plane, (_, bytes))) in layout.planes.iter().zip(&supplied).enumerate() {
+                let width = plane.bytes_per_group as usize;
+                for packet in 0..packets {
+                    let start = layout.plane_offset(packet as u64, index).unwrap() as usize;
+                    assert_eq!(
+                        &canonical[start..start + width],
+                        &bytes[packet * width..(packet + 1) * width],
+                        "`{}` plane `{}` packet {packet}",
+                        info.name,
+                        plane.name
+                    );
+                    occupied[start..start + width].fill(true);
+                }
+            }
+            assert!(canonical
+                .iter()
+                .zip(&occupied)
+                .all(|(byte, occupied)| *occupied || *byte == 0));
+        }
+    }
+
+    #[test]
+    fn packets_from_planes_refuses_a_wrong_plane_set_or_length() {
+        let layout = packed_layout("q4g64");
+        let words = [0u8; 4 * 32];
+        let scale = [0u8; 4 * 2];
+        let bias = [0u8; 4 * 2];
+        let assemble = |planes: &[(&str, &[u8])]| layout.packets_from_planes(2, 128, planes);
+        assert_eq!(
+            assemble(&[("words", &words), ("scale", &scale)]),
+            Err(PlaneAssemblyError::PlaneSet)
+        );
+        assert_eq!(
+            assemble(&[("words", &words), ("scale", &scale), ("scale", &bias)]),
+            Err(PlaneAssemblyError::PlaneSet)
+        );
+        assert_eq!(
+            assemble(&[("words", &words), ("scale", &scale), ("bias", &bias), ("extra", &bias)]),
+            Err(PlaneAssemblyError::PlaneSet)
+        );
+        assert_eq!(
+            assemble(&[("words", &words), ("scale", &scale[..6]), ("bias", &bias)]),
+            Err(PlaneAssemblyError::PlaneByteLength {
+                plane: "scale",
+                expected: 8,
+                actual: 6
+            })
+        );
+        assert_eq!(
+            assemble(&[("bias", &bias), ("words", &words), ("scale", &scale)])
+                .map(|canonical| canonical.len()),
+            Ok(4 * 36)
+        );
     }
 }

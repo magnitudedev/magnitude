@@ -1,3 +1,3 @@
-//! The sealed CUDA capability and structural-factory registry.
+//! The sealed CUDA capability registry.
 
 pub use crate::capability::registry;

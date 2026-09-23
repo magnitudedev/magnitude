@@ -143,10 +143,14 @@ impl Inference<'_> {
                 SymbolKind::LoopBinder(_) => control,
                 SymbolKind::CallDimension(_)
                 | SymbolKind::CallScalar(_)
+                | SymbolKind::CallStride(..)
                 | SymbolKind::TargetConstant(_)
                 | SymbolKind::Decision(_)
                 | SymbolKind::ScheduleSlot(_) => U::Workgroup,
                 SymbolKind::TemplateDimension(_) => unreachable!("uninstantiated template"),
+                SymbolKind::ProofVariable(_) => {
+                    unreachable!("proof variables never enter an entry arena")
+                }
             }
         }))
     }

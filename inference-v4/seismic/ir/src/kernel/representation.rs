@@ -66,12 +66,8 @@ mod tests {
     use super::*;
     use crate::construction::Construction;
     use crate::kernel::ops::Op;
-    use crate::repr::{Idx, Representation, Q6K};
     use crate::storage::GlobalBufferKind;
-    use crate::target::{
-        IntrinsicIdentityBuilder, IntrinsicNumericalSemantics, VectorOperationClass, VectorSupport,
-        VectorSupportEntry,
-    };
+    use crate::target::{IntrinsicIdentityBuilder, IntrinsicNumericalSemantics, VectorSupport};
     use seismic_lang::expr::ExprArena;
 
     #[derive(Debug)]
@@ -156,102 +152,5 @@ mod tests {
             assert!(fields >= 2, "{} has no typed field reads", info.name);
             assert!(word_work > 0, "{} has no visible decode work", info.name);
         }
-    }
-
-    #[test]
-    fn packed_vector_tail_guards_each_read_and_assembles_lanes_in_order() {
-        let mut arena = ExprArena::default();
-        let mut construction = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
-        let n = arena.nat(256);
-        let (_, view) = construction.storage_mut().tensor(
-            &mut arena,
-            GlobalBufferKind::Arena,
-            Q6K::id(),
-            vec![n],
-        );
-        let view = construction.typed_view::<Q6K>(construction.view(view, Q6K::id()));
-        let vectors = VectorSupport {
-            entries: vec![VectorSupportEntry {
-                dtype: DType::F32,
-                lanes: 4,
-                operations: vec![VectorOperationClass::Read {
-                    representation: Q6K::id(),
-                }],
-            }],
-        };
-        let mut builder = construction.kernel(&mut arena, &(), &[], &vectors);
-        let place = builder.arg_readable(view);
-        let start = builder.constant::<Idx>(253);
-        let active = builder.constant::<Idx>(3);
-        builder.vector_read::<Q6K, 4>(place, &[start], 0, active);
-        builder.close();
-        let kernel = &construction.kernels()[0];
-        let root = &kernel.blocks()[0];
-        let branches = root
-            .ops
-            .iter()
-            .filter_map(|op| {
-                if let Op::Branch {
-                    then: then_block,
-                    otherwise: else_block,
-                    outs,
-                    ..
-                } = op
-                {
-                    Some((*then_block, *else_block, outs))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(branches.len(), 4);
-        for &(then_block, else_block, _) in &branches {
-            assert!(kernel
-                .block(then_block)
-                .ops
-                .iter()
-                .any(|op| matches!(op, Op::ReadPlaneField { .. })));
-            let otherwise = &kernel.block(else_block).ops;
-            assert!(otherwise.iter().any(|op| matches!(
-                op,
-                Op::Constant {
-                    value: super::super::ops::ConstantValue::F32(0.0),
-                    ..
-                }
-            )));
-            assert!(!otherwise
-                .iter()
-                .any(|op| matches!(op, Op::ReadPlaneField { .. })));
-        }
-        let lanes = root
-            .ops
-            .iter()
-            .find_map(|op| {
-                if let Op::VectorFromLanes { out, lanes } = op {
-                    assert_eq!(
-                        kernel.value_type(*out),
-                        ValueType::Vector {
-                            dtype: DType::F32,
-                            lanes: 4
-                        }
-                    );
-                    Some(lanes)
-                } else {
-                    None
-                }
-            })
-            .unwrap();
-        assert_eq!(
-            lanes,
-            &branches
-                .iter()
-                .map(|(_, _, outs)| outs[0])
-                .collect::<Vec<_>>()
-        );
-        assert!(!kernel
-            .blocks()
-            .iter()
-            .flat_map(|block| &block.ops)
-            .any(|op| matches!(op, Op::VectorRead { .. })));
     }
 }

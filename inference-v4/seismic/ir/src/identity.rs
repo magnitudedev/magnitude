@@ -354,7 +354,7 @@ tagged_enum!(crate::kernel::ops::StoreElection, {GlobalLeader=>b"global-leader"}
 tagged_enum!(crate::schedule::LaunchParticipation, {Independent=>b"independent",CooperativeGrid=>b"cooperative-grid"});
 tagged_enum!(seismic_lang::intrinsics::AtomicOp, {Add=>b"add",Max=>b"max",Min=>b"min"});
 tagged_enum!(seismic_lang::intrinsics::MathOp, {Exp=>b"exp",Fma=>b"fma",Rsqrt=>b"rsqrt",Sqrt=>b"sqrt",Log=>b"log",Sin=>b"sin",Cos=>b"cos",Abs=>b"abs",Max=>b"max",Min=>b"min"});
-tagged_enum!(crate::target::ResourceOwnershipScope, {Participant=>b"participant",Subgroup=>b"subgroup",Workgroup=>b"workgroup",CooperativeGrid=>b"cooperative-grid"});
+tagged_enum!(crate::target::ResourceOwnershipScope, {Participant=>b"participant",Subgroup=>b"subgroup",Workgroup=>b"workgroup"});
 tagged_enum!(crate::target::AddressableResourceRealization, {Native=>b"native"});
 tagged_enum!(crate::target::ResourceLifetime, {Operation=>b"operation",Segment=>b"segment",Launch=>b"launch"});
 
@@ -436,16 +436,6 @@ impl CanonicalIdentity for crate::storage::ScheduleRegionEdge {
             } => {
                 out.bytes(b"repeat");
                 node.encode_identity(out);
-                parent_ordinal.encode_identity(out)
-            }
-            ChooseOption {
-                node,
-                value,
-                parent_ordinal,
-            } => {
-                out.bytes(b"choose");
-                node.encode_identity(out);
-                value.encode_identity(out);
                 parent_ordinal.encode_identity(out)
             }
             Imported {

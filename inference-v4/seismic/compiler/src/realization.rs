@@ -1,15 +1,14 @@
 //! Demand-driven native realization and opaque handle ownership.
 //!
 //! Structural candidate domains contain no native artifacts. Preparation
-//! hands an exact canonical coordinate to [`Realizer`], which compiles only
-//! the kernels retained by IR native specialization. The private registry
+//! hands an exact canonical coordinate to [`Realizer`], which compiles the
+//! kernels the member launches. The private registry
 //! owns each formed native handle; reconciled candidates retain their exact
 //! ordered native set without exposing handles to evaluation or planning.
 
 use crate::errors::PreparationError;
 use crate::refinement::{ConstructedCandidate, ConstructedCandidateIdentity};
 use seismic_ir::kernel::KernelId;
-use seismic_ir::schedule::LaunchId;
 use seismic_lang::expr::{AnyExpr, DecisionId, ExprArena, PartialAssignment, SymbolValue};
 use seismic_target::{
     CompatibilityIdentity, DeviceDescription, DeviceDescriptionIdentity, NativeArtifactMetrics,
@@ -31,10 +30,8 @@ pub(crate) struct CandidateRealizationIdentity {
 
 /// An exact family assignment from the checked structural domain.
 ///
-/// The request owns the family and assignment rather than a specialization
-/// borrowing the family. This lets reconciliation retain the family in its
-/// coordinate-exact output while native specialization remains a local,
-/// inspectable transition inside [`Realizer::realize`].
+/// The request owns the family and assignment. This lets reconciliation
+/// retain the family in its coordinate-exact output.
 pub(crate) struct CanonicalRealizationRequest<T: TargetFamily> {
     identity: CandidateRealizationIdentity,
     family: Arc<ConstructedCandidate<T>>,
@@ -97,7 +94,8 @@ pub struct NativeArtifactRequestKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct NativeArtifactInstanceId(usize);
 
-/// Read-only requirements from the same specialization used by realization.
+/// Read-only native artifact requirements of a candidate, derived exactly as
+/// realization derives them.
 /// Missing units have unknown formation cost; this does not initiate work.
 #[derive(Clone, Debug)]
 pub struct NativeRequirements {
@@ -126,13 +124,24 @@ impl CandidateRejection {
     }
 }
 
-/// Handle-free dense active native set. `kernels` is in first-active-launch
-/// order and retains each original KernelId, which is the exact remap later
-/// executable translation consumes after schedule-Choose elimination.
+/// Every kernel a member launches, in first-launch order without duplicates.
+/// Each of these kernels is realized.
+fn member_kernels<T: TargetFamily>(family: &ConstructedCandidate<T>) -> Vec<KernelId> {
+    let mut kernels = Vec::new();
+    for launch in family.schedule().launches() {
+        if !kernels.contains(&launch.kernel) {
+            kernels.push(launch.kernel);
+        }
+    }
+    kernels
+}
+
+/// Handle-free dense native set. `kernels` is in first-launch order and
+/// retains each original KernelId, which is the exact remap later executable
+/// translation consumes.
 #[derive(Debug)]
 pub(crate) struct RealizedNativeSet<T: TargetFamily> {
     identity: CandidateRealizationIdentity,
-    active_launches: Box<[LaunchId]>,
     kernels: Box<[RealizedKernel<T>]>,
 }
 
@@ -146,10 +155,6 @@ struct RealizedKernel<T: TargetFamily> {
 impl<T: TargetFamily> RealizedNativeSet<T> {
     pub(crate) fn assignment_identity(&self) -> [u8; 32] {
         self.identity.assignment
-    }
-
-    pub(crate) fn active_launches(&self) -> &[LaunchId] {
-        &self.active_launches
     }
 
     pub(crate) fn descriptions(
@@ -169,13 +174,12 @@ impl<T: TargetFamily> RealizedNativeSet<T> {
         self.kernels
             .iter()
             .position(|kernel| kernel.original == original)
-            .map(|index| u32::try_from(index).expect("active native kernel count exceeds u32"))
+            .map(|index| u32::try_from(index).expect("native kernel count exceeds u32"))
     }
 
     pub(crate) fn retained_metadata_bytes(&self) -> usize {
         std::mem::size_of_val(self)
             .saturating_add(std::mem::size_of_val(self.kernels.as_ref()))
-            .saturating_add(std::mem::size_of_val(self.active_launches.as_ref()))
             .saturating_add(
                 self.identity.choices.capacity()
                     * std::mem::size_of::<(crate::refinement::PhysicalChoice, i64)>(),
@@ -411,6 +415,16 @@ pub(crate) mod demand_driven_tests {
         DeviceDescription::new(device_parts()).unwrap()
     }
 
+    pub(crate) fn registry() -> crate::target::CompilerRegistry<FakeTarget> {
+        crate::target::CompilerRegistry::assemble(crate::target::CompilerRegistryParts {
+            capabilities: Vec::new(),
+
+            native_launch_constraints: |_, _, _, _, _, _| Vec::new(),
+            addressable_resources: |_| Vec::new(),
+            emitted_intrinsics: Default::default(),
+        })
+    }
+
     pub(crate) fn device_parts() -> DeviceDescriptionParts<FakeTarget> {
         DeviceDescriptionParts {
             identity: DeviceDescriptionIdentity {
@@ -472,14 +486,11 @@ pub(crate) mod demand_driven_tests {
     ) -> (
         Arc<ConstructedCandidate<FakeTarget>>,
         DecisionId,
-        [KernelId; 3],
+        [KernelId; 2],
     ) {
         let mut construction = Construction::<FakeTarget>::new(arena, vec![], false, 0);
         let vectors = VectorSupport::default();
         let first = construction
-            .portable_kernel(arena, &(), &[], &vectors)
-            .close();
-        let second = construction
             .portable_kernel(arena, &(), &[], &vectors)
             .close();
         let shared = construction
@@ -487,16 +498,8 @@ pub(crate) mod demand_driven_tests {
             .close();
         let decision = arena.decision(FiniteDomain::new(vec![0, 1]).unwrap());
         let mut schedule = construction.schedule(arena, 0);
-        schedule.choose(decision, |choice| {
-            choice.option(0, |selected| {
-                selected.launch_sequential(first);
-                selected.launch_sequential(shared);
-            });
-            choice.option(1, |selected| {
-                selected.launch_sequential(second);
-                selected.launch_sequential(shared);
-            });
-        });
+        schedule.launch_sequential(first);
+        schedule.launch_sequential(shared);
         let token = schedule.close();
         let executable = construction
             .close(token)
@@ -530,7 +533,7 @@ pub(crate) mod demand_driven_tests {
                 result_publications: Vec::new(),
             },
         ));
-        (family, decision, [first, second, shared])
+        (family, decision, [first, shared])
     }
 
     fn fixture_function_identity() -> seismic_lang::ids::StableFunctionId {
@@ -602,11 +605,11 @@ pub(crate) mod demand_driven_tests {
         let zero = request(family, 0, assignment(&arena, decision, 0));
         assert!(realizer.inspect(&arena, &zero).missing.is_empty());
         let other = realizer.inspect(&arena, &one);
-        assert_eq!(other.required.len(), 2);
-        assert_eq!(other.missing.len(), 1);
+        assert_eq!(other.required, before.required);
+        assert!(other.missing.is_empty());
         assert_eq!(compiler.form_count(), 2);
         realizer.realize(&mut arena, one).unwrap();
-        assert_eq!(compiler.form_count(), 3);
+        assert_eq!(compiler.form_count(), 2);
     }
 
     #[test]
@@ -646,7 +649,7 @@ pub(crate) mod demand_driven_tests {
     #[test]
     fn equal_assignment_digests_do_not_share_distinct_choice_vectors() {
         let mut arena = ExprArena::new();
-        let (family, decision, [first_kernel, second_kernel, _]) = choice_family(&mut arena);
+        let (family, decision, _) = choice_family(&mut arena);
         let target = device();
         let compiler = CountingCompiler::new();
         let mut realizer = Realizer::new(&compiler, &(), &target, Accept);
@@ -665,17 +668,14 @@ pub(crate) mod demand_driven_tests {
         else {
             panic!("one choice should be ready")
         };
-        assert_eq!(compiler.form_count(), 3);
-        assert!(zero.native().description(first_kernel).is_some());
-        assert!(zero.native().description(second_kernel).is_none());
-        assert!(one.native().description(first_kernel).is_none());
-        assert!(one.native().description(second_kernel).is_some());
+        assert_eq!(compiler.form_count(), 2);
+        assert!(!Arc::ptr_eq(&zero, &one));
     }
 
     #[test]
     fn realization_is_selected_only_cached_and_retries_infrastructure_failure() {
         let mut arena = ExprArena::new();
-        let (family, decision, [first, second, shared]) = choice_family(&mut arena);
+        let (family, decision, [first, shared]) = choice_family(&mut arena);
         let target = device();
         let compiler = CountingCompiler::new();
         let mut realizer = Realizer::new(&compiler, &(), &target, Accept);
@@ -692,7 +692,6 @@ pub(crate) mod demand_driven_tests {
         assert_eq!(compiler.form_count(), 2);
         assert_eq!(native.native_kernel_index(first), Some(0));
         assert_eq!(native.native_kernel_index(shared), Some(1));
-        assert_eq!(native.native_kernel_index(second), None);
         let shared_instance = native.artifact_instances().nth(1).unwrap();
 
         let zero = request(family.clone(), 0, zero_assignment.clone());
@@ -708,9 +707,8 @@ pub(crate) mod demand_driven_tests {
         };
         let selected_native = candidate.native().clone();
         let native = selected_native.as_ref();
-        assert_eq!(compiler.form_count(), 3, "shared kernel must be reused");
-        assert_eq!(native.native_kernel_index(first), None);
-        assert_eq!(native.native_kernel_index(second), Some(0));
+        assert_eq!(compiler.form_count(), 2, "formed kernels must be reused");
+        assert_eq!(native.native_kernel_index(first), Some(0));
         assert_eq!(native.native_kernel_index(shared), Some(1));
         assert_eq!(native.artifact_instances().nth(1), Some(shared_instance));
 
@@ -981,14 +979,9 @@ where
         request: &CanonicalRealizationRequest<T>,
     ) -> NativeRequirements {
         arena.view(AnyExpr::Bool(request.family.hard_constraints()));
-        let specialization = request
-            .family
-            .executable()
-            .specialize_for_native(arena, &request.assignment)
-            .expect("checked candidate must specialize");
-        let required = specialization
-            .kernels()
-            .map(|(original, _)| NativeArtifactRequestKey {
+        let required = member_kernels(&request.family)
+            .into_iter()
+            .map(|original| NativeArtifactRequestKey {
                 compatibility: self.target.compatibility_identity().clone(),
                 family_materialization: request.identity.family_materialization,
                 kernel_ordinal: original.ordinal(),
@@ -1009,7 +1002,7 @@ where
         }
     }
 
-    /// Specializes the exact assignment and realizes only active kernels.
+    /// Realizes every kernel of the member; all of them are active.
     /// Reconciliation is the sole post-reflection eligibility transition:
     /// returning Rejected caches that deterministic result, while every
     /// native infrastructure error returns before the candidate cache changes.
@@ -1041,15 +1034,11 @@ where
             assignment,
         } = request;
         let (native, formed) = {
-            let specialization = family
-                .executable()
-                .specialize_for_native(&*arena, &assignment)
-                .unwrap_or_else(|error| {
-                    panic!("checked candidate failed native specialization: {error}")
-                });
+            let originals = member_kernels(&family);
             let mut formed = empty_metrics();
-            let mut realized = Vec::with_capacity(specialization.kernels().len());
-            for (original, kernel) in specialization.kernels() {
+            let mut realized = Vec::with_capacity(originals.len());
+            for original in originals {
+                let kernel = family.executable().kernels().kernel(original);
                 let key = NativeArtifactRequestKey {
                     compatibility: self.target.compatibility_identity().clone(),
                     family_materialization: identity.family_materialization,
@@ -1097,11 +1086,6 @@ where
             }
             let native = Arc::new(RealizedNativeSet {
                 identity: identity.clone(),
-                active_launches: specialization
-                    .launches()
-                    .map(|launch| launch.id)
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
                 kernels: realized.into_boxed_slice(),
             });
             (native, formed)

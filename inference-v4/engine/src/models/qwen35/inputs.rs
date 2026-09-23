@@ -158,7 +158,7 @@ impl InputState {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use crate::{
@@ -230,7 +230,6 @@ mod tests {
         )
     }
     #[test]
-    #[ignore = "requires a Metal device"]
     fn partial_images_retain_exact_slices_and_checkpoint_ownership() {
         let device = metal();
         let plan = plan();
@@ -267,7 +266,6 @@ mod tests {
         assert_eq!(device.memory_usage().charged, 0);
     }
     #[test]
-    #[ignore = "requires a Metal device"]
     fn generation_checkpoint_forks_retain_their_own_unconsumed_features() {
         use crate::{
             models::sequence::{OwnedSequence, SequenceWork},
@@ -315,7 +313,6 @@ mod tests {
         assert_eq!(device.memory_usage().charged, 0);
     }
     #[test]
-    #[ignore = "requires a Metal device"]
     fn input_rejects_missing_duplicate_wrong_geometry_foreign_and_changed_tokens() {
         let device = metal();
         let foreign = metal();

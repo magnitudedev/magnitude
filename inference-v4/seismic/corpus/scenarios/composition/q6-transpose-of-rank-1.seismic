@@ -1,0 +1,9 @@
+# origin: X1:q6
+# rejected: "transposes a rank-2"
+fn bump(v: &mut tensor[2] f32):
+    v[0] = v[0] + 1.0
+fn probe(out: &mut tensor[4] f32, c: bool):
+    if c:
+        bump(out[0:2])
+    else:
+        bump(out.T[2:4])

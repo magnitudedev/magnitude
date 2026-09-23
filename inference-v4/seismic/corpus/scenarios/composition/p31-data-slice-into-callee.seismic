@@ -1,0 +1,14 @@
+# origin: X1:P31
+# invoke: f32[8]=1,2,3,4,5,6,7,1 ; i32[2]=2,5
+# pin: result = f32[]=12
+# invoke: f32[8]=1,2,3,4,5,6,7,1 ; i32[2]=3,3
+# pin: result = f32[]=0
+fn seed[N](x: &tensor[N] f32) -> f32 where N >= 0:
+    let mut t = tensor[N] f32
+    for i in 0..N:
+        t[i] = x[i]
+    return reduce(t, 0, sum)
+fn probe[N](x: &tensor[N] f32, bounds: &tensor[2] i32) -> f32:
+    let lo = bounds[0]
+    let hi = bounds[1]
+    return seed(x[lo:hi])

@@ -1,0 +1,9 @@
+# origin: C11:call_tensor_result_computed
+# cell: value-computed-tensor/result
+# invoke: f32[4]=1,2,3,4
+fn helper[N](a: &tensor[N] f32) -> tensor[N] f32:
+    return a * 2.0
+
+fn probe[N](x: &tensor[N] f32) -> tensor[N] f32:
+    let y = helper(x)
+    return y + 1.0

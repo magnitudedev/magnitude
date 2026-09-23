@@ -53,17 +53,6 @@ impl LanguageVersion {
             Self::V4_0 => "4.0",
         }
     }
-
-    pub(crate) fn native(self) -> objc2_metal::MTLLanguageVersion {
-        match self {
-            Self::V2_3 => objc2_metal::MTLLanguageVersion::Version2_3,
-            Self::V2_4 => objc2_metal::MTLLanguageVersion::Version2_4,
-            Self::V3_0 => objc2_metal::MTLLanguageVersion::Version3_0,
-            Self::V3_1 => objc2_metal::MTLLanguageVersion::Version3_1,
-            Self::V3_2 => objc2_metal::MTLLanguageVersion::Version3_2,
-            Self::V4_0 => objc2_metal::MTLLanguageVersion::Version4_0,
-        }
-    }
 }
 
 /// One multiply-accumulate dtype combination the native compiler accepts
@@ -117,7 +106,8 @@ pub struct MetalFacts {
 /// Buffer entries of one compute pipeline's argument table.
 pub const ARGUMENT_TABLE_ENTRIES: u32 = 31;
 /// Entries this backend reserves beyond the kernel's bindings: the
-/// parameter word block and the side (status + result slots) block.
+/// parameter word block, the side (status + result slots) block, the
+/// participant scratch block, and the register scratch block.
 pub const RESERVED_ARGUMENT_ENTRIES: u32 = 4;
 /// The emitted MSL launch ABI represents grid coordinates with `uint3`.
 /// This is a language-level representability bound, not a guessed hardware

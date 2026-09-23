@@ -1,0 +1,4 @@
+# origin: H-2
+# invoke: f32[64]=zero ; f32[5]=seq ; i32:3
+fn probe[N, M](dst: &mut tensor[N] f32, src: &tensor[M] f32, at: i32):
+    dst[at:at+M] = src

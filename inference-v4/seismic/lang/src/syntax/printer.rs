@@ -5,7 +5,7 @@ use super::ast::*;
 use super::parser::{binary_bp, NOT_BP, RANGE_BP, UNARY_BP};
 use std::fmt::Write;
 
-pub fn print(file: &File) -> String {
+pub(crate) fn print(file: &File) -> String {
     let mut p = Printer {
         out: String::new(),
         level: 0,
@@ -16,24 +16,6 @@ pub fn print(file: &File) -> String {
         }
         p.decl(decl);
     }
-    p.out
-}
-
-pub fn expr_to_string(e: &Expr) -> String {
-    let mut p = Printer {
-        out: String::new(),
-        level: 0,
-    };
-    p.expr(e, 0);
-    p.out
-}
-
-pub fn type_to_string(ty: &TypeExpr) -> String {
-    let mut p = Printer {
-        out: String::new(),
-        level: 0,
-    };
-    p.ty(ty);
     p.out
 }
 
@@ -69,9 +51,6 @@ impl Printer {
             Decl::Fn(f) => {
                 let _ = write!(self.out, "fn {}", f.name.name);
                 self.signature(&f.signature);
-                if let Some(target) = &f.target {
-                    let _ = write!(self.out, " for {}", target.name);
-                }
                 self.requires(&f.requires);
                 self.predicates(&f.signature.predicates);
                 self.out.push_str(":\n");

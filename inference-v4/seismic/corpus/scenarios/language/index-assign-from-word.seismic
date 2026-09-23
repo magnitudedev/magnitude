@@ -1,0 +1,7 @@
+# origin: A1:G-A10-new-8
+# cell: index-from-word/sl
+# rejected: "`j` has type index but the value has type i32"
+fn probe(x: &tensor[8] i32, i: index[8]) -> index[8]:
+    let mut j = i
+    j = x[0]
+    return j

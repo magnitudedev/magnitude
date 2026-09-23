@@ -1,0 +1,8 @@
+# origin: C14:s11
+# invoke: f32[5]=zero ; bool:true
+# invoke: f32[5]=zero ; bool:false
+fn probe[N](x: &mut tensor[N] f32, c: bool) -> f32:
+    let a = x + x
+    if c:
+        x[0] = 100.0
+    return reduce(a, 0, sum)

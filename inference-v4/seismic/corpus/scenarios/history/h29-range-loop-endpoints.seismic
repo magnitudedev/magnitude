@@ -1,0 +1,11 @@
+# origin: H-29
+# invoke: f32[4]=seq ; range:0..0
+# invoke: f32[4]=seq ; range:1..3
+fn helper[N](x: &tensor[N] f32) -> f32:
+    return x[0]
+
+fn probe[N](x: &tensor[N] f32, times: range[N]) -> f32:
+    let mut result = 0.0
+    for i in times:
+        result = result + helper(x) + x[i]
+    return result

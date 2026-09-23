@@ -1,0 +1,7 @@
+# origin: C13:p03a
+# rejected: "lower bound"
+fn seed[N](x: &tensor[N] i32) -> i32:
+    return i32(N)
+
+fn probe(input: &tensor[4] i32) -> i32:
+    return seed(input[0:0])

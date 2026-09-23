@@ -1,0 +1,5 @@
+# origin: test:validation:corpus/shape.seismic:column_view
+# invoke column_view: f32[3,2]=seq ; f32[2]=zero
+fn column_view[M, N](x: &tensor[M, N] f32, y: &mut tensor[N] f32) where M >= 0:
+    parallel for j in 0..N:
+        y[j] = reduce(x[:, j], 0, sum)

@@ -14,6 +14,8 @@
 
 pub(crate) mod native;
 pub(crate) mod candidate;
+mod call;
+pub(crate) use call::CallConstruction;
 pub(crate) use internals::BuilderState;
 
 use crate::numerics::NumericalApplicability;
@@ -179,13 +181,12 @@ fn native_hard_constraints<B: seismic_target::TargetFamily>(
 ) -> BoolExpr {
     let mut launch_requirements = vec![arena.bool(true); family.schedule().launches().len()];
     let schedule = family.schedule();
-    for id in native.active_launches() {
+    for (index, launch) in schedule.launches().iter().enumerate() {
         let mut constraints = Vec::new();
-        let launch = schedule.launch(*id);
-        let local_layout = family.launch_resources()[id.index() as usize].layout();
+        let local_layout = family.launch_resources()[index].layout();
         let description = native
             .description(launch.kernel)
-            .unwrap_or_else(|| panic!("active launch has no realized native kernel"));
+            .unwrap_or_else(|| panic!("launch has no realized native kernel"));
         let kernel = family.kernels().kernel(launch.kernel);
         let domain = &description.launch;
         // Reflection restricts where the selected request is applicable; it
@@ -239,7 +240,7 @@ fn native_hard_constraints<B: seismic_target::TargetFamily>(
         ));
         let predicate = arena.all(&constraints);
         let defined = arena.side_conditions(predicate.into());
-        launch_requirements[id.index() as usize] = arena.and(defined, predicate);
+        launch_requirements[index] = arena.and(defined, predicate);
     }
     schedule.launch_requirements(arena, &launch_requirements)
 }
@@ -622,94 +623,6 @@ impl FunctionContract {
             effects,
         }
     }
-}
-
-/// Owned call construction progress. Child bodies and physical payloads belong
-/// to this lexical call; no borrowed parent builder survives a pause.
-pub(crate) struct CallConstruction<B: seismic_target::TargetFamily> {
-    call: NodeId,
-    location: crate::candidate_domain::CallLocation,
-    arguments: Vec<ValueBinding>,
-    bodies: Vec<CallBody>,
-    selected: Option<usize>,
-    begun: bool,
-    child: Option<ConstructedCandidate<B>>,
-}
-
-struct CallBody {
-    candidate: seismic_lang::entry::Candidate,
-    selection: crate::candidate_domain::BodySelection,
-    initialization: Result<(), seismic_lang::initialization::InitializationFailure>,
-}
-
-impl<B: seismic_target::TargetFamily> CallConstruction<B> {
-    pub(crate) fn location(&self) -> &crate::candidate_domain::CallLocation {
-        &self.location
-    }
-    pub(crate) fn choice(&self) -> Option<crate::candidate_domain::BodyChoice> {
-        self.selected
-            .is_none()
-            .then(|| crate::candidate_domain::BodyChoice {
-                path: crate::candidate_domain::CallPath(vec![self.location.clone()]),
-                alternatives: self.bodies.iter().map(|body| body.selection.clone()).collect(),
-            })
-    }
-    pub(crate) fn select(&mut self, selection: crate::candidate_domain::BodySelection) {
-        assert!(self.selected.is_none(), "call body was already selected");
-        self.selected = Some(
-            self.bodies
-                .iter()
-                .position(|body| body.selection == selection)
-                .expect("selected body is absent from this checked call"),
-        );
-    }
-    pub(crate) fn initialization_pending(
-        &self,
-    ) -> Option<seismic_lang::initialization::InitializationFailure> {
-        self.bodies[self.selected.expect("call body must be selected")]
-            .initialization
-            .as_ref()
-            .err()
-            .cloned()
-    }
-}
-
-fn source_node_path(function: &SemanticFunction, target: NodeId) -> Vec<u32> {
-    fn find(
-        function: &SemanticFunction,
-        region: seismic_lang::ids::RegionId,
-        target: NodeId,
-        path: &mut Vec<u32>,
-    ) -> bool {
-        for (ordinal, (id, node)) in function.nodes(region).enumerate() {
-            path.push(u32::try_from(ordinal).expect("source node ordinal exceeds u32"));
-            if id == target {
-                return true;
-            }
-            let children = match node.view() {
-                SemanticNodeView::If {
-                    then, otherwise, ..
-                } => vec![then, otherwise],
-                SemanticNodeView::Loop { body, .. } => vec![body],
-                _ => Vec::new(),
-            };
-            for (arm, child) in children.into_iter().enumerate() {
-                path.push(arm as u32);
-                if find(function, child, target, path) {
-                    return true;
-                }
-                path.pop();
-            }
-            path.pop();
-        }
-        false
-    }
-    let mut path = Vec::new();
-    assert!(
-        find(function, function.root(), target, &mut path),
-        "source call is absent from its function"
-    );
-    path
 }
 
 /// A lexical schedule branch while its source bodies are being constructed.
@@ -1143,61 +1056,6 @@ impl<'a, B: seismic_target::TargetFamily> ImplementationBuilder<'a, B> {
     ) -> seismic_ir::region::Product<seismic_ir::region::ValueDestination> {
         self.inner.finish_value_repeat(repeat, backedge)
     }
-    pub(crate) fn begin_call(
-        &mut self,
-        call: NodeId,
-        arguments: &[ValueBinding],
-        selections: &crate::portable::BindingSelections,
-        contents: &crate::portable::initialization::StorageContents,
-        initialized_arguments: &[crate::portable::initialization::CallArgument<'_>],
-        binders: &[seismic_lang::expr::SymbolId],
-    ) -> CallConstruction<B> {
-        self.inner.begin_call(
-            call,
-            arguments,
-            selections,
-            contents,
-            initialized_arguments,
-            binders,
-        )
-    }
-
-    pub(crate) fn begin_call_child(
-        &mut self,
-        progress: &mut CallConstruction<B>,
-        selections: &crate::portable::BindingSelections,
-        contents: &crate::portable::initialization::StorageContents,
-        binders: &[seismic_lang::expr::SymbolId],
-    ) -> Option<crate::portable::construction::SourceConstruction<B>> {
-        self.inner
-            .begin_call_child(progress, selections, contents, binders)
-    }
-
-    pub(crate) fn complete_call_child(
-        &mut self,
-        progress: &mut CallConstruction<B>,
-        child: ConstructedCandidate<B>,
-    ) {
-        self.inner.complete_call_child(progress, child)
-    }
-
-    pub(crate) fn finish_call(
-        &mut self,
-        progress: CallConstruction<B>,
-        selections: &crate::portable::BindingSelections,
-        contents: &mut crate::portable::initialization::StorageContents,
-        initialized_arguments: &[crate::portable::initialization::CallArgument<'_>],
-        binders: &[seismic_lang::expr::SymbolId],
-    ) -> Vec<(SemanticValueId, ValueBinding)> {
-        self.inner.finish_call(
-            progress,
-            selections,
-            contents,
-            initialized_arguments,
-            binders,
-        )
-    }
-
     /// Closes the source construction's own schedule and implementation in
     /// one consuming operation. No caller supplies an execution body.
     pub(crate) fn close(mut self, mode: crate::portable::SemanticMode) -> ConstructedCandidate<B> {
@@ -1251,7 +1109,7 @@ mod internals {
     /// the IR owner before the remaining compiler metadata has been finalized;
     /// deref keeps the open-phase implementation uncluttered without exposing
     /// an optional lifecycle in the public IR API.
-    struct OpenConstruction<B: seismic_target::TargetFamily>(Option<Construction<B>>);
+    pub(super) struct OpenConstruction<B: seismic_target::TargetFamily>(Option<Construction<B>>);
     impl<B: seismic_target::TargetFamily> OpenConstruction<B> {
         fn new(construction: Construction<B>) -> Self {
             Self(Some(construction))
@@ -1344,7 +1202,7 @@ mod internals {
     /// or target context survives when construction is suspended.
     pub(crate) struct BuilderState<B: seismic_target::TargetFamily> {
         function: seismic_lang::ids::FunctionId,
-        construction: OpenConstruction<B>,
+        pub(super) construction: OpenConstruction<B>,
         contract: FunctionContract,
         semantic_coverage: TargetPredicate,
         pub(super) bindings: crate::portable::BindingArena,
@@ -1352,11 +1210,11 @@ mod internals {
         physical: PhysicalEnvironment,
         pending_result_paths: HashMap<SemanticValueId, Vec<(Vec<u32>, Vec<NatExpr>)>>,
         pub(super) schedule_region: u32,
-        choices: Vec<ChoiceDeclaration>,
-        constraints: Vec<BoolExpr>,
-        numerical_children: NumericalApplicability,
-        callees: Vec<StableFunctionId>,
-        call_occurrences: HashMap<NodeId, u32>,
+        pub(super) choices: Vec<ChoiceDeclaration>,
+        pub(super) constraints: Vec<BoolExpr>,
+        pub(super) numerical_children: NumericalApplicability,
+        pub(super) callees: Vec<StableFunctionId>,
+        pub(super) call_occurrences: HashMap<NodeId, u32>,
     }
 
     impl<B: seismic_target::TargetFamily> BuilderState<B> {
@@ -1372,8 +1230,8 @@ mod internals {
         pub(super) function: &'a SemanticFunction,
         pub(super) target: &'a DeviceDescription<B>,
         pub(super) registry: &'a CompilerRegistry<B>,
-        constants: &'a TargetConstants,
-        precision: &'a PrecisionPolicy,
+        pub(super) constants: &'a TargetConstants,
+        pub(super) precision: &'a PrecisionPolicy,
     }
 
     impl<'a, B: seismic_target::TargetFamily> Builder<'a, B> {
@@ -1964,241 +1822,6 @@ mod internals {
             self.state
                 .construction
                 .finish_value_repeat(repeat.product, backedge)
-        }
-        pub(super) fn begin_call(
-            &mut self,
-            call: NodeId,
-            arguments: &[ValueBinding],
-            selections: &crate::portable::BindingSelections,
-            contents: &crate::portable::initialization::StorageContents,
-            initialized_arguments: &[crate::portable::initialization::CallArgument<'_>],
-            binders: &[seismic_lang::expr::SymbolId],
-        ) -> CallConstruction<B> {
-            let (family_id, call_inputs, call_outputs) = match self.function.node(call).view() {
-                SemanticNodeView::Call {
-                    family,
-                    inputs,
-                    outputs,
-                } => (family, inputs, outputs),
-                _ => panic!("call construction requires a semantic Call node"),
-            };
-            assert_eq!(
-                arguments.len(),
-                call_inputs.len(),
-                "call argument arity differs"
-            );
-            let family = self.program.family(family_id);
-            let reference = family.reference().candidate();
-            let reference_function = self.program.function(reference.function);
-            let mut bodies = Vec::new();
-            for candidate in std::iter::once(reference).chain(family.alternatives()) {
-                let is_reference = std::ptr::eq(candidate, reference);
-                let backend_matches = match candidate.kind {
-                    CandidateKind::Portable => true,
-                    CandidateKind::Lowering { backend } | CandidateKind::Helper { backend } => {
-                        backend == B::NAME
-                    }
-                };
-                if !backend_matches
-                    || candidate
-                        .requires
-                        .iter()
-                        .any(|capability| !self.target.supports_capability(*capability))
-                {
-                    continue;
-                }
-                let function = self.program.function(candidate.function);
-                let initialization = if is_reference {
-                    Ok(())
-                } else {
-                    contents.applicable(
-                        &mut crate::portable::initialization_context(
-                            self.arena, selections, binders,
-                        ),
-                        function.initialization(),
-                        reference_function.initialization(),
-                        initialized_arguments,
-                    )
-                };
-                let contract = FunctionContract::derive(function);
-                assert_eq!(
-                    contract.parameters.len(),
-                    arguments.len(),
-                    "child parameter arity differs"
-                );
-                assert_eq!(
-                    contract.results.len(),
-                    call_outputs.len(),
-                    "child result arity differs"
-                );
-                let mode = match candidate.kind {
-                    CandidateKind::Portable => crate::portable::SemanticMode::Portable,
-                    _ => crate::portable::SemanticMode::AuthoredBackend,
-                };
-                bodies.push(CallBody {
-                    candidate: candidate.clone(),
-                    selection: crate::candidate_domain::BodySelection::new(self.program, function, mode),
-                    initialization: initialization.clone(),
-                });
-                if candidate.kind == CandidateKind::Portable {
-                    bodies.push(CallBody {
-                        candidate: candidate.clone(),
-                        selection: crate::candidate_domain::BodySelection::new(
-                            self.program,
-                            function,
-                            crate::portable::SemanticMode::PortableParallel,
-                        ),
-                        initialization,
-                    });
-                }
-            }
-            assert!(
-                !bodies.is_empty(),
-                "checked call has no source-compatible body"
-            );
-            let selected = (bodies.len() == 1).then_some(0);
-            let occurrence = self.state.call_occurrences.entry(call).or_default();
-            let location = crate::candidate_domain::CallLocation {
-                body: self.function.stable(),
-                source_definition: self.function.source_definition(),
-                node: source_node_path(self.function, call),
-                occurrence: *occurrence,
-            };
-            *occurrence += 1;
-            CallConstruction {
-                call,
-                location,
-                arguments: arguments.to_vec(),
-                bodies,
-                selected,
-                begun: false,
-                child: None,
-            }
-        }
-
-        pub(super) fn begin_call_child(
-            &mut self,
-            progress: &mut CallConstruction<B>,
-            selections: &crate::portable::BindingSelections,
-            contents: &crate::portable::initialization::StorageContents,
-            binders: &[seismic_lang::expr::SymbolId],
-        ) -> Option<crate::portable::construction::SourceConstruction<B>> {
-            if progress.begun {
-                return None;
-            }
-            assert!(
-                progress.initialization_pending().is_none(),
-                "unresolved initialization must remain a suspended construction"
-            );
-            let body = &progress.bodies[progress
-                .selected
-                .expect("select a child before constructing it")];
-            progress.begun = true;
-            let site = CallSite::Spliced {
-                call: progress.call,
-                arguments: &progress.arguments,
-                bindings: &self.state.bindings,
-                contents,
-                binders,
-                storage: self.state.construction.storage(),
-                selections,
-            };
-            let builder = ImplementationBuilder::new(
-                self.arena,
-                self.program,
-                self.program.function(body.candidate.function),
-                self.target,
-                self.registry,
-                self.constants,
-                self.precision,
-                body.candidate.applicability,
-                site,
-                None,
-            );
-            let (child, _) = crate::portable::construction::SourceConstruction::begin(
-                builder,
-                body.selection.mode(),
-            );
-            Some(child)
-        }
-
-        pub(super) fn complete_call_child(
-            &mut self,
-            progress: &mut CallConstruction<B>,
-            child: ConstructedCandidate<B>,
-        ) {
-            assert!(
-                progress.child.replace(child).is_none(),
-                "selected child completed twice"
-            );
-        }
-
-        pub(super) fn finish_call(
-            &mut self,
-            progress: CallConstruction<B>,
-            selections: &crate::portable::BindingSelections,
-            contents: &mut crate::portable::initialization::StorageContents,
-            initialized_arguments: &[crate::portable::initialization::CallArgument<'_>],
-            binders: &[seismic_lang::expr::SymbolId],
-        ) -> Vec<(SemanticValueId, ValueBinding)> {
-            let CallConstruction {
-                call,
-                arguments: parameter_bindings,
-                child,
-                ..
-            } = progress;
-            let (family_id, call_outputs) = match self.function.node(call).view() {
-                SemanticNodeView::Call {
-                    family, outputs, ..
-                } => (family, outputs),
-                _ => unreachable!("call progress has a checked call owner"),
-            };
-            let reference_function = self
-                .program
-                .function(self.program.family(family_id).reference().function());
-            let child = child.expect("selected call child has not completed");
-            contents
-                .call(
-                    &mut crate::portable::initialization_context(self.arena, selections, binders),
-                    reference_function.initialization(),
-                    initialized_arguments,
-                )
-                .unwrap_or_else(|error| {
-                    panic!("checked reference call lost its actual initialized input: {error:?}")
-                });
-            let parts = child.into_parts();
-            let child_ir = parts
-                .executable
-                .into_ir()
-                .into_importable()
-                .unwrap_or_else(|error| {
-                    panic!("spliced child produced a root-only executable: {error:?}")
-                });
-            let imported = self.state.construction.import(
-                self.arena,
-                self.state.schedule_region,
-                child_ir,
-                &[],
-            );
-            let results = parts.bindings.import_into(
-                &mut self.state.bindings,
-                &parameter_bindings,
-                &imported,
-                self.state.construction.storage(),
-                contents,
-            );
-            assert_eq!(
-                results.len(),
-                call_outputs.len(),
-                "child complete result arity differs"
-            );
-            self.state.choices.extend(parts.choices);
-            self.state.numerical_children.selected_child(&parts.numerical_applicability);
-            self.state.callees.push(parts.provenance.root);
-            self.state.callees.extend(parts.provenance.callees);
-            self.state.constraints.push(parts.semantic_coverage.node());
-            self.state.constraints.push(parts.hard_constraints);
-            call_outputs.iter().copied().zip(results).collect()
         }
         pub(super) fn close(mut self, closed: ClosedSchedule, mode: crate::portable::SemanticMode) -> ConstructedCandidate<B> {
             let coverage = self.state.semantic_coverage;
@@ -3095,20 +2718,6 @@ mod internals {
                             );
                             schedule_roots(arena, body, roots, control, repeat, scalar_read, host_eval, publication);
                         }
-                        ScheduleStep::Choose { decision, options } => {
-                            let id = *control;
-                            *control = (*control)
-                                .checked_add(1)
-                                .expect("schedule-control root ordinal space exhausted");
-                            let value = arena.decision_value(*decision);
-                            roots.push(arena.root(
-                                RootName::ScheduleChoice { control: id },
-                                AnyExpr::Int(value),
-                            ));
-                            for (_, body) in options {
-                                schedule_roots(arena, body, roots, control, repeat, scalar_read, host_eval, publication);
-                            }
-                        }
                     }
                 }
             }
@@ -3913,20 +3522,6 @@ mod internals {
                     digest.bytes(b"repeat");
                     product(digest,carries,&mut |digest,carry| {operand(digest,carry.initial());destination(digest,carry.header());operand(digest,carry.backedge());destination(digest,carry.result());});
                     digest_schedule(digest, builder, body);
-                }
-                ScheduleStep::Choose { decision, options } => {
-                    digest.bytes(b"choose");
-                    digest.hashed(
-                        &builder
-                            .state
-                            .choices
-                            .iter()
-                            .position(|choice| &choice.decision == decision),
-                    );
-                    for (value, body) in options {
-                        digest.hashed(value);
-                        digest_schedule(digest, builder, body);
-                    }
                 }
             }
         }

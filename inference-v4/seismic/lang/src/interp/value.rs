@@ -98,41 +98,44 @@ impl Value {
         Self::Scalar(value)
     }
 
-    pub(super) fn as_scalar(&self) -> Result<ReferenceScalar, String> {
+    pub(super) fn as_scalar(&self) -> ReferenceScalar {
         match self {
-            Self::Scalar(value) => Ok(*value),
-            _ => Err("semantic value is not scalar".to_owned()),
+            Self::Scalar(value) => *value,
+            _ => unreachable!("checked scalar operand is not a scalar value"),
         }
     }
 
-    pub(super) fn as_nat(&self) -> Result<BigUint, String> {
+    pub(super) fn as_nat(&self) -> BigUint {
+        let natural = match self {
+            Self::Index(value) => Some(value.clone()),
+            Self::Integer(value) => value.to_biguint(),
+            Self::Scalar(ReferenceScalar::U32(value)) => Some((*value).into()),
+            Self::Scalar(ReferenceScalar::I32(value)) => value.to_biguint(),
+            _ => unreachable!("checked natural operand is not a quantity or word"),
+        };
+        natural.unwrap_or_else(|| unreachable!("checked natural operand is negative"))
+    }
+
+    pub(super) fn as_nat_usize(&self) -> usize {
+        self.as_nat()
+            .to_usize()
+            .unwrap_or_else(|| unreachable!("checked in-bounds natural exceeds the address width"))
+    }
+
+    pub(super) fn as_integer(&self) -> BigInt {
         match self {
-            Self::Index(value) => Ok(value.clone()),
-            Self::Integer(value) => value.to_biguint().ok_or_else(|| "negative natural value".to_owned()),
-            Self::Scalar(ReferenceScalar::U32(value)) => Ok((*value).into()),
-            Self::Scalar(ReferenceScalar::I32(value)) => value.to_biguint().ok_or_else(|| "negative natural value".to_owned()),
-            _ => Err("semantic value is not natural".to_owned()),
+            Self::Integer(value) => value.clone(),
+            Self::Index(value) => BigInt::from(value.clone()),
+            Self::Scalar(ReferenceScalar::I32(value)) => (*value).into(),
+            Self::Scalar(ReferenceScalar::U32(value)) => (*value).into(),
+            _ => unreachable!("checked integer operand is not a quantity or word"),
         }
     }
 
-    pub(super) fn as_nat_usize(&self) -> Result<usize, String> {
-        self.as_nat()?.to_usize().ok_or_else(|| "natural value exceeds address width".to_owned())
-    }
-
-    pub(super) fn as_integer(&self) -> Result<BigInt, String> {
+    pub(super) fn as_tensor(&self) -> &TensorValue {
         match self {
-            Self::Integer(value) => Ok(value.clone()),
-            Self::Index(value) => Ok(BigInt::from(value.clone())),
-            Self::Scalar(ReferenceScalar::I32(value)) => Ok((*value).into()),
-            Self::Scalar(ReferenceScalar::U32(value)) => Ok((*value).into()),
-            _ => Err("semantic value is not integer".to_owned()),
-        }
-    }
-
-    pub(super) fn as_tensor(&self) -> Result<&TensorValue, String> {
-        match self {
-            Self::Tensor(value) => Ok(value),
-            _ => Err("semantic value is not a tensor".to_owned()),
+            Self::Tensor(value) => value,
+            _ => unreachable!("checked tensor operand is not a tensor value"),
         }
     }
 }

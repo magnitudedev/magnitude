@@ -1,0 +1,9 @@
+# origin: C11:r2_plane_lower_parallel
+# cell: plane-view-lower/parallel
+# invoke: q4g64[128]=zero ; u32[1]=zero
+fn probe(w: &tensor[128] q4g64, dst: &mut tensor[1] u32):
+    dst[0] = u32(0)
+
+lower probe(w: &tensor[128] q4g64, dst: &mut tensor[1] u32) for cpu:
+    parallel for k in 0..1:
+        dst[k] = w.words[0]

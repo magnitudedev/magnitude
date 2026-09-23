@@ -1,10 +1,9 @@
 //! The Seismic compiler core (spec §2.3).
 //!
-//! Owns: semantic refinement, implementation builders and the factory boundary,
-//! the candidate domain, total evaluation, transient solver adapter,
-//! numerical analysis, freezing, exact coverage and portfolio
-//! construction, the executable representation, the backend contract, and
-//! the complete error taxonomy.
+//! Owns: semantic refinement, implementation builders, the candidate
+//! domain, total evaluation, transient solver adapter, numerical analysis,
+//! freezing, exact coverage and portfolio construction, the executable
+//! representation, the backend contract, and the complete error taxonomy.
 //!
 //! The only artifact progression is
 //! `CheckedModule -> LogicalEntry -> CandidateDomain<'_, B>
@@ -37,11 +36,15 @@ pub mod refinement;
 pub mod solve;
 pub mod target;
 
+mod content_classes;
 mod evaluation_session;
 mod expression;
 mod frozen;
 mod portable;
+mod preparation;
+mod ranking;
 mod realization;
+mod selection;
 
 pub use planning::{
     OptimizationCompletion, PlanningBudgetReport, PlanningBudgetResource, PlanningError,

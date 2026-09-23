@@ -1,0 +1,5 @@
+# origin: C1:p21
+# invoke s: f32[3]=0,2,3
+# pin: result = f32[3]=0,1,1
+fn s[N](x: &tensor[N] f32) -> tensor[N] f32:
+    return f32(x > 1.0)

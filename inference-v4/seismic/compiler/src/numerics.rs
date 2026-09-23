@@ -187,6 +187,10 @@ pub use outcome_comparison::{
 mod validation;
 pub use validation::{ValidationCase, ValidationObservation};
 
+mod demand;
+#[cfg(test)]
+mod demand_tests;
+
 /// Canonical public numerical subjects. Writable input state currently shares
 /// the owner's `value` policy; individual writable leaves are not separate names.
 pub fn subject_names(entry: &seismic_lang::checked::EntryInfo) -> Vec<String> {

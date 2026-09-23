@@ -1,0 +1,7 @@
+# cell: value-packed/zero-trip
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero ; q4g64[4,64]=rand(171) ; index:0
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero ; q4g64[4,64]=rand(171) ; index:3
+fn probe[W](x: &tensor[4, W] f32, out: &mut tensor[4] f32, y: &mut tensor[4, W] f32, w: &tensor[4, 64] q4g64, n: index[5]) where W >= 8:
+    for i in 0..n:
+        let p = w[i]
+        out[i] = p[7]

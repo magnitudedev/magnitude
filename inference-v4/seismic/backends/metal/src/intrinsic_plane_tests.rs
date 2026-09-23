@@ -1,5 +1,6 @@
 //! Native matrix operands preserve physical plane projection through views.
-use crate::{compile, profile, DeviceHandle, Metal, MetalDevice};
+use crate::test_support::metal_device;
+use crate::{compile, profile, Metal};
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
 };
@@ -17,9 +18,8 @@ use seismic_lang::registry::{self, IntrinsicResultType, OperandCategory, Represe
 use seismic_lang::types::DType;
 
 #[test]
-#[ignore = "requires Metal device"]
 fn matrix_operand_preserves_pre_and_post_plane_views() {
-    let device = MetalDevice::open(DeviceHandle::system_default().unwrap()).unwrap();
+    let device = metal_device();
     let target = profile::open_device(&device).unwrap();
     let representation = registry::representation("q8g32s").unwrap();
     let RepresentationKind::Packed(layout) = &registry::representation_info(representation).kind

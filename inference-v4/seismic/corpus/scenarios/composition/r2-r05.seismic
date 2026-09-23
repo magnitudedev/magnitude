@@ -1,0 +1,7 @@
+# origin: X1:r2-r05
+# rejected: "independent visits"
+fn bump(v: &mut tensor[4] f32, i: index[3]):
+    v[i] = v[i + 1] + 1.0
+fn probe(t: &mut tensor[4] f32):
+    parallel for i in 0..3:
+        bump(t, i)

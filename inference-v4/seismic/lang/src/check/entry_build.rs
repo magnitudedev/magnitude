@@ -295,8 +295,8 @@ mod result_schema_tests {
             text: shape_source.into(),
         }])).unwrap_err();
         let error = &errors.diagnostics().items()[0];
-        assert_eq!(error.path, "bad-result-shape.seismic");
-        assert!(error.span.start >= shape_source.find("load(x)").unwrap() as u32);
+        assert_eq!(error.location.path, "bad-result-shape.seismic");
+        assert!(error.location.span.start >= shape_source.find("load(x)").unwrap() as u32);
 
         let conversion_source = "fn probe(x: &tensor[1] U) -> tensor[1] T:\n    return load(x)\n";
         let module = module(conversion_source);
@@ -306,7 +306,7 @@ mod result_schema_tests {
         let errors = module.entry(module.entry_named("probe").unwrap(), &bindings).unwrap_err();
         let error = &errors.diagnostics().items()[0];
         assert!(error.message.contains("no defined source installation conversion"));
-        assert!(error.span.start >= conversion_source.find("load(x)").unwrap() as u32);
+        assert!(error.location.span.start >= conversion_source.find("load(x)").unwrap() as u32);
     }
 
     #[test]
@@ -469,11 +469,14 @@ mod result_schema_tests {
     fn fixed_width_word_slice_checks_wrapped_endpoint_before_view() {
         let module = module("fn probe(input: &tensor[8] i32, lo: i32) -> i32:\n    let view = input[lo:lo+3]\n    return i32(extent(view,0))\n");
         let entry = module.entry(module.entry_named("probe").unwrap(), &ElementBindings::default()).unwrap();
-        let mut interpreter = Interpreter::new(&entry);
-        let input = interpreter.add_tensor(TensorData::dense(DType::I32, vec![8], vec![0.0; 8]));
-        let ok = interpreter.run(&[Arg::Tensor(input), Arg::Scalar(ReferenceScalar::I32(1))]).unwrap();
+        let run = |lo: i32| {
+            let mut interpreter = Interpreter::new(&entry);
+            let input = interpreter.add_tensor(TensorData::dense(DType::I32, vec![8], vec![0.0; 8]));
+            interpreter.run(&[Arg::Tensor(input), Arg::Scalar(ReferenceScalar::I32(lo))]).unwrap()
+        };
+        let ok = run(1);
         assert!(matches!(ok.results().next().unwrap().value(), OutcomeValue::Scalar(ReferenceScalar::I32(3))));
-        assert!(interpreter.run(&[Arg::Tensor(input), Arg::Scalar(ReferenceScalar::I32(i32::MAX))]).is_err());
+        assert!(matches!(run(i32::MAX).termination(), crate::failure::SourceTermination::Failed(_)));
     }
 
     #[test]
@@ -511,8 +514,8 @@ use super::{ir, xfer};
 use crate::checked::{internals::Module, SourceDiagnostic};
 use crate::entry::*;
 use crate::expr::{
-    AnyExpr, BoolExpr, CmpOp, ExprArena, IntExpr, NodeView, SymbolId, SymbolSort,
-    TargetPredicate,
+    AnyExpr, BoolExpr, CmpOp, ExprArena, IntExpr, NodeView, ScalarArgument, ScalarComponent,
+    SymbolId, SymbolSort, TargetPredicate,
 };
 use crate::ids::*;
 use crate::intrinsics::PrimitiveId;
@@ -686,21 +689,27 @@ fn build_dimension_inference_plan(
         .copied()
         .map(AnyExpr::Nat)
         .collect::<Vec<_>>();
-    let order = dimension_inference_order(arena, &dimension_specs, &observation_nodes)?;
+    let order = super::dimensions::dimension_inference_order(arena, &dimension_specs, &observation_nodes)
+        .map_err(|underdetermined| {
+            format!(
+                "external entry dimensions {} are underdetermined or require a nonlinear/invocation-dependent inversion; every dimension must be uniquely derivable from input tensor extents",
+                underdetermined.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ")
+            )
+        })?;
     let steps = order
         .into_iter()
         .map(|(dimension, observation, operations)| {
             let operations = operations
                 .into_iter()
                 .map(|operation| match operation {
-                    InferenceOp::Add(known) => DimensionInferenceOp::Add(final_known(known)),
-                    InferenceOp::Subtract(known) => {
+                    super::dimensions::InferenceOp::Add(known) => DimensionInferenceOp::Add(final_known(known)),
+                    super::dimensions::InferenceOp::Subtract(known) => {
                         DimensionInferenceOp::Subtract(final_known(known))
                     }
-                    InferenceOp::DivideExact(known) => {
+                    super::dimensions::InferenceOp::DivideExact(known) => {
                         DimensionInferenceOp::DivideExact(final_known(known))
                     }
-                    InferenceOp::ReverseSubtract(known) => {
+                    super::dimensions::InferenceOp::ReverseSubtract(known) => {
                         DimensionInferenceOp::ReverseSubtract(final_known(known))
                     }
                 })
@@ -717,597 +726,21 @@ fn build_dimension_inference_plan(
     Ok(DimensionInferencePlan::new(observations.len(), steps))
 }
 
-fn final_known(known: InferenceKnown) -> DimensionInferenceKnown {
+fn final_known(known: super::dimensions::InferenceKnown) -> DimensionInferenceKnown {
     match known {
-        InferenceKnown::Observation(observation) => {
+        super::dimensions::InferenceKnown::Observation(observation) => {
             DimensionInferenceKnown::Observation(observation)
         }
-        InferenceKnown::Expression(AnyExpr::Nat(expression)) => {
+        super::dimensions::InferenceKnown::Expression(AnyExpr::Nat(expression)) => {
             DimensionInferenceKnown::Nat(expression)
         }
-        InferenceKnown::Expression(AnyExpr::Int(expression)) => {
+        super::dimensions::InferenceKnown::Expression(AnyExpr::Int(expression)) => {
             DimensionInferenceKnown::Int(expression)
         }
-        InferenceKnown::Expression(_) => {
+        super::dimensions::InferenceKnown::Expression(_) => {
             panic!("dimension inference produced a non-integer known expression")
         }
     }
-}
-
-/// Check external-call dimension closure before a `CheckedModule` is minted.
-/// All portable families are entries: the language has no second visibility
-/// category, so an underdetermined portable signature is a source error even
-/// when another function also calls it internally.
-pub(super) fn validate_external_dimension_inference(
-    definition: &ir::Definition,
-) -> Result<(), String> {
-    fn tensor_axes(ty: &ValueType, output: &mut Vec<AnyExpr>) {
-        match ty {
-            ValueType::Tuple(items) => {
-                for item in items.iter() {
-                    tensor_axes(item, output);
-                }
-            }
-            ValueType::Tensor(tensor) => {
-                output.extend(tensor.axes.iter().copied().map(AnyExpr::Int))
-            }
-            ValueType::Scalar(_)
-            | ValueType::Integer
-            | ValueType::Index { .. }
-            | ValueType::Range { .. }
-            | ValueType::Opaque { .. }
-            | ValueType::Void => {}
-        }
-    }
-
-    let dimensions = definition
-        .dimensions
-        .iter()
-        .map(|dimension| {
-            (
-                dimension.name.as_str(),
-                dimension.symbol,
-                dimension.admits_zero,
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut observations = Vec::new();
-    for parameter in &definition.params {
-        tensor_axes(&parameter.ty, &mut observations);
-    }
-    dimension_inference_order(&definition.arena, &dimensions, &observations).map(|_| ())
-}
-
-fn dimension_inference_order(
-    arena: &ExprArena,
-    dimensions: &[(&str, SymbolId, bool)],
-    observations: &[AnyExpr],
-) -> Result<Vec<(SymbolId, usize, Vec<InferenceOp>)>, String> {
-    let observation_keys = observations
-        .iter()
-        .copied()
-        .map(|observation| CanonicalObservationKey::new(arena, observation))
-        .collect::<Vec<_>>();
-    let mut unresolved = dimensions
-        .iter()
-        .map(|(_, symbol, _)| *symbol)
-        .collect::<BTreeSet<_>>();
-    let guaranteed_nonzero = dimensions
-        .iter()
-        .filter_map(|(_, symbol, admits_zero)| (!admits_zero).then_some(*symbol))
-        .collect::<BTreeSet<_>>();
-    let mut steps = Vec::with_capacity(dimensions.len());
-    while !unresolved.is_empty() {
-        let selected = dimensions.iter().find_map(|(_, dimension, _)| {
-            if !unresolved.contains(dimension) {
-                return None;
-            }
-            observations
-                .iter()
-                .enumerate()
-                .find_map(|(observation, axis)| {
-                    inverse_operations(
-                        arena,
-                        *axis,
-                        *dimension,
-                        &unresolved,
-                        &guaranteed_nonzero,
-                        observations,
-                        &observation_keys,
-                        observation,
-                    )
-                    .map(|operations| (*dimension, observation, operations))
-                })
-        });
-        let Some((dimension, observation, operations)) = selected else {
-            let names = dimensions
-                .iter()
-                .filter(|(_, symbol, _)| unresolved.contains(symbol))
-                .map(|(name, _, _)| format!("`{name}`"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(format!(
-                "external entry dimensions {names} are underdetermined or require a nonlinear/invocation-dependent inversion; every dimension must be uniquely derivable from input tensor extents"
-            ));
-        };
-        unresolved.remove(&dimension);
-        steps.push((dimension, observation, operations));
-    }
-    Ok(steps)
-}
-
-#[derive(Clone, Copy, Debug)]
-enum InferenceKnown {
-    Observation(usize),
-    Expression(AnyExpr),
-}
-
-#[derive(Clone, Copy, Debug)]
-enum InferenceOp {
-    Add(InferenceKnown),
-    Subtract(InferenceKnown),
-    DivideExact(InferenceKnown),
-    ReverseSubtract(InferenceKnown),
-}
-
-/// DR1's private equality domain for tensor-axis observations.  This is
-/// deliberately narrower than the proof normal form: it canonicalizes only
-/// the equivalences the call ABI promises (associativity/commutativity of
-/// addition and multiplication, the binary/product spelling of
-/// multiplication, and value-preserving integer/natural shape wrappers on
-/// their defined domain). In
-/// particular, it never distributes products over sums or reorders a
-/// subtraction/division.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct CanonicalObservationKey {
-    digest: [u8; 32],
-    form: CanonicalObservationForm,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum CanonicalObservationForm {
-    Integer(i128),
-    Dimension(SymbolId),
-    Add(Vec<CanonicalObservationKey>),
-    Product(Vec<CanonicalObservationKey>),
-    ScalarInteger {
-        operation: String,
-        operands: Vec<(String, CanonicalObservationKey)>,
-    },
-    Ordered {
-        operation: u8,
-        operands: Vec<CanonicalObservationKey>,
-    },
-}
-
-impl CanonicalObservationKey {
-    fn new(arena: &ExprArena, expression: AnyExpr) -> Self {
-        fn collect_associative(
-            arena: &ExprArena,
-            expression: AnyExpr,
-            operation: crate::expr::BinaryOp,
-            output: &mut Vec<CanonicalObservationKey>,
-        ) {
-            match arena.view(expression) {
-                NodeView::Binary { op, lhs, rhs } if op == operation => {
-                    collect_associative(arena, lhs, operation, output);
-                    collect_associative(arena, rhs, operation, output);
-                }
-                NodeView::Nary {
-                    op: crate::expr::NaryOp::Product,
-                    operands,
-                } if operation == crate::expr::BinaryOp::Mul => {
-                    for operand in operands {
-                        collect_associative(arena, *operand, operation, output);
-                    }
-                }
-                _ => output.push(CanonicalObservationKey::new(arena, expression)),
-            }
-        }
-
-        fn ordered_tag(op: crate::expr::BinaryOp) -> u8 {
-            match op {
-                crate::expr::BinaryOp::Sub => 0,
-                crate::expr::BinaryOp::Div => 1,
-                crate::expr::BinaryOp::CeilDiv => 2,
-                crate::expr::BinaryOp::Rem => 3,
-                crate::expr::BinaryOp::Min => 4,
-                crate::expr::BinaryOp::Max => 5,
-                crate::expr::BinaryOp::AlignUp => 6,
-                crate::expr::BinaryOp::And => 7,
-                crate::expr::BinaryOp::Or => 8,
-                crate::expr::BinaryOp::Implies => 9,
-                crate::expr::BinaryOp::Iff => 10,
-                crate::expr::BinaryOp::Add | crate::expr::BinaryOp::Mul => {
-                    unreachable!("commutative shape operation has its own canonical form")
-                }
-            }
-        }
-
-        let form = match arena.view(expression) {
-            NodeView::NatConst(value) => CanonicalObservationForm::Integer(i128::from(value)),
-            NodeView::IntConst(value) => CanonicalObservationForm::Integer(i128::from(value)),
-            NodeView::Symbol(symbol) => CanonicalObservationForm::Dimension(symbol),
-            NodeView::ScalarInteger {
-                operation,
-                operands,
-            } => CanonicalObservationForm::ScalarInteger {
-                operation: format!("{operation:?}"),
-                operands: operands
-                    .iter()
-                    .map(|(dtype, value)| (dtype.name().into(), Self::new(arena, (*value).into())))
-                    .collect(),
-            },
-            NodeView::Unary {
-                op: crate::expr::UnaryOp::IntFromNat | crate::expr::UnaryOp::NatFromInt,
-                operand,
-            } => {
-                // This is equality of observed shape values on the admitted
-                // domain, not an expression rewrite. Both conversions preserve
-                // the integer value whenever defined. The inference plan keeps
-                // and validates the original axes after solving all dimensions,
-                // including every conversion's definedness requirements.
-                return Self::new(arena, operand);
-            }
-            NodeView::Binary {
-                op: crate::expr::BinaryOp::Add | crate::expr::BinaryOp::Mul,
-                ..
-            }
-            | NodeView::Nary {
-                op: crate::expr::NaryOp::Product,
-                ..
-            } => {
-                let operation = match arena.view(expression) {
-                    NodeView::Binary { op, .. } => op,
-                    NodeView::Nary { .. } => crate::expr::BinaryOp::Mul,
-                    _ => unreachable!(),
-                };
-                let mut operands = Vec::new();
-                collect_associative(arena, expression, operation, &mut operands);
-                operands.sort_by(|left, right| {
-                    left.digest
-                        .cmp(&right.digest)
-                        .then_with(|| left.form.cmp(&right.form))
-                });
-                match operation {
-                    crate::expr::BinaryOp::Add => CanonicalObservationForm::Add(operands),
-                    crate::expr::BinaryOp::Mul => CanonicalObservationForm::Product(operands),
-                    _ => unreachable!(),
-                }
-            }
-            NodeView::Binary { op, lhs, rhs } => CanonicalObservationForm::Ordered {
-                operation: ordered_tag(op),
-                operands: vec![Self::new(arena, lhs), Self::new(arena, rhs)],
-            },
-            NodeView::Unary { op, operand } => CanonicalObservationForm::Ordered {
-                operation: match op {
-                    crate::expr::UnaryOp::Not => 32,
-                    crate::expr::UnaryOp::NatFromInt => 33,
-                    crate::expr::UnaryOp::IntFromNat => 34,
-                    crate::expr::UnaryOp::IntFromScalar => 35,
-                    crate::expr::UnaryOp::ScalarIntegerDefined => 36,
-                },
-                operands: vec![Self::new(arena, operand)],
-            },
-            // External tensor axes are checked integer/natural shape
-            // expressions.  Reaching another expression category would be a
-            // checker/entry-builder invariant breach rather than an
-            // ambiguous call schema.
-            NodeView::BoolConst(_)
-            | NodeView::ScalarConst { .. }
-            | NodeView::Nary { .. }
-            | NodeView::Select { .. }
-            | NodeView::Cmp { .. }
-            | NodeView::In { .. }
-            | NodeView::Fold { .. }
-            | NodeView::Duration(_)
-            | NodeView::DurationScale { .. } => {
-                unreachable!("call-schema observation is not a checked integer shape expression")
-            }
-        };
-        let digest = canonical_observation_digest(arena, &form);
-        Self { digest, form }
-    }
-}
-
-fn canonical_observation_digest(arena: &ExprArena, form: &CanonicalObservationForm) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(b"seismic-call-observation-v1");
-    match form {
-        CanonicalObservationForm::Integer(value) => {
-            digest.update([0]);
-            digest.update(value.to_le_bytes());
-        }
-        CanonicalObservationForm::ScalarInteger {
-            operation,
-            operands,
-        } => {
-            digest.update([5]);
-            digest.update((operation.len() as u64).to_le_bytes());
-            digest.update(operation.as_bytes());
-            digest.update((operands.len() as u64).to_le_bytes());
-            for (dtype, operand) in operands {
-                digest.update((dtype.len() as u64).to_le_bytes());
-                digest.update(dtype.as_bytes());
-                digest.update(operand.digest);
-            }
-        }
-        CanonicalObservationForm::Dimension(symbol) => {
-            digest.update([1]);
-            match arena.symbol_kind(*symbol) {
-                crate::expr::SymbolKind::TemplateDimension(ordinal) => {
-                    digest.update([0]);
-                    digest.update(ordinal.to_le_bytes());
-                }
-                crate::expr::SymbolKind::CallDimension(id) => {
-                    digest.update([1]);
-                    digest.update((id.index() as u64).to_le_bytes());
-                }
-                _ => unreachable!("call-schema shape contains a non-dimension symbol"),
-            }
-        }
-        CanonicalObservationForm::Add(operands) => {
-            digest.update([2]);
-            digest.update((operands.len() as u64).to_le_bytes());
-            for operand in operands {
-                digest.update(operand.digest);
-            }
-        }
-        CanonicalObservationForm::Product(operands) => {
-            digest.update([3]);
-            digest.update((operands.len() as u64).to_le_bytes());
-            for operand in operands {
-                digest.update(operand.digest);
-            }
-        }
-        CanonicalObservationForm::Ordered {
-            operation,
-            operands,
-        } => {
-            digest.update([4, *operation]);
-            digest.update((operands.len() as u64).to_le_bytes());
-            for operand in operands {
-                digest.update(operand.digest);
-            }
-        }
-    }
-    digest.finalize().into()
-}
-
-fn inverse_operations(
-    arena: &ExprArena,
-    expression: AnyExpr,
-    dimension: SymbolId,
-    unresolved: &BTreeSet<SymbolId>,
-    guaranteed_nonzero: &BTreeSet<SymbolId>,
-    observations: &[AnyExpr],
-    observation_keys: &[CanonicalObservationKey],
-    root_observation: usize,
-) -> Option<Vec<InferenceOp>> {
-    fn contains(arena: &ExprArena, expression: AnyExpr, dimension: SymbolId) -> bool {
-        arena.free_symbols(expression).contains(&dimension)
-    }
-
-    fn positive(
-        arena: &ExprArena,
-        expression: AnyExpr,
-        guaranteed_nonzero: &BTreeSet<SymbolId>,
-    ) -> bool {
-        match arena.view(expression) {
-            NodeView::NatConst(value) => value > 0,
-            NodeView::IntConst(value) => value > 0,
-            NodeView::Symbol(symbol) => guaranteed_nonzero.contains(&symbol),
-            NodeView::Unary { operand, .. } => positive(arena, operand, guaranteed_nonzero),
-            NodeView::Binary {
-                op: crate::expr::BinaryOp::Mul,
-                lhs,
-                rhs,
-            } => {
-                positive(arena, lhs, guaranteed_nonzero) && positive(arena, rhs, guaranteed_nonzero)
-            }
-            NodeView::Binary {
-                op: crate::expr::BinaryOp::Add,
-                lhs,
-                rhs,
-            } => {
-                let left = positive(arena, lhs, guaranteed_nonzero);
-                let right = positive(arena, rhs, guaranteed_nonzero);
-                match expression {
-                    // Natural expressions are nonnegative, so one positive
-                    // summand proves the complete sum positive.
-                    AnyExpr::Nat(_) => left || right,
-                    // Checked integer shape expressions may also contain
-                    // subtraction. Requiring both summands positive is the
-                    // conservative structural proof that needs no range
-                    // assumptions beyond the dimension contract.
-                    AnyExpr::Int(_) => left && right,
-                    AnyExpr::Bool(_) | AnyExpr::Duration(_) | AnyExpr::Scalar(_) => false,
-                }
-            }
-            NodeView::Nary {
-                op: crate::expr::NaryOp::Product,
-                operands,
-            } => operands
-                .iter()
-                .all(|operand| positive(arena, *operand, guaranteed_nonzero)),
-            _ => false,
-        }
-    }
-
-    fn known(
-        arena: &ExprArena,
-        expression: AnyExpr,
-        unresolved: &BTreeSet<SymbolId>,
-        _observations: &[AnyExpr],
-        observation_keys: &[CanonicalObservationKey],
-        root_observation: usize,
-    ) -> Option<InferenceKnown> {
-        let key = CanonicalObservationKey::new(arena, expression);
-        if let Some(observation) =
-            observation_keys
-                .iter()
-                .enumerate()
-                .find_map(|(observation, candidate)| {
-                    (observation != root_observation && *candidate == key).then_some(observation)
-                })
-        {
-            return Some(InferenceKnown::Observation(observation));
-        }
-        let has_unresolved = arena
-            .free_symbols(expression)
-            .into_iter()
-            .any(|symbol| unresolved.contains(&symbol));
-        (!has_unresolved).then_some(InferenceKnown::Expression(expression))
-    }
-
-    fn walk(
-        arena: &ExprArena,
-        expression: AnyExpr,
-        dimension: SymbolId,
-        unresolved: &BTreeSet<SymbolId>,
-        guaranteed_nonzero: &BTreeSet<SymbolId>,
-        observations: &[AnyExpr],
-        observation_keys: &[CanonicalObservationKey],
-        root_observation: usize,
-    ) -> Option<Vec<InferenceOp>> {
-        match arena.view(expression) {
-            NodeView::Symbol(symbol) if symbol == dimension => Some(Vec::new()),
-            NodeView::Unary { operand, .. } => walk(
-                arena,
-                operand,
-                dimension,
-                unresolved,
-                guaranteed_nonzero,
-                observations,
-                observation_keys,
-                root_observation,
-            ),
-            NodeView::Binary { op, lhs, rhs } => {
-                let left_known = known(
-                    arena,
-                    lhs,
-                    unresolved,
-                    observations,
-                    observation_keys,
-                    root_observation,
-                );
-                let right_known = known(
-                    arena,
-                    rhs,
-                    unresolved,
-                    observations,
-                    observation_keys,
-                    root_observation,
-                );
-                let left = contains(arena, lhs, dimension) && left_known.is_none();
-                let right = contains(arena, rhs, dimension) && right_known.is_none();
-                if left == right {
-                    return None;
-                }
-                let (next, operation) = if left {
-                    let other = right_known?;
-                    let operation = match op {
-                        crate::expr::BinaryOp::Add => InferenceOp::Subtract(other),
-                        crate::expr::BinaryOp::Sub => InferenceOp::Add(other),
-                        crate::expr::BinaryOp::Mul if positive(arena, rhs, guaranteed_nonzero) => {
-                            InferenceOp::DivideExact(other)
-                        }
-                        _ => return None,
-                    };
-                    (lhs, operation)
-                } else {
-                    let other = left_known?;
-                    let operation = match op {
-                        crate::expr::BinaryOp::Add => InferenceOp::Subtract(other),
-                        crate::expr::BinaryOp::Sub => InferenceOp::ReverseSubtract(other),
-                        crate::expr::BinaryOp::Mul if positive(arena, lhs, guaranteed_nonzero) => {
-                            InferenceOp::DivideExact(other)
-                        }
-                        _ => return None,
-                    };
-                    (rhs, operation)
-                };
-                let mut operations = vec![operation];
-                operations.extend(walk(
-                    arena,
-                    next,
-                    dimension,
-                    unresolved,
-                    guaranteed_nonzero,
-                    observations,
-                    observation_keys,
-                    root_observation,
-                )?);
-                Some(operations)
-            }
-            NodeView::Nary {
-                op: crate::expr::NaryOp::Product,
-                operands,
-            } => {
-                let targets = operands
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, operand)| {
-                        contains(arena, **operand, dimension)
-                            && known(
-                                arena,
-                                **operand,
-                                unresolved,
-                                observations,
-                                observation_keys,
-                                root_observation,
-                            )
-                            .is_none()
-                    })
-                    .map(|(index, operand)| (index, *operand))
-                    .collect::<Vec<_>>();
-                if targets.len() != 1 {
-                    return None;
-                }
-                let (target_index, target) = targets[0];
-                let mut operations = Vec::new();
-                for (index, operand) in operands.iter().enumerate() {
-                    if index == target_index {
-                        continue;
-                    }
-                    if !positive(arena, *operand, guaranteed_nonzero) {
-                        return None;
-                    }
-                    operations.push(InferenceOp::DivideExact(known(
-                        arena,
-                        *operand,
-                        unresolved,
-                        observations,
-                        observation_keys,
-                        root_observation,
-                    )?));
-                }
-                operations.extend(walk(
-                    arena,
-                    target,
-                    dimension,
-                    unresolved,
-                    guaranteed_nonzero,
-                    observations,
-                    observation_keys,
-                    root_observation,
-                )?);
-                Some(operations)
-            }
-            _ => None,
-        }
-    }
-
-    walk(
-        arena,
-        expression,
-        dimension,
-        unresolved,
-        guaranteed_nonzero,
-        observations,
-        observation_keys,
-        root_observation,
-    )
 }
 
 fn validate_elements(
@@ -1320,13 +753,14 @@ fn validate_elements(
     if expected != actual {
         let missing: Vec<_> = expected.difference(&actual).cloned().collect();
         let extra: Vec<_> = actual.difference(&expected).cloned().collect();
-        return Err(SourceDiagnostic {
-            path: module.sources.files()[0].path.clone(),
-            span: crate::span::Span::default(),
-            message: format!(
+        return Err(SourceDiagnostic::new(
+            &module.sources.files()[0],
+            crate::span::Span::default(),
+            crate::checked::DiagnosticRule::Type,
+            format!(
                 "element bindings do not match the entry parameters; missing: {missing:?}; extra: {extra:?}"
             ),
-        });
+        ));
     }
     Ok(supplied
         .iter()
@@ -1555,11 +989,12 @@ fn source_error(
     span: crate::span::Span,
     message: impl Into<String>,
 ) -> SourceDiagnostic {
-    SourceDiagnostic {
-        path: module.sources.files()[file].path.clone(),
+    SourceDiagnostic::new(
+        &module.sources.files()[file],
         span,
-        message: message.into(),
-    }
+        crate::checked::DiagnosticRule::Type,
+        message.into(),
+    )
 }
 
 fn build_schema_parameters(
@@ -1592,18 +1027,30 @@ fn build_schema_parameters(
                 axes: tensor.axes,
             },
             SemanticType::Scalar(dtype) => {
-                let symbol = arena.call_scalar(id, scalar_sort(dtype));
+                let symbol = arena.call_scalar(
+                    ScalarArgument { parameter: id, component: ScalarComponent::Value },
+                    scalar_sort(dtype),
+                );
                 ParameterKind::Scalar { dtype, symbol }
             }
             SemanticType::Index { bound } => {
-                let symbol = arena.call_scalar(id, SymbolSort::Nat);
+                let symbol = arena.call_scalar(
+                    ScalarArgument { parameter: id, component: ScalarComponent::Value },
+                    SymbolSort::Nat,
+                );
                 let value = arena.nat_symbol(symbol);
                 domain.push(arena.nat_cmp(CmpOp::Lt, value, bound));
                 ParameterKind::Index { bound, symbol }
             }
             SemanticType::Range { bound } => {
-                let start = arena.call_scalar(id, SymbolSort::Nat);
-                let end = arena.call_scalar(id, SymbolSort::Nat);
+                let start = arena.call_scalar(
+                    ScalarArgument { parameter: id, component: ScalarComponent::RangeStart },
+                    SymbolSort::Nat,
+                );
+                let end = arena.call_scalar(
+                    ScalarArgument { parameter: id, component: ScalarComponent::RangeEnd },
+                    SymbolSort::Nat,
+                );
                 let start_value = arena.nat_symbol(start);
                 let end_value = arena.nat_symbol(end);
                 domain.push(arena.nat_cmp(CmpOp::Ge, end_value, start_value));
@@ -2017,16 +1464,15 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 && crate::registry::representation_info(tensor.representation).access
                     != crate::registry::RepresentationAccess::ReadWrite
             {
-                return Err(SourceDiagnostic {
-                    path: self.module.sources.files()[self.definition.file]
-                        .path
-                        .clone(),
+                return Err(SourceDiagnostic::new(
+                    &self.module.sources.files()[self.definition.file],
                     span,
-                    message: format!(
+                    crate::checked::DiagnosticRule::Type,
+                    format!(
                         "representation `{}` is decode-only and cannot bind a mutable tensor parameter",
                         crate::registry::representation_info(tensor.representation).name
                     ),
-                });
+                ));
             }
             tensor.storage = TensorStorage::Parameter(leaf_access);
         }
@@ -3098,16 +2544,15 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                     if crate::registry::representation_info(tensor.representation).access
                         != crate::registry::RepresentationAccess::ReadWrite
                     {
-                        return Err(SourceDiagnostic {
-                            path: self.module.sources.files()[self.definition.file]
-                                .path
-                                .clone(),
+                        return Err(SourceDiagnostic::new(
+                            &self.module.sources.files()[self.definition.file],
                             span,
-                            message: format!(
+                            crate::checked::DiagnosticRule::Type,
+                            format!(
                                 "representation `{}` is decode-only and has no canonical write contract",
                                 crate::registry::representation_info(tensor.representation).name
                             ),
-                        });
+                        ));
                     }
                 }
                 let mut inputs = vec![base];
@@ -3283,7 +2728,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             PrimitiveId::TupleGet(index) => NodeKind::TupleGet { index: *index },
             PrimitiveId::TensorAlloc => NodeKind::Alloc,
             PrimitiveId::Fill(value) => NodeKind::Fill { value: *value },
-            PrimitiveId::Materialize | PrimitiveId::Clone | PrimitiveId::Load => NodeKind::Copy,
+            PrimitiveId::Copy => NodeKind::Copy,
             PrimitiveId::RepresentationConvert(_) => {
                 panic!("representation conversion is resolved during entry construction")
             }
@@ -3298,6 +2743,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 op,
                 axis,
                 unordered,
+                ..
             } => NodeKind::Reduce {
                 op: *op,
                 axis: *axis,
@@ -3313,8 +2759,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             | PrimitiveId::Binary(_)
             | PrimitiveId::Cast(_)
             | PrimitiveId::Math(_)
-            | PrimitiveId::Select
-            | PrimitiveId::Decode => {
+            | PrimitiveId::Select => {
                 if matches!(output, SemanticType::Tensor(_)) {
                     NodeKind::Elementwise(primitive.clone())
                 } else {
@@ -3708,30 +3153,28 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                     crate::registry::IntrinsicExecution::WithinEnclosingParallel
                         if self.parallel_depth == 0 =>
                     {
-                        return Err(SourceDiagnostic {
-                            path: self.module.sources.files()[self.definition.file]
-                                .path
-                                .clone(),
-                            span: expression.span,
-                            message: format!(
+                        return Err(SourceDiagnostic::new(
+                            &self.module.sources.files()[self.definition.file],
+                            expression.span,
+                            crate::checked::DiagnosticRule::Type,
+                            format!(
                                 "intrinsic `{}` requires an enclosing parallel loop",
                                 signature.name
                             ),
-                        });
+                        ));
                     }
                     crate::registry::IntrinsicExecution::WholeTensor { .. }
                         if self.parallel_depth != 0 =>
                     {
-                        return Err(SourceDiagnostic {
-                            path: self.module.sources.files()[self.definition.file]
-                                .path
-                                .clone(),
-                            span: expression.span,
-                            message: format!(
+                        return Err(SourceDiagnostic::new(
+                            &self.module.sources.files()[self.definition.file],
+                            expression.span,
+                            crate::checked::DiagnosticRule::Type,
+                            format!(
                                 "whole-tensor intrinsic `{}` cannot be nested in a parallel loop",
                                 signature.name
                             ),
-                        });
+                        ));
                     }
                     crate::registry::IntrinsicExecution::WithinEnclosingParallel
                     | crate::registry::IntrinsicExecution::WholeTensor { .. } => {}
@@ -3783,29 +3226,31 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             let mut operand = 1usize;
             let mut axes = Vec::new();
             for (axis, index) in indices.iter().enumerate() {
-                match index {
-                    crate::intrinsics::IndexSlot::Point => {
+                let (start, end) = match *index {
+                    crate::intrinsics::IndexSlot::Point { .. } => {
                         operand += 1;
+                        continue;
                     }
-                    crate::intrinsics::IndexSlot::Range { start, end } => {
-                        let start = if *start {
-                            let value = self.runtime_int(inputs[operand]);
-                            operand += 1;
-                            value
-                        } else {
-                            self.builder.arena.int(0)
-                        };
-                        let end = if *end {
-                            let value = self.runtime_int(inputs[operand]);
-                            operand += 1;
-                            value
-                        } else {
-                            self.builder.arena.int_from_nat(base_tensor.axes[axis])
-                        };
-                        let width = self.builder.arena.int_sub(end, start);
-                        axes.push(self.builder.arena.nat_from_int(width));
-                    }
-                }
+                    crate::intrinsics::IndexSlot::Range { start, end, .. } => (start, end),
+                    // The whole axis: a range with no operands.
+                    crate::intrinsics::IndexSlot::Full => (false, false),
+                };
+                let start = if start {
+                    let value = self.runtime_int(inputs[operand]);
+                    operand += 1;
+                    value
+                } else {
+                    self.builder.arena.int(0)
+                };
+                let end = if end {
+                    let value = self.runtime_int(inputs[operand]);
+                    operand += 1;
+                    value
+                } else {
+                    self.builder.arena.int_from_nat(base_tensor.axes[axis])
+                };
+                let width = self.builder.arena.int_sub(end, start);
+                axes.push(self.builder.arena.nat_from_int(width));
             }
             axes.extend(base_tensor.axes[indices.len()..].iter().copied());
             if let ValueType::Tensor(source_tensor) = &expression.ty {
@@ -3889,16 +3334,15 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 if crate::registry::representation_info(tensor.representation).access
                     != crate::registry::RepresentationAccess::ReadWrite
                 {
-                    return Err(SourceDiagnostic {
-                        path: self.module.sources.files()[self.definition.file]
-                            .path
-                            .clone(),
-                        span: expression.span,
-                        message: format!(
+                    return Err(SourceDiagnostic::new(
+                        &self.module.sources.files()[self.definition.file],
+                        expression.span,
+                        crate::checked::DiagnosticRule::Type,
+                        format!(
                             "representation `{}` is decode-only and cannot be allocated as writable logical storage",
                             crate::registry::representation_info(tensor.representation).name
                         ),
-                    });
+                    ));
                 }
             }
         }
@@ -3916,17 +3360,16 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 source.representation,
                 destination.representation,
             ) else {
-                return Err(SourceDiagnostic {
-                    path: self.module.sources.files()[self.definition.file]
-                        .path
-                        .clone(),
-                    span: expression.span,
-                    message: format!(
+                return Err(SourceDiagnostic::new(
+                    &self.module.sources.files()[self.definition.file],
+                    expression.span,
+                    crate::checked::DiagnosticRule::Type,
+                    format!(
                         "no exact representation conversion is registered from `{}` to `{}`",
                         crate::registry::representation_info(source.representation).name,
                         crate::registry::representation_info(destination.representation).name,
                     ),
-                });
+                ));
             };
             destination.storage = TensorStorage::Owned;
             return Ok(self.emit(
@@ -3940,9 +3383,9 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             )[0]);
         }
         match primitive {
-            PrimitiveId::ElementRead { arity } => {
+            PrimitiveId::ElementRead { checks } => {
                 let base = inputs[0];
-                for axis in 0..usize::try_from(*arity).expect("index arity does not fit usize") {
+                for axis in 0..checks.len() {
                     self.emit_point_check(region, base, axis, inputs[axis + 1], expression.span);
                 }
             }
@@ -3951,7 +3394,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 let mut operand = 1;
                 for (axis, slot) in indices.iter().enumerate() {
                     match slot {
-                        crate::intrinsics::IndexSlot::Point => {
+                        crate::intrinsics::IndexSlot::Point { .. } => {
                             self.emit_point_check(
                                 region,
                                 base,
@@ -3961,7 +3404,9 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                             );
                             operand += 1;
                         }
-                        crate::intrinsics::IndexSlot::Range { start, end } => {
+                        // The whole axis: no operands and no checks.
+                        crate::intrinsics::IndexSlot::Full => {}
+                        crate::intrinsics::IndexSlot::Range { start, end, .. } => {
                             let start_value = if *start {
                                 let value = inputs[operand];
                                 operand += 1;
@@ -4021,11 +3466,8 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             | PrimitiveId::Select
             | PrimitiveId::TensorAlloc
             | PrimitiveId::Fill(_)
-            | PrimitiveId::Materialize
-            | PrimitiveId::Clone
-            | PrimitiveId::Load
+            | PrimitiveId::Copy
             | PrimitiveId::RepresentationConvert(_)
-            | PrimitiveId::Decode
             | PrimitiveId::Transpose
             | PrimitiveId::Reshape
             | PrimitiveId::Extent { .. }
@@ -4042,13 +3484,14 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 let mut axes = Vec::with_capacity(indices.len());
                 for index in indices {
                     match index {
-                        crate::intrinsics::IndexSlot::Point => axes.push(SliceAxis::Point {
+                        crate::intrinsics::IndexSlot::Point { .. } => axes.push(SliceAxis::Point {
                             value: ScalarRef::Value(
                                 scalars.next().expect("checked slice omitted point operand"),
                             ),
                             runtime_check: true,
                         }),
-                        crate::intrinsics::IndexSlot::Range { start, end } => {
+                        crate::intrinsics::IndexSlot::Full => axes.push(SliceAxis::Full),
+                        crate::intrinsics::IndexSlot::Range { start, end, .. } => {
                             let start = start.then(|| {
                                 ScalarRef::Value(
                                     scalars.next().expect("checked slice omitted range start"),
@@ -4116,17 +3559,14 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             }
             PrimitiveId::TensorAlloc
             | PrimitiveId::Fill(_)
-            | PrimitiveId::Materialize
-            | PrimitiveId::Clone
+            | PrimitiveId::Copy
             | PrimitiveId::RepresentationConvert(_) => {
                 if let SemanticType::Tensor(tensor) = &mut ty {
                     tensor.storage = TensorStorage::Owned;
                 }
                 self.primitive_kind(primitive, &ty)
             }
-            PrimitiveId::Load
-            | PrimitiveId::Decode
-            | PrimitiveId::ElementRead { .. }
+            PrimitiveId::ElementRead { .. }
             | PrimitiveId::Reduce { .. } => self.primitive_kind(primitive, &ty),
             PrimitiveId::Atomic { .. } => {
                 panic!("checked atomic primitive bypassed its authority-bearing node")
@@ -4868,11 +4308,12 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                     continue;
                 }
                 if parallel {
-                    return Err(SourceDiagnostic {
-                        path: self.module.sources.files()[self.definition.file].path.clone(),
-                        span: self.definition.body.locals[*ordinal].span,
-                        message: "a `parallel for` body cannot carry reassigned state; use an explicit reduction or write through a disjoint tensor view".to_owned(),
-                    });
+                    return Err(SourceDiagnostic::new(
+                        &self.module.sources.files()[self.definition.file],
+                        self.definition.body.locals[*ordinal].span,
+                        crate::checked::DiagnosticRule::Type,
+                        "a `parallel for` body cannot carry reassigned state; use an explicit reduction or write through a disjoint tensor view".to_owned(),
+                    ));
                 }
                 let result = SemanticValueId::new(
                     self.id,
@@ -4959,212 +4400,5 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             vec![SemanticType::Index { bound }],
             span,
         )[0]
-    }
-}
-
-#[cfg(test)]
-mod dimension_inference_tests {
-    use super::*;
-    use crate::expr::NatExpr;
-
-    fn dimensions<'a>(
-        arena: &mut ExprArena,
-        names: &'a [&'a str],
-        admit_zero: &[bool],
-    ) -> (Vec<(&'a str, SymbolId, bool)>, Vec<NatExpr>) {
-        let schema = CallSchema::fresh_id();
-        let mut specs = Vec::new();
-        let mut values = Vec::new();
-        for (ordinal, (name, admits_zero)) in names.iter().zip(admit_zero).enumerate() {
-            let (symbol, value) = arena.call_dimension(CallSchema::dimension_id(schema, ordinal));
-            specs.push((*name, symbol, *admits_zero));
-            values.push(value);
-        }
-        (specs, values)
-    }
-
-    #[test]
-    fn canonical_observation_key_matches_commuted_associative_products() {
-        let mut arena = ExprArena::new();
-        let (_, values) = dimensions(&mut arena, &["N", "G", "V"], &[false, false, false]);
-        let ng = arena.nat_mul(values[0], values[1]);
-        let binary = arena.nat_mul(ng, values[2]);
-        let product = arena.nat_product(&[values[2], values[1], values[0]]);
-
-        assert_eq!(
-            CanonicalObservationKey::new(&arena, AnyExpr::Nat(binary)),
-            CanonicalObservationKey::new(&arena, AnyExpr::Nat(product))
-        );
-    }
-
-    #[test]
-    fn canonical_observation_key_preserves_subtraction_order() {
-        let mut arena = ExprArena::new();
-        let (_, values) = dimensions(&mut arena, &["N", "G"], &[false, false]);
-        let n = arena.int_from_nat(values[0]);
-        let g = arena.int_from_nat(values[1]);
-        let ng = arena.int_sub(n, g);
-        let gn = arena.int_sub(g, n);
-
-        assert_ne!(
-            CanonicalObservationKey::new(&arena, AnyExpr::Int(ng)),
-            CanonicalObservationKey::new(&arena, AnyExpr::Int(gn))
-        );
-    }
-
-    #[test]
-    fn recurrent_observed_product_system_is_triangular() {
-        let mut arena = ExprArena::new();
-        let (specs, values) = dimensions(&mut arena, &["NK", "GV"], &[false, false]);
-        let p = arena.nat_mul(values[0], values[1]);
-        let p_reordered = arena.nat_product(&[values[1], values[0]]);
-        let two = arena.nat(2);
-        let twice_nk = arena.nat_mul(two, values[0]);
-        let q = arena.nat_add(twice_nk, p_reordered);
-
-        let plan = dimension_inference_order(&arena, &specs, &[AnyExpr::Nat(p), AnyExpr::Nat(q)])
-            .expect("P = NK*GV, Q = 2*NK + P must be triangular");
-
-        assert_eq!(plan.len(), 2);
-        assert_eq!(plan[0].0, specs[0].1);
-        assert_eq!(plan[0].1, 1);
-        assert_eq!(plan[1].0, specs[1].1);
-        assert_eq!(plan[1].1, 0);
-        assert!(plan[1]
-            .2
-            .iter()
-            .any(|operation| matches!(operation, InferenceOp::DivideExact(_))));
-    }
-
-    #[test]
-    fn direct_affine_and_chained_dimensions_use_schema_order() {
-        let mut arena = ExprArena::new();
-        let (specs, values) = dimensions(&mut arena, &["N", "P", "Q"], &[false, false, false]);
-        let three = arena.nat(3);
-        let two = arena.nat(2);
-        let twice_p = arena.nat_mul(two, values[1]);
-        let affine_p = arena.nat_add(twice_p, three);
-        let chained_q = arena.nat_add(values[2], values[1]);
-
-        let plan = dimension_inference_order(
-            &arena,
-            &specs,
-            &[
-                AnyExpr::Nat(values[0]),
-                AnyExpr::Nat(affine_p),
-                AnyExpr::Nat(chained_q),
-            ],
-        )
-        .expect("direct, affine, and chained dimensions must be triangular");
-
-        assert_eq!(
-            plan.iter().map(|step| step.0).collect::<Vec<_>>(),
-            specs.iter().map(|spec| spec.1).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            plan.iter().map(|step| step.1).collect::<Vec<_>>(),
-            vec![0, 1, 2]
-        );
-    }
-
-    #[test]
-    fn ambiguous_product_is_rejected() {
-        let mut arena = ExprArena::new();
-        let (specs, values) = dimensions(&mut arena, &["N", "G"], &[false, false]);
-        let product = arena.nat_mul(values[0], values[1]);
-        assert!(dimension_inference_order(&arena, &specs, &[AnyExpr::Nat(product)]).is_err());
-    }
-
-    #[test]
-    fn possibly_zero_observed_divisor_is_rejected() {
-        let mut arena = ExprArena::new();
-        let (specs, values) = dimensions(&mut arena, &["N", "G"], &[false, true]);
-        let product = arena.nat_mul(values[0], values[1]);
-        assert!(dimension_inference_order(
-            &arena,
-            &specs,
-            &[AnyExpr::Nat(values[1]), AnyExpr::Nat(product)],
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn positive_natural_sum_can_be_an_exact_divisor() {
-        let mut arena = ExprArena::new();
-        let (specs, values) = dimensions(
-            &mut arena,
-            &["G", "KV", "P", "S"],
-            &[false, false, false, true],
-        );
-        let two = arena.nat(2);
-        let two_p = arena.nat_mul(two, values[2]);
-        let width = arena.nat_add(two_p, values[3]);
-        let kv_width = arena.nat_mul(values[1], width);
-        let product = arena.nat_product(&[values[1], values[0], width]);
-
-        let plan = dimension_inference_order(
-            &arena,
-            &specs,
-            &[
-                AnyExpr::Nat(values[1]),
-                AnyExpr::Nat(values[2]),
-                AnyExpr::Nat(width),
-                AnyExpr::Nat(kv_width),
-                AnyExpr::Nat(product),
-            ],
-        )
-        .expect("a positive natural sum is a valid exact divisor");
-
-        assert_eq!(plan.len(), 4);
-        assert!(plan
-            .iter()
-            .find(|step| step.0 == specs[0].1)
-            .expect("G step")
-            .2
-            .iter()
-            .any(|operation| matches!(operation, InferenceOp::DivideExact(_))));
-    }
-
-    #[test]
-    fn positive_checked_integer_sum_can_be_an_exact_divisor() {
-        let mut arena = ExprArena::new();
-        let (specs, values) = dimensions(
-            &mut arena,
-            &["G", "KV", "P", "S"],
-            &[false, false, false, false],
-        );
-        let g = arena.int_from_nat(values[0]);
-        let kv = arena.int_from_nat(values[1]);
-        let p = arena.int_from_nat(values[2]);
-        let s = arena.int_from_nat(values[3]);
-        let two = arena.int(2);
-        let two_p = arena.int_mul(two, p);
-        let width = arena.int_add(two_p, s);
-        let kv_width = arena.int_mul(kv, width);
-        let kv_g = arena.int_mul(kv, g);
-        let twice_kv_g = arena.int_mul(kv_g, two);
-        let product = arena.int_mul(twice_kv_g, width);
-
-        let plan = dimension_inference_order(
-            &arena,
-            &specs,
-            &[
-                AnyExpr::Int(kv),
-                AnyExpr::Int(p),
-                AnyExpr::Int(width),
-                AnyExpr::Int(kv_width),
-                AnyExpr::Int(product),
-            ],
-        )
-        .expect("a positive checked integer sum is a valid exact divisor");
-
-        assert_eq!(plan.len(), 4);
-        assert!(plan
-            .iter()
-            .find(|step| step.0 == specs[0].1)
-            .expect("G step")
-            .2
-            .iter()
-            .any(|operation| matches!(operation, InferenceOp::DivideExact(_))));
     }
 }

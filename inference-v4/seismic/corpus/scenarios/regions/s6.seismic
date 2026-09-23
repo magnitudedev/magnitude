@@ -1,0 +1,6 @@
+# origin: C14:s6
+# invoke: f32[5]=zero
+fn probe[N](x: &mut tensor[N] f32) -> f32:
+    let a = x + x
+    x[0] = 100.0
+    return reduce(a, 0, sum)

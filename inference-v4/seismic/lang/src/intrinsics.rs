@@ -113,15 +113,77 @@ impl ReduceOp {
     }
 }
 
-/// Structure of one index slot of a view selection.
+/// Structure of one index slot of a view selection. Each `check*` flag is
+/// `true` when the checker did not prove the corresponding bound, so entry
+/// construction emits its runtime check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IndexSlot {
-    Point,
+    Point {
+        /// `0 <= i < extent` is not proved.
+        check: bool,
+    },
     /// `lo:hi` with present bounds; omitted bounds are the axis ends.
     Range {
         start: bool,
         end: bool,
+        /// `0 <= lo` is not proved.
+        check_start: bool,
+        /// `lo <= hi` is not proved.
+        check_order: bool,
+        /// `hi <= extent` is not proved.
+        check_end: bool,
+        /// A `s : s + w` slice whose realized width `hi - lo = w` is not
+        /// proved (L24).
+        check_width: bool,
     },
+    /// An omitted trailing axis: the whole axis, with no operands and no
+    /// checks.
+    Full,
+}
+
+/// The checker's proof about a primitive whose scalar recipe has failure
+/// outputs: `ProvedAbsent` means those outputs are unreachable at this site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PrimitiveFailure {
+    Possible,
+    ProvedAbsent,
+}
+
+/// The operands a unary operator is defined on (L28). Each domain admits
+/// its scalar dtypes both as scalars and as the element of a dense tensor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OperandDomain {
+    /// `not`: `bool`.
+    Bool,
+    /// `~`: the integer words `i32` and `u32`.
+    IntegerWord,
+    /// `-`: every numeric dtype, and the exact quantities `Integer` and
+    /// `index`.
+    NumericOrQuantity,
+}
+
+impl OperandDomain {
+    pub fn admits_dtype(self, dtype: DType) -> bool {
+        match self {
+            OperandDomain::Bool => dtype == DType::Bool,
+            OperandDomain::IntegerWord => dtype.is_int(),
+            OperandDomain::NumericOrQuantity => dtype.is_numeric(),
+        }
+    }
+
+    pub fn admits_quantity(self) -> bool {
+        matches!(self, OperandDomain::NumericOrQuantity)
+    }
+}
+
+/// The operand domain of a unary operator: the only owner of which operands
+/// `not`, `~` and `-` accept.
+pub fn unary_operand_domain(op: UnaryOp) -> OperandDomain {
+    match op {
+        UnaryOp::Not => OperandDomain::Bool,
+        UnaryOp::BitNot => OperandDomain::IntegerWord,
+        UnaryOp::Neg => OperandDomain::NumericOrQuantity,
+    }
 }
 
 /// The combining operation of an `atomic` update. `add` is the registry
@@ -197,26 +259,22 @@ pub enum PrimitiveId {
     TensorAlloc,
     /// `zeros_like` / `ones_like`: shape of the operand, constant fill.
     Fill(FillConstant),
-    /// `to_owned`: new owned storage from a borrowed or computed value.
-    Materialize,
-    /// `clone`: duplicate an owned tensor.
-    Clone,
-    /// `load`: snapshot in the operand's own representation.
-    Load,
+    /// `to_owned`: new owned storage holding the operand's value, in the
+    /// operand's own representation.
+    Copy,
     /// Exact registry-declared conversion between two storage
     /// representations. The result is a completely initialized owned value.
     RepresentationConvert(RepresentationTarget),
-    /// `decode`: dense `f32` value of a packed view.
-    Decode,
     Transpose,
     Reshape,
     /// View selection `t[i, j:k, …]`.
     SliceView {
         indices: Vec<IndexSlot>,
     },
-    /// Point read `t[i, j]`.
+    /// Point read `t[i, j]`: one flag per axis, `true` when the index bound
+    /// is not proved.
     ElementRead {
-        arity: u32,
+        checks: Vec<bool>,
     },
     /// `extent(v, axis)`.
     Extent {
@@ -226,12 +284,16 @@ pub enum PrimitiveId {
     /// u32; bool is rejected because bool arithmetic is undefined.
     Atomic {
         op: AtomicOp,
-        arity: u32,
+        /// One flag per axis, `true` when the index bound is not proved.
+        checks: Vec<bool>,
     },
     Reduce {
         op: ReduceOp,
         axis: u32,
         unordered: bool,
+        /// `max`/`min`/`argmax`: `true` when a nonempty reduced axis is not
+        /// proved.
+        check_nonempty: bool,
     },
 }
 
@@ -258,11 +320,8 @@ impl PrimitiveId {
             PrimitiveId::Select => "select".into(),
             PrimitiveId::TensorAlloc => "tensor.alloc".into(),
             PrimitiveId::Fill(_) => "tensor.fill".into(),
-            PrimitiveId::Materialize => "tensor.materialize".into(),
-            PrimitiveId::Clone => "tensor.clone".into(),
-            PrimitiveId::Load => "tensor.load".into(),
+            PrimitiveId::Copy => "tensor.copy".into(),
             PrimitiveId::RepresentationConvert(id) => format!("representation.convert.{id:?}"),
-            PrimitiveId::Decode => "tensor.decode".into(),
             PrimitiveId::Transpose => "tensor.transpose".into(),
             PrimitiveId::Reshape => "tensor.reshape".into(),
             PrimitiveId::SliceView { .. } => "tensor.slice".into(),
@@ -288,7 +347,7 @@ impl std::fmt::Display for PrimitiveId {
 /// floating `sum` of f16/bf16/f32 accumulates and results in f32; integer
 /// `sum` retains the input dtype and wraps; `max`/`min` retain the input
 /// dtype; `argmax` results in i32.
-pub fn accumulator_dtype(op: ReduceOp, input: DType) -> DType {
+fn accumulator_dtype(op: ReduceOp, input: DType) -> DType {
     match op {
         ReduceOp::Sum if input.is_float() => DType::F32,
         ReduceOp::Argmax => DType::I32,
@@ -321,8 +380,6 @@ pub enum TieRule {
 /// precision is the compiler's numerical analysis, not the registry's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CombineLaw {
-    /// Regrouping preserves meaning; operand order does not.
-    Associative,
     /// Regrouping and reordering both preserve meaning.
     AssociativeCommutative,
     /// Only the ascending reference fold defines the result.
@@ -434,7 +491,10 @@ impl ElemClass {
             (ElemClass::Packed, _) => false,
             (ElemClass::Dense(_), Elem::Repr(_)) => false,
             (ElemClass::Dense(class), Elem::Dtype(d)) => class.matches(*d),
-            (ElemClass::Dense(DTypeClass::Float | DTypeClass::Any), Elem::Param(_)) => true,
+            (
+                ElemClass::Dense(DTypeClass::Float | DTypeClass::Numeric | DTypeClass::Any),
+                Elem::Param(_),
+            ) => true,
             (ElemClass::Dense(_), Elem::Param(_)) => false,
         }
     }
@@ -631,10 +691,10 @@ pub(crate) fn primitive(id: &PrimitiveId) -> PrimitiveSignature {
             TypeFunction::Fixed(ValueType::Scalar(DType::I32)),
         ),
         PrimitiveId::Unary(op) => {
-            let class = match op {
-                UnaryOp::Neg => DTypeClass::Numeric,
-                UnaryOp::Not => DTypeClass::Bool,
-                UnaryOp::BitNot => DTypeClass::Int,
+            let class = match unary_operand_domain(*op) {
+                OperandDomain::NumericOrQuantity => DTypeClass::Numeric,
+                OperandDomain::Bool => DTypeClass::Bool,
+                OperandDomain::IntegerWord => DTypeClass::Int,
             };
             sig(
                 vec![ew(class)],
@@ -720,17 +780,10 @@ pub(crate) fn primitive(id: &PrimitiveId) -> PrimitiveSignature {
         ),
         PrimitiveId::TensorAlloc => sig(Vec::new(), TypeFunction::Structural),
         PrimitiveId::Fill(_) => sig(vec![TypePattern::Any], TypeFunction::Structural),
-        PrimitiveId::Materialize | PrimitiveId::Clone | PrimitiveId::Load => bulk_copy(),
+        PrimitiveId::Copy => bulk_copy(),
         PrimitiveId::RepresentationConvert(_) => sig(
             vec![TypePattern::TensorOf(ElemClass::Packed)],
             TypeFunction::Structural,
-        ),
-        PrimitiveId::Decode => sig(
-            vec![TypePattern::TensorOf(ElemClass::Packed)],
-            TypeFunction::Elementwise {
-                shape_of: 0,
-                dtype: ResultDType::Dtype(DType::F32),
-            },
         ),
         PrimitiveId::Transpose | PrimitiveId::Reshape => sig(
             vec![TypePattern::TensorOf(ElemClass::Any)],
@@ -746,7 +799,7 @@ pub(crate) fn primitive(id: &PrimitiveId) -> PrimitiveSignature {
         ),
         PrimitiveId::Atomic { .. } => sig(Vec::new(), TypeFunction::Fixed(ValueType::Void)),
         PrimitiveId::Reduce { op, axis, .. } => sig(
-            vec![TypePattern::TensorOf(ElemClass::Dense(DTypeClass::Any))],
+            vec![TypePattern::TensorOf(ElemClass::Dense(DTypeClass::Numeric))],
             TypeFunction::Reduction {
                 op: *op,
                 axis: *axis,
@@ -759,21 +812,6 @@ pub(crate) fn primitive(id: &PrimitiveId) -> PrimitiveSignature {
 // Capability intrinsic table (crate-private: interned by `registry`)
 // ---------------------------------------------------------------------------
 
-/// Reference meaning of a capability intrinsic.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum CapabilitySemantics {
-    /// Index of the participant within its group.
-    ParticipantIndex,
-    /// Exchange a value with another participant of the group.
-    Exchange,
-    /// Reduction over the participants of a group.
-    SubgroupReduction(ReduceOp),
-    /// Logical matrix multiplication with an explicit accumulation dtype.
-    MatrixMatmul,
-    /// Logical matrix multiplication added to an accumulator.
-    MatrixMatmulAdd,
-}
-
 /// One row of the static capability table, before interning. Representations
 /// are dense dtypes here; `registry` maps them to `RepresentationId`.
 pub(crate) struct CapabilityRow {
@@ -785,7 +823,7 @@ pub(crate) struct CapabilityRow {
     pub execution: crate::registry::IntrinsicExecution,
     pub participation: crate::registry::IntrinsicParticipation,
     pub result_uniformity: crate::registry::IntrinsicUniformity,
-    pub semantics: CapabilitySemantics,
+    pub denotation: crate::registry::IntrinsicDenotation,
     pub numerics: crate::registry::IntrinsicNumerics,
 }
 
@@ -809,13 +847,15 @@ pub(crate) enum RowResult {
 /// namespace's signatures in declaration order.
 pub(crate) fn capability_rows() -> Vec<CapabilityRow> {
     use crate::registry::{
-        BackendName, IntrinsicExecution, IntrinsicNumerics, IntrinsicParticipation,
-        IntrinsicUniformity,
+        BackendName, IntrinsicDenotation, IntrinsicExecution, IntrinsicNumerics,
+        IntrinsicParticipation, IntrinsicUniformity,
     };
     const MATRIX_AXES: &[crate::registry::IntrinsicResultAxis] = &[
         crate::registry::IntrinsicResultAxis { argument: 0, axis: 0 },
         crate::registry::IntrinsicResultAxis { argument: 1, axis: 1 },
     ];
+    /// The fixed workgroup size of the CUDA NVFP4 block-scaled matrix rows.
+    const NVFP4_WORKGROUP: u32 = 128;
     let mut out = Vec::new();
     for backend in [BackendName::Metal, BackendName::Cuda] {
         // `matrix` sorts before `subgroup`.
@@ -837,7 +877,7 @@ pub(crate) fn capability_rows() -> Vec<CapabilityRow> {
                 execution: IntrinsicExecution::WholeTensor { result: 0 },
                 participation: IntrinsicParticipation::FullWorkgroup,
                 result_uniformity: IntrinsicUniformity::Varying,
-                semantics: CapabilitySemantics::MatrixMatmul,
+                denotation: IntrinsicDenotation::MatrixProduct { accumulate: false },
                 numerics: IntrinsicNumerics::Reassociated {
                     accumulator: DType::F32,
                 },
@@ -855,7 +895,7 @@ pub(crate) fn capability_rows() -> Vec<CapabilityRow> {
                 execution: IntrinsicExecution::WholeTensor { result: 0 },
                 participation: IntrinsicParticipation::FullWorkgroup,
                 result_uniformity: IntrinsicUniformity::Varying,
-                semantics: CapabilitySemantics::MatrixMatmulAdd,
+                denotation: IntrinsicDenotation::MatrixProduct { accumulate: true },
                 numerics: IntrinsicNumerics::Reassociated {
                     accumulator: DType::F32,
                 },
@@ -885,7 +925,7 @@ pub(crate) fn capability_rows() -> Vec<CapabilityRow> {
                 execution: IntrinsicExecution::WholeTensor { result: 0 },
                 participation: IntrinsicParticipation::FullWorkgroup,
                 result_uniformity: IntrinsicUniformity::Varying,
-                semantics: CapabilitySemantics::MatrixMatmul,
+                denotation: IntrinsicDenotation::MatrixProduct { accumulate: false },
                 numerics: IntrinsicNumerics::Reassociated {
                     accumulator: DType::F32,
                 },
@@ -906,7 +946,7 @@ pub(crate) fn capability_rows() -> Vec<CapabilityRow> {
                 execution: IntrinsicExecution::WholeTensor { result: 0 },
                 participation: IntrinsicParticipation::FullWorkgroup,
                 result_uniformity: IntrinsicUniformity::Varying,
-                semantics: CapabilitySemantics::MatrixMatmulAdd,
+                denotation: IntrinsicDenotation::MatrixProduct { accumulate: true },
                 numerics: IntrinsicNumerics::Reassociated {
                     accumulator: DType::F32,
                 },
@@ -931,9 +971,9 @@ pub(crate) fn capability_rows() -> Vec<CapabilityRow> {
                 ],
                 result: RowResult::Owned(DType::F32, MATRIX_AXES),
                 execution: IntrinsicExecution::WholeTensor { result: 0 },
-                participation: IntrinsicParticipation::FullWorkgroup,
+                participation: IntrinsicParticipation::FixedWorkgroup(NVFP4_WORKGROUP),
                 result_uniformity: IntrinsicUniformity::Varying,
-                semantics: CapabilitySemantics::MatrixMatmul,
+                denotation: IntrinsicDenotation::MatrixProduct { accumulate: false },
                 numerics: IntrinsicNumerics::Reassociated {
                     accumulator: DType::F32,
                 },
@@ -957,9 +997,9 @@ pub(crate) fn capability_rows() -> Vec<CapabilityRow> {
                 ],
                 result: RowResult::Owned(DType::F32, MATRIX_AXES),
                 execution: IntrinsicExecution::WholeTensor { result: 0 },
-                participation: IntrinsicParticipation::FullWorkgroup,
+                participation: IntrinsicParticipation::FixedWorkgroup(NVFP4_WORKGROUP),
                 result_uniformity: IntrinsicUniformity::Varying,
-                semantics: CapabilitySemantics::MatrixMatmulAdd,
+                denotation: IntrinsicDenotation::MatrixProduct { accumulate: true },
                 numerics: IntrinsicNumerics::Reassociated {
                     accumulator: DType::F32,
                 },
@@ -974,7 +1014,7 @@ pub(crate) fn capability_rows() -> Vec<CapabilityRow> {
             execution: IntrinsicExecution::WithinEnclosingParallel,
             participation: IntrinsicParticipation::Independent,
             result_uniformity: IntrinsicUniformity::Varying,
-            semantics: CapabilitySemantics::ParticipantIndex,
+            denotation: IntrinsicDenotation::ParticipantIndex,
             numerics: IntrinsicNumerics::Exact,
         });
         for dtype in [DType::F32, DType::F16, DType::BF16] {
@@ -990,7 +1030,7 @@ pub(crate) fn capability_rows() -> Vec<CapabilityRow> {
                 execution: IntrinsicExecution::WithinEnclosingParallel,
                 participation: IntrinsicParticipation::FullSubgroup,
                 result_uniformity: IntrinsicUniformity::Varying,
-                semantics: CapabilitySemantics::Exchange,
+                denotation: IntrinsicDenotation::Exchange,
                 numerics: IntrinsicNumerics::Exact,
             });
             for (name, op) in [
@@ -1007,7 +1047,7 @@ pub(crate) fn capability_rows() -> Vec<CapabilityRow> {
                     execution: IntrinsicExecution::WithinEnclosingParallel,
                     participation: IntrinsicParticipation::FullSubgroup,
                     result_uniformity: IntrinsicUniformity::Subgroup,
-                    semantics: CapabilitySemantics::SubgroupReduction(op),
+                    denotation: IntrinsicDenotation::CohortFold { op },
                     numerics: match op {
                         ReduceOp::Sum => IntrinsicNumerics::Reassociated { accumulator: dtype },
                         _ => IntrinsicNumerics::Exact,
@@ -1064,5 +1104,41 @@ mod tests {
         );
         assert!(atomic_dtype(DType::F32));
         assert!(!atomic_dtype(DType::Bool));
+    }
+
+    #[test]
+    fn unary_operand_domains_are_the_recipe_domains() {
+        let not = unary_operand_domain(UnaryOp::Not);
+        let bit_not = unary_operand_domain(UnaryOp::BitNot);
+        let neg = unary_operand_domain(UnaryOp::Neg);
+        for dtype in DType::ALL {
+            assert_eq!(not.admits_dtype(dtype), dtype == DType::Bool);
+            assert_eq!(bit_not.admits_dtype(dtype), matches!(dtype, DType::I32 | DType::U32));
+            assert_eq!(neg.admits_dtype(dtype), dtype != DType::Bool);
+        }
+        assert!(neg.admits_quantity());
+        assert!(!not.admits_quantity());
+        assert!(!bit_not.admits_quantity());
+        // The primitive signature is derived from the same table.
+        let bool_scalar = ValueType::Scalar(DType::Bool);
+        assert!(primitive(&PrimitiveId::Unary(UnaryOp::Not)).accepts(&[bool_scalar.clone()]));
+        assert!(!primitive(&PrimitiveId::Unary(UnaryOp::BitNot)).accepts(&[bool_scalar]));
+    }
+
+    #[test]
+    fn reduce_signature_admits_only_dense_numeric_elements() {
+        let signature = primitive(&PrimitiveId::Reduce {
+            op: ReduceOp::Sum,
+            axis: 0,
+            unordered: false,
+            check_nonempty: true,
+        });
+        let tensor = |dtype| ValueType::Tensor(TensorType::new(Vec::new(), Elem::Dtype(dtype)));
+        assert!(signature.accepts(&[tensor(DType::F32)]));
+        assert!(signature.accepts(&[tensor(DType::I32)]));
+        assert!(!signature.accepts(&[tensor(DType::Bool)]));
+        // An element parameter reads as its decoded float value.
+        let parameter = ValueType::Tensor(TensorType::new(Vec::new(), Elem::Param("T".into())));
+        assert!(signature.accepts(&[parameter]));
     }
 }

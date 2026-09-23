@@ -1,8 +1,5 @@
-fn forge<T: seismic_target::TargetFamily>() {
-    let _ = seismic_compiler::SelectionPolicy::<T> {
-        candidates: todo!(),
-        selection_function: todo!(),
-    };
-}
+use seismic_compiler::SelectionPolicy;
 
-fn main() {}
+fn main() {
+    let _ = SelectionPolicy {};
+}

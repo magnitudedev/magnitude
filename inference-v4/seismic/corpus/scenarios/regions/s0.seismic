@@ -1,0 +1,4 @@
+# origin: C14:s0
+# invoke: f32[5]=rand(50)
+fn probe[N](x: &tensor[N] f32) -> tensor[N] f32:
+    return x + x

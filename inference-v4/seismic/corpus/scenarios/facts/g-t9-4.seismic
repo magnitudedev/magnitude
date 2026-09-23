@@ -1,0 +1,6 @@
+# origin: C26:G-T9-4
+# invoke: i32[5]=9,9,9,9,9
+# pin: dst = i32[5]=9,0,1,2,3
+fn probe[N](dst: &mut tensor[N] i32):
+    parallel for k in 1..N:
+        dst[k] = i32(k - 1)

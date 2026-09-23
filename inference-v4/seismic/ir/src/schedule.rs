@@ -2,66 +2,17 @@
 //!
 //! Construction stores control as a region tree. A leaf command belongs to
 //! exactly one lexical region, so allocation liveness and later command
-//! grouping cannot accidentally cross `If`, `Repeat`, or `Choose`.
+//! grouping cannot accidentally cross `If` or `Repeat`.
 
 use crate::identity::OwnerToken;
 use crate::kernel::KernelId;
 use crate::region::{BranchResult, Product, RepeatCarry};
-use crate::repr::{
-    DenseRepresentation, Representation, ScalarKind, ScalarType, WritableRepresentation,
-};
-use crate::storage::{
-    AnyBufferView, BufferViewId, BufferViewLayout, ScheduleRegionEdge, ScheduleUse,
-};
+use crate::repr::ScalarKind;
+use crate::storage::{AnyBufferView, BufferViewLayout, ScheduleRegionEdge, ScheduleUse};
 use crate::target::PhysicalDialect;
-use seismic_lang::expr::{BoolExpr, DecisionId, ExprArena, IntExpr, LoopBinderId, NatExpr, SymbolId};
+use seismic_lang::expr::{BoolExpr, ExprArena, IntExpr, LoopBinderId, NatExpr, SymbolId};
 use seismic_lang::types::DType;
-use std::fmt;
 use std::marker::PhantomData;
-
-#[derive(PartialEq, Eq, Hash)]
-pub struct ScalarSlotId<T: ScalarType> {
-    owner: OwnerToken,
-    index: u32,
-    symbol: SymbolId,
-    capture: Option<SlotCapture>,
-    marker: PhantomData<T>,
-}
-impl<T: ScalarType> Clone for ScalarSlotId<T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<T: ScalarType> Copy for ScalarSlotId<T> {}
-impl<T: ScalarType> fmt::Debug for ScalarSlotId<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "slot<{:?}>#{}", T::KIND, self.index)
-    }
-}
-impl<T: ScalarType> ScalarSlotId<T> {
-    pub(crate) fn new(owner: OwnerToken, index: u32, symbol: SymbolId) -> Self {
-        Self {
-            owner,
-            index,
-            symbol,
-            capture: None,
-            marker: PhantomData,
-        }
-    }
-    pub fn erase(self) -> AnyScalarSlot {
-        AnyScalarSlot {
-            owner: self.owner,
-            index: self.index,
-            kind: T::KIND,
-            symbol: self.symbol,
-            capture: self.capture,
-        }
-    }
-    pub fn from_any(slot: AnyScalarSlot) -> Self {
-        assert_eq!(slot.kind, T::KIND, "scalar result slot kind mismatch");
-        Self { owner: slot.owner, index: slot.index, symbol: slot.symbol, capture: slot.capture, marker: PhantomData }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AnyScalarSlot {
@@ -400,10 +351,6 @@ pub enum ScheduleStep {
         body: Vec<ScheduleStep>,
         carries: Product<RepeatCarry>,
     },
-    Choose {
-        decision: DecisionId,
-        options: Vec<(i64, Vec<ScheduleStep>)>,
-    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -489,9 +436,6 @@ impl<B: PhysicalDialect> ParametricSchedule<B> {
                         visit(then_steps, views, inside, retained, result);
                         visit(else_steps, views, inside, retained, result);
                     }
-                    ScheduleStep::Choose { options, .. } => options
-                        .iter()
-                        .for_each(|(_, body)| visit(body, views, inside, retained, result)),
                     _ => (),
                 }
             }
@@ -644,8 +588,8 @@ impl<B: PhysicalDialect> ParametricSchedule<B> {
     }
 
     /// Maximum reservation for one launch over its enclosing lexical loops.
-    /// Runtime branches reserve both possible arms; candidate choices retain their
-    /// existing guards. Empty loops do not evaluate the body requirement.
+    /// Runtime branches reserve both possible arms. Empty loops do not evaluate
+    /// the body requirement.
     fn occurrence_reservation(
         &self,
         arena: &mut ExprArena,
@@ -705,21 +649,6 @@ impl<B: PhysicalDialect> ParametricSchedule<B> {
                         );
                         arena.nat_select(nonempty, maximum, zero)
                     }),
-                    ScheduleStep::Choose { decision, options } => {
-                        let mut result = None;
-                        for (option, body) in options {
-                            if let Some(value) = visit(arena, body, occurrence, bytes) {
-                                let selected = arena.decision_is(*decision, *option);
-                                let zero = arena.nat(0);
-                                let guarded = arena.nat_select(selected, value, zero);
-                                result = Some(match result {
-                                    Some(previous) => arena.nat_max(previous, guarded),
-                                    None => guarded,
-                                });
-                            }
-                        }
-                        result
-                    }
                     ScheduleStep::Launch(_)
                     | ScheduleStep::BeginAllocationInstance { .. } | ScheduleStep::BindArgumentTensor { .. }
                     | ScheduleStep::PublishTensor { .. }
@@ -770,8 +699,8 @@ impl<B: PhysicalDialect> ParametricSchedule<B> {
     }
 
     /// Lift per-launch obligations through their lexical schedule scopes.
-    /// A repeat quantifies its local binder; compile-time choices guard their
-    /// selected arms. Runtime branches conservatively require both arms.
+    /// A repeat quantifies its local binder. Runtime branches conservatively
+    /// require both arms.
     pub fn launch_requirements(
         &self,
         arena: &mut ExprArena,
@@ -808,7 +737,7 @@ impl<B: PhysicalDialect> ParametricSchedule<B> {
                 // and exit environments need independent facts until those
                 // writes have an explicit product-level invariant.
                 if matches!(step, ScheduleStep::If { .. } | ScheduleStep::Repeat { .. }
-                    | ScheduleStep::Choose { .. } | ScheduleStep::Imported { .. }) {
+                    | ScheduleStep::Imported { .. }) {
                     established_facts.clear();
                 }
                 let facts = arena.all(&established_facts);
@@ -846,21 +775,13 @@ impl<B: PhysicalDialect> ParametricSchedule<B> {
                             arena.implies(nonempty, holds)
                         }
                     }
-                    ScheduleStep::Choose { decision, options } => {
-                        let arms = options.iter().map(|(value, body)| {
-                            let selected = arena.decision_is(*decision, *value);
-                            let body = visit(arena, body, requirement, established);
-                            arena.implies(selected, body)
-                        }).collect::<Vec<_>>();
-                        arena.all(&arms)
-                    }
                     leaf => requirement(arena, RequirementPoint::Step(leaf)),
                 };
                 terms.push(arena.implies(facts, term));
                 // Only the completed leaf's own postcondition is exported.
                 // Branch/loop-local facts never escape their lexical region.
                 if !matches!(step, ScheduleStep::If { .. } | ScheduleStep::Repeat { .. }
-                    | ScheduleStep::Choose { .. } | ScheduleStep::Imported { .. }) {
+                    | ScheduleStep::Imported { .. }) {
                     let written = match step {
                         ScheduleStep::ScalarMove(value) => Some(value.to.symbol()),
                         ScheduleStep::ScalarRead(value) => Some(value.to.symbol()),
@@ -903,12 +824,6 @@ impl<B: PhysicalDialect> ParametricSchedule<B> {
                             scope.at.region.capacity() * std::mem::size_of::<ScheduleRegionEdge>(),
                         ),
                         ScheduleStep::Repeat { body, carries, .. } => steps(body).saturating_add(carries.retained_heap_bytes(&|_|0)),
-                        ScheduleStep::Choose { options, .. } => options.iter().fold(
-                            options
-                                .capacity()
-                                .saturating_mul(std::mem::size_of::<(i64, Vec<ScheduleStep>)>()),
-                            |bytes, (_, option)| bytes.saturating_add(steps(option)),
-                        ),
                         ScheduleStep::ScalarRead(read) => read
                             .index
                             .capacity()
@@ -1021,19 +936,6 @@ fn rewrite_launch_as_repeat(
             ScheduleStep::Imported { body, .. } | ScheduleStep::Repeat { body, .. } => {
                 rewrite_launch_as_repeat(body, target, binder, symbol, start, end, replacements)
             }
-            ScheduleStep::Choose { options, .. } => {
-                for (_, body) in options {
-                    rewrite_launch_as_repeat(
-                        body,
-                        target,
-                        binder,
-                        symbol,
-                        start,
-                        end,
-                        replacements,
-                    );
-                }
-            }
             _ => {}
         }
     }
@@ -1075,10 +977,6 @@ enum RegionStep {
         end: NatExpr,
         body_region: u32,
         carries: Option<Product<RepeatCarry>>,
-    },
-    Choose {
-        decision: DecisionId,
-        options: Vec<(i64, u32)>,
     },
 }
 
@@ -1170,45 +1068,6 @@ impl<B: PhysicalDialect> ScheduleConstruction<B> {
         let RegionStep::If { results, .. } = step else { unreachable!() };
         assert!(matches!(results, Product::Unit), "branch results already closed");
         *results = products;
-    }
-
-    /// Open every arm of an existing finite construction decision. Callers
-    /// construct complete values inside these same schedule-owned regions.
-    pub fn begin_choice(
-        &mut self,
-        arena: &ExprArena,
-        parent: u32,
-        decision: DecisionId,
-    ) -> Vec<(i64, u32)> {
-        assert!(!self.closed, "a closed schedule cannot be extended");
-        let control = self.next_control;
-        self.next_control = self
-            .next_control
-            .checked_add(1)
-            .expect("schedule control identity space exhausted");
-        let parent_ordinal = self.regions[parent as usize].steps.len() as u32;
-        let mut options = Vec::new();
-        for &value in arena.decision_domain(decision).values() {
-            let mut path = self.regions[parent as usize].path.clone();
-            path.push(ScheduleRegionEdge::ChooseOption {
-                node: control,
-                parent_ordinal,
-                value,
-            });
-            let region = self.regions.len() as u32;
-            self.regions.push(Region {
-                path,
-                steps: Vec::new(),
-            });
-            options.push((value, region));
-        }
-        self.regions[parent as usize]
-            .steps
-            .push(RegionStep::Choose {
-                decision,
-                options: options.clone(),
-            });
-        options
     }
 
     pub fn begin_repeat(
@@ -1480,8 +1339,7 @@ impl<B: PhysicalDialect> ScheduleConstruction<B> {
                         ScheduleStep::ScalarMove(_) | ScheduleStep::EvaluateHost(_) | ScheduleStep::Check(_) => {}
                         ScheduleStep::Imported { .. }
                         | ScheduleStep::If { .. }
-                        | ScheduleStep::Repeat { .. }
-                        | ScheduleStep::Choose { .. } => {
+                        | ScheduleStep::Repeat { .. } => {
                             panic!("structured control cannot be inserted as a leaf")
                         }
                     }
@@ -1545,13 +1403,6 @@ impl<B: PhysicalDialect> ScheduleConstruction<B> {
                         body: self.lower_region(body_region, direct, launches),
                         carries,
                     });
-                }
-                RegionStep::Choose { decision, options } => {
-                    let options = options
-                        .into_iter()
-                        .map(|(value, child)| (value, self.lower_region(child, direct, launches)))
-                        .collect();
-                    out.push(ScheduleStep::Choose { decision, options });
                 }
             }
         }
@@ -1711,11 +1562,6 @@ impl<B: PhysicalDialect> ScheduleConstruction<B> {
                         remap_scopes(else_steps, parent);
                     }
                     ScheduleStep::Repeat { body, .. } => remap_scopes(body, parent),
-                    ScheduleStep::Choose { options, .. } => {
-                        for (_, body) in options {
-                            remap_scopes(body, parent);
-                        }
-                    }
                     _ => {}
                 }
             }
@@ -1876,13 +1722,6 @@ fn remap_steps(
                 body: remap_steps(body, view, slot, quantity_slot, launch),
                 carries: carries.map(&mut |carry| carry.remap(view, slot, quantity_slot)),
             },
-            ScheduleStep::Choose { decision, options } => ScheduleStep::Choose {
-                decision,
-                options: options
-                    .into_iter()
-                    .map(|(value, body)| (value, remap_steps(body, view, slot, quantity_slot, launch)))
-                    .collect(),
-            },
         })
         .collect()
 }
@@ -1891,59 +1730,11 @@ pub struct ScheduleBuilder<'a, B: PhysicalDialect> {
     inner: internals::Builder<'a, B>,
 }
 impl<'a, B: PhysicalDialect> ScheduleBuilder<'a, B> {
-
-    pub fn slot<T: ScalarType>(&mut self) -> ScalarSlotId<T> {
-        self.inner.slot::<T>()
-    }
-    pub fn slot_symbol<T: ScalarType>(&mut self, slot: ScalarSlotId<T>) -> SymbolId {
-        self.inner.slot_symbol(slot.erase())
-    }
     pub fn launch(&mut self, launch: Launch<B>) -> LaunchId {
         self.inner.launch(launch)
     }
     pub fn step_launch(&mut self, launch: LaunchId) -> ScheduleUse {
         self.inner.step_launch(launch)
-    }
-    pub fn copy<R: Representation>(
-        &mut self,
-        source: BufferViewId<R>,
-        destination: BufferViewId<R>,
-    ) -> ScheduleUse {
-        self.inner.copy(source.erase(), destination.erase())
-    }
-    pub fn fill_zero<R: WritableRepresentation>(
-        &mut self,
-        destination: BufferViewId<R>,
-    ) -> ScheduleUse {
-        self.inner.fill(
-            destination.erase(),
-            crate::repr::zero_fill_of::<R::Element>(),
-        )
-    }
-    pub fn fill<R: WritableRepresentation>(
-        &mut self,
-        destination: BufferViewId<R>,
-        value: <R::Element as ScalarType>::Value,
-    ) -> ScheduleUse {
-        self.inner.fill(
-            destination.erase(),
-            crate::repr::fill_value_of::<R::Element>(value),
-        )
-    }
-    pub fn scalar_move<T: ScalarType>(
-        &mut self,
-        from: ScalarSlotId<T>,
-        to: ScalarSlotId<T>,
-    ) -> ScheduleUse {
-        self.inner.scalar_move(from.erase(), to.erase())
-    }
-    pub fn scalar_read<R: DenseRepresentation>(
-        &mut self,
-        source: BufferViewId<R>,
-        index: Vec<NatExpr>,
-        to: ScalarSlotId<R::Element>,
-    ) -> ScheduleUse {
-        self.inner.scalar_read(source.erase(), index, to.erase())
     }
     pub fn branch(
         &mut self,
@@ -1960,13 +1751,6 @@ impl<'a, B: PhysicalDialect> ScheduleBuilder<'a, B> {
         body: impl FnOnce(&mut ScheduleBuilder<'_, B>, LoopBinding),
     ) {
         self.inner.repeat(start, end, body)
-    }
-    pub fn choose(
-        &mut self,
-        decision: DecisionId,
-        options: impl FnOnce(&mut ChoiceBuilder<'_, B>),
-    ) {
-        self.inner.choose(decision, options)
     }
     pub fn close(self) -> ClosedSchedule {
         self.inner.close()
@@ -2101,14 +1885,6 @@ impl<'a, B: PhysicalDialect> ScheduleBuilder<'a, B> {
         self.inner.step_launch(launch)
     }
 }
-pub struct ChoiceBuilder<'a, B: PhysicalDialect> {
-    inner: internals::Choice<'a, B>,
-}
-impl<'a, B: PhysicalDialect> ChoiceBuilder<'a, B> {
-    pub fn option(&mut self, value: i64, body: impl FnOnce(&mut ScheduleBuilder<'_, B>)) {
-        self.inner.option(value, body)
-    }
-}
 #[derive(Debug)]
 pub struct ClosedSchedule {
     pub(crate) owner: OwnerToken,
@@ -2121,15 +1897,6 @@ mod internals {
         pub(super) views: &'a [crate::storage::BufferViewLayout],
         pub(super) state: &'a mut ScheduleConstruction<B>,
         pub(super) region: u32,
-    }
-    pub(super) struct Choice<'a, B: PhysicalDialect> {
-        arena: &'a mut ExprArena,
-        views: &'a [crate::storage::BufferViewLayout],
-        state: &'a mut ScheduleConstruction<B>,
-        parent: u32,
-        control: u32,
-        decision: DecisionId,
-        options: Vec<(i64, u32)>,
     }
     impl<'a, B: PhysicalDialect> Builder<'a, B> {
         fn owner(&self) -> OwnerToken {
@@ -2165,19 +1932,6 @@ mod internals {
                 steps: Vec::new(),
             });
             id
-        }
-        fn control(&mut self) -> u32 {
-            let id = self.state.next_control;
-            self.state.next_control = self
-                .state
-                .next_control
-                .checked_add(1)
-                .unwrap_or_else(|| panic!("schedule control identity space exhausted"));
-            id
-        }
-        pub(super) fn slot<T: ScalarType>(&mut self) -> ScalarSlotId<T> {
-            let any = self.state.slot_any(self.arena, T::KIND);
-            ScalarSlotId::new(self.owner(), any.index, any.symbol)
         }
         pub(super) fn slot_symbol(&mut self, slot: AnyScalarSlot) -> SymbolId {
             self.assert_owner(slot.owner());
@@ -2446,40 +2200,6 @@ mod internals {
                 body(&mut child, binding);
             }
         }
-        pub(super) fn choose(
-            &mut self,
-            decision: DecisionId,
-            options: impl FnOnce(&mut ChoiceBuilder<'_, B>),
-        ) {
-            let control = self.control();
-            let mut choice = ChoiceBuilder {
-                inner: Choice {
-                    arena: &mut *self.arena,
-                    views: self.views,
-                    state: &mut *self.state,
-                    parent: self.region,
-                    control,
-                    decision,
-                    options: Vec::new(),
-                },
-            };
-            options(&mut choice);
-            let Choice {
-                decision,
-                mut options,
-                ..
-            } = choice.inner;
-            options.sort_by_key(|(value, _)| *value);
-            let actual: Vec<i64> = options.iter().map(|(value, _)| *value).collect();
-            assert_eq!(
-                actual.as_slice(),
-                self.arena.decision_domain(decision).values(),
-                "Choose must define exactly one option for every decision value"
-            );
-            self.state.regions[self.region as usize]
-                .steps
-                .push(RegionStep::Choose { decision, options });
-        }
         pub(super) fn close(self) -> ClosedSchedule {
             assert_eq!(
                 self.region, 0,
@@ -2489,49 +2209,6 @@ mod internals {
             ClosedSchedule {
                 owner: self.owner(),
             }
-        }
-    }
-    impl<'a, B: PhysicalDialect> Choice<'a, B> {
-        pub(super) fn option(
-            &mut self,
-            value: i64,
-            body: impl FnOnce(&mut ScheduleBuilder<'_, B>),
-        ) {
-            assert!(
-                !self.options.iter().any(|(existing, _)| *existing == value),
-                "duplicate Choose option {value}"
-            );
-            assert!(
-                self.arena
-                    .decision_domain(self.decision)
-                    .values()
-                    .contains(&value),
-                "Choose option is outside the decision domain"
-            );
-            let parent_ordinal = self.state.regions[self.parent as usize].steps.len() as u32;
-            let mut path = self.state.regions[self.parent as usize].path.clone();
-            path.push(ScheduleRegionEdge::ChooseOption {
-                node: self.control,
-                parent_ordinal,
-                value,
-            });
-            let region = self.state.regions.len() as u32;
-            self.state.regions.push(Region {
-                path,
-                steps: Vec::new(),
-            });
-            {
-                let mut child = ScheduleBuilder {
-                    inner: Builder {
-                        arena: &mut *self.arena,
-                        views: self.views,
-                        state: &mut *self.state,
-                        region,
-                    },
-                };
-                body(&mut child);
-            }
-            self.options.push((value, region));
         }
     }
 }

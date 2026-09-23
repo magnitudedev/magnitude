@@ -80,7 +80,7 @@ mod tests {
     use super::*;
     #[test]
     fn allowance_pause_rotates_pending_paths_without_declaring_completion() {
-        use crate::evaluation_session::boundary_tests::registry;
+        use crate::realization::demand_driven_tests::registry;
         use crate::realization::demand_driven_tests::device;
         use seismic_lang::checked::{check_source, SourceFile, SourceSet};
         let module = check_source(SourceSet::new(vec![SourceFile {
@@ -97,7 +97,6 @@ mod tests {
             &target,
             &registry,
             &seismic_lang::precision::PrecisionPolicy::Exact,
-            &Default::default(),
         )
         .unwrap();
         let mut traversal = ConstructionTraversal::new(&domain);

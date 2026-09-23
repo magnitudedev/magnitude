@@ -1,0 +1,5 @@
+# origin: H-26c
+# invoke: f32[1]=zero
+# pin: x = f32[1]=1
+fn probe(x: &mut tensor[1] f32):
+    x[0] = 1.0

@@ -1,5 +1,6 @@
 //! Execute target storage-plane views through the production Metal builder/compiler.
-use crate::{compile, profile, DeviceHandle, Metal, MetalDevice};
+use crate::test_support::metal_device;
+use crate::{compile, profile, Metal};
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLComputePipelineState, MTLSize,
@@ -13,9 +14,8 @@ use seismic_lang::registry::{self, PlaneEncoding, RepresentationKind};
 use seismic_lang::types::DType;
 
 #[test]
-#[ignore = "requires Metal device"]
 fn plane_storage_views_preserve_types_packet_offsets_and_partial_words() {
-    let device = MetalDevice::open(DeviceHandle::system_default().unwrap()).unwrap();
+    let device = metal_device();
     let target = profile::open_device(&device).unwrap();
     for name in ["q4g32", "q4g64", "q4k", "q6k", "nvfp4_e2m1_block16"] {
         let representation = registry::representation(name).unwrap();
@@ -202,10 +202,9 @@ fn plane_storage_views_preserve_types_packet_offsets_and_partial_words() {
 }
 
 #[test]
-#[ignore = "requires Metal device"]
 fn native_subgroup_ordinal_uses_the_actual_two_dimensional_cohort() {
     use seismic_ir::kernel::ops::{BinaryOp, ValueType};
-    let device = MetalDevice::open(DeviceHandle::system_default().unwrap()).unwrap();
+    let device = metal_device();
     let target = profile::open_device(&device).unwrap();
     let mut arena = ExprArena::default();
     let count = arena.nat(128);

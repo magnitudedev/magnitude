@@ -1,0 +1,11 @@
+# origin: X1:r2-n02
+# cell: fallible-quantity-in-run/parallel
+# invoke: f32[4]=1,2,3,4 ; f32[4]=zero ; i32:5
+# expect: failed
+# invoke: f32[4]=1,2,3,4 ; f32[4]=zero ; i32:2
+# expect: returned
+# pin: out = f32[4]=10,10,10,10
+fn probe(x: &tensor[4] f32, out: &mut tensor[4] f32, m: i32):
+    parallel for i in 0..4:
+        out[i] = 7.0
+        out[i] = x[m] + out[i]

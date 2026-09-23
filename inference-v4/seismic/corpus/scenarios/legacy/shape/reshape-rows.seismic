@@ -1,0 +1,6 @@
+# origin: test:validation:corpus/shape.seismic:reshape_rows
+# invoke reshape_rows: f32[6]=seq ; f32[2,3]=zero
+fn reshape_rows[M, N](x: &tensor[M * N] f32, y: &mut tensor[M, N] f32):
+    let grid = reshape(x, (M, N))
+    parallel for i in 0..M:
+        y[i] = grid[i] * 2.0

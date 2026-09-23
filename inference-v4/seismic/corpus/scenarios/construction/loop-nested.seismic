@@ -1,0 +1,9 @@
+# origin: C11:loop_nested
+# cell: loop-ordered/ordered
+# invoke: f32[2,3]=1,2,3,4,5,6 ; f32[2]=0,0
+fn probe[M,N](x: &tensor[M,N] f32, dst: &mut tensor[M] f32):
+    for a in 0..M:
+        let mut s = 0.0
+        for b in 0..N:
+            s = s + x[a, b]
+        dst[a] = s

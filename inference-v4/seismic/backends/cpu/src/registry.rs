@@ -1,6 +1,6 @@
 //! The sealed CPU capability registry.
 
-use crate::{Cpu, CpuLaunchMode};
+use crate::Cpu;
 use seismic_compiler::target::{CompilerRegistry, CompilerRegistryParts};
 use std::sync::OnceLock;
 

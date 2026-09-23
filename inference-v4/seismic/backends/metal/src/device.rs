@@ -160,10 +160,6 @@ impl MetalDevice {
         &self.queue
     }
 
-    pub(crate) fn queue_retained(&self) -> Retained<ProtocolObject<dyn MTLCommandQueue>> {
-        self.queue.clone()
-    }
-
     /// Allocates a shared buffer of `bytes`. Metal rejects a zero-length
     /// buffer, so a zero-byte allocation reserves one byte while reporting
     /// its requested length.

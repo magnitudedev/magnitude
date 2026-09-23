@@ -1,0 +1,8 @@
+# origin: test:validation:corpus/effects.seismic:immutable_inputs
+# invoke immutable_inputs: f32[6]=rand(100) ; f32[6]=rand(101)
+# invoke immutable_inputs: f32[0]=zero ; f32[0]=zero
+fn immutable_inputs[N](x: &tensor[N] f32, y: &tensor[N] f32) -> f32 where N >= 0:
+    let mut total = f32(0.0)
+    for i in 0..N:
+        total = fma(x[i], y[i], total)
+    return total

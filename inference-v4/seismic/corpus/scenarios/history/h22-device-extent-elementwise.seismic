@@ -1,0 +1,11 @@
+# origin: H-22
+# invoke: f32[10]=seq ; i32[2]=2,7
+# invoke: f32[10]=seq ; i32[2]=3,3
+# invoke: f32[10]=seq ; i32[2]=7,2
+# expect: failed
+fn probe[N](x: &tensor[N] f32, bounds: &tensor[2] i32) -> f32:
+    let lo = bounds[0]
+    let hi = bounds[1]
+    let w = x[lo:hi]
+    let doubled = w * 2.0
+    return reduce(doubled, 0, sum)

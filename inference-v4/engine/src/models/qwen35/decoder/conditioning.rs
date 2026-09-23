@@ -45,23 +45,6 @@ impl Conditioning {
             .collect()
     }
 
-    pub(super) fn apply(&self, overlay: &Overlay, hidden: &Tensor) -> Result<(), Error> {
-        let start = u64::try_from(overlay.destination)
-            .map_err(|_| "feature destination exceeds the Seismic shape domain")?;
-        let end = start
-            .checked_add(
-                u64::try_from(overlay.count)
-                    .map_err(|_| "feature length exceeds the Seismic shape domain")?,
-            )
-            .ok_or("feature destination overflow")?;
-        let mut destination = hidden.slice_leading(start, end)?;
-        self.kernel.call(kernels::qwen_conditioning_overlay::Args {
-            input: &overlay.source,
-            out: &mut destination,
-        })?;
-        Ok(())
-    }
-
     pub(super) fn enqueue(
         &self,
         workflow: &mut WorkflowDraft,

@@ -48,7 +48,7 @@ fn total_elementwise(
     inputs: &[SemanticValueId],
 ) -> bool {
     match primitive {
-        PrimitiveId::Constant(_) | PrimitiveId::Select | PrimitiveId::Decode => true,
+        PrimitiveId::Constant(_) | PrimitiveId::Select => true,
         _=>source_scalar::recipe(function,primitive,inputs)
             .is_some_and(|recipe|recipe.failures().is_empty()),
     }

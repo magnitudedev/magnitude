@@ -1,20 +1,24 @@
 //! The crate-private checked representation.
 //!
 //! One `Definition` is a template checked once: its signature, `where`
-//! predicates and body are symbolic over its own dimensions in its own
-//! expression arena. A call names a family and, per candidate definition
-//! that unifies with the arguments, how the callee's dimensions bind in the
-//! caller's arena. The checked call graph is acyclic.
+//! conjuncts and body are symbolic over its own dimensions in its own
+//! expression arena. A call names a family, the one argument order of its
+//! members, the callee dimensions solved by the family's dimension plan, and
+//! the members that apply at the call. The checked call graph is acyclic.
 //!
-//! Nothing here is constructible outside `check` and the bundle decoder.
+//! Nothing here is constructible outside `check`.
 
+use super::dimensions::DimensionPlan;
+use super::ownership::LocalPlace;
+use super::resolve::SignatureDimension;
+use crate::checked::ElementDomain;
 use crate::expr::{ExprArena, IntExpr, SymbolId};
 use crate::ids::{CapabilityId, FamilyId, FunctionId, IntrinsicId, StableFunctionId};
-use crate::intrinsics::PrimitiveId;
+use crate::initialization::{InitializationContract, LoopInitialization, VisitSeparation};
+use crate::intrinsics::{PrimitiveFailure, PrimitiveId};
 use crate::reference_math::ReferenceScalar;
 use crate::registry::BackendName;
 use crate::span::Span;
-use crate::syntax::ast::AssignOp;
 use crate::types::{Elem, ValueType};
 
 /// A local of one checked body. Parameters occupy the first locals in
@@ -30,10 +34,6 @@ impl LocalId {
     pub(crate) const fn index(self) -> usize {
         self.0 as usize
     }
-
-    pub(crate) const fn raw(self) -> u32 {
-        self.0
-    }
 }
 
 impl std::fmt::Display for LocalId {
@@ -45,8 +45,8 @@ impl std::fmt::Display for LocalId {
 /// What a definition is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum DefKind {
-    /// A `fn` body. `None` is portable; `Some` restricts it to one backend.
-    Body { target: Option<BackendName> },
+    /// A portable `fn` body.
+    Body,
     /// `lower … for target:` with a body.
     Lower { target: BackendName },
 }
@@ -54,13 +54,9 @@ pub(crate) enum DefKind {
 impl DefKind {
     pub(crate) fn target(self) -> Option<BackendName> {
         match self {
-            DefKind::Body { target } => target,
+            DefKind::Body => None,
             DefKind::Lower { target } => Some(target),
         }
-    }
-
-    pub(crate) fn is_portable_body(self) -> bool {
-        matches!(self, DefKind::Body { target: None })
     }
 }
 
@@ -76,17 +72,6 @@ pub(crate) enum Ownership {
     Shared,
     /// An exclusive mutable borrow (`&mut tensor`).
     Exclusive,
-}
-
-/// One dimension (shape parameter) of a definition.
-#[derive(Clone, Debug)]
-pub(crate) struct Dimension {
-    pub name: String,
-    /// Its symbol in the definition's arena.
-    pub symbol: SymbolId,
-    /// Whether a `where` predicate admits the extent zero; otherwise the
-    /// dimension is at least one.
-    pub admits_zero: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +94,44 @@ pub(crate) enum Predicate {
     NonZero(IntExpr),
 }
 
+impl Predicate {
+    pub(crate) fn expression(self) -> IntExpr {
+        match self {
+            Self::NonNegative(e) | Self::Zero(e) | Self::NonZero(e) => e,
+        }
+    }
+}
+
+/// One conjunct of a `where` clause, with the source span of its comparison.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WhereConjunct {
+    pub predicate: Predicate,
+    pub span: Span,
+}
+
+/// Where a definition may be placed relative to its call site's parallel
+/// participants (L13).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Placement {
+    /// A `WithinEnclosingParallel` intrinsic is used outside any `parallel
+    /// for` of this body.
+    pub requires_enclosing_parallel: bool,
+    /// A `WholeTensor` intrinsic is used by this body.
+    pub forbids_enclosing_parallel: bool,
+    /// A cohort intrinsic is used outside any `parallel for` of this body.
+    pub requires_uniform_call_site: bool,
+}
+
+impl Placement {
+    /// Whether a call site with `context` definitely cannot place this
+    /// definition. An enclosing parallel loop may still come from the
+    /// caller's own call site, so that requirement is decided at entry.
+    pub(crate) fn excluded_by(self, context: CallContext) -> bool {
+        (self.forbids_enclosing_parallel && context.enclosing_parallel)
+            || (self.requires_uniform_call_site && !context.participant_uniform)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Definition {
     pub stable: StableFunctionId,
@@ -116,19 +139,20 @@ pub(crate) struct Definition {
     pub kind: DefKind,
     /// Capability namespaces explicitly declared by this body.
     pub requires: Vec<CapabilityId>,
-    pub family: FamilyId,
-    pub dimensions: Vec<Dimension>,
+    pub dimensions: Vec<SignatureDimension>,
     pub elem_params: Vec<String>,
     /// Concrete elements this definition fixes where its family's contract
     /// has an element parameter.
     pub elem_bindings: Vec<(String, Elem)>,
     pub params: Vec<Param>,
-    pub aliases: Vec<(usize, usize)>,
     pub result: ValueType,
-    /// Applicability: every predicate must hold.
-    pub predicates: Vec<Predicate>,
+    /// Applicability: every conjunct must hold.
+    pub predicates: Vec<WhereConjunct>,
     pub body: Body,
-    pub initialization: crate::initialization::InitializationContract,
+    pub initialization: InitializationContract,
+    /// The admissible bindings of each element parameter.
+    pub element_domain: ElementDomain,
+    pub placement: Placement,
     /// The one arena of every extent, bound and symbolic value above.
     pub arena: ExprArena,
     /// Index into the module's source files.
@@ -136,24 +160,21 @@ pub(crate) struct Definition {
     pub span: Span,
 }
 
-impl Definition {
-    pub(crate) fn dimension_named(&self, name: &str) -> Option<usize> {
-        self.dimensions.iter().position(|d| d.name == name)
-    }
-}
-
 /// A connected component of same-name implementations with overlapping
 /// applicability and a compatible contract.
 #[derive(Clone, Debug)]
 pub(crate) struct Family {
     pub name: String,
-    /// Canonical source contract: stable parameter names, ordering, element
-    /// parameters and the domain-defining predicates.
+    /// The contract body: the first declared portable body. Its meaning is
+    /// the family's meaning (L2).
     pub contract: FunctionId,
-    /// Portable and backend-specific `fn` bodies.
+    /// Portable `fn` bodies.
     pub bodies: Vec<FunctionId>,
     /// Backend `lower` bodies.
     pub lowerings: Vec<FunctionId>,
+    /// How every family dimension is obtained from observed input axes,
+    /// over the contract's arena.
+    pub dimension_plan: DimensionPlan,
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +189,7 @@ pub(crate) struct Local {
     pub mutable: bool,
     pub span: Span,
     /// The symbol standing for this local's runtime integer value (index
-    /// parameters, loop binders, proven-bounded integers), when it has one.
+    /// parameters, loop binders, word and quantity locals), when it has one.
     pub symbol: Option<SymbolId>,
 }
 
@@ -176,32 +197,25 @@ pub(crate) struct Local {
 pub(crate) struct Body {
     pub locals: Vec<Local>,
     pub root: Block,
+    /// The function's one exit: its result values, evaluated after the whole
+    /// root block (L5).
+    pub result: Vec<Expr>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct Block {
     pub statements: Vec<Stmt>,
-    pub terminator: Terminator,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum Terminator {
-    /// Control continues with the enclosing construct.
-    Continue,
-    /// The function boundary's result values.
-    Return(Vec<Expr>),
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum Stmt {
     Let {
         pattern: Pattern,
-        mutable: bool,
         value: Expr,
     },
+    /// `place = value`; compound assignment is desugared by the checker.
     Assign {
         place: Place,
-        op: AssignOp,
         value: Expr,
         /// Fresh exact-value symbols for the installed local SSA versions.
         value_symbols: Vec<(LocalId, SymbolId)>,
@@ -216,7 +230,9 @@ pub(crate) enum Stmt {
         body: Block,
         /// Captured quantity/word locals: body parameter and exit result.
         value_symbols: Vec<(LocalId, SymbolId, SymbolId)>,
-        initialization: crate::initialization::LoopInitialization,
+        initialization: LoopInitialization,
+        /// L25 (I1)-(I3), recorded by the initialization pass.
+        separation: VisitSeparation,
     },
     If {
         condition: Expr,
@@ -337,35 +353,6 @@ impl AtomicCapability {
     }
 }
 
-/// Opaque proof for an explicit barrier. Current source syntax has no barrier
-/// form, so this can only become inhabited when the checker gains a construct
-/// that proves a uniform cohort and its visibility domain together.
-#[derive(Clone, Debug)]
-pub(crate) struct BarrierCapability {
-    cohort: Box<[LocalId]>,
-    visibility: Box<[LocalId]>,
-}
-
-impl BarrierCapability {
-    #[allow(dead_code)]
-    pub(super) fn checked(cohort: Vec<LocalId>, visibility: Vec<LocalId>) -> Self {
-        assert!(!cohort.is_empty());
-        assert!(!visibility.is_empty());
-        Self {
-            cohort: cohort.into_boxed_slice(),
-            visibility: visibility.into_boxed_slice(),
-        }
-    }
-    #[allow(dead_code)]
-    pub(crate) fn cohort(&self) -> &[LocalId] {
-        &self.cohort
-    }
-    #[allow(dead_code)]
-    pub(crate) fn visibility(&self) -> &[LocalId] {
-        &self.visibility
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(crate) enum Pattern {
     Local(LocalId),
@@ -376,19 +363,20 @@ pub(crate) enum Pattern {
 /// tuple of places (tuple assignment).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Place {
-    Local(super::ownership::LocalPlace),
+    Local(LocalPlace),
     Element {
-        root: super::ownership::LocalPlace,
+        root: LocalPlace,
         indices: Vec<Index>,
     },
     Tuple(Vec<Place>),
 }
 
+/// One axis of a selection. Every `check*` flag is `true` exactly when the
+/// checker did not prove the corresponding bound.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Index {
     Point {
         value: Expr,
-        /// The checker could not prove this data-dependent bound statically.
         runtime_check: bool,
     },
     /// `lo:hi`; `None` bounds are the axis ends.
@@ -398,7 +386,11 @@ pub(crate) enum Index {
         check_start: bool,
         check_order: bool,
         check_end: bool,
+        /// L24: a `s : s + w` range whose realized width is not proved `w`.
+        check_width: bool,
     },
+    /// An omitted trailing axis: the whole axis.
+    Full,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -406,7 +398,7 @@ pub(crate) struct Expr {
     pub kind: ExprKind,
     pub ty: ValueType,
     /// Symbolic value of integer expressions over dimensions and bounded
-    /// integer locals, when the checker proved one.
+    /// integer locals, when it equals the value exactly.
     pub sym: Option<IntExpr>,
     pub span: Span,
 }
@@ -432,11 +424,14 @@ pub(crate) enum ExprKind {
     Primitive {
         id: PrimitiveId,
         operands: Vec<Expr>,
+        /// Whether the primitive's scalar recipe can fail at this site.
+        failure: PrimitiveFailure,
     },
+    /// An atomic update of one element of a tensor place (L12).
     Atomic {
         op: crate::intrinsics::AtomicOp,
-        place: Box<Expr>,
-        indices: Vec<Expr>,
+        place: LocalPlace,
+        indices: Vec<Index>,
         value: Box<Expr>,
         authority: AtomicCapability,
     },
@@ -447,175 +442,66 @@ pub(crate) enum ExprKind {
         plane: u32,
     },
     Intrinsic {
-        id: IntrinsicId,
+        overload: IntrinsicOverload,
         args: Vec<Expr>,
     },
     Call {
         call: Box<Call>,
         args: Vec<Expr>,
     },
+    /// L31: a data word the checker proved in range at an `index[B]` or
+    /// `range[B]` position. Typed `index[B]`; its symbol is the word's.
+    IndexPosition(Box<Expr>),
 }
 
-/// One static call occurrence: the family it names and, per candidate
-/// definition that unifies with the arguments, how its parameters bind.
+/// The rows of one capability intrinsic that are compatible with some
+/// admissible binding of the call's operands. Never empty; entry
+/// construction resolves exactly one row per specialization.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct IntrinsicOverload {
+    pub capability: CapabilityId,
+    pub name: &'static str,
+    pub rows: Vec<IntrinsicId>,
+}
+
+/// The participant context of a call site within its own body (L13, L14).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CallContext {
+    /// The call is under a `parallel for` of the calling body.
+    pub enclosing_parallel: bool,
+    /// Control at the call is uniform across the participants of the
+    /// innermost enclosing `parallel for` (or of the body's own call site).
+    pub participant_uniform: bool,
+}
+
+/// One static call occurrence.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Call {
     pub family: FamilyId,
-    /// Authored shape bindings, in source evaluation order before value arguments.
-    pub explicit_shapes: Vec<(String, Expr)>,
-    /// Candidates whose unification succeeded, in definition order.
-    /// Predicates are *not* evaluated here.
+    /// Explicit dimension bindings `f[D = e]`, in source order before the
+    /// value arguments: dimension ordinal and its checked value.
+    pub seeds: Vec<(u32, Expr)>,
+    /// Argument expression ordinal for each family parameter (L3: one order
+    /// for every member).
+    pub arg_order: Vec<usize>,
+    /// The family's dimensions at this call, in the caller's arena: the
+    /// family dimension plan applied to the actual axes and seeds.
+    pub dimensions: Vec<IntExpr>,
+    pub context: CallContext,
+    /// The members that apply at this call; the contract is always first.
     pub candidates: Vec<Candidate>,
     pub span: Span,
 }
 
-/// How one candidate definition's parameters bind at a call occurrence.
+/// One family member that applies at a call: its element bindings are
+/// compatible, its initialization contract applies here with guarantees
+/// including the contract's, and its placement is not excluded.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Candidate {
     pub definition: FunctionId,
-    /// The callee's dimensions, in the callee's declaration order, as
-    /// expressions in the caller's arena.
-    pub shape_args: Vec<IntExpr>,
-    /// Ordered construction of the same dimensions from reached call inputs.
-    pub shape_plan: Vec<(u32, ShapeBindingPlan)>,
     /// Callee element parameter -> element (possibly a caller parameter).
     pub elem_args: Vec<(String, Elem)>,
-    /// Argument expression ordinal for each callee parameter.
-    pub arg_order: Vec<usize>,
     /// Element parameters of the caller that must equal these concrete
     /// elements for this candidate to apply.
     pub requires_elems: Vec<(String, Elem)>,
-    pub applicability_proven: bool,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum ShapeBindingPlan {
-    Explicit { binding: usize },
-    /// The inverse of the selected formal axis is
-    /// `(observed - formal_axis[dimension := 0]) / coefficient`.
-    /// Every remaining dimension in that offset was captured earlier.
-    Inferred {
-        observation: ShapeObservation,
-        /// This candidate definition's checked formal-axis expression, in
-        /// its own definition arena. Replacing the selected dimension with
-        /// zero yields the checker-selected inverse offset.
-        formal_axis: IntExpr,
-        coefficient: i64,
-        prior_dimensions: Vec<u32>,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum ShapeObservation {
-    TensorAxis { parameter: usize, argument: usize, path: Vec<u32>, axis: u32 },
-}
-
-// ---------------------------------------------------------------------------
-// Traversal helpers
-// ---------------------------------------------------------------------------
-
-pub(crate) fn walk_block<'a>(block: &'a Block, visit: &mut dyn FnMut(&'a Expr)) {
-    for statement in &block.statements {
-        walk_stmt(statement, visit);
-    }
-    if let Terminator::Return(values) = &block.terminator {
-        values.iter().for_each(|v| walk_expr(v, visit));
-    }
-}
-
-pub(crate) fn walk_stmt<'a>(statement: &'a Stmt, visit: &mut dyn FnMut(&'a Expr)) {
-    match statement {
-        Stmt::Let { value, .. } => walk_expr(value, visit),
-        Stmt::Assign { place, value, .. } => {
-            walk_place(place, visit);
-            walk_expr(value, visit)
-        }
-        Stmt::Loop {
-            start, end, body, ..
-        } => {
-            walk_expr(start, visit);
-            walk_expr(end, visit);
-            walk_block(body, visit);
-        }
-        Stmt::If {
-            condition,
-            then_body,
-            else_body,
-            ..
-        } => {
-            walk_expr(condition, visit);
-            walk_block(then_body, visit);
-            walk_block(else_body, visit);
-        }
-        Stmt::Evaluate(expr) => walk_expr(expr, visit),
-    }
-}
-
-pub(crate) fn walk_place<'a>(place: &'a Place, visit: &mut dyn FnMut(&'a Expr)) {
-    match place {
-        Place::Local(_) => {}
-        Place::Element { indices, .. } => {
-            for index in indices {
-                match index {
-                    Index::Point { value, .. } => walk_expr(value, visit),
-                    Index::Range { start, end, .. } => {
-                        start.iter().chain(end).for_each(|e| walk_expr(e, visit))
-                    }
-                }
-            }
-        }
-        Place::Tuple(places) => places.iter().for_each(|p| walk_place(p, visit)),
-    }
-}
-
-pub(crate) fn walk_expr<'a>(expr: &'a Expr, visit: &mut dyn FnMut(&'a Expr)) {
-    visit(expr);
-    match &expr.kind {
-        ExprKind::Primitive { operands, .. } => operands.iter().for_each(|o| walk_expr(o, visit)),
-        ExprKind::Atomic {
-            place,
-            indices,
-            value,
-            ..
-        } => {
-            walk_expr(place, visit);
-            indices.iter().for_each(|index| walk_expr(index, visit));
-            walk_expr(value, visit);
-        }
-        ExprKind::PlaneView { base, .. } => walk_expr(base, visit),
-        ExprKind::Intrinsic { args, .. } => {
-            args.iter().for_each(|a| walk_expr(a, visit))
-        }
-        ExprKind::Call { call, args } => {
-            for (_, value) in &call.explicit_shapes { walk_expr(value, visit); }
-            args.iter().for_each(|a| walk_expr(a, visit));
-        }
-        ExprKind::Literal(_) | ExprKind::Dimension(_) | ExprKind::Local(_) => {}
-    }
-}
-
-impl Body {
-    /// Every call occurrence in this body, in evaluation order.
-    pub(crate) fn calls(&self) -> Vec<&Call> {
-        let mut out = Vec::new();
-        walk_block(&self.root, &mut |expr: &Expr| {
-            if let ExprKind::Call { call, .. } = &expr.kind {
-                out.push(call.as_ref());
-            }
-        });
-        out
-    }
-
-    /// Every static callee definition reachable from this body.
-    pub(crate) fn callees(&self) -> Vec<FunctionId> {
-        let mut out: Vec<FunctionId> = Vec::new();
-        for call in self.calls() {
-            for candidate in &call.candidates {
-                if !out.contains(&candidate.definition) {
-                    out.push(candidate.definition);
-                }
-            }
-        }
-        out
-    }
 }

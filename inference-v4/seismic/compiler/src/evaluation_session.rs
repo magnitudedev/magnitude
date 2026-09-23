@@ -256,7 +256,6 @@ where
             device,
             registry,
             precision,
-            preparation_budget,
         )?;
         Self::from_domain(
             domain,
@@ -644,22 +643,12 @@ pub(crate) mod boundary_tests {
     use crate::evaluation::EvaluationProvenance;
     use crate::planning::{OptimizationCompletion, PlanningBudgetReport};
     use crate::realization::demand_driven_tests::{
-        device, CountingCompiler, FakeTarget,
+        device, registry, CountingCompiler, FakeTarget,
     };
-    use crate::target::CompilerRegistryParts;
     use seismic_lang::checked::{check_source, SourceFile, SourceSet};
     use seismic_lang::entry::ElementBindings;
     use seismic_lang::expr::compiled::InvocationValues;
     use seismic_lang::precision::PrecisionPolicy;
-    pub(crate) fn registry() -> CompilerRegistry<FakeTarget> {
-        CompilerRegistry::assemble(CompilerRegistryParts {
-            capabilities: Vec::new(),
-
-            native_launch_constraints: |_, _, _, _, _, _| Vec::new(),
-            addressable_resources: |_| Vec::new(),
-            emitted_intrinsics: Default::default(),
-        })
-    }
 
     fn domain<'ctx>(
         device: &'ctx seismic_target::DeviceDescription<FakeTarget>,
@@ -689,7 +678,6 @@ pub(crate) mod boundary_tests {
             device,
             registry,
             &PrecisionPolicy::Exact,
-            &PreparationBudget::default(),
         )
         .unwrap()
     }
@@ -705,7 +693,7 @@ pub(crate) mod boundary_tests {
         use crate::candidate_domain::{BodyMapping,ConstructionCoordinate,ConstructionAllowance,Materialization};
         let module=check_source(SourceSet::new(vec![SourceFile{path:"session-outcome.seismic".into(),text:source.into()}])).unwrap();
         let entry=module.entry(module.entry_named("probe").unwrap(),&ElementBindings::default()).unwrap();
-        let mut domain=crate::candidate_domain::construct_candidate_domain(entry,device,registry,&precision,&PreparationBudget::default()).unwrap();
+        let mut domain=crate::candidate_domain::construct_candidate_domain(entry,device,registry,&precision).unwrap();
         let selection=domain.root_selections().into_iter().find(|body|body.mapping==BodyMapping::Authored).unwrap();
         let Materialization::Ready(construction)=domain.advance(&ConstructionCoordinate::root(selection),ConstructionAllowance{work_units:100_000,wall_time:std::time::Duration::from_secs(30)}).state else {panic!("authored construction did not finish")};
         let coordinate=domain.canonicalize(domain.proposal(construction,Vec::new())).unwrap();

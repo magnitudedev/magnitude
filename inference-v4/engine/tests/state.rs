@@ -1,3 +1,4 @@
+#![cfg(target_os = "macos")]
 use magnitude_engine::state::{ComponentSpec, SequenceState, StateStore};
 use seismic::{BackendName, DType, Device, DeviceCatalog, Tensor};
 use std::rc::Rc;
@@ -52,7 +53,6 @@ fn accept(state: &mut SequenceState, count: usize) {
     advance.commit().unwrap();
 }
 #[test]
-#[ignore = "requires a Metal device"]
 fn shared_prefix_private_tail_and_parent_first_drop() {
     let store = store(true, true);
     let mut parent = store.create().unwrap();
@@ -75,7 +75,6 @@ fn shared_prefix_private_tail_and_parent_first_drop() {
     assert!(store.idle());
 }
 #[test]
-#[ignore = "requires a Metal device"]
 fn failed_and_aborted_work_cannot_publish_or_recycle_early() {
     let store = store(true, true);
     let mut state = store.create().unwrap();
@@ -112,7 +111,6 @@ fn failed_and_aborted_work_cannot_publish_or_recycle_early() {
     assert_eq!(state.begin(5).unwrap().destinations(), [0, 1, 2, 3, 4]);
 }
 #[test]
-#[ignore = "requires a Metal device"]
 fn accepted_component_versions_survive_checkpoint_and_fork() {
     let store = store(false, true);
     let mut parent = store.create().unwrap();
@@ -133,7 +131,6 @@ fn accepted_component_versions_survive_checkpoint_and_fork() {
     assert_eq!(store.occupied_rows(), 0);
 }
 #[test]
-#[ignore = "requires a Metal device"]
 fn fragmented_reservation_and_capacity_failure_are_atomic() {
     let store = store(true, false);
     let mut a = store.create().unwrap();
@@ -164,7 +161,6 @@ fn fragmented_reservation_and_capacity_failure_are_atomic() {
     assert_eq!(store.occupied_rows(), 16);
 }
 #[test]
-#[ignore = "requires a Metal device"]
 fn trim_preserves_checkpoint_logical_history_and_position() {
     let store = store(true, true);
     let mut parent = store.create().unwrap();
@@ -192,7 +188,6 @@ fn trim_preserves_checkpoint_logical_history_and_position() {
     assert_eq!(parent.position(), 10);
 }
 #[test]
-#[ignore = "requires a Metal device"]
 fn exclusive_adjacent_extents_merge_but_checkpoint_boundaries_do_not_grow() {
     let store = store(true, false);
     let mut a = store.create().unwrap();
@@ -214,7 +209,6 @@ fn exclusive_adjacent_extents_merge_but_checkpoint_boundaries_do_not_grow() {
     assert_eq!(store.occupied_rows(), 7);
 }
 #[test]
-#[ignore = "requires a Metal device"]
 fn idle_arena_release_and_value_only_or_history_only_sequences() {
     for (history, values) in [(true, false), (false, true), (true, true)] {
         let store = store(history, values);
@@ -241,7 +235,6 @@ fn idle_arena_release_and_value_only_or_history_only_sequences() {
     }
 }
 #[test]
-#[ignore = "requires a Metal device"]
 fn context_and_anticipation_bounds() {
     let store = store(true, true);
     let mut state = store.create().unwrap();
@@ -257,7 +250,6 @@ fn context_and_anticipation_bounds() {
 }
 
 #[test]
-#[ignore = "requires a Metal device"]
 fn reclamation_counts_selected_handles_once_and_respects_checkpoint_pins() {
     let store = store(true, true);
     let parent = store.create().unwrap();
@@ -277,7 +269,6 @@ fn reclamation_counts_selected_handles_once_and_respects_checkpoint_pins() {
 }
 
 #[test]
-#[ignore = "requires a Metal device"]
 fn shared_execution_publishes_completion_for_all_rows_or_none() {
     use magnitude_engine::state::StateAdvance;
     let store = store(true, true);

@@ -1,0 +1,147 @@
+# Standard-library entries through the public API (design A10 §2.8; lines owned by A10).
+# Every exported std entry has at least one line. Shapes are small but non-degenerate:
+# every free dimension is at least 2, and every packed operand holds at least one packet
+# (q4g64: 64 values; q4g32, q8g32, q8g32s: 32; q4k, q5k, q6k, iq4g32: 256; nvfp4: 16) along
+# its packed last axis. Arguments follow parameter order; dimensions are inferred from shapes.
+
+# argmax.seismic: V = 8; the second line ties at 1 and 2 (the smaller index wins).
+argmax_row: f32[1,8]=rand(1) ; i32[1]=zero
+argmax_row: f32[1,4]=1,3,3,2 ; i32[1]=zero
+
+# attention.seismic
+# attention_update: M = 2, K = 3, W = 4. The first line is a fresh carry (m = -inf, l = 0).
+attention_update[A=f32]: f32[2,4]=rand(10) ; f32[3,4]=rand(11) ; f32[3,4]=rand(12) ; f32[2]=-inf,-inf ; f32[2]=zero ; f32[2,4]=zero ; f32:0.5
+attention_update[A=bf16]: bf16[2,4]=rand(13) ; bf16[3,4]=rand(14) ; bf16[3,4]=rand(15) ; f32[2]=rand(16) ; f32[2]=1,2 ; f32[2,4]=rand(17) ; f32:0.5
+# attention: Q = 2, T = 4, H = 4, KV = 2, W = 4. The second line has an empty window on row 1.
+attention[A=f32]: f32[2,4,4]=rand(20) ; f32[4,2,4]=rand(21) ; f32[4,2,4]=rand(22) ; i32[2,2]=0,3,1,4 ; f32[2,4,4]=zero ; f32:0.5
+attention[A=bf16]: bf16[2,4,4]=rand(23) ; bf16[4,2,4]=rand(24) ; bf16[4,2,4]=rand(25) ; i32[2,2]=0,4,2,2 ; bf16[2,4,4]=zero ; f32:0.5
+# attention_append: M = 2, T = 4, KV = 2, G = 2, W = 4, R = 2. Each line has an empty span.
+attention_append[A=f32]: f32[2,4,4]=rand(30) ; f32[4,2,4]=rand(31) ; f32[4,2,4]=rand(32) ; f32[2,2,4]=rand(33) ; f32[2,2,4]=rand(34) ; i32[2,2,2]=0,2,2,3,0,4,3,3 ; f32[2,4,4]=zero ; f32:0.5
+attention_append[A=bf16]: bf16[2,4,4]=rand(35) ; bf16[4,2,4]=rand(36) ; bf16[4,2,4]=rand(37) ; bf16[2,2,4]=rand(38) ; bf16[2,2,4]=rand(39) ; i32[2,2,2]=0,1,1,4,2,2,0,4 ; bf16[2,4,4]=zero ; f32:0.5
+
+# attention_gate.seismic: H = 2, W = 4.
+attention_gate: bf16[1,2,4]=rand(40) ; bf16[1,8]=rand(41) ; bf16[1,8]=zero
+
+# delta_step.seismic: NK = 2, GV = 2 (NK * GV = 4, 2 * NK + NK * GV = 8), W = 4; both head mappings.
+delta_steps[A=f32]: f32[2,8,4]=rand(50) ; f32[2,4]=rand(51) ; f32[2,4]=rand(52) ; f32[4,4,4]=rand(53) ; f32[4,4,4]=zero ; f32[2,4,4]=zero ; bool:true
+delta_steps[A=bf16]: bf16[2,8,4]=rand(54) ; bf16[2,4]=rand(55) ; f32[2,4]=rand(56) ; f32[4,4,4]=rand(57) ; f32[4,4,4]=zero ; bf16[2,4,4]=zero ; bool:false
+delta_step[A=f32]: f32[8,4]=rand(58) ; f32[4]=rand(59) ; f32[4]=rand(60) ; f32[4,4,4]=rand(61) ; f32[4,4,4]=zero ; f32[4,4]=zero ; bool:false
+delta_step[A=bf16]: bf16[8,4]=rand(62) ; bf16[4]=rand(63) ; f32[4]=rand(64) ; f32[4,4,4]=rand(65) ; f32[4,4,4]=zero ; bf16[4,4]=zero ; bool:true
+
+# elementwise.seismic: M = 2, N = 8.
+silu[T=f32,U=f32]: f32[2,8]=rand(70) ; f32[2,8]=zero
+silu[T=bf16,U=bf16]: bf16[2,8]=rand(71) ; bf16[2,8]=zero
+silu[T=bf16,U=f32]: bf16[2,8]=rand(72) ; f32[2,8]=zero
+multiply[T=bf16,U=bf16,V=bf16]: bf16[2,8]=rand(73) ; bf16[2,8]=rand(74) ; bf16[2,8]=zero
+multiply[T=f32,U=bf16,V=f32]: f32[2,8]=rand(75) ; bf16[2,8]=rand(76) ; f32[2,8]=zero
+add[T=bf16,U=bf16,V=bf16]: bf16[2,8]=rand(77) ; bf16[2,8]=rand(78) ; bf16[2,8]=zero
+add[T=f32,U=bf16,V=f32]: f32[2,8]=rand(79) ; bf16[2,8]=rand(80) ; f32[2,8]=zero
+sigmoid[T=f32,U=f32]: f32[2,8]=rand(81) ; f32[2,8]=zero
+sigmoid[T=bf16,U=bf16]: bf16[2,8]=rand(82) ; bf16[2,8]=zero
+gelu_tanh[T=f32,U=f32]: f32[2,8]=rand(83) ; f32[2,8]=zero
+gelu_tanh[T=bf16,U=bf16]: bf16[2,8]=rand(84) ; bf16[2,8]=zero
+
+# embedding.seismic, embedding_row.seismic: V = 4.
+embedding: q4g64[4,128]=rand(90) ; index:2 ; bf16[1,128]=zero
+embedding_row[T=q4g64,A=bf16]: q4g64[4,128]=rand(91) ; index:3 ; bf16[1,128]=zero
+embedding_row[T=q8g32,A=f32]: q8g32[4,64]=rand(92) ; index:1 ; f32[1,64]=zero
+embedding_row[T=bf16,A=f32]: bf16[4,8]=rand(93) ; index:0 ; f32[1,8]=zero
+
+# gate_projection_add.seismic: N = 4, K = 128.
+gate_projection_add: bf16[1,128]=rand(100) ; bf16[1,128]=rand(101) ; q4g64[4,128]=rand(102) ; bf16[1,4]=rand(103) ; bf16[1,4]=zero
+
+# gated_norm.seismic: NV = 2, W = 8.
+gated_norm: bf16[2,8]=rand(110) ; bf16[8]=rand(111) ; bf16[1,16]=rand(112) ; f32:0.000001 ; bf16[1,16]=zero
+
+# gated_projection.seismic: N = 4, K = 128.
+gated_projection: bf16[1,128]=rand(120) ; q4g64[4,128]=rand(121) ; q4g64[4,128]=rand(122) ; bf16[1,4]=zero
+
+# gelu.seismic. erf_values: the second line reaches every piece (tiny, |x| < 0.84375,
+# < 1.25, < 2.857, < 6, saturation), signed zero, NaN and infinities; the third covers bit patterns.
+erf_values: f32[16]=rand(130)
+erf_values: f32[16]=0,-0,0.000000001,0.5,-0.84375,1,1.25,-2.5,2.857142925262451,3,5.99,6,-7,nan,inf,-inf
+erf_values: f32[64]=bits(131)
+gelu[T=f32,U=f32]: f32[2,8]=rand(132) ; f32[2,8]=zero
+gelu[T=bf16,U=bf16]: bf16[2,8]=rand(133) ; bf16[2,8]=zero
+
+# kv_append.seismic: T = 4, KV = 2, W = 4.
+kv_append[A=bf16]: bf16[1,2,4]=rand(140) ; bf16[1,2,4]=rand(141) ; bf16[4,2,4]=rand(142) ; bf16[4,2,4]=rand(143) ; index:2
+kv_append[A=f32]: f32[1,2,4]=rand(144) ; f32[1,2,4]=rand(145) ; f32[4,2,4]=rand(146) ; f32[4,2,4]=rand(147) ; index:3
+
+# layer_norm.seismic: R = 2, W = 8.
+layer_norm[T=f32,U=f32,B=f32,V=f32]: f32[2,8]=rand(150) ; f32[8]=rand(151) ; f32[8]=rand(152) ; f32[2,8]=zero ; f32:0.00001
+layer_norm[T=bf16,U=bf16,B=bf16,V=bf16]: bf16[2,8]=rand(153) ; bf16[8]=rand(154) ; bf16[8]=rand(155) ; bf16[2,8]=zero ; f32:0.00001
+
+# linear.seismic: M = 2, N = 3; one line per dense pairing and per packed weight representation.
+linear[T=f32,U=f32,V=f32]: f32[2,8]=rand(160) ; f32[3,8]=rand(161) ; f32[2,3]=zero
+linear[T=bf16,U=bf16,V=bf16]: bf16[2,8]=rand(162) ; bf16[3,8]=rand(163) ; bf16[2,3]=zero
+linear[T=f16,U=f16,V=f32]: f16[2,8]=rand(164) ; f16[3,8]=rand(165) ; f32[2,3]=zero
+linear[T=bf16,U=q4g64,V=bf16]: bf16[2,128]=rand(166) ; q4g64[3,128]=rand(167) ; bf16[2,3]=zero
+linear[T=bf16,U=q4g32,V=bf16]: bf16[2,64]=rand(168) ; q4g32[3,64]=rand(169) ; bf16[2,3]=zero
+linear[T=bf16,U=q4k,V=bf16]: bf16[2,256]=rand(170) ; q4k[3,256]=rand(171) ; bf16[2,3]=zero
+linear[T=bf16,U=q5k,V=f32]: bf16[2,256]=rand(172) ; q5k[3,256]=rand(173) ; f32[2,3]=zero
+linear[T=bf16,U=q6k,V=f32]: bf16[2,256]=rand(174) ; q6k[3,256]=rand(175) ; f32[2,3]=zero
+linear[T=f32,U=q8g32s,V=f32]: f32[2,64]=rand(176) ; q8g32s[3,64]=rand(177) ; f32[2,3]=zero
+linear[T=f32,U=q8g32,V=f32]: f32[2,64]=rand(178) ; q8g32[3,64]=rand(179) ; f32[2,3]=zero
+linear[T=f32,U=iq4g32,V=f32]: f32[2,256]=rand(180) ; iq4g32[3,256]=rand(181) ; f32[2,3]=zero
+linear[T=f32,U=nvfp4_e2m1_block16,V=f32]: f32[2,64]=rand(182) ; nvfp4_e2m1_block16[3,64]=rand(183) ; f32[2,3]=zero
+
+# linear_bias.seismic: M = 2, N = 3.
+linear_bias[T=f32,U=f32,B=f32,V=f32]: f32[2,8]=rand(190) ; f32[3,8]=rand(191) ; f32[3]=rand(192) ; f32[2,3]=zero
+linear_bias[T=bf16,U=q4g64,B=bf16,V=bf16]: bf16[2,128]=rand(193) ; q4g64[3,128]=rand(194) ; bf16[3]=rand(195) ; bf16[2,3]=zero
+
+# logits.seismic, norm_*.seismic, projection*.seismic: N = 4, K = 128.
+logits: bf16[1,128]=rand(200) ; q4g64[4,128]=rand(201) ; f32[1,4]=zero
+norm_gated_projection: bf16[1,128]=rand(210) ; bf16[1,128]=rand(211) ; q4g64[4,128]=rand(212) ; q4g64[4,128]=rand(213) ; f32:0.000001 ; bf16[1,4]=zero
+norm_logits: bf16[1,128]=rand(220) ; bf16[1,128]=rand(221) ; q4g64[4,128]=rand(222) ; f32:0.000001 ; f32[1,4]=zero
+norm_projection: bf16[1,128]=rand(230) ; bf16[1,128]=rand(231) ; q4g64[4,128]=rand(232) ; f32:0.000001 ; bf16[1,4]=zero
+projection: bf16[1,128]=rand(240) ; q4g64[4,128]=rand(241) ; bf16[1,4]=zero
+projection_add: bf16[1,128]=rand(250) ; q4g64[4,128]=rand(251) ; bf16[1,4]=rand(252) ; bf16[1,4]=zero
+
+# recurrent_prepare.seismic: NK = 2, NV = 2 (2 * NK + NV = 6), W = 4 (channels 24), C = 4.
+# M = 2 < C - 1 reads the carried window in every row; M = 5 >= C - 1 also publishes a window
+# taken wholly from this call's rows.
+recurrent_prepare_rows[A=bf16,CW=bf16]: bf16[2,24]=rand(260) ; bf16[24,4]=rand(261) ; bf16[3,24]=rand(262) ; bf16[3,24]=zero ; bf16[2,2]=rand(263) ; bf16[2,2]=rand(264) ; f32[2]=-0.5,-1 ; f32[2]=rand(265) ; f32:0.000001 ; bf16[2,6,4]=zero ; bf16[2,2]=zero ; f32[2,2]=zero
+recurrent_prepare_rows[A=f32,CW=f32]: f32[5,24]=rand(266) ; f32[24,4]=rand(267) ; f32[3,24]=rand(268) ; f32[3,24]=zero ; f32[5,2]=rand(269) ; f32[5,2]=rand(270) ; f32[2]=-0.5,-1 ; f32[2]=rand(271) ; f32:0.000001 ; f32[5,6,4]=zero ; f32[5,2]=zero ; f32[5,2]=zero
+recurrent_prepare[A=bf16,CW=f32]: bf16[1,24]=rand(272) ; f32[24,4]=rand(273) ; bf16[3,24]=rand(274) ; bf16[3,24]=zero ; bf16[1,2]=rand(275) ; bf16[1,2]=rand(276) ; f32[2]=-0.5,-1 ; f32[2]=rand(277) ; f32:0.000001 ; bf16[6,4]=zero ; bf16[2]=zero ; f32[2]=zero
+
+# rms_norm.seismic: R = 3, W = 64. sum_any_order: N = 64.
+rms_norm[T=f32,U=f32,V=f32]: f32[3,64]=rand(280) ; f32[64]=rand(281) ; f32[3,64]=zero ; f32:0.000001
+rms_norm[T=bf16,U=bf16,V=bf16]: bf16[3,64]=rand(282) ; bf16[64]=rand(283) ; bf16[3,64]=zero ; f32:0.000001
+rms_norm[T=f32,U=bf16,V=bf16]: f32[3,64]=rand(284) ; bf16[64]=rand(285) ; bf16[3,64]=zero ; f32:0.000001
+sum_any_order: f32[64]=rand(286)
+
+# rotary_prepare.seismic: P = 4, S = 2 (2 * P + S = 10); rotary_prepare: Q = 2, H = 4, KV = 2.
+norm_rotary[A=f32]: f32[10]=rand(290) ; f32[10]=rand(291) ; i32[4]=3,5,7,0 ; i32[4]=0,1,2,0 ; f32:10000.0 ; f32:0.000001
+norm_rotary[A=bf16]: bf16[10]=rand(292) ; f32[10]=rand(293) ; i32[4]=11,2,9,0 ; i32[4]=0,1,2,1 ; f32:10000.0 ; f32:0.000001
+rotary_prepare[A=bf16]: bf16[2,80]=rand(294) ; bf16[2,20]=rand(295) ; f32[10]=rand(296) ; f32[10]=rand(297) ; i32[2,4]=3,5,7,0,4,6,8,0 ; bf16[2,4,10]=zero ; bf16[2,2,10]=zero ; bf16[2,40]=zero ; i32[4]=0,1,2,0 ; f32:10000.0 ; f32:0.000001
+rotary_prepare[A=f32]: f32[2,80]=rand(298) ; f32[2,20]=rand(299) ; f32[10]=rand(300) ; f32[10]=rand(301) ; i32[2,4]=1,2,3,0,9,9,9,0 ; f32[2,4,10]=zero ; f32[2,2,10]=zero ; f32[2,40]=zero ; i32[4]=2,1,0,1 ; f32:10000.0 ; f32:0.000001
+
+# sampling.seismic: M = 2. V = 40 (mask words (V + 31) / 32 = 2): row 0 sampled with
+# Philox draws, row 1 greedy; then a masked-out row (status 1) beside a partial mask.
+# V = 2: a non-finite row (status 2) beside a row whose -inf token is excluded.
+sample_rows: f32[2,40]=rand(310) ; u32[2,2]=0xffffffff,0xff,0xffffffff,0xff ; u32[2,6]=1,7,11,0,3,0,0,0,0,0,0,0 ; i32[2,2]=zero
+sample_rows: f32[2,40]=rand(311) ; u32[2,2]=0,0,0x0f0f0f0f,0x0f ; u32[2,6]=1,5,6,4,1,2,1,9,8,4,0,1 ; i32[2,2]=zero
+sample_rows: f32[2,2]=nan,1,0.5,-inf ; u32[2,1]=3,3 ; u32[2,6]=zero ; i32[2,2]=zero
+
+# weight_import.seismic: one repack line per registered external conversion (two packets each).
+repack_weight[T=gguf_q4_k,U=q4k]: gguf_q4_k[512]=rand(320)
+repack_weight[T=gguf_q5_k,U=q5k]: gguf_q5_k[512]=rand(321)
+repack_weight[T=gguf_q6_k,U=q6k]: gguf_q6_k[512]=rand(322)
+repack_weight[T=gguf_q8_0,U=q8g32s]: gguf_q8_0[64]=rand(323)
+repack_weight[T=gguf_iq4_xs,U=iq4g32]: gguf_iq4_xs[512]=rand(324)
+import_weight[T=bf16,U=f32]: bf16[16]=rand(325) ; f32[16]=zero
+import_weight[T=f32,U=bf16]: f32[16]=rand(326) ; bf16[16]=zero
+import_weight[T=f16,U=f32]: f16[16]=rand(327) ; f32[16]=zero
+import_weight_negative_exp[T=f32,U=f32]: f32[16]=rand(328) ; f32[16]=zero
+import_weight_negative_exp[T=bf16,U=f32]: bf16[16]=rand(329) ; f32[16]=zero
+
+# matmul.seismic (with the metal.matrix lowering): M = 2, N = 3 unless stated; `into` is moved in.
+# The f16/bf16 lines guard the intrinsic element-type selection of H-25 on Metal
+# (exempt in tests/history.rs; A10 §2.6).
+matmul[T=f32,U=f32]: f32[2,8]=rand(330) ; f32[3,8]=rand(331) ; f32[2,3]=rand(332)
+# origin: H-25
+matmul[T=bf16,U=bf16]: bf16[2,8]=rand(333) ; bf16[3,8]=rand(334) ; f32[2,3]=rand(335)
+# origin: H-25
+matmul[T=f16,U=f16]: f16[8,16]=rand(336) ; f16[8,16]=rand(337) ; f32[8,8]=zero
+matmul[T=bf16,U=q4g64]: bf16[2,128]=rand(338) ; q4g64[3,128]=rand(339) ; f32[2,3]=zero

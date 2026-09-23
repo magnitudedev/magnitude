@@ -1,0 +1,7 @@
+# cell: value-view/carry
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero
+fn probe(x: &tensor[4, 8] f32, out: &mut tensor[4] f32, y: &mut tensor[4, 8] f32):
+    let mut v = y[0]
+    for i in 1..4:
+        v = x[i] * 2.0
+    out[0] = v[1]

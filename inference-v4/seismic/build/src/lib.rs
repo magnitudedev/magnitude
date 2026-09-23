@@ -195,7 +195,7 @@ mod internals {
         let mut assets=Vec::new();
         for entry in module.entries() {
             let Some(definition)=module.native_implementation(entry.id,seismic_lang::registry::BackendName::Metal) else {continue};
-            let source=module.native_asset(&entry.name).expect("shared loader captures native assets");
+            let source=module.native_asset(entry.id,seismic_lang::registry::BackendName::Metal).expect("shared loader captures native assets");
             let path=output.join(format!("{}.metal",entry.name));
             fs::write(&path,source).map_err(BuildError::Io)?;
             assets.push(NativeAsset{definition,path});
@@ -480,13 +480,13 @@ mod internals {
                 "    seismic::generated::NativeDefinition {{ source: include_str!({path:?}).into(), entry: {:?}.into(), threadgroups: [\n",
                 entry.name
             ));
-            for expression in &native.definition.threadgroups {
+            for expression in &native.definition.launch.groups {
                 out.push_str("      ");
                 render_native_expr(out, expression);
                 out.push_str(",\n");
             }
             out.push_str("    ], threads_per_threadgroup: [\n");
-            for expression in &native.definition.threads_per_threadgroup {
+            for expression in &native.definition.launch.group_extent {
                 out.push_str("      ");
                 render_native_expr(out, expression);
                 out.push_str(",\n");

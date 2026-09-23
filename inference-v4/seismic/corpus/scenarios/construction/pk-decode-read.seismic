@@ -1,0 +1,6 @@
+# origin: C11:pk_decode_read
+# cell: decode/sl
+# cell: element-read-packed/sl
+# invoke: q4g64[128]=zero
+fn probe(w: &tensor[128] q4g64) -> f32:
+    return w[1] + f32(f32(w))[3]

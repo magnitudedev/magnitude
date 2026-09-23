@@ -37,7 +37,8 @@ use super::{
     AnyExpr, ArenaId, Assignment, BinaryOp, BoolExpr, CmpOp, DecisionId, DurationEstimate,
     DurationExpr, DurationTerm, ErasedScalarExpr, EvalError, Expr, ExprDigest, FiniteDomain,
     FoldOp, IntExpr, LoopBinderId, NaryOp, NatExpr, NodeView, PartialAssignment, RootId, RootName,
-    ScalarExpr, ScalarSort, SymbolId, SymbolKind, SymbolSort, SymbolValue, TargetConstantId,
+    ScalarArgument, ScalarComponent, ScalarExpr, ScalarSort, SymbolId, SymbolKind, SymbolSort,
+    SymbolValue, TargetConstantId,
     UnaryOp,
 };
 use crate::reference_math::{self, ReferenceScalar, ScalarOp};
@@ -156,7 +157,9 @@ pub(super) struct Arena {
     decision_count: u32,
     binder_symbols: HashMap<LoopBinderId, Vec<SymbolId>>,
     loop_binder_count: u32,
+    proof_variable_count: u32,
     decisions: HashMap<DecisionId, (FiniteDomain, SymbolId)>,
+    call_strides: HashMap<(crate::ids::ParameterId, u32), SymbolId>,
     nodes: Vec<Node>,
     sorts: Vec<Sort>,
     /// Every side condition beneath the node is trivially true (conservative).
@@ -189,7 +192,9 @@ impl Arena {
             decision_count: 0,
             binder_symbols: HashMap::new(),
             loop_binder_count: 0,
+            proof_variable_count: 0,
             decisions: HashMap::new(),
+            call_strides: HashMap::new(),
             nodes: Vec::new(),
             sorts: Vec::new(),
             total: Vec::new(),
@@ -265,6 +270,9 @@ impl Arena {
     }
     fn expr_total<Sort>(&self, expression: Expr<Sort>) -> bool {
         self.is_total(self.expr_index(expression))
+    }
+    pub(super) fn expression_total(&self, expression: AnyExpr) -> bool {
+        self.is_total(self.index(expression))
     }
     fn erased(&self, i: u32) -> AnyExpr {
         match self.sort(i) {
@@ -462,12 +470,27 @@ impl Arena {
         let symbol = self.symbol(SymbolKind::RuntimeValue(value), SymbolSort::Int);
         (symbol, self.int_symbol(symbol))
     }
-    pub(super) fn call_scalar(
+    pub(super) fn call_scalar(&mut self, argument: ScalarArgument, sort: SymbolSort) -> SymbolId {
+        self.symbol(SymbolKind::CallScalar(argument), sort)
+    }
+    pub(super) fn proof_variable(&mut self, sort: SymbolSort) -> SymbolId {
+        let index = self.proof_variable_count;
+        self.proof_variable_count = index
+            .checked_add(1)
+            .expect("ExprArena proof-variable identity space exhausted");
+        self.symbol(SymbolKind::ProofVariable(index), sort)
+    }
+    pub(super) fn call_stride_symbol(
         &mut self,
         parameter: crate::ids::ParameterId,
-        sort: SymbolSort,
+        axis: u32,
     ) -> SymbolId {
-        self.symbol(SymbolKind::CallScalar(parameter), sort)
+        if let Some(symbol) = self.call_strides.get(&(parameter, axis)) {
+            return *symbol;
+        }
+        let symbol = self.symbol(SymbolKind::CallStride(parameter, axis), SymbolSort::Nat);
+        self.call_strides.insert((parameter, axis), symbol);
+        symbol
     }
     pub(super) fn target_constant(&mut self, sort: SymbolSort) -> (TargetConstantId, SymbolId) {
         let index = u32::try_from(self.target_constants.len())
@@ -1958,6 +1981,9 @@ impl Arena {
                     ScalarOp::Cast(dtype) => {
                         digest.update([3, dtype_tag(*dtype)]);
                     }
+                    ScalarOp::IntegerToFloat(dtype) => {
+                        digest.update([4, dtype_tag(*dtype)]);
+                    }
                 }
                 digest.update((operands.len() as u64).to_le_bytes());
                 for (dtype, value) in operands.iter() {
@@ -2219,9 +2245,19 @@ fn hash_symbol_kind(digest: &mut Sha256, kind: SymbolKind) {
             digest.update([1]);
             digest.update((id.index() as u64).to_le_bytes());
         }
-        SymbolKind::CallScalar(id) => {
+        SymbolKind::CallScalar(argument) => {
             digest.update([2]);
-            digest.update((id.index() as u64).to_le_bytes());
+            digest.update((argument.parameter.index() as u64).to_le_bytes());
+            digest.update([match argument.component {
+                ScalarComponent::Value => 0,
+                ScalarComponent::RangeStart => 1,
+                ScalarComponent::RangeEnd => 2,
+            }]);
+        }
+        SymbolKind::CallStride(parameter, axis) => {
+            digest.update([8]);
+            digest.update((parameter.index() as u64).to_le_bytes());
+            digest.update(axis.to_le_bytes());
         }
         SymbolKind::RuntimeValue(id) => {
             digest.update([7]);
@@ -2243,6 +2279,9 @@ fn hash_symbol_kind(digest: &mut Sha256, kind: SymbolKind) {
         SymbolKind::ScheduleSlot(ordinal) => {
             digest.update([6]);
             digest.update(ordinal.to_le_bytes());
+        }
+        SymbolKind::ProofVariable(_) => {
+            unreachable!("proof variables never enter an entry arena")
         }
     }
 }
@@ -2741,11 +2780,11 @@ impl Arena {
         )
     }
 
-    pub(super) fn resolve_runtime_values(
+    pub(super) fn resolve_runtime_values<Sort>(
         &mut self,
-        node: IntExpr,
+        node: Expr<Sort>,
         values: &[(crate::ids::SemanticValueId, IntExpr)],
-    ) -> IntExpr {
+    ) -> Expr<Sort> {
         let mut expressions = HashMap::new();
         let node = self.expr_index(node);
         for symbol in &self.free[node as usize] {

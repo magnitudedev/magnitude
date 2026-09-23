@@ -1,0 +1,9 @@
+# origin: X1:w19b
+# rejected: "`0 <= w`"
+fn probe[R](x: &tensor[R] f32, out: &mut tensor[R] f32):
+    parallel for r in 0..R:
+        let w = i32(x[r] * 3.0)
+        let mut s = 0.0
+        for i in 0..w:
+            s = s + 1.0
+        out[r] = s

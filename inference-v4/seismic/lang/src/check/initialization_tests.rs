@@ -142,7 +142,8 @@ fn parallel_accesses_follow_views_calls_and_nested_loop_footprints() {
 #[test]
 fn parallel_branch_on_per_visit_read_does_not_exclude_cross_visit_accesses() {
     let source = "fn probe(choice: &tensor[2] u32, out: &mut tensor[3] f32):\n    parallel for i in 0..2:\n        if choice[i] == 0:\n            out[i] = 1.0\n        else:\n            out[i + 1] = 2.0\n";
-    let error = check(source).expect_err("different visits can take opposite arms and write out[1]");
+    let error =
+        check(source).expect_err("different visits can take opposite arms and write out[1]");
     assert!(error.contains("overlap across distinct visits"), "{error}");
 }
 
@@ -322,6 +323,96 @@ fn prior_iterations_do_not_inherit_current_dynamic_predicate() {
 }
 
 #[test]
+fn parallel_writes_are_separated_on_any_axis() {
+    for source in [
+        "fn probe[M, N](x: &tensor[M, N] f32, y: &mut tensor[M, N] f32):\n    parallel for c in 0..N:\n        for r in 0..M:\n            y[r, c] = x[r, c]\n",
+        "fn probe[M, T, KV](key: &tensor[M, KV] f32, hist: &mut tensor[T, KV] f32, dest: &tensor[M] i32):\n    parallel for head in 0..KV:\n        for row in 0..M:\n            hist[dest[row], head] = key[row, head]\n",
+    ] {
+        check(source).unwrap_or_else(|error| panic!("{source}\n{error}"));
+    }
+    for body in ["        out[0, 0] = 1.0\n", "        out[i % 2, 0] = 1.0\n"] {
+        let source =
+            format!("fn probe(out: &mut tensor[4, 4] f32):\n    parallel for i in 0..4:\n{body}");
+        let error = check(&source).expect_err(&source);
+        assert!(
+            error.contains("overlap across distinct visits"),
+            "{source}\n{error}"
+        );
+    }
+}
+
+#[test]
+fn atomic_accesses_commute_only_with_the_same_operation() {
+    check("fn probe[N](x: &tensor[N] i32, out: &mut tensor[1] i32):\n    parallel for i in 0..N:\n        atomic(add, out[0], x[i])\n        atomic(add, out[0], x[i])\n")
+        .unwrap();
+    let mixed = "fn probe[N](x: &tensor[N] i32, out: &mut tensor[1] i32):\n    parallel for i in 0..N:\n        atomic(add, out[0], x[i])\n        atomic(max, out[0], x[i])\n";
+    assert!(check(mixed)
+        .unwrap_err()
+        .contains("overlap across distinct visits"));
+    let ordinary = "fn probe[N](x: &tensor[N] i32, out: &mut tensor[1] i32):\n    parallel for i in 0..N:\n        atomic(add, out[0], x[i])\n        out[0] = x[i]\n";
+    assert!(check(ordinary)
+        .unwrap_err()
+        .contains("overlap across distinct visits"));
+}
+
+#[test]
+fn branch_writes_under_a_non_leading_loop_cover_the_root() {
+    for source in [
+        "fn w[C, N](t: &mut tensor[C, N] f32):\n    for column in 0..N:\n        for j in 0..C:\n            if j < 1:\n                t[j, column] = 1.0\n            else:\n                t[j, column] = 2.0\n\nfn probe[C, N](x: &tensor[C, N] f32) -> tensor[C, N] f32:\n    let mut t = tensor[C, N] f32\n    w(t)\n    return t\n",
+        "fn w[M, C, N](projected: &tensor[M, N] f32, window: &tensor[C - 1, N] f32, next: &mut tensor[C - 1, N] f32):\n    for column in 0..N:\n        for j in 0..C - 1:\n            if M + j < C - 1:\n                next[j, column] = window[M + j, column]\n            else:\n                next[j, column] = projected[M + j - (C - 1), column]\n\nfn probe[M, C, N](projected: &tensor[M, N] f32, window: &tensor[C - 1, N] f32) -> tensor[C - 1, N] f32:\n    let mut t = tensor[C - 1, N] f32\n    w(projected, window, t)\n    return t\n",
+        "fn probe[M, N](x: &tensor[M, N] f32) -> tensor[M, N] f32:\n    let mut t = tensor[M, N] f32\n    for c in 0..N:\n        t[0:M, c] = x[0:M, c]\n    return t\n",
+    ] {
+        check(source).unwrap_or_else(|error| panic!("{source}\n{error}"));
+    }
+    let partial = "fn probe[M, N](x: &tensor[M, N] f32) -> tensor[M, N] f32:\n    let mut t = tensor[M, N] f32\n    for c in 1..N:\n        t[0:M, c] = x[0:M, c]\n    return t\n";
+    assert!(check(partial).unwrap_err().contains("initialization"));
+}
+
+#[test]
+fn a_failed_callee_reports_only_its_own_diagnostics() {
+    let source = "fn broken[N](x: &tensor[N] f32, y: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        y[i] = x[i] + undeclared\n\nfn probe[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut t = tensor[N] f32\n    let mut u = tensor[N] f32\n    broken(x, t)\n    broken(t, u)\n    return u\n";
+    let error = check(source).unwrap_err();
+    assert!(error.contains("undeclared"), "{error}");
+    assert!(!error.contains("before this read"), "{error}");
+}
+
+#[test]
+fn calls_keep_only_alternatives_whose_contract_applies() {
+    use crate::entry::ElementBindings;
+    let candidates = |alternative: &str| {
+        let source = format!("fn fill[N](a: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        a[i] = 0.0\n\nfn fill[N](a: &mut tensor[N] f32):\n{alternative}\nfn probe() -> tensor[4] f32:\n    let mut a = tensor[4] f32\n    fill(a)\n    return a\n");
+        let checked = check_source(SourceSet::new(vec![SourceFile {
+            path: "alternatives.seismic".into(),
+            text: source.clone(),
+        }]))
+        .unwrap_or_else(|error| panic!("{source}\n{error}"));
+        let entry = checked
+            .entry(
+                checked.entry_named("probe").unwrap(),
+                &ElementBindings::default(),
+            )
+            .unwrap();
+        let program = entry.program();
+        let (_, family) = program
+            .families()
+            .find(|(_, family)| family.name() == "fill")
+            .unwrap();
+        family.candidates().len()
+    };
+    assert_eq!(
+        candidates("    a[:] = zeros_like(a)\n"),
+        2,
+        "equal guarantees"
+    );
+    assert_eq!(candidates("    a[0] = 0.0\n"), 1, "weaker guarantees");
+    assert_eq!(
+        candidates("    let old = a[0]\n    a[:] = zeros_like(a)\n"),
+        1,
+        "a requirement the reference does not have"
+    );
+}
+
+#[test]
 fn borrowed_whole_assignment_updates_the_actual_place() {
     use crate::entry::ElementBindings;
     use crate::interp::{Arg, Interpreter, TensorData};
@@ -348,4 +439,50 @@ fn borrowed_whole_assignment_updates_the_actual_place() {
         assert_eq!(actual.tensor().read(0).unwrap(), 0., "{body}");
         assert_eq!(actual.tensor().read(1).unwrap(), 0., "{body}");
     }
+}
+
+#[test]
+fn allocation_extent_with_a_signed_cofactor_is_rejected() {
+    // `i*k - k = (i - 1)*k` is negative for `i >= 2`, `k <= -1` (G-C24-1).
+    let error = check("fn probe[N](x: &tensor[N] f32, out: &mut tensor[N] f32):\n    let mut k = N - N\n    let m = N - N - 1\n    for i in 1..N:\n        k = k - 1\n        if k <= m:\n            let mut t = tensor[i * k - k] f32\n            for q in 0..i * k - k:\n                t[q] = 1.0\n            out[i] = 1.0\n").unwrap_err();
+    assert!(error.contains("tensor extent may be negative"), "{error}");
+}
+
+fn sequential_ifs(header: &str, count: usize) -> String {
+    let mut source = format!(
+        "fn probe[N](x: &tensor[N] f32, y: &mut tensor[N] f32):\n{header}        let mut v = x[i]\n"
+    );
+    for k in 1..=count {
+        source.push_str(&format!("        if v > {k}.0:\n            v = v - 1.0\n"));
+    }
+    source.push_str("        y[i] = v\n");
+    source
+}
+
+#[test]
+fn seqif_ser_20_checks() {
+    // One world per program point (L30): twenty joins check on the default
+    // test thread, in the debug profile, without path splitting.
+    check(&sequential_ifs("    for i in 0..N:\n", 20)).unwrap();
+    check(&sequential_ifs("    parallel for i in 0..N:\n", 20)).unwrap();
+}
+
+#[test]
+fn sequential_loop_exits_join() {
+    let mut source = "fn probe[N](x: &tensor[N] f32, y: &mut tensor[N] f32):\n".to_string();
+    for _ in 0..20 {
+        source.push_str("    for i in 0..N:\n        y[i] = x[i]\n");
+    }
+    check(&source).unwrap();
+}
+
+#[test]
+fn joined_integer_keeps_the_bounds_both_arms_prove() {
+    // After the join `j` is 1 or 2, so `t[j]` reads the initialized `t[0:3]`.
+    let read = |other: u32| {
+        format!("fn probe(c: bool) -> f32:\n    let mut t = tensor[4] f32\n    t[0:3] = zeros_like(t[0:3])\n    let mut j = 1\n    if c:\n        j = {other}\n    return t[j]\n")
+    };
+    check(&read(2)).unwrap();
+    let error = check(&read(3)).unwrap_err();
+    assert!(error.contains("initialization"), "{error}");
 }

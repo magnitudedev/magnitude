@@ -19,28 +19,14 @@ fn coupled_domain<'ctx>(
     let arena = &mut parts.arena;
     let mut construction = Construction::<FakeTarget>::new(arena, vec![], false, 0);
     let vectors = seismic_ir::target::VectorSupport::default();
-    let kernels = (0..13)
-        .map(|_| {
-            construction
-                .portable_kernel(arena, &(), &[], &vectors)
-                .close()
-        })
-        .collect::<Vec<_>>();
+    let kernel = construction
+        .portable_kernel(arena, &(), &[], &vectors)
+        .close();
     let decisions = (0..6)
         .map(|_| arena.decision(FiniteDomain::new(vec![0, 1]).unwrap()))
         .collect::<Vec<_>>();
     let mut schedule = construction.schedule(arena, 0);
-    for (axis, decision) in decisions.iter().enumerate() {
-        schedule.choose(*decision, |choice| {
-            choice.option(0, |selected| {
-                selected.launch_sequential(kernels[axis * 2]);
-            });
-            choice.option(1, |selected| {
-                selected.launch_sequential(kernels[axis * 2 + 1]);
-            });
-        });
-    }
-    schedule.launch_sequential(kernels[12]);
+    schedule.launch_sequential(kernel);
     let token = schedule.close();
     family.executable = construction
         .close(token)

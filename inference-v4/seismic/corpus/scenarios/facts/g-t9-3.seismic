@@ -1,0 +1,5 @@
+# origin: C26:G-T9-3
+# invoke: i32[8]=zero
+fn probe(dst: &mut tensor[8] i32):
+    parallel for k in 0..8:
+        dst[k] = i32(k + 3000000000)

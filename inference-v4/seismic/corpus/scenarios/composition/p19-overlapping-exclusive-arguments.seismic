@@ -1,0 +1,6 @@
+# origin: X1:P19
+# rejected: "overlapping tensor arguments cannot combine owned or exclusive access"
+fn add2(a: &tensor[2] f32, b: &mut tensor[2] f32):
+    b[0] = a[0] + a[1]
+fn probe(x: &mut tensor[4] f32):
+    add2(x[0:2], x[1:3])

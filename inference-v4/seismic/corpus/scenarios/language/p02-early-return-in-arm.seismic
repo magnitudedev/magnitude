@@ -1,0 +1,6 @@
+# origin: C1:p2
+# rejected: "return"
+fn pick(a: f32, c: bool) -> f32:
+    if c:
+        return a
+    return a + 1.0

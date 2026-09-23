@@ -6,12 +6,7 @@ where
     T: TargetFamily,
     D: DeviceService<T>,
 {
-    ExecutionEnvironment {
-        device: panic!(),
-        buffers: panic!(),
-        values: panic!(),
-        kernels: panic!(),
-    }
+    ExecutionEnvironment {}
 }
 
 fn main() {}

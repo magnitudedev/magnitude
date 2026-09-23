@@ -90,15 +90,24 @@ pub fn capture_assets(
     let definitions: Vec<_> = module
         .entries()
         .iter()
-        .filter_map(|entry| {
-            module
-                .native_implementation(entry.id, BackendName::Metal)
-                .map(|n| (entry.name.clone(), n.clone()))
+        .flat_map(|entry| {
+            BackendName::ALL.into_iter().filter_map(|backend| {
+                module
+                    .native_implementation(entry.id, backend)
+                    .map(|native| {
+                        (
+                            native.entry,
+                            native.backend,
+                            native.declared_in.clone(),
+                            native.source_path.clone(),
+                        )
+                    })
+            })
         })
         .collect();
     let mut paths = Vec::new();
-    for (entry, native) in definitions {
-        let declaring = Path::new(&native.declared_in);
+    for (entry, backend, declared_in, source_path) in definitions {
+        let declaring = Path::new(&declared_in);
         let root = match base {
             Some(base) => base,
             None if declaring.is_absolute() => declaring.parent().expect("absolute source parent"),
@@ -108,9 +117,9 @@ pub fn capture_assets(
                 ))
             }
         };
-        let path = root.join(native.source).canonicalize()?;
+        let path = root.join(source_path).canonicalize()?;
         module
-            .capture_native_asset(&entry, std::fs::read_to_string(&path)?)
+            .capture_native_asset(entry, backend, std::fs::read_to_string(&path)?)
             .map_err(LoadError::Invalid)?;
         paths.push(path);
     }

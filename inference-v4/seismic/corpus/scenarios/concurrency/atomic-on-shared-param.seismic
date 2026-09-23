@@ -1,0 +1,4 @@
+# origin: C17:atomic_on_shared_param
+# rejected: "`atomic` place"
+fn probe(out: &tensor[4] i32):
+    atomic(add, out[0], 1)

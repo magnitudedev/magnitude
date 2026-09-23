@@ -1,0 +1,8 @@
+# origin: H-9
+# general-launches-at-most: 1
+# invoke: f32[17]=rand(4)
+fn probe[N](x: &tensor[N] f32) -> tensor[N] f32:
+    let mut t = tensor[N] f32
+    parallel for i in 0..N:
+        t[i] = x[i] + 1.0
+    return t

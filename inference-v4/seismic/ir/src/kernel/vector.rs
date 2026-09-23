@@ -4,8 +4,8 @@
 //! select native instructions for the value, but cannot change its lanes,
 //! element type, masking semantics, or reduction order.
 
-use super::ops::{ErasedValue, ValueSchema, ValueType};
-use super::{values_sealed, BlockId, KernelValues};
+use super::ops::{ErasedValue, ValueType};
+use super::BlockId;
 use crate::identity::OwnerToken;
 use crate::repr::VectorElement;
 use std::fmt;
@@ -54,22 +54,5 @@ impl<T: VectorElement, const LANES: u16> VectorId<T, LANES> {
             dtype: T::DTYPE,
             lanes: LANES,
         }
-    }
-}
-
-impl<T: VectorElement, const LANES: u16> values_sealed::Sealed for VectorId<T, LANES> {}
-impl<T: VectorElement, const LANES: u16> KernelValues for VectorId<T, LANES> {
-    fn schema() -> ValueSchema {
-        ValueSchema::new(vec![Self::value_type()])
-    }
-
-    fn erase(&self) -> Vec<ErasedValue> {
-        vec![self.erased()]
-    }
-
-    fn restore(values: &[ErasedValue]) -> Self {
-        assert_eq!(values.len(), 1, "vector carry schema has one value");
-        let value = values[0];
-        Self::new(value.owner, value.kernel, value.block, value.index)
     }
 }

@@ -1,0 +1,9 @@
+# origin: C11:call_tuple_result
+# cell: value-tuple/result
+# invoke: f32:2
+fn helper(a: f32) -> (f32, f32):
+    return (a, a + 1.0)
+
+fn probe(x: f32) -> f32:
+    let (p, q) = helper(x)
+    return p * q

@@ -1,0 +1,5 @@
+# origin: C11:r2_partial_slice_computed_base
+# invoke: f32[2,3]=1,5,3,4,2,6
+fn probe(x: &tensor[2,3] f32) -> f32:
+    let y = x + 1.0
+    return reduce(y[1], 0, sum)

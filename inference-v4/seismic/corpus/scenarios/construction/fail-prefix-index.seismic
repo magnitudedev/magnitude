@@ -1,0 +1,7 @@
+# origin: C11:fail_prefix_index
+# invoke: f32[4]=0,0,0,0 ; f32[4]=5,5,5,5 ; i32:9
+# expect: failed
+fn probe(dst: &mut tensor[4] f32, src: &tensor[4] f32, k: i32):
+    dst[0] = 1.0
+    let v = src[k]
+    dst[1] = v

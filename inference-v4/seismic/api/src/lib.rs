@@ -1046,8 +1046,3 @@ pub mod dynamic;
 
 /// Numerical policy values shared by every host language.
 pub mod precision { pub use seismic_lang::precision::*; }
-
-/// Shared numerical comparison primitives for host testing adapters.
-pub mod testing {
-    pub use seismic_compiler::numerics::{compare_element, ElementComparison};
-}

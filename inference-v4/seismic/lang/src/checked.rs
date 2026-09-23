@@ -10,8 +10,8 @@
 //! W1 owns the internals behind `internals::Module`.
 
 use crate::entry::{ElementBindings, LogicalEntry};
-use crate::ids::{EntryId, ModuleHash, StableEntryId};
-use crate::registry::BackendName;
+use crate::ids::{EntryId, ModuleHash, RepresentationId, StableEntryId};
+use crate::registry::{self, BackendName, RepresentationAccess, RepresentationKind};
 use crate::span::Span;
 use crate::types::DType;
 
@@ -50,16 +50,19 @@ impl SourceSet {
             file.path = canonical_path(&file.path);
         }
         self.files.sort_by(|a, b| a.path.cmp(&b.path));
-        let mut diagnostics = Vec::new();
-        for pair in self.files.windows(2) {
-            if pair[0].path == pair[1].path {
-                diagnostics.push(SourceDiagnostic {
-                    path: pair[1].path.clone(),
-                    span: Span::default(),
-                    message: "duplicate source path in one module".to_owned(),
-                });
-            }
-        }
+        let diagnostics = self
+            .files
+            .windows(2)
+            .filter(|pair| pair[0].path == pair[1].path)
+            .map(|pair| {
+                SourceDiagnostic::new(
+                    &pair[1],
+                    Span::default(),
+                    DiagnosticRule::Resolution,
+                    "duplicate source path in one module",
+                )
+            })
+            .collect();
         match Diagnostics::new(diagnostics) {
             Some(diagnostics) => Err(diagnostics),
             None => Ok(self),
@@ -92,17 +95,143 @@ fn canonical_path(path: &str) -> String {
     }
 }
 
-/// One rendered diagnostic anchored in source.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SourceDiagnostic {
+/// The language rule a diagnostic reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DiagnosticRule {
+    Syntax,
+    Resolution,
+    Type,
+    Ownership,
+    Initialization,
+    Independence,
+    CallContract,
+    Dimension,
+    Capability,
+    Placement,
+    Atomic,
+    Recursion,
+    NativeDeclaration,
+}
+
+impl DiagnosticRule {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Syntax => "Syntax",
+            Self::Resolution => "Resolution",
+            Self::Type => "Type",
+            Self::Ownership => "Ownership",
+            Self::Initialization => "Initialization",
+            Self::Independence => "Independence",
+            Self::CallContract => "CallContract",
+            Self::Dimension => "Dimension",
+            Self::Capability => "Capability",
+            Self::Placement => "Placement",
+            Self::Atomic => "Atomic",
+            Self::Recursion => "Recursion",
+            Self::NativeDeclaration => "NativeDeclaration",
+        }
+    }
+}
+
+impl std::fmt::Display for DiagnosticRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// One-based line and column (in characters) of a span's start in `text`.
+pub(crate) fn line_column(text: &str, span: Span) -> (u32, u32) {
+    let offset = (span.start as usize).min(text.len());
+    let before = &text[..offset];
+    let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
+    let line = before.matches('\n').count() + 1;
+    let column = before[line_start..].chars().count() + 1;
+    (
+        u32::try_from(line).expect("source has more than u32::MAX lines"),
+        u32::try_from(column).expect("source line has more than u32::MAX characters"),
+    )
+}
+
+/// Where a diagnostic is anchored: a span of one source file, with its
+/// one-based line and column and the text of that line.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SourceLocation {
     pub path: String,
     pub span: Span,
+    pub line: u32,
+    pub column: u32,
+    source_line: String,
+}
+
+impl SourceLocation {
+    fn new(file: &SourceFile, span: Span) -> Self {
+        let (line, column) = line_column(&file.text, span);
+        let source_line = file
+            .text
+            .lines()
+            .nth(line as usize - 1)
+            .unwrap_or("")
+            .to_owned();
+        Self {
+            path: file.path.clone(),
+            span,
+            line,
+            column,
+            source_line,
+        }
+    }
+
+    /// The source line containing the span's start.
+    pub fn source_line(&self) -> &str {
+        &self.source_line
+    }
+}
+
+/// One diagnostic anchored in source.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SourceDiagnostic {
+    pub location: SourceLocation,
+    pub rule: DiagnosticRule,
     pub message: String,
 }
 
 impl SourceDiagnostic {
-    pub fn render(&self, text: &str) -> String {
-        crate::span::Diagnostic::new(self.span, self.message.clone()).render(&self.path, text)
+    pub(crate) fn new(
+        file: &SourceFile,
+        span: Span,
+        rule: DiagnosticRule,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            location: SourceLocation::new(file, span),
+            rule,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn located(file: &SourceFile, diagnostic: crate::span::Diagnostic) -> Self {
+        Self::new(file, diagnostic.span, diagnostic.rule, diagnostic.message)
+    }
+}
+
+impl std::fmt::Display for SourceDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let location = &self.location;
+        write!(
+            f,
+            "{}:{}:{}: {}: {}",
+            location.path, location.line, location.column, self.rule, self.message
+        )?;
+        let line = location.source_line();
+        let before = location.column as usize - 1;
+        let span_bytes = location.span.end.saturating_sub(location.span.start) as usize;
+        let start = line.char_indices().nth(before).map_or(line.len(), |(offset, _)| offset);
+        let width = line[start..]
+            .char_indices()
+            .take_while(|(offset, _)| *offset < span_bytes)
+            .count()
+            .max(1);
+        write!(f, "\n  {line}\n  {}{}", " ".repeat(before), "^".repeat(width))
     }
 }
 
@@ -113,7 +242,26 @@ pub struct Diagnostics {
 }
 
 impl Diagnostics {
-    pub(crate) fn new(items: Vec<SourceDiagnostic>) -> Option<Self> {
+    /// Orders the items by path, span, rule and message, and drops repeated
+    /// items. Sorting on the whole key makes equal items adjacent.
+    pub(crate) fn new(mut items: Vec<SourceDiagnostic>) -> Option<Self> {
+        items.sort_by(|left, right| {
+            (
+                &left.location.path,
+                left.location.span.start,
+                left.location.span.end,
+                left.rule,
+                &left.message,
+            )
+                .cmp(&(
+                    &right.location.path,
+                    right.location.span.start,
+                    right.location.span.end,
+                    right.rule,
+                    &right.message,
+                ))
+        });
+        items.dedup();
         (!items.is_empty()).then_some(Self { items })
     }
 
@@ -126,34 +274,29 @@ impl Diagnostics {
     }
 }
 
-/// Source failure taxonomy (§13.2).
+/// A rejected source set: every diagnostic the checker produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SourceError {
-    Parse(Diagnostics),
-    Type(Diagnostics),
-    Effect(Diagnostics),
-    Capability(Diagnostics),
+pub struct SourceError {
+    diagnostics: Diagnostics,
 }
 
 impl SourceError {
+    pub(crate) fn new(diagnostics: Diagnostics) -> Self {
+        Self { diagnostics }
+    }
+
     pub fn diagnostics(&self) -> &Diagnostics {
-        match self {
-            Self::Parse(d) | Self::Type(d) | Self::Effect(d) | Self::Capability(d) => d,
-        }
+        &self.diagnostics
     }
 }
 
 impl std::fmt::Display for SourceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let kind = match self {
-            Self::Parse(_) => "parse",
-            Self::Type(_) => "type",
-            Self::Effect(_) => "effect",
-            Self::Capability(_) => "capability",
-        };
-        write!(f, "{kind} error")?;
-        for item in self.diagnostics().items() {
-            write!(f, "\n{}: {}", item.path, item.message)?;
+        for (ordinal, item) in self.diagnostics.items().iter().enumerate() {
+            if ordinal > 0 {
+                f.write_str("\n")?;
+            }
+            write!(f, "{item}")?;
         }
         Ok(())
     }
@@ -164,7 +307,7 @@ impl std::error::Error for SourceError {}
 /// Parses and checks a source set as one closed module. The only source-side
 /// constructor of a [`CheckedModule`].
 pub fn check_source(sources: SourceSet) -> Result<CheckedModule, SourceError> {
-    let sources = sources.canonicalized().map_err(SourceError::Parse)?;
+    let sources = sources.canonicalized().map_err(SourceError::new)?;
     internals::check(sources).map(|inner| CheckedModule { inner, assets: Default::default() })
 }
 
@@ -175,7 +318,7 @@ pub fn check_source(sources: SourceSet) -> Result<CheckedModule, SourceError> {
 #[derive(Debug)]
 pub struct CheckedModule {
     inner: internals::Module,
-    pub(crate) assets: std::collections::BTreeMap<String, String>,
+    pub(crate) assets: std::collections::BTreeMap<(EntryId, BackendName), String>,
 }
 
 impl CheckedModule {
@@ -222,17 +365,27 @@ impl CheckedModule {
         self.inner.entry(entry, bindings)
     }
 
-    /// Snapshot a native asset for an entry. The checked declaration remains authoritative.
-    pub fn capture_native_asset(&mut self, entry: &str, source: String) -> Result<(), String> {
-        let id = self.entry_named(entry).ok_or_else(|| format!("unknown entry {entry}"))?;
-        if self.native_implementation(id, BackendName::Metal).is_none() {
-            return Err(format!("entry {entry} has no native declaration"));
+    /// Snapshot the native asset of an entry's native implementation for one
+    /// backend. The checked declaration remains authoritative.
+    pub fn capture_native_asset(
+        &mut self,
+        entry: EntryId,
+        backend: BackendName,
+        source: String,
+    ) -> Result<(), String> {
+        if self.native_implementation(entry, backend).is_none() {
+            return Err(format!(
+                "entry `{}` has no native implementation for `{}`",
+                self.entries()[entry.index()].name,
+                backend.as_str()
+            ));
         }
-        self.assets.insert(entry.to_owned(), source);
+        self.assets.insert((entry, backend), source);
         Ok(())
     }
-    pub fn native_asset(&self, entry: &str) -> Option<&str> {
-        self.assets.get(entry).map(String::as_str)
+
+    pub fn native_asset(&self, entry: EntryId, backend: BackendName) -> Option<&str> {
+        self.assets.get(&(entry, backend)).map(String::as_str)
     }
 
     /// The source set this module was checked from, for diagnostics and
@@ -241,16 +394,8 @@ impl CheckedModule {
         self.inner.sources()
     }
 
-    pub(crate) fn from_internal(inner: internals::Module) -> Self {
-        Self { inner, assets: Default::default() }
-    }
-
     pub(crate) fn internal(&self) -> &internals::Module {
         &self.inner
-    }
-
-    pub(crate) fn into_internal(self) -> internals::Module {
-        self.inner
     }
 }
 
@@ -270,6 +415,184 @@ pub struct EntryInfo {
     pub result_type: SignatureType,
     pub parameters: Vec<ParameterSummary>,
     pub results: Vec<ResultSummary>,
+    /// The admissible bindings of the element parameters.
+    pub element_domain: ElementDomain,
+}
+
+/// The admissible bindings of an entry's element parameters, computed by the
+/// checker. The only owner of binding legality.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ElementDomain {
+    parameters: Vec<ElementParameter>,
+    conversions: Vec<ElementConversion>,
+}
+
+/// One element parameter and every use the entry makes of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ElementParameter {
+    pub name: String,
+    pub uses: ElementUses,
+}
+
+/// How an entry uses the elements of one element parameter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ElementUses {
+    pub decoded_read: bool,
+    pub stored: bool,
+    pub conversion_source: bool,
+    /// `to_owned` of a view selecting part of the packing axis.
+    pub partial_copy: bool,
+}
+
+/// `repack[U = target](t)` with `t: tensor[..] source`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ElementConversion {
+    pub source: String,
+    pub target: ElementTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ElementTarget {
+    Parameter(String),
+    Concrete(RepresentationId),
+}
+
+/// Element bindings outside an entry's [`ElementDomain`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ElementBindingError {
+    Missing {
+        parameter: String,
+    },
+    Unexpected {
+        parameter: String,
+    },
+    Inadmissible {
+        parameter: String,
+        representation: RepresentationId,
+        uses: ElementUses,
+    },
+    NoConversion {
+        source: RepresentationId,
+        target: RepresentationId,
+    },
+}
+
+impl std::fmt::Display for ElementBindingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = |representation: &RepresentationId| registry::representation_info(*representation).name;
+        match self {
+            Self::Missing { parameter } => {
+                write!(f, "element parameter `{parameter}` is not bound")
+            }
+            Self::Unexpected { parameter } => {
+                write!(f, "`{parameter}` is not an element parameter of this entry")
+            }
+            Self::Inadmissible {
+                parameter,
+                representation,
+                uses,
+            } => write!(
+                f,
+                "representation `{}` is not admissible for element parameter `{parameter}` ({uses:?})",
+                name(representation)
+            ),
+            Self::NoConversion { source, target } => write!(
+                f,
+                "no exact representation conversion is registered from `{}` to `{}`",
+                name(source),
+                name(target)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ElementBindingError {}
+
+impl ElementUses {
+    /// Whether an element parameter with these uses may be bound to `representation`.
+    pub fn admits(self, representation: RepresentationId) -> bool {
+        let info = registry::representation_info(representation);
+        let dense_float = matches!(
+            info.kind,
+            RepresentationKind::Dense(DType::F32 | DType::F16 | DType::BF16)
+        );
+        let decodable = dense_float
+            || (matches!(info.kind, RepresentationKind::Packed(_))
+                && registry::decode_recipe(representation, DType::F32).is_some());
+        info.decoded.is_float()
+            && (!self.stored || (info.access == RepresentationAccess::ReadWrite && dense_float))
+            && (!self.decoded_read
+                || (matches!(
+                    info.access,
+                    RepresentationAccess::ReadWrite | RepresentationAccess::ReadOnly
+                ) && decodable))
+            && (!self.partial_copy || matches!(info.kind, RepresentationKind::Dense(_)))
+    }
+}
+
+impl ElementDomain {
+    pub(crate) fn new(
+        parameters: Vec<ElementParameter>,
+        conversions: Vec<ElementConversion>,
+    ) -> Self {
+        Self {
+            parameters,
+            conversions,
+        }
+    }
+
+    pub fn parameters(&self) -> &[ElementParameter] {
+        &self.parameters
+    }
+
+    pub(crate) fn conversions(&self) -> &[ElementConversion] {
+        &self.conversions
+    }
+
+    /// Decides whether `bindings` bind exactly this domain's parameters to
+    /// admissible representations with every required conversion registered.
+    pub fn admit(&self, bindings: &ElementBindings) -> Result<(), ElementBindingError> {
+        for parameter in &self.parameters {
+            if bindings.get(&parameter.name).is_none() {
+                return Err(ElementBindingError::Missing {
+                    parameter: parameter.name.clone(),
+                });
+            }
+        }
+        for (name, _) in bindings.iter() {
+            if !self.parameters.iter().any(|parameter| parameter.name == name) {
+                return Err(ElementBindingError::Unexpected {
+                    parameter: name.to_owned(),
+                });
+            }
+        }
+        let bound = |name: &str| {
+            bindings
+                .get(name)
+                .expect("element domain names a parameter outside its own parameter list")
+        };
+        for parameter in &self.parameters {
+            let representation = bound(&parameter.name);
+            if !parameter.uses.admits(representation) {
+                return Err(ElementBindingError::Inadmissible {
+                    parameter: parameter.name.clone(),
+                    representation,
+                    uses: parameter.uses,
+                });
+            }
+        }
+        for conversion in &self.conversions {
+            let source = bound(&conversion.source);
+            let target = match &conversion.target {
+                ElementTarget::Parameter(name) => bound(name),
+                ElementTarget::Concrete(representation) => *representation,
+            };
+            if registry::representation_conversion(source, target).is_none() {
+                return Err(ElementBindingError::NoConversion { source, target });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Read-only signature structure projected from checked source types.
@@ -290,9 +613,18 @@ pub struct NativeImplementation {
     pub backend: BackendName,
     /// Canonical module source label containing the declaration.
     pub declared_in: String,
-    pub source: String,
-    pub threadgroups: [NativeNatExpr; 3],
-    pub threads_per_threadgroup: [NativeNatExpr; 3],
+    /// The native source path, relative to the declaring source file.
+    pub source_path: String,
+    pub launch: NativeLaunch,
+}
+
+/// Launch geometry of a native implementation over the entry's dimensions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeLaunch {
+    /// Number of groups on each axis.
+    pub groups: [NativeNatExpr; 3],
+    /// Participants of one group on each axis.
+    pub group_extent: [NativeNatExpr; 3],
 }
 
 /// Closed integer language used by native launch geometry.
@@ -373,7 +705,6 @@ pub(crate) mod internals {
     #[derive(Debug)]
     pub(crate) struct Module {
         pub(crate) id: ModuleId,
-        pub(crate) template_program: ProgramId,
         pub(crate) semantic_hash: ModuleHash,
         pub(crate) sources: SourceSet,
         pub(crate) entries: Vec<EntryInfo>,
@@ -385,8 +716,7 @@ pub(crate) mod internals {
 
     pub(crate) fn check(sources: SourceSet) -> Result<Module, SourceError> {
         let id = ModuleId::fresh();
-        let template_program = ProgramId::fresh();
-        crate::check::check_closed(sources, id, template_program)
+        crate::check::check_closed(sources, id, ProgramId::fresh())
     }
 
     impl Module {
@@ -411,7 +741,7 @@ pub(crate) mod internals {
                 "CheckedModule received an EntryId outside its entry arena (§13.3.2)"
             );
             crate::check::build_entry(self, entry, bindings)
-                .map_err(|diagnostic| SourceError::Type(Diagnostics::single(diagnostic)))
+                .map_err(|diagnostic| SourceError::new(Diagnostics::single(diagnostic)))
         }
         pub(crate) fn sources(&self) -> &SourceSet {
             &self.sources
@@ -499,9 +829,9 @@ mod native_tests {
             .native_implementation(entry.id, BackendName::Metal)
             .expect("native implementation");
         assert_eq!(entry.dimensions, ["N"]);
-        assert_eq!(native.source, "scale.metal");
+        assert_eq!(native.source_path, "scale.metal");
         assert!(matches!(
-            native.threadgroups[0],
+            native.launch.groups[0],
             NativeNatExpr::CeilDiv(_, _)
         ));
     }
@@ -541,5 +871,164 @@ mod native_tests {
                 "expected diagnostic containing {expected:?}, got {error}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    fn rejected(text: &str) -> SourceError {
+        check_source(SourceSet::new(vec![SourceFile {
+            path: "probe.seismic".into(),
+            text: text.into(),
+        }]))
+        .expect_err("the source must be rejected")
+    }
+
+    fn single(error: &SourceError) -> &SourceDiagnostic {
+        let [item] = error.diagnostics().items() else {
+            panic!("expected one diagnostic, got {error}")
+        };
+        item
+    }
+
+    #[test]
+    fn display_renders_location_rule_message_and_caret() {
+        let error = rejected("fn h(x: f32) -> f32 for cpu:\n    return x\n");
+        let item = single(&error);
+        assert_eq!(item.rule, DiagnosticRule::Syntax);
+        assert_eq!((item.location.line, item.location.column), (1, 21));
+        assert_eq!(
+            error.to_string(),
+            "probe.seismic:1:21: Syntax: backend code is written as `lower NAME … for BACKEND`; a `fn` is portable\n  fn h(x: f32) -> f32 for cpu:\n                      ^^^"
+        );
+    }
+
+    #[test]
+    fn diagnostics_drop_every_repeated_item() {
+        let file = SourceFile {
+            path: "probe.seismic".into(),
+            text: "fn f() -> i32:\n    return 0\n".into(),
+        };
+        let item = |end: usize, message: &str| {
+            SourceDiagnostic::new(&file, Span::new(3, end), DiagnosticRule::Type, message)
+        };
+        let diagnostics =
+            Diagnostics::new(vec![item(4, "first"), item(5, "other"), item(4, "first")])
+                .expect("the items are not empty");
+        assert_eq!(diagnostics.items(), &[item(4, "first"), item(5, "other")]);
+    }
+
+    #[test]
+    fn line_column_counts_characters_from_one() {
+        let text = "ab\n→cd\n";
+        assert_eq!(line_column(text, Span::new(0, 1)), (1, 1));
+        assert_eq!(line_column(text, Span::new(3, 4)), (2, 1));
+        assert_eq!(line_column(text, Span::new(6, 7)), (2, 2));
+    }
+
+    #[test]
+    fn resolution_rules_are_typed() {
+        let recursion = rejected(
+            "fn a[N](x: &tensor[N] i32) -> i32:\n    return b(x)\n\nfn b[N](x: &tensor[N] i32) -> i32:\n    return a(x)\n",
+        );
+        let item = single(&recursion);
+        assert_eq!(item.rule, DiagnosticRule::Recursion);
+        assert!(item.message.contains("`a` -> `b` -> `a`"), "{recursion}");
+
+        let names = rejected(
+            "fn diff(a: i32, b: i32) -> i32:\n    return a - b\n\nfn diff(b: i32, a: i32) -> i32:\n    return a - b\n",
+        );
+        let item = single(&names);
+        assert_eq!(item.rule, DiagnosticRule::CallContract);
+        assert_eq!(item.location.line, 4);
+        assert!(item.message.contains("parameter names differ"), "{names}");
+
+        for builtin in [
+            "max", "exp_fast", "index", "range", "f32", "to_owned", "load", "clone", "decode",
+            "valid", "capacity", "coord",
+        ] {
+            let error = rejected(&format!("fn {builtin}(a: f32) -> f32:\n    return a\n"));
+            let item = single(&error);
+            assert_eq!(item.rule, DiagnosticRule::Resolution, "{error}");
+            assert!(item.message.contains("names a builtin operation"), "{error}");
+        }
+    }
+
+    #[test]
+    fn retired_keywords_are_ordinary_names() {
+        check_source(SourceSet::new(vec![SourceFile {
+            path: "names.seismic".into(),
+            text: "fn f(x: f32) -> f32:\n    let stage = x\n    let tile = stage\n    return tile\n".into(),
+        }]))
+        .expect("retired keywords are ordinary names");
+    }
+
+    #[test]
+    fn element_uses_admit_by_representation() {
+        let dense = registry::dense;
+        let q4g64 = registry::representation("q4g64").unwrap();
+        let external = registry::representation("gguf_q4_k").unwrap();
+        let stored = ElementUses { stored: true, ..ElementUses::default() };
+        let read = ElementUses { decoded_read: true, ..ElementUses::default() };
+        let copied = ElementUses { decoded_read: true, partial_copy: true, ..ElementUses::default() };
+        assert!(stored.admits(dense(DType::BF16)));
+        assert!(!stored.admits(q4g64));
+        assert!(!stored.admits(dense(DType::I32)));
+        assert!(read.admits(q4g64));
+        assert!(!read.admits(external));
+        assert!(!copied.admits(q4g64));
+        assert!(ElementUses::default().admits(external));
+        assert!(!ElementUses::default().admits(dense(DType::Bool)));
+    }
+
+    #[test]
+    fn element_domain_admits_exactly_its_bindings() {
+        let external = registry::representation("gguf_q4_k").unwrap();
+        let q4k = registry::representation("q4k").unwrap();
+        let domain = ElementDomain::new(
+            vec![
+                ElementParameter {
+                    name: "T".into(),
+                    uses: ElementUses { conversion_source: true, ..ElementUses::default() },
+                },
+                ElementParameter {
+                    name: "U".into(),
+                    uses: ElementUses { stored: true, ..ElementUses::default() },
+                },
+            ],
+            vec![ElementConversion {
+                source: "T".into(),
+                target: ElementTarget::Concrete(q4k),
+            }],
+        );
+        let f32 = registry::dense(DType::F32);
+        assert_eq!(
+            domain.admit(&ElementBindings::new().bind("T", external).bind("U", f32)),
+            Ok(())
+        );
+        assert_eq!(
+            domain.admit(&ElementBindings::new().bind("T", external)),
+            Err(ElementBindingError::Missing { parameter: "U".into() })
+        );
+        assert_eq!(
+            domain.admit(
+                &ElementBindings::new().bind("T", external).bind("U", f32).bind("V", f32)
+            ),
+            Err(ElementBindingError::Unexpected { parameter: "V".into() })
+        );
+        assert_eq!(
+            domain.admit(&ElementBindings::new().bind("T", external).bind("U", q4k)),
+            Err(ElementBindingError::Inadmissible {
+                parameter: "U".into(),
+                representation: q4k,
+                uses: ElementUses { stored: true, ..ElementUses::default() },
+            })
+        );
+        assert_eq!(
+            domain.admit(&ElementBindings::new().bind("T", f32).bind("U", f32)),
+            Err(ElementBindingError::NoConversion { source: f32, target: q4k })
+        );
     }
 }

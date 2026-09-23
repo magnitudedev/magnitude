@@ -1,0 +1,4 @@
+# origin: test:validation:corpus/effects.seismic:slice_assign_prefix
+# invoke slice_assign_prefix: f32[3]=1,2,3 ; f32[5]=zero
+fn slice_assign_prefix[N, W](x: &tensor[W] f32, y: &mut tensor[N] f32) where N - W >= 0:
+    y[0:W] = x

@@ -1184,10 +1184,9 @@ fn compile_steps<B: seismic_target::TargetFamily>(
                 ExecutableStep::Command(ExecutableCommand::Launch {
                     kernel: ExecutableKernelId(
                         // Coordinate-exact reconciliation supplies a dense
-                        // table containing only kernels reachable after
-                        // compile-time choices are eliminated.
+                        // table in which every launched kernel is realized.
                         native_set.native_kernel_index(launch.kernel).unwrap_or_else(
-                            || panic!("inactive kernel reached executable lowering"),
+                            || panic!("launched kernel has no realized native kernel"),
                         ),
                     ),
                     descriptor: launch.descriptor.clone(),
@@ -1377,31 +1376,6 @@ fn compile_steps<B: seismic_target::TargetFamily>(
                 )
                 .into_boxed_slice(),
             },
-            seismic_ir::schedule::ScheduleStep::Choose { decision, options } => {
-                let selected = match fixed.get(arena.decision_symbol(*decision)) {
-                    Some(SymbolValue::Int(value)) => i64::try_from(value).expect("closed finite decision exceeds its integer domain"),
-                    _ => panic!("schedule choice is absent from exact assignment"),
-                };
-                let body = options
-                    .iter()
-                    .find_map(|(value, body)| (*value == selected).then_some(body))
-                    .unwrap_or_else(|| {
-                        panic!("exact assignment selected an absent schedule option")
-                    });
-                out.extend(compile_steps(
-                    native_set,
-                    arena,
-                    fixed,
-                    topology,
-                    allocation_remap,
-                    kernels,
-                    schedule,
-                    launch_resources,
-                    launch_bindings,
-                    body,
-                ));
-                continue;
-            }
         };
         out.push(compiled);
     }

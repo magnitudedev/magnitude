@@ -1,0 +1,5 @@
+# origin: C1:p30
+# invoke g: f32[5]=seq ; index:2
+# pin: result = f32[]=2
+fn g[N](x: &tensor[N] f32, k: index[N]) -> f32:
+    return x[k]

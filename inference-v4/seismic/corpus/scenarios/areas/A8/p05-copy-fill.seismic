@@ -1,0 +1,15 @@
+# origin: A8:G-A8-new-1
+# invoke copy_owned: f16[7]=1,-2,0.5,-0,inf,0x7e01,0x0001
+# expect: returned
+# pin: result = f16[7]=1,-2,0.5,-0,inf,0x7e01,0x0001
+# invoke clear: f16[7]=1,2,3,4,5,6,7
+# expect: returned
+# pin: x = f16[7]=0,0,0,0,0,0,0
+fn copy_owned[N](x: &tensor[N] f16) -> tensor[N] f16:
+    # An owned copy of 14 bytes: a byte copy, since the length is not a
+    # multiple of the 4-byte word.
+    return to_owned(x)
+
+fn clear[N](x: &mut tensor[N] f16):
+    # A zero fill of 7 two-byte elements.
+    x[:] = zeros_like(x)

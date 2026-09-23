@@ -1,0 +1,10 @@
+# origin: H-11
+# invoke: f32[6]=seq ; bool:true
+# invoke: f32[6]=seq ; bool:false
+fn probe[N](x: &tensor[N] f32, c: bool) -> tensor[N] f32:
+    let mut t = tensor[N] f32
+    if c:
+        t[:] = x + 1.0
+    else:
+        t[:] = x - 1.0
+    return t

@@ -19,6 +19,7 @@ members = [
   "seismic/runtime",
   "seismic/api",
   "seismic/build",
+  "seismic/corpus",
   "seismic/frontends/python",
 ]
 default-members = [
@@ -40,6 +41,7 @@ default-members = [
   "seismic/runtime",
   "seismic/api",
   "seismic/build",
+  "seismic/corpus",
 ]
 
 [workspace.package]

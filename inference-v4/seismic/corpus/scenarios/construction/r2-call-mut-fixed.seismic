@@ -1,0 +1,7 @@
+# origin: C11:r2_call_mut_fixed
+# invoke: f32[4]=0,0,0,0
+fn helper(d: &mut tensor[4] f32):
+    d[0] = 7.0
+
+fn probe(dst: &mut tensor[4] f32):
+    helper(dst)

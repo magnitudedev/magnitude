@@ -18,9 +18,7 @@ pub enum Tok {
 
 /// Reserved words. Structural words are reserved everywhere; a function cannot shadow them.
 /// Contextual words are ordinary names to the lexer and recognized by position in the
-/// parser: `tensor`/`view`/`index` (type position), `out`/`inout` (before a parameter
-/// name), `alias` (after a parameter list), `to` (after a `publish` value), `identity`
-/// (after a `merge` binder list).
+/// parser: `tensor`/`index`/`range` (type position), `from` (in a native declaration).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kw {
     Fn,
@@ -38,22 +36,15 @@ pub enum Kw {
     True,
     False,
     Inf,
-    Tile,
     Void,
     Let,
     Mut,
     Parallel,
-    Ordered,
-    Pipeline,
-    Stage,
-    Yield,
     Return,
-    Merge,
-    Publish,
 }
 
 impl Kw {
-    pub const ALL: [Kw; 27] = [
+    pub const ALL: [Kw; 20] = [
         Kw::Fn,
         Kw::Native,
         Kw::Lower,
@@ -69,18 +60,11 @@ impl Kw {
         Kw::True,
         Kw::False,
         Kw::Inf,
-        Kw::Tile,
         Kw::Void,
         Kw::Let,
         Kw::Mut,
         Kw::Parallel,
-        Kw::Ordered,
-        Kw::Pipeline,
-        Kw::Stage,
-        Kw::Yield,
         Kw::Return,
-        Kw::Merge,
-        Kw::Publish,
     ];
 
     pub fn from_name(name: &str) -> Option<Kw> {
@@ -104,18 +88,11 @@ impl Kw {
             Kw::True => "true",
             Kw::False => "false",
             Kw::Inf => "inf",
-            Kw::Tile => "tile",
             Kw::Void => "void",
             Kw::Let => "let",
             Kw::Mut => "mut",
             Kw::Parallel => "parallel",
-            Kw::Ordered => "ordered",
-            Kw::Pipeline => "pipeline",
-            Kw::Stage => "stage",
-            Kw::Yield => "yield",
             Kw::Return => "return",
-            Kw::Merge => "merge",
-            Kw::Publish => "publish",
         }
     }
 }

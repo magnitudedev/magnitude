@@ -1,9 +1,8 @@
 //! `cuda.subgroup` registry inventory.
 //!
 //! Authored calls have one construction path: the compiler-owned semantic
-//! walker invokes `Cuda::lower_semantic_intrinsic`. This module therefore
-//! records only the signatures the native emitter implements; it does not
-//! expose a second `TypedIntrinsic` lowering path.
+//! walker invokes `Cuda::lower_semantic_intrinsic`. This module records the
+//! signatures the native emitter implements.
 
 use super::{signature_id, SUBGROUP};
 use seismic_lang::ids::IntrinsicId;

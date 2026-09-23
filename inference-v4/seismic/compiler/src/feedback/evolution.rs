@@ -241,7 +241,8 @@ pub(super) fn finite_coordinates<T: TargetFamily>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evaluation_session::boundary_tests::{domain_with_optional, registry};
+    use crate::evaluation_session::boundary_tests::domain_with_optional;
+    use crate::realization::demand_driven_tests::registry;
     use crate::realization::demand_driven_tests::device;
 
     #[test]

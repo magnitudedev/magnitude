@@ -1,0 +1,10 @@
+# origin: C26:G-T9-2
+# invoke: f32[3]=5,5,5 ; bool:true
+# pin: t = f32[3]=1,0,0
+# invoke: f32[3]=5,5,5 ; bool:false
+# pin: t = f32[3]=0,0,0
+fn probe[N](t: &mut tensor[N] f32, c: bool):
+    for i in 0..N:
+        t[i] = 0.0
+    if c:
+        t[0] = 1.0

@@ -4,7 +4,8 @@
 //! applies those same contracts to its actual bindings. This module owns the
 //! one coordinate calculus; neither consumer may invent whole-root permission.
 use crate::check::{prove, xfer};
-use crate::expr::{AnyExpr, BoolExpr, ExprArena, IntExpr, SymbolId};
+use crate::expr::{AnyExpr, BoolExpr, ExprArena, IntExpr, NodeView, SymbolId};
+use crate::intrinsics::AtomicOp;
 use crate::span::Span;
 use crate::syntax::ast::BinaryOp;
 use std::collections::HashMap;
@@ -48,14 +49,25 @@ pub(crate) struct Bound {
     pub(crate) end: IntExpr,
 }
 
-/// Images bind their coordinates jointly. Logical linearization is a derived
-/// bijection from the checked axes, never a claim based on matching byte sizes.
+/// Elements of one storage root. Images bind their coordinates jointly; the
+/// row-major forms are derived from the root's checked axes, never from
+/// matching byte sizes.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Region {
     Empty,
     Full,
-    Interval(IntExpr, IntExpr),
+    /// Root elements whose logical root coordinates are `coordinates` (one
+    /// per root axis) for every assignment of `domain`. Every access builds
+    /// one; a reshape view's coordinates carry its quotient/remainder
+    /// decomposition.
     Image {
+        domain: Vec<Bound>,
+        coordinates: Vec<IntExpr>,
+    },
+    /// Row-major element interval `[start, end)` of the root.
+    Linear(IntExpr, IntExpr),
+    /// Row-major root addresses for every assignment of `domain`.
+    LinearImage {
         domain: Vec<Bound>,
         address: IntExpr,
     },
@@ -95,11 +107,79 @@ impl Region {
             (a, b) => Self::Intersection(vec![a, b]),
         }
     }
+    fn guarded(path: Path, region: Self) -> Self {
+        match region {
+            Self::Empty => Self::Empty,
+            region if path.is_empty() => region,
+            region => Self::Guard(path, Box::new(region)),
+        }
+    }
+    /// The top-level members of a union.
+    fn members(self) -> Vec<Self> {
+        match self {
+            Self::Empty => vec![],
+            Self::Union(parts) => parts,
+            other => vec![other],
+        }
+    }
+    /// The region after a join on `condition`: `then` where it held and `els`
+    /// where it did not. Members common to both arms stay unguarded, so the
+    /// region grows linearly in the number of joins.
+    pub(crate) fn branch(condition: &Condition, then: Self, els: Self) -> Self {
+        if then == els {
+            return then;
+        }
+        let then_members = then.members();
+        let else_members = els.members();
+        let (common, then_only): (Vec<_>, Vec<_>) = then_members
+            .into_iter()
+            .partition(|member| else_members.contains(member));
+        let else_only = else_members
+            .into_iter()
+            .filter(|member| !common.contains(member))
+            .collect();
+        let arm = |truth: bool, members: Vec<Region>| {
+            Region::guarded(
+                vec![(condition.clone(), truth)],
+                members.into_iter().fold(Region::Empty, Region::union),
+            )
+        };
+        common
+            .into_iter()
+            .fold(Region::Empty, Region::union)
+            .union(arm(true, then_only))
+            .union(arm(false, else_only))
+    }
+}
+
+/// Ordered-loop visit separation, L25 (I1)-(I3): accesses of distinct visits
+/// to storage live at loop entry are separated whenever one writes, no local
+/// live at entry is rebound, and no access is atomic. `Unrecorded` exists
+/// only while checking: the recording pass meets every analysed entry world
+/// into it. A loop left `Unrecorded` is dead under path facts and lowers as
+/// `Unproven`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VisitSeparation {
+    Unrecorded,
+    Separated,
+    Unproven,
+}
+impl VisitSeparation {
+    /// Meet one analysed entry world's proof into the loop's fact.
+    pub(crate) fn record(&mut self, separated: bool) {
+        *self = match (*self, separated) {
+            (Self::Unproven, _) | (_, false) => Self::Unproven,
+            (Self::Unrecorded | Self::Separated, true) => Self::Separated,
+        };
+    }
 }
 
 pub(crate) trait RegionOps {
     fn arena(&mut self) -> &mut ExprArena;
     fn arena_ref(&self) -> &ExprArena;
+    /// A fresh integer variable of this arena: a proof variable in a
+    /// definition arena, a region binder in an entry arena.
+    fn fresh_variable(&mut self) -> SymbolId;
     fn substitute(&mut self, value: IntExpr, map: &HashMap<SymbolId, IntExpr>) -> IntExpr {
         prove::substitute(self.arena(), value, &|s| map.get(&s).copied())
     }
@@ -115,9 +195,15 @@ pub(crate) trait RegionOps {
 
     fn normalize(&mut self, region: Region, facts: &prove::Facts) -> Region {
         match region {
-            Region::Image { domain, address } => self.normalize_image(domain, address, facts),
-            Region::Guard(path, inner) if path.is_empty() => self.normalize(*inner, facts),
-            Region::Interval(start, end) if self.le(facts, end, start) => Region::Empty,
+            Region::Image {
+                domain,
+                coordinates,
+            } => self.normalize_image(domain, coordinates, facts),
+            Region::LinearImage { domain, address } => {
+                self.normalize_linear(domain, address, facts)
+            }
+            Region::Guard(path, inner) => Region::guarded(path, self.normalize(*inner, facts)),
+            Region::Linear(start, end) if self.le(facts, end, start) => Region::Empty,
             Region::Union(parts) => {
                 let joined = parts.into_iter().fold(Region::Empty, |a, b| {
                     let b = self.normalize(b, facts);
@@ -133,20 +219,19 @@ pub(crate) trait RegionOps {
                 while i < parts.len() {
                     let mut j = i + 1;
                     while j < parts.len() {
-                        if let (Region::Interval(a, b), Region::Interval(c, d)) =
-                            (&parts[i], &parts[j])
+                        if let (Region::Linear(a, b), Region::Linear(c, d)) = (&parts[i], &parts[j])
                         {
                             let (a, b, c, d) = (*a, *b, *c, *d);
                             if self.le(facts, a, c) && self.le(facts, c, b) && self.le(facts, b, d)
                             {
-                                parts[i] = Region::Interval(a, d);
+                                parts[i] = Region::Linear(a, d);
                                 parts.remove(j);
                                 j = i + 1;
                                 continue;
                             }
                             if self.le(facts, c, a) && self.le(facts, a, d) && self.le(facts, d, b)
                             {
-                                parts[i] = Region::Interval(c, b);
+                                parts[i] = Region::Linear(c, b);
                                 parts.remove(j);
                                 j = i + 1;
                                 continue;
@@ -156,6 +241,8 @@ pub(crate) trait RegionOps {
                     }
                     i += 1;
                 }
+                self.join_images(&mut parts, facts);
+                merge_complementary_guards(&mut parts);
                 if parts.len() == 1 {
                     parts.pop().unwrap()
                 } else {
@@ -184,17 +271,24 @@ pub(crate) trait RegionOps {
                     }
                     Region::Image {
                         mut domain,
+                        coordinates,
+                    } => {
+                        domain.insert(0, bound);
+                        self.normalize_image(domain, coordinates, facts)
+                    }
+                    Region::LinearImage {
+                        mut domain,
                         address,
                     } => {
                         domain.insert(0, bound);
-                        self.normalize_image(domain, address, facts)
+                        self.normalize_linear(domain, address, facts)
                     }
-                    Region::Interval(start, end) => {
+                    Region::Linear(start, end) => {
                         let (symbol, index) = self.fresh_integer();
                         let zero = self.arena().int(0);
                         let width = self.arena().int_sub(end, start);
                         let address = self.arena().int_add(start, index);
-                        self.normalize_image(
+                        self.normalize_linear(
                             vec![
                                 bound,
                                 Bound {
@@ -224,7 +318,222 @@ pub(crate) trait RegionOps {
             other => other,
         }
     }
+    /// Normalize an image axis by axis. When every coordinate mentions its
+    /// own domain symbols only, the image is the product of the coordinate
+    /// images, and a coordinate that enumerates a dense range becomes one
+    /// symbol over that range: loop completion of `b + off` over
+    /// `b in [lo, hi)` is the axis range `[lo + off, hi + off)`.
     fn normalize_image(
+        &mut self,
+        domain: Vec<Bound>,
+        coordinates: Vec<IntExpr>,
+        facts: &prove::Facts,
+    ) -> Region {
+        if domain.iter().any(|d| self.le(facts, d.end, d.start)) {
+            return Region::Empty;
+        }
+        let normalized = self.rebased_image(domain.clone(), coordinates.clone(), facts);
+        // Rebasing names fresh symbols. An image that is already normal stays
+        // the identical region, so equal members remain equal across joins.
+        match normalized {
+            Region::Image {
+                domain: rebased,
+                coordinates: rebased_coordinates,
+            } if self.same_image(&rebased, &rebased_coordinates, &domain, &coordinates) => {
+                Region::Image {
+                    domain,
+                    coordinates,
+                }
+            }
+            other => other,
+        }
+    }
+    /// Whether two images enumerate the same coordinates, up to the names
+    /// of their domain symbols.
+    fn same_image(
+        &mut self,
+        domain: &[Bound],
+        coordinates: &[IntExpr],
+        other_domain: &[Bound],
+        other_coordinates: &[IntExpr],
+    ) -> bool {
+        if domain.len() != other_domain.len() || coordinates.len() != other_coordinates.len() {
+            return false;
+        }
+        let mut map = HashMap::new();
+        for (bound, other) in domain.iter().zip(other_domain) {
+            let start = self.substitute(bound.start, &map);
+            let end = self.substitute(bound.end, &map);
+            if !self.same(start, other.start) || !self.same(end, other.end) {
+                return false;
+            }
+            let renamed = self.arena().int_symbol(other.symbol);
+            map.insert(bound.symbol, renamed);
+        }
+        coordinates.iter().zip(other_coordinates).all(|(x, y)| {
+            let x = self.substitute(*x, &map);
+            self.same(x, *y)
+        })
+    }
+    fn rebased_image(
+        &mut self,
+        domain: Vec<Bound>,
+        coordinates: Vec<IntExpr>,
+        facts: &prove::Facts,
+    ) -> Region {
+        // Rebase every symbol to start at zero: `s in [a, b)` is `a + r` for
+        // a fresh `r in [0, b - a)`, so no symbol takes a new meaning. A
+        // width-one symbol is its start.
+        let mut substitutions = HashMap::new();
+        let mut dimensions = vec![];
+        for d in domain {
+            let start = self.substitute(d.start, &substitutions);
+            let end = self.substitute(d.end, &substitutions);
+            let width = self.arena().int_sub(end, start);
+            let width = prove::canonical(self.arena(), width);
+            if prove::constant(self.arena(), width) == Some(1) {
+                substitutions.insert(d.symbol, start);
+            } else {
+                let symbol = if prove::is_zero(self.arena_ref(), start) {
+                    d.symbol
+                } else {
+                    let (symbol, offset) = self.fresh_integer();
+                    let rebased = self.arena().int_add(start, offset);
+                    substitutions.insert(d.symbol, rebased);
+                    symbol
+                };
+                let zero = self.arena().int(0);
+                dimensions.push(Bound {
+                    symbol,
+                    start: zero,
+                    end: width,
+                });
+            }
+        }
+        let coordinates = coordinates
+            .into_iter()
+            .map(|c| {
+                let c = self.substitute(c, &substitutions);
+                prove::recompose_address(self.arena(), c)
+            })
+            .collect::<Vec<_>>();
+        let mentioned = coordinates
+            .iter()
+            .map(|c| {
+                (0..dimensions.len())
+                    .filter(|d| prove::mentions(self.arena_ref(), *c, dimensions[*d].symbol))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut owner = vec![None; dimensions.len()];
+        // A width that depends on another symbol makes the domain triangular,
+        // not a product.
+        let mut joint = dimensions.iter().any(|d| {
+            dimensions
+                .iter()
+                .any(|other| prove::mentions(self.arena_ref(), d.end, other.symbol))
+        });
+        for (axis, uses) in mentioned.iter().enumerate() {
+            for d in uses {
+                joint |= owner[*d].replace(axis).is_some();
+            }
+        }
+        // A symbol no coordinate mentions only matters when its range may be
+        // empty, which empties the whole image.
+        let mut kept = vec![];
+        for (d, bound) in dimensions.iter().enumerate() {
+            if owner[d].is_none() && !self.lt(facts, bound.start, bound.end) {
+                kept.push(bound.clone());
+            }
+        }
+        if joint {
+            kept.extend(
+                (0..dimensions.len())
+                    .filter(|d| owner[*d].is_some())
+                    .map(|d| dimensions[d].clone()),
+            );
+            return Region::Image {
+                domain: kept,
+                coordinates,
+            };
+        }
+        let mut axes = Vec::with_capacity(coordinates.len());
+        for (axis, coordinate) in coordinates.into_iter().enumerate() {
+            let own = mentioned[axis]
+                .iter()
+                .map(|d| dimensions[*d].clone())
+                .collect::<Vec<_>>();
+            if own.is_empty() {
+                axes.push(coordinate);
+                continue;
+            }
+            match self.dense_range(coordinate, &own, facts) {
+                Some((start, end)) => {
+                    // A coordinate that is its own symbol keeps it; any other
+                    // dense range is enumerated by a fresh symbol.
+                    let symbol = match self.arena_ref().view(AnyExpr::Int(coordinate)) {
+                        NodeView::Symbol(symbol) if own.len() == 1 && own[0].symbol == symbol => {
+                            symbol
+                        }
+                        _ => self.fresh_integer().0,
+                    };
+                    kept.push(Bound { symbol, start, end });
+                    axes.push(self.arena().int_symbol(symbol));
+                }
+                None => {
+                    kept.extend(own);
+                    axes.push(coordinate);
+                }
+            }
+        }
+        Region::Image {
+            domain: kept,
+            coordinates: axes,
+        }
+    }
+    /// `[start, end)` when `value` enumerates exactly that dense range as the
+    /// mixed-radix combination of `dimensions`, which it alone mentions.
+    /// `dimensions` is reordered from the least significant stride.
+    fn dense_range(
+        &mut self,
+        value: IntExpr,
+        dimensions: &[Bound],
+        facts: &prove::Facts,
+    ) -> Option<(IntExpr, IntExpr)> {
+        let mut terms = vec![];
+        let mut start_map = HashMap::new();
+        for d in dimensions {
+            let coefficient = prove::linear_coefficient(self.arena(), value, d.symbol)?;
+            if dimensions
+                .iter()
+                .any(|other| prove::mentions(self.arena_ref(), coefficient, other.symbol))
+                || prove::is_zero(self.arena(), coefficient)
+            {
+                return None;
+            }
+            terms.push((d.clone(), coefficient));
+            start_map.insert(d.symbol, d.start);
+        }
+        let start = self.substitute(value, &start_map);
+        let mut stride = self.arena().int(1);
+        while !terms.is_empty() {
+            let index = terms
+                .iter()
+                .position(|(_, coefficient)| self.same(*coefficient, stride))?;
+            let (d, _) = terms.remove(index);
+            let width = self.arena().int_sub(d.end, d.start);
+            if !prove::nonneg(self.arena(), facts, width) {
+                return None;
+            }
+            stride = self.arena().int_mul(stride, width);
+        }
+        let end = self.arena().int_add(start, stride);
+        Some((
+            prove::canonical(self.arena(), start),
+            prove::canonical(self.arena(), end),
+        ))
+    }
+    fn normalize_linear(
         &mut self,
         domain: Vec<Bound>,
         address: IntExpr,
@@ -245,46 +554,405 @@ pub(crate) trait RegionOps {
         }
         let address = self.substitute(address, &substitutions);
         let address = prove::recompose_address(self.arena(), address);
-        let mut terms = vec![];
-        let mut start_map = HashMap::new();
+        let mut used = vec![];
         for d in &dimensions {
-            let Some(coefficient) = prove::linear_coefficient(self.arena(), address, d.symbol)
-            else {
-                return Region::Image { domain, address };
-            };
-            if dimensions
-                .iter()
-                .any(|other| prove::mentions(self.arena_ref(), coefficient, other.symbol))
-            {
-                return Region::Image { domain, address };
+            if prove::mentions(self.arena_ref(), address, d.symbol) {
+                used.push(d.clone());
+            } else if !self.lt(facts, d.start, d.end) {
+                return Region::LinearImage { domain, address };
             }
-            if prove::is_zero(self.arena(), coefficient) {
-                if !self.lt(facts, d.start, d.end) {
-                    return Region::Image { domain, address };
+        }
+        match self.dense_range(address, &used, facts) {
+            Some((start, end)) => Region::Linear(start, end),
+            None => Region::LinearImage { domain, address },
+        }
+    }
+    /// The row-major address of root `coordinates` over the root `extents`.
+    fn linear_address(&mut self, coordinates: &[IntExpr], extents: &[IntExpr]) -> IntExpr {
+        assert_eq!(
+            coordinates.len(),
+            extents.len(),
+            "region coordinates match the root rank"
+        );
+        let mut address = self.arena().int(0);
+        for (coordinate, extent) in coordinates.iter().zip(extents) {
+            address = self.arena().int_mul(address, *extent);
+            address = self.arena().int_add(address, *coordinate);
+        }
+        address
+    }
+    /// The same elements in row-major form over the root `extents`.
+    fn linearize(&mut self, region: Region, extents: &[IntExpr], facts: &prove::Facts) -> Region {
+        match region {
+            Region::Image {
+                domain,
+                coordinates,
+            } => {
+                let address = self.linear_address(&coordinates, extents);
+                self.normalize_linear(domain, address, facts)
+            }
+            Region::Union(parts) => parts.into_iter().fold(Region::Empty, |a, b| {
+                let b = self.linearize(b, extents, facts);
+                a.union(b)
+            }),
+            Region::Intersection(parts) => parts.into_iter().fold(Region::Full, |a, b| {
+                let b = self.linearize(b, extents, facts);
+                a.intersection(b)
+            }),
+            Region::Bind(bound, inner) => {
+                let inner = self.linearize(*inner, extents, facts);
+                self.normalize(Region::Bind(bound, Box::new(inner)), facts)
+            }
+            Region::Guard(path, inner) => {
+                Region::Guard(path, Box::new(self.linearize(*inner, extents, facts)))
+            }
+            other => other,
+        }
+    }
+    /// Join union members that are boxes equal on every axis but one, where
+    /// their ranges meet or overlap: the box image of the joined range.
+    fn join_images(&mut self, parts: &mut Vec<Region>, facts: &prove::Facts) {
+        let mut ranges = parts
+            .iter()
+            .map(|part| match part {
+                Region::Image {
+                    domain,
+                    coordinates,
+                } => self.image_ranges(domain, coordinates, facts, true),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut i = 0;
+        while i < parts.len() {
+            let mut j = i + 1;
+            while j < parts.len() {
+                let joined = match (&ranges[i], &ranges[j]) {
+                    (Some(left), Some(right)) if left.len() == right.len() => {
+                        self.joined_axis(left, right, facts)
+                    }
+                    _ => None,
+                };
+                let Some((axis, start, end)) = joined else {
+                    j += 1;
+                    continue;
+                };
+                let Region::Image {
+                    mut domain,
+                    mut coordinates,
+                } = parts[i].clone()
+                else {
+                    unreachable!("only images have box ranges")
+                };
+                let bound = match self.arena_ref().view(AnyExpr::Int(coordinates[axis])) {
+                    NodeView::Symbol(symbol) => domain.iter().position(|d| d.symbol == symbol),
+                    _ => None,
+                };
+                match bound {
+                    Some(d) => {
+                        domain[d].start = start;
+                        domain[d].end = end;
+                    }
+                    None => {
+                        // The replaced coordinate enumerated its axis alone:
+                        // a domain symbol only it used goes with it, or an
+                        // empty range of that symbol would be assumed
+                        // nonempty wherever the domain becomes facts.
+                        let replaced = coordinates[axis];
+                        domain.retain(|d| {
+                            !prove::mentions(self.arena_ref(), replaced, d.symbol)
+                                || coordinates.iter().enumerate().any(|(other, c)| {
+                                    other != axis && prove::mentions(self.arena_ref(), *c, d.symbol)
+                                })
+                        });
+                        let (symbol, value) = self.fresh_integer();
+                        domain.push(Bound { symbol, start, end });
+                        coordinates[axis] = value;
+                    }
                 }
-            } else {
-                terms.push((d.clone(), coefficient));
+                let mut joined = ranges[i].take().expect("joined box has ranges");
+                joined[axis] = (start, end);
+                ranges[i] = Some(joined);
+                parts[i] = Region::Image {
+                    domain,
+                    coordinates,
+                };
+                parts.remove(j);
+                ranges.remove(j);
+                j = i + 1;
             }
-            start_map.insert(d.symbol, d.start);
+            i += 1;
         }
-        let start = self.substitute(address, &start_map);
-        let mut stride = self.arena().int(1);
-        while !terms.is_empty() {
-            let Some(index) = terms
-                .iter()
-                .position(|(_, coefficient)| self.same(*coefficient, stride))
-            else {
-                return Region::Image { domain, address };
+    }
+    /// The one axis on which two boxes differ, with their joined range, when
+    /// the two ranges on it meet or overlap.
+    fn joined_axis(
+        &mut self,
+        left: &[(IntExpr, IntExpr)],
+        right: &[(IntExpr, IntExpr)],
+        facts: &prove::Facts,
+    ) -> Option<(usize, IntExpr, IntExpr)> {
+        let differing = (0..left.len())
+            .filter(|k| !(self.same(left[*k].0, right[*k].0) && self.same(left[*k].1, right[*k].1)))
+            .collect::<Vec<_>>();
+        let [axis] = differing[..] else {
+            return None;
+        };
+        let ((a, b), (c, d)) = (left[axis], right[axis]);
+        if self.le(facts, a, c) && self.le(facts, c, b) && self.le(facts, b, d) {
+            return Some((axis, a, d));
+        }
+        if self.le(facts, c, a) && self.le(facts, a, d) && self.le(facts, d, b) {
+            return Some((axis, c, b));
+        }
+        None
+    }
+    /// Per-axis half-open ranges of an image that is the product of them.
+    /// An `available` image additionally needs every unmentioned domain
+    /// symbol to have a nonempty range, or it may hold no element at all.
+    fn image_ranges(
+        &mut self,
+        domain: &[Bound],
+        coordinates: &[IntExpr],
+        facts: &prove::Facts,
+        available: bool,
+    ) -> Option<Vec<(IntExpr, IntExpr)>> {
+        let dependent = domain.iter().any(|bound| {
+            domain.iter().any(|other| {
+                prove::mentions(self.arena_ref(), bound.start, other.symbol)
+                    || prove::mentions(self.arena_ref(), bound.end, other.symbol)
+            })
+        });
+        if dependent {
+            return None;
+        }
+        let mut owned = vec![false; domain.len()];
+        let mut ranges = vec![];
+        for coordinate in coordinates {
+            // A normalized image enumerates each axis range by one symbol.
+            if let NodeView::Symbol(symbol) = self.arena_ref().view(AnyExpr::Int(*coordinate)) {
+                if let Some(d) = domain.iter().position(|bound| bound.symbol == symbol) {
+                    if std::mem::replace(&mut owned[d], true) {
+                        return None;
+                    }
+                    ranges.push((domain[d].start, domain[d].end));
+                    continue;
+                }
+            }
+            let uses = (0..domain.len())
+                .filter(|d| prove::mentions(self.arena_ref(), *coordinate, domain[*d].symbol))
+                .collect::<Vec<_>>();
+            match uses.as_slice() {
+                [] => {
+                    let one = self.arena().int(1);
+                    let end = self.arena().int_add(*coordinate, one);
+                    ranges.push((*coordinate, end));
+                }
+                [d] if !std::mem::replace(&mut owned[*d], true) => {
+                    let bound = &domain[*d];
+                    let (symbol, start, end) = (bound.symbol, bound.start, bound.end);
+                    let coefficient = prove::linear_coefficient(self.arena(), *coordinate, symbol)?;
+                    if prove::constant(self.arena(), coefficient) != Some(1) {
+                        return None;
+                    }
+                    let zero = self.arena().int(0);
+                    let offset = self.substitute(*coordinate, &HashMap::from([(symbol, zero)]));
+                    let start = self.arena().int_add(start, offset);
+                    let end = self.arena().int_add(end, offset);
+                    ranges.push((start, end));
+                }
+                _ => return None,
+            }
+        }
+        if available
+            && (0..domain.len())
+                .filter(|d| !owned[*d])
+                .any(|d| !self.lt(facts, domain[d].start, domain[d].end))
+        {
+            return None;
+        }
+        Some(ranges)
+    }
+    /// Structural coverage of a required image, axis by axis.
+    fn covered_image(
+        &mut self,
+        available: &Region,
+        domain: &[Bound],
+        coordinates: &[IntExpr],
+        facts: &prove::Facts,
+    ) -> bool {
+        if let Region::Image {
+            domain: a,
+            coordinates: x,
+        } = available
+        {
+            if self.same_image(a, x, domain, coordinates) {
+                return true;
+            }
+        }
+        if let Some(required) = self.image_ranges(domain, coordinates, facts, false) {
+            return self.covered_ranges(available, &required, facts);
+        }
+        // Otherwise every element is the point at its coordinates, for every
+        // assignment of the domain.
+        let facts = self.domain_facts(facts, domain.iter());
+        let one = self.arena().int(1);
+        let points = coordinates
+            .iter()
+            .map(|c| (*c, self.arena().int_add(*c, one)))
+            .collect::<Vec<_>>();
+        self.covered_ranges(available, &points, &facts)
+    }
+    /// Whether the images of `available` contain the product of `required`
+    /// per-axis ranges: one box does, or boxes tile the required range along
+    /// one axis while containing it along every other axis.
+    fn covered_ranges(
+        &mut self,
+        available: &Region,
+        required: &[(IntExpr, IntExpr)],
+        facts: &prove::Facts,
+    ) -> bool {
+        let parts = match available {
+            Region::Union(parts) => parts.iter().collect::<Vec<_>>(),
+            other => vec![other],
+        };
+        let mut boxes = vec![];
+        for part in parts {
+            if let Region::Image {
+                domain,
+                coordinates,
+            } = part
+            {
+                if coordinates.len() == required.len() {
+                    if let Some(ranges) = self.image_ranges(domain, coordinates, facts, true) {
+                        boxes.push(ranges);
+                    }
+                }
+            }
+        }
+        if required.is_empty() {
+            // A rank-zero root has one element, held by any nonempty image.
+            return !boxes.is_empty();
+        }
+        let contains =
+            |owner: &mut Self, outer: &(IntExpr, IntExpr), inner: &(IntExpr, IntExpr)| {
+                owner.le(facts, outer.0, inner.0) && owner.le(facts, inner.1, outer.1)
             };
-            let (d, _) = terms.remove(index);
-            let width = self.arena().int_sub(d.end, d.start);
-            if !prove::nonneg(self.arena(), facts, width) {
-                return Region::Image { domain, address };
+        for axis in 0..required.len() {
+            let mut tiles = boxes
+                .iter()
+                .filter(|ranges| {
+                    (0..required.len())
+                        .filter(|other| *other != axis)
+                        .all(|other| contains(self, &ranges[other], &required[other]))
+                })
+                .map(|ranges| ranges[axis])
+                .collect::<Vec<_>>();
+            let (mut cursor, end) = required[axis];
+            loop {
+                if self.le(facts, end, cursor) {
+                    return true;
+                }
+                let Some(index) = tiles
+                    .iter()
+                    .position(|(a, b)| self.le(facts, *a, cursor) && self.lt(facts, cursor, *b))
+                else {
+                    break;
+                };
+                cursor = tiles.remove(index).1;
             }
-            stride = self.arena().int_mul(stride, width);
         }
-        let end = self.arena().int_add(start, stride);
-        Region::Interval(start, end)
+        false
+    }
+    fn covered_linear(
+        &mut self,
+        available: &Region,
+        required: &Region,
+        facts: &prove::Facts,
+    ) -> bool {
+        if matches!(available, Region::Full)
+            || matches!(required, Region::Empty)
+            || available == required
+        {
+            return true;
+        }
+        if let Region::Union(parts) = required {
+            return parts
+                .iter()
+                .all(|p| self.covered_linear(available, p, facts));
+        }
+        if let Region::Intersection(parts) = available {
+            return parts
+                .iter()
+                .all(|p| self.covered_linear(p, required, facts));
+        }
+        match (available, required) {
+            (Region::Linear(a, b), Region::Linear(c, d)) => {
+                self.le(facts, *a, *c) && self.le(facts, *d, *b)
+            }
+            (Region::Linear(a, b), Region::LinearImage { domain, address }) => {
+                let mut facts = facts.clone();
+                let one = self.arena().int(1);
+                for bound in domain {
+                    let upper = self.arena().int_sub(bound.end, one);
+                    facts.set_range(bound.symbol, bound.start, upper);
+                }
+                self.le(&facts, *a, *address) && self.lt(&facts, *address, *b)
+            }
+            (
+                Region::LinearImage {
+                    domain: a,
+                    address: x,
+                },
+                Region::LinearImage {
+                    domain: b,
+                    address: y,
+                },
+            ) if a.len() == b.len() => {
+                let mut map = HashMap::new();
+                for (a, b) in a.iter().zip(b) {
+                    map.insert(a.symbol, self.arena().int_symbol(b.symbol));
+                    if !self.same(a.start, b.start) || !self.same(a.end, b.end) {
+                        return false;
+                    }
+                }
+                let x = self.substitute(*x, &map);
+                self.same(x, *y)
+            }
+            (Region::Union(parts), _) => {
+                if parts
+                    .iter()
+                    .any(|part| self.covered_linear(part, required, facts))
+                {
+                    return true;
+                }
+                let Region::Linear(start, end) = required else {
+                    return false;
+                };
+                let mut cursor = *start;
+                let mut remaining = parts.iter().collect::<Vec<_>>();
+                loop {
+                    if self.le(facts, *end, cursor) {
+                        return true;
+                    }
+                    let Some(index) = remaining.iter().position(|part| match part {
+                        Region::Linear(a, b) => {
+                            self.le(facts, *a, cursor) && self.lt(facts, cursor, *b)
+                        }
+                        _ => false,
+                    }) else {
+                        return false;
+                    };
+                    let Region::Linear(_, next) = remaining.remove(index) else {
+                        unreachable!()
+                    };
+                    cursor = *next;
+                }
+            }
+            (_, Region::Intersection(parts)) => parts
+                .iter()
+                .any(|p| self.covered_linear(available, p, facts)),
+            _ => false,
+        }
     }
 
     fn condition_value(
@@ -332,19 +1000,6 @@ pub(crate) trait RegionOps {
                 }
             }
             _ => None,
-        }
-    }
-    fn assume_nonnegative(&mut self, facts: &mut prove::Facts, value: IntExpr) {
-        for symbol in prove::symbols(self.arena(), value) {
-            match prove::linear_in(self.arena(), value, symbol) {
-                Some((1, rest)) => {
-                    let zero = self.arena().int(0);
-                    let lower = self.arena().int_sub(zero, rest);
-                    facts.add_lower(symbol, lower);
-                }
-                Some((-1, rest)) => facts.add_upper(symbol, rest),
-                _ => {}
-            }
         }
     }
     fn assume(
@@ -399,9 +1054,9 @@ pub(crate) trait RegionOps {
                     // bound on one named dimension.
                     facts.assume_zero(self.arena(), difference);
                     facts.assume_zero(self.arena(), negative);
-                    self.assume_nonnegative(facts, negative);
+                    facts.assume_nonnegative(self.arena(), negative);
                 }
-                self.assume_nonnegative(facts, difference);
+                facts.assume_nonnegative(self.arena(), difference);
             }
             _ => {}
         }
@@ -453,12 +1108,15 @@ pub(crate) trait RegionOps {
             other => other,
         }
     }
+    /// Whether `available` contains `required`, both elements of one root
+    /// with `extents`, on every execution with `path` and `facts`.
     fn covered(
         &mut self,
         available: &Region,
         required: &Region,
         path: &Path,
         facts: &prove::Facts,
+        extents: &[IntExpr],
     ) -> bool {
         if let Some(condition) = self
             .unknown_guard(available, path, facts)
@@ -468,20 +1126,21 @@ pub(crate) trait RegionOps {
                 let mut path = path.clone();
                 let mut facts = facts.clone();
                 !self.assume(&mut path, &mut facts, condition.clone(), value)
-                    || self.covered(available, required, &path, &facts)
+                    || self.covered(available, required, &path, &facts, extents)
             });
         }
         let available = self.active_region(available.clone(), path, facts);
         let required = self.active_region(required.clone(), path, facts);
         let available = self.normalize(available, facts);
         let required = self.normalize(required, facts);
-        self.covered_plain(&available, &required, facts)
+        self.covered_plain(&available, &required, facts, extents)
     }
     fn covered_plain(
         &mut self,
         available: &Region,
         required: &Region,
         facts: &prove::Facts,
+        extents: &[IntExpr],
     ) -> bool {
         if matches!(available, Region::Full)
             || matches!(required, Region::Empty)
@@ -492,78 +1151,164 @@ pub(crate) trait RegionOps {
         if let Region::Union(parts) = required {
             return parts
                 .iter()
-                .all(|p| self.covered_plain(available, p, facts));
+                .all(|p| self.covered_plain(available, p, facts, extents));
         }
         if let Region::Intersection(parts) = available {
-            return parts.iter().all(|p| self.covered_plain(p, required, facts));
+            return parts
+                .iter()
+                .all(|p| self.covered_plain(p, required, facts, extents));
         }
-        match (available, required) {
-            (Region::Interval(a, b), Region::Interval(c, d)) => {
-                self.le(facts, *a, *c) && self.le(facts, *d, *b)
+        if let Region::Intersection(parts) = required {
+            if parts
+                .iter()
+                .any(|p| self.covered_plain(available, p, facts, extents))
+            {
+                return true;
             }
-            (Region::Interval(a, b), Region::Image { domain, address }) => {
-                let mut facts = facts.clone();
-                let one = self.arena().int(1);
-                for bound in domain {
-                    let upper = self.arena().int_sub(bound.end, one);
-                    facts.set_range(bound.symbol, bound.start, upper);
-                }
-                self.le(&facts, *a, *address) && self.lt(&facts, *address, *b)
+        }
+        if matches!(available, Region::Empty) {
+            return matches!(required, Region::Full)
+                && extents.iter().any(|extent| {
+                    let zero = self.arena().int(0);
+                    self.le(facts, *extent, zero)
+                });
+        }
+        let structural = match required {
+            // Coverage normalization: images spanning every root axis are
+            // the whole root.
+            Region::Full => {
+                let zero = self.arena().int(0);
+                let root = extents
+                    .iter()
+                    .map(|extent| (zero, *extent))
+                    .collect::<Vec<_>>();
+                self.covered_ranges(available, &root, facts)
             }
+            Region::Image {
+                domain,
+                coordinates,
+            } => self.covered_image(available, domain, coordinates, facts),
+            _ => false,
+        };
+        // Images of a root of rank at most one are already row-major.
+        if structural || extents.len() <= 1 && !row_major(available) && !row_major(required) {
+            return structural;
+        }
+        let available = self.linearize(available.clone(), extents, facts);
+        let available = self.normalize(available, facts);
+        let required = match required {
+            Region::Full => {
+                let zero = self.arena().int(0);
+                let elements = extents
+                    .iter()
+                    .fold(self.arena().int(1), |p, e| self.arena().int_mul(p, *e));
+                Region::Linear(zero, elements)
+            }
+            required => {
+                let required = self.linearize(required.clone(), extents, facts);
+                self.normalize(required, facts)
+            }
+        };
+        self.covered_linear(&available, &required, facts)
+    }
+    /// Whether no element of `left` is an element of `right`, both elements
+    /// of one root with `extents`. Images are separated when some axis has
+    /// separated coordinate intervals; any pair involving a row-major form
+    /// compares row-major intervals.
+    fn separated_regions(
+        &mut self,
+        left: Region,
+        right: Region,
+        facts: &prove::Facts,
+        extents: &[IntExpr],
+    ) -> bool {
+        let left = self.normalize(left, facts);
+        let right = self.normalize(right, facts);
+        match (left, right) {
+            (Region::Empty, _) | (_, Region::Empty) => true,
+            (Region::Union(parts), right) => parts
+                .into_iter()
+                .all(|part| self.separated_regions(part, right.clone(), facts, extents)),
+            (left, Region::Union(parts)) => parts
+                .into_iter()
+                .all(|part| self.separated_regions(left.clone(), part, facts, extents)),
+            (Region::Intersection(parts), right) => parts
+                .into_iter()
+                .any(|part| self.separated_regions(part, right.clone(), facts, extents)),
+            (left, Region::Intersection(parts)) => parts
+                .into_iter()
+                .any(|part| self.separated_regions(left.clone(), part, facts, extents)),
+            (Region::Guard(_, inner), right) => {
+                self.separated_regions(*inner, right, facts, extents)
+            }
+            (left, Region::Guard(_, inner)) => self.separated_regions(left, *inner, facts, extents),
+            (Region::Full, _) | (_, Region::Full) => false,
             (
                 Region::Image {
                     domain: a,
-                    address: x,
+                    coordinates: x,
                 },
                 Region::Image {
                     domain: b,
-                    address: y,
+                    coordinates: y,
                 },
-            ) if a.len() == b.len() => {
-                let mut map = HashMap::new();
-                for (a, b) in a.iter().zip(b) {
-                    map.insert(a.symbol, self.arena().int_symbol(b.symbol));
-                    if !self.same(a.start, b.start) || !self.same(a.end, b.end) {
-                        return false;
-                    }
-                }
-                let x = self.substitute(*x, &map);
-                self.same(x, *y)
+            ) if {
+                let facts = self.domain_facts(facts, a.iter().chain(b.iter()));
+                x.iter()
+                    .zip(y.iter())
+                    .any(|(x, y)| self.lt(&facts, *x, *y) || self.lt(&facts, *y, *x))
+            } =>
+            {
+                true
             }
-            (Region::Union(parts), _) => {
-                if parts
-                    .iter()
-                    .any(|part| self.covered_plain(part, required, facts))
-                {
-                    return true;
+            (left, right) => {
+                // Images of a root of rank at most one are already row-major.
+                if extents.len() <= 1 && !row_major(&left) && !row_major(&right) {
+                    return false;
                 }
-                let Region::Interval(start, end) = required else {
+                let left = self.linearize(left, extents, facts);
+                let right = self.linearize(right, extents, facts);
+                let (Some(left), Some(right)) = (self.linear_span(&left), self.linear_span(&right))
+                else {
                     return false;
                 };
-                let mut cursor = *start;
-                let mut remaining = parts.iter().collect::<Vec<_>>();
-                loop {
-                    if self.le(facts, *end, cursor) {
-                        return true;
-                    }
-                    let Some(index) = remaining.iter().position(|part| match part {
-                        Region::Interval(a, b) => {
-                            self.le(facts, *a, cursor) && self.lt(facts, cursor, *b)
-                        }
-                        _ => false,
-                    }) else {
-                        return false;
-                    };
-                    let Region::Interval(_, next) = remaining.remove(index) else {
-                        unreachable!()
-                    };
-                    cursor = *next;
-                }
+                let facts = self.domain_facts(facts, left.domain.iter().chain(right.domain));
+                self.le(&facts, left.end, right.start) || self.le(&facts, right.end, left.start)
             }
-            (_, Region::Intersection(parts)) => parts
-                .iter()
-                .any(|p| self.covered_plain(available, p, facts)),
-            _ => false,
+        }
+    }
+    /// `facts` with every symbol of `domain` bounded by its range.
+    fn domain_facts<'b>(
+        &mut self,
+        facts: &prove::Facts,
+        domain: impl Iterator<Item = &'b Bound>,
+    ) -> prove::Facts {
+        let mut facts = facts.clone();
+        let one = self.arena().int(1);
+        for bound in domain {
+            let upper = self.arena().int_sub(bound.end, one);
+            facts.set_range(bound.symbol, bound.start, upper);
+        }
+        facts
+    }
+    /// A row-major form as `(domain, [start, end))`.
+    fn linear_span<'r>(&mut self, region: &'r Region) -> Option<LinearSpan<'r>> {
+        match region {
+            Region::Linear(start, end) => Some(LinearSpan {
+                domain: &[],
+                start: *start,
+                end: *end,
+            }),
+            Region::LinearImage { domain, address } => {
+                let one = self.arena().int(1);
+                let end = self.arena().int_add(*address, one);
+                Some(LinearSpan {
+                    domain,
+                    start: *address,
+                    end,
+                })
+            }
+            _ => None,
         }
     }
     fn condition_mentions(&self, condition: &Condition, symbol: SymbolId) -> bool {
@@ -595,7 +1340,7 @@ pub(crate) trait RegionOps {
                     end: *end,
                 })
                 .collect(),
-            address: place.address,
+            coordinates: place.root.clone(),
         }
     }
     fn select_view(
@@ -626,7 +1371,12 @@ pub(crate) trait RegionOps {
         InitializationView {
             axes,
             coordinates,
-            address: self.substitute(place.address, &map),
+            root: place
+                .root
+                .iter()
+                .map(|value| self.substitute(*value, &map))
+                .collect(),
+            extents: place.extents.clone(),
         }
     }
     fn reshape_view(&mut self, place: &InitializationView, axes: &[IntExpr]) -> InitializationView {
@@ -638,14 +1388,19 @@ pub(crate) trait RegionOps {
             linear = self.arena().int_mul(linear, extent);
             linear = self.arena().int_add(linear, index);
         }
-        let address = self.view_address_at(place, linear);
         InitializationView {
             axes: axes.to_vec(),
             coordinates,
-            address,
+            root: self.view_coordinates_at(place, linear),
+            extents: place.extents.clone(),
         }
     }
-    fn view_address_at(&mut self, place: &InitializationView, mut linear: IntExpr) -> IntExpr {
+    /// Root coordinates of the view element at row-major view offset `linear`.
+    fn view_coordinates_at(
+        &mut self,
+        place: &InitializationView,
+        mut linear: IntExpr,
+    ) -> Vec<IntExpr> {
         let mut map = HashMap::new();
         for (axis, (&symbol, &extent)) in
             place.coordinates.iter().zip(&place.axes).enumerate().rev()
@@ -660,21 +1415,25 @@ pub(crate) trait RegionOps {
             map.insert(symbol, coordinate);
             linear = self.arena().int_div(linear, extent);
         }
-        self.substitute(place.address, &map)
+        place
+            .root
+            .iter()
+            .map(|value| self.substitute(*value, &map))
+            .collect()
     }
     fn root_view(&mut self, axes: &[IntExpr]) -> InitializationView {
         let mut coordinates = vec![];
-        let mut address = self.arena().int(0);
-        for &extent in axes {
+        let mut root = vec![];
+        for _ in axes {
             let (symbol, index) = self.fresh_integer();
             coordinates.push(symbol);
-            address = self.arena().int_mul(address, extent);
-            address = self.arena().int_add(address, index);
+            root.push(index);
         }
         InitializationView {
             axes: axes.to_vec(),
             coordinates,
-            address,
+            root,
+            extents: axes.to_vec(),
         }
     }
     fn boundary_condition(&self, condition: &Condition, allowed: &[SymbolId]) -> bool {
@@ -741,20 +1500,37 @@ pub(crate) trait RegionOps {
                 .iter()
                 .all(|s| allowed.contains(s))
         };
-        match region {
-            Region::Interval(a, b) if !known(self, a, allowed) || !known(self, b, allowed) => {
-                unknown
-            }
-            Region::Image { domain, address } => {
-                let mut scope = allowed.to_vec();
-                for bound in &domain {
-                    if !known(self, bound.start, &scope) || !known(self, bound.end, &scope) {
-                        return unknown;
-                    }
-                    scope.push(bound.symbol);
+        let domain_known = |owner: &Self, domain: &[Bound], scope: &mut Vec<SymbolId>| {
+            for bound in domain {
+                if !known(owner, bound.start, scope) || !known(owner, bound.end, scope) {
+                    return false;
                 }
-                if known(self, address, &scope) {
-                    Region::Image { domain, address }
+                scope.push(bound.symbol);
+            }
+            true
+        };
+        match region {
+            Region::Linear(a, b) if !known(self, a, allowed) || !known(self, b, allowed) => unknown,
+            Region::Image {
+                domain,
+                coordinates,
+            } => {
+                let mut scope = allowed.to_vec();
+                if domain_known(self, &domain, &mut scope)
+                    && coordinates.iter().all(|c| known(self, *c, &scope))
+                {
+                    Region::Image {
+                        domain,
+                        coordinates,
+                    }
+                } else {
+                    unknown
+                }
+            }
+            Region::LinearImage { domain, address } => {
+                let mut scope = allowed.to_vec();
+                if domain_known(self, &domain, &mut scope) && known(self, address, &scope) {
+                    Region::LinearImage { domain, address }
                 } else {
                     unknown
                 }
@@ -861,20 +1637,46 @@ pub(crate) trait RegionOps {
             accesses,
         }
     }
+    /// A region of the root a view denotes, in the root coordinates of that
+    /// view's own storage root.
     fn map_view_region(&mut self, region: Region, view: &InitializationView) -> Region {
         match region {
             Region::Empty => Region::Empty,
             Region::Full => self.view_region(view),
-            Region::Interval(start, end) => {
+            Region::Image {
+                domain,
+                coordinates,
+            } => {
+                assert_eq!(
+                    coordinates.len(),
+                    view.coordinates.len(),
+                    "region coordinates match the view rank"
+                );
+                let map = view
+                    .coordinates
+                    .iter()
+                    .copied()
+                    .zip(coordinates)
+                    .collect::<HashMap<_, _>>();
+                Region::Image {
+                    domain,
+                    coordinates: view
+                        .root
+                        .iter()
+                        .map(|value| self.substitute(*value, &map))
+                        .collect(),
+                }
+            }
+            Region::Linear(start, end) => {
                 let (symbol, index) = self.fresh_integer();
                 Region::Image {
                     domain: vec![Bound { symbol, start, end }],
-                    address: self.view_address_at(view, index),
+                    coordinates: self.view_coordinates_at(view, index),
                 }
             }
-            Region::Image { domain, address } => Region::Image {
+            Region::LinearImage { domain, address } => Region::Image {
                 domain,
-                address: self.view_address_at(view, address),
+                coordinates: self.view_coordinates_at(view, address),
             },
             Region::Union(parts) => Region::Union(
                 parts
@@ -898,14 +1700,15 @@ pub(crate) trait RegionOps {
     }
     fn shift_region(&mut self, region: Region, offset: IntExpr) -> Region {
         match region {
-            Region::Interval(a, b) => Region::Interval(
+            Region::Linear(a, b) => Region::Linear(
                 self.arena().int_sub(a, offset),
                 self.arena().int_sub(b, offset),
             ),
-            Region::Image { domain, address } => Region::Image {
+            Region::LinearImage { domain, address } => Region::LinearImage {
                 domain,
                 address: self.arena().int_sub(address, offset),
             },
+            Region::Image { .. } => unreachable!("only row-major regions are shifted"),
             Region::Union(parts) => Region::Union(
                 parts
                     .into_iter()
@@ -927,6 +1730,9 @@ pub(crate) trait RegionOps {
             other => other,
         }
     }
+    /// A root region seen through a view, in the view's own row-major
+    /// coordinates. Exact for a whole view and for a view that is one
+    /// contiguous row-major window of its root; otherwise nothing is known.
     fn project_view_region(
         &mut self,
         region: Region,
@@ -935,11 +1741,12 @@ pub(crate) trait RegionOps {
         facts: &prove::Facts,
     ) -> Region {
         let domain = self.view_region(view);
-        if self.covered(&region, &domain, path, facts) {
+        if self.covered(&region, &domain, path, facts, &view.extents) {
             return Region::Full;
         }
         let (symbol, linear) = self.fresh_integer();
-        let address = self.view_address_at(view, linear);
+        let coordinates = self.view_coordinates_at(view, linear);
+        let address = self.linear_address(&coordinates, &view.extents);
         let address = prove::recompose_address(self.arena(), address);
         let Some(coefficient) = prove::linear_coefficient(self.arena(), address, symbol) else {
             return Region::Empty;
@@ -949,12 +1756,88 @@ pub(crate) trait RegionOps {
         }
         let zero = self.arena().int(0);
         let offset = self.substitute(address, &HashMap::from([(symbol, zero)]));
+        let region = self.linearize(region, &view.extents, facts);
         self.shift_region(region, offset)
     }
     fn fresh_integer(&mut self) -> (SymbolId, IntExpr) {
-        let symbol = self.arena().loop_binder().1;
+        let symbol = self.fresh_variable();
         let value = self.arena().int_symbol(symbol);
         (symbol, value)
+    }
+}
+
+/// A row-major form: the addresses `[start, end)` for every assignment of
+/// `domain`.
+pub(crate) struct LinearSpan<'r> {
+    domain: &'r [Bound],
+    start: IntExpr,
+    end: IntExpr,
+}
+
+/// Whether a region mentions a row-major form.
+fn row_major(region: &Region) -> bool {
+    match region {
+        Region::Linear(..) | Region::LinearImage { .. } => true,
+        Region::Union(parts) | Region::Intersection(parts) => parts.iter().any(row_major),
+        Region::Bind(_, inner) | Region::Guard(_, inner) => row_major(inner),
+        Region::Empty | Region::Full | Region::Image { .. } => false,
+    }
+}
+
+/// Coverage normalization: `Guard(p ∧ c, R) ∪ Guard(p ∧ ¬c, R)` is
+/// `Guard(p, R)`, and a guarded copy of an unguarded member adds nothing.
+fn merge_complementary_guards(parts: &mut Vec<Region>) {
+    fn guard(region: &Region) -> (&[(Condition, bool)], &Region) {
+        match region {
+            Region::Guard(path, inner) => (path, inner),
+            other => (&[], other),
+        }
+    }
+    fn complement(left: &[(Condition, bool)], right: &[(Condition, bool)]) -> Option<Path> {
+        if left.len() != right.len() {
+            return None;
+        }
+        for (index, (condition, truth)) in left.iter().enumerate() {
+            let Some(opposite) = right.iter().position(|(c, t)| c == condition && t != truth)
+            else {
+                continue;
+            };
+            let mut rest = left.to_vec();
+            rest.remove(index);
+            let mut other = right.to_vec();
+            other.remove(opposite);
+            if rest.len() == other.len() && rest.iter().all(|entry| other.contains(entry)) {
+                return Some(rest);
+            }
+        }
+        None
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        'search: for i in 0..parts.len() {
+            for j in 0..parts.len() {
+                if i == j {
+                    continue;
+                }
+                let (left_path, left) = guard(&parts[i]);
+                let (right_path, right) = guard(&parts[j]);
+                if left != right {
+                    continue;
+                }
+                if left_path.is_empty() {
+                    parts.remove(j);
+                    changed = true;
+                    break 'search;
+                }
+                if let Some(path) = complement(left_path, right_path) {
+                    parts[i] = Region::guarded(path, left.clone());
+                    parts.remove(j);
+                    changed = true;
+                    break 'search;
+                }
+            }
+        }
     }
 }
 
@@ -975,7 +1858,9 @@ pub(crate) struct ParameterAccess {
     pub(crate) region: Region,
     pub(crate) path: Path,
     pub(crate) write: bool,
-    pub(crate) atomic: bool,
+    /// The combining operation of an atomic access. Only same-operation
+    /// atomic accesses commute (L12).
+    pub(crate) atomic: Option<AtomicOp>,
 }
 #[derive(Clone, Debug)]
 pub(crate) enum ParameterPart {
@@ -1055,11 +1940,15 @@ impl LoopInitialization {
 
 /// A checked logical view's coordinate map into its original storage root.
 /// Storage identity remains on the actual compiler binding.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct InitializationView {
     pub(crate) axes: Vec<IntExpr>,
     pub(crate) coordinates: Vec<SymbolId>,
-    pub(crate) address: IntExpr,
+    /// The root coordinates of the view element at `coordinates`, one per
+    /// root axis.
+    pub(crate) root: Vec<IntExpr>,
+    /// The axes of the storage root.
+    pub(crate) extents: Vec<IntExpr>,
 }
 /// Initialized logical coordinates of one actual storage root.
 #[derive(Clone, Debug)]
@@ -1119,6 +2008,9 @@ impl RegionOps for InitializationContext<'_> {
     }
     fn arena_ref(&self) -> &ExprArena {
         self.arena
+    }
+    fn fresh_variable(&mut self) -> SymbolId {
+        self.arena.loop_binder().1
     }
 }
 impl<'a> InitializationContext<'a> {
@@ -1192,7 +2084,13 @@ impl<'a> InitializationContext<'a> {
     }
     pub fn readable(&mut self, state: &InitializationState, view: &InitializationView) -> bool {
         let required = self.view_region(view);
-        self.covered(&state.0, &required, &self.path.clone(), &self.facts.clone())
+        self.covered(
+            &state.0,
+            &required,
+            &self.path.clone(),
+            &self.facts.clone(),
+            &view.extents,
+        )
     }
     pub fn project(
         &mut self,
@@ -1237,6 +2135,7 @@ impl<'a> InitializationContext<'a> {
         );
         InitializationState(self.normalize(before.0.clone().union(completed), &self.facts.clone()))
     }
+    /// The state after an `if` join (see [`Region::branch`]).
     pub fn branch(
         &mut self,
         condition: BoolExpr,
@@ -1244,16 +2143,11 @@ impl<'a> InitializationContext<'a> {
         then_state: &InitializationState,
         else_state: &InitializationState,
     ) -> InitializationState {
-        InitializationState(
-            Region::Guard(
-                vec![(Condition::Actual(condition, binders.to_vec()), true)],
-                Box::new(then_state.0.clone()),
-            )
-            .union(Region::Guard(
-                vec![(Condition::Actual(condition, binders.to_vec()), false)],
-                Box::new(else_state.0.clone()),
-            )),
-        )
+        InitializationState(Region::branch(
+            &Condition::Actual(condition, binders.to_vec()),
+            then_state.0.clone(),
+            else_state.0.clone(),
+        ))
     }
 }
 
@@ -1295,8 +2189,15 @@ pub(crate) trait RegionMapping {
         match region {
             Region::Empty => Region::Empty,
             Region::Full => Region::Full,
-            Region::Interval(a, b) => Region::Interval(self.integer(*a), self.integer(*b)),
-            Region::Image { domain, address } => Region::Image {
+            Region::Linear(a, b) => Region::Linear(self.integer(*a), self.integer(*b)),
+            Region::Image {
+                domain,
+                coordinates,
+            } => Region::Image {
+                domain: domain.iter().map(|b| self.bound(b)).collect(),
+                coordinates: coordinates.iter().map(|c| self.integer(*c)).collect(),
+            },
+            Region::LinearImage { domain, address } => Region::LinearImage {
                 domain: domain.iter().map(|b| self.bound(b)).collect(),
                 address: self.integer(*address),
             },
@@ -1389,7 +2290,7 @@ impl RegionMapping for EntryMapping<'_, '_, '_> {
             self.target.int_symbol(s)
         });
         match self.target.view(AnyExpr::Int(expression)) {
-            crate::expr::NodeView::Symbol(s) => s,
+            NodeView::Symbol(s) => s,
             _ => unreachable!("formal binder is a symbol"),
         }
     }
@@ -1513,7 +2414,13 @@ impl InitializationContext<'_> {
             };
             let region = self.map_view_region(required.region, view);
             let region = Region::Guard(required.path, Box::new(region));
-            if !self.covered(&state.0, &region, &self.path.clone(), &self.facts.clone()) {
+            if !self.covered(
+                &state.0,
+                &region,
+                &self.path.clone(),
+                &self.facts.clone(),
+                &view.extents,
+            ) {
                 return Err(InitializationFailure {
                     parameter,
                     phase: InitializationPhase::Input,
@@ -1613,12 +2520,15 @@ impl InitializationContext<'_> {
         let candidate = self.apply(candidate, arguments)?;
         let reference = self.apply(reference, arguments)?;
         for (parameter, (candidate, reference)) in candidate.iter().zip(&reference).enumerate() {
-            if let (Some(candidate), Some(reference)) = (candidate, reference) {
+            if let (Some(candidate), Some(reference), InitializationArgument::Tensor { view, .. }) =
+                (candidate, reference, &arguments[parameter])
+            {
                 if !self.covered(
                     &candidate.0,
                     &reference.0,
                     &self.path.clone(),
                     &self.facts.clone(),
+                    &view.extents,
                 ) {
                     return Err(InitializationFailure {
                         parameter,
@@ -1628,5 +2538,133 @@ impl InitializationContext<'_> {
             }
         }
         Ok(candidate)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expr::CmpOp;
+
+    fn size(region: &Region) -> usize {
+        match region {
+            Region::Union(parts) | Region::Intersection(parts) => {
+                1 + parts.iter().map(size).sum::<usize>()
+            }
+            Region::Bind(_, inner) | Region::Guard(_, inner) => 1 + size(inner),
+            _ => 1,
+        }
+    }
+
+    #[test]
+    fn sequential_joins_grow_linearly() {
+        let mut arena = ExprArena::new();
+        let sixteen = arena.int(16);
+        let (_, _, selector) = arena.loop_binder();
+        let conditions = (0..12)
+            .map(|k| {
+                let k = arena.int(k);
+                arena.int_cmp(CmpOp::Lt, k, selector)
+            })
+            .collect::<Vec<_>>();
+        let points = (0..12).map(|k| arena.int(k)).collect::<Vec<_>>();
+        let always = arena.bool(true);
+        let mut context = InitializationContext::new(&mut arena);
+        let root = context.root(&[sixteen]);
+        let first = context.slice(&root, &[(Some(points[0]), None, true)]);
+        let mut state = context.write(&InitializationState::empty(), &first);
+        for (condition, point) in conditions.into_iter().zip(points) {
+            let element = context.slice(&root, &[(Some(point), None, true)]);
+            let written = context.write(&state, &element);
+            state = context.branch(condition, &[], &written, &state);
+        }
+        let Region::Union(members) = &state.0 else {
+            panic!("joins keep a union: {:?}", state.0);
+        };
+        assert!(members.len() <= 13, "{} members", members.len());
+        assert!(size(&state.0) <= 3 * 13, "size {}", size(&state.0));
+        let same = context.branch(always, &[], &state, &state);
+        assert_eq!(size(&same.0), size(&state.0));
+    }
+
+    #[test]
+    fn joined_image_forgets_the_symbol_of_its_replaced_coordinate() {
+        // `s + 1` for `s in [lo, hi)` joined with the point `hi + 1`, where
+        // only `hi >= lo` is known, so `s`'s range may be empty. The joined
+        // box is `[lo + 1, hi + 2)`; `s` must not stay in its domain, or
+        // `lo <= s <= hi - 1` would become a fact about the free `s` below.
+        let mut arena = ExprArena::new();
+        let (_, _, lo) = arena.loop_binder();
+        let (_, _, hi) = arena.loop_binder();
+        let (_, s, s_value) = arena.loop_binder();
+        let mut facts = prove::Facts::new();
+        let width = arena.int_sub(hi, lo);
+        facts.assume_nonnegative(&mut arena, width);
+        let one = arena.int(1);
+        let two = arena.int(2);
+        let shifted = arena.int_add(s_value, one);
+        let last = arena.int_add(hi, one);
+        // A point that overlaps the joined box for `s = lo - 1`.
+        let other = arena.int_add(s_value, two);
+        let other = arena.int_add(other, width);
+        let extent = arena.int(64);
+        let mut context = InitializationContext::new(&mut arena);
+        let mut parts = vec![
+            Region::Image {
+                domain: vec![Bound {
+                    symbol: s,
+                    start: lo,
+                    end: hi,
+                }],
+                coordinates: vec![shifted],
+            },
+            Region::Image {
+                domain: vec![],
+                coordinates: vec![last],
+            },
+        ];
+        context.join_images(&mut parts, &facts);
+        let [Region::Image { domain, .. }] = parts.as_slice() else {
+            panic!("the two boxes join: {parts:?}");
+        };
+        assert!(domain.iter().all(|bound| bound.symbol != s), "{domain:?}");
+        let joined = parts.pop().unwrap();
+        let point = Region::Image {
+            domain: vec![],
+            coordinates: vec![other],
+        };
+        assert!(!context.separated_regions(joined, point, &facts, &[extent]));
+    }
+
+    #[test]
+    fn image_rebasing_names_fresh_symbols_and_is_idempotent() {
+        // `s + 1` over `s in [2, 9)` is the range `[3, 10)`. Its enumerating
+        // symbol is fresh: the binder `s`, still bounded by `[2, 8]` in the
+        // facts, never takes the meaning `s + 1`.
+        let mut arena = ExprArena::new();
+        let (_, s, s_value) = arena.loop_binder();
+        let (one, two, eight, nine) = (arena.int(1), arena.int(2), arena.int(8), arena.int(9));
+        let shifted = arena.int_add(s_value, one);
+        let mut facts = prove::Facts::new();
+        facts.set_range(s, two, eight);
+        let mut context = InitializationContext::new(&mut arena);
+        let image = Region::Image {
+            domain: vec![Bound {
+                symbol: s,
+                start: two,
+                end: nine,
+            }],
+            coordinates: vec![shifted],
+        };
+        let normalized = context.normalize(image, &facts);
+        let Region::Image { domain, .. } = &normalized else {
+            panic!("an image stays an image: {normalized:?}");
+        };
+        assert!(
+            domain.iter().all(|bound| bound.symbol != s),
+            "the binder is not reused with a rebased meaning: {domain:?}"
+        );
+        let again = context.normalize(normalized.clone(), &facts);
+        assert_eq!(again, normalized);
     }
 }

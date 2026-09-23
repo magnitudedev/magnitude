@@ -1,0 +1,7 @@
+# origin: C11:if_quantity_join
+# invoke: index:5 ; bool:false
+fn probe(i: index[100], c: bool) -> i32:
+    let mut k = i + 0
+    if c:
+        k = i * 2
+    return i32(k + 1)

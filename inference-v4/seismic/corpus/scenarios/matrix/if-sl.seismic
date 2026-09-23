@@ -1,0 +1,7 @@
+# cell: if/sl
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero
+fn probe[W](x: &tensor[4, W] f32, out: &mut tensor[4] f32, y: &mut tensor[4, W] f32) where W >= 8:
+    if x[0, 0] > 0.0:
+        out[0] = 1.0
+    else:
+        out[0] = 2.0

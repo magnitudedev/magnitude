@@ -157,14 +157,13 @@ pub struct NativeDecl {
     pub span: Span,
 }
 
-/// `fn name[shape](params) [-> result] [for target] [requires capability] [where pred]: body`
+/// `fn name[shape](params) [-> result] [requires capability] [where pred]: body`
 #[derive(Clone, Debug, PartialEq)]
 pub struct FnDecl {
     pub signature: Signature,
     pub name: Ident,
-    /// `None` is a portable function; `Some` restricts the function to that backend.
-    pub target: Option<Ident>,
-    /// Capability namespaces explicitly required by this backend-specific body.
+    /// Capability namespaces named by the declaration; a portable function
+    /// requires none, and the resolver rejects any.
     pub requires: Vec<CapabilityPath>,
     pub body: Block,
     pub span: Span,

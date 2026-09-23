@@ -1,0 +1,8 @@
+# cell: range-make/ordered
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero
+fn probe[W](x: &tensor[4, W] f32, out: &mut tensor[4] f32, y: &mut tensor[4, W] f32) where W >= 8:
+    for i in 0..4:
+        let mut s = 0.0
+        for j in 2..5:
+            s = s + x[i, j]
+        out[i] = s

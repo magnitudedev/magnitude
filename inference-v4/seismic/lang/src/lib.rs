@@ -28,6 +28,6 @@ pub mod types;
 
 pub mod interp;
 
-pub use span::{Diagnostic, Span};
+pub use span::Span;
 
 pub mod source;

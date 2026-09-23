@@ -1,14 +1,15 @@
 //! Declarations: signatures, `where` predicates, contract families, lowering attachment
 //! and explicit target coverage. One flat global namespace.
 
-use super::ir::{DefKind, Family, Ownership, Predicate};
+use super::ir::{DefKind, Ownership, Predicate, WhereConjunct};
+use crate::checked::DiagnosticRule;
 use crate::expr::{AnyExpr, ExprArena, IntExpr, SymbolId};
 use crate::ids::{CapabilityId, FamilyId, FunctionId, ProgramId};
 use crate::registry::{self, BackendName};
 use crate::span::{Diagnostic, Span};
 use crate::syntax::ast::{self, BinaryOp, ExprKind as A, ShapedHead, TypeKind};
 use crate::types::{DType, Elem, NonEmpty, TensorType, ValueType};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// A diagnostic attributed to a source file (index into the compiled file list).
 #[derive(Clone, Debug)]
@@ -25,31 +26,46 @@ pub(crate) struct SigParam {
     pub span: Span,
 }
 
+/// One shape parameter of a declared signature. The only owner of positivity.
+#[derive(Clone, Debug)]
+pub(crate) struct SignatureDimension {
+    pub name: String,
+    pub symbol: SymbolId,
+    /// `true` iff some `where` conjunct is `NonNegative(e)` with `prove::same(e, dim)`.
+    pub admits_zero: bool,
+}
+
 /// A declaration's checked interface. Shapes are symbolic extents over its own
 /// shape parameters.
 #[derive(Debug)]
 pub(crate) struct Sig {
     pub name: String,
-    pub shape_params: Vec<String>,
-    pub shape_symbols: Vec<SymbolId>,
+    pub dimensions: Vec<SignatureDimension>,
     pub elem_params: Vec<String>,
     pub params: Vec<SigParam>,
-    pub aliases: Vec<(usize, usize)>,
     pub result: ValueType,
-    pub predicates: Vec<Predicate>,
+    pub predicates: Vec<WhereConjunct>,
     pub arena: ExprArena,
 }
 
+/// A declaration's signature rebuilt in the arena of its checked body.
 #[derive(Debug)]
 pub(crate) struct BodySig {
     pub name: String,
-    pub shape_params: Vec<String>,
-    pub shape_symbols: Vec<SymbolId>,
+    pub dimensions: Vec<SignatureDimension>,
     pub elem_params: Vec<String>,
     pub params: Vec<SigParam>,
-    pub aliases: Vec<(usize, usize)>,
     pub result: ValueType,
-    pub predicates: Vec<Predicate>,
+    pub predicates: Vec<WhereConjunct>,
+}
+
+impl BodySig {
+    /// The ordinal of a dimension symbol of this signature.
+    pub(crate) fn dimension_of(&self, symbol: SymbolId) -> Option<usize> {
+        self.dimensions
+            .iter()
+            .position(|dimension| dimension.symbol == symbol)
+    }
 }
 
 impl Sig {
@@ -59,7 +75,7 @@ impl Sig {
     pub(crate) fn for_body(&self) -> (BodySig, ExprArena) {
         let mut arena = ExprArena::new();
         let shape_symbols: Vec<_> = self
-            .shape_symbols
+            .dimensions
             .iter()
             .enumerate()
             .map(|(ordinal, _)| {
@@ -73,9 +89,9 @@ impl Sig {
             .collect();
         let mut map = |symbol: SymbolId, destination: &mut ExprArena| {
             let ordinal = self
-                .shape_symbols
+                .dimensions
                 .iter()
-                .position(|candidate| *candidate == symbol)
+                .position(|dimension| dimension.symbol == symbol)
                 .unwrap_or_else(|| panic!("signature expression mentions a non-dimension symbol"));
             AnyExpr::Int(destination.int_symbol(shape_symbols[ordinal]))
         };
@@ -90,35 +106,37 @@ impl Sig {
             })
             .collect();
         let result = transfer_type(&self.arena, &self.result, &mut arena, &mut map);
-        let predicates =
-            self.predicates
-                .iter()
-                .map(|predicate| match *predicate {
-                    Predicate::NonNegative(value) => Predicate::NonNegative(
-                        super::xfer::transfer_int(&self.arena, value, &mut arena, &mut map),
-                    ),
-                    Predicate::Zero(value) => Predicate::Zero(super::xfer::transfer_int(
-                        &self.arena,
-                        value,
-                        &mut arena,
-                        &mut map,
-                    )),
-                    Predicate::NonZero(value) => Predicate::NonZero(super::xfer::transfer_int(
-                        &self.arena,
-                        value,
-                        &mut arena,
-                        &mut map,
-                    )),
-                })
-                .collect();
+        let predicates = self
+            .predicates
+            .iter()
+            .map(|conjunct| {
+                let mut transfer =
+                    |value| super::xfer::transfer_int(&self.arena, value, &mut arena, &mut map);
+                WhereConjunct {
+                    predicate: match conjunct.predicate {
+                        Predicate::NonNegative(value) => Predicate::NonNegative(transfer(value)),
+                        Predicate::Zero(value) => Predicate::Zero(transfer(value)),
+                        Predicate::NonZero(value) => Predicate::NonZero(transfer(value)),
+                    },
+                    span: conjunct.span,
+                }
+            })
+            .collect();
         (
             BodySig {
                 name: self.name.clone(),
-                shape_params: self.shape_params.clone(),
-                shape_symbols,
+                dimensions: self
+                    .dimensions
+                    .iter()
+                    .zip(&shape_symbols)
+                    .map(|(dimension, symbol)| SignatureDimension {
+                        name: dimension.name.clone(),
+                        symbol: *symbol,
+                        admits_zero: dimension.admits_zero,
+                    })
+                    .collect(),
                 elem_params: self.elem_params.clone(),
                 params,
-                aliases: self.aliases.clone(),
                 result,
                 predicates,
             },
@@ -189,14 +207,16 @@ fn requirements(
     let mut diagnostics = Vec::new();
     for path in paths {
         let Some(backend) = BackendName::parse(&path.backend.name) else {
-            diagnostics.push(Diagnostic::new(
+            diagnostics.push(Diagnostic::with_rule(
+                DiagnosticRule::Resolution,
                 path.backend.span,
                 format!("`{}` is not a known target", path.backend.name),
             ));
             continue;
         };
         let Some(id) = registry::capability(backend, &path.capability.name) else {
-            diagnostics.push(Diagnostic::new(
+            diagnostics.push(Diagnostic::with_rule(
+                DiagnosticRule::Resolution,
                 path.span,
                 format!(
                     "`{}.{}` is not a known capability namespace",
@@ -206,14 +226,16 @@ fn requirements(
             continue;
         };
         match target {
-            None => diagnostics.push(Diagnostic::new(
+            None => diagnostics.push(Diagnostic::with_rule(
+DiagnosticRule::Capability,
                 path.span,
                 format!(
                     "portable functions cannot require backend capability `{}`",
                     format!("{}.{}", path.backend.name, path.capability.name)
                 ),
             )),
-            Some(backend) if backend != path.backend.name => diagnostics.push(Diagnostic::new(
+            Some(backend) if backend != path.backend.name => diagnostics.push(Diagnostic::with_rule(
+DiagnosticRule::Capability,
                 path.span,
                 format!(
                     "capability `{}` belongs to backend `{}`, but this declaration is for `{backend}`",
@@ -221,7 +243,7 @@ fn requirements(
                 ),
             )),
             Some(_) if out.iter().any(|(existing, _)| existing == &id) => diagnostics.push(
-                Diagnostic::new(path.span, format!("capability `{}.{}` is required more than once", path.backend.name, path.capability.name)),
+                Diagnostic::with_rule(DiagnosticRule::Capability, path.span, format!("capability `{}.{}` is required more than once", path.backend.name, path.capability.name)),
             ),
             Some(_) => out.push((id, path.span)),
         }
@@ -233,11 +255,223 @@ fn requirements(
     }
 }
 
+/// The members of one contract family, as resolution attaches them.
+#[derive(Clone, Debug)]
+pub(crate) struct DeclaredFamily {
+    pub name: String,
+    /// The first declared portable body: the family's meaning (L2).
+    pub contract: FunctionId,
+    pub bodies: Vec<FunctionId>,
+    pub lowerings: Vec<FunctionId>,
+}
+
 pub(crate) struct Resolved<'a> {
     pub declared: Vec<Declared<'a>>,
-    pub families: Vec<Family>,
+    pub families: Vec<DeclaredFamily>,
     /// Function name -> indices into `families`.
     pub by_name: HashMap<String, Vec<usize>>,
+    pub call_graph: NameCallGraph,
+}
+
+/// Names a call dispatches to a builtin meaning before any user family is
+/// looked up, plus the quantity type names `index` and `range` (L31). A
+/// definition cannot take one, so no call silently reaches a builtin instead of
+/// the definition. The one list: `check/call.rs` dispatches exactly these.
+pub(crate) fn is_builtin_name(name: &str) -> bool {
+    DType::from_name(name).is_some()
+        || crate::intrinsics::MathOp::parse(name).is_some()
+        || matches!(
+            name,
+            "to_owned"
+                | "zeros_like"
+                | "ones_like"
+                | "select"
+                | "reduce"
+                | "reshape"
+                | "extent"
+                | "atomic"
+                | "repack"
+                | "index"
+                | "range"
+        )
+}
+
+/// The name-level call graph: every definition bearing a called name is a
+/// callee of the caller. Recursion is rejected on this graph.
+pub(crate) struct NameCallGraph {
+    /// Definition -> definitions it may call.
+    callees: Vec<BTreeSet<usize>>,
+}
+
+/// Definitions forming a call cycle, in call order.
+pub(crate) struct RecursionCycle {
+    definitions: Vec<usize>,
+}
+
+impl NameCallGraph {
+    fn new(
+        declared: &[Declared<'_>],
+        families: &[DeclaredFamily],
+        by_name: &HashMap<String, Vec<usize>>,
+    ) -> Self {
+        let callees = declared
+            .iter()
+            .map(|definition| {
+                let mut names = BTreeSet::new();
+                called_names(definition.body, &mut names);
+                names
+                    .iter()
+                    .filter_map(|name| by_name.get(name))
+                    .flatten()
+                    .flat_map(|&family| {
+                        families[family]
+                            .bodies
+                            .iter()
+                            .chain(&families[family].lowerings)
+                            .map(|member| member.index())
+                    })
+                    .collect()
+            })
+            .collect();
+        Self { callees }
+    }
+
+    /// Every definition after all of its callees.
+    pub(crate) fn bottom_up_order(&self) -> Result<Vec<usize>, RecursionCycle> {
+        fn visit(
+            graph: &NameCallGraph,
+            definition: usize,
+            state: &mut [u8],
+            stack: &mut Vec<usize>,
+            order: &mut Vec<usize>,
+        ) -> Result<(), RecursionCycle> {
+            match state[definition] {
+                2 => return Ok(()),
+                1 => {
+                    let start = stack
+                        .iter()
+                        .position(|&member| member == definition)
+                        .expect("a definition on the visit stack is in progress");
+                    return Err(RecursionCycle {
+                        definitions: stack[start..].to_vec(),
+                    });
+                }
+                _ => {}
+            }
+            state[definition] = 1;
+            stack.push(definition);
+            for &callee in &graph.callees[definition] {
+                visit(graph, callee, state, stack, order)?;
+            }
+            stack.pop();
+            state[definition] = 2;
+            order.push(definition);
+            Ok(())
+        }
+        let mut state = vec![0u8; self.callees.len()];
+        let mut stack = Vec::new();
+        let mut order = Vec::with_capacity(self.callees.len());
+        for definition in 0..self.callees.len() {
+            visit(self, definition, &mut state, &mut stack, &mut order)?;
+        }
+        Ok(order)
+    }
+}
+
+impl RecursionCycle {
+    pub(crate) fn diagnostic(&self, declared: &[Declared<'_>]) -> Located {
+        let first = &declared[self.definitions[0]];
+        let chain = self
+            .definitions
+            .iter()
+            .chain(&self.definitions[..1])
+            .map(|&definition| format!("`{}`", declared[definition].sig.name))
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        Located {
+            file: first.file,
+            diagnostic: Diagnostic::with_rule(
+                DiagnosticRule::Recursion,
+                first.name_span,
+                format!("recursive call chain {chain}: recursion is rejected"),
+            ),
+        }
+    }
+}
+
+/// Names called by a body, including calls nested in arguments and shape bindings.
+fn called_names(block: &ast::Block, out: &mut BTreeSet<String>) {
+    fn index(index: &ast::Index, out: &mut BTreeSet<String>) {
+        match index {
+            ast::Index::Expr(expression) => expr(expression, out),
+            ast::Index::Slice { start, end } => {
+                start.iter().chain(end).for_each(|bound| expr(bound, out));
+            }
+        }
+    }
+
+    fn expr(expression: &ast::Expr, out: &mut BTreeSet<String>) {
+        match &expression.kind {
+            ast::ExprKind::Call {
+                callee,
+                bindings,
+                args,
+            } => {
+                match &callee.kind {
+                    ast::ExprKind::Name(name) => {
+                        out.insert(name.name.clone());
+                    }
+                    _ => expr(callee, out),
+                }
+                bindings.iter().for_each(|(_, value)| expr(value, out));
+                args.iter().for_each(|argument| expr(&argument.value, out));
+            }
+            ast::ExprKind::Tuple(items) => items.iter().for_each(|item| expr(item, out)),
+            ast::ExprKind::Range { lo, hi } => {
+                expr(lo, out);
+                expr(hi, out);
+            }
+            ast::ExprKind::Tensor { shape, .. } => shape.iter().for_each(|axis| expr(axis, out)),
+            ast::ExprKind::Index { base, indices } => {
+                expr(base, out);
+                indices.iter().for_each(|item| index(item, out));
+            }
+            ast::ExprKind::Attr { base, .. } => expr(base, out),
+            ast::ExprKind::Unary { expr: operand, .. } => expr(operand, out),
+            ast::ExprKind::Binary { lhs, rhs, .. } => {
+                expr(lhs, out);
+                expr(rhs, out);
+            }
+            ast::ExprKind::Int(_)
+            | ast::ExprKind::Float(_)
+            | ast::ExprKind::Inf
+            | ast::ExprKind::Bool(_)
+            | ast::ExprKind::Name(_) => {}
+        }
+    }
+
+    for statement in &block.stmts {
+        match &statement.kind {
+            ast::StmtKind::Let { value, .. } => expr(value, out),
+            ast::StmtKind::Assign { target, value, .. } => {
+                expr(target, out);
+                expr(value, out);
+            }
+            ast::StmtKind::For { iter, body, .. } => {
+                expr(iter, out);
+                called_names(body, out);
+            }
+            ast::StmtKind::If { cond, then, els } => {
+                expr(cond, out);
+                called_names(then, out);
+                if let Some(els) = els {
+                    called_names(els, out);
+                }
+            }
+            ast::StmtKind::Return(values) => values.iter().for_each(|value| expr(value, out)),
+            ast::StmtKind::Expr(expression) => expr(expression, out),
+        }
+    }
 }
 
 /// A shape expression: integers, shape parameters, and `+ - * / %` over them.
@@ -251,7 +485,8 @@ pub(crate) fn shape_expr(
         A::Int(v) => i64::try_from(*v)
             .map(|value| arena.int(value))
             .map_err(|_| {
-                Diagnostic::new(
+                Diagnostic::with_rule(
+                    DiagnosticRule::Type,
                     e.span,
                     "shape constant does not fit a signed 64-bit integer",
                 )
@@ -263,7 +498,8 @@ pub(crate) fn shape_expr(
                 .expect("shape parameter lookup disagrees with contains");
             Ok(arena.int_symbol(shape_symbols[ordinal]))
         }
-        A::Name(n) => Err(Diagnostic::new(
+        A::Name(n) => Err(Diagnostic::with_rule(
+            DiagnosticRule::Resolution,
             n.span,
             format!("`{}` is not a declared shape parameter", n.name),
         )),
@@ -276,7 +512,11 @@ pub(crate) fn shape_expr(
                 BinaryOp::Mul => Ok(arena.int_mul(l, r)),
                 BinaryOp::Div | BinaryOp::Rem => {
                     if super::prove::constant(arena, r).is_some_and(|c| c <= 0) {
-                        return Err(Diagnostic::new(rhs.span, "shape divisor must be positive"));
+                        return Err(Diagnostic::with_rule(
+                            DiagnosticRule::Dimension,
+                            rhs.span,
+                            "shape divisor must be positive",
+                        ));
                     }
                     Ok(if *op == BinaryOp::Div {
                         arena.int_div(l, r)
@@ -284,13 +524,15 @@ pub(crate) fn shape_expr(
                         arena.int_rem(l, r)
                     })
                 }
-                _ => Err(Diagnostic::new(
+                _ => Err(Diagnostic::with_rule(
+                    DiagnosticRule::Type,
                     e.span,
                     "only + - * / % are allowed in shapes",
                 )),
             };
         }
-        _ => Err(Diagnostic::new(
+        _ => Err(Diagnostic::with_rule(
+            DiagnosticRule::Type,
             e.span,
             "a shape is an integer expression over shape parameters",
         )),
@@ -319,7 +561,8 @@ pub(crate) fn elem_of(
         }
         return Ok(Elem::Param(name.name.clone()));
     }
-    Err(Diagnostic::new(
+    Err(Diagnostic::with_rule(
+        DiagnosticRule::Resolution,
         name.span,
         format!(
             "`{}` is not a dtype, a representation, or an element parameter",
@@ -344,7 +587,8 @@ fn type_from_ast(
                 .next()
                 .is_some_and(|c| c.is_ascii_uppercase()) =>
             {
-                Err(Diagnostic::new(
+                Err(Diagnostic::with_rule(
+DiagnosticRule::Type,
                     name.span,
                     format!(
                         "element parameter `{}` cannot be a scalar type: scalar values have a concrete dtype",
@@ -352,7 +596,8 @@ fn type_from_ast(
                     ),
                 ))
             }
-            None => Err(Diagnostic::new(
+            None => Err(Diagnostic::with_rule(
+DiagnosticRule::Resolution,
                 name.span,
                 format!("unknown type `{}`", name.name),
             )),
@@ -365,7 +610,7 @@ fn type_from_ast(
         }),
         TypeKind::Shaped { head, shape, elem } => {
             if shape.is_empty() {
-                return Err(Diagnostic::new(t.span, "a tensor type needs a shape"));
+                return Err(Diagnostic::with_rule(DiagnosticRule::Type, t.span, "a tensor type needs a shape"));
             }
             let mut axes = Vec::new();
             for e in shape {
@@ -380,7 +625,8 @@ fn type_from_ast(
             for item in items.iter() {
                 let ty = type_from_ast(item, shape_params, shape_symbols, arena, elem_params)?;
                 if ty.is_void() {
-                    return Err(Diagnostic::new(
+                    return Err(Diagnostic::with_rule(
+DiagnosticRule::Type,
                         item.span,
                         "`void` is not a tuple component",
                     ));
@@ -403,7 +649,7 @@ fn predicates_of(
     shape_params: &[String],
     shape_symbols: &[SymbolId],
     arena: &mut ExprArena,
-    out: &mut Vec<Predicate>,
+    out: &mut Vec<WhereConjunct>,
 ) -> Result<(), Diagnostic> {
     match &e.kind {
         A::Binary {
@@ -418,24 +664,23 @@ fn predicates_of(
             let l = shape_expr(lhs, shape_params, shape_symbols, arena)?;
             let r = shape_expr(rhs, shape_params, shape_symbols, arena)?;
             let one = arena.int(1);
-            out.push(match op {
+            let predicate = match op {
                 BinaryOp::Ge => Predicate::NonNegative(arena.int_sub(l, r)),
                 BinaryOp::Gt => { let d = arena.int_sub(l, r); Predicate::NonNegative(arena.int_sub(d, one)) },
                 BinaryOp::Le => Predicate::NonNegative(arena.int_sub(r, l)),
                 BinaryOp::Lt => { let d = arena.int_sub(r, l); Predicate::NonNegative(arena.int_sub(d, one)) },
                 BinaryOp::Eq => Predicate::Zero(arena.int_sub(l, r)),
                 BinaryOp::Ne => Predicate::NonZero(arena.int_sub(l, r)),
-                _ => return Err(Diagnostic::new(e.span, "a `where` predicate is a conjunction of comparisons, divisibility and equalities over shape parameters")),
+                _ => return Err(Diagnostic::with_rule(DiagnosticRule::Type, e.span, "a `where` predicate is a conjunction of comparisons, divisibility and equalities over shape parameters")),
+            };
+            out.push(WhereConjunct {
+                predicate,
+                span: e.span,
             });
             Ok(())
         }
-        A::Call { callee, .. } if matches!(&callee.kind, A::Name(n) if n.name == "full") => {
-            Err(Diagnostic::new(
-                e.span,
-                "`full(X)` was removed with structural slices; shapes are semantic extents only",
-            ))
-        }
-        _ => Err(Diagnostic::new(
+        _ => Err(Diagnostic::with_rule(
+DiagnosticRule::Type,
             e.span,
             "a `where` predicate is a conjunction of comparisons, divisibility and equalities over shape parameters",
         )),
@@ -452,7 +697,8 @@ pub(crate) fn signature_of(
     let mut shape_params: Vec<String> = Vec::new();
     for p in &s.shape {
         if shape_params.contains(&p.name) {
-            return Err(Diagnostic::new(
+            return Err(Diagnostic::with_rule(
+                DiagnosticRule::Resolution,
                 p.span,
                 format!("duplicate shape parameter `{}`", p.name),
             ));
@@ -473,7 +719,8 @@ pub(crate) fn signature_of(
     let mut params: Vec<SigParam> = Vec::new();
     for p in &s.params {
         if params.iter().any(|q| q.name == p.name.name) || shape_params.contains(&p.name.name) {
-            return Err(Diagnostic::new(
+            return Err(Diagnostic::with_rule(
+                DiagnosticRule::Resolution,
                 p.name.span,
                 format!("duplicate parameter `{}`", p.name.name),
             ));
@@ -487,7 +734,11 @@ pub(crate) fn signature_of(
         )?;
         reject_rank_zero_packed(&ty, p.ty.span)?;
         if ty.is_void() {
-            return Err(Diagnostic::new(p.ty.span, "a parameter cannot be `void`"));
+            return Err(Diagnostic::with_rule(
+                DiagnosticRule::Type,
+                p.ty.span,
+                "a parameter cannot be `void`",
+            ));
         }
         fn ownership(ty: &ast::TypeExpr) -> Ownership {
             match &ty.kind {
@@ -514,7 +765,8 @@ pub(crate) fn signature_of(
                     if crate::registry::representation_info(*representation).access
                         != crate::registry::RepresentationAccess::ReadWrite
                     {
-                        return Err(Diagnostic::new(
+                        return Err(Diagnostic::with_rule(
+DiagnosticRule::Type,
                             p.ty.span,
                             format!(
                                 "representation `{}` is decode-only and cannot be a mutable tensor parameter",
@@ -532,7 +784,6 @@ pub(crate) fn signature_of(
             span: p.name.span,
         });
     }
-    let aliases = Vec::new();
     fn borrowed_result(ty: &ast::TypeExpr) -> bool {
         match &ty.kind {
             TypeKind::Shaped {
@@ -545,7 +796,8 @@ pub(crate) fn signature_of(
     }
     let result = match &s.result {
         Some(t) if borrowed_result(t) => {
-            return Err(Diagnostic::new(
+            return Err(Diagnostic::with_rule(
+                DiagnosticRule::Ownership,
                 t.span,
                 "borrowed tensors cannot be returned; return an owned `tensor`",
             ));
@@ -574,13 +826,26 @@ pub(crate) fn signature_of(
             &mut predicates,
         )?;
     }
+    let dimensions = shape_params
+        .iter()
+        .zip(&shape_symbols)
+        .map(|(name, &symbol)| {
+            let value = arena.int_symbol(symbol);
+            let admits_zero = predicates.iter().any(|conjunct: &WhereConjunct| {
+                matches!(conjunct.predicate, Predicate::NonNegative(expression) if super::prove::same(&arena, expression, value))
+            });
+            SignatureDimension {
+                name: name.clone(),
+                symbol,
+                admits_zero,
+            }
+        })
+        .collect();
     Ok(Sig {
         name: name.to_string(),
-        shape_params,
-        shape_symbols,
+        dimensions,
         elem_params,
         params,
-        aliases,
         result,
         predicates,
         arena,
@@ -703,7 +968,8 @@ fn reject_rank_zero_packed(ty: &ValueType, span: Span) -> Result<(), Diagnostic>
         ValueType::Tensor(tensor)
             if tensor.axes.is_empty() && matches!(tensor.elem, Elem::Repr(_)) =>
         {
-            Err(Diagnostic::new(
+            Err(Diagnostic::with_rule(
+DiagnosticRule::Type,
                 span,
                 "a packed tensor must have at least one axis because packets run along the last axis",
             ))
@@ -785,19 +1051,18 @@ fn contract_mismatch(a: &Sig, b: &Sig) -> Option<String> {
             q.name, p.name, a.name
         ));
     }
-    let normalize_aliases = |aliases: &[(usize, usize)]| {
-        let mut normalized: Vec<_> = aliases.iter().map(|&(l, r)| (l.min(r), l.max(r))).collect();
-        normalized.sort_unstable();
-        normalized.dedup();
-        normalized
-    };
-    if normalize_aliases(&a.aliases) != normalize_aliases(&b.aliases) {
+    if let Some((p, q)) = a
+        .params
+        .iter()
+        .zip(&b.params)
+        .find(|(p, q)| p.name != q.name)
+    {
         return Some(format!(
-            "overlapping definitions of `{}` must declare identical `alias` permissions",
-            a.name
+            "parameter names differ from the contract of `{}`: `{}` here, `{}` in the contract",
+            a.name, q.name, p.name
         ));
     }
-    if a.shape_params.len() != b.shape_params.len() {
+    if a.dimensions.len() != b.dimensions.len() {
         return Some(format!(
             "overlapping definitions of `{}` must declare the same number of shape parameters",
             a.name
@@ -806,7 +1071,7 @@ fn contract_mismatch(a: &Sig, b: &Sig) -> Option<String> {
 
     let mut common = ExprArena::new();
     let common_symbols: Vec<_> = a
-        .shape_params
+        .dimensions
         .iter()
         .enumerate()
         .map(|(ordinal, _)| {
@@ -819,17 +1084,17 @@ fn contract_mismatch(a: &Sig, b: &Sig) -> Option<String> {
         .collect();
     let mut map_a = |symbol: SymbolId, arena: &mut ExprArena| {
         let ordinal = a
-            .shape_symbols
+            .dimensions
             .iter()
-            .position(|candidate| *candidate == symbol)
+            .position(|dimension| dimension.symbol == symbol)
             .unwrap_or_else(|| panic!("signature expression mentions a non-dimension symbol"));
         AnyExpr::Int(arena.int_symbol(common_symbols[ordinal]))
     };
     let mut map_b = |symbol: SymbolId, arena: &mut ExprArena| {
         let ordinal = b
-            .shape_symbols
+            .dimensions
             .iter()
-            .position(|candidate| *candidate == symbol)
+            .position(|dimension| dimension.symbol == symbol)
             .unwrap_or_else(|| panic!("signature expression mentions a non-dimension symbol"));
         AnyExpr::Int(arena.int_symbol(common_symbols[ordinal]))
     };
@@ -965,24 +1230,23 @@ pub(crate) fn resolve<'a>(
     for (file, parsed) in files {
         for decl in &parsed.decls {
             let ast::Decl::Fn(f) = decl else { continue };
-            if let Some(target) = &f.target {
-                if BackendName::parse(&target.name).is_none() {
-                    diagnostics.push(Located {
-                        file: *file,
-                        diagnostic: Diagnostic::new(
-                            target.span,
-                            format!("`{}` is not a known target", target.name),
+            if is_builtin_name(&f.name.name) {
+                diagnostics.push(Located {
+                    file: *file,
+                    diagnostic: Diagnostic::with_rule(
+                        DiagnosticRule::Resolution,
+                        f.name.span,
+                        format!(
+                            "`{}` names a builtin operation; a definition cannot take a builtin's name",
+                            f.name.name
                         ),
-                    });
-                    continue;
-                }
+                    ),
+                });
+                continue;
             }
             match signature_of(&f.name.name, &f.signature, &[], &f.body) {
                 Ok(sig) => {
-                    let requires = match requirements(
-                        &f.requires,
-                        f.target.as_ref().map(|target| target.name.as_str()),
-                    ) {
+                    let requires = match requirements(&f.requires, None) {
                         Ok(requires) => requires,
                         Err(found) => {
                             diagnostics.extend(found.into_iter().map(|diagnostic| Located {
@@ -994,9 +1258,7 @@ pub(crate) fn resolve<'a>(
                     };
                     declared.push(Declared {
                         sig,
-                        kind: DefKind::Body {
-                            target: f.target.as_ref().and_then(|t| BackendName::parse(&t.name)),
-                        },
+                        kind: DefKind::Body,
                         requires,
                         family: FamilyId::new(program, 0),
                         elem_bindings: Vec::new(),
@@ -1030,32 +1292,27 @@ pub(crate) fn resolve<'a>(
             {
                 continue;
             }
-            if declared[i].kind.target().is_some() != declared[j].kind.target().is_some() {
-                diagnostics.push(Located {
-                    file: declared[i].file,
-                    diagnostic: Diagnostic::new(
-                        declared[i].name_span,
-                        format!("portable and backend-specific functions named `{}` overlap; a backend-specific function is a separate helper, not an implementation of a portable family", declared[i].sig.name),
-                    ),
-                });
-            }
             if let Some(message) = contract_mismatch(&declared[j].sig, &declared[i].sig) {
                 diagnostics.push(Located {
                     file: declared[i].file,
-                    diagnostic: Diagnostic::new(declared[i].name_span, message),
+                    diagnostic: Diagnostic::with_rule(
+                        DiagnosticRule::CallContract,
+                        declared[i].name_span,
+                        message,
+                    ),
                 });
             }
             let (a, b) = (root(&mut component, i), root(&mut component, j));
             component[a.max(b)] = a.min(b);
         }
     }
-    let mut families: Vec<Family> = Vec::new();
+    let mut families: Vec<DeclaredFamily> = Vec::new();
     let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
     let mut family_of_root: HashMap<usize, usize> = HashMap::new();
     for i in 0..declared.len() {
         let r = root(&mut component, i);
         let family = *family_of_root.entry(r).or_insert_with(|| {
-            families.push(Family {
+            families.push(DeclaredFamily {
                 name: declared[i].sig.name.clone(),
                 contract: FunctionId::new(
                     program,
@@ -1086,14 +1343,15 @@ pub(crate) fn resolve<'a>(
         for decl in &parsed.decls {
             let ast::Decl::Lower(l) = decl else { continue };
             let Some(named) = by_name.get(&l.name.name).cloned() else {
-                diagnostics.push(Located { file: *file, diagnostic: Diagnostic::new(l.name.span, format!("`{}` is not declared; a lowering implements a declared function contract", l.name.name)) });
+                diagnostics.push(Located { file: *file, diagnostic: Diagnostic::with_rule(DiagnosticRule::Resolution, l.name.span, format!("`{}` is not declared; a lowering implements a declared function contract", l.name.name)) });
                 continue;
             };
             let target = l.target.name.clone();
             let Some(target) = BackendName::parse(&target) else {
                 diagnostics.push(Located {
                     file: *file,
-                    diagnostic: Diagnostic::new(
+                    diagnostic: Diagnostic::with_rule(
+                        DiagnosticRule::Resolution,
                         l.target.span,
                         format!("`{target}` is not a known target"),
                     ),
@@ -1132,23 +1390,23 @@ pub(crate) fn resolve<'a>(
                             .iter()
                             .map(|id| id.index())
                             .find(|member| {
-                                matches!(declared[*member].kind, DefKind::Body { target: None })
+                                matches!(declared[*member].kind, DefKind::Body)
                                     && structures_overlap(&declared[*member].sig, &sig)
                             })
                             .map(|member| (*family, member))
                     })
                     .collect();
                 match matching.as_slice() {
-                        [] => diagnostics.push(Located { file: *file, diagnostic: Diagnostic::new(l.name.span, format!("no definition of `{}` has this parameter structure (kinds, ranks, element types); a lowering restates the contract it implements", l.name.name)) }),
+                        [] => diagnostics.push(Located { file: *file, diagnostic: Diagnostic::with_rule(DiagnosticRule::Resolution, l.name.span, format!("no definition of `{}` has this parameter structure (kinds, ranks, element types); a lowering restates the contract it implements", l.name.name)) }),
                         [(family, member)] => {
                             let contract = &declared[*member];
                             if let Some(message) = contract_mismatch(&contract.sig, &sig) {
-                                diagnostics.push(Located { file: *file, diagnostic: Diagnostic::new(l.name.span, message) });
+                                diagnostics.push(Located { file: *file, diagnostic: Diagnostic::with_rule(DiagnosticRule::CallContract, l.name.span, message) });
                             }
                             let bindings = elem_bindings(&contract.sig, &sig);
                             attach.push((*family, sig, bindings));
                         }
-                        _ => diagnostics.push(Located { file: *file, diagnostic: Diagnostic::new(l.name.span, format!("this lowering overlaps several disjoint contract families of `{}`; restate one family's parameter structure", l.name.name)) }),
+                        _ => diagnostics.push(Located { file: *file, diagnostic: Diagnostic::with_rule(DiagnosticRule::Resolution, l.name.span, format!("this lowering overlaps several disjoint contract families of `{}`; restate one family's parameter structure", l.name.name)) }),
                     }
             }
             for (family, sig, elem_bindings) in attach {
@@ -1174,9 +1432,11 @@ pub(crate) fn resolve<'a>(
             }
         }
     }
+    let call_graph = NameCallGraph::new(&declared, &families, &by_name);
     Resolved {
         declared,
         families,
         by_name,
+        call_graph,
     }
 }

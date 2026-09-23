@@ -1,0 +1,80 @@
+# One key's online-softmax update of the per-partition state (maximum `m`, normalizer `l`,
+# weighted-value accumulator `acc`) for the G query heads of one KV head.
+fn attention_absorb[G, W](qt: &tensor[G, W] A, key: &tensor[W] A, value: &tensor[W] A,
+                          m: &mut tensor[G] f32, l: &mut tensor[G] f32, acc: &mut tensor[G, W] f32, scale: f32):
+    for i in 0..G:
+        let score = reduce(f32(qt[i]) * f32(key), 0, sum) * scale
+        let top = max(m[i], score)
+        let keep = exp(m[i] - top)
+        let weight = exp(score - top)
+        l[i] = fma(l[i], keep, weight)
+        for j in 0..W:
+            acc[i, j] = fma(acc[i, j], keep, weight * f32(value[j]))
+        m[i] = top
+
+# Attention for M fresh rows appended after a resident history, partitioned over history.
+# Partition `part` (of 64) absorbs, in ascending order, the history keys part, part + 64, ...
+# inside the row's visible windows, then the fresh keys part, part + 64, ... up to the row itself.
+# The 64 partition states merge in ascending partition order. A window selects the history keys
+# in [0, T) that it contains.
+fn attention_append_partitioned[M, T, G, KV, W, R](q: &tensor[M, KV, G, W] A,
+    k: &tensor[T, KV, W] A, v: &tensor[T, KV, W] A,
+    fresh_key: &tensor[M, KV, W] A, fresh_value: &tensor[M, KV, W] A,
+    visible: &tensor[M, R, 2] i32, result: &mut tensor[M, KV, G, W] A, scale: f32):
+    let mut pm = tensor[M, KV, 64, G] f32
+    let mut pl = tensor[M, KV, 64, G] f32
+    let mut pacc = tensor[M, KV, 64, G, W] f32
+    let mut pn = tensor[M, KV, 64] i32
+    parallel for rows in 0..M:
+        parallel for kv_heads in 0..KV:
+            parallel for part in 0..64:
+                let qt = q[rows, kv_heads]
+                let mut m = tensor[G] f32
+                let mut l = tensor[G] f32
+                let mut acc = tensor[G, W] f32
+                for i in 0..G:
+                    m[i] = -inf
+                    l[i] = 0.0
+                    for j in 0..W:
+                        acc[i, j] = 0.0
+                let mut absorbed = i32(0)
+                for t in 0..(T + 63) / 64:
+                    if t * 64 + part < T:
+                        for span in 0..R:
+                            if i32(t * 64 + part) >= visible[rows, span, 0] and i32(t * 64 + part) < visible[rows, span, 1]:
+                                attention_absorb(qt, k[t * 64 + part, kv_heads], v[t * 64 + part, kv_heads], m, l, acc, scale)
+                                absorbed = absorbed + 1
+                for t in 0..(M + 63) / 64:
+                    if t * 64 + part < M:
+                        if t * 64 + part < rows + 1:
+                            attention_absorb(qt, fresh_key[t * 64 + part, kv_heads], fresh_value[t * 64 + part, kv_heads], m, l, acc, scale)
+                            absorbed = absorbed + 1
+                pm[rows, kv_heads, part] = m
+                pl[rows, kv_heads, part] = l
+                pacc[rows, kv_heads, part] = acc
+                pn[rows, kv_heads, part] = absorbed
+    parallel for rows in 0..M:
+        parallel for kv_heads in 0..KV:
+            let mut m = tensor[G] f32
+            let mut l = tensor[G] f32
+            let mut acc = tensor[G, W] f32
+            for i in 0..G:
+                m[i] = -inf
+                l[i] = 0.0
+                for j in 0..W:
+                    acc[i, j] = 0.0
+            for part in 0..64:
+                if pn[rows, kv_heads, part] > 0:
+                    for i in 0..G:
+                        let top = max(m[i], pm[rows, kv_heads, part, i])
+                        let keep = exp(m[i] - top)
+                        let weight = exp(pm[rows, kv_heads, part, i] - top)
+                        l[i] = fma(l[i], keep, pl[rows, kv_heads, part, i] * weight)
+                        for j in 0..W:
+                            acc[i, j] = fma(acc[i, j], keep, pacc[rows, kv_heads, part, i, j] * weight)
+                        m[i] = top
+            let mut y = tensor[G, W] f32
+            for i in 0..G:
+                for j in 0..W:
+                    y[i, j] = acc[i, j] / l[i]
+            result[rows, kv_heads] = y

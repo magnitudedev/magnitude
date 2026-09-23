@@ -1,0 +1,8 @@
+# origin: C1:p15
+# cell: reduce-empty/zero-trip
+# invoke s: f32[0]=zero
+# expect: failed
+# invoke s: f32[3]=seq
+# pin: result = f32[]=2
+fn s[N](x: &tensor[N] f32) -> f32 where N >= 0:
+    return reduce(x, 0, max)

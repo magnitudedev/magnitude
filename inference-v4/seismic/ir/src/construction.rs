@@ -3,15 +3,14 @@
 //! rebrand handles. Semantic refinement and target selection stay with the compiler.
 
 use crate::identity::OwnerToken;
-use crate::kernel::{internals, Kernel, KernelArena, KernelBuilder};
-use crate::repr::Representation;
+use crate::kernel::{internals, Kernel, KernelArena};
 use crate::schedule::{
     AnyScalarSlot, ClosedSchedule, ImportedBindings, ParametricSchedule, ScheduleBuilder,
     ScheduleConstruction,
 };
 use crate::storage::{AllocationAcquisition, GlobalBufferKind};
 use crate::storage::{
-    AllocationLiveness, AnyBufferView, BufferViewId, GlobalAllocationId, GlobalAllocationTopology,
+    AllocationLiveness, AnyBufferView, GlobalAllocationId, GlobalAllocationTopology,
     LocalAllocationTopology, TopologyBuilder,
 };
 use crate::target::{AddressableResourceClass, PhysicalDialect, VectorSupport};
@@ -88,15 +87,6 @@ impl<B: PhysicalDialect> Construction<B> {
         );
         AnyBufferView::new(self.owner, index, representation)
     }
-    pub fn typed_view<R: Representation>(&self, view: AnyBufferView) -> BufferViewId<R> {
-        self.assert_view(view);
-        assert_eq!(
-            view.representation,
-            R::id(),
-            "typed view representation mismatch"
-        );
-        BufferViewId::new(self.owner, view.index)
-    }
     pub fn allocation(&self, index: u32) -> GlobalAllocationId {
         assert!(
             index < self.storage.allocation_count(),
@@ -113,25 +103,6 @@ impl<B: PhysicalDialect> Construction<B> {
             self.owner,
             "slot belongs to another construction"
         );
-    }
-    pub fn kernel<'a>(
-        &'a mut self,
-        arena: &'a mut ExprArena,
-        facts: &'a B::Facts,
-        resources: &'a [AddressableResourceClass],
-        vectors: &'a VectorSupport,
-    ) -> KernelBuilder<'a, B> {
-        internals::open(
-            self.owner,
-            arena,
-            &self.storage,
-            &self.schedule,
-            &mut self.kernels,
-            &mut self.kernel_state,
-            facts,
-            resources,
-            vectors,
-        )
     }
     pub fn portable_kernel<'a>(
         &'a mut self,
@@ -582,7 +553,6 @@ impl<B: PhysicalDialect> NormalizedConstruction<B> {
                     }),
                     ScheduleStep::Imported { body, .. } | ScheduleStep::Repeat { body, .. } => publications(body, output),
                     ScheduleStep::If { then_steps, else_steps, .. } => { publications(then_steps, output); publications(else_steps, output); }
-                    ScheduleStep::Choose { options, .. } => for (_, body) in options { publications(body, output); },
                     _ => {}
                 }
             }
@@ -634,9 +604,6 @@ impl<B: PhysicalDialect> NormalizedConstruction<B> {
                     ScheduleStep::Imported { body, .. } | ScheduleStep::Repeat { body, .. } => definitions(body, views, reached),
                     ScheduleStep::If { then_steps, else_steps, .. } => {
                         definitions(then_steps, views, reached); definitions(else_steps, views, reached);
-                    }
-                    ScheduleStep::Choose { options, .. } => {
-                        for (_, body) in options { definitions(body, views, reached); }
                     }
                     _ => {}
                 }
@@ -1077,7 +1044,6 @@ fn schedule_point(at: &crate::storage::ScheduleUse) -> Vec<u32> {
             crate::storage::ScheduleRegionEdge::IfThen { parent_ordinal, .. }
             | crate::storage::ScheduleRegionEdge::IfElse { parent_ordinal, .. }
             | crate::storage::ScheduleRegionEdge::RepeatBody { parent_ordinal, .. }
-            | crate::storage::ScheduleRegionEdge::ChooseOption { parent_ordinal, .. }
             | crate::storage::ScheduleRegionEdge::Imported { parent_ordinal, .. } => {
                 *parent_ordinal
             }
@@ -1098,14 +1064,6 @@ fn mutually_exclusive(a: &crate::storage::ScheduleUse, b: &crate::storage::Sched
             {
                 return true;
             }
-            (
-                ChooseOption {
-                    node: a, value: av, ..
-                },
-                ChooseOption {
-                    node: b, value: bv, ..
-                },
-            ) if a == b && av != bv => return true,
             _ if left != right => return false,
             _ => {}
         }
@@ -1116,7 +1074,7 @@ fn mutually_exclusive(a: &crate::storage::ScheduleUse, b: &crate::storage::Sched
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repr::{DenseF16, DenseF32};
+    use crate::repr::{DenseF16, DenseF32, Representation};
     use crate::target::{IntrinsicIdentityBuilder, IntrinsicNumericalSemantics};
     use std::panic::{catch_unwind, AssertUnwindSafe};
     #[derive(Debug)]
@@ -1476,27 +1434,33 @@ mod tests {
     #[test]
     #[should_panic(expected = "loop yielded value exceeds its recurrence uniformity")]
     fn repeat_rejects_initially_uniform_carry_that_becomes_varying() {
-        use crate::kernel::ops::CmpOp;
-        use crate::repr::{Bool, Idx};
+        use crate::kernel::ops::{CmpOp, ConstantValue, ValueType};
         use seismic_lang::registry::IntrinsicUniformity;
         let mut arena = ExprArena::default();
         let mut construction = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
         let vectors = VectorSupport::default();
-        let mut kernel = construction.kernel(&mut arena, &(), &[], &vectors);
-        let zero = kernel.constant::<Idx>(0);
-        let two = kernel.constant::<Idx>(2);
-        let yes = kernel.constant::<Bool>(true);
+        let mut kernel = construction.portable_kernel(&mut arena, &(), &[], &vectors);
+        let zero = kernel.index_constant(0);
+        let two = kernel.index_constant(2);
+        let yes = kernel.constant(ConstantValue::Bool(true), ValueType::Bool);
         kernel.repeat(
             zero,
             two,
-            yes,
+            vec![yes],
             &[IntrinsicUniformity::Workgroup],
             |body, _, flag| {
                 // This is legal on the first iteration only if the recurrence is
                 // actually uniform. The backedge must not silently change its type.
-                body.branch(flag, |body| body.workgroup_barrier(), |_| ());
+                body.branch(
+                    flag[0],
+                    |body| {
+                        body.workgroup_barrier();
+                        vec![]
+                    },
+                    |_| vec![],
+                );
                 let lane = body.local_id(0);
-                body.cmp(CmpOp::Eq, lane, zero)
+                vec![body.cmp(CmpOp::Eq, lane, zero)]
             },
         );
         kernel.close();
@@ -1524,7 +1488,6 @@ mod tests {
     #[test]
     fn loop_carries_preserve_the_declared_inductive_uniformity() {
         use crate::kernel::ops::{BinaryOp, ConstantValue, ValueType};
-        use crate::repr::{Bool, Idx};
         use seismic_lang::registry::IntrinsicUniformity;
         let mut arena = ExprArena::default();
         let mut construction = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
@@ -1556,18 +1519,25 @@ mod tests {
         );
         assert_eq!(kernel.uniformity(varying[0]), IntrinsicUniformity::Varying);
         kernel.close();
-        let mut kernel = construction.kernel(&mut arena, &(), &[], &vectors);
-        let zero = kernel.constant::<Idx>(0);
-        let three = kernel.constant::<Idx>(3);
-        let yes = kernel.constant::<Bool>(true);
+        let mut kernel = construction.portable_kernel(&mut arena, &(), &[], &vectors);
+        let zero = kernel.index_constant(0);
+        let three = kernel.index_constant(3);
+        let yes = kernel.constant(ConstantValue::Bool(true), ValueType::Bool);
         kernel.repeat(
             zero,
             three,
-            yes,
+            vec![yes],
             &[IntrinsicUniformity::Workgroup],
             |body, _, carry| {
-                body.branch(carry, |body| body.workgroup_barrier(), |_| ());
-                body.not(carry)
+                body.branch(
+                    carry[0],
+                    |body| {
+                        body.workgroup_barrier();
+                        vec![]
+                    },
+                    |_| vec![],
+                );
+                vec![body.not(carry[0])]
             },
         );
         kernel.close();
@@ -1575,27 +1545,33 @@ mod tests {
 
     #[test]
     fn private_storage_reads_cannot_admit_collective_control() {
-        use crate::kernel::ops::CmpOp;
-        use crate::repr::{DenseU32, Idx, U32};
+        use crate::kernel::ops::{CmpOp, ConstantValue, ValueType};
         use crate::storage::LaunchLocalKind;
+        use seismic_lang::{registry, types::DType};
         for kind in [LaunchLocalKind::Participant, LaunchLocalKind::Register] {
             let failure = catch_unwind(AssertUnwindSafe(|| {
                 let mut arena = ExprArena::default();
                 let one = arena.nat(1);
                 let mut construction = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
                 let vectors = VectorSupport::default();
-                let mut kernel = construction.kernel(&mut arena, &(), &[], &vectors);
-                let cell = kernel.local::<DenseU32>(kind, vec![one]);
-                let writable = kernel.local_writable(cell);
-                let readable = kernel.local_readable(cell);
-                let zero = kernel.constant::<Idx>(0);
+                let mut kernel = construction.portable_kernel(&mut arena, &(), &[], &vectors);
+                let cell = kernel.local_tensor(kind, registry::dense(DType::U32), vec![one]);
+                let zero = kernel.index_constant(0);
                 let lane = kernel.local_id(0);
-                let value = kernel.cast::<Idx, U32>(lane);
-                kernel.write(writable, &[zero], value);
-                let observed = kernel.read(readable, &[zero]);
-                let zero_word = kernel.constant::<U32>(0);
+                let value = kernel.cast(lane, ValueType::Scalar(DType::U32));
+                kernel.tensor_write(&cell, &[zero], value);
+                let observed = kernel.tensor_read(&cell, &[zero]);
+                let zero_word =
+                    kernel.constant(ConstantValue::U32(0), ValueType::Scalar(DType::U32));
                 let condition = kernel.cmp(CmpOp::Eq, observed, zero_word);
-                kernel.branch(condition, |body| body.workgroup_barrier(), |_| ());
+                kernel.branch(
+                    condition,
+                    |body| {
+                        body.workgroup_barrier();
+                        vec![]
+                    },
+                    |_| vec![],
+                );
             }))
             .expect_err("private cell[0] is not a shared uniform observation");
             let message = failure
@@ -1730,7 +1706,6 @@ mod tests {
     #[test]
     fn subgroup_ordinal_has_subgroup_uniform_origin() {
         use crate::kernel::ops::CmpOp;
-        use crate::repr::Idx;
         use seismic_lang::registry::IntrinsicUniformity;
         let mut arena = ExprArena::default();
         let mut construction = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
@@ -1741,18 +1716,32 @@ mod tests {
         let width = portable.subgroup_size();
         assert_eq!(portable.uniformity(width), IntrinsicUniformity::Workgroup);
         portable.close();
-        let mut kernel = construction.kernel(&mut arena, &(), &[], &vectors);
+        let mut kernel = construction.portable_kernel(&mut arena, &(), &[], &vectors);
         let ordinal = kernel.subgroup_ordinal();
-        let zero = kernel.constant::<Idx>(0);
+        let zero = kernel.index_constant(0);
         let first = kernel.cmp(CmpOp::Eq, ordinal, zero);
-        kernel.branch(first, |body| body.subgroup_barrier(), |_| ());
+        kernel.branch(
+            first,
+            |body| {
+                body.subgroup_barrier();
+                vec![]
+            },
+            |_| vec![],
+        );
         kernel.close();
         let rejected = catch_unwind(AssertUnwindSafe(|| {
-            let mut kernel = construction.kernel(&mut arena, &(), &[], &vectors);
+            let mut kernel = construction.portable_kernel(&mut arena, &(), &[], &vectors);
             let ordinal = kernel.subgroup_ordinal();
-            let zero = kernel.constant::<Idx>(0);
+            let zero = kernel.index_constant(0);
             let first = kernel.cmp(CmpOp::Eq, ordinal, zero);
-            kernel.branch(first, |body| body.workgroup_barrier(), |_| ());
+            kernel.branch(
+                first,
+                |body| {
+                    body.workgroup_barrier();
+                    vec![]
+                },
+                |_| vec![],
+            );
         }));
         assert!(rejected.is_err());
     }
@@ -1760,7 +1749,7 @@ mod tests {
     #[test]
     fn typed_constants_retain_payload_bits_in_the_closed_kernel() {
         use crate::kernel::ops::{ConstantValue, Op};
-        use crate::repr::{ScalarKind, BF16, F16};
+        use crate::repr::ScalarKind;
         use seismic_lang::reference_math::ReferenceScalar;
 
         let payloads = [
@@ -1789,22 +1778,8 @@ mod tests {
         }
         kernel.close();
 
-        let mut kernel = construction.kernel(&mut arena, &(), &[], &vectors);
-        kernel.constant::<F16>(1.0006);
-        kernel.constant::<F16>(-0.0);
-        kernel.constant::<BF16>(1.005);
-        kernel.constant::<BF16>(f32::from_bits(0xff80_0001));
-        kernel.close();
-
-        for (kernel, expected) in construction.kernels().iter().zip([
-            payloads.as_slice(),
-            &[
-                ReferenceScalar::F16(0x3c01),
-                ReferenceScalar::F16(0x8000),
-                ReferenceScalar::BF16(0x3f81),
-                ReferenceScalar::BF16(0x7fc0),
-            ],
-        ]) {
+        {
+            let kernel = &construction.kernels()[0];
             let actual: Vec<_> = kernel
                 .blocks()
                 .iter()
@@ -1829,26 +1804,26 @@ mod tests {
                     value
                 })
                 .collect();
-            assert_eq!(actual, expected);
+            assert_eq!(actual, payloads);
         }
     }
 
     #[test]
     fn approximate_exponential_remains_an_explicit_physical_choice() {
-        use crate::kernel::ops::{MathPrecision, Op, UnaryMathOp};
-        use crate::repr::F32;
+        use crate::kernel::ops::{ConstantValue, MathPrecision, Op, ValueType};
         use seismic_lang::intrinsics::MathOp;
+        use seismic_lang::types::DType;
 
         let mut arena = ExprArena::default();
         let mut construction = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
         let vectors = VectorSupport::default();
         for approximate in [false, true] {
-            let mut kernel = construction.kernel(&mut arena, &(), &[], &vectors);
-            let input = kernel.constant::<F32>(1.0);
+            let mut kernel = construction.portable_kernel(&mut arena, &(), &[], &vectors);
+            let input = kernel.constant(ConstantValue::F32(1.0), ValueType::Scalar(DType::F32));
             if approximate {
-                kernel.math_approximate(UnaryMathOp::Exp, input);
+                kernel.math_approximate(MathOp::Exp, input);
             } else {
-                kernel.math(UnaryMathOp::Exp, input);
+                kernel.math(MathOp::Exp, input);
             }
             kernel.close();
         }
@@ -2115,9 +2090,6 @@ mod tests {
                         else_steps,
                         ..
                     } => repeats(then_steps) + repeats(else_steps),
-                    ScheduleStep::Choose { options, .. } => {
-                        options.iter().map(|(_, steps)| repeats(steps)).sum()
-                    }
                     _ => 0,
                 })
                 .sum()
@@ -2135,9 +2107,9 @@ mod tests {
         let (_, index) =
             c.storage_mut()
                 .tensor(arena, GlobalBufferKind::Arena, DenseF32::id(), vec![n]);
-        let view = c.typed_view::<DenseF32>(c.view(index, DenseF32::id()));
+        let view = c.view(index, DenseF32::id());
         let mut schedule = c.schedule(arena, 0);
-        schedule.fill_zero(view);
+        schedule.fill_constant_any(view, seismic_lang::intrinsics::FillConstant::Zero);
         let token = schedule.close();
         let analyzed = c
             .close(token)
@@ -2225,13 +2197,11 @@ mod tests {
             DenseF32::id(),
             vec![n],
         );
-        let first =
-            construction.typed_view::<DenseF32>(construction.view(first_index, DenseF32::id()));
-        let second =
-            construction.typed_view::<DenseF32>(construction.view(second_index, DenseF32::id()));
+        let first = construction.view(first_index, DenseF32::id());
+        let second = construction.view(second_index, DenseF32::id());
         let mut schedule = construction.schedule(&mut arena, 0);
-        schedule.fill_zero(first);
-        schedule.fill_zero(second);
+        schedule.fill_constant_any(first, seismic_lang::intrinsics::FillConstant::Zero);
+        schedule.fill_constant_any(second, seismic_lang::intrinsics::FillConstant::Zero);
         let token = schedule.close();
         let analyzed = construction
             .close(token)
@@ -2280,13 +2250,11 @@ mod tests {
             DenseF16::id(),
             vec![n],
         );
-        let first =
-            construction.typed_view::<DenseF32>(construction.view(first_index, DenseF32::id()));
-        let second =
-            construction.typed_view::<DenseF16>(construction.view(second_index, DenseF16::id()));
+        let first = construction.view(first_index, DenseF32::id());
+        let second = construction.view(second_index, DenseF16::id());
         let mut schedule = construction.schedule(&mut arena, 0);
-        schedule.fill_zero(first);
-        schedule.fill_zero(second);
+        schedule.fill_constant_any(first, seismic_lang::intrinsics::FillConstant::Zero);
+        schedule.fill_constant_any(second, seismic_lang::intrinsics::FillConstant::Zero);
         let token = schedule.close();
         let analyzed = construction
             .close(token)
@@ -2551,9 +2519,8 @@ mod tests {
             vec![n],
         );
         let view = construction.view(index, DenseF32::id());
-        let typed = construction.typed_view::<DenseF32>(view);
         let mut schedule = construction.schedule(&mut arena, 0);
-        schedule.fill_zero(typed);
+        schedule.fill_constant_any(view, seismic_lang::intrinsics::FillConstant::Zero);
         schedule.publish_tensor(view, vec![0], vec![n]);
         let token = schedule.close();
         let analyzed = construction

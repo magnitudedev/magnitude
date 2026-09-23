@@ -210,9 +210,6 @@ pub(crate) fn collect_carries<'a>(
                 collect_carries(then_steps, leaves);
                 collect_carries(else_steps, leaves);
             }
-            ScheduleStep::Choose { options, .. } => options
-                .iter()
-                .for_each(|(_, body)| collect_carries(body, leaves)),
             _ => (),
         }
     }
@@ -233,7 +230,6 @@ pub(crate) fn collect_tensor_definitions(steps: &[crate::schedule::ScheduleStep]
                     }
                 });
             }
-            ScheduleStep::Choose { options, .. } => for (_, body) in options { collect_tensor_definitions(body, definitions); },
             _ => {},
         }
     }

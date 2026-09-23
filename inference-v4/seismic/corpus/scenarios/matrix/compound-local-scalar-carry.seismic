@@ -1,0 +1,7 @@
+# cell: compound-local-scalar/carry
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero
+fn probe(x: &tensor[4, 8] f32, out: &mut tensor[4] f32):
+    let mut v = 0.0
+    for i in 0..4:
+        v += x[i, 0]
+    out[0] = v

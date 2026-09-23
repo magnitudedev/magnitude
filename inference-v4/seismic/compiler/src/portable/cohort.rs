@@ -30,7 +30,8 @@ impl Scope {
             SemanticNodeView::Intrinsic { intrinsic, .. } => match registry::intrinsic_signature(intrinsic).effects.participation {
                 registry::IntrinsicParticipation::Independent => None,
                 registry::IntrinsicParticipation::FullSubgroup => Some(Self::Subgroup),
-                registry::IntrinsicParticipation::FullWorkgroup => Some(Self::Workgroup),
+                registry::IntrinsicParticipation::FullWorkgroup
+                | registry::IntrinsicParticipation::FixedWorkgroup(_) => Some(Self::Workgroup),
             },
             SemanticNodeView::Call { family, .. } => {
                 let child = helpers[&family];

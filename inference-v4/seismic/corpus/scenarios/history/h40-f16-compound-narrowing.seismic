@@ -1,0 +1,5 @@
+# origin: H-40
+# invoke: f16[1]=0x3c00 ; f32:0x3a000800
+# pin: x = f16[1]=0x3c01
+fn probe(x: &mut tensor[1] f16, d: f32):
+    x[0] += d

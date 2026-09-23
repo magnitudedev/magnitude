@@ -7,19 +7,76 @@ use crate::entry::{
     SemanticNodeView, SemanticType, TensorStorage, ViewTransform,
 };
 use crate::expr::{
-    compiled::InvocationValues, Assignment, PartialAssignment, SymbolKind, SymbolValue,
+    compiled::InvocationValues, Assignment, ExprArena, PartialAssignment, SymbolId, SymbolKind,
+    SymbolValue,
 };
 use crate::failure::{SourceFailure, SourceFailureCause};
 use crate::ids::{FamilyId, RepresentationConversionId, SemanticValueId};
-use crate::intrinsics::{accumulator_dtype, AtomicOp, PrimitiveId, ReduceOp};
+use crate::intrinsics::{
+    reduce_schema, AtomicOp, CombineLaw, PrimitiveId, ReduceIdentity, ReduceOp,
+};
 use crate::reference_math::ReferenceScalar;
 use crate::registry::{self, PlaneRepackRecipe, RepackExpr, RepresentationKind};
 use crate::types::DType;
 use num_bigint::BigInt;
 use num_traits::{Euclid, ToPrimitive, Zero};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 
 type Environment = BTreeMap<SemanticValueId, Value>;
+
+/// The `RuntimeValue` symbol of every semantic value that has one. The entry
+/// graph mints at most one per value, so the map is exact.
+pub(super) type RuntimeSymbols = Rc<HashMap<SemanticValueId, SymbolId>>;
+
+pub(super) fn runtime_symbols(arena: &ExprArena) -> RuntimeSymbols {
+    Rc::new(
+        arena
+            .symbols()
+            .filter_map(|symbol| match arena.symbol_kind(symbol) {
+                SymbolKind::RuntimeValue(value) => Some((value, symbol)),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
+/// The values and symbol assignment of one executing function body. Every
+/// value enters through [`Frame::bind`], which also binds the value's
+/// `RuntimeValue` symbol, so extents and symbolic expressions of this body
+/// evaluate against exactly the values reached in it.
+#[derive(Clone)]
+struct Frame {
+    environment: Environment,
+    assignment: Assignment,
+    runtime_symbols: RuntimeSymbols,
+}
+
+impl Frame {
+    fn new(runtime_symbols: RuntimeSymbols, assignment: Assignment) -> Self {
+        Self {
+            environment: Environment::new(),
+            assignment,
+            runtime_symbols,
+        }
+    }
+
+    fn bind(&mut self, id: SemanticValueId, value: Value) {
+        if let Some(symbol) = self.runtime_symbols.get(&id) {
+            // RuntimeValue expressions have the mathematical Int sort,
+            // independently of the producing scalar's storage dtype.
+            self.assignment
+                .bind(*symbol, SymbolValue::Int(value.as_integer()));
+        }
+        self.environment.insert(id, value);
+    }
+
+    fn value(&self, id: SemanticValueId) -> &Value {
+        self.environment
+            .get(&id)
+            .unwrap_or_else(|| unreachable!("semantic value was used before definition"))
+    }
+}
 
 impl Interpreter<'_> {
     fn bind_arguments(
@@ -38,17 +95,10 @@ impl Interpreter<'_> {
                 let left = &arguments[self.entry.schema().parameter_ordinal(*left)];
                 let right = &arguments[self.entry.schema().parameter_ordinal(*right)];
                 if let (Arg::Tensor(a), Arg::Tensor(b)) = (left, right) {
-                    if a == b {
-                        let tensor = self.tensors.get(*a).ok_or_else(|| {
-                            OracleError::InvalidInvocation(
-                                "tensor argument index is outside the oracle table".into(),
-                            )
-                        })?;
-                        if tensor.storage_bytes()? != 0 {
-                            return Err(OracleError::InvalidInvocation(
-                                "disjoint tensor parameters share storage".into(),
-                            ));
-                        }
+                    if a == b && self.tensors[*a].storage_bytes() != 0 {
+                        return Err(OracleError::InvalidInvocation(
+                            "disjoint tensor parameters share storage".into(),
+                        ));
                     }
                 }
             }
@@ -58,11 +108,7 @@ impl Interpreter<'_> {
         for (parameter, argument) in self.entry.schema().parameters().iter().zip(arguments) {
             let value = match (&parameter.kind, argument) {
                 (ParameterKind::Tensor { representation, .. }, Arg::Tensor(index)) => {
-                    let tensor = self.tensors.get(*index).ok_or_else(|| {
-                        OracleError::InvalidInvocation(
-                            "tensor argument index is outside the oracle table".into(),
-                        )
-                    })?;
+                    let tensor = &self.tensors[*index];
                     if tensor.representation() != *representation {
                         return Err(OracleError::InvalidInvocation(format!(
                             "tensor argument `{}` has representation `{}`, expected `{}`",
@@ -115,15 +161,7 @@ impl Interpreter<'_> {
             let Arg::Tensor(index) = argument else {
                 unreachable!("checked tensor parameter is not a tensor oracle argument")
             };
-            let shape = self
-                .tensors
-                .get(*index)
-                .ok_or_else(|| {
-                    OracleError::InvalidInvocation(
-                        "tensor argument index is outside the oracle table".into(),
-                    )
-                })?
-                .shape();
+            let shape = self.tensors[*index].shape();
             if shape.len() != axes.len() {
                 return Err(OracleError::InvalidInvocation(format!(
                     "tensor argument `{}` has the wrong rank",
@@ -155,7 +193,9 @@ impl Interpreter<'_> {
             .entry
             .arena()
             .eval_bool(self.entry.domain().predicate().node(), &assignment)
-            .map_err(|error| format!("entry-domain evaluation failed: {error:?}"))?
+            .map_err(|error| {
+                OracleError::InterpreterDefect(format!("entry-domain evaluation failed: {error:?}"))
+            })?
         {
             return Err(OracleError::InvalidInvocation(
                 "invocation is outside the entry domain".into(),
@@ -166,9 +206,9 @@ impl Interpreter<'_> {
     }
 
     pub(super) fn run_reference(&mut self, arguments: &[Arg]) -> Result<Vec<Value>, EvalError> {
-        let (values, mut assignment) = self.bind_arguments(arguments)?;
+        let (values, assignment) = self.bind_arguments(arguments)?;
         let root = self.entry.program().root();
-        let results = self.call_reference(root, values, &mut assignment)?;
+        let results = self.call_reference(root, values, assignment)?;
         if results.len() != self.entry.schema().results().len() {
             unreachable!("checked root reference result arity differs from its call schema")
         }
@@ -189,11 +229,14 @@ impl Interpreter<'_> {
         (candidate, entry.program().function(candidate.function))
     }
 
+    /// Executes the reference body of `family` in a fresh frame. `assignment`
+    /// holds the invocation symbols for the entry root; a callee body mentions
+    /// only its own values and binders, so its frame starts empty.
     fn call_reference(
         &mut self,
         family: FamilyId,
         arguments: Vec<Value>,
-        assignment: &mut Assignment,
+        assignment: Assignment,
     ) -> Result<Vec<Value>, EvalError> {
         // Copy the external entry reference before mutably borrowing the
         // oracle's tensor table; semantic arenas are immutable throughout an
@@ -203,28 +246,23 @@ impl Interpreter<'_> {
         if function.parameters().len() != arguments.len() {
             unreachable!("checked call arity differs from its family contract")
         }
-        let mut environment = Environment::new();
+        let mut frame = Frame::new(self.runtime_symbols.clone(), assignment);
         for (parameter, value) in function.parameters().iter().zip(arguments) {
-            environment.insert(parameter.value, value);
+            frame.bind(parameter.value, value);
         }
-        self.execute_region(function, function.root(), &mut environment, assignment)?;
-        function
+        self.execute_region(function, function.root(), &mut frame)?;
+        Ok(function
             .results()
             .iter()
-            .map(|result| {
-                environment.get(result).cloned().ok_or_else(|| {
-                    EvalError::from("reference body did not define a declared result")
-                })
-            })
-            .collect()
+            .map(|result| frame.value(*result).clone())
+            .collect())
     }
 
     fn execute_region(
         &mut self,
         function: &SemanticFunction,
         region: crate::ids::RegionId,
-        environment: &mut Environment,
-        assignment: &mut Assignment,
+        frame: &mut Frame,
     ) -> Result<(), EvalError> {
         for (node_id, node) in function.nodes(region) {
             self.charge_work(1)?;
@@ -249,11 +287,15 @@ impl Interpreter<'_> {
                     SemanticType::Scalar(dtype) => *dtype,
                     _ => unreachable!("checked reduction requires numeric input"),
                 };
-                let accumulator = accumulator_dtype(op, dtype);
-                if accumulator.is_float() {
+                let schema = reduce_schema(op, dtype);
+                if schema.combine == CombineLaw::AssociativeCommutative
+                    && schema.accumulator.is_float()
+                {
                     self.record_association(
                         node_id,
-                        crate::entry::AssociationOutcome::Reassociated { accumulator },
+                        crate::entry::AssociationOutcome::Reassociated {
+                            accumulator: schema.accumulator,
+                        },
                     )?;
                 }
             }
@@ -264,30 +306,18 @@ impl Interpreter<'_> {
                         inputs,
                         output,
                     } => {
-                        let result = self.eval_primitive(
-                            function,
-                            primitive,
-                            inputs,
-                            output,
-                            environment,
-                            assignment,
-                        )?;
-                        environment.insert(output, result);
+                        let result =
+                            self.eval_primitive(function, primitive, inputs, output, frame)?;
+                        frame.bind(output, result);
                     }
                     SemanticNodeView::Elementwise {
                         primitive,
                         inputs,
                         output,
                     } => {
-                        let result = self.eval_elementwise(
-                            function,
-                            primitive,
-                            inputs,
-                            output,
-                            environment,
-                            assignment,
-                        )?;
-                        environment.insert(output, result);
+                        let result =
+                            self.eval_elementwise(function, primitive, inputs, output, frame)?;
+                        frame.bind(output, result);
                     }
                     SemanticNodeView::Reduce {
                         op,
@@ -296,16 +326,8 @@ impl Interpreter<'_> {
                         output,
                         ..
                     } => {
-                        let result = self.eval_reduce(
-                            function,
-                            op,
-                            axis,
-                            input,
-                            output,
-                            environment,
-                            assignment,
-                        )?;
-                        environment.insert(output, result);
+                        let result = self.eval_reduce(function, op, axis, input, output, frame)?;
+                        frame.bind(output, result);
                     }
                     SemanticNodeView::Call {
                         family,
@@ -314,14 +336,14 @@ impl Interpreter<'_> {
                     } => {
                         let arguments = inputs
                             .iter()
-                            .map(|input| self.value(environment, *input).cloned())
-                            .collect::<Result<Vec<_>, _>>()?;
-                        let results = self.call_reference(family, arguments, assignment)?;
+                            .map(|input| frame.value(*input).clone())
+                            .collect();
+                        let results = self.call_reference(family, arguments, Assignment::new())?;
                         if results.len() != outputs.len() {
                             unreachable!("checked semantic call result arity mismatch")
                         }
                         for (output, value) in outputs.iter().zip(results) {
-                            environment.insert(*output, value);
+                            frame.bind(*output, value);
                         }
                     }
                     SemanticNodeView::Alloc { extents, output } => {
@@ -329,26 +351,38 @@ impl Interpreter<'_> {
                             unreachable!("checked allocation has a non-tensor result")
                         };
                         let representation = tensor.representation;
+                        // An extent beyond the address width is a real
+                        // resource refusal, not a defect.
                         let shape = extents
                             .iter()
-                            .map(|extent| self.value(environment, *extent)?.as_nat_usize().map_err(EvalError::from))
+                            .map(|extent| {
+                                frame
+                                    .value(*extent)
+                                    .as_nat()
+                                    .to_usize()
+                                    .ok_or_else(|| self.memory_size_overflow())
+                            })
                             .collect::<Result<Vec<_>, _>>()?;
                         self.charge_tensor(&shape)?;
                         let memory = self.reserve_tensor_value(representation, &shape, true)?;
-                        environment.insert(
+                        frame.bind(
                             output,
                             Value::Tensor(TensorValue::owned(
-                                TensorData::uninitialized(representation, shape)?,
+                                TensorData::uninitialized(representation, shape),
                                 memory,
                             )),
                         );
                     }
-                    SemanticNodeView::Fill { value, like, output } => {
+                    SemanticNodeView::Fill {
+                        value,
+                        like,
+                        output,
+                    } => {
                         let SemanticType::Tensor(tensor) = &function.value(output).ty else {
                             unreachable!("checked fill has a non-tensor result")
                         };
                         let representation = tensor.representation;
-                        let shape = self.value(environment, like)?.as_tensor()?.shape().to_vec();
+                        let shape = frame.value(like).as_tensor().shape().to_vec();
                         self.charge_tensor(&shape)?;
                         let RepresentationKind::Dense(dtype) =
                             &registry::representation_info(representation).kind
@@ -357,7 +391,7 @@ impl Interpreter<'_> {
                         };
                         let count = shape.iter().product();
                         let memory = self.reserve_tensor_value(representation, &shape, true)?;
-                        let mut data = TensorData::uninitialized(representation, shape)?;
+                        let mut data = TensorData::uninitialized(representation, shape);
                         for index in 0..count {
                             data.write(
                                 index,
@@ -365,23 +399,23 @@ impl Interpreter<'_> {
                                     *dtype,
                                     value.value() as i128,
                                 ),
-                            )?;
+                            );
                         }
-                        environment.insert(output, Value::Tensor(TensorValue::owned(data, memory)));
+                        frame.bind(output, Value::Tensor(TensorValue::owned(data, memory)));
                     }
                     SemanticNodeView::Copy { input, output } => {
-                        let source = self.value(environment, input)?.as_tensor()?.clone();
-                        let result = self.copy_tensor(function, output, &source, assignment)?;
-                        environment.insert(output, Value::Tensor(result));
+                        let source = frame.value(input).as_tensor().clone();
+                        let result = self.copy_tensor(function, output, &source, frame)?;
+                        frame.bind(output, Value::Tensor(result));
                     }
                     SemanticNodeView::RepresentationConvert {
                         conversion,
                         input,
                         output,
                     } => {
-                        let source = self.value(environment, input)?.as_tensor()?.clone();
+                        let source = frame.value(input).as_tensor().clone();
                         let result = self.convert_representation(conversion, &source)?;
-                        environment.insert(output, Value::Tensor(result));
+                        frame.bind(output, Value::Tensor(result));
                     }
                     SemanticNodeView::View {
                         base,
@@ -389,20 +423,20 @@ impl Interpreter<'_> {
                         transform,
                         output,
                     } => {
-                        let base = self.value(environment, base)?.as_tensor()?.clone();
-                        let view = self.apply_view(transform, extents, base, environment, assignment)?;
-                        environment.insert(output, Value::Tensor(view));
+                        let base = frame.value(base).as_tensor().clone();
+                        let view = self.apply_view(transform, extents, base, frame)?;
+                        frame.bind(output, Value::Tensor(view));
                     }
                     SemanticNodeView::ElementRead {
                         place,
                         indices,
                         output,
                     } => {
-                        let tensor = self.value(environment, place)?.as_tensor()?;
-                        let index = self.element_index(tensor, indices, environment)?;
+                        let tensor = frame.value(place).as_tensor();
+                        let index = self.element_index(tensor, indices, frame)?;
                         let value = self.read_tensor(tensor, index)?;
                         let dtype = scalar_dtype(&function.value(output).ty);
-                        environment.insert(output, Value::Scalar(scalar::cast(dtype, value)));
+                        frame.bind(output, Value::Scalar(scalar::cast(dtype, value)));
                     }
                     SemanticNodeView::ElementWrite {
                         place,
@@ -410,11 +444,11 @@ impl Interpreter<'_> {
                         value,
                         output,
                     } => {
-                        let tensor = self.value(environment, place)?.as_tensor()?.clone();
-                        let index = self.element_index(&tensor, indices, environment)?;
-                        let value = self.value(environment, value)?.as_scalar()?;
+                        let tensor = frame.value(place).as_tensor().clone();
+                        let index = self.element_index(&tensor, indices, frame)?;
+                        let value = frame.value(value).as_scalar();
                         self.write_tensor(&tensor, index, value)?;
-                        environment.insert(output, Value::Tensor(tensor));
+                        frame.bind(output, Value::Tensor(tensor));
                     }
                     SemanticNodeView::Store {
                         destination,
@@ -422,27 +456,22 @@ impl Interpreter<'_> {
                         output,
                     } => {
                         let destination_id = destination;
-                        let destination = self
-                            .value(environment, destination_id)?
-                            .as_tensor()?
-                            .clone();
-                        let source = self.value(environment, value)?.clone();
+                        let destination = frame.value(destination_id).as_tensor().clone();
+                        let source = frame.value(value).clone();
                         self.store_tensor(&destination, &source)?;
-                        environment.insert(output, {
-                            let SemanticType::Tensor(tensor) = &function.value(destination_id).ty
-                            else {
-                                unreachable!("checked store destination is a tensor")
-                            };
-                            let TensorStorage::View { base, .. } = tensor.storage else {
-                                unreachable!("checked store destination is an explicit view")
-                            };
-                            let base = self.value(environment, base)?.as_tensor()?.clone();
-                            assert!(
-                                same_backing(&base, &destination),
-                                "store view lost its actual backing"
-                            );
-                            Value::Tensor(base)
-                        });
+                        let SemanticType::Tensor(tensor) = &function.value(destination_id).ty
+                        else {
+                            unreachable!("checked store destination is a tensor")
+                        };
+                        let TensorStorage::View { base, .. } = tensor.storage else {
+                            unreachable!("checked store destination is an explicit view")
+                        };
+                        let base = frame.value(base).as_tensor().clone();
+                        assert!(
+                            same_backing(&base, &destination),
+                            "store view lost its actual backing"
+                        );
+                        frame.bind(output, Value::Tensor(base));
                     }
                     SemanticNodeView::Atomic {
                         op,
@@ -450,13 +479,13 @@ impl Interpreter<'_> {
                         arguments,
                         output,
                     } => {
-                        let tensor = self.value(environment, place)?.as_tensor()?.clone();
+                        let tensor = frame.value(place).as_tensor().clone();
                         let (value, indices) = arguments
                             .split_last()
                             .unwrap_or_else(|| unreachable!("checked atomic has no value"));
-                        let index = self.element_index(&tensor, indices, environment)?;
+                        let index = self.element_index(&tensor, indices, frame)?;
                         let current = self.read_tensor(&tensor, index)?;
-                        let value = self.value(environment, *value)?.as_scalar()?;
+                        let value = frame.value(*value).as_scalar();
                         let dtype = registry::representation_info(tensor.representation).decoded;
                         let next = match op {
                             AtomicOp::Add => scalar::binary(
@@ -473,7 +502,7 @@ impl Interpreter<'_> {
                             }
                         };
                         self.write_tensor(&tensor, index, next)?;
-                        environment.insert(output, Value::Tensor(tensor));
+                        frame.bind(output, Value::Tensor(tensor));
                     }
                     SemanticNodeView::If {
                         condition,
@@ -482,25 +511,17 @@ impl Interpreter<'_> {
                         then,
                         otherwise,
                     } => {
-                        let condition =
-                            self.value(environment, condition)?.as_scalar()?.bits() != 0;
+                        let condition = frame.value(condition).as_scalar().bits() != 0;
                         let child = if condition { then } else { otherwise };
-                        let mut child_environment = environment.clone();
-                        self.bind_region_parameters(
-                            function,
-                            child,
-                            captures,
-                            &mut child_environment,
-                            environment,
-                        )?;
-                        self.execute_region(function, child, &mut child_environment, assignment)?;
+                        let mut child_frame = frame.clone();
+                        bind_region_parameters(function, child, captures, &mut child_frame, frame);
+                        self.execute_region(function, child, &mut child_frame)?;
                         let results = function.region(child).results();
                         if results.len() != outputs.len() {
                             unreachable!("checked if branch result arity mismatch")
                         }
                         for (output, result) in outputs.iter().zip(results) {
-                            environment
-                                .insert(*output, self.value(&child_environment, *result)?.clone());
+                            frame.bind(*output, child_frame.value(*result).clone());
                         }
                     }
                     SemanticNodeView::Loop {
@@ -512,8 +533,8 @@ impl Interpreter<'_> {
                         body,
                         carries,
                     } => {
-                        let start = self.value(environment, start)?.as_nat()?;
-                        let end = self.value(environment, end)?.as_nat()?;
+                        let start = frame.value(start).as_nat();
+                        let end = frame.value(end).as_nat();
                         let RegionKind::LoopBody { binder_symbol, .. } =
                             function.region(body).kind()
                         else {
@@ -521,22 +542,24 @@ impl Interpreter<'_> {
                         };
                         let mut current = captures
                             .iter()
-                            .map(|capture| self.value(environment, *capture).cloned())
-                            .collect::<Result<Vec<_>, _>>()?;
+                            .map(|capture| frame.value(*capture).clone())
+                            .collect::<Vec<_>>();
                         if matches!(kind, LoopKind::Parallel) && start < end {
                             self.record_parallel(node_id)?;
                         }
+                        let parameters = function.region(body).parameters();
                         let mut coordinate = start;
                         while coordinate < end {
                             self.charge_work(1)?;
-                            let mut child = environment.clone();
-                            let parameters = function.region(body).parameters();
-                            child.insert(parameters[0], Value::Index(coordinate.clone()));
+                            let mut child = frame.clone();
+                            child.bind(parameters[0], Value::Index(coordinate.clone()));
                             for (parameter, value) in parameters[1..].iter().zip(&current) {
-                                child.insert(*parameter, value.clone());
+                                child.bind(*parameter, value.clone());
                             }
-                            assignment.bind(*binder_symbol, SymbolValue::Nat(coordinate.clone()));
-                            self.execute_region(function, body, &mut child, assignment)?;
+                            child
+                                .assignment
+                                .bind(*binder_symbol, SymbolValue::Nat(coordinate.clone()));
+                            self.execute_region(function, body, &mut child)?;
                             for carry in carries {
                                 let parameter = parameters[1..]
                                     .iter()
@@ -546,7 +569,7 @@ impl Interpreter<'_> {
                                             "checked carry parameter is not a loop capture"
                                         )
                                     });
-                                current[parameter] = self.value(&child, carry.yielded)?.clone();
+                                current[parameter] = child.value(carry.yielded).clone();
                             }
                             coordinate += 1u8;
                         }
@@ -554,17 +577,17 @@ impl Interpreter<'_> {
                             unreachable!("checked parallel loop carries reassigned state")
                         }
                         for (output, carry) in outputs.iter().zip(carries) {
-                            let parameter = function.region(body).parameters()[1..]
+                            let parameter = parameters[1..]
                                 .iter()
                                 .position(|parameter| *parameter == carry.parameter)
                                 .unwrap_or_else(|| {
                                     unreachable!("checked carry parameter is not captured")
                                 });
-                            environment.insert(*output, current[parameter].clone());
+                            frame.bind(*output, current[parameter].clone());
                         }
                     }
                     SemanticNodeView::Check { condition, reason } => {
-                        if self.value(environment, condition)?.as_scalar()?.bits() == 0 {
+                        if frame.value(condition).as_scalar().bits() == 0 {
                             return Err(EvalError::Source(SourceFailure::at(
                                 function,
                                 node_id,
@@ -575,27 +598,27 @@ impl Interpreter<'_> {
                     SemanticNodeView::TuplePack { inputs, output } => {
                         let items = inputs
                             .iter()
-                            .map(|input| self.value(environment, *input).cloned())
-                            .collect::<Result<Vec<_>, _>>()?;
-                        environment.insert(output, Value::Tuple(items));
+                            .map(|input| frame.value(*input).clone())
+                            .collect();
+                        frame.bind(output, Value::Tuple(items));
                     }
                     SemanticNodeView::TupleGet {
                         tuple,
                         index,
                         output,
                     } => {
-                        let Value::Tuple(items) = self.value(environment, tuple)? else {
+                        let Value::Tuple(items) = frame.value(tuple) else {
                             unreachable!("checked tuple projection input is not a tuple")
                         };
-                        environment.insert(output, items[index as usize].clone());
+                        let item = items[index as usize].clone();
+                        frame.bind(output, item);
                     }
                     SemanticNodeView::Extent {
                         tensor,
                         axis,
                         output,
                     } => {
-                        let tensor = self.value(environment, tensor)?.as_tensor()?;
-                        let extent = tensor.shape[axis as usize];
+                        let extent = frame.value(tensor).as_tensor().shape[axis as usize];
                         let value = match function.value(output).ty {
                             SemanticType::Integer => Value::Integer(extent.into()),
                             // Authored extent keeps its existing source value
@@ -603,7 +626,7 @@ impl Interpreter<'_> {
                             // an exact mathematical Integer result.
                             _ => Value::Index(extent.into()),
                         };
-                        environment.insert(output, value);
+                        frame.bind(output, value);
                     }
                     SemanticNodeView::Intrinsic { .. } => {
                         unreachable!("backend intrinsic occurs in a sealed portable reference body")
@@ -616,82 +639,47 @@ impl Interpreter<'_> {
         Ok(())
     }
 
-    fn value<'a>(
-        &self,
-        environment: &'a Environment,
-        id: SemanticValueId,
-    ) -> Result<&'a Value, EvalError> {
-        environment
-            .get(&id)
-            .ok_or_else(|| EvalError::from("semantic value was used before definition"))
-    }
-
-    fn bind_region_parameters(
-        &self,
-        function: &SemanticFunction,
-        region: crate::ids::RegionId,
-        captures: &[SemanticValueId],
-        child: &mut Environment,
-        parent: &Environment,
-    ) -> Result<(), EvalError> {
-        let parameters = function.region(region).parameters();
-        if parameters.len() != captures.len() {
-            unreachable!("checked region capture arity mismatch")
-        }
-        for (parameter, capture) in parameters.iter().zip(captures) {
-            child.insert(*parameter, self.value(parent, *capture)?.clone());
-        }
-        Ok(())
-    }
-
     fn eval_primitive(
         &self,
         function: &SemanticFunction,
         primitive: &PrimitiveId,
         inputs: &[SemanticValueId],
         output: SemanticValueId,
-        environment: &Environment,
-        assignment: &Assignment,
+        frame: &Frame,
     ) -> Result<Value, EvalError> {
         match primitive {
             PrimitiveId::RangeMake => Ok(Value::Range(
-                self.value(environment, inputs[0])?.as_nat()?,
-                self.value(environment, inputs[1])?.as_nat()?,
+                frame.value(inputs[0]).as_nat(),
+                frame.value(inputs[1]).as_nat(),
             )),
             PrimitiveId::RangeStart | PrimitiveId::RangeEnd => {
-                let Value::Range(start, end) = self.value(environment, inputs[0])? else {
+                let Value::Range(start, end) = frame.value(inputs[0]) else {
                     unreachable!("checked range projection input is not a range")
                 };
-                Ok(Value::Index(if matches!(primitive, PrimitiveId::RangeStart) {
-                    start.clone()
-                } else {
-                    end.clone()
-                }))
+                Ok(Value::Index(
+                    if matches!(primitive, PrimitiveId::RangeStart) {
+                        start.clone()
+                    } else {
+                        end.clone()
+                    },
+                ))
             }
             PrimitiveId::Symbolic(expression) => {
-                let mut values = assignment.clone();
-                for symbol in self.entry.arena().free_symbols((*expression).into()) {
-                    if let SymbolKind::RuntimeValue(value) = self.entry.arena().symbol_kind(symbol)
-                    {
-                        let scalar = self.value(environment, value)?.as_integer()?;
-                        // RuntimeValue expressions have the mathematical Int sort,
-                        // independently of the producing scalar's storage dtype.
-                        values.bind(symbol, SymbolValue::Int(scalar));
-                    }
-                }
                 let value = self
                     .entry
                     .arena()
-                    .eval_int(*expression, &values)
-                    .map_err(|error| format!("symbolic reference evaluation failed: {error:?}"))?;
+                    .eval_int(*expression, &frame.assignment)
+                    .unwrap_or_else(|error| {
+                        unreachable!("checked symbolic expression failed over its frame: {error:?}")
+                    });
                 Ok(match function.value(output).ty {
                     SemanticType::Integer => Value::Integer(value),
-                    SemanticType::Index { .. } => Value::Index(
-                        value.to_biguint().ok_or("negative natural expression result")?,
-                    ),
-                    SemanticType::Scalar(dtype) => Value::Scalar(
-                        word_literal(dtype, &value)?,
-                    ),
+                    SemanticType::Index { .. } => {
+                        Value::Index(value.to_biguint().unwrap_or_else(|| {
+                            unreachable!("checked natural expression has a negative result")
+                        }))
+                    }
+                    SemanticType::Scalar(dtype) => Value::Scalar(word_literal(dtype, &value)),
                     _ => unreachable!("symbolic integer output"),
                 })
             }
@@ -705,35 +693,49 @@ impl Interpreter<'_> {
                 Ok(Value::Scalar(*constant))
             }
             PrimitiveId::Unary(operation) => {
-                let input = self.value(environment, inputs[0])?;
+                let input = frame.value(inputs[0]);
                 if matches!(function.value(output).ty, SemanticType::Integer) {
-                    if *operation != crate::syntax::ast::UnaryOp::Neg {
-                        return Err("unsupported mathematical integer unary operation".into());
-                    }
-                    Ok(Value::Integer(-input.as_integer()?))
+                    assert_eq!(
+                        *operation,
+                        crate::syntax::ast::UnaryOp::Neg,
+                        "checked mathematical integer unary operation is not negation"
+                    );
+                    Ok(Value::Integer(-input.as_integer()))
                 } else {
-                    Ok(Value::scalar(scalar::unary(*operation, input.as_scalar()?)?))
+                    Ok(Value::scalar(scalar::unary(*operation, input.as_scalar())?))
                 }
             }
             PrimitiveId::Binary(operation) => {
-                let left = self.value(environment, inputs[0])?;
-                let right = self.value(environment, inputs[1])?;
+                let left = frame.value(inputs[0]);
+                let right = frame.value(inputs[1]);
                 if matches!(left, Value::Integer(_) | Value::Index(_))
-                    || matches!(right, Value::Integer(_) | Value::Index(_)) {
+                    || matches!(right, Value::Integer(_) | Value::Index(_))
+                {
                     use crate::syntax::ast::BinaryOp;
-                    let (a, b) = (left.as_integer()?, right.as_integer()?);
-                    if let SemanticType::Integer | SemanticType::Index { .. } = function.value(output).ty {
+                    let (a, b) = (left.as_integer(), right.as_integer());
+                    if let SemanticType::Integer | SemanticType::Index { .. } =
+                        function.value(output).ty
+                    {
                         let result = match operation {
                             BinaryOp::Add => a + b,
                             BinaryOp::Sub => a - b,
                             BinaryOp::Mul => a * b,
                             BinaryOp::Div | BinaryOp::Rem => {
                                 if b.is_zero() {
-                                    return Err(crate::reference_math::ScalarFailure::IntegerDivisionByZero.into());
+                                    return Err(
+                                        crate::reference_math::ScalarFailure::IntegerDivisionByZero
+                                            .into(),
+                                    );
                                 }
-                                if *operation == BinaryOp::Div { a.div_euclid(&b) } else { a.rem_euclid(&b) }
+                                if *operation == BinaryOp::Div {
+                                    a.div_euclid(&b)
+                                } else {
+                                    a.rem_euclid(&b)
+                                }
                             }
-                            _ => return Err("unsupported mathematical integer operation".into()),
+                            _ => {
+                                unreachable!("checked mathematical integer operation {operation:?}")
+                            }
                         };
                         return Ok(Value::Integer(result));
                     }
@@ -755,8 +757,8 @@ impl Interpreter<'_> {
                         let SemanticType::Scalar(dtype) = function.value(output).ty else {
                             unreachable!("checked source index arithmetic has no scalar dtype")
                         };
-                        let left = word_literal(dtype, &a)?;
-                        let right = word_literal(dtype, &b)?;
+                        let left = word_literal(dtype, &a);
+                        let right = word_literal(dtype, &b);
                         Ok(Value::Scalar(scalar::binary(
                             *operation,
                             left,
@@ -767,44 +769,38 @@ impl Interpreter<'_> {
                 } else {
                     Ok(Value::scalar(scalar::binary(
                         *operation,
-                        left.as_scalar()?,
-                        right.as_scalar()?,
+                        left.as_scalar(),
+                        right.as_scalar(),
                         Some(scalar_dtype(&function.value(output).ty)),
                     )?))
                 }
             }
             PrimitiveId::Cast(dtype) => {
-                let value = self.value(environment, inputs[0])?;
+                let value = frame.value(inputs[0]);
                 Ok(Value::Scalar(match value {
-                    Value::Integer(_) | Value::Index(_) => word_literal(*dtype, &value.as_integer()?)?,
-                    _ => scalar::cast(*dtype, value.as_scalar()?),
+                    Value::Integer(_) | Value::Index(_) => {
+                        word_literal(*dtype, &value.as_integer())
+                    }
+                    _ => scalar::cast(*dtype, value.as_scalar()),
                 }))
             }
             PrimitiveId::Math(operation) => {
                 let arguments = inputs
                     .iter()
-                    .map(|input| {
-                        self.value(environment, *input)?
-                            .as_scalar()
-                            .map_err(EvalError::from)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .map(|input| frame.value(*input).as_scalar())
+                    .collect::<Vec<_>>();
                 Ok(Value::scalar(scalar::math(*operation, &arguments)?))
             }
             PrimitiveId::Select => {
-                let condition = self.value(environment, inputs[0])?.as_scalar()?.bits() != 0;
-                Ok(self
-                    .value(environment, inputs[if condition { 1 } else { 2 }])?
-                    .clone())
+                let condition = frame.value(inputs[0]).as_scalar().bits() != 0;
+                Ok(frame.value(inputs[if condition { 1 } else { 2 }]).clone())
             }
             PrimitiveId::TuplePack | PrimitiveId::TupleGet(_) => {
                 unreachable!("tuple primitive survived semantic canonicalization")
             }
             PrimitiveId::TensorAlloc
             | PrimitiveId::Fill(_)
-            | PrimitiveId::Materialize
-            | PrimitiveId::Clone
-            | PrimitiveId::Load
+            | PrimitiveId::Copy
             | PrimitiveId::RepresentationConvert(_)
             | PrimitiveId::Transpose
             | PrimitiveId::Reshape
@@ -812,8 +808,7 @@ impl Interpreter<'_> {
             | PrimitiveId::ElementRead { .. }
             | PrimitiveId::Extent { .. }
             | PrimitiveId::Atomic { .. }
-            | PrimitiveId::Reduce { .. }
-            | PrimitiveId::Decode => {
+            | PrimitiveId::Reduce { .. } => {
                 unreachable!("structural primitive survived semantic canonicalization")
             }
         }
@@ -825,10 +820,9 @@ impl Interpreter<'_> {
         primitive: &PrimitiveId,
         inputs: &[SemanticValueId],
         output: SemanticValueId,
-        environment: &Environment,
-        assignment: &Assignment,
+        frame: &Frame,
     ) -> Result<Value, EvalError> {
-        let (representation, shape) = self.tensor_type(function, output, assignment)?;
+        let (representation, shape) = self.tensor_type(function, output, frame)?;
         self.charge_tensor(&shape)?;
         let RepresentationKind::Dense(dtype) = &registry::representation_info(representation).kind
         else {
@@ -837,26 +831,28 @@ impl Interpreter<'_> {
         let count = shape.iter().product();
         let memory = self.reserve_tensor_value(representation, &shape, true)?;
         let _scalars = self.reserve_elements::<ReferenceScalar>(inputs.len())?;
-        let mut data = TensorData::uninitialized(representation, shape)?;
+        let mut data = TensorData::uninitialized(representation, shape);
         for index in 0..count {
             let mut scalar_inputs = Vec::with_capacity(inputs.len());
             for input in inputs {
-                let value = self.value(environment, *input)?;
-                let scalar = match value {
-                    Value::Scalar(..) => value.clone(),
-                    Value::Tensor(tensor) => Value::Scalar(self.read_tensor(tensor, index)?),
+                scalar_inputs.push(match frame.value(*input) {
+                    Value::Scalar(value) => *value,
+                    Value::Tensor(tensor) => self.read_tensor(tensor, index)?,
                     _ => unreachable!("checked elementwise operand is not numerical"),
-                };
-                scalar_inputs.push(scalar.as_scalar()?);
+                });
             }
             data.write(
                 index,
                 apply_scalar_primitive(primitive, &scalar_inputs, *dtype)?,
-            )?;
+            );
         }
         Ok(Value::Tensor(TensorValue::owned(data, memory)))
     }
 
+    /// Folds one axis in ascending coordinate order exactly as
+    /// [`reduce_schema`] defines: the fold starts from its identity or the
+    /// first element and combines in the schema's accumulator dtype. The
+    /// entry graph checks a `FirstElement*` axis nonempty before this node.
     fn eval_reduce(
         &self,
         function: &SemanticFunction,
@@ -864,41 +860,33 @@ impl Interpreter<'_> {
         axis: u32,
         input: SemanticValueId,
         output: SemanticValueId,
-        environment: &Environment,
-        assignment: &Assignment,
+        frame: &Frame,
     ) -> Result<Value, EvalError> {
-        let input = self.value(environment, input)?.as_tensor()?;
+        let input = frame.value(input).as_tensor();
         let axis = axis as usize;
         let extent = input.shape[axis];
-        let output_shape = match &function.value(output).ty {
-            SemanticType::Tensor(_) => self.tensor_type(function, output, assignment)?.1,
-            _ => Vec::new(),
+        let tensor_output = matches!(function.value(output).ty, SemanticType::Tensor(_));
+        let output_shape = if tensor_output {
+            self.tensor_type(function, output, frame)?.1
+        } else {
+            Vec::new()
         };
-        let input_dtype = registry::representation_info(input.representation).decoded;
-        let output_dtype = match &function.value(output).ty {
-            SemanticType::Tensor(tensor) => {
-                registry::representation_info(tensor.representation).decoded
-            }
-            ty => scalar_dtype(ty),
-        };
+        let schema = reduce_schema(
+            operation,
+            registry::representation_info(input.representation).decoded,
+        );
         self.charge_tensor(&output_shape)?;
         let output_count: usize = output_shape.iter().product();
-        let memory = if matches!(function.value(output).ty, SemanticType::Tensor(_)) {
-            Some(self.reserve_tensor_value(registry::dense(output_dtype), &output_shape, true)?)
+        let memory = if tensor_output {
+            Some(self.reserve_tensor_value(registry::dense(schema.result), &output_shape, true)?)
         } else {
             None
         };
         // The reduction's decoded working results coexist with typed output
         // storage during publication; both payloads belong in the live budget.
         let _results = self.reserve_elements::<ReferenceScalar>(output_count.max(1))?;
-        let _coordinates = self.reserve_elements::<usize>(
-            input
-                .shape
-                .len()
-                .checked_mul(2)
-                .and_then(|n| n.checked_add(output_shape.len() * 2))
-                .ok_or("reference rank overflow")?,
-        )?;
+        let _coordinates =
+            self.reserve_elements::<usize>(input.shape.len() * 2 + output_shape.len() * 2)?;
         let input_strides = row_major(&input.shape);
         let output_strides = row_major(&output_shape);
         let mut results = Vec::with_capacity(output_count.max(1));
@@ -909,35 +897,38 @@ impl Interpreter<'_> {
                 *coordinate = remainder / stride;
                 remainder %= stride;
             }
-            let mut best_index = 0usize;
-            let working_dtype = accumulator_dtype(operation, input_dtype);
-            let mut accumulator = super::tensor::scalar_from_number(
-                working_dtype,
-                match operation {
-                    ReduceOp::Sum => 0.0,
-                    ReduceOp::Max | ReduceOp::Argmax => f64::NEG_INFINITY,
-                    ReduceOp::Min => f64::INFINITY,
-                },
-            );
-            for coordinate in 0..extent {
-                let mut input_coordinate = Vec::with_capacity(input.shape.len());
-                input_coordinate.extend_from_slice(&output_coordinate[..axis]);
-                input_coordinate.push(coordinate);
-                input_coordinate.extend_from_slice(&output_coordinate[axis..]);
-                let logical = input_coordinate
+            let element = |coordinate: usize| {
+                let logical = output_coordinate[..axis]
                     .iter()
+                    .chain(std::iter::once(&coordinate))
+                    .chain(&output_coordinate[axis..])
                     .zip(&input_strides)
                     .map(|(coordinate, stride)| coordinate * stride)
                     .sum();
-                let value = self.read_tensor(input, logical)?;
-                let value = scalar::cast(working_dtype, value);
+                self.read_tensor(input, logical)
+                    .map(|value| scalar::cast(schema.accumulator, value))
+            };
+            let first = match schema.identity {
+                ReduceIdentity::Zero => 0,
+                ReduceIdentity::FirstElement | ReduceIdentity::FirstElementNonEmpty => {
+                    assert!(extent > 0, "checked nonempty reduction axis is empty");
+                    1
+                }
+            };
+            let mut accumulator = match schema.identity {
+                ReduceIdentity::Zero => super::tensor::scalar_from_number(schema.accumulator, 0.0),
+                ReduceIdentity::FirstElement | ReduceIdentity::FirstElementNonEmpty => element(0)?,
+            };
+            let mut best_index = 0usize;
+            for coordinate in first..extent {
+                let value = element(coordinate)?;
                 match operation {
                     ReduceOp::Sum => {
                         accumulator = scalar::binary(
                             crate::syntax::ast::BinaryOp::Add,
                             accumulator,
                             value,
-                            Some(working_dtype),
+                            Some(schema.accumulator),
                         )?
                     }
                     ReduceOp::Max => {
@@ -949,6 +940,8 @@ impl Interpreter<'_> {
                             scalar::math(crate::intrinsics::MathOp::Min, &[accumulator, value])?
                     }
                     ReduceOp::Argmax => {
+                        // Strictly greater: ties keep the smaller coordinate
+                        // (`TieRule::SmallerCoordinateIndex`).
                         if scalar::binary(
                             crate::syntax::ast::BinaryOp::Gt,
                             value,
@@ -965,17 +958,20 @@ impl Interpreter<'_> {
                 }
             }
             results.push(if matches!(operation, ReduceOp::Argmax) {
-                ReferenceScalar::I32(best_index as i32)
+                ReferenceScalar::I32(
+                    i32::try_from(best_index)
+                        .unwrap_or_else(|_| unreachable!("argmax coordinate exceeds i32")),
+                )
             } else {
-                scalar::cast(output_dtype, accumulator)
+                scalar::cast(schema.result, accumulator)
             });
         }
-        if matches!(function.value(output).ty, SemanticType::Tensor(_)) {
-            let mut data = TensorData::uninitialized(registry::dense(output_dtype), output_shape)?;
+        if let Some(memory) = memory {
+            let mut data = TensorData::uninitialized(registry::dense(schema.result), output_shape);
             for (index, value) in results.into_iter().enumerate() {
-                data.write(index, value)?;
+                data.write(index, value);
             }
-            Ok(Value::Tensor(TensorValue::owned(data, memory.unwrap())))
+            Ok(Value::Tensor(TensorValue::owned(data, memory)))
         } else {
             Ok(Value::Scalar(results[0]))
         }
@@ -985,23 +981,28 @@ impl Interpreter<'_> {
         &self,
         function: &SemanticFunction,
         value: SemanticValueId,
-        assignment: &Assignment,
+        frame: &Frame,
     ) -> Result<(crate::ids::RepresentationId, Vec<usize>), EvalError> {
         let SemanticType::Tensor(tensor) = &function.value(value).ty else {
             unreachable!("checked tensor operation has non-tensor output")
         };
         let _shape = self.reserve_elements::<usize>(tensor.axes.len())?;
-        let mut shape = Vec::with_capacity(tensor.axes.len());
-        for axis in &tensor.axes {
-            let extent = self
-                .entry
-                .arena()
-                .eval_nat(*axis, assignment)
-                .map_err(|error| format!("tensor extent evaluation failed: {error:?}"))?;
-            shape.push(
-                usize::try_from(extent).map_err(|_| "tensor extent exceeds usize".to_owned())?,
-            );
-        }
+        let shape = tensor
+            .axes
+            .iter()
+            .map(|axis| {
+                let extent = self
+                    .entry
+                    .arena()
+                    .eval_nat(*axis, &frame.assignment)
+                    .unwrap_or_else(|error| {
+                        unreachable!("checked tensor extent failed over its frame: {error:?}")
+                    });
+                extent.to_usize().unwrap_or_else(|| {
+                    unreachable!("extent of a materialized operand exceeds the address width")
+                })
+            })
+            .collect();
         Ok((tensor.representation, shape))
     }
 
@@ -1011,20 +1012,17 @@ impl Interpreter<'_> {
         logical: usize,
     ) -> Result<ReferenceScalar, EvalError> {
         self.charge_work(1)?;
-        let flat = *tensor
-            .positions
-            .get(logical)
-            .ok_or("tensor index outside logical shape")?;
+        let flat = tensor.positions[logical];
         let info = registry::representation_info(tensor.representation);
         let _decode = self.reserve_elements::<ReferenceScalar>(
             registry::decode_recipe(tensor.representation, info.decoded)
                 .map(|recipe| recipe.temporary_count())
                 .unwrap_or(0),
         )?;
-        match &tensor.backing {
-            Backing::Argument(index) => self.tensors[*index].read_scalar(flat).map_err(Into::into),
-            Backing::Owned(data) => data.borrow().read_scalar(flat).map_err(Into::into),
-        }
+        Ok(match &tensor.backing {
+            Backing::Argument(index) => self.tensors[*index].read_scalar(flat),
+            Backing::Owned(data) => data.borrow().read_scalar(flat),
+        })
     }
 
     fn write_tensor(
@@ -1034,14 +1032,12 @@ impl Interpreter<'_> {
         value: ReferenceScalar,
     ) -> Result<(), EvalError> {
         self.charge_work(1)?;
-        let flat = *tensor
-            .positions
-            .get(logical)
-            .ok_or("tensor index outside logical shape")?;
+        let flat = tensor.positions[logical];
         match &tensor.backing {
-            Backing::Argument(index) => self.tensors[*index].write(flat, value).map_err(Into::into),
-            Backing::Owned(data) => data.borrow_mut().write(flat, value).map_err(Into::into),
+            Backing::Argument(index) => self.tensors[*index].write(flat, value),
+            Backing::Owned(data) => data.borrow_mut().write(flat, value),
         }
+        Ok(())
     }
 
     fn store_tensor(&mut self, destination: &TensorValue, source: &Value) -> Result<(), EvalError> {
@@ -1050,16 +1046,17 @@ impl Interpreter<'_> {
         let values = match source {
             Value::Scalar(value) => vec![*value; destination.element_count()],
             Value::Tensor(source) => {
-                if source.shape != destination.shape {
-                    return Err("tensor store shape mismatch".into());
-                }
+                assert_eq!(
+                    source.shape, destination.shape,
+                    "checked tensor store changes shape"
+                );
                 let mut values = Vec::with_capacity(source.element_count());
                 for index in 0..source.element_count() {
                     values.push(self.read_tensor(source, index)?);
                 }
                 values
             }
-            _ => return Err("tensor store source is not numerical".into()),
+            _ => unreachable!("checked tensor store source is not numerical"),
         };
         for (index, value) in values.into_iter().enumerate() {
             self.write_tensor(destination, index, value)?;
@@ -1067,11 +1064,13 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    /// Every index was either proved in bounds by the checker or checked by
+    /// the entry graph before this access.
     fn element_index(
         &self,
         tensor: &TensorValue,
         indices: &[SemanticValueId],
-        environment: &Environment,
+        frame: &Frame,
     ) -> Result<usize, EvalError> {
         if indices.len() != tensor.shape.len() {
             unreachable!("checked point access index arity differs from tensor rank")
@@ -1080,11 +1079,8 @@ impl Interpreter<'_> {
         let strides = row_major(&tensor.shape);
         let mut flat = 0usize;
         for ((index, extent), stride) in indices.iter().zip(tensor.shape.iter()).zip(strides) {
-            let index = self.value(environment, *index)?.as_nat()?;
-            let index = index.to_usize().ok_or("tensor index exceeds address width")?;
-            if index >= *extent {
-                return Err("tensor index outside logical shape".into());
-            }
+            let index = frame.value(*index).as_nat_usize();
+            assert!(index < *extent, "checked point index lies outside its axis");
             flat += index * stride;
         }
         Ok(flat)
@@ -1095,9 +1091,9 @@ impl Interpreter<'_> {
         function: &SemanticFunction,
         output: SemanticValueId,
         source: &TensorValue,
-        assignment: &Assignment,
+        frame: &Frame,
     ) -> Result<TensorValue, EvalError> {
-        let (representation, shape) = self.tensor_type(function, output, assignment)?;
+        let (representation, shape) = self.tensor_type(function, output, frame)?;
         self.charge_tensor(&shape)?;
         let memory = self.reserve_tensor_value(representation, &shape, true)?;
         if representation == source.representation
@@ -1121,37 +1117,36 @@ impl Interpreter<'_> {
         }
         let RepresentationKind::Dense(dtype) = &registry::representation_info(representation).kind
         else {
-            return Err("non-dense view copy requires a complete identity packet view".into());
+            return Err(OracleError::InterpreterDefect(
+                "non-dense view copy requires a complete identity packet view".into(),
+            )
+            .into());
         };
         if representation == source.representation {
-            let mut bytes = Vec::with_capacity(
-                source
-                    .element_count()
-                    .checked_mul(dtype.bytes() as usize)
-                    .ok_or("tensor size overflow")?,
-            );
+            let mut bytes = Vec::with_capacity(source.element_count() * dtype.bytes() as usize);
             for flat in source.positions.iter().copied() {
                 self.charge_work(1)?;
                 match &source.backing {
                     Backing::Argument(index) => {
-                        bytes.extend_from_slice(self.tensors[*index].dense_element_bytes(flat)?)
+                        bytes.extend_from_slice(self.tensors[*index].dense_element_bytes(flat))
                     }
                     Backing::Owned(data) => {
-                        bytes.extend_from_slice(data.borrow().dense_element_bytes(flat)?)
+                        bytes.extend_from_slice(data.borrow().dense_element_bytes(flat))
                     }
                 }
             }
             return Ok(TensorValue::owned(
-                TensorData::dense_from_bytes(*dtype, shape, bytes)?,
+                TensorData::dense_from_bytes(*dtype, shape, bytes)
+                    .expect("copied dense elements fill the view geometry"),
                 memory,
             ));
         }
-        let mut data = TensorData::uninitialized(representation, shape)?;
+        let mut data = TensorData::uninitialized(representation, shape);
         for index in 0..source.element_count() {
             data.write(
                 index,
                 scalar::cast(*dtype, self.read_tensor(source, index)?),
-            )?;
+            );
         }
         Ok(TensorValue::owned(data, memory))
     }
@@ -1161,40 +1156,38 @@ impl Interpreter<'_> {
         transform: &ViewTransform,
         extents: &[SemanticValueId],
         mut base: TensorValue,
-        environment: &Environment,
-        assignment: &Assignment,
+        frame: &Frame,
     ) -> Result<TensorValue, EvalError> {
         match transform {
             ViewTransform::Identity => Ok(base),
-            ViewTransform::Plane { .. } => {
-                Err("raw packed planes have no portable reference value".into())
-            }
+            ViewTransform::Plane { .. } => Err(OracleError::InterpreterDefect(
+                "raw packed planes have no portable reference value".into(),
+            )
+            .into()),
             ViewTransform::Reshape { axes } => {
-                assert_eq!(axes.len(), extents.len(), "checked reshape extent arity changed");
-                let memory = std::rc::Rc::new(self.reserve_elements::<usize>(axes.len())?);
-                let mut shape = Vec::with_capacity(axes.len());
-                for extent in extents {
-                    shape.push(self.value(environment, *extent)?.as_nat_usize()?);
-                }
+                assert_eq!(
+                    axes.len(),
+                    extents.len(),
+                    "checked reshape extent arity changed"
+                );
+                let memory = Rc::new(self.reserve_elements::<usize>(axes.len())?);
+                let shape = extents
+                    .iter()
+                    .map(|extent| frame.value(*extent).as_nat_usize())
+                    .collect::<Vec<_>>();
                 if shape.iter().product::<usize>() != base.element_count() {
                     unreachable!("checked reshape changes element count")
                 }
-                base.shape = std::rc::Rc::new(shape);
+                base.shape = Rc::new(shape);
                 base.memory.shape = memory;
                 Ok(base)
             }
             ViewTransform::Transpose { permutation } => {
                 self.charge_tensor(&base.shape)?;
-                let shape_memory =
-                    std::rc::Rc::new(self.reserve_elements::<usize>(base.shape.len())?);
+                let shape_memory = Rc::new(self.reserve_elements::<usize>(base.shape.len())?);
                 let positions_memory =
-                    std::rc::Rc::new(self.reserve_elements::<usize>(base.element_count())?);
-                let _coordinates = self.reserve_elements::<usize>(
-                    base.shape
-                        .len()
-                        .checked_mul(4)
-                        .ok_or("reference rank overflow")?,
-                )?;
+                    Rc::new(self.reserve_elements::<usize>(base.element_count())?);
+                let _coordinates = self.reserve_elements::<usize>(base.shape.len() * 4)?;
                 let old_shape = base.shape.clone();
                 let old_strides = row_major(&old_shape);
                 let new_shape = permutation
@@ -1221,22 +1214,16 @@ impl Interpreter<'_> {
                         .sum::<usize>();
                     positions.push(base.positions[old_flat]);
                 }
-                base.shape = std::rc::Rc::new(new_shape);
-                base.positions = std::rc::Rc::new(positions);
+                base.shape = Rc::new(new_shape);
+                base.positions = Rc::new(positions);
                 base.memory.shape = shape_memory;
                 base.memory.positions = positions_memory;
                 Ok(base)
             }
             ViewTransform::Slice { axes } => {
                 let _choices = self.reserve_elements::<std::ops::Range<usize>>(base.shape.len())?;
-                let _coordinates = self.reserve_elements::<usize>(
-                    base.shape
-                        .len()
-                        .checked_mul(2)
-                        .ok_or("reference rank overflow")?,
-                )?;
-                let shape_memory =
-                    std::rc::Rc::new(self.reserve_elements::<usize>(base.shape.len())?);
+                let _coordinates = self.reserve_elements::<usize>(base.shape.len() * 2)?;
+                let shape_memory = Rc::new(self.reserve_elements::<usize>(base.shape.len())?);
                 let old_shape = base.shape.clone();
                 let old_strides = row_major(&old_shape);
                 let mut choices = Vec::with_capacity(old_shape.len());
@@ -1250,20 +1237,17 @@ impl Interpreter<'_> {
                             output_shape.push(extent);
                         }
                         crate::entry::SliceAxis::Point { value, .. } => {
-                            let value = self.scalar_ref(value, environment, assignment)?;
-                            choices
-                                .push(value..value.checked_add(1).ok_or("slice index overflow")?);
+                            let value = self.scalar_ref(value, frame);
+                            choices.push(value..value + 1);
                         }
                         crate::entry::SliceAxis::Range { start, end, .. } => {
                             let start = start
                                 .as_ref()
-                                .map(|value| self.scalar_ref(value, environment, assignment))
-                                .transpose()?
+                                .map(|value| self.scalar_ref(value, frame))
                                 .unwrap_or(0);
                             let end = end
                                 .as_ref()
-                                .map(|value| self.scalar_ref(value, environment, assignment))
-                                .transpose()?
+                                .map(|value| self.scalar_ref(value, frame))
                                 .unwrap_or(extent);
                             self.charge_work(end.saturating_sub(start) as u64)?;
                             choices.push(start..end);
@@ -1277,9 +1261,8 @@ impl Interpreter<'_> {
                     output_shape.push(*extent);
                 }
                 self.charge_tensor(&output_shape)?;
-                let positions_memory = std::rc::Rc::new(
-                    self.reserve_elements::<usize>(output_shape.iter().product())?,
-                );
+                let positions_memory =
+                    Rc::new(self.reserve_elements::<usize>(output_shape.iter().product())?);
                 let mut positions = Vec::with_capacity(output_shape.iter().product());
                 enumerate_coordinates(
                     &choices,
@@ -1294,8 +1277,8 @@ impl Interpreter<'_> {
                         positions.push(base.positions[old_flat]);
                     },
                 );
-                base.shape = std::rc::Rc::new(output_shape);
-                base.positions = std::rc::Rc::new(positions);
+                base.shape = Rc::new(output_shape);
+                base.positions = Rc::new(positions);
                 base.memory.shape = shape_memory;
                 base.memory.positions = positions_memory;
                 Ok(base)
@@ -1303,22 +1286,20 @@ impl Interpreter<'_> {
         }
     }
 
-    fn scalar_ref(
-        &self,
-        value: &ScalarRef,
-        environment: &Environment,
-        assignment: &Assignment,
-    ) -> Result<usize, EvalError> {
+    /// A slice endpoint. The entry graph checks endpoints against the axis
+    /// extent, so every endpoint is an address.
+    fn scalar_ref(&self, value: &ScalarRef, frame: &Frame) -> usize {
         match value {
             ScalarRef::Static(value) => self
                 .entry
                 .arena()
-                .eval_nat(*value, assignment)
-                .and_then(|value| value.to_usize().ok_or(crate::expr::EvalError::Unrepresentable))
-                .map_err(|error| EvalError::from(format!("slice bound failed: {error:?}"))),
-            ScalarRef::Value(value) => {
-                Ok(self.value(environment, *value)?.as_nat_usize()?)
-            }
+                .eval_nat(*value, &frame.assignment)
+                .unwrap_or_else(|error| {
+                    unreachable!("checked slice bound failed over its frame: {error:?}")
+                })
+                .to_usize()
+                .unwrap_or_else(|| unreachable!("checked slice bound exceeds the address width")),
+            ScalarRef::Value(value) => frame.value(*value).as_nat_usize(),
         }
     }
 
@@ -1340,18 +1321,33 @@ impl Interpreter<'_> {
             unreachable!("representation conversion source is not a complete tensor")
         }
         let memory = self.reserve_tensor_value(conversion.destination, &source.shape, true)?;
-        let source_data = match &source.backing {
-            Backing::Argument(index) => &self.tensors[*index],
+        Ok(match &source.backing {
+            Backing::Argument(index) => convert_owned_encoded(
+                conversion.id,
+                source.shape.to_vec(),
+                &self.tensors[*index],
+                memory,
+            ),
             Backing::Owned(data) => {
-                return convert_owned_encoded(
-                    conversion.id,
-                    source.shape.to_vec(),
-                    &data.borrow(),
-                    memory,
-                )
+                convert_owned_encoded(conversion.id, source.shape.to_vec(), &data.borrow(), memory)
             }
-        };
-        convert_owned_encoded(conversion.id, source.shape.to_vec(), source_data, memory)
+        })
+    }
+}
+
+fn bind_region_parameters(
+    function: &SemanticFunction,
+    region: crate::ids::RegionId,
+    captures: &[SemanticValueId],
+    child: &mut Frame,
+    parent: &Frame,
+) {
+    let parameters = function.region(region).parameters();
+    if parameters.len() != captures.len() {
+        unreachable!("checked region capture arity mismatch")
+    }
+    for (parameter, capture) in parameters.iter().zip(captures) {
+        child.bind(*parameter, parent.value(*capture).clone());
     }
 }
 
@@ -1360,11 +1356,11 @@ fn convert_owned_encoded(
     shape: Vec<usize>,
     source: &TensorData,
     memory: super::value::TensorMemory,
-) -> Result<TensorValue, EvalError> {
+) -> TensorValue {
     let conversion = registry::representation_conversion_info(conversion);
     let (representation, _, source_bytes) = source
         .encoded_parts()
-        .ok_or("representation conversion source is not encoded")?;
+        .unwrap_or_else(|| unreachable!("representation conversion source is not encoded"));
     if representation != conversion.source {
         unreachable!("checked representation conversion source mismatch")
     }
@@ -1409,10 +1405,11 @@ fn convert_owned_encoded(
             }
         }
     }
-    Ok(TensorValue::owned(
-        TensorData::encoded(conversion.destination, shape, destination)?,
+    TensorValue::owned(
+        TensorData::encoded(conversion.destination, shape, destination)
+            .expect("registered conversion fills the destination packets"),
         memory,
-    ))
+    )
 }
 
 fn eval_repack(expression: &RepackExpr, source: &[u8]) -> ReferenceScalar {
@@ -1487,14 +1484,15 @@ fn scalar_symbol(value: ReferenceScalar) -> SymbolValue {
     }
 }
 
-fn word_literal(dtype: DType, value: &BigInt) -> Result<ReferenceScalar, EvalError> {
-    if !dtype.is_int() {
-        return Err("mathematical quantity requires an integer word conversion".into());
-    }
+fn word_literal(dtype: DType, value: &BigInt) -> ReferenceScalar {
+    assert!(
+        dtype.is_int(),
+        "checked quantity conversion targets a non-word dtype"
+    );
     let bits = (value & BigInt::from(u32::MAX))
         .to_u32()
         .expect("masked mathematical integer fits one word");
-    Ok(ReferenceScalar::from_bits(dtype, bits))
+    ReferenceScalar::from_bits(dtype, bits)
 }
 
 fn apply_scalar_primitive(
@@ -1524,7 +1522,6 @@ fn apply_scalar_primitive(
         } else {
             arguments[2]
         }),
-        PrimitiveId::Decode => Ok(scalar::cast(output, arguments[0])),
         PrimitiveId::Symbolic(_)
         | PrimitiveId::TuplePack
         | PrimitiveId::TupleGet(_)
@@ -1533,9 +1530,7 @@ fn apply_scalar_primitive(
         | PrimitiveId::RangeEnd
         | PrimitiveId::TensorAlloc
         | PrimitiveId::Fill(_)
-        | PrimitiveId::Materialize
-        | PrimitiveId::Clone
-        | PrimitiveId::Load
+        | PrimitiveId::Copy
         | PrimitiveId::RepresentationConvert(_)
         | PrimitiveId::Transpose
         | PrimitiveId::Reshape

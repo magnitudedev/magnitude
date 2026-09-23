@@ -1,0 +1,7 @@
+# origin: X1:r3-t01b
+# invoke: i32[2]=zero ; f32[4]=1,2,3,4 ; index:7
+# invoke: i32[2]=zero ; f32[4]=6,2,3,4 ; index:7
+fn probe(out: &mut tensor[2] i32, x: &tensor[4] f32, n: index[5000000000]):
+    out[0] = 7
+    if x[0] > 5.0:
+        out[1] = i32(n)

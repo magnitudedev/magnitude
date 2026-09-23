@@ -1,0 +1,14 @@
+# origin: C13:p24
+# rejected: "shape binding"
+fn mk[N](x: &tensor[4] i32) -> tensor[N] i32:
+    let mut r = tensor[N] i32
+    for i in 0..N:
+        r[i] = x[0] + i32(i)
+    return r
+
+fn probe(input: &tensor[4] i32, n: i32) -> i32:
+    let mut r = 0
+    if n > 0:
+        let t = mk[N = n](input)
+        r = reduce(t, 0, sum)
+    return r

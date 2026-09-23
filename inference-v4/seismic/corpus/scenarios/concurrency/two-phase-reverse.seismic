@@ -1,0 +1,7 @@
+# origin: C17:two_phase
+# invoke: f32[4096]=rand(64) ; f32[4096]=zero ; f32[4096]=zero
+fn probe[N](x: &tensor[N] f32, tmp: &mut tensor[N] f32, out: &mut tensor[N] f32):
+    parallel for i in 0..N:
+        tmp[i] = x[i] * 2.0
+    parallel for i in 0..N:
+        out[i] = tmp[N - 1 - i]

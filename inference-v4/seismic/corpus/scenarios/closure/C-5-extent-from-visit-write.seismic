@@ -1,0 +1,18 @@
+# origin: X1:w11
+# cell: alloc-participant-extent/parallel
+# invoke: i32[3]=7,7,7 ; i32[3]=-1,-1,-1
+# expect: returned
+# pin: k = i32[3]=1,2,3
+# pin: out = i32[3]=1,2,3
+fn probe(k: &mut tensor[3] i32, out: &mut tensor[3] i32):
+    # C-5: the extent of `t` is a quantity made from an element the visit wrote
+    # earlier. `index[8](·)` caps it (I-91: not a data word), so F1 (c) passes and,
+    # with F1 (e) deleted (C-5), the loop is one Nest whose `t` is reserved at the
+    # static envelope 8 (D12); the in-kernel read sees the visit's own write
+    # (`r + 1`, not the loop-entry 7), so each visit fills exactly `r + 1` ones.
+    parallel for r in 0..3:
+        k[r] = i32(r) + 1
+        let m = index[8](k[r])
+        let mut t = tensor[m] i32
+        t[:] = ones_like(t)
+        out[r] = reduce(t, 0, sum)

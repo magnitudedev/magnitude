@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn reached_quantity_arithmetic_and_word_cast_share_the_source_schedule() {
     use crate::candidate_domain::construct_candidate_domain;
-    use crate::evaluation_session::boundary_tests::registry;
+    use crate::realization::demand_driven_tests::registry;
     use seismic_ir::schedule::{HostValueDestination, HostValueExpr, ScheduleStep};
     use seismic_lang::checked::{check_source, SourceFile, SourceSet};
     use seismic_lang::entry::ParameterKind;
@@ -22,7 +22,6 @@ fn reached_quantity_arithmetic_and_word_cast_share_the_source_schedule() {
     let domain = construct_candidate_domain(
         entry, &device, &registry,
         &seismic_lang::precision::PrecisionPolicy::Exact,
-        &Default::default(),
     ).unwrap();
     let candidate = domain.read_materialized(&domain.general_construction()).unwrap();
     let steps = candidate.candidate().schedule().steps();
@@ -85,7 +84,7 @@ fn authored_root_binds_entry_coordinates_and_nested_result_paths() {
         construct_candidate_domain, BodyMapping, ConstructionAllowance, ConstructionCoordinate,
         Materialization,
     };
-    use crate::evaluation_session::boundary_tests::registry;
+    use crate::realization::demand_driven_tests::registry;
     use seismic_lang::checked::{check_source, SourceFile, SourceSet};
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "authored-entry-abi.seismic".into(),
@@ -110,7 +109,6 @@ lower probe(x: &tensor[1] f32, pair: (f32, range[4])) -> (tensor[1] f32, (f32, r
         &device,
         &registry,
         &seismic_lang::precision::PrecisionPolicy::Exact,
-        &Default::default(),
     )
     .unwrap();
     let body = domain
@@ -168,7 +166,7 @@ lower probe(x: &tensor[1] f32, pair: (f32, range[4])) -> (tensor[1] f32, (f32, r
 #[test]
 fn loop_private_storage_does_not_escape_scalar_result() {
     use crate::candidate_domain::construct_candidate_domain;
-    use crate::evaluation_session::boundary_tests::registry;
+    use crate::realization::demand_driven_tests::registry;
     use seismic_lang::checked::{check_source, SourceFile, SourceSet};
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "historical-import.seismic".into(),
@@ -196,7 +194,6 @@ fn probe() -> f32:
         &device,
         &registry,
         &seismic_lang::precision::PrecisionPolicy::Exact,
-        &Default::default(),
     )
     .unwrap();
     let read = domain
@@ -214,7 +211,7 @@ fn probe() -> f32:
 #[test]
 fn nested_effect_only_calls_keep_distinct_executable_imports() {
     use crate::candidate_domain::construct_candidate_domain;
-    use crate::evaluation_session::boundary_tests::registry;
+    use crate::realization::demand_driven_tests::registry;
     use seismic_ir::schedule::ScheduleStep;
     use seismic_lang::checked::{check_source, SourceFile, SourceSet};
     let module = check_source(SourceSet::new(vec![SourceFile {
@@ -242,7 +239,6 @@ fn probe(left: &mut tensor[1] f32, right: &mut tensor[1] f32):
         &device,
         &registry,
         &seismic_lang::precision::PrecisionPolicy::Exact,
-        &Default::default(),
     )
     .unwrap();
     let read = domain
@@ -268,11 +264,6 @@ fn probe(left: &mut tensor[1] f32, right: &mut tensor[1] f32):
                     scopes(else_steps, result);
                 }
                 ScheduleStep::Repeat { body, .. } => scopes(body, result),
-                ScheduleStep::Choose { options, .. } => {
-                    for (_, body) in options {
-                        scopes(body, result);
-                    }
-                }
                 _ => {}
             }
         }
@@ -312,13 +303,6 @@ fn probe(left: &mut tensor[1] f32, right: &mut tensor[1] f32):
     write_roots.sort();
     write_roots.dedup();
     assert_eq!(write_roots.len(), 2, "the two Unit calls write different actual arguments");
-    // Native specialization retains the complete imported execution.
-    let assignment = seismic_lang::expr::PartialAssignment::new();
-    let specialization = candidate
-        .executable()
-        .specialize_for_native(read.arena(), &assignment)
-        .unwrap();
-    assert_eq!(specialization.launches().count(), candidate.schedule().launches().len());
 }
 
 #[test]
@@ -331,8 +315,8 @@ fn stored_unaligned_packed_slice_is_unresolved_but_logical_reads_construct() {
     }])).unwrap();
     let entry = module.entry(module.entry_named("probe").unwrap(), &Default::default()).unwrap();
     let device = device();
-    let registry = crate::evaluation_session::boundary_tests::registry();
-    let mut domain = construct_candidate_domain(entry, &device, &registry, &seismic_lang::precision::PrecisionPolicy::Exact, &Default::default()).unwrap();
+    let registry = crate::realization::demand_driven_tests::registry();
+    let mut domain = construct_candidate_domain(entry, &device, &registry, &seismic_lang::precision::PrecisionPolicy::Exact).unwrap();
     let authored = domain.root_selections().into_iter().find(|body| body.mapping == BodyMapping::Authored).unwrap();
     let coordinate = ConstructionCoordinate::root(authored);
     let mut previous = None;
@@ -360,8 +344,8 @@ fn partially_initialized_nonaffine_carry_constructs_raw_storage_relocation() {
     }])).unwrap();
     let entry = module.entry(module.entry_named("probe").unwrap(), &Default::default()).unwrap();
     let device = device();
-    let registry = crate::evaluation_session::boundary_tests::registry();
-    let mut domain = construct_candidate_domain(entry, &device, &registry, &seismic_lang::precision::PrecisionPolicy::Exact, &Default::default()).unwrap();
+    let registry = crate::realization::demand_driven_tests::registry();
+    let mut domain = construct_candidate_domain(entry, &device, &registry, &seismic_lang::precision::PrecisionPolicy::Exact).unwrap();
     let coordinate = domain.general_construction();
     let result = domain.advance(&coordinate, ConstructionAllowance { work_units: 100_000, wall_time: std::time::Duration::from_secs(30) });
     assert!(matches!(result.state, Materialization::Ready(_)), "partial mapped storage must construct without reading unspecified elements: {:?}", result.state);
@@ -379,9 +363,9 @@ fn mixed_quantity_comparison_uses_the_checked_explicit_cast() {
     for (name, expected, casts) in [("word", true, 1), ("quantity", false, 0)] {
         let entry = module.entry(module.entry_named(name).unwrap(), &Default::default()).unwrap();
         let device = device();
-        let registry = crate::evaluation_session::boundary_tests::registry();
+        let registry = crate::realization::demand_driven_tests::registry();
         let domain = crate::candidate_domain::construct_candidate_domain(
-            entry, &device, &registry, &seismic_lang::precision::PrecisionPolicy::Exact, &Default::default(),
+            entry, &device, &registry, &seismic_lang::precision::PrecisionPolicy::Exact,
         ).unwrap();
         let candidate = domain.read_materialized(&domain.general_construction()).unwrap();
         let emitted_casts = candidate.candidate().schedule().steps().iter().filter(|step| matches!(step,

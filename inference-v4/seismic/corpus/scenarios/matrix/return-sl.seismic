@@ -1,0 +1,4 @@
+# cell: return/sl
+# invoke: f32[4,8]=rand(170)
+fn probe(x: &tensor[4, 8] f32) -> f32:
+    return x[0, 0] + 1.0

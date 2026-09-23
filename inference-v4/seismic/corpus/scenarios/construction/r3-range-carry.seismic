@@ -1,0 +1,8 @@
+# origin: C11:r3_range_carry
+# invoke: range:1..3
+fn probe(r: range[10]) -> i32:
+    let mut s = 0
+    for a in 0..2:
+        for k in r:
+            s = s + i32(k)
+    return s

@@ -1,0 +1,12 @@
+# origin: H-6
+# invoke: f32[4]=seq ; bool:true
+# invoke: f32[4]=seq ; bool:false
+fn probe(x: &tensor[4] f32, c: bool) -> f32:
+    let a = x[0]
+    let b = x[1]
+    let mut r = 0.0
+    if c:
+        r = a + b
+    else:
+        r = a - b
+    return r + a

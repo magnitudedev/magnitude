@@ -1,8 +1,7 @@
 //! `cuda.matrix` registry inventory.
 //!
 //! Matrix calls are constructed only by the compiler-owned semantic walker.
-//! This module names the exact registry rows backed by native CUDA emission;
-//! there is no parallel backend `TypedIntrinsic` lowering.
+//! This module names the exact registry rows backed by native CUDA emission.
 
 use super::{capability_id, MATRIX};
 use seismic_lang::ids::IntrinsicId;

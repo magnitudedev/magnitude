@@ -19,7 +19,7 @@ fn route_topk[M, E, K](logits: &tensor[M, E] f32, routes: &mut tensor[M, K] i32,
             for i in 0..E:
                 candidates[i] = -1
                 if probabilities[i] == best:
-                    candidates[i] = i
+                    candidates[i] = i32(i)
             let winner = reduce(i32(candidates), 0, max)
             for i in 0..K:
                 if i == K - 1 - rank:
@@ -105,10 +105,9 @@ fn qwen_routed_suffix[M, H, E, K, F, S](residual: &tensor[M, H] f32, norm: &tens
     shared_gate: &tensor[S, H] SGW, shared_up: &tensor[S, H] SUW,
     shared_down: &tensor[H, S] SDW, routes: &mut tensor[M, K] i32,
     scores: &mut tensor[M, K] f32, eps: f32, normalize: i32)
-    -> (tensor[M, H] A, tensor[M, E] f32, tensor[M, K] i32, tensor[M, K] f32,
-        tensor[M, K, F] A, tensor[M, K, F] A, tensor[M, K, F] A,
-        tensor[M, K, H] A, tensor[M, S] A, tensor[M, S] A, tensor[M, S] A,
-        tensor[M, S] A, tensor[M, H] A, tensor[M, 1] A, tensor[M, H] f32):
+    -> (tensor[M, H] A, tensor[M, E] f32, tensor[M, K, F] A, tensor[M, K, F] A,
+        tensor[M, K, F] A, tensor[M, K, H] A, tensor[M, S] A, tensor[M, S] A,
+        tensor[M, S] A, tensor[M, S] A, tensor[M, H] A, tensor[M, 1] A, tensor[M, H] f32):
     let mut normalized = tensor[M, H] A
     let mut logits = tensor[M, E] f32
     let mut gate = tensor[M, K, F] A
@@ -136,4 +135,4 @@ fn qwen_routed_suffix[M, H, E, K, F, S](residual: &tensor[M, H] f32, norm: &tens
     linear(sp, shared_down, shared)
     shared_coefficient(normalized, shared_router, coefficient)
     routed_merge(projected, scores, shared, coefficient, residual, result)
-    return normalized, logits, routes, scores, gate, up, product, projected, sg, su, sa, sp, shared, coefficient, result
+    return normalized, logits, gate, up, product, projected, sg, su, sa, sp, shared, coefficient, result

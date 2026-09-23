@@ -1,0 +1,14 @@
+# origin: test:validation:programs/scalar-semantics.seismic:argmax_lookup
+# invoke argmax_lookup: f32[65]=rand(131) ; f32[1]=zero ; i32[1]=zero
+fn argmax_lookup(x: &tensor[65] f32, value: tensor[1] f32, winner: tensor[1] i32) -> (tensor[1] f32, tensor[1] i32):
+    let mut at = i32(0)
+    let mut maximum = f32(-inf)
+    for i in 0..65:
+        if x[i] > maximum:
+            maximum = x[i]
+            at = i32(i)
+    let mut output = value
+    let mut index = winner
+    output[0] = x[at]
+    index[0] = at
+    return output, index

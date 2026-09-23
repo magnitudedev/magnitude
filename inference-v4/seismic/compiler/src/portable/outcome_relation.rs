@@ -609,7 +609,7 @@ mod tests {
         construct_candidate_domain, BodyMapping, ConstructionAllowance, ConstructionCoordinate,
         Materialization,
     };
-    use crate::evaluation_session::boundary_tests::registry;
+    use crate::realization::demand_driven_tests::registry;
     use seismic_lang::checked::{check_source, SourceFile, SourceSet};
 
     fn analyze(source: &str, authored: bool) -> DerivedOutcome {
@@ -628,7 +628,6 @@ mod tests {
             &device,
             &registry,
             &seismic_lang::precision::PrecisionPolicy::Exact,
-            &Default::default(),
         )
         .unwrap();
         if authored {

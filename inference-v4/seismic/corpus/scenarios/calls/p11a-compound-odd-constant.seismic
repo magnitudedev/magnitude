@@ -1,0 +1,7 @@
+# origin: C13:p11a
+# rejected: "`seed`"
+fn seed[M](x: &tensor[2 * M] i32) -> i32:
+    return i32(M)
+
+fn probe(input: &tensor[8] i32) -> i32:
+    return seed(input[0:5])

@@ -1,0 +1,7 @@
+# origin: C26:G-T9-6
+# invoke: bool:true ; f16:1.5 ; f32:2.25
+# pin: result = f32[]=1.5
+# invoke: bool:false ; f16:1.5 ; f32:2.25
+# pin: result = f32[]=2.25
+fn probe(c: bool, a: f16, b: f32) -> f32:
+    return select(c, a, b)

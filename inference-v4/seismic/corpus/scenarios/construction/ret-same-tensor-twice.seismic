@@ -1,0 +1,6 @@
+# origin: C11:ret_same_tensor_twice
+# cell: value-tuple/sl
+# invoke: f32[4]=1,2,3,4
+fn probe(x: &tensor[4] f32) -> (tensor[4] f32, tensor[4] f32):
+    let y = x + 1.0
+    return (y, y)

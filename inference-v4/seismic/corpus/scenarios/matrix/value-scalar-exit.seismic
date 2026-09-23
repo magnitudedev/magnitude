@@ -1,0 +1,5 @@
+# cell: value-scalar/exit
+# invoke: f32[4,8]=rand(170)
+fn probe(x: &tensor[4, 8] f32) -> f32:
+    let s = x[0, 0] * 2.0
+    return s

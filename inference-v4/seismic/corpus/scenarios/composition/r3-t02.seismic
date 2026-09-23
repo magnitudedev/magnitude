@@ -1,0 +1,10 @@
+# origin: X1:r3-t02
+# cell: quantity-carry/sl
+# invoke: f32[6]=1,4,2,5,3,6 ; f32[1]=zero
+# pin: out = f32[1]=3
+fn probe[N](x: &tensor[N] f32, out: &mut tensor[1] f32):
+    let mut k = 0
+    for j in 0..N:
+        if x[j] > 3.0:
+            k = k + 1
+    out[0] = f32(k)

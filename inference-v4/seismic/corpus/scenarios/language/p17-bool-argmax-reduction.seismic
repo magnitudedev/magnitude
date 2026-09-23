@@ -1,0 +1,4 @@
+# origin: C1:p17
+# rejected: "i32("
+fn s[N](x: &tensor[N] f32) -> i32:
+    return reduce(x > 2.0, 0, argmax)
