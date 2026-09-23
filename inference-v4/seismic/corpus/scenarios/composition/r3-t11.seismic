@@ -1,0 +1,14 @@
+# origin: X1:r3-t11
+# cell: fallible-quantity-in-run/parallel
+# invoke: f32[3]=zero ; index:999999999999 ; index:0
+# expect: failed
+# invoke: f32[3]=zero ; index:12 ; index:4
+# expect: returned
+# pin: out = f32[3]=3,3,3
+fn probe[R](out: &mut tensor[R] f32, n: index[1000000000000], k: index[10]):
+    parallel for r in 0..R:
+        out[r] = 5.0
+        let q = n / k
+        let mut t = tensor[q] f32
+        t[:] = ones_like(t)
+        out[r] = reduce(t, 0, sum)

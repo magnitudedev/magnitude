@@ -1,0 +1,4 @@
+# origin: C11:r2_to_owned_packed
+# invoke: q4g64[128]=zero
+fn probe(w: &tensor[128] q4g64) -> tensor[128] q4g64:
+    return to_owned(w)

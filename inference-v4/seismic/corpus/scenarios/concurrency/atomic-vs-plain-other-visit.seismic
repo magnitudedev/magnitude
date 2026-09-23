@@ -1,0 +1,6 @@
+# origin: C17:atomic_vs_read_other_visit
+# rejected: "independent visits"
+fn probe[N](x: &tensor[N] i32, out: &mut tensor[N] i32):
+    parallel for i in 0..N:
+        atomic(add, out[0], x[i])
+        out[i] = out[i] + 1

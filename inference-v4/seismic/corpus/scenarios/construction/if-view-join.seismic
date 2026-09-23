@@ -1,0 +1,7 @@
+# origin: C11:if_view_join
+# rejected: "does not permit exclusive writes"
+fn probe(x: &tensor[4,4] f32, c: bool) -> f32:
+    let mut v = x[0]
+    if c:
+        v = x[2]
+    return reduce(v, 0, sum)

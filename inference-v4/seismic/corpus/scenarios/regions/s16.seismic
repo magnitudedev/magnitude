@@ -1,0 +1,9 @@
+# origin: C14:s16
+# invoke: f32[2]=zero ; i32:2
+# invoke: f32[2]=zero ; i32:0
+# expect: failed
+fn probe(x: &mut tensor[2] f32, d: i32) -> i32:
+    x[0] = 7.0
+    let q = 10 / d
+    x[1] = 8.0
+    return q

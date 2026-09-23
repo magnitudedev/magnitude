@@ -1,0 +1,10 @@
+# origin: C11:call_scalar
+# cell: call-portable/sl
+# cell: value-scalar/arg
+# cell: value-scalar/result
+# invoke: f32:2
+fn helper(a: f32) -> f32:
+    return a * a
+
+fn probe(x: f32) -> f32:
+    return helper(x) + helper(x + 1.0)

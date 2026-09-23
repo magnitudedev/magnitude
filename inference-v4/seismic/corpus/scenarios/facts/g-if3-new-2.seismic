@@ -1,0 +1,7 @@
+# origin: A1:G-IF3-new-2
+# invoke: f32[2,6]=1,2,3,4,5,6,7,1,2,3,4,5 ; f32[2,2]=zero
+# pin: out = f32[2,2]=6,15,10,12
+fn probe[M, KV, G](q: &tensor[M, KV * G] f32, out: &mut tensor[M, KV] f32):
+    parallel for r in 0..M:
+        for kv in 0..KV:
+            out[r, kv] = reduce(q[r, kv * G:(kv + 1) * G], 0, sum)

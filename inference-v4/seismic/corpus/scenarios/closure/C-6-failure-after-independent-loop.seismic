@@ -1,0 +1,15 @@
+# origin: X1:r6-w01
+# invoke: f32[4]=zero ; index:12 ; i32:0
+# expect: failed
+# invoke: f32[4]=zero ; index:12 ; i32:2
+# expect: returned
+# pin: out = f32[4]=3,4,6,3
+fn probe[N](out: &mut tensor[N] f32, n: index[4096], d: i32):
+    # A source failure keeps its ordered meaning (L25): it follows the whole
+    # IndependentTotal loop, so the loop's effects precede it.
+    for i in 0..N:
+        let q = n / (N - i)
+        let mut t = tensor[q] f32
+        t[:] = ones_like(t)
+        out[i] = reduce(t, 0, sum)
+    out[N - 1] = f32(6 / d)

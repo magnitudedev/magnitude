@@ -1,0 +1,8 @@
+# origin: C1:p25
+# rejected: "initialization"
+fn half[N](x: &tensor[N] f32) -> tensor[N] f32:
+    let mut out = tensor[N] f32
+    if x[0] > 0.0:
+        parallel for i in 0..N:
+            out[i] = x[i]
+    return out

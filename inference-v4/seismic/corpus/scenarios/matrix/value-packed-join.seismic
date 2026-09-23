@@ -1,0 +1,8 @@
+# cell: value-packed/join
+# invoke: q4g64[4,64]=rand(171) ; f32[4]=zero ; bool:true
+# invoke: q4g64[4,64]=rand(171) ; f32[4]=zero ; bool:false
+fn probe(w: &tensor[4, 64] q4g64, out: &mut tensor[4] f32, c: bool):
+    let mut p = to_owned(w[0])
+    if c:
+        p = to_owned(w[1])
+    out[0] = p[5]

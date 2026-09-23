@@ -1,0 +1,15 @@
+# origin: X1:r6-w01
+# invoke: f32[4]=zero ; index:4000
+# expect: returned
+# pin: out = f32[4]=0,0,0,4000
+# invoke: f32[4]=zero ; index:0
+# expect: returned
+# pin: out = f32[4]=0,0,0,0
+fn probe[N](out: &mut tensor[N] f32, n: index[4096]):
+    # X1 r6 w01 with an authored bound (D12): the envelope of `tensor[q]` is
+    # 4096 f32 per visit, so the distributed IndependentTotal loop runs.
+    for i in 0..N:
+        let q = n / ((N - 1 - i) * 1000000000 + 1)
+        let mut t = tensor[q] f32
+        t[:] = ones_like(t)
+        out[i] = reduce(t, 0, sum)

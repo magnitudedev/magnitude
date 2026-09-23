@@ -1,0 +1,8 @@
+# origin: test:seismic-compiler:compiler/src/portable/import_tests.rs:partially_initialized_nonaffine_carry_constructs_raw_storage_relocation
+# invoke:
+fn probe() -> f32:
+    let mut y = tensor[2,3] f32
+    y[0,0] = 7.0
+    for i in 0..1:
+        y = reshape(y.T, (2,3))
+    return y[0,0]

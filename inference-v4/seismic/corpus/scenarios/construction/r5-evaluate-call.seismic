@@ -1,0 +1,8 @@
+# origin: C11:r5_evaluate_call
+# rejected: "is unused"
+fn helper(d: &mut tensor[1] f32) -> f32:
+    d[0] = 3.0
+    return 1.0
+
+fn probe(dst: &mut tensor[1] f32):
+    helper(dst)

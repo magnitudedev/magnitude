@@ -1,0 +1,5 @@
+# origin: test:validation:corpus/shape.seismic:singleton_axes
+# invoke singleton_axes: f32[1,4]=seq ; f32[4,1]=zero
+fn singleton_axes[N](x: &tensor[1, N] f32, y: &mut tensor[N, 1] f32) where N >= 0:
+    parallel for i in 0..N:
+        y[i, 0] = x[0, i]

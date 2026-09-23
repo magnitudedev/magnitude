@@ -1,0 +1,8 @@
+# origin: C17:parallel_carry_reassign
+# cell: loop-parallel/carry
+# rejected: "cannot reassign captured state"
+fn probe[N](x: &tensor[N] i32) -> i32:
+    let mut s = 0
+    parallel for i in 0..N:
+        s = s + x[i]
+    return s

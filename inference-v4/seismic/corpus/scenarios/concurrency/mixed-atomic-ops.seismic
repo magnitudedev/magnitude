@@ -1,0 +1,7 @@
+# origin: C17:mixed_atomic_ops
+# cell: atomic-mixed-ops/parallel
+# rejected: "independent visits"
+fn probe[N](x: &tensor[N] i32, out: &mut tensor[1] i32):
+    parallel for i in 0..N:
+        atomic(add, out[0], x[i])
+        atomic(max, out[0], x[i])

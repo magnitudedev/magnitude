@@ -1,0 +1,13 @@
+# origin: C13:p23
+# invoke: i32[8,2]=seq ; i32[4,2]=0,0,1,4,0,8,4,5 ; i32[4]=zero
+fn seed[M, K](x: &tensor[M, K] i32) -> i32:
+    let mut scratch = tensor[M, K] i32
+    scratch[:] = ones_like(scratch)
+    return reduce(reduce(scratch, 1, sum), 0, sum)
+
+fn probe(input: &tensor[8, 2] i32, visible: &tensor[4, 2] i32, out: &mut tensor[4] i32):
+    for i in 0..4:
+        let lo = visible[i, 0]
+        let hi = visible[i, 1]
+        if hi > lo:
+            out[i] = seed(input[lo:hi, :])

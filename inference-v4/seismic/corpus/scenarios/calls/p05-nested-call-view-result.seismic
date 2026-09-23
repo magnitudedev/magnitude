@@ -1,0 +1,10 @@
+# origin: C13:p05
+# rejected: "cannot cross an owned boundary"
+fn head[N](x: &tensor[N] i32) -> tensor[2] i32 where N >= 2:
+    return x[0:2]
+
+fn seed[N](x: &tensor[N] i32) -> i32:
+    return reduce(x, 0, sum) + i32(N) * 100
+
+fn probe(input: &tensor[6] i32) -> i32:
+    return seed(head(input[3:6]))

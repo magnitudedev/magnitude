@@ -1,0 +1,6 @@
+# origin: test:validation:corpus/effects.seismic:mutable_output
+# invoke mutable_output: f32[6]=rand(102) ; f32[6]=zero
+# invoke mutable_output: f32[0]=zero ; f32[0]=zero
+fn mutable_output[N](x: &tensor[N] f32, y: &mut tensor[N] f32) where N >= 0:
+    parallel for i in 0..N:
+        y[i] = x[i] * x[i]

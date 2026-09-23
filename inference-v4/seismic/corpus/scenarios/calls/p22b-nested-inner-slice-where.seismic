@@ -1,0 +1,10 @@
+# origin: C13:p22b
+# invoke: i32[4]=seq
+fn inner[M](x: &tensor[M] i32) -> i32:
+    return i32(M) + reduce(x, 0, sum) * 10
+
+fn outer[N](x: &tensor[N] i32) -> i32 where N >= 2:
+    return inner(x[1:N]) + inner(x[0:N - 1]) * 1000
+
+fn probe(input: &tensor[4] i32) -> i32:
+    return outer(input)

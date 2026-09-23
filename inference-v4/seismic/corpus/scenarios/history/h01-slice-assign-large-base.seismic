@@ -1,0 +1,7 @@
+# origin: H-1
+# invoke: f32[4096]=zero ; f32[48]=seq ; i32:100
+# expect: returned
+# invoke: f32[4096]=zero ; f32[48]=seq ; i32:4090
+# expect: failed
+fn probe[N](dst: &mut tensor[N] f32, src: &tensor[48] f32, at: i32):
+    dst[at:at+48] = src

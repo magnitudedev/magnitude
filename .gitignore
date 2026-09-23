@@ -42,20 +42,3 @@ packages/launcher/bin/magnitude.js
 packages/acn-protocol/src/rpc-version.ts
 
 .humanlayer/tasks/
-
-# Seismic V4 build output and local validation evidence
-inference-v4/target/
-inference-v4/**/target/
-inference-v4/validation/results/
-.seismic-cache/
-
-# Generated Seismic validation fixtures, reports, and measurements.
-inference-v4/validation/**/*.json
-inference-v4/validation/**/*.jsonl
-inference-v4/validation/**/*.ndjson
-inference-v4/validation/**/__pycache__/
-
-# Solver lab results, including generated Markdown reports, stay local.
-inference-v4/solver/lab/results/
-inference-v4/solver/lab/evidence/
-inference-v4/solver/lab/**/__pycache__/

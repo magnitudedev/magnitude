@@ -1,0 +1,7 @@
+# origin: test:validation:corpus/values.seismic:mutable_view
+# invoke mutable_view: f32[4]=seq ; f32[2,4]=zero
+fn mutable_view[N](x: &tensor[N] f32, y: &mut tensor[2, N] f32):
+    for half in 0..2:
+        let mut row = y[half]
+        for i in 0..N:
+            row[i] = x[i] + f32(half)

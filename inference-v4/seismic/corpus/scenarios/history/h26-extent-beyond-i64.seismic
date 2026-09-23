@@ -1,0 +1,5 @@
+# origin: H-26
+# invoke: f32[0,9223372036854775809]=zero
+# expect: returned
+fn probe[M, N](x: &tensor[M, N] f32) -> f32 where M >= 0:
+    return reduce(reduce(x, 1, sum), 0, sum)

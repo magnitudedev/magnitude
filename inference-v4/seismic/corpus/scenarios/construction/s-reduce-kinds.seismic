@@ -1,0 +1,4 @@
+# origin: C11:s_reduce_kinds
+# invoke: f32[2,3]=1,5,3,4,2,6
+fn probe(x: &tensor[2,3] f32) -> (tensor[2] f32, tensor[3] f32, i32):
+    return (reduce(x, 1, max), reduce(x, 0, sum), reduce(x[0], 0, argmax))

@@ -1,0 +1,8 @@
+# origin: C11:r3_tuple_join
+# invoke: f32:1
+fn probe(x: f32) -> f32:
+    let mut p = (x, x)
+    if x > 0.0:
+        p = (x, 2.0)
+    let (a, b) = p
+    return a * b

@@ -1,0 +1,7 @@
+# origin: test:validation:corpus/values.seismic:index_arithmetic
+# invoke index_arithmetic: f32[5]=seq ; index:1
+fn index_arithmetic[N](x: &tensor[N] f32, at: index[N]) -> (f32, f32, i32):
+    let here = x[at]
+    let mirrored = x[N - 1 - at]
+    let doubled = i32(at * 2 + 1)
+    return here, mirrored, doubled

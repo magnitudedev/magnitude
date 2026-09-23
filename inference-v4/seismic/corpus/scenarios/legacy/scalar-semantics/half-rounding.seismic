@@ -1,0 +1,6 @@
+# origin: test:validation:programs/scalar-semantics.seismic:half_rounding
+# invoke half_rounding: f16[1]=0x3c01 ; f32[1]=zero ; f16:0x3c01
+fn half_rounding(x: &tensor[1] f16, result: tensor[1] f32, value: f16) -> tensor[1] f32:
+    let mut output = result
+    output[0] = f32(x[0] * value)
+    return output

@@ -1,0 +1,8 @@
+# cell: if/exit
+# invoke: f32[4,8]=rand(170) ; bool:true
+# invoke: f32[4,8]=rand(170) ; bool:false
+fn probe(x: &tensor[4, 8] f32, c: bool) -> f32:
+    let mut v = x[0, 0]
+    if c:
+        v = x[1, 1]
+    return v

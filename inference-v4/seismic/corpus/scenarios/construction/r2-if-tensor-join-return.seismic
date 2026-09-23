@@ -1,0 +1,7 @@
+# origin: C11:r2_if_tensor_join_return
+# invoke: f32[4]=1,1,1,1 ; f32[4]=2,2,2,2 ; bool:true
+fn probe(a: &tensor[4] f32, b: &tensor[4] f32, c: bool) -> tensor[4] f32:
+    let mut t = to_owned(a)
+    if c:
+        t = to_owned(b)
+    return t

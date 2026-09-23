@@ -1,0 +1,11 @@
+# origin: C13:p04
+# cell: value-computed-tensor/if-arm
+# invoke: i32[4]=seq ; i32:1
+fn twice[N](x: &tensor[N] i32) -> tensor[N] i32:
+    return x + x
+
+fn probe(input: &tensor[4] i32, flag: i32) -> tensor[4] i32:
+    let mut r = input * 3
+    if flag > 0:
+        r = twice(input)
+    return r

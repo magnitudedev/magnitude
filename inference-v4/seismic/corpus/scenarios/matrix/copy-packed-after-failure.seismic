@@ -1,0 +1,9 @@
+# cell: copy-packed/after-failure
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero ; q4g64[4,64]=rand(171) ; i32:2
+# expect: returned
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero ; q4g64[4,64]=rand(171) ; i32:0
+# expect: failed
+fn probe[W](x: &tensor[4, W] f32, out: &mut tensor[4] f32, y: &mut tensor[4, W] f32, w: &tensor[4, 64] q4g64, d: i32) where W >= 8:
+    let q = 10 / d
+    let t = to_owned(w[0])
+    out[0] = f32(t[3])

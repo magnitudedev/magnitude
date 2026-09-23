@@ -1,0 +1,8 @@
+# origin: H-5
+# invoke: f32[9,4]=rand(2) ; f32[9]=zero
+fn probe[N](x: &tensor[N, 4] f32, y: &mut tensor[N] f32):
+    parallel for i in 0..N:
+        let mut scratch = tensor[4] f32
+        for j in 0..4:
+            scratch[j] = x[i, j] * 2.0
+        y[i] = reduce(scratch, 0, sum)

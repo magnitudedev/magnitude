@@ -1,0 +1,11 @@
+# origin: X1:r2-s03
+# cell: write-computed-value/arg
+# invoke: f32[4]=1,2,3,4
+# pin: result = f32[4]=2,4,6,8
+# pin: a = f32[4]=7,2,3,4
+fn twice(x: &tensor[4] f32) -> tensor[4] f32:
+    return x + x
+fn probe(a: &mut tensor[4] f32) -> tensor[4] f32:
+    let c = twice(a)
+    a[0] = 7.0
+    return c

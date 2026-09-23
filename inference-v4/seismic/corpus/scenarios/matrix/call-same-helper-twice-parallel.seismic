@@ -1,0 +1,10 @@
+# cell: call-same-helper-twice/parallel
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero
+fn scale[V](r: &tensor[V] f32) -> tensor[V] f32:
+    return r * 3.0
+
+fn probe[W](x: &tensor[4, W] f32, out: &mut tensor[4] f32, y: &mut tensor[4, W] f32) where W >= 8:
+    parallel for i in 0..4:
+        let a = scale(x[i])
+        let b = scale(x[i])
+        out[i] = f32(reduce(a, 0, argmax)) + b[0]

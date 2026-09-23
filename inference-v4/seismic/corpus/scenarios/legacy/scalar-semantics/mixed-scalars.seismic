@@ -1,0 +1,12 @@
+# origin: test:validation:programs/scalar-semantics.seismic:mixed_scalars
+# invoke mixed_scalars: f32[1]=zero ; bool:true ; f32:1.5 ; bf16:0x3fc0 ; bool:false
+# invoke mixed_scalars: f32[1]=zero ; bool:false ; f32:1.5 ; bf16:0x3fc0 ; bool:true
+fn mixed_scalars(result: tensor[1] f32, first: bool, a: f32, b: bf16, last: bool) -> tensor[1] f32:
+    let mut output = result
+    let mut value = a + f32(b)
+    if first:
+        value = value + 10.0
+    if last:
+        value = value * 10.0
+    output[0] = value
+    return output

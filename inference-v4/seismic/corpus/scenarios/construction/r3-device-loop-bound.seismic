@@ -1,0 +1,8 @@
+# origin: C11:r3_device_loop_bound
+# invoke: i32[1]=2
+fn probe(x: &tensor[1] i32) -> f32:
+    let mut s = 0.0
+    for k in 0..4:
+        if k < x[0]:
+            s = s + 1.0
+    return s

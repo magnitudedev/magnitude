@@ -1,0 +1,10 @@
+# origin: C11:r3_quantity_join_loop_bound
+# invoke: index:3 ; bool:true
+fn probe(n: index[8], c: bool) -> f32:
+    let mut m = n + 0
+    if c:
+        m = n + 1
+    let mut s = 0.0
+    for k in 0..m:
+        s = s + 1.0
+    return s

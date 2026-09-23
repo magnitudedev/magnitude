@@ -1,0 +1,10 @@
+# origin: H-42 X1:P15 test:seismic-compiler:compiler/src/portable/capacity_tests.rs:source_capacity_preserves_varying_two_dimensional_snapshot_geometry test:seismic-runtime:runtime/src/feedback/failure_tests.rs:cpu_reached_snapshot_preserves_varying_axes_and_old_contents
+# invoke: i32[4]=zero
+# pin: out = i32[4]=4,4,4,4
+fn probe(out: &mut tensor[4] i32):
+    parallel for i in 0..4:
+        let mut local = tensor[i+1,i+2] i32
+        local[:] = ones_like(local)
+        let captured = local + local
+        local[0,0] = 7
+        out[i] = captured[0,0] + captured[i,i+1]

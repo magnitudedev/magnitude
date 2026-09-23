@@ -1,0 +1,16 @@
+# origin: C14:grow8
+# prepare-within-ms: 30000
+# invoke: f32[16]=rand(50) ; bool:true ; f32[16]=zero
+# invoke: f32[16]=rand(50) ; bool:false ; f32[16]=zero
+fn probe(x: &tensor[16] f32, c: bool, out: &mut tensor[16] f32):
+    let mut t = x + x
+    if c:
+        t = x * x
+    out[0] = t[0]
+    out[1] = t[1]
+    out[2] = t[2]
+    out[3] = t[3]
+    out[4] = t[4]
+    out[5] = t[5]
+    out[6] = t[6]
+    out[7] = t[7]

@@ -1,0 +1,9 @@
+# origin: C11:r3_if_join_then_if
+# invoke: f32:1
+fn probe(x: f32) -> f32:
+    let mut v = 0.0
+    if x > 0.0:
+        v = x
+    if v > 0.5:
+        v = v * 2.0
+    return v

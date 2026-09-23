@@ -1,0 +1,4 @@
+# origin: C11:r2_elementwise_param_symbolic
+# invoke: f32[4]=1,1,1,1
+fn probe[N](x: &tensor[N] f32) -> tensor[N] f32:
+    return x * 2.0

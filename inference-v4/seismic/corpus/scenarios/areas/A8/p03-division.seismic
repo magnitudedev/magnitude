@@ -1,0 +1,38 @@
+# origin: A8:C4a-6 X2:R-X2-24
+# invoke quotient: i32[3]=-2147483648,7,-7 ; i32[3]=-1,-3,3 ; i32[3]=zero
+# expect: failed
+# pin: o = i32[3]=0,0,0
+# invoke quotient: i32[3]=5,6,7 ; i32[3]=1,0,1 ; i32[3]=zero
+# expect: failed
+# pin: o = i32[3]=5,0,0
+# invoke quotient: i32[4]=7,-7,-8,2147483647 ; i32[4]=-3,3,-2,-1 ; i32[4]=zero
+# expect: returned
+# pin: o = i32[4]=-2,-3,4,-2147483647
+# invoke remainder: i32[3]=-2147483648,7,-7 ; i32[3]=-1,-3,3 ; i32[3]=zero
+# expect: failed
+# pin: o = i32[3]=0,0,0
+# invoke remainder: i32[4]=7,-7,-8,2147483647 ; i32[4]=-3,3,-2,-1 ; i32[4]=zero
+# expect: returned
+# pin: o = i32[4]=1,2,0,0
+# invoke divide_by_extent: i32[1]=12 ; i32[0]=zero ; i32[1]=5
+# expect: failed
+# pin: out = i32[1]=5
+# invoke divide_by_extent: i32[1]=12 ; i32[3]=1,2,3 ; i32[1]=5
+# expect: returned
+# pin: out = i32[1]=10
+fn quotient[N](x: &tensor[N] i32, y: &tensor[N] i32, o: &mut tensor[N] i32):
+    # A source division never traps a backend: the recipe reports its failure
+    # and the native divisor is nonzero by construction (A8 §2.5).
+    parallel for i in 0..N:
+        o[i] = x[i] / y[i]
+
+fn remainder[N](x: &tensor[N] i32, y: &tensor[N] i32, o: &mut tensor[N] i32):
+    parallel for i in 0..N:
+        o[i] = x[i] % y[i]
+
+fn divide_by_extent[M](x: &tensor[1] i32, t: &tensor[M] i32, out: &mut tensor[1] i32) where M >= 0:
+    # R-X2-24: an extent divisor is not proved nonzero by an access of that
+    # extent in the same region; M = 0 fails at the division, before any write.
+    out[0] = x[0] / i32(M)
+    for j in 0..M:
+        out[0] = out[0] + t[j]

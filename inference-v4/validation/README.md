@@ -20,8 +20,7 @@ The driver completes every generator before replacing existing fixtures. The
 individual reference generators record their source and generator hashes;
 the erf/GELU array is produced by `qwen_vision_merger_reference.py --erf`.
 
-Hardware captures and measurement reports also belong under ignored `results/`.
-See [hardware/README.md](hardware/README.md) for capture and analysis commands;
+Measurement reports also belong under ignored `results/`;
 `v3_qwen_forward_bench.py` generates the full-model V3 measurements.
 
 ## Native V4 Session Bench

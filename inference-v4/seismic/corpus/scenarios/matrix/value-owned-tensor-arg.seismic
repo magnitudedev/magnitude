@@ -1,0 +1,10 @@
+# cell: value-owned-tensor/arg
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero
+fn take[V](t: tensor[V] f32) -> f32:
+    let mut u = t
+    u[0] = u[0] + 1.0
+    return u[0]
+
+fn probe(x: &tensor[4, 8] f32, out: &mut tensor[4] f32):
+    let t = to_owned(x[0])
+    out[0] = take(t)

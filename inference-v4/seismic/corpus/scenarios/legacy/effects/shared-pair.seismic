@@ -1,0 +1,7 @@
+# origin: test:validation:corpus/effects.seismic:shared_pair
+# invoke shared_pair: f32[4]=1,2,3,4 ; f32[4]=4,3,2,1
+fn shared_pair[N](a: &tensor[N] f32, b: &tensor[N] f32) -> f32:
+    let mut total = f32(0.0)
+    for i in 0..N:
+        total = total + a[i] * b[i]
+    return total

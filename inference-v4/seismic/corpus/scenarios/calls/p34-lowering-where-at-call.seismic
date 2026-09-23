@@ -1,0 +1,13 @@
+# origin: C13:p34
+# invoke: i32[8]=seq ; i32[1]=zero
+fn total[N](x: &tensor[N] i32) -> i32:
+    return reduce(x, 0, sum)
+
+lower total[N](x: &tensor[N] i32) -> i32 for cpu where N == 8:
+    let mut acc = 0
+    for i in 0..N:
+        acc = acc + x[i]
+    return acc
+
+fn probe(input: &tensor[8] i32, out: &mut tensor[1] i32):
+    out[0] = total(input)

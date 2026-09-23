@@ -1,0 +1,7 @@
+# origin: X1:q2b
+# invoke: f32[4]=1,2,3,4
+# pin: out = f32[4]=5,4,3,4
+fn probe(out: &mut tensor[4] f32):
+    let mut v = out[0:2]
+    v = out[2:4]
+    v[0] = 5.0

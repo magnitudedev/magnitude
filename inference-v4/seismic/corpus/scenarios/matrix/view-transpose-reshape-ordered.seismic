@@ -1,0 +1,6 @@
+# cell: view-transpose-reshape/ordered
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero
+fn probe[W](x: &tensor[4, W] f32, out: &mut tensor[4] f32, y: &mut tensor[4, W] f32) where W >= 8:
+    for i in 0..4:
+        let v = reshape(x[i, 0:8], (2, 4)).T
+        out[i] = v[3, 1]

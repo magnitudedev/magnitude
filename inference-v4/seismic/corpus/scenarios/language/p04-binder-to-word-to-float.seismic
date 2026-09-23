@@ -1,0 +1,8 @@
+# origin: C1:p4
+# invoke conv: f32[5]=seq
+# pin: result = f32[5]=0,1,4,9,16
+fn conv[N](x: &tensor[N] f32) -> tensor[N] f32:
+    let mut out = tensor[N] f32
+    parallel for i in 0..N:
+        out[i] = x[i] * f32(i32(i))
+    return out

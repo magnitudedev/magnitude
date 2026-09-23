@@ -1,0 +1,6 @@
+# origin: X1:r2-r02
+# rejected: "independent visits"
+fn probe(t: &mut tensor[6] f32):
+    parallel for i in 0..2:
+        let v = t[1:5]
+        v[i] = t[i + 2]

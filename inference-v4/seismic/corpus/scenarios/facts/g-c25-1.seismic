@@ -1,0 +1,23 @@
+# origin: C25:G-C25-1
+# invoke p: bool:true
+# pin: result = f32[]=0
+# invoke p: bool:false
+# invoke q: f32[4]=1,5,2,3 ; bool:true
+# pin: result = f32[]=2
+# invoke q: f32[4]=1,5,2,3 ; bool:false
+# pin: result = f32[]=0
+fn p(c: bool) -> f32:
+    for i in 0..1:
+        let u = 0
+    if c:
+        let w = 0
+    return 0.0
+
+fn q[N](x: &tensor[N] f32, c: bool) -> f32:
+    let mut s = 0.0
+    if c:
+        let w = reduce(x, 0, argmax)
+        s = x[w]
+    if c:
+        s = 2.0
+    return s

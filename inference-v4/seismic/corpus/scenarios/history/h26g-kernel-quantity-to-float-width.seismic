@@ -1,0 +1,9 @@
+# origin: H-26
+# invoke: index:9223372036854775813 ; f32[1]=zero
+# expect: refused-index-width
+# invoke: index:5 ; f32[1]=zero
+# expect: returned
+# pin: y = f32[1]=5
+fn probe(n: index[18446744073709551615], y: &mut tensor[1] f32):
+    parallel for i in 0..1:
+        y[0] = f32(n + i)

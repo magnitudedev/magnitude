@@ -1,0 +1,7 @@
+# origin: C11:r2_loop_tensor_carry_symbolic
+# invoke: f32[4]=1,1,1,1
+fn probe[N](x: &tensor[N] f32) -> tensor[N] f32:
+    let mut t = to_owned(x)
+    for k in 0..3:
+        t = t * 2.0
+    return t

@@ -1,0 +1,11 @@
+# origin: test:seismic-runtime:runtime/src/feedback/failure_tests.rs:cpu_reached_private_allocation_does_not_reserve_unvisited_loop_envelope
+# invoke main: i32[1]=zero ; i32:0
+# expect: failed
+# pin: out = i32[1]=7
+fn main(out: &mut tensor[1] i32, divisor: i32):
+    for i in 0..65536:
+        let mut scratch = tensor[i+1] i32
+        scratch[0] = 7
+        out[0] = scratch[0]
+        let quotient = 1 / divisor
+        out[0] = quotient

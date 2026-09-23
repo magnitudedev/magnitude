@@ -1,0 +1,8 @@
+# origin: H-10
+# invoke: f32[8]=seq
+fn probe[N](x: &tensor[N] f32) -> f32:
+    let mut a = tensor[N] f32
+    let mut b = tensor[N] f32
+    a[:] = x * 2.0
+    b[:] = a + x
+    return reduce(b, 0, sum)

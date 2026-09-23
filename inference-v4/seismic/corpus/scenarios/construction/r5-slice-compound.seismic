@@ -1,0 +1,5 @@
+# origin: C11:r5_slice_compound
+# cell: compound-slice/sl
+# rejected: "scalar element place"
+fn probe(dst: &mut tensor[4] f32, src: &tensor[4] f32):
+    dst[0:2] += src[0:2]

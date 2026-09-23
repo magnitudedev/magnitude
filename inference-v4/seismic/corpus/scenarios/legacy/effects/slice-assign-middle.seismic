@@ -1,0 +1,4 @@
+# origin: test:validation:corpus/effects.seismic:slice_assign_middle
+# invoke slice_assign_middle: f32[2]=7,8 ; f32[5]=zero
+fn slice_assign_middle[N](x: &tensor[2] f32, y: &mut tensor[N] f32) where N >= 4:
+    y[1:3] = x

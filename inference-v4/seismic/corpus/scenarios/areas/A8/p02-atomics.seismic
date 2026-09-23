@@ -1,0 +1,57 @@
+# origin: A8:C17-8 A8:G-A8-new-5
+# invoke add_i32: i32[100000]=seq ; i32[1]=zero
+# expect: returned
+# pin: out = i32[1]=0x2a052eb0
+# invoke max_min_u32: u32[100000]=bits(2) ; u32[1]=zero ; u32[1]=0xffffffff
+# expect: returned
+# invoke add_f32: f32[1]=zero
+# expect: returned
+# pin: out = f32[1]=350000
+# invoke add_f16_halves: f16:1.0 ; f16[2]=zero
+# expect: returned
+# pin: out = f16[2]=2048,2048
+# invoke add_f16_beside_write: f16:1.0 ; f16:3.5 ; f16[2]=zero
+# expect: returned
+# pin: out = f16[2]=2048,3.5
+# invoke add_f16_beside_write: f16:1.0 ; f16:3.5 ; f16[2]=zero
+# expect: returned
+# invoke add_f16_beside_write: f16:1.0 ; f16:3.5 ; f16[2]=zero
+# expect: returned
+# invoke add_f16_beside_write: f16:1.0 ; f16:3.5 ; f16[2]=zero
+# expect: returned
+# invoke nan_add: f32:1.0 ; f32[1]=0x7fc01234
+# expect: returned
+# pin: out = f32[1]=0x7fc00000
+fn add_i32[N](x: &tensor[N] i32, out: &mut tensor[1] i32):
+    # (i) native I32 read-modify-write; the interpreter's sum wraps.
+    parallel for i in 0..N:
+        atomic(add, out[0], x[i])
+
+fn max_min_u32[N](x: &tensor[N] u32, high: &mut tensor[1] u32, low: &mut tensor[1] u32):
+    # (ii) native U32 max and min.
+    parallel for i in 0..N:
+        atomic(max, high[0], x[i])
+        atomic(min, low[0], x[i])
+
+fn add_f32(out: &mut tensor[1] f32):
+    # (iii) F32 compare-and-swap update; every partial sum is an integer below
+    # 2^24, so every order gives the interpreter's value.
+    parallel for i in 0..100000:
+        atomic(add, out[0], f32(i32(i % 8)))
+
+fn add_f16_halves(v: f16, out: &mut tensor[2] f16):
+    # (iv) two F16 atomics into the two halves of one 32-bit word.
+    parallel for i in 0..100000:
+        atomic(add, out[i % 2], v)
+
+fn add_f16_beside_write(v: f16, w: f16, out: &mut tensor[2] f16):
+    # (v) an F16 atomic next to a plain F16 write to the other half of its word.
+    parallel for i in 0..100000:
+        atomic(add, out[0], v)
+        if i == 0:
+            out[1] = w
+
+fn nan_add(v: f32, out: &mut tensor[1] f32):
+    # (vi) a NaN accumulator: the update's arithmetic is the recipe's.
+    parallel for i in 0..1:
+        atomic(add, out[0], v)

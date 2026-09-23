@@ -43,7 +43,10 @@ order, containing scope, publication edge, and association outcome; a barrier
 requires a uniform cohort and visibility contract. Unsupported analysis cannot
 construct the node. The oracle represents either a deterministic result or an
 allowed outcome relation and never uses one traversal order as the definition
-of unordered parallel execution.
+of unordered parallel execution. Its consuming execution returns a complete outcome
+that owns results and final tensor input backing independently of the interpreter
+and semantic arena. Allowed associations follow actual executed nodes, including
+called bodies, and are deduplicated rather than retained as an execution trace.
 
 ## Computation and implementation choice
 
@@ -74,6 +77,22 @@ recursive dependency tree is available.
 
 Compilation roots are selected externally. Source files end in `.seismic`; paths and filenames do
 not grant capabilities.
+
+Index arguments and range endpoints use natural-number symbols in the call contract and
+invocation bindings. A bounded range carries its actual start and end values. Its declared upper bound is a proof
+constraint, never an endpoint substitution. Loop construction preserves those endpoint projections
+and derives iteration/index bounds separately. Symbolic runtime integer values retain their
+mathematical integer sort independently of scalar storage representation.
+
+Dimensions, range endpoints, loop coordinates, and their arithmetic are mathematical quantities;
+Index is the nonnegative bounded refinement of that domain, not an I32 alias. An authored I32/U32
+scalar operation instead has the exact fixed-width source meaning, including wrapping and signed
+conversion. Its symbolic projection must preserve that typed result. A mathematical rewrite may
+replace it only after the applicable source facts prove equality. Converting between a quantity
+and a scalar occurs at the expression's actual typed boundary, before an operation when an operand
+is typed scalar and after an operation when its consumer requires a scalar.
+Thus I32_MAX + I32(1) is negative, U32_MAX + U32(1) is zero, while a loop coordinate
+multiplied by a shape extent retains its mathematical product even beyond a native word.
 
 ## Logical ownership
 
@@ -169,10 +188,10 @@ requirements of individual child candidates are handled by recursive candidate c
 ## Effective targets
 
 Each backend gathers device, driver, toolchain, and backend-revision facts and the core assembles
-one complete `TargetProfile` before ordinary planning: exact supported intrinsic signatures, quantitative
-limits, dtype and atomic support, numerical environment, and a canonical identity. Every fact
-that can change admissibility or selection is in the profile; native compilation never learns
-one later. Unknown is distinct from unsupported.
+one immutable device legality description: supported intrinsic signatures, device-wide
+limits, dtype and atomic support, numerical environment, and a canonical identity.
+Candidate-specific native reflection completes admission during preparation.
+Unknown is distinct from unsupported.
 
 For an intrinsic signature, availability is the intersection of:
 
@@ -184,10 +203,9 @@ For an intrinsic signature, availability is the intersection of:
 Hardware names and raw versions never appear in kernel source. When runtime queries are
 insufficient, a narrow compile and native-pipeline probe establishes support before selection.
 
-Metal device opening creates the service and queue immediately but acquires the complete target
-and execution profile lazily. Ordinary compiler preparation and capability introspection force
-that acquisition. A direct top-level native call does not: it needs only the checked call contract,
-raw buffer service, authored launch, and concrete Metal pipeline compilation.
+Metal device opening creates the service/queue and device legality description.
+Analytical characterization is acquired only for analytical evaluation; feedback
+evaluation and direct native execution do not require an analytical profile.
 
 Capability filtering occurs before solver export. Resource legality and numerical admissibility
 remain separate hard constraints; estimated cost is the objective among surviving candidates.
@@ -206,12 +224,16 @@ disabled, and final emission cannot introduce an unassessed numerical choice.
 
 Preparation covers the entry's full inferred target domain: the semantic domain implied by
 types and source constraints, intersected with target representability. Consumers supply
-tensors and ordinary parameters, never workload envelopes, shape buckets, specialization
-classes, or expected dimensions. Capability, resource, numerical, or native compiler failure
-cannot first appear during inference; once a call is accepted, no compiler-structure failure
-is possible.
+tensors and ordinary parameters at invocation. Optional typed values/ranges at
+preparation direct optimization effort while preserving the full inferred call
+domain. These ranges imply no application-frequency distribution or runtime tuning.
+Capability, static resource, numerical, or native compiler failure cannot first
+appear during inference; once a call is accepted, no compiler-structure failure
+is possible. A planned reached acquisition may still report a capacity refusal
+for an execution-produced size or unavailable live memory, without changing
+the candidate or the accepted call domain.
 
-Compiler-prepared variants, compiler-native artifacts, and numerical evidence bind to module semantic hash,
+Compiler-prepared variants, compiler-native artifacts, and numerical applicability bind to module semantic hash,
 entry identity, backend/compiler version, target-profile identity, precision-policy identity,
 implementation/variant identity, and native toolchain identity. Device names are diagnostic,
 not semantic cache keys.
@@ -229,7 +251,8 @@ not semantic cache keys.
 These outcomes are never converted into runtime fallback behavior.
 
 Direct top-level native implementations have no numerical-policy selection, modeled duration, or
-fallback. Their source bytes and attached function contract participate in generated identity;
+fallback. Their source bytes are captured with the checked module; source bytes and the attached
+function contract participate in bundle and generated identity;
 Metal compilation or execution errors are reported directly.
 
 ## Acceptance criteria
@@ -237,8 +260,10 @@ Metal compilation or execution errors are reported directly.
 - Portable functions, lowerings, and backend helpers contain no physical tile, storage, launch, or
   pipeline syntax; direct top-level native declarations contain only their explicit launch tuple.
 - Ownership and bounded iteration determine legal reads, writes, moves, and parallel effects.
-- Every accepted parallel write is constructed with an exclusive or atomic
-  capability; every atomic and barrier owns explicit participant, order,
+- Every accepted write to storage shared across parallel participants carries
+  an exclusive or atomic capability for those participants. Iteration-local
+  storage remains private; nesting depth alone does not imply sharing. Every
+  atomic and barrier owns explicit participant, order,
   scope, visibility, and outcome semantics.
 - Event projection, oracle interpretation, and lowering exhaustively match the
   same sealed checked-node vocabulary without default arms.
@@ -248,3 +273,47 @@ Metal compilation or execution errors are reported directly.
 - Unsupported specialized candidates do not remove applicable portable candidates.
 - Every physical resource requirement is represented before native compilation.
 - Capability and numerical identities participate in reconstruction and cache validity.
+
+
+### Source index values and bounds
+
+A checked loop index conversion retains its exact symbolic source expression.
+The index type's bound constrains admissible values; it is not a representation of
+the value and cannot be inverted to recover one during lowering. Reference
+execution and native lowering consume the same symbolic operation. Launch counts
+use the expression language's ceiling division, preserving zero extents without
+inventing subtraction preconditions.
+
+
+Natural-bound implication uses structural monotonicity: division or ceiling division
+by a positive constant cannot increase a natural value, and products preserve
+factorwise ordering. Both binary multiplication and n-ary products participate in
+this proof. The expression owner preserves partial-operation definedness; source
+or target dimensions are never sampled or guessed to establish universal coverage.
+This lets a legal row-width bound cover its packet count and a wider storage bound
+cover a narrower same-shaped internal allocation.
+
+Preparation-time reference execution can carry an explicit semantic-work limit.
+Nodes, loop iterations, element accesses, and allocation/view construction consume
+that budget before work or allocation. Exhaustion is a resource outcome, separate
+from a source-check failure. Reference tensor views share immutable index maps, so
+copying a logical value does not copy its whole tensor index map on every element
+operation. The oracle remains a validation tool and is not an execution fallback.
+
+External-call dimension inference matches observed shape expressions by integer
+value on their defined domain, including integer/natural conversion wrappers.
+This is an observation identity, not an arena rewrite: original axes and their
+partial-operation conditions remain intact. The complete triangular solve runs
+before original equations are checked, because an observed product can eliminate
+one dimension before its constituent dimensions are individually known. Inexact
+inversion, zero divisors, undefined axes, and inconsistent extents are rejected.
+
+Loop carries represent changes to values. An element write changes the contents
+of its existing place and keeps its storage identity in ordered and parallel
+loops alike; leaf events retain the mutation ordering. Copies of views preserve
+the view's geometry and acquire independent storage. An index-map prefix is not
+an identity view of the entire backing tensor.
+
+Provably nonnegative signed additions and products of natural shape values
+canonicalize to the same natural arithmetic DAG. Potentially negative signed
+expressions retain checked conversion and their original definedness conditions.

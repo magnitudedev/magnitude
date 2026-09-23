@@ -1,0 +1,14 @@
+# origin: C11:s_owned_alloc_write
+# cell: alloc/sl
+# cell: assign-element/sl
+# cell: compound-element/sl
+# cell: value-owned-tensor/exit
+# invoke:
+fn probe() -> tensor[4] f32:
+    let mut t = tensor[4] f32
+    t[0] = 1.0
+    t[1] = 2.0
+    t[2] = 3.0
+    t[3] = 4.0
+    t[0] += 2.0
+    return t

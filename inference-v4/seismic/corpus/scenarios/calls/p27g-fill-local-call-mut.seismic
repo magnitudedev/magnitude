@@ -1,0 +1,11 @@
+# origin: C13:p27g
+# invoke: i32[6]=seq
+fn bump[N](x: &mut tensor[N] i32):
+    for i in 0..N:
+        x[i] = x[i] + 1
+
+fn probe(input: &tensor[6] i32) -> i32:
+    let mut r = tensor[1] i32
+    r[:] = ones_like(r)
+    bump(r)
+    return r[0]

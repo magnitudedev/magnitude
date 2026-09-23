@@ -1,0 +1,5 @@
+# std: yes
+# origin: test:validation:corpus/composition.seismic:std_rms_norm
+# invoke std_rms_norm: f32[3,64]=rand(81) ; f32[64]=rand(82) ; f32[3,64]=zero ; f32:0.000001
+fn std_rms_norm[R, W](x: &tensor[R, W] f32, weight: &tensor[W] f32, y: &mut tensor[R, W] f32, eps: f32):
+    rms_norm(x, weight, y, eps)

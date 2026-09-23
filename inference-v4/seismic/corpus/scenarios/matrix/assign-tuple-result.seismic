@@ -1,0 +1,10 @@
+# cell: assign-tuple/result
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero
+fn pair(r: &tensor[8] f32) -> (f32, f32):
+    return (r[0], r[1] * 2.0)
+
+fn probe(x: &tensor[4, 8] f32, out: &mut tensor[4] f32):
+    let mut a = 0.0
+    let mut b = 0.0
+    (a, b) = pair(x[0])
+    out[0] = a + b

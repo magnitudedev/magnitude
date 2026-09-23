@@ -1,0 +1,8 @@
+# origin: C13:p19
+# rejected: "overlapping tensor arguments"
+fn pair[N](a: &mut tensor[N] i32, b: &mut tensor[N] i32):
+    a[0] = 1
+    b[0] = 2
+
+fn probe(out: &mut tensor[6] i32):
+    pair(out[0:3], out[2:5])

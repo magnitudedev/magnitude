@@ -1,0 +1,8 @@
+# cell: value-view/async
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; i32[1]=3
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; i32[1]=7
+# expect: failed
+fn probe(x: &tensor[4, 8] f32, out: &mut tensor[4] f32, bounds: &tensor[1] i32):
+    let lo = bounds[0]
+    let v = x[0, lo:lo + 2]
+    out[0] = v[1]

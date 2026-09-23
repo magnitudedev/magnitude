@@ -1,0 +1,11 @@
+# cell: if/arg
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; bool:true
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; bool:false
+fn clamp_first(r: &tensor[8] f32, c: bool) -> f32:
+    let mut v = r[0]
+    if c:
+        v = r[1]
+    return v
+
+fn probe(x: &tensor[4, 8] f32, out: &mut tensor[4] f32, c: bool):
+    out[0] = clamp_first(x[0], c)

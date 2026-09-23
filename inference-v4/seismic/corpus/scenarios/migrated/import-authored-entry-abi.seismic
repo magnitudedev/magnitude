@@ -1,0 +1,7 @@
+# origin: test:seismic-compiler:compiler/src/portable/import_tests.rs:authored_root_binds_entry_coordinates_and_nested_result_paths
+# invoke: f32[1]=2 ; f32:1.5 ; range:1..3
+fn probe(x: &tensor[1] f32, pair: (f32, range[4])) -> (tensor[1] f32, (f32, range[4])):
+    return (x + x, pair)
+
+lower probe(x: &tensor[1] f32, pair: (f32, range[4])) -> (tensor[1] f32, (f32, range[4])) for cpu:
+    return (x + x, pair)

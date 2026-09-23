@@ -1,0 +1,6 @@
+# origin: C11:s_index_quantity
+# cell: scalar-op-quantity/sl
+# invoke: index:7
+fn probe(i: index[100]) -> i32:
+    let j = i + 1
+    return i32(j * 2)

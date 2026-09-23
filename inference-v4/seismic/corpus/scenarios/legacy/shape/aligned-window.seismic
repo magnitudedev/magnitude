@@ -1,0 +1,4 @@
+# origin: test:validation:corpus/shape.seismic:aligned_window
+# invoke aligned_window: f32[8]=seq ; f32[4]=zero
+fn aligned_window[W](x: &tensor[W + 4] f32, y: &mut tensor[W] f32):
+    y[:] = x[4:W + 4]

@@ -1,0 +1,4 @@
+# origin: test:validation:corpus/shape.seismic:unaligned_window
+# invoke unaligned_window: f32[7]=seq ; f32[4]=zero
+fn unaligned_window[W](x: &tensor[W + 3] f32, y: &mut tensor[W] f32):
+    y[:] = x[3:W + 3]

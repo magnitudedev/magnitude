@@ -1,0 +1,9 @@
+# origin: C11:loop_if_inside
+# cell: if/ordered
+# invoke: f32[4]=1,2,3,4
+fn probe(x: &tensor[4] f32) -> f32:
+    let mut s = 0.0
+    for k in 0..4:
+        if x[k] > 2.0:
+            s = s + x[k]
+    return s

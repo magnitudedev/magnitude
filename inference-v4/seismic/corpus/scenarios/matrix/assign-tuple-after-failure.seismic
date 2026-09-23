@@ -1,0 +1,11 @@
+# cell: assign-tuple/after-failure
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero ; i32:2
+# expect: returned
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero ; i32:0
+# expect: failed
+fn probe[W](x: &tensor[4, W] f32, out: &mut tensor[4] f32, y: &mut tensor[4, W] f32, d: i32) where W >= 8:
+    let q = 10 / d
+    let mut a = 0.0
+    let mut b = 0.0
+    (a, b) = (x[0, 0], x[0, 1])
+    out[0] = a - b

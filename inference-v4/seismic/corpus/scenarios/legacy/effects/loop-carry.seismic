@@ -1,0 +1,8 @@
+# origin: test:validation:corpus/effects.seismic:loop_carry
+# invoke loop_carry: f32[4]=1,2,3,4
+fn loop_carry[N](seed: &tensor[N] f32) -> tensor[N] f32:
+    let mut state = to_owned(seed)
+    for step in 0..4:
+        for i in 0..N:
+            state[i] = state[i] * 0.5 + seed[i]
+    return state

@@ -1,0 +1,21 @@
+# cell: intrinsic-matrix/sl
+# backends: metal
+# undecided: reassociated
+# invoke: f32[8,8]=rand(172) ; f32[8,8]=rand(173)
+fn mm[M, N, K](a: &tensor[M, K] f32, b: &tensor[N, K] f32, into: tensor[M, N] f32) -> tensor[M, N] f32:
+    let mut out = into
+    for i in 0..M:
+        for j in 0..N:
+            let mut s = out[i, j]
+            for k in 0..K:
+                s = fma(a[i, k], b[j, k], s)
+            out[i, j] = s
+    return out
+
+lower mm[M, N, K](a: &tensor[M, K] f32, b: &tensor[N, K] f32, into: tensor[M, N] f32) -> tensor[M, N] f32
+    for metal requires metal.matrix:
+    return metal.matrix.matmul_add(a, b.T, into)
+
+fn probe(a: &tensor[8, 8] f32, b: &tensor[8, 8] f32) -> tensor[8, 8] f32:
+    let seed = zeros_like(a)
+    return mm(a, b, seed)

@@ -16,15 +16,42 @@ members = [
   "engine/models/qwen35",
   "engine/templates",
   "seismic-std",
-  "seismic/crates/seismic-lang",
-  "seismic/crates/seismic-metal",
-  "seismic/crates/seismic-cpu",
-  "seismic/crates/seismic-cuda",
-  "seismic/crates/seismic-cli",
-  "seismic/crates/seismic-compiler",
-  "seismic/crates/seismic-runtime",
-  "seismic/crates/seismic",
-  "seismic/crates/seismic-build",
+  "seismic/lang",
+  "seismic/ir",
+  "seismic/target",
+  "seismic/estimator/core",
+  "seismic/estimator/metal",
+  "seismic/backends/metal",
+  "seismic/backends/cpu",
+  "seismic/backends/cuda",
+  "seismic/cli",
+  "seismic/compiler",
+  "seismic/runtime",
+  "seismic/api",
+  "seismic/build",
+  "seismic/corpus",
+  "seismic/frontends/python",
+]
+default-members = [
+  "solver",
+  "solver/lab",
+  "engine",
+  "engine/templates",
+  "seismic-std",
+  "seismic/lang",
+  "seismic/ir",
+  "seismic/target",
+  "seismic/estimator/core",
+  "seismic/estimator/metal",
+  "seismic/backends/metal",
+  "seismic/backends/cpu",
+  "seismic/backends/cuda",
+  "seismic/cli",
+  "seismic/compiler",
+  "seismic/runtime",
+  "seismic/api",
+  "seismic/build",
+  "seismic/corpus",
 ]
 
 [workspace.package]
@@ -33,16 +60,20 @@ edition = "2021"
 license = "UNLICENSED"
 
 [workspace.dependencies]
+seismic-estimator-metal = { path = "seismic/estimator/metal" }
+seismic-ir = { path = "seismic/ir" }
+seismic-target = { path = "seismic/target" }
+seismic-estimator = { path = "seismic/estimator/core" }
 serde = { version = "=1.0.229", features = ["derive"] }
 seismic-std = { path = "seismic-std" }
-seismic-lang = { path = "seismic/crates/seismic-lang" }
-seismic-metal = { path = "seismic/crates/seismic-metal" }
-seismic-cpu = { path = "seismic/crates/seismic-cpu" }
-seismic-cuda = { path = "seismic/crates/seismic-cuda" }
-seismic-compiler = { path = "seismic/crates/seismic-compiler" }
-seismic-runtime = { path = "seismic/crates/seismic-runtime" }
-seismic = { path = "seismic/crates/seismic" }
-seismic-build = { path = "seismic/crates/seismic-build" }
+seismic-lang = { path = "seismic/lang" }
+seismic-metal = { path = "seismic/backends/metal" }
+seismic-cpu = { path = "seismic/backends/cpu" }
+seismic-cuda = { path = "seismic/backends/cuda" }
+seismic-compiler = { path = "seismic/compiler" }
+seismic-runtime = { path = "seismic/runtime" }
+seismic = { path = "seismic/api" }
+seismic-build = { path = "seismic/build" }
 
 [profile.dev]
 debug = "line-tables-only"

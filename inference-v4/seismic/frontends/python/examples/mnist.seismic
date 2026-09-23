@@ -1,0 +1,89 @@
+# Small MLP workload. Every computation, including gradients and updates,
+# is authored explicitly. Shapes permit small deterministic smoke fixtures.
+fn mnist_dense[B, I, O](x: &tensor[B, I] f32, w: &tensor[O, I] f32, bias: &tensor[O] f32) -> tensor[B, O] f32:
+    let mut y = tensor[B, O] f32
+    parallel for b in 0..B:
+        parallel for o in 0..O:
+            let mut acc = bias[o]
+            for i in 0..I:
+                acc = acc + x[b, i] * w[o, i]
+            y[b, o] = acc
+    return y
+
+fn mnist_relu[B, H](x: &tensor[B, H] f32) -> tensor[B, H] f32:
+    let mut y = zeros_like(x)
+    parallel for b in 0..B:
+        parallel for h in 0..H:
+            y[b, h] = max(x[b, h], 0.0)
+    return y
+
+fn mnist_forward[B, I, H, O](x: &tensor[B, I] f32, w1: &tensor[H, I] f32, b1: &tensor[H] f32, w2: &tensor[O, H] f32, b2: &tensor[O] f32) -> (tensor[B, H] f32, tensor[B, O] f32):
+    let z = mnist_dense(x, w1, b1)
+    let hidden = mnist_relu(z)
+    let logits = mnist_dense(hidden, w2, b2)
+    return hidden, logits
+
+# Target is a one-hot probability row. Return per-example cross entropy and
+# the gradient of the mean loss with respect to logits.
+fn mnist_loss[B, O](logits: &tensor[B, O] f32, target: &tensor[B, O] f32) -> (tensor[B] f32, tensor[B, O] f32):
+    let mut loss = tensor[B] f32
+    let mut gradient = zeros_like(logits)
+    parallel for b in 0..B:
+        let mut peak = logits[b, 0]
+        for o in 0..O:
+            peak = max(peak, logits[b, o])
+        let mut total = f32(0.0)
+        for o in 0..O:
+            total = total + exp(logits[b, o] - peak)
+        let mut row_loss = f32(0.0)
+        for o in 0..O:
+            let shifted = logits[b, o] - peak
+            row_loss = row_loss + target[b, o] * (log(total) - shifted)
+            gradient[b, o] = (exp(shifted) / total - target[b, o]) / f32(B)
+        loss[b] = row_loss
+    return loss, gradient
+
+fn mnist_dense_backward[B, I, O](x: &tensor[B, I] f32, w: &tensor[O, I] f32, dy: &tensor[B, O] f32) -> (tensor[O, I] f32, tensor[O] f32, tensor[B, I] f32):
+    let mut dw = zeros_like(w)
+    let mut db = tensor[O] f32
+    let mut dx = zeros_like(x)
+    parallel for o in 0..O:
+        let mut sum_bias = f32(0.0)
+        for b in 0..B:
+            sum_bias = sum_bias + dy[b, o]
+        db[o] = sum_bias
+        parallel for i in 0..I:
+            let mut acc = f32(0.0)
+            for b in 0..B:
+                acc = acc + dy[b, o] * x[b, i]
+            dw[o, i] = acc
+    parallel for b in 0..B:
+        parallel for i in 0..I:
+            let mut acc = f32(0.0)
+            for o in 0..O:
+                acc = acc + dy[b, o] * w[o, i]
+            dx[b, i] = acc
+    return dw, db, dx
+
+fn mnist_relu_backward[B, H](hidden: &tensor[B, H] f32, dy: &tensor[B, H] f32) -> tensor[B, H] f32:
+    let mut dx = zeros_like(hidden)
+    parallel for b in 0..B:
+        parallel for h in 0..H:
+            dx[b, h] = select(hidden[b, h] > 0.0, dy[b, h], 0.0)
+    return dx
+
+fn mnist_sgd[O, I](w: &mut tensor[O, I] f32, bias: &mut tensor[O] f32, dw: &tensor[O, I] f32, db: &tensor[O] f32, rate: f32):
+    parallel for o in 0..O:
+        bias[o] = bias[o] - rate * db[o]
+        parallel for i in 0..I:
+            w[o, i] = w[o, i] - rate * dw[o, i]
+
+fn mnist_step[B, I, H, O](x: &tensor[B, I] f32, target: &tensor[B, O] f32, w1: &mut tensor[H, I] f32, b1: &mut tensor[H] f32, w2: &mut tensor[O, H] f32, b2: &mut tensor[O] f32, rate: f32) -> tensor[B] f32:
+    let (hidden, logits) = mnist_forward(x, w1, b1, w2, b2)
+    let (loss, dy) = mnist_loss(logits, target)
+    let (dw2, db2, dh) = mnist_dense_backward(hidden, w2, dy)
+    let dz = mnist_relu_backward(hidden, dh)
+    let (dw1, db1, dx) = mnist_dense_backward(x, w1, dz)
+    mnist_sgd(w1, b1, dw1, db1, rate)
+    mnist_sgd(w2, b2, dw2, db2, rate)
+    return loss

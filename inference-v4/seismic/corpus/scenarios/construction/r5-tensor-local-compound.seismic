@@ -1,0 +1,9 @@
+# origin: C11:r5_tensor_local_compound
+# cell: compound-local-tensor/sl
+# invoke: f32[4]=1,1,1,1
+fn probe(x: &tensor[4] f32) -> f32:
+    let mut t = to_owned(x)
+    t += x
+    t -= 1.0
+    t *= 2.0
+    return reduce(t, 0, sum)

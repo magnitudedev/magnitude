@@ -1,0 +1,33 @@
+# origin: X1:w11
+# cell: alloc-participant-extent/parallel
+# invoke: f32[2,4]=1,2,3,4,5,6,7,8 ; f32[2]=-1,-1 ; index:10
+# expect: returned
+# pin: y = f32[2,4]=100,2,3,4,100,6,7,8
+# pin: out = f32[2]=10,10
+# invoke untaken: f32[2,4]=1,2,3,4,5,6,7,8 ; f32[2]=-1,-1 ; index:10
+# expect: returned
+# pin: y = f32[2,4]=-100,2,3,4,-100,6,7,8
+# pin: out = f32[2]=-1,-1
+fn probe[R, C](y: &mut tensor[R, C] f32, out: &mut tensor[R] f32, n: index[1000000000000]):
+    # C-5: the reaching condition of `t` reads `y`'s class, which the visit wrote
+    # earlier (through a `Reduce` operand). F1 (e) is deleted (C-5): the loop is
+    # one Nest and `t` is reserved at its static envelope (D12), so the in-kernel
+    # `Reduce` reads the visit's own write and every reached `t` lies inside the
+    # reservation. `untaken` reaches no `t`; under D12 it still reserves `4n`
+    # bytes per participant, exactly as a condition over loop-entry memory does.
+    parallel for r in 0..R:
+        y[r, 0] = 100.0
+        let s = reduce(y[r, :], 0, sum)
+        if s > 50.0:
+            let mut t = tensor[n] f32
+            t[:] = ones_like(t)
+            out[r] = reduce(t, 0, sum)
+
+fn untaken[R, C](y: &mut tensor[R, C] f32, out: &mut tensor[R] f32, n: index[1000000000000]):
+    parallel for r in 0..R:
+        y[r, 0] = -100.0
+        let s = reduce(y[r, :], 0, sum)
+        if s > 50.0:
+            let mut t = tensor[n] f32
+            t[:] = ones_like(t)
+            out[r] = reduce(t, 0, sum)

@@ -1,0 +1,17 @@
+# origin: test:seismic-runtime:runtime/src/feedback/binding_tests.rs:cpu_return_boundary_rounds_scalar_and_tensor_elements
+# invoke scalar: f32:1.0006
+# pin: result = f16[]=0x3c01
+# invoke tensor: f32[2]=1.0006,2
+# pin: result = f16[2]=0x3c01,0x4000
+# invoke stored: f32[2]=1.0006,2
+# pin: result = f16[2]=0x3c01,0x4000
+fn scalar(x: f32) -> f16:
+    return x
+
+fn tensor(x: &tensor[2] f32) -> tensor[2] f16:
+    return to_owned(x)
+
+fn stored(x: &tensor[2] f32) -> tensor[2] f16:
+    let mut y = tensor[2] f16
+    y[:] = to_owned(x)
+    return y

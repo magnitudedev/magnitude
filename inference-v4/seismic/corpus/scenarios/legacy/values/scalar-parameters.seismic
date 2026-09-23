@@ -1,0 +1,9 @@
+# origin: test:validation:corpus/values.seismic:scalar_parameters
+# invoke scalar_parameters: f32:1.5 ; i32:4 ; u32:5 ; bool:true
+# invoke scalar_parameters: f32:-1.5 ; i32:-4 ; u32:4294967295 ; bool:true
+fn scalar_parameters(a: f32, b: i32, c: u32, flag: bool) -> (f32, i32, u32, bool):
+    let x = a * 2.0 + 0.5
+    let y = b * 3 - 1
+    let z = c + 7
+    let w = flag and x > 0.0
+    return x, y, z, w

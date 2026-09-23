@@ -1,0 +1,5 @@
+# origin: C30:G-C30-6
+# invoke: i32[8]=seq ; i32[2]=seq
+# pin: result = i32[4]=0,1,2,3
+fn probe[H, KV](x: &tensor[H] i32, k: &tensor[KV] i32) -> tensor[H / KV] i32:
+    return x[0:H / KV] * 1

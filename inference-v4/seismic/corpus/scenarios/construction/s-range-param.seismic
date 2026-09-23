@@ -1,0 +1,8 @@
+# origin: C11:s_range_param
+# cell: value-range/sl
+# invoke: range:2..5
+fn probe(r: range[10]) -> i32:
+    let mut s = 0
+    for k in r:
+        s = s + i32(k)
+    return s

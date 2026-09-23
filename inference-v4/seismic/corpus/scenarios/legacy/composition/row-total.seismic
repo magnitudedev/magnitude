@@ -1,0 +1,7 @@
+# origin: test:validation:corpus/composition.seismic:row_total
+# invoke row_total: f32[16]=rand(80)
+fn row_total[N](x: &tensor[N] f32) -> f32:
+    return reduce(x, 0, sum)
+
+fn row_total[N](x: &tensor[N] f32) -> f32:
+    return reduce(x, 0, sum, unordered=true)

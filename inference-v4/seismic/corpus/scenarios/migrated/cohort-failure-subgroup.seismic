@@ -1,0 +1,31 @@
+# origin: test:seismic-runtime:runtime/src/feedback/evaluator_tests.rs:authored_failure_before_subgroup_preserves_prefix_and_reconverges_after_if
+# invoke: i32[64]=zero ; i32[64]=zero ; f32[1]=3 ; f32[64]=zero
+# expect: returned
+# pin: out = f32[64]=3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3
+# invoke: i32[64]=1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 ; i32[64]=1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 ; f32[1]=3 ; f32[64]=zero
+# expect: failed
+fn probe(indices: &tensor[64] i32, later: &tensor[64] i32, input: &tensor[1] f32, out: &mut tensor[64] f32):
+    parallel for i in 0..64:
+        out[i] = 7.0
+        let value = input[indices[i]]
+        if i < 32:
+            out[i] = value + 1.0
+        else:
+            out[i] = value + 2.0
+        let next = input[later[i]]
+        out[i] = next
+
+lower probe(indices: &tensor[64] i32, later: &tensor[64] i32, input: &tensor[1] f32, out: &mut tensor[64] f32)
+    for metal requires metal.subgroup:
+    parallel for i in 0..64:
+        out[i] = 7.0
+        let value = input[indices[i]]
+        let lane = metal.subgroup.lane_index()
+        let first = metal.subgroup.shuffle(value, lane)
+        if i < 32:
+            out[i] = first + 1.0
+        else:
+            out[i] = first + 2.0
+        let next = input[later[i]]
+        let second = metal.subgroup.shuffle(next, lane)
+        out[i] = second

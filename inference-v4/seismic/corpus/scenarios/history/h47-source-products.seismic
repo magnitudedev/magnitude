@@ -1,0 +1,109 @@
+# origin: H-47 test:seismic-runtime:runtime/src/feedback/cohort_tests.rs:source_products_and_failures
+# invoke selected: i32[4]=zero
+# pin: out = i32[4]=17,17,29,29
+# invoke captured_local: i32[4]=zero
+# pin: out = i32[4]=6,6,6,6
+# invoke captured_helper: i32[4]=zero
+# pin: out = i32[4]=6,6,6,6
+# invoke captured_selected: i32[4]=zero
+# pin: out = i32[4]=6,6,9,9
+# invoke captured_before_control: i32[4]=zero
+# pin: out = i32[4]=6,6,6,6
+# invoke captured_reduce: i32[4]=zero
+# pin: out = i32[4]=7,7,7,7
+# invoke captured_view: i32[4]=zero
+# pin: out = i32[4]=14,14,14,14
+# invoke captured_dynamic: i32[4]=zero
+# pin: out = i32[4]=4,4,4,4
+# invoke failing: i32[4]=4,4,4,4 ; i32[4]=zero ; i32[4]=zero
+# expect: failed
+fn piece(choose: bool) -> tensor[1] i32:
+    let mut result = tensor[1] i32
+    if choose:
+        let mut left = tensor[1] i32
+        left[0] = 17
+        result = left
+    else:
+        let mut right = tensor[1] i32
+        right[0] = 29
+        result = right
+    return result
+
+fn selected(out: &mut tensor[4] i32):
+    parallel for i in 0..4:
+        let chosen = piece(i < 2)
+        out[i] = chosen[0]
+
+fn doubled[N](input: &tensor[N] i32) -> tensor[N] i32:
+    return input + input
+
+fn captured_local(out: &mut tensor[4] i32):
+    parallel for i in 0..4:
+        let mut local = tensor[1] i32
+        local[0] = 3
+        let captured = local + local
+        local[0] = 5
+        out[i] = captured[0]
+
+fn captured_helper(out: &mut tensor[4] i32):
+    parallel for i in 0..4:
+        let mut local = tensor[1] i32
+        local[0] = 3
+        let captured = doubled(local)
+        local[0] = 5
+        out[i] = captured[0]
+
+fn captured_selected(out: &mut tensor[4] i32):
+    parallel for i in 0..4:
+        let mut local = tensor[1] i32
+        local[0] = 3
+        let mut captured = local + local
+        if i < 2:
+            captured = local + local
+        else:
+            captured = local * local
+        local[0] = 5
+        out[i] = captured[0]
+
+fn captured_before_control(out: &mut tensor[4] i32):
+    parallel for i in 0..4:
+        let mut local = tensor[1] i32
+        local[0] = 3
+        let captured = local + local
+        if i < 2:
+            local[0] = 5
+        for j in 0..2:
+            local[0] = i32(j) + 7
+        out[i] = captured[0]
+
+fn captured_reduce(out: &mut tensor[4] i32):
+    parallel for i in 0..4:
+        let mut local = tensor[2, 1] i32
+        local[0, 0] = 3
+        local[1, 0] = 4
+        let captured = reduce(local, 0, sum)
+        local[0, 0] = 5
+        out[i] = captured[0]
+
+fn captured_view(out: &mut tensor[4] i32):
+    parallel for i in 0..4:
+        let mut local = tensor[2] i32
+        local[0] = 3
+        local[1] = 4
+        let captured = reshape(local + local, (1, 2))
+        local[0] = 5
+        out[i] = captured[0, 0] + captured[0, 1]
+
+fn captured_dynamic(out: &mut tensor[4] i32):
+    parallel for i in 0..4:
+        let mut local = tensor[i+1,i+2] i32
+        local[:] = ones_like(local)
+        let captured = local + local
+        local[0,0] = 7
+        out[i] = captured[0,0] + captured[i,i+1]
+
+fn failing(indices: &tensor[4] i32, input: &tensor[4] i32, out: &mut tensor[4] i32):
+    parallel for i in 0..4:
+        out[i] = 7
+        let value = input[indices[i]]
+        out[i] = value

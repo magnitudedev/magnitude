@@ -1,0 +1,11 @@
+# origin: test:seismic-runtime:runtime/src/feedback.rs:measures_without_profile
+# invoke add: f32[0]=seq ; f32[0]=rand(153)
+# invoke add: f32[1]=seq ; f32[1]=rand(153)
+# invoke add: f32[6]=seq ; f32[6]=rand(153)
+# invoke add: f32[17]=seq ; f32[17]=rand(153)
+# invoke add: f32[257]=seq ; f32[257]=rand(153)
+fn add[N](x: &tensor[N] f32, y: &tensor[N] f32) -> tensor[N] f32 where N >= 0:
+    let mut result = zeros_like(x)
+    parallel for i in 0..N:
+        result[i] = x[i] + y[i]
+    return result

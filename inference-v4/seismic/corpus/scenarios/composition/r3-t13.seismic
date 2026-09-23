@@ -1,0 +1,9 @@
+# origin: X1:r3-t13
+# invoke: f32[2,4]=1,2,3,4,5,6,7,1 ; f32[2]=zero
+# pin: out = f32[2]=3,7
+fn probe[R, N](x: &tensor[R, N] f32, out: &mut tensor[R] f32):
+    parallel for r in 0..R:
+        let mut k = 0
+        for j in 0..N:
+            k = k + j
+        out[r] = x[r, k % N]

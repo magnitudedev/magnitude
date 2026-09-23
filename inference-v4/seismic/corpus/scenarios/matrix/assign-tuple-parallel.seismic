@@ -1,0 +1,8 @@
+# cell: assign-tuple/parallel
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero
+fn probe[W](x: &tensor[4, W] f32, out: &mut tensor[4] f32, y: &mut tensor[4, W] f32) where W >= 8:
+    parallel for i in 0..4:
+        let mut a = 0.0
+        let mut b = 0.0
+        (a, b) = (x[i, 0], x[i, 1])
+        out[i] = a - b

@@ -1,0 +1,5 @@
+# origin: C11:s_runtime_slice
+# invoke: f32[8]=1,2,3,4,5,6,7,8 ; i32:2
+fn probe(x: &tensor[8] f32, lo: i32) -> f32:
+    let v = x[lo:lo+3]
+    return reduce(v, 0, sum)

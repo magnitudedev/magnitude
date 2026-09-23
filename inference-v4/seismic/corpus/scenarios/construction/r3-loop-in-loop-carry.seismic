@@ -1,0 +1,8 @@
+# origin: C11:r3_loop_in_loop_carry
+# invoke: f32[4]=1,1,1,1
+fn probe(x: &tensor[4] f32) -> f32:
+    let mut s = 0.0
+    for a in 0..2:
+        for k in 0..4:
+            s = s + x[k]
+    return s

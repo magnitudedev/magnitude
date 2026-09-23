@@ -1,0 +1,48 @@
+# origin: test:seismic-runtime:runtime/src/feedback/reduction_tests.rs:scalar_reductions test:seismic-compiler:compiler/src/portable/streaming.rs:snapshot_materialization_is_owned_by_construction
+# invoke first: f32[2]=3,7
+# pin: result = f32[]=3
+# invoke dependent: f32[2]=3,7
+# pin: result = f32[]=16
+# invoke total: f32[4]=1,-2,3,4
+# pin: result = f32[]=6
+# invoke total: f32[0]=zero
+# pin: result = f32[]=0
+# invoke expression: f32[4]=1,-2,3,4
+# pin: result = f32[]=12
+# invoke expression: f32[0]=zero
+# pin: result = f32[]=0
+# invoke snapshot: f32[4]=1,-2,3,4
+# pin: result = f32[]=12
+# invoke narrow: f32[3]=2049,1,-2048
+# pin: result = f32[]=1
+# invoke transformed: f32[4]=1,-2,3,4
+# pin: result = f32[]=12
+# invoke nested: f32[2,3]=1,-2,3,4,5,-6
+# pin: result = f32[]=5
+fn first[N](x: &tensor[N] f32) -> f32:
+    return x[0]
+
+fn dependent[N](x: &tensor[N] f32) -> f32 where N >= 2:
+    return x[0] + x[1] + x[0] * 2.0
+
+fn total[N](x: &tensor[N] f32) -> f32 where N >= 0:
+    return reduce(x, 0, sum)
+
+fn expression[N](x: &tensor[N] f32) -> f32 where N >= 0:
+    return reduce(x + x, 0, sum)
+
+fn snapshot[N](x: &mut tensor[N] f32) -> f32:
+    let a = x + x
+    parallel for i in 0..N:
+        x[i] = 0.0
+    return reduce(a, 0, sum)
+
+fn narrow[N](x: &tensor[N] f32) -> f32:
+    return reduce(f32(f16(x)), 0, sum)
+
+fn transformed(x: &tensor[4] f32) -> f32:
+    let a = reshape(x + x, (2, 2))
+    return reduce(reduce(a, 1, sum), 0, sum)
+
+fn nested(x: &tensor[2,3] f32) -> f32:
+    return reduce(reduce(x, 1, sum), 0, sum)

@@ -1,0 +1,10 @@
+# origin: A8:G-A8-new-7
+# policies: exact
+# invoke: f32[4]=0x00000001,0x00800000,0x80000003,0x007fffff ; f32[4]=1,0.5,1,1 ; f32[4]=zero
+# expect: returned
+# pin: z = f32[4]=0x00000001,0x00400000,0x80000003,0x007fffff
+fn probe[N](x: &tensor[N] f32, y: &tensor[N] f32, z: &mut tensor[N] f32):
+    # Metal's native F32 multiply flushes subnormals (`FlushesSubnormals`), so
+    # under `exact` the product of a subnormal is the recipe's, bit for bit.
+    parallel for i in 0..N:
+        z[i] = x[i] * y[i]

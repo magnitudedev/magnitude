@@ -1,0 +1,11 @@
+# origin: test:validation:corpus/values.seismic:float_conversions
+# invoke float_conversions: f16[4]=rand(120) ; bf16[4]=rand(121) ; i32[4]=-3,0,5,1000 ; f32[4]=zero ; bf16[4]=zero ; f16[4]=zero ; i32[4]=zero
+fn float_conversions[N](h: &tensor[N] f16, b: &tensor[N] bf16, n: &tensor[N] i32,
+                        wide: &mut tensor[N] f32, narrow: &mut tensor[N] bf16,
+                        half: &mut tensor[N] f16, whole: &mut tensor[N] i32) where N >= 0:
+    parallel for i in 0..N:
+        let total = f32(h[i]) + f32(b[i]) + f32(n[i])
+        wide[i] = total
+        narrow[i] = bf16(total)
+        half[i] = f16(total)
+        whole[i] = i32(total * 4.0)

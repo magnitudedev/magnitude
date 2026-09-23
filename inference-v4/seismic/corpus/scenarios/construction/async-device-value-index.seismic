@@ -1,0 +1,4 @@
+# origin: C11:async_device_value_index
+# invoke: f32[8]=1,2,3,4,5,6,7,8 ; i32[1]=6
+fn probe(x: &tensor[8] f32, idx: &tensor[1] i32) -> f32:
+    return x[idx[0]]

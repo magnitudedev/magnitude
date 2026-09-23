@@ -1,0 +1,6 @@
+# origin: X1:r2-r01
+# rejected: "independent visits"
+fn probe(t: &mut tensor[6] f32):
+    parallel for i in 0..2:
+        let v = reshape(t, (3, 2))
+        v[i, 0] = t[2 * i + 2]

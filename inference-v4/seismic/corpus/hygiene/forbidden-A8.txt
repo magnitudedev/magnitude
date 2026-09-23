@@ -1,0 +1,43 @@
+# Identifiers deleted by A8 lanes (design A8 §5 "Hygiene"). One identifier per line;
+# `tests/hygiene.rs` fails on any word-boundary match in the scanned `.rs` files.
+
+# L2: native formation carries toolchain facts only; no reflection or reconciliation (C4a-9, G-T11-1)
+NativeLaunchDomain
+validate_reflection
+NativeReconciliationError
+reconcile_candidate_with_descriptions
+CacheFailure
+
+# L2: identity is computed once by `DeviceDescription::new` (G-T10-3)
+identity_of
+fingerprint_material
+
+# L2: native numerics are the `NativeFloatConformance` rows (G-C12-13)
+NumericalEnvironment
+approximate_transcendentals
+
+# L2 and LE: launch limits and argument memory (G-A8-new-2, IF §2.12.1)
+KernelAbiModel
+KernelAbiLayout
+participant_local_bytes
+
+# LE: kernel scalar results are device scalar cells, not backend commands
+ResultWords
+ResolvedBinding
+
+# L3: the CPU atomic helpers' process-global mutex (`static LOCK`, G-A8-new-5)
+LOCK
+
+# L5: SoftFloat prelude and the shared-crate Metal scalar vocabulary (C3-11, G-T14-3)
+SOFTFLOAT_PRELUDE
+ScalarEmissionFamily
+
+# L1 (done): Metal isolation and library helpers (C4b-15)
+queue_retained
+compile_library
+
+# L6: CUDA matrix emission (G-T10-2)
+read_to_names
+
+# IF I-17: no occupancy fact
+resident_subgroups

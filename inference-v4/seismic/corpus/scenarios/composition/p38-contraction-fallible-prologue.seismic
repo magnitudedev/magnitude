@@ -1,0 +1,11 @@
+# origin: X1:P38
+# invoke: f32[3,4]=rand(33) ; f32[5,4]=rand(34) ; i32[5]=0,1,2,3,0 ; f32[4]=1,2,3,4 ; f32[3,5]=zero
+# invoke: f32[3,4]=rand(33) ; f32[5,4]=rand(34) ; i32[5]=0,1,9,3,0 ; f32[4]=1,2,3,4 ; f32[3,5]=zero
+# expect: failed
+fn probe[M, N, K](a: &tensor[M, K] f32, b: &tensor[N, K] f32, sel: &tensor[N] i32, bias: &tensor[4] f32, y: &mut tensor[M, N] f32):
+    parallel for i in 0..M:
+        parallel for j in 0..N:
+            let mut acc = bias[sel[j]]
+            for k in 0..K:
+                acc = fma(a[i, k], b[j, k], acc)
+            y[i, j] = acc

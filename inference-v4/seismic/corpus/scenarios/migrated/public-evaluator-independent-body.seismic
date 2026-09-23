@@ -1,0 +1,6 @@
+# origin: test:seismic-runtime:runtime/src/feedback/evaluator_tests.rs:cpu_public_evaluator_selects_and_executes_an_independent_body
+# invoke: i32[4]=1,2,3,4 ; i32[4]=zero
+# pin: out = i32[4]=2,3,4,5
+fn probe(input: &tensor[4] i32, out: &mut tensor[4] i32):
+    parallel for i in 0..4:
+        out[i] = input[i] + 1

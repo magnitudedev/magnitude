@@ -8,116 +8,51 @@ applies_to:
 
 # Seismic numerical precision
 
-Numerical precision is an observable compilation contract and a hard selection constraint. It is
-not a source-level permission, a backend-wide fast-math mode, or a performance penalty.
+Numerical precision is an observable whole-entry compilation contract and a hard selection constraint. It is not a source-level permission, a backend-wide fast-math setting, or a performance penalty.
 
-An explicitly selected top-level native implementation is outside compiler selection. Its
-generated `native_for_device` API therefore accepts no precision policy and carries no inferred or
-qualified numerical assessment. Selecting it asserts that the authored native asset implements
-the attached portable function contract. This is an implementation conformance obligation, not a
-caller precondition, an `unsafe` call, or permission for silent fallback. The direct Metal compiler
-still disables fast math by default.
+An explicitly selected top-level native implementation is outside compiler selection. Selecting it asserts that the authored asset implements the attached portable function contract. It cannot silently fall back.
 
-## Authority
+## Source authority and policies
 
-The first applicable portable function body defines reference operation order, casts,
-accumulation, rounding, and exceptional-value behavior. Unary reference transcendental operations
-are defined by the versioned recipe in `seismic-lang`: one ordered graph of ordinary f32/u32/i32
-primitive steps with rounding after every floating step. The semantic interpreter evaluates that
-graph and kernel construction instantiates that same graph; neither owns another formula. “Exact”
-means zero deviation from this language-defined recipe. It does not claim the recipe is the
-correctly-rounded mathematical real function. `exp_fast` is explicitly approximate and is never
-silently treated as reference `exp`. FMA, min, and max retain their direct multi-operand primitive
-semantics rather than entering the unary recipe.
+The first applicable portable body defines reference operation order, casts, accumulation, rounding, and exceptional-value behavior. The interpreter and portable construction use the same versioned scalar recipes. Each declared floating step rounds at its declared output. Source exp_fast and exp name the same computation; an approximate exponential is a separate physical choice. Source authors cannot assert a tolerance or attach evidence.
 
-Other portable bodies and target implementations are alternatives; their presence asserts
-availability, not equivalence.
+The caller chooses one policy for the complete result, final writable input state, source failures, and progress:
 
-The compilation caller owns acceptable output deviation. A policy is part of specialization
-identity and is either exact, explicitly bounded, or unconstrained. Unconstrained selection is for
-exploration and carries no production numerical guarantee.
+| Policy | Selection requirement |
+| --- | --- |
+| Exact | The physical execution preserves the reference contract, including permitted outcomes and representation rules. |
+| Bounded | A derived whole-entry relation establishes the declared absolute, relative, ULP, and special-value limits. Exact implementations also satisfy it. |
+| Unconstrained | Floating deviation may be unbounded only after discrete values, memory, effects, failures, and progress are established. |
 
-Kernel authors express computations and ordinary domain facts. They do not assert tolerances or
-evidence. Structural partial-value correctness is independent from numerical precision.
+Bounded tolerances do not themselves prove an implementation applicable. The supported alternative analysis has no general nonzero-error bound, so an unresolved bounded alternative stays unselectable. Search effort and diagnostic comparison cannot turn it into an incumbent.
 
-## Evidence and selection
+## Construction and applicability
 
-Every selected execution has one numerical assessment: exact, proven, qualified, or unknown.
+The required source body is implemented by the compiler's source-directed operations, complete value transport, and structured continuation. Its numerical applicability follows those actual constructions; no second whole-program replay is required to authorize the same computation. The compiler must still implement each scalar recipe, tensor operation, store, call, branch, repeat, failure, and native instruction faithfully. A source-body identity is not an assertion that arbitrary emitted code is exact.
 
-- Exact evidence denotes the reference computation or proved zero deviation.
-- Proven evidence is a conservative compiler bound over an identified input domain.
-- Qualified evidence is an elementwise comparison of one complete witness with the reference on
-  an identified corpus and native numerical environment.
-- Unknown is never interpreted as zero and is selectable only by an unconstrained policy.
+Selecting a different body or physical operation requires analysis of its actual relationship to the required computation. An exact helper replacement preserves complete call behavior: results and descriptors, observable writable state, failure cause and prefix, and progress for every admitted input. The parent imports that applicability through the actual call. Local floating tolerances cannot simply be conjoined: later operations or discrete decisions can amplify or change a helper's error. An unsupported relation remains Pending, including under Unconstrained when discrete or effect behavior is unresolved.
 
-Numerical admissibility is a hard solver constraint encoded before solving: a predicate over
-decisions and invocation symbols that is true exactly when the derived transfer satisfies the
-policy analytically or matching evidence exists. It is never checked after selection. Performance
-is optimized only within the admissible family. Evidence is keyed by exact implementation identity
-and decision assignment, numerical-environment identity, semantic domain predicate, policy, corpus, and
-qualification version; it does not transfer across any of these.
+One construction-owned numerical applicability determines both solver admission and final retention. Its accepted region and explanation are derived together. An unresolved physical alternative remains in the structural domain but is not selectable. Neither factories, native signatures, mode labels, observations, nor callers may attach an independent approval guard. Precision policy participates in specialization identity; an applicability result is never reused under a different policy without re-evaluation.
 
-Every implementation's transfer is derived from its actual operations, order, data types,
-reductions, approximations, and intrinsic semantics; it is never a manually asserted label.
-Transfers compose through spliced calls, repeats, reductions, and dtype conversions with one
-model, so local and accumulated error share it. When no admissible assignment exists over some
-part of the target domain, preparation fails with `NumericalPolicyInfeasible`. Search effort
-limits optimization only and cannot turn a feasible program into a no-incumbent failure.
+## Native numerical contract
 
-A qualification retains the exact bounded policy used for elementwise checking. It may satisfy a
-later policy only when every tolerance and special-value requirement is at least as permissive and
-the input-domain facts are identical. Aggregate maxima alone never reconstruct a combined
-absolute/relative envelope.
+Native formation preserves the operation recipes and compiler options assessed before selection. Contraction, reassociation, FTZ/DAZ, approximate math, changed accumulation width, storage rounding, and target intrinsics are distinct physical choices. A typed native Cast is not automatically the source-defined conversion. CPU, Metal, and CUDA emitters must preserve the selected recipe's rounding boundaries, narrow payloads, signed zero, subnormals, infinities, and NaN behavior. A backend unable to do so cannot advertise the required source mapping.
 
-## Metrics
+Native artifact and numerical-environment identities protect reuse of an assessed formed implementation. Reflected signatures and matching result types alone do not establish its numerical behavior.
 
-For each finite output element, comparison records absolute error, scale-stabilized relative error,
-and published-dtype ULP distance. Acceptance uses the combined envelope
-`abs_error <= atol + rtol * max(abs(reference), relative_floor)` plus any ULP limit. NaN, infinity,
-signed-zero, and subnormal changes are counted and governed independently.
+## Observation and comparison
 
-The same comparison semantics govern qualification, backend sweeps, and engine validation.
+The interpreter and comparator diagnose and test implementations; they do not create selectable scope. A completed reference outcome owns returned values, final input state, and permitted outcome information. Comparison uses the actual completed native observation and checks every subject's geometry and read-only bytes before numeric differences. Integer and Boolean subjects remain exact under every floating policy.
 
-## Backend guarantees
+For finite floating elements, diagnostic comparison records absolute error, scale-stabilized relative error, and published-dtype ULP distance. The bounded comparison envelope is abs_error <= atol + rtol * max(abs(reference), relative_floor), together with any ULP and special-value rules. NaN, infinity, signed-zero, and subnormal changes are counted separately. A passing sample, corpus, feedback observation, or benchmark never grants numerical applicability. A definite mismatch from an admitted candidate is a compiler or backend defect, not a reason to widen tolerance or gather more samples.
 
-Fast math is off unless a concrete implementation operation is admitted by the policy through
-its recorded transfer. Reassociation, approximate transcendentals, contraction, storage and
-accumulation dtype, publication rounding, flush-to-zero, and backend intrinsics are distinct
-numerical effects recorded during kernel construction. Native compilation reproduces exactly the
-choices assessed before selection; it cannot enable a relaxation the transfer does not record.
-Each ordinary operation produced by a reference recipe is a separate rounding boundary. CPU
-workers enter a saved/restored strict IEEE floating environment (nearest-even and gradual
-underflow), Cranelift receives distinct strict operations, CUDA emits rounding-qualified PTX
-without `.ftz`, and Metal uses precise non-fast-math operations. A backend unable to preserve those
-boundaries cannot advertise the reference path; contraction, reassociation, FTZ/DAZ, or native
-approximate math must be represented by a different implementation and numerical transfer.
+## Intentional limits and acceptance
 
-## Runtime and identity
+Alternative analysis is conservative and may remain Pending. The general required source construction must remain available for every legal entry, subject to real target and resource limits. If an ordinary operation cannot be constructed faithfully, that is an implementation gap to fix, not numerical evidence to seek. There is no empirical qualification side channel.
 
-Preparation accepts an immutable evidence catalog; a record participates only through the
-admissibility predicate of the implementation it keys. Every executable variant carries its
-numerical assessment (exact, proven, qualified with evidence keys, or unknown) and the policy
-identity it was prepared under. Runtime never re-evaluates numerical legality.
-
-Changing the policy or available evidence changes the preparation identity.
-`NumericalEnvironmentIdentity` is distinct from compatibility and per-open
-execution-profile identities. Reprofiling unchanged numerical behavior cannot
-invalidate evidence, while any change to emitted numerical mode or the native
-kernel's numerical contract does.
-
-## Intentional limits
-
-Static proof coverage is conservative. A numerical effect without a checked transfer rule remains
-unknown; the compiler selects the exact reference path or requires matching whole-witness
-qualification. It never invents a bound to obtain a faster result.
-
-## Acceptance criteria
-
-- Exact compilation cannot select nonzero or unknown deviation.
-- Bounded compilation accepts only exact, sufficient proven, or explicitly permitted matching
-  qualified evidence.
-- Several local deviations are accepted only through a whole-entry assessment.
-- A threshold change may change the selected witness, but cannot widen evidence implicitly.
-- Unknown analysis and special-value changes cannot disappear into a performance objective.
-- Source syntax has no `admit` escape hatch; partial-value checking is numerical-policy agnostic.
-- Direct native selection is explicit and cannot be mistaken for policy-checked compiler selection.
+- Exact selection never accepts unknown or nonzero deviation.
+- Bounded selection accepts an exact implementation or an established sufficient whole-entry bound; otherwise the alternative remains unresolved.
+- Unconstrained selection never relaxes discrete values, memory, effect order, failure prefix, or progress requirements.
+- Calls import selected child applicability; a Pending child cannot become Exact merely because its parent used the required body.
+- Observations may reveal defects but never create or enlarge accepted regions.
+- Direct native selection remains explicit and separate from policy-checked compiler selection.

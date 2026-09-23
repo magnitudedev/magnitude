@@ -1,0 +1,15 @@
+//! Authoritative executable IR and its coordinated construction owner.
+//! No compiler, native backend, solver, or runtime dependency.
+
+pub mod construction;
+pub mod execution;
+pub mod identity;
+pub mod kernel;
+pub mod region;
+pub mod repr;
+pub mod schedule;
+pub mod storage;
+pub mod target;
+pub mod tensor_view;
+
+pub mod metal;

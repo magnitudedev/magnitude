@@ -1,0 +1,16 @@
+# origin: X1:P35
+# invoke: bool:true ; f32[4]=1,2,3,4
+# pin: result = f32[]=7
+# invoke: bool:false ; f32[4]=1,2,3,4
+# pin: result = f32[]=3
+fn probe(c: bool, x: &tensor[4] f32) -> f32:
+    let mut a = tensor[4] f32
+    let mut b = tensor[4] f32
+    a[0] = x[0]
+    a[1] = x[1]
+    b[0] = x[2]
+    b[1] = x[3]
+    let mut t = a
+    if c:
+        t = b
+    return t[0] + t[1]

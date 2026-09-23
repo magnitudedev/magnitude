@@ -1,0 +1,10 @@
+# origin: C11:r2_call_in_if_scalar
+# invoke: f32:1
+fn helper(a: f32) -> f32:
+    return a * 3.0
+
+fn probe(x: f32) -> f32:
+    let mut y = x
+    if x > 0.0:
+        y = helper(x)
+    return y

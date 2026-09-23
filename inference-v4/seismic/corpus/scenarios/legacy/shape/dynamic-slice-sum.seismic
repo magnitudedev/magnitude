@@ -1,0 +1,7 @@
+# origin: test:validation:corpus/shape.seismic:dynamic_slice_sum
+# invoke dynamic_slice_sum: f32[6]=seq ; i32:1 ; i32:4
+# invoke dynamic_slice_sum: f32[6]=seq ; i32:4 ; i32:1
+# expect: failed
+fn dynamic_slice_sum[N](x: &tensor[N] f32, lo: i32, hi: i32) -> f32:
+    let window = x[lo:hi]
+    return reduce(window, 0, sum)

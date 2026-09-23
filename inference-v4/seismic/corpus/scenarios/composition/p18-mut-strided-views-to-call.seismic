@@ -1,0 +1,11 @@
+# origin: X1:P18
+# invoke: f32[4,4]=1,2,3,4,5,6,7,1,2,3,4,5,6,7,1,2 ; bool:true
+# invoke: f32[4,4]=1,2,3,4,5,6,7,1,2,3,4,5,6,7,1,2 ; bool:false
+fn bump[N](v: &mut tensor[N] f32):
+    for i in 0..N:
+        v[i] = v[i] + 1.0
+fn probe(out: &mut tensor[4, 4] f32, c: bool):
+    if c:
+        bump(out[1, 1:4])
+    else:
+        bump(out[1:4, 2])

@@ -1,0 +1,15 @@
+# origin: test:validation:corpus/effects.seismic:branch_result
+# invoke branch_result: f32[4]=1,2,3,4 ; bool:true
+# invoke branch_result: f32[4]=1,2,3,4 ; bool:false
+fn branch_result[N](x: &tensor[N] f32, choose: bool) -> (tensor[N] f32, f32):
+    let mut out = zeros_like(x)
+    let mut tag = f32(0.0)
+    if choose:
+        for i in 0..N:
+            out[i] = x[i] + 1.0
+        tag = 1.0
+    else:
+        for i in 0..N:
+            out[i] = x[i] - 1.0
+        tag = -1.0
+    return out, tag

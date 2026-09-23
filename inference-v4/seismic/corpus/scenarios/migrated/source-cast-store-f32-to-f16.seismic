@@ -1,0 +1,24 @@
+# origin: test:seismic-runtime:runtime/src/feedback/payload_tests.rs:source_cast_payloads
+# invoke cast_value: f32:0x0 ; f16[1]=zero
+# invoke cast_value: f32:0x80000000 ; f16[1]=zero
+# invoke cast_value: f32:0x1 ; f16[1]=zero
+# invoke cast_value: f32:0x80000001 ; f16[1]=zero
+# invoke cast_value: f32:0x33000000 ; f16[1]=zero
+# invoke cast_value: f32:0x33000001 ; f16[1]=zero
+# invoke cast_value: f32:0x33800000 ; f16[1]=zero
+# invoke cast_value: f32:0x387fc000 ; f16[1]=zero
+# invoke cast_value: f32:0x38800000 ; f16[1]=zero
+# invoke cast_value: f32:0x3f801000 ; f16[1]=zero
+# invoke cast_value: f32:0x3f803000 ; f16[1]=zero
+# invoke cast_value: f32:0x477fe000 ; f16[1]=zero
+# invoke cast_value: f32:0x477ff000 ; f16[1]=zero
+# invoke cast_value: f32:0x7f800000 ; f16[1]=zero
+# invoke cast_value: f32:0xff800000 ; f16[1]=zero
+# invoke cast_value: f32:0x7f800001 ; f16[1]=zero
+# invoke cast_value: f32:0xff800001 ; f16[1]=zero
+# invoke cast_value: f32:0x7fc12345 ; f16[1]=zero
+# invoke cast_value: f32:0xffc12345 ; f16[1]=zero
+fn cast_value(a: f32, dst: &mut tensor[1] f16) -> f16:
+    let value = f16(a)
+    dst[0] = value
+    return value

@@ -1,0 +1,7 @@
+# origin: C13:p11c
+# invoke: i32[3,4]=seq
+fn seed[M, K](x: &tensor[M, M + K] i32) -> i32:
+    return i32(M) * 10 + i32(K)
+
+fn probe(input: &tensor[3, 4] i32) -> i32:
+    return seed(input)

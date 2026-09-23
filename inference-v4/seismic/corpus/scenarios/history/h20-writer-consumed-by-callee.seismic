@@ -1,0 +1,10 @@
+# origin: H-20
+# invoke: f32[9]=rand(9)
+fn consume[N](t: &tensor[N] f32) -> f32:
+    return reduce(t, 0, max)
+
+fn probe[N](x: &tensor[N] f32) -> f32:
+    let mut t = tensor[N] f32
+    parallel for i in 0..N:
+        t[i] = x[i] * x[i]
+    return consume(t)

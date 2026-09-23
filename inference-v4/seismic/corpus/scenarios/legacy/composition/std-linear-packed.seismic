@@ -1,0 +1,5 @@
+# std: yes
+# origin: test:validation:corpus/composition.seismic:std_linear_packed
+# invoke std_linear_packed: bf16[2,64]=rand(87) ; q4g64[4,64]=rand(88) ; bf16[2,4]=zero
+fn std_linear_packed[M, N, K](x: &tensor[M, K] bf16, weight: &tensor[N, K] q4g64, y: &mut tensor[M, N] bf16) where K % 64 == 0:
+    linear(x, weight, y)
