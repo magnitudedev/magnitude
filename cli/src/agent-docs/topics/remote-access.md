@@ -42,8 +42,16 @@ Ctrl+C stops the foreground server. Opening Magnitude Desktop on that computer t
 to Desktop and ends the foreground command.
 
 An available update never interrupts the server. When it reports a prepared update, stop the server
-and run `magnitude serve` again to install it before serving. A failed installation requires an
-explicit retry with `magnitude update install` while the server is stopped.
+and run `magnitude serve` again to install it before serving. On Linux, installation can remain
+deferred when system authorization is unavailable. Stop the server and run `magnitude update install`
+from a terminal to authorize installation or explicitly retry a failed attempt, then start it again.
+
+When using a service manager, configure restart on failure rather than unconditional restart:
+successful Desktop takeover ends `serve` normally and should leave it stopped. For a systemd user
+service, use `Restart=on-failure` and `KillMode=control-group`. Enable user lingering if the server
+must run before login or after logout. A foreground SSH session is not a persistent service;
+disconnecting it stops its process tree. Stop the service-manager unit before an explicit update
+installation, then start the unit afterward.
 
 ## WSL
 

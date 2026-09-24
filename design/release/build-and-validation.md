@@ -48,6 +48,9 @@ archives, not only on intermediate build outputs.
   retire prepared state and private helper/transaction storage, and leave each bundle accepted by
   signature, notarization-ticket and Gatekeeper checks. Native unit
   tests or injected verifier tests do not substitute for this gate.
+  Virtual signing runners may explicitly select the published CPU engine base for service
+  readiness; physical-host acceptance separately verifies accelerator inference. Fixture publisher
+  proofs are retained before runtime checks so failures can be replayed without retaining private keys.
 - Full-installation script acceptance consumes real packages over HTTPS with native publisher
   verification enabled. It covers fresh and repeat installation, invalid publisher proof,
   command registration, stopped state after installation, and public foreground serve plus CLI

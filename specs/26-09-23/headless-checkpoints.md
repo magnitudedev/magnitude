@@ -1797,3 +1797,62 @@ deadline; captured stdout alone cannot certify command success. The Windows inst
 desktop-owned CLI regressions were rerun with strict exit checks, as recorded above.
 
 Completion handoff remains on the headless branch for user review. No merge to main is authorized.
+
+Checkpoint ace43d66bbbacc9ead68c2ce9f4a5120bef6d7ff includes the request-construction fix and
+strict installed-query acceptance. Signed Mac acceptance run 35964002659 targets that exact commit.
+
+Executed the signed 0.0.504 fixture from run 35961686952 locally under
+`/tmp/magnitude-headless-transfer/mac-a0e4a786-ui` with its own profile and port 11239, using published
+ICN 0.1.5. Signature verification passed. Foreground serve reached Ready; launching the matched
+Desktop yielded the foreground process with exit 0. Computer use navigated Discover, Status and
+Settings, visually confirmed Ready at the isolated port and changed the isolated theme preference.
+Desktop-owned hardware and models-status commands both returned useful output and exit 0. Normal
+UI Quit ended Desktop with exit 0 and passive status reported Stopped/None. No test owner remains.
+This checks the a0e4a786 packaged application; ace43d66 changes installation scripting and the
+acceptance helper, not its application runtime. The personal installed app was not replaced.
+
+The maintained `test-serving-inference.ts` acceptance client exercises the public inference route
+of an already running isolated application. It validates nonempty completion text and token usage,
+cancels after eight SSE chunks, and requires a subsequent successful completion. Its targeted
+release typecheck passes. A 48-token initial fixture budget exhausted reasoning before answer text;
+the test now permits 160 tokens and uses a short deterministic prompt.
+
+Mac signed 0.0.504 and Windows installed 0.0.505 both passed with the catalog-acquired
+lfm2.5-2.6b:gguf:q4 model, then passed again after an explicit model stop and automatic reload.
+Mac returned 35 completion tokens per ordinary request; Windows returned 47. Mac receipts are in
+`/tmp/magnitude-headless-transfer/mac-a0e4a786-ui/inference{,-reload}-result.json`; Windows receipts
+and final stopped status are in `/tmp/magnitude-headless-transfer/windows-final-inference-evidence.txt`.
+After Windows inference, opening Desktop took ownership, strict models/hardware queries succeeded,
+and Quit left Stopped/None. Mac model stop followed by SIGTERM ended serve with exit 0 and Stopped/None.
+
+Ubuntu inference remains in progress. The 6 GiB no-swap VM produced answer text but subsequently
+evicted under the engine's memory supervision. Increased the disposable VM to 10 GiB; reboot cleared
+the /tmp test model cache, so the current profile is `/home/trg.guest/headless-final-inference`.
+At 10 GiB the same eviction recurred despite 8.6 GiB physical availability; the no-swap commit limit
+was only 4.8 GiB. Added a temporary 4 GiB swap file `/var/tmp/magnitude-acceptance.swap` for the
+remaining test. This swap is not in fstab and must be disabled and removed after the test.
+
+Signed Mac run 35964002659 passed request construction and progressed through the shell bootstrap
+to installed serve acceptance, which failed on the runner's Apple Paravirtual Metal device:
+`hardware calibration did not cover every enabled backend`. All native Mac/Windows/Linux lanes
+passed. This is not a signed replacement success. Detailed log:
+`/tmp/magnitude-headless-transfer/mac-35964002659-failure.log`. The original artifact download is
+still running. The harness currently signs later update records only after the initial serve gate,
+so retaining configuration and the initial offer alone is insufficient for local A-to-B-to-C-to-D
+replay. Finish this gate using a valid CPU inference fixture on the virtual runner or by retaining
+all signed update records before any runtime test; do not weaken readiness or publisher verification.
+
+The temporary swap did not change the LFM eviction result. Removed it (swapoff and unlink); the
+commit-limit hypothesis was not supported. Switching the Ubuntu inference gate to the compatible
+Gemma E2B configuration without speculative acceleration, rather than changing engine memory policy
+as part of this feature. The LFM eviction remains an observed limitation of that published engine
+and VM combination, not a passing inference receipt.
+
+The signed-runner inference fixture now has an explicit CPU-only option that acquires and verifies
+the published CPU base through the normal release acquisition code and writes its CPU declaration.
+It does not disable readiness or change production backend selection. Local acceptance against the
+signed Mac 0.0.504 application passed Ready, strict CLI queries, graceful Quit and Stopped/None with
+that exact CPU fixture (`/tmp/magnitude-headless-transfer/mac-cpu-serve-acceptance/result.json`).
+The signed harness now retains all four public release proofs immediately after build, before any
+runtime check. This permits later local replay without retaining ephemeral private signing keys.
+Targeted release typechecking passes with these changes. A new signed sequence run is still required.

@@ -16,7 +16,7 @@ Choose **Intel / AMD (x64)** for an x86-64 processor or **ARM64** for an ARM64 p
 
 ## Requirements
 
-Magnitude requires **glibc 2.35 or later** and a graphical desktop. Ubuntu 22.04 and Debian 12 meet the glibc requirement. An RPM download does not imply compatibility with every Red Hat release: RHEL 9's glibc 2.34 is below this minimum.
+Magnitude requires **glibc 2.35 or later**. Ubuntu 22.04 and Debian 12 meet the glibc requirement. An RPM download does not imply compatibility with every Red Hat release: RHEL 9's glibc 2.34 is below this minimum. The desktop window needs a graphical session; `magnitude serve` can run without one, including over SSH.
 
 Your package manager installs required desktop libraries. GPU inference also needs a supported driver; see [Hardware](/hardware). Alpine/musl packages are not available.
 
@@ -39,6 +39,61 @@ sudo dnf install ./magnitude-desktop.rpm
 
 Open **Magnitude** from your applications menu and follow [Quick start](/get-started).
 
+## Headless operation
+
+The same package installs the `magnitude` command. Start a foreground server with:
+
+```sh
+magnitude serve
+```
+
+Keep that terminal open. In another terminal, `magnitude status` reports readiness and
+`magnitude hardware` queries the running server. Ctrl+C stops it. Ordinary CLI commands connect
+to an already running server or desktop; they do not start one automatically. Opening the desktop
+transfers ownership from the foreground server to the desktop.
+
+For remote access through SSH, run this on your own computer:
+
+```sh
+ssh -N -L 10101:127.0.0.1:10100 user@server
+```
+
+While the tunnel is open, use `http://127.0.0.1:10101/inference/v1` as your OpenAI-compatible
+base URL. Run model-management commands on the server. `magnitude docs remote-access` describes
+other connection options.
+
+### Start with systemd
+
+To keep serving after SSH disconnects, create `~/.config/systemd/user/magnitude-headless.service`:
+
+```ini
+[Unit]
+Description=Magnitude headless server
+
+[Service]
+ExecStart=/usr/bin/magnitude serve
+Restart=on-failure
+RestartSec=1
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
+```
+
+Enable it with:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now magnitude-headless.service
+```
+
+For startup before login and operation after logout, enable lingering for your account with
+`loginctl enable-linger "$USER"`; your system may require administrator authorization.
+Use `journalctl --user -u magnitude-headless.service` for logs and
+`systemctl --user stop magnitude-headless.service` to stop it. `Restart=on-failure` recovers from
+a crash without restarting after a successful transfer to the desktop.
+
 ## Background operation and updates
 
 Closing the window keeps inference running. Enable **Launch at login** in Settings to start Magnitude when you sign in. This is desktop login startup, not a system service that starts before login.
@@ -46,6 +101,12 @@ Closing the window keeps inference running. Enable **Launch at login** in Settin
 Some desktop environments don't display a tray icon. Reopen Magnitude from your applications menu; use **Quit Magnitude** to stop it.
 
 App updates use your system package manager and may ask for authorization. Use **Settings → Application updates** for the available actions.
+
+A running headless server can prepare an update but never restarts itself to install it.
+The next startup attempts installation before serving. If authorization is unavailable, the update
+remains prepared. Stop the server and run `magnitude update install` interactively to authorize
+installation or retry a failed attempt, then start the server again. For a systemd-managed server,
+stop and start its unit with `systemctl --user` around the installation command.
 
 ## Uninstall
 

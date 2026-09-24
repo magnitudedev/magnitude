@@ -119,6 +119,7 @@ jobs:
         env:
           MAGNITUDE_HEADLESS_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/magnitude-headless-signed
           MAGNITUDE_ACCEPTANCE_ICN_VERSION: "0.1.5"
+          MAGNITUDE_ACCEPTANCE_CPU_ONLY: "true"
         shell: bash
         run: |
           set -o pipefail
@@ -133,6 +134,7 @@ jobs:
             ${{ runner.temp }}/mac-headless-installer.log
             ${{ runner.temp }}/magnitude-headless-signed/result.json
             ${{ runner.temp }}/magnitude-headless-signed/configuration.json
+            ${{ runner.temp }}/magnitude-headless-signed/*/release.json
             ${{ runner.temp }}/magnitude-headless-signed/script-hosting/install/**/*.json
             ${{ runner.temp }}/magnitude-headless-signed/script-hosting/mac-script-result.txt
             ${{ runner.temp }}/magnitude-headless-signed/script-hosting/mac-script-evidence.*/*.log

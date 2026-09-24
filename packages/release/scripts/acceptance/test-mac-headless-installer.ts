@@ -8,7 +8,7 @@ import { appleSigning, signAppleCode } from "../apple/signing"
 import { compileAppleBun } from "../apple/compile-bun"
 import { desktopUpdateArchive } from "../../src/targets"
 import { sha256File } from "../../src/macos-app"
-import { signUpdateRelease } from "../../src/hosted-update/release"
+import { signUpdateRelease, UpdateRelease } from "../../src/hosted-update/release"
 import { signUpdateManifest, UpdateManifest } from "../../src/hosted-update/manifest"
 import { writeInstallationDistribution } from "../build/installation-distribution"
 import { makePreparedUpdateStore } from "../../../daemon-management/src/desktop-native/prepared-update"
@@ -35,10 +35,18 @@ const run = Effect.gen(function* () {
     Command.workingDirectory(root), Command.env(environment), Command.stdout("inherit"), Command.stderr("inherit"), Command.exitCode,
     Effect.filterOrFail(code => code === 0, code => new AcceptanceFailed({ message: `Acceptance command exited ${code}: ${executable}` })), Effect.asVoid)
   const versions = ["0.0.501", "0.0.502", "0.0.503", "0.0.504"] as const
-  for (const version of versions) yield* command(process.execPath, [join(import.meta.dir, "build-desktop.ts")], {
-    MAGNITUDE_ACCEPTANCE_VERSION: version, MAGNITUDE_ACCEPTANCE_OUTPUT: join(output, version),
-    MAGNITUDE_ACCEPTANCE_CONFIG: config, MAGNITUDE_ACCEPTANCE_STANDARD_BUNDLE_ID: "true",
-  })
+  const releases = new Map<string, UpdateRelease>()
+  for (const version of versions) {
+    yield* command(process.execPath, [join(import.meta.dir, "build-desktop.ts")], {
+      MAGNITUDE_ACCEPTANCE_VERSION: version, MAGNITUDE_ACCEPTANCE_OUTPUT: join(output, version),
+      MAGNITUDE_ACCEPTANCE_CONFIG: config, MAGNITUDE_ACCEPTANCE_STANDARD_BUNDLE_ID: "true",
+    })
+    const archive = join(output, version, "artifacts", desktopUpdateArchive("darwin-arm64"))
+    const release = yield* signUpdateRelease({ version, bytes: Number((yield* fs.stat(archive)).size), sha256: yield* sha256File(archive) },
+      { os: "darwin", arch: "arm64", package: "mac-zip" }, keys.privateKey)
+    releases.set(version, release)
+    yield* fs.writeFileString(join(output, version, "release.json"), yield* Schema.encode(Schema.parseJson(UpdateRelease))(release))
+  }
   const installed = join(output, "installed")
   yield* fs.makeDirectory(installed, { mode: 0o700 })
   const bundle = join(installed, "Magnitude.app"), resources = join(bundle, "Contents/Resources")
@@ -68,8 +76,7 @@ const run = Effect.gen(function* () {
   yield* signAppleCode(harness, "dev.magnitude.installer-acceptance", "bun")
   for (const [previous, replacement] of [[versions[0], versions[1]], [versions[1], versions[2]], [versions[2], versions[3]]] as const) {
     const archive = join(output, replacement, "artifacts", desktopUpdateArchive("darwin-arm64"))
-    const release = yield* signUpdateRelease({ version: replacement, bytes: Number((yield* fs.stat(archive)).size), sha256: yield* sha256File(archive) },
-      { os: "darwin", arch: "arm64", package: "mac-zip" }, keys.privateKey)
+    const release = releases.get(replacement)!
     const transfer = join(output, "transfer.zip")
     yield* fs.copyFile(archive, transfer)
     yield* Effect.gen(function* () {

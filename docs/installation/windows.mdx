@@ -19,9 +19,28 @@ The current Windows build supports CPU inference and compatible NVIDIA CUDA or V
 
 The installer installs for your user account under `%LOCALAPPDATA%\Programs\Magnitude`.
 
+## Command line and headless serving
+
+Open a new terminal after installation to use `magnitude`. Run `magnitude serve` to keep a server
+in that terminal without opening the desktop. Use another terminal for `magnitude status`,
+`magnitude hardware` and model commands. Ctrl+C stops the foreground server.
+
+Ordinary CLI commands connect to the running desktop or headless server. They do not start the
+app automatically. Opening Magnitude Desktop transfers ownership from `serve` to the desktop.
+
 ## Updates and removal
 
 Use **Settings → Application updates** to check for updates. **Restart to update** stops local inference while the application is replaced.
+
+A headless server never restarts itself for an update. It reports when an update is prepared;
+stop it and run `magnitude serve` again to install before serving. A failed installation requires
+an explicit `magnitude update install` while the server is stopped.
+
+Versions 0.1.4 and 0.1.5 can fail with “The downloaded update could not be saved.” These installed
+versions cannot receive the updater repair through their broken update path. Install a newer build
+containing the fix directly with its Windows installer. Deleting the updates directory does not
+repair the old updater. The fixed updater repairs the inherited permissions of the existing update
+cache; your downloaded models and settings remain separate from the application installation.
 
 Uninstall Magnitude through Windows **Settings → Apps**. Downloaded models and settings are stored separately in `%USERPROFILE%\.magnitude`; keep them if you intend to reinstall.
 
