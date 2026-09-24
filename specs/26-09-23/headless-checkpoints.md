@@ -1940,3 +1940,82 @@ is disabled. Packaged verification of these changes remains required.
 
 Additional Mac workspace, prepared-installation and recovery suites passed all 86 tests (136 across
 the two focused runs). Existing CLI suite passed 103 tests, including the new stopped-owner guidance.
+
+Checkpoint 07c39a14 records the completed inference receipts, stopped-owner guidance, canonical
+Mac helper binding, native replacement diagnostics, release baseline refresh and explicit Windows
+session acceptance. Signed Mac and Windows run 35968945513 targets that checkpoint.
+
+Physical Mac desktop update regression using run 35965829695: Settings displayed retained failed
+installation and an explicit Retry update control. Clicking Retry installed 0.0.502, restarted
+Desktop, and returned Ready with matching CLI/service 0.0.502. The new bundle passed deep signature
+and platform assessment. The replacement rendered Discover and Settings normally. Changed the
+isolated theme to Light and disabled automatic downloads through Settings, then used normal Quit;
+passive status reported Stopped/None. Evidence is under
+`/tmp/magnitude-headless-transfer/mac-final-local`, including post-update status and queries.
+
+A subsequent finite 0.0.502-to-0.0.503 attempt from the test terminal again preserved 0.0.502.
+Read-only platform inspection found the terminal host lacks application-management authorization.
+No host permission was changed. An isolated finite-update verification script is prepared; testing
+it through an already-authorized terminal awaits user approval. This remains a local execution
+gate, while native desktop replacement has now passed. Do not claim the permission hypothesis
+fully confirmed until that controlled comparison completes.
+
+Prepared a local-only HTTPS update fixture and scoped CONNECT proxy outside the repository. Bun
+and Node fetch both verified the fixture certificate and a 32-byte archive Range response; TLS
+verification remains enabled and no OS trust store or routing was changed. The new signed Mac
+cohort's HTTPS origin permits actual Settings check/download/restart testing against these fixtures.
+
+Signed/native run 35968945513 completed successfully on checkpoint 07c39a14: Mac primitives,
+signed Mac installation, Windows native/signed installation, and Ubuntu 22.04/24.04 installed
+lifecycle lanes all passed. Windows receipt confirms 0.0.503, finite installation, foreground
+continuation and graceful exit; its desktop result is explicitly NoninteractiveLaunchRefused.
+Receipt: `/tmp/magnitude-headless-transfer/windows-35968945513/result.json`.
+
+## Final packaged acceptance and review handoff
+
+Source checkpoint: `07c39a14`. All five native/signed jobs in run `35968945513` passed.
+The downloaded Mac receipt confirms script installation and 0.0.504 with preparation, helper and
+transaction retired. Its HTTPS script receipt covers fresh/repeat installation, shell registration
+and invalid-signature rejection; the installed CLI receipt covers Headless Ready, queries and Quit.
+
+On the physical Mac, used this exact signed cohort in an isolated installation and profile.
+Actual Settings interaction checked for 0.0.502, displayed Available, downloaded through the HTTPS
+endpoint, displayed Ready, and installed only after clicking Restart to update. Desktop returned
+Ready at 0.0.502; packaged CLI and service versions matched. Light theme, automatic-download-off
+preference and cached model survived. Used My Models to load the cached LFM model, ran real generation,
+cancelled a stream after eight chunks, generated again, and stopped the model through the UI.
+Deep signature verification and platform assessment passed. Normal Quit left Stopped/None;
+preparation, installer helper and transaction were absent. No system trust or permission settings
+were changed. Test HTTPS/proxy and artifact-transfer servers were stopped.
+
+Evidence: `/tmp/magnitude-headless-transfer/mac-final-ui/result.json`,
+`post-update-inference.json`, `post-update-status.txt`, `final-status.txt`, and the computer-use
+observations in this task. Archive SHA-256:
+
+- 0.0.501: `731e2afa3191db931e0d3157f17c4b456e281d17ee8dae871914e9a98fe88a25`
+- 0.0.502: `e8d09790d3456bdaa6a5712625c3e716c330fcf02f7815d2c3c76be74339d827`
+
+Final acceptance map:
+
+| Contract | Evidence |
+| --- | --- |
+| Foreground ownership, containment, takeover and connect-only CLI | Native platform lanes and packaged lifecycle receipts above; Mac actual takeover/UI/CLI; Sparky SSH-loss/systemd receipts |
+| Existing Windows cache repair and successive updates | Native ACL recovery suites and signed Windows finite/startup receipt from 35968945513 |
+| Shared preparation, live-server preservation and startup continuation | Phase 7 focused/native receipts; final signed Mac A/B/C/D and Windows A/B/C cohorts |
+| Full package installation | HTTPS Mac fresh/repeat/rejection receipt; Windows strict script/PATH acceptance; native Ubuntu DEB and Fedora RPM receipts |
+| Real inference and cancellation | Physical Mac, Windows VM, Ubuntu VM and Sparky generation/cancellation/reload receipts above |
+| Existing desktop and CLI regressions | Mac computer-use R1–R6, final Settings update and post-update inference; Windows desktop-owned strict CLI; Linux installed Settings/login lifecycle |
+| Documentation and release readiness | Updated durable design and command docs, targeted package checks, CLI/Desktop suites, release preparation verification, pending Changeset |
+
+Coverage limits remain explicit: Windows guest computer-use input did not navigate reliably;
+Linux graphical testing used Playwright/Xvfb, not a visible desktop session. Mac native login
+registration was not exercised in the isolated fixture; native Linux login and existing login tests
+passed. The physical Mac terminal-host finite replacement refusal preserved the previous installation;
+the exact permission cause is not established by a controlled comparison. The optional authorized-
+terminal comparison was not run and is not needed to duplicate the passing signed CI finite-install
+scenario. No claim of local terminal-install success is made. Platform architecture/signing scope is
+that of the recorded runners and fixtures, not an assertion that every hardware combination was tested.
+
+Implementation and available-platform acceptance are complete for branch review. No release was
+published and no merge to main was performed. Further optional host-permission investigation is
+outside this completed acceptance pass. Stop after the final evidence checkpoint for user review.

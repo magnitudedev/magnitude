@@ -1,6 +1,6 @@
 # Headless serve: implementation and verification plan
 
-Status: implementation in final packaged verification. Branch: `headless`, baseline `772cfacb`.
+Status: implemented and verified for branch review; coverage limits are recorded in the checkpoint ledger. Branch: `headless`, baseline `772cfacb`.
 Prepared 2026-09-23. This is the execution plan for the whole feature, including updates,
 installation scripts, migration, documentation and release verification.
 
