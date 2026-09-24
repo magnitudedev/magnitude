@@ -2,4 +2,4 @@
 "@magnitudedev/cli": patch
 ---
 
-Require the network access API key for remote inference requests regardless of URL path case, so `/INFERENCE/...` no longer skips the check.
+Gate remote callers in the /rpc and inference route handlers instead of the middleware, so case, slash, and percent-encoded path variants can no longer skip the API key check.

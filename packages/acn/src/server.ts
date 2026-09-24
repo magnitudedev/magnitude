@@ -550,6 +550,7 @@ const makeCodexWebSocketProxy = (
 const makeInferenceProxy = (
   icn: InferenceProxyTarget,
   protocol: "openai" | "anthropic" | "codex" | "claude-code",
+  network: NetworkAccess,
   fetchTarget: InferenceFetch = fetch,
   usage?: ServingUsage,
 ) => {
@@ -564,6 +565,15 @@ const makeInferenceProxy = (
     const source = request.source
     if (!(source instanceof Request)) {
       return HttpServerResponse.text("Unsupported request transport", { status: 500 })
+    }
+    if (!isLocalCaller(request, network) && !authorizesRemoteInference({
+      authorization: request.headers.authorization,
+      "x-api-key": request.headers["x-api-key"],
+    }, network)) {
+      return HttpServerResponse.unsafeJson({ error: {
+        message: "A Magnitude API key is required from other devices. Copy it from Settings → Network access and send it as a Bearer token.",
+        type: "authentication_error",
+      } }, { status: 401, headers: { "www-authenticate": "Bearer realm=\"magnitude\"" } })
     }
     if (protocol === "codex" && source.headers.get("upgrade")?.toLowerCase() === "websocket") {
       const upgradeOrigin = source.headers.get("origin")
@@ -626,12 +636,6 @@ const invalidHostMessage = (network: NetworkAccess) => network.enabled
   ? "Invalid Host header. Magnitude accepts local names, IP addresses, host.docker.internal, *.ts.net, and names listed under network.allowedHosts in config.json."
   : "Invalid Host header. Network access is off; turn it on in Magnitude Settings to reach this service from other devices."
 
-/**
- * The path as the router matches it. The router ignores case and repeated slashes, so the
- * remote-caller gates must too, or `/INFERENCE/v1/models` reaches inference without a key.
- */
-const routedPath = (url: string) => url.split(/[?#]/, 1)[0]!.replace(/\/{2,}/g, "/").toLowerCase()
-
 /** Whether the request comes from this machine. With loopback binding every caller is local. */
 const isLocalCaller = (request: HttpServerRequest.HttpServerRequest, network: NetworkAccess) => Option.match(request.remoteAddress, {
   onNone: () => !network.enabled,
@@ -647,20 +651,6 @@ export const installAcnHealthRoutes = (
     const request = yield* HttpServerRequest.HttpServerRequest
     if (!isAllowedHostHeader(request.headers.host, network)) {
       return HttpServerResponse.text(invalidHostMessage(network), { status: 421 })
-    }
-    if (!isLocalCaller(request, network)) {
-      const path = routedPath(request.url)
-      // Application control (files, sessions, agents) never leaves this machine, whatever the bind.
-      if (path === "/rpc" || path.startsWith("/rpc/")) {
-        return HttpServerResponse.text("Magnitude application control is available only on the machine running Magnitude.", { status: 403 })
-      }
-      // Preflight carries no credentials by design; the request that follows is checked.
-      if (path.startsWith("/inference/") && request.method !== "OPTIONS" && !authorizesRemoteInference({ authorization: request.headers.authorization, "x-api-key": request.headers["x-api-key"] }, network)) {
-        return HttpServerResponse.unsafeJson({ error: {
-          message: "A Magnitude API key is required from other devices. Copy it from Settings → Network access and send it as a Bearer token.",
-          type: "authentication_error",
-        } }, { status: 401, headers: { "www-authenticate": "Bearer realm=\"magnitude\"" } })
-      }
     }
     return withCors(yield* responseEffect, request)
   }))
@@ -683,26 +673,31 @@ export const installAcnPublicRoutes = (
   router: HttpLayerRouter.HttpRouter,
   lifecycle: AcnServiceLifecycleApi,
   icn: InferenceProxyTarget,
+  network: NetworkAccess = LOOPBACK_ONLY,
   fetchTarget: InferenceFetch = fetch,
   usage?: ServingUsage,
 ) => Effect.gen(function* () {
   yield* router.add("POST", "/rpc", Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest
+    // Application control (files, sessions, agents) never leaves this machine, whatever the bind.
+    if (!isLocalCaller(request, network)) {
+      return HttpServerResponse.text("Magnitude application control is available only on the machine running Magnitude.", { status: 403 })
+    }
     return request.headers["x-magnitude-acn-id"] === ACN_INSTANCE_ID
       ? yield* lifecycle.dispatchRpc
       : HttpServerResponse.empty({ status: 409 })
   }))
   yield* router.prefixed("/inference/v1/proxies/codex").add(
-    "*", "/*", makeInferenceProxy(icn, "codex", fetchTarget, usage),
+    "*", "/*", makeInferenceProxy(icn, "codex", network, fetchTarget, usage),
   )
   yield* router.prefixed("/inference/v1").add(
-    "*", "/*", makeInferenceProxy(icn, "openai", fetchTarget),
+    "*", "/*", makeInferenceProxy(icn, "openai", network, fetchTarget),
   )
   yield* router.prefixed("/inference/anthropic/proxies/claude-code").add(
-    "*", "/*", makeInferenceProxy(icn, "claude-code", fetchTarget),
+    "*", "/*", makeInferenceProxy(icn, "claude-code", network, fetchTarget),
   )
   yield* router.prefixed("/inference/anthropic").add(
-    "*", "/*", makeInferenceProxy(icn, "anthropic", fetchTarget),
+    "*", "/*", makeInferenceProxy(icn, "anthropic", network, fetchTarget),
   )
 })
 
@@ -801,7 +796,7 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
       }
       const icn = Context.get(applicationContext, IcnProcess)
       const usage = Context.get(applicationContext, ServingUsage)
-      yield* installAcnPublicRoutes(router, lifecycle, icn, makeUsageFetch(icn.origin, usage), usage)
+      yield* installAcnPublicRoutes(router, lifecycle, icn, network, makeUsageFetch(icn.origin, usage), usage)
       yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie))
       return {
         subscriptions: Context.get(applicationContext, AcnSubscriptions),

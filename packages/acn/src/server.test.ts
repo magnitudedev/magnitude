@@ -163,7 +163,7 @@ describe("ACN network access", () => {
       const icnOrigin = loopbackOrigin(yield* listen(icn, 0))
       const publicRouter = yield* HttpLayerRouter.make
       yield* installAcnHealthRoutes(publicRouter, lifecycle, network)
-      yield* installAcnPublicRoutes(publicRouter, lifecycle, { origin: new URL(icnOrigin), clientOptions: { headers: {} } })
+      yield* installAcnPublicRoutes(publicRouter, lifecycle, { origin: new URL(icnOrigin), clientOptions: { headers: {} } }, network)
       const port = yield* listen(publicRouter, 0, "0.0.0.0")
       const rpcRouter = yield* HttpLayerRouter.make
       yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie))
@@ -190,10 +190,11 @@ describe("ACN network access", () => {
       expect(bearer.status).toBe(200)
       expect(yield* bearer.text).toBe("inference models")
       expect((yield* get(`${remote}/inference/v1/models`, { "x-api-key": "mag-test-key" })).status).toBe(200)
-      for (const path of ["/INFERENCE/v1/models", "/Inference/v1/models", "//inference/v1/models"]) {
+      for (const path of ["/INFERENCE/v1/models", "/Inference/v1/models", "//inference/v1/models", "/%69nference/v1/models"]) {
         expect((yield* get(`${remote}${path}`)).status).toBe(401)
       }
       expect((yield* get(`${remote}/INFERENCE/v1/models`, { authorization: "Bearer mag-test-key" })).status).toBe(200)
+      expect((yield* http.execute(HttpClientRequest.post(`${remote}/%72pc`, { headers: { "x-magnitude-acn-id": ACN_INSTANCE_ID }, body: HttpBody.text("{}\n", "application/ndjson") }))).status).toBe(403)
 
       const preflight = yield* http.execute(HttpClientRequest.options(`${remote}/inference/v1/models`, { headers: { origin: "http://localhost:3000" } }))
       expect(preflight.status).toBe(204)
