@@ -33,15 +33,15 @@ This amendment defines future tests; it does not claim those UI scenarios have a
 | Planning | Complete | This documentation checkpoint |
 | 0: baseline and harness | Baselines recorded; final regression gates remain | Native/source baselines and live desktop checks recorded below |
 | 1: Windows preparation repair | Implemented; final hosted acceptance pending | `f9b148d7`, `fdcd30a2`; native staging, cache repair and retained-update removal exercised |
-| 2: native continuation/admission proof | In progress | `f3762f0b`, `16f27d52`; repeated Windows replacement passed; macOS mechanical probe passed, production integration open |
+| 2: native continuation/admission proof | Implemented; signed sequence passed | Native admission/continuation receipts below; Mac and Windows packaged sequences exercised |
 | 3: shared owner extraction | Implemented; packaged regression carried forward | `18345064` |
 | 4: serve and takeover | Implemented; full packaged race acceptance carried forward | `cadd4bdd`; real foreground serving on three platforms and live Mac takeover |
 | 5: CLI cutover | Implemented; final packaged regression carried forward | `41ec9f6b`; 97 CLI tests passed on each platform, live Mac desktop-owned CLI exercised |
-| 6: shared updater/macOS transaction | In progress | `c2906a6c`; shared preparation extracted, native macOS transaction still open |
-| 7: startup updates/maintenance | Pending | — |
-| 8: install scripts | Pending | — |
-| 9: packaged/remote acceptance | Pending | — |
-| 10: documentation/release readiness | Pending | — |
+| 6: shared updater/macOS transaction | Implemented; physical Mac replacement failure remains | Signed runner sequence passed; local replacement diagnosis below |
+| 7: startup updates/maintenance | Implemented; physical Mac acceptance carried forward | `23397240`; signed Mac and native/packaged Windows/Linux receipts below |
+| 8: install scripts | Implemented; local Mac repeat-install gate remains | `a0e4a786`, `ace43d66`; Windows/DEB/RPM and signed Mac runner script gates passed |
+| 9: packaged/remote acceptance | In progress | `4d74743b`; Sparky lifecycle and Mac/Windows/Linux inference passed; final update UI and physical Mac replacement remain |
+| 10: documentation/release readiness | In progress | `4d74743b` operating docs; final requirement audit and release-readiness checks remain |
 
 ## Required entry for every implementation checkpoint
 
@@ -1856,3 +1856,87 @@ that exact CPU fixture (`/tmp/magnitude-headless-transfer/mac-cpu-serve-acceptan
 The signed harness now retains all four public release proofs immediately after build, before any
 runtime check. This permits later local replay without retaining ephemeral private signing keys.
 Targeted release typechecking passes with these changes. A new signed sequence run is still required.
+
+Checkpoint 4d74743b includes the maintained inference client, operating documentation, CPU signing
+runner fixture and early retention of public release proofs. Signed sequence run 35965829695 passed against that checkpoint; its later receipt is below.
+
+Ubuntu 0.0.505 packaged CPU inference passed with gemma-4-e2b-it-qat:gguf:q4 in the durable test
+profile, including generation, eight-chunk cancellation, subsequent generation, explicit unload and
+the same sequence after reload. Local receipts: `/tmp/magnitude-headless-transfer/gemma-inference-result.json`
+and `gemma-inference-reload-result.json`. No inference engine policy was changed. The test VM remains
+at 10 GiB; the temporary swap was removed. Model was stopped and the exact foreground owner received
+SIGTERM after receipt collection.
+
+Additional real Mac desktop regression with signed 0.0.504: loaded LFM through My Models, observed
+Ready through ordinary CLI, completed real generation/cancellation through the public endpoint,
+visually observed populated Usage, then stopped the model through UI and confirmed Unloaded by CLI.
+The earlier Light theme persisted after relaunch. Closing the native window retained Ready/Desktop;
+`magnitude app open` reopened My Models. Normal UI Quit exited 0 and passive status became Stopped/None.
+Receipt: `/tmp/magnitude-headless-transfer/mac-a0e4a786-ui/desktop-inference-result.json`.
+This advances R1/R2/R3/R4 coverage; native login registration and UI-driven update controls remain
+separate final gates. No Mac or Windows test application is left running.
+
+Signed Mac sequence run 35965829695 passed against 4d74743b: HTTPS fresh/repeat installation,
+finite installation, headless startup installation and desktop startup installation, with matched
+versions and retired installer/prepared/transaction state. Full log:
+`/tmp/magnitude-headless-transfer/mac-35965829695-success.log`. Native Windows packaged update
+run 35966523516 is still in progress.
+
+Local Mac HTTPS replay with the earlier signed 0.0.501 fixture installed successfully but refused
+repeat replacement while preserving the original bundle. Evidence:
+`/tmp/magnitude-headless-transfer/mac-script-local-final/hosting/mac-script-evidence.oFwrwIrU`.
+The transaction is Abandoned with both original identities present. A direct atomic exchange probe
+returned EPERM; the same operation on disposable ordinary directories succeeded. Both app bundles
+remain signed and the installed bundle passes platform assessment. The installed bundle has a
+macOS access-control extended attribute absent from staged replacement. No attributes, permissions
+or platform protections were changed. System logs inspected so far do not establish the reason;
+application-management policy is a hypothesis, not a diagnosis. This local replacement gate remains
+open despite the passing signed runner. No test server is running from that installation.
+
+The final signed-run log also contains native Linux packaged login regression on Ubuntu 22.04
+and 24.04. Reviewed `desktop/src/fixtures/linux-installed-lifecycle.mjs`: it operates the real
+Settings switch, checks the XDG entry, observes external disable, launches the registered command,
+quits the login-started owner, and checks CLI discovery and retained/disabled login preference.
+Both jobs report those scenarios passing. This covers native login registration in a disposable
+Linux user; it is Playwright/Xvfb evidence, not a visible computer-use session on Linux or a Mac
+login-registration test. The isolated Mac fixture correctly leaves login registration unavailable.
+
+Windows native x64 run 35966523516 completed A-to-B finite installation and B-to-C foreground
+startup, reached Ready on 0.0.503, and exited cleanly after Quit. The subsequent `app open`
+correctly refused the runner's noninteractive session, so the combined job failed and wrote no
+completion receipt. Log: `/tmp/magnitude-headless-transfer/windows-35966523516-failure.log`.
+The harness now explicitly selects desktop or headless acceptance (desktop remains the default).
+The headless CI lane must assert noninteractive launch refusal and Stopped/None, and its receipt
+distinguishes that from a passing desktop CLI regression. Targeted release typechecking passed.
+A rerun is required to certify the revised harness. This does not substitute for the visible VM lane.
+
+Release verification initially rejected the stale 0.1.4 baseline. Ran the release-owned preparation
+command, which refreshed the public baseline to 0.1.5 without changing application version 0.1.5,
+revision 46 or RPC 2. `prepare-release.ts --verify` then passed. Added a pending patch Changeset
+for the feature; no version application or publication was performed.
+
+Repeated visible Windows launch rendered Discover and the expected VM hardware. Computer-use
+coordinate clicks and key events still did not navigate the guest, although native Parallels menu
+actions worked. Guest interaction remains an explicit transport coverage gap. The same application
+passed desktop-owned model/hardware CLI queries with checked exit codes and Quit left Stopped/None.
+No Windows test owner remains.
+
+Physical Mac public finite installation with signed run 35965829695 exposed a separate canonical
+path defect: `/tmp` in the state request disagreed with the executing helper's `/private/tmp` path.
+The helper was rejected before attempting the prepared update. Retrying with canonical paths passed
+invocation admission but preserved the old application during replacement. Evidence:
+`/tmp/magnitude-headless-transfer/mac-final-local/finite{,-canonical}-update.log`. No test owner was
+started. The retained failed preparation remains available for explicit retry. The generic Python
+exchange probe used an unrelated executable and does not establish the signed installer's failure
+reason. Native replacement now emits the actual syscall error to stderr, without changing recovery.
+
+The helper now returns its retained canonical directory and state root, and the caller binds its
+request to that root. A native regression covers a state path with a linked ancestor and verifies
+that the real-path executable passes invocation decoding. Fifty helper, invocation and filesystem
+tests passed; native build and targeted daemon-management/release typechecks passed. The signed Mac
+fixture now uses a valid local HTTPS origin so subsequent UI checks can exercise its update client
+instead of failing request validation immediately. Neither signing trust nor transfer verification
+is disabled. Packaged verification of these changes remains required.
+
+Additional Mac workspace, prepared-installation and recovery suites passed all 86 tests (136 across
+the two focused runs). Existing CLI suite passed 103 tests, including the new stopped-owner guidance.

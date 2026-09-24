@@ -26,7 +26,12 @@ on:
       - "bun.lock"
       - "packages/release/scripts/build/cli.ts"
       - "packages/release/scripts/build/desktop*.ts"
+      - "packages/release/scripts/build/installation-*.ts"
+      - "packages/release/scripts/acceptance/**"
       - "packages/release/resources/linux/**"
+      - "packages/release/resources/install.*"
+      - "packages/release/src/hosted-update/**"
+      - "packages/release/src/client-update/**"
       - "packages/release/src/executables.ts"
       - "packages/release/package.json"
       - "packages/daemon-management/scripts/*.ps1"
@@ -75,6 +80,9 @@ jobs:
           bun install --frozen-lockfile --ignore-scripts
           bun packages/version/scripts/generate-version.ts
           bun packages/daemon-management/scripts/build-native.ts
+      - name: Check full-install script generation
+        working-directory: packages/release
+        run: bunx --bun vitest run scripts/build/installation-scripts.test.ts scripts/build/installation-distribution.test.ts
       - name: Exercise sealed bundle and nested signature verification
         working-directory: packages/daemon-management
         run: >-
@@ -304,6 +312,7 @@ jobs:
         env:
           MAGNITUDE_HEADLESS_ACCEPTANCE_OUTPUT: C:\magnitude-headless-test
           MAGNITUDE_ACCEPTANCE_ICN_VERSION: "0.1.5"
+          MAGNITUDE_ACCEPTANCE_SESSION: headless
         run: ./packages/release/scripts/acceptance/test-windows-headless.ps1
       - name: Retain Windows packaged update evidence
         if: always() && github.event_name == 'workflow_dispatch' && inputs.signed_windows_installer

@@ -356,8 +356,12 @@ static napi_value exchange(napi_env env, napi_callback_info info) {
       same(left_st, right_st) || left_st.st_dev != right_st.st_dev) return fail(env);
   identity_text(left_st, actual); if (strcmp(actual, expected_left)) return fail(env);
   identity_text(right_st, actual); if (strcmp(actual, expected_right)) return fail(env);
-  if (renameatx_np(left->fd, left_name, right->fd, right_name, RENAME_SWAP) ||
-      fstatat(left->fd, left_name, &observed, AT_SYMLINK_NOFOLLOW) || !same(observed, right_st) ||
+  if (renameatx_np(left->fd, left_name, right->fd, right_name, RENAME_SWAP)) {
+    int error = errno;
+    fprintf(stderr, "macOS application replacement failed: %s (%d).\n", strerror(error), error);
+    return fail(env);
+  }
+  if (fstatat(left->fd, left_name, &observed, AT_SYMLINK_NOFOLLOW) || !same(observed, right_st) ||
       fstatat(right->fd, right_name, &observed, AT_SYMLINK_NOFOLLOW) || !same(observed, left_st) ||
       fsync(left->fd) || fsync(right->fd)) return fail(env);
   return nothing(env);

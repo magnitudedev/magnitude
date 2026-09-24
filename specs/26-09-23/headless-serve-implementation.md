@@ -1,6 +1,6 @@
 # Headless serve: implementation and verification plan
 
-Status: implementation plan; no product changes yet. Branch: `headless`, baseline `772cfacb`.
+Status: implementation in final packaged verification. Branch: `headless`, baseline `772cfacb`.
 Prepared 2026-09-23. This is the execution plan for the whole feature, including updates,
 installation scripts, migration, documentation and release verification.
 
@@ -139,7 +139,8 @@ Independent OS test jobs may run concurrently. Keep dependencies, commits, insta
 installation, and stateful profile operations sequential. Add failure-injection controls only to
 test/acceptance builds; do not expose trust overrides or destructive hooks in production binaries.
 
-The current request is planning. Production publication, release promotion, fleet updates and broad
+Implementation and disposable acceptance are authorized. Stop on this branch for user review;
+do not merge to main. Production publication, release promotion, fleet updates and broad
 machine reconfiguration are separate actions; the implementation can build and test disposable
 artifacts without publishing a customer release. External acceptance workflows that upload/promote
 artifacts must be inspected and scoped to dedicated test infrastructure before execution.

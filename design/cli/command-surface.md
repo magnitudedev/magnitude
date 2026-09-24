@@ -22,7 +22,7 @@ desktop application.
 The public command vocabulary is:
 
 ```text
-update [check | status | download | install]
+update [check | status | download | install | discard]
 app open
 serve
 status
@@ -42,7 +42,7 @@ plugins call the SDK over RPC instead.
 ## Domain ownership
 
 - `serve` owns the foreground application and service tree until shutdown or cooperative Desktop handoff.
-- `status` passively reports owner and runtime readiness; tray and login-startup fields appear only for Desktop.
+- `status` passively reports owner and runtime readiness; tray and login-startup fields appear only for Desktop. With no owner, it prints startup guidance and exits successfully without starting anything.
 - `hardware` reports the local inference topology, current memory use, and current allocation.
 - `catalog` reports catalog assessment progress, reviewed model choices,
   machine-specific assessment evidence, recommendations, and download operations.

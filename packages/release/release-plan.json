@@ -1,9 +1,9 @@
 {
   "format": 2,
   "baseline": {
-    "tag": "@magnitudedev/cli@0.1.4",
-    "sourceCommit": "6bc4976cc2681de689d2a7f210cccfc7f83d8ebc",
-    "cliVersion": "0.1.4",
+    "tag": "@magnitudedev/cli@0.1.5",
+    "sourceCommit": "772cfacb0ee11b96e6729f1c913b7c7f0c327d86",
+    "cliVersion": "0.1.5",
     "rpc": {
       "version": 2,
       "fingerprint": "19098ef2a96c3c51e4c22c1dbe6e8a9d70d93ae517bdc51c850a714695f849d0"

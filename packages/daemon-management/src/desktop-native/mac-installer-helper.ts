@@ -63,5 +63,6 @@ export const prepareMacInstallerHelper = (options: {
   yield* Effect.scoped(fs.open(configurationPath, { flag: "r" }).pipe(Effect.flatMap(file => file.sync)))
   yield* native.sync(retained)
   yield* options.lease.validate
-  return { directory, executable: join(directory, "magnitude"), addonPath: join(directory, "desktop-host.node") }
+  return { directory: retained.path, stateDirectory: dirname(dirname(retained.path)),
+    executable: join(retained.path, "magnitude"), addonPath: join(retained.path, "desktop-host.node") }
 }).pipe(Effect.mapError(() => new MacInstallerHelperFailed()))

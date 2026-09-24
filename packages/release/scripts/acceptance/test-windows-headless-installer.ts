@@ -1,6 +1,6 @@
 import { Command, FileSystem } from "@effect/platform"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
-import { Config, Effect, Option, Schema } from "effect"
+import { Config, Effect, Option, Schema, Stream } from "effect"
 import { generateKeyPairSync } from "node:crypto"
 import { join, resolve } from "node:path"
 import { acceptanceInferenceInstallation } from "./inference-installation"
@@ -14,12 +14,13 @@ import { requestApplication } from "../../../daemon-management/src/desktop-nativ
 
 class AcceptanceFailed extends Schema.TaggedError<AcceptanceFailed>()("AcceptanceFailed", { message: Schema.String }) {}
 const Configuration = Schema.Struct({ origin: Schema.String, keyId: Schema.String, publicKey: Schema.String, windowsPublisher: Schema.String })
-const Evidence = Schema.Struct({ installedVersion: Schema.String, finiteInstall: Schema.Literal(true), foregroundContinuation: Schema.Literal(true), gracefulExit: Schema.Literal(true), desktopCliRegression: Schema.Literal(true) })
+const Evidence = Schema.Struct({ installedVersion: Schema.String, finiteInstall: Schema.Literal(true), foregroundContinuation: Schema.Literal(true), gracefulExit: Schema.Literal(true), desktopCliRegression: Schema.Literal("Passed", "NoninteractiveLaunchRefused") })
 const root = resolve(import.meta.dir, "../../../..")
 const run = Effect.gen(function* () {
   if (process.platform !== "win32" || process.arch !== "x64") return yield* new AcceptanceFailed({ message: "Requires the Windows x64 product runtime" })
   const fs = yield* FileSystem.FileSystem
   const output = resolve(yield* Config.string("MAGNITUDE_HEADLESS_ACCEPTANCE_OUTPUT"))
+  const session = yield* Config.literal("desktop", "headless")("MAGNITUDE_ACCEPTANCE_SESSION").pipe(Config.withDefault("desktop"))
   yield* fs.makeDirectory(output, { recursive: true })
   const nativeAddon = join(output, "acceptance-host.node")
   yield* fs.copyFile(join(root, "packages/daemon-management/dist/native/win32-x64/desktop-host.node"), nativeAddon)
@@ -83,7 +84,18 @@ const run = Effect.gen(function* () {
       return yield* new AcceptanceFailed({ message: "Replacement versions or prepared-state retirement differ" })
     }
   }
-  yield* Effect.acquireUseRelease(command(launcher, ["app", "open"]), () => Effect.gen(function* () {
+  if (session === "headless") yield* Effect.scoped(Effect.gen(function* () {
+    const child = yield* Command.make(launcher, "app", "open").pipe(Command.env(environment), Command.start)
+    const [stdout, stderr, code] = yield* Effect.all([
+      child.stdout.pipe(Stream.decodeText(), Stream.runFold("", (text, chunk) => text + chunk)),
+      child.stderr.pipe(Stream.decodeText(), Stream.runFold("", (text, chunk) => text + chunk)),
+      child.exitCode,
+    ], { concurrency: "unbounded" })
+    if (code === 0 || !`${stdout}\n${stderr}`.includes("requires a graphical Windows session")) {
+      return yield* new AcceptanceFailed({ message: "Noninteractive desktop launch did not report the expected refusal" })
+    }
+  })).pipe(Effect.timeout("30 seconds"))
+  else yield* Effect.acquireUseRelease(command(launcher, ["app", "open"]), () => Effect.gen(function* () {
     yield* Effect.gen(function* () {
       for (;;) {
         const status = yield* Command.make(launcher, "status").pipe(Command.env(environment), Command.string)
@@ -100,11 +112,11 @@ const run = Effect.gen(function* () {
   yield* Effect.gen(function* () {
     for (;;) {
       const status = yield* Command.make(launcher, "status").pipe(Command.env(environment), Command.string)
-      if (/Runtime\s+Stopped/.test(status)) break
+      if (/Runtime\s+Stopped/.test(status) && /Owner\s+None/.test(status)) break
       yield* Effect.sleep("100 millis")
     }
   }).pipe(Effect.timeout("30 seconds"))
-  yield* fs.writeFileString(join(output, "result.json"), yield* Schema.encode(Schema.parseJson(Evidence))({ installedVersion: versions[2], finiteInstall: true, foregroundContinuation: true, gracefulExit: true, desktopCliRegression: true }))
-  yield* Effect.logInfo("Windows signed finite and foreground update acceptance passed")
+  yield* fs.writeFileString(join(output, "result.json"), yield* Schema.encode(Schema.parseJson(Evidence))({ installedVersion: versions[2], finiteInstall: true, foregroundContinuation: true, gracefulExit: true, desktopCliRegression: session === "desktop" ? "Passed" : "NoninteractiveLaunchRefused" }))
+  yield* Effect.logInfo(`Windows signed finite and foreground update acceptance passed (${session} session)`)
 })
 BunRuntime.runMain(run.pipe(Effect.provide(BunContext.layer)))

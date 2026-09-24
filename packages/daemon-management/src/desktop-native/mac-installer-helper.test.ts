@@ -10,6 +10,7 @@ import { MacUpdateFilesystem, nativeMacUpdateFilesystem } from "./mac-update-fil
 import { MacBundleVerifier, MacBundleVerificationFailed } from "./mac-update-validation"
 import { MacInstallerCodeVerifier, MacInstallerHelperFailed, prepareMacInstallerHelper } from "./mac-installer-helper"
 import { readInstalledUpdateConfiguration } from "../application-update/update-configuration"
+import { decodeMacInstallerInvocation } from "../application-update/mac-installer-command"
 const addon = fileURLToPath(new URL(`../../dist/native/darwin-${process.arch}/desktop-host.node`, import.meta.url))
 const publicKey = generateKeyPairSync("ed25519").publicKey.export({ type: "spki", format: "pem" }).toString()
 const run = <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem | MacUpdateFilesystem | MacUpdateAdmission | Scope.Scope>) =>
@@ -41,7 +42,7 @@ describe.skipIf(process.platform !== "darwin")("private macOS installer runtime"
     yield* Effect.scoped(Effect.gen(function* () {
       const helper = yield* f.prepare.pipe(Effect.provideService(MacBundleVerifier, f.bundleVerifier), Effect.provideService(MacInstallerCodeVerifier, f.codeVerifier))
       directory = helper.directory
-      expect(dirname(directory)).toBe(join(f.stateDirectory, "mac-installers"))
+      expect(dirname(directory)).toBe(join(yield* f.fs.realPath(f.stateDirectory), "mac-installers"))
       expect((yield* f.fs.stat(directory)).mode & 0o777).toBe(0o700)
       expect((yield* f.fs.stat(helper.executable)).mode & 0o777).toBe(0o700)
       expect((yield* f.fs.stat(helper.addonPath)).mode & 0o777).toBe(0o600)
@@ -50,6 +51,19 @@ describe.skipIf(process.platform !== "darwin")("private macOS installer runtime"
       expect(f.checked).toEqual(["bundle", "magnitude", "desktop-host.node", "magnitude-command", "magnitude-extract"])
     }))
     expect(yield* f.fs.exists(directory)).toBe(false)
+  })))
+  it("binds the invocation to the canonical helper when the state path has a linked ancestor", () => run(Effect.gen(function* () {
+    const f = yield* fixture
+    const alias = join(f.root, "alias")
+    yield* f.fs.symlink(f.root, alias)
+    const helper = yield* prepareMacInstallerHelper({ resources: f.resources, stateDirectory: join(alias, "state"),
+      lease: f.lease, version: "0.1.5", architecture: "arm64" }).pipe(
+      Effect.provideService(MacBundleVerifier, f.bundleVerifier), Effect.provideService(MacInstallerCodeVerifier, f.codeVerifier))
+    expect(helper.executable).toBe(yield* f.fs.realPath(helper.executable))
+    const decoded = yield* decodeMacInstallerInvocation(JSON.stringify({ protocol: 1, operation: "Install",
+      bundle: dirname(dirname(f.resources)), stateDirectory: helper.stateDirectory, dataDirectory: f.root,
+      continuation: { _tag: "None" } }), helper.executable, "12")
+    expect(decoded.request.stateDirectory).toBe(yield* f.fs.realPath(f.stateDirectory))
   })))
   it("creates no helper when installed bundle verification fails", () => run(Effect.gen(function* () {
     const f = yield* fixture

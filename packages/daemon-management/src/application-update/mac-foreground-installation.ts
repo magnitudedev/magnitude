@@ -29,7 +29,7 @@ export const startMacForegroundInstallation = (options: {
     if (Option.isNone(lease)) return yield* new MacUpdateInstallationBusy()
     const helper = yield* prepareMacInstallerHelper({ ...options, lease: lease.value })
     const request = yield* Schema.encode(Schema.parseJson(MacInstallerRequest))({ protocol: 1, bundle,
-      stateDirectory: options.stateDirectory, dataDirectory: options.dataDirectory, operation: options.operation, continuation: options.continuation })
+      stateDirectory: helper.stateDirectory, dataDirectory: options.dataDirectory, operation: options.operation, continuation: options.continuation })
     return yield* lease.value.replaceProcess(helper.executable, ["_install-mac-application-update", request], process.env)
   })).pipe(Effect.provide([nativeMacUpdateAdmission(addon), nativeMacUpdateFilesystem(addon), nativeMacBundleVerifier(addon),
     NativeMacApplicationInstallation, nativeMacInstallerCodeVerifier.pipe(Layer.provide(guardedCommandLayer(join(options.resources, "magnitude-command"))))]))

@@ -30,7 +30,7 @@ const run = Effect.gen(function* () {
   const inference = yield* acceptanceInferenceInstallation(join(output, "inference"))
   const keys = yield* Effect.sync(() => generateKeyPairSync("ed25519"))
   const config = join(output, "configuration.json")
-  yield* fs.writeFileString(config, yield* Schema.encode(Schema.parseJson(Configuration))({ origin: "http://127.0.0.1:9", keyId: "isolated", publicKey: keys.publicKey.export({ type: "spki", format: "pem" }).toString() }), { mode: 0o600 })
+  yield* fs.writeFileString(config, yield* Schema.encode(Schema.parseJson(Configuration))({ origin: "https://localhost:18443", keyId: "isolated", publicKey: keys.publicKey.export({ type: "spki", format: "pem" }).toString() }), { mode: 0o600 })
   const command = (executable: string, args: readonly string[], environment: Record<string, string> = {}) => Command.make(executable, ...args).pipe(
     Command.workingDirectory(root), Command.env(environment), Command.stdout("inherit"), Command.stderr("inherit"), Command.exitCode,
     Effect.filterOrFail(code => code === 0, code => new AcceptanceFailed({ message: `Acceptance command exited ${code}: ${executable}` })), Effect.asVoid)

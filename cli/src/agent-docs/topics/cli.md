@@ -5,7 +5,7 @@ Onboarding lives in the Magnitude desktop app: use Discover to choose models and
 configure external harnesses. Agents can use the following commands to operate inference:
 
 ```text
-magnitude update
+magnitude update [check|status|download|install|discard]
 magnitude app open
 magnitude serve
 magnitude status
@@ -28,6 +28,13 @@ Run `magnitude serve` to host inference in the foreground, or open the desktop a
 Model, catalog, hardware, and connection setup commands require an existing service; they do not
 start one. `magnitude status` observes the owner and runtime without starting anything. Stop a
 foreground server with Ctrl+C. Desktop launch-at-login and Quit are available in the desktop app.
+
+`update check` checks for a release; `download` waits until it is prepared; `status` reports the
+current update state; `discard` removes a prepared update. None of these commands opens Desktop.
+`update install` restarts a running Desktop with explicit user intent, but refuses to interrupt
+a headless server. Stop `serve` first, then either run it again to apply an unattempted prepared
+update at startup or run `update install` for a finite installation that leaves the server stopped.
+Failed installation attempts require explicit retry. Linux installation may require system authorization.
 
 Each command prints only the product information relevant to that operation. Collection commands
 use borderless tables when the rows are directly comparable; detail commands use labeled fields.

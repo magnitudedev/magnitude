@@ -50,6 +50,14 @@ describe("Magnitude service definitions", () => {
     expect(output).toContain(`Runtime         ${status}`)
     expect(output).toContain("Owner           Headless")
     expect(output).not.toMatch(/Tray|Starts at login/)
+    expect(output).not.toContain("Open the Magnitude desktop app")
+  })
+
+  it("reports absence with actionable startup guidance and no desktop fields", () => {
+    const output = renderStatus({ status: "Stopped", address: "127.0.0.1:10100", version: Option.none(),
+      startsAutomaticallyOnLogin: Option.none(), activeModel: { _tag: "Unavailable" }, owner: Option.none() })
+    expect(output).toContain("Not running\nOpen the Magnitude desktop app or run `magnitude serve`.\n")
+    expect(output).not.toMatch(/Tray|Starts at login|Active model/)
   })
 
 })

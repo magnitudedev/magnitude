@@ -82,6 +82,9 @@ export const renderStatus = (status: ServiceStatusPresentation): string => [
       ? model.displayName
       : `${model.displayName} - ${model.status}`,
   })}`] : []),
+  ...(Option.isNone(status.owner) ? [
+    "", "Not running", "Open the Magnitude desktop app or run `magnitude serve`.",
+  ] : []),
   "",
 ].join("\n")
 
