@@ -1,7 +1,7 @@
 import * as FileSystem from "@effect/platform/FileSystem"
 import { Effect, Schema } from "effect"
 import { packager } from "@electron/packager"
-import { resolve, join, dirname } from "node:path"
+import { resolve, join, dirname, basename } from "node:path"
 import { fileURLToPath } from "node:url"
 import { ACN_EXECUTABLE_NAME } from "../../src/executables"
 import { MACOS_DEPLOYMENT_TARGET } from "../../src/targets"
@@ -55,6 +55,8 @@ export const buildDesktopApplication = (options: {
   yield* fs.chmod(cli, 0o755)
   yield* fs.copyFile(join(root, `packages/daemon-management/dist/native/${platform}-${arch}/desktop-host.node`), addon)
   yield* fs.copyFile(join(root, "assets/brand/trayTemplate@2x.png"), tray)
+  const windowsTrayIcons = platform === "win32" ? ["tray-black.ico", "tray-white.ico"].map(name => join(resources, name)) : []
+  for (const path of windowsTrayIcons) yield* fs.copyFile(join(root, "assets/brand", basename(path)), path)
   yield* fs.copyFile(join(root, "assets/brand/application-icon.png"), icon)
   yield* fs.copyFile(join(root, "LICENSE"), license)
   if (platform === "win32") yield* fs.copyFile(join(root, "packages/daemon-management/dist/native/win32-x64/magnitude-launcher.exe"), launcher)
@@ -74,7 +76,7 @@ export const buildDesktopApplication = (options: {
     ...(platform === "win32" ? { icon: join(root, "packages/release/resources/windows/Magnitude.ico"), win32metadata: { CompanyName: "Magnitude" } } : {}),
     ...(platform === "darwin" ? { icon: join(root, "packages/release/resources/macos/Magnitude.icns"), extendInfo: { LSMinimumSystemVersion: MACOS_DEPLOYMENT_TARGET } } : {}),
     asar: true, prune: false, overwrite: true,
-    extraResource: [service, cli, addon, tray, icon, license, updateTrust, updateConfiguration,
+    extraResource: [service, cli, addon, tray, ...windowsTrayIcons, icon, license, updateTrust, updateConfiguration,
       ...(platform === "win32" ? [launcher] : [command]), ...(platform === "darwin" ? [extractor] : [])],
   }), catch: error => new DesktopBuildFailed({ message: `Could not assemble desktop: ${String(error)}` }) })
 })).pipe(Effect.mapError(error => error instanceof DesktopBuildFailed ? error : new DesktopBuildFailed({ message: String(error) })))

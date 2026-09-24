@@ -203,18 +203,30 @@ const program = Effect.scoped(Effect.gen(function* () {
 
   const nativeTray = Layer.succeed(NativeTrayFactory, { create: Effect.acquireRelease(Effect.try({ try: () => {
     // A monochrome template works in either macOS menu-bar appearance.
-    const icon = nativeImage.createFromPath(app.isPackaged ? join(process.resourcesPath, "trayTemplate@2x.png") : join(root, "assets/brand/trayTemplate@2x.png"))
-    icon.setTemplateImage(true)
+    const iconDirectory = app.isPackaged ? process.resourcesPath : join(root, "assets/brand")
+    const icon = nativeImage.createFromPath(join(iconDirectory, process.platform === "win32" ? "tray-white.ico" : "trayTemplate@2x.png"))
+    if (process.platform === "darwin") icon.setTemplateImage(true)
     const result = new Tray(icon)
     result.setToolTip("Magnitude")
-    return result
-  }, catch: () => new NativeTrayFailed({ message: "Magnitude could not register its tray icon." }) }), value => Effect.sync(() => value.destroy())).pipe(
-    Effect.map(value => ({ setMenu: (menu: readonly Electron.MenuItemConstructorOptions[]) => Effect.try({
+    let syncTheme = () => {}
+    if (process.platform === "win32") {
+      const blackIcon = nativeImage.createFromPath(join(iconDirectory, "tray-black.ico"))
+      syncTheme = () => result.setImage(nativeTheme.shouldUseDarkColorsForSystemIntegratedUI ? icon : blackIcon)
+      syncTheme()
+      nativeTheme.on("updated", syncTheme)
+      result.on("click", () => run(show()))
+      result.on("double-click", () => run(show()))
+    }
+    return { tray: result, syncTheme }
+  }, catch: () => new NativeTrayFailed({ message: "Magnitude could not register its tray icon." }) }), value => Effect.sync(() => {
+    nativeTheme.removeListener("updated", value.syncTheme)
+    value.tray.destroy()
+  })).pipe(
+    Effect.map(({ tray: value }) => ({ setMenu: (menu: readonly Electron.MenuItemConstructorOptions[]) => Effect.try({
       try: () => value.setContextMenu(Menu.buildFromTemplate([...menu])),
       catch: () => new NativeTrayFailed({ message: "Magnitude could not update its tray menu." }),
     }) })),
   ) })
-  const tray = Context.get(yield* Layer.build(TrayOwnerLive.pipe(Layer.provide(nativeTray))), TrayOwner)
   let window: BrowserWindow
   let pendingPage: Page = "discover"
   let wantsWindow = !background
@@ -237,6 +249,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     // Raising the retained window must preserve the renderer's current page.
     if (page !== undefined) yield* PubSub.publish(actions, { _tag: "Navigate", page })
   })))
+  const tray = Context.get(yield* Layer.build(TrayOwnerLive.pipe(Layer.provide(nativeTray))), TrayOwner)
   const refreshTray = Effect.gen(function* () {
     const current = yield* Ref.get(state)
     const presentation = yield* Ref.get(model)
