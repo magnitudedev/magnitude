@@ -445,7 +445,7 @@ impl PreparedVisionGraphs {
             .map_err(SubmitError::Invariant)?;
         let outputs = active
             .attach(bindings, outputs)
-            .and_then(|ready| ready.run())
+            .and_then(super::run_graph)
             .map_err(device)?;
         let owner = output.publish(outputs);
         let features = owner

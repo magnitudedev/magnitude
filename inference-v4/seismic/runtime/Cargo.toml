@@ -14,6 +14,7 @@ seismic-cpu.workspace = true
 seismic-cuda.workspace = true
 opentelemetry = "0.33.0"
 serde.workspace = true
+sha2 = "=0.11.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -29,8 +29,9 @@ fn qwen_head_rows[M, V, D](tokens: &tensor[M] i32, table: &tensor[V, D] EW,
     return result
 
 native qwen_head_rows for metal from "metal/qwen_head_rows.metal":
-    threadgroups (ceil_div(M * D, 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_head_rows:
+        threadgroups (ceil_div(M * D, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 fn head_logits_rows[O, V, D](features: &tensor[O, D] A,
@@ -40,5 +41,6 @@ fn head_logits_rows[O, V, D](features: &tensor[O, D] A,
     return logits
 
 native head_logits_rows for metal from "metal/head_logits_rows.metal":
-    threadgroups (ceil_div(O * V, 8), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch head_logits_rows:
+        threadgroups (ceil_div(O * V, 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)

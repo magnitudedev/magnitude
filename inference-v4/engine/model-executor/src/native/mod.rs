@@ -4,6 +4,7 @@ mod head;
 mod import;
 mod preparation;
 mod qualification;
+mod specialization;
 mod target;
 mod vision;
 
@@ -194,7 +195,7 @@ mod qualification_tests {
                 AW: binding.alpha,
                 BW: binding.beta,
                 A: binding.activation,
-            },
+            }, &seismic::NativeSpecialization::new(),
         )
         .unwrap();
         qwen_recurrent_prepare::native_for_device_with(
@@ -202,14 +203,14 @@ mod qualification_tests {
             qwen_recurrent_prepare::Elements {
                 A: binding.activation,
                 RN: binding.recurrent_norm,
-            },
+            }, &seismic::NativeSpecialization::new(),
         )
         .unwrap();
         qwen_recurrent_scan::native_for_device_with(
             &device,
             qwen_recurrent_scan::Elements {
                 A: binding.activation,
-            },
+            }, &seismic::NativeSpecialization::new(),
         )
         .unwrap();
         qwen_recurrent_mix::native_for_device_with(
@@ -217,7 +218,7 @@ mod qualification_tests {
             qwen_recurrent_mix::Elements {
                 RN: binding.recurrent_norm,
                 A: binding.activation,
-            },
+            }, &seismic::NativeSpecialization::new(),
         )
         .unwrap();
         qwen_recurrent_output::native_for_device_with(
@@ -225,7 +226,7 @@ mod qualification_tests {
             qwen_recurrent_output::Elements {
                 OW: binding.output,
                 A: binding.activation,
-            },
+            }, &seismic::NativeSpecialization::new(),
         )
         .unwrap();
     }

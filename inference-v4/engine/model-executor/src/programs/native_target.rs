@@ -378,7 +378,7 @@ impl NativeTargetProgram {
                     .activate(&graph.plan)
                     .map_err(SubmitError::Invariant)?,
             )
-            .and_then(|ready| ready.run())
+            .and_then(super::run_graph)
             .map_err(device)?;
         let owner = output.publish(outputs);
         let features = owner
@@ -528,6 +528,9 @@ impl NativeTargetProgram {
         let slots = u64::try_from(batch.actual_slots)
             .map_err(|_| invalid("request slot class exceeds u64"))?;
         let mut pending: [Option<NativeGraphOutputs>; 2] = [None, None];
+        // Every run of the step is queued without waiting; the device queue
+        // orders them, and their outcomes are checked once all are queued.
+        let mut completions = Vec::new();
         let (entry, entry_bound) = self.graphs.entry(rows).map_err(invalid)?;
         let overlay = self.prepare_conditioning_overlay(state, batch)?;
         let mut overlay_slot = overlay
@@ -563,13 +566,16 @@ impl NativeTargetProgram {
             active
                 .write_input(&entry.tokens, &i32_bytes(batch.tokens))
                 .map_err(device)?;
-            active
+            let (outputs, completion) = active
                 .attach(entry_bound.bindings(), entry_lease)
-                .and_then(|ready| ready.run())
-                .map_err(device)?
+                .and_then(|ready| ready.submit())
+                .map_err(device)?;
+            completions.push(completion);
+            outputs
         };
         if let Some(ready) = overlay_ready {
-            ready.run().map_err(device)?;
+            let (_, completion) = ready.submit().map_err(device)?;
+            completions.push(completion);
         }
         let mut hidden = entry_outputs
             .exported(&entry.hidden)
@@ -718,15 +724,16 @@ impl NativeTargetProgram {
                 }
                 _ => return Err(invalid("sealed graph block differs from decoder geometry")),
             }
-            let outputs = active
+            let (outputs, completion) = active
                 .attach(
                     bindings,
                     graph_outputs[parity]
                         .activate(&graph.plan)
                         .map_err(SubmitError::Invariant)?,
                 )
-                .and_then(|ready| ready.run())
+                .and_then(|ready| ready.submit())
                 .map_err(device)?;
+            completions.push(completion);
             if matches!(&graph.state, BlockStatePorts::Recurrent { .. }) {
                 recurrent_component += 2;
             }
@@ -760,6 +767,9 @@ impl NativeTargetProgram {
         } else {
             None
         };
+        for completion in completions {
+            completion.wait().map_err(device)?;
+        }
         drop(hidden);
         let last = self.geometry.blocks.len() % 2;
         graph_outputs[last]

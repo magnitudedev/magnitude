@@ -2083,6 +2083,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "seismic-native-tests"
+version = "0.1.0"
+dependencies = [
+ "seismic",
+ "seismic-build",
+]
+
+[[package]]
 name = "seismic-python"
 version = "0.1.0"
 dependencies = [
@@ -2105,6 +2113,7 @@ dependencies = [
  "seismic-metal",
  "seismic-target",
  "serde",
+ "sha2 0.11.0",
  "windows-sys 0.61.2",
 ]
 

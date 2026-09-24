@@ -115,6 +115,26 @@ pub const RESERVED_ARGUMENT_ENTRIES: u32 = 4;
 pub const MSL_GRID_INDEX_MAX: u64 = u32::MAX as u64;
 
 impl MetalFacts {
+    /// The facts that distinguish GPU performance behavior, for keying
+    /// per-device native tuning: device, architecture and families.
+    pub fn tuning_material(&self) -> String {
+        let families = self
+            .families
+            .iter()
+            .map(|family| family.label())
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "metal;{};{};{families}",
+            self.device_name, self.architecture
+        )
+    }
+
+    /// The operating-system build that ships the Metal compiler.
+    pub fn operating_system(&self) -> &str {
+        &self.operating_system
+    }
+
     /// Every fact, serialized deterministically for the profile fingerprint.
     pub fn fingerprint_material(&self) -> String {
         let families = self

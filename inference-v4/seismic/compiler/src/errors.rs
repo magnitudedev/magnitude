@@ -54,6 +54,9 @@ pub enum PreparationError {
     NativeCompilation(NativeCompilationError),
     /// A direct native entry could not reserve its fixed invocation storage.
     NativeWorkspaceAllocation(String),
+    /// A direct native specialization does not match its declaration, or the
+    /// entry has no native implementation for the device's backend.
+    NativeSpecialization(String),
     /// The selected evaluator could not consume this sealed domain. No
     /// partial evaluated domain exists.
     Evaluation(crate::evaluation::EvaluationError),
@@ -116,6 +119,13 @@ pub enum InvocationError {
     AllocationCapacity {
         required: seismic_lang::expr::BigUint,
         available: u64,
+    },
+    /// A dimension fixed when a native implementation was prepared has a
+    /// different value in this invocation.
+    StaticDimension {
+        dimension: String,
+        expected: u64,
+        actual: seismic_lang::expr::BigUint,
     },
 }
 
@@ -195,6 +205,7 @@ impl fmt::Display for PreparationError {
             ),
             Self::NativeCompilation(e) => write!(f, "native compilation failed: {e}"),
             Self::NativeWorkspaceAllocation(s) => write!(f, "native invocation workspace: {s}"),
+            Self::NativeSpecialization(s) => write!(f, "native specialization: {s}"),
             Self::Evaluation(e) => write!(f, "candidate evaluation failed: {e:?}"),
             Self::Feedback(e) => write!(f, "feedback evaluation failed: {e:?}"),
             Self::InvalidCandidateDomain(s) => write!(f, "invalid candidate domain: {s}"),
@@ -245,6 +256,14 @@ impl fmt::Display for InvocationError {
                     "allocation needs {required} bytes but {available} are available"
                 )
             }
+            Self::StaticDimension {
+                dimension,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "dimension `{dimension}` is {actual}, but the native implementation was prepared for {expected}"
+            ),
         }
     }
 }

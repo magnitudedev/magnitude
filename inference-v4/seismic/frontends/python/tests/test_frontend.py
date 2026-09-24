@@ -307,8 +307,9 @@ def test_native_snapshot_and_route(tmp_path):
         y[i] = x[i] + 1.0
     return y
 native native_add for metal from "add.metal":
-    threadgroups (ceil_div(N, 32), 1, 1)
-    threads_per_threadgroup (32, 1, 1)
+    launch native_add:
+        threadgroups (ceil_div(N, 32), 1, 1)
+        threads_per_threadgroup (32, 1, 1)
 """
     metal = """kernel void native_add(
  device const float *x [[buffer(SEISMIC_BUFFER_X)]],

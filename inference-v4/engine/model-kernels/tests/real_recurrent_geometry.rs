@@ -63,7 +63,7 @@ fn repacked(
         repack_weight::Elements {
             E: source_element,
             U: resident_element,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(repack_weight::Args { source: &input })
@@ -172,7 +172,7 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf() {
 
     let normalized = qwen_recurrent_normalize::native_for_device_with(
         &device,
-        qwen_recurrent_normalize::Elements { NW: f32e, A: bf16 },
+        qwen_recurrent_normalize::Elements { NW: f32e, A: bf16 }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_recurrent_normalize::Args {
@@ -207,7 +207,7 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf() {
             AW: q8,
             BW: q8,
             A: bf16,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_recurrent_project::Args {
@@ -223,7 +223,7 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf() {
 
     let prepared = qwen_recurrent_prepare::native_for_device_with(
         &device,
-        qwen_recurrent_prepare::Elements { RN: f32e, A: bf16 },
+        qwen_recurrent_prepare::Elements { RN: f32e, A: bf16 }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_recurrent_prepare::Args {
@@ -242,7 +242,7 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf() {
     report(path, "prepared", prepared_values);
     let scanned = qwen_recurrent_scan::native_for_device_with(
         &device,
-        qwen_recurrent_scan::Elements { A: bf16 },
+        qwen_recurrent_scan::Elements { A: bf16 }, &seismic::NativeSpecialization::new(),
     )
         .unwrap()
         .call(qwen_recurrent_scan::Args {
@@ -257,7 +257,7 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf() {
     report(path, "delta", read_f32(&scanned.r0));
     let gated = qwen_recurrent_mix::native_for_device_with(
         &device,
-        qwen_recurrent_mix::Elements { RN: f32e, A: bf16 },
+        qwen_recurrent_mix::Elements { RN: f32e, A: bf16 }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_recurrent_mix::Args {
@@ -271,7 +271,7 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf() {
     report(path, "gated", read_bf16(&gated));
     let projected = qwen_recurrent_output::native_for_device_with(
         &device,
-        qwen_recurrent_output::Elements { OW: q5, A: bf16 },
+        qwen_recurrent_output::Elements { OW: q5, A: bf16 }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_recurrent_output::Args {

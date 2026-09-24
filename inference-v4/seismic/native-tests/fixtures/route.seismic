@@ -1,0 +1,75 @@
+# The sum of a vector in `PARTS` contiguous parts. Each part is summed in
+# element order by one participant after `WIDTH`-wide staging through shared
+# memory, so `WIDTH` never changes result bits while `PARTS` does.
+fn split_sum[N](x: &tensor[N] f32) -> tensor[1] f32:
+    let mut result = tensor[1] f32
+    let mut total = f32(0.0)
+    for i in 0..N:
+        total = total + x[i]
+    result[0] = total
+    return result
+
+native split_sum for metal from "metal/split_sum.metal":
+    static (N)
+    params (arithmetic PARTS in [1, 2, 4], WIDTH in [32, 64])
+    where PARTS <= N
+    scratch partials bytes (PARTS * 4)
+    launch split_partial:
+        threadgroups (PARTS, 1, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)
+        shared_bytes (WIDTH * 4)
+    launch split_merge:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+native split_sum for cuda from "cuda/split_sum.cu":
+    static (N)
+    params (arithmetic PARTS in [1, 2, 4], WIDTH in [32, 64])
+    where PARTS <= N
+    scratch partials bytes (PARTS * 4)
+    launch split_partial:
+        threadgroups (PARTS, 1, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)
+        shared_bytes (WIDTH * 4)
+    launch split_merge:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+native split_sum for cpu from "cpu/split_sum.rs":
+    static (N)
+    params (arithmetic PARTS in [1, 2, 4], WIDTH in [32, 64])
+    where PARTS <= N
+    scratch partials bytes (PARTS * 4)
+    launch split_partial:
+        threadgroups (PARTS, 1, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)
+        shared_bytes (WIDTH * 4)
+    launch split_merge:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# Rows scaled by a factor; `ROWS` rows per group is a mapping choice.
+fn scale_rows[M, N](x: &tensor[M, N] f32, factor: f32) -> tensor[M, N] f32:
+    let mut result = zeros_like(x)
+    parallel for row in 0..M:
+        parallel for column in 0..N:
+            result[row, column] = x[row, column] * factor
+    return result
+
+native scale_rows for metal from "metal/scale_rows.metal":
+    params (ROWS in [1, 2])
+    launch scale_rows:
+        threadgroups (ceil_div(M, ROWS), 1, 1)
+        threads_per_threadgroup (min(N, 64), 1, 1)
+
+native scale_rows for cuda from "cuda/scale_rows.cu":
+    params (ROWS in [1, 2])
+    launch scale_rows:
+        threadgroups (ceil_div(M, ROWS), 1, 1)
+        threads_per_threadgroup (min(N, 64), 1, 1)
+
+native scale_rows for cpu from "cpu/scale_rows.rs":
+    params (ROWS in [1, 2])
+    launch scale_rows:
+        threadgroups (ceil_div(M, ROWS), 1, 1)
+        threads_per_threadgroup (min(N, 64), 1, 1)

@@ -36,7 +36,7 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
             repack_weight::Elements {
                 E: q8_external,
                 U: q8,
-            },
+            }, &seismic::NativeSpecialization::new(),
         )
         .unwrap()
         .call(repack_weight::Args { source: &external })
@@ -77,7 +77,7 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
             VW: q8,
             OW: q8,
             A: bf16,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_attention_rows::Args {
@@ -115,7 +115,7 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
     let delta = tensor(&device, &[1, 1, 32, 32], &[0.0; 1024]);
     let normalized = qwen_recurrent_normalize::native_for_device_with(
         &device,
-        qwen_recurrent_normalize::Elements { NW: bf16, A: bf16 },
+        qwen_recurrent_normalize::Elements { NW: bf16, A: bf16 }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_recurrent_normalize::Args {
@@ -133,7 +133,7 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
             AW: q8,
             BW: q8,
             A: bf16,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_recurrent_project::Args {
@@ -147,7 +147,7 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
     .value;
     let prepared = qwen_recurrent_prepare::native_for_device_with(
         &device,
-        qwen_recurrent_prepare::Elements { RN: bf16, A: bf16 },
+        qwen_recurrent_prepare::Elements { RN: bf16, A: bf16 }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_recurrent_prepare::Args {
@@ -163,7 +163,7 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
     .unwrap();
     let scanned = qwen_recurrent_scan::native_for_device_with(
         &device,
-        qwen_recurrent_scan::Elements { A: bf16 },
+        qwen_recurrent_scan::Elements { A: bf16 }, &seismic::NativeSpecialization::new(),
     )
         .unwrap()
         .call(qwen_recurrent_scan::Args {
@@ -176,7 +176,7 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
         .unwrap();
     let gated = qwen_recurrent_mix::native_for_device_with(
         &device,
-        qwen_recurrent_mix::Elements { RN: bf16, A: bf16 },
+        qwen_recurrent_mix::Elements { RN: bf16, A: bf16 }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_recurrent_mix::Args {
@@ -189,7 +189,7 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
     .value;
     let recurrent = qwen_recurrent_output::native_for_device_with(
         &device,
-        qwen_recurrent_output::Elements { OW: q8, A: bf16 },
+        qwen_recurrent_output::Elements { OW: q8, A: bf16 }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_recurrent_output::Args {
@@ -204,7 +204,7 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
     let identity_rows = indices(&device, &[1], &[0]);
     let normalized = qwen_routed_normalize::native_for_device_with(
         &device,
-        qwen_routed_normalize::Elements { NW: bf16, A: bf16 },
+        qwen_routed_normalize::Elements { NW: bf16, A: bf16 }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_routed_normalize::Args {
@@ -217,7 +217,7 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
     .value;
     let logits = qwen_routed_logits::native_for_device_with(
         &device,
-        qwen_routed_logits::Elements { A: bf16, RW: q8 },
+        qwen_routed_logits::Elements { A: bf16, RW: q8 }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_routed_logits::Args {
@@ -228,7 +228,7 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
     .value;
     let mut selected_routes = indices(&device, &[1, 1], &[0]);
     let mut selected_scores = tensor(&device, &[1, 1], &[0.0]);
-    qwen_routed_select::native_for_device(&device)
+    qwen_routed_select::native_for_device(&device, &seismic::NativeSpecialization::new())
         .unwrap()
         .call(qwen_routed_select::Args {
             logits: &logits,
@@ -245,7 +245,7 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
             EUW: q8,
             SGW: q8,
             SUW: q8,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_routed_expand::Args {
@@ -264,7 +264,7 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
             A: bf16,
             EDW: q8,
             SDW: q8,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_routed_output::Args {
@@ -288,7 +288,7 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
     let out_rows = indices(&device, &[1], &[1]);
     let demanded_normalized = qwen_routed_normalize::native_for_device_with(
         &device,
-        qwen_routed_normalize::Elements { NW: bf16, A: bf16 },
+        qwen_routed_normalize::Elements { NW: bf16, A: bf16 }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_routed_normalize::Args {
@@ -301,7 +301,7 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
     .value;
     let demanded_logits = qwen_routed_logits::native_for_device_with(
         &device,
-        qwen_routed_logits::Elements { A: bf16, RW: q8 },
+        qwen_routed_logits::Elements { A: bf16, RW: q8 }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_routed_logits::Args {
@@ -312,7 +312,7 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
     .value;
     let mut demanded_routes = indices(&device, &[1, 1], &[0]);
     let mut demanded_scores = tensor(&device, &[1, 1], &[0.0]);
-    qwen_routed_select::native_for_device(&device)
+    qwen_routed_select::native_for_device(&device, &seismic::NativeSpecialization::new())
         .unwrap()
         .call(qwen_routed_select::Args {
             logits: &demanded_logits,
@@ -329,7 +329,7 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
             EUW: q8,
             SGW: q8,
             SUW: q8,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_routed_expand::Args {
@@ -348,7 +348,7 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
             A: bf16,
             EDW: q8,
             SDW: q8,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_routed_output::Args {
@@ -494,7 +494,7 @@ fn staged_attention_matches_monolith_for_gqa_rotary_extremes_and_overlap() {
             VW: f32e,
             OW: f32e,
             A: f32e,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_attention_rows::Args {
@@ -521,7 +521,7 @@ fn staged_attention_matches_monolith_for_gqa_rotary_extremes_and_overlap() {
     .value;
     let normalized = qwen_attention_normalize::native_for_device_with(
         &device,
-        qwen_attention_normalize::Elements { NW: f32e, A: f32e },
+        qwen_attention_normalize::Elements { NW: f32e, A: f32e }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_attention_normalize::Args {
@@ -538,7 +538,7 @@ fn staged_attention_matches_monolith_for_gqa_rotary_extremes_and_overlap() {
             KW: f32e,
             VW: f32e,
             A: f32e,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_attention_project::Args {
@@ -551,7 +551,7 @@ fn staged_attention_matches_monolith_for_gqa_rotary_extremes_and_overlap() {
     .unwrap();
     let prepared = qwen_attention_prepare::native_for_device_with(
         &device,
-        qwen_attention_prepare::Elements { A: f32e },
+        qwen_attention_prepare::Elements { A: f32e }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_attention_prepare::Args {
@@ -570,7 +570,7 @@ fn staged_attention_matches_monolith_for_gqa_rotary_extremes_and_overlap() {
     let mut accumulator = tensor_values(&[2, 2, 3], vec![0.0; 12]);
     let gated = qwen_attention_attend::native_for_device_with(
         &device,
-        qwen_attention_attend::Elements { A: f32e },
+        qwen_attention_attend::Elements { A: f32e }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_attention_attend::Args {
@@ -589,7 +589,7 @@ fn staged_attention_matches_monolith_for_gqa_rotary_extremes_and_overlap() {
     .value;
     let staged = qwen_attention_output::native_for_device_with(
         &device,
-        qwen_attention_output::Elements { OW: f32e, A: f32e },
+        qwen_attention_output::Elements { OW: f32e, A: f32e }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_attention_output::Args {
@@ -650,7 +650,7 @@ fn packed_native_rows_match_small_host_oracles_at_two_partitions() {
             VW: f32e,
             OW: f32e,
             A: f32e,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_attention_rows::Args {
@@ -715,7 +715,7 @@ fn packed_native_rows_match_small_host_oracles_at_two_partitions() {
     let delta = tensor(&device, &[2, 1, 1, 1], &delta_values);
     let normalized = qwen_recurrent_normalize::native_for_device_with(
         &device,
-        qwen_recurrent_normalize::Elements { NW: f32e, A: f32e },
+        qwen_recurrent_normalize::Elements { NW: f32e, A: f32e }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_recurrent_normalize::Args {
@@ -733,7 +733,7 @@ fn packed_native_rows_match_small_host_oracles_at_two_partitions() {
             AW: f32e,
             BW: f32e,
             A: f32e,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_recurrent_project::Args {
@@ -747,7 +747,7 @@ fn packed_native_rows_match_small_host_oracles_at_two_partitions() {
     .value;
     let prepared = qwen_recurrent_prepare::native_for_device_with(
         &device,
-        qwen_recurrent_prepare::Elements { RN: f32e, A: f32e },
+        qwen_recurrent_prepare::Elements { RN: f32e, A: f32e }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_recurrent_prepare::Args {
@@ -763,7 +763,7 @@ fn packed_native_rows_match_small_host_oracles_at_two_partitions() {
     .unwrap();
     let scanned = qwen_recurrent_scan::native_for_device_with(
         &device,
-        qwen_recurrent_scan::Elements { A: f32e },
+        qwen_recurrent_scan::Elements { A: f32e }, &seismic::NativeSpecialization::new(),
     )
         .unwrap()
         .call(qwen_recurrent_scan::Args {
@@ -776,7 +776,7 @@ fn packed_native_rows_match_small_host_oracles_at_two_partitions() {
         .unwrap();
     let gated = qwen_recurrent_mix::native_for_device_with(
         &device,
-        qwen_recurrent_mix::Elements { RN: f32e, A: f32e },
+        qwen_recurrent_mix::Elements { RN: f32e, A: f32e }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_recurrent_mix::Args {
@@ -789,7 +789,7 @@ fn packed_native_rows_match_small_host_oracles_at_two_partitions() {
     .value;
     let recurrent = qwen_recurrent_output::native_for_device_with(
         &device,
-        qwen_recurrent_output::Elements { OW: f32e, A: f32e },
+        qwen_recurrent_output::Elements { OW: f32e, A: f32e }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_recurrent_output::Args {
@@ -818,7 +818,7 @@ fn packed_native_rows_match_small_host_oracles_at_two_partitions() {
     let source_rows = indices(&device, &[2], &[0, 1]);
     let normalized = qwen_routed_normalize::native_for_device_with(
         &device,
-        qwen_routed_normalize::Elements { NW: f32e, A: f32e },
+        qwen_routed_normalize::Elements { NW: f32e, A: f32e }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_routed_normalize::Args {
@@ -831,7 +831,7 @@ fn packed_native_rows_match_small_host_oracles_at_two_partitions() {
     .value;
     let logits = qwen_routed_logits::native_for_device_with(
         &device,
-        qwen_routed_logits::Elements { A: f32e, RW: f32e },
+        qwen_routed_logits::Elements { A: f32e, RW: f32e }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_routed_logits::Args {
@@ -842,7 +842,7 @@ fn packed_native_rows_match_small_host_oracles_at_two_partitions() {
     .value;
     let mut selected_routes = indices(&device, &[2, 2], &[0; 4]);
     let mut selected_scores = tensor(&device, &[2, 2], &[0.0; 4]);
-    qwen_routed_select::native_for_device(&device)
+    qwen_routed_select::native_for_device(&device, &seismic::NativeSpecialization::new())
         .unwrap()
         .call(qwen_routed_select::Args {
             logits: &logits,
@@ -859,7 +859,7 @@ fn packed_native_rows_match_small_host_oracles_at_two_partitions() {
             EUW: f32e,
             SGW: f32e,
             SUW: f32e,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_routed_expand::Args {
@@ -878,7 +878,7 @@ fn packed_native_rows_match_small_host_oracles_at_two_partitions() {
             A: f32e,
             EDW: f32e,
             SDW: f32e,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_routed_output::Args {

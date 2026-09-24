@@ -8,8 +8,9 @@ fn qwen_attention_normalize[M, D](hidden: &tensor[M, D] f32,
     return normalized
 
 native qwen_attention_normalize for metal from "metal/qwen_attention_normalize.metal":
-    threadgroups (ceil_div(M, 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_attention_normalize:
+        threadgroups (ceil_div(M, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 # query_norm fixes W for the checked flattened KV*G*W projection shape.
@@ -27,8 +28,9 @@ fn qwen_attention_project[M, D, KV, G, W](normalized: &tensor[M, D] A,
     return query_gate, key, value
 
 native qwen_attention_project for metal from "metal/qwen_attention_project.metal":
-    threadgroups (ceil_div(ceil_div(M, 8) * (KV * G * 2 * W + KV * W * 2), 8), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_attention_project:
+        threadgroups (ceil_div(ceil_div(M, 8) * (KV * G * 2 * W + KV * W * 2), 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 fn qwen_attention_prepare[M, KV, G, P, S](query_gate: &tensor[M, KV * G * 2 * (2 * P + S)] A,
@@ -46,8 +48,9 @@ fn qwen_attention_prepare[M, KV, G, P, S](query_gate: &tensor[M, KV * G * 2 * (2
     return query, prepared_key, gate
 
 native qwen_attention_prepare for metal from "metal/qwen_attention_prepare.metal":
-    threadgroups (ceil_div(M * (KV * G + KV), 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_attention_prepare:
+        threadgroups (ceil_div(M * (KV * G + KV), 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 fn qwen_attention_attend[M, T, KV, G, W, R](query: &tensor[M, KV * G, W] A,
@@ -100,8 +103,9 @@ fn qwen_attention_attend[M, T, KV, G, W, R](query: &tensor[M, KV * G, W] A,
     return reshape(gated, (M, KV * G, W))
 
 native qwen_attention_attend for metal from "metal/qwen_attention_attend.metal":
-    threadgroups (KV * G, ceil_div(M, 8), 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_attention_attend:
+        threadgroups (KV * G, ceil_div(M, 8), 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 fn qwen_attention_output[M, D, T, KV, G, W](hidden: &tensor[M, D] f32,
@@ -121,5 +125,6 @@ fn qwen_attention_output[M, D, T, KV, G, W](hidden: &tensor[M, D] f32,
     return result
 
 native qwen_attention_output for metal from "metal/qwen_attention_output.metal":
-    threadgroups (ceil_div(ceil_div(M, 8) * D, 8) + ceil_div(M * KV * W, 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_attention_output:
+        threadgroups (ceil_div(ceil_div(M, 8) * D, 8) + ceil_div(M * KV * W, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)

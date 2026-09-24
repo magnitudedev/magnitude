@@ -47,7 +47,7 @@ use std::time::Instant;
 pub use command::Pipeline;
 pub use compile::NativeCandidate;
 pub use device::{DeviceHandle, MetalBuffer, MetalDevice};
-pub use direct::{DirectBatch, DirectPipeline};
+pub use direct::{DirectBatch, DirectLaunch, DirectPipeline, DirectSubmission, DIRECT_WORD_BYTES_LIMIT};
 pub use executor::MetalExecutor;
 pub use facts::MetalFacts;
 use seismic_ir::metal::MetalIntrinsic;

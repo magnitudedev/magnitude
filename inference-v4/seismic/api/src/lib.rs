@@ -19,7 +19,24 @@ pub use seismic_compiler::feedback::{
     EvaluationMethod, FeedbackOptions, FeedbackReport, InvocationRange, InvocationScope,
     PreparationOptions,
 };
+pub use seismic_lang::checked::{
+    NativeComparison, NativeConstraint, NativeImplementation, NativeLaunch, NativeNatExpr,
+    NativeParameter, NativeScratch, NativeSpecialization, NativeSpecializationError,
+};
 pub use seismic_lang::precision::PrecisionPolicy;
+pub use seismic_runtime::native::tune::{
+    Configuration, ConfigurationRecord, Exclusion, Outcome, PointMeasurement, TuneError,
+    TuningResult, Validation,
+};
+pub use seismic_runtime::native::{MeasureOptions, Measurement, NativeArtifactIdentity};
+
+/// The CPU native ABI that generated bindings wrap. Kernel authors use the
+/// generated `Context` of their entry instead.
+pub mod native_cpu {
+    pub use seismic_runtime::native::{
+        CpuInvocation, CpuKernelFn, CpuLaunchVariants, CpuNativeKernels, CpuTensor,
+    };
+}
 pub use seismic_lang::expr::{BigInt, BigUint};
 pub use seismic_lang::registry::BackendName;
 pub use seismic_lang::types::DType;
@@ -106,11 +123,15 @@ impl Device {
     pub fn backend(&self) -> BackendName {
         self.inner.info().backend
     }
+    /// Stable key of this device's model and configuration for native
+    /// tuning records.
+    pub fn tuning_identity(&self) -> String {
+        self.inner.tuning_identity()
+    }
     /// Begin a checked direct-native graph on this opened device.
-    #[cfg(target_os = "macos")]
     pub fn native_graph(&self) -> NativeGraph {
         NativeGraph {
-            inner: seismic_runtime::native_graph::NativeGraphDraft::new(&self.inner),
+            inner: seismic_runtime::native::graph::NativeGraphDraft::new(&self.inner),
         }
     }
     /// Seismic-owned charges and limits for this device and its pool.
@@ -662,22 +683,27 @@ pub struct NativeKernel<E: Entry> {
     marker: std::marker::PhantomData<E>,
 }
 
+/// One workload for native tuning: argument sets cycled by measurement, the
+/// first also used for validation, and the point's share of the objective.
+pub struct TuningPoint<'a, E: Entry> {
+    pub label: String,
+    pub weight: f64,
+    pub rotation: Vec<E::Args<'a>>,
+}
+
 /// A direct-native graph is assembled from generated entry arguments and
 /// symbolic result edges. Seismic derives every intermediate tensor from the
 /// checked entry contracts and owns its storage plan.
-#[cfg(target_os = "macos")]
 pub struct NativeGraph {
-    inner: seismic_runtime::native_graph::NativeGraphDraft,
+    inner: seismic_runtime::native::graph::NativeGraphDraft,
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Clone)]
 pub struct NativePort {
-    inner: seismic_runtime::native_graph::NativePort,
+    inner: seismic_runtime::native::graph::NativePort,
     tensor: WorkflowTensor,
 }
 
-#[cfg(target_os = "macos")]
 impl NativePort {
     pub fn tensor(&self) -> &WorkflowTensor {
         &self.tensor
@@ -687,7 +713,6 @@ impl NativePort {
     }
 }
 
-#[cfg(target_os = "macos")]
 impl NativeGraph {
     /// Declare an external tensor descriptor from model metadata. Sealing
     /// checks each use against its generated Seismic entry contract.
@@ -766,13 +791,11 @@ impl NativeGraph {
     }
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Clone)]
 pub struct NativeGraphPlan {
-    inner: Arc<seismic_runtime::native_graph::NativeGraphPlan>,
+    inner: Arc<seismic_runtime::native::graph::NativeGraphPlan>,
 }
 
-#[cfg(target_os = "macos")]
 impl NativeGraphPlan {
     pub fn workspace_bytes(&self) -> u64 {
         self.inner.workspace_bytes()
@@ -782,6 +805,10 @@ impl NativeGraphPlan {
     }
     pub fn slot_storage_bytes(&self) -> u64 {
         self.inner.slot_storage_bytes()
+    }
+    /// Bytes of one submission's host-written inputs.
+    pub fn upload_bytes(&self) -> u64 {
+        self.inner.upload_bytes()
     }
     pub fn new_slot(&self) -> Result<NativeGraphSlot, TensorError> {
         self.inner.new_slot().map(|inner| NativeGraphSlot { inner })
@@ -810,12 +837,10 @@ impl NativeGraphPlan {
     }
 }
 
-#[cfg(target_os = "macos")]
 pub struct NativeGraphFamilyOutputSlot {
-    inner: seismic_runtime::native_graph::NativeGraphFamilyOutputSlot,
+    inner: seismic_runtime::native::graph::NativeGraphFamilyOutputSlot,
 }
 
-#[cfg(target_os = "macos")]
 impl NativeGraphFamilyOutputSlot {
     pub fn activate(self, plan: &NativeGraphPlan) -> Result<NativeGraphOutputs, WorkflowError> {
         self.inner
@@ -824,12 +849,10 @@ impl NativeGraphFamilyOutputSlot {
     }
 }
 
-#[cfg(target_os = "macos")]
 pub struct BoundNativeGraphPlan {
-    inner: seismic_runtime::native_graph::BoundNativeGraphPlan,
+    inner: seismic_runtime::native::graph::BoundNativeGraphPlan,
 }
 
-#[cfg(target_os = "macos")]
 impl BoundNativeGraphPlan {
     pub fn bindings(&self) -> NativeGraphBindings {
         NativeGraphBindings {
@@ -838,20 +861,18 @@ impl BoundNativeGraphPlan {
     }
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Clone)]
 pub struct NativeGraphFamily {
-    inner: Arc<seismic_runtime::native_graph::NativeGraphFamily>,
+    inner: Arc<seismic_runtime::native::graph::NativeGraphFamily>,
 }
 
-#[cfg(target_os = "macos")]
 impl NativeGraphFamily {
     pub fn new(plans: &[NativeGraphPlan]) -> Result<Self, WorkflowError> {
         let members = plans
             .iter()
             .map(|plan| plan.inner.clone())
             .collect::<Vec<_>>();
-        seismic_runtime::native_graph::NativeGraphFamily::new(&members).map(|inner| Self {
+        seismic_runtime::native::graph::NativeGraphFamily::new(&members).map(|inner| Self {
             inner: Arc::new(inner),
         })
     }
@@ -860,6 +881,10 @@ impl NativeGraphFamily {
     }
     pub fn output_bytes(&self) -> u64 {
         self.inner.output_bytes()
+    }
+    /// Bytes of one upload region; a slot holds one per run in flight.
+    pub fn upload_bytes(&self) -> u64 {
+        self.inner.upload_bytes()
     }
     pub fn new_output_slot(&self) -> Result<NativeGraphFamilyOutputSlot, TensorError> {
         self.inner
@@ -873,12 +898,10 @@ impl NativeGraphFamily {
     }
 }
 
-#[cfg(target_os = "macos")]
 pub struct NativeGraphFamilySlot {
-    inner: seismic_runtime::native_graph::NativeGraphFamilySlot,
+    inner: seismic_runtime::native::graph::NativeGraphFamilySlot,
 }
 
-#[cfg(target_os = "macos")]
 impl NativeGraphFamilySlot {
     pub fn activate<'a>(
         &'a mut self,
@@ -890,12 +913,10 @@ impl NativeGraphFamilySlot {
     }
 }
 
-#[cfg(target_os = "macos")]
 pub struct NativeGraphFamilyActive<'a> {
-    inner: seismic_runtime::native_graph::NativeGraphFamilyActive<'a>,
+    inner: seismic_runtime::native::graph::NativeGraphFamilyActive<'a>,
 }
 
-#[cfg(target_os = "macos")]
 impl NativeGraphFamilyActive<'_> {
     pub fn local(&mut self, port: &NativePort) -> Option<Tensor> {
         self.inner.local(port.inner).map(|inner| Tensor { inner })
@@ -915,12 +936,10 @@ impl NativeGraphFamilyActive<'_> {
     }
 }
 
-#[cfg(target_os = "macos")]
 pub struct NativeGraphBindings {
-    inner: seismic_runtime::native_graph::NativeGraphBindings,
+    inner: seismic_runtime::native::graph::NativeGraphBindings,
 }
 
-#[cfg(target_os = "macos")]
 impl NativeGraphBindings {
     pub fn set(&mut self, port: &NativePort, tensor: &Tensor) -> Result<(), WorkflowError> {
         self.inner.set(port.inner, tensor.inner.clone())
@@ -939,12 +958,10 @@ impl NativeGraphBindings {
     }
 }
 
-#[cfg(target_os = "macos")]
 pub struct NativeGraphSlot {
-    inner: seismic_runtime::native_graph::NativeGraphSlot,
+    inner: seismic_runtime::native::graph::NativeGraphSlot,
 }
 
-#[cfg(target_os = "macos")]
 impl NativeGraphSlot {
     pub fn write_input(&mut self, port: &NativePort, bytes: &[u8]) -> Result<(), TensorError> {
         self.inner.write_input(port.inner, bytes)
@@ -960,12 +977,10 @@ impl NativeGraphSlot {
     }
 }
 
-#[cfg(target_os = "macos")]
 pub struct NativeGraphOutputs {
-    inner: seismic_runtime::native_graph::NativeGraphOutputs,
+    inner: seismic_runtime::native::graph::NativeGraphOutputs,
 }
 
-#[cfg(target_os = "macos")]
 impl NativeGraphOutputs {
     pub fn recycle(self) -> Result<NativeGraphFamilyOutputSlot, WorkflowError> {
         self.inner
@@ -979,15 +994,33 @@ impl NativeGraphOutputs {
     }
 }
 
-#[cfg(target_os = "macos")]
 pub struct ReadyNativeGraphRun<'a> {
-    inner: seismic_runtime::native_graph::ReadyNativeGraphRun<'a>,
+    inner: seismic_runtime::native::graph::ReadyNativeGraphRun<'a>,
 }
 
-#[cfg(target_os = "macos")]
 impl ReadyNativeGraphRun<'_> {
-    pub fn run(self) -> Result<NativeGraphOutputs, CallError> {
-        self.inner.run().map(|inner| NativeGraphOutputs { inner })
+    /// Submit without waiting. The outputs can be bound into later runs at
+    /// once; host reads of exported tensors wait for this run. The
+    /// completion reports its outcome.
+    pub fn submit(self) -> Result<(NativeGraphOutputs, NativeGraphCompletion), CallError> {
+        self.inner
+            .submit()
+            .map(|(inner, completion)| (NativeGraphOutputs { inner }, NativeGraphCompletion { inner: completion }))
+    }
+}
+
+/// The outcome of one submitted native graph run.
+#[must_use = "a native graph completion reports whether the run succeeded"]
+pub struct NativeGraphCompletion {
+    inner: seismic_runtime::native::graph::NativeGraphCompletion,
+}
+
+impl NativeGraphCompletion {
+    pub fn is_complete(&self) -> bool {
+        self.inner.is_complete()
+    }
+    pub fn wait(self) -> Result<(), CallError> {
+        self.inner.wait()
     }
 }
 
@@ -1104,8 +1137,9 @@ impl<E: Entry> NativeKernel<E> {
 
     fn prepare(
         device: &Device,
-        definition: generated::NativeDefinition,
+        specialization: NativeSpecialization,
         bindings: seismic_lang::entry::ElementBindings,
+        cpu: Option<&'static native_cpu::CpuNativeKernels>,
     ) -> Result<Self, LoadError> {
         let module = E::module().map_err(LoadError::Bundle)?;
         let entry = E::resolve(module).map_err(LoadError::Bundle)?;
@@ -1114,7 +1148,8 @@ impl<E: Entry> NativeKernel<E> {
             entry.id(),
             bindings,
             device.inner(),
-            definition,
+            specialization,
+            cpu,
         )
         .map(|inner| {
             debug_assert_eq!(
@@ -1127,6 +1162,27 @@ impl<E: Entry> NativeKernel<E> {
             }
         })
         .map_err(LoadError::from_prepare)
+    }
+
+    /// The specialization this kernel was formed under.
+    pub fn specialization(&self) -> &NativeSpecialization {
+        self.inner.specialization()
+    }
+
+    /// What was formed: backend, bindings, specialization, source digest
+    /// and toolchain.
+    pub fn artifact(&self) -> &NativeArtifactIdentity {
+        self.inner.artifact()
+    }
+
+    /// Device time of calls cycling through `rotation`.
+    pub fn measure(
+        &self,
+        rotation: Vec<E::Args<'_>>,
+        options: &MeasureOptions,
+    ) -> Result<Measurement, CallError> {
+        self.inner
+            .measure(rotation.into_iter().map(E::encode).collect(), options)
     }
 
     pub fn call(&self, args: E::Args<'_>) -> Result<E::Results, CallError> {
@@ -1194,7 +1250,6 @@ pub mod generated {
         DecodedResults, EncodedArgs, EncodedOutputs, EncodedWorkflowArgs, PendingWorkflowResults,
         WorkflowResultRef,
     };
-    pub use seismic_runtime::api::kernel::{NativeDefinition, NativeExpr};
 
     /// Opaque checked module token used only by generated bindings. Consumers
     /// can name the type because Rust trait implementations must, but cannot
@@ -1426,16 +1481,63 @@ pub mod generated {
         FeedbackPreparation::start(device, precision, options, bindings)
     }
 
-    pub fn prepare_native<E: Entry>(
-        device: &Device,
-        definition: NativeDefinition,
-        elements: &[(&str, Element)],
-    ) -> Result<NativeKernel<E>, LoadError> {
-        let bindings = elements.iter().fold(
+    fn element_bindings(elements: &[(&str, Element)]) -> seismic_lang::entry::ElementBindings {
+        elements.iter().fold(
             seismic_lang::entry::ElementBindings::new(),
             |bindings, (name, element)| bindings.bind(name, element.id()),
-        );
-        NativeKernel::prepare(device, definition, bindings)
+        )
+    }
+
+    pub fn prepare_native<E: Entry>(
+        device: &Device,
+        specialization: &NativeSpecialization,
+        elements: &[(&str, Element)],
+        cpu: Option<&'static native_cpu::CpuNativeKernels>,
+    ) -> Result<NativeKernel<E>, LoadError> {
+        NativeKernel::prepare(device, specialization.clone(), element_bindings(elements), cpu)
+    }
+
+    /// The checked native implementation of an entry for a device's backend.
+    pub fn native_implementation<E: Entry>(
+        device: &Device,
+    ) -> Result<Option<NativeImplementation>, CheckedBundleError> {
+        let module = E::module()?;
+        let entry = E::resolve(module)?;
+        Ok(module
+            .checked()
+            .native_implementation(entry.id(), device.backend())
+            .cloned())
+    }
+
+    pub fn tune_native<E: Entry>(
+        device: &Device,
+        statics: &NativeSpecialization,
+        elements: &[(&str, Element)],
+        cpu: Option<&'static native_cpu::CpuNativeKernels>,
+        points: Vec<TuningPoint<'_, E>>,
+        validation: Validation,
+        measure: MeasureOptions,
+    ) -> Result<TuningResult, TuneError> {
+        let module = E::module().map_err(|error| TuneError::Declaration(error.to_string()))?;
+        let entry = E::resolve(module).map_err(|error| TuneError::Declaration(error.to_string()))?;
+        seismic_runtime::native::tune::tune(seismic_runtime::native::tune::TuneRequest {
+            device: device.inner(),
+            module: module.checked(),
+            entry: entry.id(),
+            bindings: element_bindings(elements),
+            statics: statics.clone(),
+            cpu,
+            points: points
+                .into_iter()
+                .map(|point| seismic_runtime::native::tune::TuningPoint {
+                    label: point.label,
+                    weight: point.weight,
+                    rotation: point.rotation.into_iter().map(E::encode).collect(),
+                })
+                .collect(),
+            validation,
+            measure,
+        })
     }
 
     fn tensor_result(inner: Arc<seismic_runtime::api::tensor::TensorInner>) -> Tensor {

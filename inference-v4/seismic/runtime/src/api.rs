@@ -217,6 +217,12 @@ pub mod device {
         ) -> Result<Arc<Allocation>, ExecutionError> {
             self.kind.allocate(bytes, alignment)
         }
+        /// Stable key of this device's model and configuration for native
+        /// tuning records: its name and the backend facts that shape
+        /// performance.
+        pub fn tuning_identity(&self) -> String {
+            format!("{};{}", self.info.name, self.kind.tuning_identity())
+        }
         pub(crate) fn supports_representation(
             &self,
             representation: seismic_lang::ids::RepresentationId,
@@ -541,62 +547,31 @@ pub mod kernel {
         Preparation(PreparationError),
     }
 
-    /// Closed launch-expression vocabulary emitted by `seismic-build` for a
-    /// top-level native implementation.
-    #[derive(Clone, Debug)]
-    pub enum NativeExpr {
-        Constant(u64),
-        Dimension(String),
-        Add(Box<Self>, Box<Self>),
-        Sub(Box<Self>, Box<Self>),
-        Mul(Box<Self>, Box<Self>),
-        Div(Box<Self>, Box<Self>),
-        Rem(Box<Self>, Box<Self>),
-        CeilDiv(Box<Self>, Box<Self>),
-    }
-
-    impl NativeExpr {
-        pub fn constant(value: u64) -> Self {
-            Self::Constant(value)
-        }
-        pub fn dimension(name: &'static str) -> Self {
-            Self::Dimension(name.to_owned())
-        }
-        pub fn add(left: Self, right: Self) -> Self {
-            Self::Add(Box::new(left), Box::new(right))
-        }
-        pub fn sub(left: Self, right: Self) -> Self {
-            Self::Sub(Box::new(left), Box::new(right))
-        }
-        pub fn mul(left: Self, right: Self) -> Self {
-            Self::Mul(Box::new(left), Box::new(right))
-        }
-        pub fn div(left: Self, right: Self) -> Self {
-            Self::Div(Box::new(left), Box::new(right))
-        }
-        pub fn rem(left: Self, right: Self) -> Self {
-            Self::Rem(Box::new(left), Box::new(right))
-        }
-        pub fn ceil_div(left: Self, right: Self) -> Self {
-            Self::CeilDiv(Box::new(left), Box::new(right))
-        }
-    }
-
-    /// Source and launch contract for a generated native entry point.
-    pub struct NativeDefinition {
-        pub source: std::borrow::Cow<'static, str>,
-        pub entry: std::borrow::Cow<'static, str>,
-        pub threadgroups: [NativeExpr; 3],
-        pub threads_per_threadgroup: [NativeExpr; 3],
-    }
-
+    /// An explicitly selected, formed native implementation.
     pub struct NativePreparedAny {
-        pub(crate) inner: crate::backends::NativePreparedKind,
+        pub(crate) inner: Arc<crate::native::NativePrepared>,
     }
 
     impl NativePreparedAny {
         pub fn invocation_workspace_bytes(&self) -> u64 {
             self.inner.invocation_workspace_bytes()
+        }
+        pub fn artifact(&self) -> &crate::native::NativeArtifactIdentity {
+            self.inner.artifact()
+        }
+        pub fn specialization(&self) -> &seismic_lang::checked::NativeSpecialization {
+            self.inner.specialization()
+        }
+        pub fn implementation(&self) -> &seismic_lang::checked::NativeImplementation {
+            self.inner.implementation()
+        }
+        /// Time calls cycling through `rotation` on the device.
+        pub fn measure(
+            &self,
+            rotation: Vec<EncodedArgs>,
+            options: &crate::native::MeasureOptions,
+        ) -> Result<crate::native::Measurement, super::CallError> {
+            self.inner.measure(rotation, options)
         }
     }
 
@@ -1129,11 +1104,10 @@ pub mod kernel {
         entry: EntryId,
         bindings: ElementBindings,
         device: &Arc<DeviceInner>,
-        definition: NativeDefinition,
+        specialization: seismic_lang::checked::NativeSpecialization,
+        cpu: Option<&'static crate::native::CpuNativeKernels>,
     ) -> Result<NativePreparedAny, PrepareError> {
-        device
-            .kind
-            .prepare_native(module, entry, bindings, device, definition)
+        crate::native::NativePrepared::prepare(device, module, entry, bindings, specialization, cpu)
             .map(|inner| NativePreparedAny { inner })
     }
 

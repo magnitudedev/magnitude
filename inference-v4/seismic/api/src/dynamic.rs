@@ -254,42 +254,24 @@ impl Function {
             preparation_seconds: start.elapsed().as_secs_f64(),
         })
     }
+    /// Form the entry's native implementation for `device`'s backend under
+    /// `specialization`. Only Metal and CUDA are reachable here: CPU native
+    /// implementations are Rust compiled into a generated-binding build.
     pub fn prepare_native(
         &self,
         device: &Device,
         elements: BTreeMap<String, Element>,
+        specialization: crate::NativeSpecialization,
     ) -> Result<Kernel, Error> {
         let start = Instant::now();
         let bindings = self.bindings(&elements)?;
-        let def = self
-            .module
-            .checked
-            .native_implementation(self.info().id, device.backend())
-            .ok_or_else(|| {
-                Error::new("PreparationError", "no native declaration for this backend")
-            })?;
-        let source = self
-            .module
-            .checked
-            .native_asset(self.info().id, device.backend())
-            .ok_or_else(|| {
-                Error::new(
-                    "SourceError",
-                    "native asset is absent from this module snapshot",
-                )
-            })?;
-        let definition = runtime::NativeDefinition {
-            source: source.to_owned().into(),
-            entry: self.name().to_owned().into(),
-            threadgroups: def.launch.groups.each_ref().map(native_expr),
-            threads_per_threadgroup: def.launch.group_extent.each_ref().map(native_expr),
-        };
         let prepared = runtime::prepare_native(
             &self.module.checked,
             self.info().id,
             bindings,
             device.inner(),
-            definition,
+            specialization,
+            None,
         )?;
         Ok(Kernel {
             function: self.clone(),
@@ -298,20 +280,6 @@ impl Function {
             inner: KernelKind::Native(Arc::new(prepared)),
             preparation_seconds: start.elapsed().as_secs_f64(),
         })
-    }
-}
-fn native_expr(e: &seismic_lang::checked::NativeNatExpr) -> runtime::NativeExpr {
-    use runtime::NativeExpr as R;
-    use seismic_lang::checked::NativeNatExpr as N;
-    match e {
-        N::Constant(n) => R::Constant(*n),
-        N::Dimension(n) => R::Dimension(n.clone()),
-        N::Add(a, b) => R::add(native_expr(a), native_expr(b)),
-        N::Sub(a, b) => R::sub(native_expr(a), native_expr(b)),
-        N::Mul(a, b) => R::mul(native_expr(a), native_expr(b)),
-        N::Div(a, b) => R::div(native_expr(a), native_expr(b)),
-        N::Rem(a, b) => R::rem(native_expr(a), native_expr(b)),
-        N::CeilDiv(a, b) => R::ceil_div(native_expr(a), native_expr(b)),
     }
 }
 

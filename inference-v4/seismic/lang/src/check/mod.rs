@@ -892,18 +892,6 @@ pub(crate) fn check_closed(
                 ));
                 continue;
             };
-            if !backend.supports_direct_native() {
-                native_diagnostics.push(SourceDiagnostic::new(
-                    &sources.files()[*file],
-                    native.target.span,
-                    DiagnosticRule::NativeDeclaration,
-                    format!(
-                        "backend `{}` has no direct native route; a native implementation is declared only for a backend that supports one",
-                        backend.as_str()
-                    ),
-                ));
-                continue;
-            }
             let matching = entries
                 .iter()
                 .filter(|entry| entry.name == native.function.name)
@@ -952,34 +940,19 @@ pub(crate) fn check_closed(
                 ));
                 continue;
             }
-            let mut convert = |expression: &crate::syntax::ast::Expr| {
-                native_nat_expr(expression, &entry.dimensions).map_err(|message| {
-                    native_diagnostics.push(SourceDiagnostic::new(
-                        &sources.files()[*file],
-                        expression.span,
-                        DiagnosticRule::NativeDeclaration,
-                        message,
-                    ));
-                })
-            };
-            let groups = native.threadgroups.each_ref().map(&mut convert);
-            let group_extent = native.threads_per_threadgroup.each_ref().map(&mut convert);
-            let [Ok(x), Ok(y), Ok(z)] = groups else {
-                continue;
-            };
-            let [Ok(ex), Ok(ey), Ok(ez)] = group_extent else {
-                continue;
-            };
-            native_implementations.push(crate::checked::NativeImplementation {
-                entry: entry.id,
-                backend,
-                declared_in: sources.files()[*file].path.clone(),
-                source_path: native.source.clone(),
-                launch: crate::checked::NativeLaunch {
-                    groups: [x, y, z],
-                    group_extent: [ex, ey, ez],
-                },
-            });
+            match check_native(native, entry, backend, &sources.files()[*file].path) {
+                Ok(implementation) => native_implementations.push(implementation),
+                Err(errors) => {
+                    for (span, message) in errors {
+                        native_diagnostics.push(SourceDiagnostic::new(
+                            &sources.files()[*file],
+                            span,
+                            DiagnosticRule::NativeDeclaration,
+                            message,
+                        ));
+                    }
+                }
+            }
         }
     }
     if let Some(diagnostics) = Diagnostics::new(native_diagnostics) {
@@ -997,9 +970,190 @@ pub(crate) fn check_closed(
     })
 }
 
+/// Check one native declaration against its entry. Every problem is reported.
+fn check_native(
+    native: &crate::syntax::ast::NativeDecl,
+    entry: &crate::checked::EntryInfo,
+    backend: crate::registry::BackendName,
+    declared_in: &str,
+) -> Result<crate::checked::NativeImplementation, Vec<(Span, String)>> {
+    use crate::checked::{
+        NativeComparison, NativeConstraint, NativeLaunch, NativeNatExpr, NativeParameter,
+        NativeScratch,
+    };
+    use crate::syntax::ast::{BinaryOp, ExprKind};
+    let mut errors = Vec::new();
+
+    let mut statics: Vec<String> = Vec::new();
+    for name in &native.statics {
+        if !entry.dimensions.contains(&name.name) {
+            errors.push((
+                name.span,
+                format!(
+                    "`{}` is not a shape dimension of `{}`",
+                    name.name, entry.name
+                ),
+            ));
+        } else if statics.contains(&name.name) {
+            errors.push((name.span, format!("static dimension `{}` is listed twice", name.name)));
+        } else {
+            statics.push(name.name.clone());
+        }
+    }
+
+    let mut params: Vec<NativeParameter> = Vec::new();
+    for param in &native.params {
+        let name = &param.name.name;
+        if entry.dimensions.contains(name) {
+            errors.push((
+                param.name.span,
+                format!("native parameter `{name}` shadows a dimension of `{}`", entry.name),
+            ));
+            continue;
+        }
+        if params.iter().any(|existing| &existing.name == name) {
+            errors.push((param.name.span, format!("native parameter `{name}` is declared twice")));
+            continue;
+        }
+        let mut values: Vec<u64> = Vec::new();
+        for value in &param.values {
+            if values.contains(value) {
+                errors.push((
+                    param.span,
+                    format!("native parameter `{name}` lists {value} twice"),
+                ));
+            } else {
+                values.push(*value);
+            }
+        }
+        params.push(NativeParameter {
+            name: name.clone(),
+            arithmetic: param.arithmetic,
+            values,
+        });
+    }
+    let parameter_names = params
+        .iter()
+        .map(|parameter| parameter.name.clone())
+        .collect::<Vec<_>>();
+
+    let expression = |expr: &crate::syntax::ast::Expr, errors: &mut Vec<(Span, String)>| {
+        native_nat_expr(expr, &entry.dimensions, &parameter_names)
+            .map_err(|message| errors.push((expr.span, message)))
+            .ok()
+    };
+
+    let mut constraints = Vec::new();
+    for conjunct in &native.constraints {
+        let ExprKind::Binary { op, lhs, rhs } = &conjunct.kind else {
+            errors.push((
+                conjunct.span,
+                "a native `where` conjunct is a comparison".to_owned(),
+            ));
+            continue;
+        };
+        let comparison = match op {
+            BinaryOp::Lt => NativeComparison::Lt,
+            BinaryOp::Le => NativeComparison::Le,
+            BinaryOp::Gt => NativeComparison::Gt,
+            BinaryOp::Ge => NativeComparison::Ge,
+            BinaryOp::Eq => NativeComparison::Eq,
+            BinaryOp::Ne => NativeComparison::Ne,
+            _ => {
+                errors.push((
+                    conjunct.span,
+                    "a native `where` conjunct is a comparison joined by `and`".to_owned(),
+                ));
+                continue;
+            }
+        };
+        let (Some(left), Some(right)) = (expression(lhs, &mut errors), expression(rhs, &mut errors))
+        else {
+            continue;
+        };
+        let mut read = Vec::new();
+        left.dimensions(&mut read);
+        right.dimensions(&mut read);
+        if let Some(dynamic) = read.iter().find(|name| !statics.contains(name)) {
+            errors.push((
+                conjunct.span,
+                format!(
+                    "native `where` reads dimension `{dynamic}`, which is not static; its value is unknown at preparation"
+                ),
+            ));
+            continue;
+        }
+        constraints.push(NativeConstraint {
+            comparison,
+            left,
+            right,
+        });
+    }
+
+    let mut scratch: Vec<NativeScratch> = Vec::new();
+    for buffer in &native.scratch {
+        if scratch.iter().any(|existing| existing.name == buffer.name.name) {
+            errors.push((
+                buffer.name.span,
+                format!("scratch buffer `{}` is declared twice", buffer.name.name),
+            ));
+            continue;
+        }
+        if let Some(bytes) = expression(&buffer.bytes, &mut errors) {
+            scratch.push(NativeScratch {
+                name: buffer.name.name.clone(),
+                bytes,
+            });
+        }
+    }
+
+    let mut launches = Vec::new();
+    for launch in &native.launches {
+        let groups = launch
+            .threadgroups
+            .each_ref()
+            .map(|expr| expression(expr, &mut errors));
+        let group_extent = launch
+            .threads_per_threadgroup
+            .each_ref()
+            .map(|expr| expression(expr, &mut errors));
+        let shared_bytes = match &launch.shared_bytes {
+            Some(expr) => expression(expr, &mut errors),
+            None => Some(NativeNatExpr::Constant(0)),
+        };
+        let ([Some(x), Some(y), Some(z)], [Some(ex), Some(ey), Some(ez)], Some(shared_bytes)) =
+            (groups, group_extent, shared_bytes)
+        else {
+            continue;
+        };
+        launches.push(NativeLaunch {
+            kernel: launch.kernel.name.clone(),
+            groups: [x, y, z],
+            group_extent: [ex, ey, ez],
+            shared_bytes,
+        });
+    }
+
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    Ok(crate::checked::NativeImplementation {
+        entry: entry.id,
+        backend,
+        declared_in: declared_in.to_owned(),
+        source_path: native.source.clone(),
+        statics,
+        params,
+        constraints,
+        scratch,
+        launches,
+    })
+}
+
 fn native_nat_expr(
     expression: &crate::syntax::ast::Expr,
     dimensions: &[String],
+    parameters: &[String],
 ) -> Result<crate::checked::NativeNatExpr, String> {
     use crate::checked::NativeNatExpr as N;
     use crate::syntax::ast::{BinaryOp, ExprKind};
@@ -1007,8 +1161,8 @@ fn native_nat_expr(
                   right: &crate::syntax::ast::Expr,
                   make: fn(Box<N>, Box<N>) -> N| {
         Ok(make(
-            Box::new(native_nat_expr(left, dimensions)?),
-            Box::new(native_nat_expr(right, dimensions)?),
+            Box::new(native_nat_expr(left, dimensions, parameters)?),
+            Box::new(native_nat_expr(right, dimensions, parameters)?),
         ))
     };
     match &expression.kind {
@@ -1016,8 +1170,11 @@ fn native_nat_expr(
         ExprKind::Name(name) if dimensions.contains(&name.name) => {
             Ok(N::Dimension(name.name.clone()))
         }
+        ExprKind::Name(name) if parameters.contains(&name.name) => {
+            Ok(N::Parameter(name.name.clone()))
+        }
         ExprKind::Name(name) => Err(format!(
-            "native launch expression references unknown dimension `{}`",
+            "native expression references `{}`, which is neither a dimension nor a native parameter",
             name.name
         )),
         ExprKind::Binary { op, lhs, rhs } => match op {
@@ -1026,20 +1183,29 @@ fn native_nat_expr(
             BinaryOp::Mul => binary(lhs, rhs, N::Mul),
             BinaryOp::Div => binary(lhs, rhs, N::Div),
             BinaryOp::Rem => binary(lhs, rhs, N::Rem),
-            _ => Err("native launch expressions use only `+`, `-`, `*`, `/`, and `%`".to_owned()),
+            _ => Err("native expressions use only `+`, `-`, `*`, `/`, and `%`".to_owned()),
         },
         ExprKind::Call {
             callee,
             bindings,
             args,
         } if bindings.is_empty()
-            && matches!(&callee.kind, ExprKind::Name(name) if name.name == "ceil_div")
             && args.len() == 2
             && args.iter().all(|arg| arg.name.is_none()) =>
         {
-            binary(&args[0].value, &args[1].value, N::CeilDiv)
+            let make: fn(Box<N>, Box<N>) -> N = match &callee.kind {
+                ExprKind::Name(name) if name.name == "ceil_div" => N::CeilDiv,
+                ExprKind::Name(name) if name.name == "min" => N::Min,
+                ExprKind::Name(name) if name.name == "max" => N::Max,
+                _ => {
+                    return Err(
+                        "native expressions call only `ceil_div`, `min`, and `max`".to_owned()
+                    );
+                }
+            };
+            binary(&args[0].value, &args[1].value, make)
         }
-        _ => Err("unsupported native launch expression".to_owned()),
+        _ => Err("unsupported native expression".to_owned()),
     }
 }
 

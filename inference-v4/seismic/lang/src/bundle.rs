@@ -222,7 +222,7 @@ mod tests {
     fn checked() -> CheckedModule {
         check_source(SourceSet::new(vec![SourceFile {
             path: "snapshot.seismic".into(),
-            text: "fn twice(x: f32) -> f32:\n    return x + x\nnative twice for metal from \"twice.metal\":\n    threadgroups (1, 1, 1)\n    threads_per_threadgroup (1, 1, 1)\n".into(),
+            text: "fn twice(x: f32) -> f32:\n    return x + x\nnative twice for metal from \"twice.metal\":\n    launch twice:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".into(),
         }])).unwrap()
     }
     #[test]

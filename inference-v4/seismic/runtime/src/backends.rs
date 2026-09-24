@@ -8,7 +8,7 @@
 use crate::api::{
     device::DeviceInner,
     kernel::{
-        DecodedResults, EncodedArgs, EncodedOutputs, EncodedWorkflowArgs, NativeDefinition, PendingWorkflowResults,
+        DecodedResults, EncodedArgs, EncodedOutputs, EncodedWorkflowArgs, PendingWorkflowResults,
         WorkflowCompletionAny,
     },
     CallError, WorkflowError,
@@ -29,7 +29,7 @@ use seismic_target::TargetFamily;
 use std::sync::Arc;
 
 type CpuExecutor = seismic_cpu::Executor;
-type CpuOpened = Opened<seismic_cpu::Cpu, CpuExecutor>;
+pub(crate) type CpuOpened = Opened<seismic_cpu::Cpu, CpuExecutor>;
 type CpuPrepared = PreparedHandle<seismic_cpu::Cpu, CpuExecutor>;
 type CpuWorkflowDraft = driver::WorkflowGraphDraft<seismic_cpu::Cpu, CpuExecutor>;
 type CpuBoundWorkflow = driver::BoundWorkflowGraph<seismic_cpu::Cpu, CpuExecutor>;
@@ -38,7 +38,7 @@ type CpuAdmittedRun = crate::execution::AdmittedRun<seismic_cpu::Cpu, CpuExecuto
 #[cfg(target_os = "macos")]
 type MetalExecutor = seismic_metal::MetalExecutor;
 #[cfg(target_os = "macos")]
-type MetalOpened = Opened<seismic_metal::Metal, MetalExecutor>;
+pub(crate) type MetalOpened = Opened<seismic_metal::Metal, MetalExecutor>;
 #[cfg(target_os = "macos")]
 type MetalPrepared = PreparedHandle<seismic_metal::Metal, MetalExecutor>;
 #[cfg(target_os = "macos")]
@@ -49,7 +49,7 @@ type MetalBoundWorkflow = driver::BoundWorkflowGraph<seismic_metal::Metal, Metal
 type MetalAdmittedRun = crate::execution::AdmittedRun<seismic_metal::Metal, MetalExecutor>;
 
 type CudaExecutor = seismic_cuda::Executor;
-type CudaOpened = Opened<seismic_cuda::Cuda, CudaExecutor>;
+pub(crate) type CudaOpened = Opened<seismic_cuda::Cuda, CudaExecutor>;
 type CudaPrepared = PreparedHandle<seismic_cuda::Cuda, CudaExecutor>;
 type CudaWorkflowDraft = driver::WorkflowGraphDraft<seismic_cuda::Cuda, CudaExecutor>;
 type CudaBoundWorkflow = driver::BoundWorkflowGraph<seismic_cuda::Cuda, CudaExecutor>;
@@ -158,139 +158,6 @@ impl FeedbackKind<'_> {
             #[cfg(target_os = "macos")]
             Self::Metal(campaign) => campaign.report(),
             Self::Cuda(campaign) => campaign.report(),
-        }
-    }
-}
-
-pub(crate) enum NativePreparedKind {
-    #[cfg(target_os = "macos")]
-    Metal(Arc<driver::NativePreparedMetal>),
-    #[cfg(not(target_os = "macos"))]
-    Unsupported,
-}
-
-pub(crate) enum NativeBoundKind {
-    #[cfg(target_os = "macos")]
-    Metal(driver::NativeBoundCall),
-    #[cfg(not(target_os = "macos"))]
-    Unsupported,
-}
-
-impl NativeBoundKind {
-    pub(crate) fn run_graph(calls: Vec<Self>) -> Result<(), CallError> {
-        #[cfg(target_os = "macos")]
-        {
-            let calls = calls
-                .into_iter()
-                .map(|call| match call {
-                    Self::Metal(call) => call,
-                })
-                .collect();
-            return driver::run_native_graph_batch(calls);
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = calls;
-            unreachable!("unsupported native graph cannot be prepared")
-        }
-    }
-
-    pub(crate) fn run(self) -> Result<DecodedResults, CallError> {
-        match self {
-            #[cfg(target_os = "macos")]
-            Self::Metal(call) => call.run(),
-            #[cfg(not(target_os = "macos"))]
-            Self::Unsupported => unreachable!("unsupported native kernel cannot be prepared"),
-        }
-    }
-}
-
-impl NativePreparedKind {
-    pub(crate) fn validate_graph_batch(
-        &self,
-        device: seismic_compiler::prepared::DeviceIdentity,
-    ) -> Result<(), CallError> {
-        match self {
-            #[cfg(target_os = "macos")]
-            Self::Metal(kernel) => kernel.validate_graph_batch(device),
-            #[cfg(not(target_os = "macos"))]
-            Self::Unsupported => unreachable!("unsupported native kernel cannot be prepared"),
-        }
-    }
-    pub(crate) fn bind(
-        &self,
-        args: EncodedArgs,
-        outputs: Vec<Arc<crate::api::tensor::TensorInner>>,
-    ) -> Result<NativeBoundKind, CallError> {
-        match self {
-            #[cfg(target_os = "macos")]
-            Self::Metal(kernel) => kernel.bind(args, outputs).map(NativeBoundKind::Metal),
-            #[cfg(not(target_os = "macos"))]
-            Self::Unsupported => unreachable!("unsupported native kernel cannot be prepared"),
-        }
-    }
-    pub(crate) fn tensor_parameter_spec(
-        &self,
-        name: &str,
-        dimensions: &[(&str, u64)],
-    ) -> Result<driver::NativeTensorSpec, CallError> {
-        match self {
-            #[cfg(target_os = "macos")]
-            Self::Metal(kernel) => kernel.tensor_parameter_spec(name, dimensions),
-            #[cfg(not(target_os = "macos"))]
-            Self::Unsupported => unreachable!("unsupported native kernel cannot be prepared"),
-        }
-    }
-    pub(crate) fn result_count(&self) -> u32 {
-        match self {
-            #[cfg(target_os = "macos")]
-            Self::Metal(kernel) => kernel.result_count(),
-            #[cfg(not(target_os = "macos"))]
-            Self::Unsupported => unreachable!("unsupported native kernel cannot be prepared"),
-        }
-    }
-    pub(crate) fn describe_results(
-        &self,
-        arguments: &[seismic_compiler::prepared::ArgumentValue],
-    ) -> Result<Vec<Option<driver::NativeTensorSpec>>, CallError> {
-        match self {
-            #[cfg(target_os = "macos")]
-            Self::Metal(kernel) => kernel.describe_results(arguments),
-            #[cfg(not(target_os = "macos"))]
-            Self::Unsupported => unreachable!("unsupported native kernel cannot be prepared"),
-        }
-    }
-
-    pub(crate) fn invocation_workspace_bytes(&self) -> u64 {
-        match self {
-            #[cfg(target_os = "macos")]
-            Self::Metal(kernel) => kernel.invocation_workspace_bytes(),
-            #[cfg(not(target_os = "macos"))]
-            Self::Unsupported => unreachable!("unsupported native kernel cannot be prepared"),
-        }
-    }
-
-    pub(crate) fn call_into(
-        &self,
-        args: EncodedArgs,
-        outputs: EncodedOutputs,
-    ) -> Result<DecodedResults, CallError> {
-        match self {
-            #[cfg(target_os = "macos")]
-            Self::Metal(kernel) => kernel.call_into(args, outputs),
-            #[cfg(not(target_os = "macos"))]
-            Self::Unsupported => unreachable!("unsupported native kernel cannot be prepared"),
-        }
-    }
-    pub(crate) fn call(&self, args: EncodedArgs) -> Result<DecodedResults, CallError> {
-        self.call_with_commit(args, || {})
-    }
-    pub(crate) fn call_with_commit(&self, args: EncodedArgs, commit: impl FnOnce()) -> Result<DecodedResults, CallError> {
-        match self {
-            #[cfg(target_os = "macos")]
-            Self::Metal(kernel) => kernel.call_with_commit(args, commit),
-            #[cfg(not(target_os = "macos"))]
-            Self::Unsupported => unreachable!("unsupported native kernel cannot be prepared"),
         }
     }
 }
@@ -660,6 +527,32 @@ impl OpenedKind {
         }
     }
 
+    /// Facts that distinguish performance behavior, for keying per-device
+    /// native tuning. Equal identities denote the same device model and
+    /// configuration; there is no ordering or closeness.
+    pub(crate) fn tuning_identity(&self) -> String {
+        match self {
+            Self::Cpu(device) => {
+                let facts = device.device_description().facts();
+                format!(
+                    "cpu;{};workers {};simd {:?}",
+                    std::env::consts::ARCH,
+                    facts.workers,
+                    facts.simd
+                )
+            }
+            #[cfg(target_os = "macos")]
+            Self::Metal(device) => device.device_description().facts().tuning_material(),
+            Self::Cuda(device) => {
+                let facts = device.device_description().facts();
+                format!(
+                    "cuda;sm {};multiprocessors {}",
+                    facts.compute_capability, facts.multiprocessors
+                )
+            }
+        }
+    }
+
     pub(crate) fn supports_representation(&self, representation: RepresentationId) -> bool {
         match self {
             Self::Cpu(device) => device
@@ -793,39 +686,6 @@ impl OpenedKind {
                 options,
             )
             .map(|(campaign, kernel)| (FeedbackKind::Cuda(campaign), PreparedKind::Cuda(kernel))),
-        }
-    }
-
-    pub(crate) fn prepare_native(
-        &self,
-        module: &CheckedModule,
-        entry: EntryId,
-        bindings: ElementBindings,
-        public_device: &Arc<DeviceInner>,
-        definition: NativeDefinition,
-    ) -> Result<NativePreparedKind, crate::api::kernel::PrepareError> {
-        match self {
-            #[cfg(target_os = "macos")]
-            Self::Metal(device) => driver::prepare_native_metal(
-                device,
-                module,
-                entry,
-                bindings,
-                public_device,
-                definition,
-            )
-            .map(NativePreparedKind::Metal),
-            Self::Cpu(_) | Self::Cuda(_) => Err(crate::api::kernel::PrepareError::Preparation(
-                seismic_compiler::errors::PreparationError::NoApplicableImplementation(
-                    seismic_compiler::errors::NoApplicableReport {
-                        entry: definition.entry.into_owned(),
-                        declined: vec![(
-                            "native.metal".to_owned(),
-                            "the selected device is not a Metal device".to_owned(),
-                        )],
-                    },
-                ),
-            )),
         }
     }
 }

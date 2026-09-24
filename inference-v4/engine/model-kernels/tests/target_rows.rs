@@ -42,7 +42,7 @@ fn packed_q8_residents_execute_dense_embedding_and_readout_with_bf16_activations
             repack_weight::Elements {
                 E: q8_external,
                 U: q8_resident,
-            },
+            }, &seismic::NativeSpecialization::new(),
         )
         .unwrap()
         .call(repack_weight::Args { source: &source })
@@ -80,7 +80,7 @@ fn packed_q8_residents_execute_dense_embedding_and_readout_with_bf16_activations
             UW: q8_resident,
             DW: q8_resident,
             A: seismic::Element::bf16(),
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_dense_rows::Args {
@@ -104,7 +104,7 @@ fn packed_q8_residents_execute_dense_embedding_and_readout_with_bf16_activations
         qwen_embedding_rows::Elements {
             EW: q8_resident,
             A: seismic::Element::bf16(),
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_embedding_rows::Args {
@@ -123,7 +123,7 @@ fn packed_q8_residents_execute_dense_embedding_and_readout_with_bf16_activations
             NW: seismic::Element::bf16(),
             OW: q8_resident,
             A: seismic::Element::bf16(),
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_readout_rows::Args {
@@ -258,7 +258,7 @@ fn conditioning_overlay_copies_the_complete_row_table() {
     )
     .unwrap();
     let mut out = seismic::Tensor::zeros(&device, seismic::Element::f32(), &[2, 3]).unwrap();
-    qwen_conditioning_overlay::native_for_device(&device)
+    qwen_conditioning_overlay::native_for_device(&device, &seismic::NativeSpecialization::new())
         .unwrap()
         .call(qwen_conditioning_overlay::Args {
             input: &input,
@@ -465,7 +465,7 @@ fn native_metal_target_rows_match_host_oracles() {
             UW: f32e,
             DW: f32e,
             A: f32e,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_dense_rows::Args {
@@ -498,7 +498,7 @@ fn native_metal_target_rows_match_host_oracles() {
             UW: f32e,
             DW: f32e,
             A: f32e,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_dense_rows_demanded::Args {
@@ -530,7 +530,7 @@ fn native_metal_target_rows_match_host_oracles() {
             GW: f32e,
             UW: f32e,
             A: f32e,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_dense_expand::Args {
@@ -544,7 +544,7 @@ fn native_metal_target_rows_match_host_oracles() {
     .value;
     let staged = qwen_dense_output::native_for_device_with(
         &device,
-        qwen_dense_output::Elements { DW: f32e, A: f32e },
+        qwen_dense_output::Elements { DW: f32e, A: f32e }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_dense_output::Args {
@@ -562,7 +562,7 @@ fn native_metal_target_rows_match_host_oracles() {
             GW: f32e,
             UW: f32e,
             A: f32e,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_dense_expand_demanded::Args {
@@ -577,7 +577,7 @@ fn native_metal_target_rows_match_host_oracles() {
     .value;
     let demanded_staged = qwen_dense_output_demanded::native_for_device_with(
         &device,
-        qwen_dense_output_demanded::Elements { DW: f32e, A: f32e },
+        qwen_dense_output_demanded::Elements { DW: f32e, A: f32e }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_dense_output_demanded::Args {
@@ -597,7 +597,7 @@ fn native_metal_target_rows_match_host_oracles() {
     let tokens = indices(&[4, 1, 3]);
     let embedded = qwen_embedding_rows::native_for_device_with(
         &device,
-        qwen_embedding_rows::Elements { EW: f32e, A: f32e },
+        qwen_embedding_rows::Elements { EW: f32e, A: f32e }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_embedding_rows::Args {
@@ -618,7 +618,7 @@ fn native_metal_target_rows_match_host_oracles() {
         .collect::<Vec<_>>();
     let features = qwen_features_rows::native_for_device_with(
         &device,
-        qwen_features_rows::Elements { NW: f32e, A: f32e },
+        qwen_features_rows::Elements { NW: f32e, A: f32e }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_features_rows::Args {
@@ -643,7 +643,7 @@ fn native_metal_target_rows_match_host_oracles() {
             NW: f32e,
             OW: f32e,
             A: f32e,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_readout_rows::Args {
@@ -666,7 +666,7 @@ fn native_metal_target_rows_match_host_oracles() {
             NW: f32e,
             OW: f32e,
             A: f32e,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_selected_rows::Args {
@@ -694,7 +694,7 @@ fn native_metal_target_rows_match_host_oracles() {
     let one_features_expected = normalized(&hidden_values, &norm_values, 1);
     let one_features = qwen_features_rows::native_for_device_with(
         &device,
-        qwen_features_rows::Elements { NW: f32e, A: f32e },
+        qwen_features_rows::Elements { NW: f32e, A: f32e }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_features_rows::Args {
@@ -714,7 +714,7 @@ fn native_metal_target_rows_match_host_oracles() {
             UW: f32e,
             DW: f32e,
             A: f32e,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_dense_rows_demanded::Args {
@@ -745,7 +745,7 @@ fn native_metal_target_rows_match_host_oracles() {
             NW: f32e,
             OW: f32e,
             A: f32e,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_readout_rows::Args {
@@ -771,7 +771,7 @@ fn native_metal_target_rows_match_host_oracles() {
             NW: f32e,
             OW: f32e,
             A: f32e,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_selected_rows::Args {
@@ -815,7 +815,7 @@ fn native_metal_target_rows_match_host_oracles() {
             UW: seismic::Element::f16(),
             DW: seismic::Element::f16(),
             A: seismic::Element::bf16(),
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_dense_rows::Args {
@@ -837,7 +837,7 @@ fn native_metal_target_rows_match_host_oracles() {
             UW: seismic::Element::f16(),
             DW: seismic::Element::f16(),
             A: seismic::Element::bf16(),
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_dense_rows_demanded::Args {
@@ -866,7 +866,7 @@ fn native_metal_target_rows_match_host_oracles() {
             UW: seismic::Element::bf16(),
             DW: seismic::Element::bf16(),
             A: seismic::Element::bf16(),
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_dense_rows::Args {
@@ -911,7 +911,7 @@ fn native_dense_stages_tile_weights_across_prefill_rows() {
             GW: f32e,
             UW: f32e,
             A: f32e,
-        },
+        }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_dense_expand::Args {
@@ -925,7 +925,7 @@ fn native_dense_stages_tile_weights_across_prefill_rows() {
     .value;
     let actual = qwen_dense_output::native_for_device_with(
         &device,
-        qwen_dense_output::Elements { DW: f32e, A: f32e },
+        qwen_dense_output::Elements { DW: f32e, A: f32e }, &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_dense_output::Args {

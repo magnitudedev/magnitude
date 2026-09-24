@@ -215,11 +215,15 @@ fn native_dense_import_matches_host_for_all_nine_pairs() {
                 E: source_element,
                 U: destination_element,
             };
-            let native = import_dense::native_for_device_with(&device, elements)
-                .unwrap()
-                .call(import_dense::Args { source: &source })
-                .unwrap()
-                .value;
+            let native = import_dense::native_for_device_with(
+                &device,
+                elements,
+                &seismic::NativeSpecialization::new(),
+            )
+            .unwrap()
+            .call(import_dense::Args { source: &source })
+            .unwrap()
+            .value;
             assert_eq!(
                 native.read_to_host().unwrap(),
                 dense_bytes(destination_name, &values),
@@ -255,6 +259,7 @@ fn native_repack_matches_host_recipe_for_all_five_pairs() {
                 E: source_element,
                 U: destination_element,
             },
+            &seismic::NativeSpecialization::new(),
         )
         .unwrap()
         .call(repack_weight::Args { source: &source })

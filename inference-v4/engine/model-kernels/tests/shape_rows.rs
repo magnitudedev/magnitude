@@ -187,11 +187,13 @@ fn portable_shaping_matches_the_ordered_host_reference() {
 #[test]
 fn generated_surface_exposes_planned_and_native_preparation() {
     let planned: fn(&seismic::Device, seismic::PreparationOptions) -> _ = shape_rows::for_device;
-    let native: fn(&seismic::Device) -> _ = shape_rows::native_for_device;
+    let native: fn(&seismic::Device, &seismic::NativeSpecialization) -> _ =
+        shape_rows::native_for_device;
     let _ = (planned, native);
     let planned_sample: fn(&seismic::Device, seismic::PreparationOptions) -> _ =
         sample_rows::for_device;
-    let native_sample: fn(&seismic::Device) -> _ = sample_rows::native_for_device;
+    let native_sample: fn(&seismic::Device, &seismic::NativeSpecialization) -> _ =
+        sample_rows::native_for_device;
     let _ = (planned_sample, native_sample);
 }
 
@@ -224,7 +226,7 @@ fn native_sampling_reports_greedy_empty_and_nonfinite_rows() {
     let draws =
         seismic::Tensor::from_host(&device, seismic::Element::u32(), &[3, 6], &[0; 72]).unwrap();
     let mut result = seismic::Tensor::zeros(&device, seismic::Element::i32(), &[3, 2]).unwrap();
-    sample_rows::native_for_device(&device)
+    sample_rows::native_for_device(&device, &seismic::NativeSpecialization::new())
         .unwrap()
         .call(sample_rows::Args {
             logits: &logits,
@@ -299,7 +301,7 @@ fn native_sampling_reduces_the_vocabulary_cooperatively_with_stable_ties_and_rng
     )
     .unwrap();
     let mut result = seismic::Tensor::zeros(&device, seismic::Element::i32(), &[2, 2]).unwrap();
-    sample_rows::native_for_device(&device)
+    sample_rows::native_for_device(&device, &seismic::NativeSpecialization::new())
         .unwrap()
         .call(sample_rows::Args {
             logits: &logits,
@@ -361,7 +363,7 @@ fn native_metal_shaping_matches_the_host_reference() {
         &[ROWS as u64, VOCABULARY as u64],
     )
     .unwrap();
-    shape_rows::native_for_device(&device)
+    shape_rows::native_for_device(&device, &seismic::NativeSpecialization::new())
         .unwrap()
         .call(shape_rows::Args {
             logits: &logits,
@@ -432,7 +434,7 @@ fn native_shaping_preserves_cross_simdgroup_cutoff_ties_and_history_counts() {
     .unwrap();
     let mut out =
         seismic::Tensor::zeros(&device, seismic::Element::f32(), &[2, VOCAB as u64]).unwrap();
-    shape_rows::native_for_device(&device)
+    shape_rows::native_for_device(&device, &seismic::NativeSpecialization::new())
         .unwrap()
         .call(shape_rows::Args {
             logits: &logits,

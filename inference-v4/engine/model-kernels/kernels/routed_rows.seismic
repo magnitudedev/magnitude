@@ -91,8 +91,9 @@ fn qwen_routed_normalize[M, O, H](residual: &tensor[M, H] f32,
     return normalized
 
 native qwen_routed_normalize for metal from "metal/qwen_routed_normalize.metal":
-    threadgroups (ceil_div(O * H, 8), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_routed_normalize:
+        threadgroups (ceil_div(O * H, 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 fn qwen_routed_logits[O, H, E](normalized: &tensor[O, H] A,
@@ -102,8 +103,9 @@ fn qwen_routed_logits[O, H, E](normalized: &tensor[O, H] A,
     return logits
 
 native qwen_routed_logits for metal from "metal/qwen_routed_logits.metal":
-    threadgroups (ceil_div(O * E, 8), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_routed_logits:
+        threadgroups (ceil_div(O * E, 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 fn qwen_routed_select[O, E, K](logits: &tensor[O, E] f32, selected: i32,
@@ -133,8 +135,9 @@ fn qwen_routed_select[O, E, K](logits: &tensor[O, E] f32, selected: i32,
             for choice in 0..K:
                 scores[row, choice] = scores[row, choice] / denominator
 native qwen_routed_select for metal from "metal/qwen_routed_select.metal":
-    threadgroups (ceil_div(O, 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_routed_select:
+        threadgroups (ceil_div(O, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 fn qwen_routed_expand[O, H, E, K, F, S](normalized: &tensor[O, H] A,
@@ -186,8 +189,9 @@ fn qwen_routed_expand[O, H, E, K, F, S](normalized: &tensor[O, H] A,
     return (reshape(expert_product, (O, K, F)), shared_product, shared_coefficient)
 
 native qwen_routed_expand for metal from "metal/qwen_routed_expand.metal":
-    threadgroups (ceil_div(O * (K * F + S + 1), 8), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_routed_expand:
+        threadgroups (ceil_div(O * (K * F + S + 1), 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 fn qwen_routed_output[M, O, H, E, K, F, S](residual: &tensor[M, H] f32,
@@ -223,5 +227,6 @@ fn qwen_routed_output[M, O, H, E, K, F, S](residual: &tensor[M, H] f32,
     return value
 
 native qwen_routed_output for metal from "metal/qwen_routed_output.metal":
-    threadgroups (ceil_div(O * H, 8), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_routed_output:
+        threadgroups (ceil_div(O * H, 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)

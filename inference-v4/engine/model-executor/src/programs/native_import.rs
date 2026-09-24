@@ -135,7 +135,7 @@ mod tests {
             repack_weight::Elements {
                 E: source_element,
                 U: resident_element,
-            },
+            }, &seismic::NativeSpecialization::new(),
         )
         .unwrap();
         let expected = kernel

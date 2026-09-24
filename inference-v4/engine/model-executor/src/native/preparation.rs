@@ -1,3 +1,4 @@
+use super::specialization;
 use super::*;
 
 /// The phase-one catalog. Every handle is prepared before qualification and
@@ -56,6 +57,7 @@ impl NativePreparationCache {
                                 E: Element::dense(source),
                                 U: Element::dense(resident),
                             },
+                            &specialization::fixed::<import_dense::Entry>(device, &bindings, &[])?,
                         )
                         .map_err(|error| preparation_dynamic("import_dense", &bindings, error))?,
                     );
@@ -73,6 +75,7 @@ impl NativePreparationCache {
                                 E: source,
                                 U: resident,
                             },
+                            &specialization::fixed::<repack_weight::Entry>(device, &bindings, &[])?,
                         )
                         .map_err(|error| preparation_dynamic("repack_weight", &bindings, error))?,
                     );
@@ -96,21 +99,36 @@ impl NativePreparationCache {
             import,
             glue: GlueKernels {
                 shape_rows: Some(
-                    shape_rows::native_for_device(device)
-                        .map_err(|error| preparation("shape_rows", "fixed", error))?,
+                    shape_rows::native_for_device(
+                        device,
+                        &specialization::fixed::<shape_rows::Entry>(device, "fixed", &[])?,
+                    )
+                    .map_err(|error| preparation("shape_rows", "fixed", error))?,
                 ),
                 sample_rows: Some(
-                    sample_rows::native_for_device(device)
-                        .map_err(|error| preparation("sample_rows", "fixed", error))?,
+                    sample_rows::native_for_device(
+                        device,
+                        &specialization::fixed::<sample_rows::Entry>(device, "fixed", &[])?,
+                    )
+                    .map_err(|error| preparation("sample_rows", "fixed", error))?,
                 ),
                 conditioning_overlay: Some(
-                    qwen_conditioning_overlay::native_for_device(device).map_err(|error| {
-                        preparation("qwen_conditioning_overlay", "fixed", error)
-                    })?,
+                    qwen_conditioning_overlay::native_for_device(
+                        device,
+                        &specialization::fixed::<qwen_conditioning_overlay::Entry>(
+                            device,
+                            "fixed",
+                            &[],
+                        )?,
+                    )
+                    .map_err(|error| preparation("qwen_conditioning_overlay", "fixed", error))?,
                 ),
                 gather_rows: Some(
-                    gather_rows::native_for_device(device)
-                        .map_err(|error| preparation("gather_rows", "fixed", error))?,
+                    gather_rows::native_for_device(
+                        device,
+                        &specialization::fixed::<gather_rows::Entry>(device, "fixed", &[])?,
+                    )
+                    .map_err(|error| preparation("gather_rows", "fixed", error))?,
                 ),
                 copy_rows_f32: prepare_optional_copy(
                     device,
@@ -169,21 +187,39 @@ impl NativePreparationCache {
                 },
             )?;
         }
-        prepared.prepare_binding(device, PreparationBinding::Readout(plan.target().readout()))?;
+        prepared.prepare_binding(
+            device,
+            PreparationBinding::Readout(plan.target().readout()),
+        )?;
         if let Some(binding) = plan.target().features() {
-            prepared.prepare_binding(device, PreparationBinding::Features(binding))?;
+            prepared.prepare_binding(
+                device,
+                PreparationBinding::Features(binding),
+            )?;
         }
         if let Some(head) = plan.head() {
             for &binding in head.blocks() {
-                prepared.prepare_binding(device, PreparationBinding::Head(binding))?;
+                prepared.prepare_binding(
+                    device,
+                    PreparationBinding::Head(binding),
+                )?;
             }
         }
         if let Some(vision) = plan.vision() {
-            prepared.prepare_binding(device, PreparationBinding::VisionPatch(vision.patch()))?;
+            prepared.prepare_binding(
+                device,
+                PreparationBinding::VisionPatch(vision.patch()),
+            )?;
             for &binding in vision.blocks() {
-                prepared.prepare_binding(device, PreparationBinding::VisionBlock(binding))?;
+                prepared.prepare_binding(
+                    device,
+                    PreparationBinding::VisionBlock(binding),
+                )?;
             }
-            prepared.prepare_binding(device, PreparationBinding::VisionMerger(vision.merger()))?;
+            prepared.prepare_binding(
+                device,
+                PreparationBinding::VisionMerger(vision.merger()),
+            )?;
         }
         Ok(prepared)
     }
@@ -203,6 +239,11 @@ impl NativePreparationCache {
                             EW: b.table,
                             A: b.activation,
                         },
+                        &specialization::fixed::<qwen_embedding_rows::Entry>(
+                            device,
+                            &format!("{b:?}"),
+                            &[],
+                        )?,
                     )
                     .map_err(|e| target_preparation("qwen_embedding_rows", b, e))?;
                     prepared.target.embedding.insert(b, k);
@@ -217,6 +258,11 @@ impl NativePreparationCache {
                                 NW: b.norm,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_attention_normalize::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|e| target_preparation("qwen_attention_normalize", b, e))?,
                         project: qwen_attention_project::native_for_device_with(
@@ -227,16 +273,31 @@ impl NativePreparationCache {
                                 VW: b.value,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_attention_project::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|e| target_preparation("qwen_attention_project", b, e))?,
                         prepare: qwen_attention_prepare::native_for_device_with(
                             device,
                             qwen_attention_prepare::Elements { A: b.activation },
+                            &specialization::fixed::<qwen_attention_prepare::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|e| target_preparation("qwen_attention_prepare", b, e))?,
                         attend: qwen_attention_attend::native_for_device_with(
                             device,
                             qwen_attention_attend::Elements { A: b.activation },
+                            &specialization::fixed::<qwen_attention_attend::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|e| target_preparation("qwen_attention_attend", b, e))?,
                         output: qwen_attention_output::native_for_device_with(
@@ -245,6 +306,11 @@ impl NativePreparationCache {
                                 OW: b.output,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_attention_output::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|e| target_preparation("qwen_attention_output", b, e))?,
                     };
@@ -261,6 +327,11 @@ impl NativePreparationCache {
                                 NW: b.norm,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_recurrent_normalize::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|e| target_preparation("qwen_recurrent_normalize", b, e))?,
                         project: qwen_recurrent_project::native_for_device_with(
@@ -272,6 +343,11 @@ impl NativePreparationCache {
                                 BW: b.beta,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_recurrent_project::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|e| target_preparation("qwen_recurrent_project", b, e))?,
                         prepare: qwen_recurrent_prepare::native_for_device_with(
@@ -280,11 +356,21 @@ impl NativePreparationCache {
                                 A: b.activation,
                                 RN: b.recurrent_norm,
                             },
+                            &specialization::fixed::<qwen_recurrent_prepare::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|e| target_preparation("qwen_recurrent_prepare", b, e))?,
                         scan: qwen_recurrent_scan::native_for_device_with(
                             device,
                             qwen_recurrent_scan::Elements { A: b.activation },
+                            &specialization::fixed::<qwen_recurrent_scan::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|e| target_preparation("qwen_recurrent_scan", b, e))?,
                         mix: qwen_recurrent_mix::native_for_device_with(
@@ -293,6 +379,11 @@ impl NativePreparationCache {
                                 RN: b.recurrent_norm,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_recurrent_mix::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|e| target_preparation("qwen_recurrent_mix", b, e))?,
                         output: qwen_recurrent_output::native_for_device_with(
@@ -301,6 +392,11 @@ impl NativePreparationCache {
                                 OW: b.output,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_recurrent_output::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|e| target_preparation("qwen_recurrent_output", b, e))?,
                     };
@@ -318,6 +414,11 @@ impl NativePreparationCache {
                                 UW: b.up,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_dense_expand::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|e| target_preparation("qwen_dense_expand", b, e))?,
                         output: qwen_dense_output::native_for_device_with(
@@ -326,6 +427,11 @@ impl NativePreparationCache {
                                 DW: b.down,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_dense_output::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|e| target_preparation("qwen_dense_output", b, e))?,
                         expand_demanded: qwen_dense_expand_demanded::native_for_device_with(
@@ -336,6 +442,11 @@ impl NativePreparationCache {
                                 UW: b.up,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_dense_expand_demanded::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|e| target_preparation("qwen_dense_expand_demanded", b, e))?,
                         output_demanded: qwen_dense_output_demanded::native_for_device_with(
@@ -344,6 +455,11 @@ impl NativePreparationCache {
                                 DW: b.down,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_dense_output_demanded::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|e| target_preparation("qwen_dense_output_demanded", b, e))?,
                     };
@@ -359,6 +475,11 @@ impl NativePreparationCache {
                                 NW: b.norm,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_routed_normalize::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|e| target_preparation("qwen_routed_normalize", b, e))?,
                         logits: qwen_routed_logits::native_for_device_with(
@@ -367,10 +488,22 @@ impl NativePreparationCache {
                                 RW: b.router,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_routed_logits::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|e| target_preparation("qwen_routed_logits", b, e))?,
-                        select: qwen_routed_select::native_for_device(device)
-                            .map_err(|e| target_preparation("qwen_routed_select", b, e))?,
+                        select: qwen_routed_select::native_for_device(
+                            device,
+                            &specialization::fixed::<qwen_routed_select::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
+                        )
+                        .map_err(|e| target_preparation("qwen_routed_select", b, e))?,
                         expand: qwen_routed_expand::native_for_device_with(
                             device,
                             qwen_routed_expand::Elements {
@@ -380,6 +513,11 @@ impl NativePreparationCache {
                                 SUW: b.shared_up,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_routed_expand::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|e| target_preparation("qwen_routed_expand", b, e))?,
                         output: qwen_routed_output::native_for_device_with(
@@ -389,6 +527,11 @@ impl NativePreparationCache {
                                 SDW: b.shared_down,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_routed_output::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|e| target_preparation("qwen_routed_output", b, e))?,
                     };
@@ -404,6 +547,11 @@ impl NativePreparationCache {
                                 NW: b.norm,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_features_rows::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|e| target_preparation("qwen_features_rows", b, e))?,
                         logits: head_logits_rows::native_for_device_with(
@@ -412,6 +560,11 @@ impl NativePreparationCache {
                                 OW: b.weight,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<head_logits_rows::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|e| target_preparation("head_logits_rows", b, e))?,
                     };
@@ -423,6 +576,11 @@ impl NativePreparationCache {
                             OW: b.weight,
                             A: b.activation,
                         },
+                        &specialization::fixed::<qwen_selected_rows::Entry>(
+                            device,
+                            &format!("{b:?}"),
+                            &[],
+                        )?,
                     )
                     .map_err(|e| target_preparation("qwen_selected_rows", b, e))?;
                     prepared.target.selected.insert(b, selected);
@@ -436,6 +594,11 @@ impl NativePreparationCache {
                             NW: b.norm,
                             A: b.activation,
                         },
+                        &specialization::fixed::<qwen_features_rows::Entry>(
+                            device,
+                            &format!("{b:?}"),
+                            &[],
+                        )?,
                     )
                     .map_err(|e| target_preparation("qwen_features_rows", b, e))?;
                     prepared.target.features.insert(b, k);
@@ -460,6 +623,11 @@ impl NativePreparationCache {
                             HN: b.hidden_norm,
                             CW: b.combine,
                         },
+                        &specialization::fixed::<qwen_head_rows::Entry>(
+                            device,
+                            &format!("{b:?}"),
+                            &[],
+                        )?,
                     )
                     .map_err(|error| target_preparation("qwen_head_rows", b, error))?,
                 );
@@ -472,6 +640,11 @@ impl NativePreparationCache {
                                 NW: b.input_norm,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_attention_normalize::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|error| {
                             target_preparation("qwen_attention_normalize", b, error)
@@ -484,16 +657,31 @@ impl NativePreparationCache {
                                 VW: b.value,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_attention_project::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|error| target_preparation("qwen_attention_project", b, error))?,
                         prepare: qwen_attention_prepare::native_for_device_with(
                             device,
                             qwen_attention_prepare::Elements { A: b.activation },
+                            &specialization::fixed::<qwen_attention_prepare::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|error| target_preparation("qwen_attention_prepare", b, error))?,
                         attend: qwen_attention_attend::native_for_device_with(
                             device,
                             qwen_attention_attend::Elements { A: b.activation },
+                            &specialization::fixed::<qwen_attention_attend::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|error| target_preparation("qwen_attention_attend", b, error))?,
                         output: qwen_attention_output::native_for_device_with(
@@ -502,6 +690,11 @@ impl NativePreparationCache {
                                 OW: b.attention_output,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_attention_output::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|error| target_preparation("qwen_attention_output", b, error))?,
                     },
@@ -517,6 +710,11 @@ impl NativePreparationCache {
                                 UW: b.up,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_dense_expand::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|error| target_preparation("qwen_dense_expand", b, error))?,
                         output: qwen_dense_output::native_for_device_with(
@@ -525,6 +723,11 @@ impl NativePreparationCache {
                                 DW: b.down,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_dense_output::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|error| target_preparation("qwen_dense_output", b, error))?,
                         expand_demanded: qwen_dense_expand_demanded::native_for_device_with(
@@ -535,6 +738,11 @@ impl NativePreparationCache {
                                 UW: b.up,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_dense_expand_demanded::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|error| {
                             target_preparation("qwen_dense_expand_demanded", b, error)
@@ -545,6 +753,11 @@ impl NativePreparationCache {
                                 DW: b.down,
                                 A: b.activation,
                             },
+                            &specialization::fixed::<qwen_dense_output_demanded::Entry>(
+                                device,
+                                &format!("{b:?}"),
+                                &[],
+                            )?,
                         )
                         .map_err(|error| {
                             target_preparation("qwen_dense_output_demanded", b, error)
@@ -559,6 +772,11 @@ impl NativePreparationCache {
                             NW: b.output_norm,
                             A: b.activation,
                         },
+                        &specialization::fixed::<qwen_features_rows::Entry>(
+                            device,
+                            &format!("{b:?}"),
+                            &[],
+                        )?,
                     )
                     .map_err(|error| target_preparation("qwen_features_rows", b, error))?,
                 );
@@ -570,6 +788,11 @@ impl NativePreparationCache {
                             A: b.activation,
                             OW: b.projection,
                         },
+                        &specialization::fixed::<head_logits_rows::Entry>(
+                            device,
+                            &format!("{b:?}"),
+                            &[],
+                        )?,
                     )
                     .map_err(|error| target_preparation("head_logits_rows", b, error))?,
                 );
@@ -590,6 +813,11 @@ impl NativePreparationCache {
                             PE: b.position,
                             A: b.activation,
                         },
+                        &specialization::fixed::<qwen_vision_stem::Entry>(
+                            device,
+                            &format!("{b:?}"),
+                            &[],
+                        )?,
                     )
                     .map_err(|error| target_preparation("qwen_vision_stem", b, error))?,
                 );
@@ -621,6 +849,11 @@ impl NativePreparationCache {
                             DW: b.down,
                             DB: b.down_bias,
                         },
+                        &specialization::fixed::<qwen_vision_block::Entry>(
+                            device,
+                            &format!("{b:?}"),
+                            &[],
+                        )?,
                     )
                     .map_err(|error| target_preparation("qwen_vision_block", b, error))?,
                 );
@@ -643,6 +876,11 @@ impl NativePreparationCache {
                             DW: b.output,
                             DB: b.output_bias,
                         },
+                        &specialization::fixed::<qwen_vision_merger::Entry>(
+                            device,
+                            &format!("{b:?}"),
+                            &[],
+                        )?,
                     )
                     .map_err(|error| target_preparation("qwen_vision_merger", b, error))?,
                 );
@@ -651,6 +889,11 @@ impl NativePreparationCache {
                     qwen_vision_feature_output::native_for_device_with(
                         device,
                         qwen_vision_feature_output::Elements { A: b.activation },
+                        &specialization::fixed::<qwen_vision_feature_output::Entry>(
+                            device,
+                            &format!("{b:?}"),
+                            &[],
+                        )?,
                     )
                     .map_err(|error| target_preparation("qwen_vision_feature_output", b, error))?,
                 );
@@ -666,8 +909,12 @@ fn prepare_copy_rows(
     element: Element,
     bindings: &'static str,
 ) -> Result<NativeKernel<copy_rows::Entry>, CatalogError> {
-    copy_rows::native_for_device_with(device, copy_rows::Elements { A: element })
-        .map_err(|error| preparation("copy_rows", bindings, error))
+    copy_rows::native_for_device_with(
+        device,
+        copy_rows::Elements { A: element },
+        &specialization::fixed::<copy_rows::Entry>(device, bindings, &[])?,
+    )
+    .map_err(|error| preparation("copy_rows", bindings, error))
 }
 
 fn prepare_optional_copy(

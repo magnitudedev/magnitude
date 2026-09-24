@@ -7,9 +7,10 @@
 //! Everything else is private:
 //!
 //! - `memory`: per-pool allocation ledgers and per-device limits.
-//! - `driver`: the backend-generic opened device, preparation cache, authored
-//!   native route, and the narrow primitive that issues one already-admitted
-//!   node.
+//! - `driver`: the backend-generic opened device, preparation cache, and the
+//!   narrow primitive that issues one already-admitted node.
+//! - `native`: the explicitly selected authored-native route: formation,
+//!   graphs, asynchronous submission, measurement and tuning.
 //! - `workflow`: pure descriptor binding followed by graph-wide atomic
 //!   resource admission.
 //! - `execution`: consuming submission and completion ownership for an
@@ -35,8 +36,7 @@ mod backends;
 mod driver;
 mod execution;
 mod layout;
-#[cfg(target_os = "macos")]
-pub mod native_graph;
+pub mod native;
 mod memory;
 mod resources;
 mod telemetry;

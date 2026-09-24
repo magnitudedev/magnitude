@@ -11,8 +11,9 @@ fn copy_rows[N, TS, TD, KV, W](src: &tensor[TS, KV, W] A,
             dst[to[item], head, :] = src[from[item], head, :]
 
 native copy_rows for metal from "metal/copy_rows.metal":
-    threadgroups (ceil_div(N * KV * W, 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch copy_rows:
+        threadgroups (ceil_div(N * KV * W, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 # Dense row gather used to compact arbitrary demanded logits before shaping.
@@ -25,5 +26,6 @@ fn gather_rows[M, O, D](source: &tensor[M, D] f32,
     return result
 
 native gather_rows for metal from "metal/gather_rows.metal":
-    threadgroups (ceil_div(O * D, 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch gather_rows:
+        threadgroups (ceil_div(O * D, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)

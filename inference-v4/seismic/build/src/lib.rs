@@ -51,7 +51,7 @@
 
 use seismic_lang::checked::SourceError;
 use seismic_lang::checked::{
-    EntryInfo, NativeImplementation, NativeNatExpr, ParameterSummary,
+    EntryInfo, NativeImplementation, ParameterSummary,
     ParameterSummaryKind, ResultSummaryKind, SourceSet, TensorAccess,
 };
 use seismic_lang::types::DType;
@@ -169,9 +169,12 @@ mod internals {
     use std::ffi::OsStr;
     use std::fs;
 
-    struct NativeAsset<'a> {
-        definition: &'a NativeImplementation,
-        path: PathBuf,
+    /// The native implementations of one entry. Metal and CUDA sources
+    /// travel in the checked bundle; a CPU source is compiled into the
+    /// generated bindings.
+    struct EntryNative<'a> {
+        entry: seismic_lang::ids::EntryId,
+        cpu: Option<(&'a NativeImplementation, PathBuf)>,
     }
 
     pub(super) fn run(build: Build) -> Result<Artifacts, BuildError> {
@@ -218,49 +221,92 @@ mod internals {
         })
     }
 
-    fn resolve_native_assets<'a>(module: &'a seismic_lang::checked::CheckedModule, output: &std::path::Path) -> Result<Vec<NativeAsset<'a>>, BuildError> {
-        let mut assets=Vec::new();
+    fn resolve_native_assets<'a>(module: &'a seismic_lang::checked::CheckedModule, output: &std::path::Path) -> Result<Vec<EntryNative<'a>>, BuildError> {
+        use seismic_lang::registry::BackendName;
+        let mut natives = Vec::new();
         for entry in module.entries() {
-            let Some(definition)=module.native_implementation(entry.id,seismic_lang::registry::BackendName::Metal) else {continue};
-            let source=module.native_asset(entry.id,seismic_lang::registry::BackendName::Metal).expect("shared loader captures native assets");
-            let path=output.join(format!("{}.metal",entry.name));
-            fs::write(&path,source).map_err(BuildError::Io)?;
-            validate_native_metal_abi(entry, &path, source)?;
-            assets.push(NativeAsset{definition,path});
+            let mut any = false;
+            for (backend, extension) in [(BackendName::Metal, "metal"), (BackendName::Cuda, "cu")] {
+                let Some(definition) = module.native_implementation(entry.id, backend) else { continue };
+                any = true;
+                let source = module.native_asset(entry.id, backend).expect("shared loader captures native assets");
+                let path = output.join(format!("{}.{extension}", entry.name));
+                fs::write(&path, source).map_err(BuildError::Io)?;
+                validate_native_abi(entry, definition, backend, &path, source)?;
+            }
+            let cpu = match module.native_implementation(entry.id, BackendName::Cpu) {
+                Some(definition) => {
+                    any = true;
+                    let source = module.native_asset(entry.id, BackendName::Cpu).expect("shared loader captures native assets");
+                    let path = output.join(format!("{}.cpu.rs", entry.name));
+                    fs::write(&path, source).map_err(BuildError::Io)?;
+                    Some((definition, path))
+                }
+                None => None,
+            };
+            if any {
+                natives.push(EntryNative { entry: entry.id, cpu });
+            }
         }
-        Ok(assets)
+        Ok(natives)
     }
 
-    fn validate_native_metal_abi(
+    fn validate_native_abi(
         entry: &EntryInfo,
+        definition: &NativeImplementation,
+        backend: seismic_lang::registry::BackendName,
         path: &std::path::Path,
         source: &str,
     ) -> Result<(), BuildError> {
-        let allowed = native_abi_symbols(entry);
-        for (symbol, offset) in seismic_identifiers(source) {
-            if allowed.contains(symbol) {
-                continue;
-            }
+        let failure = |offset: usize, symbol: &str| {
             let prefix = &source[..offset];
             let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
             let column = prefix
                 .rsplit_once('\n')
                 .map_or(prefix.len() + 1, |(_, tail)| tail.len() + 1);
-            return Err(BuildError::NativeAbi {
+            BuildError::NativeAbi {
                 entry: entry.name.clone(),
                 path: path.to_path_buf(),
                 line,
                 column,
                 symbol: symbol.to_owned(),
-            });
+            }
+        };
+        if backend == seismic_lang::registry::BackendName::Cuda {
+            // CUDA sources receive their helpers from the generated prefix;
+            // vendor headers are not part of the packaged runtime.
+            if let Some(offset) = source.find("#include") {
+                return Err(failure(offset, "#include"));
+            }
+        }
+        let allowed = native_abi_symbols(entry, definition, backend);
+        for (symbol, offset) in seismic_identifiers(source) {
+            if !allowed.contains(symbol) {
+                return Err(failure(offset, symbol));
+            }
         }
         Ok(())
     }
 
-    fn native_abi_symbols(entry: &EntryInfo) -> HashSet<String> {
+    fn native_abi_symbols(
+        entry: &EntryInfo,
+        definition: &NativeImplementation,
+        backend: seismic_lang::registry::BackendName,
+    ) -> HashSet<String> {
         let mut symbols = HashSet::new();
         symbols.insert("SEISMIC_BUFFER_WORDS".to_owned());
         symbols.insert("SEISMIC_BUFFER_SCALAR_RESULTS".to_owned());
+        for parameter in &definition.params {
+            symbols.insert(format!("SEISMIC_TUNE_{}", native_macro(&parameter.name)));
+        }
+        for scratch in &definition.scratch {
+            symbols.insert(format!("SEISMIC_BUFFER_SCRATCH_{}", native_macro(&scratch.name)));
+        }
+        if backend == seismic_lang::registry::BackendName::Cuda {
+            for symbol in ["SEISMIC_KERNEL_PARAMS", "SEISMIC_PTR", "SEISMIC_PTR_", "SEISMIC_SCALAR_RESULTS"] {
+                symbols.insert(symbol.to_owned());
+            }
+        }
         for dimension in &entry.dimensions {
             symbols.insert(format!("SEISMIC_DIM_{}", native_macro(dimension)));
         }
@@ -583,7 +629,7 @@ mod internals {
         module: &seismic_lang::checked::CheckedModule,
         name: &str,
         identity: &str,
-        native_assets: &[NativeAsset<'_>],
+        native_assets: &[EntryNative<'_>],
     ) -> String {
         let mut out = String::new();
         out.push_str("// @generated by seismic-build; do not edit.\n");
@@ -597,13 +643,13 @@ mod internals {
         for entry in module.entries() {
             let native = native_assets
                 .iter()
-                .find(|asset| asset.definition.entry == entry.id);
+                .find(|native| native.entry == entry.id);
             render_entry(&mut out, entry, native);
         }
         out
     }
 
-    fn render_entry(out: &mut String, entry: &EntryInfo, native: Option<&NativeAsset<'_>>) {
+    fn render_entry(out: &mut String, entry: &EntryInfo, native: Option<&EntryNative<'_>>) {
         let module_name = ident(&entry.name);
         out.push_str(&format!("pub mod {module_name} {{\n"));
         out.push_str("  use super::*;\n");
@@ -723,26 +769,6 @@ mod internals {
             "    const NAME: &'static str = {:?};\n",
             entry.name
         ));
-        let argument_words = entry.dimensions.len() as u64
-            + entry
-                .parameters
-                .iter()
-                .map(|parameter| match &parameter.kind {
-                    ParameterSummaryKind::Tensor { rank, .. } => u64::from(*rank) * 2,
-                    ParameterSummaryKind::Range => 2,
-                    ParameterSummaryKind::Scalar(_) | ParameterSummaryKind::Index => 1,
-                })
-                .sum::<u64>()
-            + entry
-                .results
-                .iter()
-                .map(|result| match &result.kind {
-                    ResultSummaryKind::Tensor { rank, .. } => u64::from(*rank) * 2,
-                    ResultSummaryKind::Range
-                    | ResultSummaryKind::Scalar(_)
-                    | ResultSummaryKind::Index => 0,
-                })
-                .sum::<u64>();
         let scalar_words = entry
             .results
             .iter()
@@ -752,7 +778,9 @@ mod internals {
                 ResultSummaryKind::Tensor { .. } => 0,
             })
             .sum::<u64>();
-        let invocation_workspace_bytes = (argument_words * 8).max(1) + (scalar_words * 8).max(1);
+        // Argument words travel by value; a prepared native implementation
+        // owns only its scalar-result slots.
+        let invocation_workspace_bytes = (scalar_words * 8).max(1);
         out.push_str(&format!(
             "    const NATIVE_INVOCATION_WORKSPACE_BYTES: u64 = {invocation_workspace_bytes};\n"
         ));
@@ -918,68 +946,204 @@ mod internals {
             out.push_str("    ])\n  }\n");
         }
         if let Some(native) = native {
-            let path = native.path.to_string_lossy();
-            out.push_str("  fn native_definition() -> seismic::generated::NativeDefinition {\n");
-            out.push_str(&format!(
-                "    seismic::generated::NativeDefinition {{ source: include_str!({path:?}).into(), entry: {:?}.into(), threadgroups: [\n",
-                entry.name
-            ));
-            for expression in &native.definition.launch.groups {
-                out.push_str("      ");
-                render_native_expr(out, expression);
-                out.push_str(",\n");
-            }
-            out.push_str("    ], threads_per_threadgroup: [\n");
-            for expression in &native.definition.launch.group_extent {
-                out.push_str("      ");
-                render_native_expr(out, expression);
-                out.push_str(",\n");
-            }
-            out.push_str("    ] }\n  }\n");
-            if entry.element_parameters.is_empty() {
-                out.push_str("  pub fn native_for_device(device: &seismic::Device) -> Result<seismic::NativeKernel<Entry>, seismic::LoadError> { seismic::generated::prepare_native::<Entry>(device, native_definition(), &[]) }\n");
-            } else {
-                out.push_str("  pub fn native_for_device_with(device: &seismic::Device, elements: Elements) -> Result<seismic::NativeKernel<Entry>, seismic::LoadError> {\n");
-                out.push_str("    seismic::generated::prepare_native::<Entry>(device, native_definition(), &[\n");
-                for parameter in &entry.element_parameters {
-                    out.push_str(&format!(
-                        "      ({:?}, elements.{}),\n",
-                        parameter,
-                        ident(parameter)
-                    ));
-                }
-                out.push_str("    ])\n  }\n");
-            }
+            render_native(out, entry, native);
         }
         out.push_str("}\n");
     }
 
-    fn render_native_expr(out: &mut String, expression: &NativeNatExpr) {
-        let (name, left, right) = match expression {
-            NativeNatExpr::Constant(value) => {
-                out.push_str(&format!(
-                    "seismic::generated::NativeExpr::constant({value})"
-                ));
-                return;
+    /// Native entry points, and for a CPU implementation its typed context
+    /// and monomorphized launch table.
+    fn render_native(out: &mut String, entry: &EntryInfo, native: &EntryNative<'_>) {
+        let elements = !entry.element_parameters.is_empty();
+        let element_list = |out: &mut String| {
+            for parameter in &entry.element_parameters {
+                out.push_str(&format!("      ({:?}, elements.{}),\n", parameter, ident(parameter)));
             }
-            NativeNatExpr::Dimension(name) => {
-                out.push_str(&format!(
-                    "seismic::generated::NativeExpr::dimension({name:?})"
-                ));
-                return;
-            }
-            NativeNatExpr::Add(left, right) => ("add", left, right),
-            NativeNatExpr::Sub(left, right) => ("sub", left, right),
-            NativeNatExpr::Mul(left, right) => ("mul", left, right),
-            NativeNatExpr::Div(left, right) => ("div", left, right),
-            NativeNatExpr::Rem(left, right) => ("rem", left, right),
-            NativeNatExpr::CeilDiv(left, right) => ("ceil_div", left, right),
         };
-        out.push_str(&format!("seismic::generated::NativeExpr::{name}("));
-        render_native_expr(out, left);
-        out.push_str(", ");
-        render_native_expr(out, right);
-        out.push(')');
+        let cpu = if native.cpu.is_some() { "Some(&cpu_native::KERNELS)" } else { "None" };
+        if elements {
+            out.push_str("  pub fn native_for_device_with(device: &seismic::Device, elements: Elements, specialization: &seismic::NativeSpecialization) -> Result<seismic::NativeKernel<Entry>, seismic::LoadError> {\n");
+            out.push_str("    seismic::generated::prepare_native::<Entry>(device, specialization, &[\n");
+            element_list(out);
+            out.push_str(&format!("    ], {cpu})\n  }}\n"));
+            out.push_str("  pub fn native_tune_with(device: &seismic::Device, elements: Elements, statics: &seismic::NativeSpecialization, points: Vec<seismic::TuningPoint<'_, Entry>>, validation: seismic::Validation, measure: seismic::MeasureOptions) -> Result<seismic::TuningResult, seismic::TuneError> {\n");
+            out.push_str("    seismic::generated::tune_native::<Entry>(device, statics, &[\n");
+            element_list(out);
+            out.push_str(&format!("    ], {cpu}, points, validation, measure)\n  }}\n"));
+        } else {
+            out.push_str(&format!("  pub fn native_for_device(device: &seismic::Device, specialization: &seismic::NativeSpecialization) -> Result<seismic::NativeKernel<Entry>, seismic::LoadError> {{ seismic::generated::prepare_native::<Entry>(device, specialization, &[], {cpu}) }}\n"));
+            out.push_str(&format!("  pub fn native_tune(device: &seismic::Device, statics: &seismic::NativeSpecialization, points: Vec<seismic::TuningPoint<'_, Entry>>, validation: seismic::Validation, measure: seismic::MeasureOptions) -> Result<seismic::TuningResult, seismic::TuneError> {{ seismic::generated::tune_native::<Entry>(device, statics, &[], {cpu}, points, validation, measure) }}\n"));
+        }
+        out.push_str("  /// The checked native implementation for the device's backend.\n");
+        out.push_str("  pub fn native_implementation(device: &seismic::Device) -> Result<Option<seismic::NativeImplementation>, seismic::CheckedBundleError> { seismic::generated::native_implementation::<Entry>(device) }\n");
+        if let Some((definition, path)) = &native.cpu {
+            render_cpu_native(out, entry, definition, path);
+        }
+    }
+
+    /// The typed CPU view of an entry's native ABI, the authored source, and
+    /// one function per launch and tuning configuration.
+    fn render_cpu_native(
+        out: &mut String,
+        entry: &EntryInfo,
+        definition: &NativeImplementation,
+        path: &std::path::Path,
+    ) {
+        out.push_str("  pub mod cpu_native {\n");
+        out.push_str("    #![allow(dead_code)]\n");
+        out.push_str("    use seismic::native_cpu::{CpuInvocation, CpuKernelFn, CpuLaunchVariants, CpuNativeKernels, CpuTensor};\n");
+        out.push_str(&format!(
+            "    /// Typed view of the CPU native ABI of `{}`.\n",
+            entry.name
+        ));
+        out.push_str("    #[derive(Clone, Copy)]\n");
+        out.push_str("    pub struct Context<'a> { invocation: &'a CpuInvocation<'a> }\n");
+        out.push_str("    impl<'a> Context<'a> {\n");
+        out.push_str("      pub fn groups(&self) -> [u64; 3] { self.invocation.groups() }\n");
+        out.push_str("      pub fn threads(&self) -> [u64; 3] { self.invocation.threads() }\n");
+        let mut word = 0usize;
+        for dimension in &entry.dimensions {
+            out.push_str(&format!(
+                "      pub fn dim_{}(&self) -> u64 {{ self.invocation.word({word}) }}\n",
+                ident(dimension).to_lowercase()
+            ));
+            word += 1;
+        }
+        let mut buffer = 0usize;
+        let tensor = |out: &mut String, name: &str, buffer: usize, word: usize, rank: usize| {
+            let extents = (0..rank).map(|axis| format!("self.invocation.word({})", word + axis)).collect::<Vec<_>>().join(", ");
+            let strides = (0..rank).map(|axis| format!("self.invocation.word({})", word + rank + axis)).collect::<Vec<_>>().join(", ");
+            out.push_str(&format!(
+                "      pub fn {name}(&self) -> CpuTensor<{rank}> {{ CpuTensor {{ pointer: self.invocation.buffer({buffer}), extents: [{extents}], strides: [{strides}], representation: self.invocation.representation({buffer}) }} }}\n"
+            ));
+        };
+        for (ordinal, parameter) in entry.parameters.iter().enumerate() {
+            let unique = entry
+                .parameters
+                .iter()
+                .filter(|candidate| candidate.name == parameter.name)
+                .count()
+                == 1;
+            let name = if unique {
+                format!("arg_{}", ident(&parameter.name).to_lowercase())
+            } else {
+                format!("arg_{ordinal}")
+            };
+            match &parameter.kind {
+                ParameterSummaryKind::Tensor { rank, .. } => {
+                    let rank = *rank as usize;
+                    tensor(out, &name, buffer, word, rank);
+                    buffer += 1;
+                    word += rank * 2;
+                }
+                ParameterSummaryKind::Scalar(dtype) => {
+                    let (ty, decode) = match dtype {
+                        DType::F32 => ("f32", "f32::from_bits(value as u32)"),
+                        DType::F16 | DType::BF16 => ("u16", "value as u16"),
+                        DType::I32 => ("i32", "value as u32 as i32"),
+                        DType::U32 => ("u32", "value as u32"),
+                        DType::Bool => ("bool", "value != 0"),
+                    };
+                    out.push_str(&format!(
+                        "      pub fn {name}(&self) -> {ty} {{ let value = self.invocation.word({word}); {decode} }}\n"
+                    ));
+                    word += 1;
+                }
+                ParameterSummaryKind::Index => {
+                    out.push_str(&format!(
+                        "      pub fn {name}(&self) -> u64 {{ self.invocation.word({word}) }}\n"
+                    ));
+                    word += 1;
+                }
+                ParameterSummaryKind::Range => {
+                    out.push_str(&format!(
+                        "      pub fn {name}(&self) -> (u64, u64) {{ (self.invocation.word({word}), self.invocation.word({})) }}\n",
+                        word + 1
+                    ));
+                    word += 2;
+                }
+            }
+        }
+        let mut scalar = 0usize;
+        for (ordinal, result) in entry.results.iter().enumerate() {
+            match &result.kind {
+                ResultSummaryKind::Tensor { rank, .. } => {
+                    let rank = *rank as usize;
+                    tensor(out, &format!("result_{ordinal}"), buffer, word, rank);
+                    buffer += 1;
+                    word += rank * 2;
+                }
+                ResultSummaryKind::Scalar(_) | ResultSummaryKind::Index => {
+                    out.push_str(&format!(
+                        "      /// Raw word of scalar result {ordinal}; one work item writes it.\n      pub fn result_{ordinal}(&self) -> *mut u64 {{ self.invocation.scalar_result({scalar}) }}\n"
+                    ));
+                    scalar += 1;
+                }
+                ResultSummaryKind::Range => {
+                    out.push_str(&format!(
+                        "      /// Raw words (start, end) of range result {ordinal}; one work item writes them.\n      pub fn result_{ordinal}(&self) -> (*mut u64, *mut u64) {{ (self.invocation.scalar_result({scalar}), self.invocation.scalar_result({})) }}\n",
+                        scalar + 1
+                    ));
+                    scalar += 2;
+                }
+            }
+        }
+        for scratch in &definition.scratch {
+            out.push_str(&format!(
+                "      pub fn scratch_{}(&self) -> *mut u8 {{ self.invocation.buffer({buffer}) }}\n",
+                ident(&scratch.name).to_lowercase()
+            ));
+            buffer += 1;
+        }
+        out.push_str("    }\n");
+        out.push_str(&format!("    include!({:?});\n", path.to_string_lossy()));
+        // One function per launch and configuration of the parameter
+        // domains' cartesian product; `where` filtering happens when a
+        // specialization is prepared.
+        let mut configurations: Vec<Vec<u64>> = vec![Vec::new()];
+        for parameter in &definition.params {
+            configurations = configurations
+                .into_iter()
+                .flat_map(|prefix| {
+                    parameter.values.iter().map(move |value| {
+                        let mut configuration = prefix.clone();
+                        configuration.push(*value);
+                        configuration
+                    })
+                })
+                .collect();
+        }
+        out.push_str("    pub static KERNELS: CpuNativeKernels = CpuNativeKernels { launches: &[\n");
+        let mut functions = String::new();
+        for (launch_index, launch) in definition.launches.iter().enumerate() {
+            out.push_str(&format!(
+                "      CpuLaunchVariants {{ kernel: {:?}, variants: &[\n",
+                launch.kernel
+            ));
+            for (variant, configuration) in configurations.iter().enumerate() {
+                let function = format!("launch_{launch_index}_{variant}");
+                let generics = if configuration.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "::<{}>",
+                        configuration.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")
+                    )
+                };
+                functions.push_str(&format!(
+                    "    fn {function}(invocation: &CpuInvocation<'_>, group: [u64; 3], shared: &mut [u8]) {{ {}{generics}(&Context {{ invocation }}, group, shared) }}\n",
+                    launch.kernel
+                ));
+                out.push_str(&format!(
+                    "        (&[{}], {function} as CpuKernelFn),\n",
+                    configuration.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")
+                ));
+            }
+            out.push_str("      ] },\n");
+        }
+        out.push_str("    ] };\n");
+        out.push_str(&functions);
+        out.push_str("  }\n");
     }
 
     fn parameter_type(kind: &ParameterSummaryKind) -> String {
@@ -1348,7 +1512,7 @@ mod native_tests {
         let metal = root.join("native/scale.metal");
         fs::write(
             &source,
-            "fn scale[N](x: &tensor[N] f32, factor: f32, output: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        output[i] = x[i] * factor\n\nnative scale for metal from \"native/scale.metal\":\n    threadgroups (ceil_div(N, 256), 1, 1)\n    threads_per_threadgroup (256, 1, 1)\n",
+            "fn scale[N](x: &tensor[N] f32, factor: f32, output: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        output[i] = x[i] * factor\n\nnative scale for metal from \"native/scale.metal\":\n    launch scale:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n",
         )
         .expect("Seismic fixture");
         fs::write(&metal, "kernel void scale() {}\n").expect("Metal fixture");
@@ -1361,7 +1525,8 @@ mod native_tests {
             .expect("first build");
         let generated = fs::read_to_string(&first.bindings).expect("generated bindings");
         assert!(generated.contains("pub fn native_for_device"));
-        assert!(generated.contains("NativeExpr::ceil_div"));
+        assert!(generated.contains("pub fn native_implementation"));
+        assert!(generated.contains("pub fn native_tune"));
         assert!(generated.contains("NativeKernel<Entry>"));
 
         fs::write(&metal, "kernel void scale() { /* changed */ }\n").expect("changed Metal");
@@ -1391,7 +1556,7 @@ mod native_tests {
         let metal = root.join("native/scale.metal");
         fs::write(
             &source,
-            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for metal from \"native/scale.metal\":\n    threadgroups (ceil_div(N, 256), 1, 1)\n    threads_per_threadgroup (256, 1, 1)\n",
+            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for metal from \"native/scale.metal\":\n    launch scale:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n",
         )
         .expect("Seismic fixture");
         fs::write(
@@ -1438,7 +1603,7 @@ mod native_tests {
         let metal = root.join("native/scale.metal");
         fs::write(
             &source,
-            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for metal from \"native/scale.metal\":\n    threadgroups (ceil_div(N, 256), 1, 1)\n    threads_per_threadgroup (256, 1, 1)\n",
+            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for metal from \"native/scale.metal\":\n    launch scale:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n",
         )
         .expect("Seismic fixture");
         fs::write(
@@ -1453,6 +1618,68 @@ mod native_tests {
             .out_dir(&output)
             .run()
             .expect("exact entry ABI symbols must pass the consumer build");
+        fs::remove_dir_all(&root).expect("remove fixture directory");
+    }
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "seismic-native-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("native")).expect("fixture directories");
+        root
+    }
+
+    const SPECIALIZED: &str = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for cuda from \"native/scale.cu\":\n    static (N)\n    params (TILE in [32, 64])\n    scratch staging bytes (N * 4)\n    launch scale:\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (TILE, 1, 1)\n\nnative scale for cpu from \"native/scale.rs\":\n    params (TILE in [32, 64], UNROLL in [1, 2, 4])\n    launch scale:\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
+
+    const CPU_SCALE: &str = "fn scale<const TILE: u64, const UNROLL: u64>(context: &Context<'_>, group: [u64; 3], _shared: &mut [u8]) {\n    let x = context.arg_x();\n    let output = context.result_0();\n    for i in group[0] * TILE..((group[0] + 1) * TILE).min(context.dim_n()) {\n        unsafe { output.pointer.cast::<f32>().add(i as usize).write(x.pointer.cast::<f32>().add(i as usize).read()) };\n    }\n    let _ = UNROLL;\n}\n";
+
+    #[test]
+    fn cuda_assets_admit_tuning_and_scratch_symbols_and_reject_headers() {
+        let root = fixture("cuda");
+        let source = root.join("ops.seismic");
+        fs::write(&source, SPECIALIZED).expect("Seismic fixture");
+        fs::write(root.join("native/scale.rs"), CPU_SCALE).expect("CPU fixture");
+        let cuda = root.join("native/scale.cu");
+        fs::write(
+            &cuda,
+            "extern \"C\" __global__ void scale(SEISMIC_KERNEL_PARAMS) {\n    float *x = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_X));\n    float *staging = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGING));\n    if (threadIdx.x < SEISMIC_TUNE_TILE && blockIdx.x * SEISMIC_TUNE_TILE < SEISMIC_DIM_N) staging[0] = x[0];\n}\n",
+        )
+        .expect("CUDA fixture");
+        let build = |name: &str| {
+            Build::new("fixture")
+                .source(&source)
+                .std(false)
+                .out_dir(root.join(name))
+                .run()
+        };
+        let artifacts = build("out").expect("tuning and scratch symbols are generated ABI");
+        let generated = fs::read_to_string(&artifacts.bindings).expect("generated bindings");
+        assert!(generated.contains("Some(&cpu_native::KERNELS)"));
+        // Two TILE values by three UNROLL values.
+        assert_eq!(generated.matches("as CpuKernelFn").count(), 6);
+        assert!(generated.contains("scale::<64, 4>"));
+
+        fs::write(&cuda, "#include <cuda_fp16.h>\nextern \"C\" __global__ void scale(SEISMIC_KERNEL_PARAMS) {}\n")
+            .expect("CUDA fixture");
+        match build("header").expect_err("vendor headers are rejected") {
+            BuildError::NativeAbi { symbol, line, .. } => {
+                assert_eq!(symbol, "#include");
+                assert_eq!(line, 1);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        fs::write(&cuda, "extern \"C\" __global__ void scale(SEISMIC_KERNEL_PARAMS) { (void)SEISMIC_TUNE_WIDTH; }\n")
+            .expect("CUDA fixture");
+        match build("unknown").expect_err("undeclared parameters are rejected") {
+            BuildError::NativeAbi { symbol, .. } => assert_eq!(symbol, "SEISMIC_TUNE_WIDTH"),
+            other => panic!("unexpected error: {other}"),
+        }
         fs::remove_dir_all(&root).expect("remove fixture directory");
     }
 }

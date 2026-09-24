@@ -4,8 +4,9 @@
 //! storage is admitted. Ports are the only late bindings. No consumer supplies
 //! a name-to-buffer recipe for intermediate results.
 
-#![cfg(target_os = "macos")]
-
+use super::{
+    submit, NativeBoundCall, NativeSubmission, NativeTensorSpec, ScratchView, SCRATCH_ALIGNMENT,
+};
 use crate::api::device::DeviceInner;
 use crate::api::kernel::{
     EncodedArgs, EncodedWorkflowArgs, EncodedWorkflowArgument, NativePreparedAny,
@@ -13,8 +14,7 @@ use crate::api::kernel::{
 };
 use crate::api::tensor::TensorInner;
 use crate::api::{CallError, TensorError, WorkflowError};
-use crate::backends::NativeBoundKind;
-use crate::driver::{Allocation, NativeTensorSpec, write_zeros};
+use crate::driver::{write_zeros, Allocation};
 use crate::layout;
 use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::prepared::{ArgumentValue, DeviceIdentity, TensorDescriptor};
@@ -248,14 +248,15 @@ impl NativeGraphDraft {
         let mut results: Vec<Vec<Option<NativeTensorSpec>>> = Vec::new();
         let mut nodes = Vec::with_capacity(self.nodes.len());
         for node in self.nodes {
-            node.kernel.inner.validate_graph_batch(device_identity)?;
+            node.kernel.inner.validate_graph_node(device_identity)?;
             let arguments =
                 describe_arguments(&node.args, &self.ports, &results, identity, device_identity)?;
-            let described = node.kernel.inner.describe_results(&arguments)?;
+            let (described, scratch) = node.kernel.inner.describe(&arguments)?;
             results.push(described);
             nodes.push(PlannedNode {
                 kernel: node.kernel,
                 args: node.args,
+                scratch,
             });
         }
         for reference in &self.exports {
@@ -263,14 +264,7 @@ impl NativeGraphDraft {
                 return Err(CallError::Workflow(WorkflowError::MissingProducerResult));
             }
         }
-        let (
-            port_placements,
-            placements,
-            scratch_bytes,
-            scratch_alignment,
-            output_bytes,
-            output_alignment,
-        ) = plan_storage(&self.ports, &nodes, &results, &self.exports);
+        let storage = plan_storage(&self.ports, &nodes, &results, &self.exports);
         Ok(NativeGraphPlan {
             identity,
             device: self.device,
@@ -278,12 +272,15 @@ impl NativeGraphDraft {
             nodes,
             results,
             exports: self.exports,
-            port_placements,
-            placements,
-            scratch_bytes,
-            scratch_alignment,
-            output_bytes,
-            output_alignment,
+            port_placements: storage.port_placements,
+            placements: storage.placements,
+            node_scratch: storage.node_scratch,
+            scratch_bytes: storage.scratch_bytes,
+            scratch_alignment: storage.scratch_alignment,
+            output_bytes: storage.output_bytes,
+            output_alignment: storage.output_alignment,
+            upload_bytes: storage.upload_bytes,
+            upload_alignment: storage.upload_alignment,
         })
     }
 }
@@ -424,12 +421,16 @@ fn describe_reference(
 struct PlannedNode {
     kernel: Arc<NativePreparedAny>,
     args: EncodedWorkflowArgs,
+    /// Bytes of each of the node's call-private scratch buffers.
+    scratch: Vec<u64>,
 }
 
 #[derive(Clone, Copy)]
 enum Placement {
     Scratch(u64),
     Export(u64),
+    /// A host-written input in the per-submission upload region.
+    Upload(u64),
     Scalar,
 }
 
@@ -443,6 +444,19 @@ struct ScratchBlock {
 enum StorageKey {
     Port(usize),
     Result(usize, usize),
+    NodeScratch(usize, usize),
+}
+
+struct StoragePlan {
+    port_placements: Vec<Option<Placement>>,
+    placements: Vec<Vec<Placement>>,
+    node_scratch: Vec<Vec<u64>>,
+    scratch_bytes: u64,
+    scratch_alignment: u64,
+    output_bytes: u64,
+    output_alignment: u64,
+    upload_bytes: u64,
+    upload_alignment: u64,
 }
 
 struct Interval {
@@ -458,19 +472,17 @@ fn align_up(value: u64, alignment: u64) -> u64 {
     value.div_ceil(alignment) * alignment
 }
 
+/// Place graph storage. Results, graph locals and node scratch share one
+/// arena by lifetime (a node's scratch is live across its inputs and
+/// results, so it never aliases them); exports get their own arena; inputs
+/// the host writes go to a per-submission upload region so a later host
+/// write cannot race an earlier submission still reading them.
 fn plan_storage(
     ports: &[PortSpec],
     nodes: &[PlannedNode],
     results: &[Vec<Option<NativeTensorSpec>>],
     exports: &[WorkflowResultRef],
-) -> (
-    Vec<Option<Placement>>,
-    Vec<Vec<Placement>>,
-    u64,
-    u64,
-    u64,
-    u64,
-) {
+) -> StoragePlan {
     let mut last_use = results
         .iter()
         .enumerate()
@@ -494,8 +506,20 @@ fn plan_storage(
         }
     }
     let mut intervals = Vec::new();
+    let mut upload_bytes = 0u64;
+    let mut upload_alignment = 1u64;
+    let mut port_placements = vec![None; ports.len()];
     for (ordinal, port) in ports.iter().enumerate() {
         if !port.local {
+            continue;
+        }
+        if port.owned_input {
+            upload_alignment = upload_alignment.max(port.alignment);
+            let offset = align_up(upload_bytes, port.alignment);
+            upload_bytes = offset
+                .checked_add(port.byte_len.max(1))
+                .expect("native graph upload bytes overflow");
+            port_placements[ordinal] = Some(Placement::Upload(offset));
             continue;
         }
         let exported = exports
@@ -503,7 +527,7 @@ fn plan_storage(
             .any(|item| item.node == INPUT_NODE && item.result as usize == ordinal);
         intervals.push(Interval {
             key: StorageKey::Port(ordinal),
-            start: if port.owned_input || port.prewritten {
+            start: if port.prewritten {
                 0
             } else {
                 port_first[ordinal].unwrap_or(0)
@@ -530,16 +554,31 @@ fn plan_storage(
             });
         }
     }
+    for (node, planned) in nodes.iter().enumerate() {
+        for (ordinal, bytes) in planned.scratch.iter().enumerate() {
+            intervals.push(Interval {
+                key: StorageKey::NodeScratch(node, ordinal),
+                start: node * 2,
+                end: node * 2 + 1,
+                bytes: *bytes,
+                alignment: SCRATCH_ALIGNMENT,
+                exported: false,
+            });
+        }
+    }
     intervals.sort_by_key(|interval| interval.start);
     let mut blocks: Vec<ScratchBlock> = Vec::new();
     let mut cursor = 0u64;
     let mut alignment = 1u64;
     let mut output_bytes = 0u64;
     let mut output_alignment = 1u64;
-    let mut port_placements = vec![None; ports.len()];
     let mut placements = results
         .iter()
         .map(|row| vec![Placement::Scalar; row.len()])
+        .collect::<Vec<_>>();
+    let mut node_scratch = nodes
+        .iter()
+        .map(|node| vec![0u64; node.scratch.len()])
         .collect::<Vec<_>>();
     for interval in intervals {
         let placement = if interval.exported {
@@ -573,19 +612,26 @@ fn plan_storage(
             };
             Placement::Scratch(offset)
         };
-        match interval.key {
-            StorageKey::Port(ordinal) => port_placements[ordinal] = Some(placement),
-            StorageKey::Result(node, ordinal) => placements[node][ordinal] = placement,
+        match (interval.key, placement) {
+            (StorageKey::Port(ordinal), _) => port_placements[ordinal] = Some(placement),
+            (StorageKey::Result(node, ordinal), _) => placements[node][ordinal] = placement,
+            (StorageKey::NodeScratch(node, ordinal), Placement::Scratch(offset)) => {
+                node_scratch[node][ordinal] = offset;
+            }
+            (StorageKey::NodeScratch(..), _) => unreachable!("node scratch is never exported"),
         }
     }
-    (
+    StoragePlan {
         port_placements,
         placements,
-        cursor,
-        alignment,
+        node_scratch,
+        scratch_bytes: cursor,
+        scratch_alignment: alignment,
         output_bytes,
         output_alignment,
-    )
+        upload_bytes,
+        upload_alignment,
+    }
 }
 
 pub struct NativeGraphPlan {
@@ -597,10 +643,14 @@ pub struct NativeGraphPlan {
     exports: Vec<WorkflowResultRef>,
     port_placements: Vec<Option<Placement>>,
     placements: Vec<Vec<Placement>>,
+    /// Arena offset of each node's scratch buffers.
+    node_scratch: Vec<Vec<u64>>,
     scratch_bytes: u64,
     scratch_alignment: u64,
     output_bytes: u64,
     output_alignment: u64,
+    upload_bytes: u64,
+    upload_alignment: u64,
 }
 
 impl NativeGraphPlan {
@@ -612,6 +662,10 @@ impl NativeGraphPlan {
     }
     pub fn slot_storage_bytes(&self) -> u64 {
         self.scratch_bytes + self.output_bytes
+    }
+    /// Bytes of one submission's host-written inputs.
+    pub fn upload_bytes(&self) -> u64 {
+        self.upload_bytes
     }
     pub fn bindings(&self) -> NativeGraphBindings {
         NativeGraphBindings {
@@ -641,6 +695,9 @@ impl NativeGraphPlan {
             fixed: bindings,
         })
     }
+    /// A slot of this plan alone. Its upload region is fixed, so host writes
+    /// to its inputs wait for the slot's previous submission; a family slot
+    /// rotates upload regions instead.
     pub fn new_slot(self: &Arc<Self>) -> Result<NativeGraphSlot, TensorError> {
         let scratch = if self.scratch_bytes == 0 {
             None
@@ -651,25 +708,41 @@ impl NativeGraphPlan {
             write_zeros(allocation.storage(), self.scratch_bytes)?;
             Some(allocation)
         };
-        Ok(self.slot_from_scratch(scratch))
+        let upload = if self.upload_bytes == 0 {
+            None
+        } else {
+            Some(
+                self.device
+                    .allocate(self.upload_bytes, self.upload_alignment)?,
+            )
+        };
+        Ok(self.slot_from_scratch(scratch, upload))
     }
 
-    fn slot_from_scratch(self: &Arc<Self>, scratch: Option<Arc<Allocation>>) -> NativeGraphSlot {
+    fn slot_from_scratch(
+        self: &Arc<Self>,
+        scratch: Option<Arc<Allocation>>,
+        upload: Option<Arc<Allocation>>,
+    ) -> NativeGraphSlot {
         let mut locals = Vec::with_capacity(self.ports.len());
         for (ordinal, port) in self.ports.iter().enumerate() {
-            let tensor = match self.port_placements[ordinal] {
-                Some(Placement::Scratch(offset)) => Some(Arc::new(TensorInner::new_view(
+            let view = |allocation: &Option<Arc<Allocation>>, offset| {
+                Some(Arc::new(TensorInner::new_view(
                     self.device.clone(),
-                    scratch
+                    allocation
                         .as_ref()
-                        .expect("planned scratch allocation absent")
+                        .expect("planned graph storage allocation absent")
                         .clone(),
                     offset,
                     port.byte_len,
                     port.representation,
                     port.extents.clone(),
                     port.strides.clone(),
-                ))),
+                )))
+            };
+            let tensor = match self.port_placements[ordinal] {
+                Some(Placement::Scratch(offset)) => view(&scratch, offset),
+                Some(Placement::Upload(offset)) => view(&upload, offset),
                 Some(Placement::Export(_)) | None => None,
                 Some(Placement::Scalar) => unreachable!(),
             };
@@ -695,7 +768,7 @@ impl NativeGraphPlan {
                         output_row.push(None);
                         continue;
                     }
-                    Placement::Scalar => unreachable!(),
+                    Placement::Upload(_) | Placement::Scalar => unreachable!(),
                 };
                 output_row.push(Some(Arc::new(TensorInner::new_view(
                     self.device.clone(),
@@ -713,6 +786,7 @@ impl NativeGraphPlan {
             plan: self.clone(),
             locals,
             outputs,
+            scratch,
         }
     }
 
@@ -816,6 +890,8 @@ pub struct NativeGraphFamily {
     alignment: u64,
     output_bytes: u64,
     output_alignment: u64,
+    upload_bytes: u64,
+    upload_alignment: u64,
 }
 
 impl NativeGraphFamily {
@@ -850,7 +926,23 @@ impl NativeGraphFamily {
                 .map(|plan| plan.output_alignment)
                 .max()
                 .unwrap_or(1),
+            upload_bytes: plans
+                .iter()
+                .map(|plan| plan.upload_bytes)
+                .max()
+                .unwrap_or(0),
+            upload_alignment: plans
+                .iter()
+                .map(|plan| plan.upload_alignment)
+                .max()
+                .unwrap_or(1),
         })
+    }
+
+    /// Bytes of one upload region. A slot holds one region per submission
+    /// still in flight.
+    pub fn upload_bytes(&self) -> u64 {
+        self.upload_bytes
     }
 
     pub fn workspace_bytes(&self) -> u64 {
@@ -887,6 +979,7 @@ impl NativeGraphFamily {
         Ok(NativeGraphFamilySlot {
             family: self.clone(),
             scratch,
+            uploads: Vec::new(),
             lent_locals: Vec::new(),
         })
     }
@@ -917,6 +1010,10 @@ impl NativeGraphFamilyOutputSlot {
 pub struct NativeGraphFamilySlot {
     family: Arc<NativeGraphFamily>,
     scratch: Option<Arc<Allocation>>,
+    /// Upload regions. Activation reuses one no submission still reads and
+    /// no tensor view still names, and otherwise forms another, so the pool
+    /// grows to the number of submissions actually in flight.
+    uploads: Vec<Arc<Allocation>>,
     lent_locals: Vec<Weak<TensorInner>>,
 }
 
@@ -941,8 +1038,28 @@ impl NativeGraphFamilySlot {
         {
             return Err(WorkflowError::NativeGraphSlotMismatch);
         }
-        let slot = plan.slot_from_scratch(self.scratch.clone());
+        let upload = self.idle_upload().map_err(WorkflowError::TensorView)?;
+        let slot = plan.slot_from_scratch(self.scratch.clone(), upload);
         Ok(NativeGraphFamilyActive { slot, _owner: self })
+    }
+
+    fn idle_upload(&mut self) -> Result<Option<Arc<Allocation>>, TensorError> {
+        if self.family.upload_bytes == 0 {
+            return Ok(None);
+        }
+        if let Some(idle) = self
+            .uploads
+            .iter()
+            .find(|upload| Arc::strong_count(upload) == 1 && upload.device_idle())
+        {
+            return Ok(Some(idle.clone()));
+        }
+        let upload = self
+            .family
+            .device
+            .allocate(self.family.upload_bytes, self.family.upload_alignment)?;
+        self.uploads.push(upload.clone());
+        Ok(Some(upload))
     }
 }
 
@@ -976,6 +1093,7 @@ pub struct NativeGraphSlot {
     plan: Arc<NativeGraphPlan>,
     locals: Vec<Option<Arc<TensorInner>>>,
     outputs: Vec<Vec<Option<Arc<TensorInner>>>>,
+    scratch: Option<Arc<Allocation>>,
 }
 
 impl NativeGraphSlot {
@@ -1062,7 +1180,18 @@ impl NativeGraphSlot {
                 .iter()
                 .filter_map(Clone::clone)
                 .collect::<Vec<_>>();
-            bound.push(node.kernel.inner.bind(args, outputs)?);
+            let scratch = self.plan.node_scratch[ordinal]
+                .iter()
+                .map(|offset| ScratchView {
+                    allocation: self
+                        .scratch
+                        .as_ref()
+                        .expect("planned node scratch arena absent")
+                        .clone(),
+                    offset: *offset,
+                })
+                .collect();
+            bound.push(Arc::new(node.kernel.inner.bind(args, outputs, scratch)?));
         }
         Ok(ReadyNativeGraphRun {
             _slot: self,
@@ -1185,18 +1314,38 @@ impl NativeGraphBindings {
 
 pub struct ReadyNativeGraphRun<'a> {
     _slot: &'a mut NativeGraphSlot,
-    bound: Vec<NativeBoundKind>,
+    bound: Vec<Arc<NativeBoundCall>>,
     exports: NativeGraphOutputs,
 }
 
 impl ReadyNativeGraphRun<'_> {
-    /// Submission consumes the already checked attachments. Missing ports,
-    /// wrong extents, and illegal aliases cannot enter this method.
-    pub fn run(self) -> Result<NativeGraphOutputs, CallError> {
-        NativeBoundKind::run_graph(self.bound)?;
+    /// Submit the already checked attachments without waiting. Missing
+    /// ports, wrong extents, and illegal aliases cannot enter this method.
+    ///
+    /// The returned outputs may be bound into later submissions at once;
+    /// the device queue orders them. Host reads of exported tensors wait for
+    /// this submission. The completion reports its outcome.
+    pub fn submit(self) -> Result<(NativeGraphOutputs, NativeGraphCompletion), CallError> {
+        let submission = submit(&self.bound, 1)?;
         let mut exports = self.exports;
         exports.submitted = true;
-        Ok(exports)
+        Ok((exports, NativeGraphCompletion { submission }))
+    }
+}
+
+/// The outcome of one submitted native graph run.
+#[must_use = "a native graph completion reports whether the run succeeded"]
+pub struct NativeGraphCompletion {
+    submission: NativeSubmission,
+}
+
+impl NativeGraphCompletion {
+    pub fn is_complete(&self) -> bool {
+        self.submission.is_complete()
+    }
+    /// Wait for the run and report its outcome.
+    pub fn wait(self) -> Result<(), CallError> {
+        self.submission.wait()
     }
 }
 

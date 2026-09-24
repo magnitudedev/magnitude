@@ -91,6 +91,7 @@ driver! {
     event_destroy: unsafe extern "system" fn(Handle) -> ResultCode => "cuEventDestroy_v2",
     event_record: unsafe extern "system" fn(Handle, Handle) -> ResultCode => "cuEventRecord",
     event_synchronize: unsafe extern "system" fn(Handle) -> ResultCode => "cuEventSynchronize",
+    event_query: unsafe extern "system" fn(Handle) -> ResultCode => "cuEventQuery",
     event_elapsed_time: unsafe extern "system" fn(*mut f32, Handle, Handle) -> ResultCode => "cuEventElapsedTime",
     allocate: unsafe extern "system" fn(*mut u64, usize) -> ResultCode => "cuMemAlloc_v2",
     free: unsafe extern "system" fn(u64) -> ResultCode => "cuMemFree_v2",
@@ -369,6 +370,21 @@ impl Event {
                 "event synchronization",
             )
         }
+    }
+
+    /// `true` once every command recorded before the event has completed.
+    pub fn query(&self) -> Result<bool, DriverError> {
+        let _current = self.context.enter()?;
+        // CUDA_ERROR_NOT_READY
+        const NOT_READY: c_int = 600;
+        let status = unsafe { (self.context.driver.event_query)(self.raw) };
+        if status == NOT_READY {
+            return Ok(false);
+        }
+        self.context
+            .driver
+            .check(status, "event query")
+            .map(|()| true)
     }
 
     pub fn elapsed_ns(start: &Self, end: &Self) -> Result<f64, DriverError> {

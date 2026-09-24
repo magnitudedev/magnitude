@@ -9,8 +9,9 @@ fn qwen_embedding_rows[M, V, D](table: &tensor[V, D] EW, tokens: &tensor[M] i32)
     return embedded, f32(embedded)
 
 native qwen_embedding_rows for metal from "metal/qwen_embedding_rows.metal":
-    threadgroups (ceil_div(M * D, 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_embedding_rows:
+        threadgroups (ceil_div(M * D, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 # Conditioned features are already F32 model-width rows. This entry owns the
@@ -21,8 +22,9 @@ fn qwen_conditioning_overlay[M, D](input: &tensor[M, D] f32, out: &mut tensor[M,
             out[row, col] = input[row, col]
 
 native qwen_conditioning_overlay for metal from "metal/qwen_conditioning_overlay.metal":
-    threadgroups (ceil_div(M * D, 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_conditioning_overlay:
+        threadgroups (ceil_div(M * D, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 fn qwen_attention_rows[M, D, T, G, KV, P, S, R](hidden: &tensor[M, D] f32,
@@ -100,5 +102,6 @@ fn qwen_attention_rows[M, D, T, G, KV, P, S, R](hidden: &tensor[M, D] f32,
     return result
 
 native qwen_attention_rows for metal from "metal/qwen_attention_rows.metal":
-    threadgroups (ceil_div(M * D + M * KV * (2 * P + S), 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_attention_rows:
+        threadgroups (ceil_div(M * D + M * KV * (2 * P + S), 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)

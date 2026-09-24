@@ -632,7 +632,7 @@ class Function:
     def prepare(self, *, device, elements=None, precision=None, evaluation=None):
         precision = precision or Precision.exact()
         evaluation = evaluation or Analytical()
-        return self._prepare(device, elements, precision, evaluation, False)
+        return self._prepare(device, elements, precision, evaluation, False, {}, {})
 
     def start_feedback(self, *, device, options, elements=None, precision=None):
         if not isinstance(options, Feedback):
@@ -652,10 +652,18 @@ class Function:
         )
         return FeedbackSession(session, Kernel(initial, self, dev, precision, False))
 
-    def prepare_native(self, *, device, elements=None):
-        return self._prepare(device, elements, Precision.exact(), Analytical(), True)
+    def prepare_native(self, *, device, elements=None, statics=None, params=None):
+        return self._prepare(
+            device,
+            elements,
+            Precision.exact(),
+            Analytical(),
+            True,
+            dict(statics or {}),
+            dict(params or {}),
+        )
 
-    def _prepare(self, dev, elements, precision, evaluation, native):
+    def _prepare(self, dev, elements, precision, evaluation, native, statics, params):
         dev = device(dev)
         elements = {
             name: (v.name if isinstance(v, Element) else element(v).name)
@@ -672,6 +680,8 @@ class Function:
             config,
             native,
             getattr(evaluation, "scope", None),
+            statics,
+            params,
         )
         return Kernel(inner, self, dev, precision, native)
 

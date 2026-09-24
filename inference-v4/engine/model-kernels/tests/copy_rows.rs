@@ -28,7 +28,7 @@ fn native_gather_preserves_requested_order_and_duplicates() {
         .concat(),
     )
     .unwrap();
-    let actual = gather_rows::native_for_device(&device)
+    let actual = gather_rows::native_for_device(&device, &seismic::NativeSpecialization::new())
         .unwrap()
         .call(gather_rows::Args {
             source: &source,
@@ -108,7 +108,7 @@ fn generated_surface_exposes_native_and_planned_dense_plane_bindings() {
         device: &seismic::Device,
         elements: copy_rows::Elements,
     ) -> Result<seismic::NativeKernel<copy_rows::Entry>, seismic::LoadError> {
-        copy_rows::native_for_device_with(device, elements)
+        copy_rows::native_for_device_with(device, elements, &seismic::NativeSpecialization::new())
     }
     let _ = (planned, native);
 }
@@ -154,6 +154,7 @@ fn native_metal_copies_indexed_u32_plane_rows_bit_exactly() {
         copy_rows::Elements {
             A: seismic::Element::u32(),
         },
+        &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(copy_rows::Args {
@@ -203,15 +204,19 @@ fn assert_native_two_byte_plane_copy(element: seismic::Element, source: &[u16], 
     let to = seismic::Tensor::from_host(&device, seismic::Element::i32(), &[2], &indices(&[0, 2]))
         .unwrap();
 
-    copy_rows::native_for_device_with(&device, copy_rows::Elements { A: element })
-        .unwrap()
-        .call(copy_rows::Args {
-            src: &src,
-            dst: &mut dst,
-            from: &from,
-            to: &to,
-        })
-        .unwrap();
+    copy_rows::native_for_device_with(
+        &device,
+        copy_rows::Elements { A: element },
+        &seismic::NativeSpecialization::new(),
+    )
+    .unwrap()
+    .call(copy_rows::Args {
+        src: &src,
+        dst: &mut dst,
+        from: &from,
+        to: &to,
+    })
+    .unwrap();
 
     let actual = dst
         .read_to_host()
@@ -280,6 +285,7 @@ fn native_copy_into_larger_aggregate_uses_independent_row_bounds() {
         copy_rows::Elements {
             A: seismic::Element::u32(),
         },
+        &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call_into(

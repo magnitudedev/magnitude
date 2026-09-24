@@ -42,8 +42,9 @@ fn qwen_vision_stem[M, C, P, H, L](pixels: &tensor[M, C, 2, P, P] f32,
     return result
 
 native qwen_vision_stem for metal from "metal/qwen_vision_stem.metal":
-    threadgroups (ceil_div(M * H, 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_vision_stem:
+        threadgroups (ceil_div(M * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 # Projector GGUF matrices are admitted in source-major layout. Keep that
@@ -147,8 +148,9 @@ fn qwen_vision_block[M, H, P, F](hidden: &tensor[M, H, 4, P] A,
     return result
 
 native qwen_vision_block for metal from "metal/qwen_vision_block.metal":
-    threadgroups (ceil_div(M * H * 4 * P, 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_vision_block:
+        threadgroups (ceil_div(M * H * 4 * P, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 fn qwen_vision_merger[M, G, H, D](hidden: &tensor[M * G, H] A,
@@ -167,8 +169,9 @@ fn qwen_vision_merger[M, G, H, D](hidden: &tensor[M * G, H] A,
     return result
 
 native qwen_vision_merger for metal from "metal/qwen_vision_merger.metal":
-    threadgroups (ceil_div(M * D, 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_vision_merger:
+        threadgroups (ceil_div(M * D, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 fn qwen_vision_feature_output[M, D](source: &tensor[M, D] A) -> tensor[M, D] f32:
@@ -179,5 +182,6 @@ fn qwen_vision_feature_output[M, D](source: &tensor[M, D] A) -> tensor[M, D] f32
     return result
 
 native qwen_vision_feature_output for metal from "metal/qwen_vision_feature_output.metal":
-    threadgroups (ceil_div(M * D, 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_vision_feature_output:
+        threadgroups (ceil_div(M * D, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)

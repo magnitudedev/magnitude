@@ -15,8 +15,9 @@ fn qwen_readout_rows[M, O, V, D](hidden: &tensor[M, D] f32,
     return features, logits
 
 native qwen_readout_rows for metal from "metal/qwen_readout_rows.metal":
-    threadgroups (ceil_div(O * (D + V), 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_readout_rows:
+        threadgroups (ceil_div(O * (D + V), 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 fn qwen_features_rows[M, O, D](hidden: &tensor[M, D] f32,
@@ -31,8 +32,9 @@ fn qwen_features_rows[M, O, D](hidden: &tensor[M, D] f32,
     return features
 
 native qwen_features_rows for metal from "metal/qwen_features_rows.metal":
-    threadgroups (ceil_div(O, 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_features_rows:
+        threadgroups (ceil_div(O, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 fn qwen_selected_rows[M, O, V, D, Sv](hidden: &tensor[M, D] f32,
@@ -57,5 +59,6 @@ fn qwen_selected_rows[M, O, V, D, Sv](hidden: &tensor[M, D] f32,
     return features, logits
 
 native qwen_selected_rows for metal from "metal/qwen_selected_rows.metal":
-    threadgroups (ceil_div(O * (D + Sv), 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_selected_rows:
+        threadgroups (ceil_div(O * (D + Sv), 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)

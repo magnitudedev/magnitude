@@ -615,29 +615,359 @@ pub struct NativeImplementation {
     pub declared_in: String,
     /// The native source path, relative to the declaring source file.
     pub source_path: String,
-    pub launch: NativeLaunch,
+    /// Entry dimensions whose values are fixed when the implementation is
+    /// prepared, in declaration order.
+    pub statics: Vec<String>,
+    /// Tuning parameters, in declaration order.
+    pub params: Vec<NativeParameter>,
+    /// Conjuncts restricting admissible parameter configurations.
+    pub constraints: Vec<NativeConstraint>,
+    /// Call-private scratch buffers, in ABI order.
+    pub scratch: Vec<NativeScratch>,
+    /// Ordered dispatches of one call. Never empty.
+    pub launches: Vec<NativeLaunch>,
 }
 
-/// Launch geometry of a native implementation over the entry's dimensions.
+/// A tuning parameter with its finite domain. `values[0]` is the default.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeParameter {
+    pub name: String,
+    /// The parameter changes the arithmetic order of a row's result. Other
+    /// parameters must produce bit-identical results across their values.
+    pub arithmetic: bool,
+    pub values: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeComparison {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
+/// `left op right` over static dimensions and parameters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeConstraint {
+    pub comparison: NativeComparison,
+    pub left: NativeNatExpr,
+    pub right: NativeNatExpr,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeScratch {
+    pub name: String,
+    pub bytes: NativeNatExpr,
+}
+
+/// One ordered dispatch of a native call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeLaunch {
+    /// Kernel function name in the native source.
+    pub kernel: String,
     /// Number of groups on each axis.
     pub groups: [NativeNatExpr; 3],
     /// Participants of one group on each axis.
     pub group_extent: [NativeNatExpr; 3],
+    /// Dynamic group-shared memory in bytes.
+    pub shared_bytes: NativeNatExpr,
 }
 
-/// Closed integer language used by native launch geometry.
+/// Closed integer language used by native declarations.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NativeNatExpr {
     Constant(u64),
     Dimension(String),
+    Parameter(String),
     Add(Box<Self>, Box<Self>),
     Sub(Box<Self>, Box<Self>),
     Mul(Box<Self>, Box<Self>),
     Div(Box<Self>, Box<Self>),
     Rem(Box<Self>, Box<Self>),
     CeilDiv(Box<Self>, Box<Self>),
+    Min(Box<Self>, Box<Self>),
+    Max(Box<Self>, Box<Self>),
+}
+
+/// A native expression could not be evaluated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeEvalError {
+    /// A name has no value in the evaluation environment.
+    Unbound(String),
+    /// Overflow, underflow, or division by zero.
+    Arithmetic,
+}
+
+impl std::fmt::Display for NativeEvalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unbound(name) => write!(f, "native expression name `{name}` has no value"),
+            Self::Arithmetic => {
+                f.write_str("native expression overflowed, underflowed, or divided by zero")
+            }
+        }
+    }
+}
+
+impl NativeNatExpr {
+    /// Evaluate with `dimension` and `parameter` supplying named values.
+    pub fn evaluate(
+        &self,
+        dimension: &impl Fn(&str) -> Option<u64>,
+        parameter: &impl Fn(&str) -> Option<u64>,
+    ) -> Result<u64, NativeEvalError> {
+        let binary = |left: &Self, right: &Self, operation: fn(u64, u64) -> Option<u64>| {
+            let left = left.evaluate(dimension, parameter)?;
+            let right = right.evaluate(dimension, parameter)?;
+            operation(left, right).ok_or(NativeEvalError::Arithmetic)
+        };
+        match self {
+            Self::Constant(value) => Ok(*value),
+            Self::Dimension(name) => {
+                dimension(name).ok_or_else(|| NativeEvalError::Unbound(name.clone()))
+            }
+            Self::Parameter(name) => {
+                parameter(name).ok_or_else(|| NativeEvalError::Unbound(name.clone()))
+            }
+            Self::Add(left, right) => binary(left, right, u64::checked_add),
+            Self::Sub(left, right) => binary(left, right, u64::checked_sub),
+            Self::Mul(left, right) => binary(left, right, u64::checked_mul),
+            Self::Div(left, right) => binary(left, right, u64::checked_div),
+            Self::Rem(left, right) => binary(left, right, u64::checked_rem),
+            Self::CeilDiv(left, right) => binary(left, right, |left, right| {
+                if right == 0 {
+                    None
+                } else {
+                    Some(left.div_ceil(right))
+                }
+            }),
+            Self::Min(left, right) => binary(left, right, |left, right| Some(left.min(right))),
+            Self::Max(left, right) => binary(left, right, |left, right| Some(left.max(right))),
+        }
+    }
+
+    /// Every dimension name the expression reads.
+    pub fn dimensions(&self, out: &mut Vec<String>) {
+        match self {
+            Self::Constant(_) | Self::Parameter(_) => {}
+            Self::Dimension(name) => {
+                if !out.contains(name) {
+                    out.push(name.clone());
+                }
+            }
+            Self::Add(left, right)
+            | Self::Sub(left, right)
+            | Self::Mul(left, right)
+            | Self::Div(left, right)
+            | Self::Rem(left, right)
+            | Self::CeilDiv(left, right)
+            | Self::Min(left, right)
+            | Self::Max(left, right) => {
+                left.dimensions(out);
+                right.dimensions(out);
+            }
+        }
+    }
+}
+
+impl NativeConstraint {
+    pub fn holds(
+        &self,
+        dimension: &impl Fn(&str) -> Option<u64>,
+        parameter: &impl Fn(&str) -> Option<u64>,
+    ) -> Result<bool, NativeEvalError> {
+        let left = self.left.evaluate(dimension, parameter)?;
+        let right = self.right.evaluate(dimension, parameter)?;
+        Ok(match self.comparison {
+            NativeComparison::Lt => left < right,
+            NativeComparison::Le => left <= right,
+            NativeComparison::Gt => left > right,
+            NativeComparison::Ge => left >= right,
+            NativeComparison::Eq => left == right,
+            NativeComparison::Ne => left != right,
+        })
+    }
+}
+
+/// One value for every static dimension and tuning parameter of a native
+/// implementation. It is the complete compile-time input of native formation
+/// beyond element bindings.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NativeSpecialization {
+    statics: std::collections::BTreeMap<String, u64>,
+    params: std::collections::BTreeMap<String, u64>,
+}
+
+impl NativeSpecialization {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Fix a static dimension.
+    pub fn with_static(mut self, name: impl Into<String>, value: u64) -> Self {
+        self.statics.insert(name.into(), value);
+        self
+    }
+    /// Choose a tuning parameter value.
+    pub fn with_param(mut self, name: impl Into<String>, value: u64) -> Self {
+        self.params.insert(name.into(), value);
+        self
+    }
+    pub fn statics(&self) -> &std::collections::BTreeMap<String, u64> {
+        &self.statics
+    }
+    pub fn params(&self) -> &std::collections::BTreeMap<String, u64> {
+        &self.params
+    }
+    pub fn static_value(&self, name: &str) -> Option<u64> {
+        self.statics.get(name).copied()
+    }
+    pub fn param(&self, name: &str) -> Option<u64> {
+        self.params.get(name).copied()
+    }
+}
+
+/// A specialization does not match its native implementation's declaration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeSpecializationError {
+    MissingStatic(String),
+    UnknownStatic(String),
+    MissingParameter(String),
+    UnknownParameter(String),
+    OutsideDomain { parameter: String, value: u64 },
+    /// The configuration violates a `where` conjunct.
+    Inadmissible { constraint: usize },
+    Evaluation(NativeEvalError),
+}
+
+impl std::fmt::Display for NativeSpecializationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingStatic(name) => write!(f, "static dimension `{name}` has no value"),
+            Self::UnknownStatic(name) => write!(f, "`{name}` is not a static dimension"),
+            Self::MissingParameter(name) => write!(f, "native parameter `{name}` has no value"),
+            Self::UnknownParameter(name) => write!(f, "`{name}` is not a native parameter"),
+            Self::OutsideDomain { parameter, value } => {
+                write!(f, "native parameter `{parameter}` does not admit {value}")
+            }
+            Self::Inadmissible { constraint } => {
+                write!(f, "configuration violates native `where` conjunct {constraint}")
+            }
+            Self::Evaluation(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for NativeSpecializationError {}
+
+impl NativeImplementation {
+    /// Check a complete specialization against the declaration.
+    pub fn validate(
+        &self,
+        specialization: &NativeSpecialization,
+    ) -> Result<(), NativeSpecializationError> {
+        for name in &self.statics {
+            if specialization.static_value(name).is_none() {
+                return Err(NativeSpecializationError::MissingStatic(name.clone()));
+            }
+        }
+        if let Some(name) = specialization
+            .statics()
+            .keys()
+            .find(|name| !self.statics.contains(name))
+        {
+            return Err(NativeSpecializationError::UnknownStatic(name.clone()));
+        }
+        for parameter in &self.params {
+            let value = specialization
+                .param(&parameter.name)
+                .ok_or_else(|| NativeSpecializationError::MissingParameter(parameter.name.clone()))?;
+            if !parameter.values.contains(&value) {
+                return Err(NativeSpecializationError::OutsideDomain {
+                    parameter: parameter.name.clone(),
+                    value,
+                });
+            }
+        }
+        if let Some(name) = specialization
+            .params()
+            .keys()
+            .find(|name| !self.params.iter().any(|parameter| &parameter.name == *name))
+        {
+            return Err(NativeSpecializationError::UnknownParameter(name.clone()));
+        }
+        let dimension = |name: &str| specialization.static_value(name);
+        let parameter = |name: &str| specialization.param(name);
+        for (ordinal, constraint) in self.constraints.iter().enumerate() {
+            if !constraint
+                .holds(&dimension, &parameter)
+                .map_err(NativeSpecializationError::Evaluation)?
+            {
+                return Err(NativeSpecializationError::Inadmissible {
+                    constraint: ordinal,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Every admissible specialization for the given static values: the
+    /// cartesian product of the parameter domains in declaration order,
+    /// filtered by the `where` conjuncts.
+    pub fn admissible(
+        &self,
+        statics: &NativeSpecialization,
+    ) -> Result<Vec<NativeSpecialization>, NativeSpecializationError> {
+        let mut base = NativeSpecialization::new();
+        for name in &self.statics {
+            let value = statics
+                .static_value(name)
+                .ok_or_else(|| NativeSpecializationError::MissingStatic(name.clone()))?;
+            base = base.with_static(name.clone(), value);
+        }
+        if let Some(name) = statics
+            .statics()
+            .keys()
+            .find(|name| !self.statics.contains(name))
+        {
+            return Err(NativeSpecializationError::UnknownStatic(name.clone()));
+        }
+        let mut configurations = vec![base];
+        for parameter in &self.params {
+            configurations = configurations
+                .into_iter()
+                .flat_map(|configuration| {
+                    parameter.values.iter().map(move |value| {
+                        configuration.clone().with_param(parameter.name.clone(), *value)
+                    })
+                })
+                .collect();
+        }
+        let mut admissible = Vec::with_capacity(configurations.len());
+        for configuration in configurations {
+            match self.validate(&configuration) {
+                Ok(()) => admissible.push(configuration),
+                Err(NativeSpecializationError::Inadmissible { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(admissible)
+    }
+
+    /// The configuration of declared defaults (`values[0]`) at the given
+    /// static values.
+    pub fn default_specialization(
+        &self,
+        statics: &NativeSpecialization,
+    ) -> Result<NativeSpecialization, NativeSpecializationError> {
+        let mut specialization = statics.clone();
+        for parameter in &self.params {
+            specialization = specialization.with_param(parameter.name.clone(), parameter.values[0]);
+        }
+        self.validate(&specialization)?;
+        Ok(specialization)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -821,7 +1151,7 @@ mod native_tests {
     #[test]
     fn native_implementation_attaches_to_the_portable_entry() {
         let module = check_source(source(
-            "native scale for metal from \"scale.metal\":\n    threadgroups (ceil_div(N, 256), 1, 1)\n    threads_per_threadgroup (256, 1, 1)\n",
+            "native scale for metal from \"scale.metal\":\n    launch scale:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n",
         ))
         .expect("native declaration should check");
         let entry = &module.entries()[0];
@@ -830,15 +1160,69 @@ mod native_tests {
             .expect("native implementation");
         assert_eq!(entry.dimensions, ["N"]);
         assert_eq!(native.source_path, "scale.metal");
+        assert_eq!(native.launches.len(), 1);
+        assert_eq!(native.launches[0].kernel, "scale");
         assert!(matches!(
-            native.launch.groups[0],
+            native.launches[0].groups[0],
             NativeNatExpr::CeilDiv(_, _)
+        ));
+        assert_eq!(native.launches[0].shared_bytes, NativeNatExpr::Constant(0));
+    }
+
+    const SPECIALIZED: &str = "native scale for cuda from \"scale.cu\":\n    static (N)\n    params (arithmetic PARTS in [1, 2, 4], WIDTH in [64, 128])\n    where PARTS * WIDTH <= N and WIDTH >= 64\n    scratch partials bytes (PARTS * N * 4)\n    launch scale_partial:\n        threadgroups (ceil_div(N, WIDTH), PARTS, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n        shared_bytes (max(WIDTH * 4, 256))\n    launch scale_merge:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (min(N, 256), 1, 1)\n";
+
+    #[test]
+    fn specialized_multi_launch_declaration_checks() {
+        let module = check_source(source(SPECIALIZED)).expect("specialized declaration checks");
+        let entry = &module.entries()[0];
+        let native = module
+            .native_implementation(entry.id, BackendName::Cuda)
+            .expect("cuda native implementation");
+        assert_eq!(native.statics, ["N"]);
+        assert_eq!(native.params.len(), 2);
+        assert!(native.params[0].arithmetic);
+        assert!(!native.params[1].arithmetic);
+        assert_eq!(native.params[1].values, [64, 128]);
+        assert_eq!(native.constraints.len(), 2);
+        assert_eq!(native.scratch[0].name, "partials");
+        assert_eq!(native.launches.len(), 2);
+        assert_eq!(native.launches[1].kernel, "scale_merge");
+    }
+
+    #[test]
+    fn native_domain_enumerates_admissible_configurations() {
+        let module = check_source(source(SPECIALIZED)).expect("specialized declaration checks");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Cuda)
+            .unwrap();
+        let statics = NativeSpecialization::new().with_static("N", 256);
+        let admissible = native.admissible(&statics).expect("statics are complete");
+        // PARTS * WIDTH <= 256 admits (1,64) (1,128) (2,64) (2,128) (4,64).
+        assert_eq!(admissible.len(), 5);
+        assert!(admissible
+            .iter()
+            .all(|configuration| configuration.static_value("N") == Some(256)));
+        let default = native.default_specialization(&statics).unwrap();
+        assert_eq!(default.param("PARTS"), Some(1));
+        assert_eq!(default.param("WIDTH"), Some(64));
+        let small = NativeSpecialization::new().with_static("N", 32);
+        assert!(matches!(
+            native.default_specialization(&small),
+            Err(NativeSpecializationError::Inadmissible { constraint: 0 })
+        ));
+        assert!(matches!(
+            native.validate(&default.clone().with_param("WIDTH", 96)),
+            Err(NativeSpecializationError::OutsideDomain { .. })
+        ));
+        assert!(matches!(
+            native.admissible(&NativeSpecialization::new()),
+            Err(NativeSpecializationError::MissingStatic(_))
         ));
     }
 
     #[test]
     fn duplicate_native_implementations_are_rejected() {
-        let declaration = "native scale for metal from \"scale.metal\":\n    threadgroups (1, 1, 1)\n    threads_per_threadgroup (1, 1, 1)\n";
+        let declaration = "native scale for metal from \"scale.metal\":\n    launch scale:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
         let error = check_source(source(&format!("{declaration}\n{declaration}")))
             .expect_err("duplicate implementation must fail");
         assert!(error
@@ -848,23 +1232,48 @@ mod native_tests {
 
     #[test]
     fn native_implementation_rejects_unknown_contract_facts() {
+        let launch = "    launch scale:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
         let cases = [
             (
-                "native missing for metal from \"scale.metal\":\n    threadgroups (1, 1, 1)\n    threads_per_threadgroup (1, 1, 1)\n",
+                format!("native missing for metal from \"scale.metal\":\n{launch}"),
                 "unknown portable function `missing`",
             ),
             (
-                "native scale for metal from \"scale.metal\":\n    threadgroups (ceil_div(M, 256), 1, 1)\n    threads_per_threadgroup (256, 1, 1)\n",
-                "unknown dimension `M`",
+                "native scale for metal from \"scale.metal\":\n    launch scale:\n        threadgroups (ceil_div(M, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n".to_owned(),
+                "references `M`, which is neither a dimension nor a native parameter",
             ),
             (
-                "native scale for cpu from \"scale.c\":\n    threadgroups (1, 1, 1)\n    threads_per_threadgroup (1, 1, 1)\n",
-                "backend `cpu` has no direct native route",
+                format!("native scale for tpu from \"scale.c\":\n{launch}"),
+                "unknown native backend `tpu`",
+            ),
+            (
+                format!("native scale for metal from \"scale.metal\":\n    static (K)\n{launch}"),
+                "`K` is not a shape dimension of `scale`",
+            ),
+            (
+                format!("native scale for metal from \"scale.metal\":\n    params (N in [1])\n{launch}"),
+                "native parameter `N` shadows a dimension",
+            ),
+            (
+                format!("native scale for metal from \"scale.metal\":\n    params (P in [1, 1])\n{launch}"),
+                "lists 1 twice",
+            ),
+            (
+                format!("native scale for metal from \"scale.metal\":\n    params (P in [1])\n    where P <= N\n{launch}"),
+                "reads dimension `N`, which is not static",
+            ),
+            (
+                format!("native scale for metal from \"scale.metal\":\n    params (P in [1])\n    where P + 1\n{launch}"),
+                "conjunct is a comparison",
+            ),
+            (
+                "native scale for metal from \"scale.metal\":\n    static (N)\n".to_owned(),
+                "expected `launch <kernel>:`",
             ),
         ];
 
         for (declaration, expected) in cases {
-            let error = check_source(source(declaration))
+            let error = check_source(source(&declaration))
                 .expect_err("invalid native declaration must fail checking");
             assert!(
                 error.to_string().contains(expected),

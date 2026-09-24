@@ -73,14 +73,63 @@ impl Printer {
                     n.function.name, n.target.name, escaped
                 );
                 self.level += 1;
-                self.indent();
-                self.out.push_str("threadgroups (");
-                self.list(&n.threadgroups, |p, expr| p.expr(expr, 0));
-                self.out.push_str(")\n");
-                self.indent();
-                self.out.push_str("threads_per_threadgroup (");
-                self.list(&n.threads_per_threadgroup, |p, expr| p.expr(expr, 0));
-                self.out.push_str(")\n");
+                if !n.statics.is_empty() {
+                    self.indent();
+                    self.out.push_str("static (");
+                    self.names(&n.statics);
+                    self.out.push_str(")\n");
+                }
+                if !n.params.is_empty() {
+                    self.indent();
+                    self.out.push_str("params (");
+                    self.list(&n.params, |p, param| {
+                        if param.arithmetic {
+                            p.out.push_str("arithmetic ");
+                        }
+                        let values = param
+                            .values
+                            .iter()
+                            .map(u64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let _ = write!(p.out, "{} in [{values}]", param.name.name);
+                    });
+                    self.out.push_str(")\n");
+                }
+                if !n.constraints.is_empty() {
+                    self.indent();
+                    for (i, constraint) in n.constraints.iter().enumerate() {
+                        self.out.push_str(if i == 0 { "where " } else { " and " });
+                        self.expr(constraint, binary_bp(BinaryOp::And));
+                    }
+                    self.out.push('\n');
+                }
+                for scratch in &n.scratch {
+                    self.indent();
+                    let _ = write!(self.out, "scratch {} bytes (", scratch.name.name);
+                    self.expr(&scratch.bytes, 0);
+                    self.out.push_str(")\n");
+                }
+                for launch in &n.launches {
+                    self.indent();
+                    let _ = writeln!(self.out, "launch {}:", launch.kernel.name);
+                    self.level += 1;
+                    self.indent();
+                    self.out.push_str("threadgroups (");
+                    self.list(&launch.threadgroups, |p, expr| p.expr(expr, 0));
+                    self.out.push_str(")\n");
+                    self.indent();
+                    self.out.push_str("threads_per_threadgroup (");
+                    self.list(&launch.threads_per_threadgroup, |p, expr| p.expr(expr, 0));
+                    self.out.push_str(")\n");
+                    if let Some(bytes) = &launch.shared_bytes {
+                        self.indent();
+                        self.out.push_str("shared_bytes (");
+                        self.expr(bytes, 0);
+                        self.out.push_str(")\n");
+                    }
+                    self.level -= 1;
+                }
                 self.level -= 1;
             }
         }

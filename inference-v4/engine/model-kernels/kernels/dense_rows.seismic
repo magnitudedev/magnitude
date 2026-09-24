@@ -21,8 +21,9 @@ fn qwen_dense_rows[M, H, F](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
     return result
 
 native qwen_dense_rows for metal from "metal/qwen_dense_rows.metal":
-    threadgroups (ceil_div(M * H, 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_dense_rows:
+        threadgroups (ceil_div(M * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 # The final target block only advances rows with feature/logit demand.
@@ -51,8 +52,9 @@ fn qwen_dense_rows_demanded[M, O, H, F](residual: &tensor[M, H] f32,
     return result
 
 native qwen_dense_rows_demanded for metal from "metal/qwen_dense_rows_demanded.metal":
-    threadgroups (ceil_div(O * H, 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_dense_rows_demanded:
+        threadgroups (ceil_div(O * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 # Native dense execution stages the activation product because it is shared
@@ -74,8 +76,9 @@ fn qwen_dense_expand[M, H, F](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
     return product
 
 native qwen_dense_expand for metal from "metal/qwen_dense_expand.metal":
-    threadgroups (ceil_div(M * F, 8), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_dense_expand:
+        threadgroups (ceil_div(M * F, 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 fn qwen_dense_output[M, H, F](residual: &tensor[M, H] f32,
@@ -88,8 +91,9 @@ fn qwen_dense_output[M, H, F](residual: &tensor[M, H] f32,
     return result
 
 native qwen_dense_output for metal from "metal/qwen_dense_output.metal":
-    threadgroups (ceil_div(M * H, 8), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_dense_output:
+        threadgroups (ceil_div(M * H, 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 fn qwen_dense_expand_demanded[M, O, H, F](residual: &tensor[M, H] f32,
@@ -113,8 +117,9 @@ fn qwen_dense_expand_demanded[M, O, H, F](residual: &tensor[M, H] f32,
     return product
 
 native qwen_dense_expand_demanded for metal from "metal/qwen_dense_expand_demanded.metal":
-    threadgroups (ceil_div(O * F, 8), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_dense_expand_demanded:
+        threadgroups (ceil_div(O * F, 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 fn qwen_dense_output_demanded[M, O, H, F](residual: &tensor[M, H] f32,
@@ -129,5 +134,6 @@ fn qwen_dense_output_demanded[M, O, H, F](residual: &tensor[M, H] f32,
     return result
 
 native qwen_dense_output_demanded for metal from "metal/qwen_dense_output_demanded.metal":
-    threadgroups (ceil_div(O * H, 8), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_dense_output_demanded:
+        threadgroups (ceil_div(O * H, 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)

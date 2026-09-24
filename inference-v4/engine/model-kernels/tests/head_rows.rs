@@ -27,6 +27,7 @@ fn native_head_logits_matches_host_with_bf16_features_and_q8_weights() {
             E: external,
             U: resident,
         },
+        &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(repack_weight::Args { source: &source })
@@ -50,6 +51,7 @@ fn native_head_logits_matches_host_with_bf16_features_and_q8_weights() {
             A: seismic::Element::bf16(),
             OW: resident,
         },
+        &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(head_logits_rows::Args {
@@ -149,6 +151,7 @@ fn native_head_logits_decodes_q4k_and_q5k_affine_packets() {
                 A: seismic::Element::f16(),
                 OW: resident,
             },
+            &seismic::NativeSpecialization::new(),
         )
         .unwrap()
         .call(head_logits_rows::Args {

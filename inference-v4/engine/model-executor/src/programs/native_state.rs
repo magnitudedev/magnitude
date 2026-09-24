@@ -311,7 +311,7 @@ impl PreparedStateCopyGraphs {
         active.write_input(&variant.to, to).map_err(device)?;
         active
             .attach(bindings, outputs)
-            .and_then(|ready| ready.run())
+            .and_then(super::run_graph)
             .map_err(device)
     }
 

@@ -54,6 +54,53 @@ impl Executor {
         crate::profile::profile_for_workers(&mut workers, device)
     }
 
+    /// Run `items` independent work items of an authored native launch on
+    /// the worker pool and return after all complete. Each item receives its
+    /// linear index and a private `shared_bytes` buffer.
+    pub fn run_native_items(
+        &self,
+        items: u64,
+        shared_bytes: u64,
+        body: &(dyn Fn(u64, &mut [u8]) + Sync),
+    ) -> Result<(), ExecutionError> {
+        unsafe extern "C-unwind" fn item(
+            frame: *const LaunchFrame,
+            _barrier: *const crate::workers::TeamBarrier,
+            index: u64,
+            _local: u64,
+            shared: *mut u8,
+            _participant: *mut u8,
+            _register: *mut u8,
+        ) {
+            // SAFETY: `run_native_items` builds the frame from a live body
+            // reference and a shared-byte count, and the pool grows each
+            // team's workgroup scratch to that count before running items.
+            unsafe {
+                let frame = &*frame;
+                let body = &*(frame.buffers as *const &(dyn Fn(u64, &mut [u8]) + Sync));
+                let bytes = *frame.words as usize;
+                let shared = if bytes == 0 {
+                    &mut [][..]
+                } else {
+                    std::slice::from_raw_parts_mut(shared, bytes)
+                };
+                body(index, shared);
+            }
+        }
+        let body: &(dyn Fn(u64, &mut [u8]) + Sync) = body;
+        let words = [shared_bytes];
+        let frame = LaunchFrame {
+            buffers: (&body as *const &(dyn Fn(u64, &mut [u8]) + Sync)).cast(),
+            words: words.as_ptr(),
+            results: std::ptr::null_mut(),
+        };
+        self.workers
+            .lock()
+            .expect("CPU worker-pool lock poisoned")
+            .run(item, &frame, items, 1, shared_bytes, 0, 0)
+            .map_err(launch_error)
+    }
+
     pub(crate) fn from_workers(workers: Workers) -> Self {
         Self {
             workers: Arc::new(Mutex::new(workers)),

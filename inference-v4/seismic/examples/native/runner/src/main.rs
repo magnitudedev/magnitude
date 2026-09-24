@@ -2,6 +2,15 @@ mod kernels {
     include!(concat!(env!("OUT_DIR"), "/kernels.rs"));
 }
 
+/// Submit a ready graph run and wait for its outcome.
+fn run(
+    ready: seismic::ReadyNativeGraphRun<'_>,
+) -> Result<seismic::NativeGraphOutputs, seismic::CallError> {
+    let (outputs, completion) = ready.submit()?;
+    completion.wait()?;
+    Ok(outputs)
+}
+
 fn bytes(values: &[f32]) -> Vec<u8> {
     values
         .iter()
@@ -20,11 +29,15 @@ fn verify_polymorphic_native(device: &seismic::Device) -> Result<(), Box<dyn std
     let f16 = seismic::Element::f16();
     let f16_input = seismic::Tensor::from_host(device, f16, &[1], &0x4200u16.to_le_bytes())?;
     let mut f16_result = seismic::Tensor::zeros(device, seismic::Element::f32(), &[1])?;
-    kernels::read_first::native_for_device_with(device, kernels::read_first::Elements { E: f16 })?
-        .call(kernels::read_first::Args {
-            x: &f16_input,
-            result: &mut f16_result,
-        })?;
+    kernels::read_first::native_for_device_with(
+        device,
+        kernels::read_first::Elements { E: f16 },
+        &seismic::NativeSpecialization::new(),
+    )?
+    .call(kernels::read_first::Args {
+        x: &f16_input,
+        result: &mut f16_result,
+    })?;
     assert_eq!(read_f32(&f16_result)?, 3.0);
 
     let q8g32 = seismic::Element::named("q8g32").expect("q8g32 representation");
@@ -36,6 +49,7 @@ fn verify_polymorphic_native(device: &seismic::Device) -> Result<(), Box<dyn std
     kernels::read_first::native_for_device_with(
         device,
         kernels::read_first::Elements { E: q8g32 },
+        &seismic::NativeSpecialization::new(),
     )?
     .call(kernels::read_first::Args {
         x: &q8g32_input,
@@ -46,7 +60,8 @@ fn verify_polymorphic_native(device: &seismic::Device) -> Result<(), Box<dyn std
 }
 
 fn verify_native_graph(device: &seismic::Device) -> Result<(), Box<dyn std::error::Error>> {
-    let kernel = kernels::add_owned_f32::native_for_device(device)?;
+    let kernel =
+        kernels::add_owned_f32::native_for_device(device, &seismic::NativeSpecialization::new())?;
     let mut graph = device.native_graph();
     let x_port = graph.port(seismic::Element::f32(), &[2, 2])?;
     let y_port = graph.port(seismic::Element::f32(), &[2, 2])?;
@@ -94,7 +109,7 @@ fn verify_native_graph(device: &seismic::Device) -> Result<(), Box<dyn std::erro
     ));
     let mut bindings = bound_plan.bindings();
     bindings.set(&y_port, &y)?;
-    let outputs = slot.attach(bindings, plan.new_outputs()?)?.run()?;
+    let outputs = run(slot.attach(bindings, plan.new_outputs()?)?)?;
     drop(slot);
     let actual = outputs
         .exported(&final_result.value)
@@ -110,7 +125,8 @@ fn verify_native_graph(device: &seismic::Device) -> Result<(), Box<dyn std::erro
         ))
     ));
 
-    let scale = kernels::scale_f32::native_for_device(device)?;
+    let scale =
+        kernels::scale_f32::native_for_device(device, &seismic::NativeSpecialization::new())?;
     // The two stages use one prepared kernel with different scalar ABI words.
     // A shared mutable words buffer would make both stages use the last factor.
     let mut repeated = device.native_graph();
@@ -137,9 +153,8 @@ fn verify_native_graph(device: &seismic::Device) -> Result<(), Box<dyn std::erro
     let repeated_plan = repeated.seal()?;
     let mut repeated_slot = repeated_plan.new_slot()?;
     repeated_slot.write_input(&repeated_input, &bytes(&[1.0, 2.0]))?;
-    let repeated_outputs = repeated_slot
-        .attach(repeated_plan.bindings(), repeated_plan.new_outputs()?)?
-        .run()?;
+    let repeated_outputs =
+        run(repeated_slot.attach(repeated_plan.bindings(), repeated_plan.new_outputs()?)?)?;
     assert_eq!(
         repeated_outputs
             .exported(tripled.tensor())
@@ -185,12 +200,10 @@ fn verify_native_graph(device: &seismic::Device) -> Result<(), Box<dyn std::erro
     let mut family_slot = family.new_slot()?;
     let mut active = family_slot.activate(&owned_plan)?;
     active.write_input(&input, &bytes(&[2.0, 3.0, 4.0, 5.0]))?;
-    let owned_outputs = active
-        .attach(
-            owned_plan.bindings(),
-            family.new_output_slot()?.activate(&owned_plan)?,
-        )?
-        .run()?;
+    let owned_outputs = run(active.attach(
+        owned_plan.bindings(),
+        family.new_output_slot()?.activate(&owned_plan)?,
+    )?)?;
     drop(active);
     let retained = owned_outputs
         .exported(output.tensor())
@@ -200,9 +213,8 @@ fn verify_native_graph(device: &seismic::Device) -> Result<(), Box<dyn std::erro
     let recycled = owned_outputs.recycle()?;
     let mut small_active = family_slot.activate(&small_plan)?;
     small_active.write_input(&small_input, &bytes(&[3.0, 7.0]))?;
-    let small_outputs = small_active
-        .attach(small_plan.bindings(), recycled.activate(&small_plan)?)?
-        .run()?;
+    let small_outputs =
+        run(small_active.attach(small_plan.bindings(), recycled.activate(&small_plan)?)?)?;
     let small_result = small_outputs
         .exported(small_output.tensor())
         .expect("small class export");
@@ -244,12 +256,10 @@ fn verify_native_graph(device: &seismic::Device) -> Result<(), Box<dyn std::erro
     let mut borrowed_local = scratch_active.local(&prewritten).expect("checked local");
     borrowed_local.write_from_host(&bytes(&[2.0, 5.0]))?;
     scratch_active.write_input(&scratch_input, &bytes(&[100.0, 100.0]))?;
-    let scratch_outputs = scratch_active
-        .attach(
-            scratch_plan.bindings(),
-            scratch_family.new_output_slot()?.activate(&scratch_plan)?,
-        )?
-        .run()?;
+    let scratch_outputs = run(scratch_active.attach(
+        scratch_plan.bindings(),
+        scratch_family.new_output_slot()?.activate(&scratch_plan)?,
+    )?)?;
     let result = scratch_outputs
         .exported(scratch_result.tensor())
         .expect("scratch result");
@@ -299,9 +309,8 @@ fn verify_native_graph(device: &seismic::Device) -> Result<(), Box<dyn std::erro
     let mut reshape_slot = reshape_plan.new_slot()?;
     reshape_slot.write_input(&first, &bytes(&[1.0, 2.0, 3.0, 4.0]))?;
     reshape_slot.write_input(&second, &bytes(&[10.0, 20.0, 30.0, 40.0]))?;
-    let reshaped_outputs = reshape_slot
-        .attach(reshape_plan.bindings(), reshape_plan.new_outputs()?)?
-        .run()?;
+    let reshaped_outputs =
+        run(reshape_slot.attach(reshape_plan.bindings(), reshape_plan.new_outputs()?)?)?;
     assert_eq!(
         reshaped_outputs
             .exported(&final_reshape.value)
@@ -366,8 +375,8 @@ fn verify_native_graph(device: &seismic::Device) -> Result<(), Box<dyn std::erro
     overlay_bindings.set_reserved_export(&overlay_destination, &reserved, entry_output.tensor())?;
     let mut overlay_slot = overlay_plan.new_slot()?;
     let ready_overlay = overlay_slot.attach(overlay_bindings, overlay_plan.new_outputs()?)?;
-    let entry_outputs = entry_slot.attach(entry_plan.bindings(), reserved)?.run()?;
-    ready_overlay.run()?;
+    let entry_outputs = run(entry_slot.attach(entry_plan.bindings(), reserved)?)?;
+    run(ready_overlay)?;
     assert_eq!(
         entry_outputs
             .exported(entry_output.tensor())
@@ -395,7 +404,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let mut result = seismic::Tensor::zeros(&device, seismic::Element::f32(), &[2, 2])?;
 
-    let kernel = kernels::add_f32::native_for_device(&device)?;
+    let kernel =
+        kernels::add_f32::native_for_device(&device, &seismic::NativeSpecialization::new())?;
     let mut wrong_shape = seismic::Tensor::zeros(&device, seismic::Element::f32(), &[4])?;
     assert!(matches!(
         kernel.call(kernels::add_f32::Args {
@@ -414,19 +424,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let actual = result.read_to_host()?;
     assert_eq!(actual, bytes(&[11.0, 22.0, 33.0, 44.0]));
 
-    let owned = kernels::add_owned_f32::native_for_device(&device)?
-        .call(kernels::add_owned_f32::Args { x: &x, y: &y })?;
+    let owned =
+        kernels::add_owned_f32::native_for_device(&device, &seismic::NativeSpecialization::new())?
+            .call(kernels::add_owned_f32::Args { x: &x, y: &y })?;
     assert_eq!(
         owned.value.read_to_host()?,
         bytes(&[11.0, 22.0, 33.0, 44.0])
     );
 
     let mut scaled = seismic::Tensor::zeros(&device, seismic::Element::f32(), &[2, 2])?;
-    kernels::scale_f32::native_for_device(&device)?.call(kernels::scale_f32::Args {
-        x: &x,
-        factor: 2.5,
-        result: &mut scaled,
-    })?;
+    kernels::scale_f32::native_for_device(&device, &seismic::NativeSpecialization::new())?.call(
+        kernels::scale_f32::Args {
+            x: &x,
+            factor: 2.5,
+            result: &mut scaled,
+        },
+    )?;
     assert_eq!(scaled.read_to_host()?, bytes(&[2.5, 5.0, 7.5, 10.0]));
     verify_polymorphic_native(&device)?;
     verify_native_graph(&device)?;

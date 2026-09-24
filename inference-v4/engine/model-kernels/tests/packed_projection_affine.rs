@@ -126,6 +126,7 @@ fn native_projection_stages_decode_q4k_and_q5k_affine_packets() {
                 VW: element,
                 A: Element::f32(),
             },
+            &seismic::NativeSpecialization::new(),
         )
         .unwrap()
         .call(qwen_attention_project::Args {
@@ -165,6 +166,7 @@ fn native_projection_stages_decode_q4k_and_q5k_affine_packets() {
                 BW: element,
                 A: Element::f32(),
             },
+            &seismic::NativeSpecialization::new(),
         )
         .unwrap()
         .call(qwen_recurrent_project::Args {
@@ -195,6 +197,7 @@ fn native_projection_stages_decode_q4k_and_q5k_affine_packets() {
                 OW: element,
                 A: Element::f32(),
             },
+            &seismic::NativeSpecialization::new(),
         )
         .unwrap()
         .call(qwen_attention_output::Args {
@@ -221,6 +224,7 @@ fn native_projection_stages_decode_q4k_and_q5k_affine_packets() {
                 OW: element,
                 A: Element::f32(),
             },
+            &seismic::NativeSpecialization::new(),
         )
         .unwrap()
         .call(qwen_recurrent_output::Args {

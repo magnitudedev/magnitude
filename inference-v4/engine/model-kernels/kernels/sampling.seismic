@@ -66,9 +66,11 @@ fn shape_rows[Sx, V, Hn](logits: &tensor[Sx, V] f32,
                     out[row, token] = -inf
 
 native shape_rows for metal from "metal/shape_rows.metal":
-    threadgroups (Sx, 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch shape_rows:
+        threadgroups (Sx, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 native sample_rows for metal from "metal/sample_rows.metal":
-    threadgroups (M, 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch sample_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)

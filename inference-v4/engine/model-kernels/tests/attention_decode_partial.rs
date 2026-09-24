@@ -84,6 +84,7 @@ fn decode_attention_merges_gqa_masked_fresh_and_extreme_partial_states() {
     let kernel = qwen_attention_attend::native_for_device_with(
         &device,
         qwen_attention_attend::Elements { A: Element::f32() },
+        &seismic::NativeSpecialization::new(),
     )
     .unwrap();
 

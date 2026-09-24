@@ -2,7 +2,7 @@
   "name": "seismic-language",
   "displayName": "Seismic",
   "description": "Local syntax highlighting for Seismic source files.",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "publisher": "seismic-local",
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Programming Languages"],

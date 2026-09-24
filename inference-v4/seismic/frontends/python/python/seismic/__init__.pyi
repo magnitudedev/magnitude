@@ -173,6 +173,8 @@ class Function:
         *,
         device: str | Device,
         elements: Mapping[str, Element | str] | None = None,
+        statics: Mapping[str, int] | None = None,
+        params: Mapping[str, int] | None = None,
     ) -> Kernel: ...
     def start_feedback(
         self,

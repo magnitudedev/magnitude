@@ -84,6 +84,7 @@ fn metal_projection_tiles_match_independent_nine_row_host_matmuls() {
             VW: f32e,
             A: f32e,
         },
+        &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_attention_project::Args {
@@ -134,6 +135,7 @@ fn metal_projection_tiles_match_independent_nine_row_host_matmuls() {
     let attention_output = qwen_attention_output::native_for_device_with(
         &device,
         qwen_attention_output::Elements { OW: f32e, A: f32e },
+        &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_attention_output::Args {
@@ -179,6 +181,7 @@ fn metal_projection_tiles_match_independent_nine_row_host_matmuls() {
             BW: f32e,
             A: f32e,
         },
+        &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_recurrent_project::Args {
@@ -207,6 +210,7 @@ fn metal_projection_tiles_match_independent_nine_row_host_matmuls() {
     let recurrent_output = qwen_recurrent_output::native_for_device_with(
         &device,
         qwen_recurrent_output::Elements { OW: f32e, A: f32e },
+        &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(qwen_recurrent_output::Args {

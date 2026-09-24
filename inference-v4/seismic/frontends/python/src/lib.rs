@@ -514,6 +514,8 @@ impl Function {
         config: &str,
         native: bool,
         scope: Option<&Scope>,
+        statics: BTreeMap<String, u64>,
+        params: BTreeMap<String, u64>,
     ) -> PyResult<Kernel> {
         let elements = elements
             .into_iter()
@@ -529,7 +531,16 @@ impl Function {
         let inner = py
             .detach(|| {
                 if native {
-                    self.inner.prepare_native(&device, elements)
+                    let specialization = statics.into_iter().fold(
+                        seismic::NativeSpecialization::new(),
+                        |specialization, (name, value)| specialization.with_static(name, value),
+                    );
+                    let specialization = params
+                        .into_iter()
+                        .fold(specialization, |specialization, (name, value)| {
+                            specialization.with_param(name, value)
+                        });
+                    self.inner.prepare_native(&device, elements, specialization)
                 } else {
                     self.inner.prepare(&device, elements, options)
                 }

@@ -24,6 +24,17 @@ use crate::{
     VisionLaunchCore,
 };
 
+/// Submit one ready native graph run and wait for its outcome. Programs
+/// that chain several runs submit them without waiting instead and check
+/// every completion once all are queued.
+pub(crate) fn run_graph(
+    ready: seismic::ReadyNativeGraphRun<'_>,
+) -> Result<seismic::NativeGraphOutputs, seismic::CallError> {
+    let (outputs, completion) = ready.submit()?;
+    completion.wait()?;
+    Ok(outputs)
+}
+
 pub type CompletedTargetWork = CompletedWork<TargetLaunchCore, Option<TargetReadoutGraphResult>>;
 pub type CompletedHeadWork = CompletedWork<HeadLaunchCore, GraphOutputTensor>;
 pub struct ProjectGraphOutput {

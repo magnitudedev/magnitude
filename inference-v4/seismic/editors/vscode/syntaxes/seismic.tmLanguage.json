@@ -3,46 +3,163 @@
   "name": "Seismic",
   "scopeName": "source.seismic",
   "patterns": [
-    { "name": "comment.line.number-sign.seismic", "match": "#.*$" },
+    {
+      "name": "comment.line.number-sign.seismic",
+      "match": "#.*$"
+    },
+    {
+      "name": "meta.native.seismic",
+      "begin": "^(native)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+(for)\\s+(cpu|cuda|metal)\\s+(from)\\b",
+      "beginCaptures": {
+        "1": {
+          "name": "storage.type.native.seismic"
+        },
+        "2": {
+          "name": "entity.name.function.seismic"
+        },
+        "3": {
+          "name": "keyword.control.seismic"
+        },
+        "4": {
+          "name": "support.constant.backend.seismic"
+        },
+        "5": {
+          "name": "keyword.control.seismic"
+        }
+      },
+      "end": "^(?=\\S)",
+      "patterns": [
+        {
+          "match": "^\\s+(launch)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.control.native.seismic"
+            },
+            "2": {
+              "name": "entity.name.function.kernel.seismic"
+            }
+          }
+        },
+        {
+          "match": "^\\s+(scratch)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+(bytes)\\b",
+          "captures": {
+            "1": {
+              "name": "keyword.control.native.seismic"
+            },
+            "2": {
+              "name": "variable.other.scratch.seismic"
+            },
+            "3": {
+              "name": "keyword.control.native.seismic"
+            }
+          }
+        },
+        {
+          "name": "keyword.control.native.seismic",
+          "match": "^\\s+(?:static|params|threadgroups|threads_per_threadgroup|shared_bytes)\\b"
+        },
+        {
+          "name": "storage.modifier.arithmetic.seismic",
+          "match": "\\barithmetic\\b(?=\\s+[A-Za-z_])"
+        },
+        {
+          "include": "$self"
+        }
+      ]
+    },
+    {
+      "name": "string.quoted.double.seismic",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.seismic",
+          "match": "\\\\."
+        }
+      ]
+    },
     {
       "match": "\\b(fn|lower)\\s+([A-Za-z_][A-Za-z0-9_]*)",
       "captures": {
-        "1": { "name": "storage.type.function.seismic" },
-        "2": { "name": "entity.name.function.seismic" }
+        "1": {
+          "name": "storage.type.function.seismic"
+        },
+        "2": {
+          "name": "entity.name.function.seismic"
+        }
       }
     },
     {
       "name": "keyword.control.seismic",
-      "match": "\\b(?:fn|lower|requires|where|for|in|if|else|let|mut|parallel|return)\\b"
+      "match": "\\b(?:fn|lower|native|requires|where|for|in|if|else|let|mut|parallel|return)\\b"
     },
     {
       "match": "(&)(?=\\s*(?:mut\\s+)?tensor\\b)",
       "captures": {
-        "1": { "name": "storage.modifier.reference.seismic" }
+        "1": {
+          "name": "storage.modifier.reference.seismic"
+        }
       }
     },
-    { "name": "keyword.operator.word.seismic", "match": "\\b(?:and|or|not)\\b" },
-    { "name": "constant.language.seismic", "match": "\\b(?:true|false|inf)\\b" },
+    {
+      "name": "keyword.operator.word.seismic",
+      "match": "\\b(?:and|or|not)\\b"
+    },
+    {
+      "name": "constant.language.seismic",
+      "match": "\\b(?:true|false|inf)\\b"
+    },
     {
       "match": "\\b(cuda|metal)(\\.)([A-Za-z_][A-Za-z0-9_]*)(?:(\\.)([A-Za-z_][A-Za-z0-9_]*))?\\b",
       "captures": {
-        "1": { "name": "support.type.backend.seismic" },
-        "2": { "name": "punctuation.accessor.seismic" },
-        "3": { "name": "support.class.capability.seismic" },
-        "4": { "name": "punctuation.accessor.seismic" },
-        "5": { "name": "support.function.intrinsic.seismic" }
+        "1": {
+          "name": "support.type.backend.seismic"
+        },
+        "2": {
+          "name": "punctuation.accessor.seismic"
+        },
+        "3": {
+          "name": "support.class.capability.seismic"
+        },
+        "4": {
+          "name": "punctuation.accessor.seismic"
+        },
+        "5": {
+          "name": "support.function.intrinsic.seismic"
+        }
       }
     },
-    { "name": "support.constant.backend.seismic", "match": "(?<=\\bfor\\s)(?:cpu|cuda|metal)\\b" },
+    {
+      "name": "support.constant.backend.seismic",
+      "match": "(?<=\\bfor\\s)(?:cpu|cuda|metal)\\b"
+    },
     {
       "name": "storage.type.seismic",
       "match": "\\b(?:tensor|index|range|void|f32|tf32|bf16|f16|fp8_e4m3|fp8_e5m2|fp6_e2m3|fp6_e3m2|fp4_e2m1|i32|u32|bool)\\b"
     },
-    { "name": "entity.name.type.parameter.seismic", "match": "\\b[A-Z][A-Za-z0-9_]*\\b" },
-    { "name": "constant.numeric.seismic", "match": "\\b(?:0[xX][0-9a-fA-F_]+|[0-9][0-9_]*(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)\\b" },
-    { "name": "entity.name.function.call.seismic", "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*\\()" },
-    { "name": "keyword.operator.seismic", "match": "(?:->|\\.\\.|<<|>>|==|!=|<=|>=|\\+=|-=|\\*=|[+*/%&|^~<>=-])" },
-    { "name": "punctuation.section.brackets.seismic", "match": "[\\[\\]()]" },
-    { "name": "punctuation.separator.seismic", "match": "[:,;.]" }
+    {
+      "name": "entity.name.type.parameter.seismic",
+      "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+    },
+    {
+      "name": "constant.numeric.seismic",
+      "match": "\\b(?:0[xX][0-9a-fA-F_]+|[0-9][0-9_]*(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)\\b"
+    },
+    {
+      "name": "entity.name.function.call.seismic",
+      "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*\\()"
+    },
+    {
+      "name": "keyword.operator.seismic",
+      "match": "(?:->|\\.\\.|<<|>>|==|!=|<=|>=|\\+=|-=|\\*=|[+*/%&|^~<>=-])"
+    },
+    {
+      "name": "punctuation.section.brackets.seismic",
+      "match": "[\\[\\]()]"
+    },
+    {
+      "name": "punctuation.separator.seismic",
+      "match": "[:,;.]"
+    }
   ]
 }

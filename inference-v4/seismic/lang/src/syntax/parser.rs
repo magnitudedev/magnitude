@@ -305,31 +305,149 @@ impl Parser {
             }
         };
         self.expect_op(Op::Colon)?;
-        self.expect_newline()?;
-        if !matches!(self.peek(), Tok::Indent) {
-            return Err(self.error("expected an indented native declaration body".into()));
-        }
-        self.bump();
-        let threadgroups = self.native_launch_property("threadgroups")?;
-        self.expect_newline()?;
-        let threads_per_threadgroup = self.native_launch_property("threads_per_threadgroup")?;
-        self.expect_newline()?;
-        if !matches!(self.peek(), Tok::Dedent | Tok::Eof) {
-            return Err(self.error(
-                "a native declaration contains exactly `threadgroups` and `threads_per_threadgroup`"
-                    .into(),
-            ));
-        }
-        if matches!(self.peek(), Tok::Dedent) {
+        self.native_block_start("native declaration")?;
+        let mut statics = Vec::new();
+        if self.at_word("static") {
             self.bump();
+            self.expect_op(Op::LParen)?;
+            statics = self.comma_list(Self::expect_name)?;
+            self.expect_op(Op::RParen)?;
+            self.expect_newline()?;
         }
+        let mut params = Vec::new();
+        if self.at_word("params") {
+            self.bump();
+            self.expect_op(Op::LParen)?;
+            params = self.comma_list(Self::native_param)?;
+            self.expect_op(Op::RParen)?;
+            self.expect_newline()?;
+        }
+        let mut constraints = Vec::new();
+        if self.eat_kw(Kw::Where) {
+            conjuncts(self.expr()?, &mut constraints);
+            self.expect_newline()?;
+        }
+        let mut scratch = Vec::new();
+        while self.at_word("scratch") {
+            let begin = self.bump().span;
+            let name = self.expect_name()?;
+            if !self.at_word("bytes") {
+                return Err(self.error(format!(
+                    "expected `bytes (<size>)` after the scratch name, found {}",
+                    self.peek().describe()
+                )));
+            }
+            self.bump();
+            self.expect_op(Op::LParen)?;
+            let bytes = self.expr()?;
+            self.expect_op(Op::RParen)?;
+            scratch.push(NativeScratchDecl {
+                name,
+                bytes,
+                span: begin.to(self.prev_span()),
+            });
+            self.expect_newline()?;
+        }
+        let mut launches = Vec::new();
+        while self.at_word("launch") {
+            launches.push(self.native_launch()?);
+        }
+        if launches.is_empty() {
+            return Err(self.error(format!(
+                "expected `launch <kernel>:`, found {}; a native declaration lists `static`, `params`, `where`, `scratch`, then one or more launches",
+                self.peek().describe()
+            )));
+        }
+        self.native_block_end("native declaration")?;
         Ok(NativeDecl {
             function,
             target,
             source,
+            statics,
+            params,
+            constraints,
+            scratch,
+            launches,
+            span: start.to(self.prev_span()),
+        })
+    }
+
+    fn native_block_start(&mut self, what: &str) -> PResult<()> {
+        self.expect_newline()?;
+        if !matches!(self.peek(), Tok::Indent) {
+            return Err(self.error(format!("expected an indented {what} body")));
+        }
+        self.bump();
+        Ok(())
+    }
+
+    fn native_block_end(&mut self, what: &str) -> PResult<()> {
+        match self.peek() {
+            Tok::Dedent => {
+                self.bump();
+                Ok(())
+            }
+            Tok::Eof => Ok(()),
+            other => Err(self.error(format!("unexpected {} in {what}", other.describe()))),
+        }
+    }
+
+    /// `[arithmetic] NAME in [V, ..]`
+    fn native_param(&mut self) -> PResult<NativeParamDecl> {
+        let begin = self.span();
+        let arithmetic = matches!(self.peek_at(1), Tok::Name(_)) && self.at_word("arithmetic");
+        if arithmetic {
+            self.bump();
+        }
+        let name = self.expect_name()?;
+        self.expect_kw(Kw::In)?;
+        self.expect_op(Op::LBracket)?;
+        let values = self.comma_list(|parser| match parser.peek().clone() {
+            Tok::Int(value) => {
+                parser.bump();
+                Ok(value)
+            }
+            other => Err(parser.error(format!(
+                "a native parameter domain lists integer literals, found {}",
+                other.describe()
+            ))),
+        })?;
+        self.expect_op(Op::RBracket)?;
+        Ok(NativeParamDecl {
+            name,
+            arithmetic,
+            values,
+            span: begin.to(self.prev_span()),
+        })
+    }
+
+    /// `launch KERNEL:` followed by its indented geometry.
+    fn native_launch(&mut self) -> PResult<NativeLaunchDecl> {
+        let begin = self.bump().span;
+        let kernel = self.expect_name()?;
+        self.expect_op(Op::Colon)?;
+        self.native_block_start("launch")?;
+        let threadgroups = self.native_launch_property("threadgroups")?;
+        self.expect_newline()?;
+        let threads_per_threadgroup = self.native_launch_property("threads_per_threadgroup")?;
+        self.expect_newline()?;
+        let shared_bytes = if self.at_word("shared_bytes") {
+            self.bump();
+            self.expect_op(Op::LParen)?;
+            let bytes = self.expr()?;
+            self.expect_op(Op::RParen)?;
+            self.expect_newline()?;
+            Some(bytes)
+        } else {
+            None
+        };
+        self.native_block_end("launch")?;
+        Ok(NativeLaunchDecl {
+            kernel,
             threadgroups,
             threads_per_threadgroup,
-            span: start.to(self.prev_span()),
+            shared_bytes,
+            span: begin.to(self.prev_span()),
         })
     }
 
@@ -1039,7 +1157,7 @@ mod tests {
     #[test]
     fn native_declarations_round_trip_without_repeating_the_signature() {
         let file = round_trip(
-            "fn scale[N](x: &tensor[N] f32, factor: f32, output: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        output[i] = x[i] * factor\n\nnative scale for metal from \"native/scale.metal\":\n    threadgroups (ceil_div(N, 256), 1, 1)\n    threads_per_threadgroup (256, 1, 1)\n",
+            "fn scale[N](x: &tensor[N] f32, factor: f32, output: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        output[i] = x[i] * factor\n\nnative scale for metal from \"native/scale.metal\":\n    launch scale:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n",
         );
         let [Decl::Fn(_), Decl::Native(native)] = file.decls.as_slice() else {
             panic!("expected one portable function and one native implementation")
@@ -1047,6 +1165,24 @@ mod tests {
         assert_eq!(native.function.name, "scale");
         assert_eq!(native.target.name, "metal");
         assert_eq!(native.source, "native/scale.metal");
+        assert_eq!(native.launches.len(), 1);
+    }
+
+    #[test]
+    fn specialized_native_declarations_round_trip() {
+        let file = round_trip(
+            "native scale for cuda from \"scale.cu\":\n    static (N)\n    params (arithmetic PARTS in [1, 2, 4], WIDTH in [64, 128])\n    where PARTS * WIDTH <= N and WIDTH >= 64\n    scratch partials bytes (PARTS * N * 4)\n    launch scale_partial:\n        threadgroups (ceil_div(N, WIDTH), PARTS, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n        shared_bytes (max(WIDTH * 4, 256))\n    launch scale_merge:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (min(N, 256), 1, 1)\n",
+        );
+        let [Decl::Native(native)] = file.decls.as_slice() else {
+            panic!("expected one native implementation")
+        };
+        assert_eq!(native.statics.len(), 1);
+        assert_eq!(native.params.len(), 2);
+        assert!(native.params[0].arithmetic);
+        assert_eq!(native.constraints.len(), 2);
+        assert_eq!(native.scratch.len(), 1);
+        assert_eq!(native.launches.len(), 2);
+        assert!(native.launches[0].shared_bytes.is_some());
     }
 
     #[test]

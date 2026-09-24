@@ -106,7 +106,7 @@ fn staged_recurrent_matches_small_nondegenerate_reference() {
 
         let normalized = qwen_recurrent_normalize::native_for_device_with(
             &device,
-            qwen_recurrent_normalize::Elements { NW: f32, A: f32 },
+            qwen_recurrent_normalize::Elements { NW: f32, A: f32 }, &seismic::NativeSpecialization::new(),
         )
         .unwrap()
         .call(qwen_recurrent_normalize::Args {
@@ -124,7 +124,7 @@ fn staged_recurrent_matches_small_nondegenerate_reference() {
                 AW: f32,
                 BW: f32,
                 A: f32,
-            },
+            }, &seismic::NativeSpecialization::new(),
         )
         .unwrap()
         .call(qwen_recurrent_project::Args {
@@ -138,7 +138,7 @@ fn staged_recurrent_matches_small_nondegenerate_reference() {
         .value;
         let prepared = qwen_recurrent_prepare::native_for_device_with(
             &device,
-            qwen_recurrent_prepare::Elements { RN: f32, A: f32 },
+            qwen_recurrent_prepare::Elements { RN: f32, A: f32 }, &seismic::NativeSpecialization::new(),
         )
         .unwrap()
         .call(qwen_recurrent_prepare::Args {
@@ -154,7 +154,7 @@ fn staged_recurrent_matches_small_nondegenerate_reference() {
         .unwrap();
         let scanned = qwen_recurrent_scan::native_for_device_with(
             &device,
-            qwen_recurrent_scan::Elements { A: f32 },
+            qwen_recurrent_scan::Elements { A: f32 }, &seismic::NativeSpecialization::new(),
         )
             .unwrap()
             .call(qwen_recurrent_scan::Args {
@@ -167,7 +167,7 @@ fn staged_recurrent_matches_small_nondegenerate_reference() {
             .unwrap();
         let gated = qwen_recurrent_mix::native_for_device_with(
             &device,
-            qwen_recurrent_mix::Elements { RN: f32, A: f32 },
+            qwen_recurrent_mix::Elements { RN: f32, A: f32 }, &seismic::NativeSpecialization::new(),
         )
         .unwrap()
         .call(qwen_recurrent_mix::Args {
@@ -180,7 +180,7 @@ fn staged_recurrent_matches_small_nondegenerate_reference() {
         .value;
         let result = qwen_recurrent_output::native_for_device_with(
             &device,
-            qwen_recurrent_output::Elements { OW: f32, A: f32 },
+            qwen_recurrent_output::Elements { OW: f32, A: f32 }, &seismic::NativeSpecialization::new(),
         )
         .unwrap()
         .call(qwen_recurrent_output::Args {

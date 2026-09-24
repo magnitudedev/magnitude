@@ -147,13 +147,58 @@ impl Decl {
 }
 
 /// A direct top-level backend implementation of an existing portable function.
+///
+/// ```text
+/// native NAME for TARGET from "SOURCE":
+///     static (DIM, ..)
+///     params ([arithmetic] NAME in [V, ..], ..)
+///     where PREDICATE
+///     scratch NAME bytes (EXPR)
+///     launch KERNEL:
+///         threadgroups (X, Y, Z)
+///         threads_per_threadgroup (X, Y, Z)
+///         shared_bytes (EXPR)
+/// ```
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeDecl {
     pub function: Ident,
     pub target: Ident,
     pub source: String,
+    /// Entry dimensions fixed at preparation.
+    pub statics: Vec<Ident>,
+    pub params: Vec<NativeParamDecl>,
+    /// Conjuncts of the `where` line.
+    pub constraints: Vec<Expr>,
+    pub scratch: Vec<NativeScratchDecl>,
+    pub launches: Vec<NativeLaunchDecl>,
+    pub span: Span,
+}
+
+/// One tuning parameter and its finite domain. The first value is the default.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeParamDecl {
+    pub name: Ident,
+    /// The parameter changes the arithmetic order of a row's result.
+    pub arithmetic: bool,
+    pub values: Vec<u64>,
+    pub span: Span,
+}
+
+/// Call-private device memory shared by the launches of one native call.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeScratchDecl {
+    pub name: Ident,
+    pub bytes: Expr,
+    pub span: Span,
+}
+
+/// One ordered dispatch of a kernel function from the native source.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeLaunchDecl {
+    pub kernel: Ident,
     pub threadgroups: [Expr; 3],
     pub threads_per_threadgroup: [Expr; 3],
+    pub shared_bytes: Option<Expr>,
     pub span: Span,
 }
 

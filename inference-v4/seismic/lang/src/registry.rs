@@ -42,15 +42,6 @@ impl BackendName {
             BackendName::Cuda => "cuda",
         }
     }
-
-    /// Whether source may declare a direct `native … for` implementation on
-    /// this backend (the explicitly selected direct-native route, D6).
-    pub fn supports_direct_native(self) -> bool {
-        match self {
-            BackendName::Metal => true,
-            BackendName::Cpu | BackendName::Cuda => false,
-        }
-    }
 }
 
 /// Revision of the whole registry. Any semantic change to a primitive,
@@ -1509,13 +1500,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn direct_native_is_metal_only() {
-        assert!(BackendName::Metal.supports_direct_native());
-        assert!(!BackendName::Cpu.supports_direct_native());
-        assert!(!BackendName::Cuda.supports_direct_native());
     }
 
     #[test]

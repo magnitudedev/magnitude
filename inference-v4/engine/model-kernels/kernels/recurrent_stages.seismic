@@ -9,8 +9,9 @@ fn qwen_recurrent_normalize[M, H](hidden: &tensor[M, H] f32,
     return normalized
 
 native qwen_recurrent_normalize for metal from "metal/qwen_recurrent_normalize.metal":
-    threadgroups (ceil_div(M, 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_recurrent_normalize:
+        threadgroups (ceil_div(M, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 fn qwen_recurrent_project[M, H, NK, NV, W](normalized: &tensor[M, H] A, qkv_weight: &tensor[(2 * NK + NV) * W, H] QW,
@@ -44,8 +45,9 @@ fn qwen_recurrent_project[M, H, NK, NV, W](normalized: &tensor[M, H] A, qkv_weig
     return projection
 
 native qwen_recurrent_project for metal from "metal/qwen_recurrent_project.metal":
-    threadgroups (ceil_div(ceil_div(M, 8) * ((2 * NK + NV) * W + NV * W + 2 * NV), 8), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_recurrent_project:
+        threadgroups (ceil_div(ceil_div(M, 8) * ((2 * NK + NV) * W + NV * W + 2 * NV), 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 # recurrent_norm fixes W for checked recurrent projection geometry.
@@ -112,8 +114,9 @@ fn qwen_recurrent_prepare[M, B, NK, NV, W, C](projection: &tensor[M, (2 * NK + N
     return next_window, prepared, decay
 
 native qwen_recurrent_prepare for metal from "metal/qwen_recurrent_prepare.metal":
-    threadgroups (ceil_div(M * (2 * NK + NV + NV) + B * (C - 1) * (2 * NK + NV) * W, 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_recurrent_prepare:
+        threadgroups (ceil_div(M * (2 * NK + NV + NV) + B * (C - 1) * (2 * NK + NV) * W, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 fn qwen_recurrent_scan[M, B, NK, NV, W](prepared: &tensor[M, (2 * NK + NV) * W + NV] A,
@@ -155,8 +158,9 @@ fn qwen_recurrent_scan[M, B, NK, NV, W](prepared: &tensor[M, (2 * NK + NV) * W +
     return next_delta, mixed
 
 native qwen_recurrent_scan for metal from "metal/qwen_recurrent_scan.metal":
-    threadgroups (ceil_div(NV * W, 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_recurrent_scan:
+        threadgroups (ceil_div(NV * W, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 fn qwen_recurrent_mix[M, NK, NV, W](projection: &tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A,
@@ -186,8 +190,9 @@ fn qwen_recurrent_mix[M, NK, NV, W](projection: &tensor[M, (2 * NK + NV) * W + N
     return gated
 
 native qwen_recurrent_mix for metal from "metal/qwen_recurrent_mix.metal":
-    threadgroups (ceil_div(M * NV * W, 256), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_recurrent_mix:
+        threadgroups (ceil_div(M * NV * W, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 fn qwen_recurrent_output[M, H, G](hidden: &tensor[M, H] f32,
@@ -208,5 +213,6 @@ fn qwen_recurrent_output[M, H, G](hidden: &tensor[M, H] f32,
     return result
 
 native qwen_recurrent_output for metal from "metal/qwen_recurrent_output.metal":
-    threadgroups (ceil_div(ceil_div(M, 8) * H, 8), 1, 1)
-    threads_per_threadgroup (256, 1, 1)
+    launch qwen_recurrent_output:
+        threadgroups (ceil_div(ceil_div(M, 8) * H, 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)

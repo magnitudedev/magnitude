@@ -30,6 +30,7 @@ members = [
   "seismic/api",
   "seismic/build",
   "seismic/corpus",
+  "seismic/native-tests",
   "seismic/frontends/python",
 ]
 default-members = [
