@@ -62,6 +62,16 @@ export const localModelRankingUtility = (
 export const targetPhysicalMemoryBytes = (hardware: LocalInferenceHardware): number =>
   hardware.memoryDomains.reduce((total, domain) => total + domain.totalBytes, 0)
 
+/**
+ * Memory the model picker can actually use right now: each domain's free bytes where
+ * the hardware probe reports them, its total otherwise. Other resident processes (an
+ * Ollama server, the desktop itself) already hold part of the total, so picking
+ * against the total recommends models that cannot load.
+ */
+export const targetAvailableMemoryBytes = (hardware: LocalInferenceHardware): number =>
+  hardware.memoryDomains.reduce((total, domain) =>
+    total + Option.getOrElse(domain.availableBytes, () => domain.totalBytes), 0)
+
 export const rankedLocalModelOptions = (
   options: readonly LocalModelOption[],
   preference: LocalModelRankingPreference,

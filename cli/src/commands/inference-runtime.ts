@@ -12,7 +12,7 @@ import {
   localModelServingState,
   modelDownloadFailureMessage,
   rankedLocalModelOptions,
-  targetPhysicalMemoryBytes,
+  targetAvailableMemoryBytes,
 } from "@magnitudedev/client-common"
 import {
   CatalogFormModelIdSchema,
@@ -247,7 +247,7 @@ export const showRecommendations = (preferenceInput: string, limitInput: string)
         model,
       })), {
         fastToSmart: preference.value,
-        memoryBudgetBytes: targetPhysicalMemoryBytes(hardware),
+        memoryBudgetBytes: targetAvailableMemoryBytes(hardware),
       }, limit).flatMap(({ model }) => model._tag === "Catalog" ? [model] : [])
       return { catalog, models, hardware, preference, ranked }
     }))),

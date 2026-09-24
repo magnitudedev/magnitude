@@ -5,6 +5,7 @@ import {
   localModelRankingUtility,
   featuredCatalogModels,
   rankedLocalModelOptions,
+  targetAvailableMemoryBytes,
   targetPhysicalMemoryBytes,
   type LocalModelOption,
 } from "./options"
@@ -92,5 +93,33 @@ describe("local model ranking", () => {
       memoryDomains: [{ totalBytes: 64 }, { totalBytes: 24 }],
     } as unknown as LocalInferenceHardware
     expect(targetPhysicalMemoryBytes(hardware)).toBe(88)
+  })
+
+  it("picks against live free memory, falling back to the domain total when unreported", () => {
+    const hardware = {
+      totalSystemMemoryBytes: 64,
+      memoryDomains: [
+        { totalBytes: 64, availableBytes: Option.some(20) },
+        { totalBytes: 24, availableBytes: Option.none() },
+      ],
+    } as unknown as LocalInferenceHardware
+    expect(targetAvailableMemoryBytes(hardware)).toBe(44)
+  })
+
+  it("excludes models that only fit by counting memory other processes already hold", () => {
+    const hardware = {
+      totalSystemMemoryBytes: 16,
+      memoryDomains: [{ totalBytes: 16, availableBytes: Option.some(8) }],
+    } as unknown as LocalInferenceHardware
+    const fits = option("small", 8, { intelligence: 1, speed: 1, fidelity: 1 })
+    const oom = option("large", 12, { intelligence: 1, speed: 1, fidelity: 1 })
+    expect(rankedLocalModelOptions([oom, fits], {
+      fastToSmart: 0.5,
+      memoryBudgetBytes: targetAvailableMemoryBytes(hardware),
+    })).toEqual([fits])
+    expect(rankedLocalModelOptions([oom, fits], {
+      fastToSmart: 0.5,
+      memoryBudgetBytes: targetPhysicalMemoryBytes(hardware),
+    })).toHaveLength(2)
   })
 })
