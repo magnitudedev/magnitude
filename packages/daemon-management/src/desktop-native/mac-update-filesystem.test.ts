@@ -22,6 +22,32 @@ const fixture = Effect.gen(function* () {
 })
 
 describe.skipIf(process.platform !== "darwin")("native macOS transaction filesystem", () => {
+  it("publishes a fresh bundle once without changing its identity", () => run(Effect.gen(function* () {
+    const { fs, native, stagePath, parent, stage } = yield* fixture
+    yield* fs.makeDirectory(join(stagePath, "Magnitude.app"))
+    const replacement = Option.getOrThrow(yield* native.inspect(stage, "Magnitude.app"))
+    expect(yield* native.publish(parent, "Magnitude.app", stage, "Magnitude.app", parent.identity).pipe(Effect.isFailure)).toBe(true)
+    yield* native.publish(parent, "Magnitude.app", stage, "Magnitude.app", replacement)
+    expect(Option.getOrThrow(yield* native.inspect(parent, "Magnitude.app"))).toBe(replacement)
+    expect(Option.isNone(yield* native.inspect(stage, "Magnitude.app"))).toBe(true)
+    expect(yield* native.publish(parent, "Magnitude.app", stage, "Magnitude.app", replacement).pipe(Effect.isFailure)).toBe(true)
+  })))
+
+  it.each(["directory", "file", "symlink"])("fresh publication preserves an existing %s", kind => run(Effect.gen(function* () {
+    const { fs, native, root, stagePath, parent, stage } = yield* fixture
+    const destination = join(root, "Magnitude.app")
+    if (kind === "directory") yield* fs.makeDirectory(destination)
+    else if (kind === "file") yield* fs.writeFileString(destination, "keep")
+    else yield* fs.symlink("missing", destination)
+    yield* fs.makeDirectory(join(stagePath, "Magnitude.app"))
+    const replacement = Option.getOrThrow(yield* native.inspect(stage, "Magnitude.app"))
+    expect(yield* native.publish(parent, "Magnitude.app", stage, "Magnitude.app", replacement).pipe(Effect.isFailure)).toBe(true)
+    expect(Option.getOrThrow(yield* native.inspect(stage, "Magnitude.app"))).toBe(replacement)
+    if (kind === "directory") expect(yield* fs.readDirectory(destination)).toEqual([])
+    else if (kind === "file") expect(yield* fs.readFileString(destination)).toBe("keep")
+    else expect(yield* fs.readLink(destination)).toBe("missing")
+  })))
+
   it("durably replaces a private record and reads the exact bytes", () => run(Effect.gen(function* () {
     const { fs, native, stage, stagePath } = yield* fixture
     expect(Option.isNone(yield* native.readRecord(stage))).toBe(true)

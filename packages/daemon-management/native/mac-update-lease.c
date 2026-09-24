@@ -57,7 +57,7 @@ static int current(installation_lease *lease) {
 }
 static napi_value acquire_internal(napi_env env, napi_callback_info info, int adopting) {
   napi_value args[2], result; size_t argc = 2, length; bool exclusive = true; double inherited_number = -1; int inherited = -1;
-  char supplied[PATH_MAX], bundle[NAME_MAX + 1]; struct stat app, opened;
+  char supplied[PATH_MAX], bundle[NAME_MAX + 1]; struct stat app, opened; int fresh = 0;
   if (napi_get_cb_info(env, info, &argc, args, NULL, NULL) != napi_ok || argc != 2 ||
       napi_get_value_string_utf8(env, args[0], NULL, 0, &length) != napi_ok || !length || length >= sizeof(supplied) ||
       napi_get_value_string_utf8(env, args[0], supplied, sizeof(supplied), &length) != napi_ok ||
@@ -82,8 +82,12 @@ static napi_value acquire_internal(napi_env env, napi_callback_info info, int ad
   if (!realpath(supplied, lease->path)) goto failed;
   lease->parent = open(lease->path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (lease->parent < 0 || fstat(lease->parent, &lease->parent_identity) ||
-      (lease->parent_identity.st_mode & S_IWOTH) ||
-      fstatat(lease->parent, bundle, &app, AT_SYMLINK_NOFOLLOW) || !S_ISDIR(app.st_mode)) goto failed;
+      (lease->parent_identity.st_mode & S_IWOTH)) goto failed;
+  if (fstatat(lease->parent, bundle, &app, AT_SYMLINK_NOFOLLOW)) {
+    if (errno != ENOENT || !exclusive || adopting) goto failed;
+    fresh = 1;
+    app.st_uid = geteuid();
+  } else if (!S_ISDIR(app.st_mode)) goto failed;
   snprintf(lease->name, sizeof(lease->name), ".%s.installation.lock", bundle);
   lease->fd = adopting ? fcntl(inherited, F_DUPFD_CLOEXEC, 3)
     : openat(lease->parent, lease->name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
@@ -101,7 +105,10 @@ static napi_value acquire_internal(napi_env env, napi_callback_info info, int ad
     if (adopting || (errno != EWOULDBLOCK && errno != EAGAIN)) goto failed;
     release(lease); free(lease); napi_get_null(env, &result); return result;
   }
-  if (!current(lease) || fstatat(lease->parent, bundle, &opened, AT_SYMLINK_NOFOLLOW) || !same(app, opened)) goto failed;
+  if (!current(lease)) goto failed;
+  if (fresh) {
+    if (fstatat(lease->parent, bundle, &opened, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT) goto failed;
+  } else if (fstatat(lease->parent, bundle, &opened, AT_SYMLINK_NOFOLLOW) || !same(app, opened)) goto failed;
   if (napi_create_object(env, &result) != napi_ok || napi_type_tag_object(env, result, &lease_tag) != napi_ok ||
       napi_wrap(env, result, lease, finalize, NULL, NULL) != napi_ok) goto failed;
   if (adopting) close(inherited);

@@ -1,7 +1,8 @@
 import { FileSystem } from "@effect/platform"
 import { Effect, Option, Schema } from "effect"
 import { basename, dirname, join, resolve } from "node:path"
-import { exchangeMacUpdate, type MacUpdateVersions } from "./mac-update-transaction"
+import { exchangeMacUpdate, publishMacInstallation, type MacUpdateVersions } from "./mac-update-transaction"
+import type { MacBundleExpectation } from "./mac-update-validation"
 import { MacUpdateAdmission, type MacExclusiveInstallationLease } from "./mac-update-lease"
 import { MacUpdateFilesystem, MacUpdateFilesystemFailed } from "./mac-update-filesystem"
 import { MacUpdateRepairRequired, recoverMacUpdateTransaction, retireMacUpdateBundle } from "./mac-update-recovery"
@@ -42,6 +43,7 @@ export const openMacUpdateWorkspace = (bundle: string, create: boolean, retained
   yield* native.sync(installed)
   const protectedFilesystem = MacUpdateFilesystem.of({ ...native,
     exchange: (...args) => validate.pipe(Effect.mapError(() => new MacUpdateFilesystemFailed()), Effect.zipRight(native.exchange(...args))),
+    publish: (...args) => validate.pipe(Effect.mapError(() => new MacUpdateFilesystemFailed()), Effect.zipRight(native.publish(...args))),
   })
   const recover = validate.pipe(Effect.zipRight(recoverMacUpdateTransaction(installed, installedName, staging)),
     Effect.provideService(MacUpdateFilesystem, protectedFilesystem))
@@ -57,5 +59,8 @@ export const openMacUpdateWorkspace = (bundle: string, create: boolean, retained
     if (Option.isSome(candidate)) yield* native.removeTree(staging, "Magnitude.app", candidate.value)
     yield* native.sync(staging)
   })
-  return Option.some({ installed, installedName, staging, validate, recover, retire, exchange, clearUnpublishedStaging })
+  const publish = (expected: MacBundleExpectation) => validate.pipe(
+    Effect.zipRight(publishMacInstallation(installed, installedName, staging, expected)),
+    Effect.provideService(MacUpdateFilesystem, protectedFilesystem))
+  return Option.some({ installed, installedName, staging, validate, recover, retire, exchange, publish, clearUnpublishedStaging })
 }).pipe(Effect.mapError(error => error._tag === "MacUpdateInstallationBusy" ? error : new MacUpdateRepairRequired()))

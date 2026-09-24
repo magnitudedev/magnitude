@@ -10,7 +10,7 @@ export interface MacCliLink {
   readonly install: Effect.Effect<void, CliLinkFailed>
   readonly remove: Effect.Effect<void, CliLinkFailed>
 }
-export const MacCliLink = Context.GenericTag<MacCliLink>("desktop/MacCliLink")
+export const MacCliLink = Context.GenericTag<MacCliLink>("@magnitudedev/daemon-management/MacCliLink")
 export const makeMacCliLink = (options: {
   readonly link: string
   readonly target: string

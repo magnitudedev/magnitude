@@ -21,6 +21,22 @@ const fixture = Effect.gen(function* () {
 })
 
 describe.skipIf(process.platform !== "darwin")("macOS installation admission", () => {
+  it("admits fresh installation exclusively and reuses its lock after publication", () => run(Effect.gen(function* () {
+    const { admission, bundle, fs, lock } = yield* fixture
+    yield* fs.remove(bundle, { recursive: true })
+    expect(yield* admission.shared(bundle).pipe(Effect.isFailure)).toBe(true)
+    yield* Effect.scoped(Effect.gen(function* () {
+      const lease = Option.getOrThrow(yield* admission.exclusive(bundle))
+      expect(Option.isNone(yield* admission.exclusive(bundle))).toBe(true)
+      yield* fs.makeDirectory(bundle)
+      yield* lease.validate
+      expect(Option.isNone(yield* admission.shared(bundle))).toBe(true)
+    }))
+    const identity = (yield* fs.stat(lock)).ino
+    expect(Option.isSome(yield* admission.shared(bundle))).toBe(true)
+    expect((yield* fs.stat(lock)).ino).toEqual(identity)
+  })))
+
   it("admits multiple readers and excludes replacement until every reader retires", () => run(Effect.gen(function* () {
     const { admission, bundle, fs, lock } = yield* fixture
     yield* Effect.scoped(Effect.gen(function* () {

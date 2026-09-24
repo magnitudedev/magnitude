@@ -5,14 +5,15 @@ import { CliLinkFailed } from "./mac-cli-link"
 
 const begin = "# >>> Magnitude CLI PATH >>>"
 const end = "# <<< Magnitude CLI PATH <<<"
+export const MAC_CLI_DIRECTORY = ".magnitude/bin"
 const posixBlock = `\n${begin}
 case "$PATH" in
-  "$HOME/.magnitude/bin"|"$HOME/.magnitude/bin":*) ;;
-  *) export PATH="$HOME/.magnitude/bin:$PATH" ;;
+  "$HOME/${MAC_CLI_DIRECTORY}"|"$HOME/${MAC_CLI_DIRECTORY}":*) ;;
+  *) export PATH="$HOME/${MAC_CLI_DIRECTORY}:$PATH" ;;
 esac
 ${end}\n`
 const fishBlock = `\n${begin}
-fish_add_path --path --move --prepend "$HOME/.magnitude/bin"
+fish_add_path --path --move --prepend "$HOME/${MAC_CLI_DIRECTORY}"
 ${end}\n`
 
 export const makeMacCliPath = (home: string, environment: Readonly<Record<string, string>>) => Effect.gen(function* () {

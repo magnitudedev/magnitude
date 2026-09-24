@@ -48,6 +48,10 @@ archives, not only on intermediate build outputs.
   retire prepared state and private helper/transaction storage, and leave each bundle accepted by
   signature, notarization-ticket and Gatekeeper checks. Native unit
   tests or injected verifier tests do not substitute for this gate.
+- Full-installation script acceptance consumes real packages over HTTPS with native publisher
+  verification enabled. It covers fresh and repeat installation, invalid publisher proof,
+  command registration, stopped state after installation, and public foreground serve plus CLI
+  queries without opening Desktop. Temporary fixture trust and routing must be removed afterward.
 
 ## Linux build baseline
 

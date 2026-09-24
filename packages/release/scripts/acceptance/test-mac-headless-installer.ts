@@ -9,6 +9,8 @@ import { compileAppleBun } from "../apple/compile-bun"
 import { desktopUpdateArchive } from "../../src/targets"
 import { sha256File } from "../../src/macos-app"
 import { signUpdateRelease } from "../../src/hosted-update/release"
+import { signUpdateManifest, UpdateManifest } from "../../src/hosted-update/manifest"
+import { writeInstallationDistribution } from "../build/installation-distribution"
 import { makePreparedUpdateStore } from "../../../daemon-management/src/desktop-native/prepared-update"
 import { unixPrivateFilePermissions } from "../../../daemon-management/src/desktop-native/private-files"
 
@@ -17,7 +19,7 @@ const Configuration = Schema.Struct({ origin: Schema.String, keyId: Schema.Strin
 const HarnessInvocation = Schema.Struct({ resources: Schema.String, stateDirectory: Schema.String, dataDirectory: Schema.String,
   version: Schema.String, architecture: Schema.Literal("arm64"), operation: Schema.Literal("Install", "Recover"), continuation: Schema.TaggedStruct("None", {}) })
 const Evidence = Schema.Struct({ installedVersion: Schema.String, preparedRecordRetired: Schema.Literal(true),
-  helperRetired: Schema.Literal(true), transactionRetired: Schema.Literal(true) })
+  helperRetired: Schema.Literal(true), transactionRetired: Schema.Literal(true), scriptInstallation: Schema.Literal(true) })
 const root = resolve(import.meta.dir, "../../../..")
 const run = Effect.gen(function* () {
   if (process.platform !== "darwin" || process.arch !== "arm64") return yield* new AcceptanceFailed({ message: "Signed fixture requires a native macOS arm64 runner" })
@@ -39,10 +41,28 @@ const run = Effect.gen(function* () {
   })
   const installed = join(output, "installed")
   yield* fs.makeDirectory(installed, { mode: 0o700 })
-  yield* command("/usr/bin/ditto", ["-x", "-k", join(output, versions[0], "artifacts", desktopUpdateArchive("darwin-arm64")), installed])
   const bundle = join(installed, "Magnitude.app"), resources = join(bundle, "Contents/Resources")
   const stateDirectory = join(output, "state"), dataDirectory = join(output, "profile")
   const environment = { MAGNITUDE_DEV_DATA_DIR: dataDirectory, MAGNITUDE_DESKTOP_STATE_DIR: stateDirectory, MAGNITUDE_DEV_PORT: "11237", MAGNITUDE_ICN_PATH: inference }
+  const archiveName = desktopUpdateArchive("darwin-arm64")
+  const initialArchive = join(output, versions[0], "artifacts", archiveName)
+  const manifest = yield* Schema.decodeUnknown(UpdateManifest)({ protocol: 1, version: versions[0], tag: `@magnitudedev/cli@${versions[0]}`, commit: "a".repeat(40),
+    artifact: { id: "desktop-update-darwin-arm64", target: { os: "darwin", arch: "arm64", package: "mac-zip" }, filename: archiveName,
+      bytes: Number((yield* fs.stat(initialArchive)).size), sha256: yield* sha256File(initialArchive) } })
+  const hosting = join(output, "script-hosting")
+  yield* writeInstallationDistribution({ output: hosting, origin: "https://localhost:18443", appleTeam: yield* Config.string("APPLE_TEAM_ID"),
+    windowsPublisher: "Magnitude Update Acceptance", publicKey: keys.publicKey.export({ type: "spki", format: "pem" }).toString(),
+    publications: [yield* signUpdateManifest(manifest, keys.privateKey)] })
+  const downloadDirectory = join(hosting, "magnitudedev/magnitude/releases/download", manifest.tag)
+  yield* fs.makeDirectory(downloadDirectory, { recursive: true })
+  yield* fs.copyFile(initialArchive, join(downloadDirectory, archiveName))
+  yield* command("/bin/bash", [join(import.meta.dir, "test-mac-install-script.sh"), hosting, bundle, versions[0], dataDirectory, stateDirectory], environment)
+  yield* command(process.execPath, [join(import.meta.dir, "test-installed-headless.ts")], {
+    MAGNITUDE_INSTALLED_ACCEPTANCE_OUTPUT: join(output, "script-serve"),
+    MAGNITUDE_INSTALLED_ACCEPTANCE_CLI: join(resources, "magnitude"),
+    MAGNITUDE_INSTALLED_ACCEPTANCE_ADDON: join(resources, "desktop-host.node"),
+    MAGNITUDE_INSTALLED_ACCEPTANCE_VERSION: versions[0], MAGNITUDE_ICN_PATH: inference,
+  })
   const harness = join(output, "installer-entry")
   yield* compileAppleBun(join(import.meta.dir, "mac-foreground-installer-entry.ts"), harness, "bun-darwin-arm64", "cli")
   yield* signAppleCode(harness, "dev.magnitude.installer-acceptance", "bun")
@@ -85,7 +105,7 @@ const run = Effect.gen(function* () {
     yield* command("/usr/bin/xcrun", ["stapler", "validate", bundle])
     yield* command("/usr/sbin/spctl", ["--assess", "--type", "execute", "--verbose", bundle])
   }
-  yield* fs.writeFileString(join(output, "result.json"), yield* Schema.encode(Schema.parseJson(Evidence))({ installedVersion: versions[3], preparedRecordRetired: true, helperRetired: true, transactionRetired: true }))
+  yield* fs.writeFileString(join(output, "result.json"), yield* Schema.encode(Schema.parseJson(Evidence))({ installedVersion: versions[3], preparedRecordRetired: true, helperRetired: true, transactionRetired: true, scriptInstallation: true }))
   yield* Effect.logInfo("Signed macOS finite, foreground and desktop installer acceptance passed")
 })
 BunRuntime.runMain(run.pipe(Effect.provide(BunContext.layer)))

@@ -4,7 +4,7 @@ import { Effect } from "effect"
 import { execFileSync } from "node:child_process"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
-import { makeMacCliLink } from "./mac-cli-link"
+import { makeMacCliRegistration } from "./mac-cli-registration"
 import { makeMacCliPath } from "./mac-cli-path"
 
 const fixture = (test: (home: string, fs: FileSystem.FileSystem) => Effect.Effect<void, unknown, FileSystem.FileSystem>) =>
@@ -68,10 +68,10 @@ describe("user-owned Mac command PATH", () => {
     yield* fs.makeDirectory(join(target, ".."), { recursive: true })
     yield* fs.writeFileString(target, '#!/bin/sh\nprintf "bundled-cli\\n"\n')
     yield* fs.chmod(target, 0o755)
-    const link = yield* makeMacCliLink({ link: join(bin, "magnitude"), target })
-    const path = yield* makeMacCliPath(home, {})
-    yield* link.install
-    yield* path.install
+    const registration = yield* makeMacCliRegistration({ home,
+      resourcesDirectory: join(target, ".."), environment: {} })
+    yield* registration.install
+    yield* registration.install
     for (const shell of ["/bin/zsh", "/bin/bash"]) {
       for (const mode of ["-lc", "-ic"]) {
         const output = execFileSync(shell, [mode, 'command -v magnitude; magnitude'], {
@@ -81,8 +81,7 @@ describe("user-owned Mac command PATH", () => {
         expect(output.trim().split("\n")).toEqual([join(bin, "magnitude"), "bundled-cli"])
       }
     }
-    yield* link.remove
-    yield* path.remove
+    yield* registration.remove
     expect(yield* fs.exists(join(bin, "magnitude"))).toBe(false)
   })))
 })

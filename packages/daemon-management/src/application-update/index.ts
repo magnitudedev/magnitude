@@ -15,5 +15,7 @@ export * from "./linux-foreground-update"
 export * from "./windows-foreground-update"
 
 export { runMacInstallerCommand, MacInstallerRequest } from "./mac-installer-command"
+export { runMacArchiveInstallerCommand } from "./mac-archive-installer-command"
+export { verifyWindowsInstallationDownload } from "./verify-installation-download"
 export { startMacForegroundInstallation } from "./mac-foreground-installation"
 export { prepareMacForegroundStartup, macStartupUpdateOperation } from "./mac-startup-update"

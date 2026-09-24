@@ -21,6 +21,11 @@ registerInferenceCommands(program)
 registerConnectionsCommand(program)
 registerUpdateCommand(program)
 registerDocsCommand(program)
+program.command("_verify-windows-installation", { hidden: true }).argument("<offer>").argument("<artifact>").argument("<channel>")
+  .action(async (offer, artifact, channel) => {
+    const { verifyInstallationDownload } = await import("./startup/verify-installation")
+    await verifyInstallationDownload(offer, artifact, channel)
+  })
 program.command("_install-application-update", { hidden: true }).argument("<request>").option("--parent-stdin").action(async (request, options) => {
   const { runLinuxUpdateInstallation } = await import("./startup/linux-update-installation")
   await runLinuxUpdateInstallation(request, options.parentStdin === true)
@@ -32,6 +37,10 @@ program.command("_complete-application-update", { hidden: true }).action(async (
 program.command("_install-mac-application-update", { hidden: true }).argument("<request>").action(async (request: string) => {
   const { runMacApplicationInstallation } = await import("./startup/mac-installer")
   await runMacApplicationInstallation(request)
+})
+program.command("_install-mac-application", { hidden: true }).argument("<request>").action(async (request: string) => {
+  const { runMacArchiveInstallation } = await import("./startup/mac-installer")
+  await runMacArchiveInstallation(request)
 })
 
 program.command("_complete-windows-application-update", { hidden: true }).action(async () => {

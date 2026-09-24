@@ -4,10 +4,15 @@ import { getTargetInfo } from "../../../../scripts/release-target"
 import { run } from "./common"
 import { compileAppleBun, runAppleBuild } from "../apple/compile-bun"
 import { signAppleCode } from "../apple/signing"
+import { signWindowsCode } from "./windows-signing"
+import { Effect } from "effect"
+import { BunContext } from "@effect/platform-bun"
+import { decodePublisherPublicKey } from "../../src/hosted-update/manifest"
 
 const PROJECT_ROOT = resolve(import.meta.dir, "../../../..")
 
-export const buildCliBinary = async (target: string): Promise<string> => {
+export const buildCliBinary = async (target: string, bootstrapPublisherKey?: string): Promise<string> => {
+  if (bootstrapPublisherKey !== undefined) await Effect.runPromise(decodePublisherPublicKey(bootstrapPublisherKey))
   const info = getTargetInfo(target)
   const nativePlatform = info.platform === "windows" ? "win32" : info.platform
   if (nativePlatform === process.platform && info.arch === process.arch) {
@@ -42,6 +47,8 @@ export const buildCliBinary = async (target: string): Promise<string> => {
     `process.platform=${JSON.stringify(nativePlatform)}`,
     "--define",
     `process.arch=${JSON.stringify(info.arch)}`,
+    ...(bootstrapPublisherKey === undefined ? [] : ["--define", `MAGNITUDE_BOOTSTRAP_PUBLISHER_KEY=${JSON.stringify(bootstrapPublisherKey)}`]),
   ], { cwd: PROJECT_ROOT })
+  if (info.platform === "windows") await Effect.runPromise(signWindowsCode(binary).pipe(Effect.provide(BunContext.layer)))
   return binary
 }

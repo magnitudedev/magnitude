@@ -84,13 +84,20 @@ extended access grants, symlinks or hard links. A record is bounded, written com
 file, synchronized, atomically published and synchronized with its parent before acknowledging success.
 Bundle exchange is descriptor-relative and requires both expected directory identities; stale requests
 cannot exchange the bundles again. An exchange error may occur after namespace mutation and requires
-identity reconciliation, never blind retry. These capabilities belong to the finite installer process;
+identity reconciliation, never blind retry. Initial bundle publication uses an atomic no-replacement
+rename from private staging, retaining the same directory identity checks and parent synchronization.
+Any existing destination, including an empty directory or symbolic link, prevents publication.
+Publication errors likewise require observing identities before deciding whether installation occurred.
+These capabilities belong to the finite installer process;
 they neither acquire installation exclusion nor authorize mutation on their own.
 
 macOS installation admission uses a shared kernel lease outside the replaceable application bundle.
 The stable adjacent lock is owned by the installation owner, readable by other users, and never
 unlinked or rewritten. Running owners retain shared admission; an installer requires exclusive
-admission and revalidates the retained lock and parent identities before mutation. Unsafe permissions,
+admission and revalidates the retained lock and parent identities before mutation. First installation
+may acquire exclusive admission for an absent bundle using the installing user's lock ownership;
+shared owner admission still requires an installed bundle. Publication retains that lock for later
+owners and updates. Unsafe permissions,
 extended access grants, substituted paths and observation failures are errors, not contention. The
 first version carrying this admission protocol arrives through the existing updater's quit-and-relaunch
 flow. Subsequent startup replacement uses the new installation lease; an active prior native installer
@@ -145,6 +152,10 @@ substituted directories remain available for reconciliation.
 
 Application binaries are distributed through GitHub Releases. Downloads must resolve to trusted
 release assets, and interrupted or invalid transfers must not publish a prepared installer.
+Full-installation offers reuse the same publisher proof, artifact bytes and channel admission policy.
+The caller explicitly selects its target and channel because no installed version exists yet.
+An offer cannot introduce publisher trust or redirect downloads outside the release repository;
+verification binds the release to the selected OS, architecture and package format before execution.
 
 Transfer scratch storage is separate from the private prepared-update directory. Under exclusive
 application or installation admission, Windows startup may retire an older cache with the known

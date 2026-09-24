@@ -13,6 +13,8 @@ import { MacApplicationInstallation } from "../desktop-native/mac-update-install
 import { MacBundleVerifier, MacBundleVerificationFailed } from "../desktop-native/mac-update-validation"
 import { MacUpdateArchiveStager, MacUpdateStagingFailed } from "../desktop-native/mac-update-staging"
 import { completeMacPreparedInstallation, recoverMacPreparedInstallation } from "./mac-prepared-installation"
+import { installMacApplicationArchive } from "./mac-archive-installation"
+import { GuardedCommand, GuardedCommandFailed } from "../desktop-native/guarded-command"
 const addon = fileURLToPath(new URL(`../../dist/native/darwin-${process.arch}/desktop-host.node`, import.meta.url))
 const keys = generateKeyPairSync("ed25519")
 const release = await Effect.runPromise(signUpdateRelease({ version: "0.1.6", bytes: 1, sha256: "0".repeat(64) },
@@ -48,9 +50,35 @@ const fixture = Effect.gen(function* () {
     Effect.provideService(MacBundleVerifier, verifier), Effect.provideService(MacApplicationInstallation, { isInstalling: () => Effect.succeed(false) }))
   const recover = recoverMacPreparedInstallation(bundle).pipe(
     Effect.provideService(MacBundleVerifier, verifier), Effect.provideService(MacApplicationInstallation, { isInstalling: () => Effect.succeed(false) }))
-  return { fs, bundle, root, events, store, stager, install, recover }
+  const archiveInstall = installMacApplicationArchive({ bundle, archive: "archive", release, architecture: "arm64" }).pipe(
+    Effect.provideService(MacBundleVerifier, verifier), Effect.provideService(MacUpdateArchiveStager, stager),
+    Effect.provideService(MacApplicationInstallation, { isInstalling: () => Effect.succeed(false) }),
+    Effect.provideService(GuardedCommand, { run: () => fs.readFileString(join(bundle, "version")).pipe(
+      Effect.map(stdout => ({ code: 0, stdout, stderr: "" })),
+      Effect.mapError(() => new GuardedCommandFailed({ message: "Missing version" }))) }))
+  return { fs, bundle, root, events, store, stager, install, recover, archiveInstall }
 })
 describe.skipIf(process.platform !== "darwin")("prepared macOS installation", () => {
+  it("installs a fresh archive, repeats installation and leaves no transaction workspace", () => run(Effect.gen(function* () {
+    const f = yield* fixture
+    yield* f.fs.remove(f.bundle, { recursive: true })
+    for (let attempt = 0; attempt < 2; attempt++) {
+      expect(yield* f.archiveInstall).toEqual({ _tag: "Installed", version: "0.1.6" })
+      expect(yield* f.fs.readFileString(join(f.bundle, "version"))).toBe("0.1.6")
+      expect(yield* f.fs.exists(join(f.root, ".Magnitude.app.update"))).toBe(false)
+    }
+    expect(f.events).toEqual(["stage", "stage"])
+  })))
+
+  it("archive installation refuses an active installation lease without staging", () => run(Effect.gen(function* () {
+    const f = yield* fixture
+    const admission = yield* MacUpdateAdmission
+    expect(Option.isSome(yield* admission.shared(f.bundle))).toBe(true)
+    expect(yield* f.archiveInstall.pipe(Effect.isFailure)).toBe(true)
+    expect(f.events).toEqual([])
+    expect(yield* f.fs.readFileString(join(f.bundle, "version"))).toBe("0.1.5")
+  })))
+
   it("verifies and records the attempt before staging, then retires preparation after verified exchange", () => run(Effect.gen(function* () {
     const f = yield* fixture
     expect(yield* f.install.pipe(Effect.provideService(PreparedUpdateStore, f.store), Effect.provideService(MacUpdateArchiveStager, f.stager)))

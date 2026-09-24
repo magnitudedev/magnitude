@@ -8,7 +8,7 @@ import { describe, expect, it } from "vitest"
 import { MacUpdateFilesystem, MacUpdateFilesystemFailed, nativeMacUpdateFilesystem } from "./mac-update-filesystem"
 import { MacBundleVerificationFailed, MacBundleVerifier } from "./mac-update-validation"
 import { MacUpdateJournal, recoverMacUpdateTransaction, retireMacUpdateBundle } from "./mac-update-recovery"
-import { exchangeMacUpdate } from "./mac-update-transaction"
+import { exchangeMacUpdate, publishMacInstallation } from "./mac-update-transaction"
 
 const addon = fileURLToPath(new URL(`../../dist/native/darwin-${process.arch}/desktop-host.node`, import.meta.url))
 const run = <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem | MacUpdateFilesystem | Scope.Scope>) =>
@@ -44,10 +44,38 @@ const fixture = Effect.gen(function* () {
   const apply = exchangeMacUpdate(installed, "Magnitude.app", staging, { previous: "0.1.5", replacement: "0.1.6", architecture: "arm64" }).pipe(
     Effect.provideService(MacBundleVerifier, verifier))
   const retire = retireMacUpdateBundle(installed, "Magnitude.app", staging).pipe(Effect.provideService(MacBundleVerifier, verifier))
-  return { fs, native, root, installed, staging, oldPath, newPath, previous, replacement, write, read, recover, swap, apply, retire }
+  return { fs, native, verifier, root, installed, staging, oldPath, newPath, previous, replacement, write, read, recover, swap, apply, retire }
 })
 
 describe.skipIf(process.platform !== "darwin")("macOS prepared bundle exchange", () => {
+  it.each([false, true])("publishes a verified first installation, post-rename error = %s", reportedError => run(Effect.gen(function* () {
+    const { fs, native, verifier, installed, staging, oldPath, replacement } = yield* fixture
+    yield* fs.remove(oldPath, { recursive: true })
+    let calls = 0
+    const observed = { ...native, publish: (...args: Parameters<typeof native.publish>) => Effect.gen(function* () {
+      calls++
+      yield* native.publish(...args)
+      if (reportedError) return yield* new MacUpdateFilesystemFailed()
+    }) }
+    expect(yield* publishMacInstallation(installed, "Magnitude.app", staging, { version: "0.1.6", architecture: "arm64" }).pipe(
+      Effect.provideService(MacBundleVerifier, verifier), Effect.provideService(MacUpdateFilesystem, observed)))
+      .toEqual({ _tag: "Installed", version: "0.1.6" })
+    expect(calls).toBe(1)
+    expect(Option.getOrThrow(yield* native.inspect(installed, "Magnitude.app"))).toBe(replacement)
+    expect(Option.isNone(yield* native.readRecord(staging))).toBe(true)
+  })))
+
+  it.each(["existing", "invalid", "journal"])("refuses fresh publication with %s state", problem => run(Effect.gen(function* () {
+    const { fs, native, verifier, installed, staging, oldPath, newPath, replacement, write } = yield* fixture
+    if (problem !== "existing") yield* fs.remove(oldPath, { recursive: true })
+    if (problem === "invalid") yield* fs.writeFileString(join(newPath, "version"), "invalid")
+    if (problem === "journal") yield* write("ExchangeIntent")
+    expect(yield* publishMacInstallation(installed, "Magnitude.app", staging, { version: "0.1.6", architecture: "arm64" }).pipe(
+      Effect.provideService(MacBundleVerifier, verifier), Effect.isFailure)).toBe(true)
+    expect(Option.getOrThrow(yield* native.inspect(staging, "Magnitude.app"))).toBe(replacement)
+    expect(yield* fs.exists(oldPath)).toBe(problem === "existing")
+  })))
+
   it("verifies, synchronizes, journals and installs through recovery", () => run(Effect.gen(function* () {
     const { apply, read, native } = yield* fixture
     const events: string[] = []

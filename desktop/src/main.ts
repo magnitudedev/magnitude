@@ -1,6 +1,5 @@
 import { windowChrome, windowControlColors } from "./window-chrome"
-import { makeMacCliPath } from "./mac-cli-path"
-import { makeMacCliLink } from "./mac-cli-link"
+import { makeMacCliRegistration } from "@magnitudedev/daemon-management/desktop-native"
 import { ApplicationUpdateControlFailed } from "@magnitudedev/sdk/desktop-host"
 import { makeRendererRecovery } from "./renderer-recovery"
 import { resolveQuitFailure } from "./quit-failure"
@@ -137,7 +136,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     : yield* Effect.gen(function* () {
       const privateFiles = (process.platform === "win32" ? windowsPrivateFilePermissions(addonPath) : unixPrivateFilePermissions).pipe(Layer.provideMerge(NodeContext.layer))
       if (process.platform === "win32") {
-        const retired = yield* recoverWindowsUpdateDirectory(addonPath, dataDir)
+        const retired = yield* recoverWindowsUpdateDirectory(addonPath, dataDir).pipe(Effect.provide(NodeContext.layer))
         if (retired) yield* Effect.logWarning("An older update cache was preserved separately. Download the update again.")
       }
       const identity = yield* makeUpdateIdentity(dataDir).pipe(Effect.provide(privateFiles))
@@ -386,18 +385,7 @@ const program = Effect.scoped(Effect.gen(function* () {
   const cliLink = process.platform === "darwin" && app.isPackaged && !isolatedProfile && app.isInApplicationsFolder()
     ? yield* Effect.gen(function* () {
       const environment = yield* Fiber.join(harnessEnvironment)
-      const link = yield* makeMacCliLink({ link: join(homedir(), ".magnitude/bin/magnitude"),
-        target: join(process.resourcesPath, "magnitude"), path: environment.PATH ?? "" })
-      const path = yield* makeMacCliPath(homedir(), environment)
-      const registration = yield* Effect.makeSemaphore(1)
-      return {
-        install: registration.withPermits(1)(link.install.pipe(Effect.zipRight(path.install))),
-        remove: registration.withPermits(1)(Effect.gen(function* () {
-          if ((yield* link.read) !== "Installed") return
-          yield* path.remove
-          yield* link.remove
-        })),
-      }
+      return yield* makeMacCliRegistration({ home: homedir(), resourcesDirectory: process.resourcesPath, environment })
     }).pipe(Effect.provide(NodeContext.layer)) : undefined
   const installCli = cliLink?.install ?? Effect.void
   const cliResult = (operation: typeof installCli) => operation.pipe(

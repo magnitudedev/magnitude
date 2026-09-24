@@ -22,6 +22,8 @@ export interface MacUpdateFilesystem {
   readonly writeRecord: (directory: MacUpdateDirectory, bytes: Uint8Array) => Effect.Effect<void, MacUpdateFilesystemFailed>
   readonly exchange: (installed: MacUpdateDirectory, installedName: string, previous: MacFileIdentity,
     staging: MacUpdateDirectory, stagedName: string, replacement: MacFileIdentity) => Effect.Effect<void, MacUpdateFilesystemFailed>
+  readonly publish: (installed: MacUpdateDirectory, installedName: string,
+    staging: MacUpdateDirectory, stagedName: string, replacement: MacFileIdentity) => Effect.Effect<void, MacUpdateFilesystemFailed>
 }
 export const MacUpdateFilesystem = Context.GenericTag<MacUpdateFilesystem>("@magnitudedev/daemon-management/MacUpdateFilesystem")
 
@@ -37,6 +39,8 @@ interface Bindings {
   readonly readMacUpdateRecord: (directory: object) => Uint8Array | null
   readonly writeMacUpdateRecord: (directory: object, bytes: Buffer) => void
   readonly exchangeMacUpdateDirectories: (installed: object, installedName: string, previous: string,
+    staging: object, stagedName: string, replacement: string) => void
+  readonly publishMacUpdateDirectory: (installed: object, installedName: string,
     staging: object, stagedName: string, replacement: string) => void
 }
 const attempt = <A>(run: () => A) => Effect.try({ try: run, catch: () => new MacUpdateFilesystemFailed() })
@@ -64,5 +68,7 @@ export const nativeMacUpdateFilesystem = (addonPath: string) => Layer.effect(Mac
     writeRecord: (directory, bytes) => attempt(() => native.writeMacUpdateRecord(directory[handle], Buffer.from(bytes))),
     exchange: (installed, installedName, previous, staging, stagedName, replacement) =>
       attempt(() => native.exchangeMacUpdateDirectories(installed[handle], installedName, previous, staging[handle], stagedName, replacement)),
+    publish: (installed, installedName, staging, stagedName, replacement) =>
+      attempt(() => native.publishMacUpdateDirectory(installed[handle], installedName, staging[handle], stagedName, replacement)),
   })
 }))

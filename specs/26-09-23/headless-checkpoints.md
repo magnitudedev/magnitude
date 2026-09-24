@@ -1467,3 +1467,213 @@ Windows update orchestration tests, CLI regression tests (102), targeted CLI/rel
 workflow lint and PowerShell/Bash syntax checks. The macOS harness uses a real published ICN and
 requires a completion receipt; its corrected signed end-to-end run is still pending. Full-install
 scripts and final cross-platform acceptance remain open. This checkpoint does not complete the goal.
+
+### Phase 8 working results: shared macOS command registration
+
+Desktop command linking and managed shell PATH registration now live in the shared privileged host
+package. Desktop uses the same composed registration operation that the installation flow will use;
+the shell directory constant is shared with link placement. Existing overwrite/removal policy is
+preserved, and distribution applicability now covers these shared modules.
+
+The moved tests pass (12), with the real fresh zsh/bash login and interactive shell test exercising
+the shared registration entry twice before resolving and executing the bundled command. The Desktop
+suite passes (210, two platform-gated skips); the other 12 formerly Desktop tests now run in the host
+package. Targeted Desktop and daemon-management typechecks exit 0 with existing Effect diagnostics.
+No installation script or fresh bundle publication is established by this extraction. Those remain
+the next Phase 8 work, and this is not a separate checkpoint commit.
+
+Signed macOS acceptance run 35956696719 remains in progress. Its native macOS, Windows and both
+Linux jobs passed; the signed installer job still requires its completion receipt before acceptance.
+
+### Phase 8 working results: first macOS bundle publication
+
+The native transaction filesystem now supports same-volume, descriptor-relative initial publication
+with atomic no-replacement rename. It validates the staged identity and private staging capability,
+refuses existing destinations, and synchronizes both parents. The shared workspace exposes verified
+first installation under its existing exclusive lease and revalidates admission at publication.
+It verifies and synchronizes the staged bundle before mutation, reconciles identity after a reported
+publication error, verifies the installed bundle, and completes parent synchronization. There is no
+displaced bundle or exchange journal for initial publication; the atomic boundary leaves absence or
+the complete bundle. Existing installations continue through the replacement transaction.
+
+The native addon rebuilt successfully on macOS. Filesystem, recovery/transaction and workspace tests
+pass (96), including fresh publication, identity mismatch, repeated publication refusal, preservation
+of existing files/directories/symlinks, invalid staged verification, retained transaction refusal and
+an injected error after successful publication without a second rename. The host package typecheck
+exits 0. Installer command wiring, script bootstrap and signed fresh-install acceptance remain open;
+these tests do not establish those end-to-end paths.
+
+The archive installation operation now composes fresh publication and existing-bundle exchange
+through the same workspace, staging and verifier services. It reconciles retained transactions before
+an explicit retry, observes the existing installed version for replacement, and retires completed
+transaction contents. It does not start an application owner. Integration exposed the native lease's
+existing-bundle requirement; exclusive admission now permits an absent destination with current-user
+lock ownership and confirms absence again after locking. Shared application admission still rejects
+absence, and later owners reuse the same lock after publication.
+
+The native addon rebuilt and the archive/prepared-installation, lease and workspace suites pass (26).
+Coverage includes fresh archive installation, repeat replacement, no staging while a live shared
+lease exists, and retention of lock identity from first installation into owner admission. The archive
+test supplies controlled stager/verifier services; real signed archive and bootstrap acceptance remain
+required. Targeted host typechecking exits 0. CLI entry and install scripts are still to be connected.
+
+The hidden `_install-mac-application` CLI entry is now connected to archive installation and shared
+command registration. It validates bounded input, requires an extracted executing bundle outside
+the destination, verifies that source bundle, reads its sealed publisher configuration, and retains
+application maintenance admission. It invokes no owner startup. Its seven input tests and seven
+archive/prepared-installation tests pass; all 102 CLI regressions pass. Host and CLI targeted
+typechecks exit 0. Shell bootstrap and signed invocation of this new command remain unverified.
+
+Corrected signed macOS run 35956696719 completed with failure, not acceptance. Its finite update
+printed installation success and native publisher acceptance passed, but foreground continuation
+failed because inference exited with code 1 before readiness. The service also reported EBADF during
+cleanup. The native Mac, Windows and both Linux jobs passed. Failure log is saved at
+`/tmp/magnitude-headless-signed-mac-35956696719.log`; artifact download to
+`/tmp/magnitude-headless-transfer/mac-35956696719` is in progress for diagnosis. There is no successful
+foreground/desktop receipt from this run, and those acceptance requirements remain open.
+
+The published macOS inference 0.1.5 installation was independently acquired into
+`/tmp/magnitude-headless-transfer/published-mac-inference`. A bounded direct launch emitted Ready
+and exited 0 on SIGTERM. The existing signed 0.0.504 fixture then served with that installation in
+an isolated profile on port 11839, reported Headless Ready, answered a public `models status` query,
+and exited 0 on SIGTERM. Its log is `mac-published-engine-serve.log` in the transfer directory.
+This narrows the failed CI run but does not establish its cause or validate update continuation.
+The ICN lifecycle now logs its already-bounded captured diagnostics on pre-readiness exit, while
+keeping the ordinary error message concise. Six lifecycle tests pass and targeted ICN typechecking
+exits 0. The CI artifact download remains active; no replacement run has been dispatched.
+
+Full-installation release admission now reuses the existing signed release proof and shared channel
+policy with an explicit caller-selected target. The small offer contains only the release and its
+trusted-repository download URL; it can be projected from verified publisher records. Six tests pass
+for fresh installation admission, architecture/package/OS mismatches, tampered content, missing trust,
+foreign download origin, excess fields and channel selection. This is the metadata validation layer;
+the installation scripts and publication wiring remain unfinished.
+
+The Unix installer template now implements the macOS path: bounded HTTPS metadata/download,
+size and digest checks, private bootstrap extraction, pinned Apple publisher verification and
+Gatekeeper assessment, then the finite bundled installer. Its request includes the complete offer
+and selected channel; the verified bundled command authenticates those against its publisher trust
+before installation. A release-owned generator validates and pins metadata origin and Apple team.
+The script does not launch an application owner. Twelve release metadata/generation tests and seven
+installer-input tests pass; shell syntax and help pass, and release/host targeted typechecks exit 0.
+The Linux branch, Windows script, generated-script publication and signed script acceptance remain
+unfinished. The template is not yet a complete cross-platform installer and is not published.
+
+The Unix template now has a Linux branch that selects apt/dnf, authenticates release metadata with
+the pinned Ed25519 publisher key using Python 3 and OpenSSL, verifies package size/digest, then invokes
+the package manager. It requires curl, Python 3 and an OpenSSL version supporting Ed25519. It preserves
+the package manager's existing live-owner admission and never starts the application. Native Ubuntu
+22 arm64 execution passed five maintained shell tests: valid input reached the recorded package
+installation, while invalid signature, digest, architecture and channel did not. Only network and
+privileged package mutation were substituted; JSON validation and OpenSSL verification were real.
+Actual script-driven DEB/RPM installation and Windows bootstrap remain required. Release typechecking
+and shell syntax pass. The signed macOS artifact download completed at the recorded transfer path.
+
+The exact signed 0.0.503 artifact from run 35956696719 was extracted locally and passed strict deep
+code-signature verification. It reached Headless Ready with published inference 0.1.5 on port 11839,
+then exited 0 on SIGTERM; passive status confirmed Stopped/None. The isolated local log is
+`/tmp/magnitude-headless-transfer/mac-35956696719-local.log`. This does not reproduce the CI failure
+and does not establish the original update-continuation receipt.
+
+The Windows PowerShell bootstrap now downloads and authenticates a standalone CLI verifier before
+using its embedded publisher key to authenticate the installation offer and exact installer bytes.
+It also verifies installer Authenticode publisher/timestamp, waits for `/S` setup and updates the
+current shell PATH. Windows CLI release compilation now includes its existing signing pipeline.
+Six verifier tests pass for valid input, bad signature, modified/truncated/oversized bytes and wrong
+target. Seven script-generation tests pass, CLI targeted typechecking exits 0, and native Windows
+PowerShell parses the template without errors. Actual signed bootstrap execution, acceptance-key
+build configuration, package/publication integration and complete script regression lanes remain open.
+
+Release tooling now prepares a fresh static installation distribution from verified publisher records:
+Unix/PowerShell scripts plus channel/target offers. Mixed versions, duplicate targets and invalid
+signatures fail before output creation; an existing hosting directory is never overwritten. The
+publisher can export its accepted records through `MAGNITUDE_INSTALL_PUBLICATIONS_OUTPUT`, and
+`prepare-installation-distribution.ts` consumes those records with explicit hosting/signing inputs.
+This prepares local output only; it does not deploy script URLs or move a live channel. Ten script and
+distribution tests pass, and release typechecking exits 0. Windows download cancellation now covers
+stream reads as well as headers; the updated template parses in native Windows PowerShell.
+Real HTTPS/script/package acceptance and acceptance-key compilation are still open.
+
+The maintained Linux HTTPS/script acceptance passed on the disposable Ubuntu 22 arm64 VM using the
+existing compiled 0.1.9-1 DEB fixture. The prior idle test package was removed first. A temporary local
+TLS server hosted generated metadata and the real package; curl used an isolated test CA and explicit
+GitHub-to-loopback mapping, with no global trust changes. The generated installer authenticated the
+release, downloaded and verified the package, and installed through real apt. Passive status remained
+Stopped. The installed public command reached Headless Ready, answered model status and hardware,
+exited 0 on SIGTERM, and supported a repeat script installation while remaining stopped. The test
+server and owner were retired; the package remains installed for later regression tests.
+
+Receipt and logs are under `/tmp/magnitude-headless-transfer/ubuntu-script-evidence`, copied from
+VM `/tmp/magnitude-script-acceptance.IHDYoGDA`. This proves script/package integration against that
+fixture, not a newly rebuilt final cohort. Fedora script execution, Windows/Mac signed script
+acceptance, fault cases and the final application regression lanes remain open. Sixteen release
+metadata/script-generation tests pass.
+
+The same HTTPS/script acceptance passed on Fedora 44 arm64 through real dnf with the existing
+0.1.9-9 RPM fixture. The prepared hosting tree was generated on Ubuntu, then served and consumed
+inside Fedora with an isolated TLS trust file. Initial Stopped, Headless Ready, model/hardware
+queries, SIGTERM exit 0, repeat installation and final Stopped all passed. Local evidence is
+`/tmp/magnitude-headless-transfer/fedora-script-evidence`, copied from Fedora
+`/tmp/magnitude-script-acceptance.suzquiMJ`. The test package remains installed; no test owner or
+HTTPS server remains. Both DEB and RPM script results still use prior compiled fixture cohorts.
+
+Acceptance builds can now embed their isolated bootstrap publisher key at compile time; normal
+builds retain the checked-in production public key. The maintained compiled verifier acceptance
+passed on this Mac and in Windows: real CLI compilation, accepted signed fixture bytes, rejected
+same-length tampering, ignored runtime key override, and no application state creation. Test paths
+include spaces and an apostrophe. This does not establish Authenticode/bootstrap script execution;
+that remains the next Windows gate. Release and CLI typechecks exit 0.
+
+The signed Windows bootstrap acceptance now passes against a freshly built 0.0.505 fixture from
+Phase 8 source. Its application and standalone verifier used an isolated test publisher with real
+Authenticode timestamps. The generated PowerShell script was fetched over HTTPS and downloaded the
+verifier and installer through their normal HTTPS URLs, served locally inside the disposable VM.
+The script accepted both executable signatures, authenticated release metadata and installer bytes,
+completed native silent setup, and exposed the registered command in the invoking shell. Version was
+0.0.505 and passive status was Stopped/None. Repeat installation passed. A modified release digest
+was rejected with application release verification failure, leaving 0.0.505 stopped and unchanged.
+
+This test caught an unnecessary ARM Windows rejection in the script; removing that restriction lets
+Windows execute the existing x64 release through its supported emulation. The VM acceptance used
+that actual x64 package. Seven generation tests and release targeted typechecking pass. The VM's
+ordinary script-file execution policy was preserved; the downloaded script ran as a script block,
+as with the intended interactive bootstrap invocation.
+
+Evidence is `/tmp/magnitude-headless-transfer/windows-script-evidence.txt`; full guest build and
+script logs are in `C:\Users\trg\hs-phase8`. The temporary HTTPS server was stopped, original hosts
+bytes restored, and both temporary root certificates and private certificates removed. Cleanup was
+independently checked. The 0.0.505 application remains installed and stopped. This establishes signed
+script replacement/repeat/failure behavior, not a fresh-machine install or foreground serve acceptance
+for this new cohort. Those checks, maintained orchestration of this HTTPS lane, signed Mac bootstrap,
+and final desktop/CLI/remote regressions remain open. No Phase 8 checkpoint has been committed yet.
+
+The maintained installed-headless acceptance passed against the script-installed Windows 0.0.505
+application: initially stopped, public launcher `serve` reached Headless Ready with published ICN
+0.1.5, model status and hardware queries succeeded, application-control Quit returned launcher exit 0,
+and final status was Stopped/None. Native process inspection found no remaining Magnitude processes.
+Local receipt: `/tmp/magnitude-headless-transfer/windows-script-serve-evidence.txt`; guest details:
+`C:\Users\trg\hs-phase8\serve-acceptance`. This closes the Windows script-to-serve/query integration
+check for that cohort, without claiming model inference or desktop UI coverage.
+
+The first attempt used an absent profile with a separately located state directory and exposed a
+startup initialization defect: native update-directory creation requires its parent to exist.
+Shared Windows recovery now creates the profile parent before native private-cache creation. This
+preserves existing-cache validation and repair rules. Five real Windows staging tests pass, including
+the new absent-profile case; six foreground-update orchestration tests also pass. The installed
+0.0.505 fixture predates this small fix: its successful packaged run used the ordinary shared
+profile/state layout. A subsequent packaged cohort must cover the separate-root case as well.
+
+The signed Mac acceptance is now wired to install its first signed fixture through the generated
+HTTPS shell script instead of direct ZIP extraction. It checks fresh and repeat installation,
+signature rejection, isolated shell registration, stopped state and native publisher/notarization
+acceptance, then runs the maintained installed serve/query test before its existing update sequence.
+CI retains shell and serve receipts/logs. This new signed lane has not run yet. Shell syntax passes;
+release and host targeted typechecks pass, and 138 affected Mac/native tests pass. Signed Mac
+execution and remaining script fault/regression gates still precede the Phase 8 completion claim.
+
+Checkpoint preparation: the full ordinary CLI suite passes 102 tests and the Desktop suite passes
+210 tests with two platform skips after shared command-registration extraction. Sixteen release
+metadata/distribution/script tests pass. CLI targeted typechecking passes. The Phase 8 implementation
+is substantial enough to checkpoint for signed Mac execution; this checkpoint does not close Phase 8.
+The Windows and Linux script integrations have real native evidence, while signed Mac script execution,
+further failure/lease cases and final fresh-profile packaged coverage remain outstanding.

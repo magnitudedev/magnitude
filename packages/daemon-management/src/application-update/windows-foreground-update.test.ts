@@ -1,4 +1,5 @@
 import { CommandExecutor } from "@effect/platform"
+import { BunFileSystem } from "@effect/platform-bun"
 import { Effect, Option } from "effect"
 import { createHash, generateKeyPairSync } from "node:crypto"
 import { mkdtemp, rm } from "node:fs/promises"
@@ -54,7 +55,7 @@ const run = async (options: { attempted?: boolean; automatic?: boolean; protocol
         return CommandExecutor.ExitCode(options.installerCode ?? 0)
       }),
       string: () => step("version").pipe(Effect.as(options.version ?? "0.1.6\n")),
-    }), Effect.provide(host), Effect.either)).finally(() => rm(root, { recursive: true, force: true }))
+    }), Effect.provide(host), Effect.provide(BunFileSystem.layer), Effect.either)).finally(() => rm(root, { recursive: true, force: true }))
 }
 test("releases application ownership while retaining installation admission through completion", async () => {
   expect(await run()).toMatchObject({ _tag: "Right", right: true })

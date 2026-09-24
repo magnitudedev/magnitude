@@ -15,6 +15,20 @@ import { makeWindowsUpdateSource } from "./windows-update-source"
 
 // Exercise the real private-file adapter; native publisher verification has separate executable tests.
 describe.skipIf(process.platform !== "win32")("Windows installer staging", () => {
+  it("creates an absent profile before preparing its private update directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "windows-update-fresh-"))
+    try {
+      await Effect.runPromise(Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem
+        const addon = fileURLToPath(new URL("../../dist/native/win32-x64/desktop-host.node", import.meta.url))
+        const profile = join(root, "profile")
+        expect(yield* fs.exists(profile)).toBe(false)
+        expect(yield* recoverWindowsUpdateDirectory(addon, profile)).toBe(false)
+        expect(yield* recoverWindowsUpdateDirectory(addon, profile)).toBe(false)
+        expect(yield* fs.exists(join(profile, "updates"))).toBe(true)
+      }).pipe(Effect.provide(BunContext.layer)))
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
   it.each(["valid", "inherited", "changed", "unsigned"] as const)("handles a %s installer before allowing handoff", async scenario => {
     const directory = await mkdtemp(join(tmpdir(), "windows-update-stage-"))
     const archive = join(directory, "download.exe")

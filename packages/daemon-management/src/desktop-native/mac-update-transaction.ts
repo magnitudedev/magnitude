@@ -2,7 +2,7 @@ import { Effect, Option, Schema } from "effect"
 import { randomUUID } from "node:crypto"
 import { join } from "node:path"
 import { MacUpdateFilesystem, type MacUpdateDirectory } from "./mac-update-filesystem"
-import { MacBundleVerifier } from "./mac-update-validation"
+import { MacBundleVerifier, type MacBundleExpectation } from "./mac-update-validation"
 import { ExchangeIntent, MacUpdateJournal, MacUpdateRepairRequired, recoverMacUpdateTransaction, type MacUpdateRecoveryResult } from "./mac-update-recovery"
 
 export const MacUpdateVersions = Schema.Struct({
@@ -14,6 +14,32 @@ export type MacUpdateVersions = typeof MacUpdateVersions.Type
 export class MacUpdatePreparationFailed extends Schema.TaggedError<MacUpdatePreparationFailed>()("MacUpdatePreparationFailed", {}) {
   override get message() { return "The application update could not be prepared for installation." }
 }
+
+/** First installation has no displaced bundle; atomic publication leaves either absence or the complete bundle. */
+export const publishMacInstallation = (installed: MacUpdateDirectory, installedName: string,
+  staging: MacUpdateDirectory, expected: MacBundleExpectation) => Effect.uninterruptibleMask(restore => Effect.gen(function* () {
+  const fs = yield* MacUpdateFilesystem
+  const verifier = yield* MacBundleVerifier
+  const replacement = yield* restore(Effect.gen(function* () {
+    if (Option.isSome(yield* fs.readRecord(staging)) || Option.isSome(yield* fs.inspect(installed, installedName))) {
+      return yield* new MacUpdatePreparationFailed()
+    }
+    const candidate = yield* fs.inspect(staging, "Magnitude.app")
+    if (Option.isNone(candidate)) return yield* new MacUpdatePreparationFailed()
+    yield* verifier.verify(join(staging.path, "Magnitude.app"), expected)
+    yield* fs.syncTree(staging, "Magnitude.app", candidate.value)
+    return candidate.value
+  }).pipe(Effect.mapError(() => new MacUpdatePreparationFailed())))
+  yield* fs.publish(installed, installedName, staging, "Magnitude.app", replacement).pipe(
+    Effect.catchTag("MacUpdateFilesystemFailed", () => Effect.void))
+  // A reported sync error can follow successful rename. Reconcile without repeating publication.
+  if (!Option.contains(yield* fs.inspect(installed, installedName), replacement) ||
+      Option.isSome(yield* fs.inspect(staging, "Magnitude.app"))) return yield* new MacUpdatePreparationFailed()
+  yield* verifier.verify(join(installed.path, installedName), expected)
+  yield* fs.sync(installed)
+  yield* fs.sync(staging)
+  return { _tag: "Installed", version: expected.version } as const
+})).pipe(Effect.mapError(() => new MacUpdatePreparationFailed()))
 
 /** The finite installer owns exclusion and has authenticated/extracted the retained archive. */
 export const exchangeMacUpdate = (installed: MacUpdateDirectory, installedName: string, staging: MacUpdateDirectory,

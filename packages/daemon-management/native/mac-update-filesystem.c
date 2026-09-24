@@ -321,6 +321,26 @@ static napi_value write_record(napi_env env, napi_callback_info info) {
   if (!renamed) unlinkat(directory->fd, temporary, 0);
   return valid ? nothing(env) : fail(env);
 }
+/* Initial publication never replaces an entry, even if one appears after admission. */
+static napi_value publish(napi_env env, napi_callback_info info) {
+  napi_value args[5]; size_t argc = 5;
+  char installed_name[NAME_MAX + 1], staged_name[NAME_MAX + 1], expected[64], actual[64];
+  struct stat staged, observed;
+  if (napi_get_cb_info(env, info, &argc, args, NULL, NULL) != napi_ok || argc != 5 ||
+      !leaf(env, args[1], installed_name) || !leaf(env, args[3], staged_name) ||
+      !string(env, args[4], expected, sizeof(expected))) return fail(env);
+  update_directory *installed = unwrap(env, args[0], 1), *staging = unwrap(env, args[2], 1);
+  if (!installed || !staging || !staging->private_directory ||
+      same(installed->identity, staging->identity) ||
+      installed->identity.st_dev != staging->identity.st_dev ||
+      fstatat(staging->fd, staged_name, &staged, AT_SYMLINK_NOFOLLOW) ||
+      !S_ISDIR(staged.st_mode) || staged.st_uid != geteuid()) return fail(env);
+  identity_text(staged, actual); if (strcmp(actual, expected)) return fail(env);
+  if (renameatx_np(staging->fd, staged_name, installed->fd, installed_name, RENAME_EXCL) ||
+      fstatat(installed->fd, installed_name, &observed, AT_SYMLINK_NOFOLLOW) || !same(observed, staged) ||
+      fsync(installed->fd) || fsync(staging->fd)) return fail(env);
+  return nothing(env);
+}
 static napi_value exchange(napi_env env, napi_callback_info info) {
   napi_value args[6]; size_t argc = 6;
   char left_name[NAME_MAX + 1], right_name[NAME_MAX + 1], expected_left[64], expected_right[64], actual[64];
@@ -355,6 +375,7 @@ void magnitude_register_mac_update_filesystem(napi_env env, napi_value exports) 
     {"removeMacUpdateRecord", NULL, remove_record, NULL, NULL, NULL, napi_default, NULL},
     {"writeMacUpdateRecord", NULL, write_record, NULL, NULL, NULL, napi_default, NULL},
     {"exchangeMacUpdateDirectories", NULL, exchange, NULL, NULL, NULL, napi_default, NULL},
+    {"publishMacUpdateDirectory", NULL, publish, NULL, NULL, NULL, napi_default, NULL},
   };
   napi_define_properties(env, exports, sizeof(methods) / sizeof(methods[0]), methods);
 }
