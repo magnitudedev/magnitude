@@ -1,5 +1,5 @@
 //! CUDA recurrent and attention projection entries
-//! (`kernels/cuda_projection_blocks.seismic`) against host models over mma16
+//! (`kernels/{attention,recurrent}.seismic`) against host models over mma16
 //! weights; the gated recurrent-output host model is pinned to C's portable
 //! body by the reference interpreter. Tests return early without CUDA.
 
@@ -7,12 +7,12 @@ mod cuda_common;
 
 use cuda_common::*;
 use magnitude_model_kernels::{
-    qwen_attention_output, qwen_attention_project, qwen_recurrent_output, qwen_recurrent_project,
+    attention_output, qwen_attention_project, qwen_recurrent_output, qwen_recurrent_project,
 };
 use seismic::{Element, Layout, NativeSpecialization, Tensor};
 use seismic_lang::registry::bf16_round;
 
-const ROWS: [usize; 6] = [1, 3, 8, 16, 40, 128];
+const ROWS: [usize; 8] = [1, 3, 8, 12, 16, 17, 40, 128];
 
 /// The specialization of an entry; `split` for entries declaring SPLIT.
 fn specialization(statics: &[(&str, usize)], mapping: Mapping, split: bool) -> NativeSpecialization {
@@ -56,13 +56,25 @@ fn cuda_recurrent_project_matches_host_model() {
     let (h, nk, nv, w) = (512usize, 2usize, 4usize, 64usize);
     let (qkv, z) = ((2 * nk + nv) * w, nv * w);
     let width = qkv + z + 2 * nv;
-    // The 4B mix (qkv q5k, z q4k, alpha/beta q8) and a uniform q6k set.
-    for formats in [[Format::Q5K, Format::Q4K, Format::Q8, Format::Q8], [Format::Q6K; 4]] {
+    // The 4B mix (qkv q5k, z q4k, alpha/beta q8), a uniform q6k set, and the
+    // 4B MTP GGUF's mix (qkv q6k, alpha/beta F32 in the file: dense, resident
+    // bf16). `None` is a dense bf16 weight.
+    let mixes: [[Option<Format>; 4]; 3] = [
+        [Some(Format::Q5K), Some(Format::Q4K), Some(Format::Q8), Some(Format::Q8)],
+        [Some(Format::Q6K); 4],
+        [Some(Format::Q6K), Some(Format::Q4K), None, None],
+    ];
+    for formats in mixes {
+        let make = |format: Option<Format>, rows: usize, rng: &mut Rng| match format {
+            Some(format) => weight(&device, format, rows, h, rng),
+            None => dense_weight(&device, rows, h, rng),
+        };
+        let element = |format: Option<Format>| format.map_or(Element::bf16(), Format::resident);
         let weights = [
-            weight(&device, formats[0], qkv, h, &mut rng),
-            weight(&device, formats[1], z, h, &mut rng),
-            weight(&device, formats[2], nv, h, &mut rng),
-            weight(&device, formats[3], nv, h, &mut rng),
+            make(formats[0], qkv, &mut rng),
+            make(formats[1], z, &mut rng),
+            make(formats[2], nv, &mut rng),
+            make(formats[3], nv, &mut rng),
         ];
         for m in ROWS {
             let hidden_values: Vec<f32> = (0..m * h).map(|_| rng.uniform(-3.0, 3.0)).collect();
@@ -71,11 +83,13 @@ fn cuda_recurrent_project_matches_host_model() {
             let hidden = f32_tensor(&device, &[m as u64, h as u64], &hidden_values);
             let norm = f32_tensor(&device, &[h as u64], &norm_values);
             for &mapping in mappings(m) {
-                let (x, slack) = operand_rows(&normed, h, mapping);
+                // INT8 has no effect when any weight is dense.
+                let path = if formats.contains(&None) { Mapping { int8: 0, ..mapping } } else { mapping };
+                let (x, slack) = operand_rows(&normed, h, path);
                 let mut expected = vec![0.0; m * width];
                 let mut tolerance = vec![0.0; m * width];
                 for (weight, (offset, n)) in weights.iter().zip([(0, qkv), (qkv, z), (qkv + z, nv), (qkv + z + nv, nv)]) {
-                    let (values, bound) = rounded_segment(&x, &slack, weight, m, n, h, mapping);
+                    let (values, bound) = rounded_segment(&x, &slack, weight, m, n, h, path);
                     place(&mut expected, width, offset, &values, m, n);
                     place(&mut tolerance, width, offset, &bound, m, n);
                 }
@@ -83,10 +97,10 @@ fn cuda_recurrent_project_matches_host_model() {
                     &device,
                     qwen_recurrent_project::Elements {
                         NW: Element::f32(),
-                        QW: formats[0].resident(),
-                        GW: formats[1].resident(),
-                        AW: formats[2].resident(),
-                        BW: formats[3].resident(),
+                        QW: element(formats[0]),
+                        GW: element(formats[1]),
+                        AW: element(formats[2]),
+                        BW: element(formats[3]),
                         A: Element::bf16(),
                     },
                     &specialization(&[("H", h), ("NK", nk), ("NV", nv), ("W", w)], mapping, false),
@@ -246,8 +260,8 @@ fn recurrent_output_host_model_matches_portable_body() {
     let mut rng = Rng(47);
     let mut sources = seismic_std::sources();
     sources.push(SourceFile {
-        path: "recurrent_stages.seismic".into(),
-        text: include_str!("../kernels/recurrent_stages.seismic").into(),
+        path: "recurrent.seismic".into(),
+        text: include_str!("../kernels/recurrent.seismic").into(),
     });
     let module = check_source(sources).unwrap();
     for format in Format::ALL {
@@ -380,13 +394,13 @@ fn cuda_attention_output_matches_host_model() {
                 let tolerance: Vec<f64> = (0..m * d)
                     .map(|i| projected[i].abs() / 256.0 + magnitude[i] * 2e-5 + dequant[i] + 1e-6)
                     .collect();
-                let result = qwen_attention_output::native_for_device_with(
+                let result = attention_output::native_for_device_with(
                     &device,
-                    qwen_attention_output::Elements { A: Element::bf16(), OW: format.resident() },
+                    attention_output::Elements { A: Element::bf16(), OW: format.resident() },
                     &specialization(&[("D", d), ("Q", q), ("W", w)], mapping, true),
                 )
                 .unwrap()
-                .call(qwen_attention_output::Args { hidden: &hidden, gated: &gated_tensor, output_weight: &output.tensor })
+                .call(attention_output::Args { hidden: &hidden, gated: &gated_tensor, output_weight: &output.tensor })
                 .unwrap()
                 .value;
                 check(

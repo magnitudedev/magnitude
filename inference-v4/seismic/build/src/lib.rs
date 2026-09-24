@@ -84,13 +84,19 @@ pub enum BuildError {
         slots: usize,
         limit: usize,
     },
-    /// A native implementation targets a backend whose assets this build
-    /// cannot validate against a generated ABI (Vulkan: no ABI prefix exists
-    /// yet), so it would reach no device unchecked.
-    NativeBackendUnavailable {
+    /// A Vulkan asset (or an included file) uses a construct the generated
+    /// prefix and suffix own: `#version`, `#extension`, the workgroup size,
+    /// push constants, a `shared` declaration, `main`, or an unordered float
+    /// subgroup sum.
+    NativeReserved {
         entry: String,
-        backend: seismic_lang::registry::BackendName,
+        path: PathBuf,
+        line: usize,
+        column: usize,
+        construct: String,
     },
+    /// A launch names a kernel function the asset does not define.
+    NativeKernelMissing { entry: String, kernel: String },
 }
 
 impl std::fmt::Display for BuildError {
@@ -107,7 +113,7 @@ impl std::fmt::Display for BuildError {
                 symbol,
             } => write!(
                 f,
-                "native Metal ABI for `{entry}`: {}:{line}:{column}: `{symbol}` is not generated for this entry",
+                "native ABI for `{entry}`: {}:{line}:{column}: `{symbol}` is not generated for this entry",
                 path.display()
             ),
             Self::NativeInclude(e) => write!(f, "{e}"),
@@ -115,11 +121,20 @@ impl std::fmt::Display for BuildError {
                 f,
                 "native Metal implementation of `{entry}` binds {slots} buffers; Metal admits {limit}"
             ),
-            Self::NativeBackendUnavailable { entry, backend } => write!(
+            Self::NativeReserved {
+                entry,
+                path,
+                line,
+                column,
+                construct,
+            } => write!(
                 f,
-                "native {} implementation of `{entry}`: this build has no {} runtime or ABI to validate it against",
-                backend.as_str(),
-                backend.as_str()
+                "native Vulkan implementation of `{entry}`: {}:{line}:{column}: {construct}",
+                path.display()
+            ),
+            Self::NativeKernelMissing { entry, kernel } => write!(
+                f,
+                "native Vulkan implementation of `{entry}` launches `{kernel}`, but its source defines no `void {kernel}()`"
             ),
         }
     }
@@ -284,12 +299,7 @@ mod internals {
                     }
                     BackendName::Metal => "metal",
                     BackendName::Cuda => "cu",
-                    BackendName::Vulkan => {
-                        return Err(BuildError::NativeBackendUnavailable {
-                            entry: entry.name.clone(),
-                            backend,
-                        })
-                    }
+                    BackendName::Vulkan => "comp",
                 };
                 fs::write(output.join(format!("{}.{extension}", entry.name)), source).map_err(BuildError::Io)?;
                 let files = captured
@@ -300,9 +310,14 @@ mod internals {
                 // ABI, exactly like the asset itself.
                 for file in std::iter::once(&files.asset).chain(&files.includes) {
                     validate_native_abi(entry, definition, backend, &file.path, &file.text)?;
+                    if backend == BackendName::Vulkan {
+                        validate_vulkan_reserved(entry, &file.path, &file.text)?;
+                    }
                 }
-                if backend == BackendName::Metal {
-                    validate_metal_buffer_slots(entry, definition)?;
+                match backend {
+                    BackendName::Metal => validate_metal_buffer_slots(entry, definition)?,
+                    BackendName::Vulkan => validate_vulkan_kernels(entry, definition, source)?,
+                    BackendName::Cpu | BackendName::Cuda => {}
                 }
             }
             if any {
@@ -320,11 +335,7 @@ mod internals {
         source: &str,
     ) -> Result<(), BuildError> {
         let failure = |offset: usize, symbol: &str| {
-            let prefix = &source[..offset];
-            let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
-            let column = prefix
-                .rsplit_once('\n')
-                .map_or(prefix.len() + 1, |(_, tail)| tail.len() + 1);
+            let (line, column) = location(source, offset);
             BuildError::NativeAbi {
                 entry: entry.name.clone(),
                 path: path.to_path_buf(),
@@ -374,13 +385,113 @@ mod internals {
     /// Metal's per-stage buffer argument table size.
     const METAL_BUFFER_SLOTS: usize = 31;
 
+    /// The typed group-memory views of the Vulkan prefix
+    /// (`seismic_runtime`'s `VULKAN_SHARED_VIEWS`), as `SEISMIC_SHARED_<view>`.
+    const VULKAN_SHARED_VIEWS: [&str; 8] = ["F32", "F16", "BF16", "U8", "U16", "U32", "I32", "UVEC4"];
+
+    /// Identifiers a Vulkan asset may not use, with why: the prefix and
+    /// suffix own the workgroup size, push constants, group memory and
+    /// `main`; float subgroup sums have an implementation-defined order.
+    const VULKAN_RESERVED_IDENTIFIERS: [(&str, &str); 13] = [
+        ("local_size_x", "the workgroup size is generated"),
+        ("local_size_y", "the workgroup size is generated"),
+        ("local_size_z", "the workgroup size is generated"),
+        ("local_size_x_id", "the workgroup size is generated"),
+        ("local_size_y_id", "the workgroup size is generated"),
+        ("local_size_z_id", "the workgroup size is generated"),
+        ("push_constant", "the push constant is the generated argument block address"),
+        ("shared", "group memory is the generated `seismic_shared_*` views of `shared_bytes`"),
+        ("main", "`main` is generated and calls the launch's kernel"),
+        ("subgroupAdd", "float subgroup sums have no fixed order; use `seismic_subgroup_sum_f32` or `seismic_redux_add_*`"),
+        ("subgroupInclusiveAdd", "subgroup scans have no fixed order"),
+        ("subgroupExclusiveAdd", "subgroup scans have no fixed order"),
+        ("subgroupClusteredAdd", "clustered sums have no fixed order"),
+    ];
+
+    /// Directives the prefix owns.
+    const VULKAN_RESERVED_DIRECTIVES: [&str; 2] = ["version", "extension"];
+
+    fn location(source: &str, offset: usize) -> (usize, usize) {
+        let prefix = &source[..offset];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let column = prefix
+            .rsplit_once('\n')
+            .map_or(prefix.len() + 1, |(_, tail)| tail.len() + 1);
+        (line, column)
+    }
+
+    fn validate_vulkan_reserved(
+        entry: &EntryInfo,
+        path: &std::path::Path,
+        source: &str,
+    ) -> Result<(), BuildError> {
+        let reserved = |offset: usize, construct: String| {
+            let (line, column) = location(source, offset);
+            BuildError::NativeReserved {
+                entry: entry.name.clone(),
+                path: path.to_path_buf(),
+                line,
+                column,
+                construct,
+            }
+        };
+        let mut offset = 0;
+        for line in source.split_inclusive('\n') {
+            let trimmed = line.trim_start();
+            if let Some(directive) = trimmed.strip_prefix('#') {
+                let name = directive.trim_start().split(|c: char| !c.is_ascii_alphanumeric() && c != '_').next().unwrap_or("");
+                if VULKAN_RESERVED_DIRECTIVES.contains(&name) {
+                    return Err(reserved(
+                        offset + (line.len() - trimmed.len()),
+                        format!("`#{name}` is generated by the Vulkan prefix"),
+                    ));
+                }
+            }
+            offset += line.len();
+        }
+        for (identifier, offset) in identifiers(source) {
+            if let Some((_, why)) = VULKAN_RESERVED_IDENTIFIERS.iter().find(|(name, _)| *name == identifier) {
+                return Err(reserved(offset, format!("`{identifier}` is reserved: {why}")));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every launch's kernel is a `void <kernel>()` function of the expanded
+    /// source (lexically, like the symbol checks).
+    fn validate_vulkan_kernels(
+        entry: &EntryInfo,
+        definition: &NativeImplementation,
+        source: &str,
+    ) -> Result<(), BuildError> {
+        let tokens = identifiers(source);
+        for launch in &definition.launches {
+            let defined = tokens.windows(2).any(|pair| {
+                let [(ty, _), (name, at)] = pair else { unreachable!("windows of two") };
+                *ty == "void"
+                    && *name == launch.kernel
+                    && source[at + name.len()..]
+                        .trim_start()
+                        .strip_prefix('(')
+                        .is_some_and(|rest| rest.trim_start().starts_with(')'))
+            });
+            if !defined {
+                return Err(BuildError::NativeKernelMissing {
+                    entry: entry.name.clone(),
+                    kernel: launch.kernel.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn native_abi_symbols(
         entry: &EntryInfo,
         definition: &NativeImplementation,
         backend: seismic_lang::registry::BackendName,
     ) -> HashSet<String> {
+        use seismic_lang::registry::BackendName;
         let mut symbols = HashSet::new();
-        symbols.insert("SEISMIC_BUFFER_WORDS".to_owned());
         symbols.insert("SEISMIC_BUFFER_SCALAR_RESULTS".to_owned());
         for parameter in &definition.params {
             symbols.insert(format!("SEISMIC_TUNE_{}", native_macro(&parameter.name)));
@@ -388,9 +499,35 @@ mod internals {
         for scratch in &definition.scratch {
             symbols.insert(format!("SEISMIC_BUFFER_SCRATCH_{}", native_macro(&scratch.name)));
         }
-        if backend == seismic_lang::registry::BackendName::Cuda {
-            for symbol in ["SEISMIC_KERNEL_PARAMS", "SEISMIC_PTR", "SEISMIC_PTR_", "SEISMIC_SCALAR_RESULTS"] {
-                symbols.insert(symbol.to_owned());
+        match backend {
+            BackendName::Cuda => {
+                symbols.insert("SEISMIC_BUFFER_WORDS".to_owned());
+                for symbol in ["SEISMIC_KERNEL_PARAMS", "SEISMIC_PTR", "SEISMIC_PTR_", "SEISMIC_SCALAR_RESULTS"] {
+                    symbols.insert(symbol.to_owned());
+                }
+            }
+            // Vulkan words live in the argument block, read through
+            // `seismic_words`; there is no words buffer.
+            BackendName::Vulkan => {
+                for symbol in [
+                    "SEISMIC_PTR",
+                    "SEISMIC_READONLY",
+                    "SEISMIC_READONLY_",
+                    "SEISMIC_SCALAR_RESULTS",
+                    "SEISMIC_KERNEL",
+                    "SEISMIC_HAS_MATRIX",
+                    "SEISMIC_HAS_MIXED_DOT",
+                    "SEISMIC_HAS_F32_ATOMIC_ADD",
+                    "SEISMIC_HAS_SHARED_INT64_ATOMICS",
+                ] {
+                    symbols.insert(symbol.to_owned());
+                }
+                for view in VULKAN_SHARED_VIEWS {
+                    symbols.insert(format!("SEISMIC_SHARED_{view}"));
+                }
+            }
+            BackendName::Cpu | BackendName::Metal => {
+                symbols.insert("SEISMIC_BUFFER_WORDS".to_owned());
             }
         }
         for dimension in &entry.dimensions {
@@ -635,6 +772,14 @@ mod internals {
     }
 
     fn seismic_identifiers(source: &str) -> Vec<(&str, usize)> {
+        identifiers(source)
+            .into_iter()
+            .filter(|(identifier, _)| identifier.starts_with("SEISMIC_"))
+            .collect()
+    }
+
+    /// Every identifier outside comments and literals, with its offset.
+    fn identifiers(source: &str) -> Vec<(&str, usize)> {
         let bytes = source.as_bytes();
         let mut identifiers = Vec::new();
         let mut index = 0;
@@ -677,10 +822,7 @@ mod internals {
                     {
                         index += 1;
                     }
-                    let identifier = &source[start..index];
-                    if identifier.starts_with("SEISMIC_") {
-                        identifiers.push((identifier, start));
-                    }
+                    identifiers.push((&source[start..index], start));
                 }
                 _ => index += 1,
             }
@@ -1620,8 +1762,8 @@ mod native_tests {
         fs::remove_dir_all(&root).expect("remove fixture directory");
     }
 
-    #[test]
-    fn vulkan_native_implementation_is_refused_without_a_vulkan_abi() {
+    /// Build a one-entry module whose Vulkan asset is `asset`.
+    fn build_vulkan(asset: &str) -> Result<Artifacts, BuildError> {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -1630,31 +1772,71 @@ mod native_tests {
             "seismic-native-vulkan-build-{}-{unique}",
             std::process::id()
         ));
-        let output = root.join("out");
         fs::create_dir_all(root.join("vulkan")).expect("fixture directories");
         let source = root.join("ops.seismic");
         fs::write(
             &source,
-            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for vulkan from \"vulkan/scale.comp\":\n    launch scale:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n",
+            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for vulkan from \"vulkan/scale.comp\":\n    params (WIDTH in [64])\n    launch scale:\n        threadgroups (ceil_div(N, WIDTH), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n        shared_bytes (WIDTH * 4)\n",
         )
         .expect("Seismic fixture");
-        fs::write(root.join("vulkan/scale.comp"), "void scale() {}\n").expect("Vulkan fixture");
-
-        let error = Build::new("fixture")
+        fs::write(root.join("vulkan/scale.comp"), asset).expect("Vulkan fixture");
+        let result = Build::new("fixture")
             .source(&source)
             .std(false)
-            .out_dir(&output)
-            .run()
-            .expect_err("a Vulkan asset cannot be validated by this build");
-        assert!(
-            matches!(
-                &error,
-                BuildError::NativeBackendUnavailable { entry, backend }
-                    if entry == "scale" && *backend == seismic_lang::registry::BackendName::Vulkan
-            ),
-            "{error}"
-        );
+            .out_dir(root.join("out"))
+            .run();
         fs::remove_dir_all(&root).expect("remove fixture directory");
+        result
+    }
+
+    #[test]
+    fn vulkan_assets_admit_the_vulkan_abi() {
+        build_vulkan(
+            "void scale() {\n    seismic_f32 x = seismic_f32(SEISMIC_PTR(SEISMIC_BUFFER_X));\n    const bool read_only = SEISMIC_READONLY(SEISMIC_BUFFER_X);\n#if SEISMIC_HAS_MATRIX\n#endif\n    seismic_shared_f32[0] = x[uint(SEISMIC_X_STRIDE_0 * SEISMIC_SHARED_F32)].v + float(SEISMIC_TUNE_WIDTH);\n    seismic_f32(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER))[0].v = seismic_shared_f32[0];\n}\n",
+        )
+        .expect("a Vulkan asset over its generated ABI builds");
+    }
+
+    #[test]
+    fn vulkan_assets_reject_prefix_owned_constructs() {
+        for (asset, construct, expected_line) in [
+            ("#version 460\nvoid scale() {}\n", "`#version`", 1),
+            ("void scale() {}\n  #  extension GL_EXT_foo : require\n", "`#extension`", 2),
+            ("layout(local_size_x = 64) in;\nvoid scale() {}\n", "`local_size_x`", 1),
+            ("layout(push_constant) uniform p { uint x; };\nvoid scale() {}\n", "`push_constant`", 1),
+            ("shared float staging[64];\nvoid scale() {}\n", "`shared`", 1),
+            ("void scale() {}\nvoid main() { scale(); }\n", "`main`", 2),
+            ("void scale() { float x = subgroupAdd(1.0); }\n", "`subgroupAdd`", 1),
+        ] {
+            match build_vulkan(asset) {
+                Err(BuildError::NativeReserved { entry, construct: found, line, .. }) => {
+                    assert_eq!(entry, "scale");
+                    assert!(found.contains(construct), "{found}");
+                    assert_eq!(line, expected_line, "{asset}");
+                }
+                other => panic!("{asset}: expected a reserved construct, got {other:?}"),
+            }
+        }
+        // Comments and the prefix-generated `seismic_shared_*` views are not
+        // declarations.
+        build_vulkan("// shared main\nvoid scale() { seismic_shared_u32[0] = 1u; }\n")
+            .expect("comments and generated views are admitted");
+        assert!(matches!(
+            build_vulkan("void scale() { uint64_t w = SEISMIC_BUFFER_WORDS; }\n"),
+            Err(BuildError::NativeAbi { symbol, .. }) if symbol == "SEISMIC_BUFFER_WORDS"
+        ));
+    }
+
+    #[test]
+    fn vulkan_launches_name_defined_kernels() {
+        match build_vulkan("void scaled() {}\nvoid other(uint x) {}\n") {
+            Err(BuildError::NativeKernelMissing { entry, kernel }) => {
+                assert_eq!((entry.as_str(), kernel.as_str()), ("scale", "scale"));
+            }
+            other => panic!("expected a missing kernel, got {other:?}"),
+        }
+        build_vulkan("void helper() {}\n\nvoid scale ( ) {\n    helper();\n}\n")
+            .expect("the kernel is defined");
     }
 
     #[test]

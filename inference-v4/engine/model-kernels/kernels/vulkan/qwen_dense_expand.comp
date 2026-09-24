@@ -1,0 +1,114 @@
+// qwen_dense_expand: RMS prologue over the `out_rows` residual rows, the
+// paired gate/up projection, and SiLU(gate)·up. The Vulkan form of
+// `metal/qwen_dense_expand.metal` over `common/projection.glsl`.
+#include "common/activation.glsl"
+#include "common/projection.glsl"
+
+#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#define DENSE_ACT ELEMENT_ACT
+#else
+#error "qwen_dense_expand requires a bf16 or f16 activation"
+#endif
+#if defined(SEISMIC_NORM_REPRESENTATION_F32)
+#define DENSE_NORM ELEMENT_F32
+#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
+#define DENSE_NORM ELEMENT_F16
+#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
+#define DENSE_NORM ELEMENT_BF16
+#else
+#error "qwen_dense_expand requires a dense norm"
+#endif
+
+#if defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q4K)
+#define GATE_KIND PACKETS_Q4K
+#define GATE_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q5K)
+#define GATE_KIND PACKETS_Q5K
+#define GATE_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q6K)
+#define GATE_KIND PACKETS_Q6K
+#define GATE_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q8G32S)
+#define GATE_KIND PACKETS_Q8
+#define GATE_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_BF16)
+#define GATE_KIND PACKETS_BF16
+#define GATE_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_GATE_WEIGHT, 2)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_F16)
+#define GATE_KIND PACKETS_F16
+#define GATE_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_GATE_WEIGHT, 2)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_F32)
+#define GATE_KIND PACKETS_F32
+#define GATE_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_GATE_WEIGHT, 4)
+#else
+#error "unsupported qwen_dense_expand gate_weight representation"
+#endif
+#if defined(SEISMIC_GATE_WEIGHT_KIND_PACKED) && !defined(SEISMIC_GATE_WEIGHT_LAYOUT_ROWS16)
+#error "qwen_dense_expand requires the rows16 layout for gate_weight"
+#endif
+
+#if defined(SEISMIC_UP_WEIGHT_REPRESENTATION_Q4K)
+#define UP_KIND PACKETS_Q4K
+#define UP_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_UP_WEIGHT)
+#elif defined(SEISMIC_UP_WEIGHT_REPRESENTATION_Q5K)
+#define UP_KIND PACKETS_Q5K
+#define UP_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_UP_WEIGHT)
+#elif defined(SEISMIC_UP_WEIGHT_REPRESENTATION_Q6K)
+#define UP_KIND PACKETS_Q6K
+#define UP_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_UP_WEIGHT)
+#elif defined(SEISMIC_UP_WEIGHT_REPRESENTATION_Q8G32S)
+#define UP_KIND PACKETS_Q8
+#define UP_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_UP_WEIGHT)
+#elif defined(SEISMIC_UP_WEIGHT_REPRESENTATION_BF16)
+#define UP_KIND PACKETS_BF16
+#define UP_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_UP_WEIGHT, 2)
+#elif defined(SEISMIC_UP_WEIGHT_REPRESENTATION_F16)
+#define UP_KIND PACKETS_F16
+#define UP_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_UP_WEIGHT, 2)
+#elif defined(SEISMIC_UP_WEIGHT_REPRESENTATION_F32)
+#define UP_KIND PACKETS_F32
+#define UP_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_UP_WEIGHT, 4)
+#else
+#error "unsupported qwen_dense_expand up_weight representation"
+#endif
+#if defined(SEISMIC_UP_WEIGHT_KIND_PACKED) && !defined(SEISMIC_UP_WEIGHT_LAYOUT_ROWS16)
+#error "qwen_dense_expand requires the rows16 layout for up_weight"
+#endif
+
+projection_prologue dense_expand_input() {
+    return projection_rms(DENSE_ACT, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL), SEISMIC_RESIDUAL_STRIDE_0,
+        SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_NORM), SEISMIC_NORM_STRIDE_0, DENSE_NORM,
+        element_word_f32(SEISMIC_PARAM_EPS), uint(SEISMIC_DIM_H), SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS));
+}
+
+projection_epilogue dense_expand_output() {
+    return projection_silu_mul(DENSE_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
+        SEISMIC_RESULT_0_STRIDE_1);
+}
+
+projection_weights dense_expand_gate() {
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT), GATE_GEOMETRY, uint(SEISMIC_DIM_H), 0ul);
+}
+
+projection_weights dense_expand_up() {
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_UP_WEIGHT), UP_GEOMETRY, uint(SEISMIC_DIM_H), 0ul);
+}
+
+void qwen_dense_expand_gemv() {
+    projection_gemv(GATE_KIND, UP_KIND, true, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, PROJECTION_NORM_SHARED,
+        dense_expand_input(), dense_expand_output(), dense_expand_gate(), dense_expand_up(), uint(SEISMIC_DIM_O),
+        uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), gl_WorkGroupID.x);
+}
+
+void qwen_dense_expand_stage() {
+    projection_stage(dense_expand_input(), gl_WorkGroupID.x, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED),
+        uint(SEISMIC_DIM_H));
+}
+
+void qwen_dense_expand_gemm() {
+    const projection_prologue x = projection_plain(DENSE_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED),
+        SEISMIC_DIM_H, 1ul, uint(SEISMIC_DIM_H), 0ul);
+    projection_gemm_paired(GATE_KIND, UP_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, x, dense_expand_output(),
+        dense_expand_gate(), dense_expand_up(), uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H),
+        gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
+}

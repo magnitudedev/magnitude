@@ -54,6 +54,6 @@ for op,label,color in [('integer','Native integer add','#267f9b'),('cas','Strict
     rows=[get(first,kernel='atomic_'+op,n=n) for n in ns]
     ax.plot(ns,[r['median'] for r in rows],marker='o',label=label,c=color)
 ax.set(xscale='log',yscale='log',xlabel='Distinct destination addresses',ylabel='Duration (µs)',title='Same 32,768 logical atomic updates');ax.legend(frameon=False)
-fig.suptitle('Metal interaction study · m4-pro-02 · warmed device\nObserved results; no universal error bound established',fontsize=14)
+fig.suptitle('Metal interaction study · Apple M4 Pro · warmed device\nObserved results; no universal error bound established',fontsize=14)
 fig.savefig(R/'study.png',dpi=180)
 print(json.dumps({k:v for k,v in summary.items() if k!='followups'},indent=2))

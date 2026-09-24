@@ -1,7 +1,7 @@
 //! Sole join of head rows, tentative state, conditioning, and pooled memory.
 
 use crate::{
-    FeatureSpan, InvariantError, NativeGraphOutputLease, NativeGraphWorkspaceLease, PoolClass,
+    FeatureRows, InvariantError, NativeGraphOutputLease, NativeGraphWorkspaceLease, PoolClass,
     ResourceDomainId,
 };
 use magnitude_model_batching::ValidatedHeadBatch;
@@ -11,7 +11,8 @@ use std::rc::Rc;
 pub struct HeadLaunchInputs {
     batch: ValidatedHeadBatch,
     advances: Vec<OwnedStateAdvance>,
-    conditioning: Vec<FeatureSpan>,
+    /// Per slot, the host rows conditioning its entry rows in row order.
+    conditioning: Vec<FeatureRows>,
     graph_workspace: NativeGraphWorkspaceLease,
     graph_output: Option<NativeGraphOutputLease>,
 }
@@ -20,7 +21,7 @@ impl HeadLaunchInputs {
     pub fn new(
         batch: ValidatedHeadBatch,
         advances: Vec<OwnedStateAdvance>,
-        conditioning: Vec<FeatureSpan>,
+        conditioning: Vec<FeatureRows>,
         graph_workspace: NativeGraphWorkspaceLease,
         graph_output: NativeGraphOutputLease,
     ) -> Self {
@@ -38,7 +39,7 @@ impl HeadLaunchInputs {
     ) -> (
         ValidatedHeadBatch,
         Vec<OwnedStateAdvance>,
-        Vec<FeatureSpan>,
+        Vec<FeatureRows>,
         NativeGraphWorkspaceLease,
         Option<NativeGraphOutputLease>,
     ) {
@@ -55,7 +56,7 @@ impl HeadLaunchInputs {
         &self,
         store: &Rc<StateStore>,
         domain: &ResourceDomainId,
-        width: usize,
+        row_bytes: usize,
     ) -> Result<(), InvariantError> {
         let invalid = |detail: String| InvariantError {
             context: "head launch",
@@ -78,38 +79,42 @@ impl HeadLaunchInputs {
                 "workspace or output lease differs from head domain/class".into(),
             ));
         }
-        for (index, ((slot, advance), span)) in self
+        for (index, ((slot, advance), rows)) in self
             .batch
             .slots()
             .zip(&self.advances)
             .zip(&self.conditioning)
             .enumerate()
         {
-            if !advance.belongs_to(store) || slot.rows() != advance.rows() {
+            let chain = self.batch.chain_destinations(index);
+            let written = chain.iter().filter(|destination| **destination >= 0).count();
+            if !advance.belongs_to(store) || slot.rows() + written != advance.rows() {
                 return Err(invalid(format!(
                     "slot {index} differs from its state advance"
                 )));
             }
             let binding = advance.bindings();
-            if i32::try_from(binding.previous_bank).ok() != Some(slot.bank()) {
-                return Err(invalid(format!("slot {index} uses another recurrent bank")));
+            if i32::try_from(binding.previous_bank).ok() != Some(slot.bank())
+                || i32::try_from(binding.following_bank).ok() != Some(slot.following_bank())
+            {
+                return Err(invalid(format!("slot {index} uses another state bank")));
             }
-            if i32::try_from(binding.following_bank).ok() != Some(slot.following_bank()) {
-                return Err(invalid(format!(
-                    "slot {index} publishes to another recurrent successor bank"
-                )));
-            }
-            for (row, packed) in slot.destinations().iter().enumerate() {
-                let expected = binding
-                    .destinations
-                    .get(row)
-                    .map(|destination| i32::try_from(*destination).ok())
-                    .unwrap_or(Some(-1));
-                if expected != Some(*packed) {
-                    return Err(invalid(format!(
-                        "slot {index} row {row} destination differs"
-                    )));
-                }
+            // Entry rows append first, then each chained row in step order;
+            // a chained row past the request's own proposals appends nowhere.
+            let expected = binding
+                .destinations
+                .iter()
+                .map(|destination| i32::try_from(*destination).ok())
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| invalid(format!("slot {index} destination exceeds i32")))?;
+            let packed = slot
+                .destinations()
+                .iter()
+                .copied()
+                .chain(chain.iter().copied().filter(|destination| *destination >= 0))
+                .collect::<Vec<_>>();
+            if packed != expected {
+                return Err(invalid(format!("slot {index} destinations differ")));
             }
             let visible = advance
                 .history_ranges()
@@ -135,18 +140,12 @@ impl HeadLaunchInputs {
                     "slot {index} visibility differs from accepted state"
                 )));
             }
-            let allocation = span.features.allocation();
-            if span.features.domain() != domain
-                || allocation.width() != width
-                || span.count != slot.rows()
-                || span
-                    .start
-                    .checked_add(span.count)
-                    .is_none_or(|end| end > allocation.rows())
-                || allocation.tensor().is_err()
-            {
+            if rows.rows() != slot.rows() || rows.row_bytes() != row_bytes {
                 return Err(invalid(format!(
-                    "slot {index} conditioning differs from its physical rows"
+                    "slot {index} conditioning has {} rows of {} bytes for {} entry rows",
+                    rows.rows(),
+                    rows.row_bytes(),
+                    slot.rows()
                 )));
             }
         }
@@ -165,9 +164,9 @@ impl ValidatedHeadLaunch {
         inputs: HeadLaunchInputs,
         store: &Rc<StateStore>,
         domain: &ResourceDomainId,
-        width: usize,
+        row_bytes: usize,
     ) -> Result<Self, (HeadLaunchInputs, InvariantError)> {
-        if let Err(error) = inputs.validate(store, domain, width) {
+        if let Err(error) = inputs.validate(store, domain, row_bytes) {
             return Err((inputs, error));
         }
         let HeadLaunchInputs {
@@ -222,7 +221,7 @@ impl ValidatedHeadLaunch {
 pub struct HeadLaunchCore {
     batch: ValidatedHeadBatch,
     advances: Vec<OwnedStateAdvance>,
-    conditioning: Vec<FeatureSpan>,
+    conditioning: Vec<FeatureRows>,
     domain: ResourceDomainId,
 }
 
@@ -233,10 +232,10 @@ impl HeadLaunchCore {
     pub fn advances(&self) -> &[OwnedStateAdvance] {
         &self.advances
     }
-    pub fn conditioning(&self) -> &[FeatureSpan] {
+    pub fn conditioning(&self) -> &[FeatureRows] {
         &self.conditioning
     }
-    pub fn into_parts(self) -> (ValidatedHeadBatch, Vec<OwnedStateAdvance>, Vec<FeatureSpan>) {
+    pub fn into_parts(self) -> (ValidatedHeadBatch, Vec<OwnedStateAdvance>, Vec<FeatureRows>) {
         (self.batch, self.advances, self.conditioning)
     }
 }

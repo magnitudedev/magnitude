@@ -105,6 +105,7 @@ pub fn build_native_domain(
             .max(manifest.service.max_batch)
             .min(max_batch_rows),
         max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
+        lookahead: manifest.model.lookahead,
     };
     let budget = ResourceBudget {
         storage_bytes: manifest.storage.storage_bytes,
@@ -126,6 +127,7 @@ pub fn build_native_domain(
     let state = ResourcePlanner::state_plan(
         &manifest.definition,
         draft.load(),
+        draft.policy().method(),
         manifest.model.kv_codec,
         limits,
         budget,
@@ -182,6 +184,7 @@ pub fn build_native_domain(
     programs.prepare_auxiliary_graphs(
         opened.device(), draft.load(), &manifest.definition,
         state.target_state(), state.head_state(), limits,
+        manifest.model.method.proposals(),
     )?;
     let resources = ResourcePlanner::plan_with_state(
         state, &target_graphs, &target_readout_graphs,
@@ -241,10 +244,8 @@ pub fn build_native_domain(
         .load_target(&manifest.definition, &package)
         .map_err(|error| error.to_string())?;
     let definition = Rc::new(manifest.definition.clone());
-    let head_loader = definition
-        .head
-        .as_ref()
-        .map(|_| ComponentLoader::head(residency, definition.clone(), package.clone()))
+    let head_loader = head_enabled
+        .then(|| ComponentLoader::head(residency, definition.clone(), package.clone()))
         .transpose()
         .map_err(|error| error.to_string())?;
     let vision_loader = definition

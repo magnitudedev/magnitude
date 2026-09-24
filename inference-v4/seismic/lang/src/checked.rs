@@ -788,6 +788,29 @@ impl NativeNatExpr {
             }
         }
     }
+
+    /// Every tuning parameter name the expression reads.
+    pub fn parameters(&self, out: &mut Vec<String>) {
+        match self {
+            Self::Constant(_) | Self::Dimension(_) => {}
+            Self::Parameter(name) => {
+                if !out.contains(name) {
+                    out.push(name.clone());
+                }
+            }
+            Self::Add(left, right)
+            | Self::Sub(left, right)
+            | Self::Mul(left, right)
+            | Self::Div(left, right)
+            | Self::Rem(left, right)
+            | Self::CeilDiv(left, right)
+            | Self::Min(left, right)
+            | Self::Max(left, right) => {
+                left.parameters(out);
+                right.parameters(out);
+            }
+        }
+    }
 }
 
 impl NativeCondition {
@@ -835,6 +858,36 @@ impl NativeCondition {
                 right.dimensions(out);
             }
         }
+    }
+
+    /// Every tuning parameter name the condition reads.
+    pub fn parameters(&self, out: &mut Vec<String>) {
+        match self {
+            Self::Compare { left, right, .. } => {
+                left.parameters(out);
+                right.parameters(out);
+            }
+            Self::And(left, right) | Self::Or(left, right) => {
+                left.parameters(out);
+                right.parameters(out);
+            }
+        }
+    }
+}
+
+impl NativeLaunch {
+    /// Every tuning parameter the launch's declaration reads: its `when`
+    /// condition, groups, group extent and shared bytes.
+    pub fn parameters(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(when) = &self.when {
+            when.parameters(&mut out);
+        }
+        for expression in self.groups.iter().chain(&self.group_extent) {
+            expression.parameters(&mut out);
+        }
+        self.shared_bytes.parameters(&mut out);
+        out
     }
 }
 
@@ -976,26 +1029,40 @@ impl NativeImplementation {
         {
             return Err(NativeSpecializationError::UnknownStatic(name.clone()));
         }
-        let mut configurations = vec![base];
+        // Walk the product of the parameter domains in place (the last
+        // parameter varies fastest), keeping each admissible configuration.
+        let mut configuration = base;
         for parameter in &self.params {
-            configurations = configurations
-                .into_iter()
-                .flat_map(|configuration| {
-                    parameter.values.iter().map(move |value| {
-                        configuration.clone().with_param(parameter.name.clone(), *value)
-                    })
-                })
-                .collect();
+            configuration = configuration.with_param(parameter.name.clone(), parameter.values[0]);
         }
-        let mut admissible = Vec::with_capacity(configurations.len());
-        for configuration in configurations {
+        let mut steps = vec![0usize; self.params.len()];
+        let mut admissible = Vec::new();
+        loop {
             match self.validate(&configuration) {
-                Ok(()) => admissible.push(configuration),
+                Ok(()) => admissible.push(configuration.clone()),
                 Err(NativeSpecializationError::Inadmissible) => {}
                 Err(error) => return Err(error),
             }
+            let Some(position) = (0..self.params.len())
+                .rev()
+                .find(|&position| steps[position] + 1 < self.params[position].values.len())
+            else {
+                return Ok(admissible);
+            };
+            let next = steps[position] + 1;
+            let mut set = |position: usize, step: usize| {
+                steps[position] = step;
+                let parameter = &self.params[position];
+                *configuration
+                    .params
+                    .get_mut(&parameter.name)
+                    .expect("every parameter was valued") = parameter.values[step];
+            };
+            for reset in position + 1..self.params.len() {
+                set(reset, 0);
+            }
+            set(position, next);
         }
-        Ok(admissible)
     }
 
     /// The configuration of declared defaults (`values[0]`) at the given

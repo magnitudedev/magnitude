@@ -1,6 +1,6 @@
 use magnitude_model_state::{
-    BankCapacity, CodecSpec, ComponentDescriptor, ComponentSpec, LayerRef, OwnedAdvanceResolution,
-    OwnedStateAdvance, SequenceState, StateStore,
+    BankCapacity, CodecSpec, ComponentDescriptor, ComponentSpec, Holder, LayerRef,
+    OwnedAdvanceResolution, OwnedStateAdvance, SequenceState, StateStore,
 };
 use seismic::{BackendName, DType, Device, DeviceCatalog, Tensor};
 use std::rc::Rc;
@@ -200,25 +200,30 @@ fn trim_preserves_checkpoint_logical_history_and_position() {
 }
 #[test]
 #[ignore = "requires a Metal device"]
-fn exclusive_adjacent_extents_merge_but_checkpoint_boundaries_do_not_grow() {
+fn adjacent_claims_merge_but_checkpoint_boundaries_do_not_grow() {
     let store = store(true, false);
     let mut a = store.create().unwrap();
     a = accept(&store, a, 4);
     let cp = a.checkpoint();
     let mut b = cp.fork();
     drop(a);
-    drop(cp);
     b = accept(&store, b, 2);
+    // The fork grew in place and joined its rows; the checkpoint still sees 4.
+    assert_eq!(b.history_ranges(), [(0, 6)]);
+    assert_eq!(cp.fork().history_ranges(), [(0, 4)]);
+    drop(cp);
     let cp = b.checkpoint();
     let mut c = cp.fork();
     drop(b);
     drop(cp);
     assert_eq!(c.position(), 6);
     assert_eq!(c.history_ranges(), [(0, 6)]);
+    // Trimming releases exactly the trimmed rows.
     c.trim_history(4).unwrap();
-    assert_eq!(store.occupied_rows(), 6);
+    assert_eq!(store.occupied_rows(), 2);
     c = accept(&store, c, 1);
-    assert_eq!(store.occupied_rows(), 7);
+    assert_eq!(c.history_ranges(), [(4, 3)]);
+    assert_eq!(store.occupied_rows(), 3);
 }
 #[test]
 #[ignore = "requires a Metal device"]
@@ -226,9 +231,11 @@ fn idle_arena_release_and_value_only_or_history_only_sequences() {
     for (history, values) in [(true, false), (false, true), (true, true)] {
         let store = store(history, values);
         let mut parent = store.create().unwrap();
-        let old = store.history_planes().unwrap();
+        // History backing is committed on demand, not at creation.
+        assert!(store.history_planes().unwrap().is_empty());
         assert_eq!(store.release_idle().unwrap(), 0);
         parent = accept(&store, parent, 4);
+        let old = store.history_planes().unwrap();
         let checkpoint = parent.checkpoint();
         let mut branch = checkpoint.fork();
         branch = accept(&store, branch, 2);
@@ -238,16 +245,18 @@ fn idle_arena_release_and_value_only_or_history_only_sequences() {
         drop(parent);
         drop(branch);
         drop(checkpoint);
+        // Explicitly retained physical pins keep their bytes and stay usable
+        // after logical release.
         assert_eq!(store.release_idle().unwrap(), 0);
-        // Explicitly retained physical pins remain usable after logical release.
-        for buffer in old {
-            let bytes = read(&buffer.buffer);
+        for buffer in &old {
+            let bytes = read(&buffer.buffer.slice_leading(0, 4).unwrap());
             assert!(!bytes.is_empty());
         }
-        assert_eq!(
-            store.history_planes().unwrap().len(),
-            usize::from(history) * 2
-        );
+        assert!(store.history_planes().unwrap().is_empty());
+        drop(old);
+        // Without pins, an idle store returns its committed history.
+        parent = accept(&store, store.create().unwrap(), 4);
+        drop(parent);
         assert_eq!(
             store.release_idle().unwrap(),
             if history { 1024 } else { 0 }
@@ -280,22 +289,28 @@ fn context_and_anticipation_bounds() {
 #[ignore = "requires a Metal device"]
 fn reclamation_counts_selected_handles_once_and_respects_checkpoint_pins() {
     let store = store(true, true);
+    let reclaimable = |states: &[&SequenceState]| {
+        store
+            .exclusive_bytes(&states.iter().map(|state| Holder::State(state)).collect::<Vec<_>>())
+            .unwrap()
+    };
+    // One history row (32 bytes) and one bank (16 bytes).
     let seed = store.create().unwrap();
     // The zero seed is shared by every fresh sequence and never reclaimed.
-    assert_eq!(store.reclaimable(&[&seed]).unwrap(), 0);
+    assert_eq!(reclaimable(&[&seed]), 0);
     let parent = accept(&store, seed, 1);
     let checkpoint = parent.checkpoint();
     let fork = checkpoint.fork();
-    assert_eq!(store.reclaimable(&[&parent, &fork]).unwrap(), 0);
+    assert_eq!(reclaimable(&[&parent, &fork]), 0);
     drop(checkpoint);
-    assert_eq!(store.reclaimable(&[&parent]).unwrap(), 0);
-    assert_eq!(store.reclaimable(&[&parent, &fork, &parent]).unwrap(), 16);
-    // An in-flight advance from the fork pins the shared accepted bank.
+    assert_eq!(reclaimable(&[&parent]), 0);
+    assert_eq!(reclaimable(&[&parent, &fork, &parent]), 48);
+    // An in-flight advance from the fork pins the shared row and bank.
     let fork = OwnedStateAdvance::begin(fork, 1).ok().unwrap();
-    assert_eq!(store.reclaimable(&[&parent]).unwrap(), 0);
+    assert_eq!(reclaimable(&[&parent]), 0);
     let fork = fork.abort();
     drop(parent);
-    assert_eq!(store.reclaimable(&[&fork]).unwrap(), 16);
+    assert_eq!(reclaimable(&[&fork]), 48);
     let other = StateStore::new(
         Rc::new(device()),
         16,
@@ -309,7 +324,7 @@ fn reclamation_counts_selected_handles_once_and_respects_checkpoint_pins() {
         },
     )
     .unwrap();
-    assert!(other.reclaimable(&[&fork]).is_err());
+    assert!(other.exclusive_bytes(&[Holder::State(&fork)]).is_err());
 }
 
 #[test]
@@ -343,6 +358,10 @@ fn owned_advances_reconcile_independently_after_shared_completion() {
     assert_eq!(read(&bank(&store, first.bank_index())), [1; 16]);
     assert_eq!(read(&bank(&store, second.bank_index())), [0; 16]);
 
+    // A launch provisions backing for all of its advances before they begin.
+    store
+        .provision(&[first.demand(1), second.demand(1)], 2)
+        .unwrap();
     let first_advance = OwnedStateAdvance::begin(first, 1).ok().unwrap();
     let second_advance = OwnedStateAdvance::begin(second, 1).ok().unwrap();
     write(&bank(&store, first_advance.bindings().following_bank), &[3; 16]).unwrap();

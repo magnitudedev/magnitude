@@ -208,6 +208,21 @@ pub fn admit_growth(
                 }
             }
         }
+        // A dedicated Vulkan device is bounded by its memory budget less what
+        // this process already uses of the heap.
+        DeviceMeasurements::Vulkan {
+            heap_budget_bytes,
+            heap_usage_bytes,
+        } => {
+            if !memory.allocates_host_memory() {
+                let available = heap_budget_bytes
+                    .saturating_sub(heap_usage_bytes)
+                    .saturating_sub(DEDICATED_PLANNING_RESERVE);
+                if additional > available {
+                    return Err(insufficient(MemoryConstraint::DeviceLocal, available));
+                }
+            }
+        }
     }
     Ok(())
 }

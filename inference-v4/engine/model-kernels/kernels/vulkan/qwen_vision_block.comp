@@ -1,0 +1,238 @@
+// qwen_vision_block: one Qwen3-VL vision transformer block over M patch rows
+// of D = H * W (W = 4P). The Vulkan form of `metal/qwen_vision_block.metal`
+// (bodies in common/vision.glsl and the projection library). Eight launches:
+// layer norm, QKV GEMM (+ bias), 2D rotation of the queries and keys (the
+// f16 attention operands), full attention, output GEMM (+ bias, + the F32
+// block input), layer norm, up GEMM (+ bias, tanh GELU), down GEMM (+ bias,
+// + the F32 attention residual). The residual stream is F32.
+#include "common/activation.glsl"
+#include "common/vision.glsl"
+
+#if !defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) && !defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#error "qwen_vision_block requires a bf16 or f16 activation"
+#endif
+
+#if defined(SEISMIC_QKV_WEIGHT_REPRESENTATION_BF16)
+#define QKV_KIND PACKETS_BF16
+#define QKV_BYTES 2
+#elif defined(SEISMIC_QKV_WEIGHT_REPRESENTATION_F16)
+#define QKV_KIND PACKETS_F16
+#define QKV_BYTES 2
+#elif defined(SEISMIC_QKV_WEIGHT_REPRESENTATION_F32)
+#define QKV_KIND PACKETS_F32
+#define QKV_BYTES 4
+#else
+#error "unsupported qwen_vision_block qkv_weight representation"
+#endif
+
+#if defined(SEISMIC_PROJECTION_WEIGHT_REPRESENTATION_BF16)
+#define PROJECTION_KIND PACKETS_BF16
+#define PROJECTION_BYTES 2
+#elif defined(SEISMIC_PROJECTION_WEIGHT_REPRESENTATION_F16)
+#define PROJECTION_KIND PACKETS_F16
+#define PROJECTION_BYTES 2
+#elif defined(SEISMIC_PROJECTION_WEIGHT_REPRESENTATION_F32)
+#define PROJECTION_KIND PACKETS_F32
+#define PROJECTION_BYTES 4
+#else
+#error "unsupported qwen_vision_block projection_weight representation"
+#endif
+
+#if defined(SEISMIC_UP_WEIGHT_REPRESENTATION_BF16)
+#define UP_KIND PACKETS_BF16
+#define UP_BYTES 2
+#elif defined(SEISMIC_UP_WEIGHT_REPRESENTATION_F16)
+#define UP_KIND PACKETS_F16
+#define UP_BYTES 2
+#elif defined(SEISMIC_UP_WEIGHT_REPRESENTATION_F32)
+#define UP_KIND PACKETS_F32
+#define UP_BYTES 4
+#else
+#error "unsupported qwen_vision_block up_weight representation"
+#endif
+
+#if defined(SEISMIC_DOWN_WEIGHT_REPRESENTATION_BF16)
+#define DOWN_KIND PACKETS_BF16
+#define DOWN_BYTES 2
+#elif defined(SEISMIC_DOWN_WEIGHT_REPRESENTATION_F16)
+#define DOWN_KIND PACKETS_F16
+#define DOWN_BYTES 2
+#elif defined(SEISMIC_DOWN_WEIGHT_REPRESENTATION_F32)
+#define DOWN_KIND PACKETS_F32
+#define DOWN_BYTES 4
+#else
+#error "unsupported qwen_vision_block down_weight representation"
+#endif
+
+#if defined(SEISMIC_QKV_BIAS_REPRESENTATION_BF16)
+#define QKV_BIAS_KIND ELEMENT_BF16
+#elif defined(SEISMIC_QKV_BIAS_REPRESENTATION_F16)
+#define QKV_BIAS_KIND ELEMENT_F16
+#elif defined(SEISMIC_QKV_BIAS_REPRESENTATION_F32)
+#define QKV_BIAS_KIND ELEMENT_F32
+#else
+#error "unsupported qwen_vision_block qkv_bias representation"
+#endif
+
+#if defined(SEISMIC_PROJECTION_BIAS_REPRESENTATION_BF16)
+#define PROJECTION_BIAS_KIND ELEMENT_BF16
+#elif defined(SEISMIC_PROJECTION_BIAS_REPRESENTATION_F16)
+#define PROJECTION_BIAS_KIND ELEMENT_F16
+#elif defined(SEISMIC_PROJECTION_BIAS_REPRESENTATION_F32)
+#define PROJECTION_BIAS_KIND ELEMENT_F32
+#else
+#error "unsupported qwen_vision_block projection_bias representation"
+#endif
+
+#if defined(SEISMIC_UP_BIAS_REPRESENTATION_BF16)
+#define UP_BIAS_KIND ELEMENT_BF16
+#elif defined(SEISMIC_UP_BIAS_REPRESENTATION_F16)
+#define UP_BIAS_KIND ELEMENT_F16
+#elif defined(SEISMIC_UP_BIAS_REPRESENTATION_F32)
+#define UP_BIAS_KIND ELEMENT_F32
+#else
+#error "unsupported qwen_vision_block up_bias representation"
+#endif
+
+#if defined(SEISMIC_DOWN_BIAS_REPRESENTATION_BF16)
+#define DOWN_BIAS_KIND ELEMENT_BF16
+#elif defined(SEISMIC_DOWN_BIAS_REPRESENTATION_F16)
+#define DOWN_BIAS_KIND ELEMENT_F16
+#elif defined(SEISMIC_DOWN_BIAS_REPRESENTATION_F32)
+#define DOWN_BIAS_KIND ELEMENT_F32
+#else
+#error "unsupported qwen_vision_block down_bias representation"
+#endif
+
+#if defined(SEISMIC_NORM1_WEIGHT_REPRESENTATION_BF16)
+#define NORM1_WEIGHT_KIND ELEMENT_BF16
+#elif defined(SEISMIC_NORM1_WEIGHT_REPRESENTATION_F16)
+#define NORM1_WEIGHT_KIND ELEMENT_F16
+#elif defined(SEISMIC_NORM1_WEIGHT_REPRESENTATION_F32)
+#define NORM1_WEIGHT_KIND ELEMENT_F32
+#else
+#error "unsupported qwen_vision_block norm1_weight representation"
+#endif
+
+#if defined(SEISMIC_NORM1_BIAS_REPRESENTATION_BF16)
+#define NORM1_BIAS_KIND ELEMENT_BF16
+#elif defined(SEISMIC_NORM1_BIAS_REPRESENTATION_F16)
+#define NORM1_BIAS_KIND ELEMENT_F16
+#elif defined(SEISMIC_NORM1_BIAS_REPRESENTATION_F32)
+#define NORM1_BIAS_KIND ELEMENT_F32
+#else
+#error "unsupported qwen_vision_block norm1_bias representation"
+#endif
+
+#if defined(SEISMIC_NORM2_WEIGHT_REPRESENTATION_BF16)
+#define NORM2_WEIGHT_KIND ELEMENT_BF16
+#elif defined(SEISMIC_NORM2_WEIGHT_REPRESENTATION_F16)
+#define NORM2_WEIGHT_KIND ELEMENT_F16
+#elif defined(SEISMIC_NORM2_WEIGHT_REPRESENTATION_F32)
+#define NORM2_WEIGHT_KIND ELEMENT_F32
+#else
+#error "unsupported qwen_vision_block norm2_weight representation"
+#endif
+
+#if defined(SEISMIC_NORM2_BIAS_REPRESENTATION_BF16)
+#define NORM2_BIAS_KIND ELEMENT_BF16
+#elif defined(SEISMIC_NORM2_BIAS_REPRESENTATION_F16)
+#define NORM2_BIAS_KIND ELEMENT_F16
+#elif defined(SEISMIC_NORM2_BIAS_REPRESENTATION_F32)
+#define NORM2_BIAS_KIND ELEMENT_F32
+#else
+#error "unsupported qwen_vision_block norm2_bias representation"
+#endif
+
+#define VISION_W uint(4ul * SEISMIC_DIM_P)
+#define VISION_H uint(SEISMIC_DIM_H)
+#define VISION_D (VISION_H * VISION_W)
+#define VISION_F uint(SEISMIC_DIM_F)
+#define VISION_M uint(SEISMIC_DIM_M)
+#define VISION_PADDED ((VISION_M + VISION_ATTEND_ROWS - 1u) / VISION_ATTEND_ROWS * VISION_ATTEND_ROWS)
+
+float block_epsilon() { return element_word_f32(SEISMIC_PARAM_EPSILON); }
+
+// Workgroup per row.
+void qwen_vision_block_norm1() {
+    const uint64_t row = uint64_t(gl_WorkGroupID.x) * VISION_D;
+    vision_layer_norm(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN) + row * 4ul,
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED) + row * 2ul,
+        SEISMIC_PTR(SEISMIC_BUFFER_NORM1_WEIGHT), NORM1_WEIGHT_KIND, SEISMIC_PTR(SEISMIC_BUFFER_NORM1_BIAS),
+        NORM1_BIAS_KIND, VISION_D, block_epsilon());
+}
+
+void qwen_vision_block_qkv() {
+    const projection_prologue in_ = projection_plain(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED),
+        uint64_t(VISION_D), 1ul, VISION_D, 0ul);
+    const vision_epilogue out_ = vision_bias(VISION_BIAS, ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PROJECTED),
+        3ul * VISION_D, SEISMIC_PTR(SEISMIC_BUFFER_QKV_BIAS), QKV_BIAS_KIND);
+    const projection_weights w = vision_weights(SEISMIC_PTR(SEISMIC_BUFFER_QKV_WEIGHT), SEISMIC_QKV_WEIGHT_STRIDE_0,
+        QKV_BYTES, VISION_D);
+    vision_gemm(QKV_KIND, in_, out_, w, VISION_M, 3u * VISION_D, VISION_D, gl_WorkGroupID.y, gl_WorkGroupID.x);
+}
+
+// Workgroup (padded row, 8 of the 3H head rows), one subgroup per head row:
+// query heads, key heads, value heads. Rows past M publish zeros.
+void qwen_vision_block_rotate() {
+    const uint row = gl_WorkGroupID.x;
+    const uint part = gl_WorkGroupID.y * gl_NumSubgroups + gl_SubgroupID;
+    if (part >= 3u * VISION_H)
+        return;
+    const uint64_t target = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_OPERANDS)
+        + ((uint64_t(part) * VISION_PADDED + row) * VISION_W) * 2ul;
+    if (row >= VISION_M) {
+        for (uint i = gl_SubgroupInvocationID; i < VISION_W; i += 32u)
+            element_put(ELEMENT_F16, target, i, 0.0);
+        return;
+    }
+    const uint64_t head_row = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PROJECTED)
+        + (uint64_t(row) * 3ul * VISION_D + uint64_t(part) * VISION_W) * 2ul;
+    vision_rotate(ELEMENT_ACT, head_row, SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + uint64_t(row) * 8ul, VISION_W,
+        part < 2u * VISION_H, target);
+}
+
+// Workgroup (64-row query tile, head).
+void qwen_vision_block_attend() {
+    vision_attend(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_OPERANDS), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ATTENDED), VISION_M,
+        VISION_PADDED, VISION_H, VISION_W, gl_WorkGroupID.x, gl_WorkGroupID.y);
+}
+
+void qwen_vision_block_output() {
+    const projection_prologue in_ = projection_plain(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ATTENDED),
+        uint64_t(VISION_D), 1ul, VISION_D, 0ul);
+    const vision_epilogue out_ = vision_bias_f32(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_RESIDUAL), uint64_t(VISION_D),
+        SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION_BIAS), PROJECTION_BIAS_KIND, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN),
+        uint64_t(VISION_D));
+    const projection_weights w = vision_weights(SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION_WEIGHT),
+        SEISMIC_PROJECTION_WEIGHT_STRIDE_0, PROJECTION_BYTES, VISION_D);
+    vision_gemm(PROJECTION_KIND, in_, out_, w, VISION_M, VISION_D, VISION_D, gl_WorkGroupID.y, gl_WorkGroupID.x);
+}
+
+void qwen_vision_block_norm2() {
+    const uint64_t row = uint64_t(gl_WorkGroupID.x) * VISION_D;
+    vision_layer_norm(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_RESIDUAL) + row * 4ul,
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED) + row * 2ul, SEISMIC_PTR(SEISMIC_BUFFER_NORM2_WEIGHT),
+        NORM2_WEIGHT_KIND, SEISMIC_PTR(SEISMIC_BUFFER_NORM2_BIAS), NORM2_BIAS_KIND, VISION_D, block_epsilon());
+}
+
+void qwen_vision_block_up() {
+    const projection_prologue in_ = projection_plain(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED),
+        uint64_t(VISION_D), 1ul, VISION_D, 0ul);
+    const vision_epilogue out_ = vision_bias(VISION_BIAS_GELU_TANH, ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ACTIVATED), uint64_t(VISION_F), SEISMIC_PTR(SEISMIC_BUFFER_UP_BIAS),
+        UP_BIAS_KIND);
+    const projection_weights w = vision_weights(SEISMIC_PTR(SEISMIC_BUFFER_UP_WEIGHT), SEISMIC_UP_WEIGHT_STRIDE_0,
+        UP_BYTES, VISION_D);
+    vision_gemm(UP_KIND, in_, out_, w, VISION_M, VISION_F, VISION_D, gl_WorkGroupID.y, gl_WorkGroupID.x);
+}
+
+void qwen_vision_block_down() {
+    const projection_prologue in_ = projection_plain(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ACTIVATED),
+        uint64_t(VISION_F), 1ul, VISION_F, 0ul);
+    const vision_epilogue out_ = vision_bias_f32(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
+        SEISMIC_PTR(SEISMIC_BUFFER_DOWN_BIAS), DOWN_BIAS_KIND, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_RESIDUAL),
+        uint64_t(VISION_D));
+    const projection_weights w = vision_weights(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_WEIGHT), SEISMIC_DOWN_WEIGHT_STRIDE_0,
+        DOWN_BYTES, VISION_F);
+    vision_gemm(DOWN_KIND, in_, out_, w, VISION_M, VISION_D, VISION_F, gl_WorkGroupID.y, gl_WorkGroupID.x);
+}

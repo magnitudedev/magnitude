@@ -119,17 +119,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(operations)
     }
 
-    pub(super) fn input_rows(
+    /// Rotary coordinates of the target rows `position..position + count`,
+    /// including continuation rows past the admitted input.
+    pub(super) fn input_coordinates(
         &self,
         request: RequestId,
         position: usize,
-        tokens: &[crate::TokenId],
-    ) -> Result<(Vec<[i32; 4]>, Vec<crate::ConditioningSlice>), String> {
+        count: usize,
+    ) -> Result<Vec<[i32; 4]>, String> {
         let Some(state) = self.input.get(&request) else {
             let end = position
-                .checked_add(tokens.len())
+                .checked_add(count)
                 .ok_or("target input end overflows")?;
-            let coordinates = (position..end)
+            return (position..end)
                 .map(|position| {
                     let position =
                         i32::try_from(position).map_err(|_| "target position exceeds i32")?;
@@ -141,7 +143,25 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     }
                     Ok(values)
                 })
-                .collect::<Result<Vec<_>, String>>()?;
+                .collect();
+        };
+        Ok(state
+            .input
+            .coordinates_at(position, count)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|[a, b, c]| [a, b, c, 0])
+            .collect())
+    }
+
+    pub(super) fn input_rows(
+        &self,
+        request: RequestId,
+        position: usize,
+        tokens: &[crate::TokenId],
+    ) -> Result<(Vec<[i32; 4]>, Vec<crate::ConditioningSlice>), String> {
+        let coordinates = self.input_coordinates(request, position, tokens.len())?;
+        let Some(state) = self.input.get(&request) else {
             return Ok((coordinates, Vec::new()));
         };
         let end = position
@@ -160,13 +180,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         {
             return Err("target rows differ from admitted prepared input".into());
         }
-        let coordinates = state
-            .input
-            .coordinates_at(position, tokens.len())
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|[a, b, c]| [a, b, c, 0])
-            .collect();
         let mut slices = Vec::new();
         for span in state
             .input

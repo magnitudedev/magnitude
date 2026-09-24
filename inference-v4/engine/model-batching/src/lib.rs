@@ -13,7 +13,7 @@ pub use classes::{
     PREFILL_ROW_QUANTUM, SMALL_CLASS_ROWS,
 };
 pub use demand::Demand;
-pub use head::ValidatedHeadBatch;
+pub use head::{HeadSlot, ValidatedHeadBatch};
 pub use rows::{
     Draw, DrawKind, PackError, PackedRowTables, Row, Select, Shaping, Slot, HISTORY_WIDTH,
     SHAPING_WIDTH,

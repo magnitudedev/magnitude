@@ -41,6 +41,11 @@ pub enum WorkflowError {
     /// Every upload region a family slot was created with is still read by
     /// a submission in flight; a slot never grows its regions after sealing.
     UploadRegionsExhausted { regions: usize },
+    /// The device's backend is native-only (Vulkan): planned workflows are
+    /// refused.
+    PlannedRouteUnavailable {
+        backend: seismic_lang::registry::BackendName,
+    },
 }
 impl fmt::Display for WorkflowError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -86,6 +91,11 @@ impl fmt::Display for CallError {
             Self::Workflow(WorkflowError::UploadRegionsExhausted { regions }) => write!(
                 f,
                 "all {regions} upload regions of the native graph slot are in flight"
+            ),
+            Self::Workflow(WorkflowError::PlannedRouteUnavailable { backend }) => write!(
+                f,
+                "`{}` is a native-only backend: planned workflows are unavailable",
+                backend.as_str()
             ),
         }
     }
@@ -160,6 +170,12 @@ pub enum TensorError {
         extents: Vec<u64>,
         strides: Vec<u64>,
     },
+    /// Host access or a commit beyond a reserved tensor's backed rows, or a
+    /// recommit of a tensor that is not a whole reserved tensor.
+    Uncommitted {
+        rows: u64,
+        committed: u64,
+    },
     Execution(ExecutionError),
 }
 impl fmt::Display for TensorError {
@@ -208,6 +224,10 @@ impl fmt::Display for TensorError {
             Self::ReshapeLayout { extents, strides } => write!(
                 f,
                 "reshape requires contiguous storage, but the view of extents {extents:?} has strides {strides:?}"
+            ),
+            Self::Uncommitted { rows, committed } => write!(
+                f,
+                "access to {rows} leading rows of a reserved tensor with {committed} committed rows"
             ),
             Self::Execution(error) => write!(f, "{error}"),
         }
@@ -273,6 +293,29 @@ pub mod device {
         ) -> Result<Arc<Allocation>, ExecutionError> {
             self.kind.allocate_upload(bytes, alignment)
         }
+        /// Zero-filled storage of a reserved tensor; see
+        /// `OpenedKind::allocate_reserved_tensor`.
+        pub(crate) fn allocate_reserved_tensor(
+            self: &Arc<Self>,
+            committed: u64,
+            reserved: u64,
+            alignment: u64,
+        ) -> Result<Arc<Allocation>, ExecutionError> {
+            self.kind.allocate_reserved_tensor(committed, reserved, alignment)
+        }
+        pub(crate) fn reserves_address(&self, allocation: &Arc<Allocation>) -> bool {
+            self.kind.reserves_address(allocation)
+        }
+        /// A reserved tensor's storage resized in place; see
+        /// `OpenedKind::recommit_in_place`.
+        pub(crate) fn recommit_in_place(
+            self: &Arc<Self>,
+            allocation: &Arc<Allocation>,
+            committed: u64,
+            alignment: u64,
+        ) -> Result<Option<Arc<Allocation>>, ExecutionError> {
+            self.kind.recommit_in_place(allocation, committed, alignment)
+        }
         /// Stable key of this device's model and configuration for native
         /// tuning records: its name and the backend facts that shape
         /// performance.
@@ -317,9 +360,216 @@ pub mod tensor {
         representation: RepresentationId,
         extents: Vec<u64>,
         strides: Vec<u64>,
+        /// A reserved tensor's logical bytes reach past its allocation: only
+        /// its leading committed rows are backed, and no access, host or
+        /// device, may touch the rest. Its owner guarantees the device side.
+        reserved: bool,
+    }
+
+    /// Bytes of one leading-axis row of a canonical layout.
+    fn leading_row_bytes(extents: &[u64], byte_len: u64) -> Result<u64, TensorError> {
+        match extents.first() {
+            Some(&rows) if rows != 0 && byte_len % rows == 0 => Ok(byte_len / rows),
+            _ => Err(TensorError::Uncommitted {
+                rows: extents.first().copied().unwrap_or(0),
+                committed: 0,
+            }),
+        }
     }
 
     impl TensorInner {
+        /// A zero-filled tensor over `extents` whose leading rows
+        /// `[0, committed)` are physically backed. The remaining rows are an
+        /// address reservation: binding the tensor is legal only for device
+        /// work that stays within the committed rows, and host access to them
+        /// is refused.
+        pub fn reserved(
+            device: &Arc<DeviceInner>,
+            representation: RepresentationId,
+            extents: &[u64],
+            committed: u64,
+        ) -> Result<Self, TensorError> {
+            if !device.supports_representation(representation) {
+                return Err(TensorError::UnsupportedRepresentation {
+                    backend: device.info().backend,
+                    representation: representation_info(representation).name,
+                });
+            }
+            let layout = layout::canonical(representation, extents)?;
+            let row = leading_row_bytes(extents, layout.byte_len)?;
+            if committed == 0 || committed > extents[0] {
+                return Err(TensorError::Uncommitted {
+                    rows: committed,
+                    committed: extents[0],
+                });
+            }
+            let bytes = row * committed;
+            let allocation =
+                device.allocate_reserved_tensor(bytes, layout.byte_len, layout.alignment)?;
+            Ok(Self {
+                device: device.clone(),
+                allocation,
+                byte_offset: 0,
+                byte_len: layout.byte_len,
+                representation,
+                extents: extents.to_vec(),
+                strides: layout.strides,
+                reserved: bytes < layout.byte_len,
+            })
+        }
+
+        /// Leading rows physically backed: all of them unless reserved.
+        pub fn committed_rows(&self) -> u64 {
+            match (self.reserved, leading_row_bytes(&self.extents, self.byte_len)) {
+                (true, Ok(row)) => {
+                    (self.allocation.bytes().saturating_sub(self.byte_offset) / row)
+                        .min(self.extents[0])
+                }
+                _ => self.extents.first().copied().unwrap_or(1),
+            }
+        }
+
+        /// The same logical tensor with `committed` leading rows backed by a
+        /// new allocation. The first `min(committed, current)` rows keep their
+        /// contents, as seen after every submitted device write of this
+        /// tensor completes; new rows are zero. Where the backend reserved the
+        /// address range (CUDA virtual memory management) the backing is
+        /// resized in place after every device use of this tensor completes,
+        /// and the address is unchanged; elsewhere the rows are copied into
+        /// new storage. Device work bound to this tensor must not be
+        /// submitted after the new one is used.
+        pub fn recommitted(&self, committed: u64) -> Result<Self, TensorError> {
+            let layout = layout::canonical(self.representation, &self.extents)?;
+            let row = leading_row_bytes(&self.extents, layout.byte_len)?;
+            if self.byte_offset != 0
+                || self.byte_len != layout.byte_len
+                || committed == 0
+                || committed > self.extents[0]
+            {
+                return Err(TensorError::Uncommitted {
+                    rows: committed,
+                    committed: self.committed_rows(),
+                });
+            }
+            let bytes = row * committed;
+            let allocation = match self
+                .device
+                .recommit_in_place(&self.allocation, bytes, layout.alignment)?
+            {
+                Some(allocation) => allocation,
+                None => self.reallocated(bytes, layout.alignment)?,
+            };
+            Ok(Self {
+                device: self.device.clone(),
+                allocation,
+                byte_offset: 0,
+                byte_len: layout.byte_len,
+                representation: self.representation,
+                extents: self.extents.clone(),
+                strides: layout.strides,
+                reserved: bytes < layout.byte_len,
+            })
+        }
+
+        /// A new zero-filled allocation of `bytes` holding this tensor's
+        /// leading bytes, copied after every submitted device write of it
+        /// completes: recommitting where the backend keeps no reservation.
+        fn reallocated(&self, bytes: u64, alignment: u64) -> Result<Arc<Allocation>, TensorError> {
+            let allocation = self.device.allocate(bytes, alignment)?;
+            write_zeros(allocation.storage(), bytes)?;
+            let kept = bytes.min(self.allocation.bytes());
+            let access = self.allocation.acquire(false);
+            const CHUNK: u64 = 1 << 24;
+            let mut scratch = vec![0u8; usize::try_from(kept.min(CHUNK)).unwrap_or(1 << 24)];
+            let mut offset = 0u64;
+            while offset < kept {
+                let length = usize::try_from((kept - offset).min(CHUNK)).unwrap_or(1 << 24);
+                access.read(&self.allocation, offset, &mut scratch[..length])?;
+                allocation.storage().write(offset, &scratch[..length])?;
+                offset += length as u64;
+            }
+            Ok(allocation)
+        }
+
+        /// Whether [`Self::recommitted`] keeps this tensor's address: the
+        /// backend reserved its address range and resizes the backing in place.
+        pub fn resizes_in_place(&self) -> bool {
+            self.byte_offset == 0 && self.device.reserves_address(&self.allocation)
+        }
+
+        /// The same logical tensor with `committed` leading rows backed by a
+        /// new allocation that holds rows moved from this one: each
+        /// `(from, to, rows)` copies rows `[from, from + rows)`, as seen after
+        /// every submitted device write of this tensor completes, to rows
+        /// `[to, to + rows)`. Every other row is zero. The address changes on
+        /// every backend; device work bound to this tensor must not be
+        /// submitted after the new one is used.
+        pub fn relocated(
+            &self,
+            committed: u64,
+            moves: &[(u64, u64, u64)],
+        ) -> Result<Self, TensorError> {
+            let layout = layout::canonical(self.representation, &self.extents)?;
+            let row = leading_row_bytes(&self.extents, layout.byte_len)?;
+            let current = self.committed_rows();
+            let within = |start: u64, rows: u64, limit: u64| {
+                start.checked_add(rows).is_some_and(|end| end <= limit)
+            };
+            if self.byte_offset != 0
+                || self.byte_len != layout.byte_len
+                || committed == 0
+                || committed > self.extents[0]
+                || moves
+                    .iter()
+                    .any(|&(from, to, rows)| !within(from, rows, current) || !within(to, rows, committed))
+            {
+                return Err(TensorError::Uncommitted {
+                    rows: committed,
+                    committed: current,
+                });
+            }
+            let bytes = row * committed;
+            let allocation =
+                self.device
+                    .allocate_reserved_tensor(bytes, layout.byte_len, layout.alignment)?;
+            let access = self.allocation.acquire(false);
+            const CHUNK: u64 = 1 << 24;
+            let mut scratch = Vec::new();
+            for &(from, to, rows) in moves {
+                let (mut offset, end) = (from * row, (from + rows) * row);
+                while offset < end {
+                    let length = usize::try_from((end - offset).min(CHUNK)).unwrap_or(1 << 24);
+                    scratch.resize(length, 0);
+                    access.read(&self.allocation, offset, &mut scratch)?;
+                    allocation
+                        .storage()
+                        .write(offset - from * row + to * row, &scratch)?;
+                    offset += length as u64;
+                }
+            }
+            Ok(Self {
+                device: self.device.clone(),
+                allocation,
+                byte_offset: 0,
+                byte_len: layout.byte_len,
+                representation: self.representation,
+                extents: self.extents.clone(),
+                strides: layout.strides,
+                reserved: bytes < layout.byte_len,
+            })
+        }
+
+        /// Refuse host access reaching past the committed rows.
+        fn backed(&self) -> Result<(), TensorError> {
+            if self.reserved {
+                return Err(TensorError::Uncommitted {
+                    rows: self.extents.first().copied().unwrap_or(0),
+                    committed: self.committed_rows(),
+                });
+            }
+            Ok(())
+        }
+
         /// Exact canonical storage charge for a representation and logical
         /// shape, without allocating a device tensor.
         pub fn canonical_byte_len(
@@ -414,6 +664,7 @@ pub mod tensor {
                 representation,
                 extents,
                 strides,
+                reserved: false,
             }
         }
         pub fn read_to_host(&self) -> Result<Vec<u8>, ExecutionError> {
@@ -424,6 +675,8 @@ pub mod tensor {
             &self,
             access: &crate::driver::AllocationPermit,
         ) -> Result<Vec<u8>, ExecutionError> {
+            self.backed()
+                .map_err(|error| ExecutionError::AllocationFailed(error.to_string()))?;
             let canonical = crate::layout::canonical(self.representation, &self.extents)?;
             let length = usize::try_from(canonical.byte_len).map_err(|_| {
                 ExecutionError::AllocationFailed(
@@ -447,6 +700,7 @@ pub mod tensor {
             Ok(bytes)
         }
         pub fn write_from_host(&self, bytes: &[u8]) -> Result<(), TensorError> {
+            self.backed()?;
             let canonical = crate::layout::canonical(self.representation, &self.extents)?;
             let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
             if actual != canonical.byte_len {
@@ -563,6 +817,20 @@ pub mod tensor {
                 },
                 operation,
             )?;
+            if self.reserved && view.byte_offset + view.byte_len > self.allocation.bytes() {
+                // A view of a reserved tensor reaching past its committed
+                // rows stays reserved; one within them is an ordinary view.
+                return Ok(Self {
+                    device: self.device.clone(),
+                    allocation: self.allocation.clone(),
+                    byte_offset: view.byte_offset,
+                    byte_len: view.byte_len,
+                    representation: self.representation,
+                    extents: view.extents,
+                    strides: view.strides,
+                    reserved: true,
+                });
+            }
             Ok(Self::new_view(
                 self.device.clone(),
                 self.allocation.clone(),
@@ -1076,10 +1344,8 @@ pub mod kernel {
         inner: crate::backends::AdmittedWorkflowKind,
     }
 
-    pub fn workflow(device: &Arc<DeviceInner>) -> WorkflowDraftAny {
-        WorkflowDraftAny {
-            inner: device.kind.workflow(),
-        }
+    pub fn workflow(device: &Arc<DeviceInner>) -> Result<WorkflowDraftAny, super::WorkflowError> {
+        device.kind.workflow().map(|inner| WorkflowDraftAny { inner })
     }
 
     pub fn enqueue(

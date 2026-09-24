@@ -11,7 +11,7 @@ use crate::{
     programs::graph::attention::{AttentionBlock, AttentionWeights, attention},
     programs::graph::dense::dense,
     programs::graph::recurrent::{
-        RecurrentBlock, RecurrentControlPorts, RecurrentStatePorts, recurrent,
+        RECURRENT_COMPONENTS, RecurrentBlock, RecurrentControlPorts, RecurrentStatePorts, recurrent,
     },
     programs::native_constants::{ConstantTensors, GraphConstant},
 };
@@ -21,7 +21,7 @@ use magnitude_model_contracts::{
     WeightRole, WeightScope,
 };
 use magnitude_model_kernels::{
-    qwen_embedding_rows, };
+    embedding_rows, };
 use seismic::{
     BoundNativeGraphPlan, Device, Element, NativeGraph, NativeGraphFamily, NativeGraphPlan,
     NativePort, WorkflowTensor,
@@ -31,7 +31,7 @@ use std::time::Instant;
 
 #[derive(Clone)]
 pub struct PreparedTargetGraphs {
-    entries: BTreeMap<u64, PreparedTargetEntryGraph>,
+    entries: BTreeMap<(u64, EntryTokens), PreparedTargetEntryGraph>,
     classes: BTreeMap<(u64, u64, u64), Vec<PreparedTargetBlockGraph>>,
     family: NativeGraphFamily,
     max_output_bytes: u64,
@@ -82,9 +82,9 @@ fn block_graph_shapes(
             weights.sort_by_key(|(kind, _, _)| format!("{kind:?}"));
             let state = match block.mixer {
                 MixerGeometry::Recurrent(_) => {
-                    let first = recurrent_index * 2;
+                    let first = recurrent_index * RECURRENT_COMPONENTS;
                     recurrent_index += 1;
-                    format!("{:?}", components.get(first..first + 2))
+                    format!("{:?}", components.get(first..first + RECURRENT_COMPONENTS))
                 }
                 MixerGeometry::Attention(_) => String::new(),
             };
@@ -129,17 +129,20 @@ impl PreparedTargetGraphs {
         let began_all = Instant::now();
         let mut sealed_graphs = 0usize;
         for rows in row_classes.into_iter().map(|rows| rows as u64) {
-            let entry = PreparedTargetEntryGraph::prepare(
-                device,
-                &handles.embedding,
-                load,
-                geometry,
-                rows,
-            )?;
-            sealed_graphs += 1;
-            max_output_bytes = max_output_bytes.max(entry.plan.output_bytes());
-            plans.push(entry.plan.clone());
-            entries.insert(rows, entry);
+            for source in [EntryTokens::Uploaded, EntryTokens::Selected] {
+                let entry = PreparedTargetEntryGraph::prepare(
+                    device,
+                    &handles.embedding,
+                    load,
+                    geometry,
+                    rows,
+                    source,
+                )?;
+                sealed_graphs += 1;
+                max_output_bytes = max_output_bytes.max(entry.plan.output_bytes());
+                plans.push(entry.plan.clone());
+                entries.insert((rows, source), entry);
+            }
             let mut segments = 1u64;
             while segments <= MAX_CLASS_SEGMENTS as u64 {
                 for slots in 1..=max_slots {
@@ -227,14 +230,14 @@ impl PreparedTargetGraphs {
         resident: &ResidentTarget,
     ) -> Result<BoundTargetGraphs, String> {
         let mut entry_bound = BTreeMap::new();
-        for (rows, entry) in &self.entries {
+        for (key, entry) in &self.entries {
             let fixed = [(&entry.table, resident.embedding.tensor())];
             entry_bound.insert(
-                *rows,
+                *key,
                 entry
                     .plan
                     .bind_static(&fixed)
-                    .map_err(|error| format!("target embedding graph class {rows}: {error}"))?,
+                    .map_err(|error| format!("target embedding graph class {key:?}: {error}"))?,
             );
         }
         let mut constants = ConstantTensors::new(resident.embedding.tensor().device());
@@ -276,7 +279,7 @@ impl PreparedTargetGraphs {
 
 pub(crate) struct BoundTargetGraphs {
     pub prepared: PreparedTargetGraphs,
-    pub entry_bound: BTreeMap<u64, BoundNativeGraphPlan>,
+    pub entry_bound: BTreeMap<(u64, EntryTokens), BoundNativeGraphPlan>,
     pub bound: BTreeMap<(u64, u64, u64), Vec<BoundNativeGraphPlan>>,
 }
 
@@ -284,16 +287,18 @@ impl BoundTargetGraphs {
     pub(crate) fn entry(
         &self,
         rows: u64,
+        source: EntryTokens,
     ) -> Result<(&PreparedTargetEntryGraph, &BoundNativeGraphPlan), String> {
+        let key = (rows, source);
         let graph = self
             .prepared
             .entries
-            .get(&rows)
-            .ok_or_else(|| format!("target embedding class {rows} was not sealed"))?;
+            .get(&key)
+            .ok_or_else(|| format!("target embedding class {key:?} was not sealed"))?;
         let bound = self
             .entry_bound
-            .get(&rows)
-            .ok_or_else(|| format!("target embedding class {rows} was not bound"))?;
+            .get(&key)
+            .ok_or_else(|| format!("target embedding class {key:?} was not bound"))?;
         Ok((graph, bound))
     }
     pub(crate) fn block(
@@ -319,6 +324,15 @@ impl BoundTargetGraphs {
     }
 }
 
+/// How an entry graph receives its `[rows, 2]` (token, status) input rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum EntryTokens {
+    /// Written by the host into the step's upload region.
+    Uploaded,
+    /// Bound to the previous step's selection tensor on the device.
+    Selected,
+}
+
 #[derive(Clone)]
 pub(crate) struct PreparedTargetEntryGraph {
     pub plan: NativeGraphPlan,
@@ -330,10 +344,11 @@ pub(crate) struct PreparedTargetEntryGraph {
 impl PreparedTargetEntryGraph {
     fn prepare(
         device: &Device,
-        embedding: &seismic::NativeKernel<qwen_embedding_rows::Entry>,
+        embedding: &seismic::NativeKernel<embedding_rows::Entry>,
         load: &ModelLoadPlan,
         geometry: &DecoderGeometry,
         rows: u64,
+        source: EntryTokens,
     ) -> Result<Self, String> {
         let mut graph = device.native_graph();
         let mut weights = Vec::new();
@@ -348,21 +363,26 @@ impl PreparedTargetEntryGraph {
             .pop()
             .ok_or("target embedding weight port is absent")?
             .1;
-        let tokens = graph
-            .input_for(
-                embedding,
-                "tokens",
-                &[
-                    ("M", rows),
-                    ("V", geometry.vocabulary),
-                    ("D", geometry.hidden),
-                ],
-            )
-            .map_err(|error| error.to_string())?;
+        let tokens = match source {
+            EntryTokens::Uploaded => graph
+                .input_for(
+                    embedding,
+                    "tokens",
+                    &[
+                        ("M", rows),
+                        ("V", geometry.vocabulary),
+                        ("D", geometry.hidden),
+                    ],
+                )
+                .map_err(|error| error.to_string())?,
+            EntryTokens::Selected => graph
+                .port(Element::i32(), &[rows, 2])
+                .map_err(|error| error.to_string())?,
+        };
         let result = graph
             .enqueue(
                 embedding,
-                qwen_embedding_rows::WorkflowArgs {
+                embedding_rows::WorkflowArgs {
                     table: (&table_tensor).into(),
                     tokens: tokens.tensor().into(),
                 },
@@ -512,7 +532,8 @@ pub(crate) struct PreparedTargetBlockGraph {
 
 #[derive(Clone)]
 pub(crate) enum BlockStatePorts {
-    Attention { key: NativePort, value: NativePort },
+    /// The layer's history planes in the codec's plane-descriptor order.
+    Attention(Vec<NativePort>),
     Recurrent(RecurrentStatePorts),
 }
 
@@ -585,7 +606,7 @@ impl PreparedTargetBlockGraph {
             .iter()
             .filter(|block| matches!(block.mixer, MixerGeometry::Recurrent(_)))
             .count()
-            * 2;
+            * RECURRENT_COMPONENTS;
         let (mixed, state, controls) = match (&block.mixer, &handle.mixer) {
             (MixerGeometry::Attention(shape), AttestedMixer::Attention(kernels)) => {
                 let mut weight = |kind| weight(&mut graph, load, scope, kind, &mut weights);
@@ -618,10 +639,7 @@ impl PreparedTargetBlockGraph {
                 )?;
                 (
                     mixed,
-                    BlockStatePorts::Attention {
-                        key: state.key,
-                        value: state.value,
-                    },
+                    BlockStatePorts::Attention(state.planes),
                     BlockControlPorts::Attention {
                         coordinates: controls.coordinates,
                         visible: controls.visible,

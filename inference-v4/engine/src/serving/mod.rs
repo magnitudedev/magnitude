@@ -94,6 +94,7 @@ struct Host {
     vocabulary: std::cell::RefCell<Vocabulary>,
     prepare_input: InputPreparer,
     count_input: CountInput,
+    media_marker: Option<String>,
     config: Config,
     identity: String,
     next: std::cell::Cell<u64>,
@@ -110,6 +111,7 @@ impl Server {
         vocabulary: Vocabulary,
         prepare_input: InputPreparer,
         count_input: CountInput,
+        media_marker: Option<String>,
         config: Config,
     ) -> Result<Self, String> {
         config.validate(&tokenizer, &templates)?;
@@ -135,6 +137,7 @@ impl Server {
             vocabulary: std::cell::RefCell::new(vocabulary),
             prepare_input,
             count_input,
+            media_marker,
             config,
             identity: format!("{:x}-{}-{server}", time.as_nanos(), std::process::id()),
             next: std::cell::Cell::new(0),
@@ -307,6 +310,7 @@ impl Host {
             output_capacity: self.config.output_capacity,
             forced_quantum: self.config.forced_quantum,
             method: self.config.method,
+            media_marker: self.media_marker.as_deref(),
         };
         let selection = TemplateSelection {
             variant: self.config.template_variant.as_deref(),

@@ -12,47 +12,37 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     ) -> Result<PhysicalResolution, DomainError> {
         self.healthy()?;
         if matches!(pending.outcome, Outcome::Head { .. }) {
-            if decision.accepted_rows != 0
-                || decision
-                    .head_prefix
-                    .is_some_and(|rows| rows > pending.rows())
-            {
+            // A head commits exactly its entry rows; its chained proposal
+            // rows never become visible.
+            if decision.accepted_rows != pending.committed_rows {
                 let _ = self.abort(pending);
-                return Err("head decision exceeds its completed numerical rows".into());
+                return Err("head decision differs from its committed entry rows".into());
             }
             let advance = pending
                 .advance
                 .take()
                 .ok_or_else(|| self.fatal_invariant("head outcome has no owned advance"))?;
-            if let Some(rows) = decision.head_prefix {
-                let resolved = advance.commit(rows).map_err(|(state, error)| {
+            let resolved = advance
+                .commit(decision.accepted_rows)
+                .map_err(|(state, error)| {
                     self.head.insert(pending.request, state);
                     self.fatal_state(error)
                 })?;
-                let state = match resolved {
-                    OwnedAdvanceResolution::Aborted(state)
-                    | OwnedAdvanceResolution::Committed(state) => state,
-                    OwnedAdvanceResolution::Repair(repair) => {
-                        let error = self.fatal_invariant(
-                            "head method decision needs unsupported recurrent repair",
-                        );
-                        drop(repair);
-                        return Err(error);
-                    }
-                };
-                self.head.insert(pending.request, state);
-                return Ok(PhysicalResolution::Committed);
-            }
-            if self.head_pending.insert(pending.request, advance).is_some() {
-                return Err(self.fatal_invariant("head request has two suspended advances"));
-            }
+            let state = match resolved {
+                OwnedAdvanceResolution::Aborted(state)
+                | OwnedAdvanceResolution::Committed(state) => state,
+                OwnedAdvanceResolution::Repair(repair) => {
+                    let error =
+                        self.fatal_invariant("head decision needs unsupported recurrent repair");
+                    drop(repair);
+                    return Err(error);
+                }
+            };
+            self.head.insert(pending.request, state);
             return Ok(PhysicalResolution::Committed);
         }
-        if matches!(
-            pending.outcome,
-            Outcome::Project { .. } | Outcome::Encode { .. }
-        ) {
-            if decision.accepted_rows != 0 || decision.head_prefix.is_some() {
+        if matches!(pending.outcome, Outcome::Encode { .. }) {
+            if decision.accepted_rows != 0 {
                 return Err("stateless result has a physical prefix decision".into());
             }
             if let (Outcome::Encode { features }, Some(image)) = (&pending.outcome, &pending.image)
@@ -86,14 +76,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Err("accepted target prefix is outside the submitted row commitment".into());
         }
         let request = pending.request;
-        if decision.head_prefix.is_some_and(|rows| {
-            self.head_pending
-                .get(&request)
-                .is_none_or(|advance| rows > advance.rows())
-        }) {
-            let _ = self.abort(pending);
-            return Err("accepted head prefix has no matching suspended head advance".into());
-        }
         if self.target.contains_key(&request) || self.repairs.contains_key(&request) {
             return Err(self.fatal_invariant("request already has another physical state owner"));
         }
@@ -110,9 +92,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         match resolution {
             OwnedAdvanceResolution::Aborted(state) | OwnedAdvanceResolution::Committed(state) => {
                 self.target.insert(request, state);
-                if let Some(head_prefix) = decision.head_prefix {
-                    self.publish_head_prefix(request, head_prefix)?;
-                }
                 Ok(PhysicalResolution::Committed)
             }
             OwnedAdvanceResolution::Repair(repair) => {
@@ -137,7 +116,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                                 slice
                             })
                             .collect(),
-                        head_prefix: decision.head_prefix,
                     },
                 );
                 Ok(PhysicalResolution::Repair { request, rows })
@@ -154,7 +132,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 self.target.contains_key(&pending.request)
                     || self.repairs.contains_key(&pending.request)
             }
-            Outcome::Project { .. } | Outcome::Encode { .. } | Outcome::Repair => false,
+            Outcome::Encode { .. } | Outcome::Repair => false,
         };
         if conflicting_owner {
             return Err(self.fatal_invariant("request already has another physical state owner"));
@@ -174,45 +152,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 }
             }
         }
-        Ok(())
-    }
-
-    /// Cancel a staged head successor before a target decision consumes it.
-    pub fn abort_head_pending(&mut self, request: RequestId) -> Result<(), String> {
-        if let Some(advance) = self.head_pending.remove(&request) {
-            self.head.insert(request, advance.abort());
-        }
-        Ok(())
-    }
-
-    pub(super) fn publish_head_prefix(
-        &mut self,
-        request: RequestId,
-        accepted: usize,
-    ) -> Result<(), DomainError> {
-        let advance = self
-            .head_pending
-            .remove(&request)
-            .ok_or_else(|| self.fatal_invariant("head prefix has no suspended advance"))?;
-        let resolution = match advance.commit(accepted) {
-            Ok(value) => value,
-            Err((state, error)) => {
-                self.head.insert(request, state);
-                return Err(self.fatal_state(error));
-            }
-        };
-        let state = match resolution {
-            OwnedAdvanceResolution::Aborted(state) | OwnedAdvanceResolution::Committed(state) => {
-                state
-            }
-            OwnedAdvanceResolution::Repair(repair) => {
-                let error =
-                    self.fatal_invariant("head prefix requires unsupported recurrent repair");
-                drop(repair);
-                return Err(error);
-            }
-        };
-        self.head.insert(request, state);
         Ok(())
     }
 }

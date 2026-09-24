@@ -1,140 +1,76 @@
-#define DEFINE_VISION_DENSE(NAME, PREFIX) \
-inline float NAME(device const uchar *base, ulong logical) { \
-  if (PREFIX##_KIND == 0) return *reinterpret_cast<device const float *>(base + logical * PREFIX##_PACKET_SIZE); \
-  if (PREFIX##_KIND == 1) return float(*reinterpret_cast<device const half *>(base + logical * PREFIX##_PACKET_SIZE)); \
-  return as_type<float>(uint(*reinterpret_cast<device const ushort *>(base + logical * PREFIX##_PACKET_SIZE)) << 16); \
-}
+// qwen_vision_merger: layer norm of each of the M * G F32 patch rows (width
+// H) to A, then the up GEMM over G concatenated rows (+ bias, erf GELU) and
+// the down GEMM to the decoder width D (+ bias), published in F32 as the
+// image features. Bodies in common/vision.h and the projection library.
+#include "common/vision.h"
 
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_F32)
-#define A_KIND 0
+#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16)
+typedef element::Bf16 activation;
 #elif defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
-#define A_KIND 1
-#elif defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16)
-#define A_KIND 2
+typedef element::F16 activation;
 #else
-#error "vision merger requires dense activations"
+#error "qwen_vision_merger requires a bf16 or f16 activation"
 #endif
-#define A_PACKET_SIZE SEISMIC_ELEMENT_A_PACKET_SIZE
-#define DECLARE_DENSE_KIND(PREFIX) /* marker */
-#if defined(SEISMIC_NORM_WEIGHT_REPRESENTATION_F32)
-#define NW_KIND 0
-#elif defined(SEISMIC_NORM_WEIGHT_REPRESENTATION_F16)
-#define NW_KIND 1
-#elif defined(SEISMIC_NORM_WEIGHT_REPRESENTATION_BF16)
-#define NW_KIND 2
-#else
-#error "vision merger requires dense norm weights"
-#endif
-#if defined(SEISMIC_NORM_BIAS_REPRESENTATION_F32)
-#define NB_KIND 0
-#elif defined(SEISMIC_NORM_BIAS_REPRESENTATION_F16)
-#define NB_KIND 1
-#elif defined(SEISMIC_NORM_BIAS_REPRESENTATION_BF16)
-#define NB_KIND 2
-#else
-#error "vision merger requires dense norm bias"
-#endif
-#if defined(SEISMIC_UP_WEIGHT_REPRESENTATION_F32)
-#define UW_KIND 0
-#elif defined(SEISMIC_UP_WEIGHT_REPRESENTATION_F16)
-#define UW_KIND 1
-#elif defined(SEISMIC_UP_WEIGHT_REPRESENTATION_BF16)
-#define UW_KIND 2
-#else
-#error "vision merger currently requires dense resident up weights"
-#endif
-#if defined(SEISMIC_UP_BIAS_REPRESENTATION_F32)
-#define UB_KIND 0
-#elif defined(SEISMIC_UP_BIAS_REPRESENTATION_F16)
-#define UB_KIND 1
-#else
-#define UB_KIND 2
-#endif
-#if defined(SEISMIC_DOWN_WEIGHT_REPRESENTATION_F32)
-#define DW_KIND 0
-#elif defined(SEISMIC_DOWN_WEIGHT_REPRESENTATION_F16)
-#define DW_KIND 1
-#elif defined(SEISMIC_DOWN_WEIGHT_REPRESENTATION_BF16)
-#define DW_KIND 2
-#else
-#error "vision merger currently requires dense resident down weights"
-#endif
-#if defined(SEISMIC_DOWN_BIAS_REPRESENTATION_F32)
-#define DB_KIND 0
-#elif defined(SEISMIC_DOWN_BIAS_REPRESENTATION_F16)
-#define DB_KIND 1
-#else
-#define DB_KIND 2
-#endif
-#define NW_PACKET_SIZE SEISMIC_NORM_WEIGHT_PACKET_SIZE
-#define NB_PACKET_SIZE SEISMIC_NORM_BIAS_PACKET_SIZE
-#define UW_PACKET_SIZE SEISMIC_UP_WEIGHT_PACKET_SIZE
-#define UB_PACKET_SIZE SEISMIC_UP_BIAS_PACKET_SIZE
-#define DW_PACKET_SIZE SEISMIC_DOWN_WEIGHT_PACKET_SIZE
-#define DB_PACKET_SIZE SEISMIC_DOWN_BIAS_PACKET_SIZE
-DEFINE_VISION_DENSE(load_a, A)
-DEFINE_VISION_DENSE(load_nw, NW)
-DEFINE_VISION_DENSE(load_nb, NB)
-DEFINE_VISION_DENSE(load_uw, UW)
-DEFINE_VISION_DENSE(load_ub, UB)
-DEFINE_VISION_DENSE(load_dw, DW)
-DEFINE_VISION_DENSE(load_db, DB)
 
-inline void store_a(device uchar *base, ulong logical, float value) {
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_F32)
-    *reinterpret_cast<device float *>(base + logical * SEISMIC_ELEMENT_A_PACKET_SIZE) = value;
-#elif defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
-    *reinterpret_cast<device half *>(base + logical * SEISMIC_ELEMENT_A_PACKET_SIZE) = half(value);
-#else
-    uint bits = as_type<uint>(value);
-    *reinterpret_cast<device ushort *>(base + logical * SEISMIC_ELEMENT_A_PACKET_SIZE) = ushort((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
-#endif
+typedef vision::dense_packet<ELEMENT_KIND(SEISMIC_UP_WEIGHT)>::type up_packet;
+typedef vision::dense_packet<ELEMENT_KIND(SEISMIC_DOWN_WEIGHT)>::type down_packet;
+typedef ELEMENT_OF(SEISMIC_UP_WEIGHT) up_element;
+typedef ELEMENT_OF(SEISMIC_DOWN_WEIGHT) down_element;
+typedef ELEMENT_OF(SEISMIC_UP_BIAS) up_bias_element;
+typedef ELEMENT_OF(SEISMIC_DOWN_BIAS) down_bias_element;
+typedef ELEMENT_OF(SEISMIC_NORM_WEIGHT) norm_weight_element;
+typedef ELEMENT_OF(SEISMIC_NORM_BIAS) norm_bias_element;
+
+#define MERGER_ARGUMENTS                                                                         \
+    device const float *hidden [[buffer(SEISMIC_BUFFER_HIDDEN)]],                                \
+    device const uchar *norm_weight [[buffer(SEISMIC_BUFFER_NORM_WEIGHT)]],                      \
+    device const uchar *norm_bias [[buffer(SEISMIC_BUFFER_NORM_BIAS)]],                          \
+    device const uchar *up_weight [[buffer(SEISMIC_BUFFER_UP_WEIGHT)]],                          \
+    device const uchar *up_bias [[buffer(SEISMIC_BUFFER_UP_BIAS)]],                              \
+    device const uchar *down_weight [[buffer(SEISMIC_BUFFER_DOWN_WEIGHT)]],                      \
+    device const uchar *down_bias [[buffer(SEISMIC_BUFFER_DOWN_BIAS)]],                          \
+    device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                                    \
+    device uchar *normalized [[buffer(SEISMIC_BUFFER_SCRATCH_NORMALIZED)]],                      \
+    device uchar *activated [[buffer(SEISMIC_BUFFER_SCRATCH_ACTIVATED)]],                        \
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
+
+#define NORM_THREADS 256
+#define MERGER_WIDTH (SEISMIC_DIM_G * SEISMIC_DIM_H)
+
+kernel void qwen_vision_merger_norm(MERGER_ARGUMENTS,
+    uint row [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float partials[NORM_THREADS / 32];
+    const uint h = uint(SEISMIC_DIM_H);
+    vision::layer_norm<NORM_THREADS, activation, norm_weight_element, norm_bias_element>(hidden + ulong(row) * h,
+        normalized + ulong(row) * h * activation::bytes, norm_weight, norm_bias, h,
+        as_type<float>(uint(SEISMIC_PARAM_EPSILON)), partials, thread_index, sg, lane);
 }
 
-inline float merger_normalized(device const uchar *hidden, device const uchar *nw,
-    device const uchar *nb, ulong token, ulong column, float epsilon) {
-    float sum = 0.0f, squares = 0.0f;
-    for (ulong i = 0; i < SEISMIC_DIM_H; ++i) {
-        float value = load_a(hidden, token * SEISMIC_HIDDEN_STRIDE_0 + i * SEISMIC_HIDDEN_STRIDE_1);
-        sum += value;
-        squares += value * value;
-    }
-    float mean = sum / float(SEISMIC_DIM_H);
-    float variance = squares / float(SEISMIC_DIM_H) - mean * mean;
-    float value = load_a(hidden, token * SEISMIC_HIDDEN_STRIDE_0 + column * SEISMIC_HIDDEN_STRIDE_1);
-    return (value - mean) * metal::rsqrt(variance + epsilon)
-        * load_nw(nw, column * SEISMIC_NORM_WEIGHT_STRIDE_0)
-        + load_nb(nb, column * SEISMIC_NORM_BIAS_STRIDE_0);
+kernel void qwen_vision_merger_up(MERGER_ARGUMENTS,
+    uint3 tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    PROJECTION_GEMM_SHARED(shared, vision::TILE_M, vision::TILE_N);
+    const uint width = uint(MERGER_WIDTH);
+    projection::Plain<activation, projection::AllRows> in{normalized, width, 1, width, {}};
+    vision::output_bias_gelu<activation, up_bias_element, true> out{activated, width, up_bias};
+    auto w = vision::weight<up_packet>(up_weight, SEISMIC_UP_WEIGHT_STRIDE_0, up_element::bytes, width);
+    projection::gemm<up_packet, vision::TILE_M, vision::TILE_N>(in, out, w, uint(SEISMIC_DIM_M), width, width,
+        tile.y, tile.x, shared, sg, lane);
 }
 
-kernel void qwen_vision_merger(
-    device const uchar *hidden [[buffer(SEISMIC_BUFFER_HIDDEN)]],
-    device const uchar *norm_weight [[buffer(SEISMIC_BUFFER_NORM_WEIGHT)]],
-    device const uchar *norm_bias [[buffer(SEISMIC_BUFFER_NORM_BIAS)]],
-    device const uchar *up_weight [[buffer(SEISMIC_BUFFER_UP_WEIGHT)]],
-    device const uchar *up_bias [[buffer(SEISMIC_BUFFER_UP_BIAS)]],
-    device const uchar *down_weight [[buffer(SEISMIC_BUFFER_DOWN_WEIGHT)]],
-    device const uchar *down_bias [[buffer(SEISMIC_BUFFER_DOWN_BIAS)]],
-    device uchar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
-    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
-    uint raw_index [[thread_position_in_grid]]) {
-    ulong index = ulong(raw_index);
-    if (index >= SEISMIC_DIM_M * SEISMIC_DIM_D) return;
-    ulong row = index / SEISMIC_DIM_D;
-    ulong output = index % SEISMIC_DIM_D;
-    float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
-    float value = load_db(down_bias, output * SEISMIC_DOWN_BIAS_STRIDE_0);
-    for (ulong feature = 0; feature < SEISMIC_DIM_G * SEISMIC_DIM_H; ++feature) {
-        float up = load_ub(up_bias, feature * SEISMIC_UP_BIAS_STRIDE_0);
-        for (ulong source = 0; source < SEISMIC_DIM_G * SEISMIC_DIM_H; ++source) {
-            ulong token = row * SEISMIC_DIM_G + source / SEISMIC_DIM_H;
-            ulong column = source % SEISMIC_DIM_H;
-            up = metal::fma(merger_normalized(hidden, norm_weight, norm_bias, token, column, epsilon),
-                load_uw(up_weight, source * SEISMIC_UP_WEIGHT_STRIDE_0 + feature * SEISMIC_UP_WEIGHT_STRIDE_1), up);
-        }
-        float activated = 0.5f * up * (1.0f + metal::erf(up * 0.7071067811865475f));
-        value = metal::fma(activated,
-            load_dw(down_weight, feature * SEISMIC_DOWN_WEIGHT_STRIDE_0 + output * SEISMIC_DOWN_WEIGHT_STRIDE_1), value);
-    }
-    store_a(result, row * SEISMIC_RESULT_0_STRIDE_0 + output * SEISMIC_RESULT_0_STRIDE_1, value);
+kernel void qwen_vision_merger_down(MERGER_ARGUMENTS,
+    uint3 tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    PROJECTION_GEMM_SHARED(shared, vision::TILE_M, vision::TILE_N);
+    const uint width = uint(MERGER_WIDTH);
+    projection::Plain<activation, projection::AllRows> in{activated, width, 1, width, {}};
+    vision::output_bias_f32<down_bias_element> out{result, SEISMIC_RESULT_0_STRIDE_0, down_bias, nullptr, 0};
+    auto w = vision::weight<down_packet>(down_weight, SEISMIC_DOWN_WEIGHT_STRIDE_0, down_element::bytes, width);
+    projection::gemm<down_packet, vision::TILE_M, vision::TILE_N>(in, out, w, uint(SEISMIC_DIM_M),
+        uint(SEISMIC_DIM_D), width, tile.y, tile.x, shared, sg, lane);
 }

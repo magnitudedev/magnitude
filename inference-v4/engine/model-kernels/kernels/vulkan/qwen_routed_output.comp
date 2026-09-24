@@ -1,0 +1,123 @@
+// Decode output (M <= 8): workgroup (x, m) owns output channels of tile x for
+// row m. The Vulkan form of `metal/qwen_routed_output.metal`. It runs the K1
+// GEMV sums of each choice's down projection in slot order, weighting each
+// published (A-rounded) projection by its score, then the shared expert's
+// down projection, and publishes
+//     residual + selected + round_A(shared) * coefficient.
+// Every lane of a lane group (a whole subgroup) receives each channel's
+// total, so the running selection lives in every lane's registers and one
+// lane stores the channel.
+#include "common/activation.glsl"
+#include "common/routed.glsl"
+
+#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#define ROUTED_ACT ELEMENT_ACT
+#else
+#error "qwen_routed_output requires a bf16 or f16 activation"
+#endif
+
+#if defined(SEISMIC_EXPERT_DOWN_REPRESENTATION_Q4K)
+#define ED_KIND PACKETS_Q4K
+#define ED_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_EXPERT_DOWN)
+#elif defined(SEISMIC_EXPERT_DOWN_REPRESENTATION_Q5K)
+#define ED_KIND PACKETS_Q5K
+#define ED_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_EXPERT_DOWN)
+#elif defined(SEISMIC_EXPERT_DOWN_REPRESENTATION_Q6K)
+#define ED_KIND PACKETS_Q6K
+#define ED_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_EXPERT_DOWN)
+#elif defined(SEISMIC_EXPERT_DOWN_REPRESENTATION_Q8G32S)
+#define ED_KIND PACKETS_Q8
+#define ED_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_EXPERT_DOWN)
+#elif defined(SEISMIC_EXPERT_DOWN_REPRESENTATION_BF16)
+#define ED_KIND PACKETS_BF16
+#define ED_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_EXPERT_DOWN, 2)
+#elif defined(SEISMIC_EXPERT_DOWN_REPRESENTATION_F16)
+#define ED_KIND PACKETS_F16
+#define ED_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_EXPERT_DOWN, 2)
+#elif defined(SEISMIC_EXPERT_DOWN_REPRESENTATION_F32)
+#define ED_KIND PACKETS_F32
+#define ED_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_EXPERT_DOWN, 4)
+#else
+#error "unsupported qwen_routed_output expert_down representation"
+#endif
+#if defined(SEISMIC_EXPERT_DOWN_KIND_PACKED) && !defined(SEISMIC_EXPERT_DOWN_LAYOUT_ROWS16)
+#error "qwen_routed_output requires the rows16 layout for expert_down"
+#endif
+
+#if defined(SEISMIC_SHARED_DOWN_REPRESENTATION_Q4K)
+#define SD_KIND PACKETS_Q4K
+#define SD_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_SHARED_DOWN)
+#elif defined(SEISMIC_SHARED_DOWN_REPRESENTATION_Q5K)
+#define SD_KIND PACKETS_Q5K
+#define SD_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_SHARED_DOWN)
+#elif defined(SEISMIC_SHARED_DOWN_REPRESENTATION_Q6K)
+#define SD_KIND PACKETS_Q6K
+#define SD_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_SHARED_DOWN)
+#elif defined(SEISMIC_SHARED_DOWN_REPRESENTATION_Q8G32S)
+#define SD_KIND PACKETS_Q8
+#define SD_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_SHARED_DOWN)
+#elif defined(SEISMIC_SHARED_DOWN_REPRESENTATION_BF16)
+#define SD_KIND PACKETS_BF16
+#define SD_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_SHARED_DOWN, 2)
+#elif defined(SEISMIC_SHARED_DOWN_REPRESENTATION_F16)
+#define SD_KIND PACKETS_F16
+#define SD_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_SHARED_DOWN, 2)
+#elif defined(SEISMIC_SHARED_DOWN_REPRESENTATION_F32)
+#define SD_KIND PACKETS_F32
+#define SD_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_SHARED_DOWN, 4)
+#else
+#error "unsupported qwen_routed_output shared_down representation"
+#endif
+#if defined(SEISMIC_SHARED_DOWN_KIND_PACKED) && !defined(SEISMIC_SHARED_DOWN_LAYOUT_ROWS16)
+#error "qwen_routed_output requires the rows16 layout for shared_down"
+#endif
+
+#define OUTPUT_R SEISMIC_TUNE_ROWS
+
+void qwen_routed_output() {
+    const uint tile = gl_WorkGroupID.x;
+    const uint64_t m = gl_WorkGroupID.y;
+    const uint hidden = uint(SEISMIC_DIM_H);
+    const uint first = projection_gemv_first_row(OUTPUT_R, 32u, tile);
+    const uint bytes = ELEMENT_BYTES(ROUTED_ACT);
+    float selected[PROJECTION_GEMV_MAX_R];
+    [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r)
+        selected[r] = 0.0;
+    float totals[PROJECTION_GEMV_SUMS], unused[PROJECTION_GEMV_SUMS];
+
+    for (uint64_t k = 0ul; k < SEISMIC_DIM_K; ++k) {
+        const uint64_t expert = uint64_t(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)
+            + (m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1) * 4ul));
+        const projection_prologue x = projection_plain(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_PRODUCT)
+                + (m * SEISMIC_EXPERT_PRODUCT_STRIDE_0 + k * SEISMIC_EXPERT_PRODUCT_STRIDE_1) * uint64_t(bytes),
+            0ul, SEISMIC_EXPERT_PRODUCT_STRIDE_2, uint(SEISMIC_DIM_F), 0ul);
+        const projection_weights down = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN), ED_GEOMETRY,
+            routed_expert_row(expert, SEISMIC_DIM_H), uint(SEISMIC_DIM_F));
+        projection_gemv_sums(ED_KIND, ED_KIND, false, OUTPUT_R, 32u, 1u, PROJECTION_NORM_NONE, x, down, down, 1u,
+            hidden, uint(SEISMIC_DIM_F), tile, totals, unused);
+        const float score = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SCORES)
+            + (m * SEISMIC_SCORES_STRIDE_0 + k * SEISMIC_SCORES_STRIDE_1) * 4ul);
+        [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r)
+            if (r < OUTPUT_R)
+                selected[r] = seismic_fma_rn(score, element_round(ROUTED_ACT, totals[r * PROJECTION_GEMV_MAX_M]), selected[r]);
+    }
+
+    const projection_prologue x = projection_plain(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SHARED_PRODUCT)
+            + m * SEISMIC_SHARED_PRODUCT_STRIDE_0 * uint64_t(bytes),
+        0ul, SEISMIC_SHARED_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_S), 0ul);
+    const projection_weights down = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_DOWN), SD_GEOMETRY, 0ul,
+        uint(SEISMIC_DIM_S));
+    projection_gemv_sums(SD_KIND, SD_KIND, false, OUTPUT_R, 32u, 1u, PROJECTION_NORM_NONE, x, down, down, 1u, hidden,
+        uint(SEISMIC_DIM_S), tile, totals, unused);
+    const float coefficient = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_COEFFICIENT) + m * SEISMIC_COEFFICIENT_STRIDE_0 * 4ul);
+    [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r) {
+        const uint n = first + r;
+        if (r < OUTPUT_R && n < hidden && gl_SubgroupInvocationID == r) {
+            const float residual = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)
+                + (m * SEISMIC_RESIDUAL_STRIDE_0 + uint64_t(n) * SEISMIC_RESIDUAL_STRIDE_1) * 4ul);
+            element_f32_put(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)
+                    + (m * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(n) * SEISMIC_RESULT_0_STRIDE_1) * 4ul,
+                residual + selected[r] + element_round(ROUTED_ACT, totals[r * PROJECTION_GEMV_MAX_M]) * coefficient);
+        }
+    }
+}

@@ -111,9 +111,9 @@ operating-state variation is therefore a confounder; these errors cannot all be
 assigned to native compiler transformations. Neither this additive hypothesis
 nor the previous raw slopes justify a production timing contract.
 
-Full held-out measurements and archives remain on `m4-pro-01` under
-`~/seismic-v4-validation-01a0b3ad/metal-services-heldout.json` and
-`heldout-service-archives/`; the driver is `metal_services_heldout.swift`.
+The full held-out measurements (`metal-services-heldout.json`) and archives
+(`heldout-service-archives/`) stay in the measuring machine's working directory
+and are not checked in; the driver is `metal_services_heldout.swift`.
 Calibration uses the preceding `metal-services-numerical.json` capture.
 
 ## Native kernel program probes (P2, P3/R6, P4)
@@ -121,8 +121,7 @@ Calibration uses the preceding `metal-services-numerical.json` capture.
 Each probe prints one JSON document on stdout (host, device, parameters, every
 configuration's samples and medians); progress goes to stderr. Run them only on
 an otherwise idle GPU. Store the output under `../results/` (ignored), named
-by host. Copy the sources to the host (for example into `~/native-program/probes/`)
-and build them there.
+by host. Build and run them on the machine being measured.
 
 **P3/R6 streaming-read bandwidth** (`stream_read.swift`, `stream_read.cu`). Each lane
 issues `unroll` independent 16 B loads (Metal `uint4`, CUDA `ld.global.nc.v4.u32`) per
@@ -145,12 +144,12 @@ byte was read exactly once.
   uses a private-storage buffer. CUDA uses `cudaMalloc`.
 
 ```sh
-# m4-pro-01
+# Apple silicon (e.g. an Apple M4 Pro)
 swiftc -O stream_read.swift -o stream-read
-./stream-read > ../results/bandwidth-m4-pro-01.json            # flags: --sizes-gb 1,2,4 --repetitions N
-# sparky (GB10, sm_121)
-/usr/local/cuda/bin/nvcc -O3 -arch=sm_121 stream_read.cu -o stream-read
-./stream-read > ../results/bandwidth-sparky.json
+./stream-read > ../results/bandwidth-<host>.json               # flags: --sizes-gb 1,2,4 --repetitions N
+# NVIDIA (e.g. a GB10, sm_121, CUDA 13)
+nvcc -O3 -arch=sm_121 stream_read.cu -o stream-read
+./stream-read > ../results/bandwidth-<host>.json
 ```
 
 **P4 `simdgroup_matrix` throughput** (`simdgroup_throughput.swift`, Metal source inline,
@@ -172,9 +171,9 @@ accumulated in float, plus half operands with a half accumulator.
   is linear in the iteration count.
 
 ```sh
-# m4-pro-01
+# Apple silicon
 swiftc -O simdgroup_throughput.swift -o simdgroup-throughput
-./simdgroup-throughput > ../results/simdgroup-throughput-m4-pro-01.json   # flags: --iterations, --threadgroups-per-core
+./simdgroup-throughput > ../results/simdgroup-throughput-<host>.json   # flags: --iterations, --threadgroups-per-core
 ```
 
 **P4b register-resident `simdgroup_matrix` peak** (`simdgroup_peak.swift`, same compile
@@ -210,7 +209,45 @@ with one warp per 16x8 tile, chaining one mma per k16 step.
   show the accumulation order and rounding inside the mma.
 
 ```sh
-# sparky
-/usr/local/cuda/bin/nvcc -O3 -arch=sm_121 mma_determinism.cu -o mma-determinism
-./mma-determinism > ../results/mma-determinism-sparky.json     # flags: --n, --k, --repetitions
+# NVIDIA GB10 (aarch64 Linux, sm_121)
+nvcc -O3 -arch=sm_121 mma_determinism.cu -o mma-determinism
+./mma-determinism > ../results/mma-determinism-<host>.json     # flags: --n, --k, --repetitions
+```
+
+## Vulkan device facts and driver probes (`vulkan-facts/`)
+
+`vulkan-facts` is a standalone crate, outside the workspace. It uses `ash` and the same `glslang` crate as
+formation. It answers the Vulkan backend spec's §4 floor and §16 questions. For every Vulkan device it prints
+one JSON document with:
+
+- identity, driver and UUIDs;
+- subgroup, integer-dot, float-control and limit facts;
+- the §4 floor features;
+- cooperative-matrix shapes, atomics and ReBAR;
+- memory heaps and budgets;
+- queue families;
+- whether the watched extensions are present.
+
+It also runs two probes:
+
+- **`fma`:** witness inputs (a = b = 1 + 2^-12, c = −(1 + 2^-11); fused 2^-24, two roundings 0) through
+  four forms:
+  - `fma()`;
+  - `a*b+c`;
+  - `precise a*b+c`;
+  - `fma()` next to a `precise a*b+c` over the same operands.
+
+  Each form runs as compiled by glslang (`GLSL.std.450 Fma`) and, when `VK_KHR_shader_fma` is present,
+  rewritten to `OpFmaKHR`. The probe also prints the driver's ISA lines through
+  `VK_KHR_pipeline_executable_properties`.
+- **`shared_spec`:** a shared array sized by a specialization constant (64 B to 64 KiB). It reports whether
+  the result is correct and what shared size the driver reports.
+
+CPU devices are skipped unless you pass `--all`.
+
+```sh
+cargo build --release    # in vulkan-facts/
+VULKAN_FACTS_DUMP=out ./target/release/vulkan-facts > ../../results/hardware/vulkan-facts-<host>.json
+spirv-val --target-env vulkan1.3 out/fma-khr.spv                   # the rewritten module
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json ./target/release/vulkan-facts --all   # lavapipe
 ```

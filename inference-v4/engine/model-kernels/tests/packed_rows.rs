@@ -73,12 +73,15 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
 
 
     // One key and one value head of width 32, a two-tap convolution, and a
-    // two-bank state arena (bank 0 read, bank 1 published).
+    // two-bank state arena (bank 0 read, bank 1 published) with one tape row
+    // (u [1, 32] | k [1, 32] | d [1]).
     let segments = indices(&device, &[2, 2], &[0, 1, 1, 1]);
     let stop = indices(&device, &[1], &[1]);
     let previous_bank = indices(&device, &[1], &[0]);
+    let previous_tape = indices(&device, &[1], &[0]);
     let following_bank = indices(&device, &[1], &[1]);
-    let mut window = bf16_tensor(&[2, 1, 96], &[0.0; 192]);
+    let mut window = bf16_tensor(&[2, 2, 96], &[0.0; 384]);
+    let mut tape = tensor(&device, &[2, 1, 65], &[0.0; 130]);
     let qkv_weight = resident(&[96, 32]);
     let alpha_weight = resident(&[1, 32]);
     let beta_weight = resident(&[1, 32]);
@@ -118,7 +121,7 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
             .with_static("NV", 1)
             .with_static("W", 32)
             .with_static("C", 2)
-            .with_param("ROWS", 8),
+            .with_param("ROWS", 16),
     )
     .unwrap()
     .call(qwen_recurrent_step::Args {
@@ -129,9 +132,11 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
         segments: &segments,
         stop: &stop,
         previous_bank: &previous_bank,
+        previous_tape: &previous_tape,
         following_bank: &following_bank,
         window: &mut window,
         delta: &mut delta,
+        tape: &mut tape,
         norm_epsilon: epsilon,
         grouped: true,
     })
@@ -206,7 +211,7 @@ fn packed_entries_are_the_only_generated_target_surface() {
     let _ = qwen_recurrent_output::for_device_with;
     let _ = qwen_recurrent_output::native_for_device_with;
     let sources = [
-        include_str!("../kernels/target_rows.seismic"),
+        include_str!("../kernels/target.seismic"),
         include_str!("../kernels/dense_rows.seismic"),
         include_str!("../kernels/routed.seismic"),
     ]

@@ -25,7 +25,7 @@ impl Rng {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
     Q4K,
     Q5K,
@@ -105,6 +105,15 @@ pub fn weight(device: &Device, format: Format, rows: usize, k: usize, rng: &mut 
     let values = resident.decode_host(&shape, &bytes).unwrap();
     let tensor = Tensor::from_host(device, resident, &shape, &bytes).unwrap();
     Weight { tensor, values, bytes }
+}
+
+/// A dense bf16 weight [rows, k] (row-major, as dense GGUF weights are
+/// resident) and its values.
+pub fn dense_weight(device: &Device, rows: usize, k: usize, rng: &mut Rng) -> Weight {
+    let values: Vec<f32> = (0..rows * k).map(|_| bf16_round(rng.uniform(-0.05, 0.05))).collect();
+    let tensor = bf16_tensor(device, &[rows as u64, k as u64], &values);
+    let bytes = tensor.read_to_host().unwrap();
+    Weight { tensor, values: values.iter().map(|v| f64::from(*v)).collect(), bytes }
 }
 
 pub fn f32_tensor(device: &Device, shape: &[u64], values: &[f32]) -> Tensor {
@@ -192,8 +201,12 @@ pub fn silu(x: f64) -> f64 {
 }
 
 
-/// A native mapping: GEMV K split, GEMM BM, the INT8 operand path and the
-/// GEMM split-K (entries without SPLIT ignore it).
+/// The largest row count the CUDA K1 GEMV serves (`projection::GEMV_ROWS`);
+/// larger counts run the GEMM.
+pub const GEMV_ROWS: usize = 16;
+
+/// A native mapping: GEMV K split, GEMM BM, the GEMM's INT8 operand path and
+/// the GEMM split-K (entries without SPLIT ignore it).
 #[derive(Clone, Copy, Debug)]
 pub struct Mapping {
     pub ksplit: u64,
@@ -209,8 +222,13 @@ impl Mapping {
         let spec = spec.with_param("KSPLIT", self.ksplit).with_param("BM", self.bm).with_param("INT8", self.int8);
         if split { spec.with_param("SPLIT", self.split) } else { spec }
     }
+    /// Whether `rows` rows run the INT8 path (only the GEMM has one).
+    pub fn quantizes(self, rows: usize) -> bool {
+        self.int8 == 1 && rows > GEMV_ROWS
+    }
 }
 
+/// GEMV mappings. INT8 1 is included to show the GEMV ignores it.
 pub const GEMV_MAPPINGS: [Mapping; 4] = [
     Mapping { ksplit: 4, bm: 64, int8: 0, split: 1 },
     Mapping { ksplit: 2, bm: 64, int8: 0, split: 1 },
@@ -225,7 +243,7 @@ pub const GEMM_MAPPINGS: [Mapping; 4] = [
 ];
 
 pub fn mappings(m: usize) -> &'static [Mapping] {
-    if m <= 8 { &GEMV_MAPPINGS } else { &GEMM_MAPPINGS }
+    if m <= GEMV_ROWS { &GEMV_MAPPINGS } else { &GEMM_MAPPINGS }
 }
 
 /// q8_1 quantization of rows of `k` as the INT8 path forms them: per 32
@@ -259,12 +277,12 @@ pub fn slack_bound(slack: &[f32], w: &[f64], m: usize, n: usize, k: usize) -> Ve
     out
 }
 
-/// The bound of the 16-bit GEMM's weight dequantization (rows > 8, INT8 off):
-/// each weight becomes round_A(code * round_A(scale) - round_A(bias)), off
-/// by at most 2^-9 (|code * scale| + |bias| + |value|) <= 2^-7 max_row |w|
-/// in bf16; zero on every other path.
+/// The bound of the 16-bit GEMM's weight dequantization (rows > GEMV_ROWS,
+/// INT8 off): each weight becomes round_A(code * round_A(scale) -
+/// round_A(bias)), off by at most 2^-9 (|code * scale| + |bias| + |value|)
+/// <= 2^-7 max_row |w| in bf16; zero on every other path.
 pub fn dequant_bound(x: &[f32], w: &[f64], m: usize, n: usize, k: usize, mapping: Mapping) -> Vec<f64> {
-    if m <= 8 || mapping.int8 == 1 {
+    if m <= GEMV_ROWS || mapping.int8 == 1 {
         return vec![0.0; m * n];
     }
     let maximum: Vec<f64> =
@@ -279,12 +297,12 @@ pub fn dequant_bound(x: &[f32], w: &[f64], m: usize, n: usize, k: usize, mapping
     out
 }
 
-/// The activation rows a mapping's operand path multiplies, and the slack of
-/// each (zero on the 16-bit path; half a quantization step on the INT8 path,
-/// where a tie resolved differently before quantization moves a value by up
-/// to one step).
+/// The activation rows (x holds rows of `k`) a mapping's operand path
+/// multiplies, and the slack of each (zero on the 16-bit path; half a
+/// quantization step on the INT8 path, where a tie resolved differently
+/// before quantization moves a value by up to one step).
 pub fn operand_rows(x: &[f32], k: usize, mapping: Mapping) -> (Vec<f32>, Vec<f32>) {
-    if mapping.int8 == 1 { quantize(x, k) } else { (x.to_vec(), vec![0.0; x.len()]) }
+    if mapping.quantizes(x.len() / k) { quantize(x, k) } else { (x.to_vec(), vec![0.0; x.len()]) }
 }
 
 pub fn check(label: &str, actual: &[f32], expected: &[f64], tolerance: &[f64]) {

@@ -205,34 +205,31 @@ fn rejects_invalid_geometry_and_missing_wrong_or_unbound_roles() {
     d.tensors.push(extra);
     assert!(inspect(&d, ArtifactIdentity([0; 32])).is_err());
 }
+/// Explicit per-layer recurrent flags bind the layer order they name; flags
+/// that are not booleans, or not one per layer, are rejected. (Speculative
+/// nextn blocks are covered by the Qwen family's own MTP role test.)
 #[test]
-fn explicit_mixer_flags_and_speculative_blocks_keep_main_layer_order() {
+fn explicit_mixer_flags_bind_the_named_layer_order() {
     let mut d = directory(false);
-    set(&mut d, "block_count", Value::Scalar(Scalar::Unsigned(3)));
-    set(
-        &mut d,
-        "nextn_predict_layers",
-        Value::Scalar(Scalar::Unsigned(1)),
-    );
     set(
         &mut d,
         "attention.recurrent_layers",
         Value::Array(vec![Scalar::Bool(true), Scalar::Bool(false)]),
     );
-    let mut extra = d.tensors[2].clone();
-    extra.name = "blk.2.speculative.weight".into();
-    d.tensors.push(extra);
     assert_eq!(
         inspect(&d, ArtifactIdentity([0; 32])).unwrap().blocks.len(),
         2
     );
-    d.tensors.last_mut().unwrap().name = "blk.02.speculative.weight".into();
-    assert!(inspect(&d, ArtifactIdentity([0; 32])).is_err());
-    d.tensors.pop();
     set(
         &mut d,
         "attention.recurrent_layers",
         Value::Array(vec![Scalar::Unsigned(1), Scalar::Bool(false)]),
+    );
+    assert!(inspect(&d, ArtifactIdentity([0; 32])).is_err());
+    set(
+        &mut d,
+        "attention.recurrent_layers",
+        Value::Array(vec![Scalar::Bool(true)]),
     );
     assert!(inspect(&d, ArtifactIdentity([0; 32])).is_err());
 }
@@ -373,7 +370,10 @@ fn local_gguf_loading_shares_artifact_identity_with_tokenizer_and_templates() {
     let directory_error = LoadedArtifacts::open(temp.0.parent().unwrap())
         .err()
         .unwrap();
-    assert!(directory_error.contains("regular GGUF file"));
+    assert!(
+        directory_error.contains("not a regular file"),
+        "{directory_error}"
+    );
     let model = LoadedArtifacts::open(&temp.0).unwrap();
     assert_eq!(model.definition().geometry.vocabulary, 257);
     assert_eq!(model.definition().output, model.definition().embedding);

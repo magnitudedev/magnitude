@@ -181,6 +181,11 @@ pub fn check_call(
     if termination == Some(Termination::RefusedIndexWidth) {
         return refused_index_width(kernel.call(&args));
     }
+    // An unconstrained preparation admits no value comparison (the observer
+    // refuses it); its checkable outcome is the invocation's termination.
+    if matches!(policy, PrecisionPolicy::Unconstrained) {
+        return unconstrained_termination(kernel.call(&args), termination);
+    }
     let checked = kernel.check(&args, policy.clone(), CHECK_MEMORY_BYTES, CHECK_WORK_UNITS);
     if termination == Some(Termination::InvalidInvocation) {
         return invalid_invocation(checked);
@@ -195,6 +200,20 @@ fn refused_index_width(called: Result<Value, seismic::dynamic::Error>) -> Result
         Err(e) if e.message.contains("IndexWidth") => Ok(()),
         Err(e) => Err(format!("expected an IndexWidth refusal, got {}: {}", e.kind, e.message)),
         Ok(_) => Err("expected an IndexWidth refusal, the call returned".into()),
+    }
+}
+
+fn unconstrained_termination(
+    called: Result<Value, seismic::dynamic::Error>,
+    termination: Option<Termination>,
+) -> Result<(), String> {
+    let source_failure = |e: &seismic::dynamic::Error| e.kind == "ExecutionError" && e.message.starts_with("check failed at ");
+    match (called, termination) {
+        (Ok(_), None | Some(Termination::Returned)) => Ok(()),
+        (Err(e), None | Some(Termination::Failed)) if source_failure(&e) => Ok(()),
+        (Err(e), Some(Termination::InvalidInvocation)) if e.kind == "InvocationError" => Ok(()),
+        (Ok(_), expected) => Err(format!("expected {expected:?}, the call returned")),
+        (Err(e), expected) => Err(format!("expected {expected:?}, got {}: {}", e.kind, e.message)),
     }
 }
 

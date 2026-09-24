@@ -20,6 +20,8 @@ struct Geometry {
     width: usize,
     convolution: usize,
     banks: usize,
+    /// Tape rows per bank (T).
+    tape: usize,
 }
 
 impl Geometry {
@@ -29,21 +31,38 @@ impl Geometry {
     fn projection_width(self) -> usize {
         self.channels() + self.value_heads * self.width + 2 * self.value_heads
     }
+    fn window_rows(self) -> usize {
+        self.convolution - 1 + self.tape
+    }
     fn window_bank(self) -> usize {
-        (self.convolution - 1) * self.channels()
+        self.window_rows() * self.channels()
     }
     fn delta_bank(self) -> usize {
         self.value_heads * self.width * self.width
     }
+    /// Floats of one tape row: u [NV, W] | k [NK, W] | d [NV].
+    fn tape_row(self) -> usize {
+        (self.value_heads + self.key_heads) * self.width + self.value_heads
+    }
+    fn tape_bank(self) -> usize {
+        self.tape * self.tape_row()
+    }
 }
 
-/// One slot: its rows, published prefix, accepted bank and successor bank.
+/// One slot: its rows, published prefix, the version it reads (accepted bank
+/// and its tape rows) and its successor bank.
 #[derive(Clone, Copy)]
 struct SlotCase {
     rows: usize,
     stop: usize,
     previous: usize,
     following: usize,
+    taped: usize,
+}
+
+/// A slot reading bank `previous` with no tape rows.
+fn slot(rows: usize, stop: usize, previous: usize, following: usize) -> SlotCase {
+    SlotCase { rows, stop, previous, following, taped: 0 }
 }
 
 struct Case {
@@ -59,15 +78,17 @@ struct Case {
     time_bias: Vec<f32>,
     window: Vec<f32>,
     delta: Vec<f32>,
+    tape: Vec<f32>,
 }
 
 struct Outcome {
     mixed: Vec<f32>,
     window: Vec<f32>,
     delta: Vec<f32>,
+    tape: Vec<f32>,
 }
 
-/// Device tensors of one case; each call mutates its window and delta.
+/// Device tensors of one case; each call mutates its window, delta and tape.
 struct Tensors {
     projection: Tensor,
     convolution: Tensor,
@@ -76,9 +97,11 @@ struct Tensors {
     segments: Tensor,
     stop: Tensor,
     previous: Tensor,
+    previous_tape: Tensor,
     following: Tensor,
     window: Tensor,
     delta: Tensor,
+    tape: Tensor,
 }
 
 impl Tensors {
@@ -91,9 +114,11 @@ impl Tensors {
             segments: &self.segments,
             stop: &self.stop,
             previous_bank: &self.previous,
+            previous_tape: &self.previous_tape,
             following_bank: &self.following,
             window: &mut self.window,
             delta: &mut self.delta,
+            tape: &mut self.tape,
             norm_epsilon: case.epsilon,
             grouped: case.grouped,
         }
@@ -108,9 +133,11 @@ impl Tensors {
             segments: &self.segments,
             stop: &self.stop,
             previous_bank: &self.previous,
+            previous_tape: &self.previous_tape,
             following_bank: &self.following,
             window: &mut self.window,
             delta: &mut self.delta,
+            tape: &mut self.tape,
             norm_epsilon: case.epsilon,
             grouped: case.grouped,
         }
@@ -155,8 +182,10 @@ impl Case {
         let accepted = slots.iter().map(|slot| slot.previous).collect::<Vec<_>>();
         let mut window = vec![SENTINEL; geometry.banks * geometry.window_bank()];
         let mut delta = vec![SENTINEL; geometry.banks * geometry.delta_bank()];
+        let mut tape = vec![SENTINEL; geometry.banks * geometry.tape_bank()];
         window[..geometry.window_bank()].fill(0.0);
         delta[..geometry.delta_bank()].fill(0.0);
+        tape[..geometry.tape_bank()].fill(0.0);
         for bank in 1..geometry.banks {
             if accepted.contains(&bank) {
                 for value in &mut window[bank * geometry.window_bank()..][..geometry.window_bank()] {
@@ -164,6 +193,22 @@ impl Case {
                 }
                 for value in &mut delta[bank * geometry.delta_bank()..][..geometry.delta_bank()] {
                     *value = random.next() * 0.3;
+                }
+                // Tape rows: innovations, keys and decays in (0.5, 1).
+                let nvw = geometry.value_heads * geometry.width;
+                let nkw = geometry.key_heads * geometry.width;
+                for entry in 0..geometry.tape {
+                    let row = &mut tape[bank * geometry.tape_bank() + entry * geometry.tape_row()..]
+                        [..geometry.tape_row()];
+                    for (index, value) in row.iter_mut().enumerate() {
+                        *value = if index < nvw {
+                            random.next() * 0.3
+                        } else if index < nvw + nkw {
+                            random.next() * 0.2
+                        } else {
+                            0.75 + 0.25 * random.next()
+                        };
+                    }
                 }
             }
         }
@@ -180,6 +225,32 @@ impl Case {
             time_bias,
             window,
             delta,
+            tape,
+        }
+    }
+
+    /// The next advance of the same layer after `outcome`: new projection rows
+    /// for `slots` (reading the versions they name), the same weights, and the
+    /// arenas `outcome` left.
+    fn continued(&self, outcome: &Outcome, rows: usize, slots: Vec<SlotCase>, seed: u64) -> Self {
+        let fresh = Case::new(self.geometry, rows, slots, self.grouped, seed);
+        let round = |values: &[f32]| {
+            if self.bf16 {
+                values.iter().map(|value| bf16_round(*value)).collect()
+            } else {
+                values.to_vec()
+            }
+        };
+        Self {
+            projection: round(&fresh.projection),
+            convolution: self.convolution.clone(),
+            rate: self.rate.clone(),
+            time_bias: self.time_bias.clone(),
+            window: outcome.window.clone(),
+            delta: outcome.delta.clone(),
+            tape: outcome.tape.clone(),
+            bf16: self.bf16,
+            ..fresh
         }
     }
 
@@ -221,15 +292,32 @@ impl Case {
         let (nk, nv, w, c) = (g.key_heads, g.value_heads, g.width, g.convolution);
         let channels = g.channels();
         let width = g.projection_width();
+        let key_of = |head: usize| if self.grouped { head * nk / nv } else { head % nk };
         let mut mixed = vec![0.0f32; self.rows * nv * w];
         let mut window = self.window.clone();
         let mut delta = self.delta.clone();
+        let mut tape = self.tape.clone();
         let mut first = 0;
         for slot in &self.slots {
             let mut state = delta[slot.previous * g.delta_bank()..][..g.delta_bank()]
                 .iter()
                 .map(|value| *value as f64)
                 .collect::<Vec<_>>();
+            // The version: the bank's state advanced by its first tape rows.
+            for entry in 0..slot.taped {
+                let row = &self.tape[slot.previous * g.tape_bank() + entry * g.tape_row()..][..g.tape_row()];
+                for head in 0..nv {
+                    let decay = row[(nv + nk) * w + head] as f64;
+                    let key = &row[nv * w + key_of(head) * w..][..w];
+                    for state_row in 0..w {
+                        let innovation = row[head * w + state_row] as f64;
+                        let s = &mut state[(head * w + state_row) * w..][..w];
+                        for column in 0..w {
+                            s[column] = s[column] * decay + innovation * key[column] as f64;
+                        }
+                    }
+                }
+            }
             let publish = |state: &[f64], delta: &mut Vec<f32>| {
                 for (index, value) in state.iter().enumerate() {
                     delta[slot.following * g.delta_bank() + index] = *value as f32;
@@ -238,14 +326,20 @@ impl Case {
             if slot.stop == 0 {
                 publish(&state, &mut delta);
             }
-            let input = |row: usize, local: usize, tap: usize, channel: usize| -> f64 {
-                if local + tap < c - 1 {
-                    self.window[slot.previous * g.window_bank() + (local + tap) * channels + channel]
-                        as f64
+            // Raw input `position` (slot-local) of a channel.
+            let raw = |position: isize, channel: usize| -> f32 {
+                if position < 0 {
+                    self.window[slot.previous * g.window_bank()
+                        + (slot.taped as isize + c as isize - 1 + position) as usize * channels
+                        + channel]
                 } else {
-                    self.projection[(row + tap + 1 - c) * width + channel] as f64
+                    self.projection[(first + position as usize) * width + channel]
                 }
             };
+            let input = |_row: usize, local: usize, tap: usize, channel: usize| -> f64 {
+                raw(local as isize + tap as isize - (c as isize - 1), channel) as f64
+            };
+            let taped = g.tape.min(slot.rows - slot.stop);
             for local in 0..slot.rows {
                 let row = first + local;
                 let mut prepared = vec![0.0f64; channels];
@@ -288,6 +382,14 @@ impl Case {
                     let factor = (self.rate[value_head] as f64 * softplus).exp();
                     let query = &prepared[key_head * w..][..w];
                     let key = &prepared[(nk + key_head) * w..][..w];
+                    let entry = (local >= slot.stop && local - slot.stop < taped)
+                        .then(|| slot.following * g.tape_bank() + (local - slot.stop) * g.tape_row());
+                    if let Some(entry) = entry {
+                        tape[entry + (nv + nk) * w + value_head] = factor as f32;
+                        for column in 0..w {
+                            tape[entry + nv * w + key_head * w + column] = key[column] as f32;
+                        }
+                    }
                     for state_row in 0..w {
                         let s = &mut state[(value_head * w + state_row) * w..][..w];
                         let mut remembered = 0.0;
@@ -297,6 +399,9 @@ impl Case {
                         }
                         let residual =
                             (prepared[(2 * nk + value_head) * w + state_row] - remembered) * beta;
+                        if let Some(entry) = entry {
+                            tape[entry + value_head * w + state_row] = residual as f32;
+                        }
                         let mut output = 0.0;
                         for column in 0..w {
                             s[column] += residual * key[column];
@@ -309,16 +414,10 @@ impl Case {
                     publish(&state, &mut delta);
                 }
             }
-            for tap in 0..c - 1 {
+            for row in 0..c - 1 + taped {
                 for channel in 0..channels {
-                    window[slot.following * g.window_bank() + tap * channels + channel] =
-                        if slot.stop + tap < c - 1 {
-                            self.window[slot.previous * g.window_bank()
-                                + (slot.stop + tap) * channels
-                                + channel]
-                        } else {
-                            self.projection[(first + slot.stop + tap + 1 - c) * width + channel]
-                        };
+                    window[slot.following * g.window_bank() + row * channels + channel] =
+                        raw(slot.stop as isize + row as isize - (c as isize - 1), channel);
                 }
             }
             first += slot.rows;
@@ -327,6 +426,7 @@ impl Case {
             mixed,
             window,
             delta,
+            tape,
         }
     }
 
@@ -343,8 +443,8 @@ impl Case {
         };
         let mut sources = seismic_std::sources();
         sources.push(SourceFile {
-            path: "recurrent_stages.seismic".into(),
-            text: include_str!("../kernels/recurrent_stages.seismic").into(),
+            path: "recurrent.seismic".into(),
+            text: include_str!("../kernels/recurrent.seismic").into(),
         });
         let module = check_source(sources).unwrap();
         let elements = ElementBindings::new().bind("A", registry::dense(DType::F32));
@@ -379,9 +479,11 @@ impl Case {
             ),
             ints(self.slots.iter().map(|slot| slot.stop as i32).collect()),
             ints(self.slots.iter().map(|slot| slot.previous as i32).collect()),
+            ints(self.slots.iter().map(|slot| slot.taped as i32).collect()),
             ints(self.slots.iter().map(|slot| slot.following as i32).collect()),
-            floats(vec![g.banks, g.convolution - 1, g.channels()], &self.window),
+            floats(vec![g.banks, g.window_rows(), g.channels()], &self.window),
             floats(vec![g.banks, g.value_heads, g.width, g.width], &self.delta),
+            floats(vec![g.banks, g.tape, g.tape_row()], &self.tape),
         ];
         let mut arguments = tensors
             .into_iter()
@@ -404,10 +506,12 @@ impl Case {
         };
         let mut window = None;
         let mut delta = None;
+        let mut tape = None;
         for input in outcome.inputs() {
             match input.ordinal() {
-                8 => window = Some(read(input.tensor())),
-                9 => delta = Some(read(input.tensor())),
+                9 => window = Some(read(input.tensor())),
+                10 => delta = Some(read(input.tensor())),
+                11 => tape = Some(read(input.tensor())),
                 _ => {}
             }
         }
@@ -415,6 +519,7 @@ impl Case {
             mixed,
             window: window.expect("window is a mutable input"),
             delta: delta.expect("delta is a mutable input"),
+            tape: tape.expect("tape is a mutable input"),
         }
     }
 
@@ -462,15 +567,17 @@ impl Case {
             segments: ints(&[slots + 1, 2], self.segments()),
             stop: ints(&[slots], self.slots.iter().map(|slot| slot.stop as i32).collect()),
             previous: ints(&[slots], self.slots.iter().map(|slot| slot.previous as i32).collect()),
+            previous_tape: ints(&[slots], self.slots.iter().map(|slot| slot.taped as i32).collect()),
             following: ints(&[slots], self.slots.iter().map(|slot| slot.following as i32).collect()),
             window: from_activation(
-                &[g.banks as u64, g.convolution as u64 - 1, g.channels() as u64],
+                &[g.banks as u64, g.window_rows() as u64, g.channels() as u64],
                 &self.window,
             ),
             delta: from_f32(
                 &[g.banks as u64, g.value_heads as u64, g.width as u64, g.width as u64],
                 &self.delta,
             ),
+            tape: from_f32(&[g.banks as u64, g.tape as u64, g.tape_row() as u64], &self.tape),
         }
     }
 
@@ -510,7 +617,7 @@ impl Case {
         let mut t = self.tensors(device, activation);
         let mixed = match chunk {
             None => self
-                .metal_step(device, activation, 8.min(self.geometry.width as u64))
+                .metal_step(device, activation, 32.min(self.geometry.width as u64))
                 .call(t.step_args(self))
                 .unwrap()
                 .value,
@@ -524,6 +631,7 @@ impl Case {
             mixed: read(&mixed),
             window: read(&t.window),
             delta: read(&t.delta),
+            tape: read(&t.tape),
         }
     }
 
@@ -600,14 +708,33 @@ fn check(label: &str, case: &Case, actual: &Outcome, expected: &Outcome, toleran
             window.iter().zip(expected_window).all(|(a, e)| a.to_bits() == e.to_bits()),
             "{label} window bank {bank} differs"
         );
-        if case.successors().contains(&bank) {
+        let tape = &actual.tape[bank * g.tape_bank()..][..g.tape_bank()];
+        let original_tape = &case.tape[bank * g.tape_bank()..][..g.tape_bank()];
+        // Tape rows the successor records: after its stop row, at most T.
+        let recorded = case
+            .slots
+            .iter()
+            .find(|slot| slot.following == bank)
+            .map(|slot| g.tape.min(slot.rows - slot.stop) * g.tape_row());
+        if let Some(recorded) = recorded {
             let (max, rms) = errors(delta, expected_delta);
             println!("{label} delta bank {bank}: max/rms {max:.3e} rms/rms {rms:.3e}");
             assert!(max <= tolerance.0 && rms <= tolerance.1, "{label} state error {max} {rms}");
+            if recorded > 0 {
+                let expected_tape = &expected.tape[bank * g.tape_bank()..][..recorded];
+                let (max, rms) = errors(&tape[..recorded], expected_tape);
+                println!("{label} tape bank {bank}: max/rms {max:.3e} rms/rms {rms:.3e}");
+                assert!(max <= tolerance.0 && rms <= tolerance.1, "{label} tape error {max} {rms}");
+            }
+            assert!(
+                tape[recorded..].iter().zip(&original_tape[recorded..]).all(|(a, e)| a.to_bits() == e.to_bits()),
+                "{label} wrote tape rows of bank {bank} past its recorded rows"
+            );
         } else {
             let original = &case.delta[bank * g.delta_bank()..][..g.delta_bank()];
             assert!(
-                delta.iter().zip(original).all(|(a, e)| a.to_bits() == e.to_bits()),
+                delta.iter().zip(original).all(|(a, e)| a.to_bits() == e.to_bits())
+                    && tape.iter().zip(original_tape).all(|(a, e)| a.to_bits() == e.to_bits()),
                 "{label} wrote bank {bank}, which is not a successor"
             );
         }
@@ -629,15 +756,10 @@ const SMALL: Geometry = Geometry {
     width: 32,
     convolution: 4,
     banks: 6,
+    tape: 0,
 };
 
 fn small_cases() -> Vec<(&'static str, Case)> {
-    let slot = |rows, stop, previous, following| SlotCase {
-        rows,
-        stop,
-        previous,
-        following,
-    };
     vec![
         (
             "one row from the zero seed",
@@ -680,84 +802,100 @@ fn step_and_chunk_match_the_portable_body() {
     }
 }
 
+/// Small cases over tape versions (T = 3): slots that start from a version
+/// with tape rows, record the rows after their stop row (fewer, exactly, or
+/// more than T), in short and chunked slots, grouped or not.
+fn tape_cases() -> Vec<(&'static str, Case)> {
+    let geometry = Geometry { banks: 7, tape: 3, ..SMALL };
+    let version = |rows, stop, previous, following, taped| SlotCase { rows, stop, previous, following, taped };
+    vec![
+        (
+            "verify slots from tape versions",
+            Case::new(
+                geometry,
+                16,
+                vec![version(4, 1, 1, 4, 2), version(6, 2, 2, 5, 0), version(3, 3, 3, 6, 3)],
+                false,
+                51,
+            ),
+        ),
+        (
+            "chunked slots with tails, from tape versions",
+            Case::new(geometry, 64, vec![version(40, 35, 1, 4, 1), version(20, 20, 2, 5, 3)], true, 52)
+                .with_resets(&[7, 45]),
+        ),
+    ]
+}
+
+/// A committed tape version (bank, j) equals a run that published after those
+/// rows: the next advance from either has the same bits. `run` executes a
+/// case on one entry; the tentative advance is a 5-row verify slot (stop 1).
+fn tape_versions_equal_stopped_runs(label: &str, geometry: Geometry, run: &dyn Fn(&Case) -> Outcome) {
+    let verify = 5;
+    let g = Geometry { banks: 4, tape: verify - 1, ..geometry };
+    for accepted in 0..verify {
+        let tentative = Case::new(g, verify, vec![slot(verify, 1, 1, 2)], true, 41).with_bf16_activations();
+        let first = run(&tentative);
+        let next = SlotCase { rows: 3, stop: 3, previous: 2, following: 3, taped: accepted };
+        let continued = tentative.continued(&first, 3, vec![next], 42);
+        let from_tape = run(&continued);
+        let stopped = Case::new(g, verify, vec![slot(verify, 1 + accepted, 1, 2)], true, 41).with_bf16_activations();
+        let reference_first = run(&stopped);
+        let reference = stopped.continued(&reference_first, 3, vec![slot(3, 3, 2, 3)], 42);
+        let expected = run(&reference);
+        let bank = |values: &[f32], size: usize| values[3 * size..4 * size].to_vec();
+        assert!(
+            from_tape.mixed.iter().zip(&expected.mixed).all(|(a, b)| a.to_bits() == b.to_bits())
+                && bank(&from_tape.delta, g.delta_bank()) == bank(&expected.delta, g.delta_bank())
+                && bank(&from_tape.window, g.window_bank()) == bank(&expected.window, g.window_bank()),
+            "{label}: version (bank, {accepted}) differs from a run that stopped after {} rows",
+            1 + accepted
+        );
+        check(&format!("{label}: from version (bank, {accepted})"), &continued, &from_tape, &continued.host(), (1.5e-2, 3e-3));
+    }
+}
+
+#[test]
+fn tape_cases_match_the_portable_body() {
+    let Some(device) = metal() else {
+        return;
+    };
+    for (label, case) in tape_cases() {
+        let oracle = case.oracle();
+        check(&format!("{label}: host vs body"), &case, &case.host(), &oracle, (1e-4, 1e-5));
+        check(&format!("{label}: step"), &case, &case.native(&device, Element::f32(), None), &oracle, (2e-5, 2e-6));
+        for rows in METAL_CHUNK_ROWS {
+            let rows = rows.min(case.geometry.width as u64);
+            let chunked = case.native(&device, Element::f32(), Some(rows));
+            check(&format!("{label}: chunk ROWS {rows}"), &case, &chunked, &oracle, (5e-4, 2e-5));
+        }
+    }
+}
+
+#[test]
+fn tape_versions_equal_runs_that_stopped_there() {
+    let Some(device) = metal() else {
+        return;
+    };
+    let qwen = Geometry { key_heads: 16, value_heads: 32, width: 128, convolution: 4, banks: 4, tape: 0 };
+    for geometry in [SMALL, qwen] {
+        tape_versions_equal_stopped_runs("step", geometry, &|case| case.native(&device, Element::bf16(), None));
+        tape_versions_equal_stopped_runs("chunk", geometry, &|case| case.native(&device, Element::bf16(), Some(32)));
+    }
+}
+
 #[test]
 fn step_row_block_never_changes_bits_and_stop_equals_a_shorter_run() {
     let Some(device) = metal() else {
         return;
     };
-    let slot = |rows, stop| SlotCase {
-        rows,
-        stop,
-        previous: 1,
-        following: 2,
-    };
+    let slot = |rows, stop| slot(rows, stop, 1, 2);
     let full = Case::new(SMALL, 6, vec![slot(6, 3)], false, 11);
     let mut reference = None;
-    for rows in [4u64, 8, 16, 32] {
-        let g = full.geometry;
-        let from = |shape: &[u64], values: &[f32], element: Element| {
-            Tensor::from_host(
-                &device,
-                element,
-                shape,
-                &values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>(),
-            )
-            .unwrap()
-        };
-        let ints = |values: &[i32]| {
-            Tensor::from_host(
-                &device,
-                Element::i32(),
-                &[values.len() as u64],
-                &values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>(),
-            )
-            .unwrap()
-        };
-        let segments = Tensor::from_host(
-            &device,
-            Element::i32(),
-            &[2, 2],
-            &[0i32, 6, 6, 6].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
-        )
-        .unwrap();
-        let mut window = from(
-            &[g.banks as u64, 3, g.channels() as u64],
-            &full.window,
-            Element::f32(),
-        );
-        let mut delta = from(
-            &[g.banks as u64, g.value_heads as u64, g.width as u64, g.width as u64],
-            &full.delta,
-            Element::f32(),
-        );
-        let mixed = qwen_recurrent_step::native_for_device_with(
-            &device,
-            qwen_recurrent_step::Elements { A: Element::f32() },
-            &NativeSpecialization::new()
-                .with_static("NK", g.key_heads as u64)
-                    .with_static("NV", g.value_heads as u64)
-                    .with_static("W", g.width as u64)
-                    .with_static("C", g.convolution as u64)
-                .with_param("ROWS", rows),
-        )
-        .unwrap()
-        .call(qwen_recurrent_step::Args {
-            projection: &from(&[6, g.projection_width() as u64], &full.projection, Element::f32()),
-            convolution: &from(&[g.channels() as u64, 4], &full.convolution, Element::f32()),
-            rate: &from(&[g.value_heads as u64], &full.rate, Element::f32()),
-            time_bias: &from(&[g.value_heads as u64], &full.time_bias, Element::f32()),
-            segments: &segments,
-            stop: &ints(&[3]),
-            previous_bank: &ints(&[1]),
-            following_bank: &ints(&[2]),
-            window: &mut window,
-            delta: &mut delta,
-            norm_epsilon: full.epsilon,
-            grouped: false,
-        })
-        .unwrap()
-        .value;
-        let outcome = (read(&mixed), read(&window), read(&delta));
+    for rows in [16u64, 32] {
+        let mut t = full.tensors(&device, Element::f32());
+        let mixed = full.metal_step(&device, Element::f32(), rows).call(t.step_args(&full)).unwrap().value;
+        let outcome = (read(&mixed), read(&t.window), read(&t.delta));
         match &reference {
             None => reference = Some(outcome),
             Some(reference) => assert!(
@@ -795,12 +933,7 @@ fn real_4b_geometry_step_and_chunk_agree_with_the_host_model() {
         width: 128,
         convolution: 4,
         banks: 5,
-    };
-    let slot = |rows, stop, previous, following| SlotCase {
-        rows,
-        stop,
-        previous,
-        following,
+        tape: 0,
     };
     for (label, rows, slots) in [
         ("decode, one slot", 1, vec![slot(1, 1, 1, 3)]),
@@ -834,6 +967,41 @@ fn real_4b_geometry_step_and_chunk_agree_with_the_host_model() {
                 }
             }
         }
+    }
+}
+
+/// MTP verify: a slot of at most 16 rows gets the step's bits from the chunk
+/// entry too, whatever its peers (here a 40-row slot on the chunked path), so
+/// a request's verify rows never depend on the class.
+#[test]
+fn chunk_short_slots_get_the_step_bits() {
+    let Some(device) = metal() else {
+        return;
+    };
+    let geometry = Geometry { key_heads: 16, value_heads: 32, width: 128, convolution: 4, banks: 11, tape: 0 };
+    let slots = vec![slot(4, 1, 1, 6), slot(16, 9, 2, 7), slot(40, 40, 3, 8), slot(1, 1, 4, 9), slot(7, 0, 5, 10)];
+    let case = Case::new(geometry, 70, slots, false, 31).with_bf16_activations();
+    let step = case.native(&device, Element::bf16(), None);
+    let host = case.host();
+    let row_elements = geometry.value_heads * geometry.width;
+    for rows in METAL_CHUNK_ROWS {
+        let chunk = case.native(&device, Element::bf16(), Some(rows));
+        let mut first = 0;
+        for s in &case.slots {
+            let range = first * row_elements..(first + s.rows) * row_elements;
+            first += s.rows;
+            if s.rows > 16 {
+                continue;
+            }
+            let bank = s.following * geometry.delta_bank()..(s.following + 1) * geometry.delta_bank();
+            assert!(
+                step.mixed[range.clone()].iter().zip(&chunk.mixed[range]).all(|(a, b)| a.to_bits() == b.to_bits())
+                    && step.delta[bank.clone()].iter().zip(&chunk.delta[bank]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "chunk ROWS {rows}: a {}-row slot differs from the step",
+                s.rows
+            );
+        }
+        check(&format!("4B verify mix: chunk ROWS {rows}"), &case, &chunk, &host, (1e-3, 3e-3));
     }
 }
 
@@ -878,12 +1046,7 @@ fn metal_recurrent_timings() {
         samples: 15,
         min_sample_seconds: 0.01,
     };
-    let slot = |rows, previous, following| SlotCase {
-        rows,
-        stop: rows,
-        previous,
-        following,
-    };
+    let slot = |rows, previous, following| slot(rows, rows, previous, following);
     for (label, rows, slots) in [
         ("step 1 row", 1usize, vec![slot(1, 1, 2)]),
         ("step 8 slots x 1 row", 8, (0..8).map(|s| slot(1, 1 + s, 9 + s)).collect::<Vec<_>>()),
@@ -904,13 +1067,14 @@ fn metal_recurrent_timings() {
             width: 128,
             convolution: 4,
             banks,
+            tape: 0,
         };
         let case = Case::new(geometry, rows, slots, false, 5).with_bf16_activations();
         let mut rotation = (0..16)
             .map(|_| case.tensors(&device, Element::bf16()))
             .collect::<Vec<_>>();
         if label.starts_with("step") {
-            for step_rows in [8u64, 16, 32] {
+            for step_rows in [32u64, 16, 64] {
                 let kernel = case.metal_step(&device, Element::bf16(), step_rows);
                 let args = rotation.iter_mut().map(|t| t.step_args(&case)).collect();
                 let measured = kernel.measure(args, &options).unwrap();

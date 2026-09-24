@@ -120,7 +120,7 @@ def base(options) -> None:
     output.mkdir(parents=True, exist_ok=True)
     counts = chunk_counts(options.chunks)
     selected = selected_categories(options.categories)
-    record = {"kind": "reference", "n_ctx": N_CTX, "model": str(options.model),
+    record = {"kind": "reference", "n_ctx": options.n_ctx, "model": str(options.model),
               "model_sha256": sha256_file(options.model),
               "source_model": str(options.source_model or options.model),
               "corpus": manifest, **host_record(options.binary_dir), "categories": {}}
@@ -139,12 +139,12 @@ def base(options) -> None:
     for name in selected:
         target = output / f"{name}.bin"
         command = [binary(options.binary_dir, "llama-perplexity"), "-m", str(options.model),
-                   "-f", str(options.corpus / f"{name}.txt"), "-c", str(N_CTX), "--chunks", str(counts[name]),
+                   "-f", str(options.corpus / f"{name}.txt"), "-c", str(options.n_ctx), "--chunks", str(counts[name]),
                    "--kl-divergence-base", str(target), "-ngl", "0", "-dev", "none", "-fa", "off",
                    "-ctk", options.cache_type, "-ctv", options.cache_type, *options.extra]
         elapsed = run_logged(command, output / f"{name}.log")
         written = kl_base.BaseFile(target)
-        if (written.n_ctx, written.n_chunk) != (N_CTX, counts[name]):
+        if (written.n_ctx, written.n_chunk) != (options.n_ctx, counts[name]):
             raise SystemExit(f"{target}: n_ctx={written.n_ctx}, n_chunk={written.n_chunk}; corpus too short?")
         record["categories"][name] = {"base": target.name, "command": command, "seconds": elapsed,
                                       **written.describe(), "sha256": sha256_file(target)}
@@ -200,7 +200,7 @@ def spread(options) -> None:
                                 if name not in selected}
     for name in selected:
         base_path = options.reference / f"{name}.bin"
-        command = [binary(options.binary_dir, "llama-perplexity"), "-m", str(options.model), "-c", str(N_CTX),
+        command = [binary(options.binary_dir, "llama-perplexity"), "-m", str(options.model), "-c", str(reference["n_ctx"]),
                    "--kl-divergence", "--kl-divergence-base", str(base_path), "-ngl", str(options.ngl),
                    *options.extra]
         log = output / f"{name}.log"
@@ -211,7 +211,7 @@ def spread(options) -> None:
         if options.save_base:
             own = output / f"{name}.bin"
             own_command = [binary(options.binary_dir, "llama-perplexity"), "-m", str(options.model),
-                           "-f", str(options.corpus / f"{name}.txt"), "-c", str(N_CTX),
+                           "-f", str(options.corpus / f"{name}.txt"), "-c", str(reference["n_ctx"]),
                            "--chunks", str(kl_base.BaseFile(base_path).n_chunk),
                            "--kl-divergence-base", str(own), "-ngl", str(options.ngl), *options.extra]
             run_logged(own_command, output / f"{name}.base.log")
@@ -251,6 +251,9 @@ def main() -> None:
             sub.add_argument("--chunks", required=True, help="chunks per category: N or prose,code,tool_json")
             sub.add_argument("--source-model", type=Path, help="quantized GGUF an F32 --model was derived from")
             sub.add_argument("--cache-type", default="f32", help="KV cache type for K and V (default f32)")
+            sub.add_argument("--n-ctx", type=int, default=N_CTX,
+                             help=f"chunk length; the second half is scored (default {N_CTX}, the D4 set; "
+                                  "longer chunks check long-context numerics such as quantized KV)")
         else:
             sub.add_argument("--reference", type=Path, required=True)
             sub.add_argument("--ngl", type=int, default=99)

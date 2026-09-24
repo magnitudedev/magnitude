@@ -55,6 +55,18 @@ pub enum DeviceSelector {
     Metal { registry_id: u64 },
     /// `cuDeviceGetUuid_v2`: the exposed device or MIG partition.
     Cuda { uuid: [u8; 16] },
+    /// `VkPhysicalDeviceIDProperties::deviceUUID`.
+    Vulkan { uuid: [u8; 16] },
+}
+
+fn write_uuid(f: &mut fmt::Formatter<'_>, uuid: &[u8; 16]) -> fmt::Result {
+    for (index, byte) in uuid.iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            f.write_str("-")?;
+        }
+        write!(f, "{byte:02x}")?;
+    }
+    Ok(())
 }
 
 impl fmt::Display for DeviceSelector {
@@ -64,13 +76,11 @@ impl fmt::Display for DeviceSelector {
             Self::Metal { registry_id } => write!(f, "metal:{registry_id:016x}"),
             Self::Cuda { uuid } => {
                 f.write_str("cuda:")?;
-                for (index, byte) in uuid.iter().enumerate() {
-                    if matches!(index, 4 | 6 | 8 | 10) {
-                        f.write_str("-")?;
-                    }
-                    write!(f, "{byte:02x}")?;
-                }
-                Ok(())
+                write_uuid(f, uuid)
+            }
+            Self::Vulkan { uuid } => {
+                f.write_str("vulkan:")?;
+                write_uuid(f, uuid)
             }
         }
     }
@@ -100,18 +110,20 @@ impl FromStr for DeviceSelector {
                 .map(|registry_id| Self::Metal { registry_id })
                 .map_err(|_| invalid());
         }
-        let hex = text
-            .strip_prefix("cuda:")
-            .ok_or_else(invalid)?
-            .replace('-', "");
-        if hex.len() != 32 {
+        let (vulkan, text) = match (text.strip_prefix("cuda:"), text.strip_prefix("vulkan:")) {
+            (Some(uuid), _) => (false, uuid),
+            (_, Some(uuid)) => (true, uuid),
+            (None, None) => return Err(invalid()),
+        };
+        let hex = text.replace('-', "");
+        if hex.len() != 32 || !hex.is_ascii() {
             return Err(invalid());
         }
         let mut uuid = [0u8; 16];
         for (index, byte) in uuid.iter_mut().enumerate() {
             *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).map_err(|_| invalid())?;
         }
-        Ok(Self::Cuda { uuid })
+        Ok(if vulkan { Self::Vulkan { uuid } } else { Self::Cuda { uuid } })
     }
 }
 
@@ -172,6 +184,8 @@ pub enum CapacityBasis {
     OsUsableRam,
     /// CUDA `cuDeviceTotalMem`: memory of the exposed device or partition.
     CudaDeviceTotal,
+    /// The size of the Vulkan device's largest device-local heap.
+    VulkanDeviceLocalHeap,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,6 +203,8 @@ pub struct MemoryPoolInfo {
 pub(crate) enum LedgerKey {
     Host,
     Cuda([u8; 16]),
+    #[cfg(not(target_os = "macos"))]
+    Vulkan([u8; 16]),
     /// A device whose backing is not normalized accounts privately.
     Unestablished(DeviceSelector),
 }
@@ -305,6 +321,13 @@ pub enum DeviceMeasurements {
         free_bytes: u64,
         /// `cuMemGetInfo`: total memory of the exposed device.
         total_bytes: u64,
+    },
+    Vulkan {
+        /// `VK_EXT_memory_budget` of the device-local heap: what this
+        /// process may use.
+        heap_budget_bytes: u64,
+        /// What this process uses of it.
+        heap_usage_bytes: u64,
     },
 }
 

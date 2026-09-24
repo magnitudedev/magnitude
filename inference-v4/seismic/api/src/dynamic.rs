@@ -526,7 +526,8 @@ impl Kernel {
         }
         let result = match &self.inner {
             KernelKind::Ordinary(kernel) => {
-                let mut draft = runtime::workflow(self.device.inner());
+                let mut draft = runtime::workflow(self.device.inner())
+                    .map_err(|e| Error::from(CallError::Workflow(e)))?;
                 let mut workflow_args = runtime::EncodedWorkflowArgs::new();
                 for v in args {
                     workflow_encode(v, &mut workflow_args)?;

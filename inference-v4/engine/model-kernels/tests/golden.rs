@@ -903,12 +903,18 @@ fn recurrent_case(ctx: &Ctx, a: Element, label: &str, rows: usize, slots: &[Slot
             projection[row * width + gates + VALUE_HEADS + head] = rng.unit() * 4.0;
         }
     }
-    let window_bank = (CONVOLUTION - 1) * channels;
+    // Two tape rows per bank: slots that stop early record them. Every slot
+    // reads its bank's own state (previous_tape = 0).
+    const TAPE: usize = 2;
+    let window_bank = (CONVOLUTION - 1 + TAPE) * channels;
     let delta_bank = VALUE_HEADS * STATE * STATE;
+    let tape_row = (VALUE_HEADS + KEY_HEADS) * STATE + VALUE_HEADS;
     let mut window = vec![7.25f32; banks * window_bank];
     let mut delta = vec![7.25f32; banks * delta_bank];
+    let mut tape = vec![7.25f32; banks * TAPE * tape_row];
     window[..window_bank].fill(0.0);
     delta[..delta_bank].fill(0.0);
+    tape[..TAPE * tape_row].fill(0.0);
     for slot in slots {
         if slot.previous > 0 {
             for value in &mut window[slot.previous * window_bank..][..window_bank] {
@@ -939,9 +945,11 @@ fn recurrent_case(ctx: &Ctx, a: Element, label: &str, rows: usize, slots: &[Slot
             ctx.ints(&[b + 1, 2], &segments),
             ctx.ints(&[b], &slots.iter().map(|s| s.stop as i32).collect::<Vec<_>>()),
             ctx.ints(&[b], &slots.iter().map(|s| s.previous as i32).collect::<Vec<_>>()),
+            ctx.ints(&[b], &vec![0; slots.len()]),
             ctx.ints(&[b], &slots.iter().map(|s| s.following as i32).collect::<Vec<_>>()),
-            ctx.dense_mut(a, &[banks as u64, (CONVOLUTION - 1) as u64, channels as u64], &window),
+            ctx.dense_mut(a, &[banks as u64, (CONVOLUTION - 1 + TAPE) as u64, channels as u64], &window),
             ctx.dense_mut(f32e(), &[banks as u64, VALUE_HEADS as u64, STATE as u64, STATE as u64], &delta),
+            ctx.dense_mut(f32e(), &[banks as u64, TAPE as u64, tape_row as u64], &tape),
             f32s(1e-6 * STATE as f32),
             Arg::Scalar(Scalar::Bool(grouped)),
         ],
@@ -1159,7 +1167,11 @@ fn embedding_rows(ctx: &Ctx) -> Vec<Variant> {
                 label: format!("m{m}"),
                 args: vec![
                     Arg::Shared(table.clone()),
-                    ctx.ints(&[m as u64], &(0..m).map(|_| rng.below(VOCABULARY_SLICE) as i32).collect::<Vec<_>>()),
+                    // (token, status) rows, the `sample_rows` result layout.
+                    ctx.ints(
+                        &[m as u64, 2],
+                        &(0..m).flat_map(|_| [rng.below(VOCABULARY_SLICE) as i32, 0]).collect::<Vec<_>>(),
+                    ),
                 ],
             })
             .collect();
@@ -1663,9 +1675,9 @@ fn conditioning_overlay(ctx: &Ctx) -> Vec<Variant> {
 fn vision_stem(ctx: &Ctx) -> Vec<Variant> {
     // Qwen3.5 vision stem at a reduced width: C 3, P 16.
     let (c, p, h, l) = (3usize, 16usize, 64usize, 49usize);
-    [("bf16", bf16(), f16(), f32e()), ("f16", f16(), bf16(), f16()), ("f32", f32e(), f32e(), bf16())]
+    [("f16", f16(), f32e()), ("bf16", bf16(), bf16())]
         .into_iter()
-        .map(|(label, a, w, b)| {
+        .map(|(label, w, b)| {
             let mut rng = Rng::new(24);
             let cases = [1usize, 5]
                 .into_iter()
@@ -1673,10 +1685,10 @@ fn vision_stem(ctx: &Ctx) -> Vec<Variant> {
                     label: format!("m{m}"),
                     args: vec![
                         ctx.dense(f32e(), &[m as u64, c as u64, 2, p as u64, p as u64], &uniform(&mut rng, m * c * 2 * p * p, -1.0, 1.0)),
-                        ctx.dense(w, &[p as u64, p as u64, c as u64, h as u64], &uniform(&mut rng, p * p * c * h, -0.05, 0.05)),
-                        ctx.dense(w, &[p as u64, p as u64, c as u64, h as u64], &uniform(&mut rng, p * p * c * h, -0.05, 0.05)),
+                        ctx.dense(w, &[h as u64, c as u64, p as u64, p as u64], &uniform(&mut rng, p * p * c * h, -0.05, 0.05)),
+                        ctx.dense(w, &[h as u64, c as u64, p as u64, p as u64], &uniform(&mut rng, p * p * c * h, -0.05, 0.05)),
                         ctx.dense(b, &[h as u64], &uniform(&mut rng, h, -0.1, 0.1)),
-                        ctx.dense(w, &[h as u64, l as u64], &uniform(&mut rng, h * l, -0.5, 0.5)),
+                        ctx.dense(b, &[l as u64, h as u64], &uniform(&mut rng, h * l, -0.5, 0.5)),
                         ctx.ints(&[m as u64, 4], &(0..m * 4).map(|i| (i * 5 % l) as i32).collect::<Vec<_>>()),
                         ctx.dense(f32e(), &[m as u64, 4], &uniform(&mut rng, m * 4, 0.0, 0.5)),
                     ],
@@ -1684,8 +1696,8 @@ fn vision_stem(ctx: &Ctx) -> Vec<Variant> {
                 .collect();
             Variant {
                 label: label.into(),
-                elements: vec![("W0", w), ("W1", w), ("B", b), ("PE", w), ("A", a)],
-                statics: vec![],
+                elements: vec![("W0", w), ("W1", w), ("B", b), ("PE", b)],
+                statics: vec![("C", c as u64), ("P", p as u64), ("H", h as u64)],
                 every_configuration: true,
                 cases,
             }
@@ -1694,14 +1706,14 @@ fn vision_stem(ctx: &Ctx) -> Vec<Variant> {
 }
 
 fn vision_block(ctx: &Ctx) -> Vec<Variant> {
-    // The block kernel recomputes every intermediate per output: tiny width.
-    let (h, p, f) = (2usize, 2usize, 12usize);
+    // Two heads of 64 (the kernels specialize on H, P, F).
+    let (h, p, f) = (2usize, 16usize, 128usize);
     let width = h * 4 * p;
-    [("bf16", bf16(), f16(), f32e()), ("f16", f16(), bf16(), f16()), ("f32", f32e(), f32e(), f32e())]
+    [("f16", f16(), f16(), f32e()), ("bf16", bf16(), bf16(), bf16())]
         .into_iter()
         .map(|(label, a, w, n)| {
             let mut rng = Rng::new(25);
-            let cases = [2usize, 3]
+            let cases = [2usize, 70]
                 .into_iter()
                 .map(|m| {
                     let mut vector = |len: usize, low: f32, high: f32, element: Element| ctx.dense(element, &[len as u64], &uniform(&mut rng, len, low, high));
@@ -1716,19 +1728,19 @@ fn vision_block(ctx: &Ctx) -> Vec<Variant> {
                     Case {
                         label: format!("m{m}"),
                         args: vec![
-                            ctx.dense(a, &[m as u64, h as u64, 4, p as u64], &uniform(&mut rng, m * width, -1.0, 1.0)),
-                            ctx.ints(&[m as u64, 2], &(0..m * 2).map(|i| (i % 3) as i32).collect::<Vec<_>>()),
+                            ctx.dense(f32e(), &[m as u64, h as u64, 4, p as u64], &uniform(&mut rng, m * width, -1.0, 1.0)),
+                            ctx.ints(&[m as u64, 2], &(0..m * 2).map(|i| (i % 9) as i32).collect::<Vec<_>>()),
                             n1w,
                             n1b,
-                            ctx.dense(w, &[width as u64, 3 * width as u64], &uniform(&mut rng, width * 3 * width, -0.3, 0.3)),
+                            ctx.dense(w, &[3 * width as u64, width as u64], &uniform(&mut rng, width * 3 * width, -0.1, 0.1)),
                             qb,
-                            ctx.dense(w, &[width as u64, width as u64], &uniform(&mut rng, width * width, -0.3, 0.3)),
+                            ctx.dense(w, &[width as u64, width as u64], &uniform(&mut rng, width * width, -0.1, 0.1)),
                             pb,
                             n2w,
                             n2b,
-                            ctx.dense(w, &[width as u64, f as u64], &uniform(&mut rng, width * f, -0.3, 0.3)),
+                            ctx.dense(w, &[f as u64, width as u64], &uniform(&mut rng, width * f, -0.1, 0.1)),
                             ub,
-                            ctx.dense(w, &[f as u64, width as u64], &uniform(&mut rng, f * width, -0.3, 0.3)),
+                            ctx.dense(w, &[width as u64, f as u64], &uniform(&mut rng, f * width, -0.1, 0.1)),
                             db,
                             f32s(1e-6),
                         ],
@@ -1752,7 +1764,7 @@ fn vision_block(ctx: &Ctx) -> Vec<Variant> {
                     ("DB", n),
                     ("A", a),
                 ],
-                statics: vec![],
+                statics: vec![("H", h as u64), ("P", p as u64), ("F", f as u64)],
                 every_configuration: true,
                 cases,
             }
@@ -1762,7 +1774,7 @@ fn vision_block(ctx: &Ctx) -> Vec<Variant> {
 
 fn vision_merger(ctx: &Ctx) -> Vec<Variant> {
     let (g, h, d) = (4usize, 32usize, 48usize);
-    [("bf16", bf16(), f16(), f32e()), ("f16", f16(), bf16(), f16()), ("f32", f32e(), f32e(), f32e())]
+    [("f16", f16(), f16(), f32e()), ("bf16", bf16(), bf16(), bf16())]
         .into_iter()
         .map(|(label, a, w, n)| {
             let mut rng = Rng::new(26);
@@ -1771,12 +1783,12 @@ fn vision_merger(ctx: &Ctx) -> Vec<Variant> {
                 .map(|m| Case {
                     label: format!("m{m}"),
                     args: vec![
-                        ctx.dense(a, &[(m * g) as u64, h as u64], &uniform(&mut rng, m * g * h, -1.0, 1.0)),
+                        ctx.dense(f32e(), &[(m * g) as u64, h as u64], &uniform(&mut rng, m * g * h, -1.0, 1.0)),
                         ctx.dense(n, &[h as u64], &uniform(&mut rng, h, 0.5, 1.5)),
                         ctx.dense(n, &[h as u64], &uniform(&mut rng, h, -0.1, 0.1)),
                         ctx.dense(w, &[(g * h) as u64, (g * h) as u64], &uniform(&mut rng, g * h * g * h, -0.2, 0.2)),
                         ctx.dense(n, &[(g * h) as u64], &uniform(&mut rng, g * h, -0.1, 0.1)),
-                        ctx.dense(w, &[(g * h) as u64, d as u64], &uniform(&mut rng, g * h * d, -0.2, 0.2)),
+                        ctx.dense(w, &[d as u64, (g * h) as u64], &uniform(&mut rng, g * h * d, -0.2, 0.2)),
                         ctx.dense(n, &[d as u64], &uniform(&mut rng, d, -0.1, 0.1)),
                         f32s(1e-6),
                     ],
@@ -1785,27 +1797,10 @@ fn vision_merger(ctx: &Ctx) -> Vec<Variant> {
             Variant {
                 label: label.into(),
                 elements: vec![("NW", n), ("NB", n), ("UW", w), ("UB", n), ("DW", w), ("DB", n), ("A", a)],
-                statics: vec![],
+                statics: vec![("G", g as u64), ("H", h as u64), ("D", d as u64)],
                 every_configuration: true,
                 cases,
             }
-        })
-        .collect()
-}
-
-fn vision_feature_output(ctx: &Ctx) -> Vec<Variant> {
-    [bf16(), f16(), f32e()]
-        .into_iter()
-        .map(|a| {
-            let mut rng = Rng::new(27);
-            let cases = [(1usize, 2560usize), (9, 100)]
-                .into_iter()
-                .map(|(m, d)| Case {
-                    label: format!("m{m}d{d}"),
-                    args: vec![ctx.dense(a, &[m as u64, d as u64], &activations(&mut rng, m, d, 2.0))],
-                })
-                .collect();
-            Variant { label: a.name().into(), elements: vec![("A", a)], statics: vec![], every_configuration: true, cases }
         })
         .collect()
 }
@@ -1826,7 +1821,7 @@ const ENTRIES: &[EntrySpec] = &[
     EntrySpec { id: "dense_expand", names: &["dense_expand", "qwen_dense_expand"], family: "projection", library: true, build: dense_expand },
     EntrySpec { id: "dense_output", names: &["dense_output", "qwen_dense_output"], family: "projection", library: true, build: dense_output },
     EntrySpec { id: "attention_project", names: &["qwen_attention_project"], family: "attention", library: true, build: attention_project },
-    EntrySpec { id: "attention_output", names: &["attention_output", "qwen_attention_output"], family: "attention", library: true, build: attention_output },
+    EntrySpec { id: "attention_output", names: &["attention_output"], family: "attention", library: true, build: attention_output },
     EntrySpec { id: "attention_decode", names: &["qwen_attention_decode"], family: "attention", library: false, build: attention_decode },
     EntrySpec { id: "attention_prefill", names: &["qwen_attention_prefill"], family: "attention", library: false, build: attention_prefill },
     EntrySpec { id: "recurrent_project", names: &["qwen_recurrent_project"], family: "recurrent", library: true, build: recurrent_project },
@@ -1854,7 +1849,6 @@ const ENTRIES: &[EntrySpec] = &[
     EntrySpec { id: "vision_stem", names: &["qwen_vision_stem"], family: "vision", library: false, build: vision_stem },
     EntrySpec { id: "vision_block", names: &["qwen_vision_block"], family: "vision", library: false, build: vision_block },
     EntrySpec { id: "vision_merger", names: &["qwen_vision_merger"], family: "vision", library: false, build: vision_merger },
-    EntrySpec { id: "vision_feature_output", names: &["qwen_vision_feature_output"], family: "vision", library: false, build: vision_feature_output },
 ];
 
 // ---------------------------------------------------------------------------
@@ -2097,10 +2091,19 @@ fn golden() {
         other => panic!("GOLDEN_MODE must be record or compare, got {other:?}"),
     };
     let catalog = DeviceCatalog::discover().unwrap();
-    let (backend, device) = [BackendName::Metal, BackendName::Cuda]
+    // `GOLDEN_BACKEND=vulkan` selects Vulkan (never chosen by default: a CUDA
+    // host also has a Vulkan device).
+    let backends = match std::env::var("GOLDEN_BACKEND").ok().as_deref() {
+        Some("vulkan") => vec![BackendName::Vulkan],
+        Some("cuda") => vec![BackendName::Cuda],
+        Some("metal") => vec![BackendName::Metal],
+        Some(other) => panic!("GOLDEN_BACKEND={other}: expected metal, cuda or vulkan"),
+        None => vec![BackendName::Metal, BackendName::Cuda],
+    };
+    let (backend, device) = backends
         .into_iter()
         .find_map(|backend| catalog.open_backend(backend).ok().map(|device| (backend, device)))
-        .expect("a Metal or CUDA device");
+        .expect("a device of the selected backend");
     let dir = PathBuf::from(std::env::var("GOLDEN_DIR").expect("GOLDEN_DIR")).join(format!("{backend:?}").to_lowercase());
     std::fs::create_dir_all(&dir).unwrap();
     let families = std::env::var("GOLDEN_FAMILIES").unwrap_or_else(|_| "all".into());

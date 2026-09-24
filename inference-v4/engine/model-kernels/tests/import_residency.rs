@@ -101,13 +101,28 @@ fn cuda_dense_import_matches_host_for_all_nine_pairs() {
 #[cfg(target_os = "macos")]
 #[test]
 fn metal_repack_matches_the_registered_conversion_for_every_format_and_layout() {
-    repack_matches_the_registered_conversion(&device(seismic::BackendName::Metal).unwrap());
+    repack_matches_the_registered_conversion(&device(seismic::BackendName::Metal).unwrap(), &seismic::Layout::ALL);
 }
 
 #[test]
 fn cuda_repack_matches_the_registered_conversion_for_every_format_and_layout() {
     if let Some(device) = device(seismic::BackendName::Cuda) {
-        repack_matches_the_registered_conversion(&device);
+        repack_matches_the_registered_conversion(&device, &seismic::Layout::ALL);
+    }
+}
+
+#[test]
+fn vulkan_dense_import_matches_host_for_all_nine_pairs() {
+    if let Some(device) = device(seismic::BackendName::Vulkan) {
+        dense_import_matches_host_for_all_nine_pairs(&device);
+    }
+}
+
+/// Vulkan repacks into its resident layout, rows16, only.
+#[test]
+fn vulkan_repack_matches_the_registered_conversion_for_every_format() {
+    if let Some(device) = device(seismic::BackendName::Vulkan) {
+        repack_matches_the_registered_conversion(&device, &[seismic::Layout::Rows16]);
     }
 }
 
@@ -152,7 +167,7 @@ fn dense_import_matches_host_for_all_nine_pairs(device: &seismic::Device) {
 /// source's values. Shapes cover a row count off the 16-row tile, several
 /// matrices, a packing axis with an odd number of q8 packets (mma16 pads
 /// rows to whole 64-column k-blocks) and a partial trailing packet.
-fn repack_matches_the_registered_conversion(device: &seismic::Device) {
+fn repack_matches_the_registered_conversion(device: &seismic::Device, layouts: &[seismic::Layout]) {
     let device = device.clone();
     for (source_name, resident) in FORMATS {
         let source_element = seismic::Element::named(source_name).unwrap();
@@ -169,7 +184,7 @@ fn repack_matches_the_registered_conversion(device: &seismic::Device) {
             let expected_values = packet
                 .decode_host(&shape, &packet.repack_host(source_element, &shape, &bytes).unwrap())
                 .unwrap();
-            for layout in seismic::Layout::ALL {
+            for &layout in layouts {
                 let destination = seismic::Element::stored(resident, layout).unwrap();
                 let native = repack_weight::native_for_device_with(
                     &device,

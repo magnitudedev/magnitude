@@ -215,21 +215,21 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
     };
     let patch_embeddings = ["v.patch_embd.weight", "v.patch_embd.weight.1"]
         .into_iter()
-        .map(|name| tensor(name, &[patch, patch, 3, hidden]))
+        .map(|name| tensor(name, &[hidden, 3, patch, patch]))
         .collect::<Result<Vec<_>, _>>()?;
     let patch_bias = tensor("v.patch_embd.bias", &[hidden])?;
     let position = directory
         .tensor("v.position_embd.weight")
         .ok_or_else(|| invalid("missing projector position embedding"))?;
-    if position.shape.len() != 2 || position.shape[0] != hidden {
+    if position.shape.len() != 2 || position.shape[1] != hidden {
         return Err(invalid("invalid projector position embedding shape"));
     }
-    let table_rows = position.shape[1];
+    let table_rows = position.shape[0];
     let table_side = (table_rows as f64).sqrt() as u64;
     if table_side.checked_mul(table_side) != Some(table_rows) {
         return Err(invalid("projector position table is not square"));
     }
-    let position_embedding = tensor("v.position_embd.weight", &[hidden, table_rows])?;
+    let position_embedding = tensor("v.position_embd.weight", &[table_rows, hidden])?;
     let qkv_rows = product(&[3, hidden])?;
     let norm = |weight: WeightDescriptor, bias: WeightDescriptor| LayerNormWeights { weight, bias };
     let mut blocks = Vec::with_capacity(depth as usize);
@@ -243,7 +243,7 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
             ),
             attention: VisionAttentionWeights {
                 qkv: FusedQkvWeights {
-                    weight: weight("attn_qkv.weight", &[hidden, qkv_rows])?,
+                    weight: weight("attn_qkv.weight", &[qkv_rows, hidden])?,
                     bias: weight("attn_qkv.bias", &[qkv_rows])?,
                     query: RowRange {
                         start: 0,
@@ -266,9 +266,9 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
                 weight("ln2.bias", &[hidden])?,
             ),
             feedforward: VisionFeedForwardWeights {
-                up: weight("ffn_up.weight", &[hidden, intermediate])?,
+                up: weight("ffn_up.weight", &[intermediate, hidden])?,
                 up_bias: weight("ffn_up.bias", &[intermediate])?,
-                down: weight("ffn_down.weight", &[intermediate, hidden])?,
+                down: weight("ffn_down.weight", &[hidden, intermediate])?,
                 down_bias: weight("ffn_down.bias", &[hidden])?,
             },
         });
@@ -281,7 +281,7 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
     let merger = VisionMergerWeights {
         hidden: tensor("mm.0.weight", &[merger_hidden, merger_hidden])?,
         hidden_bias: tensor("mm.0.bias", &[merger_hidden])?,
-        output: tensor("mm.2.weight", &[merger_hidden, output_hidden])?,
+        output: tensor("mm.2.weight", &[output_hidden, merger_hidden])?,
         output_bias: tensor("mm.2.bias", &[output_hidden])?,
     };
     for value in &directory.tensors {
@@ -294,7 +294,10 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
     }
     let description = VisionDescription {
         geometry: VisionGeometry {
-            activation_dtype: ActivationDType::BF16,
+            // f16 intermediates around an F32 residual stream: 1.9% relative
+            // RMS from an F64 forward of the 4B projector, where bf16 puts
+            // the features 12.7% away (see the vision kernel family).
+            activation_dtype: ActivationDType::F16,
             depth,
             hidden,
             intermediate,
@@ -677,14 +680,12 @@ pub fn inspect_components(
         )));
     }
     if let Some(projector) = projector {
+        // A derived target (a quantization, a fine-tune) names its base model
+        // exactly as the projector does; an original model is its own base.
         let target_base = directory
-            .value("general.name")
+            .value("general.base_model.0.name")
             .and_then(Value::string)
-            .or_else(|| {
-                directory
-                    .value("general.base_model.0.name")
-                    .and_then(Value::string)
-            });
+            .or_else(|| directory.value("general.name").and_then(Value::string));
         let projector_base = projector
             .value("general.base_model.0.name")
             .and_then(Value::string);

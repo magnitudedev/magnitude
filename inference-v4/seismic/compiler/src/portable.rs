@@ -460,11 +460,9 @@ fn instantiate_stream_tensor<B: seismic_target::TargetFamily>(
             TensorDefinitionValue::View { base, transform }
         }
     };
-    let axes = match &value {
-        TensorDefinitionValue::Elementwise { result, .. }
-        | TensorDefinitionValue::Reduce { result, .. } => result.axes(kernel),
-        _ => plan.axes.iter().map(|axis| kernel.nat_arg(*axis)).collect(),
-    };
+    // A stream plan is a schedule-level value: its actual axes are host
+    // expressions at the launch that instantiates it.
+    let axes = plan.axes.iter().map(|axis| kernel.nat_arg(*axis)).collect();
     SegmentTensor { axes, value }
 }
 
@@ -1512,6 +1510,8 @@ impl<'f, 'b, B: seismic_target::TargetFamily> Lowerer<'f, 'b, B> {
         for input in inputs {
             let skip = rank-input.len();
             for (target,source) in output[skip..].iter_mut().zip(input) {
+                // An axis broadcast with itself is itself.
+                if *target == *source { continue; }
                 let singleton = self.builder.arena().nat_cmp(seismic_lang::expr::CmpOp::Eq,*target,one);
                 *target = self.builder.arena().nat_select(singleton,*source,*target);
             }
@@ -3132,10 +3132,19 @@ fn host_integer(arena: &mut ExprArena, bound: &Bound) -> IntExpr {
     }
 }
 
-fn condition_expr(arena: &mut ExprArena, bound: &Bound) -> seismic_lang::expr::BoolExpr {
+/// A Boolean value as a host predicate: its exact defining comparison when a
+/// host evaluation of exact quantities defined it, otherwise its slot.
+fn condition_expr(
+    arena: &mut ExprArena,
+    host_conditions: &std::collections::HashMap<seismic_lang::expr::SymbolId, seismic_lang::expr::BoolExpr>,
+    bound: &Bound,
+) -> seismic_lang::expr::BoolExpr {
     let PreparedArg::Scalar(symbol, DType::Bool) = prepare_scalar(arena, bound.scalar()) else {
         panic!("checked condition is not Boolean")
     };
+    if let Some(condition) = host_conditions.get(&symbol) {
+        return *condition;
+    }
     let value = arena.scalar_symbol::<seismic_lang::expr::BoolScalar>(symbol);
     let yes = arena.scalar_const::<seismic_lang::expr::BoolScalar>(true);
     arena.scalar_cmp(seismic_lang::expr::CmpOp::Eq, value, yes)

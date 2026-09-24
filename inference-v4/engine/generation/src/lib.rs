@@ -10,7 +10,7 @@ mod shaping;
 pub use acceptance::accept_prefix;
 pub use magnitude_artifacts::{BoundaryRule, InputLayout, InputSpan};
 pub use magnitude_model_executor::{
-    Demand, FeatureRef, FeatureRetainer, Operation, RequestId, Sampling, SelectSpec, Shaping,
+    Demand, FeatureReader, FeatureRef, Operation, RequestId, Sampling, SelectSpec, Shaping,
     TokenId, WorkKind,
 };
 pub use method::{
@@ -180,18 +180,13 @@ pub enum RoundStart {
     Method(Vec<Operation>),
 }
 
-struct ResolvedRound {
-    acceptance: RoundAcceptance,
-    constraint: Option<Box<dyn Constraint>>,
-}
-
-/// The sole numerical decision generation sends back to the executor. A
-/// verified prefix may need physical repair before the prepared transition is
-/// committed, but its accepted length cannot change during that repair.
+/// The sole numerical decision generation sends back to the executor: the
+/// target rows (or, for a head transaction, the head entry rows) to commit.
+/// A verified prefix may need physical repair before the prepared transition
+/// is committed, but its accepted length cannot change during that repair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReconcileDecision {
     pub accepted_rows: usize,
-    pub head_prefix: Option<usize>,
 }
 
 /// Every fallible logical change is performed against private state before
@@ -217,15 +212,13 @@ pub struct PreparedGenerationTransition {
     finish: Option<FinishReason>,
 }
 
+/// A method operation's outcome consumed against private method state.
 pub struct PreparedMethodTransition {
     request: RequestId,
-    expected_preview_len: Option<usize>,
     expected_resident_position: usize,
     expected_generated_len: usize,
     expected_finish: Option<FinishReason>,
     method: Box<dyn MethodState>,
-    preview: Option<MethodPreview>,
-    effects: MethodEffects,
     decision: ReconcileDecision,
 }
 
@@ -247,18 +240,6 @@ impl PreparedGenerationTransition {
     }
 }
 
-enum SuspendedRound {
-    Awaiting(RoundState),
-    Resolved(ResolvedRound),
-}
-
-struct MethodPreview {
-    request: RequestId,
-    limit: usize,
-    tokens: Vec<TokenId>,
-    constraint: Option<Box<dyn Constraint>>,
-}
-
 pub struct Generation {
     prompt: Vec<TokenId>,
     layout: InputLayout,
@@ -276,8 +257,7 @@ pub struct Generation {
     method: Box<dyn MethodState>,
     cached_tokens: usize,
     draft_stats: DraftStats,
-    round: Option<SuspendedRound>,
-    method_preview: Option<MethodPreview>,
+    round: Option<RoundState>,
 }
 
 impl Generation {
@@ -313,7 +293,7 @@ impl Generation {
             return Err("generation method factory does not match request policy".into());
         }
         let finish = (options.max_tokens == 0).then_some(FinishReason::Length);
-        let method = method_factory.create(None);
+        let method = method_factory.create(None)?;
         Ok(Self {
             prompt,
             layout,
@@ -332,7 +312,6 @@ impl Generation {
             cached_tokens: 0,
             draft_stats: DraftStats::default(),
             round: None,
-            method_preview: None,
         })
     }
     pub fn prompt(&self) -> &[TokenId] {
@@ -380,19 +359,12 @@ impl Generation {
     pub fn method_reclaimable(&self) -> u64 {
         self.method.reclaimable()
     }
-    /// Export owned method state for prefix retention. Transient features are
-    /// copied through the executor-domain retainer before the checkpoint leaves
-    /// the live request.
-    pub fn method_checkpoint(
-        &self,
-        retainer: &mut dyn FeatureRetainer,
-    ) -> Result<MethodCheckpoint, String> {
-        if self.round.is_some() || self.method_preview.is_some() || !self.resident {
+    /// Export owned method state for prefix retention.
+    pub fn method_checkpoint(&self) -> Result<MethodCheckpoint, String> {
+        if self.round.is_some() || !self.resident {
             return Err("method checkpoint requires reconciled resident state".into());
         }
-        self.method
-            .checkpoint(retainer)
-            .map_err(|error| error.to_string())
+        self.method.checkpoint().map_err(|error| error.to_string())
     }
 
     /// Restore a fresh generation at an exact retained prompt boundary. Output,
@@ -409,43 +381,34 @@ impl Generation {
             || !self.generated.is_empty()
             || !self.output.is_empty()
             || self.round.is_some()
-            || self.method_preview.is_some()
             || position > self.prompt.len()
             || !self.layout.boundary(position)
         {
             return Err("retained prefix does not match a fresh exact input boundary".into());
         }
-        match (self.options.method, checkpoint) {
-            (MethodChoice::Plain, MethodCheckpoint::Plain) => {}
-            (MethodChoice::Mtp { .. }, MethodCheckpoint::Mtp(state))
-                if state.position() == position => {}
-            _ => {
-                return Err(
-                    "retained method checkpoint does not match the fresh generation".into(),
-                );
-            }
-        }
-        self.method = self.method_factory.create(Some(checkpoint));
+        self.method = self.method_at(position, checkpoint)?;
         self.resident_position = position;
         self.accepted_position = position;
         self.reconciliation_target = position;
         self.cached_tokens = position;
         Ok(())
     }
-    pub fn stabilize_method_features(
-        &mut self,
-        retainer: &mut dyn FeatureRetainer,
-    ) -> Result<(), String> {
-        self.method.stabilize(retainer)
-    }
-    fn propose_method(&mut self, request: RequestId, limit: usize, select: SelectSpec) -> Propose {
-        let context = self
-            .prompt
-            .iter()
-            .chain(&self.generated)
-            .copied()
-            .collect::<Vec<_>>();
-        self.method.propose(request, &context, limit, select)
+
+    /// Method state restored from a retained checkpoint of `position` rows.
+    fn method_at(
+        &self,
+        position: usize,
+        checkpoint: &MethodCheckpoint,
+    ) -> Result<Box<dyn MethodState>, String> {
+        match (self.options.method, checkpoint) {
+            (MethodChoice::Plain, MethodCheckpoint::Plain) => {}
+            (MethodChoice::Mtp { .. }, MethodCheckpoint::Mtp(state))
+                if state.target_rows() == position => {}
+            _ => {
+                return Err("retained method checkpoint does not match the generation".into());
+            }
+        }
+        self.method_factory.create(Some(checkpoint))
     }
     pub fn credit_cached_tokens(&mut self, count: usize) -> Result<(), String> {
         if count > self.prompt.len() || count < self.cached_tokens {
@@ -571,70 +534,40 @@ impl Generation {
                     remaining,
                     credit,
                     self.options.method == MethodChoice::Plain,
-                );
-                let (method_limit, select) = match &self.method_preview {
-                    Some(preview) if preview.request != request => {
-                        return Err("method preview belongs to another request".into());
-                    }
-                    Some(preview) => (
-                        preview.limit,
-                        method_select(
-                            &self.options,
-                            &self.generated,
-                            &preview.tokens,
-                            preview.constraint.as_deref(),
-                        )?,
-                    ),
-                    None => (
-                        limit,
-                        method_select(
-                            &self.options,
-                            &self.generated,
-                            &[],
-                            self.constraint.as_deref(),
-                        )?,
-                    ),
-                };
-                let proposal = match self.propose_method(request, method_limit, select) {
-                    Propose::Tokens(tokens) => {
-                        if let Some(preview) = self.method_preview.take() {
-                            if tokens != preview.tokens {
-                                return Err(
-                                    "method proposal differs from reconciled preview".into()
-                                );
-                            }
-                        }
-                        tokens
-                    }
+                )
+                .min(match self.options.method {
+                    MethodChoice::Plain => 0,
+                    MethodChoice::Mtp { proposals } => usize::from(proposals),
+                });
+                let selects = self.proposal_selects(limit)?;
+                let proposal = match self.method.propose(request, &selects) {
+                    Propose::Tokens(tokens) => tokens,
                     Propose::Pending(operations) if operations.is_empty() => {
                         return Err("method returned an empty pending operation set".into());
                     }
                     Propose::Pending(operations) => {
-                        if self.method_preview.is_none() {
-                            self.method_preview = Some(MethodPreview {
-                                request,
-                                limit: method_limit,
-                                tokens: Vec::new(),
-                                constraint: self
-                                    .constraint
-                                    .as_ref()
-                                    .map(|constraint| constraint.fork()),
-                            });
-                        }
+                        self.validate_method_operations(request, &operations)?;
                         return Ok(RoundStart::Method(operations));
                     }
                 };
-                if proposal.len() > method_limit
+                if proposal.len() > limit
                     || proposal
                         .iter()
                         .any(|token| token.0 as usize >= self.options.vocabulary)
                 {
                     return Err("method returned an invalid proposal".into());
                 }
+                // A stop token is never accepted as a draft match, so rows
+                // after it could only be rejected.
+                let proposal = proposal
+                    .iter()
+                    .take_while(|token| !self.options.stop_tokens.contains(token))
+                    .copied()
+                    .collect();
                 RoundState::verification(
                     *self.generated.last().unwrap(),
                     proposal,
-                    method_limit,
+                    limit,
                     self.generated.len(),
                     &self.generated,
                     self.constraint.as_deref(),
@@ -645,8 +578,43 @@ impl Generation {
                 )?
             }
         };
-        self.round = Some(SuspendedRound::Awaiting(round));
+        self.round = Some(round);
         Ok(RoundStart::Target)
+    }
+
+    /// One selection per proposal, keyed like the target's selection of the
+    /// same output position (so identical draft and target distributions
+    /// select identical tokens). Proposal history is not previewed, and only
+    /// the first proposal knows its grammar mask.
+    fn proposal_selects(&self, count: usize) -> Result<Vec<SelectSpec>, String> {
+        let history = self
+            .options
+            .shaping
+            .uses_history()
+            .then(|| selection_history(&self.generated, &[]))
+            .transpose()?;
+        let first_mask = self
+            .constraint
+            .as_ref()
+            .map(|constraint| constraint.mask())
+            .transpose()?;
+        (0..count)
+            .map(|index| {
+                Ok(SelectSpec {
+                    sampling: self.options.sampling,
+                    seed: self.options.seed,
+                    position: self
+                        .generated
+                        .len()
+                        .checked_add(index)
+                        .ok_or("proposal selection position exhausted")?,
+                    domain: 0,
+                    mask: if index == 0 { first_mask.clone() } else { None },
+                    shaping: self.options.shaping,
+                    history: history.clone(),
+                })
+            })
+            .collect()
     }
 
     /// Numerical state may trail logically accepted tokens because selection
@@ -656,7 +624,6 @@ impl Generation {
         let progress = self.causal_progress();
         (self.resident
             && self.round.is_none()
-            && self.method_preview.is_none()
             && progress.resident_position < progress.accepted_position)
             .then_some(PendingReconciliation {
                 start: progress.resident_position,
@@ -693,7 +660,7 @@ impl Generation {
             None,
             self.method_factory.requires(),
         )?;
-        self.round = Some(SuspendedRound::Awaiting(round));
+        self.round = Some(round);
         Ok(())
     }
 
@@ -738,269 +705,54 @@ impl Generation {
     }
 
     pub fn round_forward(&self) -> Option<&RoundForward> {
-        match self.round.as_ref() {
-            Some(SuspendedRound::Awaiting(round)) => Some(round.forward()),
-            Some(SuspendedRound::Resolved(_)) | None => None,
-        }
+        self.round.as_ref().map(RoundState::forward)
     }
 
+    /// Consume a method operation's outcome against private method state.
+    /// The decision commits a head transaction's entry rows.
     pub fn prepare_method_transition(
         &self,
         operation: &Operation,
         outcome: &magnitude_model_executor::Outcome,
-        retainer: &mut dyn FeatureRetainer,
     ) -> Result<PreparedMethodTransition, String> {
         if self.round.is_some() {
             return Err("method work cannot reconcile while a target round is suspended".into());
         }
-        let request = operation.request();
-        let mut method = self.method.fork_transition()?;
-        let mut preview = self.method_preview.as_ref().map(|preview| MethodPreview {
-            request: preview.request,
-            limit: preview.limit,
-            tokens: preview.tokens.clone(),
-            constraint: preview
-                .constraint
-                .as_ref()
-                .map(|constraint| constraint.fork()),
-        });
-        let next_select = if let Some(preview) = preview.as_mut() {
-            if request != preview.request {
-                return Err("method outcome belongs to another request".into());
-            }
-            let staged_token = match (operation, outcome) {
-                (Operation::Head { .. }, magnitude_model_executor::Outcome::Head { .. }) => None,
-                (
-                    Operation::Project { .. },
-                    magnitude_model_executor::Outcome::Project { selected },
-                ) => {
-                    let [selected] = selected.as_slice() else {
-                        return Err(
-                            "method projection must return exactly one selected token".into()
-                        );
-                    };
-                    match selected.status {
-                        0 => {}
-                        1 => return Err("method projection distribution is empty".into()),
-                        2 => return Err("method projection distribution is nonfinite".into()),
-                        _ => return Err("method projection returned an unknown status".into()),
-                    }
-                    if selected.token.0 as usize >= self.options.vocabulary
-                        || preview.tokens.len() >= preview.limit
-                    {
-                        return Err("method projection returned an invalid proposal token".into());
-                    }
-                    if let Some(constraint) = preview.constraint.as_ref() {
-                        let next = constraint.stage(&[selected.token])?;
-                        if next.position() != constraint.position() + 1 {
-                            return Err("method preview advanced to an invalid position".into());
-                        }
-                        preview.constraint = Some(next);
-                    }
-                    preview.tokens.push(selected.token);
-                    Some(selected.token)
-                }
-                _ => return Err("method operation returned an outcome of the wrong kind".into()),
-            };
-            (preview.tokens.len() < preview.limit
-                && staged_token.is_none_or(|token| !self.options.stop_tokens.contains(&token)))
-            .then(|| {
-                method_select(
-                    &self.options,
-                    &self.generated,
-                    &preview.tokens,
-                    preview.constraint.as_deref(),
-                )
-            })
-            .transpose()?
-        } else {
-            if !matches!(
-                (operation, outcome),
-                (
-                    Operation::Head { .. },
-                    magnitude_model_executor::Outcome::Head { .. }
-                )
-            ) {
-                return Err(
-                    "only a priming head outcome may reconcile without a proposal preview".into(),
-                );
-            }
-            None
+        let Operation::Head { request, tokens, .. } = operation else {
+            return Err("only a head transaction reconciles into method state".into());
         };
-        let effects = method.reconcile(operation, outcome.clone(), next_select)?;
-        self.validate_method_effects(&effects)?;
-        if effects
-            .operations
-            .iter()
-            .any(|operation| operation.request() != request)
-        {
-            return Err("method returned a follow-up operation for another request".into());
-        }
-        if let Some(prefix) = effects.head_prefix {
-            if !matches!(operation, Operation::Head { .. }) || prefix > operation.row_count() {
-                return Err("method accepted an invalid head prefix".into());
+        if let magnitude_model_executor::Outcome::Head { proposals } = outcome {
+            if proposals.iter().any(|selected| {
+                selected.status > 2
+                    || (selected.status == 0
+                        && selected.token.0 as usize >= self.options.vocabulary)
+            }) {
+                return Err("head returned an invalid proposal".into());
             }
         }
-        method.stabilize(retainer)?;
+        let mut method = self.method.fork_transition();
+        method.reconcile(operation, outcome.clone())?;
         Ok(PreparedMethodTransition {
-            request,
-            expected_preview_len: self
-                .method_preview
-                .as_ref()
-                .map(|preview| preview.tokens.len()),
+            request: *request,
             expected_resident_position: self.resident_position,
             expected_generated_len: self.generated.len(),
             expected_finish: self.finish,
             method,
-            preview,
             decision: ReconcileDecision {
-                accepted_rows: 0,
-                head_prefix: effects.head_prefix,
+                accepted_rows: tokens.len(),
             },
-            effects,
         })
     }
 
-    pub fn commit_method_transition(
-        &mut self,
-        transition: PreparedMethodTransition,
-    ) -> MethodEffects {
+    pub fn commit_method_transition(&mut self, transition: PreparedMethodTransition) {
         assert!(
             self.round.is_none()
-                && self
-                    .method_preview
-                    .as_ref()
-                    .map(|preview| preview.tokens.len())
-                    == transition.expected_preview_len
                 && self.resident_position == transition.expected_resident_position
                 && self.generated.len() == transition.expected_generated_len
                 && self.finish == transition.expected_finish,
-            "method preview changed between preparation and physical reconciliation"
+            "generation changed between method preparation and physical reconciliation"
         );
         self.method = transition.method;
-        self.method_preview = transition.preview;
-        transition.effects
-    }
-
-    pub fn reconcile_method(
-        &mut self,
-        operation: &Operation,
-        outcome: magnitude_model_executor::Outcome,
-    ) -> Result<MethodEffects, String> {
-        match self.reconcile_method_inner(operation, outcome) {
-            Ok(effects) => Ok(effects),
-            Err(error) => {
-                self.method_preview = None;
-                self.finish = Some(FinishReason::Failed);
-                Err(error)
-            }
-        }
-    }
-
-    fn reconcile_method_inner(
-        &mut self,
-        operation: &Operation,
-        outcome: magnitude_model_executor::Outcome,
-    ) -> Result<MethodEffects, String> {
-        if self.round.is_some() {
-            return Err("method work cannot reconcile while a target round is suspended".into());
-        }
-        let Some(preview) = self.method_preview.as_ref() else {
-            if !matches!(
-                (&operation, &outcome),
-                (
-                    Operation::Head { .. },
-                    magnitude_model_executor::Outcome::Head { .. }
-                )
-            ) {
-                return Err(
-                    "only a priming head outcome may reconcile without a proposal preview".into(),
-                );
-            }
-            let request = operation.request();
-            let effects = self.method.reconcile(operation, outcome, None)?;
-            if effects
-                .operations
-                .iter()
-                .any(|operation| operation.request() != request)
-            {
-                return Err("method returned a follow-up operation for another request".into());
-            }
-            self.validate_method_effects(&effects)?;
-            return Ok(effects);
-        };
-        if operation.request() != preview.request {
-            return Err("method outcome belongs to another request".into());
-        }
-        let request = preview.request;
-
-        let mut staged = None;
-        let mut staged_token = None;
-        match (operation, &outcome) {
-            (Operation::Head { .. }, magnitude_model_executor::Outcome::Head { .. }) => {}
-            (
-                Operation::Project { .. },
-                magnitude_model_executor::Outcome::Project { selected },
-            ) => {
-                let [selected] = selected.as_slice() else {
-                    return Err("method projection must return exactly one selected token".into());
-                };
-                match selected.status {
-                    0 => {}
-                    1 => return Err("method projection distribution is empty".into()),
-                    2 => return Err("method projection distribution is nonfinite".into()),
-                    _ => return Err("method projection returned an unknown status".into()),
-                }
-                if selected.token.0 as usize >= self.options.vocabulary
-                    || preview.tokens.len() >= preview.limit
-                {
-                    return Err("method projection returned an invalid proposal token".into());
-                }
-                if let Some(constraint) = preview.constraint.as_ref() {
-                    let next = constraint.stage(&[selected.token])?;
-                    if next.position() != constraint.position() + 1 {
-                        return Err("method preview advanced to an invalid position".into());
-                    }
-                    staged = Some(next);
-                }
-                staged_token = Some(selected.token);
-            }
-            _ => return Err("method operation returned an outcome of the wrong kind".into()),
-        }
-
-        let mut next_tokens = preview.tokens.clone();
-        if let Some(token) = staged_token {
-            next_tokens.push(token);
-        }
-        let next_constraint = staged.as_deref().or(preview.constraint.as_deref());
-        let next_select = (next_tokens.len() < preview.limit
-            && staged_token.is_none_or(|token| !self.options.stop_tokens.contains(&token)))
-        .then(|| {
-            method_select(
-                &self.options,
-                &self.generated,
-                &next_tokens,
-                next_constraint,
-            )
-        })
-        .transpose()?;
-        let effects = self.method.reconcile(operation, outcome, next_select)?;
-        if effects
-            .operations
-            .iter()
-            .any(|operation| operation.request() != request)
-        {
-            return Err("method returned a follow-up operation for another request".into());
-        }
-        let preview = self.method_preview.as_mut().unwrap();
-        if let Some(token) = staged_token {
-            preview.tokens.push(token);
-        }
-        if staged.is_some() {
-            preview.constraint = staged;
-        }
-        self.validate_method_effects(&effects)?;
-        Ok(effects)
     }
 
     /// Prepare acceptance, grammar, method effects, counters, and publication
@@ -1011,9 +763,9 @@ impl Generation {
         request: RequestId,
         samples: &[TokenId],
         features: Option<FeatureRef>,
-        retainer: &mut dyn FeatureRetainer,
+        reader: &mut dyn FeatureReader,
     ) -> Result<PreparedGenerationTransition, String> {
-        let Some(SuspendedRound::Awaiting(round)) = self.round.as_ref() else {
+        let Some(round) = self.round.as_ref() else {
             return Err("generation has no target round awaiting selections".into());
         };
         let causal_reconciliation = self.finish.is_some()
@@ -1066,7 +818,7 @@ impl Generation {
                 })
                 .transpose()?
         };
-        let mut method = self.method.fork_transition()?;
+        let mut method = self.method.fork_transition();
         let effects = match acceptance.method_update {
             MethodUpdate::None => MethodEffects::default(),
             MethodUpdate::Prime => {
@@ -1080,7 +832,13 @@ impl Generation {
                     return Err("prefill method requires target features".into());
                 }
                 match features {
-                    Some(features) => method.prime(request, &acceptance.inputs, features)?,
+                    Some(features) => method.prime(
+                        request,
+                        &acceptance.inputs,
+                        acceptance.emitted.first().copied(),
+                        features,
+                        reader,
+                    )?,
                     None => MethodEffects::default(),
                 }
             }
@@ -1089,23 +847,19 @@ impl Generation {
                     .emitted
                     .last()
                     .ok_or("resolved verification emitted no successor token")?;
-                method.observe(Verification {
-                    inputs: &acceptance.inputs,
-                    accepted: acceptance.committed_rows,
-                    next,
-                    features,
-                })?
+                method.observe(
+                    request,
+                    Verification {
+                        inputs: &acceptance.inputs,
+                        accepted: acceptance.committed_rows,
+                        next,
+                        features,
+                    },
+                    reader,
+                )?
             }
         };
-        self.validate_method_effects(&effects)?;
-        if effects
-            .operations
-            .iter()
-            .any(|operation| operation.request() != request)
-        {
-            return Err("method returned an operation for another request".into());
-        }
-        method.stabilize(retainer)?;
+        self.validate_method_operations(request, &effects.operations)?;
         let mut draft_stats = self.draft_stats;
         draft_stats.record(acceptance.proposed, acceptance.accepted_proposals)?;
         let resident_position = self
@@ -1149,7 +903,6 @@ impl Generation {
             expected_forward: round.forward().clone(),
             decision: ReconcileDecision {
                 accepted_rows: acceptance.committed_rows,
-                head_prefix: effects.head_prefix,
             },
             method,
             effects,
@@ -1167,7 +920,7 @@ impl Generation {
     /// Any mismatch here is an executor/generation ordering bug.
     pub fn commit_transition(&mut self, transition: PreparedGenerationTransition) -> MethodEffects {
         assert!(
-            matches!(self.round.as_ref(), Some(SuspendedRound::Awaiting(_)))
+            self.round.is_some()
                 && self.resident_position == transition.expected_resident_position
                 && self.generated.len() == transition.expected_generated_len
                 && self.finish == transition.expected_finish
@@ -1190,180 +943,17 @@ impl Generation {
         transition.effects
     }
 
-    /// Reconcile device selections and stage grammar on a private matcher. No
-    /// logical token is published until the caller has committed the numerical
-    /// prefix and invokes `commit_round`.
-    pub fn resolve_round(&mut self, samples: &[TokenId]) -> Result<&RoundAcceptance, String> {
-        let Some(SuspendedRound::Awaiting(round)) = self.round.take() else {
-            return Err("generation has no target round awaiting selections".into());
-        };
-        // Reconciliation started after a finish decision commits already
-        // accepted tokens into numerical and method state without selecting.
-        let causal_reconciliation = self.finish.is_some()
-            && round.forward().kind == WorkKind::Replay
-            && round.forward().selects.is_empty();
-        let mut acceptance = match round.reconcile(samples, &self.options.stop_tokens) {
-            Ok(acceptance) => acceptance,
-            Err(error) => {
-                self.finish = Some(FinishReason::Failed);
-                return Err(error);
-            }
-        };
-        if self.finish.is_some() && !causal_reconciliation {
-            acceptance.emitted.clear();
-            acceptance.committed_rows = 0;
-            acceptance.proposed = 0;
-            acceptance.accepted_proposals = 0;
-            acceptance.method_update = MethodUpdate::None;
-        }
-        if acceptance
-            .emitted
-            .iter()
-            .any(|token| token.0 as usize >= self.options.vocabulary)
-            || acceptance.emitted.len() > self.options.output_capacity - self.output.len()
-            || acceptance.emitted.len() > self.options.max_tokens - self.generated.len()
-            || (!causal_reconciliation
-                && acceptance.committed_rows
-                    > self
-                        .options
-                        .context_limit
-                        .saturating_sub(self.resident_position))
-        {
-            self.finish = Some(FinishReason::Failed);
-            return Err("round returned invalid tokens or exceeded a generation bound".into());
-        }
-        let constraint = if acceptance.emitted.is_empty() {
-            Ok(None)
-        } else {
-            self.constraint
-                .as_ref()
-                .map(|constraint| {
-                    if constraint.position() != self.generated.len() {
-                        return Err("constraint progress differs from accepted tokens".into());
-                    }
-                    let next = constraint.stage(&acceptance.emitted)?;
-                    if next.position() != self.generated.len() + acceptance.emitted.len() {
-                        return Err("constraint successor has incorrect position".into());
-                    }
-                    Ok(next)
-                })
-                .transpose()
-        };
-        let constraint = match constraint {
-            Ok(constraint) => constraint,
-            Err(error) => {
-                self.finish = Some(FinishReason::Failed);
-                return Err(error);
-            }
-        };
-        self.round = Some(SuspendedRound::Resolved(ResolvedRound {
-            acceptance,
-            constraint,
-        }));
-        let Some(SuspendedRound::Resolved(resolved)) = self.round.as_ref() else {
-            unreachable!()
-        };
-        Ok(&resolved.acceptance)
-    }
-
-    /// Install a staged round after its numerical prefix (and any repair) has
-    /// committed. This is the only round path that publishes tokens or usage.
-    pub fn commit_round(
-        &mut self,
+    /// Method work belongs to the method's own executor and request.
+    fn validate_method_operations(
+        &self,
         request: RequestId,
-        features: Option<FeatureRef>,
-    ) -> Result<MethodEffects, String> {
-        let Some(SuspendedRound::Resolved(resolved)) = self.round.take() else {
-            return Err("generation has no resolved round to commit".into());
-        };
-        let method_effects = match resolved.acceptance.method_update {
-            MethodUpdate::None => MethodEffects::default(),
-            MethodUpdate::Prime => {
-                if self
-                    .method_factory
-                    .requires()
-                    .prefill_demand
-                    .contains(Demand::FEATURES)
-                    && features.is_none()
-                {
-                    self.finish = Some(FinishReason::Failed);
-                    return Err("prefill method requires target features".into());
-                }
-                match features {
-                    Some(features) => {
-                        self.method
-                            .prime(request, &resolved.acceptance.inputs, features)?
-                    }
-                    None => MethodEffects::default(),
-                }
-            }
-            MethodUpdate::Observe => {
-                let next = *resolved
-                    .acceptance
-                    .emitted
-                    .last()
-                    .ok_or("resolved verification emitted no successor token")?;
-                match self.method.observe(Verification {
-                    inputs: &resolved.acceptance.inputs,
-                    accepted: resolved.acceptance.committed_rows,
-                    next,
-                    features,
-                }) {
-                    Ok(effects) => effects,
-                    Err(error) => {
-                        self.finish = Some(FinishReason::Failed);
-                        return Err(error);
-                    }
-                }
-            }
-        };
-        self.validate_method_effects(&method_effects)?;
-        if method_effects
-            .operations
-            .iter()
-            .any(|operation| operation.request() != request)
-        {
-            return Err("method returned an operation for another request".into());
-        }
-        self.draft_stats.record(
-            resolved.acceptance.proposed,
-            resolved.acceptance.accepted_proposals,
-        )?;
-        self.resident_position = self
-            .resident_position
-            .checked_add(resolved.acceptance.committed_rows)
-            .ok_or("resident position exhausted")?;
-        if let Some(constraint) = resolved.constraint {
-            self.constraint = Some(constraint);
-        }
-        for token in resolved.acceptance.emitted {
-            self.generated.push(token);
-            if self.options.stop_tokens.contains(&token) {
-                self.finish = Some(FinishReason::Stop);
-                break;
-            }
-            self.output.push_back(OutputToken {
-                index: self.published + self.output.len(),
-                token,
-            });
-        }
-        if self.finish.is_none() && self.generated.len() >= self.options.max_tokens {
-            self.finish = Some(FinishReason::Length);
-        }
-        self.accepted_position = self
-            .resident_position
-            .max(self.prompt.len() + self.generated.len());
-        if self.finish.is_none() && self.resident_position >= self.options.context_limit {
-            self.finish = Some(FinishReason::Context);
-        }
-        Ok(method_effects)
-    }
-
-    fn validate_method_effects(&self, effects: &MethodEffects) -> Result<(), String> {
-        if effects.operations.iter().any(|operation| {
-            operation.executable() == magnitude_model_executor::ExecutableKind::Target
-        }) || (effects.head_prefix.is_some() && !self.method_factory.requires().head)
-        {
+        operations: &[Operation],
+    ) -> Result<(), String> {
+        if operations.iter().any(|operation| {
+            operation.request() != request
+                || operation.executable() != magnitude_model_executor::ExecutableKind::Head
+                || !self.method_factory.requires().head
+        }) {
             return Err("method returned effects outside its executor ownership".into());
         }
         Ok(())
@@ -1372,14 +962,12 @@ impl Generation {
     /// Accepted output remains owned by the caller until drained or discarded.
     pub fn cancel(&mut self) {
         self.round = None;
-        self.method_preview = None;
         if self.finish.is_none() {
             self.finish = Some(FinishReason::Cancelled);
         }
     }
     pub fn fail(&mut self) {
         self.round = None;
-        self.method_preview = None;
         if self.finish.is_none() {
             self.finish = Some(FinishReason::Failed);
         }
@@ -1394,7 +982,6 @@ impl Generation {
     pub fn evicted(&mut self) -> Result<(), String> {
         self.reconciliation_target = self.accepted_position;
         self.round = None;
-        self.method_preview = None;
         self.method.evict();
         self.resident = false;
         Ok(())
@@ -1406,29 +993,39 @@ impl Generation {
             return Err("only an evicted live request can restore".into());
         }
         self.resident_position = 0;
-        self.method.restore();
+        self.resident = true;
+        Ok(())
+    }
+
+    /// Called after numerical state of a retained prefix of this request's
+    /// accepted input (`position` rows, with its method checkpoint) is
+    /// installed. Replay advances from there to the acceptance boundary.
+    pub fn restored_at(
+        &mut self,
+        position: usize,
+        checkpoint: &MethodCheckpoint,
+    ) -> Result<(), String> {
+        if self.resident || self.finish.is_some() {
+            return Err("only an evicted live request can restore".into());
+        }
+        if position > self.accepted_position
+            || (position < self.prompt.len() && !self.layout.boundary(position))
+        {
+            return Err("retained prefix is not an exact boundary of the accepted input".into());
+        }
+        self.method = self.method_at(position, checkpoint)?;
+        self.resident_position = position;
         self.resident = true;
         Ok(())
     }
 
     /// Fork reconciled logical state at the executor's independently checked
     /// numerical checkpoint position.
-    pub fn fork_at(
-        &self,
-        numerical_position: usize,
-        retainer: &mut dyn FeatureRetainer,
-    ) -> Result<Self, String> {
-        if self.round.is_some()
-            || self.method_preview.is_some()
-            || !self.resident
-            || numerical_position != self.resident_position
+    pub fn fork_at(&self, numerical_position: usize) -> Result<Self, String> {
+        if self.round.is_some() || !self.resident || numerical_position != self.resident_position
         {
             return Err("checkpoint requires matching reconciled resident state".into());
         }
-        self.fork_reconciled(retainer)
-    }
-
-    fn fork_reconciled(&self, retainer: &mut dyn FeatureRetainer) -> Result<Self, String> {
         let constraint = self
             .constraint
             .as_ref()
@@ -1442,9 +1039,9 @@ impl Generation {
             .transpose()?;
         let method_checkpoint = self
             .method
-            .checkpoint(retainer)
+            .checkpoint()
             .map_err(|error| error.to_string())?;
-        let method = self.method_factory.create(Some(&method_checkpoint));
+        let method = self.method_factory.create(Some(&method_checkpoint))?;
         Ok(Self {
             prompt: self.prompt.clone(),
             layout: self.layout.clone(),
@@ -1463,7 +1060,6 @@ impl Generation {
             cached_tokens: self.cached_tokens,
             draft_stats: self.draft_stats,
             round: None,
-            method_preview: None,
         })
     }
 }
@@ -1508,30 +1104,6 @@ mod thread_boundary {
     }
 }
 
-fn method_select(
-    options: &Options,
-    generated: &[TokenId],
-    preview: &[TokenId],
-    constraint: Option<&dyn Constraint>,
-) -> Result<SelectSpec, String> {
-    Ok(SelectSpec {
-        sampling: options.sampling,
-        seed: options.seed,
-        position: generated
-            .len()
-            .checked_add(preview.len())
-            .ok_or("method selection position exhausted")?,
-        domain: 1,
-        mask: constraint.map(Constraint::mask).transpose()?,
-        shaping: options.shaping,
-        history: options
-            .shaping
-            .uses_history()
-            .then(|| selection_history(generated, preview))
-            .transpose()?,
-    })
-}
-
 fn method_matches_choice(choice: MethodChoice, method: &dyn Method) -> bool {
     let requirements = method.requires();
     match choice {
@@ -1545,16 +1117,11 @@ fn method_matches_choice(choice: MethodChoice, method: &dyn Method) -> bool {
                     })
         }
         MethodChoice::Mtp { proposals } => {
-            let capacity = method
-                .identity()
-                .strip_prefix("mtp:")
-                .and_then(|identity| identity.rsplit_once(':'))
-                .and_then(|(_, capacity)| capacity.parse::<usize>().ok());
             proposals > 0
                 && requirements.head
                 && requirements.prefill_demand.contains(Demand::FEATURES)
                 && requirements.verify_demand.contains(Demand::FEATURES)
-                && capacity.is_some_and(|capacity| usize::from(proposals) <= capacity)
+                && usize::from(proposals) <= method.proposals()
         }
     }
 }
@@ -1566,6 +1133,7 @@ mod method_choice_tests {
     struct Descriptor {
         identity: &'static str,
         requirements: MethodRequirements,
+        proposals: usize,
     }
 
     impl Method for Descriptor {
@@ -1575,13 +1143,19 @@ mod method_choice_tests {
         fn requires(&self) -> MethodRequirements {
             self.requirements
         }
-        fn create(&self, _checkpoint: Option<&MethodCheckpoint>) -> Box<dyn MethodState> {
-            panic!("descriptor-only validation fixture")
+        fn proposals(&self) -> usize {
+            self.proposals
+        }
+        fn create(
+            &self,
+            _checkpoint: Option<&MethodCheckpoint>,
+        ) -> Result<Box<dyn MethodState>, String> {
+            Err("descriptor-only validation fixture".into())
         }
     }
 
     #[test]
-    fn choice_requires_matching_identity_requirements_and_mtp_capacity() {
+    fn choice_requires_matching_identity_requirements_and_mtp_width() {
         let plain = Descriptor {
             identity: "plain",
             requirements: MethodRequirements {
@@ -1589,6 +1163,7 @@ mod method_choice_tests {
                 verify_demand: Demand::NONE,
                 head: false,
             },
+            proposals: 0,
         };
         assert!(method_matches_choice(MethodChoice::Plain, &plain));
         assert!(!method_matches_choice(
@@ -1603,6 +1178,7 @@ mod method_choice_tests {
                 verify_demand: Demand::FEATURES,
                 head: true,
             },
+            proposals: 3,
         };
         assert!(method_matches_choice(
             MethodChoice::Mtp { proposals: 3 },

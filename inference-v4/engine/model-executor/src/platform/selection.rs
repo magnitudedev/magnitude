@@ -1,15 +1,18 @@
 //! Device selection over the Seismic topology. A host either names the
 //! device (a backend or an exact selector) or asks for automatic selection.
-//! Automatic selection considers accelerators only (Metal, CUDA): the CPU
-//! native route exists for functional coverage and is used only when it is
-//! requested explicitly. Candidates must be executable on the path and have
-//! established memory backing. Ranking between several fitting devices is an
-//! open policy, so more than one candidate is an explicit result rather than
-//! an arbitrary choice; the host then names one.
+//! Automatic selection considers accelerators only (Metal, CUDA, and Vulkan
+//! GPUs that CUDA does not also expose: NVIDIA reports one UUID to both
+//! APIs, and such a GPU is left to CUDA). The CPU native route and software
+//! Vulkan devices (lavapipe) exist for functional coverage and are used only
+//! when requested explicitly. Candidates must be executable on the path and
+//! have established memory backing. Ranking between several fitting devices
+//! is an open policy, so more than one candidate is an explicit result
+//! rather than an arbitrary choice; the host then names one.
 
 use crate::ExecutionPath;
 use seismic::{
-    Availability, BackendName, DeviceInfo, DeviceMemory, DeviceSelector, DeviceTopology,
+    Availability, BackendName, DeviceInfo, DeviceKind, DeviceMemory, DeviceSelector,
+    DeviceTopology,
 };
 use std::{fmt, str::FromStr};
 
@@ -41,7 +44,7 @@ impl fmt::Display for DeviceRequestParseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "invalid device `{}`: expected auto, metal, cuda, vulkan, cpu, or an exact selector (host-cpu, metal:<id>, cuda:<uuid>)",
+            "invalid device `{}`: expected auto, metal, cuda, vulkan, cpu, or an exact selector (host-cpu, metal:<id>, cuda:<uuid>, vulkan:<uuid>)",
             self.0
         )
     }
@@ -67,13 +70,30 @@ impl FromStr for DeviceRequest {
 }
 
 impl DeviceRequest {
-    fn admits(self, device: &DeviceInfo) -> bool {
+    fn admits(self, device: &DeviceInfo, topology: &DeviceTopology) -> bool {
         match self {
-            Self::Automatic => matches!(device.backend, BackendName::Metal | BackendName::Cuda),
+            Self::Automatic => match device.backend {
+                BackendName::Metal | BackendName::Cuda => true,
+                BackendName::Vulkan => {
+                    device.kind == DeviceKind::Gpu && !exposed_through_cuda(device, topology)
+                }
+                BackendName::Cpu => false,
+            },
             Self::Backend(backend) => device.backend == backend,
             Self::Selector(selector) => device.selector == selector,
         }
     }
+}
+
+/// Whether the topology holds a CUDA device with this Vulkan device's UUID.
+fn exposed_through_cuda(device: &DeviceInfo, topology: &DeviceTopology) -> bool {
+    let DeviceSelector::Vulkan { uuid } = device.selector else {
+        return false;
+    };
+    topology
+        .devices()
+        .iter()
+        .any(|other| other.selector == DeviceSelector::Cuda { uuid })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,7 +150,7 @@ pub fn select(
     let mut candidates = Vec::new();
     let mut evidence = Vec::new();
     for device in topology.devices() {
-        if !request.admits(device) {
+        if !request.admits(device, topology) {
             continue;
         }
         match (&device.availability, &device.memory) {
@@ -190,6 +210,8 @@ mod tests {
             "host-cpu",
             "metal:00000001000004a5",
             "cuda:00112233-4455-6677-8899-aabbccddeeff",
+            "vulkan",
+            "vulkan:00112233-4455-6677-8899-aabbccddeeff",
         ] {
             let request: DeviceRequest = text.parse().unwrap();
             assert_eq!(request.to_string(), text);
@@ -212,7 +234,13 @@ mod tests {
         let accelerators = topology
             .devices()
             .iter()
-            .filter(|device| device.backend != BackendName::Cpu)
+            .filter(|device| match device.backend {
+                BackendName::Cpu => false,
+                BackendName::Metal | BackendName::Cuda => true,
+                BackendName::Vulkan => {
+                    device.kind == DeviceKind::Gpu && !exposed_through_cuda(device, &topology)
+                }
+            })
             .filter(|device| {
                 device.availability == Availability::Available
                     && matches!(device.memory, DeviceMemory::Established(_))
@@ -230,6 +258,31 @@ mod tests {
         }
     }
 
+    /// A Vulkan device CUDA also exposes (same UUID) is never an automatic
+    /// candidate; a software Vulkan device neither.
+    #[test]
+    fn automatic_selection_leaves_shadowed_and_software_vulkan_devices_out() {
+        let catalog = seismic::DeviceCatalog::discover().unwrap();
+        let topology = catalog.topology();
+        for device in topology.devices().iter().filter(|device| device.backend == BackendName::Vulkan) {
+            let DeviceSelector::Vulkan { uuid } = device.selector else {
+                panic!("a Vulkan device has a Vulkan selector")
+            };
+            let shadowed = topology
+                .devices()
+                .iter()
+                .any(|other| other.selector == DeviceSelector::Cuda { uuid });
+            assert_eq!(
+                DeviceRequest::Automatic.admits(device, &topology),
+                device.kind == DeviceKind::Gpu && !shadowed,
+                "{}",
+                device.selector
+            );
+        }
+    }
+
+    /// Vulkan is not built on macOS.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_vulkan_request_is_refused_with_the_missing_runtime() {
         let catalog = seismic::DeviceCatalog::discover().unwrap();

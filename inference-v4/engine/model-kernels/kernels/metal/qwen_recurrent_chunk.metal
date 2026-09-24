@@ -1,5 +1,11 @@
 // Chunked gated delta rule (WY form) over pieces of at most 8 rows, in two
-// launches that share the `inputs` scratch (f32, rows of every slot only):
+// launches that share the `inputs` scratch (f32, the chunked rows only). The
+// chunked rows of a slot are those before its stop row, starting from the
+// slot's source version (the bank's state advanced by its tape rows); the rows
+// after the stop row advance row-sequentially from the published state with
+// the step's arithmetic (`recurrent::advance_rows`), recording the tape. A slot
+// of at most RECURRENT_SEQUENTIAL_ROWS rows (an MTP verify) is not chunked at
+// all and gets the step's bits. The scratch:
 //   rows    [NK, M, 2W]   per key head: L2-normalized q (scaled by W^-1/2), k
 //   values  [NV, M, W]    convolved v heads
 //   gates   [NV, 2, M]    log decay, beta
@@ -65,20 +71,36 @@ inline RchScratch rch_scratch(device float *inputs, constant ulong *seismic_word
     return scratch;
 }
 
-// The slot containing `row` and its first row, or false outside every slot.
-inline bool rch_row_slot(device const int *segments, ulong row, thread ulong &slot,
-    thread long &lo, constant ulong *seismic_words) {
+// The slot containing `row`, or false when the row is not chunked: outside
+// every slot, in a sequential (short) slot, or after its slot's stop row.
+inline bool rch_row_slot(device const int *segments, device const int *stop, device const int *previous_bank,
+    device const int *previous_tape, device const int *following_bank, ulong row, thread recurrent::Slot &slot,
+    constant ulong *seismic_words) {
     for (ulong candidate = 0; candidate < SEISMIC_DIM_B; ++candidate) {
         const long first = segments[candidate * SEISMIC_SEGMENTS_STRIDE_0];
         const long last = segments[candidate * SEISMIC_SEGMENTS_STRIDE_0
             + SEISMIC_SEGMENTS_STRIDE_1];
         if (long(row) >= first && long(row) < last) {
-            slot = candidate;
-            lo = first;
-            return true;
+            slot = recurrent::slot_of(segments, stop, previous_bank, previous_tape, following_bank, candidate,
+                seismic_words);
+            return last - first > RECURRENT_SEQUENTIAL_ROWS && long(row) < first + slot.stop;
         }
     }
     return false;
+}
+
+// Rows after the last slot belong to no sequence: this simdgroup's 16 state
+// rows of their output are zero.
+inline void rch_zero_tail(device recurrent::Storage *mixed, ulong slot, long hi, ulong head, ulong row0,
+    ushort lane, constant ulong *seismic_words) {
+    if (slot + 1 != SEISMIC_DIM_B) {
+        return;
+    }
+    const ulong rows = SEISMIC_DIM_M - ulong(hi);
+    for (ulong index = lane; index < rows * 16; index += 32) {
+        mixed[(ulong(hi) + index / 16) * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1
+            + (row0 + index % 16) * SEISMIC_RESULT_0_STRIDE_2] = element::Act::store(0.0f);
+    }
 }
 
 kernel void qwen_recurrent_chunk_inputs(
@@ -87,7 +109,10 @@ kernel void qwen_recurrent_chunk_inputs(
     device const float *rate [[buffer(SEISMIC_BUFFER_RATE)]],
     device const float *time_bias [[buffer(SEISMIC_BUFFER_TIME_BIAS)]],
     device const int *segments [[buffer(SEISMIC_BUFFER_SEGMENTS)]],
+    device const int *stop [[buffer(SEISMIC_BUFFER_STOP)]],
     device const int *previous_bank [[buffer(SEISMIC_BUFFER_PREVIOUS_BANK)]],
+    device const int *previous_tape [[buffer(SEISMIC_BUFFER_PREVIOUS_TAPE)]],
+    device const int *following_bank [[buffer(SEISMIC_BUFFER_FOLLOWING_BANK)]],
     device const recurrent::Storage *window [[buffer(SEISMIC_BUFFER_WINDOW)]],
     device float *inputs [[buffer(SEISMIC_BUFFER_SCRATCH_INPUTS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
@@ -97,10 +122,9 @@ kernel void qwen_recurrent_chunk_inputs(
     const uint width = RCH_WIDTH;
     const uint head = group.y * 4 + simdgroup;
     const ulong row = group.x;
-    ulong slot;
-    long lo;
+    recurrent::Slot slot;
     if (head >= 2 * RCH_KEY_HEADS + RCH_VALUE_HEADS
-        || !rch_row_slot(segments, row, slot, lo, seismic_words)) {
+        || !rch_row_slot(segments, stop, previous_bank, previous_tape, following_bank, row, slot, seismic_words)) {
         return;
     }
     const RchScratch scratch = rch_scratch(inputs, seismic_words);
@@ -112,11 +136,10 @@ kernel void qwen_recurrent_chunk_inputs(
         : scratch.rows + (ulong(head % RCH_KEY_HEADS) * scratch.height + row) * RCH_ROW_STRIDE
             + (is_key ? width : 0);
 
-    // The tap rows: the window of the slot's accepted bank before the slot,
+    // The tap rows: the window of the slot's source version before the slot,
     // the projection after.
-    const ulong source = ulong(previous_bank[slot * SEISMIC_PREVIOUS_BANK_STRIDE_0]);
     device const recurrent::Storage *taps[RECURRENT_TAPS];
-    recurrent::taps(projection, window, source, long(row), long(row) - lo, taps, seismic_words);
+    recurrent::taps(projection, window, slot, long(row) - slot.lo, taps, seismic_words);
     // This lane's channel quads.
     float4 values[RCH_LANE_QUADS];
     float squares = 0.0f;
@@ -156,12 +179,17 @@ kernel void qwen_recurrent_chunk_inputs(
 
 kernel void qwen_recurrent_chunk_scan(
     device const recurrent::Storage *projection [[buffer(SEISMIC_BUFFER_PROJECTION)]],
+    device const float *convolution [[buffer(SEISMIC_BUFFER_CONVOLUTION)]],
+    device const float *rate [[buffer(SEISMIC_BUFFER_RATE)]],
+    device const float *time_bias [[buffer(SEISMIC_BUFFER_TIME_BIAS)]],
     device const int *segments [[buffer(SEISMIC_BUFFER_SEGMENTS)]],
     device const int *stop [[buffer(SEISMIC_BUFFER_STOP)]],
     device const int *previous_bank [[buffer(SEISMIC_BUFFER_PREVIOUS_BANK)]],
+    device const int *previous_tape [[buffer(SEISMIC_BUFFER_PREVIOUS_TAPE)]],
     device const int *following_bank [[buffer(SEISMIC_BUFFER_FOLLOWING_BANK)]],
     device recurrent::Storage *window [[buffer(SEISMIC_BUFFER_WINDOW)]],
     device float *delta [[buffer(SEISMIC_BUFFER_DELTA)]],
+    device float *tape [[buffer(SEISMIC_BUFFER_TAPE)]],
     device float *inputs [[buffer(SEISMIC_BUFFER_SCRATCH_INPUTS)]],
     device recurrent::Storage *mixed [[buffer(SEISMIC_RESULT_0_BUFFER)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
@@ -185,14 +213,28 @@ kernel void qwen_recurrent_chunk_scan(
     const ulong row0 = block_row0 + ulong(simdgroup) * 16;
     const ulong key_head = recurrent::key_head(head, seismic_words);
     const RchScratch scratch = rch_scratch(inputs, seismic_words);
-    const recurrent::Slot geometry = recurrent::slot_of(segments, stop, previous_bank, following_bank, slot,
-        seismic_words);
+    const recurrent::Slot geometry = recurrent::slot_of(segments, stop, previous_bank, previous_tape,
+        following_bank, slot, seismic_words);
     const ulong source = geometry.source;
     const ulong target = geometry.target;
     // The first row block publishes this head's window channels (for the
-    // state after `stop` rows).
+    // state after `stop` rows, and the tape rows).
     if (group.x == 0)
         recurrent::publish_window(projection, window, geometry, head, thread_index, RCH_THREADS, seismic_words);
+    // Rows [begin, hi) advance row-sequentially (RCH_SEQUENTIAL): the step's
+    // arithmetic, 16 state rows per simdgroup, spans of RCH_PIECE rows in the
+    // piece buffers.
+#define RCH_SEQUENTIAL(begin)                                                                               \
+    recurrent::advance_rows<16, RCH_ROWS, RCH_PIECE, RCH_INPUT_STRIDE, RCH_VALUE_STRIDE>(projection,         \
+        convolution, rate, time_bias, window, delta, tape, mixed, geometry, begin, head, block_row0, row0,   \
+        queries, keys, values, gates, gates + RCH_PIECE, thread_index, RCH_THREADS, simdgroup, lane_index,   \
+        seismic_words)
+    if (geometry.hi - geometry.lo <= RECURRENT_SEQUENTIAL_ROWS) {
+        // A short slot (an MTP verify) is not chunked.
+        RCH_SEQUENTIAL(geometry.lo);
+        rch_zero_tail(mixed, slot, geometry.hi, head, row0, lane, seismic_words);
+        return;
+    }
 
     // This lane's elements of an 8x8 simdgroup matrix: (row, column + e).
     const ushort quad = lane / 4;
@@ -213,6 +255,23 @@ kernel void qwen_recurrent_chunk_scan(
                     ulong2(0), true);
             }
         }
+        // The source version's tape rows, with the step's update: element e of
+        // tile (h, c) is S[row0 + 8h + column + e][8c + row].
+        for (long entry = 0; entry < geometry.taped; ++entry) {
+            device const float *tape_row = recurrent::tape_row(tape, source, entry, seismic_words);
+            const float factor = tape_row[RECURRENT_TAPE_D + head];
+            RECURRENT_UNROLL for (uint h = 0; h < 2; ++h) {
+                RECURRENT_UNROLL for (uint c = 0; c < RCH_TILES; ++c) {
+                    const float key_value = tape_row[RECURRENT_TAPE_K + key_head * width + 8 * c + row];
+                    RECURRENT_UNROLL for (uint e = 0; e < 2; ++e) {
+                        const float innovation = tape_row[RECURRENT_TAPE_U + head * width + row0 + 8 * h + column + e];
+                        state[h][c].thread_elements()[e] *= factor;
+                        state[h][c].thread_elements()[e] = metal::fma(innovation, key_value,
+                            state[h][c].thread_elements()[e]);
+                    }
+                }
+            }
+        }
     }
     if (geometry.stop == 0) {
         RECURRENT_UNROLL for (uint h = 0; h < 2; ++h) {
@@ -226,9 +285,8 @@ kernel void qwen_recurrent_chunk_scan(
     device const float *head_rows = scratch.rows + key_head * scratch.height * RCH_ROW_STRIDE;
     device const float *head_values = scratch.values + head * scratch.height * width + block_row0;
     device const float *head_gates = scratch.gates + head * 2 * scratch.height;
-    const ulong pieces = recurrent::piece_count<RCH_PIECE>(geometry);
     const ulong pieces_before = recurrent::pieces_before<RCH_PIECE>(geometry);
-    for (ulong piece = 0; piece < pieces; ++piece) {
+    for (ulong piece = 0; piece < pieces_before; ++piece) {
         long first;
         long length;
         recurrent::piece_of<RCH_PIECE>(geometry, piece, first, length);
@@ -381,13 +439,11 @@ kernel void qwen_recurrent_chunk_scan(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    // Rows after the last slot belong to no sequence; their output is zero.
-    if (slot + 1 == SEISMIC_DIM_B) {
-        const ulong rows = SEISMIC_DIM_M - ulong(geometry.hi);
-        for (ulong index = lane; index < rows * 16; index += 32) {
-            mixed[(ulong(geometry.hi) + index / 16) * SEISMIC_RESULT_0_STRIDE_0
-                + head * SEISMIC_RESULT_0_STRIDE_1
-                + (row0 + index % 16) * SEISMIC_RESULT_0_STRIDE_2] = element::Act::store(0.0f);
-        }
+    // The rows after the stop row advance row-sequentially from the published
+    // state (their innovations feed the tape).
+    if (geometry.stop < geometry.hi - geometry.lo) {
+        threadgroup_barrier(mem_flags::mem_device);
+        RCH_SEQUENTIAL(geometry.lo + geometry.stop);
     }
+    rch_zero_tail(mixed, slot, geometry.hi, head, row0, lane, seismic_words);
 }

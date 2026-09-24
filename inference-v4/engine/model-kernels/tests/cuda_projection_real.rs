@@ -171,8 +171,9 @@ fn relative(a: &[f64], b: &[f64], reference: &[f64]) -> Error {
     Error { rms: rms / scale, max: max / scale }
 }
 
-fn mapping_label(mapping: Mapping) -> String {
-    format!("{}{}", if mapping.int8 == 1 { "int8" } else { "16-bit" }, if mapping.bm == 128 { " bm128" } else { "" })
+fn mapping_label(mapping: Mapping, rows: usize) -> String {
+    let path = if mapping.quantizes(rows) { "int8" } else { "16-bit" };
+    format!("{path}{}", if rows > GEMV_ROWS && mapping.bm == 128 { " bm128" } else { "" })
 }
 
 #[test]
@@ -202,7 +203,7 @@ fn real_4b_projections_match_their_operand_emulation() {
         let gate = real_weight(&device, gate_format, f, k, &gate_bytes);
         let up = real_weight(&device, up_format, f, k, &up_bytes);
         for outliers in [false, true] {
-            for o in [1usize, 3, 64] {
+            for o in [1usize, 3, 12, 64] {
                 let values = residual(&gguf, o, outliers);
                 let exact = normalized(&values, &norm_values, o, h);
                 let residual_tensor = f32_tensor(&device, &[o as u64, h as u64], &values);
@@ -252,7 +253,7 @@ fn real_4b_projections_match_their_operand_emulation() {
                     println!(
                         "{gate_name} {gate_format:?} outliers={outliers} O={o} {}: device vs exact rms {:.2e} max {:.2e}; \
                          emulation vs exact rms {:.2e} max {:.2e}; device vs emulation rms {:.2e} max {:.2e}",
-                        mapping_label(mapping),
+                        mapping_label(mapping, o),
                         device_error.rms,
                         device_error.max,
                         path_error.rms,
@@ -265,9 +266,9 @@ fn real_4b_projections_match_their_operand_emulation() {
                     // on the 16-bit GEMM the weights' dequantization to bf16
                     // (2^-9 of each weight, not emulated; 1.9-5.0e-3 of the
                     // output RMS on these rows).
-                    let limit = if o > 8 && mapping.int8 == 0 { 8e-3 } else { 1e-3 };
+                    let limit = if o > GEMV_ROWS && mapping.int8 == 0 { 8e-3 } else { 1e-3 };
                     if departure.rms > limit {
-                        failures.push(format!("{gate_name} outliers={outliers} O={o} {}", mapping_label(mapping)));
+                        failures.push(format!("{gate_name} outliers={outliers} O={o} {}", mapping_label(mapping, o)));
                     }
                 }
             }

@@ -199,13 +199,15 @@ fn generated_surface_exposes_planned_and_native_preparation() {
 
 const PARTITIONS: [u64; 3] = [64, 32, 128];
 
-#[cfg(target_os = "macos")]
-fn metal() -> seismic::Device {
+/// Every accelerator this host opens.
+fn accelerators() -> Vec<seismic::Device> {
     let catalog = seismic::DeviceCatalog::discover().unwrap();
-    catalog.open_backend(seismic::BackendName::Metal).unwrap()
+    [seismic::BackendName::Metal, seismic::BackendName::Cuda, seismic::BackendName::Vulkan]
+        .into_iter()
+        .filter_map(|backend| catalog.open_backend(backend).ok())
+        .collect()
 }
 
-#[cfg(target_os = "macos")]
 fn native_shape(device: &seismic::Device, logits: &[f32], rows: usize, vocabulary: usize,
     params: &[f32], history: &[i32], parts: u64) -> Vec<f32> {
     let hn = history.len() / rows;
@@ -215,17 +217,22 @@ fn native_shape(device: &seismic::Device, logits: &[f32], rows: usize, vocabular
     let history = seismic::Tensor::from_host(device, seismic::Element::i32(), &[rows as u64, hn as u64],
         &history.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()).unwrap();
     let mut out = seismic::Tensor::zeros(device, seismic::Element::f32(), &[rows as u64, vocabulary as u64]).unwrap();
-    shape_rows::native_for_device(
-        device,
-        &seismic::NativeSpecialization::new().with_param("PARTS", parts),
-    )
+    // CUDA and Vulkan fix V and Hn statically and take a WIDTH (Metal has
+    // neither).
+    let mut specialization = seismic::NativeSpecialization::new().with_param("PARTS", parts);
+    if device.backend() != seismic::BackendName::Metal {
+        specialization = specialization
+            .with_static("V", vocabulary as u64)
+            .with_static("Hn", hn as u64)
+            .with_param("WIDTH", 256);
+    }
+    shape_rows::native_for_device(device, &specialization)
     .unwrap()
     .call(shape_rows::Args { logits: &logits, params: &params, history: &history, out: &mut out })
     .unwrap();
     out.read_to_host().unwrap().chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
 }
 
-#[cfg(target_os = "macos")]
 fn native_sample(device: &seismic::Device, logits: &[f32], rows: usize, vocabulary: usize, mask: &[u32],
     constrained: &[i32], draws: &[u32], parts: u64) -> Vec<i32> {
     let words = vocabulary.div_ceil(32);
@@ -237,10 +244,11 @@ fn native_sample(device: &seismic::Device, logits: &[f32], rows: usize, vocabula
         &constrained.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()).unwrap();
     let draws = seismic::Tensor::from_host(device, seismic::Element::u32(), &[rows as u64, 6], &u32_bytes(draws)).unwrap();
     let mut result = seismic::Tensor::zeros(device, seismic::Element::i32(), &[rows as u64, 2]).unwrap();
-    sample_rows::native_for_device(
-        device,
-        &seismic::NativeSpecialization::new().with_param("PARTS", parts),
-    )
+    let mut specialization = seismic::NativeSpecialization::new().with_param("PARTS", parts);
+    if device.backend() != seismic::BackendName::Metal {
+        specialization = specialization.with_static("V", vocabulary as u64).with_param("WIDTH", 256);
+    }
+    sample_rows::native_for_device(device, &specialization)
     .unwrap()
     .call(sample_rows::Args { logits: &logits, mask: &mask, constrained: &constrained, draws: &draws, result: &mut result })
     .unwrap();
@@ -343,23 +351,31 @@ fn shaping_reference(logits: &[f32], p: &[f32], history: &[i32]) -> (Vec<f32>, V
     (values, edge)
 }
 
-#[cfg(target_os = "macos")]
 #[test]
-fn native_metal_shaping_matches_the_host_reference() {
-    let device = metal();
+fn native_shaping_matches_the_host_reference() {
+    for device in accelerators() {
+        native_shaping_matches_the_host_reference_on(&device);
+    }
+}
+
+fn native_shaping_matches_the_host_reference_on(device: &seismic::Device) {
     let (logits, params, history) = fixture();
     let expected = host_reference(&logits, &params, &history);
     for parts in PARTITIONS {
-        let actual = native_shape(&device, &logits, ROWS, VOCABULARY, &params, &history, parts);
+        let actual = native_shape(device, &logits, ROWS, VOCABULARY, &params, &history, parts);
         assert_values(&actual, &expected);
     }
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn native_shaping_preserves_cross_partition_cutoff_ties_and_history_counts() {
+    for device in accelerators() {
+        cutoff_ties_and_history_counts_on(&device);
+    }
+}
+
+fn cutoff_ties_and_history_counts_on(device: &seismic::Device) {
     const VOCAB: usize = 513;
-    let device = metal();
     let mut logits = vec![-10.0f32; 2 * VOCAB];
     logits[5] = 4.0;
     logits[300] = 4.0;
@@ -375,7 +391,7 @@ fn native_shaping_preserves_cross_partition_cutoff_ties_and_history_counts() {
     history[VOCAB + 1] = 300;
     history[VOCAB + 2] = 300;
     for parts in PARTITIONS {
-        let actual = native_shape(&device, &logits, 2, VOCAB, &params, &history, parts);
+        let actual = native_shape(device, &logits, 2, VOCAB, &params, &history, parts);
         assert_eq!(actual[5], 4.0);
         assert_eq!(actual[300], f32::NEG_INFINITY);
         assert_eq!(actual[400], f32::NEG_INFINITY);
@@ -386,10 +402,14 @@ fn native_shaping_preserves_cross_partition_cutoff_ties_and_history_counts() {
     }
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn native_shaping_matches_the_ordered_semantics_at_full_vocabulary_for_every_partition_count() {
-    let device = metal();
+    for device in accelerators() {
+        ordered_semantics_at_full_vocabulary_on(&device);
+    }
+}
+
+fn ordered_semantics_at_full_vocabulary_on(device: &seismic::Device) {
     let param_rows: [[f32; 8]; 8] = [
         [0.7, 40.0, 0.9, 0.05, 1.1, 0.2, 0.1, 0.0],
         [1.0, 0.0, 0.5, 0.0, 1.0, 0.0, 0.0, 0.0],
@@ -405,9 +425,9 @@ fn native_shaping_matches_the_ordered_semantics_at_full_vocabulary_for_every_par
     for (vocabulary, quantized) in [(248_320usize, false), (248_320, true), (1000, true), (513, false)] {
         let logits = logits_pattern(rows * vocabulary, vocabulary as u64 + u64::from(quantized), quantized);
         let history = (0..rows * 64).map(|i| if i % 3 == 0 { -1 } else { ((i * 7919) % (vocabulary / 2)) as i32 }).collect::<Vec<_>>();
-        let base = native_shape(&device, &logits, rows, vocabulary, &params, &history, PARTITIONS[0]);
+        let base = native_shape(device, &logits, rows, vocabulary, &params, &history, PARTITIONS[0]);
         for parts in &PARTITIONS[1..] {
-            let other = native_shape(&device, &logits, rows, vocabulary, &params, &history, *parts);
+            let other = native_shape(device,&logits, rows, vocabulary, &params, &history, *parts);
             assert!(other.iter().zip(&base).all(|(a, b)| a.to_bits() == b.to_bits()),
                 "V {vocabulary}: PARTS {parts} changes the result");
         }
@@ -424,26 +444,36 @@ fn native_shaping_matches_the_ordered_semantics_at_full_vocabulary_for_every_par
                 wrong.len(), wrong.iter().take(4).map(|t| (*t, actual[*t], expected[*t])).collect::<Vec<_>>());
         }
     }
-    // Equal logits: the top-p tie rule keeps the lowest indices.
-    for (vocabulary, top_p, kept) in [(1000usize, 0.5f32, 500usize), (248_320, 0.3, 74_496), (1000, 0.0015, 2)] {
+    // Equal logits: the top-p tie rule keeps the lowest indices, exactly as
+    // many as the f64 reference keeps (token t survives while t / V < top_p:
+    // 500, 74,497 and 2 here; 74,496 / 248,320 = 0.3 < 0.3f).
+    for (vocabulary, top_p) in [(1000usize, 0.5f32), (248_320, 0.3), (1000, 0.0015)] {
         let logits = vec![1.5f32; vocabulary];
+        let params = [1.0, 0.0, top_p, 0.0, 1.0, 0.0, 0.0, 0.0];
+        let (reference, _) = shaping_reference(&logits, &params, &[-1; 64]);
+        let kept = (0..vocabulary).filter(|t| reference[*t] > f32::NEG_INFINITY).collect::<Vec<_>>();
+        assert_eq!(kept, (0..kept.len()).collect::<Vec<_>>(), "the reference keeps the lowest indices");
         for parts in PARTITIONS {
-            let out = native_shape(&device, &logits, 1, vocabulary, &[1.0, 0.0, top_p, 0.0, 1.0, 0.0, 0.0, 0.0], &[-1; 64], parts);
+            let out = native_shape(device, &logits, 1, vocabulary, &params, &[-1; 64], parts);
             let survivors = (0..vocabulary).filter(|t| out[*t] > f32::NEG_INFINITY).collect::<Vec<_>>();
-            assert_eq!(survivors, (0..kept).collect::<Vec<_>>(), "V {vocabulary} top-p {top_p} PARTS {parts}");
+            assert_eq!(survivors, kept, "V {vocabulary} top-p {top_p} PARTS {parts}");
         }
     }
     // A NaN row is left unfiltered (sampling reports it).
     let mut logits = logits_pattern(1000, 3, false);
     logits[17] = f32::NAN;
-    let out = native_shape(&device, &logits, 1, 1000, &[1.0, 5.0, 0.5, 0.1, 1.0, 0.0, 0.0, 0.0], &[-1; 64], 64);
+    let out = native_shape(device, &logits, 1, 1000, &[1.0, 5.0, 0.5, 0.1, 1.0, 0.0, 0.0, 0.0], &[-1; 64], 64);
     assert!(out.iter().all(|v| *v != f32::NEG_INFINITY));
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn native_sampling_statuses_ties_masks_and_winners_are_partition_invariant() {
-    let device = metal();
+    for device in accelerators() {
+        sampling_statuses_ties_masks_and_winners_on(&device);
+    }
+}
+
+fn sampling_statuses_ties_masks_and_winners_on(device: &seismic::Device) {
     for vocabulary in [248_320usize, 1000, 513, 33] {
         let rows = 6;
         let words = vocabulary.div_ceil(32);
@@ -476,9 +506,9 @@ fn native_sampling_statuses_ties_masks_and_winners_are_partition_invariant() {
         for row in [0usize, 2, 5] {
             draws[row * 6..row * 6 + 6].copy_from_slice(&[1, 0x1234_5678 + row as u32, 0x9abc_def0, 7 + row as u32, 11, 13]);
         }
-        let base = native_sample(&device, &logits, rows, vocabulary, &mask, &constrained, &draws, PARTITIONS[0]);
+        let base = native_sample(device, &logits, rows, vocabulary, &mask, &constrained, &draws, PARTITIONS[0]);
         for parts in &PARTITIONS[1..] {
-            assert_eq!(native_sample(&device, &logits, rows, vocabulary, &mask, &constrained, &draws, *parts), base,
+            assert_eq!(native_sample(device,&logits, rows, vocabulary, &mask, &constrained, &draws, *parts), base,
                 "V {vocabulary}: PARTS {parts} changes the winners");
         }
         for row in 0..rows {

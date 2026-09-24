@@ -1,8 +1,8 @@
 use super::specialization::Specializer;
 use super::tuning::{
     attention::{
-        AttentionDecodeTuning, AttentionMix, AttentionOutputTuning, AttentionPrefillTuning,
-        AttentionProjectTuning,
+        AttentionDecodeK8V4Tuning, AttentionDecodeTuning, AttentionMix, AttentionOutputTuning,
+        AttentionPrefillK8V4Tuning, AttentionPrefillTuning, AttentionProjectTuning,
     },
     cases::{DenseExpandTuning, DenseOutputTuning},
     readout::{
@@ -21,6 +21,7 @@ use super::tuning::{
 use super::*;
 use crate::ModelLoadPlan;
 use magnitude_model_contracts::WeightScope;
+use magnitude_model_state::KvCodec;
 
 /// The phase-one catalog. Every handle is prepared before qualification and
 /// retained for warm calls; this type has no API capable of preparing again.
@@ -48,7 +49,10 @@ pub(super) struct PreparationInputs<'a> {
 /// when the backend has no implementation, which the specializer records.
 macro_rules! fixed {
     ($spec:expr, $device:expr, $module:ident, $bindings:expr, $elements:expr) => {
-        $spec.fixed::<$module::Entry>(&$bindings, &[], |specialization| {
+        fixed!($spec, $device, $module, $bindings, $elements, statics &[])
+    };
+    ($spec:expr, $device:expr, $module:ident, $bindings:expr, $elements:expr, statics $statics:expr) => {
+        $spec.fixed::<$module::Entry>(&$bindings, $statics, |specialization| {
             $module::native_for_device_with($device, $elements, specialization)
         })?
     };
@@ -197,6 +201,9 @@ struct Preparation<'a> {
     epsilon: f32,
     /// Model width: the static dimension of the feature readout.
     hidden: u64,
+    /// The target's vocabulary: the static dimension of token selection.
+    vocabulary: u64,
+    vision_statics: Option<super::vision::VisionStatics>,
     target: TargetKernels,
     head: Option<HeadKernels>,
     vision: Option<VisionKernels>,
@@ -216,6 +223,12 @@ impl<'a> Preparation<'a> {
             tuner,
             epsilon: tuning.definition.geometry.epsilon as f32,
             hidden: tuning.definition.geometry.hidden,
+            vocabulary: tuning.definition.geometry.vocabulary,
+            vision_statics: tuning
+                .definition
+                .vision
+                .as_ref()
+                .map(|vision| super::vision::VisionStatics::of(&vision.geometry)),
             target: TargetKernels::default(),
             head: plan.head().map(|_| HeadKernels::default()),
             vision: plan.vision().map(|_| VisionKernels::default()),
@@ -248,9 +261,19 @@ impl<'a> Preparation<'a> {
             ))
         };
         Ok(GlueKernels {
-            shape_rows: self.spec.tuned(&mut self.tuner, &ShapeRowsTuning)?,
-            sample_rows: self.spec.tuned(&mut self.tuner, &SampleRowsTuning)?,
-            conditioning_overlay: fixed!(self.spec, device, qwen_conditioning_overlay, "fixed"),
+            shape_rows: self.spec.tuned(
+                &mut self.tuner,
+                &ShapeRowsTuning {
+                    vocabulary: self.vocabulary,
+                },
+            )?,
+            sample_rows: self.spec.tuned(
+                &mut self.tuner,
+                &SampleRowsTuning {
+                    vocabulary: self.vocabulary,
+                },
+            )?,
+            conditioning_overlay: fixed!(self.spec, device, conditioning_overlay, "fixed"),
             copy_rows_f32: copy(&mut self.spec, Element::f32(), "A=f32")?,
             copy_rows_f16: copy(&mut self.spec, Element::f16(), "A=f16")?,
             copy_rows_bf16: copy(&mut self.spec, Element::bf16(), "A=bf16")?,
@@ -263,13 +286,13 @@ impl<'a> Preparation<'a> {
         let spec = &mut self.spec;
         let target = plan.target();
         let b = target.embedding();
-        if let Some(kernel) = spec.fixed::<qwen_embedding_rows::Entry>(
+        if let Some(kernel) = spec.fixed::<embedding_rows::Entry>(
             &format!("{b:?}"),
             &[("D", self.hidden)],
             |specialization| {
-                qwen_embedding_rows::native_for_device_with(
+                embedding_rows::native_for_device_with(
                     device,
-                    qwen_embedding_rows::Elements {
+                    embedding_rows::Elements {
                         EW: b.table,
                         A: b.activation,
                     },
@@ -314,6 +337,7 @@ impl<'a> Preparation<'a> {
                         b.value,
                         b.output,
                         b.activation,
+                        b.history,
                         attention_layers.scopes(b),
                     )? {
                         self.target.attention.insert(b, kernels);
@@ -384,21 +408,21 @@ impl<'a> Preparation<'a> {
         Ok(())
     }
 
-    /// `qwen_features_rows` at this model's width.
+    /// `readout_features_rows` at this model's width.
     fn features(
         &mut self,
         bindings: &str,
         norm: Element,
         activation: Element,
-    ) -> Result<Option<NativeKernel<qwen_features_rows::Entry>>, CatalogFailure> {
+    ) -> Result<Option<NativeKernel<readout_features_rows::Entry>>, CatalogFailure> {
         let device = self.device;
-        self.spec.fixed::<qwen_features_rows::Entry>(
+        self.spec.fixed::<readout_features_rows::Entry>(
             bindings,
             &[("D", self.hidden)],
             |specialization| {
-                qwen_features_rows::native_for_device_with(
+                readout_features_rows::native_for_device_with(
                     device,
-                    qwen_features_rows::Elements {
+                    readout_features_rows::Elements {
                         NW: norm,
                         A: activation,
                     },
@@ -418,6 +442,7 @@ impl<'a> Preparation<'a> {
         value: Element,
         output: Element,
         activation: Element,
+        history: KvCodec,
         scopes: Vec<WeightScope>,
     ) -> Result<Option<AttentionKernels>, CatalogFailure> {
         let project = self.spec.tuned(
@@ -439,12 +464,37 @@ impl<'a> Preparation<'a> {
             scopes: scopes.clone(),
             epsilon: self.epsilon,
         };
-        let decode = self
-            .spec
-            .tuned(&mut self.tuner, &AttentionDecodeTuning(mix()))?;
-        let prefill = self
-            .spec
-            .tuned(&mut self.tuner, &AttentionPrefillTuning(mix()))?;
+        let history = match history {
+            KvCodec::Dense => {
+                let decode = self
+                    .spec
+                    .tuned(&mut self.tuner, &AttentionDecodeTuning(mix()))?;
+                let prefill = self
+                    .spec
+                    .tuned(&mut self.tuner, &AttentionPrefillTuning(mix()))?;
+                decode
+                    .zip(prefill)
+                    .map(|(decode, prefill)| AttentionHistoryKernels::Dense { decode, prefill })
+            }
+            KvCodec::AffineK8V4 => {
+                let decode = self
+                    .spec
+                    .tuned(&mut self.tuner, &AttentionDecodeK8V4Tuning(mix()))?;
+                let prefill = self
+                    .spec
+                    .tuned(&mut self.tuner, &AttentionPrefillK8V4Tuning(mix()))?;
+                decode.zip(prefill).map(|(decode, prefill)| {
+                    AttentionHistoryKernels::AffineK8V4 { decode, prefill }
+                })
+            }
+            KvCodec::RotatedK4V4 => {
+                return Err(CatalogFailure::Preparation {
+                    entry: "qwen_attention_decode",
+                    bindings: format!("{shape:?}"),
+                    outcome: "the native path has no rotated K4/V4 history entries".into(),
+                })
+            }
+        };
         let output = self.spec.tuned(
             &mut self.tuner,
             &AttentionOutputTuning {
@@ -454,11 +504,10 @@ impl<'a> Preparation<'a> {
                 scopes,
             },
         )?;
-        Ok(match (project, decode, prefill, output) {
-            (Some(project), Some(decode), Some(prefill), Some(output)) => Some(AttentionKernels {
+        Ok(match (project, history, output) {
+            (Some(project), Some(history), Some(output)) => Some(AttentionKernels {
                 project,
-                decode,
-                prefill,
+                history,
                 output,
             }),
             _ => None,
@@ -684,6 +733,8 @@ impl<'a> Preparation<'a> {
                 b.value,
                 b.attention_output,
                 b.activation,
+                // The draft head's history is always dense.
+                KvCodec::Dense,
                 layers.scopes(b),
             )?;
             let dense = self.dense(
@@ -716,6 +767,20 @@ impl<'a> Preparation<'a> {
                 head.logits.insert(b, logits);
             }
         }
+        // Token selection over the draft vocabulary.
+        let vocabulary = draft_vocabulary(self.vocabulary);
+        let shape = self
+            .spec
+            .tuned(&mut self.tuner, &ShapeRowsTuning { vocabulary })?;
+        let sample = self
+            .spec
+            .tuned(&mut self.tuner, &SampleRowsTuning { vocabulary })?;
+        let head = self
+            .head
+            .as_mut()
+            .expect("a head plan creates the head group");
+        head.shape = shape;
+        head.sample = sample;
         Ok(())
     }
 
@@ -724,6 +789,9 @@ impl<'a> Preparation<'a> {
             return Ok(());
         };
         let (device, spec) = (self.device, &mut self.spec);
+        let statics = self
+            .vision_statics
+            .expect("a vision plan has a vision definition");
         let vision = self
             .vision
             .as_mut()
@@ -739,8 +807,8 @@ impl<'a> Preparation<'a> {
                 W1: b.temporal_weight_1,
                 B: b.bias,
                 PE: b.position,
-                A: b.activation,
-            }
+            },
+            statics &statics.stem
         ) {
             vision.stem.insert(b, kernel);
         }
@@ -767,18 +835,18 @@ impl<'a> Preparation<'a> {
                     UB: b.up_bias,
                     DW: b.down,
                     DB: b.down_bias,
-                }
+                },
+                statics &statics.block
             ) {
                 vision.blocks.insert(b, kernel);
             }
         }
         let b = vision_plan.merger();
-        let bindings = format!("{b:?}");
         if let Some(kernel) = fixed!(
             spec,
             device,
             qwen_vision_merger,
-            bindings,
+            format!("{b:?}"),
             qwen_vision_merger::Elements {
                 A: b.activation,
                 NW: b.output_norm_weight,
@@ -787,18 +855,10 @@ impl<'a> Preparation<'a> {
                 UB: b.hidden_bias,
                 DW: b.output,
                 DB: b.output_bias,
-            }
+            },
+            statics &statics.merger
         ) {
             vision.merger.insert(b, kernel);
-        }
-        if let Some(kernel) = fixed!(
-            spec,
-            device,
-            qwen_vision_feature_output,
-            bindings,
-            qwen_vision_feature_output::Elements { A: b.activation }
-        ) {
-            vision.output.insert(b, kernel);
         }
         Ok(())
     }

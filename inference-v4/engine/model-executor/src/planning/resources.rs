@@ -1,5 +1,4 @@
-use super::weights::activation_dtype;
-use super::{weight_bytes_by_component, ModelLoadPlan};
+use super::{weight_bytes_by_component, ModelLoadPlan, PlannedMethod};
 use crate::{
     PreparedHeadGraphs, PreparedStateCopyGraphs, PreparedTargetGraphs, PreparedTargetReadoutGraphs,
     PreparedVisionGraphs,
@@ -18,7 +17,6 @@ pub struct RetentionCapacityPlan {
     pub branch_checkpoints: usize,
     pub retained_prefixes: usize,
     pub retained_prefix_bytes: u64,
-    pub retained_method_features: usize,
     pub retained_media_features: usize,
 }
 
@@ -32,6 +30,10 @@ pub struct ResourceLimits {
     /// Maximum physical rows in one launch that require logits projection.
     pub max_projected_rows: usize,
     pub max_images_per_request: usize,
+    /// Queue each continuable target step's successor before the step
+    /// completes (cross-step pipelining): one more target launch in flight
+    /// and one more successor bank per in-flight request.
+    pub lookahead: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,7 +62,6 @@ pub struct ResourceBytes {
     pub vision_weights: u64,
     pub history: u64,
     pub recurrent_banks: u64,
-    pub retained_features: u64,
     /// Fixed native argument/result buffers owned by every attested entry.
     pub prepared_programs: u64,
     pub scratch: u64,
@@ -218,7 +219,6 @@ impl ResourceBytes {
             self.vision_weights,
             self.history,
             self.recurrent_banks,
-            self.retained_features,
             self.prepared_programs,
             self.scratch,
             self.safety_reserve,
@@ -372,7 +372,7 @@ impl ResourcePlan {
             immutable_weights: self.bytes.target_weights
                 + self.bytes.head_weights
                 + self.bytes.vision_weights,
-            state: self.bytes.history + self.bytes.recurrent_banks + self.bytes.retained_features,
+            state: self.bytes.history + self.bytes.recurrent_banks,
             scratch: self.bytes.scratch
                 + self.bytes.prepared_programs
                 + self.qualification_peak_bytes,
@@ -390,6 +390,7 @@ pub struct ResourcePlanner;
 pub struct StateResourcePlan {
     definition: ModelDefinition,
     load: ModelLoadPlan,
+    codec: KvCodec,
     limits: ResourceLimits,
     budget: ResourceBudget,
     capacity: StateCapacityPlan,
@@ -398,7 +399,6 @@ pub struct StateResourcePlan {
     retained_entry_bytes: u64,
     history_bytes: u64,
     recurrent_banks_bytes: u64,
-    retained_features_bytes: u64,
     retention: RetentionCapacityPlan,
 }
 
@@ -420,6 +420,7 @@ impl ResourcePlanner {
     pub fn state_plan(
         definition: &ModelDefinition,
         load: &ModelLoadPlan,
+        method: PlannedMethod,
         codec: KvCodec,
         limits: ResourceLimits,
         budget: ResourceBudget,
@@ -449,6 +450,7 @@ impl ResourcePlanner {
                 .and_then(|_| definition.head.as_ref())
                 .map_or(0, |head| head.depth()),
             codec,
+            method.draft_rows(),
         )?;
         let target_history_row_bytes = history_row_bytes(&layout.target_history)?;
         let head_history_row_bytes = history_row_bytes(&layout.head_history)?;
@@ -467,25 +469,18 @@ impl ResourcePlanner {
             .ok_or("recurrent bank byte count overflow")?;
         let context = usize::try_from(definition.geometry.context_limit)
             .map_err(|_| "context limit exceeds host domain")?;
-        let checkpoint_state_bytes = checkpoint_history_row_bytes
-            .checked_mul(definition.geometry.context_limit)
-            .and_then(|bytes| bytes.checked_add(recurrent_bank_bytes))
-            .ok_or("checkpoint state byte count overflow")?;
-        let activation_bytes =
-            u64::from(activation_dtype(definition.geometry.activation_dtype).bytes());
-        let method_feature_bytes = if load.head.is_some() {
-            definition
-                .geometry
-                .hidden
-                .checked_mul(activation_bytes)
-                .and_then(|row| row.checked_mul(definition.geometry.context_limit))
-                .ok_or("retained method feature byte count overflow")?
+        // Generation methods keep their carried feature rows on the host, so
+        // a retained entry charges only numerical state. Entries on one path
+        // share their history rows (the retention budget prices the retained
+        // set's own bytes), so an entry's marginal state is its recurrent
+        // bank; without recurrent state it is a full context of history.
+        let retained_entry_bytes = if recurrent_bank_bytes != 0 {
+            recurrent_bank_bytes
         } else {
-            0
+            checkpoint_history_row_bytes
+                .checked_mul(definition.geometry.context_limit)
+                .ok_or("checkpoint state byte count overflow")?
         };
-        let retained_entry_bytes = checkpoint_state_bytes
-            .checked_add(method_feature_bytes)
-            .ok_or("retained unit byte count overflow")?;
         let retention_entries = if retained_entry_bytes == 0 {
             0
         } else {
@@ -502,17 +497,32 @@ impl ResourcePlanner {
             branch_checkpoints: limits.branch_checkpoints,
             retained,
             retention_entries,
+            // The history reservation (graphs are sealed over it; backing is
+            // committed on demand): a context for every owner, but never more
+            // rows than the storage budget could ever back.
             history_rows: limits
                 .active_requests
                 .checked_add(limits.in_flight_requests)
                 .and_then(|owners| owners.checked_add(retained))
                 .and_then(|owners| owners.checked_mul(context))
                 .and_then(|rows| rows.checked_add(limits.max_batch_rows))
-                .ok_or("history row capacity overflow")?,
+                .ok_or("history row capacity overflow")?
+                .min(
+                    usize::try_from(
+                        (budget.storage_bytes - budget.safety_reserve_bytes)
+                            / checkpoint_history_row_bytes.max(1),
+                    )
+                    .unwrap_or(usize::MAX),
+                )
+                .max(context),
         };
+        // With lookahead a request has a step and its successor in flight.
         let bank_capacity = BankCapacity {
             active: capacity.active,
-            in_flight: capacity.in_flight,
+            in_flight: capacity
+                .in_flight
+                .checked_mul(1 + usize::from(limits.lookahead))
+                .ok_or("in-flight bank count overflow")?,
             retained: capacity.retained,
         };
         let bank_count = bank_capacity
@@ -539,10 +549,6 @@ impl ResourcePlanner {
                 )
             })
             .transpose()?;
-        let history = target_state
-            .history_bytes
-            .checked_add(head_state.as_ref().map_or(0, |state| state.history_bytes))
-            .ok_or("history allocation byte count overflow")?;
         let planned_recurrent = target_state
             .recurrent_pool_bytes
             .checked_add(
@@ -554,16 +560,22 @@ impl ResourcePlanner {
         if planned_recurrent != recurrent_pool_bytes {
             return Err("state projections disagree on recurrent allocation bytes".into());
         }
-        let retained_features = method_feature_bytes
-            .checked_mul(u64::try_from(retained).map_err(|_| "retained count exceeds u64")?)
-            .ok_or("retained feature allocation byte count overflow")?;
+        // Elastic backing: history commits on demand and banks commit the
+        // zero seed plus a first granule; growth is admitted at run time
+        // against the device limit, not reserved here.
+        let history = 0;
+        let planned_recurrent = recurrent_bank_bytes
+            .checked_mul(
+                u64::try_from(magnitude_model_state::initial_banks(bank_count))
+                    .map_err(|_| "bank count exceeds u64")?,
+            )
+            .ok_or("recurrent allocation byte count overflow")?;
         let retention = RetentionCapacityPlan {
             live_sequences: capacity.active,
             submitted_successors: capacity.in_flight,
             branch_checkpoints: capacity.branch_checkpoints,
             retained_prefixes: capacity.retention_entries,
             retained_prefix_bytes: budget.retention_bytes,
-            retained_method_features: if load.head.is_some() { retained } else { 0 },
             retained_media_features: if load.vision.is_some() {
                 capacity
                     .active
@@ -578,6 +590,7 @@ impl ResourcePlanner {
         Ok(StateResourcePlan {
             definition: definition.clone(),
             load: load.clone(),
+            codec,
             limits,
             budget,
             capacity,
@@ -586,7 +599,6 @@ impl ResourcePlanner {
             retained_entry_bytes,
             history_bytes: history,
             recurrent_banks_bytes: planned_recurrent,
-            retained_features_bytes: retained_features,
             retention,
         })
     }
@@ -613,12 +625,16 @@ impl ResourcePlanner {
             .max()
             .unwrap_or(0);
         let qualification_peak_bytes = qualification_peak.max(source_import_peak);
-        let target_graph =
-            NativeGraphCharge::from_prepared(target_graphs, limits.in_flight_requests)?;
+        // A lookahead is one more target launch in flight.
+        let target_launches = limits
+            .in_flight_requests
+            .checked_add(usize::from(limits.lookahead))
+            .ok_or("target launch count overflow")?;
+        let target_graph = NativeGraphCharge::from_prepared(target_graphs, target_launches)?;
         let target_readout_graph = NativeGraphCharge::from_readout(
             target_readout_graphs,
             limits.active_requests,
-            limits.in_flight_requests,
+            target_launches,
         )?;
         let head_graph = head_graphs
             .map(|graphs| {
@@ -659,7 +675,7 @@ impl ResourcePlanner {
             .ok_or("numerical pool byte count overflow")?;
         let prepared_programs = crate::AttestedPrograms::planned_invocation_workspace_bytes(
             &load
-                .program_plan(definition)
+                .program_plan(definition, state.codec)
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
@@ -670,7 +686,6 @@ impl ResourcePlanner {
             vision_weights,
             history: state.history_bytes,
             recurrent_banks: state.recurrent_banks_bytes,
-            retained_features: state.retained_features_bytes,
             prepared_programs,
             scratch,
             safety_reserve: budget.safety_reserve_bytes,
@@ -678,7 +693,7 @@ impl ResourcePlanner {
         let required = bytes.total()?;
         if std::env::var_os("MAGNITUDE_TRACE_RESOURCES").is_some() {
             eprintln!(
-                "resource plan budget={} required={} qualification_peak={} weights=[{},{},{}] history={} recurrent_banks={} retained_features={} prepared_programs={} scratch={} safety_reserve={} graph=[target:{},readout:{},head:{},vision:{},state:{}]",
+                "resource plan budget={} required={} qualification_peak={} weights=[{},{},{}] history={} recurrent_banks={} prepared_programs={} scratch={} safety_reserve={} graph=[target:{},readout:{},head:{},vision:{},state:{}]",
                 budget.storage_bytes,
                 required,
                 qualification_peak_bytes,
@@ -687,7 +702,6 @@ impl ResourcePlanner {
                 bytes.vision_weights,
                 bytes.history,
                 bytes.recurrent_banks,
-                bytes.retained_features,
                 bytes.prepared_programs,
                 bytes.scratch,
                 bytes.safety_reserve,

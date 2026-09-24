@@ -1,17 +1,19 @@
 // Prefill expert projections over the grouped tables of `qwen_routed_group`.
 // Block b (T tile rows of expert blocks[b]) is covered by ceil(T / BM) GEMM
-// row tiles (BM = TILE_M); blocks of expert -1 exit.
+// row tiles (BM = TILE_M); blocks of expert -1 exit. A block of at most
+// `routed::batched_rows` live rows runs the batched GEMV body instead of the
+// GEMM (`routed::expert_paired` / `expert_plain`).
 //
-// L1 (`qwen_routed_experts_expand`): K1 paired GEMM of the block's expert
-// gate/up rows with a row-gather A loader (tile row t reads normalized row
-// order[b, t]; padding rows read zeros) and the SiLU . mul epilogue into the
-// `product` scratch [B * T, F].
-// L2 (`qwen_routed_experts_down`): K1 GEMM of the block's products against
-// the expert's down rows, published in A.
+// L1 (`qwen_routed_experts_expand`): K1 paired projection of the block's
+// expert gate/up rows with a row-gather A loader (tile row t reads normalized
+// row order[b, t]; padding rows read zeros) and the SiLU . mul epilogue into
+// the `product` scratch [B * T, F].
+// L2 (`qwen_routed_experts_down`): K1 projection of the block's products
+// against the expert's down rows, published in A.
 
-#define ROUTED_W0 SEISMIC_EXPERT_GATE
-#define ROUTED_W1 SEISMIC_EXPERT_UP
-#define ROUTED_W2 SEISMIC_EXPERT_DOWN
+#define KERNEL_W0 SEISMIC_EXPERT_GATE
+#define KERNEL_W1 SEISMIC_EXPERT_UP
+#define KERNEL_W2 SEISMIC_EXPERT_DOWN
 #include "common/routed.h"
 
 kernel void qwen_routed_experts_expand(
@@ -35,18 +37,18 @@ kernel void qwen_routed_experts_expand(
     const uint tm = uint(group.y % subtiles);
     const int expert = blocks[block * SEISMIC_BLOCKS_STRIDE_0];
     if (expert < 0) return;
-    const routed::input_grouped in{normalized, SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1,
+    const routed::Grouped in{normalized, SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1,
         uint(SEISMIC_DIM_H), order + block * SEISMIC_ORDER_STRIDE_0, SEISMIC_ORDER_STRIDE_1};
-    const auto gate = routed::rows_from<routed::W0>(expert_gate, ROUTED_W0_LAYOUT(SEISMIC_DIM_H),
-        ulong(expert) * SEISMIC_DIM_F, SEISMIC_DIM_H);
-    const auto up = routed::rows_from<routed::W1>(expert_up, ROUTED_W1_LAYOUT(SEISMIC_DIM_H),
-        ulong(expert) * SEISMIC_DIM_F, SEISMIC_DIM_H);
-    const projection::output_paired<A> out{product + block * SEISMIC_DIM_T * SEISMIC_DIM_F * A::bytes,
+    const auto gate = routed::weights<packets::W0>(expert_gate, KERNEL_W0_LAYOUT(SEISMIC_DIM_H),
+        routed::expert_row(ulong(expert), SEISMIC_DIM_F), SEISMIC_DIM_H);
+    const auto up = routed::weights<packets::W1>(expert_up, KERNEL_W1_LAYOUT(SEISMIC_DIM_H),
+        routed::expert_row(ulong(expert), SEISMIC_DIM_F), SEISMIC_DIM_H);
+    const projection::SiluMul<A> out{product + block * SEISMIC_DIM_T * SEISMIC_DIM_F * A::bytes,
         SEISMIC_DIM_F, 1};
     const uint live = routed::block_rows(order + block * SEISMIC_ORDER_STRIDE_0, SEISMIC_ORDER_STRIDE_1,
         uint(SEISMIC_DIM_T));
-    projection::gemm_paired<routed::W0, routed::W1, BM, BN>(in, out, gate, up, uint(SEISMIC_DIM_T),
-        uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tm, tn, tile_memory, sg, lane, live);
+    routed::expert_paired<packets::W0, packets::W1, BM, BN>(in, out, gate, up, live, uint(SEISMIC_DIM_T),
+        uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tm, tn, tile_memory, sg, lane);
 }
 
 kernel void qwen_routed_experts_down(
@@ -70,12 +72,12 @@ kernel void qwen_routed_experts_down(
     if (expert < 0) return;
     const auto in = routed::activation(product + block * SEISMIC_DIM_T * SEISMIC_DIM_F * A::bytes,
         SEISMIC_DIM_F, 1, uint(SEISMIC_DIM_F));
-    const auto down = routed::rows_from<routed::W2>(expert_down, ROUTED_W2_LAYOUT(SEISMIC_DIM_F),
-        ulong(expert) * SEISMIC_DIM_H, SEISMIC_DIM_F);
-    const projection::output_plain<A> out{output + block * SEISMIC_RESULT_0_STRIDE_0 * A::bytes,
+    const auto down = routed::weights<packets::W2>(expert_down, KERNEL_W2_LAYOUT(SEISMIC_DIM_F),
+        routed::expert_row(ulong(expert), SEISMIC_DIM_H), SEISMIC_DIM_F);
+    const projection::Store<A> out{output + block * SEISMIC_RESULT_0_STRIDE_0 * A::bytes,
         SEISMIC_RESULT_0_STRIDE_1, SEISMIC_RESULT_0_STRIDE_2, 0};
     const uint live = routed::block_rows(order + block * SEISMIC_ORDER_STRIDE_0, SEISMIC_ORDER_STRIDE_1,
         uint(SEISMIC_DIM_T));
-    projection::gemm<routed::W2, BM, BN>(in, out, down, uint(SEISMIC_DIM_T), uint(SEISMIC_DIM_H),
-        uint(SEISMIC_DIM_F), tm, group.x, tile_memory, sg, lane, live);
+    routed::expert_plain<packets::W2, BM, BN>(in, out, down, live, uint(SEISMIC_DIM_T), uint(SEISMIC_DIM_H),
+        uint(SEISMIC_DIM_F), tm, group.x, tile_memory, sg, lane);
 }

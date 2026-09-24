@@ -77,8 +77,7 @@ record carries an explicit `compile_metric` explaining this distinction.
 
 ## Reproduction
 
-Use an existing environment with MLX, MLX-LM, and NumPy. On `m4-pro-01` the
-environment is `/Users/ec2-user/magnitude-mlx/inference-v2/.venv/bin/python`.
+Use a Python environment with MLX, MLX-LM, and NumPy on an Apple silicon Mac.
 Run from the experiment scratch directory so the default `qwen-data` path
 resolves, or set `QWEN_FEEDBACK_DATA` explicitly.
 

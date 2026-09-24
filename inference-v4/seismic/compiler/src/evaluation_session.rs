@@ -414,10 +414,12 @@ where
 
         let (precision, target_domain, constants) = self.domain.numerical_context();
         let implementation = realized.reconciled().clone();
-        let safe_guard = self
-            .domain
-            .arena_mut()
-            .all(&[checked.constraint(), implementation.hard_constraints()]);
+        let fixed = crate::frozen::plan_assignment(&self.domain.arena(), &constants, &implementation);
+        let safe_guard = {
+            let mut arena = self.domain.arena_mut();
+            let guard = arena.all(&[checked.constraint(), implementation.hard_constraints()]);
+            arena.partial(guard, &fixed)
+        };
         if checked.is_universal() {
             validate_universal_implementation(
                 &implementation,
@@ -435,7 +437,7 @@ where
                 constants,
             };
             crate::executable::compile_variant(
-                freeze(&context, implementation.clone(), safe_guard),
+                freeze(&context, implementation.clone(), fixed, safe_guard),
             )
         };
         let admission_policy = if checked.is_universal() { &seismic_lang::precision::PrecisionPolicy::Exact } else { &precision };

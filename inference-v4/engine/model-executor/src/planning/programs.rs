@@ -8,6 +8,7 @@ use super::{
     VisionMergerBinding, VisionPatchBinding, WeightPlan,
 };
 use crate::error::PlanError;
+use magnitude_model_state::KvCodec;
 use magnitude_model_contracts::{
     AttentionGeometry, FeedForwardGeometry, MixerGeometry, ModelDefinition, RotarySemantics,
 };
@@ -272,6 +273,7 @@ pub(super) fn derive_program_plan(
     target: &[WeightPlan],
     head: Option<&[WeightPlan]>,
     vision: Option<&[WeightPlan]>,
+    history: KvCodec,
 ) -> Result<ProgramPlan, PlanError> {
     let lookup = |weights: &[WeightPlan], scope, kind| {
         planned_element(weights, scope, kind).map_err(PlanError::InvalidDefinition)
@@ -324,6 +326,7 @@ pub(super) fn derive_program_plan(
                 value: lookup(target, scope, WeightKind::Value)?,
                 output: lookup(target, scope, WeightKind::AttentionOutput)?,
                 activation: active_element,
+                history,
             }),
             MixerWeights::Recurrent(_) => {
                 let Some(MixerGeometry::Recurrent(geometry)) = definition
@@ -464,7 +467,6 @@ pub(super) fn derive_program_plan(
                 )?,
                 bias: lookup(weights, WeightScope::Vision, WeightKind::PatchBias)?,
                 position: lookup(weights, WeightScope::Vision, WeightKind::PositionEmbedding)?,
-                activation: active,
             };
             let mut slots = Vec::with_capacity(description.blocks.len());
             for index in 0..description.blocks.len() {

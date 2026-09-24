@@ -48,6 +48,11 @@ type MetalBoundWorkflow = driver::BoundWorkflowGraph<seismic_metal::Metal, Metal
 #[cfg(target_os = "macos")]
 type MetalAdmittedRun = crate::execution::AdmittedRun<seismic_metal::Metal, MetalExecutor>;
 
+#[cfg(not(target_os = "macos"))]
+mod vulkan;
+#[cfg(not(target_os = "macos"))]
+pub(crate) use vulkan::{vulkan_buffer, VulkanOpened};
+
 type CudaExecutor = seismic_cuda::Executor;
 pub(crate) type CudaOpened = Opened<seismic_cuda::Cuda, CudaExecutor>;
 type CudaPrepared = PreparedHandle<seismic_cuda::Cuda, CudaExecutor>;
@@ -67,6 +72,8 @@ pub(crate) enum Descriptor {
         ordinal: u32,
         uuid: [u8; 16],
     },
+    #[cfg(not(target_os = "macos"))]
+    Vulkan { uuid: [u8; 16] },
 }
 
 /// One backend device as enumerated, before the catalog assigns snapshot
@@ -107,6 +114,9 @@ pub(crate) enum OpenedKind {
     #[cfg(target_os = "macos")]
     Metal(Arc<MetalOpened>),
     Cuda(Arc<CudaOpened>),
+    /// Native-only: no planned route (Vulkan backend spec §9).
+    #[cfg(not(target_os = "macos"))]
+    Vulkan(Arc<VulkanOpened>),
 }
 
 #[derive(Clone)]
@@ -371,9 +381,17 @@ pub(crate) fn discover() -> BackendDiscovery {
         }
     }
 
-    // `vulkan` is a registered backend name (native declarations may target
-    // it), but no Vulkan runtime is built yet: a request for it is answered
-    // by this diagnostic instead of an empty result.
+    #[cfg(not(target_os = "macos"))]
+    match seismic_vulkan::discover() {
+        Err(error) => diagnostics.push(DiscoveryDiagnostic {
+            backend: BackendName::Vulkan,
+            message: error.to_string(),
+        }),
+        Ok(descriptions) => devices.extend(descriptions.into_iter().map(vulkan::discovered)),
+    }
+    // Vulkan is not built on macOS (MoltenVK is not supported): a request
+    // for it is answered by this diagnostic instead of an empty result.
+    #[cfg(target_os = "macos")]
     diagnostics.push(DiscoveryDiagnostic {
         backend: BackendName::Vulkan,
         message: "this build has no Vulkan runtime".into(),
@@ -444,6 +462,8 @@ pub(crate) fn open(
                 memory,
             )))
         }
+        #[cfg(not(target_os = "macos"))]
+        Descriptor::Vulkan { uuid } => OpenedKind::Vulkan(Arc::new(VulkanOpened::open(*uuid, &info, memory)?)),
     };
     Ok(Arc::new(DeviceInner {
         info,
@@ -483,6 +503,14 @@ impl OpenedKind {
                     total_bytes: info.total_bytes,
                 }
             }
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(device) => {
+                let budget = device.service().memory_budget();
+                DeviceMeasurements::Vulkan {
+                    heap_budget_bytes: budget.heap_budget_bytes,
+                    heap_usage_bytes: budget.heap_usage_bytes,
+                }
+            }
         };
         Ok(DeviceMemoryStatus {
             sampled_at: std::time::SystemTime::now(),
@@ -490,8 +518,8 @@ impl OpenedKind {
         })
     }
 
-    pub(crate) fn workflow(&self) -> WorkflowDraftKind {
-        match self {
+    pub(crate) fn workflow(&self) -> Result<WorkflowDraftKind, WorkflowError> {
+        Ok(match self {
             Self::Cpu(device) => {
                 WorkflowDraftKind::Cpu(driver::WorkflowGraphDraft::new(device.clone()))
             }
@@ -502,14 +530,23 @@ impl OpenedKind {
             Self::Cuda(device) => {
                 WorkflowDraftKind::Cuda(driver::WorkflowGraphDraft::new(device.clone()))
             }
-        }
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(_) => {
+                return Err(WorkflowError::PlannedRouteUnavailable {
+                    backend: seismic_lang::registry::BackendName::Vulkan,
+                })
+            }
+        })
     }
+    /// Portable capability namespaces; a native-only backend has none.
     pub(crate) fn capabilities(&self) -> Vec<String> {
         match self {
             Self::Cpu(device) => driver::opened_capability_summaries(device),
             #[cfg(target_os = "macos")]
             Self::Metal(device) => driver::opened_capability_summaries(device),
             Self::Cuda(device) => driver::opened_capability_summaries(device),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(_) => Vec::new(),
         }
     }
 
@@ -519,6 +556,8 @@ impl OpenedKind {
             #[cfg(target_os = "macos")]
             Self::Metal(device) => device.memory_usage(),
             Self::Cuda(device) => device.memory_usage(),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(device) => device.memory_usage(),
         }
     }
 
@@ -531,6 +570,8 @@ impl OpenedKind {
             #[cfg(target_os = "macos")]
             Self::Metal(device) => device.set_memory_limit(limit),
             Self::Cuda(device) => device.set_memory_limit(limit),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(device) => device.set_memory_limit(limit),
         }
     }
 
@@ -540,6 +581,8 @@ impl OpenedKind {
             #[cfg(target_os = "macos")]
             Self::Metal(device) => device.identity(),
             Self::Cuda(device) => device.identity(),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(device) => device.identity(),
         }
     }
 
@@ -577,6 +620,9 @@ impl OpenedKind {
                     facts.compute_capability, facts.multiprocessors, facts.driver_api
                 )
             }
+            // A driver update changes the key (§7.5).
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(device) => device.service().facts().tuning_identity(),
         }
     }
 
@@ -608,6 +654,12 @@ impl OpenedKind {
                         .representations
                         .contains(&representation)
             }
+            // Direct native kernels own raw storage, as on Metal.
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(_) => {
+                let _ = seismic_lang::registry::representation_info(representation);
+                true
+            }
         }
     }
 
@@ -621,13 +673,16 @@ impl OpenedKind {
             #[cfg(target_os = "macos")]
             Self::Metal(device) => device.allocate_storage(bytes, alignment),
             Self::Cuda(device) => device.allocate_storage(bytes, alignment),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(device) => device.allocate(bytes, alignment),
         }
     }
 
     /// Storage for inputs the host writes before each submission. Host
     /// writes to it are plain memory writes that never wait for queued
     /// device work: CPU and Metal storage is host-visible already, CUDA uses
-    /// mapped pinned host memory.
+    /// mapped pinned host memory, Vulkan persistently mapped host-visible
+    /// memory (device-local with ReBAR or unified memory).
     pub(crate) fn allocate_upload(
         &self,
         bytes: u64,
@@ -642,7 +697,68 @@ impl OpenedKind {
                     service.allocate_mapped(bytes)
                 })
             }
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(device) => device.allocate_upload(bytes, alignment),
         }
+    }
+
+    /// Zero-filled storage of a reserved tensor: `committed` bytes backed of
+    /// a `reserved`-byte logical length. CUDA with virtual memory management
+    /// reserves the whole address range, so [`OpenedKind::recommit_in_place`]
+    /// keeps its address; elsewhere only the committed bytes are allocated
+    /// and recommitting reallocates.
+    pub(crate) fn allocate_reserved_tensor(
+        &self,
+        committed: u64,
+        reserved: u64,
+        alignment: u64,
+    ) -> Result<Arc<driver::Allocation>, ExecutionError> {
+        if let Self::Cuda(device) = self {
+            if device.service().supports_reservation() {
+                return device.allocate_storage_with(committed, alignment, |service| {
+                    service.allocate_reserved(committed, reserved)
+                });
+            }
+        }
+        let allocation = self.allocate(committed, alignment)?;
+        driver::write_zeros(allocation.storage(), committed)?;
+        Ok(allocation)
+    }
+
+    /// Whether `allocation` is a reserved address range the backend resizes
+    /// in place (CUDA virtual memory management).
+    pub(crate) fn reserves_address(&self, allocation: &Arc<driver::Allocation>) -> bool {
+        let Self::Cuda(_) = self else {
+            return false;
+        };
+        driver::typed_buffer::<seismic_cuda::Cuda, seismic_cuda::Executor>(allocation).is_reserved()
+    }
+
+    /// The storage of `allocation`'s reserved tensor with `committed` bytes
+    /// backed, resized in place when the backend reserved its address range
+    /// (the new allocation shares the address and the kept bytes; bytes past
+    /// the old commitment are zero). It first waits for every device use of
+    /// `allocation`, so a shrink never releases bytes in use. `None` when
+    /// the storage has to be reallocated.
+    pub(crate) fn recommit_in_place(
+        &self,
+        allocation: &Arc<driver::Allocation>,
+        committed: u64,
+        alignment: u64,
+    ) -> Result<Option<Arc<driver::Allocation>>, ExecutionError> {
+        let Self::Cuda(device) = self else {
+            return Ok(None);
+        };
+        let buffer = driver::typed_buffer::<seismic_cuda::Cuda, seismic_cuda::Executor>(allocation);
+        if !buffer.is_reserved() {
+            return Ok(None);
+        }
+        let _exclusive = allocation.acquire(true);
+        device
+            .allocate_storage_with(committed, alignment, |service| {
+                service.recommit(buffer, committed)
+            })
+            .map(Some)
     }
 
     pub(crate) fn prepare(
@@ -691,6 +807,8 @@ impl OpenedKind {
                 options,
             )
             .map(PreparedKind::Cuda),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(_) => Err(planned_route_unavailable()),
         }
     }
 
@@ -741,8 +859,21 @@ impl OpenedKind {
                 options,
             )
             .map(|(campaign, kernel)| (FeedbackKind::Cuda(campaign), PreparedKind::Cuda(kernel))),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(_) => Err(planned_route_unavailable()),
         }
     }
+}
+
+/// The typed preparation-time refusal of planned operations on a
+/// native-only backend (§9.2).
+#[cfg(not(target_os = "macos"))]
+fn planned_route_unavailable() -> crate::api::kernel::PrepareError {
+    crate::api::kernel::PrepareError::Preparation(
+        seismic_compiler::errors::PreparationError::PlannedRouteUnavailable {
+            backend: seismic_lang::registry::BackendName::Vulkan,
+        },
+    )
 }
 
 fn prepare<T, E, C>(

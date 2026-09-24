@@ -9,7 +9,8 @@
 //     among equal keys by token index. Masses are exp(v - max) in 2^-32
 //     fixed point, so every sum is order-independent and exact.
 //   shape_rows_apply (PARTS x Sx): writes -inf over every removed token.
-// A zero temperature leaves the penalized values unshaped.
+// A zero temperature leaves the penalized values unshaped, as does a tempered
+// NaN or +inf anywhere in the row.
 
 typedef unsigned int u32;
 typedef unsigned long long u64;
@@ -34,6 +35,39 @@ __device__ __forceinline__ float key_value(u32 key) {
     return __uint_as_float((key & 0x80000000u) != 0 ? key ^ 0x80000000u : ~key);
 }
 __device__ __forceinline__ bool finite(float value) { return value > -INF && value < INF; }
+
+// Partition "maximum" of a partition holding NaN or +inf, above every finite
+// key: the row is left unshaped (sampling reports it).
+#define UNSHAPED 0xFFFFFFFFu
+
+// ceil(top_p * total) exactly: top_p = m * 2^-shift (m a 24-bit integer), so
+// the product is a 128-bit integer shifted right with rounding up. A token
+// survives top-p when the mass before it is below this target (the portable
+// `preceding < top_p`).
+__device__ u64 top_p_target(float top_p, u64 total) {
+    if (!(top_p > 0.0f) || total == 0)
+        return 0;
+    const u32 bits = __float_as_uint(top_p);
+    const u32 biased = bits >> 23;
+    const u64 m = biased == 0 ? (u64)(bits & 0x7FFFFFu) : (u64)((bits & 0x7FFFFFu) | 0x800000u);
+    const int shift = biased == 0 ? 149 : 150 - (int)biased;
+    const u64 low = m * total;
+    const u64 high = __umul64hi(m, total);
+    if (shift <= 0)
+        return low << -shift;
+    if (shift >= 128)
+        return 1;
+    u64 quotient;
+    bool remainder;
+    if (shift >= 64) {
+        quotient = shift == 64 ? high : high >> (shift - 64);
+        remainder = low != 0 || (shift > 64 && (high & ((1ull << (shift - 64)) - 1)) != 0);
+    } else {
+        quotient = (low >> shift) | (high << (64 - shift));
+        remainder = (low & ((1ull << shift) - 1)) != 0;
+    }
+    return quotient + (remainder ? 1 : 0);
+}
 
 // Strides may be argument words, which only kernel bodies can read.
 #define parameter(params, row, index) (params)[(row) * SEISMIC_PARAMS_STRIDE_0 + (index) * SEISMIC_PARAMS_STRIDE_1]
@@ -83,6 +117,8 @@ extern "C" __global__ void shape_rows_prepare(SEISMIC_KERNEL_PARAMS) {
         out[row * SEISMIC_OUT_STRIDE_0 + token * SEISMIC_OUT_STRIDE_1] = value;
         if (finite(value))
             maximum = max(maximum, ordered_key(value));
+        else if (value != -INF)
+            maximum = UNSHAPED;
     }
     maximum = seismic_redux_max_u32(maximum);
     if (threadIdx.x % 32 == 0)
@@ -212,6 +248,11 @@ extern "C" __global__ void shape_rows_select(SEISMIC_KERNEL_PARAMS) {
     u32 maximum = 0u;
     for (u64 part = 0; part < SEISMIC_TUNE_PARTS; ++part)
         maximum = max(maximum, scratch[part]);
+    if (maximum == UNSHAPED) {
+        if (threadIdx.x == 0)
+            selection->maximum = UNSHAPED;
+        return;
+    }
     Survivor survivor{out + row * SEISMIC_OUT_STRIDE_0, SEISMIC_OUT_STRIDE_1, key_value(maximum), 0u, 0.0f};
     u32 top_k_key = 0u;
     u64 above;
@@ -239,7 +280,7 @@ extern "C" __global__ void shape_rows_select(SEISMIC_KERNEL_PARAMS) {
         total = 0;
         for (u32 w = 0; w < blockDim.x / 32; ++w)
             total += reduce[w];
-        const u64 target = (u64)ceil((double)top_p * (double)total);
+        const u64 target = top_p_target(top_p, total);
         if (target == 0) {
             mode = 2u;
         } else {
@@ -299,6 +340,8 @@ extern "C" __global__ void shape_rows_apply(SEISMIC_KERNEL_PARAMS) {
         return;
     const Selection selection =
         *reinterpret_cast<const Selection *>(row_scratch(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATE), row) + SEISMIC_TUNE_PARTS);
+    if (selection.maximum == UNSHAPED)
+        return;
     const float maximum = key_value(selection.maximum);
     const float min_p = parameter(params, row, 3);
     for (u64 token = slice_begin(part) + threadIdx.x; token < slice_end(part); token += blockDim.x) {

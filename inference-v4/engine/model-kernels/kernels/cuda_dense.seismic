@@ -1,57 +1,64 @@
 # CUDA implementations of the dense feed-forward entries (K1 projection
 # family, `cuda/common/projection.cuh`) over the O `out_rows` rows.
 #
-# Every K1 CUDA entry has two operand paths: the 16-bit path (the A-rounded
-# activation in bf16/f16 MMAs against exact codes in the GEMV and weights
-# dequantized to A in the GEMM) and the INT8 candidate (arithmetic INT8 = 1:
-# activations quantized per 32 codes as q8_1 does, s8 MMAs); the tuner keeps
-# INT8 only where it is faster within tolerance. On the 16-bit path each GEMV
-# block forms the prologue's A rows in its shared memory (`shared_bytes`); a
-# staging launch forms the prologue's rows first for the 16-bit GEMM of a
-# normalized input (A rows) and for INT8 (q8_1 rows plus (d, d * sum q)
-# groups). Then exactly one of the GEMV (rows <= 8; `min(1, 16 / (O + 8))` is
-# 1 exactly then) and the GEMM runs. GEMV: 8 warps per block in groups of
-# KSPLIT that split K and reduce in part order. GEMM: BM activation rows per
-# 128-row block tile (BM 64: 3 cp.async stages, BM 128: 2). Small-N entries
-# also split the GEMM over K (arithmetic SPLIT): SPLIT shares write partials
-# that the finalize launch sums in part order before the epilogue.
+# Every K1 CUDA entry runs the GEMV to 16 rows and the GEMM beyond. The GEMV
+# is the 16-bit path (the A-rounded activation in bf16/f16 MMAs against exact
+# codes, rows independent of O, so each row matches O = 1 bit for bit): `gemv`
+# to 8 rows, `gemv16` (two 8-row column blocks) from 9 to 16. The GEMM has two
+# operand paths: the 16-bit path (weights dequantized to A) and the INT8
+# candidate (arithmetic INT8 = 1: activations quantized per 32 codes as q8_1
+# does, s8 MMAs); the tuner keeps INT8 only where it is faster within
+# tolerance. The staging launch forms the rows a launch does not read in
+# place: a normalized input's A rows (at O = 1 the GEMV block forms its row in
+# its shared memory instead), or the INT8 GEMM's q8_1 rows plus (d, d * sum q)
+# groups. GEMV: 8 warps per block in groups of KSPLIT that split K and reduce
+# in part order. GEMM: BM activation rows per 128-row block tile (BM 64: 3
+# cp.async stages, BM 128: 2). Small-N entries also split the GEMM over K
+# (arithmetic SPLIT): SPLIT shares write partials that the finalize launch
+# sums in part order before the epilogue.
 
 native qwen_dense_expand for cuda from "cuda/qwen_dense_expand.cu":
     static (H, F)
     params (arithmetic KSPLIT in [4, 2, 8], BM in [64, 128], arithmetic INT8 in [0, 1])
     where H % 64 == 0
-    scratch staged bytes (O * H * 2)
-    scratch groups bytes (INT8 * O * H / 4)
-    launch qwen_dense_expand_stage:
-        threadgroups (max(INT8, 1 - min(1, 16 / (O + 8))) * O, 1, 1)
+    scratch staged bytes (O * H * 2) when O > 1
+    scratch groups bytes (O * H / 4) when INT8 == 1 and O > 16
+    launch qwen_dense_expand_stage when O > 1:
+        threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_dense_expand_gemv:
-        threadgroups (min(1, 16 / (O + 8)) * ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1, 1)
+    launch qwen_dense_expand_gemv when O <= 8:
+        threadgroups (ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes ((1 - INT8) * min(O, 8) * H * 2)
-    launch qwen_dense_expand_gemm:
-        threadgroups ((1 - min(1, 16 / (O + 8))) * ceil_div(ceil_div(F, 16), 8), ceil_div(O, BM), 1)
+        shared_bytes ((1 - min(1, O - 1)) * H * 2)
+    launch qwen_dense_expand_gemv16 when O > 8 and O <= 16:
+        threadgroups (ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes ((4 - BM / 64) * (BM * (144 - 48 * INT8) + 2 * 10240) + 2 * 4096)
+    launch qwen_dense_expand_gemm when O > 16:
+        threadgroups (ceil_div(ceil_div(F, 16), 8), ceil_div(O, BM), 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((4 - BM / 64) * (BM * 144 + 2 * 10240) + 2 * 4096)
 
 native qwen_dense_output for cuda from "cuda/qwen_dense_output.cu":
     static (H, F)
     params (arithmetic KSPLIT in [4, 2, 8], BM in [64, 128], arithmetic INT8 in [0, 1],
             arithmetic SPLIT in [1, 2])
     where F % 64 == 0
-    scratch staged bytes (INT8 * O * F)
-    scratch groups bytes (INT8 * O * F / 4)
-    scratch partials bytes (min(SPLIT - 1, 1) * SPLIT * O * H * 4)
-    launch qwen_dense_output_stage:
-        threadgroups (INT8 * O, 1, 1)
+    scratch staged bytes (O * F) when INT8 == 1 and O > 16
+    scratch groups bytes (O * F / 4) when INT8 == 1 and O > 16
+    scratch partials bytes (SPLIT * O * H * 4) when SPLIT > 1 and O > 16
+    launch qwen_dense_output_stage when INT8 == 1 and O > 16:
+        threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_dense_output_gemv:
-        threadgroups (min(1, 16 / (O + 8)) * ceil_div(ceil_div(H, 16), 8 / KSPLIT), 1, 1)
+    launch qwen_dense_output_gemv when O <= 8:
+        threadgroups (ceil_div(ceil_div(H, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_dense_output_gemm:
-        threadgroups ((1 - min(1, 16 / (O + 8))) * ceil_div(ceil_div(H, 16), 8), ceil_div(O, BM), SPLIT)
+    launch qwen_dense_output_gemv16 when O > 8 and O <= 16:
+        threadgroups (ceil_div(ceil_div(H, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes ((4 - BM / 64) * (BM * (144 - 48 * INT8) + 10240) + 4096)
-    launch qwen_dense_output_finalize:
-        threadgroups ((1 - min(1, 16 / (O + 8))) * min(SPLIT - 1, 1) * ceil_div(O * H, 256), 1, 1)
+    launch qwen_dense_output_gemm when O > 16:
+        threadgroups (ceil_div(ceil_div(H, 16), 8), ceil_div(O, BM), SPLIT)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((4 - BM / 64) * (BM * 144 + 10240) + 4096)
+    launch qwen_dense_output_finalize when SPLIT > 1 and O > 16:
+        threadgroups (ceil_div(O * H, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)

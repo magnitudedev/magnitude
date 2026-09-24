@@ -12,6 +12,32 @@ pub trait ProgramSubmission {
     fn finish(self) -> Result<Self::CompletedWork, DeviceError>;
 }
 
+/// A target submission's launch and outputs, readable while it executes: a
+/// following step is formed from the launch's advances and binds its
+/// selection before this one completes.
+pub trait SubmittedTarget {
+    fn launch(&self) -> &crate::TargetLaunchCore;
+    fn output(&self) -> &crate::TargetOutput;
+}
+
+impl<S> SubmittedTarget for DeviceSubmission<crate::TargetLaunchCore, S, crate::TargetOutput> {
+    fn launch(&self) -> &crate::TargetLaunchCore {
+        &self.launch
+    }
+    fn output(&self) -> &crate::TargetOutput {
+        &self.output
+    }
+}
+
+impl<S> SubmittedTarget for ReadySubmission<crate::TargetLaunchCore, S, crate::TargetOutput> {
+    fn launch(&self) -> &crate::TargetLaunchCore {
+        &self.launch
+    }
+    fn output(&self) -> &crate::TargetOutput {
+        &self.output
+    }
+}
+
 /// Physical output plus the launch's owned reconciliation payload. The launch
 /// remains unavailable to callers until `finish` consumes its submission.
 pub struct CompletedWork<L, O> {

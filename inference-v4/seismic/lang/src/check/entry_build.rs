@@ -1419,8 +1419,23 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                     path.iter().map(|p| *p as usize).collect(), ordinal))
             })
             .collect::<Vec<_>>();
+        // A shape dimension is a semantic parameter too: the contract's
+        // dimension symbol is that parameter's value, so an application binds
+        // it from the call's actual dimension argument like any integer.
+        let dimensions = parameters
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| matches!(p.origin, FunctionParameterOrigin::ShapeDimension { .. }))
+            .map(|(ordinal, p)| {
+                let value = self.runtime_int(p.value);
+                let crate::expr::NodeView::Symbol(symbol) = self.builder.arena.view(AnyExpr::Int(value)) else {
+                    unreachable!("a shape dimension parameter is its runtime value")
+                };
+                (symbol, ordinal)
+            })
+            .collect::<Vec<_>>();
         let symbols = &self.symbols;
-        let initialization = self.definition.initialization.remap(
+        let mut initialization = self.definition.initialization.remap(
             &self.definition.arena,
             &mut self.builder.arena,
             &leaves,
@@ -1432,6 +1447,9 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 )
             },
         );
+        for (symbol, ordinal) in dimensions {
+            initialization.bind_integer_parameter(symbol, ordinal);
+        }
         let values = std::mem::take(&mut self.values);
         Ok(SemanticFunction::new(
             crate::entry::internals::Function::new(

@@ -1,10 +1,12 @@
 //! The authored-native ABI: argument word layout and the generated source
-//! prefix of Metal and CUDA native implementations.
+//! prefix of Metal, CUDA and Vulkan native implementations.
 //!
 //! Buffer order is every tensor parameter, every tensor result, then every
 //! scratch buffer, in declaration order. The argument words follow them
 //! (`setBytes` on Metal, one by-value struct parameter on CUDA), and the
-//! scalar-result slots come last.
+//! scalar-result slots come last. On Vulkan one argument block in device
+//! memory holds every buffer address, then the scalar-result address, then
+//! the words; the single push constant is the block's address.
 
 use seismic_lang::checked::{NativeImplementation, NativeSpecialization};
 use seismic_lang::expr::compiled::InvocationValues;
@@ -15,12 +17,29 @@ use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::registry;
 
+#[cfg(any(not(target_os = "macos"), test))]
+pub(crate) mod vulkan;
+
 /// Source dialects with a generated prefix. CPU implementations are Rust and
 /// receive a generated context instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Dialect {
     Metal,
     Cuda,
+    /// GLSL 4.60 compute for Vulkan 1.3, with the device's feature macros.
+    /// Vulkan is not built on macOS; its prefix still renders in tests there.
+    #[cfg(any(not(target_os = "macos"), test))]
+    Vulkan(vulkan::VulkanFeatures),
+}
+
+/// A 64-bit constant in the dialect's syntax.
+fn literal(dialect: Dialect, value: u64) -> String {
+    match dialect {
+        Dialect::Metal => format!("((ulong){value})"),
+        Dialect::Cuda => format!("((unsigned long long){value})"),
+        #[cfg(any(not(target_os = "macos"), test))]
+        Dialect::Vulkan(_) => format!("uint64_t({value}ul)"),
+    }
 }
 
 /// Number of 64-bit argument words of an entry schema. The layout depends
@@ -172,13 +191,11 @@ pub(crate) fn render_source(
 ) -> String {
     let schema = logical.schema();
     let geometry = static_geometry(logical, specialization);
-    let word_type = match dialect {
-        Dialect::Metal => "ulong",
-        Dialect::Cuda => "unsigned long long",
-    };
     let mut prefix = match dialect {
         Dialect::Metal => String::from("#include <metal_stdlib>\nusing namespace metal;\n"),
         Dialect::Cuda => String::from(CUDA_HELPERS),
+        #[cfg(any(not(target_os = "macos"), test))]
+        Dialect::Vulkan(features) => vulkan::header(features),
     };
     for (name, representation) in bindings.iter() {
         render_representation(
@@ -200,7 +217,8 @@ pub(crate) fn render_source(
         match specialization.static_value(&dimension.name) {
             Some(value) => {
                 prefix.push_str(&format!(
-                    "#define SEISMIC_DIM_{name} (({word_type}){value})\n"
+                    "#define SEISMIC_DIM_{name} {}\n",
+                    literal(dialect, value)
                 ));
             }
             None => prefix.push_str(&format!(
@@ -236,7 +254,7 @@ pub(crate) fn render_source(
                     fixed: geometry.parameters[ordinal]
                         .as_ref()
                         .expect("a tensor parameter has static geometry"),
-                    word_type,
+                    dialect,
                 };
                 tensor.render(&mut prefix, &format!("SEISMIC_PARAM_{ordinal}"));
                 if named {
@@ -290,7 +308,7 @@ pub(crate) fn render_source(
                 fixed: geometry.results[ordinal]
                     .as_ref()
                     .expect("a tensor result has static geometry"),
-                word_type,
+                dialect,
             }
             .render(&mut prefix, &format!("SEISMIC_RESULT_{ordinal}"));
             buffer += 1;
@@ -313,6 +331,27 @@ pub(crate) fn render_source(
         ));
         buffer += 1;
     }
+    // Tensor parameters lead the buffer order; a shared (`&`) parameter is
+    // read-only. Results and scratch follow.
+    let read_only = schema
+        .parameters()
+        .iter()
+        .filter_map(|parameter| match &parameter.kind {
+            ParameterKind::Tensor { access, .. } => Some(*access == TensorAccess::Shared),
+            ParameterKind::Scalar { .. } | ParameterKind::Index { .. } | ParameterKind::Range { .. } => {
+                None
+            }
+        })
+        .chain(std::iter::repeat(false))
+        .take(buffer);
+    #[cfg(any(not(target_os = "macos"), test))]
+    if let Dialect::Vulkan(_) = dialect {
+        prefix.push_str(&vulkan::tail(buffer, read_only));
+        debug_assert_eq!(word, word_count(schema));
+        prefix.push_str(asset);
+        prefix.push_str(vulkan::SUFFIX);
+        return prefix;
+    }
     prefix.push_str(&format!("#define SEISMIC_BUFFER_WORDS {buffer}\n"));
     prefix.push_str(&format!(
         "#define SEISMIC_BUFFER_SCALAR_RESULTS {}\n",
@@ -323,21 +362,9 @@ pub(crate) fn render_source(
             "struct seismic_words_t {{ unsigned long long w[{}]; }};\n#define seismic_words (seismic_words_value.w)\n",
             word.max(1)
         ));
-        // Tensor parameters lead the buffer order; a shared (`&`) parameter
-        // is read-only, so the kernel sees it `const` and its loads are
-        // eligible for the non-coherent path. Results and scratch follow.
-        let read_only = schema
-            .parameters()
-            .iter()
-            .filter_map(|parameter| match &parameter.kind {
-                ParameterKind::Tensor { access, .. } => Some(*access == TensorAccess::Shared),
-                ParameterKind::Scalar { .. }
-                | ParameterKind::Index { .. }
-                | ParameterKind::Range { .. } => None,
-            })
-            .chain(std::iter::repeat(false));
+        // A read-only buffer is `const`, so its loads are eligible for the
+        // non-coherent path.
         let buffers = read_only
-            .take(buffer)
             .enumerate()
             .map(|(index, read_only)| {
                 let qualifier = if read_only { "const " } else { "" };
@@ -370,17 +397,18 @@ struct TensorAbi<'a> {
     word: usize,
     /// Static geometry rendered as constants (S10).
     fixed: &'a StaticTensor,
-    word_type: &'static str,
+    dialect: Dialect,
 }
 
 impl TensorAbi<'_> {
     fn render(&self, out: &mut String, prefix: &str) {
         render_representation(out, prefix, self.representation);
-        let ty = self.word_type;
+        let constant = |value| literal(self.dialect, value);
         for axis in 0..self.rank {
             match self.fixed.extents[axis] {
                 Some(extent) => out.push_str(&format!(
-                    "#define {prefix}_EXTENT_{axis} (({ty}){extent})\n"
+                    "#define {prefix}_EXTENT_{axis} {}\n",
+                    constant(extent)
                 )),
                 None => out.push_str(&format!(
                     "#define {prefix}_EXTENT_{axis} (seismic_words[{}])\n",
@@ -389,8 +417,8 @@ impl TensorAbi<'_> {
             }
             match &self.fixed.strides {
                 Some(strides) => out.push_str(&format!(
-                    "#define {prefix}_STRIDE_{axis} (({ty}){})\n",
-                    strides[axis]
+                    "#define {prefix}_STRIDE_{axis} {}\n",
+                    constant(strides[axis])
                 )),
                 None => out.push_str(&format!(
                     "#define {prefix}_STRIDE_{axis} (seismic_words[{}])\n",
@@ -406,7 +434,7 @@ impl TensorAbi<'_> {
                 .checked_sub(1)
                 .expect("checked row-layout tensors have a packing axis");
             match self.fixed.extents[last] {
-                Some(extent) => render_static_rows(out, prefix, rows, extent, ty),
+                Some(extent) => render_static_rows(out, prefix, rows, extent, self.dialect),
                 None => render_symbolic_rows(out, prefix, rows, &format!("{prefix}_EXTENT_{last}")),
             }
         }
@@ -419,19 +447,20 @@ fn render_static_rows(
     prefix: &str,
     rows: &registry::PackedRowLayout,
     extent: u64,
-    word_type: &str,
+    dialect: Dialect,
 ) {
     const ADMITTED: &str = "static row geometry was admitted by its canonical layout";
+    let constant = |value: Option<u64>| literal(dialect, value.expect(ADMITTED));
     out.push_str(&format!(
-        "#define {prefix}_ROW_GROUPS (({word_type}){})\n#define {prefix}_ROW_STRIDE_BYTES (({word_type}){})\n",
-        rows.row_groups(extent).expect(ADMITTED),
-        rows.row_stride_bytes(extent).expect(ADMITTED),
+        "#define {prefix}_ROW_GROUPS {}\n#define {prefix}_ROW_STRIDE_BYTES {}\n",
+        constant(rows.row_groups(extent)),
+        constant(rows.row_stride_bytes(extent)),
     ));
     for (index, plane) in rows.planes.iter().enumerate() {
         out.push_str(&format!(
-            "#define {prefix}_PLANE_{name}_ROW_OFFSET (({word_type}){})\n#define {prefix}_PLANE_{name}_BYTES_PER_ROW (({word_type}){})\n",
-            rows.plane_row_offset(index, extent).expect(ADMITTED),
-            rows.plane_bytes_per_row(index, extent).expect(ADMITTED),
+            "#define {prefix}_PLANE_{name}_ROW_OFFSET {}\n#define {prefix}_PLANE_{name}_BYTES_PER_ROW {}\n",
+            constant(rows.plane_row_offset(index, extent)),
+            constant(rows.plane_bytes_per_row(index, extent)),
             name = native_macro(plane.name),
         ));
     }
@@ -852,6 +881,103 @@ mod tests {
         assert!(source.contains("#define SEISMIC_BUFFER_WORDS 3\n"));
         assert!(source.contains("#define SEISMIC_BUFFER_SCALAR_RESULTS 4\n"));
         assert!(!source.contains("seismic_words_t"));
+    }
+
+    const VULKAN_FEATURES: vulkan::VulkanFeatures = vulkan::VulkanFeatures {
+        matrix: false,
+        mixed_dot: true,
+        f32_atomic_add: false,
+        shared_int64_atomics: false,
+    };
+
+    #[test]
+    fn vulkan_prefix_declares_the_argument_block_views_and_suffix() {
+        let source = render(Dialect::Vulkan(VULKAN_FEATURES), "f32");
+        assert!(source.starts_with("#version 460\n"));
+        for line in [
+            "#extension GL_EXT_buffer_reference2 : require\n",
+            "#extension GL_EXT_control_flow_attributes : require\n",
+            "#extension GL_EXT_integer_dot_product : require\n",
+            "#extension GL_EXT_shader_explicit_arithmetic_types : require\n",
+            "#define SEISMIC_HAS_MATRIX 0\n",
+            "#define SEISMIC_HAS_MIXED_DOT 1\n",
+            "#define SEISMIC_DIM_K uint64_t(64ul)\n",
+            "#define SEISMIC_X_EXTENT_1 uint64_t(64ul)\n",
+            "#define SEISMIC_X_STRIDE_0 (seismic_words[",
+            "#define SEISMIC_BUFFER_SCRATCH_PARTIALS 2\n",
+            "#define SEISMIC_BUFFER_SCALAR_RESULTS 3\n",
+            "#define SEISMIC_SCALAR_RESULTS (seismic_argument_block_t(seismic_arguments).w[3])\n",
+            "#define seismic_words (seismic_argument_block_t(seismic_arguments + 32ul).w)\n",
+            "#define SEISMIC_READONLY_0 true\n",
+            "#define SEISMIC_READONLY_1 false\n",
+            "#define SEISMIC_READONLY_2 false\n",
+            "layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;\n",
+            "layout(constant_id = 3) const uint SEISMIC_SHARED_F32 = 16384u;\n",
+            "layout(constant_id = 10) const uint SEISMIC_SHARED_UVEC4 = 4096u;\n",
+            "shared seismic_shared_uvec4_t { uvec4 seismic_shared_uvec4[SEISMIC_SHARED_UVEC4]; };\n",
+        ] {
+            assert!(source.contains(line), "missing {line:?}");
+        }
+        assert!(!source.contains("SEISMIC_BUFFER_WORDS"));
+        assert!(!source.contains("GL_KHR_cooperative_matrix"));
+        assert!(source.ends_with("\n// asset\n\nvoid main() {\n    SEISMIC_KERNEL();\n}\n"));
+        let rows = render_with(
+            Dialect::Vulkan(VULKAN_FEATURES),
+            "q5k@rows16",
+            NativeSpecialization::new().with_static("K", 256),
+        );
+        assert!(rows.contains("#define SEISMIC_X_ROW_STRIDE_BYTES uint64_t(192ul)\n"));
+        let matrix = render(
+            Dialect::Vulkan(vulkan::VulkanFeatures {
+                matrix: true,
+                ..VULKAN_FEATURES
+            }),
+            "f32",
+        );
+        assert!(matrix.contains("#extension GL_KHR_cooperative_matrix : require\n#"));
+        assert!(matrix.contains("#define SEISMIC_HAS_MATRIX 1\n"));
+    }
+
+    #[test]
+    fn vulkan_shared_views_cover_the_region() {
+        assert_eq!(vulkan::shared_view_lengths(10), vec![3, 5, 5, 10, 5, 3, 3, 1]);
+        assert_eq!(vulkan::shared_footprint(10), 16);
+        assert_eq!(vulkan::shared_footprint(0), 16);
+        assert_eq!(vulkan::shared_footprint(256), 256);
+    }
+
+    /// The Vulkan prefix of every representation kind, with an asset using
+    /// the ABI and every prelude helper, compiles, seals and validates, and
+    /// takes the `OpFmaKHR` binding.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn vulkan_prefix_compiles_for_every_representation_kind() {
+        const ASSET: &str = "
+void probe() {
+    seismic_f32 result = seismic_f32(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
+    const uint lane = gl_LocalInvocationID.x;
+    seismic_shared_f32[lane] = float(SEISMIC_X_STRIDE_0 + SEISMIC_DIM_N) * float(SEISMIC_TUNE_TILE);
+    barrier();
+    float value = seismic_subgroup_sum_f32(seismic_shared_f32[lane]);
+    value = seismic_fma_rn(value, seismic_div_rn(value, 3.0), seismic_sqrt_rn(value));
+    value += seismic_bf16_to_f32(seismic_f32_to_bf16(value)) + seismic_unpack_f16x2(seismic_pack_f16x2(value, 1.0)).x;
+    value += float(seismic_dp4a_s8(int(lane), 3, 1) + seismic_dp4a_u8s8(lane, -3, 0) + seismic_redux_add_s32(1));
+    if (SEISMIC_READONLY(SEISMIC_BUFFER_X) && lane == 0u)
+        result[0].v = value + seismic_tanh_approx(value);
+    seismic_u64(SEISMIC_SCALAR_RESULTS)[0].v = seismic_words[0];
+}
+";
+        for representation in ["f32", "bf16", "q6k@rows16", "q5k@rows16", "q8g32", "gguf_q4_k"] {
+            let source = render_with(Dialect::Vulkan(VULKAN_FEATURES), representation, NativeSpecialization::new())
+                .replace("\n// asset\n", ASSET);
+            let environment = seismic_vulkan::seal::Environment {
+                rounding_rte_32: true,
+                denorm_preserve_32: true,
+            };
+            let module = seismic_vulkan::formation::compile(&source, "probe", environment)
+                .unwrap_or_else(|error| panic!("{representation}: {error:?}"));
+            seismic_vulkan::seal::fma_khr(&module).expect("the fma binding applies");
+        }
     }
 
     #[test]

@@ -7,6 +7,7 @@ use seismic_ir::schedule::{ParametricSchedule, ScheduleStep};
 use seismic_ir::storage::{GlobalAllocationTopology, ViewBase};
 use seismic_lang::reference_math::{self as reference, ReferenceNode, ReferenceScalar, WordOp};
 use std::collections::HashMap;
+mod map;
 mod packed;
 mod repeat;
 
@@ -56,6 +57,10 @@ pub(super) struct Place {
 pub(super) enum Effect {
     Write(Place, Term),
     Failure(Term, SourceFailure),
+    /// The independent visits `i in [0, extent)` of a parallel map, each
+    /// writing `place(i) := value(i)` (`i` is the map's iteration term).
+    /// Independence makes their order unobservable.
+    Map { extent: Term, writes: Vec<(Place, Term)> },
 }
 
 #[derive(Clone)]
@@ -68,13 +73,15 @@ pub(super) enum MemoryWrite {
         bytes: u64,
         pattern: seismic_ir::schedule::FillValue,
     },
+    /// Elements of `root` a parallel map wrote.
+    Map { root: ViewBase },
 }
 impl MemoryWrite {
     pub(super) fn root(&self) -> ViewBase {
         match self {
             Self::Point(place, _) => place.root,
             Self::Conditional(_, write) => write.root(),
-            Self::Fill { root, .. } => *root,
+            Self::Fill { root, .. } | Self::Map { root } => *root,
         }
     }
 }
@@ -286,17 +293,32 @@ impl Terms {
             Node::Constant(ReferenceScalar::U32(value)) => {
                 self.node(Node::Natural(u64::from(value)))
             }
-            Node::Natural(_)
-            | Node::Iteration(_)
-            | Node::Input(_, ScalarKind::Nat64)
-            | Node::NaturalFromWord(..)
-            | Node::NaturalAdd(..)
-            | Node::NaturalMul(..) => value,
+            _ if self.is_natural(value) => value,
             _ if matches!(dtype, DType::I32 | DType::U32) => {
                 self.node(Node::NaturalFromWord(value, dtype))
             }
             _ => return Err("index relation requires an actual natural or word value"),
         })
+    }
+    /// An exact source integer used as a coordinate: only a natural-valued
+    /// term has that meaning.
+    pub(super) fn exact_natural(&mut self, value: Term) -> Result<Term> {
+        if self.is_natural(value) {
+            Ok(value)
+        } else {
+            Err("index relation requires an actual natural value")
+        }
+    }
+    fn is_natural(&self, value: Term) -> bool {
+        matches!(
+            self.nodes[value.0],
+            Node::Natural(_)
+                | Node::Iteration(_)
+                | Node::Input(_, ScalarKind::Nat64)
+                | Node::NaturalFromWord(..)
+                | Node::NaturalAdd(..)
+                | Node::NaturalMul(..)
+        )
     }
     pub(super) fn word_from_natural(&mut self, value:Term, dtype:DType) -> Term {
         if let Node::Natural(value) = self.nodes[value.0] {
@@ -390,8 +412,79 @@ pub(super) struct Analysis<'a> {
     pub(super) storage: &'a GlobalAllocationTopology,
     pub(super) external: std::collections::HashSet<ViewBase>,
     pub(super) loop_depth: u32,
+    /// The storage root of each tensor value an argument binding or an
+    /// allocation instance defines. Region products have no single root.
+    tensor_roots: HashMap<u32, ViewBase>,
+    /// The participant a launch body is interpreted for.
+    lane: Option<Lane>,
 }
-impl Analysis<'_> {
+
+/// One participant of a compiler-owned logical launch: `participant` is its
+/// global index and `bound` the launch's logical extent. An active lane is
+/// below the bound; every other lane is at or beyond it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Lane {
+    participant: Term,
+    bound: Term,
+    active: bool,
+}
+impl<'a> Analysis<'a> {
+    pub(super) fn new(
+        expressions: &'a ExprArena,
+        storage: &'a GlobalAllocationTopology,
+        steps: &[ScheduleStep],
+    ) -> Self {
+        let mut analysis = Self {
+            terms: Terms::default(),
+            expressions,
+            inputs: HashMap::new(),
+            storage,
+            external: Default::default(),
+            loop_depth: 0,
+            tensor_roots: HashMap::new(),
+            lane: None,
+        };
+        analysis.define_tensor_roots(steps);
+        analysis
+    }
+
+    fn define_tensor_roots(&mut self, steps: &[ScheduleStep]) {
+        for step in steps {
+            match step {
+                ScheduleStep::BindArgumentTensor { source, result } | ScheduleStep::BeginAllocationInstance { source, result } => {
+                    let ViewBase::TensorValue(id) = self.storage.view(*result).base else {
+                        panic!("tensor definition result is not a tensor value")
+                    };
+                    self.tensor_roots.insert(id.index(), self.storage.view(*source).base);
+                    // An argument's physical strides are invocation inputs.
+                    if matches!(step, ScheduleStep::BindArgumentTensor { .. }) {
+                        for stride in &self.storage.view(*result).strides {
+                            if let seismic_lang::expr::NodeView::Symbol(symbol) = self.expressions.view((*stride).into()) {
+                                let input = self.terms.node(Node::Input(symbol, ScalarKind::Nat64));
+                                self.inputs.insert(symbol, input);
+                            }
+                        }
+                    }
+                }
+                ScheduleStep::Imported { body, .. } => self.define_tensor_roots(body),
+                ScheduleStep::If { then_steps, else_steps, .. } => {
+                    self.define_tensor_roots(then_steps);
+                    self.define_tensor_roots(else_steps);
+                }
+                ScheduleStep::Repeat { body, .. } => self.define_tensor_roots(body),
+                _ => {}
+            }
+        }
+    }
+
+    /// The storage identity a view addresses.
+    pub(super) fn storage_root(&self, base: ViewBase) -> Result<ViewBase> {
+        match base {
+            ViewBase::Allocation(_) => Ok(base),
+            ViewBase::TensorValue(id) => self.tensor_roots.get(&id.index()).copied()
+                .ok_or("selected allocation-instance relation is unfinished"),
+        }
+    }
     /// Discharge access geometry from the actual coordinate and view terms.
     /// Unknown entailment is unfinished safety, including for discarded reads.
     pub(super) fn coordinates_in_bounds(&mut self, view: AnyBufferView, indices: &[Term], state: &State) -> Result<()> {
@@ -411,10 +504,8 @@ impl Analysis<'_> {
 
     pub(super) fn place(&mut self, view: AnyBufferView, indices: &[Term], state: &State) -> Result<Place> {
         self.coordinates_in_bounds(view, indices, state)?;
+        let root = self.storage_root(self.storage.view(view).base)?;
         let layout = self.storage.view(view);
-        if !matches!(layout.base, ViewBase::Allocation(_)) {
-            return Err("selected allocation-instance relation is unfinished");
-        }
         if !matches!(layout.mapping, seismic_ir::storage::ViewMapping::Direct | seismic_ir::storage::ViewMapping::WholeAllocation) {
             return Err("transformed place relation is unfinished");
         }
@@ -428,7 +519,6 @@ impl Analysis<'_> {
         }
         let offset = layout.offset;
         let strides = layout.strides.clone();
-        let root = layout.base;
         let mut byte = self.expression(offset.into(), &state.slots)?;
         let width = self.terms.node(Node::Natural(u64::from(dtype.bytes())));
         for (&index, stride) in indices.iter().zip(strides) {
@@ -460,6 +550,7 @@ impl Analysis<'_> {
         written: &MemoryWrite,
     ) -> Result<Term> {
         match written {
+            MemoryWrite::Map { .. } => return Err("read after a parallel map relation is unfinished"),
             MemoryWrite::Conditional(condition, write) => {
                 let replacement = self.read_after_write(place, value, write)?;
                 value = self.terms.select(*condition, replacement, value);
@@ -534,6 +625,15 @@ impl Analysis<'_> {
             NodeView::ScalarConst { dtype, bits } => {
                 self.terms.scalar(ReferenceScalar::from_bits(dtype, bits))
             }
+            // An invocation dimension is one input natural, shared by both
+            // projections.
+            NodeView::Symbol(symbol)
+                if matches!(self.expressions.symbol_kind(symbol), seismic_lang::expr::SymbolKind::CallDimension(_))
+                    && !slots.contains_key(&symbol) =>
+            {
+                let input = self.terms.node(Node::Input(symbol, ScalarKind::Nat64));
+                *self.inputs.entry(symbol).or_insert(input)
+            }
             NodeView::Symbol(symbol) => *slots
                 .get(&symbol)
                 .or_else(|| self.inputs.get(&symbol))
@@ -581,6 +681,13 @@ impl Analysis<'_> {
                     seismic_lang::expr::CmpOp::Ge => reference::CmpOp::Ge,
                 };
                 self.terms.compare(op, a, b)
+            }
+            // A natural is the same mathematical value as an integer; the
+            // converse holds only for a natural-valued term.
+            NodeView::Unary { op: seismic_lang::expr::UnaryOp::IntFromNat, operand } => self.expression(operand, slots)?,
+            NodeView::Unary { op: seismic_lang::expr::UnaryOp::NatFromInt, operand } => {
+                let value = self.expression(operand, slots)?;
+                self.terms.exact_natural(value)?
             }
             _ => return Err("quantity expression relation is unfinished"),
         })
@@ -653,6 +760,36 @@ impl Analysis<'_> {
                             &state.slots,
                         )?,
                     ))
+                }
+                Op::Geometry { out, kind: ops::GeometryValue::GlobalId(0) } => {
+                    let lane = self.lane.ok_or("participant geometry outside a lane relation")?;
+                    Some((*out, lane.participant))
+                }
+                Op::Binary { op, out, a, b } if kernel.value_type(*out) == ValueType::Index => {
+                    let (a, b) = (get(a)?, get(b)?);
+                    let value = match op {
+                        ops::BinaryOp::Add => self.terms.natural_binary(false, a, b),
+                        ops::BinaryOp::Mul => self.terms.natural_binary(true, a, b),
+                        ops::BinaryOp::Sub => match (&self.terms.nodes[a.0], &self.terms.nodes[b.0]) {
+                            (_, Node::Natural(0)) => a,
+                            (Node::Natural(x), Node::Natural(y)) if x >= y => self.terms.node(Node::Natural(x - y)),
+                            _ if a == b => self.terms.node(Node::Natural(0)),
+                            _ => return Err("natural subtraction relation is unfinished"),
+                        },
+                        ops::BinaryOp::Min => match (&self.terms.nodes[a.0], &self.terms.nodes[b.0]) {
+                            (Node::Natural(x), Node::Natural(y)) => self.terms.node(Node::Natural(*x.min(y))),
+                            // An active lane's participant is below the logical
+                            // bound; an inactive one is at or beyond it.
+                            _ => match self.lane {
+                                Some(lane) if (lane.participant, lane.bound) == (a, b) || (lane.participant, lane.bound) == (b, a) => {
+                                    if lane.active { lane.participant } else { lane.bound }
+                                }
+                                _ => return Err("natural minimum relation is unfinished"),
+                            },
+                        },
+                        _ => return Err("natural operation relation is unfinished"),
+                    };
+                    Some((*out, value))
                 }
                 Op::Binary { op, out, a, b }
                     if kernel.value_type(*out) == ValueType::Scalar(DType::U32) =>
@@ -841,6 +978,25 @@ impl Analysis<'_> {
                     outs,
                 } => {
                     let condition = get(cond)?;
+                    // A condition the path already decides executes one arm.
+                    let opposite = self.terms.not(condition);
+                    let decided = if state.path.establishes(&mut self.terms, condition) {
+                        Some(*then)
+                    } else if state.path.establishes(&mut self.terms, opposite) {
+                        Some(*otherwise)
+                    } else {
+                        None
+                    };
+                    if let Some(arm) = decided {
+                        let results = self.physical_block(kernel, arm, &mut values.clone(), state)?;
+                        if outs.len() != results.len() {
+                            return Err("branch result arity differs");
+                        }
+                        for (out, value) in outs.iter().zip(results) {
+                            values.insert(*out, value);
+                        }
+                        return Ok(None);
+                    }
                     let mut yes = state.clone();
                     let mut no = state.clone();
                     yes.path.enter_arm(condition, true);
@@ -929,6 +1085,22 @@ impl Analysis<'_> {
     ) -> Result<()> {
         for step in steps {
             match step {
+                ScheduleStep::Repeat { symbol, start, end, body, visits: seismic_ir::schedule::RepeatVisits::Independent, .. } => {
+                    let start = self.expression((*start).into(), &state.slots)?;
+                    let end = self.expression((*end).into(), &state.slots)?;
+                    let extent = match (&self.terms.nodes[start.0], &self.terms.nodes[end.0]) {
+                        (Node::Natural(0), _) => end,
+                        (Node::Natural(a), Node::Natural(b)) => self.terms.node(Node::Natural(b.saturating_sub(*a))),
+                        _ => return Err("offset parallel map relation is unfinished"),
+                    };
+                    self.map_visit(state, extent, &mut |analysis, visit, lane| {
+                        let index = analysis.terms.natural_binary(false, start, visit);
+                        lane.slots.insert(*symbol, index);
+                        analysis.schedule(schedule, kernels, body, lane)?;
+                        lane.slots.remove(symbol);
+                        Ok(())
+                    })?;
+                }
                 ScheduleStep::Repeat { symbol, start, end, body, carries, .. } => {
                     let start = self.expression((*start).into(), &state.slots)?;
                     let end = self.expression((*end).into(), &state.slots)?;
@@ -939,16 +1111,16 @@ impl Analysis<'_> {
                 }
                 ScheduleStep::Launch(id) => {
                     let launch = schedule.launch(*id);
-                    for expression in launch.grid.iter().chain(&launch.workgroup) {
-                        if !matches!(
-                            self.expressions.view((*expression).into()),
-                            seismic_lang::expr::NodeView::NatConst(1)
-                        ) {
-                            return Err("participant-map relation is unfinished");
-                        }
-                    }
                     let kernel = kernels.kernel(launch.kernel);
-                    self.physical_block(kernel, kernel.root(), &mut HashMap::new(), state)?;
+                    let single = launch.grid.iter().chain(&launch.workgroup).all(|expression| matches!(
+                        self.expressions.view((*expression).into()),
+                        seismic_lang::expr::NodeView::NatConst(1)
+                    ));
+                    if single {
+                        self.physical_block(kernel, kernel.root(), &mut HashMap::new(), state)?;
+                    } else {
+                        self.physical_map(launch, kernel, state)?;
+                    }
                 }
                 ScheduleStep::ScalarMove(move_) => {
                     let value = *state
@@ -961,7 +1133,9 @@ impl Analysis<'_> {
                 // tensor elements. Tensor-result relations are checked by their
                 // result owner, not this scalar memory-effect analysis.
                 ScheduleStep::PublishTensor { .. } => {}
-                ScheduleStep::BindArgumentTensor { .. } => return Err("tensor argument descriptor relation is unfinished"),
+                // Binds the caller's actual descriptor to its argument root
+                // (`tensor_roots`); it neither reads nor writes elements.
+                ScheduleStep::BindArgumentTensor { .. } => {}
                 ScheduleStep::BeginAllocationInstance { source: view, .. } => {
                     if self.loop_depth > 0 {
                         return Err("repeated allocation-instance relation is unfinished");
@@ -983,8 +1157,9 @@ impl Analysis<'_> {
                     state.slots.insert(read.to.symbol(), value);
                 }
                 ScheduleStep::Fill(fill) => {
+                    let root = self.storage_root(self.storage.view(fill.destination).base)?;
                     let view = self.storage.view(fill.destination);
-                    if self.external.contains(&view.base) {
+                    if self.external.contains(&root) {
                         return Err("observable filled-region relation is unfinished");
                     }
                     let start = self.expression(view.offset.into(), &state.slots)?;
@@ -995,7 +1170,7 @@ impl Analysis<'_> {
                         return Err("symbolic filled-region relation is unfinished");
                     };
                     state.writes.push(MemoryWrite::Fill {
-                        root: view.base,
+                        root,
                         start: *start,
                         bytes: *bytes,
                         pattern: fill.value,
@@ -1057,7 +1232,7 @@ mod tests {
         kernel.close();
         let token = construction.schedule(&mut arena, 0).close();
         let executable = construction.close(token).normalize_launches(&mut arena, 1024, 64).unwrap().analyze_allocations().apply_allocation_plan(&mut arena, AllocationPlan::distinct()).finish();
-        let mut analysis = Analysis { terms: Terms::default(), expressions: &arena, inputs: HashMap::new(), storage: executable.storage(), external: Default::default(), loop_depth:0 };
+        let mut analysis = Analysis::new(&arena, executable.storage(), &[]);
         let (_, kernel) = executable.kernels().kernels().next().unwrap();
         let mut state = State::default();
         analysis.physical_block(kernel, kernel.root(), &mut HashMap::new(), &mut state).unwrap();
@@ -1092,7 +1267,7 @@ mod tests {
         schedule.launch_sequential(kernel);
         let token = schedule.close();
         let executable = construction.close(token).normalize_launches(&mut arena, 1024, 64).unwrap().analyze_allocations().apply_allocation_plan(&mut arena, AllocationPlan::distinct()).finish();
-        let mut analysis = Analysis { terms: Terms::default(), expressions: &arena, inputs: HashMap::new(), storage: executable.storage(), external: Default::default(), loop_depth: 0 };
+        let mut analysis = Analysis::new(&arena, executable.storage(), &[]);
         let (_, kernel) = executable.kernels().kernels().next().unwrap();
         assert_eq!(analysis.physical_block(kernel, kernel.root(), &mut HashMap::new(), &mut State::default()).unwrap_err(), "actual memory coordinate safety is not established");
     }

@@ -4,12 +4,20 @@
 //! A [`Strategy::Search`] runs the budgeted local search of
 //! [`super::search`] over the admissible configurations: the live
 //! evaluator forms each batch of configurations concurrently, then measures
-//! each at every point (weighted cost `Σ weight × median`), and re-measures
-//! the finalists alternating between them. Validation then walks the
-//! search's ranking and chooses the first configuration that agrees with
-//! the all-defaults configuration. A [`Strategy::Survey`] (development)
-//! instead forms, measures and validates every admissible configuration,
-//! recording every sample, so searches can be replayed against it.
+//! each at every point, and re-measures the finalists alternating between
+//! them. Validation then walks the search's ranking and chooses the first
+//! configuration that agrees with the all-defaults configuration. A
+//! [`Strategy::Survey`] (development) instead forms, measures and validates
+//! every admissible configuration, recording every sample, so searches can
+//! be replayed against it.
+//!
+//! The objective is [`Cost`]: per point, its weight (share of step time)
+//! times the configuration's time there relative to the defaults'. A point
+//! is measured once per [`PointKey`]: the launches doing work there and the
+//! parameters they read, as the declaration names them ([`Influence`]).
+//! Configurations that differ only in parameters no launch at a point reads
+//! share that point's measurement, so its noise cannot choose those
+//! parameters.
 //!
 //! Validation compares every tensor an entry writes, its results and its
 //! `&mut` parameters, against the all-defaults configuration: bit-exact when
@@ -21,7 +29,8 @@
 //! restores them before each validation run; one without is rejected.
 
 use super::search::{
-    self, Evaluator, ParameterValues, SearchSettings, SearchSpace, SearchSpaceError, SearchStop,
+    self, Cost, Evaluator, ParameterValues, PointKey, SearchSettings, SearchSpace,
+    SearchSpaceError, SearchStop,
 };
 use super::timing::{self, PointTiming};
 use super::{MeasureOptions, Measurement, NativePrepared};
@@ -47,8 +56,15 @@ pub type TuningInitializer<'a> = Box<dyn FnMut() -> Result<(), TensorError> + 'a
 /// One workload the tuned implementation serves.
 pub struct TuningPoint<'a> {
     pub label: String,
-    /// Share of the objective.
+    /// Share of step time spent in this workload: the objective weighs a
+    /// configuration's time here, relative to the defaults', by it.
     pub weight: f64,
+    /// Points naming the same class are variants of one workload (the same
+    /// rows at different history lengths), each occurring as often as its
+    /// weight says: together they carry their summed weight, split by the
+    /// defaults' real time at each ([`Cost::relative`]). `None`: a class of
+    /// its own.
+    pub class: Option<String>,
     /// Argument sets cycled through by measurement. The first is also the
     /// validation input.
     pub rotation: Vec<EncodedArgs>,
@@ -122,6 +138,9 @@ pub enum Exclusion {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PointMeasurement {
     pub point: String,
+    /// What the measurement depends on; configurations with the same key at
+    /// a point share it.
+    pub key: PointKey,
     pub median_seconds: f64,
     pub deviation_seconds: f64,
     pub samples: Vec<f64>,
@@ -180,14 +199,23 @@ pub struct TuningTime {
     pub validating_seconds: f64,
 }
 
+/// A tuning point as recorded.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PointRecord {
+    pub label: String,
+    pub weight: f64,
+    #[serde(default)]
+    pub class: Option<String>,
+}
+
 /// The complete, serializable outcome of tuning one implementation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TuningResult {
     pub tuning_identity: String,
     pub entry: String,
     pub backend: String,
-    /// Points in the order given, with their weights.
-    pub points: Vec<(String, f64)>,
+    /// Points in the order given, with their weights and classes.
+    pub points: Vec<PointRecord>,
     pub validation: Validation,
     /// The parameters tuned, in declaration order.
     pub parameters: Vec<DeclaredParameter>,
@@ -380,45 +408,198 @@ fn measurement_failure(points: &[TuningPoint<'_>], point: usize, error: CallErro
     }
 }
 
-/// Place `kernel`'s calls at every point.
-fn timings(
+/// Which parameters each launch reads, as the declaration names them: those
+/// its `when` condition, groups, group extent or shared bytes read. A
+/// parameter no launch names (read only by scratch sizes or the source) is
+/// taken to change every launch.
+struct Influence {
+    launches: Vec<Vec<String>>,
+    everywhere: Vec<String>,
+}
+
+impl Influence {
+    fn of(implementation: &NativeImplementation) -> Self {
+        let launches = implementation
+            .launches
+            .iter()
+            .map(|launch| launch.parameters())
+            .collect::<Vec<_>>();
+        let everywhere = implementation
+            .params
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .filter(|name| !launches.iter().any(|read| read.contains(name)))
+            .collect();
+        Self {
+            launches,
+            everywhere,
+        }
+    }
+
+    /// The key of a point where the launches `working` do work, for a
+    /// configuration with parameter `values`.
+    fn key(&self, working: Vec<usize>, values: &ParameterValues) -> PointKey {
+        let values = values
+            .iter()
+            .filter(|(name, _)| {
+                self.everywhere.contains(name)
+                    || working
+                        .iter()
+                        .any(|launch| self.launches[*launch].contains(name))
+            })
+            .map(|(name, value)| (name.clone(), *value))
+            .collect();
+        PointKey {
+            launches: working,
+            values,
+        }
+    }
+}
+
+/// A configuration placed at every point, keyed.
+struct Placed {
+    timings: Vec<PointTiming>,
+    keys: Vec<PointKey>,
+}
+
+/// Place `kernel`'s calls at every point and key them.
+fn place(
     kernel: &Arc<NativePrepared>,
     points: &[TuningPoint<'_>],
-) -> Result<Vec<PointTiming>, Exclusion> {
-    points
+    influence: &Influence,
+    values: &ParameterValues,
+) -> Result<Placed, Exclusion> {
+    let timings = points
         .iter()
         .enumerate()
         .map(|(index, point)| {
             PointTiming::new(kernel, point.rotation.clone())
                 .map_err(|error| measurement_failure(points, index, error))
         })
+        .collect::<Result<Vec<_>, _>>()?;
+    let keys = timings
+        .iter()
+        .map(|timing| influence.key(timing.working_launches(), values))
+        .collect();
+    Ok(Placed { timings, keys })
+}
+
+/// Measures configurations at the tuning points, once per point and key.
+struct Measurer {
+    influence: Influence,
+    /// Every point measured so far, by point and key.
+    measured: HashMap<(usize, PointKey), PointMeasurement>,
+}
+
+impl Measurer {
+    fn new(implementation: &NativeImplementation) -> Self {
+        Self {
+            influence: Influence::of(implementation),
+            measured: HashMap::new(),
+        }
+    }
+
+    /// The measurement of `kernel` at every point: points whose key was
+    /// measured before reuse that measurement, the others are sampled.
+    fn measure(
+        &mut self,
+        kernel: &Arc<NativePrepared>,
+        points: &[TuningPoint<'_>],
+        values: &ParameterValues,
+        options: &MeasureOptions,
+    ) -> Result<Vec<PointMeasurement>, Exclusion> {
+        let Placed { timings, keys } = place(kernel, points, &self.influence, values)?;
+        let (fresh, mut timings): (Vec<usize>, Vec<PointTiming>) = timings
+            .into_iter()
+            .enumerate()
+            .filter(|(point, _)| !self.measured.contains_key(&(*point, keys[*point].clone())))
+            .unzip();
+        timing::sample(&mut timings, options)
+            .map_err(|failure| measurement_failure(points, fresh[failure.point], failure.error))?;
+        for (point, timing) in fresh.into_iter().zip(&timings) {
+            let key = keys[point].clone();
+            let measurement = point_measurement(&points[point].label, key.clone(), timing.measurement());
+            self.measured.insert((point, key), measurement);
+        }
+        Ok(keys
+            .into_iter()
+            .enumerate()
+            .map(|(point, key)| self.measured[&(point, key)].clone())
+            .collect())
+    }
+}
+
+/// Bring the device to its sustained clock after forming a batch left it
+/// idle ([`timing::warm`]), with the first formed configuration's first
+/// point. A configuration that cannot run here fails the same way when it
+/// is measured and is excluded there.
+fn warm(formed: &[Result<Arc<NativePrepared>, Exclusion>], points: &[TuningPoint<'_>]) {
+    let Some(kernel) = formed.iter().find_map(|kernel| kernel.as_ref().ok()) else {
+        return;
+    };
+    if let Ok(point) = PointTiming::new(kernel, points[0].rotation.clone()) {
+        let _ = timing::warm(&point);
+    }
+}
+
+/// The largest median absolute deviation, relative to the median, of a
+/// confirmed finalist's samples at any point.
+const CONFIRMED_DEVIATION: f64 = 0.10;
+
+/// Why a finalist's confirmation cannot be trusted, if it cannot: at some
+/// point its samples spread widely, so a sample saw something other than
+/// the kernel (another process on the device, a clock change) and its cost
+/// may be an outlier that would win the ranking.
+///
+/// The confirmation, not the search, is the measurement of record: it
+/// samples the defaults and the finalists alternately, so a slow device
+/// change affects all of them alike, and a sample cannot read faster than
+/// the kernel runs. A search measurement taken while the device was still
+/// reaching its clock reads high, and one point's measurement is shared by
+/// every configuration with its key, so the two may disagree while the
+/// confirmation is right.
+fn unstable(confirmed: &[PointMeasurement]) -> Option<Exclusion> {
+    confirmed.iter().find_map(|confirmed| {
+        let deviation = confirmed.deviation_seconds / confirmed.median_seconds;
+        (deviation > CONFIRMED_DEVIATION).then(|| Exclusion::Measurement {
+            point: confirmed.point.clone(),
+            detail: format!("confirmed samples deviate {:.0}% from their median", deviation * 100.0),
+        })
+    })
+}
+
+/// The points' weights and classes: how the objective weighs them.
+struct Weighing {
+    weights: Vec<f64>,
+    classes: Vec<usize>,
+}
+
+impl Weighing {
+    fn of(points: &[TuningPoint<'_>]) -> Self {
+        Self {
+            weights: points.iter().map(|point| point.weight).collect(),
+            classes: search::classes(points.iter().map(|point| point.class.as_deref())),
+        }
+    }
+
+    /// The cost of `measured` relative to the defaults' measurement at the
+    /// same points.
+    fn cost(&self, measured: &[PointMeasurement], reference: &[PointMeasurement]) -> Cost {
+        Cost::relative(
+            measured.iter().map(|measurement| measurement.key.clone()).collect(),
+            &self.weights,
+            &self.classes,
+            &medians(measured),
+            &medians(reference),
+        )
+    }
+}
+
+fn medians(measured: &[PointMeasurement]) -> Vec<f64> {
+    measured
+        .iter()
+        .map(|measurement| measurement.median_seconds)
         .collect()
-}
-
-/// The measurements of one configuration's points and its weighted cost.
-fn costed(points: &[TuningPoint<'_>], timings: &[PointTiming]) -> (Vec<PointMeasurement>, f64) {
-    let measured = points
-        .iter()
-        .zip(timings)
-        .map(|(point, timing)| point_measurement(&point.label, timing.measurement()))
-        .collect::<Vec<_>>();
-    let cost = points
-        .iter()
-        .zip(&measured)
-        .map(|(point, measurement)| point.weight * measurement.median_seconds)
-        .sum();
-    (measured, cost)
-}
-
-fn measure(
-    kernel: &Arc<NativePrepared>,
-    points: &[TuningPoint<'_>],
-    options: &MeasureOptions,
-) -> Result<(Vec<PointMeasurement>, f64), Exclusion> {
-    let mut timings = timings(kernel, points)?;
-    timing::sample(&mut timings, options)
-        .map_err(|failure| measurement_failure(points, failure.point, failure.error))?;
-    Ok(costed(points, &timings))
 }
 
 fn specialization(statics: &NativeSpecialization, values: &ParameterValues) -> NativeSpecialization {
@@ -442,6 +623,7 @@ struct Live<'s, 'a> {
     space: &'s SearchSpace,
     statics: &'s NativeSpecialization,
     points: &'s [TuningPoint<'a>],
+    measurer: Measurer,
     search: MeasureOptions,
     confirmation: MeasureOptions,
     deadline: Option<Instant>,
@@ -449,8 +631,21 @@ struct Live<'s, 'a> {
     time: TuningTime,
 }
 
+impl Live<'_, '_> {
+    /// The defaults' search measurement: the reference of every cost.
+    fn reference(&self) -> Result<&[PointMeasurement], Exclusion> {
+        self.evaluated
+            .get(&self.space.default_index())
+            .map(|defaults| defaults.points.as_slice())
+            .ok_or_else(|| Exclusion::Measurement {
+                point: String::new(),
+                detail: "the defaults, the reference of every cost, were not measured".into(),
+            })
+    }
+}
+
 impl Evaluator for Live<'_, '_> {
-    fn evaluate(&mut self, batch: &[usize]) -> Vec<Result<f64, Exclusion>> {
+    fn evaluate(&mut self, batch: &[usize]) -> Vec<Result<Cost, Exclusion>> {
         let specializations = batch
             .iter()
             .map(|index| specialization(self.statics, &self.space.values(*index)))
@@ -459,78 +654,113 @@ impl Evaluator for Live<'_, '_> {
         let formed = self.formation.form_all(&specializations);
         let measuring = Instant::now();
         self.time.forming_seconds += (measuring - began).as_secs_f64();
+        warm(&formed, self.points);
+        let weighing = Weighing::of(self.points);
         let costs = batch
             .iter()
             .zip(formed)
             .map(|(index, kernel)| {
                 let kernel = kernel?;
-                let (points, cost) = measure(&kernel, self.points, &self.search)?;
+                let points =
+                    self.measurer
+                        .measure(&kernel, self.points, &self.space.values(*index), &self.search)?;
                 self.evaluated.insert(
                     *index,
                     Evaluated {
                         kernel,
-                        points,
+                        points: points.clone(),
                         confirmed: Vec::new(),
                     },
                 );
-                Ok(cost)
+                Ok(weighing.cost(&points, self.reference()?))
             })
             .collect();
         self.time.measuring_seconds += measuring.elapsed().as_secs_f64();
         costs
     }
 
-    fn confirm(&mut self, finalists: &[usize]) -> Vec<Result<f64, Exclusion>> {
+    fn confirm(&mut self, finalists: &[usize]) -> Vec<Result<Cost, Exclusion>> {
         let began = Instant::now();
-        let count = self.points.len();
-        let mut results: Vec<Option<Result<f64, Exclusion>>> = vec![None; finalists.len()];
-        // Finalists still being confirmed, by position in `finalists`.
-        let mut active = (0..finalists.len()).collect::<Vec<_>>();
-        while !active.is_empty() {
-            // Every point of every active finalist, finalist by finalist:
-            // sampling round by round alternates between the finalists.
-            let placed = active
-                .iter()
-                .map(|&finalist| timings(&self.evaluated[&finalists[finalist]].kernel, self.points))
-                .collect::<Vec<_>>();
-            if let Some(position) = placed.iter().position(Result::is_err) {
-                let failed = active.remove(position);
-                results[failed] = placed.into_iter().nth(position).map(|placed| {
-                    Err(placed.err().expect("the failed placement is an error"))
-                });
-                continue;
-            }
-            let mut flat = placed
-                .into_iter()
-                .flat_map(|placed| placed.expect("placements succeeded"))
-                .collect::<Vec<_>>();
-            match timing::sample(&mut flat, &self.confirmation) {
-                Ok(()) => {
-                    for (position, &finalist) in active.iter().enumerate() {
-                        let timings = &flat[position * count..(position + 1) * count];
-                        let (points, cost) = costed(self.points, timings);
-                        self.evaluated
-                            .get_mut(&finalists[finalist])
-                            .expect("finalists were evaluated")
-                            .confirmed = points;
-                        results[finalist] = Some(Ok(cost));
+        // Every finalist placed at every point; one timing per distinct point
+        // and key, all sampled round by round, so sampling alternates between
+        // the finalists and finalists sharing a key share its measurement.
+        let mut ids: Vec<(usize, PointKey)> = Vec::new();
+        let mut timings = Vec::new();
+        let keys = finalists
+            .iter()
+            .map(|index| {
+                let Placed {
+                    timings: placed,
+                    keys,
+                } = place(
+                    &self.evaluated[index].kernel,
+                    self.points,
+                    &self.measurer.influence,
+                    &self.space.values(*index),
+                )?;
+                for (point, (timing, key)) in placed.into_iter().zip(&keys).enumerate() {
+                    let id = (point, key.clone());
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                        timings.push(timing);
                     }
-                    active.clear();
                 }
-                Err(failure) => {
-                    let failed = active.remove(failure.point / count);
-                    results[failed] = Some(Err(measurement_failure(
-                        self.points,
-                        failure.point % count,
-                        failure.error,
-                    )));
-                }
-            }
+                Ok(keys)
+            })
+            .collect::<Vec<Result<Vec<PointKey>, Exclusion>>>();
+        let points = self.points;
+        let mut failed = HashMap::new();
+        while let Err(failure) = timing::sample(&mut timings, &self.confirmation) {
+            let (point, key) = ids.remove(failure.point);
+            timings.remove(failure.point);
+            failed.insert((point, key), measurement_failure(points, point, failure.error));
         }
-        self.time.measuring_seconds += began.elapsed().as_secs_f64();
-        results
+        let measured = ids
             .into_iter()
-            .map(|result| result.expect("every finalist was confirmed or failed"))
+            .zip(&timings)
+            .map(|((point, key), timing)| {
+                let measurement =
+                    point_measurement(&points[point].label, key.clone(), timing.measurement());
+                ((point, key), measurement)
+            })
+            .collect::<HashMap<_, _>>();
+        let confirmed = keys
+            .into_iter()
+            .map(|keys| {
+                let confirmed = keys?
+                    .into_iter()
+                    .enumerate()
+                    .map(|(point, key)| {
+                        let id = (point, key);
+                        match failed.get(&id) {
+                            Some(exclusion) => Err(exclusion.clone()),
+                            None => Ok(measured[&id].clone()),
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                match unstable(&confirmed) {
+                    Some(exclusion) => Err(exclusion),
+                    None => Ok(confirmed),
+                }
+            })
+            .collect::<Vec<_>>();
+        self.time.measuring_seconds += began.elapsed().as_secs_f64();
+        let weighing = Weighing::of(points);
+        // The finalists begin with the defaults, the reference.
+        let reference = confirmed[0].clone();
+        finalists
+            .iter()
+            .zip(confirmed)
+            .map(|(index, measured)| {
+                let measured = measured?;
+                let reference = reference.as_ref().map_err(Clone::clone)?;
+                let cost = weighing.cost(&measured, reference);
+                self.evaluated
+                    .get_mut(index)
+                    .expect("finalists were evaluated")
+                    .confirmed = measured;
+                Ok(cost)
+            })
             .collect()
     }
 
@@ -729,6 +959,8 @@ pub fn implementation_digest(
         #[cfg(target_os = "macos")]
         crate::backends::OpenedKind::Metal(_) => Some(super::abi::Dialect::Metal),
         crate::backends::OpenedKind::Cuda(_) => Some(super::abi::Dialect::Cuda),
+        #[cfg(not(target_os = "macos"))]
+        crate::backends::OpenedKind::Vulkan(opened) => Some(super::abi::Dialect::Vulkan(opened.features())),
     };
     if let Some(dialect) = dialect {
         let logical = module
@@ -770,7 +1002,7 @@ fn widen(
 /// The configuration records of a tuning run and the points they were
 /// measured at.
 struct Records {
-    points: Vec<(String, f64)>,
+    points: Vec<PointRecord>,
     records: Vec<ConfigurationRecord>,
 }
 
@@ -799,6 +1031,7 @@ impl Tuned<'_> {
             space: self.space,
             statics: self.statics,
             points: &points,
+            measurer: Measurer::new(self.formation.implementation),
             search: MeasureOptions {
                 samples: plan.settings.samples,
                 min_sample_seconds: plan.min_sample_seconds,
@@ -865,11 +1098,19 @@ impl Tuned<'_> {
             .map(|(index, result)| {
                 let configuration =
                     Configuration::of(&specialization(self.statics, &self.space.values(*index)));
-                let outcome = match (result, verdicts.get(index)) {
-                    (Err(exclusion), _) | (Ok(_), Some(Err(exclusion))) => {
-                        Outcome::Excluded(exclusion.clone())
-                    }
-                    (Ok(_), verdict) => {
+                // A finalist that could not be confirmed is excluded; the
+                // defaults stay the fallback choice whatever their
+                // confirmation showed.
+                let unconfirmed = trace
+                    .confirmed
+                    .iter()
+                    .find(|(finalist, _)| finalist == index && *index != default_index)
+                    .and_then(|(_, confirmed)| confirmed.as_ref().err());
+                let outcome = match (result, unconfirmed, verdicts.get(index)) {
+                    (Err(exclusion), _, _)
+                    | (Ok(_), Some(exclusion), _)
+                    | (Ok(_), None, Some(Err(exclusion))) => Outcome::Excluded(exclusion.clone()),
+                    (Ok(_), None, verdict) => {
                         let measured = &evaluated[index];
                         Outcome::Measured {
                             artifact: measured.kernel.artifact().0.clone(),
@@ -921,7 +1162,8 @@ impl Tuned<'_> {
         let workers = std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(1);
-        let mut outcomes: Vec<Option<(Outcome, f64)>> = vec![None; self.space.len()];
+        let mut measurer = Measurer::new(self.formation.implementation);
+        let mut outcomes: Vec<Option<Outcome>> = vec![None; self.space.len()];
         let order = (0..self.space.len()).collect::<Vec<_>>();
         for batch in order.chunks(workers) {
             let specializations = batch
@@ -931,16 +1173,19 @@ impl Tuned<'_> {
             let began = Instant::now();
             let formed = self.formation.form_all(&specializations);
             time.forming_seconds += began.elapsed().as_secs_f64();
+            warm(&formed, &points);
             for ((index, candidate), kernel) in batch.iter().zip(&specializations).zip(formed) {
                 let began = Instant::now();
                 let measured = kernel.and_then(|kernel| {
-                    measure(&kernel, &points, &options).map(|(measured, cost)| (kernel, measured, cost))
+                    measurer
+                        .measure(&kernel, &points, &self.space.values(*index), &options)
+                        .map(|measured| (kernel, measured))
                 });
                 time.measuring_seconds += began.elapsed().as_secs_f64();
                 let began = Instant::now();
                 let outcome = match measured {
-                    Err(exclusion) => (Outcome::Excluded(exclusion), f64::INFINITY),
-                    Ok((kernel, measured, cost)) => {
+                    Err(exclusion) => Outcome::Excluded(exclusion),
+                    Ok((kernel, measured)) => {
                         let mut validator = Validator {
                             implementation: self.formation.implementation,
                             default: self.default,
@@ -950,16 +1195,13 @@ impl Tuned<'_> {
                             points: &mut points,
                         };
                         match validator.check(&kernel, candidate)? {
-                            Err(exclusion) => (Outcome::Excluded(exclusion), f64::INFINITY),
-                            Ok(()) => (
-                                Outcome::Measured {
-                                    artifact: kernel.artifact().0.clone(),
-                                    points: measured,
-                                    confirmed: Vec::new(),
-                                    validated: true,
-                                },
-                                cost,
-                            ),
+                            Err(exclusion) => Outcome::Excluded(exclusion),
+                            Ok(()) => Outcome::Measured {
+                                artifact: kernel.artifact().0.clone(),
+                                points: measured,
+                                confirmed: Vec::new(),
+                                validated: true,
+                            },
                         }
                     }
                 };
@@ -971,14 +1213,26 @@ impl Tuned<'_> {
             .into_iter()
             .map(|outcome| outcome.expect("every configuration was surveyed"))
             .collect::<Vec<_>>();
+        let measured = |outcome: &Outcome| match outcome {
+            Outcome::Measured { points, .. } => Some(points.clone()),
+            Outcome::Excluded(_) => None,
+        };
+        let reference = match &outcomes[self.space.default_index()] {
+            Outcome::Measured { points, .. } => points.clone(),
+            Outcome::Excluded(exclusion) => return Err(TuneError::DefaultUnusable(exclusion.clone())),
+        };
+        let weighing = Weighing::of(&points);
         let chosen = (0..outcomes.len())
-            .min_by(|left, right| outcomes[*left].1.total_cmp(&outcomes[*right].1))
-            .filter(|index| outcomes[*index].1.is_finite())
-            .unwrap_or(self.space.default_index());
+            .filter_map(|index| {
+                measured(&outcomes[index]).map(|points| (index, weighing.cost(&points, &reference).total()))
+            })
+            .min_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(index, _)| index)
+            .expect("the defaults were measured");
         let records = outcomes
             .into_iter()
             .enumerate()
-            .map(|(index, (outcome, _))| ConfigurationRecord {
+            .map(|(index, outcome)| ConfigurationRecord {
                 configuration: Configuration::of(&specialization(
                     self.statics,
                     &self.space.values(index),
@@ -1000,10 +1254,14 @@ impl Tuned<'_> {
     }
 }
 
-fn labels(points: &[TuningPoint<'_>]) -> Vec<(String, f64)> {
+fn labels(points: &[TuningPoint<'_>]) -> Vec<PointRecord> {
     points
         .iter()
-        .map(|point| (point.label.clone(), point.weight))
+        .map(|point| PointRecord {
+            label: point.label.clone(),
+            weight: point.weight,
+            class: point.class.clone(),
+        })
         .collect()
 }
 
@@ -1206,13 +1464,41 @@ fn scalar_equal(expected: &ArgumentValue, actual: &ArgumentValue) -> bool {
     }
 }
 
-fn point_measurement(label: &str, measurement: Measurement) -> PointMeasurement {
+fn point_measurement(label: &str, key: PointKey, measurement: Measurement) -> PointMeasurement {
     PointMeasurement {
         point: label.to_owned(),
+        key,
         median_seconds: measurement.median,
         deviation_seconds: measurement.deviation,
         samples: measurement.samples,
         repetitions: measurement.repetitions,
         rotation_bytes: measurement.rotation_bytes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn measured(median: f64, deviation: f64) -> PointMeasurement {
+        PointMeasurement {
+            point: "m1".into(),
+            key: PointKey {
+                launches: vec![0],
+                values: ParameterValues::new(),
+            },
+            median_seconds: median,
+            deviation_seconds: deviation,
+            samples: Vec::new(),
+            repetitions: 1,
+            rotation_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn a_finalist_is_trusted_only_when_its_confirmed_samples_are_tight() {
+        assert_eq!(unstable(&[measured(88e-6, 2e-6)]), None);
+        // Samples that spread widely at any point.
+        assert!(unstable(&[measured(88e-6, 2e-6), measured(85e-6, 20e-6)]).is_some());
     }
 }

@@ -62,6 +62,7 @@ fn prepare_every_entry(
         max_batch_rows: 512,
         max_projected_rows: 8,
         max_images_per_request: 1,
+        lookahead: false,
     };
     let storage_bytes = storage_gib << 30;
     let draft = ExecutionPlanner::prepare(

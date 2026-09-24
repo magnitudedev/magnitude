@@ -1,0 +1,15 @@
+// qwen_recurrent_chunk (large row classes): the same contract as
+// `qwen_recurrent_step`. This first Vulkan form advances every slot
+// row-sequentially with the step's arithmetic (`recurrent_sequential`), so a
+// request's recurrent bits never depend on its row class; the chunked WY form
+// on cooperative matrices (the CUDA/Metal chunk) replaces it once it is
+// measured on the V710.
+#include "common/recurrent.glsl"
+
+#if SEISMIC_TUNE_ROWS > RECURRENT_MAX_ROWS
+#error "qwen_recurrent_chunk holds at most RECURRENT_MAX_ROWS state rows per subgroup"
+#endif
+
+void qwen_recurrent_chunk() {
+    recurrent_sequential(SEISMIC_TUNE_ROWS);
+}

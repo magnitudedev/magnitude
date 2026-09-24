@@ -82,21 +82,35 @@ pub(crate) struct FrozenPlanParts<'a, B: seismic_target::TargetFamily> {
     pub guard: FrozenGuard,
 }
 
-pub(crate) fn freeze<'a, B: seismic_target::TargetFamily>(
-    context: &CandidateContext<'a>,
-    implementation: Arc<Implementation<B>>,
-    guard_node: BoolExpr,
-) -> FrozenPlan<'a, B> {
+/// The values a frozen plan fixes: target constants and the implementation's
+/// active choices.
+pub(crate) fn plan_assignment<B: seismic_target::TargetFamily>(
+    arena: &ExprArena,
+    constants: &crate::target::TargetConstants,
+    implementation: &Implementation<B>,
+) -> PartialAssignment {
     let mut fixed = PartialAssignment::new();
-    for (symbol, value) in context.constants.bindings() {
+    for (symbol, value) in constants.bindings() {
         fixed.bind(*symbol, value.clone());
     }
     for (decision, _) in implementation.decisions() {
-        let symbol = context.arena.decision_symbol(decision);
+        let symbol = arena.decision_symbol(decision);
         if let Some(value) = implementation.assignment().get(symbol) {
             fixed.bind(symbol, value);
         }
     }
+    fixed
+}
+
+/// `guard_node` is already partially evaluated under `fixed`
+/// (`plan_assignment`): a requirement that holds for every fixed target
+/// value no longer mentions the schedule values it was scoped under.
+pub(crate) fn freeze<'a, B: seismic_target::TargetFamily>(
+    context: &CandidateContext<'a>,
+    implementation: Arc<Implementation<B>>,
+    fixed: PartialAssignment,
+    guard_node: BoolExpr,
+) -> FrozenPlan<'a, B> {
     let guard = FrozenGuard::new(&context.arena, guard_node, &fixed);
     let identity = VariantIdentity {
         implementation: implementation.identity().clone(),

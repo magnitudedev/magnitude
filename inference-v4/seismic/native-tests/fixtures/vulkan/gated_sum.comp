@@ -1,0 +1,32 @@
+// One participant sums in element order after staging the whole vector in
+// the group-memory region.
+void gated_staged() {
+    seismic_f32 x = seismic_f32(SEISMIC_PTR(SEISMIC_BUFFER_X));
+    seismic_f32 result = seismic_f32(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
+    const uint n = uint(SEISMIC_DIM_N);
+    for (uint i = 0u; i < n; ++i) {
+        seismic_shared_f32[i] = x[uint(i * SEISMIC_X_STRIDE_0)].v;
+    }
+    float total = 0.0;
+    for (uint i = 0u; i < n; ++i) {
+        total += seismic_shared_f32[i];
+    }
+    result[0].v = total;
+}
+
+// One participant sums in element order after mirroring the vector into
+// scratch.
+void gated_mirrored() {
+    seismic_f32 x = seismic_f32(SEISMIC_PTR(SEISMIC_BUFFER_X));
+    seismic_f32 mirror = seismic_f32(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_MIRROR));
+    seismic_f32 result = seismic_f32(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
+    const uint n = uint(SEISMIC_DIM_N);
+    for (uint i = 0u; i < n; ++i) {
+        mirror[i].v = x[uint(i * SEISMIC_X_STRIDE_0)].v;
+    }
+    float total = 0.0;
+    for (uint i = 0u; i < n; ++i) {
+        total += mirror[i].v;
+    }
+    result[0].v = total;
+}

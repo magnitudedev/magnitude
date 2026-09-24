@@ -86,65 +86,77 @@ pub(super) fn qualify_attention(
             epsilon: 1.0e-5,
         })
         .map_err(|e| qualification_dynamic("qwen_attention_project", label, e))?;
-    let history = |label: &str| {
-        semantic_zeros(device, elements.activation, &[2, kv_heads, width], ENTRY, label)
+    let plane = |element: Element, elements: u64| {
+        semantic_zeros(device, element, &[2, kv_heads, elements], ENTRY, label)
     };
-    let (mut history_key, mut history_value) = (history(label)?, history(label)?);
-    let decoded = kernels
-        .decode
-        .call(qwen_attention_decode::Args {
-            query_gate: &projected.r0,
-            key: &projected.r1,
-            value: &projected.r2,
-            query_norm: &query_norm,
-            key_norm: &key_norm,
-            rotary_components: &rotary_components,
-            rotary_frequencies: &rotary_frequencies,
-            coordinates: &coordinates,
-            visible: &visible,
-            fresh: &fresh,
-            destinations: &destinations,
-            history_key: &mut history_key,
-            history_value: &mut history_value,
-            epsilon: 1.0e-5,
-            scale: 1.0 / (width as f32).sqrt(),
-        })
-        .map_err(|e| qualification_dynamic("qwen_attention_decode", label, e))?
-        .value;
-    let (mut history_key, mut history_value) = (history(label)?, history(label)?);
-    let prefilled = kernels
-        .prefill
-        .call(qwen_attention_prefill::Args {
-            query_gate: &projected.r0,
-            key: &projected.r1,
-            value: &projected.r2,
-            query_norm: &query_norm,
-            key_norm: &key_norm,
-            rotary_components: &rotary_components,
-            rotary_frequencies: &rotary_frequencies,
-            coordinates: &coordinates,
-            visible: &visible,
-            fresh: &fresh,
-            destinations: &destinations,
-            history_key: &mut history_key,
-            history_value: &mut history_value,
-            epsilon: 1.0e-5,
-            scale: 1.0 / (width as f32).sqrt(),
-        })
-        .map_err(|e| qualification_dynamic("qwen_attention_prefill", label, e))?
-        .value;
-    for (entry, gated) in [
-        ("qwen_attention_decode", &decoded),
-        ("qwen_attention_prefill", &prefilled),
-    ] {
+    // Every entry takes the same arguments but its history planes, which
+    // start zero (a zero key row and a zero value row).
+    macro_rules! mix {
+        ($kernel:expr, $module:ident, $($plane:ident: $element:expr, $elements:expr),*) => {{
+            $(let mut $plane = plane($element, $elements)?;)*
+            $kernel
+                .call($module::Args {
+                    query_gate: &projected.r0,
+                    key: &projected.r1,
+                    value: &projected.r2,
+                    query_norm: &query_norm,
+                    key_norm: &key_norm,
+                    rotary_components: &rotary_components,
+                    rotary_frequencies: &rotary_frequencies,
+                    coordinates: &coordinates,
+                    visible: &visible,
+                    fresh: &fresh,
+                    destinations: &destinations,
+                    $($plane: &mut $plane,)*
+                    epsilon: 1.0e-5,
+                    scale: 1.0 / (width as f32).sqrt(),
+                })
+                .map_err(|e| qualification_dynamic(stringify!($module), label, e))?
+                .value
+        }};
+    }
+    let activation = elements.activation;
+    let mixed = match &kernels.history {
+        AttentionHistoryKernels::Dense { decode, prefill } => [
+            (
+                "qwen_attention_decode",
+                mix!(decode, qwen_attention_decode,
+                    history_key: activation, width, history_value: activation, width),
+            ),
+            (
+                "qwen_attention_prefill",
+                mix!(prefill, qwen_attention_prefill,
+                    history_key: activation, width, history_value: activation, width),
+            ),
+        ],
+        AttentionHistoryKernels::AffineK8V4 { decode, prefill } => [
+            (
+                "qwen_attention_decode_k8v4",
+                mix!(decode, qwen_attention_decode_k8v4,
+                    history_key_codes: Element::u32(), width / 4,
+                    history_key_coefficients: Element::f16(), 2,
+                    history_value_codes: Element::u32(), width / 8,
+                    history_value_coefficients: Element::f16(), 2),
+            ),
+            (
+                "qwen_attention_prefill_k8v4",
+                mix!(prefill, qwen_attention_prefill_k8v4,
+                    history_key_codes: Element::u32(), width / 4,
+                    history_key_coefficients: Element::f16(), 2,
+                    history_value_codes: Element::u32(), width / 8,
+                    history_value_coefficients: Element::f16(), 2),
+            ),
+        ],
+    };
+    for (entry, gated) in mixed.iter().map(|(entry, gated)| (*entry, gated)) {
         let result = kernels
             .output
-            .call(qwen_attention_output::Args {
+            .call(attention_output::Args {
                 hidden: &residual,
                 gated,
                 output_weight: &output,
             })
-            .map_err(|e| qualification_dynamic("qwen_attention_output", label, e))?
+            .map_err(|e| qualification_dynamic("attention_output", label, e))?
             .value;
         require_f32_values(&result, &residual_values, entry, label)?;
     }

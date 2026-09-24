@@ -175,7 +175,6 @@ impl<'a, B: seismic_target::TargetFamily> internals::Builder<'a, B> {
         let reference_function = self.program.function(reference.function);
         let mut bodies = Vec::new();
         for candidate in std::iter::once(reference).chain(family.alternatives()) {
-            let is_reference = std::ptr::eq(candidate, reference);
             let backend_matches = match candidate.kind {
                 CandidateKind::Portable => true,
                 CandidateKind::Lowering { backend } | CandidateKind::Helper { backend } => {
@@ -191,18 +190,19 @@ impl<'a, B: seismic_target::TargetFamily> internals::Builder<'a, B> {
                 continue;
             }
             let function = self.program.function(candidate.function);
-            let initialization = if is_reference {
-                Ok(())
-            } else {
-                contents.applicable(
-                    &mut crate::portable::initialization_context(
-                        self.arena, selections, binders,
-                    ),
-                    function.initialization(),
-                    reference_function.initialization(),
-                    initialized_arguments,
-                )
-            };
+            // The checker established the reference's obligations over source
+            // facts. Construction splices any body, the reference included,
+            // only where the reached contents establish them too; where they
+            // do not, the construction stays a typed Initialization pending
+            // instead of splicing a call it cannot account for.
+            let initialization = contents.applicable(
+                &mut crate::portable::initialization_context(
+                    self.arena, selections, binders,
+                ),
+                function.initialization(),
+                reference_function.initialization(),
+                initialized_arguments,
+            );
             let contract = FunctionContract::derive(function);
             assert_eq!(
                 contract.parameters.len(),
@@ -347,7 +347,7 @@ impl<'a, B: seismic_target::TargetFamily> internals::Builder<'a, B> {
                 initialized_arguments,
             )
             .unwrap_or_else(|error| {
-                panic!("checked reference call lost its actual initialized input: {error:?}")
+                panic!("call body admitted by its reached contents lost its initialized input: {error:?}")
             });
         let parts = child.into_parts();
         let child_ir = parts

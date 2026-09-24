@@ -266,11 +266,11 @@ impl Case {
     }
 }
 
+/// Metal on macOS, Vulkan elsewhere (both run the Metal decode/prefill
+/// contract with the same decode parameters); hosts without either skip.
 fn metal() -> Option<Device> {
-    DeviceCatalog::discover()
-        .ok()?
-        .open_backend(BackendName::Metal)
-        .ok()
+    let backend = if cfg!(target_os = "macos") { BackendName::Metal } else { BackendName::Vulkan };
+    DeviceCatalog::discover().ok()?.open_backend(backend).ok()
 }
 
 fn bf16_tensor(device: &Device, shape: &[usize], values: &[f32]) -> Tensor {

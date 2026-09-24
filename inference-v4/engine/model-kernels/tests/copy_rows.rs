@@ -69,7 +69,7 @@ fn generated_surface_exposes_native_and_planned_dense_plane_bindings() {
 #[test]
 fn native_copies_indexed_u32_plane_rows_bit_exactly_on_every_accelerator() {
     let catalog = seismic::DeviceCatalog::discover().unwrap();
-    for backend in [seismic::BackendName::Metal, seismic::BackendName::Cuda] {
+    for backend in [seismic::BackendName::Metal, seismic::BackendName::Cuda, seismic::BackendName::Vulkan] {
         let Ok(device) = catalog.open_backend(backend) else {
             continue;
         };

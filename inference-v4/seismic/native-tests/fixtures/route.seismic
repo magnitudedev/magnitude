@@ -35,6 +35,19 @@ native split_sum for cuda from "cuda/split_sum.cu":
         threadgroups (1, 1, 1)
         threads_per_threadgroup (1, 1, 1)
 
+native split_sum for vulkan from "vulkan/split_sum.comp":
+    static (N)
+    params (arithmetic PARTS in [1, 2, 4], WIDTH in [32, 64])
+    where PARTS <= N
+    scratch partials bytes (PARTS * 4)
+    launch split_partial:
+        threadgroups (PARTS, 1, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)
+        shared_bytes (WIDTH * 4)
+    launch split_merge:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
 native split_sum for cpu from "cpu/split_sum.rs":
     static (N)
     params (arithmetic PARTS in [1, 2, 4], WIDTH in [32, 64])
@@ -67,6 +80,13 @@ native scale_rows for cuda from "cuda/scale_rows.cu":
     launch scale_rows:
         threadgroups (ceil_div(M, ROWS), 1, 1)
         threads_per_threadgroup (min(N, 64), 1, 1)
+
+# Vulkan fixes the group size at preparation: the static bound of min(N, 64).
+native scale_rows for vulkan from "vulkan/scale_rows.comp":
+    params (ROWS in [1, 2])
+    launch scale_rows:
+        threadgroups (ceil_div(M, ROWS), 1, 1)
+        threads_per_threadgroup (64, 1, 1)
 
 native scale_rows for cpu from "cpu/scale_rows.rs":
     params (ROWS in [1, 2])

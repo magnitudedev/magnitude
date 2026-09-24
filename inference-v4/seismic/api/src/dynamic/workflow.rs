@@ -114,7 +114,8 @@ impl Workflow {
         storages.sort_by_key(|s| Arc::as_ptr(s) as usize);
         storages.dedup_by(|a, b| Arc::ptr_eq(a, b));
         let _guards: Vec<_> = storages.iter().map(|s| lock(&s.gate)).collect();
-        let mut draft = runtime::workflow(self.device.inner());
+        let mut draft = runtime::workflow(self.device.inner())
+            .map_err(|e| Error::from(CallError::Workflow(e)))?;
         let mut refs: Vec<Vec<runtime::WorkflowResultRef>> = Vec::new();
         let mut moves = Vec::new();
         for node in &nodes {

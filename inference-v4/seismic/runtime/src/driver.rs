@@ -56,6 +56,11 @@ fn fresh_allocation_identity() -> u64 {
     NEXT_ALLOCATION.fetch_add(1, Ordering::Relaxed)
 }
 
+/// The identity of a newly opened device, unique in the process.
+pub(crate) fn fresh_device_identity() -> DeviceIdentity {
+    DeviceIdentity(NEXT_DEVICE.fetch_add(1, Ordering::Relaxed))
+}
+
 fn admitted<T>(value: Result<T, seismic_lang::expr::EvalError>) -> T {
     value.unwrap_or_else(|error| panic!("PreparedKernel coverage invariant violated: admitted evaluator was not total: {error:?}"))
 }
@@ -115,7 +120,7 @@ where
         memory: Arc<MemoryDomain>,
     ) -> Self {
         Self {
-            identity: DeviceIdentity(NEXT_DEVICE.fetch_add(1, Ordering::Relaxed)),
+            identity: fresh_device_identity(),
             service: Arc::new(service),
             device,
             executor,
@@ -191,9 +196,7 @@ where
         alignment: u64,
         make: impl FnOnce(&Service<T, E>) -> Result<Buffer<T, E>, ExecutionError>,
     ) -> Result<Arc<Allocation>, ExecutionError> {
-        let mut reservation = self.memory.reserve(bytes).map_err(|capacity| {
-            ExecutionError::AllocationCapacity { required: capacity.required.into(), available: capacity.available }
-        })?;
+        let mut reservation = reserve(&self.memory, bytes)?;
         self.allocate_reserved_with(bytes, alignment, &mut reservation, make)
     }
 
@@ -217,25 +220,54 @@ where
     ) -> Result<Arc<Allocation>, ExecutionError> {
         let limits = self.device_description().limits();
         let natural_max = if limits.max_index_bits >= 64 { u64::MAX } else { (1u64 << limits.max_index_bits) - 1 };
-        let maximum = limits.max_allocation_bytes.min(natural_max);
-        if bytes > maximum {
-            return Err(ExecutionError::AllocationCapacity { required: bytes.into(), available: maximum });
-        }
-        if !alignment.is_power_of_two() || alignment > limits.max_allocation_alignment {
-            return Err(ExecutionError::ConstructionContradiction(format!(
-                "allocation alignment {alignment} exceeds target contract {}", limits.max_allocation_alignment)));
-        }
-        let buffer = make(&self.service)?;
-        Ok(Allocation::new(
-            fresh_allocation_identity(),
-            bytes,
-            reservation.take(bytes),
-            Box::new(TypedStorage::<T, E> {
+        let limits = AllocationLimits {
+            max_allocation_bytes: limits.max_allocation_bytes.min(natural_max),
+            max_allocation_alignment: limits.max_allocation_alignment,
+        };
+        allocate_reserved(limits, bytes, alignment, reservation, || {
+            let buffer = make(&self.service)?;
+            Ok(Box::new(TypedStorage::<T, E> {
                 service: self.service.clone(),
                 buffer,
-            }),
-        ))
+            }))
+        })
     }
+}
+
+/// What one device admits for a single allocation.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AllocationLimits {
+    pub(crate) max_allocation_bytes: u64,
+    pub(crate) max_allocation_alignment: u64,
+}
+
+/// Reserve `bytes` in `memory` for an allocation.
+pub(crate) fn reserve(memory: &Arc<MemoryDomain>, bytes: u64) -> Result<MemoryReservation, ExecutionError> {
+    memory.reserve(bytes).map_err(|capacity| ExecutionError::AllocationCapacity {
+        required: capacity.required.into(),
+        available: capacity.available,
+    })
+}
+
+/// The backend-neutral allocation core: check `bytes` and `alignment`
+/// against `limits`, form the storage with `make`, and charge it to
+/// `reservation`.
+pub(crate) fn allocate_reserved(
+    limits: AllocationLimits,
+    bytes: u64,
+    alignment: u64,
+    reservation: &mut MemoryReservation,
+    make: impl FnOnce() -> Result<Box<dyn Storage>, ExecutionError>,
+) -> Result<Arc<Allocation>, ExecutionError> {
+    if bytes > limits.max_allocation_bytes {
+        return Err(ExecutionError::AllocationCapacity { required: bytes.into(), available: limits.max_allocation_bytes });
+    }
+    if !alignment.is_power_of_two() || alignment > limits.max_allocation_alignment {
+        return Err(ExecutionError::ConstructionContradiction(format!(
+            "allocation alignment {alignment} exceeds target contract {}", limits.max_allocation_alignment)));
+    }
+    let storage = make()?;
+    Ok(Allocation::new(fresh_allocation_identity(), bytes, reservation.take(bytes), storage))
 }
 
 pub(crate) fn capability_summaries<T: TargetFamily>(device: &DeviceDescription<T>) -> Vec<String> {

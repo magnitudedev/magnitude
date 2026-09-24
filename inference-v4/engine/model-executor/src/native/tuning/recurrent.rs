@@ -297,12 +297,19 @@ pub(crate) struct RecurrentStateCase {
     segments: Tensor,
     stop: Tensor,
     previous_bank: Tensor,
+    previous_tape: Tensor,
     following_bank: Tensor,
     window: CaseState,
     delta: CaseState,
+    tape: CaseState,
     norm_epsilon: f32,
     grouped: bool,
 }
+
+/// Tape rows of a tuning case's banks: one, the least a store holds. Cases
+/// publish after every row (stop = rows), so the tape is never written and
+/// its size does not change the cost.
+const TUNING_TAPE_ROWS: u64 = 1;
 
 impl RecurrentState {
     fn bindings(&self) -> String {
@@ -369,13 +376,22 @@ impl RecurrentState {
         let banks = slots as u64;
         let window = inputs.activation(
             self.activation,
-            &[TUNING_BANKS, shape.convolution_width - 1, shape.channels()],
+            &[TUNING_BANKS, shape.convolution_width - 1 + TUNING_TAPE_ROWS, shape.channels()],
             seed + 2,
         )?;
         let delta = inputs.activation(
             Element::f32(),
             &[TUNING_BANKS, shape.value_heads, shape.width, shape.width],
             seed + 3,
+        )?;
+        let tape = inputs.activation(
+            Element::f32(),
+            &[
+                TUNING_BANKS,
+                TUNING_TAPE_ROWS,
+                (shape.value_heads + shape.key_heads) * shape.width + shape.value_heads,
+            ],
+            seed + 4,
         )?;
         let published = PUBLISHED_BANK..PUBLISHED_BANK + 1;
         Ok(RecurrentStateCase {
@@ -390,9 +406,11 @@ impl RecurrentState {
             segments: inputs.i32s(&[banks + 1, 2], &segments)?,
             stop: inputs.i32s(&[banks], &stop)?,
             previous_bank: inputs.i32s(&[banks], &tables.bank[..slots])?,
+            previous_tape: inputs.i32s(&[banks], &vec![0; slots])?,
             following_bank: inputs.i32s(&[banks], &tables.following_bank[..slots])?,
             window: inputs.state(window, published.clone())?,
-            delta: inputs.state(delta, published)?,
+            delta: inputs.state(delta, published.clone())?,
+            tape: inputs.state(tape, published)?,
             norm_epsilon: self.epsilon * shape.width as f32,
             grouped,
         })
@@ -439,16 +457,18 @@ macro_rules! state_entry {
                     segments: &case.segments,
                     stop: &case.stop,
                     previous_bank: &case.previous_bank,
+                    previous_tape: &case.previous_tape,
                     following_bank: &case.following_bank,
                     window: case.window.tensor_mut(),
                     delta: case.delta.tensor_mut(),
+                    tape: case.tape.tensor_mut(),
                     norm_epsilon: case.norm_epsilon,
                     grouped: case.grouped,
                 }
             }
 
             fn state(case: &Self::Case) -> Vec<&CaseState> {
-                vec![&case.window, &case.delta]
+                vec![&case.window, &case.delta, &case.tape]
             }
 
             generated_entry!($module, this => $module::Elements { A: this.0.activation });

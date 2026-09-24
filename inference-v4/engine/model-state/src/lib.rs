@@ -8,7 +8,7 @@ mod layout;
 pub use advance::{
     CodecConversionStep, OwnedAdvanceBindings, OwnedAdvanceResolution, OwnedCodecAdvance,
     OwnedCodecBindings, OwnedCompaction, OwnedCompactionBindings, OwnedCompactionPreparation,
-    OwnedRepairAdvance, OwnedStateAdvance,
+    OwnedRepairAdvance, OwnedStateAdvance, OwnedSuccessorAdvance, TentativeAdvance,
 };
 
 pub use codec::{
@@ -20,7 +20,7 @@ pub use layout::ModelStateLayout;
 use seismic::{DType, Device, Element, Tensor};
 use std::{
     cell::{Cell, RefCell},
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     rc::Rc,
 };
 
@@ -124,7 +124,8 @@ pub struct PlaneBuffer {
     pub buffer: Tensor,
 }
 
-/// Free history rows as address-ordered, coalesced `(start, count)` holes.
+/// History rows of one store: address-ordered, coalesced free holes, and the
+/// referenced rows as address-ordered runs with a reference count.
 ///
 /// Placement keeps every sequence's history in few segments however requests
 /// interleave: a sequence grows in place into the hole that begins at its
@@ -133,12 +134,220 @@ pub struct PlaneBuffer {
 /// middle of the largest hole, leaving the rows before it as growth room for
 /// the history that ends there. Only a hole at row 0 has no such history and
 /// is filled from its start.
+///
+/// A row is referenced once by every history ([`Claims`]) covering it, so a
+/// prefix is shared by any number of sequences and checkpoints at row
+/// granularity, and a row returns to the free holes only when its last
+/// history drops it. Every history is registered, so [`Arena::relayout`] can
+/// place all referenced rows anew and rewrite every history.
+#[derive(Clone)]
 struct Arena {
     free: Vec<(usize, usize)>,
+    runs: BTreeMap<usize, Run>,
+    referenced: usize,
+    entries: BTreeMap<u64, Entry>,
+    next_entry: u64,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Run {
+    count: usize,
+    references: usize,
+}
+
 impl Arena {
+    fn new(rows: usize) -> Self {
+        Self {
+            free: if rows == 0 { vec![] } else { vec![(0, rows)] },
+            runs: BTreeMap::new(),
+            referenced: 0,
+            entries: BTreeMap::new(),
+            next_entry: 0,
+        }
+    }
+
+    fn register(&mut self, ranges: Vec<(usize, usize)>, live: bool) -> u64 {
+        let id = self.next_entry;
+        self.next_entry += 1;
+        let mut joined = Vec::with_capacity(ranges.len());
+        append_ranges(&mut joined, ranges);
+        self.entries.insert(
+            id,
+            Entry {
+                ranges: joined,
+                live,
+            },
+        );
+        id
+    }
+
     fn available(&self) -> usize {
         self.free.iter().map(|(_, count)| count).sum()
+    }
+
+    /// Free rows directly after `end`: room for the history ending there to
+    /// grow in place.
+    fn room_at(&self, end: usize) -> usize {
+        self.free
+            .binary_search_by_key(&end, |(start, _)| *start)
+            .map_or(0, |hole| self.free[hole].1)
+    }
+
+    /// Live histories ending at row `end`.
+    fn live_ending_at(&self, end: usize) -> impl Iterator<Item = u64> + '_ {
+        self.entries
+            .iter()
+            .filter(move |(_, entry)| entry.live && entry.end() == Some(end))
+            .map(|(&id, _)| id)
+    }
+
+    /// Whether a relayout can give live history `id` room after its last
+    /// row: no other live history also covers that row (a branch point is a
+    /// prefix every branch but one continues in a new run, wherever the
+    /// rows are placed).
+    fn owns_its_end(&self, id: u64) -> bool {
+        let Some(last) = self.entries[&id].end().map(|end| end - 1) else {
+            return false;
+        };
+        !self.entries.iter().any(|(&other, entry)| {
+            other != id
+                && entry.live
+                && entry
+                    .ranges
+                    .iter()
+                    .any(|&(start, count)| start <= last && last < start + count)
+        })
+    }
+
+    /// Place every referenced row anew within `rows` rows and rewrite every
+    /// history. Live histories come first, those in one run before the rest
+    /// (a relayout never splits a contiguous history to join another) and
+    /// longer before shorter (a branch sharing a prefix follows it): each
+    /// is laid out as one run where its rows are not already placed as a
+    /// prefix of an earlier history, followed by `gaps[id]` free rows for it
+    /// to grow into in place. Rows only frozen histories (checkpoints)
+    /// reference are packed after. Reference counts are unchanged. Returns
+    /// the row moves `(from, to, count)`.
+    fn relayout(
+        &mut self,
+        rows: usize,
+        gaps: &BTreeMap<u64, usize>,
+    ) -> Vec<(usize, usize, usize)> {
+        let mut order = self
+            .entries
+            .iter()
+            .map(|(&id, entry)| {
+                (
+                    !entry.live,
+                    entry.ranges.len() > 1,
+                    std::cmp::Reverse(entry.rows()),
+                    id,
+                )
+            })
+            .collect::<Vec<_>>();
+        order.sort_unstable();
+        // Placed rows: old start -> (count, new start).
+        let mut placed: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
+        let mut next = 0;
+        for (_, _, _, id) in order {
+            for &(start, count) in &self.entries[&id].ranges {
+                let (mut row, end) = (start, start + count);
+                while row < end {
+                    if let Some((&from, &(moved, _))) = placed.range(..=row).next_back() {
+                        if from + moved > row {
+                            row = (from + moved).min(end);
+                            continue;
+                        }
+                    }
+                    let stop = placed
+                        .range(row..end)
+                        .next()
+                        .map_or(end, |(&from, _)| from);
+                    placed.insert(row, (stop - row, next));
+                    next += stop - row;
+                    row = stop;
+                }
+            }
+            next += gaps.get(&id).copied().unwrap_or(0);
+        }
+        debug_assert!(next <= rows, "relayout exceeds its rows");
+        let translate = |start: usize, count: usize| {
+            let mut out = Vec::new();
+            let (mut row, end) = (start, start + count);
+            while row < end {
+                let (&from, &(moved, to)) = placed
+                    .range(..=row)
+                    .next_back()
+                    .expect("every referenced row is placed");
+                let taken = (from + moved).min(end) - row;
+                append_ranges(&mut out, [(to + row - from, taken)]);
+                row += taken;
+            }
+            out
+        };
+        for entry in self.entries.values_mut() {
+            let mut ranges = Vec::with_capacity(entry.ranges.len());
+            for &(start, count) in &entry.ranges {
+                append_ranges(&mut ranges, translate(start, count));
+            }
+            entry.ranges = ranges;
+        }
+        // Reference counts follow the histories covering each row.
+        let mut events = self
+            .entries
+            .values()
+            .flat_map(|entry| entry.ranges.iter())
+            .flat_map(|&(start, count)| [(start, 1isize), (start + count, -1)])
+            .collect::<Vec<_>>();
+        events.sort_unstable();
+        self.runs.clear();
+        let (mut depth, mut from) = (0isize, 0);
+        let mut last: Option<usize> = None;
+        for (row, delta) in events {
+            if depth > 0 && row > from {
+                let references = depth as usize;
+                let extended = last.and_then(|start| {
+                    let run = self.runs.get_mut(&start)?;
+                    (start + run.count == from && run.references == references)
+                        .then(|| run.count += row - from)
+                });
+                if extended.is_none() {
+                    self.runs.insert(
+                        from,
+                        Run {
+                            count: row - from,
+                            references,
+                        },
+                    );
+                    last = Some(from);
+                }
+            }
+            depth += delta;
+            from = row;
+        }
+        debug_assert_eq!(
+            self.runs.values().map(|run| run.count).sum::<usize>(),
+            self.referenced
+        );
+        let mut cursor = 0;
+        self.free.clear();
+        for (&start, run) in &self.runs {
+            if start > cursor {
+                self.free.push((cursor, start - cursor));
+            }
+            cursor = start + run.count;
+        }
+        if rows > cursor {
+            self.free.push((cursor, rows - cursor));
+        }
+        let mut moves: Vec<(usize, usize, usize)> = Vec::with_capacity(placed.len());
+        for (from, (count, to)) in placed {
+            match moves.last_mut() {
+                Some((f, t, n)) if *f + *n == from && *t + *n == to => *n += count,
+                _ => moves.push((from, to, count)),
+            }
+        }
+        moves
     }
 
     /// Claim `count` rows, in logical order, for a sequence whose history ends
@@ -166,8 +375,31 @@ impl Arena {
         claimed
     }
 
+    /// Commit rows `from..to` as free (growth), or give back the free tail
+    /// `to..from` (release; every row there is unreferenced).
+    fn resize(&mut self, from: usize, to: usize) {
+        if to > from {
+            match self.free.last_mut() {
+                Some((start, count)) if *start + *count == from => *count += to - from,
+                _ => self.free.push((from, to - from)),
+            }
+            return;
+        }
+        let (start, count) = self.free.pop().expect("a released tail is a free hole");
+        debug_assert!(start <= to && start + count == from, "released rows are free");
+        if start < to {
+            self.free.push((start, to - start));
+        }
+    }
+
+    /// Claim the first hole of at least `count` rows from its start.
+    fn claim_contiguous(&mut self, count: usize) -> Option<usize> {
+        let hole = self.free.iter().position(|(_, size)| *size >= count)?;
+        Some(self.take(hole, 0, count).0)
+    }
+
     /// Remove `count` rows at `offset` within hole `hole`, keeping the free
-    /// list address-ordered.
+    /// list address-ordered, and reference them once.
     fn take(&mut self, hole: usize, offset: usize, count: usize) -> (usize, usize) {
         let (start, size) = self.free[hole];
         let before = (offset > 0).then_some((start, offset));
@@ -175,34 +407,320 @@ impl Arena {
             (offset + count < size).then(|| (start + offset + count, size - offset - count));
         self.free
             .splice(hole..=hole, before.into_iter().chain(after));
-        (start + offset, count)
+        let start = start + offset;
+        self.runs.insert(
+            start,
+            Run {
+                count,
+                references: 1,
+            },
+        );
+        self.referenced += count;
+        self.coalesce(start, start + count);
+        (start, count)
     }
-}
-struct Extent {
-    arena: Rc<RefCell<Arena>>,
-    start: usize,
-    count: usize,
-}
-type ExtentSet = Vec<Rc<Extent>>;
-impl Drop for Extent {
-    fn drop(&mut self) {
-        if self.count == 0 {
+
+    /// Make `row` a run boundary if it lies strictly inside a run.
+    fn boundary(&mut self, row: usize) {
+        let Some((&start, &run)) = self.runs.range(..row).next_back() else {
             return;
+        };
+        if start + run.count > row {
+            self.runs.insert(
+                start,
+                Run {
+                    count: row - start,
+                    references: run.references,
+                },
+            );
+            self.runs.insert(
+                row,
+                Run {
+                    count: start + run.count - row,
+                    references: run.references,
+                },
+            );
         }
-        let mut arena = self.arena.borrow_mut();
-        arena.free.push((self.start, self.count));
-        arena.free.sort_unstable();
-        let mut merged: Vec<(usize, usize)> = Vec::new();
-        for (start, count) in arena.free.drain(..) {
-            if let Some((s, n)) = merged.last_mut() {
-                if *s + *n == start {
-                    *n += count;
+    }
+
+    /// Add one reference to every row of a referenced range.
+    fn retain(&mut self, start: usize, count: usize) {
+        let end = start + count;
+        self.boundary(start);
+        self.boundary(end);
+        let mut covered = 0;
+        for (_, run) in self.runs.range_mut(start..end) {
+            run.references += 1;
+            covered += run.count;
+        }
+        debug_assert_eq!(covered, count, "a claim covers only referenced rows");
+        self.coalesce(start, end);
+    }
+
+    /// Remove one reference from every row of a range; rows left without a
+    /// reference return to the free holes.
+    fn release(&mut self, start: usize, count: usize) {
+        let end = start + count;
+        self.boundary(start);
+        self.boundary(end);
+        let starts = self
+            .runs
+            .range(start..end)
+            .map(|(&row, _)| row)
+            .collect::<Vec<_>>();
+        let mut freed = false;
+        for row in starts {
+            let run = self.runs.get_mut(&row).expect("run listed above");
+            run.references -= 1;
+            if run.references == 0 {
+                let count = run.count;
+                self.runs.remove(&row);
+                self.referenced -= count;
+                self.free.push((row, count));
+                freed = true;
+            }
+        }
+        if freed {
+            self.free.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::with_capacity(self.free.len());
+            for (start, count) in self.free.drain(..) {
+                match merged.last_mut() {
+                    Some((s, n)) if *s + *n == start => *n += count,
+                    _ => merged.push((start, count)),
+                }
+            }
+            self.free = merged;
+        }
+        self.coalesce(start, end);
+    }
+
+    /// Merge adjacent runs with equal reference counts around `[start, end)`
+    /// so the run map stays proportional to sharing boundaries.
+    fn coalesce(&mut self, start: usize, end: usize) {
+        let first = self
+            .runs
+            .range(..start)
+            .next_back()
+            .map_or(start, |(&row, _)| row);
+        let rows = self
+            .runs
+            .range(first..=end)
+            .map(|(&row, _)| row)
+            .collect::<Vec<_>>();
+        let mut current: Option<usize> = None;
+        for row in rows {
+            let run = self.runs[&row];
+            if let Some(previous) = current {
+                let before = self.runs[&previous];
+                if previous + before.count == row && before.references == run.references {
+                    self.runs.remove(&row);
+                    self.runs.get_mut(&previous).expect("previous run").count += run.count;
                     continue;
                 }
             }
-            merged.push((start, count));
+            current = Some(row);
         }
-        arena.free = merged;
+    }
+
+    /// Rows of `ranges` (with multiplicity) that no claim outside them
+    /// references: the rows released if exactly those claims were dropped.
+    fn exclusive_rows(&self, ranges: &[(usize, usize)]) -> usize {
+        let mut events = ranges
+            .iter()
+            .flat_map(|&(start, count)| [(start, 1isize), (start + count, -1)])
+            .collect::<Vec<_>>();
+        events.sort_unstable();
+        let mut exclusive = 0;
+        let mut depth = 0isize;
+        let mut from = 0;
+        for (row, delta) in events {
+            if depth > 0 && row > from {
+                exclusive += self.rows_with_references(from, row, depth as usize);
+            }
+            depth += delta;
+            from = row;
+        }
+        exclusive
+    }
+
+    fn rows_with_references(&self, start: usize, end: usize, references: usize) -> usize {
+        let first = self
+            .runs
+            .range(..=start)
+            .next_back()
+            .map_or(start, |(&row, _)| row);
+        self.runs
+            .range(first..end)
+            .filter(|(_, run)| run.references == references)
+            .map(|(&row, run)| (row + run.count).min(end).saturating_sub(row.max(start)))
+            .sum()
+    }
+}
+
+/// One registered history: address ranges in logical order (physically
+/// adjacent ranges joined). `live` marks the history of a sequence, which can
+/// still grow; checkpoints and tentative rows are frozen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Entry {
+    ranges: Vec<(usize, usize)>,
+    live: bool,
+}
+
+impl Entry {
+    fn rows(&self) -> usize {
+        self.ranges.iter().map(|(_, count)| count).sum()
+    }
+    fn end(&self) -> Option<usize> {
+        self.ranges.last().map(|(start, count)| start + count)
+    }
+}
+
+/// Append `ranges` to `into`, joining physically adjacent ranges.
+fn append_ranges(into: &mut Vec<(usize, usize)>, ranges: impl IntoIterator<Item = (usize, usize)>) {
+    for (start, count) in ranges {
+        match into.last_mut() {
+            Some((last, rows)) if *last + *rows == start => *rows += count,
+            _ => into.push((start, count)),
+        }
+    }
+}
+
+/// A history's claims: one reference on each row of its ranges, registered in
+/// the arena, so the arena knows every history and can relocate them all.
+/// Cloning adds a reference to every row, dropping removes one; appending and
+/// splitting move references without touching the arena's counts.
+struct Claims {
+    arena: Rc<RefCell<Arena>>,
+    id: u64,
+}
+
+impl Claims {
+    /// Take ownership of rows already referenced once for this history.
+    fn new(arena: &Rc<RefCell<Arena>>, ranges: Vec<(usize, usize)>) -> Self {
+        let id = arena.borrow_mut().register(ranges, false);
+        Self {
+            arena: arena.clone(),
+            id,
+        }
+    }
+
+    fn entry<T>(&self, read: impl FnOnce(&Entry) -> T) -> T {
+        read(&self.arena.borrow().entries[&self.id])
+    }
+
+    fn ranges(&self) -> Vec<(usize, usize)> {
+        self.entry(|entry| entry.ranges.clone())
+    }
+
+    fn rows(&self) -> usize {
+        self.entry(Entry::rows)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entry(|entry| entry.ranges.is_empty())
+    }
+
+    fn end(&self) -> Option<usize> {
+        self.entry(Entry::end)
+    }
+
+    fn set_live(&self, live: bool) {
+        self.arena
+            .borrow_mut()
+            .entries
+            .get_mut(&self.id)
+            .expect("registered history")
+            .live = live;
+    }
+
+    /// Unregister without releasing: the caller takes the references.
+    fn into_ranges(self) -> Vec<(usize, usize)> {
+        let entry = self
+            .arena
+            .borrow_mut()
+            .entries
+            .remove(&self.id)
+            .expect("registered history");
+        entry.ranges
+    }
+
+    /// Move `next`'s rows (logically following this history's) onto its end.
+    fn append(&mut self, next: Claims) {
+        debug_assert!(Rc::ptr_eq(&self.arena, &next.arena));
+        let ranges = next.into_ranges();
+        let mut arena = self.arena.borrow_mut();
+        let entry = arena.entries.get_mut(&self.id).expect("registered history");
+        append_ranges(&mut entry.ranges, ranges);
+    }
+
+    /// Keep the first `keep` rows; return the remainder as a frozen history.
+    fn split_off(&mut self, keep: usize) -> Claims {
+        let tail = {
+            let mut arena = self.arena.borrow_mut();
+            let entry = arena.entries.get_mut(&self.id).expect("registered history");
+            let (head, tail) = split_ranges(&entry.ranges, keep);
+            entry.ranges = head;
+            tail
+        };
+        Claims::new(&self.arena, tail)
+    }
+
+    /// Release the first `rows` rows.
+    fn drop_front(&mut self, rows: usize) {
+        let head = {
+            let mut arena = self.arena.borrow_mut();
+            let entry = arena.entries.get_mut(&self.id).expect("registered history");
+            let (head, tail) = split_ranges(&entry.ranges, rows);
+            entry.ranges = tail;
+            head
+        };
+        drop(Claims::new(&self.arena, head));
+    }
+}
+
+/// The first `keep` rows of `ranges` and the remainder.
+fn split_ranges(ranges: &[(usize, usize)], keep: usize) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    let mut remaining = keep;
+    let (mut head, mut tail) = (Vec::new(), Vec::new());
+    for &(start, count) in ranges {
+        if remaining >= count {
+            remaining -= count;
+            head.push((start, count));
+        } else if remaining == 0 {
+            tail.push((start, count));
+        } else {
+            head.push((start, remaining));
+            tail.push((start + remaining, count - remaining));
+            remaining = 0;
+        }
+    }
+    (head, tail)
+}
+
+impl Clone for Claims {
+    /// A frozen history referencing the same rows.
+    fn clone(&self) -> Self {
+        let mut arena = self.arena.borrow_mut();
+        let ranges = arena.entries[&self.id].ranges.clone();
+        for &(start, count) in &ranges {
+            arena.retain(start, count);
+        }
+        let id = arena.register(ranges, false);
+        Self {
+            arena: self.arena.clone(),
+            id,
+        }
+    }
+}
+
+impl Drop for Claims {
+    fn drop(&mut self) {
+        let mut arena = self.arena.borrow_mut();
+        if let Some(entry) = arena.entries.remove(&self.id) {
+            for (start, count) in entry.ranges {
+                arena.release(start, count);
+            }
+        }
     }
 }
 
@@ -252,7 +770,7 @@ pub const ZERO_SEED_BANK: usize = 0;
 
 struct BankPoolInner {
     capacity: usize,
-    free: RefCell<Vec<usize>>,
+    free: RefCell<BTreeSet<usize>>,
 }
 
 /// A claim on one arena row of every recurrent component. Dropping the last
@@ -266,7 +784,7 @@ struct BankClaim {
 impl Drop for BankClaim {
     fn drop(&mut self) {
         if self.index != ZERO_SEED_BANK {
-            self.pool.free.borrow_mut().push(self.index);
+            self.pool.free.borrow_mut().insert(self.index);
         }
     }
 }
@@ -280,17 +798,17 @@ impl BankHandle {
     }
 }
 
+/// Committed banks: the zero seed plus writable banks `1..committed`, handed
+/// out lowest first so the committed tail empties and can be released.
 struct BankPool {
     inner: Rc<BankPoolInner>,
 }
 
 impl BankPool {
-    fn new(capacity: BankCapacity) -> Result<(Self, BankHandle), Error> {
-        let count = capacity.total()?;
-        let storage_count = capacity.storage_total()?;
+    fn new(capacity: BankCapacity, committed: usize) -> Result<(Self, BankHandle), Error> {
         let inner = Rc::new(BankPoolInner {
-            capacity: count,
-            free: RefCell::new((1..storage_count).rev().collect()),
+            capacity: capacity.total()?,
+            free: RefCell::new((1..committed).collect()),
         });
         let seed = BankHandle(Rc::new(BankClaim {
             pool: inner.clone(),
@@ -304,7 +822,7 @@ impl BankPool {
             .inner
             .free
             .borrow_mut()
-            .pop()
+            .pop_first()
             .ok_or(Error::BanksExhausted {
                 capacity: self.inner.capacity,
             })?;
@@ -317,31 +835,118 @@ impl BankPool {
     fn available(&self) -> usize {
         self.inner.free.borrow().len()
     }
+
+    /// The fewest committed banks that keep every claimed bank.
+    fn required(&self, committed: usize) -> usize {
+        let free = self.inner.free.borrow();
+        (1..committed)
+            .rev()
+            .find(|bank| !free.contains(bank))
+            .map_or(1, |bank| bank + 1)
+    }
+
+    /// Commit banks `from..to` (growth) or release them (`to < from`, all free).
+    fn resize(&self, from: usize, to: usize) {
+        let mut free = self.inner.free.borrow_mut();
+        if to > from {
+            free.extend(from..to);
+        } else {
+            free.retain(|bank| *bank < to);
+        }
+    }
 }
 
-/// One zero-initialized arena per recurrent component: `[banks, ..shape]`.
-fn allocate_arenas(
-    device: &Device,
-    specs: &[ComponentSpec],
-    banks: usize,
-) -> Result<Vec<Tensor>, Error> {
-    specs
-        .iter()
-        .map(|spec| {
-            let extents = std::iter::once(banks)
-                .chain(spec.shape.iter().copied())
-                .map(|extent| {
-                    u64::try_from(extent)
-                        .map_err(|_| Error::Request("recurrent arena extent exceeds u64".into()))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Tensor::zeros(device, element(spec.dtype), &extents).map_err(Error::from)
+/// History rows the backing commits at a time: it grows by at least this many
+/// rows or half its size, and releases whole granules.
+const HISTORY_GRANULE: usize = 256;
+/// Growth keeps `referenced / HEADROOM_DIVISOR` rows free beside a launch's
+/// demand: the growth room a relayout shares among live histories.
+const HEADROOM_DIVISOR: usize = 2;
+/// A history without room is relaid out at the same size only while at least
+/// `referenced / RELAYOUT_SLACK_DIVISOR` free rows remain to share; a full
+/// reservation below that continues the history in a new run instead.
+const RELAYOUT_SLACK_DIVISOR: usize = 8;
+/// Banks committed at creation beside the zero seed, and the least growth.
+const BANK_GRANULE: usize = 2;
+
+/// Recurrent banks a store with recurrent components commits at creation,
+/// the zero seed included, out of `reserved`.
+pub fn initial_banks(reserved: usize) -> usize {
+    reserved.min(1 + BANK_GRANULE)
+}
+
+/// Grow `committed` to cover `required`, geometrically, within `reserved`.
+fn grown(committed: usize, required: usize, granule: usize, reserved: usize) -> usize {
+    required
+        .max(committed + committed / 2)
+        .max(committed + granule)
+        .div_ceil(granule)
+        .saturating_mul(granule)
+        .min(reserved)
+}
+
+/// A physical allocation failure of the elastic backing: the device limit or
+/// memory is exhausted, which is capacity, not a fault.
+fn allocation_capacity(error: &seismic::TensorError) -> bool {
+    matches!(
+        error,
+        seismic::TensorError::Execution(
+            seismic::ExecutionError::AllocationCapacity { .. }
+                | seismic::ExecutionError::AllocationFailed(_)
+        )
+    )
+}
+
+fn leading_extents(leading: usize, rest: &[usize]) -> Result<Vec<u64>, Error> {
+    std::iter::once(leading)
+        .chain(rest.iter().copied())
+        .map(|extent| {
+            u64::try_from(extent).map_err(|_| Error::Request("state extent exceeds u64".into()))
         })
         .collect()
+}
+
+/// The physical backing: reserved tensors whose leading rows (history rows,
+/// recurrent banks) are committed on demand. Graphs are sealed over the
+/// reserved shapes; only committed rows are ever handed out.
+struct Backing {
+    history: Vec<Tensor>,
+    rows: usize,
+    recurrent: Rc<[Tensor]>,
+    banks: usize,
+}
+
+/// Counts transactions that captured this store's tensors and write them
+/// later (advances, repairs, compactions, conversions). The backing may be
+/// recommitted only while none exists: a reallocating backend gives the store
+/// new tensors, and a captured old one would receive writes nobody reads.
+#[derive(Clone)]
+struct Transactions(Rc<Cell<usize>>);
+
+struct Transaction(Rc<Cell<usize>>);
+
+impl Transactions {
+    fn begin(&self) -> Transaction {
+        self.0.set(self.0.get() + 1);
+        Transaction(self.0.clone())
+    }
+    fn idle(&self) -> bool {
+        self.0.get() == 0
+    }
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
 }
 /// History rows are a shared arena; recurrent components are arenas of banks,
 /// and each accepted version is one immutable bank. A checkpoint retains both
 /// without copying tensor contents.
+///
+/// `history_capacity` rows and the bank capacity are reservations sealed into
+/// graphs; the backing commits rows and banks as demand grows and releases
+/// unreferenced tails ([`StateStore::provision`], [`StateStore::shrink`]).
 pub struct StateStore {
     device: Rc<Device>,
     context_capacity: usize,
@@ -351,12 +956,38 @@ pub struct StateStore {
     bank_capacity: BankCapacity,
     recurrent_bank_bytes: u64,
     component_specs: Vec<ComponentSpec>,
-    recurrent: Vec<Tensor>,
-    history: RefCell<Option<Vec<Tensor>>>,
+    backing: RefCell<Backing>,
     arena: Rc<RefCell<Arena>>,
     banks: BankPool,
     zero_seed: BankHandle,
     owners: Cell<usize>,
+    transactions: Transactions,
+    relayouts: Cell<Relayouts>,
+    recommits: Cell<usize>,
+}
+
+/// When [`StateStore::shrink`] releases backing: at idle only once the
+/// backing is at least twice what the store needs (hysteresis), under memory
+/// pressure everything beyond it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShrinkPolicy {
+    Idle,
+    Pressure,
+}
+
+/// History relayouts a store performed and the rows they copied.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Relayouts {
+    pub count: usize,
+    pub rows: usize,
+}
+
+/// One store's demand for history rows: a sequence whose history ends at
+/// `after` (none for a fresh one) appending `rows`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowDemand {
+    pub after: Option<usize>,
+    pub rows: usize,
 }
 impl StateStore {
     pub fn new(
@@ -384,8 +1015,26 @@ impl StateStore {
                 )
                 .ok_or_else(|| Error::Request("recurrent bank byte count overflow".into()))
         })?;
-        let (banks, zero_seed) = BankPool::new(bank_capacity)?;
-        let recurrent = allocate_arenas(&device, &component_specs, bank_capacity.storage_total()?)?;
+        let reserved_banks = bank_capacity.storage_total()?;
+        // Banks of a store without recurrent components have no storage.
+        let committed_banks = if component_specs.is_empty() {
+            reserved_banks
+        } else {
+            initial_banks(reserved_banks)
+        };
+        let (banks, zero_seed) = BankPool::new(bank_capacity, committed_banks)?;
+        let recurrent = component_specs
+            .iter()
+            .map(|spec| {
+                Tensor::reserved(
+                    &device,
+                    element(spec.dtype),
+                    &leading_extents(reserved_banks, &spec.shape)?,
+                    committed_banks as u64,
+                )
+                .map_err(Error::from)
+            })
+            .collect::<Result<Rc<[Tensor]>, _>>()?;
         Ok(Rc::new(Self {
             device,
             context_capacity,
@@ -395,14 +1044,19 @@ impl StateStore {
             bank_capacity,
             recurrent_bank_bytes,
             component_specs,
-            recurrent,
-            history: RefCell::new(None),
-            arena: Rc::new(RefCell::new(Arena {
-                free: vec![(0, history_capacity)],
-            })),
+            backing: RefCell::new(Backing {
+                history: Vec::new(),
+                rows: 0,
+                recurrent,
+                banks: committed_banks,
+            }),
+            arena: Rc::new(RefCell::new(Arena::new(0))),
             banks,
             zero_seed,
             owners: Cell::new(0),
+            transactions: Transactions(Rc::new(Cell::new(0))),
+            relayouts: Cell::new(Relayouts::default()),
+            recommits: Cell::new(0),
         }))
     }
     pub fn component_specs(&self) -> &[ComponentSpec] {
@@ -415,12 +1069,27 @@ impl StateStore {
     /// bank index selects the same row of every arena. Kernels read a
     /// sequence's accepted bank and write only an advance's successor bank;
     /// they never write an accepted bank or [`ZERO_SEED_BANK`].
-    pub fn recurrent_arenas(&self) -> &[Tensor] {
-        &self.recurrent
+    pub fn recurrent_arenas(&self) -> Rc<[Tensor]> {
+        self.backing.borrow().recurrent.clone()
     }
-    /// Banks in each recurrent arena, including the zero seed.
+    /// Banks reserved in each recurrent arena, including the zero seed.
     pub fn recurrent_bank_count(&self) -> Result<usize, Error> {
         self.bank_capacity.storage_total()
+    }
+    /// History rows and recurrent banks physically committed now.
+    pub fn committed(&self) -> (usize, usize) {
+        let backing = self.backing.borrow();
+        (backing.rows, backing.banks)
+    }
+    /// Physical bytes of the committed backing.
+    pub fn committed_bytes(&self) -> u64 {
+        let backing = self.backing.borrow();
+        backing
+            .history
+            .iter()
+            .chain(backing.recurrent.iter())
+            .map(Tensor::storage_bytes)
+            .sum()
     }
     pub fn history_capacity(&self) -> usize {
         self.history_capacity
@@ -455,25 +1124,300 @@ impl StateStore {
         })
     }
     pub fn history_allocated(&self) -> bool {
-        self.history.borrow().is_some()
+        !self.backing.borrow().history.is_empty()
     }
-    pub fn history_planes(&self) -> Result<Vec<PlaneBuffer>, Error> {
-        if self.history.borrow().is_none() {
-            let buffers = self
-                .components
+
+    /// Commit backing for a launch before any of its transactions begin: the
+    /// rows the demands need beyond the free committed rows, plus the rows a
+    /// history ending at the committed frontier needs to keep growing in
+    /// place, and `banks` free successor banks. Growth is geometric and
+    /// bounded by the reservation; a device limit leaves the backing as it is
+    /// and the caller's capacity check reports the shortage. Nothing changes
+    /// while a transaction holds this store's tensors.
+    pub fn provision(&self, demands: &[RowDemand], banks: usize) -> Result<(), Error> {
+        if !self.transactions.idle() {
+            return Ok(());
+        }
+        if !self.components.is_empty() {
+            self.provision_history(demands)?;
+        }
+        let shortage = banks.saturating_sub(self.banks.available());
+        if shortage != 0 && self.has_recurrent_components() {
+            let committed = self.backing.borrow().banks;
+            let target = grown(
+                committed,
+                committed + shortage,
+                BANK_GRANULE,
+                self.bank_capacity.storage_total()?,
+            );
+            self.recommit_banks(target)?;
+        }
+        Ok(())
+    }
+
+    /// History backing for a launch's demands. Every sequence history must
+    /// stay one run, so a history that cannot grow in place is never split
+    /// while the backing can make room: the store relays out every history
+    /// (each live one contiguous, followed by growth room) into a backing
+    /// grown when the rows in use plus demand and headroom exceed it.
+    /// Backends that reallocate on growth pay that copy anyway, so every
+    /// growth there is a relayout; a backend that resizes in place grows
+    /// in place and relays out only for a history without room.
+    fn provision_history(&self, demands: &[RowDemand]) -> Result<(), Error> {
+        let total = demands.iter().map(|demand| demand.rows).sum::<usize>();
+        if total == 0 {
+            return Ok(());
+        }
+        let (committed, in_place) = {
+            let backing = self.backing.borrow();
+            let in_place = backing.history.first().is_none_or(Tensor::resizes_in_place);
+            (backing.rows, in_place)
+        };
+        let (referenced, growing, frontier) = {
+            let arena = self.arena.borrow();
+            // Histories that grow in this launch, and the rows each needs.
+            let mut growing = BTreeMap::new();
+            for demand in demands {
+                if let Some(end) = demand.after {
+                    for id in arena.live_ending_at(end) {
+                        growing.insert(id, (end, demand.rows));
+                    }
+                }
+            }
+            let frontier = arena
+                .free
+                .last()
+                .filter(|(start, count)| start + count == committed)
+                .map_or(committed, |(start, _)| *start);
+            (arena.referenced, growing, frontier)
+        };
+        let required = referenced + total + referenced / HEADROOM_DIVISOR;
+        let target = if required > committed {
+            grown(committed, required, HISTORY_GRANULE, self.history_capacity)
+        } else {
+            committed
+        };
+        // A history without room that a relayout can give room to. In-place
+        // growth extends the free rows after the frontier history.
+        let stranded = {
+            let arena = self.arena.borrow();
+            growing.iter().any(|(&id, &(end, rows))| {
+                let extension = if in_place && end == frontier {
+                    target - committed
+                } else {
+                    0
+                };
+                arena.room_at(end) + extension < rows && arena.owns_its_end(id)
+            })
+        };
+        let slack = target.saturating_sub(referenced + total);
+        let relayout = referenced != 0
+            && ((target > committed && !in_place)
+                || (stranded && slack >= referenced / RELAYOUT_SLACK_DIVISOR));
+        if relayout {
+            let demanded = growing
+                .into_iter()
+                .map(|(id, (_, rows))| (id, rows))
+                .collect::<BTreeMap<_, _>>();
+            if self.relayout_history(target, &demanded, total)? {
+                return Ok(());
+            }
+        }
+        if target > committed {
+            self.recommit_history(target)?;
+        }
+        Ok(())
+    }
+
+    /// Relay out every history into `rows` committed rows with
+    /// [`Arena::relayout`], copying the referenced rows into new planes. The
+    /// free rows beyond `demand` become growth room: each demanding history
+    /// gets its demand, and every live history a share of the rest in
+    /// proportion to the rows it may still grow (up to the context). `false`
+    /// when the device refuses the allocation; nothing changes then.
+    fn relayout_history(
+        &self,
+        rows: usize,
+        demanded: &BTreeMap<u64, usize>,
+        demand: usize,
+    ) -> Result<bool, Error> {
+        let mut backing = self.backing.borrow_mut();
+        let mut arena = self.arena.borrow().clone();
+        let Some(spare) = rows.checked_sub(arena.referenced + demand) else {
+            return Ok(false);
+        };
+        let rooms = arena
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.live)
+            .map(|(&id, entry)| (id, self.context_capacity.saturating_sub(entry.rows())))
+            .collect::<Vec<_>>();
+        let total_room = rooms.iter().map(|(_, room)| room).sum::<usize>().max(1);
+        let gaps = rooms
+            .into_iter()
+            .map(|(id, room)| {
+                let share = (spare as u128 * room as u128 / total_room as u128) as usize;
+                (id, demanded.get(&id).copied().unwrap_or(0) + share.min(room))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let moves = arena
+            .relayout(rows, &gaps)
+            .into_iter()
+            .map(|(from, to, count)| (from as u64, to as u64, count as u64))
+            .collect::<Vec<_>>();
+        let planes = backing
+            .history
+            .iter()
+            .map(|plane| plane.relocated(rows as u64, &moves))
+            .collect::<Result<Vec<_>, _>>();
+        let planes = match planes {
+            Ok(planes) => planes,
+            Err(error) if allocation_capacity(&error) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let copied = moves.iter().map(|(_, _, count)| *count as usize).sum::<usize>();
+        *self.arena.borrow_mut() = arena;
+        backing.history = planes;
+        backing.rows = rows;
+        let stats = self.relayouts.get();
+        self.relayouts.set(Relayouts {
+            count: stats.count + 1,
+            rows: stats.rows + copied,
+        });
+        Ok(true)
+    }
+
+    /// History relayouts performed so far and the rows they copied.
+    pub fn relayouts(&self) -> Relayouts {
+        self.relayouts.get()
+    }
+
+    /// Release committed history rows and banks beyond what the store needs:
+    /// the referenced rows plus growth headroom, and the claimed banks plus a
+    /// successor for every owner plus a granule. Idle shrinking releases only
+    /// once the backing is at least twice that, so serving never alternates
+    /// between growing and shrinking; pressure releases everything beyond it.
+    /// An unreferenced tail is released in place; live rows above the kept
+    /// rows are relaid out downward first. Returns the physical bytes
+    /// released. Nothing changes while a transaction exists.
+    pub fn shrink(&self, policy: ShrinkPolicy) -> Result<u64, Error> {
+        if !self.transactions.idle() {
+            return Ok(0);
+        }
+        let release = |committed: usize, needed: usize| match policy {
+            ShrinkPolicy::Idle => committed >= 2 * needed,
+            ShrinkPolicy::Pressure => committed > needed,
+        };
+        // Idle keeps the room growth would give the rows in use again (a
+        // relayout copies every live row, so it must not recur as requests
+        // come and go); pressure keeps only the growth headroom.
+        let headroom = match policy {
+            ShrinkPolicy::Idle => 1,
+            ShrinkPolicy::Pressure => HEADROOM_DIVISOR,
+        };
+        let before = self.committed_bytes();
+        let (rows, banks) = self.committed();
+        let (top, referenced) = {
+            let arena = self.arena.borrow();
+            let top = arena
+                .runs
+                .last_key_value()
+                .map_or(0, |(start, run)| start + run.count);
+            (top, arena.referenced)
+        };
+        let needed = (referenced + referenced / headroom)
+            .max(HISTORY_GRANULE)
+            .div_ceil(HISTORY_GRANULE)
+            * HISTORY_GRANULE;
+        if rows != 0 && release(rows, needed) {
+            if top <= needed {
+                self.recommit_history(needed)?;
+            } else {
+                self.relayout_history(needed, &BTreeMap::new(), 0)?;
+            }
+        }
+        if self.has_recurrent_components() {
+            let claimed = banks - 1 - self.banks.available();
+            let needed = (1 + claimed + self.owners.get() + BANK_GRANULE)
+                .max(self.banks.required(banks));
+            if release(banks, needed) {
+                self.recommit_banks(needed)?;
+            }
+        }
+        Ok(before.saturating_sub(self.committed_bytes()))
+    }
+
+    /// Recommit every history plane to `rows` leading rows. The arena gains
+    /// the new rows as a hole, or loses a tail that no claim references.
+    fn recommit_history(&self, rows: usize) -> Result<(), Error> {
+        let mut backing = self.backing.borrow_mut();
+        if rows == backing.rows {
+            return Ok(());
+        }
+        let planes = if backing.history.is_empty() {
+            self.components
                 .iter()
                 .flat_map(ComponentDescriptor::planes)
                 .map(|plane| {
-                    let mut extents = Vec::with_capacity(plane.row_extents.len() + 1);
-                    extents.push(self.history_capacity as u64);
-                    extents.extend(plane.row_extents.iter().map(|extent| *extent as u64));
-                    Tensor::zeros(&self.device, element(plane.dtype), &extents).map_err(Error::from)
+                    Tensor::reserved(
+                        &self.device,
+                        element(plane.dtype),
+                        &leading_extents(self.history_capacity, &plane.row_extents)?,
+                        rows as u64,
+                    )
+                    .map_err(Error::from)
                 })
-                .collect::<Result<Vec<_>, _>>()?;
-            *self.history.borrow_mut() = Some(buffers);
+                .collect::<Result<Vec<_>, _>>()
+        } else {
+            backing
+                .history
+                .iter()
+                .map(|plane| plane.recommitted(rows as u64).map_err(Error::from))
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let planes = match planes {
+            Ok(planes) => planes,
+            Err(Error::Tensor(error)) if allocation_capacity(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        self.arena.borrow_mut().resize(backing.rows, rows);
+        backing.history = planes;
+        backing.rows = rows;
+        self.recommits.set(self.recommits.get() + 1);
+        Ok(())
+    }
+
+    /// Times the history rows or banks were recommitted (grown or shrunk
+    /// without a relayout); each may copy the backing.
+    pub fn recommits(&self) -> usize {
+        self.recommits.get()
+    }
+
+    fn recommit_banks(&self, banks: usize) -> Result<(), Error> {
+        let mut backing = self.backing.borrow_mut();
+        if banks == backing.banks {
+            return Ok(());
         }
-        let history = self.history.borrow();
-        let tensors = history.as_ref().unwrap();
+        let arenas = backing
+            .recurrent
+            .iter()
+            .map(|arena| arena.recommitted(banks as u64))
+            .collect::<Result<Rc<[Tensor]>, _>>();
+        let arenas = match arenas {
+            Ok(arenas) => arenas,
+            Err(error) if allocation_capacity(&error) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        self.banks.resize(backing.banks, banks);
+        backing.recurrent = arenas;
+        backing.banks = banks;
+        self.recommits.set(self.recommits.get() + 1);
+        Ok(())
+    }
+
+    pub fn history_planes(&self) -> Result<Vec<PlaneBuffer>, Error> {
+        let backing = self.backing.borrow();
+        let tensors = &backing.history;
         Ok(self
             .components
             .iter()
@@ -500,47 +1444,57 @@ impl StateStore {
             )
             .collect())
     }
+    /// History rows referenced by at least one claim; a shared row counts once.
     pub fn occupied_rows(&self) -> usize {
-        self.history_capacity - self.arena.borrow().available()
+        self.arena.borrow().referenced
     }
-    /// Recurrent bank bytes returned to the pool by closing the selected
-    /// states. A bank is reclaimed only when every claim on it belongs to the
-    /// selection: shared checkpoints, unselected descendants, and in-flight
-    /// advances prevent reclaim, and the zero seed is never reclaimed.
-    pub fn reclaimable(self: &Rc<Self>, states: &[&SequenceState]) -> Result<usize, Error> {
-        if states.iter().any(|state| !Rc::ptr_eq(self, &state.store)) {
-            return Err(Error::Request(
-                "reclamation requires states from this store".into(),
-            ));
-        }
-        let mut distinct: Vec<&SequenceState> = Vec::with_capacity(states.len());
-        for state in states {
-            if !distinct.iter().any(|seen| std::ptr::eq(*seen, *state)) {
-                distinct.push(state);
+    /// Bytes released if exactly the given holders were dropped: history rows
+    /// and recurrent banks that no claim outside the set references. Shared
+    /// prefixes are priced once, as a set; checkpoints, descendants and
+    /// in-flight advances outside the set pin what they reference, and the
+    /// zero seed is never released. Repeated holders count once.
+    pub fn exclusive_bytes(self: &Rc<Self>, holders: &[Holder<'_>]) -> Result<u64, Error> {
+        let mut distinct: Vec<&Holder<'_>> = Vec::with_capacity(holders.len());
+        for holder in holders {
+            if !Rc::ptr_eq(self, holder.store()) {
+                return Err(Error::Request(
+                    "exclusive accounting requires holders from this store".into(),
+                ));
+            }
+            if !distinct.iter().any(|seen| seen.same(holder)) {
+                distinct.push(holder);
             }
         }
-        let mut banks = 0usize;
+        let ranges = distinct
+            .iter()
+            .flat_map(|holder| holder.claims().ranges())
+            .collect::<Vec<_>>();
+        let rows = self.arena.borrow().exclusive_rows(&ranges);
+        let mut banks = 0u64;
         let mut counted: Vec<*const BankClaim> = Vec::new();
-        for state in &distinct {
-            let claim = Rc::as_ptr(&state.bank.0);
-            if state.bank.index() == ZERO_SEED_BANK || counted.contains(&claim) {
+        for holder in &distinct {
+            let bank = holder.bank();
+            let claim = Rc::as_ptr(&bank.0);
+            if bank.index() == ZERO_SEED_BANK || counted.contains(&claim) {
                 continue;
             }
             counted.push(claim);
             let selected = distinct
                 .iter()
-                .filter(|other| Rc::ptr_eq(&other.bank.0, &state.bank.0))
+                .filter(|other| Rc::ptr_eq(&other.bank().0, &bank.0))
                 .count();
-            if selected == Rc::strong_count(&state.bank.0) {
+            if selected == Rc::strong_count(&bank.0) {
                 banks += 1;
             }
         }
-        let bytes = self
-            .recurrent_bank_bytes
-            .checked_mul(banks as u64)
-            .ok_or_else(|| Error::Request("reclaimable state bytes overflow".into()))?;
-        usize::try_from(bytes)
-            .map_err(|_| Error::Request("reclaimable state bytes exceed host range".into()))
+        (rows as u64)
+            .checked_mul(self.total_history_row_bytes)
+            .and_then(|history| {
+                self.recurrent_bank_bytes
+                    .checked_mul(banks)
+                    .and_then(|recurrent| history.checked_add(recurrent))
+            })
+            .ok_or_else(|| Error::Request("exclusive state byte count overflow".into()))
     }
     pub fn idle(&self) -> bool {
         self.owners.get() == 0
@@ -558,33 +1512,42 @@ impl StateStore {
     /// Drop the store's arena allocations when no sequence/checkpoint owns them.
     /// External completion/buffer pins may still retain physical storage.
     pub fn release_idle(&self) -> Result<usize, Error> {
-        if !self.idle() {
+        if !self.idle() || !self.transactions.idle() {
             return Ok(0);
         }
-        self.history.borrow_mut().take().map_or(Ok(0), |v| {
-            usize::try_from(Tensor::reclaimable_bytes(v.iter())?)
-                .map_err(|_| Error::Request("reclaimable history bytes exceed host range".into()))
-        })
+        let planes = {
+            let mut backing = self.backing.borrow_mut();
+            backing.rows = 0;
+            std::mem::take(&mut backing.history)
+        };
+        *self.arena.borrow_mut() = Arena::new(0);
+        usize::try_from(Tensor::reclaimable_bytes(planes.iter())?)
+            .map_err(|_| Error::Request("reclaimable history bytes exceed host range".into()))
     }
     pub fn create(self: &Rc<Self>) -> Result<SequenceState, Error> {
         let bank = self.zero_seed.clone();
+        let claims = Claims::new(&self.arena, vec![]);
+        claims.set_live(true);
         self.owners.set(self.owners.get() + 1);
         Ok(SequenceState {
             store: self.clone(),
             position: 0,
             expected_end: 0,
             history_start: 0,
-            retained_start: 0,
-            extents: vec![],
+            claims,
             bank,
         })
     }
-    /// Reserve `count` rows, in logical order, for a sequence whose history
-    /// ends at row `after` (see [`Arena`] for placement).
-    fn reserve(&self, after: Option<usize>, count: usize) -> Result<Vec<Rc<Extent>>, Error> {
+    /// Reserve `count` rows, in logical order, to follow `history` (none for
+    /// rows of a new history; see [`Arena`] for placement). Provisioning may
+    /// relay the history out, so its end is read again before claiming.
+    fn reserve(&self, history: Option<&Claims>, count: usize) -> Result<Claims, Error> {
         if self.components.is_empty() {
-            return Ok(vec![]);
+            return Ok(Claims::new(&self.arena, vec![]));
         }
+        let after = history.and_then(Claims::end);
+        self.provision(&[RowDemand { after, rows: count }], 0)?;
+        let after = history.and_then(Claims::end);
         let mut arena = self.arena.borrow_mut();
         let available_rows = arena.available();
         if available_rows < count {
@@ -595,36 +1558,63 @@ impl StateStore {
                 available_bytes: capacity_charge(available_rows, total_bytes, capacity, false)?,
             });
         }
-        Ok(arena
-            .claim(after, count)
-            .into_iter()
-            .map(|(start, count)| {
-                Rc::new(Extent {
-                    arena: self.arena.clone(),
-                    start,
-                    count,
-                })
-            })
-            .collect())
+        let ranges = arena.claim(after, count);
+        drop(arena);
+        Ok(Claims::new(&self.arena, ranges))
     }
 
-    fn reserve_contiguous(&self, count: usize) -> Option<Rc<Extent>> {
+    /// A free successor bank, committing more banks first when none is free
+    /// and no transaction holds this store's tensors.
+    fn successor_bank(&self) -> Result<BankHandle, Error> {
+        self.provision(&[], 1)?;
+        self.banks.acquire()
+    }
+
+    fn begin_transaction(&self) -> Transaction {
+        self.transactions.begin()
+    }
+
+    fn reserve_contiguous(&self, count: usize) -> Option<Claims> {
         if count == 0 || self.components.is_empty() {
             return None;
         }
-        let mut arena = self.arena.borrow_mut();
-        let slot = arena.free.iter().position(|(_, size)| *size >= count)?;
-        let (start, size) = arena.free[slot];
-        if size == count {
-            arena.free.remove(slot);
-        } else {
-            arena.free[slot] = (start + count, size - count);
+        let start = self.arena.borrow_mut().claim_contiguous(count)?;
+        Some(Claims::new(&self.arena, vec![(start, count)]))
+    }
+}
+
+/// A claim holder priced by [`StateStore::exclusive_bytes`].
+#[derive(Clone, Copy)]
+pub enum Holder<'a> {
+    State(&'a SequenceState),
+    Checkpoint(&'a StateCheckpoint),
+}
+
+impl Holder<'_> {
+    fn store(&self) -> &Rc<StateStore> {
+        match self {
+            Self::State(state) => &state.store,
+            Self::Checkpoint(checkpoint) => &checkpoint.store,
         }
-        Some(Rc::new(Extent {
-            arena: self.arena.clone(),
-            start,
-            count,
-        }))
+    }
+    fn claims(&self) -> &Claims {
+        match self {
+            Self::State(state) => &state.claims,
+            Self::Checkpoint(checkpoint) => &checkpoint.claims,
+        }
+    }
+    fn bank(&self) -> &BankHandle {
+        match self {
+            Self::State(state) => &state.bank,
+            Self::Checkpoint(checkpoint) => &checkpoint.bank,
+        }
+    }
+    fn same(&self, other: &Holder<'_>) -> bool {
+        match (self, other) {
+            (Holder::State(left), Holder::State(right)) => std::ptr::eq(*left, *right),
+            (Holder::Checkpoint(left), Holder::Checkpoint(right)) => std::ptr::eq(*left, *right),
+            _ => false,
+        }
     }
 }
 
@@ -675,8 +1665,9 @@ pub struct SequenceState {
     position: usize,
     expected_end: usize,
     history_start: usize,
-    retained_start: usize,
-    extents: Vec<Rc<Extent>>,
+    /// Claims on exactly the visible rows `[history_start, position)`, in
+    /// logical order; a live history.
+    claims: Claims,
     bank: BankHandle,
 }
 impl Drop for SequenceState {
@@ -710,51 +1701,36 @@ impl SequenceState {
     /// The arena row just past this sequence's last accepted row: where its
     /// next rows continue its history without a new segment.
     fn history_end(&self) -> Option<usize> {
-        self.extents
-            .last()
-            .map(|extent| extent.start + extent.count)
+        self.claims.end()
+    }
+    /// This sequence's demand for appending `rows`, for provisioning a
+    /// launch's backing before its advances begin.
+    pub fn demand(&self, rows: usize) -> RowDemand {
+        RowDemand {
+            after: self.history_end(),
+            rows,
+        }
     }
     pub fn history_ranges(&self) -> Vec<(usize, usize)> {
-        let mut skip = self.history_start - self.retained_start;
-        let mut spans: Vec<(usize, usize)> = vec![];
-        for extent in &self.extents {
-            let omitted = skip.min(extent.count);
-            skip -= omitted;
-            let (start, count) = (extent.start + omitted, extent.count - omitted);
-            if count == 0 {
-                continue;
-            }
-            if let Some((s, n)) = spans.last_mut() {
-                if *s + *n == start {
-                    *n += count;
-                    continue;
-                }
-            }
-            spans.push((start, count));
-        }
-        spans
+        self.claims.ranges()
     }
+    /// Stop seeing rows before logical position `before`. Exactly the trimmed
+    /// rows lose this sequence's reference.
     pub fn trim_history(&mut self, before: usize) -> Result<(), String> {
         if before < self.history_start || before > self.position {
             return Err("history trim must lie within accepted logical positions".into());
         }
-        let mut retained = self.retained_start;
-        let mut count = 0;
-        for extent in &self.extents {
-            if retained + extent.count > before {
-                break;
-            }
-            retained += extent.count;
-            count += 1;
+        if !self.store.components.is_empty() {
+            self.claims.drop_front(before - self.history_start);
         }
-        self.extents.drain(..count);
-        self.retained_start = retained;
         self.history_start = before;
         Ok(())
     }
 
+    /// At the launch segment limit: the next advance could start one more
+    /// run, so the history is repacked before its next launch.
     pub fn compaction_needed(&self) -> bool {
-        self.history_ranges().len() > MAX_VISIBLE_SEGMENTS
+        self.history_ranges().len() >= MAX_VISIBLE_SEGMENTS
     }
 
     pub fn checkpoint(&self) -> StateCheckpoint {
@@ -763,8 +1739,7 @@ impl SequenceState {
             store: self.store.clone(),
             position: self.position,
             history_start: self.history_start,
-            retained_start: self.retained_start,
-            extents: self.extents.clone(),
+            claims: self.claims.clone(),
             bank: self.bank.clone(),
         }
     }
@@ -781,8 +1756,7 @@ pub struct StateCheckpoint {
     store: Rc<StateStore>,
     position: usize,
     history_start: usize,
-    retained_start: usize,
-    extents: Vec<Rc<Extent>>,
+    claims: Claims,
     bank: BankHandle,
 }
 impl Drop for StateCheckpoint {
@@ -797,102 +1771,40 @@ impl StateCheckpoint {
     pub fn bank_index(&self) -> usize {
         self.bank.index()
     }
-    /// Physical resource bytes pinned by this checkpoint. History charges the
-    /// complete allocated extents (including trimmed rows that cannot be
-    /// released while the extent is shared); recurrent state charges the one
-    /// bank retained by the checkpoint.
-    pub fn retained_bytes(&self) -> Result<u64, String> {
-        let history_rows = self.extents.iter().try_fold(0_u64, |total, extent| {
-            total
-                .checked_add(
-                    u64::try_from(extent.count)
-                        .map_err(|_| "checkpoint history rows exceed the byte domain")?,
-                )
-                .ok_or_else(|| "checkpoint history row count overflow".to_owned())
-        })?;
-        let history = history_rows
-            .checked_mul(self.store.total_history_row_bytes)
-            .ok_or("checkpoint history byte count overflow")?;
-        history
-            .checked_add(self.store.recurrent_bank_bytes)
-            .ok_or_else(|| "checkpoint retained byte count overflow".to_owned())
+    pub fn belongs_to(&self, store: &Rc<StateStore>) -> bool {
+        Rc::ptr_eq(&self.store, store)
+    }
+    pub fn store(&self) -> &Rc<StateStore> {
+        &self.store
+    }
+    pub fn history_ranges(&self) -> Vec<(usize, usize)> {
+        self.claims.ranges()
     }
     pub fn fork(&self) -> SequenceState {
+        let claims = self.claims.clone();
+        claims.set_live(true);
         self.store.owners.set(self.store.owners.get() + 1);
         SequenceState {
             store: self.store.clone(),
             position: self.position,
             expected_end: self.position,
             history_start: self.history_start,
-            retained_start: self.retained_start,
-            extents: self.extents.clone(),
+            claims,
             bank: self.bank.clone(),
         }
     }
 }
 fn install_commit(
     state: &mut SequenceState,
-    extents: &mut Vec<Rc<Extent>>,
+    claims: Claims,
     following: &mut BankHandle,
     count: usize,
 ) {
-    // V3 merges adjacent extents only when the accepted tail has no other
-    // owners. A checkpoint's retained boundary must never grow.
-    if let (Some(previous), Some(next)) = (state.extents.last_mut(), extents.first_mut()) {
-        if Rc::strong_count(previous) == 1 && previous.start + previous.count == next.start {
-            let previous = Rc::get_mut(previous).unwrap();
-            let next = Rc::get_mut(next).unwrap();
-            previous.count += next.count;
-            next.count = 0;
-            extents.remove(0);
-        }
-    }
-    state.extents.append(extents);
+    // Appending moves references: what a checkpoint or fork sharing this
+    // history's rows sees never changes.
+    state.claims.append(claims);
     std::mem::swap(&mut state.bank, following);
     state.position += count;
-}
-
-fn split_extent_prefix(
-    mut extents: ExtentSet,
-    keep_rows: usize,
-) -> Result<(ExtentSet, ExtentSet), String> {
-    let total = extents.iter().map(|extent| extent.count).sum::<usize>();
-    if keep_rows > total {
-        return Err("accepted prefix exceeds reserved extent rows".into());
-    }
-    let mut remaining = keep_rows;
-    let mut kept = Vec::new();
-    let mut released = Vec::new();
-    for mut extent in extents.drain(..) {
-        if remaining == 0 {
-            released.push(extent);
-        } else if remaining >= extent.count {
-            remaining -= extent.count;
-            kept.push(extent);
-        } else {
-            if Rc::strong_count(&extent) != 1 {
-                return Err("cannot split a reserved extent with outstanding claims".into());
-            }
-            let current = Rc::get_mut(&mut extent).unwrap();
-            let arena = current.arena.clone();
-            let start = current.start;
-            let count = current.count;
-            current.count = 0;
-            kept.push(Rc::new(Extent {
-                arena: arena.clone(),
-                start,
-                count: remaining,
-            }));
-            released.push(Rc::new(Extent {
-                arena,
-                start: start + remaining,
-                count: count - remaining,
-            }));
-            remaining = 0;
-        }
-    }
-    debug_assert_eq!(remaining, 0);
-    Ok((kept, released))
 }
 
 #[cfg(test)]
@@ -953,31 +1865,80 @@ mod tests {
         }
     }
 
-    #[test]
-    fn dropping_extents_coalesces_adjacent_arena_ranges() {
-        let arena = Rc::new(RefCell::new(Arena { free: vec![] }));
-        let left = Extent {
-            arena: arena.clone(),
-            start: 2,
-            count: 3,
-        };
-        let right = Extent {
-            arena: arena.clone(),
-            start: 5,
-            count: 4,
-        };
+    /// Claim exactly `[start, start + count)`, which must lie in one hole.
+    fn claim_rows(arena: &Rc<RefCell<Arena>>, start: usize, count: usize) -> Claims {
+        let mut inner = arena.borrow_mut();
+        let hole = inner
+            .free
+            .iter()
+            .position(|(hole, size)| *hole <= start && start + count <= hole + size)
+            .expect("rows lie in one hole");
+        let offset = start - inner.free[hole].0;
+        inner.take(hole, offset, count);
+        drop(inner);
+        Claims::new(arena, vec![(start, count)])
+    }
 
+    /// One history of the given rows, each claimed as in [`claim_rows`].
+    fn history(arena: &Rc<RefCell<Arena>>, ranges: &[(usize, usize)]) -> Claims {
+        let mut claims = Claims::new(arena, vec![]);
+        for &(start, count) in ranges {
+            claims.append(claim_rows(arena, start, count));
+        }
+        claims
+    }
+
+    fn arena(rows: usize) -> Rc<RefCell<Arena>> {
+        Rc::new(RefCell::new(Arena::new(rows)))
+    }
+
+    #[test]
+    fn dropping_claims_coalesces_adjacent_arena_ranges() {
+        let arena = arena(16);
+        let left = claim_rows(&arena, 2, 3);
+        let right = claim_rows(&arena, 5, 4);
+        assert_eq!(arena.borrow().free, vec![(0, 2), (9, 7)]);
         drop(right);
         drop(left);
+        assert_eq!(arena.borrow().free, vec![(0, 16)]);
+        assert_eq!(arena.borrow().referenced, 0);
+        assert!(arena.borrow().runs.is_empty());
+    }
 
-        assert_eq!(arena.borrow().free, vec![(2, 7)]);
+    #[test]
+    fn rows_are_shared_at_row_granularity_and_freed_by_their_last_claim() {
+        let arena = arena(32);
+        let path = claim_rows(&arena, 0, 12);
+        // Two branches share the first 8 and first 5 rows of the path.
+        let mut eight = path.clone();
+        drop(eight.split_off(8));
+        let mut five = path.clone();
+        drop(five.split_off(5));
+        assert_eq!(arena.borrow().referenced, 12);
+        // Pricing is by set: the path alone owns rows 8..12; the path and
+        // the 8-row branch own 5..12; all three own everything.
+        assert_eq!(arena.borrow().exclusive_rows(&[(0, 12)]), 4);
+        assert_eq!(arena.borrow().exclusive_rows(&[(0, 12), (0, 8)]), 7);
+        assert_eq!(arena.borrow().exclusive_rows(&[(0, 12), (0, 8), (0, 5)]), 12);
+        assert_eq!(arena.borrow().exclusive_rows(&[(0, 5)]), 0);
+        drop(path);
+        assert_eq!(arena.borrow().referenced, 8);
+        assert_eq!(arena.borrow().free, vec![(8, 24)]);
+        drop(eight);
+        assert_eq!(arena.borrow().free, vec![(5, 27)]);
+        // A history joins its physical successor without touching references.
+        let tail = claim_rows(&arena, 5, 3);
+        five.append(tail);
+        assert_eq!(five.ranges(), [(0, 8)]);
+        assert_eq!(arena.borrow().runs.len(), 1);
+        drop(five);
+        assert_eq!(arena.borrow().free, vec![(0, 32)]);
+        assert!(arena.borrow().runs.is_empty());
     }
 
     #[test]
     fn arena_grows_histories_in_place_and_starts_new_ones_mid_hole() {
-        let mut arena = Arena {
-            free: vec![(0, 100)],
-        };
+        let mut arena = Arena::new(100);
         // Row 0 has no preceding history: fill from its start.
         assert_eq!(arena.claim(None, 10), [(0, 10)]);
         // A new history leaves the rows after [0, 10) as that history's room.
@@ -1020,9 +1981,19 @@ mod tests {
         )
         .unwrap();
         assert!(!store.history_allocated());
+        assert!(store.history_planes().unwrap().is_empty());
         assert_eq!(store.total_history_row_bytes(), 32);
         assert_eq!(store.total_history_bytes(), 256);
 
+        store
+            .provision(
+                &[RowDemand {
+                    after: None,
+                    rows: 1,
+                }],
+                0,
+            )
+            .unwrap();
         let first = store.history_planes().unwrap();
         assert!(store.history_allocated());
         assert_eq!(first.len(), 2);
@@ -1072,48 +2043,37 @@ mod tests {
         ));
     }
 
-    fn test_extent(arena: &Rc<RefCell<Arena>>, start: usize, count: usize) -> Rc<Extent> {
-        Rc::new(Extent {
-            arena: arena.clone(),
-            start,
-            count,
-        })
-    }
-
-    fn extent_ranges(extents: &[Rc<Extent>]) -> Vec<(usize, usize)> {
-        extents
-            .iter()
-            .map(|extent| (extent.start, extent.count))
-            .collect()
-    }
-
     #[test]
-    fn prefix_split_handles_zero_interior_full_and_fragmented_extents() {
+    fn prefix_split_handles_zero_interior_full_and_fragmented_claims() {
         for (accepted, expected_kept, expected_released) in [
             (0, vec![], vec![(0, 3), (8, 4)]),
             (5, vec![(0, 3), (8, 2)], vec![(10, 2)]),
             (7, vec![(0, 3), (8, 4)], vec![]),
         ] {
-            let arena = Rc::new(RefCell::new(Arena { free: vec![] }));
-            let extents = vec![test_extent(&arena, 0, 3), test_extent(&arena, 8, 4)];
-            let (kept, released) = split_extent_prefix(extents, accepted).unwrap();
-            assert_eq!(extent_ranges(&kept), expected_kept);
-            assert_eq!(extent_ranges(&released), expected_released);
+            let arena = arena(12);
+            let mut kept = history(&arena, &[(0, 3), (8, 4)]);
+            let released = kept.split_off(accepted);
+            assert_eq!(kept.ranges(), expected_kept);
+            assert_eq!(released.ranges(), expected_released);
         }
     }
 
     #[test]
-    fn rejected_tail_is_not_recycled_while_an_extent_claim_is_pinned() {
-        let arena = Rc::new(RefCell::new(Arena { free: vec![] }));
-        let extents = vec![test_extent(&arena, 0, 2), test_extent(&arena, 8, 3)];
-        let tail_pin = extents[1].clone();
-        let (kept, released) = split_extent_prefix(extents, 2).unwrap();
+    fn rejected_tail_is_not_recycled_while_a_claim_is_pinned() {
+        let arena = arena(11);
+        let mut kept = claim_rows(&arena, 0, 2);
+        let tail = claim_rows(&arena, 8, 3);
+        // A shared history still splits: the pin keeps exactly its rows.
+        let tail_pin = tail.clone();
+        kept.append(tail);
+        let released = kept.split_off(3);
+        assert_eq!(kept.ranges(), [(0, 2), (8, 1)]);
         drop(released);
-        assert!(arena.borrow().free.is_empty());
+        assert_eq!(arena.borrow().free, [(2, 6)]);
         drop(tail_pin);
-        assert_eq!(arena.borrow().free, [(8, 3)]);
+        assert_eq!(arena.borrow().free, [(2, 6), (9, 2)]);
         drop(kept);
-        assert_eq!(arena.borrow().free, [(0, 2), (8, 3)]);
+        assert_eq!(arena.borrow().free, [(0, 11)]);
     }
 
     #[test]
@@ -1188,44 +2148,90 @@ mod tests {
         assert_eq!(store.occupied_rows(), 4);
     }
 
+    /// Shared system prompt, two divergent requests and retained checkpoints
+    /// on one path: every holder sees the same physical prefix rows, the
+    /// store holds them once, and pricing a set charges them once.
     #[test]
-    fn checkpoint_reports_all_pinned_history_and_recurrent_storage() {
+    fn shared_prefix_is_the_same_rows_and_is_charged_once() {
         let Some(device) = cpu_device() else {
             return;
         };
         let store = StateStore::new(
             device,
-            8,
-            8,
+            64,
+            256,
             vec![dense_component(1)],
             vec![ComponentSpec {
                 shape: vec![1],
                 dtype: DType::F32,
             }],
             BankCapacity {
-                active: 1,
-                in_flight: 1,
-                retained: 0,
+                active: 4,
+                in_flight: 4,
+                retained: 4,
             },
         )
         .unwrap();
-        let advance = OwnedStateAdvance::begin(store.create().unwrap(), 3)
-            .ok()
-            .unwrap();
-        let OwnedAdvanceResolution::Committed(state) = advance.commit_all().ok().unwrap() else {
-            panic!("full prefix must commit");
+        let row = store.total_history_row_bytes();
+        let bank = store.allocation_trace().unwrap().recurrent_bank_bytes;
+        let commit = |state: SequenceState, rows: usize| {
+            let advance = OwnedStateAdvance::begin(state, rows).ok().unwrap();
+            let OwnedAdvanceResolution::Committed(state) = advance.commit_all().ok().unwrap()
+            else {
+                panic!("full prefix must commit");
+            };
+            state
         };
-        let checkpoint = state.checkpoint();
-        let recurrent = store.allocation_trace().unwrap().recurrent_bank_bytes;
-        assert_eq!(recurrent, 4);
+        // The system prompt is one prefill run.
+        let prompt = commit(store.create().unwrap(), 24);
+        let system = prompt.checkpoint();
+        assert_eq!(system.history_ranges(), [(0, 24)]);
+        // Request A continues the path; requests B and C branch at the prompt.
+        let a = commit(prompt, 8);
+        let b = commit(system.fork(), 6);
+        let c = commit(system.fork(), 3);
+        let a_turn = a.checkpoint();
+        assert_eq!(a.history_ranges(), [(0, 32)]);
+        for branch in [&b, &c] {
+            assert_eq!(branch.history_ranges()[0], (0, 24));
+            assert_eq!(branch.history_ranges().len(), 2);
+        }
+        assert_eq!(store.occupied_rows(), 24 + 8 + 6 + 3);
+        // Alone, each live request owns only its private tail and its bank.
         assert_eq!(
-            checkpoint.retained_bytes().unwrap(),
-            3 * store.total_history_row_bytes() + recurrent
+            store.exclusive_bytes(&[Holder::State(&b)]).unwrap(),
+            6 * row + bank
         );
+        // The retained set (system prompt + A's turn) owns the prefix only
+        // once every live request is gone, and A's tail and bank once A is.
+        let retained = [Holder::Checkpoint(&system), Holder::Checkpoint(&a_turn)];
+        assert_eq!(store.exclusive_bytes(&retained).unwrap(), bank);
+        drop(a);
+        assert_eq!(store.exclusive_bytes(&retained).unwrap(), 8 * row + 2 * bank);
+        drop((b, c));
+        assert_eq!(
+            store.exclusive_bytes(&retained).unwrap(),
+            32 * row + 2 * bank
+        );
+        // Repeated holders count once.
+        let repeated = [
+            Holder::Checkpoint(&system),
+            Holder::Checkpoint(&system),
+            Holder::Checkpoint(&a_turn),
+        ];
+        assert_eq!(
+            store.exclusive_bytes(&repeated).unwrap(),
+            32 * row + 2 * bank
+        );
+        drop((system, a_turn));
+        assert_eq!(store.occupied_rows(), 0);
     }
 
+    /// A history without room in place is relaid out, not split: the
+    /// backing is full (no growth), yet the history continues in one run and
+    /// an interior prefix commits without repair.
     #[test]
-    fn attention_only_interior_prefix_commits_without_repair_when_fragmented() {
+    fn full_backing_relays_out_a_history_without_room_instead_of_splitting_it() {
         let Some(device) = cpu_device() else {
             return;
         };
@@ -1261,9 +2267,14 @@ mod tests {
         // Placement: first [0, 2), middle mid-hole at [4, 6), last [2, 4).
         let checkpoint = first.checkpoint();
         drop(last);
-        // Two rows grow in place, the third starts the largest hole.
+        assert_eq!(middle.history_ranges(), [(4, 2)]);
+        // Two free rows follow `first`, it needs three: the relayout moves
+        // `middle` past `first`'s room instead of splitting `first`.
         let advance = OwnedStateAdvance::begin(first, 3).ok().unwrap();
-        assert_eq!(advance.bindings().destinations, [2, 3, 6]);
+        assert_eq!(store.relayouts().count, 1);
+        assert_eq!(store.committed().0, 8);
+        assert_eq!(advance.bindings().destinations, [2, 3, 4]);
+        assert_eq!(middle.history_ranges(), [(5, 2)]);
         let OwnedAdvanceResolution::Committed(first) = advance.commit(2).ok().unwrap() else {
             panic!("attention prefix must commit without repair");
         };
@@ -1378,6 +2389,17 @@ mod tests {
         let root = parent.checkpoint();
         let left = root.fork();
         let right = root.fork();
+        // A launch provisions every advance's rows and successor bank before
+        // the first of them begins.
+        store
+            .provision(
+                &[2, 1, 3].map(|rows| RowDemand {
+                    after: Some(0),
+                    rows,
+                }),
+                3,
+            )
+            .unwrap();
         let left = OwnedStateAdvance::begin(left, 2).ok().unwrap();
         let right = OwnedStateAdvance::begin(right, 1).ok().unwrap();
         let parent = OwnedStateAdvance::begin(parent, 3).ok().unwrap();
@@ -1412,7 +2434,7 @@ mod tests {
         assert!(!readable(&[&left, &right, &parent], &[&root, &branch]).contains(&following));
         drop(advance);
         drop((left, right, parent, root, branch));
-        assert_eq!(store.available_banks(), 8);
+        assert_eq!(store.available_banks(), store.committed().1 - 1);
     }
 
     #[test]
@@ -1463,6 +2485,32 @@ mod tests {
         assert_eq!(store.available_banks(), 2);
     }
 
+    /// A sequence whose 17 visible rows are the even rows 0..34, with every
+    /// row outside `free` and the sequence held by filler claims.
+    fn fragmented(store: &Rc<StateStore>, free: &[(usize, usize)]) -> (SequenceState, Vec<Claims>) {
+        let rows = store.history_capacity();
+        store
+            .provision(&[RowDemand { after: None, rows }], 0)
+            .unwrap();
+        assert_eq!(store.committed().0, rows);
+        let mut state = store.create().unwrap();
+        let even = (0..17).map(|row| (row * 2, 1)).collect::<Vec<_>>();
+        state.claims.append(history(&store.arena, &even));
+        state.position = 17;
+        let held = |row: usize| {
+            (row < 34 && row % 2 == 0)
+                || free
+                    .iter()
+                    .any(|(start, count)| *start <= row && row < start + count)
+        };
+        let fillers = (0..store.history_capacity())
+            .filter(|row| !held(*row))
+            .map(|row| claim_rows(&store.arena, row, 1))
+            .collect();
+        assert_eq!(store.available_rows(), free.iter().map(|(_, n)| n).sum());
+        (state, fillers)
+    }
+
     #[test]
     fn compaction_is_bit_exact_and_publishes_only_after_success() {
         let Some(device) = cpu_device() else {
@@ -1481,12 +2529,7 @@ mod tests {
             },
         )
         .unwrap();
-        let mut state = store.create().unwrap();
-        state.extents = (0..17)
-            .map(|row| test_extent(&store.arena, row * 2, 1))
-            .collect();
-        state.position = 17;
-        store.arena.borrow_mut().free = vec![(40, 17)];
+        let (state, _fillers) = fragmented(&store, &[(40, 17)]);
 
         let planes = store.history_planes().unwrap();
         for plane in &planes {
@@ -1502,7 +2545,7 @@ mod tests {
         assert!(state.compaction_needed());
         let old_ranges = state.history_ranges();
         let OwnedCompactionPreparation::Ready(failed) =
-            OwnedCompaction::prepare(state).ok().unwrap()
+            OwnedCompaction::prepare(state, 64).ok().unwrap()
         else {
             panic!("contiguous destination must prepare compaction")
         };
@@ -1511,7 +2554,7 @@ mod tests {
         assert_eq!(state.history_ranges(), old_ranges);
 
         let OwnedCompactionPreparation::Ready(compaction) =
-            OwnedCompaction::prepare(state).ok().unwrap()
+            OwnedCompaction::prepare(state, 64).ok().unwrap()
         else {
             panic!("released destination must be reusable")
         };
@@ -1563,23 +2606,74 @@ mod tests {
             },
         )
         .unwrap();
-        let mut state = store.create().unwrap();
-        state.extents = (0..17)
-            .map(|row| test_extent(&store.arena, row * 2, 1))
-            .collect();
-        state.position = 17;
-        store.arena.borrow_mut().free = vec![(40, 8), (50, 9)];
+        let (state, _fillers) = fragmented(&store, &[(40, 8), (50, 9)]);
         assert!(state.compaction_needed());
         let OwnedCompactionPreparation::Deferred {
             state,
             segments,
             visible_rows,
-        } = OwnedCompaction::prepare(state).ok().unwrap()
+        } = OwnedCompaction::prepare(state, 64).ok().unwrap()
         else {
             panic!("fragmented capacity must defer compaction");
         };
         assert_eq!((segments, visible_rows), (17, 17));
         assert_eq!(state.history_ranges().len(), 17);
+    }
+
+    /// Repacking restores adjacency with one bounded copy: a long shared
+    /// prefix stays in place and only the recent decode runs move, joining
+    /// into one run; a checkpoint on the prefix keeps seeing the same rows.
+    #[test]
+    fn repacking_joins_the_recent_runs_and_keeps_a_shared_prefix_in_place() {
+        let Some(device) = cpu_device() else {
+            return;
+        };
+        let store = StateStore::new(
+            device,
+            512,
+            1024,
+            vec![dense_component(1)],
+            vec![],
+            BankCapacity {
+                active: 1,
+                in_flight: 1,
+                retained: 1,
+            },
+        )
+        .unwrap();
+        store
+            .provision(&[RowDemand { after: None, rows: 1024 }], 0)
+            .unwrap();
+        // A 200-row prefix (retained by a checkpoint), then 15 one-row runs
+        // separated by rows other histories hold.
+        let mut state = store.create().unwrap();
+        state.claims.append(claim_rows(&store.arena, 0, 200));
+        state.position = 200;
+        let prefix = state.checkpoint();
+        let mut fillers = Vec::new();
+        for run in 0..15 {
+            let row = 300 + 2 * run;
+            fillers.push(claim_rows(&store.arena, row + 1, 1));
+            state.claims.append(claim_rows(&store.arena, row, 1));
+            state.position += 1;
+        }
+        assert_eq!(state.history_ranges().len(), 16);
+        assert!(state.compaction_needed());
+        let OwnedCompactionPreparation::Ready(compaction) =
+            OwnedCompaction::prepare(state, 64).ok().unwrap()
+        else {
+            panic!("the recent runs fit one bounded copy")
+        };
+        assert_eq!(compaction.rows(), 15);
+        let copy = &compaction.copies()[0];
+        assert_eq!(copy.from, (0..15).map(|run| 300 + 2 * run).collect::<Vec<_>>());
+        // The first free run that fits is the one right after the prefix.
+        assert_eq!(copy.to, (200..215).collect::<Vec<_>>());
+        let state = compaction.commit();
+        assert_eq!(state.history_ranges(), [(0, 215)]);
+        assert_eq!(prefix.history_ranges(), [(0, 200)]);
+        // The moved runs' rows are free again; the prefix is held once.
+        assert_eq!(store.occupied_rows(), 200 + 15 + fillers.len());
     }
 
     /// Lock-step serving of `active` requests for `steps` steps: chunked
@@ -1589,7 +2683,7 @@ mod tests {
     /// holds `contexts` full contexts plus one batch. Returns the largest
     /// segment count any accepted history reached and the number of decode
     /// steps the longest request ran.
-    fn serve_interleaved(active: usize, contexts: usize, steps: usize) -> (usize, usize) {
+    fn serve_interleaved(active: usize, contexts: usize, steps: usize) -> Interleaved {
         const CONTEXT: usize = 512;
         const BATCH_ROWS: usize = 64;
         let device = cpu_device().expect("the CPU backend is available");
@@ -1614,18 +2708,47 @@ mod tests {
             (seed % bound as u64) as usize
         };
         struct Request {
+            serial: u32,
             state: SequenceState,
             prompt: usize,
             length: usize,
             decode_steps: usize,
         }
+        // Every accepted row holds a tag of its request and position; a
+        // finished request reads its whole history back through its ranges,
+        // so every relayout copy is checked.
+        let tag = |serial: u32, position: usize| (serial * 1024 + position as u32) as f32;
+        let verify = |request: &Request| {
+            let plane = store.history_planes().unwrap()[0].buffer.clone();
+            let rows = request
+                .state
+                .history_ranges()
+                .into_iter()
+                .flat_map(|(start, count)| start..start + count)
+                .map(|row| {
+                    let bytes = plane
+                        .slice_leading(row as u64, row as u64 + 1)
+                        .unwrap()
+                        .read_to_host()
+                        .unwrap();
+                    f32::from_le_bytes(bytes[..4].try_into().unwrap())
+                })
+                .collect::<Vec<_>>();
+            let expected = (0..request.state.position())
+                .map(|position| tag(request.serial, position))
+                .collect::<Vec<_>>();
+            assert_eq!(rows, expected, "request {} history", request.serial);
+        };
         let mut slots: Vec<Option<Request>> = (0..active).map(|_| None).collect();
-        let (mut max_segments, mut max_decode_steps) = (0, 0);
+        let (mut max_segments, mut max_decode_steps, mut peak_committed) = (0, 0, 0);
+        let (mut serials, mut written) = (0u32, 0usize);
         for step in 0..steps {
             for slot in &mut slots {
                 if slot.is_none() {
                     let prompt = 16 + random(160);
+                    serials += 1;
                     *slot = Some(Request {
+                        serial: serials,
                         state: store.create().unwrap(),
                         prompt,
                         length: prompt + 200 + random(CONTEXT - prompt - 200),
@@ -1638,22 +2761,48 @@ mod tests {
             let order = (0..active)
                 .map(|index| (index + step) % active)
                 .collect::<Vec<_>>();
+            let planned = order
+                .iter()
+                .map(|&index| {
+                    let request = slots[index].take().unwrap();
+                    let position = request.state.position();
+                    let rows = if position < request.prompt {
+                        (request.prompt - position).min(BATCH_ROWS / 2)
+                    } else {
+                        (1 + random(4)).min(request.length - position)
+                    };
+                    (index, request, rows)
+                })
+                .collect::<Vec<_>>();
+            // The launch provisions the backing for all of its advances.
+            let demands = planned
+                .iter()
+                .map(|(_, request, rows)| RowDemand {
+                    after: request.state.history_end(),
+                    rows: *rows,
+                })
+                .collect::<Vec<_>>();
+            store.provision(&demands, 0).unwrap();
+            peak_committed = peak_committed.max(store.committed().0);
             let mut advances = Vec::with_capacity(active);
-            for &index in &order {
-                let request = slots[index].take().unwrap();
-                let position = request.state.position();
-                let rows = if position < request.prompt {
-                    (request.prompt - position).min(BATCH_ROWS / 2)
-                } else {
-                    (1 + random(4)).min(request.length - position)
-                };
+            for (index, request, rows) in planned {
                 let advance = match OwnedStateAdvance::begin(request.state, rows) {
                     Ok(advance) => advance,
                     Err((_, error)) => panic!("step {step}: {error}"),
                 };
+                let plane = &advance.bindings().history[0].buffer;
+                for (offset, &row) in advance.bindings().destinations.iter().enumerate() {
+                    let value = tag(request.serial, advance.position() + offset);
+                    plane
+                        .slice_leading(row as u64, row as u64 + 1)
+                        .unwrap()
+                        .write_from_host(&value.to_le_bytes())
+                        .unwrap();
+                }
                 advances.push((
                     index,
                     rows,
+                    request.serial,
                     request.prompt,
                     request.length,
                     request.decode_steps,
@@ -1661,7 +2810,7 @@ mod tests {
                 ));
             }
             advances.reverse();
-            for (index, rows, prompt, length, decode_steps, advance) in advances {
+            for (index, rows, serial, prompt, length, decode_steps, advance) in advances {
                 let decode = advance.position() >= prompt;
                 let accepted = if decode { 1 + random(rows) } else { rows };
                 let OwnedAdvanceResolution::Committed(state) =
@@ -1669,16 +2818,25 @@ mod tests {
                 else {
                     panic!("attention-only prefixes commit without repair");
                 };
+                written += accepted;
                 let decode_steps = decode_steps + usize::from(decode);
                 max_segments = max_segments.max(state.history_ranges().len());
                 max_decode_steps = max_decode_steps.max(decode_steps);
-                slots[index] = (state.position() < length).then_some(Request {
+                let request = Request {
+                    serial,
                     state,
                     prompt,
                     length,
                     decode_steps,
-                });
+                };
+                if request.state.position() < length {
+                    slots[index] = Some(request);
+                } else {
+                    verify(&request);
+                }
             }
+            // Worst case for thrash: the engine idles between every batch.
+            store.shrink(ShrinkPolicy::Idle).unwrap();
             let mut ranges = slots
                 .iter()
                 .flatten()
@@ -1691,33 +2849,298 @@ mod tests {
                     .all(|pair| pair[0].0 + pair[0].1 <= pair[1].0),
                 "live histories overlap"
             );
+            let committed = store.committed().0;
+            peak_committed = peak_committed.max(committed);
+            assert!(
+                store.occupied_rows() <= committed,
+                "claims lie in committed rows"
+            );
         }
-        (max_segments, max_decode_steps)
+        for request in slots.iter().flatten() {
+            verify(request);
+        }
+        drop(slots);
+        store.shrink(ShrinkPolicy::Idle).unwrap();
+        Interleaved {
+            segments: max_segments,
+            decode_steps: max_decode_steps,
+            peak_committed,
+            released_to: store.committed().0,
+            relayouts: store.relayouts(),
+            written,
+        }
+    }
+
+    /// The backing commits rows and banks with demand, keeps every row's
+    /// contents across growth, and returns bytes to the device ledger when
+    /// the tail is unreferenced; nothing is recommitted under a transaction.
+    #[test]
+    fn backing_grows_and_shrinks_and_returns_device_memory() {
+        let Some(device) = cpu_device() else {
+            return;
+        };
+        let store = StateStore::new(
+            device.clone(),
+            4096,
+            16384,
+            vec![dense_component(4)],
+            vec![ComponentSpec {
+                shape: vec![64],
+                dtype: DType::F32,
+            }],
+            BankCapacity {
+                active: 16,
+                in_flight: 16,
+                retained: 16,
+            },
+        )
+        .unwrap();
+        let charged = || device.memory_usage().charged;
+        let base = charged();
+        assert_eq!(store.committed(), (0, 3));
+        // A 1,000-row prefill commits about what it uses, not the reservation.
+        let advance = OwnedStateAdvance::begin(store.create().unwrap(), 1000)
+            .ok()
+            .unwrap();
+        let rows = store.committed().0;
+        assert!((1000..=1280).contains(&rows), "committed {rows} rows");
+        // Growth is refused while a transaction holds the tensors.
+        store
+            .provision(
+                &[RowDemand {
+                    after: None,
+                    rows: 5000,
+                }],
+                8,
+            )
+            .unwrap();
+        assert_eq!(store.committed().0, rows);
+        let written = (0..1000u32)
+            .flat_map(|row| (row as f32).to_le_bytes().repeat(4))
+            .collect::<Vec<_>>();
+        advance.bindings().history[0]
+            .buffer
+            .slice_leading(0, 1000)
+            .unwrap()
+            .write_from_host(&written)
+            .unwrap();
+        let OwnedAdvanceResolution::Committed(state) = advance.commit_all().ok().unwrap() else {
+            panic!("full prefix must commit");
+        };
+        let grown = charged();
+        assert!(grown > base);
+        // Without transactions, growth commits more rows and banks and keeps
+        // the accepted rows' contents.
+        store
+            .provision(&[state.demand(5000)], 8)
+            .unwrap();
+        let (rows, banks) = store.committed();
+        assert!(rows >= 6000 && rows < 16384, "committed {rows} rows");
+        assert!(banks >= 9, "committed {banks} banks");
+        assert!(charged() > grown);
+        let plane = store.history_planes().unwrap()[0].buffer.clone();
+        assert_eq!(
+            plane.slice_leading(0, 1000).unwrap().read_to_host().unwrap(),
+            written
+        );
+        assert_eq!(state.history_ranges(), [(0, 1000)]);
+        drop(plane);
+        // Nothing above the history is referenced: shrinking returns the
+        // tail's bytes to the device ledger.
+        let before = charged();
+        let released = store.shrink(ShrinkPolicy::Idle).unwrap();
+        assert!(released > 0);
+        assert_eq!(charged(), before - released);
+        assert!(store.committed().0 < rows);
+        assert!(store.committed().0 >= 1000);
+        drop(state);
+        // Idle hysteresis keeps a small backing; pressure releases it all.
+        store.shrink(ShrinkPolicy::Pressure).unwrap();
+        assert_eq!(store.committed(), (HISTORY_GRANULE, 3));
+        assert!(store.release_idle().unwrap() > 0);
+        assert_eq!(charged(), base);
+    }
+
+    /// Regression (chost 15:36): shrinking after every step released the
+    /// successor banks the next step regrew, reallocating and copying the
+    /// bank arenas every other decode step. With hysteresis a request that
+    /// decodes 300 steps beside a retained prompt checkpoint recommits the
+    /// backing only while it grows, even when the store idles between steps.
+    #[test]
+    fn decode_never_alternates_growing_and_shrinking_the_backing() {
+        let Some(device) = cpu_device() else {
+            return;
+        };
+        let store = StateStore::new(
+            device,
+            4096,
+            4 * 4096,
+            vec![dense_component(4)],
+            vec![ComponentSpec {
+                shape: vec![256],
+                dtype: DType::F32,
+            }],
+            BankCapacity {
+                active: 4,
+                in_flight: 4,
+                retained: 4,
+            },
+        )
+        .unwrap();
+        let step = |state: SequenceState, rows: usize| {
+            store.provision(&[state.demand(rows)], 1).unwrap();
+            let advance = OwnedStateAdvance::begin(state, rows).ok().unwrap();
+            let OwnedAdvanceResolution::Committed(state) = advance.commit_all().ok().unwrap()
+            else {
+                panic!("full prefix must commit");
+            };
+            store.shrink(ShrinkPolicy::Idle).unwrap();
+            state
+        };
+        let mut state = step(store.create().unwrap(), 500);
+        let _prompt = state.checkpoint();
+        let settled = store.recommits() + store.relayouts().count;
+        let mut committed = store.committed();
+        for _ in 0..300 {
+            state = step(state, 1);
+            let now = store.committed();
+            assert!(
+                now.0 >= committed.0 && now.1 >= committed.1,
+                "decode shrank the backing from {committed:?} to {now:?}"
+            );
+            committed = now;
+        }
+        // Only geometric growth: the rows grow 500 -> 800, the banks once.
+        let changes = store.recommits() + store.relayouts().count - settled;
+        assert!(changes <= 3, "300 decode steps changed the backing {changes} times");
+    }
+
+    /// Shrinking relays out live rows stranded high in the backing: the
+    /// shared prefix stays one set of rows (a checkpoint and two branches
+    /// see the same rows, charged once), the longer branch stays one run,
+    /// every row keeps its contents, and the committed bytes fall.
+    #[test]
+    fn shrink_moves_live_tail_rows_down_and_keeps_shared_prefixes_shared() {
+        let Some(device) = cpu_device() else {
+            return;
+        };
+        let store = StateStore::new(
+            device.clone(),
+            4096,
+            8192,
+            vec![dense_component(1)],
+            vec![],
+            BankCapacity {
+                active: 4,
+                in_flight: 4,
+                retained: 4,
+            },
+        )
+        .unwrap();
+        let tag = |row: usize| (row as f32).to_le_bytes();
+        let commit = |state: SequenceState, rows: usize| {
+            let advance = OwnedStateAdvance::begin(state, rows).ok().unwrap();
+            let plane = &advance.bindings().history[0].buffer;
+            for (offset, &row) in advance.bindings().destinations.iter().enumerate() {
+                plane
+                    .slice_leading(row as u64, row as u64 + 1)
+                    .unwrap()
+                    .write_from_host(&tag(advance.position() + offset))
+                    .unwrap();
+            }
+            let OwnedAdvanceResolution::Committed(state) = advance.commit_all().ok().unwrap()
+            else {
+                panic!("attention-only advances commit");
+            };
+            state
+        };
+        let read = |ranges: Vec<(usize, usize)>| {
+            let plane = store.history_planes().unwrap()[0].buffer.clone();
+            ranges
+                .into_iter()
+                .flat_map(|(start, count)| start..start + count)
+                .map(|row| {
+                    plane
+                        .slice_leading(row as u64, row as u64 + 1)
+                        .unwrap()
+                        .read_to_host()
+                        .unwrap()[..4]
+                        .to_vec()
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected = |rows: usize| (0..rows).map(|row| tag(row).to_vec()).collect::<Vec<_>>();
+        // A large request fills the low rows; a prompt and two branches sit
+        // above it.
+        let large = commit(store.create().unwrap(), 3000);
+        let prompt = commit(store.create().unwrap(), 100);
+        let system = prompt.checkpoint();
+        let long = commit(prompt, 50);
+        let short = commit(system.fork(), 20);
+        assert!(long.history_ranges()[0].0 >= 3000);
+        drop(large);
+        let before = (store.committed().0, device.memory_usage().charged);
+        let occupied = store.occupied_rows();
+        assert_eq!(occupied, 100 + 50 + 20);
+        let relayouts = store.relayouts().count;
+        let released = store.shrink(ShrinkPolicy::Idle).unwrap();
+        assert_eq!(store.relayouts().count, relayouts + 1);
+        assert!(released > 0);
+        assert!(store.committed().0 < before.0);
+        assert!(device.memory_usage().charged < before.1);
+        assert_eq!(store.occupied_rows(), occupied);
+        assert_eq!(long.history_ranges(), [(0, 150)]);
+        assert_eq!(system.history_ranges(), [(0, 100)]);
+        assert_eq!(short.history_ranges()[0], (0, 100));
+        assert_eq!(read(long.history_ranges()), expected(150));
+        assert_eq!(read(short.history_ranges()), expected(120));
+        assert_eq!(read(system.history_ranges()), expected(100));
+    }
+
+    struct Interleaved {
+        segments: usize,
+        decode_steps: usize,
+        peak_committed: usize,
+        released_to: usize,
+        relayouts: Relayouts,
+        written: usize,
     }
 
     #[test]
-    fn interleaved_decode_keeps_every_history_in_few_segments() {
-        // Arena sized as the resource planner sizes it: a context for every
-        // active and every in-flight owner.
-        let (segments, decode_steps) = serve_interleaved(8, 16, 800);
-        assert!(
-            decode_steps > 100,
-            "requests ran {decode_steps} decode steps"
-        );
-        assert_eq!(segments, 1);
-        // Tight arenas, down to exactly one context per request: requests
-        // outgrow their room and move, but never fragment past two segments
-        // (first-fit placement gave one segment per decode step).
-        for (active, contexts) in [(4, 5), (8, 9), (8, 8), (16, 17)] {
-            let (segments, decode_steps) = serve_interleaved(active, contexts, 3000);
-            assert!(
-                decode_steps > 100,
-                "requests ran {decode_steps} decode steps"
+    fn interleaved_decode_keeps_every_request_in_one_run_with_elastic_backing() {
+        // Reservations of 8 to 17 contexts, down to exactly one context per
+        // request; the backing commits what the interleaved histories use
+        // plus growth headroom. A history that outgrows its room is relaid
+        // out, never split, so every request stays one run.
+        for (active, contexts, steps) in [
+            (8, 16, 800),
+            (4, 5, 3000),
+            (8, 9, 3000),
+            (8, 8, 3000),
+            (16, 17, 3000),
+        ] {
+            let run = serve_interleaved(active, contexts, steps);
+            let reserved = contexts * 512 + 64;
+            eprintln!(
+                "interleaved active={active} contexts={contexts}: segments={} relayouts={} \
+                 copied={} written={} peak_committed={} of {reserved}",
+                run.segments, run.relayouts.count, run.relayouts.rows, run.written, run.peak_committed
             );
-            assert!(
-                segments <= 2,
-                "{active} requests in {contexts} contexts reached {segments} segments"
+            assert!(run.decode_steps > 100, "requests ran {} decode steps", run.decode_steps);
+            assert_eq!(
+                run.segments, 1,
+                "{active} requests in {contexts} contexts reached {} segments",
+                run.segments
             );
+            // At most active x context rows are ever referenced; the backing
+            // stays proportional to use, not to the reservation.
+            assert!(
+                run.peak_committed <= reserved.min(active * 512 * 2),
+                "{active} requests committed {} of {reserved} rows",
+                run.peak_committed
+            );
+            // Unreferenced backing returns once the requests end.
+            assert_eq!(run.released_to, HISTORY_GRANULE);
         }
     }
 }

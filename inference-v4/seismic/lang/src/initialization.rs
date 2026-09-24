@@ -2027,8 +2027,45 @@ impl<'a> InitializationContext<'a> {
         }
     }
     pub fn assume(&mut self, value: BoolExpr, truth: bool, binders: &[SymbolId]) {
-        self.path
-            .push((Condition::Actual(value, binders.to_vec()), truth));
+        let condition = self.actual_condition(value, binders);
+        // The same assumption the checker makes on an arm: a comparison
+        // becomes a fact over its operands. A contradictory assumption is an
+        // unreached arm; its path stays as recorded.
+        let (mut path, mut facts) = (std::mem::take(&mut self.path), self.facts.clone());
+        if RegionOps::assume(self, &mut path, &mut facts, condition.clone(), truth) {
+            self.path = path;
+            self.facts = facts;
+        } else {
+            self.path = path;
+            self.path.push((condition, truth));
+        }
+    }
+    /// An exact integer comparison keeps its meaning (so path facts can
+    /// establish regions over its operands); any other predicate is opaque.
+    fn actual_condition(&mut self, value: BoolExpr, binders: &[SymbolId]) -> Condition {
+        use crate::expr::CmpOp;
+        match self.arena.view(AnyExpr::Bool(value)) {
+            NodeView::Cmp { op, lhs, rhs } => {
+                let (a, b) = match (lhs, rhs) {
+                    (AnyExpr::Int(a), AnyExpr::Int(b)) => (a, b),
+                    (AnyExpr::Nat(a), AnyExpr::Nat(b)) => (self.arena.int_from_nat(a), self.arena.int_from_nat(b)),
+                    _ => return Condition::Actual(value, binders.to_vec()),
+                };
+                let op = match op {
+                    CmpOp::Eq => BinaryOp::Eq,
+                    CmpOp::Ne => BinaryOp::Ne,
+                    CmpOp::Lt => BinaryOp::Lt,
+                    CmpOp::Le => BinaryOp::Le,
+                    CmpOp::Gt => BinaryOp::Gt,
+                    CmpOp::Ge => BinaryOp::Ge,
+                };
+                Condition::Compare(op, a, b)
+            }
+            NodeView::Unary { op: crate::expr::UnaryOp::Not, operand: AnyExpr::Bool(inner) } => {
+                Condition::Not(Box::new(self.actual_condition(inner, binders)))
+            }
+            _ => Condition::Actual(value, binders.to_vec()),
+        }
     }
     pub fn root(&mut self, axes: &[IntExpr]) -> InitializationView {
         self.root_view(axes)
@@ -2310,6 +2347,11 @@ impl RegionMapping for EntryMapping<'_, '_, '_> {
     }
 }
 impl InitializationContract {
+    /// `symbol` is the value of the integer semantic parameter `ordinal`.
+    pub(crate) fn bind_integer_parameter(&mut self, symbol: SymbolId, ordinal: usize) {
+        assert!(self.symbols.iter().all(|(prior, _)| *prior != symbol), "contract symbol bound twice");
+        self.symbols.push((symbol, ParameterPart::Integer(ParameterPath::root(ordinal))));
+    }
     /// Entry instantiation remaps all contract coordinates into the same arena
     /// as the semantic body, and uses its existing canonical parameter leaves.
     pub(crate) fn remap<'a>(

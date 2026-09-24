@@ -1,7 +1,7 @@
 //! Serialized ownership of logical generation and one executor resource domain.
 use super::{
     domain::{
-        DomainCheckpoint, DomainFlight, DomainLane, ExecutorDomain, OperationGroup, group,
+        DomainCheckpoint, DomainFlight, ExecutorDomain, OperationGroup, group,
         requirements, submit_group,
     },
     policy::{
@@ -12,7 +12,10 @@ use super::{
         CapacityResource, PhysicalTimings, PublicationPermit, PublicationSender, PublicationWake,
         PublicationWakeKind, PublishError, RequestError, ServiceCapacityError,
     },
-    retention::{Retention, RetentionCapacity, RetentionRequest},
+    retention::{
+        Retention, RetentionCapacity, RetentionKey, RetentionRequest, MIN_BRANCH_GAIN,
+        MIN_RETENTION_HIT,
+    },
     round_driver::{RoundError, RoundReconcile, lower_round, reconcile_forward, reconcile_repair},
 };
 use magnitude_generation::{
@@ -23,6 +26,7 @@ use magnitude_model_executor::{
     DomainError, InvariantError, NativeFamily, Operation, Outcome, PhysicalDecision, ProgramFamily,
     RequestId, ResourceKind, ResourcePlan, SubmitError, WorkKind,
 };
+use magnitude_model_state::ShrinkPolicy;
 use std::{
     collections::{BTreeMap, VecDeque},
     time::Duration,
@@ -30,6 +34,32 @@ use std::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CheckpointId(u64);
+
+/// Where a newly admitted request stops its prefill to retain a branch
+/// point, or the shared prefix it waits for a live peer to retain.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BranchPlan {
+    branch: Option<usize>,
+    awaited: Option<usize>,
+}
+
+/// Where a request's prompt is retained: one row before the prompt end, the
+/// deepest point a request with the same prompt can resume from (it must
+/// compute the row it samples from). None when that is not an exact input
+/// boundary, too short to be a hit, or already retained.
+fn prompt_boundary(record: &Record) -> Option<usize> {
+    let input = record.retention.as_ref()?;
+    let boundary = record.generation.prompt().len().checked_sub(1)?;
+    (!record.prefill_retained && boundary >= MIN_RETENTION_HIT && input.exact_boundary(boundary))
+        .then_some(boundary)
+}
+
+/// Whether `generation` is resident, unfinished, and not yet past `position`.
+fn prefilling_toward(generation: &Generation, position: usize) -> bool {
+    generation.is_resident()
+        && generation.finish_reason().is_none()
+        && generation.resident_position() < position
+}
 
 struct Checkpoint {
     generation: Generation,
@@ -53,6 +83,15 @@ struct Record {
     retention_source: Option<u64>,
     prefill_retained: bool,
     terminal_retained: bool,
+    /// A planned branch point: the prompt position where this request
+    /// diverges from a path the engine holds. Prefill stops there so the
+    /// index can retain a checkpoint every later divergent request resumes
+    /// from.
+    branch: Option<usize>,
+    /// A prompt position a live peer is prefilling toward and will retain:
+    /// this request is not scheduled until it attaches to that checkpoint
+    /// (or no peer computes it any more), so the prefix is computed once.
+    awaited_prefix: Option<usize>,
     publication: Option<PublicationSender>,
     publication_batch_limit: usize,
     pending_publication: Option<Vec<OutputToken>>,
@@ -368,7 +407,7 @@ impl<F: ProgramFamily> Owner<F> {
             .ok_or("service identity exhausted")?;
         let hit = retention_request
             .as_ref()
-            .map(|request| self.retention.lookup(request))
+            .map(|request| self.retention.lookup(request, request.tokens.len()))
             .transpose()?
             .flatten();
         let opened = match hit {
@@ -426,6 +465,17 @@ impl<F: ProgramFamily> Owner<F> {
                 ),
             });
         }
+        let mut plan = retention_request
+            .as_ref()
+            .map(|request| self.plan_branches(request, hit.map_or(0, |hit| hit.position())))
+            .unwrap_or_default();
+        // Only a text prefix waits; a request with media encodes up front and
+        // computes the prefix itself, branching there.
+        if !admission.is_empty() {
+            if let Some(point) = plan.awaited.take() {
+                plan.branch = Some(point);
+            }
+        }
         self.records.insert(
             id,
             Record {
@@ -443,6 +493,8 @@ impl<F: ProgramFamily> Owner<F> {
                 retention_source: hit.map(|hit| hit.id()),
                 prefill_retained: false,
                 terminal_retained: false,
+                branch: plan.branch,
+                awaited_prefix: plan.awaited,
                 publication: None,
                 publication_batch_limit: 0,
                 pending_publication: None,
@@ -455,6 +507,122 @@ impl<F: ProgramFamily> Owner<F> {
         );
         self.epoch.advance()?;
         Ok(id)
+    }
+
+    /// Branch points for a request resuming at `resumed` (zero or its
+    /// retention hit): the deepest position where it diverges from a
+    /// retained path or a live request's prompt. A live request that has not
+    /// yet prefilled to its divergence from this one stops there too, so the
+    /// shared prefix is retained by whichever request reaches it first and
+    /// every later request resumes at it instead of recomputing.
+    fn plan_branches(&mut self, request: &RetentionRequest, resumed: usize) -> BranchPlan {
+        let worthwhile = |point: usize, from: usize, prompt: usize| {
+            point >= MIN_RETENTION_HIT && point >= from + MIN_BRANCH_GAIN && point < prompt
+        };
+        let retained = self.retention.shared_boundary(request);
+        let mut deepest = retained;
+        // The deepest shared prefix a live peer is still prefilling toward
+        // and will retain at its branch point.
+        let mut in_flight = 0;
+        for record in self.records.values_mut() {
+            let Some(live) = record.retention.as_ref() else {
+                continue;
+            };
+            if live.key != request.key {
+                continue;
+            }
+            let shared = request.shared_boundary(&live.tokens, &live.conditioning);
+            deepest = deepest.max(shared);
+            if record.branch.is_none()
+                && worthwhile(
+                    shared,
+                    record.generation.resident_position(),
+                    live.tokens.len(),
+                )
+            {
+                record.branch = Some(shared);
+            }
+            if record.branch == Some(shared) && prefilling_toward(&record.generation, shared) {
+                in_flight = in_flight.max(shared);
+            }
+        }
+        if !worthwhile(deepest, resumed, request.tokens.len()) {
+            return BranchPlan::default();
+        }
+        if in_flight == deepest && deepest > retained {
+            // A peer computes this prefix now: wait for its checkpoint.
+            return BranchPlan {
+                branch: None,
+                awaited: Some(deepest),
+            };
+        }
+        BranchPlan {
+            branch: Some(deepest),
+            awaited: None,
+        }
+    }
+
+    /// Whether a live request other than `except` is still prefilling toward
+    /// a planned branch point at `position` on `key`'s paths.
+    fn prefix_pending(&self, key: &RetentionKey, position: usize, except: RequestId) -> bool {
+        self.records.iter().any(|(&id, record)| {
+            id != except
+                && record.branch == Some(position)
+                && record.retention.as_ref().is_some_and(|live| &live.key == key)
+                && prefilling_toward(&record.generation, position)
+        })
+    }
+
+    /// Requests waiting for a peer's prefix attach to its retained
+    /// checkpoint once it exists, and compute the prefix themselves once no
+    /// peer is still computing it.
+    fn attach_awaited(&mut self) -> Result<(), String> {
+        let waiting = self
+            .records
+            .iter()
+            .filter_map(|(&id, record)| record.awaited_prefix.map(|position| (id, position)))
+            .collect::<Vec<_>>();
+        for (id, awaited) in waiting {
+            let input = self.records[&id]
+                .retention
+                .clone()
+                .ok_or("an awaited prefix requires a retention request")?;
+            let hit = self
+                .retention
+                .lookup(&input, input.tokens.len())?
+                .filter(|hit| hit.position() >= awaited);
+            let Some(hit) = hit else {
+                if !self.prefix_pending(&input.key, awaited, id) {
+                    let record = self.records.get_mut(&id).expect("waiting request");
+                    record.awaited_prefix = None;
+                    self.epoch.advance()?;
+                }
+                continue;
+            };
+            let retained = self.retention.entry(hit)?;
+            if self
+                .domain
+                .resume_from_checkpoint(id, retained.checkpoint())
+                .is_err()
+            {
+                if let Some(fatal) = self.domain.fatal_error().cloned() {
+                    self.fail_domain_error(fatal);
+                    return Ok(());
+                }
+                // The request computes the prefix itself instead.
+                self.records.get_mut(&id).expect("waiting request").awaited_prefix = None;
+                self.epoch.advance()?;
+                continue;
+            }
+            let record = self.records.get_mut(&id).expect("waiting request");
+            record
+                .generation
+                .restore_prefix(hit.position(), retained.method())?;
+            record.retention_source = Some(hit.id());
+            record.awaited_prefix = None;
+            self.epoch.advance()?;
+        }
+        Ok(())
     }
 
     fn ensure_resident_slot(&mut self) -> Result<(), String> {
@@ -480,10 +648,18 @@ impl<F: ProgramFamily> Owner<F> {
 
     fn ensure_open_capacity(&mut self) -> Result<(), String> {
         let requirements = self.domain.open_requirements();
+        self.domain
+            .provision_open()
+            .map_err(|error| error.to_string())?;
+        while self.domain.can_open(requirements).is_err()
+            && self
+                .retention
+                .evict_one(DomainCheckpoint::exclusive_bytes)?
+                .is_some()
+        {}
         if self.domain.can_open(requirements).is_ok() {
             return Ok(());
         }
-        self.retention.evict_bytes(u64::MAX)?;
         self.domain.reclaim_idle()?;
         while self.domain.can_open(requirements).is_err() {
             if !self.evict_victims(&[], true)? {
@@ -512,7 +688,7 @@ impl<F: ProgramFamily> Owner<F> {
         let numerical = self.domain.checkpoint(request)?;
         let generation = record
             .generation
-            .fork_at(numerical.position(), &mut self.domain)?;
+            .fork_at(numerical.position())?;
         let id = CheckpointId(self.next_checkpoint);
         self.next_checkpoint = self
             .next_checkpoint
@@ -550,7 +726,7 @@ impl<F: ProgramFamily> Owner<F> {
                 .ok_or("unknown checkpoint")?;
             checkpoint
                 .generation
-                .fork_at(checkpoint.numerical.position(), &mut self.domain)?
+                .fork_at(checkpoint.numerical.position())?
         };
         let id = RequestId(self.next_id);
         self.next_id = self
@@ -592,6 +768,8 @@ impl<F: ProgramFamily> Owner<F> {
                 retention_source: None,
                 prefill_retained: false,
                 terminal_retained: false,
+                branch: None,
+                awaited_prefix: None,
                 publication: None,
                 publication_batch_limit: 0,
                 pending_publication: None,
@@ -724,9 +902,6 @@ impl<F: ProgramFamily> Owner<F> {
         if discard_output {
             record.generation.discard_output();
         }
-        if !self.batch_contains(id) {
-            self.domain.abort_head_pending(id)?;
-        }
         if changed {
             self.epoch.advance()?;
         }
@@ -747,7 +922,6 @@ impl<F: ProgramFamily> Owner<F> {
             return Err("retirement requires terminal reconciled work and drained output".into());
         }
         self.retain_terminal(id)?;
-        self.domain.abort_head_pending(id)?;
         if let Err(error) = self.domain.close(id) {
             if let Some(fatal) = self.domain.fatal_error().cloned() {
                 self.fail_domain_error(fatal);
@@ -755,6 +929,10 @@ impl<F: ProgramFamily> Owner<F> {
             return Err(error);
         }
         self.records.remove(&id);
+        // Rows the closed request shared with retained checkpoints are now
+        // held by retention alone.
+        self.retention
+            .enforce_budget(DomainCheckpoint::exclusive_bytes)?;
         self.epoch.advance()
     }
 
@@ -839,8 +1017,11 @@ impl<F: ProgramFamily> Owner<F> {
                                 }
                             }
                         }
+                        // A verified prefix awaiting its recurrent repair
+                        // still publishes against this round's permits.
                         if record.pending_publication.is_none()
                             && record.generation.output_len() == 0
+                            && record.pending_transition.is_none()
                         {
                             record.publication_permits.clear();
                         }
@@ -973,11 +1154,6 @@ impl<F: ProgramFamily> Owner<F> {
     }
 
     fn fail_request(&mut self, id: RequestId, error: RequestError) {
-        if !self.batch_contains(id) {
-            self.domain
-                .abort_head_pending(id)
-                .expect("aborting a staged head successor is infallible");
-        }
         if let Some(record) = self.records.get_mut(&id) {
             record.pending_transition = None;
             record.repair_kind = None;
@@ -1018,8 +1194,12 @@ impl<F: ProgramFamily> Owner<F> {
         if self.fatal.is_some() {
             return Ok(Step::Idle);
         }
+        self.attach_awaited()?;
         let mut candidates = Vec::new();
         for (&id, record) in &mut self.records {
+            if record.awaited_prefix.is_some() {
+                continue;
+            }
             if record
                 .capacity
                 .is_some_and(|(epoch, _, _)| !self.epoch.changed_since(epoch))
@@ -1060,23 +1240,49 @@ impl<F: ProgramFamily> Owner<F> {
                 preemption_debt: record.preemption_debt,
             });
         }
-        let Some(selection) = self.scheduler.select(&candidates, now)? else {
+        let Some(mut selection) = self.scheduler.select(&candidates, now)? else {
+            // Idle (no request is live, not merely none schedulable now):
+            // release state backing well beyond what the stores need.
+            let live = self.records.values().any(|record| {
+                record.generation.is_resident() && record.generation.finish_reason().is_none()
+            });
+            if !live {
+                if let Err(error) = self.domain.shrink_state(ShrinkPolicy::Idle) {
+                    self.fail_domain_error(error);
+                }
+            }
             return Ok(Step::Idle);
         };
-        let allowance = match selection.phase() {
-            Phase::Prefill => self.scheduler.limits().prefill_tokens,
-            Phase::Decode => self.scheduler.limits().decode_tokens,
-        };
+        // Prefill rows are one budget for the whole launch: requests take
+        // their chunks from it in selection order, and requests left without
+        // rows wait for the next round. Decode allowances are per request.
+        let mut prefill_rows = self.scheduler.limits().prefill_tokens;
+        let mut started = 0;
         let mut operations = Vec::new();
         for &request in selection.requests() {
+            let allowance = match selection.phase() {
+                Phase::Prefill if prefill_rows == 0 => break,
+                Phase::Prefill => prefill_rows,
+                Phase::Decode => self.scheduler.limits().decode_tokens,
+            };
+            started += 1;
             match self.start_request(request, allowance) {
-                Ok(mut next) => operations.append(&mut next),
+                Ok(mut next) => {
+                    let rows = next
+                        .iter()
+                        .filter(|operation| matches!(operation, Operation::Forward { .. }))
+                        .map(Operation::row_count)
+                        .sum::<usize>();
+                    prefill_rows = prefill_rows.saturating_sub(rows);
+                    operations.append(&mut next);
+                }
                 Err(error) => {
                     self.fail_request(request, RequestError::Input(error));
                     self.epoch.advance()?;
                 }
             }
         }
+        selection.truncate(started)?;
         if operations.is_empty() {
             self.scheduler.completed(selection, 0);
             return Ok(Step::Progress);
@@ -1098,6 +1304,47 @@ impl<F: ProgramFamily> Owner<F> {
         self.drive_batch(now)
     }
 
+    /// Reopen an evicted request. Replay resumes from the deepest retained
+    /// prefix of its input (its own prompt checkpoint, or a shared prefix
+    /// another request left in the index), or from the start without one.
+    fn restore(&mut self, request: RequestId) -> Result<(), String> {
+        let record = self.records.get(&request).ok_or("unknown request")?;
+        let accepted = record.generation.accepted_position();
+        let hit = match record.retention.as_ref() {
+            Some(input) => self.retention.lookup(input, accepted)?,
+            None => None,
+        };
+        let Some(hit) = hit else {
+            self.ensure_open_capacity()?;
+            let reservation = self
+                .domain
+                .reserve_open(request)
+                .map_err(|error| error.to_string())?;
+            self.domain
+                .open_reserved(reservation)
+                .map_err(|error| error.to_string())?;
+            return self
+                .records
+                .get_mut(&request)
+                .expect("known request")
+                .generation
+                .restored();
+        };
+        let retained = self.retention.entry(hit)?;
+        self.domain
+            .open_checkpoint_state(request, retained.checkpoint())
+            .map_err(|error| error.to_string())?;
+        let record = self.records.get_mut(&request).expect("known request");
+        if let Err(error) = record.generation.restored_at(hit.position(), retained.method()) {
+            return Err(match self.domain.close(request) {
+                Ok(()) => error,
+                Err(rollback) => format!("{error}; executor rollback failed ({rollback})"),
+            });
+        }
+        record.retention_source = Some(hit.id());
+        Ok(())
+    }
+
     fn start_request(
         &mut self,
         request: RequestId,
@@ -1110,19 +1357,7 @@ impl<F: ProgramFamily> Owner<F> {
             .generation
             .is_resident();
         if needs_open {
-            self.ensure_open_capacity()?;
-            let reservation = self
-                .domain
-                .reserve_open(request)
-                .map_err(|error| error.to_string())?;
-            self.domain
-                .open_reserved(reservation)
-                .map_err(|error| error.to_string())?;
-            self.records
-                .get_mut(&request)
-                .expect("known request")
-                .generation
-                .restored()?;
+            self.restore(request)?;
         }
         let record = self.records.get_mut(&request).expect("known request");
         if !record.admission.is_empty() {
@@ -1141,6 +1376,18 @@ impl<F: ProgramFamily> Owner<F> {
                 None,
             )?]);
         }
+        // A prefill chunk ends exactly at a planned branch point, and at the
+        // prompt's retained boundary one row before its end.
+        let resident = record.generation.resident_position();
+        let stop = [record.branch, prompt_boundary(record)]
+            .into_iter()
+            .flatten()
+            .filter(|&stop| stop > resident)
+            .min();
+        let allowance = match stop {
+            Some(stop) => allowance.min(stop - resident),
+            None => allowance,
+        };
         match record.generation.start_round(request, allowance)? {
             RoundStart::Target => Ok(vec![lower_round(
                 &record.generation,
@@ -1223,9 +1470,6 @@ impl<F: ProgramFamily> Owner<F> {
             })
             .collect::<Vec<_>>();
         if !ended.is_empty() {
-            for &request in &ended {
-                self.domain.abort_head_pending(request)?;
-            }
             let QueuedGroup {
                 group: queued_group,
                 purpose,
@@ -1248,6 +1492,16 @@ impl<F: ProgramFamily> Owner<F> {
             self.epoch.advance()?;
             return Ok(Step::Progress);
         }
+        // Repacking histories at the segment limit and growing the elastic
+        // state backing within the device limit come before any eviction. A
+        // capacity shortage here is reported by the checks below.
+        match self.domain.provision(queued.group.operations()) {
+            Ok(()) | Err(DomainError::Capacity(_)) => {}
+            Err(error) => {
+                self.fail_domain_error(error);
+                return Ok(Step::Progress);
+            }
+        }
         let requirement = match requirements(&self.domain, &queued.group) {
             Ok(requirement) => requirement,
             Err(error) => {
@@ -1257,10 +1511,32 @@ impl<F: ProgramFamily> Owner<F> {
         };
         if let Err(mut deficit) = self.domain.can_reserve(&requirement) {
             // Selection is provisional until every exact requirement is
-            // available. Policy releases quota-bounded retention first, then
-            // idle residency, then eligible live victims. No launch or state
-            // transaction exists while these scheduling decisions run.
-            self.retention.evict_bytes(u64::MAX)?;
+            // available. Memory pressure first releases state backing beyond
+            // what the stores need (another store may hold the device memory
+            // this one needs to grow into); policy then releases
+            // least-recently-used retention only until the requirement fits,
+            // then idle residency, then eligible live victims. No launch or
+            // state transaction exists while these scheduling decisions run.
+            match self.domain.shrink_state(ShrinkPolicy::Pressure) {
+                Ok(0) => {}
+                Ok(_) => match self.domain.provision(queued.group.operations()) {
+                    Ok(()) | Err(DomainError::Capacity(_)) => {}
+                    Err(error) => {
+                        self.fail_domain_error(error);
+                        return Ok(Step::Progress);
+                    }
+                },
+                Err(error) => {
+                    self.fail_domain_error(error);
+                    return Ok(Step::Progress);
+                }
+            }
+            while self.domain.can_reserve(&requirement).is_err()
+                && self
+                    .retention
+                    .evict_one(DomainCheckpoint::exclusive_bytes)?
+                    .is_some()
+            {}
             self.domain
                 .reclaim_idle()
                 .map_err(|error| error.to_string())?;
@@ -1365,7 +1641,6 @@ impl<F: ProgramFamily> Owner<F> {
         for operation in operations {
             let count = match operation {
                 Operation::Forward { select, .. } => select.len(),
-                Operation::Project { .. } => 1,
                 Operation::Head { .. } | Operation::Repair { .. } | Operation::Encode { .. } => 0,
             };
             if count != 0 {
@@ -1491,17 +1766,7 @@ impl<F: ProgramFamily> Owner<F> {
                         return Ok(());
                     }
                 };
-                self.reconcile_method_outcomes(pending, &active.operations, DomainLane::Head)?;
-            }
-            DomainFlight::Project(flight) => {
-                let pending = match self.domain.finish_project(flight) {
-                    Ok(pending) => pending,
-                    Err(error) => {
-                        self.fail_domain_error(error);
-                        return Ok(());
-                    }
-                };
-                self.reconcile_method_outcomes(pending, &active.operations, DomainLane::Project)?;
+                self.reconcile_method_outcomes(pending, &active.operations)?;
             }
             DomainFlight::Vision(flight) => {
                 let item = match self.domain.finish_vision(flight) {
@@ -1529,10 +1794,7 @@ impl<F: ProgramFamily> Owner<F> {
                     self.abort_pending(item)?;
                 } else if let Err(error) = self.domain.reconcile(
                     item,
-                    PhysicalDecision {
-                        accepted_rows: 0,
-                        head_prefix: None,
-                    },
+                    PhysicalDecision { accepted_rows: 0 },
                 ) {
                     self.fail_domain_outcome(request, error);
                 }
@@ -1670,7 +1932,6 @@ impl<F: ProgramFamily> Owner<F> {
         &mut self,
         pending: Vec<magnitude_model_executor::PendingOperationOutcome>,
         operations: &[Operation],
-        lane: DomainLane,
     ) -> Result<(), String> {
         let expected = operations
             .iter()
@@ -1690,23 +1951,13 @@ impl<F: ProgramFamily> Owner<F> {
             self.fail_all("method outcomes do not match submitted requests".into());
             return Ok(());
         }
-        let mut followups = Vec::new();
         for item in pending {
             let request = item.request();
             let duration = item.physical_duration();
             let kind = item.kind();
             let operation = expected[&request];
-            let correct = match lane {
-                DomainLane::Head => {
-                    matches!(operation, Operation::Head { .. })
-                        && matches!(item.outcome(), Outcome::Head { .. })
-                }
-                DomainLane::Project => {
-                    matches!(operation, Operation::Project { .. })
-                        && matches!(item.outcome(), Outcome::Project { .. })
-                }
-                _ => false,
-            };
+            let correct = matches!(operation, Operation::Head { .. })
+                && matches!(item.outcome(), Outcome::Head { .. });
             let Some(record) = self.records.get_mut(&request) else {
                 self.abort_pending(item)?;
                 continue;
@@ -1730,11 +1981,10 @@ impl<F: ProgramFamily> Owner<F> {
                 );
                 continue;
             }
-            let transition = match record.generation.prepare_method_transition(
-                operation,
-                item.outcome(),
-                &mut self.domain,
-            ) {
+            let transition = match record
+                .generation
+                .prepare_method_transition(operation, item.outcome())
+            {
                 Ok(transition) => transition,
                 Err(error) => {
                     self.abort_pending(item)?;
@@ -1742,34 +1992,15 @@ impl<F: ProgramFamily> Owner<F> {
                     continue;
                 }
             };
-            let head_prefix = transition.decision().head_prefix;
-            if lane == DomainLane::Project && head_prefix.is_some() {
-                self.abort_pending(item)?;
-                self.fail_request(
-                    request,
-                    RequestError::Invariant(InvariantError {
-                        context: "service projection transition",
-                        detail: "stateless projection requested a head prefix".into(),
-                    }),
-                );
-                continue;
-            }
             match self.domain.reconcile(
                 item,
                 PhysicalDecision {
-                    accepted_rows: 0,
-                    head_prefix,
+                    accepted_rows: transition.decision().accepted_rows,
                 },
             ) {
-                Ok(_) => {
-                    let effects = record.generation.commit_method_transition(transition);
-                    followups.extend(effects.operations);
-                }
+                Ok(_) => record.generation.commit_method_transition(transition),
                 Err(error) => self.fail_domain_outcome(request, error),
             }
-        }
-        if !followups.is_empty() {
-            self.queue_operations(followups, Purpose::Operations)?;
         }
         Ok(())
     }
@@ -1817,6 +2048,7 @@ impl<F: ProgramFamily> Owner<F> {
         let completed_requests = batch.selection.requests().to_vec();
         self.scheduler.completed(batch.selection, elapsed);
         for request in completed_requests {
+            self.retain_branch_point(request)?;
             self.retain_prefill_boundary(request)?;
             self.retain_terminal(request)?;
         }
@@ -1832,34 +2064,81 @@ impl<F: ProgramFamily> Owner<F> {
         Ok(())
     }
 
+    /// Retain the request's reconciled state at its planned branch point: the
+    /// recurrent bank and method state there, sharing every history row
+    /// before it with the request itself.
+    fn retain_branch_point(&mut self, request: RequestId) -> Result<(), String> {
+        let Some(record) = self.records.get_mut(&request) else {
+            return Ok(());
+        };
+        let Some(branch) = record.branch else {
+            return Ok(());
+        };
+        let resident = record.generation.resident_position();
+        if record.generation.finish_reason().is_some()
+            || !record.generation.is_resident()
+            || resident > branch
+        {
+            record.branch = None;
+            return Ok(());
+        }
+        if resident < branch || record.generation.awaiting_completion() {
+            return Ok(());
+        }
+        record.branch = None;
+        let tokens = record.generation.prompt()[..branch].to_vec();
+        let numerical = self.domain.checkpoint(request)?;
+        let method = self.records[&request]
+            .generation
+            .method_checkpoint()?;
+        let retained = self.retention.retain(
+            self.records[&request]
+                .retention
+                .as_ref()
+                .ok_or("a branch point requires a retention request")?,
+            tokens,
+            numerical,
+            method,
+            DomainCheckpoint::exclusive_bytes,
+        )?;
+        if retained {
+            self.epoch.advance()?;
+        }
+        Ok(())
+    }
+
+    /// Retain the request's prompt one row before its end (see
+    /// [`prompt_boundary`]): the deepest point a request with the same prompt
+    /// can resume from, since it must compute the row it samples from.
     fn retain_prefill_boundary(&mut self, request: RequestId) -> Result<(), String> {
         let Some(record) = self.records.get(&request) else {
             return Ok(());
         };
-        let prompt = record.generation.prompt().to_vec();
+        let Some(boundary) = prompt_boundary(record) else {
+            return Ok(());
+        };
         if record.prefill_retained
-            || record.retention.is_none()
             || matches!(
                 record.generation.finish_reason(),
                 Some(FinishReason::Cancelled | FinishReason::Failed)
             )
-            || record.generation.resident_position() != prompt.len()
+            || record.generation.resident_position() != boundary
             || record.generation.awaiting_completion()
             || !record.generation.is_resident()
         {
             return Ok(());
         }
+        let prompt = record.generation.prompt()[..boundary].to_vec();
         let numerical = self.domain.checkpoint(request)?;
-        if numerical.position() != prompt.len() {
+        if numerical.position() != boundary {
             return Err("prefill retention checkpoint differs from the prompt boundary".into());
         }
-        let retained_bytes = numerical.retained_bytes()?;
         let method = self
             .records
             .get(&request)
             .unwrap()
             .generation
-            .method_checkpoint(&mut self.domain)?;
+            .method_checkpoint()?;
         let retained = self.retention.retain(
             self.records
                 .get(&request)
@@ -1869,8 +2148,8 @@ impl<F: ProgramFamily> Owner<F> {
                 .unwrap(),
             prompt,
             numerical,
-            retained_bytes,
             method,
+            DomainCheckpoint::exclusive_bytes,
         )?;
         self.records.get_mut(&request).unwrap().prefill_retained = true;
         if retained {
@@ -1907,13 +2186,12 @@ impl<F: ProgramFamily> Owner<F> {
                 "terminal numerical state is not reconciled at the accepted boundary".into(),
             );
         }
-        let retained_bytes = numerical.retained_bytes()?;
         let method = self
             .records
             .get(&request)
             .unwrap()
             .generation
-            .method_checkpoint(&mut self.domain)?;
+            .method_checkpoint()?;
         let retained = self.retention.retain(
             self.records
                 .get(&request)
@@ -1923,8 +2201,8 @@ impl<F: ProgramFamily> Owner<F> {
                 .unwrap(),
             tokens,
             numerical,
-            retained_bytes,
             method,
+            DomainCheckpoint::exclusive_bytes,
         )?;
         if retained {
             self.epoch.advance()?;
@@ -2074,7 +2352,7 @@ impl<F: ProgramFamily> super::worker::Driven for Owner<F> {
             self.domain.close(id)?;
             self.records.remove(&id);
         }
-        self.retention.evict_bytes(u64::MAX)?;
+        self.retention.evict_all(DomainCheckpoint::exclusive_bytes)?;
         Ok(true)
     }
 }

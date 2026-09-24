@@ -15,20 +15,11 @@ impl<S: ProgramSubmission<CompletedWork = crate::CompletedVisionWork>> VisionFli
     }
 }
 
-pub struct ProjectFlight<S: ProgramSubmission<CompletedWork = crate::CompletedProjectWork> = <NativeFamily as ProgramFamily>::ProjectSubmission> {
-    pub(super) requests: Vec<RequestId>,
-    pub(super) submission: S,
-    pub(super) started: Instant,
-}
-
-impl<S: ProgramSubmission<CompletedWork = crate::CompletedProjectWork>> ProjectFlight<S> {
-    pub fn completion(&mut self) -> &mut dyn Completion {
-        self.submission.completion()
-    }
-}
-
 pub struct HeadFlight<S: ProgramSubmission<CompletedWork = crate::CompletedHeadWork> = <NativeFamily as ProgramFamily>::HeadSubmission> {
-    pub(super) requests: Vec<(RequestId, usize)>,
+    /// Per slot: request, entry rows, proposals.
+    pub(super) requests: Vec<(RequestId, usize, usize)>,
+    /// Selections per slot in the submitted graph.
+    pub(super) steps: usize,
     pub(super) submission: S,
     pub(super) started: Instant,
 }
@@ -43,7 +34,6 @@ pub struct StateFlight<S: ProgramSubmission<CompletedWork = crate::CompletedStat
     pub(super) request: RequestId,
     pub(super) submission: S,
     pub(super) started: Instant,
-    pub(super) head_prefix: Option<usize>,
 }
 
 impl<S: ProgramSubmission<CompletedWork = crate::CompletedStateWork>> StateFlight<S> {
@@ -66,6 +56,12 @@ pub struct TargetFlight<S: ProgramSubmission<CompletedWork = crate::CompletedTar
     pub(super) previous_selection: Option<Instant>,
     pub(super) slots: Vec<Slot>,
     pub(super) conditioning_slices: Vec<Vec<crate::ConditioningSlice>>,
+    /// Identifies the flight a lookahead continues.
+    pub(super) id: u64,
+    /// For a claimed lookahead, per slot: the accepted state its successor
+    /// advance attaches to at finish, or `None` for a slot nobody claimed
+    /// (its rows are discarded). `None` for an ordinary flight.
+    pub(super) continuation: Option<Vec<Option<SequenceState>>>,
 }
 
 impl<S: ProgramSubmission<CompletedWork = crate::CompletedTargetWork>> TargetFlight<S> {

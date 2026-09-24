@@ -1,7 +1,8 @@
 //! Recurrent (gated delta net) block graph: normed projection, the in-place
 //! state advance, and the gated output projection. State never moves: the
-//! layer's window and delta arenas are bound as ports, and per-slot bank
-//! tables select which bank each slot reads and which it publishes to.
+//! layer's window, delta and tape arenas are bound as ports, and per-slot
+//! tables select which version (bank and tape rows) each slot reads and which
+//! bank it publishes to.
 
 use super::super::native_target_graph::weight;
 use crate::{ModelLoadPlan, StateResourcePlan, native::RecurrentKernels};
@@ -12,23 +13,31 @@ use magnitude_model_kernels::{
 use seismic::{Element, NativeGraph, NativePort, WorkflowTensor};
 
 /// Row classes at or above this size advance state with the chunked entry;
-/// smaller classes use the row-sequential step.
-pub(crate) const CHUNKED_ROWS: u64 = 8;
+/// smaller classes use the row-sequential step. The chunked entry advances
+/// slots of at most 16 rows row-sequentially too (with the step's bits), so a
+/// class of at most 16 rows gains nothing from it and takes the step.
+pub(crate) const CHUNKED_ROWS: u64 = 17;
+
+/// State components of one recurrent layer, consecutive in the store's
+/// recurrent components: window, delta, tape.
+pub(crate) const RECURRENT_COMPONENTS: usize = 3;
 
 /// The layer's recurrent arenas, bound to the state store's tensors per run.
 #[derive(Clone)]
 pub(crate) struct RecurrentStatePorts {
     pub window: NativePort,
     pub delta: NativePort,
+    pub tape: NativePort,
 }
 
-/// Per-run slot tables: row segments, published row counts, and the bank
-/// each slot reads and publishes to.
+/// Per-run slot tables: row segments, published row counts, the version each
+/// slot reads (bank and tape rows) and the bank it publishes to.
 #[derive(Clone)]
 pub(crate) struct RecurrentControlPorts {
     pub segments: NativePort,
     pub stop: NativePort,
     pub previous_bank: NativePort,
+    pub previous_tape: NativePort,
     pub following_bank: NativePort,
 }
 
@@ -43,7 +52,7 @@ pub(crate) struct RecurrentBlock {
     pub grouped: bool,
     pub epsilon: f32,
     /// Index of this layer's window component in the store's recurrent
-    /// components; its delta component follows it.
+    /// components; its delta and tape components follow it.
     pub component_index: usize,
 }
 
@@ -92,6 +101,7 @@ pub(crate) fn recurrent(
     };
     let mut window = arena(block.component_index, "window")?;
     let mut delta = arena(block.component_index + 1, "delta")?;
+    let mut tape = arena(block.component_index + 2, "tape")?;
 
     let projection = graph
         .enqueue(
@@ -108,6 +118,14 @@ pub(crate) fn recurrent(
         )
         .map_err(|error| error.to_string())?
         .value;
+    let tape_rows = u64::try_from(
+        store.recurrent_components[block.component_index + 2]
+            .shape
+            .first()
+            .copied()
+            .ok_or("recurrent tape component has no row axis")?,
+    )
+    .map_err(|_| "recurrent tape rows exceed u64")?;
     let dimensions = [
         ("M", block.rows),
         ("B", block.slots),
@@ -116,6 +134,7 @@ pub(crate) fn recurrent(
         ("NV", block.value_heads),
         ("W", block.width),
         ("C", block.convolution_width),
+        ("T", tape_rows),
     ];
     // The step and chunk entries share one contract, so their inputs have the
     // same geometry whichever advances this class.
@@ -128,6 +147,7 @@ pub(crate) fn recurrent(
         segments: input(graph, "segments")?,
         stop: input(graph, "stop")?,
         previous_bank: input(graph, "previous_bank")?,
+        previous_tape: input(graph, "previous_tape")?,
         following_bank: input(graph, "following_bank")?,
     };
     // The L2-norm epsilon of the q/k prologue, scaled as the model defines it.
@@ -144,9 +164,11 @@ pub(crate) fn recurrent(
                     segments: controls.segments.tensor().into(),
                     stop: controls.stop.tensor().into(),
                     previous_bank: controls.previous_bank.tensor().into(),
+                    previous_tape: controls.previous_tape.tensor().into(),
                     following_bank: controls.following_bank.tensor().into(),
                     window: window.tensor_mut().into(),
                     delta: delta.tensor_mut().into(),
+                    tape: tape.tensor_mut().into(),
                     norm_epsilon,
                     grouped: block.grouped,
                 },
@@ -165,9 +187,11 @@ pub(crate) fn recurrent(
                     segments: controls.segments.tensor().into(),
                     stop: controls.stop.tensor().into(),
                     previous_bank: controls.previous_bank.tensor().into(),
+                    previous_tape: controls.previous_tape.tensor().into(),
                     following_bank: controls.following_bank.tensor().into(),
                     window: window.tensor_mut().into(),
                     delta: delta.tensor_mut().into(),
+                    tape: tape.tensor_mut().into(),
                     norm_epsilon,
                     grouped: block.grouped,
                 },
@@ -189,5 +213,5 @@ pub(crate) fn recurrent(
         )
         .map_err(|error| error.to_string())?
         .value;
-    Ok((output, RecurrentStatePorts { window, delta }, controls))
+    Ok((output, RecurrentStatePorts { window, delta, tape }, controls))
 }

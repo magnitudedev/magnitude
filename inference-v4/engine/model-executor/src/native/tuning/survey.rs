@@ -8,13 +8,16 @@
 //! Seismic `TuningResult` (every raw sample of every configuration) is
 //! written to one JSON file per entry instance: the true cost of every
 //! configuration in the declared space, against which a search's choice is
-//! judged. The replay harness of the tuning spec (§E2), which runs the
-//! production search (`seismic::search`) against these files, is not built
-//! yet.
+//! judged. Points are measured once per key, as the search measures them.
+//! [`replay_report`] runs the production search (`seismic::replay`) against
+//! these files (tuning spec §E2) and reports, per entry instance, the choice
+//! quality at the budget the survey's load allocated, the configurations
+//! needed, and the per-point gap of one configuration for all points
+//! (example `tuning_replay`).
 //!
-//! On a shared host, [`TuningSurvey::lock`] names a lock directory taken
-//! (`mkdir`, waiting while it exists) around each entry's survey and
-//! removed after it, so each hold lasts one entry.
+//! On a shared host the whole surveying process must run under the host's
+//! GPU lock: its model load, the tuning of entries it does not survey and
+//! its bench cells use the device as much as the survey does.
 //!
 //! Only `forward_bench` enables the feature (`--tuning-survey DIR`). The
 //! survey is process-global so that no production API carries it.
@@ -24,7 +27,6 @@ use seismic::{SurveyPlan, TuningResult};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::Duration;
 
 /// What to survey and where the records go.
 #[derive(Clone, Debug)]
@@ -38,8 +40,6 @@ pub struct TuningSurvey {
     /// Widened parameter domains by entry (each list keeps the declared
     /// default first), to test the search on larger spaces.
     pub domains: BTreeMap<String, BTreeMap<String, Vec<u64>>>,
-    /// A lock directory held around each entry's survey.
-    pub lock: Option<PathBuf>,
 }
 
 static SURVEY: Mutex<Option<TuningSurvey>> = Mutex::new(None);
@@ -66,38 +66,9 @@ pub(super) fn plan(entry: &str) -> Option<SurveyPlan> {
     })
 }
 
-/// Holds the survey's lock directory while it lives.
-pub(super) struct Held(Option<PathBuf>);
-
-/// Take the survey's lock for `entry`'s survey (waiting while another holder
-/// has it); nothing when `entry` is not surveyed or no lock is named.
-pub(super) fn hold(entry: &str) -> Result<Held, String> {
-    let Some(path) = surveying(entry).and_then(|survey| survey.lock) else {
-        return Ok(Held(None));
-    };
-    loop {
-        match std::fs::create_dir(&path) {
-            Ok(()) => return Ok(Held(Some(path))),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                std::thread::sleep(Duration::from_secs(2));
-            }
-            Err(error) => return Err(format!("taking survey lock {}: {error}", path.display())),
-        }
-    }
-}
-
-impl Drop for Held {
-    fn drop(&mut self) {
-        if let Some(path) = &self.0 {
-            if let Err(error) = std::fs::remove_dir(path) {
-                eprintln!("tuning survey: releasing lock {}: {error}", path.display());
-            }
-        }
-    }
-}
-
-/// Write one entry instance's survey.
-pub(super) fn record(key: &TuningKey, result: &TuningResult) -> Result<(), String> {
+/// Write one entry instance's survey, with the search budget this load
+/// allocated to it.
+pub(super) fn record(key: &TuningKey, budget: usize, result: &TuningResult) -> Result<(), String> {
     let guard = SURVEY.lock().expect("tuning survey lock poisoned");
     let survey = guard.as_ref().expect("a survey result implies an installed survey");
     let (entry, bindings, statics) = key;
@@ -109,6 +80,7 @@ pub(super) fn record(key: &TuningKey, result: &TuningResult) -> Result<(), Strin
         "entry": entry,
         "bindings": bindings,
         "statics": statics,
+        "budget": budget,
         "result": result,
     });
     std::fs::create_dir_all(&survey.directory)
@@ -119,4 +91,107 @@ pub(super) fn record(key: &TuningKey, result: &TuningResult) -> Result<(), Strin
             )
         })
         .map_err(|error| format!("writing survey {}: {error}", path.display()))
+}
+
+/// Replays per entry instance.
+pub const REPLAY_RUNS: usize = 1000;
+
+/// Replay the production search against every survey file in `directory`
+/// ([`REPLAY_RUNS`] runs each, §E2) and report, as Markdown: per entry
+/// instance, the chosen configuration's true cost relative to the true best
+/// at the budget the survey's load allocated and with the whole space as
+/// budget, for the production objective and the previous one; the
+/// configurations needed for 95% of runs to reach 2% of the best (`n95`);
+/// and per point, the time of the overall best configuration against the
+/// best at that point alone (what a per-size launch could recover).
+pub fn replay_report(directory: &std::path::Path) -> Result<String, String> {
+    use seismic::replay::{replay, Objective, Recording};
+    use std::fmt::Write;
+    let mut files = std::fs::read_dir(directory)
+        .map_err(|error| format!("reading {}: {error}", directory.display()))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("reading {}: {error}", directory.display()))?;
+    files.retain(|path| path.extension().is_some_and(|extension| extension == "json"));
+    files.sort();
+    let settings = super::SEARCH_SETTINGS;
+    let mut report = String::new();
+    let percent = |value: f64| format!("{:.1}%", 100.0 * value);
+    for path in files {
+        let text = std::fs::read(&path).map_err(|error| format!("reading {}: {error}", path.display()))?;
+        let record: serde_json::Value = serde_json::from_slice(&text)
+            .map_err(|error| format!("parsing {}: {error}", path.display()))?;
+        let field = |name: &str| {
+            record
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("{} has no `{name}`", path.display()))
+        };
+        let result: TuningResult = serde_json::from_value(field("result")?)
+            .map_err(|error| format!("parsing {}: {error}", path.display()))?;
+        let budget = field("budget")?
+            .as_u64()
+            .ok_or_else(|| format!("{}: `budget` is not a count", path.display()))? as usize;
+        let recording =
+            Recording::new(&result).map_err(|error| format!("{}: {error}", path.display()))?;
+        let space = recording.space().len();
+        writeln!(
+            report,
+            "### {} [{}] {}\n\n{} admissible, {} measured, budget {budget}; true best {:?}\n",
+            result.entry,
+            field("bindings")?.as_str().unwrap_or_default(),
+            field("statics")?,
+            space,
+            recording.measured(),
+            recording.space().values(recording.best()),
+        )
+        .expect("writing to a string");
+        writeln!(
+            report,
+            "| objective | budget | within 1% | within 2% | within 5% | median excess | p95 excess | evaluated | n95 (2%) |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|"
+        )
+        .expect("writing to a string");
+        for (name, objective) in [("keyed (production)", Objective::Keyed), ("separate (previous)", Objective::Separate)] {
+            for budget in [budget, space] {
+                let replayed = replay(&recording, budget, &settings, objective, REPLAY_RUNS);
+                let evaluated = replayed.evaluated.iter().sum::<usize>() as f64 / REPLAY_RUNS as f64;
+                writeln!(
+                    report,
+                    "| {name} | {budget} | {} | {} | {} | {} | {} | {evaluated:.1} | {} |",
+                    percent(replayed.within(0.01)),
+                    percent(replayed.within(0.02)),
+                    percent(replayed.within(0.05)),
+                    percent(replayed.quantile(0.5)),
+                    percent(replayed.quantile(0.95)),
+                    replayed
+                        .needed(0.02, 0.95)
+                        .map_or("never".to_owned(), |needed| needed.to_string()),
+                )
+                .expect("writing to a string");
+            }
+        }
+        writeln!(
+            report,
+            "\n| point | weight | best overall µs | best here µs | gap | best here |\n|---|---:|---:|---:|---:|---|"
+        )
+        .expect("writing to a string");
+        let gaps = recording.gaps();
+        for gap in &gaps {
+            writeln!(
+                report,
+                "| {} | {:.3} | {:.1} | {:.1} | {} | {:?} |",
+                gap.label,
+                gap.weight,
+                gap.shared_seconds * 1e6,
+                gap.local_seconds * 1e6,
+                percent(gap.gap()),
+                gap.local,
+            )
+            .expect("writing to a string");
+        }
+        let weighted = gaps.iter().map(|gap| gap.weight * gap.gap()).sum::<f64>()
+            / gaps.iter().map(|gap| gap.weight).sum::<f64>();
+        writeln!(report, "\nWeighted per-point gap: {}\n", percent(weighted)).expect("writing to a string");
+    }
+    Ok(report)
 }

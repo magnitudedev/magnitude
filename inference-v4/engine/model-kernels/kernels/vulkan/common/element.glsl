@@ -12,10 +12,11 @@
 // glslang's preprocessor has no variadic macros and does not evaluate token
 // pasting inside `#if`, so the Metal/CUDA `ELEMENT_HAS` probe cannot exist
 // here: a kind is read from the ABI prefix only by a `defined(...)` ladder
-// over the full prefix name. A header may name an ABI symbol inside
-// `defined()` even when an including entry lacks it. `ELEMENT_ACT` is the
-// kind of the activation element A when the entry binds one; an entry reads
-// the kind of any other dense element or tensor with its own ladder:
+// over the full prefix name, and the build admits only the including
+// entry's ABI names, so a ladder lives where its element exists:
+// `common/activation.glsl` gives `ELEMENT_ACT` (the activation element A) to
+// entries that bind A; an entry reads the kind of any other dense element or
+// tensor with its own ladder:
 //     #if defined(SEISMIC_ELEMENT_E_REPRESENTATION_F32)
 //     #define IMPORT_SOURCE_KIND ELEMENT_F32
 //     #elif ...
@@ -31,14 +32,6 @@
 
 // Bytes of one element of a kind.
 #define ELEMENT_BYTES(kind) ((kind) == ELEMENT_F32 ? 4u : 2u)
-
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16)
-#define ELEMENT_ACT ELEMENT_BF16
-#elif defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
-#define ELEMENT_ACT ELEMENT_F16
-#elif defined(SEISMIC_ELEMENT_A_REPRESENTATION_F32)
-#define ELEMENT_ACT ELEMENT_F32
-#endif
 
 // ---------------------------------------------------------------------------
 // Raw words at byte addresses. Reads go through `readonly` references.

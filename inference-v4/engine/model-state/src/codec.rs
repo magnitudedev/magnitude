@@ -83,6 +83,22 @@ pub enum KvCodec {
     RotatedK4V4,
 }
 
+impl std::str::FromStr for KvCodec {
+    type Err = String;
+
+    /// The operator-facing names (`--kv-codec`).
+    fn from_str(name: &str) -> Result<Self, String> {
+        match name {
+            "dense" => Ok(Self::Dense),
+            "affine-k8v4" => Ok(Self::AffineK8V4),
+            "rotated-k4v4" => Ok(Self::RotatedK4V4),
+            _ => Err(format!(
+                "unknown KV codec {name}: expected dense, affine-k8v4 or rotated-k4v4"
+            )),
+        }
+    }
+}
+
 impl KvCodec {
     pub const fn identity(self) -> &'static str {
         match self {

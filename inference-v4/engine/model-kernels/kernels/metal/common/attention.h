@@ -298,7 +298,11 @@ struct lane_codes {
     // This lane's codes of one vector's code row, shifted so its code i sits
     // at bits B * i of the (i * B / 32)-th word.
     static inline void load(device const uint *row, uint lane, thread uint (&w)[words]) {
-        if (bits >= 32) {
+        if (bits == 64) {
+            const uint2 pair = *reinterpret_cast<device const uint2 *>(row + lane * 2);
+            w[0] = pair.x;
+            w[words - 1] = pair.y;
+        } else if (bits >= 32) {
             ATTENTION_UNROLL
             for (uint j = 0; j < words; ++j)
                 w[j] = row[lane * words + j];
@@ -310,6 +314,33 @@ struct lane_codes {
     // Code i of this lane's columns, as F32 (exact).
     static inline float code(thread const uint (&w)[words], uint i) {
         return float((w[i * B / 32] >> ((i * B) % 32)) & levels);
+    }
+
+    // Every code of this lane's columns, as F32 (exact). Whole words unpack
+    // two codes at a time without a conversion instruction: a code c in the
+    // mantissa of the half 1024 (0x6400 | c) is 1024 + c exactly, and one
+    // half2 subtraction leaves c.
+    static inline void unpack(thread const uint (&w)[words], thread float (&x)[ATTENTION_E]) {
+        constexpr uint pair_mask = B == 8 ? 0x00FF00FFu : 0x000F000Fu;
+        constexpr uint per_word = 32 / B;
+        if (bits >= 32) {
+            ATTENTION_UNROLL
+            for (uint j = 0; j < words; ++j) {
+                // Shift s of the word holds codes s and s + per_word / 2 in
+                // its two halves.
+                ATTENTION_UNROLL
+                for (uint s = 0; s < per_word / 2; ++s) {
+                    const half2 pair = as_type<half2>(((w[j] >> (s * B)) & pair_mask) | 0x64006400u)
+                        - half2(1024.0h);
+                    x[j * per_word + s] = float(pair.x);
+                    x[j * per_word + s + per_word / 2] = float(pair.y);
+                }
+            }
+        } else {
+            ATTENTION_UNROLL
+            for (uint i = 0; i < ATTENTION_E; ++i)
+                x[i] = code(w, i);
+        }
     }
 };
 
@@ -379,53 +410,58 @@ inline void absorb_affine(thread const float (&q)[SEISMIC_DIM_G][ATTENTION_E],
     thread float (&output)[SEISMIC_DIM_G][ATTENTION_E], thread float (&bias)[SEISMIC_DIM_G]) {
     typedef lane_codes<ATTENTION_KEY_BITS> key_codes;
     typedef lane_codes<ATTENTION_VALUE_BITS> value_codes;
-    float k[N][ATTENTION_E];
-    float v[N][ATTENTION_E];
+    constexpr uint G = SEISMIC_DIM_G;
+    // Codes unpack one token at a time, so only one token's columns are live
+    // as F32 next to the scores and the output.
+    float score[G][N];
     ATTENTION_UNROLL
     for (uint j = 0; j < N; ++j) {
+        float k[ATTENTION_E];
+        key_codes::unpack(key[j], k);
         ATTENTION_UNROLL
-        for (uint i = 0; i < ATTENTION_E; ++i) {
-            k[j][i] = key_codes::code(key[j], i);
-            v[j][i] = value_codes::code(value[j], i);
-        }
-    }
-    ATTENTION_UNROLL
-    for (uint g = 0; g < SEISMIC_DIM_G; ++g) {
-        float score[N];
-        ATTENTION_UNROLL
-        for (uint j = 0; j < N; ++j) {
+        for (uint g = 0; g < G; ++g) {
             float partial = 0.0f;
             ATTENTION_UNROLL
             for (uint i = 0; i < ATTENTION_E; ++i)
-                partial = metal::fma(q[g][i], k[j][i], partial);
-            score[j] = metal::fma(key_coefficients[j].x, simd_sum(partial),
+                partial = metal::fma(q[g][i], k[i], partial);
+            score[g][j] = metal::fma(key_coefficients[j].x, simd_sum(partial),
                 key_coefficients[j].y * qsum[g]);
         }
+    }
+    // Each value code's weight: its probability times the value scale.
+    float weight[G][N];
+    ATTENTION_UNROLL
+    for (uint g = 0; g < G; ++g) {
         float next = maximum[g];
         ATTENTION_UNROLL
         for (uint j = 0; j < N; ++j)
-            next = metal::max(next, score[j]);
+            next = metal::max(next, score[g][j]);
         const float carry = metal::fast::exp2(maximum[g] - next);
-        float probability[N];
         float sum = 0.0f;
         float offset = bias[g] * carry;
         ATTENTION_UNROLL
         for (uint j = 0; j < N; ++j) {
-            probability[j] = metal::fast::exp2(score[j] - next);
-            sum += probability[j];
-            offset = metal::fma(probability[j], value_coefficients[j].y, offset);
+            const float probability = metal::fast::exp2(score[g][j] - next);
+            sum += probability;
+            offset = metal::fma(probability, value_coefficients[j].y, offset);
+            weight[g][j] = probability * value_coefficients[j].x;
         }
         denominator[g] = metal::fma(denominator[g], carry, sum);
         bias[g] = offset;
-        ATTENTION_UNROLL
-        for (uint i = 0; i < ATTENTION_E; ++i) {
-            float o = output[g][i] * carry;
-            ATTENTION_UNROLL
-            for (uint j = 0; j < N; ++j)
-                o = metal::fma(probability[j] * value_coefficients[j].x, v[j][i], o);
-            output[g][i] = o;
-        }
         maximum[g] = next;
+        ATTENTION_UNROLL
+        for (uint i = 0; i < ATTENTION_E; ++i)
+            output[g][i] *= carry;
+    }
+    ATTENTION_UNROLL
+    for (uint j = 0; j < N; ++j) {
+        float v[ATTENTION_E];
+        value_codes::unpack(value[j], v);
+        ATTENTION_UNROLL
+        for (uint g = 0; g < G; ++g)
+            ATTENTION_UNROLL
+            for (uint i = 0; i < ATTENTION_E; ++i)
+                output[g][i] = metal::fma(weight[g][j], v[i], output[g][i]);
     }
 }
 

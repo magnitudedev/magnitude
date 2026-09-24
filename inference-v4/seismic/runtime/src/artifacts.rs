@@ -16,6 +16,8 @@ use std::sync::Arc;
 pub enum ArtifactKind {
     /// A CUDA CUBIN image formed by NVRTC.
     CudaImage,
+    /// One Vulkan launch's sealed, validated SPIR-V (little-endian words).
+    SpirV,
 }
 
 /// A content address: the SHA-256 (lowercase hex) of everything that

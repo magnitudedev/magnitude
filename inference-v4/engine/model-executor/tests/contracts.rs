@@ -1,17 +1,19 @@
 //! Pure launch-control validation retained after the executor/domain rewrite.
 use magnitude_model_executor::{
-    batching::Demand, FeatureRef, Operation, RequestId, ResourceDomainId, Shaping, TokenId,
-    WorkKind,
+    batching::Demand, Operation, RequestId, Sampling, SelectSpec, Shaping, TokenId, WorkKind,
 };
 use std::sync::Arc;
 
-fn feature(id: u64) -> FeatureRef {
-    FeatureRef::logical(
-        ResourceDomainId::new(format!("contract-{id}")).unwrap(),
-        4,
-        4,
-    )
-    .unwrap()
+fn select() -> SelectSpec {
+    SelectSpec {
+        sampling: Sampling::Greedy,
+        seed: 0,
+        position: 0,
+        domain: 0,
+        mask: None,
+        shaping: Shaping::default(),
+        history: None,
+    }
 }
 
 #[test]
@@ -159,36 +161,28 @@ fn operation_validation_checks_the_complete_selection_row_contract() {
 }
 
 #[test]
-fn head_feature_span_must_match_rows_and_have_a_checked_nonempty_range() {
-    let mismatched = Operation::Head {
+fn head_conditioning_rows_must_match_its_entry_rows() {
+    let rows = |count: usize| {
+        magnitude_model_executor::FeatureRows::new(vec![0u8; 4 * count].into(), count).unwrap()
+    };
+    let head = |tokens: usize, conditioning: usize, proposals: usize| Operation::Head {
         request: RequestId(3),
-        tokens: vec![TokenId(4), TokenId(5)],
-        conditioning: magnitude_model_executor::FeatureSpan {
-            features: feature(5),
-            start: 0,
-            count: 1,
-        },
+        tokens: vec![TokenId(4); tokens],
+        conditioning: rows(conditioning),
         position: 0,
-        demand: Demand::NONE,
+        proposals: vec![select(); proposals],
     };
     assert!(matches!(
-        mismatched.validate(),
+        head(2, 1, 0).validate(),
         Err(magnitude_model_executor::OperationError::FeatureSpan { count: 1, rows: 2 })
     ));
-
-    let overflow = Operation::Head {
-        request: RequestId(3),
-        tokens: vec![TokenId(4)],
-        conditioning: magnitude_model_executor::FeatureSpan {
-            features: feature(5),
-            start: usize::MAX,
-            count: 1,
-        },
-        position: 0,
-        demand: Demand::NONE,
-    };
-    assert!(matches!(
-        overflow.validate(),
-        Err(magnitude_model_executor::OperationError::FeatureSpan { count: 1, rows: 1 })
-    ));
+    let drafting = head(2, 2, 3);
+    assert!(drafting.validate().is_ok());
+    // Entry rows plus one chained row per proposal after the first.
+    assert_eq!(drafting.row_count(), 4);
+    assert_eq!(drafting.demand(), Demand::SELECT);
+    assert_eq!(head(1, 1, 0).demand(), Demand::NONE);
+    assert!(magnitude_model_executor::FeatureRows::new(vec![0u8; 5].into(), 2).is_err());
+    assert!(rows(2).concat(&rows(1)).is_ok_and(|joined| joined.rows() == 3));
+    assert!(rows(3).slice(1, 3).is_err());
 }

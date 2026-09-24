@@ -1,0 +1,62 @@
+# Target input rows: the token embedding and the conditioning overlay.
+
+# Token embedding (K2): gather one table row per token and decode it with the
+# K1 packet decoders; one threadgroup per token row.
+# `tokens` has the `sample_rows` result layout (token, status), so a step can
+# embed the previous step's selection directly on the device. A failed
+# selection (token -1) embeds token 0; its step is never used.
+fn embedding_rows[M, V, D](table: &tensor[V, D] EW, tokens: &tensor[M, 2] i32)
+    -> (tensor[M, D] A, tensor[M, D] f32):
+    let mut embedded = tensor[M, D] A
+    parallel for row in 0..M:
+        let token = max(tokens[row, 0], 0)
+        parallel for col in 0..D:
+            embedded[row, col] = f32(table[token, col])
+    return embedded, f32(embedded)
+
+# Metal: 256 threads, each decoding whole 32-value rows16 packets. (CUDA: 128
+# threads over mma16 lane chunks.)
+native embedding_rows for metal from "metal/embedding_rows.metal":
+    static (D)
+    launch embedding_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CUDA: 128 threads, each decoding 16 values of an mma16 lane chunk. (Metal:
+# 256 threads over rows16 packets.)
+native embedding_rows for cuda from "cuda/embedding_rows.cu":
+    static (D)
+    launch embedding_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+
+
+# Conditioned features are already F32 model-width rows. This entry owns the
+# device-to-device publication into the selected embedding rows.
+fn conditioning_overlay[M, D](input: &tensor[M, D] f32, out: &mut tensor[M, D] f32):
+    parallel for row in 0..M:
+        parallel for col in 0..D:
+            out[row, col] = input[row, col]
+
+native conditioning_overlay for metal from "metal/conditioning_overlay.metal":
+    launch conditioning_overlay:
+        threadgroups (ceil_div(M * D, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native conditioning_overlay for cuda from "cuda/conditioning_overlay.cu":
+    launch conditioning_overlay:
+        threadgroups (ceil_div(M * D, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native embedding_rows for vulkan from "vulkan/embedding_rows.comp":
+    static (D)
+    launch embedding_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+
+# Vulkan: a grid-stride loop over every element; the x grid is capped at the
+# 65535-group floor (Vulkan spec §5.3).
+native conditioning_overlay for vulkan from "vulkan/conditioning_overlay.comp":
+    launch conditioning_overlay:
+        threadgroups (min(ceil_div(M * D, 256), 65535), 1, 1)
+        threads_per_threadgroup (256, 1, 1)

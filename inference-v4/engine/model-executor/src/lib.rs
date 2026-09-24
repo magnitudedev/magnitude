@@ -12,7 +12,7 @@ mod operation;
 mod planning;
 pub mod programs;
 pub use programs::{
-    CommitSpan, CompletedHeadWork, CompletedImportWork, CompletedProjectWork, CompletedStateWork,
+    CommitSpan, CompletedHeadWork, CompletedImportWork, CompletedStateWork,
     CompletedTargetWork, CompletedVisionWork, HeadProgram, ImportProgram, PreparedHeadGraphs, SealReport,
     PreparedStateCopyGraphs, PreparedTargetGraphs, PreparedTargetReadoutGraphs,
     PreparedVisionGraphs, StateProgram, TargetOutput, TargetProgram, VisionProgram,
@@ -30,7 +30,7 @@ pub use device_resources::{
 pub use domain::{
     DomainCheckpoint, DomainError, DomainRequirements, DomainReservation, ExecutorDomain,
     HeadFlight, NativeFamily, OpenRequirements, OpenReservation, PendingOperationOutcome,
-    PhysicalDecision, PhysicalResolution, ProgramFamily, ProjectFlight, ReservedRepair,
+    PhysicalDecision, PhysicalResolution, ProgramFamily, ReservedRepair,
     ReservedResources, StateFlight, TargetFlight, TargetHostTiming, VisionFlight,
 };
 pub use error::{CapacityError, DeviceError, InvariantError, PlanError, ResourceKind, SubmitError};
@@ -38,11 +38,10 @@ pub use execution_path::ExecutionPath;
 pub use kernel_cache::{KernelCache, KernelCacheError, TuningCacheKey, DEFAULT_KERNEL_CACHE_BYTES};
 pub use lanes::ConditioningSlice;
 pub use lanes::{
-    HeadLaunchCore, HeadLaunchInputs, ImportLaunchCore, ImportLaunchInputs, ProjectLaunchCore,
-    ProjectionLaunchInputs, ProjectionRequest, ResidentWeightSlot, StateLaunchCore,
-    StateLaunchInputs, StateWork, TargetLaunchCore, TargetLaunchInputs, TargetLaunchWorkspace,
-    ValidatedHeadLaunch,
-    ValidatedImportLaunch, ValidatedProjectionLaunch, ValidatedStateLaunch, ValidatedTargetLaunch,
+    HeadLaunchCore, HeadLaunchInputs, ImportLaunchCore, ImportLaunchInputs, ResidentWeightSlot,
+    StateLaunchCore, StateLaunchInputs, StateWork, TargetLaunchCore, TargetLaunchInputs,
+    TargetLaunchWorkspace, TargetTokens, ValidatedHeadLaunch, ValidatedImportLaunch,
+    ValidatedStateLaunch, ValidatedTargetLaunch,
     ValidatedVisionLaunch, VisionLaunchCore, VisionLaunchInputs,
 };
 pub use magnitude_model_batching::{self as batching, Demand, LaunchClass};
@@ -62,9 +61,9 @@ pub use native::pinned_tuning;
 #[cfg(feature = "tuning-survey")]
 pub use native::tuning_survey;
 pub use operation::{
-    CommittedClass, ExecutableKind, FeatureRetainer, FeatureSpan, GroupKey, Operation,
-    OperationError, Outcome, ProgramIdentity, RequestId, ResourceDomainId, RetainedFeatureSpan,
-    RowResult, Sampling, SelectSpec, Selected, Shaping, TokenId, WorkKind,
+    CommittedClass, ExecutableKind, FeatureReader, FeatureRows, FeatureSpan, GroupKey, Operation,
+    OperationError, Outcome, ProgramIdentity, RequestId, ResourceDomainId, RowResult, Sampling,
+    SelectSpec, Selected, Shaping, TokenId, WorkKind,
 };
 pub use planning::{
     resident_element, resident_layout, source_element, ArtifactComponent, ArtifactComponentKind,
@@ -72,7 +71,7 @@ pub use planning::{
     CapabilityPlan, ComponentPlan, ComponentSelection, DenseBinding, EmbeddingBinding,
     ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding, FeedForwardProgramSlot,
     HeadBinding, HeadProgramPlan, ImportProgramSlot, MixerProgramSlot, ModelLoadPlan,
-    PlannedDevice, PlannedMethod, ProgramPlan, ReadoutBinding,
+    PlannedDevice, PlannedMethod, ProgramPlan, ReadoutBinding, MAX_DRAFT_PROPOSALS,
     RecurrentBinding, ResolvedPolicy, ResourceBudget, ResourceBytes, ResourceLimits, ResourcePlan,
     ResourcePlanner, RetentionCapacityPlan, RoutedBinding, StateCapacityPlan,
     StateProgramPlan, StateResourcePlan, StateStorePlan, TargetBlockProgramSlot, NativeGraphCharge,

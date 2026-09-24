@@ -303,6 +303,9 @@ pub struct ModelLimits<'a> {
     pub output_capacity: usize,
     pub forced_quantum: usize,
     pub method: MethodPolicy,
+    /// The prompt text one image renders as in the loaded model's template;
+    /// `None` when the model takes no images.
+    pub media_marker: Option<&'a str>,
 }
 
 /// Host-selected generation method policy. The concrete proposal width is
@@ -546,15 +549,36 @@ impl Request {
                 Part::Text(_) => None,
             })
             .collect();
-        let mut request = ChatRequest::new(
-            self.body
-                .messages
-                .iter()
-                .map(serde_json::to_value)
-                .collect::<Result<_, _>>()
-                .map_err(|error| error.to_string())?,
-            now,
-        );
+        // An image part renders as the model's image placeholder text (a
+        // media marker), which the model's input preparation expands.
+        let messages = self
+            .body
+            .messages
+            .iter()
+            .map(|message| {
+                let mut value = serde_json::to_value(message).map_err(|error| error.to_string())?;
+                if let Some(Content::Parts(parts)) = &message.content {
+                    if parts.iter().any(|part| matches!(part, Part::ImageUrl(_))) {
+                        let marker = limits
+                            .media_marker
+                            .ok_or("the loaded model takes no image input")?;
+                        value["content"] = parts
+                            .iter()
+                            .map(|part| match part {
+                                Part::Text(part) => {
+                                    serde_json::json!({"type": "text", "text": part.text})
+                                }
+                                Part::ImageUrl(_) => {
+                                    serde_json::json!({"type": "media_marker", "text": marker})
+                                }
+                            })
+                            .collect();
+                    }
+                }
+                Ok(value)
+            })
+            .collect::<Result<_, String>>()?;
+        let mut request = ChatRequest::new(messages, now);
         request.tools = self
             .body
             .tools

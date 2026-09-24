@@ -924,15 +924,12 @@ impl TopologyBuilder {
         })
     }
 
-    pub(crate) fn instance_view(
-        &mut self, arena: &mut ExprArena, source: AnyBufferView,
-        extents: Vec<NatExpr>, strides: Vec<NatExpr>,
-    ) -> AnyBufferView {
-        let layout = self.view_layout(source);
+    /// A tensor value whose geometry is exactly its allocation's canonical
+    /// geometry (the same extent and stride expressions).
+    pub(crate) fn instance_view(&mut self, arena: &mut ExprArena, source: AnyBufferView) -> AnyBufferView {
+        let layout = self.view_layout(source).clone();
         assert!(matches!(layout.mapping, ViewMapping::WholeAllocation));
-        let representation = layout.representation;
-        let value = self.region_view(arena, representation, extents, strides);
-        // Begin captures precisely the canonical geometry of this allocation.
+        let value = self.region_view(arena, layout.representation, layout.extents, layout.strides);
         self.views[value.index() as usize].contiguous = true;
         value
     }

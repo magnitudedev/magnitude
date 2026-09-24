@@ -74,6 +74,9 @@ pub enum HostValueExpr {
     Natural(NatExpr),
     Bool(BoolExpr),
     Word { dtype: DType, value: IntExpr },
+    /// The language's float conversion of an exact integer (C1-19: one RNE
+    /// rounding of the mathematical value to `dtype`).
+    Float { dtype: DType, value: IntExpr },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -348,9 +351,22 @@ pub enum ScheduleStep {
         symbol: SymbolId,
         start: NatExpr,
         end: NatExpr,
+        visits: RepeatVisits,
         body: Vec<ScheduleStep>,
         carries: Product<RepeatCarry>,
     },
+}
+
+/// How a repeat's visits relate when one of them stops at a source failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RepeatVisits {
+    /// Each visit continues the previous one; a failure ends the repeat.
+    Ordered,
+    /// The checked independent participants of a `parallel for`, visited in
+    /// index order. A source failure ends only its own visit; every other
+    /// visit still runs, and the repeat then fails with the lowest-index
+    /// failure. Independent visits carry no products.
+    Independent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -698,66 +714,152 @@ impl<B: PhysicalDialect> ParametricSchedule<B> {
         }, bytes).unwrap_or(bytes)
     }
 
-    /// Lift per-launch obligations through their lexical schedule scopes.
-    /// A repeat quantifies its local binder. Runtime branches conservatively
-    /// require both arms.
-    pub fn launch_requirements(
-        &self,
-        arena: &mut ExprArena,
-        requirements: &[BoolExpr],
-    ) -> BoolExpr {
-        assert_eq!(requirements.len(), self.launches.len());
-        self.scoped_requirements(arena, &mut |arena, point| match point {
-            RequirementPoint::Step(ScheduleStep::Launch(id)) => requirements[id.index() as usize],
-            _ => arena.bool(true),
-        }, &mut |arena, _| arena.bool(true))
-    }
-
     /// Close obligations at their actual lexical use, including zero-trip
     /// repeats and the distinct initial/backedge scopes of carried products.
     /// `established` supplies only postconditions guaranteed by successful
-    /// completion of that step. They justify later dominated uses and expire
-    /// when a referenced slot is overwritten or a compound region is entered.
+    /// completion of that step. They justify later dominated uses, including
+    /// uses inside later compound regions, and expire when a slot they
+    /// reference may be written: by a leaf, anywhere inside a compound region
+    /// (on entry, since a repeat revisits its body), or by a native launch
+    /// (native scalar slots). A branch arm also knows its condition.
     pub fn scoped_requirements(
         &self,
         arena: &mut ExprArena,
+        views: &[BufferViewLayout],
         requirement: &mut impl FnMut(&mut ExprArena, RequirementPoint<'_>) -> BoolExpr,
         established: &mut impl FnMut(&mut ExprArena, &ScheduleStep) -> BoolExpr,
     ) -> BoolExpr {
+        use crate::region::{ValueDestination, ValueOperand};
+        fn destination(value: ValueDestination, out: &mut Vec<SymbolId>) {
+            match value {
+                ValueDestination::Scalar(slot) => out.push(slot.symbol()),
+                ValueDestination::Quantity(slot) => out.push(slot.symbol()),
+                // Fresh geometry slots, created after every earlier fact.
+                ValueDestination::Tensor(_) => {}
+            }
+        }
+        /// Every slot a step may write.
+        fn written(step: &ScheduleStep, native: &[SymbolId], out: &mut Vec<SymbolId>) {
+            match step {
+                ScheduleStep::ScalarMove(value) => out.push(value.to.symbol()),
+                ScheduleStep::ScalarRead(value) => out.push(value.to.symbol()),
+                ScheduleStep::EvaluateHost(value) => out.push(match value.to {
+                    HostValueDestination::Quantity(slot) => slot.symbol(),
+                    HostValueDestination::Native(slot) => slot.symbol(),
+                }),
+                ScheduleStep::Launch(_) => out.extend_from_slice(native),
+                ScheduleStep::Imported { body, .. } => body.iter().for_each(|step| written(step, native, out)),
+                ScheduleStep::If { then_steps, else_steps, results, .. } => {
+                    then_steps.iter().chain(else_steps).for_each(|step| written(step, native, out));
+                    results.visit(&mut |result| destination(result.result(), out));
+                }
+                ScheduleStep::Repeat { body, carries, .. } => {
+                    body.iter().for_each(|step| written(step, native, out));
+                    carries.visit(&mut |carry| {
+                        destination(carry.header(), out);
+                        destination(carry.result(), out);
+                    });
+                }
+                ScheduleStep::BeginAllocationInstance { .. } | ScheduleStep::BindArgumentTensor { .. }
+                | ScheduleStep::PublishTensor { .. } | ScheduleStep::Copy(_) | ScheduleStep::Fill(_)
+                | ScheduleStep::Check(_) => {}
+            }
+        }
+        fn expire(arena: &ExprArena, facts: &mut Vec<BoolExpr>, written: &[SymbolId]) {
+            facts.retain(|fact| !arena.free_symbols((*fact).into()).iter().any(|symbol| written.contains(symbol)));
+        }
+        /// Product-level invariant: a tensor destination axis whose every
+        /// incoming value has the same geometry expression, over operands the
+        /// region does not write, equals that expression wherever the
+        /// destination is in scope.
+        fn product_axes(
+            arena: &mut ExprArena,
+            views: &[BufferViewLayout],
+            sources: [ValueOperand; 2],
+            destinations: &[ValueDestination],
+            writes: &[SymbolId],
+            equal: &[(SymbolId, NatExpr)],
+            out: &mut Vec<(SymbolId, NatExpr)>,
+        ) {
+            let (ValueOperand::Tensor(a), ValueOperand::Tensor(b)) = (sources[0], sources[1]) else { return };
+            let (a, b) = (&views[a.index() as usize], &views[b.index() as usize]);
+            let axes = |layout: &BufferViewLayout| layout.extents.iter().chain(&layout.strides).copied().collect::<Vec<_>>();
+            let (a, b) = (axes(a), axes(b));
+            for (axis, (value, other)) in a.iter().zip(&b).enumerate() {
+                if value != other || arena.free_symbols((*value).into()).iter().any(|symbol| writes.contains(symbol)) {
+                    continue;
+                }
+                let value = arena.substitute_nat(*value, equal);
+                for destination in destinations {
+                    let ValueDestination::Tensor(view) = destination else { continue };
+                    let slot = axes(&views[view.index() as usize])[axis];
+                    let seismic_lang::expr::NodeView::Symbol(symbol) = arena.view(slot.into()) else {
+                        panic!("region product geometry is not its destination slot")
+                    };
+                    out.push((symbol, value));
+                }
+            }
+        }
+        #[allow(clippy::too_many_arguments)]
         fn visit(
             arena: &mut ExprArena,
+            views: &[BufferViewLayout],
             steps: &[ScheduleStep],
+            mut established_facts: Vec<BoolExpr>,
+            mut equal: Vec<(SymbolId, NatExpr)>,
+            native: &[SymbolId],
             requirement: &mut impl FnMut(&mut ExprArena, RequirementPoint<'_>) -> BoolExpr,
             established: &mut impl FnMut(&mut ExprArena, &ScheduleStep) -> BoolExpr,
         ) -> BoolExpr {
             let mut terms = Vec::new();
-            let mut established_facts = Vec::new();
             for step in steps {
-                // Compound regions can overwrite carried slots. Their entry
-                // and exit environments need independent facts until those
-                // writes have an explicit product-level invariant.
-                if matches!(step, ScheduleStep::If { .. } | ScheduleStep::Repeat { .. }
-                    | ScheduleStep::Imported { .. }) {
-                    established_facts.clear();
+                let mut writes = Vec::new();
+                written(step, native, &mut writes);
+                let compound = matches!(step, ScheduleStep::If { .. } | ScheduleStep::Repeat { .. }
+                    | ScheduleStep::Imported { .. });
+                if compound {
+                    expire(arena, &mut established_facts, &writes);
                 }
                 let facts = arena.all(&established_facts);
+                let require = |arena: &mut ExprArena, requirement: &mut dyn FnMut(&mut ExprArena, RequirementPoint<'_>) -> BoolExpr,
+                    point: RequirementPoint<'_>, equal: &[(SymbolId, NatExpr)]| {
+                    let term = requirement(arena, point);
+                    arena.substitute_nat(term, equal)
+                };
                 let term = match step {
-                    ScheduleStep::Imported { body, .. } => visit(arena, body, requirement, established),
-                    ScheduleStep::If { then_steps, else_steps, results, .. } => {
-                        let a = visit(arena, then_steps, requirement, established);
-                        let yielded_a = requirement(arena, RequirementPoint::BranchResult(results, true));
+                    ScheduleStep::Imported { body, .. } => visit(arena, views, body, established_facts.clone(), equal.clone(), native, requirement, established),
+                    ScheduleStep::If { condition, then_steps, else_steps, results } => {
+                        let condition = arena.substitute_nat(*condition, &equal);
+                        let mut then_facts = established_facts.clone();
+                        then_facts.push(condition);
+                        let a = visit(arena, views, then_steps, then_facts, equal.clone(), native, requirement, established);
+                        let yielded_a = require(arena, requirement, RequirementPoint::BranchResult(results, true), &equal);
                         let a = arena.and(a, yielded_a);
-                        let b = visit(arena, else_steps, requirement, established);
-                        let yielded_b = requirement(arena, RequirementPoint::BranchResult(results, false));
+                        let mut else_facts = established_facts.clone();
+                        else_facts.push(arena.not(condition));
+                        let b = visit(arena, views, else_steps, else_facts, equal.clone(), native, requirement, established);
+                        let yielded_b = require(arena, requirement, RequirementPoint::BranchResult(results, false), &equal);
                         let b = arena.and(b, yielded_b);
-                        arena.and(a, b)
+                        let mut joined = Vec::new();
+                        results.visit(&mut |result| product_axes(arena, views, [result.then_value(), result.else_value()],
+                            &[result.result()], &writes, &equal, &mut joined));
+                        let term = arena.and(a, b);
+                        equal.extend(joined);
+                        term
                     }
-                    ScheduleStep::Repeat { binder, symbol, start, end, body, carries } => {
-                        let initial = requirement(arena, RequirementPoint::RepeatInitial(carries));
+                    ScheduleStep::Repeat { binder, symbol, start, end, body, carries, .. } => {
+                        let initial = require(arena, requirement, RequirementPoint::RepeatInitial(carries), &equal);
                         terms.push(arena.implies(facts, initial));
-                        let body = visit(arena, body, requirement, established);
-                        let backedge = requirement(arena, RequirementPoint::RepeatBackedge(carries));
+                        let mut header = equal.clone();
+                        let mut result = Vec::new();
+                        carries.visit(&mut |carry| {
+                            product_axes(arena, views, [carry.initial(), carry.backedge()], &[carry.header()], &writes, &equal, &mut header);
+                            product_axes(arena, views, [carry.initial(), carry.backedge()], &[carry.result()], &writes, &equal, &mut result);
+                        });
+                        let body = visit(arena, views, body, established_facts.clone(), header.clone(), native, requirement, established);
+                        let backedge = require(arena, requirement, RequirementPoint::RepeatBackedge(carries), &header);
                         let body = arena.and(body, backedge);
+                        equal.extend(result);
                         if matches!(arena.view(body.into()), seismic_lang::expr::NodeView::BoolConst(true)) { body }
                         else {
                             let zero = arena.nat(0);
@@ -775,36 +877,21 @@ impl<B: PhysicalDialect> ParametricSchedule<B> {
                             arena.implies(nonempty, holds)
                         }
                     }
-                    leaf => requirement(arena, RequirementPoint::Step(leaf)),
+                    leaf => require(arena, requirement, RequirementPoint::Step(leaf), &equal),
                 };
                 terms.push(arena.implies(facts, term));
                 // Only the completed leaf's own postcondition is exported.
                 // Branch/loop-local facts never escape their lexical region.
-                if !matches!(step, ScheduleStep::If { .. } | ScheduleStep::Repeat { .. }
-                    | ScheduleStep::Imported { .. }) {
-                    let written = match step {
-                        ScheduleStep::ScalarMove(value) => Some(value.to.symbol()),
-                        ScheduleStep::ScalarRead(value) => Some(value.to.symbol()),
-                        ScheduleStep::EvaluateHost(value) => Some(match value.to {
-                            HostValueDestination::Quantity(slot) => slot.symbol(),
-                            HostValueDestination::Native(slot) => slot.symbol(),
-                        }),
-                        _ => None,
-                    };
-                    if let Some(symbol) = written {
-                        established_facts.retain(|fact| !arena.free_symbols((*fact).into()).contains(&symbol));
-                    }
-                    // Native launches can write scalar ABI slots. Without a
-                    // write inventory here, retain no prior slot facts.
-                    if matches!(step, ScheduleStep::Launch(_)) {
-                        established_facts.clear();
-                    }
-                    established_facts.push(established(arena, step));
+                if !compound {
+                    expire(arena, &mut established_facts, &writes);
+                    let fact = established(arena, step);
+                    established_facts.push(arena.substitute_nat(fact, &equal));
                 }
             }
             arena.all(&terms)
         }
-        visit(arena, &self.steps, requirement, established)
+        let native = self.slots.iter().map(|slot| slot.symbol()).collect::<Vec<_>>();
+        visit(arena, views, &self.steps, Vec::new(), Vec::new(), &native, requirement, established)
     }
 
     pub fn retained_bytes(&self) -> usize {
@@ -899,11 +986,13 @@ fn rewrite_launch_as_repeat(
     for step in steps {
         match step {
             ScheduleStep::Launch(id) if *id == target => {
+                // Chunks of one launch; the body cannot stop at a source failure.
                 *step = ScheduleStep::Repeat {
                     binder,
                     symbol,
                     start,
                     end,
+                    visits: RepeatVisits::Ordered,
                     body: vec![ScheduleStep::Launch(target)],
                     carries: Product::Unit,
                 };
@@ -975,6 +1064,7 @@ enum RegionStep {
         symbol: SymbolId,
         start: NatExpr,
         end: NatExpr,
+        visits: RepeatVisits,
         body_region: u32,
         carries: Option<Product<RepeatCarry>>,
     },
@@ -1069,6 +1159,7 @@ impl<B: PhysicalDialect> ScheduleConstruction<B> {
         parent: u32,
         start: NatExpr,
         end: NatExpr,
+        visits: RepeatVisits,
     ) -> (u32, LoopBinding) {
         assert!(!self.closed, "a closed schedule cannot be extended");
         let control = self.next_control;
@@ -1095,6 +1186,7 @@ impl<B: PhysicalDialect> ScheduleConstruction<B> {
                 symbol,
                 start,
                 end,
+                visits,
                 body_region,
                 carries: Some(Product::Unit),
             });
@@ -1363,6 +1455,7 @@ impl<B: PhysicalDialect> ScheduleConstruction<B> {
                     symbol,
                     start,
                     end,
+                    visits,
                     body_region,
                     carries,
                 } => {
@@ -1393,6 +1486,7 @@ impl<B: PhysicalDialect> ScheduleConstruction<B> {
                         symbol,
                         start,
                         end,
+                        visits,
                         body: self.lower_region(body_region, direct, launches),
                         carries,
                     });
@@ -1705,6 +1799,7 @@ fn remap_steps(
                 symbol,
                 start,
                 end,
+                visits,
                 body,
                 carries,
             } => ScheduleStep::Repeat {
@@ -1712,6 +1807,7 @@ fn remap_steps(
                 symbol,
                 start,
                 end,
+                visits,
                 body: remap_steps(body, view, slot, quantity_slot, launch),
                 carries: carries.map(&mut |carry| carry.remap(view, slot, quantity_slot)),
             },
@@ -1736,14 +1832,6 @@ impl<'a, B: PhysicalDialect> ScheduleBuilder<'a, B> {
         otherwise: impl FnOnce(&mut ScheduleBuilder<'_, B>),
     ) {
         self.inner.branch(condition, then, otherwise)
-    }
-    pub fn repeat(
-        &mut self,
-        start: NatExpr,
-        end: NatExpr,
-        body: impl FnOnce(&mut ScheduleBuilder<'_, B>, LoopBinding),
-    ) {
-        self.inner.repeat(start, end, body)
     }
     pub fn close(self) -> ClosedSchedule {
         self.inner.close()
@@ -1780,6 +1868,11 @@ impl<'a, B: PhysicalDialect> ScheduleBuilder<'a, B> {
             }
             (HostValueExpr::Word { dtype, .. }, HostValueDestination::Native(to)) => {
                 assert!(matches!(dtype, DType::I32 | DType::U32), "host word projection needs an integer scalar dtype");
+                assert_eq!(to.kind(), ScalarKind::Scalar(dtype));
+                assert_eq!(to.owner(), self.inner.state.owner);
+            }
+            (HostValueExpr::Float { dtype, .. }, HostValueDestination::Native(to)) => {
+                assert!(dtype.is_float(), "host float conversion needs a float scalar dtype");
                 assert_eq!(to.kind(), ScalarKind::Scalar(dtype));
                 assert_eq!(to.owner(), self.inner.state.owner);
             }
@@ -2165,26 +2258,6 @@ mod internals {
                 otherwise(&mut child);
             }
         }
-        pub(super) fn repeat(
-            &mut self,
-            start: NatExpr,
-            end: NatExpr,
-            body: impl FnOnce(&mut ScheduleBuilder<'_, B>, LoopBinding),
-        ) {
-            let (body_region, binding) =
-                self.state.begin_repeat(self.arena, self.region, start, end);
-            {
-                let mut child = ScheduleBuilder {
-                    inner: Builder {
-                        arena: &mut *self.arena,
-                        views: self.views,
-                        state: &mut *self.state,
-                        region: body_region,
-                    },
-                };
-                body(&mut child, binding);
-            }
-        }
         pub(super) fn close(self) -> ClosedSchedule {
             assert_eq!(
                 self.region, 0,
@@ -2202,6 +2275,14 @@ mod internals {
 mod tests {
     use super::*;
     use seismic_lang::expr::{Assignment, SymbolValue};
+
+    /// Per-launch obligations lifted through their lexical scopes.
+    fn launch_requirements<B: PhysicalDialect>(schedule: &ParametricSchedule<B>, arena: &mut ExprArena, requirements: &[BoolExpr]) -> BoolExpr {
+        schedule.scoped_requirements(arena, &[], &mut |arena, point| match point {
+            RequirementPoint::Step(ScheduleStep::Launch(id)) => requirements[id.index() as usize],
+            _ => arena.bool(true),
+        }, &mut |arena, _| arena.bool(true))
+    }
 
     #[derive(Debug)]
     struct Dialect;
@@ -2252,7 +2333,7 @@ mod tests {
         let mut values = Assignment::new();
         values.bind(symbol, SymbolValue::Int((-1).into()));
         let check = |schedule: &ParametricSchedule<Dialect>, arena: &mut ExprArena| {
-            let predicate = schedule.scoped_requirements(arena,
+            let predicate = schedule.scoped_requirements(arena, &[],
                 &mut |arena, point| match point {
                     RequirementPoint::Step(ScheduleStep::Launch(_)) => fact,
                     _ => arena.bool(true),
@@ -2358,7 +2439,7 @@ mod tests {
         let local_symbol = *symbol;
         let base = schedule.launch(launch_id).logical_base.unwrap().value;
         let requirement = arena.nat_cmp(seismic_lang::expr::CmpOp::Lt, base, seventeen);
-        let lifted = schedule.launch_requirements(&mut arena, &[requirement]);
+        let lifted = launch_requirements(&schedule, &mut arena, &[requirement]);
         assert!(!arena.free_symbols(lifted.into()).contains(&local_symbol));
         assert!(arena.eval_bool(lifted, &Assignment::new()).unwrap());
         let one = arena.nat(1);
@@ -2367,7 +2448,7 @@ mod tests {
             schedule.launch(launch_id).grid[0],
             one,
         );
-        let lifted = schedule.launch_requirements(&mut arena, &[too_small]);
+        let lifted = launch_requirements(&schedule, &mut arena, &[too_small]);
         assert!(!arena.free_symbols(lifted.into()).contains(&local_symbol));
         assert!(!arena.eval_bool(lifted, &Assignment::new()).unwrap());
 
@@ -2389,6 +2470,7 @@ mod tests {
             symbol: outer_symbol,
             start: two,
             end: four,
+            visits: RepeatVisits::Ordered,
             body,
             carries: Product::Unit,
         }];
@@ -2404,20 +2486,20 @@ mod tests {
         // A rejected native descriptor in an unexecuted loop body must not
         // restrict the empty loop's applicability.
         let unsupported_descriptor = arena.bool(false);
-        let lifted = schedule.launch_requirements(&mut arena, &[unsupported_descriptor]);
+        let lifted = launch_requirements(&schedule, &mut arena, &[unsupported_descriptor]);
         assert!(arena.eval_bool(lifted, &Assignment::new()).unwrap());
         // Use obligations in an empty body/backedge must preserve partial
         // expression laziness. Initial carried products are still evaluated.
         let zero = arena.nat(0);
         let partial = arena.nat_div(one, zero);
-        let lifted = schedule.scoped_requirements(&mut arena, &mut |arena, point| match point {
+        let lifted = schedule.scoped_requirements(&mut arena, &[], &mut |arena, point| match point {
             RequirementPoint::Step(_) | RequirementPoint::RepeatBackedge(_) => arena.nat_cmp(seismic_lang::expr::CmpOp::Eq, partial, zero),
             RequirementPoint::RepeatInitial(_) | RequirementPoint::BranchResult(_, _) => arena.bool(true),
         }, &mut |arena, _| arena.bool(true));
         assert!(arena.eval_bool(lifted, &Assignment::new()).unwrap());
         let defined = arena.side_conditions(lifted.into());
         assert!(arena.eval_bool(defined, &Assignment::new()).unwrap());
-        let invalid_initial = schedule.scoped_requirements(&mut arena, &mut |arena, point|
+        let invalid_initial = schedule.scoped_requirements(&mut arena, &[], &mut |arena, point|
             arena.bool(!matches!(point, RequirementPoint::RepeatInitial(_))),
             &mut |arena, _| arena.bool(true));
         assert!(!arena.eval_bool(invalid_initial, &Assignment::new()).unwrap());

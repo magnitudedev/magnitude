@@ -8,7 +8,6 @@ use crate::{GraphOutputTensor, ResourceDomainId};
 use magnitude_model_contracts::PreparedVisionInput;
 use seismic::{Device, Tensor};
 use std::{
-    cell::Cell,
     cmp::Ordering,
     fmt,
     hash::{Hash, Hasher},
@@ -21,11 +20,11 @@ pub struct ConditioningRange {
     pub destination: Range<usize>,
 }
 
-/// Retained results keep the pool claim alive until the final consumer drops
-/// its reference. An owned tensor remains available for non-pooled callers.
+/// Graph results keep their output arena claim alive until the final
+/// consumer drops its reference. An owned tensor remains available for
+/// non-pooled callers.
 enum TensorBacking {
     Owned(Tensor),
-    Retained(Tensor, Rc<RetentionClaim>),
     Graph(GraphOutputTensor),
 }
 
@@ -33,28 +32,8 @@ impl TensorBacking {
     fn tensor(&self) -> &Tensor {
         match self {
             Self::Owned(tensor) => tensor,
-            Self::Retained(tensor, _) => tensor,
             Self::Graph(tensor) => tensor.tensor(),
         }
-    }
-}
-
-/// The claim returns its exact device charge when the last retained feature
-/// reference drops. Source pool claims are independent of this allocation.
-pub(crate) struct RetentionClaim {
-    used: Rc<Cell<u64>>,
-    bytes: u64,
-}
-
-impl RetentionClaim {
-    pub(crate) fn new(used: Rc<Cell<u64>>, bytes: u64) -> Self {
-        Self { used, bytes }
-    }
-}
-
-impl Drop for RetentionClaim {
-    fn drop(&mut self) {
-        self.used.set(self.used.get() - self.bytes);
     }
 }
 
@@ -413,13 +392,6 @@ impl ResourceDomain {
     }
     pub fn publish_features(&self, tensor: Tensor) -> Result<FeatureRef, ResourceError> {
         self.publish_feature_backing(TensorBacking::Owned(tensor))
-    }
-    pub(crate) fn publish_retained_features(
-        &self,
-        tensor: Tensor,
-        claim: Rc<RetentionClaim>,
-    ) -> Result<FeatureRef, ResourceError> {
-        self.publish_feature_backing(TensorBacking::Retained(tensor, claim))
     }
     pub fn publish_graph_features(
         &self,

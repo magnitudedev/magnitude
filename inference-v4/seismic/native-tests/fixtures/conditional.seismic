@@ -35,6 +35,20 @@ native gated_sum for cuda from "cuda/gated_sum.cu":
         threadgroups (ceil_div(N - SMALL, N - SMALL), 1, 1)
         threads_per_threadgroup (1, 1, 1)
 
+# Vulkan fixes group memory at preparation: the static bound SMALL * 4, so
+# the staged launch's pipeline (formed even where it is inactive) is refused
+# at preparation when it exceeds the device.
+native gated_sum for vulkan from "vulkan/gated_sum.comp":
+    params (SMALL in [64, 1048576])
+    scratch mirror bytes ((N - SMALL) * 0 + N * 4) when N > SMALL
+    launch gated_staged when N <= SMALL:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (SMALL * 4)
+    launch gated_mirrored when N > SMALL:
+        threadgroups (ceil_div(N - SMALL, N - SMALL), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
 native gated_sum for cpu from "cpu/gated_sum.rs":
     params (SMALL in [64, 1048576])
     scratch mirror bytes ((N - SMALL) * 0 + N * 4) when N > SMALL

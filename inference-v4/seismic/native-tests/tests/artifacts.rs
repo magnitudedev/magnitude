@@ -1,7 +1,8 @@
 //! The embedder's artifact store around native formation (tuning spec §C1):
-//! CUDA images are looked up before NVRTC runs and kept after it; a stored
-//! image the driver refuses is a miss and is formed and stored again. Metal
-//! and CPU formation never consult the store.
+//! CUDA images and Vulkan SPIR-V are looked up before the toolchain runs and
+//! kept after it; a stored artifact the driver refuses (CUDA) or that fails
+//! validation (Vulkan) is a miss and is formed and stored again. Metal and
+//! CPU formation never consult the store.
 
 use seismic::{
     ArtifactKey, ArtifactKind, ArtifactStore, Availability, BackendName, Device, DeviceCatalog,
@@ -56,13 +57,14 @@ impl ArtifactStore for RecordingStore {
     }
 }
 
-/// Every available backend, opened from a fresh catalog with `store`, so
-/// nothing formed by an earlier open is reused in this process.
-fn devices(store: &Arc<RecordingStore>) -> Vec<Device> {
+/// The available devices of `backends`, opened from a fresh catalog with
+/// `store`, so nothing formed by an earlier open is reused in this process.
+fn devices_of(backends: &[BackendName], store: &Arc<RecordingStore>) -> Vec<Device> {
     let catalog = DeviceCatalog::discover().expect("device discovery");
     let topology = catalog.topology();
-    [BackendName::Cpu, BackendName::Metal, BackendName::Cuda]
-        .into_iter()
+    backends
+        .iter()
+        .copied()
         .filter_map(|backend| {
             topology
                 .devices()
@@ -84,6 +86,10 @@ fn devices(store: &Arc<RecordingStore>) -> Vec<Device> {
                 .expect("available device opens")
         })
         .collect()
+}
+
+fn devices(store: &Arc<RecordingStore>) -> Vec<Device> {
+    devices_of(&[BackendName::Cpu, BackendName::Metal, BackendName::Cuda], store)
 }
 
 /// Form and run the defaults of `split_sum` at N = 1000.
@@ -134,4 +140,27 @@ fn cuda_images_are_kept_in_the_embedders_store_and_a_refused_image_is_a_miss() {
         form_and_run(&device);
     }
     assert_eq!(store.counts(), Counts { gets: 3, hits: 2, puts: 2 });
+}
+
+/// Vulkan keeps each launch's sealed SPIR-V (two launches of `split_sum`);
+/// a stored module that fails validation is a miss.
+#[test]
+fn spirv_modules_are_kept_in_the_embedders_store_and_an_invalid_module_is_a_miss() {
+    let store = Arc::new(RecordingStore::default());
+    if devices_of(&[BackendName::Vulkan], &store).is_empty() {
+        return;
+    }
+    for device in devices_of(&[BackendName::Vulkan], &store) {
+        form_and_run(&device);
+    }
+    assert_eq!(store.counts(), Counts { gets: 2, hits: 0, puts: 2 });
+    for device in devices_of(&[BackendName::Vulkan], &store) {
+        form_and_run(&device);
+    }
+    assert_eq!(store.counts(), Counts { gets: 4, hits: 2, puts: 2 });
+    store.corrupt();
+    for device in devices_of(&[BackendName::Vulkan], &store) {
+        form_and_run(&device);
+    }
+    assert_eq!(store.counts(), Counts { gets: 6, hits: 4, puts: 4 });
 }

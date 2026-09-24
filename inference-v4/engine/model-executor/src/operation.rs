@@ -48,57 +48,79 @@ pub struct FeatureSpan {
     pub count: usize,
 }
 
-#[derive(Clone)]
-pub struct RetainedFeatureSpan {
-    span: FeatureSpan,
-    bytes: u64,
+/// Feature rows copied to host memory, each `row_bytes` bytes in the
+/// activation representation of the domain that produced them. Rows carried
+/// across operations live here, so no device lease outlives its round.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FeatureRows {
+    bytes: Arc<[u8]>,
+    rows: usize,
 }
 
-impl RetainedFeatureSpan {
-    pub fn new(span: FeatureSpan, bytes: u64) -> Result<Self, OperationError> {
-        if span.count == 0 || span.start.checked_add(span.count).is_none() {
-            return Err(OperationError::FeatureSpan {
-                count: span.count,
-                rows: span.count,
+impl FeatureRows {
+    pub fn new(bytes: Arc<[u8]>, rows: usize) -> Result<Self, OperationError> {
+        if rows == 0 || bytes.is_empty() || bytes.len() % rows != 0 {
+            return Err(OperationError::FeatureRows {
+                bytes: bytes.len(),
+                rows,
             });
         }
-        if bytes == 0 {
-            return Err(OperationError::FeatureStorageBytes);
+        Ok(Self { bytes, rows })
+    }
+
+    /// These rows followed by `other`'s, which must have the same width.
+    pub fn concat(&self, other: &Self) -> Result<Self, OperationError> {
+        if other.row_bytes() != self.row_bytes() {
+            return Err(OperationError::FeatureRows {
+                bytes: other.bytes.len(),
+                rows: other.rows,
+            });
         }
-        Ok(Self { span, bytes })
+        let mut bytes = Vec::with_capacity(self.bytes.len() + other.bytes.len());
+        bytes.extend_from_slice(&self.bytes);
+        bytes.extend_from_slice(&other.bytes);
+        Self::new(bytes.into(), self.rows + other.rows)
     }
 
-    pub fn span(&self) -> FeatureSpan {
-        self.span.clone()
+    /// Rows `start..start + count`.
+    pub fn slice(&self, start: usize, count: usize) -> Result<Self, OperationError> {
+        let row = self.row_bytes();
+        if count == 0 || start.checked_add(count).is_none_or(|end| end > self.rows) {
+            return Err(OperationError::FeatureRows {
+                bytes: self.bytes.len(),
+                rows: self.rows,
+            });
+        }
+        Self::new(self.bytes[start * row..(start + count) * row].into(), count)
     }
 
-    pub const fn bytes(&self) -> u64 {
-        self.bytes
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn row_bytes(&self) -> usize {
+        self.bytes.len() / self.rows
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
-impl fmt::Debug for RetainedFeatureSpan {
+impl fmt::Debug for FeatureRows {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("RetainedFeatureSpan")
-            .field("span", &self.span)
-            .field("bytes", &self.bytes)
+            .debug_struct("FeatureRows")
+            .field("rows", &self.rows)
+            .field("row_bytes", &self.row_bytes())
             .finish_non_exhaustive()
     }
 }
 
-impl PartialEq for RetainedFeatureSpan {
-    fn eq(&self, other: &Self) -> bool {
-        self.span == other.span && self.bytes == other.bytes
-    }
-}
-
-impl Eq for RetainedFeatureSpan {}
-
-/// Resource-domain seam used by generation to turn transient executor output
-/// rows into independently owned device storage.
-pub trait FeatureRetainer {
-    fn retain(&mut self, span: FeatureSpan) -> Result<RetainedFeatureSpan, String>;
+/// Resource-domain seam through which generation copies completed feature
+/// rows to host memory.
+pub trait FeatureReader {
+    fn read(&mut self, span: &FeatureSpan) -> Result<FeatureRows, String>;
 }
 
 impl FeatureSpan {
@@ -216,17 +238,19 @@ pub enum Operation {
         select: Vec<SelectSpec>,
         committed: usize,
     },
+    /// One draft-head transaction. The entry rows pair each accepted token
+    /// with the target's normalized output feature of the preceding row
+    /// (`conditioning`, in row order) and are committed to head state at
+    /// `position`. With proposals, the head then chains one speculative row
+    /// per proposal on the device: each step's selection (keyed by its
+    /// `SelectSpec`) is the next step's token, and its output feature the
+    /// next step's conditioning. Speculative rows are never committed.
     Head {
         request: RequestId,
         tokens: Vec<TokenId>,
-        conditioning: FeatureSpan,
+        conditioning: FeatureRows,
         position: usize,
-        demand: Demand,
-    },
-    Project {
-        request: RequestId,
-        features: FeatureRef,
-        select: SelectSpec,
+        proposals: Vec<SelectSpec>,
     },
     Repair {
         request: RequestId,
@@ -263,7 +287,6 @@ impl Operation {
         match self {
             Self::Forward { request, .. }
             | Self::Head { request, .. }
-            | Self::Project { request, .. }
             | Self::Repair { request, .. }
             | Self::Encode { request, .. } => *request,
         }
@@ -272,23 +295,29 @@ impl Operation {
     pub const fn executable(&self) -> ExecutableKind {
         match self {
             Self::Forward { .. } | Self::Repair { .. } => ExecutableKind::Target,
-            Self::Head { .. } | Self::Project { .. } => ExecutableKind::Head,
+            Self::Head { .. } => ExecutableKind::Head,
             Self::Encode { .. } => ExecutableKind::Encoder,
         }
     }
 
     pub fn demand(&self) -> Demand {
         match self {
-            Self::Forward { demand, .. } | Self::Head { demand, .. } => *demand,
-            Self::Project { .. } => Demand::SELECT,
+            Self::Forward { demand, .. } => *demand,
+            Self::Head { proposals, .. } if proposals.is_empty() => Demand::NONE,
+            Self::Head { .. } => Demand::SELECT,
             Self::Repair { .. } | Self::Encode { .. } => Demand::NONE,
         }
     }
 
+    /// Rows this operation advances in its lane's state. A head writes its
+    /// entry rows and one speculative row per chained proposal step (the
+    /// last proposal needs no row of its own).
     pub fn row_count(&self) -> usize {
         match self {
-            Self::Forward { tokens, .. } | Self::Head { tokens, .. } => tokens.len(),
-            Self::Project { .. } => 1,
+            Self::Forward { tokens, .. } => tokens.len(),
+            Self::Head {
+                tokens, proposals, ..
+            } => tokens.len() + proposals.len().saturating_sub(1),
             Self::Repair { rows, .. } => *rows,
             Self::Encode { image, .. } => image.patches(),
         }
@@ -299,7 +328,7 @@ impl Operation {
             Self::Forward {
                 tokens, committed, ..
             } if *committed < tokens.len() => CommittedClass::HasTentative,
-            Self::Head { .. } | Self::Project { .. } => CommittedClass::HasTentative,
+            Self::Head { .. } => CommittedClass::HasTentative,
             _ => CommittedClass::AllCommitted,
         }
     }
@@ -346,20 +375,20 @@ impl Operation {
                 }
                 validate_forward_select(*kind, tokens.len(), *demand, select)?;
             }
-            Self::Project { select, .. } => validate_select(select)?,
             Self::Head {
                 tokens,
                 conditioning,
+                proposals,
                 ..
             } => {
-                if conditioning.count != tokens.len()
-                    || conditioning.count == 0
-                    || conditioning.start.checked_add(conditioning.count).is_none()
-                {
+                if conditioning.rows() != tokens.len() {
                     return Err(OperationError::FeatureSpan {
-                        count: conditioning.count,
+                        count: conditioning.rows(),
                         rows: tokens.len(),
                     });
+                }
+                for spec in proposals {
+                    validate_select(spec)?;
                 }
             }
             _ => {}
@@ -445,7 +474,10 @@ pub enum OperationError {
         count: usize,
         rows: usize,
     },
-    FeatureStorageBytes,
+    FeatureRows {
+        bytes: usize,
+        rows: usize,
+    },
 }
 
 impl fmt::Display for OperationError {
@@ -486,11 +518,12 @@ impl fmt::Display for OperationError {
             ),
             Self::FeatureSpan { count, rows } => write!(
                 formatter,
-                "head conditioning span has {count} rows for {rows} token rows",
+                "head conditioning has {count} rows for {rows} token rows",
             ),
-            Self::FeatureStorageBytes => {
-                formatter.write_str("retained feature storage must charge at least one byte")
-            }
+            Self::FeatureRows { bytes, rows } => write!(
+                formatter,
+                "{bytes} bytes are not {rows} nonempty equal feature rows, or the rows differ in width",
+            ),
         }
     }
 }
@@ -513,8 +546,8 @@ pub struct RowResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Forward { rows: Vec<RowResult> },
-    Head { features: FeatureRef },
-    Project { selected: Vec<Selected> },
+    /// One selection per requested proposal, in chain order.
+    Head { proposals: Vec<Selected> },
     Repair,
     Encode { features: FeatureRef },
 }

@@ -90,10 +90,17 @@ impl NativeStateProgram {
                     };
                     let plan = self.graphs.plan(&class)?;
                     let bindings = self.graphs.bindings(&class, &view, &view)?;
+                    // Padding lanes repeat the last real pair: an identical
+                    // write, where a pad of row 0 would race a real copy
+                    // into row 0.
+                    let (Some(&last_from), Some(&last_to)) = (copy.from.last(), copy.to.last())
+                    else {
+                        return Err(invalid("empty copy mapping"));
+                    };
                     let mut from = copy.from.clone();
-                    from.resize(class_rows, 0);
+                    from.resize(class_rows, last_from);
                     let mut to = copy.to.clone();
-                    to.resize(class_rows, 0);
+                    to.resize(class_rows, last_to);
                     self.graphs.run(
                         &class,
                         state_graph_workspace.slot_mut(),

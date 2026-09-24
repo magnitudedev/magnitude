@@ -1,0 +1,173 @@
+// Prefill combine. The Vulkan form of `metal/qwen_routed_combine.metal`.
+// L1 (`qwen_routed_combine_shared`): the K1 paired GEMM of the shared
+// expert's gate/up over all M rows with SiluMul into the `shared_product`
+// scratch. L2 (`qwen_routed_combine_down`): the K1 GEMM of the shared down
+// projection into the `shared_output` scratch [M, H], in A. L3
+// (`qwen_routed_combine`): the grouped expert outputs of each row unpermuted
+// in slot order, published as
+//     residual + selected + shared * coefficient.
+// An L3 invocation owns 8 consecutive columns of one row: it reads each
+// choice's position and score once and the choice's 8 expert outputs as one
+// 16-byte load, so the gather moves whole rows of expert output.
+#include "common/activation.glsl"
+#include "common/routed.glsl"
+
+#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#define ROUTED_ACT ELEMENT_ACT
+#else
+#error "qwen_routed_combine requires a bf16 or f16 activation"
+#endif
+
+#if defined(SEISMIC_SHARED_GATE_REPRESENTATION_Q4K)
+#define SG_KIND PACKETS_Q4K
+#define SG_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_SHARED_GATE)
+#elif defined(SEISMIC_SHARED_GATE_REPRESENTATION_Q5K)
+#define SG_KIND PACKETS_Q5K
+#define SG_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_SHARED_GATE)
+#elif defined(SEISMIC_SHARED_GATE_REPRESENTATION_Q6K)
+#define SG_KIND PACKETS_Q6K
+#define SG_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_SHARED_GATE)
+#elif defined(SEISMIC_SHARED_GATE_REPRESENTATION_Q8G32S)
+#define SG_KIND PACKETS_Q8
+#define SG_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_SHARED_GATE)
+#elif defined(SEISMIC_SHARED_GATE_REPRESENTATION_BF16)
+#define SG_KIND PACKETS_BF16
+#define SG_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_SHARED_GATE, 2)
+#elif defined(SEISMIC_SHARED_GATE_REPRESENTATION_F16)
+#define SG_KIND PACKETS_F16
+#define SG_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_SHARED_GATE, 2)
+#elif defined(SEISMIC_SHARED_GATE_REPRESENTATION_F32)
+#define SG_KIND PACKETS_F32
+#define SG_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_SHARED_GATE, 4)
+#else
+#error "unsupported qwen_routed_combine shared_gate representation"
+#endif
+#if defined(SEISMIC_SHARED_GATE_KIND_PACKED) && !defined(SEISMIC_SHARED_GATE_LAYOUT_ROWS16)
+#error "qwen_routed_combine requires the rows16 layout for shared_gate"
+#endif
+
+#if defined(SEISMIC_SHARED_UP_REPRESENTATION_Q4K)
+#define SU_KIND PACKETS_Q4K
+#define SU_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_SHARED_UP)
+#elif defined(SEISMIC_SHARED_UP_REPRESENTATION_Q5K)
+#define SU_KIND PACKETS_Q5K
+#define SU_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_SHARED_UP)
+#elif defined(SEISMIC_SHARED_UP_REPRESENTATION_Q6K)
+#define SU_KIND PACKETS_Q6K
+#define SU_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_SHARED_UP)
+#elif defined(SEISMIC_SHARED_UP_REPRESENTATION_Q8G32S)
+#define SU_KIND PACKETS_Q8
+#define SU_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_SHARED_UP)
+#elif defined(SEISMIC_SHARED_UP_REPRESENTATION_BF16)
+#define SU_KIND PACKETS_BF16
+#define SU_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_SHARED_UP, 2)
+#elif defined(SEISMIC_SHARED_UP_REPRESENTATION_F16)
+#define SU_KIND PACKETS_F16
+#define SU_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_SHARED_UP, 2)
+#elif defined(SEISMIC_SHARED_UP_REPRESENTATION_F32)
+#define SU_KIND PACKETS_F32
+#define SU_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_SHARED_UP, 4)
+#else
+#error "unsupported qwen_routed_combine shared_up representation"
+#endif
+#if defined(SEISMIC_SHARED_UP_KIND_PACKED) && !defined(SEISMIC_SHARED_UP_LAYOUT_ROWS16)
+#error "qwen_routed_combine requires the rows16 layout for shared_up"
+#endif
+
+#if defined(SEISMIC_SHARED_DOWN_REPRESENTATION_Q4K)
+#define SD_KIND PACKETS_Q4K
+#define SD_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_SHARED_DOWN)
+#elif defined(SEISMIC_SHARED_DOWN_REPRESENTATION_Q5K)
+#define SD_KIND PACKETS_Q5K
+#define SD_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_SHARED_DOWN)
+#elif defined(SEISMIC_SHARED_DOWN_REPRESENTATION_Q6K)
+#define SD_KIND PACKETS_Q6K
+#define SD_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_SHARED_DOWN)
+#elif defined(SEISMIC_SHARED_DOWN_REPRESENTATION_Q8G32S)
+#define SD_KIND PACKETS_Q8
+#define SD_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_SHARED_DOWN)
+#elif defined(SEISMIC_SHARED_DOWN_REPRESENTATION_BF16)
+#define SD_KIND PACKETS_BF16
+#define SD_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_SHARED_DOWN, 2)
+#elif defined(SEISMIC_SHARED_DOWN_REPRESENTATION_F16)
+#define SD_KIND PACKETS_F16
+#define SD_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_SHARED_DOWN, 2)
+#elif defined(SEISMIC_SHARED_DOWN_REPRESENTATION_F32)
+#define SD_KIND PACKETS_F32
+#define SD_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_SHARED_DOWN, 4)
+#else
+#error "unsupported qwen_routed_combine shared_down representation"
+#endif
+#if defined(SEISMIC_SHARED_DOWN_KIND_PACKED) && !defined(SEISMIC_SHARED_DOWN_LAYOUT_ROWS16)
+#error "qwen_routed_combine requires the rows16 layout for shared_down"
+#endif
+
+// Invocations of an L3 workgroup (8 columns each).
+#define COMBINE_THREADS 256u
+
+void qwen_routed_combine_shared() {
+    const uint hidden = uint(SEISMIC_DIM_H);
+    const projection_prologue x = projection_plain(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
+        SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden, 0ul);
+    const projection_weights gate = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE), SG_GEOMETRY, 0ul, hidden);
+    const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP), SU_GEOMETRY, 0ul, hidden);
+    const projection_epilogue out_ = projection_silu_mul(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SHARED_PRODUCT),
+        SEISMIC_DIM_S, 1ul);
+    projection_gemm_paired(SG_KIND, SU_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, x, out_, gate, up,
+        uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_S), hidden, gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
+}
+
+void qwen_routed_combine_down() {
+    const uint shared_features = uint(SEISMIC_DIM_S);
+    const projection_prologue x = projection_plain(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SHARED_PRODUCT),
+        SEISMIC_DIM_S, 1ul, shared_features, 0ul);
+    const projection_weights down = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_DOWN), SD_GEOMETRY, 0ul,
+        shared_features);
+    const projection_epilogue out_ = projection_store(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SHARED_OUTPUT),
+        SEISMIC_DIM_H, 1ul, 0ul);
+    projection_gemm(SD_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, x, out_, down, uint(SEISMIC_DIM_M),
+        uint(SEISMIC_DIM_H), shared_features, gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
+}
+
+void qwen_routed_combine() {
+    const uint64_t m = gl_WorkGroupID.y;
+    const uint n = 8u * (gl_WorkGroupID.x * COMBINE_THREADS + gl_LocalInvocationIndex);
+    const uint columns = uint(SEISMIC_DIM_H);
+    if (n >= columns)
+        return;
+    const uint valid = min(8u, columns - n);
+    const bool vector = SEISMIC_EXPERT_OUTPUT_STRIDE_2 == 1ul && (SEISMIC_EXPERT_OUTPUT_STRIDE_1 & 7ul) == 0ul
+        && (SEISMIC_EXPERT_OUTPUT_STRIDE_0 & 7ul) == 0ul;
+    vec4 selected_even = vec4(0.0), selected_odd = vec4(0.0);
+    for (uint64_t k = 0ul; k < SEISMIC_DIM_K; ++k) {
+        const uint64_t position = uint64_t(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_INVERSE)
+            + (m * SEISMIC_INVERSE_STRIDE_0 + k * SEISMIC_INVERSE_STRIDE_1) * 4ul));
+        const float score = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SCORES)
+            + (m * SEISMIC_SCORES_STRIDE_0 + k * SEISMIC_SCORES_STRIDE_1) * 4ul);
+        const uint64_t row = (position / SEISMIC_DIM_T) * SEISMIC_EXPERT_OUTPUT_STRIDE_0
+            + (position % SEISMIC_DIM_T) * SEISMIC_EXPERT_OUTPUT_STRIDE_1;
+        vec4 even, odd;
+        projection_load8_strided(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_OUTPUT),
+            row + uint64_t(n) * SEISMIC_EXPERT_OUTPUT_STRIDE_2, SEISMIC_EXPERT_OUTPUT_STRIDE_2, valid, vector, even, odd);
+        [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+            selected_even[i] = seismic_fma_rn(score, even[i], selected_even[i]);
+            selected_odd[i] = seismic_fma_rn(score, odd[i], selected_odd[i]);
+        }
+    }
+    vec4 shared_even, shared_odd;
+    projection_load8_strided(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SHARED_OUTPUT), m * columns + n, 1ul, valid,
+        (columns & 7u) == 0u, shared_even, shared_odd);
+    const float c = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_COEFFICIENT) + m * SEISMIC_COEFFICIENT_STRIDE_0 * 4ul);
+    [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+        if (i < valid) {
+            const uint64_t column = uint64_t(n + i);
+            const float selected = (i & 1u) != 0u ? selected_odd[i >> 1] : selected_even[i >> 1];
+            const float projected = (i & 1u) != 0u ? shared_odd[i >> 1] : shared_even[i >> 1];
+            element_f32_put(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)
+                    + (m * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1) * 4ul,
+                element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)
+                    + (m * SEISMIC_RESIDUAL_STRIDE_0 + column * SEISMIC_RESIDUAL_STRIDE_1) * 4ul)
+                    + selected + projected * c);
+        }
+    }
+}

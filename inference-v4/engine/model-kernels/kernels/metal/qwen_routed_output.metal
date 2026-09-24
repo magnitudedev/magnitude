@@ -6,15 +6,15 @@
 // The GEMV stores every output channel from one fixed lane, so that lane
 // carries the channel's running sum in registers across the choices.
 
-#define ROUTED_W0 SEISMIC_EXPERT_DOWN
-#define ROUTED_W1 SEISMIC_SHARED_DOWN
+#define KERNEL_W0 SEISMIC_EXPERT_DOWN
+#define KERNEL_W1 SEISMIC_SHARED_DOWN
 #include "common/routed.h"
 
 namespace routed {
 
 // Accumulates score * round_A(projection) into the storing lane's registers.
 template <uint R>
-struct output_selected {
+struct SelectEpi {
     thread float *selected;
     uint first;
     float score;
@@ -25,7 +25,7 @@ struct output_selected {
 
 // Publishes the channel from the carried selection and the shared projection.
 template <uint R>
-struct output_final {
+struct FinalEpi {
     thread const float *selected;
     uint first;
     device float *y;
@@ -58,10 +58,12 @@ kernel void qwen_routed_output(
     uint lane [[thread_index_in_simdgroup]]) {
     constexpr uint SG = SEISMIC_TUNE_SIMDGROUPS;
     constexpr uint R = SEISMIC_TUNE_ROWS;
+    constexpr uint L = SEISMIC_TUNE_LANES;
     typedef routed::Act A;
     const uint tile = group.x;
     const ulong m = group.y;
-    const uint first = (tile * SG + sg) * R;
+    // The R output channels of this lane's group (the GEMV's row ownership).
+    const uint first = ((tile * SG + sg) * (32u / L) + lane / L) * R;
     float selected[R];
     for (uint r = 0; r < R; ++r) selected[r] = 0.0f;
 
@@ -70,21 +72,21 @@ kernel void qwen_routed_output(
         const auto in = routed::activation(expert_product
                 + (m * SEISMIC_EXPERT_PRODUCT_STRIDE_0 + k * SEISMIC_EXPERT_PRODUCT_STRIDE_1) * A::bytes,
             0, SEISMIC_EXPERT_PRODUCT_STRIDE_2, uint(SEISMIC_DIM_F));
-        const auto down = routed::rows_from<routed::W0>(expert_down, ROUTED_W0_LAYOUT(SEISMIC_DIM_F),
-            expert * SEISMIC_DIM_H, SEISMIC_DIM_F);
-        const routed::output_selected<R> out{selected, first,
+        const auto down = routed::weights<packets::W0>(expert_down, KERNEL_W0_LAYOUT(SEISMIC_DIM_F),
+            routed::expert_row(expert, SEISMIC_DIM_H), SEISMIC_DIM_F);
+        const routed::SelectEpi<R> out{selected, first,
             scores[m * SEISMIC_SCORES_STRIDE_0 + k * SEISMIC_SCORES_STRIDE_1]};
-        projection::gemv<routed::W0, SG, R, 1>(in, out, down, 1, SEISMIC_DIM_H, SEISMIC_DIM_F, tile,
+        projection::gemv<packets::W0, SG, R, 1, L>(in, out, down, 1, SEISMIC_DIM_H, SEISMIC_DIM_F, tile,
             shared, sg, lane);
     }
 
     const auto in = routed::activation(shared_product + m * SEISMIC_SHARED_PRODUCT_STRIDE_0 * A::bytes, 0,
         SEISMIC_SHARED_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_S));
-    const auto down = routed::rows_from<routed::W1>(shared_down, ROUTED_W1_LAYOUT(SEISMIC_DIM_S), 0,
+    const auto down = routed::weights<packets::W1>(shared_down, KERNEL_W1_LAYOUT(SEISMIC_DIM_S), 0,
         SEISMIC_DIM_S);
-    const routed::output_final<R> out{selected, first, value + m * SEISMIC_RESULT_0_STRIDE_0,
+    const routed::FinalEpi<R> out{selected, first, value + m * SEISMIC_RESULT_0_STRIDE_0,
         SEISMIC_RESULT_0_STRIDE_1, residual + m * SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1,
         coefficient[m * SEISMIC_COEFFICIENT_STRIDE_0]};
-    projection::gemv<routed::W1, SG, R, 1>(in, out, down, 1, SEISMIC_DIM_H, SEISMIC_DIM_S, tile, shared,
+    projection::gemv<packets::W1, SG, R, 1, L>(in, out, down, 1, SEISMIC_DIM_H, SEISMIC_DIM_S, tile, shared,
         sg, lane);
 }

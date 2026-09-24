@@ -3,9 +3,9 @@
 //! `qwen_routed_output`) are tuned at the decode row points, the grouped
 //! entries (`qwen_routed_group`, `qwen_routed_experts`,
 //! `qwen_routed_combine`) at the grouped ones. Routing tables are synthetic:
-//! every row selects distinct experts spread over the whole expert range, and
-//! the grouped tables are formed from them exactly as `qwen_routed_group`
-//! forms them.
+//! every row selects distinct experts with the uneven expert loads of real
+//! routing (`routes`), and the grouped tables are formed from them exactly as
+//! `qwen_routed_group` forms them.
 //!
 //! Route and group write their tables through `&mut` parameters; each
 //! argument set owns those tables as case state.
@@ -42,15 +42,43 @@ fn grouped_points(limits: TuningLimits) -> Vec<PointShape> {
     served_row_points(limits.max_rows, |rows| rows > DECODE_ROWS)
 }
 
-/// Distinct experts per row, spread over the expert range: choice k of row
-/// m selects (37 m + 101 k) mod E (101 is odd, so a row's choices differ
-/// whenever E is a power of two, as expert counts are).
+/// Distinct experts per row with the uneven expert loads of real routing: the
+/// expert of popularity rank r is (101 r) mod E (a permutation: 101 is prime
+/// and no expert count is a multiple of it) with popularity 1 / sqrt(r + 1),
+/// and each row draws its choices by popularity without replacement from a
+/// fixed-seed generator. A grouped point then holds blocks of every live-row
+/// count, from one row to full tiles, and experts with no rows.
 fn routes(rows: u64, shape: RoutedShape) -> Vec<i32> {
-    (0..rows)
-        .flat_map(|row| {
-            (0..shape.selected).map(move |choice| ((37 * row + 101 * choice) % shape.experts) as i32)
-        })
-        .collect()
+    let experts = shape.experts as usize;
+    let popularity = (0..experts)
+        .map(|rank| 1.0 / ((rank + 1) as f64).sqrt())
+        .collect::<Vec<_>>();
+    let total = popularity.iter().sum::<f64>();
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut routes = Vec::with_capacity(rows as usize * shape.selected as usize);
+    for _ in 0..rows {
+        let mut taken = vec![false; experts];
+        let mut remaining = total;
+        for _ in 0..shape.selected {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let mut target = (state >> 11) as f64 / (1_u64 << 53) as f64 * remaining;
+            // The last untaken expert absorbs the rounding of `remaining`.
+            let mut rank = 0;
+            for candidate in (0..experts).filter(|&candidate| !taken[candidate]) {
+                rank = candidate;
+                target -= popularity[candidate];
+                if target < 0.0 {
+                    break;
+                }
+            }
+            taken[rank] = true;
+            remaining -= popularity[rank];
+            routes.push(((rank * 101) % experts) as i32);
+        }
+    }
+    routes
 }
 
 /// The tables `qwen_routed_group` forms from `routes`: (order [B, T],

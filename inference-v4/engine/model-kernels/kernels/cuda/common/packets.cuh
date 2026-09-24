@@ -14,31 +14,19 @@
 // keep the rows16 per-row placement.
 //
 // Weight tensors are bound to slots before this file is included:
-//     #define SJ_W0 SEISMIC_GATE_WEIGHT
-// which defines `sj::W0` (the decoder type of the bound representation) and
-// `SJ_W0_AT(pointer)` (its value for a tensor base pointer). Slots W0..W3
-// exist. The activation element is `SJ_ACT` (default `SEISMIC_ELEMENT_A`).
+//     #define KERNEL_W0 SEISMIC_GATE_WEIGHT
+// which defines `packets::W0` (the decoder type of the bound representation)
+// and `KERNEL_W0_AT(pointer)` (its value for a tensor base pointer). Slots
+// W0..W3 exist. Dense element types are `element` (element.cuh).
 
-#define SJ_CAT_(a, b) a##b
-#define SJ_CAT(a, b) SJ_CAT_(a, b)
-// 1 when the macro `<prefix><suffix>` is defined as 1, else 0; usable in
-// both `#if` and constant expressions.
-#define SJ_SECOND_(a, b, ...) b
-#define SJ_SECOND(...) SJ_SECOND_(__VA_ARGS__, 0, 0)
-#define SJ_PROBE_1 ~, 1
-#define SJ_IS_ONE(value) SJ_SECOND(SJ_CAT(SJ_PROBE_, value))
-#define SJ_HAS(prefix, suffix) SJ_IS_ONE(SJ_CAT(prefix, suffix))
+#include "common/element.cuh"
 
-#ifndef SJ_ACT
-#define SJ_ACT SEISMIC_ELEMENT_A
-#endif
+namespace packets {
 
-namespace sj {
-
-typedef unsigned char u8;
-typedef unsigned short u16;
-typedef unsigned int u32;
-typedef unsigned long long u64;
+using element::u8;
+using element::u16;
+using element::u32;
+using element::u64;
 
 template <class A, class B> struct Same {
     static constexpr bool value = false;
@@ -133,68 +121,25 @@ struct OpF16 {
     static constexpr u32 ONES = 0x3C003C00u;
 };
 
-// ---------------------------------------------------------------------------
-// Dense elements. `KIND` is 0 = f32, 1 = bf16, 2 = f16.
-
-#define SJ_DENSE_KIND(prefix)                                                                      \
-    (SJ_HAS(prefix, _REPRESENTATION_F32)    ? 0                                                    \
-     : SJ_HAS(prefix, _REPRESENTATION_BF16) ? 1                                                    \
-     : SJ_HAS(prefix, _REPRESENTATION_F16)  ? 2                                                    \
-                                            : -1)
-
-template <int KIND> struct Dense {
-    static_assert(KIND >= 0, "a dense f32, bf16 or f16 representation is required");
-    __device__ static __forceinline__ float load(const u8 *base, u64 index) {
-        if constexpr (KIND == 0)
-            return reinterpret_cast<const float *>(base)[index];
-        else if constexpr (KIND == 1)
-            return seismic_bf16_to_f32(reinterpret_cast<const u16 *>(base)[index]);
-        else
-            return seismic_f16_to_f32(reinterpret_cast<const u16 *>(base)[index]);
-    }
-    __device__ static __forceinline__ float round(float value) {
-        if constexpr (KIND == 0)
-            return value;
-        else if constexpr (KIND == 1)
-            return seismic_bf16_to_f32(seismic_f32_to_bf16(value));
-        else
-            return seismic_f16_to_f32(seismic_f32_to_f16(value));
-    }
-    __device__ static __forceinline__ void store(u8 *base, u64 index, float value) {
-        if constexpr (KIND == 0)
-            reinterpret_cast<float *>(base)[index] = value;
-        else if constexpr (KIND == 1)
-            reinterpret_cast<u16 *>(base)[index] = seismic_f32_to_bf16(value);
-        else
-            reinterpret_cast<u16 *>(base)[index] = seismic_f32_to_f16(value);
-    }
-    // Elements index and index + 1: one vector store when index is even.
-    __device__ static __forceinline__ void store2(u8 *base, u64 index, float first, float second) {
-        if (index % 2 != 0) {
-            store(base, index, first);
-            store(base, index + 1, second);
-        } else if constexpr (KIND == 0) {
-            reinterpret_cast<float2 *>(base)[index / 2] = make_float2(first, second);
-        } else if constexpr (KIND == 1) {
-            reinterpret_cast<u32 *>(base)[index / 2] = seismic_pack_bf16x2(first, second);
-        } else {
-            reinterpret_cast<u32 *>(base)[index / 2] = seismic_pack_f16x2(first, second);
-        }
-    }
-};
-
-// The MMA operand type of a 16-bit dense element kind. An F32 element has no
-// exact 16-bit operand, so it has none.
-template <int KIND> struct OperandOf;
-template <> struct OperandOf<1> {
+// The MMA operand type of a 16-bit dense element. An F32 element has no exact
+// 16-bit operand, so it has none.
+template <class E> struct OperandOf;
+template <> struct OperandOf<element::Bf16> {
     using type = OpBF16;
 };
-template <> struct OperandOf<2> {
+template <> struct OperandOf<element::F16> {
     using type = OpF16;
 };
-
-// The activation element (instantiated only by kernels that bind one).
-using Act = Dense<SJ_DENSE_KIND(SJ_ACT)>;
+// Whether O is element E's own operand type (E's values enter it exactly).
+template <class O, class E> struct NativeOperand {
+    static constexpr bool value = false;
+};
+template <> struct NativeOperand<OpBF16, element::Bf16> {
+    static constexpr bool value = true;
+};
+template <> struct NativeOperand<OpF16, element::F16> {
+    static constexpr bool value = true;
+};
 
 // ---------------------------------------------------------------------------
 // Packed weights in the mma16 layout. Every decoder provides
@@ -252,6 +197,7 @@ template <int HIGH_BITS> struct KQuant45 {
     static constexpr int GROUP = 32;
     static constexpr int GROUPS = 2;
     static constexpr bool BIAS = true;
+    static constexpr bool DENSE = false;
     struct Raw {
         uint4 low;
         u32 high;
@@ -424,6 +370,7 @@ struct KQuant6 {
     static constexpr int GROUP = 16;
     static constexpr int GROUPS = 4;
     static constexpr bool BIAS = false;
+    static constexpr bool DENSE = false;
     struct Raw {
         uint4 low;
         uint2 high;
@@ -558,7 +505,7 @@ struct KQuant6 {
 };
 
 // q8g32s (GGUF q8_0): int8 codes, f16 scale per 32.
-struct Q8Group {
+struct Q8 {
     const u8 *base;
     u64 stride;
     CodePlane codes_plane;
@@ -567,6 +514,7 @@ struct Q8Group {
     static constexpr int GROUP = 32;
     static constexpr int GROUPS = 2;
     static constexpr bool BIAS = false;
+    static constexpr bool DENSE = false;
     struct Raw {
         uint4 first;
         uint4 second;
@@ -670,6 +618,119 @@ typedef KQuant45<0> Q4K;
 typedef KQuant45<1> Q5K;
 typedef KQuant6 Q6K;
 
+// Dense weights of element E (row-major [rows, K], unpadded, row stride
+// `stride` elements) in the decoder interface: the lane's fragment elements are
+// loaded directly (rows past `rows` read as zero), and there is no scale or
+// bias (one group of 32 codes with scale 1). An operand of E's own 16-bit
+// type is exact; any other E is rounded to the operand type (as the GEMM
+// rounds dequantized packed weights). The GEMM reads fragments from global
+// memory rather than staging them (`DENSE`), and there is no INT8 path.
+template <class E> struct Dense {
+    const u8 *base;
+    u64 stride;
+    u64 rows;
+
+    static constexpr int GROUP = 32;
+    static constexpr int GROUPS = 2;
+    static constexpr bool BIAS = false;
+    static constexpr bool DENSE = true;
+    static constexpr int WORDS = E::bytes / 2; // 32-bit words per fragment register
+    // Fragment register i of k16 step s: elements (2 per register) in words
+    // w[s][i][0..WORDS).
+    struct Raw {
+        u32 w[4][4][WORDS];
+    };
+    __device__ __forceinline__ Raw fetch(u64 tile, u64 kblock, u32 lane) const {
+        const u32 g = lane / 4, t = lane % 4;
+        Raw raw;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const u64 row = tile * 16 + g + 8 * half;
+            const bool valid = row < rows;
+            const u8 *line = base + (valid ? row : 0) * stride * E::bytes;
+#pragma unroll
+            for (int s = 0; s < 4; ++s)
+#pragma unroll
+                for (int upper = 0; upper < 2; ++upper) {
+                    // Register half + 2 * upper: k = 16 s + 2 t (+ 8 when upper).
+                    const u8 *at = line + (kblock * 64 + 16 * s + 2 * t + 8 * upper) * E::bytes;
+#pragma unroll
+                    for (int word = 0; word < WORDS; ++word)
+                        raw.w[s][half + 2 * upper][word] =
+                            valid ? seismic_ld_nc_u32(at + 4 * word) : 0u;
+                }
+        }
+        return raw;
+    }
+    // GEMV: a superblock names its k-blocks; `raw` fetches one.
+    struct Super {
+        u64 tile;
+        u64 superblock;
+    };
+    __device__ __forceinline__ Super fetch_superblock(u64 tile, u64 superblock, u64, u32) const {
+        return Super{tile, superblock};
+    }
+    __device__ __forceinline__ Raw raw(const Super &super, int q, u32 lane) const {
+        return fetch(super.tile, 4 * super.superblock + q, lane);
+    }
+    // The two elements of register i, as F32.
+    __device__ static __forceinline__ float2 pair(const Raw &raw, int step, int i) {
+        if constexpr (E::bytes == 4)
+            return make_float2(__uint_as_float(raw.w[step][i][0]), __uint_as_float(raw.w[step][i][1]));
+        else
+            return E::unpack2(raw.w[step][i][0]);
+    }
+    template <class O> __device__ __forceinline__ void decode(const Raw &raw, int step, u32 (&a)[4]) const {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            if constexpr (NativeOperand<O, E>::value) {
+                a[i] = raw.w[step][i][0];
+            } else {
+                const float2 values = pair(raw, step, i);
+                a[i] = O::pack(values.x, values.y);
+            }
+        }
+    }
+    struct Block {};
+    __device__ __forceinline__ Block block(u64, u64, u32) const { return Block{}; }
+    __device__ __forceinline__ void coefficients(const Block &, int, Coefficients<GROUPS> &c) const {
+#pragma unroll
+        for (int r = 0; r < 2; ++r)
+#pragma unroll
+            for (int group = 0; group < GROUPS; ++group) {
+                c.scale[r][group] = 1.0f;
+                c.bias[r][group] = 0.0f;
+            }
+    }
+    // GEMM: nothing is staged; fragments come from `fetch`.
+    static constexpr int CHUNKS = 0;
+    static constexpr int COEF_WORDS = 0;
+    __device__ __forceinline__ const u8 *chunk_source(u64, u64, u32) const { return base; }
+    __device__ __forceinline__ const u8 *coef_word(u64, u64, int) const { return base; }
+    __device__ __forceinline__ void staged_coefficient(const u32 *, u64, int, float &scale, float &bias) const {
+        scale = 1.0f;
+        bias = 0.0f;
+    }
+    // Rows: the element of fragment slot `slot` (register slot % 4, low half
+    // for slot < 4) of step `step`, as bits; `apply` converts it.
+    __device__ __forceinline__ u32 code(const Raw &raw, int step, u32 slot) const {
+        if constexpr (E::bytes == 4)
+            return raw.w[step][slot % 4][slot / 4];
+        else
+            return (raw.w[step][slot % 4][0] >> (16 * (slot / 4))) & 0xFFFFu;
+    }
+    __device__ static __forceinline__ float apply(u32 code, float, float) {
+        if constexpr (E::bytes == 4)
+            return __uint_as_float(code);
+        else
+            return E::load((typename E::storage)code);
+    }
+    __device__ __forceinline__ void coefficient(u64, u64, int, float &scale, float &bias) const {
+        scale = 1.0f;
+        bias = 0.0f;
+    }
+};
+
 // One row's values at k = 64*kb + 16*s + {2t, 2t+1, 2t+8, 2t+9} (s = 0..3)
 // into v[4*s + j]: the part of the row held by the lane chunk of lane
 // 4*(row % 8) + t, decoded with the row's coefficients.
@@ -691,109 +752,130 @@ template <class W> __device__ __forceinline__ void row_values16(const W &w, u64 
     }
 }
 
-} // namespace sj
+} // namespace packets
 
 // Values of the decoder types for a tensor prefix `P` (mma16 layout).
-#define SJ_PLANE(P, NAME)                                                                           \
-    sj::CodePlane { SJ_CAT(P, _PLANE_##NAME##_ROW_OFFSET), SJ_CAT(P, _PLANE_##NAME##_BYTES_PER_ROW) }
-#define SJ_MAKE_Q4K(P, pointer)                                                                     \
-    sj::Q4K {                                                                                       \
-        (const sj::u8 *)(pointer), SJ_CAT(P, _ROW_STRIDE_BYTES), SJ_PLANE(P, CODES_LO), sj::CodePlane{0, 1}, \
-            SJ_CAT(P, _PLANE_SCALES_ROW_OFFSET), SJ_CAT(P, _PLANE_SUPERS_ROW_OFFSET)                \
+#define PACKETS_PLANE(P, NAME)                                                                           \
+    packets::CodePlane { ELEMENT_CAT(P, _PLANE_##NAME##_ROW_OFFSET), ELEMENT_CAT(P, _PLANE_##NAME##_BYTES_PER_ROW) }
+#define PACKETS_MAKE_Q4K(P, pointer)                                                                     \
+    packets::Q4K {                                                                                       \
+        (const packets::u8 *)(pointer), ELEMENT_CAT(P, _ROW_STRIDE_BYTES), PACKETS_PLANE(P, CODES_LO), packets::CodePlane{0, 1}, \
+            ELEMENT_CAT(P, _PLANE_SCALES_ROW_OFFSET), ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET)                \
     }
-#define SJ_MAKE_Q5K(P, pointer)                                                                     \
-    sj::Q5K {                                                                                       \
-        (const sj::u8 *)(pointer), SJ_CAT(P, _ROW_STRIDE_BYTES), SJ_PLANE(P, CODES_LO), SJ_PLANE(P, CODES_HI), \
-            SJ_CAT(P, _PLANE_SCALES_ROW_OFFSET), SJ_CAT(P, _PLANE_SUPERS_ROW_OFFSET)                \
+#define PACKETS_MAKE_Q5K(P, pointer)                                                                     \
+    packets::Q5K {                                                                                       \
+        (const packets::u8 *)(pointer), ELEMENT_CAT(P, _ROW_STRIDE_BYTES), PACKETS_PLANE(P, CODES_LO), PACKETS_PLANE(P, CODES_HI), \
+            ELEMENT_CAT(P, _PLANE_SCALES_ROW_OFFSET), ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET)                \
     }
-#define SJ_MAKE_Q6K(P, pointer)                                                                     \
-    sj::Q6K {                                                                                       \
-        (const sj::u8 *)(pointer), SJ_CAT(P, _ROW_STRIDE_BYTES), SJ_PLANE(P, CODES_LO), SJ_PLANE(P, CODES_HI), \
-            SJ_CAT(P, _PLANE_SCALES_ROW_OFFSET), SJ_CAT(P, _PLANE_SUPERS_ROW_OFFSET)                \
+#define PACKETS_MAKE_Q6K(P, pointer)                                                                     \
+    packets::Q6K {                                                                                       \
+        (const packets::u8 *)(pointer), ELEMENT_CAT(P, _ROW_STRIDE_BYTES), PACKETS_PLANE(P, CODES_LO), PACKETS_PLANE(P, CODES_HI), \
+            ELEMENT_CAT(P, _PLANE_SCALES_ROW_OFFSET), ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET)                \
     }
-#define SJ_MAKE_Q8(P, pointer)                                                                      \
-    sj::Q8Group {                                                                                   \
-        (const sj::u8 *)(pointer), SJ_CAT(P, _ROW_STRIDE_BYTES), SJ_PLANE(P, CODES),                \
-            SJ_CAT(P, _PLANE_SUPERS_ROW_OFFSET)                                                     \
+#define PACKETS_MAKE_Q8(P, pointer)                                                                      \
+    packets::Q8 {                                                                                   \
+        (const packets::u8 *)(pointer), ELEMENT_CAT(P, _ROW_STRIDE_BYTES), PACKETS_PLANE(P, CODES),                \
+            ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET)                                                     \
     }
 
-// Slot bindings. Each bound slot must name a tensor in the mma16 layout.
-#if defined(SJ_W0)
-#if !SJ_HAS(SJ_W0, _LAYOUT_MMA16)
-#error "SJ_W0 must be bound in the mma16 layout"
-#elif SJ_HAS(SJ_W0, _REPRESENTATION_Q4K)
-namespace sj { typedef Q4K W0; }
-#define SJ_W0_AT(pointer) SJ_MAKE_Q4K(SJ_W0, pointer)
-#elif SJ_HAS(SJ_W0, _REPRESENTATION_Q5K)
-namespace sj { typedef Q5K W0; }
-#define SJ_W0_AT(pointer) SJ_MAKE_Q5K(SJ_W0, pointer)
-#elif SJ_HAS(SJ_W0, _REPRESENTATION_Q6K)
-namespace sj { typedef Q6K W0; }
-#define SJ_W0_AT(pointer) SJ_MAKE_Q6K(SJ_W0, pointer)
-#elif SJ_HAS(SJ_W0, _REPRESENTATION_Q8G32S)
-namespace sj { typedef Q8Group W0; }
-#define SJ_W0_AT(pointer) SJ_MAKE_Q8(SJ_W0, pointer)
-#else
-#error "SJ_W0: unsupported weight representation"
-#endif
-#endif
+// Dense weights: the tensor's rows (extent 0) at its row stride (stride 0,
+// elements). A rank-2 [rows, K] tensor is required.
+#define PACKETS_MAKE_DENSE(P, pointer)                                                                   \
+    packets::Dense<ELEMENT_OF(P)> {                                                                      \
+        (const packets::u8 *)(pointer), (packets::u64)ELEMENT_CAT(P, _STRIDE_0),                         \
+            (packets::u64)ELEMENT_CAT(P, _EXTENT_0)                                                      \
+    }
 
-#if defined(SJ_W1)
-#if !SJ_HAS(SJ_W1, _LAYOUT_MMA16)
-#error "SJ_W1 must be bound in the mma16 layout"
-#elif SJ_HAS(SJ_W1, _REPRESENTATION_Q4K)
-namespace sj { typedef Q4K W1; }
-#define SJ_W1_AT(pointer) SJ_MAKE_Q4K(SJ_W1, pointer)
-#elif SJ_HAS(SJ_W1, _REPRESENTATION_Q5K)
-namespace sj { typedef Q5K W1; }
-#define SJ_W1_AT(pointer) SJ_MAKE_Q5K(SJ_W1, pointer)
-#elif SJ_HAS(SJ_W1, _REPRESENTATION_Q6K)
-namespace sj { typedef Q6K W1; }
-#define SJ_W1_AT(pointer) SJ_MAKE_Q6K(SJ_W1, pointer)
-#elif SJ_HAS(SJ_W1, _REPRESENTATION_Q8G32S)
-namespace sj { typedef Q8Group W1; }
-#define SJ_W1_AT(pointer) SJ_MAKE_Q8(SJ_W1, pointer)
+// Slot bindings. Each bound slot must name a dense tensor or a tensor in the
+// mma16 layout.
+#if defined(KERNEL_W0)
+#if ELEMENT_HAS(KERNEL_W0, _KIND_DENSE)
+namespace packets { typedef Dense<ELEMENT_OF(KERNEL_W0)> W0; }
+#define KERNEL_W0_AT(pointer) PACKETS_MAKE_DENSE(KERNEL_W0, pointer)
+#elif !ELEMENT_HAS(KERNEL_W0, _LAYOUT_MMA16)
+#error "KERNEL_W0 must be dense or bound in the mma16 layout"
+#elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_Q4K)
+namespace packets { typedef Q4K W0; }
+#define KERNEL_W0_AT(pointer) PACKETS_MAKE_Q4K(KERNEL_W0, pointer)
+#elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_Q5K)
+namespace packets { typedef Q5K W0; }
+#define KERNEL_W0_AT(pointer) PACKETS_MAKE_Q5K(KERNEL_W0, pointer)
+#elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_Q6K)
+namespace packets { typedef Q6K W0; }
+#define KERNEL_W0_AT(pointer) PACKETS_MAKE_Q6K(KERNEL_W0, pointer)
+#elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_Q8G32S)
+namespace packets { typedef Q8 W0; }
+#define KERNEL_W0_AT(pointer) PACKETS_MAKE_Q8(KERNEL_W0, pointer)
 #else
-#error "SJ_W1: unsupported weight representation"
+#error "KERNEL_W0: unsupported weight representation"
 #endif
 #endif
 
-#if defined(SJ_W2)
-#if !SJ_HAS(SJ_W2, _LAYOUT_MMA16)
-#error "SJ_W2 must be bound in the mma16 layout"
-#elif SJ_HAS(SJ_W2, _REPRESENTATION_Q4K)
-namespace sj { typedef Q4K W2; }
-#define SJ_W2_AT(pointer) SJ_MAKE_Q4K(SJ_W2, pointer)
-#elif SJ_HAS(SJ_W2, _REPRESENTATION_Q5K)
-namespace sj { typedef Q5K W2; }
-#define SJ_W2_AT(pointer) SJ_MAKE_Q5K(SJ_W2, pointer)
-#elif SJ_HAS(SJ_W2, _REPRESENTATION_Q6K)
-namespace sj { typedef Q6K W2; }
-#define SJ_W2_AT(pointer) SJ_MAKE_Q6K(SJ_W2, pointer)
-#elif SJ_HAS(SJ_W2, _REPRESENTATION_Q8G32S)
-namespace sj { typedef Q8Group W2; }
-#define SJ_W2_AT(pointer) SJ_MAKE_Q8(SJ_W2, pointer)
+#if defined(KERNEL_W1)
+#if ELEMENT_HAS(KERNEL_W1, _KIND_DENSE)
+namespace packets { typedef Dense<ELEMENT_OF(KERNEL_W1)> W1; }
+#define KERNEL_W1_AT(pointer) PACKETS_MAKE_DENSE(KERNEL_W1, pointer)
+#elif !ELEMENT_HAS(KERNEL_W1, _LAYOUT_MMA16)
+#error "KERNEL_W1 must be dense or bound in the mma16 layout"
+#elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_Q4K)
+namespace packets { typedef Q4K W1; }
+#define KERNEL_W1_AT(pointer) PACKETS_MAKE_Q4K(KERNEL_W1, pointer)
+#elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_Q5K)
+namespace packets { typedef Q5K W1; }
+#define KERNEL_W1_AT(pointer) PACKETS_MAKE_Q5K(KERNEL_W1, pointer)
+#elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_Q6K)
+namespace packets { typedef Q6K W1; }
+#define KERNEL_W1_AT(pointer) PACKETS_MAKE_Q6K(KERNEL_W1, pointer)
+#elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_Q8G32S)
+namespace packets { typedef Q8 W1; }
+#define KERNEL_W1_AT(pointer) PACKETS_MAKE_Q8(KERNEL_W1, pointer)
 #else
-#error "SJ_W2: unsupported weight representation"
+#error "KERNEL_W1: unsupported weight representation"
 #endif
 #endif
 
-#if defined(SJ_W3)
-#if !SJ_HAS(SJ_W3, _LAYOUT_MMA16)
-#error "SJ_W3 must be bound in the mma16 layout"
-#elif SJ_HAS(SJ_W3, _REPRESENTATION_Q4K)
-namespace sj { typedef Q4K W3; }
-#define SJ_W3_AT(pointer) SJ_MAKE_Q4K(SJ_W3, pointer)
-#elif SJ_HAS(SJ_W3, _REPRESENTATION_Q5K)
-namespace sj { typedef Q5K W3; }
-#define SJ_W3_AT(pointer) SJ_MAKE_Q5K(SJ_W3, pointer)
-#elif SJ_HAS(SJ_W3, _REPRESENTATION_Q6K)
-namespace sj { typedef Q6K W3; }
-#define SJ_W3_AT(pointer) SJ_MAKE_Q6K(SJ_W3, pointer)
-#elif SJ_HAS(SJ_W3, _REPRESENTATION_Q8G32S)
-namespace sj { typedef Q8Group W3; }
-#define SJ_W3_AT(pointer) SJ_MAKE_Q8(SJ_W3, pointer)
+#if defined(KERNEL_W2)
+#if ELEMENT_HAS(KERNEL_W2, _KIND_DENSE)
+namespace packets { typedef Dense<ELEMENT_OF(KERNEL_W2)> W2; }
+#define KERNEL_W2_AT(pointer) PACKETS_MAKE_DENSE(KERNEL_W2, pointer)
+#elif !ELEMENT_HAS(KERNEL_W2, _LAYOUT_MMA16)
+#error "KERNEL_W2 must be dense or bound in the mma16 layout"
+#elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_Q4K)
+namespace packets { typedef Q4K W2; }
+#define KERNEL_W2_AT(pointer) PACKETS_MAKE_Q4K(KERNEL_W2, pointer)
+#elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_Q5K)
+namespace packets { typedef Q5K W2; }
+#define KERNEL_W2_AT(pointer) PACKETS_MAKE_Q5K(KERNEL_W2, pointer)
+#elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_Q6K)
+namespace packets { typedef Q6K W2; }
+#define KERNEL_W2_AT(pointer) PACKETS_MAKE_Q6K(KERNEL_W2, pointer)
+#elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_Q8G32S)
+namespace packets { typedef Q8 W2; }
+#define KERNEL_W2_AT(pointer) PACKETS_MAKE_Q8(KERNEL_W2, pointer)
 #else
-#error "SJ_W3: unsupported weight representation"
+#error "KERNEL_W2: unsupported weight representation"
+#endif
+#endif
+
+#if defined(KERNEL_W3)
+#if ELEMENT_HAS(KERNEL_W3, _KIND_DENSE)
+namespace packets { typedef Dense<ELEMENT_OF(KERNEL_W3)> W3; }
+#define KERNEL_W3_AT(pointer) PACKETS_MAKE_DENSE(KERNEL_W3, pointer)
+#elif !ELEMENT_HAS(KERNEL_W3, _LAYOUT_MMA16)
+#error "KERNEL_W3 must be dense or bound in the mma16 layout"
+#elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_Q4K)
+namespace packets { typedef Q4K W3; }
+#define KERNEL_W3_AT(pointer) PACKETS_MAKE_Q4K(KERNEL_W3, pointer)
+#elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_Q5K)
+namespace packets { typedef Q5K W3; }
+#define KERNEL_W3_AT(pointer) PACKETS_MAKE_Q5K(KERNEL_W3, pointer)
+#elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_Q6K)
+namespace packets { typedef Q6K W3; }
+#define KERNEL_W3_AT(pointer) PACKETS_MAKE_Q6K(KERNEL_W3, pointer)
+#elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_Q8G32S)
+namespace packets { typedef Q8 W3; }
+#define KERNEL_W3_AT(pointer) PACKETS_MAKE_Q8(KERNEL_W3, pointer)
+#else
+#error "KERNEL_W3: unsupported weight representation"
 #endif
 #endif

@@ -20,7 +20,7 @@ const RUNS: usize = 200;
 fn devices() -> Vec<Device> {
     let catalog = DeviceCatalog::discover().expect("device discovery");
     let topology = catalog.topology();
-    [BackendName::Cpu, BackendName::Metal, BackendName::Cuda]
+    [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]
         .into_iter()
         .filter(|backend| {
             topology.devices().iter().any(|device| {

@@ -3,7 +3,7 @@
 use super::{
     ArtifactComponent, ArtifactComponentKind, CapabilityPlan, ComponentPlan, ComponentSelection,
     ModelLoadPlan, PlannedMethod, ProgramPlan, ResourceBudget, ResourceLimits, ResourcePlan,
-    WeightPlan,
+    WeightPlan, MAX_DRAFT_PROPOSALS,
 };
 use crate::{
     error::{CapacityError, PlanError, ResourceKind},
@@ -201,8 +201,8 @@ impl ExecutionPlanner {
         limits: ResourceLimits,
         budget: ResourceBudget,
     ) -> Result<ExecutionPlanDraft, PlanError> {
-        if path == ExecutionPath::Native && codec != KvCodec::Dense {
-            return Err(PlanError::Unsupported("native KV codec"));
+        if path == ExecutionPath::Native && codec == KvCodec::RotatedK4V4 {
+            return Err(PlanError::Unsupported("native rotated K4/V4 KV codec"));
         }
         if budget.storage_bytes > device.assessment_capacity_bytes {
             return Err(PlanError::Resource(CapacityError {
@@ -229,7 +229,7 @@ impl ExecutionPlanner {
             super::resident_layout(path, device.info.backend),
         )
         .map_err(PlanError::InvalidDefinition)?;
-        let programs = load.program_plan(definition)?;
+        let programs = load.program_plan(definition, codec)?;
         let target = ArtifactComponent {
             kind: ArtifactComponentKind::Target,
             identity: manifest.target.identity,
@@ -250,37 +250,23 @@ impl ExecutionPlanner {
                 "enabled vision has no projector component",
             ));
         }
-        let max_draft_proposals = if selection.head {
-            let depth = definition
-                .head
-                .as_ref()
-                .ok_or(PlanError::Topology("enabled head has no model definition"))?
-                .depth();
-            let capacity = depth
-                .checked_add(1)
-                .ok_or(PlanError::Arithmetic("draft proposal capacity overflow"))?;
-            Some(
-                u8::try_from(capacity)
-                    .map_err(|_| PlanError::Arithmetic("draft proposal capacity exceeds u8"))?,
-            )
-        } else {
-            None
-        };
-        if let PlannedMethod::Mtp {
-            greedy_proposals,
-            sampled_proposals,
-        } = method
-        {
-            let capacity = max_draft_proposals
-                .ok_or(PlanError::Topology("MTP method has no draft capacity"))?;
-            if greedy_proposals == 0
-                || sampled_proposals == 0
-                || greedy_proposals > capacity
-                || sampled_proposals > capacity
-            {
-                return Err(PlanError::Unsupported("MTP proposal width"));
+        // The head block chains on the device, so the draft width is bounded
+        // by the sealed head graphs, not by the head's depth.
+        let max_draft_proposals = match method {
+            PlannedMethod::Plain => None,
+            PlannedMethod::Mtp {
+                greedy_proposals,
+                sampled_proposals,
+            } => {
+                if greedy_proposals == 0
+                    || sampled_proposals == 0
+                    || greedy_proposals.max(sampled_proposals) > MAX_DRAFT_PROPOSALS
+                {
+                    return Err(PlanError::Unsupported("MTP proposal width"));
+                }
+                Some(greedy_proposals.max(sampled_proposals))
             }
-        }
+        };
         if programs.head().is_some() != selection.head
             || programs.vision().is_some() != selection.vision
         {

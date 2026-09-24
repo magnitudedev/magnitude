@@ -3,19 +3,23 @@
 //!
 //! A checked entry's authored implementation for the opened device's backend
 //! is formed under one [`NativeSpecialization`] and executed without a
-//! compiler plan. Metal and CUDA sources receive the generated prefix of
-//! [`abi`]; CPU implementations are Rust compiled into the binary and reached
-//! through [`cpu`].
+//! compiler plan. Metal, CUDA and Vulkan sources receive the generated
+//! prefix of [`abi`]; CPU implementations are Rust compiled into the binary
+//! and reached through [`cpu`].
 //!
 //! Submission is asynchronous. Launches of one submission share one serial
-//! encoder (Metal), one stream (CUDA) or the worker pool (CPU); the device
-//! queue orders submissions, and allocation fences order host access after
-//! them.
+//! encoder (Metal), one stream (CUDA), one command buffer on the device's
+//! queue (Vulkan) or the worker pool (CPU); the device queue orders
+//! submissions, and allocation fences order host access after them.
 
 pub(crate) mod abi;
 pub mod cpu;
 mod cuda;
 pub mod graph;
+mod graph_replays;
+#[cfg(not(target_os = "macos"))]
+mod vulkan;
+pub mod replay;
 pub mod search;
 mod timing;
 pub mod trace;
@@ -93,8 +97,12 @@ pub(crate) const BUFFER_ALIGNMENT: u64 = 256;
 pub(crate) struct NativeQueue {
     /// Held from encoding a submission to recording its allocation fences.
     order: Mutex<()>,
-    /// CUDA graphs of sealed-plan submissions (unused on other backends).
-    replays: cuda::Replays,
+    /// CUDA graphs of sealed-plan submissions (CUDA devices only).
+    cuda_replays: cuda::CudaReplays,
+    /// Recorded Vulkan graphs of sealed-plan submissions (Vulkan devices
+    /// only).
+    #[cfg(not(target_os = "macos"))]
+    vulkan_replays: vulkan::VulkanReplays,
 }
 
 /// Bytes charged to a scratch buffer that is empty or inactive: it keeps
@@ -114,6 +122,11 @@ enum NativeRoute {
     Cuda {
         opened: Arc<CudaOpened>,
         module: seismic_cuda::direct::DirectModule,
+    },
+    #[cfg(not(target_os = "macos"))]
+    Vulkan {
+        opened: Arc<crate::backends::VulkanOpened>,
+        module: seismic_vulkan::formation::DirectModule,
     },
 }
 
@@ -149,6 +162,71 @@ pub struct NativePrepared {
     route: NativeRoute,
 }
 
+/// The pipeline geometry of every launch of a Vulkan implementation: its
+/// workgroup size and group-memory view lengths. Both read only static
+/// dimensions and parameters (the checker's Vulkan rule), so every pipeline
+/// is formed, and checked against the device, at preparation.
+#[cfg(not(target_os = "macos"))]
+fn vulkan_geometry(
+    opened: &crate::backends::VulkanOpened,
+    name: &str,
+    implementation: &NativeImplementation,
+    specialization: &NativeSpecialization,
+) -> Result<Vec<([u32; 3], Vec<u32>)>, PrepareError> {
+    let limits = opened.service().facts().limits;
+    let narrow = |value: u64, what: &str| {
+        u32::try_from(value).map_err(|_| preparation(format!("`{name}`: {what} {value} exceeds the Vulkan ABI")))
+    };
+    implementation
+        .launches
+        .iter()
+        .map(|launch| {
+            let kernel = &launch.kernel;
+            let evaluate = |expression: &NativeNatExpr| {
+                expression
+                    .evaluate(&|dimension| specialization.static_value(dimension), &|parameter| {
+                        specialization.param(parameter)
+                    })
+                    .map_err(|error| preparation(format!("`{name}` launch `{kernel}`: {error}")))
+            };
+            let threads = [
+                evaluate(&launch.group_extent[0])?,
+                evaluate(&launch.group_extent[1])?,
+                evaluate(&launch.group_extent[2])?,
+            ];
+            let invocations = threads.iter().try_fold(1u64, |product, value| product.checked_mul(*value));
+            if threads.contains(&0)
+                || invocations.is_none_or(|invocations| invocations > limits.max_invocations)
+                || threads.iter().zip(limits.max_group_size).any(|(threads, limit)| *threads > limit)
+            {
+                return Err(preparation(format!(
+                    "launch `{kernel}` requests {threads:?} threads per workgroup; the device allows {:?} and {} in total",
+                    limits.max_group_size, limits.max_invocations
+                )));
+            }
+            let shared_bytes = evaluate(&launch.shared_bytes)?;
+            let footprint = abi::vulkan::shared_footprint(shared_bytes);
+            if footprint > limits.max_shared_bytes {
+                return Err(preparation(format!(
+                    "launch `{kernel}` needs {footprint} shared bytes; the device allows {}",
+                    limits.max_shared_bytes
+                )));
+            }
+            Ok((
+                [
+                    narrow(threads[0], "a workgroup extent")?,
+                    narrow(threads[1], "a workgroup extent")?,
+                    narrow(threads[2], "a workgroup extent")?,
+                ],
+                abi::vulkan::shared_view_lengths(shared_bytes)
+                    .into_iter()
+                    .map(|length| narrow(length, "a shared view length"))
+                    .collect::<Result<_, _>>()?,
+            ))
+        })
+        .collect()
+}
+
 fn entry_name(module: &CheckedModule, entry: EntryId) -> String {
     module
         .entries()
@@ -169,6 +247,8 @@ pub(crate) fn backend_name(kind: &OpenedKind) -> BackendName {
         #[cfg(target_os = "macos")]
         OpenedKind::Metal(_) => BackendName::Metal,
         OpenedKind::Cuda(_) => BackendName::Cuda,
+        #[cfg(not(target_os = "macos"))]
+        OpenedKind::Vulkan(_) => BackendName::Vulkan,
     }
 }
 
@@ -402,6 +482,59 @@ impl NativePrepared {
                     toolchain,
                 )
             }
+            #[cfg(not(target_os = "macos"))]
+            OpenedKind::Vulkan(opened) => {
+                let source = abi::render_source(
+                    abi::Dialect::Vulkan(opened.features()),
+                    &logical,
+                    &bindings,
+                    &implementation,
+                    &specialization,
+                    asset(BackendName::Vulkan)?,
+                );
+                digest.update(source.as_bytes());
+                let geometry = vulkan_geometry(opened, &name, &implementation, &specialization)?;
+                let formation = seismic_vulkan::formation::formation(opened.service());
+                // A launch's SPIR-V is determined by the source, its kernel
+                // and the formation: the store's key.
+                let key = |kernel: &str| {
+                    crate::artifacts::ArtifactKey::of(&[
+                        source.as_bytes(),
+                        kernel.as_bytes(),
+                        formation.as_bytes(),
+                    ])
+                };
+                let kind = crate::artifacts::ArtifactKind::SpirV;
+                let store = device.artifacts.as_deref();
+                let formed = geometry
+                    .iter()
+                    .zip(&kernels)
+                    .map(|((threads, views), kernel)| seismic_vulkan::formation::Kernel {
+                        name: kernel,
+                        threads: *threads,
+                        constants: views,
+                    })
+                    .collect::<Vec<_>>();
+                let module = seismic_vulkan::formation::DirectModule::form(
+                    opened.service(),
+                    &source,
+                    &formed,
+                    |kernel| store.and_then(|store| store.get(kind, &key(kernel))),
+                    |kernel, spirv| {
+                        if let Some(store) = store {
+                            store.put(kind, &key(kernel), spirv);
+                        }
+                    },
+                )
+                .map_err(compilation)?;
+                (
+                    NativeRoute::Vulkan {
+                        opened: opened.clone(),
+                        module,
+                    },
+                    formation,
+                )
+            }
         };
         let bindings_text = bindings
             .iter()
@@ -631,6 +764,18 @@ impl NativePrepared {
                             "launch `{}` needs {} shared bytes; the device allows {available}",
                             launch.kernel,
                             shared_bytes + module.static_shared_bytes(ordinal)
+                        )));
+                    }
+                }
+                // The workgroup size and group memory are the pipeline's,
+                // checked at preparation; only the grid varies per call.
+                #[cfg(not(target_os = "macos"))]
+                NativeRoute::Vulkan { opened, .. } => {
+                    let available = opened.service().facts().limits.max_group_count;
+                    if let Some(axis) = (0..3).find(|axis| groups[*axis] > available[*axis]) {
+                        return Err(limit(format!(
+                            "launch `{}` requests {} workgroups on axis {axis}; the device allows {}",
+                            launch.kernel, groups[axis], available[axis]
                         )));
                     }
                 }
@@ -1131,6 +1276,8 @@ enum RouteSubmission {
     #[cfg(target_os = "macos")]
     Metal(seismic_metal::DirectSubmission),
     Cuda(seismic_cuda::direct::DirectSubmission),
+    #[cfg(not(target_os = "macos"))]
+    Vulkan(seismic_vulkan::direct::DirectSubmission),
 }
 
 impl DeviceCompletion for RouteSubmission {
@@ -1140,6 +1287,8 @@ impl DeviceCompletion for RouteSubmission {
             #[cfg(target_os = "macos")]
             Self::Metal(submission) => submission.is_complete(),
             Self::Cuda(submission) => submission.is_complete(),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(submission) => submission.is_complete(),
         }
     }
     fn wait_complete(&self) {
@@ -1148,6 +1297,8 @@ impl DeviceCompletion for RouteSubmission {
             #[cfg(target_os = "macos")]
             Self::Metal(submission) => submission.wait_complete(),
             Self::Cuda(submission) => submission.wait_complete(),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(submission) => submission.wait_complete(),
         }
     }
 }
@@ -1172,6 +1323,8 @@ impl NativeSubmission {
             #[cfg(target_os = "macos")]
             RouteSubmission::Metal(submission) => submission.finish(),
             RouteSubmission::Cuda(submission) => submission.finish(),
+            #[cfg(not(target_os = "macos"))]
+            RouteSubmission::Vulkan(submission) => submission.finish(),
         }
         .map_err(CallError::Execution)
     }
@@ -1184,6 +1337,10 @@ impl NativeSubmission {
             #[cfg(target_os = "macos")]
             RouteSubmission::Metal(submission) => Ok(submission.device_seconds()),
             RouteSubmission::Cuda(submission) => {
+                submission.device_seconds().map_err(CallError::Execution)
+            }
+            #[cfg(not(target_os = "macos"))]
+            RouteSubmission::Vulkan(submission) => {
                 submission.device_seconds().map_err(CallError::Execution)
             }
         }
@@ -1332,13 +1489,22 @@ fn encode(
         NativeRoute::Cuda { opened, .. } => {
             cuda::encode(
                 opened.service(),
-                &first.public_device.native.replays,
+                &first.public_device.native.cuda_replays,
                 list,
                 repetitions,
                 timed.is_some(),
                 retained,
             )
         }
+        #[cfg(not(target_os = "macos"))]
+        NativeRoute::Vulkan { opened, .. } => vulkan::encode(
+            opened.service(),
+            &first.public_device.native.vulkan_replays,
+            list,
+            repetitions,
+            timed.map(|(_, launches)| launches),
+            retained,
+        ),
     }
 }
 

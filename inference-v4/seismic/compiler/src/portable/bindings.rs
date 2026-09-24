@@ -97,6 +97,10 @@ pub(super) struct SemanticBindings {
     pub(super) selections: BindingSelections,
     pub(super) contents: StorageContents,
     pub(super) binders: Vec<seismic_lang::expr::SymbolId>,
+    /// The exact meaning of a Boolean slot a host comparison of exact
+    /// quantities defined in this environment (`slot == (a < b)`). Its
+    /// operands are single-assignment values that dominate every use.
+    pub(super) host_conditions: std::collections::HashMap<seismic_lang::expr::SymbolId, seismic_lang::expr::BoolExpr>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -275,7 +279,7 @@ impl BindingArena {
         for (_, value) in &options {
             assert_eq!(value.owner, self.owner);
         }
-        if options.iter().all(|(_, value)| *value == first) {
+        if options.iter().all(|(_, value)| *value == first || self.same_value(*value, first)) {
             return first;
         }
         let id = BindingId {
@@ -284,6 +288,42 @@ impl BindingArena {
         };
         self.nodes.push(BindingValue::Selected { selector, options });
         id
+    }
+
+    /// Every value a binding may hold after its selections: one value when
+    /// the dominating arms decide it, otherwise every option of each
+    /// undecided selection (a join the caller transports as one product).
+    pub(super) fn possible_values(&self, id: BindingId, selections: &BindingSelections) -> Vec<Bound> {
+        assert_eq!(id.owner, self.owner, "binding belongs to another construction");
+        match &self.nodes[id.index] {
+            BindingValue::Value(value) => vec![value.clone()],
+            BindingValue::Selected { selector, options } => match selections.get(selector) {
+                Some(value) => self.possible_values(
+                    options.iter().find(|(option, _)| option == value).expect("selected binding option is complete").1,
+                    selections,
+                ),
+                None => options.iter().flat_map(|(_, option)| self.possible_values(*option, selections)).collect(),
+            },
+        }
+    }
+
+    /// Two bindings are one value when every leaf is the same scalar
+    /// realization (for example both arms forwarded into one join slot).
+    /// Tensors keep per-arm storage identity and never merge here.
+    fn same_value(&self, a: BindingId, b: BindingId) -> bool {
+        fn same(a: &Bound, b: &Bound) -> bool {
+            match (a, b) {
+                (Bound::Scalar(a), Bound::Scalar(b)) => a == b,
+                (Bound::Unit, Bound::Unit) => true,
+                (Bound::Range { start: a, end: b }, Bound::Range { start: c, end: d }) => same(a, c) && same(b, d),
+                (Bound::Tuple(a), Bound::Tuple(b)) => a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same(a, b)),
+                _ => false,
+            }
+        }
+        match (&self.nodes[a.index], &self.nodes[b.index]) {
+            (BindingValue::Value(a), BindingValue::Value(b)) => same(a, b),
+            _ => false,
+        }
     }
 }
 
@@ -665,6 +705,7 @@ impl SemanticBindings {
             selections: std::collections::HashMap::new(),
             contents: StorageContents::new(),
             binders: Vec::new(),
+            host_conditions: std::collections::HashMap::new(),
         }
     }
     pub(super) fn slot(&self, value: SemanticValueId) -> usize {

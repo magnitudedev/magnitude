@@ -1,0 +1,79 @@
+// qwen_dense_output: the down projection of the product rows plus the F32
+// residual of the `out_rows` rows. The Vulkan form of
+// `metal/qwen_dense_output.metal` over `common/projection.glsl`; the GEMM
+// class may split K (SPLIT parts, then an in-order reduction).
+#include "common/activation.glsl"
+#include "common/projection.glsl"
+
+#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#define DENSE_ACT ELEMENT_ACT
+#else
+#error "qwen_dense_output requires a bf16 or f16 activation"
+#endif
+
+#if defined(SEISMIC_DOWN_WEIGHT_REPRESENTATION_Q4K)
+#define DOWN_KIND PACKETS_Q4K
+#define DOWN_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_DOWN_WEIGHT)
+#elif defined(SEISMIC_DOWN_WEIGHT_REPRESENTATION_Q5K)
+#define DOWN_KIND PACKETS_Q5K
+#define DOWN_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_DOWN_WEIGHT)
+#elif defined(SEISMIC_DOWN_WEIGHT_REPRESENTATION_Q6K)
+#define DOWN_KIND PACKETS_Q6K
+#define DOWN_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_DOWN_WEIGHT)
+#elif defined(SEISMIC_DOWN_WEIGHT_REPRESENTATION_Q8G32S)
+#define DOWN_KIND PACKETS_Q8
+#define DOWN_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_DOWN_WEIGHT)
+#elif defined(SEISMIC_DOWN_WEIGHT_REPRESENTATION_BF16)
+#define DOWN_KIND PACKETS_BF16
+#define DOWN_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_DOWN_WEIGHT, 2)
+#elif defined(SEISMIC_DOWN_WEIGHT_REPRESENTATION_F16)
+#define DOWN_KIND PACKETS_F16
+#define DOWN_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_DOWN_WEIGHT, 2)
+#elif defined(SEISMIC_DOWN_WEIGHT_REPRESENTATION_F32)
+#define DOWN_KIND PACKETS_F32
+#define DOWN_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_DOWN_WEIGHT, 4)
+#else
+#error "unsupported qwen_dense_output down_weight representation"
+#endif
+#if defined(SEISMIC_DOWN_WEIGHT_KIND_PACKED) && !defined(SEISMIC_DOWN_WEIGHT_LAYOUT_ROWS16)
+#error "qwen_dense_output requires the rows16 layout for down_weight"
+#endif
+
+projection_prologue dense_output_input() {
+    return projection_plain(DENSE_ACT, SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT), SEISMIC_PRODUCT_STRIDE_0,
+        SEISMIC_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_F), 0ul);
+}
+
+projection_epilogue dense_output_output() {
+    return projection_residual(DENSE_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
+        SEISMIC_RESULT_0_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL), SEISMIC_RESIDUAL_STRIDE_0,
+        SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS));
+}
+
+projection_weights dense_output_down() {
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_WEIGHT), DOWN_GEOMETRY, uint(SEISMIC_DIM_F), 0ul);
+}
+
+void qwen_dense_output_gemv() {
+    const projection_weights w = dense_output_down();
+    projection_gemv(DOWN_KIND, DOWN_KIND, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, PROJECTION_NORM_NONE,
+        dense_output_input(), dense_output_output(), w, w, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_H),
+        uint(SEISMIC_DIM_F), gl_WorkGroupID.x);
+}
+
+void qwen_dense_output_gemm() {
+    const uint m = uint(SEISMIC_DIM_O), n = uint(SEISMIC_DIM_H), k = uint(SEISMIC_DIM_F);
+#if SEISMIC_TUNE_SPLIT == 1
+    projection_gemm(DOWN_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, dense_output_input(), dense_output_output(),
+        dense_output_down(), m, n, k, gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
+#else
+    projection_gemm_part(DOWN_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, dense_output_input(),
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), dense_output_down(), m, n, k, SEISMIC_TUNE_SPLIT,
+        gl_WorkGroupID.z, gl_WorkGroupID.y, gl_WorkGroupID.x);
+#endif
+}
+
+void qwen_dense_output_finalize() {
+    projection_gemm_finalize(dense_output_output(), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), uint(SEISMIC_DIM_O),
+        uint(SEISMIC_DIM_H), SEISMIC_TUNE_SPLIT, gl_GlobalInvocationID.x);
+}

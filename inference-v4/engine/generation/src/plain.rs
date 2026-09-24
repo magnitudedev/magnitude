@@ -2,7 +2,9 @@ use crate::method::{
     Method, MethodCheckpoint, MethodCheckpointError, MethodEffects, MethodRequirements,
     MethodState, Propose, Verification,
 };
-use magnitude_model_executor::{Demand, FeatureRef, Operation, Outcome, RequestId, TokenId};
+use magnitude_model_executor::{
+    Demand, FeatureReader, FeatureRef, Operation, Outcome, RequestId, SelectSpec, TokenId,
+};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Plain;
@@ -20,9 +22,20 @@ impl Method for Plain {
         }
     }
 
-    fn create(&self, checkpoint: Option<&MethodCheckpoint>) -> Box<dyn MethodState> {
-        debug_assert!(checkpoint.is_none_or(|checkpoint| *checkpoint == MethodCheckpoint::Plain));
-        Box::new(PlainState)
+    fn proposals(&self) -> usize {
+        0
+    }
+
+    fn create(
+        &self,
+        checkpoint: Option<&MethodCheckpoint>,
+    ) -> Result<Box<dyn MethodState>, String> {
+        match checkpoint {
+            None | Some(MethodCheckpoint::Plain) => Ok(Box::new(PlainState)),
+            Some(MethodCheckpoint::Mtp(_)) => {
+                Err("an MTP checkpoint cannot restore plain state".into())
+            }
+        }
     }
 }
 
@@ -30,51 +43,43 @@ impl Method for Plain {
 struct PlainState;
 
 impl MethodState for PlainState {
-    fn fork_transition(&self) -> Result<Box<dyn MethodState>, String> {
-        Ok(Box::new(self.clone()))
+    fn fork_transition(&self) -> Box<dyn MethodState> {
+        Box::new(self.clone())
     }
+
     fn prime(
         &mut self,
         _: RequestId,
-        _tokens: &[TokenId],
-        _features: FeatureRef,
+        _: &[TokenId],
+        _: Option<TokenId>,
+        _: FeatureRef,
+        _: &mut dyn FeatureReader,
     ) -> Result<MethodEffects, String> {
         Ok(MethodEffects::default())
     }
 
-    fn propose(
-        &mut self,
-        _: RequestId,
-        _context: &[TokenId],
-        _limit: usize,
-        _: magnitude_model_executor::SelectSpec,
-    ) -> Propose {
+    fn propose(&mut self, _: RequestId, _: &[SelectSpec]) -> Propose {
         Propose::Tokens(Vec::new())
     }
 
-    fn observe(&mut self, _verification: Verification<'_>) -> Result<MethodEffects, String> {
+    fn observe(
+        &mut self,
+        _: RequestId,
+        _: Verification<'_>,
+        _: &mut dyn FeatureReader,
+    ) -> Result<MethodEffects, String> {
         Ok(MethodEffects::default())
     }
 
-    fn reconcile(
-        &mut self,
-        _operation: &Operation,
-        _outcome: Outcome,
-        _: Option<magnitude_model_executor::SelectSpec>,
-    ) -> Result<MethodEffects, String> {
+    fn reconcile(&mut self, _: &Operation, _: Outcome) -> Result<(), String> {
         Err("plain generation cannot receive method operations".into())
     }
 
-    fn checkpoint(
-        &self,
-        _retainer: &mut dyn magnitude_model_executor::FeatureRetainer,
-    ) -> Result<MethodCheckpoint, MethodCheckpointError> {
+    fn checkpoint(&self) -> Result<MethodCheckpoint, MethodCheckpointError> {
         Ok(MethodCheckpoint::Plain)
     }
 
     fn evict(&mut self) {}
-
-    fn restore(&mut self) {}
 
     fn reclaimable(&self) -> u64 {
         0
@@ -84,21 +89,12 @@ impl MethodState for PlainState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::method::Method;
-    use magnitude_model_executor::{FeatureRetainer, FeatureSpan, RetainedFeatureSpan};
-
-    struct NoFeatures;
-
-    impl FeatureRetainer for NoFeatures {
-        fn retain(&mut self, _span: FeatureSpan) -> Result<RetainedFeatureSpan, String> {
-            Err("plain method does not retain features".into())
-        }
-    }
 
     #[test]
     fn plain_has_no_head_work_or_state() {
         let plain = Plain;
         assert_eq!(plain.identity(), "plain");
+        assert_eq!(plain.proposals(), 0);
         assert_eq!(
             plain.requires(),
             MethodRequirements {
@@ -107,8 +103,8 @@ mod tests {
                 head: false,
             }
         );
-        let mut state = plain.create(None);
-        let select = magnitude_model_executor::SelectSpec {
+        let mut state = plain.create(None).unwrap();
+        let select = SelectSpec {
             sampling: magnitude_model_executor::Sampling::Greedy,
             seed: 0,
             position: 0,
@@ -118,13 +114,10 @@ mod tests {
             history: None,
         };
         assert_eq!(
-            state.propose(RequestId(1), &[TokenId(1)], 4, select),
+            state.propose(RequestId(1), &[select]),
             Propose::Tokens(vec![])
         );
-        assert_eq!(
-            state.checkpoint(&mut NoFeatures).unwrap(),
-            MethodCheckpoint::Plain
-        );
+        assert_eq!(state.checkpoint().unwrap(), MethodCheckpoint::Plain);
         assert_eq!(state.reclaimable(), 0);
     }
 }

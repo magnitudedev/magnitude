@@ -1,18 +1,22 @@
 //! Target readout graphs. Features, logits and selection have distinct
 //! sealed graphs, so feature-only work never touches the vocabulary
 //! projection. Every entry gathers its rows from the final hidden rows
-//! directly: `qwen_features_rows` through `out_rows`, `qwen_head_rows`
+//! directly: `readout_features_rows` through `out_rows`, `readout_head_rows`
 //! through `logit_rows` (the hidden rows of the projected outputs). The host
 //! orders the projected rows with the selected ones first, so shaping and
 //! sampling read the leading `selected` logits rows; no identity copy or
 //! gather node precedes any readout entry.
 
-use crate::{ModelLoadPlan, ResidentTarget, ResourceLimits, native::AttestedTarget};
+use crate::{
+    DeviceError, InvariantError, ModelLoadPlan, ResidentTarget, ResourceLimits, SubmitError,
+    native::AttestedTarget,
+};
+use magnitude_model_batching::TargetBatchUpload;
 use magnitude_model_contracts::{DecoderGeometry, WeightKind, WeightRole, WeightScope};
-use magnitude_model_kernels::{qwen_features_rows, qwen_head_rows, sample_rows, shape_rows};
+use magnitude_model_kernels::{readout_features_rows, readout_head_rows, sample_rows, shape_rows};
 use seismic::{
-    BoundNativeGraphPlan, Device, Element, NativeGraphFamily, NativeGraphPlan, NativePort,
-    WorkflowTensor,
+    BoundNativeGraphPlan, Device, Element, NativeGraphFamily, NativeGraphPlan, NativeKernel,
+    NativePort, WorkflowTensor, WorkflowTensorMut, WorkflowTensorRef,
 };
 use std::collections::BTreeMap;
 
@@ -272,7 +276,7 @@ impl PreparedTargetReadoutGraph {
         let features = graph
             .enqueue(
                 &target.readout.features,
-                qwen_features_rows::WorkflowArgs {
+                readout_features_rows::WorkflowArgs {
                     hidden: hidden.tensor().into(),
                     norm: norm.tensor().into(),
                     out_rows: out_rows.tensor().into(),
@@ -306,7 +310,7 @@ impl PreparedTargetReadoutGraph {
             let projected = graph
                 .enqueue(
                     &target.readout.head,
-                    qwen_head_rows::WorkflowArgs {
+                    readout_head_rows::WorkflowArgs {
                         hidden: hidden.tensor().into(),
                         norm: norm.tensor().into(),
                         weight: projection.tensor().into(),
@@ -318,16 +322,27 @@ impl PreparedTargetReadoutGraph {
                 .value;
             graph.export(&projected).map_err(error)?;
             if let ReadoutKind::Selection { shaped } = class.kind {
-                let (ports, sampled) = Self::select(
+                let mut sampled = graph
+                    .local_for(
+                        &target.sample,
+                        "result",
+                        &[("M", class.selected), ("V", geometry.vocabulary)],
+                    )
+                    .map_err(error)?;
+                let leading = projected.slice_leading(0, class.selected);
+                let ports = sample(
                     &mut graph,
-                    target,
-                    geometry,
-                    &projected.slice_leading(0, class.selected),
+                    &target.shape,
+                    &target.sample,
+                    geometry.vocabulary,
+                    (&leading).into(),
                     class.selected,
                     shaped,
+                    sampled.tensor_mut().into(),
                 )?;
+                graph.export(sampled.tensor()).map_err(error)?;
                 selection = Some(ports);
-                selected = Some(sampled);
+                selected = Some(sampled.tensor().clone());
             }
             weight = Some(projection);
             logit_rows = Some(rows);
@@ -349,83 +364,161 @@ impl PreparedTargetReadoutGraph {
         })
     }
 
-    /// Sampling of the leading `selected` logits rows, after `shape_rows`
-    /// when the class is `shaped`.
-    fn select(
-        graph: &mut seismic::NativeGraph,
-        target: &AttestedTarget,
-        geometry: &DecoderGeometry,
-        logits: &seismic::WorkflowTensorView,
-        selected: u64,
-        shaped: bool,
-    ) -> Result<(SelectionPorts, WorkflowTensor), String> {
-        let sample_dims = [("M", selected), ("V", geometry.vocabulary)];
-        let mask = graph.input_for(&target.sample, "mask", &sample_dims).map_err(error)?;
-        let constrained = graph
-            .input_for(&target.sample, "constrained", &sample_dims)
+}
+
+/// Sampling of `rows` logits rows into `result`, after `shape_rows` when
+/// `shaped`. The target readout and the draft head select through this one
+/// node sequence and control layout.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sample(
+    graph: &mut seismic::NativeGraph,
+    shape: &NativeKernel<shape_rows::Entry>,
+    sample: &NativeKernel<sample_rows::Entry>,
+    vocabulary: u64,
+    logits: WorkflowTensorRef<'_>,
+    rows: u64,
+    shaped: bool,
+    result: WorkflowTensorMut<'_>,
+) -> Result<SelectionPorts, String> {
+    let sample_dims = [("M", rows), ("V", vocabulary)];
+    let mask = graph.input_for(sample, "mask", &sample_dims).map_err(error)?;
+    let constrained = graph
+        .input_for(sample, "constrained", &sample_dims)
+        .map_err(error)?;
+    let draws = graph.input_for(sample, "draws", &sample_dims).map_err(error)?;
+    let shaping = if shaped {
+        let shape_dims = [("Sx", rows), ("V", vocabulary), ("Hn", HISTORY_TOKENS)];
+        let parameters = graph.input_for(shape, "params", &shape_dims).map_err(error)?;
+        let history = graph.input_for(shape, "history", &shape_dims).map_err(error)?;
+        let mut out = graph.local_for(shape, "out", &shape_dims).map_err(error)?;
+        graph
+            .enqueue(
+                shape,
+                shape_rows::WorkflowArgs {
+                    logits,
+                    params: parameters.tensor().into(),
+                    history: history.tensor().into(),
+                    out: out.tensor_mut().into(),
+                },
+            )
             .map_err(error)?;
-        let draws = graph.input_for(&target.sample, "draws", &sample_dims).map_err(error)?;
-        let mut sampled = graph.local_for(&target.sample, "result", &sample_dims).map_err(error)?;
-        let shaping = if shaped {
-            let shape_dims = [
-                ("Sx", selected),
-                ("V", geometry.vocabulary),
-                ("Hn", HISTORY_TOKENS),
-            ];
-            let parameters = graph.input_for(&target.shape, "params", &shape_dims).map_err(error)?;
-            let history = graph.input_for(&target.shape, "history", &shape_dims).map_err(error)?;
-            let mut out = graph.local_for(&target.shape, "out", &shape_dims).map_err(error)?;
-            graph
-                .enqueue(
-                    &target.shape,
-                    shape_rows::WorkflowArgs {
-                        logits: logits.into(),
-                        params: parameters.tensor().into(),
-                        history: history.tensor().into(),
-                        out: out.tensor_mut().into(),
-                    },
-                )
-                .map_err(error)?;
-            graph
-                .enqueue(
-                    &target.sample,
-                    sample_rows::WorkflowArgs {
-                        logits: out.tensor().into(),
-                        mask: mask.tensor().into(),
-                        constrained: constrained.tensor().into(),
-                        draws: draws.tensor().into(),
-                        result: sampled.tensor_mut().into(),
-                    },
-                )
-                .map_err(error)?;
-            Some(ShapingPorts {
-                parameters,
-                history,
-            })
-        } else {
-            graph
-                .enqueue(
-                    &target.sample,
-                    sample_rows::WorkflowArgs {
-                        logits: logits.into(),
-                        mask: mask.tensor().into(),
-                        constrained: constrained.tensor().into(),
-                        draws: draws.tensor().into(),
-                        result: sampled.tensor_mut().into(),
-                    },
-                )
-                .map_err(error)?;
-            None
-        };
-        graph.export(sampled.tensor()).map_err(error)?;
-        Ok((
-            SelectionPorts {
-                shaping,
-                constrained,
-                mask,
-                draws,
-            },
-            sampled.tensor().clone(),
-        ))
+        graph
+            .enqueue(
+                sample,
+                sample_rows::WorkflowArgs {
+                    logits: out.tensor().into(),
+                    mask: mask.tensor().into(),
+                    constrained: constrained.tensor().into(),
+                    draws: draws.tensor().into(),
+                    result,
+                },
+            )
+            .map_err(error)?;
+        Some(ShapingPorts {
+            parameters,
+            history,
+        })
+    } else {
+        graph
+            .enqueue(
+                sample,
+                sample_rows::WorkflowArgs {
+                    logits,
+                    mask: mask.tensor().into(),
+                    constrained: constrained.tensor().into(),
+                    draws: draws.tensor().into(),
+                    result,
+                },
+            )
+            .map_err(error)?;
+        None
+    };
+    Ok(SelectionPorts {
+        shaping,
+        constrained,
+        mask,
+        draws,
+    })
+}
+
+/// Selection controls of a padded selection class from a pass's packed
+/// selections. Padding rows repeat the first selected row. An unconstrained
+/// row carries only its flag: the mask input is written only when some row
+/// is constrained, and then holds zeros in the rows that are not. A graph
+/// that selects over the leading `row_words * 32` tokens takes each mask's
+/// leading `row_words` words.
+pub(crate) fn write_selection(
+    batch: &TargetBatchUpload<'_>,
+    active: &mut seismic::NativeGraphFamilyActive<'_>,
+    ports: &SelectionPorts,
+    selected_class: usize,
+    row_words: usize,
+) -> Result<(), SubmitError> {
+    fn device(error: impl std::fmt::Display) -> SubmitError {
+        SubmitError::Device(DeviceError::Execution(error.to_string()))
     }
+    fn invalid(detail: &str) -> SubmitError {
+        SubmitError::Invariant(InvariantError {
+            context: "selection controls",
+            detail: detail.into(),
+        })
+    }
+    let actual_selected = batch.select_rows.len();
+    let source = |index: usize| if index < actual_selected { index } else { 0 };
+    if let Some(shaping) = &ports.shaping {
+        let parameters = (0..selected_class)
+            .flat_map(|index| batch.shaping[source(index)])
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        active
+            .write_input(&shaping.parameters, &parameters)
+            .map_err(device)?;
+        let history = (0..selected_class)
+            .flat_map(|index| batch.history[source(index)])
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        active
+            .write_input(&shaping.history, &history)
+            .map_err(device)?;
+    }
+    let draws = (0..selected_class)
+        .flat_map(|index| batch.draws[source(index)])
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    active.write_input(&ports.draws, &draws).map_err(device)?;
+    let mask_rows = (0..selected_class)
+        .map(|index| batch.mask_rows[source(index)])
+        .collect::<Vec<_>>();
+    let constrained = mask_rows
+        .iter()
+        .flat_map(|&mask_row| i32::from(mask_row >= 0).to_le_bytes())
+        .collect::<Vec<_>>();
+    active
+        .write_input(&ports.constrained, &constrained)
+        .map_err(device)?;
+    if mask_rows.iter().all(|&mask_row| mask_row < 0) {
+        return Ok(());
+    }
+    if row_words > batch.mask_words {
+        return Err(invalid("selection graph is wider than the vocabulary"));
+    }
+    let mut masks = vec![0_u32; selected_class * row_words];
+    for (index, &mask_row) in mask_rows.iter().enumerate() {
+        let Ok(mask_row) = usize::try_from(mask_row) else {
+            continue;
+        };
+        let mask = batch
+            .masks
+            .get(mask_row)
+            .ok_or_else(|| invalid("selection mask is absent"))?;
+        if mask.len() != batch.mask_words {
+            return Err(invalid("selection mask width differs from the vocabulary"));
+        }
+        masks[index * row_words..(index + 1) * row_words].copy_from_slice(&mask[..row_words]);
+    }
+    let bytes = masks
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    active.write_input(&ports.mask, &bytes).map_err(device)
 }

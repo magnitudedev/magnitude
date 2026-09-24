@@ -8,27 +8,30 @@ use crate::batching::{
 use crate::programs::ProgramSubmission;
 use crate::{
     AllocatedResources, AttestedPrograms, CapacityError, Completion, ComponentLoader,
-    ExecutionPlan, FeatureRef, FeatureRetainer, FeatureSpan, GroupKey, HeadLaunchInputs, ImageRef,
-    NativeGraphOutputLease, NativeGraphWorkspaceLease, Operation, Outcome, PoolClass,
-    ProgramIdentity, ProjectionLaunchInputs, ProjectionRequest, RequestId, ResidentHead,
-    ResidentVision, ResourceDomain, ResourceDomainId, ResourceKind, RetainedFeatureSpan, RowResult,
-    Selected, StateLaunchInputs, StateWork, TargetGraphOutputLease, TargetGraphWorkspaceLease,
-    TargetLaunchInputs, ValidatedHeadLaunch, ValidatedProjectionLaunch, ValidatedStateLaunch,
-    ValidatedTargetLaunch, ValidatedVisionLaunch, VisionLaunchInputs, WorkKind,
+    ExecutionPlan, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, GroupKey,
+    HeadLaunchInputs, ImageRef, NativeGraphOutputLease, NativeGraphWorkspaceLease, Operation,
+    Outcome, PoolClass, ProgramIdentity, RequestId, ResidentHead, ResidentVision, ResourceDomain,
+    ResourceDomainId, ResourceKind, RowResult, Selected, StateLaunchInputs, StateWork,
+    TargetGraphOutputLease, TargetGraphWorkspaceLease, TargetLaunchInputs, TargetTokens,
+    ValidatedHeadLaunch,
+    ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch, VisionLaunchInputs,
+    WorkKind,
 };
 use magnitude_model_contracts::{ModelDefinition, PreparedModelInput, TextCoordinateSemantics};
 use magnitude_model_state::{
-    OwnedAdvanceResolution, OwnedRepairAdvance, OwnedStateAdvance, SequenceState, StateCheckpoint,
-    StateStore,
+    Holder, OwnedAdvanceResolution, OwnedCompaction, OwnedCompactionPreparation,
+    OwnedRepairAdvance, OwnedStateAdvance, SequenceState, StateCheckpoint, StateStore,
+    TentativeAdvance,
 };
+use seismic::Tensor;
 mod family;
+mod features;
 mod head;
 mod in_flight;
 mod input;
+mod lookahead;
 mod ownership;
-mod project;
 mod reconcile;
-mod retention;
 mod state;
 mod target;
 mod vision;
@@ -38,12 +41,11 @@ mod domain_tests;
 
 pub use family::{NativeFamily, ProgramFamily};
 use in_flight::decode_selected;
-pub use in_flight::{HeadFlight, ProjectFlight, StateFlight, TargetFlight, VisionFlight};
+pub use in_flight::{HeadFlight, StateFlight, TargetFlight, VisionFlight};
 pub use ownership::{OpenRequirements, OpenReservation};
 pub use target::TargetHostTiming;
 
 use std::{
-    cell::Cell,
     collections::{BTreeMap, BTreeSet},
     rc::Rc,
     time::{Duration, Instant},
@@ -53,7 +55,6 @@ use std::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PhysicalDecision {
     pub accepted_rows: usize,
-    pub head_prefix: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -178,7 +179,6 @@ pub enum PhysicalResolution {
 pub enum ReservationLane {
     Target,
     Head,
-    Project,
     Vision,
     Repair,
 }
@@ -190,6 +190,8 @@ pub struct DomainRequirements {
     state_rows: usize,
     successor_banks: usize,
     secondary_pool: Option<PoolClass>,
+    /// The operations claim the queued lookahead step: nothing is reserved.
+    claim: bool,
 }
 
 impl DomainRequirements {
@@ -227,7 +229,14 @@ pub enum ReservedResources {
 
 /// Complete target capacity is owned before launch construction. Decoder
 /// graphs include checked recurrent state copies; readout has its own lease.
-pub struct TargetGraphReservation {
+pub enum TargetGraphReservation {
+    Launch(TargetLaunchReservation),
+    /// The operations claim the queued lookahead step's slots, in operation
+    /// order.
+    Claim(Vec<usize>),
+}
+
+pub struct TargetLaunchReservation {
     advances: Vec<OwnedStateAdvance>,
     graph_workspace: NativeGraphWorkspaceLease,
     graph_outputs: [NativeGraphOutputLease; 2],
@@ -257,7 +266,6 @@ struct PendingRepair {
     slot: Slot,
     conditioning: Option<crate::ConditioningRef>,
     conditioning_slices: Vec<crate::ConditioningSlice>,
-    head_prefix: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -285,29 +293,58 @@ impl DomainCheckpoint {
         self.target.position()
     }
 
-    pub fn retained_bytes(&self) -> Result<u64, String> {
-        let mut total = self.target.retained_bytes()?;
-        if let Some(head) = &self.head {
+    /// Bytes released if exactly this set of checkpoints were dropped: target
+    /// and head history rows and recurrent banks that nothing outside the set
+    /// references (a shared prefix counts once, and not at all while a live
+    /// request or another checkpoint shares it), plus the set's distinct
+    /// encoded media.
+    pub fn exclusive_bytes(set: &[&DomainCheckpoint]) -> Result<u64, String> {
+        let Some(first) = set.first() else {
+            return Ok(0);
+        };
+        let lane = |holders: Vec<Holder<'_>>, store: &Rc<StateStore>| {
+            store
+                .exclusive_bytes(&holders)
+                .map_err(|error| error.to_string())
+        };
+        let mut total = lane(
+            set.iter()
+                .map(|checkpoint| Holder::Checkpoint(&checkpoint.target))
+                .collect(),
+            first.target.store(),
+        )?;
+        if let Some(head) = &first.head {
+            let heads = set
+                .iter()
+                .map(|checkpoint| {
+                    checkpoint
+                        .head
+                        .as_ref()
+                        .map(Holder::Checkpoint)
+                        .ok_or("checkpoint set mixes head and headless state")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             total = total
-                .checked_add(head.retained_bytes()?)
+                .checked_add(lane(heads, head.store())?)
                 .ok_or("checkpoint byte count overflow")?;
         }
-        if let Some(input) = &self.input {
-            for image in input.images.values() {
-                if let Some(feature) = &image.features {
-                    total = total
-                        .checked_add(
-                            feature
-                                .allocation()
-                                .tensor()
-                                .map_err(|error| error.to_string())?
-                                .storage_bytes(),
-                        )
-                        .ok_or("checkpoint media byte count overflow")?;
+        let mut media: Vec<&Tensor> = Vec::new();
+        for input in set.iter().filter_map(|checkpoint| checkpoint.input.as_ref()) {
+            for feature in input.images.values().filter_map(|image| image.features.as_ref()) {
+                let tensor = feature
+                    .allocation()
+                    .tensor()
+                    .map_err(|error| error.to_string())?;
+                if media.iter().all(|seen| !seen.shares_allocation(tensor)) {
+                    media.push(tensor);
                 }
             }
         }
-        Ok(total)
+        media.iter().try_fold(total, |total, tensor| {
+            total
+                .checked_add(tensor.storage_bytes())
+                .ok_or_else(|| "checkpoint media byte count overflow".to_owned())
+        })
     }
 }
 
@@ -325,10 +362,8 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     vision_loader: Option<ComponentLoader<ResidentVision>>,
     target: BTreeMap<RequestId, SequenceState>,
     head: BTreeMap<RequestId, SequenceState>,
-    head_pending: BTreeMap<RequestId, OwnedStateAdvance>,
     input: BTreeMap<RequestId, RequestInput>,
     repairs: BTreeMap<RequestId, PendingRepair>,
-    retained_used: Rc<Cell<u64>>,
     fatal: Option<DomainError>,
     /// Group identities of the target, head and encoder executables.
     lane_identities: [ProgramIdentity; 3],
@@ -337,6 +372,13 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     target_timing: Option<TargetHostTiming>,
     /// Log each finished target step's host timing (read once at start).
     trace_host_steps: bool,
+    /// The step queued behind the last submitted target step, until claimed
+    /// or orphaned (see `lookahead`).
+    lookahead: Option<lookahead::Lookahead<F::TargetSubmission>>,
+    /// Identity of the next target flight.
+    next_flight: u64,
+    /// Log lookahead queues, claims and orphans (read once at start).
+    trace_lookahead: bool,
 }
 
 impl ExecutorDomain<NativeFamily> {
@@ -352,7 +394,8 @@ impl ExecutorDomain<NativeFamily> {
         target_store: Rc<StateStore>,
         head_store: Option<Rc<StateStore>>,
     ) -> Result<Self, String> {
-        if head_loader.is_some() != definition.head.is_some()
+        // A model's draft head is enabled only when its method drafts.
+        if (head_loader.is_some() && definition.head.is_none())
             || vision_loader.is_some() != definition.vision.is_some()
         {
             return Err("component loaders differ from enabled model components".into());
@@ -386,13 +429,22 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         operations: &[Operation],
     ) -> Result<DomainRequirements, DomainError> {
         self.healthy()?;
+        if let Some(class) = self.claim_class(operations) {
+            return Ok(DomainRequirements {
+                lane: ReservationLane::Target,
+                pool: PoolClass::Target(class),
+                secondary_pool: None,
+                state_rows: 0,
+                successor_banks: 0,
+                claim: true,
+            });
+        }
         let first = operations
             .first()
             .ok_or_else(|| DomainError::invariant("empty reservation"))?;
         let lane = match first {
             Operation::Forward { .. } => ReservationLane::Target,
             Operation::Head { .. } => ReservationLane::Head,
-            Operation::Project { .. } => ReservationLane::Project,
             Operation::Encode { .. } => ReservationLane::Vision,
             Operation::Repair { .. } => ReservationLane::Repair,
         };
@@ -401,7 +453,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 (lane, operation),
                 (ReservationLane::Target, Operation::Forward { .. })
                     | (ReservationLane::Head, Operation::Head { .. })
-                    | (ReservationLane::Project, Operation::Project { .. })
                     | (ReservationLane::Vision, Operation::Encode { .. })
                     | (ReservationLane::Repair, Operation::Repair { .. })
             )
@@ -458,26 +509,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                                     .into(),
                             ));
                         }
-                        Operation::Head {
-                            tokens,
-                            conditioning,
-                            ..
-                        } if conditioning.count != tokens.len()
-                            || conditioning.features.domain() != self.domain.id() =>
+                        Operation::Head { conditioning, .. }
+                            if conditioning.row_bytes() != self.head_conditioning_bytes() =>
                         {
                             return Err(DomainError::Input(
-                                "head conditioning differs from physical rows or resource domain"
-                                    .into(),
+                                "head conditioning rows differ from the activation width".into(),
                             ));
                         }
                         _ => {}
-                    }
-                    if lane == ReservationLane::Head
-                        && self.head_pending.contains_key(&operation.request())
-                    {
-                        return Err(DomainError::Input(
-                            "head reservation has a suspended advance".into(),
-                        ));
                     }
                     segments = segments.max(state.history_ranges().len());
                 }
@@ -494,37 +533,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     rows,
                     operations.len(),
                 )
-            }
-            ReservationLane::Project => {
-                let mut seen = BTreeSet::new();
-                for operation in operations {
-                    let request = operation.request();
-                    if !seen.insert(request)
-                        || !self.head.contains_key(&request)
-                            && !self.head_pending.contains_key(&request)
-                    {
-                        return Err(DomainError::Input(
-                            "projection request is repeated or not open".into(),
-                        ));
-                    }
-                }
-                let rows = operations
-                    .iter()
-                    .try_fold(0usize, |total, operation| match operation {
-                        Operation::Project { features, .. } => total
-                            .checked_add(features.allocation().rows())
-                            .ok_or("projection reservation rows overflow"),
-                        _ => unreachable!(),
-                    })
-                    .map_err(DomainError::from)?;
-                let class = crate::LaunchClass::covering(
-                    rows,
-                    operations.len(),
-                    crate::batching::Demand::SELECT,
-                    limits.max_batch_rows,
-                )
-                .map_err(|error| error.to_string())?;
-                (PoolClass::Head(class), None, 0, 0)
             }
             ReservationLane::Vision => {
                 let [Operation::Encode { image, .. }] = operations else {
@@ -588,10 +596,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             secondary_pool,
             state_rows,
             successor_banks,
+            claim: false,
         })
     }
 
     pub fn can_reserve(&self, requirements: &DomainRequirements) -> Result<(), CapacityError> {
+        if requirements.claim {
+            return Ok(());
+        }
         let available = |workspace: Option<usize>, output: Option<usize>| {
             if workspace.unwrap_or(0) == 0 {
                 return Err(CapacityError {
@@ -637,7 +649,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     Some(readout.available_output()),
                 )?;
             }
-            ReservationLane::Head | ReservationLane::Project => {
+            ReservationLane::Head => {
                 let graph = self.resources.head_graph().ok_or(CapacityError {
                     resource: ResourceKind::Workspace,
                     required: 1,
@@ -713,8 +725,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     pub fn reserve(&mut self, operations: &[Operation]) -> Result<DomainReservation, DomainError> {
         let requirements = self.requirements(operations)?;
+        if requirements.claim {
+            let slots = self
+                .claim_slots(operations)
+                .ok_or_else(|| DomainError::invariant("a claimable group lost its lookahead"))?;
+            return Ok(DomainReservation {
+                requirements,
+                resources: ReservedResources::Target(TargetGraphReservation::Claim(slots)),
+            });
+        }
         match requirements.lane {
-            ReservationLane::Head | ReservationLane::Project if !self.family.head_is_bound() => {
+            ReservationLane::Head if !self.family.head_is_bound() => {
                 let resident = self
                     .head_loader
                     .as_ref()
@@ -734,6 +755,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             _ => {}
         }
+        // Every advance of the group begins against backing committed now.
+        self.provision(operations)?;
         self.can_reserve(&requirements)
             .map_err(DomainError::Capacity)?;
         let invariant = |detail: &str, error: CapacityError| {
@@ -762,15 +785,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 let readout_output = readout
                     .acquire_output()
                     .map_err(|error| invariant("target readout output", error))?;
-                ReservedResources::Target(TargetGraphReservation {
-                    advances: Vec::with_capacity(operations.len()),
-                    graph_workspace,
-                    graph_outputs,
-                    readout_workspace,
-                    readout_output,
-                })
+                ReservedResources::Target(TargetGraphReservation::Launch(
+                    TargetLaunchReservation {
+                        advances: Vec::with_capacity(operations.len()),
+                        graph_workspace,
+                        graph_outputs,
+                        readout_workspace,
+                        readout_output,
+                    },
+                ))
             }
-            ReservationLane::Head | ReservationLane::Project => {
+            ReservationLane::Head => {
                 let graph = self.resources.head_graph().expect("checked head graph");
                 ReservedResources::Head(
                     graph
@@ -779,11 +804,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     graph
                         .acquire_output()
                         .map_err(|error| invariant("head graph output", error))?,
-                    Vec::with_capacity(if requirements.lane == ReservationLane::Head {
-                        operations.len()
-                    } else {
-                        0
-                    }),
+                    Vec::with_capacity(operations.len()),
                 )
             }
             ReservationLane::Vision => {
@@ -836,7 +857,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         let mut resources = resources;
         match &mut resources {
-            ReservedResources::Target(TargetGraphReservation { advances, .. }) => {
+            ReservedResources::Target(TargetGraphReservation::Launch(TargetLaunchReservation {
+                advances,
+                ..
+            })) => {
                 for operation in operations {
                     let request = operation.request();
                     let state = self
@@ -857,9 +881,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     }
                 }
             }
-            ReservedResources::Head(_, _, advances)
-                if requirements.lane == ReservationLane::Head =>
-            {
+            ReservedResources::Head(_, _, advances) => {
                 for operation in operations {
                     let request = operation.request();
                     let state = self
@@ -915,15 +937,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             vision_loader,
             target: BTreeMap::new(),
             head: BTreeMap::new(),
-            head_pending: BTreeMap::new(),
             input: BTreeMap::new(),
             repairs: BTreeMap::new(),
-            retained_used: Rc::new(Cell::new(0)),
             fatal: None,
             lane_identities,
             selection_read: None,
             target_timing: None,
             trace_host_steps: std::env::var_os("MAGNITUDE_TRACE_HOST_STEP").is_some(),
+            lookahead: None,
+            next_flight: 0,
+            trace_lookahead: std::env::var_os("MAGNITUDE_TRACE_LOOKAHEAD").is_some(),
         }
     }
 

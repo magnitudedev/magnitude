@@ -433,6 +433,18 @@ struct LaunchTiming {
     calibration: TimestampPair,
 }
 
+/// How often a host wait polls a command buffer's status.
+///
+/// A host blocked in `waitUntilCompleted` leaves its CPU idle for the whole
+/// command buffer, and Apple silicon then runs the GPU's memory-bound work
+/// measurably slower: on an M4 Pro, 4B decode takes 3.5% more device time
+/// than while a host thread polls at this interval (every kernel 2–4%).
+/// Polling costs about 0.8 W of CPU (about 3% more energy per decoded
+/// token) and observes completion about 20 µs sooner than the blocking
+/// wait's wake-up. Polling every 100 µs keeps only a third of the gain.
+/// Measurements: `specs/26-09-23/benchmark-results.md`, "Metal host wait".
+const WAIT_POLL: std::time::Duration = std::time::Duration::from_micros(20);
+
 /// A committed direct command buffer.
 pub struct DirectSubmission {
     device: MetalDevice,
@@ -452,13 +464,16 @@ impl DirectSubmission {
         )
     }
 
+    /// Wait for completion by polling the status every [`WAIT_POLL`].
     pub fn wait_complete(&self) {
-        self.command.waitUntilCompleted();
+        while !self.is_complete() {
+            std::thread::sleep(WAIT_POLL);
+        }
     }
 
     /// Wait and report the command buffer's outcome.
     pub fn finish(&self) -> Result<(), ExecutionError> {
-        self.command.waitUntilCompleted();
+        self.wait_complete();
         match self.command.error() {
             Some(error) => Err(ExecutionError::SubmissionFailed(
                 error.localizedDescription().to_string(),

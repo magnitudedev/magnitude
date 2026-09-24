@@ -1,7 +1,7 @@
 # Metal execution-model laboratory
 
 A working, standalone prototype of pre-native analytical GPU estimation on
-`m4-pro-02`. It is an experiment, **not a certified production profile**.
+an Apple M4 Pro. It is an experiment, **not a certified production profile**.
 
 The completed three-revision experiment and measured results are in
 [the result report](../../../../specs/26-09-21/metal-execution-model-results.md).
@@ -74,7 +74,7 @@ python3 tooling.py prepare
 clang++ -O3 -std=c++17 -dynamiclib scheduler.cpp -o results/scheduler.dylib
 ```
 
-Create an isolated remote directory with `ssh m4-pro-02 mktemp -d`. Copy
+Create an isolated directory on the measuring Mac with `mktemp -d`. Copy
 `runner.swift`, `archive.swift`, `results/helpers` and
 `results/calibration-sources` there. Compile with `swiftc -O`, then run:
 
@@ -96,7 +96,7 @@ results/venv/bin/python qualify.py freeze
 
 Freeze refuses to overwrite an existing prediction artifact. Preserve the
 entire run before starting a new model revision. Only after freezing, upload
-`results/qualification-sources` and run on the remote host:
+`results/qualification-sources` and run on the measuring Mac:
 
 ```sh
 ./runner qualification-sources all qualification --warm > qualification.jsonl
@@ -114,9 +114,8 @@ frozen source hashes, category errors and selected output checks, and generates
 the comparison plot. Its counter preparation path emits an instrumented CAS
 runner for diagnostic retry counts; these counts never calibrate the profile.
 
-The recorded remote directory for this experiment is
-`/Users/ec2-user/metal-execution-model.D0UUkW`. Earlier development campaigns
-remain there and locally; they are not held-out evidence. See the dated result
+Earlier development campaigns of the recorded experiment are not held-out
+evidence. See the dated result
 document for the final frozen artifact identity and quantitative findings.
 
 ## Boundaries and limits

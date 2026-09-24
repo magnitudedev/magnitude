@@ -6,7 +6,10 @@ impl<'a> QualificationView<'a> {
         let (Some(head_plan), Some(head)) = (self.plan.head(), self.programs.head.as_ref()) else {
             return Ok(());
         };
-        let (hidden, vocabulary) = (self.geometry.hidden, self.geometry.vocabulary);
+        let (hidden, vocabulary) = (
+            self.geometry.hidden,
+            crate::native::draft_vocabulary(self.geometry.vocabulary),
+        );
         for (index, (&binding, block)) in head_plan.blocks().iter().zip(&head.blocks).enumerate() {
             let label = format!("{binding:?}");
             let scope = magnitude_model_contracts::WeightScope::HeadBlock(
@@ -17,7 +20,8 @@ impl<'a> QualificationView<'a> {
                 magnitude_model_contracts::WeightKind::DenseGate,
                 "qwen_dense_expand",
             )?[0];
-            let tokens = semantic_zeros(device, Element::i32(), &[1], "head", &label)?;
+            // One (token, status) selection row.
+            let tokens = semantic_zeros(device, Element::i32(), &[1, 2], "head", &label)?;
             let table =
                 semantic_pattern(device, binding.embedding_table, &[1, hidden], "head", &label)?;
             let pattern = (0..hidden)
@@ -102,13 +106,13 @@ impl<'a> QualificationView<'a> {
             let output_norm = semantic_ones(device, binding.output_norm, &[hidden], "head", &label)?;
             let projected_features = block
                 .features
-                .call(qwen_features_rows::Args {
+                .call(readout_features_rows::Args {
                     hidden: &dense,
                     norm: &output_norm,
                     out_rows: &out_rows,
                     epsilon: 1.0e-5,
                 })
-                .map_err(|error| qualification_dynamic("qwen_features_rows", &label, error))?
+                .map_err(|error| qualification_dynamic("readout_features_rows", &label, error))?
                 .value;
             let projection = semantic_pattern(device, binding.projection, &[vocabulary, hidden], "head", &label)?;
             let logits = block

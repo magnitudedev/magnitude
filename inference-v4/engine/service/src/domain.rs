@@ -6,7 +6,7 @@
 
 use magnitude_model_executor::{
     Completion, DomainError, DomainRequirements, GroupKey, HeadFlight, NativeFamily, Operation,
-    ProgramFamily, ProjectFlight, ReservedResources, StateFlight, TargetFlight, VisionFlight,
+    ProgramFamily, ReservedResources, StateFlight, TargetFlight, VisionFlight,
 };
 pub use magnitude_model_executor::{DomainCheckpoint, ExecutorDomain};
 
@@ -14,7 +14,6 @@ pub use magnitude_model_executor::{DomainCheckpoint, ExecutorDomain};
 pub enum DomainLane {
     Target,
     Head,
-    Project,
     Repair,
     Encoder,
 }
@@ -24,7 +23,6 @@ impl DomainLane {
         match operation {
             Operation::Forward { .. } => Self::Target,
             Operation::Head { .. } => Self::Head,
-            Operation::Project { .. } => Self::Project,
             Operation::Repair { .. } => Self::Repair,
             Operation::Encode { .. } => Self::Encoder,
         }
@@ -90,7 +88,6 @@ pub fn group<F: ProgramFamily>(
 pub enum DomainFlight<F: ProgramFamily = NativeFamily> {
     Target(TargetFlight<F::TargetSubmission>),
     Head(HeadFlight<F::HeadSubmission>),
-    Project(ProjectFlight<F::ProjectSubmission>),
     Vision(VisionFlight<F::VisionSubmission>),
     Repair(StateFlight<F::StateSubmission>),
 }
@@ -109,19 +106,6 @@ pub fn submit_group<F: ProgramFamily>(
             domain
                 .submit_head(operations, graph_workspace, graph_output, advances)
                 .map(DomainFlight::Head)
-        }
-        (DomainLane::Project, ReservedResources::Head(graph_workspace, graph_output, advances)) => {
-            if !advances.is_empty() {
-                return Err(DomainError::Invariant(
-                    magnitude_model_executor::InvariantError {
-                        context: "reserved domain submission",
-                        detail: "projection reservation unexpectedly owns state advances".into(),
-                    },
-                ));
-            }
-            domain
-                .submit_project(operations, graph_workspace, graph_output)
-                .map(DomainFlight::Project)
         }
         (DomainLane::Repair, ReservedResources::Repair(reservation)) => {
             let [Operation::Repair { request, .. }] = operations else {
@@ -173,7 +157,6 @@ impl<F: ProgramFamily> DomainFlight<F> {
         match self {
             Self::Target(flight) => flight.completion(),
             Self::Head(flight) => flight.completion(),
-            Self::Project(flight) => flight.completion(),
             Self::Vision(flight) => flight.completion(),
             Self::Repair(flight) => flight.completion(),
         }

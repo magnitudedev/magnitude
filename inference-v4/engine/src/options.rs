@@ -9,7 +9,12 @@ use magnitude_artifacts::{Package, PackageIdentity, PackageManifest};
 use magnitude_chat::wire::MethodPolicy;
 use magnitude_generation::{Method, Mtp, Plain};
 use magnitude_model_contracts::{FeedForwardGeometry, ModelDefinition};
-use magnitude_model_executor::{platform::DeviceRequest, ExecutionPath, ResourcePlan};
+use magnitude_model_executor::{
+    platform::DeviceRequest, ExecutionPath, ResourcePlan, MAX_DRAFT_PROPOSALS,
+};
+
+/// Dense-target MTP width when none is requested.
+const DEFAULT_PROPOSALS: u8 = 3;
 use magnitude_model_state::KvCodec;
 use magnitude_service::ServiceLimits;
 use std::{path::PathBuf, sync::Arc};
@@ -54,6 +59,9 @@ pub struct ModelPolicy {
     /// absent, the measured fixed-width policy is resolved from model shape.
     pub mtp_proposals: Option<u8>,
     pub kv_codec: KvCodec,
+    /// Queue each plain decode step's successor on the device before the
+    /// step completes (cross-step pipelining).
+    pub lookahead: bool,
 }
 
 impl Default for ModelPolicy {
@@ -62,6 +70,7 @@ impl Default for ModelPolicy {
             method: ModelMethod::Auto,
             mtp_proposals: None,
             kv_codec: KvCodec::Dense,
+            lookahead: true,
         }
     }
 }
@@ -105,13 +114,24 @@ impl StoragePolicy {
 pub enum ResolvedMethod {
     Plain,
     Mtp {
-        capacity: u8,
         greedy_proposals: u8,
         sampled_proposals: u8,
     },
 }
 
 impl ResolvedMethod {
+    /// The widest draft any request may use: the head graphs are sealed for
+    /// every width up to it. Zero for plain generation.
+    pub fn proposals(self) -> usize {
+        match self {
+            Self::Plain => 0,
+            Self::Mtp {
+                greedy_proposals,
+                sampled_proposals,
+            } => usize::from(greedy_proposals.max(sampled_proposals)),
+        }
+    }
+
     pub const fn policy(self) -> MethodPolicy {
         match self {
             Self::Plain => MethodPolicy::Plain,
@@ -129,10 +149,7 @@ impl ResolvedMethod {
     pub fn factory(self, artifact_identity: &str) -> Result<Arc<dyn Method>, String> {
         match self {
             Self::Plain => Ok(Arc::new(Plain)),
-            Self::Mtp { capacity, .. } => Ok(Arc::new(Mtp::new(
-                artifact_identity,
-                usize::from(capacity),
-            )?)),
+            Self::Mtp { .. } => Ok(Arc::new(Mtp::new(artifact_identity, self.proposals())?)),
         }
     }
 }
@@ -141,6 +158,7 @@ impl ResolvedMethod {
 pub struct ResolvedModelPolicy {
     pub method: ResolvedMethod,
     pub kv_codec: KvCodec,
+    pub lookahead: bool,
 }
 
 impl ModelPolicy {
@@ -150,6 +168,7 @@ impl ModelPolicy {
         Ok(ResolvedModelPolicy {
             method,
             kv_codec: self.kv_codec,
+            lookahead: self.lookahead,
         })
     }
 }
@@ -201,7 +220,6 @@ impl ResourcePlanSummary {
             state_bytes: bytes
                 .history
                 .checked_add(bytes.recurrent_banks)
-                .and_then(|total| total.checked_add(bytes.retained_features))
                 .ok_or("state resource summary overflow")?,
             scratch_bytes: bytes.scratch,
             safety_reserve_bytes: bytes.safety_reserve,
@@ -271,13 +289,7 @@ fn resolve_method(
         }
         return Ok(ResolvedMethod::Plain);
     }
-    let head = head.ok_or("MTP was requested but the artifact has no draft head")?;
-    let capacity = head
-        .blocks
-        .len()
-        .checked_add(1)
-        .and_then(|value| u8::try_from(value).ok())
-        .ok_or("draft-head proposal capacity exceeds the supported domain")?;
+    head.ok_or("MTP was requested but the artifact has no draft head")?;
     let routed = definition
         .geometry
         .blocks
@@ -285,14 +297,15 @@ fn resolve_method(
         .any(|block| matches!(&block.feedforward, FeedForwardGeometry::Routed(_)));
     let (greedy_proposals, sampled_proposals) = match override_width {
         Some(0) => return Err("mtp_proposals must be positive".into()),
-        Some(width) if width > capacity => {
-            return Err("mtp_proposals exceeds the artifact draft-head capacity".into())
+        Some(width) if width > MAX_DRAFT_PROPOSALS => {
+            return Err(format!("mtp_proposals exceeds {MAX_DRAFT_PROPOSALS}"))
         }
         Some(width) => (width, width),
-        None => (if routed { 1 } else { capacity.min(2) }, 1),
+        // Every verify row of a routed target streams more experts.
+        None if routed => (1, 1),
+        None => (DEFAULT_PROPOSALS, DEFAULT_PROPOSALS),
     };
     Ok(ResolvedMethod::Mtp {
-        capacity,
         greedy_proposals,
         sampled_proposals,
     })
@@ -399,9 +412,8 @@ mod tests {
         assert_eq!(
             mtp.method,
             ResolvedMethod::Mtp {
-                capacity: 2,
-                greedy_proposals: 2,
-                sampled_proposals: 1,
+                greedy_proposals: DEFAULT_PROPOSALS,
+                sampled_proposals: DEFAULT_PROPOSALS,
             }
         );
     }
@@ -415,7 +427,7 @@ mod tests {
         };
         assert!(options.resolve(&definition(false)).is_err());
         assert!(options.resolve(&definition(true)).is_ok());
-        options.mtp_proposals = Some(3);
+        options.mtp_proposals = Some(MAX_DRAFT_PROPOSALS + 1);
         assert!(options.resolve(&definition(true)).is_err());
         options.method = ModelMethod::Plain;
         assert!(options.resolve(&definition(true)).is_err());

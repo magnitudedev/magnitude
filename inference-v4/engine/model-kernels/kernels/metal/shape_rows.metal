@@ -78,8 +78,35 @@ inline ulong shape_weight(float value, float maximum) {
     return w >= 1.0f ? (1ul << 32) : ulong(w * 4294967296.0f);
 }
 
-inline float fixed_float(ulong value) {
-    return float(uint(value >> 32)) + float(uint(value)) * 2.3283064365386963e-10f;
+// ceil(top_p * total) exactly: top_p = m * 2^-shift (m a 24-bit integer), so
+// the product is a 128-bit integer (high, low) shifted right with rounding
+// up. A token survives top-p when the mass before it is below this target
+// (the portable `preceding < top_p`), bit for bit as on CUDA and Vulkan.
+inline ulong shape_top_p_target(float top_p, ulong total) {
+    if (!(top_p > 0.0f) || total == 0)
+        return 0;
+    const uint bits = as_type<uint>(top_p);
+    const uint biased = bits >> 23;
+    const ulong m = biased == 0 ? ulong(bits & 0x7fffffu) : ulong((bits & 0x7fffffu) | 0x800000u);
+    const int shift = biased == 0 ? 149 : 150 - int(biased);
+    const ulong low_part = m * (total & 0xfffffffful);
+    const ulong mid = m * (total >> 32);
+    const ulong low = low_part + (mid << 32);
+    const ulong high = (mid >> 32) + (low < low_part ? 1ul : 0ul);
+    if (shift <= 0)
+        return low << uint(-shift);
+    if (shift >= 128)
+        return 1;
+    ulong quotient;
+    bool remainder;
+    if (shift >= 64) {
+        quotient = shift == 64 ? high : high >> uint(shift - 64);
+        remainder = low != 0 || (shift > 64 && (high & ((1ul << uint(shift - 64)) - 1ul)) != 0);
+    } else {
+        quotient = (low >> uint(shift)) | (high << uint(64 - shift));
+        remainder = (low & ((1ul << uint(shift)) - 1ul)) != 0;
+    }
+    return quotient + (remainder ? 1ul : 0ul);
 }
 
 // Survival of top-k and min-p (the population top-p ranks).
@@ -366,10 +393,9 @@ kernel void shape_rows_select(SHAPE_ARGUMENTS,
         ulong den = level == 0 ? total_mass
             : ((ulong(state[word_den_hi]) << 32) | ulong(state[word_den_lo]));
         ulong above = (ulong(state[word_topp_above_hi]) << 32) | ulong(state[word_topp_above_lo]);
-        float top_p = as_type<float>(state[word_top_p]);
-        float den_f = fixed_float(den);
+        const ulong target = shape_top_p_target(as_type<float>(state[word_top_p]), den);
         for (uint i = 0; i < 8; ++i) {
-            if (counts[i] != 0 && fixed_float(above + before_mass) / den_f < top_p) {
+            if (counts[i] != 0 && above + before_mass < target) {
                 uint b = shape_buckets - 1u - (8u * thread_index + i);
                 atomic_fetch_min_explicit(&chosen, b, memory_order_relaxed);
             }
@@ -420,12 +446,14 @@ kernel void shape_rows_select(SHAPE_ARGUMENTS,
                 state[word_topp_key] = shape_lower_bound(prefix, b, level);
                 uint keep = keep_all;
                 if (level == 2 && chosen_count > 1) {
-                    float w = fixed_float(shape_weight(shape_value(shape_lower_bound(prefix, b, level)),
-                        as_type<float>(state[word_max])));
-                    float needed = (as_type<float>(state[word_top_p]) * fixed_float(den)
-                        - fixed_float(reached)) / w;
-                    uint n = uint(metal::clamp(metal::ceil(needed), 1.0f, float(chosen_count)));
-                    keep = n >= chosen_count ? keep_all : n;
+                    // Ties in ascending token order: the first whose
+                    // inclusive mass reaches the target is the last kept
+                    // (reached < target, as the bucket was chosen).
+                    const ulong w = shape_weight(shape_value(shape_lower_bound(prefix, b, level)),
+                        as_type<float>(state[word_max]));
+                    const ulong target = shape_top_p_target(as_type<float>(state[word_top_p]), den);
+                    const ulong n = w == 0 ? ulong(chosen_count) : (target - reached + w - 1ul) / w;
+                    keep = n >= chosen_count ? keep_all : uint(max(n, 1ul));
                 }
                 state[word_topp_keep] = keep;
                 flags_now |= flag_topp_done;

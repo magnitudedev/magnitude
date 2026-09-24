@@ -25,3 +25,8 @@ pinned-tuning = []
 # the search. Enabled only through `magnitude-engine`'s `tuning-survey`
 # feature by `forward_bench`; never by a served engine.
 tuning-survey = []
+
+# Development-only: replays the tuning search against survey records.
+[[example]]
+name = "tuning_replay"
+required-features = ["tuning-survey"]

@@ -164,6 +164,9 @@ pub(super) struct Arena {
     sorts: Vec<Sort>,
     /// Every side condition beneath the node is trivially true (conservative).
     total: Vec<bool>,
+    /// Total by its operations alone, without the facts a short-circuit
+    /// guard establishes (a subset of `total`).
+    unguarded_total: Vec<bool>,
     /// Free symbols beneath the node, sorted; fold binders are bound.
     free: Vec<Vec<SymbolId>>,
     interned: HashMap<Node, u32>,
@@ -198,6 +201,7 @@ impl Arena {
             nodes: Vec::new(),
             sorts: Vec::new(),
             total: Vec::new(),
+            unguarded_total: Vec::new(),
             free: Vec::new(),
             interned: HashMap::new(),
             roots: Vec::new(),
@@ -297,13 +301,15 @@ impl Arena {
         if let Some(&i) = self.interned.get(&node) {
             return i;
         }
-        let total = self.node_total(&node);
+        let unguarded_total = self.node_total(&node, &self.unguarded_total);
+        let total = unguarded_total || self.node_total(&node, &self.total) || self.guarded_total(&node);
         let free = self.node_free(&node);
         let i = u32::try_from(self.nodes.len())
             .unwrap_or_else(|_| panic!("ExprArena node identity space exhausted"));
         self.nodes.push(node.clone());
         self.sorts.push(sort);
         self.total.push(total);
+        self.unguarded_total.push(unguarded_total);
         self.free.push(free);
         self.interned.insert(node, i);
         i
@@ -345,7 +351,10 @@ impl Arena {
         }
     }
 
-    fn node_total(&self, node: &Node) -> bool {
+    /// Totality of `node` from its own operation and its children's recorded
+    /// totality (`table`: `total` or `unguarded_total`).
+    fn node_total(&self, node: &Node, table: &[bool]) -> bool {
+        let child_total = |child: AnyExpr| table[self.index(child) as usize];
         if let Node::Unary {
             op: UnaryOp::ScalarIntegerDefined,
             operand,
@@ -355,11 +364,11 @@ impl Arena {
             // placeholder. Its operands must still themselves be defined.
             return Self::children(self.node(self.index(*operand)))
                 .into_iter()
-                .all(|child| self.is_total(self.index(child)));
+                .all(child_total);
         }
         let children_total = Self::children(node)
             .into_iter()
-            .all(|c| self.is_total(self.index(c)));
+            .all(child_total);
         if !children_total {
             return false;
         }
@@ -378,7 +387,15 @@ impl Arena {
                 ..
             } => false,
             Node::Binary { op, lhs, rhs } => match op {
-                BinaryOp::Sub => self.sort(self.index(*lhs)) == Sort::Int,
+                // Natural subtraction is exact when the minuend's structural
+                // lower bound reaches the subtrahend's upper bound
+                // (`max(x, 1) - 1`).
+                BinaryOp::Sub => {
+                    self.sort(self.index(*lhs)) == Sort::Int
+                        || matches!((lhs, rhs), (AnyExpr::Nat(minuend), AnyExpr::Nat(subtrahend))
+                            if self.nat_constant_upper(*subtrahend)
+                                .is_some_and(|upper| self.nat_constant_lower(*minuend) >= upper))
+                }
                 BinaryOp::Div | BinaryOp::CeilDiv | BinaryOp::Rem | BinaryOp::AlignUp => {
                     self.nonzero_const(self.index(*rhs))
                 }
@@ -388,6 +405,109 @@ impl Arena {
                 .iter()
                 .all(|term| term.denominator != 0 && term.lower_numerator <= term.upper_numerator),
             _ => true,
+        }
+    }
+
+    /// A short-circuit connective evaluates its right operand only under its
+    /// guard (`a` for `and`/`implies`, `not a` for `or`). With a total left
+    /// operand whose guard establishes every side condition of the right
+    /// operand, evaluation cannot fail.
+    fn guarded_total(&mut self, node: &Node) -> bool {
+        let Node::Binary { op, lhs: AnyExpr::Bool(a), rhs: AnyExpr::Bool(b) } = *node else {
+            return false;
+        };
+        if !matches!(op, BinaryOp::And | BinaryOp::Implies | BinaryOp::Or) || !self.expr_total(a) {
+            return false;
+        }
+        let guard = if op == BinaryOp::Or { self.not(a) } else { a };
+        let mut facts = Vec::new();
+        self.conjuncts(guard, &mut facts);
+        self.defined_under(&mut facts, self.expr_index(b))
+    }
+
+    fn conjuncts(&self, predicate: BoolExpr, out: &mut Vec<BoolExpr>) {
+        match *self.node(self.expr_index(predicate)) {
+            Node::Binary { op: BinaryOp::And, lhs: AnyExpr::Bool(lhs), rhs: AnyExpr::Bool(rhs) } => {
+                self.conjuncts(lhs, out);
+                self.conjuncts(rhs, out);
+            }
+            _ => out.push(predicate),
+        }
+    }
+
+    /// Whether evaluation of `i` cannot fail wherever every fact holds. Each
+    /// partial operation's own condition (the one `side_conditions` records)
+    /// must be a fact; short-circuit operands see their guard as a fact.
+    fn defined_under(&mut self, facts: &mut Vec<BoolExpr>, i: u32) -> bool {
+        if self.is_total(i) {
+            return true;
+        }
+        let holds = |arena: &Self, facts: &[BoolExpr], condition: BoolExpr| {
+            arena.bool_of(condition) == Some(true)
+                || facts.contains(&condition)
+                || facts.iter().any(|fact| arena.nat_upper_bound_dominates(*fact, condition, facts))
+        };
+        match self.node(i).clone() {
+            Node::Binary { op: op @ (BinaryOp::And | BinaryOp::Implies | BinaryOp::Or), lhs: AnyExpr::Bool(a), rhs: AnyExpr::Bool(b) } => {
+                if !self.defined_under(facts, self.expr_index(a)) {
+                    return false;
+                }
+                let guard = if op == BinaryOp::Or { self.not(a) } else { a };
+                let before = facts.len();
+                self.conjuncts(guard, facts);
+                let defined = self.defined_under(facts, self.expr_index(b));
+                facts.truncate(before);
+                defined
+            }
+            Node::Select { cond, then, otherwise } => {
+                if !self.defined_under(facts, self.expr_index(cond)) {
+                    return false;
+                }
+                let before = facts.len();
+                self.conjuncts(cond, facts);
+                let then = self.defined_under(facts, self.index(then));
+                facts.truncate(before);
+                let not_cond = self.not(cond);
+                self.conjuncts(not_cond, facts);
+                let otherwise = self.defined_under(facts, self.index(otherwise));
+                facts.truncate(before);
+                then && otherwise
+            }
+            Node::Unary { op: UnaryOp::NatFromInt, operand: AnyExpr::Int(value) } => {
+                if !self.defined_under(facts, self.expr_index(value)) {
+                    return false;
+                }
+                let zero = self.int_const(0);
+                let condition = self.int_cmp(CmpOp::Ge, value, zero);
+                holds(self, facts, condition)
+            }
+            Node::Binary { op: BinaryOp::Sub, lhs: AnyExpr::Nat(a), rhs: AnyExpr::Nat(b) } => {
+                if !self.defined_under(facts, self.expr_index(a)) || !self.defined_under(facts, self.expr_index(b)) {
+                    return false;
+                }
+                let condition = self.nat_cmp(CmpOp::Le, b, a);
+                holds(self, facts, condition)
+            }
+            node @ (Node::Unary { op: UnaryOp::ScalarIntegerDefined, .. } | Node::ScalarInteger { .. }
+            | Node::Fold { .. } | Node::Duration(_)) => {
+                let _ = node;
+                false
+            }
+            node => {
+                // Every other operation is total over defined operands
+                // unless `node_total` names a condition (a non-constant
+                // divisor); those stay undecided here.
+                let children = Self::children(&node);
+                if !children.into_iter().all(|child| { let child = self.index(child); self.defined_under(facts, child) }) {
+                    return false;
+                }
+                match node {
+                    Node::Binary { op: BinaryOp::Div | BinaryOp::CeilDiv | BinaryOp::Rem | BinaryOp::AlignUp, rhs, .. } => {
+                        self.nonzero_const(self.index(rhs))
+                    }
+                    _ => true,
+                }
+            }
         }
     }
 
@@ -866,7 +986,7 @@ impl Arena {
                 _ => (),
             }
         }
-        handle(
+        let fold: NatExpr = handle(
             self.id,
             self.intern(
                 Node::Fold {
@@ -878,7 +998,16 @@ impl Arena {
                 },
                 Sort::Nat,
             ),
-        )
+        );
+        // A closed fold is a constant. Every evaluation of it (a guard at
+        // each invocation) computes the same value, so compute it once here;
+        // a failing fold keeps its node and its failure.
+        if self.free[self.expr_index(fold) as usize].is_empty() {
+            if let Ok(value) = self.eval_nat(fold, &Assignment::new()) {
+                return self.nat_exact(value);
+            }
+        }
+        fold
     }
     // Preserve natural shape arithmetic through the signed source-expression
     // layer. Only operations on independently nonnegative operands qualify;
@@ -1202,6 +1331,10 @@ impl Arena {
         if a == b {
             return a;
         }
+        let guarded = self.under_guard(a, b);
+        if guarded != b {
+            return self.and(a, guarded);
+        }
         self.bool_binary(BinaryOp::And, a, b)
     }
     /// `a or b`, short-circuit: `b` is evaluated only when `a` fails.
@@ -1261,7 +1394,87 @@ impl Arena {
         if self.expr_total(a) && self.conjunction_contains(a, b) {
             return self.bool_const(true);
         }
+        let guarded = self.under_guard(a, b);
+        if guarded != b {
+            return self.implies(a, guarded);
+        }
         self.bool_binary(BinaryOp::Implies, a, b)
+    }
+
+    /// `b` evaluated only where `guard` holds. When a total guard
+    /// establishes every side condition of `b`, `b` is defined there and
+    /// simplifies exactly as a total predicate would.
+    fn under_guard(&mut self, guard: BoolExpr, b: BoolExpr) -> BoolExpr {
+        if !self.expr_total(guard) || self.unguarded_total[self.expr_index(b) as usize] {
+            return b;
+        }
+        let mut facts = Vec::new();
+        self.conjuncts(guard, &mut facts);
+        if self.defined_under(&mut facts, self.expr_index(b)) {
+            self.assume_defined(&mut facts, b)
+        } else {
+            b
+        }
+    }
+
+    /// Re-simplify a predicate whose evaluation cannot fail where `facts`
+    /// hold: a fact is true there, and the folds that otherwise need total
+    /// operands apply.
+    fn assume_defined(&mut self, facts: &mut Vec<BoolExpr>, predicate: BoolExpr) -> BoolExpr {
+        if facts.contains(&predicate) {
+            return self.bool_const(true);
+        }
+        match self.node(self.expr_index(predicate)).clone() {
+            Node::Cmp { op, lhs: AnyExpr::Nat(x), rhs: AnyExpr::Nat(y) } => {
+                if x == y {
+                    return self.bool_const(reflexive(op));
+                }
+                if let (Some(upper), Some(rhs)) = (self.nat_constant_upper(x), self.nat_of(y)) {
+                    match op {
+                        CmpOp::Le if upper <= rhs => return self.bool_const(true),
+                        CmpOp::Lt if upper < rhs => return self.bool_const(true),
+                        CmpOp::Gt if upper <= rhs => return self.bool_const(false),
+                        CmpOp::Ge if upper < rhs => return self.bool_const(false),
+                        _ => {}
+                    }
+                }
+                if let Some(lhs) = self.nat_of(x) {
+                    let lower = self.nat_constant_lower(y);
+                    match op {
+                        CmpOp::Le if lhs <= lower => return self.bool_const(true),
+                        CmpOp::Lt if lhs < lower => return self.bool_const(true),
+                        CmpOp::Gt if lhs <= lower => return self.bool_const(false),
+                        CmpOp::Ge if lhs < lower => return self.bool_const(false),
+                        _ => {}
+                    }
+                }
+                predicate
+            }
+            Node::Cmp { op, lhs: AnyExpr::Int(x), rhs: AnyExpr::Int(y) } if x == y => self.bool_const(reflexive(op)),
+            Node::Binary { op: op @ (BinaryOp::And | BinaryOp::Implies | BinaryOp::Or), lhs: AnyExpr::Bool(x), rhs: AnyExpr::Bool(y) } => {
+                // The right operand is evaluated only under its guard.
+                let guard = if op == BinaryOp::Or { self.not(x) } else { x };
+                let before = facts.len();
+                self.conjuncts(guard, facts);
+                let y = self.assume_defined(facts, y);
+                facts.truncate(before);
+                let x = self.assume_defined(facts, x);
+                match op {
+                    BinaryOp::And => self.and(x, y),
+                    BinaryOp::Implies if self.bool_of(y) == Some(true) => y,
+                    BinaryOp::Implies => self.implies(x, y),
+                    _ if self.bool_of(x) == Some(true) || self.bool_of(y) == Some(true) => {
+                        self.bool_const(true)
+                    }
+                    _ => self.or(x, y),
+                }
+            }
+            Node::Unary { op: UnaryOp::Not, operand: AnyExpr::Bool(x) } => {
+                let x = self.assume_defined(facts, x);
+                self.not(x)
+            }
+            _ => predicate,
+        }
     }
 
     pub(super) fn entails(&self, antecedent: BoolExpr, consequent: BoolExpr) -> bool {
@@ -1535,6 +1748,18 @@ impl Arena {
                 }
             }
         }
+        if self.expr_total(b) {
+            if let Some(lhs) = self.nat_of(a) {
+                let lower = self.nat_constant_lower(b);
+                match op {
+                    CmpOp::Le if lhs <= lower => return self.bool_const(true),
+                    CmpOp::Lt if lhs < lower => return self.bool_const(true),
+                    CmpOp::Gt if lhs <= lower => return self.bool_const(false),
+                    CmpOp::Ge if lhs < lower => return self.bool_const(false),
+                    _ => {}
+                }
+            }
+        }
         self.cmp_node(op, AnyExpr::Nat(a), AnyExpr::Nat(b))
     }
     /// A conservative constant upper bound from total expression structure.
@@ -1572,6 +1797,27 @@ impl Arena {
                     .max(self.nat_constant_upper(*b)?),
             ),
             _ => None,
+        }
+    }
+
+    /// A conservative constant lower bound from total expression structure.
+    fn nat_constant_lower(&self, expression: NatExpr) -> u64 {
+        match self.node(self.expr_index(expression)) {
+            Node::NatConst(value) => *value,
+            Node::Binary { op, lhs: AnyExpr::Nat(a), rhs: AnyExpr::Nat(b) } => {
+                let (a, b) = (self.nat_constant_lower(*a), self.nat_constant_lower(*b));
+                match op {
+                    BinaryOp::Max => a.max(b),
+                    BinaryOp::Min => a.min(b),
+                    BinaryOp::Add => a.saturating_add(b),
+                    BinaryOp::Mul => a.saturating_mul(b),
+                    _ => 0,
+                }
+            }
+            Node::Select { then: AnyExpr::Nat(a), otherwise: AnyExpr::Nat(b), .. } => {
+                self.nat_constant_lower(*a).min(self.nat_constant_lower(*b))
+            }
+            _ => 0,
         }
     }
 
@@ -2778,6 +3024,27 @@ impl Arena {
             self.id,
             self.partial_of(node, a, &HashMap::new(), &mut shadow, &mut memo),
         )
+    }
+
+    pub(super) fn substitute_nat<Sort>(
+        &mut self,
+        node: Expr<Sort>,
+        values: &[(SymbolId, NatExpr)],
+    ) -> Expr<Sort> {
+        let mut expressions = HashMap::new();
+        for (symbol, value) in values {
+            assert_eq!(self.record(*symbol).sort, SymbolSort::Nat, "natural substitution of a non-natural symbol");
+            expressions.insert(*symbol, self.expr_index(*value));
+        }
+        let node = self.expr_index(node);
+        let result = self.partial_of(
+            node,
+            &PartialAssignment::new(),
+            &expressions,
+            &mut Vec::new(),
+            &mut HashMap::new(),
+        );
+        self.h(result)
     }
 
     pub(super) fn resolve_runtime_values<Sort>(

@@ -649,6 +649,16 @@ impl ExprArena {
         self.inner.resolve_runtime_values(node, values)
     }
 
+    /// Replaces natural symbols by expressions that equal them where `node`
+    /// is evaluated (for example a product slot proved equal to its source).
+    pub fn substitute_nat<Sort>(
+        &mut self,
+        node: Expr<Sort>,
+        values: &[(SymbolId, NatExpr)],
+    ) -> Expr<Sort> {
+        self.inner.substitute_nat(node, values)
+    }
+
     /// The `NatExpr` counterpart of [`ExprArena::resolve_runtime_values`].
     pub fn resolve_runtime_nat(
         &mut self,

@@ -209,6 +209,11 @@ pub enum PackError {
         row: usize,
         demand: Demand,
     },
+    /// A head slot whose proposal or chained row count differs from the
+    /// batch's step count.
+    HeadSteps {
+        slot: usize,
+    },
     EmptyVocabulary,
 }
 
@@ -265,6 +270,10 @@ impl fmt::Display for PackError {
                 f,
                 "head row {row} has incompatible demand bits {}",
                 demand.bits()
+            ),
+            Self::HeadSteps { slot } => write!(
+                f,
+                "head slot {slot} has a proposal or chained row count other than the batch's steps"
             ),
             Self::EmptyVocabulary => f.write_str("vocabulary must contain at least one token"),
         }

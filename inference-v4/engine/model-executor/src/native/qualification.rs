@@ -14,6 +14,7 @@ pub(super) struct QualificationView<'a> {
     programs: &'a AttestedPrograms,
     plan: &'a ProgramPlan,
     geometry: &'a magnitude_model_contracts::DecoderGeometry,
+    vision: Option<&'a magnitude_model_contracts::VisionGeometry>,
     load: &'a crate::ModelLoadPlan,
 }
 
@@ -22,12 +23,14 @@ impl<'a> QualificationView<'a> {
         programs: &'a AttestedPrograms,
         plan: &'a ProgramPlan,
         geometry: &'a magnitude_model_contracts::DecoderGeometry,
+        vision: Option<&'a magnitude_model_contracts::VisionGeometry>,
         load: &'a crate::ModelLoadPlan,
     ) -> Self {
         Self {
             programs,
             plan,
             geometry,
+            vision,
             load,
         }
     }

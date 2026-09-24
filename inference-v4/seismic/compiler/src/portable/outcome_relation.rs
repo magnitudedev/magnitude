@@ -99,7 +99,8 @@ impl Analysis<'_> {
             ),
             Bound::Unit => Value::Unit,
             Bound::Tensor(TensorRealization::Stored(value)) => {
-                self.external.insert(value.root);
+                let root = self.storage_root(value.root)?;
+                self.external.insert(root);
                 Value::Tensor(*value.view.direct_backing().ok_or("mapped input relation is unfinished")?)
             }
             Bound::Tensor(TensorRealization::Computed(_)) => {
@@ -279,15 +280,7 @@ impl Analysis<'_> {
                     };
                     let coordinates = indices
                         .iter()
-                        .map(|index| {
-                            let value = values[index].scalar()?;
-                            let dtype = match function.value(*index).ty {
-                                SemanticType::Scalar(dtype) => dtype,
-                                SemanticType::Index { .. } => DType::U32,
-                                _ => return Err("source index kind"),
-                            };
-                            self.terms.natural(value, dtype)
-                        })
+                        .map(|index| self.source_coordinate(function, values, *index))
                         .collect::<Result<Vec<_>>>()?;
                     let value = self.source_tensor_read(*view, &coordinates, state)?;
                     values.insert(output, Value::Scalar(value));
@@ -304,24 +297,41 @@ impl Analysis<'_> {
                     let view = *view;
                     let coordinates = indices
                         .iter()
-                        .map(|index| {
-                            let value = values[index].scalar()?;
-                            let dtype = match function.value(*index).ty {
-                                SemanticType::Scalar(dtype) => dtype,
-                                SemanticType::Index { .. } => DType::U32,
-                                _ => return Err("source index kind"),
-                            };
-                            self.terms.natural(value, dtype)
-                        })
+                        .map(|index| self.source_coordinate(function, values, *index))
                         .collect::<Result<Vec<_>>>()?;
                     let place = self.place(view, &coordinates, state)?;
                     self.write(state, place, values[&value].scalar()?);
                     values.insert(output, Value::Tensor(view));
                 }
-                SemanticNodeView::Loop { kind, start, end, captures, body, carries, .. } => {
-                    if kind != seismic_lang::entry::LoopKind::Ordered {
-                        return Err("parallel map coverage relation is unfinished");
+                SemanticNodeView::Loop { kind, start, end, captures, body, carries, .. }
+                    if kind == seismic_lang::entry::LoopKind::Parallel =>
+                {
+                    if !carries.is_empty() {
+                        return Err("checked parallel loops carry no products");
                     }
+                    let start = self.source_index(function, start, values)?;
+                    let end = self.source_index(function, end, values)?;
+                    let extent = match (&self.terms.nodes[start.0], &self.terms.nodes[end.0]) {
+                        (Node::Natural(0), _) => end,
+                        (Node::Natural(a), Node::Natural(b)) => self.terms.node(Node::Natural(b.saturating_sub(*a))),
+                        _ => return Err("offset parallel map relation is unfinished"),
+                    };
+                    let body_region = function.region(body);
+                    let (binder, parameters) = body_region.parameters().split_first().ok_or("source loop binder unavailable")?;
+                    if parameters.len() != captures.len() { return Err("source loop capture arity differs"); }
+                    let mut iteration = values.clone();
+                    for (parameter, capture) in parameters.iter().zip(captures) {
+                        iteration.insert(*parameter, values.get(capture).cloned().ok_or("source loop capture unavailable")?);
+                    }
+                    let binder = *binder;
+                    self.map_visit(state, extent, &mut |analysis, visit, lane| {
+                        let index = analysis.terms.natural_binary(false, start, visit);
+                        let mut iteration = iteration.clone();
+                        iteration.insert(binder, Value::Scalar(index));
+                        analysis.source_region(program, function, body, &mut iteration, lane)
+                    })?;
+                }
+                SemanticNodeView::Loop { start, end, captures, body, carries, .. } => {
                     let start = self.source_index(function, start, values)?;
                     let end = self.source_index(function, end, values)?;
                     let depth = self.loop_depth;
@@ -376,6 +386,17 @@ impl Analysis<'_> {
             }
         }
         Ok(())
+    }
+
+    /// One checked element coordinate as a natural term.
+    fn source_coordinate(&mut self, function: &SemanticFunction, values: &HashMap<SemanticValueId, Value>, index: SemanticValueId) -> Result<Term> {
+        let value = values.get(&index).ok_or("source coordinate unavailable")?.scalar()?;
+        match function.value(index).ty {
+            SemanticType::Scalar(dtype) => self.terms.natural(value, dtype),
+            SemanticType::Index { .. } => self.terms.natural(value, DType::U32),
+            SemanticType::Integer => self.terms.exact_natural(value),
+            _ => Err("source index kind"),
+        }
     }
 
     fn source_index(&mut self, function: &SemanticFunction, value: SemanticValueId, values: &HashMap<SemanticValueId, Value>) -> Result<Term> {
@@ -468,14 +489,7 @@ pub(crate) fn derive<B: seismic_target::TargetFamily>(
     bindings: &BindingArena,
     executable: &seismic_ir::execution::ClosedExecutableIr<B>,
 ) -> DerivedOutcome {
-    let mut analysis = Analysis {
-        terms: Terms::default(),
-        expressions: arena,
-        inputs: HashMap::new(),
-        storage: executable.storage(),
-        external: Default::default(),
-        loop_depth:0,
-    };
+    let mut analysis = Analysis::new(arena, executable.storage(), executable.schedule().steps());
     let result = (|| -> Result<DerivedOutcome> {
         let family = program
             .families()
@@ -512,11 +526,16 @@ pub(crate) fn derive<B: seismic_target::TargetFamily>(
         let mut floating_difference = false;
         let mut successful = Vec::new();
         for effect in source.effects.iter().chain(&physical.effects) {
-            let value = match effect { Effect::Write(place,value) => {
-                if analysis.terms.contains_opaque(place.byte) { return Err("opaque observed write address"); }
-                *value
-            }, Effect::Failure(value,_) => *value };
-            if analysis.terms.contains_opaque(value) { return Err("opaque observed state or failure value"); }
+            let observed = match effect {
+                Effect::Write(place, value) => vec![(Some(place), *value)],
+                Effect::Failure(value, _) => vec![(None, *value)],
+                Effect::Map { extent, writes } => std::iter::once((None, *extent))
+                    .chain(writes.iter().map(|(place, value)| (Some(place), *value))).collect(),
+            };
+            for (place, value) in observed {
+                if place.is_some_and(|place| analysis.terms.contains_opaque(place.byte)) { return Err("opaque observed write address"); }
+                if analysis.terms.contains_opaque(value) { return Err("opaque observed state or failure value"); }
+            }
         }
         if source.effects.len() != physical.effects.len() {
             return Err("ordered observable effects differ from reference");
@@ -532,6 +551,21 @@ pub(crate) fn derive<B: seismic_target::TargetFamily>(
                 {
                     successful.push((*expected, false));
                     successful.push((*actual, false));
+                }
+                (Effect::Map { extent: expected_extent, writes: expected }, Effect::Map { extent: actual_extent, writes: actual })
+                    if expected_extent == actual_extent && expected.len() == actual.len()
+                        && expected.iter().zip(actual).all(|((a, _), (b, _))| a == b) =>
+                {
+                    for ((place, expected_value), (_, actual_value)) in expected.iter().zip(actual) {
+                        if analysis.terms.under(*expected_value, &successful)
+                            != analysis.terms.under(*actual_value, &successful)
+                        {
+                            if !matches!(place.dtype, DType::F16 | DType::BF16 | DType::F32) {
+                                return Err("discrete writable-state equality is not established");
+                            }
+                            floating_difference = true;
+                        }
+                    }
                 }
                 (Effect::Write(expected, expected_value), Effect::Write(actual, actual_value))
                     if expected == actual =>
@@ -613,6 +647,11 @@ mod tests {
     use seismic_lang::checked::{check_source, SourceFile, SourceSet};
 
     fn analyze(source: &str, authored: bool) -> DerivedOutcome {
+        analyze_mapped(source, authored.then_some(BodyMapping::Authored))
+    }
+
+    /// The universal member, or the root body constructed with `mapping`.
+    fn analyze_mapped(source: &str, mapping: Option<BodyMapping>) -> DerivedOutcome {
         let module = check_source(SourceSet::new(vec![SourceFile {
             path: "outcome-relation.seismic".into(),
             text: source.into(),
@@ -630,11 +669,11 @@ mod tests {
             &seismic_lang::precision::PrecisionPolicy::Exact,
         )
         .unwrap();
-        if authored {
+        if let Some(mapping) = mapping {
             let selected = domain
                 .root_selections()
                 .into_iter()
-                .find(|selected| selected.mapping == BodyMapping::Authored)
+                .find(|selected| selected.mapping == mapping)
                 .unwrap();
             let state = domain
                 .advance(
@@ -648,7 +687,7 @@ mod tests {
             assert!(matches!(state, Materialization::Ready(_)), "{state:?}");
         }
         let parts = domain.into_parts();
-        let candidate = if authored {
+        let candidate = if mapping.is_some() {
             &parts.materialized.as_slice().last().unwrap().family
         } else {
             &parts.materialized.first().family
@@ -666,6 +705,21 @@ mod tests {
             &candidate.bindings().arena,
             candidate.executable(),
         )
+    }
+
+    #[test]
+    fn independent_participants_relate_to_the_parallel_map_visits() {
+        let map = "fn probe(input: &tensor[4] f32, out: &mut tensor[4] f32):\n    parallel for i in 0..4:\n        out[i] = input[i] + 1.0\n";
+        assert_eq!(analyze_mapped(map, Some(BodyMapping::Independent)), DerivedOutcome::Exact);
+        assert_eq!(analyze_mapped(map, None), DerivedOutcome::Exact);
+        let symbolic = "fn probe[N](input: &tensor[N] f32, out: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        out[i] = input[i] * 2.0\n";
+        assert_eq!(analyze_mapped(symbolic, Some(BodyMapping::Independent)), DerivedOutcome::Exact);
+        // A later read of mapped storage stays unfinished, and so does a
+        // different authored participant map.
+        let later = "fn probe(input: &tensor[4] f32, out: &mut tensor[4] f32) -> f32:\n    parallel for i in 0..4:\n        out[i] = input[i]\n    return out[0]\n";
+        assert!(matches!(analyze_mapped(later, Some(BodyMapping::Independent)), DerivedOutcome::Pending(_)));
+        let authored = format!("{map}\nlower probe(input: &tensor[4] f32, out: &mut tensor[4] f32) for cpu:\n    parallel for i in 0..4:\n        out[i] = input[i] + 2.0\n");
+        assert_ne!(analyze_mapped(&authored, Some(BodyMapping::Authored)), DerivedOutcome::Exact);
     }
 
     #[test]

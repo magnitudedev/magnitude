@@ -134,7 +134,7 @@ impl<'f, 'b, B: seismic_target::TargetFamily> Lowerer<'f, 'b, B> {
         outputs: &[SemanticValueId], then_region: RegionId, else_region: RegionId,
     ) -> construction::IfConstruction {
         let condition_bound = self.bound(condition_value);
-        let condition = condition_expr(self.builder.arena(), &condition_bound);
+        let condition = condition_expr(self.builder.arena(), &self.values.host_conditions, &condition_bound);
         let captures = capture_values.iter().map(|value| self.values.handle(*value)).collect::<Vec<_>>();
         let parent = self.values.clone();
         let schedule = self.builder.begin_source_branch(condition);
@@ -215,7 +215,7 @@ impl<'f, 'b, B: seismic_target::TargetFamily> Lowerer<'f, 'b, B> {
         }
     }
 
-    pub(super) fn begin_loop(&mut self,start_value:SemanticValueId,end_value:SemanticValueId,capture_values:&[SemanticValueId],body:RegionId,carries:&[seismic_lang::entry::Carry])->LoopConstruction {
+    pub(super) fn begin_loop(&mut self,start_value:SemanticValueId,end_value:SemanticValueId,capture_values:&[SemanticValueId],body:RegionId,carries:&[seismic_lang::entry::Carry],visits:seismic_ir::schedule::RepeatVisits)->LoopConstruction {
         let start_bound=self.bound(start_value);
         let end_bound=self.bound(end_value);
         let start=index_expr(self.builder.arena(),&start_bound);
@@ -226,7 +226,7 @@ impl<'f, 'b, B: seismic_target::TargetFamily> Lowerer<'f, 'b, B> {
         let initial=self.realize_region_product(initial,&initial_type);
         let operands=self.region_operand_product(&initial);
         let parent=self.values.clone();
-        let schedule=self.builder.begin_value_repeat(start,end,operands);
+        let schedule=self.builder.begin_value_repeat(start,end,visits,operands);
         let binding=schedule.binding();
         self.values.binders.push(binding.symbol);
         self.bind_region_parameters(body,&captures);
@@ -246,8 +246,65 @@ impl<'f, 'b, B: seismic_target::TargetFamily> Lowerer<'f, 'b, B> {
         LoopConstruction{schedule,parent,initial,start,end,carries:carries.to_vec()}
     }
 
+    /// A value transported by a region product (a loop backedge). A value
+    /// still selected by an enclosed branch joins its arms: every arm was
+    /// forwarded into that branch's one destination, so the product is that
+    /// destination with the contents both arms guarantee.
+    fn transported(&mut self, value: SemanticValueId) -> Bound {
+        let mut values = self.builder.bindings().possible_values(self.values.handle(value), &self.values.selections);
+        if values.len() == 1 { return values.pop().expect("one possible value"); }
+        self.joined(values)
+    }
+
+    fn joined(&mut self, values: Vec<Bound>) -> Bound {
+        match &values[0] {
+            Bound::Tensor(TensorRealization::Stored(first)) => {
+                let view = *first.view.direct_backing().expect("a branch product is its destination view");
+                let layout = self.builder.portable_layout(view).clone();
+                let axes = layout.extents.iter().map(|axis| self.builder.arena().int_from_nat(*axis)).collect::<Vec<_>>();
+                let mut context = InitializationContext::new(self.builder.arena());
+                let mut state = None;
+                for value in &values {
+                    let Bound::Tensor(TensorRealization::Stored(arm)) = value else { panic!("joined tensor arms differ in kind") };
+                    assert!(arm.view.direct_backing() == Some(&view), "joined tensor arms have one destination");
+                    let arm = context.project(self.values.contents.state(arm), &arm.initialized_view);
+                    state = Some(match state { None => arm, Some(state) => arm.intersection(&state) });
+                }
+                let state = state.expect("a join has arms");
+                Bound::stored(self.values.contents.root(&mut context, layout.base, StoredView::new(view, layout.extents.clone()), &axes, state))
+            }
+            Bound::Tuple(first) => {
+                let arity = first.len();
+                let mut columns = vec![Vec::new(); arity];
+                for value in values {
+                    let Bound::Tuple(items) = value else { panic!("joined tuple arms differ in kind") };
+                    assert_eq!(items.len(), arity, "joined tuple arms differ in arity");
+                    for (column, item) in columns.iter_mut().zip(items) { column.push(item); }
+                }
+                Bound::Tuple(columns.into_iter().map(|column| self.joined(column)).collect())
+            }
+            Bound::Range { .. } => {
+                let (mut starts, mut ends) = (Vec::new(), Vec::new());
+                for value in values {
+                    let Bound::Range { start, end } = value else { panic!("joined range arms differ in kind") };
+                    starts.push(*start);
+                    ends.push(*end);
+                }
+                Bound::Range { start: Box::new(self.joined(starts)), end: Box::new(self.joined(ends)) }
+            }
+            Bound::Scalar(first) => {
+                let first = *first;
+                assert!(values.iter().all(|value| matches!(value, Bound::Scalar(arm) if *arm == first)),
+                    "joined scalar arms were forwarded into one destination");
+                Bound::Scalar(first)
+            }
+            Bound::Unit => Bound::Unit,
+            Bound::Tensor(TensorRealization::Computed(_)) => panic!("a branch product is realized before its join"),
+        }
+    }
+
     pub(super) fn finish_loop(&mut self,ticket:LoopConstruction) {
-        let yielded=Bound::Tuple(ticket.carries.iter().map(|carry|self.bound(carry.yielded)).collect());
+        let yielded=Bound::Tuple(ticket.carries.iter().map(|carry|self.transported(carry.yielded)).collect());
         let yielded_type=SemanticType::Tuple(ticket.carries.iter().map(|carry|self.function.value(carry.yielded).ty.clone()).collect());
         let yielded=self.realize_region_product(yielded,&yielded_type);
         let backedge=self.region_operand_product(&yielded);

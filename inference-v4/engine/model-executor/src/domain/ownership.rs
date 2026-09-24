@@ -8,6 +8,15 @@ pub struct OpenRequirements {
     head_banks: usize,
 }
 
+impl OpenRequirements {
+    pub fn target_banks(self) -> usize {
+        self.target_banks
+    }
+    pub fn head_banks(self) -> usize {
+        self.head_banks
+    }
+}
+
 pub struct OpenReservation {
     request: RequestId,
     target: SequenceState,
@@ -90,7 +99,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     fn ensure_closed(&self, request: RequestId) -> Result<(), DomainError> {
         if self.target.contains_key(&request)
             || self.head.contains_key(&request)
-            || self.head_pending.contains_key(&request)
             || self.input.contains_key(&request)
             || self.repairs.contains_key(&request)
         {
@@ -100,8 +108,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     pub fn close(&mut self, request: RequestId) -> Result<(), String> {
-        if self.head_pending.contains_key(&request)
-            || self.repairs.contains_key(&request)
+        if self.repairs.contains_key(&request)
             || !self.target.contains_key(&request)
             || (self.head_store.is_some() && !self.head.contains_key(&request))
         {
@@ -168,7 +175,24 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(())
     }
 
+    /// Open a request at a checkpoint: its state and the checkpoint source's
+    /// input (admission then installs the request's own retained input).
     pub fn open_checkpoint(
+        &mut self,
+        request: RequestId,
+        checkpoint: &DomainCheckpoint,
+    ) -> Result<(), DomainError> {
+        self.open_checkpoint_state(request, checkpoint)?;
+        if let Some(input) = &checkpoint.input {
+            self.input.insert(request, input.clone());
+        }
+        Ok(())
+    }
+
+    /// Open a closed request at a checkpoint's state only, with no input:
+    /// the request replays its own accepted rows after the checkpoint (an
+    /// evicted request, whose input was released with its state).
+    pub fn open_checkpoint_state(
         &mut self,
         request: RequestId,
         checkpoint: &DomainCheckpoint,
@@ -176,12 +200,52 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.healthy()?;
         if self.target.contains_key(&request)
             || self.head.contains_key(&request)
-            || self.head_pending.contains_key(&request)
             || self.input.contains_key(&request)
             || self.repairs.contains_key(&request)
         {
             return Err("checkpoint request is already open".into());
         }
+        let (target, head) = self.fork_checkpoint(checkpoint)?;
+        self.target.insert(request, target);
+        if let Some(head) = head {
+            self.head.insert(request, head);
+        }
+        Ok(())
+    }
+
+    /// Replace an open request's fresh state (no accepted rows) with the
+    /// checkpoint's state, keeping the request's own installed input: a
+    /// request attaching to a shared prefix another request computed.
+    pub fn resume_from_checkpoint(
+        &mut self,
+        request: RequestId,
+        checkpoint: &DomainCheckpoint,
+    ) -> Result<(), DomainError> {
+        self.healthy()?;
+        let fresh = self
+            .target
+            .get(&request)
+            .is_some_and(|state| state.position() == 0)
+            && self
+                .head
+                .get(&request)
+                .is_none_or(|state| state.position() == 0)
+            && !self.repairs.contains_key(&request);
+        if !fresh {
+            return Err("only an open request without accepted state can resume".into());
+        }
+        let (target, head) = self.fork_checkpoint(checkpoint)?;
+        self.target.insert(request, target);
+        if let Some(head) = head {
+            self.head.insert(request, head);
+        }
+        Ok(())
+    }
+
+    fn fork_checkpoint(
+        &self,
+        checkpoint: &DomainCheckpoint,
+    ) -> Result<(SequenceState, Option<SequenceState>), DomainError> {
         let target = checkpoint.target.fork();
         if !target.belongs_to(&self.target_store)
             || checkpoint.head.is_some() != self.head_store.is_some()
@@ -197,48 +261,38 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }) {
             return Err("checkpoint head belongs to another state arena".into());
         }
-        self.target.insert(request, target);
-        if let Some(head) = head {
-            self.head.insert(request, head);
-        }
-        if let Some(input) = &checkpoint.input {
-            self.input.insert(request, input.clone());
-        }
-        Ok(())
+        Ok((target, head))
     }
 
+    /// State bytes released by evicting exactly these requests, priced as a
+    /// set: rows and banks shared with anything outside it are not counted.
     pub fn reclaimable(&self, requests: &[RequestId]) -> Result<u64, String> {
         let target = requests
             .iter()
             .map(|request| {
-                self.target.get(request).ok_or_else(|| {
+                self.target.get(request).map(Holder::State).ok_or_else(|| {
                     "reclamation request has unresolved or absent target state".to_owned()
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut bytes = u64::try_from(
-            self.target_store
-                .reclaimable(&target)
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|_| "target reclaim bytes exceed u64")?;
+        let mut bytes = self
+            .target_store
+            .exclusive_bytes(&target)
+            .map_err(|error| error.to_string())?;
         if let Some(store) = &self.head_store {
             let head = requests
                 .iter()
                 .map(|request| {
-                    self.head.get(request).ok_or_else(|| {
+                    self.head.get(request).map(Holder::State).ok_or_else(|| {
                         "reclamation request has unresolved or absent head state".to_owned()
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             bytes = bytes
                 .checked_add(
-                    u64::try_from(
-                        store
-                            .reclaimable(&head)
-                            .map_err(|error| error.to_string())?,
-                    )
-                    .map_err(|_| "head reclaim bytes exceed u64")?,
+                    store
+                        .exclusive_bytes(&head)
+                        .map_err(|error| error.to_string())?,
                 )
                 .ok_or("reclaim byte count overflow")?;
         }
@@ -276,7 +330,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn fork(&mut self, source: RequestId, destination: RequestId) -> Result<(), String> {
         if self.target.contains_key(&destination)
             || self.head.contains_key(&destination)
-            || self.head_pending.contains_key(&destination)
             || self.input.contains_key(&destination)
             || self.repairs.contains_key(&destination)
         {

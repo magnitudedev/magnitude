@@ -100,6 +100,7 @@ fn wire_accepts_and_forwards_all_sampling_shaping_options() {
                 output_capacity: 8,
                 forced_quantum: 4,
                 method: MethodPolicy::Plain,
+                media_marker: None,
             },
         )
         .unwrap();

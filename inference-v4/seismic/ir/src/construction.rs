@@ -176,30 +176,18 @@ impl<B: PhysicalDialect> Construction<B> {
 
     /// Define one stored tensor value only on successful reached acquisition.
     pub fn begin_tensor_instance(&mut self, arena: &mut ExprArena, region: u32, source: AnyBufferView) -> AnyBufferView {
-        let layout = self.storage.view_layout(source).clone();
-        assert!(matches!(layout.mapping, crate::storage::ViewMapping::WholeAllocation),
+        assert!(matches!(self.storage.view_layout(source).mapping, crate::storage::ViewMapping::WholeAllocation),
             "reached tensor creation requires allocation-owned geometry");
-        // Root ABI parameters are bound once for the invocation. Target and
-        // selection values are fixed before execution. Every execution-local
-        // axis instead needs an owned snapshot, even if it happens to have the
-        // same value on several visits.
-        let extents = layout.extents.iter().map(|extent| {
-            let invariant = arena.free_symbols((*extent).into()).into_iter().all(|symbol| matches!(
-                arena.symbol_kind(symbol), seismic_lang::expr::SymbolKind::CallDimension(_)
-                    | seismic_lang::expr::SymbolKind::CallScalar(_)
-                    | seismic_lang::expr::SymbolKind::TargetConstant(_)
-                    | seismic_lang::expr::SymbolKind::Decision(_)
-            ));
-            if invariant { *extent } else {
-                let slot = self.schedule.quantity_slot(arena, crate::schedule::HostQuantityKind::Natural);
-                arena.nat_symbol(slot.symbol())
-            }
-        }).collect();
-        let strides = (0..layout.strides.len()).map(|_| {
-            let slot = self.schedule.quantity_slot(arena, crate::schedule::HostQuantityKind::Natural);
-            arena.nat_symbol(slot.symbol())
-        }).collect();
-        let result = self.storage.instance_view(arena, source, extents, strides);
+        // The instance's geometry is its allocation's geometry: the same
+        // extent and stride expressions, evaluated where the instance is
+        // acquired. Every operand of those expressions is defined once per
+        // visit of its region (call values, target constants, decisions,
+        // loop binders, and single-assignment slots), and a tensor value only
+        // leaves the visit that acquired it through a branch or repeat product,
+        // whose destination owns fresh geometry slots. So the expressions keep
+        // their acquired values for as long as this instance is in scope, and
+        // every obligation over the instance is stated over its source.
+        let result = self.storage.instance_view(arena, source);
         self.schedule(arena, region).begin_allocation_instance(source, result);
         result
     }
@@ -237,9 +225,15 @@ impl<B: PhysicalDialect> Construction<B> {
         parent: u32,
         start: NatExpr,
         end: NatExpr,
+        visits: crate::schedule::RepeatVisits,
         initial: crate::region::Product<crate::region::ValueOperand>,
     ) -> RepeatConstruction {
-        let (body, binding) = self.schedule.begin_repeat(arena, parent, start, end);
+        if visits == crate::schedule::RepeatVisits::Independent {
+            let mut carried = 0usize;
+            initial.visit(&mut |_| carried += 1);
+            assert_eq!(carried, 0, "independent visits carry no products");
+        }
+        let (body, binding) = self.schedule.begin_repeat(arena, parent, start, end, visits);
         self.schedule.open_repeat_products(body);
         let header = self.value_destinations(arena, &initial);
         let result = self.value_destinations(arena, &initial);
@@ -1129,7 +1123,7 @@ mod tests {
     }
 
     #[test]
-    fn begin_preserves_immutable_axes_and_snapshots_execution_local_axes() {
+    fn begin_defines_an_instance_with_its_allocation_geometry() {
         let mut arena = ExprArena::default();
         let mut construction = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
         let fixed = arena.nat(2);
@@ -1139,11 +1133,12 @@ mod tests {
         let (_, index) = construction.storage_mut().tensor(&mut arena, GlobalBufferKind::Arena, representation, vec![fixed, dynamic]);
         let source = construction.view(index, representation);
         let result = construction.begin_tensor_instance(&mut arena, 0, source);
-        let layout = construction.storage.view_layout(result);
-        assert_eq!(layout.extents[0], fixed);
-        assert_ne!(layout.extents[1], dynamic);
-        assert!(matches!(arena.view(layout.extents[1].into()), seismic_lang::expr::NodeView::Symbol(symbol)
-            if matches!(arena.symbol_kind(symbol), seismic_lang::expr::SymbolKind::ScheduleSlot(_))));
+        let (source, layout) = (construction.storage.view_layout(source), construction.storage.view_layout(result));
+        // Invocation-fixed and execution-local axes alike: the instance's
+        // extents and strides are its allocation's own expressions.
+        assert_eq!(layout.extents, [fixed, dynamic]);
+        assert_eq!(layout.strides, source.strides);
+        assert!(layout.contiguous);
         assert!(matches!(layout.base, crate::storage::ViewBase::TensorValue(_)));
     }
 
@@ -1186,6 +1181,7 @@ mod tests {
                 0,
                 zero,
                 end,
+                crate::schedule::RepeatVisits::Ordered,
                 Product::Leaf(ValueOperand::Tensor(initial)),
             );
             let Product::Leaf(ValueDestination::Tensor(header)) = repeat.header() else {
@@ -1257,6 +1253,7 @@ mod tests {
             0,
             zero,
             one,
+            crate::schedule::RepeatVisits::Ordered,
             Product::Leaf(ValueOperand::Scalar(ScalarOperand::Natural(one))),
         );
         let close = construction.schedule(&mut arena, 0).close();
@@ -1275,7 +1272,7 @@ mod tests {
         let start = arena.nat(0);
         let end = arena.nat(2);
         let repeat = construction.begin_value_repeat(
-            &mut arena, 0, start, end,
+            &mut arena, 0, start, end, crate::schedule::RepeatVisits::Ordered,
             Product::Leaf(ValueOperand::Quantity(QuantityOperand::Integer(initial))),
         );
         let Product::Leaf(ValueDestination::Quantity(header)) = repeat.header() else { panic!("exact header") };
@@ -1308,7 +1305,7 @@ mod tests {
         let inside = instance_tensor(&mut construction, &mut arena, 16);
         construction.begin_tensor_instance(&mut arena, 0, outside);
         let zero = arena.nat(0);
-        let repeat = construction.begin_value_repeat(&mut arena, 0, zero, zero, Product::Unit);
+        let repeat = construction.begin_value_repeat(&mut arena, 0, zero, zero, crate::schedule::RepeatVisits::Ordered, Product::Unit);
         construction.begin_tensor_instance(&mut arena, repeat.body(), inside);
         construction.finish_value_repeat(repeat, Product::Unit);
         let close = construction.schedule(&mut arena, 0).close();

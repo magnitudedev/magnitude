@@ -1,8 +1,8 @@
 // qwen_recurrent_chunk (prefill row classes): the gated delta rule in the
 // chunked WY form over pieces of 16 rows.
 //
-// Each slot's rows split into pieces of at most 16 rows with a boundary at the
-// publication row. Within a piece (rows t, cumulative log decay G_t,
+// The slot's rows before its publication (stop) row split into pieces of at
+// most 16 rows. Within a piece (rows t, cumulative log decay G_t,
 // gamma_t = exp(G_t)) with initial state S:
 //   A[t][s] = beta_t exp(G_t - G_s) k_t.k_s (s < t),  Tb = (I + A)^-1 diag(beta),
 //   D[t][s] = exp(G_t - G_s) q_t.k_s (s <= t),
@@ -20,23 +20,31 @@
 // slot): each warp keeps 16 state rows as m16n8k16 accumulators (S rows by key
 // columns, F32) and applies the slot's pieces in order on tensor cores
 // (f16 operands, F32 accumulation), the next piece's operands staged into
-// shared memory with cp.async while the current one computes. The state is
-// published after the piece that ends at the publication row (or before the
-// first piece when stop = 0), with the window. Grid z = B zeroes the mixed
-// rows no slot covers. ROWS never changes result bits.
+// shared memory with cp.async while the current one computes. The scan starts
+// from the slot's source version (the bank's state advanced by its tape rows
+// with the step's update) and publishes the state after the last piece, with
+// the window; the rows after the stop row then advance row-sequentially from
+// that state with the step's arithmetic (`recurrent::advance_rows`), recording
+// the tape.
+//
+// A slot of at most recurrent::SEQUENTIAL_ROWS rows (an MTP verify) has no
+// pieces: its scan blocks advance all its rows row-sequentially with the
+// step's bits. Grid z = B zeroes the mixed rows no slot covers. ROWS never
+// changes result bits.
 
 #include "common/recurrent.cuh"
 
 namespace {
 
-using mx::u16;
-using mx::u32;
-using mx::u64;
-using mx::u8;
-using rec::C;
-using rec::NK;
-using rec::NV;
-using rec::W;
+using recurrent::Act;
+using recurrent::u16;
+using recurrent::u32;
+using recurrent::u64;
+using recurrent::u8;
+using recurrent::C;
+using recurrent::NK;
+using recurrent::NV;
+using recurrent::W;
 
 constexpr int PIECE = 16;
 constexpr int GROUP = NV / NK;
@@ -81,30 +89,35 @@ __device__ __forceinline__ u8 *record(u8 *pieces, int piece, int head) {
            static_cast<u64>(head) * RECORD_BYTES;
 }
 
+// The slot's chunked pieces (the rows before its stop row): none for a
+// sequential (short) slot.
+__device__ __forceinline__ int scratch_pieces(const recurrent::Slot &slot) {
+    return slot.hi - slot.lo <= recurrent::SEQUENTIAL_ROWS ? 0 : recurrent::pieces_before<PIECE>(slot);
+}
+
 // The global index of the first piece of slot `slot_index`.
-__device__ __forceinline__ int first_piece(const rec::Inputs &in, u64 slot_index) {
+__device__ __forceinline__ int first_piece(const recurrent::Inputs &in, u64 slot_index) {
     int total = 0;
-    for (u64 slot = 0; slot < slot_index; ++slot)
-        total += rec::piece_count<PIECE>(rec::slot_of(in, slot));
+    for (u64 slot = 0; slot < slot_index; ++slot) total += scratch_pieces(recurrent::slot_of(in, slot));
     return total;
 }
 
-// Value head `member` of key head `key_head` (inverse of rec::key_head).
-__device__ __forceinline__ int member_head(const rec::Inputs &in, int key_head, int member) {
+// Value head `member` of key head `key_head` (inverse of recurrent::key_head).
+__device__ __forceinline__ int member_head(const recurrent::Inputs &in, int key_head, int member) {
     return in.grouped ? key_head * GROUP + member : key_head + member * NK;
 }
 
 // Input x_j of the causal convolution for slot-local position j (the window of
-// the slot's accepted bank before the slot, the projection after), CPL
+// the slot's source version before the slot, the projection after), CPL
 // channels from `channel`, in F32.
-__device__ __forceinline__ void convolution_input(const rec::Inputs &in, const rec::Slot &slot,
+__device__ __forceinline__ void convolution_input(const recurrent::Inputs &in, const recurrent::Slot &slot,
                                                   int position, int channel, float (&out)[CPL]) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     if (position < 0)
-        mx::act_span<CPL, true>(in.window,
-                                rec::window_at(in, slot.source, C - 1 + position, channel), out);
+        element::span<Act, CPL, true>(
+            in.window, recurrent::window_at(in, slot.source, slot.taped + C - 1 + position, channel), out);
     else
-        mx::act_span<CPL, true>(in.projection,
+        element::span<Act, CPL, true>(in.projection,
                                 static_cast<u64>(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0 +
                                     channel,
                                 out);
@@ -139,7 +152,7 @@ __device__ __forceinline__ void split_tiles(const float (&left)[4], const float 
 }  // namespace
 
 extern "C" __global__ void __launch_bounds__(PREPARE_THREADS) qwen_recurrent_chunk_prepare(SEISMIC_KERNEL_PARAMS) {
-    const rec::Inputs in = REC_INPUTS();
+    const recurrent::Inputs in = RECURRENT_INPUTS();
     u8 *pieces = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PIECES);
     const int key_head = blockIdx.y;
     const int warp = threadIdx.x / 32;
@@ -147,15 +160,15 @@ extern "C" __global__ void __launch_bounds__(PREPARE_THREADS) qwen_recurrent_chu
 
     // Locate this block's piece.
     int remaining = blockIdx.x;
-    rec::Slot slot{};
-    rec::Piece piece{0, 0};
+    recurrent::Slot slot{};
+    recurrent::Piece piece{0, 0};
     bool owned = false;
     for (u64 index = 0; index < SEISMIC_DIM_B && !owned; ++index) {
-        const rec::Slot candidate = rec::slot_of(in, index);
-        const int count = rec::piece_count<PIECE>(candidate);
+        const recurrent::Slot candidate = recurrent::slot_of(in, index);
+        const int count = scratch_pieces(candidate);
         if (remaining < count) {
             slot = candidate;
-            piece = rec::piece_of<PIECE>(candidate, remaining);
+            piece = recurrent::piece_of<PIECE>(candidate, remaining);
             owned = true;
         } else {
             remaining -= count;
@@ -189,7 +202,7 @@ extern "C" __global__ void __launch_bounds__(PREPARE_THREADS) qwen_recurrent_chu
 #pragma unroll
         for (int c = 0; c < CPL; ++c) {
             float taps[C];
-            mx::f32_span<C>(in.convolution + static_cast<u64>(channel + c) * C, taps);
+            element::f32_span<C>(in.convolution + static_cast<u64>(channel + c) * C, taps);
 #pragma unroll
             for (int tap = 0; tap < C; ++tap) weights[tap][c] = taps[tap];
         }
@@ -258,7 +271,7 @@ extern "C" __global__ void __launch_bounds__(PREPARE_THREADS) qwen_recurrent_chu
         const int t = threadIdx.x % PIECE;
         float log_decay = 0.0f, b = 0.0f;
         if (t < n) {
-            const rec::Gates gates = rec::gates(in, piece.first + t, member_head(in, key_head, member));
+            const recurrent::Gates gates = recurrent::gates(in, piece.first + t, member_head(in, key_head, member));
             log_decay = gates.log_decay;
             b = gates.beta;
         }
@@ -351,25 +364,22 @@ struct Stage {
 // Pieces in flight: the scan computes one while the next STAGES - 1 load.
 constexpr int STAGES = 3;
 static_assert(sizeof(Stage) == 96 * W + 32 * ROWS + 1680, "the declaration's shared_bytes");
+static_assert(sizeof(recurrent::SequentialShared<ROWS>) <= STAGES * sizeof(Stage),
+              "the sequential advance fits the stage ring");
 
-// Eight consecutive activation elements from F32, with 16-byte stores.
-__device__ __forceinline__ void store_row8(u8 *base, u64 element, const float (&values)[8]) {
-#if MX_ACT_BYTES == 4
-    float4 *out = reinterpret_cast<float4 *>(base + element * 4);
-    out[0] = make_float4(values[0], values[1], values[2], values[3]);
-    out[1] = make_float4(values[4], values[5], values[6], values[7]);
-#else
-    u32 words[4];
+// Eight consecutive elements of E from F32, with 16-byte stores.
+template <class E>
+__device__ __forceinline__ void store_row8(u8 *base, u64 index, const float (&values)[8]) {
+    if constexpr (E::bytes == 4) {
+        float4 *out = reinterpret_cast<float4 *>(base + index * 4);
+        out[0] = make_float4(values[0], values[1], values[2], values[3]);
+        out[1] = make_float4(values[4], values[5], values[6], values[7]);
+    } else {
+        u32 words[4];
 #pragma unroll
-    for (int k = 0; k < 4; ++k) {
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
-        words[k] = seismic_pack_f16x2(values[2 * k], values[2 * k + 1]);
-#else
-        words[k] = seismic_pack_bf16x2(values[2 * k], values[2 * k + 1]);
-#endif
+        for (int k = 0; k < 4; ++k) words[k] = E::pack2(values[2 * k], values[2 * k + 1]);
+        *reinterpret_cast<uint4 *>(base + index * 2) = make_uint4(words[0], words[1], words[2], words[3]);
     }
-    *reinterpret_cast<uint4 *>(base + element * 2) = make_uint4(words[0], words[1], words[2], words[3]);
-#endif
 }
 
 __device__ __forceinline__ void stage_piece(Stage &stage, u8 *pieces, int piece, int key_head,
@@ -405,7 +415,7 @@ __device__ __forceinline__ void stage_piece(Stage &stage, u8 *pieces, int piece,
 }  // namespace
 
 extern "C" __global__ void __launch_bounds__(SCAN_THREADS) qwen_recurrent_chunk_scan(SEISMIC_KERNEL_PARAMS) {
-    const rec::Inputs in = REC_INPUTS();
+    const recurrent::Inputs in = RECURRENT_INPUTS();
     u8 *pieces = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PIECES);
     u8 *mixed = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
     const int head = blockIdx.y;
@@ -422,22 +432,31 @@ extern "C" __global__ void __launch_bounds__(SCAN_THREADS) qwen_recurrent_chunk_
                static_cast<u64>(state_row) * SEISMIC_RESULT_0_STRIDE_2;
     };
     if (slot_index == SEISMIC_DIM_B) {
-        const u64 covered = rec::covered_end(in);
+        const u64 covered = recurrent::covered_end(in);
         for (u64 index = covered * ROWS + threadIdx.x; index < SEISMIC_DIM_M * ROWS;
              index += SCAN_THREADS)
-            mx::act_store(mixed, mixed_at(static_cast<int>(index / ROWS), row0 + index % ROWS),
+            element::put<Act>(mixed, mixed_at(static_cast<int>(index / ROWS), row0 + index % ROWS),
                           0.0f);
         return;
     }
-    const rec::Slot slot = rec::slot_of(in, slot_index);
-    rec::publish_window(in, slot, head * gridDim.x + blockIdx.x, NV * gridDim.x);
-    const int key_head = rec::key_head(in, head);
+    const recurrent::Slot slot = recurrent::slot_of(in, slot_index);
+    recurrent::publish_window(in, slot, head * gridDim.x + blockIdx.x, NV * gridDim.x);
+    extern __shared__ __align__(16) unsigned char scan_shared[];
+    auto &sequential = *reinterpret_cast<recurrent::SequentialShared<ROWS> *>(scan_shared);
+    if (slot.hi - slot.lo <= recurrent::SEQUENTIAL_ROWS) {
+        recurrent::WarpRows<16> rows;
+        recurrent::load_version<16>(in, slot, head, warp_row, rows);
+        recurrent::advance_rows<16, ROWS>(in, slot, slot.lo, head, row0, true, warp_row, rows, mixed, sequential);
+        return;
+    }
+    const int key_head = recurrent::key_head(in, head);
 
     // The warp's 16 state rows as accumulators: tile j holds S[row g, g + 8]
-    // [key columns 8j + 2t4, + 1].
+    // [key columns 8j + 2t4, + 1]; the source version's tape rows are applied
+    // with the step's update.
     float state[W / 8][4];
     auto state_at = [&](int bank, int e) {
-        return rec::state_row(in, bank, head, warp_row + g + 8 * (e / 2));
+        return recurrent::state_row(in, bank, head, warp_row + g + 8 * (e / 2));
     };
     {
         const float *upper = state_at(slot.source, 0);
@@ -451,6 +470,19 @@ extern "C" __global__ void __launch_bounds__(SCAN_THREADS) qwen_recurrent_chunk_
             state[j][2] = bottom.x;
             state[j][3] = bottom.y;
         }
+        for (int entry = 0; entry < slot.taped; ++entry) {
+            const recurrent::TapeEntry tape = recurrent::tape_entry(in, slot, head, entry);
+            const float u[2] = {tape.row[recurrent::TAPE_U + head * W + warp_row + g],
+                                tape.row[recurrent::TAPE_U + head * W + warp_row + g + 8]};
+            const float *k = tape.row + recurrent::TAPE_K + key_head * W;
+#pragma unroll
+            for (int j = 0; j < W / 8; ++j) {
+                const float2 pair = *reinterpret_cast<const float2 *>(k + 8 * j + 2 * t4);
+#pragma unroll
+                for (int e = 0; e < 4; ++e)
+                    state[j][e] = __fmaf_rn(u[e / 2], e & 1 ? pair.y : pair.x, state[j][e] * tape.decay);
+            }
+        }
     }
     auto publish = [&]() {
         float *upper = state_at(slot.target, 0);
@@ -463,11 +495,10 @@ extern "C" __global__ void __launch_bounds__(SCAN_THREADS) qwen_recurrent_chunk_
     };
     if (slot.stop == 0) publish();
 
-    extern __shared__ __align__(16) unsigned char scan_shared[];
     Stage *stages = reinterpret_cast<Stage *>(scan_shared);
     float (*transpose)[17] =
         reinterpret_cast<float (*)[17]>(scan_shared + STAGES * sizeof(Stage)) + 16 * warp;
-    const int count = rec::piece_count<PIECE>(slot);
+    const int count = recurrent::pieces_before<PIECE>(slot);
     const int base = first_piece(in, slot_index);
     // One commit group per piece slot, empty past the last piece.
 #pragma unroll
@@ -476,7 +507,7 @@ extern "C" __global__ void __launch_bounds__(SCAN_THREADS) qwen_recurrent_chunk_
         seismic_cp_async_commit();
     }
     for (int local = 0; local < count; ++local) {
-        const rec::Piece piece = rec::piece_of<PIECE>(slot, local);
+        const recurrent::Piece piece = recurrent::piece_of<PIECE>(slot, local);
         const Stage &stage = stages[local % STAGES];
         const int ahead = local + STAGES - 1;
         if (ahead < count)
@@ -571,7 +602,7 @@ extern "C" __global__ void __launch_bounds__(SCAN_THREADS) qwen_recurrent_chunk_
                 float values[8];
 #pragma unroll
                 for (int k = 0; k < 8; ++k) values[k] = transpose[t][8 * (lane % 2) + k];
-                store_row8(mixed, mixed_at(piece.first + t, warp_row + 8 * (lane % 2)), values);
+                store_row8<Act>(mixed, mixed_at(piece.first + t, warp_row + 8 * (lane % 2)), values);
             }
         }
 
@@ -603,7 +634,17 @@ extern "C" __global__ void __launch_bounds__(SCAN_THREADS) qwen_recurrent_chunk_
             seismic_mma_m16n8k16_f16(state[2 * pair], wa, l0);
             seismic_mma_m16n8k16_f16(state[2 * pair + 1], wa, l1);
         }
-        if (piece.first + piece.count == slot.lo + slot.stop) publish();
         __syncthreads();
+    }
+    if (count > 0) publish();
+    // The rows after the stop row advance row-sequentially from the published
+    // state (their innovations feed the tape).
+    if (slot.stop < slot.hi - slot.lo) {
+        seismic_cp_async_wait<0>();
+        __syncthreads();
+        recurrent::WarpRows<16> rows;
+        recurrent::load_rows<16>(in, slot.target, head, warp_row, rows);
+        recurrent::advance_rows<16, ROWS>(in, slot, slot.lo + slot.stop, head, row0, true, warp_row, rows, mixed,
+                                          sequential);
     }
 }

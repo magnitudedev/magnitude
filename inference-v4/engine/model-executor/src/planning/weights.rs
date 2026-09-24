@@ -10,6 +10,7 @@ use magnitude_model_contracts::{
     VisionDescription, WeightDescriptor, WeightKind, WeightRole, WeightScope,
 };
 use crate::ExecutionPath;
+use magnitude_model_state::KvCodec;
 use seismic::{BackendName, DType, Element, Layout};
 use std::collections::{HashMap, HashSet};
 
@@ -71,6 +72,8 @@ pub struct AttentionBinding {
     pub value: Element,
     pub output: Element,
     pub activation: Element,
+    /// How the block's history planes encode keys and values.
+    pub history: KvCodec,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -156,7 +159,6 @@ pub struct VisionPatchBinding {
     pub temporal_weight_1: Element,
     pub bias: Element,
     pub position: Element,
-    pub activation: Element,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -254,12 +256,14 @@ impl ModelLoadPlan {
     pub(crate) fn program_plan(
         &self,
         definition: &ModelDefinition,
+        history: KvCodec,
     ) -> Result<ProgramPlan, PlanError> {
         super::programs::derive_program_plan(
             definition,
             &self.target,
             self.head.as_deref(),
             self.vision.as_deref(),
+            history,
         )
     }
 
@@ -421,14 +425,11 @@ impl ModelLoadPlan {
                 .chain(vision.as_deref().unwrap_or_default()),
         )?;
 
-        let load = Self {
+        Ok(Self {
             target,
             head,
             vision,
-        };
-        load.program_plan(definition)
-            .map_err(|error| error.to_string())?;
-        Ok(load)
+        })
     }
 
     pub fn weights(&self) -> impl Iterator<Item = &WeightPlan> {
@@ -486,7 +487,17 @@ fn push_weight(
         ));
     }
     let role = WeightRole { scope, kind };
-    let dense_resident = resident_dtype(role, form.activation);
+    // Projector weights keep their stored dense element: the vision kernels
+    // read f32, f16 and bf16 matrices and vectors directly, and converting
+    // f16 matrices or f32 biases to the activation dtype only loses bits.
+    let stored_dense = source_element(stored.encoding).and_then(Element::dtype);
+    let dense_resident = match (role.scope, stored_dense) {
+        (
+            WeightScope::Vision | WeightScope::VisionPatch(_) | WeightScope::VisionBlock(_),
+            Some(dtype),
+        ) => dtype,
+        _ => resident_dtype(role, form.activation),
+    };
     if is_fixed_dense_role(kind)
         && !matches!(
             stored.encoding,

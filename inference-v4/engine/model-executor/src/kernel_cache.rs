@@ -33,7 +33,10 @@ pub const DEFAULT_KERNEL_CACHE_BYTES: u64 = 1 << 30;
 const ABANDONED_WRITE: Duration = Duration::from_secs(60 * 60);
 
 const CUDA: &str = "cuda";
+const VULKAN: &str = "vulkan";
 const TUNING: &str = "tuning";
+/// Every directory of the cache.
+const DIRECTORIES: [&str; 3] = [CUDA, VULKAN, TUNING];
 
 #[derive(Debug)]
 pub enum KernelCacheError {
@@ -83,7 +86,7 @@ impl KernelCache {
     /// Open the cache at `root`, creating it, and evict the least recently
     /// used entries beyond `capacity` bytes.
     pub fn open(root: PathBuf, capacity: u64) -> Result<Self, KernelCacheError> {
-        for directory in [CUDA, TUNING] {
+        for directory in DIRECTORIES {
             let path = root.join(directory);
             fs::create_dir_all(&path).map_err(|error| KernelCacheError::Create { path, error })?;
         }
@@ -152,7 +155,7 @@ impl KernelCache {
     fn evict(&self, capacity: u64) {
         let now = SystemTime::now();
         let mut entries = Vec::new();
-        for directory in [CUDA, TUNING] {
+        for directory in DIRECTORIES {
             let Ok(listing) = fs::read_dir(self.root.join(directory)) else {
                 continue;
             };
@@ -186,12 +189,14 @@ impl ArtifactStore for KernelCache {
     fn get(&self, kind: ArtifactKind, key: &ArtifactKey) -> Option<Vec<u8>> {
         match kind {
             ArtifactKind::CudaImage => self.read(&self.entry(CUDA, key.as_str(), "cubin")),
+            ArtifactKind::SpirV => self.read(&self.entry(VULKAN, key.as_str(), "spv")),
         }
     }
 
     fn put(&self, kind: ArtifactKind, key: &ArtifactKey, bytes: &[u8]) {
         match kind {
             ArtifactKind::CudaImage => self.write(&self.entry(CUDA, key.as_str(), "cubin"), bytes),
+            ArtifactKind::SpirV => self.write(&self.entry(VULKAN, key.as_str(), "spv"), bytes),
         }
     }
 }

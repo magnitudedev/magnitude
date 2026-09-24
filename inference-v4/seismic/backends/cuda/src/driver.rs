@@ -130,6 +130,15 @@ driver! {
         graph_launch: unsafe extern "system" fn(Handle, Handle) -> ResultCode => "cuGraphLaunch",
         graph_exec_destroy: unsafe extern "system" fn(Handle) -> ResultCode => "cuGraphExecDestroy",
         graph_destroy: unsafe extern "system" fn(Handle) -> ResultCode => "cuGraphDestroy",
+        // Driver API 10.2+: virtual memory management (reserved address ranges).
+        memory_granularity: unsafe extern "system" fn(*mut usize, *const AllocationProperties, c_uint) -> ResultCode => "cuMemGetAllocationGranularity",
+        address_reserve: unsafe extern "system" fn(*mut u64, usize, usize, u64, u64) -> ResultCode => "cuMemAddressReserve",
+        address_free: unsafe extern "system" fn(u64, usize) -> ResultCode => "cuMemAddressFree",
+        physical_create: unsafe extern "system" fn(*mut u64, usize, *const AllocationProperties, u64) -> ResultCode => "cuMemCreate",
+        physical_release: unsafe extern "system" fn(u64) -> ResultCode => "cuMemRelease",
+        map: unsafe extern "system" fn(u64, usize, usize, u64, u64) -> ResultCode => "cuMemMap",
+        unmap: unsafe extern "system" fn(u64, usize) -> ResultCode => "cuMemUnmap",
+        set_access: unsafe extern "system" fn(u64, usize, *const AccessDescription, usize) -> ResultCode => "cuMemSetAccess",
     }
 }
 
@@ -470,20 +479,7 @@ impl Allocation {
             bytes.len(),
             self.bytes
         );
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        let _current = self.context.enter()?;
-        unsafe {
-            self.context.driver.check(
-                (self.context.driver.upload)(
-                    self.pointer + offset as u64,
-                    bytes.as_ptr().cast(),
-                    bytes.len(),
-                ),
-                "upload",
-            )
-        }
+        upload(&self.context, self.pointer + offset as u64, bytes)
     }
 
     /// Precondition (this module's own): `offset + bytes.len() <= self.bytes`.
@@ -496,20 +492,260 @@ impl Allocation {
             bytes.len(),
             self.bytes
         );
-        if bytes.is_empty() {
+        download(&self.context, self.pointer + offset as u64, bytes)
+    }
+}
+
+/// `CUmemLocation`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct MemoryLocation {
+    kind: c_uint,
+    id: c_int,
+}
+
+impl MemoryLocation {
+    fn device(ordinal: c_int) -> Self {
+        // CU_MEM_LOCATION_TYPE_DEVICE
+        Self { kind: 1, id: ordinal }
+    }
+}
+
+/// `CUmemAllocationProp`.
+#[repr(C)]
+pub(crate) struct AllocationProperties {
+    kind: c_uint,
+    requested_handle_types: c_uint,
+    location: MemoryLocation,
+    win32_metadata: *mut c_void,
+    compression: c_uchar,
+    rdma_capable: c_uchar,
+    usage: u16,
+    reserved: [c_uchar; 4],
+}
+
+impl AllocationProperties {
+    /// Pinned device memory of `ordinal`, not exportable.
+    fn device(ordinal: c_int) -> Self {
+        Self {
+            // CU_MEM_ALLOCATION_TYPE_PINNED
+            kind: 1,
+            requested_handle_types: 0,
+            location: MemoryLocation::device(ordinal),
+            win32_metadata: std::ptr::null_mut(),
+            compression: 0,
+            rdma_capable: 0,
+            usage: 0,
+            reserved: [0; 4],
+        }
+    }
+}
+
+/// `CUmemAccessDesc`.
+#[repr(C)]
+pub(crate) struct AccessDescription {
+    location: MemoryLocation,
+    flags: c_uint,
+}
+
+fn memory_management_symbol<F: Copy>(symbol: Option<F>) -> Result<F, DriverError> {
+    symbol.ok_or(DriverError {
+        operation: "virtual memory management",
+        code: 0,
+        description: "the CUDA driver predates driver API 10.2 virtual memory management".into(),
+    })
+}
+
+/// A device address range reserved once, with physical memory mapped over a
+/// leading prefix of it in granules (CUDA virtual memory management). The
+/// base address never changes while the backed prefix grows and shrinks, so
+/// work bound to it (and graphs keyed by its address) stays valid.
+pub(crate) struct Reservation {
+    pub base: u64,
+    /// Bytes of address space, a whole number of granules.
+    pub reserved: usize,
+    granularity: usize,
+    /// Physical allocation handles, mapped in order from `base`.
+    granules: std::sync::Mutex<Vec<u64>>,
+    context: Arc<Context>,
+}
+
+unsafe impl Send for Reservation {}
+unsafe impl Sync for Reservation {}
+
+impl Reservation {
+    /// Reserve address space for `bytes` with nothing backed.
+    pub fn new(context: &Arc<Context>, bytes: usize) -> Result<Self, DriverError> {
+        let driver = &context.driver;
+        let granularity_of = memory_management_symbol(driver.memory_granularity)?;
+        let reserve = memory_management_symbol(driver.address_reserve)?;
+        let _current = context.enter()?;
+        let properties = AllocationProperties::device(context.ordinal());
+        let mut granularity = 0usize;
+        unsafe {
+            // CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
+            driver.check(
+                granularity_of(&mut granularity, &properties, 1),
+                "allocation granularity",
+            )?;
+        }
+        let reserved = bytes.max(1).div_ceil(granularity) * granularity;
+        let mut base = 0u64;
+        unsafe {
+            driver.check(
+                reserve(&mut base, reserved, granularity, 0, 0),
+                "address reservation",
+            )?;
+        }
+        Ok(Self {
+            base,
+            reserved,
+            granularity,
+            granules: std::sync::Mutex::new(Vec::new()),
+            context: context.clone(),
+        })
+    }
+
+    pub fn context(&self) -> &Arc<Context> {
+        &self.context
+    }
+
+    /// Back exactly the granules covering the leading `bytes`: map new ones
+    /// read-write for this device, or unmap and release the tail. Precondition
+    /// for a shrink: no device work still touches the released range.
+    pub fn commit(&self, bytes: usize) -> Result<(), DriverError> {
+        assert!(
+            bytes <= self.reserved,
+            "Reservation::commit precondition: {bytes} bytes exceed the {}-byte reservation",
+            self.reserved
+        );
+        let driver = &self.context.driver;
+        let create = memory_management_symbol(driver.physical_create)?;
+        let release = memory_management_symbol(driver.physical_release)?;
+        let map = memory_management_symbol(driver.map)?;
+        let unmap = memory_management_symbol(driver.unmap)?;
+        let set_access = memory_management_symbol(driver.set_access)?;
+        let _current = self.context.enter()?;
+        let mut granules = self
+            .granules
+            .lock()
+            .expect("reservation granule lock is never poisoned");
+        let wanted = bytes.div_ceil(self.granularity);
+        let address = |index: usize| self.base + (index * self.granularity) as u64;
+        while granules.len() > wanted {
+            let index = granules.len() - 1;
+            unsafe {
+                driver.check(unmap(address(index), self.granularity), "unmap")?;
+                driver.check(release(granules[index]), "physical release")?;
+            }
+            granules.pop();
+        }
+        let first_new = granules.len();
+        if wanted == first_new {
             return Ok(());
         }
-        let _current = self.context.enter()?;
-        unsafe {
-            self.context.driver.check(
-                (self.context.driver.download)(
-                    bytes.as_mut_ptr().cast(),
-                    self.pointer + offset as u64,
-                    bytes.len(),
-                ),
-                "download",
-            )
+        let properties = AllocationProperties::device(self.context.ordinal());
+        let mapped = (|| {
+            while granules.len() < wanted {
+                let mut handle = 0u64;
+                unsafe {
+                    driver.check(
+                        create(&mut handle, self.granularity, &properties, 0),
+                        "physical allocation",
+                    )?;
+                    if let Err(error) = driver.check(
+                        map(address(granules.len()), self.granularity, 0, handle, 0),
+                        "map",
+                    ) {
+                        release(handle);
+                        return Err(error);
+                    }
+                }
+                granules.push(handle);
+            }
+            let access = AccessDescription {
+                location: MemoryLocation::device(self.context.ordinal()),
+                // CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+                flags: 3,
+            };
+            unsafe {
+                driver.check(
+                    set_access(
+                        address(first_new),
+                        (wanted - first_new) * self.granularity,
+                        &access,
+                        1,
+                    ),
+                    "set access",
+                )
+            }
+        })();
+        if mapped.is_err() {
+            // Leave the backing as it was: release what this call mapped.
+            while granules.len() > first_new {
+                let index = granules.len() - 1;
+                unsafe {
+                    unmap(address(index), self.granularity);
+                    release(granules[index]);
+                }
+                granules.pop();
+            }
         }
+        mapped
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let driver = &self.context.driver;
+        let (Some(unmap), Some(release), Some(free)) =
+            (driver.unmap, driver.physical_release, driver.address_free)
+        else {
+            return;
+        };
+        if let Ok(_current) = self.context.enter() {
+            let granules = self
+                .granules
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (index, handle) in granules.iter().enumerate() {
+                unsafe {
+                    unmap(self.base + (index * self.granularity) as u64, self.granularity);
+                    release(*handle);
+                }
+            }
+            unsafe {
+                free(self.base, self.reserved);
+            }
+        }
+    }
+}
+
+/// Synchronous host copy into device memory at `pointer`.
+pub(crate) fn upload(context: &Context, pointer: u64, bytes: &[u8]) -> Result<(), DriverError> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let _current = context.enter()?;
+    unsafe {
+        context.driver.check(
+            (context.driver.upload)(pointer, bytes.as_ptr().cast(), bytes.len()),
+            "upload",
+        )
+    }
+}
+
+/// Synchronous device-to-host copy from `pointer`.
+pub(crate) fn download(context: &Context, pointer: u64, bytes: &mut [u8]) -> Result<(), DriverError> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let _current = context.enter()?;
+    unsafe {
+        context.driver.check(
+            (context.driver.download)(bytes.as_mut_ptr().cast(), pointer, bytes.len()),
+            "download",
+        )
     }
 }
 

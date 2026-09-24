@@ -1,8 +1,8 @@
 //! Owned tentative state, movable through an in-flight program submission.
 
 use super::{
-    install_commit, split_extent_prefix, BankHandle, Codec, ComponentDescriptor, Error, Extent,
-    KvCodec, LayerRef, PlaneBuffer, PlaneCopy, SequenceState, StateStore, VectorKind,
+    append_ranges, install_commit, BankHandle, Claims, Codec, ComponentDescriptor, Error, KvCodec, LayerRef,
+    PlaneBuffer, PlaneCopy, SequenceState, StateStore, Transaction, VectorKind,
     MAX_VISIBLE_SEGMENTS,
 };
 use seismic::Tensor;
@@ -26,10 +26,12 @@ pub struct OwnedAdvanceBindings<'a> {
 pub struct OwnedStateAdvance {
     state: SequenceState,
     count: usize,
-    extents: Vec<Rc<Extent>>,
+    claims: Claims,
     following: BankHandle,
     history: Vec<PlaneBuffer>,
+    recurrent: Rc<[Tensor]>,
     destinations: Vec<usize>,
+    transaction: Transaction,
 }
 
 /// Preparation keeps ownership of the source sequence in every outcome.
@@ -48,9 +50,10 @@ pub enum OwnedCompactionPreparation {
 /// extents remain accepted until the state program completes and commits it.
 pub struct OwnedCompaction {
     state: SequenceState,
-    destination: Rc<Extent>,
+    destination: Claims,
     copies: Vec<PlaneCopy>,
     history: Vec<PlaneBuffer>,
+    _transaction: Transaction,
 }
 
 /// Physical copy bindings pinned by the owned compaction until completion.
@@ -93,14 +96,17 @@ pub struct OwnedCodecBindings<'a> {
 pub struct OwnedCodecAdvance {
     source: SequenceState,
     destination: SequenceState,
-    extents: Vec<Rc<Extent>>,
+    claims: Claims,
     destination_bank: BankHandle,
     source_history: Vec<PlaneBuffer>,
     destination_history: Vec<PlaneBuffer>,
+    source_recurrent: Rc<[Tensor]>,
+    destination_recurrent: Rc<[Tensor]>,
     conversions: Vec<CodecConversionStep>,
     source_codec: KvCodec,
     destination_codec: KvCodec,
     rows: usize,
+    _transaction: Transaction,
 }
 
 impl OwnedCodecAdvance {
@@ -110,17 +116,18 @@ impl OwnedCodecAdvance {
     ) -> Result<Self, (SequenceState, SequenceState, Error)> {
         match Self::prepare(&source, &destination) {
             Ok((source_codec, destination_codec, from, rows)) => {
-                let extents = match destination.store.reserve(None, rows) {
-                    Ok(extents) => extents,
+                let claims = match destination.store.reserve(None, rows) {
+                    Ok(claims) => claims,
                     Err(error) => return Err((source, destination, error)),
                 };
-                let destination_bank = match destination.store.banks.acquire() {
+                let destination_bank = match destination.store.successor_bank() {
                     Ok(bank) => bank,
                     Err(error) => return Err((source, destination, error)),
                 };
-                let to = extents
-                    .iter()
-                    .flat_map(|extent| extent.start..extent.start + extent.count)
+                let to = claims
+                    .ranges()
+                    .into_iter()
+                    .flat_map(|(start, count)| start..start + count)
                     .collect::<Vec<_>>();
                 let source_history = match source.store.history_planes() {
                     Ok(planes) => planes,
@@ -131,10 +138,13 @@ impl OwnedCodecAdvance {
                     Err(error) => return Err((source, destination, error)),
                 };
                 let conversions = conversion_steps(&source, &destination, &from, &to);
+                let transaction = destination.store.begin_transaction();
                 Ok(Self {
+                    source_recurrent: source.store.recurrent_arenas(),
+                    destination_recurrent: destination.store.recurrent_arenas(),
                     source,
                     destination,
-                    extents,
+                    claims,
                     destination_bank,
                     source_history,
                     destination_history,
@@ -142,6 +152,7 @@ impl OwnedCodecAdvance {
                     source_codec,
                     destination_codec,
                     rows,
+                    _transaction: transaction,
                 })
             }
             Err(error) => Err((source, destination, error)),
@@ -155,9 +166,8 @@ impl OwnedCodecAdvance {
         if Rc::ptr_eq(&source.store, &destination.store)
             || !Rc::ptr_eq(&source.store.device, &destination.store.device)
             || destination.position != 0
-            || !destination.extents.is_empty()
+            || !destination.claims.is_empty()
             || destination.history_start != 0
-            || destination.retained_start != 0
             || source.store.component_specs != destination.store.component_specs
             || source.position > destination.store.context_capacity
             || source.expected_end > destination.store.context_capacity
@@ -232,9 +242,9 @@ impl OwnedCodecAdvance {
         OwnedCodecBindings {
             source_history: &self.source_history,
             destination_history: &self.destination_history,
-            source_recurrent: self.source.store.recurrent_arenas(),
+            source_recurrent: &self.source_recurrent,
             source_bank: self.source.bank.index(),
-            destination_recurrent: self.destination.store.recurrent_arenas(),
+            destination_recurrent: &self.destination_recurrent,
             destination_bank: self.destination_bank.index(),
             conversions: &self.conversions,
         }
@@ -242,14 +252,20 @@ impl OwnedCodecAdvance {
     pub fn abort(self) -> (SequenceState, SequenceState) {
         (self.source, self.destination)
     }
-    pub fn commit(mut self) -> SequenceState {
-        self.destination.position = self.source.position;
-        self.destination.expected_end = self.source.expected_end;
-        self.destination.history_start = self.source.history_start;
-        self.destination.retained_start = self.source.history_start;
-        self.destination.extents = std::mem::take(&mut self.extents);
-        std::mem::swap(&mut self.destination.bank, &mut self.destination_bank);
-        self.destination
+    pub fn commit(self) -> SequenceState {
+        let Self {
+            source,
+            mut destination,
+            claims,
+            mut destination_bank,
+            ..
+        } = self;
+        destination.position = source.position;
+        destination.expected_end = source.expected_end;
+        destination.history_start = source.history_start;
+        destination.claims.append(claims);
+        std::mem::swap(&mut destination.bank, &mut destination_bank);
+        destination
     }
 }
 
@@ -333,23 +349,32 @@ fn conversion_steps(
 }
 
 impl OwnedCompaction {
+    /// Join the longest suffix of a history's runs (at least two) holding at
+    /// most `max_rows` rows into one contiguous run: the recent small runs
+    /// decode leaves, moved with one bounded copy. Histories below the
+    /// segment limit need nothing.
     pub fn prepare(
         state: SequenceState,
+        max_rows: usize,
     ) -> Result<OwnedCompactionPreparation, (SequenceState, Error)> {
         let ranges = state.history_ranges();
-        if ranges.len() <= MAX_VISIBLE_SEGMENTS {
+        if ranges.len() < MAX_VISIBLE_SEGMENTS {
             return Ok(OwnedCompactionPreparation::NotNeeded(state));
         }
-        let Some(visible_rows) = ranges
-            .iter()
-            .try_fold(0usize, |total, (_, count)| total.checked_add(*count))
-        else {
-            return Err((
-                state,
-                Error::Request("visible history row count overflow".into()),
-            ));
-        };
-        let Some(destination) = state.store.reserve_contiguous(visible_rows) else {
+        let visible_rows = ranges.iter().map(|(_, count)| count).sum::<usize>();
+        let mut moved = 0;
+        let mut suffix = 0;
+        for (_, count) in ranges.iter().rev() {
+            if moved + count > max_rows {
+                break;
+            }
+            moved += count;
+            suffix += 1;
+        }
+        let destination = (suffix >= 2)
+            .then(|| state.store.reserve_contiguous(moved))
+            .flatten();
+        let Some(destination) = destination else {
             return Ok(OwnedCompactionPreparation::Deferred {
                 state,
                 segments: ranges.len(),
@@ -360,11 +385,15 @@ impl OwnedCompaction {
             Ok(history) => history,
             Err(error) => return Err((state, error)),
         };
-        let from = ranges
+        let from = ranges[ranges.len() - suffix..]
             .iter()
             .flat_map(|(start, count)| *start..*start + *count)
             .collect::<Vec<_>>();
-        let to = (destination.start..destination.start + destination.count).collect::<Vec<_>>();
+        let to = destination
+            .ranges()
+            .into_iter()
+            .flat_map(|(start, count)| start..start + count)
+            .collect::<Vec<_>>();
         let copies = state
             .store
             .components
@@ -377,11 +406,13 @@ impl OwnedCompaction {
                 to: to.clone(),
             })
             .collect();
+        let transaction = state.store.begin_transaction();
         Ok(OwnedCompactionPreparation::Ready(Self {
             state,
             destination,
             copies,
             history,
+            _transaction: transaction,
         }))
     }
 
@@ -389,7 +420,7 @@ impl OwnedCompaction {
         self.state.belongs_to(store)
     }
     pub fn rows(&self) -> usize {
-        self.destination.count
+        self.destination.rows()
     }
     pub fn copies(&self) -> &[PlaneCopy] {
         &self.copies
@@ -402,10 +433,16 @@ impl OwnedCompaction {
     }
 
     /// Called only after the owning state submission has physically finished.
-    pub fn commit(mut self) -> SequenceState {
-        self.state.extents = vec![self.destination];
-        self.state.retained_start = self.state.history_start;
-        self.state
+    pub fn commit(self) -> SequenceState {
+        let Self {
+            mut state,
+            destination,
+            ..
+        } = self;
+        let kept = state.claims.rows() - destination.rows();
+        drop(state.claims.split_off(kept));
+        state.claims.append(destination);
+        state
     }
 
     pub fn abort(self) -> SequenceState {
@@ -419,11 +456,11 @@ impl OwnedStateAdvance {
         if count == 0 || count > state.store.context_capacity.saturating_sub(state.position) {
             return Err((state, Error::from("advance exceeds context capacity")));
         }
-        let extents = match state.store.reserve(state.history_end(), count) {
-            Ok(extents) => extents,
+        let claims = match state.store.reserve(Some(&state.claims), count) {
+            Ok(claims) => claims,
             Err(error) => return Err((state, error)),
         };
-        let following = match state.store.banks.acquire() {
+        let following = match state.store.successor_bank() {
             Ok(following) => following,
             Err(error) => return Err((state, error)),
         };
@@ -431,17 +468,22 @@ impl OwnedStateAdvance {
             Ok(history) => history,
             Err(error) => return Err((state, error)),
         };
-        let destinations = extents
-            .iter()
-            .flat_map(|extent| extent.start..extent.start + extent.count)
+        let destinations = claims
+            .ranges()
+            .into_iter()
+            .flat_map(|(start, count)| start..start + count)
             .collect();
+        let recurrent = state.store.recurrent_arenas();
+        let transaction = state.store.begin_transaction();
         Ok(Self {
             state,
             count,
-            extents,
+            claims,
             following,
             history,
+            recurrent,
             destinations,
+            transaction,
         })
     }
 
@@ -465,7 +507,7 @@ impl OwnedStateAdvance {
 
     pub fn bindings(&self) -> OwnedAdvanceBindings<'_> {
         OwnedAdvanceBindings {
-            recurrent: self.state.store.recurrent_arenas(),
+            recurrent: &self.recurrent,
             previous_bank: self.state.bank.index(),
             following_bank: self.following.index(),
             history: &self.history,
@@ -491,10 +533,12 @@ impl OwnedStateAdvance {
         let Self {
             mut state,
             count,
-            mut extents,
+            claims,
             mut following,
             history: _,
+            recurrent,
             destinations: _,
+            transaction,
         } = self;
         if accepted > count {
             return Err((
@@ -506,24 +550,244 @@ impl OwnedStateAdvance {
             return Ok(OwnedAdvanceResolution::Aborted(state));
         }
         if accepted == count {
-            install_commit(&mut state, &mut extents, &mut following, count);
+            install_commit(&mut state, claims, &mut following, count);
             return Ok(OwnedAdvanceResolution::Committed(state));
         }
-        let (mut kept, released) = match split_extent_prefix(extents, accepted) {
-            Ok(parts) => parts,
-            Err(error) => return Err((state, Error::from(error))),
-        };
-        drop(released);
+        let mut kept = claims;
+        drop(kept.split_off(accepted));
         if !state.store.has_recurrent_components() {
-            install_commit(&mut state, &mut kept, &mut following, accepted);
+            install_commit(&mut state, kept, &mut following, accepted);
             return Ok(OwnedAdvanceResolution::Committed(state));
         }
         Ok(OwnedAdvanceResolution::Repair(OwnedRepairAdvance {
             state,
             accepted,
-            extents: kept,
+            claims: kept,
             following,
+            recurrent,
+            _transaction: transaction,
         }))
+    }
+}
+
+impl OwnedStateAdvance {
+    /// Tentative rows following this advance's rows, formed before this
+    /// advance is reconciled; see [`OwnedSuccessorAdvance`].
+    pub fn successor(&self, count: usize) -> Result<OwnedSuccessorAdvance, Error> {
+        let mut ranges = self.state.history_ranges();
+        append_ranges(&mut ranges, self.claims.ranges());
+        OwnedSuccessorAdvance::reserve(
+            &self.state.store,
+            Predecessor {
+                end: self.state.position + self.count,
+                bank: self.following.index(),
+                claims: &self.claims,
+                ranges,
+                history: &self.history,
+                recurrent: &self.recurrent,
+            },
+            count,
+        )
+    }
+}
+
+/// What a successor needs of the tentative rows it follows.
+struct Predecessor<'a> {
+    /// The position after the predecessor's rows.
+    end: usize,
+    /// The bank the predecessor publishes.
+    bank: usize,
+    claims: &'a Claims,
+    /// Visible history once the predecessor commits.
+    ranges: Vec<(usize, usize)>,
+    history: &'a [PlaneBuffer],
+    recurrent: &'a Rc<[Tensor]>,
+}
+
+/// Tentative rows that follow an in-flight advance (or successor) before it
+/// is reconciled, so the next step can be submitted while the previous one
+/// executes. It reads the predecessor's published bank and history and
+/// writes only its own rows and bank; its source state is the predecessor's
+/// committed state, joined by [`OwnedSuccessorAdvance::attach`] once the
+/// predecessor committed every row. Dropping it releases its rows and bank.
+/// It holds a transaction, so the backing is never recommitted under it.
+pub struct OwnedSuccessorAdvance {
+    store: Rc<StateStore>,
+    position: usize,
+    previous_bank: usize,
+    ranges: Vec<(usize, usize)>,
+    count: usize,
+    claims: Claims,
+    following: BankHandle,
+    history: Vec<PlaneBuffer>,
+    recurrent: Rc<[Tensor]>,
+    destinations: Vec<usize>,
+    transaction: Transaction,
+}
+
+impl OwnedSuccessorAdvance {
+    fn reserve(
+        store: &Rc<StateStore>,
+        predecessor: Predecessor<'_>,
+        count: usize,
+    ) -> Result<Self, Error> {
+        if count == 0 || count > store.context_capacity.saturating_sub(predecessor.end) {
+            return Err(Error::from("successor advance exceeds context capacity"));
+        }
+        if predecessor.ranges.len() >= MAX_VISIBLE_SEGMENTS {
+            return Err(Error::from("successor advance would exceed the segment limit"));
+        }
+        let claims = store.reserve(Some(predecessor.claims), count)?;
+        let following = store.successor_bank()?;
+        let destinations = claims
+            .ranges()
+            .into_iter()
+            .flat_map(|(start, count)| start..start + count)
+            .collect();
+        Ok(Self {
+            store: store.clone(),
+            position: predecessor.end,
+            previous_bank: predecessor.bank,
+            ranges: predecessor.ranges,
+            count,
+            claims,
+            following,
+            history: predecessor.history.to_vec(),
+            recurrent: predecessor.recurrent.clone(),
+            destinations,
+            transaction: store.begin_transaction(),
+        })
+    }
+
+    /// Tentative rows following this successor's rows.
+    pub fn successor(&self, count: usize) -> Result<OwnedSuccessorAdvance, Error> {
+        let mut ranges = self.ranges.clone();
+        append_ranges(&mut ranges, self.claims.ranges());
+        Self::reserve(
+            &self.store,
+            Predecessor {
+                end: self.position + self.count,
+                bank: self.following.index(),
+                claims: &self.claims,
+                ranges,
+                history: &self.history,
+                recurrent: &self.recurrent,
+            },
+            count,
+        )
+    }
+
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    pub fn rows(&self) -> usize {
+        self.count
+    }
+
+    pub fn belongs_to(&self, store: &Rc<StateStore>) -> bool {
+        Rc::ptr_eq(&self.store, store)
+    }
+
+    pub fn history_ranges(&self) -> Vec<(usize, usize)> {
+        self.ranges.clone()
+    }
+
+    pub fn bindings(&self) -> OwnedAdvanceBindings<'_> {
+        OwnedAdvanceBindings {
+            recurrent: &self.recurrent,
+            previous_bank: self.previous_bank,
+            following_bank: self.following.index(),
+            history: &self.history,
+            destinations: &self.destinations,
+        }
+    }
+
+    /// Join the predecessor's committed state: an ordinary advance over the
+    /// rows and bank this successor reserved. `state` must be exactly the
+    /// state the predecessor published (position, bank and history).
+    pub fn attach(self, state: SequenceState) -> Result<OwnedStateAdvance, (SequenceState, Error)> {
+        if !state.belongs_to(&self.store)
+            || state.position != self.position
+            || state.bank.index() != self.previous_bank
+            || state.history_ranges() != self.ranges
+        {
+            return Err((
+                state,
+                Error::from("successor advance does not follow the committed state"),
+            ));
+        }
+        let Self {
+            count,
+            claims,
+            following,
+            history,
+            recurrent,
+            destinations,
+            transaction,
+            ..
+        } = self;
+        Ok(OwnedStateAdvance {
+            state,
+            count,
+            claims,
+            following,
+            history,
+            recurrent,
+            destinations,
+            transaction,
+        })
+    }
+}
+
+/// The tentative rows of one launch slot: an advance of accepted state, or a
+/// successor of an advance still in flight.
+pub enum TentativeAdvance {
+    Accepted(OwnedStateAdvance),
+    Successor(OwnedSuccessorAdvance),
+}
+
+impl TentativeAdvance {
+    pub fn position(&self) -> usize {
+        match self {
+            Self::Accepted(advance) => advance.position(),
+            Self::Successor(advance) => advance.position(),
+        }
+    }
+
+    pub fn rows(&self) -> usize {
+        match self {
+            Self::Accepted(advance) => advance.rows(),
+            Self::Successor(advance) => advance.rows(),
+        }
+    }
+
+    pub fn belongs_to(&self, store: &Rc<StateStore>) -> bool {
+        match self {
+            Self::Accepted(advance) => advance.belongs_to(store),
+            Self::Successor(advance) => advance.belongs_to(store),
+        }
+    }
+
+    pub fn history_ranges(&self) -> Vec<(usize, usize)> {
+        match self {
+            Self::Accepted(advance) => advance.history_ranges(),
+            Self::Successor(advance) => advance.history_ranges(),
+        }
+    }
+
+    pub fn bindings(&self) -> OwnedAdvanceBindings<'_> {
+        match self {
+            Self::Accepted(advance) => advance.bindings(),
+            Self::Successor(advance) => advance.bindings(),
+        }
+    }
+
+    pub fn successor(&self, count: usize) -> Result<OwnedSuccessorAdvance, Error> {
+        match self {
+            Self::Accepted(advance) => advance.successor(count),
+            Self::Successor(advance) => advance.successor(count),
+        }
     }
 }
 
@@ -538,8 +802,10 @@ pub enum OwnedAdvanceResolution {
 pub struct OwnedRepairAdvance {
     state: SequenceState,
     accepted: usize,
-    extents: Vec<Rc<Extent>>,
+    claims: Claims,
     following: BankHandle,
+    recurrent: Rc<[Tensor]>,
+    _transaction: Transaction,
 }
 
 impl OwnedRepairAdvance {
@@ -558,7 +824,7 @@ impl OwnedRepairAdvance {
     /// One arena per recurrent component; repair reads `previous_bank` and
     /// writes only `following_bank`.
     pub fn recurrent(&self) -> &[Tensor] {
-        self.state.store.recurrent_arenas()
+        &self.recurrent
     }
 
     pub fn previous_bank(&self) -> usize {
@@ -569,14 +835,16 @@ impl OwnedRepairAdvance {
         self.following.index()
     }
 
-    pub fn commit(mut self) -> SequenceState {
-        install_commit(
-            &mut self.state,
-            &mut self.extents,
-            &mut self.following,
-            self.accepted,
-        );
-        self.state
+    pub fn commit(self) -> SequenceState {
+        let Self {
+            mut state,
+            accepted,
+            claims,
+            mut following,
+            ..
+        } = self;
+        install_commit(&mut state, claims, &mut following, accepted);
+        state
     }
 
     pub fn abort(self) -> SequenceState {
@@ -630,6 +898,71 @@ mod tests {
         };
         assert_eq!(state.position(), 2);
         assert_eq!(store.occupied_rows(), 2);
+    }
+
+    #[test]
+    fn successors_follow_in_flight_advances_and_attach_to_their_commits() {
+        let Some(device) = DeviceCatalog::discover()
+            .ok()
+            .and_then(|catalog| catalog.open_backend(BackendName::Cpu).ok())
+        else {
+            return;
+        };
+        let store = StateStore::new(
+            Rc::new(device),
+            8,
+            8,
+            vec![
+                ComponentDescriptor::new(LayerRef::Target(0), CodecSpec::dense(DType::F32, 1, 1), 1)
+                    .unwrap(),
+            ],
+            vec![],
+            BankCapacity {
+                active: 1,
+                in_flight: 3,
+                retained: 0,
+            },
+        )
+        .unwrap();
+        let state = store.create().unwrap();
+        let first = OwnedStateAdvance::begin(state, 2).ok().unwrap();
+        let second = first.successor(1).unwrap();
+        let third = second.successor(1).unwrap();
+        assert_eq!((second.position(), third.position()), (2, 3));
+        assert_eq!(second.bindings().previous_bank, first.bindings().following_bank);
+        assert_eq!(third.bindings().previous_bank, second.bindings().following_bank);
+        assert_eq!(second.history_ranges(), first.bindings().destinations.iter().map(|&row| (row, 1)).fold(
+            Vec::new(),
+            |mut ranges, range| {
+                append_ranges(&mut ranges, [range]);
+                ranges
+            },
+        ));
+        // Rows follow their predecessors physically: one run.
+        assert_eq!(second.bindings().destinations, [first.bindings().destinations[1] + 1]);
+        assert_eq!(third.bindings().destinations, [second.bindings().destinations[0] + 1]);
+        assert_eq!(store.occupied_rows(), 4);
+
+        let OwnedAdvanceResolution::Committed(state) = first.commit_all().ok().unwrap() else {
+            panic!("full accepted prefix must commit");
+        };
+        // A successor attaches only to the state its predecessor published.
+        let (state, _) = third.attach(state).err().unwrap();
+        let second = second.attach(state).ok().unwrap();
+        let OwnedAdvanceResolution::Committed(state) = second.commit_all().ok().unwrap() else {
+            panic!("full accepted prefix must commit");
+        };
+        assert_eq!(state.position(), 3);
+        assert_eq!(state.history_ranges().len(), 1);
+        // The dropped third successor released its row and bank.
+        assert_eq!(store.occupied_rows(), 3);
+        let next = OwnedStateAdvance::begin(state, 1).ok().unwrap();
+        let orphan = next.successor(1).unwrap();
+        drop(orphan);
+        assert_eq!(store.occupied_rows(), 4);
+        let state = next.abort();
+        assert_eq!(state.position(), 3);
+        assert_eq!(store.occupied_rows(), 3);
     }
 
     #[test]

@@ -189,10 +189,20 @@ pub const ARITHMETIC_TOLERANCE: Validation = Validation::Relative { error: 0.05 
 /// Version of the search procedure: part of every stored tuning result's
 /// key. Bump it whenever the search could choose differently given the same
 /// measurements.
-pub const SEARCH_VERSION: u32 = 1;
+/// 2: per-point keyed measurement and costs relative to the defaults.
+/// 3: device warmed before each measured batch; a finalist whose confirmed
+///    samples spread widely is excluded.
+/// 4: points of one class (the same rows at different history lengths)
+///    split their weight by real time.
+pub const SEARCH_VERSION: u32 = 4;
 /// Configurations one model's tuning may evaluate in all (`B_model`,
-/// §D3), shared equally among its tuning units.
+/// §D3), allocated by [`allocate`].
 pub const MODEL_BUDGET: usize = 100;
+/// Spaces of at most this many configurations are searched completely when
+/// the model's budget holds all of them: at the budgets the searches get,
+/// the replay found the search on 24-configuration spaces within 2% of the
+/// best 0% of the time (tuning spec §E3).
+pub const COMPLETE_SIZE: usize = 24;
 /// The search's constants (§D2).
 pub const SEARCH_SETTINGS: SearchSettings = SearchSettings {
     improvement: 0.01,
@@ -219,6 +229,9 @@ pub struct PointShape {
     pub rows: u64,
     /// Visible history rows for attention points.
     pub context: Option<u64>,
+    /// The row point whose history lengths this point varies: points of one
+    /// class split its weight by real time (`seismic::TuningPoint::class`).
+    pub class: Option<String>,
 }
 
 /// The engine's shape bounds that decide which points exist.
@@ -259,6 +272,7 @@ fn row_point(rows: u64) -> PointShape {
         weight: row_share(rows),
         rows,
         context: None,
+        class: None,
     }
 }
 
@@ -342,6 +356,7 @@ pub fn with_contexts(limits: TuningLimits, rows: Vec<PointShape>) -> Vec<PointSh
                     weight: point.weight * share,
                     rows: point.rows,
                     context: Some(context),
+                    class: Some(point.label.clone()),
                 })
             })
             .collect(),
@@ -719,13 +734,36 @@ fn f16_bits(value: f32) -> u16 {
 /// result applies to (a tuning unit).
 type TuningKey = (&'static str, String, BTreeMap<String, u64>);
 
-/// Split `total` configurations equally among tuning units of `sizes`
-/// admissible configurations each (§D3): a unit smaller than its share takes
-/// only its size, and what it leaves is shared again among the others. Every
-/// unit gets at least one configuration (its defaults). Deterministic given
-/// the sizes in order; the remainder of an uneven split goes to the first
-/// units.
+/// Split `total` configurations among tuning units of `sizes` admissible
+/// configurations each (§D3). Units of at most [`COMPLETE_SIZE`]
+/// configurations are searched completely when all of them fit in `total`;
+/// the rest is split equally among the larger units ([`share`]). When they
+/// do not all fit, every unit shares `total` equally.
 pub fn allocate(total: usize, sizes: &[usize]) -> Vec<usize> {
+    let small = sizes.iter().map(|size| (*size).max(1)).filter(|size| *size <= COMPLETE_SIZE);
+    let complete = small.clone().sum::<usize>();
+    let large = sizes.iter().filter(|size| **size > COMPLETE_SIZE).count();
+    if complete + large > total {
+        return share(total, sizes);
+    }
+    let large_units = (0..sizes.len()).filter(|unit| sizes[*unit] > COMPLETE_SIZE).collect::<Vec<_>>();
+    let large_budgets = share(
+        total - complete,
+        &large_units.iter().map(|unit| sizes[*unit]).collect::<Vec<_>>(),
+    );
+    let mut budgets = sizes.iter().map(|size| (*size).max(1)).collect::<Vec<_>>();
+    for (unit, budget) in large_units.into_iter().zip(large_budgets) {
+        budgets[unit] = budget;
+    }
+    budgets
+}
+
+/// Split `total` configurations equally among tuning units of `sizes`
+/// admissible configurations each: a unit smaller than its share takes only
+/// its size, and what it leaves is shared again among the others. Every unit
+/// gets at least one configuration (its defaults). Deterministic given the
+/// sizes in order; the remainder of an uneven split goes to the first units.
+fn share(total: usize, sizes: &[usize]) -> Vec<usize> {
     let mut budgets = vec![0; sizes.len()];
     let mut open = (0..sizes.len()).collect::<Vec<_>>();
     let mut remaining = total;
@@ -862,14 +900,16 @@ impl<'a> Tuner<'a> {
             bindings: bindings.clone(),
             outcome,
         };
-        let configurations = implementation
-            .admissible(statics)
-            .map_err(|error| failure(error.to_string()))?
-            .len();
+        let configurations = || {
+            implementation
+                .admissible(statics)
+                .map(|admissible| admissible.len())
+                .map_err(|error| failure(error.to_string()))
+        };
         let budget = match &mut self.allocation {
             Allocation::Census(units) => {
                 if !units.iter().any(|(counted, _)| *counted == key) {
-                    units.push((key, configurations));
+                    units.push((key, configurations()?));
                 }
                 return implementation
                     .default_specialization(statics)
@@ -924,7 +964,7 @@ impl<'a> Tuner<'a> {
         self.context.observer.event(&TuningEvent::Started {
             entry,
             bindings: bindings.clone(),
-            configurations,
+            configurations: configurations()?,
             points: shapes.len(),
         });
         let mut shared = HashMap::new();
@@ -951,6 +991,7 @@ impl<'a> Tuner<'a> {
             .map(|((shape, cases), initialize)| TuningPoint {
                 label: shape.label.clone(),
                 weight: shape.weight,
+                class: shape.class.clone(),
                 rotation: cases.iter_mut().map(T::args).collect(),
                 initialize,
             })
@@ -966,17 +1007,12 @@ impl<'a> Tuner<'a> {
                 deadline: Some(self.deadline),
             }),
         };
-        #[cfg(feature = "tuning-survey")]
-        let held = survey::hold(entry).map_err(failure)?;
         let result = case
             .tune(self.device, statics, points, ARITHMETIC_TOLERANCE, strategy)
             .map_err(|error| failure(error.to_string()))?;
         #[cfg(feature = "tuning-survey")]
-        {
-            drop(held);
-            if surveyed {
-                survey::record(&key, &result).map_err(failure)?;
-            }
+        if surveyed {
+            survey::record(&key, budget, &result).map_err(failure)?;
         }
         drop(rotations);
         drop(shared);
@@ -1058,7 +1094,10 @@ fn tuning_key_material(
 ) -> String {
     let points = shapes
         .iter()
-        .map(|shape| format!("{}={:?}", shape.label, shape.weight))
+        .map(|shape| match &shape.class {
+            Some(class) => format!("{}={:?}@{class}", shape.label, shape.weight),
+            None => format!("{}={:?}", shape.label, shape.weight),
+        })
         .collect::<Vec<_>>()
         .join(",");
     format!(

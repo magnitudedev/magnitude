@@ -9,6 +9,7 @@ use magnitude_engine::{
     telemetry::{Telemetry, DEFAULT_TRACES_ENDPOINT},
 };
 use magnitude_model_executor::{platform::DeviceRequest, ExecutionPath};
+use magnitude_model_state::KvCodec;
 use std::{path::PathBuf, time::Duration};
 
 struct Options {
@@ -23,9 +24,20 @@ struct Options {
     output_capacity: usize,
     method: ModelMethod,
     mtp_proposals: Option<u8>,
+    kv_codec: KvCodec,
+    lookahead: bool,
     telemetry_endpoint: String,
     device: DeviceRequest,
     kernel_cache: Option<PathBuf>,
+}
+
+/// `on` or `off`.
+fn switch(flag: &str, value: &str) -> Result<bool, String> {
+    match value {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        other => Err(format!("{flag} takes on or off, not {other}")),
+    }
 }
 
 fn value(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<String, String> {
@@ -45,6 +57,8 @@ fn parse() -> Result<Options, String> {
     let mut output_capacity = 256_usize;
     let mut method = ModelMethod::Auto;
     let mut mtp_proposals = None;
+    let mut kv_codec = ModelPolicy::default().kv_codec;
+    let mut lookahead = ModelPolicy::default().lookahead;
     let mut telemetry_endpoint = DEFAULT_TRACES_ENDPOINT.to_owned();
     let mut device = DeviceRequest::Automatic;
     let mut kernel_cache = None;
@@ -100,6 +114,8 @@ fn parse() -> Result<Options, String> {
                         .map_err(|e| format!("{e}"))?,
                 )
             }
+            "--kv-codec" => kv_codec = value(&flag, &mut args)?.parse()?,
+            "--lookahead" => lookahead = switch(&flag, &value(&flag, &mut args)?)?,
             "--telemetry" => telemetry_endpoint = value(&flag, &mut args)?,
             "--device" => {
                 device = value(&flag, &mut args)?
@@ -112,8 +128,9 @@ fn parse() -> Result<Options, String> {
                     "magnitude-engine --model TARGET.gguf [--projector PROJECTOR.gguf | --no-projector] \
                      [--host ADDR] [--port N] [--served-model NAME] [--context-tokens N] [--storage-gib N] \
                      [--max-batch N] [--output-capacity N] [--method auto|plain|mtp] \
-                     [--mtp-proposals N] [--telemetry URL] \
-                     [--device auto|metal|cuda|cpu|SELECTOR] [--cache-dir DIR]"
+                     [--mtp-proposals N] [--kv-codec dense|affine-k8v4] [--lookahead on|off] \
+                     [--telemetry URL] \
+                     [--device auto|metal|cuda|vulkan|cpu|SELECTOR] [--cache-dir DIR]"
                 );
                 std::process::exit(0);
             }
@@ -145,6 +162,8 @@ fn parse() -> Result<Options, String> {
         output_capacity,
         method,
         mtp_proposals,
+        kv_codec,
+        lookahead,
         telemetry_endpoint,
         device,
         kernel_cache,
@@ -178,7 +197,8 @@ fn run() -> Result<(), String> {
         model: ModelPolicy {
             method: options.method,
             mtp_proposals: options.mtp_proposals,
-            ..ModelPolicy::default()
+            kv_codec: options.kv_codec,
+            lookahead: options.lookahead,
         },
         context_tokens: options.context_tokens,
         service,

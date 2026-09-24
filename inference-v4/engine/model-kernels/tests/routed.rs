@@ -223,11 +223,35 @@ fn assert_close(name: &str, actual: &[f32], expected: &[f64], tolerance: f64) {
     }
 }
 
+/// CUDA, else Metal; `SEISMIC_TEST_BACKEND=vulkan` selects Vulkan (a CUDA
+/// host also has a Vulkan device).
 fn native_device() -> Option<seismic::Device> {
     let catalog = seismic::DeviceCatalog::discover().ok()?;
-    [seismic::BackendName::Cuda, seismic::BackendName::Metal]
-        .into_iter()
-        .find_map(|backend| catalog.open_backend(backend).ok())
+    match std::env::var("SEISMIC_TEST_BACKEND").ok().as_deref() {
+        // A selected backend must open: never skip silently.
+        Some("vulkan") => Some(catalog.open_backend(seismic::BackendName::Vulkan).expect("the Vulkan device opens")),
+        Some(other) => panic!("SEISMIC_TEST_BACKEND={other}: only vulkan is selectable"),
+        None => [seismic::BackendName::Cuda, seismic::BackendName::Metal]
+            .into_iter()
+            .find_map(|backend| catalog.open_backend(backend).ok()),
+    }
+}
+
+/// The route's hidden-axis splits on the device's backend (CUDA splits its
+/// router GEMM; Metal has no split parameter).
+fn route_splits(device: &seismic::Device) -> Vec<u64> {
+    match device.backend() {
+        seismic::BackendName::Cuda => vec![8, 4, 16],
+        _ => vec![1],
+    }
+}
+
+/// The route's mapping parameters for `simdgroups` and `split`.
+fn route_mapping(device: &seismic::Device, simdgroups: u64, split: u64) -> Vec<(&'static str, u64)> {
+    match device.backend() {
+        seismic::BackendName::Cuda => vec![("SIMDGROUPS", simdgroups), ("SPLIT", split)],
+        _ => vec![("SIMDGROUPS", simdgroups)],
+    }
 }
 
 #[test]
@@ -241,12 +265,14 @@ fn native_route_matches_portable_body_for_every_mapping() {
         for (rows, normalize) in [(1usize, 1), (5, 0), (9, 1)] {
             let case = RouteCase::new(rows, normalize);
             let (normalized, coefficient, routes, scores) = case.portable(&module, activation);
-            for simdgroups in [8, 4, 2] {
-                let specialization = seismic::NativeSpecialization::new()
-                    .with_static("H", H as u64)
-                    .with_static("E", E as u64)
-                    .with_static("K", K as u64)
-                    .with_param("SIMDGROUPS", simdgroups);
+            for (simdgroups, split) in [8, 4, 2]
+                .into_iter()
+                .flat_map(|simdgroups| route_splits(&device).into_iter().map(move |split| (simdgroups, split)))
+            {
+                let specialization = specialize(
+                    &[("H", H as u64), ("E", E as u64), ("K", K as u64)],
+                    &route_mapping(&device, simdgroups, split),
+                );
                 let kernel = qwen_routed_route::native_for_device_with(
                     &device,
                     qwen_routed_route::Elements {
@@ -271,7 +297,7 @@ fn native_route_matches_portable_body_for_every_mapping() {
                         normalize,
                     })
                     .unwrap();
-                let label = format!("{activation:?} rows {rows} SIMDGROUPS {simdgroups}");
+                let label = format!("{activation:?} rows {rows} SIMDGROUPS {simdgroups} SPLIT {split}");
                 let expected_routes = routes.iter().map(|v| *v as i32).collect::<Vec<_>>();
                 assert_eq!(read_i32(&native_routes), expected_routes, "{label} routes");
                 assert_close(&format!("{label} scores"), &read_f32(&native_scores), &scores, 1e-5);
@@ -393,7 +419,7 @@ fn portable_group_is_a_stable_expert_permutation() {
 fn native_group_matches_portable_tables() {
     let Some(device) = native_device() else { return };
     let module = module();
-    for (rows, experts, tile) in [(1, 8, 4), (13, 8, 4), (37, 16, 8), (64, 32, 16), (200, 32, 32)] {
+    for (rows, experts, tile) in [(1, 8, 4), (13, 8, 4), (37, 16, 8), (64, 32, 16), (200, 32, 32), (512, 256, 32)] {
         let case = GroupCase::new(rows, experts, tile);
         let expected = case.portable(&module);
         let blocks = case.blocks();
@@ -938,6 +964,18 @@ fn decode_mappings(device: &seismic::Device) -> Vec<Vec<(&'static str, u64)>> {
             vec![("TPW", 1), ("KSPLIT", 2)],
             vec![("TPW", 2), ("KSPLIT", 4)],
         ],
+        seismic::BackendName::Vulkan => vec![
+            vec![("SIMDGROUPS", 2), ("ROWS", 1)],
+            vec![("SIMDGROUPS", 4), ("ROWS", 2)],
+            vec![("SIMDGROUPS", 8), ("ROWS", 4)],
+        ],
+        seismic::BackendName::Metal => vec![
+            vec![("SIMDGROUPS", 2), ("ROWS", 1), ("LANES", 32)],
+            vec![("SIMDGROUPS", 4), ("ROWS", 2), ("LANES", 32)],
+            vec![("SIMDGROUPS", 4), ("ROWS", 4), ("LANES", 16)],
+            vec![("SIMDGROUPS", 8), ("ROWS", 4), ("LANES", 16)],
+            vec![("SIMDGROUPS", 16), ("ROWS", 1), ("LANES", 16)],
+        ],
         _ => vec![
             vec![("SIMDGROUPS", 2), ("ROWS", 1)],
             vec![("SIMDGROUPS", 4), ("ROWS", 2)],
@@ -1227,7 +1265,8 @@ impl Qwen35b {
     }
 
     /// Native routing of `residual`, checked against the host reference;
-    /// every SIMDGROUPS mapping must give the same bits.
+    /// every SIMDGROUPS mapping must give the same bits (at the backend's
+    /// first split).
     fn route(&self, device: &seismic::Device, residual: &[f32]) -> NativeRouting {
         let (h, e, k) = (Self::HIDDEN as u64, Self::EXPERTS as u64, Self::CHOICES as u64);
         let rows = residual.len() / Self::HIDDEN;
@@ -1244,7 +1283,7 @@ impl Qwen35b {
             let outcome = qwen_routed_route::native_for_device_with(
                 device,
                 qwen_routed_route::Elements { NW: bf16, RW: bf16, A: bf16 },
-                &specialize(&[("H", h), ("E", e), ("K", k)], &[("SIMDGROUPS", simdgroups)]),
+                &specialize(&[("H", h), ("E", e), ("K", k)], &route_mapping(device, simdgroups, route_splits(device)[0])),
             )
             .unwrap()
             .call(qwen_routed_route::Args {
@@ -1705,6 +1744,7 @@ fn routed_kernel_timings() {
         .map(|(m, inputs)| seismic::TuningPoint {
             label: format!("m{m}"),
             weight: 1.0,
+            class: None,
             rotation: inputs
                 .iter_mut()
                 .zip(&layers)
@@ -1762,6 +1802,7 @@ fn routed_kernel_timings() {
         .map(|(m, inputs)| seismic::TuningPoint {
             label: format!("m{m}"),
             weight: 1.0,
+            class: None,
             rotation: inputs
                 .iter()
                 .zip(&layers)
@@ -1800,6 +1841,7 @@ fn routed_kernel_timings() {
         .map(|(m, inputs)| seismic::TuningPoint {
             label: format!("m{m}"),
             weight: 1.0,
+            class: None,
             rotation: inputs
                 .iter()
                 .zip(&layers)
@@ -1862,6 +1904,7 @@ fn routed_kernel_timings() {
         .map(|(m, inputs)| seismic::TuningPoint {
             label: format!("m{m}"),
             weight: 1.0,
+            class: None,
             rotation: inputs
                 .iter()
                 .zip(&layers)
@@ -1894,6 +1937,7 @@ fn routed_kernel_timings() {
         .map(|(m, inputs)| seismic::TuningPoint {
             label: format!("m{m}"),
             weight: 1.0,
+            class: None,
             rotation: inputs
                 .iter()
                 .zip(&layers)
@@ -1955,6 +1999,7 @@ fn routed_kernel_timings() {
         .map(|((m, inputs), tables)| seismic::TuningPoint {
             label: format!("m{m}"),
             weight: 1.0,
+            class: None,
             rotation: inputs
                 .iter()
                 .zip(tables.iter_mut())

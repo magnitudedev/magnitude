@@ -30,12 +30,13 @@
 //!     [--sequences 1,2,4,8]
 //!     [--warm 16] [--steps 32] [--attribution-steps 4]
 //! forward_bench qualify --model M.gguf --reference REF_DIR --output out.json
-//!     [--chunks N] [--label NAME]
+//!     [--chunks N] [--label NAME] [--verify-width W]
 //! ```
 //!
 //! Either mode takes `--cache-dir DIR`, the engine's kernel cache (compiled
 //! kernels and tuning results); without it every load forms and tunes every
-//! entry.
+//! entry. Either mode takes `--kv-codec dense|affine-k8v4` (default dense),
+//! the target history codec.
 //!
 //! Built with `--features pinned-tuning` (development only), either mode also
 //! takes `--tuning-record FILE` or `--tuning-replay FILE` to pin tuned
@@ -50,6 +51,7 @@ use magnitude_engine::{
     options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, StoragePolicy},
 };
 use magnitude_model_contracts::DecoderGeometry;
+use magnitude_model_state::KvCodec;
 use magnitude_model_executor::{
     Demand, DomainError, ExecutionPath, ExecutorDomain, Operation, Outcome, PhysicalDecision,
     PhysicalResolution, RequestId, Sampling, SelectSpec, Shaping, TokenId, WorkKind,
@@ -220,8 +222,8 @@ mod tuning_pin {
 }
 
 /// `--tuning-survey DIR [--tuning-survey-samples N] [--tuning-survey-entries
-/// E,..] [--tuning-survey-widen ENTRY:P=v,v,..;Q=v,..] [--tuning-survey-lock
-/// DIR]`, only with the development feature `tuning-survey`
+/// E,..] [--tuning-survey-widen ENTRY:P=v,v,..;Q=v,..]`, only with the
+/// development feature `tuning-survey`
 /// (`cargo run --release --example forward_bench --features tuning-survey`).
 ///
 /// Every tuned entry instance (or the named entries) is surveyed instead of
@@ -229,8 +231,8 @@ mod tuning_pin {
 /// point (15 by default) and validated, one JSON record per instance in DIR:
 /// the true costs a search's choice is judged against (tuning spec §E).
 /// `--tuning-survey-widen` replaces an entry's parameter domains (keeping
-/// each default first); `--tuning-survey-lock` takes that lock directory
-/// around each entry's survey. See `magnitude_model_executor::tuning_survey`.
+/// each default first). On a shared host, run the whole process under the
+/// GPU lock. See `magnitude_model_executor::tuning_survey`.
 #[cfg(feature = "tuning-survey")]
 mod tuning_survey {
     use magnitude_model_executor::tuning_survey::{self, TuningSurvey};
@@ -287,7 +289,6 @@ mod tuning_survey {
                     .insert(name.to_owned(), values);
             }
         }
-        let lock = flags.remove("--tuning-survey-lock").map(PathBuf::from);
         if let Some(flag) = flags.keys().next() {
             return Err(format!("unknown flag {flag}"));
         }
@@ -297,7 +298,6 @@ mod tuning_survey {
             samples,
             entries,
             domains,
-            lock,
         });
         Ok(())
     }
@@ -314,14 +314,30 @@ pub(crate) struct Options {
     /// History tokens before each prefill cell's chunks (0 = fresh sequences).
     prefill_history: usize,
     sequences: Vec<usize>,
+    /// Rows of one sequence's verification step (`verify` cell).
+    widths: Vec<usize>,
     warm: usize,
     steps: usize,
     attribution_steps: usize,
     reference: Option<PathBuf>,
     chunks: Option<usize>,
+    /// `qualify`: scored rows per teacher-forced step; above 1 they run as one
+    /// verification forward (the MTP verify shapes) instead of single-row decodes.
+    verify_width: usize,
     label: Option<String>,
     /// The kernel cache directory (`--cache-dir`); none caches nothing.
     kernel_cache: Option<PathBuf>,
+    /// The target history codec (`--kv-codec`).
+    kv_codec: KvCodec,
+    /// The device to run on (`--device auto|metal|cuda|vulkan|cpu|SELECTOR`).
+    device: magnitude_model_executor::platform::DeviceRequest,
+    /// Cross-step pipelining (`--lookahead on|off`, default off). It needs
+    /// `--decode-tokens selected`: the queued successor step embeds the
+    /// previous selection, so only that decode stream claims it.
+    lookahead: bool,
+    /// Decode input tokens (`--decode-tokens forced|selected`, default
+    /// forced): the forced stream, or each step's greedy selection fed back.
+    feedback: bool,
 }
 
 fn list(value: &str) -> Result<Vec<usize>, String> {
@@ -348,13 +364,19 @@ impl Options {
             prefills: vec![32, 128, 512],
             prefill_history: 0,
             sequences: vec![1, 2, 4, 8],
+            widths: vec![1, 2, 3, 4, 5, 6, 8],
             warm: 16,
             steps: 32,
             attribution_steps: 4,
             reference: None,
             chunks: None,
+            verify_width: 1,
             label: None,
             kernel_cache: None,
+            kv_codec: KvCodec::Dense,
+            device: magnitude_model_executor::platform::DeviceRequest::Automatic,
+            lookahead: false,
+            feedback: false,
         };
         while let Some(flag) = args.next() {
             let mut value = || args.next().ok_or(format!("{flag} requires a value"));
@@ -376,6 +398,7 @@ impl Options {
                 "--context" => options.contexts = list(&value()?)?,
                 "--prefill" => options.prefills = list(&value()?)?,
                 "--sequences" => options.sequences = list(&value()?)?,
+                "--widths" => options.widths = list(&value()?)?,
                 "--prefill-history" => {
                     options.prefill_history = value()?
                         .parse()
@@ -395,8 +418,35 @@ impl Options {
                     options.chunks =
                         Some(value()?.parse().map_err(|_| "--chunks requires a count")?)
                 }
+                "--verify-width" => {
+                    options.verify_width = value()?
+                        .parse()
+                        .ok()
+                        .filter(|width| *width > 0)
+                        .ok_or("--verify-width requires a positive count")?
+                }
                 "--label" => options.label = Some(value()?),
                 "--cache-dir" => options.kernel_cache = Some(PathBuf::from(value()?)),
+                "--kv-codec" => options.kv_codec = value()?.parse()?,
+                "--device" => options.device = value()?.parse().map_err(|error| format!("{error}"))?,
+                "--lookahead" => {
+                    options.lookahead = match value()?.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        other => return Err(format!("--lookahead takes on or off, not {other}")),
+                    }
+                }
+                "--decode-tokens" => {
+                    options.feedback = match value()?.as_str() {
+                        "forced" => false,
+                        "selected" => true,
+                        other => {
+                            return Err(format!(
+                                "--decode-tokens takes forced or selected, not {other}"
+                            ))
+                        }
+                    }
+                }
                 other => return Err(format!("unknown flag {other}")),
             }
         }
@@ -405,8 +455,11 @@ impl Options {
         if options.steps == 0 || options.cells.is_empty() {
             return Err("--steps and --cells must be non-empty".into());
         }
+        if options.lookahead && !options.feedback {
+            return Err("--lookahead on needs --decode-tokens selected".into());
+        }
         for cell in &options.cells {
-            if !matches!(cell.as_str(), "decode" | "prefill" | "concurrent") {
+            if !matches!(cell.as_str(), "decode" | "prefill" | "concurrent" | "verify") {
                 return Err(format!("unknown cell {cell:?}"));
             }
         }
@@ -423,12 +476,20 @@ pub(crate) struct Bench {
     /// The loaded model's decoder geometry (`qualify` selects the D4 limits by it).
     geometry: DecoderGeometry,
     next_request: u64,
+    /// Cross-step pipelining: traces are collected once per measurement
+    /// window (a per-step collect would wait for the step queued behind it).
+    lookahead: bool,
+    /// Decode feeds back each step's selection instead of forced tokens.
+    feedback: bool,
 }
 
 /// One open request and its accepted position.
 pub(crate) struct Sequence {
     request: RequestId,
     position: usize,
+    /// The token the last step selected, which decode feeds back under
+    /// lookahead.
+    selected: Option<TokenId>,
 }
 
 /// Host and device times of one step. All times are `seismic::host_seconds`.
@@ -447,7 +508,11 @@ impl Bench {
         storage_gib: u64,
         context_tokens: usize,
         max_batch: usize,
+        decode_rows: usize,
         kernel_cache: Option<&std::path::Path>,
+        kv_codec: KvCodec,
+        device: magnitude_model_executor::platform::DeviceRequest,
+        lookahead: bool,
     ) -> Result<Self, String> {
         let storage_bytes = storage_gib
             .checked_mul(1 << 30)
@@ -459,14 +524,16 @@ impl Bench {
             },
             model: ModelPolicy {
                 method: ModelMethod::Plain,
-                ..ModelPolicy::default()
+                mtp_proposals: None,
+                kv_codec,
+                lookahead,
             },
             context_tokens: Some(context_tokens),
             service: ServiceLimits {
                 max_requests: max_batch,
                 max_batch,
                 prefill_tokens: PREFILL_ROWS,
-                decode_tokens: max_batch,
+                decode_tokens: decode_rows,
                 decode_share: 0.5,
                 locality_seconds: 1.0,
             },
@@ -476,7 +543,7 @@ impl Bench {
                 safety_reserve_bytes: (storage_bytes / 10).min(1 << 30),
             },
             path,
-            device: magnitude_model_executor::platform::DeviceRequest::Automatic,
+            device,
             control_capacity: 256,
             kernel_cache: kernel_cache.map(std::path::Path::to_path_buf),
         }
@@ -492,6 +559,8 @@ impl Bench {
             vocabulary,
             geometry,
             next_request: 1,
+            lookahead,
+            feedback: false,
         })
     }
 
@@ -506,7 +575,17 @@ impl Bench {
         Ok(Sequence {
             request,
             position: 0,
+            selected: None,
         })
+    }
+
+    /// A decode step's input token: the forced token, or with feedback the
+    /// sequence's last selection (under lookahead, the step queued ahead).
+    fn decode_token(&self, sequence: &Sequence) -> TokenId {
+        match sequence.selected {
+            Some(token) if self.feedback => token,
+            _ => self.token(sequence.position),
+        }
     }
 
     pub(crate) fn close(&mut self, sequence: Sequence) -> Result<(), String> {
@@ -595,6 +674,9 @@ impl Bench {
             if pending.request() != sequence.request {
                 return Err("step outcome order differs from its sequences".into());
             }
+            if let Outcome::Forward { rows } = pending.outcome() {
+                sequence.selected = rows.last().and_then(|row| row.selected).map(|row| row.token);
+            }
             outcomes.push(pending.outcome().clone());
             let rows = pending.rows();
             match self
@@ -603,7 +685,6 @@ impl Bench {
                     pending,
                     PhysicalDecision {
                         accepted_rows: rows,
-                        head_prefix: None,
                     },
                 )
                 .map_err(text)?
@@ -752,28 +833,29 @@ fn medians(summaries: &[Value]) -> Value {
 }
 
 /// Device time per entry over attribution steps, per step.
-fn attribution(steps: &[Step]) -> Value {
+/// Device time per entry of `steps` attributed steps, from their launches
+/// that started before `until` (the last step's end: a step queued behind it
+/// under lookahead is not one of them).
+fn attribution(submissions: &[TracedSubmission], steps: usize, until: f64) -> Value {
     let mut entries: BTreeMap<String, (usize, f64)> = BTreeMap::new();
     let mut timed = 0.0;
-    for step in steps {
-        for submission in &step.submissions {
-            for launch in &submission.launches {
-                let Some((start, end)) = launch.device else {
-                    continue;
-                };
-                let label = if launch.launch == 0 {
-                    launch.entry.clone()
-                } else {
-                    format!("{}#{}", launch.entry, launch.launch)
-                };
-                let entry = entries.entry(label).or_default();
-                entry.0 += 1;
-                entry.1 += end - start;
-                timed += end - start;
-            }
+    for submission in submissions {
+        for launch in &submission.launches {
+            let Some((start, end)) = launch.device.filter(|(start, _)| *start < until) else {
+                continue;
+            };
+            let label = if launch.launch == 0 {
+                launch.entry.clone()
+            } else {
+                format!("{}#{}", launch.entry, launch.launch)
+            };
+            let entry = entries.entry(label).or_default();
+            entry.0 += 1;
+            entry.1 += end - start;
+            timed += end - start;
         }
     }
-    let count = steps.len().max(1) as f64;
+    let count = steps.max(1) as f64;
     let mut rows = entries
         .into_iter()
         .map(|(entry, (launches, seconds))| {
@@ -789,7 +871,7 @@ fn attribution(steps: &[Step]) -> Value {
     let device_ms = |row: &Value| row["device_ms_per_step"].as_f64().expect("device time");
     rows.sort_by(|a, b| device_ms(b).total_cmp(&device_ms(a)));
     json!({
-        "steps": steps.len(),
+        "steps": steps,
         "timed_device_ms_per_step": timed / count * MS,
         "entries": rows,
     })
@@ -817,25 +899,55 @@ fn measure(
      -> Result<Step, String> {
         let operations = make(bench, sequences);
         let mut refs = sequences.iter_mut().collect::<Vec<_>>();
-        bench.step(operations, &mut refs, Some(trace)).map(|(step, _)| step)
+        // Under lookahead the trace is collected once per window: a per-step
+        // collect would wait for the step queued behind this one.
+        let per_step = (!bench.lookahead).then_some(trace);
+        bench.step(operations, &mut refs, per_step).map(|(step, _)| step)
     };
+    let collect = |trace: &SubmissionTrace| trace.collect().map_err(|error| error.to_string());
     let trace = traced(bench, TraceDetail::Submissions)?;
     for _ in 0..warm {
         run(bench, sequences, &trace)?;
     }
+    // Under lookahead a step's submissions are traced during the previous
+    // step, so steps are summarized by host time only and device time over
+    // the whole window.
+    collect(&trace)?;
     let mut summaries = Vec::with_capacity(measured);
     let mut previous = None;
+    let mut window = Vec::new();
+    let mut span = (f64::INFINITY, f64::NEG_INFINITY);
+    // Every sequence's selections, step by step: equal with and without
+    // lookahead when decode feeds them back.
+    let mut selected = Vec::with_capacity(measured);
     for _ in 0..measured {
         let step = run(bench, sequences, &trace)?;
-        summaries.push(step_summary(&step, previous)?);
-        previous = Some(device_end(&step));
+        selected.push(
+            sequences
+                .iter()
+                .map(|sequence| sequence.selected.map(|token| token.0))
+                .collect::<Vec<_>>(),
+        );
+        span = (span.0.min(step.start), span.1.max(step.end));
+        if bench.lookahead {
+            summaries.push(json!({ "wall_ms": (step.end - step.start) * MS }));
+        } else {
+            summaries.push(step_summary(&step, previous)?);
+            previous = Some(device_end(&step));
+        }
+        window.extend(step.submissions);
     }
+    window.extend(collect(&trace)?);
     drop(trace);
     let trace = traced(bench, TraceDetail::Launches)?;
-    let mut attributed = Vec::with_capacity(attribution_steps);
+    let mut attributed = Vec::new();
+    let mut attributed_end = f64::NEG_INFINITY;
     for _ in 0..attribution_steps {
-        attributed.push(run(bench, sequences, &trace)?);
+        let step = run(bench, sequences, &trace)?;
+        attributed_end = step.end;
+        attributed.extend(step.submissions);
     }
+    attributed.extend(collect(&trace)?);
     drop(trace);
     let mut wall = summaries
         .iter()
@@ -843,11 +955,32 @@ fn measure(
         .collect::<Vec<_>>();
     Ok(json!({
         "warm_steps": warm,
+        "lookahead": bench.lookahead,
         "median_ms": median(&mut wall),
         "median": medians(&summaries),
+        "window": window_summary(measured, span, &window),
+        "selected": selected,
         "steps": summaries,
-        "attribution": attribution(&attributed),
+        "attribution": attribution(&attributed, attribution_steps, attributed_end),
     }))
+}
+
+/// Device time over a window of consecutive steps: busy is the union of the
+/// submissions' device intervals clipped to the window, idle the rest.
+fn window_summary(steps: usize, (start, end): (f64, f64), submissions: &[TracedSubmission]) -> Value {
+    let busy = union(
+        submissions
+            .iter()
+            .map(|submission| (submission.device.0.max(start), submission.device.1.min(end)))
+            .filter(|(from, to)| to > from)
+            .collect(),
+    );
+    let steps = steps as f64;
+    json!({
+        "wall_ms_per_step": (end - start) * MS / steps,
+        "device_busy_ms_per_step": busy * MS / steps,
+        "device_idle_ms_per_step": (end - start - busy) * MS / steps,
+    })
 }
 
 fn decode_operations(bench: &Bench, sequences: &[Sequence]) -> Vec<Operation> {
@@ -857,7 +990,7 @@ fn decode_operations(bench: &Bench, sequences: &[Sequence]) -> Vec<Operation> {
             Bench::forward(
                 sequence,
                 WorkKind::Decode,
-                bench.forced(sequence.position, 1),
+                vec![bench.decode_token(sequence)],
                 Demand::SELECT,
             )
         })
@@ -944,7 +1077,7 @@ fn prefill_cell(bench: &mut Bench, options: &Options, rows: usize) -> Result<Val
         .device()
         .trace_submissions(TraceDetail::Launches)
         .map_err(|error| error.to_string())?;
-    let attributed = vec![chunk(bench, &mut shared, &trace)?];
+    let attributed = chunk(bench, &mut shared, &trace)?;
     drop(trace);
     if let Some(sequence) = shared {
         bench.close(sequence)?;
@@ -960,7 +1093,7 @@ fn prefill_cell(bench: &mut Bench, options: &Options, rows: usize) -> Result<Val
         "cold": cold,
         "median": medians(&summaries),
         "steps": summaries,
-        "attribution": attribution(&attributed),
+        "attribution": attribution(&attributed.submissions, 1, attributed.end),
     }))
 }
 
@@ -976,12 +1109,19 @@ fn bench(options: &Options) -> Result<(), String> {
     let decode = options.cells.iter().any(|cell| cell == "decode");
     let concurrent = options.cells.iter().any(|cell| cell == "concurrent");
     let prefill = options.cells.iter().any(|cell| cell == "prefill");
-    let longest = if decode || concurrent {
+    let verify = options.cells.iter().any(|cell| cell == "verify");
+    let longest = if decode || concurrent || verify {
         options.contexts.iter().copied().max().unwrap_or(0)
     } else {
         0
     };
-    let steps = options.warm + options.steps + options.attribution_steps + 1;
+    // A verification step accepts every row it verifies.
+    let widest = if verify {
+        options.widths.iter().copied().max().unwrap_or(1)
+    } else {
+        1
+    };
+    let steps = (options.warm + options.steps + options.attribution_steps + 1) * widest;
     let widest_prefill = options.prefills.iter().copied().max().unwrap_or(0);
     let longest_prefill = match (prefill, options.prefill_history) {
         (false, _) => 0,
@@ -1001,15 +1141,23 @@ fn bench(options: &Options) -> Result<(), String> {
         options.storage_gib,
         context_tokens,
         max_batch,
+        max_batch * widest,
         options.kernel_cache.as_deref(),
+        options.kv_codec,
+        options.device,
+        options.lookahead,
     )?;
+    bench.feedback = options.feedback;
     let load_seconds = host_seconds() - loaded;
     let mut report = json!({
         "tool": "engine/examples/forward_bench.rs",
-        "protocol": "forced-token forward through the executor domain (below the service); greedy selection on decode and finishing prefill; dense KV; per-submission device intervals on the host clock; attribution steps time each launch separately",
+        "lookahead": options.lookahead,
+        "decode_tokens": if options.feedback { "selected" } else { "forced" },
+        "protocol": "forced-token forward through the executor domain (below the service); greedy selection on decode and finishing prefill; per-submission device intervals on the host clock; attribution steps time each launch separately",
         "host": host(),
         "model": options.model,
         "path": options.path.to_string(),
+        "kv_codec": options.kv_codec.identity(),
         "device": bench.device().info().name.clone(),
         "context_tokens": context_tokens,
         "max_batch": max_batch,
@@ -1017,6 +1165,7 @@ fn bench(options: &Options) -> Result<(), String> {
         "decode": [],
         "prefill": [],
         "concurrent": [],
+        "verify": [],
     });
     let write = |report: &Value| {
         std::fs::write(
@@ -1057,14 +1206,76 @@ fn bench(options: &Options) -> Result<(), String> {
             }
         }
     }
+    if verify {
+        for &context in &options.contexts {
+            for &width in &options.widths {
+                eprintln!("verify width={width} context={context}");
+                let cell = verify_cell(&mut bench, options, context, width)?;
+                eprintln!("  median {:.3} ms", cell["median_ms"].as_f64().unwrap_or(f64::NAN));
+                report["verify"].as_array_mut().expect("array").push(cell);
+                write(&report)?;
+            }
+        }
+    }
     write(&report)
+}
+
+/// One sequence verifying `width` rows per step, every row selecting (the
+/// MTP verification shape); every row is accepted.
+fn verify_cell(
+    bench: &mut Bench,
+    options: &Options,
+    context: usize,
+    width: usize,
+) -> Result<Value, String> {
+    let mut sequence = bench.open_sequence()?;
+    bench.history(&mut sequence, context, None)?;
+    let make = |bench: &Bench, sequences: &[Sequence]| {
+        sequences
+            .iter()
+            .map(|sequence| {
+                let tokens = bench.forced(sequence.position, width);
+                let select = (0..width)
+                    .map(|row| Bench::greedy(sequence.position + row))
+                    .collect();
+                Operation::Forward {
+                    request: sequence.request,
+                    kind: if width == 1 {
+                        WorkKind::Decode
+                    } else {
+                        WorkKind::Verify
+                    },
+                    tokens,
+                    position: sequence.position,
+                    conditioning: None,
+                    demand: Demand::SELECT,
+                    select,
+                    committed: width,
+                }
+            })
+            .collect()
+    };
+    let mut sequences = [sequence];
+    let mut result = measure(
+        bench,
+        &mut sequences,
+        options.warm,
+        options.steps,
+        options.attribution_steps,
+        &make,
+    )?;
+    result["context"] = json!(context);
+    result["width"] = json!(width);
+    let [sequence] = sequences;
+    bench.close(sequence)?;
+    Ok(result)
 }
 
 /// D4 precision runner (Q1): V4 logits against a llama.cpp
 /// `--kl-divergence-base` file, with llama.cpp's own KL and same-top
 /// definitions (`validation/precision/README.md` documents the file).
 mod qualify {
-    use super::{host, Bench, DecoderGeometry, Demand, Options, Outcome, WorkKind};
+    use super::{host, Bench, DecoderGeometry, Demand, Operation, Options, Outcome, WorkKind};
     use magnitude_model_contracts::FeedForwardGeometry;
     use magnitude_model_executor::TokenId;
     use serde_json::json;
@@ -1214,6 +1425,10 @@ mod qualify {
 
     /// The fixed prompt set's categories: `<reference dir>/<category>.bin`.
     const CATEGORIES: [&str; 3] = ["prose", "code", "tool_json"];
+
+    /// The D4 prompt set's chunk length (64 scored positions per chunk). A reference
+    /// with longer chunks is a long-context check: reported, but D4's limits don't apply.
+    const D4_N_CTX: usize = 130;
 
     /// One model's D4 limits against its F32 reference (spec
     /// `seismic-native-kernel-program.md` §1 D4: limits are per model).
@@ -1387,8 +1602,8 @@ mod qualify {
             .collect::<Result<Vec<_>, _>>()?;
         let n_ctx = bases[0].1.n_ctx;
         for (name, base) in &bases {
-            if base.n_ctx != n_ctx || base.evaluated() == 0 || base.first() > super::PREFILL_ROWS {
-                return Err(format!("{name}: reference chunk geometry differs or is outside the prefill class"));
+            if base.n_ctx != n_ctx || base.evaluated() == 0 {
+                return Err(format!("{name}: reference chunk geometry differs"));
             }
         }
         // The bench seals prefill classes up to PREFILL_ROWS and load warm-up runs each of them
@@ -1400,13 +1615,19 @@ mod qualify {
             options.storage_gib,
             context,
             1,
+            options.verify_width,
             options.kernel_cache.as_deref(),
+            options.kv_codec,
+            options.device,
+            false,
         )?;
         let limits = limits(&bench.geometry)?;
         let mut report = json!({
             "tool": "engine/examples/forward_bench.rs qualify",
-            "protocol": "V4 native target: prefill of the chunk's first n_ctx/2 tokens, then teacher-forced decode with LOGITS demand for each evaluated position; KL(base || V4) over base log-probs above -16 nats and first-index argmax agreement, as llama-perplexity --kl-divergence",
+            "protocol": "V4 native target: prefill of the chunk's first n_ctx/2 tokens (in PREFILL_ROWS chunks), then teacher-forced decode with LOGITS demand for each evaluated position; KL(base || V4) over base log-probs above -16 nats and first-index argmax agreement, as llama-perplexity --kl-divergence",
             "label": options.label,
+            "kv_codec": options.kv_codec.identity(),
+            "verify_width": options.verify_width,
             "host": host(),
             "model": options.model,
             "reference": directory,
@@ -1422,7 +1643,8 @@ mod qualify {
                 ));
             }
             let chunks = options.chunks.unwrap_or(base.n_chunk).min(base.n_chunk);
-            let (positions, per_chunk) = category(&mut bench, base, chunks, name)?;
+            let (positions, per_chunk) =
+                category(&mut bench, base, chunks, options.verify_width, name)?;
             let mut summary = positions.summary();
             summary["chunks"] = json!(chunks);
             summary["per_chunk"] = json!(per_chunk);
@@ -1434,7 +1656,9 @@ mod qualify {
                     overall.extend(positions);
                 }
                 report["overall"] = overall.summary();
-                report["d4"] = verdict(limits, &done, &overall);
+                if n_ctx == D4_N_CTX {
+                    report["d4"] = verdict(limits, &done, &overall);
+                }
             }
             std::fs::write(
                 &options.output,
@@ -1445,10 +1669,14 @@ mod qualify {
         Ok(())
     }
 
+    /// Scored rows per `span_mean_kld` entry of a chunk.
+    const SPAN: usize = 512;
+
     fn category(
         bench: &mut Bench,
         base: &mut BaseFile,
         chunks: usize,
+        width: usize,
         name: &str,
     ) -> Result<(Positions, Vec<serde_json::Value>), String> {
         let mut positions = Positions::default();
@@ -1457,45 +1685,75 @@ mod qualify {
             let tokens = base.chunk_tokens(chunk)?;
             let first = base.first();
             let mut sequence = bench.open_sequence()?;
-            let prefill = Bench::forward(
-                &sequence,
-                WorkKind::Prefill,
-                tokens[..first].to_vec(),
-                Demand::NONE,
-            );
-            bench.step(vec![prefill], &mut [&mut sequence], None)?;
+            for rows in tokens[..first].chunks(super::PREFILL_ROWS) {
+                let prefill =
+                    Bench::forward(&sequence, WorkKind::Prefill, rows.to_vec(), Demand::NONE);
+                bench.step(vec![prefill], &mut [&mut sequence], None)?;
+            }
             let (mut chunk_kl, mut chunk_same) = (0.0, 0usize);
-            for row in 0..base.evaluated() {
-                let decode = Bench::forward(
-                    &sequence,
-                    WorkKind::Decode,
-                    vec![tokens[first + row]],
-                    Demand::LOGITS,
-                );
-                let (_, outcomes) = bench.step(vec![decode], &mut [&mut sequence], None)?;
-                let [Outcome::Forward { rows }] = outcomes.as_slice() else {
-                    return Err("decode returned a non-forward outcome".into());
+            // Mean KL per SPAN scored rows, to locate where along the history a
+            // long-context divergence starts.
+            let mut span_kl = vec![0.0; base.evaluated().div_ceil(SPAN)];
+            let mut row = 0;
+            while row < base.evaluated() {
+                let group = width.min(base.evaluated() - row);
+                let forced = tokens[first + row..first + row + group].to_vec();
+                let step = if group == 1 {
+                    Bench::forward(&sequence, WorkKind::Decode, forced, Demand::LOGITS)
+                } else {
+                    Operation::Forward {
+                        request: sequence.request,
+                        kind: WorkKind::Verify,
+                        tokens: forced,
+                        position: sequence.position,
+                        conditioning: None,
+                        demand: Demand::LOGITS | Demand::SELECT,
+                        select: (0..group)
+                            .map(|offset| Bench::greedy(sequence.position + offset))
+                            .collect(),
+                        committed: group,
+                    }
                 };
-                let logits = rows
-                    .first()
-                    .and_then(|row| row.logits.as_ref())
-                    .ok_or("decode returned no logits")?
-                    .read_to_host()
-                    .map_err(|error| error.to_string())?;
-                if logits.len() != base.n_vocab {
-                    return Err("logits row width differs from the vocabulary".into());
+                let (_, outcomes) = bench.step(vec![step], &mut [&mut sequence], None)?;
+                let [Outcome::Forward { rows }] = outcomes.as_slice() else {
+                    return Err("scored step returned a non-forward outcome".into());
+                };
+                if rows.len() != group {
+                    return Err("scored step returned a row count unlike its tokens".into());
                 }
-                let reference = base.row(chunk, row)?;
-                let (kl, top) = compare(&reference, &logits);
-                positions.push(kl, top, top_gap(&reference));
-                chunk_kl += kl;
-                chunk_same += usize::from(top);
+                for (offset, result) in rows.iter().enumerate() {
+                    let logits = result
+                        .logits
+                        .as_ref()
+                        .ok_or("scored step returned no logits")?
+                        .read_to_host()
+                        .map_err(|error| error.to_string())?;
+                    if logits.len() != base.n_vocab {
+                        return Err("logits row width differs from the vocabulary".into());
+                    }
+                    let reference = base.row(chunk, row + offset)?;
+                    let (kl, top) = compare(&reference, &logits);
+                    positions.push(kl, top, top_gap(&reference));
+                    chunk_kl += kl;
+                    chunk_same += usize::from(top);
+                    span_kl[(row + offset) / SPAN] += kl;
+                }
+                row += group;
             }
             bench.close(sequence)?;
+            let spans = span_kl
+                .iter()
+                .enumerate()
+                .map(|(span, total)| {
+                    total / (base.evaluated() - span * SPAN).min(SPAN) as f64
+                })
+                .collect::<Vec<_>>();
             per_chunk.push(json!({
                 "chunk": chunk,
                 "mean_kld": chunk_kl / base.evaluated() as f64,
                 "same_top": chunk_same as f64 / base.evaluated() as f64,
+                "span_rows": SPAN,
+                "span_mean_kld": spans,
             }));
             eprintln!(
                 "{name} chunk {chunk}: running mean KLD {:.6}, same top {:.4}",

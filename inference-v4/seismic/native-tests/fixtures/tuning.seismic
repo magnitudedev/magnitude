@@ -18,6 +18,12 @@ native accumulate for cuda from "cuda/accumulate.cu":
         threadgroups (ceil_div(N, WIDTH), 1, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
 
+native accumulate for vulkan from "vulkan/accumulate.comp":
+    params (BIAS in [0, 1], WIDTH in [32, 64])
+    launch accumulate:
+        threadgroups (ceil_div(N, WIDTH), 1, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)
+
 native accumulate for cpu from "cpu/accumulate.rs":
     params (BIAS in [0, 1], WIDTH in [32, 64])
     launch accumulate:

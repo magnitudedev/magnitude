@@ -8,7 +8,7 @@ use crate::{
 };
 use magnitude_model_contracts::{VisionGeometry, WeightKind, WeightRole, WeightScope};
 use magnitude_model_kernels::{
-    qwen_vision_block, qwen_vision_feature_output, qwen_vision_merger, qwen_vision_stem,
+    qwen_vision_block, qwen_vision_merger, qwen_vision_stem,
 };
 use seismic::{
     BoundNativeGraphPlan, Device, NativeGraphFamily, NativeGraphFamilySlot, NativeGraphPlan,
@@ -172,7 +172,7 @@ impl PreparedVisionGraphs {
                 kind: WeightKind::MergerOutputBias,
             },
         )?;
-        if merger_output.shape != [merger_hidden, decoder_hidden]
+        if merger_output.shape != [decoder_hidden, merger_hidden]
             || merger_bias.shape != [decoder_hidden]
         {
             return Err(invalid(
@@ -219,7 +219,7 @@ impl PreparedVisionGraphs {
                 ("C", geometry.channels),
                 ("P", geometry.patch),
                 ("H", geometry.hidden),
-                ("L", position.shape[1]),
+                ("L", position.shape[0]),
             ];
             let pixels = graph
                 .input_for(&handles.stem, "pixels", &stem_dims)
@@ -314,7 +314,7 @@ impl PreparedVisionGraphs {
             let up_bias = weight!(WeightScope::Vision, WeightKind::MergerHiddenBias);
             let down_weight = weight!(WeightScope::Vision, WeightKind::MergerOutput);
             let down_bias = weight!(WeightScope::Vision, WeightKind::MergerOutputBias);
-            let merged = graph
+            let features = graph
                 .enqueue(
                     &handles.merger,
                     qwen_vision_merger::WorkflowArgs {
@@ -326,15 +326,6 @@ impl PreparedVisionGraphs {
                         down_weight: (&down_weight).into(),
                         down_bias: (&down_bias).into(),
                         epsilon: geometry.epsilon as f32,
-                    },
-                )
-                .map_err(device)?
-                .value;
-            let features = graph
-                .enqueue(
-                    &handles.output,
-                    qwen_vision_feature_output::WorkflowArgs {
-                        source: (&merged).into(),
                     },
                 )
                 .map_err(device)?

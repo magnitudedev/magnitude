@@ -110,28 +110,28 @@ impl<'a> QualificationView<'a> {
             device,
             &[1, 2],
             &[1.0, -2.0],
-            "qwen_conditioning_overlay",
+            "conditioning_overlay",
             "fixed",
         )?;
         let mut out = Tensor::zeros(device, Element::f32(), &[1, 2])
-            .map_err(|error| qualification("qwen_conditioning_overlay", "fixed", error))?;
+            .map_err(|error| qualification("conditioning_overlay", "fixed", error))?;
         self.programs
             .state
             .conditioning
             .as_ref()
             .expect("attested conditioning slot")
-            .call(qwen_conditioning_overlay::Args {
+            .call(conditioning_overlay::Args {
                 input: &input,
                 out: &mut out,
             })
-            .map_err(|error| qualification("qwen_conditioning_overlay", "fixed", error))?;
+            .map_err(|error| qualification("conditioning_overlay", "fixed", error))?;
         if out
             .read_to_host()
-            .map_err(|error| qualification("qwen_conditioning_overlay", "fixed", error))?
+            .map_err(|error| qualification("conditioning_overlay", "fixed", error))?
             != [1.0_f32.to_le_bytes(), (-2.0_f32).to_le_bytes()].concat()
         {
             return Err(qualification(
-                "qwen_conditioning_overlay",
+                "conditioning_overlay",
                 "fixed",
                 "copy smoke mismatch",
             ));

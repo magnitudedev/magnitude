@@ -136,7 +136,7 @@ fn reference(
 #[test]
 fn draft_rows_match_the_host_model_over_resident_weights() {
     let catalog = seismic::DeviceCatalog::discover().unwrap();
-    for backend in [seismic::BackendName::Metal, seismic::BackendName::Cuda] {
+    for backend in [seismic::BackendName::Metal, seismic::BackendName::Cuda, seismic::BackendName::Vulkan] {
         let Ok(device) = catalog.open_backend(backend) else {
             continue;
         };
@@ -145,22 +145,34 @@ fn draft_rows_match_the_host_model_over_resident_weights() {
 }
 
 fn draft_rows_match_on(device: &Device) {
-    let kernel = qwen_draft_rows::native_for_device_with(
-        &device,
-        qwen_draft_rows::Elements {
-            EW: resident_q8(&device),
-            A: Element::bf16(),
-            EN: Element::bf16(),
-            HN: Element::bf16(),
-            CW: resident_q8(&device),
-        },
-        &NativeSpecialization::new(),
-    )
-    .unwrap();
+    // Vulkan fixes the width D at preparation (it sizes the shared joined
+    // row); the other backends declare no statics.
+    let implementation = qwen_draft_rows::native_implementation(device)
+        .unwrap()
+        .expect("qwen_draft_rows has a native implementation on every accelerator");
+    let prepare = |width: usize| {
+        let statics = implementation.statics.iter().fold(NativeSpecialization::new(), |statics, name| {
+            assert_eq!(name, "D", "qwen_draft_rows may only fix D");
+            statics.with_static(name.clone(), width as u64)
+        });
+        qwen_draft_rows::native_for_device_with(
+            device,
+            qwen_draft_rows::Elements {
+                EW: resident_q8(device),
+                A: Element::bf16(),
+                EN: Element::bf16(),
+                HN: Element::bf16(),
+                CW: resident_q8(device),
+            },
+            &statics,
+        )
+        .unwrap()
+    };
     let epsilon = 1.0e-6;
     // Widths of whole 64-column k-blocks, below and past one block's 32
     // outputs, rows 1..3.
     for (width, vocabulary, rows) in [(64, 5, 1), (128, 7, 3), (192, 4, 2)] {
+        let kernel = prepare(width);
         let mut random = Random(width as u64 * 31 + rows as u64);
         let (table, table_values) = q8_weight(&device, vocabulary, width, 0.03125, &mut random);
         let (combine, combine_values) = q8_weight(&device, width, 2 * width, 0.0078125, &mut random);
@@ -173,14 +185,28 @@ fn draft_rows_match_on(device: &Device) {
         let conditioning_values = (0..rows * width)
             .map(|_| bf16_round(2.0 * random.symmetric()))
             .collect::<Vec<_>>();
-        let token_values = (0..rows)
-            .map(|_| (random.next() % vocabulary as u32) as i32)
+        // Selection rows (token, status); the last is a failed selection,
+        // which embeds token 0.
+        let selections = (0..rows)
+            .map(|row| {
+                if row + 1 == rows {
+                    [-1, 1]
+                } else {
+                    [(random.next() % vocabulary as u32) as i32, 0]
+                }
+            })
             .collect::<Vec<_>>();
-        let token_bytes = token_values
+        let token_values = selections
             .iter()
+            .map(|[token, _]| (*token).max(0))
+            .collect::<Vec<_>>();
+        let token_bytes = selections
+            .iter()
+            .flatten()
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
-        let tokens = Tensor::from_host(&device, Element::i32(), &[rows as u64], &token_bytes).unwrap();
+        let tokens =
+            Tensor::from_host(&device, Element::i32(), &[rows as u64, 2], &token_bytes).unwrap();
         let conditioning = bf16_tensor(&device, &[rows as u64, width as u64], &conditioning_values);
         let embedding_norm = bf16_tensor(&device, &[width as u64], &embedding_norm_values);
         let hidden_norm = bf16_tensor(&device, &[width as u64], &hidden_norm_values);

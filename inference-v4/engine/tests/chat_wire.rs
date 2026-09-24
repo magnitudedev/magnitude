@@ -111,6 +111,7 @@ fn aliases_defaults_unicode_stops_and_context_limits_follow_v3() {
         output_capacity: 4,
         forced_quantum: 2,
         method: MethodPolicy::Plain,
+        media_marker: None,
     };
     let default = parse(&body()).unwrap();
     assert_eq!(default.output_limit(), 512);
@@ -242,6 +243,7 @@ fn tool_schema_policy_and_unconnected_media_are_explicit() {
         output_capacity: 4,
         forced_quantum: 0,
         method: MethodPolicy::Plain,
+        media_marker: None,
     };
     let structured = parse(&schema)
         .unwrap()
@@ -265,6 +267,7 @@ fn tool_schema_policy_and_unconnected_media_are_explicit() {
         output_capacity: 4,
         forced_quantum: 0,
         method: MethodPolicy::Plain,
+        media_marker: None,
     };
     assert!(request
         .prepare(
@@ -276,5 +279,20 @@ fn tool_schema_policy_and_unconnected_media_are_explicit() {
         )
         .err()
         .unwrap()
-        .contains("media preparation"));
+        .contains("takes no image input"));
+    // A model that takes images renders each image part as its marker.
+    let marker = ModelLimits {
+        media_marker: Some("<img>"),
+        ..limits
+    };
+    let prepared = request
+        .prepare(
+            &bundle,
+            &tokenizer,
+            &TemplateSelection::default(),
+            0,
+            &marker,
+        )
+        .unwrap();
+    assert_eq!(prepared.image_sources, ["data:image/png;base64,AA=="]);
 }

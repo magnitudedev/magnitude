@@ -48,6 +48,10 @@ fn attention_points_cross_rows_with_served_contexts() {
     assert_eq!(points.len(), REPRESENTATIVE_ROWS.len() * 3, "64k exceeds the served context");
     assert!(points.iter().all(|point| point.context.unwrap() <= 16384));
     assert_eq!(points[0].label, "m1-c256");
+    // The history lengths of one row point form its class.
+    assert_eq!(points[0].class.as_deref(), Some("m1"));
+    assert_eq!(points[2].class.as_deref(), Some("m1"));
+    assert_eq!(points[3].class.as_deref(), Some("m4"));
     assert!((points.iter().map(|point| point.weight).sum::<f64>() - 1.0).abs() < 1e-12);
     let short = attention_points(TuningLimits {
         max_rows: 1,
@@ -107,6 +111,15 @@ fn the_model_budget_is_shared_equally_and_small_spaces_return_their_rest() {
     assert_eq!(allocate(2, &[10, 10, 10]), [1, 1, 1]);
     // Redistribution cascades: after the 10 leaves, 45 each fits the 40.
     assert_eq!(allocate(100, &[10, 40, 500]), [10, 40, 50]);
+}
+
+#[test]
+fn spaces_up_to_the_complete_size_are_searched_completely_first() {
+    // The 24s are complete although an equal share (100 / 5 = 20) would
+    // cut them; the two large units share the remaining 44.
+    assert_eq!(allocate(100, &[24, 24, 8, 1620, 540]), [24, 24, 8, 22, 22]);
+    // When the small spaces do not all fit, every unit shares equally.
+    assert_eq!(allocate(40, &[24, 24, 8, 1620]), [11, 11, 8, 10]);
 }
 
 #[test]
@@ -269,7 +282,11 @@ impl EntryTuning for FakeCase {
             backend: "metal".into(),
             points: points
                 .iter()
-                .map(|point| (point.label.clone(), point.weight))
+                .map(|point| seismic::PointRecord {
+                    label: point.label.clone(),
+                    weight: point.weight,
+                    class: point.class.clone(),
+                })
                 .collect(),
             validation,
             parameters: Vec::new(),

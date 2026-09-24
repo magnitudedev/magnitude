@@ -256,6 +256,29 @@ impl ResidencyStore {
         self.resident.is_empty()
     }
 
+    /// Imports a dense weight into the element its admitted plan chose.
+    pub(crate) fn import_gguf_planned(
+        &mut self,
+        artifact: &GgufArtifact,
+        descriptor: &WeightDescriptor,
+    ) -> Result<ResidentWeight, WeightImportError> {
+        let target = self
+            .execution
+            .weights()
+            .find(|weight| {
+                weight.component.identity == artifact.identity()
+                    && weight.descriptor.name == descriptor.name
+            })
+            .and_then(|weight| weight.resident.dtype())
+            .ok_or_else(|| {
+                invalid(format!(
+                    "weight {:?} has no dense element in the admitted WeightPlan",
+                    descriptor.name
+                ))
+            })?;
+        self.import_gguf(artifact, descriptor, target)
+    }
+
     pub(crate) fn import_gguf(
         &mut self,
         artifact: &GgufArtifact,

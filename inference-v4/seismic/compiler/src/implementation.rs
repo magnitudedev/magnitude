@@ -242,7 +242,27 @@ fn native_hard_constraints<B: seismic_target::TargetFamily>(
         let defined = arena.side_conditions(predicate.into());
         launch_requirements[index] = arena.and(defined, predicate);
     }
-    schedule.launch_requirements(arena, &launch_requirements)
+    use seismic_ir::schedule::{RequirementPoint, ScheduleStep};
+    let storage = family.global_allocations();
+    schedule.scoped_requirements(arena, storage.views(), &mut |arena, point| match point {
+        RequirementPoint::Step(ScheduleStep::Launch(id)) => launch_requirements[id.index() as usize],
+        _ => arena.bool(true),
+    }, &mut |arena, step| acquisition_established(arena, storage, step))
+}
+
+/// A successful acquisition establishes that its allocation's geometry is
+/// defined (every side condition of its byte size).
+fn acquisition_established(
+    arena: &mut ExprArena,
+    storage: &seismic_ir::storage::GlobalAllocationTopology,
+    step: &seismic_ir::schedule::ScheduleStep,
+) -> BoolExpr {
+    if let seismic_ir::schedule::ScheduleStep::BeginAllocationInstance { source, .. } = step {
+        if let seismic_ir::storage::ViewBase::Allocation(id) = storage.views()[source.index() as usize].base {
+            return arena.side_conditions(storage.allocation(id).bytes.into());
+        }
+    }
+    arena.bool(true)
 }
 
 pub(crate) fn expression_detail(arena: &ExprArena, expression: AnyExpr, depth: usize) -> String {
@@ -476,7 +496,7 @@ impl fmt::Debug for CallSite<'_> {
 /// A scalar's actual realization, shared by lowering and call binding.
 /// Index expressions never require a fabricated backing symbol. Published
 /// values derive their type and symbol from the one owning schedule slot.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScalarBinding {
     Value {
         symbol: seismic_lang::expr::SymbolId,
@@ -1045,9 +1065,10 @@ impl<'a, B: seismic_target::TargetFamily> ImplementationBuilder<'a, B> {
         &mut self,
         start: NatExpr,
         end: NatExpr,
+        visits: seismic_ir::schedule::RepeatVisits,
         initial: seismic_ir::region::Product<seismic_ir::region::ValueOperand>,
     ) -> ScheduleRepeat {
-        self.inner.begin_value_repeat(start, end, initial)
+        self.inner.begin_value_repeat(start, end, visits, initial)
     }
     pub(crate) fn finish_value_repeat(
         &mut self,
@@ -1591,7 +1612,7 @@ mod internals {
             // No coordinate exists for an empty tensor. Avoid constructing
             // division by a statically zero axis even inside an unvisited body.
             if count == zero { return; }
-            let repeat = self.begin_value_repeat(zero, count, Product::Unit);
+            let repeat = self.begin_value_repeat(zero, count, seismic_ir::schedule::RepeatVisits::Ordered, Product::Unit);
             let linear = repeat.binding().index;
             let mut remaining = linear;
             let mut indices = vec![zero; source.extents().len()];
@@ -1792,13 +1813,14 @@ mod internals {
             &mut self,
             start: NatExpr,
             end: NatExpr,
+            visits: seismic_ir::schedule::RepeatVisits,
             initial: seismic_ir::region::Product<seismic_ir::region::ValueOperand>,
         ) -> ScheduleRepeat {
             let parent = self.state.schedule_region;
             let product = self
                 .state
                 .construction
-                .begin_value_repeat(self.arena, parent, start, end, initial);
+                .begin_value_repeat(self.arena, parent, start, end, visits, initial);
             self.state.schedule_region = product.body();
             ScheduleRepeat { parent, product }
         }
@@ -2281,7 +2303,7 @@ mod internals {
                 let defined = self.arena.side_conditions(predicate.into());
                 launch_constraints.push(self.arena.and(defined, predicate));
             }
-            let scoped = schedule.scoped_requirements(self.arena, &mut |arena, point| {
+            let scoped = schedule.scoped_requirements(self.arena, storage.views(), &mut |arena, point| {
                 use seismic_ir::schedule::RequirementPoint;
                 let mut terms = Vec::new();
                 match point {
@@ -2314,14 +2336,7 @@ mod internals {
                     _ => {}
                 }
                 arena.all(&terms)
-            }, &mut |arena, step| {
-                if let ScheduleStep::BeginAllocationInstance { source: view, .. } = step {
-                    if let seismic_ir::storage::ViewBase::Allocation(id) = storage.views()[view.index() as usize].base {
-                        return arena.side_conditions(storage.allocation(id).bytes.into());
-                    }
-                }
-                arena.bool(true)
-            });
+            }, &mut |arena, step| acquisition_established(arena, storage, step));
             self.state.constraints.push(scoped);
         }
 
@@ -2330,7 +2345,7 @@ mod internals {
             schedule: &ParametricSchedule<B>,
             storage: &seismic_ir::storage::TopologyBuilder,
         ) {
-            let scoped = schedule.scoped_requirements(self.arena, &mut |arena, point| {
+            let scoped = schedule.scoped_requirements(self.arena, storage.views(), &mut |arena, point| {
                 use seismic_ir::schedule::RequirementPoint;
                 let mut terms = Vec::new();
                 let (views, bytes) = match point {
@@ -2658,7 +2673,8 @@ mod internals {
                                 .expect("host-evaluation root ordinal space exhausted");
                             let value = match evaluation.value {
                                 seismic_ir::schedule::HostValueExpr::Integer(value)
-                                | seismic_ir::schedule::HostValueExpr::Word { value, .. } => AnyExpr::Int(value),
+                                | seismic_ir::schedule::HostValueExpr::Word { value, .. }
+                                | seismic_ir::schedule::HostValueExpr::Float { value, .. } => AnyExpr::Int(value),
                                 seismic_ir::schedule::HostValueExpr::Natural(value) => AnyExpr::Nat(value),
                                 seismic_ir::schedule::HostValueExpr::Bool(value) => AnyExpr::Bool(value),
                             };
@@ -3464,6 +3480,10 @@ mod internals {
                         seismic_ir::schedule::HostValueExpr::Bool(_) => digest.bytes(b"bool"),
                         seismic_ir::schedule::HostValueExpr::Word { dtype, .. } => {
                             digest.bytes(b"word");
+                            digest.hashed(&dtype);
+                        }
+                        seismic_ir::schedule::HostValueExpr::Float { dtype, .. } => {
+                            digest.bytes(b"float");
                             digest.hashed(&dtype);
                         }
                     }

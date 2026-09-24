@@ -165,8 +165,11 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf() {
     };
     let segments = indices(&[2, 2], &[0, 1, 1, 1]);
     // Bank 0 is the zero seed the advance reads; bank 1 is its successor.
-    let mut window = bf16_tensor(&device, &[2, 3, 8192], &vec![0.0; 2 * 3 * 8192]);
+    // One tape row per bank: the window holds C - 1 + 1 rows.
+    let mut window = bf16_tensor(&device, &[2, 4, 8192], &vec![0.0; 2 * 4 * 8192]);
     let mut delta = f32_tensor(&device, &[2, 32, 128, 128], &vec![0.0; 2 * 32 * 128 * 128]);
+    let tape_row = (32 + 16) * 128 + 32;
+    let mut tape = f32_tensor(&device, &[2, 1, tape_row as u64], &vec![0.0; 2 * tape_row]);
 
     let projection = qwen_recurrent_project::native_for_device_with(
         &device,
@@ -202,7 +205,7 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf() {
             .with_static("NV", 32)
             .with_static("W", 128)
             .with_static("C", 4)
-            .with_param("ROWS", 8),
+            .with_param("ROWS", 32),
     )
     .unwrap()
     .call(qwen_recurrent_step::Args {
@@ -213,9 +216,11 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf() {
         segments: &segments,
         stop: &indices(&[1], &[1]),
         previous_bank: &indices(&[1], &[0]),
+        previous_tape: &indices(&[1], &[0]),
         following_bank: &indices(&[1], &[1]),
         window: &mut window,
         delta: &mut delta,
+        tape: &mut tape,
         norm_epsilon: 128e-6,
         grouped: false,
     })

@@ -36,3 +36,18 @@ native repack_weight for cuda from "cuda/repack_weight.cu":
     launch repack_weight:
         threadgroups (ceil_div(K, 256) * 8, ceil_div(N, 16), B)
         threads_per_threadgroup (32, 1, 1)
+
+# Vulkan: a grid-stride loop over every element; the x grid is capped at the
+# 65535-group floor (Vulkan spec §5.3).
+native import_dense for vulkan from "vulkan/import_dense.comp":
+    launch import_dense:
+        threadgroups (min(ceil_div(B * N * K, 256), 65535), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# Vulkan: one workgroup converts one 16-row by 32-column tile into rows16 (the
+# Vulkan resident layout). N / 16 stays below 65535 for every model weight
+# (the largest, the 248320-row head, gives 15520).
+native repack_weight for vulkan from "vulkan/repack_weight.comp":
+    launch repack_weight:
+        threadgroups (ceil_div(K, 256) * 8, ceil_div(N, 16), B)
+        threads_per_threadgroup (32, 1, 1)

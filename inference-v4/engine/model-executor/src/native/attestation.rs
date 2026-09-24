@@ -9,6 +9,7 @@ use crate::{
 use super::preparation::PreparationInputs;
 use super::tuning::{TunedEntry, TuningContext, TuningLimits};
 use magnitude_model_kernels::{import_dense, repack_weight};
+use magnitude_model_state::KvCodec;
 use std::{collections::HashSet, rc::Rc};
 
 pub struct AttestedPrograms {
@@ -31,11 +32,11 @@ pub struct AttestedPrograms {
 
 #[derive(Clone)]
 pub(crate) struct AttestedTarget {
-    pub embedding: NativeKernel<qwen_embedding_rows::Entry>,
+    pub embedding: NativeKernel<embedding_rows::Entry>,
     pub blocks: Vec<AttestedTargetBlock>,
     pub readout: ReadoutKernels,
-    pub features: Option<NativeKernel<qwen_features_rows::Entry>>,
-    pub selected: NativeKernel<qwen_selected_rows::Entry>,
+    pub features: Option<NativeKernel<readout_features_rows::Entry>>,
+    pub selected: NativeKernel<readout_selected_rows::Entry>,
     pub shape: NativeKernel<shape_rows::Entry>,
     pub sample: NativeKernel<sample_rows::Entry>,
 }
@@ -61,6 +62,9 @@ pub(crate) enum AttestedFeedForward {
 #[derive(Clone)]
 pub(crate) struct AttestedHead {
     pub blocks: Vec<AttestedHeadBlock>,
+    /// Token selection over the draft vocabulary.
+    pub shape: NativeKernel<shape_rows::Entry>,
+    pub sample: NativeKernel<sample_rows::Entry>,
 }
 
 #[derive(Clone)]
@@ -68,7 +72,7 @@ pub(crate) struct AttestedHeadBlock {
     pub input: NativeKernel<qwen_draft_rows::Entry>,
     pub attention: AttentionKernels,
     pub dense: DenseKernels,
-    pub features: NativeKernel<qwen_features_rows::Entry>,
+    pub features: NativeKernel<readout_features_rows::Entry>,
     pub logits: NativeKernel<head_logits_rows::Entry>,
 }
 
@@ -77,13 +81,12 @@ pub(crate) struct AttestedVision {
     pub stem: NativeKernel<qwen_vision_stem::Entry>,
     pub blocks: Vec<NativeKernel<qwen_vision_block::Entry>>,
     pub merger: NativeKernel<qwen_vision_merger::Entry>,
-    pub output: NativeKernel<qwen_vision_feature_output::Entry>,
 }
 
 #[derive(Clone)]
 pub(crate) struct AttestedState {
     pub copies: Vec<(Element, NativeKernel<copy_rows::Entry>)>,
-    pub conditioning: Option<NativeKernel<qwen_conditioning_overlay::Entry>>,
+    pub conditioning: Option<NativeKernel<conditioning_overlay::Entry>>,
 }
 
 #[derive(Clone)]
@@ -140,6 +143,9 @@ impl AttestedPrograms {
         )
     }
 
+    /// Seals the head, vision and state-copy graphs. `proposals` is the most
+    /// proposals one head transaction drafts (unused without a head).
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_auxiliary_graphs(
         &mut self,
         device: &Device,
@@ -148,6 +154,7 @@ impl AttestedPrograms {
         target_state: &crate::StateStorePlan,
         head_state: Option<&crate::StateStorePlan>,
         limits: crate::ResourceLimits,
+        proposals: usize,
     ) -> Result<(), String> {
         let row_classes = magnitude_model_batching::row_classes(limits.max_batch_rows)
             .into_iter()
@@ -156,11 +163,6 @@ impl AttestedPrograms {
         let max_rows = *row_classes
             .last()
             .ok_or_else(|| format!("batch row bound {} has no row class", limits.max_batch_rows))?;
-        let max_segments = u64::try_from(limits.in_flight_requests)
-            .map_err(|_| "request slot bound exceeds u64")?
-            .checked_next_power_of_two()
-            .ok_or("request slot class overflows")?
-            .min(max_rows);
         if let (Some(handles), Some(state)) = (&self.head, head_state) {
             let attention = definition
                 .geometry
@@ -174,76 +176,59 @@ impl AttestedPrograms {
                 .ok_or("head graph requires target attention geometry")?;
             let history_rows =
                 u64::try_from(state.history_rows).map_err(|_| "head history rows exceed u64")?;
-            let mut forward_classes = Vec::new();
-            let mut project_classes = Vec::new();
-            for &rows in &row_classes {
-                project_classes.push(crate::programs::native_head::HeadProjectGraphClass { rows });
-                let mut segments = 1u64;
-                while segments <= max_segments && segments <= rows {
-                    forward_classes.push(crate::programs::native_head::HeadForwardGraphClass {
-                        rows,
-                        segments,
+            let slot_bound = limits.in_flight_requests.min(limits.max_batch_rows);
+            let slot_classes = magnitude_model_batching::row_classes(slot_bound)
+                .into_iter()
+                .map(|slots| slots as u64)
+                .collect::<Vec<_>>();
+            let mut classes = Vec::new();
+            // Causal-only heads (catch-up after prefill or while not
+            // drafting) over any row class.
+            for &entry_rows in &row_classes {
+                for &slots in slot_classes.iter().filter(|slots| **slots <= entry_rows) {
+                    classes.push(crate::programs::native_head::HeadGraphClass {
+                        entry_rows,
+                        slots,
                         history_rows,
+                        steps: 0,
+                        shaped: false,
                     });
-                    segments *= 2;
                 }
             }
-            let forward = crate::programs::native_head::PreparedHeadForwardGraphs::prepare(
-                device,
-                handles,
-                load,
-                &definition.geometry,
-                attention,
-                self.state
-                    .copies
+            // Drafting heads: each slot enters at most `proposals + 1`
+            // committed rows (its accepted verification prefix and anchor).
+            for &slots in &slot_classes {
+                let entry_bound = magnitude_model_batching::row_class(
+                    (slots as usize).saturating_mul(proposals + 1).min(max_rows as usize),
+                )
+                .ok_or("head entry row bound has no class")? as u64;
+                for &entry_rows in row_classes
                     .iter()
-                    .find(|(element, _)| {
-                        *element
-                            == match definition.geometry.activation_dtype {
-                                magnitude_model_contracts::ActivationDType::F16 => {
-                                    seismic::Element::f16()
-                                }
-                                magnitude_model_contracts::ActivationDType::BF16 => {
-                                    seismic::Element::bf16()
-                                }
-                            }
-                    })
-                    .or_else(|| self.state.copies.first())
-                    .map(|(_, kernel)| kernel)
-                    .ok_or_else(|| "head conditioning copy specialization is absent".to_string())?,
-                forward_classes,
-            )
-            .map_err(|error| error.to_string())?;
-            let project = crate::programs::native_head::PreparedHeadProjectGraphs::prepare(
-                device,
-                handles,
-                &self.target.shape,
-                &self.target.sample,
-                load,
-                &definition.geometry,
-                self.state
-                    .copies
-                    .iter()
-                    .find(|(element, _)| {
-                        *element
-                            == match definition.geometry.activation_dtype {
-                                magnitude_model_contracts::ActivationDType::F16 => {
-                                    seismic::Element::f16()
-                                }
-                                magnitude_model_contracts::ActivationDType::BF16 => {
-                                    seismic::Element::bf16()
-                                }
-                            }
-                    })
-                    .or_else(|| self.state.copies.first())
-                    .map(|(_, kernel)| kernel)
-                    .ok_or_else(|| "head feature copy specialization is absent".to_string())?,
-                project_classes,
-            )
-            .map_err(|error| error.to_string())?;
+                    .filter(|rows| **rows >= slots && **rows <= entry_bound)
+                {
+                    for steps in 1..=proposals as u64 {
+                        for shaped in [false, true] {
+                            classes.push(crate::programs::native_head::HeadGraphClass {
+                                entry_rows,
+                                slots,
+                                history_rows,
+                                steps,
+                                shaped,
+                            });
+                        }
+                    }
+                }
+            }
             self.head_graphs = Some(Rc::new(
-                crate::programs::native_head::PreparedHeadGraphs::from_parts(forward, project)
-                    .map_err(|error| error.to_string())?,
+                crate::programs::native_head::PreparedHeadGraphs::prepare(
+                    device,
+                    handles,
+                    load,
+                    &definition.geometry,
+                    attention,
+                    classes,
+                )
+                .map_err(|error| error.to_string())?,
             ));
         }
         if let (Some(handles), Some(vision)) = (&self.vision, definition.vision.as_ref()) {
@@ -379,19 +364,29 @@ impl AttestedPrograms {
                 bytes += bytes!(copy_rows);
             }
         }
-        bytes += bytes!(qwen_conditioning_overlay);
+        bytes += bytes!(conditioning_overlay);
         bytes += bytes!(shape_rows) + bytes!(sample_rows);
         let target = plan.target();
-        bytes += bytes!(qwen_embedding_rows);
+        bytes += bytes!(embedding_rows);
         for block in target.blocks() {
             match block.mixer() {
                 MixerProgramSlot::Attention(binding)
                     if charged_mixers.insert(MixerProgramSlot::Attention(binding)) =>
                 {
                     bytes += bytes!(qwen_attention_project)
-                        + bytes!(qwen_attention_decode)
-                        + bytes!(qwen_attention_prefill)
-                        + bytes!(qwen_attention_output)
+                        + bytes!(attention_output)
+                        + match binding.history {
+                            KvCodec::Dense => {
+                                bytes!(qwen_attention_decode) + bytes!(qwen_attention_prefill)
+                            }
+                            KvCodec::AffineK8V4 => {
+                                bytes!(qwen_attention_decode_k8v4)
+                                    + bytes!(qwen_attention_prefill_k8v4)
+                            }
+                            KvCodec::RotatedK4V4 => {
+                                return Err(PlanError::Unsupported("native rotated K4/V4 KV codec"))
+                            }
+                        }
                 }
                 MixerProgramSlot::Recurrent(binding)
                     if charged_mixers.insert(MixerProgramSlot::Recurrent(binding)) =>
@@ -422,21 +417,23 @@ impl AttestedPrograms {
                 _ => {}
             }
         }
-        bytes += bytes!(qwen_features_rows) + bytes!(qwen_head_rows) + bytes!(qwen_selected_rows);
+        bytes += bytes!(readout_features_rows) + bytes!(readout_head_rows) + bytes!(readout_selected_rows);
         if target.features().is_some() {
-            bytes += bytes!(qwen_features_rows);
+            bytes += bytes!(readout_features_rows);
         }
         if let Some(head) = plan.head() {
+            // Token selection over the draft vocabulary.
+            bytes += bytes!(shape_rows) + bytes!(sample_rows);
             for &binding in head.blocks() {
                 if charged_heads.insert(binding) {
                     bytes += bytes!(qwen_draft_rows)
                         + bytes!(qwen_attention_project)
                         + bytes!(qwen_attention_decode)
                         + bytes!(qwen_attention_prefill)
-                        + bytes!(qwen_attention_output)
+                        + bytes!(attention_output)
                         + bytes!(qwen_dense_expand)
                         + bytes!(qwen_dense_output)
-                        + bytes!(qwen_features_rows)
+                        + bytes!(readout_features_rows)
                         + bytes!(head_logits_rows);
                 }
             }
@@ -448,7 +445,7 @@ impl AttestedPrograms {
                     bytes += bytes!(qwen_vision_block);
                 }
             }
-            bytes += bytes!(qwen_vision_merger) + bytes!(qwen_vision_feature_output);
+            bytes += bytes!(qwen_vision_merger);
         }
         u64::try_from(bytes)
             .map_err(|_| PlanError::Arithmetic("native invocation workspace bytes overflow"))
@@ -594,7 +591,7 @@ impl AttestedPrograms {
             embedding: slot(
                 &prepared.target.embedding,
                 target_plan.embedding(),
-                "qwen_embedding_rows",
+                "embedding_rows",
             )?,
             blocks,
             readout: prepared
@@ -605,12 +602,12 @@ impl AttestedPrograms {
                 .ok_or_else(|| missing("qwen_readout_stages", target_plan.readout()))?,
             features: target_plan
                 .features()
-                .map(|binding| slot(&prepared.target.features, binding, "qwen_features_rows"))
+                .map(|binding| slot(&prepared.target.features, binding, "readout_features_rows"))
                 .transpose()?,
             selected: slot(
                 &prepared.target.selected,
                 target_plan.readout(),
-                "qwen_selected_rows",
+                "readout_selected_rows",
             )?,
             shape: prepared
                 .glue
@@ -644,11 +641,21 @@ impl AttestedPrograms {
                             .get(&binding)
                             .cloned()
                             .ok_or_else(|| missing("qwen_dense_stages", binding))?,
-                        features: slot(&handles.features, binding, "qwen_features_rows")?,
+                        features: slot(&handles.features, binding, "readout_features_rows")?,
                         logits: slot(&handles.logits, binding, "head_logits_rows")?,
                     });
                 }
-                Ok::<_, CatalogFailure>(AttestedHead { blocks })
+                Ok::<_, CatalogFailure>(AttestedHead {
+                    blocks,
+                    shape: handles
+                        .shape
+                        .clone()
+                        .ok_or_else(|| missing("shape_rows", "draft"))?,
+                    sample: handles
+                        .sample
+                        .clone()
+                        .ok_or_else(|| missing("sample_rows", "draft"))?,
+                })
             })
             .transpose()?;
         let vision = topology
@@ -667,11 +674,6 @@ impl AttestedPrograms {
                         .map(|binding| slot(&handles.blocks, binding, "qwen_vision_block"))
                         .collect::<Result<_, _>>()?,
                     merger: slot(&handles.merger, vision_plan.merger(), "qwen_vision_merger")?,
-                    output: slot(
-                        &handles.output,
-                        vision_plan.merger(),
-                        "qwen_vision_feature_output",
-                    )?,
                 })
             })
             .transpose()?;
@@ -696,7 +698,7 @@ impl AttestedPrograms {
                 copies,
                 conditioning: Some(
                     prepared.glue.conditioning_overlay.clone().ok_or_else(|| {
-                        missing("qwen_conditioning_overlay", "target conditioning")
+                        missing("conditioning_overlay", "target conditioning")
                     })?,
                 ),
             };
@@ -751,7 +753,14 @@ impl AttestedPrograms {
             vision_graphs: None,
             state_graphs: None,
         };
-        QualificationView::new(&attested, topology, &definition.geometry, load).qualify(device)?;
+        QualificationView::new(
+            &attested,
+            topology,
+            &definition.geometry,
+            definition.vision.as_ref().map(|vision| &vision.geometry),
+            load,
+        )
+        .qualify(device)?;
         Ok(attested)
     }
 
@@ -771,8 +780,7 @@ impl AttestedPrograms {
         charge!(prepared.target.embedding.values());
         for handles in prepared.target.attention.values() {
             bytes += u128::from(handles.project.invocation_workspace_bytes())
-                + u128::from(handles.decode.invocation_workspace_bytes())
-                + u128::from(handles.prefill.invocation_workspace_bytes())
+                + u128::from(handles.history.invocation_workspace_bytes())
                 + u128::from(handles.output.invocation_workspace_bytes());
         }
         for handles in prepared.target.recurrent.values() {
@@ -803,8 +811,7 @@ impl AttestedPrograms {
             charge!(head.input.values());
             for handles in head.attention.values() {
                 bytes += u128::from(handles.project.invocation_workspace_bytes())
-                    + u128::from(handles.decode.invocation_workspace_bytes())
-                    + u128::from(handles.prefill.invocation_workspace_bytes())
+                    + u128::from(handles.history.invocation_workspace_bytes())
                     + u128::from(handles.output.invocation_workspace_bytes());
             }
             for handles in head.dense.values() {
@@ -813,12 +820,13 @@ impl AttestedPrograms {
             }
             charge!(head.features.values());
             charge!(head.logits.values());
+            charge!(head.shape.iter());
+            charge!(head.sample.iter());
         }
         if let Some(vision) = &prepared.vision {
             charge!(vision.stem.values());
             charge!(vision.blocks.values());
             charge!(vision.merger.values());
-            charge!(vision.output.values());
         }
         if let Some(handle) = &prepared.glue.shape_rows {
             bytes += u128::from(handle.invocation_workspace_bytes());
@@ -934,31 +942,14 @@ impl AttestedPrograms {
         {
             return Err(missing("head", "native single-block topology"));
         }
-        let attention = definition
-            .geometry
-            .blocks
-            .iter()
-            .rev()
-            .find_map(|block| match &block.mixer {
-                magnitude_model_contracts::MixerGeometry::Attention(geometry) => {
-                    Some(geometry.clone())
-                }
-                _ => None,
-            })
-            .ok_or_else(|| missing("head", "target attention geometry"))?;
         let graphs = self
             .head_graphs
             .as_ref()
             .ok_or_else(|| missing("head", "prepared native graphs"))?
-            .clone()
             .bind_weights(&resident)
             .map_err(|error| missing("head", error))?;
-        crate::programs::native_head::NativeHeadProgram::new(
-            definition.geometry.clone(),
-            attention,
-            graphs,
-        )
-        .map_err(|error| missing("head", error))
+        crate::programs::native_head::NativeHeadProgram::new(definition.geometry.clone(), graphs)
+            .map_err(|error| missing("head", error))
     })()
         .map_err(|failure| CatalogError::native(self.backend, failure))
     }

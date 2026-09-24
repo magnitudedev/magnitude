@@ -8,10 +8,9 @@ Start with the [architecture overview](docs/overview.md), then the
 These local docs are normative. Seismic is governed by the
 [structured authoring spec](../specs/26-09-18/seismic-structured-authoring-spec.md);
 the [implementation plan](../specs/26-09-19/seismic-structured-authoring-implementation-plan.md)
-records the decisions taken where the spec is silent. The
-[master implementation spec](/Users/anerli/notes/specs/26-09-17/inference-v4-master.md)
-gives engine context; where it describes Seismic differently, the structured
-authoring spec and the local docs win. V3's active behavior and numerical contracts
+records the decisions taken where the spec is silent. Where any other engine
+planning document describes Seismic differently, the structured authoring spec and
+the local docs win. V3's active behavior and numerical contracts
 remain the preservation reference.
 
 ## Status

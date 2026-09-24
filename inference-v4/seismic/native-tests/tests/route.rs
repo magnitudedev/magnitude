@@ -33,7 +33,7 @@ fn search(samples: usize) -> Strategy {
 fn devices() -> Vec<Device> {
     let catalog = DeviceCatalog::discover().expect("device discovery");
     let topology = catalog.topology();
-    let devices = [BackendName::Cpu, BackendName::Metal, BackendName::Cuda]
+    let devices = [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]
         .into_iter()
         .filter(|backend| {
             topology.devices().iter().any(|device| {
@@ -255,12 +255,14 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
                 TuningPoint {
                     label: "short".into(),
                     weight: 1.0,
+                    class: None,
                     rotation: inputs.iter().map(|x| split_sum::Args { x }).collect(),
                     initialize: None,
                 },
                 TuningPoint {
                     label: "long".into(),
                     weight: 3.0,
+                    class: None,
                     rotation: inputs.iter().map(|x| split_sum::Args { x }).collect(),
                     initialize: None,
                 },
@@ -691,6 +693,7 @@ fn tuning_rejects_shared_mutable_state_without_an_initializer() {
         let points = vec![TuningPoint {
             label: "rows".into(),
             weight: 1.0,
+            class: None,
             rotation: vec![accumulate::Args { state: &mut state, x: &x }],
             initialize: None,
         }];
@@ -726,6 +729,7 @@ fn tuning_validates_in_place_parameters_and_excludes_misclassified_ones() {
         let points = vec![TuningPoint {
             label: "rows".into(),
             weight: 1.0,
+            class: None,
             rotation: vec![accumulate::Args { state: &mut state, x: &x }],
             initialize: Some(initialize),
         }];
@@ -891,8 +895,14 @@ fn gated(device: &Device, small: u64) -> seismic::NativeKernel<gated_sum::Entry>
 #[test]
 fn conditional_launches_run_only_the_active_launch() {
     for device in devices() {
-        // (N, SMALL, active launch ordinal)
-        for (n, small, active) in [(10u64, 64u64, 0usize), (64, 64, 0), (200, 64, 1), (200, 1_048_576, 0)] {
+        // (N, SMALL, active launch ordinal). Vulkan forms group memory at
+        // preparation, so SMALL = 2^20 (4 MiB staged) does not prepare there
+        // (`inactive_launches_are_exempt_from_device_limits`).
+        let cases = [(10u64, 64u64, 0usize), (64, 64, 0), (200, 64, 1), (200, 1_048_576, 0)];
+        let cases = cases
+            .into_iter()
+            .filter(|(_, small, _)| device.backend() != BackendName::Vulkan || *small == 64);
+        for (n, small, active) in cases {
             let values = exact_values(n as usize);
             let expected = portable_gated_sum(&values);
             let kernel = gated(&device, small);
@@ -938,7 +948,9 @@ fn conditional_launches_run_only_the_active_launch() {
 
 /// An inactive launch is not checked against device limits: the staged
 /// launch's group memory (512 KiB here) exceeds every device's limit, which
-/// is an error only when that launch is active.
+/// is an error only when that launch is active. Vulkan fixes group memory
+/// when the kernel is prepared, so there the staged launch's 4 MiB region is
+/// refused at preparation, whether or not a call would activate it.
 #[test]
 fn inactive_launches_are_exempt_from_device_limits() {
     for device in devices() {
@@ -951,6 +963,20 @@ fn inactive_launches_are_exempt_from_device_limits() {
         assert_eq!(read_f32(&value), [values.iter().sum::<f32>()], "{:?}", device.backend());
         if device.backend() == BackendName::Cpu {
             // The CPU route has no group-memory limit.
+            continue;
+        }
+        if device.backend() == BackendName::Vulkan {
+            let error = gated_sum::native_for_device(
+                &device,
+                &NativeSpecialization::new().with_param("SMALL", 1_048_576),
+            )
+            .err()
+            .expect("a 4 MiB group-memory region is refused at preparation");
+            assert!(
+                error.to_string().contains("launch `gated_staged` needs")
+                    && error.to_string().contains("the device allows"),
+                "{error}"
+            );
             continue;
         }
         match gated(&device, 1_048_576).call(gated_sum::Args { x: &x }) {
@@ -996,5 +1022,86 @@ fn inactive_scratch_is_charged_the_minimum() {
         };
         assert!(workspace(10) < 800, "{:?}", device.backend());
         assert!(workspace(200) >= 800, "{:?}", device.backend());
+    }
+}
+
+/// A reserved tensor backs only its leading committed rows. Recommitting
+/// keeps them (device work bound afterwards reads them) and zero-fills the
+/// rows it adds, including rows released by a shrink and backed again (CUDA
+/// resizes its reserved address range in place, reusing granules).
+#[test]
+fn a_reserved_tensor_recommits_keeping_its_rows() {
+    for device in devices() {
+        let backend = device.backend();
+        // 1 KiB rows: several 2 MiB CUDA granules are mapped, released and
+        // mapped again.
+        let (rows, n) = (8192u64, 256u64);
+        let (grow, shrink, regrow) = (6000u64, 4u64, 5000u64);
+        let row_values = |count: u64| {
+            (0..count * n)
+                .map(|index| (index % 97) as f32 * 0.5 + 1.0)
+                .collect::<Vec<_>>()
+        };
+        let bytes = |values: &[f32]| values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+        let with_zeros = |values: &[f32], count: u64| {
+            let mut all = values.to_vec();
+            all.resize((count * n) as usize, 0.0);
+            all
+        };
+        let reserved = Tensor::reserved(&device, Element::f32(), &[rows, n], 8).unwrap();
+        assert_eq!(reserved.committed_rows(), 8, "{backend:?}");
+        assert_eq!(reserved.resizes_in_place(), backend == BackendName::Cuda, "{backend:?}");
+        assert!(reserved.read_to_host().is_err(), "{backend:?}: host access past the committed rows");
+        let first = row_values(8);
+        reserved.slice_leading(0, 8).unwrap().write_from_host(&bytes(&first)).unwrap();
+
+        let grown = reserved.recommitted(grow).unwrap();
+        drop(reserved);
+        assert_eq!(grown.committed_rows(), grow, "{backend:?}");
+        assert_eq!(read_f32(&grown.slice_leading(0, grow).unwrap()), with_zeros(&first, grow), "{backend:?}");
+        grown
+            .slice_leading(8, grow)
+            .unwrap()
+            .write_from_host(&bytes(&row_values(grow - 8)))
+            .unwrap();
+
+        let scale =
+            scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
+                .unwrap();
+        let mut graph = device.native_graph();
+        let x = graph.port(Element::f32(), &[8, n]).unwrap();
+        let tripled = graph
+            .enqueue(&scale, scale_rows::WorkflowArgs { x: x.tensor().into(), factor: 3.0 })
+            .unwrap()
+            .value;
+        graph.export(&tripled).unwrap();
+        let plan = graph.seal().unwrap();
+        let mut bindings = plan.bindings();
+        bindings.set(&x, &grown.slice_leading(0, 8).unwrap()).unwrap();
+        let (outputs, completion) = plan
+            .new_slot()
+            .unwrap()
+            .attach(bindings, plan.new_outputs().unwrap())
+            .unwrap()
+            .submit()
+            .unwrap();
+        completion.wait().unwrap();
+        assert_eq!(
+            read_f32(&outputs.exported(&tripled).unwrap()),
+            first.iter().map(|value| value * 3.0).collect::<Vec<_>>(),
+            "{backend:?}"
+        );
+
+        let shrunk = grown.recommitted(shrink).unwrap();
+        drop(grown);
+        assert_eq!(shrunk.committed_rows(), shrink, "{backend:?}");
+        assert_eq!(shrunk.resizes_in_place(), backend == BackendName::Cuda, "{backend:?}");
+        let regrown = shrunk.recommitted(regrow).unwrap();
+        drop(shrunk);
+        assert_eq!(
+            read_f32(&regrown.slice_leading(0, regrow).unwrap()),
+            with_zeros(&first[..(shrink * n) as usize], regrow),
+            "{backend:?}: rows released and backed again read zero"
+        );
     }
 }

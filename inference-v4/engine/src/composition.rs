@@ -210,6 +210,7 @@ impl ReadyEngine {
             .map_err(|_| "artifact context limit exceeds host domain")?;
         let mut count_definition = definition.clone();
         count_definition.geometry.context_limit = declared_context_limit;
+        let media_marker = media.as_ref().map(|_| QWEN_IMAGE_PLACEHOLDER.to_owned());
         let count_adapter = input_adapter.clone();
         let count_media = media.clone();
         let count_policy = media_policy.clone();
@@ -241,10 +242,16 @@ impl ReadyEngine {
             vocabulary,
             prepare_input,
             count_input,
+            media_marker,
             config,
         )
     }
 }
+
+/// The text one image renders as in the Qwen chat template: the image pad
+/// between the vision delimiters, which input preparation expands to the
+/// image's merged patch rows.
+const QWEN_IMAGE_PLACEHOLDER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
 
 impl EngineConfiguration {
     pub fn resolve(self) -> Result<ResolvedEngineConfiguration, String> {
@@ -258,14 +265,6 @@ impl EngineConfiguration {
             artifacts.definition.geometry.context_limit,
         )?;
         let model = self.model.resolve(artifacts.definition())?;
-        if self.path == ExecutionPath::Native
-            && model.kv_codec != magnitude_model_state::KvCodec::Dense
-        {
-            return Err(format!(
-                "the native path supports only the dense KV codec; requested {}",
-                model.kv_codec.identity()
-            ));
-        }
         let storage: ResolvedStoragePolicy = self.storage.resolve()?;
         let manifest = ExecutionManifest::new(
             artifacts.package().manifest(),

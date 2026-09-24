@@ -1,9 +1,9 @@
 #include "common/attention.h"
 
-// History keys each simdgroup loads before scoring them. Affine rows are 2.6x
-// smaller than dense ones, so twice the dense batch keeps as many bytes in
-// flight.
-#define DECODE_BATCH 8
+// History keys each simdgroup loads before scoring them: the dense batch.
+// The affine absorb is bound by per-key work, not bytes in flight; larger
+// batches only raise register pressure (measured 8 and 16 slower on M4).
+#define DECODE_BATCH 4
 
 // L1: threadgroup (kv head, partition, row), as `qwen_attention_decode`, over
 // affine K8/V4 history. History keys score as scale * (q . code) + zero *

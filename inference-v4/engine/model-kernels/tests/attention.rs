@@ -67,11 +67,14 @@ fn prefill_kernel(
     geometry: Geometry,
     (query_tile, split_groups): (u64, u64),
 ) -> seismic::NativeKernel<qwen_attention_prefill::Entry> {
+    // Vulkan tiles ROWS = 64 matrix rows (query tile x query heads), the one
+    // tile admissible at every tested geometry, whatever QT asks for.
+    let tile = if device.backend() == BackendName::Vulkan { ("ROWS", 64) } else { ("QT", query_tile) };
     qwen_attention_prefill::native_for_device_with(
         device,
         qwen_attention_prefill::Elements { A: Element::bf16() },
         &statics(geometry)
-            .with_param("QT", query_tile)
+            .with_param(tile.0, tile.1)
             .with_param("SPLIT_GROUPS", split_groups),
     )
     .unwrap()

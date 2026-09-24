@@ -17,7 +17,7 @@ definitions.
 | `reference.py base` | CPU reference base file per category (`results/precision/<label>/`). `--categories code,tool_json` (re)produces only those; the label's existing `reference.json` entries for the other categories are kept when model, corpus and llama.cpp build match. |
 | `reference.py f32-gguf` | Dequantizes the pinned GGUF to an all-F32 GGUF, the true F32 reference model. |
 | `reference.py spread` | Runs `--kl-divergence` on a GPU backend against a reference, parses its summary to `spread.json`; `--save-base` also writes that backend's own base files and cross-checks with `kl_base.py`. |
-| `spread_host.sh` | `spread --save-base` on a shared host, one category per hold of `~/native-program/gpu-lock`. |
+| `spread_host.sh` | `spread --save-base` one category at a time; with `GPU_LOCK` set, each category runs under that shared lock directory. |
 | `kl_base.py` | NumPy reader/writer for the base format; computes mean KL, same-top, PPL between two base files or a base file and a raw-logits `.npy`; `self-test`. |
 
 All outputs are under the git-ignored `inference-v4/validation/results/precision/`.
@@ -60,8 +60,8 @@ affects batching.
 
 Written by `perplexity()` in `tools/perplexity/perplexity.cpp` when
 `--kl-divergence-base` is given without `--kl-divergence`. Identical in b8680
-(local Homebrew, commit 15f786e65), b9994, b10809 (m4-pro-01) and b10998
-(sparky); the only changes between b8680 and later are `size_t` casts in
+(Homebrew, commit 15f786e65), b9994, b10809 (Metal build) and b10998
+(CUDA build); the only changes between b8680 and later are `size_t` casts in
 offset arithmetic (a >2 GiB overflow fix for huge `n_ctx * nv`, not a format
 change). All integers and floats are little-endian; there is no padding
 or alignment between sections.
@@ -218,16 +218,16 @@ llama-perplexity -m $G -c 130 --kl-divergence --kl-divergence-base <ref>/<cat>.b
 p`, `PPL(Q)`, `PPL(base)`, `RMS Δp` (with uncertainties), plus a
 position-weighted overall mean KL and same-top. GPU defaults (F16 KV cache,
 flash attention auto) are what the spread measures; pass `--extra` to change
-flags. Hosts: Metal on m4-pro-02 (`--binary-dir /opt/homebrew/bin`, b10964;
-m4-pro-01 is reserved for performance evidence), CUDA on sparky
-(`--binary-dir ~/magnitude-external/llama-b10998/llama-b10998`, `LD_LIBRARY_PATH`
-to that directory). Copy `precision/`, the corpus and the reference directory to
-`~/native-program/precision/inference-v4/validation/…` on the host first. The base
-files compress ~8× with `zstd -3` (5.4 GB → 0.4–0.9 GB), which matters over the
-hosts' slow links; check the decompressed sha256 against `reference.json`. A spread
-saturates the GPU: hold the host's `~/native-program/gpu-lock` (mkdir/rmdir) while
-it runs, one category per lock hold (`spread_host.sh`; `spread --categories`
-merges into the label's `spread.json`).
+flags. Recorded backends: Metal on an Apple M4 Pro (Homebrew llama.cpp b10964,
+`--binary-dir /opt/homebrew/bin`), CUDA on an NVIDIA GB10 (llama.cpp b10998 release
+build, `--binary-dir <llama.cpp dir>` with `LD_LIBRARY_PATH` set to that directory).
+To measure on another machine, copy `precision/`, the corpus and the reference
+directory into an `inference-v4/validation/` tree there first. The base files compress
+~8× with `zstd -3` (5.4 GB → 0.4–0.9 GB), which matters over slow links; check the
+decompressed sha256 against `reference.json`. A spread saturates the GPU: on a
+machine shared with other timing work, hold a shared lock while it runs, one category
+per lock hold (`GPU_LOCK=<dir> spread_host.sh`; `spread --categories` merges into the
+label's `spread.json`).
 
 ## Local results (2026-09-23, M4 Max, Homebrew llama.cpp b8680 `15f786e65`)
 
@@ -285,8 +285,8 @@ chunks; sha256s in its `reference.json`). Against it, all 32,768 positions:
 | Candidate | Mean KL overall | Category max | Same top overall | Category min | KL p99 max |
 |---|---|---|---|---|---|
 | llama.cpp Metal, M4 Max, b8680 | 0.000331 | 0.000556 (tool JSON) | 99.203 % | 98.931 % (prose) | 0.0032 |
-| llama.cpp Metal, M4 Pro (m4-pro-02), b10964 | 0.000331 | 0.000555 | 99.225 % | 98.958 % | 0.0032 |
-| llama.cpp CUDA, GB10 (sparky), b10998 | 0.004264 | 0.005821 (tool JSON) | 97.040 % | 96.446 % (prose) | 0.0496 |
+| llama.cpp Metal, M4 Pro, b10964 | 0.000331 | 0.000555 | 99.225 % | 98.958 % | 0.0032 |
+| llama.cpp CUDA, GB10, b10998 | 0.004264 | 0.005821 (tool JSON) | 97.040 % | 96.446 % (prose) | 0.0496 |
 | llama.cpp CPU on the Q4_K_M file (Q8_K activations), b8680 | 0.003554 | 0.004673 | 96.960 % | 96.296 % | 0.0460 |
 
 CUDA sits with the CPU-Q4_K_M forward, not with Metal: its quantized matmuls
@@ -298,7 +298,7 @@ reference's top-two gap exceeds 0.1 nats); CUDA keeps 275 flips above that gap
 ## V4 qualification
 
 ```
-# from validation/results/precision (sparky: export SEISMIC_NVRTC_DIRECTORY=/usr/local/cuda/lib64)
+# from validation/results/precision (CUDA: export SEISMIC_NVRTC_DIRECTORY=<CUDA toolkit>/lib64)
 forward_bench qualify --model $G --reference ref-cpu-f32-b8680 --output v4-qualify/<label>.json [--chunks N]
 ```
 
@@ -309,7 +309,7 @@ logits exported, compared with the stored rows by llama.cpp's KL and same-top
 definitions. The report is rewritten after each category; with all three it
 carries `overall` and a `d4` verdict (each threshold, value, pass). `--chunks N`
 caps the chunks per category for a quick look. `--storage-gib` must hold the
-model (35B: 25 locally, 30 on sparky). The 35B F32 reference is
+model (35B: 25 on an M4 Max, 30 on a GB10). The 35B F32 reference is
 `ref-cpu-f32-35b-b8680` (139 GB F32 GGUF, larger than RAM; built with
 `--extra -b 2048 -ub 2048` so each pass streams the file once). On a shared host, hold the GPU
 lock for the run. First result (2026-09-24, local M4 Max, Metal): mean KL

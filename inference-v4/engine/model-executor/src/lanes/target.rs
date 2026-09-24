@@ -2,17 +2,28 @@
 //! planned device leases.
 
 use crate::{
-    ConditioningRef, FeatureSpan, InvariantError, NativeGraphOutputLease,
+    ConditioningRef, FeatureSpan, GraphOutputTensor, InvariantError, NativeGraphOutputLease,
     NativeGraphWorkspaceLease, PoolClass, ResourceDomainId, TargetGraphOutputLease,
     TargetGraphWorkspaceLease,
 };
 use magnitude_model_batching::ValidatedTargetBatch;
-use magnitude_model_state::{OwnedStateAdvance, StateStore};
+use magnitude_model_state::{StateStore, TentativeAdvance};
 use std::rc::Rc;
+
+/// Where a launch's input tokens come from.
+#[derive(Clone)]
+pub enum TargetTokens {
+    /// The batch's host tokens, written into the step's upload region.
+    Host,
+    /// The previous step's selections (`[rows, 2]` token, status rows in slot
+    /// order), read on the device: the step continues that one.
+    Selected(GraphOutputTensor),
+}
 
 pub struct TargetLaunchInputs {
     batch: ValidatedTargetBatch,
-    advances: Vec<OwnedStateAdvance>,
+    tokens: TargetTokens,
+    advances: Vec<TentativeAdvance>,
     conditioning: Vec<Option<ConditioningRef>>,
     conditioning_slices: Vec<Vec<ConditioningSlice>>,
     graph_workspace: TargetGraphWorkspaceLease,
@@ -32,7 +43,8 @@ pub struct ConditioningSlice {
 impl TargetLaunchInputs {
     pub fn new(
         batch: ValidatedTargetBatch,
-        advances: Vec<OwnedStateAdvance>,
+        tokens: TargetTokens,
+        advances: Vec<TentativeAdvance>,
         conditioning: Vec<Option<ConditioningRef>>,
         conditioning_slices: Vec<Vec<ConditioningSlice>>,
         graph_workspace: TargetGraphWorkspaceLease,
@@ -42,6 +54,7 @@ impl TargetLaunchInputs {
     ) -> Self {
         Self {
             batch,
+            tokens,
             advances,
             conditioning,
             conditioning_slices,
@@ -56,7 +69,7 @@ impl TargetLaunchInputs {
         self,
     ) -> (
         ValidatedTargetBatch,
-        Vec<OwnedStateAdvance>,
+        Vec<TentativeAdvance>,
         Vec<Option<ConditioningRef>>,
         Vec<Vec<ConditioningSlice>>,
     ) {
@@ -86,6 +99,17 @@ impl TargetLaunchInputs {
             return Err(invalid(
                 "slot, advance, and conditioning counts disagree".into(),
             ));
+        }
+        if let TargetTokens::Selected(selected) = &self.tokens {
+            let rows = self.batch.class().rows() as u64;
+            if selected.tensor().extents() != [rows, 2]
+                || self.batch.slots().any(|slot| slot.rows() != 1)
+                || self.conditioning.iter().any(Option::is_some)
+            {
+                return Err(invalid(
+                    "selected tokens differ from the launch's one-row slots".into(),
+                ));
+            }
         }
         if self.graph_workspace.domain() != domain
             || self
@@ -234,6 +258,7 @@ impl ValidatedTargetLaunch {
         }
         let TargetLaunchInputs {
             batch,
+            tokens,
             advances,
             conditioning,
             conditioning_slices,
@@ -245,6 +270,7 @@ impl ValidatedTargetLaunch {
         Ok(Self {
             core: TargetLaunchCore {
                 batch,
+                tokens,
                 advances,
                 conditioning,
                 conditioning_slices,
@@ -311,7 +337,9 @@ pub struct TargetLaunchWorkspace {
 /// physical finish.
 pub struct TargetLaunchCore {
     batch: ValidatedTargetBatch,
-    advances: Vec<OwnedStateAdvance>,
+    /// Selected tokens stay held until the launch that reads them completes.
+    tokens: TargetTokens,
+    advances: Vec<TentativeAdvance>,
     conditioning: Vec<Option<ConditioningRef>>,
     conditioning_slices: Vec<Vec<ConditioningSlice>>,
     domain: ResourceDomainId,
@@ -322,7 +350,11 @@ impl TargetLaunchCore {
         &self.batch
     }
 
-    pub fn advances(&self) -> &[OwnedStateAdvance] {
+    pub fn tokens(&self) -> &TargetTokens {
+        &self.tokens
+    }
+
+    pub fn advances(&self) -> &[TentativeAdvance] {
         &self.advances
     }
 
@@ -338,7 +370,7 @@ impl TargetLaunchCore {
         self,
     ) -> (
         ValidatedTargetBatch,
-        Vec<OwnedStateAdvance>,
+        Vec<TentativeAdvance>,
         Vec<Option<ConditioningRef>>,
         Vec<Vec<ConditioningSlice>>,
     ) {

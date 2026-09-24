@@ -1,7 +1,9 @@
 // Groups the M * K routed choices by expert into T-row tiles; the CUDA form of
-// `metal/qwen_routed_group.metal`. One block; thread (expert, part) owns the
-// choices of `part` (a contiguous slice of the flat choice order) that route
-// to `expert`, so every expert's rows keep their flat (row, choice) order.
+// `metal/qwen_routed_group.metal`. One block. The routes are staged once into
+// shared memory; thread (part, expert) owns the choices of `part` (a
+// contiguous slice of the flat choice order) that route to `expert`, so every
+// expert's rows keep their flat (row, choice) order. Threads of one warp share
+// a part, so their slice reads are broadcasts.
 
 extern "C" __global__ void qwen_routed_group(SEISMIC_KERNEL_PARAMS) {
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
@@ -11,35 +13,40 @@ extern "C" __global__ void qwen_routed_group(SEISMIC_KERNEL_PARAMS) {
     int *blocks = reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_BLOCKS));
     extern __shared__ unsigned slices[];
     constexpr unsigned parts = SEISMIC_TUNE_PARTS;
-    constexpr unsigned threads = SEISMIC_DIM_E * parts;
+    constexpr unsigned experts = SEISMIC_DIM_E;
+    constexpr unsigned threads = experts * parts;
+    constexpr unsigned K = SEISMIC_DIM_K;
+    const unsigned tile = static_cast<unsigned>(SEISMIC_DIM_T);
     unsigned *starts = slices + threads;
-    unsigned *used = starts + SEISMIC_DIM_E;
+    unsigned *used = starts + experts;
+    unsigned short *staged = reinterpret_cast<unsigned short *>(used + 4);
     const unsigned thread = threadIdx.x;
-    const unsigned expert = thread / parts;
-    const unsigned part = thread % parts;
-    const unsigned long long tile = SEISMIC_DIM_T;
-    const unsigned long long choices = SEISMIC_DIM_M * SEISMIC_DIM_K;
-    const unsigned long long span = (choices + parts - 1) / parts;
-    const unsigned long long start = static_cast<unsigned long long>(part) * span;
-    const unsigned long long begin = start < choices ? start : choices;
-    const unsigned long long end = begin + span < choices ? begin + span : choices;
+    const unsigned expert = thread % experts;
+    const unsigned part = thread / experts;
+    const unsigned choices = static_cast<unsigned>(SEISMIC_DIM_M) * K;
+    const unsigned span = (choices + parts - 1) / parts;
+    const unsigned begin = min(part * span, choices);
+    const unsigned end = min(begin + span, choices);
+
+    for (unsigned flat = thread; flat < choices; flat += threads)
+        staged[flat] = static_cast<unsigned short>(
+            routes[static_cast<unsigned long long>(flat / K) * SEISMIC_ROUTES_STRIDE_0 +
+                   static_cast<unsigned long long>(flat % K) * SEISMIC_ROUTES_STRIDE_1]);
+    __syncthreads();
 
     unsigned count = 0;
-    for (unsigned long long flat = begin; flat < end; ++flat) {
-        const unsigned long long row = flat / SEISMIC_DIM_K;
-        const unsigned long long choice = flat % SEISMIC_DIM_K;
-        count += routes[row * SEISMIC_ROUTES_STRIDE_0 + choice * SEISMIC_ROUTES_STRIDE_1] == static_cast<int>(expert);
-    }
-    slices[thread] = count;
+    for (unsigned flat = begin; flat < end; ++flat)
+        count += staged[flat] == expert;
+    slices[expert * parts + part] = count;
     __syncthreads();
 
     if (thread == 0) {
         unsigned block = 0;
-        for (unsigned index = 0; index < SEISMIC_DIM_E; ++index) {
+        for (unsigned index = 0; index < experts; ++index) {
             starts[index] = block;
             unsigned total = 0;
             for (unsigned slice = 0; slice < parts; ++slice) total += slices[index * parts + slice];
-            block += static_cast<unsigned>((total + tile - 1) / tile);
+            block += (total + tile - 1) / tile;
         }
         used[0] = block;
     }
@@ -52,29 +59,33 @@ extern "C" __global__ void qwen_routed_group(SEISMIC_KERNEL_PARAMS) {
         preceding += slice < part ? value : 0;
         total += value;
     }
-    const unsigned long long base = static_cast<unsigned long long>(starts[expert]) * tile;
-    unsigned long long position = base + preceding;
-    for (unsigned long long flat = begin; flat < end; ++flat) {
-        const unsigned long long row = flat / SEISMIC_DIM_K;
-        const unsigned long long choice = flat % SEISMIC_DIM_K;
-        if (routes[row * SEISMIC_ROUTES_STRIDE_0 + choice * SEISMIC_ROUTES_STRIDE_1] != static_cast<int>(expert))
+    const unsigned base = starts[expert] * tile;
+    unsigned position = base + preceding;
+    for (unsigned flat = begin; flat < end; ++flat) {
+        if (staged[flat] != expert)
             continue;
-        order[(position / tile) * SEISMIC_ORDER_STRIDE_0 + (position % tile) * SEISMIC_ORDER_STRIDE_1] =
-            static_cast<int>(row);
-        inverse[row * SEISMIC_INVERSE_STRIDE_0 + choice * SEISMIC_INVERSE_STRIDE_1] = static_cast<int>(position);
+        const unsigned row = flat / K;
+        order[static_cast<unsigned long long>(position / tile) * SEISMIC_ORDER_STRIDE_0 +
+              static_cast<unsigned long long>(position % tile) * SEISMIC_ORDER_STRIDE_1] = static_cast<int>(row);
+        inverse[static_cast<unsigned long long>(row) * SEISMIC_INVERSE_STRIDE_0 +
+                static_cast<unsigned long long>(flat % K) * SEISMIC_INVERSE_STRIDE_1] = static_cast<int>(position);
         ++position;
     }
     if (part == 0) {
         counts[expert * SEISMIC_COUNTS_STRIDE_0] = static_cast<int>(total);
-        const unsigned long long tiles = (total + tile - 1) / tile;
-        for (unsigned long long padding = base + total; padding < base + tiles * tile; ++padding)
-            order[(padding / tile) * SEISMIC_ORDER_STRIDE_0 + (padding % tile) * SEISMIC_ORDER_STRIDE_1] = -1;
-        for (unsigned long long block = starts[expert]; block < starts[expert] + tiles; ++block)
+        const unsigned tiles = (total + tile - 1) / tile;
+        for (unsigned padding = base + total; padding < base + tiles * tile; ++padding)
+            order[static_cast<unsigned long long>(padding / tile) * SEISMIC_ORDER_STRIDE_0 +
+                  static_cast<unsigned long long>(padding % tile) * SEISMIC_ORDER_STRIDE_1] = -1;
+        for (unsigned block = starts[expert]; block < starts[expert] + tiles; ++block)
             blocks[block * SEISMIC_BLOCKS_STRIDE_0] = static_cast<int>(expert);
     }
-    for (unsigned long long block = used[0] + thread; block < SEISMIC_DIM_B; block += threads) {
-        blocks[block * SEISMIC_BLOCKS_STRIDE_0] = -1;
-        for (unsigned long long lane = 0; lane < tile; ++lane)
-            order[block * SEISMIC_ORDER_STRIDE_0 + lane * SEISMIC_ORDER_STRIDE_1] = -1;
+    for (unsigned flat = used[0] * tile + thread; flat < static_cast<unsigned>(SEISMIC_DIM_B) * tile; flat += threads) {
+        const unsigned block = flat / tile;
+        const unsigned lane = flat % tile;
+        if (lane == 0)
+            blocks[block * SEISMIC_BLOCKS_STRIDE_0] = -1;
+        order[static_cast<unsigned long long>(block) * SEISMIC_ORDER_STRIDE_0 +
+              static_cast<unsigned long long>(lane) * SEISMIC_ORDER_STRIDE_1] = -1;
     }
 }

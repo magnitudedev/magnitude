@@ -81,7 +81,11 @@ def main() -> None:
     parser.add_argument("--startup-timeout", type=int, default=900)
     parser.add_argument("--storage-gib", type=int, default=28)
     parser.add_argument("--method", choices=("auto", "plain", "mtp"), default="auto")
+    parser.add_argument("--mtp-proposals", type=int,
+                        help="MTP proposal width (default: the engine's)")
     args = parser.parse_args()
+    if args.mtp_proposals is not None and args.method != "mtp":
+        parser.error("--mtp-proposals requires --method mtp")
     if any(value <= 0 for value in (
         args.context, args.repeat, args.startup_timeout, args.storage_gib
     )):
@@ -156,6 +160,7 @@ def main() -> None:
                 "startup_timeout_seconds": args.startup_timeout,
                 "storage_gib": args.storage_gib,
                 "method": args.method,
+                "mtp_proposals": args.mtp_proposals,
                 "count_endpoint": "/v1/count",
                 "target_schema_key": "magnitude",
                 "measurement": "unchanged V3 Session Bench fixtures, client, runner, and report",
@@ -201,6 +206,8 @@ def main() -> None:
                 "--max-batch", str(parallel),
                 "--output-capacity", "256",
                 "--method", args.method,
+                *(["--mtp-proposals", str(args.mtp_proposals)]
+                  if args.mtp_proposals is not None else []),
             ]
 
         def verify_ready(self, data, context, parallel):

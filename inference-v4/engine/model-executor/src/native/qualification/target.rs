@@ -16,20 +16,20 @@ impl<'a> QualificationView<'a> {
                 device,
                 binding.table,
                 &[1, hidden],
-                "qwen_embedding_rows",
+                "embedding_rows",
                 &label,
             )?;
-            let tokens = semantic_i32(device, &[1], &[0], "qwen_embedding_rows", &label)?;
+            let tokens = semantic_i32(device, &[1, 2], &[0, 0], "embedding_rows", &label)?;
             let result = self
                 .programs
                 .target
                 .embedding
-                .call(qwen_embedding_rows::Args {
+                .call(embedding_rows::Args {
                     table: &table,
                     tokens: &tokens,
                 })
-                .map_err(|error| qualification_dynamic("qwen_embedding_rows", &label, error))?;
-            require_finite_nonzero_f32(&result.r1, "qwen_embedding_rows", &label)?;
+                .map_err(|error| qualification_dynamic("embedding_rows", &label, error))?;
+            require_finite_nonzero_f32(&result.r1, "embedding_rows", &label)?;
         }
 
         for (slot, attested) in self
@@ -143,11 +143,13 @@ impl<'a> QualificationView<'a> {
                 semantic_i32(device, &[2, 2], &[0, 1, 1, 1], "target_recurrent", &label)?;
             let stop = semantic_i32(device, &[1], &[1], "target_recurrent", &label)?;
             let previous_bank = semantic_i32(device, &[1], &[0], "target_recurrent", &label)?;
+            let previous_tape = semantic_i32(device, &[1], &[0], "target_recurrent", &label)?;
             let following_bank = semantic_i32(device, &[1], &[1], "target_recurrent", &label)?;
+            // One tape row, the least a bank holds.
             let mut window = semantic_zeros(
                 device,
                 binding.activation,
-                &[2, taps - 1, channels],
+                &[2, taps, channels],
                 "target_recurrent",
                 &label,
             )?;
@@ -155,6 +157,13 @@ impl<'a> QualificationView<'a> {
                 device,
                 Element::f32(),
                 &[2, value_heads, w, w],
+                "target_recurrent",
+                &label,
+            )?;
+            let mut tape = semantic_zeros(
+                device,
+                Element::f32(),
+                &[2, 1, (value_heads + key_heads) * w + value_heads],
                 "target_recurrent",
                 &label,
             )?;
@@ -181,9 +190,11 @@ impl<'a> QualificationView<'a> {
                     segments: &segments,
                     stop: &stop,
                     previous_bank: &previous_bank,
+                    previous_tape: &previous_tape,
                     following_bank: &following_bank,
                     window: &mut window,
                     delta: &mut delta,
+                    tape: &mut tape,
                     norm_epsilon: 1.0e-5,
                     grouped: false,
                 })
@@ -199,9 +210,11 @@ impl<'a> QualificationView<'a> {
                     segments: &segments,
                     stop: &stop,
                     previous_bank: &previous_bank,
+                    previous_tape: &previous_tape,
                     following_bank: &following_bank,
                     window: &mut window,
                     delta: &mut delta,
+                    tape: &mut tape,
                     norm_epsilon: 1.0e-5,
                     grouped: false,
                 })
@@ -305,36 +318,36 @@ impl<'a> QualificationView<'a> {
                 .target
                 .readout
                 .features
-                .call(qwen_features_rows::Args {
+                .call(readout_features_rows::Args {
                     hidden: &hidden_residual,
                     norm: &norm,
                     out_rows: &out_rows,
                     epsilon: 1.0e-5,
                 })
-                .map_err(|error| qualification_dynamic("qwen_features_rows", &label, error))?
+                .map_err(|error| qualification_dynamic("readout_features_rows", &label, error))?
                 .value;
-            require_finite_nonzero(&features, "qwen_features_rows", &label)?;
+            require_finite_nonzero(&features, "readout_features_rows", &label)?;
             let logits = self
                 .programs
                 .target
                 .readout
                 .head
-                .call(qwen_head_rows::Args {
+                .call(readout_head_rows::Args {
                     hidden: &hidden_residual,
                     norm: &norm,
                     weight: &weight,
                     out_rows: &out_rows,
                     epsilon: 1.0e-5,
                 })
-                .map_err(|error| qualification_dynamic("qwen_head_rows", &label, error))?
+                .map_err(|error| qualification_dynamic("readout_head_rows", &label, error))?
                 .value;
-            require_zero_result(&logits, "qwen_head_rows", &label)?;
-            let selected = semantic_i32(device, &[1], &[0], "qwen_selected_rows", &label)?;
+            require_zero_result(&logits, "readout_head_rows", &label)?;
+            let selected = semantic_i32(device, &[1], &[0], "readout_selected_rows", &label)?;
             let selected_result = self
                 .programs
                 .target
                 .selected
-                .call(qwen_selected_rows::Args {
+                .call(readout_selected_rows::Args {
                     hidden: &hidden_residual,
                     norm: &norm,
                     weight: &weight,
@@ -342,9 +355,9 @@ impl<'a> QualificationView<'a> {
                     selected: &selected,
                     epsilon: 1.0e-5,
                 })
-                .map_err(|error| qualification_dynamic("qwen_selected_rows", &label, error))?
+                .map_err(|error| qualification_dynamic("readout_selected_rows", &label, error))?
                 .value;
-            require_zero_result(&selected_result, "qwen_selected_rows", &label)?;
+            require_zero_result(&selected_result, "readout_selected_rows", &label)?;
         }
 
         for (binding, kernel) in self
@@ -356,15 +369,15 @@ impl<'a> QualificationView<'a> {
             let label = format!("{binding:?}");
             let norm = semantic_ones(device, binding.norm, &[hidden], "target_features", &label)?;
             let result = kernel
-                .call(qwen_features_rows::Args {
+                .call(readout_features_rows::Args {
                     hidden: &hidden_residual,
                     norm: &norm,
                     out_rows: &out_rows,
                     epsilon: 1.0e-5,
                 })
-                .map_err(|error| qualification_dynamic("qwen_features_rows", &label, error))?
+                .map_err(|error| qualification_dynamic("readout_features_rows", &label, error))?
                 .value;
-            require_finite_nonzero(&result, "qwen_features_rows", &label)?;
+            require_finite_nonzero(&result, "readout_features_rows", &label)?;
         }
         Ok(())
     }

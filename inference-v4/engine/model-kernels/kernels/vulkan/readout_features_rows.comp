@@ -1,0 +1,44 @@
+// readout_features_rows: the final RMS normalization of the `out_rows` hidden
+// rows, published in the activation type. One workgroup per output row. The
+// Vulkan form of `metal/readout_features_rows.metal`.
+#include "common/activation.glsl"
+#include "common/projection.glsl"
+
+#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#define FEATURES_ACT ELEMENT_ACT
+#else
+#error "readout_features_rows requires a bf16 or f16 activation"
+#endif
+#if defined(SEISMIC_NORM_REPRESENTATION_F32)
+#define FEATURES_NORM ELEMENT_F32
+#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
+#define FEATURES_NORM ELEMENT_F16
+#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
+#define FEATURES_NORM ELEMENT_BF16
+#else
+#error "readout_features_rows requires a dense norm"
+#endif
+
+// Shared: one partial per subgroup (reduce_group_sum at float 0).
+void readout_features_rows() {
+    const uint width = uint(SEISMIC_DIM_D);
+    const uint row = gl_WorkGroupID.x, thread = gl_LocalInvocationIndex;
+    const projection_prologue in_ = projection_rms(FEATURES_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN),
+        SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_NORM), SEISMIC_NORM_STRIDE_0,
+        FEATURES_NORM, element_word_f32(SEISMIC_PARAM_EPSILON), width, SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS));
+    float squares = 0.0;
+    for (uint i = thread; i < width; i += gl_WorkGroupSize.x) {
+        const float v = projection_norm_input(in_, row, 0u, i);
+        squares = seismic_fma_rn(v, v, squares);
+    }
+    squares = reduce_group_sum(squares, 0u);
+    const float inverse = inversesqrt(seismic_div_rn(squares, float(width)) + in_.eps);
+    const uint64_t features = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    for (uint i = thread; i < width; i += gl_WorkGroupSize.x) {
+        const float value = element_round(FEATURES_ACT,
+            projection_norm_input(in_, row, 0u, i) * inverse
+                * element_at(FEATURES_NORM, in_.norm, uint64_t(i) * in_.norm_stride));
+        element_put(FEATURES_ACT, features,
+            uint64_t(row) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(i) * SEISMIC_RESULT_0_STRIDE_1, value);
+    }
+}

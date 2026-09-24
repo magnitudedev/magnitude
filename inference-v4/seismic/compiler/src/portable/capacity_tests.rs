@@ -1,3 +1,6 @@
+//! Private tensors of the universal member are acquired where the schedule
+//! reaches them. Their backing and geometry are the actual per-visit values,
+//! never a launch-local envelope over a declared or I32 domain.
 use super::*;
 use crate::candidate_domain::construct_candidate_domain;
 use seismic_lang::checked::{check_source, SourceFile, SourceSet};
@@ -5,7 +8,16 @@ use seismic_lang::entry::ElementBindings;
 use seismic_lang::expr::Assignment;
 use seismic_lang::precision::PrecisionPolicy;
 
-fn reservations(source: &str) -> Result<Vec<Vec<u64>>, crate::errors::PreparationError> {
+/// One axis of a reached allocation's geometry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Axis {
+    /// Fixed for the whole invocation.
+    Fixed(u64),
+    /// An execution value of the visit that acquires the tensor.
+    Actual(seismic_lang::expr::NatExpr),
+}
+
+fn reached_geometry(source: &str) -> Result<Vec<Vec<Axis>>, crate::errors::PreparationError> {
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "source-capacity.seismic".into(),
         text: source.into(),
@@ -41,19 +53,27 @@ fn reservations(source: &str) -> Result<Vec<Vec<u64>>, crate::errors::Preparatio
         &PrecisionPolicy::Exact,
     )?;
     let parts = domain.into_parts();
-    Ok(parts
-        .materialized
-        .first()
-        .family
-        .local_allocations()
-        .into_locals()
+    let family = &parts.materialized.first().family;
+    assert!(
+        family.local_allocations().into_locals().iter().all(Vec::is_empty),
+        "private tensors are not launch-local envelopes"
+    );
+    Ok(family
+        .global_allocations()
+        .allocations()
         .iter()
-        .flatten()
-        .map(|local| {
-            local
+        .filter(|allocation| allocation.acquisition == seismic_ir::storage::AllocationAcquisition::Reached)
+        .map(|allocation| {
+            allocation
+                .geometry
+                .as_ref()
+                .expect("a reached tensor owns its geometry")
                 .extents
                 .iter()
-                .map(|axis| parts.arena.eval_nat_u64(*axis, &Assignment::new()).unwrap())
+                .map(|axis| match parts.arena.eval_nat_u64(*axis, &Assignment::new()) {
+                    Ok(value) => Axis::Fixed(value),
+                    Err(_) => Axis::Actual(*axis),
+                })
                 .collect()
         })
         .collect())
@@ -61,7 +81,7 @@ fn reservations(source: &str) -> Result<Vec<Vec<u64>>, crate::errors::Preparatio
 
 #[test]
 fn source_capacity_pairs_helper_dimensions_with_actual_checked_slice() {
-    let capacities = reservations(
+    let geometry = reached_geometry(
         r#"fn seed[M,K](x: &tensor[M,K] i32) -> i32:
     let mut scratch = tensor[M,K] i32
     scratch[:] = ones_like(scratch)
@@ -76,21 +96,17 @@ fn probe(input: &tensor[8,2] i32, visible: &tensor[4,2] i32, out: &mut tensor[4]
 "#,
     )
     .unwrap();
+    // The helper's `M` is the actual checked slice extent of each visit and
+    // its `K` the caller's fixed axis.
     assert!(
-        capacities.iter().any(|axes| axes == &[8, 2]),
-        "{capacities:?}"
-    );
-    assert!(
-        capacities
-            .iter()
-            .all(|axes| axes.iter().all(|axis| *axis <= 8)),
-        "slice capacities must use the original axis, not the full I32 domain: {capacities:?}"
+        geometry.iter().any(|axes| matches!(axes.as_slice(), [Axis::Actual(_), Axis::Fixed(2)])),
+        "{geometry:?}"
     );
 }
 
 #[test]
 fn source_capacity_preserves_varying_two_dimensional_snapshot_geometry() {
-    let capacities = reservations(
+    let geometry = reached_geometry(
         r#"fn probe(out: &mut tensor[4] i32):
     parallel for i in 0..4:
         let mut local = tensor[i+1,i+2] i32
@@ -101,25 +117,19 @@ fn source_capacity_preserves_varying_two_dimensional_snapshot_geometry() {
 "#,
     )
     .unwrap();
-    assert!(
-        capacities
-            .iter()
-            .filter(|axes| axes.as_slice() == [4, 5])
-            .count()
-            >= 2,
-        "original and captured storage share the source envelope: {capacities:?}"
-    );
-    assert!(
-        capacities
-            .iter()
-            .all(|axes| axes.iter().all(|axis| *axis <= 5)),
-        "{capacities:?}"
-    );
+    // The captured snapshot is stored with exactly the original's actual
+    // per-visit axes.
+    let varying = geometry
+        .iter()
+        .filter(|axes| matches!(axes.as_slice(), [Axis::Actual(_), Axis::Actual(_)]))
+        .collect::<Vec<_>>();
+    assert!(varying.len() >= 2, "{geometry:?}");
+    assert!(varying.iter().all(|axes| *axes == varying[0]), "{geometry:?}");
 }
 
 #[test]
 fn source_capacity_composes_transpose_point_zero_and_full_width_calls() {
-    let capacities = reservations(
+    let geometry = reached_geometry(
         r#"fn seed[N](x: &tensor[N] i32) -> i32 where N >= 0:
     let scratch = ones_like(x)
     return reduce(scratch, 0, sum)
@@ -136,18 +146,11 @@ fn probe(input: &tensor[8,2] i32, visible: &tensor[4,2] i32, out: &mut tensor[4]
 "#,
     )
     .unwrap();
+    for expected in [Axis::Fixed(8), Axis::Fixed(0)] {
+        assert!(geometry.iter().any(|axes| axes.as_slice() == [expected.clone()]), "{geometry:?}");
+    }
     assert!(
-        capacities.iter().any(|axes| axes.as_slice() == [8]),
-        "{capacities:?}"
-    );
-    assert!(
-        capacities.iter().any(|axes| axes.as_slice() == [0]),
-        "{capacities:?}"
-    );
-    assert!(
-        capacities
-            .iter()
-            .all(|axes| axes.iter().all(|axis| *axis <= 8)),
-        "{capacities:?}"
+        geometry.iter().any(|axes| matches!(axes.as_slice(), [Axis::Actual(_)])),
+        "{geometry:?}"
     );
 }

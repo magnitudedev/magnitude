@@ -143,6 +143,27 @@ native shape_rows for cuda from "cuda/shape_rows.cu":
         threadgroups (PARTS, Sx, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
 
+# Native Vulkan: the CUDA form, the same contract bit for bit; the select's
+# 64-bit histogram is (low, high) u32 planes with carrying atomic adds.
+# Shared: prepare holds the history row and one word per subgroup; select
+# 5252 words (histogram planes, lane totals, subgroup totals, per-invocation
+# tie counts, digit and base).
+native shape_rows for vulkan from "vulkan/shape_rows.comp":
+    static (V, Hn)
+    params (PARTS in [64, 128, 32], WIDTH in [256, 512])
+    scratch state bytes (Sx * (PARTS + 8) * 4)
+    launch shape_rows_prepare:
+        threadgroups (PARTS, Sx, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)
+        shared_bytes (Hn * 4 + 128)
+    launch shape_rows_select:
+        threadgroups (Sx, 1, 1)
+        threads_per_threadgroup (1024, 1, 1)
+        shared_bytes (21008)
+    launch shape_rows_apply:
+        threadgroups (PARTS, Sx, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)
+
 # `sample_rows` (portable body in seismic-std).
 # Native Metal: L1 scans PARTS contiguous vocabulary slices per row and keeps
 # (score bits, token, invalid); L2 merges them per row. The maximum score
@@ -168,6 +189,19 @@ native sample_rows for cuda from "cuda/sample_rows.cu":
     launch sample_rows_partition:
         threadgroups (PARTS, M, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
+    launch sample_rows_merge:
+        threadgroups (ceil_div(M, 32), 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+
+# Native Vulkan: the CUDA two stages, with the same merge order.
+native sample_rows for vulkan from "vulkan/sample_rows.comp":
+    static (V)
+    params (PARTS in [32, 64, 128, 16], WIDTH in [256, 512])
+    scratch partials bytes (M * PARTS * 12)
+    launch sample_rows_partition:
+        threadgroups (PARTS, M, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)
+        shared_bytes (WIDTH / 32 * 12)
     launch sample_rows_merge:
         threadgroups (ceil_div(M, 32), 1, 1)
         threads_per_threadgroup (32, 1, 1)

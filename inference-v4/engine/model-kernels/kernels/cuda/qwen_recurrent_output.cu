@@ -2,22 +2,22 @@
 //   gated = round_A(round_A(mixed * rsqrt(sum_head mixed^2 / W + eps) * norm)
 //                   * round_A(silu(z)))
 // with z the gate columns of the recurrent projection, then the ssm_out
-// projection with the F32 hidden rows added. GEMV for M <= 8 (each block
-// forms the A rows in shared memory; q8_1 rows staged first for the INT8
-// candidate), GEMM otherwise (A rows or q8_1 rows staged first), optionally
-// split over K (partials summed in part order by the finalize).
-#define SJ_W0 SEISMIC_OUTPUT_WEIGHT
+// projection with the F32 hidden rows added. GEMV for M <= 16 (`gemv` to 8
+// rows, `gemv16` beyond; at M = 1 the block forms the A row in shared memory,
+// else the staging launch forms the A rows first), GEMM otherwise (A rows, or
+// q8_1 rows for the INT8 candidate, staged first), optionally split over K
+// (partials summed in part order by the finalize).
+#define KERNEL_W0 SEISMIC_OUTPUT_WEIGHT
 #include "common/projection.cuh"
 
-constexpr bool S8 = SEISMIC_TUNE_INT8 == 1;
+constexpr bool S8 = SEISMIC_TUNE_INT8 == 1 && projection::quantizable<packets::W0>;
 constexpr unsigned SPLIT = SEISMIC_TUNE_SPLIT;
-using Shape = sj::GemvShape<8, 1, SEISMIC_TUNE_KSPLIT>;
-using GShape = sj::GemmShape<SEISMIC_TUNE_BM, 2, 4, 4 - SEISMIC_TUNE_BM / 64>;
-using Pro = sj::GatedRms<SJ_DENSE_KIND(SEISMIC_ELEMENT_A), SJ_DENSE_KIND(SEISMIC_ELEMENT_A),
-                         SJ_DENSE_KIND(SEISMIC_RECURRENT_NORM), (unsigned)SEISMIC_DIM_W, (unsigned)SEISMIC_DIM_NV,
-                         sj::AllRows>;
-using Source = sj::GemvSource<S8, Pro>;
-using Epi = sj::ResidualAdd<sj::AllRows>;
+using GShape = projection::GemmShape<SEISMIC_TUNE_BM, 2, 4, 4 - SEISMIC_TUNE_BM / 64>;
+using Pro = projection::GatedRms<ELEMENT_OF(SEISMIC_ELEMENT_A), ELEMENT_OF(SEISMIC_ELEMENT_A),
+                         ELEMENT_OF(SEISMIC_RECURRENT_NORM), (unsigned)SEISMIC_DIM_W, (unsigned)SEISMIC_DIM_NV,
+                         projection::AllRows>;
+using Source = projection::GemvSource<Pro>;
+using Epi = projection::Residual<projection::AllRows>;
 
 #define GATED (SEISMIC_DIM_NV * SEISMIC_DIM_W)
 // z: the gate segment of the projection row, after qkv.
@@ -27,51 +27,63 @@ using Epi = sj::ResidualAdd<sj::AllRows>;
             SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION) +                                                         \
                 (2 * SEISMIC_DIM_NK + SEISMIC_DIM_NV) * SEISMIC_DIM_W * sizeof(unsigned short),              \
             SEISMIC_PROJECTION_STRIDE_0, SEISMIC_PTR(SEISMIC_BUFFER_RECURRENT_NORM),                         \
-            __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON), sj::AllRows{}                                  \
+            __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON), projection::AllRows{}                                  \
     }
 #define STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
 #define GROUPS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS)
-#define OUTPUT SJ_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_OUTPUT_WEIGHT))
+#define OUTPUT KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_OUTPUT_WEIGHT))
 #define PARTIALS reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS))
 #define EPILOGUE                                                                                       \
     Epi {                                                                                              \
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)), SEISMIC_HIDDEN_STRIDE_0,   \
-            sj::AllRows{}, reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)),            \
+            projection::AllRows{}, reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)),            \
             SEISMIC_RESULT_0_STRIDE_0                                                                  \
     }
 
+// The GEMV over NB column blocks of 8 rows.
+template <int NB>
+__device__ __forceinline__ void output_gemv(const Pro &pro, projection::u8 *row, const projection::u8 *staged,
+                                            unsigned M, unsigned long long K, unsigned long long H,
+                                            const packets::W0 &output, const Epi &epi) {
+    using Shape = projection::GemvShape<8, 1, SEISMIC_TUNE_KSPLIT, NB>;
+    __shared__ projection::GemvShared<Shape, Source::type> shared;
+    const Source::type x = Source::make(pro, row, M, K, staged);
+    const unsigned long long group = Shape::tile_group();
+    if (group < projection::gemv_groups<Shape>(H))
+        projection::gemv_segment<Shape>(shared, x, M, K / 64, group, H, output, projection::NoWeight{}, epi);
+}
+
 extern "C" __global__ void qwen_recurrent_output_stage(SEISMIC_KERNEL_PARAMS) {
-    sj::stage_row<S8>(PROLOGUE, blockIdx.x, GATED, STAGING, GROUPS);
+    projection::stage_row<S8>(PROLOGUE, blockIdx.x, (unsigned)SEISMIC_DIM_M, GATED, STAGING, GROUPS);
 }
 
 extern "C" __global__ void qwen_recurrent_output_gemv(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ uint4 dynamic_shared[];
-    __shared__ sj::GemvShared<Shape, Source::type> shared;
-    const Source::type x = Source::make(PROLOGUE, reinterpret_cast<sj::u8 *>(dynamic_shared), (unsigned)SEISMIC_DIM_M,
-                                        GATED, STAGING, GROUPS);
-    const unsigned long long group = Shape::tile_group();
-    if (group < sj::gemv_groups<Shape>(SEISMIC_DIM_H))
-        sj::gemv_segment<Shape>(shared, x, (unsigned)SEISMIC_DIM_M, GATED / 64, group, SEISMIC_DIM_H, OUTPUT,
-                                sj::NoWeight{}, EPILOGUE);
+    output_gemv<1>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, (unsigned)SEISMIC_DIM_M,
+                   GATED, SEISMIC_DIM_H, OUTPUT, EPILOGUE);
+}
+
+extern "C" __global__ void qwen_recurrent_output_gemv16(SEISMIC_KERNEL_PARAMS) {
+    output_gemv<2>(PROLOGUE, nullptr, STAGING, (unsigned)SEISMIC_DIM_M, GATED, SEISMIC_DIM_H, OUTPUT, EPILOGUE);
 }
 
 extern "C" __global__ void qwen_recurrent_output_gemm(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ uint4 dynamic_shared[];
-    if (blockIdx.x >= sj::gemm_columns(SEISMIC_DIM_H))
+    if (blockIdx.x >= projection::gemm_columns(SEISMIC_DIM_H))
         return;
-    sj::u8 *shared = reinterpret_cast<sj::u8 *>(dynamic_shared);
+    projection::u8 *shared = reinterpret_cast<projection::u8 *>(dynamic_shared);
     if constexpr (SPLIT > 1)
-        sj::gemm_run<GShape, S8>(shared, STAGING, GATED, GROUPS, (unsigned)SEISMIC_DIM_M, GATED, blockIdx.x,
-                                 SEISMIC_DIM_H, OUTPUT, sj::NoWeight{},
-                                 sj::PartialStore<1>{PARTIALS, SEISMIC_DIM_M, SEISMIC_DIM_H, 0, blockIdx.z}, blockIdx.z,
+        projection::gemm_run<GShape, S8>(shared, STAGING, GATED, GROUPS, (unsigned)SEISMIC_DIM_M, GATED, blockIdx.x,
+                                 SEISMIC_DIM_H, OUTPUT, projection::NoWeight{},
+                                 projection::PartialStore<1>{PARTIALS, SEISMIC_DIM_M, SEISMIC_DIM_H, 0, blockIdx.z}, blockIdx.z,
                                  SPLIT);
     else
-        sj::gemm_run<GShape, S8>(shared, STAGING, GATED, GROUPS, (unsigned)SEISMIC_DIM_M, GATED, blockIdx.x,
-                                 SEISMIC_DIM_H, OUTPUT, sj::NoWeight{}, EPILOGUE);
+        projection::gemm_run<GShape, S8>(shared, STAGING, GATED, GROUPS, (unsigned)SEISMIC_DIM_M, GATED, blockIdx.x,
+                                 SEISMIC_DIM_H, OUTPUT, projection::NoWeight{}, EPILOGUE);
 }
 
 extern "C" __global__ void qwen_recurrent_output_finalize(SEISMIC_KERNEL_PARAMS) {
     const Epi epi = EPILOGUE;
-    sj::split_finalize<1>(PARTIALS, SPLIT, SEISMIC_DIM_M, SEISMIC_DIM_H,
+    projection::split_finalize<1>(PARTIALS, SPLIT, SEISMIC_DIM_M, SEISMIC_DIM_H,
                           [&](unsigned m, unsigned long long n, float value, float) { epi(m, n, value, 0.0f); });
 }

@@ -6,7 +6,7 @@ No production candidates are timed. Native FMA probes measure an execution mecha
 
 ## Reproduce
 
-Local Python requires NumPy, SciPy and Matplotlib. The remote host requires Swift Command Line Tools and Metal runtime support. The recorded host is `m4-pro-02`; its retained isolated directory is `/Users/ec2-user/metal-interactions.3csNgI`.
+Local Python requires NumPy, SciPy and Matplotlib. The measuring Mac requires Swift Command Line Tools and Metal runtime support. The recorded study ran on an Apple M4 Pro in a fresh isolated directory (`mktemp -d`).
 
 From this directory:
 

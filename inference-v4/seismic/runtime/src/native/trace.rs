@@ -2,8 +2,8 @@
 //! every native submission on that device is recorded with its host encode
 //! interval and, once complete, its device interval on the same host clock.
 //! At launch detail each launch runs in its own timed unit (Metal encoder,
-//! CUDA event pair), so device time is attributed to entries; that changes
-//! the device work and is for attribution runs only.
+//! CUDA event pair, Vulkan timestamp pair), so device time is attributed to
+//! entries; that changes the device work and is for attribution runs only.
 
 use super::RouteSubmission;
 use crate::api::device::DeviceInner;
@@ -99,6 +99,8 @@ enum Timeline {
     #[cfg(target_os = "macos")]
     Metal(Arc<seismic_metal::LaunchTimestamps>),
     Cuda(seismic_cuda::direct::TimelineAnchor),
+    #[cfg(not(target_os = "macos"))]
+    Vulkan(seismic_vulkan::direct::TimelineAnchor),
 }
 
 pub(crate) struct TraceSink {
@@ -151,6 +153,11 @@ impl SubmissionTrace {
         let timeline = match &device.kind {
             OpenedKind::Cuda(opened) => Timeline::Cuda(
                 seismic_cuda::direct::TimelineAnchor::record(opened.service(), host_seconds)
+                    .map_err(TraceError::Execution)?,
+            ),
+            #[cfg(not(target_os = "macos"))]
+            OpenedKind::Vulkan(opened) => Timeline::Vulkan(
+                seismic_vulkan::direct::TimelineAnchor::record(opened.service(), host_seconds)
                     .map_err(TraceError::Execution)?,
             ),
             #[cfg(target_os = "macos")]
@@ -225,6 +232,18 @@ impl SubmissionTrace {
             }
             (RouteSubmission::Cuda(_), _) => {
                 unreachable!("a CUDA device trace always holds a CUDA timeline")
+            }
+            #[cfg(not(target_os = "macos"))]
+            (RouteSubmission::Vulkan(submission), Timeline::Vulkan(anchor)) => {
+                submission.finish().map_err(execution)?;
+                (
+                    submission.device_interval(anchor).map_err(execution)?,
+                    submission.launch_intervals(anchor).map_err(execution)?,
+                )
+            }
+            #[cfg(not(target_os = "macos"))]
+            (RouteSubmission::Vulkan(_), _) => {
+                unreachable!("a Vulkan device trace always holds a Vulkan timeline")
             }
         };
         if intervals

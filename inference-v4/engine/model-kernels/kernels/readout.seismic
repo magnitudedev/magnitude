@@ -3,8 +3,12 @@
 # no identity copy or gather precedes the readout. Features, logits and
 # selected-vocabulary logits are separate entries: feature-only work never
 # touches the vocabulary projection.
+#
+# The head and selected-vocabulary entries are K1 projections (see
+# `dense.seismic` for the projection library's launches and parameters on
+# each backend).
 
-fn qwen_features_rows[M, O, D](hidden: &tensor[M, D] f32,
+fn readout_features_rows[M, O, D](hidden: &tensor[M, D] f32,
     norm: &tensor[D] NW, out_rows: &tensor[O] i32,
     epsilon: f32) -> tensor[O, D] A:
     let mut selected = tensor[O, D] f32
@@ -15,19 +19,29 @@ fn qwen_features_rows[M, O, D](hidden: &tensor[M, D] f32,
     rms_norm(selected, norm, features, epsilon)
     return features
 
-native qwen_features_rows for metal from "metal/qwen_features_rows.metal":
+native readout_features_rows for metal from "metal/readout_features_rows.metal":
     static (D)
-    launch qwen_features_rows:
+    launch readout_features_rows:
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
+native readout_features_rows for cuda from "cuda/readout_features_rows.cu":
+    static (D)
+    launch readout_features_rows:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native readout_features_rows for vulkan from "vulkan/readout_features_rows.comp":
+    static (D)
+    launch readout_features_rows:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
+
 
 # The head (K1 projection): final RMS prologue over the `out_rows` rows, then
-# the vocabulary projection into F32 logits. M <= 2 output rows run the GEMV
-# launch, 3..8 the batched launch, each normalizing its rows in-threadgroup;
-# larger classes a pre-pass that writes the normalized rows to scratch, then
-# the GEMM launch.
-fn qwen_head_rows[M, O, V, D](hidden: &tensor[M, D] f32,
+# the vocabulary projection into F32 logits.
+fn readout_head_rows[M, O, V, D](hidden: &tensor[M, D] f32,
     norm: &tensor[D] NW, weight: &tensor[V, D] OW,
     out_rows: &tensor[O] i32, epsilon: f32) -> tensor[O, V] f32:
     let mut selected = tensor[O, D] f32
@@ -40,31 +54,85 @@ fn qwen_head_rows[M, O, V, D](hidden: &tensor[M, D] f32,
     linear(features, weight, logits)
     return logits
 
-native qwen_head_rows for metal from "metal/qwen_head_rows.metal":
+# Metal: rows below BATCH_FROM run the GEMV, BATCH_FROM..8 the batched GEMV,
+# each normalizing its rows in-threadgroup; larger classes stage the
+# normalized rows, then the GEMM. (CUDA: GEMV up to 8 rows, no batched launch.)
+native readout_head_rows for metal from "metal/readout_head_rows.metal":
     static (V, D)
     params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
             arithmetic BATCH_FROM in [5, 3, 9], BATCH_SIMDGROUPS in [8, 4, 16, 32], BATCH_ROWS in [2, 1, 4],
             TILE_M in [64, 128, 32], TILE_N in [64, 128])
-    scratch normalized bytes (min(O / 9, 1) * O * D * 2)
-    launch qwen_head_rows_normalize:
-        threadgroups (min(O / 9, 1) * O, 1, 1)
+    scratch normalized bytes (O * D * 2) when O > 16
+    launch readout_head_rows_stage when O > 16:
+        threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_head_rows_gemv:
-        threadgroups ((1 - min(O / BATCH_FROM, 1)) * ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+    launch readout_head_rows_gemv when O < BATCH_FROM:
+        threadgroups (ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (min(O, 8) * min(ceil_div(D, 32), 288 / max(O, 1)) * 72)
-    launch qwen_head_rows_batch:
-        threadgroups (min(O / BATCH_FROM, 1) * (1 - min(O / 9, 1)) * ceil_div(V, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
+        shared_bytes (O * min(ceil_div(D, 32), 288 / max(O, 1)) * 72)
+    launch readout_head_rows_batch when O >= BATCH_FROM and O <= 16:
+        threadgroups (ceil_div(V, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
         threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
-        shared_bytes (16512)
-    launch qwen_head_rows_gemm:
-        threadgroups (min(O / 9, 1) * ceil_div(V, TILE_N), ceil_div(O, TILE_M), 1)
+        shared_bytes (16640)
+    launch readout_head_rows_gemm when O > 16:
+        threadgroups (ceil_div(V, TILE_N), ceil_div(O, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
 
+# CUDA: the GEMV up to 16 rows (`gemv` to 8, `gemv16` beyond; at O = 1 the
+# block forms its normalized row in shared memory, else `stage` forms the
+# rows), the GEMM beyond; the GEMM's INT8 (q8_1) candidate stages quantized
+# rows. (Metal: GEMV, batched GEMV, GEMM row classes; no INT8 path.)
+native readout_head_rows for cuda from "cuda/readout_head_rows.cu":
+    static (V, D)
+    params (arithmetic KSPLIT in [4, 2, 8], BM in [64, 128], arithmetic INT8 in [0, 1])
+    where D % 64 == 0
+    scratch staged bytes (O * D * 2) when O > 1
+    scratch groups bytes (O * D / 4) when INT8 == 1 and O > 16
+    launch readout_head_rows_stage when O > 1:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch readout_head_rows_gemv when O <= 8:
+        threadgroups (ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((1 - min(1, O - 1)) * D * 2)
+    launch readout_head_rows_gemv16 when O > 8 and O <= 16:
+        threadgroups (ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch readout_head_rows_gemm when O > 16:
+        threadgroups (ceil_div(ceil_div(V, 16), 8), ceil_div(O, BM), 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((4 - BM / 64) * (BM * 144 + 10240) + 4096)
 
-# The head projection restricted to the `selected` vocabulary rows (a weight
-# row gather inside the same K1 projection).
-fn qwen_selected_rows[M, O, V, D, Sv](hidden: &tensor[M, D] f32,
+# Vulkan: the K1 projection library (`vulkan/common/projection.glsl`). Output
+# rows O <= 8 run the GEMV launch (SIMDGROUPS x ROWS lane groups of LANES
+# lanes per workgroup, each owning weight rows; LANES sets the reduction
+# order, so it is arithmetic), applying the norm prologue in-workgroup; larger
+# classes a stage launch that writes the normalized rows to scratch, then the
+# GEMM over TILE_M x TILE_N tiles (cooperative-matrix f16 multiplies under
+# SEISMIC_HAS_MATRIX, F32 FMAs otherwise). The vocabulary GEMV grid must stay
+# within the 65535-group floor.
+native readout_head_rows for vulkan from "vulkan/readout_head_rows.comp":
+    static (V, D)
+    params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
+            TILE_M in [64, 128, 32], TILE_N in [64, 128])
+    where ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES) <= 65535
+    scratch normalized bytes (O * D * 2) when O > 8
+    launch readout_head_rows_stage when O > 8:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
+    launch readout_head_rows_gemv when O <= 8:
+        threadgroups (ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (256 + min(8 * ceil_div(D, 32), 288) * 72)
+    launch readout_head_rows_gemm when O > 8:
+        threadgroups (ceil_div(V, TILE_N), ceil_div(O, TILE_M), 1)
+        threads_per_threadgroup (TILE_M * TILE_N / 32, 1, 1)
+        shared_bytes ((TILE_M + TILE_N) * 80)
+
+
+# The head projection restricted to the `selected` vocabulary rows.
+fn readout_selected_rows[M, O, V, D, Sv](hidden: &tensor[M, D] f32,
     norm: &tensor[D] NW, weight: &tensor[V, D] OW,
     out_rows: &tensor[O] i32, selected: &tensor[Sv] i32,
     epsilon: f32) -> tensor[O, Sv] f32:
@@ -85,23 +153,59 @@ fn qwen_selected_rows[M, O, V, D, Sv](hidden: &tensor[M, D] f32,
             logits[row, col] = acc[0, 0]
     return logits
 
-native qwen_selected_rows for metal from "metal/qwen_selected_rows.metal":
+# Metal: the K1 projection with a weight row gather (the head's row classes).
+# (CUDA: a custom per-vocabulary-row kernel.)
+native readout_selected_rows for metal from "metal/readout_selected_rows.metal":
     static (V, D)
     params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
             arithmetic BATCH_FROM in [5, 3, 9], BATCH_SIMDGROUPS in [8, 4, 16, 32], BATCH_ROWS in [2, 1, 4],
             TILE_M in [64, 128, 32], TILE_N in [64, 128])
-    scratch normalized bytes (min(O / 9, 1) * O * D * 2)
-    launch qwen_selected_rows_normalize:
-        threadgroups (min(O / 9, 1) * O, 1, 1)
+    scratch normalized bytes (O * D * 2) when O > 16
+    launch readout_selected_rows_stage when O > 16:
+        threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_selected_rows_gemv:
-        threadgroups ((1 - min(O / BATCH_FROM, 1)) * ceil_div(Sv, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+    launch readout_selected_rows_gemv when O < BATCH_FROM:
+        threadgroups (ceil_div(Sv, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (min(O, 8) * min(ceil_div(D, 32), 288 / max(O, 1)) * 72)
-    launch qwen_selected_rows_batch:
-        threadgroups (min(O / BATCH_FROM, 1) * (1 - min(O / 9, 1)) * ceil_div(Sv, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
+        shared_bytes (O * min(ceil_div(D, 32), 288 / max(O, 1)) * 72)
+    launch readout_selected_rows_batch when O >= BATCH_FROM and O <= 16:
+        threadgroups (ceil_div(Sv, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
         threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
-        shared_bytes (16512)
-    launch qwen_selected_rows_gemm:
-        threadgroups (min(O / 9, 1) * ceil_div(Sv, TILE_N), ceil_div(O, TILE_M), 1)
+        shared_bytes (16640)
+    launch readout_selected_rows_gemm when O > 16:
+        threadgroups (ceil_div(Sv, TILE_N), ceil_div(O, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+
+# CUDA: `stage` writes the final RMS rows as A to scratch; `logits` (one
+# block per selected vocabulary row) decodes that weight row once per feature
+# row (mma16 lane chunks) and sums the products in a fixed thread order.
+# (Metal: the K1 projection.)
+native readout_selected_rows for cuda from "cuda/readout_selected_rows.cu":
+    static (V, D)
+    where D % 64 == 0
+    scratch features bytes (O * D * 2)
+    launch readout_selected_rows_stage:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch readout_selected_rows_logits:
+        threadgroups (Sv, 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+
+# Vulkan: the K1 projection over the selected rows (as `readout_head_rows`).
+native readout_selected_rows for vulkan from "vulkan/readout_selected_rows.comp":
+    static (V, D)
+    params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
+            TILE_M in [64, 128, 32], TILE_N in [64, 128])
+    scratch normalized bytes (O * D * 2) when O > 8
+    launch readout_selected_rows_stage when O > 8:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
+    launch readout_selected_rows_gemv when O <= 8:
+        threadgroups (ceil_div(Sv, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (256 + min(8 * ceil_div(D, 32), 288) * 72)
+    launch readout_selected_rows_gemm when O > 8:
+        threadgroups (ceil_div(Sv, TILE_N), ceil_div(O, TILE_M), 1)
+        threads_per_threadgroup (TILE_M * TILE_N / 32, 1, 1)
+        shared_bytes ((TILE_M + TILE_N) * 80)

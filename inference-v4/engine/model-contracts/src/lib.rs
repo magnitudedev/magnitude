@@ -31,6 +31,15 @@ pub enum ActivationDType {
     BF16,
 }
 
+impl ActivationDType {
+    /// Bytes of one stored activation element.
+    pub const fn bytes(self) -> usize {
+        match self {
+            Self::F16 | Self::BF16 => 2,
+        }
+    }
+}
+
 /// One family-bound tensor role, independent of its container encoding.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct WeightDescriptor {
@@ -752,14 +761,14 @@ impl VisionDescription {
         for patch in &self.patch_embeddings {
             expect_shape(
                 patch,
-                &[g.patch, g.patch, g.channels, g.hidden],
+                &[g.hidden, g.channels, g.patch, g.patch],
                 "vision patch embedding",
             )?;
         }
         expect_shape(&self.patch_bias, &[g.hidden], "vision patch bias")?;
         expect_shape(
             &self.position_embedding,
-            &[g.hidden, table_rows],
+            &[table_rows, g.hidden],
             "vision position embedding",
         )?;
         for block in &self.blocks {
@@ -770,7 +779,7 @@ impl VisionDescription {
                 "vision feed-forward norm",
             )?;
             let qkv = &block.attention.qkv;
-            if qkv.weight.shape != [g.hidden, fused]
+            if qkv.weight.shape != [fused, g.hidden]
                 || qkv.bias.shape != [fused]
                 || qkv.query
                     != (RowRange {
@@ -802,7 +811,7 @@ impl VisionDescription {
             )?;
             expect_shape(
                 &block.feedforward.up,
-                &[g.hidden, g.intermediate],
+                &[g.intermediate, g.hidden],
                 "vision feed-forward up projection",
             )?;
             expect_shape(
@@ -812,7 +821,7 @@ impl VisionDescription {
             )?;
             expect_shape(
                 &block.feedforward.down,
-                &[g.intermediate, g.hidden],
+                &[g.hidden, g.intermediate],
                 "vision feed-forward down projection",
             )?;
             expect_shape(
@@ -834,7 +843,7 @@ impl VisionDescription {
         )?;
         expect_shape(
             &self.merger.output,
-            &[merger_hidden, g.output_hidden],
+            &[g.output_hidden, merger_hidden],
             "vision merger output projection",
         )?;
         expect_shape(

@@ -10,7 +10,7 @@ mod programs;
 mod resources;
 mod weights;
 
-pub use capabilities::{CapabilityPlan, PlannedMethod};
+pub use capabilities::{CapabilityPlan, PlannedMethod, MAX_DRAFT_PROPOSALS};
 pub use components::{ArtifactComponent, ArtifactComponentKind, ComponentPlan, ComponentSelection};
 pub use execution_plan::{
     ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, PlannedDevice, ResolvedPolicy,
@@ -253,6 +253,7 @@ pub(crate) mod tests {
             max_batch_rows: 2,
             max_projected_rows: 2,
             max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
+            lookahead: false,
         };
         let budget = ResourceBudget {
             storage_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
@@ -274,9 +275,15 @@ pub(crate) mod tests {
             budget,
         )
         .unwrap();
-        let state =
-            ResourcePlanner::state_plan(&definition, draft.load(), KvCodec::Dense, limits, budget)
-                .unwrap();
+        let state = ResourcePlanner::state_plan(
+            &definition,
+            draft.load(),
+            draft.policy().method(),
+            KvCodec::Dense,
+            limits,
+            budget,
+        )
+        .unwrap();
         let mut programs = crate::AttestedPrograms::prepare_draft(
             &draft,
             &device,
@@ -302,6 +309,7 @@ pub(crate) mod tests {
                 state.target_state(),
                 state.head_state(),
                 limits,
+                0,
             )
             .unwrap();
         let copy = programs.state_graphs().unwrap();

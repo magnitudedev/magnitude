@@ -1,0 +1,130 @@
+# Draft-head input publication. Attention, dense feed-forward, and final norm
+# reuse the identical checked decoder entries; this entry owns the only
+# head-specific equation: normalized successor embedding + normalized target
+# feature followed by the 2D -> D combining projection.
+#
+# `tokens` has the `sample_rows` result layout (token, status), so a chained
+# draft step embeds the previous step's selection directly. A failed
+# selection (token -1) embeds token 0; its proposal is discarded by the host.
+fn qwen_draft_rows[M, V, D](tokens: &tensor[M, 2] i32, table: &tensor[V, D] EW,
+    conditioning: &tensor[M, D] A, embedding_norm: &tensor[D] EN,
+    hidden_norm: &tensor[D] HN, combine: &tensor[D, 2 * D] CW,
+    epsilon: f32) -> tensor[M, D] f32:
+    let mut embedded = tensor[M, D] A
+    let mut normalized_embedding = tensor[M, D] A
+    let mut normalized_hidden = tensor[M, D] A
+    let mut joined = tensor[M, 2 * D] A
+    let mut result = tensor[M, D] f32
+    for row in 0..M:
+        for column in 0..2 * D:
+            joined[row, column] = 0.0
+        for column in 0..D:
+            result[row, column] = 0.0
+    parallel for row in 0..M:
+        let token = max(tokens[row, 0], 0)
+        parallel for column in 0..D:
+            embedded[row, column] = f32(table[token, column])
+    rms_norm(embedded, embedding_norm, normalized_embedding, epsilon)
+    rms_norm(conditioning, hidden_norm, normalized_hidden, epsilon)
+    parallel for row in 0..M:
+        parallel for column in 0..D:
+            joined[row, column] = normalized_embedding[row, column]
+            joined[row, D + column] = normalized_hidden[row, column]
+    linear(joined, combine, result)
+    return result
+
+# One threadgroup per (32 outputs, row). The threadgroup forms the row's
+# joined [2D] input in A in threadgroup memory (embedding rows and the combine
+# weight decoded through the `rows16` packet library), then each simdgroup
+# reduces four combine rows over it. (CUDA holds the joined row in F32 and
+# decodes mma16 lane chunks, hence its larger shared memory.)
+native qwen_draft_rows for metal from "metal/qwen_draft_rows.metal":
+    launch qwen_draft_rows:
+        threadgroups (ceil_div(D, 32), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (4 * D + 64)
+
+# Packed tables and combine weights decode whole 64-column k-blocks (every
+# k-quant row is a multiple of 256 columns); the joined row is F32 in shared
+# memory. (Metal holds it in A.)
+native qwen_draft_rows for cuda from "cuda/qwen_draft_rows.cu":
+    launch qwen_draft_rows:
+        threadgroups (ceil_div(D, 32), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (8 * D)
+
+# Vulkan: one workgroup per (32 outputs, row); D is static because it sizes
+# the shared joined row (Vulkan spec §6.2).
+native qwen_draft_rows for vulkan from "vulkan/qwen_draft_rows.comp":
+    static (D)
+    launch qwen_draft_rows:
+        threadgroups (ceil_div(D, 32), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (4 * D + 64)
+
+
+# The draft head's readout: the vocabulary projection of feature rows that
+# are already normalized (K1 projection without a prologue).
+fn head_logits_rows[O, V, D](features: &tensor[O, D] A,
+    weight: &tensor[V, D] OW) -> tensor[O, V] f32:
+    let mut logits = tensor[O, V] f32
+    linear(features, weight, logits)
+    return logits
+
+# Metal: GEMV below BATCH_FROM rows, batched GEMV to 8, GEMM beyond; the
+# features are read in place. (CUDA: GEMV to 8 rows, GEMM beyond, INT8
+# candidate.)
+native head_logits_rows for metal from "metal/head_logits_rows.metal":
+    static (V, D)
+    params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
+            arithmetic BATCH_FROM in [5, 3, 9], BATCH_SIMDGROUPS in [8, 4, 16, 32], BATCH_ROWS in [2, 1, 4],
+            TILE_M in [64, 128, 32], TILE_N in [64, 128])
+    launch head_logits_rows_gemv when O < BATCH_FROM:
+        threadgroups (ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (O * min(ceil_div(D, 32), 288 / max(O, 1)) * 72)
+    launch head_logits_rows_batch when O >= BATCH_FROM and O <= 16:
+        threadgroups (ceil_div(V, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
+        threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
+        shared_bytes (16640)
+    launch head_logits_rows_gemm when O > 16:
+        threadgroups (ceil_div(V, TILE_N), ceil_div(O, TILE_M), 1)
+        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+
+# CUDA: GEMV to 16 rows (`gemv` to 8, `gemv16` beyond), GEMM beyond, the
+# features read in place; the GEMM's INT8 (q8_1) candidate stages quantized
+# rows. (Metal: batched GEMV row class, no INT8 path.)
+native head_logits_rows for cuda from "cuda/head_logits_rows.cu":
+    static (V, D)
+    params (arithmetic KSPLIT in [4, 2, 8], BM in [64, 128], arithmetic INT8 in [0, 1])
+    where D % 64 == 0
+    scratch staged bytes (O * D) when INT8 == 1 and O > 16
+    scratch groups bytes (O * D / 4) when INT8 == 1 and O > 16
+    launch head_logits_rows_stage when INT8 == 1 and O > 16:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch head_logits_rows_gemv when O <= 8:
+        threadgroups (ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch head_logits_rows_gemv16 when O > 8 and O <= 16:
+        threadgroups (ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch head_logits_rows_gemm when O > 16:
+        threadgroups (ceil_div(ceil_div(V, 16), 8), ceil_div(O, BM), 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((4 - BM / 64) * (BM * 144 + 10240) + 4096)
+
+# Vulkan: the K1 projection without a prologue (see `readout_head_rows`).
+native head_logits_rows for vulkan from "vulkan/head_logits_rows.comp":
+    static (V, D)
+    params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
+            TILE_M in [64, 128, 32], TILE_N in [64, 128])
+    where ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES) <= 65535
+    launch head_logits_rows_gemv when O <= 8:
+        threadgroups (ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (256 + min(8 * ceil_div(D, 32), 288) * 72)
+    launch head_logits_rows_gemm when O > 8:
+        threadgroups (ceil_div(V, TILE_N), ceil_div(O, TILE_M), 1)
+        threads_per_threadgroup (TILE_M * TILE_N / 32, 1, 1)
+        shared_bytes ((TILE_M + TILE_N) * 80)

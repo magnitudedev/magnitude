@@ -440,15 +440,17 @@ fn materialize_head(
     })
 }
 
+// Projector weights are imported into the dense element their admitted plan
+// chose (their stored element).
+
 fn import_layer_norm(
     residency: &mut ResidencyStore,
     artifact: &GgufArtifact,
     norm: &LayerNormWeights,
-    activation: DType,
 ) -> Result<ResidentLayerNormWeights, ResidencyError> {
     Ok(ResidentLayerNormWeights {
-        weight: residency.import_gguf(artifact, &norm.weight, activation)?,
-        bias: residency.import_gguf(artifact, &norm.bias, activation)?,
+        weight: residency.import_gguf_planned(artifact, &norm.weight)?,
+        bias: residency.import_gguf_planned(artifact, &norm.bias)?,
     })
 }
 
@@ -456,11 +458,10 @@ fn import_fused_qkv(
     residency: &mut ResidencyStore,
     artifact: &GgufArtifact,
     qkv: &FusedQkvWeights,
-    activation: DType,
 ) -> Result<ResidentFusedQkvWeights, ResidencyError> {
     Ok(ResidentFusedQkvWeights {
-        weight: residency.import_gguf(artifact, &qkv.weight, activation)?,
-        bias: residency.import_gguf(artifact, &qkv.bias, activation)?,
+        weight: residency.import_gguf_planned(artifact, &qkv.weight)?,
+        bias: residency.import_gguf_planned(artifact, &qkv.bias)?,
         query: qkv.query,
         key: qkv.key,
         value: qkv.value,
@@ -471,12 +472,11 @@ fn materialize_vision_attention(
     residency: &mut ResidencyStore,
     artifact: &GgufArtifact,
     weights: &VisionAttentionWeights,
-    activation: DType,
 ) -> Result<ResidentVisionAttentionWeights, ResidencyError> {
     Ok(ResidentVisionAttentionWeights {
-        qkv: import_fused_qkv(residency, artifact, &weights.qkv, activation)?,
-        output: residency.import_gguf(artifact, &weights.output, activation)?,
-        output_bias: residency.import_gguf(artifact, &weights.output_bias, activation)?,
+        qkv: import_fused_qkv(residency, artifact, &weights.qkv)?,
+        output: residency.import_gguf_planned(artifact, &weights.output)?,
+        output_bias: residency.import_gguf_planned(artifact, &weights.output_bias)?,
     })
 }
 
@@ -484,13 +484,12 @@ fn materialize_vision_feedforward(
     residency: &mut ResidencyStore,
     artifact: &GgufArtifact,
     weights: &VisionFeedForwardWeights,
-    activation: DType,
 ) -> Result<ResidentVisionFeedForwardWeights, ResidencyError> {
     Ok(ResidentVisionFeedForwardWeights {
-        up: residency.import_gguf(artifact, &weights.up, activation)?,
-        up_bias: residency.import_gguf(artifact, &weights.up_bias, activation)?,
-        down: residency.import_gguf(artifact, &weights.down, activation)?,
-        down_bias: residency.import_gguf(artifact, &weights.down_bias, activation)?,
+        up: residency.import_gguf_planned(artifact, &weights.up)?,
+        up_bias: residency.import_gguf_planned(artifact, &weights.up_bias)?,
+        down: residency.import_gguf_planned(artifact, &weights.down)?,
+        down_bias: residency.import_gguf_planned(artifact, &weights.down_bias)?,
     })
 }
 
@@ -498,23 +497,12 @@ fn materialize_vision_block(
     residency: &mut ResidencyStore,
     artifact: &GgufArtifact,
     block: &VisionBlockWeights,
-    activation: DType,
 ) -> Result<ResidentVisionBlockWeights, ResidencyError> {
     Ok(ResidentVisionBlockWeights {
-        input_norm: import_layer_norm(residency, artifact, &block.input_norm, activation)?,
-        attention: materialize_vision_attention(residency, artifact, &block.attention, activation)?,
-        feedforward_norm: import_layer_norm(
-            residency,
-            artifact,
-            &block.feedforward_norm,
-            activation,
-        )?,
-        feedforward: materialize_vision_feedforward(
-            residency,
-            artifact,
-            &block.feedforward,
-            activation,
-        )?,
+        input_norm: import_layer_norm(residency, artifact, &block.input_norm)?,
+        attention: materialize_vision_attention(residency, artifact, &block.attention)?,
+        feedforward_norm: import_layer_norm(residency, artifact, &block.feedforward_norm)?,
+        feedforward: materialize_vision_feedforward(residency, artifact, &block.feedforward)?,
     })
 }
 
@@ -522,13 +510,12 @@ fn materialize_vision_merger(
     residency: &mut ResidencyStore,
     artifact: &GgufArtifact,
     merger: &VisionMergerWeights,
-    activation: DType,
 ) -> Result<ResidentVisionMergerWeights, ResidencyError> {
     Ok(ResidentVisionMergerWeights {
-        hidden: residency.import_gguf(artifact, &merger.hidden, activation)?,
-        hidden_bias: residency.import_gguf(artifact, &merger.hidden_bias, activation)?,
-        output: residency.import_gguf(artifact, &merger.output, activation)?,
-        output_bias: residency.import_gguf(artifact, &merger.output_bias, activation)?,
+        hidden: residency.import_gguf_planned(artifact, &merger.hidden)?,
+        hidden_bias: residency.import_gguf_planned(artifact, &merger.hidden_bias)?,
+        output: residency.import_gguf_planned(artifact, &merger.output)?,
+        output_bias: residency.import_gguf_planned(artifact, &merger.output_bias)?,
     })
 }
 
@@ -537,26 +524,21 @@ fn materialize_vision(
     artifact: &GgufArtifact,
     vision: &VisionDescription,
 ) -> Result<ResidentVision, ResidencyError> {
-    let activation = activation_dtype(vision.geometry.activation_dtype);
     Ok(ResidentVision {
         patch_embeddings: vision
             .patch_embeddings
             .iter()
-            .map(|weight| residency.import_gguf(artifact, weight, activation))
+            .map(|weight| residency.import_gguf_planned(artifact, weight))
             .collect::<Result<Vec<_>, _>>()?,
-        patch_bias: residency.import_gguf(artifact, &vision.patch_bias, activation)?,
-        position_embedding: residency.import_gguf(
-            artifact,
-            &vision.position_embedding,
-            activation,
-        )?,
+        patch_bias: residency.import_gguf_planned(artifact, &vision.patch_bias)?,
+        position_embedding: residency.import_gguf_planned(artifact, &vision.position_embedding)?,
         blocks: vision
             .blocks
             .iter()
-            .map(|block| materialize_vision_block(residency, artifact, block, activation))
+            .map(|block| materialize_vision_block(residency, artifact, block))
             .collect::<Result<Vec<_>, _>>()?,
-        output_norm: import_layer_norm(residency, artifact, &vision.output_norm, activation)?,
-        merger: materialize_vision_merger(residency, artifact, &vision.merger, activation)?,
+        output_norm: import_layer_norm(residency, artifact, &vision.output_norm)?,
+        merger: materialize_vision_merger(residency, artifact, &vision.merger)?,
     })
 }
 

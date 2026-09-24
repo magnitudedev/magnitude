@@ -232,27 +232,27 @@ fn projector() -> Directory {
         });
     };
     for (name, shape) in [
-        ("v.patch_embd.weight", vec![2, 2, 3, 4]),
-        ("v.patch_embd.weight.1", vec![2, 2, 3, 4]),
+        ("v.patch_embd.weight", vec![4, 3, 2, 2]),
+        ("v.patch_embd.weight.1", vec![4, 3, 2, 2]),
         ("v.patch_embd.bias", vec![4]),
         ("v.position_embd.weight", vec![4, 4]),
         ("v.blk.0.ln1.weight", vec![4]),
         ("v.blk.0.ln1.bias", vec![4]),
-        ("v.blk.0.attn_qkv.weight", vec![4, 12]),
+        ("v.blk.0.attn_qkv.weight", vec![12, 4]),
         ("v.blk.0.attn_qkv.bias", vec![12]),
         ("v.blk.0.attn_out.weight", vec![4, 4]),
         ("v.blk.0.attn_out.bias", vec![4]),
         ("v.blk.0.ln2.weight", vec![4]),
         ("v.blk.0.ln2.bias", vec![4]),
-        ("v.blk.0.ffn_up.weight", vec![4, 8]),
+        ("v.blk.0.ffn_up.weight", vec![8, 4]),
         ("v.blk.0.ffn_up.bias", vec![8]),
-        ("v.blk.0.ffn_down.weight", vec![8, 4]),
+        ("v.blk.0.ffn_down.weight", vec![4, 8]),
         ("v.blk.0.ffn_down.bias", vec![4]),
         ("v.post_ln.weight", vec![4]),
         ("v.post_ln.bias", vec![4]),
         ("mm.0.weight", vec![16, 16]),
         ("mm.0.bias", vec![16]),
-        ("mm.2.weight", vec![16, 6]),
+        ("mm.2.weight", vec![6, 16]),
         ("mm.2.bias", vec![6]),
     ] {
         add(name, &shape);
@@ -426,6 +426,30 @@ fn projector_description_validates_roles_and_fused_qkv_ranges() {
         model.artifact_identity.projector,
         Some(ArtifactIdentity([2; 32]))
     );
+
+    // A derived target (a quantization) names its own file and its base
+    // model; the projector pairs with the base model.
+    let mut derived = directory(false);
+    for (name, value) in [
+        ("general.name", "fixture-Q4_K_M"),
+        ("general.base_model.0.name", "fixture"),
+    ] {
+        derived.metadata.push(Metadata {
+            name: name.into(),
+            value: Value::Scalar(Scalar::String(value.into())),
+        });
+    }
+    let identity = PackageIdentity {
+        target: ArtifactIdentity([1; 32]),
+        projector: Some(ArtifactIdentity([2; 32])),
+    };
+    assert!(inspect_components(&derived, Some(&projector), identity.clone()).is_ok());
+    derived.metadata.pop();
+    derived.metadata.push(Metadata {
+        name: "general.base_model.0.name".into(),
+        value: Value::Scalar(Scalar::String("other".into())),
+    });
+    assert!(inspect_components(&derived, Some(&projector), identity).is_err());
 
     let mut malformed = projector;
     malformed.tensors.push(TensorDescriptor {

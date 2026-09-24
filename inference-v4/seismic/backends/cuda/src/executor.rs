@@ -2,7 +2,9 @@
 
 use crate::buffer::Buffer;
 use crate::command::{CompiledKernel, LaunchFrame};
-use crate::driver::{Allocation, Context, Driver, DriverError, HostMapped, PinnedUpload, Stream};
+use crate::driver::{
+    Allocation, Context, Driver, DriverError, HostMapped, PinnedUpload, Reservation, Stream,
+};
 use crate::{Cuda, CudaLaunchMode};
 use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::executable::{
@@ -14,7 +16,7 @@ use seismic_ir::schedule::{AnyScalarSlot, FillValue};
 use seismic_ir::target::KernelAbiAllocationRole;
 use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::SymbolValue;
-use std::ffi::c_void;
+use std::ffi::{c_int, c_void};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -80,6 +82,82 @@ impl Device {
         HostMapped::new(&self.context, bytes)
             .map(Buffer::mapped)
             .map_err(allocation_error)
+    }
+
+    /// Whether this device reserves address ranges and backs them in place
+    /// (CUDA virtual memory management).
+    pub fn supports_reservation(&self) -> bool {
+        // CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED
+        const VIRTUAL_MEMORY_MANAGEMENT: c_int = 102;
+        let driver = &self.context.driver;
+        driver.address_reserve.is_some()
+            && driver
+                .attribute(VIRTUAL_MEMORY_MANAGEMENT, self.context.ordinal())
+                .is_ok_and(|supported| supported != 0)
+    }
+
+    /// Device memory over a reserved address range of `reserved` bytes, with
+    /// the leading `committed` bytes backed and zeroed. [`Device::recommit`]
+    /// changes the backed prefix without moving it.
+    pub fn allocate_reserved(&self, committed: u64, reserved: u64) -> Result<Buffer, ExecutionError> {
+        let host = |bytes: u64| {
+            usize::try_from(bytes).map_err(|_| {
+                ExecutionError::AllocationFailed("CUDA reservation exceeds host address space".into())
+            })
+        };
+        let (committed, reserved) = (host(committed)?, host(reserved)?);
+        let reservation =
+            Arc::new(Reservation::new(&self.context, reserved).map_err(allocation_error)?);
+        reservation.commit(committed).map_err(allocation_error)?;
+        self.zero(reservation.base, committed)?;
+        Ok(Buffer::reserved(reservation, committed))
+    }
+
+    /// `buffer`'s reservation with its leading `committed` bytes backed; the
+    /// bytes past `buffer`'s own are zeroed. Both buffers share the base
+    /// address. Precondition when shrinking: no device work still touches
+    /// the released bytes.
+    pub fn recommit(&self, buffer: &Buffer, committed: u64) -> Result<Buffer, ExecutionError> {
+        let reservation = buffer.reservation().ok_or_else(|| {
+            ExecutionError::ConstructionContradiction(
+                "only a reserved CUDA buffer can be recommitted".into(),
+            )
+        })?;
+        let committed = usize::try_from(committed)
+            .ok()
+            .filter(|bytes| *bytes <= reservation.reserved)
+            .ok_or_else(|| {
+                ExecutionError::AllocationFailed(format!(
+                    "{committed} bytes exceed a {}-byte CUDA reservation",
+                    reservation.reserved
+                ))
+            })?;
+        reservation.commit(committed).map_err(allocation_error)?;
+        let kept = buffer.len() as usize;
+        if committed > kept {
+            self.zero(reservation.base + kept as u64, committed - kept)?;
+        }
+        Ok(Buffer::reserved(reservation.clone(), committed))
+    }
+
+    /// Zero `bytes` at `pointer` after all queued device work, and wait.
+    fn zero(&self, pointer: u64, bytes: usize) -> Result<(), ExecutionError> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        {
+            let _current = self.context.enter().map_err(submission_error)?;
+            let driver = &self.context.driver;
+            unsafe {
+                driver
+                    .check(
+                        (driver.memset_d8_async)(pointer, 0, bytes, self.stream.raw()),
+                        "reservation zero fill",
+                    )
+                    .map_err(submission_error)?;
+            }
+        }
+        self.stream.synchronize().map_err(submission_error)
     }
 }
 

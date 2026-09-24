@@ -105,8 +105,7 @@ exact expected-latency optimum.
 reference in the same observer process, in randomized blocks. This independent
 comparison is outside each tuning budget and is used to assess selected quality.
 
-The first runs use `m4-pro-01`, under
-`/tmp/seismic-feedback-prototype-20260921`. Generated results belong under
+The first runs used an Apple M4 Pro, from a scratch directory. Generated results belong under
 `inference-v4/validation/results/feedback-tuning/`; do not stage them.
 
 ## Remaining scope

@@ -2,13 +2,13 @@
 //! Every lane keeps its concrete submission type through completion and finish.
 
 use crate::programs::{
-    CompletedHeadWork, CompletedProjectWork, CompletedStateWork, CompletedTargetWork,
-    CompletedVisionWork, HeadProgram, ProgramSubmission, StateProgram, TargetProgram,
-    VisionProgram,
+    CompletedHeadWork, CompletedStateWork, CompletedTargetWork,
+    CompletedVisionWork, HeadProgram, ProgramSubmission, StateProgram, SubmittedTarget,
+    TargetProgram, VisionProgram,
 };
 use crate::{
     AttestedPrograms, ResidentHead, ResidentTarget, ResidentVision, SubmitError,
-    ValidatedHeadLaunch, ValidatedProjectionLaunch, ValidatedStateLaunch, ValidatedTargetLaunch,
+    ValidatedHeadLaunch, ValidatedStateLaunch, ValidatedTargetLaunch,
     ValidatedVisionLaunch,
 };
 use magnitude_model_contracts::{DecoderGeometry, ModelDefinition};
@@ -16,9 +16,10 @@ use magnitude_model_state::StateStore;
 use std::rc::Rc;
 
 pub trait ProgramFamily: 'static {
-    type TargetSubmission: ProgramSubmission<CompletedWork = CompletedTargetWork> + 'static;
+    type TargetSubmission: ProgramSubmission<CompletedWork = CompletedTargetWork>
+        + SubmittedTarget
+        + 'static;
     type HeadSubmission: ProgramSubmission<CompletedWork = CompletedHeadWork> + 'static;
-    type ProjectSubmission: ProgramSubmission<CompletedWork = CompletedProjectWork> + 'static;
     type VisionSubmission: ProgramSubmission<CompletedWork = CompletedVisionWork> + 'static;
     type StateSubmission: ProgramSubmission<CompletedWork = CompletedStateWork> + 'static;
 
@@ -44,10 +45,6 @@ pub trait ProgramFamily: 'static {
         &mut self,
         launch: ValidatedHeadLaunch,
     ) -> Result<Self::HeadSubmission, (SubmitError, ValidatedHeadLaunch)>;
-    fn submit_project(
-        &mut self,
-        launch: ValidatedProjectionLaunch,
-    ) -> Result<Self::ProjectSubmission, (SubmitError, ValidatedProjectionLaunch)>;
     fn submit_vision(
         &mut self,
         launch: ValidatedVisionLaunch,
@@ -92,8 +89,6 @@ impl ProgramFamily for NativeFamily {
         <crate::programs::native_target::NativeTargetProgram as TargetProgram>::Submission;
     type HeadSubmission =
         <crate::programs::native_head::NativeHeadProgram as HeadProgram>::Submission;
-    type ProjectSubmission =
-        <crate::programs::native_head::NativeHeadProgram as HeadProgram>::ProjectSubmission;
     type VisionSubmission =
         <crate::programs::native_vision::NativeVisionProgram as VisionProgram>::Submission;
     type StateSubmission =
@@ -151,15 +146,6 @@ impl ProgramFamily for NativeFamily {
             .as_mut()
             .expect("head was bound before submission")
             .submit(launch)
-    }
-    fn submit_project(
-        &mut self,
-        launch: ValidatedProjectionLaunch,
-    ) -> Result<Self::ProjectSubmission, (SubmitError, ValidatedProjectionLaunch)> {
-        self.head
-            .as_mut()
-            .expect("head was bound before projection")
-            .project(launch)
     }
     fn submit_vision(
         &mut self,

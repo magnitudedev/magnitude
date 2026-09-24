@@ -2,16 +2,21 @@
 //! attention entry (q/k norms, partial M-RoPE, K/V append at the rows'
 //! destinations, attention over the visible history spans and fresh rows,
 //! sigmoid gate) and the output projection plus residual. Decode row classes
-//! use `qwen_attention_decode`; larger classes use `qwen_attention_prefill`.
-//! Both share one contract, so their ports have the same geometry.
+//! use the history codec's decode entry (`qwen_attention_decode`,
+//! `qwen_attention_decode_k8v4`); larger classes its prefill entry. Both share
+//! one contract, so their ports have the same geometry.
 //!
 //! The rotary table (the coordinate axis and frequency of every rotated pair)
 //! is a graph constant, bound once with the weights.
 
-use crate::{native::AttentionKernels, programs::native_constants::GraphConstant};
+use crate::{
+    native::{AttentionHistoryKernels, AttentionKernels},
+    programs::native_constants::GraphConstant,
+};
 use magnitude_model_contracts::RotarySemantics;
 use magnitude_model_kernels::{
-    qwen_attention_decode, qwen_attention_output, qwen_attention_prefill, qwen_attention_project,
+    qwen_attention_decode, qwen_attention_decode_k8v4, attention_output,
+    qwen_attention_prefill, qwen_attention_prefill_k8v4, qwen_attention_project,
 };
 use seismic::{Element, NativeGraph, NativePort, WorkflowTensor};
 
@@ -43,12 +48,13 @@ pub(crate) struct AttentionBlock<'a> {
     pub activation: Element,
 }
 
-/// The layer's key and value history arenas, bound to the state store's
-/// planes per run.
+/// The layer's history planes, bound to the state store's planes per run, in
+/// the order of the history codec's plane descriptors (the key's planes,
+/// then the value's): dense key and value, or affine key codes, key
+/// coefficients, value codes and value coefficients.
 #[derive(Clone)]
 pub(crate) struct AttentionStatePorts {
-    pub key: NativePort,
-    pub value: NativePort,
+    pub planes: Vec<NativePort>,
 }
 
 /// Per-run row tables: rotary coordinates, visible history spans, fresh
@@ -99,9 +105,15 @@ pub(crate) fn attention(
         ("R", block.segments),
     ];
     let input = |graph: &mut NativeGraph, name: &str| {
-        graph
-            .input_for(&kernels.decode, name, &dimensions)
-            .map_err(|error| error.to_string())
+        match &kernels.history {
+            AttentionHistoryKernels::Dense { decode, .. } => {
+                graph.input_for(decode, name, &dimensions)
+            }
+            AttentionHistoryKernels::AffineK8V4 { decode, .. } => {
+                graph.input_for(decode, name, &dimensions)
+            }
+        }
+        .map_err(|error| error.to_string())
     };
     let controls = AttentionControlPorts {
         coordinates: input(graph, "coordinates")?,
@@ -111,66 +123,83 @@ pub(crate) fn attention(
     };
     let components = GraphConstant::i32(graph, &rotary_components(block.rotary)?)?;
     let frequencies = GraphConstant::f32(graph, &rotary_frequencies(block.rotary))?;
-    let mut key = graph
-        .port(block.activation, &[block.history_rows, block.kv_heads, block.width])
-        .map_err(|error| error.to_string())?;
-    let mut value = graph
-        .port(block.activation, &[block.history_rows, block.kv_heads, block.width])
-        .map_err(|error| error.to_string())?;
+    let mut plane = |element: Element, elements: u64| {
+        graph
+            .port(element, &[block.history_rows, block.kv_heads, elements])
+            .map_err(|error| error.to_string())
+    };
+    let mut planes = match &kernels.history {
+        AttentionHistoryKernels::Dense { .. } => vec![
+            plane(block.activation, block.width)?,
+            plane(block.activation, block.width)?,
+        ],
+        AttentionHistoryKernels::AffineK8V4 { .. } => vec![
+            plane(Element::u32(), block.width / 4)?,
+            plane(Element::f16(), 2)?,
+            plane(Element::u32(), block.width / 8)?,
+            plane(Element::f16(), 2)?,
+        ],
+    };
     let scale = 1.0 / (block.width as f32).sqrt();
-    let gated = if block.rows <= DECODE_ROWS {
-        graph
-            .enqueue(
-                &kernels.decode,
-                qwen_attention_decode::WorkflowArgs {
-                    query_gate: (&projected.r0).into(),
-                    key: (&projected.r1).into(),
-                    value: (&projected.r2).into(),
-                    query_norm: (&weights.query_norm).into(),
-                    key_norm: (&weights.key_norm).into(),
-                    rotary_components: components.port().tensor().into(),
-                    rotary_frequencies: frequencies.port().tensor().into(),
-                    coordinates: controls.coordinates.tensor().into(),
-                    visible: controls.visible.tensor().into(),
-                    fresh: controls.fresh.tensor().into(),
-                    destinations: controls.destinations.tensor().into(),
-                    history_key: key.tensor_mut().into(),
-                    history_value: value.tensor_mut().into(),
-                    epsilon: block.epsilon,
-                    scale,
-                },
-            )
-            .map_err(|error| error.to_string())?
-            .value
-    } else {
-        graph
-            .enqueue(
-                &kernels.prefill,
-                qwen_attention_prefill::WorkflowArgs {
-                    query_gate: (&projected.r0).into(),
-                    key: (&projected.r1).into(),
-                    value: (&projected.r2).into(),
-                    query_norm: (&weights.query_norm).into(),
-                    key_norm: (&weights.key_norm).into(),
-                    rotary_components: components.port().tensor().into(),
-                    rotary_frequencies: frequencies.port().tensor().into(),
-                    coordinates: controls.coordinates.tensor().into(),
-                    visible: controls.visible.tensor().into(),
-                    fresh: controls.fresh.tensor().into(),
-                    destinations: controls.destinations.tensor().into(),
-                    history_key: key.tensor_mut().into(),
-                    history_value: value.tensor_mut().into(),
-                    epsilon: block.epsilon,
-                    scale,
-                },
-            )
-            .map_err(|error| error.to_string())?
-            .value
+    // Every entry takes the same arguments but its history planes.
+    macro_rules! mix {
+        ($kernel:expr, $module:ident, $($plane:ident),*) => {{
+            let [$($plane),*] = planes.as_mut_slice() else {
+                return Err("attention history planes disagree with the entry".into());
+            };
+            graph
+                .enqueue(
+                    $kernel,
+                    $module::WorkflowArgs {
+                        query_gate: (&projected.r0).into(),
+                        key: (&projected.r1).into(),
+                        value: (&projected.r2).into(),
+                        query_norm: (&weights.query_norm).into(),
+                        key_norm: (&weights.key_norm).into(),
+                        rotary_components: components.port().tensor().into(),
+                        rotary_frequencies: frequencies.port().tensor().into(),
+                        coordinates: controls.coordinates.tensor().into(),
+                        visible: controls.visible.tensor().into(),
+                        fresh: controls.fresh.tensor().into(),
+                        destinations: controls.destinations.tensor().into(),
+                        $($plane: $plane.tensor_mut().into(),)*
+                        epsilon: block.epsilon,
+                        scale,
+                    },
+                )
+                .map_err(|error| error.to_string())?
+                .value
+        }};
+    }
+    let decode = block.rows <= DECODE_ROWS;
+    let gated = match &kernels.history {
+        AttentionHistoryKernels::Dense { decode: kernel, .. } if decode => {
+            mix!(kernel, qwen_attention_decode, history_key, history_value)
+        }
+        AttentionHistoryKernels::Dense { prefill: kernel, .. } => {
+            mix!(kernel, qwen_attention_prefill, history_key, history_value)
+        }
+        AttentionHistoryKernels::AffineK8V4 { decode: kernel, .. } if decode => mix!(
+            kernel,
+            qwen_attention_decode_k8v4,
+            history_key_codes,
+            history_key_coefficients,
+            history_value_codes,
+            history_value_coefficients
+        ),
+        AttentionHistoryKernels::AffineK8V4 { prefill: kernel, .. } => mix!(
+            kernel,
+            qwen_attention_prefill_k8v4,
+            history_key_codes,
+            history_key_coefficients,
+            history_value_codes,
+            history_value_coefficients
+        ),
     };
     let mixed = graph
         .enqueue(
             &kernels.output,
-            qwen_attention_output::WorkflowArgs {
+            attention_output::WorkflowArgs {
                 hidden: hidden.into(),
                 gated: (&gated).into(),
                 output_weight: (&weights.output).into(),
@@ -180,7 +209,7 @@ pub(crate) fn attention(
         .value;
     constants.push(components);
     constants.push(frequencies);
-    Ok((mixed, AttentionStatePorts { key, value }, controls))
+    Ok((mixed, AttentionStatePorts { planes }, controls))
 }
 
 /// Per rotary pair, the coordinate axis that drives it: the interleaved

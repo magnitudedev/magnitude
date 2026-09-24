@@ -484,8 +484,9 @@ impl<B: seismic_target::TargetFamily> SourceConstruction<B> {
                             // Checked independent visits may execute in any order. The
                             // required mapping uses the ordinary source cursor so exact
                             // host quantities and reached failures keep their source
-                            // operations instead of entering a native-only segment.
-                            let progress = lowerer.begin_loop(start, end, captures, body, carries);
+                            // operations instead of entering a native-only segment. A
+                            // visit's failure ends only that participant.
+                            let progress = lowerer.begin_loop(start, end, captures, body, carries, seismic_ir::schedule::RepeatVisits::Independent);
                             regions.push(RegionReturn::Loop { resume, progress });
                             SourceStep::Body(RegionCursor::begin(body))
                         }
@@ -524,7 +525,7 @@ impl<B: seismic_target::TargetFamily> SourceConstruction<B> {
                             for dependency in data.dependencies() {
                                 lowerer.materialize_tensor(dependency);
                             }
-                            let progress = lowerer.begin_loop(start, end, captures, body, carries);
+                            let progress = lowerer.begin_loop(start, end, captures, body, carries, seismic_ir::schedule::RepeatVisits::Ordered);
                             regions.push(RegionReturn::Loop { resume, progress });
                             SourceStep::Body(RegionCursor::begin(body))
                         }

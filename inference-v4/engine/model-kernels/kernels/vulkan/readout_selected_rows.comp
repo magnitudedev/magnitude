@@ -1,0 +1,87 @@
+// readout_selected_rows: the head projection restricted to the `selected`
+// vocabulary rows (a weight-row gather inside the same K1 projection). The
+// Vulkan form of `metal/readout_selected_rows.metal` over
+// `common/projection.glsl`.
+#include "common/activation.glsl"
+#include "common/projection.glsl"
+
+#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#define HEAD_ACT ELEMENT_ACT
+#else
+#error "readout_selected_rows requires a bf16 or f16 activation"
+#endif
+#if defined(SEISMIC_NORM_REPRESENTATION_F32)
+#define HEAD_NORM ELEMENT_F32
+#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
+#define HEAD_NORM ELEMENT_F16
+#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
+#define HEAD_NORM ELEMENT_BF16
+#else
+#error "readout_selected_rows requires a dense norm"
+#endif
+
+#if defined(SEISMIC_WEIGHT_REPRESENTATION_Q4K)
+#define HEAD_KIND PACKETS_Q4K
+#define HEAD_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_WEIGHT)
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q5K)
+#define HEAD_KIND PACKETS_Q5K
+#define HEAD_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_WEIGHT)
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q6K)
+#define HEAD_KIND PACKETS_Q6K
+#define HEAD_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_WEIGHT)
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q8G32S)
+#define HEAD_KIND PACKETS_Q8
+#define HEAD_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_WEIGHT)
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_BF16)
+#define HEAD_KIND PACKETS_BF16
+#define HEAD_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_WEIGHT, 2)
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_F16)
+#define HEAD_KIND PACKETS_F16
+#define HEAD_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_WEIGHT, 2)
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_F32)
+#define HEAD_KIND PACKETS_F32
+#define HEAD_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_WEIGHT, 4)
+#else
+#error "unsupported readout_selected_rows weight representation"
+#endif
+#if defined(SEISMIC_WEIGHT_KIND_PACKED) && !defined(SEISMIC_WEIGHT_LAYOUT_ROWS16)
+#error "readout_selected_rows requires the rows16 layout for weight"
+#endif
+
+#define HEAD_K uint(SEISMIC_DIM_D)
+
+projection_prologue selected_rows_input() {
+    return projection_rms(HEAD_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN), SEISMIC_HIDDEN_STRIDE_0,
+        SEISMIC_HIDDEN_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_NORM), SEISMIC_NORM_STRIDE_0, HEAD_NORM,
+        element_word_f32(SEISMIC_PARAM_EPSILON), HEAD_K, SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS));
+}
+
+projection_epilogue selected_rows_output() {
+    return projection_store(ELEMENT_F32, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
+        SEISMIC_RESULT_0_STRIDE_1, 0ul);
+}
+
+// Weight row n is vocabulary row selected[n] (a unit-stride i32 table).
+projection_weights selected_rows_weight() {
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), HEAD_GEOMETRY, HEAD_K,
+        SEISMIC_PTR(SEISMIC_BUFFER_SELECTED));
+}
+
+void readout_selected_rows_gemv() {
+    const projection_weights w = selected_rows_weight();
+    projection_gemv(HEAD_KIND, HEAD_KIND, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, PROJECTION_NORM_SHARED,
+        selected_rows_input(), selected_rows_output(), w, w, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_SV), HEAD_K,
+        gl_WorkGroupID.x);
+}
+
+void readout_selected_rows_stage() {
+    projection_stage(selected_rows_input(), gl_WorkGroupID.x, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED), HEAD_K);
+}
+
+void readout_selected_rows_gemm() {
+    const projection_prologue x = projection_plain(HEAD_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED),
+        uint64_t(HEAD_K), 1ul, HEAD_K, 0ul);
+    projection_gemm(HEAD_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, x, selected_rows_output(),
+        selected_rows_weight(), uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_SV), HEAD_K, gl_WorkGroupID.y,
+        gl_WorkGroupID.x, 0xffffffffu);
+}

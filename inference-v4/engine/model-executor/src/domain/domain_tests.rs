@@ -7,7 +7,7 @@ use crate::{
     completion::CompletionWake,
     platform,
     programs::{
-        CompletedHeadWork, CompletedProjectWork, CompletedStateWork, CompletedVisionWork,
+        CompletedHeadWork, CompletedStateWork, CompletedVisionWork,
         CompletedWork, ProgramSubmission, ReadySubmission,
     },
 };
@@ -54,6 +54,7 @@ fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>
         max_batch_rows: 2,
         max_projected_rows: 2,
         max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
+        lookahead: false,
     };
     let budget = ResourceBudget {
         storage_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
@@ -75,9 +76,15 @@ fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>
         budget,
     )
     .unwrap();
-    let state =
-        ResourcePlanner::state_plan(&definition, draft.load(), KvCodec::Dense, limits, budget)
-            .unwrap();
+    let state = ResourcePlanner::state_plan(
+        &definition,
+        draft.load(),
+        draft.policy().method(),
+        KvCodec::Dense,
+        limits,
+        budget,
+    )
+    .unwrap();
     let mut programs = AttestedPrograms::prepare_draft(
             &draft,
             &device,
@@ -103,6 +110,7 @@ fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>
             state.target_state(),
             state.head_state(),
             limits,
+            0,
         )
         .unwrap();
     let resources_plan = ResourcePlanner::plan_with_state(
@@ -259,6 +267,20 @@ enum TestSubmission<L, W, O> {
     Ready(ReadySubmission<L, W, O>),
     Pending(PendingSubmission<L, W, O>),
 }
+impl<W> crate::programs::SubmittedTarget for TestSubmission<TargetLaunchCore, W, crate::TargetOutput> {
+    fn launch(&self) -> &TargetLaunchCore {
+        match self {
+            Self::Ready(value) => value.launch(),
+            Self::Pending(value) => &value.core,
+        }
+    }
+    fn output(&self) -> &crate::TargetOutput {
+        match self {
+            Self::Ready(value) => value.output(),
+            Self::Pending(value) => &value.output,
+        }
+    }
+}
 impl<L, W, O> ProgramSubmission for TestSubmission<L, W, O> {
     type CompletedWork = CompletedWork<L, O>;
     fn completion(&mut self) -> &mut dyn Completion {
@@ -294,7 +316,6 @@ impl ProgramFamily for TestFamily {
     type TargetSubmission =
         TestSubmission<TargetLaunchCore, (), crate::TargetOutput>;
     type HeadSubmission = PendingFailureSubmission<CompletedHeadWork>;
-    type ProjectSubmission = PendingFailureSubmission<CompletedProjectWork>;
     type VisionSubmission = PendingFailureSubmission<CompletedVisionWork>;
     type StateSubmission = PendingFailureSubmission<CompletedStateWork>;
     fn bind_head(&mut self, _: crate::ResidentHead, _: &ModelDefinition) -> Result<(), String> {
@@ -335,12 +356,6 @@ impl ProgramFamily for TestFamily {
         _: ValidatedHeadLaunch,
     ) -> Result<Self::HeadSubmission, (crate::SubmitError, ValidatedHeadLaunch)> {
         panic!("controlled fixture does not submit head work")
-    }
-    fn submit_project(
-        &mut self,
-        _: ValidatedProjectionLaunch,
-    ) -> Result<Self::ProjectSubmission, (crate::SubmitError, ValidatedProjectionLaunch)> {
-        panic!("controlled fixture does not submit projection work")
     }
     fn submit_vision(
         &mut self,
@@ -385,10 +400,7 @@ fn ready_target_can_abort_then_reconcile() {
     assert!(matches!(
         domain.reconcile(
             pending,
-            PhysicalDecision {
-                accepted_rows: 1,
-                head_prefix: None
-            }
+            PhysicalDecision { accepted_rows: 1 }
         ),
         Ok(PhysicalResolution::Committed)
     ));
@@ -446,6 +458,7 @@ fn pending_head_vision_and_state_device_failures_poison_the_domain_owner() {
     let head_control = PendingControl::default();
     let mut head = HeadFlight {
         requests: Vec::new(),
+        steps: 0,
         submission: PendingFailureSubmission::<CompletedHeadWork>::new(head_control.clone()),
         started: Instant::now(),
     };
@@ -489,7 +502,6 @@ fn pending_head_vision_and_state_device_failures_poison_the_domain_owner() {
         request: RequestId(42),
         submission: PendingFailureSubmission::<CompletedStateWork>::new(state_control.clone()),
         started: Instant::now(),
-        head_prefix: None,
     };
     assert!(!state.completion().is_complete());
     state_control.resolve(Err(failure("state")));
@@ -515,17 +527,11 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops_without_pois
     // state remaining resident must not be mistaken for a conflicting owner.
     let head_source = domain.target.get(&request).unwrap().checkpoint().fork();
     let head_advance = OwnedStateAdvance::begin(head_source, 1).ok().unwrap();
-    let head_features = FeatureRef::logical(
-        domain.resource_identity().clone(),
-        1,
-        domain.definition.geometry.hidden as usize,
-    )
-    .unwrap();
     domain
         .abort(PendingOperationOutcome {
             request,
             outcome: Outcome::Head {
-                features: head_features,
+                proposals: Vec::new(),
             },
             advance: Some(head_advance),
             rows: 1,

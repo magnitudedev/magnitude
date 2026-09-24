@@ -7,17 +7,13 @@ pub use graph::{
 };
 
 use crate::{
-    device_resources::RetentionClaim, ExecutionPlan, InvariantError, PreparedHeadGraphs,
-    PreparedStateCopyGraphs, PreparedTargetGraphs, PreparedTargetReadoutGraphs,
-    PreparedVisionGraphs, ResourceDomainId, WeightPlan,
+    ExecutionPlan, InvariantError, PreparedHeadGraphs, PreparedStateCopyGraphs,
+    PreparedTargetGraphs, PreparedTargetReadoutGraphs, PreparedVisionGraphs, ResourceDomainId,
+    WeightPlan,
 };
 use magnitude_model_batching::LaunchClass;
 use seismic::{Device, Tensor};
-use std::{
-    cell::Cell,
-    fmt,
-    rc::Rc,
-};
+use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PoolClass {
@@ -120,37 +116,6 @@ impl AllocatedResources {
 pub struct ResourceAllocator;
 
 impl ResourceAllocator {
-    /// Variable retained features use an exact plan-backed charge rather than
-    /// a fixed-shape pool. The returned claim refunds the charge on final drop.
-    pub(crate) fn retained_feature(
-        execution: &ExecutionPlan,
-        device: &Device,
-        source: &Tensor,
-        used: &Rc<Cell<u64>>,
-    ) -> Result<(Tensor, Rc<RetentionClaim>), AllocationError> {
-        let invalid = |detail: &str| {
-            AllocationError::Plan(InvariantError {
-                context: "retained feature allocation",
-                detail: detail.into(),
-            })
-        };
-        let bytes = source.byte_len();
-        let next = used
-            .get()
-            .checked_add(bytes)
-            .ok_or_else(|| invalid("byte charge overflows"))?;
-        if next > execution.resources().bytes().retained_features {
-            return Err(invalid("byte charge exceeds the admitted method budget"));
-        }
-        let tensor = Tensor::zeros(device, source.element(), source.extents())
-            .map_err(|error| AllocationError::Device(error.to_string()))?;
-        if tensor.storage_bytes() != bytes {
-            return Err(invalid("storage differs from the preflight byte charge"));
-        }
-        used.set(next);
-        Ok((tensor, Rc::new(RetentionClaim::new(used.clone(), bytes))))
-    }
-
     /// Imports are serialized at startup or optional-component materialization.
     /// Each upload owns one exact source tensor until physical completion.
     pub fn import_workspace(

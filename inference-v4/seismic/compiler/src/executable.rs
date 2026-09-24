@@ -30,7 +30,9 @@ use std::fmt;
 #[derive(Debug)]
 pub enum ExecutableStep<C, P, R> {
     BindArgumentTensor { allocation: ExecutableAllocationId, representation: seismic_lang::ids::RepresentationId, result: u32, strides: Vec<seismic_lang::expr::SymbolId> },
-    BeginAllocationInstance { allocation: ExecutableAllocationId, banks: Vec<ExecutableAllocationId>, bytes: CompiledNat, alignment: u64, geometry: CompiledBufferView, result: CompiledRegionDestination },
+    /// Acquires one instance of `allocation`. The defined tensor value `result`
+    /// has the allocation's own geometry (`geometry`), evaluated here.
+    BeginAllocationInstance { allocation: ExecutableAllocationId, banks: Vec<ExecutableAllocationId>, bytes: CompiledNat, alignment: u64, geometry: CompiledBufferView, result: u32 },
     PublishTensor { path: Vec<u32>, view: CompiledBufferView, bytes: CompiledNat, declared_axes: Vec<CompiledNat> },
     Command(C),
     EvaluateHost {
@@ -55,6 +57,7 @@ pub enum ExecutableStep<C, P, R> {
     Repeat {
         range: R,
         binder: LoopBinder,
+        visits: seismic_ir::schedule::RepeatVisits,
         body: Box<[ExecutableStep<C, P, R>]>,
         carries: seismic_ir::region::Product<CompiledRepeatCarry>,
     },
@@ -66,11 +69,12 @@ pub enum CompiledHostValue {
     Natural(CompiledNat),
     Bool(CompiledPredicate),
     Word { dtype: seismic_lang::types::DType, value: CompiledInt },
+    Float { dtype: seismic_lang::types::DType, value: CompiledInt },
 }
 impl CompiledHostValue {
     fn retained_metadata_bytes(&self) -> usize {
         match self {
-            Self::Integer(value) | Self::Word { value, .. } => value.retained_metadata_bytes(),
+            Self::Integer(value) | Self::Word { value, .. } | Self::Float { value, .. } => value.retained_metadata_bytes(),
             Self::Natural(value) => value.retained_metadata_bytes(),
             Self::Bool(value) => value.retained_metadata_bytes(),
         }
@@ -99,15 +103,10 @@ enum CompiledRegionOperand {
     Tensor(CompiledBufferView),
 }
 #[derive(Debug)]
-pub enum CompiledTensorAxisDestination {
-    Bound(seismic_lang::expr::SymbolId),
-    Invariant(CompiledNat),
-}
-#[derive(Debug)]
 pub enum CompiledRegionDestination {
     Scalar(AnyScalarSlot),
     Quantity(HostQuantitySlot),
-    Tensor { id: u32, extents: Vec<CompiledTensorAxisDestination>, strides: Vec<seismic_lang::expr::SymbolId> },
+    Tensor { id: u32, extents: Vec<seismic_lang::expr::SymbolId>, strides: Vec<seismic_lang::expr::SymbolId> },
 }
 #[derive(Clone, Debug)]
 enum RegionValue {
@@ -774,7 +773,7 @@ impl<B: seismic_target::TargetFamily> CompiledVariantBody<B> {
         }
         fn destination_bytes(value: &CompiledRegionDestination) -> usize {
             match value {
-                CompiledRegionDestination::Tensor { extents,strides,.. } => extents.capacity()*std::mem::size_of::<CompiledTensorAxisDestination>() + strides.capacity()*std::mem::size_of::<seismic_lang::expr::SymbolId>() + extents.iter().map(|value|match value {CompiledTensorAxisDestination::Invariant(value)=>value.retained_metadata_bytes(), _=>0}).sum::<usize>(),
+                CompiledRegionDestination::Tensor { extents,strides,.. } => (extents.capacity() + strides.capacity())*std::mem::size_of::<seismic_lang::expr::SymbolId>(),
                 _=>0,
             }
         }
@@ -1118,7 +1117,7 @@ fn compile_steps<B: seismic_target::TargetFamily>(
                                 seismic_lang::expr::NodeView::Symbol(symbol) => symbol,
                                 _ => panic!("tensor geometry must be its constructor-owned transport"),
                             }).collect::<Vec<_>>();
-                            CompiledRegionDestination::Tensor { id: id.index(), extents: symbols(&layout.extents).into_iter().map(CompiledTensorAxisDestination::Bound).collect(), strides: symbols(&layout.strides) }
+                            CompiledRegionDestination::Tensor { id: id.index(), extents: symbols(&layout.extents), strides: symbols(&layout.strides) }
                         }
                     };
     let mut out = Vec::new();
@@ -1147,21 +1146,11 @@ fn compile_steps<B: seismic_target::TargetFamily>(
                 assert!(topology.allocation(root).geometry.is_some(), "Begin requires tensor geometry");
                 let allocation = ExecutableAllocationId(allocation_remap[root.index() as usize]);
                 let banks = (0..topology.allocation(root).instances).map(|offset| ExecutableAllocationId(allocation.0.checked_add(offset).expect("bank ordinal overflow"))).collect();
-                let layout = topology.view(*result);
-                let seismic_ir::storage::ViewBase::TensorValue(id) = layout.base else { panic!("Begin must define a tensor value") };
-                let symbols = |values: &[seismic_lang::expr::NatExpr]| values.iter().map(|value| match arena.view((*value).into()) {
-                    seismic_lang::expr::NodeView::Symbol(symbol) => symbol,
-                    _ => panic!("tensor geometry destination must be a constructor-owned slot"),
-                }).collect();
+                let seismic_ir::storage::ViewBase::TensorValue(id) = topology.view(*result).base else { panic!("Begin must define a tensor value") };
                 ExecutableStep::BeginAllocationInstance {
                     allocation, banks, bytes: arena.compile_nat_with(topology.allocation(root).bytes, fixed),
                     alignment: topology.allocation(root).alignment, geometry: view(*source),
-                    result: CompiledRegionDestination::Tensor {
-                        id: id.index(), extents: layout.extents.iter().map(|axis| match arena.view((*axis).into()) {
-                            seismic_lang::expr::NodeView::Symbol(symbol) if matches!(arena.symbol_kind(symbol), seismic_lang::expr::SymbolKind::ScheduleSlot(_)) => CompiledTensorAxisDestination::Bound(symbol),
-                            _ => CompiledTensorAxisDestination::Invariant(arena.compile_nat_with(*axis, fixed)),
-                        }).collect(), strides: symbols(&layout.strides),
-                    },
+                    result: id.index(),
                 }
             }
             seismic_ir::schedule::ScheduleStep::PublishTensor { view, path, bytes, declared_axes } => ExecutableStep::PublishTensor {
@@ -1287,6 +1276,7 @@ fn compile_steps<B: seismic_target::TargetFamily>(
                     HostValueExpr::Natural(expr) => CompiledHostValue::Natural(arena.compile_nat_with(expr, fixed)),
                     HostValueExpr::Bool(expr) => CompiledHostValue::Bool(arena.compile_bool_with(expr, fixed)),
                     HostValueExpr::Word { dtype, value } => CompiledHostValue::Word { dtype, value: arena.compile_int_with(value, fixed) },
+                    HostValueExpr::Float { dtype, value } => CompiledHostValue::Float { dtype, value: arena.compile_int_with(value, fixed) },
                 };
                 ExecutableStep::EvaluateHost { value, to: evaluation.to, failure: evaluation.failure.clone() }
             }
@@ -1347,9 +1337,11 @@ fn compile_steps<B: seismic_target::TargetFamily>(
                 symbol,
                 start,
                 end,
+                visits,
                 body,
                 carries,
             } => ExecutableStep::Repeat {
+                visits: *visits,
                 carries: carries.map(&mut |carry| {
                     CompiledRepeatCarry { initial: operand(carry.initial()), header: destination(carry.header()), backedge: operand(carry.backedge()), result: destination(carry.result()) }
                 }),
@@ -1471,12 +1463,7 @@ impl<'a, T: seismic_target::TargetFamily, H, D: DeviceService<T>>
             }
             (CompiledRegionDestination::Tensor { id, extents, strides }, RegionValue::Tensor(value)) => {
                 assert_eq!(extents.len(),value.extents.len(),"closed tensor rank changed");
-                for (destination, extent) in extents.iter().zip(&value.extents) {
-                    match destination {
-                        CompiledTensorAxisDestination::Bound(symbol) => self.values.bind(*symbol, SymbolValue::Nat(extent.clone())),
-                        CompiledTensorAxisDestination::Invariant(expression) => assert_eq!(expression.evaluate(self.values).expect("constructor-owned invariant axis must be defined after acquisition"), *extent, "acquired geometry disagrees with its defining expression"),
-                    }
-                }
+                for (symbol, extent) in extents.iter().zip(&value.extents) { self.values.bind(*symbol, SymbolValue::Nat(extent.clone())); }
                 assert_eq!(strides.len(),value.strides.len(),"closed region tensor rank changed");
                 for (symbol,stride) in strides.iter().zip(&value.strides) { self.values.bind(*symbol,SymbolValue::Nat(stride.clone())); }
                 self.tensor_values.insert(*id,value.clone());
@@ -1646,7 +1633,7 @@ impl<'a, T: seismic_target::TargetFamily, H, D: DeviceService<T>>
     fn retire_tensor_definitions(&mut self, steps: &[NativeStep<T>]) {
         for step in steps {
             match step {
-                ExecutableStep::BeginAllocationInstance { result: CompiledRegionDestination::Tensor { id, .. }, .. } => { self.tensor_values.remove(id); }
+                ExecutableStep::BeginAllocationInstance { result, .. } => { self.tensor_values.remove(result); }
                 ExecutableStep::If { then_steps, else_steps, results, .. } => {
                     self.retire_tensor_definitions(then_steps); self.retire_tensor_definitions(else_steps);
                     results.visit(&mut |result| if let CompiledRegionDestination::Tensor { id, .. } = result.result { self.tensor_values.remove(&id); });
@@ -1838,7 +1825,7 @@ where
                 })?;
                 let mut descriptor = env.capture_view(geometry)?;
                 descriptor.allocation = bank;
-                env.bind_region_value(result, &RegionValue::Tensor(descriptor));
+                env.tensor_values.insert(*result, descriptor);
             }
             ExecutableStep::PublishTensor { path, view, bytes, declared_axes } => {
                 if env.published.contains_key(path) {
@@ -1871,6 +1858,14 @@ where
                     CompiledHostValue::Word { dtype: seismic_lang::types::DType::I32, value } => value.evaluate(env.values).and_then(|word| i32::try_from(word).map(SymbolValue::I32).map_err(|_| seismic_lang::expr::EvalError::Unrepresentable)),
                     CompiledHostValue::Word { dtype: seismic_lang::types::DType::U32, value } => value.evaluate(env.values).and_then(|word| u32::try_from(word).map(SymbolValue::U32).map_err(|_| seismic_lang::expr::EvalError::Unrepresentable)),
                     CompiledHostValue::Word { .. } => panic!("host word operation has no integer scalar dtype"),
+                    CompiledHostValue::Float { dtype, value } => value.evaluate(env.values).map(|integer| {
+                        match seismic_lang::reference_math::integer_to_float(*dtype, &integer) {
+                            seismic_lang::reference_math::ReferenceScalar::F32(bits) => SymbolValue::F32(f32::from_bits(bits)),
+                            seismic_lang::reference_math::ReferenceScalar::F16(bits) => SymbolValue::F16(bits),
+                            seismic_lang::reference_math::ReferenceScalar::BF16(bits) => SymbolValue::BF16(bits),
+                            other => panic!("float conversion produced {other:?}"),
+                        }
+                    }),
                 };
                 let evaluated = evaluated.map_err(|error| {
                     if matches!(error, seismic_lang::expr::EvalError::DivisionByZero | seismic_lang::expr::EvalError::ScalarFailure(seismic_lang::reference_math::ScalarFailure::IntegerDivisionByZero)) {
@@ -2004,6 +1999,7 @@ where
             ExecutableStep::Repeat {
                 range,
                 binder,
+                visits,
                 body,
                 carries,
             } => {
@@ -2018,14 +2014,28 @@ where
                 let initial = carries.try_map(&mut |carry| env.region_operand(&carry.initial))?;
                 env.bind_region_product(carries, &initial, false);
                 let mut current = initial;
+                // The lowest-index source failure among independent visits.
+                let mut failed = None;
                 let mut i = start;
                 while i < end {
                     env.values.bind(binder.symbol, SymbolValue::Nat(i.clone()));
-                    execute_schedule(body, submission, env)?;
-                    current = carries.try_map(&mut |carry| env.region_operand(&carry.backedge))?;
+                    match (execute_schedule(body, submission, env), visits) {
+                        (Ok(()), _) => {
+                            current = carries.try_map(&mut |carry| env.region_operand(&carry.backedge))?;
+                        }
+                        // The failing participant ends; its completed writes
+                        // remain and every other participant still runs.
+                        (Err(ExecutionError::DataCheckFailed(failure)), seismic_ir::schedule::RepeatVisits::Independent) => {
+                            failed.get_or_insert(failure);
+                        }
+                        (Err(error), _) => return Err(error),
+                    }
                     env.retire_tensor_definitions(body);
                     env.bind_region_product(carries, &current, false);
                     i += 1u8;
+                }
+                if let Some(failure) = failed {
+                    return Err(ExecutionError::DataCheckFailed(failure));
                 }
                 env.bind_region_product(carries, &current, true);
                 carries.visit(&mut |carry| if let CompiledRegionDestination::Tensor { id, .. } = &carry.header { env.tensor_values.remove(id); });
@@ -2143,15 +2153,16 @@ mod allocation_size_tests {
             let steps = [ExecutableStep::Repeat {
                 range: RuntimeRange { start: arena.compile_nat(zero), end: arena.compile_nat(end) },
                 binder: LoopBinder { binder, symbol },
+                visits: seismic_ir::schedule::RepeatVisits::Ordered,
                 body: vec![ExecutableStep::EvaluateHost {
                     value: CompiledHostValue::Natural(arena.compile_nat(header_value)),
                     to: HostValueDestination::Quantity(observed), failure: None,
                 }].into_boxed_slice(),
                 carries: seismic_ir::region::Product::Leaf(CompiledRepeatCarry {
                     initial: CompiledRegionOperand::Tensor(view(initial_axis)),
-                    header: CompiledRegionDestination::Tensor { id: 1, extents: vec![CompiledTensorAxisDestination::Bound(header_axis.symbol())], strides: vec![header_stride.symbol()] },
+                    header: CompiledRegionDestination::Tensor { id: 1, extents: vec![header_axis.symbol()], strides: vec![header_stride.symbol()] },
                     backedge: CompiledRegionOperand::Tensor(view(next_axis)),
-                    result: CompiledRegionDestination::Tensor { id: 2, extents: vec![CompiledTensorAxisDestination::Bound(result_axis.symbol())], strides: vec![result_stride.symbol()] },
+                    result: CompiledRegionDestination::Tensor { id: 2, extents: vec![result_axis.symbol()], strides: vec![result_stride.symbol()] },
                 }),
             }];
             let mut resources = limited_resources(); let mut values = InvocationValues::new();
@@ -2187,13 +2198,13 @@ mod allocation_size_tests {
             let symbols=(0..6).map(|i|arena.schedule_slot(i,seismic_lang::expr::SymbolSort::Nat)).collect::<Vec<_>>();
             let representation=seismic_lang::registry::dense(seismic_lang::types::DType::I32);
             let view=|base,axis|CompiledBufferView {base,representation,byte_offset:arena.compile_nat(zero),extents:vec![arena.compile_nat(axis)],strides:vec![arena.compile_nat(one)]};
-            let destination=|id,index:usize|CompiledRegionDestination::Tensor {id,extents:vec![CompiledTensorAxisDestination::Bound(symbols[index])],strides:vec![symbols[index+1]]};
-            let begin=|bank,id,axis,bytes,index|ExecutableStep::BeginAllocationInstance {
+            let destination=|id,index:usize|CompiledRegionDestination::Tensor {id,extents:vec![symbols[index]],strides:vec![symbols[index+1]]};
+            let begin=|bank,id,axis,bytes|ExecutableStep::BeginAllocationInstance {
                 allocation:ExecutableAllocationId(bank),banks:vec![ExecutableAllocationId(bank)],bytes:arena.compile_nat(bytes),alignment:4,
-                geometry:view(CompiledViewBase::Allocation(ExecutableAllocationId(bank)),axis),result:destination(id,index),
+                geometry:view(CompiledViewBase::Allocation(ExecutableAllocationId(bank)),axis),result:id,
             };
             let branch=ExecutableStep::If {
-                condition:arena.compile_bool(condition),then_steps:vec![begin(0,1,two,eight,0)].into_boxed_slice(),else_steps:vec![begin(1,2,five,twenty,2)].into_boxed_slice(),
+                condition:arena.compile_bool(condition),then_steps:vec![begin(0,1,two,eight)].into_boxed_slice(),else_steps:vec![begin(1,2,five,twenty)].into_boxed_slice(),
                 results:seismic_ir::region::Product::Leaf(CompiledBranchResult {
                     then_value:CompiledRegionOperand::Tensor(view(CompiledViewBase::TensorValue(1),two)),
                     else_value:CompiledRegionOperand::Tensor(view(CompiledViewBase::TensorValue(2),five)), result:destination(3,4),
@@ -2256,7 +2267,7 @@ mod allocation_size_tests {
     }
 
     #[test]
-    fn begin_freezes_whole_tensor_geometry_for_the_actual_instance() {
+    fn begin_defines_the_actual_instance_with_its_allocation_geometry() {
         struct Resources(RuntimeBuffer<()>);
         impl ExecutionResources<()> for Resources {
             fn buffer(&self, _: ExecutableAllocationId) -> &RuntimeBuffer<()> { &self.0 }
@@ -2272,21 +2283,18 @@ mod allocation_size_tests {
         let one = arena.nat(1);
         let four = arena.nat(4);
         let bytes = arena.nat_mul(extent, four);
-        let axis_symbol = arena.schedule_slot(1, seismic_lang::expr::SymbolSort::Nat);
-        let stride_symbol = arena.schedule_slot(2, seismic_lang::expr::SymbolSort::Nat);
-        let actual_axis = arena.nat_symbol(axis_symbol);
-        let actual_stride = arena.nat_symbol(stride_symbol);
         let view = |base, axis, stride| CompiledBufferView {
             base, representation: seismic_lang::registry::dense(seismic_lang::types::DType::I32),
             byte_offset: arena.compile_nat(zero), extents: vec![arena.compile_nat(axis)],
             strides: vec![arena.compile_nat(stride)],
         };
-        let whole = view(CompiledViewBase::TensorValue(1), actual_axis, actual_stride);
+        // The instance view states the allocation's own geometry expressions.
+        let whole = view(CompiledViewBase::TensorValue(1), extent, one);
         let begin = ExecutableStep::BeginAllocationInstance {
             allocation: ExecutableAllocationId(0), banks: vec![ExecutableAllocationId(0), ExecutableAllocationId(1)],
             bytes: arena.compile_nat(bytes), alignment: 4,
             geometry: view(CompiledViewBase::Allocation(ExecutableAllocationId(0)), extent, one),
-            result: CompiledRegionDestination::Tensor { id: 1, extents: vec![CompiledTensorAxisDestination::Bound(axis_symbol)], strides: vec![stride_symbol] },
+            result: 1,
         };
         let mut resources = Resources(RuntimeBuffer { tensor: None, buffer: (), base_offset: 0, accessible_bytes: 0 });
         let mut values = InvocationValues::new();
@@ -2298,16 +2306,13 @@ mod allocation_size_tests {
         };
         assert!(matches!(env.resolve_view(&whole), Err(ExecutionError::ConstructionContradiction(_))));
         execute_schedule::<FakeTarget, NoCommands>(std::slice::from_ref(&begin), &mut NoCommands, &mut env).unwrap();
-        env.values.bind(symbol, SymbolValue::Nat(99u64.into()));
         let resolved = env.resolve_view(&whole).unwrap();
         assert_eq!(resolved.extents, [3]);
         assert_eq!(resolved.byte_span, 12);
-        assert!(matches!(env.resolve_view(&view(CompiledViewBase::Allocation(ExecutableAllocationId(0)), extent, one)), Err(ExecutionError::ConstructionContradiction(_))));
         // Capturing an alias keeps the old instance even after this exact
         // Begin definition executes again with identical geometry.
         let old = env.capture_view(&whole).unwrap();
         env.tensor_values.insert(2, old.clone());
-        env.values.bind(symbol, SymbolValue::Nat(3u64.into()));
         execute_schedule::<FakeTarget, NoCommands>(std::slice::from_ref(&begin), &mut NoCommands, &mut env).unwrap();
         let current = env.capture_view(&whole).unwrap();
         assert_ne!(old.allocation, current.allocation);
@@ -2381,6 +2386,7 @@ mod allocation_size_tests {
         let steps = [ExecutableStep::Repeat {
             range: RuntimeRange { start: arena.compile_nat(start), end: arena.compile_nat(end) },
             binder: LoopBinder { binder, symbol },
+            visits: seismic_ir::schedule::RepeatVisits::Ordered,
             body: vec![ExecutableStep::EvaluateHost {
                 value: CompiledHostValue::Natural(arena.compile_nat(index)),
                 to: HostValueDestination::Quantity(slot), failure: None,

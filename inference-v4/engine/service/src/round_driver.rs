@@ -70,7 +70,6 @@ pub fn reconcile_forward<F: ProgramFamily>(
             pending,
             PhysicalDecision {
                 accepted_rows: committed_rows,
-                head_prefix: transition.decision().head_prefix,
             },
         )
         .map_err(RoundError::Physical)?

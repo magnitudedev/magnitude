@@ -25,14 +25,16 @@ pub use seismic_lang::checked::{
 };
 pub use seismic_lang::precision::PrecisionPolicy;
 pub use seismic_runtime::artifacts::{ArtifactKey, ArtifactKind, ArtifactStore, DeviceOptions};
+/// Replay of the tuning search against recorded surveys (development).
+pub use seismic_runtime::native::replay;
 pub use seismic_runtime::native::search::{
-    search, Evaluator, ParameterValues, SearchSettings, SearchSpace, SearchSpaceError, SearchStop,
-    SearchTrace,
+    search, Cost, Evaluator, ParameterValues, PointKey, SearchSettings, SearchSpace,
+    SearchSpaceError, SearchStop, SearchTrace,
 };
 pub use seismic_runtime::native::tune::{
     Configuration, ConfigurationRecord, DeclaredParameter, Exclusion, Outcome, PointMeasurement,
-    SearchPlan, Strategy, SurveyPlan, TuneError, TuningInitializer, TuningMethod, TuningResult,
-    TuningTime, Validation,
+    PointRecord, SearchPlan, Strategy, SurveyPlan, TuneError, TuningInitializer, TuningMethod,
+    TuningResult, TuningTime, Validation,
 };
 pub use seismic_runtime::native::{MeasureOptions, Measurement, NativeArtifactIdentity};
 pub use seismic_runtime::native::trace::{
@@ -171,10 +173,9 @@ impl Device {
     pub fn memory_status(&self) -> Result<DeviceMemoryStatus, ObservationError> {
         self.inner.memory_status()
     }
-    pub fn workflow(&self) -> WorkflowDraft {
-        WorkflowDraft {
-            inner: seismic_runtime::api::kernel::workflow(&self.inner),
-        }
+    /// A planned workflow on this device; refused on a native-only backend.
+    pub fn workflow(&self) -> Result<WorkflowDraft, WorkflowError> {
+        seismic_runtime::api::kernel::workflow(&self.inner).map(|inner| WorkflowDraft { inner })
     }
     pub(crate) fn inner(&self) -> &Arc<seismic_runtime::api::device::DeviceInner> {
         &self.inner
@@ -382,6 +383,59 @@ impl Tensor {
             bytes,
         )
         .map(|inner| Tensor {
+            inner: Arc::new(inner),
+        })
+    }
+    /// A zero-filled tensor over `extents` whose leading-axis rows
+    /// `[0, committed)` are physically backed and charged. The rest of the
+    /// leading extent is reserved address space: graphs are sealed over the
+    /// whole shape, while device work bound to the tensor must stay within
+    /// the committed rows, and host access to the tensor is refused (views
+    /// within the committed rows are ordinary tensors).
+    pub fn reserved(
+        device: &Device,
+        element: Element,
+        extents: &[u64],
+        committed: u64,
+    ) -> Result<Tensor, TensorError> {
+        seismic_runtime::api::tensor::TensorInner::reserved(
+            device.inner(),
+            element.id(),
+            extents,
+            committed,
+        )
+        .map(|inner| Tensor {
+            inner: Arc::new(inner),
+        })
+    }
+    /// Leading rows physically backed: every row unless the tensor is reserved.
+    pub fn committed_rows(&self) -> u64 {
+        self.inner.committed_rows()
+    }
+    /// The same reserved shape with `committed` leading rows backed. Rows
+    /// below the smaller commitment keep their contents (copied after every
+    /// submitted device write of this tensor completes); new rows are zero.
+    /// The result is a new allocation: work bound to `self` is not ordered
+    /// with work bound to the result, so the owner switches only between
+    /// submissions.
+    pub fn recommitted(&self, committed: u64) -> Result<Tensor, TensorError> {
+        self.inner.recommitted(committed).map(|inner| Tensor {
+            inner: Arc::new(inner),
+        })
+    }
+    /// Whether [`Tensor::recommitted`] keeps this tensor's address: the backend
+    /// reserved its address range (CUDA virtual memory management).
+    pub fn resizes_in_place(&self) -> bool {
+        self.inner.resizes_in_place()
+    }
+    /// The same reserved shape with `committed` leading rows backed by a new
+    /// allocation holding the rows `moves` names: each `(from, to, rows)`
+    /// copies rows `[from, from + rows)` (after every submitted device write
+    /// of this tensor completes) to rows `[to, to + rows)`; every other row is
+    /// zero. The address always changes, so the owner switches only between
+    /// submissions.
+    pub fn relocated(&self, committed: u64, moves: &[(u64, u64, u64)]) -> Result<Tensor, TensorError> {
+        self.inner.relocated(committed, moves).map(|inner| Tensor {
             inner: Arc::new(inner),
         })
     }
@@ -774,6 +828,10 @@ pub struct NativeKernel<E: Entry> {
 pub struct TuningPoint<'a, E: Entry> {
     pub label: String,
     pub weight: f64,
+    /// Points naming the same class are variants of one workload (the same
+    /// rows at different history lengths): they split their summed weight by
+    /// the defaults' real time at each. `None`: a class of its own.
+    pub class: Option<String>,
     pub rotation: Vec<E::Args<'a>>,
     /// Required when the entry has `&mut` parameters: restores the tensors
     /// they bind in `rotation[0]` before each configuration's validation
@@ -1672,6 +1730,7 @@ pub mod generated {
                 .map(|point| seismic_runtime::native::tune::TuningPoint {
                     label: point.label,
                     weight: point.weight,
+                    class: point.class,
                     rotation: point.rotation.into_iter().map(E::encode).collect(),
                     initialize: point.initialize,
                 })

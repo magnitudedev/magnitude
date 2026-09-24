@@ -18,19 +18,40 @@ pub struct TargetHostTiming {
 }
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
-    /// Submit one target group with state advances already reserved.
+    /// Submit one target group with state advances already reserved, or
+    /// claim the queued lookahead step it equals. A continuable group queues
+    /// its own lookahead behind it.
     pub fn submit_target(
         &mut self,
         operations: &[Operation],
         reservation: TargetGraphReservation,
     ) -> Result<TargetFlight<F::TargetSubmission>, DomainError> {
-        let TargetGraphReservation {
+        let flight = match reservation {
+            TargetGraphReservation::Claim(slots) => self.claim_lookahead(operations, slots)?,
+            TargetGraphReservation::Launch(reservation) => {
+                self.launch_target(operations, reservation)?
+            }
+        };
+        self.queue_lookahead(&flight, operations)?;
+        Ok(flight)
+    }
+
+    fn launch_target(
+        &mut self,
+        operations: &[Operation],
+        reservation: TargetLaunchReservation,
+    ) -> Result<TargetFlight<F::TargetSubmission>, DomainError> {
+        let TargetLaunchReservation {
             advances,
             graph_workspace,
             graph_outputs,
             readout_workspace,
             readout_output,
         } = reservation;
+        let advances = advances
+            .into_iter()
+            .map(TentativeAdvance::Accepted)
+            .collect::<Vec<_>>();
         self.healthy()?;
         if operations.is_empty() {
             return Err("target group is empty".into());
@@ -133,6 +154,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .collect();
         let inputs = TargetLaunchInputs::new(
             batch,
+            TargetTokens::Host,
             advances,
             conditioning,
             conditioning_slices.clone(),
@@ -175,6 +197,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             previous_selection: self.selection_read.take(),
             slots,
             conditioning_slices,
+            id: self.flight_id(),
+            continuation: None,
         })
     }
 
@@ -229,6 +253,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.selection_read = Some(Instant::now());
             decode_selected(&bytes)?
         };
+        self.predecessor_selected(flight.id, &selected);
         let mut physical = vec![RowResult::default(); batch.actual_rows()];
         for (projected_index, &output_index) in output
             .as_ref()
@@ -323,13 +348,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let (_, advances, _, _) = core.into_parts();
         let mut pending = Vec::with_capacity(flight.requests.len());
         let mut offset = 0usize;
-        for ((((request, rows, conditioning, kind, committed_rows), advance), slot), slices) in
+        let mut continuation = flight.continuation;
+        for (index, ((((request, rows, conditioning, kind, committed_rows), advance), slot), slices)) in
             flight
                 .requests
                 .into_iter()
                 .zip(advances)
                 .zip(flight.slots)
                 .zip(flight.conditioning_slices)
+                .enumerate()
         {
             let end = offset
                 .checked_add(rows)
@@ -338,6 +365,29 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .get(offset..end)
                 .ok_or("target request row slice exceeds batch")?
                 .to_vec();
+            offset = end;
+            let source = continuation.as_mut().map(|sources| sources[index].take());
+            let advance = match (advance, source) {
+                (TentativeAdvance::Accepted(advance), None) => advance,
+                (TentativeAdvance::Successor(successor), Some(Some(state))) => {
+                    match successor.attach(state) {
+                        Ok(advance) => advance,
+                        Err((state, error)) => {
+                            self.target.insert(request, state);
+                            return Err(DomainError::invariant(format!(
+                                "claimed lookahead slot no longer follows its state: {error}"
+                            )));
+                        }
+                    }
+                }
+                // Nobody claimed this slot: its rows are discarded.
+                (TentativeAdvance::Successor(_), Some(None)) => continue,
+                _ => {
+                    return Err(DomainError::invariant(
+                        "target flight advances differ from its continuation",
+                    ))
+                }
+            };
             pending.push(PendingOperationOutcome {
                 request,
                 outcome: Outcome::Forward { rows: result },
@@ -351,7 +401,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 conditioning_slices: slices,
                 image: None,
             });
-            offset = end;
         }
         let timing = TargetHostTiming {
             launch: commits.first.saturating_duration_since(flight.started),
@@ -386,17 +435,24 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             WorkKind,
             usize,
         )>,
-        advances: Vec<OwnedStateAdvance>,
+        advances: Vec<TentativeAdvance>,
     ) {
         for ((request, _, _, _, _), advance) in metadata.into_iter().zip(advances) {
-            self.target.insert(request, advance.abort());
+            match advance {
+                TentativeAdvance::Accepted(advance) => {
+                    self.target.insert(request, advance.abort());
+                }
+                // A successor's source state stays with its predecessor;
+                // dropping it releases its rows and bank.
+                TentativeAdvance::Successor(successor) => drop(successor),
+            }
         }
     }
 
-    fn target_slot(
+    pub(super) fn target_slot(
         &self,
         operation: &Operation,
-        advance: &OwnedStateAdvance,
+        advance: &TentativeAdvance,
     ) -> Result<(Slot, Vec<crate::ConditioningSlice>), String> {
         let Operation::Forward {
             request,
@@ -469,8 +525,12 @@ fn row_demand(operation: &Operation, row: usize) -> crate::batching::Demand {
 }
 
 fn selection(operation: &Operation, row: usize) -> Option<Select> {
-    let spec = operation.selection_for_row(row)?;
-    Some(Select {
+    operation.selection_for_row(row).map(select_row)
+}
+
+/// The packed selection controls of one selection spec.
+pub(super) fn select_row(spec: &crate::SelectSpec) -> Select {
+    Select {
         draw: Draw {
             kind: match spec.sampling {
                 crate::Sampling::Greedy => DrawKind::Greedy,
@@ -495,5 +555,5 @@ fn selection(operation: &Operation, row: usize) -> Option<Select> {
             .history
             .as_ref()
             .map_or_else(Vec::new, |value| value.to_vec()),
-    })
+    }
 }

@@ -13,49 +13,26 @@
 //! Standalone calls, and every launch of a launch-detail trace (timed one by
 //! one), are launched individually.
 
+use super::graph_replays::Replays;
 use super::{DispatchList, NativeRoute, RouteSubmission};
 use crate::api::CallError;
 use crate::driver::{typed_buffer, Allocation};
 use seismic_compiler::errors::ExecutionError;
 use seismic_cuda::direct::{DirectBatch, DirectGraph, DirectGraphBuilder, DirectLaunch};
 use std::any::Any;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 type Cuda = seismic_cuda::Cuda;
 type Executor = seismic_cuda::Executor;
 
-/// Graphs one device keeps; the least recently replayed is dropped beyond
-/// it. The steady state is one graph per step shape (row class and batch)
-/// and workspace slot, plus the runs submitted alone.
-const REPLAY_CAPACITY: usize = 1024;
-
-/// A device's CUDA graphs of sealed-plan submissions, keyed by the plans'
-/// identities followed by every buffer address the submission binds.
-#[derive(Default)]
-pub(crate) struct Replays {
-    entries: Mutex<ReplayEntries>,
-}
-
-#[derive(Default)]
-struct ReplayEntries {
-    clock: u64,
-    graphs: HashMap<Vec<u64>, Replay>,
-}
-
-struct Replay {
-    /// Clock of the last replay.
-    used: u64,
-    graph: DirectGraph,
-    /// The plans the graph's kernels belong to, kept loaded while it lives.
-    _retained: Arc<dyn Any + Send + Sync>,
-}
+/// A device's CUDA graphs of sealed-plan submissions.
+pub(crate) type CudaReplays = Replays<DirectGraph>;
 
 /// Encode `list` on the device's stream: a replay when the list is made of
 /// sealed plans and is not timed, else launch by launch.
 pub(super) fn encode(
     device: &seismic_cuda::Device,
-    replays: &Replays,
+    replays: &CudaReplays,
     list: &impl DispatchList,
     repetitions: usize,
     timed: bool,
@@ -70,46 +47,25 @@ pub(super) fn encode(
     match list.plans().filter(|_| !timed) {
         Some(mut key) => {
             key.extend(addresses(list));
-            let mut entries = replays
-                .entries
-                .lock()
-                .expect("native graph replays lock is never poisoned");
-            entries.clock += 1;
-            let clock = entries.clock;
-            if !entries.graphs.contains_key(&key) {
-                if entries.graphs.len() == REPLAY_CAPACITY {
-                    let oldest = entries
-                        .graphs
-                        .iter()
-                        .min_by_key(|(_, replay)| replay.used)
-                        .map(|(key, _)| key.clone())
-                        .expect("a full replay set has an entry");
-                    entries.graphs.remove(&oldest);
-                }
-                let mut builder =
-                    DirectGraphBuilder::new(device).map_err(CallError::Execution)?;
-                each_launch(list, |launch| match launch {
-                    Some(launch) => builder.launch(launch),
-                    None => Ok(()),
-                })?;
-                let graph = builder.instantiate().map_err(CallError::Execution)?;
-                entries.graphs.insert(
-                    key.clone(),
-                    Replay {
-                        used: clock,
-                        graph,
-                        _retained: retained.clone(),
-                    },
-                );
-            }
-            let replay = entries
-                .graphs
-                .get_mut(&key)
-                .expect("the submission's graph was formed above");
-            replay.used = clock;
-            for _ in 0..repetitions {
-                batch.replay(&replay.graph).map_err(CallError::Execution)?;
-            }
+            replays.replay(
+                key,
+                retained,
+                || {
+                    let mut builder =
+                        DirectGraphBuilder::new(device).map_err(CallError::Execution)?;
+                    each_launch(list, |launch| match launch {
+                        Some(launch) => builder.launch(launch),
+                        None => Ok(()),
+                    })?;
+                    builder.instantiate().map_err(CallError::Execution)
+                },
+                |graph| {
+                    for _ in 0..repetitions {
+                        batch.replay(graph).map_err(CallError::Execution)?;
+                    }
+                    Ok(())
+                },
+            )?;
         }
         None => {
             for _ in 0..repetitions {

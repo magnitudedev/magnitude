@@ -16,13 +16,14 @@ pub use native_target::{CommitSpan, TargetOutput, TargetReadoutGraphResult};
 pub use native_target_graph::{PreparedTargetGraphs, SealReport};
 pub use graph::readout::PreparedTargetReadoutGraphs;
 pub use native_vision::PreparedVisionGraphs;
-pub use submission::{CompletedWork, DeviceSubmission, ProgramSubmission, ReadySubmission};
+pub use submission::{
+    CompletedWork, DeviceSubmission, ProgramSubmission, ReadySubmission, SubmittedTarget,
+};
 
 use crate::{
-    GraphOutputTensor, HeadLaunchCore, ImportLaunchCore, ProjectLaunchCore, ResidentWeightSlot,
-    StateLaunchCore, SubmitError, TargetLaunchCore, ValidatedHeadLaunch, ValidatedImportLaunch,
-    ValidatedProjectionLaunch, ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch,
-    VisionLaunchCore,
+    GraphOutputTensor, HeadLaunchCore, ImportLaunchCore, ResidentWeightSlot, StateLaunchCore,
+    SubmitError, TargetLaunchCore, ValidatedHeadLaunch, ValidatedImportLaunch,
+    ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch, VisionLaunchCore,
 };
 
 /// Submit one ready native graph run and wait for its outcome. Programs
@@ -37,12 +38,9 @@ pub(crate) fn run_graph(
 }
 
 pub type CompletedTargetWork = CompletedWork<TargetLaunchCore, TargetOutput>;
-pub type CompletedHeadWork = CompletedWork<HeadLaunchCore, GraphOutputTensor>;
-pub struct ProjectGraphOutput {
-    pub(crate) logits: GraphOutputTensor,
-    pub(crate) selected: GraphOutputTensor,
-}
-pub type CompletedProjectWork = CompletedWork<ProjectLaunchCore, ProjectGraphOutput>;
+/// A head's selections, `[steps, slot class, 2]` (token, status) rows in
+/// step-major order; absent for a causal-only head.
+pub type CompletedHeadWork = CompletedWork<HeadLaunchCore, Option<GraphOutputTensor>>;
 pub type CompletedVisionWork = CompletedWork<VisionLaunchCore, GraphOutputTensor>;
 pub type CompletedStateWork = CompletedWork<StateLaunchCore, ()>;
 pub type CompletedImportWork = CompletedWork<ImportLaunchCore, ResidentWeightSlot>;
@@ -62,16 +60,11 @@ pub trait TargetProgram {
 
 pub trait HeadProgram {
     type Submission: ProgramSubmission<CompletedWork = CompletedHeadWork>;
-    type ProjectSubmission: ProgramSubmission<CompletedWork = CompletedProjectWork>;
 
     fn submit(
         &mut self,
         launch: ValidatedHeadLaunch,
     ) -> Result<Self::Submission, (SubmitError, ValidatedHeadLaunch)>;
-    fn project(
-        &mut self,
-        launch: ValidatedProjectionLaunch,
-    ) -> Result<Self::ProjectSubmission, (SubmitError, ValidatedProjectionLaunch)>;
 }
 
 pub trait VisionProgram {

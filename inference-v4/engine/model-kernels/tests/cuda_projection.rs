@@ -5,8 +5,8 @@
 //! CUDA device.
 
 use magnitude_model_kernels::{
-    qwen_dense_expand, qwen_dense_output, qwen_embedding_rows, qwen_features_rows, qwen_head_rows,
-    qwen_selected_rows, sample_rows, shape_rows,
+    qwen_dense_expand, qwen_dense_output, embedding_rows, readout_features_rows, readout_head_rows,
+    readout_selected_rows, sample_rows, shape_rows,
 };
 mod cuda_common;
 
@@ -108,7 +108,8 @@ fn output_kernel(
     .unwrap()
 }
 
-const ROWS: [usize; 8] = [1, 2, 3, 8, 16, 40, 64, 128];
+// GEMV (1..8), two-block GEMV (12, 16), GEMM (17 and beyond).
+const ROWS: [usize; 10] = [1, 2, 3, 8, 12, 16, 17, 40, 64, 128];
 
 #[test]
 fn cuda_dense_expand_matches_host_model() {
@@ -186,6 +187,139 @@ fn cuda_dense_output_matches_host_model() {
     }
 }
 
+/// Dense bf16 weights (row-major, unpadded) bind like packed ones on every
+/// path; INT8 has no effect with them (the INT8 GEMM needs packed weights).
+#[test]
+fn cuda_dense_weights_match_host_model() {
+    let Some(device) = cuda() else { return };
+    let mut rng = Rng(23);
+    let (h, f) = (512, 320);
+    let gate = dense_weight(&device, f, h, &mut rng);
+    let up = dense_weight(&device, f, h, &mut rng);
+    let down = dense_weight(&device, h, f, &mut rng);
+    let bf16 = Element::bf16();
+    for o in ROWS {
+        let case = DenseCase::new(o, h, f, &mut rng);
+        let residual = f32_tensor(&device, &[case.m as u64, h as u64], &case.residual);
+        let norm = f32_tensor(&device, &[h as u64], &case.norm);
+        let out_rows = i32_tensor(&device, &[o as u64], &case.out_rows);
+        for &mapping in mappings(o) {
+            let spec = |split| {
+                mapping.params(NativeSpecialization::new().with_static("H", h as u64).with_static("F", f as u64), split)
+            };
+            // INT8 has no effect with dense weights: every mapping runs the
+            // 16-bit path.
+            let (expected, tolerance) = case.expand(&gate, &up, Mapping { int8: 0, ..mapping });
+            let product = qwen_dense_expand::native_for_device_with(
+                &device,
+                qwen_dense_expand::Elements { NW: Element::f32(), GW: bf16, UW: bf16, A: bf16 },
+                &spec(false),
+            )
+            .unwrap()
+            .call(qwen_dense_expand::Args {
+                residual: &residual,
+                norm: &norm,
+                gate_weight: &gate.tensor,
+                up_weight: &up.tensor,
+                out_rows: &out_rows,
+                eps: EPSILON,
+            })
+            .unwrap()
+            .value;
+            check(&format!("dense expand O={o} {mapping:?}"), &read_bf16(&product), &expected, &tolerance);
+
+            let product_values: Vec<f32> = (0..o * f).map(|_| bf16_round(rng.uniform(-1.0, 1.0))).collect();
+            let product = bf16_tensor(&device, &[o as u64, f as u64], &product_values);
+            let (projected, magnitude) = project(&product_values, &down.values, o, h, f);
+            let expected: Vec<f64> = (0..o * h)
+                .map(|i| f64::from(case.residual[case.out_rows[i / h] as usize * h + i % h]) + projected[i])
+                .collect();
+            let tolerance: Vec<f64> =
+                (0..o * h).map(|i| projected[i].abs() / 256.0 + magnitude[i] * 2e-5 + 1e-6).collect();
+            let result = qwen_dense_output::native_for_device_with(
+                &device,
+                qwen_dense_output::Elements { DW: bf16, A: bf16 },
+                &spec(true),
+            )
+            .unwrap()
+            .call(qwen_dense_output::Args {
+                residual: &residual,
+                product: &product,
+                down_weight: &down.tensor,
+                out_rows: &out_rows,
+            })
+            .unwrap()
+            .value;
+            check(&format!("dense output O={o} {mapping:?}"), &read_f32(&result), &expected, &tolerance);
+        }
+    }
+}
+
+/// Every row of a GEMV class (2..=GEMV_ROWS rows, staged and two-block paths)
+/// equals the same row projected alone (M = 1, formed in the GEMV block) bit
+/// for bit: a verification row does not depend on its peers or on M.
+#[test]
+fn cuda_gemv_rows_match_single_row_bits() {
+    let Some(device) = cuda() else { return };
+    let mut rng = Rng(19);
+    let (h, f) = (512, 768);
+    for format in Format::ALL {
+        let gate = weight(&device, format, f, h, &mut rng);
+        let up = weight(&device, format, f, h, &mut rng);
+        let down = weight(&device, format, h, f, &mut rng);
+        let rows = GEMV_ROWS;
+        let residual_values: Vec<f32> = (0..rows * h).map(|_| rng.uniform(-3.0, 3.0)).collect();
+        let norm = f32_tensor(&device, &[h as u64], &(0..h).map(|_| rng.uniform(0.25, 1.25)).collect::<Vec<_>>());
+        let product_values: Vec<f32> = (0..rows * f).map(|_| bf16_round(rng.uniform(-1.0, 1.0))).collect();
+        for &mapping in &GEMV_MAPPINGS {
+            let expand = qwen_dense_expand::native_for_device_with(
+                &device,
+                qwen_dense_expand::Elements { NW: Element::f32(), GW: format.resident(), UW: format.resident(), A: Element::bf16() },
+                &mapping.params(NativeSpecialization::new().with_static("H", h as u64).with_static("F", f as u64), false),
+            )
+            .unwrap();
+            let output = output_kernel(&device, format, h, f, mapping);
+            let run = |o: usize, first: usize| {
+                let residual = f32_tensor(&device, &[o as u64, h as u64], &residual_values[first * h..(first + o) * h]);
+                let product = bf16_tensor(&device, &[o as u64, f as u64], &product_values[first * f..(first + o) * f]);
+                let out_rows = i32_tensor(&device, &[o as u64], &(0..o as i32).collect::<Vec<_>>());
+                let expanded = expand
+                    .call(qwen_dense_expand::Args {
+                        residual: &residual,
+                        norm: &norm,
+                        gate_weight: &gate.tensor,
+                        up_weight: &up.tensor,
+                        out_rows: &out_rows,
+                        eps: EPSILON,
+                    })
+                    .unwrap()
+                    .value;
+                let residual_rows = f32_tensor(&device, &[o as u64, h as u64], &vec![0.0; o * h]);
+                let projected = output
+                    .call(qwen_dense_output::Args {
+                        residual: &residual_rows,
+                        product: &product,
+                        down_weight: &down.tensor,
+                        out_rows: &out_rows,
+                    })
+                    .unwrap()
+                    .value;
+                (read_bf16(&expanded), read_f32(&projected))
+            };
+            let singles: Vec<(Vec<f32>, Vec<f32>)> = (0..rows).map(|row| run(1, row)).collect();
+            for o in [2usize, 5, 8, 9, 12, 16] {
+                let (expanded, projected) = run(o, 0);
+                for row in 0..o {
+                    let label = format!("{format:?} {mapping:?} O={o} row {row}");
+                    let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                    assert_eq!(bits(&expanded[row * f..(row + 1) * f]), bits(&singles[row].0), "expand {label}");
+                    assert_eq!(bits(&projected[row * h..(row + 1) * h]), bits(&singles[row].1), "output {label}");
+                }
+            }
+        }
+    }
+}
+
 /// Expected head logits of a case (features of the `out_rows` rows against
 /// every vocabulary row) and their tolerance.
 fn head_expected(case: &DenseCase, weight: &Weight, v: usize, mapping: Mapping) -> (Vec<f64>, Vec<f64>) {
@@ -214,13 +348,13 @@ fn cuda_head_rows_match_host_model() {
             let out_rows = i32_tensor(&device, &[o as u64], &case.out_rows);
             for &mapping in mappings(o) {
                 let (expected, tolerance) = head_expected(&case, &head, v, mapping);
-                let logits = qwen_head_rows::native_for_device_with(
+                let logits = readout_head_rows::native_for_device_with(
                     &device,
-                    qwen_head_rows::Elements { NW: Element::f32(), OW: format.resident(), A: Element::bf16() },
+                    readout_head_rows::Elements { NW: Element::f32(), OW: format.resident(), A: Element::bf16() },
                     &mapping.params(NativeSpecialization::new().with_static("V", v as u64).with_static("D", d as u64), false),
                 )
                 .unwrap()
-                .call(qwen_head_rows::Args {
+                .call(readout_head_rows::Args {
                     hidden: &hidden,
                     norm: &norm,
                     weight: &head.tensor,
@@ -250,13 +384,13 @@ fn cuda_features_and_selected_rows_match_host_model() {
             let hidden = f32_tensor(&device, &[case.m as u64, d as u64], &case.residual);
             let norm = f32_tensor(&device, &[d as u64], &case.norm);
             let out_rows = i32_tensor(&device, &[o as u64], &case.out_rows);
-            let features = qwen_features_rows::native_for_device_with(
+            let features = readout_features_rows::native_for_device_with(
                 &device,
-                qwen_features_rows::Elements { NW: Element::f32(), A: Element::bf16() },
+                readout_features_rows::Elements { NW: Element::f32(), A: Element::bf16() },
                 &NativeSpecialization::new().with_static("D", d as u64),
             )
             .unwrap()
-            .call(qwen_features_rows::Args { hidden: &hidden, norm: &norm, out_rows: &out_rows, epsilon: EPSILON })
+            .call(readout_features_rows::Args { hidden: &hidden, norm: &norm, out_rows: &out_rows, epsilon: EPSILON })
             .unwrap()
             .value;
             // The device and host differ only in the order of the square sum
@@ -271,13 +405,13 @@ fn cuda_features_and_selected_rows_match_host_model() {
             }
             assert!(off * 100 <= actual_features.len() as i64, "features {format:?} O={o}: {off} values one step off");
             let selected = i32_tensor(&device, &[sv as u64], &selected_values);
-            let actual = qwen_selected_rows::native_for_device_with(
+            let actual = readout_selected_rows::native_for_device_with(
                 &device,
-                qwen_selected_rows::Elements { NW: Element::f32(), OW: format.resident(), A: Element::bf16() },
+                readout_selected_rows::Elements { NW: Element::f32(), OW: format.resident(), A: Element::bf16() },
                 &NativeSpecialization::new().with_static("V", v as u64).with_static("D", d as u64),
             )
             .unwrap()
-            .call(qwen_selected_rows::Args {
+            .call(readout_selected_rows::Args {
                 hidden: &hidden,
                 norm: &norm,
                 weight: &head.tensor,
@@ -364,14 +498,16 @@ fn cuda_embedding_rows_decode_table_rows() {
     for format in Format::ALL {
         let table = weight(&device, format, v, d, &mut rng);
         let tokens_values = [0, 39, 17, 16, 15, 3];
-        let tokens = i32_tensor(&device, &[tokens_values.len() as u64], &tokens_values);
-        let result = qwen_embedding_rows::native_for_device_with(
+        // (token, status) rows, the `sample_rows` result layout.
+        let rows = tokens_values.iter().flat_map(|token| [*token, 0]).collect::<Vec<_>>();
+        let tokens = i32_tensor(&device, &[tokens_values.len() as u64, 2], &rows);
+        let result = embedding_rows::native_for_device_with(
             &device,
-            qwen_embedding_rows::Elements { EW: format.resident(), A: Element::bf16() },
+            embedding_rows::Elements { EW: format.resident(), A: Element::bf16() },
             &NativeSpecialization::new().with_static("D", d as u64),
         )
         .unwrap()
-        .call(qwen_embedding_rows::Args { table: &table.tensor, tokens: &tokens })
+        .call(embedding_rows::Args { table: &table.tensor, tokens: &tokens })
         .unwrap();
         let rounded = read_bf16(&result.r0);
         let wide = read_f32(&result.r1);
@@ -634,7 +770,8 @@ fn cuda_projection_timings() {
         let downs: Vec<Tensor> = (0..rotation).map(|_| timing_weight(&device, format, h, f)).collect();
         let expand_bytes = gates[0].byte_len() as f64 * 2.0;
         let output_bytes = downs[0].byte_len() as f64;
-        for m in [1usize, 8, 128] {
+        // Decode, the verification / concurrency curve (MTP), prefill.
+        for m in [1usize, 2, 4, 8, 12, 16, 32, 128] {
             let case = DenseCase::new(m, h, f, &mut rng);
             let residual = f32_tensor(&device, &[case.m as u64, h as u64], &case.residual);
             let norm = f32_tensor(&device, &[h as u64], &case.norm);
@@ -691,21 +828,21 @@ fn cuda_head_timings() {
     let (d, v) = (2560usize, 65536usize);
     let heads: Vec<Tensor> = (0..2).map(|_| timing_weight(&device, Format::Q6K, v, d)).collect();
     let bytes = heads[0].byte_len() as f64;
-    for o in [1usize, 8, 128] {
+    for o in [1usize, 2, 4, 8, 12, 16, 32, 128] {
         let case = DenseCase::new(o, d, v, &mut rng);
         let hidden = f32_tensor(&device, &[case.m as u64, d as u64], &case.residual);
         let norm = f32_tensor(&device, &[d as u64], &case.norm);
         let out_rows = i32_tensor(&device, &[o as u64], &case.out_rows);
         for &mapping in mappings(o) {
-            let kernel = qwen_head_rows::native_for_device_with(
+            let kernel = readout_head_rows::native_for_device_with(
                 &device,
-                qwen_head_rows::Elements { NW: Element::f32(), OW: Format::Q6K.resident(), A: Element::bf16() },
+                readout_head_rows::Elements { NW: Element::f32(), OW: Format::Q6K.resident(), A: Element::bf16() },
                 &mapping.params(NativeSpecialization::new().with_static("V", v as u64).with_static("D", d as u64), false),
             )
             .unwrap();
             let args = heads
                 .iter()
-                .map(|head| qwen_head_rows::Args {
+                .map(|head| readout_head_rows::Args {
                     hidden: &hidden,
                     norm: &norm,
                     weight: head,

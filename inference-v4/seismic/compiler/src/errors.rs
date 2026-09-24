@@ -64,6 +64,11 @@ pub enum PreparationError {
         slots: usize,
         limit: usize,
     },
+    /// The device's backend is native-only (Vulkan): it has no planned
+    /// route, so planned preparation and feedback are refused.
+    PlannedRouteUnavailable {
+        backend: seismic_lang::registry::BackendName,
+    },
     /// The selected evaluator could not consume this sealed domain. No
     /// partial evaluated domain exists.
     Evaluation(crate::evaluation::EvaluationError),
@@ -223,6 +228,11 @@ impl fmt::Display for PreparationError {
                 "native implementation of `{entry}` binds {slots} buffers; the backend admits {limit}"
             ),
             Self::NativeSpecialization(s) => write!(f, "native specialization: {s}"),
+            Self::PlannedRouteUnavailable { backend } => write!(
+                f,
+                "`{}` is a native-only backend: planned preparation is unavailable",
+                backend.as_str()
+            ),
             Self::Evaluation(e) => write!(f, "candidate evaluation failed: {e:?}"),
             Self::Feedback(e) => write!(f, "feedback evaluation failed: {e:?}"),
             Self::InvalidCandidateDomain(s) => write!(f, "invalid candidate domain: {s}"),

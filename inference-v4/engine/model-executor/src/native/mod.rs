@@ -17,12 +17,14 @@ pub(crate) use attestation::{
 };
 use glue::GlueKernels;
 use head::HeadKernels;
+pub(crate) use head::draft_vocabulary;
 pub(crate) use import::ImportKernels;
 use preparation::NativePreparationCache;
 use qualification::QualificationView;
 use target::TargetKernels;
 pub(crate) use target::{
-    AttentionKernels, DenseKernels, ReadoutKernels, RecurrentKernels, RoutedKernels,
+    AttentionHistoryKernels, AttentionKernels, DenseKernels, ReadoutKernels, RecurrentKernels,
+    RoutedKernels,
 };
 pub use tuning::{
     attention_points, row_points, ZeroTuningWeights, PointShape, TunedEntry, TuningContext,
@@ -40,14 +42,14 @@ use crate::{
     ProgramPlan, RecurrentBinding, RoutedBinding,
 };
 use magnitude_model_kernels::{
-    copy_rows, head_logits_rows, import_dense, qwen_attention_decode,
-    qwen_attention_output, qwen_attention_prefill, qwen_attention_project,
-    qwen_conditioning_overlay, qwen_dense_expand, qwen_dense_output, qwen_draft_rows,
-    qwen_embedding_rows, qwen_features_rows, qwen_head_rows, qwen_recurrent_chunk, qwen_recurrent_output,
+    copy_rows, head_logits_rows, import_dense, qwen_attention_decode, qwen_attention_decode_k8v4,
+    attention_output, qwen_attention_prefill, qwen_attention_prefill_k8v4,
+    qwen_attention_project,
+    conditioning_overlay, qwen_dense_expand, qwen_dense_output, qwen_draft_rows,
+    embedding_rows, readout_features_rows, readout_head_rows, qwen_recurrent_chunk, qwen_recurrent_output,
     qwen_recurrent_project, qwen_recurrent_step, qwen_routed_combine, qwen_routed_expand,
     qwen_routed_experts, qwen_routed_group, qwen_routed_output, qwen_routed_route,
-    qwen_selected_rows, qwen_vision_block, qwen_vision_feature_output,
-    qwen_vision_merger, qwen_vision_stem, repack_weight, sample_rows, shape_rows,
+    readout_selected_rows, qwen_vision_block, qwen_vision_merger, qwen_vision_stem, repack_weight, sample_rows, shape_rows,
 };
 use seismic::{BackendName, DType, Device, Element, NativeKernel, Tensor};
 use std::{collections::HashMap, fmt};

@@ -24,6 +24,7 @@ members = [
   "seismic/backends/metal",
   "seismic/backends/cpu",
   "seismic/backends/cuda",
+  "seismic/backends/vulkan",
   "seismic/cli",
   "seismic/compiler",
   "seismic/runtime",
@@ -71,6 +72,7 @@ seismic-lang = { path = "seismic/lang" }
 seismic-metal = { path = "seismic/backends/metal" }
 seismic-cpu = { path = "seismic/backends/cpu" }
 seismic-cuda = { path = "seismic/backends/cuda" }
+seismic-vulkan = { path = "seismic/backends/vulkan" }
 seismic-compiler = { path = "seismic/compiler" }
 seismic-runtime = { path = "seismic/runtime" }
 seismic = { path = "seismic/api" }

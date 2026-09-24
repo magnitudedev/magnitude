@@ -11,7 +11,8 @@ impl<'f, 'b, B: seismic_target::TargetFamily> Lowerer<'f, 'b, B> {
         out: SemanticValueId,
     ) {
         use seismic_lang::syntax::ast::BinaryOp as B;
-        // A literal quantity is already an immutable exact source value. Keep
+        // A literal quantity, or one over invocation values only, is already
+        // an immutable exact source value. Keep
         // that value as the binding itself, so geometry defined by it cannot
         // acquire an unrelated schedule slot and an artificial entry premise.
         // Public results still use their declared publication destination.
@@ -20,7 +21,7 @@ impl<'f, 'b, B: seismic_target::TargetFamily> Lowerer<'f, 'b, B> {
         {
             let literal = match primitive {
                 PrimitiveId::Symbolic(expression)
-                    if matches!(self.builder.arena().view((*expression).into()), NodeView::IntConst(_)) => Some(*expression),
+                    if invocation_evaluable(self.builder.arena(), (*expression).into()) => Some(*expression),
                 PrimitiveId::Constant(ReferenceScalar::I32(value)) => {
                     Some(self.builder.arena().int(i64::from(*value)))
                 }
@@ -62,7 +63,7 @@ impl<'f, 'b, B: seismic_target::TargetFamily> Lowerer<'f, 'b, B> {
             }
             PrimitiveId::Cast(_) => host_integer(arena, &operands[0]),
             PrimitiveId::Select => {
-                let condition = condition_expr(arena, &operands[0]);
+                let condition = condition_expr(arena, &self.values.host_conditions, &operands[0]);
                 let yes = host_integer(arena, &operands[1]);
                 let no = host_integer(arena, &operands[2]);
                 arena.int_select(condition, yes, no)
@@ -103,7 +104,8 @@ impl<'f, 'b, B: seismic_target::TargetFamily> Lowerer<'f, 'b, B> {
                         );
                         HostValueExpr::Word { dtype, value: typed }
                     }
-                    _ => panic!("checked exact-to-word operation lacks its typed conversion"),
+                    (dtype, PrimitiveId::Cast(_)) if dtype.is_float() => HostValueExpr::Float { dtype, value: integer },
+                    other => panic!("checked exact-to-word operation lacks its typed conversion: {other:?}"),
                 };
                 (value, HostValueDestination::Native(*slot))
             }
@@ -123,6 +125,9 @@ impl<'f, 'b, B: seismic_target::TargetFamily> Lowerer<'f, 'b, B> {
         } else {
             None
         };
+        if let (HostValueExpr::Bool(condition), HostValueDestination::Native(slot)) = (value, to) {
+            self.values.host_conditions.insert(slot.symbol(), condition);
+        }
         self.builder.schedule().evaluate_host(HostEvaluation { value, to, failure });
         self.values.bind(self.builder.bindings_mut(), out, target);
     }
@@ -237,21 +242,7 @@ impl<'f, 'b, B: seismic_target::TargetFamily> Lowerer<'f, 'b, B> {
                 // Index bounds express admissibility, never the scalar value.
                 // The checked symbolic operation carries its exact expression.
                 let direct = self.builder.arena().nat_from_int(*expression);
-                let invocation_evaluable = self
-                    .builder
-                    .arena()
-                    .free_symbols(AnyExpr::Nat(direct))
-                    .iter()
-                    .all(|symbol| {
-                        matches!(
-                            self.builder.arena().symbol_kind(*symbol),
-                            SymbolKind::CallDimension(_)
-                                | SymbolKind::CallScalar(_)
-                                | SymbolKind::TargetConstant(_)
-                                | SymbolKind::Decision(_)
-                        )
-                    });
-                if invocation_evaluable {
+                if invocation_evaluable(self.builder.arena(), AnyExpr::Nat(direct)) {
                     self.values.bind(
                         self.builder.bindings_mut(),
                         output,
@@ -315,9 +306,25 @@ impl<'f, 'b, B: seismic_target::TargetFamily> Lowerer<'f, 'b, B> {
 
     pub(super) fn lower_extent(&mut self, tensor: SemanticValueId, axis: u32, output: SemanticValueId) {
         let view = self.bound(tensor).tensor();
-        let target = self.output_target(output);
         let value = *view.extents().get(axis as usize)
             .expect("checked extent axis exceeds actual view rank");
+        // An axis fixed for the whole invocation is its own exact value, as
+        // for an invocation-evaluable index expression. Public results still
+        // use their declared publication destination.
+        if !self.function.results().contains(&output)
+            && invocation_evaluable(self.builder.arena(), AnyExpr::Nat(value))
+        {
+            let direct = match self.function.value(output).ty {
+                SemanticType::Index { .. } => Some(ScalarBinding::Index(value)),
+                SemanticType::Integer => Some(ScalarBinding::Integer(self.builder.arena().int_from_nat(value))),
+                _ => None,
+            };
+            if let Some(direct) = direct {
+                self.values.bind(self.builder.bindings_mut(), output, Bound::Scalar(direct));
+                return;
+            }
+        }
+        let target = self.output_target(output);
         let (value, to) = match &target {
             Bound::Scalar(ScalarBinding::Quantity(slot)) => (
                 match slot.kind() {
@@ -350,4 +357,13 @@ impl<'f, 'b, B: seismic_target::TargetFamily> Lowerer<'f, 'b, B> {
         self.values
             .bind(self.builder.bindings_mut(), output, target);
     }
+}
+
+/// Only invocation symbols: call values, target constants and decisions.
+fn invocation_evaluable(arena: &ExprArena, expression: AnyExpr) -> bool {
+    arena.free_symbols(expression).iter().all(|symbol| matches!(
+        arena.symbol_kind(*symbol),
+        SymbolKind::CallDimension(_) | SymbolKind::CallScalar(_)
+            | SymbolKind::TargetConstant(_) | SymbolKind::Decision(_)
+    ))
 }

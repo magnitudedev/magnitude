@@ -5,8 +5,8 @@ use magnitude_generation::{
     TokenId, Verification, WaitReason, WorkKind,
 };
 use magnitude_model_executor::{
-    FeatureRef, FeatureRetainer, FeatureSpan, Operation, Outcome, ResourceDomainId,
-    RetainedFeatureSpan, Selected,
+    FeatureReader, FeatureRef, FeatureRows, FeatureSpan, Operation, Outcome, ResourceDomainId,
+    Selected,
 };
 use std::{
     cell::RefCell,
@@ -30,6 +30,33 @@ fn feature(id: u64) -> FeatureRef {
             })
             .clone()
     })
+}
+
+/// Reads row `r` of feature `id` as the four bytes `[id, r, 0, 0]`.
+struct Rows;
+
+impl FeatureReader for Rows {
+    fn read(&mut self, span: &FeatureSpan) -> Result<FeatureRows, String> {
+        let id = span
+            .features
+            .domain()
+            .as_str()
+            .strip_prefix("generation-")
+            .and_then(|id| id.parse::<u8>().ok())
+            .ok_or("unknown test feature")?;
+        let bytes = (span.start..span.start + span.count)
+            .flat_map(|row| [id, row as u8, 0, 0])
+            .collect::<Vec<_>>();
+        FeatureRows::new(bytes.into(), span.count).map_err(|error| error.to_string())
+    }
+}
+
+/// The (feature id, row) of every row, in order.
+fn row_ids(rows: &FeatureRows) -> Vec<(u8, u8)> {
+    rows.bytes()
+        .chunks_exact(4)
+        .map(|row| (row[0], row[1]))
+        .collect()
 }
 
 fn options() -> Options {
@@ -60,14 +87,6 @@ fn generation(constraint: Option<Box<dyn Constraint>>) -> Generation {
     .unwrap()
 }
 
-struct UnusedRetainer;
-
-impl FeatureRetainer for UnusedRetainer {
-    fn retain(&mut self, _span: FeatureSpan) -> Result<RetainedFeatureSpan, String> {
-        Err("test method does not retain features".into())
-    }
-}
-
 fn start(generation: &mut Generation, allowance: usize) -> magnitude_generation::RoundForward {
     assert_eq!(
         generation.start_round(RequestId(1), allowance).unwrap(),
@@ -82,11 +101,10 @@ fn resolve(
     features: Option<FeatureRef>,
 ) -> Vec<Operation> {
     let samples = samples.iter().copied().map(TokenId).collect::<Vec<_>>();
-    generation.resolve_round(&samples).unwrap();
-    generation
-        .commit_round(RequestId(1), features)
-        .unwrap()
-        .operations
+    let transition = generation
+        .prepare_round_transition(RequestId(1), &samples, features, &mut Rows)
+        .unwrap();
+    generation.commit_transition(transition).operations
 }
 
 fn prefill(generation: &mut Generation, selected: u32) {
@@ -217,20 +235,6 @@ fn output_credit_stop_and_wait_reasons_are_round_native() {
 }
 
 #[test]
-fn grammar_failure_fails_before_logical_publication() {
-    let mut generation = generation(Some(Box::new(Grammar {
-        accepted: vec![],
-        forced: vec![],
-        reject: Some(TokenId(12)),
-    })));
-    start(&mut generation, 2);
-    assert!(generation.resolve_round(&[TokenId(12)]).is_err());
-    assert_eq!(generation.finish_reason(), Some(FinishReason::Failed));
-    assert_eq!(generation.resident_position(), 0);
-    assert!(generation.generated().is_empty());
-}
-
-#[test]
 fn prepared_transition_does_not_change_live_generation_until_commit() {
     let mut generation = generation(Some(Box::new(Grammar {
         accepted: vec![],
@@ -240,7 +244,7 @@ fn prepared_transition_does_not_change_live_generation_until_commit() {
     start(&mut generation, 2);
     assert!(
         generation
-            .prepare_round_transition(RequestId(1), &[TokenId(12)], None, &mut UnusedRetainer)
+            .prepare_round_transition(RequestId(1), &[TokenId(12)], None, &mut Rows)
             .is_err()
     );
     assert_eq!(generation.finish_reason(), None);
@@ -248,7 +252,7 @@ fn prepared_transition_does_not_change_live_generation_until_commit() {
     assert!(generation.awaiting_completion());
 
     let prepared = generation
-        .prepare_round_transition(RequestId(1), &[TokenId(10)], None, &mut UnusedRetainer)
+        .prepare_round_transition(RequestId(1), &[TokenId(10)], None, &mut Rows)
         .unwrap();
     assert_eq!(prepared.decision().accepted_rows, 2);
     drop(prepared);
@@ -257,7 +261,7 @@ fn prepared_transition_does_not_change_live_generation_until_commit() {
     assert!(generation.awaiting_completion());
 
     let prepared = generation
-        .prepare_round_transition(RequestId(1), &[TokenId(10)], None, &mut UnusedRetainer)
+        .prepare_round_transition(RequestId(1), &[TokenId(10)], None, &mut Rows)
         .unwrap();
     let effects = generation.commit_transition(prepared);
     assert!(effects.operations.is_empty());
@@ -271,9 +275,7 @@ fn cancellation_reconciles_the_round_without_committing_or_publishing_it() {
     let mut generation = generation(None);
     start(&mut generation, 2);
     generation.cancel();
-    let acceptance = generation.resolve_round(&[TokenId(10)]).unwrap();
-    assert_eq!(acceptance.committed_rows, 0);
-    generation.commit_round(RequestId(1), None).unwrap();
+    assert!(!generation.awaiting_completion());
     assert_eq!(generation.resident_position(), 0);
     assert!(generation.generated().is_empty());
     assert_eq!(generation.finish_reason(), Some(FinishReason::Cancelled));
@@ -298,25 +300,225 @@ fn eviction_discards_suspended_work_and_replays_through_rounds() {
     assert_eq!(generation.generated(), [TokenId(10)]);
 }
 
-struct DraftMethod;
-impl Method for DraftMethod {
-    fn identity(&self) -> &str {
-        "mtp:fixture:2"
-    }
-    fn requires(&self) -> MethodRequirements {
-        MethodRequirements {
-            prefill_demand: Demand::FEATURES,
-            verify_demand: Demand::FEATURES,
-            head: true,
-        }
-    }
-    fn create(&self, _checkpoint: Option<&MethodCheckpoint>) -> Box<dyn MethodState> {
-        Box::new(DraftState)
-    }
+#[test]
+fn eviction_resumes_from_a_retained_prefix_and_replays_the_rest() {
+    let mut generation = generation(None);
+    prefill(&mut generation, 10);
+    let checkpoint = generation.method_checkpoint().unwrap();
+    generation.evicted().unwrap();
+    // Accepted input: the prompt and the sampled token, three rows.
+    assert!(generation.restored_at(4, &checkpoint).is_err());
+    generation.restored_at(1, &checkpoint).unwrap();
+    assert!(generation.restored_at(1, &checkpoint).is_err());
+    assert_eq!(generation.resident_position(), 1);
+    let replay = start(&mut generation, 4);
+    assert_eq!(replay.kind, WorkKind::Replay);
+    assert_eq!(replay.tokens, [TokenId(2), TokenId(10)]);
+    resolve(&mut generation, &[], None);
+    assert_eq!(generation.resident_position(), 3);
+    assert_eq!(generation.generated(), [TokenId(10)]);
+}
+
+fn mtp_generation(prompt: &[u32], proposals: u8) -> Generation {
+    let mut configured = options();
+    configured.method = MethodChoice::Mtp { proposals };
+    Generation::new_with_method(
+        prompt.iter().copied().map(TokenId).collect(),
+        InputLayout::new(prompt.len(), vec![]).unwrap(),
+        configured,
+        None,
+        Arc::new(Mtp::new("fixture", usize::from(proposals)).unwrap()),
+    )
+    .unwrap()
+}
+
+fn head_parts(operation: &Operation) -> (Vec<TokenId>, Vec<(u8, u8)>, usize, Vec<SelectSpec>) {
+    let Operation::Head {
+        tokens,
+        conditioning,
+        position,
+        proposals,
+        ..
+    } = operation
+    else {
+        panic!("expected a head transaction")
+    };
+    (
+        tokens.clone(),
+        row_ids(conditioning),
+        *position,
+        proposals.clone(),
+    )
+}
+
+/// Reconcile a head transaction as the service does.
+fn reconcile_head(generation: &mut Generation, operation: &Operation, proposals: &[(u32, u8)]) {
+    let outcome = Outcome::Head {
+        proposals: proposals
+            .iter()
+            .map(|&(token, status)| Selected {
+                token: TokenId(token),
+                status,
+            })
+            .collect(),
+    };
+    let transition = generation
+        .prepare_method_transition(operation, &outcome)
+        .unwrap();
+    let Operation::Head { tokens, .. } = operation else {
+        unreachable!()
+    };
+    assert_eq!(transition.decision().accepted_rows, tokens.len());
+    generation.commit_method_transition(transition);
+}
+
+#[test]
+fn prefill_chunks_enter_target_conditioned_pairs_and_keep_the_anchor() {
+    let request = RequestId(1);
+    let mut generation = mtp_generation(&[1, 2, 3], 2);
+    // First chunk: rows 1, 2. Its pairs are (2, f5.0); f5.1 waits for 3.
+    start(&mut generation, 2);
+    let effects = resolve(&mut generation, &[], Some(feature(5)));
+    let [head] = effects.as_slice() else {
+        panic!("a non-final chunk enters its complete pairs")
+    };
+    let (tokens, rows, position, proposals) = head_parts(head);
+    assert_eq!((tokens, rows, position), (vec![TokenId(2)], vec![(5, 0)], 0));
+    assert!(proposals.is_empty());
+    reconcile_head(&mut generation, head, &[]);
+    // Final chunk: row 3 selects 10. Pairs (3, f5.1) are entered; the anchor
+    // (10, f6.0) waits for the first draft.
+    start(&mut generation, 1);
+    let effects = resolve(&mut generation, &[10], Some(feature(6)));
+    let [head] = effects.as_slice() else {
+        panic!("the final chunk enters all but the anchor")
+    };
+    let (tokens, rows, position, _) = head_parts(head);
+    assert_eq!((tokens, rows, position), (vec![TokenId(3)], vec![(5, 1)], 1));
+    reconcile_head(&mut generation, head, &[]);
+    generation.take(4).unwrap();
+    let RoundStart::Method(draft) = generation.start_round(request, 4).unwrap() else {
+        panic!("decode drafts first")
+    };
+    let (tokens, rows, position, proposals) = head_parts(&draft[0]);
+    assert_eq!((tokens, rows, position), (vec![TokenId(10)], vec![(6, 0)], 2));
+    // Proposal selections share the target's keys at the same output rows.
+    assert_eq!(
+        proposals
+            .iter()
+            .map(|select| (select.position, select.domain))
+            .collect::<Vec<_>>(),
+        [(1, 0), (2, 0)]
+    );
+}
+
+#[test]
+fn verification_accepts_the_matching_prefix_and_re_enters_accepted_rows() {
+    let request = RequestId(1);
+    let mut generation = mtp_generation(&[1, 2], 3);
+    start(&mut generation, 2);
+    let effects = resolve(&mut generation, &[10], Some(feature(1)));
+    reconcile_head(&mut generation, &effects[0], &[]);
+    generation.take(4).unwrap();
+    let RoundStart::Method(draft) = generation.start_round(request, 4).unwrap() else {
+        panic!("decode drafts first")
+    };
+    reconcile_head(&mut generation, &draft[0], &[(11, 0), (12, 0), (13, 0)]);
+    let verify = start(&mut generation, 4);
+    assert_eq!(verify.kind, WorkKind::Verify);
+    assert_eq!(
+        verify.tokens,
+        [TokenId(10), TokenId(11), TokenId(12), TokenId(13)]
+    );
+    // The target agrees on 11 and 12 and samples 20 after them.
+    assert!(resolve(&mut generation, &[11, 12, 20, 30], Some(feature(2))).is_empty());
+    assert_eq!(
+        generation.generated(),
+        [TokenId(10), TokenId(11), TokenId(12), TokenId(20)]
+    );
+    assert_eq!(generation.resident_position(), 5);
+    assert_eq!(generation.detailed_usage().draft_n, 3);
+    assert_eq!(generation.detailed_usage().draft_n_accepted, 2);
+    generation.take(4).unwrap();
+    // The next draft enters every accepted row with its target feature and
+    // anchors on the bonus token: (11, f2.0), (12, f2.1), (20, f2.2).
+    let RoundStart::Method(draft) = generation.start_round(request, 4).unwrap() else {
+        panic!("decode drafts again")
+    };
+    let (tokens, rows, position, _) = head_parts(&draft[0]);
+    assert_eq!(tokens, [TokenId(11), TokenId(12), TokenId(20)]);
+    assert_eq!(rows, [(2, 0), (2, 1), (2, 2)]);
+    assert_eq!(position, 2);
+}
+
+#[test]
+fn proposals_stop_at_a_failed_selection_or_a_stop_token() {
+    let request = RequestId(1);
+    let mut generation = mtp_generation(&[1, 2], 3);
+    start(&mut generation, 2);
+    let effects = resolve(&mut generation, &[10], Some(feature(1)));
+    reconcile_head(&mut generation, &effects[0], &[]);
+    generation.take(4).unwrap();
+    let RoundStart::Method(draft) = generation.start_round(request, 4).unwrap() else {
+        panic!("decode drafts first")
+    };
+    reconcile_head(&mut generation, &draft[0], &[(11, 0), (99, 0), (13, 0)]);
+    assert_eq!(start(&mut generation, 4).tokens, [TokenId(10), TokenId(11)]);
+
+    let mut failed = mtp_generation(&[1, 2], 3);
+    start(&mut failed, 2);
+    let effects = resolve(&mut failed, &[10], Some(feature(1)));
+    reconcile_head(&mut failed, &effects[0], &[]);
+    failed.take(4).unwrap();
+    let RoundStart::Method(draft) = failed.start_round(request, 4).unwrap() else {
+        panic!("decode drafts first")
+    };
+    reconcile_head(&mut failed, &draft[0], &[(11, 0), (0, 1), (13, 0)]);
+    assert_eq!(start(&mut failed, 4).tokens, [TokenId(10), TokenId(11)]);
+}
+
+#[test]
+fn checkpoints_carry_host_rows_and_restore_at_their_target_boundary() {
+    let request = RequestId(1);
+    let mut source = mtp_generation(&[1, 2], 2);
+    start(&mut source, 2);
+    let effects = resolve(&mut source, &[10], Some(feature(3)));
+    // A checkpoint needs reconciled method work.
+    assert!(source.method_checkpoint().is_err());
+    reconcile_head(&mut source, &effects[0], &[]);
+    let checkpoint = source.method_checkpoint().unwrap();
+    assert_eq!(checkpoint.retained_bytes(), 4);
+    let fork = source.fork_at(source.resident_position()).unwrap();
+    assert_eq!(fork.method_checkpoint().unwrap(), checkpoint);
+    let MethodCheckpoint::Mtp(state) = &checkpoint else {
+        panic!("MTP checkpoint")
+    };
+    // Head row 0 entered, the anchor pending: two target rows.
+    assert_eq!((state.position(), state.target_rows()), (1, 2));
+    let mut fresh = mtp_generation(&[1, 2, 7], 2);
+    assert!(fresh.restore_prefix(1, &checkpoint).is_err());
+    fresh.restore_prefix(2, &checkpoint).unwrap();
+    assert_eq!(fresh.resident_position(), 2);
+    let _ = request;
+}
+
+#[test]
+fn mtp_choice_requires_an_injected_factory() {
+    let mut configured = options();
+    configured.method = MethodChoice::Mtp { proposals: 2 };
+    assert!(
+        Generation::new(
+            vec![TokenId(1), TokenId(2)],
+            InputLayout::new(2, vec![]).unwrap(),
+            configured,
+            None,
+        )
+        .is_err()
+    );
 }
 
 struct PrimeMethod {
-    calls: Arc<Mutex<Vec<Vec<TokenId>>>>,
+    calls: Arc<Mutex<Vec<(Vec<TokenId>, Option<TokenId>)>>>,
 }
 impl Method for PrimeMethod {
     fn identity(&self) -> &str {
@@ -329,64 +531,62 @@ impl Method for PrimeMethod {
             head: true,
         }
     }
-    fn create(&self, _checkpoint: Option<&MethodCheckpoint>) -> Box<dyn MethodState> {
-        Box::new(PrimeState {
+    fn proposals(&self) -> usize {
+        1
+    }
+    fn create(
+        &self,
+        _checkpoint: Option<&MethodCheckpoint>,
+    ) -> Result<Box<dyn MethodState>, String> {
+        Ok(Box::new(PrimeState {
             calls: self.calls.clone(),
-        })
+        }))
     }
 }
 #[derive(Clone)]
 struct PrimeState {
-    calls: Arc<Mutex<Vec<Vec<TokenId>>>>,
+    calls: Arc<Mutex<Vec<(Vec<TokenId>, Option<TokenId>)>>>,
 }
 impl MethodState for PrimeState {
-    fn fork_transition(&self) -> Result<Box<dyn MethodState>, String> {
-        Ok(Box::new(self.clone()))
+    fn fork_transition(&self) -> Box<dyn MethodState> {
+        Box::new(self.clone())
     }
     fn prime(
         &mut self,
         _: RequestId,
         tokens: &[TokenId],
+        next: Option<TokenId>,
         _features: FeatureRef,
+        _: &mut dyn FeatureReader,
     ) -> Result<MethodEffects, String> {
-        self.calls.lock().unwrap().push(tokens.to_vec());
+        self.calls.lock().unwrap().push((tokens.to_vec(), next));
         Ok(MethodEffects::default())
     }
-    fn propose(
-        &mut self,
-        _: RequestId,
-        _context: &[TokenId],
-        _limit: usize,
-        _: SelectSpec,
-    ) -> Propose {
+    fn propose(&mut self, _: RequestId, _: &[SelectSpec]) -> Propose {
         Propose::Tokens(Vec::new())
     }
-    fn observe(&mut self, _verification: Verification<'_>) -> Result<MethodEffects, String> {
-        Ok(MethodEffects::default())
-    }
-    fn reconcile(
+    fn observe(
         &mut self,
-        _: &Operation,
-        _: Outcome,
-        _: Option<SelectSpec>,
+        _: RequestId,
+        _: Verification<'_>,
+        _: &mut dyn FeatureReader,
     ) -> Result<MethodEffects, String> {
         Ok(MethodEffects::default())
     }
-    fn checkpoint(
-        &self,
-        _retainer: &mut dyn FeatureRetainer,
-    ) -> Result<MethodCheckpoint, MethodCheckpointError> {
+    fn reconcile(&mut self, _: &Operation, _: Outcome) -> Result<(), String> {
+        Ok(())
+    }
+    fn checkpoint(&self) -> Result<MethodCheckpoint, MethodCheckpointError> {
         Ok(MethodCheckpoint::Plain)
     }
     fn evict(&mut self) {}
-    fn restore(&mut self) {}
     fn reclaimable(&self) -> u64 {
         0
     }
 }
 
 #[test]
-fn every_prefill_chunk_primes_the_method_with_its_target_features() {
+fn every_prefill_chunk_primes_the_method_with_its_selected_successor() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let mut configured = options();
     configured.method = MethodChoice::Mtp { proposals: 1 };
@@ -407,383 +607,10 @@ fn every_prefill_chunk_primes_the_method_with_its_target_features() {
     resolve(&mut generation, &[10], Some(feature(2)));
     assert_eq!(
         *calls.lock().unwrap(),
-        vec![vec![TokenId(1)], vec![TokenId(2)]]
-    );
-}
-
-#[test]
-fn prefill_prime_head_reconciles_without_a_proposal_preview() {
-    let request = RequestId(9);
-    let mut configured = options();
-    configured.method = MethodChoice::Mtp { proposals: 2 };
-    let mut generation = Generation::new_with_method(
-        vec![TokenId(1), TokenId(2)],
-        InputLayout::new(2, vec![]).unwrap(),
-        configured,
-        None,
-        Arc::new(Mtp::new("fixture", 2).unwrap()),
-    )
-    .unwrap();
-    assert_eq!(
-        generation.start_round(request, 2).unwrap(),
-        RoundStart::Target
-    );
-    generation.resolve_round(&[TokenId(10)]).unwrap();
-    let priming = generation.commit_round(request, Some(feature(50))).unwrap();
-    let [head @ Operation::Head { conditioning, .. }] = priming.operations.as_slice() else {
-        panic!("two-row prefill must produce one shifted priming head")
-    };
-    assert_eq!(
-        *conditioning,
-        FeatureSpan {
-            features: feature(50),
-            start: 0,
-            count: 1
-        }
-    );
-    let effects = generation
-        .reconcile_method(
-            head,
-            Outcome::Head {
-                features: feature(51),
-            },
-        )
-        .unwrap();
-    assert_eq!(effects.head_prefix, Some(1));
-    assert!(effects.operations.is_empty());
-}
-#[derive(Clone)]
-struct DraftState;
-impl MethodState for DraftState {
-    fn fork_transition(&self) -> Result<Box<dyn MethodState>, String> {
-        Ok(Box::new(self.clone()))
-    }
-    fn prime(
-        &mut self,
-        _: RequestId,
-        _tokens: &[TokenId],
-        _features: FeatureRef,
-    ) -> Result<MethodEffects, String> {
-        Ok(MethodEffects::default())
-    }
-    fn propose(
-        &mut self,
-        _: RequestId,
-        _context: &[TokenId],
-        limit: usize,
-        _: SelectSpec,
-    ) -> Propose {
-        Propose::Tokens([TokenId(11), TokenId(12)][..limit.min(2)].to_vec())
-    }
-    fn observe(&mut self, _verification: Verification<'_>) -> Result<MethodEffects, String> {
-        Ok(MethodEffects::default())
-    }
-    fn reconcile(
-        &mut self,
-        _: &Operation,
-        _: Outcome,
-        _: Option<SelectSpec>,
-    ) -> Result<MethodEffects, String> {
-        Ok(MethodEffects::default())
-    }
-    fn checkpoint(
-        &self,
-        _retainer: &mut dyn FeatureRetainer,
-    ) -> Result<MethodCheckpoint, MethodCheckpointError> {
-        Ok(MethodCheckpoint::Plain)
-    }
-    fn evict(&mut self) {}
-    fn restore(&mut self) {}
-    fn reclaimable(&self) -> u64 {
-        0
-    }
-}
-
-#[test]
-fn proposal_acceptance_and_usage_stay_inside_the_round_transcript() {
-    let mut configured = options();
-    configured.method = MethodChoice::Mtp { proposals: 2 };
-    let mut generation = Generation::new_with_method(
-        vec![TokenId(1), TokenId(2)],
-        InputLayout::new(2, vec![]).unwrap(),
-        configured,
-        None,
-        Arc::new(DraftMethod),
-    )
-    .unwrap();
-    start(&mut generation, 2);
-    resolve(&mut generation, &[10], Some(feature(1)));
-    generation.take(4).unwrap();
-    let verify = start(&mut generation, 3);
-    assert_eq!(verify.kind, WorkKind::Verify);
-    assert_eq!(verify.tokens, [TokenId(10), TokenId(11), TokenId(12)]);
-    resolve(&mut generation, &[11, 20, 21], Some(feature(2)));
-    assert_eq!(
-        generation.generated(),
-        [TokenId(10), TokenId(11), TokenId(20)]
-    );
-    assert_eq!(generation.detailed_usage().draft_n, 2);
-    assert_eq!(generation.detailed_usage().draft_n_accepted, 1);
-}
-
-struct ChainedMethod;
-impl Method for ChainedMethod {
-    fn identity(&self) -> &str {
-        "mtp:chain:2"
-    }
-    fn requires(&self) -> MethodRequirements {
-        MethodRequirements {
-            prefill_demand: Demand::FEATURES,
-            verify_demand: Demand::FEATURES,
-            head: true,
-        }
-    }
-    fn create(&self, _: Option<&MethodCheckpoint>) -> Box<dyn MethodState> {
-        Box::new(ChainedState {
-            proposed: Vec::new(),
-            feature: None,
-        })
-    }
-}
-
-#[derive(Clone)]
-struct ChainedState {
-    proposed: Vec<TokenId>,
-    feature: Option<FeatureRef>,
-}
-impl MethodState for ChainedState {
-    fn fork_transition(&self) -> Result<Box<dyn MethodState>, String> {
-        Ok(Box::new(self.clone()))
-    }
-    fn prime(
-        &mut self,
-        _: RequestId,
-        _: &[TokenId],
-        _: FeatureRef,
-    ) -> Result<MethodEffects, String> {
-        Ok(MethodEffects::default())
-    }
-    fn propose(
-        &mut self,
-        request: RequestId,
-        context: &[TokenId],
-        limit: usize,
-        _: SelectSpec,
-    ) -> Propose {
-        if !self.proposed.is_empty() {
-            return Propose::Tokens(self.proposed.clone());
-        }
-        Propose::Pending(vec![Operation::Head {
-            request,
-            tokens: context[context.len() - 1..].to_vec(),
-            conditioning: FeatureSpan {
-                features: feature(70),
-                start: 0,
-                count: 1,
-            },
-            position: context.len() - 1,
-            demand: Demand::FEATURES
-                & if limit > 0 {
-                    Demand::FEATURES
-                } else {
-                    Demand::NONE
-                },
-        }])
-    }
-    fn observe(&mut self, _: Verification<'_>) -> Result<MethodEffects, String> {
-        Ok(MethodEffects::default())
-    }
-    fn reconcile(
-        &mut self,
-        operation: &Operation,
-        outcome: Outcome,
-        next_select: Option<SelectSpec>,
-    ) -> Result<MethodEffects, String> {
-        let request = operation.request();
-        match outcome {
-            Outcome::Head { features } => self.feature = Some(features),
-            Outcome::Project { selected } => self.proposed.push(selected[0].token),
-            _ => return Err("wrong chained outcome".into()),
-        }
-        Ok(MethodEffects {
-            operations: next_select
-                .map(|select| Operation::Project {
-                    request,
-                    features: self.feature.clone().unwrap(),
-                    select,
-                })
-                .into_iter()
-                .collect(),
-            head_prefix: None,
-        })
-    }
-    fn checkpoint(
-        &self,
-        _retainer: &mut dyn FeatureRetainer,
-    ) -> Result<MethodCheckpoint, MethodCheckpointError> {
-        Ok(MethodCheckpoint::Plain)
-    }
-    fn evict(&mut self) {}
-    fn restore(&mut self) {}
-    fn reclaimable(&self) -> u64 {
-        0
-    }
-}
-
-fn ready_chained_generation(request: RequestId) -> Generation {
-    let mut configured = options();
-    configured.method = MethodChoice::Mtp { proposals: 2 };
-    let mut generation = Generation::new_with_method(
-        vec![TokenId(1)],
-        InputLayout::new(1, vec![]).unwrap(),
-        configured,
-        Some(Box::new(Grammar {
-            accepted: vec![],
-            forced: vec![],
-            reject: None,
-        })),
-        Arc::new(ChainedMethod),
-    )
-    .unwrap();
-    assert_eq!(
-        generation.start_round(request, 1).unwrap(),
-        RoundStart::Target
-    );
-    generation.resolve_round(&[TokenId(10)]).unwrap();
-    generation.commit_round(request, Some(feature(60))).unwrap();
-    generation.take(4).unwrap();
-    generation
-}
-
-#[test]
-fn method_project_chain_uses_generation_owned_preview_selection() {
-    let request = RequestId(44);
-    let mut generation = ready_chained_generation(request);
-
-    let RoundStart::Method(head) = generation.start_round(request, 3).unwrap() else {
-        panic!("method must start with head work")
-    };
-    assert!(
-        generation
-            .fork_at(generation.resident_position(), &mut UnusedRetainer)
-            .is_err()
-    );
-    let first = generation
-        .reconcile_method(
-            &head[0],
-            Outcome::Head {
-                features: feature(71),
-            },
-        )
-        .unwrap();
-    let Operation::Project { select, .. } = &first.operations[0] else {
-        panic!("head must yield first projection")
-    };
-    assert_eq!(select.position, 1);
-    assert_eq!(select.domain, 1);
-
-    let second = generation
-        .reconcile_method(
-            &first.operations[0],
-            Outcome::Project {
-                selected: vec![Selected {
-                    token: TokenId(11),
-                    status: 0,
-                }],
-            },
-        )
-        .unwrap();
-    let Operation::Project { select, .. } = &second.operations[0] else {
-        panic!("first projection must yield second projection")
-    };
-    assert_eq!(select.position, 2);
-
-    assert!(
-        generation
-            .reconcile_method(
-                &second.operations[0],
-                Outcome::Project {
-                    selected: vec![Selected {
-                        token: TokenId(12),
-                        status: 0,
-                    }],
-                },
-            )
-            .unwrap()
-            .operations
-            .is_empty()
-    );
-    assert_eq!(
-        generation.start_round(request, 3).unwrap(),
-        RoundStart::Target
-    );
-    assert_eq!(
-        generation.round_forward().unwrap().tokens,
-        [TokenId(10), TokenId(11), TokenId(12)]
-    );
-}
-
-#[test]
-fn method_preview_is_cleared_by_cancellation_and_reconciliation_error() {
-    let request = RequestId(45);
-    let mut cancelled = ready_chained_generation(request);
-    assert!(matches!(
-        cancelled.start_round(request, 3).unwrap(),
-        RoundStart::Method(_)
-    ));
-    cancelled.cancel();
-    assert!(
-        cancelled
-            .fork_at(cancelled.resident_position(), &mut UnusedRetainer)
-            .is_ok()
-    );
-
-    let mut failed = ready_chained_generation(request);
-    let RoundStart::Method(head) = failed.start_round(request, 3).unwrap() else {
-        panic!("method must start with head work")
-    };
-    let project = failed
-        .reconcile_method(
-            &head[0],
-            Outcome::Head {
-                features: feature(72),
-            },
-        )
-        .unwrap();
-    assert!(
-        failed
-            .reconcile_method(
-                &project.operations[0],
-                Outcome::Project {
-                    selected: vec![Selected {
-                        token: TokenId(11),
-                        status: 1,
-                    }],
-                },
-            )
-            .is_err()
-    );
-    assert_eq!(failed.finish_reason(), Some(FinishReason::Failed));
-    assert_eq!(failed.constraint_position(), Some(1));
-    assert!(
-        failed
-            .fork_at(failed.resident_position(), &mut UnusedRetainer)
-            .is_ok()
-    );
-}
-
-#[test]
-fn mtp_choice_requires_an_injected_factory() {
-    let mut configured = options();
-    configured.method = MethodChoice::Mtp { proposals: 2 };
-    assert!(
-        Generation::new(
-            vec![TokenId(1), TokenId(2)],
-            InputLayout::new(2, vec![]).unwrap(),
-            configured,
-            None,
-        )
-        .is_err()
+        vec![
+            (vec![TokenId(1)], None),
+            (vec![TokenId(2)], Some(TokenId(10)))
+        ]
     );
 }
 
@@ -813,8 +640,7 @@ fn retained_prefix_restores_position_into_a_fresh_extended_prompt() {
     assert_eq!(source.generated(), [TokenId(70)]);
     assert_eq!(source.constraint_position(), Some(1));
     assert_eq!(source.output_len(), 1);
-    let checkpoint = source.method_checkpoint(&mut UnusedRetainer).unwrap();
-
+    let checkpoint = source.method_checkpoint().unwrap();
     let mut extended = prompt;
     extended.extend([TokenId(80), TokenId(81)]);
     let mut fresh = Generation::new(
@@ -825,7 +651,6 @@ fn retained_prefix_restores_position_into_a_fresh_extended_prompt() {
     )
     .unwrap();
     fresh.restore_prefix(64, &checkpoint).unwrap();
-
     assert_eq!(fresh.prompt(), extended);
     assert_eq!(fresh.resident_position(), 64);
     assert_eq!(fresh.accepted_position(), 64);
@@ -860,45 +685,6 @@ fn retained_prefix_requires_an_exact_layout_boundary() {
 }
 
 #[test]
-fn causal_reconciliation_commits_the_final_sample_without_new_output() {
-    let prompt = (0..64).map(TokenId).collect::<Vec<_>>();
-    let mut configured = options();
-    configured.max_tokens = 1;
-    configured.context_limit = 128;
-    configured.vocabulary = 256;
-    let mut generation = Generation::new(
-        prompt.clone(),
-        InputLayout::new(prompt.len(), vec![]).unwrap(),
-        configured,
-        None,
-    )
-    .unwrap();
-    start(&mut generation, 64);
-    resolve(&mut generation, &[TokenId(70).0], None);
-    assert_eq!(generation.finish_reason(), Some(FinishReason::Length));
-    assert_eq!(generation.resident_position(), 64);
-    assert_eq!(generation.generated(), [TokenId(70)]);
-    assert_eq!(
-        generation.pending_reconciliation().unwrap(),
-        magnitude_generation::PendingReconciliation { start: 64, end: 65 }
-    );
-
-    generation.start_reconciliation(1).unwrap();
-    let reconciliation = generation.round_forward().unwrap();
-    assert_eq!(reconciliation.kind, WorkKind::Replay);
-    assert_eq!(reconciliation.tokens, [TokenId(70)]);
-    assert!(reconciliation.selects.is_empty());
-    generation.resolve_round(&[]).unwrap();
-    generation.commit_round(RequestId(1), None).unwrap();
-
-    assert_eq!(generation.resident_position(), 65);
-    assert_eq!(generation.finish_reason(), Some(FinishReason::Length));
-    assert_eq!(generation.generated(), [TokenId(70)]);
-    assert_eq!(generation.output_len(), 1);
-    assert!(generation.pending_reconciliation().is_none());
-}
-
-#[test]
 fn staged_causal_reconciliation_advances_after_finished_prefill() {
     let prompt = (0..64).map(TokenId).collect::<Vec<_>>();
     let mut configured = options();
@@ -914,20 +700,24 @@ fn staged_causal_reconciliation_advances_after_finished_prefill() {
     .unwrap();
     start(&mut generation, 64);
     let transition = generation
-        .prepare_round_transition(RequestId(1), &[TokenId(70)], None, &mut UnusedRetainer)
+        .prepare_round_transition(RequestId(1), &[TokenId(70)], None, &mut Rows)
         .unwrap();
     assert_eq!(transition.decision().accepted_rows, 64);
     generation.commit_transition(transition);
     assert_eq!(generation.finish_reason(), Some(FinishReason::Length));
     assert_eq!(generation.pending_reconciliation().unwrap().end, 65);
-
     generation.start_reconciliation(1).unwrap();
+    let reconciliation = generation.round_forward().unwrap();
+    assert_eq!(reconciliation.kind, WorkKind::Replay);
+    assert_eq!(reconciliation.tokens, [TokenId(70)]);
+    assert!(reconciliation.selects.is_empty());
     let transition = generation
-        .prepare_round_transition(RequestId(1), &[], None, &mut UnusedRetainer)
+        .prepare_round_transition(RequestId(1), &[], None, &mut Rows)
         .unwrap();
     assert_eq!(transition.decision().accepted_rows, 1);
     generation.commit_transition(transition);
     assert_eq!(generation.resident_position(), 65);
     assert!(generation.pending_reconciliation().is_none());
     assert_eq!(generation.generated(), [TokenId(70)]);
+    assert_eq!(generation.output_len(), 1);
 }
