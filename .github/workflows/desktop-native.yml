@@ -33,6 +33,11 @@ on:
       - "packages/daemon-management/src/desktop-native/fixtures/windows-*"
       - ".github/workflows/desktop-native.yml"
   workflow_dispatch:
+    inputs:
+      signed_mac_installer:
+        description: Exercise the custom installer with signed and notarized disposable macOS apps
+        type: boolean
+        default: false
   workflow_call:
 
 permissions:
@@ -64,10 +69,70 @@ jobs:
       - name: Build native bundle verification
         run: |
           bun install --frozen-lockfile --ignore-scripts
+          bun packages/version/scripts/generate-version.ts
           bun packages/daemon-management/scripts/build-native.ts
       - name: Exercise sealed bundle and nested signature verification
         working-directory: packages/daemon-management
-        run: bunx --bun vitest run src/desktop-native/mac-update-validation.test.ts src/desktop-native/mac-update-filesystem.test.ts src/desktop-native/mac-update-recovery.test.ts
+        run: >-
+          bunx --bun vitest run
+          src/desktop-native/mac-update-*.test.ts
+          src/desktop-native/mac-installer-helper.test.ts
+          src/desktop-native/mac-headless-installation-admission.test.ts
+          src/desktop-native/unix-continuation.test.ts
+          src/desktop-native/guarded-command.test.ts
+          src/application-update/mac-*.test.ts
+
+  macos-signed-installer:
+    if: github.event_name == 'workflow_dispatch' && inputs.signed_mac_installer
+    needs: macos-update-primitives
+    environment: apple-release
+    runs-on: blacksmith-12vcpu-macos-15
+    timeout-minutes: 90
+    env:
+      MAGNITUDE_APPLE_DISTRIBUTION: developer-id
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+      - run: |
+          bun install --frozen-lockfile --ignore-scripts
+          bun packages/version/scripts/generate-version.ts
+      - name: Import Apple signing credentials
+        run: bash packages/release/scripts/apple/credentials.sh
+        env:
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_NOTARY_API_KEY_P8: ${{ secrets.APPLE_NOTARY_API_KEY_P8 }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+      - name: Exercise signed private-helper installation and native publisher acceptance
+        env:
+          MAGNITUDE_HEADLESS_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/magnitude-headless-signed
+        run: bun packages/release/scripts/acceptance/test-mac-headless-installer.ts 2>&1 | tee "$RUNNER_TEMP/mac-headless-installer.log"
+      - name: Retain signed fixtures and verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-headless-installer-evidence
+          path: |
+            ${{ runner.temp }}/mac-headless-installer.log
+            ${{ runner.temp }}/magnitude-headless-signed/result.json
+            ${{ runner.temp }}/magnitude-headless-signed/*/artifacts/*.zip
+            ${{ runner.temp }}/magnitude-headless-signed/*/artifacts/*.json
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Remove temporary signing keychain
+        if: always()
+        run: |
+          if [ -n "${APPLE_RELEASE_KEYCHAIN:-}" ]; then
+            security delete-keychain "$APPLE_RELEASE_KEYCHAIN"
+          fi
 
   linux-native-ownership:
     strategy:
@@ -110,6 +175,7 @@ jobs:
         run: |
           systemctl --user show-environment > /dev/null
           bunx --bun vitest run src/desktop-native/native.test.ts src/desktop-native/owned-child.test.ts src/desktop-native/login-startup.test.ts
+          bunx --bun vitest run src/desktop-native/unix-continuation.test.ts src/desktop-native/guarded-command.test.ts src/desktop-native/linux-update-maintenance.test.ts src/desktop-native/linux-update-package.test.ts src/application-update/linux-foreground-update.test.ts
       - name: Exercise Linux process identity and exit races
         working-directory: packages/utils
         run: bunx --bun vitest run src/process-groups/exact-process.test.ts src/process-groups/exact-process-linux.test.ts

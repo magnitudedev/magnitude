@@ -94,6 +94,18 @@ admission and revalidates the retained lock and parent identities before mutatio
 extended access grants, substituted paths and observation failures are errors, not contention. The
 lease does not establish that an older application version participates in admission; migration must
 separately exclude prior-version owners before automatic replacement is enabled.
+A foreground installer continuation may explicitly retain only exclusive installation admission across
+exec. Adoption validates the inherited descriptor against the exact named installation lock, restores
+close-on-exec behavior and consumes that descriptor. Ordinary owner/service descriptors remain
+close-on-exec. Failed exec cancels the temporary inheritance without releasing the caller's original
+lease. Workspace adoption cannot authorize a different installation.
+The foreground installer executes from private storage outside the bundle being replaced. Preparation
+verifies the installed bundle, copies the finite runtime and installed publisher configuration, and
+verifies every copied code file against the compiled publisher requirement. It must not weaken trust
+for an unsigned build. The hidden entry point accepts only a bounded schema-checked request bound to
+its executing helper directory and consumes the inherited descriptor before running child commands.
+Only a foreground serve continuation or finite completion is permitted; it cannot launch a background
+server or interpret an arbitrary executable supplied in the request.
 
 macOS recovery validates a bounded, schema-checked journal bound to both retained parent identities
 and the installation name. Observed bundle identities determine the result: an unexecuted exchange is
@@ -107,6 +119,15 @@ bundle. Deletion stays within the retained private directory and cannot traverse
 partial deletion retains the terminal journal for retry. Cleanup removes and durably synchronizes the
 exact terminal receipt last, before another transaction can supersede its installed identity.
 Cleanup failure is distinct from an invalid installed bundle. Recovery itself preserves contents.
+Transaction discovery uses one private directory adjacent to each installed bundle, independent of
+user profile and download-cache location. Opening it requires exclusive installation admission and
+revalidates both its identity and its entry in the retained installation parent. Observation does not
+create staging. A new attempt may retire incomplete extracted content only while no transaction
+receipt exists; a published receipt requires reconciliation instead. Preparation is retired before
+the committed transaction receipt, so interrupted preparation cleanup can recover without repeating
+extraction or exchange. Lease identity is checked again at the native exchange boundary. Scope cleanup may unlink only the
+exact retained empty private directory and synchronizes its installation parent; nonempty or
+substituted directories remain available for reconciliation.
 
 Application binaries are distributed through GitHub Releases. Downloads must resolve to trusted
 release assets, and interrupted or invalid transfers must not publish a prepared installer.

@@ -11,6 +11,7 @@ import { serveWindowsApplicationControl } from "./windows-control"
 import { applicationNativeHostPath, makeApplicationService, type ApplicationRuntime, type ApplicationProfile } from "./application-bootstrap"
 import { acquireLinuxInstallationLease } from "./linux-installation-lease"
 import { isUpdateInstallationActive } from "./update-installation-lease"
+import { acquireMacApplicationInstallationLease, nativeMacUpdateAdmission } from "./mac-update-lease"
 import { MacApplicationInstallation, NativeMacApplicationInstallation } from "./mac-update-installation"
 import { ProcessGroupController } from "@magnitudedev/utils/process-groups"
 import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native"
@@ -44,6 +45,7 @@ export const runHeadlessApplication = (options: {
       const bundle = dirname(dirname(options.runtime.resourcesDirectory))
       const active = yield* Effect.flatMap(MacApplicationInstallation, installation => installation.isInstalling(bundle)).pipe(Effect.provide(NativeMacApplicationInstallation))
       if (active) return yield* new HeadlessApplicationFailed({ message: "A Magnitude update is being installed. Run `magnitude serve` when it finishes." })
+      yield* acquireMacApplicationInstallationLease(bundle).pipe(Effect.provide(nativeMacUpdateAdmission(addon)))
     }
   }
   if (yield* Deferred.isDone(stop)) return

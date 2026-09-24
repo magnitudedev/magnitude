@@ -1081,3 +1081,159 @@ phase7-linux-interruption-bounded.log and phase7-linux-final-startup.log.
 This is a substantial Linux checkpoint, not completion of all update work. Interactive authorization
 with terminal policies, complete RPM acceptance, macOS installer integration, Windows launcher
 packaging/integration, full release acceptance, live GUI regressions and remote inference remain open.
+
+### Phase 6 integration in progress: macOS owner installation admission
+
+Installed Desktop and Headless entry points now acquire the tested shared bundle installation lease
+before service initialization and retain it in their owner scope. Development remains outside this
+installed-bundle admission. Exclusive admission fails owner startup before update initialization;
+normal cancellation releases the shared lease. The fixed adjacent lock permits different profiles
+to participate in the same installation exclusion. Inaccessible or unsafe admission fails closed;
+installation provisioning and migration remain required before full release acceptance.
+
+Native headless integration plus existing native admission tests passed: 8 tests. The integration test
+runs actual headless owner admission against a disposable bundle and native addon, proves that an
+exclusive installer prevents initialization, proves the admitted owner excludes installation, then
+interrupts the owner and proves release. Desktop targeted typecheck exited 0. The first daemon-management
+typecheck identified the test fixture missing its SQLite layer; the fixture now provides the ordinary
+Bun SQLite layer, and its typecheck was rerun.
+Logs: /tmp/magnitude-headless-transfer/mac-owner-admission-tests.log,
+mac-owner-admission-desktop-types.log, mac-owner-admission-native-types.log. These changes remain
+uncommitted pending the larger macOS integration checkpoint; custom installer handoff, transaction
+discovery, prior-owner migration and packaged/GUI acceptance are still open.
+
+### Phase 6 integration in progress: discoverable macOS installation workspace
+
+Added one stable private transaction workspace adjacent to the installed bundle. Opening it retains
+exclusive installation admission, binds the staging entry to its native directory identity, and
+synchronizes its discovery entry before staging or journal publication. Observation does not create
+staging. Exchange rechecks lease identity at the filesystem capability boundary. Unpublished partial
+extraction can be cleared for an explicit retry; a published receipt must go through reconciliation.
+Native scope cleanup removes only the exact empty private workspace and syncs the parent. Nonempty,
+unsafe, unrelated or substituted entries are preserved.
+
+Prepared-install orchestration now composes saved archive verification, durable Attempted state,
+archive staging, verified exchange, recovery and terminal cleanup. It refuses an active prior native
+installation. Preparation retirement precedes removal of the committed transaction receipt: a failed
+preparation discard can be reconciled without another extraction or exchange. Cleanup failure after
+commit remains a cleanup warning rather than authorizing rollback. Actual helper/startup wiring and
+prior-version exclusion are still open; this does not enable automatic macOS replacement yet.
+
+Native regression run: 89 tests passed across transaction filesystem, recovery, workspace, prepared
+installation and headless admission. Follow-up expanded workspace/prepared-install tests: 12 passed,
+including substituted-directory protection and partial-extraction failure followed by explicit retry.
+The native addon rebuild passed. Targeted daemon-management typecheck passed after mapping lease
+validation failures into the filesystem capability's declared error channel. Logs are under
+/tmp/magnitude-headless-transfer: mac-workspace-native-build.log, mac-workspace-regressions.log,
+mac-workspace-completion-tests.log, mac-workspace-final-types.log. These tests use real filesystem
+exchanges and kernel leases with an injected bundle verifier/stager; production publisher, extraction
+and packaged acceptance remain separate gates. No additional checkpoint commit was made.
+
+### Phase 6 integration in progress: foreground installer admission transfer
+
+Added explicit macOS exclusive-lease transfer across exec. Preparing continuation duplicates only the
+exclusive installation descriptor for inheritance; ordinary descriptors remain close-on-exec. A fresh
+installer validates the inherited descriptor against the named lock and parent, consumes it, and
+retains a close-on-exec capability. Failed exec closes the temporary descriptor while retaining the
+original lease. Shared leases cannot prepare this transfer. Workspace composition accepts a retained
+exclusive capability only for its bound installation, so helper adoption need not reacquire its own
+already-held lock.
+
+A native process fixture executed original → installer → replacement with one PID, proved shared
+admission remained excluded inside the installer, and proved the replacement could acquire ordinary
+shared admission after the installer descriptor closed on exec. Repeated failed exec and invalid
+adoption inputs were also tested. Native rebuild and targeted daemon-management typecheck passed;
+22 lease/workspace/prepared-install tests passed. Logs: /tmp/magnitude-headless-transfer/
+mac-lease-handoff-build.log, mac-handoff-workspace-tests.log, mac-handoff-workspace-types.log.
+
+These remain integration primitives. Creating/authenticating the external helper, invoking the real
+CLI hidden entry point, automatic startup recovery, prior-owner migration and packaged publisher/GUI
+acceptance are not yet complete. No additional checkpoint commit was made.
+
+### Phase 6 integration in progress: private helper and hidden installer command
+
+Added scoped preparation of the external macOS installer runtime. It verifies the installed bundle,
+copies the CLI/native addon/command supervisor/extractor into private storage, checks every copied
+code file against the compiled publisher policy, and writes the decoded installed update trust
+configuration. Unsafe existing helper storage, linked runtime files, bundle-verification failure and
+copied-code verification failure refuse preparation; incomplete files are cleaned up. No unsigned
+publisher fallback was added.
+
+Added a bounded schema-checked hidden CLI installer entry point. Its request must match the executing
+private helper path and contain a valid inherited descriptor; continuation is finite completion or
+foreground serve arguments, never an arbitrary executable. Composition adopts the installation
+lease, acquires application maintenance, runs the prepared transaction using copied resources,
+retires the exact helper directory by native identity, then returns or execs the installed CLI.
+The foreground starter composes helper preparation and lease-preserving exec. It remains unwired to
+public startup/maintenance until prior-version exclusion and packaged acceptance are established.
+
+Validation: 27 helper-preparation/invocation tests passed; ordinary CLI regression suite 102 passed;
+daemon-management and CLI targeted typechecks exited 0. Logs under /tmp/magnitude-headless-transfer:
+mac-helper-command-tests.log, mac-helper-command-final-types.log, mac-installer-cli-types.log,
+mac-installer-cli-regression.log. Helper preparation tests inject signature verifiers; they establish
+copy/permission/cleanup orchestration, not production publisher acceptance. The hidden command has
+not yet passed a signed end-to-end packaged installation. No checkpoint commit was made.
+
+### macOS helper integration checkpoint and signed CI preparation
+
+The integrated chunk now contains shared owner admission, discoverable transaction workspace,
+prepared installation, exclusive lease transfer across exec, private helper preparation and the hidden
+CLI installer. Public automatic startup and finite maintenance are deliberately not connected until
+migration policy and signed acceptance are established. This checkpoint does not mark Phase 6 complete.
+
+Expanded native CI now runs the macOS helper/admission/continuation suites and the Linux foreground
+update/descendant-retirement suites. Added an explicitly dispatched signed macOS installer job in the
+existing Apple signing environment. Its new harness builds two complete signed/notarized applications
+with the standard bundle identity, a temporary publisher key and a loopback-only update origin; it
+publishes no release or hosted offer. It invokes the copied helper and real hidden CLI entry point,
+then checks replacement version, preparation/helper/transaction retirement, native signatures,
+notarization ticket and Gatekeeper. The producer accepts a supplied fixture configuration without
+changing existing hosted acceptance defaults. This signed job has not yet run successfully.
+
+Also corrected native updater observation for a user with no GUI launchd domain. On this Mac a
+lookup of a nonexistent GUI domain returned code 112 with its exact missing-domain diagnostic;
+that specific response now means absence. Unrelated diagnostics, another UID and other failures
+remain errors. Nine observation/headless admission tests passed.
+
+Local checkpoint validation: daemon-management 490 passed / 12 skips; expanded macOS CI selection
+155 passed / one Linux-only skip; CLI 102 passed in the preceding integration run; targeted
+daemon-management, CLI and release typechecks exited 0. Workflow YAML parsing and diff whitespace
+checks passed. Logs: /tmp/magnitude-headless-transfer/mac-helper-checkpoint-regression.log,
+mac-helper-checkpoint-types.log, mac-helper-checkpoint-release-types.log, mac-expanded-ci-tests.log,
+mac-no-gui-observation-tests.log. Local keychain still has zero valid signing identities. The remote
+Apple signing environment has no branch restriction or additional approval rule, so branch CI is the
+available production-signature path. A one-time reboot migration restriction has been raised as a
+product preference; no migration bypass or unproven process-absence assumption was enabled.
+
+A substantial checkpoint is being committed to let signed CI test this exact source tree. Signed
+end-to-end results, public startup/recovery wiring, migration, remaining platforms and full GUI/remote
+inference acceptance remain open.
+
+Checkpoint: cf9bf329, Connect macOS installer admission and private helper execution. The initial
+publication f21cdf57 failed workflow parsing before jobs ran because runner.temp was placed in a
+job-level environment field. That configuration correction was folded into the same checkpoint;
+actionlint 1.7.12 then passed. The branch update used an exact expected-SHA lease.
+Signed/native validation was successfully dispatched as GitHub Actions run 35947492258 against
+cf9bf32992c6ffc4189f4fd81ca02ff24cb720e4. Both Linux jobs passed; macOS failed because
+the fresh checkout lacked generated protocol identity, and Windows failed in the cache ACL fixture.
+The signed installer job was skipped because its native prerequisite failed.
+Run URL: https://github.com/magnitudedev/magnitude/actions/runs/35947492258.
+
+
+### Native CI fixture corrections within the macOS integration checkpoint
+
+Added version generation to both macOS CI setup paths. Repeated the expanded native selection in a
+fresh detached checkout using the corrected setup: 156 passed, one Linux-only skip. Actionlint and
+whitespace validation pass.
+
+The Windows cache fixture previously inherited arbitrary temporary-directory permissions. It now
+creates a parent with the recognized user/SYSTEM/Administrators inheritance and explicitly assigns
+the current-user owner to the child, independent of elevated-token defaults. The child ACL itself is
+still inherited. Recovery failure diagnostics now print the returned native status. Production ACL
+validation and recovery remain unchanged. On the Windows VM, the revised test compiled with /W4 /WX
+and passed. In a temporary directory with an additional Everyone grant, the old test reproduced the
+CI failure (exit 1 at cache retirement) while the corrected test passed (exit 0). This also preserves
+unknown-content refusal, old-byte retirement and repeatability assertions.
+
+These CI setup/fixture corrections are folded into the existing integration checkpoint to avoid a
+separate small checkpoint. Signed acceptance still requires a successful rerun.

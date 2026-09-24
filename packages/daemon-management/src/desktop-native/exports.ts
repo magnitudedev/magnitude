@@ -43,3 +43,5 @@ export { recoverWindowsUpdateDirectory, WindowsUpdateDirectoryFailed } from "./w
 
 export { ApplicationRuntime, ApplicationProfile, ApplicationRuntimeUnavailable, resolveInstalledApplicationRuntime, resolveApplicationProfile, applicationNativeHostPath, applicationServiceCommand, makeApplicationService } from "./application-bootstrap"
 export { makeUnixProcessContinuation, ForegroundContinuationFailed } from "./unix-continuation"
+
+export { acquireMacApplicationInstallationLease, nativeMacUpdateAdmission } from "./mac-update-lease"

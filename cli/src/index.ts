@@ -29,6 +29,10 @@ program.command("_complete-application-update", { hidden: true }).action(async (
   const { runLinuxUpdateHandoff } = await import("./startup/linux-update-installation")
   await runLinuxUpdateHandoff()
 })
+program.command("_install-mac-application-update", { hidden: true }).argument("<request>").action(async (request: string) => {
+  const { runMacApplicationInstallation } = await import("./startup/mac-installer")
+  await runMacApplicationInstallation(request)
+})
 program.command("_complete-mac-application-update", { hidden: true }).action(async () => {
   const { runMacUpdateHandoff } = await import("./startup/mac-update-installation")
   await runMacUpdateHandoff()

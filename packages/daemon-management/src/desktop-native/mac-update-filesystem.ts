@@ -15,6 +15,7 @@ export interface MacUpdateFilesystem {
   readonly inspect: (directory: MacUpdateDirectory, name: string) => Effect.Effect<Option.Option<MacFileIdentity>, MacUpdateFilesystemFailed>
   readonly removeRecord: (directory: MacUpdateDirectory, expected: Uint8Array) => Effect.Effect<void, MacUpdateFilesystemFailed>
   readonly readRecord: (directory: MacUpdateDirectory) => Effect.Effect<Option.Option<Uint8Array>, MacUpdateFilesystemFailed>
+  readonly removeEmptyDirectory: (parent: MacUpdateDirectory, name: string, child: MacUpdateDirectory) => Effect.Effect<boolean, MacUpdateFilesystemFailed>
   readonly sync: (directory: MacUpdateDirectory) => Effect.Effect<void, MacUpdateFilesystemFailed>
   readonly removeTree: (directory: MacUpdateDirectory, name: string, expected: MacFileIdentity) => Effect.Effect<void, MacUpdateFilesystemFailed>
   readonly syncTree: (directory: MacUpdateDirectory, name: string, expected: MacFileIdentity) => Effect.Effect<void, MacUpdateFilesystemFailed>
@@ -27,6 +28,7 @@ export const MacUpdateFilesystem = Context.GenericTag<MacUpdateFilesystem>("@mag
 interface Bindings {
   readonly openMacUpdateDirectory: (path: string, privateDirectory: boolean) => { readonly identity: unknown; readonly path: unknown }
   readonly closeMacUpdateDirectory: (directory: object) => void
+  readonly removeEmptyMacUpdateDirectory: (parent: object, name: string, child: object) => boolean
   readonly syncMacUpdateDirectory: (directory: object) => void
   readonly removeMacUpdateTree: (directory: object, name: string, expected: string) => void
   readonly syncMacUpdateTree: (directory: object, name: string, expected: string) => void
@@ -55,6 +57,7 @@ export const nativeMacUpdateFilesystem = (addonPath: string) => Layer.effect(Mac
       Effect.mapError(() => new MacUpdateFilesystemFailed())),
     removeRecord: (directory, expected) => attempt(() => native.removeMacUpdateRecord(directory[handle], Buffer.from(expected))),
     readRecord: directory => attempt(() => Option.fromNullable(native.readMacUpdateRecord(directory[handle]))),
+    removeEmptyDirectory: (parent, name, child) => attempt(() => native.removeEmptyMacUpdateDirectory(parent[handle], name, child[handle])),
     sync: directory => attempt(() => native.syncMacUpdateDirectory(directory[handle])),
     removeTree: (directory, name, expected) => attempt(() => native.removeMacUpdateTree(directory[handle], name, expected)),
     syncTree: (directory, name, expected) => attempt(() => native.syncMacUpdateTree(directory[handle], name, expected)),

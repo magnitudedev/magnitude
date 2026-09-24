@@ -29,6 +29,10 @@ admission. It retains PID, arguments, environment, working directory and termina
 ownership descriptors close on exec; the replacement must acquire ownership normally before starting
 a service. Failed exec leaves the caller alive to report failure and release its retained resources.
 No shell evaluates continuation arguments, and malformed or oversized input is rejected before exec.
+The macOS installer transition explicitly transfers exclusive installation admission across its first
+exec, then restores close-on-exec when the helper adopts it. The replacement owner reacquires normal
+admission after the installation transaction completes; installer exclusion cannot leak into service
+children.
 
 The lock file lives in a private local user directory. Never unlink or replace it during recovery.
 The kernel releases ownership when the owning process exits. Child processes must not inherit the
@@ -80,6 +84,11 @@ retain a nonblocking shared lease. Missing, unsafe or busy admission and an inst
 before service launch. The lease has a distinct native capability, releases idempotently with its
 scope, and is close-on-exec so children cannot prevent later package installation. It is independent
 of per-user application ownership.
+Installed macOS Desktop and Headless owners likewise retain shared installation admission after
+startup installation and before service creation, until their service trees retire. Admission is
+adjacent to the bundle so all user profiles share exclusion; an exclusive installer prevents owner
+admission. Unsafe or inaccessible admission fails before service creation. Development does not
+acquire an installed-bundle lease.
 Cold Windows application launch requires the caller's assigned interactive window station and its
 ordinary desktop. A noninteractive service or SSH session cannot create an unreachable tray owner.
 Native inspection failure is not permission to launch. This checks the assigned desktop rather than

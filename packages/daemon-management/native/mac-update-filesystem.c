@@ -102,6 +102,20 @@ static napi_value close_directory(napi_env env, napi_callback_info info) {
   if (!directory) return fail(env);
   release(directory); return nothing(env);
 }
+/* Retire only the exact private empty workspace; a nonempty transaction remains discoverable. */
+static napi_value remove_empty_directory(napi_env env, napi_callback_info info) {
+  napi_value args[3], result; size_t argc = 3; char name[NAME_MAX + 1]; struct stat named;
+  if (napi_get_cb_info(env, info, &argc, args, NULL, NULL) != napi_ok || argc != 3 || !leaf(env, args[1], name)) return fail(env);
+  update_directory *parent = unwrap(env, args[0], 1), *child = unwrap(env, args[2], 1);
+  if (!parent || !child || !child->private_directory ||
+      fstatat(parent->fd, name, &named, AT_SYMLINK_NOFOLLOW) || !same(named, child->identity)) return fail(env);
+  if (unlinkat(parent->fd, name, AT_REMOVEDIR)) {
+    if (errno != ENOTEMPTY && errno != EEXIST) return fail(env);
+    napi_get_boolean(env, false, &result); return result;
+  }
+  if (fsync(parent->fd)) return fail(env);
+  napi_get_boolean(env, true, &result); return result;
+}
 static napi_value sync_directory(napi_env env, napi_callback_info info) {
   napi_value arg; size_t argc = 1;
   if (napi_get_cb_info(env, info, &argc, &arg, NULL, NULL) != napi_ok || argc != 1) return fail(env);
@@ -332,6 +346,7 @@ void magnitude_register_mac_update_filesystem(napi_env env, napi_value exports) 
   napi_property_descriptor methods[] = {
     {"openMacUpdateDirectory", NULL, acquire, NULL, NULL, NULL, napi_default, NULL},
     {"closeMacUpdateDirectory", NULL, close_directory, NULL, NULL, NULL, napi_default, NULL},
+    {"removeEmptyMacUpdateDirectory", NULL, remove_empty_directory, NULL, NULL, NULL, napi_default, NULL},
     {"syncMacUpdateDirectory", NULL, sync_directory, NULL, NULL, NULL, napi_default, NULL},
     {"syncMacUpdateTree", NULL, sync_tree, NULL, NULL, NULL, napi_default, NULL},
     {"removeMacUpdateTree", NULL, remove_tree, NULL, NULL, NULL, napi_default, NULL},

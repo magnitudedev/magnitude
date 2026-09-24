@@ -12,3 +12,5 @@ export * from "./update-configuration"
 export * from "./installed-preparation"
 export * from "./headless-update"
 export * from "./linux-foreground-update"
+
+export { runMacInstallerCommand, MacInstallerRequest } from "./mac-installer-command"

@@ -51,6 +51,31 @@ describe.skipIf(process.platform !== "darwin")("macOS installation admission", (
     expect((yield* fs.stat(lock)).ino).toEqual(identity)
   })))
 
+  it("retains exclusive admission across installer exec and closes it before the replacement owner", () => run(Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-update-continuation-" })
+    const text = yield* Command.make(process.execPath,
+      fileURLToPath(new URL("./fixtures/mac-update-continuation.cjs", import.meta.url)), addon, root).pipe(Command.string, Effect.timeout("10 seconds"))
+    const result = JSON.parse(text)
+    expect(result.original).toBe(result.installer)
+    expect(result.installer).toBe(result.replacement)
+  })))
+
+  it("restores close-on-exec behavior after failed continuation and refuses invalid adoption", () => run(Effect.gen(function* () {
+    const { admission, bundle } = yield* fixture
+    yield* Effect.scoped(Effect.gen(function* () {
+      const lease = Option.getOrThrow(yield* admission.exclusive(bundle))
+      for (let attempt = 0; attempt < 2; attempt++) {
+        expect(yield* lease.replaceProcess("/absent/magnitude", [], {}).pipe(Effect.isFailure)).toBe(true)
+        yield* lease.validate
+      }
+    }))
+    expect(Option.isSome(yield* admission.exclusive(bundle))).toBe(true)
+    for (const descriptor of [-1, 0, 1, 2, 3.5, NaN, Infinity, 2147483648]) {
+      expect(yield* admission.adopt(bundle, descriptor).pipe(Effect.isFailure)).toBe(true)
+    }
+  })))
+
   it("keeps the same lock after replacing the bundle", () => run(Effect.gen(function* () {
     const { fs, admission, root, bundle, lock } = yield* fixture
     const retained = Option.getOrThrow(yield* admission.exclusive(bundle))

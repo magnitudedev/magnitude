@@ -36,7 +36,7 @@ import {
   LinuxTrayHost, linuxTrayHostLayer, guardedCommandLayer,
   unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory,
   nativeWindowsInstallerVerifier,
-  adoptLinuxInstallationLease,
+  adoptLinuxInstallationLease, acquireMacApplicationInstallationLease, nativeMacUpdateAdmission,
   MacUpdateHandoff, startMacUpdateHandoff, MacApplicationInstallation, PreparedUpdateStore, makePreparedUpdateStore, NativeMacApplicationInstallation, nativeMachineIdentity, ApplicationMemory, nativeApplicationMemoryLayer, observeApplicationMemory,
 } from "@magnitudedev/daemon-management/desktop-native"
 import { ProcessGroupController } from "@magnitudedev/utils/process-groups"
@@ -98,6 +98,8 @@ const program = Effect.scoped(Effect.gen(function* () {
       const installation = yield* MacApplicationInstallation
       return yield* installation.isInstalling(dirname(dirname(dirname(process.execPath))))
     }).pipe(Effect.provide(NativeMacApplicationInstallation))
+    yield* acquireMacApplicationInstallationLease(dirname(dirname(dirname(process.execPath)))).pipe(
+      Effect.provide(nativeMacUpdateAdmission(addonPath)))
   }
   yield* Effect.promise(() => app.whenReady())
   yield* Effect.sync(() => handleAppProtocol(resolveRendererDir(here)))

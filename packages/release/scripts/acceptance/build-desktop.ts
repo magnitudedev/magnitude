@@ -26,8 +26,9 @@ const run = Effect.gen(function* () {
   ))({ platform: process.platform, arch: process.arch })
   const output = resolve(yield* Config.string("MAGNITUDE_ACCEPTANCE_OUTPUT"))
   yield* fs.makeDirectory(output, { recursive: true })
-  const configPath = join(output, "update-acceptance.json")
-  yield* fs.writeFileString(configPath, yield* Schema.encode(Schema.parseJson(Schema.Struct({ origin: Schema.String, keyId: Schema.String, publicKey: Schema.String,
+  const suppliedConfiguration = yield* Config.option(Config.string("MAGNITUDE_ACCEPTANCE_CONFIG"))
+  const configPath = Option.getOrElse(suppliedConfiguration, () => join(output, "update-acceptance.json"))
+  if (Option.isNone(suppliedConfiguration)) yield* fs.writeFileString(configPath, yield* Schema.encode(Schema.parseJson(Schema.Struct({ origin: Schema.String, keyId: Schema.String, publicKey: Schema.String,
     windowsPublisher: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
   })) )({
     origin: "https://magnitude-update-acceptance.vercel.app",
@@ -57,7 +58,8 @@ const run = Effect.gen(function* () {
     if (cliVersion.trim() !== version) return yield* new AcceptanceBuildFailed({ message: "Application and bundled CLI versions differ" })
     if (target.platform === "darwin") {
       // Separate Launch Services identity; the executable, service and native installation path are real.
-      yield* command(["/usr/libexec/PlistBuddy", "-c", "Set :CFBundleIdentifier dev.magnitude.desktop.update-acceptance", join(app, "Contents/Info.plist")])
+      const standardIdentity = yield* Config.boolean("MAGNITUDE_ACCEPTANCE_STANDARD_BUNDLE_ID").pipe(Config.withDefault(false))
+      if (!standardIdentity) yield* command(["/usr/libexec/PlistBuddy", "-c", "Set :CFBundleIdentifier dev.magnitude.desktop.update-acceptance", join(app, "Contents/Info.plist")])
       yield* buildDesktopDmg({ app, output: join(output, "artifacts"), host: "darwin-arm64" })
     } else if (target.platform === "win32") {
       const thumbprint = yield* Config.string("MAGNITUDE_ACCEPTANCE_WINDOWS_CERTIFICATE")
