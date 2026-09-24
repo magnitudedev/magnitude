@@ -1,14 +1,14 @@
 import { BunContext } from "@effect/platform-bun"
-import { acquireUpdateInstallationLease, completeLinuxUpdateHandoff, installLinuxApplicationUpdate, LinuxUpdateHandoffRequest,
-  nativeHostLayer, relaunchLinuxAfterUpdate, unixPrivateFilePermissions } from "@magnitudedev/daemon-management/desktop-native"
+import { acquireUpdateInstallationLease, completeLinuxUpdateHandoff, installLinuxApplicationUpdate, guardLinuxInstallerParent, LinuxUpdateHandoffRequest,
+  nativeHostLayer, relaunchLinuxAfterUpdate, unixPrivateFilePermissions, guardedCommandLayer } from "@magnitudedev/daemon-management/desktop-native"
 import { Effect } from "effect"
 import { CLI_VERSION } from "../version"
 import { writeSync } from "node:fs"
 import { readUpdateHandoff, UpdateHandoffChannelFailed } from "./update-handoff-channel"
 
-export const runLinuxUpdateInstallation = (request: string) => Effect.runPromise(
-  installLinuxApplicationUpdate(request, CLI_VERSION).pipe(
-    Effect.provide(BunContext.layer),
+export const runLinuxUpdateInstallation = (request: string, parentStdin = false) => Effect.runPromise(
+  (parentStdin ? guardLinuxInstallerParent : Effect.void).pipe(Effect.zipRight(installLinuxApplicationUpdate(request, CLI_VERSION)),
+    Effect.provide([BunContext.layer, guardedCommandLayer("/usr/lib/magnitude-desktop/resources/magnitude-command")]),
     Effect.catchAll(error => Effect.sync(() => { process.stderr.write(`${error.message}\n`); process.exitCode = 1 })),
   ),
 )

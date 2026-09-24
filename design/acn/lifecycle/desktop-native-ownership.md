@@ -24,6 +24,12 @@ Only lock acquisition after the predecessor releases ownership permits replaceme
 during cold startup or teardown permits bounded retry; malformed replies and access failures remain
 errors. Lock acquisition is not service readiness.
 
+Unix foreground continuation after verified installation replaces the calling process before service
+admission. It retains PID, arguments, environment, working directory and terminal streams. Native
+ownership descriptors close on exec; the replacement must acquire ownership normally before starting
+a service. Failed exec leaves the caller alive to report failure and release its retained resources.
+No shell evaluates continuation arguments, and malformed or oversized input is rejected before exec.
+
 The lock file lives in a private local user directory. Never unlink or replace it during recovery.
 The kernel releases ownership when the owning process exits. Child processes must not inherit the
 lock. Explicit release is idempotent and occurs after owned-child shutdown. Filesystem or permission
@@ -95,10 +101,13 @@ Linux process-stat lookup treats ENOENT and ESRCH as process disappearance, incl
 opening and reading procfs. Other read failures remain observation failures; process disappearance
 alone still does not prove process-group retirement.
 
-Transient Unix shell probes also use a native lifetime-bound process group. A bundled helper retains
+Transient Unix commands also use a native lifetime-bound process group. A bundled helper retains
 the group until command output is drained; command exit is separate from group retirement. Parent
 death, cancellation, timeout, and output overflow retire the helper and all ordinary descendants,
-even when the command ignores termination or its shell has already exited. No probe acquires service
+even when the command ignores termination or its shell has already exited. On Linux, the helper
+retains and reaps descendants that create new process groups or sessions. Privileged package commands
+retain a caller lifetime channel across authorization; closing it retires the installer and its
+protected descendants. Interruption preserves package-manager repair state. No probe acquires service
 ownership or changes the application environment.
 
 Windows uses a parent-owned unnamed kill-on-close Job Object for children; a Unix watchdog is not

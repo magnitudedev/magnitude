@@ -25,5 +25,5 @@ export const renderApplicationUpdate = (state: DesktopUpdateState, owner: "Deskt
 
 export const runUpdate = (input: string) => runCommand({
   effect: Schema.decodeUnknown(ApplicationUpdateAction)(input).pipe(Effect.flatMap(action => updateApplication(action).pipe(Effect.map(result => ({ action, ...result }))))),
-  render: ({ action, state, owner }) => action === "install" ? "Magnitude is stopping its model and service to install the update and restart.\n" : action === "discard" ? "The prepared update was discarded.\n" : renderApplicationUpdate(state, owner),
+  render: ({ action, state, owner }) => action === "install" ? owner === "None" ? "The Magnitude update was installed.\n" : "Magnitude is stopping its model and service to install the update and restart.\n" : action === "discard" ? "The prepared update was discarded.\n" : renderApplicationUpdate(state, owner),
 })

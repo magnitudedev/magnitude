@@ -21,9 +21,9 @@ registerInferenceCommands(program)
 registerConnectionsCommand(program)
 registerUpdateCommand(program)
 registerDocsCommand(program)
-program.command("_install-application-update", { hidden: true }).argument("<request>").action(async request => {
+program.command("_install-application-update", { hidden: true }).argument("<request>").option("--parent-stdin").action(async (request, options) => {
   const { runLinuxUpdateInstallation } = await import("./startup/linux-update-installation")
-  await runLinuxUpdateInstallation(request)
+  await runLinuxUpdateInstallation(request, options.parentStdin === true)
 })
 program.command("_complete-application-update", { hidden: true }).action(async () => {
   const { runLinuxUpdateHandoff } = await import("./startup/linux-update-installation")

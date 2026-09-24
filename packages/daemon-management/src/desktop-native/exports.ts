@@ -23,7 +23,7 @@ export { makeWindowsOwnedChildSpawner } from "./windows-owned-child"
 export { requireServicePort } from "./service-port"
 export { ApplicationMemory, nativeApplicationMemoryLayer, observeApplicationMemory } from "./application-memory"
 export { nativeMachineIdentity } from "./machine-identity"
-export { installLinuxApplicationUpdate } from "./linux-update-maintenance"
+export { installLinuxApplicationUpdate, guardLinuxInstallerParent } from "./linux-update-maintenance"
 export { LinuxPackageUpdate } from "./linux-update-package"
 export { relaunchLinuxAfterUpdate, LinuxUpdateHandoffRequest, startLinuxUpdateHandoff, completeLinuxUpdateHandoff } from "./linux-update-handoff"
 export { relaunchWindowsAfterUpdate, WindowsUpdateHandoffRequest, startWindowsUpdateHandoff, completeWindowsUpdateHandoff } from "./windows-update-handoff"
@@ -42,3 +42,4 @@ export { NetworkPreferences, NetworkPreferencesFailed, makeNetworkPreferences, l
 export { recoverWindowsUpdateDirectory, WindowsUpdateDirectoryFailed } from "./windows-update-directory"
 
 export { ApplicationRuntime, ApplicationProfile, ApplicationRuntimeUnavailable, resolveInstalledApplicationRuntime, resolveApplicationProfile, applicationNativeHostPath, applicationServiceCommand, makeApplicationService } from "./application-bootstrap"
+export { makeUnixProcessContinuation, ForegroundContinuationFailed } from "./unix-continuation"

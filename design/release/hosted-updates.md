@@ -42,6 +42,19 @@ removal. These commands do not modify the automatic-download preference or insta
 Cancellation retires scoped transfer work; it cannot publish a partial prepared installer. Existing
 prepared or failed installation state is retained until explicit installation retry or discard.
 
+An explicit Linux installation without an owner holds maintenance and installation admission while
+the installed privileged package helper runs. Terminal authorization may prompt only with an
+interactive terminal; unattended execution uses noninteractive authorization. The helper validates
+the authorizing user's identity and installed publisher trust. Success requires both successful
+package installation and the replacement CLI reporting the prepared version before retained state
+is removed. Cancellation retires privileged installation descendants, cannot report success or clear
+an attempted installation, and preserves package-manager repair state when replacement was interrupted.
+Linux Headless startup considers only unattempted preparation before acquiring shared installation
+admission or starting a service. It checks authorization for the exact installed helper without a
+prompt; unavailable authorization retains preparation and permits ordinary startup. An admitted
+installation must complete and verify replacement before the foreground process executes the new
+CLI with the same invocation. Failed or interrupted attempts are never automatically retried.
+
 Updates must match the application platform and release channel. The client verifies release
 signatures, downloaded file integrity, and applicable native publisher signatures before
 installation. Failed checks or verification must not be reported as successful updates.

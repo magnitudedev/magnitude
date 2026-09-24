@@ -4,6 +4,7 @@ import { createHash, type KeyObject } from "node:crypto"
 import { join } from "node:path"
 import { LINUX_DESKTOP_PACKAGE_NAME } from "@magnitudedev/release/executables"
 import { acceptsUpdateRelease, UpdateRelease, verifyUpdateRelease } from "@magnitudedev/release/hosted-update"
+import { GuardedCommand } from "./guarded-command"
 
 export const LinuxPackageUpdate = Schema.Struct({
   release: UpdateRelease,
@@ -26,6 +27,7 @@ export const makeLinuxPackageInstaller = (options: {
 }) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const executor = yield* CommandExecutor.CommandExecutor
+  const guarded = yield* GuardedCommand
   return LinuxPackageInstaller.of({ install: request => Effect.scoped(Effect.gen(function* () {
     if (process.platform !== "linux" || process.getuid?.() !== 0 || !Number.isSafeInteger(options.callerUid) || options.callerUid <= 0) {
       return yield* new LinuxPackageUpdateFailed({ message: "Package installation requires system authorization from your desktop session." })
@@ -70,11 +72,12 @@ export const makeLinuxPackageInstaller = (options: {
       || !identity[1]!.startsWith(versionPrefix) || !/^[1-9][0-9]*$/.test(identity[1]!.slice(versionPrefix.length))) {
       return yield* new LinuxPackageUpdateFailed({ message: "The package identity does not match the signed Magnitude release." })
     }
-    const install = target.package === "deb"
-      ? Command.make("/usr/bin/apt-get", "install", "--yes", "--no-remove", "--", archive).pipe(Command.env({ DEBIAN_FRONTEND: "noninteractive", NEEDRESTART_MODE: "l" }))
-      : Command.make("/usr/bin/dnf", "--assumeyes", "install", archive)
-    const status = yield* executor.exitCode(install.pipe(Command.stdout("inherit"), Command.stderr("inherit")))
-    if (status !== 0) return yield* new LinuxPackageUpdateFailed({ message: "The system package manager could not install Magnitude. Check its installation details before retrying." })
+    const environment = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined))
+    const result = yield* (target.package === "deb"
+      ? guarded.run("/usr/bin/apt-get", ["install", "--yes", "--no-remove", "--", archive], { ...environment, DEBIAN_FRONTEND: "noninteractive", NEEDRESTART_MODE: "l" })
+      : guarded.run("/usr/bin/dnf", ["--assumeyes", "install", archive], environment))
+    yield* Effect.sync(() => { process.stdout.write(result.stdout); process.stderr.write(result.stderr) })
+    if (result.code !== 0) return yield* new LinuxPackageUpdateFailed({ message: "The system package manager could not install Magnitude. Check its installation details before retrying." })
   })).pipe(Effect.mapError(error => error instanceof LinuxPackageUpdateFailed ? error
     : new LinuxPackageUpdateFailed({ message: "The signed application package could not be verified or installed." }))) })
 })

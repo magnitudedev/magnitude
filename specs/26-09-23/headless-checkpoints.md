@@ -914,3 +914,170 @@ Final logs under `/tmp/magnitude-headless-transfer`: `phase7-checkpoint-daemon-t
 `phase7-checkpoint-cli-tests.log`, `phase7-checkpoint-desktop-tests.log` (initial failure),
 `phase7-checkpoint-desktop-retest.log`, `phase7-checkpoint-daemon-types.log`, and
 `phase7-checkpoint-cli-types.log`. This checkpoint is not cross-platform production acceptance.
+
+### Phase 7 working results after c5fb3742: Linux foreground completion
+
+Uncommitted. Explicit no-owner Linux install now retains maintenance plus per-user installation
+admission, verifies the retained archive, durably records the attempt, and waits for sudo to run the
+installed privileged package entry. Interactive stdin/stderr permit terminal authorization; otherwise
+sudo uses noninteractive mode. Completion requires a successful helper exit and the installed CLI
+reporting the prepared release before discard. Installer/version failures retain failed state;
+interruption retains the attempted record. No Desktop is launched. The existing root-only installed
+entry now accepts sudo's invoking-user identity as well as its existing authorization identity,
+rejecting absent, invalid, root and conflicting identities before touching the request.
+
+Nineteen targeted tests passed on Mac (8 completion/order/failure/cancellation, 11 authorization
+identity). On the Ubuntu arm64 VM the same tests plus 7 privileged package-verification tests passed
+(26 total). These mock package execution; actual sudo/package replacement is still an open gate.
+VM was reachable, noninteractive sudo returned uid 0, installed CLI reported 0.1.5 and no service
+process was observed. Shared-runtime and CLI typechecks passed after resolving the expanded Effect
+requirements in CLI composition. Log: `/tmp/magnitude-headless-transfer/phase7-linux-native-tests.log`.
+Startup exec/continuation, cancellation during an actual package transaction and authorization-denied
+VM acceptance remain unfinished. No additional commit was made.
+
+### Phase 7 working results: real Linux finite package transaction
+
+Ubuntu arm64 disposable VM now exercised the compiled CLI's actual no-owner `update install` path
+through sudo, the root-only installed helper, publisher/hash/package identity verification and apt.
+Compiled A reported 0.1.5. The signed prepared package contained compiled B reporting 0.1.6; the
+finite command exited 0 and printed installation completion only after B version verification.
+The prepared record was retired, the package-manager transaction marker was absent, and no Desktop
+or service process was observed. The original VM application payload is retained under
+`/home/trg.guest/magnitude-headless.uAol17lC/phase7-package/original`; the Mac installation and Sparky
+were untouched. The installed VM is now a disposable 0.1.6 package fixture, not a production release.
+
+Package: `magnitude-desktop_0.1.6-1_arm64.deb`, 193336508 bytes,
+SHA-256 `e16f4ec88af1fe7ec485a729eac3562d73c762a566a70f987835140f49ce1b05`.
+The fixture reused the installed graphical/service payload with the newly compiled CLI to isolate
+this transaction. It does not prove matched-release Desktop or inference acceptance. Local ephemeral
+publisher trust was installed only in this test VM. Initial packaging failed because an installed
+payload omits the packager's expected LICENSE input; the fixture used the installed copyright file
+and the corrected packaging run passed the normal package identity/permission validation.
+
+Logs under `/tmp/magnitude-headless-transfer`: `phase7-linux-cli-build.log`,
+`phase7-linux-package-build.log` (initial fixture failure), `phase7-linux-package-rebuild.log`,
+`phase7-linux-real-install.log`. Startup exec, actual transaction interruption, denied authorization
+and repeated A→B→C remain open. No checkpoint commit was made.
+
+### Phase 7 working results: Unix foreground replacement
+
+Uncommitted native continuation performs exec with explicit bounded arguments/environment, rejects
+embedded NULs and invalid environment entries, and leaves the caller alive if exec fails. It never
+uses a shell for dispatch. The Effect adapter exposes failure without introducing a waiting parent
+or detached replacement. Native ownership descriptors remain close-on-exec; replacement reacquires
+normal admission before starting service work.
+
+Native builds and two process-level tests passed on Mac arm64 and Ubuntu arm64. The fixture executes
+the real Bun runtime again and verifies equal PID, exact literal argument, cwd, explicit environment,
+stdin and stderr preservation, and successful acquisition of the old process's ownership lock after
+exec. Malformed input and nonexistent executable tests return errors without terminating the caller.
+Linux evidence: `/tmp/magnitude-headless-transfer/phase7-linux-continuation.log`; Mac build:
+`phase7-unix-continuation-build.log`. This primitive is not yet wired to startup installation;
+package-manager cancellation and same-invocation A→B→C serving remain open. No commit was made.
+
+### Phase 7 working results: real Linux startup installation and continuation
+
+Uncommitted startup composition now runs after application ownership but before the shared Linux
+installation lease and service creation. It considers only unattempted retained releases, checks
+noninteractive sudo authorization for the exact installed helper, and defers without changing the
+record if unavailable. Authorized startup retains the per-user installation lease, waits for verified
+completion, then executes the replacement CLI with the original invocation/environment. The native
+continuation adapter is loaded before replacement. Stop signals race startup work; a completed stop
+cannot proceed to service admission. Failed installation/exec propagates rather than starting an
+uncertain old runtime. Both affected package typechecks passed.
+
+Executed on Ubuntu arm64 using a real generated deb, current compiled CLI A 0.1.5 and matched CLI/
+service B 0.1.6. A single `magnitude serve` invocation (PID 36493) installed B, retired the prepared
+record and exec'd the installed replacement without changing PID. Health then reported service
+0.1.6, revision 46, RPC 2, Ready (service PID 36784); ordinary CLI status reported Headless Ready
+0.1.6. The first service startup log followed apt completion. SIGTERM returned exit 0; subsequent
+process observation found no Desktop/service and the package transaction marker was absent.
+Installed package is now fixture 0.1.6-2. The graphical payload was retained from the original VM
+installation and was not launched; this proves headless update continuation, not graphical release
+acceptance or inference generation.
+
+Package `magnitude-desktop_0.1.6-2_arm64.deb`: 193340462 bytes,
+SHA-256 `fc7ffb03497ab628886aa9cc28a35b295a672ac16660342421dd4e86ab479c4f`.
+VM fixture `/home/trg.guest/magnitude-headless.uAol17lC/phase7-startup` retains build inputs and log.
+Host logs: `/tmp/magnitude-headless-transfer/phase7-linux-startup-build.log` and
+`phase7-linux-startup-acceptance.log`; type logs `phase7-startup-cli-types.log` and
+`phase7-startup-native-types.log`. Repeated B→C, denied authorization, cancellation during package
+replacement and system-manager lifetime tests remain open. No commit was made.
+
+### Phase 7 working results: denied Linux authorization and repeated startup update
+
+The Ubuntu fixture now passed the second real startup replacement, B 0.1.6→C 0.1.7, following the
+previous A→B run. A temporary validated sudoers rule denied only the installed update-helper command.
+With C prepared, startup retained the Unattempted record and served B (foreground PID 39854,
+service PID 39866, service identity ik7pg9vhiman). A live `magnitude update install` returned the
+stop-first failure; subsequent health preserved both service PID and identity. No update ran while
+that server was alive. The denied server stopped cleanly.
+
+After the temporary rule was removed, the next invocation (PID 39938) installed C and exec'd the
+replacement under that same PID. Service Ready reported version 0.1.7, revision 46, RPC 2, PID 40230;
+the prepared record was retired. Shutdown returned 0. Independent follow-up confirmed the test rule
+was absent, the package transaction marker was absent, installed CLI reported 0.1.7 and no Desktop/
+service process remained. Native replacement identity was checked against `/proc/<foreground>/exe`.
+
+Package `magnitude-desktop_0.1.7-1_arm64.deb`: 193340452 bytes,
+SHA-256 `48c47d248e2a270a3a0d738b837943da894ee639b537c686f6bcad4a26d1c9ca`.
+Logs: `/tmp/magnitude-headless-transfer/phase7-linux-c-build.log` and
+`phase7-linux-denied-and-c.log`. These use matched compiled CLI/service fixtures and the retained
+original graphical payload; no graphical or model-generation claim. Actual mid-install cancellation,
+system-manager cleanup and full release acceptance remain open. No commit was made.
+
+### Phase 7 working results: Linux service-manager lifetime
+
+Real Ubuntu user-systemd acceptance passed with KillMode=control-group, Restart=no and a bounded
+stop timeout. A hardened unit with NoNewPrivileges=yes could not authorize installation, retained
+the Unattempted 0.1.8 preparation and reached Ready on 0.1.7 (MainPID 40425, service 40439). A normal
+unit then installed 0.1.8 and continued with unchanged MainPID 40509; service 40817 reported Ready
+0.1.8. Both foreground and service processes were verified in their respective unit cgroups.
+Stopping each unit returned Result=success and ExecMainStatus=0; captured PIDs disappeared. Follow-up
+showed both units inactive, no package transaction marker, and installed CLI version 0.1.8.
+
+Package `magnitude-desktop_0.1.8-1_arm64.deb`: 193340460 bytes,
+SHA-256 `5823163973aa7d0a7c06e586edfcc558347051f72c0f513c076f1b1bc32431ce`.
+Logs: `/tmp/magnitude-headless-transfer/phase7-linux-d-build.log` and `phase7-linux-systemd.log`.
+This covers normal completion and managed shutdown after readiness, plus hardened-unit authorization
+deferral. It does not cover interruption during package mutation, which remains open. No commit.
+
+### Phase 7 checkpoint: Linux startup installation and bounded cancellation
+
+Implemented finite Linux installation and startup-only installation before service admission. The
+replacement preserves the foreground PID and invocation. Startup defers without prompting when
+system authorization is unavailable; live servers reject installation. Explicit installation verifies
+both the signed package and the installed CLI version before retiring preparation.
+
+A paused real deb pre-install script exposed two cancellation defects: privileged descendants outlived
+the foreground process, and a never-ending command-input stream retained the foreground runtime.
+The privileged installer now retains a caller lifetime pipe; package commands run under the native
+command supervisor. Linux supervision adopts and reaps descendants even when package tools create
+new sessions. Scoped input completion releases the command-input pump. Earlier failed fixture runs
+were repaired through dpkg before further acceptance; they are not counted as passing tests.
+
+Final interruption acceptance used systemd MainPID 42853 and captured eleven cgroup processes during
+actual package mutation. Stop returned Result=success and ExecMainStatus=0. All captured processes
+retired within 33 ms after stop returned. Preparation remained Attempted, the installation marker
+remained present, and the prior CLI remained 0.1.8. This deliberately requires package-manager repair;
+it cannot be silently retried as an unattempted update. The test allows up to three seconds for native
+asynchronous descendant retirement and checks actual process state, rather than relying on unit state.
+
+After repairing the disposable VM, the final code installed fixture 0.1.9 from 0.1.8 in one startup.
+Foreground PID 43010 continued into the installed replacement; service PID 43316 reached Ready with
+version 0.1.9, revision 46, RPC 2. The prepared record was removed only after successful verification.
+Ordinary CLI status reported Headless Ready 0.1.9. SIGTERM returned 0. Package control version is
+0.1.9-6; fixture filename remains magnitude-desktop_0.1.9-1_arm64.deb, 169554508 bytes,
+SHA-256 c47f4c5e4a244c9765c6d0aff70bafba8cc077db5b11dc8952627038ecd21799.
+The graphical payload is retained fixture content; this does not prove graphical release acceptance.
+
+Validation: macOS daemon-management 446 passed / 12 platform skips; CLI 102 passed; Desktop 227 passed /
+2 skips. Linux targeted suite 30 passed, including real native same-PID exec and escaped-session child
+retirement. Both affected package typechecks exited 0 with existing advisory diagnostics. macOS and
+Linux native builds passed. Logs are under /tmp/magnitude-headless-transfer: phase7-daemon-regression.log,
+phase7-cli-regression.log, phase7-desktop-regression.log, phase7-linux-final-tests.log,
+phase7-linux-interruption-bounded.log and phase7-linux-final-startup.log.
+
+This is a substantial Linux checkpoint, not completion of all update work. Interactive authorization
+with terminal policies, complete RPM acceptance, macOS installer integration, Windows launcher
+packaging/integration, full release acceptance, live GUI regressions and remote inference remain open.

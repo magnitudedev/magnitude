@@ -24,6 +24,7 @@ export const runHeadlessApplication = (options: {
   readonly stop: Effect.Effect<void>
   readonly observe: (state: OwnedServiceState) => Effect.Effect<void>
   readonly initializeUpdates?: Effect.Effect<ApplicationUpdate, never, Scope.Scope>
+  readonly prepareStartup?: Effect.Effect<void, { readonly message: string }, Scope.Scope>
   readonly updateReady?: (version: string) => Effect.Effect<void>
 }) => Effect.scoped(Effect.gen(function* () {
   const stop = yield* Deferred.make<void>()
@@ -34,6 +35,9 @@ export const runHeadlessApplication = (options: {
   const owner = yield* acquireApplicationOwner(options.stateDirectory, { _tag: "Headless" })
   if (owner._tag !== "Owner") return yield* new HeadlessApplicationFailed({ message: "Magnitude is already running." })
   if (yield* isUpdateInstallationActive(options.stateDirectory)) return yield* new HeadlessApplicationFailed({ message: "A Magnitude update is being installed. Run `magnitude serve` when it finishes." })
+  if (yield* Deferred.isDone(stop)) return
+  if (options.prepareStartup) yield* Effect.raceFirst(options.prepareStartup, Deferred.await(stop))
+  if (yield* Deferred.isDone(stop)) return
   if (options.runtime._tag === "Installed") {
     if (process.platform === "linux") yield* acquireLinuxInstallationLease(addon)
     if (process.platform === "darwin") {

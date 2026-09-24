@@ -8,6 +8,7 @@ import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { PublisherKeyId, signUpdateManifest, UpdateManifest } from "../../../release/src/hosted-update/manifest"
 import { makeLinuxPackageInstaller } from "./linux-update-package"
+import { GuardedCommand } from "./guarded-command"
 
 const uid = process.getuid!()
 afterEach(() => vi.unstubAllGlobals())
@@ -47,14 +48,13 @@ describe("privileged Linux application package verification", () => {
           expect(await readFile(command.args.at(-1)!)).toEqual(bytes)
           return `${scenario === "identity" ? "another-package" : "magnitude-desktop"}\t2.0.0-42\tarm64`
         }),
-        exitCode: command => Effect.sync(() => {
+      }), Effect.provideService(GuardedCommand, {
+        run: (command, args, environment) => Effect.sync(() => {
           installed = true
-          expect(command._tag).toBe("StandardCommand")
-          if (command._tag === "StandardCommand") {
-            expect(command.command).toBe("/usr/bin/apt-get")
-            expect(command.args.slice(0, 4)).toEqual(["install", "--yes", "--no-remove", "--"])
-          }
-          return CommandExecutor.ExitCode(scenario === "package-manager" ? 100 : 0)
+          expect(command).toBe("/usr/bin/apt-get")
+          expect(args.slice(0, 4)).toEqual(["install", "--yes", "--no-remove", "--"])
+          expect(environment.DEBIAN_FRONTEND).toBe("noninteractive")
+          return { code: scenario === "package-manager" ? 100 : 0, stdout: "", stderr: "" }
         }),
       }), Effect.provide(BunContext.layer)))
       expect(result._tag).toBe(scenario === "valid" ? "Right" : "Left")

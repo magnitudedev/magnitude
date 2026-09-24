@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <wchar.h>
@@ -47,6 +48,58 @@ static napi_value failure(napi_env env, const char *message) {
   napi_throw_error(env, NULL, message);
   return NULL;
 }
+
+#ifndef _WIN32
+static char *continuation_string(napi_env env, napi_value value, size_t *budget) {
+  size_t length = 0, written = 0;
+  if (napi_get_value_string_utf8(env, value, NULL, 0, &length) != napi_ok || length > *budget) return NULL;
+  char *text = malloc(length + 1);
+  if (!text) return NULL;
+  if (napi_get_value_string_utf8(env, value, text, length + 1, &written) != napi_ok ||
+      written != length || memchr(text, 0, length)) { free(text); return NULL; }
+  *budget -= length;
+  return text;
+}
+
+/* Replacement retains the caller's PID, cwd and stdio; ownership descriptors stay close-on-exec. */
+static napi_value replace_process(napi_env env, napi_callback_info info) {
+  napi_value input[3]; size_t argc = 3, budget = 1024 * 1024;
+  uint32_t argument_count = 0, environment_count = 0;
+  bool array = false;
+  char *path = NULL, **arguments = NULL, **environment = NULL;
+  const char *message = "Invalid foreground continuation";
+  if (napi_get_cb_info(env, info, &argc, input, NULL, NULL) != napi_ok || argc != 3) goto done;
+  path = continuation_string(env, input[0], &budget);
+  if (!path || path[0] != '/') goto done;
+  if (napi_is_array(env, input[1], &array) != napi_ok || !array ||
+      napi_get_array_length(env, input[1], &argument_count) != napi_ok || argument_count > 4096) goto done;
+  if (napi_is_array(env, input[2], &array) != napi_ok || !array ||
+      napi_get_array_length(env, input[2], &environment_count) != napi_ok || environment_count > 4096) goto done;
+  arguments = calloc((size_t)argument_count + 2, sizeof(char *));
+  environment = calloc((size_t)environment_count + 1, sizeof(char *));
+  if (!arguments || !environment) goto done;
+  arguments[0] = path;
+  for (uint32_t i = 0; i < argument_count; i++) {
+    napi_value value;
+    if (napi_get_element(env, input[1], i, &value) != napi_ok ||
+        !(arguments[i + 1] = continuation_string(env, value, &budget))) goto done;
+  }
+  for (uint32_t i = 0; i < environment_count; i++) {
+    napi_value value;
+    if (napi_get_element(env, input[2], i, &value) != napi_ok ||
+        !(environment[i] = continuation_string(env, value, &budget))) goto done;
+    const char *separator = strchr(environment[i], '=');
+    if (!separator || separator == environment[i]) goto done;
+  }
+  execve(path, arguments, environment);
+  message = "Could not execute the updated application";
+done:
+  if (arguments) { for (uint32_t i = 1; i <= argument_count; i++) free(arguments[i]); free(arguments); }
+  if (environment) { for (uint32_t i = 0; i < environment_count; i++) free(environment[i]); free(environment); }
+  free(path);
+  return failure(env, message);
+}
+#endif
 
 static void release_lock(owner_lock *lock) {
   if (lock->released) return;
@@ -334,6 +387,13 @@ static napi_value interactive_desktop(napi_env env, napi_callback_info info) {
 #endif
 
 #ifdef __linux__
+/* Authorization changes credentials; the privileged command must retain its caller's lifetime. */
+static napi_value guard_installer(napi_env env, napi_callback_info info) {
+  if (getuid() != 0 || geteuid() != 0) return failure(env, "Installer lifetime guard requires system authorization");
+  if (getpgrp() != getpid() && setpgid(0, 0) != 0) return failure(env, "Cannot isolate the installer process group");
+  return guard(env, info);
+}
+
 static const napi_type_tag installation_lease_tag = { UINT64_C(0x9ea889074de74b31), UINT64_C(0xbd86372f62d16d50) };
 
 /* A foreground host opens its own shared admission; it has no inherited desktop launcher. */
@@ -402,7 +462,11 @@ static napi_value init(napi_env env, napi_value exports) {
     {"acquireLock", NULL, acquire, NULL, NULL, NULL, napi_default, NULL},
     {"releaseLock", NULL, release, NULL, NULL, NULL, napi_default, NULL},
     {"guardParent", NULL, guard, NULL, NULL, NULL, napi_default, NULL},
+#ifndef _WIN32
+    {"replaceProcess", NULL, replace_process, NULL, NULL, NULL, napi_default, NULL},
+#endif
 #ifdef __linux__
+    {"guardInstallerParent", NULL, guard_installer, NULL, NULL, NULL, napi_default, NULL},
     {"acquireInstallationLease", NULL, acquire_installation_lease, NULL, NULL, NULL, napi_default, NULL},
     {"releaseInstallationLease", NULL, release_installation_lease, NULL, NULL, NULL, napi_default, NULL},
     {"adoptInstallationLease", NULL, adopt_installation_lease, NULL, NULL, NULL, napi_default, NULL},
