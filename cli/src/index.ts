@@ -33,10 +33,7 @@ program.command("_install-mac-application-update", { hidden: true }).argument("<
   const { runMacApplicationInstallation } = await import("./startup/mac-installer")
   await runMacApplicationInstallation(request)
 })
-program.command("_complete-mac-application-update", { hidden: true }).action(async () => {
-  const { runMacUpdateHandoff } = await import("./startup/mac-update-installation")
-  await runMacUpdateHandoff()
-})
+
 program.command("_complete-windows-application-update", { hidden: true }).action(async () => {
   const { runWindowsUpdateHandoff } = await import("./startup/windows-update-installation")
   await runWindowsUpdateHandoff()

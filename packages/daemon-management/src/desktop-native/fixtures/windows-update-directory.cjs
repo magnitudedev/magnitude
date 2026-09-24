@@ -19,8 +19,8 @@ try {
   fs.unlinkSync(updates)
   fs.mkdirSync(updates, { mode: 0o700 })
   // Keep inherited permissions, but make ownership independent of elevated-token defaults.
-  const ownerScript = "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; $p=$env:MAGNITUDE_TEST_CACHE; $a=Get-Acl -LiteralPath $p; " +
-    "$a.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User); Set-Acl -LiteralPath $p -AclObject $a"
+  const ownerScript = "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; $p=$env:MAGNITUDE_TEST_CACHE; $a=[IO.Directory]::GetAccessControl($p); " +
+    "$a.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User); [IO.Directory]::SetAccessControl($p,$a)"
   execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(ownerScript, 'utf16le').toString('base64')],
     { env: { ...process.env, MAGNITUDE_TEST_CACHE: updates } })
   const child = path.join(updates, 'desktop-update-abc123')

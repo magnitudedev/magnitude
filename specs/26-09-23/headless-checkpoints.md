@@ -1315,3 +1315,28 @@ retaining the update and printing permission guidance. Recovery cannot take that
 This substantial checkpoint connects macOS foreground installation/recovery and finite maintenance;
 Desktop updater replacement, full signed public-command acceptance and remaining platform work are
 still open. It does not declare the whole phase complete.
+
+### Desktop custom installer integration checkpoint
+
+Signed run 35949905805 passed the public finite A-to-B and serve-startup B-to-C scenarios at
+b127a73a, including Ready Headless ownership, graceful shutdown, matching executable versions,
+private storage retirement and publisher acceptance. Log: mac-signed-public-installer-ci.log in
+/tmp/magnitude-headless-transfer. Native Mac and both Linux jobs passed. The Windows job failed
+because its fixture inherited a PowerShell module path incompatible with the child shell. The
+fixture now uses the .NET ACL API directly; Node and pinned Bun passed in the disposable Windows
+VM with an intentionally unavailable module path. Production directory validation is unchanged.
+
+Desktop now prepares the same archive as the CLI and closes its owned resources before entering the
+shared installer. Startup handles pending installation/recovery before starting a service; explicit
+installation preserves window visibility through the private helper. Removed the replaced staging
+and handoff implementations. The signed harness adds a third replacement through Desktop startup;
+that new signed continuation scenario remains pending at this checkpoint.
+
+Desktop typechecking and production bundle assembly passed. Desktop tests passed 222 with two
+platform skips; daemon-management passed 498 with 12 platform skips. Targeted release checking
+passed. Logs: desktop-custom-update-tests.log, mac-desktop-shared-installer-tests.log and
+ desktop-update-release-types.log under the transfer directory. An initial shell test failure under
+local Bun 1.3.14 was reproduced and diagnosed; it passes with the project-pinned Bun 1.4.2, including
+the full Desktop suite. Temporary instrumentation was removed without changing shell behavior.
+This checkpoint completes the Desktop wiring, not final signed Desktop acceptance or the remaining
+Windows/package-script/remote inference gates.

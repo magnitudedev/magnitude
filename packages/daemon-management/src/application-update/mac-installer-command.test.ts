@@ -19,6 +19,10 @@ describe("macOS private installer invocation", () => {
   it("accepts recovery as distinct from another installation attempt", async () => {
     expect((await Effect.runPromise(decode({ ...request, operation: "Recover" }))).request.operation).toBe("Recover")
   })
+  it.each([true, false])("preserves desktop visibility %s", async showWindow => {
+    expect((await Effect.runPromise(decode({ ...request, continuation: { _tag: "Desktop", showWindow } }))).request.continuation)
+      .toEqual({ _tag: "Desktop", showWindow })
+  })
   it.each([undefined, "0", "2", "-1", "3.5", "1e2", "03", "2147483648", "12suffix"])("rejects descriptor %s", async descriptor => {
     expect(await Effect.runPromise(decodeMacInstallerInvocation(JSON.stringify(request), executable, descriptor).pipe(Effect.isFailure))).toBe(true)
   })

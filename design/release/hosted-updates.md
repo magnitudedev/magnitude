@@ -105,8 +105,11 @@ verifies the installed bundle, copies the finite runtime and installed publisher
 verifies every copied code file against the compiled publisher requirement. It must not weaken trust
 for an unsigned build. The hidden entry point accepts only a bounded schema-checked request bound to
 its executing helper directory and consumes the inherited descriptor before running child commands.
-Only a foreground serve continuation or finite completion is permitted; it cannot launch a background
-server or interpret an arbitrary executable supplied in the request.
+Continuation is a foreground serve invocation, Desktop with its retained visibility intent, or finite
+completion. It cannot launch a background server or interpret an arbitrary executable supplied in
+the request. Desktop finishes service shutdown and closes its application scope before reacquiring
+maintenance admission and executing the private installer. The installed desktop then acquires a new
+owner lifetime normally; its replacement is not delegated to Electron's updater.
 The request distinguishes explicit installation from transaction recovery. Recovery may continue with
 the verified preserved installation; an explicit installation that preserves the old bundle reports
 failure instead of claiming the requested update succeeded.

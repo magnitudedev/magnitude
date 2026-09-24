@@ -7,9 +7,7 @@ import { resolveQuitFailure } from "./quit-failure"
 import { buildApplicationMenu } from "./application-menu"
 import { buildTrayMenu } from "./tray-menu"
 import { initializeLoginStartup, makeLoginStartup, WINDOWS_APPLICATION_ID } from "./login-startup"
-import { ApplicationUpdateFailed, ApplicationUpdateSource, makeApplicationUpdate, unavailableApplicationUpdate, readLinuxUpdateMetadata, makeUpdateIdentity, makeUpdateSchedule, makeLinuxUpdateSource, makeWindowsUpdateSource } from "@magnitudedev/daemon-management/application-update"
-import { macUpdateSource } from "./mac-update-source"
-import { NativeMacUpdate, nativeMacUpdate } from "./mac-update-stage"
+import { ApplicationUpdateFailed, ApplicationUpdateSource, makeApplicationUpdate, unavailableApplicationUpdate, readLinuxUpdateMetadata, makeUpdateIdentity, makeUpdateSchedule, makeLinuxUpdateSource, makeWindowsUpdateSource, hostedUpdateSource, startMacForegroundInstallation, macStartupUpdateOperation } from "@magnitudedev/daemon-management/application-update"
 import { PreparedUpdateInstaller, reconcilePreparedUpdate, installPreparedUpdate, type UpdateInstallationIntent } from "@magnitudedev/daemon-management/application-update"
 import { isNewerVersion } from "@magnitudedev/release"
 import { ReleaseTarget, UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
@@ -23,7 +21,7 @@ import { makeHarnessConnectionService, resolveHarnessConnectionPaths, harnessExe
 import { HttpsUrlSchema } from "@magnitudedev/sdk"
 import { slate } from "@magnitudedev/client-common"
 import { DESKTOP_APP_ORIGIN, handleAppProtocol, resolveRendererDir } from "./app-protocol"
-import { app, autoUpdater, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, powerMonitor, shell, Tray } from "electron"
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, powerMonitor, shell, Tray } from "electron"
 import { join, resolve, dirname } from "node:path"
 import { homedir } from "node:os"
 import { fileURLToPath } from "node:url"
@@ -37,7 +35,7 @@ import {
   unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory,
   nativeWindowsInstallerVerifier,
   adoptLinuxInstallationLease, acquireMacApplicationInstallationLease, nativeMacUpdateAdmission,
-  MacUpdateHandoff, startMacUpdateHandoff, MacApplicationInstallation, PreparedUpdateStore, makePreparedUpdateStore, NativeMacApplicationInstallation, nativeMachineIdentity, ApplicationMemory, nativeApplicationMemoryLayer, observeApplicationMemory,
+  acquireApplicationMaintenance, acquireUpdateInstallationLease, MacApplicationInstallation, PreparedUpdateStore, makePreparedUpdateStore, NativeMacApplicationInstallation, nativeMachineIdentity, ApplicationMemory, nativeApplicationMemoryLayer, observeApplicationMemory,
 } from "@magnitudedev/daemon-management/desktop-native"
 import { ProcessGroupController } from "@magnitudedev/utils/process-groups"
 import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native"
@@ -71,6 +69,8 @@ let systemShutdownRequested = false
 let earlyQuitRequested = false
 let restartPreparedUpdate: ((intent: UpdateInstallationIntent) => Effect.Effect<"Started" | "Deferred", ApplicationUpdateFailed>) | undefined
 let startupUpdateStarted = false
+let startupMacUpdate = false
+let macUpdateOperation: "Install" | "Recover" = "Install"
 let startupUpdateDeferred = false
 let reopenAfterUpdate = false
 let requestQuit: () => void = () => { earlyQuitRequested = true }
@@ -78,10 +78,6 @@ app.on("before-quit", event => { if (!exiting) { event.preventDefault(); request
 // OS-requested termination must retire the owned service before Electron exits.
 if (process.platform !== "win32") process.on("SIGTERM", () => requestQuit())
 app.on("window-all-closed", () => {})
-// Electron may emit a late native error after a staging observer has completed. Keep an
-// application-lifetime listener so it remains diagnostic rather than an unhandled event.
-if (process.platform === "darwin") autoUpdater.on("error", error => console.error("Application update:", error.message))
-
 const program = Effect.scoped(Effect.gen(function* () {
   const native = yield* NativeHost
   if (process.platform === "linux" && app.isPackaged) yield* adoptLinuxInstallationLease(addonPath)
@@ -165,19 +161,30 @@ const program = Effect.scoped(Effect.gen(function* () {
             cliPath: join(process.resourcesPath, "magnitude.exe"), addonPath }).pipe(
               Effect.provide([nativeWindowsInstallerVerifier(addonPath, publisher.value), privateFiles]))
         }
-        return yield* macUpdateSource({ ...options, bundle: dirname(dirname(dirname(process.execPath))), cliPath: join(process.resourcesPath, "magnitude"), addonPath }).pipe(Effect.provideService(NativeMacUpdate, nativeMacUpdate(autoUpdater)), Effect.provideService(MacUpdateHandoff, { start: startMacUpdateHandoff }), Effect.provide(privateFiles))
+        return { source: yield* hostedUpdateSource(options, (archive, release) => store.prepare(archive, release).pipe(
+          Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })))), installer: undefined }
       }).pipe(Effect.provideService(PreparedUpdateStore, store), Effect.provide(NodeContext.layer))
-      restartPreparedUpdate = intent => installPreparedUpdate(intent).pipe(
-        Effect.provideService(PreparedUpdateStore, store), Effect.provideService(PreparedUpdateInstaller, platform.installer))
+      restartPreparedUpdate = platform.installer ? intent => installPreparedUpdate(intent).pipe(
+        Effect.provideService(PreparedUpdateStore, store), Effect.provideService(PreparedUpdateInstaller, platform.installer!)) : undefined
       const saved = yield* store.read
       if (startupUpdateDeferred) {
-        // ShipIt may still be finishing the relaunch of the successfully installed version.
+        // A previously admitted native installer may still be completing its relaunch.
         if (Option.isSome(saved) && !isNewerVersion(saved.value.release.version, app.getVersion())) startupUpdateDeferred = false
         else return unavailableApplicationUpdate("An application update is being installed.")
       }
+      if (process.platform === "darwin" && !earlyQuitRequested) {
+        const operation = yield* macStartupUpdateOperation(dirname(dirname(process.resourcesPath)), app.getVersion()).pipe(
+          Effect.provideService(PreparedUpdateStore, store), Effect.provide(NodeContext.layer))
+        if (Option.isSome(operation)) {
+          startupMacUpdate = true
+          macUpdateOperation = operation.value
+          reopenAfterUpdate = !background
+          return unavailableApplicationUpdate("Completing the prepared application update.")
+        }
+      }
       let pending = yield* reconcilePreparedUpdate(app.getVersion()).pipe(Effect.provideService(PreparedUpdateStore, store))
       if (Option.isSome(pending) && pending.value.installation._tag === "Unattempted" && !earlyQuitRequested) {
-        const attempted = yield* restartPreparedUpdate({ continuation: { _tag: "Desktop", showWindow: !background }, allowAuthorizationPrompt: !background }).pipe(Effect.either)
+        const attempted = yield* restartPreparedUpdate!({ continuation: { _tag: "Desktop", showWindow: !background }, allowAuthorizationPrompt: !background }).pipe(Effect.either)
         startupUpdateStarted = attempted._tag === "Right" && attempted.right === "Started"
         pending = yield* store.read
       }
@@ -188,6 +195,7 @@ const program = Effect.scoped(Effect.gen(function* () {
       Effect.catchAll(() => Effect.succeed(unavailableApplicationUpdate("Application update setup could not be read."))),
     )
   if (startupUpdateDeferred) return "Quit" as const
+  if (startupMacUpdate) return "InstallMacUpdate" as const
   if (startupUpdateStarted) return "RestartUpdate" as const
   const updateSchedule = yield* makeUpdateSchedule(updates.check)
   const resumeUpdates = () => run(updateSchedule.resume)
@@ -418,6 +426,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     const stopped = yield* service.shutdown.pipe(Effect.either)
     if (stopped._tag === "Right") {
       if (systemShutdownRequested || intent === "Quit") return "Quit" as const
+      if (intent === "RestartUpdate" && process.platform === "darwin") return "InstallMacUpdate" as const
       if (intent === "Relaunch" || !restartPreparedUpdate) return "Relaunch" as const
       const installation = yield* restartPreparedUpdate({ continuation: { _tag: "Desktop", showWindow: reopenAfterUpdate }, allowAuthorizationPrompt: true }).pipe(Effect.either)
       if (installation._tag === "Left") yield* Effect.logError(installation.left.message)
@@ -438,8 +447,24 @@ Effect.runPromiseExit(program).then(Exit.match({
     exiting = true
     // `args` replaces the argument list, so keep the original ones (the app directory in development).
     if (intent === "Relaunch") app.relaunch({ args: [...process.argv.slice(1).filter(argument => argument !== "--background"), ...(reopenAfterUpdate ? [] : ["--background"])] })
-    // Native staging happens only during installation. Squirrel applies on ordinary exit;
-    // the admitted helper preserves profile and window intent when relaunching afterward.
+    if (intent === "InstallMacUpdate") {
+      const install = Effect.scoped(Effect.gen(function* () {
+        const stateDirectory = yield* applicationStateDirectory({ platform: process.platform, dataDirectory: dataDir, override: Option.fromNullable(stateOverride) })
+        yield* acquireApplicationMaintenance(stateDirectory)
+        yield* acquireUpdateInstallationLease(stateDirectory)
+        const architecture = yield* Schema.decodeUnknown(Schema.Literal("arm64", "x64"))(process.arch)
+        return yield* startMacForegroundInstallation({ resources: process.resourcesPath, stateDirectory, dataDirectory: dataDir,
+          version: app.getVersion(), architecture, operation: macUpdateOperation, continuation: { _tag: "Desktop", showWindow: reopenAfterUpdate } })
+      })).pipe(Effect.provide([NodeContext.layer, nativeHostLayer(addonPath)]))
+      void Effect.runPromiseExit(install).then(result => {
+        if (Exit.isFailure(result)) {
+          console.error(Cause.pretty(result.cause))
+          if (reopenAfterUpdate) dialog.showErrorBox("Magnitude could not install the update", "The update remains pending. Open Magnitude and try again.")
+        }
+        app.quit()
+      })
+      return
+    }
     app.quit()
   },
   onFailure: cause => {

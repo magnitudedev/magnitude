@@ -31,7 +31,6 @@ export { PreparedUpdate, UpdateInstallation, PreparedUpdateStore, PreparedUpdate
 export { acquireUpdateInstallationLease, isUpdateInstallationActive } from "./update-installation-lease"
 export { UpdatePreferences, UpdatePreferencesFailed, makeUpdatePreferences } from "./update-preferences"
 
-export { MacUpdateHandoff, MacUpdateHandoffRequest, MacUpdateHandoffFailed, startMacUpdateHandoff, relaunchMacAfterUpdate } from "./mac-update-handoff"
 
 export { previousInstallationUpgrade } from "./previous-installation-live"
 

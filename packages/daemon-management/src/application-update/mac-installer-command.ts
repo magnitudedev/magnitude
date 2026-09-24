@@ -21,7 +21,7 @@ const Path = Schema.NonEmptyString.pipe(Schema.maxLength(4096), Schema.filter(pa
 export const MacInstallerRequest = Schema.Struct({
   protocol: Schema.Literal(1), bundle: Path.pipe(Schema.endsWith(".app")), stateDirectory: Path, dataDirectory: Path,
   operation: Schema.Literal("Install", "Recover"),
-  continuation: Schema.Union(Schema.TaggedStruct("None", {}), Schema.TaggedStruct("Foreground", {
+  continuation: Schema.Union(Schema.TaggedStruct("None", {}), Schema.TaggedStruct("Desktop", { showWindow: Schema.Boolean }), Schema.TaggedStruct("Foreground", {
     arguments: Schema.Array(Schema.String.pipe(Schema.maxLength(4096), Schema.filter(value => !value.includes("\0")))).pipe(
       Schema.minItems(1), Schema.maxItems(4096), Schema.filter(args => args[0] === "serve")),
   })),
@@ -72,5 +72,7 @@ export const runMacInstallerCommand = (payload: string, version: string) => Effe
     nativeMacBundleVerifier(addon), NativeMacApplicationInstallation, guardedCommandLayer(join(directory, "magnitude-command")), unixPrivateFilePermissions])))
   if (result._tag !== "Installed" && request.operation === "Install") return yield* new ApplicationUpdateFailed({ message: "The previous installation was preserved. Retry the update explicitly." })
   if (request.continuation._tag === "Foreground") return yield* continuation.replace(join(request.bundle, "Contents/Resources/magnitude"), request.continuation.arguments, process.env)
+  if (request.continuation._tag === "Desktop") return yield* continuation.replace(join(request.bundle, "Contents/MacOS/Magnitude"),
+    request.continuation.showWindow ? [] : ["--background"], process.env)
   yield* Effect.sync(() => { process.stdout.write(result._tag === "Installed" ? "The Magnitude update was installed.\n" : "Application update recovery completed.\n") })
 }).pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })))
