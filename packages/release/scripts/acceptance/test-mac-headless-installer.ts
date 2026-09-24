@@ -3,6 +3,7 @@ import { BunContext, BunRuntime } from "@effect/platform-bun"
 import { Config, Effect, Schema } from "effect"
 import { generateKeyPairSync } from "node:crypto"
 import { join, resolve } from "node:path"
+import { acceptanceInferenceInstallation } from "./inference-installation"
 import { appleSigning, signAppleCode } from "../apple/signing"
 import { compileAppleBun } from "../apple/compile-bun"
 import { desktopUpdateArchive } from "../../src/targets"
@@ -24,6 +25,7 @@ const run = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const output = resolve(yield* Config.string("MAGNITUDE_HEADLESS_ACCEPTANCE_OUTPUT"))
   yield* fs.makeDirectory(output, { mode: 0o700 })
+  const inference = yield* acceptanceInferenceInstallation(join(output, "inference"))
   const keys = yield* Effect.sync(() => generateKeyPairSync("ed25519"))
   const config = join(output, "configuration.json")
   yield* fs.writeFileString(config, yield* Schema.encode(Schema.parseJson(Configuration))({ origin: "http://127.0.0.1:9", keyId: "isolated", publicKey: keys.publicKey.export({ type: "spki", format: "pem" }).toString() }), { mode: 0o600 })
@@ -40,7 +42,7 @@ const run = Effect.gen(function* () {
   yield* command("/usr/bin/ditto", ["-x", "-k", join(output, versions[0], "artifacts", desktopUpdateArchive("darwin-arm64")), installed])
   const bundle = join(installed, "Magnitude.app"), resources = join(bundle, "Contents/Resources")
   const stateDirectory = join(output, "state"), dataDirectory = join(output, "profile")
-  const environment = { MAGNITUDE_DEV_DATA_DIR: dataDirectory, MAGNITUDE_DESKTOP_STATE_DIR: stateDirectory, MAGNITUDE_DEV_PORT: "11237" }
+  const environment = { MAGNITUDE_DEV_DATA_DIR: dataDirectory, MAGNITUDE_DESKTOP_STATE_DIR: stateDirectory, MAGNITUDE_DEV_PORT: "11237", MAGNITUDE_ICN_PATH: inference }
   const harness = join(output, "installer-entry")
   yield* compileAppleBun(join(import.meta.dir, "mac-foreground-installer-entry.ts"), harness, "bun-darwin-arm64", "cli")
   yield* signAppleCode(harness, "dev.magnitude.installer-acceptance", "bun")

@@ -25,9 +25,11 @@ const build = Effect.gen(function* () {
     if (process.arch !== "x64" || !library || !existsSync(library)) {
       return yield* new NativeBuildFailed({ message: "Windows x64 native build requires Visual Studio C++ tools and MAGNITUDE_NODE_LIBRARY pointing to a verified x64 node.lib" })
     }
-    yield* Effect.async<void, NativeBuildFailed>(resume => {
-      const child = spawn("pwsh", ["-NoProfile", "-File", resolve(root, "scripts/build-windows-native.ps1"),
-        "-Headers", headers, "-NodeLibrary", library, "-Output", output], { stdio: "inherit" })
+    for (const args of [
+      [resolve(root, "scripts/build-windows-native.ps1"), "-Headers", headers, "-NodeLibrary", library, "-Output", output],
+      [resolve(root, "scripts/build-windows-cli-launcher.ps1"), "-Output", resolve(output, "..", "magnitude-launcher.exe")],
+    ]) yield* Effect.async<void, NativeBuildFailed>(resume => {
+      const child = spawn("pwsh", ["-NoProfile", "-File", ...args], { stdio: "inherit" })
       child.once("error", error => resume(Effect.fail(new NativeBuildFailed({ message: error.message }))))
       child.once("exit", code => resume(code === 0 ? Effect.void : Effect.fail(new NativeBuildFailed({ message: `Windows native build exited ${code}` }))))
       return Effect.sync(() => { if (child.exitCode === null) child.kill() })

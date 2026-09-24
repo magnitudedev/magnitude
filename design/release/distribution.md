@@ -76,7 +76,10 @@ script lifetimes; launches fail with repair guidance until configuration succeed
 installation never becomes an independently running service. The lock inode survives reinstall.
 Package abort hooks must preserve a healthy old installation after a rejected upgrade. Debian's
 `postinst abort-upgrade` and `abort-remove` release the gate after the package manager restores the
-old installation; a refusal before gate acquisition does not acquire or clear another owner's gate.
+old installation; a Debian refusal before gate acquisition does not acquire or clear another owner's gate.
+RPM removal refusal retains the repair gate because DNF can still remove automatic dependencies
+from the failed transaction. The existing owner continues running, but subsequent startup requires
+package reinstallation to restore dependencies and clear the gate.
 `/usr/bin/magnitude-desktop` is the graphical launch entry; `/usr/bin/magnitude` resolves the
 bundled headless CLI. Login registration remains a user preference controlled
 by the running application. Package installation does not register an independent daemon or
@@ -125,10 +128,15 @@ The concrete host dependency contracts are defined in
 
 ## Desktop-owned command registration
 
-The installed desktop exposes its bundled CLI directly. macOS silently creates the user-owned
+The installed desktop exposes its bundled CLI. macOS silently creates the user-owned
 `~/.magnitude/bin/magnitude` link on installed-app launch and prepends that directory using marked
-shell configuration entries. It never requests administrator authorization. Windows registers the
-bundled CLI directory in the current user's PATH. Linux retains its package-owned
+shell configuration entries. It never requests administrator authorization. Windows registers a
+private native launcher outside the replaceable application tree in the current user's PATH. The
+launcher resolves the matched bundled CLI on each invocation and retains foreground command ownership
+across a startup update. Launcher publication preserves mapped prior images under distinct retired
+names; a later installation removes them after their commands exit. Retrying setup repairs an
+interrupted publication. Uninstall defers while retired images are mapped or the command directory
+contains unrelated files. Linux retains its package-owned
 `/usr/bin/magnitude` link. App replacement keeps the command pointed at the matching bundled
 version. No npm launcher is required.
 

@@ -38,6 +38,10 @@ on:
         description: Exercise the custom installer with signed and notarized disposable macOS apps
         type: boolean
         default: false
+      signed_windows_installer:
+        description: Exercise Windows packaged startup updates with a disposable test publisher
+        type: boolean
+        default: false
   workflow_call:
 
 permissions:
@@ -114,7 +118,12 @@ jobs:
       - name: Exercise signed private-helper installation and native publisher acceptance
         env:
           MAGNITUDE_HEADLESS_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/magnitude-headless-signed
-        run: bun packages/release/scripts/acceptance/test-mac-headless-installer.ts 2>&1 | tee "$RUNNER_TEMP/mac-headless-installer.log"
+          MAGNITUDE_ACCEPTANCE_ICN_VERSION: "0.1.5"
+        shell: bash
+        run: |
+          set -o pipefail
+          bun packages/release/scripts/acceptance/test-mac-headless-installer.ts 2>&1 | tee "$RUNNER_TEMP/mac-headless-installer.log"
+          test -s "$MAGNITUDE_HEADLESS_ACCEPTANCE_OUTPUT/result.json"
       - name: Retain signed fixtures and verification evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -211,7 +220,7 @@ jobs:
 
   windows-job-containment:
     runs-on: blacksmith-8vcpu-windows-2025
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -247,6 +256,9 @@ jobs:
       - name: Compile and exercise native ownership and Node/Bun pipe interoperability
         shell: pwsh
         run: ./packages/daemon-management/scripts/test-windows-native.ps1 -Headers $env:MAGNITUDE_NODE_HEADERS -NodeLibrary $env:MAGNITUDE_NODE_LIBRARY
+      - name: Verify foreground installation admission and failed-update retention
+        working-directory: packages/daemon-management
+        run: bunx --bun vitest run src/application-update/windows-foreground-update.test.ts
 
       - name: Exercise Rust atomic child creation and descendant retirement
         working-directory: inference
@@ -277,3 +289,17 @@ jobs:
           if ($failure -notmatch 'Magnitude desktop is not installed at' -or $failure -match 'invalid\\environment-profile') { throw 'CLI did not resolve the missing desktop through the native known folder.' }
           if (Test-Path $env:MAGNITUDE_DESKTOP_STATE_DIR) { throw 'Missing installation created ownership state.' }
           exit 0
+      - name: Exercise signed Windows finite and foreground updates
+        if: github.event_name == 'workflow_dispatch' && inputs.signed_windows_installer
+        shell: pwsh
+        env:
+          MAGNITUDE_HEADLESS_ACCEPTANCE_OUTPUT: C:\magnitude-headless-test
+          MAGNITUDE_ACCEPTANCE_ICN_VERSION: "0.1.5"
+        run: ./packages/release/scripts/acceptance/test-windows-headless.ps1
+      - name: Retain Windows packaged update evidence
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.signed_windows_installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-headless-installer-evidence
+          path: C:\magnitude-headless-test\result.json
+          if-no-files-found: warn

@@ -25,7 +25,7 @@ function Assert-Version([string]$Version) {
 }
 $environment = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
 $originalPath = $environment.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
-$cliDirectory = Join-Path $installation 'resources'
+$cliDirectory = Join-Path $env:LOCALAPPDATA 'Programs\Magnitude CLI'
 function Assert-CliPath {
   $expected = if ([string]::IsNullOrEmpty($originalPath)) { $cliDirectory } else { "$cliDirectory;$originalPath" }
   if ($environment.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) -cne $expected) { throw 'Installer PATH registration differs' }
@@ -69,7 +69,7 @@ Copy-Item -LiteralPath $next -Destination (Join-Path $data 'updates\magnitude-se
 $release = @{ version='1.2.4'; bytes=(Get-Item $next).Length; sha256=(Get-FileHash $next -Algorithm SHA256).Hash.ToLowerInvariant(); signature=('A' * 86 + '==') }
 # This inert installer fixture exercises native ownership and handoff, not publisher cryptography.
 @{ release=$release; installation=@{_tag='Attempted'} } | ConvertTo-Json -Depth 5 -Compress | Set-Content -Encoding utf8 (Join-Path $data 'updates\update.json')
-$request = @{ stateDirectory=$state; helperDirectory=$prepared; dataDirectory=$data; applicationPath=(Join-Path $installation 'Magnitude.exe'); showWindow=$false; release=$release }
+$request = @{ stateDirectory=$state; helperDirectory=$prepared; dataDirectory=$data; applicationPath=(Join-Path $installation 'Magnitude.exe'); continuation=@{_tag="Desktop"; showWindow=$false}; release=$release }
 
 $start = [Diagnostics.ProcessStartInfo]::new($helper)
 $start.WorkingDirectory = $prepared

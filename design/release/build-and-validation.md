@@ -103,7 +103,7 @@ admission, model reload, and worker cleanup.
 An independent Windows consumer extracts and runs the final archives, checks their metadata,
 and exercises engine readiness and parent-loss shutdown before candidate assembly can pass.
 Production Windows packaging uses Artifact Signing with an explicit publisher identity. Owned code,
-the embedded uninstaller, and the final installer are signed and timestamped before checksums are
+the native CLI launcher, the embedded uninstaller, and the final installer are signed and timestamped before checksums are
 recorded. Publisher and signature validation fail the build; missing credentials cannot produce a
 production installer. Bundling preserves the signed CLI and service bytes from their archives.
 Local unsigned builds carry no production trust claim.

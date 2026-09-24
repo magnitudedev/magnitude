@@ -178,12 +178,25 @@ stageFailed:
   SetErrorLevel 1
   Abort "Setup could not complete. Installation files were retained for recovery. Close applications using them and run setup again."
 installed:
-  System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::ConfigureCliPath(w "$INSTDIR\resources", w "${REGKEY}", i 0) i .r0'
+  System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::InstallCliLauncher(w "$INSTDIR\resources\magnitude-launcher.exe", w "$LOCALAPPDATA\Programs\Magnitude CLI") i .r0'
+  ${If} $0 != 0
+    SetErrorLevel 1
+    Abort "Magnitude is installed, but its command could not be published (code $0). Run setup again to repair it."
+  ${EndIf}
+  ReadRegStr $9 HKCU "${REGKEY}" "OwnedCliPath"
+  ${If} $9 == "$INSTDIR\resources"
+    System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::ConfigureCliPath(w "$INSTDIR\resources", w "${REGKEY}", i 1) i .r0'
+    ${If} $0 != 0
+      SetErrorLevel 1
+      Abort "The previous command registration could not be retired (code $0). Run setup again."
+    ${EndIf}
+  ${EndIf}
+  System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::ConfigureCliPath(w "$LOCALAPPDATA\Programs\Magnitude CLI", w "${REGKEY}", i 0) i .r0'
   ${If} $0 != 0
     SetErrorLevel 1
     Abort "Magnitude is installed, but its command could not be added to PATH (code $0). Run setup again to repair command registration."
   ${EndIf}
-  System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::RemovePreviousCliCommands(w "$INSTDIR\resources", w .r8, i 1024) i .r0'
+  System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::RemovePreviousCliCommands(w "$LOCALAPPDATA\Programs\Magnitude CLI", w "$INSTDIR\resources", w .r8, i 1024) i .r0'
   ${If} $0 != 0
     SetErrorLevel 1
     Abort "Magnitude is installed, but setup could not replace a previous command: $8 (code $0). Close programs using it and run setup again."
@@ -208,7 +221,12 @@ Section "Uninstall"
     SetErrorLevel 1
     Abort
   ${EndIf}
-  System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::ConfigureCliPath(w "$INSTDIR\resources", w "${REGKEY}", i 1) i .r0'
+  System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::RemoveCliLauncher(w "$LOCALAPPDATA\Programs\Magnitude CLI") i .r0'
+  ${If} $0 != 0
+    SetErrorLevel 1
+    Abort "Close Magnitude commands and retry uninstall (code $0). Application files were preserved."
+  ${EndIf}
+  System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::ConfigureCliPath(w "$LOCALAPPDATA\Programs\Magnitude CLI", w "${REGKEY}", i 1) i .r0'
   ${If} $0 != 0
     SetErrorLevel 1
     Abort "Command registration could not be removed (code $0). Application files were preserved."

@@ -45,5 +45,5 @@ export const makeInstalledUpdatePreparation = (options: {
     return yield* hostedUpdateSource({ ...configuration, metadata, sign: identity.sign,
       dataDirectory: options.dataDirectory, userAgent: `Magnitude/${options.version} ${options.architecture} ${metadata.os}/${options.osVersion}` }, stage)
   }).pipe(Effect.mapError(() => new ApplicationUpdateFailed({ message: "Application update preparation could not be initialized." })))
-  return { store, preferences, makeSource }
+  return { configuration, store, preferences, makeSource }
 }).pipe(Effect.mapError(() => new ApplicationUpdateFailed({ message: "The installed application update configuration could not be initialized." })))

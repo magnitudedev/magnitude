@@ -1318,9 +1318,9 @@ still open. It does not declare the whole phase complete.
 
 ### Desktop custom installer integration checkpoint
 
-Signed run 35949905805 passed the public finite A-to-B and serve-startup B-to-C scenarios at
-b127a73a, including Ready Headless ownership, graceful shutdown, matching executable versions,
-private storage retirement and publisher acceptance. Log: mac-signed-public-installer-ci.log in
+Signed run 35949905805 completed public finite A-to-B at b127a73a, but the later artifact-log audit
+showed serve-startup B-to-C failed before Ready because the fixture version had no published ICN.
+The pipeline masked that failure; its green step was not valid startup acceptance. Log: mac-signed-public-installer-ci.log in
 /tmp/magnitude-headless-transfer. Native Mac and both Linux jobs passed. The Windows job failed
 because its fixture inherited a PowerShell module path incompatible with the child shell. The
 fixture now uses the .NET ACL API directly; Node and pinned Bun passed in the disposable Windows
@@ -1340,3 +1340,130 @@ local Bun 1.3.14 was reproduced and diagnosed; it passes with the project-pinned
 the full Desktop suite. Temporary instrumentation was removed without changing shell behavior.
 This checkpoint completes the Desktop wiring, not final signed Desktop acceptance or the remaining
 Windows/package-script/remote inference gates.
+
+### Remote inference acceptance on Sparky
+
+At 2336c140, copied the branch into /home/tom/magnitude-headless.KY79vO5a and built native ownership
+there. Source CLI serve reached Ready on isolated port 11237 and profile using the existing installed
+ICN runtime; the stale development ICN declaration was first rejected for a missing binary. Copied
+the existing model cache into the isolated profile, restarted the test owner, and loaded
+qwen3.6-35b-a3b:gguf:q4 through the ordinary CLI. A real OpenAI-compatible chat request produced a
+response (109 generated tokens, approximately 63 tokens/second). Local receipt:
+/tmp/magnitude-headless-transfer/sparky-headless-inference.json. Models stop unloaded it; SIGTERM to
+the verified test owner exited zero, CLI status reported Stopped/None and port 11237 was closed.
+The original user magnitude.service remained active throughout. This proves source headless ownership
+and inference on the DGX, not a full script-installed package or startup update on that machine.
+
+### Windows release integration in progress
+
+Run 35950727523 passed the repaired Node/Bun private-cache fixture and Rust child retirement. Its
+next failure was the NSIS handoff fixture still sending showWindow instead of the required Desktop
+continuation. Updated that request and ran the full native/NSIS installer test on the Windows VM:
+configuration preservation, interrupted recovery, fresh install, unknown-file refusal, owner-exit
+handoff, upgrade, startup preservation and uninstall passed. A prior unregistered test resources
+folder was preserved under the test root before running the fixture. The native launcher compiled
+successfully with the actual Windows toolchain (153600 bytes).
+
+Uncommitted release wiring now builds and bundles the launcher alongside the matched CLI and includes
+it in signing and installer payload validation. Windows installer contract tests passed (29), and
+targeted release checking passed. External launcher installation, PATH maintenance and foreground
+startup continuation remain unfinished; these packaging edits are not a phase checkpoint.
+
+Signed macOS run 35950727523 produced four signed fixture applications and completed finite CLI
+A-to-B. The downloaded log contradicts its green step: B-to-C exited before Ready after trying to
+acquire ICN for an unpublished fixture version. Desktop C-to-D was therefore never exercised, and
+result.json was absent. The earlier success report based on the job step was incorrect. Both signed
+startup and Desktop continuation gates remain open. The harness now resolves an explicit real ICN
+installation; its pipeline propagates failure and requires the final receipt. Artifact ZIPs were
+retrieved to /tmp/magnitude-headless-transfer/signed-mac-35950727523 for local GUI regression.
+
+
+A disposable Windows probe tested FileRenameInfoEx with replace/POSIX flags against its own mapped
+executable. The first replacement returned ERROR_ACCESS_DENIED (5); it made no product changes.
+Do not rely on atomic replacement of an executing launcher. Launcher maintenance must explicitly
+account for a mapped image. Probe source is /tmp/magnitude-headless-transfer/windows-launcher-replace-probe.c.
+
+
+### Phase 7 Windows foreground update implementation and acceptance
+
+The working tree now installs a private native command outside the replaceable application,
+registers its PATH entry, and retains the original foreground launcher across one verified replacement.
+Finite installation releases application ownership while retaining installation admission; startup
+only attempts unattempted preparations and never replaces a live server. Missing update configuration
+defers automatic installation without preventing serving; explicit installation still reports it.
+The six Windows orchestration tests passed on the VM. CLI regression tests passed (102), and targeted
+CLI/release type checks passed. Full native/NSIS fixtures passed before the added interruption case.
+Repeated native testing exposed a loader-startup race in the mapped-image fixture; it now waits for
+an explicit child readiness event. The expanded fixture also checks repair between launcher renames.
+The expanded native DLL suite passed, including interrupted launcher publication repair and all three
+application replacement recovery states. The signed packaged finite/startup update harness is still running.
+
+The packaged Windows harness uses a separate native DLL copy, since loading the build output before
+rebuilding it pins that DLL on Windows. Its real ICN fixture resolves published 0.1.5. The VM output
+uses a short directory to avoid the test root exceeding Windows staging path limits. The temporary
+acceptance publisher is scoped to this disposable VM and must be removed after signed testing.
+
+The signed 0.0.504 macOS fixture was launched from a disposable /tmp application and isolated profile.
+Computer use verified Discover, Ready Status and Settings; ordinary CLI status, models status and
+hardware queries worked against that Desktop owner. The app quit with exit 0. The personal installed
+application was not replaced. This is desktop regression evidence, not signed update continuation.
+
+
+Packaged Windows acceptance now has an opt-in native CI entry with temporary test-publisher cleanup
+and a required completion receipt. Workflow lint and the PowerShell parser passed. Its maintained
+harness also opens Desktop after the update sequence, checks Ready plus ordinary model/hardware
+commands after the finite launcher exits, and quits the isolated owner. This added regression is
+not yet runtime evidence; the currently running VM harness predates those final checks.
+
+The first complete Windows cohort built and signed all three packages and installed 0.0.501. It then
+failed in fixture preparation because the isolated profile parent had not been created. Native
+private-directory creation is intentionally nonrecursive. The harness now creates its private profile
+before staging; direct native creation of profile and updates passed. No application update was
+proved by that run. A fresh cohort is necessary because its in-memory publisher key was lost; future
+runs now retain public signed release records before installing anything, without retaining a private
+signing key. The rerun writes a complete VM log rather than relying on truncated terminal output.
+
+Before removing 0.0.501, its external native command successfully opened Desktop and returned while
+Desktop remained alive. Status reported Ready, Desktop, 0.0.501, and the isolated endpoint; models
+status and hardware both succeeded. Computer vision observed Discover render detected CPU and memory.
+Navigation through Parallels did not change views, so this is not proof of interactive Windows UI
+operation. Native Quit completed and a separate CLI status confirmed Stopped/None; uninstall then
+passed. A harness wait was corrected to observe Stopped instead of expecting a retained endpoint
+record to disappear. The fresh signed sequence, including maintained desktop CLI checks, is running.
+
+### Phase 7 checkpoint: Windows packaged continuation and native RPM recovery
+
+Windows signed packaged acceptance completed with exit 0. The receipt at
+`/tmp/magnitude-headless-transfer/windows-headless-result.json` records installed 0.0.503,
+finiteInstall, foregroundContinuation, gracefulExit and desktopCliRegression. The complete log is
+`/tmp/magnitude-headless-transfer/windows-headless-acceptance.log`; VM artifacts remain at
+`C:\Users\trg\hu-f77c57f4`. The sequence installed 0.0.501, used the public command for finite
+0.0.502 installation, applied 0.0.503 before foreground serving, observed Ready while the original
+launcher remained alive, and stopped cleanly. It then opened Desktop with the public command,
+observed Desktop Ready, ran models status/hardware, quit, and observed Stopped. Both temporary test
+publisher trust and its signing key were removed after verification. This is disposable test-publisher
+acceptance, not production Windows publisher certification. Interactive Windows navigation remains
+unproven through the current computer-use adapter; macOS live UI operation has been exercised.
+
+A Fedora 44 arm64 VM (`magnitude-rpm`, Lima VZ, two CPUs, 4 GiB) now provides native RPM coverage.
+Its test uses the existing 0.1.9 compiled Linux fixture and the current package scripts, not a newly
+built final release cohort. Revisions 7 and 8 installed/upgraded and served with published CPU ICN
+0.1.5. An upgrade during serving was refused while the old server stayed Ready. A refused removal
+exposed DNF removing automatic dependencies despite the RPM pre-uninstall refusal. RPM pre-uninstall
+now leaves the existing repair gate on refusal; it does not interrupt the live owner. Subsequent
+startup reports package-manager repair until reinstallation restores dependencies and clears the gate.
+
+The maintained `test-linux-rpm.sh` passed on Fedora with revisions 7 and 9: fresh installation,
+upgrade refusal with live model queries, clean SIGTERM, stopped upgrade, restart, removal refusal
+with continued live queries, stopped startup refusal with repair guidance, dependency-restoring
+reinstallation, Ready plus hardware, clean stop, successful removal, and preserved profile sentinel.
+The exit-0 receipt and logs are under `/tmp/magnitude-headless-transfer/rpm-evidence`; VM evidence is
+`/tmp/magnitude-rpm-acceptance.yAnfJaB2`. No test owner remains. RPM interrupted-transaction fault
+injection and final-cohort desktop/inference coverage are still required beyond this scenario.
+
+Validation for this checkpoint also includes the expanded Windows native installer suite (mapped
+launcher replacement, interrupted publication repair, PATH ownership, application recovery), six
+Windows update orchestration tests, CLI regression tests (102), targeted CLI/release type checks,
+workflow lint and PowerShell/Bash syntax checks. The macOS harness uses a real published ICN and
+requires a completion receipt; its corrected signed end-to-end run is still pending. Full-install
+scripts and final cross-platform acceptance remain open. This checkpoint does not complete the goal.

@@ -14,7 +14,7 @@ const run = Effect.gen(function* () {
   const code = yield* Command.exitCode(Command.make(process.execPath, "build", join(import.meta.dirname, "windows-foreground-probe.ts"),
     "--compile", "--outfile", join(app, "resources/magnitude.exe")))
   if (code !== 0) return yield* Effect.dieMessage("Foreground probe compilation failed")
-  for (const file of ["Magnitude.exe", "resources/magnitude-service.exe"]) {
+  for (const file of ["Magnitude.exe", "resources/magnitude-launcher.exe", "resources/magnitude-service.exe"]) {
     yield* fs.copyFile(join(root, "windows-installer-test.exe"), join(app, file))
   }
   yield* fs.copyFile(join(root, "desktop-host.node"), join(app, "resources/desktop-host.node"))
