@@ -1,11 +1,18 @@
 import { Command, CommandExecutor, FileSystem } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
-import { Effect } from "effect"
+import { Effect, Scope } from "effect"
+import { createHash, generateKeyPairSync } from "node:crypto"
 import { createRequire } from "node:module"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { describe, expect, it } from "vitest"
-import { MacBundleVerifier, nativeMacBundleVerifier } from "./mac-update-validation"
+import { MacBundleVerificationFailed, MacBundleVerifier, nativeMacBundleVerifier } from "./mac-update-validation"
+import { MacUpdateFilesystem, nativeMacUpdateFilesystem } from "./mac-update-filesystem"
+import { exchangeMacUpdate } from "./mac-update-transaction"
+import { retireMacUpdateBundle } from "./mac-update-recovery"
+import { makeMacUpdateArchiveStager } from "./mac-update-staging"
+import { guardedCommandLayer } from "./guarded-command"
+import { signUpdateRelease } from "../../../release/src/hosted-update/release"
 
 const addon = fileURLToPath(new URL(`../../dist/native/darwin-${process.arch}/desktop-host.node`, import.meta.url))
 const rule = 'identifier "dev.magnitude.desktop"'
@@ -18,7 +25,7 @@ const plist = (identifier: string) => `<?xml version="1.0" encoding="UTF-8"?>
 <key>CFBundleExecutable</key><string>program</string><key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>0.1.6</string><key>CFBundleVersion</key><string>6</string></dict></plist>`
 
-const fixture = <A, E>(use: (bundle: string, root: string) => Effect.Effect<A, E, FileSystem.FileSystem | CommandExecutor.CommandExecutor>) => Effect.gen(function* () {
+const fixture = <A, E>(use: (bundle: string, root: string) => Effect.Effect<A, E, FileSystem.FileSystem | CommandExecutor.CommandExecutor | Scope.Scope>) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-bundle-validation-" })
   const bundle = join(root, "Magnitude π.app")
@@ -38,6 +45,70 @@ const verify = (bundle: string, requirement = rule, version = "0.1.6", arch = ar
 })
 
 describe.skipIf(process.platform !== "darwin")("native macOS bundle verification", () => {
+  it("installs two successive signed archive fixtures with transaction recovery and displaced-bundle cleanup", () => fixture((bundle, root) => Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    const native = yield* MacUpdateFilesystem
+    const stagingPath = join(root, "transaction")
+    yield* fs.makeDirectory(stagingPath, { mode: 0o700 })
+    const payload = join(root, "payload/Magnitude.app")
+    yield* fs.makeDirectory(join(root, "payload"))
+    yield* fs.copy(bundle, payload)
+    const archive = join(root, "update.zip")
+    yield* command("/usr/bin/ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", payload, archive)
+    const bytes = yield* fs.readFile(archive)
+    const key = generateKeyPairSync("ed25519")
+    const release = yield* signUpdateRelease({ version: "0.1.6", bytes: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex") },
+      { os: "darwin", arch: process.arch === "arm64" ? "arm64" : "x64", package: "mac-zip" }, key.privateKey)
+    const stager = yield* makeMacUpdateArchiveStager({
+      helper: join(addon, "../magnitude-extract"), architecture: process.arch === "arm64" ? "arm64" : "x64",
+      trustedPublishers: new Map([["fixture", key.publicKey]]),
+    })
+    yield* fs.writeFileString(join(bundle, "Contents/Info.plist"), plist("dev.magnitude.desktop").replace("0.1.6", "0.1.5"))
+    yield* command("/usr/bin/codesign", "--force", "--sign", "-", bundle)
+    const installed = yield* native.open(root, false)
+    const staging = yield* native.open(stagingPath, true)
+    expect(yield* stager.stage(archive, staging, { ...release, sha256: "0".repeat(64) }).pipe(Effect.isFailure)).toBe(true)
+    expect(yield* fs.readDirectory(stagingPath)).toEqual([])
+    yield* fs.writeFile(archive, Buffer.concat([bytes, Buffer.from("changed")]))
+    expect(yield* stager.stage(archive, staging, release).pipe(Effect.isFailure)).toBe(true)
+    expect(yield* fs.readDirectory(stagingPath)).toEqual([])
+    yield* fs.writeFile(archive, bytes)
+    yield* stager.stage(archive, staging, release)
+    const result = yield* exchangeMacUpdate(installed, "Magnitude π.app", staging, {
+      previous: "0.1.5", replacement: "0.1.6", architecture: process.arch === "arm64" ? "arm64" : "x64",
+    })
+    expect(result).toEqual({ _tag: "Installed", version: "0.1.6" })
+    yield* verify(bundle, rule, "0.1.6")
+    yield* verify(join(stagingPath, "Magnitude.app"), rule, "0.1.5")
+    expect(yield* retireMacUpdateBundle(installed, "Magnitude π.app", staging)).toEqual(result)
+    expect(yield* fs.exists(join(stagingPath, "Magnitude.app"))).toBe(false)
+    yield* verify(bundle, rule, "0.1.6")
+
+    yield* fs.writeFileString(join(payload, "Contents/Info.plist"), plist("dev.magnitude.desktop").replace("0.1.6", "0.1.7"))
+    yield* command("/usr/bin/codesign", "--force", "--sign", "-", payload)
+    yield* command("/usr/bin/ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", payload, archive)
+    const nextBytes = yield* fs.readFile(archive)
+    const nextRelease = yield* signUpdateRelease({ version: "0.1.7", bytes: nextBytes.length,
+      sha256: createHash("sha256").update(nextBytes).digest("hex") },
+      { os: "darwin", arch: process.arch === "arm64" ? "arm64" : "x64", package: "mac-zip" }, key.privateKey)
+    const nextPath = join(root, "next-transaction")
+    yield* fs.makeDirectory(nextPath, { mode: 0o700 })
+    const next = yield* native.open(nextPath, true)
+    yield* stager.stage(archive, next, nextRelease)
+    expect(yield* exchangeMacUpdate(installed, "Magnitude π.app", next, {
+      previous: "0.1.6", replacement: "0.1.7", architecture: process.arch === "arm64" ? "arm64" : "x64",
+    })).toEqual({ _tag: "Installed", version: "0.1.7" })
+    yield* verify(bundle, rule, "0.1.7")
+    yield* retireMacUpdateBundle(installed, "Magnitude π.app", next)
+    yield* verify(bundle, rule, "0.1.7")
+    expect(yield* fs.readDirectory(stagingPath)).toEqual([])
+    expect(yield* fs.readDirectory(nextPath)).toEqual([])
+  }).pipe(Effect.provide([nativeMacUpdateFilesystem(addon), guardedCommandLayer(join(addon, "../magnitude-command"))]), Effect.provideService(MacBundleVerifier, {
+    verify: (path, expected) => verify(path, rule, expected.version, expected.architecture === "x64" ? "x86_64" : "arm64").pipe(
+      Effect.mapError(() => new MacBundleVerificationFailed())),
+  }))))
+
   it("validates sealed local fixtures without granting production publisher trust", () => fixture(bundle => Effect.gen(function* () {
     yield* verify(bundle)
     expect(yield* verify(bundle, `${rule} and anchor apple generic`).pipe(Effect.isFailure)).toBe(true)

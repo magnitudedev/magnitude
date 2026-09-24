@@ -26,6 +26,9 @@ parent-job containment; installed Linux serving retains a close-on-exec shared i
 Headless control reports its owner form, acknowledges Yield before shutdown, rejects login settings,
 and never launches Desktop to handle update requests. Terminal service failure exits nonzero after
 cleanup; normal stop and Yield exit after complete owned-service retirement.
+The Headless owner retains update preparation and its check schedule for that same lifetime.
+Ready notifications explain how to stop and start the server; update installation requests never
+interrupt a running server.
 
 Commands validate argument syntax and supported identifiers before connecting. Service-backed
 commands require an existing owner and await its compatible Ready service without startup authority.
@@ -68,9 +71,9 @@ An established SDK connection may reconnect to an available service, but cannot 
 again. A stale request or subscription therefore cannot undo explicit Quit. Only an explicit application launch may ensure the application again. Startup waits remain bound to the admitted application
 occurrence and fail if it is replaced.
 
-CLI update commands delegate to the desktop update owner independently of service readiness.
-Status is passive; active commands may start the tray without opening the window. The CLI does not
-run a package manager or update itself separately. RPC mismatch gives an update action rather than
+CLI update commands delegate to a present application owner independently of service readiness.
+They never launch Desktop. Without an owner, status reads saved state and finite preparation holds
+maintenance ownership. The CLI does not update itself separately. RPC mismatch gives an update action rather than
 replacing or downgrading the running service.
 Before a cold installed macOS launch, the host waits for an active native update job targeting that
 exact application bundle to finish. An inactive retained job is not an active installation. Observation

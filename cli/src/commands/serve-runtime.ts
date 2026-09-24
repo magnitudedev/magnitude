@@ -7,6 +7,7 @@ import { BunSqliteDriverLayer, bundledWindowsNative } from "@magnitudedev/daemon
 import { applicationNativeHostPath, applicationStateDirectory, nativeHostLayer, resolveApplicationProfile,
   resolveInstalledApplicationRuntime, runHeadlessApplication, type ApplicationRuntime } from "@magnitudedev/daemon-management/desktop-native"
 import { isDevelopmentBuild } from "../runtime/environment"
+import { initializeServeUpdates } from "../server/serve-updates"
 
 export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const stopped = yield* Deferred.make<void>()
@@ -22,6 +23,8 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
   const stateDirectory = yield* applicationStateDirectory({ platform: process.platform, dataDirectory: profile.dataDirectory, override: Option.fromNullable(process.env.MAGNITUDE_DESKTOP_STATE_DIR) })
   const addon = applicationNativeHostPath(runtime, process.platform, process.arch)
   yield* runHeadlessApplication({ runtime, profile, stateDirectory, home: homedir(), environment: process.env,
+    initializeUpdates: initializeServeUpdates(runtime, profile, addon),
+    updateReady: version => Effect.sync(() => { process.stderr.write(`Magnitude ${version} is ready to install. Stop the server, then run: magnitude serve\n`) }),
     stop: Deferred.await(stopped), observe: state => state._tag === "Ready"
       ? Effect.sync(() => { process.stderr.write(`Magnitude is serving at ${profile.endpoint}. Press Ctrl+C to stop.\n`) }) : Effect.void,
   }).pipe(Effect.provide(process.platform === "win32" ? bundledWindowsNative.host : nativeHostLayer(addon)))

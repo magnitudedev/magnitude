@@ -118,4 +118,60 @@ describe.skipIf(process.platform !== "darwin")("native macOS transaction filesys
       expect(() => native.readMacUpdateRecord(retained)).toThrow()
     })
   })))
+
+  it("synchronizes the expected staged tree without following links", () => run(Effect.gen(function* () {
+    const { fs, native, root, stagePath, stage } = yield* fixture
+    const bundle = join(stagePath, "Magnitude.app")
+    yield* fs.makeDirectory(join(bundle, "Contents"), { recursive: true })
+    yield* fs.writeFileString(join(bundle, "Contents/data"), "staged")
+    yield* fs.symlink(join(root, "missing-external-target"), join(bundle, "link"))
+    const identity = Option.getOrThrow(yield* native.inspect(stage, "Magnitude.app"))
+    yield* native.syncTree(stage, "Magnitude.app", identity)
+    expect(yield* native.syncTree(stage, "Magnitude.app", stage.identity).pipe(Effect.isFailure)).toBe(true)
+    expect(yield* fs.readLink(join(bundle, "link"))).toBe(join(root, "missing-external-target"))
+  })))
+
+  it("refuses special files and hard links during staged synchronization", () => run(Effect.gen(function* () {
+    const { fs, native, root, stagePath, stage } = yield* fixture
+    const bundle = join(stagePath, "Magnitude.app")
+    yield* fs.makeDirectory(bundle)
+    const identity = Option.getOrThrow(yield* native.inspect(stage, "Magnitude.app"))
+    expect(yield* Command.make("/usr/bin/mkfifo", join(bundle, "pipe")).pipe(Command.exitCode)).toBe(0)
+    expect(yield* native.syncTree(stage, "Magnitude.app", identity).pipe(Effect.isFailure)).toBe(true)
+    yield* fs.remove(join(bundle, "pipe"))
+    yield* fs.writeFileString(join(root, "external"), "outside")
+    yield* fs.link(join(root, "external"), join(bundle, "linked"))
+    expect(yield* native.syncTree(stage, "Magnitude.app", identity).pipe(Effect.isFailure)).toBe(true)
+    expect(yield* fs.readFileString(join(root, "external"))).toBe("outside")
+  })))
+  it("removes only the expected private tree without traversing outside links", () => run(Effect.gen(function* () {
+    const { fs, native, root, stagePath, stage, parent } = yield* fixture
+    const bundle = join(stagePath, "Magnitude.app")
+    const external = join(root, "external")
+    yield* fs.makeDirectory(join(bundle, "Contents"), { recursive: true })
+    yield* fs.makeDirectory(external)
+    yield* fs.writeFileString(join(external, "retain"), "outside")
+    yield* fs.symlink(external, join(bundle, "Contents/link"))
+    yield* fs.link(join(external, "retain"), join(bundle, "Contents/hardlink"))
+    yield* fs.writeFileString(join(bundle, "Contents/data"), "displaced")
+    const identity = Option.getOrThrow(yield* native.inspect(stage, "Magnitude.app"))
+    expect(yield* native.removeTree(stage, "Magnitude.app", parent.identity).pipe(Effect.isFailure)).toBe(true)
+    expect(yield* native.removeTree(parent, "transaction", stage.identity).pipe(Effect.isFailure)).toBe(true)
+    yield* native.writeRecord(stage, Buffer.from("retained receipt"))
+    yield* native.removeTree(stage, "Magnitude.app", identity)
+    expect(yield* fs.readDirectory(stagePath)).toEqual(["transaction.json"])
+    expect(yield* fs.readFileString(join(external, "retain"))).toBe("outside")
+    expect(Buffer.from(Option.getOrThrow(yield* native.readRecord(stage))).toString()).toBe("retained receipt")
+  })))
+
+  it("durably removes only the exact retained receipt", () => run(Effect.gen(function* () {
+    const { native, stage } = yield* fixture
+    const receipt = Buffer.from("terminal receipt")
+    yield* native.writeRecord(stage, receipt)
+    expect(yield* native.removeRecord(stage, Buffer.from("different receipt")).pipe(Effect.isFailure)).toBe(true)
+    expect(Buffer.from(Option.getOrThrow(yield* native.readRecord(stage)))).toEqual(receipt)
+    yield* native.removeRecord(stage, receipt)
+    expect(Option.isNone(yield* native.readRecord(stage))).toBe(true)
+  })))
+
 })

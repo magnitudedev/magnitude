@@ -13,8 +13,11 @@ export interface MacUpdateDirectory {
 export interface MacUpdateFilesystem {
   readonly open: (path: string, privateDirectory: boolean) => Effect.Effect<MacUpdateDirectory, MacUpdateFilesystemFailed, Scope.Scope>
   readonly inspect: (directory: MacUpdateDirectory, name: string) => Effect.Effect<Option.Option<MacFileIdentity>, MacUpdateFilesystemFailed>
+  readonly removeRecord: (directory: MacUpdateDirectory, expected: Uint8Array) => Effect.Effect<void, MacUpdateFilesystemFailed>
   readonly readRecord: (directory: MacUpdateDirectory) => Effect.Effect<Option.Option<Uint8Array>, MacUpdateFilesystemFailed>
   readonly sync: (directory: MacUpdateDirectory) => Effect.Effect<void, MacUpdateFilesystemFailed>
+  readonly removeTree: (directory: MacUpdateDirectory, name: string, expected: MacFileIdentity) => Effect.Effect<void, MacUpdateFilesystemFailed>
+  readonly syncTree: (directory: MacUpdateDirectory, name: string, expected: MacFileIdentity) => Effect.Effect<void, MacUpdateFilesystemFailed>
   readonly writeRecord: (directory: MacUpdateDirectory, bytes: Uint8Array) => Effect.Effect<void, MacUpdateFilesystemFailed>
   readonly exchange: (installed: MacUpdateDirectory, installedName: string, previous: MacFileIdentity,
     staging: MacUpdateDirectory, stagedName: string, replacement: MacFileIdentity) => Effect.Effect<void, MacUpdateFilesystemFailed>
@@ -25,7 +28,10 @@ interface Bindings {
   readonly openMacUpdateDirectory: (path: string, privateDirectory: boolean) => { readonly identity: unknown; readonly path: unknown }
   readonly closeMacUpdateDirectory: (directory: object) => void
   readonly syncMacUpdateDirectory: (directory: object) => void
+  readonly removeMacUpdateTree: (directory: object, name: string, expected: string) => void
+  readonly syncMacUpdateTree: (directory: object, name: string, expected: string) => void
   readonly inspectMacUpdateDirectory: (directory: object, name: string) => unknown
+  readonly removeMacUpdateRecord: (directory: object, expected: Buffer) => void
   readonly readMacUpdateRecord: (directory: object) => Uint8Array | null
   readonly writeMacUpdateRecord: (directory: object, bytes: Buffer) => void
   readonly exchangeMacUpdateDirectories: (installed: object, installedName: string, previous: string,
@@ -47,8 +53,11 @@ export const nativeMacUpdateFilesystem = (addonPath: string) => Layer.effect(Mac
     inspect: (directory, name) => attempt(() => native.inspectMacUpdateDirectory(directory[handle], name)).pipe(
       Effect.flatMap(Schema.decodeUnknown(Schema.OptionFromNullOr(MacFileIdentity))),
       Effect.mapError(() => new MacUpdateFilesystemFailed())),
+    removeRecord: (directory, expected) => attempt(() => native.removeMacUpdateRecord(directory[handle], Buffer.from(expected))),
     readRecord: directory => attempt(() => Option.fromNullable(native.readMacUpdateRecord(directory[handle]))),
     sync: directory => attempt(() => native.syncMacUpdateDirectory(directory[handle])),
+    removeTree: (directory, name, expected) => attempt(() => native.removeMacUpdateTree(directory[handle], name, expected)),
+    syncTree: (directory, name, expected) => attempt(() => native.syncMacUpdateTree(directory[handle], name, expected)),
     writeRecord: (directory, bytes) => attempt(() => native.writeMacUpdateRecord(directory[handle], Buffer.from(bytes))),
     exchange: (installed, installedName, previous, staging, stagedName, replacement) =>
       attempt(() => native.exchangeMacUpdateDirectories(installed[handle], installedName, previous, staging[handle], stagedName, replacement)),

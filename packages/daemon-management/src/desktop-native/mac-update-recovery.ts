@@ -40,19 +40,27 @@ export class MacUpdateRepairRequired extends Schema.TaggedError<MacUpdateRepairR
 }
 const repair = () => new MacUpdateRepairRequired()
 
+const readJournal = (installed: MacUpdateDirectory, installedName: string, staging: MacUpdateDirectory) => Effect.gen(function* () {
+  const fs = yield* MacUpdateFilesystem
+  const bytes = yield* fs.readRecord(staging)
+  if (Option.isNone(bytes)) return Option.none<MacUpdateJournal>()
+  const text = yield* Effect.try({ try: () => new TextDecoder("utf-8", { fatal: true }).decode(bytes.value), catch: repair })
+  const record = yield* Schema.decodeUnknown(Schema.parseJson(MacUpdateJournal))(text, { onExcessProperty: "error" }).pipe(Effect.mapError(repair))
+  if (record.transaction.installedParent !== installed.identity || record.transaction.stagingParent !== staging.identity ||
+      record.transaction.installedName !== installedName) return yield* repair()
+  return Option.some(record)
+}).pipe(Effect.catchTag("MacUpdateFilesystemFailed", repair))
+
 /** Caller holds installation exclusion. Recovery never starts a service or retries a forward exchange. */
 export const recoverMacUpdateTransaction = (installed: MacUpdateDirectory, installedName: string, staging: MacUpdateDirectory):
   Effect.Effect<MacUpdateRecoveryResult, MacUpdateRepairRequired, MacUpdateFilesystem | MacBundleVerifier> =>
   Effect.gen(function* () {
     const fs = yield* MacUpdateFilesystem
     const verifier = yield* MacBundleVerifier
-    const bytes = yield* fs.readRecord(staging)
-    if (Option.isNone(bytes)) return { _tag: "NoTransaction" } as const
-    const text = yield* Effect.try({ try: () => new TextDecoder("utf-8", { fatal: true }).decode(bytes.value), catch: repair })
-    const record = yield* Schema.decodeUnknown(Schema.parseJson(MacUpdateJournal))(text, { onExcessProperty: "error" }).pipe(Effect.mapError(repair))
+    const saved = yield* readJournal(installed, installedName, staging)
+    if (Option.isNone(saved)) return { _tag: "NoTransaction" } as const
+    const record = saved.value
     const transaction = record.transaction
-    if (transaction.installedParent !== installed.identity || transaction.stagingParent !== staging.identity ||
-        transaction.installedName !== installedName) return yield* repair()
     const observe = Effect.gen(function* () {
       const current = yield* fs.inspect(installed, installedName)
       const displaced = yield* fs.inspect(staging, "Magnitude.app")
@@ -126,3 +134,34 @@ export const recoverMacUpdateTransaction = (installed: MacUpdateDirectory, insta
     Effect.catchTags({ MacUpdateFilesystemFailed: () => repair(), MacBundleVerificationFailed: () => repair() }),
     Effect.uninterruptible,
   )
+
+export class MacUpdateCleanupFailed extends Schema.TaggedError<MacUpdateCleanupFailed>()("MacUpdateCleanupFailed", {}) {
+  override get message() { return "The completed update has retained files to clean up on the next startup." }
+}
+
+/** Retire displaced contents after terminal reconciliation, then remove the exact terminal receipt. */
+export const retireMacUpdateBundle = (installed: MacUpdateDirectory, installedName: string, staging: MacUpdateDirectory):
+  Effect.Effect<MacUpdateRecoveryResult, MacUpdateRepairRequired | MacUpdateCleanupFailed, MacUpdateFilesystem | MacBundleVerifier> =>
+  Effect.gen(function* () {
+    const fs = yield* MacUpdateFilesystem
+    const saved = yield* readJournal(installed, installedName, staging)
+    if (Option.isNone(saved)) {
+      yield* fs.sync(staging).pipe(Effect.mapError(() => new MacUpdateCleanupFailed()))
+      return { _tag: "NoTransaction" } as const
+    }
+    const record = saved.value
+    if (record._tag === "ExchangeIntent" || record._tag === "RestoreIntent") return yield* repair()
+    const result = yield* recoverMacUpdateTransaction(installed, installedName, staging)
+    const expected = record._tag === "Committed" ? record.transaction.previous.identity : record.transaction.replacement.identity
+    const displaced = yield* fs.inspect(staging, "Magnitude.app").pipe(Effect.mapError(repair))
+    if (Option.isSome(displaced)) {
+      if (displaced.value !== expected) return yield* repair()
+      yield* fs.removeTree(staging, "Magnitude.app", expected).pipe(Effect.mapError(() => new MacUpdateCleanupFailed()))
+    }
+    // The receipt is last: partial tree deletion remains recoverable against the verified installed bundle.
+    yield* fs.sync(staging).pipe(Effect.mapError(() => new MacUpdateCleanupFailed()))
+    const receipt = yield* fs.readRecord(staging).pipe(Effect.mapError(() => new MacUpdateCleanupFailed()))
+    if (Option.isNone(receipt)) return yield* repair()
+    yield* fs.removeRecord(staging, receipt.value).pipe(Effect.mapError(() => new MacUpdateCleanupFailed()))
+    return result
+  }).pipe(Effect.uninterruptible)

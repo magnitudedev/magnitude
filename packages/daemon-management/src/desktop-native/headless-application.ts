@@ -1,6 +1,8 @@
-import { Deferred, Effect, Exit, Option, Schema, Stream } from "effect"
+import { Deferred, Effect, Exit, Option, Schema, Stream, type Scope } from "effect"
 import { dirname } from "node:path"
-import { ApplicationUpdateControlFailed, LoginStartupFailed, type OwnedServiceState } from "@magnitudedev/sdk/desktop-host"
+import { LoginStartupFailed, type OwnedServiceState } from "@magnitudedev/sdk/desktop-host"
+import { unavailableApplicationUpdate, type ApplicationUpdate } from "../application-update/application-update"
+import { makeHeadlessUpdateControl } from "../application-update/headless-update"
 import { WindowsPipeName, nativeWindowsPrivatePipesLayer } from "@magnitudedev/utils/windows-native"
 import { NativeHost } from "./index"
 import { acquireApplicationOwner } from "./application-owner"
@@ -21,6 +23,8 @@ export const runHeadlessApplication = (options: {
   readonly stateDirectory: string; readonly home: string; readonly environment: Readonly<Record<string, string | undefined>>
   readonly stop: Effect.Effect<void>
   readonly observe: (state: OwnedServiceState) => Effect.Effect<void>
+  readonly initializeUpdates?: Effect.Effect<ApplicationUpdate, never, Scope.Scope>
+  readonly updateReady?: (version: string) => Effect.Effect<void>
 }) => Effect.scoped(Effect.gen(function* () {
   const stop = yield* Deferred.make<void>()
   yield* options.stop.pipe(Effect.zipRight(Deferred.succeed(stop, undefined)), Effect.forkScoped)
@@ -39,12 +43,21 @@ export const runHeadlessApplication = (options: {
     }
   }
   if (yield* Deferred.isDone(stop)) return
+  const updates = yield* options.initializeUpdates ?? Effect.succeed(unavailableApplicationUpdate("Application updates require an installed Magnitude application."))
+  if (yield* Deferred.isDone(stop)) return
+  const update = yield* makeHeadlessUpdateControl(updates)
+  if (options.updateReady) {
+    const notify = options.updateReady
+    yield* updates.changes.pipe(Stream.map(state => state.transfer), Stream.changesWith((a, b) =>
+      a._tag === "Ready" && b._tag === "Ready" && a.version === b.version),
+      Stream.runForEach(state => state._tag === "Ready" ? notify(state.version) : Effect.void), Effect.forkScoped)
+  }
   const service = yield* makeApplicationService({ ...options, output: "Foreground", admission: "Immediate" })
   const control: ApplicationControlOptions = {
     snapshot: service.state.pipe(Effect.map(state => ({ version: 1 as const, pid: process.pid, endpoint: options.profile.endpoint, owner: { _tag: "Headless" as const }, service: state }))),
     dispatch: intent => intent === "Yield" || intent === "Quit" ? Deferred.succeed(stop, undefined).pipe(Effect.asVoid) : Effect.void,
     login: () => new LoginStartupFailed({ message: "Login startup belongs to the desktop app. Open Magnitude to change it." }),
-    update: () => new ApplicationUpdateControlFailed({ message: "Stop `magnitude serve` before managing application updates." }),
+    update,
   }
   if (process.platform === "win32") {
     const name = yield* Schema.decodeUnknown(WindowsPipeName)(owner.socketPath)

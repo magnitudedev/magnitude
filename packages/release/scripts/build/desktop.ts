@@ -43,6 +43,9 @@ export const buildDesktopApplication = (options: {
   const icon = join(resources, "application-icon.png")
   const license = join(resources, "Magnitude-LICENSE.txt")
   const command = join(resources, "magnitude-command")
+  const extractor = join(resources, "magnitude-extract")
+  const updateConfiguration = join(resources, "update-configuration.json")
+  yield* fs.copyFile(join(root, "desktop/out/main/update-configuration.json"), updateConfiguration)
   const updateTrust = join(resources, "update-trust.json")
   yield* fs.copyFile(join(root, "desktop/out/main/update-trust.json"), updateTrust)
   yield* fs.copyFile(options.service, service)
@@ -57,6 +60,10 @@ export const buildDesktopApplication = (options: {
     yield* fs.copyFile(join(root, `packages/daemon-management/dist/native/${platform}-${arch}/magnitude-command`), command)
     yield* fs.chmod(command, 0o755)
   }
+  if (platform === "darwin") {
+    yield* fs.copyFile(join(root, `packages/daemon-management/dist/native/${platform}-${arch}/magnitude-extract`), extractor)
+    yield* fs.chmod(extractor, 0o755)
+  }
   const electron = yield* fs.readFileString(join(root, "node_modules/electron/package.json")).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(PackageVersion))))
   return yield* Effect.tryPromise({ try: () => packager({
     dir: app, out: options.outputDirectory, name: "Magnitude", executableName: platform === "linux" ? "magnitude" : "Magnitude",
@@ -65,6 +72,7 @@ export const buildDesktopApplication = (options: {
     ...(platform === "win32" ? { icon: join(root, "packages/release/resources/windows/Magnitude.ico"), win32metadata: { CompanyName: "Magnitude" } } : {}),
     ...(platform === "darwin" ? { icon: join(root, "packages/release/resources/macos/Magnitude.icns"), extendInfo: { LSMinimumSystemVersion: MACOS_DEPLOYMENT_TARGET } } : {}),
     asar: true, prune: false, overwrite: true,
-    extraResource: [service, cli, addon, tray, icon, license, updateTrust, ...(platform === "win32" ? [] : [command])],
+    extraResource: [service, cli, addon, tray, icon, license, updateTrust, updateConfiguration,
+      ...(platform === "win32" ? [] : [command]), ...(platform === "darwin" ? [extractor] : [])],
   }), catch: error => new DesktopBuildFailed({ message: `Could not assemble desktop: ${String(error)}` }) })
 })).pipe(Effect.mapError(error => error instanceof DesktopBuildFailed ? error : new DesktopBuildFailed({ message: String(error) })))

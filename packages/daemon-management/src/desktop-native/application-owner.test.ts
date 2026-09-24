@@ -5,8 +5,9 @@ import { fileURLToPath } from "node:url"
 import { Deferred, Effect, Exit, Fiber, Option, Ref, Schema, Scope, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
 import { ApplicationSnapshot } from "@magnitudedev/sdk/desktop-host"
-import { acquireApplicationOwner } from "./application-owner"
+import { acquireApplicationMaintenance, acquireApplicationOwner } from "./application-owner"
 import { serveApplicationControl } from "./application-control"
+import { acquireUpdateInstallationLease } from "./update-installation-lease"
 import { nativeHostLayer } from "./index"
 
 const addon = fileURLToPath(new URL(`../../dist/native/${process.platform}-${process.arch}/desktop-host.node`, import.meta.url))
@@ -17,6 +18,29 @@ const noLogin = () => Effect.die("Unexpected login request")
 const noUpdate = () => Effect.die("Unexpected update request")
 
 describe.skipIf(process.platform === "win32")("native application owner arbitration", () => {
+  it("excludes owners during finite maintenance and releases afterward", () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const root = yield* directory
+    yield* Effect.scoped(Effect.gen(function* () {
+      yield* acquireApplicationMaintenance(root)
+      expect(yield* acquireApplicationOwner(root, { _tag: "Headless" }).pipe(Effect.isFailure)).toBe(true)
+      expect(yield* acquireApplicationMaintenance(root).pipe(Effect.isFailure)).toBe(true)
+    }))
+    expect((yield* acquireApplicationOwner(root, { _tag: "Headless" }))._tag).toBe("Owner")
+  })).pipe(Effect.provide(nativeHostLayer(addon)))))
+
+  it("does not admit maintenance over a running owner or active installation", () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const root = yield* directory
+    yield* Effect.scoped(Effect.gen(function* () {
+      yield* acquireApplicationOwner(root, { _tag: "Headless" })
+      expect(yield* acquireApplicationMaintenance(root).pipe(Effect.isFailure)).toBe(true)
+    }))
+    yield* Effect.scoped(Effect.gen(function* () {
+      yield* acquireUpdateInstallationLease(root)
+      expect(yield* Effect.scoped(acquireApplicationMaintenance(root)).pipe(Effect.isFailure)).toBe(true)
+    }))
+    yield* acquireApplicationMaintenance(root)
+  })).pipe(Effect.provide(nativeHostLayer(addon)))))
+
   it("admits exactly one owner across concurrent headless attempts", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const root = yield* directory

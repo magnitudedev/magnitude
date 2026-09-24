@@ -2,6 +2,8 @@
    The transaction owner authenticates and retains the archive before invoking it. */
 #include "vendor/libarchive/archive.h"
 #include "vendor/libarchive/archive_entry.h"
+#include <CommonCrypto/CommonDigest.h>
+#include <sys/acl.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -42,9 +44,42 @@ static int remember(const char *path, int symlink) {
   entries[slot].symlink = symlink;
   return entries[slot].path != NULL;
 }
+static int no_extended_acl(int fd) {
+  acl_t acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED);
+  if (!acl) return errno == ENOENT;
+  acl_entry_t entry;
+  int empty = acl_valid(acl) == 0 && acl_get_entry(acl, ACL_FIRST_ENTRY, &entry) == -1 && errno == EINVAL;
+  acl_free(acl); return empty;
+}
+/* Hash the same retained descriptor the parser consumes; path substitution cannot change its input. */
+static int verify_archive(int fd, const char *expected, uint64_t bytes) {
+  struct stat before, after;
+  if (fstat(fd, &before) || !S_ISREG(before.st_mode) || before.st_uid != geteuid() || before.st_nlink != 1 ||
+      (before.st_mode & 022) || before.st_size < 0 || (uint64_t)before.st_size != bytes || !no_extended_acl(fd) ||
+      lseek(fd, 0, SEEK_SET) != 0) return 0;
+  CC_SHA256_CTX hash;
+  if (!CC_SHA256_Init(&hash)) return 0;
+  unsigned char buffer[65536], digest[CC_SHA256_DIGEST_LENGTH];
+  uint64_t total = 0;
+  for (;;) {
+    ssize_t count = read(fd, buffer, sizeof(buffer));
+    if (count < 0 && errno == EINTR) continue;
+    if (count < 0 || (uint64_t)count > bytes - total) return 0;
+    if (!count) break;
+    if (!CC_SHA256_Update(&hash, buffer, (CC_LONG)count)) return 0;
+    total += (uint64_t)count;
+  }
+  char actual[CC_SHA256_DIGEST_LENGTH * 2 + 1];
+  if (total != bytes || !CC_SHA256_Final(digest, &hash)) return 0;
+  for (size_t index = 0; index < sizeof(digest); index++) snprintf(actual + index * 2, 3, "%02x", digest[index]);
+  return !strcmp(actual, expected) && fstat(fd, &after) == 0 && before.st_size == after.st_size &&
+    before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec && before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec &&
+    before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec && before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec &&
+    lseek(fd, 0, SEEK_SET) == 0;
+}
 static int empty_private_directory(int fd) {
   struct stat st;
-  if (fstat(fd, &st) || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 077)) return 0;
+  if (fstat(fd, &st) || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 077) || !no_extended_acl(fd)) return 0;
   int copy = dup(fd);
   if (copy < 0) return 0;
   DIR *directory = fdopendir(copy);
@@ -130,14 +165,18 @@ done:
   return success;
 }
 int main(int argc, char **argv) {
-  if (argc != 3 || argv[1][0] != '/' || argv[2][0] != '/') {
-    fprintf(stderr, "Expected archive and private staging directory paths.\n"); return 1;
+  if (argc != 5 || argv[1][0] != '/' || argv[2][0] != '/' || strlen(argv[3]) != 64 ||
+      strspn(argv[3], "0123456789abcdef") != 64 || !*argv[4] || strlen(argv[4]) > 16 ||
+      strspn(argv[4], "0123456789") != strlen(argv[4])) {
+    fprintf(stderr, "Expected archive, private staging directory, authenticated digest and byte count.\n"); return 1;
   }
-  int source = open(argv[1], O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  uint64_t expected_bytes = strtoull(argv[4], NULL, 10);
+  if (!expected_bytes || expected_bytes > EXPANDED_LIMIT) return 1;
+  int source = open(argv[1], O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
   int destination = open(argv[2], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  struct stat st;
-  int valid = source >= 0 && destination >= 0 && fstat(source, &st) == 0 && S_ISREG(st.st_mode) &&
-    empty_private_directory(destination) && fchdir(destination) == 0 && extract(source);
+  int valid = source >= 0 && destination >= 0 && empty_private_directory(destination) &&
+    verify_archive(source, argv[3], expected_bytes) && fchdir(destination) == 0 && extract(source) &&
+    verify_archive(source, argv[3], expected_bytes);
   if (destination >= 0) close(destination);
   if (source >= 0) close(source);
   return valid ? 0 : 1;

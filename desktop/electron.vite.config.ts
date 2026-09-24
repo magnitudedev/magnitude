@@ -26,6 +26,11 @@ const bundledRuntime = (): Plugin => ({
 });
 
 const acceptanceConfig = process.env.MAGNITUDE_UPDATE_ACCEPTANCE_CONFIG;
+const developerIdBuild = process.env.MAGNITUDE_APPLE_DISTRIBUTION === "developer-id";
+const appleTeam = developerIdBuild ? process.env.APPLE_TEAM_ID ?? "" : "";
+if (developerIdBuild && !/^[A-Z0-9]{10}$/.test(appleTeam)) {
+  throw new Error("Developer ID builds require a valid Apple Team ID.");
+}
 const updateConfiguration = acceptanceConfig ? {
   ...JSON.parse(readFileSync(acceptanceConfig, "utf8")), acceptance: true,
 } : {
@@ -44,10 +49,12 @@ export default defineConfig({
       "process.env.WS_NO_UTF_8_VALIDATE": "true",
       __MAGNITUDE_UPDATE_CONFIGURATION__: JSON.stringify(updateConfiguration),
       __MAGNITUDE_UPDATE_ACCEPTANCE__: JSON.stringify(Boolean(acceptanceConfig)),
+      MAGNITUDE_APPLE_TEAM_ID: JSON.stringify(appleTeam),
     },
     plugins: [bundledRuntime(), { name: "harness-skill-text", load(id) { if (id.endsWith(".md")) return `export default ${JSON.stringify(readFileSync(id, "utf8"))}` } }, {
       name: "installed-update-trust",
       generateBundle() {
+        this.emitFile({ type: "asset", fileName: "update-configuration.json", source: JSON.stringify(updateConfiguration) });
         this.emitFile({ type: "asset", fileName: "update-trust.json", source: JSON.stringify({ keyId: updateConfiguration.keyId, publicKey: updateConfiguration.publicKey }) });
       },
     }],

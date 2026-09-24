@@ -109,9 +109,8 @@ export const makeDesktopApplicationHost = (developmentRepository: Option.Option<
     Effect.zipRight(endpoint.pipe(Effect.flatMap(path => requestLoginStartup(path, enabled ? "enable" : "disable")))),
   )
 
-  const updateDesktopApplication = (action: import("@magnitudedev/sdk/desktop-host").ApplicationUpdateAction) => (action === "status" ? Effect.void : desktopApplication.ensure().pipe(Effect.asVoid)).pipe(
-    Effect.zipRight(endpoint.pipe(Effect.flatMap(path => requestApplicationUpdate(path, action)))),
-  )
+  const updateDesktopApplication = (action: import("@magnitudedev/sdk/desktop-host").ApplicationUpdateAction) =>
+    endpoint.pipe(Effect.flatMap(path => requestApplicationUpdate(path, action)))
 
   return { updateDesktopApplication, desktopIsolatedProfile, desktopDataDirectory, desktopServiceOrigin, desktopApplication, startDesktopApplication, stopDesktopApplication, readDesktopLoginStartup, setDesktopLoginStartup }
 

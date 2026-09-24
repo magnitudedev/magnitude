@@ -1,13 +1,14 @@
 import { FileSystem } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
-import { Effect, Option, Schema, Scope } from "effect"
+import { Deferred, Effect, Exit, Fiber, Option, Schema, Scope } from "effect"
 import { spawn } from "node:child_process"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { describe, expect, it } from "vitest"
 import { MacUpdateFilesystem, MacUpdateFilesystemFailed, nativeMacUpdateFilesystem } from "./mac-update-filesystem"
 import { MacBundleVerificationFailed, MacBundleVerifier } from "./mac-update-validation"
-import { MacUpdateJournal, recoverMacUpdateTransaction } from "./mac-update-recovery"
+import { MacUpdateJournal, recoverMacUpdateTransaction, retireMacUpdateBundle } from "./mac-update-recovery"
+import { exchangeMacUpdate } from "./mac-update-transaction"
 
 const addon = fileURLToPath(new URL(`../../dist/native/darwin-${process.arch}/desktop-host.node`, import.meta.url))
 const run = <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem | MacUpdateFilesystem | Scope.Scope>) =>
@@ -40,12 +41,86 @@ const fixture = Effect.gen(function* () {
     Schema.decodeUnknown(Schema.parseJson(MacUpdateJournal))(Buffer.from(Option.getOrThrow(bytes)).toString())))
   const recover = recoverMacUpdateTransaction(installed, "Magnitude.app", staging).pipe(Effect.provideService(MacBundleVerifier, verifier))
   const swap = native.exchange(installed, "Magnitude.app", previous, staging, "Magnitude.app", replacement)
-  return { fs, native, root, installed, staging, oldPath, newPath, previous, replacement, write, read, recover, swap }
+  const apply = exchangeMacUpdate(installed, "Magnitude.app", staging, { previous: "0.1.5", replacement: "0.1.6", architecture: "arm64" }).pipe(
+    Effect.provideService(MacBundleVerifier, verifier))
+  const retire = retireMacUpdateBundle(installed, "Magnitude.app", staging).pipe(Effect.provideService(MacBundleVerifier, verifier))
+  return { fs, native, root, installed, staging, oldPath, newPath, previous, replacement, write, read, recover, swap, apply, retire }
+})
+
+describe.skipIf(process.platform !== "darwin")("macOS prepared bundle exchange", () => {
+  it("verifies, synchronizes, journals and installs through recovery", () => run(Effect.gen(function* () {
+    const { apply, read, native } = yield* fixture
+    const events: string[] = []
+    const traced = { ...native,
+      syncTree: (...args: Parameters<typeof native.syncTree>) => native.syncTree(...args).pipe(Effect.tap(() => Effect.sync(() => events.push("tree")))),
+      writeRecord: (...args: Parameters<typeof native.writeRecord>) => native.writeRecord(...args).pipe(Effect.tap(() => Effect.sync(() => events.push("record")))),
+      exchange: (...args: Parameters<typeof native.exchange>) => native.exchange(...args).pipe(Effect.tap(() => Effect.sync(() => events.push("exchange")))),
+    }
+    expect(yield* apply.pipe(Effect.provideService(MacUpdateFilesystem, traced))).toEqual({ _tag: "Installed", version: "0.1.6" })
+    expect(events).toEqual(["tree", "record", "exchange", "record"])
+    expect((yield* read)._tag).toBe("Committed")
+  })))
+
+  it.each(["previous", "replacement"])("refuses an invalid %s bundle before journal publication", invalid => run(Effect.gen(function* () {
+    const { apply, fs, native, staging, oldPath, newPath } = yield* fixture
+    yield* fs.writeFileString(join(invalid === "previous" ? oldPath : newPath, "version"), "damaged")
+    const result = yield* apply.pipe(Effect.either)
+    expect(result._tag).toBe("Left")
+    if (result._tag === "Left") expect(result.left._tag).toBe(invalid === "previous" ? "MacUpdateRepairRequired" : "MacUpdatePreparationFailed")
+    expect(Option.isNone(yield* native.readRecord(staging))).toBe(true)
+  })))
+
+  it("does not publish intent when staged synchronization fails", () => run(Effect.gen(function* () {
+    const { apply, native, staging } = yield* fixture
+    expect(yield* apply.pipe(Effect.provideService(MacUpdateFilesystem, { ...native,
+      syncTree: () => Effect.fail(new MacUpdateFilesystemFailed()) }), Effect.isFailure)).toBe(true)
+    expect(Option.isNone(yield* native.readRecord(staging))).toBe(true)
+  })))
+
+  it("does not replace an existing transaction journal", () => run(Effect.gen(function* () {
+    const { apply, write, read } = yield* fixture
+    yield* write("ExchangeIntent")
+    const before = yield* read
+    expect(yield* apply.pipe(Effect.isFailure)).toBe(true)
+    expect(yield* read).toEqual(before)
+  })))
+
+  it.each([false, true])("reconciles exchange failure after mutation = %s", mutated => run(Effect.gen(function* () {
+    const { apply, native, read } = yield* fixture
+    const result = yield* apply.pipe(Effect.provideService(MacUpdateFilesystem, { ...native,
+      exchange: (...args) => (mutated ? native.exchange(...args) : Effect.void).pipe(Effect.zipRight(Effect.fail(new MacUpdateFilesystemFailed()))) }))
+    expect(result._tag).toBe(mutated ? "Installed" : "Preserved")
+    expect((yield* read)._tag).toBe(mutated ? "Committed" : "Abandoned")
+  })))
+
+  it("cancels before intent without authorizing exchange", () => run(Effect.gen(function* () {
+    const { apply, native, staging } = yield* fixture
+    const waiting = yield* Deferred.make<void>()
+    const worker = yield* apply.pipe(Effect.provideService(MacUpdateFilesystem, { ...native,
+      syncTree: () => Deferred.succeed(waiting, undefined).pipe(Effect.zipRight(Effect.never)) }), Effect.forkScoped)
+    yield* Deferred.await(waiting)
+    expect(Exit.isInterrupted(yield* Fiber.interrupt(worker))).toBe(true)
+    expect(Option.isNone(yield* native.readRecord(staging))).toBe(true)
+  })))
+
+  it("finishes reconciliation when cancellation arrives after intent", () => run(Effect.gen(function* () {
+    const { apply, native, read } = yield* fixture
+    const published = yield* Deferred.make<void>()
+    const resume = yield* Deferred.make<void>()
+    const worker = yield* apply.pipe(Effect.provideService(MacUpdateFilesystem, { ...native,
+      writeRecord: (...args) => native.writeRecord(...args).pipe(Effect.zipRight(Deferred.succeed(published, undefined)), Effect.zipRight(Deferred.await(resume))),
+    }), Effect.forkScoped)
+    yield* Deferred.await(published)
+    yield* Fiber.interruptFork(worker)
+    yield* Deferred.succeed(resume, undefined)
+    expect(Exit.isInterrupted(yield* Fiber.await(worker))).toBe(true)
+    expect((yield* read)._tag).toBe("Committed")
+  })))
 })
 
 describe.skipIf(process.platform !== "darwin")("macOS transaction recovery on native filesystems", () => {
-  it.each(["BeforeExchange", "AfterExchange", "AfterCommit", "BeforeRestore", "AfterRestore"])("recovers after actual process loss at %s", phase => run(Effect.gen(function* () {
-    const { root, staging, write, recover } = yield* fixture
+  it.each(["BeforeExchange", "AfterExchange", "AfterCommit", "BeforeRestore", "AfterRestore", "PartialCleanup", "AfterTreeRemoval", "AfterReceiptRemoval"])("recovers after actual process loss at %s", phase => run(Effect.gen(function* () {
+    const { root, staging, write, recover, retire, fs, oldPath, newPath } = yield* fixture
     yield* write("ExchangeIntent")
     yield* Effect.async<void>(resume => {
       const child = spawn(process.execPath, [fileURLToPath(new URL("./fixtures/mac-update-recovery-crash.ts", import.meta.url)), root, staging.path, phase], { stdio: ["ignore", "ignore", "inherit"] })
@@ -53,10 +128,16 @@ describe.skipIf(process.platform !== "darwin")("macOS transaction recovery on na
       child.once("exit", (_code, signal) => resume(Effect.sync(() => expect(signal).toBe("SIGKILL"))))
       return Effect.sync(() => { child.kill("SIGKILL") })
     })
-    const expected = phase === "BeforeExchange" ? { _tag: "Preserved", reason: "Interrupted" }
+    const expected = phase === "AfterReceiptRemoval" ? { _tag: "NoTransaction" } : phase === "BeforeExchange" ? { _tag: "Preserved", reason: "Interrupted" }
       : phase.endsWith("Restore") ? { _tag: "Preserved", reason: "Restored" } : { _tag: "Installed", version: "0.1.6" }
     expect(yield* recover).toMatchObject(expected)
     expect(yield* recover).toMatchObject(expected)
+    if (["PartialCleanup", "AfterTreeRemoval", "AfterReceiptRemoval"].includes(phase)) {
+      expect(yield* fs.readFileString(join(oldPath, "version"))).toBe("0.1.6")
+      yield* retire
+      expect(yield* fs.exists(newPath)).toBe(false)
+      expect(yield* recover).toEqual({ _tag: "NoTransaction" })
+    }
   })))
 
   it("leaves an installation with no journal untouched", () => run(Effect.gen(function* () {
@@ -227,5 +308,58 @@ describe.skipIf(process.platform !== "darwin")("macOS transaction recovery on na
       expect(result._tag).toBe("Right")
       if (result._tag === "Right") expect(result.right._tag).toBe(outcome)
     }
+  })))
+})
+
+describe.skipIf(process.platform !== "darwin")("macOS completed transaction cleanup", () => {
+  it.each(["Committed", "Restored", "Abandoned"] as const)("retires only displaced contents for %s and replays without exchange", tag => run(Effect.gen(function* () {
+    const { fs, newPath, oldPath, write, read, swap, retire, recover } = yield* fixture
+    if (tag === "Committed") yield* swap
+    yield* write(tag)
+    const expected = yield* recover
+    expect(yield* retire).toEqual(expected)
+    expect(yield* fs.exists(newPath)).toBe(false)
+    expect(yield* fs.readFileString(join(oldPath, "version"))).toBe(tag === "Committed" ? "0.1.6" : "0.1.5")
+    expect(yield* retire).toEqual({ _tag: "NoTransaction" })
+    expect(yield* recover).toEqual({ _tag: "NoTransaction" })
+  })))
+
+  it.each(["ExchangeIntent", "RestoreIntent"] as const)("refuses cleanup of %s", tag => run(Effect.gen(function* () {
+    const { fs, newPath, write, read, retire } = yield* fixture
+    yield* write(tag)
+    expect(yield* retire.pipe(Effect.isFailure)).toBe(true)
+    expect(yield* fs.readFileString(join(newPath, "version"))).toBe("0.1.6")
+    expect((yield* read)._tag).toBe(tag)
+  })))
+
+  it("leaves unjournaled contents untouched", () => run(Effect.gen(function* () {
+    const { fs, newPath, retire } = yield* fixture
+    expect(yield* retire).toEqual({ _tag: "NoTransaction" })
+    expect(yield* fs.readFileString(join(newPath, "version"))).toBe("0.1.6")
+  })))
+
+  it("requires verified installed contents before deleting the displaced bundle", () => run(Effect.gen(function* () {
+    const { fs, oldPath, newPath, write, retire, swap } = yield* fixture
+    yield* swap
+    yield* write("Committed")
+    yield* fs.writeFileString(join(oldPath, "version"), "damaged")
+    expect(yield* retire.pipe(Effect.isFailure)).toBe(true)
+    expect(yield* fs.readFileString(join(newPath, "version"))).toBe("0.1.5")
+  })))
+
+  it("retains the terminal receipt after partial cleanup and retries only deletion", () => run(Effect.gen(function* () {
+    const { fs, native, newPath, write, read, swap, retire, recover } = yield* fixture
+    yield* swap
+    yield* write("Committed")
+    const failed = yield* retire.pipe(Effect.provideService(MacUpdateFilesystem, { ...native,
+      removeTree: () => fs.remove(join(newPath, "version")).pipe(Effect.orDie,
+        Effect.zipRight(Effect.fail(new MacUpdateFilesystemFailed()))),
+    }), Effect.either)
+    expect(failed._tag).toBe("Left")
+    if (failed._tag === "Left") expect(failed.left._tag).toBe("MacUpdateCleanupFailed")
+    expect((yield* read)._tag).toBe("Committed")
+    expect(yield* recover).toEqual({ _tag: "Installed", version: "0.1.6" })
+    expect(yield* retire).toEqual({ _tag: "Installed", version: "0.1.6" })
+    expect(yield* fs.exists(newPath)).toBe(false)
   })))
 })

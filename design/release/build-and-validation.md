@@ -130,6 +130,11 @@ embedding; executables use Hardened Runtime and the Bun executables receive JIT 
 Electron nested code is signed from the inside out. Electron receives its JIT entitlement; the
 bundled service retains Bun's separate JIT profile. No broad library-validation exception or device
 permissions are enabled by default. Framework symlinks remain intact in the platform installer.
+The macOS update extraction executable ships inside the sealed application resources and receives
+the native-helper entitlement profile, without a JIT entitlement. The packaged update configuration
+matches the build's Desktop configuration so foreground preparation uses the same publisher trust.
+Developer ID builds compile the Apple Team ID into both Desktop and the CLI; a missing or malformed
+identity fails the build. Installed runtime environment variables cannot replace that identity.
 
 Apple must accept the CLI, inference payload, desktop, app, and backend submissions. A rejected or incomplete
 submission fails the build and retains diagnostic logs. The app ticket is stapled and validated before

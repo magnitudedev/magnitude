@@ -696,3 +696,221 @@ Recovery still requires caller-held installation exclusion. Initial preparation,
 archive authentication/capability transfer, transaction cleanup, fresh-install publication, foreground
 execution and startup integration remain unfinished. This checkpoint does not enable automatic
 replacement or authorize service startup through an uncertain transaction.
+
+### Phase 6 working results: transaction preparation and installation admission
+
+Uncommitted work above `a27c35d9`; retained for the integrated installer checkpoint, following the
+requested larger checkpoint cadence. The execution-plan checkpoint guidance now reflects that cadence.
+
+The initial exchange transaction verifies both versions, synchronizes the staged tree, durably
+publishes intent, exchanges once and reconciles actual identities. Cancellation before publication
+leaves no intent; after publication it waits for reconciliation. Native staged-tree synchronization
+is bounded, does not traverse symlinks, and refuses special files and hard-linked files. A signed
+fixture integration test now exercises the real native verifier, tree sync, exchange and recovery
+together using an explicitly injected ad-hoc test requirement. Production trust remains unchanged.
+
+Added installation-wide shared/exclusive native admission with a scoped Effect capability. The
+stable lock is adjacent to the bundle, owned by its owner and readable across users, and remains
+outside bundle exchange. File creation is exclusive and permitted only to the bundle owner. Existing
+lock files are never repaired, replaced or unlinked. Validation rejects unsafe modes, extended ACLs,
+links, nonempty files, substituted parent/lock identities and forged native capabilities. Descriptors
+are close-on-exec. New admission is not yet wired to owner startup or replacement; installations owned
+by another user require the installer to provision the lock. Prior-version owner exclusion remains a
+separate migration gate, as does actual cross-user acceptance.
+
+Local Mac evidence (Bun 1.4.2, arm64):
+- Recovery/initial transaction tests: 54 passed, including interruption and failures on both sides of
+  exchange. Native filesystem tests: 11 passed. Actual signature tests: 13 passed.
+- Installation admission: seven tests passed, including independent-process contention and SIGKILL
+  release without lock replacement, shared-reader/exclusive-writer exclusion, bundle replacement,
+  unsafe files, extended ACLs and retained capability validation.
+- Full daemon-management suite: 388 passed, 11 platform/integration skips, exit 0. Log:
+  `/tmp/magnitude-headless-transfer/phase6-mac-admission-suite.log`.
+- Targeted daemon-management typecheck and native build exited 0. Clang static analysis passed for
+  changed transaction filesystem and admission sources. `git diff --check` passed.
+
+These results do not prove a packaged startup update. Admission migration, retained archive transfer,
+extractor containment, cleanup, foreground continuation, startup composition, signed release assembly,
+actual cross-user/system-manager and abrupt VM shutdown acceptance remain unfinished. No automatic
+replacement has been enabled, and no checkpoint commit was made for these intermediate results.
+
+### Phase 6 working results: authenticated extraction composition
+
+Still uncommitted above `a27c35d9`. The native build now produces the extraction helper alongside the
+existing command-lifetime helper. A shared Effect staging service authenticates the release for the
+exact Mac ZIP target, invokes extraction through the native command guard, and revalidates staging
+before returning. The extractor hashes its retained no-follow archive descriptor before and after
+parsing, checks the authenticated byte count, and rejects write access for other users, hard links
+and extended ACLs. Private staging now rejects extended ACLs at the extraction boundary too.
+
+The existing native signed-fixture transaction now starts with a publisher-signed ZIP release and
+runs guarded extraction, native bundle validation, staged-tree synchronization, exchange and recovery.
+An invalid release signature and modified archive bytes both fail before populating staging. This
+is an ad-hoc bundle/test-publisher integration fixture, not production signing or packaged startup.
+Native build, 13 bundle/integration tests, seven admission tests, targeted package typecheck and
+extractor Clang static analysis passed. Eighteen Python extraction cases passed normally and with
+address/undefined-behavior sanitizers. `git diff --check` passed. The full-suite result in the preceding
+entry predates these extraction changes; only affected tests were rerun here.
+
+Migration investigation rejected using an empty whole-machine process-search result as admission
+proof: the implementation can omit failed observations. Direct executable-path observation detected
+an unrelated live process with an unresolved executable on this Mac. Consequently, whole-machine
+path scanning also cannot provide a practical migration guarantee without a separate identity model.
+The exploratory observation code was removed; no process was terminated. The shared kernel lease
+remains, while prior-version migration policy and its acceptance remain open. Automatic replacement
+is still disabled. Integration must not silently equate an unobservable process to an absent owner.
+
+### Phase 6 working results: terminal cleanup and repeated signed transactions
+
+Uncommitted work remains above `a27c35d9`. Added descriptor-relative displaced-tree removal and
+exact-content journal removal. Cleanup first requires a terminal transaction and revalidates the
+installed bundle through recovery. It removes only the expected displaced identity within private
+staging, never traverses symlinks, and keeps the journal throughout partial deletion. The exact
+terminal record is removed and durably synchronized last. An unsuccessful deletion is a distinct
+cleanup failure, not a claim that the installed bundle needs rollback. Empty-journal retries sync
+the staging directory. Old terminal receipts cannot remain eligible for recovery after a later
+transaction changes the installed identity.
+
+The actual signed fixture now performs two successive publisher-authenticated ZIP extractions,
+native signature checks, exchanges and cleanup, verifying versions 0.1.5 → 0.1.6 → 0.1.7. Both
+transaction directories are empty afterward. This remains fixture-bundle acceptance, not a packaged
+Desktop/CLI/ACN update or production publisher acceptance.
+
+Added terminal-state cleanup/replay, refusal of nonterminal and unjournaled deletion, installed-bundle
+validation before retirement, partial-deletion failure/retry, outside symlink/hard-link preservation
+and exact receipt matching tests. Three additional fixture subprocesses actually die by SIGKILL
+after partial cleanup, displaced-tree removal and receipt removal. Recovery observes the expected
+version and cleanup completes without another exchange. These are process-loss tests, not VM
+power-loss evidence.
+
+Native build, targeted daemon-management typecheck and Clang filesystem static analysis passed.
+Full daemon-management suite passed: 401 tests, 11 platform/integration skips, exit 0; log
+`/tmp/magnitude-headless-transfer/phase6-mac-cleanup-suite.log`. The first full-suite invocation used
+the workspace directory accidentally; it was interrupted (exit 130), preserved separately as
+`phase6-mac-cleanup-wrong-scope-interrupted.log`, and is not a claimed pass. The corrected package run
+is the result above. `git diff --check` passed. No checkpoint commit was made; startup/continuation,
+transaction discovery, migration exclusion and packaged acceptance remain unfinished.
+
+### Phase 7 working results: finite update preparation and maintenance admission
+
+Uncommitted alongside the Phase 6 integration work. Added shared finite preparation and persisted
+observation, independently of the long-lived owner's timer. Passive observation reads only prepared
+state and preferences. Check never auto-downloads, even when the saved preference is enabled.
+Download performs one check and waits through durable preparation plus transfer-scope retirement;
+it refuses to claim Ready if staging did not publish the exact unattempted release. Existing
+prepared/failed installers are not silently replaced or retried. Discard waits for store cleanup.
+These operations do not install an application or change preferences.
+
+A scoped maintenance entry acquires the same native application lock without a control listener,
+service or takeover, then rechecks the per-user installer lease before any operation. Contention
+fails immediately. The normal ownership directory setup is shared with application admission.
+The public CLI has not yet been routed to this entry; update-source/configuration composition,
+owner routing, finite installation completion and headless scheduling remain to integrate.
+
+Nine finite-preparation tests and eight native owner-arbitration tests passed (17 total). They cover
+passive reads, check without auto-download, publication/cleanup ordering, cancellation during staging,
+missing publication, retained installation failures, failed discard, owner/maintenance contention,
+installer exclusion and ownership release. Targeted daemon-management typecheck and diff whitespace
+checks passed. Mac native evidence does not establish Windows/Linux maintenance acceptance. No commit
+was made; the next checkpoint remains substantial integrated behavior with its full validation.
+
+### Phase 7 working results: installed preparation and CLI routing
+
+Uncommitted. Desktop build configuration now has a shared strict decoder and a packaged
+`update-configuration.json` resource for installed CLI preparation. Status and discard do not acquire
+a network source or request identity. The CLI passively observes the owner, routes once to a present
+owner, and uses scoped maintenance when absent. An owner mutation's lost reply is never retried via
+maintenance. The native host update method no longer ensures or launches Desktop. Ready output
+identifies whether the user must stop a live foreground server first.
+
+Targeted validation: 19 shared tests passed (configuration 8, installed preparation 2, finite
+preparation 9), plus 8 CLI routing/output tests. Installed preparation uses real temporary resources
+and missing profiles with write capabilities that fail if called; both Mac and Windows target
+composition remains observational and isolated production source acquisition refuses before writes.
+These are Mac-hosted tests, not Windows packaged acceptance. Targeted daemon-management and CLI
+TypeScript checks passed. An initial Windows fixture used an unsupported arm64 release target and
+was corrected to the shipped x64 target. Lazy-import mocking did not intercept maintenance under the
+Bun test runtime; the absence routing test now exercises the actual development-build refusal.
+
+The command matrix is not complete: finite install still refuses without an owner, the headless
+owner's update endpoint remains to integrate, and new resource assembly needs a Desktop build and
+packaged verification. Startup installation, scheduling, continuation and platform acceptance remain
+open. No checkpoint commit was made.
+
+### Phase 7 working results: live headless preparation controls
+
+Uncommitted. Headless bootstrap now initializes installed preparation after ownership/installation
+admission and before service startup. It composes the shared update engine and persisted preferences,
+reconciles retained records, and retains one scoped schedule. Control accepts status, check, download
+and discard; install returns stop-first guidance with no shutdown or installer capability. Ready
+state changes print restart guidance in the foreground terminal. Development builds remain explicitly
+unavailable for updates. Initialization failures leave serving available with an unavailable update
+state. This connects preparation only; startup installation remains unfinished and the reported
+restart path still needs the platform continuation work before feature acceptance.
+
+Twelve targeted tests passed: live-headless control 2, schedule 2, native ownership 8. They exercise
+read-only status, preparation requests, install refusal without close, timer finalization, and native
+owner exclusion. CLI and daemon-management typechecks passed with existing informational Effect
+language-service diagnostics. These results do not replace live installed-server or packaged
+cross-platform acceptance. No commit was made.
+
+Full CLI suite subsequently passed: 10 files, 102 tests, exit 0, including passive entrypoints,
+connect-only ordinary commands, status, update routing and presentation. Log:
+`/tmp/magnitude-headless-transfer/phase7-cli-suite.log`. Whitespace validation passed.
+
+### Phase 6/7 working results: packaged preparation resources
+
+Node-driven Desktop build passed and emitted the shared update configuration. Desktop and release
+package typechecks passed. Assembly now includes the macOS extraction executable; signing assigns
+it the native-helper profile without JIT entitlements. An isolated application was assembled under
+`/tmp/magnitude-headless-transfer/phase7-assembly`, using the existing installed 0.1.5 CLI and service
+as read-only assembly inputs. It was not launched and is not a matched-current-runtime acceptance
+fixture. The personal installation was not modified.
+
+The assembled configuration equals Desktop's generated configuration and its publisher fields match
+packaged trust. Ad-hoc signing through the release signing function and strict deep verification
+passed. The helper's signed entitlements are empty; loader inspection lists only system libarchive
+and libSystem. All 18 extraction fixtures passed against the executable inside this signed bundle.
+An attempted post-signing byte comparison with the unsigned build input failed because signing
+changes executable bytes; it was not counted as validation. Signing and native behavior were then
+verified directly. Production Developer ID/notarization and matched-version application update
+acceptance remain open. Logs: `phase7-desktop-build.log`, `phase7-desktop-types.log`,
+`phase7-release-types.log`, `phase7-assembly.log`, `phase7-sign.log`, and
+`phase7-packaged-extraction.log` under `/tmp/magnitude-headless-transfer`. No commit was made.
+
+### Phase 6/7 working results: startup integration review
+
+The existing Linux Desktop handoff explicitly waits for the parent's lifetime pipe to close before
+starting package installation. A foreground caller cannot wait synchronously on that same handoff;
+its installation/completion path must be separate, retain invoking-user identity and authorize the
+narrow installed package operation before continuing. No foreground completion claim was added.
+
+Desktop now substitutes its Apple publisher Team ID at build time under the same Developer ID mode
+used by CLI compilation. Missing/empty and malformed Team IDs were both exercised through actual
+Electron build configuration loading and failed with the intended error. The normal ad-hoc Desktop
+build passed. Runtime environment cannot supply this compiled value; the custom verifier still
+refuses an absent production identity. The verifier is not yet connected to Desktop replacement.
+Also added a stop-request recheck after headless update initialization so cancellation during that
+initialization cannot proceed into service startup. No commit was made.
+
+### Checkpoint: shared preparation and macOS transaction integration foundation
+
+Checkpoint includes the substantial uncommitted preparation/control, native extraction/admission,
+transaction cleanup, packaged resources and associated design work described above. It does not mark
+Phase 6 or 7 complete. The unfinished Linux foreground installer is excluded and retained separately
+for continuation. Remaining startup/continuation and packaged acceptance gates remain authoritative.
+
+Final checkpoint validation on macOS arm64 with Bun 1.4.2:
+- Shared runtime: 424 passed, 11 platform/integration skips, exit 0.
+- CLI: 102 passed, exit 0.
+- Desktop: 227 passed, 2 packaged/integration skips, exit 0 on full rerun. The initial concurrent
+  run returned empty shell output in one unchanged harness-quoting test; its isolated 11-test file
+  and the full rerun passed without changes. The intermittent failure remains recorded, not diagnosed.
+- Targeted shared-runtime and CLI typechecks passed; Desktop/release typechecks and Node Desktop
+  builds passed earlier in this checkpoint. Native and packaged extraction evidence is recorded above.
+- Diff whitespace check passed. Added text was checked for prohibited sensitive references.
+
+Final logs under `/tmp/magnitude-headless-transfer`: `phase7-checkpoint-daemon-tests.log`,
+`phase7-checkpoint-cli-tests.log`, `phase7-checkpoint-desktop-tests.log` (initial failure),
+`phase7-checkpoint-desktop-retest.log`, `phase7-checkpoint-daemon-types.log`, and
+`phase7-checkpoint-cli-types.log`. This checkpoint is not cross-platform production acceptance.

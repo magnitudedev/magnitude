@@ -1,9 +1,11 @@
 import { Effect, Option, Schema } from "effect"
+import { unlinkSync } from "node:fs"
+import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { MacUpdateFilesystem, nativeMacUpdateFilesystem } from "../mac-update-filesystem"
 import { MacUpdateJournal } from "../mac-update-recovery"
 
-const Phase = Schema.Literal("BeforeExchange", "AfterExchange", "AfterCommit", "BeforeRestore", "AfterRestore")
+const Phase = Schema.Literal("BeforeExchange", "AfterExchange", "AfterCommit", "BeforeRestore", "AfterRestore", "PartialCleanup", "AfterTreeRemoval", "AfterReceiptRemoval")
 const crash = Effect.sync(() => process.kill(process.pid, "SIGKILL"))
 const program = Effect.gen(function* () {
   const [root, stagingPath, phase] = yield* Schema.decodeUnknown(Schema.Tuple(Schema.NonEmptyString, Schema.NonEmptyString, Phase))(process.argv.slice(2))
@@ -19,8 +21,17 @@ const program = Effect.gen(function* () {
   if (phase === "BeforeExchange") return yield* crash
   yield* fs.exchange(installed, "Magnitude.app", transaction.previous.identity, staging, "Magnitude.app", transaction.replacement.identity)
   if (phase === "AfterExchange") return yield* crash
-  if (phase === "AfterCommit") {
+  if (phase === "AfterCommit" || phase === "PartialCleanup" || phase === "AfterTreeRemoval" || phase === "AfterReceiptRemoval") {
     yield* write("Committed")
+    if (phase === "AfterCommit") return yield* crash
+    if (phase === "PartialCleanup") {
+      yield* Effect.sync(() => unlinkSync(join(stagingPath, "Magnitude.app/version")))
+      return yield* crash
+    }
+    yield* fs.removeTree(staging, "Magnitude.app", transaction.previous.identity)
+    if (phase === "AfterTreeRemoval") return yield* crash
+    const receipt = Option.getOrThrow(yield* fs.readRecord(staging))
+    yield* fs.removeRecord(staging, receipt)
     return yield* crash
   }
   yield* write("RestoreIntent")

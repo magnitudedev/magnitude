@@ -117,8 +117,10 @@ ssh tom@sparky
 
 ## Execution and checkpoint discipline
 
-Each phase ends with a narrow commit after its gates pass. Do not accumulate unfinished phases into
-one large commit. No automatic amend/squash of accepted checkpoints. Preserve unrelated user work.
+Checkpoint commits cover substantial integrated work after its validation gates pass. Component
+steps and intermediate tests stay uncommitted until the larger working chunk is verified; phases may
+be combined or adapted as evidence warrants. No automatic amend/squash of accepted checkpoints.
+Preserve unrelated user work.
 
 At each checkpoint record: source commit, test commands and exit codes, OS/architecture/runtime,
 artifact SHA-256/version/source commit, scenario results, skipped tests with reason, logs and remaining

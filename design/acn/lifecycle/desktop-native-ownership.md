@@ -65,6 +65,10 @@ sibling electron/ directory and must not pre-create the protected state leaf wit
 Desktop, CLI and installer resolve the same application.lock. Update helpers use a separate kernel
 installation lease only to exclude app startup/cleanup during replacement, never to elect a service
 or infer liveness from file presence.
+Finite update maintenance acquires the same application lock without creating a control listener,
+service or desktop. Contention fails immediately without requesting takeover. After acquisition it
+rechecks the per-user installation lease before any update operation; release follows completion or
+cancellation of all scoped transfer work. Passive update observation does not acquire maintenance.
 Installed Linux foreground owners open the root-owned, read-only installation lock themselves and
 retain a nonblocking shared lease. Missing, unsafe or busy admission and an installation marker fail
 before service launch. The lease has a distinct native capability, releases idempotently with its

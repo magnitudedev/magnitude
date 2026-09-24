@@ -1,5 +1,6 @@
 /* Bounded synchronous operations for the finite installer process, under installation exclusion. */
 #include <node_api.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -108,6 +109,104 @@ static napi_value sync_directory(napi_env env, napi_callback_info info) {
   if (!directory || fsync(directory->fd)) return fail(env);
   return nothing(env);
 }
+static int sync_tree_contents(int fd, unsigned depth, unsigned *entries, uint64_t *bytes) {
+  if (depth > 64) return 0;
+  int duplicate = dup(fd);
+  if (duplicate < 0) return 0;
+  DIR *directory = fdopendir(duplicate);
+  if (!directory) { close(duplicate); return 0; }
+  int valid = 1;
+  struct dirent *entry;
+  for (;;) {
+    errno = 0;
+    entry = readdir(directory);
+    if (!entry) { if (errno) valid = 0; break; }
+    if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+    struct stat before, opened;
+    if (++*entries > 65536 || fstatat(fd, entry->d_name, &before, AT_SYMLINK_NOFOLLOW)) { valid = 0; break; }
+    if (S_ISLNK(before.st_mode)) continue;
+    if ((!S_ISDIR(before.st_mode) && !S_ISREG(before.st_mode)) || before.st_uid != geteuid()) { valid = 0; break; }
+    int child = openat(fd, entry->d_name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK |
+      (S_ISDIR(before.st_mode) ? O_DIRECTORY : 0));
+    if (child < 0) { valid = 0; break; }
+    valid = fstat(child, &opened) == 0 && same(before, opened);
+    if (valid && S_ISDIR(before.st_mode)) valid = sync_tree_contents(child, depth + 1, entries, bytes);
+    else if (valid) {
+      const uint64_t limit = UINT64_C(8) * 1024 * 1024 * 1024;
+      valid = opened.st_nlink == 1 && opened.st_size >= 0 && (uint64_t)opened.st_size <= limit - *bytes;
+      if (valid) { *bytes += (uint64_t)opened.st_size; valid = fsync(child) == 0; }
+    }
+    close(child);
+    if (!valid) break;
+  }
+  closedir(directory);
+  return valid && fsync(fd) == 0;
+}
+static napi_value sync_tree(napi_env env, napi_callback_info info) {
+  napi_value args[3]; size_t argc = 3;
+  char name[NAME_MAX + 1], expected[64], actual[64]; struct stat before, opened, after;
+  if (napi_get_cb_info(env, info, &argc, args, NULL, NULL) != napi_ok || argc != 3 ||
+      !leaf(env, args[1], name) || !string(env, args[2], expected, sizeof(expected))) return fail(env);
+  update_directory *directory = unwrap(env, args[0], 1);
+  if (!directory || !directory->private_directory || fstatat(directory->fd, name, &before, AT_SYMLINK_NOFOLLOW) ||
+      !S_ISDIR(before.st_mode) || before.st_uid != geteuid()) return fail(env);
+  identity_text(before, actual);
+  if (strcmp(actual, expected)) return fail(env);
+  int fd = openat(directory->fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) return fail(env);
+  unsigned entries = 0; uint64_t bytes = 0;
+  int valid = fstat(fd, &opened) == 0 && same(before, opened) && sync_tree_contents(fd, 0, &entries, &bytes) &&
+    fstatat(directory->fd, name, &after, AT_SYMLINK_NOFOLLOW) == 0 && same(before, after) && fsync(directory->fd) == 0;
+  close(fd);
+  return valid ? nothing(env) : fail(env);
+}
+static int remove_tree_contents(int fd, unsigned depth, unsigned *entries) {
+  if (depth > 64) return 0;
+  int duplicate = dup(fd);
+  if (duplicate < 0) return 0;
+  DIR *directory = fdopendir(duplicate);
+  if (!directory) { close(duplicate); return 0; }
+  int valid = 1;
+  for (;;) {
+    errno = 0;
+    struct dirent *entry = readdir(directory);
+    if (!entry) { if (errno) valid = 0; break; }
+    if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+    struct stat before, opened, current;
+    if (++*entries > 65536 || fstatat(fd, entry->d_name, &before, AT_SYMLINK_NOFOLLOW)) { valid = 0; break; }
+    if (S_ISDIR(before.st_mode)) {
+      int child = openat(fd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      if (child < 0) { valid = 0; break; }
+      valid = fstat(child, &opened) == 0 && same(before, opened) && remove_tree_contents(child, depth + 1, entries);
+      close(child);
+      if (!valid) break;
+    }
+    if (fstatat(fd, entry->d_name, &current, AT_SYMLINK_NOFOLLOW) || !same(before, current) ||
+        unlinkat(fd, entry->d_name, S_ISDIR(before.st_mode) ? AT_REMOVEDIR : 0)) { valid = 0; break; }
+  }
+  closedir(directory);
+  return valid && fsync(fd) == 0;
+}
+/* Only a terminal transaction authorizes this operation; the private journal remains intact. */
+static napi_value remove_tree(napi_env env, napi_callback_info info) {
+  napi_value args[3]; size_t argc = 3;
+  char name[NAME_MAX + 1], expected[64], actual[64]; struct stat before, opened, after;
+  if (napi_get_cb_info(env, info, &argc, args, NULL, NULL) != napi_ok || argc != 3 ||
+      !leaf(env, args[1], name) || !string(env, args[2], expected, sizeof(expected))) return fail(env);
+  update_directory *directory = unwrap(env, args[0], 1);
+  if (!directory || !directory->private_directory || fstatat(directory->fd, name, &before, AT_SYMLINK_NOFOLLOW) ||
+      !S_ISDIR(before.st_mode)) return fail(env);
+  identity_text(before, actual);
+  if (strcmp(actual, expected)) return fail(env);
+  int fd = openat(directory->fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) return fail(env);
+  unsigned entries = 0;
+  int valid = fstat(fd, &opened) == 0 && same(before, opened) && remove_tree_contents(fd, 0, &entries) &&
+    fstatat(directory->fd, name, &after, AT_SYMLINK_NOFOLLOW) == 0 && same(before, after) &&
+    unlinkat(directory->fd, name, AT_REMOVEDIR) == 0 && fsync(directory->fd) == 0;
+  close(fd);
+  return valid ? nothing(env) : fail(env);
+}
 static napi_value inspect(napi_env env, napi_callback_info info) {
   napi_value args[2], result; size_t argc = 2;
   char name[NAME_MAX + 1], identity[64]; struct stat st;
@@ -148,6 +247,32 @@ static napi_value read_record(napi_env env, napi_callback_info info) {
   if (!valid || length != (size_t)st.st_size || length > RECORD_LIMIT ||
       napi_create_buffer_copy(env, length, bytes, NULL, &result) != napi_ok) return fail(env);
   return result;
+}
+static napi_value remove_record(napi_env env, napi_callback_info info) {
+  napi_value args[2]; size_t argc = 2, length; void *bytes; bool buffer = false;
+  if (napi_get_cb_info(env, info, &argc, args, NULL, NULL) != napi_ok || argc != 2 ||
+      napi_is_buffer(env, args[1], &buffer) != napi_ok || !buffer ||
+      napi_get_buffer_info(env, args[1], &bytes, &length) != napi_ok || !length || length > RECORD_LIMIT) return fail(env);
+  update_directory *directory = unwrap(env, args[0], 1);
+  if (!directory || !directory->private_directory) return fail(env);
+  int fd = openat(directory->fd, "transaction.json", O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+  if (fd < 0) return fail(env);
+  struct stat before, named;
+  char actual[RECORD_LIMIT + 1]; size_t read_length = 0;
+  int valid = fstat(fd, &before) == 0 && S_ISREG(before.st_mode) && before.st_uid == geteuid() &&
+    before.st_nlink == 1 && !(before.st_mode & 077) && before.st_size == (off_t)length && no_extended_acl(fd);
+  while (valid && read_length < sizeof(actual)) {
+    ssize_t count = read(fd, actual + read_length, sizeof(actual) - read_length);
+    if (count < 0 && errno == EINTR) continue;
+    if (count < 0) { valid = 0; break; }
+    if (!count) break;
+    read_length += (size_t)count;
+  }
+  valid = valid && read_length == length && !memcmp(actual, bytes, length) &&
+    fstatat(directory->fd, "transaction.json", &named, AT_SYMLINK_NOFOLLOW) == 0 && same(before, named) &&
+    unlinkat(directory->fd, "transaction.json", 0) == 0 && fsync(directory->fd) == 0 && fcntl(fd, F_FULLFSYNC) == 0;
+  close(fd);
+  return valid ? nothing(env) : fail(env);
 }
 static napi_value write_record(napi_env env, napi_callback_info info) {
   napi_value args[2]; size_t argc = 2, length; void *bytes; bool buffer = false;
@@ -208,8 +333,11 @@ void magnitude_register_mac_update_filesystem(napi_env env, napi_value exports) 
     {"openMacUpdateDirectory", NULL, acquire, NULL, NULL, NULL, napi_default, NULL},
     {"closeMacUpdateDirectory", NULL, close_directory, NULL, NULL, NULL, napi_default, NULL},
     {"syncMacUpdateDirectory", NULL, sync_directory, NULL, NULL, NULL, napi_default, NULL},
+    {"syncMacUpdateTree", NULL, sync_tree, NULL, NULL, NULL, napi_default, NULL},
+    {"removeMacUpdateTree", NULL, remove_tree, NULL, NULL, NULL, napi_default, NULL},
     {"inspectMacUpdateDirectory", NULL, inspect, NULL, NULL, NULL, napi_default, NULL},
     {"readMacUpdateRecord", NULL, read_record, NULL, NULL, NULL, napi_default, NULL},
+    {"removeMacUpdateRecord", NULL, remove_record, NULL, NULL, NULL, napi_default, NULL},
     {"writeMacUpdateRecord", NULL, write_record, NULL, NULL, NULL, napi_default, NULL},
     {"exchangeMacUpdateDirectories", NULL, exchange, NULL, NULL, NULL, napi_default, NULL},
   };

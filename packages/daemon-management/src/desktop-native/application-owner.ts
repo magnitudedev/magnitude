@@ -3,6 +3,7 @@ import { dirname, join } from "node:path"
 import { Effect, Option, Schema } from "effect"
 import { NativeHost } from "./index"
 import { requestApplication } from "./application-control"
+import { isUpdateInstallationActive } from "./update-installation-lease"
 
 export class ApplicationOwnershipFailed extends Schema.TaggedError<ApplicationOwnershipFailed>()("ApplicationOwnershipFailed", { message: Schema.String }) {}
 export const ApplicationOwnerRequest = Schema.Union(
@@ -11,10 +12,7 @@ export const ApplicationOwnerRequest = Schema.Union(
 )
 export type ApplicationOwnerRequest = typeof ApplicationOwnerRequest.Type
 
-/** A handoff requests cooperation; only acquisition of the retained kernel lock admits a new owner. */
-export const acquireApplicationOwner = (directory: string, request: ApplicationOwnerRequest) => Effect.gen(function* () {
-  const native = yield* NativeHost
-  yield* Effect.tryPromise({ try: async () => {
+const prepareOwnershipDirectory = (directory: string) => Effect.tryPromise({ try: async () => {
     // Windows creates the final directory with its private ACL inside native acquisition.
     await mkdir(process.platform === "win32" ? dirname(directory) : directory, { recursive: true, mode: 0o700 })
     if (process.platform !== "win32") {
@@ -23,6 +21,11 @@ export const acquireApplicationOwner = (directory: string, request: ApplicationO
       await chmod(directory, 0o700)
     }
   }, catch: error => new ApplicationOwnershipFailed({ message: String(error) }) })
+
+/** A handoff requests cooperation; only acquisition of the retained kernel lock admits a new owner. */
+export const acquireApplicationOwner = (directory: string, request: ApplicationOwnerRequest) => Effect.gen(function* () {
+  const native = yield* NativeHost
+  yield* prepareOwnershipDirectory(directory)
   for (;;) {
     const lock = yield* native.acquireOwnership(join(directory, "application.lock"))
     if (Option.isSome(lock)) return { _tag: "Owner" as const, socketPath: yield* native.ownedEndpoint(lock.value, directory), lock: lock.value }
@@ -48,3 +51,16 @@ export const acquireApplicationOwner = (directory: string, request: ApplicationO
 }).pipe(Effect.timeoutFail({ duration: "60 seconds", onTimeout: () => new ApplicationOwnershipFailed({
   message: "The existing Magnitude owner has not finished stopping; it has not been replaced.",
 }) }))
+
+/** Finite mutations use the same kernel ownership, with no control listener, takeover or service. */
+export const acquireApplicationMaintenance = (directory: string) => Effect.gen(function* () {
+  const native = yield* NativeHost
+  yield* prepareOwnershipDirectory(directory)
+  const lock = yield* native.acquireOwnership(join(directory, "application.lock"))
+  if (Option.isNone(lock)) return yield* new ApplicationOwnershipFailed({
+    message: "Magnitude started while preparing this update command. Retry the command against the running application.",
+  })
+  if (yield* isUpdateInstallationActive(directory)) return yield* new ApplicationOwnershipFailed({
+    message: "A Magnitude update is being installed. Retry the command when it finishes.",
+  })
+})

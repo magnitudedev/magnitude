@@ -1,10 +1,10 @@
 import { Effect, Schema } from "effect"
 import { ApplicationUpdateAction, type DesktopUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { formatStorageSize } from "@magnitudedev/client-common"
-import { updateDesktopApplication } from "../server/application"
+import { updateApplication } from "../server/application"
 import { runCommand } from "./output"
 
-export const renderApplicationUpdate = (state: DesktopUpdateState): string => {
+export const renderApplicationUpdate = (state: DesktopUpdateState, owner: "Desktop" | "Headless" | "None" = "Desktop"): string => {
   if (state.check._tag === "Checking" && (state.transfer._tag === "Idle" || state.transfer._tag === "Failed")) {
     return "Checking for application updates.\n"
   }
@@ -14,7 +14,7 @@ export const renderApplicationUpdate = (state: DesktopUpdateState): string => {
     case "Downloading": return `Downloading Magnitude ${state.transfer.version}: ${formatStorageSize(state.transfer.completed)} of ${formatStorageSize(state.transfer.total)}.\nCheck progress: magnitude update status\n`
     case "Staging": return `Preparing Magnitude ${state.transfer.version}.\nCheck progress: magnitude update status\n`
     case "InstallationFailed": return `${state.transfer.message}\nRetry installation: magnitude update install\nDiscard download: magnitude update discard\n`
-    case "Ready": return `Magnitude ${state.transfer.version} is ready to install.\nInstall and restart: magnitude update install\n`
+    case "Ready": return `Magnitude ${state.transfer.version} is ready to install.\n${owner === "Headless" ? "Stop the server, then run: magnitude serve" : owner === "None" ? "Install: magnitude update install" : "Install and restart: magnitude update install"}\n`
     case "Cancelling": return "Cancelling the automatic update download.\nCheck progress: magnitude update status\n"
     case "Closed": return "Magnitude is quitting.\n"
     case "Idle": return state.check._tag === "Succeeded" ? "Magnitude is up to date.\n"
@@ -24,6 +24,6 @@ export const renderApplicationUpdate = (state: DesktopUpdateState): string => {
 }
 
 export const runUpdate = (input: string) => runCommand({
-  effect: Schema.decodeUnknown(ApplicationUpdateAction)(input).pipe(Effect.flatMap(action => updateDesktopApplication(action).pipe(Effect.map(state => ({ action, state }))))),
-  render: ({ action, state }) => action === "install" ? "Magnitude is stopping its model and service to install the update and restart.\n" : action === "discard" ? "The prepared update was discarded.\n" : renderApplicationUpdate(state),
+  effect: Schema.decodeUnknown(ApplicationUpdateAction)(input).pipe(Effect.flatMap(action => updateApplication(action).pipe(Effect.map(result => ({ action, ...result }))))),
+  render: ({ action, state, owner }) => action === "install" ? "Magnitude is stopping its model and service to install the update and restart.\n" : action === "discard" ? "The prepared update was discarded.\n" : renderApplicationUpdate(state, owner),
 })

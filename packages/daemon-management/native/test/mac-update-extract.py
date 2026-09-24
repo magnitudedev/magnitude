@@ -1,4 +1,5 @@
 """Native extraction acceptance; no installed application is modified."""
+import hashlib
 import os
 from pathlib import Path
 import stat
@@ -36,9 +37,38 @@ class Extraction(unittest.TestCase):
                 entry.compress_type = zipfile.ZIP_DEFLATED
                 archive.writestr(entry, content)
 
+    def command(self):
+        data = self.archive.read_bytes()
+        return [HELPER, str(self.archive), str(self.stage), hashlib.sha256(data).hexdigest(), str(len(data))]
+
     def extract(self, accepted):
-        result = subprocess.run([HELPER, str(self.archive), str(self.stage)], capture_output=True, timeout=15)
+        result = subprocess.run(self.command(), capture_output=True, timeout=15)
         self.assertEqual(result.returncode == 0, accepted, result.stderr.decode())
+
+    def test_authenticated_digest_and_length_are_required_before_extraction(self):
+        self.create_archive([("Magnitude.app/file", stat.S_IFREG | 0o600, b"verified")])
+        good = self.command()
+        for digest, size in [("0" * 64, good[4]), (good[3], str(int(good[4]) + 1)),
+                             (good[3], "-1"), (good[3], "0"), ("invalid", good[4])]:
+            with self.subTest(digest=digest, size=size):
+                result = subprocess.run(good[:3] + [digest, size], capture_output=True, timeout=15)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(list(self.stage.iterdir()), [])
+
+    def test_archive_writers_and_hard_links_are_refused(self):
+        self.create_archive([("Magnitude.app/file", stat.S_IFREG | 0o600, b"verified")])
+        self.archive.chmod(0o666)
+        self.extract(False)
+        self.archive.chmod(0o600)
+        os.link(self.archive, self.root / "alias.zip")
+        self.extract(False)
+        self.assertEqual(list(self.stage.iterdir()), [])
+
+    def test_extended_staging_access_is_refused(self):
+        self.create_archive([("Magnitude.app/file", stat.S_IFREG | 0o600, b"verified")])
+        subprocess.run(["/bin/chmod", "+a", "everyone allow read,search", str(self.stage)], check=True)
+        self.extract(False)
+        self.assertEqual(list(self.stage.iterdir()), [])
 
     def test_regular_modes_and_framework_links(self):
         self.create_archive([
@@ -97,7 +127,7 @@ class Extraction(unittest.TestCase):
         # The ZIP reader may normalize special attributes to regular files; it cannot create devices.
         self.create_archive([("Magnitude.app/pipe", stat.S_IFIFO | 0o600, b""),
                              ("Magnitude.app/device", stat.S_IFCHR | 0o600, b"")])
-        result = subprocess.run([HELPER, str(self.archive), str(self.stage)], capture_output=True, timeout=15)
+        result = subprocess.run(self.command(), capture_output=True, timeout=15)
         self.assertIn(result.returncode, [0, 1])
         for name in ["pipe", "device"]:
             path = self.stage / "Magnitude.app" / name
