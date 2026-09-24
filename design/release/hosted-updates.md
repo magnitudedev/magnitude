@@ -92,8 +92,9 @@ The stable adjacent lock is owned by the installation owner, readable by other u
 unlinked or rewritten. Running owners retain shared admission; an installer requires exclusive
 admission and revalidates the retained lock and parent identities before mutation. Unsafe permissions,
 extended access grants, substituted paths and observation failures are errors, not contention. The
-lease does not establish that an older application version participates in admission; migration must
-separately exclude prior-version owners before automatic replacement is enabled.
+first version carrying this admission protocol arrives through the existing updater's quit-and-relaunch
+flow. Subsequent startup replacement uses the new installation lease; an active prior native installer
+still excludes replacement. Migration requires no computer reboot or extra restart ceremony.
 A foreground installer continuation may explicitly retain only exclusive installation admission across
 exec. Adoption validates the inherited descriptor against the exact named installation lock, restores
 close-on-exec behavior and consumes that descriptor. Ordinary owner/service descriptors remain
@@ -106,6 +107,9 @@ for an unsigned build. The hidden entry point accepts only a bounded schema-chec
 its executing helper directory and consumes the inherited descriptor before running child commands.
 Only a foreground serve continuation or finite completion is permitted; it cannot launch a background
 server or interpret an arbitrary executable supplied in the request.
+The request distinguishes explicit installation from transaction recovery. Recovery may continue with
+the verified preserved installation; an explicit installation that preserves the old bundle reports
+failure instead of claiming the requested update succeeded.
 
 macOS recovery validates a bounded, schema-checked journal bound to both retained parent identities
 and the installation name. Observed bundle identities determine the result: an unexecuted exchange is
@@ -119,6 +123,13 @@ bundle. Deletion stays within the retained private directory and cannot traverse
 partial deletion retains the terminal journal for retry. Cleanup removes and durably synchronizes the
 exact terminal receipt last, before another transaction can supersede its installed identity.
 Cleanup failure is distinct from an invalid installed bundle. Recovery itself preserves contents.
+Recovery of persisted preparation never admits a new attempt or requires the archive extractor.
+Without a transaction receipt it leaves preparation and incomplete extraction available for explicit
+retry; mere staging-directory presence cannot trigger another installer continuation.
+Foreground startup gives a published receipt precedence over prepared-update selection. Without a
+receipt, only unattempted preparation admits installation. Recovery cleanup must finish before
+foreground continuation, so a retained receipt cannot cause an endless exec cycle. Finite installation
+without an owner leaves the service stopped.
 Transaction discovery uses one private directory adjacent to each installed bundle, independent of
 user profile and download-cache location. Opening it requires exclusive installation admission and
 revalidates both its identity and its entry in the retained installation parent. Observation does not

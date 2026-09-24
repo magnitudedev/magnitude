@@ -44,8 +44,9 @@ archives, not only on intermediate build outputs.
 - Custom macOS installer acceptance runs explicitly in the Apple signing environment using isolated,
   signed and notarized applications. A temporary publisher key and local-only update origin keep
   fixture metadata separate from hosted releases. The copied helper and actual hidden CLI entry
-  point must install the replacement, retire prepared state and private helper/transaction storage,
-  and leave a bundle accepted by signature, notarization-ticket and Gatekeeper checks. Native unit
+  point must install two successive replacements, verify matching CLI/service versions after each,
+  retire prepared state and private helper/transaction storage, and leave each bundle accepted by
+  signature, notarization-ticket and Gatekeeper checks. Native unit
   tests or injected verifier tests do not substitute for this gate.
 
 ## Linux build baseline

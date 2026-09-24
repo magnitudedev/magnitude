@@ -6,7 +6,7 @@ import { release } from "node:os"
 import { type ApplicationRuntime, type ApplicationProfile, PreparedUpdateStore, UpdatePreferences, makeUnixProcessContinuation, acquireUpdateInstallationLease,
   unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory } from "@magnitudedev/daemon-management/desktop-native"
 import { ApplicationUpdateSource, makeInstalledUpdatePreparation, makeApplicationUpdate,
-  reconcilePreparedUpdate, unavailableApplicationUpdate, completeLinuxForegroundUpdate } from "@magnitudedev/daemon-management/application-update"
+  reconcilePreparedUpdate, unavailableApplicationUpdate, completeLinuxForegroundUpdate, prepareMacForegroundStartup } from "@magnitudedev/daemon-management/application-update"
 import { CLI_VERSION } from "../version"
 
 /** Acquired by the headless owner after native admission, before it starts service work. */
@@ -31,12 +31,15 @@ export const initializeServeUpdates = (runtime: ApplicationRuntime, profile: App
 
 /** Startup installation precedes the shared package lease and every service process. */
 export const prepareServeStartup = (runtime: ApplicationRuntime, profile: ApplicationProfile, addon: string, stateDirectory: string) => Effect.gen(function* () {
-  if (runtime._tag !== "Installed" || process.platform !== "linux") return
+  if (runtime._tag !== "Installed" || (process.platform !== "linux" && process.platform !== "darwin")) return
   const architecture = yield* Schema.decodeUnknown(Schema.Literal("arm64", "x64"))(process.arch)
   const preparation = yield* makeInstalledUpdatePreparation({ resources: runtime.resourcesDirectory, addonPath: addon,
-    dataDirectory: profile.dataDirectory, version: CLI_VERSION, osVersion: release(), platform: "linux", architecture, isolated: profile.isolated }).pipe(Effect.option)
+    dataDirectory: profile.dataDirectory, version: CLI_VERSION, osVersion: release(), platform: process.platform, architecture, isolated: profile.isolated }).pipe(Effect.option)
   if (Option.isNone(preparation)) return
   const store = preparation.value.store
+  if (process.platform === "darwin") return yield* prepareMacForegroundStartup({ resources: runtime.resourcesDirectory,
+    stateDirectory, dataDirectory: profile.dataDirectory, version: CLI_VERSION, architecture, arguments: process.argv.slice(2) }).pipe(
+      Effect.provideService(PreparedUpdateStore, store))
   const pending = yield* reconcilePreparedUpdate(CLI_VERSION).pipe(Effect.provideService(PreparedUpdateStore, store))
   if (Option.isNone(pending) || pending.value.installation._tag !== "Unattempted") return
   const authorized = yield* Command.make("/usr/bin/sudo", "-n", "-l", "--", "/usr/lib/magnitude-desktop/resources/magnitude",

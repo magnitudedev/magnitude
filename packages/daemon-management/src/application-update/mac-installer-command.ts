@@ -2,7 +2,7 @@ import { FileSystem } from "@effect/platform"
 import { Effect, Schema } from "effect"
 import { dirname, isAbsolute, join, resolve, basename } from "node:path"
 import { ApplicationUpdateFailed } from "./application-update"
-import { completeMacPreparedInstallation } from "./mac-prepared-installation"
+import { completeMacPreparedInstallation, recoverMacPreparedInstallation } from "./mac-prepared-installation"
 import { readInstalledUpdateConfiguration } from "./update-configuration"
 import { makePreparedUpdateStore, PreparedUpdateStore } from "../desktop-native/prepared-update"
 import { acquireApplicationMaintenance } from "../desktop-native/application-owner"
@@ -20,6 +20,7 @@ import { makeUnixProcessContinuation } from "../desktop-native/unix-continuation
 const Path = Schema.NonEmptyString.pipe(Schema.maxLength(4096), Schema.filter(path => isAbsolute(path) && resolve(path) === path && !path.includes("\0")))
 export const MacInstallerRequest = Schema.Struct({
   protocol: Schema.Literal(1), bundle: Path.pipe(Schema.endsWith(".app")), stateDirectory: Path, dataDirectory: Path,
+  operation: Schema.Literal("Install", "Recover"),
   continuation: Schema.Union(Schema.TaggedStruct("None", {}), Schema.TaggedStruct("Foreground", {
     arguments: Schema.Array(Schema.String.pipe(Schema.maxLength(4096), Schema.filter(value => !value.includes("\0")))).pipe(
       Schema.minItems(1), Schema.maxItems(4096), Schema.filter(args => args[0] === "serve")),
@@ -61,13 +62,15 @@ export const runMacInstallerCommand = (payload: string, version: string) => Effe
     const configuration = yield* readInstalledUpdateConfiguration(directory)
     const store = yield* makePreparedUpdateStore({ dataDirectory: request.dataDirectory,
       target: { os: "darwin", arch: architecture, package: "mac-zip" }, trustedPublishers: configuration.trustedPublishers })
+    if (request.operation === "Recover") return yield* recoverMacPreparedInstallation(request.bundle, lease).pipe(
+      Effect.provideService(PreparedUpdateStore, store))
     const stager = yield* makeMacUpdateArchiveStager({ helper: join(directory, "magnitude-extract"), architecture,
       trustedPublishers: configuration.trustedPublishers })
     return yield* completeMacPreparedInstallation({ bundle: request.bundle, version, architecture }, lease).pipe(
       Effect.provideService(PreparedUpdateStore, store), Effect.provideService(MacUpdateArchiveStager, stager))
   }).pipe(Effect.provide([nativeHostLayer(addon), nativeMacUpdateAdmission(addon), nativeMacUpdateFilesystem(addon),
     nativeMacBundleVerifier(addon), NativeMacApplicationInstallation, guardedCommandLayer(join(directory, "magnitude-command")), unixPrivateFilePermissions])))
-  if (result._tag !== "Installed") return yield* new ApplicationUpdateFailed({ message: "The previous installation was preserved. Retry the update explicitly." })
+  if (result._tag !== "Installed" && request.operation === "Install") return yield* new ApplicationUpdateFailed({ message: "The previous installation was preserved. Retry the update explicitly." })
   if (request.continuation._tag === "Foreground") return yield* continuation.replace(join(request.bundle, "Contents/Resources/magnitude"), request.continuation.arguments, process.env)
-  yield* Effect.sync(() => { process.stdout.write("The Magnitude update was installed.\n") })
+  yield* Effect.sync(() => { process.stdout.write(result._tag === "Installed" ? "The Magnitude update was installed.\n" : "Application update recovery completed.\n") })
 }).pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })))

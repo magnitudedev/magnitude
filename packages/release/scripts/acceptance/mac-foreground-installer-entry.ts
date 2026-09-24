@@ -8,7 +8,8 @@ import { acquireUpdateInstallationLease } from "../../../daemon-management/src/d
 import { nativeHostLayer } from "../../../daemon-management/src/desktop-native/index"
 
 const Input = Schema.Struct({ resources: Schema.String, stateDirectory: Schema.String, dataDirectory: Schema.String,
-  version: Schema.String, architecture: Schema.Literal("arm64", "x64"), continuation: MacInstallerRequest.fields.continuation })
+  version: Schema.String, architecture: Schema.Literal("arm64", "x64"), operation: MacInstallerRequest.fields.operation,
+  continuation: MacInstallerRequest.fields.continuation })
 
 // Compiled with the real publisher identity. Each fixture is a fresh isolated installation.
 BunRuntime.runMain(Effect.scoped(Effect.gen(function* () {

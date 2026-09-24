@@ -6,6 +6,29 @@ import { MacApplicationInstallation } from "../desktop-native/mac-update-install
 import { MacUpdateArchiveStager } from "../desktop-native/mac-update-staging"
 import { openMacUpdateWorkspace, MacUpdateInstallationBusy } from "../desktop-native/mac-update-workspace"
 
+const reconcilePreparation = (workspace: Option.Option.Value<Effect.Effect.Success<ReturnType<typeof openMacUpdateWorkspace>>>) => Effect.gen(function* () {
+  const store = yield* PreparedUpdateStore
+  const pending = yield* store.read
+  const recovered = yield* workspace.recover
+  if (recovered._tag !== "NoTransaction") {
+    if (Option.isSome(pending)) {
+      if (recovered._tag === "Installed" && recovered.version === pending.value.release.version) yield* store.discard
+      else if (recovered._tag === "Preserved") yield* store.recordFailure(pending.value.release, "The previous installation attempt was interrupted. Retry installation explicitly.")
+    }
+    yield* workspace.retire
+  }
+  return recovered
+})
+
+/** Reconciles an existing transaction without admitting another installation attempt. */
+export const recoverMacPreparedInstallation = (bundle: string, retained?: MacExclusiveInstallationLease) => Effect.scoped(Effect.gen(function* () {
+  const installation = yield* MacApplicationInstallation
+  if (yield* installation.isInstalling(bundle)) return yield* new MacUpdateInstallationBusy()
+  const workspace = yield* openMacUpdateWorkspace(bundle, false, retained)
+  if (Option.isNone(workspace)) return { _tag: "NoTransaction" } as const
+  return yield* reconcilePreparation(workspace.value)
+}))
+
 /** Finite installer only. The caller retains application admission and owns startup continuation. */
 export const completeMacPreparedInstallation = (options: {
   readonly bundle: string
@@ -16,17 +39,10 @@ export const completeMacPreparedInstallation = (options: {
   if (yield* installation.isInstalling(options.bundle)) return yield* new MacUpdateInstallationBusy()
   const workspace = Option.getOrThrow(yield* openMacUpdateWorkspace(options.bundle, true, retained))
   const store = yield* PreparedUpdateStore
-  const pending = yield* store.read
   const cleanup = workspace.retire.pipe(Effect.catchTag("MacUpdateCleanupFailed", error => Effect.logWarning(error.message)))
-  const recovered = yield* workspace.recover
-  if (recovered._tag !== "NoTransaction") {
-    if (Option.isSome(pending)) {
-      if (recovered._tag === "Installed" && recovered.version === pending.value.release.version) yield* store.discard
-      else if (recovered._tag === "Preserved") yield* store.recordFailure(pending.value.release, "The previous installation attempt was interrupted. Retry installation explicitly.")
-    }
-    yield* cleanup
-    return recovered
-  }
+  const recovered = yield* reconcilePreparation(workspace)
+  if (recovered._tag !== "NoTransaction") return recovered
+  const pending = yield* store.read
   if (Option.isNone(pending)) return yield* new ApplicationUpdateFailed({ message: "There is no prepared application update to install." })
   const release = pending.value.release
   const archive = yield* store.verify(release)

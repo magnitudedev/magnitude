@@ -1237,3 +1237,81 @@ unknown-content refusal, old-byte retirement and repeatability assertions.
 
 These CI setup/fixture corrections are folded into the existing integration checkpoint to avoid a
 separate small checkpoint. Signed acceptance still requires a successful rerun.
+
+### Startup recovery separation and second native CI pass
+
+Checkpoint 85e893ab is running as Actions run 35948213286. macOS native acceptance and both Linux
+jobs passed. Windows passed native security/cache recovery, jobs, launcher lifetime and pipe tests,
+then exposed the same ambient temporary-ACL assumption in the Node/Bun junction fixture. That fixture
+now uses a native-created private parent and explicitly sets child ownership while preserving actual
+ACL inheritance. Both Node 24.21.0 and the pinned Bun runtime passed on the Windows VM. Production
+permission/recovery logic is unchanged. This correction remains uncommitted pending the next checkpoint.
+The signed macOS job is confirmed running; no signed installation success is claimed yet.
+
+Added a separate macOS prepared-transaction recovery operation. It observes existing staging without
+creating a workspace and reconciles published transactions without admitting another attempt or
+requiring the archive extractor. Partial extraction with no receipt remains for explicit retry;
+failed preparation stays failed. Tests now retain preparation state across operations and prove
+committed receipt reconciliation, no replay after failed extraction, and no installation merely from
+unattempted preparation. Combined recovery/workspace/installer tests: 102 passed. Targeted
+package typecheck exited 0. Logs: /tmp/magnitude-headless-transfer/mac-prepared-recovery-tests.log
+and mac-recovery-types.log. These changes remain uncommitted; public startup wiring is still open.
+
+Signed macOS acceptance in run 35948213286 completed successfully against 85e893ab: the real copied
+helper/hidden CLI installed the 0.0.502 app, retired preparation/helper/transaction storage, and passed
+codesign, stapler and Gatekeeper (Notarized Developer ID). Log retained locally as
+/tmp/magnitude-headless-transfer/mac-signed-installer-ci.log. Artifact 10786909601 contains the two
+signed ZIPs and result receipt; retrieval is in progress. This proves finite A-to-B installation,
+not public startup, desktop continuation or migration. The local acceptance harness now additionally
+requires A-to-B-to-C and matching CLI/service versions after each replacement; targeted release
+checking passes, but the expanded signed scenario has not run yet. Node and pinned Bun junction
+fixtures also passed under SYSTEM, in addition to the normal-user runs. No new checkpoint was made.
+
+The private installer request now requires an explicit Install or Recover operation. Recover uses
+transaction reconciliation without constructing an archive stager and permits continuation after a
+verified preservation result; Install still fails if the requested replacement did not commit.
+Missing/unknown operations are rejected before admission. The signed harness now includes a finite
+recovery invocation after each of its two replacements. Native transaction/workspace and invocation
+tests passed (105); daemon-management and release targeted typechecks passed; ordinary CLI regression
+passed. Logs: mac-recovery-command-tests.log, mac-recovery-command-types.log,
+mac-recovery-release-types.log and mac-recovery-cli-regression.log under the local transfer directory.
+Public startup/migration is not enabled by this private-command change. No additional commit yet.
+
+### macOS foreground startup wiring and signed local regression
+
+Connected installed macOS serve startup and finite no-owner installation to the private custom
+installer. Published receipts select recovery first; otherwise only unattempted preparation selects
+installation. Recovery receipt retirement is required before exec continuation to prevent an exec
+loop on cleanup failure. The first upgraded application arrives through the existing updater's
+quit/relaunch path; no reboot or extra migration ceremony is required. Startup-selection tests passed
+(6); macOS application-update tests passed (37); ordinary CLI tests passed (102); targeted CLI and
+daemon-management checking passed after completing the test-store implementation. Full signed
+acceptance of this new public wiring is still pending; these edits remain uncommitted.
+
+Downloaded artifact 10786909601 and inspected its successful finite-install receipt. Extracted the
+signed 0.0.502 app to /tmp/magnitude-headless-transfer/signed-mac-local, leaving the personal
+installation untouched. CLI and service version commands both returned 0.0.502. Using isolated
+profile /tmp/magnitude-headless-transfer/signed-mac-profile and port 11237, with the local development
+ICN installation override, serve reached Ready. Launching the same signed desktop cooperatively
+retired Headless (exit 0), and CLI status then reported Ready/Desktop. Computer use opened the real
+Status page and visually verified Ready at the isolated address. The bundled ordinary models status
+command succeeded against the desktop-owned service. Quit was driven through the real desktop UI;
+this run proves packaged ownership/CLI/GUI regression, not model inference or the new uncommitted
+startup-update wiring.
+
+### macOS foreground installation checkpoint
+
+The next signed harness exercises the public finite update-install command for A-to-B and public
+serve startup for B-to-C, waits for a Ready Headless service while retaining the original command
+process, then requires graceful zero-exit shutdown. Each replacement verifies matched CLI/service
+versions, private storage retirement and publisher/Gatekeeper acceptance. This expanded signed run
+is pending; the prior A-to-B private-helper acceptance remains the completed signing evidence.
+
+The full local daemon-management run initially had one intermittent lease assertion failure amid
+499 passes. That suite passed in isolation (9 tests), and a complete repeat passed 500 tests with
+12 platform skips. Logs: mac-startup-checkpoint-tests.log and mac-startup-checkpoint-repeat.log.
+The new startup path also defers unattempted installation when the application parent is not writable,
+retaining the update and printing permission guidance. Recovery cannot take that deferral path.
+This substantial checkpoint connects macOS foreground installation/recovery and finite maintenance;
+Desktop updater replacement, full signed public-command acceptance and remaining platform work are
+still open. It does not declare the whole phase complete.

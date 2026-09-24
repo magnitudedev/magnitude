@@ -14,3 +14,5 @@ export * from "./headless-update"
 export * from "./linux-foreground-update"
 
 export { runMacInstallerCommand, MacInstallerRequest } from "./mac-installer-command"
+export { startMacForegroundInstallation } from "./mac-foreground-installation"
+export { prepareMacForegroundStartup } from "./mac-startup-update"

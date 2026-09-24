@@ -6,7 +6,7 @@ import { ApplicationUpdateControlFailed, type ApplicationUpdateAction } from "@m
 import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
 import { acquireApplicationMaintenance, acquireUpdateInstallationLease, applicationNativeHostPath, nativeHostLayer, resolveInstalledApplicationRuntime,
   PreparedUpdateStore, UpdatePreferences, unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory } from "@magnitudedev/daemon-management/desktop-native"
-import { ApplicationUpdateSource, makeInstalledUpdatePreparation, readPreparedUpdateState, discardPreparedUpdate, runFiniteUpdatePreparation, completeLinuxForegroundUpdate } from "@magnitudedev/daemon-management/application-update"
+import { ApplicationUpdateSource, makeInstalledUpdatePreparation, readPreparedUpdateState, discardPreparedUpdate, runFiniteUpdatePreparation, completeLinuxForegroundUpdate, startMacForegroundInstallation } from "@magnitudedev/daemon-management/application-update"
 import { CLI_VERSION } from "../version"
 import { isDevelopmentBuild } from "../runtime/environment"
 
@@ -18,7 +18,7 @@ export const runLocalUpdateMaintenance = (options: {
   readonly isolated: boolean
 }) => Effect.scoped(Effect.gen(function* () {
   if (isDevelopmentBuild()) return yield* new ApplicationUpdateControlFailed({ message: "Application updates require an installed Magnitude application." })
-  if (options.action === "install" && process.platform !== "linux") return yield* new ApplicationUpdateControlFailed({ message: "Installation without a running application is not available in this build." })
+  if (options.action === "install" && process.platform === "win32") return yield* new ApplicationUpdateControlFailed({ message: "Installation without a running application is not available in this build." })
   const platform = yield* Schema.decodeUnknown(Schema.Literal("darwin", "linux", "win32"))(process.platform)
   const architecture = yield* Schema.decodeUnknown(Schema.Literal("arm64", "x64"))(process.arch)
   const runtime = yield* resolveInstalledApplicationRuntime(process.execPath, platform)
@@ -38,6 +38,9 @@ export const runLocalUpdateMaintenance = (options: {
       if (options.action === "status") return yield* readPreparedUpdateState
       if (options.action === "install") {
         yield* acquireUpdateInstallationLease(options.stateDirectory)
+        if (platform === "darwin") return yield* startMacForegroundInstallation({ resources: runtime.resourcesDirectory,
+          stateDirectory: options.stateDirectory, dataDirectory: options.dataDirectory, version: CLI_VERSION, architecture,
+          operation: "Install", continuation: { _tag: "None" } })
         yield* completeLinuxForegroundUpdate(options.dataDirectory, Boolean(process.stdin.isTTY && process.stderr.isTTY))
         return yield* readPreparedUpdateState
       }
