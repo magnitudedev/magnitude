@@ -8,6 +8,9 @@ import { ApplicationUpdateRequest, ApplicationUpdateReply, type ApplicationUpdat
 export { ApplicationIntent, ApplicationRequest, ApplicationSnapshot } from "@magnitudedev/sdk/desktop-host"
 
 export class ApplicationControlFailed extends Schema.TaggedError<ApplicationControlFailed>()("ApplicationControlFailed", { message: Schema.String }) {}
+export class ApplicationControlClosed extends Schema.TaggedError<ApplicationControlClosed>()("ApplicationControlClosed", {}) {
+  override get message() { return "Application closed without a response" }
+}
 export class ApplicationControlUnavailable extends Schema.TaggedError<ApplicationControlUnavailable>()("ApplicationControlUnavailable", { message: Schema.String }) {}
 const failure = (error: unknown) => new ApplicationControlFailed({ message: String(error) })
 
@@ -105,7 +108,7 @@ const exchange = <Q, QI, A, AI>(path: string, requestSchema: Schema.Schema<Q, QI
   const response = yield* receiveJsonLines(socket, replySchema).pipe(Stream.take(1), Stream.runHead, Effect.forkScoped)
   yield* sendJsonLine(socket, requestSchema, request)
   const value = yield* response.await.pipe(Effect.flatten)
-  return yield* Option.match(value, { onNone: () => Effect.fail(new ApplicationControlFailed({ message: "Application closed without a response" })), onSome: Effect.succeed })
+  return yield* Option.match(value, { onNone: () => Effect.fail(new ApplicationControlClosed()), onSome: Effect.succeed })
 })).pipe(Effect.catchTag("JsonLineChannelFailed", error => Effect.fail(new ApplicationControlFailed({ message: error.message }))), Effect.timeoutFail({ duration: timeout, onTimeout: () => new ApplicationControlFailed({ message: "Application control request timed out" }) }))
 
 export const requestApplication = (path: string, intent: ApplicationIntent) => exchange(path, ApplicationRequest, { version: 1 as const, intent }, ApplicationSnapshot)

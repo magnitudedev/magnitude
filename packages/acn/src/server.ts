@@ -819,7 +819,7 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
       yield* closeApplicationScope
     } else {
       const { subscriptions, icn } = started.value
-      yield* Effect.logInfo("ACN shutdown requested").pipe(Effect.annotateLogs({
+      yield* (request.reason === "administrative" ? Effect.logDebug : Effect.logInfo)("ACN shutdown requested").pipe(Effect.annotateLogs({
         reason: request.reason,
         detail: Option.getOrNull(request.safeDetail),
       }))

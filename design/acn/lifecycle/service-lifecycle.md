@@ -78,6 +78,9 @@ Quit is the owner shutdown command. ICN remains the private mandatory child.
 
 ## Shutdown
 
+The application owner presents the user-facing shutdown reason. Routine administrative ACN shutdown
+is a debug diagnostic; unexpected shutdown reasons remain visible at the normal logging level.
+
 Every stop cause uses one process-owned, single-flight shutdown:
 
 ```text

@@ -21,7 +21,7 @@ stopping the incumbent. Desktop forwards intent to an existing Desktop, or reque
 Headless owner and waits for native lock acquisition within one 60-second deadline. Yield replies
 precede teardown and acknowledge the request, not completed retirement. Desktop ignores Yield.
 Only lock acquisition after the predecessor releases ownership permits replacement. Missing control
-during cold startup or teardown permits bounded retry; malformed replies and access failures remain
+during cold startup or teardown, including an empty closed connection, permits bounded retry; malformed replies and access failures remain
 errors. Lock acquisition is not service readiness.
 
 Unix foreground continuation after verified installation replaces the calling process before service

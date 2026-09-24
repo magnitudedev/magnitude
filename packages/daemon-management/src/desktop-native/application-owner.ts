@@ -35,12 +35,14 @@ export const acquireApplicationOwner = (directory: string, request: ApplicationO
     const socketPath = endpoint.value
     // A cold owner may still be binding its endpoint. Malformed replies are never absence.
     const observed = yield* requestApplication(socketPath, "Observe").pipe(
-      Effect.map(Option.some), Effect.catchTag("ApplicationControlUnavailable", () => Effect.succeed(Option.none())),
+      Effect.map(Option.some), Effect.catchTags({ ApplicationControlUnavailable: () => Effect.succeed(Option.none()),
+        ApplicationControlClosed: () => Effect.succeed(Option.none()) }),
     )
     if (Option.isNone(observed)) { yield* Effect.sleep("100 millis"); continue }
     const response = observed.value
     const forwarded = yield* requestApplication(socketPath, response.owner._tag === "Desktop" ? request.intent : "Yield").pipe(
-      Effect.map(Option.some), Effect.catchTag("ApplicationControlUnavailable", () => Effect.succeed(Option.none())),
+      Effect.map(Option.some), Effect.catchTags({ ApplicationControlUnavailable: () => Effect.succeed(Option.none()),
+        ApplicationControlClosed: () => Effect.succeed(Option.none()) }),
     )
     if (Option.isSome(forwarded) && forwarded.value.owner._tag === "Desktop" && response.owner._tag === "Desktop") {
       return { _tag: "Forwarded" as const, response: forwarded.value }

@@ -2019,3 +2019,22 @@ that of the recorded runners and fixtures, not an assertion that every hardware 
 Implementation and available-platform acceptance are complete for branch review. No release was
 published and no merge to main was performed. Further optional host-permission investigation is
 outside this completed acceptance pass. Stop after the final evidence checkpoint for user review.
+
+## Review correction: takeover acknowledgement and terminal shutdown
+
+User review exposed an empty control connection during the Headless-to-Desktop transition.
+The explicit launch waiter now distinguishes empty EOF from malformed replies and retries the
+former within its existing deadline, without launching another application. Owner arbitration
+also tolerates the retiring control endpoint. Initial empty replies remain errors rather than
+permission to launch. Regression tests cover EOF classification, transition recovery, malformed
+replies and no extra launch.
+
+Headless shutdown retains the winning stop reason and presents Desktop takeover or ordinary stop
+in plain language. Routine administrative child shutdown is debug-level diagnostic output.
+Thirty control/client/native-owner tests and eight ACN lifecycle tests passed; host, CLI and ACN
+package typechecks passed. Built the actual development desktop and verified source CLI takeover
+on isolated port 11241: app open printed Opened Magnitude and exited 0, serve explained Desktop
+takeover and exited 0, Desktop rendered Discover and reported Ready, and warm app open succeeded.
+Normal Quit and a separate foreground Ctrl+C test completed cleanly; Ctrl+C printed the ordinary
+stop message. The user's older signed fixture was not modified; the local review shell setup now
+selects current source CLI plus the rebuilt development desktop after re-sourcing.

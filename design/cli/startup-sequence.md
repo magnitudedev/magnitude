@@ -25,7 +25,8 @@ owner, excludes active installation, and starts the matched bundled service. Win
 parent-job containment; installed Linux serving retains a close-on-exec shared installation lease.
 Headless control reports its owner form, acknowledges Yield before shutdown, rejects login settings,
 and never launches Desktop to handle update requests. Terminal service failure exits nonzero after
-cleanup; normal stop and Yield exit after complete owned-service retirement.
+cleanup; normal stop and Yield exit after complete owned-service retirement. The foreground
+command explains a requested stop and explicitly identifies Desktop takeover before shutdown.
 The Headless owner retains update preparation and its check schedule for that same lifetime.
 Ready notifications explain how to stop and start the server; update installation requests never
 interrupt a running server.
@@ -39,7 +40,9 @@ not wait for inference readiness and can open a failed application's Status.
 The privileged application client owns installation discovery, launch intent, and local control.
 An absent application control endpoint permits a launch attempt. Explicit Open may also launch
 Desktop when a Headless owner responds; the new Desktop performs cooperative handoff and Open waits
-for a Desktop snapshot, never treating the Headless reply as proof that a window opened. A timeout, permission error,
+for a Desktop snapshot. During this already-launched transition, an empty closed control
+connection is retried within the existing launch deadline; it cannot trigger another launch.
+Malformed replies remain failures. Open never treats the Headless reply as proof that a window opened. A timeout, permission error,
 unresponsive owner, or explicit application failure is not absence and must not create another
 owner. Concurrent launches coalesce through the desktop native lifetime lock. A cancelled CLI
 request does not cancel an application that has already started. Cold startup observes launcher

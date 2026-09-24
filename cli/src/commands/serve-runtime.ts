@@ -32,6 +32,9 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
       Effect.provide(process.platform === "win32" ? bundledWindowsNative.host : nativeHostLayer(addon))),
     initializeUpdates: initializeServeUpdates(runtime, profile, addon),
     updateReady: version => Effect.sync(() => { process.stderr.write(`Magnitude ${version} is ready to install. Stop the server, then run: magnitude serve\n`) }),
+    stopping: reason => Effect.sync(() => { process.stderr.write(reason === "DesktopTakeover"
+      ? "The desktop app was opened and is taking over. Stopping the headless server.\n"
+      : "Stopping the Magnitude server.\n") }),
     stop: Deferred.await(stopped), observe: state => state._tag === "Ready"
       ? Effect.sync(() => { process.stderr.write(`Magnitude is serving at ${profile.endpoint}. Press Ctrl+C to stop.\n`) }) : Effect.void,
   }).pipe(Effect.provide(process.platform === "win32" ? bundledWindowsNative.host : nativeHostLayer(addon)))

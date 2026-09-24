@@ -23,13 +23,14 @@ export const runHeadlessApplication = (options: {
   readonly runtime: ApplicationRuntime; readonly profile: ApplicationProfile
   readonly stateDirectory: string; readonly home: string; readonly environment: Readonly<Record<string, string | undefined>>
   readonly stop: Effect.Effect<void>
+  readonly stopping?: (reason: "DesktopTakeover" | "Requested") => Effect.Effect<void>
   readonly observe: (state: OwnedServiceState) => Effect.Effect<void>
   readonly initializeUpdates?: Effect.Effect<ApplicationUpdate, never, Scope.Scope>
   readonly prepareStartup?: Effect.Effect<void, { readonly message: string }, Scope.Scope>
   readonly updateReady?: (version: string) => Effect.Effect<void>
 }) => Effect.scoped(Effect.gen(function* () {
-  const stop = yield* Deferred.make<void>()
-  yield* options.stop.pipe(Effect.zipRight(Deferred.succeed(stop, undefined)), Effect.forkScoped)
+  const stop = yield* Deferred.make<"DesktopTakeover" | "Requested">()
+  yield* options.stop.pipe(Effect.zipRight(Deferred.succeed(stop, "Requested")), Effect.forkScoped)
   const native = yield* NativeHost
   const addon = applicationNativeHostPath(options.runtime, process.platform, process.arch)
   if (process.platform === "win32") yield* native.guardParent(0)
@@ -61,7 +62,7 @@ export const runHeadlessApplication = (options: {
   const service = yield* makeApplicationService({ ...options, output: "Foreground", admission: "Immediate" })
   const control: ApplicationControlOptions = {
     snapshot: service.state.pipe(Effect.map(state => ({ version: 1 as const, pid: process.pid, endpoint: options.profile.endpoint, owner: { _tag: "Headless" as const }, service: state }))),
-    dispatch: intent => intent === "Yield" || intent === "Quit" ? Deferred.succeed(stop, undefined).pipe(Effect.asVoid) : Effect.void,
+    dispatch: intent => intent === "Yield" || intent === "Quit" ? Deferred.succeed(stop, intent === "Yield" ? "DesktopTakeover" : "Requested").pipe(Effect.asVoid) : Effect.void,
     login: () => new LoginStartupFailed({ message: "Login startup belongs to the desktop app. Open Magnitude to change it." }),
     update,
   }
@@ -73,6 +74,7 @@ export const runHeadlessApplication = (options: {
   const failure = service.changes.pipe(Stream.filter(state => state._tag === "Failed" || state._tag === "CleanupFailed"), Stream.take(1), Stream.runHead,
     Effect.flatMap(state => Option.isSome(state) ? Effect.fail(new HeadlessApplicationFailed({ message: state.value.message })) : Effect.never))
   const result = yield* Effect.raceFirst(Deferred.await(stop), failure).pipe(Effect.exit)
+  if (Exit.isSuccess(result) && options.stopping) yield* options.stopping(result.value)
   yield* service.shutdown
   if (Exit.isFailure(result)) return yield* Effect.failCause(result.cause)
 })).pipe(Effect.provideService(ProcessGroupController, ProcessGroupControllerLive))
