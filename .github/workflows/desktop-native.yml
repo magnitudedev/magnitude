@@ -132,6 +132,8 @@ jobs:
           path: |
             ${{ runner.temp }}/mac-headless-installer.log
             ${{ runner.temp }}/magnitude-headless-signed/result.json
+            ${{ runner.temp }}/magnitude-headless-signed/configuration.json
+            ${{ runner.temp }}/magnitude-headless-signed/script-hosting/install/**/*.json
             ${{ runner.temp }}/magnitude-headless-signed/script-hosting/mac-script-result.txt
             ${{ runner.temp }}/magnitude-headless-signed/script-hosting/mac-script-evidence.*/*.log
             ${{ runner.temp }}/magnitude-headless-signed/script-hosting/mac-script-evidence.*/*.txt

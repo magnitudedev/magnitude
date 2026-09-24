@@ -25,6 +25,7 @@ scratch=$(mktemp -d "${TMPDIR:-/tmp}/magnitude-install.XXXXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
+scratch=$(cd "$scratch" && pwd -P)
 download() {
   curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
     --connect-timeout 15 --max-time 600 --max-filesize "$3" --output "$2" "$1"
@@ -53,11 +54,12 @@ case "$(uname -s)" in
     app="$scratch/bootstrap/Magnitude.app"
     /usr/bin/codesign --verify --deep --strict -R "=anchor apple generic and identifier \"dev.magnitude.desktop\" and certificate leaf[subject.OU] = \"$apple_team\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists" "$app"
     /usr/sbin/spctl --assess --type execute "$app"
-    /usr/bin/plutil -create json "$scratch/request.json"
-    /usr/bin/plutil -insert bundle -string "$destination" "$scratch/request.json"
-    /usr/bin/plutil -insert archive -string "$scratch/magnitude.zip" "$scratch/request.json"
-    /usr/bin/plutil -insert channel -string "$channel" "$scratch/request.json"
-    /usr/bin/plutil -insert offer -json "$(cat "$scratch/offer.json")" "$scratch/request.json"
+    /usr/bin/plutil -create xml1 "$scratch/request.plist"
+    /usr/bin/plutil -insert bundle -string "$destination" "$scratch/request.plist"
+    /usr/bin/plutil -insert archive -string "$scratch/magnitude.zip" "$scratch/request.plist"
+    /usr/bin/plutil -insert channel -string "$channel" "$scratch/request.plist"
+    /usr/bin/plutil -insert offer -json "$(cat "$scratch/offer.json")" "$scratch/request.plist"
+    /usr/bin/plutil -convert json -o "$scratch/request.json" "$scratch/request.plist"
     "$app/Contents/Resources/magnitude" _install-mac-application "$(cat "$scratch/request.json")"
     ;;
   Linux)

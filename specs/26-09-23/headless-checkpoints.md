@@ -1677,3 +1677,123 @@ metadata/distribution/script tests pass. CLI targeted typechecking passes. The P
 is substantial enough to checkpoint for signed Mac execution; this checkpoint does not close Phase 8.
 The Windows and Linux script integrations have real native evidence, while signed Mac script execution,
 further failure/lease cases and final fresh-profile packaged coverage remain outstanding.
+
+Checkpoint `a0e4a7869c7a8c257c4a9bec5cbb99edcb095680` — **Install complete Magnitude
+applications from shell scripts** — is committed and pushed on `headless`. Release, host, CLI and
+Desktop targeted typechecks pass; Desktop's Windows recovery composition explicitly provides the
+new filesystem requirement. The checkpoint retains the Phase 8 completion gaps above.
+
+Signed Mac acceptance dispatched as GitHub Actions run **35961686952** against this exact commit:
+`https://github.com/magnitudedev/magnitude/actions/runs/35961686952`. Initial authoritative state was
+queued. It enables signed Mac installation only; no release publication or channel promotion is
+requested. Inspect this run's existing status before retrying or scheduling a replacement.
+
+Run 35961686952 passed both Linux native lanes, Mac primitives and Windows containment. Its signed
+Mac job is in progress; no signed-installation completion receipt has been observed yet.
+
+Built fresh Linux arm64 DEB and RPM artifacts from checkpoint a0e4a786 as isolated version 0.0.505,
+revision 46, under Ubuntu `/home/trg.guest/magnitude-headless.uAol17lC/phase8-current`. The fresh DEB
+passed maintained HTTPS script installation, foreground readiness, CLI queries, graceful shutdown
+and repeat installation. Evidence: `/tmp/magnitude-headless-transfer/ubuntu-phase8-current-evidence`
+(from guest `/tmp/magnitude-script-acceptance.Pt3nywhq`). No owner remains. This replaces the earlier
+Ubuntu script evidence based on a prior binary cohort. The matching RPM still requires consumption.
+
+The installed Windows 0.0.505 Desktop opened through the ordinary CLI and visibly rendered Discover
+with the detected hardware and completed model rankings. Two mouse attempts and a keyboard attempt
+through the Parallels console did not establish page navigation; interactive Windows computer-use
+coverage remains unproven. Application-control Quit retired the Desktop and final status was stopped.
+The ordinary CLI query receipt from that attempt is insufficient: inspection found that Effect's
+Command.string does not verify process exit status, and those query outputs were empty.
+
+The maintained installed-headless helper now explicitly drains output, checks every command exit
+code, and bounds each query. Its Windows rerun passed readiness, model status, hardware, graceful
+shutdown and final Stopped/None with those stricter assertions. Evidence:
+`/tmp/magnitude-headless-transfer/windows-script-serve-strict-evidence.txt`. Desktop-owned CLI queries
+must be repeated with explicit exit checks; earlier blank output is not success evidence.
+Sparky is reachable and its original user service remains active; no new remote payload has run yet.
+
+The matching checkpoint RPM (0.0.505-46 arm64) passed fresh Fedora HTTPS script installation,
+public foreground serve, model/hardware queries, graceful shutdown, repeat installation and final
+Stopped/None. Evidence: `/tmp/magnitude-headless-transfer/fedora-phase8-current-evidence`, copied from
+`/tmp/magnitude-script-acceptance.bP2mPpvm`. Both Linux package formats now have current-checkpoint
+script acceptance. DEB SHA-256 is `4d9edf16900e64a71892f31cb9aeda213ee6f6d8cbf948789327ac1bbaea3c57`;
+RPM SHA-256 is `23625acc8b5c73ae16c03e924923a74a8c6e0c366c096c48862478c2ca892607`.
+
+Repeated Windows Desktop-owned CLI regression with bounded commands and explicit exit-code checks.
+Desktop reached Ready; models status and hardware returned real output; application-control Quit
+completed and passive status became Stopped/None. No Magnitude processes remained. Evidence:
+`/tmp/magnitude-headless-transfer/windows-desktop-cli-strict-evidence.txt`. This supersedes the prior
+empty-output query attempt and does not claim successful interactive VM navigation.
+
+Transferred the exact DEB to `/home/tom/magnitude-packaged-a0e4a786` on Sparky, verified its digest,
+and extracted it into `payload`; the bundled CLI reports 0.0.505. No package is installed there and
+passwordless sudo is unavailable. Real installed Linux admission requires the package-owned root
+lock, so extracted execution is not a substitute. Requested that the user run the exact apt install
+command. Until that prerequisite is supplied, leave the original active magnitude.service untouched
+and continue other acceptance. Signed Mac run 35961686952 remains in its signing/build/acceptance step;
+all four prerequisite/native jobs passed. Do not restart the live run.
+
+The user installed the transferred package on Sparky. Verified installed magnitude-desktop 0.0.505-46,
+bundled CLI 0.0.505 and the original magnitude.service still active. The actual `/usr/bin/magnitude
+serve` reached Headless Ready on isolated loopback port 11237 without DISPLAY/WAYLAND or developer
+PATH. It uses `/home/tom/magnitude-packaged-a0e4a786/profile` and a separate copy of the earlier test
+model cache. Published installed ICN 0.0.10 detects NVIDIA GB10 CUDA acceleration. Loaded Qwen3.6
+35B-A3B Q4 and exercised real local inference: 140 completion tokens, cancellation after eight stream
+chunks, then another successful 140-token completion. Unload/reload and graceful cleanup remain in
+progress; the test owner is still intentionally running.
+
+Signed Mac run 35961686952 is now terminal failed at the new shell-installation step. All four signed
+fixtures finished building, but `/bin/bash` returned 1 after printing the script evidence directory.
+The detailed shell logs and fixtures are being downloaded through the original live artifact-download
+session. This is not the earlier inference-startup failure and no rerun has been dispatched.
+
+Sparky packaged acceptance completed generation, eight-chunk stream cancellation and post-cancellation
+generation, then repeated those checks after model unload/reload. Both passes produced 140 completion
+tokens on each ordinary request. Unloaded the model, verified the recorded owner PID still executed
+the installed bundled CLI, and sent SIGTERM. The original foreground SSH command exited 0; passive
+status became Stopped/None, port 11237 was closed and the original user magnitude.service remained
+active. Receipts: `/tmp/magnitude-headless-transfer/sparky-packaged-inference.json`,
+`sparky-packaged-hardware.txt` and `sparky-packaged-final-state.txt`. This proves current packaged
+remote inference and clean foreground shutdown. SSH-loss containment and independent systemd lifecycle
+remain separate final acceptance cases. The matched package and isolated model copy remain for them.
+
+Current packaged Sparky service-manager acceptance passed. The initial transient user unit stopped
+when the SSH session ended because the host had Linger=no. Enabled user lingering temporarily,
+then ran an isolated transient service with Restart=on-failure, RestartSec=1, KillMode=control-group
+and a bounded stop deadline. It remained Ready after the launching SSH command disconnected.
+SIGKILL of the exact test unit's main process caused one restart (NRestarts=1) and a new Ready owner.
+All process IDs captured in the previous unit cgroup were gone. A privileged cooperative Yield then
+ended the replacement successfully: inactive, MainPID=0, ExecMainStatus=0, Result=success, and
+Stopped/None, with no restart after the delay. Restored the original Linger=no setting. The original
+magnitude.service was active during final inspection. Logs and properties are under
+`/tmp/magnitude-headless-transfer/sparky-systemd-evidence`.
+
+Abrupt foreground SSH-loss acceptance also passed against the installed package. After Ready,
+captured owner plus descendant PIDs, killed only the local SSH client, and observed all four remote
+processes disappear within the bounded wait. Passive status became Stopped/None. Receipt:
+`/tmp/magnitude-headless-transfer/sparky-ssh-loss-result.json`. The original package installation,
+model copy and profile remain available for later regression; no test server remains running.
+
+Reproduced a Mac shell-bootstrap path defect independently while the failed-run artifacts download:
+macOS TMPDIR ends in a slash, and mktemp retained the resulting double slash. The private installer
+requires canonical absolute request paths. The shell now resolves its created scratch directory
+physically before forming download and installer paths. A real shell regression using a symlinked,
+space/apostrophe-containing temporary directory with a trailing slash passes, including scratch
+cleanup after download failure. Eight generator/shell tests pass. CI artifact retention now includes
+public installation offers and public publisher configuration so signed fixtures can be replayed
+locally. The actual failed-run shell log still must be inspected before attributing its failure.
+
+The downloaded run 35961686952 fresh-install log identifies request-file construction as the
+failure. Reproduced the same `plutil` unknown error locally: insertion into its JSON-format file
+fails. Constructing the request as an XML plist and converting the completed object to JSON fixes
+it. A native Mac regression executes the generated script's actual request-construction commands
+with spaces and apostrophes and checks the complete resulting request. The script-generation and
+distribution suites now pass all 12 tests. Targeted release typechecking passes. The separate
+scratch-path normalization fix remains necessary for the installer request schema. Signed
+installation and successive startup updates still require a new acceptance run.
+
+The installed-headless acceptance helper now checks query exit codes and has a bounded query
+deadline; captured stdout alone cannot certify command success. The Windows installed CLI and
+desktop-owned CLI regressions were rerun with strict exit checks, as recorded above.
+
+Completion handoff remains on the headless branch for user review. No merge to main is authorized.

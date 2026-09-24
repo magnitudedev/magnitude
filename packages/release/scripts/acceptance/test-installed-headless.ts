@@ -1,6 +1,6 @@
 import { Command, FileSystem } from "@effect/platform"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
-import { Config, Effect, Option, Schema } from "effect"
+import { Config, Effect, Option, Schema, Stream } from "effect"
 import { join, resolve } from "node:path"
 import { NativeHost, nativeHostLayer } from "../../../daemon-management/src/desktop-native/index"
 import { requestApplication } from "../../../daemon-management/src/desktop-native/application-control"
@@ -19,7 +19,13 @@ const run = Effect.scoped(Effect.gen(function* () {
   const environment = { MAGNITUDE_DEV_DATA_DIR: join(output, "profile"), MAGNITUDE_DESKTOP_STATE_DIR: stateDirectory,
     MAGNITUDE_DEV_PORT: "11237", MAGNITUDE_ICN_PATH: inference }
   const native = yield* NativeHost.pipe(Effect.provide(nativeHostLayer(addon)))
-  const query = (...args: string[]) => Command.make(cli, ...args).pipe(Command.env(environment), Command.string)
+  const query = (...args: string[]) => Effect.scoped(Effect.gen(function* () {
+    const child = yield* Command.make(cli, ...args).pipe(Command.env(environment), Command.stderr("inherit"), Command.start)
+    const output = yield* child.stdout.pipe(Stream.decodeText(), Stream.runFold("", (text, chunk) => text + chunk))
+    const code = yield* child.exitCode
+    if (code !== 0) return yield* new AcceptanceFailed({ message: `Installed command ${args.join(" ")} exited ${code}` })
+    return output
+  })).pipe(Effect.timeout("30 seconds"))
   const initial = yield* query("status")
   if (!/Runtime\s+Stopped/.test(initial) || (yield* query("--version")).trim() !== version) {
     return yield* new AcceptanceFailed({ message: "Expected stopped installation at the selected version" })
