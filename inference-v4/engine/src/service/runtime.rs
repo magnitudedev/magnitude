@@ -156,6 +156,7 @@ impl EngineService {
                 if domain.execution_path() != manifest.path {
                     return Err("executor domain differs from the planned execution path".into());
                 }
+                let backend = domain.execution_backend();
                 let mut owner = Owner::with_resource_plan(domain, manifest.service.clone(), &plan)?;
                 let ready = ReadyInfo {
                     package: manifest.package.identity.clone(),
@@ -163,6 +164,7 @@ impl EngineService {
                     service: manifest.service.clone(),
                     resources: ResourcePlanSummary::from_plan(&plan)?,
                     path: manifest.path,
+                    backend,
                 };
                 Ok((
                     Box::new(ExecutionOwner {

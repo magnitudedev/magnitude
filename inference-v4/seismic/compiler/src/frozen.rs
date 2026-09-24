@@ -20,11 +20,10 @@ pub struct VariantIdentity {
 #[derive(Clone, Debug)]
 pub(crate) struct FrozenGuard {
     node: BoolExpr,
-    fixed: PartialAssignment,
 }
 
 impl FrozenGuard {
-    fn new(arena: &ExprArena, node: BoolExpr, fixed: PartialAssignment) -> Self {
+    fn new(arena: &ExprArena, node: BoolExpr, fixed: &PartialAssignment) -> Self {
         for symbol in arena.free_symbols(node.into()) {
             match arena.symbol_kind(symbol) {
                 SymbolKind::CallDimension(_) | SymbolKind::CallScalar(_) => {}
@@ -33,14 +32,11 @@ impl FrozenGuard {
                 kind => panic!("frozen guard retained an unfixed planning symbol: {kind:?}"),
             }
         }
-        Self { node, fixed }
+        Self { node }
     }
 
     pub(crate) fn node(&self) -> BoolExpr {
         self.node
-    }
-    pub(crate) fn fixed(&self) -> &PartialAssignment {
-        &self.fixed
     }
 }
 
@@ -101,7 +97,7 @@ pub(crate) fn freeze<'a, B: seismic_target::TargetFamily>(
             fixed.bind(symbol, value);
         }
     }
-    let guard = FrozenGuard::new(&context.arena, guard_node, fixed.clone());
+    let guard = FrozenGuard::new(&context.arena, guard_node, &fixed);
     let identity = VariantIdentity {
         implementation: implementation.identity().clone(),
         assignment: implementation.assignment_identity(),

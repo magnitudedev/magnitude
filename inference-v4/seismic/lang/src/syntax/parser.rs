@@ -322,9 +322,9 @@ impl Parser {
             self.expect_op(Op::RParen)?;
             self.expect_newline()?;
         }
-        let mut constraints = Vec::new();
+        let mut constraint = None;
         if self.eat_kw(Kw::Where) {
-            conjuncts(self.expr()?, &mut constraints);
+            constraint = Some(self.expr()?);
             self.expect_newline()?;
         }
         let mut scratch = Vec::new();
@@ -341,9 +341,11 @@ impl Parser {
             self.expect_op(Op::LParen)?;
             let bytes = self.expr()?;
             self.expect_op(Op::RParen)?;
+            let when = self.native_when()?;
             scratch.push(NativeScratchDecl {
                 name,
                 bytes,
+                when,
                 span: begin.to(self.prev_span()),
             });
             self.expect_newline()?;
@@ -365,7 +367,7 @@ impl Parser {
             source,
             statics,
             params,
-            constraints,
+            constraint,
             scratch,
             launches,
             span: start.to(self.prev_span()),
@@ -421,10 +423,20 @@ impl Parser {
         })
     }
 
-    /// `launch KERNEL:` followed by its indented geometry.
+    /// An optional `when CONDITION` (`when` is a contextual word).
+    fn native_when(&mut self) -> PResult<Option<Expr>> {
+        if !self.at_word("when") {
+            return Ok(None);
+        }
+        self.bump();
+        Ok(Some(self.expr()?))
+    }
+
+    /// `launch KERNEL [when CONDITION]:` followed by its indented geometry.
     fn native_launch(&mut self) -> PResult<NativeLaunchDecl> {
         let begin = self.bump().span;
         let kernel = self.expect_name()?;
+        let when = self.native_when()?;
         self.expect_op(Op::Colon)?;
         self.native_block_start("launch")?;
         let threadgroups = self.native_launch_property("threadgroups")?;
@@ -444,6 +456,7 @@ impl Parser {
         self.native_block_end("launch")?;
         Ok(NativeLaunchDecl {
             kernel,
+            when,
             threadgroups,
             threads_per_threadgroup,
             shared_bytes,
@@ -1179,10 +1192,47 @@ mod tests {
         assert_eq!(native.statics.len(), 1);
         assert_eq!(native.params.len(), 2);
         assert!(native.params[0].arithmetic);
-        assert_eq!(native.constraints.len(), 2);
+        assert!(matches!(
+            native.constraint.as_ref().map(|constraint| &constraint.kind),
+            Some(ExprKind::Binary {
+                op: BinaryOp::And,
+                ..
+            })
+        ));
         assert_eq!(native.scratch.len(), 1);
         assert_eq!(native.launches.len(), 2);
         assert!(native.launches[0].shared_bytes.is_some());
+    }
+
+    #[test]
+    fn conditional_native_launches_and_scratch_round_trip() {
+        let file = round_trip(
+            "native rows for metal from \"rows.metal\":\n    params (SPLIT in [1, 2])\n    where SPLIT == 1 or (SPLIT > 1 and SPLIT < 4)\n    scratch normalized bytes (O * H * 2) when O > 8\n    scratch partials bytes (SPLIT * O * 4) when (SPLIT > 1 or O >= 9) and O != 0\n    launch rows_normalize when O > 8:\n        threadgroups (O, 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n    launch rows_gemv when O <= 2 or (INT8 == 1 and O <= 8):\n        threadgroups (ceil_div(F, 8), 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n        shared_bytes (O * 72)\n    launch rows_merge:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n",
+        );
+        let [Decl::Native(native)] = file.decls.as_slice() else {
+            panic!("expected one native implementation")
+        };
+        assert!(matches!(
+            native.constraint.as_ref().map(|constraint| &constraint.kind),
+            Some(ExprKind::Binary { op: BinaryOp::Or, .. })
+        ));
+        assert!(native.scratch.iter().all(|scratch| scratch.when.is_some()));
+        assert!(matches!(
+            native.scratch[1].when.as_ref().map(|when| &when.kind),
+            Some(ExprKind::Binary { op: BinaryOp::And, .. })
+        ));
+        assert!(native.launches[0].when.is_some());
+        assert!(matches!(
+            native.launches[1].when.as_ref().map(|when| &when.kind),
+            Some(ExprKind::Binary { op: BinaryOp::Or, .. })
+        ));
+        assert!(native.launches[2].when.is_none());
+        let printed = print(&file);
+        assert!(
+            printed.contains("when (SPLIT > 1 or O >= 9) and O != 0\n"),
+            "{printed}"
+        );
+        assert!(printed.contains("launch rows_gemv when O <= 2 or INT8 == 1 and O <= 8:\n"), "{printed}");
     }
 
     #[test]

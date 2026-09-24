@@ -166,6 +166,11 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
                         layout.byte_len.max(validation)
                     }
                     registry::RepresentationKind::External(_) => unreachable!(),
+                    registry::RepresentationKind::PackedRows(_) => {
+                        return Err(ObservationError::Unsupported(
+                            registry::ROW_LAYOUT_IS_NATIVE_ONLY.into(),
+                        ))
+                    }
                 };
                 construction_temporary = construction_temporary.max(temporary);
             }
@@ -687,18 +692,6 @@ fn encode(dtype: DType, value: f64, bytes: &mut Vec<u8>) {
         DType::Bool => bytes.push(u8::from(value != 0.0)),
     }
 }
-fn decode(dtype: DType, bytes: &[u8]) -> f64 {
-    match dtype {
-        DType::F32 => f32::from_le_bytes(bytes.try_into().unwrap()) as f64,
-        DType::F16 => registry::f16_to_f32(u16::from_le_bytes(bytes.try_into().unwrap())) as f64,
-        DType::BF16 => {
-            f32::from_bits((u16::from_le_bytes(bytes.try_into().unwrap()) as u32) << 16) as f64
-        }
-        DType::I32 => i32::from_le_bytes(bytes.try_into().unwrap()) as f64,
-        DType::U32 => u32::from_le_bytes(bytes.try_into().unwrap()) as f64,
-        DType::Bool => f64::from(bytes[0] != 0),
-    }
-}
 fn validation_input_value(
     dtype: DType,
     assumption: Option<(f64, f64)>,
@@ -908,6 +901,18 @@ fn capture_invocation<T: TargetFamily, H>(
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
+    fn decode(dtype: DType, bytes: &[u8]) -> f64 {
+        match dtype {
+            DType::F32 => f32::from_le_bytes(bytes.try_into().unwrap()) as f64,
+            DType::F16 => registry::f16_to_f32(u16::from_le_bytes(bytes.try_into().unwrap())) as f64,
+            DType::BF16 => {
+                f32::from_bits((u16::from_le_bytes(bytes.try_into().unwrap()) as u32) << 16) as f64
+            }
+            DType::I32 => i32::from_le_bytes(bytes.try_into().unwrap()) as f64,
+            DType::U32 => u32::from_le_bytes(bytes.try_into().unwrap()) as f64,
+            DType::Bool => f64::from(bytes[0] != 0),
+        }
+    }
 
     #[test]
     fn constructed_case_must_match_every_requested_invocation_binding() {

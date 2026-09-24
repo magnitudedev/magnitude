@@ -201,13 +201,8 @@ impl ExecutionPlanner {
         limits: ResourceLimits,
         budget: ResourceBudget,
     ) -> Result<ExecutionPlanDraft, PlanError> {
-        if path == ExecutionPath::NativeMetal {
-            if device.info.backend != BackendName::Metal {
-                return Err(PlanError::Unsupported("native Metal on selected backend"));
-            }
-            if codec != KvCodec::Dense {
-                return Err(PlanError::Unsupported("native Metal KV codec"));
-            }
+        if path == ExecutionPath::Native && codec != KvCodec::Dense {
+            return Err(PlanError::Unsupported("native KV codec"));
         }
         if budget.storage_bytes > device.assessment_capacity_bytes {
             return Err(PlanError::Resource(CapacityError {
@@ -227,8 +222,13 @@ impl ExecutionPlanner {
             }
             _ => {}
         }
-        let load = ModelLoadPlan::derive(manifest, definition, selection)
-            .map_err(PlanError::InvalidDefinition)?;
+        let load = ModelLoadPlan::derive(
+            manifest,
+            definition,
+            selection,
+            super::resident_layout(path, device.info.backend),
+        )
+        .map_err(PlanError::InvalidDefinition)?;
         let programs = load.program_plan(definition)?;
         let target = ArtifactComponent {
             kind: ArtifactComponentKind::Target,

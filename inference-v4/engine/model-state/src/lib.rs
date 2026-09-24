@@ -124,8 +124,59 @@ pub struct PlaneBuffer {
     pub buffer: Tensor,
 }
 
+/// Free history rows as address-ordered, coalesced `(start, count)` holes.
+///
+/// Placement keeps every sequence's history in few segments however requests
+/// interleave: a sequence grows in place into the hole that begins at its
+/// history end, and a sequence that cannot grow in place (a fresh sequence, a
+/// fork whose sibling took the rows, or a neighbour boundary) starts at the
+/// middle of the largest hole, leaving the rows before it as growth room for
+/// the history that ends there. Only a hole at row 0 has no such history and
+/// is filled from its start.
 struct Arena {
     free: Vec<(usize, usize)>,
+}
+impl Arena {
+    fn available(&self) -> usize {
+        self.free.iter().map(|(_, count)| count).sum()
+    }
+
+    /// Claim `count` rows, in logical order, for a sequence whose history ends
+    /// at row `after`. The caller has checked `count <= self.available()`.
+    fn claim(&mut self, after: Option<usize>, count: usize) -> Vec<(usize, usize)> {
+        let mut claimed = Vec::new();
+        let mut remaining = count;
+        if let Some(end) = after {
+            if let Some(hole) = self.free.iter().position(|(start, _)| *start == end) {
+                let taken = self.free[hole].1.min(remaining);
+                claimed.push(self.take(hole, 0, taken));
+                remaining -= taken;
+            }
+        }
+        while remaining > 0 {
+            let hole = (0..self.free.len())
+                .max_by_key(|&hole| (self.free[hole].1, std::cmp::Reverse(self.free[hole].0)))
+                .expect("claimed rows never exceed the available rows");
+            let (start, size) = self.free[hole];
+            let taken = size.min(remaining);
+            let offset = if start == 0 { 0 } else { (size - taken) / 2 };
+            claimed.push(self.take(hole, offset, taken));
+            remaining -= taken;
+        }
+        claimed
+    }
+
+    /// Remove `count` rows at `offset` within hole `hole`, keeping the free
+    /// list address-ordered.
+    fn take(&mut self, hole: usize, offset: usize, count: usize) -> (usize, usize) {
+        let (start, size) = self.free[hole];
+        let before = (offset > 0).then_some((start, offset));
+        let after =
+            (offset + count < size).then(|| (start + offset + count, size - offset - count));
+        self.free
+            .splice(hole..=hole, before.into_iter().chain(after));
+        (start + offset, count)
+    }
 }
 struct Extent {
     arena: Rc<RefCell<Arena>>,
@@ -195,25 +246,28 @@ pub struct StateAllocationTrace {
     pub recurrent_pool_bytes: u64,
 }
 
+/// The permanently pristine bank every new sequence starts from. It is never
+/// on the free list, so no advance can name it as its successor.
+pub const ZERO_SEED_BANK: usize = 0;
+
 struct BankPoolInner {
     capacity: usize,
     free: RefCell<Vec<usize>>,
-    returned: RefCell<Vec<Option<Vec<Tensor>>>>,
 }
 
+/// A claim on one arena row of every recurrent component. Dropping the last
+/// handle returns the row to the free list; the storage itself stays in the
+/// store's arenas.
 struct BankClaim {
     pool: Rc<BankPoolInner>,
     index: usize,
-    values: Option<Vec<Tensor>>,
 }
 
 impl Drop for BankClaim {
     fn drop(&mut self) {
-        let values = self.values.take().expect("live bank claim has storage");
-        let mut returned = self.pool.returned.borrow_mut();
-        debug_assert!(returned[self.index].is_none());
-        returned[self.index] = Some(values);
-        self.pool.free.borrow_mut().push(self.index);
+        if self.index != ZERO_SEED_BANK {
+            self.pool.free.borrow_mut().push(self.index);
+        }
     }
 }
 
@@ -224,10 +278,6 @@ impl BankHandle {
     fn index(&self) -> usize {
         self.0.index
     }
-
-    fn values(&self) -> &[Tensor] {
-        self.0.values.as_deref().expect("live bank has storage")
-    }
 }
 
 struct BankPool {
@@ -235,27 +285,16 @@ struct BankPool {
 }
 
 impl BankPool {
-    fn new(
-        device: &Device,
-        specs: &[ComponentSpec],
-        capacity: BankCapacity,
-    ) -> Result<(Self, BankHandle), Error> {
+    fn new(capacity: BankCapacity) -> Result<(Self, BankHandle), Error> {
         let count = capacity.total()?;
         let storage_count = capacity.storage_total()?;
-        let mut returned = Vec::with_capacity(storage_count);
-        for _ in 0..storage_count {
-            returned.push(Some(allocate_values(device, specs)?));
-        }
-        let seed_values = returned[0].take().expect("zero seed bank is allocated");
         let inner = Rc::new(BankPoolInner {
             capacity: count,
             free: RefCell::new((1..storage_count).rev().collect()),
-            returned: RefCell::new(returned),
         });
         let seed = BankHandle(Rc::new(BankClaim {
             pool: inner.clone(),
-            index: 0,
-            values: Some(seed_values),
+            index: ZERO_SEED_BANK,
         }));
         Ok((Self { inner }, seed))
     }
@@ -269,13 +308,9 @@ impl BankPool {
             .ok_or(Error::BanksExhausted {
                 capacity: self.inner.capacity,
             })?;
-        let values = self.inner.returned.borrow_mut()[index]
-            .take()
-            .expect("free bank has storage");
         Ok(BankHandle(Rc::new(BankClaim {
             pool: self.inner.clone(),
             index,
-            values: Some(values),
         })))
     }
 
@@ -284,21 +319,29 @@ impl BankPool {
     }
 }
 
-fn allocate_values(device: &Device, specs: &[ComponentSpec]) -> Result<Vec<Tensor>, Error> {
+/// One zero-initialized arena per recurrent component: `[banks, ..shape]`.
+fn allocate_arenas(
+    device: &Device,
+    specs: &[ComponentSpec],
+    banks: usize,
+) -> Result<Vec<Tensor>, Error> {
     specs
         .iter()
         .map(|spec| {
-            let extents = spec
-                .shape
-                .iter()
-                .map(|&extent| extent as u64)
-                .collect::<Vec<_>>();
+            let extents = std::iter::once(banks)
+                .chain(spec.shape.iter().copied())
+                .map(|extent| {
+                    u64::try_from(extent)
+                        .map_err(|_| Error::Request("recurrent arena extent exceeds u64".into()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             Tensor::zeros(device, element(spec.dtype), &extents).map_err(Error::from)
         })
         .collect()
 }
-/// History rows are a shared arena; recurrent components are immutable accepted
-/// versions. A checkpoint retains both without copying tensor contents.
+/// History rows are a shared arena; recurrent components are arenas of banks,
+/// and each accepted version is one immutable bank. A checkpoint retains both
+/// without copying tensor contents.
 pub struct StateStore {
     device: Rc<Device>,
     context_capacity: usize,
@@ -308,6 +351,7 @@ pub struct StateStore {
     bank_capacity: BankCapacity,
     recurrent_bank_bytes: u64,
     component_specs: Vec<ComponentSpec>,
+    recurrent: Vec<Tensor>,
     history: RefCell<Option<Vec<Tensor>>>,
     arena: Rc<RefCell<Arena>>,
     banks: BankPool,
@@ -340,7 +384,8 @@ impl StateStore {
                 )
                 .ok_or_else(|| Error::Request("recurrent bank byte count overflow".into()))
         })?;
-        let (banks, zero_seed) = BankPool::new(&device, &component_specs, bank_capacity)?;
+        let (banks, zero_seed) = BankPool::new(bank_capacity)?;
+        let recurrent = allocate_arenas(&device, &component_specs, bank_capacity.storage_total()?)?;
         Ok(Rc::new(Self {
             device,
             context_capacity,
@@ -350,6 +395,7 @@ impl StateStore {
             bank_capacity,
             recurrent_bank_bytes,
             component_specs,
+            recurrent,
             history: RefCell::new(None),
             arena: Rc::new(RefCell::new(Arena {
                 free: vec![(0, history_capacity)],
@@ -364,6 +410,17 @@ impl StateStore {
     }
     pub fn has_recurrent_components(&self) -> bool {
         !self.component_specs.is_empty()
+    }
+    /// One arena per recurrent component, `[banks, ..component shape]`. A
+    /// bank index selects the same row of every arena. Kernels read a
+    /// sequence's accepted bank and write only an advance's successor bank;
+    /// they never write an accepted bank or [`ZERO_SEED_BANK`].
+    pub fn recurrent_arenas(&self) -> &[Tensor] {
+        &self.recurrent
+    }
+    /// Banks in each recurrent arena, including the zero seed.
+    pub fn recurrent_bank_count(&self) -> Result<usize, Error> {
+        self.bank_capacity.storage_total()
     }
     pub fn history_capacity(&self) -> usize {
         self.history_capacity
@@ -444,27 +501,46 @@ impl StateStore {
             .collect())
     }
     pub fn occupied_rows(&self) -> usize {
-        self.history_capacity
-            - self
-                .arena
-                .borrow()
-                .free
-                .iter()
-                .map(|(_, n)| n)
-                .sum::<usize>()
+        self.history_capacity - self.arena.borrow().available()
     }
-    /// Recurrent component storage freed by closing the selected states. Shared
-    /// checkpoints, unselected descendants, and execution pins prevent reclaim.
+    /// Recurrent bank bytes returned to the pool by closing the selected
+    /// states. A bank is reclaimed only when every claim on it belongs to the
+    /// selection: shared checkpoints, unselected descendants, and in-flight
+    /// advances prevent reclaim, and the zero seed is never reclaimed.
     pub fn reclaimable(self: &Rc<Self>, states: &[&SequenceState]) -> Result<usize, Error> {
         if states.iter().any(|state| !Rc::ptr_eq(self, &state.store)) {
             return Err(Error::Request(
                 "reclamation requires states from this store".into(),
             ));
         }
-        usize::try_from(Tensor::reclaimable_bytes(
-            states.iter().flat_map(|state| state.bank.values()),
-        )?)
-        .map_err(|_| Error::Request("reclaimable state bytes exceed host range".into()))
+        let mut distinct: Vec<&SequenceState> = Vec::with_capacity(states.len());
+        for state in states {
+            if !distinct.iter().any(|seen| std::ptr::eq(*seen, *state)) {
+                distinct.push(state);
+            }
+        }
+        let mut banks = 0usize;
+        let mut counted: Vec<*const BankClaim> = Vec::new();
+        for state in &distinct {
+            let claim = Rc::as_ptr(&state.bank.0);
+            if state.bank.index() == ZERO_SEED_BANK || counted.contains(&claim) {
+                continue;
+            }
+            counted.push(claim);
+            let selected = distinct
+                .iter()
+                .filter(|other| Rc::ptr_eq(&other.bank.0, &state.bank.0))
+                .count();
+            if selected == Rc::strong_count(&state.bank.0) {
+                banks += 1;
+            }
+        }
+        let bytes = self
+            .recurrent_bank_bytes
+            .checked_mul(banks as u64)
+            .ok_or_else(|| Error::Request("reclaimable state bytes overflow".into()))?;
+        usize::try_from(bytes)
+            .map_err(|_| Error::Request("reclaimable state bytes exceed host range".into()))
     }
     pub fn idle(&self) -> bool {
         self.owners.get() == 0
@@ -477,12 +553,7 @@ impl StateStore {
         if self.components.is_empty() {
             return usize::MAX;
         }
-        self.arena
-            .borrow()
-            .free
-            .iter()
-            .map(|(_, count)| *count)
-            .sum()
+        self.arena.borrow().available()
     }
     /// Drop the store's arena allocations when no sequence/checkpoint owns them.
     /// External completion/buffer pins may still retain physical storage.
@@ -508,12 +579,14 @@ impl StateStore {
             bank,
         })
     }
-    fn reserve(&self, count: usize) -> Result<Vec<Rc<Extent>>, Error> {
+    /// Reserve `count` rows, in logical order, for a sequence whose history
+    /// ends at row `after` (see [`Arena`] for placement).
+    fn reserve(&self, after: Option<usize>, count: usize) -> Result<Vec<Rc<Extent>>, Error> {
         if self.components.is_empty() {
             return Ok(vec![]);
         }
         let mut arena = self.arena.borrow_mut();
-        let available_rows = arena.free.iter().map(|(_, n)| n).sum::<usize>();
+        let available_rows = arena.available();
         if available_rows < count {
             let capacity = self.history_capacity as u64;
             let total_bytes = self.total_history_bytes();
@@ -522,25 +595,17 @@ impl StateStore {
                 available_bytes: capacity_charge(available_rows, total_bytes, capacity, false)?,
             });
         }
-        let mut remaining = count;
-        let mut reserved = Vec::new();
-        let mut free = Vec::new();
-        for &(start, size) in &arena.free {
-            let taken = size.min(remaining);
-            if taken > 0 {
-                reserved.push(Rc::new(Extent {
+        Ok(arena
+            .claim(after, count)
+            .into_iter()
+            .map(|(start, count)| {
+                Rc::new(Extent {
                     arena: self.arena.clone(),
                     start,
-                    count: taken,
-                }));
-                remaining -= taken;
-            }
-            if size > taken {
-                free.push((start + taken, size - taken));
-            }
-        }
-        arena.free = free;
-        Ok(reserved)
+                    count,
+                })
+            })
+            .collect())
     }
 
     fn reserve_contiguous(&self, count: usize) -> Option<Rc<Extent>> {
@@ -630,9 +695,8 @@ impl SequenceState {
     pub fn expected_end(&self) -> usize {
         self.expected_end
     }
-    pub fn values(&self) -> &[Tensor] {
-        self.bank.values()
-    }
+    /// The accepted recurrent bank: the row of every recurrent arena that
+    /// holds this sequence's state.
     pub fn bank_index(&self) -> usize {
         self.bank.index()
     }
@@ -642,6 +706,13 @@ impl SequenceState {
         }
         self.expected_end = self.expected_end.max(position);
         Ok(())
+    }
+    /// The arena row just past this sequence's last accepted row: where its
+    /// next rows continue its history without a new segment.
+    fn history_end(&self) -> Option<usize> {
+        self.extents
+            .last()
+            .map(|extent| extent.start + extent.count)
     }
     pub fn history_ranges(&self) -> Vec<(usize, usize)> {
         let mut skip = self.history_start - self.retained_start;
@@ -726,13 +797,10 @@ impl StateCheckpoint {
     pub fn bank_index(&self) -> usize {
         self.bank.index()
     }
-    pub fn values(&self) -> &[Tensor] {
-        self.bank.values()
-    }
     /// Physical resource bytes pinned by this checkpoint. History charges the
     /// complete allocated extents (including trimmed rows that cannot be
-    /// released while the extent is shared); recurrent state charges the bank
-    /// allocations retained by the checkpoint.
+    /// released while the extent is shared); recurrent state charges the one
+    /// bank retained by the checkpoint.
     pub fn retained_bytes(&self) -> Result<u64, String> {
         let history_rows = self.extents.iter().try_fold(0_u64, |total, extent| {
             total
@@ -745,11 +813,9 @@ impl StateCheckpoint {
         let history = history_rows
             .checked_mul(self.store.total_history_row_bytes)
             .ok_or("checkpoint history byte count overflow")?;
-        self.bank.values().iter().try_fold(history, |total, value| {
-            total
-                .checked_add(value.storage_bytes())
-                .ok_or_else(|| "checkpoint retained byte count overflow".to_owned())
-        })
+        history
+            .checked_add(self.store.recurrent_bank_bytes)
+            .ok_or_else(|| "checkpoint retained byte count overflow".to_owned())
     }
     pub fn fork(&self) -> SequenceState {
         self.store.owners.set(self.store.owners.get() + 1);
@@ -841,10 +907,25 @@ mod tests {
             .map(Rc::new)
     }
 
+    fn bank_view(store: &StateStore, bank: usize) -> Tensor {
+        store.recurrent_arenas()[0]
+            .slice_leading(bank as u64, bank as u64 + 1)
+            .unwrap()
+    }
+
+    fn bank_bytes(store: &StateStore, bank: usize) -> Vec<u8> {
+        bank_view(store, bank).read_to_host().unwrap()
+    }
+
+    fn write_bank(store: &StateStore, bank: usize, bytes: &[u8]) {
+        bank_view(store, bank).write_from_host(bytes).unwrap();
+    }
+
     fn dense_component(width: usize) -> ComponentDescriptor {
         ComponentDescriptor::new(
             LayerRef::Target(0),
             CodecSpec::dense(DType::F32, width, width),
+            1,
         )
         .unwrap()
     }
@@ -893,6 +974,32 @@ mod tests {
     }
 
     #[test]
+    fn arena_grows_histories_in_place_and_starts_new_ones_mid_hole() {
+        let mut arena = Arena {
+            free: vec![(0, 100)],
+        };
+        // Row 0 has no preceding history: fill from its start.
+        assert_eq!(arena.claim(None, 10), [(0, 10)]);
+        // A new history leaves the rows after [0, 10) as that history's room.
+        assert_eq!(arena.claim(None, 10), [(50, 10)]);
+        assert_eq!(arena.free, [(10, 40), (60, 40)]);
+        // Both grow in place, one row at a time, whatever the interleaving.
+        for step in 0..5 {
+            assert_eq!(arena.claim(Some(10 + step), 1), [(10 + step, 1)]);
+            assert_eq!(arena.claim(Some(60 + step), 1), [(60 + step, 1)]);
+        }
+        // A third history starts mid-way through the largest hole (ties go to
+        // the lower address); a history without room in place follows it.
+        assert_eq!(arena.claim(None, 5), [(30, 5)]);
+        assert_eq!(arena.claim(Some(35), 20), [(35, 15), (80, 5)]);
+        assert_eq!(arena.free, [(15, 15), (65, 15), (85, 15)]);
+        // A request larger than every hole takes whole holes, largest first.
+        assert_eq!(arena.claim(Some(3), 40), [(15, 15), (65, 15), (87, 10)]);
+        assert_eq!(arena.free, [(85, 2), (97, 3)]);
+        assert_eq!(arena.available(), 5);
+    }
+
+    #[test]
     fn planes_allocate_lazily_as_one_stable_set() {
         let Some(device) = cpu_device() else {
             // A backend may be present yet fail Seismic's runtime calibration
@@ -929,7 +1036,7 @@ mod tests {
                 && plane.name == PlaneName::Dense
                 && plane.row_bytes == 16
                 && plane.base_row == 0
-                && plane.buffer.extents() == [8, 4]
+                && plane.buffer.extents() == [8, 1, 4]
         }));
 
         let second = store.history_planes().unwrap();
@@ -1031,37 +1138,39 @@ mod tests {
         )
         .unwrap();
         let state = store.create().unwrap();
-        let original = state.values()[0].clone();
+        let original = state.bank_index();
+        assert_eq!(original, ZERO_SEED_BANK);
         let checkpoint = state.checkpoint();
 
         let advance = OwnedStateAdvance::begin(state, 3).ok().unwrap();
-        assert!(advance.bindings().previous[0].shares_allocation(&original));
-        assert!(!advance.bindings().following[0].shares_allocation(&original));
+        assert_eq!(advance.bindings().previous_bank, original);
+        assert_ne!(advance.bindings().following_bank, original);
+        assert!(advance.bindings().recurrent[0].shares_allocation(&store.recurrent_arenas()[0]));
         let OwnedAdvanceResolution::Repair(repair) = advance.commit(1).ok().unwrap() else {
             panic!("interior prefix must require repair");
         };
         assert_eq!(repair.rows(), 1);
         assert_eq!(store.occupied_rows(), 1);
-        assert!(repair.previous()[0].shares_allocation(&original));
-        assert!(!repair.following()[0].shares_allocation(&original));
+        assert_eq!(repair.previous_bank(), original);
+        assert_ne!(repair.following_bank(), original);
         let state = repair.abort();
         assert_eq!(state.position(), 0);
-        assert!(state.values()[0].shares_allocation(&original));
+        assert_eq!(state.bank_index(), original);
         assert_eq!(store.occupied_rows(), 0);
 
         let advance = OwnedStateAdvance::begin(state, 3).ok().unwrap();
         let OwnedAdvanceResolution::Repair(repair) = advance.commit(2).ok().unwrap() else {
             panic!("interior prefix must require repair");
         };
-        let successor = repair.following()[0].clone();
+        let successor = repair.following_bank();
         let state = repair.commit();
         assert_eq!(state.position(), 2);
-        assert!(state.values()[0].shares_allocation(&successor));
+        assert_eq!(state.bank_index(), successor);
         assert_eq!(store.occupied_rows(), 2);
         assert_eq!(checkpoint.position(), 0);
         let checkpoint_fork = checkpoint.fork();
         assert_eq!(checkpoint_fork.position(), 0);
-        assert!(checkpoint_fork.values()[0].shares_allocation(&original));
+        assert_eq!(checkpoint_fork.bank_index(), original);
         assert!(checkpoint_fork.history_ranges().is_empty());
         drop(checkpoint_fork);
 
@@ -1107,11 +1216,8 @@ mod tests {
             panic!("full prefix must commit");
         };
         let checkpoint = state.checkpoint();
-        let recurrent = checkpoint
-            .values()
-            .iter()
-            .map(Tensor::storage_bytes)
-            .sum::<u64>();
+        let recurrent = store.allocation_trace().unwrap().recurrent_bank_bytes;
+        assert_eq!(recurrent, 4);
         assert_eq!(
             checkpoint.retained_bytes().unwrap(),
             3 * store.total_history_row_bytes() + recurrent
@@ -1152,8 +1258,10 @@ mod tests {
         let first = states.next().unwrap();
         let middle = states.next().unwrap();
         let last = states.next().unwrap();
+        // Placement: first [0, 2), middle mid-hole at [4, 6), last [2, 4).
         let checkpoint = first.checkpoint();
-        drop(middle);
+        drop(last);
+        // Two rows grow in place, the third starts the largest hole.
         let advance = OwnedStateAdvance::begin(first, 3).ok().unwrap();
         assert_eq!(advance.bindings().destinations, [2, 3, 6]);
         let OwnedAdvanceResolution::Committed(first) = advance.commit(2).ok().unwrap() else {
@@ -1164,7 +1272,7 @@ mod tests {
         assert_eq!(checkpoint.position(), 2);
         assert_eq!(checkpoint.fork().history_ranges(), [(0, 2)]);
         assert_eq!(store.occupied_rows(), 6);
-        assert_eq!(last.position(), 2);
+        assert_eq!(middle.position(), 2);
     }
 
     #[test]
@@ -1220,11 +1328,91 @@ mod tests {
         assert_eq!(store.available_banks(), 1);
         let next = OwnedStateAdvance::begin(state, 1).ok().unwrap();
         assert_eq!(next.bindings().following_bank, following_bank);
-        let original_allocation = next.bindings().following[0].clone();
         let state = next.abort();
         assert_eq!(store.available_banks(), 1);
         let retry = OwnedStateAdvance::begin(state, 1).ok().unwrap();
-        assert!(retry.bindings().following[0].shares_allocation(&original_allocation));
+        assert_eq!(retry.bindings().following_bank, following_bank);
+    }
+
+    /// Every successor bank is disjoint from bank 0 and from every bank a live
+    /// state, checkpoint, fork, or other in-flight advance can read, through
+    /// forks, commits, aborts, and repairs.
+    #[test]
+    fn successor_banks_never_alias_a_readable_bank_or_the_zero_seed() {
+        let Some(device) = cpu_device() else {
+            return;
+        };
+        let store = StateStore::new(
+            device,
+            16,
+            16,
+            vec![dense_component(1)],
+            vec![
+                ComponentSpec {
+                    shape: vec![3, 8],
+                    dtype: DType::BF16,
+                },
+                ComponentSpec {
+                    shape: vec![2, 4, 4],
+                    dtype: DType::F32,
+                },
+            ],
+            BankCapacity {
+                active: 3,
+                in_flight: 3,
+                retained: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(store.recurrent_arenas().len(), 2);
+        assert_eq!(store.recurrent_arenas()[0].extents(), [9, 3, 8]);
+        assert_eq!(store.recurrent_arenas()[1].extents(), [9, 2, 4, 4]);
+        let readable = |states: &[&SequenceState], checkpoints: &[&StateCheckpoint]| {
+            states
+                .iter()
+                .map(|state| state.bank_index())
+                .chain(checkpoints.iter().map(|checkpoint| checkpoint.bank_index()))
+                .collect::<Vec<_>>()
+        };
+        let parent = store.create().unwrap();
+        let root = parent.checkpoint();
+        let left = root.fork();
+        let right = root.fork();
+        let left = OwnedStateAdvance::begin(left, 2).ok().unwrap();
+        let right = OwnedStateAdvance::begin(right, 1).ok().unwrap();
+        let parent = OwnedStateAdvance::begin(parent, 3).ok().unwrap();
+        let successors = [&left, &right, &parent].map(|advance| advance.bindings().following_bank);
+        for (index, advance) in [&left, &right, &parent].into_iter().enumerate() {
+            let bindings = advance.bindings();
+            assert_eq!(bindings.previous_bank, ZERO_SEED_BANK);
+            assert_ne!(bindings.following_bank, ZERO_SEED_BANK);
+            assert!(!readable(&[], &[&root]).contains(&bindings.following_bank));
+            assert!(successors
+                .iter()
+                .enumerate()
+                .all(|(other, bank)| other == index || *bank != bindings.following_bank));
+        }
+        let OwnedAdvanceResolution::Committed(left) = left.commit_all().ok().unwrap() else {
+            panic!("full prefix must commit");
+        };
+        let right = right.abort();
+        let OwnedAdvanceResolution::Repair(repair) = parent.commit(2).ok().unwrap() else {
+            panic!("interior recurrent prefix must repair");
+        };
+        let branch = left.checkpoint();
+        let fork = branch.fork();
+        assert_eq!(fork.bank_index(), left.bank_index());
+        assert_ne!(repair.following_bank(), repair.previous_bank());
+        assert!(!readable(&[&left, &right, &fork], &[&root, &branch])
+            .contains(&repair.following_bank()));
+        let parent = repair.commit();
+        let advance = OwnedStateAdvance::begin(fork, 1).ok().unwrap();
+        let following = advance.bindings().following_bank;
+        assert_ne!(following, ZERO_SEED_BANK);
+        assert!(!readable(&[&left, &right, &parent], &[&root, &branch]).contains(&following));
+        drop(advance);
+        drop((left, right, parent, root, branch));
+        assert_eq!(store.available_banks(), 8);
     }
 
     #[test]
@@ -1256,25 +1444,22 @@ mod tests {
 
         let first = store.create().unwrap();
         let seed_bank = first.bank_index();
-        assert_eq!(first.values()[0].read_to_host().unwrap(), vec![0; 16]);
+        assert_eq!(seed_bank, ZERO_SEED_BANK);
+        assert_eq!(bank_bytes(&store, seed_bank), vec![0; 16]);
         let advance = OwnedStateAdvance::begin(first, 1).ok().unwrap();
-        let mut dirty = advance.bindings().following[0].clone();
-        dirty
-            .write_from_host(&7.5f32.to_le_bytes().repeat(4))
-            .unwrap();
+        let dirty = advance.bindings().following_bank;
+        assert_ne!(dirty, seed_bank);
+        write_bank(&store, dirty, &7.5f32.to_le_bytes().repeat(4));
         let OwnedAdvanceResolution::Committed(first) = advance.commit_all().ok().unwrap() else {
             panic!("full prefix must commit");
         };
-        assert_eq!(
-            first.values()[0].read_to_host().unwrap(),
-            7.5f32.to_le_bytes().repeat(4)
-        );
+        assert_eq!(first.bank_index(), dirty);
+        assert_eq!(bank_bytes(&store, dirty), 7.5f32.to_le_bytes().repeat(4));
         drop(first);
 
         let second = store.create().unwrap();
         assert_eq!(second.bank_index(), seed_bank);
-        assert!(!second.values()[0].shares_allocation(&dirty));
-        assert_eq!(second.values()[0].read_to_host().unwrap(), vec![0; 16]);
+        assert_eq!(bank_bytes(&store, seed_bank), vec![0; 16]);
         assert_eq!(store.available_banks(), 2);
     }
 
@@ -1395,5 +1580,144 @@ mod tests {
         };
         assert_eq!((segments, visible_rows), (17, 17));
         assert_eq!(state.history_ranges().len(), 17);
+    }
+
+    /// Lock-step serving of `active` requests for `steps` steps: chunked
+    /// prefills interleaved with speculative decode (1 + 0..=3 draft rows,
+    /// a random accepted prefix), every advance of a step in flight at once,
+    /// requests finishing and new ones admitted into their slots. The arena
+    /// holds `contexts` full contexts plus one batch. Returns the largest
+    /// segment count any accepted history reached and the number of decode
+    /// steps the longest request ran.
+    fn serve_interleaved(active: usize, contexts: usize, steps: usize) -> (usize, usize) {
+        const CONTEXT: usize = 512;
+        const BATCH_ROWS: usize = 64;
+        let device = cpu_device().expect("the CPU backend is available");
+        let store = StateStore::new(
+            device,
+            CONTEXT,
+            contexts * CONTEXT + BATCH_ROWS,
+            vec![dense_component(1)],
+            vec![],
+            BankCapacity {
+                active,
+                in_flight: active,
+                retained: 0,
+            },
+        )
+        .unwrap();
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut random = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        struct Request {
+            state: SequenceState,
+            prompt: usize,
+            length: usize,
+            decode_steps: usize,
+        }
+        let mut slots: Vec<Option<Request>> = (0..active).map(|_| None).collect();
+        let (mut max_segments, mut max_decode_steps) = (0, 0);
+        for step in 0..steps {
+            for slot in &mut slots {
+                if slot.is_none() {
+                    let prompt = 16 + random(160);
+                    *slot = Some(Request {
+                        state: store.create().unwrap(),
+                        prompt,
+                        length: prompt + 200 + random(CONTEXT - prompt - 200),
+                        decode_steps: 0,
+                    });
+                }
+            }
+            // Every advance of the step reserves before any resolves; the
+            // scheduling order rotates so no request always reserves first.
+            let order = (0..active)
+                .map(|index| (index + step) % active)
+                .collect::<Vec<_>>();
+            let mut advances = Vec::with_capacity(active);
+            for &index in &order {
+                let request = slots[index].take().unwrap();
+                let position = request.state.position();
+                let rows = if position < request.prompt {
+                    (request.prompt - position).min(BATCH_ROWS / 2)
+                } else {
+                    (1 + random(4)).min(request.length - position)
+                };
+                let advance = match OwnedStateAdvance::begin(request.state, rows) {
+                    Ok(advance) => advance,
+                    Err((_, error)) => panic!("step {step}: {error}"),
+                };
+                advances.push((
+                    index,
+                    rows,
+                    request.prompt,
+                    request.length,
+                    request.decode_steps,
+                    advance,
+                ));
+            }
+            advances.reverse();
+            for (index, rows, prompt, length, decode_steps, advance) in advances {
+                let decode = advance.position() >= prompt;
+                let accepted = if decode { 1 + random(rows) } else { rows };
+                let OwnedAdvanceResolution::Committed(state) =
+                    advance.commit(accepted).ok().unwrap()
+                else {
+                    panic!("attention-only prefixes commit without repair");
+                };
+                let decode_steps = decode_steps + usize::from(decode);
+                max_segments = max_segments.max(state.history_ranges().len());
+                max_decode_steps = max_decode_steps.max(decode_steps);
+                slots[index] = (state.position() < length).then_some(Request {
+                    state,
+                    prompt,
+                    length,
+                    decode_steps,
+                });
+            }
+            let mut ranges = slots
+                .iter()
+                .flatten()
+                .flat_map(|request| request.state.history_ranges())
+                .collect::<Vec<_>>();
+            ranges.sort_unstable();
+            assert!(
+                ranges
+                    .windows(2)
+                    .all(|pair| pair[0].0 + pair[0].1 <= pair[1].0),
+                "live histories overlap"
+            );
+        }
+        (max_segments, max_decode_steps)
+    }
+
+    #[test]
+    fn interleaved_decode_keeps_every_history_in_few_segments() {
+        // Arena sized as the resource planner sizes it: a context for every
+        // active and every in-flight owner.
+        let (segments, decode_steps) = serve_interleaved(8, 16, 800);
+        assert!(
+            decode_steps > 100,
+            "requests ran {decode_steps} decode steps"
+        );
+        assert_eq!(segments, 1);
+        // Tight arenas, down to exactly one context per request: requests
+        // outgrow their room and move, but never fragment past two segments
+        // (first-fit placement gave one segment per decode step).
+        for (active, contexts) in [(4, 5), (8, 9), (8, 8), (16, 17)] {
+            let (segments, decode_steps) = serve_interleaved(active, contexts, 3000);
+            assert!(
+                decode_steps > 100,
+                "requests ran {decode_steps} decode steps"
+            );
+            assert!(
+                segments <= 2,
+                "{active} requests in {contexts} contexts reached {segments} segments"
+            );
+        }
     }
 }

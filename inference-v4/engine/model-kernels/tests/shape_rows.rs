@@ -197,197 +197,169 @@ fn generated_surface_exposes_planned_and_native_preparation() {
     let _ = (planned_sample, native_sample);
 }
 
+const PARTITIONS: [u64; 3] = [64, 32, 128];
+
 #[cfg(target_os = "macos")]
-#[test]
-fn native_sampling_reports_greedy_empty_and_nonfinite_rows() {
+fn metal() -> seismic::Device {
     let catalog = seismic::DeviceCatalog::discover().unwrap();
-    let device = catalog.open_backend(seismic::BackendName::Metal).unwrap();
-    let values = [1.0f32, 3.0, 2.0, 4.0, 5.0, 6.0, f32::NAN, 0.0, 1.0];
-    let logits = seismic::Tensor::from_host(
-        &device,
-        seismic::Element::f32(),
-        &[3, 3],
-        &values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>(),
-    )
-    .unwrap();
-    let mask = seismic::Tensor::from_host(
-        &device,
-        seismic::Element::u32(),
-        &[3, 1],
-        &[0b111u32, 0, 0b111]
-            .into_iter()
-            .flat_map(u32::to_le_bytes)
-            .collect::<Vec<_>>(),
-    )
-    .unwrap();
-    let draws =
-        seismic::Tensor::from_host(&device, seismic::Element::u32(), &[3, 6], &[0; 72]).unwrap();
-    let mut result = seismic::Tensor::zeros(&device, seismic::Element::i32(), &[3, 2]).unwrap();
-    sample_rows::native_for_device(&device, &seismic::NativeSpecialization::new())
-        .unwrap()
-        .call(sample_rows::Args {
-            logits: &logits,
-            mask: &mask,
-            draws: &draws,
-            result: &mut result,
-        })
-        .unwrap();
-    let actual = result
-        .read_to_host()
-        .unwrap()
-        .chunks_exact(4)
-        .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap()))
-        .collect::<Vec<_>>();
-    assert_eq!(actual, vec![1, 0, -1, 1, -1, 2]);
+    catalog.open_backend(seismic::BackendName::Metal).unwrap()
 }
 
 #[cfg(target_os = "macos")]
-#[test]
-fn native_sampling_reduces_the_vocabulary_cooperatively_with_stable_ties_and_rng() {
-    const VOCAB: usize = 513;
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
-    let device = catalog.open_backend(seismic::BackendName::Metal).unwrap();
-    let mut values = vec![-4.0f32; 2 * VOCAB];
-    values[5] = 7.0;
-    values[300] = 7.0;
-    for token in 0..VOCAB {
-        values[VOCAB + token] = (token % 17) as f32 * 0.125 - 1.0;
+fn native_shape(device: &seismic::Device, logits: &[f32], rows: usize, vocabulary: usize,
+    params: &[f32], history: &[i32], parts: u64) -> Vec<f32> {
+    let hn = history.len() / rows;
+    let f32_bytes = |values: &[f32]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+    let logits = seismic::Tensor::from_host(device, seismic::Element::f32(), &[rows as u64, vocabulary as u64], &f32_bytes(logits)).unwrap();
+    let params = seismic::Tensor::from_host(device, seismic::Element::f32(), &[rows as u64, 8], &f32_bytes(params)).unwrap();
+    let history = seismic::Tensor::from_host(device, seismic::Element::i32(), &[rows as u64, hn as u64],
+        &history.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+    let mut out = seismic::Tensor::zeros(device, seismic::Element::f32(), &[rows as u64, vocabulary as u64]).unwrap();
+    shape_rows::native_for_device(
+        device,
+        &seismic::NativeSpecialization::new().with_param("PARTS", parts),
+    )
+    .unwrap()
+    .call(shape_rows::Args { logits: &logits, params: &params, history: &history, out: &mut out })
+    .unwrap();
+    out.read_to_host().unwrap().chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
+}
+
+#[cfg(target_os = "macos")]
+fn native_sample(device: &seismic::Device, logits: &[f32], rows: usize, vocabulary: usize, mask: &[u32],
+    constrained: &[i32], draws: &[u32], parts: u64) -> Vec<i32> {
+    let words = vocabulary.div_ceil(32);
+    let u32_bytes = |values: &[u32]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+    let logits = seismic::Tensor::from_host(device, seismic::Element::f32(), &[rows as u64, vocabulary as u64],
+        &logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+    let mask = seismic::Tensor::from_host(device, seismic::Element::u32(), &[rows as u64, words as u64], &u32_bytes(mask)).unwrap();
+    let constrained = seismic::Tensor::from_host(device, seismic::Element::i32(), &[rows as u64],
+        &constrained.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+    let draws = seismic::Tensor::from_host(device, seismic::Element::u32(), &[rows as u64, 6], &u32_bytes(draws)).unwrap();
+    let mut result = seismic::Tensor::zeros(device, seismic::Element::i32(), &[rows as u64, 2]).unwrap();
+    sample_rows::native_for_device(
+        device,
+        &seismic::NativeSpecialization::new().with_param("PARTS", parts),
+    )
+    .unwrap()
+    .call(sample_rows::Args { logits: &logits, mask: &mask, constrained: &constrained, draws: &draws, result: &mut result })
+    .unwrap();
+    result.read_to_host().unwrap().chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect()
+}
+
+/// Deterministic logits of an approximately normal shape; `quantized` rounds
+/// them to quarters so many ties exist.
+fn logits_pattern(count: usize, seed: u64, quantized: bool) -> Vec<f32> {
+    let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+    let mut uniform = move || {
+        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        ((state >> 40) as f32) / (1u64 << 24) as f32
+    };
+    (0..count)
+        .map(|_| {
+            let value = (uniform() + uniform() + uniform() + uniform() - 2.0) * 4.0;
+            if quantized { (value * 4.0).round() / 4.0 } else { value }
+        })
+        .collect()
+}
+
+fn sample_reference(logits: &[f32], mask: &[u32], constrained: bool, draw: [u32; 6]) -> (i32, i32) {
+    let mut bad = false;
+    let mut best: Option<(f32, usize)> = None;
+    for (token, value) in logits.iter().enumerate() {
+        bad |= value.is_nan() || *value == f32::INFINITY;
+        if (constrained && (mask[token / 32] >> (token % 32)) & 1 == 0) || !value.is_finite() {
+            continue;
+        }
+        let score = if draw[0] == 1 { philox_score(*value, token as u32, draw) } else { *value };
+        if best.map_or(true, |(b, _)| score > b) {
+            best = Some((score, token));
+        }
     }
-    let draw = [1, 0x1234_5678, 0x9abc_def0, 7, 11, 13];
-    let stochastic = (0..VOCAB)
-        .map(|token| philox_score(values[VOCAB + token], token as u32, draw))
-        .enumerate()
-        .max_by(|(left_token, left), (right_token, right)| {
-            left.total_cmp(right)
-                .then_with(|| right_token.cmp(left_token))
-        })
-        .unwrap()
-        .0 as i32;
-    let logits = seismic::Tensor::from_host(
-        &device,
-        seismic::Element::f32(),
-        &[2, VOCAB as u64],
-        &values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>(),
-    )
-    .unwrap();
-    let mask_words = VOCAB.div_ceil(32);
-    let mask_values = vec![u32::MAX; 2 * mask_words];
-    let mask = seismic::Tensor::from_host(
-        &device,
-        seismic::Element::u32(),
-        &[2, mask_words as u64],
-        &mask_values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>(),
-    )
-    .unwrap();
-    let mut draw_values = vec![0u32; 12];
-    draw_values[6..].copy_from_slice(&draw);
-    let draws = seismic::Tensor::from_host(
-        &device,
-        seismic::Element::u32(),
-        &[2, 6],
-        &draw_values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>(),
-    )
-    .unwrap();
-    let mut result = seismic::Tensor::zeros(&device, seismic::Element::i32(), &[2, 2]).unwrap();
-    sample_rows::native_for_device(&device, &seismic::NativeSpecialization::new())
-        .unwrap()
-        .call(sample_rows::Args {
-            logits: &logits,
-            mask: &mask,
-            draws: &draws,
-            result: &mut result,
-        })
-        .unwrap();
-    let actual = result
-        .read_to_host()
-        .unwrap()
-        .chunks_exact(4)
-        .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap()))
-        .collect::<Vec<_>>();
-    assert_eq!(actual, vec![5, 0, stochastic, 0]);
+    match (bad, best) {
+        (true, _) => (-1, 2),
+        (false, Some((_, token))) => (token as i32, 0),
+        (false, None) => (-1, 1),
+    }
+}
+
+/// The portable shaping semantics in O(V log V); `edge` marks tokens whose
+/// top-p decision lies within rounding of the threshold.
+fn shaping_reference(logits: &[f32], p: &[f32], history: &[i32]) -> (Vec<f32>, Vec<bool>) {
+    let vocabulary = logits.len();
+    let mut values = logits.to_vec();
+    for (token, value) in values.iter_mut().enumerate() {
+        let count = history.iter().filter(|h| **h == token as i32).count();
+        if count > 0 {
+            *value = if *value < 0.0 { *value * p[4] } else { *value / p[4] };
+            *value = *value - p[5] - p[6] * count as f32;
+        }
+    }
+    let mut edge = vec![false; vocabulary];
+    if p[0] == 0.0 {
+        return (values, edge);
+    }
+    for value in values.iter_mut() {
+        *value /= p[0];
+    }
+    if values.iter().any(|x| x.is_nan() || *x == f32::INFINITY) {
+        return (values, edge);
+    }
+    let top_k = p[1] as i32;
+    if top_k > 0 {
+        let mut sorted = values.clone();
+        sorted.sort_by(|a, b| b.total_cmp(a));
+        let kth = sorted[(top_k as usize).min(vocabulary) - 1];
+        for value in values.iter_mut() {
+            if *value < kth {
+                *value = f32::NEG_INFINITY;
+            }
+        }
+    }
+    let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if p[3] > 0.0 {
+        for value in values.iter_mut() {
+            if (*value - maximum).exp() < p[3] {
+                *value = f32::NEG_INFINITY;
+            }
+        }
+    }
+    if p[2] < 1.0 {
+        let weights = values.iter().map(|x| f64::from((*x - maximum).exp())).collect::<Vec<_>>();
+        let denominator = weights.iter().sum::<f64>();
+        let mut order = (0..vocabulary).collect::<Vec<_>>();
+        // IEEE order: -0.0 and +0.0 are one tie group, as in the portable body.
+        order.sort_by(|a, b| values[*b].partial_cmp(&values[*a]).unwrap().then(a.cmp(b)));
+        let mut before = 0f64;
+        for token in order {
+            let preceding = before / denominator;
+            edge[token] = (preceding - f64::from(p[2])).abs() < 1e-5;
+            if preceding >= f64::from(p[2]) {
+                values[token] = f32::NEG_INFINITY;
+            }
+            before += weights[token];
+        }
+    }
+    (values, edge)
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 fn native_metal_shaping_matches_the_host_reference() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
-    let device = catalog.open_backend(seismic::BackendName::Metal).unwrap();
+    let device = metal();
     let (logits, params, history) = fixture();
     let expected = host_reference(&logits, &params, &history);
-    let f32_bytes = |values: &[f32]| {
-        values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>()
-    };
-    let logits = seismic::Tensor::from_host(
-        &device,
-        seismic::Element::f32(),
-        &[ROWS as u64, VOCABULARY as u64],
-        &f32_bytes(&logits),
-    )
-    .unwrap();
-    let params = seismic::Tensor::from_host(
-        &device,
-        seismic::Element::f32(),
-        &[ROWS as u64, 8],
-        &f32_bytes(&params),
-    )
-    .unwrap();
-    let history_bytes = history
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect::<Vec<_>>();
-    let history = seismic::Tensor::from_host(
-        &device,
-        seismic::Element::i32(),
-        &[ROWS as u64, HISTORY as u64],
-        &history_bytes,
-    )
-    .unwrap();
-    let mut out = seismic::Tensor::zeros(
-        &device,
-        seismic::Element::f32(),
-        &[ROWS as u64, VOCABULARY as u64],
-    )
-    .unwrap();
-    shape_rows::native_for_device(&device, &seismic::NativeSpecialization::new())
-        .unwrap()
-        .call(shape_rows::Args {
-            logits: &logits,
-            params: &params,
-            history: &history,
-            out: &mut out,
-        })
-        .unwrap();
-    let actual = out
-        .read_to_host()
-        .unwrap()
-        .chunks_exact(4)
-        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
-        .collect::<Vec<_>>();
-    assert_values(&actual, &expected);
+    for parts in PARTITIONS {
+        let actual = native_shape(&device, &logits, ROWS, VOCABULARY, &params, &history, parts);
+        assert_values(&actual, &expected);
+    }
 }
 
 #[cfg(target_os = "macos")]
 #[test]
-fn native_shaping_preserves_cross_simdgroup_cutoff_ties_and_history_counts() {
+fn native_shaping_preserves_cross_partition_cutoff_ties_and_history_counts() {
     const VOCAB: usize = 513;
-    const HISTORY_WIDTH: usize = 513;
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
-    let device = catalog.open_backend(seismic::BackendName::Metal).unwrap();
+    let device = metal();
     let mut logits = vec![-10.0f32; 2 * VOCAB];
     logits[5] = 4.0;
     logits[300] = 4.0;
@@ -398,68 +370,126 @@ fn native_shaping_preserves_cross_simdgroup_cutoff_ties_and_history_counts() {
         1.0, 2.0, 0.5, 0.0, 1.0, 0.0, 0.0, 0.0, // top-p cuts the later score tie
         1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, // frequency uses exact counts
     ];
-    let mut history = vec![-1i32; 2 * HISTORY_WIDTH];
-    history[HISTORY_WIDTH] = 5;
-    history[HISTORY_WIDTH + 1] = 300;
-    history[HISTORY_WIDTH + 2] = 300;
-    let f32_bytes = |values: &[f32]| {
-        values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>()
-    };
-    let logits = seismic::Tensor::from_host(
-        &device,
-        seismic::Element::f32(),
-        &[2, VOCAB as u64],
-        &f32_bytes(&logits),
-    )
-    .unwrap();
-    let params = seismic::Tensor::from_host(
-        &device,
-        seismic::Element::f32(),
-        &[2, 8],
-        &f32_bytes(&params),
-    )
-    .unwrap();
-    let history = seismic::Tensor::from_host(
-        &device,
-        seismic::Element::i32(),
-        &[2, HISTORY_WIDTH as u64],
-        &history
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>(),
-    )
-    .unwrap();
-    let mut out =
-        seismic::Tensor::zeros(&device, seismic::Element::f32(), &[2, VOCAB as u64]).unwrap();
-    shape_rows::native_for_device(&device, &seismic::NativeSpecialization::new())
-        .unwrap()
-        .call(shape_rows::Args {
-            logits: &logits,
-            params: &params,
-            history: &history,
-            out: &mut out,
-        })
-        .unwrap();
-    let actual = out
-        .read_to_host()
-        .unwrap()
-        .chunks_exact(4)
-        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
-        .collect::<Vec<_>>();
-    assert_eq!(actual[5], 4.0);
-    assert_eq!(actual[300], f32::NEG_INFINITY);
-    assert_eq!(actual[400], f32::NEG_INFINITY);
-    assert_eq!(actual[VOCAB + 5], 3.0);
-    assert_eq!(actual[VOCAB + 300], f32::NEG_INFINITY);
-    assert!(actual[..VOCAB]
-        .iter()
-        .enumerate()
-        .all(|(token, value)| token == 5 || *value == f32::NEG_INFINITY));
-    assert!(actual[VOCAB..]
-        .iter()
-        .enumerate()
-        .all(|(token, value)| token == 5 || *value == f32::NEG_INFINITY));
+    let mut history = vec![-1i32; 2 * VOCAB];
+    history[VOCAB] = 5;
+    history[VOCAB + 1] = 300;
+    history[VOCAB + 2] = 300;
+    for parts in PARTITIONS {
+        let actual = native_shape(&device, &logits, 2, VOCAB, &params, &history, parts);
+        assert_eq!(actual[5], 4.0);
+        assert_eq!(actual[300], f32::NEG_INFINITY);
+        assert_eq!(actual[400], f32::NEG_INFINITY);
+        assert_eq!(actual[VOCAB + 5], 3.0);
+        assert_eq!(actual[VOCAB + 300], f32::NEG_INFINITY);
+        assert!(actual[..VOCAB].iter().enumerate().all(|(t, v)| t == 5 || *v == f32::NEG_INFINITY));
+        assert!(actual[VOCAB..].iter().enumerate().all(|(t, v)| t == 5 || *v == f32::NEG_INFINITY));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_shaping_matches_the_ordered_semantics_at_full_vocabulary_for_every_partition_count() {
+    let device = metal();
+    let param_rows: [[f32; 8]; 8] = [
+        [0.7, 40.0, 0.9, 0.05, 1.1, 0.2, 0.1, 0.0],
+        [1.0, 0.0, 0.5, 0.0, 1.0, 0.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        [1.3, 1_000_000.0, 0.95, 0.0, 1.0, 0.0, 0.0, 0.0],
+        [0.0, 40.0, 0.9, 0.05, 1.3, 0.5, 0.25, 0.0],
+        [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        [0.8, 20.0, 1.0, 0.1, 1.0, 0.0, 0.0, 0.0],
+        [1.0, 64.0, 0.99, 0.0, 1.0, 0.0, 0.0, 0.0],
+    ];
+    let rows = param_rows.len();
+    let params = param_rows.iter().flatten().copied().collect::<Vec<_>>();
+    for (vocabulary, quantized) in [(248_320usize, false), (248_320, true), (1000, true), (513, false)] {
+        let logits = logits_pattern(rows * vocabulary, vocabulary as u64 + u64::from(quantized), quantized);
+        let history = (0..rows * 64).map(|i| if i % 3 == 0 { -1 } else { ((i * 7919) % (vocabulary / 2)) as i32 }).collect::<Vec<_>>();
+        let base = native_shape(&device, &logits, rows, vocabulary, &params, &history, PARTITIONS[0]);
+        for parts in &PARTITIONS[1..] {
+            let other = native_shape(&device, &logits, rows, vocabulary, &params, &history, *parts);
+            assert!(other.iter().zip(&base).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "V {vocabulary}: PARTS {parts} changes the result");
+        }
+        for row in 0..rows {
+            let (expected, edge) = shaping_reference(&logits[row * vocabulary..(row + 1) * vocabulary],
+                &param_rows[row], &history[row * 64..(row + 1) * 64]);
+            let actual = &base[row * vocabulary..(row + 1) * vocabulary];
+            let wrong = (0..vocabulary)
+                .filter(|t| !edge[*t] && actual[*t].to_bits() != expected[*t].to_bits()
+                    && (actual[*t].is_infinite() || expected[*t].is_infinite()
+                        || (actual[*t] - expected[*t]).abs() > 1e-6 * expected[*t].abs()))
+                .collect::<Vec<_>>();
+            assert!(wrong.is_empty(), "V {vocabulary} row {row}: {} tokens differ, first {:?}",
+                wrong.len(), wrong.iter().take(4).map(|t| (*t, actual[*t], expected[*t])).collect::<Vec<_>>());
+        }
+    }
+    // Equal logits: the top-p tie rule keeps the lowest indices.
+    for (vocabulary, top_p, kept) in [(1000usize, 0.5f32, 500usize), (248_320, 0.3, 74_496), (1000, 0.0015, 2)] {
+        let logits = vec![1.5f32; vocabulary];
+        for parts in PARTITIONS {
+            let out = native_shape(&device, &logits, 1, vocabulary, &[1.0, 0.0, top_p, 0.0, 1.0, 0.0, 0.0, 0.0], &[-1; 64], parts);
+            let survivors = (0..vocabulary).filter(|t| out[*t] > f32::NEG_INFINITY).collect::<Vec<_>>();
+            assert_eq!(survivors, (0..kept).collect::<Vec<_>>(), "V {vocabulary} top-p {top_p} PARTS {parts}");
+        }
+    }
+    // A NaN row is left unfiltered (sampling reports it).
+    let mut logits = logits_pattern(1000, 3, false);
+    logits[17] = f32::NAN;
+    let out = native_shape(&device, &logits, 1, 1000, &[1.0, 5.0, 0.5, 0.1, 1.0, 0.0, 0.0, 0.0], &[-1; 64], 64);
+    assert!(out.iter().all(|v| *v != f32::NEG_INFINITY));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_sampling_statuses_ties_masks_and_winners_are_partition_invariant() {
+    let device = metal();
+    for vocabulary in [248_320usize, 1000, 513, 33] {
+        let rows = 6;
+        let words = vocabulary.div_ceil(32);
+        let mut logits = logits_pattern(rows * vocabulary, vocabulary as u64, vocabulary < 100);
+        let mut mask = vec![u32::MAX; rows * words];
+        if vocabulary % 32 != 0 {
+            for row in 0..rows {
+                mask[row * words + words - 1] = (1u32 << (vocabulary % 32)) - 1;
+            }
+        }
+        // Row 1: a greedy tie between an early and the last token.
+        logits[vocabulary..2 * vocabulary].fill(-1.0);
+        logits[vocabulary + 3] = 5.0;
+        logits[2 * vocabulary - 1] = 5.0;
+        // Row 2: only the last token (the mask boundary) competes.
+        mask[2 * words..3 * words].fill(0);
+        mask[3 * words - 1] = 1u32 << ((vocabulary - 1) % 32);
+        // Row 3: nothing competes: status 1.
+        mask[3 * words..4 * words].fill(0);
+        // Row 4: a masked-out +inf still makes the row invalid: status 2.
+        logits[4 * vocabulary + vocabulary / 2] = f32::INFINITY;
+        mask[4 * words + (vocabulary / 2) / 32] &= !(1u32 << ((vocabulary / 2) % 32));
+        // Rows 2..=4 are constrained; the others admit the vocabulary, so
+        // their all-zero mask rows are ignored.
+        let constrained = [0, 0, 1, 1, 1, 0];
+        for row in [0usize, 1, 5] {
+            mask[row * words..(row + 1) * words].fill(0);
+        }
+        let mut draws = vec![0u32; rows * 6];
+        for row in [0usize, 2, 5] {
+            draws[row * 6..row * 6 + 6].copy_from_slice(&[1, 0x1234_5678 + row as u32, 0x9abc_def0, 7 + row as u32, 11, 13]);
+        }
+        let base = native_sample(&device, &logits, rows, vocabulary, &mask, &constrained, &draws, PARTITIONS[0]);
+        for parts in &PARTITIONS[1..] {
+            assert_eq!(native_sample(&device, &logits, rows, vocabulary, &mask, &constrained, &draws, *parts), base,
+                "V {vocabulary}: PARTS {parts} changes the winners");
+        }
+        for row in 0..rows {
+            let draw: [u32; 6] = draws[row * 6..row * 6 + 6].try_into().unwrap();
+            let expected = sample_reference(&logits[row * vocabulary..(row + 1) * vocabulary],
+                &mask[row * words..(row + 1) * words], constrained[row] != 0, draw);
+            assert_eq!((base[2 * row], base[2 * row + 1]), expected, "V {vocabulary} row {row}");
+        }
+        assert_eq!((base[2], base[3]), (3, 0), "V {vocabulary}: ties go to the lowest token");
+        assert_eq!((base[4], base[5]), ((vocabulary - 1) as i32, 0), "V {vocabulary}: mask boundary");
+        assert_eq!((base[6], base[7]), (-1, 1), "V {vocabulary}: empty row");
+        assert_eq!((base[8], base[9]), (-1, 2), "V {vocabulary}: non-finite row");
+    }
 }

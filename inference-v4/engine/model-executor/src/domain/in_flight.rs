@@ -62,6 +62,8 @@ pub struct TargetFlight<S: ProgramSubmission<CompletedWork = crate::CompletedTar
     )>,
     pub(super) submission: S,
     pub(super) started: Instant,
+    /// When the domain last read a selection before this step was submitted.
+    pub(super) previous_selection: Option<Instant>,
     pub(super) slots: Vec<Slot>,
     pub(super) conditioning_slices: Vec<Vec<crate::ConditioningSlice>>,
 }

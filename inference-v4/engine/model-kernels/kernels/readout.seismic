@@ -1,24 +1,8 @@
-# Packed target readout variants. Rows are selected explicitly so a mixed
-# launch never publishes state-only rows to the host-facing generation path.
-fn qwen_readout_rows[M, O, V, D](hidden: &tensor[M, D] f32,
-    norm: &tensor[D] NW, weight: &tensor[V, D] OW,
-    out_rows: &tensor[O] i32, epsilon: f32)
-    -> (tensor[O, D] A, tensor[O, V] f32):
-    let mut selected = tensor[O, D] f32
-    let mut features = tensor[O, D] A
-    let mut logits = tensor[O, V] f32
-    parallel for row in 0..O:
-        parallel for col in 0..D:
-            selected[row, col] = hidden[out_rows[row], col]
-    rms_norm(selected, norm, features, epsilon)
-    linear(features, weight, logits)
-    return features, logits
-
-native qwen_readout_rows for metal from "metal/qwen_readout_rows.metal":
-    launch qwen_readout_rows:
-        threadgroups (ceil_div(O * (D + V), 256), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-
+# Packed target readout. Every entry reads the `out_rows` rows of the final
+# hidden rows directly, so a mixed launch never publishes state-only rows and
+# no identity copy or gather precedes the readout. Features, logits and
+# selected-vocabulary logits are separate entries: feature-only work never
+# touches the vocabulary projection.
 
 fn qwen_features_rows[M, O, D](hidden: &tensor[M, D] f32,
     norm: &tensor[D] NW, out_rows: &tensor[O] i32,
@@ -32,15 +16,58 @@ fn qwen_features_rows[M, O, D](hidden: &tensor[M, D] f32,
     return features
 
 native qwen_features_rows for metal from "metal/qwen_features_rows.metal":
+    static (D)
     launch qwen_features_rows:
-        threadgroups (ceil_div(O, 256), 1, 1)
+        threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 
+# The head (K1 projection): final RMS prologue over the `out_rows` rows, then
+# the vocabulary projection into F32 logits. M <= 2 output rows run the GEMV
+# launch, 3..8 the batched launch, each normalizing its rows in-threadgroup;
+# larger classes a pre-pass that writes the normalized rows to scratch, then
+# the GEMM launch.
+fn qwen_head_rows[M, O, V, D](hidden: &tensor[M, D] f32,
+    norm: &tensor[D] NW, weight: &tensor[V, D] OW,
+    out_rows: &tensor[O] i32, epsilon: f32) -> tensor[O, V] f32:
+    let mut selected = tensor[O, D] f32
+    let mut features = tensor[O, D] A
+    let mut logits = tensor[O, V] f32
+    parallel for row in 0..O:
+        parallel for col in 0..D:
+            selected[row, col] = hidden[out_rows[row], col]
+    rms_norm(selected, norm, features, epsilon)
+    linear(features, weight, logits)
+    return logits
+
+native qwen_head_rows for metal from "metal/qwen_head_rows.metal":
+    static (V, D)
+    params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
+            arithmetic BATCH_FROM in [5, 3, 9], BATCH_SIMDGROUPS in [8, 4, 16, 32], BATCH_ROWS in [2, 1, 4],
+            TILE_M in [64, 128, 32], TILE_N in [64, 128])
+    scratch normalized bytes (min(O / 9, 1) * O * D * 2)
+    launch qwen_head_rows_normalize:
+        threadgroups (min(O / 9, 1) * O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch qwen_head_rows_gemv:
+        threadgroups ((1 - min(O / BATCH_FROM, 1)) * ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(O, 8) * min(ceil_div(D, 32), 288 / max(O, 1)) * 72)
+    launch qwen_head_rows_batch:
+        threadgroups (min(O / BATCH_FROM, 1) * (1 - min(O / 9, 1)) * ceil_div(V, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
+        threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
+        shared_bytes (16512)
+    launch qwen_head_rows_gemm:
+        threadgroups (min(O / 9, 1) * ceil_div(V, TILE_N), ceil_div(O, TILE_M), 1)
+        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+
+
+# The head projection restricted to the `selected` vocabulary rows (a weight
+# row gather inside the same K1 projection).
 fn qwen_selected_rows[M, O, V, D, Sv](hidden: &tensor[M, D] f32,
     norm: &tensor[D] NW, weight: &tensor[V, D] OW,
     out_rows: &tensor[O] i32, selected: &tensor[Sv] i32,
-    epsilon: f32) -> (tensor[O, D] A, tensor[O, Sv] f32):
+    epsilon: f32) -> tensor[O, Sv] f32:
     let mut demanded = tensor[O, D] f32
     let mut features = tensor[O, D] A
     let mut logits = tensor[O, Sv] f32
@@ -56,9 +83,25 @@ fn qwen_selected_rows[M, O, V, D, Sv](hidden: &tensor[M, D] f32,
                 zeros_like(logits[row : row + 1, col : col + 1], dtype=f32),
             )
             logits[row, col] = acc[0, 0]
-    return features, logits
+    return logits
 
 native qwen_selected_rows for metal from "metal/qwen_selected_rows.metal":
-    launch qwen_selected_rows:
-        threadgroups (ceil_div(O * (D + Sv), 256), 1, 1)
+    static (V, D)
+    params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
+            arithmetic BATCH_FROM in [5, 3, 9], BATCH_SIMDGROUPS in [8, 4, 16, 32], BATCH_ROWS in [2, 1, 4],
+            TILE_M in [64, 128, 32], TILE_N in [64, 128])
+    scratch normalized bytes (min(O / 9, 1) * O * D * 2)
+    launch qwen_selected_rows_normalize:
+        threadgroups (min(O / 9, 1) * O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
+    launch qwen_selected_rows_gemv:
+        threadgroups ((1 - min(O / BATCH_FROM, 1)) * ceil_div(Sv, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(O, 8) * min(ceil_div(D, 32), 288 / max(O, 1)) * 72)
+    launch qwen_selected_rows_batch:
+        threadgroups (min(O / BATCH_FROM, 1) * (1 - min(O / 9, 1)) * ceil_div(Sv, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
+        threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
+        shared_bytes (16512)
+    launch qwen_selected_rows_gemm:
+        threadgroups (min(O / 9, 1) * ceil_div(Sv, TILE_N), ceil_div(O, TILE_M), 1)
+        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)

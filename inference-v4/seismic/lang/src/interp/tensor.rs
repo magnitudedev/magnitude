@@ -14,8 +14,8 @@ pub enum TensorData {
         bytes: Vec<u8>,
         initialized: Vec<bool>,
     },
-    /// Canonical packet-interleaved bytes for a packed resident or external
-    /// representation.
+    /// Canonical bytes of a packed resident storage (any layout) or an
+    /// external representation.
     Encoded {
         representation: RepresentationId,
         shape: Vec<usize>,
@@ -132,7 +132,7 @@ impl TensorData {
                     initialized: vec![false; count],
                 }
             }
-            RepresentationKind::Packed(_) => Self::Encoded {
+            RepresentationKind::Packed(_) | RepresentationKind::PackedRows(_) => Self::Encoded {
                 representation,
                 bytes: vec![0; encoded_bytes(representation, &shape).expect(ADMITTED)],
                 shape,
@@ -284,6 +284,9 @@ pub(super) fn encoded_bytes(
         RepresentationKind::Packed(layout) => layout
             .bytes(rows, *last as u64)
             .ok_or("packed tensor size overflow")?,
+        RepresentationKind::PackedRows(layout) => layout
+            .bytes(&shape.iter().map(|extent| *extent as u64).collect::<Vec<_>>())
+            .ok_or("row-layout tensor size overflow or rank below its layout's")?,
         RepresentationKind::External(layout) => rows
             .checked_mul((*last as u64).div_ceil(u64::from(layout.logical_group)))
             .and_then(|packets| packets.checked_mul(u64::from(layout.packet_size)))
@@ -303,8 +306,27 @@ fn decode(
     flat: usize,
 ) -> ReferenceScalar {
     let info = registry::representation_info(representation);
-    let RepresentationKind::Packed(layout) = &info.kind else {
-        unreachable!("checked source decodes a conversion-only external representation")
+    let storage = match &info.kind {
+        RepresentationKind::Packed(layout) => PlaneStorage::Packet {
+            layout,
+            packets_per_row: shape
+                .last()
+                .unwrap_or_else(|| unreachable!("packed storage has rank zero"))
+                .div_ceil(layout.group as usize),
+        },
+        RepresentationKind::PackedRows(layout) => {
+            let extents = shape.iter().map(|extent| *extent as u64).collect::<Vec<_>>();
+            PlaneStorage::Rows {
+                layout,
+                geometry: layout
+                    .geometry(*extents.last().expect("row layout storage has a packing axis"))
+                    .expect("admitted row-layout storage has a row geometry"),
+                extents,
+            }
+        }
+        RepresentationKind::Dense(_) | RepresentationKind::External(_) => {
+            unreachable!("checked source decodes a conversion-only external representation")
+        }
     };
     let width = *shape
         .last()
@@ -314,9 +336,9 @@ fn decode(
     }
     let row = flat / width;
     let column = flat % width;
-    let packets_per_row = width.div_ceil(layout.group as usize);
-    let packet = row * packets_per_row + column / layout.group as usize;
-    let local = (column % layout.group as usize) as u64;
+    let group = storage.packet().group as usize;
+    let packet = column / group;
+    let local = (column % group) as u64;
     let recipe = registry::decode_recipe(representation, info.decoded)
         .unwrap_or_else(|| unreachable!("registered packed representation has no decode recipe"));
     let mut temporaries = vec![ReferenceScalar::U32(0); recipe.temporary_count()];
@@ -325,7 +347,7 @@ fn decode(
             DecodeStep::ReadPlaneField { plane, field, .. } => {
                 let schema = &recipe.planes()[*plane as usize];
                 let entry = schema.entry(local, *field);
-                read_plane(layout, bytes, packet, *plane as usize, entry)
+                storage.read_plane(bytes, row, packet, *plane as usize, entry)
             }
             DecodeStep::InterpretCode {
                 raw,
@@ -379,32 +401,67 @@ fn decode(
     temporaries[recipe.ordinal(recipe.output())]
 }
 
-fn read_plane(
-    layout: &crate::registry::PackedPacketLayout,
-    bytes: &[u8],
-    packet: usize,
-    plane: usize,
-    entry: u64,
-) -> ReferenceScalar {
-    // The packet lies inside storage whose byte length `TensorData::encoded`
-    // admitted for this representation and shape.
-    let schema = &layout.planes[plane];
-    let start = packet * layout.packet_size as usize + schema.offset as usize;
-    let plane_bytes = &bytes[start..start + schema.bytes_per_group as usize];
-    match &schema.encoding {
-        PlaneEncoding::Packed { .. } | PlaneEncoding::FloatCode { .. } => {
-            ReferenceScalar::U32(read_bits(
-                plane_bytes,
-                entry as usize * schema.entry_bits as usize,
-                schema.entry_bits,
-            ))
+/// Where the packet-form planes of one packed tensor live: interleaved per
+/// packet, or placed by a row layout.
+enum PlaneStorage<'a> {
+    Packet {
+        layout: &'a registry::PackedPacketLayout,
+        packets_per_row: usize,
+    },
+    Rows {
+        layout: &'a registry::PackedRowLayout,
+        geometry: registry::RowGeometry,
+        extents: Vec<u64>,
+    },
+}
+
+impl PlaneStorage<'_> {
+    fn packet(&self) -> &registry::PackedPacketLayout {
+        match self {
+            Self::Packet { layout, .. } => layout,
+            Self::Rows { layout, .. } => &layout.packet,
         }
-        PlaneEncoding::Dense(dtype) => {
-            let offset = entry as usize * dtype.bytes() as usize;
-            read_dense(
-                *dtype,
-                &plane_bytes[offset..offset + dtype.bytes() as usize],
-            )
+    }
+
+    /// Entry `entry` of packet-form plane `plane` of packet `packet` of
+    /// logical row `row`. The storage lies inside bytes whose length
+    /// `TensorData::encoded` admitted for this representation and shape.
+    fn read_plane(
+        &self,
+        bytes: &[u8],
+        row: usize,
+        packet: usize,
+        plane: usize,
+        entry: u64,
+    ) -> ReferenceScalar {
+        let schema = &self.packet().planes[plane];
+        let (first, width) = match &schema.encoding {
+            PlaneEncoding::Packed { .. } | PlaneEncoding::FloatCode { .. } => {
+                (entry as u32 * schema.entry_bits, schema.entry_bits)
+            }
+            PlaneEncoding::Dense(dtype) => (entry as u32 * dtype.bytes() * 8, dtype.bytes() * 8),
+        };
+        let raw = match self {
+            Self::Packet {
+                layout,
+                packets_per_row,
+            } => {
+                let start = (row * packets_per_row + packet) * layout.packet_size as usize
+                    + schema.offset as usize;
+                read_bits(&bytes[start..start + schema.bytes_per_group as usize], first as usize, width)
+            }
+            Self::Rows {
+                layout,
+                geometry,
+                extents,
+            } => {
+                let stored = layout.stored_row(extents, row as u64);
+                layout.read_packet_bits(bytes, geometry, stored, packet as u64, plane, first, width)
+            }
+        };
+        match &schema.encoding {
+            PlaneEncoding::Packed { .. } | PlaneEncoding::FloatCode { .. } => ReferenceScalar::U32(raw),
+            PlaneEncoding::Dense(dtype) => read_dense(*dtype, &raw.to_le_bytes()[..dtype.bytes() as usize]),
         }
     }
 }

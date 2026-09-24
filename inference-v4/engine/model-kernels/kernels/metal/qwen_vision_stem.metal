@@ -1,67 +1,12 @@
-#define VISION_DENSE_LOAD(NAME, PREFIX) \
-inline float NAME(device const uchar *base, ulong logical) { \
-  /* Vision bootstrap favors correctness; packed projector weights remain explicit unsupported bindings. */ \
-  if (PREFIX##_KIND == 0) return *reinterpret_cast<device const float *>(base + logical * PREFIX##_PACKET_SIZE); \
-  if (PREFIX##_KIND == 1) return float(*reinterpret_cast<device const half *>(base + logical * PREFIX##_PACKET_SIZE)); \
-  if (PREFIX##_KIND == 2) return as_type<float>(uint(*reinterpret_cast<device const ushort *>(base + logical * PREFIX##_PACKET_SIZE)) << 16); \
-  return 0.0f; \
-}
+// The vision patch stem: one thread per (row, output) sums both temporal
+// patch projections, the bias and the bilinear position-table blend. Every
+// weight is dense (packed projector weights are unsupported bindings).
+#include "common/element.h"
 
-#if defined(SEISMIC_TEMPORAL_WEIGHT_0_REPRESENTATION_F32)
-#define TEMPORAL_WEIGHT_0_KIND 0
-#elif defined(SEISMIC_TEMPORAL_WEIGHT_0_REPRESENTATION_F16)
-#define TEMPORAL_WEIGHT_0_KIND 1
-#elif defined(SEISMIC_TEMPORAL_WEIGHT_0_REPRESENTATION_BF16)
-#define TEMPORAL_WEIGHT_0_KIND 2
-#else
-#error "native vision stem requires dense first temporal patch weights"
-#endif
-#if defined(SEISMIC_TEMPORAL_WEIGHT_1_REPRESENTATION_F32)
-#define TEMPORAL_WEIGHT_1_KIND 0
-#elif defined(SEISMIC_TEMPORAL_WEIGHT_1_REPRESENTATION_F16)
-#define TEMPORAL_WEIGHT_1_KIND 1
-#elif defined(SEISMIC_TEMPORAL_WEIGHT_1_REPRESENTATION_BF16)
-#define TEMPORAL_WEIGHT_1_KIND 2
-#else
-#error "native vision stem requires dense second temporal patch weights"
-#endif
-#if defined(SEISMIC_BIAS_REPRESENTATION_F32)
-#define BIAS_KIND 0
-#elif defined(SEISMIC_BIAS_REPRESENTATION_F16)
-#define BIAS_KIND 1
-#elif defined(SEISMIC_BIAS_REPRESENTATION_BF16)
-#define BIAS_KIND 2
-#else
-#error "native vision stem requires dense bias"
-#endif
-#if defined(SEISMIC_TABLE_REPRESENTATION_F32)
-#define TABLE_KIND 0
-#elif defined(SEISMIC_TABLE_REPRESENTATION_F16)
-#define TABLE_KIND 1
-#elif defined(SEISMIC_TABLE_REPRESENTATION_BF16)
-#define TABLE_KIND 2
-#else
-#error "native vision stem requires a dense position table"
-#endif
-#define TEMPORAL_WEIGHT_0_PACKET_SIZE SEISMIC_TEMPORAL_WEIGHT_0_PACKET_SIZE
-#define TEMPORAL_WEIGHT_1_PACKET_SIZE SEISMIC_TEMPORAL_WEIGHT_1_PACKET_SIZE
-#define BIAS_PACKET_SIZE SEISMIC_BIAS_PACKET_SIZE
-#define TABLE_PACKET_SIZE SEISMIC_TABLE_PACKET_SIZE
-VISION_DENSE_LOAD(load_temporal_weight_0, TEMPORAL_WEIGHT_0)
-VISION_DENSE_LOAD(load_temporal_weight_1, TEMPORAL_WEIGHT_1)
-VISION_DENSE_LOAD(load_bias, BIAS)
-VISION_DENSE_LOAD(load_table, TABLE)
-
-inline void store_activation(device uchar *base, ulong logical, float value) {
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_F32)
-    *reinterpret_cast<device float *>(base + logical * SEISMIC_ELEMENT_A_PACKET_SIZE) = value;
-#elif defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
-    *reinterpret_cast<device half *>(base + logical * SEISMIC_ELEMENT_A_PACKET_SIZE) = half(value);
-#else
-    uint bits = as_type<uint>(value);
-    *reinterpret_cast<device ushort *>(base + logical * SEISMIC_ELEMENT_A_PACKET_SIZE) = ushort((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
-#endif
-}
+typedef ELEMENT_OF(SEISMIC_TEMPORAL_WEIGHT_0) TemporalWeight0;
+typedef ELEMENT_OF(SEISMIC_TEMPORAL_WEIGHT_1) TemporalWeight1;
+typedef ELEMENT_OF(SEISMIC_BIAS) Bias;
+typedef ELEMENT_OF(SEISMIC_TABLE) Table;
 
 kernel void qwen_vision_stem(
     device const float *pixels [[buffer(SEISMIC_BUFFER_PIXELS)]],
@@ -78,7 +23,7 @@ kernel void qwen_vision_stem(
     if (index >= SEISMIC_DIM_M * SEISMIC_DIM_H) return;
     ulong row = index / SEISMIC_DIM_H;
     ulong output = index % SEISMIC_DIM_H;
-    float projected = load_bias(bias, output * SEISMIC_BIAS_STRIDE_0);
+    float projected = element::at<Bias>(bias, output * SEISMIC_BIAS_STRIDE_0);
     for (ulong y = 0; y < SEISMIC_DIM_P; ++y)
         for (ulong x = 0; x < SEISMIC_DIM_P; ++x)
             for (ulong channel = 0; channel < SEISMIC_DIM_C; ++channel) {
@@ -95,18 +40,18 @@ kernel void qwen_vision_stem(
                     + output * SEISMIC_TEMPORAL_WEIGHT_1_STRIDE_3;
                 projected = metal::fma(
                     pixels[pixel_base],
-                    load_temporal_weight_0(temporal_weight_0, weight_0_index), projected);
+                    element::at<TemporalWeight0>(temporal_weight_0, weight_0_index), projected);
                 projected = metal::fma(
                     pixels[pixel_base + SEISMIC_PIXELS_STRIDE_2],
-                    load_temporal_weight_1(temporal_weight_1, weight_1_index), projected);
+                    element::at<TemporalWeight1>(temporal_weight_1, weight_1_index), projected);
             }
     for (ulong corner = 0; corner < 4; ++corner) {
         int table_row = indices[row * SEISMIC_INDICES_STRIDE_0 + corner * SEISMIC_INDICES_STRIDE_1];
         float coefficient = coefficients[row * SEISMIC_COEFFICIENTS_STRIDE_0
             + corner * SEISMIC_COEFFICIENTS_STRIDE_1];
         ulong table_index = output * SEISMIC_TABLE_STRIDE_0 + ulong(table_row) * SEISMIC_TABLE_STRIDE_1;
-        projected = metal::fma(load_table(table, table_index), coefficient, projected);
+        projected = metal::fma(element::at<Table>(table, table_index), coefficient, projected);
     }
-    ulong result_index = row * SEISMIC_RESULT_0_STRIDE_0 + output * SEISMIC_RESULT_0_STRIDE_1;
-    store_activation(result, result_index, projected);
+    element::put<element::Act>(result, row * SEISMIC_RESULT_0_STRIDE_0 + output * SEISMIC_RESULT_0_STRIDE_1,
+        projected);
 }

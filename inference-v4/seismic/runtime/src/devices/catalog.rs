@@ -4,6 +4,7 @@ use super::{
     MemoryPoolKind, ObservationError, OpenError, ResolveError,
 };
 use crate::api::device::DeviceInner;
+use crate::artifacts::DeviceOptions;
 use crate::backends::{self, DiscoveredMemory};
 use crate::memory::{MemoryDomain, PoolLedger};
 use seismic_lang::registry::BackendName;
@@ -94,6 +95,12 @@ impl Catalog {
     }
 
     pub fn open(&self, id: DeviceId) -> Result<Arc<DeviceInner>, OpenError> {
+        self.open_with(id, DeviceOptions::default())
+    }
+
+    /// Open with `options`. A device already open is shared as it was
+    /// opened; asking it for a different artifact store is an error.
+    pub fn open_with(&self, id: DeviceId, options: DeviceOptions) -> Result<Arc<DeviceInner>, OpenError> {
         // Holding this lock through acquisition makes opening atomic: two
         // callers cannot create independent services or profiles for the
         // same descriptor. A dropped device may be opened and profiled
@@ -105,6 +112,14 @@ impl Catalog {
             .ok_or(OpenError::Stale(id))?
             .clone();
         if let Some(device) = state.opened.get(&id).and_then(Weak::upgrade) {
+            let same = match (&device.artifacts, &options.artifacts) {
+                (_, None) => true,
+                (Some(open), Some(requested)) => Arc::ptr_eq(open, requested),
+                (None, Some(_)) => false,
+            };
+            if !same {
+                return Err(OpenError::ArtifactStoreConflict(info.selector));
+            }
             return Ok(device);
         }
         if let Availability::Unavailable { reason } = &info.availability {
@@ -123,7 +138,7 @@ impl Catalog {
             }
             DeviceMemory::Unsupported { .. } => LedgerKey::Unestablished(info.selector),
         };
-        let device = backends::open(info, MemoryDomain::new(pool_ledger(key)))?;
+        let device = backends::open(info, MemoryDomain::new(pool_ledger(key)), options)?;
         state.opened.insert(id, Arc::downgrade(&device));
         Ok(device)
     }
@@ -131,14 +146,19 @@ impl Catalog {
     /// Low-level control: opens the first discovered device of a backend in
     /// discovery order. Managed selection chooses by model requirements.
     pub fn open_backend(&self, backend: BackendName) -> Result<Arc<DeviceInner>, OpenError> {
-        let id = self
-            .topology()
-            .devices()
-            .iter()
-            .find(|device| device.backend == backend)
-            .map(|device| device.id)
-            .ok_or(OpenError::NoDevice(backend))?;
-        self.open(id)
+        let topology = self.topology();
+        let Some(device) = topology.devices().iter().find(|device| device.backend == backend) else {
+            return Err(OpenError::NoDevice {
+                backend,
+                diagnostics: topology
+                    .diagnostics()
+                    .iter()
+                    .filter(|diagnostic| diagnostic.backend == backend)
+                    .map(|diagnostic| diagnostic.message.clone())
+                    .collect(),
+            });
+        };
+        self.open(device.id)
     }
 
     pub fn host_memory_status(&self) -> Result<HostMemoryStatus, ObservationError> {
@@ -289,6 +309,18 @@ mod tests {
         assert!(matches!(catalog.open(old), Err(OpenError::Stale(_))));
         let current = catalog.resolve(DeviceSelector::HostCpu).unwrap();
         assert_ne!(old, current);
+    }
+
+    #[test]
+    fn a_vulkan_request_is_refused_with_the_missing_runtime() {
+        let catalog = Catalog::discover().unwrap();
+        assert_eq!(
+            catalog.open_backend(BackendName::Vulkan).err(),
+            Some(OpenError::NoDevice {
+                backend: BackendName::Vulkan,
+                diagnostics: vec!["this build has no Vulkan runtime".into()],
+            })
+        );
     }
 
     #[test]

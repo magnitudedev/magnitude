@@ -34,7 +34,8 @@ impl Drop for JitMemory {
 
 pub struct CompiledKernel {
     pub(crate) entry: LaunchEntry,
-    pub(crate) memory: Arc<JitMemory>,
+    /// Drop guard: keeps the JIT code `entry` points into alive.
+    pub(crate) _memory: Arc<JitMemory>,
     pub(crate) layout: KernelEmissionLayout,
 }
 

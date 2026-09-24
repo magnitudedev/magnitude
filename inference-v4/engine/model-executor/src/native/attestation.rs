@@ -3,13 +3,17 @@
 
 use super::*;
 use crate::{
-    ExecutionPlan, ExecutionPlanDraft, FeedForwardProgramSlot, ImportProgramSlot, MixerProgramSlot,
+    ExecutionPlanDraft, FeedForwardProgramSlot, ImportProgramSlot, MixerProgramSlot,
     PlanError, PlannedDevice, ProgramPlan,
 };
+use super::preparation::PreparationInputs;
+use super::tuning::{TunedEntry, TuningContext, TuningLimits};
 use magnitude_model_kernels::{import_dense, repack_weight};
 use std::{collections::HashSet, rc::Rc};
 
 pub struct AttestedPrograms {
+    backend: BackendName,
+    tuned: Vec<TunedEntry>,
     pub(super) owner: Tensor,
     report: QualificationReport,
     pub(super) target: AttestedTarget,
@@ -61,7 +65,7 @@ pub(crate) struct AttestedHead {
 
 #[derive(Clone)]
 pub(crate) struct AttestedHeadBlock {
-    pub input: NativeKernel<qwen_head_rows::Entry>,
+    pub input: NativeKernel<qwen_draft_rows::Entry>,
     pub attention: AttentionKernels,
     pub dense: DenseKernels,
     pub features: NativeKernel<qwen_features_rows::Entry>,
@@ -79,7 +83,6 @@ pub(crate) struct AttestedVision {
 #[derive(Clone)]
 pub(crate) struct AttestedState {
     pub copies: Vec<(Element, NativeKernel<copy_rows::Entry>)>,
-    pub gather: Option<NativeKernel<gather_rows::Entry>>,
     pub conditioning: Option<NativeKernel<qwen_conditioning_overlay::Entry>>,
 }
 
@@ -89,9 +92,8 @@ pub(crate) enum AttestedImport {
     Repack(NativeKernel<repack_weight::Entry>),
 }
 
-fn missing(entry: &'static str, binding: impl fmt::Debug) -> CatalogError {
-    CatalogError::Qualification {
-        path: ExecutionPath::NativeMetal,
+fn missing(entry: &'static str, binding: impl fmt::Debug) -> CatalogFailure {
+    CatalogFailure::Qualification {
         entry,
         bindings: format!("{binding:?}"),
         outcome: "ordered program slot was not prepared".into(),
@@ -102,7 +104,7 @@ fn slot<K, E>(
     handles: &HashMap<K, NativeKernel<E>>,
     binding: K,
     entry: &'static str,
-) -> Result<NativeKernel<E>, CatalogError>
+) -> Result<NativeKernel<E>, CatalogFailure>
 where
     K: Copy + Eq + std::hash::Hash + fmt::Debug,
     E: seismic::Entry,
@@ -129,10 +131,9 @@ impl AttestedPrograms {
         geometry: &magnitude_model_contracts::DecoderGeometry,
         limits: crate::ResourceLimits,
     ) -> Result<crate::PreparedTargetReadoutGraphs, String> {
-        crate::programs::native_target_readout_graph::PreparedTargetReadoutGraphs::prepare(
+        crate::programs::graph::readout::PreparedTargetReadoutGraphs::prepare(
             device,
             &self.target,
-            &self.state,
             load,
             geometry,
             limits,
@@ -148,10 +149,13 @@ impl AttestedPrograms {
         head_state: Option<&crate::StateStorePlan>,
         limits: crate::ResourceLimits,
     ) -> Result<(), String> {
-        let max_rows = u64::try_from(limits.max_batch_rows)
-            .map_err(|_| "batch row bound exceeds u64")?
-            .checked_next_power_of_two()
-            .ok_or("batch row class overflows")?;
+        let row_classes = magnitude_model_batching::row_classes(limits.max_batch_rows)
+            .into_iter()
+            .map(|rows| rows as u64)
+            .collect::<Vec<_>>();
+        let max_rows = *row_classes
+            .last()
+            .ok_or_else(|| format!("batch row bound {} has no row class", limits.max_batch_rows))?;
         let max_segments = u64::try_from(limits.in_flight_requests)
             .map_err(|_| "request slot bound exceeds u64")?
             .checked_next_power_of_two()
@@ -172,8 +176,7 @@ impl AttestedPrograms {
                 u64::try_from(state.history_rows).map_err(|_| "head history rows exceed u64")?;
             let mut forward_classes = Vec::new();
             let mut project_classes = Vec::new();
-            let mut rows = 1u64;
-            while rows <= max_rows {
+            for &rows in &row_classes {
                 project_classes.push(crate::programs::native_head::HeadProjectGraphClass { rows });
                 let mut segments = 1u64;
                 while segments <= max_segments && segments <= rows {
@@ -184,7 +187,6 @@ impl AttestedPrograms {
                     });
                     segments *= 2;
                 }
-                rows *= 2;
             }
             let forward = crate::programs::native_head::PreparedHeadForwardGraphs::prepare(
                 device,
@@ -279,8 +281,7 @@ impl AttestedPrograms {
                         1,
                         width,
                     ];
-                    let mut rows = 1u64;
-                    while rows <= max_rows {
+                    for &rows in &row_classes {
                         let class = crate::programs::native_state::StateCopyGraphClass {
                             element: Element::dense(plane.dtype),
                             source_extents: extents.clone(),
@@ -290,34 +291,9 @@ impl AttestedPrograms {
                         if !state_classes.contains(&class) {
                             state_classes.push(class);
                         }
-                        rows *= 2;
                     }
                 }
             }
-        }
-        let mut segments = 1u64;
-        while segments <= max_segments {
-            for component in &target_state.recurrent_components {
-                let width = component
-                    .shape
-                    .iter()
-                    .try_fold(1u64, |total, extent| {
-                        total.checked_mul(u64::try_from(*extent).ok()?)
-                    })
-                    .ok_or("recurrent component width overflow")?;
-                for (source_rows, destination_rows) in [(1, segments), (segments, 1)] {
-                    let class = crate::programs::native_state::StateCopyGraphClass {
-                        element: Element::dense(component.dtype),
-                        source_extents: vec![source_rows, 1, width],
-                        destination_extents: vec![destination_rows, 1, width],
-                        map_rows: 1,
-                    };
-                    if !state_classes.contains(&class) {
-                        state_classes.push(class);
-                    }
-                }
-            }
-            segments *= 2;
         }
         self.state_graphs = Some(Rc::new(
             crate::programs::native_state::PreparedStateCopyGraphs::prepare(
@@ -365,7 +341,6 @@ impl AttestedPrograms {
         crate::programs::native_target_graph::PreparedTargetGraphs::prepare(
             device,
             &self.target,
-            &self.state,
             load,
             geometry,
             state,
@@ -404,7 +379,7 @@ impl AttestedPrograms {
                 bytes += bytes!(copy_rows);
             }
         }
-        bytes += bytes!(qwen_conditioning_overlay) + bytes!(gather_rows);
+        bytes += bytes!(qwen_conditioning_overlay);
         bytes += bytes!(shape_rows) + bytes!(sample_rows);
         let target = plan.target();
         bytes += bytes!(qwen_embedding_rows);
@@ -413,20 +388,17 @@ impl AttestedPrograms {
                 MixerProgramSlot::Attention(binding)
                     if charged_mixers.insert(MixerProgramSlot::Attention(binding)) =>
                 {
-                    bytes += bytes!(qwen_attention_normalize)
-                        + bytes!(qwen_attention_project)
-                        + bytes!(qwen_attention_prepare)
-                        + bytes!(qwen_attention_attend)
+                    bytes += bytes!(qwen_attention_project)
+                        + bytes!(qwen_attention_decode)
+                        + bytes!(qwen_attention_prefill)
                         + bytes!(qwen_attention_output)
                 }
                 MixerProgramSlot::Recurrent(binding)
                     if charged_mixers.insert(MixerProgramSlot::Recurrent(binding)) =>
                 {
-                    bytes += bytes!(qwen_recurrent_normalize)
-                        + bytes!(qwen_recurrent_project)
-                        + bytes!(qwen_recurrent_prepare)
-                        + bytes!(qwen_recurrent_scan)
-                        + bytes!(qwen_recurrent_mix)
+                    bytes += bytes!(qwen_recurrent_project)
+                        + bytes!(qwen_recurrent_step)
+                        + bytes!(qwen_recurrent_chunk)
                         + bytes!(qwen_recurrent_output)
                 }
                 _ => {}
@@ -435,40 +407,35 @@ impl AttestedPrograms {
                 FeedForwardProgramSlot::Dense(binding)
                     if charged_feed_forward.insert(FeedForwardProgramSlot::Dense(binding)) =>
                 {
-                    bytes += bytes!(qwen_dense_expand)
-                        + bytes!(qwen_dense_output)
-                        + bytes!(qwen_dense_expand_demanded)
-                        + bytes!(qwen_dense_output_demanded)
+                    bytes += bytes!(qwen_dense_expand) + bytes!(qwen_dense_output)
                 }
                 FeedForwardProgramSlot::Routed(binding)
                     if charged_feed_forward.insert(FeedForwardProgramSlot::Routed(binding)) =>
                 {
-                    bytes += bytes!(qwen_routed_normalize)
-                        + bytes!(qwen_routed_logits)
-                        + bytes!(qwen_routed_select)
+                    bytes += bytes!(qwen_routed_route)
                         + bytes!(qwen_routed_expand)
                         + bytes!(qwen_routed_output)
+                        + bytes!(qwen_routed_group)
+                        + bytes!(qwen_routed_experts)
+                        + bytes!(qwen_routed_combine)
                 }
                 _ => {}
             }
         }
-        bytes += bytes!(qwen_features_rows) + bytes!(head_logits_rows) + bytes!(qwen_selected_rows);
+        bytes += bytes!(qwen_features_rows) + bytes!(qwen_head_rows) + bytes!(qwen_selected_rows);
         if target.features().is_some() {
             bytes += bytes!(qwen_features_rows);
         }
         if let Some(head) = plan.head() {
             for &binding in head.blocks() {
                 if charged_heads.insert(binding) {
-                    bytes += bytes!(qwen_head_rows)
-                        + bytes!(qwen_attention_normalize)
+                    bytes += bytes!(qwen_draft_rows)
                         + bytes!(qwen_attention_project)
-                        + bytes!(qwen_attention_prepare)
-                        + bytes!(qwen_attention_attend)
+                        + bytes!(qwen_attention_decode)
+                        + bytes!(qwen_attention_prefill)
                         + bytes!(qwen_attention_output)
                         + bytes!(qwen_dense_expand)
                         + bytes!(qwen_dense_output)
-                        + bytes!(qwen_dense_expand_demanded)
-                        + bytes!(qwen_dense_output_demanded)
                         + bytes!(qwen_features_rows)
                         + bytes!(head_logits_rows);
                 }
@@ -487,36 +454,66 @@ impl AttestedPrograms {
             .map_err(|_| PlanError::Arithmetic("native invocation workspace bytes overflow"))
     }
 
-    pub fn prepare(plan: &ExecutionPlan, device: &Device) -> Result<Self, CatalogError> {
-        Self::prepare_for(plan.policy().path(), plan.device(), plan.programs(), device)
+    /// Prepare every native entry the draft's program plan needs on the
+    /// opened device: static values from the model, parameters tuned on the
+    /// device, qualification. Errors name the native path and the device's
+    /// backend; entries without an implementation for that backend are
+    /// reported together.
+    pub fn prepare_draft(
+        plan: &ExecutionPlanDraft,
+        device: &Device,
+        tuning: TuningContext<'_>,
+    ) -> Result<Self, CatalogError> {
+        let limits = plan.policy().limits();
+        Self::prepare_for(
+            plan.policy().path(),
+            plan.device(),
+            plan.programs(),
+            plan.load(),
+            TuningLimits {
+                max_rows: limits.max_batch_rows as u64,
+                max_projected_rows: limits.max_projected_rows as u64,
+                context_tokens: tuning.definition.geometry.context_limit,
+            },
+            device,
+            tuning,
+        )
+        .map_err(|failure| CatalogError::native(device.backend(), failure))
     }
 
-    pub fn prepare_draft(plan: &ExecutionPlanDraft, device: &Device) -> Result<Self, CatalogError> {
-        Self::prepare_for(plan.policy().path(), plan.device(), plan.programs(), device)
-    }
-
+    #[allow(clippy::too_many_arguments)]
     fn prepare_for(
         path: ExecutionPath,
         planned_device: &PlannedDevice,
         topology: &ProgramPlan,
+        load: &crate::ModelLoadPlan,
+        limits: TuningLimits,
         device: &Device,
-    ) -> Result<Self, CatalogError> {
-        if path != ExecutionPath::NativeMetal || device.backend() != BackendName::Metal {
-            return Err(CatalogError::Backend {
-                path,
-                backend: device.backend(),
-                outcome: "native program factory requires the planned Metal path".into(),
+        tuning: TuningContext<'_>,
+    ) -> Result<Self, CatalogFailure> {
+        if path != ExecutionPath::Native {
+            return Err(CatalogFailure::Preparation {
+                entry: "program_factory",
+                bindings: "execution path".into(),
+                outcome: format!("the native program factory cannot serve the {path} path"),
             });
         }
         if planned_device.selector() != device.info().selector {
-            return Err(CatalogError::Preparation {
-                path: ExecutionPath::NativeMetal,
+            return Err(CatalogFailure::Preparation {
                 entry: "program_factory",
                 bindings: "selected device".into(),
                 outcome: "program plan and opened device differ".into(),
             });
         }
-        let prepared = NativePreparationCache::prepare_programs(device, topology)?;
+        let definition = tuning.definition;
+        let mut prepared = NativePreparationCache::prepare_programs(PreparationInputs {
+            device,
+            plan: topology,
+            load,
+            limits,
+            tuning,
+        })?;
+        let tuned = std::mem::take(&mut prepared.tuned);
         let mut cases = Vec::new();
         let mut include = |case| {
             if !cases.contains(&case) {
@@ -636,7 +633,7 @@ impl AttestedPrograms {
                 let mut blocks = Vec::with_capacity(head_plan.blocks().len());
                 for &binding in head_plan.blocks() {
                     blocks.push(AttestedHeadBlock {
-                        input: slot(&handles.input, binding, "qwen_head_rows")?,
+                        input: slot(&handles.input, binding, "qwen_draft_rows")?,
                         attention: handles
                             .attention
                             .get(&binding)
@@ -651,7 +648,7 @@ impl AttestedPrograms {
                         logits: slot(&handles.logits, binding, "head_logits_rows")?,
                     });
                 }
-                Ok::<_, CatalogError>(AttestedHead { blocks })
+                Ok::<_, CatalogFailure>(AttestedHead { blocks })
             })
             .transpose()?;
         let vision = topology
@@ -661,7 +658,7 @@ impl AttestedPrograms {
                     .vision
                     .as_ref()
                     .ok_or_else(|| missing("vision", "enabled"))?;
-                Ok::<_, CatalogError>(AttestedVision {
+                Ok::<_, CatalogFailure>(AttestedVision {
                     stem: slot(&handles.stem, vision_plan.patch(), "qwen_vision_stem")?,
                     blocks: vision_plan
                         .blocks()
@@ -697,13 +694,6 @@ impl AttestedPrograms {
         let state =
             AttestedState {
                 copies,
-                gather: Some(
-                    prepared
-                        .glue
-                        .gather_rows
-                        .clone()
-                        .ok_or_else(|| missing("gather_rows", "target selection"))?,
-                ),
                 conditioning: Some(
                     prepared.glue.conditioning_overlay.clone().ok_or_else(|| {
                         missing("qwen_conditioning_overlay", "target conditioning")
@@ -729,16 +719,14 @@ impl AttestedPrograms {
         let invocation_workspace_bytes = Self::sum_invocation_workspace_bytes(&prepared)?;
         let planned_bytes =
             Self::planned_invocation_workspace_bytes(topology).map_err(|error| {
-                CatalogError::Preparation {
-                    path: ExecutionPath::NativeMetal,
+                CatalogFailure::Preparation {
                     entry: "program_factory",
                     bindings: "native invocation workspace".into(),
                     outcome: error.to_string(),
                 }
             })?;
         if invocation_workspace_bytes != planned_bytes {
-            return Err(CatalogError::Qualification {
-                path: ExecutionPath::NativeMetal,
+            return Err(CatalogFailure::Qualification {
                 entry: "program_factory",
                 bindings: "native invocation workspace".into(),
                 outcome: format!(
@@ -747,6 +735,8 @@ impl AttestedPrograms {
             });
         }
         let attested = Self {
+            backend: device.backend(),
+            tuned,
             owner: prepared.owner.clone(),
             report,
             target,
@@ -761,13 +751,13 @@ impl AttestedPrograms {
             vision_graphs: None,
             state_graphs: None,
         };
-        QualificationView::new(&attested, topology).qualify(device)?;
+        QualificationView::new(&attested, topology, &definition.geometry, load).qualify(device)?;
         Ok(attested)
     }
 
     fn sum_invocation_workspace_bytes(
         prepared: &NativePreparationCache,
-    ) -> Result<u64, CatalogError> {
+    ) -> Result<u64, CatalogFailure> {
         let mut bytes = u128::from(prepared.owner.storage_bytes());
         macro_rules! charge {
             ($iter:expr) => {
@@ -780,53 +770,46 @@ impl AttestedPrograms {
         charge!(prepared.import.repack_weight.values());
         charge!(prepared.target.embedding.values());
         for handles in prepared.target.attention.values() {
-            bytes += u128::from(handles.normalize.invocation_workspace_bytes())
-                + u128::from(handles.project.invocation_workspace_bytes())
-                + u128::from(handles.prepare.invocation_workspace_bytes())
-                + u128::from(handles.attend.invocation_workspace_bytes())
+            bytes += u128::from(handles.project.invocation_workspace_bytes())
+                + u128::from(handles.decode.invocation_workspace_bytes())
+                + u128::from(handles.prefill.invocation_workspace_bytes())
                 + u128::from(handles.output.invocation_workspace_bytes());
         }
         for handles in prepared.target.recurrent.values() {
-            bytes += u128::from(handles.normalize.invocation_workspace_bytes())
-                + u128::from(handles.project.invocation_workspace_bytes())
-                + u128::from(handles.prepare.invocation_workspace_bytes())
-                + u128::from(handles.scan.invocation_workspace_bytes())
-                + u128::from(handles.mix.invocation_workspace_bytes())
+            bytes += u128::from(handles.project.invocation_workspace_bytes())
+                + u128::from(handles.step.invocation_workspace_bytes())
+                + u128::from(handles.chunk.invocation_workspace_bytes())
                 + u128::from(handles.output.invocation_workspace_bytes());
         }
         for handles in prepared.target.dense.values() {
             bytes += u128::from(handles.expand.invocation_workspace_bytes())
-                + u128::from(handles.output.invocation_workspace_bytes())
-                + u128::from(handles.expand_demanded.invocation_workspace_bytes())
-                + u128::from(handles.output_demanded.invocation_workspace_bytes());
+                + u128::from(handles.output.invocation_workspace_bytes());
         }
         for handles in prepared.target.routed.values() {
-            bytes += u128::from(handles.normalize.invocation_workspace_bytes())
-                + u128::from(handles.logits.invocation_workspace_bytes())
-                + u128::from(handles.select.invocation_workspace_bytes())
+            bytes += u128::from(handles.route.invocation_workspace_bytes())
                 + u128::from(handles.expand.invocation_workspace_bytes())
-                + u128::from(handles.output.invocation_workspace_bytes());
+                + u128::from(handles.output.invocation_workspace_bytes())
+                + u128::from(handles.group.invocation_workspace_bytes())
+                + u128::from(handles.experts.invocation_workspace_bytes())
+                + u128::from(handles.combine.invocation_workspace_bytes());
         }
         for handles in prepared.target.readout.values() {
             bytes += u128::from(handles.features.invocation_workspace_bytes())
-                + u128::from(handles.logits.invocation_workspace_bytes());
+                + u128::from(handles.head.invocation_workspace_bytes());
         }
         charge!(prepared.target.features.values());
         charge!(prepared.target.selected.values());
         if let Some(head) = &prepared.head {
             charge!(head.input.values());
             for handles in head.attention.values() {
-                bytes += u128::from(handles.normalize.invocation_workspace_bytes())
-                    + u128::from(handles.project.invocation_workspace_bytes())
-                    + u128::from(handles.prepare.invocation_workspace_bytes())
-                    + u128::from(handles.attend.invocation_workspace_bytes())
+                bytes += u128::from(handles.project.invocation_workspace_bytes())
+                    + u128::from(handles.decode.invocation_workspace_bytes())
+                    + u128::from(handles.prefill.invocation_workspace_bytes())
                     + u128::from(handles.output.invocation_workspace_bytes());
             }
             for handles in head.dense.values() {
                 bytes += u128::from(handles.expand.invocation_workspace_bytes())
-                    + u128::from(handles.output.invocation_workspace_bytes())
-                    + u128::from(handles.expand_demanded.invocation_workspace_bytes())
-                    + u128::from(handles.output_demanded.invocation_workspace_bytes());
+                    + u128::from(handles.output.invocation_workspace_bytes());
             }
             charge!(head.features.values());
             charge!(head.logits.values());
@@ -846,9 +829,6 @@ impl AttestedPrograms {
         if let Some(handle) = &prepared.glue.conditioning_overlay {
             bytes += u128::from(handle.invocation_workspace_bytes());
         }
-        if let Some(handle) = &prepared.glue.gather_rows {
-            bytes += u128::from(handle.invocation_workspace_bytes());
-        }
         for handle in [
             prepared.glue.copy_rows_f32.as_ref(),
             prepared.glue.copy_rows_f16.as_ref(),
@@ -860,23 +840,27 @@ impl AttestedPrograms {
         {
             bytes += u128::from(handle.invocation_workspace_bytes());
         }
-        u64::try_from(bytes).map_err(|_| CatalogError::Preparation {
-            path: ExecutionPath::NativeMetal,
+        u64::try_from(bytes).map_err(|_| CatalogFailure::Preparation {
             entry: "program_factory",
             bindings: "native invocation workspace".into(),
             outcome: "prepared invocation workspace bytes overflow".into(),
         })
     }
 
-    /// Startup-only allowance for one bounded qualification fixture.
-    /// The target/head/vision fixtures use one row and at most 4-wide hidden
-    /// vectors; each repack fixture is one GGUF packet. Fixture locals drop
-    /// before the next binding. Sixteen MiB covers all simultaneously live
-    /// tensor inputs, allocating checked results, and allocator alignment.
-    /// Prepared invocation buffers are charged separately. Recheck this
-    /// bound whenever qualification fixture extents change.
-    pub const fn qualification_peak_bytes() -> u64 {
-        16 * 1024 * 1024
+    /// Startup-only allowance for qualification. Entries are specialized to
+    /// the model's geometry, so fixtures run at it: the weight fixtures of one
+    /// qualification hold at most one weight scope's tensors (one block, or
+    /// the target's embedding, norm and output), and fixture locals drop
+    /// before the next binding. Sixteen MiB more covers one-row activations,
+    /// row tables, logits rows, checked results and allocator alignment.
+    /// Prepared invocation buffers are charged separately.
+    pub fn qualification_peak_bytes(load: &crate::ModelLoadPlan) -> u64 {
+        const FIXTURES: u64 = 16 * 1024 * 1024;
+        let mut scopes = HashMap::<magnitude_model_contracts::WeightScope, u64>::new();
+        for weight in load.weights() {
+            *scopes.entry(weight.role.scope).or_default() += weight.resident_bytes;
+        }
+        FIXTURES + scopes.into_values().max().unwrap_or(0)
     }
     pub(crate) fn target(&self) -> &AttestedTarget {
         &self.target
@@ -886,6 +870,7 @@ impl AttestedPrograms {
         model: crate::ResidentTarget,
         geometry: magnitude_model_contracts::DecoderGeometry,
     ) -> Result<crate::programs::native_target::NativeTargetProgram, CatalogError> {
+        (|| -> Result<crate::programs::native_target::NativeTargetProgram, CatalogFailure> {
         if model.blocks.len() != self.target.blocks.len()
             || model.blocks.len() != geometry.blocks.len()
         {
@@ -896,8 +881,7 @@ impl AttestedPrograms {
             .as_ref()
             .ok_or_else(|| missing("target", "prepared graphs"))?
             .bind_weights(&model)
-            .map_err(|error| CatalogError::Preparation {
-                path: ExecutionPath::NativeMetal,
+            .map_err(|error| CatalogFailure::Preparation {
                 entry: "target_graph",
                 bindings: "resident decoder weights".into(),
                 outcome: error,
@@ -908,8 +892,7 @@ impl AttestedPrograms {
             .ok_or_else(|| missing("target", "prepared readout graphs"))?
             .clone()
             .bind_weights(&model)
-            .map_err(|error| CatalogError::Preparation {
-                path: ExecutionPath::NativeMetal,
+            .map_err(|error| CatalogFailure::Preparation {
                 entry: "target_readout_graph",
                 bindings: "resident readout weights".into(),
                 outcome: error,
@@ -921,12 +904,13 @@ impl AttestedPrograms {
             graphs,
             readout_graphs,
         )
-        .map_err(|error| CatalogError::Preparation {
-            path: ExecutionPath::NativeMetal,
+        .map_err(|error| CatalogFailure::Preparation {
             entry: "target_graph_controls",
             bindings: "sealed attention rotary controls".into(),
             outcome: error.to_string(),
         })
+    })()
+        .map_err(|failure| CatalogError::native(self.backend, failure))
     }
     pub(crate) fn head(&self) -> Option<&AttestedHead> {
         self.head.as_ref()
@@ -936,6 +920,7 @@ impl AttestedPrograms {
         resident: crate::ResidentHead,
         definition: &magnitude_model_contracts::ModelDefinition,
     ) -> Result<crate::programs::native_head::NativeHeadProgram, CatalogError> {
+        (|| -> Result<crate::programs::native_head::NativeHeadProgram, CatalogFailure> {
         let head = self
             .head
             .as_ref()
@@ -974,6 +959,8 @@ impl AttestedPrograms {
             graphs,
         )
         .map_err(|error| missing("head", error))
+    })()
+        .map_err(|failure| CatalogError::native(self.backend, failure))
     }
     pub(crate) fn vision(&self) -> Option<&AttestedVision> {
         self.vision.as_ref()
@@ -983,6 +970,7 @@ impl AttestedPrograms {
         resident: crate::ResidentVision,
         definition: &magnitude_model_contracts::ModelDefinition,
     ) -> Result<crate::programs::native_vision::NativeVisionProgram, CatalogError> {
+        (|| -> Result<crate::programs::native_vision::NativeVisionProgram, CatalogFailure> {
         let vision = self
             .vision
             .as_ref()
@@ -1007,6 +995,8 @@ impl AttestedPrograms {
         Ok(crate::programs::native_vision::NativeVisionProgram::new(
             graphs,
         ))
+    })()
+        .map_err(|failure| CatalogError::native(self.backend, failure))
     }
     pub(crate) fn state(&self) -> &AttestedState {
         &self.state
@@ -1035,6 +1025,7 @@ impl AttestedPrograms {
         &self,
         weight: &crate::WeightPlan,
     ) -> Result<crate::programs::native_import::NativeImportProgram, CatalogError> {
+        (|| -> Result<crate::programs::native_import::NativeImportProgram, CatalogFailure> {
         let requested = if let (Some(source), Some(resident)) =
             (weight.source.dtype(), weight.resident.dtype())
         {
@@ -1054,6 +1045,8 @@ impl AttestedPrograms {
             weight.storage_identity(),
             handle.clone(),
         ))
+    })()
+        .map_err(|failure| CatalogError::native(self.backend, failure))
     }
     pub fn invocation_workspace_bytes(&self) -> u64 {
         self.invocation_workspace_bytes
@@ -1065,6 +1058,14 @@ impl AttestedPrograms {
         self.owner.belongs_to(device)
     }
     pub const fn path(&self) -> ExecutionPath {
-        ExecutionPath::NativeMetal
+        ExecutionPath::Native
+    }
+    /// The backend of the device these programs were prepared for.
+    pub const fn backend(&self) -> BackendName {
+        self.backend
+    }
+    /// Every entry tuned while these programs were prepared.
+    pub fn tuned(&self) -> &[TunedEntry] {
+        &self.tuned
     }
 }

@@ -102,7 +102,7 @@ impl Module {
         } else {
             SourceSet::default()
         };
-        let (checked, _) = seismic_lang::source::load(paths, prelude)?;
+        let checked = seismic_lang::source::load(paths, prelude)?.module;
         Ok(Self {
             checked: Arc::new(checked),
         })

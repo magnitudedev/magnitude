@@ -73,6 +73,24 @@ pub enum BuildError {
         column: usize,
         symbol: String,
     },
+    /// A native asset (or an included file) includes something other than
+    /// its backend's `common/` device library.
+    NativeInclude(seismic_lang::source::NativeIncludeError),
+    /// A Metal implementation binds more buffers than Metal's argument
+    /// table holds.
+    MetalBufferSlots {
+        entry: String,
+        /// Tensor parameters + tensor results + scratch + words + scalar slots.
+        slots: usize,
+        limit: usize,
+    },
+    /// A native implementation targets a backend whose assets this build
+    /// cannot validate against a generated ABI (Vulkan: no ABI prefix exists
+    /// yet), so it would reach no device unchecked.
+    NativeBackendUnavailable {
+        entry: String,
+        backend: seismic_lang::registry::BackendName,
+    },
 }
 
 impl std::fmt::Display for BuildError {
@@ -91,6 +109,17 @@ impl std::fmt::Display for BuildError {
                 f,
                 "native Metal ABI for `{entry}`: {}:{line}:{column}: `{symbol}` is not generated for this entry",
                 path.display()
+            ),
+            Self::NativeInclude(e) => write!(f, "{e}"),
+            Self::MetalBufferSlots { entry, slots, limit } => write!(
+                f,
+                "native Metal implementation of `{entry}` binds {slots} buffers; Metal admits {limit}"
+            ),
+            Self::NativeBackendUnavailable { entry, backend } => write!(
+                f,
+                "native {} implementation of `{entry}`: this build has no {} runtime or ABI to validate it against",
+                backend.as_str(),
+                backend.as_str()
             ),
         }
     }
@@ -166,7 +195,6 @@ mod internals {
     use seismic_lang::checked::ElementSummary;
     use seismic_lang::registry::{self, CodeInterpretation, PlaneEncoding, RepresentationInfo};
     use std::collections::HashSet;
-    use std::ffi::OsStr;
     use std::fs;
 
     /// The native implementations of one entry. Metal and CUDA sources
@@ -189,15 +217,26 @@ mod internals {
         let output=output.canonicalize().map_err(BuildError::Io)?;
 
         let prelude = if build.include_std() { seismic_std::sources() } else { SourceSet::default() };
-        let (checked, dependencies) = seismic_lang::source::load(build.sources(), prelude).map_err(|e|match e {
-            seismic_lang::source::LoadError::Io(e)=>BuildError::Io(e),
-            seismic_lang::source::LoadError::Source(e)=>BuildError::Source(e),
-            seismic_lang::source::LoadError::Invalid(e)=>BuildError::Environment(e),
+        let loaded = seismic_lang::source::load(build.sources(), prelude).map_err(|e| match e {
+            seismic_lang::source::LoadError::Io(e) => BuildError::Io(e),
+            seismic_lang::source::LoadError::Source(e) => BuildError::Source(e),
+            seismic_lang::source::LoadError::Invalid(e) => BuildError::Environment(e),
+            seismic_lang::source::LoadError::NativeInclude(e) => BuildError::NativeInclude(e),
         })?;
-        for path in dependencies { println!("cargo:rerun-if-changed={}",path.display()); }
-        for path in build.sources() { println!("cargo:rerun-if-changed={}",path.display()); }
-        let encoded = seismic_lang::bundle::encode_checked_bundle(&checked);
-        let native_assets = resolve_native_assets(&checked, &output)?;
+        for path in loaded.dependencies() { println!("cargo:rerun-if-changed={}", path.display()); }
+        for path in build.sources() { println!("cargo:rerun-if-changed={}", path.display()); }
+        // A new `common/` file can satisfy a previously missing include.
+        for asset in &loaded.assets {
+            if !asset.includes.is_empty() {
+                let common = asset.asset.path.parent().expect("canonical asset parent").join("common");
+                println!("cargo:rerun-if-changed={}", common.display());
+            }
+        }
+        let checked = &loaded.module;
+        // Captured Metal/CUDA assets carry their `common/` includes inlined,
+        // so the bundle digest below covers every included file.
+        let encoded = seismic_lang::bundle::encode_checked_bundle(checked);
+        let native_assets = resolve_native_assets(checked, &loaded.assets, &output)?;
         // The checked bundle contains the canonical sources, bundle format,
         // checker semantic version, registry revision, and semantic hash.
         // Addressing the emitted bundle therefore cannot accidentally reuse
@@ -211,7 +250,7 @@ mod internals {
         fs::write(&bundle, encoded).map_err(BuildError::Io)?;
         fs::write(
             &bindings,
-            render(&checked, build.module(), &identity, &native_assets),
+            render(checked, build.module(), &identity, &native_assets),
         )
         .map_err(BuildError::Io)?;
         Ok(Artifacts {
@@ -221,29 +260,51 @@ mod internals {
         })
     }
 
-    fn resolve_native_assets<'a>(module: &'a seismic_lang::checked::CheckedModule, output: &std::path::Path) -> Result<Vec<EntryNative<'a>>, BuildError> {
+    fn resolve_native_assets<'a>(
+        module: &'a seismic_lang::checked::CheckedModule,
+        captured: &[seismic_lang::source::CapturedAsset],
+        output: &std::path::Path,
+    ) -> Result<Vec<EntryNative<'a>>, BuildError> {
         use seismic_lang::registry::BackendName;
         let mut natives = Vec::new();
         for entry in module.entries() {
             let mut any = false;
-            for (backend, extension) in [(BackendName::Metal, "metal"), (BackendName::Cuda, "cu")] {
+            let mut cpu = None;
+            for backend in BackendName::ALL {
                 let Some(definition) = module.native_implementation(entry.id, backend) else { continue };
                 any = true;
                 let source = module.native_asset(entry.id, backend).expect("shared loader captures native assets");
-                let path = output.join(format!("{}.{extension}", entry.name));
-                fs::write(&path, source).map_err(BuildError::Io)?;
-                validate_native_abi(entry, definition, backend, &path, source)?;
-            }
-            let cpu = match module.native_implementation(entry.id, BackendName::Cpu) {
-                Some(definition) => {
-                    any = true;
-                    let source = module.native_asset(entry.id, BackendName::Cpu).expect("shared loader captures native assets");
-                    let path = output.join(format!("{}.cpu.rs", entry.name));
-                    fs::write(&path, source).map_err(BuildError::Io)?;
-                    Some((definition, path))
+                let extension = match backend {
+                    // CPU assets are Rust, compiled into the embedding crate.
+                    BackendName::Cpu => {
+                        let path = output.join(format!("{}.cpu.rs", entry.name));
+                        fs::write(&path, source).map_err(BuildError::Io)?;
+                        cpu = Some((definition, path));
+                        continue;
+                    }
+                    BackendName::Metal => "metal",
+                    BackendName::Cuda => "cu",
+                    BackendName::Vulkan => {
+                        return Err(BuildError::NativeBackendUnavailable {
+                            entry: entry.name.clone(),
+                            backend,
+                        })
+                    }
+                };
+                fs::write(output.join(format!("{}.{extension}", entry.name)), source).map_err(BuildError::Io)?;
+                let files = captured
+                    .iter()
+                    .find(|asset| asset.entry == entry.id && asset.backend == backend)
+                    .expect("shared loader captures every native asset");
+                // Included files are validated against the including entry's
+                // ABI, exactly like the asset itself.
+                for file in std::iter::once(&files.asset).chain(&files.includes) {
+                    validate_native_abi(entry, definition, backend, &file.path, &file.text)?;
                 }
-                None => None,
-            };
+                if backend == BackendName::Metal {
+                    validate_metal_buffer_slots(entry, definition)?;
+                }
+            }
             if any {
                 natives.push(EntryNative { entry: entry.id, cpu });
             }
@@ -272,13 +333,6 @@ mod internals {
                 symbol: symbol.to_owned(),
             }
         };
-        if backend == seismic_lang::registry::BackendName::Cuda {
-            // CUDA sources receive their helpers from the generated prefix;
-            // vendor headers are not part of the packaged runtime.
-            if let Some(offset) = source.find("#include") {
-                return Err(failure(offset, "#include"));
-            }
-        }
         let allowed = native_abi_symbols(entry, definition, backend);
         for (symbol, offset) in seismic_identifiers(source) {
             if !allowed.contains(symbol) {
@@ -287,6 +341,38 @@ mod internals {
         }
         Ok(())
     }
+
+    /// Metal's argument table holds 31 buffers. The native ABI binds every
+    /// tensor parameter, every tensor result, every scratch buffer, the
+    /// argument words and the scalar-result slots; all of them are known from
+    /// the declaration, so the limit is checked here rather than at encode.
+    fn validate_metal_buffer_slots(
+        entry: &EntryInfo,
+        definition: &NativeImplementation,
+    ) -> Result<(), BuildError> {
+        let tensors = entry
+            .parameters
+            .iter()
+            .filter(|parameter| matches!(parameter.kind, ParameterSummaryKind::Tensor { .. }))
+            .count()
+            + entry
+                .results
+                .iter()
+                .filter(|result| matches!(result.kind, ResultSummaryKind::Tensor { .. }))
+                .count();
+        let slots = tensors + definition.scratch.len() + 2;
+        if slots > METAL_BUFFER_SLOTS {
+            return Err(BuildError::MetalBufferSlots {
+                entry: entry.name.clone(),
+                slots,
+                limit: METAL_BUFFER_SLOTS,
+            });
+        }
+        Ok(())
+    }
+
+    /// Metal's per-stage buffer argument table size.
+    const METAL_BUFFER_SLOTS: usize = 31;
 
     fn native_abi_symbols(
         entry: &EntryInfo,
@@ -420,7 +506,7 @@ mod internals {
         for representation in representations {
             symbols.insert(format!(
                 "{prefix}_REPRESENTATION_{}",
-                native_macro(representation.name)
+                native_macro(representation.representation)
             ));
             symbols.insert(format!(
                 "{prefix}_DECODED_{}",
@@ -437,8 +523,43 @@ mod internals {
                 registry::RepresentationKind::External(_) => {
                     symbols.insert(format!("{prefix}_KIND_EXTERNAL"));
                 }
+                // The row-layout ABI of the frozen weight-storage interface
+                // (native-program-execution.md, "Weight storage").
+                registry::RepresentationKind::PackedRows(layout) => {
+                    symbols.insert(format!("{prefix}_KIND_PACKED"));
+                    symbols.insert(format!(
+                        "{prefix}_LAYOUT_{}",
+                        native_macro(layout.layout.as_str())
+                    ));
+                    symbols.insert(format!("{prefix}_ROW_STRIDE_BYTES"));
+                    for suffix in [
+                        "ROW_GROUPS",
+                        "GROUP_MULTIPLE",
+                        "ROW_ALIGNMENT",
+                        "TILE_ROWS",
+                        "CODE_BITS",
+                        "MMA_KBLOCK",
+                        "MMA_LANES",
+                    ] {
+                        symbols.insert(format!("{prefix}_{suffix}"));
+                    }
+                    for plane in &layout.planes {
+                        let plane_prefix = format!("{prefix}_PLANE_{}", native_macro(plane.name));
+                        symbols.insert(plane_prefix.clone());
+                        for suffix in [
+                            "ROW_OFFSET",
+                            "BYTES_PER_ROW",
+                            "BYTES_PER_GROUP",
+                            "CODE_SHIFT",
+                            "CODE_BITS",
+                        ] {
+                            symbols.insert(format!("{plane_prefix}_{suffix}"));
+                        }
+                    }
+                }
                 registry::RepresentationKind::Packed(layout) => {
                     symbols.insert(format!("{prefix}_KIND_PACKED"));
+                    symbols.insert(format!("{prefix}_LAYOUT_PACKET"));
                     for (ordinal, plane) in layout.planes.iter().enumerate() {
                         let plane_prefix = format!("{prefix}_PLANE_{ordinal}");
                         symbols.insert(format!("{plane_prefix}_NAME_{}", native_macro(plane.name)));
@@ -577,52 +698,6 @@ mod internals {
                 }
             })
             .collect()
-    }
-
-    fn source_label(path: &std::path::Path) -> String {
-        let relative = std::env::current_dir()
-            .ok()
-            .and_then(|directory| {
-                path.strip_prefix(directory)
-                    .ok()
-                    .map(std::path::Path::to_path_buf)
-            })
-            .unwrap_or_else(|| path.to_path_buf());
-        relative.to_string_lossy().replace('\\', "/")
-    }
-
-    fn collect(path: &std::path::Path, output: &mut Vec<PathBuf>) -> Result<(), BuildError> {
-        let metadata = fs::metadata(path).map_err(BuildError::Io)?;
-        if metadata.is_file() {
-            if path.extension() != Some(OsStr::new("seismic")) {
-                return Err(BuildError::Environment(format!(
-                    "source `{}` is not a .seismic file",
-                    path.display()
-                )));
-            }
-            output.push(path.to_path_buf());
-            return Ok(());
-        }
-        if !metadata.is_dir() {
-            return Err(BuildError::Environment(format!(
-                "source `{}` is neither a file nor a directory",
-                path.display()
-            )));
-        }
-        let mut children = fs::read_dir(path)
-            .map_err(BuildError::Io)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(BuildError::Io)?;
-        children.sort_by_key(|entry| entry.path());
-        for child in children {
-            let child_path = child.path();
-            if child.file_type().map_err(BuildError::Io)?.is_dir()
-                || child_path.extension() == Some(OsStr::new("seismic"))
-            {
-                collect(&child_path, output)?;
-            }
-        }
-        Ok(())
     }
 
     fn render(
@@ -966,13 +1041,18 @@ mod internals {
             out.push_str("    seismic::generated::prepare_native::<Entry>(device, specialization, &[\n");
             element_list(out);
             out.push_str(&format!("    ], {cpu})\n  }}\n"));
-            out.push_str("  pub fn native_tune_with(device: &seismic::Device, elements: Elements, statics: &seismic::NativeSpecialization, points: Vec<seismic::TuningPoint<'_, Entry>>, validation: seismic::Validation, measure: seismic::MeasureOptions) -> Result<seismic::TuningResult, seismic::TuneError> {\n");
+            out.push_str("  pub fn native_tune_with(device: &seismic::Device, elements: Elements, statics: &seismic::NativeSpecialization, points: Vec<seismic::TuningPoint<'_, Entry>>, validation: seismic::Validation, strategy: seismic::Strategy) -> Result<seismic::TuningResult, seismic::TuneError> {\n");
             out.push_str("    seismic::generated::tune_native::<Entry>(device, statics, &[\n");
             element_list(out);
-            out.push_str(&format!("    ], {cpu}, points, validation, measure)\n  }}\n"));
+            out.push_str(&format!("    ], {cpu}, points, validation, strategy)\n  }}\n"));
+            out.push_str("  pub fn native_digest_with(device: &seismic::Device, elements: Elements, statics: &seismic::NativeSpecialization) -> Result<String, seismic::TuneError> {\n");
+            out.push_str("    seismic::generated::digest_native::<Entry>(device, statics, &[\n");
+            element_list(out);
+            out.push_str("    ])\n  }\n");
         } else {
             out.push_str(&format!("  pub fn native_for_device(device: &seismic::Device, specialization: &seismic::NativeSpecialization) -> Result<seismic::NativeKernel<Entry>, seismic::LoadError> {{ seismic::generated::prepare_native::<Entry>(device, specialization, &[], {cpu}) }}\n"));
-            out.push_str(&format!("  pub fn native_tune(device: &seismic::Device, statics: &seismic::NativeSpecialization, points: Vec<seismic::TuningPoint<'_, Entry>>, validation: seismic::Validation, measure: seismic::MeasureOptions) -> Result<seismic::TuningResult, seismic::TuneError> {{ seismic::generated::tune_native::<Entry>(device, statics, &[], {cpu}, points, validation, measure) }}\n"));
+            out.push_str(&format!("  pub fn native_tune(device: &seismic::Device, statics: &seismic::NativeSpecialization, points: Vec<seismic::TuningPoint<'_, Entry>>, validation: seismic::Validation, strategy: seismic::Strategy) -> Result<seismic::TuningResult, seismic::TuneError> {{ seismic::generated::tune_native::<Entry>(device, statics, &[], {cpu}, points, validation, strategy) }}\n"));
+            out.push_str("  pub fn native_digest(device: &seismic::Device, statics: &seismic::NativeSpecialization) -> Result<String, seismic::TuneError> { seismic::generated::digest_native::<Entry>(device, statics, &[]) }\n");
         }
         out.push_str("  /// The checked native implementation for the device's backend.\n");
         out.push_str("  pub fn native_implementation(device: &seismic::Device) -> Result<Option<seismic::NativeImplementation>, seismic::CheckedBundleError> { seismic::generated::native_implementation::<Entry>(device) }\n");
@@ -1541,6 +1621,43 @@ mod native_tests {
     }
 
     #[test]
+    fn vulkan_native_implementation_is_refused_without_a_vulkan_abi() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "seismic-native-vulkan-build-{}-{unique}",
+            std::process::id()
+        ));
+        let output = root.join("out");
+        fs::create_dir_all(root.join("vulkan")).expect("fixture directories");
+        let source = root.join("ops.seismic");
+        fs::write(
+            &source,
+            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for vulkan from \"vulkan/scale.comp\":\n    launch scale:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n",
+        )
+        .expect("Seismic fixture");
+        fs::write(root.join("vulkan/scale.comp"), "void scale() {}\n").expect("Vulkan fixture");
+
+        let error = Build::new("fixture")
+            .source(&source)
+            .std(false)
+            .out_dir(&output)
+            .run()
+            .expect_err("a Vulkan asset cannot be validated by this build");
+        assert!(
+            matches!(
+                &error,
+                BuildError::NativeBackendUnavailable { entry, backend }
+                    if entry == "scale" && *backend == seismic_lang::registry::BackendName::Vulkan
+            ),
+            "{error}"
+        );
+        fs::remove_dir_all(&root).expect("remove fixture directory");
+    }
+
+    #[test]
     fn native_asset_rejects_dimension_macro_not_generated_for_entry() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1667,9 +1784,9 @@ mod native_tests {
         fs::write(&cuda, "#include <cuda_fp16.h>\nextern \"C\" __global__ void scale(SEISMIC_KERNEL_PARAMS) {}\n")
             .expect("CUDA fixture");
         match build("header").expect_err("vendor headers are rejected") {
-            BuildError::NativeAbi { symbol, line, .. } => {
-                assert_eq!(symbol, "#include");
-                assert_eq!(line, 1);
+            BuildError::NativeInclude(error) => {
+                assert_eq!(error.reason, seismic_lang::source::NativeIncludeReason::System);
+                assert_eq!(error.line, 1);
             }
             other => panic!("unexpected error: {other}"),
         }
@@ -1679,6 +1796,84 @@ mod native_tests {
         match build("unknown").expect_err("undeclared parameters are rejected") {
             BuildError::NativeAbi { symbol, .. } => assert_eq!(symbol, "SEISMIC_TUNE_WIDTH"),
             other => panic!("unexpected error: {other}"),
+        }
+        fs::remove_dir_all(&root).expect("remove fixture directory");
+    }
+
+    const SCALE_METAL: &str = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for metal from \"native/scale.metal\":\n    launch scale:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n";
+
+    #[test]
+    fn common_includes_are_inlined_validated_and_part_of_identity() {
+        let root = fixture("include");
+        let source = root.join("ops.seismic");
+        fs::write(&source, SCALE_METAL).expect("Seismic fixture");
+        fs::create_dir_all(root.join("native/common")).expect("common directory");
+        let header = root.join("native/common/copy.h");
+        fs::write(&header, "#define COPY(i) output[i * SEISMIC_RESULT_0_STRIDE_0] = x[i * SEISMIC_X_STRIDE_0]\n")
+            .expect("header fixture");
+        fs::write(
+            root.join("native/scale.metal"),
+            "#include \"common/copy.h\"\nkernel void scale(device const float *x [[buffer(SEISMIC_BUFFER_X)]], device float *output [[buffer(SEISMIC_RESULT_0_BUFFER)]], constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]], uint index [[thread_position_in_grid]]) { if (index < SEISMIC_DIM_N) COPY(index); }\n",
+        )
+        .expect("Metal fixture");
+        let build = |name: &str| {
+            Build::new("fixture")
+                .source(&source)
+                .std(false)
+                .out_dir(root.join(name))
+                .run()
+        };
+        let first = build("first").expect("a common include builds");
+        let rendered = fs::read_to_string(root.join("first/scale.metal")).expect("rendered asset");
+        assert!(rendered.starts_with("#line 1 \"common/copy.h\"\n#define COPY(i)"));
+        assert!(!rendered.contains("#include"));
+
+        fs::write(&header, "#define COPY(i) output[i] = x[i]\n").expect("changed header");
+        let second = build("second").expect("changed header builds");
+        assert_ne!(first.identity, second.identity, "included files are part of identity");
+
+        fs::write(&header, "#define COPY(i) output[i] = x[i * SEISMIC_DIM_W]\n").expect("bad header");
+        match build("symbol").expect_err("included files are validated against the entry ABI") {
+            BuildError::NativeAbi { path, line, symbol, .. } => {
+                assert_eq!(path, header.canonicalize().expect("canonical header"));
+                assert_eq!(line, 1);
+                assert_eq!(symbol, "SEISMIC_DIM_W");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        fs::write(root.join("native/copy.h"), "\n").expect("outside header");
+        fs::write(root.join("native/scale.metal"), "#include \"copy.h\"\nkernel void scale() {}\n")
+            .expect("Metal fixture");
+        match build("outside").expect_err("includes outside common/ are rejected") {
+            BuildError::NativeInclude(error) => {
+                assert_eq!(error.reason, seismic_lang::source::NativeIncludeReason::OutsideCommon)
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        fs::remove_dir_all(&root).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn metal_implementations_beyond_the_buffer_table_are_rejected() {
+        let root = fixture("slots");
+        let source = root.join("ops.seismic");
+        // 29 tensor parameters + 1 tensor result + words + scalar slots = 32.
+        let parameters = (0..29).map(|index| format!("x{index}: &tensor[N] f32")).collect::<Vec<_>>().join(", ");
+        fs::write(
+            &source,
+            format!("fn wide[N]({parameters}) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x0[i]\n    return output\n\nnative wide for metal from \"native/wide.metal\":\n    launch wide:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n"),
+        )
+        .expect("Seismic fixture");
+        fs::write(root.join("native/wide.metal"), "kernel void wide() {}\n").expect("Metal fixture");
+        match Build::new("fixture").source(&source).std(false).out_dir(root.join("out")).run() {
+            Err(BuildError::MetalBufferSlots { entry, slots, limit }) => {
+                assert_eq!(entry, "wide");
+                assert_eq!(slots, 32);
+                assert_eq!(limit, 31);
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("32 buffers must not build for Metal"),
         }
         fs::remove_dir_all(&root).expect("remove fixture directory");
     }

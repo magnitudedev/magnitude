@@ -24,7 +24,8 @@ pub use resources::{
     ResourcePlanner, RetentionCapacityPlan, StateCapacityPlan, StateResourcePlan, StateStorePlan,
 };
 pub use weights::{
-    resident_element, source_element, AttentionBinding, DenseBinding, EmbeddingBinding,
+    resident_element, resident_layout, source_element, AttentionBinding, AttentionShape, DenseBinding,
+    EmbeddingBinding,
     FeaturesBinding, HeadBinding, ModelLoadPlan, ReadoutBinding, RecurrentBinding, RoutedBinding,
     VisionBlockBinding, VisionMergerBinding, VisionPatchBinding, WeightPlan, WeightStorageIdentity,
 };
@@ -34,7 +35,7 @@ use weights::{planned_element, weight_bytes_by_component};
 use weights::{resident_dtype, validate_unique_roles};
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use magnitude_artifacts::{
         gguf::{Encoding, TensorDescriptor},
@@ -112,19 +113,26 @@ mod tests {
         }
     }
 
-    fn fixture_definition() -> ModelDefinition {
+    /// The smallest geometry every native kernel admits: hidden and
+    /// feed-forward widths a multiple of 64 (CUDA K1 k-blocks), an attention
+    /// head width a multiple of 32 (attention lanes), one head.
+    pub(crate) fn fixture_definition() -> ModelDefinition {
+        const HIDDEN: u64 = 128;
+        const WIDTH: u64 = 64;
+        const FEATURES: u64 = 128;
+        const VOCABULARY: u64 = 256;
         let attention = || AttentionWeights {
-            query_gate: descriptor("qg", &[8, 2]),
-            key: descriptor("k", &[4, 2]),
-            value: descriptor("v", &[4, 2]),
-            query_norm: descriptor("qn", &[4]),
-            key_norm: descriptor("kn", &[4]),
-            output: descriptor("o", &[2, 4]),
+            query_gate: descriptor("qg", &[2 * WIDTH, HIDDEN]),
+            key: descriptor("k", &[WIDTH, HIDDEN]),
+            value: descriptor("v", &[WIDTH, HIDDEN]),
+            query_norm: descriptor("qn", &[WIDTH]),
+            key_norm: descriptor("kn", &[WIDTH]),
+            output: descriptor("o", &[HIDDEN, WIDTH]),
         };
         let dense = || DenseFeedForwardWeights {
-            gate: descriptor("gate", &[4, 2]),
-            up: descriptor("up", &[4, 2]),
-            down: descriptor("down", &[2, 4]),
+            gate: descriptor("gate", &[FEATURES, HIDDEN]),
+            up: descriptor("up", &[FEATURES, HIDDEN]),
+            down: descriptor("down", &[HIDDEN, FEATURES]),
         };
         ModelDefinition {
             family: magnitude_model_contracts::FamilyId("resource-fixture".into()),
@@ -138,40 +146,40 @@ mod tests {
             },
             geometry: magnitude_model_contracts::DecoderGeometry {
                 activation_dtype: ActivationDType::BF16,
-                hidden: 2,
-                vocabulary: 8,
+                hidden: HIDDEN,
+                vocabulary: VOCABULARY,
                 context_limit: 128,
                 epsilon: 1e-6,
                 blocks: vec![BlockGeometry {
                     mixer: magnitude_model_contracts::MixerGeometry::Attention(AttentionGeometry {
                         heads: 1,
                         kv_heads: 1,
-                        width: 4,
+                        width: WIDTH,
                         rotary: RotarySemantics::Interleaved {
-                            width: 2,
+                            width: WIDTH / 2,
                             base: 10_000.0,
-                            sections: vec![1],
+                            sections: vec![WIDTH / 4],
                             axis_pattern: vec![0],
                         },
                     }),
-                    feedforward: FeedForwardGeometry::Dense { intermediate: 4 },
+                    feedforward: FeedForwardGeometry::Dense { intermediate: FEATURES },
                 }],
             },
-            embedding: descriptor("embedding", &[8, 2]),
+            embedding: descriptor("embedding", &[VOCABULARY, HIDDEN]),
             blocks: vec![BlockWeights {
-                input_norm: descriptor("input_norm", &[2]),
+                input_norm: descriptor("input_norm", &[HIDDEN]),
                 mixer: MixerWeights::Attention(Box::new(attention())),
-                feedforward_norm: descriptor("ffn_norm", &[2]),
+                feedforward_norm: descriptor("ffn_norm", &[HIDDEN]),
                 feedforward: FeedForwardWeights::Dense(Box::new(dense())),
             }],
-            output_norm: descriptor("output_norm", &[2]),
-            output: descriptor("output", &[8, 2]),
+            output_norm: descriptor("output_norm", &[HIDDEN]),
+            output: descriptor("output", &[VOCABULARY, HIDDEN]),
             head: None,
             vision: None,
         }
     }
 
-    fn fixture_manifest(definition: &ModelDefinition) -> PackageManifest {
+    pub(crate) fn fixture_manifest(definition: &ModelDefinition) -> PackageManifest {
         let block = &definition.blocks[0];
         let MixerWeights::Attention(attention) = &block.mixer else {
             unreachable!()
@@ -228,7 +236,11 @@ mod tests {
     fn prepared_resource_plan() -> Option<ResourcePlan> {
         let catalog = seismic::DeviceCatalog::discover().ok()?;
         let selected =
-            crate::platform::select_device(&catalog, crate::ExecutionPath::NativeMetal).ok()?;
+            crate::platform::select_device(
+                &catalog,
+                crate::ExecutionPath::Native,
+                crate::platform::DeviceRequest::Automatic,
+            ).ok()?;
         let device = catalog
             .open(catalog.resolve(selected.info.selector).unwrap())
             .unwrap();
@@ -255,7 +267,7 @@ mod tests {
                 head: false,
                 vision: false,
             },
-            crate::ExecutionPath::NativeMetal,
+            crate::ExecutionPath::Native,
             PlannedMethod::Plain,
             KvCodec::Dense,
             limits,
@@ -265,7 +277,17 @@ mod tests {
         let state =
             ResourcePlanner::state_plan(&definition, draft.load(), KvCodec::Dense, limits, budget)
                 .unwrap();
-        let mut programs = crate::AttestedPrograms::prepare_draft(&draft, &device).unwrap();
+        let mut programs = crate::AttestedPrograms::prepare_draft(
+            &draft,
+            &device,
+            crate::TuningContext {
+                definition: &definition,
+                weights: &crate::ZeroTuningWeights,
+                observer: &crate::UnreportedTuning,
+                cache: None,
+            },
+        )
+        .unwrap();
         let target = programs
             .prepare_target_graphs(&device, draft.load(), &definition.geometry, &state, limits)
             .unwrap();

@@ -152,13 +152,16 @@ impl Decl {
 /// native NAME for TARGET from "SOURCE":
 ///     static (DIM, ..)
 ///     params ([arithmetic] NAME in [V, ..], ..)
-///     where PREDICATE
-///     scratch NAME bytes (EXPR)
-///     launch KERNEL:
+///     where CONDITION
+///     scratch NAME bytes (EXPR) [when CONDITION]
+///     launch KERNEL [when CONDITION]:
 ///         threadgroups (X, Y, Z)
 ///         threads_per_threadgroup (X, Y, Z)
 ///         shared_bytes (EXPR)
 /// ```
+///
+/// A `CONDITION` is comparisons of natural-number expressions joined by
+/// `and` and `or`, grouped with parentheses.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeDecl {
     pub function: Ident,
@@ -167,8 +170,8 @@ pub struct NativeDecl {
     /// Entry dimensions fixed at preparation.
     pub statics: Vec<Ident>,
     pub params: Vec<NativeParamDecl>,
-    /// Conjuncts of the `where` line.
-    pub constraints: Vec<Expr>,
+    /// The `where` condition restricting admissible configurations.
+    pub constraint: Option<Expr>,
     pub scratch: Vec<NativeScratchDecl>,
     pub launches: Vec<NativeLaunchDecl>,
     pub span: Span,
@@ -189,6 +192,8 @@ pub struct NativeParamDecl {
 pub struct NativeScratchDecl {
     pub name: Ident,
     pub bytes: Expr,
+    /// The buffer is sized only when this condition holds.
+    pub when: Option<Expr>,
     pub span: Span,
 }
 
@@ -196,6 +201,8 @@ pub struct NativeScratchDecl {
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeLaunchDecl {
     pub kernel: Ident,
+    /// The launch runs only when this condition holds.
+    pub when: Option<Expr>,
     pub threadgroups: [Expr; 3],
     pub threads_per_threadgroup: [Expr; 3],
     pub shared_bytes: Option<Expr>,

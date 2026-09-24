@@ -57,6 +57,13 @@ pub enum PreparationError {
     /// A direct native specialization does not match its declaration, or the
     /// entry has no native implementation for the device's backend.
     NativeSpecialization(String),
+    /// A direct native implementation binds more buffers than the backend's
+    /// argument table holds (Metal: 31).
+    NativeBufferSlots {
+        entry: String,
+        slots: usize,
+        limit: usize,
+    },
     /// The selected evaluator could not consume this sealed domain. No
     /// partial evaluated domain exists.
     Evaluation(crate::evaluation::EvaluationError),
@@ -126,6 +133,12 @@ pub enum InvocationError {
         dimension: String,
         expected: u64,
         actual: seismic_lang::expr::BigUint,
+    },
+    /// A tensor parameter whose extents are all static renders constant
+    /// canonical strides into its native source, so it must be bound with
+    /// exactly those strides.
+    NoncanonicalStaticTensor {
+        parameter: String,
     },
 }
 
@@ -205,6 +218,10 @@ impl fmt::Display for PreparationError {
             ),
             Self::NativeCompilation(e) => write!(f, "native compilation failed: {e}"),
             Self::NativeWorkspaceAllocation(s) => write!(f, "native invocation workspace: {s}"),
+            Self::NativeBufferSlots { entry, slots, limit } => write!(
+                f,
+                "native implementation of `{entry}` binds {slots} buffers; the backend admits {limit}"
+            ),
             Self::NativeSpecialization(s) => write!(f, "native specialization: {s}"),
             Self::Evaluation(e) => write!(f, "candidate evaluation failed: {e:?}"),
             Self::Feedback(e) => write!(f, "feedback evaluation failed: {e:?}"),
@@ -263,6 +280,10 @@ impl fmt::Display for InvocationError {
             } => write!(
                 f,
                 "dimension `{dimension}` is {actual}, but the native implementation was prepared for {expected}"
+            ),
+            Self::NoncanonicalStaticTensor { parameter } => write!(
+                f,
+                "`{parameter}` has static extents, so the native implementation requires its canonical strides"
             ),
         }
     }

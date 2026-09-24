@@ -3,21 +3,30 @@
 //! A graph is sealed from the generated entry contracts before resident model
 //! storage is admitted. Ports are the only late bindings. No consumer supplies
 //! a name-to-buffer recipe for intermediate results.
+//!
+//! Sealing validates every node against its entry contract once and fixes
+//! its executable form: argument words, launch geometry, and for every
+//! buffer the storage region and offset it lives at. A run supplies only the
+//! regions (the slot's workspace, the run's upload region and output arena)
+//! and the tensors bound to external ports; attaching checks those bindings
+//! alone, so per-run host work does not revalidate nodes.
 
 use super::{
-    submit, NativeBoundCall, NativeSubmission, NativeTensorSpec, ScratchView, SCRATCH_ALIGNMENT,
+    merge_access, submit, word_bytes, CallLaunches, Dispatch, DispatchList, NativePrepared,
+    NativeSubmission, NativeTensorSpec, BUFFER_ALIGNMENT,
 };
 use crate::api::device::DeviceInner;
 use crate::api::kernel::{
-    EncodedArgs, EncodedWorkflowArgs, EncodedWorkflowArgument, NativePreparedAny,
-    PendingWorkflowResults, ViewOperation, WorkflowResultRef, WorkflowTensorArgument,
+    EncodedWorkflowArgs, EncodedWorkflowArgument, NativePreparedAny, PendingWorkflowResults,
+    ViewOperation, WorkflowResultRef, WorkflowTensorArgument,
 };
 use crate::api::tensor::TensorInner;
 use crate::api::{CallError, TensorError, WorkflowError};
 use crate::driver::{write_zeros, Allocation};
 use crate::layout;
-use seismic_compiler::errors::ExecutionError;
+use seismic_compiler::errors::{ExecutionError, InvocationError};
 use seismic_compiler::prepared::{ArgumentValue, DeviceIdentity, TensorDescriptor};
+use seismic_lang::entry::{AliasRule, ParameterKind, TensorAccess};
 use seismic_lang::ids::RepresentationId;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -42,7 +51,6 @@ struct PortSpec {
     extents: Vec<u64>,
     strides: Vec<u64>,
     byte_len: u64,
-    alignment: u64,
     local: bool,
     owned_input: bool,
     prewritten: bool,
@@ -86,7 +94,6 @@ impl NativeGraphDraft {
             extents: extents.to_vec(),
             strides: layout.strides,
             byte_len: layout.byte_len,
-            alignment: layout.alignment,
             local: false,
             owned_input: false,
             prewritten: false,
@@ -116,7 +123,6 @@ impl NativeGraphDraft {
             extents: spec.extents,
             strides: spec.strides,
             byte_len: spec.byte_len,
-            alignment: spec.alignment,
             local: true,
             owned_input: false,
             prewritten: false,
@@ -143,7 +149,6 @@ impl NativeGraphDraft {
             extents: spec.extents,
             strides: spec.strides,
             byte_len: spec.byte_len,
-            alignment: spec.alignment,
             local: true,
             owned_input: true,
             prewritten: false,
@@ -246,41 +251,47 @@ impl NativeGraphDraft {
         let identity = self.identity;
         let device_identity = self.device.kind.identity();
         let mut results: Vec<Vec<Option<NativeTensorSpec>>> = Vec::new();
-        let mut nodes = Vec::with_capacity(self.nodes.len());
+        let mut planned = Vec::with_capacity(self.nodes.len());
+        let mut shaped = Vec::with_capacity(self.nodes.len());
         for node in self.nodes {
             node.kernel.inner.validate_graph_node(device_identity)?;
             let arguments =
                 describe_arguments(&node.args, &self.ports, &results, identity, device_identity)?;
-            let (described, scratch) = node.kernel.inner.describe(&arguments)?;
-            results.push(described);
-            nodes.push(PlannedNode {
-                kernel: node.kernel,
+            let shape = node.kernel.inner.shape(&arguments)?;
+            results.push(shape.results.clone());
+            planned.push(PlannedNode {
                 args: node.args,
-                scratch,
+                scratch: shape.scratch.clone(),
             });
+            shaped.push((node.kernel.inner.clone(), arguments, shape));
         }
         for reference in &self.exports {
             if reference.node != INPUT_NODE && result_spec(&results, *reference).is_none() {
                 return Err(CallError::Workflow(WorkflowError::MissingProducerResult));
             }
         }
-        let storage = plan_storage(&self.ports, &nodes, &results, &self.exports);
+        let storage = plan_storage(&self.ports, &planned, &results, &self.exports);
+        let mut executable = Executable {
+            nodes: Vec::with_capacity(planned.len()),
+            external_writes: vec![false; self.ports.len()],
+            upload_written: false,
+            disjoint: Vec::new(),
+        };
+        for (node, ((kernel, arguments, shape), planned)) in shaped.into_iter().zip(&planned).enumerate() {
+            executable.seal_node(kernel, &arguments, shape, &planned.args, &storage, node);
+        }
         Ok(NativeGraphPlan {
             identity,
             device: self.device,
             ports: self.ports,
-            nodes,
+            executable,
             results,
             exports: self.exports,
             port_placements: storage.port_placements,
             placements: storage.placements,
-            node_scratch: storage.node_scratch,
             scratch_bytes: storage.scratch_bytes,
-            scratch_alignment: storage.scratch_alignment,
             output_bytes: storage.output_bytes,
-            output_alignment: storage.output_alignment,
             upload_bytes: storage.upload_bytes,
-            upload_alignment: storage.upload_alignment,
         })
     }
 }
@@ -418,11 +429,171 @@ fn describe_reference(
     Ok(virtual_descriptor(spec, device, allocation))
 }
 
+/// A node as storage planning sees it.
 struct PlannedNode {
-    kernel: Arc<NativePreparedAny>,
     args: EncodedWorkflowArgs,
     /// Bytes of each of the node's call-private scratch buffers.
     scratch: Vec<u64>,
+}
+
+/// Where a node's buffer lives. Only an external port's tensor is bound
+/// per run; every other buffer is placed at seal.
+#[derive(Clone, Copy, Debug)]
+enum Region {
+    /// The tensor bound to this external port; the site offset is added to
+    /// the tensor's own byte offset.
+    External(usize),
+    /// The slot's workspace arena: results, graph locals and node scratch.
+    Workspace,
+    /// The run's upload region: host-written inputs.
+    Upload,
+    /// The run's output arena: exports.
+    Outputs,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Site {
+    region: Region,
+    offset: u64,
+}
+
+/// One node in executable form, fixed at seal.
+struct SealedNode {
+    kernel: Arc<NativePrepared>,
+    /// Buffers in ABI order.
+    sites: Vec<Site>,
+    representations: Vec<&'static str>,
+    words: Vec<u64>,
+    word_bytes: Vec<u8>,
+    /// Per launch ordinal, fixed at seal; `None` for an inactive launch.
+    launches: CallLaunches,
+}
+
+/// Byte range of an external port's view in one node argument.
+#[derive(Clone, Debug)]
+struct PortRange {
+    port: usize,
+    offset: u64,
+    bytes: u64,
+    /// The entry parameter, for the aliasing error.
+    parameter: String,
+}
+
+/// The sealed nodes and what a run must check of its external bindings.
+struct Executable {
+    nodes: Vec<SealedNode>,
+    /// Per port: whether any node writes the external tensor bound to it.
+    external_writes: Vec<bool>,
+    /// Whether any node writes a host-written input.
+    upload_written: bool,
+    /// Argument pairs on two different external ports that their entry
+    /// requires to be disjoint. Pairs on graph storage, or on one port,
+    /// were decided at seal.
+    disjoint: Vec<(PortRange, PortRange)>,
+}
+
+impl Executable {
+    fn seal_node(
+        &mut self,
+        kernel: Arc<NativePrepared>,
+        arguments: &[ArgumentValue],
+        shape: super::CallShape,
+        args: &EncodedWorkflowArgs,
+        storage: &StoragePlan,
+        node: usize,
+    ) {
+        let schema = kernel.schema();
+        let mut sites = Vec::new();
+        let mut representations = Vec::new();
+        let mut external = vec![None; arguments.len()];
+        for (ordinal, ((parameter, argument), value)) in schema
+            .parameters()
+            .iter()
+            .zip(args.arguments())
+            .zip(arguments)
+            .enumerate()
+        {
+            let ParameterKind::Tensor { access, .. } = &parameter.kind else {
+                continue;
+            };
+            let ArgumentValue::Tensor(descriptor) = value else {
+                unreachable!("a validated tensor parameter carries a tensor descriptor");
+            };
+            let reference = argument_reference(argument)
+                .expect("a sealed graph tensor argument names a port or a result");
+            let (region, base) = if reference.node == INPUT_NODE {
+                let port = reference.result as usize;
+                match storage.port_placements[port] {
+                    Some(placement) => placement.site(),
+                    None => {
+                        external[ordinal] = Some(PortRange {
+                            port,
+                            offset: descriptor.byte_offset,
+                            bytes: descriptor.byte_len,
+                            parameter: parameter.name.clone(),
+                        });
+                        (Region::External(port), 0)
+                    }
+                }
+            } else {
+                storage.placements[reference.node as usize][reference.result as usize].site()
+            };
+            let write = matches!(access, TensorAccess::Owned | TensorAccess::Mutable);
+            match region {
+                Region::External(port) => self.external_writes[port] |= write,
+                Region::Upload => self.upload_written |= write,
+                Region::Workspace | Region::Outputs => {}
+            }
+            sites.push(Site {
+                region,
+                offset: base + descriptor.byte_offset,
+            });
+            representations.push(
+                seismic_lang::registry::representation_info(descriptor.representation).name,
+            );
+        }
+        for rule in schema.aliases() {
+            let AliasRule::Disjoint(first, second) = *rule else {
+                continue;
+            };
+            let position = |id| {
+                schema
+                    .parameters()
+                    .iter()
+                    .position(|parameter| parameter.id == id)
+                    .expect("alias rule names a schema parameter")
+            };
+            if let (Some(first), Some(second)) =
+                (&external[position(first)], &external[position(second)])
+            {
+                if first.port != second.port {
+                    self.disjoint.push((first.clone(), second.clone()));
+                }
+            }
+        }
+        for (ordinal, result) in shape.results.iter().enumerate() {
+            let Some(spec) = result else { continue };
+            let (region, offset) = storage.placements[node][ordinal].site();
+            sites.push(Site { region, offset });
+            representations
+                .push(seismic_lang::registry::representation_info(spec.representation).name);
+        }
+        for offset in &storage.node_scratch[node] {
+            sites.push(Site {
+                region: Region::Workspace,
+                offset: *offset,
+            });
+            representations.push("bytes");
+        }
+        self.nodes.push(SealedNode {
+            kernel,
+            sites,
+            representations,
+            word_bytes: word_bytes(&shape.words),
+            words: shape.words,
+            launches: shape.launches,
+        });
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -432,6 +603,17 @@ enum Placement {
     /// A host-written input in the per-submission upload region.
     Upload(u64),
     Scalar,
+}
+
+impl Placement {
+    fn site(self) -> (Region, u64) {
+        match self {
+            Self::Scratch(offset) => (Region::Workspace, offset),
+            Self::Export(offset) => (Region::Outputs, offset),
+            Self::Upload(offset) => (Region::Upload, offset),
+            Self::Scalar => unreachable!("a scalar result is never a graph buffer"),
+        }
+    }
 }
 
 struct ScratchBlock {
@@ -452,11 +634,8 @@ struct StoragePlan {
     placements: Vec<Vec<Placement>>,
     node_scratch: Vec<Vec<u64>>,
     scratch_bytes: u64,
-    scratch_alignment: u64,
     output_bytes: u64,
-    output_alignment: u64,
     upload_bytes: u64,
-    upload_alignment: u64,
 }
 
 struct Interval {
@@ -464,7 +643,6 @@ struct Interval {
     start: usize,
     end: usize,
     bytes: u64,
-    alignment: u64,
     exported: bool,
 }
 
@@ -476,7 +654,8 @@ fn align_up(value: u64, alignment: u64) -> u64 {
 /// arena by lifetime (a node's scratch is live across its inputs and
 /// results, so it never aliases them); exports get their own arena; inputs
 /// the host writes go to a per-submission upload region so a later host
-/// write cannot race an earlier submission still reading them.
+/// write cannot race an earlier submission still reading them. Every buffer
+/// starts at a [`BUFFER_ALIGNMENT`] offset of its region.
 fn plan_storage(
     ports: &[PortSpec],
     nodes: &[PlannedNode],
@@ -507,15 +686,13 @@ fn plan_storage(
     }
     let mut intervals = Vec::new();
     let mut upload_bytes = 0u64;
-    let mut upload_alignment = 1u64;
     let mut port_placements = vec![None; ports.len()];
     for (ordinal, port) in ports.iter().enumerate() {
         if !port.local {
             continue;
         }
         if port.owned_input {
-            upload_alignment = upload_alignment.max(port.alignment);
-            let offset = align_up(upload_bytes, port.alignment);
+            let offset = align_up(upload_bytes, BUFFER_ALIGNMENT);
             upload_bytes = offset
                 .checked_add(port.byte_len.max(1))
                 .expect("native graph upload bytes overflow");
@@ -534,7 +711,6 @@ fn plan_storage(
             },
             end: port_last[ordinal],
             bytes: port.byte_len.max(1),
-            alignment: port.alignment,
             exported,
         });
     }
@@ -549,7 +725,6 @@ fn plan_storage(
                 start: node * 2 + 1,
                 end: last_use[node][ordinal],
                 bytes: spec.byte_len.max(1),
-                alignment: spec.alignment,
                 exported,
             });
         }
@@ -561,7 +736,6 @@ fn plan_storage(
                 start: node * 2,
                 end: node * 2 + 1,
                 bytes: *bytes,
-                alignment: SCRATCH_ALIGNMENT,
                 exported: false,
             });
         }
@@ -569,9 +743,7 @@ fn plan_storage(
     intervals.sort_by_key(|interval| interval.start);
     let mut blocks: Vec<ScratchBlock> = Vec::new();
     let mut cursor = 0u64;
-    let mut alignment = 1u64;
     let mut output_bytes = 0u64;
-    let mut output_alignment = 1u64;
     let mut placements = results
         .iter()
         .map(|row| vec![Placement::Scalar; row.len()])
@@ -582,24 +754,20 @@ fn plan_storage(
         .collect::<Vec<_>>();
     for interval in intervals {
         let placement = if interval.exported {
-            output_alignment = output_alignment.max(interval.alignment);
-            let offset = align_up(output_bytes, interval.alignment);
+            let offset = align_up(output_bytes, BUFFER_ALIGNMENT);
             output_bytes = offset
                 .checked_add(interval.bytes)
                 .expect("native graph output bytes overflow");
             Placement::Export(offset)
         } else {
-            alignment = alignment.max(interval.alignment);
             let reuse = blocks.iter_mut().find(|block| {
-                block.live_until < interval.start
-                    && block.capacity >= interval.bytes
-                    && block.offset % interval.alignment == 0
+                block.live_until < interval.start && block.capacity >= interval.bytes
             });
             let offset = if let Some(block) = reuse {
                 block.live_until = interval.end;
                 block.offset
             } else {
-                let offset = align_up(cursor, interval.alignment);
+                let offset = align_up(cursor, BUFFER_ALIGNMENT);
                 cursor = offset
                     .checked_add(interval.bytes)
                     .expect("native graph storage overflow");
@@ -626,11 +794,8 @@ fn plan_storage(
         placements,
         node_scratch,
         scratch_bytes: cursor,
-        scratch_alignment: alignment,
         output_bytes,
-        output_alignment,
         upload_bytes,
-        upload_alignment,
     }
 }
 
@@ -638,19 +803,14 @@ pub struct NativeGraphPlan {
     identity: u64,
     device: Arc<DeviceInner>,
     ports: Vec<PortSpec>,
-    nodes: Vec<PlannedNode>,
+    executable: Executable,
     results: Vec<Vec<Option<NativeTensorSpec>>>,
     exports: Vec<WorkflowResultRef>,
     port_placements: Vec<Option<Placement>>,
     placements: Vec<Vec<Placement>>,
-    /// Arena offset of each node's scratch buffers.
-    node_scratch: Vec<Vec<u64>>,
     scratch_bytes: u64,
-    scratch_alignment: u64,
     output_bytes: u64,
-    output_alignment: u64,
     upload_bytes: u64,
-    upload_alignment: u64,
 }
 
 impl NativeGraphPlan {
@@ -672,8 +832,11 @@ impl NativeGraphPlan {
             identity: self.identity,
             inputs: vec![None; self.ports.len()],
             external: self.ports.iter().map(|port| !port.local).collect(),
+            checked: vec![false; self.ports.len()],
         }
     }
+    /// Bind the ports that stay fixed across runs, checked once here; a
+    /// run's attach checks only the ports set after this.
     pub fn bind_static(
         self: &Arc<Self>,
         fixed: &[(NativePort, Arc<TensorInner>)],
@@ -689,6 +852,7 @@ impl NativeGraphPlan {
                     port: ordinal,
                 }));
             }
+            bindings.checked[ordinal] = true;
         }
         Ok(BoundNativeGraphPlan {
             _plan: self.clone(),
@@ -699,12 +863,12 @@ impl NativeGraphPlan {
     /// to its inputs wait for the slot's previous submission; a family slot
     /// rotates upload regions instead.
     pub fn new_slot(self: &Arc<Self>) -> Result<NativeGraphSlot, TensorError> {
-        let scratch = if self.scratch_bytes == 0 {
+        let workspace = if self.scratch_bytes == 0 {
             None
         } else {
             let allocation = self
                 .device
-                .allocate(self.scratch_bytes, self.scratch_alignment)?;
+                .allocate(self.scratch_bytes, BUFFER_ALIGNMENT)?;
             write_zeros(allocation.storage(), self.scratch_bytes)?;
             Some(allocation)
         };
@@ -713,81 +877,14 @@ impl NativeGraphPlan {
         } else {
             Some(
                 self.device
-                    .allocate(self.upload_bytes, self.upload_alignment)?,
+                    .allocate_upload(self.upload_bytes, BUFFER_ALIGNMENT)?,
             )
         };
-        Ok(self.slot_from_scratch(scratch, upload))
-    }
-
-    fn slot_from_scratch(
-        self: &Arc<Self>,
-        scratch: Option<Arc<Allocation>>,
-        upload: Option<Arc<Allocation>>,
-    ) -> NativeGraphSlot {
-        let mut locals = Vec::with_capacity(self.ports.len());
-        for (ordinal, port) in self.ports.iter().enumerate() {
-            let view = |allocation: &Option<Arc<Allocation>>, offset| {
-                Some(Arc::new(TensorInner::new_view(
-                    self.device.clone(),
-                    allocation
-                        .as_ref()
-                        .expect("planned graph storage allocation absent")
-                        .clone(),
-                    offset,
-                    port.byte_len,
-                    port.representation,
-                    port.extents.clone(),
-                    port.strides.clone(),
-                )))
-            };
-            let tensor = match self.port_placements[ordinal] {
-                Some(Placement::Scratch(offset)) => view(&scratch, offset),
-                Some(Placement::Upload(offset)) => view(&upload, offset),
-                Some(Placement::Export(_)) | None => None,
-                Some(Placement::Scalar) => unreachable!(),
-            };
-            locals.push(tensor);
-        }
-        let mut outputs = Vec::with_capacity(self.results.len());
-        for (node, row) in self.results.iter().enumerate() {
-            let mut output_row = Vec::with_capacity(row.len());
-            for (ordinal, result) in row.iter().enumerate() {
-                let Some(spec) = result else {
-                    output_row.push(None);
-                    continue;
-                };
-                let (allocation, offset) = match self.placements[node][ordinal] {
-                    Placement::Scratch(offset) => (
-                        scratch
-                            .as_ref()
-                            .expect("planned scratch allocation absent")
-                            .clone(),
-                        offset,
-                    ),
-                    Placement::Export(_) => {
-                        output_row.push(None);
-                        continue;
-                    }
-                    Placement::Upload(_) | Placement::Scalar => unreachable!(),
-                };
-                output_row.push(Some(Arc::new(TensorInner::new_view(
-                    self.device.clone(),
-                    allocation,
-                    offset,
-                    spec.byte_len,
-                    spec.representation,
-                    spec.extents.clone(),
-                    spec.strides.clone(),
-                ))));
-            }
-            outputs.push(output_row);
-        }
-        NativeGraphSlot {
+        Ok(NativeGraphSlot {
             plan: self.clone(),
-            locals,
-            outputs,
-            scratch,
-        }
+            workspace,
+            upload,
+        })
     }
 
     /// Exported outputs are a separate owner so their lifetime can outlive
@@ -796,12 +893,22 @@ impl NativeGraphPlan {
         let arena = if self.output_bytes == 0 {
             None
         } else {
-            Some(
-                self.device
-                    .allocate(self.output_bytes, self.output_alignment)?,
-            )
+            Some(self.device.allocate(self.output_bytes, BUFFER_ALIGNMENT)?)
         };
         Ok(self.outputs_from_arena(arena, None))
+    }
+
+    fn port_view(&self, ordinal: usize, allocation: &Arc<Allocation>, offset: u64) -> Arc<TensorInner> {
+        let port = &self.ports[ordinal];
+        Arc::new(TensorInner::new_view(
+            self.device.clone(),
+            allocation.clone(),
+            offset,
+            port.byte_len,
+            port.representation,
+            port.extents.clone(),
+            port.strides.clone(),
+        ))
     }
 
     fn outputs_from_arena(
@@ -810,17 +917,13 @@ impl NativeGraphPlan {
         family: Option<Arc<NativeGraphFamily>>,
     ) -> NativeGraphOutputs {
         let mut locals = Vec::with_capacity(self.ports.len());
-        for (ordinal, port) in self.ports.iter().enumerate() {
+        for ordinal in 0..self.ports.len() {
             let tensor = if let Some(Placement::Export(offset)) = self.port_placements[ordinal] {
-                Some(Arc::new(TensorInner::new_view(
-                    self.device.clone(),
-                    arena.as_ref().expect("planned output arena absent").clone(),
+                Some(self.port_view(
+                    ordinal,
+                    arena.as_ref().expect("planned output arena absent"),
                     offset,
-                    port.byte_len,
-                    port.representation,
-                    port.extents.clone(),
-                    port.strides.clone(),
-                )))
+                ))
             } else {
                 None
             };
@@ -887,11 +990,8 @@ pub struct NativeGraphFamily {
     plans: Vec<Arc<NativeGraphPlan>>,
     device: Arc<DeviceInner>,
     workspace_bytes: u64,
-    alignment: u64,
     output_bytes: u64,
-    output_alignment: u64,
     upload_bytes: u64,
-    upload_alignment: u64,
 }
 
 impl NativeGraphFamily {
@@ -911,31 +1011,16 @@ impl NativeGraphFamily {
                 .map(|plan| plan.scratch_bytes)
                 .max()
                 .unwrap_or(0),
-            alignment: plans
-                .iter()
-                .map(|plan| plan.scratch_alignment)
-                .max()
-                .unwrap_or(1),
             output_bytes: plans
                 .iter()
                 .map(|plan| plan.output_bytes)
                 .max()
                 .unwrap_or(0),
-            output_alignment: plans
-                .iter()
-                .map(|plan| plan.output_alignment)
-                .max()
-                .unwrap_or(1),
             upload_bytes: plans
                 .iter()
                 .map(|plan| plan.upload_bytes)
                 .max()
                 .unwrap_or(0),
-            upload_alignment: plans
-                .iter()
-                .map(|plan| plan.upload_alignment)
-                .max()
-                .unwrap_or(1),
         })
     }
 
@@ -957,10 +1042,7 @@ impl NativeGraphFamily {
         let arena = if self.output_bytes == 0 {
             None
         } else {
-            Some(
-                self.device
-                    .allocate(self.output_bytes, self.output_alignment)?,
-            )
+            Some(self.device.allocate(self.output_bytes, BUFFER_ALIGNMENT)?)
         };
         Ok(NativeGraphFamilyOutputSlot {
             family: self.clone(),
@@ -968,18 +1050,29 @@ impl NativeGraphFamily {
         })
     }
 
-    pub fn new_slot(self: &Arc<Self>) -> Result<NativeGraphFamilySlot, TensorError> {
+    /// A slot with its scratch arena and `regions` upload regions, all
+    /// allocated here: one region per graph run the slot's owner keeps in
+    /// flight at once. A family whose plans write no input allocates none.
+    pub fn new_slot(self: &Arc<Self>, regions: usize) -> Result<NativeGraphFamilySlot, TensorError> {
         let scratch = if self.workspace_bytes == 0 {
             None
         } else {
-            let allocation = self.device.allocate(self.workspace_bytes, self.alignment)?;
+            let allocation = self.device.allocate(self.workspace_bytes, BUFFER_ALIGNMENT)?;
             write_zeros(allocation.storage(), self.workspace_bytes)?;
             Some(allocation)
+        };
+        let uploads = if self.upload_bytes == 0 {
+            Vec::new()
+        } else {
+            (0..regions)
+                .map(|_| self.device.allocate_upload(self.upload_bytes, BUFFER_ALIGNMENT))
+                .collect::<Result<Vec<_>, _>>()?
         };
         Ok(NativeGraphFamilySlot {
             family: self.clone(),
             scratch,
-            uploads: Vec::new(),
+            uploads,
+            next_upload: 0,
             lent_locals: Vec::new(),
         })
     }
@@ -1010,10 +1103,13 @@ impl NativeGraphFamilyOutputSlot {
 pub struct NativeGraphFamilySlot {
     family: Arc<NativeGraphFamily>,
     scratch: Option<Arc<Allocation>>,
-    /// Upload regions. Activation reuses one no submission still reads and
-    /// no tensor view still names, and otherwise forms another, so the pool
-    /// grows to the number of submissions actually in flight.
+    /// Upload regions, fixed when the slot was created. Activation takes one
+    /// no submission still reads and no tensor view still names.
     uploads: Vec<Arc<Allocation>>,
+    /// The region the next activation tries first. Regions are taken in
+    /// rotation, so a submission sequence of a fixed length binds the same
+    /// region at the same position every time and replays its graphs.
+    next_upload: usize,
     lent_locals: Vec<Weak<TensorInner>>,
 }
 
@@ -1038,28 +1134,30 @@ impl NativeGraphFamilySlot {
         {
             return Err(WorkflowError::NativeGraphSlotMismatch);
         }
-        let upload = self.idle_upload().map_err(WorkflowError::TensorView)?;
-        let slot = plan.slot_from_scratch(self.scratch.clone(), upload);
+        let upload = self.idle_upload()?;
+        let slot = NativeGraphSlot {
+            plan: plan.clone(),
+            workspace: self.scratch.clone(),
+            upload,
+        };
         Ok(NativeGraphFamilyActive { slot, _owner: self })
     }
 
-    fn idle_upload(&mut self) -> Result<Option<Arc<Allocation>>, TensorError> {
+    /// The first idle region in rotation order from `next_upload`.
+    fn idle_upload(&mut self) -> Result<Option<Arc<Allocation>>, WorkflowError> {
         if self.family.upload_bytes == 0 {
             return Ok(None);
         }
-        if let Some(idle) = self
-            .uploads
-            .iter()
-            .find(|upload| Arc::strong_count(upload) == 1 && upload.device_idle())
-        {
-            return Ok(Some(idle.clone()));
-        }
-        let upload = self
-            .family
-            .device
-            .allocate(self.family.upload_bytes, self.family.upload_alignment)?;
-        self.uploads.push(upload.clone());
-        Ok(Some(upload))
+        let regions = self.uploads.len();
+        let index = (0..regions)
+            .map(|step| (self.next_upload + step) % regions)
+            .find(|index| {
+                let upload = &self.uploads[*index];
+                Arc::strong_count(upload) == 1 && upload.device_idle()
+            })
+            .ok_or(WorkflowError::UploadRegionsExhausted { regions })?;
+        self.next_upload = (index + 1) % regions;
+        Ok(Some(self.uploads[index].clone()))
     }
 }
 
@@ -1091,9 +1189,10 @@ impl NativeGraphFamilyActive<'_> {
 
 pub struct NativeGraphSlot {
     plan: Arc<NativeGraphPlan>,
-    locals: Vec<Option<Arc<TensorInner>>>,
-    outputs: Vec<Vec<Option<Arc<TensorInner>>>>,
-    scratch: Option<Arc<Allocation>>,
+    /// Results, graph locals and node scratch.
+    workspace: Option<Arc<Allocation>>,
+    /// Host-written inputs of the next run.
+    upload: Option<Arc<Allocation>>,
 }
 
 impl NativeGraphSlot {
@@ -1102,32 +1201,45 @@ impl NativeGraphSlot {
         if port.reference.workflow != self.plan.identity || port.reference.node != INPUT_NODE {
             return None;
         }
-        let spec = self.plan.ports.get(ordinal)?;
-        if !spec.prewritten {
+        if !self.plan.ports.get(ordinal)?.prewritten {
             return None;
         }
-        self.locals.get(ordinal)?.clone()
+        let Some(Placement::Scratch(offset)) = self.plan.port_placements[ordinal] else {
+            return None;
+        };
+        let workspace = self
+            .workspace
+            .as_ref()
+            .expect("planned graph workspace absent");
+        Some(self.plan.port_view(ordinal, workspace, offset))
     }
 
     pub fn write_input(&mut self, port: NativePort, bytes: &[u8]) -> Result<(), TensorError> {
         let ordinal = port.reference.result as usize;
-        if port.reference.workflow != self.plan.identity
-            || port.reference.node != INPUT_NODE
-            || !self
+        let owned = port.reference.workflow == self.plan.identity
+            && port.reference.node == INPUT_NODE
+            && self
                 .plan
                 .ports
                 .get(ordinal)
-                .is_some_and(|spec| spec.owned_input)
-        {
+                .is_some_and(|spec| spec.owned_input);
+        let Some(Placement::Upload(offset)) = owned
+            .then(|| self.plan.port_placements[ordinal])
+            .flatten()
+        else {
             return Err(TensorError::Execution(ExecutionError::SubmissionFailed(
                 "write_input requires an owned native graph input port".to_owned(),
             )));
-        }
-        self.locals[ordinal]
-            .as_ref()
-            .expect("planned owned input tensor is absent")
+        };
+        let upload = self.upload.as_ref().expect("planned upload region absent");
+        self.plan
+            .port_view(ordinal, upload, offset)
             .write_from_host(bytes)
     }
+
+    /// Check the run's external bindings and output lease. Nodes were
+    /// validated at seal; only bindings set after [`NativeGraphPlan::bind_static`]
+    /// are checked against their port here.
     pub fn attach(
         &mut self,
         bindings: NativeGraphBindings,
@@ -1141,61 +1253,53 @@ impl NativeGraphSlot {
                 WorkflowError::NativeOutputLeaseConsumed,
             ));
         }
-        let combined = self
-            .outputs
-            .iter()
-            .zip(&exports.outputs)
-            .map(|(scratch, retained)| {
-                scratch
-                    .iter()
-                    .zip(retained)
-                    .map(|(scratch, retained)| scratch.clone().or_else(|| retained.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let inputs = bindings
-            .inputs
+        let owned = [&self.workspace, &self.upload, &exports.arena]
             .into_iter()
-            .enumerate()
-            .map(|(port, tensor)| {
-                tensor
-                    .or_else(|| self.locals[port].clone())
-                    .or_else(|| exports.locals[port].clone())
-                    .ok_or(CallError::Workflow(WorkflowError::NativePortUnbound {
-                        port,
-                    }))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        for (ordinal, (tensor, spec)) in inputs.iter().zip(&self.plan.ports).enumerate() {
-            if !port_matches(&self.plan.device, spec, tensor) {
+            .flatten()
+            .map(|allocation| allocation.identity())
+            .collect::<Vec<_>>();
+        for (port, spec) in self.plan.ports.iter().enumerate() {
+            if spec.local {
+                continue;
+            }
+            let tensor = bindings.inputs[port]
+                .as_ref()
+                .ok_or(CallError::Workflow(WorkflowError::NativePortUnbound { port }))?;
+            // An external binding never names this run's own storage: the
+            // plan placed every graph buffer apart from external tensors.
+            if (!bindings.checked[port] && !port_matches(&self.plan.device, spec, tensor))
+                || owned.contains(&tensor.allocation().identity())
+            {
                 return Err(CallError::Workflow(WorkflowError::NativePortMismatch {
-                    port: ordinal,
+                    port,
                 }));
             }
         }
-        let mut bound = Vec::with_capacity(self.plan.nodes.len());
-        for (ordinal, node) in self.plan.nodes.iter().enumerate() {
-            let args = resolve_arguments(&node.args, &inputs, &combined, self.plan.identity)?;
-            let outputs = combined[ordinal]
-                .iter()
-                .filter_map(Clone::clone)
-                .collect::<Vec<_>>();
-            let scratch = self.plan.node_scratch[ordinal]
-                .iter()
-                .map(|offset| ScratchView {
-                    allocation: self
-                        .scratch
-                        .as_ref()
-                        .expect("planned node scratch arena absent")
-                        .clone(),
-                    offset: *offset,
-                })
-                .collect();
-            bound.push(Arc::new(node.kernel.inner.bind(args, outputs, scratch)?));
+        for (first, second) in &self.plan.executable.disjoint {
+            let range = |range: &PortRange| {
+                let tensor = bindings.inputs[range.port]
+                    .as_ref()
+                    .expect("every external port was bound above");
+                let start = tensor.byte_offset() + range.offset;
+                (tensor.allocation().identity(), start, start + range.bytes)
+            };
+            let (first_allocation, first_start, first_end) = range(first);
+            let (second_allocation, second_start, second_end) = range(second);
+            if first_allocation == second_allocation
+                && first.bytes != 0
+                && second.bytes != 0
+                && first_start < second_end
+                && second_start < first_end
+            {
+                return Err(CallError::Invocation(InvocationError::IllegalAliasing {
+                    first: first.parameter.clone(),
+                    second: second.parameter.clone(),
+                }));
+            }
         }
         Ok(ReadyNativeGraphRun {
-            _slot: self,
-            bound,
+            slot: self,
+            externals: bindings.inputs,
             exports,
         })
     }
@@ -1277,6 +1381,8 @@ pub struct NativeGraphBindings {
     identity: u64,
     inputs: Vec<Option<Arc<TensorInner>>>,
     external: Vec<bool>,
+    /// Ports whose binding was checked by `bind_static`.
+    checked: Vec<bool>,
 }
 
 impl NativeGraphBindings {
@@ -1313,23 +1419,192 @@ impl NativeGraphBindings {
 }
 
 pub struct ReadyNativeGraphRun<'a> {
-    _slot: &'a mut NativeGraphSlot,
-    bound: Vec<Arc<NativeBoundCall>>,
+    slot: &'a mut NativeGraphSlot,
+    /// The tensor of every external port (`None` for graph locals).
+    externals: Vec<Option<Arc<TensorInner>>>,
     exports: NativeGraphOutputs,
 }
 
 impl ReadyNativeGraphRun<'_> {
-    /// Submit the already checked attachments without waiting. Missing
-    /// ports, wrong extents, and illegal aliases cannot enter this method.
+    /// Submit the already checked attachments without waiting, as a
+    /// sequence of this one run. Missing ports, wrong extents, and illegal
+    /// aliases cannot enter this method.
     ///
     /// The returned outputs may be bound into later submissions at once;
     /// the device queue orders them. Host reads of exported tensors wait for
     /// this submission. The completion reports its outcome.
     pub fn submit(self) -> Result<(NativeGraphOutputs, NativeGraphCompletion), CallError> {
-        let submission = submit(&self.bound, 1)?;
+        let mut sequence = NativeGraphSequence::new(&self.slot.plan.device);
+        let outputs = self.queue(&mut sequence)?;
+        Ok((outputs, sequence.submit()?))
+    }
+
+    /// Append this run to `sequence`, which submits every run queued on it
+    /// as one unit of device work, in queue order. The returned outputs may
+    /// be bound into runs queued after it at once. The run's storage stays
+    /// held by the sequence until it is submitted; host access to it before
+    /// then does not wait for the queued work.
+    pub fn queue(self, sequence: &mut NativeGraphSequence) -> Result<NativeGraphOutputs, CallError> {
+        let plan = self.slot.plan.clone();
+        if !Arc::ptr_eq(&plan.device, &sequence.device) {
+            return Err(CallError::Workflow(WorkflowError::NativeGraphSlotMismatch));
+        }
+        let externals = self
+            .externals
+            .iter()
+            .map(|tensor| {
+                tensor
+                    .as_ref()
+                    .map(|tensor| (tensor.allocation().clone(), tensor.byte_offset()))
+            })
+            .collect::<Vec<_>>();
+        sequence.access.extend(
+            externals
+                .iter()
+                .zip(&plan.executable.external_writes)
+                .filter_map(|(binding, write)| {
+                    binding
+                        .as_ref()
+                        .map(|(allocation, _)| (allocation.clone(), *write))
+                })
+                .chain(self.slot.workspace.iter().map(|allocation| (allocation.clone(), true)))
+                .chain(
+                    self.slot
+                        .upload
+                        .iter()
+                        .map(|allocation| (allocation.clone(), plan.executable.upload_written)),
+                )
+                .chain(self.exports.arena.iter().map(|allocation| (allocation.clone(), true))),
+        );
+        sequence.runs.push(QueuedRun {
+            plan,
+            externals,
+            workspace: self.slot.workspace.clone(),
+            upload: self.slot.upload.clone(),
+            outputs: self.exports.arena.clone(),
+        });
         let mut exports = self.exports;
         exports.submitted = true;
-        Ok((exports, NativeGraphCompletion { submission }))
+        Ok(exports)
+    }
+}
+
+/// Attached graph runs queued for one submission: on Metal one command
+/// buffer, on CUDA one stream submission (one graph launch once seen). The
+/// device executes the runs in queue order, each after the previous one's
+/// writes, exactly as separately submitted runs; the sequence only removes
+/// the submission boundaries between them.
+///
+/// Runs hold their storage (not their tensor handles), so an output lease
+/// whose tensors a queued run reads may be recycled and bound again by a
+/// later run of the same sequence; the queue orders the reuse. An upload
+/// region a queued run reads is not idle until the sequence's work
+/// completes, so no later activation takes it.
+pub struct NativeGraphSequence {
+    device: Arc<DeviceInner>,
+    runs: Vec<QueuedRun>,
+    /// Every allocation the queued runs touch, with whether they write it.
+    access: Vec<(Arc<Allocation>, bool)>,
+}
+
+impl NativeGraphSequence {
+    pub fn new(device: &Arc<DeviceInner>) -> Self {
+        Self {
+            device: device.clone(),
+            runs: Vec::new(),
+            access: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    /// Submit every queued run without waiting. The completion reports the
+    /// outcome of all of them.
+    pub fn submit(self) -> Result<NativeGraphCompletion, CallError> {
+        let access = merge_access(self.access.iter().cloned());
+        let retained: Arc<dyn std::any::Any + Send + Sync> = Arc::new(
+            self.runs
+                .iter()
+                .map(|run| run.plan.clone())
+                .collect::<Vec<_>>(),
+        );
+        let nodes = self
+            .runs
+            .iter()
+            .enumerate()
+            .flat_map(|(run, queued)| {
+                (0..queued.plan.executable.nodes.len()).map(move |node| (run, node))
+            })
+            .collect::<Vec<_>>();
+        let list = SequenceList {
+            runs: &self.runs,
+            nodes,
+        };
+        let submission = submit(&list, &access, retained, 1)?;
+        Ok(NativeGraphCompletion { submission })
+    }
+}
+
+/// One queued run: its plan's sealed nodes over the storage it binds.
+struct QueuedRun {
+    plan: Arc<NativeGraphPlan>,
+    /// Per port, the allocation and byte offset of the bound tensor (`None`
+    /// for graph locals).
+    externals: Vec<Option<(Arc<Allocation>, u64)>>,
+    workspace: Option<Arc<Allocation>>,
+    upload: Option<Arc<Allocation>>,
+    outputs: Option<Arc<Allocation>>,
+}
+
+/// A sequence's runs as the encoder reads them: every node of every run.
+struct SequenceList<'a> {
+    runs: &'a [QueuedRun],
+    /// (run, node) of each dispatch, in order.
+    nodes: Vec<(usize, usize)>,
+}
+
+impl DispatchList for SequenceList<'_> {
+    fn count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn dispatch<'s>(
+        &'s self,
+        index: usize,
+        buffers: &mut Vec<(&'s Allocation, u64)>,
+    ) -> Dispatch<'s> {
+        let (run, node) = self.nodes[index];
+        let run = &self.runs[run];
+        let node = &run.plan.executable.nodes[node];
+        let region = |region: &'s Option<Arc<Allocation>>| {
+            &**region
+                .as_ref()
+                .expect("a planned graph storage region is present")
+        };
+        buffers.extend(node.sites.iter().map(|site| match site.region {
+            Region::External(port) => {
+                let (allocation, offset) = run.externals[port]
+                    .as_ref()
+                    .expect("attach bound every external port");
+                (&**allocation, offset + site.offset)
+            }
+            Region::Workspace => (region(&run.workspace), site.offset),
+            Region::Upload => (region(&run.upload), site.offset),
+            Region::Outputs => (region(&run.outputs), site.offset),
+        }));
+        Dispatch {
+            kernel: &node.kernel,
+            words: &node.words,
+            word_bytes: &node.word_bytes,
+            launches: &node.launches,
+            representations: &node.representations,
+        }
+    }
+
+    fn plans(&self) -> Option<Vec<u64>> {
+        Some(self.runs.iter().map(|run| run.plan.identity).collect())
     }
 }
 
@@ -1347,72 +1622,4 @@ impl NativeGraphCompletion {
     pub fn wait(self) -> Result<(), CallError> {
         self.submission.wait()
     }
-}
-
-fn resolve_arguments(
-    args: &EncodedWorkflowArgs,
-    inputs: &[Arc<TensorInner>],
-    outputs: &[Vec<Option<Arc<TensorInner>>>],
-    identity: u64,
-) -> Result<EncodedArgs, CallError> {
-    let mut resolved = EncodedArgs::new();
-    for argument in args.clone().into_arguments() {
-        match argument {
-            EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::External(_)) => {
-                return Err(CallError::Workflow(WorkflowError::NativePortMismatch {
-                    port: usize::MAX,
-                }));
-            }
-            EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::Result(reference)) => {
-                resolved.push_tensor(resolve_reference(reference, inputs, outputs, identity)?);
-            }
-            EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::ResultView {
-                result,
-                operations,
-            }) => {
-                let tensor = resolve_reference(result, inputs, outputs, identity)?;
-                let mut view = tensor;
-                for operation in operations {
-                    view = Arc::new(
-                        match operation {
-                            ViewOperation::LeadingSlice { start, end } => {
-                                view.slice_leading(start, end)
-                            }
-                            ViewOperation::Reshape { extents } => view.reshape(&extents),
-                        }
-                        .map_err(WorkflowError::TensorView)
-                        .map_err(CallError::Workflow)?,
-                    );
-                }
-                resolved.push_tensor(view);
-            }
-            EncodedWorkflowArgument::Scalar(value) => resolved.push_scalar(value),
-            EncodedWorkflowArgument::ScalarResult(_) => {
-                return Err(CallError::Workflow(WorkflowError::HostBoundaryRequired));
-            }
-        }
-    }
-    Ok(resolved)
-}
-
-fn resolve_reference(
-    reference: WorkflowResultRef,
-    inputs: &[Arc<TensorInner>],
-    outputs: &[Vec<Option<Arc<TensorInner>>>],
-    identity: u64,
-) -> Result<Arc<TensorInner>, CallError> {
-    if reference.workflow != identity {
-        return Err(CallError::Workflow(WorkflowError::CrossWorkflowResult));
-    }
-    if reference.node == INPUT_NODE {
-        return inputs
-            .get(reference.result as usize)
-            .cloned()
-            .ok_or(CallError::Workflow(WorkflowError::MissingProducerResult));
-    }
-    outputs
-        .get(reference.node as usize)
-        .and_then(|row| row.get(reference.result as usize))
-        .and_then(Clone::clone)
-        .ok_or(CallError::Workflow(WorkflowError::MissingProducerResult))
 }

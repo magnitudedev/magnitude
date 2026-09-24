@@ -3,12 +3,12 @@ use crate::{
     RecurrentBinding, RoutedBinding,
 };
 use magnitude_model_kernels::{
-    head_logits_rows, qwen_attention_attend, qwen_attention_normalize, qwen_attention_output,
-    qwen_attention_prepare, qwen_attention_project, qwen_dense_expand, qwen_dense_expand_demanded,
-    qwen_dense_output, qwen_dense_output_demanded, qwen_embedding_rows, qwen_features_rows,
-    qwen_recurrent_mix, qwen_recurrent_normalize, qwen_recurrent_output, qwen_recurrent_prepare,
-    qwen_recurrent_project, qwen_recurrent_scan, qwen_routed_expand, qwen_routed_logits,
-    qwen_routed_normalize, qwen_routed_output, qwen_routed_select, qwen_selected_rows,
+    qwen_attention_decode, qwen_attention_output, qwen_attention_prefill,
+    qwen_attention_project, qwen_dense_expand, qwen_dense_output, qwen_embedding_rows,
+    qwen_features_rows, qwen_head_rows,
+    qwen_recurrent_chunk, qwen_recurrent_output, qwen_recurrent_project, qwen_recurrent_step,
+    qwen_routed_combine, qwen_routed_expand,
+    qwen_routed_experts, qwen_routed_group, qwen_routed_output, qwen_routed_route, qwen_selected_rows,
 };
 use seismic::NativeKernel;
 use std::collections::HashMap;
@@ -26,27 +26,34 @@ pub struct TargetKernels {
     pub(super) selected: HashMap<ReadoutBinding, NativeKernel<qwen_selected_rows::Entry>>,
 }
 
+/// The target readout: final-norm features, and the head projection that
+/// normalizes its own rows.
 #[derive(Clone, Debug)]
 pub struct ReadoutKernels {
     pub features: NativeKernel<qwen_features_rows::Entry>,
-    pub logits: NativeKernel<head_logits_rows::Entry>,
+    pub head: NativeKernel<qwen_head_rows::Entry>,
 }
 
 #[derive(Clone, Debug)]
 pub struct RoutedKernels {
-    pub normalize: NativeKernel<qwen_routed_normalize::Entry>,
-    pub logits: NativeKernel<qwen_routed_logits::Entry>,
-    pub select: NativeKernel<qwen_routed_select::Entry>,
+    pub route: NativeKernel<qwen_routed_route::Entry>,
+    /// Decode form (row classes up to the GEMV bound).
     pub expand: NativeKernel<qwen_routed_expand::Entry>,
     pub output: NativeKernel<qwen_routed_output::Entry>,
+    /// Grouped form (larger row classes).
+    pub group: NativeKernel<qwen_routed_group::Entry>,
+    pub experts: NativeKernel<qwen_routed_experts::Entry>,
+    pub combine: NativeKernel<qwen_routed_combine::Entry>,
 }
 
+/// An attention block: normed Q/K/V projection, the fused attention entry
+/// (`decode` for decode row classes, `prefill` for the rest), output
+/// projection plus residual.
 #[derive(Clone, Debug)]
 pub struct AttentionKernels {
-    pub normalize: NativeKernel<qwen_attention_normalize::Entry>,
     pub project: NativeKernel<qwen_attention_project::Entry>,
-    pub prepare: NativeKernel<qwen_attention_prepare::Entry>,
-    pub attend: NativeKernel<qwen_attention_attend::Entry>,
+    pub decode: NativeKernel<qwen_attention_decode::Entry>,
+    pub prefill: NativeKernel<qwen_attention_prefill::Entry>,
     pub output: NativeKernel<qwen_attention_output::Entry>,
 }
 
@@ -54,16 +61,14 @@ pub struct AttentionKernels {
 pub struct DenseKernels {
     pub expand: NativeKernel<qwen_dense_expand::Entry>,
     pub output: NativeKernel<qwen_dense_output::Entry>,
-    pub expand_demanded: NativeKernel<qwen_dense_expand_demanded::Entry>,
-    pub output_demanded: NativeKernel<qwen_dense_output_demanded::Entry>,
 }
 
+/// A recurrent block: normed projection, the state advance (row-sequential
+/// `step` for small row classes, chunked for the rest), gated output.
 #[derive(Clone, Debug)]
 pub struct RecurrentKernels {
-    pub normalize: NativeKernel<qwen_recurrent_normalize::Entry>,
     pub project: NativeKernel<qwen_recurrent_project::Entry>,
-    pub prepare: NativeKernel<qwen_recurrent_prepare::Entry>,
-    pub scan: NativeKernel<qwen_recurrent_scan::Entry>,
-    pub mix: NativeKernel<qwen_recurrent_mix::Entry>,
+    pub step: NativeKernel<qwen_recurrent_step::Entry>,
+    pub chunk: NativeKernel<qwen_recurrent_chunk::Entry>,
     pub output: NativeKernel<qwen_recurrent_output::Entry>,
 }

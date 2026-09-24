@@ -1,0 +1,74 @@
+# CUDA implementations of the routed entries declared in `routed.seismic`
+# (K1 projection family, `cuda/common/projection.cuh`). Decode entries run
+# the swap-AB GEMV (TPW tiles per warp group; KSPLIT splits K across the
+# warps of a group and reduces in part order); grouped entries run the
+# staged GEMM.
+
+native qwen_routed_route for cuda from "cuda/qwen_routed_route.cu":
+    static (H, E, K)
+    params (SIMDGROUPS in [8, 4, 2])
+    where H % 32 == 0 and E % 32 == 0 and E <= 1024
+    scratch logits bytes (M * (E + 1) * 4)
+    launch qwen_routed_normalize:
+        threadgroups (min(M / 9, 1) * M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch qwen_routed_logits_gemv:
+        threadgroups ((1 - min(M / 9, 1)) * ceil_div(E + 1, SIMDGROUPS), 1, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+    launch qwen_routed_logits_gemm:
+        threadgroups (min(M / 9, 1) * ceil_div(E + 1, 32), ceil_div(M, 32), 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch qwen_routed_select:
+        threadgroups (ceil_div(M, 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native qwen_routed_expand for cuda from "cuda/qwen_routed_expand.cu":
+    static (H, K, F, S)
+    params (TPW in [1, 2], arithmetic KSPLIT in [1, 2, 4])
+    launch qwen_routed_expand:
+        threadgroups (ceil_div(ceil_div(ceil_div(max(F, S), 16), TPW), 4 / KSPLIT), M * K + 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+
+native qwen_routed_output for cuda from "cuda/qwen_routed_output.cu":
+    static (H, K, F, S)
+    params (TPW in [1, 2], arithmetic KSPLIT in [1, 2, 4])
+    launch qwen_routed_output:
+        threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M, 1)
+        threads_per_threadgroup (128, 1, 1)
+
+native qwen_routed_group for cuda from "cuda/qwen_routed_group.cu":
+    static (E, K)
+    params (PARTS in [1, 2, 4])
+    where E * PARTS <= 1024
+    launch qwen_routed_group:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (E * PARTS, 1, 1)
+        shared_bytes (E * PARTS * 4 + E * 4 + 16)
+
+native qwen_routed_experts for cuda from "cuda/qwen_routed_experts.cu":
+    static (H, F)
+    scratch staged bytes (B * T * H * 2)
+    scratch product bytes (B * T * F * 2)
+    launch qwen_routed_experts_gather:
+        threadgroups (B * T, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch qwen_routed_experts_expand:
+        threadgroups (ceil_div(ceil_div(F, 16), 8), ceil_div(T, 32), B)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (3 * (32 * 144 + 2 * 10240) + 2 * 4096)
+    launch qwen_routed_experts_down:
+        threadgroups (ceil_div(ceil_div(H, 16), 8), ceil_div(T, 32), B)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (3 * (32 * 144 + 10240) + 4096)
+
+native qwen_routed_combine for cuda from "cuda/qwen_routed_combine.cu":
+    static (H, K, S)
+    scratch shared_product bytes (M * S * 2)
+    launch qwen_routed_combine_shared:
+        threadgroups (ceil_div(ceil_div(S, 16), 8), ceil_div(M, 64), 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (3 * (64 * 144 + 2 * 10240) + 2 * 4096)
+    launch qwen_routed_combine:
+        threadgroups (ceil_div(ceil_div(H, 16), 8), ceil_div(M, 64), 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (3 * (64 * 144 + 10240) + 4096)

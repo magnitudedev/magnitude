@@ -1,0 +1,28 @@
+# CUDA implementations of the draft head entries declared in
+# `head_rows.seismic`: the draft input row and the head's vocabulary
+# projection (K1 projection family, `cuda/common/projection.cuh`).
+
+# Packed tables and combine weights decode whole 64-column k-blocks (every
+# k-quant row is a multiple of 256 columns).
+native qwen_draft_rows for cuda from "cuda/qwen_draft_rows.cu":
+    launch qwen_draft_rows:
+        threadgroups (ceil_div(D, 32), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (8 * D)
+
+native head_logits_rows for cuda from "cuda/head_logits_rows.cu":
+    static (V, D)
+    params (arithmetic KSPLIT in [4, 2, 8], BM in [64, 128], arithmetic INT8 in [0, 1])
+    where D % 64 == 0
+    scratch staged bytes (INT8 * O * D)
+    scratch groups bytes (INT8 * O * D / 4)
+    launch head_logits_rows_stage:
+        threadgroups (INT8 * O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch head_logits_rows_gemv:
+        threadgroups (min(1, 16 / (O + 8)) * ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch head_logits_rows_gemm:
+        threadgroups ((1 - min(1, 16 / (O + 8))) * ceil_div(ceil_div(V, 16), 8), ceil_div(O, BM), 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((4 - BM / 64) * (BM * (144 - 48 * INT8) + 10240) + 4096)

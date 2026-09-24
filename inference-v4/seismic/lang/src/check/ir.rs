@@ -152,7 +152,6 @@ pub(crate) struct Definition {
     pub initialization: InitializationContract,
     /// The admissible bindings of each element parameter.
     pub element_domain: ElementDomain,
-    pub placement: Placement,
     /// The one arena of every extent, bound and symbolic value above.
     pub arena: ExprArena,
     /// Index into the module's source files.

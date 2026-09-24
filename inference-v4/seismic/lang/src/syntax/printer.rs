@@ -96,23 +96,31 @@ impl Printer {
                     });
                     self.out.push_str(")\n");
                 }
-                if !n.constraints.is_empty() {
+                if let Some(constraint) = &n.constraint {
                     self.indent();
-                    for (i, constraint) in n.constraints.iter().enumerate() {
-                        self.out.push_str(if i == 0 { "where " } else { " and " });
-                        self.expr(constraint, binary_bp(BinaryOp::And));
-                    }
+                    self.out.push_str("where ");
+                    self.expr(constraint, 0);
                     self.out.push('\n');
                 }
                 for scratch in &n.scratch {
                     self.indent();
                     let _ = write!(self.out, "scratch {} bytes (", scratch.name.name);
                     self.expr(&scratch.bytes, 0);
-                    self.out.push_str(")\n");
+                    self.out.push(')');
+                    if let Some(when) = &scratch.when {
+                        self.out.push_str(" when ");
+                        self.expr(when, 0);
+                    }
+                    self.out.push('\n');
                 }
                 for launch in &n.launches {
                     self.indent();
-                    let _ = writeln!(self.out, "launch {}:", launch.kernel.name);
+                    let _ = write!(self.out, "launch {}", launch.kernel.name);
+                    if let Some(when) = &launch.when {
+                        self.out.push_str(" when ");
+                        self.expr(when, 0);
+                    }
+                    self.out.push_str(":\n");
                     self.level += 1;
                     self.indent();
                     self.out.push_str("threadgroups (");

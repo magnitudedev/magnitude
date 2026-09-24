@@ -2,7 +2,7 @@ use super::super::*;
 use super::*;
 
 impl<'a> QualificationView<'a> {
-    pub(super) fn qualify_vision(&self, device: &Device) -> Result<(), CatalogError> {
+    pub(super) fn qualify_vision(&self, device: &Device) -> Result<(), CatalogFailure> {
         let (Some(vision_plan), Some(vision)) = (self.plan.vision(), self.programs.vision.as_ref())
         else {
             return Ok(());

@@ -108,7 +108,7 @@ impl BackendSet {
         match backend {
             BackendName::Cpu => self.cpu,
             BackendName::Metal => self.metal,
-            BackendName::Cuda => false,
+            BackendName::Cuda | BackendName::Vulkan => false,
         }
     }
 }
@@ -726,6 +726,17 @@ fn check_fill(element: &str, shape: &[u64], fill: &Fill) -> Result<(), String> {
                 Fill::Zero | Fill::Uniform { .. } | Fill::Bits { .. } => Ok(()),
                 Fill::Sequence | Fill::Values(_) => Err(format!(
                     "`seq` and literal fills are not defined for the packed element `{element}`"
+                )),
+            };
+        }
+        // A row layout places packet planes per row at tensor-dependent
+        // offsets, so bounded random values (`uniform`) are not defined
+        // bytewise; its bytes are zero or random.
+        RepresentationKind::PackedRows(_) => {
+            return match fill {
+                Fill::Zero | Fill::Bits { .. } => Ok(()),
+                Fill::Uniform { .. } | Fill::Sequence | Fill::Values(_) => Err(format!(
+                    "only `zero` and `bits` fills are defined for the row-layout element `{element}`"
                 )),
             };
         }

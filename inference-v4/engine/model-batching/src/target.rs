@@ -1,6 +1,7 @@
 //! Opaque, device-independent target row semantics.
 
-use crate::{ControlOffsets, LaunchClass, PackError, PackedRowTables, Slot};
+use crate::{LaunchClass, PackError, PackedRowTables, Slot};
+use std::sync::Arc;
 
 /// The packed controls and their row mapping are validated together once.
 /// Device leases and state transactions are joined by the executor later.
@@ -32,21 +33,12 @@ impl ValidatedTargetBatch {
         self.packed.actual_slots
     }
 
-    /// One immutable upload image; programs never join independent controls.
-    pub fn controls(&self) -> &[u32] {
-        &self.packed.control
-    }
-
     pub fn demand_bits(&self) -> &[u32] {
         &self.packed.demand[..self.packed.actual_rows]
     }
 
-    pub fn offsets(&self) -> ControlOffsets {
-        self.packed.offsets
-    }
-
-    /// The validated physical upload image. These fields are borrowed from
-    /// the same packed batch so programs cannot recombine unrelated row plans.
+    /// The validated physical row tables. These fields are borrowed from the
+    /// same packed batch so programs cannot recombine unrelated row plans.
     pub fn upload(&self) -> TargetBatchUpload<'_> {
         let packed = &self.packed;
         TargetBatchUpload {
@@ -64,6 +56,7 @@ impl ValidatedTargetBatch {
             demand: &packed.demand,
             segments: &packed.segments,
             bank: &packed.bank,
+            following_bank: &packed.following_bank,
             plane_base: &packed.plane_base,
             out_rows: &packed.out_rows,
             select_rows: &packed.select_rows,
@@ -72,8 +65,6 @@ impl ValidatedTargetBatch {
             masks: &packed.masks,
             shaping: &packed.shaping,
             history: &packed.history,
-            control: &packed.control,
-            offsets: packed.offsets,
         }
     }
 
@@ -86,6 +77,7 @@ impl ValidatedTargetBatch {
         let end = usize::try_from(end).ok()?;
         Some(TargetBatchSlot {
             bank: self.packed.bank[index],
+            following_bank: self.packed.following_bank[index],
             destinations: &self.packed.destinations[start..end],
             visible: &self.packed.visible[start..end],
         })
@@ -114,20 +106,20 @@ pub struct TargetBatchUpload<'a> {
     pub demand: &'a [u32],
     pub segments: &'a [[i32; 2]],
     pub bank: &'a [i32],
+    pub following_bank: &'a [i32],
     pub plane_base: &'a [i32],
     pub out_rows: &'a [i32],
     pub select_rows: &'a [i32],
     pub draws: &'a [[u32; 6]],
     pub mask_rows: &'a [i32],
-    pub masks: &'a [Vec<u32>],
+    pub masks: &'a [Arc<[u32]>],
     pub shaping: &'a [[f32; crate::SHAPING_WIDTH]],
     pub history: &'a [[i32; crate::HISTORY_WIDTH]],
-    pub control: &'a [u32],
-    pub offsets: ControlOffsets,
 }
 
 pub struct TargetBatchSlot<'a> {
     bank: i32,
+    following_bank: i32,
     destinations: &'a [i32],
     visible: &'a [Vec<[i32; 2]>],
 }
@@ -135,6 +127,10 @@ pub struct TargetBatchSlot<'a> {
 impl TargetBatchSlot<'_> {
     pub fn bank(&self) -> i32 {
         self.bank
+    }
+
+    pub fn following_bank(&self) -> i32 {
+        self.following_bank
     }
 
     pub fn rows(&self) -> usize {
@@ -160,6 +156,7 @@ mod tests {
         let batch = ValidatedTargetBatch::from_slots(
             &[Slot {
                 bank: 2,
+                following_bank: 3,
                 rows: vec![Row {
                     token: 7,
                     coordinates: [1, 1, 1, 0],
@@ -175,9 +172,9 @@ mod tests {
         .unwrap();
         assert_eq!(batch.actual_rows(), 1);
         assert_eq!(batch.actual_slots(), 1);
-        assert!(!batch.controls().is_empty());
         let slot = batch.slot(0).unwrap();
         assert_eq!(slot.bank(), 2);
+        assert_eq!(slot.following_bank(), 3);
         assert_eq!(slot.destinations(), &[3]);
         assert!(batch.slot(1).is_none());
     }

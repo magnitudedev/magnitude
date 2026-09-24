@@ -17,6 +17,21 @@ pub mod value;
 pub use tensor::{round_to, TensorData};
 pub use value::Value;
 
+/// Host reference of a registered representation conversion: the canonical
+/// destination bytes of `conversion` applied to the canonical source bytes of
+/// a tensor of `shape` (recipe into the packet form, then the destination
+/// layout's placement). `None` when `source` is not exactly the canonical
+/// byte count of the conversion's source over `shape`.
+pub fn repack(
+    conversion: crate::ids::RepresentationConversionId,
+    shape: &[usize],
+    source: &[u8],
+) -> Option<Vec<u8>> {
+    let source_representation = crate::registry::representation_conversion_info(conversion).source;
+    TensorData::encoded(source_representation, shape.to_vec(), source.to_vec()).ok()?;
+    Some(oracle::repack_bytes(conversion, shape, source))
+}
+
 use crate::entry::{AssociationOutcome, LogicalEntry, LogicalEntryView};
 use crate::failure::{SourceFailure, SourceFailureCause, SourceTermination};
 use crate::ids::NodeId;

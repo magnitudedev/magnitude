@@ -27,3 +27,12 @@ seismic.workspace = true
 opentelemetry = "0.33.0"
 opentelemetry_sdk = "0.33.0"
 opentelemetry-otlp = { version = "0.33.0", features = ["http-json", "reqwest"] }
+
+[features]
+# Development-only: lets the `forward_bench` example record tuned
+# configurations and replay them in a later run (bit-exact comparisons).
+# The served `magnitude-engine` binary never installs a pin.
+pinned-tuning = ["magnitude-model-executor/pinned-tuning"]
+# Development-only: lets the `forward_bench` example survey every admissible
+# tuning configuration (`--tuning-survey DIR`) for replaying the search.
+tuning-survey = ["magnitude-model-executor/tuning-survey"]

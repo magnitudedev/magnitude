@@ -15,8 +15,6 @@ use crate::target::PhysicalDialect;
 
 pub mod ops;
 mod representation;
-mod vector;
-pub use vector::VectorId;
 
 // ---------------------------------------------------------------------------
 // Handles
@@ -117,9 +115,6 @@ pub struct KernelArena<B: PhysicalDialect> {
 }
 
 impl<B: PhysicalDialect> KernelArena<B> {
-    pub(crate) fn get(&self, id: KernelId) -> Option<&Kernel<B>> {
-        self.inner.get(id)
-    }
     pub fn retained_bytes(&self) -> usize {
         self.inner.retained_bytes()
     }

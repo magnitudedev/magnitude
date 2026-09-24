@@ -11,13 +11,13 @@ use magnitude_chat::{
 use magnitude_model_contracts::{
     ModelDefinition, ModelInputAdapter, PreparedModelInput, TokenPlan,
 };
-use magnitude_model_executor::ExecutionPath;
+use magnitude_model_executor::{platform::DeviceRequest, ExecutionPath};
 use magnitude_model_qwen35::{
     inputs::{QwenImageTokens, QwenInputAdapter},
     inspect_package,
 };
 use magnitude_service::ServiceLimits;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::{rc::Rc, sync::Arc};
 
 use crate::options::{
@@ -131,7 +131,14 @@ pub struct EngineConfiguration {
     pub service: ServiceLimits,
     pub storage: StoragePolicy,
     pub path: ExecutionPath,
+    /// The device the numerical worker opens; the native path runs on its
+    /// backend.
+    pub device: DeviceRequest,
     pub control_capacity: usize,
+    /// The directory the host keeps formed kernels and tuning results in
+    /// (`--cache-dir`; ACN names `<dataDir>/cache/kernels`). `None` caches
+    /// nothing: every load forms and tunes every entry.
+    pub kernel_cache: Option<PathBuf>,
 }
 
 /// The two authorities produced by host resolution: local chat artifacts stay
@@ -251,11 +258,11 @@ impl EngineConfiguration {
             artifacts.definition.geometry.context_limit,
         )?;
         let model = self.model.resolve(artifacts.definition())?;
-        if self.path == ExecutionPath::NativeMetal
+        if self.path == ExecutionPath::Native
             && model.kv_codec != magnitude_model_state::KvCodec::Dense
         {
             return Err(format!(
-                "native Metal bootstrap supports only the dense KV codec; requested {}",
+                "the native path supports only the dense KV codec; requested {}",
                 model.kv_codec.identity()
             ));
         }
@@ -267,6 +274,8 @@ impl EngineConfiguration {
             self.service,
             storage,
             self.path,
+            self.device,
+            self.kernel_cache,
         )?;
         Ok(ResolvedEngineConfiguration {
             artifacts,

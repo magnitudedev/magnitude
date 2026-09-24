@@ -2746,8 +2746,9 @@ impl AtomicCapability {
 }
 
 /// Authority for a future explicit semantic barrier. No current source form
-/// constructs one; keeping the constructor private prevents an intrinsic from
-/// acquiring barrier semantics by convention.
+/// constructs one, and it has no constructor: a checked source form that
+/// introduces barrier semantics adds one, so no intrinsic acquires barrier
+/// semantics by convention.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BarrierCapability {
     cohort: ParticipantDomain,
@@ -2755,9 +2756,6 @@ pub struct BarrierCapability {
 }
 
 impl BarrierCapability {
-    pub(crate) fn checked(cohort: ParticipantDomain, visibility: VisibilityScope) -> Self {
-        Self { cohort, visibility }
-    }
     pub fn cohort(&self) -> &ParticipantDomain {
         &self.cohort
     }

@@ -251,7 +251,8 @@ fn matrix_operand_dtype(category: &OperandCategory) -> Option<DType> {
             match info.kind {
                 registry::RepresentationKind::Dense(dtype) => Some(dtype),
                 registry::RepresentationKind::Packed(_) => Some(info.decoded),
-                registry::RepresentationKind::External(_) => None,
+                registry::RepresentationKind::PackedRows(_)
+                | registry::RepresentationKind::External(_) => None,
             }
         }
         _ => None,
@@ -265,9 +266,9 @@ fn matrix_result_dtype(signature: &IntrinsicSignature) -> Option<DType> {
             axes,
         } if axes.len() == 2 => match registry::representation_info(representation).kind {
             registry::RepresentationKind::Dense(dtype) => Some(dtype),
-            registry::RepresentationKind::Packed(_) | registry::RepresentationKind::External(_) => {
-                None
-            }
+            registry::RepresentationKind::Packed(_)
+            | registry::RepresentationKind::PackedRows(_)
+            | registry::RepresentationKind::External(_) => None,
         },
         _ => None,
     }

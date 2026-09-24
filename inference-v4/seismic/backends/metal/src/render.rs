@@ -208,7 +208,6 @@ enum LocalStorage {
 struct LocalPlace {
     storage: LocalStorage,
     dtype: DType,
-    geometry: seismic_ir::target::RepresentationGeometry,
     strides: Vec<String>,
 }
 
@@ -290,8 +289,7 @@ impl<'a> Renderer<'a> {
         }
         let mut locals = Vec::new();
         for (index, local) in kernel.locals().iter().enumerate() {
-            let geometry = shape.locals[index].geometry.clone();
-            let dtype = geometry.info.decoded;
+            let dtype = shape.locals[index].geometry.info.decoded;
             let strides: Vec<String> = (0..local.extents.len())
                 .map(|axis| format!("seismic_ls{index}_{axis}"))
                 .collect();
@@ -309,7 +307,6 @@ impl<'a> Renderer<'a> {
             locals.push(LocalPlace {
                 storage,
                 dtype,
-                geometry,
                 strides,
             });
         }
@@ -374,6 +371,9 @@ impl<'a> Renderer<'a> {
                 RepresentationKind::Dense(dtype) => dtype_name(dtype),
                 RepresentationKind::Packed(_) => "uchar",
                 RepresentationKind::External(_) => "uchar",
+                RepresentationKind::PackedRows(_) => {
+                    panic!("{}", seismic_lang::registry::ROW_LAYOUT_IS_NATIVE_ONLY)
+                }
             };
             body.push(format!(
                 "{access} {ty}* {p} = reinterpret_cast<{access} {ty}*>({b});",
@@ -512,6 +512,10 @@ impl<'a> Renderer<'a> {
                                 RepresentationKind::External(layout) => {
                                     format!("(ulong({coord}) / {}ul)", layout.logical_group)
                                 }
+                                RepresentationKind::PackedRows(_) => panic!(
+                                    "{}",
+                                    seismic_lang::registry::ROW_LAYOUT_IS_NATIVE_ONLY
+                                ),
                             }
                         } else {
                             format!("ulong({coord})")
@@ -527,6 +531,9 @@ impl<'a> Renderer<'a> {
                     }
                     RepresentationKind::External(layout) => {
                         format!("({units}) * {}ul", layout.packet_size)
+                    }
+                    RepresentationKind::PackedRows(_) => {
+                        panic!("{}", seismic_lang::registry::ROW_LAYOUT_IS_NATIVE_ONLY)
                     }
                 };
                 (global.pointer.clone(), address)
@@ -564,6 +571,10 @@ impl<'a> Renderer<'a> {
                                 RepresentationKind::External(layout) => {
                                     format!("(ulong({coord}) / {}ul)", layout.logical_group)
                                 }
+                                RepresentationKind::PackedRows(_) => panic!(
+                                    "{}",
+                                    seismic_lang::registry::ROW_LAYOUT_IS_NATIVE_ONLY
+                                ),
                                 RepresentationKind::Dense(_) => format!("ulong({coord})"),
                             }
                         } else {
@@ -580,6 +591,9 @@ impl<'a> Renderer<'a> {
                     }
                     RepresentationKind::External(layout) => {
                         format!("({units}) * {}ul", layout.packet_size)
+                    }
+                    RepresentationKind::PackedRows(_) => {
+                        panic!("{}", seismic_lang::registry::ROW_LAYOUT_IS_NATIVE_ONLY)
                     }
                 };
                 (global.pointer.clone(), address)
@@ -785,6 +799,9 @@ impl<'a> Renderer<'a> {
             }
             RepresentationKind::External(_) => {
                 panic!("external packets are consumed only by registered conversion ops")
+            }
+            RepresentationKind::PackedRows(_) => {
+                panic!("{}", seismic_lang::registry::ROW_LAYOUT_IS_NATIVE_ONLY)
             }
         }
     }

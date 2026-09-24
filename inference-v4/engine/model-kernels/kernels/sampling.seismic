@@ -1,8 +1,7 @@
 # Per-row sampling shaping. Penalties, temperature, top-k, min-p, and top-p
 # are deliberately staged in specification order. Equal top-k cutoff values
 # are all retained; top-p ties use ascending token index as the stable order.
-# The portable body is the semantic oracle. The Metal entry performs the same
-# stages cooperatively, using radix selection rather than vocabulary-pair scans.
+# The portable body is the semantic oracle.
 fn shape_rows[Sx, V, Hn](logits: &tensor[Sx, V] f32,
     params: &tensor[Sx, 8] f32, history: &tensor[Sx, Hn] i32,
     out: &mut tensor[Sx, V] f32):
@@ -65,12 +64,110 @@ fn shape_rows[Sx, V, Hn](logits: &tensor[Sx, V] f32,
                 if top_p < 1.0 and preceding >= top_p:
                     out[row, token] = -inf
 
+# Native Metal: the vocabulary of each row is split into PARTS contiguous
+# partitions. prepare applies penalties and temperature; three count/select
+# rounds of an order-preserving-key radix select (11/11/10-bit digits) find
+# the top-k threshold, three more the top-p cutoff over the top-k and min-p
+# survivors (masses exp(v - max) in 64-bit fixed point, so decisions do not
+# depend on PARTS); ties counts the cutoff key's survivors per partition for
+# the ascending-index tie rule; apply writes -inf over removed tokens.
 native shape_rows for metal from "metal/shape_rows.metal":
-    launch shape_rows:
+    params (PARTS in [64, 32, 128])
+    scratch state bytes (Sx * 64)
+    scratch partials bytes (Sx * PARTS * 12)
+    scratch histogram bytes (Sx * 2048 * 12)
+    launch shape_rows_prepare:
+        threadgroups (PARTS, Sx, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch shape_rows_count:
+        threadgroups (PARTS, Sx, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch shape_rows_select:
         threadgroups (Sx, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-
-native sample_rows for metal from "metal/sample_rows.metal":
-    launch sample_rows:
-        threadgroups (M, 1, 1)
+    launch shape_rows_count:
+        threadgroups (PARTS, Sx, 1)
         threads_per_threadgroup (256, 1, 1)
+    launch shape_rows_select:
+        threadgroups (Sx, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch shape_rows_count:
+        threadgroups (PARTS, Sx, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch shape_rows_select:
+        threadgroups (Sx, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch shape_rows_count:
+        threadgroups (PARTS, Sx, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch shape_rows_select:
+        threadgroups (Sx, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch shape_rows_count:
+        threadgroups (PARTS, Sx, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch shape_rows_select:
+        threadgroups (Sx, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch shape_rows_count:
+        threadgroups (PARTS, Sx, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch shape_rows_select:
+        threadgroups (Sx, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch shape_rows_ties:
+        threadgroups (PARTS, Sx, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch shape_rows_apply:
+        threadgroups (PARTS, Sx, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# Native CUDA: each row's vocabulary is split into PARTS contiguous slices.
+# prepare applies penalties and temperature; select finds both cutoffs in one
+# 1024-thread block per row with order-independent integer sums; apply writes
+# -inf over removed tokens. The result is independent of PARTS and WIDTH.
+# Differs from Metal: 3 launches (Metal selects over 6 count/select rounds
+# plus a ties launch, 5 stages); both follow the same contract bit for bit.
+native shape_rows for cuda from "cuda/shape_rows.cu":
+    static (V, Hn)
+    params (PARTS in [64, 128, 32], WIDTH in [256, 512])
+    scratch state bytes (Sx * (PARTS + 8) * 4)
+    launch shape_rows_prepare:
+        threadgroups (PARTS, Sx, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)
+        shared_bytes (Hn * 4)
+    launch shape_rows_select:
+        threadgroups (Sx, 1, 1)
+        threads_per_threadgroup (1024, 1, 1)
+    launch shape_rows_apply:
+        threadgroups (PARTS, Sx, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)
+
+# `sample_rows` (portable body in seismic-std).
+# Native Metal: L1 scans PARTS contiguous vocabulary slices per row and keeps
+# (score bits, token, invalid); L2 merges them per row. The maximum score
+# wins, ties go to the lowest token, and the winning bits are carried
+# unchanged, so the result does not depend on PARTS.
+native sample_rows for metal from "metal/sample_rows.metal":
+    params (PARTS in [64, 32, 128])
+    scratch partials bytes (M * PARTS * 12)
+    launch sample_rows_partition:
+        threadgroups (PARTS, M, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch sample_rows_merge:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+
+# Native CUDA: the same two stages; the merge runs one thread per row (32
+# rows per block) and combines the slice winners in slice order, so the
+# result is independent of PARTS and WIDTH.
+native sample_rows for cuda from "cuda/sample_rows.cu":
+    static (V)
+    params (PARTS in [32, 64, 128, 16], WIDTH in [256, 512])
+    scratch partials bytes (M * PARTS * 12)
+    launch sample_rows_partition:
+        threadgroups (PARTS, M, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)
+    launch sample_rows_merge:
+        threadgroups (ceil_div(M, 32), 1, 1)
+        threads_per_threadgroup (32, 1, 1)

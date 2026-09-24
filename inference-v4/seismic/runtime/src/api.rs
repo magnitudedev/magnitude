@@ -38,6 +38,9 @@ pub enum WorkflowError {
     NativeGraphSlotMismatch,
     NativeOutputLeaseConsumed,
     NativeExportStillLive,
+    /// Every upload region a family slot was created with is still read by
+    /// a submission in flight; a slot never grows its regions after sealing.
+    UploadRegionsExhausted { regions: usize },
 }
 impl fmt::Display for WorkflowError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -80,6 +83,10 @@ impl fmt::Display for CallError {
             Self::Workflow(WorkflowError::NativeExportStillLive) => {
                 f.write_str("native graph export is still retained")
             }
+            Self::Workflow(WorkflowError::UploadRegionsExhausted { regions }) => write!(
+                f,
+                "all {regions} upload regions of the native graph slot are in flight"
+            ),
         }
     }
 }
@@ -131,6 +138,19 @@ pub enum TensorError {
         start: u64,
         end: u64,
     },
+    /// A row-layout view may select whole rows only: never its packing axis,
+    /// and on an `mma16` row axis only whole 16-row tiles.
+    UnalignedRowSlice {
+        representation: &'static str,
+        start: u64,
+        end: u64,
+    },
+    /// A row-layout reshape must keep the packing axis (and the `mma16` row
+    /// axis) whose extents define its row geometry.
+    RowLayoutReshape {
+        representation: &'static str,
+        extents: Vec<u64>,
+    },
     ReshapeStorage {
         current_bytes: u64,
         requested_bytes: u64,
@@ -162,6 +182,21 @@ impl fmt::Display for TensorError {
             Self::UnalignedPacketSlice { group, start, end } => write!(
                 f,
                 "packed slice {start}..{end} is not aligned to packet group {group}"
+            ),
+            Self::UnalignedRowSlice {
+                representation,
+                start,
+                end,
+            } => write!(
+                f,
+                "`{representation}` slice {start}..{end} does not select whole rows or row tiles"
+            ),
+            Self::RowLayoutReshape {
+                representation,
+                extents,
+            } => write!(
+                f,
+                "reshape to {extents:?} changes the row geometry of `{representation}` storage"
             ),
             Self::ReshapeStorage {
                 current_bytes,
@@ -200,8 +235,20 @@ pub mod device {
         pub(crate) info: DeviceInfo,
         pub(crate) capabilities: std::sync::OnceLock<Vec<String>>,
         pub(crate) kind: OpenedKind,
+        /// The active submission trace, if any (`native::trace`).
+        pub(crate) trace: std::sync::Mutex<Option<Arc<crate::native::trace::TraceSink>>>,
+        /// Where formed native artifacts are looked up and kept.
+        pub(crate) artifacts: Option<Arc<dyn crate::artifacts::ArtifactStore>>,
+        /// Native submission order and CUDA graph replays.
+        pub(crate) native: crate::native::NativeQueue,
     }
     impl DeviceInner {
+        pub(crate) fn active_trace(&self) -> Option<Arc<crate::native::trace::TraceSink>> {
+            self.trace
+                .lock()
+                .expect("trace slot lock is never poisoned")
+                .clone()
+        }
         pub fn info(&self) -> &DeviceInfo {
             &self.info
         }
@@ -216,6 +263,15 @@ pub mod device {
             alignment: u64,
         ) -> Result<Arc<Allocation>, ExecutionError> {
             self.kind.allocate(bytes, alignment)
+        }
+        /// Storage the host fills before each submission; see
+        /// `OpenedKind::allocate_upload`.
+        pub(crate) fn allocate_upload(
+            self: &Arc<Self>,
+            bytes: u64,
+            alignment: u64,
+        ) -> Result<Arc<Allocation>, ExecutionError> {
+            self.kind.allocate_upload(bytes, alignment)
         }
         /// Stable key of this device's model and configuration for native
         /// tuning records: its name and the backend facts that shape

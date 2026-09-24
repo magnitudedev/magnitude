@@ -217,7 +217,7 @@ pub(crate) fn fill_constant_for(
 ) -> crate::schedule::FillValue {
     let dtype = match registry::representation_info(representation).kind {
         registry::RepresentationKind::Dense(dtype) => dtype,
-        registry::RepresentationKind::Packed(_) => {
+        registry::RepresentationKind::Packed(_) | registry::RepresentationKind::PackedRows(_) => {
             panic!("decode-only packed representation has no fill contract")
         }
         registry::RepresentationKind::External(_) => {
@@ -235,18 +235,26 @@ pub(crate) fn fill_constant_for(
     }
 }
 
-/// A registered element representation, at the type level.
+/// A registered element storage at the type level: the pair
+/// (representation, layout).
 pub trait Representation: 'static + Copy + fmt::Debug + Send + Sync + sealed::Sealed {
-    /// Registry name.
+    /// Registry name of the logical representation.
     const NAME: &'static str;
+    /// The storage layout (`Packet` for dense storage).
+    const LAYOUT: registry::Layout;
     /// The dtype a read of one element produces.
     type Element: VectorElement;
-    /// Number of physical planes (1 for dense).
+    /// Number of physical planes of this storage (1 for dense).
     const PLANES: u32;
 
     fn id() -> RepresentationId {
-        registry::representation(Self::NAME)
-            .unwrap_or_else(|| panic!("registry has no representation `{}`", Self::NAME))
+        registry::storage(Self::NAME, Self::LAYOUT).unwrap_or_else(|| {
+            panic!(
+                "registry has no `{}` storage in layout `{}`",
+                Self::NAME,
+                Self::LAYOUT.as_str()
+            )
+        })
     }
 }
 
@@ -257,11 +265,15 @@ pub trait WritableRepresentation: DenseRepresentation {}
 
 macro_rules! representation {
     ($name:ident, $registry:literal, $elem:ty, $planes:literal) => {
+        representation!($name, $registry, Packet, $elem, $planes);
+    };
+    ($name:ident, $registry:literal, $layout:ident, $elem:ty, $planes:literal) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         pub enum $name {}
         impl sealed::Sealed for $name {}
         impl Representation for $name {
             const NAME: &'static str = $registry;
+            const LAYOUT: registry::Layout = registry::Layout::$layout;
             type Element = $elem;
             const PLANES: u32 = $planes;
         }
@@ -294,6 +306,16 @@ representation!(Q6K, "q6k", F32, 3);
 representation!(Q8G32S, "q8g32s", F32, 2);
 representation!(IQ4G32, "iq4g32", F32, 2);
 representation!(Q8G32, "q8g32", F32, 2);
+representation!(Q4KRows16, "q4k", Rows16, F32, 3);
+representation!(Q5KRows16, "q5k", Rows16, F32, 4);
+representation!(Q6KRows16, "q6k", Rows16, F32, 4);
+representation!(Q8G32SRows16, "q8g32s", Rows16, F32, 2);
+representation!(IQ4G32Rows16, "iq4g32", Rows16, F32, 2);
+representation!(Q4KMma16, "q4k", Mma16, F32, 3);
+representation!(Q5KMma16, "q5k", Mma16, F32, 4);
+representation!(Q6KMma16, "q6k", Mma16, F32, 4);
+representation!(Q8G32SMma16, "q8g32s", Mma16, F32, 2);
+representation!(IQ4G32Mma16, "iq4g32", Mma16, F32, 2);
 
 /// Dispatches a runtime representation id into the typed world.
 pub trait RepresentationVisitor {
@@ -308,8 +330,25 @@ pub fn with_representation<V: RepresentationVisitor>(
     id: RepresentationId,
     visitor: V,
 ) -> V::Output {
-    let name = registry::representation_info(id).name;
-    match name {
+    let info = registry::representation_info(id);
+    match (info.representation, info.layout) {
+        ("q4k", registry::Layout::Rows16) => return visitor.visit::<Q4KRows16>(),
+        ("q5k", registry::Layout::Rows16) => return visitor.visit::<Q5KRows16>(),
+        ("q6k", registry::Layout::Rows16) => return visitor.visit::<Q6KRows16>(),
+        ("q8g32s", registry::Layout::Rows16) => return visitor.visit::<Q8G32SRows16>(),
+        ("iq4g32", registry::Layout::Rows16) => return visitor.visit::<IQ4G32Rows16>(),
+        ("q4k", registry::Layout::Mma16) => return visitor.visit::<Q4KMma16>(),
+        ("q5k", registry::Layout::Mma16) => return visitor.visit::<Q5KMma16>(),
+        ("q6k", registry::Layout::Mma16) => return visitor.visit::<Q6KMma16>(),
+        ("q8g32s", registry::Layout::Mma16) => return visitor.visit::<Q8G32SMma16>(),
+        ("iq4g32", registry::Layout::Mma16) => return visitor.visit::<IQ4G32Mma16>(),
+        (_, registry::Layout::Packet) => {}
+        (other, layout) => panic!(
+            "registry storage `{other}` in layout `{}` has no type-level marker",
+            layout.as_str()
+        ),
+    }
+    match info.name {
         "f32" => visitor.visit::<DenseF32>(),
         "f16" => visitor.visit::<DenseF16>(),
         "bf16" => visitor.visit::<DenseBF16>(),
@@ -380,5 +419,34 @@ mod scalar_kind_tests {
             ScalarKind::Scalar(DType::F16).decode_word(padded | 0x7c01),
             SymbolValue::F16(0x7c01)
         );
+    }
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+
+    struct Identity;
+    impl RepresentationVisitor for Identity {
+        type Output = (RepresentationId, registry::Layout, u32);
+        fn visit<R: Representation>(self) -> Self::Output {
+            (R::id(), R::LAYOUT, R::PLANES)
+        }
+    }
+
+    #[test]
+    fn every_resident_storage_has_a_marker_carrying_its_pair() {
+        for info in registry::representations() {
+            if matches!(info.kind, registry::RepresentationKind::External(_))
+                || info.representation == "nvfp4_e2m1_block16"
+            {
+                continue;
+            }
+            let (id, layout, planes) = with_representation(info.id, Identity);
+            assert_eq!((id, layout), (info.id, info.layout), "`{}`", info.name);
+            if let registry::RepresentationKind::PackedRows(rows) = &info.kind {
+                assert_eq!(planes as usize, rows.planes.len(), "`{}`", info.name);
+            }
+        }
     }
 }

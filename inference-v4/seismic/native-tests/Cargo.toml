@@ -8,5 +8,8 @@ publish = false
 [dependencies]
 seismic.workspace = true
 
+[dev-dependencies]
+seismic-lang.workspace = true
+
 [build-dependencies]
 seismic-build.workspace = true

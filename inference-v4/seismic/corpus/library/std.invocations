@@ -118,18 +118,15 @@ rotary_prepare[A=bf16]: bf16[2,80]=rand(294) ; bf16[2,20]=rand(295) ; f32[10]=ra
 rotary_prepare[A=f32]: f32[2,80]=rand(298) ; f32[2,20]=rand(299) ; f32[10]=rand(300) ; f32[10]=rand(301) ; i32[2,4]=1,2,3,0,9,9,9,0 ; f32[2,4,10]=zero ; f32[2,2,10]=zero ; f32[2,40]=zero ; i32[4]=2,1,0,1 ; f32:10000.0 ; f32:0.000001
 
 # sampling.seismic: M = 2. V = 40 (mask words (V + 31) / 32 = 2): row 0 sampled with
-# Philox draws, row 1 greedy; then a masked-out row (status 1) beside a partial mask.
+# Philox draws, row 1 greedy; then a masked-out row (status 1) beside a partial mask;
+# then an unconstrained row whose all-zero mask is ignored beside a constrained row.
 # V = 2: a non-finite row (status 2) beside a row whose -inf token is excluded.
-sample_rows: f32[2,40]=rand(310) ; u32[2,2]=0xffffffff,0xff,0xffffffff,0xff ; u32[2,6]=1,7,11,0,3,0,0,0,0,0,0,0 ; i32[2,2]=zero
-sample_rows: f32[2,40]=rand(311) ; u32[2,2]=0,0,0x0f0f0f0f,0x0f ; u32[2,6]=1,5,6,4,1,2,1,9,8,4,0,1 ; i32[2,2]=zero
-sample_rows: f32[2,2]=nan,1,0.5,-inf ; u32[2,1]=3,3 ; u32[2,6]=zero ; i32[2,2]=zero
+sample_rows: f32[2,40]=rand(310) ; u32[2,2]=0xffffffff,0xff,0xffffffff,0xff ; i32[2]=1,1 ; u32[2,6]=1,7,11,0,3,0,0,0,0,0,0,0 ; i32[2,2]=zero
+sample_rows: f32[2,40]=rand(311) ; u32[2,2]=0,0,0x0f0f0f0f,0x0f ; i32[2]=1,1 ; u32[2,6]=1,5,6,4,1,2,1,9,8,4,0,1 ; i32[2,2]=zero
+sample_rows: f32[2,40]=rand(312) ; u32[2,2]=0,0,0x0f0f0f0f,0x0f ; i32[2]=0,1 ; u32[2,6]=1,5,6,4,1,2,1,9,8,4,0,1 ; i32[2,2]=zero
+sample_rows: f32[2,2]=nan,1,0.5,-inf ; u32[2,1]=3,3 ; i32[2]=1,1 ; u32[2,6]=zero ; i32[2,2]=zero
 
-# weight_import.seismic: one repack line per registered external conversion (two packets each).
-repack_weight[T=gguf_q4_k,U=q4k]: gguf_q4_k[512]=rand(320)
-repack_weight[T=gguf_q5_k,U=q5k]: gguf_q5_k[512]=rand(321)
-repack_weight[T=gguf_q6_k,U=q6k]: gguf_q6_k[512]=rand(322)
-repack_weight[T=gguf_q8_0,U=q8g32s]: gguf_q8_0[64]=rand(323)
-repack_weight[T=gguf_iq4_xs,U=iq4g32]: gguf_iq4_xs[512]=rand(324)
+# weight_import.seismic (external conversions: `repack_weight` in engine.invocations).
 import_weight[T=bf16,U=f32]: bf16[16]=rand(325) ; f32[16]=zero
 import_weight[T=f32,U=bf16]: f32[16]=rand(326) ; bf16[16]=zero
 import_weight[T=f16,U=f32]: f16[16]=rand(327) ; f32[16]=zero

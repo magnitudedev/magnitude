@@ -1,0 +1,38 @@
+# CUDA readout entries (K5): the head as a K1 projection (paths and mapping
+# as described in `cuda_dense.seismic`), and the feature and
+# selected-vocabulary variants over the same prologue and decoders.
+
+native qwen_head_rows for cuda from "cuda/qwen_head_rows.cu":
+    static (V, D)
+    params (arithmetic KSPLIT in [4, 2, 8], BM in [64, 128], arithmetic INT8 in [0, 1])
+    where D % 64 == 0
+    scratch staged bytes (O * D * 2)
+    scratch groups bytes (INT8 * O * D / 4)
+    launch qwen_head_rows_stage:
+        threadgroups (max(INT8, 1 - min(1, 16 / (O + 8))) * O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch qwen_head_rows_gemv:
+        threadgroups (min(1, 16 / (O + 8)) * ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((1 - INT8) * min(O, 8) * D * 2)
+    launch qwen_head_rows_gemm:
+        threadgroups ((1 - min(1, 16 / (O + 8))) * ceil_div(ceil_div(V, 16), 8), ceil_div(O, BM), 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((4 - BM / 64) * (BM * (144 - 48 * INT8) + 10240) + 4096)
+
+native qwen_features_rows for cuda from "cuda/qwen_features_rows.cu":
+    static (D)
+    launch qwen_features_rows:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native qwen_selected_rows for cuda from "cuda/qwen_selected_rows.cu":
+    static (V, D)
+    where D % 64 == 0
+    scratch features bytes (O * D * 2)
+    launch selected_features:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch selected_logits:
+        threadgroups (Sv, 1, 1)
+        threads_per_threadgroup (128, 1, 1)

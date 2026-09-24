@@ -1,0 +1,47 @@
+# The ordered sum of a vector by one of two conditional launches. At most
+# `SMALL` elements are staged through group memory; more are mirrored into
+# scratch first. Exactly one launch is active for every `N`. Where a launch or
+# the scratch is inactive, its expressions would fail: the staged launch's
+# group memory exceeds every device limit for large `N`, the mirrored launch's
+# grid divides by zero at `N == SMALL` and underflows below it, and the
+# scratch size underflows below `SMALL`.
+fn gated_sum[N](x: &tensor[N] f32) -> tensor[1] f32:
+    let mut result = tensor[1] f32
+    let mut total = f32(0.0)
+    for i in 0..N:
+        total = total + x[i]
+    result[0] = total
+    return result
+
+native gated_sum for metal from "metal/gated_sum.metal":
+    params (SMALL in [64, 1048576])
+    scratch mirror bytes ((N - SMALL) * 0 + N * 4) when N > SMALL
+    launch gated_staged when N <= SMALL:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (N * 4)
+    launch gated_mirrored when N > SMALL:
+        threadgroups (ceil_div(N - SMALL, N - SMALL), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+native gated_sum for cuda from "cuda/gated_sum.cu":
+    params (SMALL in [64, 1048576])
+    scratch mirror bytes ((N - SMALL) * 0 + N * 4) when N > SMALL
+    launch gated_staged when N <= SMALL:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (N * 4)
+    launch gated_mirrored when N > SMALL:
+        threadgroups (ceil_div(N - SMALL, N - SMALL), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+native gated_sum for cpu from "cpu/gated_sum.rs":
+    params (SMALL in [64, 1048576])
+    scratch mirror bytes ((N - SMALL) * 0 + N * 4) when N > SMALL
+    launch gated_staged when N <= SMALL:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (N * 4)
+    launch gated_mirrored when N > SMALL:
+        threadgroups (ceil_div(N - SMALL, N - SMALL), 1, 1)
+        threads_per_threadgroup (1, 1, 1)

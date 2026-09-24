@@ -436,13 +436,7 @@ impl<B: PhysicalDialect> Construction<B> {
         self.schedule.append_imported_at(region, imported)
     }
     pub fn local_allocations(&self) -> LocalAllocationTopology {
-        LocalAllocationTopology::new(
-            self.owner,
-            self.kernels
-                .iter()
-                .map(|kernel| kernel.locals().to_vec())
-                .collect(),
-        )
+        local_allocations(&self.kernels)
     }
     /// Closes every mutable IR table as one consuming transition. The returned
     /// phase has no mutation API, so closed storage, kernels, and schedule
@@ -486,7 +480,7 @@ impl<B: PhysicalDialect> SealedConstruction<B> {
         &self.schedule
     }
     pub fn local_allocations(&self) -> LocalAllocationTopology {
-        local_allocations(self.owner, &self.kernels)
+        local_allocations(&self.kernels)
     }
 
     /// Establish bounded semantic launch scopes before deriving liveness,
@@ -921,7 +915,6 @@ impl<B: PhysicalDialect> ExecutableIr<B> {
     }
     pub fn local_allocations(&self) -> LocalAllocationTopology {
         LocalAllocationTopology::new(
-            self.owner,
             self.kernels
                 .kernels()
                 .map(|(_, kernel)| kernel.locals().to_vec())
@@ -986,12 +979,8 @@ impl<B: PhysicalDialect> ExecutableIr<B> {
     }
 }
 
-fn local_allocations<B: PhysicalDialect>(
-    owner: OwnerToken,
-    kernels: &[Kernel<B>],
-) -> LocalAllocationTopology {
+fn local_allocations<B: PhysicalDialect>(kernels: &[Kernel<B>]) -> LocalAllocationTopology {
     LocalAllocationTopology::new(
-        owner,
         kernels
             .iter()
             .map(|kernel| kernel.locals().to_vec())
@@ -1872,8 +1861,8 @@ mod tests {
                 .into_importable()
                 .unwrap();
             let mut parent = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
-            let imported = parent.import(&mut arena, 0, child, &[]);
-            let mut schedule = parent.schedule(&mut arena, 0);
+            parent.import(&mut arena, 0, child, &[]);
+            let schedule = parent.schedule(&mut arena, 0);
             let token = schedule.close();
             let result =
                 parent
@@ -2063,7 +2052,7 @@ mod tests {
             .into_importable()
             .unwrap();
         let mut parent = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
-        let imported = parent.import(&mut arena, 0, child, &[]);
+        parent.import(&mut arena, 0, child, &[]);
         let imported_kernel = &parent.kernels()[0];
         for op in imported_kernel.blocks().iter().flat_map(|block| &block.ops) {
             if let crate::kernel::ops::Op::NatArg { out, index } = op {
@@ -2072,7 +2061,7 @@ mod tests {
                 }
             }
         }
-        let mut schedule = parent.schedule(&mut arena, 0);
+        let schedule = parent.schedule(&mut arena, 0);
         let closed = schedule.close();
         let analyzed = parent
             .close(closed)
@@ -2135,7 +2124,7 @@ mod tests {
         let imported = parent.import(&mut arena, 0, child, &[]);
         let returned_view = imported.remap_view(returned_view);
         parent.assert_view(returned_view);
-        let mut builder = parent.schedule(&mut arena, 0);
+        let builder = parent.schedule(&mut arena, 0);
         let token = builder.close();
         let analyzed = parent
             .close(token)

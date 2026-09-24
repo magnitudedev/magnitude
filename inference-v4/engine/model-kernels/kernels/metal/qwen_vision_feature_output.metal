@@ -1,14 +1,5 @@
-inline float vision_feature_load(device const uchar *base, ulong logical) {
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_F32)
-    return *reinterpret_cast<device const float *>(base + logical * SEISMIC_ELEMENT_A_PACKET_SIZE);
-#elif defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
-    return float(*reinterpret_cast<device const half *>(base + logical * SEISMIC_ELEMENT_A_PACKET_SIZE));
-#elif defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16)
-    return as_type<float>(uint(*reinterpret_cast<device const ushort *>(base + logical * SEISMIC_ELEMENT_A_PACKET_SIZE)) << 16);
-#else
-#error "vision features require dense activations"
-#endif
-}
+// Vision features published as F32 model-width rows.
+#include "common/element.h"
 
 kernel void qwen_vision_feature_output(
     device const uchar *source [[buffer(SEISMIC_BUFFER_SOURCE)]],
@@ -21,5 +12,5 @@ kernel void qwen_vision_feature_output(
     ulong column = index % SEISMIC_DIM_D;
     ulong source_index = row * SEISMIC_SOURCE_STRIDE_0 + column * SEISMIC_SOURCE_STRIDE_1;
     ulong result_index = row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1;
-    result[result_index] = vision_feature_load(source, source_index);
+    result[result_index] = element::at<element::Act>(source, source_index);
 }

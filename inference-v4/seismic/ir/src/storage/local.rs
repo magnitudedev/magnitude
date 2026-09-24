@@ -1,55 +1,6 @@
 //! Launch-local storage: allocations declared by one kernel and their layout.
 use super::*;
 
-/// A launch-local allocation declared by one kernel. Not convertible to a
-/// global buffer.
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LaunchLocalId<R: Representation> {
-    owner: OwnerToken,
-    kernel: u32,
-    index: u32,
-    repr: PhantomData<R>,
-}
-
-impl<R: Representation> Clone for LaunchLocalId<R> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<R: Representation> Copy for LaunchLocalId<R> {}
-impl<R: Representation> fmt::Debug for LaunchLocalId<R> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{:?}/local<{}>#{}.{}",
-            self.owner,
-            R::NAME,
-            self.kernel,
-            self.index
-        )
-    }
-}
-
-impl<R: Representation> LaunchLocalId<R> {
-    pub(crate) fn new(owner: OwnerToken, kernel: u32, index: u32) -> Self {
-        Self {
-            owner,
-            kernel,
-            index,
-            repr: PhantomData,
-        }
-    }
-    pub(crate) fn kernel(self) -> u32 {
-        self.kernel
-    }
-    pub fn index(self) -> u32 {
-        self.index
-    }
-    pub(crate) fn owner(self) -> OwnerToken {
-        self.owner
-    }
-}
-
 /// Kinds of launch-local storage (§8.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LaunchLocalKind {

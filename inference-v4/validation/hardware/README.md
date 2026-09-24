@@ -115,3 +115,102 @@ Full held-out measurements and archives remain on `m4-pro-01` under
 `~/seismic-v4-validation-01a0b3ad/metal-services-heldout.json` and
 `heldout-service-archives/`; the driver is `metal_services_heldout.swift`.
 Calibration uses the preceding `metal-services-numerical.json` capture.
+
+## Native kernel program probes (P2, P3/R6, P4)
+
+Each probe prints one JSON document on stdout (host, device, parameters, every
+configuration's samples and medians); progress goes to stderr. Run them only on
+an otherwise idle GPU. Store the output under `../results/` (ignored), named
+by host. Copy the sources to the host (for example into `~/native-program/probes/`)
+and build them there.
+
+**P3/R6 streaming-read bandwidth** (`stream_read.swift`, `stream_read.cu`). Each lane
+issues `unroll` independent 16 B loads (Metal `uint4`, CUDA `ld.global.nc.v4.u32`) per
+grid-stride step and adds them into a register accumulator. Each simdgroup or warp
+writes one sum. For every configuration, the probe checks that the sum of all outputs
+equals the closed-form wrapping sum of the GPU-filled buffer. This proves that every
+byte was read exactly once.
+
+- The sweep covers buffer sizes (default 1, 2, 4 GB), `unroll` 1/2/4/8, and 64 to 1024
+  threads per group.
+- The grid is either a multiple of the core or SM count (0.125x to 128x) or `full`,
+  meaning one step per lane.
+- Bandwidth is `bytes / median GPU time / 1e9`, taken over 10 repetitions after 2
+  warmups, with one dispatch per command buffer or event pair.
+- The whole sweep is reported, along with the best configuration per size and overall.
+- Bytes in flight is `threads * unroll * 16`. CUDA caps the thread count at resident
+  threads from `cudaOccupancyMaxActiveBlocksPerMultiprocessor`. Metal has no occupancy
+  query, so it reports issued grid threads.
+- Metal gets its core count from the IORegistry (`AGXAccelerator` `gpu-core-count`) and
+  uses a private-storage buffer. CUDA uses `cudaMalloc`.
+
+```sh
+# m4-pro-01
+swiftc -O stream_read.swift -o stream-read
+./stream-read > ../results/bandwidth-m4-pro-01.json            # flags: --sizes-gb 1,2,4 --repetitions N
+# sparky (GB10, sm_121)
+/usr/local/cuda/bin/nvcc -O3 -arch=sm_121 stream_read.cu -o stream-read
+./stream-read > ../results/bandwidth-sparky.json
+```
+
+**P4 `simdgroup_matrix` throughput** (`simdgroup_throughput.swift`, Metal source inline,
+MSL 3.1, safe math). It measures three operand types (half, bfloat and float), each
+accumulated in float, plus half operands with a half accumulator.
+
+- Each threadgroup stages 16 distinct A and B fragments from device memory into
+  threadgroup memory.
+- In each iteration, a simdgroup loads `na` A and `nb` B fragments. Each load is indexed
+  by the iteration and a runtime mask, so the fragments differ every iteration.
+- The simdgroup then issues `na*nb` data-dependent chains `c = a*b + c` (1, 2, 4 or 8
+  accumulators). The accumulators start from values in device memory and are all stored
+  back to it.
+- A one-threadgroup run is compared with a host sequential-FMA reference. Half
+  accumulation rounds after every FMA step. A relative error of 1e-2 or more aborts the
+  run; unequal bits are reported.
+- Times are measured at 512 to 4096 iterations, interleaved per repetition. TFLOP/s is
+  `simdgroups * mmas * 1024 / slope`, and `linearityMaxRelativeResidual` shows that time
+  is linear in the iteration count.
+
+```sh
+# m4-pro-01
+swiftc -O simdgroup_throughput.swift -o simdgroup-throughput
+./simdgroup-throughput > ../results/simdgroup-throughput-m4-pro-01.json   # flags: --iterations, --threadgroups-per-core
+```
+
+**P4b register-resident `simdgroup_matrix` peak** (`simdgroup_peak.swift`, same compile
+options). Each simdgroup loads its `na` A and `nb` B fragments from device memory once and
+then issues `na*nb` independent chains per iteration with no memory instruction in the
+loop, so the slope is the matrix units' issue rate alone (P4 includes the threadgroup
+fragment loads). Variants: half and bfloat operands with float or same-type accumulation,
+and float; shapes 1x1 to 4x4; 1k to 8k iterations.
+
+```sh
+swiftc -O simdgroup_peak.swift -o simdgroup-peak
+./simdgroup-peak > ../results/simdgroup-peak-<host>.json   # flags: --threads, --threadgroups-per-core, --iterations
+```
+
+**P2 GB10 `mma.sync` determinism and swap-AB** (`mma_determinism.cu`, inline PTX
+`mma.sync.aligned.m16n8k16.row.col.f32.{bf16,f16}`). One kernel computes `D = P*Q^T`
+with one warp per 16x8 tile, chaining one mma per k16 step.
+
+- **Forms:** the standard form uses activations as A (`out[m][n]`). The swapped form
+  uses weights as A with the M rows in N=8 (`out[n][m]`, the K1 GEMV form).
+- **Problems:** M = 1, 5, 8 and 16 with N = K = 1024, over uniform and wide-exponent
+  data, for both types.
+- **Determinism:** every form is rerun 10 times under four launch variants. The variants
+  differ in warps per block, reversed tile order, and two concurrent half-grid launches.
+  Each rerun is compared bitwise with the first run.
+- **Swap-AB:** the swapped result is compared bitwise with the standard one.
+- **Host models:** both forms are compared with three models, reporting unequal-bit
+  count, maximum ULP and maximum absolute error. The models are sequential f32 FMA,
+  and the exact k16 block sum added to the accumulator with round-to-nearest or with
+  truncation. Exact sums use binary128 `long double`, so the probe builds only on an
+  aarch64 Linux host.
+- **Crafted cases:** single dot products that separate those models. Their results
+  show the accumulation order and rounding inside the mma.
+
+```sh
+# sparky
+/usr/local/cuda/bin/nvcc -O3 -arch=sm_121 mma_determinism.cu -o mma-determinism
+./mma-determinism > ../results/mma-determinism-sparky.json     # flags: --n, --k, --repetitions
+```

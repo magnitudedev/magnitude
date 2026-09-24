@@ -69,13 +69,40 @@ pub struct ResourceBytes {
 
 /// A Seismic-derived physical family charge. The engine chooses concurrency;
 /// Seismic supplies every byte and every tensor layout within each slot.
+/// Each workspace slot holds `upload_regions` upload regions of
+/// `upload_bytes`, allocated with the slot: one per graph run its lease
+/// keeps in flight at once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeGraphCharge {
     pub workspace_bytes: u64,
     pub output_bytes: u64,
+    pub upload_bytes: u64,
+    pub upload_regions: usize,
     pub workspace_slots: usize,
     pub output_slots: usize,
     pub committed_bytes: u64,
+}
+
+/// A family's per-slot storage: scratch, output arena and upload region
+/// bytes, and the runs one workspace lease keeps in flight.
+#[derive(Clone, Copy, Debug)]
+struct FamilyFootprint {
+    workspace_bytes: u64,
+    output_bytes: u64,
+    upload_bytes: u64,
+    runs_in_flight: usize,
+}
+
+impl FamilyFootprint {
+    /// A family whose lease runs one graph at a time to completion.
+    fn serial(family: &seismic::NativeGraphFamily) -> Self {
+        Self {
+            workspace_bytes: family.workspace_bytes(),
+            output_bytes: family.output_bytes(),
+            upload_bytes: family.upload_bytes(),
+            runs_in_flight: 1,
+        }
+    }
 }
 
 impl NativeGraphCharge {
@@ -83,9 +110,13 @@ impl NativeGraphCharge {
         let output_slots = in_flight
             .checked_mul(2)
             .ok_or("target graph output slot count overflow")?;
-        Self::from_bytes(
-            graphs.workspace_bytes(),
-            graphs.output_bytes(),
+        Self::from_footprint(
+            FamilyFootprint {
+                workspace_bytes: graphs.workspace_bytes(),
+                output_bytes: graphs.output_bytes(),
+                upload_bytes: graphs.family().upload_bytes(),
+                runs_in_flight: graphs.runs_per_step(),
+            },
             in_flight,
             output_slots,
         )
@@ -99,33 +130,34 @@ impl NativeGraphCharge {
         let output_slots = active
             .checked_add(in_flight)
             .ok_or("target readout output slot count overflow")?;
-        Self::from_bytes(
-            graphs.workspace_bytes(),
-            graphs.output_bytes(),
-            in_flight,
-            output_slots,
-        )
+        Self::from_footprint(FamilyFootprint::serial(graphs.family()), in_flight, output_slots)
     }
 
-    fn from_bytes(
-        workspace_bytes: u64,
-        output_bytes: u64,
+    fn from_footprint(
+        footprint: FamilyFootprint,
         workspace_slots: usize,
         output_slots: usize,
     ) -> Result<Self, String> {
-        let committed_bytes = workspace_bytes
-            .checked_mul(
-                u64::try_from(workspace_slots).map_err(|_| "workspace slot count exceeds u64")?,
-            )
+        let count = |value: usize| u64::try_from(value).map_err(|_| "slot count exceeds u64");
+        let per_slot = footprint
+            .upload_bytes
+            .checked_mul(count(footprint.runs_in_flight)?)
+            .and_then(|uploads| uploads.checked_add(footprint.workspace_bytes))
+            .ok_or("graph slot byte count overflows")?;
+        let committed_bytes = per_slot
+            .checked_mul(count(workspace_slots)?)
             .and_then(|bytes| {
-                output_bytes
+                footprint
+                    .output_bytes
                     .checked_mul(u64::try_from(output_slots).ok()?)
                     .and_then(|outputs| bytes.checked_add(outputs))
             })
-            .ok_or("target graph charge overflows")?;
+            .ok_or("graph charge overflows")?;
         Ok(Self {
-            workspace_bytes,
-            output_bytes,
+            workspace_bytes: footprint.workspace_bytes,
+            output_bytes: footprint.output_bytes,
+            upload_bytes: footprint.upload_bytes,
+            upload_regions: footprint.runs_in_flight,
             workspace_slots,
             output_slots,
             committed_bytes,
@@ -571,7 +603,7 @@ impl ResourcePlanner {
         let load = &state.load;
         let limits = state.limits;
         let budget = state.budget;
-        let qualification_peak = crate::AttestedPrograms::qualification_peak_bytes();
+        let qualification_peak = crate::AttestedPrograms::qualification_peak_bytes(load);
         let source_import_peak = load
             .target
             .iter()
@@ -590,9 +622,8 @@ impl ResourcePlanner {
         )?;
         let head_graph = head_graphs
             .map(|graphs| {
-                NativeGraphCharge::from_bytes(
-                    graphs.workspace_bytes_max(),
-                    graphs.output_bytes_max(),
+                NativeGraphCharge::from_footprint(
+                    FamilyFootprint::serial(graphs.family()),
                     limits.in_flight_requests,
                     limits
                         .active_requests
@@ -603,17 +634,15 @@ impl ResourcePlanner {
             .transpose()?;
         let vision_graph = vision_graphs
             .map(|graphs| {
-                NativeGraphCharge::from_bytes(
-                    graphs.workspace_bytes_max(),
-                    graphs.output_bytes_max(),
+                NativeGraphCharge::from_footprint(
+                    FamilyFootprint::serial(graphs.family()),
                     limits.in_flight_requests,
                     state.retention.retained_media_features,
                 )
             })
             .transpose()?;
-        let state_graph = NativeGraphCharge::from_bytes(
-            state_graphs.workspace_bytes_max(),
-            state_graphs.output_bytes_max(),
+        let state_graph = NativeGraphCharge::from_footprint(
+            FamilyFootprint::serial(state_graphs.family()),
             limits.in_flight_requests,
             limits.in_flight_requests,
         )?;

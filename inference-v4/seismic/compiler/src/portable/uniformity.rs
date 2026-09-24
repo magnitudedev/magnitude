@@ -175,15 +175,6 @@ impl Inference<'_> {
             members: vec![],
         }
     }
-    fn region(
-        &self,
-        function: &SemanticFunction,
-        region: RegionId,
-        values: &mut Values,
-        control: U,
-    ) -> U {
-        self.region_with(function, region, values, control, Meaning::Physical)
-    }
     fn region_with(
         &self,
         function: &SemanticFunction,
@@ -632,7 +623,7 @@ fn probe(x: i32, times: range[4]) -> i32:
             let successful =
                 inference.successful_values(function, function.root(), &values, U::Workgroup);
             assert_eq!(scalar(&successful, function.results()[0]), input);
-            inference.region(function, function.root(), &mut values, U::Workgroup);
+            inference.region_with(function, function.root(), &mut values, U::Workgroup, Meaning::Physical);
             assert_eq!(scalar(&values, function.results()[0]), input,
                 "the second carry must inherit the first carry's later scope, including through a call");
         }

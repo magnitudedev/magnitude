@@ -30,6 +30,7 @@
 //! interprets the portable body.
 
 pub mod api;
+pub mod artifacts;
 pub mod devices;
 
 mod backends;

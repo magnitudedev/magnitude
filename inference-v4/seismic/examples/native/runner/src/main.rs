@@ -197,7 +197,7 @@ fn verify_native_graph(device: &seismic::Device) -> Result<(), Box<dyn std::erro
             .max(small_plan.workspace_bytes())
     );
     assert_eq!(family.output_bytes(), owned_plan.output_bytes());
-    let mut family_slot = family.new_slot()?;
+    let mut family_slot = family.new_slot(1)?;
     let mut active = family_slot.activate(&owned_plan)?;
     active.write_input(&input, &bytes(&[2.0, 3.0, 4.0, 5.0]))?;
     let owned_outputs = run(active.attach(
@@ -251,7 +251,7 @@ fn verify_native_graph(device: &seismic::Device) -> Result<(), Box<dyn std::erro
     let scratch_plan = scratch_graph.seal()?;
     assert_eq!(scratch_plan.workspace_bytes(), 24);
     let scratch_family = seismic::NativeGraphFamily::new(&[scratch_plan.clone()])?;
-    let mut scratch_slot = scratch_family.new_slot()?;
+    let mut scratch_slot = scratch_family.new_slot(1)?;
     let mut scratch_active = scratch_slot.activate(&scratch_plan)?;
     let mut borrowed_local = scratch_active.local(&prewritten).expect("checked local");
     borrowed_local.write_from_host(&bytes(&[2.0, 5.0]))?;

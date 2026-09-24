@@ -1,130 +1,83 @@
-inline ulong head_at2(ulong row, ulong column, ulong stride0, ulong stride1) {
-    return row * stride0 + column * stride1;
-}
-inline uint head_code(device const uchar *bytes, ulong bit, uint width) {
-    ulong byte = bit >> 3;
-    uint shift = uint(bit & 7);
-    uint value = uint(bytes[byte]) >> shift;
-    if (shift + width > 8)
-        value |= uint(bytes[byte + 1]) << (8 - shift);
-    return value & ((1u << width) - 1u);
-}
-inline float head_resident(device const uchar *base, ulong logical, uint kind,
-    ulong packet_size, ulong group, ulong words, ulong coefficients, ulong factor, ulong bias) {
-    device const uchar *packet = base + (logical / group) * packet_size;
-    ulong position = logical % group;
-    if (kind == 8)
-        return float(int(reinterpret_cast<device const char *>(packet + words)[position]))
-            * float(*reinterpret_cast<device const half *>(packet + factor));
-    if (kind == 14) {
-        const int table[16] = {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113};
-        return reinterpret_cast<device const float *>(packet + factor)[position / 32]
-            * float(table[head_code(packet + words, position * 4, 4)]);
-    }
-    int code = int(head_code(packet + words, position * kind, kind));
-    if (kind == 6) code -= 32;
-    ulong ci = position / (kind == 6 ? 16 : 32);
-    if (kind == 6)
-        return float(code * int(reinterpret_cast<device const char *>(packet + coefficients)[ci]))
-            * float(*reinterpret_cast<device const half *>(packet + factor));
-    uint scale_code = head_code(packet + coefficients, ci * 12, 6);
-    uint bias_code = head_code(packet + coefficients, ci * 12 + 6, 6);
-    return metal::fma(float(*reinterpret_cast<device const half *>(packet + factor))
-        * float(scale_code), float(code),
-        -float(*reinterpret_cast<device const half *>(packet + bias)) * float(bias_code));
-}
-inline float head_feature(device const uchar *base, ulong logical) {
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_F32)
-    return *reinterpret_cast<device const float *>(base + logical * 4);
+// head_logits_rows: the vocabulary projection of already-normalized feature
+// rows (the draft head's readout) into F32 logits.
+#include "common/projection.h"
+
+#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16)
+typedef packets::bf16 activation;
 #elif defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
-    return float(*reinterpret_cast<device const half *>(base + logical * 2));
-#elif defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16)
-    return as_type<float>(uint(*reinterpret_cast<device const ushort *>(base + logical * 2)) << 16);
+typedef packets::f16 activation;
 #else
-#error "head logits require dense features"
+#error "head_logits_rows requires a bf16 or f16 activation"
 #endif
-}
-inline float head_weight(device const uchar *base, ulong logical) {
-#if defined(SEISMIC_WEIGHT_REPRESENTATION_F32)
-    return *reinterpret_cast<device const float *>(base + logical * SEISMIC_WEIGHT_PACKET_SIZE);
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_F16)
-    return float(*reinterpret_cast<device const half *>(base + logical * SEISMIC_WEIGHT_PACKET_SIZE));
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_BF16)
-    return as_type<float>(uint(*reinterpret_cast<device const ushort *>(base + logical * SEISMIC_WEIGHT_PACKET_SIZE)) << 16);
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q8G32S)
-    return head_resident(base, logical, 8, SEISMIC_WEIGHT_PACKET_SIZE, SEISMIC_WEIGHT_LOGICAL_GROUP,
-        SEISMIC_WEIGHT_PLANE_0_OFFSET, 0, SEISMIC_WEIGHT_PLANE_1_OFFSET, 0);
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q4K)
-    return head_resident(base, logical, 4, SEISMIC_WEIGHT_PACKET_SIZE, SEISMIC_WEIGHT_LOGICAL_GROUP,
-        SEISMIC_WEIGHT_PLANE_0_OFFSET, SEISMIC_WEIGHT_PLANE_1_OFFSET,
-        SEISMIC_WEIGHT_PLANE_2_OFFSET, SEISMIC_WEIGHT_PLANE_3_OFFSET);
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q5K)
-    return head_resident(base, logical, 5, SEISMIC_WEIGHT_PACKET_SIZE, SEISMIC_WEIGHT_LOGICAL_GROUP,
-        SEISMIC_WEIGHT_PLANE_0_OFFSET, SEISMIC_WEIGHT_PLANE_1_OFFSET,
-        SEISMIC_WEIGHT_PLANE_2_OFFSET, SEISMIC_WEIGHT_PLANE_3_OFFSET);
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q6K)
-    return head_resident(base, logical, 6, SEISMIC_WEIGHT_PACKET_SIZE, SEISMIC_WEIGHT_LOGICAL_GROUP,
-        SEISMIC_WEIGHT_PLANE_0_OFFSET, SEISMIC_WEIGHT_PLANE_1_OFFSET,
-        SEISMIC_WEIGHT_PLANE_2_OFFSET, 0);
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_IQ4G32)
-    return head_resident(base, logical, 14, SEISMIC_WEIGHT_PACKET_SIZE, SEISMIC_WEIGHT_LOGICAL_GROUP,
-        SEISMIC_WEIGHT_PLANE_0_OFFSET, 0, SEISMIC_WEIGHT_PLANE_1_OFFSET, 0);
-#else
-#error "unsupported head logits weight"
-#endif
-}
-kernel void head_logits_rows(
-    device const uchar *features [[buffer(SEISMIC_BUFFER_FEATURES)]],
-    device const uchar *weight [[buffer(SEISMIC_BUFFER_WEIGHT)]],
-    device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
-    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
-    uint raw_index [[thread_position_in_grid]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint simd_width [[threads_per_simdgroup]]) {
-    ulong index = ulong(raw_index) / ulong(simd_width);
-    if (index >= SEISMIC_DIM_O * SEISMIC_DIM_V) return;
-    ulong row = index / SEISMIC_DIM_V;
-    ulong output = index % SEISMIC_DIM_V;
-    float sum = 0.0f;
-#if defined(SEISMIC_WEIGHT_REPRESENTATION_Q4K) || defined(SEISMIC_WEIGHT_REPRESENTATION_Q5K)
-    // One SIMD group owns one output row. Traverse resident packets once and
-    // reuse each packet's affine metadata while lanes decode adjacent values.
 #if defined(SEISMIC_WEIGHT_REPRESENTATION_Q4K)
-    const uint code_bits = 4;
+typedef packets::q4k head_packet;
+#define HEAD_LAYOUT {SEISMIC_WEIGHT_ROW_STRIDE_BYTES, SEISMIC_WEIGHT_PLANE_CODES_LO_ROW_OFFSET, 0, SEISMIC_WEIGHT_PLANE_SCALES_ROW_OFFSET, SEISMIC_WEIGHT_PLANE_SUPERS_ROW_OFFSET}
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q5K)
+typedef packets::q5k head_packet;
+#define HEAD_LAYOUT {SEISMIC_WEIGHT_ROW_STRIDE_BYTES, SEISMIC_WEIGHT_PLANE_CODES_LO_ROW_OFFSET, SEISMIC_WEIGHT_PLANE_CODES_HI_ROW_OFFSET, SEISMIC_WEIGHT_PLANE_SCALES_ROW_OFFSET, SEISMIC_WEIGHT_PLANE_SUPERS_ROW_OFFSET}
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q6K)
+typedef packets::q6k head_packet;
+#define HEAD_LAYOUT {SEISMIC_WEIGHT_ROW_STRIDE_BYTES, SEISMIC_WEIGHT_PLANE_CODES_LO_ROW_OFFSET, SEISMIC_WEIGHT_PLANE_CODES_HI_ROW_OFFSET, SEISMIC_WEIGHT_PLANE_SCALES_ROW_OFFSET, SEISMIC_WEIGHT_PLANE_SUPERS_ROW_OFFSET}
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q8G32S)
+typedef packets::q8 head_packet;
+#define HEAD_LAYOUT {SEISMIC_WEIGHT_ROW_STRIDE_BYTES, SEISMIC_WEIGHT_PLANE_CODES_ROW_OFFSET, 0, 0, SEISMIC_WEIGHT_PLANE_SUPERS_ROW_OFFSET}
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_BF16)
+typedef packets::dense<packets::bf16> head_packet;
+#define HEAD_LAYOUT {SEISMIC_WEIGHT_STRIDE_0 * 2, 0, 0, 0, 0}
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_F16)
+typedef packets::dense<packets::f16> head_packet;
+#define HEAD_LAYOUT {SEISMIC_WEIGHT_STRIDE_0 * 2, 0, 0, 0, 0}
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_F32)
+typedef packets::dense<packets::f32> head_packet;
+#define HEAD_LAYOUT {SEISMIC_WEIGHT_STRIDE_0 * 4, 0, 0, 0, 0}
 #else
-    const uint code_bits = 5;
+#error "unsupported head_logits_rows weight representation"
 #endif
-    ulong row_begin = output * SEISMIC_DIM_D;
-    ulong row_end = row_begin + SEISMIC_DIM_D;
-    ulong first_packet = row_begin / SEISMIC_WEIGHT_LOGICAL_GROUP;
-    ulong last_packet = (row_end - 1) / SEISMIC_WEIGHT_LOGICAL_GROUP;
-    for (ulong packet_index = first_packet; packet_index <= last_packet; ++packet_index) {
-        device const uchar *packet = weight + packet_index * SEISMIC_WEIGHT_PACKET_SIZE;
-        ulong packet_begin = packet_index * SEISMIC_WEIGHT_LOGICAL_GROUP;
-        float factor = float(*reinterpret_cast<device const half *>(packet + SEISMIC_WEIGHT_PLANE_2_OFFSET));
-        float bias = float(*reinterpret_cast<device const half *>(packet + SEISMIC_WEIGHT_PLANE_3_OFFSET));
-        for (ulong group = 0; group < SEISMIC_WEIGHT_LOGICAL_GROUP; group += ulong(simd_width)) {
-            ulong position = group + ulong(lane);
-            ulong logical = packet_begin + position;
-            if (position >= SEISMIC_WEIGHT_LOGICAL_GROUP || logical < row_begin || logical >= row_end) continue;
-            ulong ci = position >> 5;
-            uint scale_code = head_code(packet + SEISMIC_WEIGHT_PLANE_1_OFFSET, ci * 12, 6);
-            uint bias_code = head_code(packet + SEISMIC_WEIGHT_PLANE_1_OFFSET, ci * 12 + 6, 6);
-            uint code = head_code(packet + SEISMIC_WEIGHT_PLANE_0_OFFSET, position * code_bits, code_bits);
-            float value = metal::fma(factor * float(scale_code), float(code), -bias * float(bias_code));
-            sum = metal::fma(head_feature(features, head_at2(row, logical - row_begin,
-                SEISMIC_FEATURES_STRIDE_0, SEISMIC_FEATURES_STRIDE_1)), value, sum);
-        }
-    }
-#else
-    for (ulong source = ulong(lane); source < SEISMIC_DIM_D; source += ulong(simd_width)) {
-        sum = metal::fma(head_feature(features, head_at2(row, source,
-            SEISMIC_FEATURES_STRIDE_0, SEISMIC_FEATURES_STRIDE_1)),
-            head_weight(weight, output * SEISMIC_DIM_D + source), sum);
-    }
+#if defined(SEISMIC_WEIGHT_KIND_PACKED) && !defined(SEISMIC_WEIGHT_LAYOUT_ROWS16)
+#error "head_logits_rows requires the rows16 layout for weight"
 #endif
-    sum = simd_sum(sum);
-    if (lane == 0)
-        result[head_at2(row, output, SEISMIC_RESULT_0_STRIDE_0,
-            SEISMIC_RESULT_0_STRIDE_1)] = sum;
+
+#define HEAD_LOGITS_ARGUMENTS                                                           \
+    device const uchar *features [[buffer(SEISMIC_BUFFER_FEATURES)]],                   \
+    device const uchar *weight [[buffer(SEISMIC_BUFFER_WEIGHT)]],                       \
+    device float *logits [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
+
+#define HEAD_LOGITS_OPERANDS                                                            \
+    const uint k = uint(SEISMIC_DIM_D);                                                 \
+    projection::input_plain<activation> in{features, SEISMIC_FEATURES_STRIDE_0,        \
+        SEISMIC_FEATURES_STRIDE_1, k, {nullptr}};                                       \
+    projection::output_logits out{logits, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1}; \
+    projection::weight_rows<head_packet> w{weight, HEAD_LAYOUT, k, nullptr}
+
+kernel void head_logits_rows_gemv(HEAD_LOGITS_ARGUMENTS,
+    threadgroup uchar *shared [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    HEAD_LOGITS_OPERANDS;
+    uint rows = uint(SEISMIC_DIM_O);
+    PROJECTION_FOR_ROWS(rows,
+        projection::gemv<head_packet, SEISMIC_TUNE_SIMDGROUPS, SEISMIC_TUNE_ROWS, MAXM, SEISMIC_TUNE_LANES>(
+            in, out, w, rows, uint(SEISMIC_DIM_V), k, tile, shared, sg, lane));
+}
+
+kernel void head_logits_rows_batch(HEAD_LOGITS_ARGUMENTS,
+    threadgroup uchar *shared [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    HEAD_LOGITS_OPERANDS;
+    projection::gemv_batch<head_packet, SEISMIC_TUNE_BATCH_SIMDGROUPS, SEISMIC_TUNE_BATCH_ROWS>(in, out, w,
+        uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_V), k, tile, shared, sg, lane);
+}
+
+kernel void head_logits_rows_gemm(HEAD_LOGITS_ARGUMENTS,
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    PROJECTION_GEMM_SHARED(shared, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N);
+    HEAD_LOGITS_OPERANDS;
+    projection::gemm<head_packet, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N>(in, out, w, uint(SEISMIC_DIM_O),
+        uint(SEISMIC_DIM_V), k, tile.y, tile.x, shared, sg, lane);
 }

@@ -1,9 +1,8 @@
 use crate::{ClassError, Demand, LaunchClass};
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 pub const HISTORY_WIDTH: usize = 64;
 pub const SHAPING_WIDTH: usize = 8;
-const ALIGNMENT_WORDS: usize = 4;
 
 /// One sampler invocation. The packed representation is the six-word draw
 /// record consumed by selection kernels.
@@ -92,8 +91,9 @@ impl Shaping {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Select {
     pub draw: Draw,
-    /// One packed vocabulary mask, or `None` for an unconstrained row.
-    pub mask: Option<Vec<u32>>,
+    /// One packed vocabulary mask, or `None` for an unconstrained row. The
+    /// mask is shared with its producer, never copied into the batch.
+    pub mask: Option<Arc<[u32]>>,
     pub shaping: Shaping,
     /// Recent accepted tokens, oldest to newest. Missing entries are padded
     /// with -1 on the right.
@@ -113,48 +113,17 @@ pub struct Row {
 }
 
 /// A request-local run of rows. Slots are packed in scheduler order.
+/// Recurrent entries read the slot's state from bank `bank` and publish its
+/// successor to bank `following_bank`; a successor is never the zero seed
+/// (bank 0), the slot's own bank, or another slot's successor.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Slot {
     pub rows: Vec<Row>,
     pub bank: i32,
+    pub following_bank: i32,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ControlField {
-    pub offset_words: usize,
-    pub len_words: usize,
-}
-
-impl ControlField {
-    pub const fn offset_bytes(self) -> usize {
-        self.offset_words * size_of::<u32>()
-    }
-}
-
-/// Field locations in the single packed control allocation. The ordering is
-/// fixed by blueprint section 5.1.3.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ControlOffsets {
-    pub tokens: ControlField,
-    pub coordinates: ControlField,
-    pub visible: ControlField,
-    pub fresh: ControlField,
-    pub destinations: ControlField,
-    pub slot: ControlField,
-    pub demand: ControlField,
-    pub segments: ControlField,
-    pub bank: ControlField,
-    pub plane_base: ControlField,
-    pub out_rows: ControlField,
-    pub select_rows: ControlField,
-    pub draws: ControlField,
-    pub mask_rows: ControlField,
-    pub masks: ControlField,
-    pub shaping: ControlField,
-    pub history: ControlField,
-}
-
-/// Fully padded logical row tables and their one-upload control image.
+/// Fully padded logical row tables.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PackedRowTables {
     pub class: LaunchClass,
@@ -172,16 +141,16 @@ pub struct PackedRowTables {
     pub demand: Vec<u32>,
     pub segments: Vec<[i32; 2]>,
     pub bank: Vec<i32>,
+    pub following_bank: Vec<i32>,
     pub plane_base: Vec<i32>,
     pub out_rows: Vec<i32>,
     pub select_rows: Vec<i32>,
     pub draws: Vec<[u32; 6]>,
+    /// Per selected row, its index in `masks`, or -1 when unconstrained.
     pub mask_rows: Vec<i32>,
-    pub masks: Vec<Vec<u32>>,
+    pub masks: Vec<Arc<[u32]>>,
     pub shaping: Vec<[f32; SHAPING_WIDTH]>,
     pub history: Vec<[i32; HISTORY_WIDTH]>,
-    pub control: Vec<u32>,
-    pub offsets: ControlOffsets,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -194,6 +163,11 @@ pub enum PackError {
     InvalidBank {
         slot: usize,
         bank: i32,
+    },
+    InvalidFollowingBank {
+        slot: usize,
+        bank: i32,
+        following_bank: i32,
     },
     InvalidToken {
         row: usize,
@@ -211,7 +185,7 @@ pub enum PackError {
         row: usize,
         range: [i32; 2],
     },
-    UnorderedVisibleRanges {
+    OverlappingVisibleRanges {
         row: usize,
     },
     SelectMismatch {
@@ -247,6 +221,14 @@ impl fmt::Display for PackError {
                 write!(f, "{field} does not fit the row-table representation")
             }
             Self::InvalidBank { slot, bank } => write!(f, "slot {slot} has invalid bank {bank}"),
+            Self::InvalidFollowingBank {
+                slot,
+                bank,
+                following_bank,
+            } => write!(
+                f,
+                "slot {slot} successor bank {following_bank} is the zero seed, its own bank {bank}, or another slot's successor"
+            ),
             Self::InvalidToken { row, token } => write!(f, "row {row} has invalid token {token}"),
             Self::InvalidCoordinates { row, coordinates } => {
                 write!(f, "row {row} has invalid coordinates {coordinates:?}")
@@ -259,8 +241,8 @@ impl fmt::Display for PackError {
                 "row {row} has invalid visible range [{}, {})",
                 range[0], range[1]
             ),
-            Self::UnorderedVisibleRanges { row } => {
-                write!(f, "row {row} has overlapping or unordered visible ranges")
+            Self::OverlappingVisibleRanges { row } => {
+                write!(f, "row {row} has overlapping visible ranges")
             }
             Self::SelectMismatch { row } => write!(
                 f,
@@ -334,6 +316,18 @@ impl PackedRowTables {
                     bank: slot.bank,
                 });
             }
+            if slot.following_bank <= 0
+                || slot.following_bank == slot.bank
+                || slots[..slot_index]
+                    .iter()
+                    .any(|other| other.following_bank == slot.following_bank)
+            {
+                return Err(PackError::InvalidFollowingBank {
+                    slot: slot_index,
+                    bank: slot.bank,
+                    following_bank: slot.following_bank,
+                });
+            }
             for row in &slot.rows {
                 let index = normalized.len();
                 if row.token < 0 {
@@ -387,6 +381,7 @@ impl PackedRowTables {
             demand: vec![0; m],
             segments: vec![[m_i32, m_i32]; padded_slots + 1],
             bank: vec![-1; padded_slots + 1],
+            following_bank: vec![-1; padded_slots + 1],
             plane_base: vec![0; padded_slots + 1],
             out_rows: Vec::new(),
             select_rows: Vec::new(),
@@ -395,8 +390,6 @@ impl PackedRowTables {
             masks: Vec::new(),
             shaping: Vec::new(),
             history: Vec::new(),
-            control: Vec::new(),
-            offsets: ControlOffsets::default(),
         };
 
         let mut row_index = 0;
@@ -406,6 +399,7 @@ impl PackedRowTables {
             packed.segments[slot_index] =
                 [as_i32(lo, "segment start")?, as_i32(hi, "segment end")?];
             packed.bank[slot_index] = slot.bank;
+            packed.following_bank[slot_index] = slot.following_bank;
             for row in &slot.rows {
                 packed.tokens[row_index] = row.token;
                 packed.coordinates[row_index] = row.coordinates;
@@ -434,29 +428,28 @@ impl PackedRowTables {
             }
         }
         packed.mask_count = packed.masks.len();
-        let (control, offsets) = build_control(&packed)?;
-        packed.control = control;
-        packed.offsets = offsets;
         Ok(packed)
     }
 }
 
+/// Coalesce a row's visible ranges, kept in logical history order, and reject
+/// ranges that share a row. Arena placement does not follow logical order, so
+/// a later range may lie at a lower address than an earlier one.
 fn normalize_visible(row: usize, ranges: &[[i32; 2]]) -> Result<Vec<[i32; 2]>, PackError> {
     let mut result: Vec<[i32; 2]> = Vec::with_capacity(ranges.len());
     for &range in ranges {
         if range[0] < 0 || range[0] >= range[1] {
             return Err(PackError::InvalidVisibleRange { row, range });
         }
-        if let Some(previous) = result.last_mut() {
-            if range[0] < previous[1] {
-                return Err(PackError::UnorderedVisibleRanges { row });
-            }
-            if range[0] == previous[1] {
-                previous[1] = range[1];
-                continue;
-            }
+        match result.last_mut() {
+            Some(previous) if previous[1] == range[0] => previous[1] = range[1],
+            _ => result.push(range),
         }
-        result.push(range);
+    }
+    let mut ordered = result.clone();
+    ordered.sort_unstable();
+    if ordered.windows(2).any(|pair| pair[1][0] < pair[0][1]) {
+        return Err(PackError::OverlappingVisibleRanges { row });
     }
     Ok(result)
 }
@@ -493,7 +486,7 @@ fn append_select(
         packed
             .mask_rows
             .push(as_i32(packed.masks.len(), "mask row")?);
-        packed.masks.push(mask.clone());
+        packed.masks.push(Arc::clone(mask));
     } else {
         packed.mask_rows.push(-1);
     }
@@ -519,118 +512,6 @@ fn as_i32(value: usize, field: &'static str) -> Result<i32, PackError> {
     i32::try_from(value).map_err(|_| PackError::IntegerOverflow(field))
 }
 
-fn build_control(tables: &PackedRowTables) -> Result<(Vec<u32>, ControlOffsets), PackError> {
-    let mut words = Vec::new();
-    let mut offsets = ControlOffsets::default();
-    append_i32(
-        &mut words,
-        &mut offsets.tokens,
-        tables.tokens.iter().copied(),
-    );
-    append_i32(
-        &mut words,
-        &mut offsets.coordinates,
-        tables.coordinates.iter().flatten().copied(),
-    );
-    append_i32(
-        &mut words,
-        &mut offsets.visible,
-        tables.visible.iter().flatten().flatten().copied(),
-    );
-    append_i32(
-        &mut words,
-        &mut offsets.fresh,
-        tables.fresh.iter().flatten().copied(),
-    );
-    append_i32(
-        &mut words,
-        &mut offsets.destinations,
-        tables.destinations.iter().copied(),
-    );
-    append_i32(
-        &mut words,
-        &mut offsets.slot,
-        tables.row_slots.iter().copied(),
-    );
-    append_u32(
-        &mut words,
-        &mut offsets.demand,
-        tables.demand.iter().copied(),
-    );
-    append_i32(
-        &mut words,
-        &mut offsets.segments,
-        tables.segments.iter().flatten().copied(),
-    );
-    append_i32(&mut words, &mut offsets.bank, tables.bank.iter().copied());
-    append_i32(
-        &mut words,
-        &mut offsets.plane_base,
-        tables.plane_base.iter().copied(),
-    );
-    append_i32(
-        &mut words,
-        &mut offsets.out_rows,
-        tables.out_rows.iter().copied(),
-    );
-    append_i32(
-        &mut words,
-        &mut offsets.select_rows,
-        tables.select_rows.iter().copied(),
-    );
-    append_u32(
-        &mut words,
-        &mut offsets.draws,
-        tables.draws.iter().flatten().copied(),
-    );
-    append_i32(
-        &mut words,
-        &mut offsets.mask_rows,
-        tables.mask_rows.iter().copied(),
-    );
-    append_u32(
-        &mut words,
-        &mut offsets.masks,
-        tables.masks.iter().flatten().copied(),
-    );
-    append_u32(
-        &mut words,
-        &mut offsets.shaping,
-        tables.shaping.iter().flatten().map(|value| value.to_bits()),
-    );
-    append_i32(
-        &mut words,
-        &mut offsets.history,
-        tables.history.iter().flatten().copied(),
-    );
-    if words.len().checked_mul(size_of::<u32>()).is_none() {
-        return Err(PackError::IntegerOverflow("control buffer size"));
-    }
-    Ok((words, offsets))
-}
-
-fn align(words: &mut Vec<u32>) {
-    let aligned = words.len().next_multiple_of(ALIGNMENT_WORDS);
-    words.resize(aligned, 0);
-}
-
-fn append_u32<I>(words: &mut Vec<u32>, field: &mut ControlField, values: I)
-where
-    I: IntoIterator<Item = u32>,
-{
-    align(words);
-    field.offset_words = words.len();
-    words.extend(values);
-    field.len_words = words.len() - field.offset_words;
-}
-
-fn append_i32<I>(words: &mut Vec<u32>, field: &mut ControlField, values: I)
-where
-    I: IntoIterator<Item = i32>,
-{
-    append_u32(words, field, values.into_iter().map(|value| value as u32));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,6 +528,7 @@ mod tests {
     }
 
     fn selection(mask: Option<Vec<u32>>) -> Select {
+        let mask = mask.map(Arc::from);
         Select {
             draw: Draw {
                 kind: DrawKind::Categorical,
@@ -670,14 +552,17 @@ mod tests {
                     row(3, Demand::NONE),
                 ],
                 bank: 7,
+                following_bank: 8,
             },
             Slot {
                 rows: vec![row(4, Demand::LOGITS)],
                 bank: 9,
+                following_bank: 10,
             },
             Slot {
                 rows: vec![row(5, Demand::NONE), row(6, Demand::NONE)],
                 bank: 11,
+                following_bank: 12,
             },
         ];
         let packed = PackedRowTables::pack(&slots, 33, 512).unwrap();
@@ -688,6 +573,7 @@ mod tests {
             vec![[0, 3], [3, 4], [4, 6], [8, 8], [8, 8]]
         );
         assert_eq!(packed.bank, vec![7, 9, 11, -1, -1]);
+        assert_eq!(packed.following_bank, vec![8, 10, 12, -1, -1]);
         assert_eq!(&packed.row_slots[..6], &[0, 0, 0, 1, 2, 2]);
         assert_eq!(&packed.row_slots[6..], &[4, 4]);
         assert_eq!(
@@ -720,6 +606,7 @@ mod tests {
                     both,
                 ],
                 bank: 0,
+                following_bank: 1,
             }],
             33,
             512,
@@ -728,64 +615,13 @@ mod tests {
         assert_eq!(packed.out_rows, vec![1, 2, 3]);
         assert_eq!(packed.select_rows, vec![1, 2]);
         assert_eq!(packed.mask_rows, vec![0, -1]);
-        assert_eq!(packed.masks, vec![vec![u32::MAX, 1]]);
+        assert_eq!(packed.masks, vec![Arc::from(vec![u32::MAX, 1])]);
         assert_eq!(
             packed.draws[0],
             [1, 0x5566_7788, 0x1122_3344, 0xddee_ff00, 0x99aa_bbcc, 0]
         );
         assert_eq!(&packed.history[0][..4], &[7, 8, -1, -1]);
         assert_eq!(packed.shaping[0], [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn packed_control_is_equivalent_to_logical_tables_and_aligned() {
-        let mut selected = row(2, Demand::SELECT);
-        selected.select = Some(selection(Some(vec![3])));
-        let packed = PackedRowTables::pack(
-            &[Slot {
-                rows: vec![row(1, Demand::NONE), selected],
-                bank: 4,
-            }],
-            32,
-            512,
-        )
-        .unwrap();
-        let fields = [
-            packed.offsets.tokens,
-            packed.offsets.coordinates,
-            packed.offsets.visible,
-            packed.offsets.fresh,
-            packed.offsets.destinations,
-            packed.offsets.slot,
-            packed.offsets.demand,
-            packed.offsets.segments,
-            packed.offsets.bank,
-            packed.offsets.plane_base,
-            packed.offsets.out_rows,
-            packed.offsets.select_rows,
-            packed.offsets.draws,
-            packed.offsets.mask_rows,
-            packed.offsets.masks,
-            packed.offsets.shaping,
-            packed.offsets.history,
-        ];
-        assert!(fields.iter().all(|field| field.offset_bytes() % 16 == 0));
-        let tokens = packed.offsets.tokens;
-        assert_eq!(
-            &packed.control[tokens.offset_words..tokens.offset_words + tokens.len_words],
-            &[1, 2]
-        );
-        let destinations = packed.offsets.destinations;
-        assert_eq!(
-            &packed.control
-                [destinations.offset_words..destinations.offset_words + destinations.len_words],
-            &[101, 102]
-        );
-        let masks = packed.offsets.masks;
-        assert_eq!(
-            &packed.control[masks.offset_words..masks.offset_words + masks.len_words],
-            &[3]
-        );
     }
 
     #[test]
@@ -798,7 +634,8 @@ mod tests {
             PackedRowTables::pack(
                 &[Slot {
                     rows: vec![],
-                    bank: 0
+                    bank: 0,
+                    following_bank: 1,
                 }],
                 32,
                 512
@@ -811,7 +648,8 @@ mod tests {
             PackedRowTables::pack(
                 &[Slot {
                     rows: vec![bad.clone()],
-                    bank: 0
+                    bank: 0,
+                    following_bank: 1,
                 }],
                 32,
                 512
@@ -823,7 +661,8 @@ mod tests {
             PackedRowTables::pack(
                 &[Slot {
                     rows: vec![bad],
-                    bank: 0
+                    bank: 0,
+                    following_bank: 1,
                 }],
                 32,
                 512
@@ -831,18 +670,69 @@ mod tests {
             Err(PackError::InvalidMaskWidth { .. })
         ));
 
-        let mut bad_range = row(1, Demand::NONE);
-        bad_range.visible = vec![[5, 8], [7, 9]];
-        assert!(matches!(
+        for visible in [vec![[5, 8], [7, 9]], vec![[20, 30], [5, 8], [7, 9]]] {
+            let mut bad_range = row(1, Demand::NONE);
+            bad_range.visible = visible;
+            assert!(matches!(
+                PackedRowTables::pack(
+                    &[Slot {
+                        rows: vec![bad_range],
+                        bank: 0,
+                        following_bank: 1,
+                    }],
+                    32,
+                    512
+                ),
+                Err(PackError::OverlappingVisibleRanges { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn visible_ranges_keep_logical_order_across_arena_addresses() {
+        let mut moved = row(1, Demand::NONE);
+        moved.visible = vec![[40, 44], [44, 46], [8, 12], [60, 61]];
+        let packed = PackedRowTables::pack(
+            &[Slot {
+                rows: vec![moved],
+                bank: 0,
+                following_bank: 1,
+            }],
+            32,
+            512,
+        )
+        .unwrap();
+        assert_eq!(packed.class.segments(), 4);
+        assert_eq!(packed.visible[0], vec![[40, 46], [8, 12], [60, 61], [0, 0]]);
+    }
+
+    #[test]
+    fn successor_banks_are_validated_per_slot() {
+        let pack = |slots: &[(i32, i32)]| {
             PackedRowTables::pack(
-                &[Slot {
-                    rows: vec![bad_range],
-                    bank: 0
-                }],
+                &slots
+                    .iter()
+                    .map(|&(bank, following_bank)| Slot {
+                        rows: vec![row(1, Demand::NONE)],
+                        bank,
+                        following_bank,
+                    })
+                    .collect::<Vec<_>>(),
                 32,
-                512
-            ),
-            Err(PackError::UnorderedVisibleRanges { .. })
-        ));
+                512,
+            )
+        };
+        assert!(pack(&[(0, 3), (0, 4)]).is_ok());
+        for (slots, slot) in [
+            (&[(0, 0)][..], 0),
+            (&[(2, 2)][..], 0),
+            (&[(0, -1)][..], 0),
+            (&[(0, 3), (5, 3)][..], 1),
+        ] {
+            assert!(matches!(
+                pack(slots),
+                Err(PackError::InvalidFollowingBank { slot: actual, .. }) if actual == slot
+            ));
+        }
     }
 }

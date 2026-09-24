@@ -1363,19 +1363,39 @@ fn convert_owned_encoded(
     source: &TensorData,
     memory: super::value::TensorMemory,
 ) -> TensorValue {
-    let conversion = registry::representation_conversion_info(conversion);
     let (representation, _, source_bytes) = source
         .encoded_parts()
         .unwrap_or_else(|| unreachable!("representation conversion source is not encoded"));
+    let conversion = registry::representation_conversion_info(conversion);
     if representation != conversion.source {
         unreachable!("checked representation conversion source mismatch")
     }
+    let destination = repack_bytes(conversion.id, &shape, source_bytes);
+    TensorValue::owned(
+        TensorData::encoded(conversion.destination, shape, destination)
+            .expect("registered conversion fills the destination storage"),
+        memory,
+    )
+}
+
+/// The canonical destination bytes of registered conversion `conversion`
+/// applied to the canonical source bytes of a tensor of `shape`: every source
+/// packet through the recipe into the destination representation's packet
+/// form, then placed by the destination layout.
+pub(crate) fn repack_bytes(
+    conversion: RepresentationConversionId,
+    shape: &[usize],
+    source_bytes: &[u8],
+) -> Vec<u8> {
+    let conversion = registry::representation_conversion_info(conversion);
     let source_layout = match &registry::representation_info(conversion.source).kind {
         RepresentationKind::External(layout) => layout,
         _ => unreachable!("registered conversion source is not external"),
     };
-    let destination_layout = match &registry::representation_info(conversion.destination).kind {
+    let destination_kind = &registry::representation_info(conversion.destination).kind;
+    let destination_layout = match destination_kind {
         RepresentationKind::Packed(layout) => layout,
+        RepresentationKind::PackedRows(layout) => &layout.packet,
         _ => unreachable!("registered conversion destination is not packed"),
     };
     let packet_count = source_bytes.len() / source_layout.packet_size as usize;
@@ -1411,11 +1431,14 @@ fn convert_owned_encoded(
             }
         }
     }
-    TensorValue::owned(
-        TensorData::encoded(conversion.destination, shape, destination)
-            .expect("registered conversion fills the destination packets"),
-        memory,
-    )
+    // `destination` is the packet form; a row layout places it.
+    match destination_kind {
+        RepresentationKind::PackedRows(layout) => layout.place(
+            &shape.iter().map(|extent| *extent as u64).collect::<Vec<_>>(),
+            &destination,
+        ),
+        _ => destination,
+    }
 }
 
 fn eval_repack(expression: &RepackExpr, source: &[u8]) -> ReferenceScalar {

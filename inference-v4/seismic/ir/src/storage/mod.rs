@@ -15,18 +15,16 @@ pub use layout::{
     addressed_span_u64, concrete_storage_units, representation_alignment, valid_concrete_view,
 };
 pub use local::{
-    derive_launch_local_layout, LaunchAbiRequirement, LaunchLocalId, LaunchLocalKind,
+    derive_launch_local_layout, LaunchAbiRequirement, LaunchLocalKind,
     LaunchLocalLayout, LaunchScratchRequirements, LocalAllocation, LocalLayout,
     ScratchRequirement,
 };
 
 use crate::identity::OwnerToken;
-use crate::repr::Representation;
 use seismic_lang::expr::{CmpOp, AnyExpr, DecisionId, ExprArena, NatExpr, NodeView};
 use seismic_lang::ids::{ParameterId, RepresentationId, SemanticValueId};
 use seismic_lang::registry::{self, RepresentationKind};
 use std::fmt;
-use std::marker::PhantomData;
 
 /// One global allocation, untyped by representation (an allocation is bytes;
 /// views are typed).
@@ -68,9 +66,6 @@ impl TensorValueId {
     pub fn index(self) -> u32 {
         self.index
     }
-    pub(crate) fn owner(self) -> OwnerToken {
-        self.owner
-    }
 }
 
 /// The actual base of a view. Region values resolve through their structured
@@ -79,26 +74,6 @@ impl TensorValueId {
 pub enum ViewBase {
     Allocation(GlobalAllocationId),
     TensorValue(TensorValueId),
-}
-
-/// A typed view of one global allocation: `(base allocation, typed layout)`.
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BufferViewId<R: Representation> {
-    owner: OwnerToken,
-    index: u32,
-    repr: PhantomData<R>,
-}
-
-impl<R: Representation> Clone for BufferViewId<R> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<R: Representation> Copy for BufferViewId<R> {}
-impl<R: Representation> fmt::Debug for BufferViewId<R> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}/view<{}>#{}", self.owner, R::NAME, self.index)
-    }
 }
 
 /// A representation-erased view handle for tables and provenance.
@@ -114,29 +89,6 @@ impl AnyBufferView {
     }
     pub fn representation(&self) -> RepresentationId {
         self.representation
-    }
-}
-
-impl<R: Representation> BufferViewId<R> {
-    pub fn erase(self) -> AnyBufferView {
-        AnyBufferView {
-            index: self.index,
-            representation: R::id(),
-            owner: self.owner,
-        }
-    }
-    pub(crate) fn new(owner: OwnerToken, index: u32) -> Self {
-        Self {
-            owner,
-            index,
-            repr: PhantomData,
-        }
-    }
-    pub fn index(self) -> u32 {
-        self.index
-    }
-    pub(crate) fn owner(self) -> OwnerToken {
-        self.owner
     }
 }
 
@@ -453,7 +405,6 @@ impl GlobalAllocationTopology {
 /// The launch-local topology of one implementation, keyed by kernel.
 #[derive(Debug)]
 pub struct LocalAllocationTopology {
-    owner: OwnerToken,
     /// `locals[kernel][index]`.
     locals: Vec<Vec<LocalAllocation>>,
 }
@@ -473,8 +424,8 @@ impl LocalAllocationTopology {
                 })
                 .sum::<usize>()
     }
-    pub(crate) fn new(owner: OwnerToken, locals: Vec<Vec<LocalAllocation>>) -> Self {
-        Self { owner, locals }
+    pub(crate) fn new(locals: Vec<Vec<LocalAllocation>>) -> Self {
+        Self { locals }
     }
     pub fn of_kernel(&self, kernel: u32) -> &[LocalAllocation] {
         &self.locals[kernel as usize]
@@ -532,6 +483,7 @@ pub fn tensor_bytes(
             let bytes = arena.nat(u64::from(layout.packet_size));
             arena.nat_mul(count, bytes)
         }
+        RepresentationKind::PackedRows(_) => panic!("{}", registry::ROW_LAYOUT_IS_NATIVE_ONLY),
     }
 }
 
@@ -558,6 +510,7 @@ pub fn dense_strides(
         RepresentationKind::External(layout) => {
             packed_extents(arena, extents, layout.logical_group)
         }
+        RepresentationKind::PackedRows(_) => panic!("{}", registry::ROW_LAYOUT_IS_NATIVE_ONLY),
     };
     let mut strides = vec![arena.nat(1); units.len()];
     let mut acc = arena.nat(1);
@@ -600,10 +553,6 @@ impl TopologyBuilder {
             result_views: Vec::new(),
             disjoint,
         }
-    }
-
-    pub(crate) fn owner(&self) -> OwnerToken {
-        self.owner
     }
 
     pub fn allocation_count(&self) -> u32 {
@@ -1332,6 +1281,9 @@ pub fn addressed_bytes(
                 }
                 (u64::from(packet.packet_size), extents)
             }
+            registry::RepresentationKind::PackedRows(_) => {
+                panic!("{}", registry::ROW_LAYOUT_IS_NATIVE_ONLY)
+            }
         };
     let zero = arena.nat(0);
     let one = arena.nat(1);
@@ -1358,7 +1310,7 @@ pub fn addressed_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repr::DenseF32;
+    use crate::repr::{DenseF32, Representation};
 
     #[test]
     fn concrete_view_footprint_handles_packed_units_and_empty_axes() {

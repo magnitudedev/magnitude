@@ -838,7 +838,7 @@ impl<'f, 'b, B: seismic_target::TargetFamily> Lowerer<'f, 'b, B> {
     fn stored_allocation(
         &mut self, value: SemanticValueId, view: AnyBufferView, initial: InitializationState,
     ) -> Bound {
-        let SemanticType::Tensor(tensor) = &self.function.value(value).ty else {
+        let SemanticType::Tensor(_) = &self.function.value(value).ty else {
             panic!("stored allocation has a non-tensor semantic value")
         };
         let layout=self.builder.portable_layout(view);
@@ -3084,41 +3084,12 @@ fn value_type(dtype: DType) -> ValueType {
 fn element_dtype(representation: seismic_lang::ids::RepresentationId) -> DType {
     match registry::representation_info(representation).kind {
         RepresentationKind::Dense(dtype) => dtype,
-        RepresentationKind::Packed(_) => DType::F32,
+        RepresentationKind::Packed(_) | RepresentationKind::PackedRows(_) => DType::F32,
         RepresentationKind::External(_) => {
             panic!("external artifact representation has no element-read dtype")
         }
     }
 }
-fn representation_unit_bytes(representation: seismic_lang::ids::RepresentationId) -> u64 {
-    match registry::representation_info(representation).kind {
-        RepresentationKind::Dense(dtype) => u64::from(dtype.bytes()),
-        RepresentationKind::Packed(ref packet) => u64::from(packet.packet_size),
-        RepresentationKind::External(ref packet) => u64::from(packet.packet_size),
-    }
-}
-
-fn dense_strides(
-    arena: &mut ExprArena,
-    representation: seismic_lang::ids::RepresentationId,
-    axes: &[NatExpr],
-) -> Vec<NatExpr> {
-    assert!(
-        matches!(
-            registry::representation_info(representation).kind,
-            RepresentationKind::Dense(_)
-        ),
-        "reshape of packed representation is forbidden by checking"
-    );
-    let mut stride = arena.nat(1);
-    let mut strides = vec![stride; axes.len()];
-    for axis in (0..axes.len()).rev() {
-        strides[axis] = stride;
-        stride = arena.nat_mul(stride, axes[axis]);
-    }
-    strides
-}
-
 fn prepare_scalar(arena: &mut ExprArena, value: ScalarBinding) -> PreparedArg {
     match value {
         ScalarBinding::Integer(value) => PreparedArg::Integer(value),

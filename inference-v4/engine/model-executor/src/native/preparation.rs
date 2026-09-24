@@ -1,5 +1,26 @@
-use super::specialization;
+use super::specialization::Specializer;
+use super::tuning::{
+    attention::{
+        AttentionDecodeTuning, AttentionMix, AttentionOutputTuning, AttentionPrefillTuning,
+        AttentionProjectTuning,
+    },
+    cases::{DenseExpandTuning, DenseOutputTuning},
+    readout::{
+        HeadLogitsTuning, HeadRowsTuning, SampleRowsTuning, SelectedRowsTuning, ShapeRowsTuning,
+    },
+    recurrent::{
+        RecurrentChunkTuning, RecurrentOutputTuning, RecurrentProjectTuning, RecurrentShape,
+        RecurrentState, RecurrentStepTuning,
+    },
+    routed::{
+        RoutedCombineTuning, RoutedExpandTuning, RoutedExpertsTuning, RoutedGroupTuning,
+        RoutedOutputTuning, RoutedRouteTuning, RoutedShape,
+    },
+    TunedEntry, Tuner, TuningContext, TuningLimits, TuningWeights,
+};
 use super::*;
+use crate::ModelLoadPlan;
+use magnitude_model_contracts::WeightScope;
 
 /// The phase-one catalog. Every handle is prepared before qualification and
 /// retained for warm calls; this type has no API capable of preparing again.
@@ -11,976 +32,774 @@ pub(super) struct NativePreparationCache {
     pub(super) target: TargetKernels,
     pub(super) head: Option<HeadKernels>,
     pub(super) vision: Option<VisionKernels>,
+    pub(super) tuned: Vec<TunedEntry>,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum PreparationBinding {
-    TargetEmbedding(EmbeddingBinding),
-    TargetAttention(AttentionBinding),
-    TargetRecurrent(RecurrentBinding),
-    TargetDense(DenseBinding),
-    TargetRouted(RoutedBinding),
-    Readout(ReadoutBinding),
-    Features(FeaturesBinding),
-    Head(crate::HeadBinding),
-    VisionPatch(crate::VisionPatchBinding),
-    VisionBlock(crate::VisionBlockBinding),
-    VisionMerger(crate::VisionMergerBinding),
+/// Everything program preparation reads.
+pub(super) struct PreparationInputs<'a> {
+    pub device: &'a Device,
+    pub plan: &'a ProgramPlan,
+    pub load: &'a ModelLoadPlan,
+    pub limits: TuningLimits,
+    pub tuning: TuningContext<'a>,
+}
+
+/// Prepare one entry that has no tuning case. Evaluates to `Option`: `None`
+/// when the backend has no implementation, which the specializer records.
+macro_rules! fixed {
+    ($spec:expr, $device:expr, $module:ident, $bindings:expr, $elements:expr) => {
+        $spec.fixed::<$module::Entry>(&$bindings, &[], |specialization| {
+            $module::native_for_device_with($device, $elements, specialization)
+        })?
+    };
+    ($spec:expr, $device:expr, $module:ident, $bindings:expr) => {
+        $spec.fixed::<$module::Entry>(&$bindings, &[], |specialization| {
+            $module::native_for_device($device, specialization)
+        })?
+    };
+}
+
+/// The layers each binding is prepared for, in model order. Tuning cases
+/// rotate through these layers' resident weights.
+struct BindingLayers<K> {
+    layers: HashMap<K, Vec<WeightScope>>,
+}
+
+impl<K: Copy + Eq + std::hash::Hash> BindingLayers<K> {
+    fn of(bindings: impl IntoIterator<Item = (K, WeightScope)>) -> Self {
+        let mut layers: HashMap<K, Vec<WeightScope>> = HashMap::new();
+        for (binding, scope) in bindings {
+            layers.entry(binding).or_default().push(scope);
+        }
+        Self { layers }
+    }
+
+    fn scopes(&self, binding: K) -> Vec<WeightScope> {
+        self.layers[&binding].clone()
+    }
+}
+
+fn block_scope(index: usize) -> WeightScope {
+    WeightScope::TargetBlock(u32::try_from(index).expect("block count fits u32"))
+}
+
+fn head_scope(index: usize) -> WeightScope {
+    WeightScope::HeadBlock(u32::try_from(index).expect("head block count fits u32"))
 }
 
 impl NativePreparationCache {
-    pub(super) fn prepare_programs(
-        device: &Device,
-        plan: &ProgramPlan,
-    ) -> Result<Self, CatalogError> {
-        if device.backend() != BackendName::Metal {
-            return Err(CatalogError::Backend {
-                path: ExecutionPath::NativeMetal,
-                backend: device.backend(),
-                outcome: "phase one admits Metal only".into(),
-            });
-        }
-        let mut import_handles = HashMap::new();
-        let mut repack_handles = HashMap::new();
+    pub(super) fn prepare_programs(inputs: PreparationInputs<'_>) -> Result<Self, CatalogFailure> {
+        let PreparationInputs {
+            device,
+            plan,
+            load,
+            limits,
+            tuning,
+        } = inputs;
+        let mut spec = Specializer::new(device);
+        let mut import = ImportKernels {
+            import_dense: HashMap::new(),
+            repack_weight: HashMap::new(),
+        };
         for slot in plan.imports() {
             match *slot {
                 ImportProgramSlot::Dense { source, resident } => {
-                    if import_handles.contains_key(&(source, resident)) {
+                    if import.import_dense.contains_key(&(source, resident)) {
                         continue;
                     }
                     let bindings = dense_binding_name(source, resident);
-                    import_handles.insert(
-                        (source, resident),
-                        import_dense::native_for_device_with(
-                            device,
-                            import_dense::Elements {
-                                E: Element::dense(source),
-                                U: Element::dense(resident),
-                            },
-                            &specialization::fixed::<import_dense::Entry>(device, &bindings, &[])?,
-                        )
-                        .map_err(|error| preparation_dynamic("import_dense", &bindings, error))?,
-                    );
+                    if let Some(kernel) = fixed!(
+                        spec,
+                        device,
+                        import_dense,
+                        bindings,
+                        import_dense::Elements {
+                            E: Element::dense(source),
+                            U: Element::dense(resident),
+                        }
+                    ) {
+                        import.import_dense.insert((source, resident), kernel);
+                    }
                 }
                 ImportProgramSlot::Repack { source, resident } => {
-                    if repack_handles.contains_key(&(source, resident)) {
+                    if import.repack_weight.contains_key(&(source, resident)) {
                         continue;
                     }
                     let bindings = element_binding_name(source, resident);
-                    repack_handles.insert(
-                        (source, resident),
-                        repack_weight::native_for_device_with(
-                            device,
-                            repack_weight::Elements {
-                                E: source,
-                                U: resident,
-                            },
-                            &specialization::fixed::<repack_weight::Entry>(device, &bindings, &[])?,
-                        )
-                        .map_err(|error| preparation_dynamic("repack_weight", &bindings, error))?,
-                    );
+                    if let Some(kernel) = fixed!(
+                        spec,
+                        device,
+                        repack_weight,
+                        bindings,
+                        repack_weight::Elements {
+                            E: source,
+                            U: resident,
+                        }
+                    ) {
+                        import.repack_weight.insert((source, resident), kernel);
+                    }
                 }
             }
         }
         let owner = Tensor::zeros(device, Element::u32(), &[1]).map_err(|error| {
-            CatalogError::Preparation {
-                path: ExecutionPath::NativeMetal,
+            CatalogFailure::Preparation {
                 entry: "catalog_owner",
                 bindings: "A=u32".into(),
                 outcome: error.to_string(),
             }
         })?;
-        let import = ImportKernels {
-            import_dense: import_handles,
-            repack_weight: repack_handles,
-        };
-        let mut prepared = Self {
+        // A census walk counts the program's tuning units, so the model's
+        // budget can be shared before anything is tuned.
+        let mut census = Preparation::new(
+            device,
+            plan,
+            tuning,
+            Specializer::census(device),
+            Tuner::census(device, tuning, limits, TuningWeights::new(device, load, tuning.weights, &import)),
+        );
+        census.walk(plan)?;
+        let budgets = census.tuner.budgets();
+        let weights = TuningWeights::new(device, load, tuning.weights, &import);
+        let mut preparation = Preparation::new(
+            device,
+            plan,
+            tuning,
+            spec,
+            Tuner::new(device, tuning, limits, weights, budgets),
+        );
+        let glue = preparation.walk(plan)?;
+        let Preparation {
+            spec,
+            tuner,
+            target,
+            head,
+            vision,
+            ..
+        } = preparation;
+        let tuned = tuner.tuned();
+        spec.finish()?;
+        Ok(Self {
             owner,
             import,
-            glue: GlueKernels {
-                shape_rows: Some(
-                    shape_rows::native_for_device(
-                        device,
-                        &specialization::fixed::<shape_rows::Entry>(device, "fixed", &[])?,
-                    )
-                    .map_err(|error| preparation("shape_rows", "fixed", error))?,
-                ),
-                sample_rows: Some(
-                    sample_rows::native_for_device(
-                        device,
-                        &specialization::fixed::<sample_rows::Entry>(device, "fixed", &[])?,
-                    )
-                    .map_err(|error| preparation("sample_rows", "fixed", error))?,
-                ),
-                conditioning_overlay: Some(
-                    qwen_conditioning_overlay::native_for_device(
-                        device,
-                        &specialization::fixed::<qwen_conditioning_overlay::Entry>(
-                            device,
-                            "fixed",
-                            &[],
-                        )?,
-                    )
-                    .map_err(|error| preparation("qwen_conditioning_overlay", "fixed", error))?,
-                ),
-                gather_rows: Some(
-                    gather_rows::native_for_device(
-                        device,
-                        &specialization::fixed::<gather_rows::Entry>(device, "fixed", &[])?,
-                    )
-                    .map_err(|error| preparation("gather_rows", "fixed", error))?,
-                ),
-                copy_rows_f32: prepare_optional_copy(
-                    device,
-                    plan.state().copies(),
-                    Element::f32(),
-                    "A=f32",
-                )?,
-                copy_rows_f16: prepare_optional_copy(
-                    device,
-                    plan.state().copies(),
-                    Element::f16(),
-                    "A=f16",
-                )?,
-                copy_rows_bf16: prepare_optional_copy(
-                    device,
-                    plan.state().copies(),
-                    Element::bf16(),
-                    "A=bf16",
-                )?,
-                copy_rows_u32: prepare_optional_copy(
-                    device,
-                    plan.state().copies(),
-                    Element::u32(),
-                    "A=u32",
-                )?,
-            },
+            glue,
+            target,
+            head,
+            vision,
+            tuned,
+        })
+    }
+}
+
+struct Preparation<'a> {
+    device: &'a Device,
+    spec: Specializer<'a>,
+    tuner: Tuner<'a>,
+    epsilon: f32,
+    /// Model width: the static dimension of the feature readout.
+    hidden: u64,
+    target: TargetKernels,
+    head: Option<HeadKernels>,
+    vision: Option<VisionKernels>,
+}
+
+impl<'a> Preparation<'a> {
+    fn new(
+        device: &'a Device,
+        plan: &ProgramPlan,
+        tuning: TuningContext<'a>,
+        spec: Specializer<'a>,
+        tuner: Tuner<'a>,
+    ) -> Self {
+        Self {
+            device,
+            spec,
+            tuner,
+            epsilon: tuning.definition.geometry.epsilon as f32,
+            hidden: tuning.definition.geometry.hidden,
             target: TargetKernels::default(),
             head: plan.head().map(|_| HeadKernels::default()),
             vision: plan.vision().map(|_| VisionKernels::default()),
-        };
-        prepared.prepare_binding(
-            device,
-            PreparationBinding::TargetEmbedding(plan.target().embedding()),
-        )?;
-        for block in plan.target().blocks() {
-            prepared.prepare_binding(
-                device,
-                match block.mixer() {
-                    MixerProgramSlot::Attention(binding) => {
-                        PreparationBinding::TargetAttention(binding)
-                    }
-                    MixerProgramSlot::Recurrent(binding) => {
-                        PreparationBinding::TargetRecurrent(binding)
-                    }
-                },
-            )?;
-            prepared.prepare_binding(
-                device,
-                match block.feed_forward() {
-                    FeedForwardProgramSlot::Dense(binding) => {
-                        PreparationBinding::TargetDense(binding)
-                    }
-                    FeedForwardProgramSlot::Routed(binding) => {
-                        PreparationBinding::TargetRouted(binding)
-                    }
-                },
-            )?;
         }
-        prepared.prepare_binding(
-            device,
-            PreparationBinding::Readout(plan.target().readout()),
-        )?;
-        if let Some(binding) = plan.target().features() {
-            prepared.prepare_binding(
-                device,
-                PreparationBinding::Features(binding),
-            )?;
-        }
-        if let Some(head) = plan.head() {
-            for &binding in head.blocks() {
-                prepared.prepare_binding(
-                    device,
-                    PreparationBinding::Head(binding),
-                )?;
-            }
-        }
-        if let Some(vision) = plan.vision() {
-            prepared.prepare_binding(
-                device,
-                PreparationBinding::VisionPatch(vision.patch()),
-            )?;
-            for &binding in vision.blocks() {
-                prepared.prepare_binding(
-                    device,
-                    PreparationBinding::VisionBlock(binding),
-                )?;
-            }
-            prepared.prepare_binding(
-                device,
-                PreparationBinding::VisionMerger(vision.merger()),
-            )?;
-        }
-        Ok(prepared)
     }
 
-    fn prepare_binding(
-        &mut self,
-        device: &Device,
-        key: PreparationBinding,
-    ) -> Result<(), CatalogError> {
-        let prepared = self;
-        match key {
-            PreparationBinding::TargetEmbedding(b) => {
-                if !prepared.target.embedding.contains_key(&b) {
-                    let k = qwen_embedding_rows::native_for_device_with(
-                        device,
-                        qwen_embedding_rows::Elements {
-                            EW: b.table,
-                            A: b.activation,
-                        },
-                        &specialization::fixed::<qwen_embedding_rows::Entry>(
-                            device,
-                            &format!("{b:?}"),
-                            &[],
-                        )?,
-                    )
-                    .map_err(|e| target_preparation("qwen_embedding_rows", b, e))?;
-                    prepared.target.embedding.insert(b, k);
-                }
+    /// Prepare every program entry, in a fixed order.
+    fn walk(&mut self, plan: &ProgramPlan) -> Result<GlueKernels, CatalogFailure> {
+        let glue = self.glue(plan)?;
+        self.target(plan)?;
+        self.head(plan)?;
+        self.vision(plan)?;
+        Ok(glue)
+    }
+
+    /// Token selection, the conditioning overlay and the state row copies.
+    fn glue(&mut self, plan: &ProgramPlan) -> Result<GlueKernels, CatalogFailure> {
+        let device = self.device;
+        let copies = plan.state().copies();
+        let copy = |spec: &mut Specializer<'_>, element: Element, bindings: &'static str| {
+            if !copies.contains(&element) {
+                return Ok(None);
             }
-            PreparationBinding::TargetAttention(b) => {
-                if !prepared.target.attention.contains_key(&b) {
-                    let kernels = AttentionKernels {
-                        normalize: qwen_attention_normalize::native_for_device_with(
-                            device,
-                            qwen_attention_normalize::Elements {
-                                NW: b.norm,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_attention_normalize::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("qwen_attention_normalize", b, e))?,
-                        project: qwen_attention_project::native_for_device_with(
-                            device,
-                            qwen_attention_project::Elements {
-                                QW: b.query_gate,
-                                KW: b.key,
-                                VW: b.value,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_attention_project::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("qwen_attention_project", b, e))?,
-                        prepare: qwen_attention_prepare::native_for_device_with(
-                            device,
-                            qwen_attention_prepare::Elements { A: b.activation },
-                            &specialization::fixed::<qwen_attention_prepare::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("qwen_attention_prepare", b, e))?,
-                        attend: qwen_attention_attend::native_for_device_with(
-                            device,
-                            qwen_attention_attend::Elements { A: b.activation },
-                            &specialization::fixed::<qwen_attention_attend::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("qwen_attention_attend", b, e))?,
-                        output: qwen_attention_output::native_for_device_with(
-                            device,
-                            qwen_attention_output::Elements {
-                                OW: b.output,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_attention_output::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("qwen_attention_output", b, e))?,
-                    };
-                    prepared.target.attention.insert(b, kernels);
-                }
-            }
-            PreparationBinding::TargetRecurrent(b) => {
-                check_native_recurrent_scan_width(b)?;
-                if !prepared.target.recurrent.contains_key(&b) {
-                    let k = RecurrentKernels {
-                        normalize: qwen_recurrent_normalize::native_for_device_with(
-                            device,
-                            qwen_recurrent_normalize::Elements {
-                                NW: b.norm,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_recurrent_normalize::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("qwen_recurrent_normalize", b, e))?,
-                        project: qwen_recurrent_project::native_for_device_with(
-                            device,
-                            qwen_recurrent_project::Elements {
-                                QW: b.qkv,
-                                GW: b.gate,
-                                AW: b.alpha,
-                                BW: b.beta,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_recurrent_project::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("qwen_recurrent_project", b, e))?,
-                        prepare: qwen_recurrent_prepare::native_for_device_with(
-                            device,
-                            qwen_recurrent_prepare::Elements {
-                                A: b.activation,
-                                RN: b.recurrent_norm,
-                            },
-                            &specialization::fixed::<qwen_recurrent_prepare::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("qwen_recurrent_prepare", b, e))?,
-                        scan: qwen_recurrent_scan::native_for_device_with(
-                            device,
-                            qwen_recurrent_scan::Elements { A: b.activation },
-                            &specialization::fixed::<qwen_recurrent_scan::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("qwen_recurrent_scan", b, e))?,
-                        mix: qwen_recurrent_mix::native_for_device_with(
-                            device,
-                            qwen_recurrent_mix::Elements {
-                                RN: b.recurrent_norm,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_recurrent_mix::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("qwen_recurrent_mix", b, e))?,
-                        output: qwen_recurrent_output::native_for_device_with(
-                            device,
-                            qwen_recurrent_output::Elements {
-                                OW: b.output,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_recurrent_output::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("qwen_recurrent_output", b, e))?,
-                    };
-                    prepared.target.recurrent.insert(b, k);
-                }
-            }
-            PreparationBinding::TargetDense(b) => {
-                if !prepared.target.dense.contains_key(&b) {
-                    let kernels = DenseKernels {
-                        expand: qwen_dense_expand::native_for_device_with(
-                            device,
-                            qwen_dense_expand::Elements {
-                                NW: b.norm,
-                                GW: b.gate,
-                                UW: b.up,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_dense_expand::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("qwen_dense_expand", b, e))?,
-                        output: qwen_dense_output::native_for_device_with(
-                            device,
-                            qwen_dense_output::Elements {
-                                DW: b.down,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_dense_output::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("qwen_dense_output", b, e))?,
-                        expand_demanded: qwen_dense_expand_demanded::native_for_device_with(
-                            device,
-                            qwen_dense_expand_demanded::Elements {
-                                NW: b.norm,
-                                GW: b.gate,
-                                UW: b.up,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_dense_expand_demanded::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("qwen_dense_expand_demanded", b, e))?,
-                        output_demanded: qwen_dense_output_demanded::native_for_device_with(
-                            device,
-                            qwen_dense_output_demanded::Elements {
-                                DW: b.down,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_dense_output_demanded::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("qwen_dense_output_demanded", b, e))?,
-                    };
-                    prepared.target.dense.insert(b, kernels);
-                }
-            }
-            PreparationBinding::TargetRouted(b) => {
-                if !prepared.target.routed.contains_key(&b) {
-                    let kernels = RoutedKernels {
-                        normalize: qwen_routed_normalize::native_for_device_with(
-                            device,
-                            qwen_routed_normalize::Elements {
-                                NW: b.norm,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_routed_normalize::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("qwen_routed_normalize", b, e))?,
-                        logits: qwen_routed_logits::native_for_device_with(
-                            device,
-                            qwen_routed_logits::Elements {
-                                RW: b.router,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_routed_logits::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("qwen_routed_logits", b, e))?,
-                        select: qwen_routed_select::native_for_device(
-                            device,
-                            &specialization::fixed::<qwen_routed_select::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("qwen_routed_select", b, e))?,
-                        expand: qwen_routed_expand::native_for_device_with(
-                            device,
-                            qwen_routed_expand::Elements {
-                                EGW: b.expert_gate,
-                                EUW: b.expert_up,
-                                SGW: b.shared_gate,
-                                SUW: b.shared_up,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_routed_expand::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("qwen_routed_expand", b, e))?,
-                        output: qwen_routed_output::native_for_device_with(
-                            device,
-                            qwen_routed_output::Elements {
-                                EDW: b.expert_down,
-                                SDW: b.shared_down,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_routed_output::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("qwen_routed_output", b, e))?,
-                    };
-                    prepared.target.routed.insert(b, kernels);
-                }
-            }
-            PreparationBinding::Readout(b) => {
-                if !prepared.target.readout.contains_key(&b) {
-                    let kernels = ReadoutKernels {
-                        features: qwen_features_rows::native_for_device_with(
-                            device,
-                            qwen_features_rows::Elements {
-                                NW: b.norm,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_features_rows::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("qwen_features_rows", b, e))?,
-                        logits: head_logits_rows::native_for_device_with(
-                            device,
-                            head_logits_rows::Elements {
-                                OW: b.weight,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<head_logits_rows::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|e| target_preparation("head_logits_rows", b, e))?,
-                    };
-                    prepared.target.readout.insert(b, kernels);
-                    let selected = qwen_selected_rows::native_for_device_with(
-                        device,
-                        qwen_selected_rows::Elements {
-                            NW: b.norm,
-                            OW: b.weight,
-                            A: b.activation,
-                        },
-                        &specialization::fixed::<qwen_selected_rows::Entry>(
-                            device,
-                            &format!("{b:?}"),
-                            &[],
-                        )?,
-                    )
-                    .map_err(|e| target_preparation("qwen_selected_rows", b, e))?;
-                    prepared.target.selected.insert(b, selected);
-                }
-            }
-            PreparationBinding::Features(b) => {
-                if !prepared.target.features.contains_key(&b) {
-                    let k = qwen_features_rows::native_for_device_with(
-                        device,
-                        qwen_features_rows::Elements {
-                            NW: b.norm,
-                            A: b.activation,
-                        },
-                        &specialization::fixed::<qwen_features_rows::Entry>(
-                            device,
-                            &format!("{b:?}"),
-                            &[],
-                        )?,
-                    )
-                    .map_err(|e| target_preparation("qwen_features_rows", b, e))?;
-                    prepared.target.features.insert(b, k);
-                }
-            }
-            PreparationBinding::Head(b) => {
-                let head = prepared
-                    .head
-                    .as_mut()
-                    .expect("head requirement creates head group");
-                if head.input.contains_key(&b) {
-                    return Ok(());
-                }
-                head.input.insert(
-                    b,
-                    qwen_head_rows::native_for_device_with(
-                        device,
-                        qwen_head_rows::Elements {
-                            EW: b.embedding_table,
-                            A: b.activation,
-                            EN: b.embedding_norm,
-                            HN: b.hidden_norm,
-                            CW: b.combine,
-                        },
-                        &specialization::fixed::<qwen_head_rows::Entry>(
-                            device,
-                            &format!("{b:?}"),
-                            &[],
-                        )?,
-                    )
-                    .map_err(|error| target_preparation("qwen_head_rows", b, error))?,
-                );
-                head.attention.insert(
-                    b,
-                    AttentionKernels {
-                        normalize: qwen_attention_normalize::native_for_device_with(
-                            device,
-                            qwen_attention_normalize::Elements {
-                                NW: b.input_norm,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_attention_normalize::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|error| {
-                            target_preparation("qwen_attention_normalize", b, error)
-                        })?,
-                        project: qwen_attention_project::native_for_device_with(
-                            device,
-                            qwen_attention_project::Elements {
-                                QW: b.query_gate,
-                                KW: b.key,
-                                VW: b.value,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_attention_project::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|error| target_preparation("qwen_attention_project", b, error))?,
-                        prepare: qwen_attention_prepare::native_for_device_with(
-                            device,
-                            qwen_attention_prepare::Elements { A: b.activation },
-                            &specialization::fixed::<qwen_attention_prepare::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|error| target_preparation("qwen_attention_prepare", b, error))?,
-                        attend: qwen_attention_attend::native_for_device_with(
-                            device,
-                            qwen_attention_attend::Elements { A: b.activation },
-                            &specialization::fixed::<qwen_attention_attend::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|error| target_preparation("qwen_attention_attend", b, error))?,
-                        output: qwen_attention_output::native_for_device_with(
-                            device,
-                            qwen_attention_output::Elements {
-                                OW: b.attention_output,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_attention_output::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|error| target_preparation("qwen_attention_output", b, error))?,
+            Ok::<_, CatalogFailure>(fixed!(
+                spec,
+                device,
+                copy_rows,
+                bindings,
+                copy_rows::Elements { A: element }
+            ))
+        };
+        Ok(GlueKernels {
+            shape_rows: self.spec.tuned(&mut self.tuner, &ShapeRowsTuning)?,
+            sample_rows: self.spec.tuned(&mut self.tuner, &SampleRowsTuning)?,
+            conditioning_overlay: fixed!(self.spec, device, qwen_conditioning_overlay, "fixed"),
+            copy_rows_f32: copy(&mut self.spec, Element::f32(), "A=f32")?,
+            copy_rows_f16: copy(&mut self.spec, Element::f16(), "A=f16")?,
+            copy_rows_bf16: copy(&mut self.spec, Element::bf16(), "A=bf16")?,
+            copy_rows_u32: copy(&mut self.spec, Element::u32(), "A=u32")?,
+        })
+    }
+
+    fn target(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
+        let device = self.device;
+        let spec = &mut self.spec;
+        let target = plan.target();
+        let b = target.embedding();
+        if let Some(kernel) = spec.fixed::<qwen_embedding_rows::Entry>(
+            &format!("{b:?}"),
+            &[("D", self.hidden)],
+            |specialization| {
+                qwen_embedding_rows::native_for_device_with(
+                    device,
+                    qwen_embedding_rows::Elements {
+                        EW: b.table,
+                        A: b.activation,
                     },
-                );
-                head.dense.insert(
-                    b,
-                    DenseKernels {
-                        expand: qwen_dense_expand::native_for_device_with(
-                            device,
-                            qwen_dense_expand::Elements {
-                                NW: b.feedforward_norm,
-                                GW: b.gate,
-                                UW: b.up,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_dense_expand::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|error| target_preparation("qwen_dense_expand", b, error))?,
-                        output: qwen_dense_output::native_for_device_with(
-                            device,
-                            qwen_dense_output::Elements {
-                                DW: b.down,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_dense_output::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|error| target_preparation("qwen_dense_output", b, error))?,
-                        expand_demanded: qwen_dense_expand_demanded::native_for_device_with(
-                            device,
-                            qwen_dense_expand_demanded::Elements {
-                                NW: b.feedforward_norm,
-                                GW: b.gate,
-                                UW: b.up,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_dense_expand_demanded::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|error| {
-                            target_preparation("qwen_dense_expand_demanded", b, error)
-                        })?,
-                        output_demanded: qwen_dense_output_demanded::native_for_device_with(
-                            device,
-                            qwen_dense_output_demanded::Elements {
-                                DW: b.down,
-                                A: b.activation,
-                            },
-                            &specialization::fixed::<qwen_dense_output_demanded::Entry>(
-                                device,
-                                &format!("{b:?}"),
-                                &[],
-                            )?,
-                        )
-                        .map_err(|error| {
-                            target_preparation("qwen_dense_output_demanded", b, error)
-                        })?,
-                    },
-                );
-                head.features.insert(
-                    b,
-                    qwen_features_rows::native_for_device_with(
-                        device,
-                        qwen_features_rows::Elements {
-                            NW: b.output_norm,
-                            A: b.activation,
-                        },
-                        &specialization::fixed::<qwen_features_rows::Entry>(
-                            device,
-                            &format!("{b:?}"),
-                            &[],
-                        )?,
-                    )
-                    .map_err(|error| target_preparation("qwen_features_rows", b, error))?,
-                );
-                head.logits.insert(
-                    b,
-                    head_logits_rows::native_for_device_with(
-                        device,
-                        head_logits_rows::Elements {
-                            A: b.activation,
-                            OW: b.projection,
-                        },
-                        &specialization::fixed::<head_logits_rows::Entry>(
-                            device,
-                            &format!("{b:?}"),
-                            &[],
-                        )?,
-                    )
-                    .map_err(|error| target_preparation("head_logits_rows", b, error))?,
-                );
-            }
-            PreparationBinding::VisionPatch(b) => {
-                let vision = prepared
-                    .vision
-                    .as_mut()
-                    .expect("vision requirement creates vision group");
-                vision.stem.insert(
-                    b,
-                    qwen_vision_stem::native_for_device_with(
-                        device,
-                        qwen_vision_stem::Elements {
-                            W0: b.temporal_weight_0,
-                            W1: b.temporal_weight_1,
-                            B: b.bias,
-                            PE: b.position,
-                            A: b.activation,
-                        },
-                        &specialization::fixed::<qwen_vision_stem::Entry>(
-                            device,
-                            &format!("{b:?}"),
-                            &[],
-                        )?,
-                    )
-                    .map_err(|error| target_preparation("qwen_vision_stem", b, error))?,
-                );
-            }
-            PreparationBinding::VisionBlock(b) => {
-                let vision = prepared
-                    .vision
-                    .as_mut()
-                    .expect("vision requirement creates vision group");
-                if vision.blocks.contains_key(&b) {
-                    return Ok(());
+                    specialization,
+                )
+            },
+        )? {
+            self.target.embedding.insert(b, kernel);
+        }
+        let attention_layers = BindingLayers::of(target.blocks().iter().enumerate().filter_map(
+            |(index, block)| match block.mixer() {
+                MixerProgramSlot::Attention(binding) => Some((binding, block_scope(index))),
+                MixerProgramSlot::Recurrent(_) => None,
+            },
+        ));
+        let recurrent_layers = BindingLayers::of(target.blocks().iter().enumerate().filter_map(
+            |(index, block)| match block.mixer() {
+                MixerProgramSlot::Recurrent(binding) => Some((binding, block_scope(index))),
+                MixerProgramSlot::Attention(_) => None,
+            },
+        ));
+        let dense_layers = BindingLayers::of(target.blocks().iter().enumerate().filter_map(
+            |(index, block)| match block.feed_forward() {
+                FeedForwardProgramSlot::Dense(binding) => Some((binding, block_scope(index))),
+                FeedForwardProgramSlot::Routed(_) => None,
+            },
+        ));
+        let routed_layers = BindingLayers::of(target.blocks().iter().enumerate().filter_map(
+            |(index, block)| match block.feed_forward() {
+                FeedForwardProgramSlot::Routed(binding) => Some((binding, block_scope(index))),
+                FeedForwardProgramSlot::Dense(_) => None,
+            },
+        ));
+        for block in target.blocks() {
+            match block.mixer() {
+                MixerProgramSlot::Attention(b) if !self.target.attention.contains_key(&b) => {
+                    if let Some(kernels) = self.attention(
+                        b.shape,
+                        b.norm,
+                        b.query_gate,
+                        b.key,
+                        b.value,
+                        b.output,
+                        b.activation,
+                        attention_layers.scopes(b),
+                    )? {
+                        self.target.attention.insert(b, kernels);
+                    }
                 }
-                vision.blocks.insert(
-                    b,
-                    qwen_vision_block::native_for_device_with(
-                        device,
-                        qwen_vision_block::Elements {
-                            A: b.activation,
-                            N1W: b.input_norm_weight,
-                            N1B: b.input_norm_bias,
-                            QW: b.qkv_weight,
-                            QB: b.qkv_bias,
-                            PW: b.attention_output,
-                            PB: b.attention_output_bias,
-                            N2W: b.feedforward_norm_weight,
-                            N2B: b.feedforward_norm_bias,
-                            UW: b.up,
-                            UB: b.up_bias,
-                            DW: b.down,
-                            DB: b.down_bias,
-                        },
-                        &specialization::fixed::<qwen_vision_block::Entry>(
-                            device,
-                            &format!("{b:?}"),
-                            &[],
-                        )?,
-                    )
-                    .map_err(|error| target_preparation("qwen_vision_block", b, error))?,
-                );
+                MixerProgramSlot::Recurrent(b) if !self.target.recurrent.contains_key(&b) => {
+                    if let Some(kernels) = self.recurrent(b, recurrent_layers.scopes(b))? {
+                        self.target.recurrent.insert(b, kernels);
+                    }
+                }
+                MixerProgramSlot::Attention(_) | MixerProgramSlot::Recurrent(_) => {}
             }
-            PreparationBinding::VisionMerger(b) => {
-                let vision = prepared
-                    .vision
-                    .as_mut()
-                    .expect("vision requirement creates vision group");
-                vision.merger.insert(
-                    b,
-                    qwen_vision_merger::native_for_device_with(
-                        device,
-                        qwen_vision_merger::Elements {
-                            A: b.activation,
-                            NW: b.output_norm_weight,
-                            NB: b.output_norm_bias,
-                            UW: b.hidden,
-                            UB: b.hidden_bias,
-                            DW: b.output,
-                            DB: b.output_bias,
-                        },
-                        &specialization::fixed::<qwen_vision_merger::Entry>(
-                            device,
-                            &format!("{b:?}"),
-                            &[],
-                        )?,
-                    )
-                    .map_err(|error| target_preparation("qwen_vision_merger", b, error))?,
-                );
-                vision.output.insert(
-                    b,
-                    qwen_vision_feature_output::native_for_device_with(
-                        device,
-                        qwen_vision_feature_output::Elements { A: b.activation },
-                        &specialization::fixed::<qwen_vision_feature_output::Entry>(
-                            device,
-                            &format!("{b:?}"),
-                            &[],
-                        )?,
-                    )
-                    .map_err(|error| target_preparation("qwen_vision_feature_output", b, error))?,
-                );
+            match block.feed_forward() {
+                FeedForwardProgramSlot::Dense(b) if !self.target.dense.contains_key(&b) => {
+                    if let Some(kernels) = self.dense(
+                        b.norm,
+                        b.gate,
+                        b.up,
+                        b.down,
+                        b.activation,
+                        dense_layers.scopes(b),
+                    )? {
+                        self.target.dense.insert(b, kernels);
+                    }
+                }
+                FeedForwardProgramSlot::Routed(b) if !self.target.routed.contains_key(&b) => {
+                    if let Some(kernels) = self.routed(b, routed_layers.scopes(b))? {
+                        self.target.routed.insert(b, kernels);
+                    }
+                }
+                FeedForwardProgramSlot::Dense(_) | FeedForwardProgramSlot::Routed(_) => {}
             }
-            _ => {}
+        }
+        let b = target.readout();
+        let bindings = format!("{b:?}");
+        let features = self.features(&bindings, b.norm, b.activation)?;
+        let head = self.spec.tuned(
+            &mut self.tuner,
+            &HeadRowsTuning {
+                norm: b.norm,
+                weight: b.weight,
+                activation: b.activation,
+                epsilon: self.epsilon,
+            },
+        )?;
+        let selected = self.spec.tuned(
+            &mut self.tuner,
+            &SelectedRowsTuning {
+                norm: b.norm,
+                weight: b.weight,
+                activation: b.activation,
+                epsilon: self.epsilon,
+            },
+        )?;
+        if let (Some(features), Some(head)) = (features, head) {
+            self.target
+                .readout
+                .insert(b, ReadoutKernels { features, head });
+        }
+        if let Some(selected) = selected {
+            self.target.selected.insert(b, selected);
+        }
+        if let Some(b) = target.features() {
+            if let Some(kernel) = self.features(&format!("{b:?}"), b.norm, b.activation)? {
+                self.target.features.insert(b, kernel);
+            }
         }
         Ok(())
     }
-}
 
-fn prepare_copy_rows(
-    device: &Device,
-    element: Element,
-    bindings: &'static str,
-) -> Result<NativeKernel<copy_rows::Entry>, CatalogError> {
-    copy_rows::native_for_device_with(
-        device,
-        copy_rows::Elements { A: element },
-        &specialization::fixed::<copy_rows::Entry>(device, bindings, &[])?,
-    )
-    .map_err(|error| preparation("copy_rows", bindings, error))
-}
-
-fn prepare_optional_copy(
-    device: &Device,
-    copies: &[Element],
-    element: Element,
-    bindings: &'static str,
-) -> Result<Option<NativeKernel<copy_rows::Entry>>, CatalogError> {
-    copies
-        .contains(&element)
-        .then(|| prepare_copy_rows(device, element, bindings))
-        .transpose()
-}
-
-fn preparation(
-    entry: &'static str,
-    bindings: &'static str,
-    outcome: impl fmt::Display,
-) -> CatalogError {
-    CatalogError::Preparation {
-        path: ExecutionPath::NativeMetal,
-        entry,
-        bindings: bindings.into(),
-        outcome: outcome.to_string(),
+    /// `qwen_features_rows` at this model's width.
+    fn features(
+        &mut self,
+        bindings: &str,
+        norm: Element,
+        activation: Element,
+    ) -> Result<Option<NativeKernel<qwen_features_rows::Entry>>, CatalogFailure> {
+        let device = self.device;
+        self.spec.fixed::<qwen_features_rows::Entry>(
+            bindings,
+            &[("D", self.hidden)],
+            |specialization| {
+                qwen_features_rows::native_for_device_with(
+                    device,
+                    qwen_features_rows::Elements {
+                        NW: norm,
+                        A: activation,
+                    },
+                    specialization,
+                )
+            },
+        )
     }
-}
 
-fn preparation_dynamic(
-    entry: &'static str,
-    bindings: &str,
-    outcome: impl fmt::Display,
-) -> CatalogError {
-    CatalogError::Preparation {
-        path: ExecutionPath::NativeMetal,
-        entry,
-        bindings: bindings.to_owned(),
-        outcome: outcome.to_string(),
+    #[allow(clippy::too_many_arguments)]
+    fn attention(
+        &mut self,
+        shape: AttentionShape,
+        norm: Element,
+        query_gate: Element,
+        key: Element,
+        value: Element,
+        output: Element,
+        activation: Element,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<AttentionKernels>, CatalogFailure> {
+        let project = self.spec.tuned(
+            &mut self.tuner,
+            &AttentionProjectTuning {
+                norm,
+                query_gate,
+                key,
+                value,
+                activation,
+                shape,
+                scopes: scopes.clone(),
+                epsilon: self.epsilon,
+            },
+        )?;
+        let mix = || AttentionMix {
+            activation,
+            shape,
+            scopes: scopes.clone(),
+            epsilon: self.epsilon,
+        };
+        let decode = self
+            .spec
+            .tuned(&mut self.tuner, &AttentionDecodeTuning(mix()))?;
+        let prefill = self
+            .spec
+            .tuned(&mut self.tuner, &AttentionPrefillTuning(mix()))?;
+        let output = self.spec.tuned(
+            &mut self.tuner,
+            &AttentionOutputTuning {
+                output,
+                activation,
+                shape,
+                scopes,
+            },
+        )?;
+        Ok(match (project, decode, prefill, output) {
+            (Some(project), Some(decode), Some(prefill), Some(output)) => Some(AttentionKernels {
+                project,
+                decode,
+                prefill,
+                output,
+            }),
+            _ => None,
+        })
     }
-}
 
-fn target_preparation(
-    entry: &'static str,
-    binding: impl fmt::Debug,
-    outcome: impl fmt::Display,
-) -> CatalogError {
-    CatalogError::Preparation {
-        path: ExecutionPath::NativeMetal,
-        entry,
-        bindings: "model binding".into(),
-        outcome: format!("{binding:?}: {outcome}"),
+    fn recurrent(
+        &mut self,
+        b: RecurrentBinding,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<RecurrentKernels>, CatalogFailure> {
+        let shape = RecurrentShape {
+            key_heads: b.key_heads,
+            value_heads: b.value_heads,
+            width: b.width,
+            convolution_width: b.convolution_width,
+            scopes,
+        };
+        let state = || RecurrentState {
+            activation: b.activation,
+            shape: shape.clone(),
+            epsilon: self.epsilon,
+        };
+        let step = self
+            .spec
+            .tuned(&mut self.tuner, &RecurrentStepTuning(state()))?;
+        let chunk = self
+            .spec
+            .tuned(&mut self.tuner, &RecurrentChunkTuning(state()))?;
+        let project = self.spec.tuned(
+            &mut self.tuner,
+            &RecurrentProjectTuning {
+                norm: b.norm,
+                qkv: b.qkv,
+                gate: b.gate,
+                alpha: b.alpha,
+                beta: b.beta,
+                activation: b.activation,
+                shape: shape.clone(),
+                epsilon: self.epsilon,
+            },
+        )?;
+        let output = self.spec.tuned(
+            &mut self.tuner,
+            &RecurrentOutputTuning {
+                recurrent_norm: b.recurrent_norm,
+                output: b.output,
+                activation: b.activation,
+                shape,
+                epsilon: self.epsilon,
+            },
+        )?;
+        Ok(match (project, step, chunk, output) {
+            (Some(project), Some(step), Some(chunk), Some(output)) => Some(RecurrentKernels {
+                project,
+                step,
+                chunk,
+                output,
+            }),
+            _ => None,
+        })
     }
-}
 
-// The direct Metal scan stores one W-vector per thread. Program planning may
-// describe wider models; only this native kernel has the finite width bound.
-const NATIVE_RECURRENT_SCAN_WIDTH_CAPACITY: u64 = 256;
-
-pub(super) fn check_native_recurrent_scan_width(
-    binding: RecurrentBinding,
-) -> Result<(), CatalogError> {
-    if binding.width > NATIVE_RECURRENT_SCAN_WIDTH_CAPACITY {
-        return Err(target_preparation(
-            "qwen_recurrent_scan",
-            binding,
-            "native recurrent scan supports width at most 256",
-        ));
+    fn dense(
+        &mut self,
+        norm: Element,
+        gate: Element,
+        up: Element,
+        down: Element,
+        activation: Element,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<DenseKernels>, CatalogFailure> {
+        let expand = self.spec.tuned(
+            &mut self.tuner,
+            &DenseExpandTuning {
+                norm,
+                gate,
+                up,
+                activation,
+                scopes: scopes.clone(),
+                epsilon: self.epsilon,
+            },
+        )?;
+        let output = self.spec.tuned(
+            &mut self.tuner,
+            &DenseOutputTuning {
+                down,
+                activation,
+                scopes,
+            },
+        )?;
+        Ok(match (expand, output) {
+            (Some(expand), Some(output)) => Some(DenseKernels { expand, output }),
+            _ => None,
+        })
     }
-    Ok(())
+
+    fn routed(
+        &mut self,
+        b: RoutedBinding,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<RoutedKernels>, CatalogFailure> {
+        let shape = RoutedShape {
+            hidden: b.hidden,
+            experts: b.experts,
+            selected: b.selected,
+            features: b.features,
+            shared: b.shared,
+        };
+        let route = self.spec.tuned(
+            &mut self.tuner,
+            &RoutedRouteTuning {
+                norm: b.norm,
+                router: b.router,
+                activation: b.activation,
+                shape,
+                scopes: scopes.clone(),
+                epsilon: self.epsilon,
+            },
+        )?;
+        let group = self
+            .spec
+            .tuned(&mut self.tuner, &RoutedGroupTuning { shape })?;
+        let expand = self.spec.tuned(
+            &mut self.tuner,
+            &RoutedExpandTuning {
+                expert_gate: b.expert_gate,
+                expert_up: b.expert_up,
+                shared_gate: b.shared_gate,
+                shared_up: b.shared_up,
+                activation: b.activation,
+                shape,
+                scopes: scopes.clone(),
+            },
+        )?;
+        let output = self.spec.tuned(
+            &mut self.tuner,
+            &RoutedOutputTuning {
+                expert_down: b.expert_down,
+                shared_down: b.shared_down,
+                activation: b.activation,
+                shape,
+                scopes: scopes.clone(),
+            },
+        )?;
+        let experts = self.spec.tuned(
+            &mut self.tuner,
+            &RoutedExpertsTuning {
+                expert_gate: b.expert_gate,
+                expert_up: b.expert_up,
+                expert_down: b.expert_down,
+                activation: b.activation,
+                shape,
+                scopes: scopes.clone(),
+            },
+        )?;
+        let combine = self.spec.tuned(
+            &mut self.tuner,
+            &RoutedCombineTuning {
+                shared_gate: b.shared_gate,
+                shared_up: b.shared_up,
+                shared_down: b.shared_down,
+                activation: b.activation,
+                shape,
+                scopes,
+            },
+        )?;
+        Ok(match (route, expand, output, group, experts, combine) {
+            (Some(route), Some(expand), Some(output), Some(group), Some(experts), Some(combine)) => {
+                Some(RoutedKernels {
+                    route,
+                    expand,
+                    output,
+                    group,
+                    experts,
+                    combine,
+                })
+            }
+            _ => None,
+        })
+    }
+
+    fn head(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
+        let Some(head_plan) = plan.head() else {
+            return Ok(());
+        };
+        let layers = BindingLayers::of(
+            head_plan
+                .blocks()
+                .iter()
+                .enumerate()
+                .map(|(index, binding)| (*binding, head_scope(index))),
+        );
+        let device = self.device;
+        for &b in head_plan.blocks() {
+            if self
+                .head
+                .as_ref()
+                .is_some_and(|head| head.input.contains_key(&b))
+            {
+                continue;
+            }
+            let bindings = format!("{b:?}");
+            let spec = &mut self.spec;
+            let input = fixed!(
+                spec,
+                device,
+                qwen_draft_rows,
+                bindings,
+                qwen_draft_rows::Elements {
+                    EW: b.embedding_table,
+                    A: b.activation,
+                    EN: b.embedding_norm,
+                    HN: b.hidden_norm,
+                    CW: b.combine,
+                }
+            );
+            let attention = self.attention(
+                b.attention_shape,
+                b.input_norm,
+                b.query_gate,
+                b.key,
+                b.value,
+                b.attention_output,
+                b.activation,
+                layers.scopes(b),
+            )?;
+            let dense = self.dense(
+                b.feedforward_norm,
+                b.gate,
+                b.up,
+                b.down,
+                b.activation,
+                layers.scopes(b),
+            )?;
+            let features = self.features(&bindings, b.output_norm, b.activation)?;
+            let logits = self.spec.tuned(
+                &mut self.tuner,
+                &HeadLogitsTuning {
+                    weight: b.projection,
+                    activation: b.activation,
+                },
+            )?;
+            let head = self
+                .head
+                .as_mut()
+                .expect("a head plan creates the head group");
+            if let (Some(input), Some(attention), Some(dense), Some(features), Some(logits)) =
+                (input, attention, dense, features, logits)
+            {
+                head.input.insert(b, input);
+                head.attention.insert(b, attention);
+                head.dense.insert(b, dense);
+                head.features.insert(b, features);
+                head.logits.insert(b, logits);
+            }
+        }
+        Ok(())
+    }
+
+    fn vision(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
+        let Some(vision_plan) = plan.vision() else {
+            return Ok(());
+        };
+        let (device, spec) = (self.device, &mut self.spec);
+        let vision = self
+            .vision
+            .as_mut()
+            .expect("a vision plan creates the vision group");
+        let b = vision_plan.patch();
+        if let Some(kernel) = fixed!(
+            spec,
+            device,
+            qwen_vision_stem,
+            format!("{b:?}"),
+            qwen_vision_stem::Elements {
+                W0: b.temporal_weight_0,
+                W1: b.temporal_weight_1,
+                B: b.bias,
+                PE: b.position,
+                A: b.activation,
+            }
+        ) {
+            vision.stem.insert(b, kernel);
+        }
+        for &b in vision_plan.blocks() {
+            if vision.blocks.contains_key(&b) {
+                continue;
+            }
+            if let Some(kernel) = fixed!(
+                spec,
+                device,
+                qwen_vision_block,
+                format!("{b:?}"),
+                qwen_vision_block::Elements {
+                    A: b.activation,
+                    N1W: b.input_norm_weight,
+                    N1B: b.input_norm_bias,
+                    QW: b.qkv_weight,
+                    QB: b.qkv_bias,
+                    PW: b.attention_output,
+                    PB: b.attention_output_bias,
+                    N2W: b.feedforward_norm_weight,
+                    N2B: b.feedforward_norm_bias,
+                    UW: b.up,
+                    UB: b.up_bias,
+                    DW: b.down,
+                    DB: b.down_bias,
+                }
+            ) {
+                vision.blocks.insert(b, kernel);
+            }
+        }
+        let b = vision_plan.merger();
+        let bindings = format!("{b:?}");
+        if let Some(kernel) = fixed!(
+            spec,
+            device,
+            qwen_vision_merger,
+            bindings,
+            qwen_vision_merger::Elements {
+                A: b.activation,
+                NW: b.output_norm_weight,
+                NB: b.output_norm_bias,
+                UW: b.hidden,
+                UB: b.hidden_bias,
+                DW: b.output,
+                DB: b.output_bias,
+            }
+        ) {
+            vision.merger.insert(b, kernel);
+        }
+        if let Some(kernel) = fixed!(
+            spec,
+            device,
+            qwen_vision_feature_output,
+            bindings,
+            qwen_vision_feature_output::Elements { A: b.activation }
+        ) {
+            vision.output.insert(b, kernel);
+        }
+        Ok(())
+    }
 }

@@ -1,36 +1,22 @@
-# Packed target feed-forward stage. Its checked body remains the semantic
-# oracle while the native route computes one complete output coordinate per
-# owner with reductions ordered by ascending source coordinate.
-fn qwen_dense_rows[M, H, F](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
-                            gate_weight: &tensor[F, H] GW, up_weight: &tensor[F, H] UW,
-                            down_weight: &tensor[H, F] DW, eps: f32) -> tensor[M, H] f32:
-    let mut normalized = tensor[M, H] A
-    let mut gate = tensor[M, F] A
-    let mut up = tensor[M, F] A
-    let mut activated = tensor[M, F] A
-    let mut product = tensor[M, F] A
-    let mut projected = tensor[M, H] A
-    let mut result = tensor[M, H] f32
-    rms_norm(residual, norm, normalized, eps)
-    linear(normalized, gate_weight, gate)
-    linear(normalized, up_weight, up)
-    silu(gate, activated)
-    multiply(activated, up, product)
-    linear(product, down_weight, projected)
-    add(residual, projected, result)
-    return result
-
-native qwen_dense_rows for metal from "metal/qwen_dense_rows.metal":
-    launch qwen_dense_rows:
-        threadgroups (ceil_div(M * H, 256), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-
-
-# The final target block only advances rows with feature/logit demand.
-fn qwen_dense_rows_demanded[M, O, H, F](residual: &tensor[M, H] f32,
-    norm: &tensor[H] NW, gate_weight: &tensor[F, H] GW,
-    up_weight: &tensor[F, H] UW, down_weight: &tensor[H, F] DW,
-    out_rows: &tensor[O] i32, eps: f32) -> tensor[O, H] f32:
+# Packed target feed-forward stages. The portable bodies are the semantic
+# oracles. Both entries operate on the `out_rows` rows of the residual: a
+# block that advances every row binds the identity, the final block binds
+# the rows with feature or logit demand.
+#
+# Native Metal: the K1 projection library (`metal/common/projection.h`). The
+# GEMV and batched launches apply a norm prologue in-threadgroup, so a decode
+# projection is one launch; in larger classes a pre-pass first writes the
+# normalized rows to scratch. Output rows below BATCH_FROM run the GEMV
+# launch (SIMDGROUPS x ROWS lane groups of LANES lanes per threadgroup, each
+# owning weight rows; LANES sets the reduction order, so it is arithmetic);
+# BATCH_FROM..8 rows the batched launch on the matrix units (SIMDGROUPS x ROWS
+# blocks of 8 weight rows, half operands, so BATCH_FROM is arithmetic too);
+# larger classes the GEMM launch over TILE_M x TILE_N tiles (activations
+# staged as stored, weights decoded to half once per tile), with SPLIT-way
+# split-K on the down projection.
+fn qwen_dense_expand[M, O, H, F](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
+    gate_weight: &tensor[F, H] GW, up_weight: &tensor[F, H] UW,
+    out_rows: &tensor[O] i32, eps: f32) -> tensor[O, F] A:
     let mut selected = tensor[O, H] f32
     parallel for row in 0..O:
         parallel for col in 0..H:
@@ -40,35 +26,7 @@ fn qwen_dense_rows_demanded[M, O, H, F](residual: &tensor[M, H] f32,
     let mut up = tensor[O, F] A
     let mut activated = tensor[O, F] A
     let mut product = tensor[O, F] A
-    let mut projected = tensor[O, H] A
-    let mut result = tensor[O, H] f32
     rms_norm(selected, norm, normalized, eps)
-    linear(normalized, gate_weight, gate)
-    linear(normalized, up_weight, up)
-    silu(gate, activated)
-    multiply(activated, up, product)
-    linear(product, down_weight, projected)
-    add(selected, projected, result)
-    return result
-
-native qwen_dense_rows_demanded for metal from "metal/qwen_dense_rows_demanded.metal":
-    launch qwen_dense_rows_demanded:
-        threadgroups (ceil_div(O * H, 256), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-
-
-# Native dense execution stages the activation product because it is shared
-# by every output column. This preserves the semantic entry above while
-# avoiding H identical gate/up projections per row and feature.
-fn qwen_dense_expand[M, H, F](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
-    gate_weight: &tensor[F, H] GW, up_weight: &tensor[F, H] UW, eps: f32)
-    -> tensor[M, F] A:
-    let mut normalized = tensor[M, H] A
-    let mut gate = tensor[M, F] A
-    let mut up = tensor[M, F] A
-    let mut activated = tensor[M, F] A
-    let mut product = tensor[M, F] A
-    rms_norm(residual, norm, normalized, eps)
     linear(normalized, gate_weight, gate)
     linear(normalized, up_weight, up)
     silu(gate, activated)
@@ -76,53 +34,28 @@ fn qwen_dense_expand[M, H, F](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
     return product
 
 native qwen_dense_expand for metal from "metal/qwen_dense_expand.metal":
-    launch qwen_dense_expand:
-        threadgroups (ceil_div(M * F, 8), 1, 1)
+    static (H, F)
+    params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
+            arithmetic BATCH_FROM in [5, 3, 9], BATCH_SIMDGROUPS in [8, 4, 16, 32], BATCH_ROWS in [2, 1, 4],
+            TILE_M in [64, 128, 32], TILE_N in [64, 128])
+    scratch normalized bytes (min(O / 9, 1) * O * H * 2)
+    launch qwen_dense_expand_normalize:
+        threadgroups (min(O / 9, 1) * O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
+    launch qwen_dense_expand_gemv:
+        threadgroups ((1 - min(O / BATCH_FROM, 1)) * ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(O, 8) * min(ceil_div(H, 32), 288 / max(O, 1)) * 72)
+    launch qwen_dense_expand_batch:
+        threadgroups (min(O / BATCH_FROM, 1) * (1 - min(O / 9, 1)) * ceil_div(F, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
+        threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
+        shared_bytes (16512)
+    launch qwen_dense_expand_gemm:
+        threadgroups (min(O / 9, 1) * ceil_div(F, TILE_N / 2), ceil_div(O, TILE_M), 1)
+        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
 
 
-fn qwen_dense_output[M, H, F](residual: &tensor[M, H] f32,
-    product: &tensor[M, F] A, down_weight: &tensor[H, F] DW)
-    -> tensor[M, H] f32:
-    let mut projected = tensor[M, H] A
-    let mut result = tensor[M, H] f32
-    linear(product, down_weight, projected)
-    add(residual, projected, result)
-    return result
-
-native qwen_dense_output for metal from "metal/qwen_dense_output.metal":
-    launch qwen_dense_output:
-        threadgroups (ceil_div(M * H, 8), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-
-
-fn qwen_dense_expand_demanded[M, O, H, F](residual: &tensor[M, H] f32,
-    norm: &tensor[H] NW, gate_weight: &tensor[F, H] GW,
-    up_weight: &tensor[F, H] UW, out_rows: &tensor[O] i32, eps: f32)
-    -> tensor[O, F] A:
-    let mut selected = tensor[O, H] f32
-    parallel for row in 0..O:
-        parallel for col in 0..H:
-            selected[row, col] = residual[out_rows[row], col]
-    let mut normalized = tensor[O, H] A
-    let mut gate = tensor[O, F] A
-    let mut up = tensor[O, F] A
-    let mut activated = tensor[O, F] A
-    let mut product = tensor[O, F] A
-    rms_norm(selected, norm, normalized, eps)
-    linear(normalized, gate_weight, gate)
-    linear(normalized, up_weight, up)
-    silu(gate, activated)
-    multiply(activated, up, product)
-    return product
-
-native qwen_dense_expand_demanded for metal from "metal/qwen_dense_expand_demanded.metal":
-    launch qwen_dense_expand_demanded:
-        threadgroups (ceil_div(O * F, 8), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-
-
-fn qwen_dense_output_demanded[M, O, H, F](residual: &tensor[M, H] f32,
+fn qwen_dense_output[M, O, H, F](residual: &tensor[M, H] f32,
     product: &tensor[O, F] A, down_weight: &tensor[H, F] DW,
     out_rows: &tensor[O] i32) -> tensor[O, H] f32:
     let mut projected = tensor[O, H] A
@@ -133,7 +66,23 @@ fn qwen_dense_output_demanded[M, O, H, F](residual: &tensor[M, H] f32,
             result[row, col] = residual[out_rows[row], col] + f32(projected[row, col])
     return result
 
-native qwen_dense_output_demanded for metal from "metal/qwen_dense_output_demanded.metal":
-    launch qwen_dense_output_demanded:
-        threadgroups (ceil_div(O * H, 8), 1, 1)
+native qwen_dense_output for metal from "metal/qwen_dense_output.metal":
+    static (H, F)
+    params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
+            arithmetic BATCH_FROM in [5, 3, 9], BATCH_SIMDGROUPS in [8, 4, 16, 32], BATCH_ROWS in [2, 1, 4],
+            TILE_M in [64, 128, 32], TILE_N in [64, 128], arithmetic SPLIT in [1, 2, 4])
+    scratch partials bytes (SPLIT * O * H * 4)
+    launch qwen_dense_output_gemv:
+        threadgroups ((1 - min(O / BATCH_FROM, 1)) * ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(O, 8) * min(ceil_div(F, 32), 288 / max(O, 1)) * 72)
+    launch qwen_dense_output_batch:
+        threadgroups (min(O / BATCH_FROM, 1) * (1 - min(O / 9, 1)) * ceil_div(H, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
+        threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
+        shared_bytes (16512)
+    launch qwen_dense_output_gemm:
+        threadgroups (min(O / 9, 1) * ceil_div(H, TILE_N), ceil_div(O, TILE_M), SPLIT)
+        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+    launch qwen_dense_output_reduce:
+        threadgroups (min(O / 9, 1) * (min(SPLIT, 2) - 1) * ceil_div(O * H, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)

@@ -9,10 +9,11 @@ use seismic::Tensor;
 use std::rc::Rc;
 
 /// A read-only view whose tensors and row claims are owned by the transaction.
+/// `recurrent` holds one arena per recurrent component; the advance reads bank
+/// `previous_bank` and writes only bank `following_bank` of each.
 #[derive(Clone, Copy)]
 pub struct OwnedAdvanceBindings<'a> {
-    pub previous: &'a [Tensor],
-    pub following: &'a [Tensor],
+    pub recurrent: &'a [Tensor],
     pub previous_bank: usize,
     pub following_bank: usize,
     pub history: &'a [PlaneBuffer],
@@ -74,11 +75,16 @@ pub struct CodecConversionStep {
 }
 
 /// Physical buffers remain pinned by the owned transaction through finish.
+/// Recurrent state moves from bank `source_bank` of the source arenas to bank
+/// `destination_bank` of the destination arenas, a successor claimed for the
+/// conversion (never the destination's zero seed).
 pub struct OwnedCodecBindings<'a> {
     pub source_history: &'a [PlaneBuffer],
     pub destination_history: &'a [PlaneBuffer],
     pub source_recurrent: &'a [Tensor],
+    pub source_bank: usize,
     pub destination_recurrent: &'a [Tensor],
+    pub destination_bank: usize,
     pub conversions: &'a [CodecConversionStep],
 }
 
@@ -88,6 +94,7 @@ pub struct OwnedCodecAdvance {
     source: SequenceState,
     destination: SequenceState,
     extents: Vec<Rc<Extent>>,
+    destination_bank: BankHandle,
     source_history: Vec<PlaneBuffer>,
     destination_history: Vec<PlaneBuffer>,
     conversions: Vec<CodecConversionStep>,
@@ -103,8 +110,12 @@ impl OwnedCodecAdvance {
     ) -> Result<Self, (SequenceState, SequenceState, Error)> {
         match Self::prepare(&source, &destination) {
             Ok((source_codec, destination_codec, from, rows)) => {
-                let extents = match destination.store.reserve(rows) {
+                let extents = match destination.store.reserve(None, rows) {
                     Ok(extents) => extents,
+                    Err(error) => return Err((source, destination, error)),
+                };
+                let destination_bank = match destination.store.banks.acquire() {
+                    Ok(bank) => bank,
                     Err(error) => return Err((source, destination, error)),
                 };
                 let to = extents
@@ -124,6 +135,7 @@ impl OwnedCodecAdvance {
                     source,
                     destination,
                     extents,
+                    destination_bank,
                     source_history,
                     destination_history,
                     conversions,
@@ -220,8 +232,10 @@ impl OwnedCodecAdvance {
         OwnedCodecBindings {
             source_history: &self.source_history,
             destination_history: &self.destination_history,
-            source_recurrent: self.source.bank.values(),
-            destination_recurrent: self.destination.bank.values(),
+            source_recurrent: self.source.store.recurrent_arenas(),
+            source_bank: self.source.bank.index(),
+            destination_recurrent: self.destination.store.recurrent_arenas(),
+            destination_bank: self.destination_bank.index(),
             conversions: &self.conversions,
         }
     }
@@ -234,6 +248,7 @@ impl OwnedCodecAdvance {
         self.destination.history_start = self.source.history_start;
         self.destination.retained_start = self.source.history_start;
         self.destination.extents = std::mem::take(&mut self.extents);
+        std::mem::swap(&mut self.destination.bank, &mut self.destination_bank);
         self.destination
     }
 }
@@ -404,7 +419,7 @@ impl OwnedStateAdvance {
         if count == 0 || count > state.store.context_capacity.saturating_sub(state.position) {
             return Err((state, Error::from("advance exceeds context capacity")));
         }
-        let extents = match state.store.reserve(count) {
+        let extents = match state.store.reserve(state.history_end(), count) {
             Ok(extents) => extents,
             Err(error) => return Err((state, error)),
         };
@@ -450,8 +465,7 @@ impl OwnedStateAdvance {
 
     pub fn bindings(&self) -> OwnedAdvanceBindings<'_> {
         OwnedAdvanceBindings {
-            previous: self.state.bank.values(),
-            following: self.following.values(),
+            recurrent: self.state.store.recurrent_arenas(),
             previous_bank: self.state.bank.index(),
             following_bank: self.following.index(),
             history: &self.history,
@@ -500,7 +514,7 @@ impl OwnedStateAdvance {
             Err(error) => return Err((state, Error::from(error))),
         };
         drop(released);
-        if following.values().is_empty() {
+        if !state.store.has_recurrent_components() {
             install_commit(&mut state, &mut kept, &mut following, accepted);
             return Ok(OwnedAdvanceResolution::Committed(state));
         }
@@ -541,16 +555,18 @@ impl OwnedRepairAdvance {
         self.state.history_ranges()
     }
 
+    /// One arena per recurrent component; repair reads `previous_bank` and
+    /// writes only `following_bank`.
+    pub fn recurrent(&self) -> &[Tensor] {
+        self.state.store.recurrent_arenas()
+    }
+
     pub fn previous_bank(&self) -> usize {
         self.state.bank.index()
     }
 
-    pub fn previous(&self) -> &[Tensor] {
-        self.state.bank.values()
-    }
-
-    pub fn following(&self) -> &[Tensor] {
-        self.following.values()
+    pub fn following_bank(&self) -> usize {
+        self.following.index()
     }
 
     pub fn commit(mut self) -> SequenceState {
@@ -589,7 +605,7 @@ mod tests {
             4,
             4,
             vec![
-                ComponentDescriptor::new(LayerRef::Target(0), CodecSpec::dense(DType::F32, 1, 1))
+                ComponentDescriptor::new(LayerRef::Target(0), CodecSpec::dense(DType::F32, 1, 1), 1)
                     .unwrap(),
             ],
             vec![],
@@ -630,7 +646,7 @@ mod tests {
             4,
             4,
             vec![
-                ComponentDescriptor::new(LayerRef::Target(0), CodecSpec::dense(DType::F16, 8, 8))
+                ComponentDescriptor::new(LayerRef::Target(0), CodecSpec::dense(DType::F16, 8, 8), 1)
                     .unwrap(),
             ],
             vec![],
@@ -648,6 +664,7 @@ mod tests {
             vec![ComponentDescriptor::new(
                 LayerRef::Target(0),
                 KvCodec::AffineK8V4.spec(DType::F16, 8, 8),
+                1,
             )
             .unwrap()],
             vec![],
@@ -670,7 +687,8 @@ mod tests {
         assert_eq!(conversion.source_codec(), KvCodec::Dense);
         assert_eq!(conversion.destination_codec(), KvCodec::AffineK8V4);
         assert_eq!(conversion.conversions().len(), 2);
-        assert_eq!(conversion.bindings().destination_history.len(), 6);
+        // Codes and coefficient planes per vector kind.
+        assert_eq!(conversion.bindings().destination_history.len(), 4);
         assert_eq!(destination_store.occupied_rows(), 2);
         let (source, destination) = conversion.abort();
         assert_eq!(source.position(), 2);
@@ -703,7 +721,7 @@ mod tests {
             4,
             4,
             vec![
-                ComponentDescriptor::new(LayerRef::Target(0), CodecSpec::dense(DType::F32, 1, 1))
+                ComponentDescriptor::new(LayerRef::Target(0), CodecSpec::dense(DType::F32, 1, 1), 1)
                     .unwrap(),
             ],
             vec![ComponentSpec {

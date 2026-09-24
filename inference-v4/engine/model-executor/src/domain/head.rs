@@ -7,7 +7,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// separately from the accepted head state until a later target decision.
     pub fn submit_head(
         &mut self,
-        operations: Vec<Operation>,
+        operations: &[Operation],
         graph_workspace: NativeGraphWorkspaceLease,
         graph_output: NativeGraphOutputLease,
         advances: Vec<OwnedStateAdvance>,
@@ -51,7 +51,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         }
         let mut metadata = Vec::new();
-        for operation in &operations {
+        for operation in operations {
             let request = operation.request();
             metadata.push((request, operation.row_count()));
         }
@@ -189,6 +189,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(Slot {
             rows,
             bank: i32::try_from(binding.previous_bank).map_err(|_| "head bank exceeds i32")?,
+            following_bank: i32::try_from(binding.following_bank)
+                .map_err(|_| "head successor bank exceeds i32")?,
         })
     }
 

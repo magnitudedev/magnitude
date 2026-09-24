@@ -6,6 +6,7 @@ mod preparation;
 mod qualification;
 mod specialization;
 mod target;
+mod tuning;
 mod vision;
 
 pub(crate) use attestation::AttestedImport;
@@ -23,46 +24,76 @@ use target::TargetKernels;
 pub(crate) use target::{
     AttentionKernels, DenseKernels, ReadoutKernels, RecurrentKernels, RoutedKernels,
 };
+pub use tuning::{
+    attention_points, row_points, ZeroTuningWeights, PointShape, TunedEntry, TuningContext,
+    TuningEvent, TuningLimits, TuningObserver, TuningOrigin, TuningWeightSource, UnreportedTuning, ROTATION_LAYERS,
+    TUNING_CONTEXTS, TUNING_ROWS,
+};
+#[cfg(feature = "pinned-tuning")]
+pub use tuning::pinned as pinned_tuning;
+#[cfg(feature = "tuning-survey")]
+pub use tuning::survey as tuning_survey;
 use vision::VisionKernels;
 
 use crate::{
-    AttentionBinding, DenseBinding, EmbeddingBinding, ExecutionPath, FeaturesBinding,
-    FeedForwardProgramSlot, ImportProgramSlot, MixerProgramSlot, ProgramPlan, ReadoutBinding,
-    RecurrentBinding, RoutedBinding,
+    AttentionShape, ExecutionPath, FeedForwardProgramSlot, ImportProgramSlot, MixerProgramSlot,
+    ProgramPlan, RecurrentBinding, RoutedBinding,
 };
 use magnitude_model_kernels::{
-    copy_rows, gather_rows, head_logits_rows, import_dense, qwen_attention_attend,
-    qwen_attention_normalize, qwen_attention_output, qwen_attention_prepare,
-    qwen_attention_project, qwen_conditioning_overlay, qwen_dense_expand,
-    qwen_dense_expand_demanded, qwen_dense_output, qwen_dense_output_demanded, qwen_embedding_rows,
-    qwen_features_rows, qwen_head_rows, qwen_recurrent_mix, qwen_recurrent_normalize,
-    qwen_recurrent_output, qwen_recurrent_prepare, qwen_recurrent_project, qwen_recurrent_scan,
-    qwen_routed_expand, qwen_routed_logits, qwen_routed_normalize, qwen_routed_output,
-    qwen_routed_select, qwen_selected_rows, qwen_vision_block, qwen_vision_feature_output,
+    copy_rows, head_logits_rows, import_dense, qwen_attention_decode,
+    qwen_attention_output, qwen_attention_prefill, qwen_attention_project,
+    qwen_conditioning_overlay, qwen_dense_expand, qwen_dense_output, qwen_draft_rows,
+    qwen_embedding_rows, qwen_features_rows, qwen_head_rows, qwen_recurrent_chunk, qwen_recurrent_output,
+    qwen_recurrent_project, qwen_recurrent_step, qwen_routed_combine, qwen_routed_expand,
+    qwen_routed_experts, qwen_routed_group, qwen_routed_output, qwen_routed_route,
+    qwen_selected_rows, qwen_vision_block, qwen_vision_feature_output,
     qwen_vision_merger, qwen_vision_stem, repack_weight, sample_rows, shape_rows,
 };
 use seismic::{BackendName, DType, Device, Element, NativeKernel, Tensor};
 use std::{collections::HashMap, fmt};
 
+/// A failure of the native program catalog, reported with the execution
+/// path and the backend of the opened device it was preparing for.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CatalogError {
-    PathUnavailable {
-        path: ExecutionPath,
-        outcome: String,
-    },
-    Backend {
-        path: ExecutionPath,
-        backend: BackendName,
-        outcome: String,
-    },
+pub struct CatalogError {
+    pub path: ExecutionPath,
+    pub backend: BackendName,
+    pub failure: CatalogFailure,
+}
+
+impl CatalogError {
+    pub(crate) fn native(backend: BackendName, failure: CatalogFailure) -> Self {
+        Self {
+            path: ExecutionPath::Native,
+            backend,
+            failure,
+        }
+    }
+}
+
+/// An entry the program plan requires that has no native implementation
+/// for the opened device's backend.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MissingImplementation {
+    pub entry: &'static str,
+    pub bindings: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CatalogFailure {
+    /// Every required entry without an implementation for the backend.
+    MissingImplementations(Vec<MissingImplementation>),
     Preparation {
-        path: ExecutionPath,
+        entry: &'static str,
+        bindings: String,
+        outcome: String,
+    },
+    Tuning {
         entry: &'static str,
         bindings: String,
         outcome: String,
     },
     Qualification {
-        path: ExecutionPath,
         entry: &'static str,
         bindings: String,
         outcome: String,
@@ -71,62 +102,60 @@ pub enum CatalogError {
 
 impl fmt::Display for CatalogError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PathUnavailable { path, outcome } => {
-                write!(formatter, "execution path {path} is unavailable: {outcome}")
+        let path = self.path;
+        let backend = self.backend.as_str();
+        match &self.failure {
+            CatalogFailure::MissingImplementations(missing) => {
+                let mut entries: Vec<(&str, usize)> = Vec::new();
+                for missing in missing {
+                    match entries.iter_mut().find(|(entry, _)| *entry == missing.entry) {
+                        Some((_, bindings)) => *bindings += 1,
+                        None => entries.push((missing.entry, 1)),
+                    }
+                }
+                write!(
+                    formatter,
+                    "execution path {path} on {backend}: {} required entries have no {backend} implementation: {}",
+                    entries.len(),
+                    entries
+                        .iter()
+                        .map(|(entry, bindings)| match bindings {
+                            1 => (*entry).to_owned(),
+                            count => format!("{entry} ({count} element bindings)"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             }
-            Self::Backend {
-                path,
-                backend,
-                outcome,
-            } => write!(
-                formatter,
-                "execution path {path} cannot use {}: {outcome}",
-                backend.as_str()
-            ),
-            Self::Preparation {
-                path,
+            CatalogFailure::Preparation {
                 entry,
                 bindings,
                 outcome,
             } => write!(
                 formatter,
-                "failed to prepare {entry} on {path} with {bindings}: {outcome}"
+                "failed to prepare {entry} on {path} ({backend}) with {bindings}: {outcome}"
             ),
-            Self::Qualification {
-                path,
+            CatalogFailure::Tuning {
                 entry,
                 bindings,
                 outcome,
             } => write!(
                 formatter,
-                "failed to qualify {entry} on {path} with {bindings}: {outcome}"
+                "failed to tune {entry} on {path} ({backend}) with {bindings}: {outcome}"
+            ),
+            CatalogFailure::Qualification {
+                entry,
+                bindings,
+                outcome,
+            } => write!(
+                formatter,
+                "failed to qualify {entry} on {path} ({backend}) with {bindings}: {outcome}"
             ),
         }
     }
 }
 
 impl std::error::Error for CatalogError {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StageCallError {
-    pub path: ExecutionPath,
-    pub entry: &'static str,
-    pub bindings: String,
-    pub outcome: String,
-}
-
-impl fmt::Display for StageCallError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{} call to {} with {} failed: {}",
-            self.path, self.entry, self.bindings, self.outcome
-        )
-    }
-}
-
-impl std::error::Error for StageCallError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum QualificationCase {
@@ -173,11 +202,16 @@ mod qualification_tests {
         let Ok(device) = catalog.open_backend(BackendName::Metal) else {
             return;
         };
-        let q4k = Element::named("q4k").unwrap();
-        let q5k = Element::named("q5k").unwrap();
-        let q8 = Element::named("q8g32s").unwrap();
+        // Native Metal residents use the rows16 layout.
+        let rows16 = |representation| Element::stored(representation, seismic::Layout::Rows16).unwrap();
+        let q4k = rows16("q4k");
+        let q5k = rows16("q5k");
+        let q8 = rows16("q8g32s");
         let binding = RecurrentBinding {
+            key_heads: 16,
+            value_heads: 32,
             width: 128,
+            convolution_width: 4,
             norm: Element::bf16(),
             qkv: q5k,
             gate: q4k,
@@ -187,73 +221,63 @@ mod qualification_tests {
             output: q5k,
             activation: Element::bf16(),
         };
+        let heads = seismic::NativeSpecialization::new()
+            .with_static("NK", binding.key_heads)
+            .with_static("NV", binding.value_heads)
+            .with_static("W", binding.width);
+        let projections = heads.clone().with_static("H", 2560);
+        let statics = heads.with_static("C", binding.convolution_width);
+        /// The declared defaults of `E` at `statics`.
+        fn defaults<E: seismic::Entry>(
+            device: &seismic::Device,
+            statics: &seismic::NativeSpecialization,
+        ) -> seismic::NativeSpecialization {
+            seismic::generated::native_implementation::<E>(device)
+                .unwrap()
+                .unwrap()
+                .default_specialization(statics)
+                .unwrap()
+        }
         qwen_recurrent_project::native_for_device_with(
             &device,
             qwen_recurrent_project::Elements {
+                NW: binding.norm,
                 QW: binding.qkv,
                 GW: binding.gate,
                 AW: binding.alpha,
                 BW: binding.beta,
                 A: binding.activation,
-            }, &seismic::NativeSpecialization::new(),
+            },
+            &defaults::<qwen_recurrent_project::Entry>(&device, &projections),
         )
         .unwrap();
-        qwen_recurrent_prepare::native_for_device_with(
+        let step = defaults::<qwen_recurrent_step::Entry>(&device, &statics);
+        qwen_recurrent_step::native_for_device_with(
             &device,
-            qwen_recurrent_prepare::Elements {
+            qwen_recurrent_step::Elements {
                 A: binding.activation,
-                RN: binding.recurrent_norm,
-            }, &seismic::NativeSpecialization::new(),
+            },
+            &step,
         )
         .unwrap();
-        qwen_recurrent_scan::native_for_device_with(
+        let chunk = defaults::<qwen_recurrent_chunk::Entry>(&device, &statics);
+        qwen_recurrent_chunk::native_for_device_with(
             &device,
-            qwen_recurrent_scan::Elements {
+            qwen_recurrent_chunk::Elements {
                 A: binding.activation,
-            }, &seismic::NativeSpecialization::new(),
-        )
-        .unwrap();
-        qwen_recurrent_mix::native_for_device_with(
-            &device,
-            qwen_recurrent_mix::Elements {
-                RN: binding.recurrent_norm,
-                A: binding.activation,
-            }, &seismic::NativeSpecialization::new(),
+            },
+            &chunk,
         )
         .unwrap();
         qwen_recurrent_output::native_for_device_with(
             &device,
             qwen_recurrent_output::Elements {
+                RN: binding.recurrent_norm,
                 OW: binding.output,
                 A: binding.activation,
-            }, &seismic::NativeSpecialization::new(),
+            },
+            &defaults::<qwen_recurrent_output::Entry>(&device, &projections),
         )
         .unwrap();
-    }
-
-    #[test]
-    fn native_scan_preparation_rejects_width_above_thread_local_capacity() {
-        let binding = RecurrentBinding {
-            width: 256,
-            norm: Element::bf16(),
-            qkv: Element::bf16(),
-            gate: Element::bf16(),
-            alpha: Element::bf16(),
-            beta: Element::bf16(),
-            recurrent_norm: Element::bf16(),
-            output: Element::bf16(),
-            activation: Element::bf16(),
-        };
-        assert!(preparation::check_native_recurrent_scan_width(binding).is_ok());
-        assert!(matches!(
-            preparation::check_native_recurrent_scan_width(RecurrentBinding {
-                width: 257,
-                ..binding
-            }),
-            Err(CatalogError::Preparation {
-                entry: "qwen_recurrent_scan",
-                ..
-            })
-        ));
     }
 }

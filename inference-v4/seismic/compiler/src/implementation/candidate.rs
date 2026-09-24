@@ -8,11 +8,11 @@ use crate::numerics::NumericalApplicability;
 use seismic_ir::{
     kernel::KernelArena,
     schedule::{AnyScalarSlot, ParametricSchedule},
-    storage::{AnyBufferView, GlobalAllocationTopology, LocalAllocationTopology},
+    storage::{GlobalAllocationTopology, LocalAllocationTopology},
     target::PhysicalDialect,
 };
 use seismic_lang::{
-    expr::{AnyExpr, BoolExpr, DecisionId, NatExpr, SymbolKind, TargetPredicate},
+    expr::{AnyExpr, BoolExpr, DecisionId, SymbolKind, TargetPredicate},
     ids::StableFunctionId,
 };
 use std::collections::HashSet;

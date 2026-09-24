@@ -33,7 +33,7 @@ use seismic_ir::storage::{
 };
 use seismic_lang::entry::{
     AliasRule, CallSchema, CandidateKind, ParameterAccess, ParameterKind, SemanticEventKind,
-    SemanticFunction, SemanticNodeView, SemanticProgram, SemanticType, TensorStorage,
+    SemanticFunction, SemanticNodeView, SemanticProgram, SemanticType,
 };
 use seismic_lang::expr::{
     AnyExpr, BoolExpr, DecisionId, ExprArena, FiniteDomain, NatExpr, NodeView, TargetPredicate,
@@ -159,7 +159,7 @@ mod implementation_invariant_tests {
         let partial_extent = arena.nat_sub(end, start);
         let zero = arena.nat(0);
 
-        let span = internals::addressed_axis_span(&mut arena, partial_extent, zero);
+        let span = seismic_ir::storage::addressed_axis_span(&mut arena, partial_extent, zero);
         assert!(matches!(
             arena.view(AnyExpr::Nat(span)),
             NodeView::NatConst(0)
@@ -1235,17 +1235,6 @@ mod internals {
     }
 
     impl<'a, B: seismic_target::TargetFamily> Builder<'a, B> {
-        pub(super) fn context(&mut self) -> ConstructionContext<'_, B> {
-            ConstructionContext {
-                arena: self.arena,
-                program: self.program,
-                target: self.target,
-                registry: self.registry,
-                constants: self.constants,
-                precision: self.precision,
-            }
-        }
-
         pub(super) fn into_parts(self) -> (BuilderState<B>, ConstructionContext<'a, B>) {
             (
                 self.state,
@@ -2035,7 +2024,16 @@ mod internals {
             for &id in allocation_ids {
                 let allocation = storage.allocation(id);
                 let bytes = allocation.reserved_bytes;
+                // An imported allocation is a proxy for a caller-owned view.
+                // The caller established that view's representability where
+                // it acquired it; restating its span here puts the caller's
+                // reached geometry slots into this callee's guard.
+                let imported = matches!(
+                    allocation.kind,
+                    seismic_ir::storage::GlobalBufferKind::Imported { .. }
+                );
                 if allocation.acquisition == seismic_ir::storage::AllocationAcquisition::Invocation
+                    && !imported
                 {
                     self.state.constraints.push(self.arena.nat_cmp(
                         CmpOp::Le,
@@ -2750,7 +2748,7 @@ mod internals {
     /// Do not construct or evaluate `(max(extent, 1) - 1)` in that case: the
     /// extent can itself be a partial range subtraction, but its definedness
     /// is irrelevant to this axis's address contribution.
-    pub(super) use seismic_ir::storage::{addressed_axis_span, addressed_bytes};
+    pub(super) use seismic_ir::storage::addressed_bytes;
 
     fn digest_structure<B: seismic_target::TargetFamily>(
         digest: &mut seismic_ir::identity::StructureDigest,

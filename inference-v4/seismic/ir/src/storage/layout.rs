@@ -6,12 +6,15 @@ pub fn representation_alignment(representation: RepresentationId) -> u64 {
     match &registry::representation_info(representation).kind {
         RepresentationKind::Dense(dtype) => dtype.bytes() as u64,
         RepresentationKind::Packed(layout) => u64::from(layout.packet_alignment),
+        RepresentationKind::PackedRows(_) => registry::ROW_ALIGNMENT,
         RepresentationKind::External(layout) => u64::from(layout.packet_alignment),
     }
 }
 
 /// Concrete per-axis storage units and the byte width of one unit.
 /// Packed/external final axes count packets rather than logical elements.
+/// Row layouts count rows: the final axis is one unit of the row stride, and
+/// `mma16` pads the row axis to whole 16-row tiles.
 pub fn concrete_storage_units(
     representation: RepresentationId,
     extents: &[u64],
@@ -26,6 +29,10 @@ pub fn concrete_storage_units(
         RepresentationKind::External(packet) => {
             *units.last_mut()? = extents.last()?.div_ceil(u64::from(packet.logical_group));
             u64::from(packet.packet_size)
+        }
+        RepresentationKind::PackedRows(layout) => {
+            units = layout.storage_units(extents)?;
+            layout.row_stride_bytes(*extents.last()?)?
         }
     };
     if width == 0 {

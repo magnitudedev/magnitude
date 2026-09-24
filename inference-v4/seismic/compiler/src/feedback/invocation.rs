@@ -62,10 +62,10 @@ pub(super) struct WitnessCursor {
 
 /// Outcomes concern the remaining, unvisited search space. ProvenEmpty is
 /// returned only after exhaustive traversal or sound pruning, never a timeout.
-pub(super) enum WitnessResult<'a> {
+pub(super) enum WitnessResult {
     Found(Point),
     ProvenEmpty,
-    Unresolved(&'a WitnessCursor),
+    Unresolved,
 }
 
 /// Ranks are navigation bookkeeping over the finite single-word slice. An
@@ -521,15 +521,15 @@ impl Navigator {
     pub fn next(&mut self, random: &mut Random) -> Option<Point> {
         match self.query(random, 64) {
             WitnessResult::Found(point) => Some(point),
-            WitnessResult::ProvenEmpty | WitnessResult::Unresolved(_) => None,
+            WitnessResult::ProvenEmpty | WitnessResult::Unresolved => None,
         }
     }
 
-    pub fn query(&mut self, random: &mut Random, allowance: usize) -> WitnessResult<'_> {
+    pub fn query(&mut self, random: &mut Random, allowance: usize) -> WitnessResult {
         match self.search(random, allowance) {
             Some(point) => WitnessResult::Found(point),
             None if self.exhausted() && !self.rank_limited => WitnessResult::ProvenEmpty,
-            None => WitnessResult::Unresolved(&self.cursor),
+            None => WitnessResult::Unresolved,
         }
     }
 
@@ -1011,10 +1011,10 @@ mod tests {
             vec![(0, 1_000_000), (0, 1_000_000)],
         );
         let mut random = Random(19);
-        let WitnessResult::Unresolved(cursor) = nav.query(&mut random, 0) else {
+        let WitnessResult::Unresolved = nav.query(&mut random, 0) else {
             panic!("zero allowance is not proof of emptiness")
         };
-        assert_eq!(cursor.refinement.len(), 1);
+        assert_eq!(nav.cursor.refinement.len(), 1);
         let WitnessResult::Found(first) = nav.query(&mut random, 1) else {
             panic!("affine propagation should construct a witness")
         };
@@ -1043,7 +1043,7 @@ mod tests {
         let mut random = Random(42);
         assert!(matches!(
             nav.query(&mut random, 0),
-            WitnessResult::Unresolved(_)
+            WitnessResult::Unresolved
         ));
         assert!(matches!(
             nav.query(&mut random, 1),
@@ -1069,7 +1069,7 @@ mod tests {
         let mut random = Random(42);
         assert!(matches!(
             nav.query(&mut random, 1),
-            WitnessResult::Unresolved(_)
+            WitnessResult::Unresolved
         ));
     }
     #[test]

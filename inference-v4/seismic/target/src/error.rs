@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::PathBuf;
 
 /// A malformed immutable target description.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +35,13 @@ impl std::error::Error for TargetDescriptionError {}
 /// those are description, construction, or reconciliation defects.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NativeCompilationError {
+    /// The installation's native toolchain cannot be used on this host.
+    ToolchainUnavailable(ToolchainUnavailable),
+    /// The device's architecture is not one the installed toolchain targets.
+    UnsupportedArchitecture {
+        architecture: String,
+        supported: Vec<String>,
+    },
     ToolchainFailure(String),
     MalformedToolchainOutput(String),
     DeviceLost(String),
@@ -41,9 +49,72 @@ pub enum NativeCompilationError {
     ToolchainResourceExhausted(String),
 }
 
+/// Why an owned native toolchain library cannot be used. `library` is the
+/// file name the installation layout defines.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolchainUnavailable {
+    /// The toolchain's directory could not be determined.
+    Unlocated { reason: String },
+    /// The library is absent from the resolved directory.
+    Missing {
+        library: String,
+        directory: PathBuf,
+    },
+    /// The library is present but cannot be loaded or lacks an entry point.
+    Unusable {
+        library: String,
+        path: PathBuf,
+        reason: String,
+    },
+    /// The library is present with a version this build cannot use.
+    IncompatibleVersion {
+        library: String,
+        path: PathBuf,
+        found: String,
+        required: String,
+    },
+}
+
+impl fmt::Display for ToolchainUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unlocated { reason } => {
+                write!(f, "the toolchain directory cannot be determined: {reason}")
+            }
+            Self::Missing { library, directory } => {
+                write!(f, "{library} is not present in {}", directory.display())
+            }
+            Self::Unusable {
+                library,
+                path,
+                reason,
+            } => write!(f, "{library} at {} is unusable: {reason}", path.display()),
+            Self::IncompatibleVersion {
+                library,
+                path,
+                found,
+                required,
+            } => write!(
+                f,
+                "{library} at {} is version {found}, but this build requires {required}",
+                path.display()
+            ),
+        }
+    }
+}
+
 impl fmt::Display for NativeCompilationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ToolchainUnavailable(reason) => write!(f, "toolchain unavailable: {reason}"),
+            Self::UnsupportedArchitecture {
+                architecture,
+                supported,
+            } => write!(
+                f,
+                "architecture {architecture} is not supported by the installed toolchain (supported: {})",
+                supported.join(", ")
+            ),
             Self::ToolchainFailure(message) => write!(f, "toolchain failure: {message}"),
             Self::MalformedToolchainOutput(message) => {
                 write!(f, "malformed toolchain output: {message}")

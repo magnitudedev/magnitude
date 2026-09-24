@@ -1,0 +1,33 @@
+# CUDA implementations of the gated-delta state entries (contracts in
+# recurrent_stages.seismic). Grid z runs over the B slots plus one block
+# layer that zeroes the mixed rows no slot covers.
+
+# Warp per state row: each warp owns ROWS state rows, W / 32 float columns
+# per lane, for the whole slot; the preparation is fused per row.
+native qwen_recurrent_step for cuda from "cuda/qwen_recurrent_step.cu":
+    static (NK, NV, W, C)
+    params (ROWS in [2, 4], WARPS in [4, 8])
+    where W % 32 == 0 and W % (ROWS * WARPS) == 0
+    launch qwen_recurrent_step:
+        threadgroups (NV, W / (ROWS * WARPS), B + 1)
+        threads_per_threadgroup (WARPS * 32, 1, 1)
+
+
+# Chunked WY form over pieces of 16 rows: a prepare launch per (piece, key
+# head) convolves the piece's q/k/v rows once and forms, per value head, the
+# decayed K K^T system's inverse and Q K^T (F32); a scan launch per (ROWS state
+# rows, value head, slot) keeps the state in tensor-core accumulators and
+# applies the slot's pieces in order on f16 m16n8k16 operands. The Metal chunk
+# instead convolves in an `inputs` launch and builds the systems in its scan.
+native qwen_recurrent_chunk for cuda from "cuda/qwen_recurrent_chunk.cu":
+    static (NK, NV, W, C)
+    params (ROWS in [128, 64, 32, 16])
+    where W % 32 == 0 and W <= 256 and W % ROWS == 0 and NV % NK == 0 and 8 % (2 + NV / NK) == 0
+    scratch pieces bytes ((ceil_div(M, 16) + 2 * B) * (NK * 96 * W + NV * (32 * W + 1168)))
+    launch qwen_recurrent_chunk_prepare:
+        threadgroups (ceil_div(M, 16) + 2 * B, NK, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch qwen_recurrent_chunk_scan:
+        threadgroups (W / ROWS, NV, B + 1)
+        threads_per_threadgroup (2 * ROWS, 1, 1)
+        shared_bytes (3 * (96 * W + 32 * ROWS + 1680) + ROWS / 16 * 16 * 17 * 4)

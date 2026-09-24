@@ -108,6 +108,8 @@ impl StateLaunchInputs {
                     || advance.rows() != replay.actual_rows()
                     || replay.slot(0).is_none_or(|slot| {
                         i32::try_from(advance.previous_bank()).ok() != Some(slot.bank())
+                            || i32::try_from(advance.following_bank()).ok()
+                                != Some(slot.following_bank())
                     })
                 {
                     return Err(invalid(

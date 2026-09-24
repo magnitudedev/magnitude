@@ -21,7 +21,13 @@ individual reference generators record their source and generator hashes;
 the erf/GELU array is produced by `qwen_vision_merger_reference.py --erf`.
 
 Measurement reports also belong under ignored `results/`;
-`v3_qwen_forward_bench.py` generates the full-model V3 measurements.
+`v3_qwen_forward_bench.py` generates the full-model V3 measurements on a GGUF
+file: decode after `--context` tokens of history, prefill chunks (`--prefill`)
+and concurrent decode (`--sequences`), selected with `--cells
+decode,prefill,concurrent`, each with one per-kernel profile. Run one cell
+family per process when the families need different context capacities or
+sequence counts; each run writes one JSON file (`--output x.json`, or a
+directory receiving `result.json`).
 
 ## Native V4 Session Bench
 

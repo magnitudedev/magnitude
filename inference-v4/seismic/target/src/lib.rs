@@ -14,7 +14,7 @@ pub use description::{
     CompatibilityIdentity, DeviceDescription, DeviceDescriptionIdentity, DeviceDescriptionParts,
     NativeNumericalModeIdentity, NumericalEnvironmentIdentity, TargetFamily,
 };
-pub use error::{NativeCompilationError, TargetDescriptionError};
+pub use error::{NativeCompilationError, TargetDescriptionError, ToolchainUnavailable};
 pub use native::{
     form_native_kernel, reconcile_native_kernel, ClusterPortability, NativeArtifactMetrics,
     NativeClusterDomain, NativeCompiler, NativeFormation, NativeKernel, NativeKernelCandidate,

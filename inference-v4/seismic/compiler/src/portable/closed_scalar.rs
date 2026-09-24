@@ -5,7 +5,6 @@ use seismic_ir::kernel::ops::{self, Op, ValueType};
 use seismic_ir::repr::ScalarKind;
 use seismic_ir::schedule::{ParametricSchedule, ScheduleStep};
 use seismic_ir::storage::{GlobalAllocationTopology, ViewBase};
-use seismic_lang::entry::SemanticProgram;
 use seismic_lang::reference_math::{self as reference, ReferenceNode, ReferenceScalar, WordOp};
 use std::collections::HashMap;
 mod packed;

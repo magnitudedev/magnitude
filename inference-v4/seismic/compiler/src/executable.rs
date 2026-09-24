@@ -99,12 +99,12 @@ enum CompiledRegionOperand {
     Tensor(CompiledBufferView),
 }
 #[derive(Debug)]
-enum CompiledTensorAxisDestination {
+pub enum CompiledTensorAxisDestination {
     Bound(seismic_lang::expr::SymbolId),
     Invariant(CompiledNat),
 }
 #[derive(Debug)]
-enum CompiledRegionDestination {
+pub enum CompiledRegionDestination {
     Scalar(AnyScalarSlot),
     Quantity(HostQuantitySlot),
     Tensor { id: u32, extents: Vec<CompiledTensorAxisDestination>, strides: Vec<seismic_lang::expr::SymbolId> },
@@ -169,7 +169,6 @@ enum CompiledViewBase {
 #[derive(Clone, Debug)]
 struct TensorDescriptor {
     allocation: ExecutableAllocationId,
-    representation: seismic_lang::ids::RepresentationId,
     byte_offset: seismic_lang::expr::BigUint,
     extents: Vec<seismic_lang::expr::BigUint>,
     strides: Vec<seismic_lang::expr::BigUint>,
@@ -1574,7 +1573,7 @@ impl<'a, T: seismic_target::TargetFamily, H, D: DeviceService<T>>
         let evaluate = |value: &CompiledNat| value.evaluate(self.values)
             .map_err(|error| eval_failure("tensor geometry capture", error));
         Ok(TensorDescriptor {
-            allocation, representation: view.representation,
+            allocation,
             byte_offset: offset + evaluate(&view.byte_offset)?,
             extents: view.extents.iter().map(evaluate).collect::<Result<_, _>>()?,
             strides: view.strides.iter().map(evaluate).collect::<Result<_, _>>()?,
@@ -1600,6 +1599,9 @@ impl<'a, T: seismic_target::TargetFamily, H, D: DeviceService<T>>
             seismic_lang::registry::RepresentationKind::External(layout) => {
                 if let Some(last) = addressed_extents.last_mut() { *last = last.div_ceil(u64::from(layout.logical_group)); }
                 u64::from(layout.packet_size)
+            }
+            seismic_lang::registry::RepresentationKind::PackedRows(_) => {
+                return Err(contradiction(seismic_lang::registry::ROW_LAYOUT_IS_NATIVE_ONLY))
             }
         };
         let exact_span = if addressed_extents.contains(&0) { seismic_lang::expr::BigUint::default() }
@@ -1810,7 +1812,7 @@ where
                 let geometry = env.resources.buffer(*allocation).tensor.as_ref().ok_or_else(|| ExecutionError::ConstructionContradiction("argument tensor lost its bound geometry".into()))?;
                 if geometry.representation != *representation { return Err(ExecutionError::ConstructionContradiction("argument representation changed after binding".into())); }
                 let value = TensorDescriptor {
-                    allocation: *allocation, representation: *representation, byte_offset: 0u64.into(),
+                    allocation: *allocation, byte_offset: 0u64.into(),
                     extents: geometry.extents.iter().map(|value| (*value).into()).collect(),
                     strides: geometry.strides.iter().map(|value| (*value).into()).collect(),
                 };
@@ -2111,7 +2113,7 @@ mod allocation_size_tests {
     fn available_with_retained_product() -> Vec<ExecutableAllocationId> {
         let banks = [ExecutableAllocationId(0), ExecutableAllocationId(1), ExecutableAllocationId(2)];
         let retained = std::collections::BTreeMap::from([(7, TensorDescriptor {
-            allocation: banks[2], representation: seismic_lang::registry::dense(seismic_lang::types::DType::I32), byte_offset: 0u64.into(), extents: vec![2u64.into()], strides: vec![4u64.into()],
+            allocation: banks[2], byte_offset: 0u64.into(), extents: vec![2u64.into()], strides: vec![4u64.into()],
         })]);
         available_instance_banks(&banks, &retained)
     }
@@ -2153,7 +2155,7 @@ mod allocation_size_tests {
                 }),
             }];
             let mut resources = limited_resources(); let mut values = InvocationValues::new();
-            let initial = TensorDescriptor { allocation: ExecutableAllocationId(2), representation,
+            let initial = TensorDescriptor { allocation: ExecutableAllocationId(2),
                 byte_offset: 0u64.into(), extents: vec![seismic_lang::expr::BigUint::from(1u8) << 80usize], strides: vec![1u64.into()] };
             let mut env = ExecutionEnvironment {
                 native_index_bits: 64, device: &NoDevice, resources: &mut resources, values: &mut values,

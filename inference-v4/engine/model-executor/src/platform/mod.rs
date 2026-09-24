@@ -17,4 +17,4 @@ pub use qualification::{
     open_selected, select_device, BudgetError, MemoryRequirements, OpenedPlatform,
     PlatformConfig, PlatformError, QualifiedPlatform, SelectedDevice,
 };
-pub use selection::{select, SelectionError};
+pub use selection::{select, DeviceRequest, DeviceRequestParseError, SelectionError};

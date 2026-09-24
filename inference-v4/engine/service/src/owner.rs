@@ -996,7 +996,13 @@ impl<F: ProgramFamily> Owner<F> {
             return Ok(Step::Idle);
         }
         let before = self.publish_ready()?;
-        let step = self.step_inner(now)?;
+        let mut step = self.step_inner(now)?;
+        if step == Step::Reconciled {
+            // Submit the next round before publishing the reconciled batch's
+            // tokens, so publication overlaps device execution. The round
+            // never depends on publication; it reads only reconciled state.
+            step = self.step_inner(now)?;
+        }
         let after = self.publish_ready()?;
         if (before || after) && matches!(step, Step::Idle | Step::Waiting) {
             Ok(Step::Progress)
@@ -1075,15 +1081,7 @@ impl<F: ProgramFamily> Owner<F> {
             self.scheduler.completed(selection, 0);
             return Ok(Step::Progress);
         }
-        let groups = match group(&self.domain, operations) {
-            Ok(groups) => groups,
-            Err(error) => {
-                self.fail_all(error);
-                self.epoch.advance()?;
-                self.scheduler.completed(selection, 0);
-                return Ok(Step::Progress);
-            }
-        };
+        let groups = group(&self.domain, operations);
         self.batch = Some(Batch {
             selection,
             started: now,
@@ -1210,37 +1208,41 @@ impl<F: ProgramFamily> Owner<F> {
 
     fn submit_next(&mut self) -> Result<Step, String> {
         let queued = self.batch.as_mut().unwrap().queued.pop_front().unwrap();
-        let operations = queued.group.operations().to_vec();
-        let live = operations
+        let ended = queued
+            .group
+            .operations()
             .iter()
-            .filter(|operation| {
-                self.records
-                    .get(&operation.request())
-                    .is_some_and(|record| {
-                        !matches!(
-                            record.generation.finish_reason(),
-                            Some(FinishReason::Cancelled | FinishReason::Failed)
-                        )
-                    })
+            .map(Operation::request)
+            .filter(|request| {
+                self.records.get(request).is_none_or(|record| {
+                    matches!(
+                        record.generation.finish_reason(),
+                        Some(FinishReason::Cancelled | FinishReason::Failed)
+                    )
+                })
             })
-            .cloned()
             .collect::<Vec<_>>();
-        if live.len() != operations.len() {
-            for operation in operations.iter().filter(|operation| {
-                !live
-                    .iter()
-                    .any(|candidate| candidate.request() == operation.request())
-            }) {
-                self.domain.abort_head_pending(operation.request())?;
+        if !ended.is_empty() {
+            for &request in &ended {
+                self.domain.abort_head_pending(request)?;
             }
+            let QueuedGroup {
+                group: queued_group,
+                purpose,
+            } = queued;
+            let live = queued_group
+                .into_operations()
+                .into_iter()
+                .filter(|operation| !ended.contains(&operation.request()))
+                .collect::<Vec<_>>();
             if !live.is_empty() {
-                let mut groups = group(&self.domain, live)?;
+                let mut groups = group(&self.domain, live);
                 if groups.len() != 1 {
                     return Err("filtered operation group changed its numerical lane".into());
                 }
                 self.batch.as_mut().unwrap().queued.push_front(QueuedGroup {
                     group: groups.pop().unwrap(),
-                    purpose: queued.purpose,
+                    purpose,
                 });
             }
             self.epoch.advance()?;
@@ -1272,20 +1274,23 @@ impl<F: ProgramFamily> Owner<F> {
                 deficit = current;
                 return self.capacity_unavailable(
                     queued,
-                    operations,
                     deficit.resource,
                     deficit.required,
                     deficit.available,
                 );
             }
         }
-        let Some(publication_permits) = self.reserve_group_publications(&operations)? else {
+        let Some(publication_permits) =
+            self.reserve_group_publications(queued.group.operations())?
+        else {
             let batch = self.batch.as_mut().unwrap();
             batch.queued.push_front(queued);
             batch.blocked = Some(self.epoch);
             return Ok(Step::Waiting);
         };
-        match submit_group(&mut self.domain, &queued.group) {
+        let submitted = submit_group(&mut self.domain, &queued.group);
+        let operations = queued.group.into_operations();
+        match submitted {
             Ok(flight) => {
                 let mut retention_uses = Vec::new();
                 for request in operations
@@ -1397,11 +1402,11 @@ impl<F: ProgramFamily> Owner<F> {
     fn capacity_unavailable(
         &mut self,
         queued: QueuedGroup,
-        operations: Vec<Operation>,
         resource: ResourceKind,
         required: u64,
         available: u64,
     ) -> Result<Step, String> {
+        let operations = queued.group.operations();
         if std::env::var_os("MAGNITUDE_TRACE_TARGET").is_some() {
             eprintln!(
                 "target admission deficit {:?} required={} available={} operations={} rows={:?}",
@@ -1415,6 +1420,10 @@ impl<F: ProgramFamily> Owner<F> {
                     .collect::<Vec<_>>()
             );
         }
+        let requests = operations
+            .iter()
+            .map(Operation::request)
+            .collect::<Vec<_>>();
         let selected = self.batch.as_ref().unwrap().selection.requests().to_vec();
 
         let can_change = self.records.iter().any(|(id, record)| {
@@ -1424,8 +1433,8 @@ impl<F: ProgramFamily> Owner<F> {
                     || record.capacity.is_none())
         });
         if can_change {
-            for operation in &operations {
-                if let Some(record) = self.records.get_mut(&operation.request()) {
+            for request in &requests {
+                if let Some(record) = self.records.get_mut(request) {
                     record.capacity = Some((self.epoch, required, available));
                 }
             }
@@ -1434,9 +1443,9 @@ impl<F: ProgramFamily> Owner<F> {
             batch.blocked = Some(self.epoch);
             Ok(Step::Waiting)
         } else {
-            for operation in operations {
+            for request in requests {
                 self.fail_request(
-                    operation.request(),
+                    request,
                     RequestError::Capacity(ServiceCapacityError {
                         resource: CapacityResource::Execution(resource),
                         required,
@@ -1770,7 +1779,7 @@ impl<F: ProgramFamily> Owner<F> {
         operations: Vec<Operation>,
         purpose: Purpose,
     ) -> Result<(), String> {
-        let groups = group(&self.domain, operations).map_err(|error| error.to_string())?;
+        let groups = group(&self.domain, operations);
         if groups.len() > 1 && matches!(purpose, Purpose::Repairs) {
             return Err("repair operations crossed executor groups".into());
         }

@@ -187,8 +187,10 @@ pub(crate) fn device_for_workers(
         subgroup_width: None,
     };
     let scalars: BTreeSet<_> = DType::ALL.into_iter().collect();
+    // Row layouts are native-only (`ROW_LAYOUT_IS_NATIVE_ONLY`).
     let representations = language_registry::representations()
         .iter()
+        .filter(|info| info.layout == language_registry::Layout::Packet)
         .map(|info| info.id)
         .collect();
     let dtypes = DataTypeSupport {

@@ -374,7 +374,7 @@ fn mixed_quantity_comparison_uses_the_checked_explicit_cast() {
         )).count();
         assert_eq!(emitted_casts, casts, "{name}: only the checked word boundary emits a cast");
         let entry = module.entry(module.entry_named(name).unwrap(), &Default::default()).unwrap();
-        let mut oracle = Interpreter::new(&entry);
+        let oracle = Interpreter::new(&entry);
         let outcome = oracle.run(&[Arg::Index(2147483648_u64.into()), Arg::Scalar(ReferenceScalar::I32(0))]).unwrap();
         assert!(matches!(outcome.results().next().unwrap().value(), OutcomeValue::Scalar(ReferenceScalar::Bool(value)) if value == expected), "{name}");
     }

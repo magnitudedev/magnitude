@@ -51,71 +51,6 @@ pub(crate) enum PackingAxisRule {
     Last,
 }
 
-impl PackingAxisRule {
-    pub(crate) fn resolve(self, rank: usize) -> Option<usize> {
-        match self {
-            Self::Last => rank.checked_sub(1),
-        }
-    }
-}
-
-/// Private packet rows large enough to retain any logical prefix within a
-/// representation group. The same physical plane geometry owns native storage
-/// declarations and raw snapshot copies on every backend.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SnapshotLayout {
-    pub(crate) physical_width: u64,
-    pub(crate) strides: Vec<u64>,
-    pub(crate) planes: Vec<SnapshotPlane>,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SnapshotPlane {
-    pub(crate) plane: Plane,
-    pub(crate) elements_per_row: u64,
-    pub(crate) elements: u64,
-}
-impl Repr {
-    pub(crate) fn snapshot_layout(&self, capacities: &[u64]) -> Option<SnapshotLayout> {
-        let (&width, outer) = capacities.split_last()?;
-        let group = u64::from(self.storage_group());
-        let physical_width = if width == 0 {
-            0
-        } else {
-            width
-                .checked_add(group - 1)?
-                .div_ceil(group)
-                .checked_mul(group)?
-        };
-        let rows = if outer.contains(&0) {
-            0
-        } else {
-            outer.iter().try_fold(1u64, |n, &d| n.checked_mul(d))?
-        };
-        let mut strides = vec![1; capacities.len()];
-        let mut stride = physical_width;
-        for axis in (0..outer.len()).rev() {
-            strides[axis] = stride;
-            stride = stride.checked_mul(capacities[axis])?;
-        }
-        let planes = self
-            .planes()
-            .into_iter()
-            .map(|plane| {
-                let elements_per_row = plane.storage_elements(physical_width)?;
-                Some(SnapshotPlane {
-                    elements: rows.checked_mul(elements_per_row)?,
-                    elements_per_row,
-                    plane,
-                })
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(SnapshotLayout {
-            physical_width,
-            strides,
-            planes,
-        })
-    }
-}
 /// Physical coefficient encoding. Hierarchical fields are interleaved scale,
 /// bias (when present); factors are shared by a larger group.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -212,6 +147,9 @@ pub(crate) struct Plane {
     pub(crate) fields: u32,
     pub(crate) encoding: PlaneEncoding,
 }
+/// Reference coefficient structure; the decode-recipe tests check every
+/// recipe against it.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Coefficient {
     Direct {
@@ -239,40 +177,22 @@ impl Plane {
             PlaneEncoding::FloatCode { format } => format.bits(),
         }
     }
-    pub(crate) fn entries(&self, values: u64) -> Option<u64> {
-        values
+    /// Plane bytes for `values` logical values; the tests check the plane
+    /// tables against the published payload sizes with it.
+    #[cfg(test)]
+    pub(crate) fn bytes(&self, values: u64) -> Option<u64> {
+        let entries = values
             .div_ceil(u64::from(self.group))
-            .checked_mul(u64::from(self.fields))
-    }
-    pub(crate) fn storage_elements(&self, values: u64) -> Option<u64> {
-        let entries = self.entries(values)?;
+            .checked_mul(u64::from(self.fields))?;
         match self.encoding {
-            PlaneEncoding::Dense(_) => Some(entries),
-            PlaneEncoding::Packed { bits, .. } => {
-                entries.checked_mul(u64::from(bits)).map(|n| n.div_ceil(32))
-            }
+            PlaneEncoding::Dense(dtype) => entries.checked_mul(u64::from(dtype.bytes())),
+            PlaneEncoding::Packed { bits, .. } => entries
+                .checked_mul(u64::from(bits))
+                .map(|n| n.div_ceil(32) * u64::from(DType::U32.bytes())),
             PlaneEncoding::FloatCode { format } => entries
                 .checked_mul(u64::from(format.bits()))
                 .map(|bits| bits.div_ceil(8)),
         }
-    }
-    pub(crate) fn bytes(&self, values: u64) -> Option<u64> {
-        match self.encoding {
-            PlaneEncoding::FloatCode { .. } => self.storage_elements(values),
-            _ => self
-                .storage_elements(values)?
-                .checked_mul(u64::from(self.dtype().bytes())),
-        }
-    }
-    pub(crate) fn byte_offset(&self, logical: u64) -> Option<u64> {
-        if !logical.is_multiple_of(u64::from(self.group)) {
-            return None;
-        }
-        let bits = (logical / u64::from(self.group))
-            .checked_mul(u64::from(self.fields))?
-            .checked_mul(u64::from(self.entry_bits()))?;
-        let alignment = u64::from(self.dtype().bytes()) * 8;
-        bits.is_multiple_of(alignment).then_some(bits / 8)
     }
 }
 
@@ -283,6 +203,7 @@ pub enum CodeInterpretation {
     Offset(i32),
     Table(&'static [i32]),
 }
+#[cfg(test)]
 impl Repr {
     pub(crate) fn decode_code(&self, raw: u32) -> i32 {
         self.code.decode(raw, self.bits)
@@ -758,6 +679,7 @@ impl CodeInterpretation {
     }
 }
 
+#[cfg(test)]
 impl Repr {
     pub(crate) fn has_bias(&self) -> bool {
         match self.coefficients {
@@ -765,13 +687,9 @@ impl Repr {
             Coefficients::BlockFloat { .. } => false,
         }
     }
-    pub(crate) fn coefficient_dtype(&self) -> DType {
-        match self.coefficients {
-            Coefficients::Direct { dtype, .. } => dtype,
-            Coefficients::Hierarchical { .. } => DType::F32,
-            Coefficients::BlockFloat { .. } => DType::F32,
-        }
-    }
+}
+
+impl Repr {
     pub(crate) fn storage_group(&self) -> u32 {
         match self.coefficients {
             Coefficients::Direct { packet_group, .. } => packet_group,
@@ -898,12 +816,6 @@ impl Repr {
             .collect()
     }
 
-    /// The typed decode recipe of this representation producing `f32`
-    /// (the portable `decode` result).
-    pub(crate) fn decode_recipe(&self) -> DecodeRecipe {
-        self.decode_recipe_to(DType::F32)
-    }
-
     /// The typed decode recipe of this representation producing `output`
     /// (a `cast` of a packed value). The recipe is the registry's single
     /// statement of the decode: `scale * code + bias` rounded once to `f32`,
@@ -1027,9 +939,10 @@ impl Repr {
             output: output_temp,
         }
     }
-    pub(crate) fn plane(&self, name: &str) -> Option<Plane> {
-        self.planes().into_iter().find(|p| p.name == name)
-    }
+}
+
+#[cfg(test)]
+impl Repr {
     pub(crate) fn plane_index(&self, name: &str) -> Option<usize> {
         self.planes().iter().position(|p| p.name == name)
     }
@@ -1068,30 +981,6 @@ impl Repr {
                 plane: find(PlaneField::BlockScale)?,
             }),
         }
-    }
-    pub(crate) fn bits_per_value(&self) -> f64 {
-        self.planes()
-            .iter()
-            .map(|p| p.entry_bits() as f64 * p.fields as f64 / p.group as f64)
-            .sum()
-    }
-}
-
-/// Little-endian contiguous packed entry; reads only bytes containing the entry.
-pub(crate) fn read_packed(bytes: &[u8], entry: usize, bits: u32) -> u32 {
-    let first = entry * bits as usize;
-    let mut value = 0;
-    for bit in 0..bits as usize {
-        value |= u32::from((bytes[(first + bit) / 8] >> ((first + bit) % 8)) & 1) << bit;
-    }
-    value
-}
-pub(crate) fn write_packed(bytes: &mut [u8], entry: usize, bits: u32, value: u32) {
-    let first = entry * bits as usize;
-    for bit in 0..bits as usize {
-        let index = (first + bit) / 8;
-        let shift = (first + bit) % 8;
-        bytes[index] = (bytes[index] & !(1 << shift)) | (((value >> bit) as u8 & 1) << shift);
     }
 }
 
@@ -1177,7 +1066,7 @@ mod tests {
     #[test]
     fn decode_recipes_match_reference_coefficient_semantics() {
         for repr in REPRS {
-            let recipe = repr.decode_recipe();
+            let recipe = repr.decode_recipe_to(DType::F32);
             let plane_entry = synthetic_plane_entry(repr);
             let planes = repr.planes();
             assert_eq!(recipe.planes().len(), planes.len());
@@ -1335,7 +1224,7 @@ mod tests {
     #[test]
     fn hierarchical_recipes_apply_the_bias_sign_and_direct_recipes_do_not_negate() {
         for repr in REPRS {
-            let recipe = repr.decode_recipe();
+            let recipe = repr.decode_recipe_to(DType::F32);
             let negations = recipe
                 .steps
                 .iter()
@@ -1361,7 +1250,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_planes_match_payload_and_cross_word_entries() {
+    fn compact_planes_match_payload() {
         for (name, expected) in [("q4k", 144), ("q5k", 176), ("q6k", 210)] {
             let r = lookup(name).unwrap();
             assert_eq!(
@@ -1371,22 +1260,6 @@ mod tests {
                     .sum::<u64>(),
                 expected
             );
-            for plane in r.planes() {
-                if let PlaneEncoding::Packed { bits, .. } = plane.encoding {
-                    let n = plane.entries(512).unwrap() as usize;
-                    let mut bytes = vec![0; plane.bytes(512).unwrap() as usize];
-                    for i in 0..n {
-                        write_packed(&mut bytes, i, bits, (i as u32).wrapping_mul(31));
-                    }
-                    for i in 0..n {
-                        assert_eq!(
-                            read_packed(&bytes, i, bits),
-                            (i as u32).wrapping_mul(31) & ((1 << bits) - 1)
-                        );
-                    }
-                    assert_eq!(plane.byte_offset(256), plane.bytes(256));
-                }
-            }
         }
     }
 }

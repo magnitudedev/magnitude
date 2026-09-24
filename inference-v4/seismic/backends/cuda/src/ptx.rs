@@ -10,7 +10,7 @@ use seismic_ir::kernel::{BlockId, Kernel};
 use seismic_ir::storage::LaunchLocalKind;
 use seismic_ir::target::{
     DenseRepresentationGeometry, KernelEmissionLayout, PackedRepresentationGeometry,
-    ReadableRepresentationGeometry, RepresentationGeometry,
+    ReadableRepresentationGeometry,
 };
 use seismic_lang::intrinsics::{AtomicOp, MathOp, ReduceOp};
 use seismic_lang::registry::{
@@ -1251,13 +1251,6 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn place_raw(&mut self, place: PlaceRef) -> (RepresentationGeometry, u32, u32, String) {
-        let closed = self.kernel.closed_place(place, self.layout);
-        self.place(&closed)
-    }
-    fn dense_place(&self, place: PlaceRef) -> ClosedDensePlace {
-        self.kernel.closed_dense_place(place, self.layout)
-    }
     fn readable_place(&self, place: PlaceRef) -> ClosedReadablePlace {
         self.kernel.closed_readable_place(place, self.layout)
     }
@@ -2017,10 +2010,6 @@ impl<'a> Emitter<'a> {
             }
         }
     }
-    fn load(&mut self, out: ErasedValue, out_type: ValueType, address: &str, dtype: DType) {
-        let destination = self.v(out);
-        self.load_to(&destination, out_type, address, dtype);
-    }
     fn load_to(&mut self, destination: &str, out_type: ValueType, address: &str, dtype: DType) {
         if matches!(dtype, DType::F16 | DType::BF16) {
             let bits = self.h16();
@@ -2030,17 +2019,6 @@ impl<'a> Emitter<'a> {
             let temp = self.load_temp(address, dtype);
             self.line(format!("mov{} {destination}, {temp};", suffix(out_type)));
         }
-    }
-    fn load_bits(&mut self, out: ErasedValue, address: &str, dtype: DType) {
-        self.line(format!(
-            "ld.global{} {}, [{address}];",
-            match dtype {
-                DType::F32 | DType::I32 | DType::U32 => ".u32",
-                DType::F16 | DType::BF16 => ".u16",
-                DType::Bool => ".u8",
-            },
-            self.v(out)
-        ));
     }
     fn write(&mut self, place: &ClosedDensePlace, index: &[ErasedValue], value: ErasedValue) {
         let (address, geometry, _) = self.address(place, index);
@@ -3762,7 +3740,6 @@ mod tests {
     }
 
     fn fixture(run: impl FnOnce(&mut Emitter<'_>, &[ClosedValue])) -> String {
-        use crate::profile::{ComputeCapability, DriverApiVersion, PtxTarget, TensorMemory};
         use seismic_ir::{
             construction::Construction,
             target::{KernelWordLayout, VectorSupport},
@@ -3936,7 +3913,8 @@ mod tests {
                 emitter.scalar_arg(value.value, 0, seismic_ir::repr::ScalarKind::Scalar(dtype));
                 emitter.copy_value(*value, value.value);
                 let geometry =
-                    RepresentationGeometry::of(seismic_lang::registry::dense(dtype)).dense();
+                    seismic_ir::target::RepresentationGeometry::of(seismic_lang::registry::dense(dtype))
+                        .dense();
                 emitter.write_address("%address", &geometry, &name);
                 emitter.store_slot(0, seismic_ir::repr::ScalarKind::Scalar(dtype), *value);
             }

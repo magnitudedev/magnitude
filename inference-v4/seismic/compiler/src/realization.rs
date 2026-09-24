@@ -7,9 +7,9 @@
 //! ordered native set without exposing handles to evaluation or planning.
 
 use crate::errors::PreparationError;
-use crate::refinement::{ConstructedCandidate, ConstructedCandidateIdentity};
+use crate::refinement::ConstructedCandidate;
 use seismic_ir::kernel::KernelId;
-use seismic_lang::expr::{AnyExpr, DecisionId, ExprArena, PartialAssignment, SymbolValue};
+use seismic_lang::expr::{AnyExpr, ExprArena, PartialAssignment, SymbolValue};
 use seismic_target::{
     CompatibilityIdentity, DeviceDescription, DeviceDescriptionIdentity, NativeArtifactMetrics,
     NativeCompiler, NativeKernelDescription, TargetFamily,
@@ -198,8 +198,10 @@ pub(crate) mod demand_driven_tests {
     use super::*;
     use crate::numerics::NumericalApplicability;
     use crate::refinement::{
-        ChoiceDeclaration, ConstructedCandidateParts, ImplementationProvenance,
+        ChoiceDeclaration, ConstructedCandidateIdentity, ConstructedCandidateParts,
+        ImplementationProvenance,
     };
+    use seismic_lang::expr::DecisionId;
     use seismic_ir::construction::{AllocationPlan, Construction};
     use seismic_ir::kernel::{Kernel, KernelId};
     use seismic_ir::target::{
@@ -380,16 +382,18 @@ pub(crate) mod demand_driven_tests {
         }
     }
 
+    /// Accepts every candidate and retains its realized native set, which the
+    /// tests inspect through the reconciled output.
     struct Accept;
     impl NativeCandidateReconciler<FakeTarget> for Accept {
-        type Output = ();
+        type Output = Arc<RealizedNativeSet<FakeTarget>>;
 
         fn reconcile(
             &mut self,
             _: &mut ExprArena,
-            _: ReconciliationInput<FakeTarget>,
+            input: ReconciliationInput<FakeTarget>,
         ) -> Result<Self::Output, NativeReconciliationError> {
-            Ok(())
+            Ok(input.into_parts().2)
         }
     }
 
@@ -641,8 +645,8 @@ pub(crate) mod demand_driven_tests {
         };
         assert_eq!(compiler.form_count(), 4);
         assert_ne!(
-            first.native().artifact_instances().collect::<Vec<_>>(),
-            second.native().artifact_instances().collect::<Vec<_>>()
+            first.reconciled().as_ref().artifact_instances().collect::<Vec<_>>(),
+            second.reconciled().as_ref().artifact_instances().collect::<Vec<_>>()
         );
     }
 
@@ -688,7 +692,7 @@ pub(crate) mod demand_driven_tests {
         else {
             panic!("selected candidate was rejected")
         };
-        let native = candidate.native();
+        let native = candidate.reconciled().as_ref();
         assert_eq!(compiler.form_count(), 2);
         assert_eq!(native.native_kernel_index(first), Some(0));
         assert_eq!(native.native_kernel_index(shared), Some(1));
@@ -705,15 +709,14 @@ pub(crate) mod demand_driven_tests {
         else {
             panic!("selected candidate was rejected")
         };
-        let selected_native = candidate.native().clone();
+        let selected_native = candidate.reconciled().as_ref().clone();
         let native = selected_native.as_ref();
         assert_eq!(compiler.form_count(), 2, "formed kernels must be reused");
         assert_eq!(native.native_kernel_index(first), Some(0));
         assert_eq!(native.native_kernel_index(shared), Some(1));
         assert_eq!(native.artifact_instances().nth(1), Some(shared_instance));
 
-        let registry = realizer.into_registry();
-        assert_eq!(registry.resolve(target.identity(), native).len(), 2);
+        assert_eq!(realizer.registry().resolve(target.identity(), native).len(), 2);
 
         let retry_compiler = CountingCompiler::new();
         retry_compiler.fail_next.store(true, Ordering::SeqCst);
@@ -770,7 +773,7 @@ pub(crate) mod demand_driven_tests {
         };
         assert_eq!(newly_formed.code_bytes, 1);
         assert_eq!(compiler.form_count(), 3);
-        assert_eq!(candidate.native().artifact_instances().count(), 2);
+        assert_eq!(candidate.reconciled().as_ref().artifact_instances().count(), 2);
     }
 
     #[test]
@@ -787,7 +790,7 @@ pub(crate) mod demand_driven_tests {
         else {
             panic!("candidate should be ready")
         };
-        let native = candidate.native();
+        let native = candidate.reconciled().as_ref();
         let instances = native.artifact_instances().collect::<Vec<_>>();
         assert_eq!(instances.len(), 2);
         assert_ne!(instances[0], instances[1]);
@@ -855,24 +858,19 @@ pub(crate) mod demand_driven_tests {
     }
 }
 
-pub(crate) struct RealizedCandidate<T: TargetFamily, O> {
-    native: Arc<RealizedNativeSet<T>>,
+pub(crate) struct RealizedCandidate<O> {
     reconciled: Arc<O>,
 }
 
-impl<T: TargetFamily, O> RealizedCandidate<T, O> {
-    pub(crate) fn native(&self) -> &Arc<RealizedNativeSet<T>> {
-        &self.native
-    }
-
+impl<O> RealizedCandidate<O> {
     pub(crate) fn reconciled(&self) -> &Arc<O> {
         &self.reconciled
     }
 }
 
-pub(crate) enum RealizationOutcome<T: TargetFamily, O> {
+pub(crate) enum RealizationOutcome<O> {
     Ready {
-        candidate: Arc<RealizedCandidate<T, O>>,
+        candidate: Arc<RealizedCandidate<O>>,
         newly_formed: NativeArtifactMetrics,
     },
     Rejected {
@@ -889,8 +887,8 @@ pub(crate) struct RealizationFailure {
     pub(crate) newly_formed: NativeArtifactMetrics,
 }
 
-enum CachedCandidate<T: TargetFamily, O> {
-    Ready(Arc<RealizedCandidate<T, O>>),
+enum CachedCandidate<O> {
+    Ready(Arc<RealizedCandidate<O>>),
     Rejected(Arc<CandidateRejection>),
 }
 
@@ -948,7 +946,7 @@ pub(crate) struct Realizer<
     target: &'a DeviceDescription<T>,
     reconciler: R,
     registry: RealizationRegistry<T, C::Handle>,
-    candidates: HashMap<CandidateRealizationIdentity, CachedCandidate<T, R::Output>>,
+    candidates: HashMap<CandidateRealizationIdentity, CachedCandidate<R::Output>>,
 }
 
 impl<'a, T, C, R> Realizer<'a, T, C, R>
@@ -1010,7 +1008,7 @@ where
         &mut self,
         arena: &mut ExprArena,
         request: CanonicalRealizationRequest<T>,
-    ) -> Result<RealizationOutcome<T, R::Output>, RealizationFailure> {
+    ) -> Result<RealizationOutcome<R::Output>, RealizationFailure> {
         // Validate the authoritative arena even on a candidate-cache hit.
         // Reconciled outputs may retain nodes added to this arena, so serving
         // them under a different arena would violate their identity contract.
@@ -1093,7 +1091,7 @@ where
         let reconciliation = ReconciliationInput {
             family,
             assignment,
-            native: native.clone(),
+            native,
         };
         let reconciled = match self.reconciler.reconcile(arena, reconciliation) {
             Ok(reconciled) => reconciled,
@@ -1114,7 +1112,6 @@ where
             }
         };
         let candidate = Arc::new(RealizedCandidate {
-            native: native.clone(),
             reconciled: Arc::new(reconciled),
         });
         let replaced = self
@@ -1132,9 +1129,6 @@ where
 
     pub(crate) fn registry(&self) -> &RealizationRegistry<T, C::Handle> {
         &self.registry
-    }
-    pub(crate) fn into_registry(self) -> RealizationRegistry<T, C::Handle> {
-        self.registry
     }
 }
 

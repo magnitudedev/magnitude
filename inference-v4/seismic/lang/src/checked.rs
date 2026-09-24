@@ -517,7 +517,10 @@ impl ElementUses {
             RepresentationKind::Dense(DType::F32 | DType::F16 | DType::BF16)
         );
         let decodable = dense_float
-            || (matches!(info.kind, RepresentationKind::Packed(_))
+            || (matches!(
+                info.kind,
+                RepresentationKind::Packed(_) | RepresentationKind::PackedRows(_)
+            )
                 && registry::decode_recipe(representation, DType::F32).is_some());
         info.decoded.is_float()
             && (!self.stored || (info.access == RepresentationAccess::ReadWrite && dense_float))
@@ -620,8 +623,9 @@ pub struct NativeImplementation {
     pub statics: Vec<String>,
     /// Tuning parameters, in declaration order.
     pub params: Vec<NativeParameter>,
-    /// Conjuncts restricting admissible parameter configurations.
-    pub constraints: Vec<NativeConstraint>,
+    /// The `where` condition restricting admissible parameter
+    /// configurations. It reads only static dimensions and parameters.
+    pub constraint: Option<NativeCondition>,
     /// Call-private scratch buffers, in ABI order.
     pub scratch: Vec<NativeScratch>,
     /// Ordered dispatches of one call. Never empty.
@@ -648,18 +652,28 @@ pub enum NativeComparison {
     Ne,
 }
 
-/// `left op right` over static dimensions and parameters.
+/// A boolean formula over native natural-number expressions: a native
+/// `where` or `when` condition.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NativeConstraint {
-    pub comparison: NativeComparison,
-    pub left: NativeNatExpr,
-    pub right: NativeNatExpr,
+pub enum NativeCondition {
+    Compare {
+        comparison: NativeComparison,
+        left: NativeNatExpr,
+        right: NativeNatExpr,
+    },
+    And(Box<Self>, Box<Self>),
+    Or(Box<Self>, Box<Self>),
 }
 
+/// Call-private device memory of one native call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeScratch {
     pub name: String,
     pub bytes: NativeNatExpr,
+    /// The buffer is sized by `bytes` only when this holds; otherwise it
+    /// keeps its ABI slot at the minimum charge and `bytes` is not
+    /// evaluated. `None` is always active.
+    pub when: Option<NativeCondition>,
 }
 
 /// One ordered dispatch of a native call.
@@ -667,6 +681,10 @@ pub struct NativeScratch {
 pub struct NativeLaunch {
     /// Kernel function name in the native source.
     pub kernel: String,
+    /// The launch runs only when this holds; an inactive launch is not
+    /// encoded, not limit-checked, and its geometry is not evaluated. It
+    /// keeps its ordinal. `None` is always active.
+    pub when: Option<NativeCondition>,
     /// Number of groups on each axis.
     pub groups: [NativeNatExpr; 3],
     /// Participants of one group on each axis.
@@ -772,22 +790,51 @@ impl NativeNatExpr {
     }
 }
 
-impl NativeConstraint {
+impl NativeCondition {
+    /// Evaluate with `dimension` and `parameter` supplying named values.
+    /// `and` and `or` evaluate their right side only when the left side
+    /// does not decide the result.
     pub fn holds(
         &self,
         dimension: &impl Fn(&str) -> Option<u64>,
         parameter: &impl Fn(&str) -> Option<u64>,
     ) -> Result<bool, NativeEvalError> {
-        let left = self.left.evaluate(dimension, parameter)?;
-        let right = self.right.evaluate(dimension, parameter)?;
-        Ok(match self.comparison {
-            NativeComparison::Lt => left < right,
-            NativeComparison::Le => left <= right,
-            NativeComparison::Gt => left > right,
-            NativeComparison::Ge => left >= right,
-            NativeComparison::Eq => left == right,
-            NativeComparison::Ne => left != right,
-        })
+        match self {
+            Self::Compare {
+                comparison,
+                left,
+                right,
+            } => {
+                let left = left.evaluate(dimension, parameter)?;
+                let right = right.evaluate(dimension, parameter)?;
+                Ok(match comparison {
+                    NativeComparison::Lt => left < right,
+                    NativeComparison::Le => left <= right,
+                    NativeComparison::Gt => left > right,
+                    NativeComparison::Ge => left >= right,
+                    NativeComparison::Eq => left == right,
+                    NativeComparison::Ne => left != right,
+                })
+            }
+            Self::And(left, right) => Ok(left.holds(dimension, parameter)?
+                && right.holds(dimension, parameter)?),
+            Self::Or(left, right) => Ok(left.holds(dimension, parameter)?
+                || right.holds(dimension, parameter)?),
+        }
+    }
+
+    /// Every dimension name the condition reads.
+    pub fn dimensions(&self, out: &mut Vec<String>) {
+        match self {
+            Self::Compare { left, right, .. } => {
+                left.dimensions(out);
+                right.dimensions(out);
+            }
+            Self::And(left, right) | Self::Or(left, right) => {
+                left.dimensions(out);
+                right.dimensions(out);
+            }
+        }
     }
 }
 
@@ -836,8 +883,8 @@ pub enum NativeSpecializationError {
     MissingParameter(String),
     UnknownParameter(String),
     OutsideDomain { parameter: String, value: u64 },
-    /// The configuration violates a `where` conjunct.
-    Inadmissible { constraint: usize },
+    /// The configuration violates the `where` condition.
+    Inadmissible,
     Evaluation(NativeEvalError),
 }
 
@@ -851,9 +898,7 @@ impl std::fmt::Display for NativeSpecializationError {
             Self::OutsideDomain { parameter, value } => {
                 write!(f, "native parameter `{parameter}` does not admit {value}")
             }
-            Self::Inadmissible { constraint } => {
-                write!(f, "configuration violates native `where` conjunct {constraint}")
-            }
+            Self::Inadmissible => f.write_str("configuration violates the native `where` condition"),
             Self::Evaluation(error) => write!(f, "{error}"),
         }
     }
@@ -899,14 +944,12 @@ impl NativeImplementation {
         }
         let dimension = |name: &str| specialization.static_value(name);
         let parameter = |name: &str| specialization.param(name);
-        for (ordinal, constraint) in self.constraints.iter().enumerate() {
+        if let Some(constraint) = &self.constraint {
             if !constraint
                 .holds(&dimension, &parameter)
                 .map_err(NativeSpecializationError::Evaluation)?
             {
-                return Err(NativeSpecializationError::Inadmissible {
-                    constraint: ordinal,
-                });
+                return Err(NativeSpecializationError::Inadmissible);
             }
         }
         Ok(())
@@ -914,7 +957,7 @@ impl NativeImplementation {
 
     /// Every admissible specialization for the given static values: the
     /// cartesian product of the parameter domains in declaration order,
-    /// filtered by the `where` conjuncts.
+    /// filtered by the `where` condition.
     pub fn admissible(
         &self,
         statics: &NativeSpecialization,
@@ -948,7 +991,7 @@ impl NativeImplementation {
         for configuration in configurations {
             match self.validate(&configuration) {
                 Ok(()) => admissible.push(configuration),
-                Err(NativeSpecializationError::Inadmissible { .. }) => {}
+                Err(NativeSpecializationError::Inadmissible) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -1183,7 +1226,7 @@ mod native_tests {
         assert!(native.params[0].arithmetic);
         assert!(!native.params[1].arithmetic);
         assert_eq!(native.params[1].values, [64, 128]);
-        assert_eq!(native.constraints.len(), 2);
+        assert!(matches!(native.constraint, Some(NativeCondition::And(..))));
         assert_eq!(native.scratch[0].name, "partials");
         assert_eq!(native.launches.len(), 2);
         assert_eq!(native.launches[1].kernel, "scale_merge");
@@ -1208,7 +1251,7 @@ mod native_tests {
         let small = NativeSpecialization::new().with_static("N", 32);
         assert!(matches!(
             native.default_specialization(&small),
-            Err(NativeSpecializationError::Inadmissible { constraint: 0 })
+            Err(NativeSpecializationError::Inadmissible)
         ));
         assert!(matches!(
             native.validate(&default.clone().with_param("WIDTH", 96)),
@@ -1218,6 +1261,113 @@ mod native_tests {
             native.admissible(&NativeSpecialization::new()),
             Err(NativeSpecializationError::MissingStatic(_))
         ));
+    }
+
+    #[test]
+    fn conditions_gate_launches_and_scratch_and_restrict_configurations() {
+        let module = check_source(source(
+            "native scale for cuda from \"scale.cu\":\n    params (PARTS in [1, 2, 4])\n    where PARTS == 1 or (PARTS >= 2 and PARTS < 4)\n    scratch partials bytes (PARTS * N * 4) when PARTS > 1 and N > 256\n    launch scale_small when N <= 256:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (N, 1, 1)\n    launch scale_large when N > 256 or PARTS > 1:\n        threadgroups (ceil_div(N, 256), PARTS, 1)\n        threads_per_threadgroup (256, 1, 1)\n    launch scale_merge:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n",
+        ))
+        .expect("`when` may read a dimension that is not static");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Cuda)
+            .unwrap();
+        // `where` gained `or`: PARTS 4 is outside it.
+        let admissible = native.admissible(&NativeSpecialization::new()).unwrap();
+        assert_eq!(
+            admissible
+                .iter()
+                .map(|configuration| configuration.param("PARTS").unwrap())
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        let at = |n: u64, parts: u64| {
+            move |condition: &NativeCondition| {
+                condition
+                    .holds(&|name| (name == "N").then_some(n), &|name| {
+                        (name == "PARTS").then_some(parts)
+                    })
+                    .unwrap()
+            }
+        };
+        let small = native.launches[0].when.as_ref().unwrap();
+        let large = native.launches[1].when.as_ref().unwrap();
+        let partials = native.scratch[0].when.as_ref().unwrap();
+        assert!(native.launches[2].when.is_none());
+        assert!(at(64, 1)(small) && !at(64, 1)(large) && !at(64, 1)(partials));
+        assert!(!at(1024, 1)(small) && at(1024, 1)(large) && !at(1024, 1)(partials));
+        assert!(at(64, 2)(small) && at(64, 2)(large) && !at(64, 2)(partials));
+        assert!(at(1024, 2)(partials));
+        let mut read = Vec::new();
+        large.dimensions(&mut read);
+        assert_eq!(read, ["N"]);
+        // `and` and `or` evaluate their right side only when needed.
+        let unbound = NativeCondition::Compare {
+            comparison: NativeComparison::Eq,
+            left: NativeNatExpr::Dimension("Z".into()),
+            right: NativeNatExpr::Constant(0),
+        };
+        let never = NativeCondition::Compare {
+            comparison: NativeComparison::Lt,
+            left: NativeNatExpr::Constant(1),
+            right: NativeNatExpr::Constant(0),
+        };
+        let none = |_: &str| None;
+        assert_eq!(
+            NativeCondition::And(Box::new(never.clone()), Box::new(unbound.clone()))
+                .holds(&none, &none),
+            Ok(false)
+        );
+        assert_eq!(
+            NativeCondition::Or(Box::new(never), Box::new(unbound)).holds(&none, &none),
+            Err(NativeEvalError::Unbound("Z".into()))
+        );
+    }
+
+    #[test]
+    fn vulkan_launch_geometry_reads_only_static_dimensions_and_parameters() {
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "rows.seismic".to_owned(),
+            text: "fn rows[M, N](x: &tensor[M, N] f32) -> tensor[M] f32:\n    let mut output = tensor[M] f32\n    for i in 0..M:\n        output[i] = x[i, 0]\n    return output\n\nnative rows for vulkan from \"vulkan/rows.comp\":\n    static (N)\n    params (WIDTH in [64, 128])\n    scratch partials bytes (M * 4) when M > 1\n    launch rows when M > 0:\n        threadgroups (ceil_div(M, WIDTH), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n        shared_bytes (min(N, 8) * WIDTH * 4)\n".to_owned(),
+        }]))
+        .expect("group counts, `when` and scratch may read per-call dimensions");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Vulkan)
+            .expect("vulkan implementation");
+        assert_eq!(native.backend.as_str(), "vulkan");
+        for (property, expected) in [
+            ("threads_per_threadgroup (M, 1, 1)", "`M` is only known per call"),
+            ("threads_per_threadgroup (64, 1, 1)\n        shared_bytes (min(M, 8) * 72)", "`M` is only known per call"),
+        ] {
+            let error = check_source(SourceSet::new(vec![SourceFile {
+                path: "rows.seismic".to_owned(),
+                text: format!("fn rows[M, N](x: &tensor[M, N] f32) -> tensor[M] f32:\n    let mut output = tensor[M] f32\n    for i in 0..M:\n        output[i] = x[i, 0]\n    return output\n\nnative rows for vulkan from \"vulkan/rows.comp\":\n    static (N)\n    launch rows:\n        threadgroups (1, 1, 1)\n        {property}\n"),
+            }]))
+            .expect_err("per-call launch geometry is rejected on Vulkan");
+            let text = error.to_string();
+            assert!(text.contains(expected) && text.contains("Vulkan fixes the group size"), "{text}");
+        }
+        // The same declaration is admitted for CUDA, where geometry is per launch.
+        check_source(SourceSet::new(vec![SourceFile {
+            path: "rows.seismic".to_owned(),
+            text: "fn rows[M, N](x: &tensor[M, N] f32) -> tensor[M] f32:\n    let mut output = tensor[M] f32\n    for i in 0..M:\n        output[i] = x[i, 0]\n    return output\n\nnative rows for cuda from \"cuda/rows.cu\":\n    launch rows:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (M, 1, 1)\n        shared_bytes (min(M, 8) * 72)\n".to_owned(),
+        }]))
+        .expect("CUDA launch geometry may read per-call dimensions");
+    }
+
+    #[test]
+    fn lowerings_are_rejected_for_the_native_only_vulkan_backend() {
+        let source = |target: &str| {
+            SourceSet::new(vec![SourceFile {
+                path: "copy.seismic".to_owned(),
+                text: format!("fn copy[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nlower copy[N](x: &tensor[N] f32) -> tensor[N] f32\n    for {target}:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n"),
+            }])
+        };
+        check_source(source("cpu")).expect("a lowering for a compiler target is admitted");
+        let text = check_source(source("vulkan"))
+            .expect_err("vulkan has no compiler target")
+            .to_string();
+        assert!(text.contains("`vulkan` runs only native implementations"), "{text}");
     }
 
     #[test]
@@ -1264,7 +1414,35 @@ mod native_tests {
             ),
             (
                 format!("native scale for metal from \"scale.metal\":\n    params (P in [1])\n    where P + 1\n{launch}"),
-                "conjunct is a comparison",
+                "a native `where` condition is a comparison",
+            ),
+            (
+                format!("native scale for metal from \"scale.metal\":\n    params (P in [1])\n    where P == 1 or P < N\n{launch}"),
+                "reads dimension `N`, which is not static",
+            ),
+            (
+                "native scale for metal from \"scale.metal\":\n    launch scale when N:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".to_owned(),
+                "a native `when` condition is a comparison",
+            ),
+            (
+                "native scale for metal from \"scale.metal\":\n    launch scale when N + 1:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".to_owned(),
+                "a native `when` condition is a comparison",
+            ),
+            (
+                "native scale for metal from \"scale.metal\":\n    launch scale when N > 1 and (N < 8 or N):\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".to_owned(),
+                "a native `when` condition is a comparison",
+            ),
+            (
+                "native scale for metal from \"scale.metal\":\n    launch scale when M > 1:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".to_owned(),
+                "references `M`, which is neither a dimension nor a native parameter",
+            ),
+            (
+                format!("native scale for metal from \"scale.metal\":\n    scratch partials bytes (N * 4) when N\n{launch}"),
+                "a native `when` condition is a comparison",
+            ),
+            (
+                format!("native scale for metal from \"scale.metal\":\n    scratch partials bytes (N * 4) when Q >= 2\n{launch}"),
+                "references `Q`, which is neither a dimension nor a native parameter",
             ),
             (
                 "native scale for metal from \"scale.metal\":\n    static (N)\n".to_owned(),

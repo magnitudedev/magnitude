@@ -1,6 +1,6 @@
 use super::{AttentionKernels, DenseKernels};
 use crate::HeadBinding;
-use magnitude_model_kernels::{head_logits_rows, qwen_features_rows, qwen_head_rows};
+use magnitude_model_kernels::{head_logits_rows, qwen_draft_rows, qwen_features_rows};
 use seismic::NativeKernel;
 use std::collections::HashMap;
 
@@ -8,7 +8,7 @@ use std::collections::HashMap;
 /// native entries needed by that head block.
 #[derive(Debug, Default)]
 pub struct HeadKernels {
-    pub(super) input: HashMap<HeadBinding, NativeKernel<qwen_head_rows::Entry>>,
+    pub(super) input: HashMap<HeadBinding, NativeKernel<qwen_draft_rows::Entry>>,
     pub(super) attention: HashMap<HeadBinding, AttentionKernels>,
     pub(super) dense: HashMap<HeadBinding, DenseKernels>,
     pub(super) features: HashMap<HeadBinding, NativeKernel<qwen_features_rows::Entry>>,

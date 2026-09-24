@@ -133,6 +133,9 @@ fn tensor_bytes(element: &str, shape: &[u64], fill: &Fill, storage: usize) -> Ve
         (Fill::Sequence | Fill::Values(_), _) => {
             unreachable!("the parser rejects `seq` and literal fills of packed elements")
         }
+        (Fill::Uniform { .. }, RepresentationKind::PackedRows(_)) => {
+            unreachable!("the parser rejects `uniform` fills of row-layout elements")
+        }
     }
 }
 

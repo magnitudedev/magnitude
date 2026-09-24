@@ -9,7 +9,7 @@ use magnitude_artifacts::{Package, PackageIdentity, PackageManifest};
 use magnitude_chat::wire::MethodPolicy;
 use magnitude_generation::{Method, Mtp, Plain};
 use magnitude_model_contracts::{FeedForwardGeometry, ModelDefinition};
-use magnitude_model_executor::{ExecutionPath, ResourcePlan};
+use magnitude_model_executor::{platform::DeviceRequest, ExecutionPath, ResourcePlan};
 use magnitude_model_state::KvCodec;
 use magnitude_service::ServiceLimits;
 use std::{path::PathBuf, sync::Arc};
@@ -162,6 +162,9 @@ pub struct ExecutionManifest {
     pub service: ServiceLimits,
     pub storage: ResolvedStoragePolicy,
     pub path: ExecutionPath,
+    pub device: DeviceRequest,
+    /// The kernel cache directory the host names; `None` caches nothing.
+    pub kernel_cache: Option<PathBuf>,
 }
 
 /// Device-free readiness evidence returned only after worker construction has
@@ -218,6 +221,8 @@ pub struct ReadyInfo {
     pub service: ServiceLimits,
     pub resources: ResourcePlanSummary,
     pub path: ExecutionPath,
+    /// The backend of the opened device the native path executes on.
+    pub backend: seismic::BackendName,
 }
 
 impl ExecutionManifest {
@@ -228,6 +233,8 @@ impl ExecutionManifest {
         service: ServiceLimits,
         storage: ResolvedStoragePolicy,
         path: ExecutionPath,
+        device: DeviceRequest,
+        kernel_cache: Option<PathBuf>,
     ) -> Result<Self, String> {
         definition.validate().map_err(|error| error.to_string())?;
         service.validate()?;
@@ -241,6 +248,8 @@ impl ExecutionManifest {
             service,
             storage,
             path,
+            device,
+            kernel_cache,
         })
     }
 }

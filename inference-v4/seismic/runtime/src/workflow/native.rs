@@ -2,7 +2,7 @@
 use crate::driver::workflow::{
     AccessMode, AllocationDescription, AllocationKind, ArgumentBinding, BoundInvocation, BoundNode,
     ByteRange, OutputDescription, OutputRef, PlanError, PreparedPolicy, ResourceId,
-    ScalarDescriptor, ScalarValue, TensorDescriptor, TensorStorage, WorkflowId, WorkflowPlanDraft,
+    ScalarDescriptor, ScalarValue, TensorDescriptor, WorkflowId, WorkflowPlanDraft,
 };
 use crate::driver::AdmittedCommand;
 use crate::driver::*;
@@ -15,7 +15,7 @@ use super::Acquisition;
 #[derive(Clone, Copy)]
 enum PlannedAllocation {
     Argument { argument: usize },
-    Private { slot: usize, executable: usize },
+    Private { slot: usize },
 }
 
 struct PlannedNode<T: TargetFamily, E: NativeExecutor<T>> {
@@ -160,10 +160,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> PreparedPolicy for InvocationTarget<
                         acquisition,
                         alignment: allocation.alignment,
                     });
-                    allocations.push(PlannedAllocation::Private {
-                        slot,
-                        executable: index,
-                    });
+                    allocations.push(PlannedAllocation::Private { slot });
                 }
             }
         }
@@ -446,8 +443,8 @@ fn admit_reached_node<T: TargetFamily, E: NativeExecutor<T>>(
         if let ResourceId::Persistent { owner, variant, slot } = requirement.resource {
             let key = (owner, variant as usize, slot as usize);
             if let Some(old) = resources.preclaimed_binding(key) {
-                copy_between::<T, E>(&*device.service, &typed_buffer::<T, E>(&old.allocation),
-                    &typed_buffer::<T, E>(&allocation), old.capacity).map_err(CallError::Execution)?;
+                copy_between::<T, E>(&*device.service, typed_buffer::<T, E>(&old.allocation),
+                    typed_buffer::<T, E>(&allocation), old.capacity).map_err(CallError::Execution)?;
             }
             replacements.push((key, PersistentBinding { allocation: allocation.clone(), capacity: bytes }));
         }
@@ -531,7 +528,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> WorkflowGraphDraft<T, E> {
         if self.nodes.is_empty() {
             return Err(CallError::Workflow(crate::api::WorkflowError::Empty));
         }
-        let mut planner = WorkflowPlanDraft::with_identity(self.identity);
+        let planner = WorkflowPlanDraft::with_identity(self.identity);
         let mut physical = BTreeMap::new();
         let mut pending = std::collections::VecDeque::new();
         let mut keys = BTreeMap::new();
@@ -766,10 +763,7 @@ fn stage_planned<T: TargetFamily, E: NativeExecutor<T>>(
                     }),
                 });
             }
-            PlannedAllocation::Private {
-                slot,
-                executable: _,
-            } => {
+            PlannedAllocation::Private { slot } => {
                 let local = &node.private_resources[slot];
                 let requirement = requirements.get(&local.resource).unwrap_or(local);
                 if requirement.acquisition == Acquisition::ReachedPrivate {

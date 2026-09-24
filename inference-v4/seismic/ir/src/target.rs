@@ -276,6 +276,9 @@ impl RepresentationGeometry {
                 seismic_lang::registry::decode_recipe(representation, info.decoded)
             }
             seismic_lang::registry::RepresentationKind::External(_) => None,
+            seismic_lang::registry::RepresentationKind::PackedRows(_) => {
+                panic!("{}", seismic_lang::registry::ROW_LAYOUT_IS_NATIVE_ONLY)
+            }
         };
         Self { info, decode }
     }
@@ -300,6 +303,9 @@ impl RepresentationGeometry {
             }
             seismic_lang::registry::RepresentationKind::External(_) => {
                 panic!("external representation is not element-readable")
+            }
+            seismic_lang::registry::RepresentationKind::PackedRows(_) => {
+                panic!("{}", seismic_lang::registry::ROW_LAYOUT_IS_NATIVE_ONLY)
             }
         }
     }

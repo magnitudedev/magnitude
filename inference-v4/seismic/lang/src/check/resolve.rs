@@ -1468,6 +1468,22 @@ pub(crate) fn resolve<'a>(
                 });
                 continue;
             };
+            if !target.compiles_planned_code() {
+                diagnostics.push(Located {
+                    file: *file,
+                    diagnostic: Diagnostic::with_rule(
+                        DiagnosticRule::Resolution,
+                        l.target.span,
+                        format!(
+                            "`{}` runs only native implementations; a lowering needs a compiler target (write `native {} for {}` instead)",
+                            target.as_str(),
+                            l.name.name,
+                            target.as_str()
+                        ),
+                    ),
+                });
+                continue;
+            }
             let kind = DefKind::Lower { target };
             let requires = match requirements(&l.requires, Some(&l.target.name)) {
                 Ok(requires) => requires,

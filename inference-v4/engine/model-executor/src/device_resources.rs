@@ -254,6 +254,28 @@ impl ConditioningRef {
 }
 
 impl LogitsRef {
+    /// Read the leased `[rows, vocabulary]` F32 logits to the host, waiting
+    /// for the work that produced them.
+    pub fn read_to_host(&self) -> Result<Vec<f32>, ResourceError> {
+        let bytes = self
+            .allocation
+            .tensor()?
+            .read_to_host()
+            .map_err(|error| ResourceError::Tensor(error.to_string()))?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|word| f32::from_le_bytes(word.try_into().expect("four bytes")))
+            .collect())
+    }
+
+    pub fn rows(&self) -> usize {
+        self.allocation.rows()
+    }
+
+    pub fn vocabulary(&self) -> usize {
+        self.allocation.vocabulary()
+    }
+
     pub fn logical(
         domain: ResourceDomainId,
         rows: usize,

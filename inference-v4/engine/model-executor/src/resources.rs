@@ -215,48 +215,36 @@ impl ResourceAllocator {
             }));
         }
         let plan = execution.resources();
+        // The admitted charge was derived from this family's footprint.
+        let admitted = |family: &seismic::NativeGraphFamily, charge: crate::NativeGraphCharge| {
+            family.workspace_bytes() == charge.workspace_bytes
+                && family.output_bytes() == charge.output_bytes
+                && family.upload_bytes() == charge.upload_bytes
+        };
         let graph_charge = plan.target_graph();
-        if target_graphs.workspace_bytes() != graph_charge.workspace_bytes
-            || target_graphs.output_bytes() != graph_charge.output_bytes
+        if !admitted(target_graphs.family(), graph_charge)
+            || target_graphs.runs_per_step() != graph_charge.upload_regions
         {
             return Err(AllocationError::Plan(InvariantError {
                 context: "resource allocator",
                 detail: "prepared target graph differs from admitted Seismic footprint".into(),
             }));
         }
-        let target_graph = NativeGraphPool::new(
-            domain.clone(),
-            target_graphs.family(),
-            graph_charge.workspace_slots,
-            graph_charge.output_slots,
-        )?;
+        let target_graph =
+            NativeGraphPool::new(domain.clone(), target_graphs.family(), graph_charge)?;
         let readout_charge = plan.target_readout_graph();
-        if target_readout_graphs.workspace_bytes() != readout_charge.workspace_bytes
-            || target_readout_graphs.output_bytes() != readout_charge.output_bytes
-        {
+        if !admitted(target_readout_graphs.family(), readout_charge) {
             return Err(AllocationError::Plan(InvariantError {
                 context: "resource allocator",
                 detail: "prepared target readout graph differs from admitted Seismic footprint"
                     .into(),
             }));
         }
-        let target_readout_graph = NativeGraphPool::new(
-            domain.clone(),
-            target_readout_graphs.family(),
-            readout_charge.workspace_slots,
-            readout_charge.output_slots,
-        )?;
+        let target_readout_graph =
+            NativeGraphPool::new(domain.clone(), target_readout_graphs.family(), readout_charge)?;
         let head_graph = match (head_graphs, plan.head_graph()) {
-            (Some(graphs), Some(charge))
-                if graphs.workspace_bytes_max() == charge.workspace_bytes
-                    && graphs.output_bytes_max() == charge.output_bytes =>
-            {
-                Some(NativeGraphPool::new(
-                    domain.clone(),
-                    graphs.family(),
-                    charge.workspace_slots,
-                    charge.output_slots,
-                )?)
+            (Some(graphs), Some(charge)) if admitted(graphs.family(), charge) => {
+                Some(NativeGraphPool::new(domain.clone(), graphs.family(), charge)?)
             }
             (None, None) => None,
             _ => {
@@ -267,16 +255,8 @@ impl ResourceAllocator {
             }
         };
         let vision_graph = match (vision_graphs, plan.vision_graph()) {
-            (Some(graphs), Some(charge))
-                if graphs.workspace_bytes_max() == charge.workspace_bytes
-                    && graphs.output_bytes_max() == charge.output_bytes =>
-            {
-                Some(NativeGraphPool::new(
-                    domain.clone(),
-                    graphs.family(),
-                    charge.workspace_slots,
-                    charge.output_slots,
-                )?)
+            (Some(graphs), Some(charge)) if admitted(graphs.family(), charge) => {
+                Some(NativeGraphPool::new(domain.clone(), graphs.family(), charge)?)
             }
             (None, None) => None,
             _ => {
@@ -287,20 +267,13 @@ impl ResourceAllocator {
             }
         };
         let state_charge = plan.state_graph();
-        if state_graphs.workspace_bytes_max() != state_charge.workspace_bytes
-            || state_graphs.output_bytes_max() != state_charge.output_bytes
-        {
+        if !admitted(state_graphs.family(), state_charge) {
             return Err(AllocationError::Plan(InvariantError {
                 context: "resource allocator",
                 detail: "prepared state graph differs from admitted Seismic footprint".into(),
             }));
         }
-        let state_graph = NativeGraphPool::new(
-            domain.clone(),
-            state_graphs.family(),
-            state_charge.workspace_slots,
-            state_charge.output_slots,
-        )?;
+        let state_graph = NativeGraphPool::new(domain.clone(), state_graphs.family(), state_charge)?;
         let allocated = AllocatedResources {
             domain: domain.clone(),
             target_graph,

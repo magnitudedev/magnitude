@@ -9,7 +9,8 @@ use magnitude_model_contracts::{
     LayerNormWeights, MixerWeights, ModelDefinition, RecurrentWeights, RoutedFeedForwardWeights,
     VisionDescription, WeightDescriptor, WeightKind, WeightRole, WeightScope,
 };
-use seismic::{DType, Element};
+use crate::ExecutionPath;
+use seismic::{BackendName, DType, Element, Layout};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,8 +51,20 @@ pub struct EmbeddingBinding {
     pub activation: Element,
 }
 
+/// The dimensions attention kernels are specialized to: the hidden width,
+/// kv heads, query heads per kv head, rotated pairs and head width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AttentionShape {
+    pub hidden: u64,
+    pub kv_heads: u64,
+    pub group: u64,
+    pub rotary_pairs: u64,
+    pub width: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AttentionBinding {
+    pub shape: AttentionShape,
     pub norm: Element,
     pub query_gate: Element,
     pub key: Element,
@@ -62,7 +75,10 @@ pub struct AttentionBinding {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RecurrentBinding {
+    pub key_heads: u64,
+    pub value_heads: u64,
     pub width: u64,
+    pub convolution_width: u64,
     pub norm: Element,
     pub qkv: Element,
     pub gate: Element,
@@ -84,6 +100,11 @@ pub struct DenseBinding {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RoutedBinding {
+    pub hidden: u64,
+    pub experts: u64,
+    pub selected: u64,
+    pub features: u64,
+    pub shared: u64,
     pub norm: Element,
     pub router: Element,
     pub expert_gate: Element,
@@ -110,6 +131,7 @@ pub struct FeaturesBinding {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct HeadBinding {
+    pub attention_shape: AttentionShape,
     pub embedding_table: Element,
     pub embedding_norm: Element,
     pub hidden_norm: Element,
@@ -241,10 +263,14 @@ impl ModelLoadPlan {
         )
     }
 
+    /// Plan every selected weight. Packed weights become resident in
+    /// `layout` (`resident_layout` of the engine's execution path and
+    /// device backend).
     pub fn derive(
         manifest: &PackageManifest,
         definition: &ModelDefinition,
         selection: ComponentSelection,
+        layout: Layout,
     ) -> Result<Self, String> {
         definition.validate().map_err(|error| error.to_string())?;
         if manifest.identity != definition.artifact_identity {
@@ -254,7 +280,10 @@ impl ModelLoadPlan {
             kind: ArtifactComponentKind::Target,
             identity: manifest.target.identity,
         };
-        let target_dtype = activation_dtype(definition.geometry.activation_dtype);
+        let target_form = ResidentForm {
+            activation: activation_dtype(definition.geometry.activation_dtype),
+            layout,
+        };
         let mut target = Vec::new();
         push_weight(
             &mut target,
@@ -263,7 +292,7 @@ impl ModelLoadPlan {
             WeightScope::Target,
             WeightKind::Embedding,
             &definition.embedding,
-            target_dtype,
+            target_form,
         )?;
         for (index, block) in definition.blocks.iter().enumerate() {
             let index = u32::try_from(index).map_err(|_| "target block index exceeds u32")?;
@@ -273,7 +302,7 @@ impl ModelLoadPlan {
                 target_component,
                 WeightScope::TargetBlock(index),
                 block,
-                target_dtype,
+                target_form,
             )?;
         }
         push_weight(
@@ -283,7 +312,7 @@ impl ModelLoadPlan {
             WeightScope::Target,
             WeightKind::OutputNorm,
             &definition.output_norm,
-            target_dtype,
+            target_form,
         )?;
         push_weight(
             &mut target,
@@ -292,7 +321,7 @@ impl ModelLoadPlan {
             WeightScope::Target,
             WeightKind::Output,
             &definition.output,
-            target_dtype,
+            target_form,
         )?;
 
         if selection.head && definition.head.is_none() {
@@ -327,7 +356,7 @@ impl ModelLoadPlan {
                             scope,
                             kind,
                             descriptor,
-                            target_dtype,
+                            target_form,
                         )?;
                     }
                     append_attention(
@@ -336,7 +365,7 @@ impl ModelLoadPlan {
                         target_component,
                         scope,
                         &block.attention,
-                        target_dtype,
+                        target_form,
                     )?;
                     push_weight(
                         &mut plans,
@@ -345,7 +374,7 @@ impl ModelLoadPlan {
                         scope,
                         WeightKind::FeedForwardNorm,
                         &block.feedforward_norm,
-                        target_dtype,
+                        target_form,
                     )?;
                     append_dense(
                         &mut plans,
@@ -353,7 +382,7 @@ impl ModelLoadPlan {
                         target_component,
                         scope,
                         &block.feedforward,
-                        target_dtype,
+                        target_form,
                     )?;
                     push_weight(
                         &mut plans,
@@ -362,7 +391,7 @@ impl ModelLoadPlan {
                         scope,
                         WeightKind::OutputNorm,
                         &block.output_norm,
-                        target_dtype,
+                        target_form,
                     )?;
                 }
                 Ok::<_, String>(plans)
@@ -382,7 +411,7 @@ impl ModelLoadPlan {
                     kind: ArtifactComponentKind::Projector,
                     identity: component_manifest.identity,
                 };
-                plan_vision(component_manifest.tensors.as_slice(), component, vision)
+                plan_vision(component_manifest.tensors.as_slice(), component, vision, layout)
             })
             .transpose()?;
         validate_unique_roles(
@@ -439,7 +468,7 @@ fn push_weight(
     scope: WeightScope,
     kind: WeightKind,
     descriptor: &WeightDescriptor,
-    activation: DType,
+    form: ResidentForm,
 ) -> Result<(), String> {
     let stored = inventory
         .iter()
@@ -457,7 +486,7 @@ fn push_weight(
         ));
     }
     let role = WeightRole { scope, kind };
-    let dense_resident = resident_dtype(role, activation);
+    let dense_resident = resident_dtype(role, form.activation);
     if is_fixed_dense_role(kind)
         && !matches!(
             stored.encoding,
@@ -471,18 +500,21 @@ fn push_weight(
     }
     let source = source_element(stored.encoding)
         .ok_or_else(|| format!("unsupported source encoding {:?}", stored.encoding))?;
-    let resident = resident_element(stored.encoding, dense_resident)
-        .ok_or_else(|| format!("unsupported resident encoding {:?}", stored.encoding))?;
+    let resident = resident_element(stored.encoding, dense_resident, form.layout).ok_or_else(|| {
+        format!(
+            "{:?} has no resident form in the `{}` layout",
+            stored.encoding,
+            form.layout.as_str()
+        )
+    })?;
+    let source_bytes = representation_bytes(source, &stored.shape)?;
+    if source_bytes != stored.nbytes {
+        return Err(format!(
+            "weight {:?} ({role:?}) stores {} bytes, but its {:?} shape {:?} is {source_bytes}",
+            descriptor.name, stored.nbytes, stored.encoding, stored.shape
+        ));
+    }
     let resident_bytes = representation_bytes(resident, &stored.shape)?;
-    validate_flat_import(
-        &descriptor.name,
-        role,
-        source,
-        resident,
-        &stored.shape,
-        stored.nbytes,
-        resident_bytes,
-    )?;
     out.push(WeightPlan {
         role,
         component,
@@ -526,7 +558,7 @@ fn append_block(
     component: ArtifactComponent,
     scope: WeightScope,
     block: &BlockWeights,
-    dtype: DType,
+    form: ResidentForm,
 ) -> Result<(), String> {
     push_weight(
         out,
@@ -535,14 +567,14 @@ fn append_block(
         scope,
         WeightKind::InputNorm,
         &block.input_norm,
-        dtype,
+        form,
     )?;
     match &block.mixer {
         MixerWeights::Attention(weights) => {
-            append_attention(out, inventory, component, scope, weights, dtype)?
+            append_attention(out, inventory, component, scope, weights, form)?
         }
         MixerWeights::Recurrent(weights) => {
-            append_recurrent(out, inventory, component, scope, weights, dtype)?
+            append_recurrent(out, inventory, component, scope, weights, form)?
         }
     }
     push_weight(
@@ -552,14 +584,14 @@ fn append_block(
         scope,
         WeightKind::FeedForwardNorm,
         &block.feedforward_norm,
-        dtype,
+        form,
     )?;
     match &block.feedforward {
         FeedForwardWeights::Dense(weights) => {
-            append_dense(out, inventory, component, scope, weights, dtype)
+            append_dense(out, inventory, component, scope, weights, form)
         }
         FeedForwardWeights::Routed(weights) => {
-            append_routed(out, inventory, component, scope, weights, dtype)
+            append_routed(out, inventory, component, scope, weights, form)
         }
     }
 }
@@ -570,7 +602,7 @@ fn append_attention(
     component: ArtifactComponent,
     scope: WeightScope,
     weights: &AttentionWeights,
-    dtype: DType,
+    form: ResidentForm,
 ) -> Result<(), String> {
     for (kind, descriptor) in [
         (WeightKind::QueryGate, &weights.query_gate),
@@ -580,7 +612,7 @@ fn append_attention(
         (WeightKind::KeyNorm, &weights.key_norm),
         (WeightKind::AttentionOutput, &weights.output),
     ] {
-        push_weight(out, inventory, component, scope, kind, descriptor, dtype)?;
+        push_weight(out, inventory, component, scope, kind, descriptor, form)?;
     }
     Ok(())
 }
@@ -591,7 +623,7 @@ fn append_recurrent(
     component: ArtifactComponent,
     scope: WeightScope,
     weights: &RecurrentWeights,
-    dtype: DType,
+    form: ResidentForm,
 ) -> Result<(), String> {
     for (kind, descriptor) in [
         (WeightKind::RecurrentQueryKeyValue, &weights.query_key_value),
@@ -604,7 +636,7 @@ fn append_recurrent(
         (WeightKind::RecurrentNorm, &weights.norm),
         (WeightKind::RecurrentOutput, &weights.output),
     ] {
-        push_weight(out, inventory, component, scope, kind, descriptor, dtype)?;
+        push_weight(out, inventory, component, scope, kind, descriptor, form)?;
     }
     Ok(())
 }
@@ -615,14 +647,14 @@ fn append_dense(
     component: ArtifactComponent,
     scope: WeightScope,
     weights: &DenseFeedForwardWeights,
-    dtype: DType,
+    form: ResidentForm,
 ) -> Result<(), String> {
     for (kind, descriptor) in [
         (WeightKind::DenseGate, &weights.gate),
         (WeightKind::DenseUp, &weights.up),
         (WeightKind::DenseDown, &weights.down),
     ] {
-        push_weight(out, inventory, component, scope, kind, descriptor, dtype)?;
+        push_weight(out, inventory, component, scope, kind, descriptor, form)?;
     }
     Ok(())
 }
@@ -633,7 +665,7 @@ fn append_routed(
     component: ArtifactComponent,
     scope: WeightScope,
     weights: &RoutedFeedForwardWeights,
-    dtype: DType,
+    form: ResidentForm,
 ) -> Result<(), String> {
     for (kind, descriptor) in [
         (WeightKind::Router, &weights.router),
@@ -645,7 +677,7 @@ fn append_routed(
         (WeightKind::SharedUp, &weights.shared_up),
         (WeightKind::SharedDown, &weights.shared_down),
     ] {
-        push_weight(out, inventory, component, scope, kind, descriptor, dtype)?;
+        push_weight(out, inventory, component, scope, kind, descriptor, form)?;
     }
     Ok(())
 }
@@ -658,7 +690,7 @@ fn push_norm(
     weight_kind: WeightKind,
     bias_kind: WeightKind,
     norm: &LayerNormWeights,
-    dtype: DType,
+    form: ResidentForm,
 ) -> Result<(), String> {
     push_weight(
         out,
@@ -667,10 +699,10 @@ fn push_norm(
         scope,
         weight_kind,
         &norm.weight,
-        dtype,
+        form,
     )?;
     push_weight(
-        out, inventory, component, scope, bias_kind, &norm.bias, dtype,
+        out, inventory, component, scope, bias_kind, &norm.bias, form,
     )
 }
 
@@ -678,8 +710,12 @@ fn plan_vision(
     inventory: &[TensorDescriptor],
     component: ArtifactComponent,
     vision: &VisionDescription,
+    layout: Layout,
 ) -> Result<Vec<WeightPlan>, String> {
-    let dtype = activation_dtype(vision.geometry.activation_dtype);
+    let form = ResidentForm {
+        activation: activation_dtype(vision.geometry.activation_dtype),
+        layout,
+    };
     let mut out = Vec::new();
     for (index, descriptor) in vision.patch_embeddings.iter().enumerate() {
         let scope = WeightScope::VisionPatch(
@@ -692,7 +728,7 @@ fn plan_vision(
             scope,
             WeightKind::PatchEmbedding,
             descriptor,
-            dtype,
+            form,
         )?;
     }
     push_weight(
@@ -702,7 +738,7 @@ fn plan_vision(
         WeightScope::Vision,
         WeightKind::PatchBias,
         &vision.patch_bias,
-        dtype,
+        form,
     )?;
     push_weight(
         &mut out,
@@ -711,7 +747,7 @@ fn plan_vision(
         WeightScope::Vision,
         WeightKind::PositionEmbedding,
         &vision.position_embedding,
-        dtype,
+        form,
     )?;
     for (index, block) in vision.blocks.iter().enumerate() {
         let scope = WeightScope::VisionBlock(
@@ -725,7 +761,7 @@ fn plan_vision(
             WeightKind::InputNormWeight,
             WeightKind::InputNormBias,
             &block.input_norm,
-            dtype,
+            form,
         )?;
         push_weight(
             &mut out,
@@ -734,7 +770,7 @@ fn plan_vision(
             scope,
             WeightKind::FusedQkvWeight,
             &block.attention.qkv.weight,
-            dtype,
+            form,
         )?;
         push_weight(
             &mut out,
@@ -743,7 +779,7 @@ fn plan_vision(
             scope,
             WeightKind::FusedQkvBias,
             &block.attention.qkv.bias,
-            dtype,
+            form,
         )?;
         push_weight(
             &mut out,
@@ -752,7 +788,7 @@ fn plan_vision(
             scope,
             WeightKind::AttentionOutput,
             &block.attention.output,
-            dtype,
+            form,
         )?;
         push_weight(
             &mut out,
@@ -761,7 +797,7 @@ fn plan_vision(
             scope,
             WeightKind::AttentionOutputBias,
             &block.attention.output_bias,
-            dtype,
+            form,
         )?;
         push_norm(
             &mut out,
@@ -771,7 +807,7 @@ fn plan_vision(
             WeightKind::FeedForwardNormWeight,
             WeightKind::FeedForwardNormBias,
             &block.feedforward_norm,
-            dtype,
+            form,
         )?;
         for (kind, descriptor) in [
             (WeightKind::DenseUp, &block.feedforward.up),
@@ -783,7 +819,7 @@ fn plan_vision(
             ),
         ] {
             push_weight(
-                &mut out, inventory, component, scope, kind, descriptor, dtype,
+                &mut out, inventory, component, scope, kind, descriptor, form,
             )?;
         }
     }
@@ -795,7 +831,7 @@ fn plan_vision(
         WeightKind::NormWeight,
         WeightKind::NormBias,
         &vision.output_norm,
-        dtype,
+        form,
     )?;
     for (kind, descriptor) in [
         (WeightKind::MergerHidden, &vision.merger.hidden),
@@ -810,7 +846,7 @@ fn plan_vision(
             WeightScope::Vision,
             kind,
             descriptor,
-            dtype,
+            form,
         )?;
     }
     Ok(out)
@@ -828,6 +864,27 @@ pub(super) fn planned_element(
         .ok_or_else(|| format!("load plan is missing {scope:?}/{kind:?}"))
 }
 
+/// How the weights of one component become resident: the activation dtype
+/// dense weights follow, and the layout packed weights are stored in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResidentForm {
+    activation: DType,
+    layout: Layout,
+}
+
+/// The layout resident packed weights use for an execution path on a device
+/// backend (spec S1/E7). Native kernels read the backend's execution layout:
+/// Metal and Vulkan `rows16`, CUDA `mma16`; native CPU kernels and every planned
+/// (compiled) kernel read the `packet` layout.
+pub fn resident_layout(path: ExecutionPath, backend: BackendName) -> Layout {
+    match (path, backend) {
+        (ExecutionPath::Native, BackendName::Metal | BackendName::Vulkan) => Layout::Rows16,
+        (ExecutionPath::Native, BackendName::Cuda) => Layout::Mma16,
+        (ExecutionPath::Native, BackendName::Cpu) | (ExecutionPath::Planned, _) => Layout::Packet,
+    }
+}
+
+/// The external storage of an artifact encoding.
 pub fn source_element(encoding: Encoding) -> Option<Element> {
     match encoding {
         Encoding::F32 => Some(Element::dense(DType::F32)),
@@ -842,45 +899,26 @@ pub fn source_element(encoding: Encoding) -> Option<Element> {
     }
 }
 
-pub fn resident_element(encoding: Encoding, dense: DType) -> Option<Element> {
-    match encoding {
-        Encoding::F32 | Encoding::F16 | Encoding::BF16 => Some(Element::dense(dense)),
-        Encoding::Q8_0 => Element::named("q8g32s"),
-        Encoding::Q4K => Element::named("q4k"),
-        Encoding::Q5K => Element::named("q5k"),
-        Encoding::Q6K => Element::named("q6k"),
-        Encoding::Iq4Xs => Element::named("iq4g32"),
-        _ => None,
-    }
+/// The one map from an artifact encoding to resident storage: dense
+/// encodings become `dense`; packed encodings become their representation
+/// (from the source format) in `layout` (from the device backend).
+pub fn resident_element(encoding: Encoding, dense: DType, layout: Layout) -> Option<Element> {
+    let representation = match encoding {
+        Encoding::F32 | Encoding::F16 | Encoding::BF16 => return Some(Element::dense(dense)),
+        Encoding::Q8_0 => "q8g32s",
+        Encoding::Q4K => "q4k",
+        Encoding::Q5K => "q5k",
+        Encoding::Q6K => "q6k",
+        Encoding::Iq4Xs => "iq4g32",
+        _ => return None,
+    };
+    Element::stored(representation, layout)
 }
 
-fn representation_bytes(resident: Element, shape: &[u64]) -> Result<u64, String> {
-    resident
+fn representation_bytes(element: Element, shape: &[u64]) -> Result<u64, String> {
+    element
         .canonical_byte_len(shape)
-        .map_err(|error| format!("resident {:?} shape {shape:?}: {error}", resident))
-}
-
-fn validate_flat_import(
-    name: &str,
-    role: WeightRole,
-    source: Element,
-    resident: Element,
-    shape: &[u64],
-    source_bytes: u64,
-    resident_bytes: u64,
-) -> Result<(), String> {
-    let count = shape
-        .iter()
-        .try_fold(1u64, |count, extent| count.checked_mul(*extent))
-        .ok_or_else(|| format!("weight {name:?} element count overflows"))?;
-    let flat_source_bytes = representation_bytes(source, &[count])?;
-    let flat_resident_bytes = representation_bytes(resident, &[count])?;
-    if flat_source_bytes != source_bytes || flat_resident_bytes != resident_bytes {
-        return Err(format!(
-            "weight {name:?} ({role:?}) cannot use the admitted flat import: source bytes {source_bytes} vs {flat_source_bytes}, resident bytes {resident_bytes} vs {flat_resident_bytes} for shape {shape:?}",
-        ));
-    }
-    Ok(())
+        .map_err(|error| format!("{} shape {shape:?}: {error}", element.name()))
 }
 
 #[cfg(test)]
@@ -905,17 +943,44 @@ mod representation_byte_tests {
     }
 
     #[test]
-    fn flat_import_rejects_row_padded_packed_weight_before_allocation() {
-        let source = Element::named("gguf_q4_k").unwrap();
-        let resident = Element::named("q4k").unwrap();
-        let role = WeightRole {
-            scope: WeightScope::Target,
-            kind: WeightKind::Embedding,
-        };
-        let padded = validate_flat_import("padded", role, source, resident, &[2, 128], 144, 288);
-        assert!(padded
-            .unwrap_err()
-            .contains("cannot use the admitted flat import"));
-        validate_flat_import("aligned", role, source, resident, &[2, 256], 288, 288).unwrap();
+    fn row_layouts_pad_rows_to_sixteen_bytes_and_mma16_rows_to_tiles() {
+        // Qwen3.5 K = 2560, q4k: codes 1280 | scales 120 -> 128 | supers 40 -> 48.
+        let rows16 = Element::stored("q4k", Layout::Rows16).unwrap();
+        assert_eq!(representation_bytes(rows16, &[3, 2560]).unwrap(), 3 * 1456);
+        let mma16 = Element::stored("q4k", Layout::Mma16).unwrap();
+        assert_eq!(representation_bytes(mma16, &[17, 2560]).unwrap(), 32 * 1456);
+        // A q6k row of one group: codes 128 | 64 | scales 16 | supers 2 -> 16.
+        let q6 = Element::stored("q6k", Layout::Rows16).unwrap();
+        assert_eq!(representation_bytes(q6, &[1, 256]).unwrap(), 224);
+    }
+
+    #[test]
+    fn one_map_chooses_representation_from_format_and_layout_from_backend() {
+        for (path, backend, layout) in [
+            (ExecutionPath::Native, BackendName::Metal, Layout::Rows16),
+            (ExecutionPath::Native, BackendName::Vulkan, Layout::Rows16),
+            (ExecutionPath::Native, BackendName::Cuda, Layout::Mma16),
+            (ExecutionPath::Native, BackendName::Cpu, Layout::Packet),
+            (ExecutionPath::Planned, BackendName::Metal, Layout::Packet),
+        ] {
+            assert_eq!(resident_layout(path, backend), layout);
+        }
+        for (encoding, representation) in [
+            (Encoding::Q8_0, "q8g32s"),
+            (Encoding::Q4K, "q4k"),
+            (Encoding::Q5K, "q5k"),
+            (Encoding::Q6K, "q6k"),
+            (Encoding::Iq4Xs, "iq4g32"),
+        ] {
+            for layout in Layout::ALL {
+                let element = resident_element(encoding, DType::BF16, layout).unwrap();
+                assert_eq!((element.representation(), element.layout()), (representation, layout));
+            }
+        }
+        assert_eq!(
+            resident_element(Encoding::F16, DType::BF16, Layout::Rows16),
+            Some(Element::bf16())
+        );
+        assert_eq!(resident_element(Encoding::Q3K, DType::BF16, Layout::Rows16), None);
     }
 }

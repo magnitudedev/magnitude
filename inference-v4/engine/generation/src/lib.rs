@@ -702,7 +702,10 @@ impl Generation {
             .min(self.options.forced_quantum)
             .min(self.options.max_tokens - self.generated.len())
             .min(self.options.output_capacity - self.output.len());
-        let Some(constraint) = &self.constraint else {
+        // A zero bound forces nothing: quantum 0 disables forced runs, and the
+        // output or token budget may be spent. Constraints serve positive
+        // allowances only.
+        let Some(constraint) = self.constraint.as_ref().filter(|_| limit > 0) else {
             return Ok(Vec::new());
         };
         let forced = constraint.forced(limit)?;

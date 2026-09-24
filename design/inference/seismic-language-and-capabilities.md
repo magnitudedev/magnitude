@@ -66,9 +66,27 @@ native implementation a portable compiler candidate.
 Direct Metal source receives a generated ABI prefix after element parameters are bound. The
 prefix derives representation descriptors exclusively from the semantic registry for every bound
 element parameter and tensor parameter/result: canonical identity, dense/packed/external kind,
-decoded dtype, packet geometry, and packed-plane layout and encoding. These are compile-time Metal
-macros, while dimensions, extents, strides, and scalars remain invocation words. Native assets do
-not infer representations from byte lengths or reproduce registry layout tables.
+decoded dtype, and for packed storage the (representation, layout) pair with its packet or row
+geometry and plane encoding. These are compile-time macros. Static dimensions render as
+constants, as do the extents they fix and the row geometry of a row-layout tensor with a static
+packing axis; a tensor whose every extent is static also renders its canonical strides as
+constants and must be bound canonically. Other dimensions, extents, strides, and scalars remain
+invocation words. Native assets do
+not infer representations from byte lengths or reproduce registry layout tables. A Metal or CUDA
+asset may include its backend's shared device library, `common/<name>.h` or `common/<name>.cuh`
+beside the asset; the build inlines, hashes and ABI-validates included files like the asset and
+rejects every other include, vendor and system headers included. A Metal implementation's
+buffers, argument words and scalar slots must fit Metal's 31-entry argument table, checked at
+build and at preparation.
+
+`vulkan` is a registered, native-only backend name: it has no compiler target, capabilities or
+intrinsics, so a `lower … for vulkan` body is rejected at checking. A `native … for vulkan`
+declaration is checked, and its `threads_per_threadgroup` and `shared_bytes` may read only static
+dimensions and tuning parameters, because a Vulkan pipeline fixes its group size and shared memory
+when the kernel is prepared. Its assets may include `common/<name>.glsl`. Until a Vulkan ABI prefix
+and runtime exist, the build refuses a Vulkan native implementation (it cannot be ABI-validated),
+and discovery reports a `vulkan` diagnostic that this build has no Vulkan runtime, so a request for a
+Vulkan device fails with that reason.
 
 At each static call occurrence, compilation considers every applicable portable body and every
 applicable lowering for the selected backend. Portable bodies are not fallback implementations and
@@ -157,6 +175,16 @@ The only physical source exception is the launch tuple on an explicitly selected
 implementation. It is closed integer arithmetic over the attached function's inferred dimensions
 and is consumed only by the direct native runtime; it is not visible to portable bodies, lowerings,
 static calls, or compiler planning.
+
+A native launch and a native scratch buffer may be conditional (`launch K when C:`, `scratch S bytes
+(E) when C`). A condition is comparisons of that same integer arithmetic joined by `and` and `or`;
+it reads every entry dimension and tuning parameter and is evaluated with the launch geometry (per
+standalone call, once per node when a native graph is sealed). The same condition form restricts
+tuning configurations in `where`, which reads only static dimensions and parameters. An inactive
+launch is neither encoded nor checked against pipeline or device limits, its geometry is not
+evaluated, and it keeps its ordinal (formed functions and trace entries stay in declaration order;
+a trace records it as an empty launch). An inactive scratch buffer keeps its ABI slot at the minimum
+charge without evaluating its size. A call whose launches are all inactive is legal and does nothing.
 
 ## Backend capabilities
 
@@ -251,14 +279,19 @@ not semantic cache keys.
 These outcomes are never converted into runtime fallback behavior.
 
 Direct top-level native implementations have no numerical-policy selection, modeled duration, or
-fallback. Their source bytes are captured with the checked module; source bytes and the attached
+fallback. They may use reduced-precision arithmetic and explicitly called fast math functions;
+their numerical admission is the consuming application's empirical precision gate. Global
+fast-math modes remain disabled on this route as well. Their source bytes are captured with the checked module; source bytes and the attached
 function contract participate in bundle and generated identity;
 Metal compilation or execution errors are reported directly.
 
 ## Acceptance criteria
 
 - Portable functions, lowerings, and backend helpers contain no physical tile, storage, launch, or
-  pipeline syntax; direct top-level native declarations contain only their explicit launch tuple.
+  pipeline syntax; direct top-level native declarations contain only their explicit launch tuples,
+  scratch sizes, tuning domains and conditions (`where`, `when`).
+- An inactive native launch does no device work and is exempt from limit checks; its geometry and
+  an inactive scratch buffer's size are never evaluated.
 - Ownership and bounded iteration determine legal reads, writes, moves, and parallel effects.
 - Every accepted write to storage shared across parallel participants carries
   an exclusive or atomic capability for those participants. Iteration-local
@@ -283,6 +316,11 @@ the value and cannot be inverted to recover one during lowering. Reference
 execution and native lowering consume the same symbolic operation. Launch counts
 use the expression language's ceiling division, preserving zero extents without
 inventing subtraction preconditions.
+
+The checker records, per indexed axis, whether each point or range bound is proved in
+its source scope. Semantic lowering emits a runtime source check exactly for the bounds
+the checker did not prove, whether the access is an element read, a slice view or a
+store destination; the slice metadata carries the same per-bound flags.
 
 
 Natural-bound implication uses structural monotonicity: division or ceiling division

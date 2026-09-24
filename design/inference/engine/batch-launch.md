@@ -9,8 +9,13 @@ applies_to:
 
 Batching owns device-independent row semantics. It validates slot order, row mappings,
 coordinates, visibility, destinations, demands, selection controls, and physical capacity class
-once, then produces an opaque domain-specific batch. The packed upload is a derived view of that
-batch, not a separately mutable authority.
+once, then produces an opaque domain-specific batch. A row's visible history ranges keep the
+history's logical order, coalesce only logically adjacent ranges, and must not share a row; their
+addresses need not ascend. The history-segment class limit is the state store's segment bound.
+Its row tables are the only upload source;
+programs encode each graph's inputs from them directly, with no separate packed control image.
+Selection masks are shared with their producer rather than copied into the batch, and an
+unconstrained row carries no mask.
 
 Execution joins a validated batch with owned state advances, conditioning, workspace, and output
 leases into one opaque launch. Its constructor checks only cross-domain facts: resource identity,

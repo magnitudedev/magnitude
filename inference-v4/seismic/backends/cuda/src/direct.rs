@@ -22,6 +22,7 @@ pub struct DirectModule {
     /// Keeps the functions' module loaded.
     _module: Arc<Module>,
     functions: Vec<DirectFunction>,
+    formation: nvrtc::Formation,
 }
 
 struct DirectFunction {
@@ -39,8 +40,19 @@ unsafe impl Sync for DirectModule {}
 
 fn formation_error(error: NvrtcError) -> NativeCompilationError {
     match error {
+        NvrtcError::Unavailable(reason) => NativeCompilationError::ToolchainUnavailable(reason),
+        NvrtcError::UnsupportedArchitecture {
+            architecture,
+            supported,
+        } => NativeCompilationError::UnsupportedArchitecture {
+            architecture: format!("sm_{architecture}"),
+            supported: supported
+                .into_iter()
+                .map(|architecture| format!("sm_{architecture}"))
+                .collect(),
+        },
         NvrtcError::Compilation { log } => NativeCompilationError::ToolchainFailure(log),
-        other => NativeCompilationError::ToolchainFailure(other.to_string()),
+        call @ NvrtcError::Call { .. } => NativeCompilationError::ToolchainFailure(call.to_string()),
     }
 }
 
@@ -65,21 +77,43 @@ fn submission(error: DriverError) -> ExecutionError {
 }
 
 impl DirectModule {
-    /// Form `source` with NVRTC for `sm_<architecture>` and load each named
-    /// kernel, in the given order.
-    pub fn compile(
+    /// Form `source` for `sm_<architecture>` and load each named kernel, in
+    /// the given order. `stored` may supply an image formed earlier under the
+    /// same formation (compiler release, architecture, options); an image
+    /// the driver does not load is ignored. Otherwise NVRTC compiles the
+    /// source and `store` receives the new image.
+    pub fn form(
         device: &Device,
         source: &str,
         name: &str,
         architecture: u32,
         kernels: &[&str],
+        stored: impl FnOnce(&nvrtc::Formation) -> Option<Vec<u8>>,
+        store: impl FnOnce(&nvrtc::Formation, &[u8]),
     ) -> Result<Self, NativeCompilationError> {
+        let formation = nvrtc::formation(architecture).map_err(formation_error)?;
+        if let Some(image) = stored(&formation) {
+            if let Ok(module) = Self::load(device, &image, formation, kernels) {
+                return Ok(module);
+            }
+        }
         let cubin = nvrtc::compile_cubin(source, name, architecture).map_err(formation_error)?;
+        store(&cubin.formation, &cubin.image);
+        Self::load(device, &cubin.image, cubin.formation, kernels)
+    }
+
+    /// Load a CUBIN image and each named kernel of it.
+    fn load(
+        device: &Device,
+        image: &[u8],
+        formation: nvrtc::Formation,
+        kernels: &[&str],
+    ) -> Result<Self, NativeCompilationError> {
         let context = device.context();
         let first = kernels.first().ok_or_else(|| {
             NativeCompilationError::MalformedToolchainOutput("native module has no kernels".into())
         })?;
-        let (module, _) = driver::load_module(context, &cubin, first).map_err(jit_error)?;
+        let (module, _) = driver::load_module(context, image, first).map_err(jit_error)?;
         let mut functions = Vec::with_capacity(kernels.len());
         for kernel in kernels {
             let raw = driver::module_function(&module, kernel).map_err(jit_error)?;
@@ -98,7 +132,14 @@ impl DirectModule {
         Ok(Self {
             _module: Arc::new(module),
             functions,
+            formation,
         })
+    }
+
+    /// The compiler release, architecture and options that formed this
+    /// module; together with the source they determine its code.
+    pub fn formation(&self) -> &nvrtc::Formation {
+        &self.formation
     }
 
     pub fn max_threads_per_block(&self, function: usize) -> u64 {
@@ -124,26 +165,23 @@ pub struct DirectLaunch<'a> {
     pub shared_bytes: u64,
 }
 
-/// Launches issued in order on the device's stream. The stream orders each
-/// launch after the previous one's writes.
-pub struct DirectBatch {
-    device: Device,
-    start: Event,
+/// A non-empty launch checked against its function and in driver form.
+struct FormedLaunch {
+    function: Handle,
+    grid: [u32; 3],
+    block: [u32; 3],
+    shared_bytes: u32,
+    /// Buffer addresses in ABI order, then the scalar-result address.
+    pointers: Vec<u64>,
+    words: Vec<u8>,
 }
 
-impl DirectBatch {
-    pub fn new(device: &Device) -> Result<Self, ExecutionError> {
-        let start = Event::new(device.context()).map_err(submission)?;
-        start.record(device.stream()).map_err(submission)?;
-        Ok(Self {
-            device: device.clone(),
-            start,
-        })
-    }
-
-    pub fn launch(&mut self, launch: &DirectLaunch<'_>) -> Result<(), ExecutionError> {
+impl FormedLaunch {
+    /// `None` for an empty grid. Raises the function's dynamic shared-memory
+    /// limit when the launch needs more.
+    fn form(device: &Device, launch: &DirectLaunch<'_>) -> Result<Option<Self>, ExecutionError> {
         if launch.grid.contains(&0) || launch.block.contains(&0) {
-            return Ok(());
+            return Ok(None);
         }
         let function = &launch.module.functions[launch.function];
         let threads = launch.block.iter().product::<u64>();
@@ -153,13 +191,12 @@ impl DirectBatch {
                 function.max_threads
             )));
         }
-        let context = self.device.context();
         if launch.shared_bytes > function.dynamic_shared_limit.load(Ordering::Acquire) {
             let bytes = i32::try_from(launch.shared_bytes).map_err(|_| {
                 ExecutionError::SubmissionFailed("dynamic shared size exceeds driver ABI".into())
             })?;
             driver::set_function_attribute(
-                context,
+                device.context(),
                 function.raw,
                 MAX_DYNAMIC_SHARED_SIZE_BYTES,
                 bytes,
@@ -169,43 +206,174 @@ impl DirectBatch {
                 .dynamic_shared_limit
                 .fetch_max(launch.shared_bytes, Ordering::AcqRel);
         }
-        let mut pointers = launch
-            .buffers
-            .iter()
-            .map(|(buffer, offset)| buffer.pointer() + offset)
-            .collect::<Vec<u64>>();
+        let mut pointers = Vec::with_capacity(launch.buffers.len() + 1);
+        pointers.extend(
+            launch
+                .buffers
+                .iter()
+                .map(|(buffer, offset)| buffer.pointer() + offset),
+        );
         pointers.push(launch.scalar_results.0.pointer() + launch.scalar_results.1);
-        // Parameter order: buffers, words (by value), scalar results.
-        let buffer_count = launch.buffers.len();
         // The prefix declares at least one word, so an entry without words
         // still passes one zeroed word.
-        let mut words = launch.words.to_vec();
-        if words.is_empty() {
-            words = vec![0; 8];
-        }
-        let mut parameters: Vec<*mut c_void> = Vec::with_capacity(buffer_count + 2);
-        for pointer in pointers.iter_mut().take(buffer_count) {
-            parameters.push((pointer as *mut u64).cast());
-        }
-        parameters.push(words.as_mut_ptr().cast());
-        parameters.push((&mut pointers[buffer_count] as *mut u64).cast());
+        let words = if launch.words.is_empty() {
+            vec![0; 8]
+        } else {
+            launch.words.to_vec()
+        };
         let dimension = |value: u64| {
             u32::try_from(value).map_err(|_| {
                 ExecutionError::SubmissionFailed("native launch geometry exceeds driver ABI".into())
             })
         };
+        let axes = |values: [u64; 3]| -> Result<[u32; 3], ExecutionError> {
+            Ok([
+                dimension(values[0])?,
+                dimension(values[1])?,
+                dimension(values[2])?,
+            ])
+        };
+        Ok(Some(Self {
+            function: function.raw,
+            grid: axes(launch.grid)?,
+            block: axes(launch.block)?,
+            shared_bytes: dimension(launch.shared_bytes)?,
+            pointers,
+            words,
+        }))
+    }
+
+    /// The kernel parameter array, pointing into `self`: buffers, the words
+    /// struct (by value), the scalar-result address.
+    fn parameters(&mut self) -> Vec<*mut c_void> {
+        let (scalars, buffers) = self
+            .pointers
+            .split_last_mut()
+            .expect("a formed launch carries its scalar-result address");
+        let mut parameters: Vec<*mut c_void> = Vec::with_capacity(buffers.len() + 2);
+        parameters.extend(
+            buffers
+                .iter_mut()
+                .map(|pointer| (pointer as *mut u64).cast::<c_void>()),
+        );
+        parameters.push(self.words.as_mut_ptr().cast());
+        parameters.push((scalars as *mut u64).cast());
+        parameters
+    }
+}
+
+/// Forms a [`DirectGraph`]: the launches of one submission, in order.
+pub struct DirectGraphBuilder {
+    device: Device,
+    graph: driver::Graph,
+}
+
+impl DirectGraphBuilder {
+    pub fn new(device: &Device) -> Result<Self, ExecutionError> {
+        Ok(Self {
+            device: device.clone(),
+            graph: driver::Graph::new(device.context()).map_err(submission)?,
+        })
+    }
+
+    /// Append a launch after every launch added before it; an empty grid
+    /// adds nothing. The argument values are copied into the graph.
+    pub fn launch(&mut self, launch: &DirectLaunch<'_>) -> Result<(), ExecutionError> {
+        let Some(mut formed) = FormedLaunch::form(&self.device, launch)? else {
+            return Ok(());
+        };
+        let mut parameters = formed.parameters();
+        self.graph
+            .push_kernel(&driver::KernelNodeParams {
+                function: formed.function,
+                grid: formed.grid,
+                block: formed.block,
+                shared_bytes: formed.shared_bytes,
+                parameters: parameters.as_mut_ptr(),
+                extra: std::ptr::null_mut(),
+                kernel: std::ptr::null_mut(),
+                context: std::ptr::null_mut(),
+            })
+            .map_err(submission)
+    }
+
+    pub fn instantiate(self) -> Result<DirectGraph, ExecutionError> {
+        Ok(DirectGraph {
+            exec: self.graph.instantiate().map_err(submission)?,
+        })
+    }
+}
+
+/// An instantiated CUDA graph of direct launches with fixed arguments. One
+/// graph launch replaces its launches' individual driver calls; the device
+/// runs them in order, as the stream would.
+pub struct DirectGraph {
+    exec: driver::GraphExec,
+}
+
+/// Launches issued in order on the device's stream. The stream orders each
+/// launch after the previous one's writes.
+pub struct DirectBatch {
+    device: Device,
+    start: Event,
+    /// For a timed batch, per `launch` call, the event recorded just before
+    /// the launch (absent for an empty launch).
+    marks: Option<Vec<Option<Event>>>,
+}
+
+impl DirectBatch {
+    pub fn new(device: &Device) -> Result<Self, ExecutionError> {
+        let start = Event::new(device.context()).map_err(submission)?;
+        start.record(device.stream()).map_err(submission)?;
+        Ok(Self {
+            device: device.clone(),
+            start,
+            marks: None,
+        })
+    }
+
+    /// A measurement batch that records an event before every launch, so
+    /// each launch's device interval is known. The events add stream work;
+    /// a timed batch attributes time but does not measure production.
+    pub fn timed(device: &Device) -> Result<Self, ExecutionError> {
+        let mut batch = Self::new(device)?;
+        batch.marks = Some(Vec::new());
+        Ok(batch)
+    }
+
+    /// Record a launch that does no device work (inactive, or an empty
+    /// grid): nothing is issued, and a timed batch keeps its place with no
+    /// interval.
+    pub fn skip(&mut self) {
+        if let Some(marks) = &mut self.marks {
+            marks.push(None);
+        }
+    }
+
+    pub fn launch(&mut self, launch: &DirectLaunch<'_>) -> Result<(), ExecutionError> {
+        let Some(mut formed) = FormedLaunch::form(&self.device, launch)? else {
+            self.skip();
+            return Ok(());
+        };
+        if let Some(marks) = &mut self.marks {
+            let mark = Event::new(self.device.context()).map_err(submission)?;
+            mark.record(self.device.stream()).map_err(submission)?;
+            marks.push(Some(mark));
+        }
+        let mut parameters = formed.parameters();
+        let context = self.device.context();
         let _current = context.enter().map_err(submission)?;
         let driver = &context.driver;
         let status = unsafe {
             (driver.launch)(
-                function.raw,
-                dimension(launch.grid[0])?,
-                dimension(launch.grid[1])?,
-                dimension(launch.grid[2])?,
-                dimension(launch.block[0])?,
-                dimension(launch.block[1])?,
-                dimension(launch.block[2])?,
-                dimension(launch.shared_bytes)?,
+                formed.function,
+                formed.grid[0],
+                formed.grid[1],
+                formed.grid[2],
+                formed.block[0],
+                formed.block[1],
+                formed.block[2],
+                formed.shared_bytes,
                 self.device.stream().raw(),
                 parameters.as_mut_ptr(),
                 std::ptr::null_mut(),
@@ -216,6 +384,19 @@ impl DirectBatch {
             .map_err(submission)
     }
 
+    /// Queue every launch of `graph`, in its order. A timed batch launches
+    /// individually instead, so it never replays.
+    pub fn replay(&mut self, graph: &DirectGraph) -> Result<(), ExecutionError> {
+        assert!(
+            self.marks.is_none(),
+            "DirectBatch::replay precondition: a timed batch times each launch"
+        );
+        graph
+            .exec
+            .launch(self.device.stream())
+            .map_err(submission)
+    }
+
     /// Record completion without waiting.
     pub fn commit(self) -> Result<DirectSubmission, ExecutionError> {
         let end = Event::new(self.device.context()).map_err(submission)?;
@@ -223,7 +404,39 @@ impl DirectBatch {
         Ok(DirectSubmission {
             start: self.start,
             end,
+            marks: self.marks,
         })
+    }
+}
+
+/// A completed stream event paired with the host clock time read just after
+/// it completed: the origin that places device events on the host timeline.
+pub struct TimelineAnchor {
+    event: Event,
+    host_seconds: f64,
+}
+
+// See `DirectSubmission`.
+unsafe impl Send for TimelineAnchor {}
+unsafe impl Sync for TimelineAnchor {}
+
+impl TimelineAnchor {
+    /// Record an event on the device's (idle) stream, wait for it, and read
+    /// `host_clock`. The pairing error is the synchronization latency.
+    pub fn record(device: &Device, host_clock: impl FnOnce() -> f64) -> Result<Self, ExecutionError> {
+        let event = Event::new(device.context()).map_err(submission)?;
+        event.record(device.stream()).map_err(submission)?;
+        event.synchronize().map_err(submission)?;
+        Ok(Self {
+            event,
+            host_seconds: host_clock(),
+        })
+    }
+
+    fn place(&self, event: &Event) -> Result<f64, ExecutionError> {
+        Event::elapsed_ns(&self.event, event)
+            .map(|nanoseconds| self.host_seconds + nanoseconds / 1e9)
+            .map_err(submission)
     }
 }
 
@@ -231,6 +444,7 @@ impl DirectBatch {
 pub struct DirectSubmission {
     start: Event,
     end: Event,
+    marks: Option<Vec<Option<Event>>>,
 }
 
 // Events are driver objects usable from any thread with their context made
@@ -258,9 +472,36 @@ impl DirectSubmission {
             .map(|nanoseconds| nanoseconds / 1e9)
             .map_err(submission)
     }
-}
 
-/// The NVRTC identity recorded in native artifact identities.
-pub fn nvrtc_version() -> Result<(u32, u32), NativeCompilationError> {
-    nvrtc::version().map_err(|error| NativeCompilationError::ToolchainFailure(error.to_string()))
+    /// The completed batch's device interval on the anchor's host clock.
+    pub fn device_interval(&self, anchor: &TimelineAnchor) -> Result<(f64, f64), ExecutionError> {
+        Ok((anchor.place(&self.start)?, anchor.place(&self.end)?))
+    }
+
+    /// For a timed batch, each `launch` call's device interval on the
+    /// anchor's host clock, in launch order (`None` for an empty launch). A
+    /// launch ends where the next recorded launch (or the batch) ends.
+    /// `None` for a production batch. Call after completion.
+    pub fn launch_intervals(
+        &self,
+        anchor: &TimelineAnchor,
+    ) -> Result<Option<Vec<Option<(f64, f64)>>>, ExecutionError> {
+        let Some(marks) = &self.marks else {
+            return Ok(None);
+        };
+        let mut intervals = Vec::with_capacity(marks.len());
+        for (index, mark) in marks.iter().enumerate() {
+            let Some(mark) = mark else {
+                intervals.push(None);
+                continue;
+            };
+            let end = marks[index + 1..]
+                .iter()
+                .flatten()
+                .next()
+                .unwrap_or(&self.end);
+            intervals.push(Some((anchor.place(mark)?, anchor.place(end)?)));
+        }
+        Ok(Some(intervals))
+    }
 }

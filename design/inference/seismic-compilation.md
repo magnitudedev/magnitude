@@ -42,9 +42,45 @@ CheckedModule -> LogicalEntry -> InvocationContract
 
 This route reuses the checked entry contract and public tensor runtime but constructs none of
 `RefinedCandidateFamilies`, compiler kernel IR, `CandidateDomain`, `SelectionPolicy`, `ExecutableVariant`,
-`PreparedKernel`, or portable workflow artifacts. It has no tuning, solving, duration model, candidate
-selection, retry, or fallback. The distinct public handle makes direct-only use structural.
-Standalone native calls use the same checked entry without creating a graph.
+`PreparedKernel`, or portable workflow artifacts. It has no solving, duration model, candidate
+selection, retry, or fallback. Its only search is tuning, fast enough to run at program
+preparation: a budgeted local search of the author's declared parameter domain, minimizing one
+weighted device-measured cost (`Σ weight × median`) over the consumer's points. Each parameter's
+values are ordered numerically; neighbours differ by one step in one parameter. The search
+evaluates the defaults (and any start configurations the consumer names), then repeatedly forms
+every unvisited neighbour of the current configuration as one parallel batch, measures each, and
+moves to the best while it improves by more than ε; at a local minimum it restarts from the
+unvisited configuration farthest from everything visited. It stops when the consumer's budget (a
+configuration count, never a wall-clock limit) is spent, the space is exhausted, R consecutive
+restarts found nothing better, or the consumer's safety deadline passes. Configurations the
+device cannot form or run cost +∞ and consume budget. The K cheapest configurations and the
+defaults are then re-measured with more samples, alternating round by round, and ranked by those
+costs; the defaults rank first unless the leader beats them by δ. The search is a pure function of
+an evaluator's costs, so a recorded evaluator can replay it. Measurement is device time: a
+point's calls are placed once, calibrated so one sample covers a minimum device time, and every
+sample of every point is submitted before any is read. The consumer then prepares the chosen
+specialization explicitly. Validation walks the confirmed ranking until one configuration passes,
+so only the chosen configuration and any that beat it are validated: a configuration whose
+arithmetic parameters equal the defaults' must be bit-identical (else its mapping parameters are
+misclassified), others must agree within the consumer's tolerance, a bound on each dense
+result's error norm relative to the reference's norm (reduced-precision operands perturb every
+element by a share of the output's scale, not of its own value). Validation covers every tensor
+an entry writes, results and `&mut` parameters. The tuner never saves or restores state: a tuning
+point whose entry writes in place supplies an initializer that restores those tensors before each
+validation run, and a point without one is rejected. A configuration that fails to form, run,
+measure or validate is excluded with its typed reason; only the default configuration is required
+to run. The distinct public handle makes direct-only use structural.
+Seismic performs no file I/O for formed artifacts and knows no cache locations. An embedder that
+keeps them between processes passes an `ArtifactStore` when it opens a device. CUDA formation
+computes a content address over the rendered source and the NVRTC formation (release,
+architecture, options), asks the store before running NVRTC, loads a stored CUBIN instead of
+compiling, and hands every newly formed CUBIN to the store; a stored image the driver refuses is a
+miss and is formed again. Metal and CPU formation do not use the store. For keying the embedder's
+own records of tuning results, Seismic exposes a device tuning identity that includes the Metal OS
+build or the CUDA driver and NVRTC release, and an implementation digest over an entry's
+declaration and the source rendered for it.
+Standalone native calls use the same checked entry without creating a graph. Their scalar-result
+slots and scratch are the prepared kernel's invocation workspace, which reports both.
 A native graph composes checked native entries, owns the shapes and lifetimes of
 its graph-local mutable tensors, host-uploaded input tensors, intermediate results, and exported
 outputs, and reports its exact storage charge. Compatible workflow variants may share a bounded
@@ -53,9 +89,35 @@ classes before the engine becomes ready. Request-dependent external state and re
 are joined to checked ports while constructing an owned run, before submission. A submitted run
 does not discover an absent tensor, incompatible shape, representation, or alias.
 Direct native workflow nodes execute in their checked dependency order within one Metal command
-buffer per workflow submission. Their invocation arguments are fixed independently for each node
-before encoding, and the workflow holds all referenced storage through the single completion.
+buffer, or one CUDA stream submission, per workflow submission. Sealing validates each node
+against its entry contract once and fixes its argument words, launch geometry and the storage
+region and offset of every buffer, each at the one native buffer alignment (256 B, the alignment of
+device allocations, so every placed buffer satisfies what kernels assume of a standalone call's); a
+run supplies only its storage regions and the tensors bound to external ports, and attaching
+checks those bindings alone. Per-run values live in storage, never in launch arguments: host-written
+inputs go to the run's upload region, which is host-visible memory (Metal shared storage, CUDA
+mapped pinned host memory), so writing it is a plain host write that never waits for queued
+device work. A slot takes its upload regions in rotation, so a fixed sequence of runs binds the
+same storage at the same position. Attached runs of different plans may be queued on a sequence
+and submitted together as one unit (one Metal command buffer, one CUDA stream submission); the
+device runs them in queue order exactly as if submitted one by one, and a queued run holds its
+storage rather than its tensor handles, so output leases it reads can be recycled and rebound by
+later runs of the same sequence. On CUDA a submission's launches are fully determined by its
+plans and the addresses it binds: the device keeps the instantiated CUDA graph of each (plans,
+bound addresses) key (least recently used dropped beyond a bound) and a submission with a known
+key is one graph launch. Standalone calls and launch-detail traces launch individually. Graph
+nodes publish no scalar results and never touch a kernel's scalar slots. A submission holds all
+referenced storage through its completion. An allocation's host access orders after only the
+newest submitted device use (host writes) or write (host reads): a device's native submissions
+run on its one queue (one CUDA stream, one Metal command queue of serial compute passes) and
+complete in commit order, and each submission commits and records its fences under the device's
+order lock, so the newest fence of a kind completes after every earlier one.
 Standalone native calls retain their own submission boundary.
+A device's submission trace (measurement only, one active at a time) records every native
+submission's host encode interval and its device interval on one host clock. At launch detail
+each launch is encoded in its own timestamped encoder (Metal) or between recorded stream events
+(CUDA), still within the same single submission; that attributes device time to entries but
+changes the device work, so launch-detail steps are never production timings.
 
 ## Principles
 
@@ -109,7 +171,9 @@ indices take the maximum across those iterations; execution retains the exact pe
 layout. Runtime branches reserve both possible arms without evaluating content predicates.
 Every invocation-determined allocation reservation, including storage acquired
 at a reached schedule action, must fit the target's fixed per-allocation and
-index limits throughout the accepted invocation domain. Execution-dependent
+index limits throughout the accepted invocation domain. A callee's imported proxy of
+a caller-owned view is not a reservation: the caller's own reservation carries that
+obligation, so the callee never restates the caller's reached geometry. Execution-dependent
 reached sizes and aggregate available capacity retain their planned runtime
 capacity-failure behavior. The IR's coordinated
 construction API owns scoped identities and child import; consumers cannot mutate

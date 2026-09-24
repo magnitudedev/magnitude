@@ -862,7 +862,7 @@ pub(crate) fn capability_rows() -> Vec<CapabilityRow> {
         let matrix_elements: &[DType] = match backend {
             BackendName::Metal => &[DType::F16, DType::F32],
             BackendName::Cuda => &[DType::F16, DType::BF16],
-            BackendName::Cpu => &[],
+            BackendName::Cpu | BackendName::Vulkan => &[],
         };
         for &elem in matrix_elements {
             out.push(CapabilityRow {

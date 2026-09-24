@@ -110,26 +110,6 @@ impl StorageContents {
         self.roots.insert(destination.root, state);
     }
 
-    pub(crate) fn carried_allocation(
-        &mut self,
-        before: &Self,
-        iteration: &Self,
-        value: &StoredTensor,
-    ) {
-        self.roots.insert(
-            value.root,
-            before.state(value).intersection(iteration.state(value)),
-        );
-    }
-
-    pub(crate) fn readable(
-        &self,
-        context: &mut InitializationContext<'_>,
-        value: &StoredTensor,
-    ) -> bool {
-        context.readable(self.state(value), &value.initialized_view)
-    }
-
     pub(crate) fn arguments(&self, arguments: &[CallArgument<'_>]) -> Vec<InitializationArgument> {
         arguments
             .iter()

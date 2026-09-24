@@ -36,12 +36,14 @@ pub enum VectorKind {
     Value,
 }
 
+/// A history plane of one vector kind. Affine metadata is one plane of
+/// (scale, zero) pairs per group, so an attention read fetches both with one
+/// load; codes never share a plane with metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PlaneName {
     Dense,
     Codes,
-    Scale,
-    Zero,
+    Coefficients,
     Norm,
 }
 
@@ -90,6 +92,8 @@ impl KvCodec {
         }
     }
 
+    /// `spec` widths are per attention head: every (history row, head)
+    /// vector is one codec group.
     pub const fn spec(self, dense_dtype: DType, key_width: usize, value_width: usize) -> CodecSpec {
         let (key, value) = match self {
             Self::Dense => (
@@ -162,47 +166,50 @@ pub struct PlaneDescriptor {
     pub row_bytes: usize,
 }
 
+/// One attention-history component: `heads` vectors of each kind per history
+/// row, each encoded by `codec` (whose widths are per head). Every plane row
+/// is `[heads, per-head elements]`, so a plane is `[rows, heads, elements]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ComponentDescriptor {
     pub layer: LayerRef,
     pub codec: CodecSpec,
+    pub heads: usize,
     planes: Vec<PlaneDescriptor>,
 }
 
 impl ComponentDescriptor {
-    pub fn new(layer: LayerRef, codec: CodecSpec) -> Result<Self, LayoutError> {
+    pub fn new(layer: LayerRef, codec: CodecSpec, heads: usize) -> Result<Self, LayoutError> {
         let codec = codec.validate()?;
+        if heads == 0 {
+            return Err(LayoutError::ZeroHeads);
+        }
         let mut planes = planes_for(VectorKind::Key, codec.key, codec.key_width)?;
         planes.extend(planes_for(
             VectorKind::Value,
             codec.value,
             codec.value_width,
         )?);
+        for plane in &mut planes {
+            plane.row_extents = vec![heads, plane.row_elements];
+            plane.row_elements = plane
+                .row_elements
+                .checked_mul(heads)
+                .ok_or(LayoutError::ArithmeticOverflow("plane row elements"))?;
+            plane.row_bytes = plane
+                .row_bytes
+                .checked_mul(heads)
+                .ok_or(LayoutError::ArithmeticOverflow("plane row bytes"))?;
+        }
         Ok(Self {
             layer,
             codec,
+            heads,
             planes,
         })
     }
 
     pub fn planes(&self) -> &[PlaneDescriptor] {
         &self.planes
-    }
-
-    /// Dense planes retain their semantic row axes while codec arithmetic uses
-    /// the equivalent flattened width.
-    pub fn dense_shaped(
-        layer: LayerRef,
-        dtype: DType,
-        key_shape: Vec<usize>,
-        value_shape: Vec<usize>,
-    ) -> Result<Self, LayoutError> {
-        let key_width = shape_elements(&key_shape)?;
-        let value_width = shape_elements(&value_shape)?;
-        let mut component = Self::new(layer, CodecSpec::dense(dtype, key_width, value_width))?;
-        component.planes[0].row_extents = key_shape;
-        component.planes[1].row_extents = value_shape;
-        Ok(component)
     }
 
     pub fn row_bytes(&self) -> Result<usize, LayoutError> {
@@ -217,6 +224,7 @@ impl ComponentDescriptor {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LayoutError {
     ZeroWidth(VectorKind),
+    ZeroHeads,
     InvalidDType { plane: PlaneName, dtype: DType },
     InvalidBits(u8),
     InvalidGroup { width: usize, group: usize },
@@ -229,6 +237,7 @@ impl fmt::Display for LayoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ZeroWidth(vector) => write!(f, "{vector:?} width must be positive"),
+            Self::ZeroHeads => f.write_str("an attention-history component needs a head"),
             Self::InvalidDType { plane, dtype } => {
                 write!(
                     f,
@@ -269,12 +278,13 @@ fn planes_for(
             scale_dtype,
         } => {
             require_bits(bits)?;
-            require_float(PlaneName::Scale, scale_dtype)?;
-            let groups = groups(width, group)?;
+            require_float(PlaneName::Coefficients, scale_dtype)?;
+            let pairs = groups(width, group)?
+                .checked_mul(2)
+                .ok_or(LayoutError::ArithmeticOverflow("coefficient pairs"))?;
             Ok(vec![
                 codes_plane(vector, width, bits)?,
-                plane(vector, PlaneName::Scale, scale_dtype, groups)?,
-                plane(vector, PlaneName::Zero, scale_dtype, groups)?,
+                plane(vector, PlaneName::Coefficients, scale_dtype, pairs)?,
             ])
         }
         Codec::RotatedLloydMax {
@@ -353,17 +363,6 @@ fn plane(
     })
 }
 
-fn shape_elements(shape: &[usize]) -> Result<usize, LayoutError> {
-    if shape.is_empty() || shape.contains(&0) {
-        return Err(LayoutError::ArithmeticOverflow("dense row shape"));
-    }
-    shape.iter().try_fold(1usize, |elements, extent| {
-        elements
-            .checked_mul(*extent)
-            .ok_or(LayoutError::ArithmeticOverflow("dense row shape"))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,7 +370,7 @@ mod tests {
     #[test]
     fn dense_and_affine_plane_arithmetic_is_exact() {
         let dense =
-            ComponentDescriptor::new(LayerRef::Target(2), CodecSpec::dense(DType::F16, 128, 64))
+            ComponentDescriptor::new(LayerRef::Target(2), CodecSpec::dense(DType::F16, 128, 64), 1)
                 .unwrap();
         assert_eq!(
             dense
@@ -402,6 +401,7 @@ mod tests {
                 value_width: 96,
                 packing: 2,
             },
+            1,
         )
         .unwrap();
         assert_eq!(
@@ -412,13 +412,42 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 (VectorKind::Key, PlaneName::Codes, 96),
-                (VectorKind::Key, PlaneName::Scale, 6),
-                (VectorKind::Key, PlaneName::Zero, 6),
+                (VectorKind::Key, PlaneName::Coefficients, 12),
                 (VectorKind::Value, PlaneName::Codes, 48),
-                (VectorKind::Value, PlaneName::Scale, 2),
-                (VectorKind::Value, PlaneName::Zero, 2),
+                (VectorKind::Value, PlaneName::Coefficients, 4),
             ]
         );
+    }
+
+    #[test]
+    fn head_vectors_are_codec_groups() {
+        // Qwen3.5-4B attention history: 4 kv heads of 256.
+        let affine =
+            ComponentDescriptor::new(LayerRef::Target(3), KvCodec::AffineK8V4.spec(DType::BF16, 256, 256), 4)
+                .unwrap();
+        assert_eq!(
+            affine
+                .planes()
+                .iter()
+                .map(|plane| (plane.vector, plane.name, plane.dtype, plane.row_extents.clone(), plane.row_bytes))
+                .collect::<Vec<_>>(),
+            vec![
+                (VectorKind::Key, PlaneName::Codes, DType::U32, vec![4, 64], 1024),
+                (VectorKind::Key, PlaneName::Coefficients, DType::F16, vec![4, 2], 16),
+                (VectorKind::Value, PlaneName::Codes, DType::U32, vec![4, 32], 512),
+                (VectorKind::Value, PlaneName::Coefficients, DType::F16, vec![4, 2], 16),
+            ]
+        );
+        assert_eq!(affine.row_bytes().unwrap(), 1568);
+        let dense =
+            ComponentDescriptor::new(LayerRef::Target(3), KvCodec::Dense.spec(DType::BF16, 256, 256), 4)
+                .unwrap();
+        assert_eq!(dense.planes()[0].row_extents, [4, 256]);
+        assert_eq!(dense.row_bytes().unwrap(), 4096);
+        assert!(matches!(
+            ComponentDescriptor::new(LayerRef::Target(3), CodecSpec::dense(DType::BF16, 8, 8), 0),
+            Err(LayoutError::ZeroHeads)
+        ));
     }
 
     #[test]
@@ -476,6 +505,7 @@ mod tests {
                 value_width: 8,
                 packing: 2,
             },
+            1,
         )
         .unwrap();
         assert_eq!(rotated.planes()[0].name, PlaneName::Codes);
@@ -502,7 +532,8 @@ mod tests {
                     key_width: 8,
                     value_width: 8,
                     packing: 2,
-                }
+                },
+                1,
             ),
             Err(LayoutError::InvalidGroup { .. })
         ));

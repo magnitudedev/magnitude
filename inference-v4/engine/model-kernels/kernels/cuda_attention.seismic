@@ -1,0 +1,39 @@
+# CUDA implementations of the gated-attention entries (contracts in
+# attention.seismic). Head width 2 * P + S is a multiple of 32 up to 256: a
+# warp holds one head vector at W / 32 dimensions per lane, and prefill tiles
+# are 16-bit rows of whole 16-byte chunks.
+
+# Split-KV decode. PARTS partitions per (kv head, row) size the grid for the
+# 48 SMs of GB10 (KV * PARTS blocks per row); WARPS warps per block scan
+# contiguous slices of the partition.
+native qwen_attention_decode for cuda from "cuda/qwen_attention_decode.cu":
+    static (KV, G, P, S)
+    params (arithmetic PARTS in [12, 24, 48], arithmetic WARPS in [4, 8])
+    where (2 * P + S) % 32 == 0 and 2 * P + S <= 256
+    scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
+    scratch statistics bytes (M * KV * G * PARTS * 8)
+    launch qwen_attention_decode_partial:
+        threadgroups (KV, PARTS, M)
+        threads_per_threadgroup (WARPS * 32, 1, 1)
+        shared_bytes ((G + WARPS) * (2 * P + S) * 4 + WARPS * G * 8)
+    launch qwen_attention_decode_merge:
+        threadgroups (KV * G, M, 1)
+        threads_per_threadgroup (2 * P + S, 1, 1)
+
+
+# Flash attention on m16n8k16 tensor cores. A block owns WARPS * 16 matrix
+# rows (WARPS * 16 / G tokens x G query heads) of one kv head; K/V tiles of 32
+# keys are double-buffered next to the query tile in shared memory.
+native qwen_attention_prefill for cuda from "cuda/qwen_attention_prefill.cu":
+    static (KV, G, P, S)
+    params (arithmetic WARPS in [4, 2])
+    where (2 * P + S) % 32 == 0 and 2 * P + S <= 256 and 16 % G == 0
+    scratch queries bytes (M * KV * G * (2 * P + S) * 2)
+    scratch keys bytes (M * KV * (2 * P + S) * 4)
+    launch qwen_attention_prefill_prepare:
+        threadgroups (ceil_div(M * KV * (G + 1), 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch qwen_attention_prefill_attend:
+        threadgroups (ceil_div(M * G, WARPS * 16), KV, 1)
+        threads_per_threadgroup (WARPS * 32, 1, 1)
+        shared_bytes ((WARPS * 16 + 4 * 32) * (2 * P + S) * 2 + (R + 1) * 16)

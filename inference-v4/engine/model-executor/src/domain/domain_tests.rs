@@ -11,16 +11,8 @@ use crate::{
         CompletedWork, ProgramSubmission, ReadySubmission,
     },
 };
-use magnitude_artifacts::{
-    ArtifactIdentity, ComponentManifest, PackageIdentity, PackageManifest,
-    gguf::{Encoding, TensorDescriptor},
-};
-use magnitude_model_contracts::{
-    ActivationDType, AttentionGeometry, AttentionWeights, BlockGeometry, BlockWeights,
-    DecoderGeometry, DenseFeedForwardWeights, FamilyId, FeedForwardGeometry, FeedForwardWeights,
-    InputSemantics, MixerGeometry, MixerWeights, RotarySemantics, TextCoordinateSemantics,
-    WeightDescriptor,
-};
+use magnitude_artifacts::PackageManifest;
+use magnitude_model_contracts::FamilyId;
 use magnitude_model_state::KvCodec;
 use std::marker::PhantomData;
 use std::sync::{
@@ -28,125 +20,26 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-fn descriptor(name: &str, shape: &[u64]) -> WeightDescriptor {
-    WeightDescriptor {
-        name: name.into(),
-        shape: shape.to_vec(),
-    }
-}
-
+/// The planning fixture's model (the smallest geometry every native kernel
+/// admits) with an 8-token context.
 fn tiny_definition() -> ModelDefinition {
-    ModelDefinition {
-        family: FamilyId("controlled-target-domain".into()),
-        artifact_identity: PackageIdentity {
-            target: ArtifactIdentity([7; 32]),
-            projector: None,
-        },
-        inputs: InputSemantics {
-            text_coordinates: TextCoordinateSemantics::ReplicatedPosition,
-            coordinate_axes: 1,
-        },
-        geometry: DecoderGeometry {
-            activation_dtype: ActivationDType::BF16,
-            hidden: 2,
-            vocabulary: 8,
-            context_limit: 8,
-            epsilon: 1e-6,
-            blocks: vec![BlockGeometry {
-                mixer: MixerGeometry::Attention(AttentionGeometry {
-                    heads: 1,
-                    kv_heads: 1,
-                    width: 4,
-                    rotary: RotarySemantics::Interleaved {
-                        width: 2,
-                        base: 10_000.0,
-                        sections: vec![1],
-                        axis_pattern: vec![0],
-                    },
-                }),
-                feedforward: FeedForwardGeometry::Dense { intermediate: 4 },
-            }],
-        },
-        embedding: descriptor("embedding", &[8, 2]),
-        blocks: vec![BlockWeights {
-            input_norm: descriptor("input_norm", &[2]),
-            mixer: MixerWeights::Attention(Box::new(AttentionWeights {
-                query_gate: descriptor("qg", &[8, 2]),
-                key: descriptor("k", &[4, 2]),
-                value: descriptor("v", &[4, 2]),
-                query_norm: descriptor("qn", &[4]),
-                key_norm: descriptor("kn", &[4]),
-                output: descriptor("o", &[2, 4]),
-            })),
-            feedforward_norm: descriptor("ffn_norm", &[2]),
-            feedforward: FeedForwardWeights::Dense(Box::new(DenseFeedForwardWeights {
-                gate: descriptor("gate", &[4, 2]),
-                up: descriptor("up", &[4, 2]),
-                down: descriptor("down", &[2, 4]),
-            })),
-        }],
-        output_norm: descriptor("output_norm", &[2]),
-        output: descriptor("output", &[8, 2]),
-        head: None,
-        vision: None,
-    }
+    let mut definition = crate::planning::tests::fixture_definition();
+    definition.family = FamilyId("controlled-target-domain".into());
+    definition.geometry.context_limit = 8;
+    definition
 }
 
 fn tiny_manifest(definition: &ModelDefinition) -> PackageManifest {
-    let block = &definition.blocks[0];
-    let MixerWeights::Attention(attention) = &block.mixer else {
-        unreachable!()
-    };
-    let FeedForwardWeights::Dense(dense) = &block.feedforward else {
-        unreachable!()
-    };
-    let descriptors = [
-        &definition.embedding,
-        &block.input_norm,
-        &attention.query_gate,
-        &attention.key,
-        &attention.value,
-        &attention.query_norm,
-        &attention.key_norm,
-        &attention.output,
-        &block.feedforward_norm,
-        &dense.gate,
-        &dense.up,
-        &dense.down,
-        &definition.output_norm,
-        &definition.output,
-    ];
-    let mut offset = 0;
-    let tensors = descriptors
-        .into_iter()
-        .map(|descriptor| {
-            let nbytes = descriptor.shape.iter().product::<u64>() * 2;
-            let tensor = TensorDescriptor {
-                name: descriptor.name.clone(),
-                shape: descriptor.shape.clone(),
-                encoding: Encoding::F16,
-                offset,
-                nbytes,
-            };
-            offset += nbytes;
-            tensor
-        })
-        .collect();
-    PackageManifest {
-        identity: definition.artifact_identity,
-        target: ComponentManifest {
-            path: "controlled-domain.gguf".into(),
-            identity: definition.artifact_identity.target,
-            size: offset,
-            tensors,
-        },
-        projector: None,
-    }
+    crate::planning::tests::fixture_manifest(definition)
 }
 
 fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>> {
     let catalog = seismic::DeviceCatalog::discover().ok()?;
-    let selected = platform::select_device(&catalog, ExecutionPath::NativeMetal).ok()?;
+    let selected = platform::select_device(
+        &catalog,
+        ExecutionPath::Native,
+        platform::DeviceRequest::Automatic,
+    ).ok()?;
     let device = Rc::new(
         catalog
             .open(catalog.resolve(selected.info.selector).unwrap())
@@ -175,7 +68,7 @@ fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>
             head: false,
             vision: false,
         },
-        ExecutionPath::NativeMetal,
+        ExecutionPath::Native,
         PlannedMethod::Plain,
         KvCodec::Dense,
         limits,
@@ -185,7 +78,17 @@ fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>
     let state =
         ResourcePlanner::state_plan(&definition, draft.load(), KvCodec::Dense, limits, budget)
             .unwrap();
-    let mut programs = AttestedPrograms::prepare_draft(&draft, &device).unwrap();
+    let mut programs = AttestedPrograms::prepare_draft(
+            &draft,
+            &device,
+            crate::TuningContext {
+                definition: &definition,
+                weights: &crate::ZeroTuningWeights,
+                observer: &crate::UnreportedTuning,
+                cache: None,
+            },
+        )
+        .unwrap();
     let target_graphs = programs
         .prepare_target_graphs(&device, draft.load(), &definition.geometry, &state, limits)
         .unwrap();
@@ -389,7 +292,7 @@ impl TestFamily {
 }
 impl ProgramFamily for TestFamily {
     type TargetSubmission =
-        TestSubmission<TargetLaunchCore, (), Option<crate::programs::TargetReadoutGraphResult>>;
+        TestSubmission<TargetLaunchCore, (), crate::TargetOutput>;
     type HeadSubmission = PendingFailureSubmission<CompletedHeadWork>;
     type ProjectSubmission = PendingFailureSubmission<CompletedProjectWork>;
     type VisionSubmission = PendingFailureSubmission<CompletedVisionWork>;
@@ -413,8 +316,19 @@ impl ProgramFamily for TestFamily {
         &mut self,
         launch: ValidatedTargetLaunch,
     ) -> Result<Self::TargetSubmission, (crate::SubmitError, ValidatedTargetLaunch)> {
-        let core = launch.into_submission_parts();
-        Ok(self.submit(core, (), None))
+        let (core, _) = launch.into_submission_parts();
+        let now = std::time::Instant::now();
+        Ok(self.submit(
+            core,
+            (),
+            crate::TargetOutput {
+                readout: None,
+                commits: crate::CommitSpan {
+                    first: now,
+                    last: now,
+                },
+            },
+        ))
     }
     fn submit_head(
         &mut self,
@@ -446,12 +360,11 @@ fn submit_reserved_target<F: ProgramFamily>(
     domain: &mut ExecutorDomain<F>,
     operations: Vec<Operation>,
 ) -> Result<TargetFlight<F::TargetSubmission>, DomainError> {
-    let reservation = domain.reserve(operations)?;
-    let (operations, resources) = reservation.into_parts();
+    let resources = domain.reserve(&operations)?.into_resources();
     let ReservedResources::Target(reservation) = resources else {
         panic!("target operation produced another reservation lane")
     };
-    domain.submit_target(operations, reservation)
+    domain.submit_target(&operations, reservation)
 }
 
 #[test]

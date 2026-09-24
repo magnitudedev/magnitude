@@ -40,6 +40,7 @@ pub use family::{NativeFamily, ProgramFamily};
 use in_flight::decode_selected;
 pub use in_flight::{HeadFlight, ProjectFlight, StateFlight, TargetFlight, VisionFlight};
 pub use ownership::{OpenRequirements, OpenReservation};
+pub use target::TargetHostTiming;
 
 use std::{
     cell::Cell,
@@ -206,9 +207,10 @@ impl DomainRequirements {
     }
 }
 
+/// Capacity reserved for one operation group. The caller keeps the
+/// operations and submits them with these resources.
 pub struct DomainReservation {
     requirements: DomainRequirements,
-    operations: Vec<Operation>,
     resources: ReservedResources,
 }
 
@@ -245,11 +247,8 @@ impl DomainReservation {
     pub fn requirements(&self) -> &DomainRequirements {
         &self.requirements
     }
-    pub fn operations(&self) -> &[Operation] {
-        &self.operations
-    }
-    pub fn into_parts(self) -> (Vec<Operation>, ReservedResources) {
-        (self.operations, self.resources)
+    pub fn into_resources(self) -> ReservedResources {
+        self.resources
     }
 }
 
@@ -331,6 +330,13 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     repairs: BTreeMap<RequestId, PendingRepair>,
     retained_used: Rc<Cell<u64>>,
     fatal: Option<DomainError>,
+    /// Group identities of the target, head and encoder executables.
+    lane_identities: [ProgramIdentity; 3],
+    /// When the last target selection was read to the host.
+    selection_read: Option<Instant>,
+    target_timing: Option<TargetHostTiming>,
+    /// Log each finished target step's host timing (read once at start).
+    trace_host_steps: bool,
 }
 
 impl ExecutorDomain<NativeFamily> {
@@ -705,11 +711,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(())
     }
 
-    pub fn reserve(
-        &mut self,
-        operations: Vec<Operation>,
-    ) -> Result<DomainReservation, DomainError> {
-        let requirements = self.requirements(&operations)?;
+    pub fn reserve(&mut self, operations: &[Operation]) -> Result<DomainReservation, DomainError> {
+        let requirements = self.requirements(operations)?;
         match requirements.lane {
             ReservationLane::Head | ReservationLane::Project if !self.family.head_is_bound() => {
                 let resident = self
@@ -834,7 +837,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let mut resources = resources;
         match &mut resources {
             ReservedResources::Target(TargetGraphReservation { advances, .. }) => {
-                for operation in &operations {
+                for operation in operations {
                     let request = operation.request();
                     let state = self
                         .target
@@ -857,7 +860,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             ReservedResources::Head(_, _, advances)
                 if requirements.lane == ReservationLane::Head =>
             {
-                for operation in &operations {
+                for operation in operations {
                     let request = operation.request();
                     let state = self
                         .head
@@ -881,7 +884,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         Ok(DomainReservation {
             requirements,
-            operations,
             resources,
         })
     }
@@ -897,6 +899,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         family: F,
     ) -> Self {
         let id = resources.domain().clone();
+        let lane_identities = ["target", "head", "vision"].map(|lane| {
+            ProgramIdentity::new(format!("{id}:{lane}"))
+                .expect("a lane identity names its lane and is never empty")
+        });
         Self {
             execution,
             definition,
@@ -914,6 +920,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             repairs: BTreeMap::new(),
             retained_used: Rc::new(Cell::new(0)),
             fatal: None,
+            lane_identities,
+            selection_read: None,
+            target_timing: None,
+            trace_host_steps: std::env::var_os("MAGNITUDE_TRACE_HOST_STEP").is_some(),
         }
     }
 
@@ -923,6 +933,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn execution_path(&self) -> crate::ExecutionPath {
         self.execution.policy().path()
     }
+    /// The backend of the device this domain executes on.
+    pub fn execution_backend(&self) -> seismic::BackendName {
+        self.execution.device().backend()
+    }
     pub fn resources(&self) -> &ResourceDomain {
         &self.domain
     }
@@ -930,18 +944,25 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.fatal.as_ref()
     }
 
-    pub fn group_key(&self, operation: &Operation) -> Result<GroupKey, String> {
-        operation.validate().map_err(|error| error.to_string())?;
-        let lane = match operation.executable() {
-            crate::ExecutableKind::Target => "target",
-            crate::ExecutableKind::Head => "head",
-            crate::ExecutableKind::Encoder => "vision",
+    /// The compatibility key of an operation. Keying does not validate;
+    /// reservation validates every operation at the domain boundary.
+    pub fn group_key(&self, operation: &Operation) -> GroupKey {
+        let executable = operation.executable();
+        let lane = match executable {
+            crate::ExecutableKind::Target => 0,
+            crate::ExecutableKind::Head => 1,
+            crate::ExecutableKind::Encoder => 2,
         };
-        Ok(GroupKey {
-            program_identity: ProgramIdentity::new(format!("{}:{lane}", self.domain.id()))?,
-            executable: operation.executable(),
+        GroupKey {
+            program_identity: self.lane_identities[lane].clone(),
+            executable,
             commitment: operation.commitment(),
-        })
+        }
+    }
+
+    /// Host timing of the most recently finished target step.
+    pub fn target_timing(&self) -> Option<TargetHostTiming> {
+        self.target_timing
     }
 
     fn healthy(&self) -> Result<(), DomainError> {

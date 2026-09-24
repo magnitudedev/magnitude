@@ -7,7 +7,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// remains a proposal until `reconcile` installs it in admitted input.
     pub fn submit_vision(
         &mut self,
-        operation: Operation,
+        operation: &Operation,
         workspace: NativeGraphWorkspaceLease,
         output: NativeGraphOutputLease,
     ) -> Result<VisionFlight<F::VisionSubmission>, DomainError> {
@@ -22,7 +22,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let slot = input
             .images
             .values()
-            .find(|slot| slot.image == image)
+            .find(|slot| slot.image == *image)
             .ok_or("image is not part of admitted input")?;
         if slot.features.is_some() {
             return Err("image is already encoded".into());
@@ -56,8 +56,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         };
         Ok(VisionFlight {
-            request,
-            image,
+            request: *request,
+            image: image.clone(),
             submission,
             started,
         })

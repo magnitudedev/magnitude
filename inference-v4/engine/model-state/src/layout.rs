@@ -31,22 +31,11 @@ impl ModelStateLayout {
                 MixerGeometry::Attention(attention) => {
                     let kv_heads = host(attention.kv_heads, "attention KV heads")?;
                     let width = host(attention.width, "attention head width")?;
-                    let row_width = kv_heads
-                        .checked_mul(width)
-                        .ok_or("attention history row width overflow")?;
-                    let component = if target_codec == KvCodec::Dense {
-                        ComponentDescriptor::dense_shaped(
-                            LayerRef::Target(layer(index)?),
-                            activation,
-                            vec![kv_heads, width],
-                            vec![kv_heads, width],
-                        )
-                    } else {
-                        ComponentDescriptor::new(
-                            LayerRef::Target(layer(index)?),
-                            target_codec.spec(activation, row_width, row_width),
-                        )
-                    }
+                    let component = ComponentDescriptor::new(
+                        LayerRef::Target(layer(index)?),
+                        target_codec.spec(activation, width, width),
+                        kv_heads,
+                    )
                     .map_err(|error| error.to_string())?;
                     target_history.push(component);
                     head_geometry = Some((kv_heads, width));
@@ -61,23 +50,17 @@ impl ModelStateLayout {
         if head_depth != 0 {
             let (kv_heads, width) = head_geometry
                 .ok_or("draft head requires at least one target attention geometry")?;
-            let row_width = kv_heads
-                .checked_mul(width)
-                .ok_or("draft-head history row width overflow")?;
             for index in 0..head_depth {
-                // Head history is dense in the native functional pass. The
-                // target codec policy applies to it only once codec-aware head
-                // kernels exist.
+                // Head history stays dense whatever the target codec: the
+                // draft head's attention reads dense planes only.
                 head_history.push(
-                    ComponentDescriptor::dense_shaped(
+                    ComponentDescriptor::new(
                         LayerRef::Head(layer(index)?),
-                        activation,
-                        vec![kv_heads, width],
-                        vec![kv_heads, width],
+                        KvCodec::Dense.spec(activation, width, width),
+                        kv_heads,
                     )
                     .map_err(|error| error.to_string())?,
                 );
-                debug_assert_eq!(head_history.last().unwrap().codec.key_width, row_width);
             }
         }
 
@@ -183,7 +166,12 @@ mod tests {
         let layout = ModelStateLayout::derive(&geometry, 2, KvCodec::AffineK8V4).unwrap();
         assert_eq!(layout.target_history.len(), 1);
         assert_eq!(layout.target_history[0].layer, LayerRef::Target(0));
-        assert_eq!(layout.target_history[0].codec.key_width, 16);
+        // One codec group per (row, kv head) vector: 2 heads of width 8, each
+        // code row padded to 16 bytes.
+        assert_eq!(layout.target_history[0].codec.key_width, 8);
+        assert_eq!(layout.target_history[0].heads, 2);
+        assert_eq!(layout.target_history[0].planes()[0].row_extents, [2, 4]);
+        assert_eq!(layout.target_history[0].planes()[1].row_extents, [2, 2]);
         assert_eq!(layout.target_recurrent.len(), 2);
         assert_eq!(layout.target_recurrent[0].shape, [3, 64]);
         assert_eq!(layout.target_recurrent[0].dtype, DType::BF16);
@@ -191,7 +179,7 @@ mod tests {
         assert_eq!(layout.target_recurrent[1].dtype, DType::F32);
         assert_eq!(layout.head_history.len(), 2);
         assert_eq!(layout.head_history[1].layer, LayerRef::Head(1));
-        assert_eq!(layout.head_history[1].codec.key_width, 16);
+        assert_eq!(layout.head_history[1].codec.key_width, 8);
         assert_eq!(layout.head_history[1].planes()[0].row_extents, [2, 8]);
         assert!(matches!(
             layout.head_history[1].codec.key,

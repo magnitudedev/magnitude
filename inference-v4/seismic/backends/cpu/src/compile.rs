@@ -85,7 +85,7 @@ pub(crate) fn compile_kernel(
     Ok(NativeCandidate {
         kernel: CompiledKernel {
             entry,
-            memory: Arc::new(JitMemory::new(module)),
+            _memory: Arc::new(JitMemory::new(module)),
             layout: layout.clone(),
         },
         artifact_digest,

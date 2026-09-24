@@ -5,6 +5,7 @@
 //! path, and owns the sole cache of resulting device tensors.
 
 use crate::programs::ProgramSubmission;
+use crate::{resident_element, source_element};
 use crate::{
     AllocationError, ExecutionPlan, ImportLaunchInputs, ImportProgram, InvariantError,
     ResidentWeightSlot, ResourceAllocator, ResourceDomainId, SubmitError, ValidatedImportLaunch,
@@ -144,7 +145,7 @@ impl Stored {
     pub fn source_element(&self) -> Option<Element> {
         match self {
             Self::Dense(tensor) => Some(Element::dense(tensor.dtype)),
-            Self::GgmlBlocks { encoding, .. } => external_element(*encoding),
+            Self::GgmlBlocks { encoding, .. } => source_element(*encoding),
         }
     }
 
@@ -292,9 +293,13 @@ impl ResidencyStore {
         let actual_source = stored
             .source_element()
             .ok_or_else(|| invalid("unsupported source representation"))?;
+        let layout = crate::resident_layout(
+            self.execution.policy().path(),
+            self.execution.device().backend(),
+        );
         let actual_resident = match stored {
             Stored::Dense(_) => Element::dense(target),
-            Stored::GgmlBlocks { encoding, .. } => resident_element(*encoding)
+            Stored::GgmlBlocks { encoding, .. } => resident_element(*encoding, target, layout)
                 .ok_or_else(|| invalid("unsupported packed resident representation"))?,
         };
         if planned.source != actual_source
@@ -473,30 +478,6 @@ impl ComponentLoader<crate::ResidentVision> {
     }
 }
 
-fn external_element(encoding: Encoding) -> Option<Element> {
-    let name = match encoding {
-        Encoding::Q8_0 => "gguf_q8_0",
-        Encoding::Q4K => "gguf_q4_k",
-        Encoding::Q5K => "gguf_q5_k",
-        Encoding::Q6K => "gguf_q6_k",
-        Encoding::Iq4Xs => "gguf_iq4_xs",
-        _ => return None,
-    };
-    Element::named(name)
-}
-
-fn resident_element(encoding: Encoding) -> Option<Element> {
-    let name = match encoding {
-        Encoding::Q8_0 => "q8g32s",
-        Encoding::Q4K => "q4k",
-        Encoding::Q5K => "q5k",
-        Encoding::Q6K => "q6k",
-        Encoding::Iq4Xs => "iq4g32",
-        _ => return None,
-    };
-    Element::named(name)
-}
-
 fn validate_request(
     descriptor: &WeightDescriptor,
     stored: &Stored,
@@ -544,7 +525,7 @@ fn validate_request(
             if *nbytes != expected {
                 return Err(invalid("packed weight byte count mismatch"));
             }
-            if external_element(*encoding).is_none() || resident_element(*encoding).is_none() {
+            if source_element(*encoding).is_none() {
                 return Err(invalid(format!(
                     "GGUF encoding {encoding:?} has no qualified native import"
                 )));
@@ -595,8 +576,10 @@ mod tests {
             Encoding::Q6K,
             Encoding::Iq4Xs,
         ] {
-            assert!(external_element(encoding).is_some());
-            assert!(resident_element(encoding).is_some());
+            assert!(source_element(encoding).is_some());
+            for layout in seismic::Layout::ALL {
+                assert!(resident_element(encoding, DType::BF16, layout).is_some());
+            }
         }
         for encoding in [
             Encoding::Q4_0,
@@ -610,8 +593,8 @@ mod tests {
             Encoding::Q1_0,
             Encoding::I32,
         ] {
-            assert!(external_element(encoding).is_none());
-            assert!(resident_element(encoding).is_none());
+            assert!(source_element(encoding).is_none());
+            assert!(resident_element(encoding, DType::BF16, seismic::Layout::Rows16).is_none());
         }
     }
 

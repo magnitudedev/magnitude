@@ -1,11 +1,12 @@
 use super::policy::{admit_growth, assessment_capacity, MemoryPolicyError};
-use super::selection::{select, SelectionError};
+use super::selection::{select, DeviceRequest, SelectionError};
 use crate::{AttestedPrograms, CatalogError, ExecutionPath};
 use seismic::{
-    BackendName, Device, DeviceCatalog, DeviceInfo, DeviceSelector, MemoryLimitError,
-    ObservationError, OpenError, ResolveError,
+    ArtifactStore, BackendName, Device, DeviceCatalog, DeviceInfo, DeviceOptions, DeviceSelector,
+    MemoryLimitError, ObservationError, OpenError, ResolveError,
 };
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryRequirements {
@@ -61,11 +62,13 @@ impl fmt::Display for BudgetError {
 
 impl std::error::Error for BudgetError {}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct PlatformConfig {
     pub path: ExecutionPath,
     /// The engine's requested Seismic allocation budget for the device.
     pub storage_bytes: u64,
+    /// Where the device keeps formed kernels between loads.
+    pub artifacts: Option<Arc<dyn ArtifactStore>>,
 }
 
 /// The automatically selected device and its stable assessment capacity.
@@ -147,11 +150,11 @@ pub enum PlatformError {
     Budget(BudgetError),
     Policy {
         path: ExecutionPath,
-        backend: BackendName,
         outcome: String,
     },
     MemoryLimit {
         path: ExecutionPath,
+        backend: BackendName,
         selector: DeviceSelector,
         storage_bytes: u64,
         error: MemoryLimitError,
@@ -168,23 +171,19 @@ impl fmt::Display for PlatformError {
             Self::Resolve(error) => write!(formatter, "{error}"),
             Self::Open(error) => write!(formatter, "{error}"),
             Self::Budget(error) => write!(formatter, "{error}"),
-            Self::Policy {
-                path,
-                backend,
-                outcome,
-            } => write!(
-                formatter,
-                "platform rejected path {path} on {}: {outcome}",
-                backend.as_str()
-            ),
+            Self::Policy { path, outcome } => {
+                write!(formatter, "platform rejected path {path}: {outcome}")
+            }
             Self::MemoryLimit {
                 path,
+                backend,
                 selector,
                 storage_bytes,
                 error,
             } => write!(
                 formatter,
-                "failed to set {storage_bytes}-byte limit for {path} on {selector}: {error}"
+                "failed to set {storage_bytes}-byte limit for {path} ({}) on {selector}: {error}",
+                backend.as_str()
             ),
             Self::Qualification(error) => write!(formatter, "{error}"),
         }
@@ -197,10 +196,11 @@ impl std::error::Error for PlatformError {}
 pub fn select_device(
     catalog: &DeviceCatalog,
     path: ExecutionPath,
+    request: DeviceRequest,
 ) -> Result<SelectedDevice, PlatformError> {
     enforce_phase_one(path)?;
     let topology = catalog.topology();
-    let info = select(&topology, path).map_err(PlatformError::Selection)?;
+    let info = select(&topology, path, request).map_err(PlatformError::Selection)?;
     let host = catalog
         .host_memory_status()
         .map_err(PlatformError::Observation)?;
@@ -225,19 +225,20 @@ pub fn open_selected(
         return Err(PlatformError::Budget(BudgetError::ZeroBudget));
     }
     let id = catalog.resolve(selector).map_err(PlatformError::Resolve)?;
-    let device = catalog.open(id).map_err(PlatformError::Open)?;
-    if config.path == ExecutionPath::NativeMetal && device.backend() != BackendName::Metal {
-        return Err(PlatformError::Policy {
-            path: config.path,
-            backend: device.backend(),
-            outcome: "the native Metal path requires a Metal device".into(),
-        });
-    }
+    let device = catalog
+        .open_with(
+            id,
+            DeviceOptions {
+                artifacts: config.artifacts,
+            },
+        )
+        .map_err(PlatformError::Open)?;
     admit_growth(catalog, &device, config.storage_bytes).map_err(PlatformError::Memory)?;
     device
         .set_memory_limit(Some(config.storage_bytes))
         .map_err(|error| PlatformError::MemoryLimit {
             path: config.path,
+            backend: device.backend(),
             selector,
             storage_bytes: config.storage_bytes,
             error,
@@ -250,14 +251,13 @@ pub fn open_selected(
 }
 
 fn enforce_phase_one(path: ExecutionPath) -> Result<(), PlatformError> {
-    if path != ExecutionPath::NativeMetal {
-        return Err(PlatformError::Policy {
+    match path {
+        ExecutionPath::Native => Ok(()),
+        ExecutionPath::Planned => Err(PlatformError::Policy {
             path,
-            backend: BackendName::Metal,
             outcome: "Planned remains unavailable until compiler convergence gate G6".into(),
-        });
+        }),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -273,7 +273,7 @@ mod tests {
                 ..
             })
         ));
-        assert!(enforce_phase_one(ExecutionPath::NativeMetal).is_ok());
+        assert!(enforce_phase_one(ExecutionPath::Native).is_ok());
     }
 
     #[test]
@@ -305,8 +305,9 @@ mod tests {
                 &catalog,
                 missing,
                 PlatformConfig {
-                    path: ExecutionPath::NativeMetal,
+                    path: ExecutionPath::Native,
                     storage_bytes: 1,
+                    artifacts: None,
                 },
             ),
             Err(PlatformError::Resolve(ResolveError::Missing(selector))) if selector == missing

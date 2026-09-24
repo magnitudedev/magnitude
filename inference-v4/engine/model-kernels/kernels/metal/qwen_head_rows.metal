@@ -1,166 +1,111 @@
-inline ulong head_input_at2(ulong row, ulong column, ulong stride0, ulong stride1) {
-    return row * stride0 + column * stride1;
-}
+// qwen_head_rows: final RMS prologue over the `out_rows` hidden rows and the
+// vocabulary projection into F32 logits.
+#include "common/projection.h"
 
-inline uint head_input_code(device const uchar *bytes, ulong bit, uint width) {
-    uint value = 0;
-    for (uint offset = 0; offset < width; ++offset)
-        value |= uint((bytes[(bit + offset) >> 3] >> ((bit + offset) & 7)) & 1) << offset;
-    return value;
-}
-
-inline float head_input_resident(device const uchar *base, ulong logical, uint kind,
-    ulong packet_size, ulong group, ulong words, ulong coefficients, ulong factor, ulong bias) {
-    device const uchar *packet = base + (logical / group) * packet_size;
-    ulong position = logical % group;
-    if (kind == 8)
-        return float(int(reinterpret_cast<device const char *>(packet + words)[position]))
-            * float(*reinterpret_cast<device const half *>(packet + factor));
-    if (kind == 14) {
-        const int table[16] = {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113};
-        return reinterpret_cast<device const float *>(packet + factor)[position / 32]
-            * float(table[head_input_code(packet + words, position * 4, 4)]);
-    }
-    int code = int(head_input_code(packet + words, position * kind, kind));
-    if (kind == 6) code -= 32;
-    ulong ci = position / (kind == 6 ? 16 : 32);
-    if (kind == 6)
-        return float(code * int(reinterpret_cast<device const char *>(packet + coefficients)[ci]))
-            * float(*reinterpret_cast<device const half *>(packet + factor));
-    uint scale_code = head_input_code(packet + coefficients, ci * 12, 6);
-    uint bias_code = head_input_code(packet + coefficients, ci * 12 + 6, 6);
-    return metal::fma(float(*reinterpret_cast<device const half *>(packet + factor))
-        * float(scale_code), float(code),
-        -float(*reinterpret_cast<device const half *>(packet + bias)) * float(bias_code));
-}
-
-#define HEAD_DENSE_LOAD(PREFIX, BASE, LOGICAL) \
-    *reinterpret_cast<device const PREFIX##_TYPE *>((BASE) + (LOGICAL) * PREFIX##_PACKET_SIZE)
-
-inline float head_input_table(device const uchar *base, ulong logical) {
-#if defined(SEISMIC_TABLE_REPRESENTATION_F32)
-    return *reinterpret_cast<device const float *>(base + logical * SEISMIC_TABLE_PACKET_SIZE);
-#elif defined(SEISMIC_TABLE_REPRESENTATION_F16)
-    return float(*reinterpret_cast<device const half *>(base + logical * SEISMIC_TABLE_PACKET_SIZE));
-#elif defined(SEISMIC_TABLE_REPRESENTATION_BF16)
-    return as_type<float>(uint(*reinterpret_cast<device const ushort *>(base + logical * SEISMIC_TABLE_PACKET_SIZE)) << 16);
-#elif defined(SEISMIC_TABLE_REPRESENTATION_Q8G32S)
-    return head_input_resident(base, logical, 8, SEISMIC_TABLE_PACKET_SIZE, SEISMIC_TABLE_LOGICAL_GROUP, SEISMIC_TABLE_PLANE_0_OFFSET, 0, SEISMIC_TABLE_PLANE_1_OFFSET, 0);
-#elif defined(SEISMIC_TABLE_REPRESENTATION_Q4K)
-    return head_input_resident(base, logical, 4, SEISMIC_TABLE_PACKET_SIZE, SEISMIC_TABLE_LOGICAL_GROUP, SEISMIC_TABLE_PLANE_0_OFFSET, SEISMIC_TABLE_PLANE_1_OFFSET, SEISMIC_TABLE_PLANE_2_OFFSET, SEISMIC_TABLE_PLANE_3_OFFSET);
-#elif defined(SEISMIC_TABLE_REPRESENTATION_Q5K)
-    return head_input_resident(base, logical, 5, SEISMIC_TABLE_PACKET_SIZE, SEISMIC_TABLE_LOGICAL_GROUP, SEISMIC_TABLE_PLANE_0_OFFSET, SEISMIC_TABLE_PLANE_1_OFFSET, SEISMIC_TABLE_PLANE_2_OFFSET, SEISMIC_TABLE_PLANE_3_OFFSET);
-#elif defined(SEISMIC_TABLE_REPRESENTATION_Q6K)
-    return head_input_resident(base, logical, 6, SEISMIC_TABLE_PACKET_SIZE, SEISMIC_TABLE_LOGICAL_GROUP, SEISMIC_TABLE_PLANE_0_OFFSET, SEISMIC_TABLE_PLANE_1_OFFSET, SEISMIC_TABLE_PLANE_2_OFFSET, 0);
-#elif defined(SEISMIC_TABLE_REPRESENTATION_IQ4G32)
-    return head_input_resident(base, logical, 14, SEISMIC_TABLE_PACKET_SIZE, SEISMIC_TABLE_LOGICAL_GROUP, SEISMIC_TABLE_PLANE_0_OFFSET, 0, SEISMIC_TABLE_PLANE_1_OFFSET, 0);
+#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16)
+typedef packets::bf16 activation;
+#elif defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+typedef packets::f16 activation;
 #else
-#error "unsupported draft-head embedding table"
+#error "qwen_head_rows requires a bf16 or f16 activation"
 #endif
+#if defined(SEISMIC_NORM_REPRESENTATION_F32)
+typedef packets::f32 norm_element;
+#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
+typedef packets::f16 norm_element;
+#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
+typedef packets::bf16 norm_element;
+#else
+#error "qwen_head_rows requires a dense norm"
+#endif
+#if defined(SEISMIC_WEIGHT_REPRESENTATION_Q4K)
+typedef packets::q4k head_packet;
+#define HEAD_LAYOUT {SEISMIC_WEIGHT_ROW_STRIDE_BYTES, SEISMIC_WEIGHT_PLANE_CODES_LO_ROW_OFFSET, 0, SEISMIC_WEIGHT_PLANE_SCALES_ROW_OFFSET, SEISMIC_WEIGHT_PLANE_SUPERS_ROW_OFFSET}
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q5K)
+typedef packets::q5k head_packet;
+#define HEAD_LAYOUT {SEISMIC_WEIGHT_ROW_STRIDE_BYTES, SEISMIC_WEIGHT_PLANE_CODES_LO_ROW_OFFSET, SEISMIC_WEIGHT_PLANE_CODES_HI_ROW_OFFSET, SEISMIC_WEIGHT_PLANE_SCALES_ROW_OFFSET, SEISMIC_WEIGHT_PLANE_SUPERS_ROW_OFFSET}
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q6K)
+typedef packets::q6k head_packet;
+#define HEAD_LAYOUT {SEISMIC_WEIGHT_ROW_STRIDE_BYTES, SEISMIC_WEIGHT_PLANE_CODES_LO_ROW_OFFSET, SEISMIC_WEIGHT_PLANE_CODES_HI_ROW_OFFSET, SEISMIC_WEIGHT_PLANE_SCALES_ROW_OFFSET, SEISMIC_WEIGHT_PLANE_SUPERS_ROW_OFFSET}
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q8G32S)
+typedef packets::q8 head_packet;
+#define HEAD_LAYOUT {SEISMIC_WEIGHT_ROW_STRIDE_BYTES, SEISMIC_WEIGHT_PLANE_CODES_ROW_OFFSET, 0, 0, SEISMIC_WEIGHT_PLANE_SUPERS_ROW_OFFSET}
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_BF16)
+typedef packets::dense<packets::bf16> head_packet;
+#define HEAD_LAYOUT {SEISMIC_WEIGHT_STRIDE_0 * 2, 0, 0, 0, 0}
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_F16)
+typedef packets::dense<packets::f16> head_packet;
+#define HEAD_LAYOUT {SEISMIC_WEIGHT_STRIDE_0 * 2, 0, 0, 0, 0}
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_F32)
+typedef packets::dense<packets::f32> head_packet;
+#define HEAD_LAYOUT {SEISMIC_WEIGHT_STRIDE_0 * 4, 0, 0, 0, 0}
+#else
+#error "unsupported qwen_head_rows weight representation"
+#endif
+#if defined(SEISMIC_WEIGHT_KIND_PACKED) && !defined(SEISMIC_WEIGHT_LAYOUT_ROWS16)
+#error "qwen_head_rows requires the rows16 layout for weight"
+#endif
+
+#define HEAD_ROWS_ARGUMENTS                                                             \
+    device const float *hidden [[buffer(SEISMIC_BUFFER_HIDDEN)]],                       \
+    device const uchar *norm [[buffer(SEISMIC_BUFFER_NORM)]],                           \
+    device const uchar *weight [[buffer(SEISMIC_BUFFER_WEIGHT)]],                       \
+    device const int *out_rows [[buffer(SEISMIC_BUFFER_OUT_ROWS)]],                     \
+    device float *logits [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
+    device uchar *normalized [[buffer(SEISMIC_BUFFER_SCRATCH_NORMALIZED)]],             \
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
+
+#define HEAD_ROWS_OPERANDS                                                              \
+    const uint k = uint(SEISMIC_DIM_D);                                                 \
+    projection::input_rms<activation, norm_element> in{hidden, SEISMIC_HIDDEN_STRIDE_0, \
+        SEISMIC_HIDDEN_STRIDE_1, norm, SEISMIC_NORM_STRIDE_0,                           \
+        as_type<float>(uint(SEISMIC_PARAM_EPSILON)), k, {out_rows}};                    \
+    projection::output_logits out{logits, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1}; \
+    projection::weight_rows<head_packet> w{weight, HEAD_LAYOUT, k, nullptr}
+
+kernel void qwen_head_rows_gemv(HEAD_ROWS_ARGUMENTS,
+    threadgroup uchar *shared [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    HEAD_ROWS_OPERANDS;
+    uint rows = uint(SEISMIC_DIM_O);
+    PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
+    projection::threadgroup_squares<SEISMIC_TUNE_SIMDGROUPS>(in, rows, squares, sg, lane);
+    projection::SharedNorm<decltype(in)> x{in, squares};
+    PROJECTION_FOR_ROWS(rows,
+        projection::gemv<head_packet, SEISMIC_TUNE_SIMDGROUPS, SEISMIC_TUNE_ROWS, MAXM, SEISMIC_TUNE_LANES>(
+            x, out, w, rows, uint(SEISMIC_DIM_V), k, tile, shared, sg, lane));
 }
 
-#define HEAD_INPUT_DENSE_LOADER(NAME, PREFIX) \
-inline float NAME(device const uchar *base, ulong logical) { \
-    /* all norms and activation rows are dense by contract */ \
-    if (PREFIX##_KIND == 0) return *reinterpret_cast<device const float *>(base + logical * PREFIX##_PACKET_SIZE); \
-    if (PREFIX##_KIND == 1) return float(*reinterpret_cast<device const half *>(base + logical * PREFIX##_PACKET_SIZE)); \
-    return as_type<float>(uint(*reinterpret_cast<device const ushort *>(base + logical * PREFIX##_PACKET_SIZE)) << 16); \
+kernel void qwen_head_rows_batch(HEAD_ROWS_ARGUMENTS,
+    threadgroup uchar *shared [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    HEAD_ROWS_OPERANDS;
+    PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
+    projection::threadgroup_squares<SEISMIC_TUNE_BATCH_SIMDGROUPS>(in, uint(SEISMIC_DIM_O), squares, sg, lane);
+    projection::SharedNorm<decltype(in)> x{in, squares};
+    projection::gemv_batch<head_packet, SEISMIC_TUNE_BATCH_SIMDGROUPS, SEISMIC_TUNE_BATCH_ROWS>(x, out, w,
+        uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_V), k, tile, shared, sg, lane);
 }
 
-#if defined(SEISMIC_CONDITIONING_REPRESENTATION_F32)
-#define CONDITIONING_KIND 0
-#elif defined(SEISMIC_CONDITIONING_REPRESENTATION_F16)
-#define CONDITIONING_KIND 1
-#elif defined(SEISMIC_CONDITIONING_REPRESENTATION_BF16)
-#define CONDITIONING_KIND 2
-#else
-#error "draft-head conditioning must be dense"
-#endif
-#define CONDITIONING_PACKET_SIZE SEISMIC_CONDITIONING_PACKET_SIZE
-HEAD_INPUT_DENSE_LOADER(head_input_conditioning, CONDITIONING)
-
-#if defined(SEISMIC_EMBEDDING_NORM_REPRESENTATION_F32)
-#define EMBEDDING_NORM_KIND 0
-#elif defined(SEISMIC_EMBEDDING_NORM_REPRESENTATION_F16)
-#define EMBEDDING_NORM_KIND 1
-#elif defined(SEISMIC_EMBEDDING_NORM_REPRESENTATION_BF16)
-#define EMBEDDING_NORM_KIND 2
-#else
-#error "draft-head embedding norm must be dense"
-#endif
-#define EMBEDDING_NORM_PACKET_SIZE SEISMIC_EMBEDDING_NORM_PACKET_SIZE
-HEAD_INPUT_DENSE_LOADER(head_input_embedding_norm, EMBEDDING_NORM)
-
-#if defined(SEISMIC_HIDDEN_NORM_REPRESENTATION_F32)
-#define HIDDEN_NORM_KIND 0
-#elif defined(SEISMIC_HIDDEN_NORM_REPRESENTATION_F16)
-#define HIDDEN_NORM_KIND 1
-#elif defined(SEISMIC_HIDDEN_NORM_REPRESENTATION_BF16)
-#define HIDDEN_NORM_KIND 2
-#else
-#error "draft-head hidden norm must be dense"
-#endif
-#define HIDDEN_NORM_PACKET_SIZE SEISMIC_HIDDEN_NORM_PACKET_SIZE
-HEAD_INPUT_DENSE_LOADER(head_input_hidden_norm, HIDDEN_NORM)
-
-inline float head_input_combine(device const uchar *base, ulong logical) {
-#if defined(SEISMIC_COMBINE_REPRESENTATION_F32)
-    return *reinterpret_cast<device const float *>(base + logical * SEISMIC_COMBINE_PACKET_SIZE);
-#elif defined(SEISMIC_COMBINE_REPRESENTATION_F16)
-    return float(*reinterpret_cast<device const half *>(base + logical * SEISMIC_COMBINE_PACKET_SIZE));
-#elif defined(SEISMIC_COMBINE_REPRESENTATION_BF16)
-    return as_type<float>(uint(*reinterpret_cast<device const ushort *>(base + logical * SEISMIC_COMBINE_PACKET_SIZE)) << 16);
-#elif defined(SEISMIC_COMBINE_REPRESENTATION_Q8G32S)
-    return head_input_resident(base, logical, 8, SEISMIC_COMBINE_PACKET_SIZE, SEISMIC_COMBINE_LOGICAL_GROUP, SEISMIC_COMBINE_PLANE_0_OFFSET, 0, SEISMIC_COMBINE_PLANE_1_OFFSET, 0);
-#elif defined(SEISMIC_COMBINE_REPRESENTATION_Q4K)
-    return head_input_resident(base, logical, 4, SEISMIC_COMBINE_PACKET_SIZE, SEISMIC_COMBINE_LOGICAL_GROUP, SEISMIC_COMBINE_PLANE_0_OFFSET, SEISMIC_COMBINE_PLANE_1_OFFSET, SEISMIC_COMBINE_PLANE_2_OFFSET, SEISMIC_COMBINE_PLANE_3_OFFSET);
-#elif defined(SEISMIC_COMBINE_REPRESENTATION_Q5K)
-    return head_input_resident(base, logical, 5, SEISMIC_COMBINE_PACKET_SIZE, SEISMIC_COMBINE_LOGICAL_GROUP, SEISMIC_COMBINE_PLANE_0_OFFSET, SEISMIC_COMBINE_PLANE_1_OFFSET, SEISMIC_COMBINE_PLANE_2_OFFSET, SEISMIC_COMBINE_PLANE_3_OFFSET);
-#elif defined(SEISMIC_COMBINE_REPRESENTATION_Q6K)
-    return head_input_resident(base, logical, 6, SEISMIC_COMBINE_PACKET_SIZE, SEISMIC_COMBINE_LOGICAL_GROUP, SEISMIC_COMBINE_PLANE_0_OFFSET, SEISMIC_COMBINE_PLANE_1_OFFSET, SEISMIC_COMBINE_PLANE_2_OFFSET, 0);
-#elif defined(SEISMIC_COMBINE_REPRESENTATION_IQ4G32)
-    return head_input_resident(base, logical, 14, SEISMIC_COMBINE_PACKET_SIZE, SEISMIC_COMBINE_LOGICAL_GROUP, SEISMIC_COMBINE_PLANE_0_OFFSET, 0, SEISMIC_COMBINE_PLANE_1_OFFSET, 0);
-#else
-#error "unsupported draft-head combine weight"
-#endif
+kernel void qwen_head_rows_normalize(HEAD_ROWS_ARGUMENTS,
+    uint item [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    PROJECTION_NORMALIZE_SHARED(norms);
+    HEAD_ROWS_OPERANDS;
+    projection::device_normalize<256>(in, item, normalized, k, norms, thread_index);
 }
 
-kernel void qwen_head_rows(
-    device const int *tokens [[buffer(SEISMIC_BUFFER_TOKENS)]],
-    device const uchar *table [[buffer(SEISMIC_BUFFER_TABLE)]],
-    device const uchar *conditioning [[buffer(SEISMIC_BUFFER_CONDITIONING)]],
-    device const uchar *embedding_norm [[buffer(SEISMIC_BUFFER_EMBEDDING_NORM)]],
-    device const uchar *hidden_norm [[buffer(SEISMIC_BUFFER_HIDDEN_NORM)]],
-    device const uchar *combine [[buffer(SEISMIC_BUFFER_COMBINE)]],
-    device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
-    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
-    uint raw_index [[thread_position_in_grid]]) {
-    ulong index = ulong(raw_index);
-    if (index >= SEISMIC_DIM_M * SEISMIC_DIM_D) return;
-    ulong row = index / SEISMIC_DIM_D;
-    ulong output = index % SEISMIC_DIM_D;
-    int token = tokens[row * SEISMIC_TOKENS_STRIDE_0];
-    float embedding_squares = 0.0f;
-    float hidden_squares = 0.0f;
-    for (ulong column = 0; column < SEISMIC_DIM_D; ++column) {
-        float embedded = head_input_table(table, ulong(token) * SEISMIC_DIM_D + column);
-        float conditioned = head_input_conditioning(conditioning,
-            head_input_at2(row, column, SEISMIC_CONDITIONING_STRIDE_0, SEISMIC_CONDITIONING_STRIDE_1));
-        embedding_squares += embedded * embedded;
-        hidden_squares += conditioned * conditioned;
-    }
-    float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
-    float embedding_inverse = metal::rsqrt(embedding_squares / float(SEISMIC_DIM_D) + epsilon);
-    float hidden_inverse = metal::rsqrt(hidden_squares / float(SEISMIC_DIM_D) + epsilon);
-    float sum = 0.0f;
-    for (ulong column = 0; column < SEISMIC_DIM_D; ++column) {
-        float embedded = head_input_table(table, ulong(token) * SEISMIC_DIM_D + column)
-            * embedding_inverse * head_input_embedding_norm(embedding_norm, column * SEISMIC_EMBEDDING_NORM_STRIDE_0);
-        float conditioned = head_input_conditioning(conditioning,
-            head_input_at2(row, column, SEISMIC_CONDITIONING_STRIDE_0, SEISMIC_CONDITIONING_STRIDE_1))
-            * hidden_inverse * head_input_hidden_norm(hidden_norm, column * SEISMIC_HIDDEN_NORM_STRIDE_0);
-        sum = metal::fma(embedded, head_input_combine(combine, output * (2 * SEISMIC_DIM_D) + column), sum);
-        sum = metal::fma(conditioned, head_input_combine(combine, output * (2 * SEISMIC_DIM_D) + SEISMIC_DIM_D + column), sum);
-    }
-    result[head_input_at2(row, output, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1)] = sum;
+kernel void qwen_head_rows_gemm(HEAD_ROWS_ARGUMENTS,
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    PROJECTION_GEMM_SHARED(shared, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N);
+    HEAD_ROWS_OPERANDS;
+    projection::input_plain<activation> x{normalized, k, 1, k, {nullptr}};
+    projection::gemm<head_packet, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N>(x, out, w, uint(SEISMIC_DIM_O),
+        uint(SEISMIC_DIM_V), k, tile.y, tile.x, shared, sg, lane);
 }

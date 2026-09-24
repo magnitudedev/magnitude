@@ -3,12 +3,14 @@
 
 use super::weights::activation_dtype;
 use super::{
-    planned_element, AttentionBinding, DenseBinding, EmbeddingBinding, FeaturesBinding,
+    planned_element, AttentionBinding, AttentionShape, DenseBinding, EmbeddingBinding, FeaturesBinding,
     HeadBinding, ReadoutBinding, RecurrentBinding, RoutedBinding, VisionBlockBinding,
     VisionMergerBinding, VisionPatchBinding, WeightPlan,
 };
 use crate::error::PlanError;
-use magnitude_model_contracts::{FeedForwardGeometry, MixerGeometry, ModelDefinition};
+use magnitude_model_contracts::{
+    AttentionGeometry, FeedForwardGeometry, MixerGeometry, ModelDefinition, RotarySemantics,
+};
 use magnitude_model_contracts::{FeedForwardWeights, MixerWeights, WeightKind, WeightScope};
 use seismic::{DType, Element};
 use std::collections::HashSet;
@@ -306,6 +308,16 @@ pub(super) fn derive_program_plan(
         );
         let mixer = match &block.mixer {
             MixerWeights::Attention(_) => MixerProgramSlot::Attention(AttentionBinding {
+                shape: match definition.geometry.blocks.get(index).map(|block| &block.mixer) {
+                    Some(MixerGeometry::Attention(geometry)) => {
+                        attention_shape(definition.geometry.hidden, geometry)?
+                    }
+                    _ => {
+                        return Err(PlanError::Topology(
+                            "attention program slot geometry differs",
+                        ))
+                    }
+                },
                 norm: lookup(target, scope, WeightKind::InputNorm)?,
                 query_gate: lookup(target, scope, WeightKind::QueryGate)?,
                 key: lookup(target, scope, WeightKind::Key)?,
@@ -325,7 +337,10 @@ pub(super) fn derive_program_plan(
                     ));
                 };
                 MixerProgramSlot::Recurrent(RecurrentBinding {
+                    key_heads: geometry.key_heads,
+                    value_heads: geometry.value_heads,
                     width: geometry.width,
+                    convolution_width: geometry.convolution_width,
                     norm: lookup(target, scope, WeightKind::InputNorm)?,
                     qkv: lookup(target, scope, WeightKind::RecurrentQueryKeyValue)?,
                     gate: lookup(target, scope, WeightKind::RecurrentGate)?,
@@ -345,7 +360,21 @@ pub(super) fn derive_program_plan(
                 down: lookup(target, scope, WeightKind::DenseDown)?,
                 activation: active_element,
             }),
-            FeedForwardWeights::Routed(_) => FeedForwardProgramSlot::Routed(RoutedBinding {
+            FeedForwardWeights::Routed(_) => {
+                let Some(FeedForwardGeometry::Routed(geometry)) = definition
+                    .geometry
+                    .blocks
+                    .get(index)
+                    .map(|block| &block.feedforward)
+                else {
+                    return Err(PlanError::Topology("routed program slot geometry differs"));
+                };
+                FeedForwardProgramSlot::Routed(RoutedBinding {
+                hidden: definition.geometry.hidden,
+                experts: geometry.count,
+                selected: geometry.selected,
+                features: geometry.intermediate,
+                shared: geometry.shared_intermediate,
                 norm: lookup(target, scope, WeightKind::FeedForwardNorm)?,
                 router: lookup(target, scope, WeightKind::Router)?,
                 expert_gate: lookup(target, scope, WeightKind::ExpertGate)?,
@@ -355,7 +384,8 @@ pub(super) fn derive_program_plan(
                 shared_up: lookup(target, scope, WeightKind::SharedUp)?,
                 shared_down: lookup(target, scope, WeightKind::SharedDown)?,
                 activation: active_element,
-            }),
+            })
+            }
         };
         blocks.push(TargetBlockProgramSlot::new(mixer, feed_forward));
     }
@@ -384,6 +414,16 @@ pub(super) fn derive_program_plan(
                         .map_err(|_| PlanError::Arithmetic("head block index exceeds u32"))?,
                 );
                 slots.push(HeadBinding {
+                    attention_shape: definition
+                        .geometry
+                        .blocks
+                        .iter()
+                        .find_map(|block| match &block.mixer {
+                            MixerGeometry::Attention(geometry) => Some(geometry),
+                            MixerGeometry::Recurrent(_) => None,
+                        })
+                        .ok_or(PlanError::Topology("head requires target attention geometry"))
+                        .and_then(|geometry| attention_shape(definition.geometry.hidden, geometry))?,
                     embedding_table: lookup(target, WeightScope::Target, WeightKind::Embedding)?,
                     embedding_norm: lookup(weights, scope, WeightKind::HeadEmbeddingNorm)?,
                     hidden_norm: lookup(weights, scope, WeightKind::HeadHiddenNorm)?,
@@ -484,4 +524,20 @@ pub(super) fn derive_program_plan(
         vision_program,
         state,
     )
+}
+
+/// The attention kernel dimensions of one attention geometry.
+fn attention_shape(hidden: u64, geometry: &AttentionGeometry) -> Result<AttentionShape, PlanError> {
+    let RotarySemantics::Interleaved { width: rotary, .. } = &geometry.rotary;
+    if geometry.kv_heads == 0 || geometry.heads % geometry.kv_heads != 0 || *rotary > geometry.width
+    {
+        return Err(PlanError::Topology("attention heads or rotary width are inconsistent"));
+    }
+    Ok(AttentionShape {
+        hidden,
+        kv_heads: geometry.kv_heads,
+        group: geometry.heads / geometry.kv_heads,
+        rotary_pairs: rotary / 2,
+        width: geometry.width,
+    })
 }

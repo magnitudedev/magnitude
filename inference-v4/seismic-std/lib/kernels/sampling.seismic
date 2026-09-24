@@ -2,8 +2,11 @@
 # and draw domain; the request seed is the key. Partitioning never changes a draw:
 # the token counter is the semantic vocabulary coordinate, never a slice-local offset.
 # Output pairs are (token, status): 0 success, 1 empty, 2 nonfinite source.
+# A row's mask applies only when its `constrained` flag is nonzero; an
+# unconstrained row admits the whole vocabulary, so its mask row may hold any
+# bytes and native implementations do not read it.
 fn sample_rows[M, V](logits: &tensor[M, V] f32, mask: &tensor[M, (V + 31) / 32] u32,
-    draws: &tensor[M, 6] u32, result: &mut tensor[M, 2] i32):
+    constrained: &tensor[M] i32, draws: &tensor[M, 6] u32, result: &mut tensor[M, 2] i32):
     # Row-local reductions are whole-tensor intrinsics, which Seismic cannot
     # currently lower inside a parallel loop. The native Metal implementation
     # dispatches rows independently.
@@ -18,7 +21,8 @@ fn sample_rows[M, V](logits: &tensor[M, V] f32, mask: &tensor[M, (V + 31) / 32] 
         for token in 0..V:
             let mut value = logits[rows, token]
             scores[token] = -inf
-            if ((mask[rows, token / 32] >> u32(token % 32)) & 1) != 0 and value > -inf and value < inf:
+            let admitted = constrained[rows] == 0 or ((mask[rows, token / 32] >> u32(token % 32)) & 1) != 0
+            if admitted and value > -inf and value < inf:
                 if draws[rows, 0] == 1:
                     let mut c0 = u32(token)
                     let mut c1 = draws[rows, 3]

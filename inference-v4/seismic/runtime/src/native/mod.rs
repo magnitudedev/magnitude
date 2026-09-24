@@ -14,7 +14,11 @@
 
 pub(crate) mod abi;
 pub mod cpu;
+mod cuda;
 pub mod graph;
+pub mod search;
+mod timing;
+pub mod trace;
 pub mod tune;
 
 use crate::api::device::DeviceInner;
@@ -30,7 +34,7 @@ use seismic_compiler::prepared::{
     validate_invocation, ArgumentValue, DeviceIdentity, InvocationContract,
 };
 use seismic_lang::checked::{
-    CheckedModule, NativeImplementation, NativeNatExpr, NativeSpecialization,
+    CheckedModule, NativeCondition, NativeImplementation, NativeNatExpr, NativeSpecialization,
 };
 use seismic_lang::entry::{CallSchema, ElementBindings, LogicalEntry, ParameterKind, ResultKind};
 use seismic_lang::expr::compiled::{CompiledNat, InvocationValues};
@@ -63,7 +67,6 @@ pub(crate) struct NativeTensorSpec {
     pub(crate) extents: Vec<u64>,
     pub(crate) strides: Vec<u64>,
     pub(crate) byte_len: u64,
-    pub(crate) alignment: u64,
 }
 
 /// Evaluated geometry of one launch of one call.
@@ -74,8 +77,29 @@ pub(crate) struct LaunchGeometry {
     pub(crate) shared_bytes: u64,
 }
 
-/// Alignment of every scratch buffer.
-pub(crate) const SCRATCH_ALIGNMENT: u64 = 256;
+/// Geometry of every launch of one call, by declaration ordinal; `None` for
+/// a launch whose `when` condition does not hold (not encoded).
+pub(crate) type CallLaunches = Vec<Option<LaunchGeometry>>;
+
+/// Alignment of the base of every buffer the route places: standalone
+/// scratch, and every graph result, local, host-written input, export and
+/// scratch buffer. Device allocations are at least this aligned, so kernels
+/// may rely on it for vector access to any placed buffer, as they do for a
+/// standalone call's.
+pub(crate) const BUFFER_ALIGNMENT: u64 = 256;
+
+/// Per-device state of native submission.
+#[derive(Default)]
+pub(crate) struct NativeQueue {
+    /// Held from encoding a submission to recording its allocation fences.
+    order: Mutex<()>,
+    /// CUDA graphs of sealed-plan submissions (unused on other backends).
+    replays: cuda::Replays,
+}
+
+/// Bytes charged to a scratch buffer that is empty or inactive: it keeps
+/// its ABI slot.
+const MINIMUM_SCRATCH_BYTES: u64 = 1;
 
 enum NativeRoute {
     Cpu {
@@ -111,15 +135,28 @@ pub struct NativePrepared {
     specialization: NativeSpecialization,
     /// Static dimensions: name, invocation symbol and fixed value.
     statics: Vec<(String, SymbolId, u64)>,
+    /// Tensor parameters (by schema ordinal) whose static extents render
+    /// constant canonical strides (S10), with those strides.
+    canonical_parameters: Vec<(usize, Vec<u64>)>,
     results: Vec<NativeResult>,
     scalar_words: usize,
     /// Scalar-result slots. Graph nodes publish no scalars, so only
     /// standalone calls write them; `standalone` serializes those calls.
     scalars: Arc<Allocation>,
-    standalone: Mutex<()>,
+    standalone: Mutex<Standalone>,
     scalar_bytes: u64,
     artifact: NativeArtifactIdentity,
     route: NativeRoute,
+}
+
+fn entry_name(module: &CheckedModule, entry: EntryId) -> String {
+    module
+        .entries()
+        .iter()
+        .find(|candidate| candidate.id == entry)
+        .expect("entry belongs to its module")
+        .name
+        .clone()
 }
 
 fn preparation(message: impl Into<String>) -> PrepareError {
@@ -148,22 +185,41 @@ impl NativePrepared {
         cpu: Option<&'static CpuNativeKernels>,
     ) -> Result<Arc<Self>, PrepareError> {
         let backend = backend_name(&device.kind);
-        let name = module
-            .entries()
-            .iter()
-            .find(|candidate| candidate.id == entry)
-            .expect("entry belongs to its module")
-            .name
-            .clone();
         let implementation = module
             .native_implementation(entry, backend)
             .cloned()
             .ok_or_else(|| {
                 preparation(format!(
-                    "`{name}` has no native implementation for `{}`",
+                    "`{}` has no native implementation for `{}`",
+                    entry_name(module, entry),
                     backend.as_str()
                 ))
             })?;
+        Self::prepare_implementation(
+            device,
+            module,
+            entry,
+            bindings,
+            specialization,
+            cpu,
+            implementation,
+        )
+    }
+
+    /// Form `implementation` of the entry, which may differ from the
+    /// module's declaration in its parameter domains only (a tuning
+    /// survey's widened domains).
+    pub(crate) fn prepare_implementation(
+        device: &Arc<DeviceInner>,
+        module: &CheckedModule,
+        entry: EntryId,
+        bindings: ElementBindings,
+        specialization: NativeSpecialization,
+        cpu: Option<&'static CpuNativeKernels>,
+        implementation: NativeImplementation,
+    ) -> Result<Arc<Self>, PrepareError> {
+        let backend = backend_name(&device.kind);
+        let name = entry_name(module, entry);
         implementation
             .validate(&specialization)
             .map_err(|error| preparation(format!("`{name}`: {error}")))?;
@@ -263,6 +319,14 @@ impl NativePrepared {
             }
             #[cfg(target_os = "macos")]
             OpenedKind::Metal(opened) => {
+                let slots = abi::buffer_slots(schema, &implementation);
+                if slots > seismic_metal::DIRECT_BUFFER_SLOTS {
+                    return Err(PrepareError::Preparation(PreparationError::NativeBufferSlots {
+                        entry: name,
+                        slots,
+                        limit: seismic_metal::DIRECT_BUFFER_SLOTS,
+                    }));
+                }
                 if words * 8 > seismic_metal::DIRECT_WORD_BYTES_LIMIT {
                     return Err(preparation(format!(
                         "`{name}` needs {} argument bytes, beyond Metal's setBytes limit",
@@ -271,7 +335,7 @@ impl NativePrepared {
                 }
                 let source = abi::render_source(
                     abi::Dialect::Metal,
-                    schema,
+                    &logical,
                     &bindings,
                     &implementation,
                     &specialization,
@@ -295,7 +359,7 @@ impl NativePrepared {
             OpenedKind::Cuda(opened) => {
                 let source = abi::render_source(
                     abi::Dialect::Cuda,
-                    schema,
+                    &logical,
                     &bindings,
                     &implementation,
                     &specialization,
@@ -305,24 +369,37 @@ impl NativePrepared {
                 let facts = opened.device_description().facts();
                 let architecture = u32::from(facts.compute_capability.major) * 10
                     + u32::from(facts.compute_capability.minor);
-                let module = seismic_cuda::direct::DirectModule::compile(
+                // A CUBIN is determined by its source and formation (NVRTC
+                // release, architecture, options): the store's key.
+                let key = |formation: &seismic_cuda::nvrtc::Formation| {
+                    crate::artifacts::ArtifactKey::of(&[
+                        source.as_bytes(),
+                        formation.to_string().as_bytes(),
+                    ])
+                };
+                let kind = crate::artifacts::ArtifactKind::CudaImage;
+                let store = device.artifacts.as_deref();
+                let module = seismic_cuda::direct::DirectModule::form(
                     opened.service(),
                     &source,
                     &format!("{name}.cu"),
                     architecture,
                     &kernels,
+                    |formation| store.and_then(|store| store.get(kind, &key(formation))),
+                    |formation, image| {
+                        if let Some(store) = store {
+                            store.put(kind, &key(formation), image);
+                        }
+                    },
                 )
                 .map_err(compilation)?;
-                let (major, minor) = seismic_cuda::direct::nvrtc_version().map_err(compilation)?;
+                let toolchain = format!("cuda;{};driver {}", module.formation(), facts.driver_api.0);
                 (
                     NativeRoute::Cuda {
                         opened: opened.clone(),
                         module,
                     },
-                    format!(
-                        "cuda;nvrtc {major}.{minor};sm_{architecture};driver {}",
-                        facts.driver_api.0
-                    ),
+                    toolchain,
                 )
             }
         };
@@ -341,6 +418,18 @@ impl NativePrepared {
             backend.as_str(),
             crate::telemetry::hex(&digest.finalize())
         ));
+        // S10: tensor parameters whose extents are static render constant
+        // canonical strides, so binding them requires those strides.
+        let canonical_parameters = abi::static_geometry(&logical, &specialization)
+            .parameters
+            .into_iter()
+            .enumerate()
+            .filter_map(|(ordinal, fixed)| {
+                fixed
+                    .and_then(|fixed| fixed.strides)
+                    .map(|strides| (ordinal, strides))
+            })
+            .collect();
         let scalar_bytes = (scalar_words as u64 * 8).max(1);
         let scalars = device.allocate(scalar_bytes, 8).map_err(|error| {
             PrepareError::Preparation(PreparationError::NativeWorkspaceAllocation(
@@ -356,10 +445,11 @@ impl NativePrepared {
             implementation,
             specialization,
             statics,
+            canonical_parameters,
             results,
             scalar_words,
             scalars,
-            standalone: Mutex::new(()),
+            standalone: Mutex::new(Standalone::default()),
             scalar_bytes,
             artifact,
             route,
@@ -378,10 +468,16 @@ impl NativePrepared {
     pub(crate) fn schema(&self) -> &CallSchema {
         self.logical.schema()
     }
-    /// Fixed device storage of this prepared implementation: its
-    /// scalar-result slots.
+    /// Device storage this prepared implementation holds for its calls:
+    /// the scalar-result slots, fixed at preparation, and the standalone
+    /// scratch arena, which grows to the largest standalone call's scratch.
     pub(crate) fn invocation_workspace_bytes(&self) -> u64 {
         self.scalar_bytes
+            + self
+                .standalone
+                .lock()
+                .expect("native standalone-call lock poisoned")
+                .bytes()
     }
     pub(crate) fn result_count(&self) -> u32 {
         u32::try_from(self.results.len()).expect("native result ordinal space exhausted")
@@ -408,6 +504,18 @@ impl NativePrepared {
                 _ => panic!("validated invocation omitted a native static dimension"),
             }
         }
+        for (ordinal, strides) in &self.canonical_parameters {
+            let ArgumentValue::Tensor(tensor) = &arguments[*ordinal] else {
+                panic!("validated invocation bound a non-tensor to a tensor parameter")
+            };
+            if &tensor.strides != strides {
+                return Err(CallError::Invocation(
+                    InvocationError::NoncanonicalStaticTensor {
+                        parameter: self.schema().parameters()[*ordinal].name.clone(),
+                    },
+                ));
+            }
+        }
         Ok(values)
     }
 
@@ -424,6 +532,13 @@ impl NativePrepared {
         }
     }
 
+    fn evaluation_error(&self, error: seismic_lang::checked::NativeEvalError) -> CallError {
+        CallError::Execution(ExecutionError::SubmissionFailed(format!(
+            "native expression of `{}`: {error}",
+            self.name
+        )))
+    }
+
     fn evaluate(
         &self,
         expression: &NativeNatExpr,
@@ -433,22 +548,36 @@ impl NativePrepared {
             .evaluate(&|name| self.dimension(values, name), &|name| {
                 self.specialization.param(name)
             })
-            .map_err(|error| {
-                CallError::Execution(ExecutionError::SubmissionFailed(format!(
-                    "native expression of `{}`: {error}",
-                    self.name
-                )))
-            })
+            .map_err(|error| self.evaluation_error(error))
+    }
+
+    /// Whether a launch or scratch buffer with this `when` condition is
+    /// active for one invocation.
+    fn active(
+        &self,
+        when: &Option<NativeCondition>,
+        values: &InvocationValues,
+    ) -> Result<bool, CallError> {
+        match when {
+            None => Ok(true),
+            Some(condition) => condition
+                .holds(&|name| self.dimension(values, name), &|name| {
+                    self.specialization.param(name)
+                })
+                .map_err(|error| self.evaluation_error(error)),
+        }
     }
 
     /// Geometry of every launch for one invocation, checked against the
-    /// formed functions and device limits.
-    pub(crate) fn launches(
-        &self,
-        values: &InvocationValues,
-    ) -> Result<Vec<LaunchGeometry>, CallError> {
+    /// formed functions and device limits. An inactive launch is `None`:
+    /// its geometry is neither evaluated nor checked.
+    pub(crate) fn launches(&self, values: &InvocationValues) -> Result<CallLaunches, CallError> {
         let mut geometry = Vec::with_capacity(self.implementation.launches.len());
         for (ordinal, launch) in self.implementation.launches.iter().enumerate() {
+            if !self.active(&launch.when, values)? {
+                geometry.push(None);
+                continue;
+            }
             let axes = |expressions: &[NativeNatExpr; 3]| -> Result<[u64; 3], CallError> {
                 Ok([
                     self.evaluate(&expressions[0], values)?,
@@ -506,23 +635,27 @@ impl NativePrepared {
                     }
                 }
             }
-            geometry.push(LaunchGeometry {
+            geometry.push(Some(LaunchGeometry {
                 groups,
                 threads,
                 shared_bytes,
-            });
+            }));
         }
         Ok(geometry)
     }
 
-    /// Bytes of every scratch buffer for one invocation.
+    /// Bytes of every scratch buffer for one invocation. An inactive buffer
+    /// is charged the minimum without evaluating its size.
     pub(crate) fn scratch_bytes(&self, values: &InvocationValues) -> Result<Vec<u64>, CallError> {
         self.implementation
             .scratch
             .iter()
             .map(|scratch| {
+                if !self.active(&scratch.when, values)? {
+                    return Ok(MINIMUM_SCRATCH_BYTES);
+                }
                 self.evaluate(&scratch.bytes, values)
-                    .map(|bytes| bytes.max(1))
+                    .map(|bytes| bytes.max(MINIMUM_SCRATCH_BYTES))
             })
             .collect()
     }
@@ -548,15 +681,13 @@ impl NativePrepared {
             .collect()
     }
 
-    /// Describe a node without allocating: result specs and scratch sizes.
-    /// Graph planning feeds descriptors, including virtual result edges,
-    /// through the same contract as a direct call.
-    pub(crate) fn describe(
-        &self,
-        arguments: &[ArgumentValue],
-    ) -> Result<(Vec<Option<NativeTensorSpec>>, Vec<u64>), CallError> {
+    /// The parts of one call its arguments' geometry and scalar values fix,
+    /// after full contract validation: result specs, scratch sizes, argument
+    /// words and launch geometry. A standalone call evaluates it per call; a
+    /// sealed graph evaluates it once per node, at seal.
+    pub(crate) fn shape(&self, arguments: &[ArgumentValue]) -> Result<CallShape, CallError> {
         let values = self.validate(arguments)?;
-        self.launches(&values)?;
+        let launches = self.launches(&values)?;
         let results = self
             .result_extents(&values)?
             .into_iter()
@@ -570,13 +701,18 @@ impl NativePrepared {
                             extents,
                             strides: layout.strides,
                             byte_len: layout.byte_len,
-                            alignment: layout.alignment,
                         })
                     })
                     .transpose()
             })
             .collect::<Result<Vec<_>, CallError>>()?;
-        Ok((results, self.scratch_bytes(&values)?))
+        let words = native_words(self.schema(), arguments, &results, &values)?;
+        Ok(CallShape {
+            scratch: self.scratch_bytes(&values)?,
+            results,
+            words,
+            launches,
+        })
     }
 
     pub(crate) fn tensor_parameter_spec(
@@ -631,7 +767,6 @@ impl NativePrepared {
             extents,
             strides: layout.strides,
             byte_len: layout.byte_len,
-            alignment: layout.alignment,
         })
     }
 
@@ -655,70 +790,6 @@ impl NativePrepared {
         Ok(())
     }
 
-    /// Check an attached node and produce its executable call.
-    pub(crate) fn bind(
-        self: &Arc<Self>,
-        args: EncodedArgs,
-        outputs: Vec<Arc<TensorInner>>,
-        scratch: Vec<ScratchView>,
-    ) -> Result<NativeBoundCall, CallError> {
-        let values = self.validate(&args.values())?;
-        let expected = self
-            .result_extents(&values)?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        if expected.len() != outputs.len() {
-            return Err(CallError::Output(OutputError::Count {
-                expected: expected.len(),
-                actual: outputs.len(),
-            }));
-        }
-        for (index, ((representation, extents), tensor)) in
-            expected.iter().zip(&outputs).enumerate()
-        {
-            validate_output(
-                index,
-                tensor,
-                self.device,
-                *representation,
-                extents,
-                &args,
-                &outputs[..index],
-            )?;
-        }
-        let sizes = self.scratch_bytes(&values)?;
-        if sizes.len() != scratch.len()
-            || sizes
-                .iter()
-                .zip(&scratch)
-                .any(|(bytes, view)| view.offset + bytes > view.allocation.bytes())
-        {
-            return Err(CallError::Execution(ExecutionError::SubmissionFailed(
-                "native scratch placement does not cover the call's scratch".into(),
-            )));
-        }
-        self.seal(args, outputs, scratch, &values)
-    }
-
-    fn seal(
-        self: &Arc<Self>,
-        args: EncodedArgs,
-        results: Vec<Arc<TensorInner>>,
-        scratch: Vec<ScratchView>,
-        values: &InvocationValues,
-    ) -> Result<NativeBoundCall, CallError> {
-        let words = native_words(self.schema(), &args, &results, values)?;
-        Ok(NativeBoundCall {
-            launches: self.launches(values)?,
-            kernel: self.clone(),
-            args,
-            results,
-            scratch,
-            words,
-        })
-    }
-
     pub(crate) fn call(self: &Arc<Self>, args: EncodedArgs) -> Result<DecodedResults, CallError> {
         self.call_with(args, None, || {})
     }
@@ -739,29 +810,27 @@ impl NativePrepared {
         self.call_with(args, None, commit)
     }
 
-    /// Allocate a call's results and scratch without submitting it.
-    pub(crate) fn prepare_call(
-        self: &Arc<Self>,
+    /// Validate a standalone call, place its results and its scratch (in the
+    /// standalone scratch arena), and fix its executable form.
+    fn prepare_call(
+        &self,
+        standalone: &mut Standalone,
         args: EncodedArgs,
         outputs: Option<EncodedOutputs>,
     ) -> Result<NativeBoundCall, CallError> {
-        let values = self.validate(&args.values())?;
-        let expected = self
-            .result_extents(&values)?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+        let shape = self.shape(&args.values())?;
+        let specs = shape.results.iter().flatten().collect::<Vec<_>>();
         let supplied = outputs.map(EncodedOutputs::into_tensors);
         if let Some(outputs) = &supplied {
-            if outputs.len() != expected.len() {
+            if outputs.len() != specs.len() {
                 return Err(CallError::Output(OutputError::Count {
-                    expected: expected.len(),
+                    expected: specs.len(),
                     actual: outputs.len(),
                 }));
             }
         }
-        let mut results = Vec::with_capacity(expected.len());
-        for (index, (representation, extents)) in expected.into_iter().enumerate() {
+        let mut results = Vec::with_capacity(specs.len());
+        for (index, spec) in specs.into_iter().enumerate() {
             let tensor = match &supplied {
                 Some(outputs) => {
                     let tensor = outputs[index].clone();
@@ -769,34 +838,64 @@ impl NativePrepared {
                         index,
                         &tensor,
                         self.device,
-                        representation,
-                        &extents,
+                        spec.representation,
+                        &spec.extents,
                         &args,
                         &results,
                     )?;
                     tensor
                 }
                 None => Arc::new(
-                    TensorInner::zeros(&self.public_device, representation, &extents)
+                    TensorInner::zeros(&self.public_device, spec.representation, &spec.extents)
                         .map_err(tensor_error)?,
                 ),
             };
             results.push(tensor);
         }
-        let scratch = self
-            .scratch_bytes(&values)?
-            .into_iter()
-            .map(|bytes| {
-                self.public_device
-                    .allocate(bytes, SCRATCH_ALIGNMENT)
-                    .map(|allocation| ScratchView {
-                        allocation,
-                        offset: 0,
-                    })
-                    .map_err(CallError::Execution)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        self.seal(args, results, scratch, &values)
+        let mut scratch = Vec::with_capacity(shape.scratch.len());
+        let mut scratch_end = 0u64;
+        for bytes in &shape.scratch {
+            let offset = scratch_end.next_multiple_of(BUFFER_ALIGNMENT);
+            scratch.push(offset);
+            scratch_end = offset + bytes;
+        }
+        let arena = standalone.scratch(&self.public_device, scratch_end)?;
+
+        let schema = self.schema();
+        let mut buffers = Vec::new();
+        let mut representations = Vec::new();
+        let mut access = collect_native_access(schema, &args);
+        for (ordinal, parameter) in schema.parameters().iter().enumerate() {
+            if matches!(parameter.kind, ParameterKind::Tensor { .. }) {
+                let tensor = args
+                    .tensor(ordinal)
+                    .expect("validated native tensor argument disappeared");
+                buffers.push((tensor.allocation().clone(), tensor.byte_offset()));
+                representations.push(representation_name(tensor.representation()));
+            }
+        }
+        for tensor in &results {
+            buffers.push((tensor.allocation().clone(), tensor.byte_offset()));
+            representations.push(representation_name(tensor.representation()));
+            access.push((tensor.allocation().clone(), true));
+        }
+        if let Some(arena) = arena {
+            for offset in scratch {
+                buffers.push((arena.clone(), offset));
+                representations.push("bytes");
+            }
+            access.push((arena, true));
+        }
+        access.push((self.scalars.clone(), true));
+        Ok(NativeBoundCall {
+            results,
+            buffers,
+            representations,
+            word_bytes: word_bytes(&shape.words),
+            words: shape.words,
+            launches: shape.launches,
+            access,
+        })
     }
 
     fn call_with(
@@ -805,29 +904,33 @@ impl NativePrepared {
         outputs: Option<EncodedOutputs>,
         commit: impl FnOnce(),
     ) -> Result<DecodedResults, CallError> {
-        let call = self.prepare_call(args, outputs)?;
-        // The scalar-result slots are shared by standalone calls of this
-        // implementation; the guard covers their reset, execution and read.
-        let _standalone = self
+        // Standalone calls of this implementation share its scalar-result
+        // slots and scratch arena; the guard covers their placement, reset,
+        // execution and read.
+        let mut standalone = self
             .standalone
             .lock()
             .expect("native standalone-call lock poisoned");
+        let call = self.prepare_call(&mut standalone, args, outputs)?;
         let scalars = &self.scalars;
         {
             let _host = scalars.acquire(true);
             write_zeros(scalars.storage(), self.scalar_bytes).map_err(CallError::Execution)?;
         }
         commit();
-        let call = Arc::new(call);
-        let submission = submit(std::slice::from_ref(&call), 1)?;
-        submission.wait()?;
+        let calls = [call];
+        StandaloneCalls {
+            kernel: self,
+            calls: &calls,
+        }
+        .submit(1)?
+        .wait()?;
         let mut scalar_bytes = vec![0u8; self.scalar_words * 8];
         scalars
             .acquire(false)
-            .read(&scalars, 0, &mut scalar_bytes)
+            .read(scalars, 0, &mut scalar_bytes)
             .map_err(CallError::Execution)?;
-        let call = Arc::try_unwrap(call)
-            .unwrap_or_else(|_| panic!("completed native submission retained its call"));
+        let [call] = calls;
         let mut offset = 0usize;
         let mut tensors = call.results.into_iter();
         let mut decoded = Vec::with_capacity(self.results.len());
@@ -862,96 +965,168 @@ impl NativePrepared {
     }
 }
 
-/// A scratch buffer's placement.
-#[derive(Clone)]
-pub(crate) struct ScratchView {
-    pub(crate) allocation: Arc<Allocation>,
-    pub(crate) offset: u64,
+/// Device storage of standalone calls beyond the scalar-result slots: one
+/// scratch arena, grown to the largest standalone call's scratch and reused
+/// by every later one (the device queue orders its users).
+#[derive(Default)]
+struct Standalone {
+    scratch: Option<Arc<Allocation>>,
 }
 
-/// One validated call ready for submission: arguments, results, scratch,
-/// argument words and launch geometry are fixed.
-pub(crate) struct NativeBoundCall {
-    kernel: Arc<NativePrepared>,
-    args: EncodedArgs,
+impl Standalone {
+    fn bytes(&self) -> u64 {
+        self.scratch.as_ref().map_or(0, |arena| arena.bytes())
+    }
+
+    /// The arena, holding at least `bytes`; `None` when the call has no
+    /// scratch.
+    fn scratch(
+        &mut self,
+        device: &Arc<DeviceInner>,
+        bytes: u64,
+    ) -> Result<Option<Arc<Allocation>>, CallError> {
+        if bytes == 0 {
+            return Ok(None);
+        }
+        if let Some(arena) = self.scratch.as_ref().filter(|arena| arena.bytes() >= bytes) {
+            return Ok(Some(arena.clone()));
+        }
+        let arena = device
+            .allocate(bytes, BUFFER_ALIGNMENT)
+            .map_err(CallError::Execution)?;
+        write_zeros(arena.storage(), bytes).map_err(CallError::Execution)?;
+        self.scratch = Some(arena.clone());
+        Ok(Some(arena))
+    }
+}
+
+/// What a call's argument geometry and scalar values fix
+/// ([`NativePrepared::shape`]).
+pub(crate) struct CallShape {
+    /// Per result ordinal; `None` for a scalar result.
+    pub(crate) results: Vec<Option<NativeTensorSpec>>,
+    /// Bytes of each scratch buffer.
+    pub(crate) scratch: Vec<u64>,
+    pub(crate) words: Vec<u64>,
+    pub(crate) launches: CallLaunches,
+}
+
+pub(crate) fn word_bytes(words: &[u64]) -> Vec<u8> {
+    words.iter().flat_map(|word| word.to_le_bytes()).collect()
+}
+
+fn representation_name(representation: RepresentationId) -> &'static str {
+    seismic_lang::registry::representation_info(representation).name
+}
+
+/// One validated standalone call ready for submission: its arguments,
+/// results, buffers, argument words and launch geometry are fixed.
+struct NativeBoundCall {
     results: Vec<Arc<TensorInner>>,
-    scratch: Vec<ScratchView>,
+    /// Buffers in ABI order with their byte offsets.
+    buffers: Vec<(Arc<Allocation>, u64)>,
+    representations: Vec<&'static str>,
     words: Vec<u64>,
-    launches: Vec<LaunchGeometry>,
+    word_bytes: Vec<u8>,
+    launches: CallLaunches,
+    /// Every allocation the call touches, with whether it writes it.
+    access: Vec<(Arc<Allocation>, bool)>,
 }
 
-impl NativeBoundCall {
-    /// Every allocation the call touches, with whether it writes it.
-    fn access(&self) -> Vec<(Arc<Allocation>, bool)> {
-        let mut access = collect_native_access(self.kernel.schema(), &self.args);
-        access.extend(
-            self.results
+/// Standalone calls of one prepared implementation, in submission order.
+struct StandaloneCalls<'k> {
+    kernel: &'k Arc<NativePrepared>,
+    calls: &'k [NativeBoundCall],
+}
+
+impl StandaloneCalls<'_> {
+    fn submit(&self, repetitions: usize) -> Result<NativeSubmission, CallError> {
+        let access = merge_access(
+            self.calls
                 .iter()
-                .map(|tensor| (tensor.allocation().clone(), true)),
+                .flat_map(|call| call.access.iter().cloned()),
         );
-        access.extend(
-            self.scratch
-                .iter()
-                .map(|view| (view.allocation.clone(), true)),
-        );
-        access.push((self.kernel.scalars.clone(), true));
-        access
+        submit(self, &access, self.kernel.clone(), repetitions)
+    }
+}
+
+impl DispatchList for StandaloneCalls<'_> {
+    fn count(&self) -> usize {
+        self.calls.len()
     }
 
-    /// Buffers in ABI order with their byte offsets.
-    fn buffers(&self) -> Vec<(&Arc<Allocation>, u64)> {
-        let mut buffers = Vec::new();
-        for (ordinal, parameter) in self.kernel.schema().parameters().iter().enumerate() {
-            if matches!(parameter.kind, ParameterKind::Tensor { .. }) {
-                let tensor = self
-                    .args
-                    .tensor(ordinal)
-                    .expect("validated native tensor argument disappeared");
-                buffers.push((tensor.allocation(), tensor.byte_offset()));
-            }
+    fn dispatch<'s>(
+        &'s self,
+        index: usize,
+        buffers: &mut Vec<(&'s Allocation, u64)>,
+    ) -> Dispatch<'s> {
+        let call = &self.calls[index];
+        buffers.extend(
+            call.buffers
+                .iter()
+                .map(|(allocation, offset)| (&**allocation, *offset)),
+        );
+        Dispatch {
+            kernel: self.kernel,
+            words: &call.words,
+            word_bytes: &call.word_bytes,
+            launches: &call.launches,
+            representations: &call.representations,
         }
-        for tensor in &self.results {
-            buffers.push((tensor.allocation(), tensor.byte_offset()));
-        }
-        for view in &self.scratch {
-            buffers.push((&view.allocation, view.offset));
-        }
-        buffers
     }
 
+    fn plans(&self) -> Option<Vec<u64>> {
+        None
+    }
+}
+
+/// One call as the encoder consumes it: everything but its buffers is
+/// fixed.
+pub(crate) struct Dispatch<'a> {
+    pub(crate) kernel: &'a NativePrepared,
+    pub(crate) words: &'a [u64],
+    pub(crate) word_bytes: &'a [u8],
+    /// By declaration ordinal; `None` for an inactive launch.
+    pub(crate) launches: &'a [Option<LaunchGeometry>],
     /// Registry name of each buffer's representation, in ABI order.
-    fn representations(&self) -> Vec<&'static str> {
-        let mut names = Vec::new();
-        for (ordinal, parameter) in self.kernel.schema().parameters().iter().enumerate() {
-            if matches!(parameter.kind, ParameterKind::Tensor { .. }) {
-                let tensor = self
-                    .args
-                    .tensor(ordinal)
-                    .expect("validated native tensor argument disappeared");
-                names.push(
-                    seismic_lang::registry::representation_info(tensor.representation()).name,
-                );
-            }
-        }
-        for tensor in &self.results {
-            names.push(seismic_lang::registry::representation_info(tensor.representation()).name);
-        }
-        names.extend(self.scratch.iter().map(|_| "bytes"));
-        names
-    }
+    pub(crate) representations: &'a [&'static str],
+}
 
-    fn word_bytes(&self) -> Vec<u8> {
-        self.words
-            .iter()
-            .flat_map(|word| word.to_le_bytes())
-            .collect()
+/// The calls of one submission, in order. Every call belongs to one device.
+pub(crate) trait DispatchList {
+    fn count(&self) -> usize;
+    /// Call `index`; its buffers, in ABI order with byte offsets, are
+    /// appended to `buffers`.
+    fn dispatch<'s>(&'s self, index: usize, buffers: &mut Vec<(&'s Allocation, u64)>)
+        -> Dispatch<'s>;
+    /// Identities of the sealed plans whose runs make up the list, in
+    /// order: with the buffer addresses the list binds they fix every launch
+    /// argument, so CUDA replays the list as one graph. `None` for lists
+    /// launched call by call.
+    fn plans(&self) -> Option<Vec<u64>>;
+}
+
+/// One entry per allocation with merged write access, in identity order:
+/// the order device permits are taken in, so concurrent submitters cannot
+/// deadlock.
+pub(crate) fn merge_access(
+    access: impl IntoIterator<Item = (Arc<Allocation>, bool)>,
+) -> Vec<(Arc<Allocation>, bool)> {
+    let mut merged: BTreeMap<u64, (Arc<Allocation>, bool)> = BTreeMap::new();
+    for (allocation, write) in access {
+        merged
+            .entry(allocation.identity())
+            .and_modify(|(_, current)| *current |= write)
+            .or_insert((allocation, write));
     }
+    merged.into_values().collect()
 }
 
 enum RouteSubmission {
     Cpu {
         outcome: Result<(), ExecutionError>,
-        seconds: f64,
+        /// Execution interval on the [`trace::host_seconds`] clock.
+        interval: (f64, f64),
     },
     #[cfg(target_os = "macos")]
     Metal(seismic_metal::DirectSubmission),
@@ -982,7 +1157,7 @@ impl DeviceCompletion for RouteSubmission {
 /// until the work completes.
 pub(crate) struct NativeSubmission {
     route: Arc<RouteSubmission>,
-    _kernels: Vec<Arc<NativePrepared>>,
+    _retained: Arc<dyn std::any::Any + Send + Sync>,
 }
 
 impl NativeSubmission {
@@ -1005,7 +1180,7 @@ impl NativeSubmission {
     pub(crate) fn device_seconds(&self) -> Result<f64, CallError> {
         self.wait()?;
         match &*self.route {
-            RouteSubmission::Cpu { seconds, .. } => Ok(*seconds),
+            RouteSubmission::Cpu { interval, .. } => Ok(interval.1 - interval.0),
             #[cfg(target_os = "macos")]
             RouteSubmission::Metal(submission) => Ok(submission.device_seconds()),
             RouteSubmission::Cuda(submission) => {
@@ -1015,102 +1190,135 @@ impl NativeSubmission {
     }
 }
 
-/// Submit calls, in order, `repetitions` times, as one unit of device work.
-/// Every call must belong to one device.
+/// Encode `list` `repetitions` times as one unit of device work and commit
+/// it. `access` names every allocation the work touches exactly once
+/// ([`merge_access`]); `retained` keeps the formed functions alive with the
+/// submission.
 pub(crate) fn submit(
-    calls: &[Arc<NativeBoundCall>],
+    list: &impl DispatchList,
+    access: &[(Arc<Allocation>, bool)],
+    retained: Arc<dyn std::any::Any + Send + Sync>,
     repetitions: usize,
 ) -> Result<NativeSubmission, CallError> {
-    let first = calls
-        .first()
-        .ok_or(CallError::Workflow(crate::api::WorkflowError::Empty))?;
-    if calls
-        .iter()
-        .any(|call| call.kernel.device != first.kernel.device)
-    {
-        return Err(CallError::Workflow(
-            crate::api::WorkflowError::NativeGraphSlotMismatch,
-        ));
+    if list.count() == 0 {
+        return Err(CallError::Workflow(crate::api::WorkflowError::Empty));
     }
-    let mut access: BTreeMap<u64, (Arc<Allocation>, bool)> = BTreeMap::new();
-    for call in calls {
-        for (allocation, write) in call.access() {
-            access
-                .entry(allocation.identity())
-                .and_modify(|(_, current)| *current |= write)
-                .or_insert((allocation, write));
-        }
-    }
-    // Host access is excluded while the work is encoded; ordered by identity
-    // so concurrent submitters cannot deadlock.
+    // Host access is excluded while the work is encoded.
     let permits = access
-        .values()
+        .iter()
         .map(|(allocation, write)| allocation.acquire_for_device(*write))
         .collect::<Vec<_>>();
-    let route = Arc::new(encode(first, calls, repetitions)?);
+    let first = list.dispatch(0, &mut Vec::new()).kernel;
+    // Commit and fence recording in one order: allocation fences rely on
+    // being recorded in the queue's execution order.
+    let _order = first
+        .public_device
+        .native
+        .order
+        .lock()
+        .expect("native submission order lock is never poisoned");
+    let trace = first.public_device.active_trace();
+    let encode_start = trace::host_seconds();
+    let labels = trace.as_ref().map(|_| launch_labels(list, repetitions));
+    let timed = trace
+        .as_deref()
+        .filter(|sink| sink.detail() == trace::TraceDetail::Launches)
+        .map(|sink| (sink, labels.as_ref().map_or(0, Vec::len)));
+    let route = Arc::new(encode(first, list, repetitions, timed, &retained)?);
+    if let (Some(sink), Some(labels)) = (trace, labels) {
+        sink.record(route.clone(), labels, encode_start, trace::host_seconds());
+    }
     let completion: Arc<dyn DeviceCompletion> = route.clone();
-    for (allocation, write) in access.values() {
+    for (allocation, write) in access {
         allocation.record_device_use(completion.clone(), *write);
     }
     drop(permits);
     Ok(NativeSubmission {
         route,
-        _kernels: calls.iter().map(|call| call.kernel.clone()).collect(),
+        _retained: retained,
     })
 }
 
+/// Entry name and launch index of every launch, in encode order.
+fn launch_labels(list: &impl DispatchList, repetitions: usize) -> Vec<(String, usize)> {
+    let mut labels = Vec::new();
+    for _ in 0..repetitions {
+        for index in 0..list.count() {
+            let dispatch = list.dispatch(index, &mut Vec::new());
+            labels.extend(
+                (0..dispatch.launches.len()).map(|launch| (dispatch.kernel.name.clone(), launch)),
+            );
+        }
+    }
+    labels
+}
+
+/// Encode and commit the calls. `timed` (a launch-detail trace and the
+/// launch count) encodes every launch in its own timed unit.
 fn encode(
-    first: &Arc<NativeBoundCall>,
-    calls: &[Arc<NativeBoundCall>],
+    first: &NativePrepared,
+    list: &impl DispatchList,
     repetitions: usize,
+    timed: Option<(&trace::TraceSink, usize)>,
+    retained: &Arc<dyn std::any::Any + Send + Sync>,
 ) -> Result<RouteSubmission, CallError> {
-    match &first.kernel.route {
+    let mut buffers = Vec::new();
+    match &first.route {
         NativeRoute::Cpu { opened, .. } => {
-            let started = std::time::Instant::now();
+            let started = trace::host_seconds();
+            let mut pointers = Vec::new();
             let outcome = (|| {
                 for _ in 0..repetitions {
-                    for call in calls {
-                        run_cpu(opened, call)?;
+                    for index in 0..list.count() {
+                        buffers.clear();
+                        let dispatch = list.dispatch(index, &mut buffers);
+                        run_cpu(opened, &dispatch, &buffers, &mut pointers)?;
                     }
                 }
                 Ok(())
             })();
             Ok(RouteSubmission::Cpu {
                 outcome,
-                seconds: started.elapsed().as_secs_f64(),
+                interval: (started, trace::host_seconds()),
             })
         }
         #[cfg(target_os = "macos")]
         NativeRoute::Metal { opened, .. } => {
             type Metal = seismic_metal::Metal;
             type Executor = seismic_metal::MetalExecutor;
-            let mut batch =
-                seismic_metal::DirectBatch::new(opened.service()).map_err(CallError::Execution)?;
+            let mut batch = match timed {
+                Some((sink, launches)) => seismic_metal::DirectBatch::timed(
+                    opened.service(),
+                    sink.metal_timestamps(),
+                    launches,
+                ),
+                None => seismic_metal::DirectBatch::new(opened.service()),
+            }
+            .map_err(CallError::Execution)?;
+            let mut typed = Vec::new();
             for _ in 0..repetitions {
-                for call in calls {
-                    let NativeRoute::Metal { pipelines, .. } = &call.kernel.route else {
+                for index in 0..list.count() {
+                    buffers.clear();
+                    let dispatch = list.dispatch(index, &mut buffers);
+                    let NativeRoute::Metal { pipelines, .. } = &dispatch.kernel.route else {
                         unreachable!("one device has one native route");
                     };
-                    let owned = call
-                        .buffers()
-                        .into_iter()
-                        .map(|(allocation, offset)| {
-                            (typed_buffer::<Metal, Executor>(allocation), offset)
-                        })
-                        .collect::<Vec<_>>();
-                    let buffers = owned
-                        .iter()
-                        .map(|(buffer, offset)| (buffer, *offset))
-                        .collect::<Vec<_>>();
-                    let scalars = typed_buffer::<Metal, Executor>(&call.kernel.scalars);
-                    let words = call.word_bytes();
-                    for (pipeline, launch) in pipelines.iter().zip(&call.launches) {
+                    typed.clear();
+                    typed.extend(buffers.iter().map(|(allocation, offset)| {
+                        (typed_buffer::<Metal, Executor>(allocation), *offset)
+                    }));
+                    let scalars = typed_buffer::<Metal, Executor>(&dispatch.kernel.scalars);
+                    for (pipeline, launch) in pipelines.iter().zip(dispatch.launches) {
+                        let Some(launch) = launch else {
+                            batch.skip();
+                            continue;
+                        };
                         batch
                             .encode(&seismic_metal::DirectLaunch {
                                 pipeline,
-                                buffers: &buffers,
-                                words: &words,
-                                scalar_results: (&scalars, 0),
+                                buffers: &typed,
+                                words: dispatch.word_bytes,
+                                scalar_results: (scalars, 0),
                                 threadgroups: launch.groups,
                                 threads_per_threadgroup: launch.threads,
                                 threadgroup_bytes: launch.shared_bytes,
@@ -1122,77 +1330,45 @@ fn encode(
             Ok(RouteSubmission::Metal(batch.commit()))
         }
         NativeRoute::Cuda { opened, .. } => {
-            type Cuda = seismic_cuda::Cuda;
-            type Executor = seismic_cuda::Executor;
-            let mut batch = seismic_cuda::direct::DirectBatch::new(opened.service())
-                .map_err(CallError::Execution)?;
-            for _ in 0..repetitions {
-                for call in calls {
-                    let NativeRoute::Cuda { module, .. } = &call.kernel.route else {
-                        unreachable!("one device has one native route");
-                    };
-                    let owned = call
-                        .buffers()
-                        .into_iter()
-                        .map(|(allocation, offset)| {
-                            (typed_buffer::<Cuda, Executor>(allocation), offset)
-                        })
-                        .collect::<Vec<_>>();
-                    let buffers = owned
-                        .iter()
-                        .map(|(buffer, offset)| (buffer, *offset))
-                        .collect::<Vec<_>>();
-                    let scalars = typed_buffer::<Cuda, Executor>(&call.kernel.scalars);
-                    let words = call.word_bytes();
-                    for (function, launch) in call.launches.iter().enumerate() {
-                        batch
-                            .launch(&seismic_cuda::direct::DirectLaunch {
-                                module,
-                                function,
-                                buffers: &buffers,
-                                words: &words,
-                                scalar_results: (&scalars, 0),
-                                grid: launch.groups,
-                                block: launch.threads,
-                                shared_bytes: launch.shared_bytes,
-                            })
-                            .map_err(CallError::Execution)?;
-                    }
-                }
-            }
-            batch
-                .commit()
-                .map(RouteSubmission::Cuda)
-                .map_err(CallError::Execution)
+            cuda::encode(
+                opened.service(),
+                &first.public_device.native.replays,
+                list,
+                repetitions,
+                timed.is_some(),
+                retained,
+            )
         }
     }
 }
 
-fn run_cpu(opened: &Arc<CpuOpened>, call: &NativeBoundCall) -> Result<(), ExecutionError> {
+fn run_cpu(
+    opened: &Arc<CpuOpened>,
+    dispatch: &Dispatch<'_>,
+    buffers: &[(&Allocation, u64)],
+    pointers: &mut Vec<*mut u8>,
+) -> Result<(), ExecutionError> {
     type Cpu = seismic_cpu::Cpu;
     type Executor = seismic_cpu::Executor;
-    let NativeRoute::Cpu { launches, .. } = &call.kernel.route else {
+    let NativeRoute::Cpu { launches, .. } = &dispatch.kernel.route else {
         unreachable!("one device has one native route");
     };
-    let pointers = call
-        .buffers()
-        .into_iter()
-        .map(|(allocation, offset)| {
-            let base = typed_buffer::<Cpu, Executor>(allocation).data_pointer();
-            // SAFETY: tensor views and scratch placements lie inside their
-            // allocations (checked when the views were formed).
-            unsafe { base.add(offset as usize) }
-        })
-        .collect::<Vec<_>>();
-    let representations = call.representations();
-    let scalars = typed_buffer::<Cpu, Executor>(&call.kernel.scalars)
+    pointers.clear();
+    pointers.extend(buffers.iter().map(|(allocation, offset)| {
+        let base = typed_buffer::<Cpu, Executor>(allocation).data_pointer();
+        // SAFETY: tensor views and scratch placements lie inside their
+        // allocations (checked when the views were formed).
+        unsafe { base.add(*offset as usize) }
+    }));
+    let scalars = typed_buffer::<Cpu, Executor>(&dispatch.kernel.scalars)
         .data_pointer()
         .cast::<u64>();
-    for (function, launch) in launches.iter().zip(&call.launches) {
+    for (function, launch) in launches.iter().zip(dispatch.launches) {
+        let Some(launch) = launch else { continue };
         let invocation = CpuInvocation {
-            buffers: &pointers,
-            representations: &representations,
-            words: &call.words,
+            buffers: pointers,
+            representations: dispatch.representations,
+            words: dispatch.words,
             scalar_results: scalars,
             groups: launch.groups,
             threads: launch.threads,
@@ -1285,8 +1461,8 @@ fn evaluate_compiled(
 
 fn native_words(
     schema: &CallSchema,
-    args: &EncodedArgs,
-    results: &[Arc<TensorInner>],
+    arguments: &[ArgumentValue],
+    results: &[Option<NativeTensorSpec>],
     values: &InvocationValues,
 ) -> Result<Vec<u64>, CallError> {
     let mut words = Vec::with_capacity(abi::word_count(schema));
@@ -1296,19 +1472,21 @@ fn native_words(
             _ => panic!("validated invocation omitted a native ABI dimension"),
         }
     }
-    for (ordinal, parameter) in schema.parameters().iter().enumerate() {
-        match &parameter.kind {
-            ParameterKind::Tensor { .. } => {
-                let tensor = args.tensor(ordinal).expect("validated tensor disappeared");
-                words.extend_from_slice(tensor.extents());
-                words.extend_from_slice(tensor.strides());
+    for (parameter, argument) in schema.parameters().iter().zip(arguments) {
+        match (&parameter.kind, argument) {
+            (ParameterKind::Tensor { .. }, ArgumentValue::Tensor(tensor)) => {
+                words.extend_from_slice(&tensor.extents);
+                words.extend_from_slice(&tensor.strides);
             }
-            ParameterKind::Scalar { symbol, .. } | ParameterKind::Index { symbol, .. } => {
+            (ParameterKind::Tensor { .. }, _) => {
+                panic!("validated native tensor argument is not a tensor")
+            }
+            (ParameterKind::Scalar { symbol, .. } | ParameterKind::Index { symbol, .. }, _) => {
                 words.push(word(
                     values.get(*symbol).expect("validated scalar disappeared"),
                 )?);
             }
-            ParameterKind::Range { start, end, .. } => {
+            (ParameterKind::Range { start, end, .. }, _) => {
                 words.push(word(
                     values
                         .get(*start)
@@ -1320,9 +1498,9 @@ fn native_words(
             }
         }
     }
-    for tensor in results {
-        words.extend_from_slice(tensor.extents());
-        words.extend_from_slice(tensor.strides());
+    for spec in results.iter().flatten() {
+        words.extend_from_slice(&spec.extents);
+        words.extend_from_slice(&spec.strides);
     }
     Ok(words)
 }
@@ -1386,59 +1564,6 @@ impl Default for MeasureOptions {
     }
 }
 
-impl NativePrepared {
-    /// Measure calls cycling through `rotation`. Results and scratch of each
-    /// argument set are allocated once and reused by every repetition.
-    pub(crate) fn measure(
-        self: &Arc<Self>,
-        rotation: Vec<EncodedArgs>,
-        options: &MeasureOptions,
-    ) -> Result<Measurement, CallError> {
-        if rotation.is_empty() || options.samples == 0 {
-            return Err(CallError::Workflow(crate::api::WorkflowError::Empty));
-        }
-        let calls = rotation
-            .into_iter()
-            .map(|args| self.prepare_call(args, None).map(Arc::new))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut distinct = BTreeMap::new();
-        for call in &calls {
-            for (allocation, _) in call.access() {
-                distinct.insert(allocation.identity(), allocation.bytes());
-            }
-        }
-        let rotation_bytes = distinct.values().sum();
-        // Warm-up, which also calibrates the repetition count.
-        let warm = submit(&calls, 1)?.device_seconds()? / calls.len() as f64;
-        let repetitions = if warm > 0.0 {
-            ((options.min_sample_seconds / warm).ceil() as usize)
-                .div_ceil(calls.len())
-                .max(1)
-        } else {
-            1
-        };
-        let mut samples = Vec::with_capacity(options.samples);
-        for _ in 0..options.samples {
-            let seconds = submit(&calls, repetitions)?.device_seconds()?;
-            samples.push(seconds / (repetitions * calls.len()) as f64);
-        }
-        let median = median(&samples);
-        let deviation = median_of(
-            samples
-                .iter()
-                .map(|sample| (sample - median).abs())
-                .collect(),
-        );
-        Ok(Measurement {
-            samples,
-            median,
-            deviation,
-            repetitions: repetitions * calls.len(),
-            rotation_bytes,
-        })
-    }
-}
-
 fn median(samples: &[f64]) -> f64 {
     median_of(samples.to_vec())
 }
@@ -1450,5 +1575,55 @@ fn median_of(mut values: Vec<f64>) -> f64 {
         (values[middle - 1] + values[middle]) / 2.0
     } else {
         values[middle]
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use seismic_lang::checked::{check_source, SourceFile, SourceSet};
+
+    /// A module built without seismic-build (which rejects this at build
+    /// time) reaches preparation, which rejects it before compiling.
+    #[test]
+    #[ignore = "requires Metal device"]
+    fn metal_preparation_rejects_implementations_beyond_the_buffer_table() {
+        let parameters = (0..29)
+            .map(|index| format!("x{index}: &tensor[N] f32"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut module = check_source(SourceSet::new(vec![SourceFile {
+            path: "wide.seismic".into(),
+            text: format!("fn wide[N]({parameters}) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x0[i]\n    return output\n\nnative wide for metal from \"wide.metal\":\n    launch wide:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n"),
+        }]))
+        .expect("wide source checks");
+        let entry = module.entry_named("wide").expect("wide entry");
+        module
+            .capture_native_asset(entry, BackendName::Metal, "kernel void wide() {}\n".into())
+            .expect("asset capture");
+        let device = crate::devices::Catalog::discover()
+            .expect("device discovery")
+            .open_backend(BackendName::Metal)
+            .expect("Metal device");
+        match NativePrepared::prepare(
+            &device,
+            &module,
+            entry,
+            ElementBindings::default(),
+            NativeSpecialization::new(),
+            None,
+        ) {
+            Err(PrepareError::Preparation(PreparationError::NativeBufferSlots {
+                entry,
+                slots,
+                limit,
+            })) => {
+                assert_eq!(entry, "wide");
+                assert_eq!(slots, 32);
+                assert_eq!(limit, 31);
+            }
+            Err(other) => panic!("unexpected preparation error: {other:?}"),
+            Ok(_) => panic!("32 Metal buffer slots were prepared"),
+        }
     }
 }

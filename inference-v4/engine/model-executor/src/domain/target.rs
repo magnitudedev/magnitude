@@ -2,11 +2,26 @@
 
 use super::*;
 
+/// Host timing of one finished target step. Device execution overlaps the
+/// encode span; the selection gap is time the device may idle between steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TargetHostTiming {
+    /// From entry into `submit_target` to the step's first commit.
+    pub launch: Duration,
+    /// From the step's first to its last command-buffer commit.
+    pub encode: Duration,
+    /// From the previous selection read to this step's first commit, when a
+    /// selection was read since the previous step was submitted.
+    pub selection_to_commit: Option<Duration>,
+    /// From entry into `finish_target` to its return.
+    pub finish: Duration,
+}
+
 impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Submit one target group with state advances already reserved.
     pub fn submit_target(
         &mut self,
-        operations: Vec<Operation>,
+        operations: &[Operation],
         reservation: TargetGraphReservation,
     ) -> Result<TargetFlight<F::TargetSubmission>, DomainError> {
         let TargetGraphReservation {
@@ -65,7 +80,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let class = crate::LaunchClass::covering(rows, segments, demand, limits.max_batch_rows)
             .map_err(|error| error.to_string())?;
         let mut metadata = Vec::with_capacity(operations.len());
-        for operation in &operations {
+        for operation in operations {
             let request = operation.request();
             let Operation::Forward {
                 conditioning,
@@ -145,7 +160,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let submission = match self.family.submit_target(launch) {
             Ok(submission) => submission,
             Err((error, launch)) => {
-                let core = launch.into_submission_parts();
+                let (core, _) = launch.into_submission_parts();
                 let (_, advances, _, _) = core.into_parts();
                 self.restore_advances(metadata, advances);
                 let failure = DomainError::from(error);
@@ -157,6 +172,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             requests: metadata,
             submission,
             started,
+            previous_selection: self.selection_read.take(),
             slots,
             conditioning_slices,
         })
@@ -186,8 +202,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 return Err(DomainError::Device(error));
             }
         };
+        let finish_started = Instant::now();
         let physical_duration = flight.started.elapsed();
         let (core, output) = completed.into_parts();
+        let crate::TargetOutput {
+            readout: output,
+            commits,
+        } = output;
         let batch = core.batch();
         if batch.actual_slots() != flight.requests.len() {
             return Err("completed target slot count differs from submitted requests".into());
@@ -202,9 +223,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .ok_or("completed target has no selection tensor")?
                 .slice_leading(0, upload.select_rows.len() as u64)
                 .map_err(|error| error.to_string())?;
-            decode_selected(&tensor.tensor().read_to_host().map_err(|error| {
+            let bytes = tensor.tensor().read_to_host().map_err(|error| {
                 DomainError::Device(crate::DeviceError::Transfer(error.to_string()))
-            })?)?
+            })?;
+            self.selection_read = Some(Instant::now());
+            decode_selected(&bytes)?
         };
         let mut physical = vec![RowResult::default(); batch.actual_rows()];
         for (projected_index, &output_index) in output
@@ -330,6 +353,27 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             });
             offset = end;
         }
+        let timing = TargetHostTiming {
+            launch: commits.first.saturating_duration_since(flight.started),
+            encode: commits.last.saturating_duration_since(commits.first),
+            selection_to_commit: flight
+                .previous_selection
+                .map(|read| commits.first.saturating_duration_since(read)),
+            finish: finish_started.elapsed(),
+        };
+        if self.trace_host_steps {
+            eprintln!(
+                "target host step rows={} launch_us={} encode_us={} selection_to_commit_us={} finish_us={}",
+                physical.len(),
+                timing.launch.as_micros(),
+                timing.encode.as_micros(),
+                timing
+                    .selection_to_commit
+                    .map_or_else(|| "-".to_owned(), |gap| gap.as_micros().to_string()),
+                timing.finish.as_micros(),
+            );
+        }
+        self.target_timing = Some(timing);
         Ok(pending)
     }
 
@@ -397,6 +441,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Slot {
                 rows,
                 bank: i32::try_from(binding.previous_bank).map_err(|_| "bank exceeds i32")?,
+                following_bank: i32::try_from(binding.following_bank)
+                    .map_err(|_| "successor bank exceeds i32")?,
             },
             slices,
         ))
@@ -434,7 +480,7 @@ fn selection(operation: &Operation, row: usize) -> Option<Select> {
             position: spec.position as u64,
             domain: spec.domain,
         },
-        mask: spec.mask.as_ref().map(|value| value.to_vec()),
+        mask: spec.mask.clone(),
         shaping: RowShaping {
             temperature: spec.shaping.temperature,
             top_p: spec.shaping.top_p,

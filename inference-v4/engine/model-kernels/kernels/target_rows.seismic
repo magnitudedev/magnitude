@@ -1,5 +1,5 @@
-# Checked packed-row equations. Temporal recurrence is ordered; projections and
-# feedforward work span all rows. A single decode row is the M = 1 case.
+# Token embedding (K2): gather one table row per token and decode it with the
+# K1 packet decoders; one threadgroup per token row.
 fn qwen_embedding_rows[M, V, D](table: &tensor[V, D] EW, tokens: &tensor[M] i32)
     -> (tensor[M, D] A, tensor[M, D] f32):
     let mut embedded = tensor[M, D] A
@@ -9,9 +9,16 @@ fn qwen_embedding_rows[M, V, D](table: &tensor[V, D] EW, tokens: &tensor[M] i32)
     return embedded, f32(embedded)
 
 native qwen_embedding_rows for metal from "metal/qwen_embedding_rows.metal":
+    static (D)
     launch qwen_embedding_rows:
-        threadgroups (ceil_div(M * D, 256), 1, 1)
+        threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
+
+native qwen_embedding_rows for cuda from "cuda/qwen_embedding_rows.cu":
+    static (D)
+    launch qwen_embedding_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (128, 1, 1)
 
 
 # Conditioned features are already F32 model-width rows. This entry owns the
@@ -26,82 +33,7 @@ native qwen_conditioning_overlay for metal from "metal/qwen_conditioning_overlay
         threadgroups (ceil_div(M * D, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
-
-fn qwen_attention_rows[M, D, T, G, KV, P, S, R](hidden: &tensor[M, D] f32,
-    input_norm: &tensor[D] NW, query_gate_weight: &tensor[KV * G * 2 * (2 * P + S), D] QW,
-    key_weight: &tensor[KV * (2 * P + S), D] KW,
-    value_weight: &tensor[KV * (2 * P + S), D] VW,
-    query_norm: &tensor[2 * P + S] f32, key_norm: &tensor[2 * P + S] f32,
-    output_weight: &tensor[D, KV * G * (2 * P + S)] OW, coordinates: &tensor[M, 4] i32,
-    rotary_components: &tensor[P] i32,
-    visible: &tensor[M, R, 2] i32, fresh: &tensor[M, 2] i32,
-    destinations: &tensor[M] i32, history_key: &mut tensor[T, KV, 2 * P + S] A,
-    history_value: &mut tensor[T, KV, 2 * P + S] A,
-    base: f32, epsilon: f32, scale: f32) -> tensor[M, D] f32:
-    let mut normalized = tensor[M, D] A
-    let mut query_gate = tensor[M, KV * G * 2 * (2 * P + S)] A
-    let mut key = tensor[M, KV * (2 * P + S)] A
-    let mut value = tensor[M, KV * (2 * P + S)] A
-    let mut query = tensor[M, KV * G, 2 * P + S] A
-    let mut prepared_key = tensor[M, KV, 2 * P + S] A
-    let mut gate = tensor[M, KV * G * (2 * P + S)] A
-    let mut attended = tensor[M, KV * G, 2 * P + S] A
-    let mut activated = tensor[M, KV * G * (2 * P + S)] A
-    let mut gated = tensor[M, KV * G * (2 * P + S)] A
-    let mut projected = tensor[M, D] A
-    let mut result = tensor[M, D] f32
-    for row in 0..M:
-        for head in 0..KV * G:
-            for column in 0..2 * P + S:
-                attended[row, head, column] = 0.0
-        for column in 0..KV * G * (2 * P + S):
-            gated[row, column] = 0.0
-        for column in 0..D:
-            projected[row, column] = 0.0
-            result[row, column] = 0.0
-    rms_norm(hidden, input_norm, normalized, epsilon)
-    linear(normalized, query_gate_weight, query_gate)
-    linear(normalized, key_weight, key)
-    linear(normalized, value_weight, value)
-    rotary_prepare(query_gate, key, query_norm, key_norm, coordinates, query, prepared_key, gate, rotary_components, base, epsilon)
-    for row in 0..M:
-        for kv_head in 0..KV:
-            let qt = query[row, kv_head * G : (kv_head + 1) * G]
-            let mut maximum = tensor[G] f32
-            let mut denominator = tensor[G] f32
-            let mut accumulator = tensor[G, 2 * P + S] f32
-            for head in 0..G:
-                maximum[head] = -inf
-                denominator[head] = 0.0
-                for column in 0..2 * P + S:
-                    accumulator[head, column] = 0.0
-            for span in 0..R:
-                let lo = visible[row, span, 0]
-                let hi = visible[row, span, 1]
-                if hi > lo:
-                    attention_update(qt, history_key[lo : hi, kv_head], history_value[lo : hi, kv_head], maximum, denominator, accumulator, scale)
-            let fresh_lo = fresh[row, 0]
-            let fresh_hi = fresh[row, 1]
-            if fresh_hi > fresh_lo:
-                attention_update(qt, prepared_key[fresh_lo : fresh_hi, kv_head], reshape(value, (M, KV, 2 * P + S))[fresh_lo : fresh_hi, kv_head], maximum, denominator, accumulator, scale)
-            for head in 0..G:
-                for column in 0..2 * P + S:
-                    if denominator[head] > 0.0:
-                        attended[row, kv_head * G + head, column] = accumulator[head, column] / denominator[head]
-                    else:
-                        attended[row, kv_head * G + head, column] = 0.0
-    for kv_head in 0..KV:
-        for row in 0..M:
-            if destinations[row] >= 0:
-                history_key[destinations[row], kv_head] = prepared_key[row, kv_head]
-                history_value[destinations[row], kv_head] = reshape(value, (M, KV, 2 * P + S))[row, kv_head]
-    sigmoid(gate, activated)
-    multiply(reshape(attended, (M, KV * G * (2 * P + S))), activated, gated)
-    linear(gated, output_weight, projected)
-    add(hidden, projected, result)
-    return result
-
-native qwen_attention_rows for metal from "metal/qwen_attention_rows.metal":
-    launch qwen_attention_rows:
-        threadgroups (ceil_div(M * D + M * KV * (2 * P + S), 256), 1, 1)
+native qwen_conditioning_overlay for cuda from "cuda/qwen_conditioning_overlay.cu":
+    launch qwen_conditioning_overlay:
+        threadgroups (ceil_div(M * D, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)

@@ -565,8 +565,10 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
         .collect(),
         // Exact native/CAS implementations in the PTX emitter.
         atomics: [DType::F32, DType::I32, DType::U32].into_iter().collect(),
+        // Row layouts are native-only (`ROW_LAYOUT_IS_NATIVE_ONLY`).
         representations: registry::representations()
             .iter()
+            .filter(|info| info.layout == registry::Layout::Packet)
             .map(|info| info.id)
             .collect(),
     };
@@ -2017,12 +2019,6 @@ fn put_option_u32(digest: &mut Sha256, value: Option<u32>) {
     if let Some(value) = value {
         digest.update(value.to_le_bytes());
     }
-}
-
-/// The dtype support set as a `BTreeSet`, for registrations that narrow by
-/// dtype.
-pub fn supports_scalar(dtypes: &DataTypeSupport, dtype: DType) -> bool {
-    dtypes.scalars.contains(&dtype)
 }
 
 #[allow(dead_code)]

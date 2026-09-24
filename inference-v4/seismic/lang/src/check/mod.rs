@@ -805,7 +805,6 @@ pub(crate) fn check_program(
             predicates: checked.signature.predicates,
             initialization: checked.initialization,
             element_domain: checked.element_domain,
-            placement: checked.placement,
             body: checked.body,
             arena: checked.arena,
             file: declared.file,
@@ -977,11 +976,7 @@ fn check_native(
     backend: crate::registry::BackendName,
     declared_in: &str,
 ) -> Result<crate::checked::NativeImplementation, Vec<(Span, String)>> {
-    use crate::checked::{
-        NativeComparison, NativeConstraint, NativeLaunch, NativeNatExpr, NativeParameter,
-        NativeScratch,
-    };
-    use crate::syntax::ast::{BinaryOp, ExprKind};
+    use crate::checked::{NativeLaunch, NativeNatExpr, NativeParameter, NativeScratch};
     let mut errors = Vec::new();
 
     let mut statics: Vec<String> = Vec::new();
@@ -1043,51 +1038,32 @@ fn check_native(
             .ok()
     };
 
-    let mut constraints = Vec::new();
-    for conjunct in &native.constraints {
-        let ExprKind::Binary { op, lhs, rhs } = &conjunct.kind else {
-            errors.push((
-                conjunct.span,
-                "a native `where` conjunct is a comparison".to_owned(),
-            ));
-            continue;
-        };
-        let comparison = match op {
-            BinaryOp::Lt => NativeComparison::Lt,
-            BinaryOp::Le => NativeComparison::Le,
-            BinaryOp::Gt => NativeComparison::Gt,
-            BinaryOp::Ge => NativeComparison::Ge,
-            BinaryOp::Eq => NativeComparison::Eq,
-            BinaryOp::Ne => NativeComparison::Ne,
-            _ => {
-                errors.push((
-                    conjunct.span,
-                    "a native `where` conjunct is a comparison joined by `and`".to_owned(),
-                ));
-                continue;
-            }
-        };
-        let (Some(left), Some(right)) = (expression(lhs, &mut errors), expression(rhs, &mut errors))
-        else {
-            continue;
-        };
+    // `None` inside the result means the clause is absent; an outer `None`
+    // means it failed to check (its errors are recorded).
+    let condition = |clause: &str,
+                     expr: &Option<crate::syntax::ast::Expr>,
+                     errors: &mut Vec<(Span, String)>| match expr {
+        None => Some(None),
+        Some(expr) => {
+            native_condition(clause, expr, &entry.dimensions, &parameter_names)
+                .map_err(|error| errors.push(error))
+                .ok()
+                .map(Some)
+        }
+    };
+
+    let constraint = condition("where", &native.constraint, &mut errors).flatten();
+    if let (Some(constraint), Some(expr)) = (&constraint, &native.constraint) {
         let mut read = Vec::new();
-        left.dimensions(&mut read);
-        right.dimensions(&mut read);
+        constraint.dimensions(&mut read);
         if let Some(dynamic) = read.iter().find(|name| !statics.contains(name)) {
             errors.push((
-                conjunct.span,
+                expr.span,
                 format!(
                     "native `where` reads dimension `{dynamic}`, which is not static; its value is unknown at preparation"
                 ),
             ));
-            continue;
         }
-        constraints.push(NativeConstraint {
-            comparison,
-            left,
-            right,
-        });
     }
 
     let mut scratch: Vec<NativeScratch> = Vec::new();
@@ -1099,16 +1075,20 @@ fn check_native(
             ));
             continue;
         }
-        if let Some(bytes) = expression(&buffer.bytes, &mut errors) {
+        let bytes = expression(&buffer.bytes, &mut errors);
+        let when = condition("when", &buffer.when, &mut errors);
+        if let (Some(bytes), Some(when)) = (bytes, when) {
             scratch.push(NativeScratch {
                 name: buffer.name.name.clone(),
                 bytes,
+                when,
             });
         }
     }
 
     let mut launches = Vec::new();
     for launch in &native.launches {
+        let when = condition("when", &launch.when, &mut errors);
         let groups = launch
             .threadgroups
             .each_ref()
@@ -1121,13 +1101,41 @@ fn check_native(
             Some(expr) => expression(expr, &mut errors),
             None => Some(NativeNatExpr::Constant(0)),
         };
-        let ([Some(x), Some(y), Some(z)], [Some(ex), Some(ey), Some(ez)], Some(shared_bytes)) =
-            (groups, group_extent, shared_bytes)
+        let (
+            Some(when),
+            [Some(x), Some(y), Some(z)],
+            [Some(ex), Some(ey), Some(ez)],
+            Some(shared_bytes),
+        ) = (when, groups, group_extent, shared_bytes)
         else {
             continue;
         };
+        // A Vulkan pipeline is created with its workgroup size and shared
+        // memory, so both must be known when the implementation is prepared.
+        if backend == crate::registry::BackendName::Vulkan {
+            let fixed = [
+                (&ex, &launch.threads_per_threadgroup[0]),
+                (&ey, &launch.threads_per_threadgroup[1]),
+                (&ez, &launch.threads_per_threadgroup[2]),
+            ]
+            .into_iter()
+            .chain(launch.shared_bytes.as_ref().map(|expr| (&shared_bytes, expr)));
+            for (checked, expr) in fixed {
+                let mut read = Vec::new();
+                checked.dimensions(&mut read);
+                if let Some(dynamic) = read.iter().find(|name| !statics.contains(name)) {
+                    errors.push((
+                        expr.span,
+                        format!(
+                            "Vulkan fixes the group size and shared memory when the kernel is prepared; `{dynamic}` is only known per call (declare it `static` or use a static bound)"
+                        ),
+                    ));
+                }
+            }
+        }
         launches.push(NativeLaunch {
             kernel: launch.kernel.name.clone(),
+            when,
             groups: [x, y, z],
             group_extent: [ex, ey, ez],
             shared_bytes,
@@ -1144,9 +1152,57 @@ fn check_native(
         source_path: native.source.clone(),
         statics,
         params,
-        constraints,
+        constraint,
         scratch,
         launches,
+    })
+}
+
+/// Lower a native `where` or `when` condition: comparisons of native
+/// natural-number expressions joined by `and` and `or` (parentheses group).
+fn native_condition(
+    clause: &str,
+    expression: &crate::syntax::ast::Expr,
+    dimensions: &[String],
+    parameters: &[String],
+) -> Result<crate::checked::NativeCondition, (Span, String)> {
+    use crate::checked::{NativeComparison, NativeCondition};
+    use crate::syntax::ast::{BinaryOp, ExprKind};
+    let not_a_condition = || {
+        (
+            expression.span,
+            format!(
+                "a native `{clause}` condition is a comparison (`<`, `<=`, `>`, `>=`, `==`, `!=`) of natural-number expressions, or conditions joined by `and` and `or`"
+            ),
+        )
+    };
+    let ExprKind::Binary { op, lhs, rhs } = &expression.kind else {
+        return Err(not_a_condition());
+    };
+    let comparison = match op {
+        BinaryOp::And | BinaryOp::Or => {
+            let left = Box::new(native_condition(clause, lhs, dimensions, parameters)?);
+            let right = Box::new(native_condition(clause, rhs, dimensions, parameters)?);
+            return Ok(match op {
+                BinaryOp::And => NativeCondition::And(left, right),
+                _ => NativeCondition::Or(left, right),
+            });
+        }
+        BinaryOp::Lt => NativeComparison::Lt,
+        BinaryOp::Le => NativeComparison::Le,
+        BinaryOp::Gt => NativeComparison::Gt,
+        BinaryOp::Ge => NativeComparison::Ge,
+        BinaryOp::Eq => NativeComparison::Eq,
+        BinaryOp::Ne => NativeComparison::Ne,
+        _ => return Err(not_a_condition()),
+    };
+    let operand = |expr: &crate::syntax::ast::Expr| {
+        native_nat_expr(expr, dimensions, parameters).map_err(|message| (expr.span, message))
+    };
+    Ok(NativeCondition::Compare {
+        comparison,
+        left: operand(lhs)?,
+        right: operand(rhs)?,
     })
 }
 

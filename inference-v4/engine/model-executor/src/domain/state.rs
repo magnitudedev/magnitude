@@ -46,6 +46,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         slot.bank = i32::try_from(pending.advance.previous_bank())
             .map_err(|_| "repair bank exceeds i32")?;
+        slot.following_bank = i32::try_from(pending.advance.following_bank())
+            .map_err(|_| "repair successor bank exceeds i32")?;
         let replay = ValidatedTargetBatch::from_slots(
             &[slot],
             self.definition.geometry.vocabulary as usize,

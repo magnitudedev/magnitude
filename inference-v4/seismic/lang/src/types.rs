@@ -98,10 +98,6 @@ impl DType {
             DType::Bool => 5,
         }
     }
-
-    pub(crate) fn from_ordinal(ordinal: u8) -> Option<DType> {
-        DType::ALL.get(usize::from(ordinal)).copied()
-    }
 }
 
 impl fmt::Display for DType {
@@ -141,10 +137,6 @@ impl Elem {
             Elem::Param(_) => Some(DType::F32),
             Elem::Repr(_) => None,
         }
-    }
-
-    pub(crate) fn is_packed(&self) -> bool {
-        matches!(self, Elem::Repr(_))
     }
 }
 
@@ -254,16 +246,6 @@ impl ValueType {
     pub(crate) fn is_void(&self) -> bool {
         matches!(self, ValueType::Void)
     }
-
-    /// Every extent handle mentioned by this type, in traversal order.
-    pub(crate) fn extents(&self, out: &mut Vec<IntExpr>) {
-        match self {
-            ValueType::Scalar(_) | ValueType::Integer | ValueType::Opaque { .. } | ValueType::Void => {}
-            ValueType::Index { bound } | ValueType::Range { bound } => out.push(*bound),
-            ValueType::Tensor(t) => out.extend(t.axes.iter().copied()),
-            ValueType::Tuple(items) => items.iter().for_each(|item| item.extents(out)),
-        }
-    }
 }
 
 impl ValueType {
@@ -341,60 +323,6 @@ impl fmt::Display for ValueType {
         }
         .fmt(f)
     }
-}
-
-/// Ordinal path of one component of a value: tuple nesting and ordinal paths
-/// are preserved; names never define identity.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub(crate) struct ValuePath(pub Vec<u32>);
-
-impl ValuePath {
-    pub(crate) fn extend(&self, index: u32) -> ValuePath {
-        let mut out = self.0.clone();
-        out.push(index);
-        ValuePath(out)
-    }
-}
-
-/// One semantic leaf of a canonical type: a range is one leaf, a tensor is
-/// one leaf. Opaque values are not leaves: they cannot cross a portable
-/// boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Leaf<'a> {
-    Scalar(DType),
-    Integer,
-    Index(IntExpr),
-    Range(IntExpr),
-    Tensor(&'a TensorType),
-}
-
-/// The one canonical leaf traversal. `None` names an opaque value somewhere
-/// in the type. `Void` has no leaves.
-pub(crate) fn canonical_leaves(ty: &ValueType) -> Option<Vec<(ValuePath, Leaf<'_>)>> {
-    fn walk<'a>(
-        ty: &'a ValueType,
-        path: &ValuePath,
-        out: &mut Vec<(ValuePath, Leaf<'a>)>,
-    ) -> Option<()> {
-        match ty {
-            ValueType::Scalar(d) => out.push((path.clone(), Leaf::Scalar(*d))),
-            ValueType::Integer => out.push((path.clone(), Leaf::Integer)),
-            ValueType::Index { bound } => out.push((path.clone(), Leaf::Index(*bound))),
-            ValueType::Range { bound } => out.push((path.clone(), Leaf::Range(*bound))),
-            ValueType::Tensor(s) => out.push((path.clone(), Leaf::Tensor(s))),
-            ValueType::Tuple(items) => {
-                for (i, item) in items.iter().enumerate() {
-                    walk(item, &path.extend(i as u32), out)?;
-                }
-            }
-            ValueType::Opaque { .. } => return None,
-            ValueType::Void => {}
-        }
-        Some(())
-    }
-    let mut out = Vec::new();
-    walk(ty, &ValuePath::default(), &mut out)?;
-    Some(out)
 }
 
 #[cfg(test)]

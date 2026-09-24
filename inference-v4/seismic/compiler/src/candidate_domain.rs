@@ -667,18 +667,6 @@ impl<'a, B: seismic_target::TargetFamily> ConstructedCandidateView<'a, B> {
     pub fn choices(&self) -> &'a [ChoiceDeclaration] {
         self.candidate.family.choices()
     }
-    pub fn constraints(&self) -> &'a [DomainConstraint] {
-        self.candidate.constraints.conjuncts()
-    }
-    pub fn numerical_requirement(&self) -> StructuralNumericalObligation {
-        self.candidate.numerical
-    }
-    pub fn executable(&self) -> crate::evaluation::TargetClosedExecutableView<'a, B> {
-        crate::evaluation::TargetClosedExecutableView::new(
-            &self.candidate.family,
-            self.candidate.constraints.conjuncts(),
-        )
-    }
 }
 
 pub(crate) struct CandidateDomainParts<'ctx, B: seismic_target::TargetFamily> {

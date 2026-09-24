@@ -200,3 +200,83 @@ fn token_stream_is_chunk_invariant_and_stops_before_semantic_parsing() {
     );
     assert!(stream.finish(FinishReason::Cancelled).is_err());
 }
+
+/// A JSON-schema request starts generating under every forced-run quantum.
+/// Quantum 0 (the served engine's setting) disables forced runs: the final
+/// prefill chunk selects its first token under the grammar mask.
+#[test]
+fn json_constrained_generation_starts_with_and_without_forced_runs() {
+    use magnitude_artifacts::InputLayout;
+    use magnitude_chat::{CacheLimits, Options, Sampling, Vocabulary};
+    use magnitude_generation::{Plain, RequestId, RoundStart, Shaping, WorkKind};
+    use magnitude_model_contracts::{PreparedModelInput, TokenPlan};
+    use std::sync::Arc;
+
+    let tokenizer = Arc::new(tokenizer());
+    let mut request = ChatRequest::new(vec![serde_json::json!({"role":"user", "content":"hi"})], 0);
+    request.json_schema = Some(serde_json::json!({
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": false
+    }));
+    let prepared = PreparedChat::prepare(
+        &bundle(""),
+        &tokenizer,
+        &request,
+        &TemplateSelection::default(),
+    )
+    .unwrap();
+    let tokens = prepared.input().tokens.clone();
+    let coordinates = (0..tokens.len())
+        .map(|position| [position as i32; 3])
+        .collect();
+    let layout = InputLayout::new(tokens.len(), Vec::new()).unwrap();
+    let plan = PreparedModelInput::from_text_coordinates(
+        TokenPlan::new(tokens.clone(), layout).unwrap(),
+        coordinates,
+    )
+    .unwrap();
+    let mut vocabulary = Vocabulary::new(
+        tokenizer.clone(),
+        tokenizer.vocabulary(),
+        CacheLimits {
+            entries: 2,
+            bytes: 1 << 20,
+        },
+    )
+    .unwrap();
+    for forced_quantum in [0, 4] {
+        let options = Options {
+            max_tokens: 64,
+            output_capacity: 16,
+            context_limit: 256,
+            vocabulary: tokenizer.vocabulary(),
+            stop_tokens: tokenizer.stop_tokens().clone(),
+            sampling: Sampling::Greedy,
+            shaping: Shaping {
+                temperature: 0.0,
+                ..Default::default()
+            },
+            seed: 0,
+            forced_quantum,
+            method: magnitude_generation::MethodChoice::Plain,
+        };
+        let mut generation = vocabulary
+            .prepare_generation_for_input(prepared.input(), options, &plan)
+            .unwrap()
+            .into_generation(Arc::new(Plain))
+            .unwrap();
+        assert_eq!(
+            generation.start_round(RequestId(1), 64).unwrap(),
+            RoundStart::Target
+        );
+        let forward = generation.round_forward().unwrap();
+        assert_eq!(forward.kind, WorkKind::Prefill);
+        assert_eq!(forward.tokens, tokens);
+        // The schema admits leading whitespace, so no token is forced: the
+        // first output is selected under the grammar mask.
+        assert_eq!(forward.selects.len(), 1);
+        assert!(forward.selects[0].mask.is_some());
+    }
+}

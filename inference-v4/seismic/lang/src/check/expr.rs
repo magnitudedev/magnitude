@@ -1513,6 +1513,7 @@ impl<'a> Checker<'a> {
                                 Some((s.clone(), *r, layout))
                             }
                             crate::registry::RepresentationKind::Dense(_)
+                            | crate::registry::RepresentationKind::PackedRows(_)
                             | crate::registry::RepresentationKind::External(_) => None,
                         },
                         _ => None,

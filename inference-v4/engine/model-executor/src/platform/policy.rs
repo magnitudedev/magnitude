@@ -196,15 +196,16 @@ pub fn admit_growth(
                 return Err(insufficient(MemoryConstraint::DeviceWorkingSet, available));
             }
         }
+        // A dedicated device's pool is bounded by the driver's free bytes. An
+        // integrated (host-backed) device allocates host RAM, bounded by the
+        // host check above; its driver-reported free bytes exclude
+        // reclaimable page cache, so they are not an allocation bound.
         DeviceMeasurements::Cuda { free_bytes, .. } => {
-            if memory.allocates_host_memory() {
-                return Err(MemoryPolicyError::MismatchedObservation {
-                    device: info.selector.to_string(),
-                });
-            }
-            let available = free_bytes.saturating_sub(DEDICATED_PLANNING_RESERVE);
-            if additional > available {
-                return Err(insufficient(MemoryConstraint::DeviceLocal, available));
+            if !memory.allocates_host_memory() {
+                let available = free_bytes.saturating_sub(DEDICATED_PLANNING_RESERVE);
+                if additional > available {
+                    return Err(insufficient(MemoryConstraint::DeviceLocal, available));
+                }
             }
         }
     }

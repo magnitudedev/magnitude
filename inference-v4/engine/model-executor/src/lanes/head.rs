@@ -94,6 +94,11 @@ impl HeadLaunchInputs {
             if i32::try_from(binding.previous_bank).ok() != Some(slot.bank()) {
                 return Err(invalid(format!("slot {index} uses another recurrent bank")));
             }
+            if i32::try_from(binding.following_bank).ok() != Some(slot.following_bank()) {
+                return Err(invalid(format!(
+                    "slot {index} publishes to another recurrent successor bank"
+                )));
+            }
             for (row, packed) in slot.destinations().iter().enumerate() {
                 let expected = binding
                     .destinations

@@ -1,0 +1,395 @@
+# Qwen gated attention over projected rows: q/k RMS norms and partial M-RoPE,
+# attention over each row's visible history spans plus its fresh span of this
+# batch's rows, the sigmoid output gate, and the K/V append at `destinations`.
+#
+# The prepared query and key are published in the activation dtype; the key
+# exactly as it is stored in history, so a fresh read and a later history read
+# of the same key agree. A row with no visible key attends to zero.
+# Destinations are freshly reserved history rows: no row of the batch sees one
+# of them through `visible`, so the append is independent of every read.
+# One head row RMS-normalized in F32, its first 2P columns rotated: pair p by
+# the coordinate on axis components[p] at frequencies[p] (a static table the
+# engine derives from the model's rotary base and sections).
+fn qwen_norm_rotary[P, S](x: &tensor[2 * P + S] A, wt: &tensor[2 * P + S] f32,
+    coordinates: &tensor[4] i32, components: &tensor[P] i32,
+    frequencies: &tensor[P] f32, epsilon: f32) -> tensor[2 * P + S] f32:
+    let xf = f32(x)
+    let ss = sum_any_order(xf * xf)
+    let inv = rsqrt(ss / f32(2 * P + S) + epsilon)
+    let normalized = xf * inv * wt
+    let mut rotated = zeros_like(x, dtype=f32)
+    for i in 0..2 * P + S:
+        if i < 2 * P:
+            let pair = i % P
+            let angle = f32(coordinates[components[pair]]) * frequencies[pair]
+            if i < P:
+                rotated[i] = normalized[i] * cos(angle) - normalized[i + P] * sin(angle)
+            else:
+                rotated[i] = normalized[i] * cos(angle) + normalized[i - P] * sin(angle)
+        else:
+            rotated[i] = normalized[i]
+    return rotated
+
+fn qwen_gated_attention[M, T, KV, G, P, S, R](
+    query_gate: &tensor[M, KV * G * 2 * (2 * P + S)] A,
+    key: &tensor[M, KV * (2 * P + S)] A, value: &tensor[M, KV * (2 * P + S)] A,
+    query_norm: &tensor[2 * P + S] f32, key_norm: &tensor[2 * P + S] f32,
+    rotary_components: &tensor[P] i32, rotary_frequencies: &tensor[P] f32,
+    coordinates: &tensor[M, 4] i32, visible: &tensor[M, R, 2] i32,
+    fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
+    history_key: &mut tensor[T, KV, 2 * P + S] A,
+    history_value: &mut tensor[T, KV, 2 * P + S] A,
+    epsilon: f32, scale: f32) -> tensor[M, KV * G, 2 * P + S] A:
+    let mut prepared_key = tensor[M, KV, 2 * P + S] A
+    for row in 0..M:
+        for head in 0..KV:
+            prepared_key[row, head] = qwen_norm_rotary(
+                key[row, head * (2 * P + S) : (head + 1) * (2 * P + S)], key_norm,
+                coordinates[row], rotary_components, rotary_frequencies, epsilon)
+    let fresh_value = reshape(value, (M, KV, 2 * P + S))
+    let mut gated = tensor[M, KV * G, 2 * P + S] A
+    for row in 0..M:
+        for kv_head in 0..KV:
+            let mut qt = tensor[G, 2 * P + S] A
+            let mut maximum = tensor[G] f32
+            let mut denominator = tensor[G] f32
+            let mut accumulator = tensor[G, 2 * P + S] f32
+            for head in 0..G:
+                let first = (kv_head * G + head) * 2 * (2 * P + S)
+                qt[head] = qwen_norm_rotary(query_gate[row, first : first + (2 * P + S)],
+                    query_norm, coordinates[row], rotary_components, rotary_frequencies,
+                    epsilon)
+                maximum[head] = -inf
+                denominator[head] = 0.0
+                for column in 0..2 * P + S:
+                    accumulator[head, column] = 0.0
+            for span in 0..R:
+                let lo = visible[row, span, 0]
+                let hi = visible[row, span, 1]
+                if hi > lo:
+                    attention_update(qt, history_key[lo : hi, kv_head],
+                        history_value[lo : hi, kv_head], maximum, denominator,
+                        accumulator, scale)
+            let fresh_lo = fresh[row, 0]
+            let fresh_hi = fresh[row, 1]
+            if fresh_hi > fresh_lo:
+                attention_update(qt, prepared_key[fresh_lo : fresh_hi, kv_head],
+                    fresh_value[fresh_lo : fresh_hi, kv_head], maximum, denominator,
+                    accumulator, scale)
+            for head in 0..G:
+                let gate_first = (kv_head * G + head) * 2 * (2 * P + S) + (2 * P + S)
+                for column in 0..2 * P + S:
+                    let gate = f32(query_gate[row, gate_first + column])
+                    let attended = accumulator[head, column] / max(denominator[head], 1e-30)
+                    gated[row, kv_head * G + head, column] = attended / (1.0 + exp(-gate))
+    for row in 0..M:
+        if destinations[row] >= 0:
+            for head in 0..KV:
+                history_key[destinations[row], head] = prepared_key[row, head]
+                history_value[destinations[row], head] = fresh_value[row, head]
+    return gated
+
+
+# Decode rows (M <= 8). L1: one threadgroup per (kv head, partition, row). A
+# row's visible keys (spans in order, then its fresh span) split into
+# consecutive partitions of max(SPAN, ceil(keys / PARTS)) keys, so a short row
+# still spreads over several partitions and a long one over all PARTS. The
+# SIMDS simdgroups of a partition scan contiguous sub-ranges of it for all G
+# query heads, so each K/V row is read once per kv head. Partition 0 also
+# appends the row's K/V. L2: per (query head, row), a fixed-order LSE merge of
+# the row's partitions and the sigmoid gate.
+fn qwen_attention_decode[M, T, KV, G, P, S, R](
+    query_gate: &tensor[M, KV * G * 2 * (2 * P + S)] A,
+    key: &tensor[M, KV * (2 * P + S)] A, value: &tensor[M, KV * (2 * P + S)] A,
+    query_norm: &tensor[2 * P + S] f32, key_norm: &tensor[2 * P + S] f32,
+    rotary_components: &tensor[P] i32, rotary_frequencies: &tensor[P] f32,
+    coordinates: &tensor[M, 4] i32, visible: &tensor[M, R, 2] i32,
+    fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
+    history_key: &mut tensor[T, KV, 2 * P + S] A,
+    history_value: &mut tensor[T, KV, 2 * P + S] A,
+    epsilon: f32, scale: f32) -> tensor[M, KV * G, 2 * P + S] A:
+    return qwen_gated_attention[G = G](query_gate, key, value, query_norm, key_norm,
+        rotary_components, rotary_frequencies, coordinates, visible, fresh,
+        destinations, history_key, history_value, epsilon, scale)
+
+native qwen_attention_decode for metal from "metal/qwen_attention_decode.metal":
+    static (KV, G, P, S)
+    params (arithmetic SPAN in [32, 64, 128, 256], arithmetic PARTS in [16, 8, 32],
+        arithmetic SIMDS in [4, 8])
+    scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
+    scratch statistics bytes (M * KV * G * PARTS * 8)
+    launch qwen_attention_decode_partial:
+        threadgroups (KV, PARTS, M)
+        threads_per_threadgroup (SIMDS * 32, 1, 1)
+        shared_bytes ((G + SIMDS) * (2 * P + S) * 4 + SIMDS * G * 8)
+    launch qwen_attention_decode_merge:
+        threadgroups (KV * G, M, 1)
+        threads_per_threadgroup (2 * P + S, 1, 1)
+
+
+# Prefill rows (M >= 16). L1: one simdgroup per (row, query or key head)
+# prepares the query or the key (activation dtype) into scratch, copies the
+# value beside it, and appends K/V at the row's destination; query rows are
+# padded with zeros to whole QT tiles. L2: streaming attention per (QT-row
+# tile, kv head, key partition); the tile's QT tokens x G query heads are the
+# matrix rows. Each visible span, then the fresh span, is staged over the
+# union of the tile rows' intervals in 32-key K/V tiles sharing one
+# threadgroup buffer; per-row masks apply only to tiles outside the rows'
+# common interval. Queries and probabilities enter the products in the
+# activation dtype; scores, the softmax state and the output are F32. The key
+# tiles split into consecutive runs of at least 16 tiles over up to
+# max(1, ceil(SPLIT_GROUPS / (tiles * KV))) partitions, so a long history
+# fills the device and a short one runs unsplit. A tile served by one
+# partition stores its gated output directly (gate fused into the store);
+# otherwise L3 merges the partitions' (partial output, maximum, denominator)
+# in partition order with the decode merge rule and applies the gate.
+fn qwen_attention_prefill[M, T, KV, G, P, S, R](
+    query_gate: &tensor[M, KV * G * 2 * (2 * P + S)] A,
+    key: &tensor[M, KV * (2 * P + S)] A, value: &tensor[M, KV * (2 * P + S)] A,
+    query_norm: &tensor[2 * P + S] f32, key_norm: &tensor[2 * P + S] f32,
+    rotary_components: &tensor[P] i32, rotary_frequencies: &tensor[P] f32,
+    coordinates: &tensor[M, 4] i32, visible: &tensor[M, R, 2] i32,
+    fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
+    history_key: &mut tensor[T, KV, 2 * P + S] A,
+    history_value: &mut tensor[T, KV, 2 * P + S] A,
+    epsilon: f32, scale: f32) -> tensor[M, KV * G, 2 * P + S] A:
+    return qwen_gated_attention[G = G](query_gate, key, value, query_norm, key_norm,
+        rotary_components, rotary_frequencies, coordinates, visible, fresh,
+        destinations, history_key, history_value, epsilon, scale)
+
+native qwen_attention_prefill for metal from "metal/qwen_attention_prefill.metal":
+    static (KV, G, P, S)
+    params (arithmetic QT in [16, 8], arithmetic SPLIT_GROUPS in [256, 128, 512, 1])
+    scratch queries bytes (ceil_div(M, QT) * QT * KV * G * (2 * P + S) * 2)
+    scratch keys bytes (M * KV * (2 * P + S) * 2)
+    scratch values bytes (M * KV * (2 * P + S) * 2)
+    scratch partials bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV)) * M * KV * G * (2 * P + S) * 4)
+    scratch statistics bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV)) * M * KV * G * 8)
+    scratch counts bytes (ceil_div(M, QT) * 4)
+    launch qwen_attention_prefill_prepare:
+        threadgroups (ceil_div(ceil_div(M, QT) * QT * KV * (G + 1), 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch qwen_attention_prefill_attend:
+        threadgroups (ceil_div(M, QT), KV, max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV)))
+        threads_per_threadgroup (QT * G * 4, 1, 1)
+        shared_bytes (32 * (2 * P + S + 8) * 2 + (R + 1) * 16)
+    launch qwen_attention_prefill_merge:
+        threadgroups (ceil_div(M, QT) * min(max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV)) - 1, 1), KV * G, 1)
+        threads_per_threadgroup (2 * P + S, 1, 1)
+
+
+# Affine K8/V4 history (the `affine_k8_uniform_v4` KV codec). Every (history
+# row, kv head) vector of W values x is one affine group stored as codes plus
+# an F16 coefficient pair (scale, zero): zero = f16(min x), scale =
+# f16((max x - min x) / L) and code = min(L, u32(fma(x - zero, 1 / scale,
+# 0.5))) (0 when scale is 0), decoded as code * scale + zero. Keys use 8-bit
+# codes (L = 255, four per u32 word), values 4-bit codes (L = 15, eight per
+# word); code i sits at bits B * (i % (32 / B)) of word i / (32 / B). The key
+# encoded is the prepared key rounded to the activation dtype, the value the
+# projected value. Fresh rows of the batch attend dense; only history is
+# encoded.
+fn affine_encode[W, N](x: &tensor[W] f32, codes: &mut tensor[N] u32,
+    coefficients: &mut tensor[2] f16):
+    let levels = (u32(1) << u32(32 * N / W)) - u32(1)
+    let low = reduce(x, 0, min)
+    let high = reduce(x, 0, max)
+    let zero = f16(low)
+    let scale = f16((high - low) / f32(levels))
+    let mut inverse = 0.0
+    if f32(scale) > 0.0:
+        inverse = 1.0 / f32(scale)
+    for word in 0..N:
+        codes[word] = u32(0)
+    for i in 0..W:
+        let word = i / (W / N)
+        if word < N:
+            let code = min(u32(fma(x[i] - f32(zero), inverse, 0.5)), levels)
+            codes[word] = codes[word] | (code << (u32(i % (W / N)) * u32(32 * N / W)))
+    coefficients[0] = scale
+    coefficients[1] = zero
+
+fn affine_decode[W, N](codes: &tensor[N] u32, coefficients: &tensor[2] f16,
+    x: &mut tensor[W] f32):
+    let levels = (u32(1) << u32(32 * N / W)) - u32(1)
+    let scale = f32(coefficients[0])
+    let zero = f32(coefficients[1])
+    for i in 0..W:
+        let word = i / (W / N)
+        if word < N:
+            let code = (codes[word] >> (u32(i % (W / N)) * u32(32 * N / W))) & levels
+            x[i] = fma(f32(code), scale, zero)
+
+# One decoded history key/value absorbed by the online softmax of G query
+# heads (F32 scores and state).
+fn attention_absorb[G, W](qt: &tensor[G, W] A, key: &tensor[W] f32,
+    value: &tensor[W] f32, m: &mut tensor[G] f32, l: &mut tensor[G] f32,
+    acc: &mut tensor[G, W] f32, scale: f32):
+    for head in 0..G:
+        let mut dot = 0.0
+        for column in 0..W:
+            dot = fma(f32(qt[head, column]), key[column], dot)
+        let next = max(m[head], dot * scale)
+        let p = exp(dot * scale - next)
+        let carry = exp(m[head] - next)
+        l[head] = fma(l[head], carry, p)
+        for column in 0..W:
+            acc[head, column] = fma(p, value[column], acc[head, column] * carry)
+        m[head] = next
+
+fn qwen_gated_attention_k8v4[M, T, KV, G, P, S, R](
+    query_gate: &tensor[M, KV * G * 2 * (2 * P + S)] A,
+    key: &tensor[M, KV * (2 * P + S)] A, value: &tensor[M, KV * (2 * P + S)] A,
+    query_norm: &tensor[2 * P + S] f32, key_norm: &tensor[2 * P + S] f32,
+    rotary_components: &tensor[P] i32, rotary_frequencies: &tensor[P] f32,
+    coordinates: &tensor[M, 4] i32, visible: &tensor[M, R, 2] i32,
+    fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
+    history_key_codes: &mut tensor[T, KV, (2 * P + S) / 4] u32,
+    history_key_coefficients: &mut tensor[T, KV, 2] f16,
+    history_value_codes: &mut tensor[T, KV, (2 * P + S) / 8] u32,
+    history_value_coefficients: &mut tensor[T, KV, 2] f16,
+    epsilon: f32, scale: f32) -> tensor[M, KV * G, 2 * P + S] A:
+    let mut prepared_key = tensor[M, KV, 2 * P + S] A
+    for row in 0..M:
+        for head in 0..KV:
+            prepared_key[row, head] = qwen_norm_rotary(
+                key[row, head * (2 * P + S) : (head + 1) * (2 * P + S)], key_norm,
+                coordinates[row], rotary_components, rotary_frequencies, epsilon)
+    let fresh_value = reshape(value, (M, KV, 2 * P + S))
+    let mut gated = tensor[M, KV * G, 2 * P + S] A
+    let mut decoded_key = tensor[2 * P + S] f32
+    let mut decoded_value = tensor[2 * P + S] f32
+    for column in 0..2 * P + S:
+        decoded_key[column] = 0.0
+        decoded_value[column] = 0.0
+    for row in 0..M:
+        for kv_head in 0..KV:
+            let mut qt = tensor[G, 2 * P + S] A
+            let mut maximum = tensor[G] f32
+            let mut denominator = tensor[G] f32
+            let mut accumulator = tensor[G, 2 * P + S] f32
+            for head in 0..G:
+                let first = (kv_head * G + head) * 2 * (2 * P + S)
+                qt[head] = qwen_norm_rotary(query_gate[row, first : first + (2 * P + S)],
+                    query_norm, coordinates[row], rotary_components, rotary_frequencies,
+                    epsilon)
+                maximum[head] = -inf
+                denominator[head] = 0.0
+                for column in 0..2 * P + S:
+                    accumulator[head, column] = 0.0
+            for span in 0..R:
+                let lo = visible[row, span, 0]
+                let hi = visible[row, span, 1]
+                if lo >= 0 and hi > lo and (2 * P + S) / 8 >= 1 and (2 * P + S) / 4 >= 1:
+                    for token in lo..hi:
+                        affine_decode(history_key_codes[token, kv_head],
+                            history_key_coefficients[token, kv_head], decoded_key)
+                        affine_decode(history_value_codes[token, kv_head],
+                            history_value_coefficients[token, kv_head], decoded_value)
+                        attention_absorb(qt, decoded_key, decoded_value, maximum, denominator,
+                            accumulator, scale)
+            let fresh_lo = fresh[row, 0]
+            let fresh_hi = fresh[row, 1]
+            if fresh_hi > fresh_lo:
+                attention_update(qt, prepared_key[fresh_lo : fresh_hi, kv_head],
+                    fresh_value[fresh_lo : fresh_hi, kv_head], maximum, denominator,
+                    accumulator, scale)
+            for head in 0..G:
+                let gate_first = (kv_head * G + head) * 2 * (2 * P + S) + (2 * P + S)
+                for column in 0..2 * P + S:
+                    let gate = f32(query_gate[row, gate_first + column])
+                    let attended = accumulator[head, column] / max(denominator[head], 1e-30)
+                    gated[row, kv_head * G + head, column] = attended / (1.0 + exp(-gate))
+    for row in 0..M:
+        if destinations[row] >= 0 and (2 * P + S) / 8 >= 1 and (2 * P + S) / 4 >= 1:
+            for head in 0..KV:
+                affine_encode(f32(prepared_key[row, head]),
+                    history_key_codes[destinations[row], head],
+                    history_key_coefficients[destinations[row], head])
+                affine_encode(f32(fresh_value[row, head]),
+                    history_value_codes[destinations[row], head],
+                    history_value_coefficients[destinations[row], head])
+    return gated
+
+
+# Decode rows (M <= 8) over affine K8/V4 history: `qwen_attention_decode`'s
+# partitioning and merge. Scores against history are corrected, not decoded:
+# scale * (q . code) + zero * sum(q); the value product accumulates
+# (p * scale) * code and carries sum(p * zero) through the online softmax as a
+# per-head bias added before the partition state is published. Partition 0
+# appends the row's key and value encoded.
+fn qwen_attention_decode_k8v4[M, T, KV, G, P, S, R](
+    query_gate: &tensor[M, KV * G * 2 * (2 * P + S)] A,
+    key: &tensor[M, KV * (2 * P + S)] A, value: &tensor[M, KV * (2 * P + S)] A,
+    query_norm: &tensor[2 * P + S] f32, key_norm: &tensor[2 * P + S] f32,
+    rotary_components: &tensor[P] i32, rotary_frequencies: &tensor[P] f32,
+    coordinates: &tensor[M, 4] i32, visible: &tensor[M, R, 2] i32,
+    fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
+    history_key_codes: &mut tensor[T, KV, (2 * P + S) / 4] u32,
+    history_key_coefficients: &mut tensor[T, KV, 2] f16,
+    history_value_codes: &mut tensor[T, KV, (2 * P + S) / 8] u32,
+    history_value_coefficients: &mut tensor[T, KV, 2] f16,
+    epsilon: f32, scale: f32) -> tensor[M, KV * G, 2 * P + S] A:
+    return qwen_gated_attention_k8v4[G = G](query_gate, key, value, query_norm, key_norm,
+        rotary_components, rotary_frequencies, coordinates, visible, fresh,
+        destinations, history_key_codes, history_key_coefficients, history_value_codes,
+        history_value_coefficients, epsilon, scale)
+
+# A lane's W / 32 codes must be whole words or a power-of-two part of one, so
+# W is a power of two.
+native qwen_attention_decode_k8v4 for metal from "metal/qwen_attention_decode_k8v4.metal":
+    static (KV, G, P, S)
+    params (arithmetic SPAN in [32, 64, 128, 256], arithmetic PARTS in [16, 8, 32],
+        arithmetic SIMDS in [4, 8])
+    where 2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256
+    scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
+    scratch statistics bytes (M * KV * G * PARTS * 8)
+    launch qwen_attention_decode_k8v4_partial:
+        threadgroups (KV, PARTS, M)
+        threads_per_threadgroup (SIMDS * 32, 1, 1)
+        shared_bytes ((G + SIMDS) * (2 * P + S) * 4 + SIMDS * G * 8)
+    launch qwen_attention_decode_k8v4_merge:
+        threadgroups (KV * G, M, 1)
+        threads_per_threadgroup (2 * P + S, 1, 1)
+
+
+# Prefill rows (M >= 16) over affine K8/V4 history: `qwen_attention_prefill`
+# with the prepare launch appending encoded rows and every history K/V tile
+# decoded (code * scale + zero, rounded to the activation dtype) as it is
+# staged, so the products are unchanged and read 2.6x fewer history bytes.
+fn qwen_attention_prefill_k8v4[M, T, KV, G, P, S, R](
+    query_gate: &tensor[M, KV * G * 2 * (2 * P + S)] A,
+    key: &tensor[M, KV * (2 * P + S)] A, value: &tensor[M, KV * (2 * P + S)] A,
+    query_norm: &tensor[2 * P + S] f32, key_norm: &tensor[2 * P + S] f32,
+    rotary_components: &tensor[P] i32, rotary_frequencies: &tensor[P] f32,
+    coordinates: &tensor[M, 4] i32, visible: &tensor[M, R, 2] i32,
+    fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
+    history_key_codes: &mut tensor[T, KV, (2 * P + S) / 4] u32,
+    history_key_coefficients: &mut tensor[T, KV, 2] f16,
+    history_value_codes: &mut tensor[T, KV, (2 * P + S) / 8] u32,
+    history_value_coefficients: &mut tensor[T, KV, 2] f16,
+    epsilon: f32, scale: f32) -> tensor[M, KV * G, 2 * P + S] A:
+    return qwen_gated_attention_k8v4[G = G](query_gate, key, value, query_norm, key_norm,
+        rotary_components, rotary_frequencies, coordinates, visible, fresh,
+        destinations, history_key_codes, history_key_coefficients, history_value_codes,
+        history_value_coefficients, epsilon, scale)
+
+native qwen_attention_prefill_k8v4 for metal from "metal/qwen_attention_prefill_k8v4.metal":
+    static (KV, G, P, S)
+    params (arithmetic QT in [16, 8], arithmetic SPLIT_GROUPS in [256, 128, 512, 1])
+    where 2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256
+    scratch queries bytes (ceil_div(M, QT) * QT * KV * G * (2 * P + S) * 2)
+    scratch keys bytes (M * KV * (2 * P + S) * 2)
+    scratch values bytes (M * KV * (2 * P + S) * 2)
+    scratch partials bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV)) * M * KV * G * (2 * P + S) * 4)
+    scratch statistics bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV)) * M * KV * G * 8)
+    scratch counts bytes (ceil_div(M, QT) * 4)
+    launch qwen_attention_prefill_k8v4_prepare:
+        threadgroups (ceil_div(ceil_div(M, QT) * QT * KV * (G + 1), 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch qwen_attention_prefill_k8v4_attend:
+        threadgroups (ceil_div(M, QT), KV, max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV)))
+        threads_per_threadgroup (QT * G * 4, 1, 1)
+        shared_bytes (32 * (2 * P + S + 8) * 2 + (R + 1) * 16)
+    launch qwen_attention_prefill_k8v4_merge:
+        threadgroups (ceil_div(M, QT) * min(max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV)) - 1, 1), KV * G, 1)
+        threads_per_threadgroup (2 * P + S, 1, 1)

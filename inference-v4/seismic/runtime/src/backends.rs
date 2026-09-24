@@ -8,7 +8,7 @@
 use crate::api::{
     device::DeviceInner,
     kernel::{
-        DecodedResults, EncodedArgs, EncodedOutputs, EncodedWorkflowArgs, PendingWorkflowResults,
+        DecodedResults, EncodedArgs, EncodedWorkflowArgs, PendingWorkflowResults,
         WorkflowCompletionAny,
     },
     CallError, WorkflowError,
@@ -334,10 +334,14 @@ pub(crate) fn discover() -> BackendDiscovery {
                         continue;
                     }
                 };
+                // An integrated GPU (GB10) allocates from the host RAM pool,
+                // like Apple silicon: it shares the host memory domain and
+                // budget instead of contributing a device pool.
                 let memory = if descriptor.integrated {
-                    DiscoveredMemory::Unsupported {
-                        reason: "integrated CUDA memory reconciliation with host RAM is not qualified"
-                            .into(),
+                    DiscoveredMemory::Host {
+                        max_allocation_bytes: seismic_cuda::max_allocation_bytes(
+                            descriptor.total_memory_bytes,
+                        ),
                     }
                 } else {
                     DiscoveredMemory::Dedicated {
@@ -367,6 +371,14 @@ pub(crate) fn discover() -> BackendDiscovery {
         }
     }
 
+    // `vulkan` is a registered backend name (native declarations may target
+    // it), but no Vulkan runtime is built yet: a request for it is answered
+    // by this diagnostic instead of an empty result.
+    diagnostics.push(DiscoveryDiagnostic {
+        backend: BackendName::Vulkan,
+        message: "this build has no Vulkan runtime".into(),
+    });
+
     BackendDiscovery {
         devices,
         diagnostics,
@@ -378,6 +390,7 @@ pub(crate) fn discover() -> BackendDiscovery {
 pub(crate) fn open(
     info: DeviceInfo,
     memory: Arc<MemoryDomain>,
+    options: crate::artifacts::DeviceOptions,
 ) -> Result<Arc<DeviceInner>, OpenError> {
     let descriptor = info.descriptor.clone();
     let kind = match descriptor.as_ref() {
@@ -436,6 +449,9 @@ pub(crate) fn open(
         info,
         capabilities: std::sync::OnceLock::new(),
         kind,
+        trace: std::sync::Mutex::new(None),
+        artifacts: options.artifacts,
+        native: crate::native::NativeQueue::default(),
     }))
 }
 
@@ -528,8 +544,9 @@ impl OpenedKind {
     }
 
     /// Facts that distinguish performance behavior, for keying per-device
-    /// native tuning. Equal identities denote the same device model and
-    /// configuration; there is no ordering or closeness.
+    /// native tuning, including the toolchain and driver versions. Equal
+    /// identities denote the same device model and configuration; there is
+    /// no ordering or closeness.
     pub(crate) fn tuning_identity(&self) -> String {
         match self {
             Self::Cpu(device) => {
@@ -541,13 +558,23 @@ impl OpenedKind {
                     facts.simd
                 )
             }
+            // The OS build ships the Metal compiler, and the NVRTC release
+            // and driver form and run CUDA code: an update can change which
+            // configuration wins.
             #[cfg(target_os = "macos")]
-            Self::Metal(device) => device.device_description().facts().tuning_material(),
+            Self::Metal(device) => {
+                let facts = device.device_description().facts();
+                format!("{};os {}", facts.tuning_material(), facts.operating_system())
+            }
             Self::Cuda(device) => {
                 let facts = device.device_description().facts();
+                let nvrtc = seismic_cuda::nvrtc::release().map_or_else(
+                    |error| format!("unavailable ({error})"),
+                    |(major, minor)| format!("{major}.{minor}"),
+                );
                 format!(
-                    "cuda;sm {};multiprocessors {}",
-                    facts.compute_capability, facts.multiprocessors
+                    "cuda;sm {};multiprocessors {};driver {};nvrtc {nvrtc}",
+                    facts.compute_capability, facts.multiprocessors, facts.driver_api
                 )
             }
         }
@@ -569,11 +596,18 @@ impl OpenedKind {
                 let _ = seismic_lang::registry::representation_info(representation);
                 true
             }
-            Self::Cuda(device) => device
-                .device_description()
-                .dtypes()
-                .representations
-                .contains(&representation),
+            // Row layouts (`mma16`, the CUDA resident layout) are storage for
+            // direct native kernels only; compiled construction refuses them
+            // through the profile's representation set.
+            Self::Cuda(device) => {
+                seismic_lang::registry::representation_info(representation).layout
+                    != seismic_lang::registry::Layout::Packet
+                    || device
+                        .device_description()
+                        .dtypes()
+                        .representations
+                        .contains(&representation)
+            }
         }
     }
 
@@ -587,6 +621,27 @@ impl OpenedKind {
             #[cfg(target_os = "macos")]
             Self::Metal(device) => device.allocate_storage(bytes, alignment),
             Self::Cuda(device) => device.allocate_storage(bytes, alignment),
+        }
+    }
+
+    /// Storage for inputs the host writes before each submission. Host
+    /// writes to it are plain memory writes that never wait for queued
+    /// device work: CPU and Metal storage is host-visible already, CUDA uses
+    /// mapped pinned host memory.
+    pub(crate) fn allocate_upload(
+        &self,
+        bytes: u64,
+        alignment: u64,
+    ) -> Result<Arc<driver::Allocation>, ExecutionError> {
+        match self {
+            Self::Cpu(device) => device.allocate_storage(bytes, alignment),
+            #[cfg(target_os = "macos")]
+            Self::Metal(device) => device.allocate_storage(bytes, alignment),
+            Self::Cuda(device) => {
+                device.allocate_storage_with(bytes, alignment, |service| {
+                    service.allocate_mapped(bytes)
+                })
+            }
         }
     }
 

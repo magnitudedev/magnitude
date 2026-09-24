@@ -180,17 +180,40 @@ where
         bytes: u64,
         alignment: u64,
     ) -> Result<Arc<Allocation>, ExecutionError> {
+        self.allocate_storage_with(bytes, alignment, |service| service.allocate(bytes, alignment))
+    }
+
+    /// Charge and allocate storage whose buffer `make` forms, for backends
+    /// with more than one kind of memory.
+    pub(crate) fn allocate_storage_with(
+        self: &Arc<Self>,
+        bytes: u64,
+        alignment: u64,
+        make: impl FnOnce(&Service<T, E>) -> Result<Buffer<T, E>, ExecutionError>,
+    ) -> Result<Arc<Allocation>, ExecutionError> {
         let mut reservation = self.memory.reserve(bytes).map_err(|capacity| {
             ExecutionError::AllocationCapacity { required: capacity.required.into(), available: capacity.available }
         })?;
-        self.allocate_reserved(bytes, alignment, &mut reservation)
+        self.allocate_reserved_with(bytes, alignment, &mut reservation, make)
     }
 
-    fn allocate_reserved(
+    pub(crate) fn allocate_reserved(
         self: &Arc<Self>,
         bytes: u64,
         alignment: u64,
         reservation: &mut MemoryReservation,
+    ) -> Result<Arc<Allocation>, ExecutionError> {
+        self.allocate_reserved_with(bytes, alignment, reservation, |service| {
+            service.allocate(bytes, alignment)
+        })
+    }
+
+    fn allocate_reserved_with(
+        self: &Arc<Self>,
+        bytes: u64,
+        alignment: u64,
+        reservation: &mut MemoryReservation,
+        make: impl FnOnce(&Service<T, E>) -> Result<Buffer<T, E>, ExecutionError>,
     ) -> Result<Arc<Allocation>, ExecutionError> {
         let limits = self.device_description().limits();
         let natural_max = if limits.max_index_bits >= 64 { u64::MAX } else { (1u64 << limits.max_index_bits) - 1 };
@@ -202,7 +225,7 @@ where
             return Err(ExecutionError::ConstructionContradiction(format!(
                 "allocation alignment {alignment} exceeds target contract {}", limits.max_allocation_alignment)));
         }
-        let buffer = self.service.allocate(bytes, alignment)?;
+        let buffer = make(&self.service)?;
         Ok(Allocation::new(
             fresh_allocation_identity(),
             bytes,
@@ -268,10 +291,13 @@ pub(crate) struct Allocation {
 struct AllocationAccess {
     readers: u64,
     writer: bool,
-    /// Submitted device work that reads (`false`) or writes (`true`) this
-    /// allocation and may still be executing. Device work on one queue is
-    /// ordered by the queue; these fences only order host access against it.
-    device: Vec<(Arc<dyn DeviceCompletion>, bool)>,
+    /// The newest submitted device work that uses this allocation, and the
+    /// newest that writes it, until they complete. An allocation belongs to
+    /// one device, whose native submissions all run on its one queue in
+    /// submission order, so the newest fence of a kind completes after every
+    /// earlier one: it is the only one host access must wait for.
+    last_use: Option<Arc<dyn DeviceCompletion>>,
+    last_write: Option<Arc<dyn DeviceCompletion>>,
 }
 
 /// Completion of submitted device work, as allocation fences observe it.
@@ -284,16 +310,26 @@ pub(crate) trait DeviceCompletion: Send + Sync {
 }
 
 impl AllocationAccess {
+    /// Forget completed fences. The newest use completes last, so once it
+    /// has, no device work uses the allocation.
     fn prune(&mut self) {
-        self.device.retain(|(completion, _)| !completion.is_complete());
+        if self.last_write.as_ref().is_some_and(|fence| fence.is_complete()) {
+            self.last_write = None;
+        }
+        if self.last_use.as_ref().is_some_and(|fence| fence.is_complete()) {
+            self.last_use = None;
+            self.last_write = None;
+        }
     }
-    /// A device fence that host access of the given kind must wait for.
+    /// The device fence host access of the given kind must wait for: a host
+    /// write waits for every device use, a host read for device writes.
     fn conflicting_device(&mut self, write: bool) -> Option<Arc<dyn DeviceCompletion>> {
         self.prune();
-        self.device
-            .iter()
-            .find(|(_, device_write)| write || *device_write)
-            .map(|(completion, _)| completion.clone())
+        if write {
+            self.last_use.clone()
+        } else {
+            self.last_write.clone()
+        }
     }
 }
 
@@ -370,13 +406,17 @@ impl Allocation {
     }
 
     /// Record submitted device work so later host access orders after it.
+    /// Called in submission order: `completion` completes after every fence
+    /// recorded before it.
     pub(crate) fn record_device_use(&self, completion: Arc<dyn DeviceCompletion>, write: bool) {
         let mut state = self
             .access
             .lock()
             .expect("tensor allocation access lock poisoned");
-        state.prune();
-        state.device.push((completion, write));
+        if write {
+            state.last_write = Some(completion.clone());
+        }
+        state.last_use = Some(completion);
     }
 
     /// No submitted device work still uses this allocation.
@@ -386,7 +426,7 @@ impl Allocation {
             .lock()
             .expect("tensor allocation access lock poisoned");
         state.prune();
-        state.device.is_empty()
+        state.last_use.is_none()
     }
 
     fn grant(
@@ -431,8 +471,8 @@ impl Drop for Allocation {
             .access
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (completion, _) in state.device.drain(..) {
-            completion.wait_complete();
+        if let Some(fence) = state.last_use.take() {
+            fence.wait_complete();
         }
     }
 }
@@ -480,10 +520,10 @@ impl Drop for AllocationPermit {
     }
 }
 
-pub(crate) fn typed_buffer<T: TargetFamily, E: NativeExecutor<T>>(allocation: &Allocation) -> Buffer<T, E> {
-    allocation.storage.as_any().downcast_ref::<TypedStorage<T, E>>()
+pub(crate) fn typed_buffer<T: TargetFamily, E: NativeExecutor<T>>(allocation: &Allocation) -> &Buffer<T, E> {
+    &allocation.storage.as_any().downcast_ref::<TypedStorage<T, E>>()
         .unwrap_or_else(|| panic!("Tensor allocation backend invariant violated after successful WrongDevice validation"))
-        .buffer.clone()
+        .buffer
 }
 
 pub(crate) fn write_zeros(storage: &dyn Storage, byte_len: u64) -> Result<(), ExecutionError> {
@@ -813,7 +853,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> seismic_compiler::executable::Execut
         self.owner.check_reached_capacity(bytes)?;
         let backing = self.device.allocate_storage(bytes, alignment.max(planned_alignment))?;
         let permit = backing.try_acquire(true).expect("fresh private backing cannot have an access owner");
-        let buffer = RuntimeBuffer { tensor: None, buffer: typed_buffer::<T, E>(&backing), base_offset: 0, accessible_bytes: bytes };
+        let buffer = RuntimeBuffer { tensor: None, buffer: typed_buffer::<T, E>(&backing).clone(), base_offset: 0, accessible_bytes: bytes };
         self.owner.install_private(slot, permit);
         self.buffers[index] = Some(buffer);
         Ok(())
@@ -908,12 +948,12 @@ impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedCommand<T, E> {
                 let allocation = resources.allocation(*allocation);
                 assert!(base_offset.checked_add(*accessible_bytes).is_some_and(|end| end <= allocation.bytes()),
                     "staged binding exceeds its admitted physical slot");
-                Some(RuntimeBuffer { tensor: tensor.clone(), buffer: typed_buffer::<T, E>(allocation), base_offset: *base_offset, accessible_bytes: *accessible_bytes })
+                Some(RuntimeBuffer { tensor: tensor.clone(), buffer: typed_buffer::<T, E>(allocation).clone(), base_offset: *base_offset, accessible_bytes: *accessible_bytes })
             }
             PhysicalBufferBinding::Reached { slot, .. } => {
                 resources.declare_private(*slot);
                 resources.private_backing(*slot).map(|allocation| RuntimeBuffer {
-                    tensor: None, buffer: typed_buffer::<T, E>(allocation), base_offset: 0, accessible_bytes: allocation.bytes(),
+                    tensor: None, buffer: typed_buffer::<T, E>(allocation).clone(), base_offset: 0, accessible_bytes: allocation.bytes(),
                 })
             }
         }).collect();
@@ -950,13 +990,6 @@ impl<T: TargetFamily, E: NativeExecutor<T>> PreparedHandle<T, E> {
         telemetry::record_call(span.elapsed_ms(), allocated_bytes, &attributes);
         Ok(results)
     }
-}
-
-fn acquire_access(access: &[(Arc<Allocation>, bool)]) -> Vec<AllocationPermit> {
-    access
-        .iter()
-        .map(|(allocation, write)| allocation.acquire(*write))
-        .collect()
 }
 
 /// Access collection for the deliberately separate authored-native route.

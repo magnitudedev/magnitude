@@ -541,7 +541,7 @@ mod tests {
             } else {
                 let OperationCost::Demands(cost) = cost.unwrap() else { panic!("matrix work cannot be elided") };
                 let matrix = cost.iter().find(|d| d.class == MetalService::Matrix).unwrap();
-                assert_eq!(arena.eval_nat(matrix.units, &Assignment::new()).unwrap(), 4);
+                assert_eq!(arena.eval_nat_u64(matrix.units, &Assignment::new()).unwrap(), 4);
             }
         }
     }

@@ -10,6 +10,8 @@ mod source_check_tests {
     #[test]
     fn slice_axes_retain_checked_omission_premises_in_their_source_scope() {
         use crate::entry::{SliceAxis, ViewTransform};
+        // Every slice of the first source is proved in its loop scope, so no
+        // axis carries a runtime check; the second source proves nothing.
         for (source, expects_omission) in [
             ("fn run[N](dst: &mut tensor[N] f32):\n    for i in 0..N:\n        dst[i:i+1] = zeros_like(dst[i:i+1])\n", true),
             ("fn run(dst: &tensor[4] f32, lo: i32, hi: i32):\n    let view = dst[lo:hi]\n", false),
@@ -39,7 +41,10 @@ mod source_check_tests {
                 }
             }
             assert_eq!(omitted, expects_omission, "{source}");
-            assert!(checked, "runtime slice checks must remain attached to their actual operands");
+            assert_eq!(
+                checked, !expects_omission,
+                "runtime slice checks must remain attached to their actual operands: {source}"
+            );
         }
     }
 
@@ -1263,7 +1268,6 @@ fn instantiate_function(
 }
 
 struct RegionWork {
-    id: RegionId,
     kind: RegionKind,
     parameters: Vec<SemanticValueId>,
     results: Vec<SemanticValueId>,
@@ -1523,7 +1527,6 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             u32::try_from(self.regions.len()).expect("function has more than u32::MAX regions"),
         );
         self.regions.push(Some(RegionWork {
-            id,
             kind,
             parameters: Vec::new(),
             results: Vec::new(),
@@ -3329,7 +3332,8 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                     let source_info = crate::registry::representation_info(source.representation);
                     let permitted = match &source_info.kind {
                         crate::registry::RepresentationKind::Dense(from) => from.is_numeric() && dtype.is_numeric(),
-                        crate::registry::RepresentationKind::Packed(_) => *dtype == DType::F32
+                        crate::registry::RepresentationKind::Packed(_)
+                        | crate::registry::RepresentationKind::PackedRows(_) => *dtype == DType::F32
                             && crate::registry::decode_recipe(source.representation, *dtype).is_some(),
                         crate::registry::RepresentationKind::External(_) => false,
                     };
@@ -3397,8 +3401,10 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         match primitive {
             PrimitiveId::ElementRead { checks } => {
                 let base = inputs[0];
-                for axis in 0..checks.len() {
-                    self.emit_point_check(region, base, axis, inputs[axis + 1], expression.span);
+                for (axis, check) in checks.iter().enumerate() {
+                    if *check {
+                        self.emit_point_check(region, base, axis, inputs[axis + 1], expression.span);
+                    }
                 }
             }
             PrimitiveId::SliceView { indices } => {
@@ -3406,19 +3412,29 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 let mut operand = 1;
                 for (axis, slot) in indices.iter().enumerate() {
                     match slot {
-                        crate::intrinsics::IndexSlot::Point { .. } => {
-                            self.emit_point_check(
-                                region,
-                                base,
-                                axis,
-                                inputs[operand],
-                                expression.span,
-                            );
+                        crate::intrinsics::IndexSlot::Point { check } => {
+                            if *check {
+                                self.emit_point_check(
+                                    region,
+                                    base,
+                                    axis,
+                                    inputs[operand],
+                                    expression.span,
+                                );
+                            }
                             operand += 1;
                         }
                         // The whole axis: no operands and no checks.
                         crate::intrinsics::IndexSlot::Full => {}
-                        crate::intrinsics::IndexSlot::Range { start, end, .. } => {
+                        crate::intrinsics::IndexSlot::Range {
+                            start,
+                            end,
+                            check_start,
+                            check_order,
+                            check_end,
+                            // L24 width checks are not emitted yet.
+                            check_width: _,
+                        } => {
                             let start_value = if *start {
                                 let value = inputs[operand];
                                 operand += 1;
@@ -3439,7 +3455,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                                 axis,
                                 start_value,
                                 end_value,
-                                (*start, *start || *end, *end),
+                                (*check_start, *check_order, *check_end),
                                 expression.span,
                             );
                         }
@@ -3496,14 +3512,21 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 let mut axes = Vec::with_capacity(indices.len());
                 for index in indices {
                     match index {
-                        crate::intrinsics::IndexSlot::Point { .. } => axes.push(SliceAxis::Point {
+                        crate::intrinsics::IndexSlot::Point { check } => axes.push(SliceAxis::Point {
                             value: ScalarRef::Value(
                                 scalars.next().expect("checked slice omitted point operand"),
                             ),
-                            runtime_check: true,
+                            runtime_check: *check,
                         }),
                         crate::intrinsics::IndexSlot::Full => axes.push(SliceAxis::Full),
-                        crate::intrinsics::IndexSlot::Range { start, end, .. } => {
+                        crate::intrinsics::IndexSlot::Range {
+                            start,
+                            end,
+                            check_start,
+                            check_order,
+                            check_end,
+                            check_width: _,
+                        } => {
                             let start = start.then(|| {
                                 ScalarRef::Value(
                                     scalars.next().expect("checked slice omitted range start"),
@@ -3518,9 +3541,9 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                                 axes.push(SliceAxis::Full);
                             } else {
                                 axes.push(SliceAxis::Range {
-                                    check_start: start.is_some(),
-                                    check_order: start.is_some() || end.is_some(),
-                                    check_end: end.is_some(),
+                                    check_start: *check_start,
+                                    check_order: *check_order,
+                                    check_end: *check_end,
                                     start,
                                     end,
                                 });

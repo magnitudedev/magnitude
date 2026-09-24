@@ -3,6 +3,8 @@ node_modules
 inference/target/
 inference/**/target/
 inference/dist/
+# Per-agent Cargo target directories and scratch source mirrors.
+/.agent-targets/
 # Optional workspace-local model cache; the default cache is under inference/target/.
 inference/.parity-models/
 # Parity evidence uses unique, immutable run directories and is never source.

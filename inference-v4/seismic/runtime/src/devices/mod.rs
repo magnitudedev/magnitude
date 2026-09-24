@@ -328,7 +328,12 @@ impl std::error::Error for DiscoveryError {}
 pub enum OpenError {
     /// The identifier belongs to an earlier topology revision.
     Stale(DeviceId),
-    NoDevice(BackendName),
+    /// No device of `backend` was discovered; `diagnostics` are that
+    /// backend's discovery diagnostics (why it has none, when it said).
+    NoDevice {
+        backend: BackendName,
+        diagnostics: Vec<String>,
+    },
     Unavailable {
         selector: DeviceSelector,
         reason: String,
@@ -337,13 +342,24 @@ pub enum OpenError {
     /// identity.
     IdentityChanged(DeviceSelector),
     Backend(TargetError),
+    /// The device is already open with a different artifact store.
+    ArtifactStoreConflict(DeviceSelector),
 }
 
 impl fmt::Display for OpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Stale(id) => write!(f, "device id {id:?} belongs to an earlier topology revision"),
-            Self::NoDevice(backend) => write!(f, "no {} device was discovered", backend.as_str()),
+            Self::NoDevice {
+                backend,
+                diagnostics,
+            } => {
+                write!(f, "no {} device was discovered", backend.as_str())?;
+                if !diagnostics.is_empty() {
+                    write!(f, ": {}", diagnostics.join("; "))?;
+                }
+                Ok(())
+            }
             Self::Unavailable { selector, reason } => {
                 write!(f, "device {selector} is unavailable: {reason}")
             }
@@ -351,6 +367,9 @@ impl fmt::Display for OpenError {
                 write!(f, "device {selector} changed identity since discovery")
             }
             Self::Backend(error) => write!(f, "{error}"),
+            Self::ArtifactStoreConflict(selector) => {
+                write!(f, "device {selector} is already open with a different artifact store")
+            }
         }
     }
 }

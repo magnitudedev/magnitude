@@ -2,11 +2,16 @@ use super::super::*;
 use super::*;
 
 impl<'a> QualificationView<'a> {
-    pub(super) fn qualify_shape_rows(&self, device: &Device) -> Result<(), CatalogError> {
-        let logits = [-1.0_f32, 0.0, 1.0, 2.0];
+    pub(super) fn qualify_shape_rows(&self, device: &Device) -> Result<(), CatalogFailure> {
+        // One vocabulary row at unit temperature without cuts or penalties:
+        // shaping is the identity.
+        let vocabulary = self.geometry.vocabulary;
+        let values = (0..vocabulary)
+            .map(|token| (token % 4) as f32 - 1.0)
+            .collect::<Vec<_>>();
         let params = [1.0_f32, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0];
         let history = [-1_i32; 64];
-        let logits = tensor_f32(device, &[1, 4], &logits, "shape_rows", "fixed")?;
+        let logits = tensor_f32(device, &[1, vocabulary], &values, "shape_rows", "fixed")?;
         let params = tensor_f32(device, &[1, 8], &params, "shape_rows", "fixed")?;
         let history_bytes = history
             .iter()
@@ -14,7 +19,7 @@ impl<'a> QualificationView<'a> {
             .collect::<Vec<_>>();
         let history = Tensor::from_host(device, Element::i32(), &[1, 64], &history_bytes)
             .map_err(|error| qualification("shape_rows", "fixed", error))?;
-        let mut out = Tensor::zeros(device, Element::f32(), &[1, 4])
+        let mut out = Tensor::zeros(device, Element::f32(), &[1, vocabulary])
             .map_err(|error| qualification("shape_rows", "fixed", error))?;
         self.programs
             .target
@@ -29,7 +34,7 @@ impl<'a> QualificationView<'a> {
         let output = out
             .read_to_host()
             .map_err(|error| qualification("shape_rows", "fixed", error))?;
-        let expected = [-1.0_f32, 0.0, 1.0, 2.0]
+        let expected = values
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
@@ -43,13 +48,31 @@ impl<'a> QualificationView<'a> {
         Ok(())
     }
 
-    pub(super) fn qualify_sample_rows(&self, device: &Device) -> Result<(), CatalogError> {
-        let logits = tensor_f32(device, &[1, 2], &[1.0, 2.0], "sample_rows", "fixed")?;
-        let mask = Tensor::from_host(device, Element::u32(), &[1, 1], &3_u32.to_le_bytes())
+    pub(super) fn qualify_sample_rows(&self, device: &Device) -> Result<(), CatalogFailure> {
+        // Logits ascend with the token. Row 0 is unconstrained (its empty
+        // mask is ignored) and selects the last token; row 1 admits only
+        // token 0.
+        let vocabulary = self.geometry.vocabulary;
+        let words = vocabulary.div_ceil(32);
+        let values = (0..2 * vocabulary)
+            .map(|index| (index % vocabulary) as f32)
+            .collect::<Vec<_>>();
+        let logits = tensor_f32(device, &[2, vocabulary], &values, "sample_rows", "fixed")?;
+        let mask_words = (0..2 * words)
+            .map(|index| u32::from(index == words))
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        let mask = Tensor::from_host(device, Element::u32(), &[2, words], &mask_words)
             .map_err(|error| qualification("sample_rows", "fixed", error))?;
-        let draws = Tensor::zeros(device, Element::u32(), &[1, 6])
+        let flags = [0_i32, 1_i32]
+            .iter()
+            .flat_map(|flag| flag.to_le_bytes())
+            .collect::<Vec<_>>();
+        let constrained = Tensor::from_host(device, Element::i32(), &[2], &flags)
             .map_err(|error| qualification("sample_rows", "fixed", error))?;
-        let mut result = Tensor::zeros(device, Element::i32(), &[1, 2])
+        let draws = Tensor::zeros(device, Element::u32(), &[2, 6])
+            .map_err(|error| qualification("sample_rows", "fixed", error))?;
+        let mut result = Tensor::zeros(device, Element::i32(), &[2, 2])
             .map_err(|error| qualification("sample_rows", "fixed", error))?;
         self.programs
             .target
@@ -57,14 +80,21 @@ impl<'a> QualificationView<'a> {
             .call(sample_rows::Args {
                 logits: &logits,
                 mask: &mask,
+                constrained: &constrained,
                 draws: &draws,
                 result: &mut result,
             })
             .map_err(|error| qualification("sample_rows", "fixed", error))?;
+        let last = i32::try_from(vocabulary - 1)
+            .map_err(|error| qualification("sample_rows", "fixed", error))?;
+        let expected = [last, 0, 0, 0]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
         if result
             .read_to_host()
             .map_err(|error| qualification("sample_rows", "fixed", error))?
-            != [1_i32.to_le_bytes(), 0_i32.to_le_bytes()].concat()
+            != expected
         {
             return Err(qualification(
                 "sample_rows",
@@ -75,7 +105,7 @@ impl<'a> QualificationView<'a> {
         Ok(())
     }
 
-    pub(super) fn qualify_conditioning_overlay(&self, device: &Device) -> Result<(), CatalogError> {
+    pub(super) fn qualify_conditioning_overlay(&self, device: &Device) -> Result<(), CatalogFailure> {
         let input = tensor_f32(
             device,
             &[1, 2],
@@ -109,51 +139,12 @@ impl<'a> QualificationView<'a> {
         Ok(())
     }
 
-    pub(super) fn qualify_gather_rows(&self, device: &Device) -> Result<(), CatalogError> {
-        let source = tensor_f32(
-            device,
-            &[3, 2],
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            "gather_rows",
-            "fixed",
-        )?;
-        let rows = Tensor::from_host(
-            device,
-            Element::i32(),
-            &[2],
-            &[2_i32.to_le_bytes(), 0_i32.to_le_bytes()].concat(),
-        )
-        .map_err(|error| qualification("gather_rows", "fixed", error))?;
-        let output = self
-            .programs
-            .state
-            .gather
-            .as_ref()
-            .expect("attested gather slot")
-            .call(gather_rows::Args {
-                source: &source,
-                rows: &rows,
-            })
-            .map_err(|error| qualification("gather_rows", "fixed", error))?
-            .value
-            .read_to_host()
-            .map_err(|error| qualification("gather_rows", "fixed", error))?;
-        let expected = [5.0_f32, 6.0, 1.0, 2.0]
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>();
-        if output != expected {
-            return Err(qualification("gather_rows", "fixed", "row order mismatch"));
-        }
-        Ok(())
-    }
-
     pub(super) fn qualify_copy_rows(
         &self,
         device: &Device,
         element: Element,
         binding: &'static str,
-    ) -> Result<(), CatalogError> {
+    ) -> Result<(), CatalogFailure> {
         let width = element.dtype().expect("dense qualified binding").bytes() as usize;
         let source = (0..4 * width).map(|byte| byte as u8).collect::<Vec<_>>();
         let sentinel = vec![0xff; 4 * width];

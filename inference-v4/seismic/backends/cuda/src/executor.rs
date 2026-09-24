@@ -2,7 +2,7 @@
 
 use crate::buffer::Buffer;
 use crate::command::{CompiledKernel, LaunchFrame};
-use crate::driver::{Allocation, Context, Driver, DriverError, PinnedUpload, Stream};
+use crate::driver::{Allocation, Context, Driver, DriverError, HostMapped, PinnedUpload, Stream};
 use crate::{Cuda, CudaLaunchMode};
 use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::executable::{
@@ -12,7 +12,7 @@ use seismic_compiler::executable::{
 };
 use seismic_ir::schedule::{AnyScalarSlot, FillValue};
 use seismic_ir::target::KernelAbiAllocationRole;
-use seismic_lang::expr::compiled::{Compiled, InvocationValues};
+use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::SymbolValue;
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -69,6 +69,18 @@ impl Device {
     pub(crate) fn stream(&self) -> &Arc<Stream> {
         &self.stream
     }
+
+    /// Pinned host memory mapped into the device address space, for inputs
+    /// the host fills before each submission: the host writes it in place,
+    /// without a driver copy that would wait for queued device work.
+    pub fn allocate_mapped(&self, bytes: u64) -> Result<Buffer, ExecutionError> {
+        let bytes = usize::try_from(bytes).map_err(|_| {
+            ExecutionError::AllocationFailed("CUDA allocation exceeds host address space".into())
+        })?;
+        HostMapped::new(&self.context, bytes)
+            .map(Buffer::mapped)
+            .map_err(allocation_error)
+    }
 }
 
 impl DeviceService<Cuda> for Device {
@@ -81,24 +93,18 @@ impl DeviceService<Cuda> for Device {
             ExecutionError::AllocationFailed("CUDA allocation exceeds host address space".into())
         })?;
         Allocation::new(&self.context, bytes)
-            .map(Buffer::new)
+            .map(Buffer::device)
             .map_err(allocation_error)
     }
     fn write(&self, buffer: &Buffer, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
         let offset = usize::try_from(offset)
             .unwrap_or_else(|_| panic!("prepared CUDA upload offset exceeds usize"));
-        buffer
-            .allocation
-            .upload_at(offset, bytes)
-            .map_err(submission_error)
+        buffer.upload_at(offset, bytes).map_err(submission_error)
     }
     fn read(&self, buffer: &Buffer, offset: u64, into: &mut [u8]) -> Result<(), ExecutionError> {
         let offset = usize::try_from(offset)
             .unwrap_or_else(|_| panic!("prepared CUDA download offset exceeds usize"));
-        buffer
-            .allocation
-            .download_at(offset, into)
-            .map_err(submission_error)
+        buffer.download_at(offset, into).map_err(submission_error)
     }
     fn buffer_len(&self, buffer: &Buffer) -> u64 {
         buffer.len()
@@ -374,7 +380,6 @@ impl Submission {
             let mut result_words = vec![0u8; result_slots.len() * 8];
             results
                 .buffer
-                .allocation
                 .download_at(abi_offset(results), &mut result_words)
                 .map_err(synchronization_error)?;
             for (index, slot) in result_slots.iter().enumerate() {
@@ -523,7 +528,6 @@ impl Submission {
             .unwrap_or_else(|| panic!("prepared CUDA scalar-read offset overflows"));
         source
             .buffer
-            .allocation
             .download_at(
                 usize::try_from(absolute)
                     .unwrap_or_else(|_| panic!("prepared CUDA scalar-read offset exceeds usize")),

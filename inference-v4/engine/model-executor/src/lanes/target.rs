@@ -119,6 +119,11 @@ impl TargetLaunchInputs {
             if i32::try_from(binding.previous_bank).ok() != Some(slot.bank()) {
                 return Err(invalid(format!("slot {index} uses another recurrent bank")));
             }
+            if i32::try_from(binding.following_bank).ok() != Some(slot.following_bank()) {
+                return Err(invalid(format!(
+                    "slot {index} publishes to another recurrent successor bank"
+                )));
+            }
             if !binding.destinations.is_empty()
                 && binding.destinations.len() != slot.destinations().len()
             {
@@ -278,13 +283,32 @@ impl ValidatedTargetLaunch {
         )
     }
 
-    pub(crate) fn into_submission_parts(self) -> TargetLaunchCore {
-        self.core
+    /// The reconciliation payload and the device leases the submitted work
+    /// uses; the leases stay held until the submission is finished.
+    pub(crate) fn into_submission_parts(self) -> (TargetLaunchCore, TargetLaunchWorkspace) {
+        (
+            self.core,
+            TargetLaunchWorkspace {
+                _graph_workspace: self.graph_workspace,
+                _graph_outputs: self.graph_outputs,
+                _readout_workspace: self.readout_workspace,
+                _readout_output: self.readout_output,
+            },
+        )
     }
 }
 
-/// Reconciliation payload retained by a submission after its workspace has
-/// returned to the pool. It is unavailable before physical finish.
+/// Device leases of a submitted target launch. Dropping it returns them to
+/// their pools, so it is dropped only after the launch's work completed.
+pub struct TargetLaunchWorkspace {
+    _graph_workspace: TargetGraphWorkspaceLease,
+    _graph_outputs: [TargetGraphOutputLease; 2],
+    _readout_workspace: NativeGraphWorkspaceLease,
+    _readout_output: Option<NativeGraphOutputLease>,
+}
+
+/// Reconciliation payload retained by a submission. It is unavailable before
+/// physical finish.
 pub struct TargetLaunchCore {
     batch: ValidatedTargetBatch,
     advances: Vec<OwnedStateAdvance>,

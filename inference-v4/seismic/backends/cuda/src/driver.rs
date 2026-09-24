@@ -97,6 +97,8 @@ driver! {
     free: unsafe extern "system" fn(u64) -> ResultCode => "cuMemFree_v2",
     allocate_host: unsafe extern "system" fn(*mut *mut c_void, usize) -> ResultCode => "cuMemAllocHost_v2",
     free_host: unsafe extern "system" fn(*mut c_void) -> ResultCode => "cuMemFreeHost",
+    host_alloc: unsafe extern "system" fn(*mut *mut c_void, usize, c_uint) -> ResultCode => "cuMemHostAlloc",
+    host_device_pointer: unsafe extern "system" fn(*mut u64, *mut c_void, c_uint) -> ResultCode => "cuMemHostGetDevicePointer_v2",
     upload: unsafe extern "system" fn(u64, *const c_void, usize) -> ResultCode => "cuMemcpyHtoD_v2",
     upload_async: unsafe extern "system" fn(u64, *const c_void, usize, Handle) -> ResultCode => "cuMemcpyHtoDAsync_v2",
     download: unsafe extern "system" fn(*mut c_void, u64, usize) -> ResultCode => "cuMemcpyDtoH_v2",
@@ -121,6 +123,13 @@ driver! {
         // Driver API 11.4+: identifies the exposed device, including a MIG
         // partition, rather than its parent GPU.
         device_uuid_v2: unsafe extern "system" fn(*mut [u8; 16], c_int) -> ResultCode => "cuDeviceGetUuid_v2",
+        // Driver API 12.0+: explicitly built kernel graphs (direct-native replay).
+        graph_create: unsafe extern "system" fn(*mut Handle, c_uint) -> ResultCode => "cuGraphCreate",
+        graph_add_kernel_node: unsafe extern "system" fn(*mut Handle, Handle, *const Handle, usize, *const KernelNodeParams) -> ResultCode => "cuGraphAddKernelNode_v2",
+        graph_instantiate: unsafe extern "system" fn(*mut Handle, Handle, u64) -> ResultCode => "cuGraphInstantiateWithFlags",
+        graph_launch: unsafe extern "system" fn(Handle, Handle) -> ResultCode => "cuGraphLaunch",
+        graph_exec_destroy: unsafe extern "system" fn(Handle) -> ResultCode => "cuGraphExecDestroy",
+        graph_destroy: unsafe extern "system" fn(Handle) -> ResultCode => "cuGraphDestroy",
     }
 }
 
@@ -191,11 +200,6 @@ impl DriverError {
             self.code,
             4 | 46 | 214 | 700 | 702 | 710 | 714 | 715 | 716 | 717 | 718 | 719
         )
-    }
-
-    /// `CUDA_ERROR_OUT_OF_MEMORY`.
-    pub fn is_out_of_memory(&self) -> bool {
-        self.code == 2
     }
 }
 
@@ -505,6 +509,221 @@ impl Allocation {
                 ),
                 "download",
             )
+        }
+    }
+}
+
+/// `CUDA_KERNEL_NODE_PARAMS_v2`.
+#[repr(C)]
+pub(crate) struct KernelNodeParams {
+    pub function: Handle,
+    pub grid: [c_uint; 3],
+    pub block: [c_uint; 3],
+    pub shared_bytes: c_uint,
+    pub parameters: *mut *mut c_void,
+    pub extra: *mut *mut c_void,
+    pub kernel: Handle,
+    pub context: Handle,
+}
+
+fn graph_symbol<F: Copy>(symbol: Option<F>) -> Result<F, DriverError> {
+    symbol.ok_or(DriverError {
+        operation: "kernel graph",
+        code: 0,
+        description: "the CUDA driver predates driver API 12.0 kernel graphs".into(),
+    })
+}
+
+/// A kernel graph under construction: kernel nodes, each depending on the
+/// previous one, so it executes in stream order.
+pub(crate) struct Graph {
+    raw: Handle,
+    last: Option<Handle>,
+    context: Arc<Context>,
+}
+
+impl Graph {
+    pub fn new(context: &Arc<Context>) -> Result<Self, DriverError> {
+        let create = graph_symbol(context.driver.graph_create)?;
+        let _current = context.enter()?;
+        let mut raw = std::ptr::null_mut();
+        unsafe {
+            context
+                .driver
+                .check(create(&mut raw, 0), "kernel graph creation")?;
+        }
+        Ok(Self {
+            raw,
+            last: None,
+            context: context.clone(),
+        })
+    }
+
+    /// Append a kernel node after every node added before it. The driver
+    /// copies the parameter values the node's `parameters` point to.
+    pub fn push_kernel(&mut self, node: &KernelNodeParams) -> Result<(), DriverError> {
+        let add = graph_symbol(self.context.driver.graph_add_kernel_node)?;
+        let _current = self.context.enter()?;
+        let mut raw = std::ptr::null_mut();
+        let dependencies = self.last.as_slice();
+        unsafe {
+            self.context.driver.check(
+                add(
+                    &mut raw,
+                    self.raw,
+                    dependencies.as_ptr(),
+                    dependencies.len(),
+                    node,
+                ),
+                "kernel graph node",
+            )?;
+        }
+        self.last = Some(raw);
+        Ok(())
+    }
+
+    pub fn instantiate(self) -> Result<GraphExec, DriverError> {
+        let instantiate = graph_symbol(self.context.driver.graph_instantiate)?;
+        let _current = self.context.enter()?;
+        let mut raw = std::ptr::null_mut();
+        unsafe {
+            self.context.driver.check(
+                instantiate(&mut raw, self.raw, 0),
+                "kernel graph instantiation",
+            )?;
+        }
+        Ok(GraphExec {
+            raw,
+            context: self.context.clone(),
+        })
+    }
+}
+
+impl Drop for Graph {
+    fn drop(&mut self) {
+        if let (Some(destroy), Ok(_current)) = (self.context.driver.graph_destroy, self.context.enter()) {
+            unsafe {
+                destroy(self.raw);
+            }
+        }
+    }
+}
+
+/// An instantiated kernel graph. Launches of it already queued complete
+/// even if it is destroyed.
+pub(crate) struct GraphExec {
+    raw: Handle,
+    context: Arc<Context>,
+}
+
+// Graph executables are driver objects usable from any thread with their
+// context current; launches of one are serialized by the owner.
+unsafe impl Send for GraphExec {}
+unsafe impl Sync for GraphExec {}
+
+impl GraphExec {
+    pub fn launch(&self, stream: &Stream) -> Result<(), DriverError> {
+        let launch = graph_symbol(self.context.driver.graph_launch)?;
+        let _current = self.context.enter()?;
+        unsafe {
+            self.context
+                .driver
+                .check(launch(self.raw, stream.raw()), "kernel graph launch")
+        }
+    }
+}
+
+impl Drop for GraphExec {
+    fn drop(&mut self) {
+        if let (Some(destroy), Ok(_current)) =
+            (self.context.driver.graph_exec_destroy, self.context.enter())
+        {
+            unsafe {
+                destroy(self.raw);
+            }
+        }
+    }
+}
+
+/// Pinned host memory mapped into the device address space. The host writes
+/// and reads it directly; kernels address it through `device`. A host write
+/// made before a launch is visible to that launch, so filling it needs no
+/// driver call and never waits for the device stream.
+pub(crate) struct HostMapped {
+    host: *mut u8,
+    pub device: u64,
+    pub bytes: usize,
+    context: Arc<Context>,
+}
+
+// The CUDA driver owns the pinned allocation; host access is plain memory
+// access, and the owner serializes host access against device use.
+unsafe impl Send for HostMapped {}
+unsafe impl Sync for HostMapped {}
+
+impl HostMapped {
+    pub fn new(context: &Arc<Context>, bytes: usize) -> Result<Self, DriverError> {
+        // CU_MEMHOSTALLOC_DEVICEMAP
+        const DEVICE_MAP: c_uint = 2;
+        let _current = context.enter()?;
+        let mut host = std::ptr::null_mut();
+        unsafe {
+            context.driver.check(
+                (context.driver.host_alloc)(&mut host, bytes.max(1), DEVICE_MAP),
+                "mapped host allocation",
+            )?;
+            // Owned from here, so a failed mapping query frees it.
+            let mut mapped = Self {
+                host: host.cast(),
+                device: 0,
+                bytes,
+                context: context.clone(),
+            };
+            context.driver.check(
+                (context.driver.host_device_pointer)(&mut mapped.device, host, 0),
+                "mapped host device pointer",
+            )?;
+            Ok(mapped)
+        }
+    }
+
+    /// Precondition (this module's own): `offset + bytes.len() <= self.bytes`.
+    pub fn write_at(&self, offset: usize, bytes: &[u8]) {
+        assert!(
+            offset
+                .checked_add(bytes.len())
+                .is_some_and(|end| end <= self.bytes),
+            "HostMapped::write_at precondition: [{offset}, {offset}+{}) exceeds {} bytes",
+            bytes.len(),
+            self.bytes
+        );
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.host.add(offset), bytes.len());
+        }
+    }
+
+    /// Precondition (this module's own): `offset + bytes.len() <= self.bytes`.
+    pub fn read_at(&self, offset: usize, bytes: &mut [u8]) {
+        assert!(
+            offset
+                .checked_add(bytes.len())
+                .is_some_and(|end| end <= self.bytes),
+            "HostMapped::read_at precondition: [{offset}, {offset}+{}) exceeds {} bytes",
+            bytes.len(),
+            self.bytes
+        );
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.host.add(offset), bytes.as_mut_ptr(), bytes.len());
+        }
+    }
+}
+
+impl Drop for HostMapped {
+    fn drop(&mut self) {
+        if let Ok(_current) = self.context.enter() {
+            unsafe {
+                (self.context.driver.free_host)(self.host.cast());
+            }
         }
     }
 }

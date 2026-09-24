@@ -1225,6 +1225,8 @@ dependencies = [
  "magnitude-model-kernels",
  "magnitude-model-state",
  "seismic",
+ "serde_json",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -2088,6 +2090,7 @@ version = "0.1.0"
 dependencies = [
  "seismic",
  "seismic-build",
+ "seismic-lang",
 ]
 
 [[package]]

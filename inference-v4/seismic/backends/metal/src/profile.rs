@@ -253,6 +253,8 @@ fn dtype_support_of(facts: &MetalFacts) -> DataTypeSupport {
                         .all(|plane| scalars.contains(&plane.storage_dtype))
             }
             RepresentationKind::External(_) => scalars.contains(&info.decoded),
+            // Row layouts are native-only (`ROW_LAYOUT_IS_NATIVE_ONLY`).
+            RepresentationKind::PackedRows(_) => false,
         })
         .map(|info| info.id)
         .collect();

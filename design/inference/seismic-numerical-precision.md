@@ -10,7 +10,7 @@ applies_to:
 
 Numerical precision is an observable whole-entry compilation contract and a hard selection constraint. It is not a source-level permission, a backend-wide fast-math setting, or a performance penalty.
 
-An explicitly selected top-level native implementation is outside compiler selection. Selecting it asserts that the authored asset implements the attached portable function contract. It cannot silently fall back.
+An explicitly selected top-level native implementation is outside compiler selection and outside these policies. Selecting it asserts that the authored asset implements the attached portable function's semantics; its numerical agreement with the reference is qualified by the consuming application's empirical precision gate, not established by Seismic. It cannot silently fall back.
 
 ## Source authority and policies
 
@@ -48,7 +48,7 @@ For finite floating elements, diagnostic comparison records absolute error, scal
 
 ## Intentional limits and acceptance
 
-Alternative analysis is conservative and may remain Pending. The general required source construction must remain available for every legal entry, subject to real target and resource limits. If an ordinary operation cannot be constructed faithfully, that is an implementation gap to fix, not numerical evidence to seek. There is no empirical qualification side channel.
+Alternative analysis is conservative and may remain Pending. The general required source construction must remain available for every legal entry, subject to real target and resource limits. If an ordinary operation cannot be constructed faithfully, that is an implementation gap to fix, not numerical evidence to seek. Compiler selection has no empirical qualification side channel; empirical qualification applies only to explicitly selected native implementations, outside compiler selection.
 
 - Exact selection never accepts unknown or nonzero deviation.
 - Bounded selection accepts an exact implementation or an established sufficient whole-entry bound; otherwise the alternative remains unresolved.

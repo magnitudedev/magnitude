@@ -8,17 +8,47 @@ use helpers::*;
 
 use super::*;
 
+/// Runs every attested entry once on fixtures at the model's geometry (the
+/// entries are specialized to it) with weights chosen so the result is known.
 pub(super) struct QualificationView<'a> {
     programs: &'a AttestedPrograms,
     plan: &'a ProgramPlan,
+    geometry: &'a magnitude_model_contracts::DecoderGeometry,
+    load: &'a crate::ModelLoadPlan,
 }
 
 impl<'a> QualificationView<'a> {
-    pub(super) fn new(programs: &'a AttestedPrograms, plan: &'a ProgramPlan) -> Self {
-        Self { programs, plan }
+    pub(super) fn new(
+        programs: &'a AttestedPrograms,
+        plan: &'a ProgramPlan,
+        geometry: &'a magnitude_model_contracts::DecoderGeometry,
+        load: &'a crate::ModelLoadPlan,
+    ) -> Self {
+        Self {
+            programs,
+            plan,
+            geometry,
+            load,
+        }
     }
 
-    pub(super) fn qualify(&self, device: &Device) -> Result<(), CatalogError> {
+    /// The planned shape of one weight, for fixtures of its geometry.
+    fn weight_shape(
+        &self,
+        scope: magnitude_model_contracts::WeightScope,
+        kind: magnitude_model_contracts::WeightKind,
+        entry: &'static str,
+    ) -> Result<&'a [u64], CatalogFailure> {
+        self.load
+            .weights()
+            .find(|weight| weight.role.scope == scope && weight.role.kind == kind)
+            .map(|weight| weight.shape.as_slice())
+            .ok_or_else(|| {
+                qualification(entry, "fixture", format!("the load plan has no {kind:?} weight in {scope:?}"))
+            })
+    }
+
+    pub(super) fn qualify(&self, device: &Device) -> Result<(), CatalogFailure> {
         for (slot, handle) in &self.programs.imports {
             let (
                 ImportProgramSlot::Dense {
@@ -33,7 +63,7 @@ impl<'a> QualificationView<'a> {
             let bindings = dense_binding_name(*source_dtype, *target_dtype);
             let source_bytes = one_bytes(*source_dtype);
             let source =
-                Tensor::from_host(device, Element::dense(*source_dtype), &[1], &source_bytes)
+                Tensor::from_host(device, Element::dense(*source_dtype), &[1, 1, 1], &source_bytes)
                     .map_err(|error| qualification_dynamic("import_dense", &bindings, error))?;
             let destination = handle
                 .call(import_dense::Args { source: &source })
@@ -63,53 +93,39 @@ impl<'a> QualificationView<'a> {
             else {
                 continue;
             };
-            let (_, _, bindings, logical, source_bytes) = repack_bindings()
-                .into_iter()
-                .find(|(source, resident, _, _, _)| {
-                    *source == *source_element && *resident == *target_element
-                })
-                .ok_or_else(|| {
-                    qualification_dynamic(
-                        "repack_weight",
-                        &element_binding_name(*source_element, *target_element),
-                        "no bounded qualification fixture exists for the required binding",
-                    )
-                })?;
-            let source =
-                Tensor::from_host(device, *source_element, &[logical], &vec![0; source_bytes])
-                    .map_err(|error| qualification("repack_weight", bindings, error))?;
+            // Two packets per row of 17 rows (a partial 16-row tile), of
+            // arbitrary source bytes, against the registry's host reference.
+            let bindings = element_binding_name(*source_element, *target_element);
+            let failure = |error: String| qualification_dynamic("repack_weight", &bindings, error);
+            let group = source_element
+                .logical_group()
+                .ok_or_else(|| failure("the repack source is not packet storage".into()))?;
+            let shape = [1, 17, 2 * group];
+            let length = source_element
+                .canonical_byte_len(&shape)
+                .map_err(|error| failure(error.to_string()))?;
+            let bytes = (0..length)
+                .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
+                .collect::<Vec<_>>();
+            let source = Tensor::from_host(device, *source_element, &shape, &bytes)
+                .map_err(|error| failure(error.to_string()))?;
             let result = handle
                 .call(repack_weight::Args { source: &source })
                 .map(|results| results.value)
-                .map_err(|error| qualification("repack_weight", bindings, error))?;
+                .map_err(|error| failure(error.to_string()))?;
             let output = result
                 .read_to_host()
-                .map_err(|error| qualification("repack_weight", bindings, error))?;
-            // An all-zero IQ4_XS packet has a zero base scale and signed
-            // sub-scales of -32. Its exact resident factor is therefore -0.0,
-            // not the all-zero byte pattern used by the other formats.
-            let expected = if source_element.name() == "gguf_iq4_xs" {
-                let mut bytes = vec![0; 160];
-                for group in 0..8 {
-                    bytes[128 + group * 4..132 + group * 4]
-                        .copy_from_slice(&(-0.0_f32).to_le_bytes());
-                }
-                bytes
-            } else {
-                vec![0; output.len()]
-            };
+                .map_err(|error| failure(error.to_string()))?;
+            let expected = target_element
+                .repack_host(*source_element, &shape, &bytes)
+                .ok_or_else(|| failure("no registered conversion for the binding".into()))?;
             if result.element() != *target_element || output != expected {
-                return Err(qualification(
-                    "repack_weight",
-                    bindings,
-                    "zero-packet repack mismatch",
-                ));
+                return Err(failure("repack differs from the registered conversion".into()));
             }
         }
         self.qualify_shape_rows(device)?;
         self.qualify_sample_rows(device)?;
         self.qualify_conditioning_overlay(device)?;
-        self.qualify_gather_rows(device)?;
         self.qualify_target(device)?;
         self.qualify_head(device)?;
         self.qualify_vision(device)?;

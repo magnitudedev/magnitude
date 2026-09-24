@@ -1,51 +1,4 @@
-use magnitude_model_kernels::{copy_rows, gather_rows};
-
-#[cfg(target_os = "macos")]
-#[test]
-fn native_gather_preserves_requested_order_and_duplicates() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
-    let device = catalog.open_backend(seismic::BackendName::Metal).unwrap();
-    let values = (0..12).map(|value| value as f32).collect::<Vec<_>>();
-    let source = seismic::Tensor::from_host(
-        &device,
-        seismic::Element::f32(),
-        &[3, 4],
-        &values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>(),
-    )
-    .unwrap();
-    let rows = seismic::Tensor::from_host(
-        &device,
-        seismic::Element::i32(),
-        &[3],
-        &[
-            2_i32.to_le_bytes(),
-            0_i32.to_le_bytes(),
-            2_i32.to_le_bytes(),
-        ]
-        .concat(),
-    )
-    .unwrap();
-    let actual = gather_rows::native_for_device(&device, &seismic::NativeSpecialization::new())
-        .unwrap()
-        .call(gather_rows::Args {
-            source: &source,
-            rows: &rows,
-        })
-        .unwrap()
-        .value
-        .read_to_host()
-        .unwrap()
-        .chunks_exact(4)
-        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        actual,
-        vec![8.0, 9.0, 10.0, 11.0, 0.0, 1.0, 2.0, 3.0, 8.0, 9.0, 10.0, 11.0]
-    );
-}
+use magnitude_model_kernels::copy_rows;
 
 #[test]
 fn portable_copy_moves_only_the_indexed_dense_rows() {
@@ -113,11 +66,18 @@ fn generated_surface_exposes_native_and_planned_dense_plane_bindings() {
     let _ = (planned, native);
 }
 
-#[cfg(target_os = "macos")]
 #[test]
-fn native_metal_copies_indexed_u32_plane_rows_bit_exactly() {
+fn native_copies_indexed_u32_plane_rows_bit_exactly_on_every_accelerator() {
     let catalog = seismic::DeviceCatalog::discover().unwrap();
-    let device = catalog.open_backend(seismic::BackendName::Metal).unwrap();
+    for backend in [seismic::BackendName::Metal, seismic::BackendName::Cuda] {
+        let Ok(device) = catalog.open_backend(backend) else {
+            continue;
+        };
+        copy_u32_plane_rows(&device);
+    }
+}
+
+fn copy_u32_plane_rows(device: &seismic::Device) {
     let source = (0_u32..24).collect::<Vec<_>>();
     let source_bytes = source
         .iter()

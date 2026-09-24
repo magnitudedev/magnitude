@@ -174,7 +174,9 @@ fn category_admits(category: &OperandCategory, argument: &ValueType) -> bool {
 fn representation_element(representation: crate::ids::RepresentationId) -> Elem {
     match crate::registry::representation_info(representation).kind {
         RepresentationKind::Dense(dtype) => Elem::Dtype(dtype),
-        RepresentationKind::Packed(_) | RepresentationKind::External(_) => Elem::Repr(representation),
+        RepresentationKind::Packed(_)
+        | RepresentationKind::PackedRows(_)
+        | RepresentationKind::External(_) => Elem::Repr(representation),
     }
 }
 
@@ -664,6 +666,7 @@ impl<'a> Checker<'a> {
                     let info = crate::registry::representation_info(*representation);
                     let group = match &info.kind {
                         RepresentationKind::Packed(layout) => Some(layout.group),
+                        RepresentationKind::PackedRows(layout) => Some(layout.group()),
                         RepresentationKind::External(layout) => Some(layout.logical_group),
                         RepresentationKind::Dense(_) => None,
                     };

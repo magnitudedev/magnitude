@@ -1,8 +1,6 @@
 //! Device-independent head row semantics.
 
-use crate::{
-    ControlOffsets, Demand, LaunchClass, PackError, Slot, TargetBatchUpload, ValidatedTargetBatch,
-};
+use crate::{Demand, LaunchClass, PackError, Slot, TargetBatchUpload, ValidatedTargetBatch};
 
 /// Head rows can produce only a final feature readout. Projection owns logits
 /// and selection, so those demands cannot enter a head program.
@@ -51,16 +49,8 @@ impl ValidatedHeadBatch {
         self.rows.actual_slots()
     }
 
-    pub fn controls(&self) -> &[u32] {
-        self.rows.controls()
-    }
-
     pub fn upload(&self) -> TargetBatchUpload<'_> {
         self.rows.upload()
-    }
-
-    pub fn offsets(&self) -> ControlOffsets {
-        self.rows.offsets()
     }
 
     pub fn slots(&self) -> impl Iterator<Item = crate::TargetBatchSlot<'_>> {

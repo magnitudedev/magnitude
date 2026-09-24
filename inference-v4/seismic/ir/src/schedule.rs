@@ -999,13 +999,6 @@ impl<B: PhysicalDialect> ScheduleConstruction<B> {
             marker: PhantomData,
         }
     }
-    pub(crate) fn builder<'a>(
-        &'a mut self,
-        arena: &'a mut ExprArena,
-        views: &'a [crate::storage::BufferViewLayout],
-    ) -> ScheduleBuilder<'a, B> {
-        self.builder_at(arena, views, 0)
-    }
     pub(crate) fn builder_at<'a>(
         &'a mut self,
         arena: &'a mut ExprArena,
@@ -1923,16 +1916,6 @@ mod internals {
                 .push(RegionStep::Leaf(step));
             at
         }
-        fn child_region(&mut self, edge: ScheduleRegionEdge) -> u32 {
-            let mut path = self.state.regions[self.region as usize].path.clone();
-            path.push(edge);
-            let id = self.state.regions.len() as u32;
-            self.state.regions.push(Region {
-                path,
-                steps: Vec::new(),
-            });
-            id
-        }
         pub(super) fn slot_symbol(&mut self, slot: AnyScalarSlot) -> SymbolId {
             self.assert_owner(slot.owner());
             let stored = self.state.slots[slot.index as usize];
@@ -2068,7 +2051,8 @@ mod internals {
             let dtype =
                 match &seismic_lang::registry::representation_info(source.representation).kind {
                     seismic_lang::registry::RepresentationKind::Dense(dtype) => *dtype,
-                    seismic_lang::registry::RepresentationKind::Packed(_) => DType::F32,
+                    seismic_lang::registry::RepresentationKind::Packed(_)
+                    | seismic_lang::registry::RepresentationKind::PackedRows(_) => DType::F32,
                     seismic_lang::registry::RepresentationKind::External(_) => {
                         panic!("external representations permit only sealed conversion")
                     }
@@ -2098,7 +2082,8 @@ mod internals {
                     seismic_lang::registry::RepresentationKind::Dense(dtype) => {
                         u64::from(dtype.bytes())
                     }
-                    seismic_lang::registry::RepresentationKind::Packed(_) => {
+                    seismic_lang::registry::RepresentationKind::Packed(_)
+                    | seismic_lang::registry::RepresentationKind::PackedRows(_) => {
                         unreachable!("DenseRepresentation excludes packed scalar reads")
                     }
                     seismic_lang::registry::RepresentationKind::External(_) => {

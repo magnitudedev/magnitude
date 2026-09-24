@@ -47,20 +47,23 @@ impl OperationGroup {
     pub fn operations(&self) -> &[Operation] {
         &self.operations
     }
+    pub fn into_operations(self) -> Vec<Operation> {
+        self.operations
+    }
 }
 
 /// Preserve input order while coalescing adjacent compatible operations. A
 /// request may occupy only one slot in a group; another operation starts a new
-/// group so dependencies never leap across an intervening lane.
+/// group so dependencies never leap across an intervening lane. The domain
+/// validates every operation when a group is reserved.
 pub fn group<F: ProgramFamily>(
     domain: &ExecutorDomain<F>,
     operations: Vec<Operation>,
-) -> Result<Vec<OperationGroup>, String> {
+) -> Vec<OperationGroup> {
     let mut groups: Vec<OperationGroup> = Vec::new();
     for operation in operations {
-        operation.validate().map_err(|error| error.to_string())?;
         let lane = DomainLane::for_operation(&operation);
-        let key = domain.group_key(&operation)?;
+        let key = domain.group_key(&operation);
         let request = operation.request();
         let existing = groups.last_mut().filter(|group| {
             group.lane == lane
@@ -81,7 +84,7 @@ pub fn group<F: ProgramFamily>(
             });
         }
     }
-    Ok(groups)
+    groups
 }
 
 pub enum DomainFlight<F: ProgramFamily = NativeFamily> {
@@ -96,8 +99,8 @@ pub fn submit_group<F: ProgramFamily>(
     domain: &mut ExecutorDomain<F>,
     group: &OperationGroup,
 ) -> Result<DomainFlight<F>, DomainError> {
-    let reservation = domain.reserve(group.operations.clone())?;
-    let (operations, resources) = reservation.into_parts();
+    let operations = group.operations.as_slice();
+    let resources = domain.reserve(operations)?.into_resources();
     let submitted = match (group.lane, resources) {
         (DomainLane::Target, ReservedResources::Target(reservation)) => domain
             .submit_target(operations, reservation)
@@ -121,7 +124,7 @@ pub fn submit_group<F: ProgramFamily>(
                 .map(DomainFlight::Project)
         }
         (DomainLane::Repair, ReservedResources::Repair(reservation)) => {
-            let [Operation::Repair { request, .. }] = operations.as_slice() else {
+            let [Operation::Repair { request, .. }] = operations else {
                 return Err(DomainError::Input(
                     "repair group must contain one operation".into(),
                 ));
@@ -131,13 +134,13 @@ pub fn submit_group<F: ProgramFamily>(
                 .map(DomainFlight::Repair)
         }
         (DomainLane::Encoder, ReservedResources::Vision(workspace, output)) => {
-            let [operation @ Operation::Encode { .. }] = operations.as_slice() else {
+            let [operation @ Operation::Encode { .. }] = operations else {
                 return Err(DomainError::Input(
                     "vision group must contain one encode operation".into(),
                 ));
             };
             domain
-                .submit_vision(operation.clone(), workspace, output)
+                .submit_vision(operation, workspace, output)
                 .map(DomainFlight::Vision)
         }
         _ => Err(DomainError::Invariant(

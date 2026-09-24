@@ -984,6 +984,7 @@ impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
     fn read_entry(&mut self, entry: PlaceEntry, index: &[PortableValue]) -> PortableValue {
         match &registry::representation_info(entry.representation).kind {
             RepresentationKind::Packed(_) => super::representation::read(self, entry, index),
+            RepresentationKind::PackedRows(_) => panic!("{}", registry::ROW_LAYOUT_IS_NATIVE_ONLY),
             RepresentationKind::Dense(dtype) => {
                 let indices = self.read_indices(entry, index);
                 let ty = dtype_value_type(*dtype);
@@ -1062,7 +1063,7 @@ impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
         let entry = self.checked_place(place);
         let dtype = match registry::representation_info(entry.representation).kind {
             RepresentationKind::Dense(dtype) => dtype,
-            RepresentationKind::Packed(_) => {
+            RepresentationKind::Packed(_) | RepresentationKind::PackedRows(_) => {
                 panic!("packed writes have no canonical encode contract")
             }
             RepresentationKind::External(_) => {
@@ -1109,7 +1110,7 @@ impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
         let entry = self.checked_place(place);
         let dtype = match registry::representation_info(entry.representation).kind {
             RepresentationKind::Dense(dtype) => dtype,
-            RepresentationKind::Packed(_) => {
+            RepresentationKind::Packed(_) | RepresentationKind::PackedRows(_) => {
                 panic!("packed atomics have no canonical update contract")
             }
             RepresentationKind::External(_) => {
@@ -2415,6 +2416,7 @@ fn representation_alignment(id: RepresentationId) -> u64 {
     match &registry::representation_info(id).kind {
         RepresentationKind::Dense(dtype) => dtype.bytes() as u64,
         RepresentationKind::Packed(layout) => u64::from(layout.packet_alignment),
+        RepresentationKind::PackedRows(_) => registry::ROW_ALIGNMENT,
         RepresentationKind::External(layout) => u64::from(layout.packet_alignment),
     }
 }
@@ -2683,11 +2685,6 @@ pub(crate) struct Arena<B: PhysicalDialect> {
 }
 
 impl<B: PhysicalDialect> Arena<B> {
-    pub(super) fn get(&self, id: KernelId) -> Option<&Kernel<B>> {
-        (id.owner() == self.owner)
-            .then(|| self.kernels.get(id.index() as usize))
-            .flatten()
-    }
     pub(super) fn retained_bytes(&self) -> usize {
         self.kernels.capacity() * std::mem::size_of::<Kernel<B>>()
             + self
@@ -2729,10 +2726,6 @@ pub(crate) fn arena_from_kernels<B: PhysicalDialect>(
 
 pub(crate) fn arena_into_kernels<B: PhysicalDialect>(arena: KernelArena<B>) -> Vec<Kernel<B>> {
     arena.inner.kernels
-}
-
-pub(crate) fn data<B: PhysicalDialect>(kernel: &Kernel<B>) -> &KernelData<B> {
-    &kernel.inner
 }
 
 #[derive(Debug)]

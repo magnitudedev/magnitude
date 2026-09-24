@@ -50,6 +50,29 @@ pub(crate) fn canonical(
             packet.packet_size,
             packet.packet_alignment,
         ),
+        RepresentationKind::PackedRows(rows) => {
+            let too_low_rank = || {
+                ExecutionError::AllocationFailed(format!(
+                    "`{}` storage requires rank at least {}",
+                    info.name,
+                    if rows.layout == seismic_lang::registry::Layout::Mma16 { 2 } else { 1 }
+                ))
+            };
+            let units = rows.storage_units(extents).ok_or_else(|| {
+                if extents.len() < 2 {
+                    too_low_rank()
+                } else {
+                    unaddressable(info.name, extents)
+                }
+            })?;
+            let (strides, _) = row_major(&units).ok_or_else(|| unaddressable(info.name, extents))?;
+            let byte_len = rows.bytes(extents).ok_or_else(|| unaddressable(info.name, extents))?;
+            Ok(Layout {
+                strides,
+                byte_len,
+                alignment: seismic_lang::registry::ROW_ALIGNMENT,
+            })
+        }
     }
 }
 
@@ -177,6 +200,18 @@ pub(crate) fn apply_view(
         // A reshape reinterprets contiguous row-major storage; a strided view
         // has no reshape that is still a view of the same elements.
         ViewOperation::Reshape { extents } => {
+            if let RepresentationKind::PackedRows(rows) = &representation_info(representation).kind {
+                let geometry = |extents: &[u64]| {
+                    let tail = if rows.layout == seismic_lang::registry::Layout::Mma16 { 2 } else { 1 };
+                    extents.len().checked_sub(tail).map(|start| extents[start..].to_vec())
+                };
+                if geometry(extents).is_none() || geometry(extents) != geometry(&source.extents) {
+                    return Err(TensorError::RowLayoutReshape {
+                        representation: representation_info(representation).name,
+                        extents: extents.clone(),
+                    });
+                }
+            }
             if canonical(representation, &source.extents)?.strides != source.strides {
                 return Err(TensorError::ReshapeLayout {
                     extents: source.extents,
@@ -229,6 +264,25 @@ fn leading_slice(
         RepresentationKind::Packed(packet) => (packet.group, u64::from(packet.packet_size)),
         RepresentationKind::External(packet) => {
             (packet.logical_group, u64::from(packet.packet_size))
+        }
+        RepresentationKind::PackedRows(rows) => {
+            // Rank 1 would slice the packing axis; an `mma16` row axis slices
+            // in whole tiles.
+            let tiled = rows.layout == seismic_lang::registry::Layout::Mma16 && extents.len() == 2;
+            let tile = seismic_lang::registry::MMA_TILE_ROWS;
+            if extents.len() == 1
+                || (tiled && (start % tile != 0 || (end != leading && end % tile != 0)))
+            {
+                return Err(TensorError::UnalignedRowSlice {
+                    representation: info.name,
+                    start,
+                    end,
+                });
+            }
+            let stride = rows
+                .row_stride_bytes(*extents.last().expect("row slice rank was checked"))
+                .ok_or_else(|| TensorError::Execution(unaddressable(info.name, extents)))?;
+            (1, stride)
         }
     };
     // Only a rank-1 packed tensor slices its packing axis.

@@ -1,5 +1,5 @@
 use magnitude_model_state::{
-    BankCapacity, ComponentDescriptor, ComponentSpec, LayerRef, OwnedAdvanceResolution,
+    BankCapacity, CodecSpec, ComponentDescriptor, ComponentSpec, LayerRef, OwnedAdvanceResolution,
     OwnedStateAdvance, SequenceState, StateStore,
 };
 use seismic::{BackendName, DType, Device, DeviceCatalog, Tensor};
@@ -18,8 +18,14 @@ fn write(tensor: &Tensor, bytes: &[u8]) -> Result<(), magnitude_model_state::Err
 fn read(tensor: &Tensor) -> Vec<u8> {
     tensor.read_to_host().unwrap()
 }
-fn history_component(shape: Vec<usize>, dtype: DType) -> ComponentDescriptor {
-    ComponentDescriptor::dense_shaped(LayerRef::Target(0), dtype, shape.clone(), shape).unwrap()
+/// The one-bank row of the store's single recurrent arena.
+fn bank(store: &StateStore, index: usize) -> Tensor {
+    store.recurrent_arenas()[0]
+        .slice_leading(index as u64, index as u64 + 1)
+        .unwrap()
+}
+fn history_component(width: usize, dtype: DType) -> ComponentDescriptor {
+    ComponentDescriptor::new(LayerRef::Target(0), CodecSpec::dense(dtype, width, width), 1).unwrap()
 }
 fn store(history: bool, values: bool) -> Rc<StateStore> {
     StateStore::new(
@@ -27,7 +33,7 @@ fn store(history: bool, values: bool) -> Rc<StateStore> {
         16,
         32,
         if history {
-            vec![history_component(vec![4], DType::F32)]
+            vec![history_component(4, DType::F32)]
         } else {
             vec![]
         },
@@ -47,10 +53,11 @@ fn store(history: bool, values: bool) -> Rc<StateStore> {
     )
     .unwrap()
 }
-fn accept(state: SequenceState, count: usize) -> SequenceState {
+fn accept(store: &StateStore, state: SequenceState, count: usize) -> SequenceState {
     let advance = OwnedStateAdvance::begin(state, count).ok().unwrap();
-    for value in advance.bindings().following {
-        write(value, &vec![0; value.byte_len() as usize]).unwrap();
+    if store.has_recurrent_components() {
+        let successor = bank(store, advance.bindings().following_bank);
+        write(&successor, &vec![0; successor.byte_len() as usize]).unwrap();
     }
     let OwnedAdvanceResolution::Committed(next) = advance.commit_all().ok().unwrap() else {
         panic!("full advance must commit");
@@ -62,16 +69,17 @@ fn accept(state: SequenceState, count: usize) -> SequenceState {
 fn shared_prefix_private_tail_and_parent_first_drop() {
     let store = store(true, true);
     let mut parent = store.create().unwrap();
-    parent = accept(parent, 8);
+    parent = accept(&store, parent, 8);
     let checkpoint = parent.checkpoint();
     let mut branches = (0..6).map(|_| checkpoint.fork()).collect::<Vec<_>>();
     assert_eq!(store.occupied_rows(), 8);
     assert!(branches.iter().all(|b| b.history_ranges() == [(0, 8)]));
-    parent = accept(parent, 2);
+    parent = accept(&store, parent, 2);
     let branch = branches.remove(0);
-    branches.insert(0, accept(branch, 3));
+    branches.insert(0, accept(&store, branch, 3));
     assert_eq!(checkpoint.position(), 8);
-    assert_eq!(branches[0].history_ranges(), [(0, 8), (10, 3)]);
+    // The parent grew in place into [8, 10); the branch starts mid-hole.
+    assert_eq!(branches[0].history_ranges(), [(0, 8), (19, 3)]);
     assert_eq!(branches[1].history_ranges(), [(0, 8)]);
     assert_eq!(store.occupied_rows(), 13);
     drop(parent);
@@ -86,14 +94,14 @@ fn shared_prefix_private_tail_and_parent_first_drop() {
 fn failed_and_aborted_work_cannot_publish_or_recycle_early() {
     let store = store(true, true);
     let state = store.create().unwrap();
-    let original = state.values()[0].clone();
+    let original = bank(&store, state.bank_index());
     let before = read(&original);
     let advance = OwnedStateAdvance::begin(state, 5).ok().unwrap();
     let bindings = advance.bindings();
     assert_eq!(bindings.destinations, [0, 1, 2, 3, 4]);
     assert_eq!(store.occupied_rows(), 5);
-    write(&bindings.following[0], &[0xff; 16]).unwrap();
-    write(&bindings.history[0].buffer, &[0x33; 16]).unwrap();
+    write(&bank(&store, bindings.following_bank), &[0xff; 16]).unwrap();
+    write(&bindings.history[0].buffer.slice_leading(0, 1).unwrap(), &[0x33; 16]).unwrap();
     // A failed physical submission returns ownership for abort, never commit.
     assert_eq!(store.occupied_rows(), 5);
     let state = advance.abort();
@@ -102,8 +110,9 @@ fn failed_and_aborted_work_cannot_publish_or_recycle_early() {
     let after = read(&original);
     assert_eq!(before, after);
     let advance = OwnedStateAdvance::begin(state, 5).ok().unwrap();
-    write(&advance.bindings().following[0], &[0x22; 16]).unwrap();
+    write(&bank(&store, advance.bindings().following_bank), &[0x22; 16]).unwrap();
     let state = advance.abort();
+    assert_eq!(read(&bank(&store, state.bank_index())), before);
     assert_eq!(state.position(), 0);
     assert_eq!(store.occupied_rows(), 0);
     let advance = OwnedStateAdvance::begin(state, 5).ok().unwrap();
@@ -117,12 +126,13 @@ fn accepted_component_versions_survive_checkpoint_and_fork() {
     let checkpoint = parent.checkpoint();
     let child = checkpoint.fork();
     let advance = OwnedStateAdvance::begin(parent, 1).ok().unwrap();
-    write(&advance.bindings().following[0], &[0x22; 16]).unwrap();
+    assert_ne!(advance.bindings().following_bank, child.bank_index());
+    write(&bank(&store, advance.bindings().following_bank), &[0x22; 16]).unwrap();
     let OwnedAdvanceResolution::Committed(parent) = advance.commit_all().ok().unwrap() else {
         panic!("full advance must commit");
     };
-    let parent_bytes = read(&parent.values()[0]);
-    let child_bytes = read(&child.values()[0]);
+    let parent_bytes = read(&bank(&store, parent.bank_index()));
+    let child_bytes = read(&bank(&store, child.bank_index()));
     assert_eq!(parent_bytes, [0x22; 16]);
     assert_eq!(child_bytes, [0; 16]);
     assert_eq!(store.occupied_rows(), 0);
@@ -131,13 +141,12 @@ fn accepted_component_versions_survive_checkpoint_and_fork() {
 #[ignore = "requires a Metal device"]
 fn fragmented_reservation_and_capacity_failure_are_atomic() {
     let store = store(true, false);
-    let mut a = store.create().unwrap();
-    let mut b = store.create().unwrap();
-    let mut c = store.create().unwrap();
-    a = accept(a, 8);
-    b = accept(b, 8);
-    c = accept(c, 8);
-    drop(b);
+    let a = accept(&store, store.create().unwrap(), 8);
+    let b = accept(&store, store.create().unwrap(), 8);
+    let c = accept(&store, store.create().unwrap(), 8);
+    assert_eq!(b.history_ranges(), [(16, 8)]);
+    // Placement: a [0, 8), b mid-hole [16, 24), c [8, 16).
+    drop(c);
     let advance = OwnedStateAdvance::begin(a, 8).ok().unwrap();
     assert_eq!(advance.bindings().destinations, (8..16).collect::<Vec<_>>());
     let _a = advance.abort();
@@ -166,7 +175,7 @@ fn fragmented_reservation_and_capacity_failure_are_atomic() {
 fn trim_preserves_checkpoint_logical_history_and_position() {
     let store = store(true, true);
     let mut parent = store.create().unwrap();
-    parent = accept(parent, 8);
+    parent = accept(&store, parent, 8);
     let checkpoint = parent.checkpoint();
     parent.trim_history(5).unwrap();
     assert_eq!(parent.position(), 8);
@@ -176,7 +185,7 @@ fn trim_preserves_checkpoint_logical_history_and_position() {
     let original = checkpoint.fork();
     assert_eq!(fork.history_ranges(), [(5, 3)]);
     assert_eq!(original.history_ranges(), [(0, 8)]);
-    parent = accept(parent, 2);
+    parent = accept(&store, parent, 2);
     parent.trim_history(8).unwrap();
     assert_eq!(parent.history_ranges(), [(8, 2)]);
     assert_eq!(store.occupied_rows(), 10);
@@ -194,12 +203,12 @@ fn trim_preserves_checkpoint_logical_history_and_position() {
 fn exclusive_adjacent_extents_merge_but_checkpoint_boundaries_do_not_grow() {
     let store = store(true, false);
     let mut a = store.create().unwrap();
-    a = accept(a, 4);
+    a = accept(&store, a, 4);
     let cp = a.checkpoint();
     let mut b = cp.fork();
     drop(a);
     drop(cp);
-    b = accept(b, 2);
+    b = accept(&store, b, 2);
     let cp = b.checkpoint();
     let mut c = cp.fork();
     drop(b);
@@ -208,7 +217,7 @@ fn exclusive_adjacent_extents_merge_but_checkpoint_boundaries_do_not_grow() {
     assert_eq!(c.history_ranges(), [(0, 6)]);
     c.trim_history(4).unwrap();
     assert_eq!(store.occupied_rows(), 6);
-    c = accept(c, 1);
+    c = accept(&store, c, 1);
     assert_eq!(store.occupied_rows(), 7);
 }
 #[test]
@@ -219,10 +228,10 @@ fn idle_arena_release_and_value_only_or_history_only_sequences() {
         let mut parent = store.create().unwrap();
         let old = store.history_planes().unwrap();
         assert_eq!(store.release_idle().unwrap(), 0);
-        parent = accept(parent, 4);
+        parent = accept(&store, parent, 4);
         let checkpoint = parent.checkpoint();
         let mut branch = checkpoint.fork();
-        branch = accept(branch, 2);
+        branch = accept(&store, branch, 2);
         assert_eq!(parent.position(), 4);
         assert_eq!(branch.position(), 6);
         assert_eq!(store.occupied_rows(), if history { 6 } else { 0 });
@@ -260,7 +269,7 @@ fn context_and_anticipation_bounds() {
     let Err((mut state, _)) = OwnedStateAdvance::begin(state, 17) else {
         panic!("advance beyond context must fail");
     };
-    state = accept(state, 16);
+    state = accept(&store, state, 16);
     let Err((mut state, _)) = OwnedStateAdvance::begin(state, 1) else {
         panic!("full context must reject another row");
     };
@@ -271,16 +280,20 @@ fn context_and_anticipation_bounds() {
 #[ignore = "requires a Metal device"]
 fn reclamation_counts_selected_handles_once_and_respects_checkpoint_pins() {
     let store = store(true, true);
-    let parent = store.create().unwrap();
+    let seed = store.create().unwrap();
+    // The zero seed is shared by every fresh sequence and never reclaimed.
+    assert_eq!(store.reclaimable(&[&seed]).unwrap(), 0);
+    let parent = accept(&store, seed, 1);
     let checkpoint = parent.checkpoint();
     let fork = checkpoint.fork();
     assert_eq!(store.reclaimable(&[&parent, &fork]).unwrap(), 0);
     drop(checkpoint);
     assert_eq!(store.reclaimable(&[&parent]).unwrap(), 0);
     assert_eq!(store.reclaimable(&[&parent, &fork, &parent]).unwrap(), 16);
-    let external = parent.values()[0].clone();
-    assert_eq!(store.reclaimable(&[&parent, &fork]).unwrap(), 0);
-    drop(external);
+    // An in-flight advance from the fork pins the shared accepted bank.
+    let fork = OwnedStateAdvance::begin(fork, 1).ok().unwrap();
+    assert_eq!(store.reclaimable(&[&parent]).unwrap(), 0);
+    let fork = fork.abort();
     drop(parent);
     assert_eq!(store.reclaimable(&[&fork]).unwrap(), 16);
     let other = StateStore::new(
@@ -312,13 +325,14 @@ fn owned_advances_reconcile_independently_after_shared_completion() {
     assert!(first_bindings.history[0]
         .buffer
         .shares_allocation(&second_bindings.history[0].buffer));
-    assert!(!first_bindings.following[0].shares_allocation(&second_bindings.following[0]));
+    assert_ne!(first_bindings.following_bank, second_bindings.following_bank);
+    assert!(first_bindings.recurrent[0].shares_allocation(&second_bindings.recurrent[0]));
     assert!(first_bindings
         .destinations
         .iter()
         .all(|row| !second_bindings.destinations.contains(row)));
-    write(&first_bindings.following[0], &[1; 16]).unwrap();
-    write(&second_bindings.following[0], &[2; 16]).unwrap();
+    write(&bank(&store, first_bindings.following_bank), &[1; 16]).unwrap();
+    write(&bank(&store, second_bindings.following_bank), &[2; 16]).unwrap();
     let OwnedAdvanceResolution::Committed(first) = first_advance.commit_all().ok().unwrap() else {
         panic!("completed first row must commit");
     };
@@ -326,12 +340,12 @@ fn owned_advances_reconcile_independently_after_shared_completion() {
     assert_eq!(first.position(), 2);
     assert_eq!(second.position(), 0);
     assert_eq!(store.occupied_rows(), 2);
-    assert_eq!(read(&first.values()[0]), [1; 16]);
-    assert_eq!(read(&second.values()[0]), [0; 16]);
+    assert_eq!(read(&bank(&store, first.bank_index())), [1; 16]);
+    assert_eq!(read(&bank(&store, second.bank_index())), [0; 16]);
 
     let first_advance = OwnedStateAdvance::begin(first, 1).ok().unwrap();
     let second_advance = OwnedStateAdvance::begin(second, 1).ok().unwrap();
-    write(&first_advance.bindings().following[0], &[3; 16]).unwrap();
+    write(&bank(&store, first_advance.bindings().following_bank), &[3; 16]).unwrap();
     // A shared failed submission aborts both owned advances.
     let first = first_advance.abort();
     let second = second_advance.abort();

@@ -1,21 +1,22 @@
 //! Typed callable numerical programs and their submission lifecycle.
 
+pub(crate) mod graph;
+pub(crate) mod native_constants;
 pub(crate) mod native_head;
 pub(crate) mod native_import;
 pub(crate) mod native_state;
 pub(crate) mod native_target;
 pub(crate) mod native_target_graph;
-pub(crate) mod native_target_readout_graph;
 pub(crate) mod native_vision;
 mod submission;
 
 pub use native_head::PreparedHeadGraphs;
 pub use native_state::PreparedStateCopyGraphs;
-pub use native_target::TargetReadoutGraphResult;
-pub use native_target_graph::PreparedTargetGraphs;
-pub use native_target_readout_graph::PreparedTargetReadoutGraphs;
+pub use native_target::{CommitSpan, TargetOutput, TargetReadoutGraphResult};
+pub use native_target_graph::{PreparedTargetGraphs, SealReport};
+pub use graph::readout::PreparedTargetReadoutGraphs;
 pub use native_vision::PreparedVisionGraphs;
-pub use submission::{CompletedWork, ProgramSubmission, ReadySubmission};
+pub use submission::{CompletedWork, DeviceSubmission, ProgramSubmission, ReadySubmission};
 
 use crate::{
     GraphOutputTensor, HeadLaunchCore, ImportLaunchCore, ProjectLaunchCore, ResidentWeightSlot,
@@ -35,7 +36,7 @@ pub(crate) fn run_graph(
     Ok(outputs)
 }
 
-pub type CompletedTargetWork = CompletedWork<TargetLaunchCore, Option<TargetReadoutGraphResult>>;
+pub type CompletedTargetWork = CompletedWork<TargetLaunchCore, TargetOutput>;
 pub type CompletedHeadWork = CompletedWork<HeadLaunchCore, GraphOutputTensor>;
 pub struct ProjectGraphOutput {
     pub(crate) logits: GraphOutputTensor,
@@ -46,8 +47,8 @@ pub type CompletedVisionWork = CompletedWork<VisionLaunchCore, GraphOutputTensor
 pub type CompletedStateWork = CompletedWork<StateLaunchCore, ()>;
 pub type CompletedImportWork = CompletedWork<ImportLaunchCore, ResidentWeightSlot>;
 
-/// One typed numerical lane. Native implementations return an already-ready
-/// submission; compiler-planned implementations may remain pending.
+/// One typed numerical lane. A submission may still be executing on the
+/// device when it is returned; its completion reports when it is not.
 pub trait TargetProgram {
     type Submission: ProgramSubmission<CompletedWork = CompletedTargetWork>;
 

@@ -13,6 +13,24 @@ successor reservations, device binding views, and proposed extent. The advance c
 validated launch and remain in flight without borrowing a sequence record. Dropping unfinished
 work releases every tentative claim. An explicit abort recovers the unchanged accepted source
 state when the request can continue.
+Recurrent state lives in one arena per component and layer; a bank is an index into those
+arenas, claimed and returned through shared ownership exactly as a separate allocation would be.
+An advance names its accepted bank and its successor bank, and the batch carries both per slot, so
+kernels read one row and write another in place. No kernel writes an accepted bank or the zero
+seed; forks and checkpoints share accepted banks by claim, never by copy.
+Attention history rows are one shared arena, and each accepted history is a list of address
+ranges (segments) in logical order; the attention entries bound the segments a row may read.
+Placement keeps that count independent of how requests interleave: an advance first grows its
+sequence in place, into the free rows that begin at its history's end, so rows released by a
+rejected tail or an abort are reused in place. Rows that cannot grow in place (a fresh sequence, a
+fork whose sibling took the rows, a neighbouring history) start at the middle of the largest free
+run, leaving the rows before them as growth room for the history that ends there; a run starting
+at row 0 has no such history and fills from its start. Only a reservation larger than every free
+run splits across runs, largest first. Segment addresses need not ascend in logical order.
+Every history plane is indexed by that same row, with one codec group per (row, kv head) vector:
+a plane is `[rows, kv heads, elements]`. Dense history has one activation plane per vector kind;
+affine history has a code plane and one coefficient plane of (scale, zero) pairs, so placement,
+compaction and conversion treat every codec's planes alike.
 Every newly created sequence begins from one immutable, pristine zero recurrent bank. It may share
 that seed with other new sequences; the first and every later advance reserves a distinct writable
 successor. Returned successor banks never become the initial state of another sequence. The zero
@@ -44,7 +62,12 @@ Commit publishes the destination position and history only after the state progr
 ## Acceptance criteria
 
 - No in-flight state transaction borrows sequence storage.
+- Interleaved advances of concurrent sequences add no history segment while a sequence's following
+  rows are free; lock-step serving with speculative tails, completions and admissions keeps every
+  history within two segments even when the arena holds exactly one context per request.
 - A new sequence observes zero recurrent state even after prior sequences have returned dirty banks.
+- A successor bank is never the zero seed, an accepted bank a live state, checkpoint or fork can
+  read, or another in-flight successor.
 - Submit failure and cancellation leave accepted state unchanged and release tentative claims.
 - Full, partial, and zero acceptance reconcile each transaction exactly once.
 - A recurrent interior prefix is not visible until its repair work completes.

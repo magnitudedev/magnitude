@@ -5,7 +5,7 @@ use super::*;
 impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn submit_project(
         &mut self,
-        operations: Vec<Operation>,
+        operations: &[Operation],
         graph_workspace: NativeGraphWorkspaceLease,
         graph_output: NativeGraphOutputLease,
     ) -> Result<ProjectFlight<F::ProjectSubmission>, DomainError> {
@@ -27,16 +27,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             else {
                 return Err("projection group contains another operation kind".into());
             };
-            if !seen.insert(request)
-                || !self.head.contains_key(&request) && !self.head_pending.contains_key(&request)
+            if !seen.insert(*request)
+                || !self.head.contains_key(request) && !self.head_pending.contains_key(request)
             {
                 return Err("projection request is repeated or not open".into());
             }
             rows = rows
                 .checked_add(features.allocation().rows())
                 .ok_or("projection row count overflow")?;
-            requests.push(request);
-            projections.push(ProjectionRequest::new(request, features, select));
+            requests.push(*request);
+            projections.push(ProjectionRequest::new(
+                *request,
+                features.clone(),
+                select.clone(),
+            ));
         }
         let class = crate::LaunchClass::covering(
             rows,

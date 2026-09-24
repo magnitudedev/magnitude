@@ -1,22 +1,21 @@
 use super::super::*;
+use crate::programs::graph::routed::{grouped_blocks, DECODE_ROWS, TILE_ROWS};
 use super::*;
 
 impl<'a> QualificationView<'a> {
-    pub(super) fn qualify_target(&self, device: &Device) -> Result<(), CatalogError> {
-        let residual_values = [1.0_f32, -2.0, 3.0, -4.0];
-        let residual = semantic_f32(device, &[1, 4], &residual_values, "target", "residual")?;
+    pub(super) fn qualify_target(&self, device: &Device) -> Result<(), CatalogFailure> {
         let out_rows = semantic_i32(device, &[1], &[0], "target", "out_rows")?;
-        const WIDE: u64 = 4;
-        let wide_values = vec![1.0_f32; WIDE as usize];
-        let wide_residual =
-            semantic_f32(device, &[1, WIDE], &wide_values, "target", "wide residual")?;
+        let hidden = self.geometry.hidden;
+        let hidden_values = vec![1.0_f32; hidden as usize];
+        let hidden_residual =
+            semantic_f32(device, &[1, hidden], &hidden_values, "target", "hidden residual")?;
 
         for binding in [self.plan.target().embedding()] {
             let label = format!("{binding:?}");
             let table = semantic_pattern(
                 device,
                 binding.table,
-                &[1, 4],
+                &[1, hidden],
                 "qwen_embedding_rows",
                 &label,
             )?;
@@ -45,75 +44,23 @@ impl<'a> QualificationView<'a> {
             else {
                 continue;
             };
-            let label = format!("{binding:?}");
-            let input_norm =
-                semantic_zeros(device, binding.norm, &[4], "target_attention", &label)?;
-            let query_gate = semantic_zeros(
-                device,
-                binding.query_gate,
-                &[8, 4],
-                "target_attention",
-                &label,
-            )?;
-            let key = semantic_zeros(device, binding.key, &[4, 4], "target_attention", &label)?;
-            let value = semantic_zeros(device, binding.value, &[4, 4], "target_attention", &label)?;
-            let output =
-                semantic_zeros(device, binding.output, &[4, 4], "target_attention", &label)?;
-            let query_norm =
-                semantic_zeros(device, Element::f32(), &[4], "target_attention", &label)?;
-            let key_norm =
-                semantic_zeros(device, Element::f32(), &[4], "target_attention", &label)?;
-            let coordinates =
-                semantic_zeros(device, Element::i32(), &[1, 4], "target_attention", &label)?;
-            let rotary = semantic_zeros(device, Element::i32(), &[1], "target_attention", &label)?;
-            let visible = semantic_zeros(
-                device,
-                Element::i32(),
-                &[1, 1, 2],
-                "target_attention",
-                &label,
-            )?;
-            let fresh = semantic_i32(device, &[1, 2], &[0, 1], "target_attention", &label)?;
-            let destinations =
-                semantic_zeros(device, Element::i32(), &[1], "target_attention", &label)?;
-            let mut history_key = semantic_zeros(
-                device,
-                binding.activation,
-                &[1, 1, 4],
-                "target_attention",
-                &label,
-            )?;
-            let mut history_value = semantic_zeros(
-                device,
-                binding.activation,
-                &[1, 1, 4],
-                "target_attention",
-                &label,
-            )?;
-            let result = qualify_attention_stages(
+            qualify_attention(
                 device,
                 kernel,
-                &residual,
-                &input_norm,
-                &query_gate,
-                &key,
-                &value,
-                &query_norm,
-                &key_norm,
-                &output,
-                &coordinates,
-                &rotary,
-                &visible,
-                &fresh,
-                &destinations,
-                &mut history_key,
-                &mut history_value,
-                binding.activation,
-                &label,
+                binding.shape,
+                &AttentionElements {
+                    input_norm: binding.norm,
+                    query_gate: binding.query_gate,
+                    key: binding.key,
+                    value: binding.value,
+                    output: binding.output,
+                    activation: binding.activation,
+                },
+                &format!("{binding:?}"),
             )?;
-            require_f32_values(&result, &residual_values, "qwen_attention_output", &label)?;
         }
 
+        let mut qualified = std::collections::HashSet::new();
         for (slot, attested) in self
             .plan
             .target()
@@ -126,147 +73,188 @@ impl<'a> QualificationView<'a> {
             else {
                 continue;
             };
+            if !qualified.insert(binding) {
+                continue;
+            }
             let label = format!("{binding:?}");
-            const H: u64 = 4;
-            const W: u64 = 2;
-            const QKV: u64 = 3 * W;
-            let recurrent_values = vec![1.0_f32; H as usize];
-            let recurrent_hidden = semantic_f32(
+            // The model's recurrent geometry (the entries fix it statically)
+            // over a two-bank arena: bank 0 is the zero seed the advance
+            // reads, bank 1 its successor. Zero weights leave the residual
+            // unchanged.
+            let w = binding.width;
+            let (key_heads, value_heads) = (binding.key_heads, binding.value_heads);
+            let taps = binding.convolution_width;
+            let channels = (2 * key_heads + value_heads) * w;
+            let norm = semantic_zeros(device, binding.norm, &[hidden], "target_recurrent", &label)?;
+            let qkv = semantic_zeros(
                 device,
-                &[1, H],
-                &recurrent_values,
+                binding.qkv,
+                &[channels, hidden],
                 "target_recurrent",
                 &label,
             )?;
-            let norm = semantic_zeros(device, binding.norm, &[H], "target_recurrent", &label)?;
-            let qkv = semantic_zeros(device, binding.qkv, &[QKV, H], "target_recurrent", &label)?;
-            let gate = semantic_zeros(device, binding.gate, &[W, H], "target_recurrent", &label)?;
-            let alpha = semantic_zeros(device, binding.alpha, &[1, H], "target_recurrent", &label)?;
-            let beta = semantic_zeros(device, binding.beta, &[1, H], "target_recurrent", &label)?;
+            let gate = semantic_zeros(
+                device,
+                binding.gate,
+                &[value_heads * w, hidden],
+                "target_recurrent",
+                &label,
+            )?;
+            let alpha = semantic_zeros(
+                device,
+                binding.alpha,
+                &[value_heads, hidden],
+                "target_recurrent",
+                &label,
+            )?;
+            let beta = semantic_zeros(
+                device,
+                binding.beta,
+                &[value_heads, hidden],
+                "target_recurrent",
+                &label,
+            )?;
             let convolution = semantic_zeros(
                 device,
                 Element::f32(),
-                &[QKV, 2],
+                &[channels, taps],
                 "target_recurrent",
                 &label,
             )?;
-            let rate = semantic_zeros(device, Element::f32(), &[1], "target_recurrent", &label)?;
+            let rate =
+                semantic_zeros(device, Element::f32(), &[value_heads], "target_recurrent", &label)?;
             let time_bias =
-                semantic_zeros(device, Element::f32(), &[1], "target_recurrent", &label)?;
+                semantic_zeros(device, Element::f32(), &[value_heads], "target_recurrent", &label)?;
             let recurrent_norm = semantic_zeros(
                 device,
                 binding.recurrent_norm,
-                &[W],
+                &[w],
                 "target_recurrent",
                 &label,
             )?;
-            let output =
-                semantic_zeros(device, binding.output, &[H, W], "target_recurrent", &label)?;
+            let output = semantic_zeros(
+                device,
+                binding.output,
+                &[hidden, value_heads * w],
+                "target_recurrent",
+                &label,
+            )?;
             let segments =
                 semantic_i32(device, &[2, 2], &[0, 1, 1, 1], "target_recurrent", &label)?;
-            let window = semantic_zeros(
+            let stop = semantic_i32(device, &[1], &[1], "target_recurrent", &label)?;
+            let previous_bank = semantic_i32(device, &[1], &[0], "target_recurrent", &label)?;
+            let following_bank = semantic_i32(device, &[1], &[1], "target_recurrent", &label)?;
+            let mut window = semantic_zeros(
                 device,
                 binding.activation,
-                &[1, 1, QKV],
+                &[2, taps - 1, channels],
                 "target_recurrent",
                 &label,
             )?;
-            let delta = semantic_zeros(
+            let mut delta = semantic_zeros(
                 device,
                 Element::f32(),
-                &[1, 1, W, W],
+                &[2, value_heads, w, w],
                 "target_recurrent",
                 &label,
             )?;
-            let normalized = kernels
-                .normalize
-                .call(qwen_recurrent_normalize::Args {
-                    hidden: &recurrent_hidden,
-                    input_norm: &norm,
-                    epsilon: 1.0e-5,
-                })
-                .map_err(|error| qualification_dynamic("qwen_recurrent_normalize", &label, error))?
-                .value;
             let projection = kernels
                 .project
                 .call(qwen_recurrent_project::Args {
-                    normalized: &normalized,
+                    hidden: &hidden_residual,
+                    input_norm: &norm,
                     qkv_weight: &qkv,
                     gate_weight: &gate,
                     alpha_weight: &alpha,
                     beta_weight: &beta,
+                    epsilon: 1.0e-5,
                 })
                 .map_err(|error| qualification_dynamic("qwen_recurrent_project", &label, error))?
                 .value;
-            let prepared = kernels
-                .prepare
-                .call(qwen_recurrent_prepare::Args {
+            let mixed = kernels
+                .step
+                .call(qwen_recurrent_step::Args {
                     projection: &projection,
                     convolution: &convolution,
                     rate: &rate,
                     time_bias: &time_bias,
-                    recurrent_norm: &recurrent_norm,
                     segments: &segments,
-                    window: &window,
-                    preparation_epsilon: 1.0e-5,
+                    stop: &stop,
+                    previous_bank: &previous_bank,
+                    following_bank: &following_bank,
+                    window: &mut window,
+                    delta: &mut delta,
+                    norm_epsilon: 1.0e-5,
+                    grouped: false,
                 })
-                .map_err(|error| qualification_dynamic("qwen_recurrent_prepare", &label, error))?;
-            let scanned = kernels
-                .scan
-                .call(qwen_recurrent_scan::Args {
-                    prepared: &prepared.r1,
-                    decay: &prepared.r2,
-                    segments: &segments,
-                    delta: &delta,
-                    grouped: true,
-                })
-                .map_err(|error| qualification_dynamic("qwen_recurrent_scan", &label, error))?;
-            let gated = kernels
-                .mix
-                .call(qwen_recurrent_mix::Args {
-                    projection: &projection,
-                    mixed: &scanned.r1,
-                    recurrent_norm: &recurrent_norm,
-                    epsilon: 1.0e-5,
-                })
-                .map_err(|error| qualification_dynamic("qwen_recurrent_mix", &label, error))?
+                .map_err(|error| qualification_dynamic("qwen_recurrent_step", &label, error))?
                 .value;
+            kernels
+                .chunk
+                .call(qwen_recurrent_chunk::Args {
+                    projection: &projection,
+                    convolution: &convolution,
+                    rate: &rate,
+                    time_bias: &time_bias,
+                    segments: &segments,
+                    stop: &stop,
+                    previous_bank: &previous_bank,
+                    following_bank: &following_bank,
+                    window: &mut window,
+                    delta: &mut delta,
+                    norm_epsilon: 1.0e-5,
+                    grouped: false,
+                })
+                .map_err(|error| qualification_dynamic("qwen_recurrent_chunk", &label, error))?;
             let result = kernels
                 .output
                 .call(qwen_recurrent_output::Args {
-                    hidden: &recurrent_hidden,
-                    gated: &gated,
+                    hidden: &hidden_residual,
+                    mixed: &mixed,
+                    projection: &projection,
+                    recurrent_norm: &recurrent_norm,
                     output_weight: &output,
+                    epsilon: 1.0e-5,
                 })
                 .map_err(|error| qualification_dynamic("qwen_recurrent_output", &label, error))?
                 .value;
-            require_f32_values(&result, &recurrent_values, "qwen_recurrent_output", &label)?;
+            require_f32_values(&result, &hidden_values, "qwen_recurrent_output", &label)?;
         }
 
-        for (slot, attested) in self
+        let mut qualified = std::collections::HashSet::new();
+        for ((slot, attested), block) in self
             .plan
             .target()
             .blocks()
             .iter()
             .zip(&self.programs.target.blocks)
+            .zip(&self.geometry.blocks)
         {
-            let (FeedForwardProgramSlot::Dense(binding), AttestedFeedForward::Dense(kernels)) =
-                (slot.feed_forward(), &attested.feed_forward)
+            let (
+                FeedForwardProgramSlot::Dense(binding),
+                AttestedFeedForward::Dense(kernels),
+                magnitude_model_contracts::FeedForwardGeometry::Dense { intermediate },
+            ) = (slot.feed_forward(), &attested.feed_forward, &block.feedforward)
             else {
                 continue;
             };
+            if !qualified.insert((binding, *intermediate)) {
+                continue;
+            }
             let label = format!("{binding:?}");
-            let norm = semantic_zeros(device, binding.norm, &[WIDE], "target_dense", &label)?;
-            let gate = semantic_zeros(device, binding.gate, &[WIDE, WIDE], "target_dense", &label)?;
-            let up = semantic_zeros(device, binding.up, &[WIDE, WIDE], "target_dense", &label)?;
-            let down = semantic_zeros(device, binding.down, &[WIDE, WIDE], "target_dense", &label)?;
+            let f = *intermediate;
+            let norm = semantic_zeros(device, binding.norm, &[hidden], "target_dense", &label)?;
+            let gate = semantic_zeros(device, binding.gate, &[f, hidden], "target_dense", &label)?;
+            let up = semantic_zeros(device, binding.up, &[f, hidden], "target_dense", &label)?;
+            let down = semantic_zeros(device, binding.down, &[hidden, f], "target_dense", &label)?;
             let product = kernels
                 .expand
                 .call(qwen_dense_expand::Args {
-                    residual: &wide_residual,
+                    residual: &hidden_residual,
                     norm: &norm,
                     gate_weight: &gate,
                     up_weight: &up,
+                    out_rows: &out_rows,
                     eps: 1.0e-5,
                 })
                 .map_err(|error| qualification_dynamic("qwen_dense_expand", &label, error))?
@@ -274,47 +262,17 @@ impl<'a> QualificationView<'a> {
             let result = kernels
                 .output
                 .call(qwen_dense_output::Args {
-                    residual: &wide_residual,
+                    residual: &hidden_residual,
                     product: &product,
                     down_weight: &down,
+                    out_rows: &out_rows,
                 })
                 .map_err(|error| qualification_dynamic("qwen_dense_output", &label, error))?
                 .value;
-            require_f32_values(&result, &wide_values, "qwen_dense_output", &label)?;
-            let demanded_product = kernels
-                .expand_demanded
-                .call(qwen_dense_expand_demanded::Args {
-                    residual: &wide_residual,
-                    norm: &norm,
-                    gate_weight: &gate,
-                    up_weight: &up,
-                    out_rows: &out_rows,
-                    eps: 1.0e-5,
-                })
-                .map_err(|error| {
-                    qualification_dynamic("qwen_dense_expand_demanded", &label, error)
-                })?
-                .value;
-            let demanded = kernels
-                .output_demanded
-                .call(qwen_dense_output_demanded::Args {
-                    residual: &wide_residual,
-                    product: &demanded_product,
-                    down_weight: &down,
-                    out_rows: &out_rows,
-                })
-                .map_err(|error| {
-                    qualification_dynamic("qwen_dense_output_demanded", &label, error)
-                })?
-                .value;
-            require_f32_values(
-                &demanded,
-                &wide_values,
-                "qwen_dense_output_demanded",
-                &label,
-            )?;
+            require_f32_values(&result, &hidden_values, "qwen_dense_output", &label)?;
         }
 
+        let mut qualified = std::collections::HashSet::new();
         for (slot, attested) in self
             .plan
             .target()
@@ -327,129 +285,28 @@ impl<'a> QualificationView<'a> {
             else {
                 continue;
             };
-            let label = format!("{binding:?}");
-            let norm = semantic_zeros(device, binding.norm, &[WIDE], "target_routed", &label)?;
-            let router =
-                semantic_zeros(device, binding.router, &[1, WIDE], "target_routed", &label)?;
-            let shared_router =
-                semantic_zeros(device, Element::f32(), &[WIDE], "target_routed", &label)?;
-            let expert_gate = semantic_zeros(
-                device,
-                binding.expert_gate,
-                &[1, WIDE, WIDE],
-                "target_routed",
-                &label,
-            )?;
-            let expert_up = semantic_zeros(
-                device,
-                binding.expert_up,
-                &[1, WIDE, WIDE],
-                "target_routed",
-                &label,
-            )?;
-            let expert_down = semantic_zeros(
-                device,
-                binding.expert_down,
-                &[1, WIDE, WIDE],
-                "target_routed",
-                &label,
-            )?;
-            let shared_gate = semantic_zeros(
-                device,
-                binding.shared_gate,
-                &[WIDE, WIDE],
-                "target_routed",
-                &label,
-            )?;
-            let shared_up = semantic_zeros(
-                device,
-                binding.shared_up,
-                &[WIDE, WIDE],
-                "target_routed",
-                &label,
-            )?;
-            let shared_down = semantic_zeros(
-                device,
-                binding.shared_down,
-                &[WIDE, WIDE],
-                "target_routed",
-                &label,
-            )?;
-            let source_rows =
-                semantic_zeros(device, Element::i32(), &[1], "target_routed", &label)?;
-            let normalized = kernels
-                .normalize
-                .call(qwen_routed_normalize::Args {
-                    residual: &wide_residual,
-                    norm: &norm,
-                    source_rows: &source_rows,
-                    eps: 1.0e-5,
-                })
-                .map_err(|e| qualification_dynamic("qwen_routed_normalize", &label, e))?
-                .value;
-            let logits = kernels
-                .logits
-                .call(qwen_routed_logits::Args {
-                    normalized: &normalized,
-                    router_weight: &router,
-                })
-                .map_err(|e| qualification_dynamic("qwen_routed_logits", &label, e))?
-                .value;
-            let mut routes =
-                semantic_zeros(device, Element::i32(), &[1, 1], "target_routed", &label)?;
-            let mut scores =
-                semantic_zeros(device, Element::f32(), &[1, 1], "target_routed", &label)?;
-            kernels
-                .select
-                .call(qwen_routed_select::Args {
-                    logits: &logits,
-                    selected: 1,
-                    routes: &mut routes,
-                    scores: &mut scores,
-                })
-                .map_err(|e| qualification_dynamic("qwen_routed_select", &label, e))?;
-            let expanded = kernels
-                .expand
-                .call(qwen_routed_expand::Args {
-                    normalized: &normalized,
-                    expert_gate: &expert_gate,
-                    expert_up: &expert_up,
-                    shared_gate: &shared_gate,
-                    shared_up: &shared_up,
-                    shared_control: &shared_router,
-                    routes: &routes,
-                })
-                .map_err(|e| qualification_dynamic("qwen_routed_expand", &label, e))?;
-            let result = kernels
-                .output
-                .call(qwen_routed_output::Args {
-                    residual: &wide_residual,
-                    source_rows: &source_rows,
-                    expert_product: &expanded.r0,
-                    shared_product: &expanded.r1,
-                    shared_coefficient: &expanded.r2,
-                    expert_down: &expert_down,
-                    shared_down: &shared_down,
-                    routes: &routes,
-                    scores: &scores,
-                })
-                .map_err(|e| qualification_dynamic("qwen_routed_output", &label, e))?
-                .value;
-            require_f32_values(&result, &wide_values, "qwen_routed_output", &label)?;
+            if qualified.insert(binding) {
+                qualify_routed(device, binding, kernels)?;
+            }
         }
 
         for binding in [self.plan.target().readout()] {
             let label = format!("{binding:?}");
-            let norm = semantic_ones(device, binding.norm, &[WIDE], "target_readout", &label)?;
-            let weight =
-                semantic_zeros(device, binding.weight, &[1, WIDE], "target_readout", &label)?;
+            let norm = semantic_ones(device, binding.norm, &[hidden], "target_readout", &label)?;
+            let weight = semantic_zeros(
+                device,
+                binding.weight,
+                &[self.geometry.vocabulary, hidden],
+                "target_readout",
+                &label,
+            )?;
             let features = self
                 .programs
                 .target
                 .readout
                 .features
                 .call(qwen_features_rows::Args {
-                    hidden: &wide_residual,
+                    hidden: &hidden_residual,
                     norm: &norm,
                     out_rows: &out_rows,
                     epsilon: 1.0e-5,
@@ -461,30 +318,33 @@ impl<'a> QualificationView<'a> {
                 .programs
                 .target
                 .readout
-                .logits
-                .call(head_logits_rows::Args {
-                    features: &features,
+                .head
+                .call(qwen_head_rows::Args {
+                    hidden: &hidden_residual,
+                    norm: &norm,
                     weight: &weight,
+                    out_rows: &out_rows,
+                    epsilon: 1.0e-5,
                 })
-                .map_err(|error| qualification_dynamic("head_logits_rows", &label, error))?
+                .map_err(|error| qualification_dynamic("qwen_head_rows", &label, error))?
                 .value;
-            require_zero_result(&logits, "head_logits_rows", &label)?;
+            require_zero_result(&logits, "qwen_head_rows", &label)?;
             let selected = semantic_i32(device, &[1], &[0], "qwen_selected_rows", &label)?;
             let selected_result = self
                 .programs
                 .target
                 .selected
                 .call(qwen_selected_rows::Args {
-                    hidden: &wide_residual,
+                    hidden: &hidden_residual,
                     norm: &norm,
                     weight: &weight,
                     out_rows: &out_rows,
                     selected: &selected,
                     epsilon: 1.0e-5,
                 })
-                .map_err(|error| qualification_dynamic("qwen_selected_rows", &label, error))?;
-            require_finite_nonzero(&selected_result.r0, "qwen_selected_rows", &label)?;
-            require_zero_result(&selected_result.r1, "qwen_selected_rows", &label)?;
+                .map_err(|error| qualification_dynamic("qwen_selected_rows", &label, error))?
+                .value;
+            require_zero_result(&selected_result, "qwen_selected_rows", &label)?;
         }
 
         for (binding, kernel) in self
@@ -494,10 +354,10 @@ impl<'a> QualificationView<'a> {
             .zip(self.programs.target.features.as_ref())
         {
             let label = format!("{binding:?}");
-            let norm = semantic_ones(device, binding.norm, &[WIDE], "target_features", &label)?;
+            let norm = semantic_ones(device, binding.norm, &[hidden], "target_features", &label)?;
             let result = kernel
                 .call(qwen_features_rows::Args {
-                    hidden: &wide_residual,
+                    hidden: &hidden_residual,
                     norm: &norm,
                     out_rows: &out_rows,
                     epsilon: 1.0e-5,
@@ -508,4 +368,129 @@ impl<'a> QualificationView<'a> {
         }
         Ok(())
     }
+}
+
+/// The routed entries at the model's routed geometry (they fix it
+/// statically) with zero weights, so both forms leave the residual unchanged.
+/// The route runs over the full expert range; the projections read expert 0
+/// of one-expert tensors through all-zero routes.
+fn qualify_routed(
+    device: &Device,
+    binding: RoutedBinding,
+    kernels: &RoutedKernels,
+) -> Result<(), CatalogFailure> {
+    let label = format!("{binding:?}");
+    let (h, e, k, f, s) = (
+        binding.hidden,
+        binding.experts,
+        binding.selected,
+        binding.features,
+        binding.shared,
+    );
+    let zeros = |element: Element, extents: &[u64]| {
+        semantic_zeros(device, element, extents, "target_routed", &label)
+    };
+    let norm = zeros(binding.norm, &[h])?;
+    let router = zeros(binding.router, &[e, h])?;
+    let shared_router = zeros(Element::f32(), &[h])?;
+    let expert_gate = zeros(binding.expert_gate, &[1, f, h])?;
+    let expert_up = zeros(binding.expert_up, &[1, f, h])?;
+    let expert_down = zeros(binding.expert_down, &[1, h, f])?;
+    let shared_gate = zeros(binding.shared_gate, &[s, h])?;
+    let shared_up = zeros(binding.shared_up, &[s, h])?;
+    let shared_down = zeros(binding.shared_down, &[h, s])?;
+    let grouped_rows = DECODE_ROWS * 2;
+    for rows in [1, grouped_rows] {
+        let values = vec![1.0_f32; (rows * h) as usize];
+        let residual = semantic_f32(device, &[rows, h], &values, "target_routed", &label)?;
+        let mut routes = zeros(Element::i32(), &[rows, k])?;
+        let mut scores = zeros(Element::f32(), &[rows, k])?;
+        let routed = kernels
+            .route
+            .call(qwen_routed_route::Args {
+                residual: &residual,
+                norm: &norm,
+                router: &router,
+                shared_router: &shared_router,
+                routes: &mut routes,
+                scores: &mut scores,
+                eps: 1.0e-5,
+                normalize: 1,
+            })
+            .map_err(|error| qualification_dynamic("qwen_routed_route", &label, error))?;
+        let first = zeros(Element::i32(), &[rows, k])?;
+        let result = if rows <= DECODE_ROWS {
+            let expanded = kernels
+                .expand
+                .call(qwen_routed_expand::Args {
+                    normalized: &routed.r0,
+                    routes: &first,
+                    expert_gate: &expert_gate,
+                    expert_up: &expert_up,
+                    shared_gate: &shared_gate,
+                    shared_up: &shared_up,
+                })
+                .map_err(|error| qualification_dynamic("qwen_routed_expand", &label, error))?;
+            kernels
+                .output
+                .call(qwen_routed_output::Args {
+                    residual: &residual,
+                    expert_product: &expanded.r0,
+                    shared_product: &expanded.r1,
+                    routes: &first,
+                    scores: &scores,
+                    coefficient: &routed.r1,
+                    expert_down: &expert_down,
+                    shared_down: &shared_down,
+                })
+                .map_err(|error| qualification_dynamic("qwen_routed_output", &label, error))?
+                .value
+        } else {
+            let blocks = grouped_blocks(rows, e, k)
+                .map_err(|error| qualification_dynamic("qwen_routed_group", &label, error))?;
+            let mut counts = zeros(Element::i32(), &[e])?;
+            let mut order = zeros(Element::i32(), &[blocks, TILE_ROWS])?;
+            let mut inverse = zeros(Element::i32(), &[rows, k])?;
+            let mut block_experts = zeros(Element::i32(), &[blocks])?;
+            kernels
+                .group
+                .call(qwen_routed_group::Args {
+                    routes: &first,
+                    counts: &mut counts,
+                    order: &mut order,
+                    inverse: &mut inverse,
+                    blocks: &mut block_experts,
+                })
+                .map_err(|error| qualification_dynamic("qwen_routed_group", &label, error))?;
+            let experts = kernels
+                .experts
+                .call(qwen_routed_experts::Args {
+                    normalized: &routed.r0,
+                    order: &order,
+                    blocks: &block_experts,
+                    expert_gate: &expert_gate,
+                    expert_up: &expert_up,
+                    expert_down: &expert_down,
+                })
+                .map_err(|error| qualification_dynamic("qwen_routed_experts", &label, error))?
+                .value;
+            kernels
+                .combine
+                .call(qwen_routed_combine::Args {
+                    residual: &residual,
+                    expert_output: &experts,
+                    inverse: &inverse,
+                    scores: &scores,
+                    normalized: &routed.r0,
+                    coefficient: &routed.r1,
+                    shared_gate: &shared_gate,
+                    shared_up: &shared_up,
+                    shared_down: &shared_down,
+                })
+                .map_err(|error| qualification_dynamic("qwen_routed_combine", &label, error))?
+                .value
+        };
+        require_f32_values(&result, &values, "qwen_routed", &label)?;
+    }
+    Ok(())
 }

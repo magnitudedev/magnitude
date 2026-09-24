@@ -1,5 +1,5 @@
 use crate::{
-    completion::{Completed, Completion},
+    completion::{Completed, Completion, DeviceCompletion},
     error::DeviceError,
 };
 
@@ -29,9 +29,46 @@ impl<L, O> CompletedWork<L, O> {
     }
 }
 
-/// The native direct path has already completed when it returns this value.
-/// A planned program may instead provide a pending implementation of the same
-/// trait without changing its caller. Both retain the launch and leases.
+/// Native work submitted without waiting. The launch, its device leases and
+/// its output stay owned here until completion is observed; `finish` before
+/// completion blocks on the device.
+pub struct DeviceSubmission<L, S, O> {
+    completion: DeviceCompletion,
+    launch: L,
+    workspace: S,
+    output: O,
+}
+
+impl<L, S, O> DeviceSubmission<L, S, O> {
+    pub(crate) fn new(completion: DeviceCompletion, launch: L, workspace: S, output: O) -> Self {
+        Self {
+            completion,
+            launch,
+            workspace,
+            output,
+        }
+    }
+}
+
+impl<L, S, O> ProgramSubmission for DeviceSubmission<L, S, O> {
+    type CompletedWork = CompletedWork<L, O>;
+
+    fn completion(&mut self) -> &mut dyn Completion {
+        &mut self.completion
+    }
+
+    fn finish(mut self) -> Result<Self::CompletedWork, DeviceError> {
+        self.completion.result()?;
+        drop(self.workspace);
+        Ok(CompletedWork {
+            launch: self.launch,
+            output: self.output,
+        })
+    }
+}
+
+/// Work that has already completed when the program returns this value.
+/// Both forms retain the launch and leases until `finish`.
 pub struct ReadySubmission<L, S, O> {
     completion: Completed,
     launch: L,

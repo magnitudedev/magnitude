@@ -20,15 +20,24 @@ pub use seismic_compiler::feedback::{
     PreparationOptions,
 };
 pub use seismic_lang::checked::{
-    NativeComparison, NativeConstraint, NativeImplementation, NativeLaunch, NativeNatExpr,
+    NativeComparison, NativeCondition, NativeImplementation, NativeLaunch, NativeNatExpr,
     NativeParameter, NativeScratch, NativeSpecialization, NativeSpecializationError,
 };
 pub use seismic_lang::precision::PrecisionPolicy;
+pub use seismic_runtime::artifacts::{ArtifactKey, ArtifactKind, ArtifactStore, DeviceOptions};
+pub use seismic_runtime::native::search::{
+    search, Evaluator, ParameterValues, SearchSettings, SearchSpace, SearchSpaceError, SearchStop,
+    SearchTrace,
+};
 pub use seismic_runtime::native::tune::{
-    Configuration, ConfigurationRecord, Exclusion, Outcome, PointMeasurement, TuneError,
-    TuningResult, Validation,
+    Configuration, ConfigurationRecord, DeclaredParameter, Exclusion, Outcome, PointMeasurement,
+    SearchPlan, Strategy, SurveyPlan, TuneError, TuningInitializer, TuningMethod, TuningResult,
+    TuningTime, Validation,
 };
 pub use seismic_runtime::native::{MeasureOptions, Measurement, NativeArtifactIdentity};
+pub use seismic_runtime::native::trace::{
+    host_seconds, SubmissionTrace, TraceDetail, TraceError, TracedLaunch, TracedSubmission,
+};
 
 /// The CPU native ABI that generated bindings wrap. Kernel authors use the
 /// generated `Context` of their entry instead.
@@ -38,7 +47,7 @@ pub mod native_cpu {
     };
 }
 pub use seismic_lang::expr::{BigInt, BigUint};
-pub use seismic_lang::registry::BackendName;
+pub use seismic_lang::registry::{BackendName, Layout};
 pub use seismic_lang::types::DType;
 pub use seismic_runtime::api::{CallError, OutputError, TensorError, WorkflowError};
 pub use seismic_runtime::devices::{
@@ -85,6 +94,11 @@ impl DeviceCatalog {
     pub fn open(&self, id: DeviceId) -> Result<Device, OpenError> {
         self.inner.open(id).map(|inner| Device { inner })
     }
+    /// Open with `options` (for example an artifact store). A device already
+    /// open is shared; asking it for a different store is an error.
+    pub fn open_with(&self, id: DeviceId, options: DeviceOptions) -> Result<Device, OpenError> {
+        self.inner.open_with(id, options).map(|inner| Device { inner })
+    }
     /// Low-level control: opens the first discovered device of a backend.
     /// Managed callers select by requirements and open by identity.
     pub fn open_backend(&self, backend: BackendName) -> Result<Device, OpenError> {
@@ -128,10 +142,21 @@ impl Device {
     pub fn tuning_identity(&self) -> String {
         self.inner.tuning_identity()
     }
+    /// Record every native submission on this device until the returned
+    /// trace is dropped (measurement only; see `TraceDetail`).
+    pub fn trace_submissions(&self, detail: TraceDetail) -> Result<SubmissionTrace, TraceError> {
+        SubmissionTrace::start(&self.inner, detail)
+    }
     /// Begin a checked direct-native graph on this opened device.
     pub fn native_graph(&self) -> NativeGraph {
         NativeGraph {
             inner: seismic_runtime::native::graph::NativeGraphDraft::new(&self.inner),
+        }
+    }
+    /// An empty sequence of graph runs to submit together.
+    pub fn native_sequence(&self) -> NativeGraphSequence {
+        NativeGraphSequence {
+            inner: seismic_runtime::native::graph::NativeGraphSequence::new(&self.inner),
         }
     }
     /// Seismic-owned charges and limits for this device and its pool.
@@ -171,11 +196,71 @@ impl fmt::Debug for Device {
 pub struct Element(RepresentationId);
 
 impl Element {
+    /// The storage registered under a unique storage name (`q4k`,
+    /// `q4k@rows16`, `f32`, `gguf_q4_k`).
     pub fn named(name: &str) -> Option<Element> {
         seismic_lang::registry::representation(name).map(Element)
     }
+    /// Packed representation `representation` (`q4k`) in `layout`.
+    pub fn stored(representation: &str, layout: Layout) -> Option<Element> {
+        seismic_lang::registry::storage(representation, layout).map(Element)
+    }
+    /// Unique storage name.
     pub fn name(&self) -> &'static str {
         seismic_lang::registry::representation_info(self.0).name
+    }
+    /// The logical representation this storage encodes.
+    pub fn representation(&self) -> &'static str {
+        seismic_lang::registry::representation_info(self.0).representation
+    }
+    pub fn layout(&self) -> Layout {
+        seismic_lang::registry::representation_info(self.0).layout
+    }
+    /// Logical values per packet along the packing axis of packed or external
+    /// storage; `None` for dense storage.
+    pub fn logical_group(&self) -> Option<u64> {
+        match &seismic_lang::registry::representation_info(self.0).kind {
+            seismic_lang::registry::RepresentationKind::Dense(_) => None,
+            seismic_lang::registry::RepresentationKind::Packed(layout) => Some(u64::from(layout.group)),
+            seismic_lang::registry::RepresentationKind::PackedRows(layout) => {
+                Some(u64::from(layout.group()))
+            }
+            seismic_lang::registry::RepresentationKind::External(layout) => {
+                Some(u64::from(layout.logical_group))
+            }
+        }
+    }
+    /// Host reference of the registered conversion from `source` into this
+    /// storage over a tensor of `shape`. `None` when no conversion is
+    /// registered or `bytes` is not the source's canonical byte count.
+    pub fn repack_host(self, source: Element, shape: &[u64], bytes: &[u8]) -> Option<Vec<u8>> {
+        let conversion = seismic_lang::registry::representation_conversion(source.0, self.0)?;
+        let shape = shape
+            .iter()
+            .map(|extent| usize::try_from(*extent).ok())
+            .collect::<Option<Vec<_>>>()?;
+        seismic_lang::interp::repack(conversion.id, &shape, bytes)
+    }
+    /// Host reference decode of canonical packed or dense bytes of a tensor
+    /// of `shape` into logical values in row-major order. `None` for external
+    /// storage or a wrong byte count.
+    pub fn decode_host(self, shape: &[u64], bytes: &[u8]) -> Option<Vec<f64>> {
+        let shape = shape
+            .iter()
+            .map(|extent| usize::try_from(*extent).ok())
+            .collect::<Option<Vec<_>>>()?;
+        let data = match &seismic_lang::registry::representation_info(self.0).kind {
+            seismic_lang::registry::RepresentationKind::Dense(dtype) => {
+                seismic_lang::interp::TensorData::dense_from_bytes(*dtype, shape, bytes.to_vec())
+            }
+            seismic_lang::registry::RepresentationKind::Packed(_)
+            | seismic_lang::registry::RepresentationKind::PackedRows(_) => {
+                seismic_lang::interp::TensorData::encoded(self.0, shape, bytes.to_vec())
+            }
+            seismic_lang::registry::RepresentationKind::External(_) => return None,
+        }
+        .ok()?;
+        data.values().ok()
     }
     fn id(&self) -> RepresentationId {
         self.0
@@ -187,6 +272,7 @@ impl Element {
         match &seismic_lang::registry::representation_info(self.0).kind {
             seismic_lang::registry::RepresentationKind::Dense(dtype) => Some(*dtype),
             seismic_lang::registry::RepresentationKind::Packed(_)
+            | seismic_lang::registry::RepresentationKind::PackedRows(_)
             | seismic_lang::registry::RepresentationKind::External(_) => None,
         }
     }
@@ -689,6 +775,10 @@ pub struct TuningPoint<'a, E: Entry> {
     pub label: String,
     pub weight: f64,
     pub rotation: Vec<E::Args<'a>>,
+    /// Required when the entry has `&mut` parameters: restores the tensors
+    /// they bind in `rotation[0]` before each configuration's validation
+    /// run. The tuner never saves or restores state itself.
+    pub initialize: Option<TuningInitializer<'a>>,
 }
 
 /// A direct-native graph is assembled from generated entry arguments and
@@ -891,9 +981,11 @@ impl NativeGraphFamily {
             .new_output_slot()
             .map(|inner| NativeGraphFamilyOutputSlot { inner })
     }
-    pub fn new_slot(&self) -> Result<NativeGraphFamilySlot, TensorError> {
+    /// A slot whose `regions` upload regions (one per run it keeps in flight
+    /// at once) are allocated here; activation never allocates.
+    pub fn new_slot(&self, regions: usize) -> Result<NativeGraphFamilySlot, TensorError> {
         self.inner
-            .new_slot()
+            .new_slot(regions)
             .map(|inner| NativeGraphFamilySlot { inner })
     }
 }
@@ -1006,6 +1098,36 @@ impl ReadyNativeGraphRun<'_> {
         self.inner
             .submit()
             .map(|(inner, completion)| (NativeGraphOutputs { inner }, NativeGraphCompletion { inner: completion }))
+    }
+
+    /// Append this run to `sequence` instead of submitting it: every run
+    /// queued on a sequence is submitted as one unit of device work, in
+    /// queue order. The outputs may be bound into later queued runs at
+    /// once; host reads of them are valid only after the sequence is
+    /// submitted.
+    pub fn queue(self, sequence: &mut NativeGraphSequence) -> Result<NativeGraphOutputs, CallError> {
+        self.inner
+            .queue(&mut sequence.inner)
+            .map(|inner| NativeGraphOutputs { inner })
+    }
+}
+
+/// Graph runs queued for one submission (one Metal command buffer, one
+/// CUDA graph launch), executed in queue order as if submitted one by one.
+pub struct NativeGraphSequence {
+    inner: seismic_runtime::native::graph::NativeGraphSequence,
+}
+
+impl NativeGraphSequence {
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+    /// Submit every queued run without waiting; the completion reports all
+    /// of them.
+    pub fn submit(self) -> Result<NativeGraphCompletion, CallError> {
+        self.inner
+            .submit()
+            .map(|inner| NativeGraphCompletion { inner })
     }
 }
 
@@ -1509,6 +1631,24 @@ pub mod generated {
             .cloned())
     }
 
+    /// Digest of the entry's implementation for `device`'s backend at these
+    /// bindings and static values, for keying stored tuning results.
+    pub fn digest_native<E: Entry>(
+        device: &Device,
+        statics: &NativeSpecialization,
+        elements: &[(&str, Element)],
+    ) -> Result<String, TuneError> {
+        let module = E::module().map_err(|error| TuneError::Declaration(error.to_string()))?;
+        let entry = E::resolve(module).map_err(|error| TuneError::Declaration(error.to_string()))?;
+        seismic_runtime::native::tune::implementation_digest(
+            device.inner(),
+            module.checked(),
+            entry.id(),
+            &element_bindings(elements),
+            statics,
+        )
+    }
+
     pub fn tune_native<E: Entry>(
         device: &Device,
         statics: &NativeSpecialization,
@@ -1516,7 +1656,7 @@ pub mod generated {
         cpu: Option<&'static native_cpu::CpuNativeKernels>,
         points: Vec<TuningPoint<'_, E>>,
         validation: Validation,
-        measure: MeasureOptions,
+        strategy: Strategy,
     ) -> Result<TuningResult, TuneError> {
         let module = E::module().map_err(|error| TuneError::Declaration(error.to_string()))?;
         let entry = E::resolve(module).map_err(|error| TuneError::Declaration(error.to_string()))?;
@@ -1533,10 +1673,11 @@ pub mod generated {
                     label: point.label,
                     weight: point.weight,
                     rotation: point.rotation.into_iter().map(E::encode).collect(),
+                    initialize: point.initialize,
                 })
                 .collect(),
             validation,
-            measure,
+            strategy,
         })
     }
 

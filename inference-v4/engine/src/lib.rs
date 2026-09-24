@@ -4,6 +4,7 @@
 pub mod chat;
 pub mod composition;
 mod execution;
+pub use execution::build_native_domain;
 pub mod generation;
 pub mod inputs;
 pub mod options;

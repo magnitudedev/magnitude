@@ -8,7 +8,7 @@ use magnitude_engine::{
     serving::Config as ServerConfig,
     telemetry::{Telemetry, DEFAULT_TRACES_ENDPOINT},
 };
-use magnitude_model_executor::ExecutionPath;
+use magnitude_model_executor::{platform::DeviceRequest, ExecutionPath};
 use std::{path::PathBuf, time::Duration};
 
 struct Options {
@@ -24,6 +24,8 @@ struct Options {
     method: ModelMethod,
     mtp_proposals: Option<u8>,
     telemetry_endpoint: String,
+    device: DeviceRequest,
+    kernel_cache: Option<PathBuf>,
 }
 
 fn value(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<String, String> {
@@ -44,6 +46,8 @@ fn parse() -> Result<Options, String> {
     let mut method = ModelMethod::Auto;
     let mut mtp_proposals = None;
     let mut telemetry_endpoint = DEFAULT_TRACES_ENDPOINT.to_owned();
+    let mut device = DeviceRequest::Automatic;
+    let mut kernel_cache = None;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -97,12 +101,19 @@ fn parse() -> Result<Options, String> {
                 )
             }
             "--telemetry" => telemetry_endpoint = value(&flag, &mut args)?,
+            "--device" => {
+                device = value(&flag, &mut args)?
+                    .parse()
+                    .map_err(|error| format!("{error}"))?
+            }
+            "--cache-dir" => kernel_cache = Some(PathBuf::from(value(&flag, &mut args)?)),
             "--help" | "-h" => {
                 println!(
                     "magnitude-engine --model TARGET.gguf [--projector PROJECTOR.gguf | --no-projector] \
                      [--host ADDR] [--port N] [--served-model NAME] [--context-tokens N] [--storage-gib N] \
                      [--max-batch N] [--output-capacity N] [--method auto|plain|mtp] \
-                     [--mtp-proposals N] [--telemetry URL]"
+                     [--mtp-proposals N] [--telemetry URL] \
+                     [--device auto|metal|cuda|cpu|SELECTOR] [--cache-dir DIR]"
                 );
                 std::process::exit(0);
             }
@@ -135,6 +146,8 @@ fn parse() -> Result<Options, String> {
         method,
         mtp_proposals,
         telemetry_endpoint,
+        device,
+        kernel_cache,
     })
 }
 
@@ -174,8 +187,10 @@ fn run() -> Result<(), String> {
             retention_bytes: None,
             safety_reserve_bytes,
         },
-        path: ExecutionPath::NativeMetal,
+        path: ExecutionPath::Native,
+        device: options.device,
         control_capacity: 256,
+        kernel_cache: options.kernel_cache,
     }
     .resolve()?;
     let context_tokens = usize::try_from(resolved.artifacts.definition().geometry.context_limit)
@@ -183,7 +198,9 @@ fn run() -> Result<(), String> {
     let vocabulary = usize::try_from(resolved.artifacts.definition().geometry.vocabulary)
         .map_err(|_| "model vocabulary exceeds host domain")?;
     let method = resolved.manifest.model.method.policy();
-    let server = resolved.start()?.into_server(
+    let ready = resolved.start()?;
+    let backend = ready.ready_info().backend;
+    let server = ready.into_server(
         MediaSourcePolicy::data_urls_only(),
         CacheLimits {
             entries: 16,
@@ -215,8 +232,12 @@ fn run() -> Result<(), String> {
             .await
             .map_err(|error| format!("binding {address}: {error}"))?;
         eprintln!(
-            "magnitude-engine: model={} path=native-metal context={} vocabulary={} max_batch={}",
-            options.served_model, context_tokens, vocabulary, options.max_batch
+            "magnitude-engine: model={} path=native backend={} context={} vocabulary={} max_batch={}",
+            options.served_model,
+            backend.as_str(),
+            context_tokens,
+            vocabulary,
+            options.max_batch
         );
         eprintln!("magnitude-engine: serving http://{address}/v1/chat/completions");
         server.serve(listener, std::future::pending::<()>()).await

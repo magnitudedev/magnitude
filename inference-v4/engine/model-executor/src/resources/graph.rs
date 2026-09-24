@@ -14,17 +14,18 @@ pub struct NativeGraphPool {
 }
 
 impl NativeGraphPool {
+    /// Every slot of the pool with its storage, `upload_regions` upload
+    /// regions per workspace slot among it; nothing is allocated later.
     pub(crate) fn new(
         domain: ResourceDomainId,
         family: &NativeGraphFamily,
-        workspace_slots: usize,
-        output_slots: usize,
+        charge: crate::NativeGraphCharge,
     ) -> Result<Self, super::AllocationError> {
-        let workspace = (0..workspace_slots)
-            .map(|_| family.new_slot())
+        let workspace = (0..charge.workspace_slots)
+            .map(|_| family.new_slot(charge.upload_regions))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| super::AllocationError::Device(error.to_string()))?;
-        let output = (0..output_slots)
+        let output = (0..charge.output_slots)
             .map(|_| family.new_output_slot())
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| super::AllocationError::Device(error.to_string()))?;
