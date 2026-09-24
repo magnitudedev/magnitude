@@ -14,12 +14,12 @@ use seismic_lang::registry::bf16_round;
 
 const ROWS: [usize; 8] = [1, 3, 8, 12, 16, 17, 40, 128];
 
-/// The specialization of an entry; `split` for entries declaring SPLIT.
-fn specialization(statics: &[(&str, usize)], mapping: Mapping, split: bool) -> NativeSpecialization {
+/// The specialization of an entry.
+fn specialization(statics: &[(&str, usize)], mapping: Mapping) -> NativeSpecialization {
     let spec = statics
         .iter()
         .fold(NativeSpecialization::new(), |spec, (name, value)| spec.with_static(*name, *value as u64));
-    mapping.params(spec, split)
+    mapping.params(spec)
 }
 
 /// One segment's expected A-rounded projection and tolerance over operand
@@ -103,7 +103,7 @@ fn cuda_recurrent_project_matches_host_model() {
                         BW: element(formats[3]),
                         A: Element::bf16(),
                     },
-                    &specialization(&[("H", h), ("NK", nk), ("NV", nv), ("W", w)], mapping, false),
+                    &specialization(&[("H", h), ("NK", nk), ("NV", nv), ("W", w)], mapping),
                 )
                 .unwrap()
                 .call(qwen_recurrent_project::Args {
@@ -219,7 +219,7 @@ fn cuda_recurrent_output_matches_host_model() {
                 let result = qwen_recurrent_output::native_for_device_with(
                     &device,
                     qwen_recurrent_output::Elements { A: Element::bf16(), RN: Element::f32(), OW: format.resident() },
-                    &specialization(&[("H", case.h), ("NK", case.nk), ("NV", case.nv), ("W", case.w)], mapping, true),
+                    &specialization(&[("H", case.h), ("NK", case.nk), ("NV", case.nv), ("W", case.w)], mapping),
                 )
                 .unwrap()
                 .call(qwen_recurrent_output::Args {
@@ -345,7 +345,7 @@ fn cuda_attention_project_matches_host_model() {
                         VW: formats[2].resident(),
                         A: Element::bf16(),
                     },
-                    &specialization(&[("D", d), ("KV", kv), ("G", g), ("W", w)], mapping, false),
+                    &specialization(&[("D", d), ("KV", kv), ("G", g), ("W", w)], mapping),
                 )
                 .unwrap()
                 .call(qwen_attention_project::Args {
@@ -397,7 +397,7 @@ fn cuda_attention_output_matches_host_model() {
                 let result = attention_output::native_for_device_with(
                     &device,
                     attention_output::Elements { A: Element::bf16(), OW: format.resident() },
-                    &specialization(&[("D", d), ("Q", q), ("W", w)], mapping, true),
+                    &specialization(&[("D", d), ("Q", q), ("W", w)], mapping),
                 )
                 .unwrap()
                 .call(attention_output::Args { hidden: &hidden, gated: &gated_tensor, output_weight: &output.tensor })
@@ -437,7 +437,7 @@ fn cuda_projection_block_timings() {
     let output_weights: Vec<Tensor> = (0..rotation * 2).map(|_| timing_weight(&device, Format::Q5K, h, z)).collect();
     let project_bytes: f64 = project_weights[0].iter().map(|t| t.byte_len() as f64).sum();
     let output_bytes = output_weights[0].byte_len() as f64;
-    for m in [1usize, 8, 128] {
+    for m in timing_rows(&[1, 8, 32, 128, 512]) {
         let hidden = f32_tensor(&device, &[m as u64, h as u64], &vec![0.5; m * h]);
         let norm = f32_tensor(&device, &[h as u64], &vec![1.0; h]);
         let mixed = bf16_tensor(&device, &[m as u64, nv as u64, w as u64], &vec![0.25; m * z]);
@@ -454,7 +454,7 @@ fn cuda_projection_block_timings() {
                     BW: Format::Q8.resident(),
                     A: Element::bf16(),
                 },
-                &specialization(&[("H", h), ("NK", nk), ("NV", nv), ("W", w)], mapping, false),
+                &specialization(&[("H", h), ("NK", nk), ("NV", nv), ("W", w)], mapping),
             )
             .unwrap();
             let args = project_weights
@@ -480,7 +480,7 @@ fn cuda_projection_block_timings() {
             let kernel = qwen_recurrent_output::native_for_device_with(
                 &device,
                 qwen_recurrent_output::Elements { A: Element::bf16(), RN: Element::f32(), OW: Format::Q5K.resident() },
-                &specialization(&[("H", h), ("NK", nk), ("NV", nv), ("W", w)], mapping, true),
+                &specialization(&[("H", h), ("NK", nk), ("NV", nv), ("W", w)], mapping),
             )
             .unwrap();
             let args = output_weights

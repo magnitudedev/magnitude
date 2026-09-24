@@ -16,33 +16,52 @@ include!("attention_common/fixtures.rs");
 
 const KEY_BITS: u32 = 8;
 const VALUE_BITS: u32 = 4;
+/// Values per (scale, zero) pair: the codec's group (model-state
+/// `AFFINE_GROUP`).
+const GROUP: usize = 32;
+
+/// Two affine groups per head vector, for the decode portable-body comparison.
+const GROUPED: Geometry = Geometry { kv: 2, g: 2, p: 8, s: 48 };
+
+/// F16 coefficient elements of one head vector: a (scale, zero) pair per
+/// group.
+fn coefficient_elements(width: usize) -> usize {
+    2 * width / GROUP
+}
 
 /// One vector's affine encoding: codes packed B bits each into u32 words
 /// (code i at bits B * (i % (32 / B)) of word i / (32 / B)) and the F16 bits
-/// of (scale, zero), exactly as the portable body defines it.
-fn encode(x: &[f32], bits: u32) -> (Vec<u32>, [u16; 2]) {
+/// of (scale, zero) per group of GROUP values, exactly as the portable body
+/// defines it.
+fn encode(x: &[f32], bits: u32) -> (Vec<u32>, Vec<u16>) {
     let levels = (1u32 << bits) - 1;
-    let low = x.iter().copied().fold(f32::INFINITY, f32::min);
-    let high = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let zero = f16_bits(low);
-    let scale = f16_bits((high - low) / levels as f32);
-    let inverse = if f16_to_f32(scale) > 0.0 { 1.0 / f16_to_f32(scale) } else { 0.0 };
     let per = (32 / bits) as usize;
     let mut words = vec![0u32; x.len() / per];
-    for (i, value) in x.iter().enumerate() {
-        let code = ((value - f16_to_f32(zero)).mul_add(inverse, 0.5) as u32).min(levels);
-        words[i / per] |= code << ((i % per) as u32 * bits);
+    let mut coefficients = Vec::with_capacity(coefficient_elements(x.len()));
+    for (group, values) in x.chunks_exact(GROUP).enumerate() {
+        let low = values.iter().copied().fold(f32::INFINITY, f32::min);
+        let high = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let zero = f16_bits(low);
+        let scale = f16_bits((high - low) / levels as f32);
+        let inverse = if f16_to_f32(scale) > 0.0 { 1.0 / f16_to_f32(scale) } else { 0.0 };
+        for (offset, value) in values.iter().enumerate() {
+            let i = group * GROUP + offset;
+            let code = ((value - f16_to_f32(zero)).mul_add(inverse, 0.5) as u32).min(levels);
+            words[i / per] |= code << ((i % per) as u32 * bits);
+        }
+        coefficients.extend([scale, zero]);
     }
-    (words, [scale, zero])
+    (words, coefficients)
 }
 
-fn decode(words: &[u32], coefficients: [u16; 2], bits: u32, width: usize) -> Vec<f32> {
+fn decode(words: &[u32], coefficients: &[u16], bits: u32, width: usize) -> Vec<f32> {
     let per = (32 / bits) as usize;
     let mask = (1u32 << bits) - 1;
     (0..width)
         .map(|i| {
             let code = (words[i / per] >> ((i % per) as u32 * bits)) & mask;
-            (code as f32).mul_add(f16_to_f32(coefficients[0]), f16_to_f32(coefficients[1]))
+            let pair = &coefficients[i / GROUP * 2..][..2];
+            (code as f32).mul_add(f16_to_f32(pair[0]), f16_to_f32(pair[1]))
         })
         .collect()
 }
@@ -81,10 +100,15 @@ impl Planes {
     fn decoded(&self, geometry: Geometry, vector: usize) -> (Vec<f32>, Vec<f32>) {
         let w = geometry.w();
         let (kw, vw) = (w * KEY_BITS as usize / 32, w * VALUE_BITS as usize / 32);
-        let coefficients = |plane: &[u16]| [plane[vector * 2], plane[vector * 2 + 1]];
+        let c = coefficient_elements(w);
         (
-            decode(&self.key_codes[vector * kw..][..kw], coefficients(&self.key_coefficients), KEY_BITS, w),
-            decode(&self.value_codes[vector * vw..][..vw], coefficients(&self.value_coefficients), VALUE_BITS, w),
+            decode(&self.key_codes[vector * kw..][..kw], &self.key_coefficients[vector * c..][..c], KEY_BITS, w),
+            decode(
+                &self.value_codes[vector * vw..][..vw],
+                &self.value_coefficients[vector * c..][..c],
+                VALUE_BITS,
+                w,
+            ),
         )
     }
 }
@@ -115,6 +139,7 @@ impl Encoded {
         let (gated, keys, values) = decoded.expected();
         let mut planes = self.planes.clone();
         let (kw, vw) = (w * KEY_BITS as usize / 32, w * VALUE_BITS as usize / 32);
+        let c = coefficient_elements(w);
         for &destination in &self.case.destinations {
             if destination < 0 {
                 continue;
@@ -123,10 +148,10 @@ impl Encoded {
                 let vector = destination as usize * geometry.kv + head;
                 let (codes, coefficients) = encode(&keys[vector * w..][..w], KEY_BITS);
                 planes.key_codes[vector * kw..][..kw].copy_from_slice(&codes);
-                planes.key_coefficients[vector * 2..][..2].copy_from_slice(&coefficients);
+                planes.key_coefficients[vector * c..][..c].copy_from_slice(&coefficients);
                 let (codes, coefficients) = encode(&values[vector * w..][..w], VALUE_BITS);
                 planes.value_codes[vector * vw..][..vw].copy_from_slice(&codes);
-                planes.value_coefficients[vector * 2..][..2].copy_from_slice(&coefficients);
+                planes.value_coefficients[vector * c..][..c].copy_from_slice(&coefficients);
             }
         }
         (gated, planes)
@@ -200,9 +225,17 @@ impl Bound {
             fresh: i32_tensor(device, &[m, 2], &case.fresh),
             destinations: i32_tensor(device, &[m], &case.destinations),
             key_codes: u32_tensor(device, &[t, kv, w / 4], &encoded.planes.key_codes),
-            key_coefficients: f16_tensor(device, &[t, kv, 2], &encoded.planes.key_coefficients),
+            key_coefficients: f16_tensor(
+                device,
+                &[t, kv, coefficient_elements(w)],
+                &encoded.planes.key_coefficients,
+            ),
             value_codes: u32_tensor(device, &[t, kv, w / 8], &encoded.planes.value_codes),
-            value_coefficients: f16_tensor(device, &[t, kv, 2], &encoded.planes.value_coefficients),
+            value_coefficients: f16_tensor(
+                device,
+                &[t, kv, coefficient_elements(w)],
+                &encoded.planes.value_coefficients,
+            ),
         }
     }
 
@@ -346,9 +379,12 @@ fn check(label: &str, encoded: &Encoded, gated: &Tensor, bound: &Bound, expected
         let (key, value) = planes.decoded(geometry, vector);
         let (expected_key, expected_value) = expected.1.decoded(geometry, vector);
         if appended.contains(&vector) {
-            let step = |coefficients: &[u16]| f16_to_f32(coefficients[vector * 2]);
-            let (key_step, value_step) = (step(&expected.1.key_coefficients), step(&expected.1.value_coefficients));
             for column in 0..w {
+                let step = |coefficients: &[u16]| {
+                    f16_to_f32(coefficients[vector * coefficient_elements(w) + column / GROUP * 2])
+                };
+                let (key_step, value_step) =
+                    (step(&expected.1.key_coefficients), step(&expected.1.value_coefficients));
                 assert!(
                     (key[column] - expected_key[column]).abs()
                         <= 1.01 * key_step + 8.0e-3 * expected_key[column].abs().max(1.0),
@@ -421,9 +457,9 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
         tensor(DType::I32, vec![m, 2], ints(&case.fresh)),
         tensor(DType::I32, vec![m], ints(&case.destinations)),
         tensor(DType::U32, vec![t, kv, w / 4], unsigned(&planes.key_codes)),
-        tensor(DType::F16, vec![t, kv, 2], halves(&planes.key_coefficients)),
+        tensor(DType::F16, vec![t, kv, coefficient_elements(w)], halves(&planes.key_coefficients)),
         tensor(DType::U32, vec![t, kv, w / 8], unsigned(&planes.value_codes)),
-        tensor(DType::F16, vec![t, kv, 2], halves(&planes.value_coefficients)),
+        tensor(DType::F16, vec![t, kv, coefficient_elements(w)], halves(&planes.value_coefficients)),
         Arg::Scalar(ReferenceScalar::F32(case.epsilon.to_bits())),
         Arg::Scalar(ReferenceScalar::F32(case.scale.to_bits())),
     ];
@@ -460,8 +496,9 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
     for vector in 0..t * kv {
         let (key, _) = portable.decoded(case.geometry, vector);
         let (expected_key, _) = expected.1.decoded(case.geometry, vector);
-        let step = f16_to_f32(expected.1.key_coefficients[vector * 2]);
         for column in 0..w {
+            let step =
+                f16_to_f32(expected.1.key_coefficients[vector * coefficient_elements(w) + column / GROUP * 2]);
             assert!(
                 (key[column] - expected_key[column]).abs() <= 1.01 * step + 8.0e-3 * expected_key[column].abs().max(1.0),
                 "{entry} portable key vector {vector}[{column}] {}, host model {}",
@@ -474,15 +511,15 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
 
 #[test]
 fn decode_matches_portable_body() {
-    let encoded = Encoded::new(Case::new(SMALL, 64, 2, &decode_rows(5), 11));
+    let encoded = Encoded::new(Case::new(GROUPED, 64, 2, &decode_rows(5), 11));
     check_host_model_against_portable_body("qwen_attention_decode_k8v4", &encoded);
     let expected = encoded.expected();
     for (backend, device) in accelerators() {
         for config in decode_configs(backend) {
-            let kernel = decode_kernel(&device, SMALL, &config);
+            let kernel = decode_kernel(&device, GROUPED, &config);
             let mut bound = Bound::new(&device, &encoded);
             let gated = kernel.call(args!(qwen_attention_decode_k8v4, bound, encoded.case)).unwrap().value;
-            check(&format!("{backend:?} small decode {config:?}"), &encoded, &gated, &bound, &expected);
+            check(&format!("{backend:?} grouped decode {config:?}"), &encoded, &gated, &bound, &expected);
         }
     }
 }
@@ -491,6 +528,8 @@ fn decode_matches_portable_body() {
 fn prefill_matches_portable_body() {
     // 300 history rows are 10 key tiles: the split configurations split the
     // first sequence's history spans over two partitions and merge them.
+    // One affine group per vector keeps the interpreter's prefill affordable;
+    // the Qwen geometry test covers eight groups.
     let encoded = Encoded::new(Case::new(SMALL, 400, 2, &prefill_rows(20, 300), 23));
     check_host_model_against_portable_body("qwen_attention_prefill_k8v4", &encoded);
     let expected = encoded.expected();
@@ -603,7 +642,8 @@ fn decode_timing() {
                     .measure(vec![args!(qwen_attention_decode_k8v4, bound, encoded.case)], &TIMING)
                     .unwrap()
                     .median;
-                let affine_bytes = (context * QWEN.kv * (QWEN.w() + QWEN.w() / 2 + 8)) as f64;
+                let affine_bytes =
+                    (context * QWEN.kv * (QWEN.w() + QWEN.w() / 2 + 4 * coefficient_elements(QWEN.w()))) as f64;
                 let dense_bytes = (context * QWEN.kv * QWEN.w() * 4) as f64;
                 // The dense entry's domain may not admit this configuration.
                 let dense_time = qwen_attention_decode::native_for_device_with(

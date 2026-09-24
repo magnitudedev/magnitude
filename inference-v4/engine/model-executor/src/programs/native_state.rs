@@ -6,7 +6,6 @@ use crate::{
     SubmitError, ValidatedStateLaunch, native::AttestedState,
 };
 use magnitude_model_kernels::copy_rows;
-use magnitude_model_state::StateStore;
 use seismic::{
     Device, Element, NativeGraphBindings, NativeGraphFamily, NativeGraphFamilySlot,
     NativeGraphOutputs, NativeGraphPlan, NativePort, Tensor,
@@ -23,24 +22,12 @@ fn device(error: impl ToString) -> SubmitError {
     SubmitError::Device(DeviceError::Execution(error.to_string()))
 }
 pub struct NativeStateProgram {
-    repair: Option<(super::native_target::NativeTargetProgram, Rc<StateStore>)>,
     graphs: Rc<PreparedStateCopyGraphs>,
 }
 
 impl NativeStateProgram {
     pub(crate) fn new(graphs: Rc<PreparedStateCopyGraphs>) -> Self {
-        Self {
-            repair: None,
-            graphs,
-        }
-    }
-    pub(crate) fn with_repair(
-        mut self,
-        target: super::native_target::NativeTargetProgram,
-        store: Rc<StateStore>,
-    ) -> Self {
-        self.repair = Some((target, store));
-        self
+        Self { graphs }
     }
 
     fn execute(
@@ -115,31 +102,6 @@ impl NativeStateProgram {
             StateWork::CodecConversion(_) => Err(invalid(
                 "codec conversion has no defined native numerical implementation",
             )),
-            StateWork::RecurrentRepair {
-                advance,
-                conditioning,
-                conditioning_slices,
-                graph_workspace,
-                graph_outputs,
-            } => {
-                let (target, store) = self
-                    .repair
-                    .as_ref()
-                    .ok_or_else(|| invalid("repair target program is not bound"))?;
-                let replay = batch
-                    .replay()
-                    .ok_or_else(|| invalid("repair replay controls are absent"))?;
-                let history = store.history_planes().map_err(device)?;
-                target.execute_repair(
-                    replay,
-                    advance,
-                    &history,
-                    conditioning.as_ref(),
-                    conditioning_slices,
-                    graph_workspace,
-                    graph_outputs,
-                )
-            }
         }
     }
 }

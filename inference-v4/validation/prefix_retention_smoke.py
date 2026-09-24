@@ -143,7 +143,9 @@ def timing(port, tokens=300):
             if not line.startswith("data:") or line == "data: [DONE]":
                 continue
             choices = json.loads(line[5:]).get("choices") or []
-            if choices and choices[0].get("delta", {}).get("content"):
+            # Every generated token streams as content or, while the model thinks, reasoning.
+            delta = choices[0].get("delta", {}) if choices else {}
+            if delta.get("content") or delta.get("reasoning_content"):
                 arrivals.append(time.perf_counter())
     intervals = [(b - a) * 1000 for a, b in zip(arrivals, arrivals[1:])]
     if len(intervals) < 20:

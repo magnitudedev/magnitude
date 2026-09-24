@@ -88,10 +88,10 @@ void qwen_recurrent_output_gemm() {
         uint64_t(OUTPUT_K), 1ul, OUTPUT_K, 0ul);
     const uint m = uint(SEISMIC_DIM_M), n = uint(SEISMIC_DIM_H);
 #if SEISMIC_TUNE_SPLIT == 1
-    projection_gemm(OUTPUT_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, x, recurrent_output_output(),
+    projection_gemm(OUTPUT_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, recurrent_output_output(),
         recurrent_output_weight(), m, n, OUTPUT_K, gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
 #else
-    projection_gemm_part(OUTPUT_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, x,
+    projection_gemm_part(OUTPUT_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x,
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), recurrent_output_weight(), m, n, OUTPUT_K, SEISMIC_TUNE_SPLIT,
         gl_WorkGroupID.z, gl_WorkGroupID.y, gl_WorkGroupID.x);
 #endif

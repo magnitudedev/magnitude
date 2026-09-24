@@ -1,8 +1,15 @@
-"""Chat continuations of contiguous book passages, independent of session scheduling."""
+"""Chat requests over contiguous book passages, independent of session scheduling.
+
+Two workloads share one sizing policy. ``prose-continue`` asks for new prose after the
+passage; its output varies by engine and numerics. ``prose-repeat`` asks for the passage
+back, starting at the first sentence of "Loomings" at every checkpoint, so each request's
+256-token output is the same text regardless of context size.
+"""
 
 import re
 from dataclasses import dataclass
 from functools import cached_property
+from typing import Literal
 
 from pydantic import JsonValue
 
@@ -13,19 +20,48 @@ from .records import digest
 PASSAGE_WORDS = 256
 CONTINUATION_WORDS = 128
 INSTRUCTION = "Continue the passage below in prose. Return only the continuation.\n\n"
+REPEAT_INSTRUCTION = "Copy the supplied passage exactly. Output only its text.\n\n"
+REPEAT_START = "Call me Ishmael."
+# The repeated text is single-spaced with ASCII quotes, as V3's Loomings repeat recipe rendered it.
+STRAIGHT_QUOTES = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"'})
+
+ProseWorkload = Literal["prose-continue", "prose-repeat"]
 
 
 @dataclass(frozen=True)
 class Prose:
     text: str
     provenance: dict[str, str]
+    workload: ProseWorkload = "prose-continue"
+
+    @property
+    def repeating(self) -> bool:
+        return self.workload == "prose-repeat"
+
+    @cached_property
+    def body(self) -> str:
+        if self.repeating:
+            return " ".join(self.text.translate(STRAIGHT_QUOTES).split())
+        return self.text
 
     @cached_property
     def word_ends(self) -> tuple[int, ...]:
-        return (0, *(m.end() for m in re.finditer(r"\S+\s*", self.text)))
+        return (0, *(m.end() for m in re.finditer(r"\S+\s*", self.body)))
+
+    @cached_property
+    def start_word(self) -> int:
+        if not self.repeating:
+            return 0
+        return self.word_ends.index(self.body.index(REPEAT_START))
+
+    @property
+    def fixture(self) -> str:
+        return "prose.moby-dick.repeat" if self.repeating else "prose.moby-dick"
 
     @property
     def identity(self) -> str:
+        if self.repeating:
+            return digest({**self.provenance, "workload": self.workload})
         return digest(self.provenance)
 
 
@@ -33,14 +69,15 @@ class ProseHistory:
     def __init__(self, source: Prose, identity: str):
         self.source, self.identity = source, identity
         self.ends = source.word_ends
-        self.cursor = 0
+        self.cursor = source.start_word
         self.messages: list[dict[str, JsonValue]] = [
             {"role": "system", "content": f"Reading session {identity}."}
         ]
         self.pending: Context | None = None
-        self.end = 0
+        self.start = self.cursor
+        self.end = self.cursor
         self.current = Interaction(
-            id="prose.moby-dick",
+            id=source.fixture,
             category="prose",
             messages=[],
             tools=[],
@@ -49,7 +86,8 @@ class ProseHistory:
         )
 
     def passage(self, start: int, end: int) -> str:
-        return self.source.text[self.ends[start] : self.ends[end]]
+        text = self.source.body[self.ends[start] : self.ends[end]]
+        return text.rstrip() if self.source.repeating else text
 
     async def prepare(self, target: int, counter: Counter, sizing_identity: str) -> PreparedContext:
         if target < 0:
@@ -57,11 +95,12 @@ class ProseHistory:
         available = len(self.ends) - 1 - self.cursor - CONTINUATION_WORDS
         if available < PASSAGE_WORDS:
             raise ValueError("Moby Dick has no remaining passage and canonical continuation")
+        instruction = REPEAT_INSTRUCTION if self.source.repeating else INSTRUCTION
 
         async def evaluate(words: int) -> tuple[Context, int]:
             message: dict[str, JsonValue] = {
                 "role": "user",
-                "content": INSTRUCTION + self.passage(self.cursor, self.cursor + words),
+                "content": instruction + self.passage(self.cursor, self.cursor + words),
             }
             context = Context(messages=[*self.messages, message])
             count = await counter(context)
@@ -86,6 +125,7 @@ class ProseHistory:
                 high, context, count = middle, candidate, size
             else:
                 low = middle
+        self.start = self.cursor
         self.end = self.cursor + high
         self.pending = context
         self.current = self.current.model_copy(update={"messages": context.messages[-1:]})
@@ -94,8 +134,10 @@ class ProseHistory:
             tokens=count,
             provenance={
                 **self.source.provenance,
-                "fixture": "prose.moby-dick",
-                "recipe": "prose-chat-history-v1",
+                "fixture": self.source.fixture,
+                "recipe": (
+                    "prose-repeat-history-v1" if self.source.repeating else "prose-chat-history-v1"
+                ),
                 "history": self.identity,
                 "passage_start_word": self.cursor,
                 "passage_end_word": self.end,
@@ -110,12 +152,14 @@ class ProseHistory:
     def complete(self) -> None:
         if self.pending is None:
             raise ValueError("prose history has no prepared request")
+        # The canonical answer repeats the passage's opening words, or continues after it.
+        answer = self.start if self.source.repeating else self.end
         self.messages = [
             *self.pending.messages,
             {
                 "role": "assistant",
-                "content": self.passage(self.end, self.end + CONTINUATION_WORDS),
+                "content": self.passage(answer, answer + CONTINUATION_WORDS),
             },
         ]
-        self.cursor = self.end + CONTINUATION_WORDS
+        self.cursor = self.end if self.source.repeating else self.end + CONTINUATION_WORDS
         self.pending = None

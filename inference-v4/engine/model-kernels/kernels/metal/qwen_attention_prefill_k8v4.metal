@@ -1,12 +1,9 @@
 #include "common/attention.h"
 
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_F32)
-#error "prefill attention stages 2-byte activations in threadgroup memory"
-#endif
-
 // The three launches over affine K8/V4 history (bodies in common/attention.h):
 // the prepare launch appends encoded rows, and every history K/V tile is
-// decoded into the activation dtype as it is staged.
+// decoded to F16 as it is staged; every product takes F16 operands
+// (attention::affine_history). The scratch rows are F16.
 
 kernel void qwen_attention_prefill_k8v4_prepare(
     device const attention::Scalar *query_gate [[buffer(SEISMIC_BUFFER_QUERY_GATE)]],
@@ -22,9 +19,9 @@ kernel void qwen_attention_prefill_k8v4_prepare(
     device half *key_coefficients [[buffer(SEISMIC_BUFFER_HISTORY_KEY_COEFFICIENTS)]],
     device uint *value_codes [[buffer(SEISMIC_BUFFER_HISTORY_VALUE_CODES)]],
     device half *value_coefficients [[buffer(SEISMIC_BUFFER_HISTORY_VALUE_COEFFICIENTS)]],
-    device attention::Scalar *queries [[buffer(SEISMIC_BUFFER_SCRATCH_QUERIES)]],
-    device attention::Scalar *keys [[buffer(SEISMIC_BUFFER_SCRATCH_KEYS)]],
-    device attention::Scalar *values [[buffer(SEISMIC_BUFFER_SCRATCH_VALUES)]],
+    device half *queries [[buffer(SEISMIC_BUFFER_SCRATCH_QUERIES)]],
+    device half *keys [[buffer(SEISMIC_BUFFER_SCRATCH_KEYS)]],
+    device half *values [[buffer(SEISMIC_BUFFER_SCRATCH_VALUES)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint group [[threadgroup_position_in_grid]],
     uint simd [[simdgroup_index_in_threadgroup]],
@@ -45,9 +42,9 @@ kernel void qwen_attention_prefill_k8v4_attend(
     device uint *value_codes [[buffer(SEISMIC_BUFFER_HISTORY_VALUE_CODES)]],
     device half *value_coefficients [[buffer(SEISMIC_BUFFER_HISTORY_VALUE_COEFFICIENTS)]],
     device attention::Scalar *gated [[buffer(SEISMIC_RESULT_0_BUFFER)]],
-    device const attention::Scalar *queries [[buffer(SEISMIC_BUFFER_SCRATCH_QUERIES)]],
-    device const attention::Scalar *keys [[buffer(SEISMIC_BUFFER_SCRATCH_KEYS)]],
-    device const attention::Scalar *values [[buffer(SEISMIC_BUFFER_SCRATCH_VALUES)]],
+    device const half *queries [[buffer(SEISMIC_BUFFER_SCRATCH_QUERIES)]],
+    device const half *keys [[buffer(SEISMIC_BUFFER_SCRATCH_KEYS)]],
+    device const half *values [[buffer(SEISMIC_BUFFER_SCRATCH_VALUES)]],
     device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
     device float *statistics [[buffer(SEISMIC_BUFFER_SCRATCH_STATISTICS)]],
     device uint *counts [[buffer(SEISMIC_BUFFER_SCRATCH_COUNTS)]],

@@ -157,7 +157,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             TargetTokens::Host,
             advances,
             conditioning,
-            conditioning_slices.clone(),
+            conditioning_slices,
             graph_workspace,
             graph_outputs,
             readout_workspace,
@@ -194,9 +194,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             requests: metadata,
             submission,
             started,
+            runnable: started,
             previous_selection: self.selection_read.take(),
-            slots,
-            conditioning_slices,
             id: self.flight_id(),
             continuation: None,
         })
@@ -227,7 +226,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         };
         let finish_started = Instant::now();
-        let physical_duration = flight.started.elapsed();
+        let physical_duration = flight.runnable.elapsed();
         let (core, output) = completed.into_parts();
         let crate::TargetOutput {
             readout: output,
@@ -253,7 +252,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.selection_read = Some(Instant::now());
             decode_selected(&bytes)?
         };
-        self.predecessor_selected(flight.id, &selected);
+        self.predecessor_selected(flight.id, &selected, finish_started);
         let mut physical = vec![RowResult::default(); batch.actual_rows()];
         for (projected_index, &output_index) in output
             .as_ref()
@@ -349,14 +348,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let mut pending = Vec::with_capacity(flight.requests.len());
         let mut offset = 0usize;
         let mut continuation = flight.continuation;
-        for (index, ((((request, rows, conditioning, kind, committed_rows), advance), slot), slices)) in
-            flight
-                .requests
-                .into_iter()
-                .zip(advances)
-                .zip(flight.slots)
-                .zip(flight.conditioning_slices)
-                .enumerate()
+        for (index, ((request, rows, _, kind, committed_rows), advance)) in
+            flight.requests.into_iter().zip(advances).enumerate()
         {
             let end = offset
                 .checked_add(rows)
@@ -396,9 +389,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 committed_rows,
                 kind,
                 physical_duration,
-                slot: Some(slot),
-                conditioning,
-                conditioning_slices: slices,
                 image: None,
             });
         }
@@ -497,8 +487,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Slot {
                 rows,
                 bank: i32::try_from(binding.previous_bank).map_err(|_| "bank exceeds i32")?,
+                previous_tape: i32::try_from(binding.previous_tape)
+                    .map_err(|_| "tape rows exceed i32")?,
                 following_bank: i32::try_from(binding.following_bank)
                     .map_err(|_| "successor bank exceeds i32")?,
+                stop: i32::try_from(binding.stop).map_err(|_| "committed rows exceed i32")?,
             },
             slices,
         ))

@@ -885,6 +885,7 @@ mod tests {
 
     const VULKAN_FEATURES: vulkan::VulkanFeatures = vulkan::VulkanFeatures {
         matrix: false,
+        wide_accumulators: true,
         mixed_dot: true,
         f32_atomic_add: false,
         shared_int64_atomics: false,

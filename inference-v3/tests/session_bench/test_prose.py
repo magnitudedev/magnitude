@@ -7,7 +7,12 @@ import pytest
 from test_client import Fragments, terminal_event
 from test_runner import FixtureAdapter
 
-from benchmark_fixtures.prose_history import CONTINUATION_WORDS, Prose, ProseHistory
+from benchmark_fixtures.prose_history import (
+    CONTINUATION_WORDS,
+    REPEAT_INSTRUCTION,
+    Prose,
+    ProseHistory,
+)
 from session_bench import cli, runner
 from session_bench.client import measure
 from session_bench.models import Target
@@ -72,6 +77,38 @@ async def test_prose_continuation_uses_next_book_words_and_exhaustion_fails(sour
         await history.prepare(10**9, count, "test")
 
 
+@pytest.fixture
+def book():
+    front = "".join(f"front{i} " for i in range(300))
+    body = "".join(f"“word{i}’s” " for i in range(15000))
+    return f"{front}CHAPTER 1. Loomings.\n\nCall me Ishmael. {body}"
+
+
+async def test_prose_repeat_supplies_the_same_opening_at_every_checkpoint(book):
+    source = Prose(book, {"sha256": "pinned-test-source"}, "prose-repeat")
+    assert source.identity != Prose(book, {"sha256": "pinned-test-source"}).identity
+    openings = set()
+    for checkpoint in (0, 4096, 16384):
+        prepared = await ProseHistory(source, "one").prepare(checkpoint, count, "test")
+        content = prepared.content.messages[-1]["content"]
+        assert content.startswith(REPEAT_INSTRUCTION + 'Call me Ishmael. "word0\'s" ')
+        assert not any(quote in content for quote in "‘’“”")
+        assert prepared.provenance["fixture"] == "prose.moby-dick.repeat"
+        assert prepared.tokens >= checkpoint
+        openings.add(content[: len(REPEAT_INSTRUCTION) + 1024])
+    assert len(openings) == 1
+
+
+async def test_prose_repeat_session_repeats_then_moves_to_new_text(book):
+    history = ProseHistory(Prose(book, {"sha256": "pinned"}, "prose-repeat"), "one")
+    first = await history.prepare(4096, count, "test")
+    start, end = first.provenance["passage_start_word"], first.provenance["passage_end_word"]
+    history.complete()
+    assert history.messages[-1]["content"] == history.passage(start, start + CONTINUATION_WORDS)
+    second = await history.prepare(4096, count, "test")
+    assert second.provenance["passage_start_word"] == end
+
+
 @pytest.mark.parametrize(
     "finish,tokens,outcome",
     [
@@ -108,14 +145,18 @@ async def test_prose_completion_budget_is_not_tool_truncation(source, finish, to
     assert result.outcome == outcome
 
 
-def test_prose_command_roundtrip_and_incompatible_filters(tmp_path):
+@pytest.mark.parametrize("workload", ["prose-continue", "prose-repeat"])
+def test_prose_command_roundtrip_and_incompatible_filters(tmp_path, workload):
     target = Target(engine="magnitude", reference=str(tmp_path))
-    command = public_command([target], ("context",), (65536,), ("simple-python",), 1, prose=True)
+    command = public_command(
+        [target], ("context",), (65536,), ("simple-python",), 1, prose=workload
+    )
     args = cli.parser().parse_args(shlex.split(command)[4:])
-    assert args.prose and args.category is None
+    assert args.workload == workload and args.category is None
     assert "--category" not in command
     for flag in ("--case", "--category"):
-        assert cli.main(["run", "--target", f"magnitude={tmp_path}", "--prose", flag, "all"]) == 2
+        argv = ["run", "--target", f"magnitude={tmp_path}", "--workload", workload, flag, "all"]
+        assert cli.main(argv) == 2
     assert runner.capacity([{"request": 65536}], [66000], 256) == 65792
 
 
@@ -140,12 +181,12 @@ async def test_prose_real_process_run_records_mode_and_no_bfcl(
         1,
         None,
         lambda _: None,
-        prose=True,
+        prose="prose-continue",
     )
     assert result["status"] == "completed", result
-    assert result["workload"] == "prose"
+    assert result["workload"] == "prose-continue"
     path = Path(result["path"])
-    assert "--prose" in (path / "command.txt").read_text()
+    assert "--workload prose-continue" in (path / "command.txt").read_text()
     report = (path / "report.md").read_text()
     assert "no answer-quality scoring" in report
     assert "BFCL" not in report

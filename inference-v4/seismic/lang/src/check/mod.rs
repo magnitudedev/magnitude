@@ -959,6 +959,7 @@ pub(crate) fn check_closed(
     }
     Ok(crate::checked::internals::Module {
         id: module_id,
+        program,
         semantic_hash,
         sources,
         entries,

@@ -18,7 +18,7 @@ use crate::{
 use magnitude_model_batching::{Demand, TargetBatchUpload};
 use magnitude_model_contracts::{DecoderGeometry, MixerGeometry};
 use magnitude_model_kernels::conditioning_overlay;
-use magnitude_model_state::{LayerRef, OwnedRepairAdvance, PlaneBuffer};
+use magnitude_model_state::LayerRef;
 use seismic::{
     Device, Element, NativeGraphCompletion, NativeGraphOutputs, NativeGraphPlan,
     NativeGraphSequence, NativePort, Tensor,
@@ -146,15 +146,8 @@ pub struct NativeTargetProgram {
     trace: TargetTrace,
 }
 
-enum RowState<'a> {
-    Forward(&'a TargetLaunchCore),
-    Repair {
-        advance: &'a OwnedRepairAdvance,
-        history: &'a [PlaneBuffer],
-        conditioning: Option<&'a ConditioningRef>,
-        conditioning_slices: &'a [ConditioningSlice],
-    },
-}
+/// The launch whose rows a step runs: its advances' state and conditioning.
+struct RowState<'a>(&'a TargetLaunchCore);
 
 pub struct TargetReadoutGraphResult {
     pub features: GraphOutputTensor,
@@ -187,42 +180,30 @@ struct QueuedStep {
 
 impl RowState<'_> {
     fn slots(&self) -> usize {
-        match self {
-            Self::Forward(core) => core.advances().len(),
-            Self::Repair { .. } => 1,
-        }
+        self.0.advances().len()
     }
-    /// A repair replays its original host tokens.
     fn tokens(&self) -> &TargetTokens {
-        match self {
-            Self::Forward(core) => core.tokens(),
-            Self::Repair { .. } => &TargetTokens::Host,
-        }
+        self.0.tokens()
     }
     /// The state store's recurrent arenas, one per component. Every slot's
     /// advance belongs to the same store; the batch's bank columns select
     /// the rows each slot reads and publishes.
     fn recurrent_arenas(&self) -> Result<&[Tensor], SubmitError> {
-        match self {
-            Self::Forward(core) => core
-                .advances()
-                .first()
-                .map(|advance| advance.bindings().recurrent)
-                .ok_or_else(|| invalid("recurrent batch has no state advance")),
-            Self::Repair { advance, .. } => Ok(advance.recurrent()),
-        }
+        self.0
+            .advances()
+            .first()
+            .map(|advance| advance.bindings().recurrent)
+            .ok_or_else(|| invalid("recurrent batch has no state advance"))
     }
     /// `layer`'s history planes in the codec's plane-descriptor order, as
     /// the attention graph's state ports take them.
     fn history(&self, layer: LayerRef) -> Result<Vec<&Tensor>, SubmitError> {
-        let planes = match self {
-            Self::Forward(core) => core
-                .advances()
-                .first()
-                .map(|advance| advance.bindings().history)
-                .ok_or_else(|| invalid("attention batch has no state advance"))?,
-            Self::Repair { history, .. } => *history,
-        };
+        let planes = self
+            .0
+            .advances()
+            .first()
+            .map(|advance| advance.bindings().history)
+            .ok_or_else(|| invalid("attention batch has no state advance"))?;
         Ok(planes
             .iter()
             .filter(|plane| plane.layer == layer)
@@ -230,24 +211,14 @@ impl RowState<'_> {
             .collect())
     }
     fn conditioning(&self, slot: usize) -> Option<&ConditioningRef> {
-        match self {
-            Self::Forward(core) => core.conditioning().get(slot).and_then(Option::as_ref),
-            Self::Repair { conditioning, .. } if slot == 0 => *conditioning,
-            _ => None,
-        }
+        self.0.conditioning().get(slot).and_then(Option::as_ref)
     }
     fn conditioning_slices(&self, slot: usize) -> &[ConditioningSlice] {
-        match self {
-            Self::Forward(core) => core
-                .conditioning_slices()
-                .get(slot)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-            Self::Repair {
-                conditioning_slices,
-                ..
-            } => conditioning_slices,
-        }
+        self.0
+            .conditioning_slices()
+            .get(slot)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 }
 
@@ -522,7 +493,7 @@ impl NativeTargetProgram {
         &self,
         batch: &TargetBatchUpload<'_>,
         state: &RowState<'_>,
-        readout: Option<(&mut NativeGraphWorkspaceLease, NativeGraphOutputLease)>,
+        readout: (&mut NativeGraphWorkspaceLease, NativeGraphOutputLease),
         graph_workspace: &mut TargetGraphWorkspaceLease,
         graph_outputs: &mut [TargetGraphOutputLease; 2],
     ) -> Result<QueuedStep, SubmitError> {
@@ -557,7 +528,7 @@ impl NativeTargetProgram {
         &self,
         batch: &TargetBatchUpload<'_>,
         state: &RowState<'_>,
-        readout: Option<(&mut NativeGraphWorkspaceLease, NativeGraphOutputLease)>,
+        readout: (&mut NativeGraphWorkspaceLease, NativeGraphOutputLease),
         graph_workspace: &mut TargetGraphWorkspaceLease,
         graph_outputs: &mut [TargetGraphOutputLease; 2],
         submitter: &mut StepSubmitter,
@@ -760,16 +731,14 @@ impl NativeTargetProgram {
                 );
             }
         }
-        let result = match readout {
-            Some((readout_workspace, readout_output)) => self.graph_readout(
-                batch,
-                &hidden,
-                readout_workspace,
-                readout_output,
-                submitter,
-            )?,
-            None => None,
-        };
+        let (readout_workspace, readout_output) = readout;
+        let result = self.graph_readout(
+            batch,
+            &hidden,
+            readout_workspace,
+            readout_output,
+            submitter,
+        )?;
         let last_commit = Instant::now();
         // Every consumer of the final hidden rows is queued, so its output
         // slot returns to the lease; the device queue orders any reuse.
@@ -790,32 +759,6 @@ impl NativeTargetProgram {
             },
         ))
     }
-
-    pub(crate) fn execute_repair(
-        &self,
-        replay: &magnitude_model_batching::ValidatedTargetBatch,
-        advance: &OwnedRepairAdvance,
-        history: &[PlaneBuffer],
-        conditioning: Option<&ConditioningRef>,
-        conditioning_slices: &[ConditioningSlice],
-        graph_workspace: &mut TargetGraphWorkspaceLease,
-        graph_outputs: &mut [TargetGraphOutputLease; 2],
-    ) -> Result<(), SubmitError> {
-        let batch = replay.upload();
-        let queued = self.queue_rows(
-            &batch,
-            &RowState::Repair {
-                advance,
-                history,
-                conditioning,
-                conditioning_slices,
-            },
-            None,
-            graph_workspace,
-            graph_outputs,
-        )?;
-        wait_all(queued.completions)
-    }
 }
 
 struct GraphControls {
@@ -824,10 +767,11 @@ struct GraphControls {
     fresh: Vec<u8>,
     destinations: Vec<u8>,
     segments: Vec<u8>,
-    /// Rows after which each slot publishes its recurrent state: all of them.
+    /// Rows after which each slot publishes its recurrent state; later rows
+    /// are recorded on the successor bank's tape.
     stop: Vec<u8>,
+    /// Each slot's read version: bank, and the tape rows that complete it.
     previous_bank: Vec<u8>,
-    /// Tape rows of each slot's read version: none (the bank's own state).
     previous_tape: Vec<u8>,
     following_bank: Vec<u8>,
 }
@@ -881,12 +825,9 @@ impl GraphControls {
                 .flatten()
                 .flat_map(|value| value.to_le_bytes())
                 .collect(),
-            stop: batch.segments[..batch.actual_slots]
-                .iter()
-                .flat_map(|[start, end]| (end - start).to_le_bytes())
-                .collect(),
+            stop: i32_bytes(&batch.stop[..batch.actual_slots]),
             previous_bank: i32_bytes(&batch.bank[..batch.actual_slots]),
-            previous_tape: i32_bytes(&vec![0; batch.actual_slots]),
+            previous_tape: i32_bytes(&batch.previous_tape[..batch.actual_slots]),
             following_bank: i32_bytes(&batch.following_bank[..batch.actual_slots]),
         })
     }
@@ -905,13 +846,13 @@ impl TargetProgram for NativeTargetProgram {
             let batch = core.batch().upload();
             self.queue_rows(
                 &batch,
-                &RowState::Forward(core),
-                Some((
+                &RowState(core),
+                (
                     readout_workspace,
                     readout_output
                         .take()
                         .expect("readout output was reserved before submit"),
-                )),
+                ),
                 graph_workspace,
                 graph_outputs,
             )

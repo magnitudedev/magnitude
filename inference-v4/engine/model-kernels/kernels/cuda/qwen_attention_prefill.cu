@@ -15,7 +15,8 @@ extern "C" __global__ void __launch_bounds__(256) qwen_attention_prefill_prepare
     attention::prefill::prepare(
         ATTENTION_INPUTS(), HISTORY(),
         reinterpret_cast<attention::u16 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERIES)),
-        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS));
+        reinterpret_cast<attention::u16 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS)),
+        reinterpret_cast<attention::u16 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES)));
 }
 
 extern "C" __global__ void __launch_bounds__(attention::prefill::WARPS * 32, 1)
@@ -23,5 +24,6 @@ extern "C" __global__ void __launch_bounds__(attention::prefill::WARPS * 32, 1)
     attention::prefill::attend(ATTENTION_INPUTS(), HISTORY(),
                                SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERIES),
                                SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS),
+                               SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES),
                                SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
 }

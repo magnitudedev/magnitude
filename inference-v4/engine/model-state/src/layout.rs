@@ -143,7 +143,7 @@ mod tests {
         MixerGeometry::Attention(AttentionGeometry {
             heads: 4,
             kv_heads: 2,
-            width: 8,
+            width: 32,
             rotary: RotarySemantics::Interleaved {
                 width: 8,
                 base: 10_000.0,
@@ -181,11 +181,11 @@ mod tests {
         let layout = ModelStateLayout::derive(&geometry, 2, KvCodec::AffineK8V4, 3).unwrap();
         assert_eq!(layout.target_history.len(), 1);
         assert_eq!(layout.target_history[0].layer, LayerRef::Target(0));
-        // One codec group per (row, kv head) vector: 2 heads of width 8, each
-        // code row padded to 16 bytes.
-        assert_eq!(layout.target_history[0].codec.key_width, 8);
+        // 2 heads of width 32: 8-bit key code rows of 8 words and one affine
+        // group (one (scale, zero) pair) per (row, kv head) vector.
+        assert_eq!(layout.target_history[0].codec.key_width, 32);
         assert_eq!(layout.target_history[0].heads, 2);
-        assert_eq!(layout.target_history[0].planes()[0].row_extents, [2, 4]);
+        assert_eq!(layout.target_history[0].planes()[0].row_extents, [2, 8]);
         assert_eq!(layout.target_history[0].planes()[1].row_extents, [2, 2]);
         // Window: 3 history rows + 3 tape rows of 64 channels; delta; tape rows
         // of u [4, 8] | k [2, 8] | d [4].
@@ -198,8 +198,8 @@ mod tests {
         assert_eq!(layout.target_recurrent[2].dtype, DType::F32);
         assert_eq!(layout.head_history.len(), 2);
         assert_eq!(layout.head_history[1].layer, LayerRef::Head(1));
-        assert_eq!(layout.head_history[1].codec.key_width, 8);
-        assert_eq!(layout.head_history[1].planes()[0].row_extents, [2, 8]);
+        assert_eq!(layout.head_history[1].codec.key_width, 32);
+        assert_eq!(layout.head_history[1].planes()[0].row_extents, [2, 32]);
         assert!(matches!(
             layout.head_history[1].codec.key,
             crate::Codec::Dense { dtype: DType::BF16 }
@@ -220,7 +220,7 @@ mod tests {
             }],
         };
         let layout = ModelStateLayout::derive(&geometry, 0, KvCodec::Dense, 0).unwrap();
-        assert_eq!(layout.target_history[0].planes()[0].row_extents, [2, 8]);
-        assert_eq!(layout.target_history[0].planes()[1].row_extents, [2, 8]);
+        assert_eq!(layout.target_history[0].planes()[0].row_extents, [2, 32]);
+        assert_eq!(layout.target_history[0].planes()[1].row_extents, [2, 32]);
     }
 }

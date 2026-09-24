@@ -3,11 +3,13 @@
 // `metal/common/attention.h`.
 //
 // An affine (history row, kv head) vector is a code row of W * B / 32 u32
-// words (code i at bits B * (i % (32 / B)) of word i / (32 / B)) plus an f16
-// (scale, zero) pair; its decoded value is code * scale + zero. Keys use 8-bit
-// codes, values 4-bit codes. A lane holding E = W / 32 columns of a vector
-// owns E * B code bits: whole words when E * B >= 32, else a power-of-two part
-// of a word shared with its neighbours (W is a power of two).
+// words (code i at bits B * (i % (32 / B)) of word i / (32 / B)) plus one f16
+// (scale, zero) pair per group of HISTORY_GROUP consecutive columns, pairs in
+// group order; its decoded value is code * scale + zero with its group's
+// pair. Keys use 8-bit codes, values 4-bit codes. A lane holding E = W / 32
+// columns of a vector owns E * B code bits: whole words when E * B >= 32,
+// else a power-of-two part of a word shared with its neighbours (W is a power
+// of two); its columns lie in one group, shared by HISTORY_GROUP / E lanes.
 //
 // `attention_history` names an entry's history buffers; its `affine` field is
 // a compile-time constant at every construction, so the driver folds the form
@@ -19,12 +21,17 @@
 
 #define HISTORY_KEY_BITS 8u
 #define HISTORY_VALUE_BITS 4u
+// Columns per (scale, zero) pair: the codec's group (model-state
+// `AFFINE_GROUP`); the (scale, zero) pairs per vector; the lanes sharing one.
+#define HISTORY_GROUP 32u
+#define HISTORY_PAIRS (ATTENTION_W / HISTORY_GROUP)
+#define HISTORY_PAIR_LANES (HISTORY_GROUP / ATTENTION_E)
 
 struct attention_history {
     bool affine;
     uint64_t key;                 // dense: [T, KV, W] A; affine: key codes
     uint64_t value;               // dense: [T, KV, W] A; affine: value codes
-    uint64_t key_coefficients;    // affine: [T, KV, 2] f16
+    uint64_t key_coefficients;    // affine: [T, KV, 2 * HISTORY_PAIRS] f16
     uint64_t value_coefficients;
 };
 
@@ -65,15 +72,16 @@ float history_code(const uint b, uint w[2], uint i) {
     return float((w[(i * b) / 32u] >> ((i * b) % 32u)) & history_levels(b));
 }
 
-// The (scale, zero) pair of one vector.
-vec2 history_coefficients(uint64_t coefficients, uint64_t vector) {
-    return unpackHalf2x16(element_u32_at(coefficients + vector * 4ul));
+// The (scale, zero) pair of group `group` of one vector.
+vec2 history_coefficients(uint64_t coefficients, uint64_t vector, uint group) {
+    return unpackHalf2x16(element_u32_at(coefficients + (vector * HISTORY_PAIRS + group) * 4ul));
 }
 
 // Encodes one vector held by a subgroup (lane `lane` owns columns [lane * E,
-// lane * E + E)) with B-bit codes at code row `row` and its coefficient pair
-// at `coefficients`: zero = f16(min), scale = f16((max - min) / L),
-// code = min(L, u32(fma(x - zero, 1 / scale, 0.5))), 0 when scale is 0.
+// lane * E + E)) with B-bit codes at code row `row` and its group coefficient
+// pairs at `coefficients`: per group, zero = f16(min), scale =
+// f16((max - min) / L), code = min(L, u32(fma(x - zero, 1 / scale, 0.5))), 0
+// when scale is 0.
 void history_encode(const uint b, float x[ATTENTION_E], uint64_t row, uint64_t coefficients, uint lane) {
     const uint levels = history_levels(b);
     const uint bits = ATTENTION_E * b;
@@ -82,8 +90,13 @@ void history_encode(const uint b, float x[ATTENTION_E], uint64_t row, uint64_t c
         low = min(low, x[i]);
         high = max(high, x[i]);
     }
-    low = subgroupMin(low);
-    high = subgroupMax(high);
+    // The group's range, over its HISTORY_PAIR_LANES neighbouring lanes.
+    [[unroll]] for (uint offset = 1u; offset < 32u; offset *= 2u) {
+        if (offset < HISTORY_PAIR_LANES) {
+            low = min(low, subgroupShuffleXor(low, offset));
+            high = max(high, subgroupShuffleXor(high, offset));
+        }
+    }
     const float zero = element_round(ELEMENT_F16, low);
     const float scale = element_round(ELEMENT_F16, seismic_div_rn(high - low, float(levels)));
     const float inverse = scale > 0.0 ? seismic_div_rn(1.0, scale) : 0.0;
@@ -110,8 +123,9 @@ void history_encode(const uint b, float x[ATTENTION_E], uint64_t row, uint64_t c
         if (lane % sharing == 0u)
             element_u32_put(row + uint64_t(lane / sharing) * 4ul, joined);
     }
-    if (lane == 0u)
-        element_u32_put(coefficients, element_pack2(ELEMENT_F16, scale, zero));
+    if (lane % HISTORY_PAIR_LANES == 0u)
+        element_u32_put(coefficients + uint64_t(lane / HISTORY_PAIR_LANES) * 4ul,
+            element_pack2(ELEMENT_F16, scale, zero));
 }
 
 // ---------------------------------------------------------------------------
@@ -126,14 +140,15 @@ void history_append(attention_history h, const bool is_key, int destination, uin
     const uint b = is_key ? HISTORY_KEY_BITS : HISTORY_VALUE_BITS;
     const uint64_t vector = uint64_t(destination) * ATTENTION_KV + kv_head;
     history_encode(b, x, (is_key ? h.key : h.value) + vector * history_row_words(b) * 4ul,
-        (is_key ? h.key_coefficients : h.value_coefficients) + vector * 4ul, lane);
+        (is_key ? h.key_coefficients : h.value_coefficients) + vector * HISTORY_PAIRS * 4ul, lane);
 }
 
 // ---------------------------------------------------------------------------
 // Staging history rows [first, first + FLASH_KEYS) of one kv head as the f16
 // tile at shared half `base` (row pitch W + 8); rows at or past `end` are
-// zero. Affine rows decode as code * scale + zero rounded to A. Every
-// invocation of the workgroup takes part.
+// zero. Affine rows decode as code * scale + zero rounded to f16 directly (a
+// rounding to a BF16 A first would cost the 8-bit keys up to a code step).
+// Every invocation of the workgroup takes part.
 void history_stage(attention_history h, const bool is_key, int first, int end, uint kv_head, uint base) {
     if (!h.affine) {
         flash_stage(ELEMENT_ACT, is_key ? h.key : h.value, uint64_t(ATTENTION_KV * ATTENTION_W),
@@ -151,14 +166,14 @@ void history_stage(attention_history h, const bool is_key, int first, int end, u
         uvec4 bits = uvec4(0u);
         if (t < end) {
             const uint64_t vector = uint64_t(t) * ATTENTION_KV + kv_head;
-            const vec2 sz = history_coefficients(coefficients, vector);
+            const vec2 sz = history_coefficients(coefficients, vector, c / HISTORY_GROUP);
             const uint64_t word = codes + (vector * history_row_words(b) + (c * b) / 32u) * 4ul;
             uint w[2];
             w[0] = element_u32_at(word);
             w[1] = b == 8u ? element_u32_at(word + 4ul) : 0u;
             float v[8];
             [[unroll]] for (uint i = 0u; i < 8u; ++i)
-                v[i] = element_round(ELEMENT_ACT, seismic_fma_rn(history_code(b, w, i), sz.x, sz.y));
+                v[i] = seismic_fma_rn(history_code(b, w, i), sz.x, sz.y);
             bits = element_pack8(ELEMENT_F16, vec4(v[0], v[2], v[4], v[6]), vec4(v[1], v[3], v[5], v[7]));
         }
         seismic_shared_uvec4[(base + k * flash_pitch(ATTENTION_W) + c) / 8u] = bits;
@@ -167,10 +182,13 @@ void history_stage(attention_history h, const bool is_key, int first, int end, u
 
 // ---------------------------------------------------------------------------
 // The online-softmax state of G query heads absorbing `n` (at most
-// HISTORY_BATCH) affine-coded keys and values. Scores are corrected, not
-// decoded: scale * (q . code) + zero * qsum. The value product accumulates
-// (p * scale) * code into `result` and sum(p * zero) into the per-head `bias`,
-// both carried by the same factor, so result + bias is the attended sum.
+// HISTORY_BATCH) affine-coded keys and values, with this lane's group pairs.
+// Scores are corrected, not decoded: the sum over groups of
+// scale * (q . code) + zero * sum(q), each lane adding its columns' share
+// (`qsum` is the sum of this lane's query columns). The value product
+// accumulates (p * scale) * code into `result` and sum(p * zero) into this
+// lane's per-head `bias`, both carried by the same factor, so result + bias is
+// the attended sum.
 #define HISTORY_BATCH 8u
 
 void history_absorb_affine(const uint n, float q[ATTENTION_G][ATTENTION_E], float qsum[ATTENTION_G],
@@ -187,8 +205,8 @@ void history_absorb_affine(const uint n, float q[ATTENTION_G][ATTENTION_E], floa
                 float partial = 0.0;
                 [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
                     partial = seismic_fma_rn(q[g][i], k[i], partial);
-                score[g][j] = seismic_fma_rn(key_coefficients[j].x, seismic_subgroup_sum_f32(partial),
-                    key_coefficients[j].y * qsum[g]);
+                score[g][j] = seismic_subgroup_sum_f32(seismic_fma_rn(key_coefficients[j].x, partial,
+                    key_coefficients[j].y * qsum[g]));
             }
         }
     }

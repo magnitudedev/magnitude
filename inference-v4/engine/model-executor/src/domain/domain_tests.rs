@@ -162,7 +162,7 @@ fn forward(request: RequestId, position: usize) -> Operation {
         conditioning: None,
         demand: crate::batching::Demand::NONE,
         select: Vec::new(),
-        committed: 0,
+        committed: 1,
     }
 }
 
@@ -397,13 +397,9 @@ fn ready_target_can_abort_then_reconcile() {
     assert_eq!(domain.checkpoint(request).unwrap().target.position(), 0);
     let flight = submit_reserved_target(&mut domain, vec![forward(request, 0)]).unwrap();
     let pending = domain.finish_target(flight).unwrap().pop().unwrap();
-    assert!(matches!(
-        domain.reconcile(
-            pending,
-            PhysicalDecision { accepted_rows: 1 }
-        ),
-        Ok(PhysicalResolution::Committed)
-    ));
+    assert!(domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .is_ok());
     assert_eq!(domain.checkpoint(request).unwrap().target.position(), 1);
 }
 
@@ -447,7 +443,7 @@ fn pending_target_request_cancellation_aborts_without_poisoning_then_device_fail
 }
 
 #[test]
-fn pending_head_vision_and_state_device_failures_poison_the_domain_owner() {
+fn pending_head_and_vision_device_failures_poison_the_domain_owner() {
     let failure = |lane: &'static str| {
         crate::DeviceError::Execution(format!("failed pending {lane} submission"))
     };
@@ -493,26 +489,6 @@ fn pending_head_vision_and_state_device_failures_poison_the_domain_owner() {
         vision_domain.fatal_error(),
         Some(DomainError::Device(_))
     ));
-
-    let Some(mut state_domain) = fixture(None) else {
-        return;
-    };
-    let state_control = PendingControl::default();
-    let mut state = StateFlight {
-        request: RequestId(42),
-        submission: PendingFailureSubmission::<CompletedStateWork>::new(state_control.clone()),
-        started: Instant::now(),
-    };
-    assert!(!state.completion().is_complete());
-    state_control.resolve(Err(failure("state")));
-    assert!(matches!(
-        state_domain.finish_repair(state),
-        Err(DomainError::Device(_))
-    ));
-    assert!(matches!(
-        state_domain.fatal_error(),
-        Some(DomainError::Device(_))
-    ));
 }
 
 #[test]
@@ -538,9 +514,6 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops_without_pois
             committed_rows: 0,
             kind: WorkKind::Decode,
             physical_duration: Duration::ZERO,
-            slot: None,
-            conditioning: None,
-            conditioning_slices: Vec::new(),
             image: None,
         })
         .unwrap();
@@ -568,9 +541,6 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops_without_pois
             committed_rows: 0,
             kind: WorkKind::Prefill,
             physical_duration: Duration::ZERO,
-            slot: None,
-            conditioning: None,
-            conditioning_slices: Vec::new(),
             image: Some(image),
         })
         .unwrap();

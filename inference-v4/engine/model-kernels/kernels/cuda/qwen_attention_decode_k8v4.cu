@@ -2,11 +2,11 @@
 // decode over affine K8/V4 history.
 //
 // L1 `qwen_attention_decode_k8v4_partial`, one block per (kv head, partition,
-// row), partitioned exactly as the dense entry. History keys score as
-// scale * (q . code) + zero * sum(q) and values accumulate (p * scale) * code
-// plus the per-head bias sum(p * zero), carried through the online softmax by
-// the same factor as the accumulator (`absorb`), so no history element is
-// decoded. The fresh span stays dense; the bias is folded into the
+// row), partitioned exactly as the dense entry. History keys score as the sum
+// over groups of scale * (q . code) + zero * sum(q) and values accumulate
+// (p * scale) * code plus the bias sum(p * zero) of each lane's group, carried
+// through the online softmax by the same factor as the accumulator
+// (`absorb`), so no history element is decoded. The fresh span stays dense; the bias is folded into the
 // accumulator before it. Partition 0 appends the row's key and value encoded.
 // L2 `qwen_attention_decode_k8v4_merge`: the dense entry's merge and gate.
 
@@ -31,8 +31,9 @@ constexpr int PARTS = SEISMIC_TUNE_PARTS;
 // dense ones, so twice the dense batch keeps as many bytes in flight.
 constexpr int TOKENS = G >= 8 ? 4 : 8;
 
-// Absorb `count` (1..N) affine-coded keys and values into `state` and the
-// per-head `bias` (exp2 domain; `q` scaled into it, `qsum` its sums).
+// Absorb `count` (1..N) affine-coded keys and values, with this lane's group
+// pairs `kc` and `vc`, into `state` and this lane's per-head `bias` (exp2
+// domain; `q` scaled into it, `qsum` the sums of this lane's dimensions).
 template <int N>
 __device__ __forceinline__ void absorb(attention::State &state, float (&bias)[G],
                                        const float (&q)[G][DPL], const float (&qsum)[G],
@@ -51,7 +52,7 @@ __device__ __forceinline__ void absorb(attention::State &state, float (&bias)[G]
             float dot = 0.0f;
 #pragma unroll
             for (int d = 0; d < DPL; ++d) dot = __fmaf_rn(q[h][d], key[d], dot);
-            score[t][h] = __fmaf_rn(kc[t].x, seismic_warp_sum_f32(dot), kc[t].y * qsum[h]);
+            score[t][h] = seismic_warp_sum_f32(__fmaf_rn(kc[t].x, dot, kc[t].y * qsum[h]));
         }
     }
     float value[N][DPL];
@@ -152,8 +153,10 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
         float sum = 0.0f;
 #pragma unroll
         for (int d = 0; d < DPL; ++d) sum += q[h][d];
-        qsum[h] = seismic_warp_sum_f32(sum);
+        qsum[h] = sum;
     }
+    // This lane's (scale, zero) pair within a vector's pairs.
+    const int pair = lane / attention::PAIR_LANES;
 
     // Equal partitions of the row's keys, then equal warp slices of this one.
     const u64 spans = SEISMIC_DIM_R;
@@ -191,8 +194,8 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
                         const int at = min(token + t, hi - 1);
                         KeyCodes::load(history.key_row(at, kv), lane, k[t]);
                         ValueCodes::load(history.value_row(at, kv), lane, v[t]);
-                        kc[t] = attention::coefficients(history.key_pair(at, kv));
-                        vc[t] = attention::coefficients(history.value_pair(at, kv));
+                        kc[t] = attention::coefficients(history.key_pair(at, kv) + pair);
+                        vc[t] = attention::coefficients(history.value_pair(at, kv) + pair);
                     }
                     absorb(state, bias, q, qsum, k, kc, v, vc, count);
                 }

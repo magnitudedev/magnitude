@@ -307,15 +307,18 @@ fn warm_up(domain: &mut ExecutorDomain, limits: ResourceLimits, context: usize) 
             let operations = requests
                 .iter()
                 .enumerate()
-                .map(|(slot, &request)| Operation::Forward {
-                    request,
-                    kind: WorkKind::Replay,
-                    tokens: vec![TokenId(0); rows / slots + usize::from(slot < rows % slots)],
-                    position: 0,
-                    conditioning: None,
-                    demand: Demand::NONE,
-                    select: Vec::new(),
-                    committed: 0,
+                .map(|(slot, &request)| {
+                    let count = rows / slots + usize::from(slot < rows % slots);
+                    Operation::Forward {
+                        request,
+                        kind: WorkKind::Replay,
+                        tokens: vec![TokenId(0); count],
+                        position: 0,
+                        conditioning: None,
+                        demand: Demand::NONE,
+                        select: Vec::new(),
+                        committed: count,
+                    }
                 })
                 .collect::<Vec<_>>();
             let resources = domain

@@ -203,7 +203,12 @@ def markdown(summary: dict) -> str:
             f"Output budget: {PROSE_OUTPUT_TOKENS} tokens. "
             "EOS or reaching that budget ends a valid measurement; "
             "actual lengths are in summary.json."
-            if summary.get("workload") == "prose"
+            if summary.get("workload") == "prose-continue"
+            else "Prose repeat: every request repeats the same Moby Dick passage back; "
+            f"no answer-quality scoring. Output budget: {PROSE_OUTPUT_TOKENS} tokens. "
+            "EOS or reaching that budget ends a valid measurement; "
+            "actual lengths are in summary.json."
+            if summary.get("workload") == "prose-repeat"
             else "BFCL-derived tool correctness; not an official BFCL leaderboard score."
         ),
         "",
@@ -213,7 +218,7 @@ def markdown(summary: dict) -> str:
             if summary.get("workload") == "retrieval"
             else "Only protocol-complete text responses are included; premature truncation and "
             "execution failures are excluded."
-            if summary.get("workload") == "prose"
+            if summary.get("workload") in ("prose-continue", "prose-repeat")
             else "Context rows may include semantically invalid responses with complete protocol "
             "evidence. All other sections require valid semantics. "
             "Truncation and execution failures are excluded."

@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub const VERSION: &str = "seismic-scalar-reference-bits-v3";
 
 /// Operation identities describe source semantics, never physical approximations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ScalarOp {
     Binary(ast::BinaryOp),
     Unary(ast::UnaryOp),
@@ -55,7 +55,7 @@ pub fn scalar_operation(primitive: &crate::intrinsics::PrimitiveId) -> Option<Sc
 }
 
 /// Payload bits are authoritative, including NaN payloads and signed zero.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ReferenceScalar {
     F16(u16),
     BF16(u16),

@@ -48,12 +48,14 @@ inference-v3/.venv/bin/python inference-v4/validation/v4_sessionbench.py \
   --results inference-v4/validation/results \
   --artifact /absolute/path/Qwen3.5-4B-Q4_K_M.gguf \
   --artifact /absolute/path/Qwen3.5-35B-A3B-Q4_K_M.gguf \
-  --suite context --context 16384 --workload prose --repeat 1
+  --suite context --context 16384 --workload prose-repeat --repeat 1
 ```
 
 Use `--suite single` for a short smoke run. Use `--context 65536` with the
-`context` suite for the longer context pass and `--workload retrieval`
-for the pinned RULER-derived retrieval fixture. `--storage-gib` and `--method`
+`context` suite for the longer context pass. `--workload prose-repeat` (the
+default benchmark: the same 256-token output at every context) and
+`--workload prose-continue` select the Moby Dick fixtures; `--workload retrieval`
+selects the pinned RULER-derived retrieval fixture. `--storage-gib` and `--method`
 pass directly to the V4 binary. The result's `v4-launcher.json` records the
 V4 source hash and per-file hashes (Rust, Seismic, Metal, Cargo inputs,
 validation Python, and the complete vendored native template build tree,

@@ -17,6 +17,7 @@
 
 use crate::ids::{DimensionId, ParameterId};
 use crate::types::DType;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 pub use num_bigint::{BigInt, BigUint};
 use std::marker::PhantomData;
@@ -28,10 +29,51 @@ use std::num::NonZeroU64;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ArenaId(NonZeroU64);
 
+impl ArenaId {
+    pub(crate) fn fresh() -> Self {
+        static NEXT_ARENA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_ARENA
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |value| value.checked_add(1),
+            )
+            .unwrap_or_else(|_| panic!("ExprArena identity space exhausted"));
+        Self(
+            NonZeroU64::new(id)
+                .unwrap_or_else(|| panic!("ExprArena identity allocator produced zero")),
+        )
+    }
+}
+
 impl fmt::Debug for ArenaId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "arena#{}", self.0.get())
     }
+}
+
+/// Arena-owned handles serialize as (owner slot, ordinal) inside a
+/// checked-bundle encode, and decode onto the owner allocated for that slot
+/// (`crate::wire`).
+macro_rules! arena_handle_wire {
+    ($kind:ident, $name:ident $(<$parameter:ident>)?, $construct:expr) => {
+        impl$(<$parameter>)? serde::Serialize for $name$(<$parameter>)? {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::Error as _;
+                let slot = crate::wire::encode_arena(self.owner).map_err(S::Error::custom)?;
+                (slot, self.index).serialize(serializer)
+            }
+        }
+        impl<'de $(, $parameter)?> serde::Deserialize<'de> for $name$(<$parameter>)? {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                use serde::de::Error as _;
+                let (slot, index) = <(u32, u32)>::deserialize(deserializer)?;
+                let owner = crate::wire::decode_arena(slot, crate::wire::ArenaHandle::$kind, index)
+                    .map_err(D::Error::custom)?;
+                Ok(($construct)(owner, index))
+            }
+        }
+    };
 }
 
 pub mod compiled;
@@ -50,6 +92,12 @@ impl<Sort> fmt::Debug for Expr<Sort> {
         write!(f, "{:?}.expr#{}", self.owner, self.index)
     }
 }
+
+arena_handle_wire!(Node, Expr<Sort>, |owner, index| Expr {
+    owner,
+    index,
+    sort: PhantomData
+});
 
 /// Sort markers.
 pub mod sort {
@@ -89,9 +137,11 @@ impl fmt::Debug for SymbolId {
     }
 }
 
+arena_handle_wire!(Symbol, SymbolId, |owner, index| SymbolId { owner, index });
+
 /// What a symbol stands for. Construction is available only through the
 /// typed allocator corresponding to each semantic category.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SymbolKind {
     /// A source declaration's symbolic shape parameter before entry
     /// monomorphization. Checker-private and forbidden from every public
@@ -126,13 +176,13 @@ pub enum SymbolKind {
 
 /// One scalar component of a call-schema parameter: the value of a scalar or
 /// `index` parameter, or one endpoint of a `range` parameter.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ScalarArgument {
     pub parameter: ParameterId,
     pub component: ScalarComponent,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ScalarComponent {
     Value,
     RangeStart,
@@ -178,8 +228,15 @@ pub struct LoopBinderId {
     index: u32,
 }
 
+arena_handle_wire!(TargetConstant, TargetConstantId, |owner, index| TargetConstantId {
+    owner,
+    index
+});
+arena_handle_wire!(Decision, DecisionId, |owner, index| DecisionId { owner, index });
+arena_handle_wire!(LoopBinder, LoopBinderId, |owner, index| LoopBinderId { owner, index });
+
 /// The sort of a symbol's value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SymbolSort {
     Nat,
     Int,
@@ -187,9 +244,27 @@ pub enum SymbolSort {
 }
 
 /// A finite explicit domain for a decision symbol (§10.2).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "Vec<i64>", into = "Vec<i64>")]
 pub struct FiniteDomain {
     values: Vec<i64>,
+}
+
+/// A decoded domain must already be non-empty, ascending and duplicate-free.
+impl TryFrom<Vec<i64>> for FiniteDomain {
+    type Error = &'static str;
+    fn try_from(values: Vec<i64>) -> Result<Self, Self::Error> {
+        let ascending = values.windows(2).all(|pair| pair[0] < pair[1]);
+        (!values.is_empty() && ascending)
+            .then_some(Self { values })
+            .ok_or("finite domain is not a non-empty ascending set")
+    }
+}
+
+impl From<FiniteDomain> for Vec<i64> {
+    fn from(domain: FiniteDomain) -> Self {
+        domain.values
+    }
 }
 
 impl FiniteDomain {
@@ -210,7 +285,7 @@ impl FiniteDomain {
 }
 
 /// Reduction operator of a symbolic sum/product over a lexical binder.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FoldOp {
     Sum,
     Product,
@@ -224,7 +299,8 @@ pub enum FoldOp {
 /// Divisions record their nonzero-divisor side condition, which is exposed
 /// through [`ExprArena::side_conditions`] and must be conjoined into any
 /// predicate that claims totality.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ExprArena {
     inner: internals::Arena,
 }
@@ -763,7 +839,7 @@ impl ExprArena {
 }
 
 /// Comparison operators.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CmpOp {
     Eq,
     Ne,
@@ -808,7 +884,7 @@ scalar_sort!(I32, i32, DType::I32, |value: i32| value as u32);
 scalar_sort!(U32, u32, DType::U32, |value: u32| value);
 
 /// One additive contribution to a physical duration interval, in nanoseconds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DurationTerm {
     /// Exact structural multiplicity derived from executable semantics.
     pub demand: NatExpr,
@@ -929,7 +1005,7 @@ impl DurationEstimate {
 }
 
 /// A sort-erased handle, for analysis entry points.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AnyExpr {
     Nat(NatExpr),
     Int(IntExpr),
@@ -945,6 +1021,11 @@ pub struct ErasedScalarExpr {
     owner: ArenaId,
     index: u32,
 }
+
+arena_handle_wire!(Node, ErasedScalarExpr, |owner, index| ErasedScalarExpr {
+    owner,
+    index
+});
 
 impl From<NatExpr> for AnyExpr {
     fn from(e: NatExpr) -> Self {
@@ -985,7 +1066,7 @@ impl<T: ScalarSort> Expr<sort::Scalar<T>> {
 }
 
 /// Name of a derived root.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RootName {
     /// An actual scalar/quantity operand of a structured region result.
     RegionOperand { operand: u32 },
@@ -1143,6 +1224,8 @@ pub struct RootId {
     index: u32,
 }
 
+arena_handle_wire!(Root, RootId, |owner, index| RootId { owner, index });
+
 /// Stable SHA-256 content identity of canonical expression roots.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExprDigest([u8; 32]);
@@ -1218,7 +1301,7 @@ pub enum NodeView<'a> {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum UnaryOp {
     Not,
     NatFromInt,
@@ -1228,7 +1311,7 @@ pub enum UnaryOp {
     ScalarIntegerDefined,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BinaryOp {
     Add,
     Sub,
@@ -1245,7 +1328,7 @@ pub enum BinaryOp {
     Iff,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NaryOp {
     All,
     Any,

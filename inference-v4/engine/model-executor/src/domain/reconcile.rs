@@ -3,13 +3,14 @@
 use super::*;
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
-    /// The decision is relative to this request's submitted rows. An interior
-    /// recurrent prefix stays owned by `repairs` until replay completes.
+    /// The decision is relative to this request's submitted rows. Every
+    /// accepted prefix within the row commitment publishes at once: recurrent
+    /// state commits as a tape version of the advance's successor bank.
     pub fn reconcile(
         &mut self,
         mut pending: PendingOperationOutcome,
         decision: PhysicalDecision,
-    ) -> Result<PhysicalResolution, DomainError> {
+    ) -> Result<(), DomainError> {
         self.healthy()?;
         if matches!(pending.outcome, Outcome::Head { .. }) {
             // A head commits exactly its entry rows; its chained proposal
@@ -22,24 +23,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .advance
                 .take()
                 .ok_or_else(|| self.fatal_invariant("head outcome has no owned advance"))?;
-            let resolved = advance
-                .commit(decision.accepted_rows)
-                .map_err(|(state, error)| {
-                    self.head.insert(pending.request, state);
-                    self.fatal_state(error)
-                })?;
-            let state = match resolved {
-                OwnedAdvanceResolution::Aborted(state)
-                | OwnedAdvanceResolution::Committed(state) => state,
-                OwnedAdvanceResolution::Repair(repair) => {
-                    let error =
-                        self.fatal_invariant("head decision needs unsupported recurrent repair");
-                    drop(repair);
-                    return Err(error);
-                }
-            };
+            let (OwnedAdvanceResolution::Aborted(state) | OwnedAdvanceResolution::Committed(state)) =
+                advance
+                    .commit(decision.accepted_rows)
+                    .map_err(|(state, error)| {
+                        self.head.insert(pending.request, state);
+                        self.fatal_state(error)
+                    })?;
             self.head.insert(pending.request, state);
-            return Ok(PhysicalResolution::Committed);
+            return Ok(());
         }
         if matches!(pending.outcome, Outcome::Encode { .. }) {
             if decision.accepted_rows != 0 {
@@ -67,7 +59,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     .expect("admitted image checked above");
                 slot.features = Some(features.clone());
             }
-            return Ok(PhysicalResolution::Committed);
+            return Ok(());
         }
         if decision.accepted_rows < pending.committed_rows
             || decision.accepted_rows > pending.rows()
@@ -76,49 +68,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Err("accepted target prefix is outside the submitted row commitment".into());
         }
         let request = pending.request;
-        if self.target.contains_key(&request) || self.repairs.contains_key(&request) {
+        if self.target.contains_key(&request) {
             return Err(self.fatal_invariant("request already has another physical state owner"));
         }
         let Some(advance) = pending.advance.take() else {
             return Err(self.fatal_invariant("target outcome has no owned target advance"));
         };
-        let resolution = match advance.commit(decision.accepted_rows) {
-            Ok(resolution) => resolution,
+        match advance.commit(decision.accepted_rows) {
+            Ok(OwnedAdvanceResolution::Aborted(state) | OwnedAdvanceResolution::Committed(state)) => {
+                self.target.insert(request, state);
+                Ok(())
+            }
             Err((state, error)) => {
                 self.target.insert(request, state);
-                return Err(self.fatal_state(error));
-            }
-        };
-        match resolution {
-            OwnedAdvanceResolution::Aborted(state) | OwnedAdvanceResolution::Committed(state) => {
-                self.target.insert(request, state);
-                Ok(PhysicalResolution::Committed)
-            }
-            OwnedAdvanceResolution::Repair(repair) => {
-                let rows = repair.rows();
-                let mut slot = pending.slot.ok_or_else(|| {
-                    self.fatal_invariant("recurrent repair has no original target rows")
-                })?;
-                slot.rows.truncate(rows);
-                self.repairs.insert(
-                    request,
-                    PendingRepair {
-                        advance: repair,
-                        slot,
-                        conditioning: pending.conditioning,
-                        conditioning_slices: pending
-                            .conditioning_slices
-                            .into_iter()
-                            .filter(|slice| slice.destination < rows)
-                            .map(|mut slice| {
-                                slice.source.count =
-                                    slice.source.count.min(rows - slice.destination);
-                                slice
-                            })
-                            .collect(),
-                    },
-                );
-                Ok(PhysicalResolution::Repair { request, rows })
+                Err(self.fatal_state(error))
             }
         }
     }
@@ -128,11 +91,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn abort(&mut self, pending: PendingOperationOutcome) -> Result<(), DomainError> {
         let conflicting_owner = match &pending.outcome {
             Outcome::Head { .. } => self.head.contains_key(&pending.request),
-            Outcome::Forward { .. } => {
-                self.target.contains_key(&pending.request)
-                    || self.repairs.contains_key(&pending.request)
-            }
-            Outcome::Encode { .. } | Outcome::Repair => false,
+            Outcome::Forward { .. } => self.target.contains_key(&pending.request),
+            Outcome::Encode { .. } => false,
         };
         if conflicting_owner {
             return Err(self.fatal_invariant("request already has another physical state owner"));
@@ -145,7 +105,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 Outcome::Forward { .. } => {
                     self.target.insert(pending.request, advance.abort());
                 }
-                _ => {
+                Outcome::Encode { .. } => {
                     return Err(
                         self.fatal_invariant("stateless outcome unexpectedly owns sequence state")
                     );

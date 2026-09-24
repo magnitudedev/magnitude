@@ -116,9 +116,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             committed_rows: 0,
             kind: WorkKind::Prefill,
             physical_duration: duration,
-            slot: None,
-            conditioning: None,
-            conditioning_slices: Vec::new(),
             image: Some(flight.image),
         })
     }

@@ -12,7 +12,6 @@ use crate::{
     ValidatedVisionLaunch,
 };
 use magnitude_model_contracts::{DecoderGeometry, ModelDefinition};
-use magnitude_model_state::StateStore;
 use std::rc::Rc;
 
 pub trait ProgramFamily: 'static {
@@ -68,12 +67,11 @@ impl NativeFamily {
         programs: Rc<AttestedPrograms>,
         resident: ResidentTarget,
         geometry: DecoderGeometry,
-        store: Rc<StateStore>,
     ) -> Result<Self, String> {
         let target = programs
             .bind_target(resident, geometry)
             .map_err(|error| error.to_string())?;
-        let state = programs.bind_state_with_repair(&target, store);
+        let state = programs.bind_state();
         Ok(Self {
             programs,
             target,

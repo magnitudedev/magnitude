@@ -2,9 +2,14 @@
 //!
 //! An ordinal is never an identity on its own. Every module-, program-,
 //! schema-, function-, or region-local handle carries the runtime owner that
-//! allocated it. Owners are deliberately not serialized: checked bundles
-//! carry stable content identities and rebuild fresh arenas when decoded.
+//! allocated it. Owners are deliberately not serialized: a checked bundle
+//! carries ordinals, and one decode rebinds them to owners allocated fresh
+//! for it (`crate::wire`). Stable content identities serialize as they are.
 
+use crate::wire;
+use serde::de::Error as _;
+use serde::ser::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
@@ -84,6 +89,19 @@ macro_rules! module_id {
                 write!(f, "{}({:?}, #{})", stringify!($name), self.module, self.ordinal)
             }
         }
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                wire::encode_module(self.module).map_err(S::Error::custom)?;
+                self.ordinal.serialize(serializer)
+            }
+        }
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let ordinal = u32::deserialize(deserializer)?;
+                let module = wire::decode_module(ordinal).map_err(D::Error::custom)?;
+                Ok(Self::new(module, ordinal))
+            }
+        }
     };
 }
 
@@ -91,7 +109,7 @@ module_id!(/// One exported entry in a checked module.
     EntryId);
 
 macro_rules! program_id {
-    ($(#[$doc:meta])* $name:ident) => {
+    ($(#[$doc:meta])* $name:ident, $kind:ident) => {
         $(#[$doc])*
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name { program: ProgramId, ordinal: u32 }
@@ -105,13 +123,27 @@ macro_rules! program_id {
                 write!(f, "{}({:?}, #{})", stringify!($name), self.program.0, self.ordinal)
             }
         }
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                wire::encode_program(self.program).map_err(S::Error::custom)?;
+                self.ordinal.serialize(serializer)
+            }
+        }
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let ordinal = u32::deserialize(deserializer)?;
+                let program = wire::decode_program(wire::ProgramHandle::$kind, ordinal)
+                    .map_err(D::Error::custom)?;
+                Ok(Self::new(program, ordinal))
+            }
+        }
     };
 }
 
 program_id!(/// One monomorphized function family.
-    FamilyId);
+    FamilyId, Family);
 program_id!(/// One monomorphized function body.
-    FunctionId);
+    FunctionId, Function);
 
 macro_rules! schema_id {
     ($(#[$doc:meta])* $name:ident) => {
@@ -126,6 +158,19 @@ macro_rules! schema_id {
         impl fmt::Debug for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 write!(f, "{}({:?}, #{})", stringify!($name), self.schema.0, self.ordinal)
+            }
+        }
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let slot = wire::encode_schema(self.schema).map_err(S::Error::custom)?;
+                (slot, self.ordinal).serialize(serializer)
+            }
+        }
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let (slot, ordinal) = <(u32, u32)>::deserialize(deserializer)?;
+                let schema = wire::decode_schema(slot).map_err(D::Error::custom)?;
+                Ok(Self::new(schema, ordinal))
             }
         }
     };
@@ -162,7 +207,7 @@ impl fmt::Debug for RegionId {
 }
 
 /// One function-global SSA value.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SemanticValueId {
     function: FunctionId,
     ordinal: u32,
@@ -235,7 +280,7 @@ impl fmt::Debug for BinderId {
 
 /// Process-global registry identities, scoped by `REGISTRY_REVISION`.
 macro_rules! registry_id {
-    ($(#[$doc:meta])* $name:ident) => {
+    ($(#[$doc:meta])* $name:ident, $table:ident) => {
         $(#[$doc])*
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(u32);
@@ -248,17 +293,35 @@ macro_rules! registry_id {
                 write!(f, "{}#{}", stringify!($name), self.0)
             }
         }
+        /// Registry identities serialize as their index; the bundle header
+        /// pins `REGISTRY_REVISION`, and decoding rejects an index outside
+        /// the table.
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.0.serialize(serializer)
+            }
+        }
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let index = u32::deserialize(deserializer)?;
+                if (index as usize) < crate::registry::table_len(crate::registry::Table::$table) {
+                    Ok(Self(index))
+                } else {
+                    Err(D::Error::custom(concat!(stringify!($name), " outside the registry")))
+                }
+            }
+        }
     };
 }
 
 registry_id!(/// One registered capability namespace.
-    CapabilityId);
+    CapabilityId, Capability);
 registry_id!(/// One registered typed intrinsic signature.
-    IntrinsicId);
+    IntrinsicId, Intrinsic);
 registry_id!(/// One registered element representation.
-    RepresentationId);
+    RepresentationId, Representation);
 registry_id!(/// One exact registered conversion between element representations.
-    RepresentationConversionId);
+    RepresentationConversionId, RepresentationConversion);
 
 /// Content-derived stable identity of a semantic entity.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -276,6 +339,18 @@ impl<Kind> StableId<Kind> {
     }
     pub const fn digest(&self) -> &[u8; 32] {
         &self.digest
+    }
+}
+
+impl<Kind> Serialize for StableId<Kind> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.digest.serialize(serializer)
+    }
+}
+
+impl<'de, Kind> Deserialize<'de> for StableId<Kind> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        <[u8; 32]>::deserialize(deserializer).map(Self::new)
     }
 }
 

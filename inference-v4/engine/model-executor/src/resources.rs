@@ -20,7 +20,6 @@ pub enum PoolClass {
     Target(LaunchClass),
     Head(LaunchClass),
     Vision { patch_rows: usize },
-    State { rows: usize },
     Import { bytes: u64 },
 }
 

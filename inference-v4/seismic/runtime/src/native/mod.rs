@@ -13,6 +13,8 @@
 //! submissions, and allocation fences order host access after them.
 
 pub(crate) mod abi;
+#[cfg(test)]
+mod bundle_identity_tests;
 pub mod cpu;
 mod cuda;
 pub mod graph;

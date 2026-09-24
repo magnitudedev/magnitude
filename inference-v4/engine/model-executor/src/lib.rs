@@ -30,8 +30,8 @@ pub use device_resources::{
 pub use domain::{
     DomainCheckpoint, DomainError, DomainRequirements, DomainReservation, ExecutorDomain,
     HeadFlight, NativeFamily, OpenRequirements, OpenReservation, PendingOperationOutcome,
-    PhysicalDecision, PhysicalResolution, ProgramFamily, ReservedRepair,
-    ReservedResources, StateFlight, TargetFlight, TargetHostTiming, VisionFlight,
+    PhysicalDecision, ProgramFamily, ReservedResources, TargetFlight, TargetHostTiming,
+    VisionFlight,
 };
 pub use error::{CapacityError, DeviceError, InvariantError, PlanError, ResourceKind, SubmitError};
 pub use execution_path::ExecutionPath;

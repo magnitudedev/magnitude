@@ -10,9 +10,10 @@
 
 use crate::expr::{ExprArena, IntExpr, SymbolId};
 use crate::ids::{CapabilityId, RepresentationId};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum DType {
     F32,
     BF16,
@@ -107,7 +108,7 @@ impl fmt::Display for DType {
 }
 
 /// Element type of a tensor at checked scope.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum Elem {
     Dtype(DType),
     /// A packed representation. Reading one element yields its decoded value.
@@ -152,8 +153,16 @@ impl fmt::Display for Elem {
 
 /// A nonempty list; tuple components are never empty (an empty source result
 /// canonicalizes to `Void`).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "Vec<T>")]
 pub(crate) struct NonEmpty<T>(Vec<T>);
+
+impl<T> TryFrom<Vec<T>> for NonEmpty<T> {
+    type Error = &'static str;
+    fn try_from(items: Vec<T>) -> Result<Self, Self::Error> {
+        NonEmpty::new(items).ok_or("empty tuple type")
+    }
+}
 
 impl<T> NonEmpty<T> {
     pub(crate) fn new(items: Vec<T>) -> Option<NonEmpty<T>> {
@@ -175,7 +184,7 @@ impl<T> NonEmpty<T> {
 
 /// Semantic shape of a tensor value: one semantic leaf, one or more physical
 /// planes when the element is a packed representation.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct TensorType {
     /// Axis extents, symbolic over the definition's dimensions and body
     /// symbols, in the definition's arena.
@@ -204,7 +213,7 @@ impl TensorType {
 }
 
 /// The canonical value type of the checked representation.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum ValueType {
     Scalar(DType),
     /// Exact signed mathematical quantity.
@@ -222,7 +231,8 @@ pub(crate) enum ValueType {
     /// A backend-opaque intrinsic value.
     Opaque {
         capability: CapabilityId,
-        name: &'static str,
+        #[serde(deserialize_with = "crate::registry::deserialize_declared_name")]
+        name: crate::registry::DeclaredName,
     },
     /// The canonical form of an empty result or tuple.
     Void,

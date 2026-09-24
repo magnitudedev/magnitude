@@ -129,24 +129,27 @@ pub(super) fn qualify_attention(
                     history_key: activation, width, history_value: activation, width),
             ),
         ],
-        AttentionHistoryKernels::AffineK8V4 { decode, prefill } => [
-            (
-                "qwen_attention_decode_k8v4",
-                mix!(decode, qwen_attention_decode_k8v4,
-                    history_key_codes: Element::u32(), width / 4,
-                    history_key_coefficients: Element::f16(), 2,
-                    history_value_codes: Element::u32(), width / 8,
-                    history_value_coefficients: Element::f16(), 2),
-            ),
-            (
-                "qwen_attention_prefill_k8v4",
-                mix!(prefill, qwen_attention_prefill_k8v4,
-                    history_key_codes: Element::u32(), width / 4,
-                    history_key_coefficients: Element::f16(), 2,
-                    history_value_codes: Element::u32(), width / 8,
-                    history_value_coefficients: Element::f16(), 2),
-            ),
-        ],
+        AttentionHistoryKernels::AffineK8V4 { decode, prefill } => {
+            let pairs = crate::programs::graph::attention::affine_coefficients(width);
+            [
+                (
+                    "qwen_attention_decode_k8v4",
+                    mix!(decode, qwen_attention_decode_k8v4,
+                        history_key_codes: Element::u32(), width / 4,
+                        history_key_coefficients: Element::f16(), pairs,
+                        history_value_codes: Element::u32(), width / 8,
+                        history_value_coefficients: Element::f16(), pairs),
+                ),
+                (
+                    "qwen_attention_prefill_k8v4",
+                    mix!(prefill, qwen_attention_prefill_k8v4,
+                        history_key_codes: Element::u32(), width / 4,
+                        history_key_coefficients: Element::f16(), pairs,
+                        history_value_codes: Element::u32(), width / 8,
+                        history_value_coefficients: Element::f16(), pairs),
+                ),
+            ]
+        }
     };
     for (entry, gated) in mixed.iter().map(|(entry, gated)| (*entry, gated)) {
         let result = kernels

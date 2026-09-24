@@ -12,7 +12,7 @@ use crate::{
     HeadLaunchInputs, ImageRef, NativeGraphOutputLease, NativeGraphWorkspaceLease, Operation,
     Outcome, PoolClass, ProgramIdentity, RequestId, ResidentHead, ResidentVision, ResourceDomain,
     ResourceDomainId, ResourceKind, RowResult, Selected, StateLaunchInputs, StateWork,
-    TargetGraphOutputLease, TargetGraphWorkspaceLease, TargetLaunchInputs, TargetTokens,
+    TargetLaunchInputs, TargetTokens,
     ValidatedHeadLaunch,
     ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch, VisionLaunchInputs,
     WorkKind,
@@ -20,8 +20,7 @@ use crate::{
 use magnitude_model_contracts::{ModelDefinition, PreparedModelInput, TextCoordinateSemantics};
 use magnitude_model_state::{
     Holder, OwnedAdvanceResolution, OwnedCompaction, OwnedCompactionPreparation,
-    OwnedRepairAdvance, OwnedStateAdvance, SequenceState, StateCheckpoint, StateStore,
-    TentativeAdvance,
+    OwnedStateAdvance, SequenceState, StateCheckpoint, StateStore, TentativeAdvance,
 };
 use seismic::Tensor;
 mod family;
@@ -41,7 +40,7 @@ mod domain_tests;
 
 pub use family::{NativeFamily, ProgramFamily};
 use in_flight::decode_selected;
-pub use in_flight::{HeadFlight, StateFlight, TargetFlight, VisionFlight};
+pub use in_flight::{HeadFlight, TargetFlight, VisionFlight};
 pub use ownership::{OpenRequirements, OpenReservation};
 pub use target::TargetHostTiming;
 
@@ -146,9 +145,6 @@ pub struct PendingOperationOutcome {
     committed_rows: usize,
     kind: WorkKind,
     physical_duration: Duration,
-    slot: Option<Slot>,
-    conditioning: Option<crate::ConditioningRef>,
-    conditioning_slices: Vec<crate::ConditioningSlice>,
     image: Option<ImageRef>,
 }
 
@@ -170,17 +166,11 @@ impl PendingOperationOutcome {
     }
 }
 
-pub enum PhysicalResolution {
-    Committed,
-    Repair { request: RequestId, rows: usize },
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReservationLane {
     Target,
     Head,
     Vision,
-    Repair,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,7 +179,6 @@ pub struct DomainRequirements {
     pool: PoolClass,
     state_rows: usize,
     successor_banks: usize,
-    secondary_pool: Option<PoolClass>,
     /// The operations claim the queued lookahead step: nothing is reserved.
     claim: bool,
 }
@@ -224,7 +213,6 @@ pub enum ReservedResources {
         Vec<OwnedStateAdvance>,
     ),
     Vision(NativeGraphWorkspaceLease, NativeGraphOutputLease),
-    Repair(ReservedRepair),
 }
 
 /// Complete target capacity is owned before launch construction. Decoder
@@ -244,14 +232,6 @@ pub struct TargetLaunchReservation {
     readout_output: NativeGraphOutputLease,
 }
 
-pub struct ReservedRepair {
-    class_rows: usize,
-    state_graph_workspace: NativeGraphWorkspaceLease,
-    graph_workspace: TargetGraphWorkspaceLease,
-    graph_outputs: [TargetGraphOutputLease; 2],
-    pending: PendingRepair,
-}
-
 impl DomainReservation {
     pub fn requirements(&self) -> &DomainRequirements {
         &self.requirements
@@ -259,13 +239,6 @@ impl DomainReservation {
     pub fn into_resources(self) -> ReservedResources {
         self.resources
     }
-}
-
-struct PendingRepair {
-    advance: OwnedRepairAdvance,
-    slot: Slot,
-    conditioning: Option<crate::ConditioningRef>,
-    conditioning_slices: Vec<crate::ConditioningSlice>,
 }
 
 #[derive(Clone)]
@@ -363,7 +336,6 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     target: BTreeMap<RequestId, SequenceState>,
     head: BTreeMap<RequestId, SequenceState>,
     input: BTreeMap<RequestId, RequestInput>,
-    repairs: BTreeMap<RequestId, PendingRepair>,
     fatal: Option<DomainError>,
     /// Group identities of the target, head and encoder executables.
     lane_identities: [ProgramIdentity; 3],
@@ -403,12 +375,7 @@ impl ExecutorDomain<NativeFamily> {
         if head_loader.is_some() != head_store.is_some() {
             return Err("head state arena differs from enabled head component".into());
         }
-        let family = NativeFamily::new(
-            programs,
-            resident,
-            definition.geometry.clone(),
-            target_store.clone(),
-        )?;
+        let family = NativeFamily::new(programs, resident, definition.geometry.clone())?;
         Ok(Self::with_family(
             execution,
             definition,
@@ -433,7 +400,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Ok(DomainRequirements {
                 lane: ReservationLane::Target,
                 pool: PoolClass::Target(class),
-                secondary_pool: None,
                 state_rows: 0,
                 successor_banks: 0,
                 claim: true,
@@ -446,7 +412,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Operation::Forward { .. } => ReservationLane::Target,
             Operation::Head { .. } => ReservationLane::Head,
             Operation::Encode { .. } => ReservationLane::Vision,
-            Operation::Repair { .. } => ReservationLane::Repair,
         };
         if operations.iter().any(|operation| {
             !matches!(
@@ -454,7 +419,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 (ReservationLane::Target, Operation::Forward { .. })
                     | (ReservationLane::Head, Operation::Head { .. })
                     | (ReservationLane::Vision, Operation::Encode { .. })
-                    | (ReservationLane::Repair, Operation::Repair { .. })
             )
         }) {
             return Err(DomainError::invariant(
@@ -462,7 +426,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             ));
         }
         let limits = self.execution.policy().limits();
-        let (pool, secondary_pool, state_rows, successor_banks) = match lane {
+        let (pool, state_rows, successor_banks) = match lane {
             ReservationLane::Target | ReservationLane::Head => {
                 let mut rows = 0usize;
                 let mut segments = 1usize;
@@ -492,6 +456,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     if state.position() != position {
                         return Err(DomainError::Input(
                             "reservation position differs from accepted state".into(),
+                        ));
+                    }
+                    // Speculative target rows are recorded on the recurrent
+                    // tape, which holds the planned draft rows.
+                    if lane == ReservationLane::Target
+                        && operation.row_count() - operation.committed_rows()
+                            > self.execution.policy().method().draft_rows()
+                    {
+                        return Err(DomainError::Input(
+                            "speculative target rows exceed the planned draft rows".into(),
                         ));
                     }
                     match operation {
@@ -529,7 +503,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     } else {
                         PoolClass::Head(class)
                     },
-                    None,
                     rows,
                     operations.len(),
                 )
@@ -557,34 +530,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     PoolClass::Vision {
                         patch_rows: image.patches(),
                     },
-                    None,
-                    0,
-                    0,
-                )
-            }
-            ReservationLane::Repair => {
-                let [Operation::Repair { rows, .. }] = operations else {
-                    return Err(DomainError::Input(
-                        "repair reservation must contain one request".into(),
-                    ));
-                };
-                let [Operation::Repair { request, .. }] = operations else {
-                    unreachable!()
-                };
-                let pending = self.repairs.get(request).ok_or_else(|| {
-                    DomainError::Input("request has no pending recurrent repair".into())
-                })?;
-                let segments = pending.advance.history_ranges().len().max(1);
-                let target = crate::LaunchClass::covering(
-                    *rows,
-                    segments,
-                    crate::batching::Demand::NONE,
-                    limits.max_batch_rows,
-                )
-                .map_err(|error| error.to_string())?;
-                (
-                    PoolClass::State { rows: *rows },
-                    Some(PoolClass::Target(target)),
                     0,
                     0,
                 )
@@ -593,7 +538,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(DomainRequirements {
             lane,
             pool,
-            secondary_pool,
             state_rows,
             successor_banks,
             claim: false,
@@ -670,30 +614,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     Some(graph.available_workspace()),
                     Some(graph.available_output()),
                 )?;
-            }
-            ReservationLane::Repair => {
-                let graph = self.resources.target_graph();
-                if graph.available_workspace() == 0 {
-                    return Err(CapacityError {
-                        resource: ResourceKind::Workspace,
-                        required: 1,
-                        available: 0,
-                    });
-                }
-                if graph.available_output() < 2 {
-                    return Err(CapacityError {
-                        resource: ResourceKind::Output,
-                        required: 2,
-                        available: graph.available_output() as u64,
-                    });
-                }
-                if self.resources.state_graph().available_workspace() == 0 {
-                    return Err(CapacityError {
-                        resource: ResourceKind::Workspace,
-                        required: 1,
-                        available: 0,
-                    });
-                }
             }
         }
         let store = if requirements.lane == ReservationLane::Head {
@@ -818,42 +738,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         .map_err(|error| invariant("vision graph output", error))?,
                 )
             }
-            ReservationLane::Repair => {
-                let PoolClass::State { rows: class_rows } = requirements.pool else {
-                    unreachable!()
-                };
-                let graph_workspace = self
-                    .resources
-                    .target_graph()
-                    .acquire_workspace()
-                    .map_err(|error| invariant("repair graph workspace", error))?;
-                let state_graph_workspace = self
-                    .resources
-                    .state_graph()
-                    .acquire_workspace()
-                    .map_err(|error| invariant("state graph workspace", error))?;
-                let graph_output_0 = self
-                    .resources
-                    .target_graph()
-                    .acquire_output()
-                    .map_err(|error| invariant("repair graph output", error))?;
-                let graph_output_1 = self
-                    .resources
-                    .target_graph()
-                    .acquire_output()
-                    .map_err(|error| invariant("repair graph output", error))?;
-                let pending = self
-                    .repairs
-                    .remove(&operations[0].request())
-                    .expect("reservation preflight established repair ownership");
-                ReservedResources::Repair(ReservedRepair {
-                    class_rows,
-                    state_graph_workspace,
-                    graph_workspace,
-                    graph_outputs: [graph_output_0, graph_output_1],
-                    pending,
-                })
-            }
         };
         let mut resources = resources;
         match &mut resources {
@@ -867,7 +751,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         .target
                         .remove(&request)
                         .expect("reservation preflight established target ownership");
-                    match OwnedStateAdvance::begin(state, operation.row_count()) {
+                    match OwnedStateAdvance::begin_speculative(
+                        state,
+                        operation.row_count(),
+                        operation.committed_rows(),
+                    ) {
                         Ok(advance) => advances.push(advance),
                         Err((state, error)) => {
                             self.target.insert(request, state);
@@ -888,7 +776,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         .head
                         .remove(&request)
                         .expect("reservation preflight established head ownership");
-                    match OwnedStateAdvance::begin(state, operation.row_count()) {
+                    match OwnedStateAdvance::begin_speculative(
+                        state,
+                        operation.row_count(),
+                        operation.committed_rows(),
+                    ) {
                         Ok(advance) => advances.push(advance),
                         Err((state, error)) => {
                             self.head.insert(request, state);
@@ -938,7 +830,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             target: BTreeMap::new(),
             head: BTreeMap::new(),
             input: BTreeMap::new(),
-            repairs: BTreeMap::new(),
             fatal: None,
             lane_identities,
             selection_read: None,

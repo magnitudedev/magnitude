@@ -195,12 +195,13 @@ void recurrent_load_version(recurrent_inputs in_, recurrent_slot slot, const uin
     }
 }
 
-// The row-sequential gated delta rule over the slot's rows (a workgroup's
-// shape never changes bits). Every invocation of the workgroup calls it. The
-// workgroup owns state rows [block_row, block_row + block_rows) of value head
-// `head`; each subgroup holds its `rows` rows from `first_row` in `state`,
-// advances them, writes their mixed outputs and publishes them after the
-// slot's first `stop` rows. Per span of up to RECURRENT_SPAN rows the
+// The row-sequential gated delta rule over the slot's rows from `begin` (a
+// workgroup's shape never changes bits). Every invocation of the workgroup
+// calls it. The workgroup owns state rows [block_row, block_row + block_rows)
+// of value head `head`; each subgroup holds its `rows` rows from `first_row`
+// in `state` (the state before row `begin`), advances them, writes their mixed
+// outputs and publishes them after the slot's first `stop` rows (at the start
+// when `begin` is the publication row). Per span of up to RECURRENT_SPAN rows the
 // workgroup convolves (causal depthwise conv + SiLU) the key head's q and k
 // channels and the workgroup's v channels with every load in flight at once;
 // each subgroup then walks the span's rows from shared memory: L2-normalized
@@ -209,8 +210,9 @@ void recurrent_load_version(recurrent_inputs in_, recurrent_slot slot, const uin
 //
 // Shared floats: prepared [SPAN][2W + block_rows], then beta [SPAN] and decay
 // [SPAN].
-void recurrent_advance_rows(recurrent_inputs in_, recurrent_slot slot, uint head, uint block_row, const uint block_rows,
-    const uint rows, uint first_row, inout float state[RECURRENT_MAX_ROWS][RECURRENT_CPL], uint64_t mixed) {
+void recurrent_advance_rows(recurrent_inputs in_, recurrent_slot slot, int begin, uint head, uint block_row,
+    const uint block_rows, const uint rows, uint first_row, inout float state[RECURRENT_MAX_ROWS][RECURRENT_CPL],
+    uint64_t mixed) {
     const uint W = RECURRENT_W, C = RECURRENT_C, CPL = RECURRENT_CPL;
     const uint prepared_width = 2u * W + block_rows;
     const uint beta_at = RECURRENT_SPAN * prepared_width;
@@ -220,11 +222,11 @@ void recurrent_advance_rows(recurrent_inputs in_, recurrent_slot slot, uint head
     const int publish = slot.lo + slot.stop;
     const int taped = recurrent_tape_rows(slot);
     const bool records_keys = recurrent_records_key(in_, head);
-    if (slot.stop == 0)
+    if (begin == publish)
         recurrent_store_rows(in_, rows, slot.target, head, first_row, state);
 
     const float root = inversesqrt(float(W));
-    for (int first = slot.lo; first < slot.hi; first += int(RECURRENT_SPAN)) {
+    for (int first = begin; first < slot.hi; first += int(RECURRENT_SPAN)) {
         const int count = min(int(RECURRENT_SPAN), slot.hi - first);
         // Each channel's C - 1 earlier inputs and the span's inputs load once.
         for (uint index = thread; index < prepared_width; index += gl_WorkGroupSize.x) {
@@ -361,5 +363,5 @@ void recurrent_sequential(const uint rows) {
     float state[RECURRENT_MAX_ROWS][RECURRENT_CPL];
     recurrent_load_version(in_, slot, rows, head, first_row, state);
     recurrent_publish_window(in_, slot, head * gl_NumWorkGroups.y + gl_WorkGroupID.y, RECURRENT_NV * gl_NumWorkGroups.y);
-    recurrent_advance_rows(in_, slot, head, block_row, block_rows, rows, first_row, state, mixed);
+    recurrent_advance_rows(in_, slot, slot.lo, head, block_row, block_rows, rows, first_row, state, mixed);
 }

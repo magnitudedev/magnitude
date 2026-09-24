@@ -132,6 +132,10 @@ impl ProcessMemoryLimit {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProcessLimitKind {
+    /// cgroup v1 `memory.limit_in_bytes` of this process's cgroup or a
+    /// visible ancestor in the v1 memory hierarchy, enforced against that
+    /// cgroup's `memory.usage_in_bytes`.
+    CgroupV1 { cgroup: String },
     /// cgroup v2 `memory.max` of this process's cgroup or a visible
     /// ancestor, enforced against that cgroup's `memory.current`.
     CgroupV2 { cgroup: String },

@@ -15,9 +15,9 @@
 // matrix rows (token-major, head-minor) split into 16-row blocks, one per
 // subgroup. The tile's key tiles (each span's union interval in 32-key steps,
 // spans then fresh) split into consecutive runs of at least 16 tiles over
-// the partitions. Each partition runs the two passes of `common/flash.glsl`
-// (row maxima, then exp2(s - max) and P V) over its key tiles, K and V staged
-// as f16 (history converted from A or decoded and rounded to A, fresh rows
+// the partitions. Each partition makes one online-softmax pass of
+// `common/flash.glsl` (scores, exp2(s - running max), rescaled P V) over its key tiles, K and V staged
+// as f16 (history converted from A or decoded straight to f16, fresh rows
 // from scratch). A tile served by one partition stores its gated output
 // directly; otherwise each partition stores (partial output, maximum,
 // denominator) and L3 merges them.
@@ -34,6 +34,10 @@
 #define PREFILL_KEYS FLASH_KEYS
 #define PREFILL_MIN_TILES 16u
 #define PREFILL_QT (uint(SEISMIC_TUNE_ROWS) / ATTENTION_G)
+// Output columns per pass over the keys: the whole head, so every key tile's
+// scores and history decode happen once, where the device compiles wide
+// accumulator arrays (`flash.glsl`).
+#define PREFILL_WINDOW FLASH_WINDOW
 
 // ---------------------------------------------------------------------------
 // L1.
@@ -183,16 +187,13 @@ void prefill_attend(attention_history h) {
     const uint64_t partials = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS);
     const uint64_t statistics = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS);
     flash_output o;
-    float maximum = -ATTENTION_INF;
-    float denominator = 0.0;
 
-    // Pass 0 finds the lane row's maximum; pass 1 + i accumulates and
-    // publishes output window i (columns 128 i ..).
-    const uint windows = (W + FLASH_OUT_W - 1u) / FLASH_OUT_W;
-    for (uint pass = 0u; pass <= windows; ++pass) {
-        const uint column0 = pass == 0u ? 0u : (pass - 1u) * FLASH_OUT_W;
-        flash_output_clear(W, o);
-        denominator = 0.0;
+    // One online-softmax pass per output window of PREFILL_WINDOW columns.
+    const uint windows = (W + PREFILL_WINDOW - 1u) / PREFILL_WINDOW;
+    for (uint pass = 0u; pass < windows; ++pass) {
+        const uint column0 = pass * PREFILL_WINDOW;
+        flash_output_clear(W, PREFILL_WINDOW, o);
+        flash_softmax softmax = flash_softmax_start();
         uint tiles_before = 0u;
         for (uint64_t index = 0ul; index <= spans; ++index) {
             const ivec4 interval = prefill_interval(visible, fresh, tile_first, rows, spans, index);
@@ -216,54 +217,43 @@ void prefill_attend(attention_history h) {
                 const bool inside = first >= interval.z && first + int(PREFILL_KEYS) <= interval.w;
                 float s[16];
                 prefill_lane_scores(scratch, scale, first, inside, row_lo, row_hi, s);
-                if (pass == 0u) {
-                    [[unroll]] for (uint j = 0u; j < 16u; ++j)
-                        maximum = max(maximum, s[j]);
-                    continue;
-                }
-                const bool seen = maximum > -ATTENTION_INF;
-                [[unroll]] for (uint j = 0u; j < 16u; ++j) {
-                    s[j] = seen ? exp2(s[j] - maximum) : 0.0;
-                    denominator += s[j];
-                }
+                const float alpha = flash_online(softmax, s);
                 const uint p_half = flash_publish_probabilities(scratch, s);
+                flash_rescale(scratch, alpha, W, PREFILL_WINDOW, o);
                 barrier();
                 prefill_stage(h, false, historical, first, interval.y, kv_head);
                 barrier();
-                flash_accumulate(p_half, 0u, W, column0, o);
+                flash_accumulate(p_half, 0u, W, PREFILL_WINDOW, column0, o);
             }
         }
-        if (pass == 0u) {
-            maximum = max(maximum, subgroupShuffleXor(maximum, 16u));
-        } else {
-            denominator += subgroupShuffleXor(denominator, 16u);
-            // Every subgroup of a used partition reaches here; the scratch is
-            // free.
-            barrier();
-            // Unrolled, so every fragment index is a constant.
-            [[unroll]] for (uint q = 0u; q < FLASH_OUT_W / 2u; ++q) {
-                if (q >= flash_window(W) / 2u)
-                    break;
-                const float value = flash_output_value(o, scratch, q);
-                const uint r = block_row + flash_output_row(q);
-                const uint column = flash_output_column(W, column0, q);
-                const uint64_t out_token = tile_first + r / G;
-                const uint64_t out_head = kv_head * G + r % G;
-                // The row's softmax state lives on lanes r % 16 and r % 16 + 16.
-                const float row_maximum = subgroupShuffle(maximum, r % 16u);
-                const float row_denominator = subgroupShuffle(denominator, r % 16u);
-                if (out_token < rows) {
-                    if (used > 1u) {
-                        const uint64_t slot = (uint64_t(part) * rows + out_token) * heads + out_head;
-                        element_f32_put(partials + (slot * W + column) * 4ul, value);
-                        if (column == 0u) {
-                            element_f32_put(statistics + slot * 8ul, row_maximum);
-                            element_f32_put(statistics + slot * 8ul + 4ul, row_denominator);
-                        }
-                    } else {
-                        attention_store_gated(query_gate, gated, out_token, out_head, column,
-                            seismic_div_rn(value, max(row_denominator, 1e-30)));
+        const float maximum = softmax.maximum;
+        const float denominator = flash_denominator(softmax);
+        // Every subgroup of a used partition reaches here; the scratch is
+        // free.
+        barrier();
+        // Unrolled, so every fragment index is a constant.
+        [[unroll]] for (uint q = 0u; q < PREFILL_WINDOW / 2u; ++q) {
+            if (q >= flash_window(W, PREFILL_WINDOW) / 2u)
+                break;
+            const float value = flash_output_value(o, scratch, q);
+            const uint r = block_row + flash_output_row(q);
+            const uint column = flash_output_column(W, PREFILL_WINDOW, column0, q);
+            const uint64_t out_token = tile_first + r / G;
+            const uint64_t out_head = kv_head * G + r % G;
+            // The row's softmax state lives on lanes r % 16 and r % 16 + 16.
+            const float row_maximum = subgroupShuffle(maximum, r % 16u);
+            const float row_denominator = subgroupShuffle(denominator, r % 16u);
+            if (out_token < rows) {
+                if (used > 1u) {
+                    const uint64_t slot = (uint64_t(part) * rows + out_token) * heads + out_head;
+                    element_f32_put(partials + (slot * W + column) * 4ul, value);
+                    if (column == 0u) {
+                        element_f32_put(statistics + slot * 8ul, row_maximum);
+                        element_f32_put(statistics + slot * 8ul + 4ul, row_denominator);
                     }
+                } else {
+                    attention_store_gated(query_gate, gated, out_token, out_head, column,
+                        seismic_div_rn(value, max(row_denominator, 1e-30)));
                 }
             }
         }

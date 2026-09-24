@@ -1,8 +1,7 @@
 use magnitude_generation::{Generation, MethodEffects, PreparedGenerationTransition, RoundForward};
 use magnitude_model_executor::{
     ConditioningRef, DomainError, ExecutorDomain, FeatureRef, Operation, Outcome,
-    PendingOperationOutcome, PhysicalDecision, PhysicalResolution, ProgramFamily, RequestId,
-    RowResult,
+    PendingOperationOutcome, PhysicalDecision, ProgramFamily, RequestId, RowResult,
 };
 
 pub enum RoundError {
@@ -27,16 +26,6 @@ impl std::fmt::Debug for RoundError {
 
 impl std::error::Error for RoundError {}
 
-pub enum RoundReconcile {
-    Committed {
-        effects: MethodEffects,
-    },
-    Repair {
-        operation: Operation,
-        transition: PreparedGenerationTransition,
-    },
-}
-
 pub fn lower_round(
     generation: &Generation,
     request: RequestId,
@@ -55,7 +44,7 @@ pub fn reconcile_forward<F: ProgramFamily>(
     domain: &mut ExecutorDomain<F>,
     request: RequestId,
     pending: PendingOperationOutcome,
-) -> Result<RoundReconcile, RoundError> {
+) -> Result<MethodEffects, RoundError> {
     let staged = stage_forward(generation, domain, request, &pending);
     let transition = match staged {
         Ok(transition) => transition,
@@ -64,31 +53,11 @@ pub fn reconcile_forward<F: ProgramFamily>(
             return Err(RoundError::Logical(error));
         }
     };
-    let committed_rows = transition.decision().accepted_rows;
-    match domain
-        .reconcile(
-            pending,
-            PhysicalDecision {
-                accepted_rows: committed_rows,
-            },
-        )
-        .map_err(RoundError::Physical)?
-    {
-        PhysicalResolution::Committed => {
-            let effects = generation.commit_transition(transition);
-            Ok(RoundReconcile::Committed { effects })
-        }
-        PhysicalResolution::Repair {
-            request: repair_request,
-            rows,
-        } if repair_request == request && rows == committed_rows => Ok(RoundReconcile::Repair {
-            operation: Operation::Repair { request, rows },
-            transition,
-        }),
-        PhysicalResolution::Repair { .. } => Err(RoundError::Logical(
-            "executor returned an invalid prefix repair".into(),
-        )),
-    }
+    let accepted_rows = transition.decision().accepted_rows;
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows })
+        .map_err(RoundError::Physical)?;
+    Ok(generation.commit_transition(transition))
 }
 
 fn stage_forward<F: ProgramFamily>(
@@ -151,17 +120,6 @@ fn stage_forward<F: ProgramFamily>(
     }
     let features = common_features(&rows, features_required)?;
     generation.prepare_round_transition(request, &samples, features, domain)
-}
-
-pub fn reconcile_repair(
-    generation: &mut Generation,
-    request: RequestId,
-    transition: PreparedGenerationTransition,
-) -> Result<MethodEffects, String> {
-    if transition.request() != request {
-        return Err("prefix repair belongs to another prepared request".into());
-    }
-    Ok(generation.commit_transition(transition))
 }
 
 /// A forward may attach one aggregate `[rows, D]` lease to exactly one row, or

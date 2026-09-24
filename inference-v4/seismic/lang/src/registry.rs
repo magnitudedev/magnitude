@@ -16,7 +16,9 @@ pub use crate::repr::{
 };
 
 /// Backends are a closed set.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum BackendName {
     Cpu,
     Metal,
@@ -968,6 +970,35 @@ pub fn representation_conversion_info(
 ) -> &'static RepresentationConversion {
     internals::representation_conversion_info(id)
 }
+/// A registry table indexed by one kind of typed registry identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Table {
+    Capability,
+    Intrinsic,
+    Representation,
+    RepresentationConversion,
+}
+/// The number of rows of `table`.
+pub(crate) fn table_len(table: Table) -> usize {
+    internals::table_len(table)
+}
+/// The registry's own `'static` copy of an intrinsic or opaque-value name it
+/// declares, or `None` when the registry declares no such name.
+pub(crate) fn declared_name(name: &str) -> Option<&'static str> {
+    internals::declared_name(name)
+}
+/// A name the registry declares. Fields of this type deserialize through
+/// [`deserialize_declared_name`]; naming the type keeps serde from treating
+/// the field as borrowed from the input.
+pub(crate) type DeclaredName = &'static str;
+/// Deserializes a registry-declared name back to the registry's own copy.
+pub(crate) fn deserialize_declared_name<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<&'static str, D::Error> {
+    use serde::de::Error as _;
+    let name = <&'de str as serde::Deserialize>::deserialize(deserializer)?;
+    declared_name(name).ok_or_else(|| D::Error::custom("name the registry does not declare"))
+}
 /// The registered conversion of external `source` into resident storage in
 /// `layout`: the resident form of an external representation for one layout.
 /// `None` for dense and packed sources, and for a layout the resident
@@ -1917,6 +1948,36 @@ pub(crate) mod internals {
     }
     pub(super) fn dense(dtype: DType) -> RepresentationId {
         RepresentationId::new(u32::from(dtype.ordinal()))
+    }
+    pub(super) fn table_len(table: Table) -> usize {
+        let t = tables();
+        match table {
+            Table::Capability => t.capabilities.len(),
+            Table::Intrinsic => t.intrinsics.len(),
+            Table::Representation => t.representations.len(),
+            Table::RepresentationConversion => t.conversions.len(),
+        }
+    }
+    pub(super) fn declared_name(name: &str) -> Option<&'static str> {
+        static NAMES: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
+        NAMES
+            .get_or_init(|| {
+                let mut names = std::collections::HashSet::new();
+                for signature in &tables().intrinsics {
+                    names.insert(signature.name);
+                    if let IntrinsicResultType::Opaque { name, .. } = signature.result {
+                        names.insert(name);
+                    }
+                    for argument in &signature.arguments {
+                        if let OperandCategory::Opaque { name, .. } = argument.category {
+                            names.insert(name);
+                        }
+                    }
+                }
+                names
+            })
+            .get(name)
+            .copied()
     }
 
     pub(super) fn intrinsic_denotation(id: IntrinsicId) -> IntrinsicDenotation {

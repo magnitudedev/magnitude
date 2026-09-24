@@ -989,6 +989,12 @@ fn decode_mappings(device: &seismic::Device) -> Vec<Vec<(&'static str, u64)>> {
 fn grouped_mappings(device: &seismic::Device) -> Vec<Vec<(&'static str, u64)>> {
     match device.backend() {
         seismic::BackendName::Cuda => vec![vec![]],
+        // Vulkan also maps the tile onto subgroups of SUB_M x SUB_N.
+        seismic::BackendName::Vulkan => vec![
+            vec![("TILE_M", 32), ("TILE_N", 128), ("SUB_M", 32), ("SUB_N", 32)],
+            vec![("TILE_M", 64), ("TILE_N", 64), ("SUB_M", 64), ("SUB_N", 64)],
+            vec![("TILE_M", 32), ("TILE_N", 64), ("SUB_M", 32), ("SUB_N", 64)],
+        ],
         _ => vec![
             vec![("TILE_M", 32), ("TILE_N", 128)],
             vec![("TILE_M", 64), ("TILE_N", 64)],

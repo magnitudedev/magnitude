@@ -8,9 +8,10 @@ use crate::expr::{AnyExpr, BoolExpr, ExprArena, IntExpr, NodeView, SymbolId};
 use crate::intrinsics::AtomicOp;
 use crate::span::Span;
 use crate::syntax::ast::BinaryOp;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct ParameterPath {
     pub(crate) parameter: usize,
     pub(crate) fields: Vec<usize>,
@@ -29,7 +30,7 @@ impl ParameterPath {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) enum Condition {
     Constant(bool),
     Parameter(ParameterPath),
@@ -42,7 +43,7 @@ pub(crate) enum Condition {
 }
 pub(crate) type Path = Vec<(Condition, bool)>;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Bound {
     pub(crate) symbol: SymbolId,
     pub(crate) start: IntExpr,
@@ -52,7 +53,7 @@ pub(crate) struct Bound {
 /// Elements of one storage root. Images bind their coordinates jointly; the
 /// row-major forms are derived from the root's checked axes, never from
 /// matching byte sizes.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) enum Region {
     Empty,
     Full,
@@ -158,7 +159,7 @@ impl Region {
 /// only while checking: the recording pass meets every analysed entry world
 /// into it. A loop left `Unrecorded` is dead under path facts and lowers as
 /// `Unproven`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum VisitSeparation {
     Unrecorded,
     Separated,
@@ -1846,7 +1847,7 @@ fn merge_complementary_guards(parts: &mut Vec<Region>) {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Requirement {
     pub(crate) parameter: ParameterPath,
     pub(crate) region: Region,
@@ -1857,7 +1858,7 @@ pub(crate) struct Requirement {
 /// guaranteed exit write, this includes reads of already initialized data and
 /// writes on any reachable source path. Calls instantiate it at their actual
 /// argument views when checking independent visits.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct ParameterAccess {
     pub(crate) parameter: ParameterPath,
     pub(crate) region: Region,
@@ -1867,18 +1868,18 @@ pub(crate) struct ParameterAccess {
     /// atomic accesses commute (L12).
     pub(crate) atomic: Option<AtomicOp>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum ParameterPart {
     Integer(ParameterPath),
     Start(ParameterPath),
     End(ParameterPath),
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Exit {
     pub(crate) path: Path,
     pub(crate) written: Vec<(ParameterPath, Region)>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InitializationContract {
     pub(crate) requirements: Vec<Requirement>,
     pub(crate) exits: Vec<Exit>,
@@ -1899,7 +1900,7 @@ impl InitializationContract {
 
 /// The checked loop's captured writes and owned carry invariants. Both are
 /// derived by source checking and instantiated on the loop's actual parameters.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoopInitialization {
     pub(crate) transfer: InitializationContract,
     pub(crate) carried: Vec<(ParameterPath, Region)>,

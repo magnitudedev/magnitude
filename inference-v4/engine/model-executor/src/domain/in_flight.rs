@@ -30,18 +30,6 @@ impl<S: ProgramSubmission<CompletedWork = crate::CompletedHeadWork>> HeadFlight<
     }
 }
 
-pub struct StateFlight<S: ProgramSubmission<CompletedWork = crate::CompletedStateWork> = <NativeFamily as ProgramFamily>::StateSubmission> {
-    pub(super) request: RequestId,
-    pub(super) submission: S,
-    pub(super) started: Instant,
-}
-
-impl<S: ProgramSubmission<CompletedWork = crate::CompletedStateWork>> StateFlight<S> {
-    pub fn completion(&mut self) -> &mut dyn Completion {
-        self.submission.completion()
-    }
-}
-
 pub struct TargetFlight<S: ProgramSubmission<CompletedWork = crate::CompletedTargetWork> = <NativeFamily as ProgramFamily>::TargetSubmission> {
     pub(super) requests: Vec<(
         RequestId,
@@ -52,10 +40,13 @@ pub struct TargetFlight<S: ProgramSubmission<CompletedWork = crate::CompletedTar
     )>,
     pub(super) submission: S,
     pub(super) started: Instant,
+    /// When the device could begin this step: its submission, or for a step
+    /// queued behind its predecessor (lookahead), the predecessor's
+    /// completion. The step's physical duration is measured from here, so
+    /// pipelined steps never charge their predecessor's time again.
+    pub(super) runnable: Instant,
     /// When the domain last read a selection before this step was submitted.
     pub(super) previous_selection: Option<Instant>,
-    pub(super) slots: Vec<Slot>,
-    pub(super) conditioning_slices: Vec<Vec<crate::ConditioningSlice>>,
     /// Identifies the flight a lookahead continues.
     pub(super) id: u64,
     /// For a claimed lookahead, per slot: the accepted state its successor

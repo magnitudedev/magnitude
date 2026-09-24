@@ -20,11 +20,22 @@ use crate::reference_math::ReferenceScalar;
 use crate::registry::BackendName;
 use crate::span::Span;
 use crate::types::{Elem, ValueType};
+use serde::{Deserialize, Serialize};
 
 /// A local of one checked body. Parameters occupy the first locals in
 /// parameter order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub(crate) struct LocalId(u32);
+
+/// A decoded local must lie inside the locals of the definition decoding it.
+impl<'de> Deserialize<'de> for LocalId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let index = u32::deserialize(deserializer)?;
+        crate::wire::decode_local(index).map_err(D::Error::custom)?;
+        Ok(Self(index))
+    }
+}
 
 impl LocalId {
     pub(crate) const fn new(index: u32) -> Self {
@@ -43,7 +54,7 @@ impl std::fmt::Display for LocalId {
 }
 
 /// What a definition is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum DefKind {
     /// A portable `fn` body.
     Body,
@@ -61,7 +72,7 @@ impl DefKind {
 }
 
 /// Logical call ownership of a parameter.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum Ownership {
     Tuple(Vec<Ownership>),
     /// A plain value (scalar, index, range, tuple, opaque value).
@@ -74,7 +85,7 @@ pub(crate) enum Ownership {
     Exclusive,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Param {
     pub name: String,
     pub ownership: Ownership,
@@ -84,7 +95,7 @@ pub(crate) struct Param {
 }
 
 /// A decidable applicability predicate over dimensions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Predicate {
     /// `expr >= 0`
     NonNegative(IntExpr),
@@ -103,7 +114,7 @@ impl Predicate {
 }
 
 /// One conjunct of a `where` clause, with the source span of its comparison.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WhereConjunct {
     pub predicate: Predicate,
     pub span: Span,
@@ -132,7 +143,7 @@ impl Placement {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Definition {
     pub stable: StableFunctionId,
     pub name: String,
@@ -161,7 +172,7 @@ pub(crate) struct Definition {
 
 /// A connected component of same-name implementations with overlapping
 /// applicability and a compatible contract.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Family {
     pub name: String,
     /// The contract body: the first declared portable body. Its meaning is
@@ -180,7 +191,7 @@ pub(crate) struct Family {
 // Bodies
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Local {
     pub ownership: super::ownership::ValueOwnership,
     pub name: String,
@@ -192,7 +203,7 @@ pub(crate) struct Local {
     pub symbol: Option<SymbolId>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Body {
     pub locals: Vec<Local>,
     pub root: Block,
@@ -201,12 +212,12 @@ pub(crate) struct Body {
     pub result: Vec<Expr>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Block {
     pub statements: Vec<Stmt>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Stmt {
     Let {
         pattern: Pattern,
@@ -246,7 +257,7 @@ pub(crate) enum Stmt {
 }
 
 /// Source-level loop semantics, independent of any physical execution width.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum LoopKind {
     /// Ascending `for`; captured mutable values are carried across visits.
     Ordered,
@@ -256,7 +267,7 @@ pub(crate) enum LoopKind {
 
 /// Opaque proof that a parallel write's selected regions are disjoint across
 /// the exact enclosing logical participants. Only the checker constructs it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ExclusiveWriteCapability {
     region: Box<Place>,
     participants: Box<[LocalId]>,
@@ -278,30 +289,30 @@ impl ExclusiveWriteCapability {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum CheckedAtomicOrder {
     Relaxed,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum CheckedAtomicScope {
     Participant,
     Participants(Box<[LocalId]>),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum CheckedAtomicPublication {
     CommandCompletion,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum CheckedAssociationOutcome {
     Exact,
     Reassociated { accumulator: crate::types::DType },
 }
 
 /// Opaque, identity-bound authority for one checked atomic RMW.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct AtomicCapability {
     region: Box<Place>,
     participants: Box<[LocalId]>,
@@ -352,7 +363,7 @@ impl AtomicCapability {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Pattern {
     Local(LocalId),
     Tuple(Vec<Pattern>),
@@ -360,7 +371,7 @@ pub(crate) enum Pattern {
 
 /// A mutable place: a local's storage, an element/selection of it, or a
 /// tuple of places (tuple assignment).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) enum Place {
     Local(LocalPlace),
     Element {
@@ -372,7 +383,7 @@ pub(crate) enum Place {
 
 /// One axis of a selection. Every `check*` flag is `true` exactly when the
 /// checker did not prove the corresponding bound.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) enum Index {
     Point {
         value: Expr,
@@ -392,7 +403,7 @@ pub(crate) enum Index {
     Full,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Expr {
     pub kind: ExprKind,
     pub ty: ValueType,
@@ -413,12 +424,12 @@ impl Expr {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) enum ExprKind {
     Literal(ReferenceScalar),
     /// A dimension of the definition used as a value; ordinal into
     /// `Definition::dimensions`.
-    Dimension(u32),
+    Dimension(#[serde(deserialize_with = "crate::wire::deserialize_dimension")] u32),
     Local(LocalId),
     Primitive {
         id: PrimitiveId,
@@ -456,15 +467,16 @@ pub(crate) enum ExprKind {
 /// The rows of one capability intrinsic that are compatible with some
 /// admissible binding of the call's operands. Never empty; entry
 /// construction resolves exactly one row per specialization.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct IntrinsicOverload {
     pub capability: CapabilityId,
-    pub name: &'static str,
+    #[serde(deserialize_with = "crate::registry::deserialize_declared_name")]
+    pub name: crate::registry::DeclaredName,
     pub rows: Vec<IntrinsicId>,
 }
 
 /// The participant context of a call site within its own body (L13, L14).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CallContext {
     /// The call is under a `parallel for` of the calling body.
     pub enclosing_parallel: bool,
@@ -474,7 +486,7 @@ pub(crate) struct CallContext {
 }
 
 /// One static call occurrence.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Call {
     pub family: FamilyId,
     /// Explicit dimension bindings `f[D = e]`, in source order before the
@@ -495,7 +507,7 @@ pub(crate) struct Call {
 /// One family member that applies at a call: its element bindings are
 /// compatible, its initialization contract applies here with guarantees
 /// including the contract's, and its placement is not excluded.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Candidate {
     pub definition: FunctionId,
     /// Callee element parameter -> element (possibly a caller parameter).

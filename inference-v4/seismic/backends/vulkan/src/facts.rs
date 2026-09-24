@@ -117,6 +117,12 @@ pub struct Facts {
     /// Subgroup-scope 16x16x16 cooperative matrix with f16xf16->f32 and
     /// s8xs8->s32 (`SEISMIC_HAS_MATRIX`), never on RDNA2.
     pub matrix: bool,
+    /// The compiler handles a subgroup's cooperative-matrix accumulator
+    /// arrays beyond 4 fragments in the flash-attention body
+    /// (`SEISMIC_HAS_WIDE_ACCUMULATORS`). False on the NVIDIA proprietary
+    /// driver: 580.159.03 returns wrong outputs for 8- and 16-fragment
+    /// output accumulators there, while 4 are reliable.
+    pub wide_accumulators: bool,
     /// `DenormPreserve 32` is emitted when true (§7.3).
     pub denorm_preserve_32: bool,
     /// `RoundingModeRTE 32` is emitted when true (§7.3). False on the NVIDIA
@@ -330,6 +336,7 @@ pub(crate) fn describe(instance: &Instance, physical: vk::PhysicalDevice) -> Des
         queue_family: queue_family.map_or(0, |family| family as u32),
         dedicated_compute_queue: compute_only.is_some(),
         matrix,
+        wide_accumulators: v12.driver_id != vk::DriverId::NVIDIA_PROPRIETARY,
         denorm_preserve_32: v12.shader_denorm_preserve_float32 == vk::TRUE,
         rounding_rte_32: v12.driver_id != vk::DriverId::NVIDIA_PROPRIETARY,
         mixed_dot_accelerated,

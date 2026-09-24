@@ -19,6 +19,7 @@ static_assert(SEISMIC_DIM_W % 8 == 0 && SEISMIC_DIM_W <= 256 && ((SEISMIC_DIM_W 
     device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
     device uchar *normalized [[buffer(SEISMIC_BUFFER_SCRATCH_NORMALIZED)]],             \
     device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],                 \
+    device float *small_partials [[buffer(SEISMIC_BUFFER_SCRATCH_SMALL_PARTIALS)]],     \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
 #define RECURRENT_OUTPUT_OPERANDS                                                       \
@@ -66,20 +67,38 @@ kernel void qwen_recurrent_output_stage(RECURRENT_OUTPUT_ARGUMENTS,
     projection::device_normalize<32>(in, item, normalized, k, norms, thread_index);
 }
 
+#define RECURRENT_OUTPUT_GEMM(TM, TN, SPLIT, PARTIALS)                                  \
+    PROJECTION_GEMM_SHARED(shared, TM, TN);                                             \
+    RECURRENT_OUTPUT_OPERANDS;                                                          \
+    projection::Plain<activation, projection::AllRows> x{normalized, k, 1, k, {}};      \
+    const uint m = uint(SEISMIC_DIM_M), n = uint(SEISMIC_DIM_H);                        \
+    if (SPLIT == 1)                                                                     \
+        projection::gemm<packets::W0, TM, TN>(x, out, w, m, n, k, tile.y, tile.x, shared, sg, lane); \
+    else                                                                                \
+        projection::gemm_part<packets::W0, TM, TN>(x, PARTIALS, w, m, n, k, SPLIT, tile.z, tile.y, tile.x, \
+            shared, sg, lane)
+
+// 17..64 rows: the fixed small-row tile and split.
+kernel void qwen_recurrent_output_gemm_small(RECURRENT_OUTPUT_ARGUMENTS,
+    uint3 tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    RECURRENT_OUTPUT_GEMM(projection::small_tile_m, projection::small_tile_n, projection::small_split,
+        small_partials);
+}
+
+kernel void qwen_recurrent_output_finalize_small(RECURRENT_OUTPUT_ARGUMENTS,
+    uint index [[thread_position_in_grid]]) {
+    RECURRENT_OUTPUT_OPERANDS;
+    projection::gemm_reduce(out, small_partials, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_H), projection::small_split,
+        index);
+}
+
 kernel void qwen_recurrent_output_gemm(RECURRENT_OUTPUT_ARGUMENTS,
     uint3 tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint TM = SEISMIC_TUNE_TILE_M, TN = SEISMIC_TUNE_TILE_N;
-    PROJECTION_GEMM_SHARED(shared, TM, TN);
-    RECURRENT_OUTPUT_OPERANDS;
-    projection::Plain<activation, projection::AllRows> x{normalized, k, 1, k, {}};
-    const uint m = uint(SEISMIC_DIM_M), n = uint(SEISMIC_DIM_H);
-    if (SEISMIC_TUNE_SPLIT == 1)
-        projection::gemm<packets::W0, TM, TN>(x, out, w, m, n, k, tile.y, tile.x, shared, sg, lane);
-    else
-        projection::gemm_part<packets::W0, TM, TN>(x, partials, w, m, n, k, SEISMIC_TUNE_SPLIT, tile.z,
-            tile.y, tile.x, shared, sg, lane);
+    RECURRENT_OUTPUT_GEMM(SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SPLIT, partials);
 }
 
 kernel void qwen_recurrent_output_finalize(RECURRENT_OUTPUT_ARGUMENTS,

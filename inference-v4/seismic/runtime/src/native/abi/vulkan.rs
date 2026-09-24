@@ -10,6 +10,8 @@
 pub(crate) struct VulkanFeatures {
     /// Subgroup 16x16x16 cooperative matrix, f16->f32 and s8->s32.
     pub(crate) matrix: bool,
+    /// Accumulator arrays of more than 4 matrix fragments compile correctly.
+    pub(crate) wide_accumulators: bool,
     /// Mixed-signedness packed 4x8 dot product is accelerated.
     pub(crate) mixed_dot: bool,
     pub(crate) f32_atomic_add: bool,
@@ -101,6 +103,7 @@ pub(super) fn header(features: VulkanFeatures) -> String {
     }
     for (name, on) in [
         ("MATRIX", features.matrix),
+        ("WIDE_ACCUMULATORS", features.wide_accumulators),
         ("MIXED_DOT", features.mixed_dot),
         ("F32_ATOMIC_ADD", features.f32_atomic_add),
         ("SHARED_INT64_ATOMICS", features.shared_int64_atomics),
@@ -213,6 +216,7 @@ void main() {
         let device = seismic_vulkan::Device::open(description.facts.uuid).expect("device opens");
         let features = VulkanFeatures {
             matrix: false,
+            wide_accumulators: false,
             mixed_dot: false,
             f32_atomic_add: false,
             shared_int64_atomics: false,

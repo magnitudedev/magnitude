@@ -19,7 +19,9 @@ use super::{
     row_points, served_row_points, with_contexts, CaseState, EntryTuning, PointShape,
     TuningInputs, TuningLimits,
 };
-use crate::programs::graph::attention::{rotary_components, rotary_frequencies, DECODE_ROWS};
+use crate::programs::graph::attention::{
+    affine_coefficients, rotary_components, rotary_frequencies, DECODE_ROWS,
+};
 use crate::AttentionShape;
 use magnitude_model_contracts::{MixerGeometry, RotarySemantics, WeightKind, WeightScope};
 use magnitude_model_kernels::{
@@ -327,8 +329,8 @@ impl MixHistory for DenseMixHistory {
     }
 }
 
-/// Affine K8/V4 planes: code rows `[T, KV, W * B / 32]` u32 and (scale,
-/// zero) pairs `[T, KV, 2]` f16 per vector kind. Codes are pseudo-random and
+/// Affine K8/V4 planes: code rows `[T, KV, W * B / 32]` u32 and group
+/// (scale, zero) pairs `[T, KV, 2 * W / group]` f16 per vector kind. Codes are pseudo-random and
 /// every pair decodes its codes into [-1, 1], as the dense planes hold.
 pub(crate) struct AffineMixHistory {
     key_codes: CaseState,
@@ -390,7 +392,7 @@ impl MixHistory for AffineMixHistory {
                 appended.clone(),
             )
         };
-        let pairs = [rows, shape.kv_heads, 2];
+        let pairs = [rows, shape.kv_heads, affine_coefficients(shape.width)];
         Ok(Self {
             key_codes: plane("history_key_codes", &|inputs| {
                 Self::codes(inputs, &[rows, shape.kv_heads, shape.width / 4], 0x6b)

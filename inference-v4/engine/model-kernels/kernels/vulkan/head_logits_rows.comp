@@ -62,7 +62,7 @@ void head_logits_rows_gemv() {
 }
 
 void head_logits_rows_gemm() {
-    projection_gemm(HEAD_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, head_logits_input(), head_logits_output(),
-        head_logits_weight(), uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_V), HEAD_K, gl_WorkGroupID.y, gl_WorkGroupID.x,
+    projection_gemm(HEAD_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
+        head_logits_input(), head_logits_output(), head_logits_weight(), uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_V), HEAD_K, gl_WorkGroupID.y, gl_WorkGroupID.x,
         0xffffffffu);
 }

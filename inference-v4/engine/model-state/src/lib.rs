@@ -8,12 +8,12 @@ mod layout;
 pub use advance::{
     CodecConversionStep, OwnedAdvanceBindings, OwnedAdvanceResolution, OwnedCodecAdvance,
     OwnedCodecBindings, OwnedCompaction, OwnedCompactionBindings, OwnedCompactionPreparation,
-    OwnedRepairAdvance, OwnedStateAdvance, OwnedSuccessorAdvance, TentativeAdvance,
+    OwnedStateAdvance, OwnedSuccessorAdvance, TentativeAdvance,
 };
 
 pub use codec::{
-    Codec, CodecIdentity, CodecSpec, ComponentDescriptor, KvCodec, LayerRef, LayoutError,
-    PlaneDescriptor, PlaneName, VectorKind,
+    AFFINE_GROUP, Codec, CodecIdentity, CodecSpec, ComponentDescriptor, KvCodec, LayerRef,
+    LayoutError, PlaneDescriptor, PlaneName, VectorKind,
 };
 pub use layout::ModelStateLayout;
 
@@ -917,7 +917,7 @@ struct Backing {
 }
 
 /// Counts transactions that captured this store's tensors and write them
-/// later (advances, repairs, compactions, conversions). The backing may be
+/// later (advances, compactions, conversions). The backing may be
 /// recommitted only while none exists: a reallocating backend gives the store
 /// new tensors, and a captured old one would receive writes nobody reads.
 #[derive(Clone)]
@@ -1536,6 +1536,7 @@ impl StateStore {
             history_start: 0,
             claims,
             bank,
+            tape: 0,
         })
     }
     /// Reserve `count` rows, in logical order, to follow `history` (none for
@@ -1669,6 +1670,11 @@ pub struct SequenceState {
     /// logical order; a live history.
     claims: Claims,
     bank: BankHandle,
+    /// Rows of `bank`'s tape that complete the accepted recurrent state: the
+    /// bank holds the state `tape` rows before `position`, and the next
+    /// advance replays those tape rows before its own (see
+    /// [`OwnedStateAdvance::begin_speculative`]). 0 after a plain advance.
+    tape: usize,
 }
 impl Drop for SequenceState {
     fn drop(&mut self) {
@@ -1690,6 +1696,11 @@ impl SequenceState {
     /// holds this sequence's state.
     pub fn bank_index(&self) -> usize {
         self.bank.index()
+    }
+    /// The tape rows of the accepted bank that complete this sequence's
+    /// recurrent state; the next advance reads version (bank, tape).
+    pub fn tape_rows(&self) -> usize {
+        self.tape
     }
     pub fn anticipate(&mut self, position: usize) -> Result<(), String> {
         if position > self.store.context_capacity {
@@ -1741,6 +1752,7 @@ impl SequenceState {
             history_start: self.history_start,
             claims: self.claims.clone(),
             bank: self.bank.clone(),
+            tape: self.tape,
         }
     }
 }
@@ -1758,6 +1770,7 @@ pub struct StateCheckpoint {
     history_start: usize,
     claims: Claims,
     bank: BankHandle,
+    tape: usize,
 }
 impl Drop for StateCheckpoint {
     fn drop(&mut self) {
@@ -1770,6 +1783,9 @@ impl StateCheckpoint {
     }
     pub fn bank_index(&self) -> usize {
         self.bank.index()
+    }
+    pub fn tape_rows(&self) -> usize {
+        self.tape
     }
     pub fn belongs_to(&self, store: &Rc<StateStore>) -> bool {
         Rc::ptr_eq(&self.store, store)
@@ -1791,19 +1807,23 @@ impl StateCheckpoint {
             history_start: self.history_start,
             claims,
             bank: self.bank.clone(),
+            tape: self.tape,
         }
     }
 }
+/// Publish `count` rows whose recurrent version is (`following`, `tape`).
 fn install_commit(
     state: &mut SequenceState,
     claims: Claims,
     following: &mut BankHandle,
+    tape: usize,
     count: usize,
 ) {
     // Appending moves references: what a checkpoint or fork sharing this
     // history's rows sees never changes.
     state.claims.append(claims);
     std::mem::swap(&mut state.bank, following);
+    state.tape = tape;
     state.position += count;
 }
 
@@ -2077,7 +2097,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_commit_repair_is_transactional_and_retains_both_banks() {
+    fn prefix_commit_is_transactional_and_publishes_a_tape_version() {
         let Some(device) = cpu_device() else {
             return;
         };
@@ -2102,30 +2122,23 @@ mod tests {
         assert_eq!(original, ZERO_SEED_BANK);
         let checkpoint = state.checkpoint();
 
-        let advance = OwnedStateAdvance::begin(state, 3).ok().unwrap();
+        let advance = OwnedStateAdvance::begin_speculative(state, 3, 1).ok().unwrap();
         assert_eq!(advance.bindings().previous_bank, original);
         assert_ne!(advance.bindings().following_bank, original);
         assert!(advance.bindings().recurrent[0].shares_allocation(&store.recurrent_arenas()[0]));
-        let OwnedAdvanceResolution::Repair(repair) = advance.commit(1).ok().unwrap() else {
-            panic!("interior prefix must require repair");
-        };
-        assert_eq!(repair.rows(), 1);
-        assert_eq!(store.occupied_rows(), 1);
-        assert_eq!(repair.previous_bank(), original);
-        assert_ne!(repair.following_bank(), original);
-        let state = repair.abort();
+        assert_eq!(store.occupied_rows(), 3);
+        let state = advance.abort();
         assert_eq!(state.position(), 0);
         assert_eq!(state.bank_index(), original);
         assert_eq!(store.occupied_rows(), 0);
 
-        let advance = OwnedStateAdvance::begin(state, 3).ok().unwrap();
-        let OwnedAdvanceResolution::Repair(repair) = advance.commit(2).ok().unwrap() else {
-            panic!("interior prefix must require repair");
+        let advance = OwnedStateAdvance::begin_speculative(state, 3, 1).ok().unwrap();
+        let successor = advance.bindings().following_bank;
+        let OwnedAdvanceResolution::Committed(state) = advance.commit(2).ok().unwrap() else {
+            panic!("an accepted prefix commits as a tape version");
         };
-        let successor = repair.following_bank();
-        let state = repair.commit();
         assert_eq!(state.position(), 2);
-        assert_eq!(state.bank_index(), successor);
+        assert_eq!((state.bank_index(), state.tape_rows()), (successor, 1));
         assert_eq!(store.occupied_rows(), 2);
         assert_eq!(checkpoint.position(), 0);
         let checkpoint_fork = checkpoint.fork();
@@ -2139,6 +2152,11 @@ mod tests {
             panic!("zero prefix must abort");
         };
         assert_eq!(state.position(), 2);
+        assert_eq!(store.occupied_rows(), 2);
+        // A plain advance has no interior recurrent version.
+        let advance = OwnedStateAdvance::begin(state, 2).ok().unwrap();
+        let (state, _) = advance.commit(1).err().unwrap();
+        assert_eq!((state.position(), state.tape_rows()), (2, 1));
         assert_eq!(store.occupied_rows(), 2);
         let advance = OwnedStateAdvance::begin(state, 2).ok().unwrap();
         let OwnedAdvanceResolution::Committed(state) = advance.commit_all().ok().unwrap() else {
@@ -2347,7 +2365,7 @@ mod tests {
 
     /// Every successor bank is disjoint from bank 0 and from every bank a live
     /// state, checkpoint, fork, or other in-flight advance can read, through
-    /// forks, commits, aborts, and repairs.
+    /// forks, commits, aborts, and prefix commits.
     #[test]
     fn successor_banks_never_alias_a_readable_bank_or_the_zero_seed() {
         let Some(device) = cpu_device() else {
@@ -2402,7 +2420,7 @@ mod tests {
             .unwrap();
         let left = OwnedStateAdvance::begin(left, 2).ok().unwrap();
         let right = OwnedStateAdvance::begin(right, 1).ok().unwrap();
-        let parent = OwnedStateAdvance::begin(parent, 3).ok().unwrap();
+        let parent = OwnedStateAdvance::begin_speculative(parent, 3, 1).ok().unwrap();
         let successors = [&left, &right, &parent].map(|advance| advance.bindings().following_bank);
         for (index, advance) in [&left, &right, &parent].into_iter().enumerate() {
             let bindings = advance.bindings();
@@ -2418,16 +2436,16 @@ mod tests {
             panic!("full prefix must commit");
         };
         let right = right.abort();
-        let OwnedAdvanceResolution::Repair(repair) = parent.commit(2).ok().unwrap() else {
-            panic!("interior recurrent prefix must repair");
+        let OwnedAdvanceResolution::Committed(parent) = parent.commit(2).ok().unwrap() else {
+            panic!("an interior recurrent prefix commits as a tape version");
         };
         let branch = left.checkpoint();
         let fork = branch.fork();
         assert_eq!(fork.bank_index(), left.bank_index());
-        assert_ne!(repair.following_bank(), repair.previous_bank());
+        assert_eq!(parent.bank_index(), successors[2]);
+        assert_eq!(parent.tape_rows(), 1);
         assert!(!readable(&[&left, &right, &fork], &[&root, &branch])
-            .contains(&repair.following_bank()));
-        let parent = repair.commit();
+            .contains(&parent.bank_index()));
         let advance = OwnedStateAdvance::begin(fork, 1).ok().unwrap();
         let following = advance.bindings().following_bank;
         assert_ne!(following, ZERO_SEED_BANK);

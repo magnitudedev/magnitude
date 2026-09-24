@@ -56,7 +56,9 @@ impl ValidatedTargetBatch {
             demand: &packed.demand,
             segments: &packed.segments,
             bank: &packed.bank,
+            previous_tape: &packed.previous_tape,
             following_bank: &packed.following_bank,
+            stop: &packed.stop,
             plane_base: &packed.plane_base,
             out_rows: &packed.out_rows,
             select_rows: &packed.select_rows,
@@ -106,7 +108,9 @@ pub struct TargetBatchUpload<'a> {
     pub demand: &'a [u32],
     pub segments: &'a [[i32; 2]],
     pub bank: &'a [i32],
+    pub previous_tape: &'a [i32],
     pub following_bank: &'a [i32],
+    pub stop: &'a [i32],
     pub plane_base: &'a [i32],
     pub out_rows: &'a [i32],
     pub select_rows: &'a [i32],
@@ -156,7 +160,9 @@ mod tests {
         let batch = ValidatedTargetBatch::from_slots(
             &[Slot {
                 bank: 2,
+                previous_tape: 0,
                 following_bank: 3,
+                stop: 1,
                 rows: vec![Row {
                     token: 7,
                     coordinates: [1, 1, 1, 0],

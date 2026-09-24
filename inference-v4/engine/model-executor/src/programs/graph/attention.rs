@@ -18,11 +18,18 @@ use magnitude_model_kernels::{
     qwen_attention_decode, qwen_attention_decode_k8v4, attention_output,
     qwen_attention_prefill, qwen_attention_prefill_k8v4, qwen_attention_project,
 };
+use magnitude_model_state::AFFINE_GROUP;
 use seismic::{Element, NativeGraph, NativePort, WorkflowTensor};
 
 /// Row classes up to this size attend with the decode entry; larger classes
 /// use the prefill entry.
 pub(crate) const DECODE_ROWS: u64 = 8;
+
+/// F16 elements of one head vector's affine (scale, zero) pairs: one pair per
+/// codec group of a `width`-wide head.
+pub(crate) const fn affine_coefficients(width: u64) -> u64 {
+    2 * width / AFFINE_GROUP as u64
+}
 
 /// The block's weight tensors, as ports of the graph being built.
 pub(crate) struct AttentionWeights {
@@ -135,9 +142,9 @@ pub(crate) fn attention(
         ],
         AttentionHistoryKernels::AffineK8V4 { .. } => vec![
             plane(Element::u32(), block.width / 4)?,
-            plane(Element::f16(), 2)?,
+            plane(Element::f16(), affine_coefficients(block.width))?,
             plane(Element::u32(), block.width / 8)?,
-            plane(Element::f16(), 2)?,
+            plane(Element::f16(), affine_coefficients(block.width))?,
         ],
     };
     let scale = 1.0 / (block.width as f32).sqrt();

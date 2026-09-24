@@ -25,6 +25,10 @@
 
 #define VISION_TILE_M 64u
 #define VISION_TILE_N 64u
+// 32 x 32 per subgroup: 128 invocations.
+#define VISION_SUB 32u
+// Output columns per attention pass (`common/flash.glsl`).
+#define VISION_WINDOW FLASH_WINDOW
 // Shared bytes of a vision GEMM launch: (TM + TN) * 80.
 #define VISION_GEMM_SHARED 10240u
 // Query rows of one attention workgroup (16 per subgroup).
@@ -138,12 +142,12 @@ void vision_gemm(const int wk, projection_prologue in_, vision_epilogue out_, pr
     uint rows, uint k, uint tm_index, uint tn_index) {
     const uint first = tn_index * VISION_TILE_N;
     projection_gemm_acc acc;
-    projection_gemm_accumulate(wk, wk, false, VISION_TILE_M, VISION_TILE_N, in_, w, w, first, rows,
-        tm_index * VISION_TILE_M, m_rows, k, 0u, (k + PROJECTION_GEMM_K - 1u) / PROJECTION_GEMM_K, m_rows, acc);
-    for (uint q = 0u; q < PROJECTION_GEMM_PAIRS; ++q) {
-        const vec2 c = projection_gemm_pair(acc, q);
-        const uint m = tm_index * VISION_TILE_M + projection_gemm_pair_row(VISION_TILE_N, q);
-        const uint n = first + projection_gemm_pair_column(VISION_TILE_N, q);
+    projection_gemm_accumulate(wk, wk, false, VISION_TILE_M, VISION_TILE_N, VISION_SUB, VISION_SUB, in_, w, w, first,
+        rows, tm_index * VISION_TILE_M, m_rows, k, 0u, (k + PROJECTION_GEMM_K - 1u) / PROJECTION_GEMM_K, m_rows, acc);
+    [[unroll]] for (uint q = 0u; q < projection_gemm_pairs(VISION_SUB, VISION_SUB); ++q) {
+        const vec2 c = projection_gemm_pair(acc, VISION_SUB, q);
+        const uint m = tm_index * VISION_TILE_M + projection_gemm_pair_row(VISION_TILE_N, VISION_SUB, VISION_SUB, q);
+        const uint n = first + projection_gemm_pair_column(VISION_TILE_N, VISION_SUB, q);
         if (m < m_rows && n < rows)
             vision_put(out_, m, n, c.x);
         if (m < m_rows && n + 1u < rows)
@@ -213,7 +217,8 @@ void vision_rotate(const int act, uint64_t head_row, uint64_t coordinates, const
 // ---------------------------------------------------------------------------
 // Full attention of one head over every row: workgroup (tile of
 // VISION_ATTEND_ROWS query rows, head), 16 query rows per subgroup, keys
-// streamed in FLASH_KEYS-row tiles in the two passes of `common/flash.glsl`.
+// streamed in FLASH_KEYS-row tiles, one online-softmax pass of
+// `common/flash.glsl` per VISION_WINDOW output columns.
 // `operands` are the f16 rows [3][heads][padded][w]; the output row r of
 // head h is A at out_[r * heads * w + h * w ..], rounded from F32.
 // Shared: the K/V tile (FLASH_KEYS x (w + 8) f16), then
@@ -232,15 +237,12 @@ void vision_attend(const int act, uint64_t operands, uint64_t out_, uint rows, u
 
     const uint64_t width = uint64_t(heads) * w;
     flash_output o;
-    float maximum = -VISION_INF;
-    float denominator = 0.0;
-    // Pass 0 finds the row maxima; pass 1 + i accumulates and publishes
-    // output window i.
-    const uint windows = (w + FLASH_OUT_W - 1u) / FLASH_OUT_W;
-    for (uint pass = 0u; pass <= windows; ++pass) {
-        const uint column0 = pass == 0u ? 0u : (pass - 1u) * FLASH_OUT_W;
-        flash_output_clear(w, o);
-        denominator = 0.0;
+    // One online-softmax pass per output window.
+    const uint windows = (w + VISION_WINDOW - 1u) / VISION_WINDOW;
+    for (uint pass = 0u; pass < windows; ++pass) {
+        const uint column0 = pass * VISION_WINDOW;
+        flash_output_clear(w, VISION_WINDOW, o);
+        flash_softmax softmax = flash_softmax_start();
         for (uint first = 0u; first < rows; first += FLASH_KEYS) {
             barrier();
             flash_stage(ELEMENT_F16, keys, uint64_t(w), 0ul, int(first), int(rows), w, 0u);
@@ -253,31 +255,20 @@ void vision_attend(const int act, uint64_t operands, uint64_t out_, uint rows, u
                 if (first + 16u * (lane / 16u) + j >= rows)
                     s[j] = -VISION_INF;
             }
-            if (pass == 0u) {
-                [[unroll]] for (uint j = 0u; j < 16u; ++j)
-                    maximum = max(maximum, s[j]);
-                continue;
-            }
-            [[unroll]] for (uint j = 0u; j < 16u; ++j) {
-                s[j] = exp2(s[j] - maximum);
-                denominator += s[j];
-            }
+            const float alpha = flash_online(softmax, s);
             const uint p_half = flash_publish_probabilities(scratch, s);
+            flash_rescale(scratch, alpha, w, VISION_WINDOW, o);
             barrier();
             flash_stage(ELEMENT_F16, values, uint64_t(w), 0ul, int(first), int(rows), w, 0u);
             barrier();
-            flash_accumulate(p_half, 0u, w, column0, o);
+            flash_accumulate(p_half, 0u, w, VISION_WINDOW, column0, o);
         }
-        if (pass == 0u) {
-            maximum = max(maximum, subgroupShuffleXor(maximum, 16u));
-            continue;
-        }
-        denominator += subgroupShuffleXor(denominator, 16u);
+        const float denominator = flash_denominator(softmax);
 
         barrier();
         // Unrolled, so every fragment index is a constant.
-        [[unroll]] for (uint q = 0u; q < FLASH_OUT_W / 2u; ++q) {
-            if (q >= flash_window(w) / 2u)
+        [[unroll]] for (uint q = 0u; q < VISION_WINDOW / 2u; ++q) {
+            if (q >= flash_window(w, VISION_WINDOW) / 2u)
                 break;
             const float value = flash_output_value(o, scratch, q);
             const uint r = flash_output_row(q);
@@ -285,7 +276,7 @@ void vision_attend(const int act, uint64_t operands, uint64_t out_, uint rows, u
             const uint row = block_row + r;
             if (row < rows)
                 element_put(act, out_,
-                    uint64_t(row) * width + uint64_t(head) * w + flash_output_column(w, column0, q),
+                    uint64_t(row) * width + uint64_t(head) * w + flash_output_column(w, VISION_WINDOW, column0, q),
                     seismic_div_rn(value, row_denominator));
         }
     }

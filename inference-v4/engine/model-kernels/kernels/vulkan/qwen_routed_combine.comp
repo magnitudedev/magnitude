@@ -113,7 +113,7 @@ void qwen_routed_combine_shared() {
     const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP), SU_GEOMETRY, 0ul, hidden);
     const projection_epilogue out_ = projection_silu_mul(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SHARED_PRODUCT),
         SEISMIC_DIM_S, 1ul);
-    projection_gemm_paired(SG_KIND, SU_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, x, out_, gate, up,
+    projection_gemm_paired(SG_KIND, SU_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, out_, gate, up,
         uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_S), hidden, gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
 }
 
@@ -125,7 +125,7 @@ void qwen_routed_combine_down() {
         shared_features);
     const projection_epilogue out_ = projection_store(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SHARED_OUTPUT),
         SEISMIC_DIM_H, 1ul, 0ul);
-    projection_gemm(SD_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, x, out_, down, uint(SEISMIC_DIM_M),
+    projection_gemm(SD_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, out_, down, uint(SEISMIC_DIM_M),
         uint(SEISMIC_DIM_H), shared_features, gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
 }
 

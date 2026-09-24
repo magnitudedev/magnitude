@@ -9,13 +9,17 @@ use seismic::Tensor;
 use std::rc::Rc;
 
 /// A read-only view whose tensors and row claims are owned by the transaction.
-/// `recurrent` holds one arena per recurrent component; the advance reads bank
-/// `previous_bank` and writes only bank `following_bank` of each.
+/// `recurrent` holds one arena per recurrent component; the advance reads
+/// version (`previous_bank`, `previous_tape`) and writes only bank
+/// `following_bank` of each. It publishes its recurrent state after `stop`
+/// rows and records the tape of the rows after it.
 #[derive(Clone, Copy)]
 pub struct OwnedAdvanceBindings<'a> {
     pub recurrent: &'a [Tensor],
     pub previous_bank: usize,
+    pub previous_tape: usize,
     pub following_bank: usize,
+    pub stop: usize,
     pub history: &'a [PlaneBuffer],
     pub destinations: &'a [usize],
 }
@@ -26,12 +30,15 @@ pub struct OwnedAdvanceBindings<'a> {
 pub struct OwnedStateAdvance {
     state: SequenceState,
     count: usize,
+    /// The rows that always commit; the recurrent state is published after
+    /// them and every later row is recorded on the tape.
+    committed: usize,
     claims: Claims,
     following: BankHandle,
     history: Vec<PlaneBuffer>,
     recurrent: Rc<[Tensor]>,
     destinations: Vec<usize>,
-    transaction: Transaction,
+    _transaction: Transaction,
 }
 
 /// Preparation keeps ownership of the source sequence in every outcome.
@@ -265,6 +272,7 @@ impl OwnedCodecAdvance {
         destination.history_start = source.history_start;
         destination.claims.append(claims);
         std::mem::swap(&mut destination.bank, &mut destination_bank);
+        destination.tape = source.tape;
         destination
     }
 }
@@ -451,10 +459,31 @@ impl OwnedCompaction {
 }
 
 impl OwnedStateAdvance {
-    /// Returns ownership of the unchanged source state if reservation fails.
+    /// An advance whose rows all commit. Returns ownership of the unchanged
+    /// source state if reservation fails.
     pub fn begin(state: SequenceState, count: usize) -> Result<Self, (SequenceState, Error)> {
+        Self::begin_speculative(state, count, count)
+    }
+
+    /// An advance of which only the first `committed` rows always commit
+    /// (a verification: the anchor, then proposals). Its recurrent state is
+    /// published after the committed rows and the later rows are recorded
+    /// on the successor bank's tape, so any accepted prefix of at least
+    /// `committed` rows commits as a version of that one bank, with no
+    /// second pass.
+    pub fn begin_speculative(
+        state: SequenceState,
+        count: usize,
+        committed: usize,
+    ) -> Result<Self, (SequenceState, Error)> {
         if count == 0 || count > state.store.context_capacity.saturating_sub(state.position) {
             return Err((state, Error::from("advance exceeds context capacity")));
+        }
+        if committed == 0 || committed > count {
+            return Err((
+                state,
+                Error::from("committed rows must be a nonempty prefix of the advance"),
+            ));
         }
         let claims = match state.store.reserve(Some(&state.claims), count) {
             Ok(claims) => claims,
@@ -478,12 +507,13 @@ impl OwnedStateAdvance {
         Ok(Self {
             state,
             count,
+            committed,
             claims,
             following,
             history,
             recurrent,
             destinations,
-            transaction,
+            _transaction: transaction,
         })
     }
 
@@ -509,7 +539,9 @@ impl OwnedStateAdvance {
         OwnedAdvanceBindings {
             recurrent: &self.recurrent,
             previous_bank: self.state.bank.index(),
+            previous_tape: self.state.tape,
             following_bank: self.following.index(),
+            stop: self.committed,
             history: &self.history,
             destinations: &self.destinations,
         }
@@ -527,18 +559,18 @@ impl OwnedStateAdvance {
         self.commit(rows)
     }
 
-    /// Publish exactly the accepted physical prefix. A recurrent interior
-    /// prefix yields owned repair work before any successor becomes visible.
+    /// Publish exactly the accepted physical prefix. Recurrent state commits
+    /// as version (successor bank, accepted - committed): an accepted prefix
+    /// shorter than the committed rows has no recurrent version and is
+    /// refused. Stores without recurrent state commit any prefix.
     pub fn commit(self, accepted: usize) -> Result<OwnedAdvanceResolution, (SequenceState, Error)> {
         let Self {
             mut state,
             count,
+            committed,
             claims,
             mut following,
-            history: _,
-            recurrent,
-            destinations: _,
-            transaction,
+            ..
         } = self;
         if accepted > count {
             return Err((
@@ -549,24 +581,31 @@ impl OwnedStateAdvance {
         if accepted == 0 {
             return Ok(OwnedAdvanceResolution::Aborted(state));
         }
-        if accepted == count {
-            install_commit(&mut state, claims, &mut following, count);
-            return Ok(OwnedAdvanceResolution::Committed(state));
-        }
+        let tape = if state.store.has_recurrent_components() {
+            let Some(tape) = accepted.checked_sub(committed) else {
+                return Err((
+                    state,
+                    Error::from("accepted prefix ends before the published recurrent state"),
+                ));
+            };
+            tape
+        } else {
+            0
+        };
         let mut kept = claims;
         drop(kept.split_off(accepted));
-        if !state.store.has_recurrent_components() {
-            install_commit(&mut state, kept, &mut following, accepted);
-            return Ok(OwnedAdvanceResolution::Committed(state));
-        }
-        Ok(OwnedAdvanceResolution::Repair(OwnedRepairAdvance {
-            state,
-            accepted,
-            claims: kept,
-            following,
-            recurrent,
-            _transaction: transaction,
-        }))
+        install_commit(&mut state, kept, &mut following, tape, accepted);
+        Ok(OwnedAdvanceResolution::Committed(state))
+    }
+}
+
+/// The tape rows of the version an advance of `count` rows publishes when
+/// all of them commit.
+fn published_tape(store: &StateStore, count: usize, committed: usize) -> usize {
+    if store.has_recurrent_components() {
+        count - committed
+    } else {
+        0
     }
 }
 
@@ -581,6 +620,7 @@ impl OwnedStateAdvance {
             Predecessor {
                 end: self.state.position + self.count,
                 bank: self.following.index(),
+                tape: published_tape(&self.state.store, self.count, self.committed),
                 claims: &self.claims,
                 ranges,
                 history: &self.history,
@@ -595,8 +635,9 @@ impl OwnedStateAdvance {
 struct Predecessor<'a> {
     /// The position after the predecessor's rows.
     end: usize,
-    /// The bank the predecessor publishes.
+    /// The version the predecessor publishes when all its rows commit.
     bank: usize,
+    tape: usize,
     claims: &'a Claims,
     /// Visible history once the predecessor commits.
     ranges: Vec<(usize, usize)>,
@@ -615,6 +656,7 @@ pub struct OwnedSuccessorAdvance {
     store: Rc<StateStore>,
     position: usize,
     previous_bank: usize,
+    previous_tape: usize,
     ranges: Vec<(usize, usize)>,
     count: usize,
     claims: Claims,
@@ -648,6 +690,7 @@ impl OwnedSuccessorAdvance {
             store: store.clone(),
             position: predecessor.end,
             previous_bank: predecessor.bank,
+            previous_tape: predecessor.tape,
             ranges: predecessor.ranges,
             count,
             claims,
@@ -668,6 +711,7 @@ impl OwnedSuccessorAdvance {
             Predecessor {
                 end: self.position + self.count,
                 bank: self.following.index(),
+                tape: 0,
                 claims: &self.claims,
                 ranges,
                 history: &self.history,
@@ -697,7 +741,9 @@ impl OwnedSuccessorAdvance {
         OwnedAdvanceBindings {
             recurrent: &self.recurrent,
             previous_bank: self.previous_bank,
+            previous_tape: self.previous_tape,
             following_bank: self.following.index(),
+            stop: self.count,
             history: &self.history,
             destinations: &self.destinations,
         }
@@ -705,11 +751,12 @@ impl OwnedSuccessorAdvance {
 
     /// Join the predecessor's committed state: an ordinary advance over the
     /// rows and bank this successor reserved. `state` must be exactly the
-    /// state the predecessor published (position, bank and history).
+    /// state the predecessor published (position, version and history).
     pub fn attach(self, state: SequenceState) -> Result<OwnedStateAdvance, (SequenceState, Error)> {
         if !state.belongs_to(&self.store)
             || state.position != self.position
             || state.bank.index() != self.previous_bank
+            || state.tape != self.previous_tape
             || state.history_ranges() != self.ranges
         {
             return Err((
@@ -730,12 +777,13 @@ impl OwnedSuccessorAdvance {
         Ok(OwnedStateAdvance {
             state,
             count,
+            committed: count,
             claims,
             following,
             history,
             recurrent,
             destinations,
-            transaction,
+            _transaction: transaction,
         })
     }
 }
@@ -794,62 +842,6 @@ impl TentativeAdvance {
 pub enum OwnedAdvanceResolution {
     Aborted(SequenceState),
     Committed(SequenceState),
-    Repair(OwnedRepairAdvance),
-}
-
-/// Recompute the recurrent successor of an accepted interior prefix using an
-/// ordinary state-program submission, then publish it atomically.
-pub struct OwnedRepairAdvance {
-    state: SequenceState,
-    accepted: usize,
-    claims: Claims,
-    following: BankHandle,
-    recurrent: Rc<[Tensor]>,
-    _transaction: Transaction,
-}
-
-impl OwnedRepairAdvance {
-    pub fn belongs_to(&self, store: &Rc<StateStore>) -> bool {
-        self.state.belongs_to(store)
-    }
-
-    pub fn rows(&self) -> usize {
-        self.accepted
-    }
-
-    pub fn history_ranges(&self) -> Vec<(usize, usize)> {
-        self.state.history_ranges()
-    }
-
-    /// One arena per recurrent component; repair reads `previous_bank` and
-    /// writes only `following_bank`.
-    pub fn recurrent(&self) -> &[Tensor] {
-        &self.recurrent
-    }
-
-    pub fn previous_bank(&self) -> usize {
-        self.state.bank.index()
-    }
-
-    pub fn following_bank(&self) -> usize {
-        self.following.index()
-    }
-
-    pub fn commit(self) -> SequenceState {
-        let Self {
-            mut state,
-            accepted,
-            claims,
-            mut following,
-            ..
-        } = self;
-        install_commit(&mut state, claims, &mut following, accepted);
-        state
-    }
-
-    pub fn abort(self) -> SequenceState {
-        self.state
-    }
 }
 
 #[cfg(test)]
@@ -979,7 +971,7 @@ mod tests {
             4,
             4,
             vec![
-                ComponentDescriptor::new(LayerRef::Target(0), CodecSpec::dense(DType::F16, 8, 8), 1)
+                ComponentDescriptor::new(LayerRef::Target(0), CodecSpec::dense(DType::F16, 32, 32), 1)
                     .unwrap(),
             ],
             vec![],
@@ -996,7 +988,7 @@ mod tests {
             4,
             vec![ComponentDescriptor::new(
                 LayerRef::Target(0),
-                KvCodec::AffineK8V4.spec(DType::F16, 8, 8),
+                KvCodec::AffineK8V4.spec(DType::F16, 32, 32),
                 1,
             )
             .unwrap()],
@@ -1041,42 +1033,118 @@ mod tests {
         assert_eq!(destination_store.occupied_rows(), 2);
     }
 
-    #[test]
-    fn recurrent_interior_prefix_remains_unpublished_until_repair() {
-        let Some(device) = DeviceCatalog::discover()
+    fn recurrent_store(context: usize, in_flight: usize) -> Option<Rc<StateStore>> {
+        let device = DeviceCatalog::discover()
             .ok()
-            .and_then(|catalog| catalog.open_backend(BackendName::Cpu).ok())
-        else {
+            .and_then(|catalog| catalog.open_backend(BackendName::Cpu).ok())?;
+        Some(
+            StateStore::new(
+                Rc::new(device),
+                context,
+                context,
+                vec![ComponentDescriptor::new(
+                    LayerRef::Target(0),
+                    CodecSpec::dense(DType::F32, 1, 1),
+                    1,
+                )
+                .unwrap()],
+                vec![ComponentSpec {
+                    shape: vec![1],
+                    dtype: DType::F32,
+                }],
+                BankCapacity {
+                    active: 2,
+                    in_flight,
+                    retained: 0,
+                },
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A verification publishes its recurrent state after its committed rows
+    /// and records the rest on the tape: any accepted prefix commits as
+    /// version (successor bank, accepted - committed), read by the next
+    /// advance, with no second pass.
+    #[test]
+    fn speculative_prefixes_commit_as_tape_versions() {
+        let Some(store) = recurrent_store(8, 2) else {
             return;
         };
-        let store = StateStore::new(
-            Rc::new(device),
-            4,
-            4,
-            vec![
-                ComponentDescriptor::new(LayerRef::Target(0), CodecSpec::dense(DType::F32, 1, 1), 1)
-                    .unwrap(),
-            ],
-            vec![ComponentSpec {
-                shape: vec![1],
-                dtype: DType::F32,
-            }],
-            BankCapacity {
-                active: 1,
-                in_flight: 1,
-                retained: 0,
-            },
-        )
-        .unwrap();
         let state = store.create().unwrap();
-        let advance = OwnedStateAdvance::begin(state, 2).ok().unwrap();
-        let OwnedAdvanceResolution::Repair(repair) = advance.commit(1).ok().unwrap() else {
-            panic!("interior recurrent prefix must require repair");
+        let advance = OwnedStateAdvance::begin_speculative(state, 4, 1).ok().unwrap();
+        let bindings = advance.bindings();
+        assert_eq!((bindings.stop, bindings.previous_tape), (1, 0));
+        let following = bindings.following_bank;
+        let OwnedAdvanceResolution::Committed(state) = advance.commit(3).ok().unwrap() else {
+            panic!("an accepted prefix past the committed rows commits");
         };
-        assert_eq!(repair.rows(), 1);
-        assert_eq!(store.occupied_rows(), 1);
-        let state = repair.abort();
-        assert_eq!(state.position(), 0);
-        assert_eq!(store.occupied_rows(), 0);
+        assert_eq!((state.position(), state.bank_index(), state.tape_rows()), (3, following, 2));
+        assert_eq!(store.occupied_rows(), 3);
+
+        // The next advance reads the version; a checkpoint and its forks keep it.
+        let checkpoint = state.checkpoint();
+        assert_eq!(checkpoint.tape_rows(), 2);
+        assert_eq!(checkpoint.fork().tape_rows(), 2);
+        let advance = OwnedStateAdvance::begin(state, 1).ok().unwrap();
+        let bindings = advance.bindings();
+        assert_eq!(
+            (bindings.previous_bank, bindings.previous_tape, bindings.stop),
+            (following, 2, 1)
+        );
+        let OwnedAdvanceResolution::Committed(state) = advance.commit_all().ok().unwrap() else {
+            panic!("a plain advance commits");
+        };
+        assert_eq!((state.position(), state.tape_rows()), (4, 0));
+
+        // A prefix ending before the published state has no version.
+        let advance = OwnedStateAdvance::begin_speculative(state, 3, 2).ok().unwrap();
+        let (state, _) = advance.commit(1).err().unwrap();
+        assert_eq!((state.position(), state.tape_rows()), (4, 0));
+        assert_eq!(store.occupied_rows(), 4);
+        let advance = OwnedStateAdvance::begin_speculative(state, 3, 2).ok().unwrap();
+        let OwnedAdvanceResolution::Aborted(state) = advance.commit(0).ok().unwrap() else {
+            panic!("an empty prefix aborts");
+        };
+        assert_eq!(state.position(), 4);
+        assert!(OwnedStateAdvance::begin_speculative(state, 2, 0).is_err());
+    }
+
+    /// A successor of a verification follows the version the verification
+    /// publishes when every row is accepted, and attaches only to it.
+    #[test]
+    fn successors_follow_the_tape_version_of_a_speculative_advance() {
+        let Some(store) = recurrent_store(8, 3) else {
+            return;
+        };
+        let first = OwnedStateAdvance::begin_speculative(store.create().unwrap(), 3, 1)
+            .ok()
+            .unwrap();
+        let second = first.successor(1).unwrap();
+        let bindings = second.bindings();
+        assert_eq!(
+            (bindings.previous_bank, bindings.previous_tape, bindings.stop),
+            (first.bindings().following_bank, 2, 1)
+        );
+        let OwnedAdvanceResolution::Committed(state) = first.commit_all().ok().unwrap() else {
+            panic!("full accepted prefix must commit");
+        };
+        assert_eq!(state.tape_rows(), 2);
+        let second = second.attach(state).ok().unwrap();
+        let OwnedAdvanceResolution::Committed(state) = second.commit_all().ok().unwrap() else {
+            panic!("full accepted prefix must commit");
+        };
+        assert_eq!((state.position(), state.tape_rows()), (4, 0));
+
+        // A partially accepted verification publishes another version. A
+        // launch commits the banks of both steps before either begins.
+        store.provision(&[], 2).unwrap();
+        let first = OwnedStateAdvance::begin_speculative(state, 3, 1).ok().unwrap();
+        let second = first.successor(1).unwrap();
+        let OwnedAdvanceResolution::Committed(state) = first.commit(2).ok().unwrap() else {
+            panic!("an accepted prefix commits");
+        };
+        assert_eq!(state.tape_rows(), 1);
+        assert!(second.attach(state).is_err());
     }
 }

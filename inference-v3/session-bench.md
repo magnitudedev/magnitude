@@ -43,8 +43,12 @@ uv run session-bench run --model qwen-q4 \
   --suite session,parallel,fork --context 4k,16k
 
 # Use prose with the same serving schedules.
-uv run session-bench run --model qwen-q4 --prose \
+uv run session-bench run --model qwen-q4 --workload prose-continue \
   --suite context,session --context 4k,16k,64k
+
+# Repeat one fixed passage back: the same 256-token output at every checkpoint.
+uv run session-bench run --model qwen-q4 --workload prose-repeat \
+  --suite single,context --context 4k,16k,64k
 
 # Compare against upstream llama.cpp using the alias's GGUF representation.
 uv run session-bench run --model qwen-q4 \
@@ -61,17 +65,26 @@ uv run session-bench show <run-id>
 ```
 
 Repeat `--model` and `--engine` to select their combinations. Use repeated
-`--target ENGINE=ARTIFACT` instead for explicit pairs. `--category` accepts comma-separated
+`--target ENGINE=ARTIFACT` instead for explicit pairs. `--workload` selects `tools` (the
+default), `prose-continue`, `prose-repeat` or `retrieval`; each workload's own options are
+rejected under any other workload. For `tools`, `--category` accepts comma-separated
 `simple-python`, `parallel`, `parallel-multiple`, or `all`; `--case` selects a specific current decision.
 Canonical background history still comes from the selected categories. `--dry-run` inspects
 the selection; token-bound histories are prepared when running with the first target. `--repeat` repeats the
 balanced schedule. Add `--json` for machine-readable discovery and results; progress goes to stderr.
 
-## Prose mode
+## Prose workloads
 
-`--prose` selects the shared, downloaded `prose.moby-dick` fixture. Each request asks
-the model to continue a passage, returning only prose. Requests omit tools and tool
-choice. `--category` and `--case` are tool-only filters and cannot accompany `--prose`.
+`--workload prose-continue` selects the shared, downloaded `prose.moby-dick` fixture. Each
+request asks the model to continue a passage, returning only prose. Requests omit tools and
+tool choice.
+
+`--workload prose-repeat` selects `prose.moby-dick.repeat`: each request asks the model to
+copy the supplied passage back. Every independent session's passage starts at the first
+sentence of "Loomings" and grows to the checkpoint, so the 256-token output is the same text
+at every context size and on every engine. It is the consistent decode benchmark and the
+speculative-decoding benchmark. At the minimum passage (`single`) the passage is
+byte-identical to V3's Loomings repeat reference.
 
 All sections remain available. `single` uses a short passage; `context`, `parallel`
 and `concurrency` use independent reading sessions sized at the requested checkpoints.
@@ -88,13 +101,13 @@ score. Later inputs use canonical book text, regardless of what the model genera
 
 ## Retrieval mode and fixture API
 
-`--retrieval` selects deterministic key/value retrieval over synthetic distractor records.
+`--workload retrieval` selects deterministic key/value retrieval over synthetic distractor records.
 The local recipe adapts RULER's record-haystack and multi-query tasks with stable indexed
 facts, explicit placement and strict JSON scoring. It records the upstream revision and
 local recipe identity; it requires no corpus download or upstream runtime.
 
 ```sh
-uv run session-bench run --model qwen-q4 --retrieval \
+uv run session-bench run --model qwen-q4 --workload retrieval \
   --retrieval-variant multiquery --retrieval-queries 4 --retrieval-seed 42 \
   --needle-depth 0.5 --suite context --context 4k,16k,32k,4k
 ```
@@ -149,8 +162,8 @@ and exact results. Reports include exact-answer and field accuracy with failure-
 denominators: unscored requests earn zero. Latency includes correct and incorrect
 protocol-complete responses, excluding truncation and execution failures.
 
-`--retrieval` and `--prose` are mutually exclusive. Neither accepts tool filters
-`--category`/`--case`; retrieval-specific options require `--retrieval`.
+Retrieval options (`--retrieval-*`, `--needle-depth`) require `--workload retrieval`; tool
+filters (`--category`, `--case`) require `--workload tools`.
 
 ## Maintained sections and policy
 

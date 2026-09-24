@@ -1000,13 +1000,6 @@ impl AttestedPrograms {
                 .clone(),
         )
     }
-    pub(crate) fn bind_state_with_repair(
-        &self,
-        target: &crate::programs::native_target::NativeTargetProgram,
-        store: std::rc::Rc<magnitude_model_state::StateStore>,
-    ) -> crate::programs::native_state::NativeStateProgram {
-        self.bind_state().with_repair(target.clone(), store)
-    }
     pub(crate) fn imports(&self) -> &[(ImportProgramSlot, AttestedImport)] {
         &self.imports
     }

@@ -47,7 +47,7 @@ native qwen_dense_expand for metal from "metal/qwen_dense_expand.metal":
     launch qwen_dense_expand_gemv when O < BATCH_FROM:
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (min(O, 8) * min(ceil_div(H, 32), 288 / max(O, 1)) * 72)
+        shared_bytes (min(ceil_div(H, 32) * (min(O, 2) + 2 * min(O / 3, 1) + 4 * min(O / 5, 1)), 448) * 64)
     launch qwen_dense_expand_batch when O >= BATCH_FROM and O <= 16:
         threadgroups (ceil_div(F, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
         threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
@@ -69,7 +69,8 @@ native qwen_dense_expand for metal from "metal/qwen_dense_expand.metal":
 native qwen_dense_expand for vulkan from "vulkan/qwen_dense_expand.comp":
     static (H, F)
     params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
-            TILE_M in [64, 128, 32], TILE_N in [64, 128])
+            TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
+    where SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch normalized bytes (O * H * 2) when O > 8
     launch qwen_dense_expand_stage when O > 8:
         threadgroups (O, 1, 1)
@@ -81,7 +82,7 @@ native qwen_dense_expand for vulkan from "vulkan/qwen_dense_expand.comp":
         shared_bytes (256 + min(8 * ceil_div(H, 32), 288) * 72)
     launch qwen_dense_expand_gemm when O > 8:
         threadgroups (ceil_div(F, TILE_N / 2), ceil_div(O, TILE_M), 1)
-        threads_per_threadgroup (TILE_M * TILE_N / 32, 1, 1)
+        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
         shared_bytes ((TILE_M + TILE_N) * 80)
 
 
@@ -106,7 +107,7 @@ native qwen_dense_output for metal from "metal/qwen_dense_output.metal":
     launch qwen_dense_output_gemv when O < BATCH_FROM:
         threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (min(O, 8) * min(ceil_div(F, 32), 288 / max(O, 1)) * 72)
+        shared_bytes (min(ceil_div(F, 32) * (min(O, 2) + 2 * min(O / 3, 1) + 4 * min(O / 5, 1)), 448) * 64)
     launch qwen_dense_output_batch when O >= BATCH_FROM and O <= 16:
         threadgroups (ceil_div(H, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
         threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
@@ -129,7 +130,9 @@ native qwen_dense_output for metal from "metal/qwen_dense_output.metal":
 native qwen_dense_output for vulkan from "vulkan/qwen_dense_output.comp":
     static (H, F)
     params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
-            TILE_M in [64, 128, 32], TILE_N in [64, 128], arithmetic SPLIT in [1, 2, 4])
+            TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64],
+            arithmetic SPLIT in [1, 2, 4])
+    where SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch partials bytes (SPLIT * O * H * 4) when O > 8 and SPLIT > 1
     launch qwen_dense_output_gemv when O <= 8:
         threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
@@ -137,7 +140,7 @@ native qwen_dense_output for vulkan from "vulkan/qwen_dense_output.comp":
         shared_bytes (256 + min(8 * ceil_div(F, 32), 288) * 72)
     launch qwen_dense_output_gemm when O > 8:
         threadgroups (ceil_div(H, TILE_N), ceil_div(O, TILE_M), SPLIT)
-        threads_per_threadgroup (TILE_M * TILE_N / 32, 1, 1)
+        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
         shared_bytes ((TILE_M + TILE_N) * 80)
     launch qwen_dense_output_finalize when O > 8 and SPLIT > 1:
         threadgroups (ceil_div(O * H, 256), 1, 1)

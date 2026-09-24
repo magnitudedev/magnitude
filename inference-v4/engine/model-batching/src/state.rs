@@ -1,6 +1,5 @@
 //! Device-independent row controls for state maintenance submissions.
 
-use crate::{Demand, ValidatedTargetBatch};
 use magnitude_model_state::{CodecConversionStep, KvCodec, PlaneCopy};
 use std::{collections::HashSet, fmt};
 
@@ -11,18 +10,16 @@ pub enum StateBatchKind {
         source: KvCodec,
         destination: KvCodec,
     },
-    RecurrentRepair,
 }
 
 #[derive(Clone, Debug)]
 enum StateRows {
     Copies(Vec<PlaneCopy>),
     Conversions(Vec<CodecConversionStep>),
-    Replay(ValidatedTargetBatch),
 }
 
-/// A closed state operation. Numerical repair carries a validated replay
-/// batch; copy and conversion carry checked plane row mappings.
+/// A closed state operation: copy and conversion carry checked plane row
+/// mappings.
 #[derive(Clone, Debug)]
 pub struct ValidatedStateBatch {
     kind: StateBatchKind,
@@ -178,35 +175,6 @@ impl ValidatedStateBatch {
         })
     }
 
-    pub fn repair(
-        replay: ValidatedTargetBatch,
-        accepted_rows: usize,
-        class_rows: usize,
-    ) -> Result<Self, StateBatchError> {
-        if accepted_rows == 0
-            || accepted_rows != replay.actual_rows()
-            || replay.actual_slots() != 1
-            || replay
-                .demand_bits()
-                .iter()
-                .any(|demand| *demand != Demand::NONE.bits())
-        {
-            return Err(StateBatchError::InvalidMapping);
-        }
-        if accepted_rows > class_rows {
-            return Err(StateBatchError::Capacity {
-                required: accepted_rows,
-                available: class_rows,
-            });
-        }
-        Ok(Self {
-            kind: StateBatchKind::RecurrentRepair,
-            rows: StateRows::Replay(replay),
-            actual_rows: accepted_rows,
-            class_rows,
-        })
-    }
-
     pub fn kind(&self) -> StateBatchKind {
         self.kind
     }
@@ -219,19 +187,13 @@ impl ValidatedStateBatch {
     pub fn copies(&self) -> Option<&[PlaneCopy]> {
         match &self.rows {
             StateRows::Copies(copies) => Some(copies),
-            _ => None,
+            StateRows::Conversions(_) => None,
         }
     }
     pub fn conversions(&self) -> Option<&[CodecConversionStep]> {
         match &self.rows {
             StateRows::Conversions(steps) => Some(steps),
-            _ => None,
-        }
-    }
-    pub fn replay(&self) -> Option<&ValidatedTargetBatch> {
-        match &self.rows {
-            StateRows::Replay(replay) => Some(replay),
-            _ => None,
+            StateRows::Copies(_) => None,
         }
     }
 }

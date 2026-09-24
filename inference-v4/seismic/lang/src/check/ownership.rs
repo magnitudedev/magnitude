@@ -3,9 +3,10 @@
 use super::{ir, Checker, LocalKind, ValueClass};
 use crate::intrinsics::{PrimitiveFailure, PrimitiveId};
 use crate::types::ValueType;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct LocalPlace {
     pub local: ir::LocalId,
     pub path: Vec<usize>,
@@ -22,13 +23,13 @@ impl LocalPlace {
             && (self.path.starts_with(&other.path) || other.path.starts_with(&self.path))
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum TensorOwnership {
     Owned { moved: bool },
     Computed,
     Borrowed { owner: LocalPlace, exclusive: bool },
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ValueOwnership {
     Scalar,
     Tensor(TensorOwnership),

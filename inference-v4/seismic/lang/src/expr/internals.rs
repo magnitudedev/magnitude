@@ -47,8 +47,7 @@ use num_bigint::{BigInt, BigUint};
 use num_traits::{Euclid, One, Signed, Zero};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicU64, Ordering};
+use serde::{Deserialize, Serialize};
 
 fn handle<Sort>(owner: ArenaId, index: u32) -> Expr<Sort> {
     Expr {
@@ -77,7 +76,7 @@ const SYMBOL_OUT_OF_ARENA: &str = "ExprArena: symbol id outside its owning arena
 const UNDECLARED_DECISION: &str =
     "ExprArena: decision id was never declared in its owning arena (§13.3.2)";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum Sort {
     Nat,
     Int,
@@ -88,7 +87,7 @@ enum Sort {
 
 /// One interned node. Operands are sort-carrying handles so `view` is a
 /// direct projection.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum Node {
     NatConst(u64),
     IntConst(i64),
@@ -143,7 +142,7 @@ enum Node {
     },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct SymbolRecord {
     kind: SymbolKind,
     sort: SymbolSort,
@@ -174,22 +173,227 @@ pub(super) struct Arena {
 }
 
 // ---------------------------------------------------------------------------
+// checked-bundle wire form
+// ---------------------------------------------------------------------------
+
+/// Every field of an arena except the intern table, which decoding rebuilds
+/// from `nodes`. Maps serialize as key-sorted pairs so equal arenas encode to
+/// equal bytes. The owner serializes as its wire slot (`crate::wire`).
+#[derive(Serialize)]
+struct ArenaFields<'a> {
+    id: u32,
+    symbols: &'a [SymbolRecord],
+    target_constants: &'a [SymbolId],
+    decision_count: u32,
+    binder_symbols: Vec<(&'a LoopBinderId, &'a Vec<SymbolId>)>,
+    loop_binder_count: u32,
+    proof_variable_count: u32,
+    decisions: Vec<(&'a DecisionId, &'a (FiniteDomain, SymbolId))>,
+    call_strides: Vec<(&'a (crate::ids::ParameterId, u32), &'a SymbolId)>,
+    nodes: &'a [Node],
+    sorts: &'a [Sort],
+    total: &'a [bool],
+    unguarded_total: &'a [bool],
+    free: &'a [Vec<SymbolId>],
+    roots: &'a [(RootName, AnyExpr)],
+}
+
+/// The owned form of [`ArenaFields`], field for field.
+#[derive(Deserialize)]
+struct ArenaParts {
+    id: u32,
+    symbols: Vec<SymbolRecord>,
+    target_constants: Vec<SymbolId>,
+    decision_count: u32,
+    binder_symbols: Vec<(LoopBinderId, Vec<SymbolId>)>,
+    loop_binder_count: u32,
+    proof_variable_count: u32,
+    decisions: Vec<(DecisionId, (FiniteDomain, SymbolId))>,
+    call_strides: Vec<((crate::ids::ParameterId, u32), SymbolId)>,
+    nodes: Vec<Node>,
+    sorts: Vec<Sort>,
+    total: Vec<bool>,
+    unguarded_total: Vec<bool>,
+    free: Vec<Vec<SymbolId>>,
+    roots: Vec<(RootName, AnyExpr)>,
+}
+
+fn sorted<K: Ord, V>(map: &HashMap<K, V>) -> Vec<(&K, &V)> {
+    let mut pairs: Vec<_> = map.iter().collect();
+    pairs.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    pairs
+}
+
+impl Serialize for Arena {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::Error as _;
+        let Arena {
+            id,
+            symbols,
+            target_constants,
+            decision_count,
+            binder_symbols,
+            loop_binder_count,
+            proof_variable_count,
+            decisions,
+            call_strides,
+            nodes,
+            sorts,
+            total,
+            unguarded_total,
+            free,
+            interned: _,
+            roots,
+        } = self;
+        ArenaFields {
+            id: crate::wire::encode_arena(*id).map_err(S::Error::custom)?,
+            symbols,
+            target_constants,
+            decision_count: *decision_count,
+            binder_symbols: sorted(binder_symbols),
+            loop_binder_count: *loop_binder_count,
+            proof_variable_count: *proof_variable_count,
+            decisions: sorted(decisions),
+            call_strides: sorted(call_strides),
+            nodes,
+            sorts,
+            total,
+            unguarded_total,
+            free,
+            roots,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Arena {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        Arena::from_parts(ArenaParts::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+impl Arena {
+    /// Rebuilds a decoded arena. Every handle it holds must be its own, every
+    /// node's operands must precede it with the sort the operand handle
+    /// claims, the per-node tables must cover every node, and nodes must be
+    /// structurally unique. Handle ranges are checked when the decode ends
+    /// (`crate::wire::decode`).
+    fn from_parts(parts: ArenaParts) -> Result<Self, crate::wire::WireError> {
+        use crate::wire::{ArenaExtent, ArenaHandle, WireError};
+        let ArenaParts {
+            id: slot,
+            symbols,
+            target_constants,
+            decision_count,
+            binder_symbols,
+            loop_binder_count,
+            proof_variable_count,
+            decisions,
+            call_strides,
+            nodes,
+            sorts,
+            total,
+            unguarded_total,
+            free,
+            roots,
+        } = parts;
+        let extent = ArenaExtent::default()
+            .with(ArenaHandle::Node, nodes.len())?
+            .with(ArenaHandle::Symbol, symbols.len())?
+            .with(ArenaHandle::TargetConstant, target_constants.len())?
+            .with(ArenaHandle::Decision, decision_count as usize)?
+            .with(ArenaHandle::LoopBinder, loop_binder_count as usize)?
+            .with(ArenaHandle::Root, roots.len())?;
+        let id = crate::wire::define_arena(slot, extent)?;
+        let foreign = WireError("arena holds a handle of another arena");
+        let own = |owner: ArenaId| if owner == id { Ok(()) } else { Err(foreign) };
+        if [sorts.len(), total.len(), unguarded_total.len(), free.len()]
+            .iter()
+            .any(|length| *length != nodes.len())
+        {
+            return Err(WireError("arena node tables disagree in length"));
+        }
+        for symbol in target_constants
+            .iter()
+            .chain(binder_symbols.iter().flat_map(|(_, symbols)| symbols))
+            .chain(decisions.iter().map(|(_, (_, symbol))| symbol))
+            .chain(call_strides.iter().map(|(_, symbol)| symbol))
+            .chain(free.iter().flatten())
+        {
+            own(symbol.owner)?;
+        }
+        for (binder, _) in &binder_symbols {
+            own(binder.owner)?;
+        }
+        for (decision, _) in &decisions {
+            own(decision.owner)?;
+        }
+        for (_, root) in &roots {
+            own(raw(*root).0)?;
+        }
+        let mut interned = HashMap::with_capacity(nodes.len());
+        for (index, node) in nodes.iter().enumerate() {
+            for child in Self::children(node) {
+                let (owner, position) = raw(child);
+                own(owner)?;
+                let position = position as usize;
+                let earlier = position < index
+                    && match child {
+                        AnyExpr::Nat(_) => sorts[position] == Sort::Nat,
+                        AnyExpr::Int(_) => sorts[position] == Sort::Int,
+                        AnyExpr::Bool(_) => sorts[position] == Sort::Bool,
+                        AnyExpr::Duration(_) => sorts[position] == Sort::Duration,
+                        AnyExpr::Scalar(_) => matches!(sorts[position], Sort::Scalar(_)),
+                    };
+                if !earlier {
+                    return Err(WireError("arena node operand is not an earlier node of its sort"));
+                }
+            }
+            match node {
+                Node::Symbol(symbol) => own(symbol.owner)?,
+                Node::Fold { binder, .. } => own(binder.owner)?,
+                _ => {}
+            }
+            let index = u32::try_from(index).map_err(|_| WireError("arena exceeds u32 nodes"))?;
+            if interned.insert(node.clone(), index).is_some() {
+                return Err(WireError("arena interns one node twice"));
+            }
+        }
+        fn unique<K: Eq + std::hash::Hash, V>(pairs: Vec<(K, V)>) -> Result<HashMap<K, V>, WireError> {
+            let length = pairs.len();
+            let map: HashMap<K, V> = pairs.into_iter().collect();
+            (map.len() == length).then_some(map).ok_or(WireError("arena map repeats a key"))
+        }
+        Ok(Arena {
+            id,
+            symbols,
+            target_constants,
+            decision_count,
+            binder_symbols: unique(binder_symbols)?,
+            loop_binder_count,
+            proof_variable_count,
+            decisions: unique(decisions)?,
+            call_strides: unique(call_strides)?,
+            nodes,
+            sorts,
+            total,
+            unguarded_total,
+            free,
+            interned,
+            roots,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // construction
 // ---------------------------------------------------------------------------
 
 impl Arena {
     pub(super) fn new() -> Self {
-        static NEXT_ARENA: AtomicU64 = AtomicU64::new(1);
-        let id = NEXT_ARENA
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1)
-            })
-            .unwrap_or_else(|_| panic!("ExprArena identity space exhausted"));
         Self {
-            id: ArenaId(
-                NonZeroU64::new(id)
-                    .unwrap_or_else(|| panic!("ExprArena identity allocator produced zero")),
-            ),
+            id: ArenaId::fresh(),
             symbols: Vec::new(),
             target_constants: Vec::new(),
             decision_count: 0,

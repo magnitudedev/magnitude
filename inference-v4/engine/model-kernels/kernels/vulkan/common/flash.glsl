@@ -5,11 +5,14 @@
 // the shared region in tiles of FLASH_KEYS rows as f16 with rows padded to
 // w + 8. Per tile the block's scores S = Q K^T are formed in F32 (16x16x16
 // cooperative matrices under SEISMIC_HAS_MATRIX, FMAs otherwise) and passed
-// through the subgroup's shared scratch to the caller's scalar softmax,
-// whose f16 probabilities multiply the staged V tile into F32 output
-// accumulators. Callers run a row-maxima pass, then an accumulation pass per
-// output window (FLASH_OUT_W columns), so the accumulators are never
-// rescaled: the cooperative-matrix fragment layout is opaque.
+// through the subgroup's shared scratch to the scalar online softmax
+// (`flash_online`), whose f16 probabilities multiply the staged V tile into
+// F32 output accumulators. Callers make one pass over the keys per output
+// window (a caller constant of at most FLASH_MAX_W columns); when a row's
+// running maximum grows, its accumulated outputs are rescaled by a
+// component-wise product with a fragment of per-row factors staged in the
+// scratch (`flash_rescale`), since the cooperative-matrix fragment layout is
+// opaque.
 //
 // Lane layout of the scalar softmax: lane l owns row l % 16 and keys
 // 16 (l / 16) .. + 15 of the tile.
@@ -19,9 +22,20 @@
 
 #define FLASH_KEYS 32u
 #define FLASH_MAX_W 256u
-// Floats of shared scratch per subgroup (scores 16 x 32; the output
-// fragments reuse it).
+// Floats of shared scratch per subgroup: the scores 16 x 32; then the f16 P
+// (16 x 32) in its first half, the rescale factors (16 x 16) in its second
+// half; the output fragments reuse it.
 #define FLASH_SCRATCH_FLOATS 512u
+#define FLASH_FACTORS 256u
+#define FLASH_INF uintBitsToFloat(0x7f800000u)
+// The widest output window a device takes in one pass: the whole head, or 4
+// accumulator fragments where the compiler mishandles wider accumulator
+// arrays (NVIDIA 580, `SEISMIC_HAS_WIDE_ACCUMULATORS` 0).
+#if SEISMIC_HAS_WIDE_ACCUMULATORS
+#define FLASH_WINDOW FLASH_MAX_W
+#else
+#define FLASH_WINDOW 64u
+#endif
 
 #if SEISMIC_HAS_MATRIX
 #define FLASH_FRAGMENT_A coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
@@ -128,52 +142,108 @@ uint flash_publish_probabilities(uint scratch, float p[16]) {
     return p_half;
 }
 
-// The output accumulators of a block over one window of at most
-// FLASH_OUT_W columns (columns [column0, column0 + FLASH_OUT_W) of w): wide
-// heads accumulate their columns window by window, each over the whole key
-// walk, so a subgroup holds at most 4 accumulator fragments: the NVIDIA 580
-// compiler returns wrong outputs for some larger accumulator arrays (16
-// fragments; 8 declared with 2 used), while 4 are reliable at every tested
-// width. Every window is `flash_window(w)` columns, a compile-time constant,
-// as window / 16 fragments, or window / 2 columns per lane (row lane % 16,
-// columns (lane / 16) window / 2 ..). So w is at most FLASH_OUT_W or a
-// multiple of it. (Wider windows cost fewer score passes: revisit per device.)
-#define FLASH_OUT_W 64u
+// The online softmax state of the lane's row: its running maximum (shared by
+// both lanes of the row) and the lane's half of the running denominator.
+struct flash_softmax {
+    float maximum;
+    float denominator;
+};
 
-uint flash_window(const uint w) { return min(FLASH_OUT_W, w); }
+flash_softmax flash_softmax_start() { return flash_softmax(-FLASH_INF, 0.0); }
+
+// Turns the lane's 16 masked, scaled (log2) scores into probabilities
+// exp2(s - m) against the row's new running maximum m, folds them into the
+// denominator, and returns the factor exp2(m_old - m) that rescales the row's
+// earlier accumulations (1 while nothing is seen).
+float flash_online(inout flash_softmax state, inout float s[16]) {
+    float tile = s[0];
+    [[unroll]] for (uint j = 1u; j < 16u; ++j)
+        tile = max(tile, s[j]);
+    tile = max(tile, subgroupShuffleXor(tile, 16u));
+    const float next = max(state.maximum, tile);
+    const bool seen = next > -FLASH_INF;
+    const float alpha = seen ? exp2(state.maximum - next) : 1.0;
+    float sum = 0.0;
+    [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+        s[j] = seen ? exp2(s[j] - next) : 0.0;
+        sum += s[j];
+    }
+    state.denominator = state.denominator * alpha + sum;
+    state.maximum = next;
+    return alpha;
+}
+
+// The row's whole denominator (both lanes' halves), on both lanes.
+float flash_denominator(flash_softmax state) {
+    return state.denominator + subgroupShuffleXor(state.denominator, 16u);
+}
+
+// The output accumulators of a block over one window of `window` columns
+// (columns [column0, column0 + window) of w; window a compile-time constant
+// dividing w, at most FLASH_MAX_W): window / 16 fragments, or window / 2
+// columns per lane (row lane % 16, columns (lane / 16) window / 2 ..). A
+// window narrower than w costs one more score pass per extra window.
+uint flash_window(const uint w, const uint window) { return min(window, w); }
 
 struct flash_output {
 #if SEISMIC_HAS_MATRIX
-    FLASH_FRAGMENT_C c[FLASH_OUT_W / 16u];
+    FLASH_FRAGMENT_C c[FLASH_MAX_W / 16u];
 #else
-    float c[FLASH_OUT_W / 2u];
+    float c[FLASH_MAX_W / 2u];
 #endif
 };
 
-// Clears the fragments (columns) a window of w uses; the others stay unused.
-void flash_output_clear(const uint w, inout flash_output o) {
+// Clears the fragments (columns) a window uses; the others stay unused.
+void flash_output_clear(const uint w, const uint window, inout flash_output o) {
 #if SEISMIC_HAS_MATRIX
-    [[unroll]] for (uint d = 0u; d < FLASH_OUT_W / 16u; ++d)
-        if (d < flash_window(w) / 16u)
+    [[unroll]] for (uint d = 0u; d < FLASH_MAX_W / 16u; ++d)
+        if (d < flash_window(w, window) / 16u)
             o.c[d] = FLASH_FRAGMENT_C(0.0);
 #else
-    [[unroll]] for (uint d = 0u; d < FLASH_OUT_W / 2u; ++d)
-        if (d < flash_window(w) / 2u)
+    [[unroll]] for (uint d = 0u; d < FLASH_MAX_W / 2u; ++d)
+        if (d < flash_window(w, window) / 2u)
             o.c[d] = 0.0;
+#endif
+}
+
+// O <- diag(alpha) O for the lane rows' factors `alpha` (from
+// `flash_online`). Skipped when no row's maximum grew. Every lane of the
+// subgroup calls it, after `flash_publish_probabilities`.
+void flash_rescale(uint scratch, float alpha, const uint w, const uint window, inout flash_output o) {
+    if (subgroupAll(alpha == 1.0))
+        return;
+#if SEISMIC_HAS_MATRIX
+    // The factors as a 16 x 16 accumulator fragment, row r all alpha_r: each
+    // lane writes half of its row.
+    const uint lane = gl_SubgroupInvocationID;
+    [[unroll]] for (uint i = 0u; i < 8u; ++i)
+        seismic_shared_f32[scratch + FLASH_FACTORS + (lane % 16u) * 16u + 8u * (lane / 16u) + i] = alpha;
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+    FLASH_FRAGMENT_C factors;
+    coopMatLoad(factors, seismic_shared_f32, scratch + FLASH_FACTORS, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    [[unroll]] for (uint d = 0u; d < FLASH_MAX_W / 16u; ++d)
+        if (d < flash_window(w, window) / 16u)
+            o.c[d] = o.c[d] * factors;
+    subgroupBarrier();
+#else
+    [[unroll]] for (uint d = 0u; d < FLASH_MAX_W / 2u; ++d)
+        if (d < flash_window(w, window) / 2u)
+            o.c[d] *= alpha;
 #endif
 }
 
 // O += P V over the window's columns of the V tile at shared half `v_base`;
 // P at shared half `p_half` (row pitch 32).
-void flash_accumulate(uint p_half, uint v_base, const uint w, uint column0, inout flash_output o) {
+void flash_accumulate(uint p_half, uint v_base, const uint w, const uint window, uint column0, inout flash_output o) {
     const uint pitch = flash_pitch(w);
-    const uint window = flash_window(w);
+    const uint width = flash_window(w, window);
 #if SEISMIC_HAS_MATRIX
     FLASH_FRAGMENT_A p[2];
     coopMatLoad(p[0], seismic_shared_f16, p_half, 32u, gl_CooperativeMatrixLayoutRowMajor);
     coopMatLoad(p[1], seismic_shared_f16, p_half + 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
-    [[unroll]] for (uint d = 0u; d < FLASH_OUT_W / 16u; ++d) {
-        if (d < window / 16u) {
+    [[unroll]] for (uint d = 0u; d < FLASH_MAX_W / 16u; ++d) {
+        if (d < width / 16u) {
             [[unroll]] for (uint j = 0u; j < 2u; ++j) {
                 FLASH_FRAGMENT_B v;
                 coopMatLoad(v, seismic_shared_f16, v_base + j * 16u * pitch + column0 + 16u * d, pitch,
@@ -185,10 +255,10 @@ void flash_accumulate(uint p_half, uint v_base, const uint w, uint column0, inou
 #else
     const uint lane = gl_SubgroupInvocationID;
     const uint r = lane % 16u, h = lane / 16u;
-    const uint columns = window / 2u;
+    const uint columns = width / 2u;
     for (uint j = 0u; j < FLASH_KEYS; ++j) {
         const float p = float(seismic_shared_f16[p_half + r * 32u + j]);
-        [[unroll]] for (uint c = 0u; c < FLASH_OUT_W / 2u; c += 2u) {
+        [[unroll]] for (uint c = 0u; c < FLASH_MAX_W / 2u; c += 2u) {
             if (c < columns) {
                 const vec2 v = unpackHalf2x16(seismic_shared_u32[(v_base + j * pitch + column0 + h * columns + c) / 2u]);
                 o.c[c] = seismic_fma_rn(p, v.x, o.c[c]);
@@ -200,8 +270,8 @@ void flash_accumulate(uint p_half, uint v_base, const uint w, uint column0, inou
 }
 
 // The lane's outputs of the window: value q (q < window / 2) sits at block
-// row `flash_output_row(q)`, column `flash_output_column(w, column0, q)` (of
-// w). The matrix path publishes each fragment through the subgroup's
+// row `flash_output_row(q)`, column `flash_output_column(w, window, column0,
+// q)` (of w). The matrix path publishes each fragment through the subgroup's
 // scratch: call `flash_output_value` for q = 0 .. window / 2 - 1 in order
 // from every lane, after a barrier that frees the scratch.
 uint flash_output_row(uint q) {
@@ -212,11 +282,11 @@ uint flash_output_row(uint q) {
 #endif
 }
 
-uint flash_output_column(const uint w, uint column0, uint q) {
+uint flash_output_column(const uint w, const uint window, uint column0, uint q) {
 #if SEISMIC_HAS_MATRIX
     return column0 + 16u * (q / 8u) + (8u * gl_SubgroupInvocationID + q % 8u) % 16u;
 #else
-    return column0 + (gl_SubgroupInvocationID / 16u) * (flash_window(w) / 2u) + q;
+    return column0 + (gl_SubgroupInvocationID / 16u) * (flash_window(w, window) / 2u) + q;
 #endif
 }
 

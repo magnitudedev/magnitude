@@ -14,7 +14,7 @@ import httpx
 
 from benchmark_fixtures import bfcl as corpus
 from benchmark_fixtures import prose as prose_source
-from benchmark_fixtures.prose_history import Prose
+from benchmark_fixtures.prose_history import Prose, ProseWorkload
 from benchmark_fixtures.ruler import RetrievalAnswers, RulerFixture
 from performance.thermals import ThermalRecorder
 
@@ -216,7 +216,7 @@ async def run(
     repeat: int,
     case: str | None,
     progress: Callable[[str], None],
-    prose: bool = False,
+    prose: ProseWorkload | None = None,
     retrieval: RulerFixture | None = None,
     needle_depth: float = 0.5,
 ) -> dict:
@@ -225,7 +225,7 @@ async def run(
     command = public_command(
         targets, sections, contexts, categories, repeat, case, prose, retrieval, needle_depth
     )
-    workload = "retrieval" if retrieval else "prose" if prose else "tools"
+    workload = "retrieval" if retrieval else prose or "tools"
     store = RunStore(
         root,
         command,
@@ -266,7 +266,7 @@ async def run(
                     raise ValueError("--case is only supported for tool fixtures")
                 progress("Preparing pinned Moby Dick")
                 text, provenance = await prose_source.prepare()
-                fixtures = Prose(text, provenance)
+                fixtures = Prose(text, provenance, prose)
                 corpus_digest = fixtures.identity
             else:
                 progress("Preparing pinned BFCL corpus")

@@ -106,23 +106,35 @@ kernel void qwen_recurrent_project_stage(RECURRENT_PROJECT_ARGUMENTS,
     projection::device_normalize<256>(in, item, normalized, k, norms, thread_index);
 }
 
+#define RECURRENT_PROJECT_GEMM(TM, TN)                                                  \
+    PROJECTION_GEMM_SHARED(shared, TM, TN);                                             \
+    RECURRENT_PROJECT_OPERANDS;                                                         \
+    projection::Plain<activation, projection::AllRows> x{normalized, k, 1, k, {}};      \
+    uint m = uint(SEISMIC_DIM_M);                                                       \
+    uint t0 = (qkv_rows + TN - 1) / TN, t1 = (gate_rows + TN - 1) / TN, t2 = (head_rows + TN - 1) / TN; \
+    uint n = tile.x;                                                                    \
+    if (n < t0)                                                                         \
+        projection::gemm<packets::W0, TM, TN>(x, qkv_out, qkv, m, qkv_rows, k, tile.y, n, shared, sg, lane); \
+    else if (n < t0 + t1)                                                               \
+        projection::gemm<packets::W1, TM, TN>(x, gate_out, gate, m, gate_rows, k, tile.y, n - t0, shared, sg, lane); \
+    else if (n < t0 + t1 + t2)                                                          \
+        projection::gemm<packets::W2, TM, TN>(x, alpha_out, alpha, m, head_rows, k, tile.y, n - t0 - t1, shared, \
+            sg, lane);                                                                  \
+    else                                                                                \
+        projection::gemm<packets::W3, TM, TN>(x, beta_out, beta, m, head_rows, k, tile.y, n - t0 - t1 - t2, \
+            shared, sg, lane)
+
+// 17..64 rows: the fixed small-row tile.
+kernel void qwen_recurrent_project_gemm_small(RECURRENT_PROJECT_ARGUMENTS,
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    RECURRENT_PROJECT_GEMM(projection::small_tile_m, projection::small_tile_n);
+}
+
 kernel void qwen_recurrent_project_gemm(RECURRENT_PROJECT_ARGUMENTS,
     uint2 tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint TM = SEISMIC_TUNE_TILE_M, TN = SEISMIC_TUNE_TILE_N;
-    PROJECTION_GEMM_SHARED(shared, TM, TN);
-    RECURRENT_PROJECT_OPERANDS;
-    projection::Plain<activation, projection::AllRows> x{normalized, k, 1, k, {}};
-    uint m = uint(SEISMIC_DIM_M);
-    uint t0 = (qkv_rows + TN - 1) / TN, t1 = (gate_rows + TN - 1) / TN, t2 = (head_rows + TN - 1) / TN;
-    uint n = tile.x;
-    if (n < t0)
-        projection::gemm<packets::W0, TM, TN>(x, qkv_out, qkv, m, qkv_rows, k, tile.y, n, shared, sg, lane);
-    else if (n < t0 + t1)
-        projection::gemm<packets::W1, TM, TN>(x, gate_out, gate, m, gate_rows, k, tile.y, n - t0, shared, sg, lane);
-    else if (n < t0 + t1 + t2)
-        projection::gemm<packets::W2, TM, TN>(x, alpha_out, alpha, m, head_rows, k, tile.y, n - t0 - t1, shared, sg, lane);
-    else
-        projection::gemm<packets::W3, TM, TN>(x, beta_out, beta, m, head_rows, k, tile.y, n - t0 - t1 - t2, shared, sg, lane);
+    RECURRENT_PROJECT_GEMM(SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N);
 }

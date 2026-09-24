@@ -7,4 +7,6 @@ license.workspace = true
 [dependencies]
 num-bigint = "=0.4.8"
 num-traits = "=0.2.19"
+postcard.workspace = true
+serde.workspace = true
 sha2 = "=0.11.0"

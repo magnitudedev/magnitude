@@ -699,7 +699,9 @@ impl TuningInputs<'_, '_> {
                         })
                         .collect(),
                     bank: slot as i32 + 1,
+                    previous_tape: 0,
                     following_bank: (slots + slot) as i32 + 1,
+                    stop: count as i32,
                 }
             })
             .collect::<Vec<_>>();

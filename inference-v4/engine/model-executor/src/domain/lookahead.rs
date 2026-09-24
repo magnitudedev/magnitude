@@ -99,6 +99,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 || operation != &expected
                 || state.position() != advance.position()
                 || state.bank_index() != advance.bindings().previous_bank
+                || state.tape_rows() != advance.bindings().previous_tape
                 || state.history_ranges() != advance.history_ranges()
             {
                 return None;
@@ -143,13 +144,21 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Record the selections of a finished flight for the lookahead it feeds.
-    pub(super) fn predecessor_selected(&mut self, flight: u64, selected: &[Selected]) {
+    /// The predecessor finished at `completed`: the queued step's selections
+    /// are known, and the device runs it from then on.
+    pub(super) fn predecessor_selected(
+        &mut self,
+        flight: u64,
+        selected: &[Selected],
+        completed: Instant,
+    ) {
         if let Some(lookahead) = self
             .lookahead
             .as_mut()
             .filter(|lookahead| lookahead.predecessor == flight)
         {
             lookahead.selected = Some(selected.to_vec());
+            lookahead.flight.runnable = completed;
         }
     }
 
@@ -326,9 +335,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 requests,
                 submission,
                 started,
+                runnable: started,
                 previous_selection: None,
-                conditioning_slices: vec![Vec::new(); count],
-                slots,
                 id,
                 continuation: None,
             },

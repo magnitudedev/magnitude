@@ -723,7 +723,8 @@ impl<'a> Preparation<'a> {
                     EN: b.embedding_norm,
                     HN: b.hidden_norm,
                     CW: b.combine,
-                }
+                },
+                statics &[("D", b.attention_shape.hidden)]
             );
             let attention = self.attention(
                 b.attention_shape,

@@ -91,7 +91,8 @@ impl Module {
                 ));
             }
             let bytes = std::fs::read(&paths[0]).map_err(|e| Error::new("OSError", e))?;
-            let checked = seismic_lang::bundle::decode_checked_bundle(&bytes)
+            // A bundle file is external input: its sources are checked here.
+            let checked = seismic_lang::bundle::check_bundle_sources(&bytes)
                 .map_err(|e| Error::new("BundleError", e))?;
             return Ok(Self {
                 checked: Arc::new(checked),

@@ -104,6 +104,8 @@
 
 #define EXPERTS_TM SEISMIC_TUNE_TILE_M
 #define EXPERTS_TN SEISMIC_TUNE_TILE_N
+#define EXPERTS_WM SEISMIC_TUNE_SUB_M
+#define EXPERTS_WN SEISMIC_TUNE_SUB_N
 
 void qwen_routed_experts_expand() {
     const uint64_t tile_rows = SEISMIC_DIM_T;
@@ -125,7 +127,7 @@ void qwen_routed_experts_expand() {
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT) + block * tile_rows * SEISMIC_DIM_F * uint64_t(ELEMENT_BYTES(ROUTED_ACT)),
         SEISMIC_DIM_F, 1ul);
     const uint live = routed_block_rows(order, SEISMIC_ORDER_STRIDE_1, uint(tile_rows));
-    projection_gemm_paired(EG_KIND, EU_KIND, EXPERTS_TM, EXPERTS_TN, x, out_, gate, up, uint(tile_rows),
+    projection_gemm_paired(EG_KIND, EU_KIND, EXPERTS_TM, EXPERTS_TN, EXPERTS_WM, EXPERTS_WN, x, out_, gate, up, uint(tile_rows),
         uint(SEISMIC_DIM_F), hidden, tm_index, gl_WorkGroupID.x, live);
 }
 
@@ -149,6 +151,6 @@ void qwen_routed_experts_down() {
         SEISMIC_RESULT_0_STRIDE_2, 0ul);
     const uint live = routed_block_rows(SEISMIC_PTR(SEISMIC_BUFFER_ORDER) + block * SEISMIC_ORDER_STRIDE_0 * 4ul,
         SEISMIC_ORDER_STRIDE_1, uint(tile_rows));
-    projection_gemm(ED_KIND, EXPERTS_TM, EXPERTS_TN, x, out_, down, uint(tile_rows), uint(SEISMIC_DIM_H), features,
+    projection_gemm(ED_KIND, EXPERTS_TM, EXPERTS_TN, EXPERTS_WM, EXPERTS_WN, x, out_, down, uint(tile_rows), uint(SEISMIC_DIM_H), features,
         tm_index, gl_WorkGroupID.x, live);
 }

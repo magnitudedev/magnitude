@@ -379,10 +379,18 @@ struct DenseHistory {
 // Affine K8/V4 history (the `affine_k8_uniform_v4` codec,
 // `qwen_attention_*_k8v4`). A (history row, kv head) vector is a code row of
 // W * B / 32 u32 words (code i at bits B * (i % (32 / B)) of word
-// i / (32 / B)) plus an F16 (scale, zero) pair; decoded value =
-// code * scale + zero. Keys use B = 8, values B = 4.
+// i / (32 / B)) plus one F16 (scale, zero) pair per group of GROUP
+// consecutive dimensions, pairs in group order; decoded value =
+// code * scale + zero with its group's pair. Keys use B = 8, values B = 4. A
+// lane's DPL dimensions lie in one group, shared by PAIR_LANES lanes.
 constexpr int KEY_BITS = 8;
 constexpr int VALUE_BITS = 4;
+// Dimensions per (scale, zero) pair: the codec's group (model-state
+// `AFFINE_GROUP`), and the pairs per vector.
+constexpr int GROUP = 32;
+constexpr int PAIRS = W / GROUP;
+constexpr int PAIR_LANES = GROUP / DPL;
+static_assert(W % GROUP == 0 && GROUP % DPL == 0, "a lane's dimensions lie in one group");
 
 // A lane's share of one code row: its DPL codes are DPL * B bits, whole
 // words or a power-of-two part of one word shared with its neighbours.
@@ -419,11 +427,11 @@ template <int B> struct LaneCodes {
 
 // Encodes one vector held by a warp (lane `lane` owns dimensions
 // [lane * DPL, (lane + 1) * DPL)) as B-bit codes at `row` (its code row) and
-// its (scale, zero) pair at `pair`: zero = f16(min), scale =
-// f16((max - min) / L), code = min(L, u32(fma(x - zero, 1 / scale, 0.5))),
-// 0 when scale is 0.
+// its group (scale, zero) pairs at `pairs`: per group, zero = f16(min),
+// scale = f16((max - min) / L), code = min(L, u32(fma(x - zero, 1 / scale,
+// 0.5))), 0 when scale is 0.
 template <int B>
-__device__ __forceinline__ void encode(const float (&x)[DPL], u32 *row, u32 *pair, int lane) {
+__device__ __forceinline__ void encode(const float (&x)[DPL], u32 *row, u32 *pairs, int lane) {
     typedef LaneCodes<B> Codes;
     float low = x[0];
     float high = x[0];
@@ -432,8 +440,12 @@ __device__ __forceinline__ void encode(const float (&x)[DPL], u32 *row, u32 *pai
         low = fminf(low, x[d]);
         high = fmaxf(high, x[d]);
     }
-    low = -seismic_warp_max_f32(-low);
-    high = seismic_warp_max_f32(high);
+    // The group's range, over its PAIR_LANES neighbouring lanes.
+#pragma unroll
+    for (int offset = 1; offset < PAIR_LANES; offset *= 2) {
+        low = fminf(low, seismic_shfl_xor_f32(low, offset));
+        high = fmaxf(high, seismic_shfl_xor_f32(high, offset));
+    }
     const u16 zero_bits = seismic_f32_to_f16(low);
     const u16 scale_bits = seismic_f32_to_f16((high - low) / static_cast<float>(Codes::levels));
     const float zero = seismic_f16_to_f32(zero_bits);
@@ -460,17 +472,18 @@ __device__ __forceinline__ void encode(const float (&x)[DPL], u32 *row, u32 *pai
             joined |= seismic_shfl_xor_u32(joined, offset);
         if (lane % sharing == 0) row[lane / sharing] = joined;
     }
-    if (lane == 0) *pair = static_cast<u32>(scale_bits) | (static_cast<u32>(zero_bits) << 16);
+    if (lane % PAIR_LANES == 0)
+        pairs[lane / PAIR_LANES] = static_cast<u32>(scale_bits) | (static_cast<u32>(zero_bits) << 16);
 }
 
-// The (scale, zero) pair of a vector, as F32.
+// A (scale, zero) pair, as F32.
 __device__ __forceinline__ float2 coefficients(const u32 *pair) {
     return seismic_unpack_f16x2(*pair);
 }
 
 // Affine history: code planes [T, KV, W * B / 32] u32 and (scale, zero)
-// planes [T, KV, 2] f16 per vector kind. Every plane is canonical: a vector's
-// code row and its pair are contiguous.
+// planes [T, KV, 2 * PAIRS] f16 per vector kind. Every plane is canonical: a
+// vector's code row and its pairs are contiguous.
 struct AffineHistory {
     static constexpr bool CODED = true;
     u32 *key_codes;
@@ -480,7 +493,7 @@ struct AffineHistory {
     u64 key_codes_row, key_codes_head, key_pairs_row, key_pairs_head;
     u64 value_codes_row, value_codes_head, value_pairs_row, value_pairs_head;
 
-    // A vector's code row and (scale, zero) pair (as one u32).
+    // A vector's code row and (scale, zero) pairs (one u32 each).
     __device__ __forceinline__ u32 *key_row(int token, int kv_head) const {
         return key_codes + static_cast<u64>(token) * key_codes_row +
                static_cast<u64>(kv_head) * key_codes_head;

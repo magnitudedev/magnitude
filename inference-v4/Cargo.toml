@@ -67,6 +67,7 @@ seismic-ir = { path = "seismic/ir" }
 seismic-target = { path = "seismic/target" }
 seismic-estimator = { path = "seismic/estimator/core" }
 serde = { version = "=1.0.229", features = ["derive"] }
+postcard = { version = "=1.1.3", default-features = false, features = ["use-std"] }
 seismic-std = { path = "seismic-std" }
 seismic-lang = { path = "seismic/lang" }
 seismic-metal = { path = "seismic/backends/metal" }

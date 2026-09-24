@@ -45,7 +45,8 @@ void embedding_rows() {
     const uint width = uint(SEISMIC_DIM_D);
     const uint64_t row = gl_WorkGroupID.x;
     const packets_rows16 geometry = TABLE_LAYOUT;
-    const uint64_t token = uint64_t(element_i32_index(tokens, row * SEISMIC_TOKENS_STRIDE_0));
+    // A failed selection (token -1) embeds token 0 (the contract).
+    const uint64_t token = uint64_t(max(element_i32_index(tokens, row * SEISMIC_TOKENS_STRIDE_0), 0));
     const uint64_t table_row = table + token * geometry.stride;
     for (uint p = gl_LocalInvocationID.x; p * 32u < width; p += gl_WorkGroupSize.x) {
         const packets_packet packet = packets_load(TABLE_KIND, table_row, geometry, p, width);

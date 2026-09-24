@@ -275,7 +275,7 @@ agent sessions for either GGUF or MLX artifacts:
 ```sh
 uv run session-bench run \
   --target magnitude=/path/to/model.gguf-or-mlx-directory \
-  --suite context --context 16384,65536 --prose --repeat 1
+  --suite context --context 16384,65536 --workload prose-continue --repeat 1
 ```
 
 `python -m performance import RUN_DIRECTORY` imports a completed run into the

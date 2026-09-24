@@ -35,8 +35,8 @@
 //!
 //! Either mode takes `--cache-dir DIR`, the engine's kernel cache (compiled
 //! kernels and tuning results); without it every load forms and tunes every
-//! entry. Either mode takes `--kv-codec dense|affine-k8v4` (default dense),
-//! the target history codec.
+//! entry. Either mode takes `--kv-codec dense|affine-k8v4` (default
+//! affine-k8v4, the engine default), the target history codec.
 //!
 //! Built with `--features pinned-tuning` (development only), either mode also
 //! takes `--tuning-record FILE` or `--tuning-replay FILE` to pin tuned
@@ -54,7 +54,7 @@ use magnitude_model_contracts::DecoderGeometry;
 use magnitude_model_state::KvCodec;
 use magnitude_model_executor::{
     Demand, DomainError, ExecutionPath, ExecutorDomain, Operation, Outcome, PhysicalDecision,
-    PhysicalResolution, RequestId, Sampling, SelectSpec, Shaping, TokenId, WorkKind,
+    RequestId, Sampling, SelectSpec, Shaping, TokenId, WorkKind,
 };
 use magnitude_service::{
     domain::{self as service_domain, DomainFlight},
@@ -373,7 +373,7 @@ impl Options {
             verify_width: 1,
             label: None,
             kernel_cache: None,
-            kv_codec: KvCodec::Dense,
+            kv_codec: KvCodec::AffineK8V4,
             device: magnitude_model_executor::platform::DeviceRequest::Automatic,
             lookahead: false,
             feedback: false,
@@ -679,21 +679,15 @@ impl Bench {
             }
             outcomes.push(pending.outcome().clone());
             let rows = pending.rows();
-            match self
-                .domain
+            self.domain
                 .reconcile(
                     pending,
                     PhysicalDecision {
                         accepted_rows: rows,
                     },
                 )
-                .map_err(text)?
-            {
-                PhysicalResolution::Committed => sequence.position += rows,
-                PhysicalResolution::Repair { .. } => {
-                    return Err("a fully accepted step asked for repair".into())
-                }
-            }
+                .map_err(text)?;
+            sequence.position += rows;
         }
         let end = host_seconds();
         let submissions = trace

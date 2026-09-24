@@ -1,8 +1,9 @@
 //! The Vulkan `qwen_recurrent_step` / `qwen_recurrent_chunk` against the same
 //! cases, portable-body oracle and host model as the Metal tests (included
-//! verbatim; their Metal tests skip without a Metal device). The Vulkan chunk
-//! advances every slot row-sequentially with the step's arithmetic, so it is
-//! held to the step's bits.
+//! verbatim; their Metal tests skip without a Metal device). The step and the
+//! chunk's row-sequential slots (at most 16 rows, zero stop) share their bits;
+//! the chunk's scanned rows are held to the oracle and host model, and no
+//! mapping changes their bits.
 
 include!("recurrent_stages.rs");
 
@@ -47,6 +48,11 @@ impl Case {
             tape: read(&t.tape),
         }
     }
+
+    /// Every slot advances row-sequentially in the chunk entry too.
+    fn sequential_in_chunk(&self) -> bool {
+        self.slots.iter().all(|slot| slot.rows <= 16 || slot.stop == 0)
+    }
 }
 
 fn same_bits(a: &Outcome, b: &Outcome) -> bool {
@@ -62,11 +68,21 @@ fn vulkan_step_and_chunk_match_the_portable_body() {
             continue;
         }
         let oracle = case.oracle();
+        let mut reference: Option<Outcome> = None;
         for mapping in MAPPINGS.into_iter().filter(|(rows, warps)| case.geometry.width as u64 % (rows * warps) == 0) {
             let step = case.vulkan(&device, Element::f32(), false, mapping);
             check(&format!("{label}: vulkan step {mapping:?}"), &case, &step, &oracle, (2e-5, 2e-6));
             let chunk = case.vulkan(&device, Element::f32(), true, mapping);
-            assert!(same_bits(&step, &chunk), "{label}: vulkan chunk {mapping:?} differs from the step");
+            check(&format!("{label}: vulkan chunk {mapping:?}"), &case, &chunk, &oracle, (5e-4, 2e-5));
+            if case.sequential_in_chunk() {
+                assert!(same_bits(&step, &chunk), "{label}: vulkan chunk {mapping:?} differs from the step");
+            }
+            match &reference {
+                Some(reference) => {
+                    assert!(same_bits(reference, &chunk), "{label}: vulkan chunk {mapping:?} changed result bits")
+                }
+                None => reference = Some(chunk),
+            }
         }
     }
 }
@@ -121,10 +137,58 @@ fn vulkan_real_4b_geometry_step_and_chunk_agree_with_the_host_model() {
         let host = case.host();
         let step = case.vulkan(&device, Element::bf16(), false, MAPPINGS[0]);
         check(&format!("4B {label}: vulkan step"), &case, &step, &host, (1.5e-2, 3e-3));
+        let mut reference: Option<Outcome> = None;
         for mapping in MAPPINGS {
             let chunk = case.vulkan(&device, Element::bf16(), true, mapping);
-            assert!(same_bits(&step, &chunk), "4B {label}: vulkan chunk {mapping:?} differs from the step");
+            if case.sequential_in_chunk() {
+                assert!(same_bits(&step, &chunk), "4B {label}: vulkan chunk {mapping:?} differs from the step");
+                continue;
+            }
+            check(&format!("4B {label}: vulkan chunk {mapping:?}"), &case, &chunk, &host, (1.5e-2, 3e-3));
+            let (max, rms) = errors(&chunk.mixed, &step.mixed);
+            println!("4B {label}: vulkan chunk {mapping:?} vs step: max {max:.3e} rms {rms:.3e}");
+            // Both are within one BF16 ulp of the host model per element, so
+            // they may differ by two ulps of the largest output.
+            assert!(max <= 4e-2 && rms <= 3e-3);
+            match &reference {
+                Some(reference) => {
+                    assert!(same_bits(reference, &chunk), "4B {label}: vulkan chunk {mapping:?} changed result bits")
+                }
+                None => reference = Some(chunk),
+            }
         }
+    }
+}
+
+/// MTP verify: a slot of at most 16 rows gets the step's bits from the chunk
+/// entry too, whatever its peers (here a 40-row slot on the scanned path).
+#[test]
+fn vulkan_chunk_short_slots_get_the_step_bits() {
+    let Some(device) = vulkan() else { return };
+    let geometry = Geometry { key_heads: 16, value_heads: 32, width: 128, convolution: 4, banks: 11, tape: 0 };
+    let slots = vec![slot(4, 1, 1, 6), slot(16, 9, 2, 7), slot(40, 40, 3, 8), slot(1, 1, 4, 9), slot(7, 0, 5, 10)];
+    let case = Case::new(geometry, 70, slots, false, 31).with_bf16_activations();
+    let step = case.vulkan(&device, Element::bf16(), false, MAPPINGS[0]);
+    let host = case.host();
+    let row_elements = geometry.value_heads * geometry.width;
+    for mapping in MAPPINGS {
+        let chunk = case.vulkan(&device, Element::bf16(), true, mapping);
+        let mut first = 0;
+        for s in &case.slots {
+            let range = first * row_elements..(first + s.rows) * row_elements;
+            first += s.rows;
+            if s.rows > 16 {
+                continue;
+            }
+            let bank = s.following * geometry.delta_bank()..(s.following + 1) * geometry.delta_bank();
+            assert!(
+                step.mixed[range.clone()].iter().zip(&chunk.mixed[range]).all(|(a, b)| a.to_bits() == b.to_bits())
+                    && step.delta[bank.clone()].iter().zip(&chunk.delta[bank]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "chunk {mapping:?}: a {}-row slot differs from the step",
+                s.rows
+            );
+        }
+        check(&format!("4B verify mix: vulkan chunk {mapping:?}"), &case, &chunk, &host, (1.5e-2, 3e-3));
     }
 }
 
@@ -137,11 +201,13 @@ fn vulkan_tape_cases_match_the_portable_body() {
             let step = case.vulkan(&device, Element::f32(), false, mapping);
             check(&format!("{label}: vulkan step {mapping:?}"), &case, &step, &oracle, (2e-5, 2e-6));
             let chunk = case.vulkan(&device, Element::f32(), true, mapping);
-            check(&format!("{label}: vulkan chunk {mapping:?}"), &case, &chunk, &oracle, (2e-5, 2e-6));
-            assert!(
-                step.tape.iter().zip(&chunk.tape).all(|(a, b)| a.to_bits() == b.to_bits()),
-                "{label}: vulkan chunk {mapping:?} records a different tape"
-            );
+            check(&format!("{label}: vulkan chunk {mapping:?}"), &case, &chunk, &oracle, (5e-4, 2e-5));
+            if case.sequential_in_chunk() {
+                assert!(
+                    step.tape.iter().zip(&chunk.tape).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{label}: vulkan chunk {mapping:?} records a different tape"
+                );
+            }
         }
     }
 }

@@ -169,12 +169,12 @@ void qwen_attention_project_gemm() {
     const uint m = uint(SEISMIC_DIM_M), n = gl_WorkGroupID.x;
     const uint t0 = (PROJECT_QUERY_ROWS + tn - 1u) / tn, t1 = (PROJECT_KV_ROWS + tn - 1u) / tn;
     if (n < t0)
-        projection_gemm(QUERY_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, x, attention_project_query_out(),
+        projection_gemm(QUERY_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, attention_project_query_out(),
             attention_project_query(), m, PROJECT_QUERY_ROWS, PROJECT_K, gl_WorkGroupID.y, n, 0xffffffffu);
     else if (n < t0 + t1)
-        projection_gemm(KEY_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, x, attention_project_key_out(),
+        projection_gemm(KEY_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, attention_project_key_out(),
             attention_project_key(), m, PROJECT_KV_ROWS, PROJECT_K, gl_WorkGroupID.y, n - t0, 0xffffffffu);
     else
-        projection_gemm(VALUE_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, x, attention_project_value_out(),
+        projection_gemm(VALUE_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, attention_project_value_out(),
             attention_project_value(), m, PROJECT_KV_ROWS, PROJECT_K, gl_WorkGroupID.y, n - t0 - t1, 0xffffffffu);
 }

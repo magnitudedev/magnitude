@@ -159,7 +159,7 @@ native qwen_routed_expand for metal from "metal/qwen_routed_expand.metal":
     launch qwen_routed_expand:
         threadgroups (ceil_div(max(F, S), SIMDGROUPS * ROWS * 32 / LANES), M * K + 1, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (max(min(ceil_div(H, 32), 288), min(M, 8) * min(ceil_div(H, 32), 288 / max(M, 1))) * 72)
+        shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
 
 # CUDA: the swap-AB GEMV (TPW tiles per warp group; KSPLIT splits K across
 # the warps of a group and reduces in part order). (Metal: the rows16 GEMV.)
@@ -217,7 +217,7 @@ native qwen_routed_output for metal from "metal/qwen_routed_output.metal":
     launch qwen_routed_output:
         threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), M, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (min(ceil_div(max(F, S), 32), 288) * 72)
+        shared_bytes (min(ceil_div(max(F, S), 32), 448) * 64)
 
 # CUDA: the swap-AB GEMV (TPW, KSPLIT as in the expansion). (Metal: the
 # rows16 GEMV.)
@@ -363,15 +363,16 @@ native qwen_routed_experts for cuda from "cuda/qwen_routed_experts.cu":
 # tiles, then the down tiles).
 native qwen_routed_experts for vulkan from "vulkan/qwen_routed_experts.comp":
     static (H, F)
-    params (TILE_M in [32, 64], TILE_N in [128, 64])
+    params (TILE_M in [32, 64], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
+    where SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch product bytes (B * T * F * 2)
     launch qwen_routed_experts_expand:
         threadgroups (ceil_div(F * 2, TILE_N), B * ceil_div(T, TILE_M), 1)
-        threads_per_threadgroup (TILE_M * TILE_N / 32, 1, 1)
+        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
         shared_bytes ((TILE_M + TILE_N) * 80)
     launch qwen_routed_experts_down:
         threadgroups (ceil_div(H, TILE_N), B * ceil_div(T, TILE_M), 1)
-        threads_per_threadgroup (TILE_M * TILE_N / 32, 1, 1)
+        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
         shared_bytes ((TILE_M + TILE_N) * 80)
 
 
@@ -441,16 +442,17 @@ native qwen_routed_combine for cuda from "cuda/qwen_routed_combine.cu":
 # down GEMM, then the unpermuting combine.
 native qwen_routed_combine for vulkan from "vulkan/qwen_routed_combine.comp":
     static (H, K, S)
-    params (TILE_M in [64, 128, 32], TILE_N in [64, 128])
+    params (TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
+    where SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch shared_product bytes (M * S * 2)
     scratch shared_output bytes (M * H * 2)
     launch qwen_routed_combine_shared:
         threadgroups (ceil_div(S * 2, TILE_N), ceil_div(M, TILE_M), 1)
-        threads_per_threadgroup (TILE_M * TILE_N / 32, 1, 1)
+        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
         shared_bytes ((TILE_M + TILE_N) * 80)
     launch qwen_routed_combine_down:
         threadgroups (ceil_div(H, TILE_N), ceil_div(M, TILE_M), 1)
-        threads_per_threadgroup (TILE_M * TILE_N / 32, 1, 1)
+        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
         shared_bytes ((TILE_M + TILE_N) * 80)
     launch qwen_routed_combine:
         threadgroups (ceil_div(H, 2048), M, 1)

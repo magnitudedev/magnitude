@@ -16,10 +16,10 @@ use super::{
         Retention, RetentionCapacity, RetentionKey, RetentionRequest, MIN_BRANCH_GAIN,
         MIN_RETENTION_HIT,
     },
-    round_driver::{RoundError, RoundReconcile, lower_round, reconcile_forward, reconcile_repair},
+    round_driver::{RoundError, lower_round, reconcile_forward},
 };
 use magnitude_generation::{
-    DetailedUsage, FinishReason, Generation, OutputToken, PreparedGenerationTransition, RoundStart,
+    DetailedUsage, FinishReason, Generation, OutputToken, RoundStart,
     WaitReason,
 };
 use magnitude_model_executor::{
@@ -97,9 +97,6 @@ struct Record {
     pending_publication: Option<Vec<OutputToken>>,
     publication_permits: VecDeque<PublicationPermit>,
     publication_blocked: bool,
-    pending_transition: Option<PreparedGenerationTransition>,
-    repair_kind: Option<WorkKind>,
-    cancel_after_transition: bool,
 }
 
 impl Record {
@@ -150,17 +147,6 @@ pub enum Step {
     Progress,
 }
 
-#[derive(Clone)]
-enum Purpose {
-    Operations,
-    Repairs,
-}
-
-struct QueuedGroup {
-    group: OperationGroup,
-    purpose: Purpose,
-}
-
 struct ActiveGroup<F: ProgramFamily> {
     flight: DomainFlight<F>,
     operations: Vec<Operation>,
@@ -171,7 +157,7 @@ struct ActiveGroup<F: ProgramFamily> {
 struct Batch<F: ProgramFamily> {
     selection: Selection,
     started: u64,
-    queued: VecDeque<QueuedGroup>,
+    queued: VecDeque<OperationGroup>,
     active: Option<ActiveGroup<F>>,
     blocked: Option<AvailabilityEpoch>,
 }
@@ -500,9 +486,6 @@ impl<F: ProgramFamily> Owner<F> {
                 pending_publication: None,
                 publication_permits: VecDeque::new(),
                 publication_blocked: false,
-                pending_transition: None,
-                repair_kind: None,
-                cancel_after_transition: false,
             },
         );
         self.epoch.advance()?;
@@ -775,9 +758,6 @@ impl<F: ProgramFamily> Owner<F> {
                 pending_publication: None,
                 publication_permits: VecDeque::new(),
                 publication_blocked: false,
-                pending_transition: None,
-                repair_kind: None,
-                cancel_after_transition: false,
             },
         );
         self.epoch.advance()?;
@@ -892,10 +872,6 @@ impl<F: ProgramFamily> Owner<F> {
 
     pub fn cancel(&mut self, id: RequestId, discard_output: bool) -> Result<(), String> {
         let record = self.records.get_mut(&id).ok_or("unknown request")?;
-        if record.pending_transition.is_some() {
-            record.cancel_after_transition = true;
-            return Ok(());
-        }
         let changed = record.generation.finish_reason().is_none()
             || (discard_output && record.generation.output_len() > 0);
         record.generation.cancel();
@@ -964,9 +940,6 @@ impl<F: ProgramFamily> Owner<F> {
         let record = self.records.get_mut(&id).ok_or("unknown request")?;
         record.pending_publication = None;
         record.publication_permits.clear();
-        if record.cancel_after_transition {
-            return Ok(());
-        }
         self.publish_ready().map(|_| ())
     }
 
@@ -1017,11 +990,8 @@ impl<F: ProgramFamily> Owner<F> {
                                 }
                             }
                         }
-                        // A verified prefix awaiting its recurrent repair
-                        // still publishes against this round's permits.
                         if record.pending_publication.is_none()
                             && record.generation.output_len() == 0
-                            && record.pending_transition.is_none()
                         {
                             record.publication_permits.clear();
                         }
@@ -1118,9 +1088,6 @@ impl<F: ProgramFamily> Owner<F> {
         let first = self.fatal.is_none();
         self.fatal.get_or_insert_with(|| format!("{error:?}"));
         for record in self.records.values_mut() {
-            record.pending_transition = None;
-            record.repair_kind = None;
-            record.cancel_after_transition = false;
             if record.generation.finish_reason().is_none()
                 || record.generation.awaiting_completion()
             {
@@ -1155,9 +1122,6 @@ impl<F: ProgramFamily> Owner<F> {
 
     fn fail_request(&mut self, id: RequestId, error: RequestError) {
         if let Some(record) = self.records.get_mut(&id) {
-            record.pending_transition = None;
-            record.repair_kind = None;
-            record.cancel_after_transition = false;
             record.publication_permits.clear();
             record.generation.fail();
             record.error = Some(error);
@@ -1291,13 +1255,7 @@ impl<F: ProgramFamily> Owner<F> {
         self.batch = Some(Batch {
             selection,
             started: now,
-            queued: groups
-                .into_iter()
-                .map(|group| QueuedGroup {
-                    group,
-                    purpose: Purpose::Operations,
-                })
-                .collect(),
+            queued: groups.into_iter().collect(),
             active: None,
             blocked: None,
         });
@@ -1456,7 +1414,6 @@ impl<F: ProgramFamily> Owner<F> {
     fn submit_next(&mut self) -> Result<Step, String> {
         let queued = self.batch.as_mut().unwrap().queued.pop_front().unwrap();
         let ended = queued
-            .group
             .operations()
             .iter()
             .map(Operation::request)
@@ -1470,11 +1427,7 @@ impl<F: ProgramFamily> Owner<F> {
             })
             .collect::<Vec<_>>();
         if !ended.is_empty() {
-            let QueuedGroup {
-                group: queued_group,
-                purpose,
-            } = queued;
-            let live = queued_group
+            let live = queued
                 .into_operations()
                 .into_iter()
                 .filter(|operation| !ended.contains(&operation.request()))
@@ -1484,10 +1437,11 @@ impl<F: ProgramFamily> Owner<F> {
                 if groups.len() != 1 {
                     return Err("filtered operation group changed its numerical lane".into());
                 }
-                self.batch.as_mut().unwrap().queued.push_front(QueuedGroup {
-                    group: groups.pop().unwrap(),
-                    purpose,
-                });
+                self.batch
+                    .as_mut()
+                    .unwrap()
+                    .queued
+                    .push_front(groups.pop().unwrap());
             }
             self.epoch.advance()?;
             return Ok(Step::Progress);
@@ -1495,14 +1449,14 @@ impl<F: ProgramFamily> Owner<F> {
         // Repacking histories at the segment limit and growing the elastic
         // state backing within the device limit come before any eviction. A
         // capacity shortage here is reported by the checks below.
-        match self.domain.provision(queued.group.operations()) {
+        match self.domain.provision(queued.operations()) {
             Ok(()) | Err(DomainError::Capacity(_)) => {}
             Err(error) => {
                 self.fail_domain_error(error);
                 return Ok(Step::Progress);
             }
         }
-        let requirement = match requirements(&self.domain, &queued.group) {
+        let requirement = match requirements(&self.domain, &queued) {
             Ok(requirement) => requirement,
             Err(error) => {
                 self.fail_domain_error(error);
@@ -1519,7 +1473,7 @@ impl<F: ProgramFamily> Owner<F> {
             // state transaction exists while these scheduling decisions run.
             match self.domain.shrink_state(ShrinkPolicy::Pressure) {
                 Ok(0) => {}
-                Ok(_) => match self.domain.provision(queued.group.operations()) {
+                Ok(_) => match self.domain.provision(queued.operations()) {
                     Ok(()) | Err(DomainError::Capacity(_)) => {}
                     Err(error) => {
                         self.fail_domain_error(error);
@@ -1557,15 +1511,15 @@ impl<F: ProgramFamily> Owner<F> {
             }
         }
         let Some(publication_permits) =
-            self.reserve_group_publications(queued.group.operations())?
+            self.reserve_group_publications(queued.operations())?
         else {
             let batch = self.batch.as_mut().unwrap();
             batch.queued.push_front(queued);
             batch.blocked = Some(self.epoch);
             return Ok(Step::Waiting);
         };
-        let submitted = submit_group(&mut self.domain, &queued.group);
-        let operations = queued.group.into_operations();
+        let submitted = submit_group(&mut self.domain, &queued);
+        let operations = queued.into_operations();
         match submitted {
             Ok(flight) => {
                 let mut retention_uses = Vec::new();
@@ -1641,7 +1595,7 @@ impl<F: ProgramFamily> Owner<F> {
         for operation in operations {
             let count = match operation {
                 Operation::Forward { select, .. } => select.len(),
-                Operation::Head { .. } | Operation::Repair { .. } | Operation::Encode { .. } => 0,
+                Operation::Head { .. } | Operation::Encode { .. } => 0,
             };
             if count != 0 {
                 *tokens.entry(operation.request()).or_default() += count;
@@ -1676,12 +1630,12 @@ impl<F: ProgramFamily> Owner<F> {
 
     fn capacity_unavailable(
         &mut self,
-        queued: QueuedGroup,
+        queued: OperationGroup,
         resource: ResourceKind,
         required: u64,
         available: u64,
     ) -> Result<Step, String> {
-        let operations = queued.group.operations();
+        let operations = queued.operations();
         if std::env::var_os("MAGNITUDE_TRACE_TARGET").is_some() {
             eprintln!(
                 "target admission deficit {:?} required={} available={} operations={} rows={:?}",
@@ -1799,44 +1753,6 @@ impl<F: ProgramFamily> Owner<F> {
                     self.fail_domain_outcome(request, error);
                 }
             }
-            DomainFlight::Repair(flight) => {
-                let [Operation::Repair { request, .. }] = active.operations.as_slice() else {
-                    self.fail_all("repair flight has the wrong operations".into());
-                    return Ok(());
-                };
-                let request = *request;
-                let duration = match self.domain.finish_repair(flight) {
-                    Ok(duration) => duration,
-                    Err(error) => {
-                        self.fail_domain_error(error);
-                        return Ok(());
-                    }
-                };
-                let record = self
-                    .records
-                    .get_mut(&request)
-                    .ok_or("repair request disappeared")?;
-                if let Some(kind) = record.repair_kind.take() {
-                    record.add_physical_duration(kind, duration);
-                }
-                let transition = record
-                    .pending_transition
-                    .take()
-                    .ok_or("prefix repair has no prepared generation transition")?;
-                match reconcile_repair(&mut record.generation, request, transition) {
-                    Ok(effects) => {
-                        if record.cancel_after_transition {
-                            record.cancel_after_transition = false;
-                            record.generation.cancel();
-                            record.generation.discard_output();
-                            record.pending_publication = None;
-                        } else if !effects.operations.is_empty() {
-                            self.queue_operations(effects.operations, Purpose::Operations)?;
-                        }
-                    }
-                    Err(error) => self.fail_request(request, RequestError::Input(error)),
-                }
-            }
             DomainFlight::Target(flight) => {
                 let pending = match self.domain.finish_target(flight) {
                     Ok(pending) => pending,
@@ -1867,7 +1783,6 @@ impl<F: ProgramFamily> Owner<F> {
                     return Ok(());
                 }
                 let mut followups = Vec::new();
-                let mut repairs = Vec::new();
                 for item in pending {
                     let request = item.request();
                     let kind = item.kind();
@@ -1898,16 +1813,8 @@ impl<F: ProgramFamily> Owner<F> {
                     }
                     match reconcile_forward(&mut record.generation, &mut self.domain, request, item)
                     {
-                        Ok(RoundReconcile::Committed { effects }) => {
+                        Ok(effects) => {
                             followups.extend(effects.operations);
-                        }
-                        Ok(RoundReconcile::Repair {
-                            operation,
-                            transition,
-                        }) => {
-                            record.pending_transition = Some(transition);
-                            record.repair_kind = Some(kind);
-                            repairs.push(operation);
                         }
                         Err(RoundError::Logical(error)) => {
                             self.fail_request(request, RequestError::Input(error))
@@ -1917,11 +1824,8 @@ impl<F: ProgramFamily> Owner<F> {
                         }
                     }
                 }
-                if !repairs.is_empty() {
-                    self.queue_operations(repairs, Purpose::Repairs)?;
-                }
                 if !followups.is_empty() {
-                    self.queue_operations(followups, Purpose::Operations)?;
+                    self.queue_operations(followups);
                 }
             }
         }
@@ -2005,25 +1909,9 @@ impl<F: ProgramFamily> Owner<F> {
         Ok(())
     }
 
-    fn queue_operations(
-        &mut self,
-        operations: Vec<Operation>,
-        purpose: Purpose,
-    ) -> Result<(), String> {
+    fn queue_operations(&mut self, operations: Vec<Operation>) {
         let groups = group(&self.domain, operations);
-        if groups.len() > 1 && matches!(purpose, Purpose::Repairs) {
-            return Err("repair operations crossed executor groups".into());
-        }
-        for group in groups {
-            self.batch.as_mut().unwrap().queued.push_back(QueuedGroup {
-                group,
-                purpose: match &purpose {
-                    Purpose::Operations => Purpose::Operations,
-                    Purpose::Repairs => Purpose::Repairs,
-                },
-            });
-        }
-        Ok(())
+        self.batch.as_mut().unwrap().queued.extend(groups);
     }
 
     fn finish_batch(&mut self, now: u64) -> Result<(), String> {

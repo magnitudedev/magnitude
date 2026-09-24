@@ -1,15 +1,293 @@
 // qwen_recurrent_chunk (large row classes): the same contract as
-// `qwen_recurrent_step`. This first Vulkan form advances every slot
-// row-sequentially with the step's arithmetic (`recurrent_sequential`), so a
-// request's recurrent bits never depend on its row class; the chunked WY form
-// on cooperative matrices (the CUDA/Metal chunk) replaces it once it is
-// measured on the V710.
+// `qwen_recurrent_step`, in two launches that share the `inputs` scratch (f32,
+// the chunked rows only). The chunked rows of a slot are those before its
+// stop row in a slot of more than CHUNK_SEQUENTIAL_ROWS rows; a shorter slot
+// (an MTP verify) and a slot with a zero stop advance row-sequentially with
+// the step's bits (`recurrent_sequential`), and the rows after a stop row
+// advance row-sequentially from the published state, recording the tape. The
+// scratch:
+//   rows    [NK, M, 2W]   per key head: L2-normalized q (scaled by W^-1/2), k
+//   values  [NV, M, W]    convolved v heads
+//   gates   [NV, 2, M]    decay, beta
+//
+// `qwen_recurrent_chunk_inputs`: one subgroup per (row, channel head)
+// convolves the row once with the step's arithmetic (so q, k, v and the gates
+// carry the step's bits), W / 32 channels per lane.
+//
+// `qwen_recurrent_chunk_scan`: the workgroup geometry of the step, (value
+// head, block of ROWS * WARPS state rows, slot), with the state transposed
+// onto the lanes: each subgroup's ROWS state rows sit on groups of
+// CHUNK_LANES = 8 adjacent lanes (groups past ROWS idle), lane j of a group
+// holding columns j, j + CHUNK_LANES, ... of its row. A row's dot products are then a lane's
+// short FMA chain and a butterfly over its group, and the rows' chains run in
+// parallel instead of one reduction per state row. Per piece of
+// RECURRENT_SPAN rows the workgroup stages the piece's q, k, v and gates in
+// the shared region, the next piece's loads in flight while the piece
+// advances. ROWS and WARPS never change result bits.
 #include "common/recurrent.glsl"
+#include "common/reduce.glsl"
 
 #if SEISMIC_TUNE_ROWS > RECURRENT_MAX_ROWS
 #error "qwen_recurrent_chunk holds at most RECURRENT_MAX_ROWS state rows per subgroup"
 #endif
 
-void qwen_recurrent_chunk() {
-    recurrent_sequential(SEISMIC_TUNE_ROWS);
+#define CHUNK_SEQUENTIAL_ROWS 16
+#define CHUNK_ROWS uint(SEISMIC_TUNE_ROWS)
+#define CHUNK_WARPS uint(SEISMIC_TUNE_WARPS)
+#define CHUNK_BLOCK_ROWS (CHUNK_ROWS * CHUNK_WARPS)
+#define CHUNK_THREADS (32u * CHUNK_WARPS)
+// Lanes per state row, fixed so that ROWS never changes a row's summation
+// order: groups of lanes past ROWS idle.
+#define CHUNK_LANES 8u
+#define CHUNK_COLUMNS (RECURRENT_W / CHUNK_LANES)
+#define CHUNK_MAX_COLUMNS CHUNK_COLUMNS
+// A piece's staged q, k and v rows, in float4 items, and the items each
+// invocation carries between pieces.
+#define CHUNK_PREPARED (2u * RECURRENT_W + CHUNK_BLOCK_ROWS)
+#define CHUNK_ITEMS (RECURRENT_SPAN * CHUNK_PREPARED / 4u)
+#define CHUNK_ITEMS_PER_THREAD ((CHUNK_ITEMS + CHUNK_THREADS - 1u) / CHUNK_THREADS)
+
+// Byte addresses of the scratch regions.
+uint64_t chunk_rows_at(uint64_t inputs, uint key_head, uint64_t row) {
+    return inputs + (uint64_t(key_head) * SEISMIC_DIM_M + row) * 2ul * RECURRENT_W * 4ul;
+}
+
+uint64_t chunk_values_at(uint64_t inputs, uint value_head, uint64_t row) {
+    return inputs
+        + (uint64_t(2u * RECURRENT_NK) * SEISMIC_DIM_M * RECURRENT_W
+              + (uint64_t(value_head) * SEISMIC_DIM_M + row) * RECURRENT_W)
+            * 4ul;
+}
+
+// `which`: 0 the decay, 1 beta.
+uint64_t chunk_gates_at(uint64_t inputs, uint value_head, uint which, uint64_t row) {
+    return inputs
+        + (uint64_t(2u * RECURRENT_NK + RECURRENT_NV) * SEISMIC_DIM_M * RECURRENT_W
+              + uint64_t(2u * value_head + which) * SEISMIC_DIM_M + row)
+            * 4ul;
+}
+
+bool chunk_long(recurrent_slot slot) { return slot.hi - slot.lo > CHUNK_SEQUENTIAL_ROWS && slot.stop > 0; }
+
+// The slot containing `row`, or false when the row is not chunked: outside
+// every slot, in a slot the scan advances row-sequentially, or after its
+// slot's stop row.
+bool chunk_row_slot(uint64_t row, out recurrent_slot slot) {
+    for (uint64_t candidate = 0ul; candidate < SEISMIC_DIM_B; ++candidate) {
+        const recurrent_slot s = recurrent_slot_of(candidate);
+        if (int(row) >= s.lo && int(row) < s.hi) {
+            slot = s;
+            return chunk_long(s) && int(row) < s.lo + s.stop;
+        }
+    }
+    return false;
+}
+
+void qwen_recurrent_chunk_inputs() {
+    const recurrent_inputs in_ = recurrent_inputs_of();
+    const uint64_t inputs = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_INPUTS);
+    const uint W = RECURRENT_W, C = RECURRENT_C, CPL = RECURRENT_CPL;
+    const uint channel_head = gl_WorkGroupID.y * gl_NumSubgroups + gl_SubgroupID;
+    const uint64_t row = gl_WorkGroupID.x;
+    recurrent_slot slot;
+    if (channel_head >= 2u * RECURRENT_NK + RECURRENT_NV || !chunk_row_slot(row, slot))
+        return;
+    const uint lane = gl_SubgroupInvocationID;
+    const int position = int(row) - slot.lo;
+    float values[RECURRENT_CPL];
+    float squares = 0.0;
+    [[unroll]] for (uint c = 0u; c < CPL; ++c) {
+        const uint channel = channel_head * W + lane * CPL + c;
+        float weights[RECURRENT_MAX_C];
+        [[unroll]] for (uint tap = 0u; tap < RECURRENT_MAX_C; ++tap)
+            if (tap < C)
+                weights[tap] = element_f32_at(in_.convolution
+                    + (uint64_t(channel) * SEISMIC_CONVOLUTION_STRIDE_0 + uint64_t(tap) * SEISMIC_CONVOLUTION_STRIDE_1) * 4ul);
+        float sum = weights[C - 1u] * recurrent_raw_input(in_, slot, position, channel);
+        [[unroll]] for (uint tap = 0u; tap + 1u < RECURRENT_MAX_C; ++tap)
+            if (tap + 1u < C)
+                sum = seismic_fma_rn(weights[tap], recurrent_raw_input(in_, slot, position + int(tap) - (int(C) - 1), channel), sum);
+        values[c] = seismic_div_rn(sum, 1.0 + exp(-sum));
+        squares = seismic_fma_rn(values[c], values[c], squares);
+    }
+    if (channel_head < 2u * RECURRENT_NK) {
+        const bool key = channel_head >= RECURRENT_NK;
+        const float inverse = key ? inversesqrt(seismic_subgroup_sum_f32(squares) + in_.epsilon)
+                                  : inversesqrt(seismic_subgroup_sum_f32(squares) + in_.epsilon) * inversesqrt(float(W));
+        const uint64_t destination = chunk_rows_at(inputs, channel_head % RECURRENT_NK, row) + (key ? W : 0u) * 4ul;
+        [[unroll]] for (uint c = 0u; c < CPL; ++c)
+            element_f32_put(destination + uint64_t(lane * CPL + c) * 4ul, values[c] * inverse);
+    } else {
+        const uint head = channel_head - 2u * RECURRENT_NK;
+        const uint64_t destination = chunk_values_at(inputs, head, row);
+        [[unroll]] for (uint c = 0u; c < CPL; ++c)
+            element_f32_put(destination + uint64_t(lane * CPL + c) * 4ul, values[c]);
+        if (lane == 0u) {
+            float beta, log_decay, decay;
+            recurrent_gates(in_, row, head, beta, log_decay, decay);
+            element_f32_put(chunk_gates_at(inputs, head, 0u, row), decay);
+            element_f32_put(chunk_gates_at(inputs, head, 1u, row), beta);
+        }
+    }
+}
+
+// This lane's state row (block-local) and column part.
+uint chunk_row() { return gl_SubgroupID * CHUNK_ROWS + gl_SubgroupInvocationID / CHUNK_LANES; }
+uint chunk_part() { return gl_SubgroupInvocationID % CHUNK_LANES; }
+// The lane's group holds one of the subgroup's ROWS state rows.
+bool chunk_active() { return gl_SubgroupInvocationID / CHUNK_LANES < CHUNK_ROWS; }
+
+// The lane's columns of its state row in the slot's source version (the
+// bank's state advanced by its first `taped` tape rows with the step's
+// update).
+void chunk_load_version(recurrent_inputs in_, recurrent_slot slot, uint head, uint state_row,
+    out float state[CHUNK_MAX_COLUMNS]) {
+    [[unroll]] for (uint c = 0u; c < CHUNK_COLUMNS; ++c)
+        state[c] = 0.0;
+    if (!chunk_active())
+        return;
+    const uint part = chunk_part();
+    const uint64_t source = recurrent_state_row(in_, slot.source, head, state_row);
+    [[unroll]] for (uint c = 0u; c < CHUNK_COLUMNS; ++c)
+        state[c] = element_f32_at(source + uint64_t(part + CHUNK_LANES * c) * 4ul);
+    const uint key = recurrent_key_head(in_, head);
+    for (int entry = 0; entry < slot.taped; ++entry) {
+        const uint64_t tape = recurrent_tape_row(in_, slot.source, entry);
+        const float decay = element_f32_at(tape + uint64_t(RECURRENT_TAPE_D + head) * 4ul);
+        const float u = element_f32_at(tape + uint64_t(RECURRENT_TAPE_U + head * RECURRENT_W + state_row) * 4ul);
+        [[unroll]] for (uint c = 0u; c < CHUNK_COLUMNS; ++c) {
+            const float k = element_f32_at(tape + uint64_t(RECURRENT_TAPE_K + key * RECURRENT_W + part + CHUNK_LANES * c) * 4ul);
+            state[c] = seismic_fma_rn(u, k, state[c] * decay);
+        }
+    }
+}
+
+void chunk_store(recurrent_inputs in_, int bank, uint head, uint state_row, float state[CHUNK_MAX_COLUMNS]) {
+    if (!chunk_active())
+        return;
+    const uint part = chunk_part();
+    const uint64_t target = recurrent_state_row(in_, bank, head, state_row);
+    [[unroll]] for (uint c = 0u; c < CHUNK_COLUMNS; ++c)
+        element_f32_put(target + uint64_t(part + CHUNK_LANES * c) * 4ul, state[c]);
+}
+
+// Shared floats of a staged piece: row r's q at r * CHUNK_PREPARED, its k at
+// + W, the block's v at + 2W; then decay [SPAN] and beta [SPAN].
+#define CHUNK_DECAY (RECURRENT_SPAN * CHUNK_PREPARED)
+#define CHUNK_BETA (CHUNK_DECAY + RECURRENT_SPAN)
+
+// The piece of rows [first, first + count): each invocation's float4 items and
+// (for the first 2 SPAN invocations) one gate.
+struct chunk_stage {
+    vec4 items[CHUNK_ITEMS_PER_THREAD];
+    float gate;
+};
+
+chunk_stage chunk_load_piece(uint64_t inputs, uint head, uint key_head, uint block_row, int first, int count) {
+    chunk_stage stage;
+    [[unroll]] for (uint i = 0u; i < CHUNK_ITEMS_PER_THREAD; ++i) {
+        const uint item = gl_LocalInvocationIndex + i * CHUNK_THREADS;
+        stage.items[i] = vec4(0.0);
+        const uint r = item / (CHUNK_PREPARED / 4u), at = 4u * (item % (CHUNK_PREPARED / 4u));
+        if (item < CHUNK_ITEMS && int(r) < count) {
+            const uint64_t row = uint64_t(first + int(r));
+            stage.items[i] = at < 2u * RECURRENT_W
+                ? element_vec4_at(chunk_rows_at(inputs, key_head, row) + uint64_t(at) * 4ul)
+                : element_vec4_at(chunk_values_at(inputs, head, row) + uint64_t(block_row + at - 2u * RECURRENT_W) * 4ul);
+        }
+    }
+    const uint thread = gl_LocalInvocationIndex;
+    stage.gate = 0.0;
+    if (thread < 2u * RECURRENT_SPAN && int(thread % RECURRENT_SPAN) < count)
+        stage.gate = element_f32_at(chunk_gates_at(inputs, head, thread / RECURRENT_SPAN, uint64_t(first) + thread % RECURRENT_SPAN));
+    return stage;
+}
+
+void chunk_store_piece(chunk_stage stage) {
+    [[unroll]] for (uint i = 0u; i < CHUNK_ITEMS_PER_THREAD; ++i) {
+        const uint item = gl_LocalInvocationIndex + i * CHUNK_THREADS;
+        if (item < CHUNK_ITEMS) {
+            const uint r = item / (CHUNK_PREPARED / 4u), at = 4u * (item % (CHUNK_PREPARED / 4u));
+            [[unroll]] for (uint e = 0u; e < 4u; ++e)
+                seismic_shared_f32[r * CHUNK_PREPARED + at + e] = stage.items[i][e];
+        }
+    }
+    if (gl_LocalInvocationIndex < 2u * RECURRENT_SPAN)
+        seismic_shared_f32[CHUNK_DECAY + gl_LocalInvocationIndex] = stage.gate;
+}
+
+// Advance the lane's state row over the slot's rows [lo, lo + stop), write
+// their mixed outputs, and publish the state after them.
+void chunk_scan_rows(recurrent_inputs in_, recurrent_slot slot, uint head, uint block_row, uint64_t mixed,
+    inout float state[CHUNK_MAX_COLUMNS]) {
+    const uint64_t inputs = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_INPUTS);
+    const uint W = RECURRENT_W, L = CHUNK_LANES;
+    const uint key_head = recurrent_key_head(in_, head);
+    const uint local_row = chunk_row(), part = chunk_part();
+    const int end = slot.lo + slot.stop;
+    chunk_stage stage = chunk_load_piece(inputs, head, key_head, block_row, slot.lo, min(int(RECURRENT_SPAN), end - slot.lo));
+    for (int first = slot.lo; first < end; first += int(RECURRENT_SPAN)) {
+        const int count = min(int(RECURRENT_SPAN), end - first);
+        // The previous piece's reads of the region finish before it is
+        // restaged.
+        barrier();
+        chunk_store_piece(stage);
+        barrier();
+        const int next = first + int(RECURRENT_SPAN);
+        if (next < end)
+            stage = chunk_load_piece(inputs, head, key_head, block_row, next, min(int(RECURRENT_SPAN), end - next));
+        for (int r = 0; r < count; ++r) {
+            const uint base = uint(r) * CHUNK_PREPARED;
+            const float decay = seismic_shared_f32[CHUNK_DECAY + uint(r)];
+            const float beta = seismic_shared_f32[CHUNK_BETA + uint(r)];
+            float k[CHUNK_MAX_COLUMNS];
+            float remembered = 0.0;
+            [[unroll]] for (uint c = 0u; c < CHUNK_COLUMNS; ++c) {
+                k[c] = seismic_shared_f32[base + W + part + L * c];
+                remembered = seismic_fma_rn(state[c] * decay, k[c], remembered);
+            }
+            remembered = reduce_lanes_sum(remembered, L);
+            const float residual = (seismic_shared_f32[base + 2u * W + local_row] - remembered) * beta;
+            float attended = 0.0;
+            [[unroll]] for (uint c = 0u; c < CHUNK_COLUMNS; ++c) {
+                state[c] = seismic_fma_rn(residual, k[c], state[c] * decay);
+                attended = seismic_fma_rn(state[c], seismic_shared_f32[base + part + L * c], attended);
+            }
+            attended = reduce_lanes_sum(attended, L);
+            if (part == 0u && chunk_active())
+                element_put(ELEMENT_ACT, mixed,
+                    uint64_t(first + r) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(head) * SEISMIC_RESULT_0_STRIDE_1
+                        + uint64_t(block_row + local_row) * SEISMIC_RESULT_0_STRIDE_2,
+                    attended);
+        }
+    }
+    chunk_store(in_, slot.target, head, block_row + local_row, state);
+}
+
+void qwen_recurrent_chunk_scan() {
+    const uint64_t slot_index = gl_WorkGroupID.z;
+    if (slot_index == SEISMIC_DIM_B || !chunk_long(recurrent_slot_of(slot_index))) {
+        recurrent_sequential(CHUNK_ROWS);
+        return;
+    }
+    const recurrent_inputs in_ = recurrent_inputs_of();
+    const recurrent_slot slot = recurrent_slot_of(slot_index);
+    const uint64_t mixed = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const uint head = gl_WorkGroupID.x;
+    const uint block_row = gl_WorkGroupID.y * CHUNK_BLOCK_ROWS;
+    float state[CHUNK_MAX_COLUMNS];
+    chunk_load_version(in_, slot, head, block_row + chunk_row(), state);
+    recurrent_publish_window(in_, slot, head * gl_NumWorkGroups.y + gl_WorkGroupID.y, RECURRENT_NV * gl_NumWorkGroups.y);
+    chunk_scan_rows(in_, slot, head, block_row, mixed, state);
+    if (slot.stop < slot.hi - slot.lo) {
+        // The rows after the stop row advance row-sequentially from the
+        // published state (their innovations feed the tape).
+        memoryBarrierBuffer();
+        barrier();
+        const uint first_row = block_row + gl_SubgroupID * CHUNK_ROWS;
+        float rows[RECURRENT_MAX_ROWS][RECURRENT_CPL];
+        recurrent_load_rows(in_, CHUNK_ROWS, slot.target, head, first_row, rows);
+        recurrent_advance_rows(in_, slot, slot.lo + slot.stop, head, block_row, CHUNK_BLOCK_ROWS, CHUNK_ROWS, first_row,
+            rows, mixed);
+    }
 }

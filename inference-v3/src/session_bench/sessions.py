@@ -91,7 +91,7 @@ class Plan(Record):
                         },
                     ],
                     "fixture_provenance": {
-                        "fixture": "prose.moby-dick",
+                        "fixture": first.fixture_id,
                         "recipe": "prose-qualification-v1",
                         "corpus_digest": self.corpus_digest,
                     },

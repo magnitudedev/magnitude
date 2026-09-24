@@ -2,10 +2,10 @@
 // history. The Vulkan form of `metal/qwen_attention_decode_k8v4.metal`: the
 // partitioning, subgroup walk and merge of `qwen_attention_decode`.
 //
-// L1: workgroup (kv head, partition, row). History keys score as
-// scale * (q . code) + zero * sum(q) and values accumulate (p * scale) * code
-// plus the carried per-head bias sum(p * zero) (`history_absorb_affine`), so
-// no history element is decoded. The fresh span stays dense; the bias is
+// L1: workgroup (kv head, partition, row). History keys score as the sum over
+// groups of scale * (q . code) + zero * sum(q) and values accumulate
+// (p * scale) * code plus the carried bias sum(p * zero) of each lane's group
+// (`history_absorb_affine`), so no history element is decoded. The fresh span stays dense; the bias is
 // folded into the output before it. Partition 0 appends the row's key
 // (prepared, rounded to A) and value encoded (`history_encode`).
 //
@@ -89,7 +89,7 @@ void qwen_attention_decode_k8v4_partial() {
             sum += q[g][i];
             result[g][i] = 0.0;
         }
-        qsum[g] = seismic_subgroup_sum_f32(sum);
+        qsum[g] = sum;
         maximum[g] = -ATTENTION_INF;
         denominator[g] = 0.0;
         bias[g] = 0.0;
@@ -119,8 +119,8 @@ void qwen_attention_decode_k8v4_partial() {
                         const uint64_t vector = (uint64_t(lo) + (position + j - offset)) * KV + kv_head;
                         history_lane_load(HISTORY_KEY_BITS, h.key + vector * key_words * 4ul, lane, k[j]);
                         history_lane_load(HISTORY_VALUE_BITS, h.value + vector * value_words * 4ul, lane, v[j]);
-                        kc[j] = history_coefficients(h.key_coefficients, vector);
-                        vc[j] = history_coefficients(h.value_coefficients, vector);
+                        kc[j] = history_coefficients(h.key_coefficients, vector, lane / HISTORY_PAIR_LANES);
+                        vc[j] = history_coefficients(h.value_coefficients, vector, lane / HISTORY_PAIR_LANES);
                     }
                 }
                 history_absorb_affine(n, q, qsum, k, kc, v, vc, maximum, denominator, result, bias);

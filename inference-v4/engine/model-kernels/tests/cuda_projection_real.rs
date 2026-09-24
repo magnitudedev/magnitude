@@ -173,7 +173,14 @@ fn relative(a: &[f64], b: &[f64], reference: &[f64]) -> Error {
 
 fn mapping_label(mapping: Mapping, rows: usize) -> String {
     let path = if mapping.quantizes(rows) { "int8" } else { "16-bit" };
-    format!("{path}{}", if rows > GEMV_ROWS && mapping.bm == 128 { " bm128" } else { "" })
+    let kernel = if rows <= GEMV_ROWS {
+        "gemv"
+    } else if rows <= SMALL_GEMM_ROWS {
+        "gemm_small"
+    } else {
+        "gemm"
+    };
+    format!("{kernel} {path}")
 }
 
 #[test]
@@ -203,7 +210,7 @@ fn real_4b_projections_match_their_operand_emulation() {
         let gate = real_weight(&device, gate_format, f, k, &gate_bytes);
         let up = real_weight(&device, up_format, f, k, &up_bytes);
         for outliers in [false, true] {
-            for o in [1usize, 3, 12, 64] {
+            for o in [1usize, 3, 12, 64, 128] {
                 let values = residual(&gguf, o, outliers);
                 let exact = normalized(&values, &norm_values, o, h);
                 let residual_tensor = f32_tensor(&device, &[o as u64, h as u64], &values);
@@ -228,7 +235,7 @@ fn real_4b_projections_match_their_operand_emulation() {
                             UW: up_format.resident(),
                             A: Element::bf16(),
                         },
-                        &mapping.params(NativeSpecialization::new().with_static("H", h as u64).with_static("F", f as u64), false),
+                        &mapping.params(NativeSpecialization::new().with_static("H", h as u64).with_static("F", f as u64)),
                     )
                     .unwrap();
                     let actual: Vec<f64> = read_bf16(
@@ -266,7 +273,7 @@ fn real_4b_projections_match_their_operand_emulation() {
                     // on the 16-bit GEMM the weights' dequantization to bf16
                     // (2^-9 of each weight, not emulated; 1.9-5.0e-3 of the
                     // output RMS on these rows).
-                    let limit = if o > GEMV_ROWS && mapping.int8 == 0 { 8e-3 } else { 1e-3 };
+                    let limit = if o > GEMV_ROWS && !mapping.quantizes(o) { 8e-3 } else { 1e-3 };
                     if departure.rms > limit {
                         failures.push(format!("{gate_name} outliers={outliers} O={o} {}", mapping_label(mapping, o)));
                     }

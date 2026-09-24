@@ -35,7 +35,14 @@
 // tiles over a STAGES-deep cp.async pipeline (activation rows, code chunks and
 // coefficient words), ldmatrix activation fragments, and weight B fragments
 // dequantized from the staged mma16 chunks (an A-fragment register pair of a
-// 16-row weight tile is the B fragment of one of its 8-row halves).
+// 16-row weight tile is the B fragment of one of its 8-row halves). Entries
+// run it in two row bands with their own launches: `SmallGemm` up to
+// SMALL_GEMM_ROWS (64-row tiles, the INT8 candidate) and `LargeGemm` beyond
+// (128-row tiles, the 16-bit path). Entries with few output columns also
+// split it over K up to SPLIT_ROWS rows. Measured on GB10 for every K1 entry
+// (17 to 512 rows, both operand paths, split 1/2/4): up to 64 rows want the
+// small tiles, beyond them the large ones, and the few-column entries the
+// split up to 128 rows.
 #include "common/packets.cuh"
 #include "common/reduce.cuh"
 
@@ -582,6 +589,22 @@ template <int BM_, int WM_, int WN_, int STAGES_> struct GemmShape {
     static constexpr int SHARED_BYTES = STAGES * STAGE_BYTES<STREAMS, S8> + STREAMS * WARPS * COEF_WARP;
 };
 
+// The GEMM row bands of the K1 entries (declared as their `_gemm_small` and
+// `_gemm` launches). Each warp owns one weight tile of the block tile and all
+// its activation rows (one warp row: measured faster than two at every row
+// count, most at 512 rows). Shared bytes: small 3 * (64 * 144 + STREAMS *
+// 10240) + STREAMS * 2048, large 2 * (128 * 144 + STREAMS * 10240) + STREAMS
+// * 2048.
+constexpr u32 SMALL_GEMM_ROWS = 64;
+using SmallGemm = GemmShape<64, 1, 8, 3>;
+using LargeGemm = GemmShape<128, 1, 8, 2>;
+// Entries with few output columns split their GEMM over K into SPLIT shares
+// up to SPLIT_ROWS rows (the declarations' grid z `1 + min(1, 128 / rows)`,
+// partials scratch and finalize launch): their block columns alone leave most
+// of the device idle there.
+constexpr u32 SPLIT_ROWS = 128;
+constexpr u32 SPLIT = 2;
+
 // The raw fragments of weight tile `tile`, k-block `kblock` for the lane: from
 // the stage's staged chunks, or for dense weights (nothing staged) from
 // global memory.
@@ -1052,20 +1075,22 @@ __device__ __forceinline__ void gemm_segment_s8(u8 *shared, const QuantizedRows 
 }
 
 // ---------------------------------------------------------------------------
-// Operand paths of an entry. The GEMV always runs the 16-bit path; the GEMM
-// runs it or, with S8, the INT8 candidate (q8_1 activations and s8 MMAs). The
-// staging launch (one block per row) writes the rows a launch does not read in
-// place: the q8_1 rows (S8 GEMM: K bytes per row in `staged`, the (d, d * sum
-// q) groups in `groups`), else the prologue's A rows (a prologue that is not
-// read in place, M > 1: K A elements per row in `staged`).
+// Operand paths of an entry. The GEMV and the large-band GEMM run the 16-bit
+// path; the small-band GEMM runs it or, with S8, the INT8 candidate (q8_1
+// activations and s8 MMAs). The staging launches (one block per row) write
+// the rows a launch does not read in place: `_stage` the prologue's A rows (a
+// prologue that is not read in place, M > 1: K A elements per row in
+// `staged`), `_stage_s8` the INT8 candidate's q8_1 rows (K bytes per row in
+// `staged`, the (d, d * sum q) groups in `groups`).
 // Whether the INT8 candidate applies to an entry's weights: it multiplies
 // q8_1 activations with packed codes, so with any dense weight INT8 has no
-// effect and the GEMM runs the 16-bit path.
+// effect: the GEMM runs the 16-bit path, and `_stage_s8` stages what that
+// path reads.
 template <class... W> constexpr bool quantizable = (!W::DENSE && ...);
 
 template <bool S8, class Pro>
-__device__ __forceinline__ void stage_row(const Pro &pro, u32 m, u32 M, u64 K, u8 *staged, void *groups) {
-    if (S8 && M > GEMV_ROWS)
+__device__ __forceinline__ void stage_row(const Pro &pro, u32 m, u64 K, u8 *staged, void *groups) {
+    if constexpr (S8)
         stage_row_s8(pro, m, K, staged, reinterpret_cast<float2 *>(groups));
     else if constexpr (Pro::STAGED)
         form_row(pro, m, K, staged);
@@ -1153,6 +1178,21 @@ __device__ __forceinline__ void split_finalize(const float *partials, u64 parts,
             second += slice[rows_m * columns];
     }
     apply(m, column, first, second);
+}
+
+// One GEMM block of a single-stream entry with few output columns: its K
+// share's partials when the launch is split (grid z = SPLIT shares up to
+// SPLIT_ROWS rows, summed by the finalize launch), else published through
+// `epi`.
+template <class Shape, bool S8, class W, class Epi>
+__device__ __forceinline__ void gemm_run_split(u8 *shared, const u8 *act, u64 act_stride, const void *groups, u32 M,
+                                               u64 K, u64 nblock, u64 rows, const W &w, const Epi &epi,
+                                               float *partials) {
+    if (gridDim.z > 1)
+        gemm_run<Shape, S8>(shared, act, act_stride, groups, M, K, nblock, rows, w, NoWeight{},
+                            PartialStore<1>{partials, M, rows, 0, blockIdx.z}, blockIdx.z, gridDim.z);
+    else
+        gemm_run<Shape, S8>(shared, act, act_stride, groups, M, K, nblock, rows, w, NoWeight{}, epi);
 }
 
 } // namespace projection

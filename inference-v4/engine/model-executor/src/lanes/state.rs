@@ -1,23 +1,13 @@
 //! State maintenance owns physical state until a completed submission is reconciled.
 
-use crate::{
-    ConditioningRef, ConditioningSlice, InvariantError, NativeGraphWorkspaceLease,
-    ResourceDomainId, TargetGraphOutputLease, TargetGraphWorkspaceLease,
-};
+use crate::{InvariantError, NativeGraphWorkspaceLease, ResourceDomainId};
 use magnitude_model_batching::{StateBatchKind, ValidatedStateBatch};
-use magnitude_model_state::{OwnedCodecAdvance, OwnedCompaction, OwnedRepairAdvance, StateStore};
+use magnitude_model_state::{OwnedCodecAdvance, OwnedCompaction, StateStore};
 use std::rc::Rc;
 
 pub enum StateWork {
     Copy(OwnedCompaction),
     CodecConversion(OwnedCodecAdvance),
-    RecurrentRepair {
-        advance: OwnedRepairAdvance,
-        conditioning: Option<ConditioningRef>,
-        conditioning_slices: Vec<ConditioningSlice>,
-        graph_workspace: TargetGraphWorkspaceLease,
-        graph_outputs: [TargetGraphOutputLease; 2],
-    },
 }
 
 pub struct StateLaunchInputs {
@@ -39,16 +29,11 @@ impl StateLaunchInputs {
         }
     }
 
-    pub(crate) fn into_parts(self) -> (ValidatedStateBatch, StateWork, NativeGraphWorkspaceLease) {
-        (self.batch, self.work, self.graph_workspace)
-    }
-
     fn validate(
         &self,
         source_store: &Rc<StateStore>,
         destination_store: Option<&Rc<StateStore>>,
         domain: &ResourceDomainId,
-        width: usize,
     ) -> Result<(), InvariantError> {
         let invalid = |detail: String| InvariantError {
             context: "state launch",
@@ -90,78 +75,6 @@ impl StateLaunchInputs {
                     ));
                 }
             }
-            (
-                StateWork::RecurrentRepair {
-                    advance,
-                    conditioning,
-                    conditioning_slices,
-                    graph_workspace,
-                    graph_outputs,
-                },
-                StateBatchKind::RecurrentRepair,
-            ) => {
-                let replay = self
-                    .batch
-                    .replay()
-                    .ok_or_else(|| invalid("repair has no replay rows".into()))?;
-                if !advance.belongs_to(source_store)
-                    || advance.rows() != replay.actual_rows()
-                    || replay.slot(0).is_none_or(|slot| {
-                        i32::try_from(advance.previous_bank()).ok() != Some(slot.bank())
-                            || i32::try_from(advance.following_bank()).ok()
-                                != Some(slot.following_bank())
-                    })
-                {
-                    return Err(invalid(
-                        "repair rows differ from the owned recurrent transaction".into(),
-                    ));
-                }
-                if graph_workspace.domain() != domain
-                    || graph_outputs.iter().any(|lease| lease.domain() != domain)
-                {
-                    return Err(invalid(
-                        "repair graph leases differ from the resource domain".into(),
-                    ));
-                }
-                if let Some(lease) = conditioning {
-                    if lease.domain() != domain
-                        || lease.allocation().rows() != replay.actual_rows()
-                        || lease.allocation().width() != width
-                        || lease.allocation().tensor().is_err()
-                    {
-                        return Err(invalid(
-                            "repair conditioning differs from the physical replay rows".into(),
-                        ));
-                    }
-                }
-                let mut occupied = vec![false; replay.actual_rows()];
-                for slice in conditioning_slices {
-                    let source = slice.source.features.allocation();
-                    let end = slice.destination.checked_add(slice.source.count);
-                    if slice.source.features.domain() != domain
-                        || source.width() != width
-                        || source.tensor().is_err()
-                        || slice.source.count == 0
-                        || slice
-                            .source
-                            .start
-                            .checked_add(slice.source.count)
-                            .is_none_or(|end| end > source.rows())
-                        || end.is_none_or(|end| end > replay.actual_rows())
-                    {
-                        return Err(invalid(
-                            "repair feature slice differs from the accepted replay rows".into(),
-                        ));
-                    }
-                    let Some(end) = end else {
-                        return Err(invalid("repair feature destination overflows".into()));
-                    };
-                    if occupied[slice.destination..end].iter().any(|set| *set) {
-                        return Err(invalid("repair feature slices overlap".into()));
-                    }
-                    occupied[slice.destination..end].fill(true);
-                }
-            }
             _ => {
                 return Err(invalid(
                     "state batch and owned maintenance operation differ".into(),
@@ -183,9 +96,8 @@ impl ValidatedStateLaunch {
         source_store: &Rc<StateStore>,
         destination_store: Option<&Rc<StateStore>>,
         domain: &ResourceDomainId,
-        width: usize,
     ) -> Result<Self, (StateLaunchInputs, InvariantError)> {
-        if let Err(error) = inputs.validate(source_store, destination_store, domain, width) {
+        if let Err(error) = inputs.validate(source_store, destination_store, domain) {
             return Err((inputs, error));
         }
         let StateLaunchInputs {

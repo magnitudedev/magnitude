@@ -77,7 +77,9 @@ def main() -> None:
     parser.add_argument("--suite", default="single")
     parser.add_argument("--context", type=int, default=512)
     parser.add_argument("--repeat", type=int, default=1)
-    parser.add_argument("--workload", choices=("retrieval", "prose"), default="retrieval")
+    parser.add_argument(
+        "--workload", choices=("retrieval", "prose-continue", "prose-repeat"), default="retrieval"
+    )
     parser.add_argument("--startup-timeout", type=int, default=900)
     parser.add_argument("--storage-gib", type=int, default=28)
     parser.add_argument("--method", choices=("auto", "plain", "mtp"), default="auto")
@@ -257,8 +259,8 @@ def main() -> None:
                 source, [Target(engine="magnitude", reference=str(artifact))], sections,
                 (args.context,), (), args.repeat, None,
                 lambda message: print(message, file=sys.stderr, flush=True),
-                prose=args.workload == "prose",
-                retrieval=None if args.workload == "prose" else RulerFixture(
+                prose=None if args.workload == "retrieval" else args.workload,
+                retrieval=None if args.workload != "retrieval" else RulerFixture(
                     seed=42, variant="single", haystack="records", queries=1
                 ),
             )
@@ -267,7 +269,10 @@ def main() -> None:
                 break
         return results
 
-    print(json.dumps(asyncio.run(all_runs()), indent=2))
+    results = asyncio.run(all_runs())
+    print(json.dumps(results, indent=2))
+    if any(entry["result"].get("status") != "completed" for entry in results):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

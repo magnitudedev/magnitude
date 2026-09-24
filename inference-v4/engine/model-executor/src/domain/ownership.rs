@@ -100,7 +100,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.target.contains_key(&request)
             || self.head.contains_key(&request)
             || self.input.contains_key(&request)
-            || self.repairs.contains_key(&request)
         {
             return Err(format!("request {} is already open", request.0).into());
         }
@@ -108,8 +107,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     pub fn close(&mut self, request: RequestId) -> Result<(), String> {
-        if self.repairs.contains_key(&request)
-            || !self.target.contains_key(&request)
+        if !self.target.contains_key(&request)
             || (self.head_store.is_some() && !self.head.contains_key(&request))
         {
             return Err("request has unresolved work or is not open".into());
@@ -201,7 +199,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.target.contains_key(&request)
             || self.head.contains_key(&request)
             || self.input.contains_key(&request)
-            || self.repairs.contains_key(&request)
         {
             return Err("checkpoint request is already open".into());
         }
@@ -229,8 +226,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             && self
                 .head
                 .get(&request)
-                .is_none_or(|state| state.position() == 0)
-            && !self.repairs.contains_key(&request);
+                .is_none_or(|state| state.position() == 0);
         if !fresh {
             return Err("only an open request without accepted state can resume".into());
         }
@@ -331,7 +327,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.target.contains_key(&destination)
             || self.head.contains_key(&destination)
             || self.input.contains_key(&destination)
-            || self.repairs.contains_key(&destination)
         {
             return Err("fork destination is already open".into());
         }

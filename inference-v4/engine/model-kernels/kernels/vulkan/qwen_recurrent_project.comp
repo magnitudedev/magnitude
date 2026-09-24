@@ -193,20 +193,20 @@ void qwen_recurrent_project_gemm() {
     const uint t0 = (PROJECT_QKV_ROWS + tn - 1u) / tn, t1 = (PROJECT_GATE_ROWS + tn - 1u) / tn;
     const uint t2 = (PROJECT_HEAD_ROWS + tn - 1u) / tn;
     if (n < t0)
-        projection_gemm(QKV_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, x, recurrent_project_out(0u),
+        projection_gemm(QKV_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, recurrent_project_out(0u),
             recurrent_project_weight(SEISMIC_PTR(SEISMIC_BUFFER_QKV_WEIGHT), QKV_GEOMETRY), m, PROJECT_QKV_ROWS,
             PROJECT_K, tm_index, n, 0xffffffffu);
     else if (n < t0 + t1)
-        projection_gemm(GATE_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, x, recurrent_project_out(PROJECT_QKV_ROWS),
+        projection_gemm(GATE_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, recurrent_project_out(PROJECT_QKV_ROWS),
             recurrent_project_weight(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT), GATE_GEOMETRY), m, PROJECT_GATE_ROWS,
             PROJECT_K, tm_index, n - t0, 0xffffffffu);
     else if (n < t0 + t1 + t2)
-        projection_gemm(ALPHA_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, x,
+        projection_gemm(ALPHA_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x,
             recurrent_project_out(PROJECT_QKV_ROWS + PROJECT_GATE_ROWS),
             recurrent_project_weight(SEISMIC_PTR(SEISMIC_BUFFER_ALPHA_WEIGHT), ALPHA_GEOMETRY), m, PROJECT_HEAD_ROWS,
             PROJECT_K, tm_index, n - t0 - t1, 0xffffffffu);
     else
-        projection_gemm(BETA_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, x,
+        projection_gemm(BETA_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x,
             recurrent_project_out(PROJECT_QKV_ROWS + PROJECT_GATE_ROWS + PROJECT_HEAD_ROWS),
             recurrent_project_weight(SEISMIC_PTR(SEISMIC_BUFFER_BETA_WEIGHT), BETA_GEOMETRY), m, PROJECT_HEAD_ROWS,
             PROJECT_K, tm_index, n - t0 - t1 - t2, 0xffffffffu);

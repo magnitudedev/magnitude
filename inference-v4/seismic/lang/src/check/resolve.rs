@@ -27,7 +27,7 @@ pub(crate) struct SigParam {
 }
 
 /// One shape parameter of a declared signature. The only owner of positivity.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SignatureDimension {
     pub name: String,
     pub symbol: SymbolId,

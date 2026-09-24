@@ -11,6 +11,12 @@ PREFILL_TOKENS = 2048
 OUTPUT_CAPACITY = 64
 DEFAULT_CONTEXTS = (1_024, 4_096, 16_384)
 ENGINES = ("magnitude", "mlx-vlm", "omlx", "llama.cpp", "tilelang-poc")
+WORKLOADS = {
+    "tools": "BFCL tool-call decisions (default)",
+    "prose-continue": "continue a Moby Dick passage; output varies",
+    "prose-repeat": "repeat a Moby Dick passage back; the same 256-token output at every context",
+    "retrieval": "score RULER-derived key/value retrieval",
+}
 
 
 def project_root() -> Path:

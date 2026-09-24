@@ -25,6 +25,7 @@ pub(crate) mod repr;
 pub mod span;
 pub mod syntax;
 pub mod types;
+mod wire;
 
 pub mod interp;
 

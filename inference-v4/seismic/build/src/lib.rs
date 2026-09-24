@@ -3,8 +3,9 @@
 //!
 //! A consumer's `build.rs` names its `.seismic` sources and a module name.
 //! Generation parses and checks (with the standard library unless opted
-//! out), emits `<module>.seismicbundle` and `<module>.rs` into `OUT_DIR`,
-//! and records source/compiler hashes for cache identity. Generated Rust
+//! out), emits `<module>.seismicbundle` (the checked module and its sources)
+//! and `<module>.rs` into `OUT_DIR`, and records source/compiler hashes for
+//! cache identity. Generated Rust
 //! embeds no target executable: target compilation happens in `for_device`.
 //!
 //! W9-A owns generation internals. The surface below and the generated
@@ -54,6 +55,7 @@ use seismic_lang::checked::{
     EntryInfo, NativeImplementation, ParameterSummary,
     ParameterSummaryKind, ResultSummaryKind, SourceSet, TensorAccess,
 };
+pub use seismic_lang::registry::BackendName;
 use seismic_lang::types::DType;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -203,6 +205,19 @@ pub struct Artifacts {
     pub bindings: PathBuf,
     /// Hex digest of sources plus compiler semantic version.
     pub identity: String,
+    /// Every authored native implementation of the module's entries, in
+    /// entry order, then backend order. A library can enforce its own
+    /// backend coverage policy over these at build time.
+    pub natives: Vec<NativeCoverage>,
+}
+
+/// One `native <entry> for <backend> from "<asset>"` declaration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeCoverage {
+    pub entry: String,
+    pub backend: BackendName,
+    /// Canonical path of the authored asset.
+    pub asset: PathBuf,
 }
 
 mod internals {
@@ -252,10 +267,12 @@ mod internals {
         // so the bundle digest below covers every included file.
         let encoded = seismic_lang::bundle::encode_checked_bundle(checked);
         let native_assets = resolve_native_assets(checked, &loaded.assets, &output)?;
-        // The checked bundle contains the canonical sources, bundle format,
-        // checker semantic version, registry revision, and semantic hash.
-        // Addressing the emitted bundle therefore cannot accidentally reuse
-        // generated bindings across a change in any of those inputs.
+        // The checked bundle contains the canonical sources, the checked
+        // module this build's checker produced (decoded at run time without
+        // checking again), bundle format, checker semantic version, registry
+        // revision, and semantic hash. Addressing the emitted bundle therefore
+        // cannot accidentally reuse generated bindings across a change in any
+        // of those inputs.
         let mut identity_hasher = Sha256::new();
         identity_hasher.update(&encoded);
         let bundle_digest: [u8; 32] = identity_hasher.finalize().into();
@@ -272,7 +289,30 @@ mod internals {
             bundle,
             bindings,
             identity,
+            natives: native_coverage(checked, &loaded.assets),
         })
+    }
+
+    fn native_coverage(
+        module: &seismic_lang::checked::CheckedModule,
+        captured: &[seismic_lang::source::CapturedAsset],
+    ) -> Vec<NativeCoverage> {
+        module
+            .entries()
+            .iter()
+            .flat_map(|entry| {
+                BackendName::ALL.into_iter().filter_map(move |backend| {
+                    captured
+                        .iter()
+                        .find(|asset| asset.entry == entry.id && asset.backend == backend)
+                        .map(|asset| NativeCoverage {
+                            entry: entry.name.clone(),
+                            backend,
+                            asset: asset.asset.path.clone(),
+                        })
+                })
+            })
+            .collect()
     }
 
     fn resolve_native_assets<'a>(
@@ -516,6 +556,7 @@ mod internals {
                     "SEISMIC_SCALAR_RESULTS",
                     "SEISMIC_KERNEL",
                     "SEISMIC_HAS_MATRIX",
+                    "SEISMIC_HAS_WIDE_ACCUMULATORS",
                     "SEISMIC_HAS_MIXED_DOT",
                     "SEISMIC_HAS_F32_ATOMIC_ADD",
                     "SEISMIC_HAS_SHARED_INT64_ATOMICS",

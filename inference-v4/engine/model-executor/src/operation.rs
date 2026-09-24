@@ -252,10 +252,6 @@ pub enum Operation {
         position: usize,
         proposals: Vec<SelectSpec>,
     },
-    Repair {
-        request: RequestId,
-        rows: usize,
-    },
     Encode {
         request: RequestId,
         image: ImageRef,
@@ -287,14 +283,13 @@ impl Operation {
         match self {
             Self::Forward { request, .. }
             | Self::Head { request, .. }
-            | Self::Repair { request, .. }
             | Self::Encode { request, .. } => *request,
         }
     }
 
     pub const fn executable(&self) -> ExecutableKind {
         match self {
-            Self::Forward { .. } | Self::Repair { .. } => ExecutableKind::Target,
+            Self::Forward { .. } => ExecutableKind::Target,
             Self::Head { .. } => ExecutableKind::Head,
             Self::Encode { .. } => ExecutableKind::Encoder,
         }
@@ -305,7 +300,7 @@ impl Operation {
             Self::Forward { demand, .. } => *demand,
             Self::Head { proposals, .. } if proposals.is_empty() => Demand::NONE,
             Self::Head { .. } => Demand::SELECT,
-            Self::Repair { .. } | Self::Encode { .. } => Demand::NONE,
+            Self::Encode { .. } => Demand::NONE,
         }
     }
 
@@ -318,8 +313,17 @@ impl Operation {
             Self::Head {
                 tokens, proposals, ..
             } => tokens.len() + proposals.len().saturating_sub(1),
-            Self::Repair { rows, .. } => *rows,
             Self::Encode { image, .. } => image.patches(),
+        }
+    }
+
+    /// The leading rows of `row_count` that always commit: a forward's
+    /// committed rows, a head's entry rows. The rest are speculative.
+    pub fn committed_rows(&self) -> usize {
+        match self {
+            Self::Forward { committed, .. } => *committed,
+            Self::Head { tokens, .. } => tokens.len(),
+            Self::Encode { .. } => self.row_count(),
         }
     }
 
@@ -367,7 +371,7 @@ impl Operation {
                 committed,
                 ..
             } => {
-                if *committed > tokens.len() {
+                if *committed == 0 || *committed > tokens.len() {
                     return Err(OperationError::CommittedRows {
                         committed: *committed,
                         rows: tokens.len(),
@@ -548,6 +552,5 @@ pub enum Outcome {
     Forward { rows: Vec<RowResult> },
     /// One selection per requested proposal, in chain order.
     Head { proposals: Vec<Selected> },
-    Repair,
     Encode { features: FeatureRef },
 }

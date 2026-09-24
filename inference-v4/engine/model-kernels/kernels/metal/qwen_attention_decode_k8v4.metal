@@ -6,10 +6,10 @@
 #define DECODE_BATCH 4
 
 // L1: threadgroup (kv head, partition, row), as `qwen_attention_decode`, over
-// affine K8/V4 history. History keys score as scale * (q . code) + zero *
-// sum(q) and values accumulate (p * scale) * code plus the carried per-head
-// bias sum(p * zero) (attention::absorb_affine), so no history element is
-// decoded. The fresh span stays dense; the bias is folded into the output
+// affine K8/V4 history. History keys score as the sum over groups of
+// scale * (q . code) + zero * sum(q) and values accumulate (p * scale) * code
+// plus the carried bias sum(p * zero) of each lane's group
+// (attention::absorb_affine), so no history element is decoded. The fresh span stays dense; the bias is folded into the output
 // before it. Partition 0 appends the row's key (prepared, rounded to the
 // activation dtype) and value encoded (attention::encode).
 kernel void qwen_attention_decode_k8v4_partial(
@@ -65,13 +65,13 @@ kernel void qwen_attention_decode_k8v4_partial(
                 for (uint i = 0; i < E; ++i)
                     x[i] = float(attention::Scalar(x[i]));
                 attention::encode<ATTENTION_KEY_BITS>(x, key_codes + vector * key_lane::row_words,
-                    key_coefficients + vector * 2, lane);
+                    key_coefficients + vector * key_lane::pairs * 2, lane);
             } else {
                 ATTENTION_UNROLL
                 for (uint i = 0; i < E; ++i)
                     x[i] = float(value[source + lane * E + i]);
                 attention::encode<ATTENTION_VALUE_BITS>(x, value_codes + vector * value_lane::row_words,
-                    value_coefficients + vector * 2, lane);
+                    value_coefficients + vector * value_lane::pairs * 2, lane);
             }
         }
     }
@@ -112,7 +112,7 @@ kernel void qwen_attention_decode_k8v4_partial(
             sum += q[g][i];
             output[g][i] = 0.0f;
         }
-        qsum[g] = simd_sum(sum);
+        qsum[g] = sum;
         maximum[g] = -INFINITY;
         denominator[g] = 0.0f;
         bias[g] = 0.0f;
@@ -141,8 +141,8 @@ kernel void qwen_attention_decode_k8v4_partial(
                     const ulong vector = (ulong(lo) + (position + j - offset)) * KV + kv_head;
                     key_lane::load(key_codes + vector * key_lane::row_words, lane, k[j]);
                     value_lane::load(value_codes + vector * value_lane::row_words, lane, v[j]);
-                    kc[j] = float2(*reinterpret_cast<device const half2 *>(key_coefficients + vector * 2));
-                    vc[j] = float2(*reinterpret_cast<device const half2 *>(value_coefficients + vector * 2));
+                    kc[j] = key_lane::pair(key_coefficients, vector, lane);
+                    vc[j] = value_lane::pair(value_coefficients, vector, lane);
                 }
                 attention::absorb_affine<DECODE_BATCH>(q, qsum, k, kc, v, vc, maximum, denominator,
                     output, bias);
@@ -155,8 +155,8 @@ kernel void qwen_attention_decode_k8v4_partial(
                 const ulong vector = (ulong(lo) + (position - offset)) * KV + kv_head;
                 key_lane::load(key_codes + vector * key_lane::row_words, lane, k[0]);
                 value_lane::load(value_codes + vector * value_lane::row_words, lane, v[0]);
-                kc[0] = float2(*reinterpret_cast<device const half2 *>(key_coefficients + vector * 2));
-                vc[0] = float2(*reinterpret_cast<device const half2 *>(value_coefficients + vector * 2));
+                kc[0] = key_lane::pair(key_coefficients, vector, lane);
+                vc[0] = value_lane::pair(value_coefficients, vector, lane);
                 attention::absorb_affine<1>(q, qsum, k, kc, v, vc, maximum, denominator, output, bias);
             }
         } else {

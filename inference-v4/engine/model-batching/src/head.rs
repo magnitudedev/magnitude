@@ -83,7 +83,9 @@ impl ValidatedHeadBatch {
                         Slot {
                             rows: vec![row],
                             bank: slot.entry.bank,
+                            previous_tape: slot.entry.previous_tape,
                             following_bank: slot.entry.following_bank,
+                            stop: 1,
                         }
                     })
                     .collect::<Vec<_>>();

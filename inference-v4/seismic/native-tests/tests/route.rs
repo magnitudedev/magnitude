@@ -23,7 +23,10 @@ fn search(samples: usize) -> Strategy {
             samples,
             confirmation_samples: samples,
         },
-        min_sample_seconds: 0.0002,
+        // Long enough that a sample of these µs-scale kernels measures the
+        // kernel rather than the host's scheduling: confirmation excludes a
+        // finalist whose samples spread more than 10%.
+        min_sample_seconds: 0.005,
         start: Vec::new(),
         deadline: None,
     })

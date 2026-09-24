@@ -82,7 +82,7 @@ native head_logits_rows for metal from "metal/head_logits_rows.metal":
     launch head_logits_rows_gemv when O < BATCH_FROM:
         threadgroups (ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (O * min(ceil_div(D, 32), 288 / max(O, 1)) * 72)
+        shared_bytes (min(ceil_div(D, 32) * (min(O, 2) + 2 * min(O / 3, 1) + 4 * min(O / 5, 1)), 448) * 64)
     launch head_logits_rows_batch when O >= BATCH_FROM and O <= 16:
         threadgroups (ceil_div(V, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
         threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
@@ -91,40 +91,40 @@ native head_logits_rows for metal from "metal/head_logits_rows.metal":
         threadgroups (ceil_div(V, TILE_N), ceil_div(O, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
 
-# CUDA: GEMV to 16 rows (`gemv` to 8, `gemv16` beyond), GEMM beyond, the
-# features read in place; the GEMM's INT8 (q8_1) candidate stages quantized
-# rows. (Metal: batched GEMV row class, no INT8 path.)
+# CUDA: GEMV to 16 rows (`gemv` to 8, `gemv16` beyond), the 16-bit GEMM
+# beyond in the K1 row bands (`gemm_small` to 64 rows, `gemm` beyond; see
+# `cuda_dense.seismic`), the features read in place. (Metal: batched GEMV row
+# class.)
 native head_logits_rows for cuda from "cuda/head_logits_rows.cu":
     static (V, D)
-    params (arithmetic KSPLIT in [4, 2, 8], BM in [64, 128], arithmetic INT8 in [0, 1])
+    params (arithmetic KSPLIT in [4, 2, 8])
     where D % 64 == 0
-    scratch staged bytes (O * D) when INT8 == 1 and O > 16
-    scratch groups bytes (O * D / 4) when INT8 == 1 and O > 16
-    launch head_logits_rows_stage when INT8 == 1 and O > 16:
-        threadgroups (O, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
     launch head_logits_rows_gemv when O <= 8:
         threadgroups (ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch head_logits_rows_gemv16 when O > 8 and O <= 16:
         threadgroups (ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch head_logits_rows_gemm when O > 16:
-        threadgroups (ceil_div(ceil_div(V, 16), 8), ceil_div(O, BM), 1)
+    launch head_logits_rows_gemm_small when O > 16 and O <= 64:
+        threadgroups (ceil_div(ceil_div(V, 16), 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes ((4 - BM / 64) * (BM * 144 + 10240) + 4096)
+        shared_bytes (3 * (64 * 144 + 10240) + 2048)
+    launch head_logits_rows_gemm when O > 64:
+        threadgroups (ceil_div(ceil_div(V, 16), 8), ceil_div(O, 128), 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (2 * (128 * 144 + 10240) + 2048)
 
 # Vulkan: the K1 projection without a prologue (see `readout_head_rows`).
 native head_logits_rows for vulkan from "vulkan/head_logits_rows.comp":
     static (V, D)
     params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
-            TILE_M in [64, 128, 32], TILE_N in [64, 128])
-    where ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES) <= 65535
+            TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
+    where ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES) <= 65535 and SUB_M <= TILE_M and SUB_N <= TILE_N
     launch head_logits_rows_gemv when O <= 8:
         threadgroups (ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (256 + min(8 * ceil_div(D, 32), 288) * 72)
     launch head_logits_rows_gemm when O > 8:
         threadgroups (ceil_div(V, TILE_N), ceil_div(O, TILE_M), 1)
-        threads_per_threadgroup (TILE_M * TILE_N / 32, 1, 1)
+        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
         shared_bytes ((TILE_M + TILE_N) * 80)

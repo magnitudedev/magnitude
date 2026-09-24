@@ -240,7 +240,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             entry: Slot {
                 rows: entry,
                 bank: i32_of(binding.previous_bank, "bank")?,
+                previous_tape: i32_of(binding.previous_tape, "tape rows")?,
                 following_bank: i32_of(binding.following_bank, "successor bank")?,
+                stop: i32_of(binding.stop, "committed rows")?,
             },
             chain,
             proposals: selections,
@@ -307,9 +309,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 committed_rows: rows,
                 kind: WorkKind::Decode,
                 physical_duration: duration,
-                slot: None,
-                conditioning: None,
-                conditioning_slices: Vec::new(),
                 image: None,
             })
             .collect())

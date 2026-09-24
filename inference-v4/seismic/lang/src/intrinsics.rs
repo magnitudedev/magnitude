@@ -13,13 +13,14 @@ use crate::ids::RepresentationId;
 use crate::reference_math::ReferenceScalar;
 use crate::syntax::ast::{BinaryOp, UnaryOp};
 use crate::types::{DType, Elem, NonEmpty, TensorType, ValueType};
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Operation vocabularies
 // ---------------------------------------------------------------------------
 
 /// Mathematical operations admitted by the source `max`, `min`, `fma`, … calls.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MathOp {
     Fma,
     Exp,
@@ -83,7 +84,7 @@ impl MathOp {
 
 /// The four reductions. `argmax` returns `i32` and chooses the smaller
 /// coordinate on ties; it never accepts reassociation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ReduceOp {
     Sum,
     Max,
@@ -116,7 +117,7 @@ impl ReduceOp {
 /// Structure of one index slot of a view selection. Each `check*` flag is
 /// `true` when the checker did not prove the corresponding bound, so entry
 /// construction emits its runtime check.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum IndexSlot {
     Point {
         /// `0 <= i < extent` is not proved.
@@ -143,7 +144,7 @@ pub enum IndexSlot {
 
 /// The checker's proof about a primitive whose scalar recipe has failure
 /// outputs: `ProvedAbsent` means those outputs are unreachable at this site.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PrimitiveFailure {
     Possible,
     ProvedAbsent,
@@ -189,7 +190,7 @@ pub fn unary_operand_domain(op: UnaryOp) -> OperandDomain {
 /// The combining operation of an `atomic` update. `add` is the registry
 /// load/add/round/store; `max` and `min` are exact and order-independent
 /// (NaN operands are ignored, as in the reference reductions).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AtomicOp {
     Add,
     Max,
@@ -213,7 +214,7 @@ impl AtomicOp {
 }
 
 /// The constant of a `zeros_like` / `ones_like` fill.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FillConstant {
     Zero,
     One,
@@ -231,7 +232,7 @@ impl FillConstant {
 /// The closed portable primitive vocabulary. Every checked expression is a
 /// registry primitive, a capability intrinsic, or a static function-family
 /// call; payloads carry only structure the operands cannot express.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PrimitiveId {
     /// A typed literal; the node's output type supplies the dtype.
     Constant(ReferenceScalar),
@@ -297,7 +298,7 @@ pub enum PrimitiveId {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RepresentationTarget {
     Concrete(RepresentationId),
     Parameter(String),

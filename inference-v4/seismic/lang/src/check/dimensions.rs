@@ -6,11 +6,12 @@
 use super::resolve::{SigParam, SignatureDimension};
 use crate::expr::{AnyExpr, ExprArena, IntExpr, NodeView, SymbolId};
 use crate::types::ValueType;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 /// One tensor axis of one (possibly tuple-nested) parameter.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ObservedAxis {
     pub parameter: u32,
     pub path: Vec<u32>,
@@ -18,17 +19,17 @@ pub(crate) struct ObservedAxis {
 }
 
 /// A value an inverse operation combines with.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) enum Known {
     Observation(ObservedAxis),
     /// An earlier solved family dimension.
-    Dimension(u32),
+    Dimension(#[serde(deserialize_with = "crate::wire::deserialize_dimension")] u32),
     Constant(i64),
     /// An expression over earlier solved dimensions, in the contract arena.
     Expression(IntExpr),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) enum InverseOp {
     Add(Known),
     Subtract(Known),
@@ -37,15 +38,16 @@ pub(crate) enum InverseOp {
 }
 
 /// Solve `dimension` from `observation` by the inverse operations, in order.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct DimensionStep {
+    #[serde(deserialize_with = "crate::wire::deserialize_dimension")]
     pub dimension: u32,
     pub observation: ObservedAxis,
     pub operations: Vec<InverseOp>,
 }
 
 /// The family's dimension plan over its contract's arena.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct DimensionPlan {
     /// The contract's dimension symbols, in declaration order.
     dimensions: Vec<SymbolId>,

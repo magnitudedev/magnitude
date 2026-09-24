@@ -67,11 +67,13 @@ void attention_output_gemv() {
 void attention_output_gemm() {
     const uint m = uint(SEISMIC_DIM_M), n = uint(SEISMIC_DIM_D);
 #if SEISMIC_TUNE_SPLIT == 1
-    projection_gemm(OUTPUT_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, attention_output_input(),
+    projection_gemm(OUTPUT_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
+        attention_output_input(),
         attention_output_output(), attention_output_weight(), m, n, OUTPUT_K, gl_WorkGroupID.y, gl_WorkGroupID.x,
         0xffffffffu);
 #else
-    projection_gemm_part(OUTPUT_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, attention_output_input(),
+    projection_gemm_part(OUTPUT_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
+        attention_output_input(),
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), attention_output_weight(), m, n, OUTPUT_K, SEISMIC_TUNE_SPLIT,
         gl_WorkGroupID.z, gl_WorkGroupID.y, gl_WorkGroupID.x);
 #endif

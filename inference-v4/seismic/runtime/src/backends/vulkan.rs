@@ -80,6 +80,7 @@ impl VulkanOpened {
         let facts = self.service.facts();
         VulkanFeatures {
             matrix: facts.matrix,
+            wide_accumulators: facts.wide_accumulators,
             mixed_dot: facts.mixed_dot_accelerated,
             f32_atomic_add: facts.f32_atomic_add,
             shared_int64_atomics: facts.shared_int64_atomics,

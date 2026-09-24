@@ -255,17 +255,6 @@ impl ProgramPlan {
     pub fn state(&self) -> &StateProgramPlan {
         &self.state
     }
-
-    /// Recurrent prefix repair is a state transaction executed by the exact
-    /// already-planned target replay slots. This projection adds no second
-    /// independently attested kernel topology.
-    pub fn recurrent_repair_replay(&self) -> Option<&TargetProgramPlan> {
-        self.target
-            .blocks
-            .iter()
-            .any(|block| matches!(block.mixer, MixerProgramSlot::Recurrent(_)))
-            .then_some(&self.target)
-    }
 }
 
 pub(super) fn derive_program_plan(

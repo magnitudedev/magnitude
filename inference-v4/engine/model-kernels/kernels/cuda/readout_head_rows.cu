@@ -1,13 +1,12 @@
 // readout_head_rows: final RMS prologue over the `out_rows` rows, then the
 // vocabulary projection into F32 logits (a K1 projection). GEMV for O <= 16
 // (`gemv` to 8 rows, `gemv16` beyond; at O = 1 the block forms the A row in
-// shared memory, else the staging launch forms the A rows first), GEMM
-// otherwise (A rows, or q8_1 rows for the INT8 candidate, staged first).
+// shared memory, else `stage` forms the A rows first), GEMM otherwise over
+// the A rows (`gemm_small` to 64 rows, `gemm` beyond; the 16-bit path: head
+// GEMMs are rare, so the INT8 candidate is not offered).
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "common/projection.cuh"
 
-constexpr bool S8 = SEISMIC_TUNE_INT8 == 1 && projection::quantizable<packets::W0>;
-using GShape = projection::GemmShape<SEISMIC_TUNE_BM, 2, 4, 4 - SEISMIC_TUNE_BM / 64>;
 using Pro = projection::Rms<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows>;
 using Source = projection::GemvSource<Pro>;
 using Epi = projection::Store<element::F32>;
@@ -19,7 +18,6 @@ using Epi = projection::Store<element::F32>;
             projection::SelectedRows{reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS))}             \
     }
 #define STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
-#define GROUPS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS)
 #define HEAD KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT))
 #define EPILOGUE Epi{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0, 0}
 
@@ -36,8 +34,18 @@ __device__ __forceinline__ void head_gemv(const Pro &pro, projection::u8 *row, c
         projection::gemv_segment<Shape>(shared, x, O, D / 64, group, V, head, projection::NoWeight{}, epi);
 }
 
+// The GEMM of one row band over the staged A rows.
+template <class Shape>
+__device__ __forceinline__ void head_gemm(const projection::u8 *staged, unsigned O, unsigned long long D,
+                                          unsigned long long V, const packets::W0 &head, const Epi &epi) {
+    extern __shared__ uint4 dynamic_shared[];
+    if (blockIdx.x < projection::gemm_columns(V))
+        projection::gemm_run<Shape, false>(reinterpret_cast<projection::u8 *>(dynamic_shared), staged, D, nullptr, O,
+                                           D, blockIdx.x, V, head, projection::NoWeight{}, epi);
+}
+
 extern "C" __global__ void readout_head_rows_stage(SEISMIC_KERNEL_PARAMS) {
-    projection::stage_row<S8>(PROLOGUE, blockIdx.x, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, STAGING, GROUPS);
+    projection::stage_row<false>(PROLOGUE, blockIdx.x, SEISMIC_DIM_D, STAGING, nullptr);
 }
 
 extern "C" __global__ void readout_head_rows_gemv(SEISMIC_KERNEL_PARAMS) {
@@ -50,10 +58,10 @@ extern "C" __global__ void readout_head_rows_gemv16(SEISMIC_KERNEL_PARAMS) {
     head_gemv<2>(PROLOGUE, nullptr, STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
 }
 
+extern "C" __global__ void readout_head_rows_gemm_small(SEISMIC_KERNEL_PARAMS) {
+    head_gemm<projection::SmallGemm>(STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
+}
+
 extern "C" __global__ void readout_head_rows_gemm(SEISMIC_KERNEL_PARAMS) {
-    extern __shared__ uint4 dynamic_shared[];
-    if (blockIdx.x < projection::gemm_columns(SEISMIC_DIM_V))
-        projection::gemm_run<GShape, S8>(reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, SEISMIC_DIM_D,
-                                         GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, blockIdx.x, SEISMIC_DIM_V,
-                                         HEAD, projection::NoWeight{}, EPILOGUE);
+    head_gemm<projection::LargeGemm>(STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
 }

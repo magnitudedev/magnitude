@@ -14,6 +14,7 @@ from pathlib import Path
 
 import psutil
 
+from benchmark_fixtures.prose_history import ProseWorkload
 from benchmark_fixtures.ruler import RulerFixture
 
 from .models import Target, file_hash
@@ -37,7 +38,7 @@ def public_command(
     categories: tuple[str, ...],
     repeat: int,
     case: str | None = None,
-    prose: bool = False,
+    prose: ProseWorkload | None = None,
     retrieval: RulerFixture | None = None,
     needle_depth: float = 0.5,
 ) -> str:
@@ -54,7 +55,8 @@ def public_command(
     ]
     if retrieval is not None:
         args += [
-            "--retrieval",
+            "--workload",
+            "retrieval",
             "--retrieval-variant",
             retrieval.variant,
             "--retrieval-seed",
@@ -64,8 +66,10 @@ def public_command(
             "--needle-depth",
             str(needle_depth),
         ]
+    elif prose is not None:
+        args += ["--workload", prose]
     else:
-        args += ["--prose"] if prose else ["--category", ",".join(categories)]
+        args += ["--workload", "tools", "--category", ",".join(categories)]
     if case:
         args += ["--case", case]
     return shlex.join(args)

@@ -73,6 +73,10 @@ pub struct CodecSpec {
     pub packing: u8,
 }
 
+/// Values per (scale, zero) pair of the affine K8/V4 codec: llama.cpp's
+/// q8_0/q4_0 block size. A head width must be a multiple of it.
+pub const AFFINE_GROUP: usize = 32;
+
 /// Host-selectable KV storage policy. These names are the stable public
 /// options; their numerical constants are centralized here so model-family
 /// adapters and executors cannot acquire private codec variants.
@@ -108,8 +112,8 @@ impl KvCodec {
         }
     }
 
-    /// `spec` widths are per attention head: every (history row, head)
-    /// vector is one codec group.
+    /// `spec` widths are per attention head. Affine K8/V4 splits every
+    /// (history row, head) vector into groups of [`AFFINE_GROUP`] values.
     pub const fn spec(self, dense_dtype: DType, key_width: usize, value_width: usize) -> CodecSpec {
         let (key, value) = match self {
             Self::Dense => (
@@ -119,12 +123,12 @@ impl KvCodec {
             Self::AffineK8V4 => (
                 Codec::Affine {
                     bits: 8,
-                    group: 0,
+                    group: AFFINE_GROUP,
                     scale_dtype: DType::F16,
                 },
                 Codec::Affine {
                     bits: 4,
-                    group: 0,
+                    group: AFFINE_GROUP,
                     scale_dtype: DType::F16,
                 },
             ),
@@ -436,8 +440,8 @@ mod tests {
     }
 
     #[test]
-    fn head_vectors_are_codec_groups() {
-        // Qwen3.5-4B attention history: 4 kv heads of 256.
+    fn head_vectors_split_into_affine_groups() {
+        // Qwen3.5-4B attention history: 4 kv heads of 256, 8 groups each.
         let affine =
             ComponentDescriptor::new(LayerRef::Target(3), KvCodec::AffineK8V4.spec(DType::BF16, 256, 256), 4)
                 .unwrap();
@@ -449,12 +453,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 (VectorKind::Key, PlaneName::Codes, DType::U32, vec![4, 64], 1024),
-                (VectorKind::Key, PlaneName::Coefficients, DType::F16, vec![4, 2], 16),
+                (VectorKind::Key, PlaneName::Coefficients, DType::F16, vec![4, 16], 128),
                 (VectorKind::Value, PlaneName::Codes, DType::U32, vec![4, 32], 512),
-                (VectorKind::Value, PlaneName::Coefficients, DType::F16, vec![4, 2], 16),
+                (VectorKind::Value, PlaneName::Coefficients, DType::F16, vec![4, 16], 128),
             ]
         );
-        assert_eq!(affine.row_bytes().unwrap(), 1568);
+        assert_eq!(affine.row_bytes().unwrap(), 1792);
+        assert!(matches!(
+            ComponentDescriptor::new(LayerRef::Target(3), KvCodec::AffineK8V4.spec(DType::BF16, 48, 48), 1),
+            Err(LayoutError::InvalidGroup { width: 48, group: AFFINE_GROUP })
+        ));
         let dense =
             ComponentDescriptor::new(LayerRef::Target(3), KvCodec::Dense.spec(DType::BF16, 256, 256), 4)
                 .unwrap();
@@ -476,7 +484,7 @@ mod tests {
             affine.key,
             Codec::Affine {
                 bits: 8,
-                group: 0,
+                group: 32,
                 scale_dtype: DType::F16,
             }
         );
@@ -484,7 +492,7 @@ mod tests {
             affine.value,
             Codec::Affine {
                 bits: 4,
-                group: 0,
+                group: 32,
                 scale_dtype: DType::F16,
             }
         );

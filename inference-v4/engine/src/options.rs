@@ -69,7 +69,7 @@ impl Default for ModelPolicy {
         Self {
             method: ModelMethod::Auto,
             mtp_proposals: None,
-            kv_codec: KvCodec::Dense,
+            kv_codec: KvCodec::AffineK8V4,
             lookahead: true,
         }
     }
@@ -406,7 +406,7 @@ mod tests {
     fn defaults_resolve_after_artifact_inspection() {
         let plain = ModelPolicy::default().resolve(&definition(false)).unwrap();
         assert_eq!(plain.method, ResolvedMethod::Plain);
-        assert_eq!(plain.kv_codec, KvCodec::Dense);
+        assert_eq!(plain.kv_codec, KvCodec::AffineK8V4);
 
         let mtp = ModelPolicy::default().resolve(&definition(true)).unwrap();
         assert_eq!(

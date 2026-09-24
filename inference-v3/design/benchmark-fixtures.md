@@ -84,10 +84,17 @@ No numerical tolerance changes follow from this distinction.
 
 ### Session-bench prose
 
-`--prose` uses the same pinned book with a chat continuation recipe,
+`--workload prose-continue` uses the same pinned book with a chat continuation recipe,
 `prose-chat-history-v1`. It wraps each passage in a request to return only its prose
 continuation. This differs from the model benchmark's raw, unwrapped token window;
 the recipe identity keeps those observations distinct.
+
+`--workload prose-repeat` uses `prose-repeat-history-v1`: the passage is rendered single-spaced
+with ASCII quotes, starts at "Call me Ishmael." in every independent session, and is wrapped
+in a request to copy it exactly. The requested output is therefore the same text at every
+checkpoint. Its corpus identity adds the workload to the book's provenance. A session's
+canonical answer is the passage's first 128 words, and its next request copies the text
+after the passage.
 
 An independent reading session begins at the book's start. Preparation extends a
 contiguous passage at word boundaries until the first target's rendered prompt reaches

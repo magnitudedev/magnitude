@@ -123,7 +123,7 @@ def test_command_roundtrip_preserves_configuration_and_resize_order(tmp_path):
         needle_depth=0.8,
     )
     args = cli.parser().parse_args(shlex.split(command)[4:])
-    assert args.retrieval and not args.prose and args.category is None
+    assert args.workload == "retrieval" and args.category is None
     assert (args.retrieval_seed, args.retrieval_variant, args.retrieval_queries) == (
         17,
         "multiquery",
@@ -132,9 +132,10 @@ def test_command_roundtrip_preserves_configuration_and_resize_order(tmp_path):
     assert args.needle_depth == 0.8
     assert cli.contexts(args.context, preserve_order=True) == (4096, 16384, 4096)
     for flags in (
-        ("--retrieval", "--category", "all"),
+        ("--workload", "retrieval", "--category", "all"),
         ("--retrieval-seed", "3"),
-        ("--retrieval", "--needle-depth", "nan"),
+        ("--workload", "prose-repeat", "--retrieval-seed", "3"),
+        ("--workload", "retrieval", "--needle-depth", "nan"),
     ):
         assert cli.main(["run", "--target", f"magnitude={tmp_path}", *flags]) == 2
 
@@ -165,7 +166,7 @@ async def test_retrieval_real_process_run_and_score_denominators(
     assert all(row["retrieval"]["exact_accuracy"] == 1 for row in result["rows"])
     assert any("retrieval 4/4" in line for line in progress)
     path = Path(result["path"])
-    assert "--retrieval" in (path / "command.txt").read_text()
+    assert "--workload retrieval" in (path / "command.txt").read_text()
     assert "Exact answers" in (path / "report.md").read_text()
     rows = [json.loads(line) for line in (path / "results.jsonl").read_text().splitlines()]
     measured = next(row for row in rows if row["phase"] == "measured")

@@ -205,45 +205,73 @@ pub fn silu(x: f64) -> f64 {
 /// larger counts run the GEMM.
 pub const GEMV_ROWS: usize = 16;
 
-/// A native mapping: GEMV K split, GEMM BM, the GEMM's INT8 operand path and
-/// the GEMM split-K (entries without SPLIT ignore it).
+/// The largest row count the small-band GEMM serves
+/// (`projection::SMALL_GEMM_ROWS`); larger counts run the large-band GEMM.
+pub const SMALL_GEMM_ROWS: usize = 64;
+
+/// A native mapping: the GEMV K split and the small-band GEMM's INT8 operand
+/// path (the large-band GEMM is the 16-bit path).
 #[derive(Clone, Copy, Debug)]
 pub struct Mapping {
     pub ksplit: u64,
-    pub bm: u64,
     pub int8: u64,
-    pub split: u64,
 }
 
 impl Mapping {
-    /// The specialization params of an entry; `split` only for entries
-    /// declaring SPLIT.
-    pub fn params(self, spec: seismic::NativeSpecialization, split: bool) -> seismic::NativeSpecialization {
-        let spec = spec.with_param("KSPLIT", self.ksplit).with_param("BM", self.bm).with_param("INT8", self.int8);
-        if split { spec.with_param("SPLIT", self.split) } else { spec }
+    /// The specialization params of a K1 entry declaring KSPLIT and INT8.
+    pub fn params(self, spec: seismic::NativeSpecialization) -> seismic::NativeSpecialization {
+        spec.with_param("KSPLIT", self.ksplit).with_param("INT8", self.int8)
     }
-    /// Whether `rows` rows run the INT8 path (only the GEMM has one).
+    /// The specialization params of a head entry (KSPLIT only; its GEMMs
+    /// are the 16-bit path).
+    pub fn head_params(self, spec: seismic::NativeSpecialization) -> seismic::NativeSpecialization {
+        spec.with_param("KSPLIT", self.ksplit)
+    }
+    /// Whether `rows` rows run the INT8 path (only the small-band GEMM has
+    /// one).
     pub fn quantizes(self, rows: usize) -> bool {
-        self.int8 == 1 && rows > GEMV_ROWS
+        self.int8 == 1 && rows > GEMV_ROWS && rows <= SMALL_GEMM_ROWS
     }
 }
 
 /// GEMV mappings. INT8 1 is included to show the GEMV ignores it.
 pub const GEMV_MAPPINGS: [Mapping; 4] = [
-    Mapping { ksplit: 4, bm: 64, int8: 0, split: 1 },
-    Mapping { ksplit: 2, bm: 64, int8: 0, split: 1 },
-    Mapping { ksplit: 8, bm: 64, int8: 1, split: 1 },
-    Mapping { ksplit: 4, bm: 64, int8: 1, split: 1 },
+    Mapping { ksplit: 4, int8: 0 },
+    Mapping { ksplit: 2, int8: 0 },
+    Mapping { ksplit: 8, int8: 1 },
+    Mapping { ksplit: 4, int8: 1 },
 ];
-pub const GEMM_MAPPINGS: [Mapping; 4] = [
-    Mapping { ksplit: 4, bm: 64, int8: 0, split: 1 },
-    Mapping { ksplit: 4, bm: 128, int8: 0, split: 2 },
-    Mapping { ksplit: 4, bm: 64, int8: 1, split: 2 },
-    Mapping { ksplit: 4, bm: 128, int8: 1, split: 1 },
-];
+/// GEMM mappings: both operand paths (the large band ignores INT8).
+pub const GEMM_MAPPINGS: [Mapping; 2] = [Mapping { ksplit: 4, int8: 0 }, Mapping { ksplit: 4, int8: 1 }];
 
 pub fn mappings(m: usize) -> &'static [Mapping] {
     if m <= GEMV_ROWS { &GEMV_MAPPINGS } else { &GEMM_MAPPINGS }
+}
+
+/// The row counts of a timing sweep: `CUDA_TIMING_ROWS` (comma-separated)
+/// or `default`.
+pub fn timing_rows(default: &[usize]) -> Vec<usize> {
+    match std::env::var("CUDA_TIMING_ROWS") {
+        Ok(list) => list.split(',').map(|rows| rows.trim().parse().expect("CUDA_TIMING_ROWS: row counts")).collect(),
+        Err(_) => default.to_vec(),
+    }
+}
+
+/// The formats of a timing sweep: `CUDA_TIMING_FORMATS` (comma-separated
+/// representation names, e.g. `q4k,q6k`) or every format.
+pub fn timing_formats() -> Vec<Format> {
+    match std::env::var("CUDA_TIMING_FORMATS") {
+        Ok(list) => list
+            .split(',')
+            .map(|name| {
+                *Format::ALL
+                    .iter()
+                    .find(|format| format.representation() == name.trim())
+                    .expect("CUDA_TIMING_FORMATS: q4k, q5k, q6k or q8g32s")
+            })
+            .collect(),
+        Err(_) => Format::ALL.to_vec(),
+    }
 }
 
 /// q8_1 quantization of rows of `k` as the INT8 path forms them: per 32
@@ -278,11 +306,11 @@ pub fn slack_bound(slack: &[f32], w: &[f64], m: usize, n: usize, k: usize) -> Ve
 }
 
 /// The bound of the 16-bit GEMM's weight dequantization (rows > GEMV_ROWS,
-/// INT8 off): each weight becomes round_A(code * round_A(scale) -
-/// round_A(bias)), off by at most 2^-9 (|code * scale| + |bias| + |value|)
+/// not on the INT8 path): each weight becomes round_A(code * round_A(scale)
+/// - round_A(bias)), off by at most 2^-9 (|code * scale| + |bias| + |value|)
 /// <= 2^-7 max_row |w| in bf16; zero on every other path.
 pub fn dequant_bound(x: &[f32], w: &[f64], m: usize, n: usize, k: usize, mapping: Mapping) -> Vec<f64> {
-    if m <= GEMV_ROWS || mapping.int8 == 1 {
+    if m <= GEMV_ROWS || mapping.quantizes(m) {
         return vec![0.0; m * n];
     }
     let maximum: Vec<f64> =

@@ -85,10 +85,7 @@ fn expand_kernel(
             UW: format.resident(),
             A: Element::bf16(),
         },
-        &mapping.params(
-            NativeSpecialization::new().with_static("H", case.h as u64).with_static("F", case.f as u64),
-            false,
-        ),
+        &mapping.params(NativeSpecialization::new().with_static("H", case.h as u64).with_static("F", case.f as u64)),
     )
     .unwrap()
 }
@@ -103,7 +100,7 @@ fn output_kernel(
     qwen_dense_output::native_for_device_with(
         device,
         qwen_dense_output::Elements { DW: format.resident(), A: Element::bf16() },
-        &mapping.params(NativeSpecialization::new().with_static("H", h as u64).with_static("F", f as u64), true),
+        &mapping.params(NativeSpecialization::new().with_static("H", h as u64).with_static("F", f as u64)),
     )
     .unwrap()
 }
@@ -204,16 +201,14 @@ fn cuda_dense_weights_match_host_model() {
         let norm = f32_tensor(&device, &[h as u64], &case.norm);
         let out_rows = i32_tensor(&device, &[o as u64], &case.out_rows);
         for &mapping in mappings(o) {
-            let spec = |split| {
-                mapping.params(NativeSpecialization::new().with_static("H", h as u64).with_static("F", f as u64), split)
-            };
+            let spec = mapping.params(NativeSpecialization::new().with_static("H", h as u64).with_static("F", f as u64));
             // INT8 has no effect with dense weights: every mapping runs the
             // 16-bit path.
             let (expected, tolerance) = case.expand(&gate, &up, Mapping { int8: 0, ..mapping });
             let product = qwen_dense_expand::native_for_device_with(
                 &device,
                 qwen_dense_expand::Elements { NW: Element::f32(), GW: bf16, UW: bf16, A: bf16 },
-                &spec(false),
+                &spec,
             )
             .unwrap()
             .call(qwen_dense_expand::Args {
@@ -239,7 +234,7 @@ fn cuda_dense_weights_match_host_model() {
             let result = qwen_dense_output::native_for_device_with(
                 &device,
                 qwen_dense_output::Elements { DW: bf16, A: bf16 },
-                &spec(true),
+                &spec,
             )
             .unwrap()
             .call(qwen_dense_output::Args {
@@ -275,7 +270,7 @@ fn cuda_gemv_rows_match_single_row_bits() {
             let expand = qwen_dense_expand::native_for_device_with(
                 &device,
                 qwen_dense_expand::Elements { NW: Element::f32(), GW: format.resident(), UW: format.resident(), A: Element::bf16() },
-                &mapping.params(NativeSpecialization::new().with_static("H", h as u64).with_static("F", f as u64), false),
+                &mapping.params(NativeSpecialization::new().with_static("H", h as u64).with_static("F", f as u64)),
             )
             .unwrap();
             let output = output_kernel(&device, format, h, f, mapping);
@@ -347,11 +342,12 @@ fn cuda_head_rows_match_host_model() {
             let norm = f32_tensor(&device, &[d as u64], &case.norm);
             let out_rows = i32_tensor(&device, &[o as u64], &case.out_rows);
             for &mapping in mappings(o) {
-                let (expected, tolerance) = head_expected(&case, &head, v, mapping);
+                // The head's GEMMs are the 16-bit path.
+                let (expected, tolerance) = head_expected(&case, &head, v, Mapping { int8: 0, ..mapping });
                 let logits = readout_head_rows::native_for_device_with(
                     &device,
                     readout_head_rows::Elements { NW: Element::f32(), OW: format.resident(), A: Element::bf16() },
-                    &mapping.params(NativeSpecialization::new().with_static("V", v as u64).with_static("D", d as u64), false),
+                    &mapping.head_params(NativeSpecialization::new().with_static("V", v as u64).with_static("D", d as u64)),
                 )
                 .unwrap()
                 .call(readout_head_rows::Args {
@@ -764,14 +760,14 @@ fn cuda_projection_timings() {
     let (h, f) = (2560usize, 9216usize);
     // Rotations exceed the 24 MiB L2.
     let rotation = 4;
-    for format in [Format::Q4K, Format::Q6K, Format::Q5K, Format::Q8] {
+    for format in timing_formats() {
         let gates: Vec<Tensor> = (0..rotation).map(|_| timing_weight(&device, format, f, h)).collect();
         let ups: Vec<Tensor> = (0..rotation).map(|_| timing_weight(&device, format, f, h)).collect();
         let downs: Vec<Tensor> = (0..rotation).map(|_| timing_weight(&device, format, h, f)).collect();
         let expand_bytes = gates[0].byte_len() as f64 * 2.0;
         let output_bytes = downs[0].byte_len() as f64;
         // Decode, the verification / concurrency curve (MTP), prefill.
-        for m in [1usize, 2, 4, 8, 12, 16, 32, 128] {
+        for m in timing_rows(&[1, 2, 4, 8, 12, 16, 32, 128, 256, 512]) {
             let case = DenseCase::new(m, h, f, &mut rng);
             let residual = f32_tensor(&device, &[case.m as u64, h as u64], &case.residual);
             let norm = f32_tensor(&device, &[h as u64], &case.norm);
@@ -837,7 +833,7 @@ fn cuda_head_timings() {
             let kernel = readout_head_rows::native_for_device_with(
                 &device,
                 readout_head_rows::Elements { NW: Element::f32(), OW: Format::Q6K.resident(), A: Element::bf16() },
-                &mapping.params(NativeSpecialization::new().with_static("V", v as u64).with_static("D", d as u64), false),
+                &mapping.head_params(NativeSpecialization::new().with_static("V", v as u64).with_static("D", d as u64)),
             )
             .unwrap();
             let args = heads

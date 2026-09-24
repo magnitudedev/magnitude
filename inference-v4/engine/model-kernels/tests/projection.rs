@@ -436,8 +436,9 @@ fn read_act(act: Act, tensor: &Tensor) -> Vec<f32> {
 /// A K1 mapping: the GEMV threadgroup (SIMDGROUPS x ROWS lane groups of
 /// LANES lanes), the first row count served by the batched GEMV (BATCH_FROM;
 /// smaller classes run the GEMV), the batched threadgroup (BATCH_SIMDGROUPS x
-/// BATCH_ROWS blocks of 8 weight rows), the GEMM tile (TILE_M x TILE_N) and,
-/// for the small-N output projections, the split-K factor.
+/// BATCH_ROWS blocks of 8 weight rows), the GEMM tile (TILE_M x TILE_N; on
+/// Vulkan over subgroups of SUB_M x SUB_N) and, for the small-N output
+/// projections, the split-K factor.
 #[derive(Clone, Copy, Debug)]
 struct Mapping {
     simdgroups: u64,
@@ -448,6 +449,8 @@ struct Mapping {
     batch_rows: u64,
     tile_m: u64,
     tile_n: u64,
+    sub_m: u64,
+    sub_n: u64,
     split: u64,
 }
 
@@ -462,15 +465,17 @@ const fn gemm_mapping(tile_m: u64, tile_n: u64, split: u64) -> Mapping {
         batch_rows: 2,
         tile_m,
         tile_n,
+        sub_m: 32,
+        sub_n: 32,
         split,
     }
 }
 
 const MAPPINGS: [Mapping; 4] = [
-    Mapping { simdgroups: 4, rows: 1, lanes: 32, batch_from: 3, batch_simdgroups: 4, batch_rows: 1, tile_m: 64, tile_n: 64, split: 1 },
-    Mapping { simdgroups: 2, rows: 4, lanes: 16, batch_from: 9, batch_simdgroups: 16, batch_rows: 2, tile_m: 128, tile_n: 64, split: 2 },
-    Mapping { simdgroups: 32, rows: 2, lanes: 32, batch_from: 5, batch_simdgroups: 8, batch_rows: 4, tile_m: 32, tile_n: 128, split: 4 },
-    Mapping { simdgroups: 16, rows: 2, lanes: 16, batch_from: 3, batch_simdgroups: 32, batch_rows: 1, tile_m: 64, tile_n: 128, split: 2 },
+    Mapping { simdgroups: 4, rows: 1, lanes: 32, batch_from: 3, batch_simdgroups: 4, batch_rows: 1, tile_m: 64, tile_n: 64, sub_m: 64, sub_n: 64, split: 1 },
+    Mapping { simdgroups: 2, rows: 4, lanes: 16, batch_from: 9, batch_simdgroups: 16, batch_rows: 2, tile_m: 128, tile_n: 64, sub_m: 64, sub_n: 32, split: 2 },
+    Mapping { simdgroups: 32, rows: 2, lanes: 32, batch_from: 5, batch_simdgroups: 8, batch_rows: 4, tile_m: 32, tile_n: 128, sub_m: 32, sub_n: 64, split: 4 },
+    Mapping { simdgroups: 16, rows: 2, lanes: 16, batch_from: 3, batch_simdgroups: 32, batch_rows: 1, tile_m: 64, tile_n: 128, sub_m: 32, sub_n: 32, split: 2 },
 ];
 
 /// Relative bound on the reassociation error of a dot product over
@@ -505,14 +510,15 @@ fn specialization(statics: &[(&str, usize)], mapping: Mapping) -> NativeSpeciali
         .with_param("LANES", mapping.lanes)
         .with_param("TILE_M", mapping.tile_m)
         .with_param("TILE_N", mapping.tile_n);
-    // Vulkan has no batched GEMV class (its GEMV serves M <= 8).
+    // Vulkan has no batched GEMV class (its GEMV serves M <= 8) and maps the
+    // GEMM tile onto subgroup tiles.
     if cfg!(target_os = "macos") {
         specialization
             .with_param("BATCH_FROM", mapping.batch_from)
             .with_param("BATCH_SIMDGROUPS", mapping.batch_simdgroups)
             .with_param("BATCH_ROWS", mapping.batch_rows)
     } else {
-        specialization
+        specialization.with_param("SUB_M", mapping.sub_m).with_param("SUB_N", mapping.sub_n)
     }
 }
 

@@ -6,7 +6,7 @@
 
 use magnitude_model_executor::{
     Completion, DomainError, DomainRequirements, GroupKey, HeadFlight, NativeFamily, Operation,
-    ProgramFamily, ReservedResources, StateFlight, TargetFlight, VisionFlight,
+    ProgramFamily, ReservedResources, TargetFlight, VisionFlight,
 };
 pub use magnitude_model_executor::{DomainCheckpoint, ExecutorDomain};
 
@@ -14,7 +14,6 @@ pub use magnitude_model_executor::{DomainCheckpoint, ExecutorDomain};
 pub enum DomainLane {
     Target,
     Head,
-    Repair,
     Encoder,
 }
 
@@ -23,7 +22,6 @@ impl DomainLane {
         match operation {
             Operation::Forward { .. } => Self::Target,
             Operation::Head { .. } => Self::Head,
-            Operation::Repair { .. } => Self::Repair,
             Operation::Encode { .. } => Self::Encoder,
         }
     }
@@ -89,7 +87,6 @@ pub enum DomainFlight<F: ProgramFamily = NativeFamily> {
     Target(TargetFlight<F::TargetSubmission>),
     Head(HeadFlight<F::HeadSubmission>),
     Vision(VisionFlight<F::VisionSubmission>),
-    Repair(StateFlight<F::StateSubmission>),
 }
 
 pub fn submit_group<F: ProgramFamily>(
@@ -106,16 +103,6 @@ pub fn submit_group<F: ProgramFamily>(
             domain
                 .submit_head(operations, graph_workspace, graph_output, advances)
                 .map(DomainFlight::Head)
-        }
-        (DomainLane::Repair, ReservedResources::Repair(reservation)) => {
-            let [Operation::Repair { request, .. }] = operations else {
-                return Err(DomainError::Input(
-                    "repair group must contain one operation".into(),
-                ));
-            };
-            domain
-                .submit_repair(*request, reservation)
-                .map(DomainFlight::Repair)
         }
         (DomainLane::Encoder, ReservedResources::Vision(workspace, output)) => {
             let [operation @ Operation::Encode { .. }] = operations else {
@@ -158,7 +145,6 @@ impl<F: ProgramFamily> DomainFlight<F> {
             Self::Target(flight) => flight.completion(),
             Self::Head(flight) => flight.completion(),
             Self::Vision(flight) => flight.completion(),
-            Self::Repair(flight) => flight.completion(),
         }
     }
 }

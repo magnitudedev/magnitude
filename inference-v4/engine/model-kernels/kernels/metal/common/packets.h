@@ -17,9 +17,8 @@
 // conversion costs several times a half subtraction.
 //
 // A packet's logical value is `scale(g) * code + bias(g)` for its coefficient
-// group g. Dot products are factored: `scale * dot(code, x) + bias * sum(x)`,
-// where the activation sums per 16 elements are computed once per staged
-// activation and reused by every weight row.
+// group g, dequantized with one F32 rounding (`value`, or the fused
+// `fma(scale, code, bias)` of whole steps).
 //
 // Weight tensors are bound to slots before this file is included:
 //     #define KERNEL_W0 SEISMIC_GATE_WEIGHT
@@ -90,8 +89,6 @@ inline float2 code_pair(uint two, half offset) {
 
 struct Q4K {
     static constant constexpr uint groups = 1;       // coefficient groups per packet
-    static constant constexpr uint group_size = 32;
-    static constant constexpr bool biased = true;
     struct packet {
         uint4 low;
         float scale;
@@ -129,8 +126,6 @@ struct Q4K {
 // q5k: q4k plus one high bit per code (code = low + 16*high).
 struct Q5K {
     static constant constexpr uint groups = 1;
-    static constant constexpr uint group_size = 32;
-    static constant constexpr bool biased = true;
     struct packet {
         uint4 low;
         uint high;
@@ -172,8 +167,6 @@ struct Q5K {
 // 16 and per-256 d: value = d*scale8*(code - 32).
 struct Q6K {
     static constant constexpr uint groups = 2;
-    static constant constexpr uint group_size = 16;
-    static constant constexpr bool biased = true;
     struct packet {
         uint4 low;
         uint2 high;
@@ -214,8 +207,6 @@ struct Q6K {
 // q8 (q8g32s): int8 codes, one f16 scale per 32.
 struct Q8 {
     static constant constexpr uint groups = 1;
-    static constant constexpr uint group_size = 32;
-    static constant constexpr bool biased = false;
     struct packet {
         uint4 first;
         uint4 second;
@@ -254,8 +245,6 @@ struct Q8 {
 template <typename E>
 struct Dense {
     static constant constexpr uint groups = 1;
-    static constant constexpr uint group_size = 32;
-    static constant constexpr bool biased = false;
     struct packet {
         device const uchar *values;
         uint valid;   // elements of this packet inside the row

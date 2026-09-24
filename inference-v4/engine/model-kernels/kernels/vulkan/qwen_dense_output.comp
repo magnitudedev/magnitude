@@ -64,10 +64,12 @@ void qwen_dense_output_gemv() {
 void qwen_dense_output_gemm() {
     const uint m = uint(SEISMIC_DIM_O), n = uint(SEISMIC_DIM_H), k = uint(SEISMIC_DIM_F);
 #if SEISMIC_TUNE_SPLIT == 1
-    projection_gemm(DOWN_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, dense_output_input(), dense_output_output(),
+    projection_gemm(DOWN_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
+        dense_output_input(), dense_output_output(),
         dense_output_down(), m, n, k, gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
 #else
-    projection_gemm_part(DOWN_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, dense_output_input(),
+    projection_gemm_part(DOWN_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
+        dense_output_input(),
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), dense_output_down(), m, n, k, SEISMIC_TUNE_SPLIT,
         gl_WorkGroupID.z, gl_WorkGroupID.y, gl_WorkGroupID.x);
 #endif

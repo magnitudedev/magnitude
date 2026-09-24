@@ -113,14 +113,19 @@ pub struct Row {
 }
 
 /// A request-local run of rows. Slots are packed in scheduler order.
-/// Recurrent entries read the slot's state from bank `bank` and publish its
-/// successor to bank `following_bank`; a successor is never the zero seed
-/// (bank 0), the slot's own bank, or another slot's successor.
+/// Recurrent entries read the slot's state from version (`bank`,
+/// `previous_tape`): the bank's state advanced by that many of its tape rows.
+/// They publish the state after the first `stop` rows to bank
+/// `following_bank` and record the rows after `stop` on its tape. A
+/// successor is never the zero seed (bank 0), the slot's own bank, or another
+/// slot's successor.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Slot {
     pub rows: Vec<Row>,
     pub bank: i32,
+    pub previous_tape: i32,
     pub following_bank: i32,
+    pub stop: i32,
 }
 
 /// Fully padded logical row tables.
@@ -141,7 +146,9 @@ pub struct PackedRowTables {
     pub demand: Vec<u32>,
     pub segments: Vec<[i32; 2]>,
     pub bank: Vec<i32>,
+    pub previous_tape: Vec<i32>,
     pub following_bank: Vec<i32>,
+    pub stop: Vec<i32>,
     pub plane_base: Vec<i32>,
     pub out_rows: Vec<i32>,
     pub select_rows: Vec<i32>,
@@ -168,6 +175,12 @@ pub enum PackError {
         slot: usize,
         bank: i32,
         following_bank: i32,
+    },
+    /// A negative read tape, or a publication point outside the slot's rows.
+    InvalidRecurrentVersion {
+        slot: usize,
+        previous_tape: i32,
+        stop: i32,
     },
     InvalidToken {
         row: usize,
@@ -233,6 +246,14 @@ impl fmt::Display for PackError {
             } => write!(
                 f,
                 "slot {slot} successor bank {following_bank} is the zero seed, its own bank {bank}, or another slot's successor"
+            ),
+            Self::InvalidRecurrentVersion {
+                slot,
+                previous_tape,
+                stop,
+            } => write!(
+                f,
+                "slot {slot} reads tape rows {previous_tape} or publishes after {stop} rows outside the slot"
             ),
             Self::InvalidToken { row, token } => write!(f, "row {row} has invalid token {token}"),
             Self::InvalidCoordinates { row, coordinates } => {
@@ -337,6 +358,16 @@ impl PackedRowTables {
                     following_bank: slot.following_bank,
                 });
             }
+            if slot.previous_tape < 0
+                || slot.stop < 1
+                || usize::try_from(slot.stop).is_ok_and(|stop| stop > slot.rows.len())
+            {
+                return Err(PackError::InvalidRecurrentVersion {
+                    slot: slot_index,
+                    previous_tape: slot.previous_tape,
+                    stop: slot.stop,
+                });
+            }
             for row in &slot.rows {
                 let index = normalized.len();
                 if row.token < 0 {
@@ -390,7 +421,9 @@ impl PackedRowTables {
             demand: vec![0; m],
             segments: vec![[m_i32, m_i32]; padded_slots + 1],
             bank: vec![-1; padded_slots + 1],
+            previous_tape: vec![0; padded_slots + 1],
             following_bank: vec![-1; padded_slots + 1],
+            stop: vec![0; padded_slots + 1],
             plane_base: vec![0; padded_slots + 1],
             out_rows: Vec::new(),
             select_rows: Vec::new(),
@@ -408,7 +441,9 @@ impl PackedRowTables {
             packed.segments[slot_index] =
                 [as_i32(lo, "segment start")?, as_i32(hi, "segment end")?];
             packed.bank[slot_index] = slot.bank;
+            packed.previous_tape[slot_index] = slot.previous_tape;
             packed.following_bank[slot_index] = slot.following_bank;
+            packed.stop[slot_index] = slot.stop;
             for row in &slot.rows {
                 packed.tokens[row_index] = row.token;
                 packed.coordinates[row_index] = row.coordinates;
@@ -561,17 +596,23 @@ mod tests {
                     row(3, Demand::NONE),
                 ],
                 bank: 7,
+                previous_tape: 2,
                 following_bank: 8,
+                stop: 1,
             },
             Slot {
                 rows: vec![row(4, Demand::LOGITS)],
                 bank: 9,
+                previous_tape: 0,
                 following_bank: 10,
+                stop: 1,
             },
             Slot {
                 rows: vec![row(5, Demand::NONE), row(6, Demand::NONE)],
                 bank: 11,
+                previous_tape: 0,
                 following_bank: 12,
+                stop: 2,
             },
         ];
         let packed = PackedRowTables::pack(&slots, 33, 512).unwrap();
@@ -582,7 +623,9 @@ mod tests {
             vec![[0, 3], [3, 4], [4, 6], [8, 8], [8, 8]]
         );
         assert_eq!(packed.bank, vec![7, 9, 11, -1, -1]);
+        assert_eq!(packed.previous_tape, vec![2, 0, 0, 0, 0]);
         assert_eq!(packed.following_bank, vec![8, 10, 12, -1, -1]);
+        assert_eq!(packed.stop, vec![1, 1, 2, 0, 0]);
         assert_eq!(&packed.row_slots[..6], &[0, 0, 0, 1, 2, 2]);
         assert_eq!(&packed.row_slots[6..], &[4, 4]);
         assert_eq!(
@@ -615,7 +658,9 @@ mod tests {
                     both,
                 ],
                 bank: 0,
+                previous_tape: 0,
                 following_bank: 1,
+                stop: 1,
             }],
             33,
             512,
@@ -644,7 +689,9 @@ mod tests {
                 &[Slot {
                     rows: vec![],
                     bank: 0,
+                    previous_tape: 0,
                     following_bank: 1,
+                    stop: 1,
                 }],
                 32,
                 512
@@ -658,7 +705,9 @@ mod tests {
                 &[Slot {
                     rows: vec![bad.clone()],
                     bank: 0,
+                    previous_tape: 0,
                     following_bank: 1,
+                    stop: 1,
                 }],
                 32,
                 512
@@ -671,7 +720,9 @@ mod tests {
                 &[Slot {
                     rows: vec![bad],
                     bank: 0,
+                    previous_tape: 0,
                     following_bank: 1,
+                    stop: 1,
                 }],
                 32,
                 512
@@ -687,7 +738,9 @@ mod tests {
                     &[Slot {
                         rows: vec![bad_range],
                         bank: 0,
+                        previous_tape: 0,
                         following_bank: 1,
+                        stop: 1,
                     }],
                     32,
                     512
@@ -705,7 +758,9 @@ mod tests {
             &[Slot {
                 rows: vec![moved],
                 bank: 0,
+                previous_tape: 0,
                 following_bank: 1,
+                stop: 1,
             }],
             32,
             512,
@@ -724,7 +779,9 @@ mod tests {
                     .map(|&(bank, following_bank)| Slot {
                         rows: vec![row(1, Demand::NONE)],
                         bank,
+                        previous_tape: 0,
                         following_bank,
+                        stop: 1,
                     })
                     .collect::<Vec<_>>(),
                 32,
@@ -741,6 +798,31 @@ mod tests {
             assert!(matches!(
                 pack(slots),
                 Err(PackError::InvalidFollowingBank { slot: actual, .. }) if actual == slot
+            ));
+        }
+    }
+
+    #[test]
+    fn recurrent_versions_are_validated_per_slot() {
+        let pack = |previous_tape: i32, stop: i32| {
+            PackedRowTables::pack(
+                &[Slot {
+                    rows: vec![row(1, Demand::NONE), row(2, Demand::NONE)],
+                    bank: 0,
+                    previous_tape,
+                    following_bank: 1,
+                    stop,
+                }],
+                32,
+                512,
+            )
+        };
+        assert!(pack(3, 1).is_ok());
+        assert!(pack(0, 2).is_ok());
+        for (previous_tape, stop) in [(-1, 1), (0, 0), (0, 3)] {
+            assert!(matches!(
+                pack(previous_tape, stop),
+                Err(PackError::InvalidRecurrentVersion { slot: 0, .. })
             ));
         }
     }

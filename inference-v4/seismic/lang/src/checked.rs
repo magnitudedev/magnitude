@@ -1,9 +1,18 @@
 //! The opaque checked module (spec §3.2).
 //!
-//! Exactly two constructors exist: [`check_source`] and
-//! [`crate::bundle::decode_checked_bundle`]. There is no struct literal,
-//! `Default`, unchecked deserializer, arena mutation, or constructor that
-//! accepts already-typed nodes. Consumers read through accessors and obtain a
+//! Exactly two constructors exist, one per kind of input:
+//!
+//! - [`check_source`] parses and checks source text: files, the dynamic
+//!   API's inline source, development overrides, and the source section of a
+//!   bundle file that arrives from outside the binary
+//!   ([`crate::bundle::check_bundle_sources`]).
+//! - [`crate::bundle::decode_checked_bundle`] decodes the checked module a
+//!   bundle embedded by `seismic-build` carries: the output of the build's
+//!   checker, validated structurally and never re-checked.
+//!
+//! There is no struct literal, `Default`, deserializer outside the bundle
+//! decoder's context, arena mutation, or constructor that accepts
+//! already-typed nodes. Consumers read through accessors and obtain a
 //! [`LogicalEntry`] through [`CheckedModule::entry`], the only builder of
 //! entry semantics.
 //!
@@ -14,6 +23,7 @@ use crate::ids::{EntryId, ModuleHash, RepresentationId, StableEntryId};
 use crate::registry::{self, BackendName, RepresentationAccess, RepresentationKind};
 use crate::span::Span;
 use crate::types::DType;
+use serde::{Deserialize, Serialize};
 
 /// One source file. Paths are diagnostic labels; they grant nothing.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -397,11 +407,21 @@ impl CheckedModule {
     pub(crate) fn internal(&self) -> &internals::Module {
         &self.inner
     }
+
+    /// The bundle decoder's constructor: a module the build's checker
+    /// produced, decoded and structurally validated by
+    /// [`crate::bundle::decode_checked_bundle`].
+    pub(crate) fn decoded(inner: internals::Module) -> Self {
+        Self {
+            inner,
+            assets: Default::default(),
+        }
+    }
 }
 
 /// Summary of one entry sufficient for binding generation before
 /// monomorphization.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryInfo {
     pub id: EntryId,
     pub stable: StableEntryId,
@@ -421,21 +441,21 @@ pub struct EntryInfo {
 
 /// The admissible bindings of an entry's element parameters, computed by the
 /// checker. The only owner of binding legality.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ElementDomain {
     parameters: Vec<ElementParameter>,
     conversions: Vec<ElementConversion>,
 }
 
 /// One element parameter and every use the entry makes of it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ElementParameter {
     pub name: String,
     pub uses: ElementUses,
 }
 
 /// How an entry uses the elements of one element parameter.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ElementUses {
     pub decoded_read: bool,
     pub stored: bool,
@@ -445,13 +465,13 @@ pub struct ElementUses {
 }
 
 /// `repack[U = target](t)` with `t: tensor[..] source`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ElementConversion {
     pub source: String,
     pub target: ElementTarget,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ElementTarget {
     Parameter(String),
     Concrete(RepresentationId),
@@ -599,7 +619,7 @@ impl ElementDomain {
 }
 
 /// Read-only signature structure projected from checked source types.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SignatureType {
     Unit,
     Tuple(Vec<SignatureType>),
@@ -610,7 +630,7 @@ pub enum SignatureType {
 }
 
 /// One direct top-level native implementation attached to a checked entry.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeImplementation {
     pub entry: EntryId,
     pub backend: BackendName,
@@ -633,7 +653,7 @@ pub struct NativeImplementation {
 }
 
 /// A tuning parameter with its finite domain. `values[0]` is the default.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeParameter {
     pub name: String,
     /// The parameter changes the arithmetic order of a row's result. Other
@@ -642,7 +662,7 @@ pub struct NativeParameter {
     pub values: Vec<u64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativeComparison {
     Lt,
     Le,
@@ -654,7 +674,7 @@ pub enum NativeComparison {
 
 /// A boolean formula over native natural-number expressions: a native
 /// `where` or `when` condition.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativeCondition {
     Compare {
         comparison: NativeComparison,
@@ -666,7 +686,7 @@ pub enum NativeCondition {
 }
 
 /// Call-private device memory of one native call.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeScratch {
     pub name: String,
     pub bytes: NativeNatExpr,
@@ -677,7 +697,7 @@ pub struct NativeScratch {
 }
 
 /// One ordered dispatch of a native call.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeLaunch {
     /// Kernel function name in the native source.
     pub kernel: String,
@@ -694,7 +714,7 @@ pub struct NativeLaunch {
 }
 
 /// Closed integer language used by native declarations.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativeNatExpr {
     Constant(u64),
     Dimension(String),
@@ -1080,7 +1100,7 @@ impl NativeImplementation {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParameterSummary {
     /// Authored parameter ordinal and tuple path. The summary is leaf-flat;
     /// generated bindings group leaves by these canonical coordinates.
@@ -1090,7 +1110,7 @@ pub struct ParameterSummary {
     pub kind: ParameterSummaryKind,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParameterSummaryKind {
     Tensor {
         access: TensorAccess,
@@ -1102,14 +1122,14 @@ pub enum ParameterSummaryKind {
     Range,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TensorAccess {
     Owned,
     Shared,
     Mutable,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ElementSummary {
     /// A fixed dtype or packed representation, by registry name.
     Fixed(String),
@@ -1117,14 +1137,14 @@ pub enum ElementSummary {
     Parameter(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultSummary {
     /// Ordinal tuple path; empty for a non-tuple result.
     pub path: Vec<u32>,
     pub kind: ResultSummaryKind,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResultSummaryKind {
     Tensor { rank: u32, element: ElementSummary },
     Scalar(DType),
@@ -1136,7 +1156,8 @@ pub(crate) mod internals {
     //! W1-owned. Must satisfy: private arenas, region-qualified node ids,
     //! typed registry ids, content-derived stable identities, and no
     //! constructor reachable from outside `seismic-lang` other than
-    //! `check` and the bundle decoder.
+    //! `check` and the bundle decoder. Every field other than the owners,
+    //! the semantic hash and the sources is the bundle's checked section.
 
     use super::{Diagnostics, EntryInfo, NativeImplementation, SourceError, SourceSet};
     use crate::entry::{ElementBindings, LogicalEntry};
@@ -1145,6 +1166,8 @@ pub(crate) mod internals {
     #[derive(Debug)]
     pub(crate) struct Module {
         pub(crate) id: ModuleId,
+        /// The owner of every `FunctionId` and `FamilyId` below.
+        pub(crate) program: ProgramId,
         pub(crate) semantic_hash: ModuleHash,
         pub(crate) sources: SourceSet,
         pub(crate) entries: Vec<EntryInfo>,

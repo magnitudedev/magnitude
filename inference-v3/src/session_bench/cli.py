@@ -9,7 +9,7 @@ from pathlib import Path
 
 from benchmark_fixtures import bfcl as corpus
 from benchmark_fixtures import prose as prose_source
-from benchmark_fixtures.prose_history import Prose
+from benchmark_fixtures.prose_history import Prose, ProseWorkload
 from benchmark_fixtures.ruler import RulerFixture
 
 from . import models
@@ -19,6 +19,7 @@ from .policy import (
     MAX_OUTPUT_TOKENS,
     PROSE_OUTPUT_TOKENS,
     RETRIEVAL_OUTPUT_TOKENS,
+    WORKLOADS,
     project_root,
 )
 from .results import inspect_run, public_command
@@ -61,18 +62,21 @@ def parser() -> argparse.ArgumentParser:
         default=",".join(map(str, DEFAULT_CONTEXTS)),
         help="input checkpoints, e.g. 4k,16k",
     )
-    workload = execute.add_mutually_exclusive_group()
-    workload.add_argument("--prose", action="store_true", help="continue Moby Dick; no tools")
-    workload.add_argument("--retrieval", action="store_true", help="score RULER-derived retrieval")
-    execute.add_argument("--retrieval-variant", choices=("single", "multiquery"))
-    execute.add_argument("--retrieval-seed", type=int)
-    execute.add_argument("--retrieval-queries", type=int)
     execute.add_argument(
-        "--needle-depth", type=float, help="fraction of distractor records before facts"
+        "--workload",
+        choices=tuple(WORKLOADS),
+        default="tools",
+        help="; ".join(f"{name}: {summary}" for name, summary in WORKLOADS.items()),
     )
-    execute.add_argument("--category", default=None, help=", ".join(corpus.CATEGORIES))
-    execute.add_argument(
-        "--case", help="BFCL decision ID; canonical background history is retained"
+    tools = execute.add_argument_group("tools workload")
+    tools.add_argument("--category", default=None, help=", ".join(corpus.CATEGORIES))
+    tools.add_argument("--case", help="BFCL decision ID; canonical background history is retained")
+    retrieval = execute.add_argument_group("retrieval workload")
+    retrieval.add_argument("--retrieval-variant", choices=("single", "multiquery"))
+    retrieval.add_argument("--retrieval-seed", type=int)
+    retrieval.add_argument("--retrieval-queries", type=int)
+    retrieval.add_argument(
+        "--needle-depth", type=float, help="fraction of distractor records before facts"
     )
     execute.add_argument("--repeat", type=int, default=1, help="repeat the whole balanced schedule")
     execute.add_argument(
@@ -98,7 +102,7 @@ async def dry_run(
     categories,
     repeat,
     case,
-    prose=False,
+    prose: ProseWorkload | None = None,
     retrieval: RulerFixture | None = None,
     needle_depth: float = 0.5,
 ):
@@ -106,7 +110,7 @@ async def dry_run(
         corpus_digest = retrieval.identity
     elif prose:
         text, provenance = await prose_source.prepare()
-        corpus_digest = Prose(text, provenance).identity
+        corpus_digest = Prose(text, provenance, prose).identity
     else:
         fixtures, corpus_digest = await corpus.prepare(categories)
         if case is not None and not any(f.id == case for f in fixtures):
@@ -126,7 +130,7 @@ async def dry_run(
             if prose
             else MAX_OUTPUT_TOKENS
         ),
-        "workload": "retrieval" if retrieval else "prose" if prose else "tools",
+        "workload": "retrieval" if retrieval else prose or "tools",
         "retrieval": retrieval.model_dump(mode="json") if retrieval else None,
         "needle_depth": needle_depth if retrieval else None,
         "preparation": "pending first-target tokenizer binding",
@@ -155,24 +159,28 @@ def main(argv=None) -> int:
         if args.command == "run":
             selected = models.select(root, args.model, args.engine, args.target)
             sections = choices(args.suite, tuple(SECTIONS))
-            checkpoints = contexts(args.context, preserve_order=args.retrieval)
-            if (args.prose or args.retrieval) and (
-                args.category is not None or args.case is not None
-            ):
-                raise ValueError("--prose/--retrieval cannot be combined with --category or --case")
-            retrieval_options = (
-                args.retrieval_variant,
-                args.retrieval_seed,
-                args.retrieval_queries,
-                args.needle_depth,
+            checkpoints = contexts(args.context, preserve_order=args.workload == "retrieval")
+            workload_options = {
+                "tools": {"--category": args.category, "--case": args.case},
+                "retrieval": {
+                    "--retrieval-variant": args.retrieval_variant,
+                    "--retrieval-seed": args.retrieval_seed,
+                    "--retrieval-queries": args.retrieval_queries,
+                    "--needle-depth": args.needle_depth,
+                },
+            }
+            for owner, options in workload_options.items():
+                for flag, value in options.items():
+                    if value is not None and args.workload != owner:
+                        raise ValueError(f"{flag} requires --workload {owner}")
+            prose: ProseWorkload | None = (
+                args.workload if args.workload in ("prose-continue", "prose-repeat") else None
             )
-            if not args.retrieval and any(value is not None for value in retrieval_options):
-                raise ValueError("retrieval options require --retrieval")
             retrieval = None
             needle_depth = 0.5 if args.needle_depth is None else args.needle_depth
             if not 0 <= needle_depth <= 1:
                 raise ValueError("--needle-depth must be between zero and one")
-            if args.retrieval:
+            if args.workload == "retrieval":
                 variant = args.retrieval_variant or "single"
                 retrieval = RulerFixture(
                     seed=42 if args.retrieval_seed is None else args.retrieval_seed,
@@ -186,9 +194,9 @@ def main(argv=None) -> int:
                     ),
                 )
             categories = (
-                ()
-                if args.prose or args.retrieval
-                else choices(args.category or "all", tuple(corpus.CATEGORIES))
+                choices(args.category or "all", tuple(corpus.CATEGORIES))
+                if args.workload == "tools"
+                else ()
             )
             if args.repeat < 1:
                 raise ValueError("--repeat must be positive")
@@ -202,7 +210,7 @@ def main(argv=None) -> int:
                         categories,
                         args.repeat,
                         args.case,
-                        args.prose,
+                        prose,
                         retrieval,
                         needle_depth,
                     )
@@ -218,7 +226,7 @@ def main(argv=None) -> int:
                         args.repeat,
                         args.case,
                         lambda message: print(message, file=sys.stderr, flush=True),
-                        args.prose,
+                        prose,
                         retrieval,
                         needle_depth,
                     )

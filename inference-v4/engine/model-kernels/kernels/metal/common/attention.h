@@ -274,14 +274,19 @@ inline void decode_gate(device const Scalar *query_gate, device const int *visib
 // ---------------------------------------------------------------------------
 // Affine K8/V4 history (`qwen_attention_*_k8v4`). A (history row, kv head)
 // vector is a code row of W * B / 32 u32 words (code i at bits B * (i % (32 /
-// B)) of word i / (32 / B)) plus an F16 (scale, zero) pair; decoded value =
-// code * scale + zero. A lane holding E columns of a vector owns E * B code
-// bits: whole words when E * B >= 32, else a part of a word shared with its
-// neighbours.
+// B)) of word i / (32 / B)) plus one F16 (scale, zero) pair per group of
+// GROUP consecutive columns, pairs in group order; decoded value = code *
+// scale + zero with its group's pair. A lane holding E columns of a vector
+// owns E * B code bits: whole words when E * B >= 32, else a part of a word
+// shared with its neighbours; its columns lie in one group, shared by
+// GROUP / E neighbouring lanes.
 // ---------------------------------------------------------------------------
 
 #define ATTENTION_KEY_BITS 8
 #define ATTENTION_VALUE_BITS 4
+// Columns per (scale, zero) pair: the codec's group (model-state
+// `AFFINE_GROUP`).
+#define ATTENTION_GROUP 32
 
 template <uint B>
 struct lane_codes {
@@ -291,9 +296,21 @@ struct lane_codes {
         words = (bits + 31) / 32,
         row_words = ATTENTION_W * B / 32,
         levels = (1u << B) - 1u,
+        // (scale, zero) pairs per vector, and the lanes sharing one.
+        pairs = ATTENTION_W / ATTENTION_GROUP,
+        pair_lanes = ATTENTION_GROUP / ATTENTION_E,
     };
     static_assert(bits % 32 == 0 || 32 % bits == 0,
         "a lane's codes are whole words or a power-of-two part of one");
+    static_assert(ATTENTION_W % ATTENTION_GROUP == 0 && ATTENTION_GROUP % ATTENTION_E == 0,
+        "a lane's columns lie in one group");
+
+    // The (scale, zero) pair of this lane's group of vector `vector`, whose
+    // pairs start at `coefficients + vector * pairs * 2`.
+    static inline float2 pair(device const half *coefficients, ulong vector, uint lane) {
+        return float2(*reinterpret_cast<device const half2 *>(
+            coefficients + (vector * pairs + lane / pair_lanes) * 2));
+    }
 
     // This lane's codes of one vector's code row, shifted so its code i sits
     // at bits B * i of the (i * B / 32)-th word.
@@ -345,9 +362,10 @@ struct lane_codes {
 };
 
 // Encodes one vector held by a simdgroup (lane `lane` owns columns [lane * E,
-// lane * E + E)) with B-bit codes at `row` (its code row) and its coefficient
-// pair at `coefficients`: zero = f16(min), scale = f16((max - min) / L),
-// code = min(L, u32(fma(x - zero, 1 / scale, 0.5))), 0 when scale is 0.
+// lane * E + E)) with B-bit codes at `row` (its code row) and its group
+// coefficient pairs at `coefficients`: per group, zero = f16(min), scale =
+// f16((max - min) / L), code = min(L, u32(fma(x - zero, 1 / scale, 0.5))), 0
+// when scale is 0.
 template <uint B>
 inline void encode(thread const float (&x)[ATTENTION_E], device uint *row,
     device half *coefficients, uint lane) {
@@ -359,8 +377,12 @@ inline void encode(thread const float (&x)[ATTENTION_E], device uint *row,
         low = metal::min(low, x[i]);
         high = metal::max(high, x[i]);
     }
-    low = simd_min(low);
-    high = simd_max(high);
+    // The group's range, over its pair_lanes neighbouring lanes.
+    ATTENTION_UNROLL
+    for (uint offset = 1; offset < codes::pair_lanes; offset *= 2) {
+        low = metal::min(low, simd_shuffle_xor(low, ushort(offset)));
+        high = metal::max(high, simd_shuffle_xor(high, ushort(offset)));
+    }
     const half zero = half(low);
     const half scale = half((high - low) / float(codes::levels));
     const float inverse = float(scale) > 0.0f ? 1.0f / float(scale) : 0.0f;
@@ -388,17 +410,19 @@ inline void encode(thread const float (&x)[ATTENTION_E], device uint *row,
         if (lane % sharing == 0)
             row[lane / sharing] = joined;
     }
-    if (lane == 0) {
-        coefficients[0] = scale;
-        coefficients[1] = zero;
+    if (lane % codes::pair_lanes == 0) {
+        coefficients[lane / codes::pair_lanes * 2] = scale;
+        coefficients[lane / codes::pair_lanes * 2 + 1] = zero;
     }
 }
 
 // The online-softmax state of G query heads absorbing N affine-coded keys and
-// values. Scores are corrected, not decoded: scale * (q . code) + zero *
-// qsum. The value product accumulates (p * scale) * code into `output` and
-// sum(p * zero) into the per-head `bias`, both carried by the same factor,
-// so output + bias is the attended sum.
+// values, with this lane's group pairs. Scores are corrected, not decoded:
+// the sum over groups of scale * (q . code) + zero * sum(q), each lane adding
+// its columns' share (`qsum` is the sum of this lane's query columns). The
+// value product accumulates (p * scale) * code into `output` and
+// sum(p * zero) into this lane's per-head `bias`, both carried by the same
+// factor, so output + bias is the attended sum.
 template <uint N>
 inline void absorb_affine(thread const float (&q)[SEISMIC_DIM_G][ATTENTION_E],
     thread const float (&qsum)[SEISMIC_DIM_G],
@@ -424,8 +448,8 @@ inline void absorb_affine(thread const float (&q)[SEISMIC_DIM_G][ATTENTION_E],
             ATTENTION_UNROLL
             for (uint i = 0; i < ATTENTION_E; ++i)
                 partial = metal::fma(q[g][i], k[i], partial);
-            score[g][j] = metal::fma(key_coefficients[j].x, simd_sum(partial),
-                key_coefficients[j].y * qsum[g]);
+            score[g][j] = simd_sum(metal::fma(key_coefficients[j].x, partial,
+                key_coefficients[j].y * qsum[g]));
         }
     }
     // Each value code's weight: its probability times the value scale.
@@ -489,12 +513,12 @@ struct prefill_interval {
 };
 
 // Copies key rows [first, first + PREFILL_KEYS) of one kv head (row-major
-// [T, KV, W], 16-byte aligned) into `staged` (row pitch PREFILL_PITCH) in
-// 16-byte pieces; rows at or past `end` are zero. The loop stays rolled: one
-// piece in flight per thread keeps the staging registers off the
-// accumulators' budget.
-template <uint THREADS>
-inline void prefill_stage(threadgroup Scalar *staged, device const Scalar *rows,
+// [T, KV, W] 2-byte elements, 16-byte aligned) into `staged` (row pitch
+// PREFILL_PITCH) in 16-byte pieces; rows at or past `end` are zero. The loop
+// stays rolled: one piece in flight per thread keeps the staging registers
+// off the accumulators' budget.
+template <uint THREADS, class T>
+inline void prefill_stage(threadgroup T *staged, device const T *rows,
     int first, int end, uint kv_head, uint thread_index) {
     constexpr uint W = ATTENTION_W;
     constexpr uint PIECES = W / 8;
@@ -511,8 +535,10 @@ inline void prefill_stage(threadgroup Scalar *staged, device const Scalar *rows,
     }
 }
 
-// Dense history: [T, KV, W] activation planes.
+// Dense history: [T, KV, W] activation planes, whose products take
+// activation-dtype operands.
 struct dense_history {
+    typedef Scalar Operand;
     device Scalar *key;
     device Scalar *value;
 
@@ -535,10 +561,14 @@ struct dense_history {
     }
 };
 
-// Affine K8/V4 history: code rows plus (scale, zero) pairs per (row, kv head).
-// A staged tile holds the decoded values code * scale + zero rounded to the
-// activation dtype, so the products are the dense ones.
+// Affine K8/V4 history: code rows plus group (scale, zero) pairs per (row, kv
+// head). Its products take F16 operands, the codec's coefficient element: a
+// staged tile holds the decoded values code * scale + zero rounded to F16 (a
+// BF16 rounding would cost the 8-bit keys up to a code step), and queries,
+// fresh keys and values (activation-dtype values, exact in F16 within the
+// codec's range) and probabilities enter as F16.
 struct affine_history {
+    typedef half Operand;
     device uint *key_codes;
     device half *key_coefficients;
     device uint *value_codes;
@@ -546,50 +576,54 @@ struct affine_history {
 
     inline void append(int destination, uint kv_head, uint lane, thread const float (&k)[ATTENTION_E],
         thread const Scalar (&v)[ATTENTION_E]) const {
+        typedef lane_codes<ATTENTION_KEY_BITS> key_lane;
+        typedef lane_codes<ATTENTION_VALUE_BITS> value_lane;
         const ulong vector = ulong(destination) * SEISMIC_DIM_KV + kv_head;
         float x[ATTENTION_E];
         ATTENTION_UNROLL
         for (uint i = 0; i < ATTENTION_E; ++i)
             x[i] = float(Scalar(k[i]));
-        encode<ATTENTION_KEY_BITS>(x, key_codes + vector * lane_codes<ATTENTION_KEY_BITS>::row_words,
-            key_coefficients + vector * 2, lane);
+        encode<ATTENTION_KEY_BITS>(x, key_codes + vector * key_lane::row_words,
+            key_coefficients + vector * key_lane::pairs * 2, lane);
         ATTENTION_UNROLL
         for (uint i = 0; i < ATTENTION_E; ++i)
             x[i] = float(v[i]);
-        encode<ATTENTION_VALUE_BITS>(x,
-            value_codes + vector * lane_codes<ATTENTION_VALUE_BITS>::row_words,
-            value_coefficients + vector * 2, lane);
+        encode<ATTENTION_VALUE_BITS>(x, value_codes + vector * value_lane::row_words,
+            value_coefficients + vector * value_lane::pairs * 2, lane);
     }
 
     // Rows [first, first + PREFILL_KEYS) of one kv head decoded into `staged`,
-    // one 16-byte code piece (128 / B codes) per item; rows at or past `end`
-    // are zero.
+    // one 16-byte code piece (128 / B codes, within one group) per item; rows
+    // at or past `end` are zero.
     template <uint B, uint THREADS>
-    static inline void stage(threadgroup Scalar *staged, device const uint *codes,
+    static inline void stage(threadgroup half *staged, device const uint *codes,
         device const half *coefficients, int first, int end, uint kv_head, uint thread_index) {
         constexpr uint W = ATTENTION_W;
         constexpr uint PER = 128 / B;
         constexpr uint PIECES = W / PER;
         constexpr uint MASK = (1u << B) - 1u;
         constexpr uint ROW_WORDS = lane_codes<B>::row_words;
+        constexpr uint PAIRS = lane_codes<B>::pairs;
+        static_assert(ATTENTION_GROUP % PER == 0, "a code piece lies in one group");
         ATTENTION_ROLLED
         for (uint item = thread_index; item < PREFILL_KEYS * PIECES; item += THREADS) {
             const uint k = item / PIECES;
             const uint c = item % PIECES;
             const int t = first + int(k);
-            threadgroup Scalar *to = staged + k * PREFILL_PITCH + c * PER;
+            threadgroup half *to = staged + k * PREFILL_PITCH + c * PER;
             if (t < end) {
                 const ulong vector = ulong(t) * SEISMIC_DIM_KV + kv_head;
                 const uint4 words = *reinterpret_cast<device const uint4 *>(codes + vector * ROW_WORDS + c * 4);
-                const float2 pair = float2(*reinterpret_cast<device const half2 *>(coefficients + vector * 2));
+                const float2 pair = float2(*reinterpret_cast<device const half2 *>(
+                    coefficients + (vector * PAIRS + c * PER / ATTENTION_GROUP) * 2));
                 // Element pairs of the piece, low element in the low half.
                 uint packed[PER / 2];
                 ATTENTION_UNROLL
                 for (uint i = 0; i < PER; i += 2) {
                     const uint word = words[i * B / 32];
                     const uint shift = (i * B) % 32;
-                    const Scalar lo = Scalar(metal::fma(float((word >> shift) & MASK), pair.x, pair.y));
-                    const Scalar hi = Scalar(metal::fma(float((word >> (shift + B)) & MASK), pair.x, pair.y));
+                    const half lo = half(metal::fma(float((word >> shift) & MASK), pair.x, pair.y));
+                    const half hi = half(metal::fma(float((word >> (shift + B)) & MASK), pair.x, pair.y));
                     packed[i / 2] = uint(as_type<ushort>(lo)) | (uint(as_type<ushort>(hi)) << 16);
                 }
                 ATTENTION_UNROLL
@@ -605,14 +639,14 @@ struct affine_history {
     }
 
     template <uint THREADS>
-    inline void stage_key(threadgroup Scalar *staged, int first, int end, uint kv_head,
+    inline void stage_key(threadgroup half *staged, int first, int end, uint kv_head,
         uint thread_index) const {
         stage<ATTENTION_KEY_BITS, THREADS>(staged, key_codes, key_coefficients, first, end, kv_head,
             thread_index);
     }
 
     template <uint THREADS>
-    inline void stage_value(threadgroup Scalar *staged, int first, int end, uint kv_head,
+    inline void stage_value(threadgroup half *staged, int first, int end, uint kv_head,
         uint thread_index) const {
         stage<ATTENTION_VALUE_BITS, THREADS>(staged, value_codes, value_coefficients, first, end,
             kv_head, thread_index);
@@ -621,17 +655,20 @@ struct affine_history {
 
 // L1: one simdgroup per (row, query head or kv head), rows padded to whole
 // QT tiles. Queries and keys are prepared in the activation dtype and go to
-// scratch exactly as rounded (L2 applies the softmax scale to the F32
-// scores); padding rows' queries are zero. The value is copied beside the key
-// so L2 reads every fresh operand from aligned scratch, and the key and value
-// are appended at the row's destination through the history policy.
+// scratch exactly as rounded, as the history policy's operands (L2 applies
+// the softmax scale to the F32 scores); padding rows' queries are zero. The
+// value is copied beside the key so L2 reads every fresh operand from aligned
+// scratch, and the key and value are appended at the row's destination
+// through the history policy.
 template <uint QT, class History>
 inline void prefill_prepare(History history, device const Scalar *query_gate,
     device const Scalar *key, device const Scalar *value, device const float *query_norm,
     device const float *key_norm, device const int *rotary_components,
     device const float *rotary_frequencies, device const int *coordinates,
-    device const int *destinations, device Scalar *queries, device Scalar *keys,
-    device Scalar *values, ulong M, float epsilon, uint group, uint simd, uint lane) {
+    device const int *destinations, device typename History::Operand *queries,
+    device typename History::Operand *keys, device typename History::Operand *values, ulong M,
+    float epsilon, uint group, uint simd, uint lane) {
+    typedef typename History::Operand Operand;
     constexpr uint W = ATTENTION_W;
     constexpr uint E = ATTENTION_E;
     constexpr uint KV = SEISMIC_DIM_KV;
@@ -644,7 +681,7 @@ inline void prefill_prepare(History history, device const Scalar *query_gate,
     if (row >= M) {
         if (head < KV * G)
             for (uint i = 0; i < E; ++i)
-                queries[(row * KV * G + head) * W + lane * E + i] = Scalar(0.0f);
+                queries[(row * KV * G + head) * W + lane * E + i] = Operand(0.0f);
         return;
     }
     float x[E];
@@ -653,7 +690,7 @@ inline void prefill_prepare(History history, device const Scalar *query_gate,
             coordinates + row * 4, rotary_components, rotary_frequencies, epsilon, lane, x);
         const ulong at = (row * KV * G + head) * W + lane * E;
         for (uint i = 0; i < E; ++i)
-            queries[at + i] = Scalar(x[i]);
+            queries[at + i] = Operand(Scalar(x[i]));
         return;
     }
     const ulong kv_head = head - KV * G;
@@ -662,9 +699,9 @@ inline void prefill_prepare(History history, device const Scalar *query_gate,
         rotary_frequencies, epsilon, lane, x);
     Scalar v[E];
     for (uint i = 0; i < E; ++i) {
-        keys[source + lane * E + i] = Scalar(x[i]);
+        keys[source + lane * E + i] = Operand(Scalar(x[i]));
         v[i] = value[source + lane * E + i];
-        values[source + lane * E + i] = v[i];
+        values[source + lane * E + i] = Operand(v[i]);
     }
     const int destination = destinations[row];
     if (destination < 0)
@@ -685,14 +722,16 @@ inline void prefill_prepare(History history, device const Scalar *query_gate,
 // array is fully unrolled so it stays in registers. Query tiles dispatch
 // last-first. A tile served by one partition stores its gated output
 // directly; otherwise each partition stores (partial output, maximum,
-// denominator) and the merge launch combines them.
+// denominator) and the merge launch combines them. Operands (queries, staged
+// tiles, probabilities) are the history policy's.
 template <uint QT, class History>
 inline void prefill_attend(History history, device const Scalar *query_gate,
     device const int *visible, device const int *fresh, device Scalar *gated,
-    device const Scalar *queries, device const Scalar *keys, device const Scalar *values,
-    device float *partials, device float *statistics, device uint *counts, ulong M, ulong R,
-    float scale, threadgroup uchar *shared, uint3 group, uint3 groups, uint thread_index,
-    uint simd, uint lane) {
+    device const typename History::Operand *queries, device const typename History::Operand *keys,
+    device const typename History::Operand *values, device float *partials,
+    device float *statistics, device uint *counts, ulong M, ulong R, float scale,
+    threadgroup uchar *shared, uint3 group, uint3 groups, uint thread_index, uint simd, uint lane) {
+    typedef typename History::Operand Operand;
     constexpr uint W = ATTENTION_W;
     constexpr uint KV = SEISMIC_DIM_KV;
     constexpr uint G = SEISMIC_DIM_G;
@@ -708,9 +747,9 @@ inline void prefill_attend(History history, device const Scalar *query_gate,
     const uint tile = groups.x - 1 - group.x;
     const uint kv_head = group.y;
     const uint partition = group.z;
-    threadgroup Scalar *staged = reinterpret_cast<threadgroup Scalar *>(shared);
+    threadgroup Operand *staged = reinterpret_cast<threadgroup Operand *>(shared);
     threadgroup prefill_interval *intervals = reinterpret_cast<threadgroup prefill_interval *>(
-        shared + KEYS * PITCH * sizeof(Scalar));
+        shared + KEYS * PITCH * sizeof(Operand));
 
     if (simd == 0) {
         const ulong tile_row = ulong(tile) * QT + lane;
@@ -756,7 +795,7 @@ inline void prefill_attend(History history, device const Scalar *query_gate,
     const ulong first_token = ulong(tile) * QT + (simd % BLOCKS) * 8;
     const ulong token = first_token + fm;
     const bool valid = token < M;
-    device const Scalar *query_rows = queries + (first_token * KV * G + head) * W;
+    device const Operand *query_rows = queries + (first_token * KV * G + head) * W;
 
     simdgroup_matrix<float, 8, 8> output[DB];
     ATTENTION_UNROLL
@@ -794,11 +833,11 @@ inline void prefill_attend(History history, device const Scalar *query_gate,
                 scores[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
             ATTENTION_UNROLL
             for (uint d = 0; d < DB; ++d) {
-                simdgroup_matrix<Scalar, 8, 8> q;
+                simdgroup_matrix<Operand, 8, 8> q;
                 simdgroup_load(q, query_rows + d * 8, KV * G * W);
                 ATTENTION_UNROLL
                 for (uint j = 0; j < KB; ++j) {
-                    simdgroup_matrix<Scalar, 8, 8> k;
+                    simdgroup_matrix<Operand, 8, 8> k;
                     simdgroup_load(k, staged + j * 8 * PITCH + d * 8, PITCH, ulong2(0, 0), true);
                     simdgroup_multiply_accumulate(scores[j], q, k, scores[j]);
                 }
@@ -834,16 +873,16 @@ inline void prefill_attend(History history, device const Scalar *query_gate,
             const float next = metal::max(maximum, tile_maximum);
             const bool seen = next > -INFINITY;
             const float carry = seen ? metal::fast::exp2(maximum - next) : 1.0f;
-            // Probabilities enter the PV product in the activation dtype; the
-            // denominator sums them in F32.
-            simdgroup_matrix<Scalar, 8, 8> probabilities[KB];
+            // Probabilities enter the PV product as operands; the denominator
+            // sums them in F32.
+            simdgroup_matrix<Operand, 8, 8> probabilities[KB];
             float tile_sum = 0.0f;
             ATTENTION_UNROLL
             for (uint j = 0; j < KB; ++j) {
                 ATTENTION_UNROLL
                 for (uint e = 0; e < 2; ++e) {
                     const float p = seen ? metal::fast::exp2(scores[j].thread_elements()[e] - next) : 0.0f;
-                    probabilities[j].thread_elements()[e] = Scalar(p);
+                    probabilities[j].thread_elements()[e] = Operand(p);
                     tile_sum += p;
                 }
             }
@@ -867,7 +906,7 @@ inline void prefill_attend(History history, device const Scalar *query_gate,
             for (uint d = 0; d < DB; ++d) {
                 ATTENTION_UNROLL
                 for (uint j = 0; j < KB; ++j) {
-                    simdgroup_matrix<Scalar, 8, 8> v;
+                    simdgroup_matrix<Operand, 8, 8> v;
                     simdgroup_load(v, staged + j * 8 * PITCH + d * 8, PITCH);
                     simdgroup_multiply_accumulate(output[d], probabilities[j], v, output[d]);
                 }

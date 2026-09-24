@@ -108,7 +108,7 @@ void qwen_dense_expand_stage() {
 void qwen_dense_expand_gemm() {
     const projection_prologue x = projection_plain(DENSE_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED),
         SEISMIC_DIM_H, 1ul, uint(SEISMIC_DIM_H), 0ul);
-    projection_gemm_paired(GATE_KIND, UP_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, x, dense_expand_output(),
-        dense_expand_gate(), dense_expand_up(), uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H),
+    projection_gemm_paired(GATE_KIND, UP_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M,
+        SEISMIC_TUNE_SUB_N, x, dense_expand_output(), dense_expand_gate(), dense_expand_up(), uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H),
         gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
 }

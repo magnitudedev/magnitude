@@ -81,7 +81,7 @@ void readout_selected_rows_stage() {
 void readout_selected_rows_gemm() {
     const projection_prologue x = projection_plain(HEAD_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED),
         uint64_t(HEAD_K), 1ul, HEAD_K, 0ul);
-    projection_gemm(HEAD_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, x, selected_rows_output(),
+    projection_gemm(HEAD_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, selected_rows_output(),
         selected_rows_weight(), uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_SV), HEAD_K, gl_WorkGroupID.y,
         gl_WorkGroupID.x, 0xffffffffu);
 }
