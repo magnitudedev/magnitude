@@ -16,8 +16,11 @@ applies_to:
 
 One application owner holds the service lifetime: Desktop or Headless. Its control snapshot carries
 that owner variant; only Desktop has tray state. A passive kernel lock excludes concurrent owners
-without terminating an unresponsive owner. A second Headless contender fails without contacting or
-stopping the incumbent. Desktop forwards intent to an existing Desktop, or requests Yield from a
+without terminating an unresponsive owner. A second Headless contender fails without requesting
+takeover or stopping the incumbent. Ownership contention uses bounded read-only observation to
+identify Desktop or Headless and explains which to quit, including during startup update checks.
+Unavailable or invalid observation retains a generic contention error and never authorizes startup.
+Desktop forwards intent to an existing Desktop, or requests Yield from a
 Headless owner and waits for native lock acquisition within one 60-second deadline. Yield replies
 precede teardown and acknowledge the request, not completed retirement. Desktop ignores Yield.
 Only lock acquisition after the predecessor releases ownership permits replacement. Missing control
@@ -76,7 +79,7 @@ Desktop, CLI and installer resolve the same application.lock. Update helpers use
 installation lease only to exclude app startup/cleanup during replacement, never to elect a service
 or infer liveness from file presence.
 Finite update maintenance acquires the same application lock without creating a control listener,
-service or desktop. Contention fails immediately without requesting takeover. After acquisition it
+service or desktop. Contention fails after bounded owner observation without requesting takeover. After acquisition it
 rechecks the per-user installation lease before any update operation; release follows completion or
 cancellation of all scoped transfer work. Passive update observation does not acquire maintenance.
 Installed Linux foreground owners open the root-owned, read-only installation lock themselves and

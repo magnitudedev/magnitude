@@ -6,6 +6,20 @@ import { requestApplication } from "./application-control"
 import { isUpdateInstallationActive } from "./update-installation-lease"
 
 export class ApplicationOwnershipFailed extends Schema.TaggedError<ApplicationOwnershipFailed>()("ApplicationOwnershipFailed", { message: Schema.String }) {}
+const applicationAlreadyRunning = (directory: string) => Effect.gen(function* () {
+  const owner = yield* Effect.gen(function* () {
+    const native = yield* NativeHost
+    const endpoint = yield* native.inspectEndpoint(directory)
+    if (Option.isNone(endpoint)) return Option.none()
+    return Option.some((yield* requestApplication(endpoint.value, "Observe")).owner._tag)
+  }).pipe(Effect.timeout("1 second"), Effect.catchAll(() => Effect.succeed(Option.none())))
+  return yield* new ApplicationOwnershipFailed({ message: Option.match(owner, {
+    onNone: () => "Magnitude is already running. Stop the existing application or server before retrying.",
+    onSome: owner => owner === "Desktop"
+      ? "Magnitude Desktop is still running. Fully quit the desktop app before retrying."
+      : "Another `magnitude serve` command is already running. Stop it before starting another.",
+  }) })
+})
 export const ApplicationOwnerRequest = Schema.Union(
   Schema.TaggedStruct("Desktop", { intent: Schema.Literal("EnsureRunning", "ShowWindow") }),
   Schema.TaggedStruct("Headless", {}),
@@ -29,7 +43,7 @@ export const acquireApplicationOwner = (directory: string, request: ApplicationO
   for (;;) {
     const lock = yield* native.acquireOwnership(join(directory, "application.lock"))
     if (Option.isSome(lock)) return { _tag: "Owner" as const, socketPath: yield* native.ownedEndpoint(lock.value, directory), lock: lock.value }
-    if (request._tag === "Headless") return yield* new ApplicationOwnershipFailed({ message: "Magnitude is already running. Stop the existing service before running `magnitude serve`." })
+    if (request._tag === "Headless") return yield* applicationAlreadyRunning(directory)
     const endpoint = yield* native.inspectEndpoint(directory)
     if (Option.isNone(endpoint)) return yield* new ApplicationOwnershipFailed({ message: "The existing application directory could not be resolved." })
     const socketPath = endpoint.value
@@ -59,9 +73,7 @@ export const acquireApplicationMaintenance = (directory: string) => Effect.gen(f
   const native = yield* NativeHost
   yield* prepareOwnershipDirectory(directory)
   const lock = yield* native.acquireOwnership(join(directory, "application.lock"))
-  if (Option.isNone(lock)) return yield* new ApplicationOwnershipFailed({
-    message: "Magnitude started while preparing this update command. Retry the command against the running application.",
-  })
+  if (Option.isNone(lock)) return yield* applicationAlreadyRunning(directory)
   if (yield* isUpdateInstallationActive(directory)) return yield* new ApplicationOwnershipFailed({
     message: "A Magnitude update is being installed. Retry the command when it finishes.",
   })

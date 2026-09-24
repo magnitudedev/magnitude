@@ -18,6 +18,25 @@ const noLogin = () => Effect.die("Unexpected login request")
 const noUpdate = () => Effect.die("Unexpected update request")
 
 describe.skipIf(process.platform === "win32")("native application owner arbitration", () => {
+  it.each(["Desktop", "Headless"] as const)("identifies %s for both startup and maintenance contention without stopping it", owner => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const root = yield* directory
+    const first = yield* acquireApplicationOwner(root, { _tag: "Headless" })
+    if (first._tag !== "Owner") return yield* Effect.die("Expected owner")
+    const intents = yield* Ref.make<string[]>([])
+    yield* serveApplicationControl(first.socketPath, {
+      snapshot: Effect.succeed({ ...snapshot, owner: owner === "Desktop"
+        ? { _tag: "Desktop", tray: { _tag: "Registered" } } : { _tag: "Headless" } }),
+      login: noLogin, update: noUpdate, dispatch: intent => Ref.update(intents, values => [...values, intent]),
+    })
+    const startup = yield* acquireApplicationOwner(root, { _tag: "Headless" }).pipe(Effect.flip)
+    const maintenance = yield* acquireApplicationMaintenance(root).pipe(Effect.flip)
+    expect(startup.message).toBe(owner === "Desktop"
+      ? "Magnitude Desktop is still running. Fully quit the desktop app before retrying."
+      : "Another `magnitude serve` command is already running. Stop it before starting another.")
+    expect(maintenance.message).toBe(startup.message)
+    expect(yield* Ref.get(intents)).toEqual(["Observe", "Observe"])
+  })).pipe(Effect.provide(nativeHostLayer(addon)))))
+
   it("excludes owners during finite maintenance and releases afterward", () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     const root = yield* directory
     yield* Effect.scoped(Effect.gen(function* () {
@@ -64,7 +83,7 @@ describe.skipIf(process.platform === "win32")("native application owner arbitrat
     })).pipe(Effect.provide([nativeHostLayer(addon), TestContext.TestContext])))
   }, 15000)
 
-  it("refuses a second headless owner without contacting or replacing the first", async () => {
+  it("refuses a second headless owner without a control endpoint or replacing the first", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const root = yield* directory
       expect((yield* acquireApplicationOwner(root, { _tag: "Headless" }))._tag).toBe("Owner")
