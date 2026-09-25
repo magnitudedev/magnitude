@@ -40,13 +40,13 @@ import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "rea
 import { Atom, RegistryProvider, Result, useAtomValue, useAtomSet, useAtomRefresh } from "@effect-atom/atom-react"
 import { Cause, Effect, Exit, Layer, Option, Runtime, Schema, Scope, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
-import { MagnitudeClient, ProviderModelIdSchema, type ProviderModelId, type CatalogLocalModel } from "@magnitudedev/sdk"
+import { MagnitudeClient, ProviderModelIdSchema, type ProviderModelId, type CatalogLocalModel, type LocalModel } from "@magnitudedev/sdk"
 import { ApplicationSnapshot, LoginStartupState, type NetworkAccessChange } from "@magnitudedev/sdk/desktop-host"
 import {
   DesktopApplicationInfo, DesktopUpdateState, DesktopConnectRequest, DesktopHostUnavailable, DesktopSession, DesktopConnectionsSnapshot, activeLocalModel, modelDownloadFailureMessage,
   createAgentClient, AgentClientProvider, useAgentClient, makeFirstPartyConnection,
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, localModelFailureMessage, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
-  formatStorageSize, formatTransferRate, formatMemorySize, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes,
+  formatStorageSize, formatTransferRate, formatMemorySize, localModelIsInstalled, localModelProviderModelId, localModelServingState, localModelStorageBytes, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes,
   LOCAL_MODEL_RANKING_SCALE_VALUES,
 } from "@magnitudedev/client-common"
 import { HardwareOverview, ModelRadar } from "./discovery-visuals"
@@ -101,8 +101,15 @@ const hostState = Atom.keepAlive(Atom.make(observation))
 const pageNames: Record<Page, string> = { discover: "Discover", catalog: "Catalog", models: "My Models", connections: "Connections", usage: "Usage", status: "Status", settings: "Settings" }
 const pageIcons = { discover: StackIcon, catalog: SquaresFourIcon, models: CubeIcon, connections: PlugIcon, usage: ChartBarIcon, status: PulseIcon, settings: SlidersIcon }
 
-function ModelFit({ model }: { model: CatalogLocalModel }) {
-  const serving = model.servingState
+const servingOf = (model: LocalModel) => Option.getOrUndefined(localModelServingState(model))
+const residencyOf = (model: LocalModel) => model._tag === "Catalog"
+  ? ("residencyState" in model.acquisitionState ? model.acquisitionState.residencyState : undefined)
+  : model.state._tag === "Ready" ? model.state.residencyState : undefined
+function ModelFit({ model }: { model: LocalModel }) {
+  const serving = servingOf(model)
+  if (!serving) return model._tag === "Discovered" && model.state._tag === "Unavailable"
+    ? <p className="mt-3 text-sm text-slate-500">Unavailable: {model.state.failure.message}</p>
+    : null
   if (serving._tag === "Assessing") return <p className="mt-3 text-sm text-slate-500">Checking compatibility with your machine…</p>
   if (serving._tag === "Failed") return <p className="mt-3 text-sm text-slate-500">Assessment unavailable: {serving.failure.message}</p>
   const assessment = serving.assessment
@@ -110,16 +117,16 @@ function ModelFit({ model }: { model: CatalogLocalModel }) {
   if (assessment._tag === "DoesNotFit") return <p className="mt-3 text-sm text-slate-500">Doesn’t fit this machine · short by {formatMemorySize(assessment.deficitBytes, { rounding: "up" })} of memory.</p>
   return <p className="mt-3 text-sm text-blue-700 dark:text-blue-400">Fits your machine · {formatMemorySize(assessment.memory.totalRequiredBytes)} estimated memory</p>
 }
-function ModelDetails({ model, radar = false, open, contentId, compact = false }: { model: CatalogLocalModel; radar?: boolean; open?: boolean; contentId?: string; compact?: boolean }) {
-  const serving = model.servingState
+function ModelDetails({ model, radar = false, open, contentId, compact = false }: { model: LocalModel; radar?: boolean; open?: boolean; contentId?: string; compact?: boolean }) {
+  const serving = servingOf(model)
   const content = (
     <div className={compact ? "grid gap-5 text-sm" : "mt-3 grid items-start gap-8 border-t border-slate-200 pt-5 dark:border-slate-750 lg:grid-cols-2"}>
       <div className={radar ? "space-y-5" : "contents"}>
       <div className="min-w-0 space-y-5">
         <dl className="flex flex-wrap gap-x-8 gap-y-3">
           <div><dt className="text-xs text-slate-500">License</dt><dd className="mt-1">{Option.getOrElse(model.presentation.license, () => "Not specified")}</dd></div>
-          {serving._tag === "Assessed" && <div><dt className="text-xs text-slate-500">Context window</dt><dd className="mt-1">{serving.assessment.profile.contextLength.toLocaleString()} tokens</dd></div>}
-          {serving._tag === "Assessed" && serving.capabilities.vision && <div className="self-end"><TooltipProvider><ActionTooltip label="Supports vision" trigger={<button type="button" aria-label="Supports vision" className="rounded p-1 text-slate-500 hover:text-slate-800 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-200"><EyeIcon aria-hidden="true" className="size-4" /></button>} /></TooltipProvider></div>}
+          {serving?._tag === "Assessed" && <div><dt className="text-xs text-slate-500">Context window</dt><dd className="mt-1">{serving.assessment.profile.contextLength.toLocaleString()} tokens</dd></div>}
+          {serving?._tag === "Assessed" && serving.capabilities.vision && <div className="self-end"><TooltipProvider><ActionTooltip label="Supports vision" trigger={<button type="button" aria-label="Supports vision" className="rounded p-1 text-slate-500 hover:text-slate-800 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-200"><EyeIcon aria-hidden="true" className="size-4" /></button>} /></TooltipProvider></div>}
         </dl>
         {model.presentation.sourceUrls.length > 0 && <div><p className="mb-2 text-xs text-slate-500">Sources</p><div className="flex flex-wrap gap-x-4 gap-y-2">{model.presentation.sourceUrls.map(url => {
           const source = new URL(url)
@@ -127,7 +134,7 @@ function ModelDetails({ model, radar = false, open, contentId, compact = false }
           return <a className="inline-flex items-center gap-1 text-sm text-slate-600 hover:underline dark:text-slate-300" key={url} href={url} title={url} target="_blank" rel="noreferrer">{label}<ArrowUpRightIcon aria-hidden="true" className="size-3.5" /></a>
         })}</div></div>}
       </div>
-      {serving._tag === "Assessed" && serving.assessment._tag === "Fits" && serving.assessment.performance.length > 0 && <div className="min-w-0">
+      {serving?._tag === "Assessed" && serving.assessment._tag === "Fits" && serving.assessment.performance.length > 0 && <div className="min-w-0">
         <table className="w-full text-left text-sm tabular-nums">
           <caption className="mb-3 text-left font-medium">Estimated speed on your machine</caption>
           <thead className="text-xs text-slate-500"><tr><th className="pb-2 font-normal">Context tokens</th><th className="pb-2 text-right font-normal">Tokens / sec</th></tr></thead>
@@ -166,39 +173,56 @@ function DownloadProgress({ acquisition, modelName, onCancel, pending = false }:
     {onCancel && <div className="mt-7 flex justify-center"><Button variant="ghost" className="hover:bg-transparent hover:text-red-600 dark:hover:bg-transparent dark:hover:text-red-400" disabled={pending} onClick={onCancel}><XIcon />Cancel download</Button></div>}
   </div>
 }
-function ModelControls({ model, replacing, children, onConnectAgent }: { model: CatalogLocalModel; replacing?: string; children?: ReactNode; onConnectAgent?: () => void }) {
+function ModelControls({ model, replacing, children, onConnectAgent }: { model: LocalModel; replacing?: string; children?: ReactNode; onConnectAgent?: () => void }) {
   const { install, load, stop, cancel, remove, dismissFailure: dismiss } = useLocalModelMutations()
   const command = useLocalModelCommandStatus(model.modelId)
   const stopping = useLocalModelStopStatus()
-  const pending = command.pending || stopping.pending || model.acquisitionState._tag === "Removing"
+  const serving = servingOf(model)
+  const residency = residencyOf(model)
+  const canStop = residency !== undefined && ["Ready", "Loading", "Requested", "Stopping"].includes(residency._tag)
+  const pendingStop = command.pending || stopping.pending
+  const confirmLoad = () => { if (!replacing || window.confirm(`Loading ${formatLocalModelDisplayName(model)} will stop ${replacing}. Continue?`)) load(model.modelId) }
+  const residencyActions = onConnectAgent
+    ? <Button className="min-w-28" disabled={pendingStop} onClick={onConnectAgent}><PlugIcon />Connect Agent</Button>
+    : canStop
+      ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button>
+      : <Button className="min-w-28" disabled={pendingStop} onClick={confirmLoad}><PlayIcon />Load model</Button>
+  const alerts = <>
+    {(serving?._tag !== "Assessed" || serving.assessment._tag !== "Fits") && <ModelFit model={model} />}
+    {residency?._tag === "Failed" && <p role="alert" className="mt-3 text-sm">{residency.failure.message}</p>}
+    {command.failures.map(message => <p key={message} role="alert" className="mt-3 text-sm">{message}</p>)}
+    {residency?._tag === "Stopping" && Option.isSome(stopping.failure) && <p role="alert" className="mt-3 text-sm">{stopping.failure.value}</p>}
+  </>
+  if (model._tag === "Discovered") return <div>
+    <div className="flex flex-wrap items-center gap-2">{children}{model.state._tag === "Ready" && residencyActions}</div>
+    {alerts}
+  </div>
+  const pending = pendingStop || model.acquisitionState._tag === "Removing"
   const acquisition = model.acquisitionState
   const installed = "residencyState" in acquisition
-  const residency = installed ? acquisition.residencyState : undefined
-  const canStop = residency !== undefined && ["Ready", "Loading", "Requested", "Stopping"].includes(residency._tag)
   const transferring = acquisition._tag === "Installing" || acquisition._tag === "Updating"
   return <div>
     <div className="flex flex-wrap items-center gap-2">{children}
-      {transferring ? <DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={acquisition} pending={command.pending} onCancel={() => cancel(model.modelId)} /> : !installed ? <Button disabled={pending || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <>
-        {onConnectAgent ? <Button className="min-w-28" disabled={pending} onClick={onConnectAgent}><PlugIcon />Connect Agent</Button> : canStop ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button> : <Button className="min-w-28" disabled={pending} onClick={() => { if (!replacing || window.confirm(`Loading ${formatLocalModelDisplayName(model)} will stop ${replacing}. Continue?`)) load(model.modelId) }}><PlayIcon />Load model</Button>}
+      {transferring ? <DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={acquisition} pending={command.pending} onCancel={() => cancel(model.modelId)} /> : !installed ? <Button disabled={pending || serving?._tag !== "Assessed" || serving.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <>
+        {onConnectAgent ? <Button className="min-w-28" disabled={pending} onClick={onConnectAgent}><PlugIcon />Connect Agent</Button> : canStop ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button> : <Button className="min-w-28" disabled={pending} onClick={confirmLoad}><PlayIcon />Load model</Button>}
         {!onConnectAgent && <Button variant="ghost" size="icon" aria-label={`Remove ${formatLocalModelDisplayName(model)}`} title="Remove download" disabled={pending} onClick={() => { if (window.confirm(`Remove the downloaded files for ${formatLocalModelDisplayName(model)}?`)) remove(model.modelId) }}><TrashIcon /></Button>}
         {(acquisition._tag === "UpdateAvailable" || acquisition._tag === "UpdateFailed") && <Button variant="outline" disabled={pending} onClick={() => install(model.modelId)}>Update</Button>}
       </>}
       {(acquisition._tag === "InstallFailed" || acquisition._tag === "UpdateFailed") && <Button variant="outline" onClick={() => dismiss(model.modelId)}>Dismiss error</Button>}
     </div>
-    {(model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits") && <ModelFit model={model} />}
+    {alerts}
     {"failure" in acquisition && <p role="alert" className="mt-3 text-sm">{acquisition._tag === "InstallFailed" || acquisition._tag === "UpdateFailed" ? modelDownloadFailureMessage(acquisition.failure) : acquisition.failure.message}</p>}
-    {residency?._tag === "Failed" && <p role="alert" className="mt-3 text-sm">{residency.failure.message}</p>}
-    {command.failures.map(message => <p key={message} role="alert" className="mt-3 text-sm">{message}</p>)}
-    {residency?._tag === "Stopping" && Option.isSome(stopping.failure) && <p role="alert" className="mt-3 text-sm">{stopping.failure.value}</p>}
   </div>
 }
-function ModelCard({ model, showMemory = false, replacing }: { model: CatalogLocalModel; showMemory?: boolean; replacing?: string }) {
+function ModelCard({ model, showMemory = false, replacing }: { model: LocalModel; showMemory?: boolean; replacing?: string }) {
   const [detailsOpen, setDetailsOpen] = useState(false)
   const detailsId = useId()
-  const acquisition = model.acquisitionState
-  const residency = "residencyState" in acquisition ? acquisition.residencyState : undefined
-  const statusLabel = acquisition._tag === "Removing" ? "Removing…" : acquisition._tag === "RemoveFailed" ? "Removal failed" : residency?._tag === "Ready" ? "Loaded" : residency?._tag === "Unloaded" ? "Downloaded" : residency?._tag ?? (acquisition._tag === "NotInstalled" ? "" : acquisition._tag)
-  const status = (statusLabel || showMemory) && <div className="mt-1 flex flex-wrap items-center gap-x-3 text-sm text-slate-500">{statusLabel && <span className={residency?._tag === "Ready" ? "text-green-600 dark:text-green-400" : ""}>{statusLabel}</span>}{showMemory && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits" && <><span aria-hidden="true">·</span><span>{formatMemorySize(model.servingState.assessment.memory.totalRequiredBytes)} memory</span></>}</div>
+  const serving = servingOf(model)
+  const residency = residencyOf(model)
+  const statusLabel = model._tag === "Discovered"
+    ? model.state._tag === "Unavailable" ? "Unavailable" : residency?._tag === "Ready" ? "Loaded" : residency?._tag === "Unloaded" ? "On disk" : residency?._tag ?? ""
+    : model.acquisitionState._tag === "Removing" ? "Removing…" : model.acquisitionState._tag === "RemoveFailed" ? "Removal failed" : residency?._tag === "Ready" ? "Loaded" : residency?._tag === "Unloaded" ? "Downloaded" : residency?._tag ?? (model.acquisitionState._tag === "NotInstalled" ? "" : model.acquisitionState._tag)
+  const status = (statusLabel || showMemory) && <div className="mt-1 flex flex-wrap items-center gap-x-3 text-sm text-slate-500">{statusLabel && <span className={residency?._tag === "Ready" ? "text-green-600 dark:text-green-400" : ""}>{statusLabel}</span>}{showMemory && serving?._tag === "Assessed" && serving.assessment._tag === "Fits" && <><span aria-hidden="true">·</span><span>{formatMemorySize(serving.assessment.memory.totalRequiredBytes)} memory</span></>}</div>
   return <article className={pageLayout.modelCard}>
     <div className={pageLayout.modelRow}>
       <div className="flex min-w-0 items-center gap-4"><ModelLogo model={model} /><div className="min-w-0"><h2 className="text-lg font-semibold">{formatLocalModelDisplayName(model)}</h2>{status}</div></div>
@@ -289,26 +313,30 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const preferenceResult = useAtomValue(preferenceAtom)
   const preference = Result.isSuccess(preferenceResult) ? preferenceResult.value : 2
   const setPreference = useAtomSet(useMemo(() => client.runtime.fn((index: number) => Effect.flatMap(DesktopSession, service => service.setRankingPreference(index))), [client]))
-  if (Result.isFailure(catalog)) return <>{!discover && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<p role="alert" className="mt-5">{localModelFailureMessage(catalog.cause, "Could not read the model catalog. Check Status and try again.")}</p></>
-  if (!Result.isSuccess(catalog) && !discover) return <ModelsSkeleton page={page} />
-  const models = (Result.isSuccess(catalog) ? catalog.value.models : []).filter((model): model is CatalogLocalModel => model._tag === "Catalog")
-  const ranked = !installedOnly && Result.isSuccess(hardware) ? rankedLocalModelOptions(models.map(model => ({ id: model.modelId, kind: localModelIsInstalled(model) ? "stored" as const : "downloadable" as const, model })), { fastToSmart: LOCAL_MODEL_RANKING_SCALE_VALUES[preference]!, memoryBudgetBytes: targetPhysicalMemoryBytes(hardware.value) }, models.length).flatMap(option => option.model._tag === "Catalog" ? [option.model] : []) : []
+  const source = installedOnly ? localModels : catalog
+  if (Result.isFailure(source)) return <>{!discover && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<p role="alert" className="mt-5">{localModelFailureMessage(source.cause, "Could not read the model catalog. Check Status and try again.")}</p></>
+  if (!Result.isSuccess(source) && !discover) return <ModelsSkeleton page={page} />
+  const models = Result.isSuccess(source) ? source.value.models : []
+  const catalogModels = models.filter((model): model is CatalogLocalModel => model._tag === "Catalog")
+  const ranked = !installedOnly && Result.isSuccess(hardware) ? rankedLocalModelOptions(catalogModels.map(model => ({ id: model.modelId, kind: localModelIsInstalled(model) ? "stored" as const : "downloadable" as const, model })), { fastToSmart: LOCAL_MODEL_RANKING_SCALE_VALUES[preference]!, memoryBudgetBytes: targetPhysicalMemoryBytes(hardware.value) }, catalogModels.length).flatMap(option => option.model._tag === "Catalog" ? [option.model] : []) : []
   const assessment = Result.isSuccess(catalog) ? catalog.value.preparation.assessment : undefined
   const recommendationsPending = !Result.isFailure(hardware) && (Result.isInitial(hardware) || !assessment?.complete)
-  const rankedIds = new Set(ranked.map(model => model.modelId))
+  const rankedIds = new Set<string>(ranked.map(model => model.modelId))
   const ordered = installedOnly ? models : [...ranked, ...models.filter(model => !rankedIds.has(model.modelId))]
-  const library = ordered.filter(model => !installedOnly || model.acquisitionState._tag !== "NotInstalled")
+  const library = ordered.filter(model => !installedOnly || model._tag === "Discovered" || model.acquisitionState._tag !== "NotInstalled")
   const visible = library.filter(model => {
-    const acquisition = model.acquisitionState
+    const acquisition = model._tag === "Catalog" ? model.acquisitionState : undefined
+    const serving = servingOf(model)
     const matchesFilter = filter === "all"
-      || filter === "fits" && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits"
+      || filter === "fits" && serving?._tag === "Assessed" && serving.assessment._tag === "Fits"
       || filter === "downloaded" && localModelIsInstalled(model)
-      || filter === "downloading" && (acquisition._tag === "Installing" || acquisition._tag === "Updating")
+      || filter === "downloading" && (acquisition?._tag === "Installing" || acquisition?._tag === "Updating")
     return matchesFilter && `${formatLocalModelDisplayName(model)} ${model.presentation.description}`.toLowerCase().includes(search.trim().toLowerCase())
   })
+  const storageBytes = (model: LocalModel) => Option.getOrElse(localModelStorageBytes(model), () => 0)
   if (sort !== "recommended") visible.sort((a, b) => {
     const byName = formatLocalModelDisplayName(a).localeCompare(formatLocalModelDisplayName(b), undefined, { numeric: true }) || a.modelId.localeCompare(b.modelId)
-    return sort === "smallest" ? a.storageBytes - b.storageBytes || byName : sort === "largest" ? b.storageBytes - a.storageBytes || byName : byName
+    return sort === "smallest" ? storageBytes(a) - storageBytes(b) || byName : sort === "largest" ? storageBytes(b) - storageBytes(a) || byName : byName
   })
   return <>
     {!discover && <>

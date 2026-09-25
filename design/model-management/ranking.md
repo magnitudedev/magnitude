@@ -57,9 +57,15 @@ eligible only when its assessed `memory.totalRequiredBytes` does not exceed the 
 physical-memory capacity.
 
 The physical-memory maximum is the sum of the normalized, distinct hardware memory domains. The
-system-memory total is not added separately. The client filters every local model option with scores,
-sorts by descending utility, breaks ties by canonical model ID, and then applies the caller's result limit. Installation state affects the row action, not ranking eligibility. Every installed
-model remains available in My Models, including when it appears in Discover.
+system-memory total is not added separately. The client ranks catalog options that have scores:
+it filters them by the memory budget, sorts by descending utility, and breaks ties by canonical
+model ID. A discovered model has no ranking scores and receives none. When its assessment fits and
+it passes the same memory budget, it is appended after every ranked catalog option, ordered by
+canonical model ID. The caller's result limit then applies to that combined list, so a discovered
+model never changes catalog utility order or displaces a higher-ranked catalog result. Installation
+state affects the row action, not ranking eligibility. Every installed model remains available in
+My Models, including when it appears in Discover. Discovered models already on disk are part of
+that library and are not ranked recommendations.
 
 ## Preference lifetime and rendering
 
@@ -93,5 +99,6 @@ as its defaults. It prints a finite result and does not render a chooser or keyb
 - Filtering and sorting happen before the requested result limit.
 - Equal utility is ordered by canonical model ID only.
 - Eligible installed choices are ranked by the same controls as downloadable choices.
+- Fitting discovered models follow ranked catalog options, in model-ID order, and receive no ranking scores.
 - Every installed choice remains available in My Models, including ranked choices.
 - Live native load admission remains authoritative after assessment and ranking.
