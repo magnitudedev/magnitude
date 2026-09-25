@@ -44,7 +44,7 @@ export const runFiniteUpdatePreparation = (action: "check" | "download" | "disca
   const initial = yield* readPreparedUpdateState
   if (action === "download" && initial.transfer._tag !== "Idle") return initial
   const source = yield* ApplicationUpdateSource
-  const candidate = yield* source.check
+  const candidate = yield* source.check("manual")
   const check = { _tag: "Succeeded", at: yield* Clock.currentTimeMillis } as const
   if (initial.transfer._tag !== "Idle") return { ...initial, check }
   if (Option.isNone(candidate)) return { ...initial, check }

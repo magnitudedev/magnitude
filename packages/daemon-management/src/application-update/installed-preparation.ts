@@ -1,6 +1,6 @@
 import { Effect, Option, Schema } from "effect"
 import { ReleaseTarget, UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
-import { makePreparedUpdateStore } from "../desktop-native/prepared-update"
+import { makePreparedUpdateStore, PreparedUpdateStore } from "../desktop-native/prepared-update"
 import { makeUpdatePreferences } from "../desktop-native/update-preferences"
 import { nativeWindowsInstallerVerifier, WindowsInstallerVerifier } from "../desktop-native/windows-update-signature"
 import { ApplicationUpdateFailed } from "./application-update"
@@ -43,7 +43,8 @@ export const makeInstalledUpdatePreparation = (options: {
       yield* store.prepare(archive, release)
     }).pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })))
     return yield* hostedUpdateSource({ ...configuration, metadata, sign: identity.sign,
-      dataDirectory: options.dataDirectory, userAgent: `Magnitude/${options.version} ${options.architecture} ${metadata.os}/${options.osVersion}` }, stage)
+      dataDirectory: options.dataDirectory, userAgent: `Magnitude/${options.version} ${options.architecture} ${metadata.os}/${options.osVersion}` }, stage).pipe(
+        Effect.provideService(PreparedUpdateStore, store))
   }).pipe(Effect.mapError(() => new ApplicationUpdateFailed({ message: "Application update preparation could not be initialized." })))
   return { configuration, store, preferences, makeSource }
 }).pipe(Effect.mapError(() => new ApplicationUpdateFailed({ message: "The installed application update configuration could not be initialized." })))

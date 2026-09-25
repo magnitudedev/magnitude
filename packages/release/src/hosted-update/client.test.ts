@@ -3,8 +3,9 @@ import { FetchHttpClient } from "@effect/platform"
 import { Effect, Either, Option, Schema } from "effect"
 import { generateKeyPairSync } from "node:crypto"
 import { describe, expect, it } from "vitest"
-import { checkHostedUpdate, resolveHostedDownload, UpdateClientMetadata } from "./client"
+import { checkHostedUpdate, resolveHostedDownload, UpdateClientMetadata, type UpdateCheck } from "./client"
 import { signUpdateRequest, verifyUpdateRequest, installationId } from "./request-auth"
+import { decodeUpdateRequest } from "./request"
 import { PublisherKeyId, signUpdateManifest, UpdateManifest } from "./manifest"
 
 const installation = generateKeyPairSync("ed25519"), publisher = generateKeyPairSync("ed25519")
@@ -13,9 +14,9 @@ const metadata = Schema.decodeUnknownSync(UpdateClientMetadata)({ version: "1.0.
 const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, tag: "@magnitudedev/cli@2.0.0", version: "2.0.0", commit: "a".repeat(40), artifact: {
   id: "desktop-arm64", target: { os: "darwin", arch: "arm64", package: "mac-zip" }, filename: "app.zip", bytes: 123, sha256: "b".repeat(64),
 } })
-const check = (fetch: (...args: Parameters<typeof globalThis.fetch>) => Promise<Response>) => checkHostedUpdate({ origin: "https://magnitude.dev", metadata,
+const check = (fetch: (...args: Parameters<typeof globalThis.fetch>) => Promise<Response>, request: UpdateCheck = { reason: "manual", outcome: Option.none() }) => checkHostedUpdate({ origin: "https://magnitude.dev", metadata,
   sign: url => signUpdateRequest(installation.privateKey, url), trustedPublishers: new Map([[keyId, publisher.publicKey]]), userAgent: "Magnitude/1.0.0",
-}).pipe(Effect.provide(FetchHttpClient.layer), Effect.provideService(FetchHttpClient.Fetch, Object.assign(fetch, { preconnect: () => {} })))
+}, request).pipe(Effect.provide(FetchHttpClient.layer), Effect.provideService(FetchHttpClient.Fetch, Object.assign(fetch, { preconnect: () => {} })))
 
 describe("hosted update client", () => {
   it("signs the download selector and resolves only the trusted GitHub release repository without following it", async () => {
@@ -38,6 +39,22 @@ describe("hosted update client", () => {
       expect(calls).toBe(1)
       expect(Either.isRight(result)).toBe(location === expected)
     }
+  })
+  it("carries the check reason and a pending update outcome as signed query fields", async () => {
+    const seen: URL[] = []
+    const fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init), url = new URL(request.url)
+      seen.push(url)
+      expect(await Effect.runPromise(verifyUpdateRequest(request.headers.get("authorization")!, url))).toBe(await Effect.runPromise(installationId(installation.publicKey)))
+      expect(Option.isSome(await Effect.runPromise(Effect.option(decodeUpdateRequest(url, Math.floor(Date.now() / 1000)))))).toBe(true)
+      return new Response(null, { status: 204 })
+    }
+    await Effect.runPromise(check(fetch, { reason: "launch", outcome: Option.some({ outcome: "failed", version: "1.0.1", reason: Option.some("verify") }) }))
+    await Effect.runPromise(check(fetch, { reason: "scheduled", outcome: Option.some({ outcome: "applied", version: "1.0.0", reason: Option.none() }) }))
+    await Effect.runPromise(check(fetch, { reason: "manual", outcome: Option.none() }))
+    expect(seen.map(url => [url.searchParams.get("reason"), url.searchParams.get("outcome"), url.searchParams.get("outcome_version"), url.searchParams.get("outcome_reason")])).toEqual([
+      ["launch", "failed", "1.0.1", "verify"], ["scheduled", "applied", "1.0.0", null], ["manual", null, null, null],
+    ])
   })
   it("sends a verifiable complete request and accepts 204 without a body", async () => {
     let calls = 0

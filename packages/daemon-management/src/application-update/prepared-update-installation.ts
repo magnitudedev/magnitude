@@ -1,6 +1,6 @@
 import { Context, Effect, Option, Schema } from "effect"
 import { isNewerVersion, isValidVersion } from "@magnitudedev/release"
-import type { UpdateRelease } from "@magnitudedev/release/hosted-update"
+import type { UpdateOutcome, UpdateRelease } from "@magnitudedev/release/hosted-update"
 import { PreparedUpdateStore, type PreparedUpdate } from "@magnitudedev/daemon-management/desktop-native"
 import { UpdateContinuation } from "./update-continuation"
 import { ApplicationUpdateFailed } from "./application-update"
@@ -25,6 +25,20 @@ export const preparedUpdateFailure = (record: PreparedUpdate): Option.Option<str
   }
 }
 
+const outcomeOf = (record: PreparedUpdate, applied: boolean): Option.Option<UpdateOutcome> => {
+  const version = record.release.version
+  if (applied) return Option.some({ outcome: "applied", version, reason: Option.none() })
+  switch (record.installation._tag) {
+    case "Unattempted": return Option.none()
+    case "Attempted": return Option.some({ outcome: "failed", version, reason: Option.some("incomplete") })
+    case "Failed": {
+      const text = record.installation.reason.toLowerCase()
+      return Option.some({ outcome: "failed", version, reason: Option.some(text.includes("verif") || text.includes("changed") ? "verify"
+        : text.includes("authoriz") ? "authorization" : "install") })
+    }
+  }
+}
+
 /** Native exclusion is checked first by bootstrap; this runs before any owned service starts. */
 export const reconcilePreparedUpdate = (installedVersion: string) => Effect.gen(function* () {
   const store = yield* PreparedUpdateStore
@@ -32,7 +46,9 @@ export const reconcilePreparedUpdate = (installedVersion: string) => Effect.gen(
   yield* store.removeAbandonedTransfers
   const pending = yield* store.read
   if (Option.isNone(pending)) return pending
-  if (!isNewerVersion(pending.value.release.version, installedVersion)) {
+  const applied = !isNewerVersion(pending.value.release.version, installedVersion)
+  yield* Option.match(outcomeOf(pending.value, applied), { onNone: () => Effect.void, onSome: store.recordOutcome }).pipe(Effect.ignore)
+  if (applied) {
     yield* store.discard
     return Option.none<PreparedUpdate>()
   }

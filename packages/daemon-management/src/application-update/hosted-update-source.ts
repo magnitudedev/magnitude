@@ -3,6 +3,7 @@ import { checkHostedUpdate, resolveHostedDownload, downloadUpdateArtifact, updat
 import { Effect, Option, Schema } from "effect"
 import type { KeyObject } from "node:crypto"
 import { join } from "node:path"
+import { PreparedUpdateStore } from "../desktop-native/prepared-update"
 import { ApplicationUpdateFailed, ApplicationUpdateSource } from "./application-update"
 
 export type HostedUpdateSourceOptions = HostedUpdateConnection & {
@@ -14,8 +15,14 @@ export type HostedUpdateSourceOptions = HostedUpdateConnection & {
 export const hostedUpdateSource = (options: HostedUpdateSourceOptions, stage: ApplicationUpdateSource["stage"]) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const path = yield* Path.Path
+  const store = yield* PreparedUpdateStore
   return ApplicationUpdateSource.of({
-    check: checkHostedUpdate(options).pipe(
+    check: reason => Effect.gen(function* () {
+      const outcome = yield* store.outcome.pipe(Effect.orElseSucceed(() => Option.none()))
+      const candidate = yield* checkHostedUpdate(options, { reason, outcome })
+      if (Option.isSome(outcome)) yield* store.markOutcomeReported.pipe(Effect.ignore)
+      return candidate
+    }).pipe(
       Effect.mapError(() => new ApplicationUpdateFailed({ message: "Could not check for application updates." })), Effect.provide(FetchHttpClient.layer),
     ),
     download: (candidate, progress) => Effect.gen(function* () {

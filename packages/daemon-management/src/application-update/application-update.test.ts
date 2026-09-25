@@ -11,7 +11,7 @@ const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, tag: "@
 } })
 const candidate = (await Effect.runPromise(signUpdateManifest(manifest, generateKeyPairSync("ed25519").privateKey))).release
 const waitFor = (owner: ApplicationUpdate, tag: string) => owner.changes.pipe(Stream.filter(state => state.transfer._tag === tag), Stream.take(1), Stream.runDrain)
-const run = <A, E>(effect: Effect.Effect<A, E, Scope.Scope | UpdatePreferences | PreparedUpdateStore>) => Effect.runPromise(effect.pipe(Effect.provideService(PreparedUpdateStore, { read: Effect.succeed(Option.none()), prepare: () => Effect.void, verify: () => Effect.die("Unexpected verification"), recordAttempt: () => Effect.void, recordFailure: () => Effect.void, discard: Effect.void, removeAbandonedTransfers: Effect.void }), Effect.provideService(UpdatePreferences, { read: Effect.succeed(false), write: () => Effect.void }), Effect.scoped, Effect.timeout("3 seconds")))
+const run = <A, E>(effect: Effect.Effect<A, E, Scope.Scope | UpdatePreferences | PreparedUpdateStore>) => Effect.runPromise(effect.pipe(Effect.provideService(PreparedUpdateStore, { read: Effect.succeed(Option.none()), prepare: () => Effect.void, verify: () => Effect.die("Unexpected verification"), recordAttempt: () => Effect.void, recordFailure: () => Effect.void, discard: Effect.void, removeAbandonedTransfers: Effect.void, outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void }), Effect.provideService(UpdatePreferences, { read: Effect.succeed(false), write: () => Effect.void }), Effect.scoped, Effect.timeout("3 seconds")))
 
 describe("application-owned updates", () => {
   it.each([false, true])("discards a retained update only after durable cleanup succeeds (failure=%s)", fail => run(Effect.gen(function* () {
@@ -19,7 +19,7 @@ describe("application-owned updates", () => {
     const calls = yield* Ref.make(0)
     const owner = yield* makeApplicationUpdate(Option.some({ release: candidate, installation: { _tag: "Failed", reason: "Invalid retained bytes" } })).pipe(
       Effect.provideService(PreparedUpdateStore, { ...store, discard: Ref.update(calls, n => n + 1).pipe(Effect.zipRight(fail ? new PreparedUpdateFailed({ message: "Cleanup failed" }) : Effect.void)) }),
-      Effect.provideService(ApplicationUpdateSource, { check: Effect.succeed(Option.some(candidate)), download: () => Effect.die("Discard must not download"), stage: () => Effect.void }),
+      Effect.provideService(ApplicationUpdateSource, { check: () => Effect.succeed(Option.some(candidate)), download: () => Effect.die("Discard must not download"), stage: () => Effect.void }),
     )
     const outcome = yield* owner.discard.pipe(Effect.either)
     expect(outcome._tag).toBe(fail ? "Left" : "Right")
@@ -27,7 +27,7 @@ describe("application-owned updates", () => {
     expect((yield* owner.state).transfer._tag).toBe(fail ? "InstallationFailed" : "Idle")
     if (!fail) {
       expect((yield* owner.requireReady.pipe(Effect.either))._tag).toBe("Left")
-      yield* owner.check
+      yield* owner.check("manual")
       yield* waitFor(owner, "Available")
     }
   })))
@@ -36,10 +36,10 @@ describe("application-owned updates", () => {
       installation: tag === "Failed" ? { _tag: tag, reason: "Authorization cancelled" } : { _tag: tag },
     })).pipe(Effect.provideService(UpdatePreferences, { read: Effect.succeed(true), write: () => Effect.void }),
       Effect.provideService(ApplicationUpdateSource, {
-        check: Effect.succeed(Option.some(candidate)),
+        check: () => Effect.succeed(Option.some(candidate)),
         download: () => Effect.die("Retained installers must not be redownloaded"), stage: () => Effect.die("No new download"),
       }))
-    yield* owner.check
+    yield* owner.check("manual")
     yield* owner.changes.pipe(Stream.filter(state => state.check._tag === "Succeeded"), Stream.take(1), Stream.runDrain)
     expect((yield* owner.state).transfer).toEqual(tag === "Unattempted" ? { _tag: "Ready", version: candidate.version }
       : { _tag: "InstallationFailed", version: candidate.version, message: tag === "Failed" ? "Authorization cancelled" : "The update did not complete." })
@@ -50,9 +50,9 @@ describe("application-owned updates", () => {
       read: new UpdatePreferencesFailed({ message: "Unreadable preferences" }),
       write: () => new UpdatePreferencesFailed({ message: "Read-only profile" }),
     }), Effect.provideService(ApplicationUpdateSource, {
-      check: Effect.succeed(Option.some(candidate)), download: () => Effect.die("Automatic download must remain paused"), stage: () => Effect.void,
+      check: () => Effect.succeed(Option.some(candidate)), download: () => Effect.die("Automatic download must remain paused"), stage: () => Effect.void,
     }))
-    yield* owner.check
+    yield* owner.check("manual")
     yield* waitFor(owner, "Available")
     expect((yield* owner.setAutoDownload(true).pipe(Effect.either))._tag).toBe("Left")
     expect((yield* owner.state).preference._tag).toBe("Unavailable")
@@ -62,18 +62,18 @@ describe("application-owned updates", () => {
     const checks = yield* Ref.make(0)
     const finish = yield* Deferred.make<void>()
     const owner = yield* makeApplicationUpdate().pipe(Effect.provideService(UpdatePreferences, { read: Effect.succeed(true), write: () => Effect.void }), Effect.provideService(ApplicationUpdateSource, {
-      check: Ref.updateAndGet(checks, n => n + 1).pipe(Effect.map(n => n === 1 ? Option.some(candidate) : Option.none())),
+      check: () => Ref.updateAndGet(checks, n => n + 1).pipe(Effect.map(n => n === 1 ? Option.some(candidate) : Option.none())),
       download: () => Deferred.await(finish).pipe(Effect.as("archive")), stage: () => Effect.void,
     }))
-    yield* owner.check
+    yield* owner.check("manual")
     yield* waitFor(owner, "Downloading")
-    yield* owner.check
+    yield* owner.check("manual")
     yield* owner.changes.pipe(Stream.filter(state => state.check._tag === "Succeeded"), Stream.take(1), Stream.runDrain)
     expect(yield* Ref.get(checks)).toBe(2)
     expect((yield* owner.state).transfer._tag).toBe("Downloading")
     yield* Deferred.succeed(finish, undefined)
     yield* waitFor(owner, "Ready")
-    yield* owner.check
+    yield* owner.check("manual")
     yield* owner.changes.pipe(Stream.filter(state => state.check._tag === "Succeeded"), Stream.take(1), Stream.runDrain)
     expect(yield* Ref.get(checks)).toBe(3)
     yield* owner.requireReady
@@ -86,7 +86,7 @@ describe("application-owned updates", () => {
     const downloads = yield* Ref.make(0)
     const staged = yield* Ref.make(false)
     const owner = yield* makeApplicationUpdate().pipe(Effect.provideService(UpdatePreferences, { read: Effect.succeed(true), write: () => Effect.void }), Effect.provideService(ApplicationUpdateSource, {
-      check: Effect.succeed(Option.some(candidate)),
+      check: () => Effect.succeed(Option.some(candidate)),
       download: () => Effect.gen(function* () {
         const count = yield* Ref.updateAndGet(downloads, n => n + 1)
         if (count === 1) {
@@ -97,7 +97,7 @@ describe("application-owned updates", () => {
         return "archive"
       }), stage: () => Ref.set(staged, true),
     }))
-    yield* owner.check
+    yield* owner.check("manual")
     yield* Deferred.await(started)
     yield* owner.setAutoDownload(false)
     yield* Deferred.await(cleanup)
@@ -115,9 +115,9 @@ describe("application-owned updates", () => {
   it("turning automatic downloads off preserves an explicit user download", () => run(Effect.gen(function* () {
     const finish = yield* Deferred.make<void>()
     const owner = yield* makeApplicationUpdate().pipe(Effect.provideService(ApplicationUpdateSource, {
-      check: Effect.succeed(Option.some(candidate)), download: () => Deferred.await(finish).pipe(Effect.as("archive")), stage: () => Effect.void,
+      check: () => Effect.succeed(Option.some(candidate)), download: () => Deferred.await(finish).pipe(Effect.as("archive")), stage: () => Effect.void,
     }))
-    yield* owner.check
+    yield* owner.check("manual")
     yield* waitFor(owner, "Available")
     yield* owner.download
     yield* owner.setAutoDownload(false)
@@ -131,7 +131,7 @@ describe("application-owned updates", () => {
     const finishStage = yield* Deferred.make<void>()
     const released = yield* Ref.make(false)
     const owner = yield* makeApplicationUpdate().pipe(Effect.provideService(ApplicationUpdateSource, {
-      check: Ref.update(checks, n => n + 1).pipe(Effect.zipRight(Deferred.await(finishCheck)), Effect.as(Option.some(candidate))),
+      check: () => Ref.update(checks, n => n + 1).pipe(Effect.zipRight(Deferred.await(finishCheck)), Effect.as(Option.some(candidate))),
       download: (selected, report) => Effect.acquireRelease(Effect.gen(function* () {
         expect(selected).toEqual(candidate)
         yield* report(80)
@@ -144,8 +144,8 @@ describe("application-owned updates", () => {
       }),
     }))
     expect(yield* Ref.get(checks)).toBe(0)
-    yield* owner.check
-    expect((yield* owner.check.pipe(Effect.either))._tag).toBe("Right")
+    yield* owner.check("manual")
+    expect((yield* owner.check("manual").pipe(Effect.either))._tag).toBe("Right")
     yield* Deferred.succeed(finishCheck, undefined)
     yield* waitFor(owner, "Available")
     expect(yield* Ref.get(checks)).toBe(1)
@@ -167,42 +167,42 @@ describe("application-owned updates", () => {
     const cancelled = yield* Deferred.make<void>()
     const staged = yield* Ref.make(false)
     const owner = yield* makeApplicationUpdate().pipe(Effect.provideService(ApplicationUpdateSource, {
-      check: Effect.succeed(Option.some(candidate)),
+      check: () => Effect.succeed(Option.some(candidate)),
       download: () => Deferred.succeed(started, undefined).pipe(Effect.zipRight(Effect.never), Effect.ensuring(Deferred.succeed(cancelled, undefined))),
       stage: () => Ref.set(staged, true),
     }))
-    yield* owner.check
+    yield* owner.check("manual")
     yield* waitFor(owner, "Available")
     yield* owner.download
     yield* Deferred.await(started)
     yield* owner.close
     yield* Deferred.await(cancelled)
     expect(yield* Ref.get(staged)).toBe(false)
-    expect((yield* owner.check.pipe(Effect.either))._tag).toBe("Left")
+    expect((yield* owner.check("manual").pipe(Effect.either))._tag).toBe("Left")
     expect((yield* owner.download.pipe(Effect.either))._tag).toBe("Left")
   })))
 
   it("reports source failures and permits a fresh explicit check", () => run(Effect.gen(function* () {
     const failed = yield* Ref.make(true)
     const owner = yield* makeApplicationUpdate().pipe(Effect.provideService(ApplicationUpdateSource, {
-      check: Ref.get(failed).pipe(Effect.flatMap(value => value
+      check: () => Ref.get(failed).pipe(Effect.flatMap(value => value
         ? new ApplicationUpdateFailed({ message: "Registry unavailable" }) : Effect.succeed(Option.none()))),
       download: () => Effect.die("must not download"), stage: () => Effect.die("must not stage"),
     }))
-    yield* owner.check
+    yield* owner.check("manual")
     yield* owner.changes.pipe(Stream.filter(state => state.check._tag === "Failed"), Stream.take(1), Stream.runDrain)
     expect((yield* owner.state).check).toMatchObject({ _tag: "Failed", message: "Registry unavailable" })
     yield* Ref.set(failed, false)
-    yield* owner.check
+    yield* owner.check("manual")
     yield* owner.changes.pipe(Stream.filter(state => state.check._tag === "Succeeded"), Stream.take(1), Stream.runDrain)
   })))
 
   it("never reports Ready when native signature verification fails", () => run(Effect.gen(function* () {
     const owner = yield* makeApplicationUpdate().pipe(Effect.provideService(ApplicationUpdateSource, {
-      check: Effect.succeed(Option.some(candidate)), download: () => Effect.succeed("/verified/archive.zip"),
+      check: () => Effect.succeed(Option.some(candidate)), download: () => Effect.succeed("/verified/archive.zip"),
       stage: () => new ApplicationUpdateFailed({ message: "The native updater rejected this signature" }),
     }))
-    yield* owner.check
+    yield* owner.check("manual")
     yield* waitFor(owner, "Available")
     yield* owner.download
     yield* waitFor(owner, "Failed")

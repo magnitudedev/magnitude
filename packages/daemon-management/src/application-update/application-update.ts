@@ -1,5 +1,5 @@
 import { Clock, Context, Effect, ExecutionStrategy, Exit, Fiber, Option, Schema, Scope, Stream, SubscriptionRef } from "effect"
-import { UpdateRelease } from "@magnitudedev/release/hosted-update"
+import { UpdateRelease, type UpdateCheckReason } from "@magnitudedev/release/hosted-update"
 import type { DesktopUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { UpdatePreferences } from "../desktop-native/update-preferences"
 import { PreparedUpdateStore, type PreparedUpdate } from "../desktop-native/prepared-update"
@@ -9,7 +9,7 @@ export class ApplicationUpdateFailed extends Schema.TaggedError<ApplicationUpdat
 }) {}
 type Candidate = typeof UpdateRelease.Type
 export interface ApplicationUpdateSource {
-  readonly check: Effect.Effect<Option.Option<Candidate>, ApplicationUpdateFailed>
+  readonly check: (reason: UpdateCheckReason) => Effect.Effect<Option.Option<Candidate>, ApplicationUpdateFailed>
   readonly download: (candidate: Candidate, progress: (completed: number) => Effect.Effect<void>) => Effect.Effect<string, ApplicationUpdateFailed, Scope.Scope>
   readonly stage: (archive: string, candidate: Candidate) => Effect.Effect<void, ApplicationUpdateFailed>
 }
@@ -41,7 +41,7 @@ const present = (state: State): DesktopUpdateState => {
 export interface ApplicationUpdate {
   readonly state: Effect.Effect<DesktopUpdateState>
   readonly changes: Stream.Stream<DesktopUpdateState>
-  readonly check: Effect.Effect<void, ApplicationUpdateFailed>
+  readonly check: (reason: UpdateCheckReason) => Effect.Effect<void, ApplicationUpdateFailed>
   readonly download: Effect.Effect<void, ApplicationUpdateFailed>
   readonly discard: Effect.Effect<void, ApplicationUpdateFailed>
   readonly setAutoDownload: (enabled: boolean) => Effect.Effect<void, ApplicationUpdateFailed>
@@ -107,12 +107,12 @@ export const makeApplicationUpdate = (pending: Option.Option<PreparedUpdate> = O
     yield* Scope.close(owner, Exit.void)
   }).pipe(Effect.uninterruptible)
   yield* Effect.addFinalizer(() => close)
-  const check = gate.withPermits(1)(Effect.gen(function* () {
+  const check = (reason: UpdateCheckReason) => gate.withPermits(1)(Effect.gen(function* () {
     const current = yield* SubscriptionRef.get(state)
     if (current.transfer._tag === "Closed") return yield* closed
     if (current.check._tag === "Checking") return
     yield* SubscriptionRef.set(state, { ...current, check: { _tag: "Checking" } })
-    yield* source.check.pipe(
+    yield* source.check(reason).pipe(
       Effect.flatMap(candidate => gate.withPermits(1)(Effect.gen(function* () {
         const current = yield* SubscriptionRef.get(state)
         if (current.transfer._tag === "Closed") return
@@ -162,7 +162,7 @@ export const makeApplicationUpdate = (pending: Option.Option<PreparedUpdate> = O
 
 export const unavailableApplicationUpdate = (message: string): ApplicationUpdate => {
   const state: DesktopUpdateState = { transfer: { _tag: "Unavailable", message }, check: { _tag: "Idle" }, preference: { _tag: "Unavailable", message } }
-  return { state: Effect.succeed(state), changes: Stream.succeed(state), check: new ApplicationUpdateFailed({ message }),
+  return { state: Effect.succeed(state), changes: Stream.succeed(state), check: () => new ApplicationUpdateFailed({ message }),
     download: new ApplicationUpdateFailed({ message }), discard: new ApplicationUpdateFailed({ message }), setAutoDownload: () => new ApplicationUpdateFailed({ message }),
     requireReady: new ApplicationUpdateFailed({ message }), close: Effect.void }
 }

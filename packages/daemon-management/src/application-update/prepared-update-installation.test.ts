@@ -1,5 +1,6 @@
 import { Effect, Option } from "effect"
 import { describe, expect, it } from "vitest"
+import type { UpdateOutcome } from "@magnitudedev/release/hosted-update"
 import { PreparedUpdateFailed, PreparedUpdateStore, type PreparedUpdate } from "@magnitudedev/daemon-management/desktop-native"
 import { ApplicationUpdateFailed } from "./application-update"
 import { PreparedUpdateInstaller, installPreparedUpdate, reconcilePreparedUpdate, preparedUpdateFailure } from "./prepared-update-installation"
@@ -8,7 +9,10 @@ const release = { version: "2.0.0", bytes: 1, sha256: "a".repeat(64), signature:
 const harness = (installation: PreparedUpdate["installation"] = { _tag: "Unattempted" }) => {
   let pending = Option.some<PreparedUpdate>({ release, installation })
   const events: string[] = []
+  const outcomes: UpdateOutcome[] = []
   const store: PreparedUpdateStore = {
+    outcome: Effect.succeed(Option.none()), markOutcomeReported: Effect.void,
+    recordOutcome: outcome => Effect.sync(() => { outcomes.push(outcome) }),
     read: Effect.sync(() => pending),
     prepare: () => Effect.die("No download belongs in restart recovery"),
     verify: () => Effect.sync(() => { events.push("verify"); return "retained-installer" }),
@@ -24,7 +28,7 @@ const harness = (installation: PreparedUpdate["installation"] = { _tag: "Unattem
   }) }
   const run = <A, E>(effect: Effect.Effect<A, E, PreparedUpdateStore | PreparedUpdateInstaller>, overrides: Partial<PreparedUpdateStore> = {}, native: Partial<PreparedUpdateInstaller> = {}) =>
     Effect.runPromise(effect.pipe(Effect.provideService(PreparedUpdateStore, { ...store, ...overrides }), Effect.provideService(PreparedUpdateInstaller, { ...installer, ...native })))
-  return { run, events, pending: () => pending }
+  return { run, events, outcomes, pending: () => pending }
 }
 
 describe("prepared update installation", () => {
@@ -43,6 +47,29 @@ describe("prepared update installation", () => {
     const h = harness(tag === "Failed" ? { _tag: tag, reason: "previous failure" } : { _tag: tag })
     expect(Option.isNone(await h.run(reconcilePreparedUpdate("3.0.0")))).toBe(true)
     expect(h.events).toEqual(["cleanup", "discard"])
+  })
+  it("records the applied outcome once a prepared release is the installed one", async () => {
+    const h = harness({ _tag: "Attempted" })
+    expect(Option.isNone(await h.run(reconcilePreparedUpdate("2.0.0")))).toBe(true)
+    expect(h.outcomes).toEqual([{ outcome: "applied", version: "2.0.0", reason: Option.none() }])
+  })
+  it.each([
+    [{ _tag: "Attempted" }, "incomplete"],
+    [{ _tag: "Failed", reason: "The downloaded update could not be verified. Download it again before installing." }, "verify"],
+    [{ _tag: "Failed", reason: "System authorization was cancelled" }, "authorization"],
+    [{ _tag: "Failed", reason: "The update installer could not be started." }, "install"],
+  ] as const)("records a still-pending %o as a failed outcome classified %s", async (installation, reason) => {
+    const h = harness(installation)
+    expect(Option.isSome(await h.run(reconcilePreparedUpdate("1.0.0")))).toBe(true)
+    expect(h.outcomes).toEqual([{ outcome: "failed", version: "2.0.0", reason: Option.some(reason) }])
+  })
+  it("records nothing for an unattempted pending update and survives an outcome write failure", async () => {
+    const h = harness()
+    expect(Option.isSome(await h.run(reconcilePreparedUpdate("1.0.0")))).toBe(true)
+    expect(h.outcomes).toEqual([])
+    const failing = harness({ _tag: "Attempted" })
+    expect(Option.isNone(await failing.run(reconcilePreparedUpdate("2.0.0"), { recordOutcome: () => new PreparedUpdateFailed({ message: "disk full" }) }))).toBe(true)
+    expect(failing.events).toEqual(["cleanup", "discard"])
   })
   it("retains an interrupted attempt without inventing an installer error", async () => {
     const h = harness({ _tag: "Attempted" })

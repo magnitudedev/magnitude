@@ -15,7 +15,7 @@ const run = (state: "None" | "Unattempted" | "Attempted" | "Failed", receipt: bo
   const pending = state === "None" ? Option.none() : Option.some({ release: { version: "0.1.6", bytes: 1, sha256: "0".repeat(64), signature: "fixture" },
     installation: state === "Failed" ? { _tag: state, reason: "Interrupted" } : { _tag: state } } as PreparedUpdate)
   return yield* macStartupUpdateOperation(join(root, "Magnitude.app"), "0.1.5").pipe(
-    Effect.provideService(PreparedUpdateStore, { read: Effect.succeed(pending), removeAbandonedTransfers: Effect.void,
+    Effect.provideService(PreparedUpdateStore, { read: Effect.succeed(pending), removeAbandonedTransfers: Effect.void, outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void,
       discard: Effect.die("Unexpected discard"), prepare: () => Effect.die("Unexpected prepare"),
       verify: () => Effect.die("Unexpected verify"), recordAttempt: () => Effect.die("Unexpected attempt"),
       recordFailure: () => Effect.die("Unexpected failure") }))

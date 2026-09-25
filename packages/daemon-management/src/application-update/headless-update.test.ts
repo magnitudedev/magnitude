@@ -8,7 +8,7 @@ const fixture = () => {
   const call = (name: string) => Effect.sync(() => { calls.push(name) })
   const state = { transfer: { _tag: "Ready", version: "0.1.6" }, check: { _tag: "Idle" }, preference: { _tag: "Known", autoDownload: true } } as const
   const updates: ApplicationUpdate = { state: Effect.succeed(state), changes: Stream.succeed(state),
-    check: call("check"), download: call("download"), discard: call("discard"), close: call("close"),
+    check: () => call("check"), download: call("download"), discard: call("discard"), close: call("close"),
     requireReady: Effect.die("A live server cannot admit installation"),
     setAutoDownload: () => Effect.die("Control cannot change preferences"),
   }

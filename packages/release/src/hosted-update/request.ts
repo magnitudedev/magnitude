@@ -1,10 +1,19 @@
-import { Effect, Schema } from "effect"
+import { Effect, Option, Schema } from "effect"
 import { isValidVersion } from "../client-update/release-channels"
 import { RequestNonce } from "./request-auth"
 
-const Version = Schema.String.pipe(Schema.maxLength(96), Schema.filter(isValidVersion))
+export const Version = Schema.String.pipe(Schema.maxLength(96), Schema.filter(isValidVersion))
 const PlatformVersion = Schema.String.pipe(Schema.minLength(1), Schema.maxLength(96), Schema.pattern(/^[a-zA-Z0-9 ._+()-]+$/))
-export const UpdateRequest = Schema.Struct({
+export const UpdateCheckReason = Schema.Literal("launch", "scheduled", "manual")
+export type UpdateCheckReason = typeof UpdateCheckReason.Type
+export const UpdateOutcomeReason = Schema.Literal("verify", "install", "authorization", "incomplete")
+export const UpdateOutcome = Schema.Struct({
+  outcome: Schema.Literal("applied", "failed"),
+  version: Version,
+  reason: Schema.optionalWith(UpdateOutcomeReason, { as: "Option", exact: true }),
+}).pipe(Schema.filter(outcome => (outcome.outcome === "failed") === Option.isSome(outcome.reason)))
+export type UpdateOutcome = typeof UpdateOutcome.Type
+export const UpdateRequestFields = Schema.Struct({
   protocol: Schema.Literal("1"),
   product: Schema.Literal("desktop"),
   version: Version,
@@ -17,7 +26,14 @@ export const UpdateRequest = Schema.Struct({
   nonce: RequestNonce,
   distro: Schema.optionalWith(PlatformVersion, { as: "Option", exact: true }),
   distro_version: Schema.optionalWith(PlatformVersion, { as: "Option", exact: true }),
+  reason: Schema.optionalWith(UpdateCheckReason, { as: "Option", exact: true }),
+  outcome: Schema.optionalWith(Schema.Literal("applied", "failed"), { as: "Option", exact: true }),
+  outcome_version: Schema.optionalWith(Version, { as: "Option", exact: true }),
+  outcome_reason: Schema.optionalWith(UpdateOutcomeReason, { as: "Option", exact: true }),
 })
+export const UpdateRequest = UpdateRequestFields.pipe(Schema.filter(request => Option.isNone(request.outcome)
+  ? Option.isNone(request.outcome_version) && Option.isNone(request.outcome_reason)
+  : Option.isSome(request.outcome_version) && (request.outcome.value === "failed") === Option.isSome(request.outcome_reason)))
 export type UpdateRequest = typeof UpdateRequest.Type
 export class InvalidUpdateRequest extends Schema.TaggedError<InvalidUpdateRequest>()("InvalidUpdateRequest", {}) {}
 export class ExpiredUpdateRequest extends Schema.TaggedError<ExpiredUpdateRequest>()("ExpiredUpdateRequest", {}) {}

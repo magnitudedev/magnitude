@@ -35,7 +35,7 @@ const fixture = Effect.gen(function* () {
     verify: () => step("verify").pipe(Effect.as("archive")),
     recordAttempt: () => step("attempt").pipe(Effect.zipRight(Ref.set(prepared, Option.some({ release, installation: { _tag: "Attempted" } })))),
     recordFailure: (_, reason) => step("failure").pipe(Effect.zipRight(Ref.set(prepared, Option.some({ release, installation: { _tag: "Failed", reason } })))),
-    discard: step("discard").pipe(Effect.zipRight(Ref.set(prepared, Option.none()))), removeAbandonedTransfers: Effect.void,
+    discard: step("discard").pipe(Effect.zipRight(Ref.set(prepared, Option.none()))), removeAbandonedTransfers: Effect.void, outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void,
     prepare: () => Effect.die("Unexpected download"),
   })
   const stager = MacUpdateArchiveStager.of({ stage: (_, staging) => Effect.gen(function* () {

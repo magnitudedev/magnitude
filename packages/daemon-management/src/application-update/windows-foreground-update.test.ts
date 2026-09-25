@@ -39,7 +39,7 @@ const run = async (options: { attempted?: boolean; automatic?: boolean; protocol
   const store = PreparedUpdateStore.of({
     read: Effect.succeed(Option.some({ release, installation: options.attempted ? { _tag: "Attempted" } : { _tag: "Unattempted" } })),
     verify: () => step("verify").pipe(Effect.as("installer.exe")), recordAttempt: () => step("attempt"),
-    recordFailure: () => step("failure"), discard: step("discard"), removeAbandonedTransfers: Effect.void,
+    recordFailure: () => step("failure"), discard: step("discard"), removeAbandonedTransfers: Effect.void, outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void,
     prepare: () => Effect.die("Unexpected download"),
   })
   return Effect.runPromise(completeWindowsForegroundUpdate({ resources: fileURLToPath(new URL("../../dist/native/win32-x64", import.meta.url)), dataDirectory: root,

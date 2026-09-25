@@ -19,11 +19,12 @@ const fixture = Effect.gen(function* () {
     prepare: (_archive, candidate) => event("publish").pipe(Effect.zipRight(Ref.set(pending, Option.some({ release: candidate, installation: { _tag: "Unattempted" } })))),
     discard: event("discard").pipe(Effect.zipRight(Ref.set(pending, Option.none()))),
     removeAbandonedTransfers: event("scratch-cleanup"),
+    outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void,
     verify: () => Effect.die("Preparation cannot install"), recordAttempt: () => Effect.die("Preparation cannot attempt installation"),
     recordFailure: () => Effect.die("Preparation cannot record installation failure"),
   })
   const source = ApplicationUpdateSource.of({
-    check: event("check").pipe(Effect.as(Option.some(release))),
+    check: () => event("check").pipe(Effect.as(Option.some(release))),
     download: () => Effect.acquireRelease(event("download").pipe(Effect.as("archive")), () => event("retire-transfer")),
     stage: archive => store.prepare(archive, release).pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message }))),
   })

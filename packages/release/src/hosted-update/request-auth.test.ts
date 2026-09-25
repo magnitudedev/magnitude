@@ -1,5 +1,5 @@
 import { createPrivateKey, generateKeyPairSync } from "node:crypto"
-import { Effect, Either } from "effect"
+import { Effect, Either, Option } from "effect"
 import { describe, expect, it } from "vitest"
 import { installationId, newUpdateNonce, signUpdateRequest, updateQuery, verifyUpdateRequest } from "./request-auth"
 import { decodeUpdateRequest } from "./request"
@@ -29,6 +29,19 @@ describe("Ollama-compatible update authentication", () => {
     }
     const changed = new URL(original); changed.pathname = "/api/download/file"
     expect(Either.isLeft(await Effect.runPromise(Effect.either(verifyUpdateRequest(signed, changed))))).toBe(true)
+  })
+  it("admits check reasons and outcome fields only in valid combinations", async () => {
+    const withFields = (fields: Record<string, string>) => { const changed = url(); for (const [key, value] of Object.entries(fields)) changed.searchParams.set(key, value); return changed }
+    const decoded = await Effect.runPromise(decodeUpdateRequest(withFields({ reason: "launch", outcome: "failed", outcome_version: "1.2.4", outcome_reason: "install" }), 1000000))
+    expect([decoded.reason, decoded.outcome, decoded.outcome_version, decoded.outcome_reason].map(Option.getOrNull)).toEqual(["launch", "failed", "1.2.4", "install"])
+    expect(Option.getOrNull((await Effect.runPromise(decodeUpdateRequest(withFields({ outcome: "applied", outcome_version: "1.2.3" }), 1000000))).outcome)).toBe("applied")
+    for (const fields of [
+      { reason: "startup" }, { outcome: "applied" }, { outcome: "failed", outcome_version: "1.2.4" },
+      { outcome: "applied", outcome_version: "1.2.3", outcome_reason: "install" }, { outcome_version: "1.2.3" }, { outcome_reason: "install" },
+      { outcome: "failed", outcome_version: "bad", outcome_reason: "install" }, { outcome: "failed", outcome_version: "1.2.4", outcome_reason: "other" },
+    ] as Record<string, string>[]) {
+      expect(Either.isLeft(await Effect.runPromise(Effect.either(decodeUpdateRequest(withFields(fields), 1000000))))).toBe(true)
+    }
   })
   it("rejects malformed, noncanonical and oversized authorization", async () => {
     const signed = await Effect.runPromise(signUpdateRequest(pair.privateKey, url()))
