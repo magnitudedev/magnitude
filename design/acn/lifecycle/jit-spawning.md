@@ -1,8 +1,8 @@
 ---
 applies_to:
   - packages/daemon-management/src/desktop-native/owned-service.ts
-  - packages/acn-protocol/src/acn-identity.ts
-  - packages/acn-protocol/src/acn-revision.ts
+  - packages/acn-protocol/src/acn-*.ts
+  - packages/daemon-management/src/desktop-native/application-bootstrap.ts
   - packages/acn/src/server.ts
   - packages/acn/src/icn/**
   - packages/version/scripts/generate-version.ts
@@ -14,18 +14,33 @@ applies_to:
 
 # Desktop-owned service supervision
 
-The desktop application is the sole production service owner. Login, CLI commands, and supported
-harness starters launch or contact that application. Only its privileged main process launches ACN;
-ACN privately owns ICN and workers. No client independently downloads, adopts, elects, replaces, or
-retains an ACN process.
+Desktop and the foreground serving host are the two application owner forms. Only their privileged
+composition roots launch ACN while retaining application ownership; ACN privately owns ICN and
+workers. Ordinary clients never independently download, adopt, elect, replace, or retain an ACN
+process. Login startup belongs exclusively to Desktop.
 The web development host uses the same application launcher with an isolated development profile
 and proxies that profile's service endpoint. Closing the web host or cancelling its startup response
 does not quit an already admitted desktop owner.
 
 A kernel-held application lock excludes concurrent owners without killing a stalled predecessor.
-A losing launch forwards background Ensure or explicit Open intent over per-user local IPC, or
-returns a bounded owner-unavailable result. Background demand never shows or focuses a window.
+A losing Desktop launch forwards background Ensure or explicit Open intent to another Desktop over
+per-user local IPC. A Headless incumbent receives cooperative Yield; the Desktop must then acquire
+the native lock before proceeding. A losing Headless launch fails without replacing the incumbent.
+Unavailable or stalled owners remain bounded failures. Background demand never shows or focuses a window.
 The SDK remains portable and receives a starter capability rather than OS process authority.
+
+Application bootstrap selects one installed resource directory or one development checkout and
+constructs the service command from that selection. Profile selection, native adapter location,
+previous-installation retirement and per-attempt port preflight are shared host composition in
+daemon-management. Installed service and adapter paths always come from the same resource directory.
+Bundled CLI resource selection resolves the executing payload through filesystem symlinks and
+requires the installed layout; it never substitutes a different installation found through PATH.
+Development runtime and engine overrides remain explicit. Selection itself never creates state,
+acquires ownership, or spawns a child; the retained owner admits supervised startup.
+Foreground startup completes previous-installation retirement and one port preflight before starting
+supervision, so admission errors return immediately to the command. Desktop keeps admission errors
+inside supervision for its existing failure presentation. Both retain port preflight on every child
+attempt, and the child's actual bind remains authoritative against races.
 
 ## Child supervision
 

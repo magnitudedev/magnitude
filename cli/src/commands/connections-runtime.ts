@@ -13,7 +13,7 @@ import {
 import { ProviderModelIdSchema } from "@magnitudedev/sdk"
 import { Data, Effect, Option, Schema } from "effect"
 import { makeHarnessConnection } from "../server/harness-connections"
-import { headlessAcnConnection } from "../server/acn-connection"
+import { existingAcnConnection } from "../server/acn-connection"
 import { renderFields, renderTable, runCommand } from "./output"
 
 class ConnectionsCommandError extends Data.TaggedError("ConnectionsCommandError")<{
@@ -32,7 +32,7 @@ const parseModel = (input: string | undefined) => input === undefined
     )
 
 const requireRunningService = Effect.gen(function* () {
-  const connection = yield* headlessAcnConnection
+  const connection = yield* existingAcnConnection
   yield* connection.startup.awaitReady
 })
 

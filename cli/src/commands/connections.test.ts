@@ -9,7 +9,7 @@ import { addConnection, syncConnections, renderAddedConnection, renderConnection
 const startupProbe = vi.hoisted(() => vi.fn(() => { throw new Error("Unexpected service startup") }))
 vi.mock("../server/acn-connection", async () => {
   const { Effect } = await import("effect")
-  return { headlessAcnConnection: Effect.sync(startupProbe) }
+  return { existingAcnConnection: Effect.sync(startupProbe) }
 })
 
 describe("connections command contract", () => {

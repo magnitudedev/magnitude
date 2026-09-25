@@ -2,7 +2,7 @@
   "$schema": "https://mintlify.com/docs.json",
   "name": "Magnitude",
   "theme": "linden",
-  "description": "Run the best local models for your machine",
+  "description": "Run the best open models for your machine",
   "logo": {
     "light": "/wordmark-black.svg",
     "dark": "/wordmark-white.svg"
@@ -68,6 +68,7 @@
           "installation/macos",
           "installation/windows",
           "installation/linux",
+          "remote-server",
           "hardware",
           "models",
           "settings"
@@ -93,7 +94,7 @@
           "api/overview",
           "api/endpoints",
           "api/other-apps",
-          "api/other-devices",
+          "api/network-access",
           "api/windows-wsl"
         ]
       },

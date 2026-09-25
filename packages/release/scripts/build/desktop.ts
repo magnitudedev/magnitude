@@ -1,7 +1,7 @@
 import * as FileSystem from "@effect/platform/FileSystem"
 import { Effect, Schema } from "effect"
 import { packager } from "@electron/packager"
-import { resolve, join, dirname } from "node:path"
+import { resolve, join, dirname, basename } from "node:path"
 import { fileURLToPath } from "node:url"
 import { ACN_EXECUTABLE_NAME } from "../../src/executables"
 import { MACOS_DEPLOYMENT_TARGET } from "../../src/targets"
@@ -43,6 +43,10 @@ export const buildDesktopApplication = (options: {
   const icon = join(resources, "application-icon.png")
   const license = join(resources, "Magnitude-LICENSE.txt")
   const command = join(resources, "magnitude-command")
+  const extractor = join(resources, "magnitude-extract")
+  const launcher = join(resources, "magnitude-launcher.exe")
+  const updateConfiguration = join(resources, "update-configuration.json")
+  yield* fs.copyFile(join(root, "desktop/out/main/update-configuration.json"), updateConfiguration)
   const updateTrust = join(resources, "update-trust.json")
   yield* fs.copyFile(join(root, "desktop/out/main/update-trust.json"), updateTrust)
   yield* fs.copyFile(options.service, service)
@@ -51,11 +55,18 @@ export const buildDesktopApplication = (options: {
   yield* fs.chmod(cli, 0o755)
   yield* fs.copyFile(join(root, `packages/daemon-management/dist/native/${platform}-${arch}/desktop-host.node`), addon)
   yield* fs.copyFile(join(root, "assets/brand/trayTemplate@2x.png"), tray)
+  const windowsTrayIcons = platform === "win32" ? ["tray-black.ico", "tray-white.ico"].map(name => join(resources, name)) : []
+  for (const path of windowsTrayIcons) yield* fs.copyFile(join(root, "assets/brand", basename(path)), path)
   yield* fs.copyFile(join(root, "assets/brand/application-icon.png"), icon)
   yield* fs.copyFile(join(root, "LICENSE"), license)
+  if (platform === "win32") yield* fs.copyFile(join(root, "packages/daemon-management/dist/native/win32-x64/magnitude-launcher.exe"), launcher)
   if (platform !== "win32") {
     yield* fs.copyFile(join(root, `packages/daemon-management/dist/native/${platform}-${arch}/magnitude-command`), command)
     yield* fs.chmod(command, 0o755)
+  }
+  if (platform === "darwin") {
+    yield* fs.copyFile(join(root, `packages/daemon-management/dist/native/${platform}-${arch}/magnitude-extract`), extractor)
+    yield* fs.chmod(extractor, 0o755)
   }
   const electron = yield* fs.readFileString(join(root, "node_modules/electron/package.json")).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(PackageVersion))))
   return yield* Effect.tryPromise({ try: () => packager({
@@ -65,6 +76,7 @@ export const buildDesktopApplication = (options: {
     ...(platform === "win32" ? { icon: join(root, "packages/release/resources/windows/Magnitude.ico"), win32metadata: { CompanyName: "Magnitude" } } : {}),
     ...(platform === "darwin" ? { icon: join(root, "packages/release/resources/macos/Magnitude.icns"), extendInfo: { LSMinimumSystemVersion: MACOS_DEPLOYMENT_TARGET } } : {}),
     asar: true, prune: false, overwrite: true,
-    extraResource: [service, cli, addon, tray, icon, license, updateTrust, ...(platform === "win32" ? [] : [command])],
+    extraResource: [service, cli, addon, tray, ...windowsTrayIcons, icon, license, updateTrust, updateConfiguration,
+      ...(platform === "win32" ? [launcher] : [command]), ...(platform === "darwin" ? [extractor] : [])],
   }), catch: error => new DesktopBuildFailed({ message: `Could not assemble desktop: ${String(error)}` }) })
 })).pipe(Effect.mapError(error => error instanceof DesktopBuildFailed ? error : new DesktopBuildFailed({ message: String(error) })))

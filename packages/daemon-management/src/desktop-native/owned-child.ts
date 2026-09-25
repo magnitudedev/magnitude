@@ -1,4 +1,5 @@
 import type { Duplex } from "node:stream"
+import { makeChildOutput, type ChildOutputMode } from "./child-output"
 import { DesktopChildEvent, DesktopOwnerCommand } from "@magnitudedev/acn-protocol/desktop-control"
 import { receiveJsonLines, sendJsonLine, type JsonLineChannelFailed } from "@magnitudedev/utils/json-line-channel"
 import { spawn, type ChildProcess } from "node:child_process"
@@ -40,6 +41,7 @@ export interface OwnedChild {
   readonly stop: Effect.Effect<void, OwnedChildStopError>
 }
 export interface OwnedChildCommand {
+  readonly output: ChildOutputMode
   readonly executable: string
   readonly arguments: ReadonlyArray<string>
   readonly environment: Readonly<Record<string, string | undefined>>
@@ -59,14 +61,11 @@ export const makeUnixOwnedChildSpawner = Effect.gen(function* () {
   return OwnedChildSpawner.of({
     spawn: command => Effect.gen(function* () {
       if (process.platform === "win32") return yield* new OwnedChildPlatformUnsupported({ platform: process.platform })
-      const tail = yield* Ref.make("")
+      const output = yield* makeChildOutput(command.output)
       const exited = yield* Deferred.make<number>()
       const runtime = yield* Effect.runtime<never>()
       const publishExit = (code: number) => Runtime.runSync(runtime)(Deferred.succeed(exited, code))
-      const append = (chunk: Buffer) => Runtime.runSync(runtime)(Ref.update(tail, text => {
-        const bytes = Buffer.concat([Buffer.from(text), chunk])
-        return bytes.subarray(Math.max(0, bytes.length - 16_384)).toString("utf8")
-      }))
+      const append = (chunk: Buffer) => Runtime.runSync(runtime)(output.append(chunk))
       // Own the raw handle before any interruptible identity observation.
       const child = yield* Effect.acquireRelease(
         Effect.async<ChildProcess, OwnedChildSpawnFailed>(resume => {
@@ -110,7 +109,7 @@ export const makeUnixOwnedChildSpawner = Effect.gen(function* () {
       yield* Effect.addFinalizer(() => stop.pipe(Effect.catchAll(error => Effect.logError("Owned child cleanup failed", error))))
       const channel = child.stdio[3] as Duplex
       return {
-        identity, stop, exit: Deferred.await(exited), diagnosticTail: Ref.get(tail),
+        identity, stop, exit: Deferred.await(exited), diagnosticTail: output.diagnosticTail,
         events: receiveJsonLines(channel, DesktopChildEvent),
         send: command => sendJsonLine(channel, DesktopOwnerCommand, command),
       }

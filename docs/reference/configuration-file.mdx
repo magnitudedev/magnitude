@@ -29,7 +29,7 @@ Magnitude reads `~/.magnitude/config.json`, or `%USERPROFILE%\.magnitude\config.
 | `modelsDirectory` | Absolute path of the model folder. Absent means `~/.magnitude/models`. A symbolic link is followed. | Next start |
 | `network.enabled` | `true` to accept connections from other devices. Absent or `false` means this computer only. | Next start |
 | `network.bind` | One IP address of this computer. Absent means all interfaces. | Next start |
-| `network.apiKey` | The key other devices must send. Generated when network access is first enabled; **Regenerate** in Settings replaces it. | Next start |
+| `network.apiKey` | The key other devices must send. Generated when enabled through Settings. When editing this file, supply a long, randomly generated secret. | Next start |
 | `network.requireApiKey` | `false` lets other devices connect without a key. Default `true`. | Next start |
 | `network.allowedHosts` | Hostnames accepted in requests from other devices, in addition to IP addresses, `localhost`, `host.docker.internal`, and `.ts.net` names. | Next start |
 | `contextLimits.softCapRatio` | Fraction of a model's context window used before compaction. Default `0.9`. | Next model load |

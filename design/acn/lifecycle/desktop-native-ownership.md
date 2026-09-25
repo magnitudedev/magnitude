@@ -14,9 +14,28 @@ applies_to:
 
 # Native application ownership
 
-The desktop process owns the service lifetime. A passive kernel lock excludes concurrent desktop
-owners without terminating or replacing an unresponsive owner. A contender forwards intent through
-local application control or reports bounded unavailability. Lock acquisition is not service readiness.
+One application owner holds the service lifetime: Desktop or Headless. Its control snapshot carries
+that owner variant; only Desktop has tray state. A passive kernel lock excludes concurrent owners
+without terminating an unresponsive owner. A second Headless contender fails without requesting
+takeover or stopping the incumbent. Ownership contention uses bounded read-only observation to
+identify Desktop or Headless and explains which to quit, including during startup update checks.
+Unavailable or invalid observation retains a generic contention error and never authorizes startup.
+Desktop forwards intent to an existing Desktop, or requests Yield from a
+Headless owner and waits for native lock acquisition within one 60-second deadline. Yield replies
+precede teardown and acknowledge the request, not completed retirement. Desktop ignores Yield.
+Only lock acquisition after the predecessor releases ownership permits replacement. Missing control
+during cold startup or teardown, including an empty closed connection, permits bounded retry; malformed replies and access failures remain
+errors. Lock acquisition is not service readiness.
+
+Unix foreground continuation after verified installation replaces the calling process before service
+admission. It retains PID, arguments, environment, working directory and terminal streams. Native
+ownership descriptors close on exec; the replacement must acquire ownership normally before starting
+a service. Failed exec leaves the caller alive to report failure and release its retained resources.
+No shell evaluates continuation arguments, and malformed or oversized input is rejected before exec.
+The macOS installer transition explicitly transfers exclusive installation admission across its first
+exec, then restores close-on-exec when the helper adopts it. The replacement owner reacquires normal
+admission after the installation transaction completes; installer exclusion cannot leak into service
+children.
 
 The lock file lives in a private local user directory. Never unlink or replace it during recovery.
 The kernel releases ownership when the owning process exits. Child processes must not inherit the
@@ -31,6 +50,9 @@ Windows lock input names a local drive path (including its extended-length form)
 file must be a disk file with one link. Windows native acquisition creates the final private directory
 and lock with explicit current-user ownership and protected current-user-only ACLs at creation.
 Existing files and directories must satisfy that contract; acquisition does not rewrite unsafe ACLs.
+Update-cache recovery is a separate, owner-admitted operation: it may preserve and retire a recognized
+inherited cache before creating fresh private storage, under the application-update contract. It
+never repairs ownership-lock directories, follows reparse points, or authorizes unverified old bytes.
 The directory handle requests directory read access and is retained without delete sharing until lock release;
 metadata-only access does not establish that sharing protection. Directory reparse points,
 null/broad/inherited ACLs, wrong ownership and invalid file types are failures rather than contention.
@@ -56,6 +78,20 @@ sibling electron/ directory and must not pre-create the protected state leaf wit
 Desktop, CLI and installer resolve the same application.lock. Update helpers use a separate kernel
 installation lease only to exclude app startup/cleanup during replacement, never to elect a service
 or infer liveness from file presence.
+Finite update maintenance acquires the same application lock without creating a control listener,
+service or desktop. Contention fails after bounded owner observation without requesting takeover. After acquisition it
+rechecks the per-user installation lease before any update operation; release follows completion or
+cancellation of all scoped transfer work. Passive update observation does not acquire maintenance.
+Installed Linux foreground owners open the root-owned, read-only installation lock themselves and
+retain a nonblocking shared lease. Missing, unsafe or busy admission and an installation marker fail
+before service launch. The lease has a distinct native capability, releases idempotently with its
+scope, and is close-on-exec so children cannot prevent later package installation. It is independent
+of per-user application ownership.
+Installed macOS Desktop and Headless owners likewise retain shared installation admission after
+startup installation and before service creation, until their service trees retire. Admission is
+adjacent to the bundle so all user profiles share exclusion; an exclusive installer prevents owner
+admission. Unsafe or inaccessible admission fails before service creation. Development does not
+acquire an installed-bundle lease.
 Cold Windows application launch requires the caller's assigned interactive window station and its
 ordinary desktop. A noninteractive service or SSH session cannot create an unreachable tray owner.
 Native inspection failure is not permission to launch. This checks the assigned desktop rather than
@@ -77,10 +113,13 @@ Linux process-stat lookup treats ENOENT and ESRCH as process disappearance, incl
 opening and reading procfs. Other read failures remain observation failures; process disappearance
 alone still does not prove process-group retirement.
 
-Transient Unix shell probes also use a native lifetime-bound process group. A bundled helper retains
+Transient Unix commands also use a native lifetime-bound process group. A bundled helper retains
 the group until command output is drained; command exit is separate from group retirement. Parent
 death, cancellation, timeout, and output overflow retire the helper and all ordinary descendants,
-even when the command ignores termination or its shell has already exited. No probe acquires service
+even when the command ignores termination or its shell has already exited. On Linux, the helper
+retains and reaps descendants that create new process groups or sessions. Privileged package commands
+retain a caller lifetime channel across authorization; closing it retires the installer and its
+protected descendants. Interruption preserves package-manager repair state. No probe acquires service
 ownership or changes the application environment.
 
 Windows uses a parent-owned unnamed kill-on-close Job Object for children; a Unix watchdog is not
@@ -91,6 +130,21 @@ No suspended-child assignment interval or ordinary-spawn fallback is permitted. 
 selected I/O handles are inherited; the job handle is never inherited. Root exit is observed through
 the retained process handle, while full retirement is proved by the job's active-process count.
 Nested jobs and forced-owner-exit cleanup require native Windows execution, not cross-compilation.
+The Windows foreground CLI launcher owns a serving command in the same kind of atomic job.
+It resides outside the replaceable application payload and never owns application or update locks.
+It resolves the installed payload through the native user known folder, preserves arguments, working
+directory, console and standard streams, and returns the command's exit status. The launcher itself
+moves outside the payload directory before spawning. A reserved startup continuation result permits
+one replacement child only after complete tree retirement and observation of a changed executable
+file identity. It is not permission to restart a running service. Cancellation prevents continuation,
+allows bounded graceful shutdown and then terminates the retained job. Launcher death closes the
+sole job handle and contains descendants without relying on the command runtime. Native acceptance
+must prove repeated installed replacements, command context preservation, cancellation and parent
+loss before release packaging enables this entry point. Finite commands retain their ordinary
+process lifetime and may launch an independent desktop: completing `app open` cannot retire it.
+The launcher classifies the root serving command and advertises its continuation protocol only to
+that contained child. Serving admission must independently verify native containment; environment
+values alone cannot authorize an uncontained server. Finite commands cannot request continuation.
 Windows named pipes install a protected current-user DACL at creation and reject remote clients.
 The first instance refuses an existing endpoint. Native client PID observation fences child admission.
 Pending accept/read/write operations retain their buffers through confirmed cancellation; close cannot
@@ -118,7 +172,7 @@ replacement. Retirement releases them only after both zero active members and ro
 application-scope exit can force release without misreporting that as observed retirement. Observers
 cannot take ownership or dispose of the job. Windows process IDs use the same identity type for
 retained process observations and native pipe-client admission.
-CLI Quit observes the Windows application through a scoped read-only process handle acquired before
+Privileged application Quit observes the Windows application through a scoped read-only process handle acquired before
 requesting shutdown. It waits on that same handle rather than repeatedly resolving a PID, and checks
 that the reply identifies the observed application. Observation grants no termination or job rights.
 Permission failures are not process absence; cancellation releases observation without killing the
@@ -157,8 +211,7 @@ public RPC or inference contracts; the service and desktop ship as one matched a
 Login startup is an OS-owned preference, independent of the running service. Application control
 can read or explicitly change that preference; it replies only after the native adapter finishes.
 These requests never dispatch lifecycle intent or create an independent daemon. Errors are typed
-and do not masquerade as successful registration. A cold CLI registration request first ensures the
-desktop in the background; unregistration then requests full application Quit. Development builds
+and do not masquerade as successful registration. Login preference changes are Desktop operations; the CLI does not expose registration commands. Development builds
 report login registration unavailable and never register source executables.
 Linux desktop entries use the system env executable to exec the absolute application path with
 background intent, preserving the environment and process identity without a shell. This permits
@@ -170,6 +223,12 @@ Service failure presentation uses ACN's safe detail or a concise typed error mes
 stacks and stderr remain in logs instead of becoming the ordinary Status label.
 Failed child attempts retain bounded diagnostics in logs even when control-channel closure is
 observed before process exit; diagnostic visibility cannot depend on which failure wins that race.
+Each service attempt retains the final 16 KiB of output. Desktop ownership collects diagnostics
+without forwarding them to the terminal. Foreground ownership additionally forwards output to parent
+stderr, with at most one 16 KiB write outstanding. Slow terminals may lose live output; diagnostic
+collection continues independently. Terminal errors disable forwarding and cannot fail service
+admission, prevent process-tree retirement, or make shutdown wait for the terminal. Child ownership
+never closes the parent's terminal stream.
 
 On macOS and Linux, production startup automatically retires a verified previous standalone Magnitude installation
 before spawning its bundled service, while holding the application lock. This bounded upgrade is

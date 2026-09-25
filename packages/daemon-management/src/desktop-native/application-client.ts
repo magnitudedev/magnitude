@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process"
 import { Deferred, Effect, Option, Schedule, Schema } from "effect"
-import { ApplicationControlFailed, ApplicationControlUnavailable } from "./application-control"
+import { ApplicationControlClosed, ApplicationControlFailed, ApplicationControlUnavailable } from "./application-control"
 import { type ApplicationIntent, type ApplicationSnapshot } from "@magnitudedev/sdk/desktop-host"
 
 export class ApplicationLaunchFailed extends Schema.TaggedError<ApplicationLaunchFailed>()("ApplicationLaunchFailed", { message: Schema.String }) {}
@@ -49,8 +49,8 @@ export const launchApplicationProcess = <A, E, R>(command: ApplicationLaunchComm
 }))
 
 export interface ApplicationClientOptions {
-  readonly launch: (intent: "EnsureRunning" | "ShowWindow", observe: Effect.Effect<ApplicationSnapshot, ApplicationControlFailed | ApplicationControlUnavailable | ApplicationLaunchFailed>) => Effect.Effect<ApplicationSnapshot, ApplicationControlFailed | ApplicationControlUnavailable | ApplicationLaunchFailed>
-  readonly request: (intent: ApplicationIntent) => Effect.Effect<ApplicationSnapshot, ApplicationControlFailed | ApplicationControlUnavailable>
+  readonly launch: (intent: "EnsureRunning" | "ShowWindow", observe: Effect.Effect<ApplicationSnapshot, ApplicationControlClosed | ApplicationControlFailed | ApplicationControlUnavailable | ApplicationLaunchFailed>) => Effect.Effect<ApplicationSnapshot, ApplicationControlClosed | ApplicationControlFailed | ApplicationControlUnavailable | ApplicationLaunchFailed>
+  readonly request: (intent: ApplicationIntent) => Effect.Effect<ApplicationSnapshot, ApplicationControlClosed | ApplicationControlFailed | ApplicationControlUnavailable>
 }
 
 /** A request may launch once. Waiting and recovery only observe that owner; they never relaunch it. */
@@ -58,10 +58,16 @@ export const makeApplicationClient = (options: ApplicationClientOptions) => {
   const request = options.request
   const ensure = (intent: "EnsureRunning" | "ShowWindow" = "EnsureRunning") => Effect.gen(function* () {
     const existing = yield* request(intent).pipe(Effect.map(Option.some), Effect.catchTag("ApplicationControlUnavailable", () => Effect.succeed(Option.none())))
-    if (Option.isSome(existing)) return existing.value
-    const observe = request(intent).pipe(
-      Effect.retry({ while: error => error._tag === "ApplicationControlUnavailable", schedule: Schedule.spaced("100 millis") }),
-      Effect.timeoutFail({ duration: "30 seconds", onTimeout: () => new ApplicationLaunchFailed({ message: "Magnitude did not respond after launch. Open the desktop app to inspect startup." }) }),
+    if (Option.isSome(existing) && (intent !== "ShowWindow" || existing.value.owner._tag === "Desktop")) return existing.value
+    const observe = Effect.gen(function* () {
+      for (;;) {
+        const snapshot = yield* request(intent)
+        if (intent !== "ShowWindow" || snapshot.owner._tag === "Desktop") return snapshot
+        yield* Effect.sleep("100 millis")
+      }
+    }).pipe(
+      Effect.retry({ while: error => (error._tag === "ApplicationControlUnavailable" || error._tag === "ApplicationControlClosed"), schedule: Schedule.spaced("100 millis") }),
+      Effect.timeoutFail({ duration: "60 seconds", onTimeout: () => new ApplicationLaunchFailed({ message: "Magnitude did not respond after launch. Open the desktop app to inspect startup." }) }),
     )
     return yield* options.launch(intent, observe)
   }).pipe(Effect.flatMap(snapshot => snapshot.service._tag === "Stopping" || snapshot.service._tag === "Stopped"

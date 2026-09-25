@@ -41,6 +41,20 @@ archives, not only on intermediate build outputs.
 - Desktop resources include the exact headless CLI and service built with the application version.
   Apple signs both compiled runtimes with their required JIT entitlements before notarization.
   Package acceptance executes both version commands; an application update cannot leave its CLI behind.
+- Custom macOS installer acceptance runs explicitly in the Apple signing environment using isolated,
+  signed and notarized applications. A temporary publisher key and local-only update origin keep
+  fixture metadata separate from hosted releases. Public finite installation, foreground startup and Desktop startup must each install a successive
+  replacement through the copied helper, verify matching CLI/service versions after each,
+  retire prepared state and private helper/transaction storage, and leave each bundle accepted by
+  signature, notarization-ticket and Gatekeeper checks. Native unit
+  tests or injected verifier tests do not substitute for this gate.
+  Virtual signing runners may explicitly select the published CPU engine base for service
+  readiness; physical-host acceptance separately verifies accelerator inference. Fixture publisher
+  proofs are retained before runtime checks so failures can be replayed without retaining private keys.
+- Full-installation script acceptance consumes real packages over HTTPS with native publisher
+  verification enabled. It covers fresh and repeat installation, invalid publisher proof,
+  command registration, stopped state after installation, and public foreground serve plus CLI
+  queries without opening Desktop. Temporary fixture trust and routing must be removed afterward.
 
 ## Linux build baseline
 
@@ -96,7 +110,7 @@ admission, model reload, and worker cleanup.
 An independent Windows consumer extracts and runs the final archives, checks their metadata,
 and exercises engine readiness and parent-loss shutdown before candidate assembly can pass.
 Production Windows packaging uses Artifact Signing with an explicit publisher identity. Owned code,
-the embedded uninstaller, and the final installer are signed and timestamped before checksums are
+the native CLI launcher, the embedded uninstaller, and the final installer are signed and timestamped before checksums are
 recorded. Publisher and signature validation fail the build; missing credentials cannot produce a
 production installer. Bundling preserves the signed CLI and service bytes from their archives.
 Local unsigned builds carry no production trust claim.
@@ -130,6 +144,11 @@ embedding; executables use Hardened Runtime and the Bun executables receive JIT 
 Electron nested code is signed from the inside out. Electron receives its JIT entitlement; the
 bundled service retains Bun's separate JIT profile. No broad library-validation exception or device
 permissions are enabled by default. Framework symlinks remain intact in the platform installer.
+The macOS update extraction executable ships inside the sealed application resources and receives
+the native-helper entitlement profile, without a JIT entitlement. The packaged update configuration
+matches the build's Desktop configuration so foreground preparation uses the same publisher trust.
+Developer ID builds compile the Apple Team ID into both Desktop and the CLI; a missing or malformed
+identity fails the build. Installed runtime environment variables cannot replace that identity.
 
 Apple must accept the CLI, inference payload, desktop, app, and backend submissions. A rejected or incomplete
 submission fails the build and retains diagnostic logs. The app ticket is stapled and validated before

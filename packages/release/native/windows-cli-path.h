@@ -87,8 +87,8 @@ done:
 }
 
 /* Retire previous commands after installing the bundled CLI and registering its PATH. */
-__declspec(dllexport) DWORD WINAPI RemovePreviousCliCommands(LPCWSTR directory, LPWSTR conflict, DWORD capacity) {
-  if (!leaseHeld || !directory || !conflict || capacity < 2) return ERROR_INVALID_PARAMETER;
+__declspec(dllexport) DWORD WINAPI RemovePreviousCliCommands(LPCWSTR directory, LPCWSTR bundled, LPWSTR conflict, DWORD capacity) {
+  if (!leaseHeld || !directory || !bundled || !conflict || capacity < 2) return ERROR_INVALID_PARAMETER;
   conflict[0] = 0;
   WCHAR *path = calloc(CLI_PATH_CAPACITY, sizeof(WCHAR));
   WCHAR *entry = calloc(CLI_PATH_CAPACITY, sizeof(WCHAR));
@@ -110,7 +110,8 @@ __declspec(dllexport) DWORD WINAPI RemovePreviousCliCommands(LPCWSTR directory, 
       wmemcpy(entry, cursor, count); entry[count] = 0;
       DWORD needed = ExpandEnvironmentStringsW(entry, expanded, CLI_PATH_CAPACITY);
       if (!needed || needed > CLI_PATH_CAPACITY) { error = needed ? ERROR_BUFFER_OVERFLOW : GetLastError(); goto finish; }
-      if (!cli_path_entry_matches(expanded, wcslen(expanded), directory)) {
+      if (!cli_path_entry_matches(expanded, wcslen(expanded), directory) &&
+          !cli_path_entry_matches(expanded, wcslen(expanded), bundled)) {
         static const LPCWSTR extensions[] = {L"", L".exe", L".com", L".cmd", L".bat", L".ps1"};
         for (size_t i = 0; i < sizeof(extensions) / sizeof(extensions[0]); i++) {
           if (swprintf(candidate, CLI_PATH_CAPACITY, L"%ls\\magnitude%ls", expanded, extensions[i]) < 0) { error = ERROR_BUFFER_OVERFLOW; goto finish; }
@@ -131,5 +132,144 @@ __declspec(dllexport) DWORD WINAPI RemovePreviousCliCommands(LPCWSTR directory, 
   }
 finish:
   free(path); free(entry); free(expanded); free(candidate);
+  return error;
+}
+
+/* The command lives outside the replaceable application tree. Retired images can remain
+ * mapped by an existing foreground command; each publication uses a distinct name. */
+static DWORD retire_cli_images(HANDLE directory) {
+  BYTE buffer[16384];
+  FILE_INFO_BY_HANDLE_CLASS query = FileIdBothDirectoryRestartInfo;
+  for (;;) {
+    if (!GetFileInformationByHandleEx(directory, query, buffer, sizeof(buffer)))
+      return GetLastError() == ERROR_NO_MORE_FILES ? ERROR_SUCCESS : GetLastError();
+    FILE_ID_BOTH_DIR_INFO *entry = (FILE_ID_BOTH_DIR_INFO *)buffer;
+    BOOL removed = FALSE;
+    for (;;) {
+      WCHAR name[128];
+      size_t count = entry->FileNameLength / sizeof(WCHAR);
+      if (count < 128) {
+        wmemcpy(name, entry->FileName, count); name[count] = 0;
+        if ((count == 60 && !wcsncmp(name, L"magnitude-retired-", 18) && !wcscmp(name + 56, L".exe")) ||
+            (count == 61 && !wcsncmp(name, L"magnitude-incoming-", 19) && !wcscmp(name + 57, L".exe"))) {
+          HANDLE file = INVALID_HANDLE_VALUE;
+          DWORD error = open_without_reparse(directory, name, DELETE | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_NON_DIRECTORY_FILE, &file);
+          if (!error) {
+            FILE_DISPOSITION_INFO disposition = {TRUE};
+            removed = SetFileInformationByHandle(file, FileDispositionInfo, &disposition, sizeof(disposition));
+            CloseHandle(file);
+          }
+          if (removed) break;
+        }
+      }
+      if (!entry->NextEntryOffset) break;
+      entry = (FILE_ID_BOTH_DIR_INFO *)((BYTE *)entry + entry->NextEntryOffset);
+    }
+    query = removed ? FileIdBothDirectoryRestartInfo : FileIdBothDirectoryInfo;
+  }
+}
+
+__declspec(dllexport) DWORD WINAPI InstallCliLauncher(LPCWSTR source, LPCWSTR path) {
+  if (!leaseHeld || !source || !path) return ERROR_INVALID_PARAMETER;
+  DWORD error = magnitude_prepare_private_directory(path);
+  HANDLE directory = INVALID_HANDLE_VALUE, incoming = INVALID_HANDLE_VALUE, current = INVALID_HANDLE_VALUE;
+  HANDLE input = INVALID_HANDLE_VALUE;
+  WCHAR temporary[32768], retired[128];
+  GUID id;
+  WCHAR guid[40];
+  BOOL moved = FALSE;
+  if (!error) error = open_installation_directory(path, &directory);
+  if (!error) error = retire_cli_images(directory);
+  if (error) goto done;
+  if (FAILED(CoCreateGuid(&id)) || !StringFromGUID2(&id, guid, 40) ||
+      swprintf(temporary, 32768, L"%ls\\magnitude-incoming-%ls.exe", path, guid) < 0 ||
+      swprintf(retired, 128, L"magnitude-retired-%ls.exe", guid) < 0) { error = ERROR_INVALID_DATA; goto done; }
+  input = CreateFileW(source, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+  if (input == INVALID_HANDLE_VALUE) { error = GetLastError(); goto done; }
+  BY_HANDLE_FILE_INFORMATION info;
+  if (!GetFileInformationByHandle(input, &info)) { error = GetLastError(); goto done; }
+  if (info.nNumberOfLinks != 1 || (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) { error = ERROR_INVALID_DATA; goto done; }
+  error = magnitude_create_private_content(temporary);
+  if (error) goto done;
+  incoming = CreateFileW(temporary, GENERIC_WRITE | DELETE, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+  if (incoming == INVALID_HANDLE_VALUE) { error = GetLastError(); DeleteFileW(temporary); goto done; }
+  BYTE buffer[16384]; DWORD read = 0, written = 0;
+  for (;;) {
+    if (!ReadFile(input, buffer, sizeof(buffer), &read, NULL)) { error = GetLastError(); break; }
+    if (!read) break;
+    if (!WriteFile(incoming, buffer, read, &written, NULL) || written != read) { error = GetLastError(); if (!error) error = ERROR_WRITE_FAULT; break; }
+  }
+  if (!error && !FlushFileBuffers(incoming)) error = GetLastError();
+  if (error) goto done;
+  error = open_without_reparse(directory, L"magnitude.exe", DELETE | FILE_READ_ATTRIBUTES,
+    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_NON_DIRECTORY_FILE, &current);
+  if (error == ERROR_FILE_NOT_FOUND) { current = INVALID_HANDLE_VALUE; error = ERROR_SUCCESS; }
+  if (!error && current != INVALID_HANDLE_VALUE) {
+    if (!GetFileInformationByHandle(current, &info)) error = GetLastError();
+    else if (info.nNumberOfLinks != 1 || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) error = ERROR_INVALID_DATA;
+    if (!error) { error = rename_directory(current, directory, retired); moved = !error; }
+  }
+  if (!error) error = rename_directory(incoming, directory, L"magnitude.exe");
+  if (error && moved) {
+    DWORD rollback = rename_directory(current, directory, L"magnitude.exe");
+    if (rollback) error = rollback;
+  }
+  if (!error && current != INVALID_HANDLE_VALUE) {
+    FILE_DISPOSITION_INFO disposition = {TRUE};
+    SetFileInformationByHandle(current, FileDispositionInfo, &disposition, sizeof(disposition));
+  }
+done:
+  if (incoming != INVALID_HANDLE_VALUE) {
+    if (error) { FILE_DISPOSITION_INFO disposition = {TRUE}; SetFileInformationByHandle(incoming, FileDispositionInfo, &disposition, sizeof(disposition)); }
+    CloseHandle(incoming);
+  }
+  if (current != INVALID_HANDLE_VALUE) CloseHandle(current);
+  if (input != INVALID_HANDLE_VALUE) CloseHandle(input);
+  if (directory != INVALID_HANDLE_VALUE) CloseHandle(directory);
+  return error;
+}
+
+__declspec(dllexport) DWORD WINAPI RemoveCliLauncher(LPCWSTR path) {
+  if (!leaseHeld || !path) return ERROR_INVALID_PARAMETER;
+  HANDLE directory = INVALID_HANDLE_VALUE, file = INVALID_HANDLE_VALUE;
+  DWORD error = open_installation_directory(path, &directory);
+  if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return ERROR_SUCCESS;
+  if (error) return error;
+  error = retire_cli_images(directory);
+  BYTE buffer[16384];
+  FILE_INFO_BY_HANDLE_CLASS query = FileIdBothDirectoryRestartInfo;
+  while (!error) {
+    if (!GetFileInformationByHandleEx(directory, query, buffer, sizeof(buffer))) {
+      error = GetLastError();
+      if (error == ERROR_NO_MORE_FILES) error = ERROR_SUCCESS;
+      break;
+    }
+    FILE_ID_BOTH_DIR_INFO *entry = (FILE_ID_BOTH_DIR_INFO *)buffer;
+    for (;;) {
+      size_t count = entry->FileNameLength / sizeof(WCHAR);
+      BOOL dot = (count == 1 && entry->FileName[0] == L'.') || (count == 2 && !wcsncmp(entry->FileName, L"..", 2));
+      if (!dot && (count != 13 || wcsncmp(entry->FileName, L"magnitude.exe", 13))) { error = ERROR_DIR_NOT_EMPTY; break; }
+      if (!entry->NextEntryOffset) break;
+      entry = (FILE_ID_BOTH_DIR_INFO *)((BYTE *)entry + entry->NextEntryOffset);
+    }
+    query = FileIdBothDirectoryInfo;
+  }
+  if (!error) {
+    error = open_without_reparse(directory, L"magnitude.exe", DELETE | FILE_READ_ATTRIBUTES,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_NON_DIRECTORY_FILE, &file);
+    if (error == ERROR_FILE_NOT_FOUND) { file = INVALID_HANDLE_VALUE; error = ERROR_SUCCESS; }
+    if (!error && file != INVALID_HANDLE_VALUE) {
+      BY_HANDLE_FILE_INFORMATION info;
+      if (!GetFileInformationByHandle(file, &info)) error = GetLastError();
+      else if (info.nNumberOfLinks != 1 || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) error = ERROR_INVALID_DATA;
+      FILE_DISPOSITION_INFO disposition = {TRUE};
+      if (!error && !SetFileInformationByHandle(file, FileDispositionInfo, &disposition, sizeof(disposition))) error = GetLastError();
+      CloseHandle(file);
+    }
+    FILE_DISPOSITION_INFO disposition = {TRUE};
+    if (!error && !SetFileInformationByHandle(directory, FileDispositionInfo, &disposition, sizeof(disposition))) error = GetLastError();
+  }
+  CloseHandle(directory);
   return error;
 }

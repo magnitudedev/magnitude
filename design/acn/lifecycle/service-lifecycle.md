@@ -5,8 +5,8 @@ applies_to:
   - packages/acn/src/server.test.ts
   - packages/acn/src/acn-subscriptions.ts
   - packages/acn/src/icn/**
-  - cli/src/commands/server.ts
-  - cli/src/commands/server-runtime.ts
+  - cli/src/commands/status.ts
+  - cli/src/commands/status-runtime.ts
   - cli/src/server/application.ts
   - packages/acn-protocol/src/schemas/acn-health.ts
 ---
@@ -26,14 +26,14 @@ lifetime.
 
 ## Process admission
 
-The desktop application owns ACN as a direct child for the full application lifetime. ACN installs
+The admitted Desktop or Headless application owns ACN as a direct child for its full lifetime. ACN installs
 native parent-loss protection and opens its inherited control channel before application or ICN
 initialization. It reports Booted and waits for the owner to validate its retained child identity and
 send Start. No SQLite owner row, competing candidate, adoption, or ownership polling participates in
 normal serving. A missing owner channel fails startup.
 
 The parent lifetime channel remains open after readiness. Owner loss terminates the owned service
-tree; native protection does not depend on the JavaScript event loop. Only the desktop supervisor
+tree; native protection does not depend on the JavaScript event loop. Only the application supervisor
 may restart a failed service, after predecessor cleanup. Domain failures remain in their domains.
 
 ## Readiness and admission
@@ -46,7 +46,7 @@ the complete application and private ICN exist.
 observable. The first stop reason wins; both transitions are
 monotonic and idempotent.
 
-The desktop bounds startup and recovery. ACN independently owns a five-minute absolute
+The application owner bounds startup and recovery. ACN independently owns a five-minute absolute
 application-startup ceiling; optional progress cannot extend it. Expiry enters Stopping(startup-failed).
 
 ## Per-user application
@@ -77,6 +77,9 @@ an ordinary client cannot stop the service. Closing the desktop window hides it;
 Quit is the owner shutdown command. ICN remains the private mandatory child.
 
 ## Shutdown
+
+The application owner presents the user-facing shutdown reason. Routine administrative ACN shutdown
+is a debug diagnostic; unexpected shutdown reasons remain visible at the normal logging level.
 
 Every stop cause uses one process-owned, single-flight shutdown:
 

@@ -1,6 +1,6 @@
 import { Deferred, Effect, Fiber, Ref } from "effect"
 import { describe, expect, it } from "vitest"
-import { MacApplicationInstallation, MacInstallationObservationFailed, macUpdateJobIsActive, waitForMacApplicationInstallation } from "./mac-update-installation"
+import { MacApplicationInstallation, MacInstallationObservationFailed, macUpdateJobIsActive, macUpdateLookupIsActive, waitForMacApplicationInstallation } from "./mac-update-installation"
 
 const executable = "/Applications/Magnitude.app/Contents/Frameworks/Squirrel.framework/Resources/ShipIt"
 describe("Mac native update launch barrier", () => {
@@ -15,6 +15,14 @@ describe("Mac native update launch barrier", () => {
   it("does not reinterpret malformed native evidence as installation absence", async () => {
     const result = await Effect.runPromise(macUpdateJobIsActive("unexpected output", executable).pipe(Effect.either))
     expect(result._tag).toBe("Left")
+  })
+  it("accepts exact GUI-domain absence while preserving unexpected lookup failures", async () => {
+    expect(await Effect.runPromise(macUpdateLookupIsActive({ code: 112, stdout: "", stderr: "Bad request.\nCould not find domain for user gui: 501\n" }, executable, 501))).toBe(false)
+    for (const result of [
+      { code: 112, stdout: "", stderr: "Operation not permitted" },
+      { code: 112, stdout: "", stderr: "Bad request.\nCould not find domain for user gui: 502" },
+      { code: 1, stdout: "", stderr: "Bad request.\nCould not find domain for user gui: 501" },
+    ]) expect(await Effect.runPromise(macUpdateLookupIsActive(result, executable, 501).pipe(Effect.isFailure))).toBe(true)
   })
   it("waits through active installation without mutating or supervising its job", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {

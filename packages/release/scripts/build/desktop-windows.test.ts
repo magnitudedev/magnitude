@@ -57,7 +57,7 @@ describe("Windows installer source boundary", () => {
       const fixture = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-installer-input-" })
       const app = join(fixture, "app")
       yield* fs.makeDirectory(join(app, "resources"), { recursive: true })
-      for (const name of ["Magnitude.exe", "resources/app.asar", "resources/magnitude.exe", "resources/magnitude-service.exe", "resources/desktop-host.node", "resources/Magnitude-LICENSE.txt"]) {
+      for (const name of ["Magnitude.exe", "resources/app.asar", "resources/magnitude.exe", "resources/magnitude-launcher.exe", "resources/magnitude-service.exe", "resources/desktop-host.node", "resources/Magnitude-LICENSE.txt"]) {
         yield* fs.writeFileString(join(app, name), "fixture")
       }
       const guard = join(fixture, "guard.dll")

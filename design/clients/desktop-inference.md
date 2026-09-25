@@ -16,6 +16,8 @@ applies_to:
 The existing Electron application is the local inference product. Its retained renderer owns one
 SDK connection and one client-common Effect Query runtime. Electron main owns the tray and service
 supervisor; ACN owns the inference engine. Renderer recreation rereads ACN and never restarts it.
+The application snapshot identifies Desktop ownership with its tray state, separately from Headless
+ownership. Renderer background-activity presentation reads that Desktop variant directly.
 Every platform exposes full Quit in its native application menu, including when no tray host exists.
 Window Close remains hide-only; menu Quit uses the same awaited owner shutdown as tray and CLI.
 Unix SIGTERM requests that same awaited shutdown; it does not bypass child retirement.
@@ -114,7 +116,8 @@ means native registration was requested successfully, not guaranteed pixel visib
 The tray shows service and model state without a setup-completion state. First use follows the ordinary Discover, model and connection actions.
 
 A background launch starts the owner and tray without showing or focusing a window. Explicit Show
-Window or navigation intent opens it. Dock activation reopens a hidden window and explicit Open
+Window or navigation intent opens it. On Windows, left-click or double-click on the tray icon opens
+the window; right-click opens its context menu. Dock activation reopens a hidden window and explicit Open
 restores a minimized window. Raising or reactivating the retained window preserves its selected page;
 only an explicit destination from a native menu action requests navigation. Window close hides the retained renderer. Full Quit stops owned
 children, proves cleanup, and releases application ownership. Cleanup failure stays visible
@@ -214,7 +217,10 @@ Use the existing slate surfaces and blue actions/selections, Inter UI text, Mart
 shared Magnitude mark, Phosphor icons exclusively, and shared button/input/progress primitives.
 The Magnitude mark is a transparent white outline in dark appearance and its black inverse in
 light appearance. Tray artwork uses the transparent outline; macOS template rendering follows the
-menu-bar appearance. Model identities use the landing site's family/provider artwork throughout
+menu-bar appearance. Windows tray artwork is black on a light taskbar and white on a dark taskbar,
+following system theme changes independently of the application's appearance preference.
+Windows uses separate multi-resolution icons rendered from the vector artwork for native display scaling.
+Model identities use the landing site's family/provider artwork throughout
 Discover, My Models, active-model status and download activity. Action and navigation icons retain
 their existing semantics. Missing provider artwork must not be replaced with another company's logo.
 Do not create a separate palette, substitute fonts, or copy a second appearance store. Desktop

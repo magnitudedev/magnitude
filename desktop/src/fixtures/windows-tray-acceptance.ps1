@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$Evidence, [ValidateSet('Discover Models','Open Magnitude')][string]$MenuAction = 'Discover Models')
+param([Parameter(Mandatory=$true)][string]$Evidence, [ValidateSet('Discover Models','Open Magnitude','Quit Magnitude')][string]$MenuAction = 'Discover Models')
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes

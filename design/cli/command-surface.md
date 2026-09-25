@@ -22,9 +22,10 @@ desktop application.
 The public command vocabulary is:
 
 ```text
-update [check | status | download | install]
+update [check | status | download | install | discard]
 app open
-service install | uninstall | start | stop | status
+serve
+status
 hardware
 catalog status | list | show <model-id> | recommendations [--preference <value>] [--limit <count>]
 catalog pull <model-id> | cancel <model-id> | remove <model-id>
@@ -40,7 +41,8 @@ plugins call the SDK over RPC instead.
 
 ## Domain ownership
 
-- `service` reports runtime readiness, tray registration, and login-startup intent independently.
+- `serve` owns the foreground application and service tree until shutdown or cooperative Desktop handoff.
+- `status` passively reports owner and runtime readiness; tray and login-startup fields appear only for Desktop. With no owner, it prints startup guidance and exits successfully without starting anything.
 - `hardware` reports the local inference topology, current memory use, and current allocation.
 - `catalog` reports catalog assessment progress, reviewed model choices,
   machine-specific assessment evidence, recommendations, and download operations.
@@ -70,15 +72,14 @@ retryability flags, and stack traces.
 Memory uses hardware-conventional units; storage and transfer use decimal units; context uses
 compact token counts; generation speed uses `tok/s`. Rounded values are presentation only.
 
-## Plugin service startup
+## Client connections
 
-The CLI provides human-oriented commands and owns daemon administration. Plugins use the private
-bundled Effect SDK and the daemon's existing RPC endpoint for model observation and control.
-There is no model-control JSON CLI protocol or separately published integration-contract package.
-
-The SDK's optional CLI starter invokes argv `magnitude service start`. Exit status acknowledges
-the command; the SDK independently verifies Ready health and the exact RPC version before admitting
-operations. Command output remains human text and is not scraped or parsed as an application API.
+The CLI provides human-oriented commands. Plugins use the private bundled Effect SDK and the
+existing RPC endpoint for model observation and control. Both connect to an already-running
+Desktop or Headless owner without launching an application. With no owner, service-backed CLI
+commands fail with “No Magnitude service is running. Open the Magnitude desktop app or run
+`magnitude serve`.” Passive `status` reports absence successfully. There is no model-control JSON
+CLI protocol, CLI service starter, or separately published integration-contract package.
 
 ## Catalog and recommendation behavior
 
@@ -101,7 +102,7 @@ documentation command for interpreting the evidence and ranking methodology.
 `catalog show` supplies one model's useful curated and machine-specific evidence.
 
 No catalog or model observation command waits for assessment or residency to settle. Service health
-and `service start` completion are likewise independent of background assessment.
+is likewise independent of background assessment.
 
 ## Model operations
 

@@ -54,7 +54,7 @@ export class Stopped extends Schema.TaggedClass<Stopped>()("Stopped", {}) {}
 export const OwnedServiceState = Schema.Union(Starting, Ready, Failed, CleanupFailed, Stopping, Stopped)
 export type OwnedServiceState = typeof OwnedServiceState.Type
 
-export const ApplicationIntent = Schema.Literal("EnsureRunning", "ShowWindow", "Observe", "Retry", "Quit")
+export const ApplicationIntent = Schema.Literal("EnsureRunning", "ShowWindow", "Observe", "Retry", "Quit", "Yield")
 export type ApplicationIntent = typeof ApplicationIntent.Type
 export const ApplicationRequest = Schema.Struct({ version: Schema.Literal(1), intent: ApplicationIntent })
 export const TrayRegistration = Schema.Union(
@@ -62,9 +62,14 @@ export const TrayRegistration = Schema.Union(
   Schema.TaggedStruct("Unavailable", { message: Schema.String }), Schema.TaggedStruct("Closed", {}),
 )
 export type TrayRegistration = typeof TrayRegistration.Type
+export const ApplicationOwner = Schema.Union(
+  Schema.TaggedStruct("Desktop", { tray: TrayRegistration }),
+  Schema.TaggedStruct("Headless", {}),
+)
+export type ApplicationOwner = typeof ApplicationOwner.Type
 export const ApplicationSnapshot = Schema.Struct({
   version: Schema.Literal(1), pid: Schema.Int.pipe(Schema.positive()),
-  endpoint: Schema.String, service: OwnedServiceState, tray: TrayRegistration,
+  endpoint: Schema.String, service: OwnedServiceState, owner: ApplicationOwner,
 })
 export type ApplicationSnapshot = typeof ApplicationSnapshot.Type
 

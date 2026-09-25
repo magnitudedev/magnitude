@@ -4,7 +4,7 @@ import { expect, it } from "vitest"
 import { OwnedChildSpawner, OwnedChildSpawnFailed } from "./owned-child"
 import { requireServicePort } from "./service-port"
 
-const command = { executable: "test-service", arguments: [], environment: {} }
+const command = { output: "DiagnosticTail" as const, executable: "test-service", arguments: [], environment: {} }
 const reachedChild = new OwnedChildSpawnFailed({ executable: command.executable, message: "Reached child creation" })
 const listener = Effect.acquireRelease(
   Effect.async<ReturnType<typeof createServer>>(resume => {

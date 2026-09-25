@@ -8,7 +8,7 @@ import { createServer as createHttpServer } from "node:http"
 import { createServer as createLocalServer, Socket } from "node:net"
 import { ApplicationSnapshot, requestLoginStartup, requestApplicationUpdate, requestApplication, serveApplicationControl, type ApplicationIntent } from "./application-control"
 
-const snapshot = Schema.decodeUnknownSync(ApplicationSnapshot)({ version: 1, pid: process.pid, endpoint: "http://127.0.0.1:11101", service: { _tag: "Starting", attempt: 0 }, tray: { _tag: "Registered" } })
+const snapshot = Schema.decodeUnknownSync(ApplicationSnapshot)({ version: 1, pid: process.pid, endpoint: "http://127.0.0.1:11101", service: { _tag: "Starting", attempt: 0 }, owner: { _tag: "Desktop", tray: { _tag: "Registered" } } })
 const setup = Effect.acquireRelease(Effect.promise(() => mkdtemp(join(tmpdir(), "mag-ipc-"))), path => Effect.promise(() => rm(path, { recursive: true, force: true })))
 describe("local application control", () => {
   it("carries update state independently of service readiness and acknowledges before restart", async () => {
@@ -32,7 +32,7 @@ describe("local application control", () => {
     const connect = vi.spyOn(Socket.prototype, "connect")
     try {
       const requests = [
-        ...(["EnsureRunning", "ShowWindow", "Observe", "Retry", "Quit"] as const).map(intent => requestApplication(path, intent).pipe(Effect.asVoid)),
+        ...(["EnsureRunning", "ShowWindow", "Observe", "Retry", "Quit", "Yield"] as const).map(intent => requestApplication(path, intent).pipe(Effect.asVoid)),
         ...(["read", "enable", "disable"] as const).map(action => requestLoginStartup(path, action).pipe(Effect.asVoid)),
       ]
       for (const request of requests) {
@@ -71,6 +71,19 @@ describe("local application control", () => {
       }
     })))
   })
+  it("distinguishes an empty closed connection from an invalid reply", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const path = join(yield* setup, "closing.sock")
+      const server = yield* Effect.acquireRelease(Effect.sync(() => createLocalServer(socket => {
+        socket.on("error", () => {})
+        socket.once("data", () => socket.end())
+      })), server => Effect.promise(() => new Promise<void>(resolve => server.close(() => resolve()))))
+      yield* Effect.promise(() => new Promise<void>(resolve => server.listen(path, resolve)))
+      const result = yield* requestApplication(path, "ShowWindow").pipe(Effect.either)
+      expect(result._tag).toBe("Left")
+      if (result._tag === "Left") expect(result.left._tag).toBe("ApplicationControlClosed")
+    })))
+  })
   it("reports cold-start connection failure inside an HTTP callback without crashing the host", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const path = join(yield* setup, "missing.sock")
@@ -92,12 +105,12 @@ describe("local application control", () => {
       const intents = yield* Ref.make<ApplicationIntent[]>([])
       const server = yield* serveApplicationControl(path, { snapshot: Effect.succeed(snapshot), update: () => Effect.die("Unexpected update request"), login: () => Effect.succeed({ _tag: "Disabled" }), dispatch: intent => Ref.update(intents, list => [...list, intent]) })
       expect((yield* Effect.promise(() => stat(path))).mode & 0o777).toBe(0o600)
-      for (const intent of ["EnsureRunning", "ShowWindow", "Observe", "Retry", "Quit"] as const) {
+      for (const intent of ["EnsureRunning", "ShowWindow", "Observe", "Retry", "Quit", "Yield"] as const) {
         const received = yield* requestApplication(path, intent)
         expect(received.service._tag).toBe("Starting")
         expect(received.pid).toBe(process.pid)
       }
-      expect(yield* Ref.get(intents)).toEqual(["EnsureRunning", "ShowWindow", "Observe", "Retry", "Quit"])
+      expect(yield* Ref.get(intents)).toEqual(["EnsureRunning", "ShowWindow", "Observe", "Retry", "Quit", "Yield"])
       yield* Fiber.interrupt(server)
       expect(yield* Effect.promise(() => stat(path).then(() => true, () => false))).toBe(false)
     })))

@@ -414,6 +414,7 @@ function DownloadActivity() {
 }
 function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null }) {
   const service = snapshot?.service
+  const tray = snapshot?.owner._tag === "Desktop" ? snapshot.owner.tray : undefined
   const ready=service?._tag === "Ready"
   return <div className={pageLayout.statusStack}>
     <section aria-busy={!snapshot} aria-label={!snapshot ? "Loading service status" : undefined} className={pageLayout.statusHero}>
@@ -430,7 +431,7 @@ function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null
       {service?._tag === "Failed" && <Button className="mt-5" variant="outline" onClick={() => host.retry()}>Retry service</Button>}
     </section>
     <MemoryBreakdown />
-    <section className={pageLayout.card}><div className="flex items-center gap-3"><PlugIcon className="size-5 text-blue-600 dark:text-blue-400" /><h2 className="font-heading text-lg">Local connection</h2></div><p className="mt-2 text-sm text-slate-500">Your tools connect to Magnitude on this machine.</p><p className="mt-4 break-all rounded-lg bg-slate-50 p-4 font-mono text-sm dark:bg-slate-900">{snapshot?.endpoint ?? <SkeletonLine className="h-5 text-sm" width="200px" />}</p><div className="mt-5 flex items-start gap-3"><span className={`mt-1 size-2 shrink-0 rounded-full ${snapshot?.tray._tag === "Registered" ? "bg-blue-500" : "bg-slate-400"}`} /><div><p className="text-sm font-medium">Background activity</p><p className="mt-1 text-sm text-slate-500">{snapshot?.tray._tag === "Registered" ? "Magnitude keeps running when you close the window." : snapshot?.tray._tag === "Unavailable" ? snapshot.tray.message : snapshot?.tray._tag === "Closed" ? "Magnitude is quitting." : <SkeletonLine className="h-5 w-72 text-sm" />}</p></div></div></section>
+    <section className={pageLayout.card}><div className="flex items-center gap-3"><PlugIcon className="size-5 text-blue-600 dark:text-blue-400" /><h2 className="font-heading text-lg">Local connection</h2></div><p className="mt-2 text-sm text-slate-500">Your tools connect to Magnitude on this machine.</p><p className="mt-4 break-all rounded-lg bg-slate-50 p-4 font-mono text-sm dark:bg-slate-900">{snapshot?.endpoint ?? <SkeletonLine className="h-5 text-sm" width="200px" />}</p><div className="mt-5 flex items-start gap-3"><span className={`mt-1 size-2 shrink-0 rounded-full ${tray?._tag === "Registered" ? "bg-blue-500" : "bg-slate-400"}`} /><div><p className="text-sm font-medium">Background activity</p><p className="mt-1 text-sm text-slate-500">{tray?._tag === "Registered" ? "Magnitude keeps running when you close the window." : tray?._tag === "Unavailable" ? tray.message : tray?._tag === "Closed" ? "Magnitude is quitting." : <SkeletonLine className="h-5 w-72 text-sm" />}</p></div></div></section>
   </div>
 }
 type UpdateTransfer = (typeof DesktopUpdateState.Type)["transfer"]

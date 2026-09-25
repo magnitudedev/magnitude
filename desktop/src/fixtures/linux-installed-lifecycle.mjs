@@ -32,7 +32,7 @@ const request=intent=>new Promise((resolve,reject)=>{
  const socket=createConnection(endpoint);let data='';
  socket.setTimeout(5000,()=>socket.destroy(Error('Control timeout')));
  socket.on('error',reject);
- socket.on('connect',()=>socket.write(JSON.stringify({version:1,intent})+'\n'));
+ socket.on('connect',()=>socket.write(JSON.stringify(typeof intent === 'string' ? {version:1,intent} : {version:1,...intent})+'\n'));
  socket.on('data',chunk=>{data+=chunk;if(data.includes('\n')){socket.destroy();try{resolve(JSON.parse(data.split('\n')[0]))}catch(e){reject(e)}}});
 });
 let app;let coldOwner;
@@ -66,21 +66,25 @@ try {
  await until(()=>{try{process.kill(coldOwner,0);return false}catch(e){if(e.code==='ESRCH')return true;throw e}});coldOwner=undefined;
  console.log('PASS login-started owner accepts full Quit');
  const cli=args=>execFileSync(cliExecutable,args,{env,encoding:'utf8',timeout:20000});
- assert.match(cli(['service','install']),/start in the background when you log in/);
+ assert.match(cli(['app','open']),/opened/i);
  coldOwner=(await request('Observe')).pid;
  assert.match(await readFile(entry,'utf8'),/Hidden=false/);
- if(inferenceInstallation)await until(()=>/Runtime\s+Ready/.test(cli(['service','status'])));
- const status=cli(['service','status']);
+ if(inferenceInstallation)await until(()=>/Runtime\s+Ready/.test(cli(['status'])));
+ const status=cli(['status']);
  assert.match(status,inferenceInstallation?/Runtime\s+Ready/:/Runtime\s+(Starting|Failed)/);
  if(inferenceInstallation)console.log('PASS installed desktop owns a Ready service with the supplied inference installation');
  assert.match(status,/Starts at login\s+Yes/);
- assert.match(cli(['service','stop']),/service stopped/);
+ await request('Quit');
  await until(()=>{try{process.kill(coldOwner,0);return false}catch(e){if(e.code==='ESRCH')return true;throw e}});coldOwner=undefined;
  assert.match(await readFile(entry,'utf8'),/Hidden=false/);
- assert.match(cli(['service','uninstall']),/removed from login startup and quit/);
+ cli(['app','open']);
+ coldOwner=(await request('Observe')).pid;
+ assert.equal((await request({login:'disable'})).state._tag,'Disabled');
+ await request('Quit');
+ await until(()=>{try{process.kill(coldOwner,0);return false}catch(e){if(e.code==='ESRCH')return true;throw e}});coldOwner=undefined;
  assert.match(await readFile(entry,'utf8'),/Hidden=true/);
- assert.match(cli(['service','status']),/Runtime\s+Stopped/);
- console.log('PASS compiled Linux CLI install/status/stop/uninstall uses the desktop owner and preserves stop-versus-uninstall semantics');
+ assert.match(cli(['status']),/Runtime\s+Stopped/);
+ console.log('PASS compiled Linux CLI app open/status observes Desktop; Quit preserves login and explicit login disable persists');
  app=await electron.launch({chromiumSandbox:true,executablePath,args:['--background'],env,timeout:20000});
  await (await app.firstWindow()).waitForLoadState('domcontentloaded');
  const shutdownProcess=app.process();
@@ -88,7 +92,7 @@ try {
  await app.evaluate(({powerMonitor})=>powerMonitor.emit('shutdown',{preventDefault(){throw Error('System shutdown must not be vetoed')}}));
  await shutdownClosed;app=undefined;
  assert.equal(shutdownProcess.exitCode,0);
- assert.match(cli(['service','status']),/Runtime\s+Stopped/);
+ assert.match(cli(['status']),/Runtime\s+Stopped/);
  console.log('PASS simulated Linux powerMonitor shutdown: no veto, exit0, owner stopped; not an OS logout test');
 
  {

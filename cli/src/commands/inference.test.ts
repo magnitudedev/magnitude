@@ -20,7 +20,7 @@ import {
 const startupProbe = vi.hoisted(() => vi.fn(() => { throw new Error("Unexpected service startup") }))
 vi.mock("../server/acn-connection", async () => {
   const { Effect } = await import("effect")
-  return { headlessAcnConnection: Effect.sync(startupProbe) }
+  return { existingAcnConnection: Effect.sync(startupProbe) }
 })
 
 type CatalogSnapshotState = Exclude<ModelCatalogState, { readonly _tag: "Initializing" }>

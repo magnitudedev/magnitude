@@ -1,6 +1,6 @@
 # CLI Architecture
 
-The CLI is entirely headless. It exposes finite commands for agents and terminal users; onboarding and visual interaction belong to the desktop application. Do not add a TUI, chat harness, terminal renderer, or interactive onboarding.
+The CLI is entirely headless. It exposes finite commands for agents and terminal users plus the foreground `serve` owner; onboarding and visual interaction belong to the desktop application. Do not add a TUI, chat harness, terminal renderer, or interactive onboarding.
 
 ## Client-State Guidance
 

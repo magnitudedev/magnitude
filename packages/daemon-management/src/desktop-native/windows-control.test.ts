@@ -39,7 +39,7 @@ const fixture = () => {
   return { instances, layer: windowsPrivatePipesLayer(native) }
 }
 const name = WindowsPipeName.make("\\\\.\\pipe\\magnitude-control-fixture")
-const snapshot = Schema.decodeUnknownSync(ApplicationSnapshot)({ version: 1, pid: process.pid, endpoint: "http://127.0.0.1:11101", service: { _tag: "Starting", attempt: 0 }, tray: { _tag: "Registered" } })
+const snapshot = Schema.decodeUnknownSync(ApplicationSnapshot)({ version: 1, pid: process.pid, endpoint: "http://127.0.0.1:11101", service: { _tag: "Starting", attempt: 0 }, owner: { _tag: "Desktop", tray: { _tag: "Registered" } } })
 const waitFor = (predicate: () => boolean) => Effect.repeat(Effect.sync(predicate), { until: Boolean, schedule: Schedule.spaced("1 millis") }).pipe(Effect.timeout("2 seconds"))
 
 describe("Windows application control (simulated native transport)", () => {
@@ -57,7 +57,7 @@ describe("Windows application control (simulated native transport)", () => {
     expect(result._tag).toBe("Left")
     if (result._tag === "Left") expect(result.left._tag).toBe("WindowsPipeFailed")
   })
-  it.each(["EnsureRunning", "ShowWindow", "Observe", "Retry", "Quit"] as const)("retains a listener and writes the snapshot before dispatching %s", async intent => {
+  it.each(["EnsureRunning", "ShowWindow", "Observe", "Retry", "Quit", "Yield"] as const)("retains a listener and writes the snapshot before dispatching %s", async intent => {
     const test = fixture()
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const done = yield* Deferred.make<void>()
@@ -65,7 +65,7 @@ describe("Windows application control (simulated native transport)", () => {
         snapshot: Effect.succeed(snapshot), update: () => Effect.die("Unexpected update request"), login: () => Effect.succeed({ _tag: "Disabled" }),
         dispatch: received => Effect.sync(() => {
           expect(received).toBe(intent)
-          expect(JSON.parse(Buffer.concat(test.instances[0]!.output).toString()).tray._tag).toBe("Registered")
+          expect(JSON.parse(Buffer.concat(test.instances[0]!.output).toString()).owner.tray._tag).toBe("Registered")
           expect(test.instances[1]!.closed).toBe(false)
         }).pipe(Effect.zipRight(Deferred.succeed(done, undefined))),
       })

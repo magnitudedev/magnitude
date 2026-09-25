@@ -10,11 +10,11 @@ export interface MacApplicationInstallation {
   readonly isInstalling: (bundle: string) => Effect.Effect<boolean, MacInstallationObservationFailed>
 }
 export const MacApplicationInstallation = Context.GenericTag<MacApplicationInstallation>("desktop/MacApplicationInstallation")
-const Result = Schema.Struct({ code: Schema.Int, stdout: Schema.String })
+const Result = Schema.Struct({ code: Schema.Int, stdout: Schema.String, stderr: Schema.String })
 const command = (executable: string, args: readonly string[]) => Effect.async<typeof Result.Type, MacInstallationObservationFailed>(resume => {
-  const child = execFile(executable, [...args], { encoding: "utf8", timeout: 5000, maxBuffer: 128 * 1024 }, (error, stdout) => {
+  const child = execFile(executable, [...args], { encoding: "utf8", timeout: 5000, maxBuffer: 128 * 1024, env: { ...process.env, LC_ALL: "C" } }, (error, stdout, stderr) => {
     if (error !== null && typeof error.code !== "number") return resume(new MacInstallationObservationFailed({ message: "Could not inspect the native Magnitude updater. Retry the command." }))
-    resume(Effect.succeed({ code: typeof error?.code === "number" ? error.code : 0, stdout }))
+    resume(Effect.succeed({ code: typeof error?.code === "number" ? error.code : 0, stdout, stderr }))
   })
   return Effect.sync(() => child.kill())
 })
@@ -28,6 +28,14 @@ export const macUpdateJobIsActive = (output: string, executable: string) => Effe
   return state !== "not running"
 })
 
+/** A user without a GUI domain cannot have an updater registered in that domain. */
+export const macUpdateLookupIsActive = (result: typeof Result.Type, executable: string, uid: number) => Effect.gen(function* () {
+  if (result.code === 113) return false
+  if (result.code === 112 && result.stderr.trim() === `Bad request.\nCould not find domain for user gui: ${uid}`) return false
+  if (result.code !== 0) return yield* new MacInstallationObservationFailed({ message: "Could not inspect the native Magnitude update job. Retry the command." })
+  return yield* macUpdateJobIsActive(result.stdout, executable)
+})
+
 /** Capture bundle identity while it is stable, before replacement can temporarily move it. */
 export const observeMacApplicationInstallation = (bundle: string) => Effect.gen(function* () {
   const canonical = yield* Effect.tryPromise({ try: () => realpath(bundle), catch: () => new MacInstallationObservationFailed({ message: "Could not locate the Magnitude app while checking its update." }) })
@@ -36,9 +44,7 @@ export const observeMacApplicationInstallation = (bundle: string) => Effect.gen(
   if (metadata.code !== 0 || !/^[A-Za-z0-9.-]+$/.test(identifier)) return yield* new MacInstallationObservationFailed({ message: "Could not read the installed Magnitude app identity." })
   return Effect.gen(function* () {
     const job = yield* command("/bin/launchctl", ["print", `gui/${process.getuid!()}/${identifier}.ShipIt`])
-    if (job.code === 113) return false
-    if (job.code !== 0) return yield* new MacInstallationObservationFailed({ message: "Could not inspect the native Magnitude update job. Retry the command." })
-    return yield* macUpdateJobIsActive(job.stdout, join(canonical, "Contents/Frameworks/Squirrel.framework/Resources/ShipIt"))
+    return yield* macUpdateLookupIsActive(job, join(canonical, "Contents/Frameworks/Squirrel.framework/Resources/ShipIt"), process.getuid!())
   })
 })
 

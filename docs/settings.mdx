@@ -44,8 +44,8 @@ Off by default. When on, other devices can use Magnitude for inference. Nothing 
 | API key | Generated once. Other devices send it with every request. Turn off **Require key** only on a network you trust. **Regenerate** replaces it. |
 | Reachable at | The base URL to use on other devices. |
 
-Changes apply after Magnitude restarts. For how to connect from another computer, a tailnet, a container, or WSL, see [Other devices](/api/other-devices).
+These settings also apply to `magnitude serve`. Changes apply after Magnitude restarts. For how to connect from another computer, a tailnet, a container, or WSL, see [Network access](/api/network-access).
 
 ## Automatic updates
 
-Downloads updates in the background when they are available. Installing an update still requires **Restart to update**.
+Downloads updates in the background when they are available. In Desktop, use **Restart to update** to install. A headless server keeps running and applies a prepared update at its next startup. See [Update the server](/remote-server#update-the-server).

@@ -73,11 +73,35 @@ pub struct SystemMemoryObservation {
 }
 
 pub fn observe_system_memory() -> Result<SystemMemoryObservation, String> {
+    let (physical_capacity_bytes, physical_available_bytes) = sample_physical_memory();
+    normalize_system_memory(physical_capacity_bytes, physical_available_bytes)
+}
+
+/// Samples physical memory once for every ICN caller so discovery and later observations apply
+/// the same consistency rules.
+fn sample_physical_memory() -> (u64, u64) {
     let mut system = System::new_with_specifics(
         RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
     );
     system.refresh_memory_specifics(MemoryRefreshKind::everything());
-    normalize_system_memory(system.total_memory(), system.available_memory())
+    clamp_physical_memory_sample(system.total_memory(), system.available_memory())
+}
+
+/// Some operating systems report reclaimable memory such that available briefly exceeds the
+/// installed physical capacity. Keep the sample internally consistent instead of making model
+/// admission fail because of that sampling discrepancy. An unknown (zero) capacity is left
+/// untouched so callers can apply their own fallback.
+fn clamp_physical_memory_sample(
+    physical_capacity_bytes: u64,
+    physical_available_bytes: u64,
+) -> (u64, u64) {
+    if physical_capacity_bytes == 0 {
+        return (physical_capacity_bytes, physical_available_bytes);
+    }
+    (
+        physical_capacity_bytes,
+        physical_available_bytes.min(physical_capacity_bytes),
+    )
 }
 
 /// Normalizes an already-sampled physical-memory observation into ICN's allocation contract.
@@ -88,11 +112,13 @@ pub fn normalize_system_memory(
     physical_capacity_bytes: u64,
     physical_available_bytes: u64,
 ) -> Result<SystemMemoryObservation, String> {
-    if physical_capacity_bytes == 0 || physical_available_bytes > physical_capacity_bytes {
+    if physical_capacity_bytes == 0 {
         return Err(format!(
             "invalid system memory observation: total={physical_capacity_bytes}, available={physical_available_bytes}"
         ));
     }
+    let (physical_capacity_bytes, physical_available_bytes) =
+        clamp_physical_memory_sample(physical_capacity_bytes, physical_available_bytes);
     let platform_limit = platform_allocation_limit()?;
     Ok(SystemMemoryObservation {
         physical_capacity_bytes,
@@ -373,12 +399,7 @@ pub fn discover_hardware(
     native_build: impl Into<String>,
     enabled_backends: Vec<String>,
 ) -> HardwareSnapshot {
-    let mut system = System::new_with_specifics(
-        RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
-    );
-    system.refresh_memory();
-    let total_bytes = system.total_memory();
-    let available_bytes = system.available_memory();
+    let (total_bytes, available_bytes) = sample_physical_memory();
     let thresholds = system_memory_thresholds(total_bytes);
     let mut system_memory = HardwareSystemMemory {
         physical_capacity_bytes: total_bytes,
@@ -2771,6 +2792,40 @@ fn path_c_string(path: &Path) -> Result<CString, NativePlanningError> {
 mod tests {
     use super::*;
     use llama_cpp_2::model::params::fit::{FitAllocations, FitDeviceKind, FitMemoryEstimate};
+
+    #[test]
+    fn system_memory_observation_clamps_available_memory_to_physical_capacity() {
+        let capacity = 137_438_953_472;
+        let observation = normalize_system_memory(capacity, 137_855_139_840).unwrap();
+
+        assert_eq!(observation.physical_capacity_bytes, capacity);
+        assert_eq!(observation.physical_available_bytes, capacity);
+    }
+
+    #[test]
+    fn physical_memory_sample_clamps_available_memory_to_known_capacity() {
+        let capacity = 137_438_953_472;
+
+        assert_eq!(
+            clamp_physical_memory_sample(capacity, 137_855_139_840),
+            (capacity, capacity)
+        );
+        assert_eq!(
+            clamp_physical_memory_sample(capacity, 1_024),
+            (capacity, 1_024)
+        );
+        assert_eq!(clamp_physical_memory_sample(0, 1_024), (0, 1_024));
+    }
+
+    #[test]
+    fn system_memory_observation_rejects_zero_physical_capacity() {
+        let error = normalize_system_memory(0, 1).unwrap_err();
+
+        assert_eq!(
+            error,
+            "invalid system memory observation: total=0, available=1"
+        );
+    }
 
     #[test]
     fn system_memory_policy_uses_fractional_reserves_with_absolute_floors() {

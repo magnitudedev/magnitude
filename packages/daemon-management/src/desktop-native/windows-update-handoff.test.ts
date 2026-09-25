@@ -20,9 +20,14 @@ const request: WindowsUpdateHandoffRequest = {
   stateDirectory: "C:\\Users\\tester\\Magnitude",
   helperDirectory: "C:\\Users\\tester\\Magnitude\\update-helpers\\helper-12345678-1234-1234-1234-123456789abc",
   applicationPath: "C:\\Users\\tester\\AppData\\Local\\Programs\\Magnitude\\Magnitude.exe",
-  dataDirectory: "C:\\Users\\tester\\.magnitude", showWindow: false,
+  dataDirectory: "C:\\Users\\tester\\.magnitude", continuation: { _tag: "Desktop", showWindow: false },
   release: Schema.decodeUnknownSync(UpdateRelease)({ version: "2.0.0", bytes: 1, sha256: "a".repeat(64), signature: "A".repeat(86) + "==" }),
 }
+it("leaves caller continuation to the invoking command without launching Desktop", async () => {
+  await Effect.runPromise(relaunchWindowsAfterUpdate({ ...request, continuation: { _tag: "Caller" } }))
+  expect(spawn).not.toHaveBeenCalled()
+})
+
 describe("Windows update handoff", () => {
   it.each([
     { helperDirectory: "C:\\unrelated\\helper-12345678-1234-1234-1234-123456789abc" },

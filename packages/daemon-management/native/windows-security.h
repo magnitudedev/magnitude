@@ -9,6 +9,8 @@ DWORD magnitude_open_private_lock(const WCHAR *path, HANDLE *file, HANDLE *direc
 DWORD magnitude_validate_private_directory(HANDLE directory);
 /* Update material is created with explicit current-user ownership and a protected private ACL. */
 DWORD magnitude_prepare_private_directory(const WCHAR *path);
+/* Under exclusive application/update admission, preserve and retire only a known inherited cache. */
+DWORD magnitude_recover_update_directory(const WCHAR *path, BOOL *retired);
 DWORD magnitude_create_private_content(const WCHAR *path);
 DWORD magnitude_validate_private_content(const WCHAR *path);
 DWORD magnitude_directory_endpoint(HANDLE directory, WCHAR endpoint[128]);

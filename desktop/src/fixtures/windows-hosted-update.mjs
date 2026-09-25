@@ -36,7 +36,8 @@ execFileSync('pwsh', ['-NoProfile', '-Command', '& { param($p) $s=Get-Authentico
 await unlink(installer)
 console.log('PASS actual hosted installer download, publisher signature and native fresh install')
 const data = join(root, 'consumer-profile')
-const state = join(data, 'desktop')
+const state = join(data, 'state')
+await mkdir(join(data, 'updates'), { recursive: true, mode: 0o700 })
 const env = { ...process.env, MAGNITUDE_DEV_DATA_DIR: data, MAGNITUDE_DESKTOP_STATE_DIR: state, MAGNITUDE_DEV_PORT: '11143' }
 const executablePath = join(installation, 'Magnitude.exe')
 const cli = args => execFileSync(join(installation, 'resources/magnitude.exe'), args, { env, encoding: 'utf8', timeout: 30000 })
@@ -62,13 +63,13 @@ try {
   let page = await app.firstWindow()
   await page.getByRole('button', { name: 'Settings', exact: true }).click()
   const automatic = page.getByRole('switch', { name: 'Automatic updates' })
-  const preferencesPath = join(data, 'updates/preferences.json')
+  const preferencesPath = join(data, 'config.json')
   for (const enabled of [false, true, false]) {
     await automatic.click()
     await automatic.and(page.locator(`[aria-checked="${enabled}"]`)).waitFor({ timeout: 10000 })
-    assert.equal(JSON.parse(await readFile(preferencesPath, 'utf8')).autoDownload, enabled)
+    assert.equal(JSON.parse(await readFile(preferencesPath, 'utf8')).autoDownloadUpdates, enabled)
   }
-  const keyPath = join(data, 'updates/installation-key.pem')
+  const keyPath = join(data, 'identity.pem')
   const identity = await readFile(keyPath)
   const publicBytes = createPublicKey(identity).export({ type: 'spki', format: 'der' }).subarray(-32)
   const installationId = createHash('sha256').update(publicBytes).digest('hex')
@@ -102,7 +103,7 @@ try {
   while (Date.now() < restarted) {
     try {
       if (cli(['--version']).trim() === to) {
-        status = cli(['service', 'status'])
+        status = cli(['status'])
         if (/Tray\s+Registered/i.test(status)) break
       }
     } catch {}
@@ -114,8 +115,12 @@ try {
   assert.equal(JSON.parse(await readFile(preferencesPath, 'utf8')).autoDownload, false)
   await writeFile(join(evidence, 'after-relaunch.txt'), status)
   console.log('PASS real Settings download/restart, updated installed version, automatic owner/tray relaunch and identity preservation')
-  cli(['service', 'stop'])
-  await delay(1000)
+  execFileSync('powershell', ['-NoProfile', '-File', fileURLToPath(new URL('./windows-tray-acceptance.ps1', import.meta.url)), '-Evidence', evidence, '-MenuAction', 'Quit Magnitude'], { stdio: 'inherit', timeout: 60000 })
+  const stoppedDeadline = Date.now() + 30000
+  while (!/Runtime\s+Stopped/.test(cli(['status']))) {
+    assert.ok(Date.now() < stoppedDeadline, 'Updated owner did not quit')
+    await delay(100)
+  }
   app = await electron.launch({ executablePath, env, timeout: 30000 })
   page = await app.firstWindow()
   await page.getByRole('button', { name: 'Settings', exact: true }).click()
@@ -127,7 +132,7 @@ try {
   await page.getByRole('heading', { name: 'Discover', exact: true }).waitFor({ timeout: 10000 })
   await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().forEach(window => window.close()))
   assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().some(window => window.isVisible())), false)
-  assert.match(cli(['service', 'status']), /Tray\s+Registered/i)
+  assert.match(cli(['status']), /Tray\s+Registered/i)
   execFileSync('powershell', ['-NoProfile', '-File', fileURLToPath(new URL('./windows-tray-acceptance.ps1', import.meta.url)), '-Evidence', evidence, '-MenuAction', 'Open Magnitude'], { stdio: 'inherit', timeout: 60000 })
   await page.getByRole('heading', { name: 'Discover', exact: true }).waitFor({ timeout: 10000 })
   assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().some(window => window.isVisible())), true)

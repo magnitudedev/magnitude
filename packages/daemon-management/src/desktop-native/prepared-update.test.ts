@@ -2,7 +2,7 @@ import { FileSystem } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import { Effect, Option, Schema } from "effect"
 import { createHash, generateKeyPairSync } from "node:crypto"
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
@@ -26,6 +26,34 @@ const make = Effect.gen(function* () {
 const run = <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem>) => Effect.runPromise(effect.pipe(Effect.provide(BunContext.layer)))
 beforeEach(async () => { root = await mkdtemp(join(tmpdir(), "prepared-update-")); archive = join(root, "download"); await writeFile(archive, bytes) })
 afterEach(async () => rm(root, { recursive: true, force: true }))
+
+describe("last update outcome", () => {
+  it("keeps one outcome, reports it once, ignores a repeat of the same result, and drops a corrupt record", async () => {
+    const failed = { outcome: "failed" as const, version: "2.0.0", reason: Option.some("install" as const) }
+    const applied = { outcome: "applied" as const, version: "2.0.0", reason: Option.none() }
+    await run(Effect.gen(function* () {
+      const store = yield* make
+      expect(Option.isNone(yield* store.outcome)).toBe(true)
+      yield* store.markOutcomeReported
+      yield* store.recordOutcome(failed)
+      expect(yield* store.outcome).toEqual(Option.some(failed))
+      yield* store.markOutcomeReported
+      expect(Option.isNone(yield* store.outcome)).toBe(true)
+      yield* store.recordOutcome(failed)
+      expect(Option.isNone(yield* store.outcome)).toBe(true)
+      yield* store.recordOutcome(applied)
+      expect(yield* store.outcome).toEqual(Option.some(applied))
+    }))
+    expect(JSON.parse(await readFile(join(root, "updates/outcome.json"), "utf8"))).toEqual({ outcome: { outcome: "applied", version: "2.0.0" }, reported: false })
+    await writeFile(join(root, "updates/outcome.json"), "{not json")
+    await run(Effect.gen(function* () {
+      const store = yield* make
+      expect(Option.isNone(yield* store.outcome)).toBe(true)
+      yield* store.recordOutcome(failed)
+      expect(yield* store.outcome).toEqual(Option.some(failed))
+    }))
+  })
+})
 
 describe("one durable prepared update", () => {
   it("persists verified bytes and only the release and installation union across reconstruction", async () => {
@@ -90,8 +118,12 @@ describe("one durable prepared update", () => {
     await run(Effect.gen(function* () { const store = yield* make; yield* store.prepare(archive, release); yield* store.discard }))
     await writeFile(join(root, "updates/installer-12345678-1234-1234-1234-123456789abc.tmp"), "partial")
     await writeFile(join(root, "updates/magnitude.deb"), "orphan")
+    await mkdir(join(root, "update-downloads/desktop-update-abc123"), { recursive: true })
+    await writeFile(join(root, "update-downloads/desktop-update-abc123/partial.exe"), "partial")
+    await writeFile(join(root, "update-downloads/unknown"), "preserve")
     await run(Effect.gen(function* () { const store = yield* make; yield* store.removeAbandonedTransfers }))
     expect(await readdir(join(root, "updates"))).toEqual([])
+    expect(await readdir(join(root, "update-downloads"))).toEqual(["unknown"])
     expect(await readFile(join(root, "identity.pem"), "utf8")).toBe("private identity")
     expect(await readFile(join(root, "config.json"), "utf8")).toBe("{}")
   })

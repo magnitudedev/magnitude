@@ -1,15 +1,15 @@
 ---
 applies_to:
-  - packages/release/src/contracts.ts
-  - packages/release/src/executables.ts
-  - packages/release/src/targets.ts
+  - packages/release/src/*.ts
   - packages/release/scripts/assemble.ts
+  - packages/release/scripts/prepare-installation-distribution.ts
   - packages/release/scripts/build/**
-  - packages/release/native/windows-installer.*
-  - packages/release/native/windows-cli-path.h
+  - packages/release/native/**
   - packages/release/resources/windows/desktop.nsi
+  - packages/release/resources/install.*
   - packages/release/scripts/apple/desktop.ts
   - packages/launcher/package.json
+  - packages/daemon-management/src/desktop-native/mac-cli-*.ts
 ---
 
 # Release distribution
@@ -51,8 +51,12 @@ The desktop bundle owns the window, tray, and service lifecycle. Inference artif
 remain outside the app. Its installer preserves the sealed native bundle, including framework
 symlinks; runtime archive extraction never installs or interprets a desktop artifact. Signing and
 notarization precede final installer checksums. Ad-hoc local builds never imply publisher trust.
-Initial desktop installation uses direct platform downloads, with a DMG on macOS and no curl/shell
-installer. Both Mac architectures open a compact, styled installer window with explicit drag-to-install
+Initial installation supports direct platform downloads and full-application shell installers.
+The macOS shell installer verifies the downloaded bootstrap before invoking its finite bundled CLI
+installer outside the destination. That entry verifies signed release metadata and bundle contents,
+uses shared installation admission and transactions, and registers the command through shared host
+code. Installation never starts Desktop or a headless server. The macOS DMG remains available;
+both Mac architectures open a compact, styled installer window with explicit drag-to-install
 instructions, the app on the left, a directional arrow, and a working Applications shortcut on the right.
 On macOS and Linux, opening the new desktop automatically retires verified previous standalone services and their
 startup registrations before starting the bundled service. No command or confirmation is required.
@@ -76,7 +80,10 @@ script lifetimes; launches fail with repair guidance until configuration succeed
 installation never becomes an independently running service. The lock inode survives reinstall.
 Package abort hooks must preserve a healthy old installation after a rejected upgrade. Debian's
 `postinst abort-upgrade` and `abort-remove` release the gate after the package manager restores the
-old installation; a refusal before gate acquisition does not acquire or clear another owner's gate.
+old installation; a Debian refusal before gate acquisition does not acquire or clear another owner's gate.
+RPM removal refusal retains the repair gate because DNF can still remove automatic dependencies
+from the failed transaction. The existing owner continues running, but subsequent startup requires
+package reinstallation to restore dependencies and clear the gate.
 `/usr/bin/magnitude-desktop` is the graphical launch entry; `/usr/bin/magnitude` resolves the
 bundled headless CLI. Login registration remains a user preference controlled
 by the running application. Package installation does not register an independent daemon or
@@ -84,7 +91,10 @@ automatically open a window. Native DEB/RPM consumption and upgrade acceptance p
 in the published artifact graph.
 
 Windows installer candidates use the desktop's existing application lease and never start or adopt
-an independent service. Fresh installation publishes a complete staged payload by same-volume rename.
+an independent service. The PowerShell bootstrap authenticates a publisher-signed standalone CLI
+before using its embedded publisher key to verify the installer release and bytes. It separately
+authenticates the installer, waits for silent setup, and refreshes command PATH in the invoking shell.
+Both executable signatures require the configured publisher and a timestamp. Fresh installation publishes a complete staged payload by same-volume rename.
 A private installer-owned scratch container permits recovery after interrupted extraction; cleanup
 is relative to retained handles and cannot follow directory redirections. Existing unsafe scratch
 permissions are rejected without repair. The installed uninstaller is the sole removal record and
@@ -98,7 +108,11 @@ complete file/directory membership; unknown files, duplicate names, redirected p
 hard-linked payloads fail inspection without mutation. Replacement retains the previous payload
 until the registered version is durably committed. Rerunning setup restores the previous version
 before that commit or finishes exact owned-file retirement afterward. The previous installation
-is never extraction scratch. Upgrades preserve startup and shortcut preferences. No pre-cutover
+is never extraction scratch. Uninstall retires that previous tree against its inventory before
+changing the current payload, PATH, startup preference or registration. Unknown or mapped previous
+files defer removal while the exact uninstaller and recovery registration remain available. Retrying
+removal after the obstruction is gone must leave no previous payload that could block a fresh install.
+Upgrades preserve startup and shortcut preferences. No pre-cutover
 installation compatibility is implied, and automatic delivery remains gated on native acceptance.
 
 ## Distribution contract
@@ -119,12 +133,25 @@ The concrete host dependency contracts are defined in
 [CLI updates](./client-updates.md), and remote publication is defined in
 [Publication](./publication.md).
 
+Installer distribution preparation consumes authenticated publisher records and emits both scripts
+and per-channel target offers into a fresh static hosting directory. It verifies the complete input
+batch before writing and rejects duplicate targets or mixed release versions. Preparing these files
+does not deploy them or promote a channel. Linux bootstrap requires curl, Python 3 and OpenSSL with
+Ed25519 support; Windows bootstrap uses the publisher-signed CLI from the selected release.
+
 ## Desktop-owned command registration
 
-The installed desktop exposes its bundled CLI directly. macOS silently creates the user-owned
+The installed desktop exposes its bundled CLI. macOS silently creates the user-owned
 `~/.magnitude/bin/magnitude` link on installed-app launch and prepends that directory using marked
-shell configuration entries. It never requests administrator authorization. Windows registers the
-bundled CLI directory in the current user's PATH. Linux retains its package-owned
+shell configuration entries. Shared host code owns command placement and shell configuration for
+both Desktop and installation, including removal of only unchanged managed entries. It never
+requests administrator authorization. Windows registers a
+private native launcher outside the replaceable application tree in the current user's PATH. The
+launcher resolves the matched bundled CLI on each invocation and retains foreground command ownership
+across a startup update. Launcher publication preserves mapped prior images under distinct retired
+names; a later installation removes them after their commands exit. Retrying setup repairs an
+interrupted publication. Uninstall defers while retired images are mapped or the command directory
+contains unrelated files. Linux retains its package-owned
 `/usr/bin/magnitude` link. App replacement keeps the command pointed at the matching bundled
 version. No npm launcher is required.
 

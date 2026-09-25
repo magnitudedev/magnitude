@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <wchar.h>
@@ -26,6 +27,11 @@ void magnitude_register_windows_updates(napi_env env, napi_value exports);
 
 void magnitude_register_application_memory(napi_env env, napi_value exports);
 void magnitude_register_machine_identity(napi_env env, napi_value exports);
+#ifdef __APPLE__
+void magnitude_register_mac_updates(napi_env env, napi_value exports);
+void magnitude_register_mac_update_filesystem(napi_env env, napi_value exports);
+void magnitude_register_mac_update_lease(napi_env env, napi_value exports);
+#endif
 
 typedef struct {
 #ifdef _WIN32
@@ -42,6 +48,58 @@ static napi_value failure(napi_env env, const char *message) {
   napi_throw_error(env, NULL, message);
   return NULL;
 }
+
+#ifndef _WIN32
+static char *continuation_string(napi_env env, napi_value value, size_t *budget) {
+  size_t length = 0, written = 0;
+  if (napi_get_value_string_utf8(env, value, NULL, 0, &length) != napi_ok || length > *budget) return NULL;
+  char *text = malloc(length + 1);
+  if (!text) return NULL;
+  if (napi_get_value_string_utf8(env, value, text, length + 1, &written) != napi_ok ||
+      written != length || memchr(text, 0, length)) { free(text); return NULL; }
+  *budget -= length;
+  return text;
+}
+
+/* Replacement retains the caller's PID, cwd and stdio; ownership descriptors stay close-on-exec. */
+static napi_value replace_process(napi_env env, napi_callback_info info) {
+  napi_value input[3]; size_t argc = 3, budget = 1024 * 1024;
+  uint32_t argument_count = 0, environment_count = 0;
+  bool array = false;
+  char *path = NULL, **arguments = NULL, **environment = NULL;
+  const char *message = "Invalid foreground continuation";
+  if (napi_get_cb_info(env, info, &argc, input, NULL, NULL) != napi_ok || argc != 3) goto done;
+  path = continuation_string(env, input[0], &budget);
+  if (!path || path[0] != '/') goto done;
+  if (napi_is_array(env, input[1], &array) != napi_ok || !array ||
+      napi_get_array_length(env, input[1], &argument_count) != napi_ok || argument_count > 4096) goto done;
+  if (napi_is_array(env, input[2], &array) != napi_ok || !array ||
+      napi_get_array_length(env, input[2], &environment_count) != napi_ok || environment_count > 4096) goto done;
+  arguments = calloc((size_t)argument_count + 2, sizeof(char *));
+  environment = calloc((size_t)environment_count + 1, sizeof(char *));
+  if (!arguments || !environment) goto done;
+  arguments[0] = path;
+  for (uint32_t i = 0; i < argument_count; i++) {
+    napi_value value;
+    if (napi_get_element(env, input[1], i, &value) != napi_ok ||
+        !(arguments[i + 1] = continuation_string(env, value, &budget))) goto done;
+  }
+  for (uint32_t i = 0; i < environment_count; i++) {
+    napi_value value;
+    if (napi_get_element(env, input[2], i, &value) != napi_ok ||
+        !(environment[i] = continuation_string(env, value, &budget))) goto done;
+    const char *separator = strchr(environment[i], '=');
+    if (!separator || separator == environment[i]) goto done;
+  }
+  execve(path, arguments, environment);
+  message = "Could not execute the updated application";
+done:
+  if (arguments) { for (uint32_t i = 1; i <= argument_count; i++) free(arguments[i]); free(arguments); }
+  if (environment) { for (uint32_t i = 0; i < environment_count; i++) free(environment[i]); free(environment); }
+  free(path);
+  return failure(env, message);
+}
+#endif
 
 static void release_lock(owner_lock *lock) {
   if (lock->released) return;
@@ -113,6 +171,18 @@ static napi_value private_directory(napi_env env, napi_callback_info info) {
   free(path);
   if (error) return failure(env, "Unsafe or inaccessible private directory");
   napi_get_undefined(env, &result); return result;
+}
+static napi_value recover_update_directory(napi_env env, napi_callback_info info) {
+  napi_value arg, result; size_t argc = 1;
+  if (napi_get_cb_info(env, info, &argc, &arg, NULL, NULL) != napi_ok || argc != 1)
+    return failure(env, "Expected an update directory path");
+  WCHAR *path = private_path(env, arg);
+  if (!path) return NULL;
+  BOOL retired = FALSE;
+  DWORD error = magnitude_recover_update_directory(path, &retired);
+  free(path);
+  if (error) return failure(env, "Cannot safely prepare the update directory; existing contents were preserved");
+  napi_get_boolean(env, retired, &result); return result;
 }
 static napi_value private_content(napi_env env, napi_callback_info info) {
   napi_value arg, result; size_t argc = 1;
@@ -317,6 +387,56 @@ static napi_value interactive_desktop(napi_env env, napi_callback_info info) {
 #endif
 
 #ifdef __linux__
+/* Authorization changes credentials; the privileged command must retain its caller's lifetime. */
+static napi_value guard_installer(napi_env env, napi_callback_info info) {
+  if (getuid() != 0 || geteuid() != 0) return failure(env, "Installer lifetime guard requires system authorization");
+  if (getpgrp() != getpid() && setpgid(0, 0) != 0) return failure(env, "Cannot isolate the installer process group");
+  return guard(env, info);
+}
+
+static const napi_type_tag installation_lease_tag = { UINT64_C(0x9ea889074de74b31), UINT64_C(0xbd86372f62d16d50) };
+
+/* A foreground host opens its own shared admission; it has no inherited desktop launcher. */
+static napi_value acquire_installation_lease(napi_env env, napi_callback_info info) {
+  (void)info;
+  const char *path = "/var/lib/magnitude-desktop/installation.lock";
+  int descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  if (descriptor < 0) return failure(env, "Magnitude installation admission is missing or inaccessible; reinstall Magnitude");
+  struct stat opened, installed;
+  if (fstat(descriptor, &opened) != 0 || lstat(path, &installed) != 0 ||
+      !S_ISREG(opened.st_mode) || opened.st_uid != 0 || (opened.st_mode & 0222) || opened.st_nlink != 1 ||
+      opened.st_dev != installed.st_dev || opened.st_ino != installed.st_ino) {
+    close(descriptor); return failure(env, "Magnitude installation admission is unsafe; repair the installation");
+  }
+  if (flock(descriptor, LOCK_SH | LOCK_NB) != 0 ||
+      lstat("/var/lib/magnitude-desktop/installing", &installed) == 0 || errno != ENOENT) {
+    close(descriptor); return failure(env, "Magnitude installation is in progress or needs package-manager repair");
+  }
+  owner_lock *lease = calloc(1, sizeof(*lease));
+  if (!lease) { close(descriptor); return failure(env, "Cannot allocate installation admission"); }
+  lease->fd = descriptor;
+  napi_value result;
+  if (napi_create_object(env, &result) != napi_ok || napi_type_tag_object(env, result, &installation_lease_tag) != napi_ok ||
+      napi_wrap(env, result, lease, finalize_lock, NULL, NULL) != napi_ok) {
+    release_lock(lease); free(lease); return failure(env, "Cannot retain installation admission");
+  }
+  return result;
+}
+
+static napi_value release_installation_lease(napi_env env, napi_callback_info info) {
+  napi_value arg, result;
+  size_t argc = 1;
+  void *data;
+  bool matches = false;
+  if (napi_get_cb_info(env, info, &argc, &arg, NULL, NULL) != napi_ok || argc != 1 ||
+      napi_check_object_type_tag(env, arg, &installation_lease_tag, &matches) != napi_ok || !matches ||
+      napi_unwrap(env, arg, &data) != napi_ok)
+    return failure(env, "Invalid installation admission");
+  release_lock(data);
+  napi_get_undefined(env, &result);
+  return result;
+}
+
 static napi_value adopt_installation_lease(napi_env env, napi_callback_info info) {
   (void)info;
   struct stat inherited, installed;
@@ -342,7 +462,13 @@ static napi_value init(napi_env env, napi_value exports) {
     {"acquireLock", NULL, acquire, NULL, NULL, NULL, napi_default, NULL},
     {"releaseLock", NULL, release, NULL, NULL, NULL, napi_default, NULL},
     {"guardParent", NULL, guard, NULL, NULL, NULL, napi_default, NULL},
+#ifndef _WIN32
+    {"replaceProcess", NULL, replace_process, NULL, NULL, NULL, napi_default, NULL},
+#endif
 #ifdef __linux__
+    {"guardInstallerParent", NULL, guard_installer, NULL, NULL, NULL, napi_default, NULL},
+    {"acquireInstallationLease", NULL, acquire_installation_lease, NULL, NULL, NULL, napi_default, NULL},
+    {"releaseInstallationLease", NULL, release_installation_lease, NULL, NULL, NULL, napi_default, NULL},
     {"adoptInstallationLease", NULL, adopt_installation_lease, NULL, NULL, NULL, napi_default, NULL},
 #endif
 #ifdef _WIN32
@@ -350,6 +476,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"inspectApplicationEndpoint", NULL, inspect_endpoint, NULL, NULL, NULL, napi_default, NULL},
     {"localAppDataDirectory", NULL, local_app_data, NULL, NULL, NULL, napi_default, NULL},
     {"preparePrivateDirectory", NULL, private_directory, NULL, NULL, NULL, napi_default, NULL},
+    {"recoverUpdateDirectory", NULL, recover_update_directory, NULL, NULL, NULL, napi_default, NULL},
     {"createPrivateContent", NULL, create_private_content, NULL, NULL, NULL, napi_default, NULL},
     {"validatePrivateContent", NULL, private_content, NULL, NULL, NULL, napi_default, NULL},
     {"isInteractiveDesktop", NULL, interactive_desktop, NULL, NULL, NULL, napi_default, NULL},
@@ -364,6 +491,11 @@ static napi_value init(napi_env env, napi_value exports) {
   #endif
   magnitude_register_application_memory(env, exports);
   magnitude_register_machine_identity(env, exports);
+  #ifdef __APPLE__
+  magnitude_register_mac_updates(env, exports);
+  magnitude_register_mac_update_filesystem(env, exports);
+  magnitude_register_mac_update_lease(env, exports);
+  #endif
   return exports;
 }
 NAPI_MODULE(NODE_GYP_MODULE_NAME, init)

@@ -1,0 +1,92 @@
+---
+title: "Network access"
+description: "Connect to Magnitude over your network or an SSH tunnel."
+---
+
+By default the API is available only on the computer running Magnitude. Network access makes it available to other devices for inference. The app and model management stay on this computer.
+
+For a complete server setup, see [Remote server](/remote-server).
+
+## Enable network access
+
+### Desktop Settings
+
+1. Open **Settings → Network access** and turn it on.
+2. Choose an **Address**. **All interfaces** serves every network this computer is on. Choosing one address serves only that network.
+3. Copy the **API key**. Other devices send it with every request.
+4. Copy the **Reachable at** URL.
+5. Restart Magnitude when the **Restart required** notice appears.
+
+The first time the service listens on a network, macOS or Windows may ask whether to allow incoming connections. Allow them.
+
+Without Desktop, use the [configuration example](/remote-server#configure-network-access). All fields are documented in [Configuration file](/reference/configuration-file).
+
+## Choose an address
+
+| Connection | Address |
+| --- | --- |
+| Same local network | The server's Wi-Fi or Ethernet IP, such as `192.168.1.20`. It can change when the server joins another network. |
+| Private network, such as Tailscale | The server's address on that network, such as `100.x.y.z`. Both computers must be connected to it. |
+
+Select that address in Settings or use it as `network.bind`. Use `http://ADDRESS:10100/inference/v1` as the base URL. A private network can make the server reachable when you are away from home.
+
+## SSH tunnel
+
+Keep Magnitude running on the server. On your own computer, run:
+
+```sh
+ssh -N -L 10101:127.0.0.1:10100 user@server
+```
+
+Use `http://127.0.0.1:10101/inference/v1` in your client. SSH forwards that local port to Magnitude on the server. Network access can stay off, and no Magnitude API key is required through the tunnel. If your client requires a key, any value works.
+
+Keep the tunnel running while using inference. You must be able to reach the server over SSH, for example through your local network or Tailscale.
+
+## Containers
+
+From a container on this computer, use `http://host.docker.internal:10100/inference/v1` with the API key. Network access must be on, because the container connects from its own address.
+
+## Windows with WSL
+
+See [Windows and WSL](/api/windows-wsl) for mirrored and NAT networking.
+
+## Configure the app or agent
+
+Use the server URL as the base URL and its API key as the key. For an app that is not a supported agent, the settings are the same as in [Other apps](/api/other-apps) with the network address in place of `127.0.0.1`.
+
+**Connections** cannot configure a supported agent on another device, so write its configuration yourself. Each agent page shows the exact block under **Configuration**. Replace `ADDRESS` with the server address, `API_KEY` with the API key, and `MODEL_ID` with the model's exact ID; take the context window and output limit from the model's **Details**.
+
+- [Pi](/integrations/pi#configuration)
+- [OpenCode](/integrations/opencode#configuration)
+- [Hermes](/integrations/hermes#configuration)
+- [OpenClaw](/integrations/openclaw#configuration)
+- [Codex](/integrations/codex#configuration)
+- [Claude Code](/integrations/claude-code#configuration)
+- [Oh My Pi](/integrations/oh-my-pi#configuration)
+- [Cline](/integrations/cline#configuration)
+
+Codex and Claude Code route hosted models through Magnitude's gateway. From another device, only local models are available to them.
+
+## Check the connection
+
+From the other device:
+
+```sh
+curl -H "Authorization: Bearer API_KEY" http://ADDRESS:10100/inference/v1/models
+```
+
+On Windows PowerShell, use `curl.exe` instead of `curl`. A model list means the connection works.
+
+## Custom hostnames
+
+Magnitude accepts requests addressed to its IP addresses, `localhost`, `host.docker.internal`, and Tailscale MagicDNS names ending in `.ts.net`. To reach it by another name, such as a reverse proxy or a LAN hostname, list the name under `network.allowedHosts` in the [configuration file](/reference/configuration-file).
+
+## Troubleshooting
+
+| Response | Meaning |
+| --- | --- |
+| Connection refused | Network access is off, Magnitude is not running, or the chosen address does not include the network you are on. |
+| Connection timed out | Check that the server is reachable and its firewall allows TCP port `10100`. |
+| `401` | The request did not include the API key, or the key changed. Check the key in Settings or the server configuration. |
+| `403` on `/rpc` | Application control is never available from other devices. Only inference is. |
+| `421 Invalid Host header` | The request used a hostname Magnitude does not accept. Use an IP address or add the name to `network.allowedHosts`. |

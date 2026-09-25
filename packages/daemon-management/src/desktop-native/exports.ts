@@ -1,12 +1,15 @@
 export * from "./index"
-export { adoptLinuxInstallationLease } from "./linux-installation-lease"
+export { makeMacCliRegistration } from "./mac-cli-registration"
+export { adoptLinuxInstallationLease, acquireLinuxInstallationLease } from "./linux-installation-lease"
 export { WindowsInstallerVerifier, nativeWindowsInstallerVerifier } from "./windows-update-signature"
+export { MacBundleVerifier, MacBundleVerificationFailed, MacBundleExpectation, nativeMacBundleVerifier } from "./mac-update-validation"
 export { PrivateFilePermissions, unixPrivateFilePermissions, windowsPrivateFilePermissions } from "./private-files"
 export * from "./owned-service"
 export * from "./owned-child"
 export * from "./application-control"
 export { serveWindowsApplicationControl } from "./windows-control"
 export * from "./application-owner"
+export { runHeadlessApplication, HeadlessApplicationFailed } from "./headless-application"
 
 export * from "./application-client"
 export * from "./application-host"
@@ -21,7 +24,7 @@ export { makeWindowsOwnedChildSpawner } from "./windows-owned-child"
 export { requireServicePort } from "./service-port"
 export { ApplicationMemory, nativeApplicationMemoryLayer, observeApplicationMemory } from "./application-memory"
 export { nativeMachineIdentity } from "./machine-identity"
-export { installLinuxApplicationUpdate } from "./linux-update-maintenance"
+export { installLinuxApplicationUpdate, guardLinuxInstallerParent } from "./linux-update-maintenance"
 export { LinuxPackageUpdate } from "./linux-update-package"
 export { relaunchLinuxAfterUpdate, LinuxUpdateHandoffRequest, startLinuxUpdateHandoff, completeLinuxUpdateHandoff } from "./linux-update-handoff"
 export { relaunchWindowsAfterUpdate, WindowsUpdateHandoffRequest, startWindowsUpdateHandoff, completeWindowsUpdateHandoff } from "./windows-update-handoff"
@@ -29,10 +32,16 @@ export { PreparedUpdate, UpdateInstallation, PreparedUpdateStore, PreparedUpdate
 export { acquireUpdateInstallationLease, isUpdateInstallationActive } from "./update-installation-lease"
 export { UpdatePreferences, UpdatePreferencesFailed, makeUpdatePreferences } from "./update-preferences"
 
-export { MacUpdateHandoff, MacUpdateHandoffRequest, MacUpdateHandoffFailed, startMacUpdateHandoff, relaunchMacAfterUpdate } from "./mac-update-handoff"
 
 export { previousInstallationUpgrade } from "./previous-installation-live"
 
 export { AppearancePreferences, AppearancePreferencesFailed, makeAppearancePreferences } from "./appearance-preferences"
 export { ModelStoragePreferences, ModelStoragePreferencesFailed, makeModelStoragePreferences } from "./model-storage-preferences"
 export { NetworkPreferences, NetworkPreferencesFailed, makeNetworkPreferences, listNetworkInterfaces, networkAccessEquals, LOOPBACK_ONLY, type NetworkAccess, type NetworkAccessChange, type NetworkInterfaceAddress, type NetworkInterfaceKind } from "./network-preferences"
+
+export { recoverWindowsUpdateDirectory, WindowsUpdateDirectoryFailed } from "./windows-update-directory"
+
+export { ApplicationRuntime, ApplicationProfile, ApplicationRuntimeUnavailable, resolveInstalledApplicationRuntime, resolveApplicationProfile, applicationNativeHostPath, applicationServiceCommand, makeApplicationService } from "./application-bootstrap"
+export { makeUnixProcessContinuation, ForegroundContinuationFailed } from "./unix-continuation"
+
+export { acquireMacApplicationInstallationLease, nativeMacUpdateAdmission } from "./mac-update-lease"
