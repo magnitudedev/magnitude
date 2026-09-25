@@ -3,7 +3,9 @@ title: "Overview"
 description: "Base URLs, keys, and model IDs for the local inference API."
 ---
 
-Magnitude serves an HTTP API on port `10100` while it is running. **Connections** uses it to configure supported agents. Any other OpenAI-compatible or Anthropic-compatible client can use it directly.
+Magnitude serves an HTTP API on port `10100` while Desktop or `magnitude serve` is running. **Connections** uses it to configure supported agents. Any other OpenAI-compatible or Anthropic-compatible client can use it directly.
+
+To run models on another machine, see [Remote server](/remote-server).
 
 ## Base URLs
 
@@ -14,14 +16,14 @@ Magnitude serves an HTTP API on port `10100` while it is running. **Connections*
 
 Clients append their own paths, such as `/chat/completions` or `/v1/messages`. If a client asks for a full endpoint URL instead, use the paths in [Endpoints](/api/endpoints).
 
-From another device, replace `127.0.0.1` with the address shown under **Reachable at** in **Settings → Network access**. See [Other devices](/api/other-devices).
+From another device, replace `127.0.0.1` with the server's network address. See [Network access](/api/network-access).
 
 ## API keys
 
 | Caller | Key |
 | --- | --- |
 | This computer | None required. If the client insists on a value, any value works. |
-| Other devices | The key from **Settings → Network access**, sent as `Authorization: Bearer KEY` or `x-api-key: KEY`. |
+| Other devices | The server’s configured API key, sent as `Authorization: Bearer KEY` or `x-api-key: KEY`. |
 
 ## Model IDs
 

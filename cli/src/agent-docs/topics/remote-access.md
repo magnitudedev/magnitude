@@ -11,7 +11,7 @@ On the same computer, `ADDRESS` is `127.0.0.1` and no API key is needed. Send an
 
 ## From another device
 
-The user turns on Network access in Magnitude Settings. That setting shows the address to use and an API key. Send the key as `Authorization: Bearer KEY` or `x-api-key: KEY`. Only inference is available from other devices; model management and `/rpc` are not.
+Enable Network access in Magnitude Settings, or set `network.enabled`, `network.bind`, and `network.apiKey` in `~/.magnitude/config.json` on the server. Use an IP address assigned to the server and a long, randomly generated key. Restart Magnitude after changes. The address can be on a local network or a private network such as Tailscale. Send the key as `Authorization: Bearer KEY` or `x-api-key: KEY`. Only inference is available from other devices; model management and `/rpc` are not.
 
 Check the connection:
 
@@ -25,12 +25,12 @@ curl -H "Authorization: Bearer KEY" http://ADDRESS:10100/inference/v1/models
 | 401 | Missing or changed API key. |
 | 421 | Hostname not accepted. Use an IP address, or the user adds the name to `network.allowedHosts` in `~/.magnitude/config.json`. |
 
-## Headless server over SSH
+## Remote inference server
 
 On the remote computer, run `magnitude serve` and leave that terminal running. Use another SSH
 session for commands such as `magnitude models status` and `magnitude models load <model-id>`.
 
-To reach inference from your own computer without enabling Network access, open a tunnel:
+For direct access, enable Network access and use the server address and API key in your client. To connect through SSH without enabling Network access, open a tunnel on your own computer:
 
 ```sh
 ssh -N -L 10101:127.0.0.1:10100 user@server

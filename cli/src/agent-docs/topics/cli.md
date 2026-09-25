@@ -1,8 +1,7 @@
 # Magnitude CLI
 
-The CLI is headless. Running `magnitude` without a subcommand prints help and exits.
-Onboarding lives in the Magnitude desktop app: use Discover to choose models and Connections to
-configure external harnesses. Agents can use the following commands to operate inference:
+Running `magnitude` without a subcommand prints help and exits.
+Use Desktop or `magnitude serve` to run inference. The following commands manage models and agent connections:
 
 ```text
 magnitude update [check|status|download|install|discard]
@@ -26,14 +25,13 @@ magnitude docs [topic-id]
 
 Run `magnitude serve` to host inference in the foreground, or open the desktop app.
 Model, catalog, hardware, and connection setup commands require an existing service; they do not
-start one. `magnitude status` observes the owner and runtime without starting anything. Stop a
+start one. `magnitude status` reports service and model status without starting anything. Stop a
 foreground server with Ctrl+C. Desktop launch-at-login and Quit are available in the desktop app.
 
 `update check` checks for a release; `download` waits until it is prepared; `status` reports the
 current update state; `discard` removes a prepared update. None of these commands opens Desktop.
-`update install` restarts a running Desktop with explicit user intent, but refuses to interrupt
-a headless server. Stop `serve` first, then either run it again to apply an unattempted prepared
-update at startup or run `update install` for a finite installation that leaves the server stopped.
+`update install` restarts a running Desktop but refuses to interrupt
+a headless server. Stop `serve` first, then either run it again to apply a prepared update that has not failed installation at startup or run `update install` to install while leaving the server stopped.
 Failed installation attempts require explicit retry. Linux installation may require system authorization.
 
 Each command prints only the product information relevant to that operation. Collection commands
