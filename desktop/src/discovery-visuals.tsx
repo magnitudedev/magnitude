@@ -4,15 +4,16 @@ import { Option } from "effect"
 import { useMemo } from "react"
 import { Result, useAtomValue } from "@effect-atom/atom-react"
 import { MemoryIcon, CircuitryIcon, CpuIcon } from "@phosphor-icons/react"
-import { DesktopSession, useAgentClient, localModelRadarAxes, useLocalInferenceHardware } from "@magnitudedev/client-common"
+import { DesktopSession, useAgentClient, localModelRadarAxes, localModelServingState, useLocalInferenceHardware } from "@magnitudedev/client-common"
 import { type HardwarePhoto } from "./hardware-photos"
 import { hardwareDetails } from "./hardware-details"
 import type { MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
-import type { CatalogLocalModel, LocalInferenceHardware } from "@magnitudedev/sdk"
+import type { LocalInferenceHardware, LocalModel } from "@magnitudedev/sdk"
 
-export function ModelRadar({ model }: { model: CatalogLocalModel }) {
+export function ModelRadar({ model }: { model: LocalModel }) {
   const axes = localModelRadarAxes(model)
-  if (Option.isNone(axes)) return <p className="py-12 text-center text-sm text-slate-500">{model.servingState._tag === "Assessing" ? "Waiting for model assessment" : "No performance profile is available for this configuration."}</p>
+  const serving = Option.getOrUndefined(localModelServingState(model))
+  if (Option.isNone(axes)) return <p className="py-12 text-center text-sm text-slate-500">{serving?._tag === "Assessing" ? "Waiting for model assessment" : "No performance profile is available for this configuration."}</p>
   const point = (index: number, radius: number) => {
     const angle = -Math.PI / 2 + index * Math.PI * 2 / 5
     return [180 + Math.cos(angle) * radius, 138 + Math.sin(angle) * radius]

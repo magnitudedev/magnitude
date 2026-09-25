@@ -76,6 +76,30 @@ describe("local model ranking", () => {
     )).toEqual([first, second])
   })
 
+  it("appends a fitting discovered model after ranked catalog choices", () => {
+    const catalog = option("catalog", 1, { intelligence: 1, speed: 1, fidelity: 1 })
+    const discovered = (modelId: string, totalRequiredBytes: number): LocalModelOption => ({
+      id: `stored:${modelId}`,
+      kind: "stored",
+      model: {
+        _tag: "Discovered",
+        modelId,
+        state: {
+          _tag: "Ready",
+          servingState: {
+            _tag: "Assessed",
+            assessment: { _tag: "Fits", memory: { totalRequiredBytes } },
+          },
+        },
+      } as unknown as LocalModel,
+    })
+    const fits = discovered("hf:org/repo/model.gguf", 1)
+    const overBudget = discovered("hf:org/repo/huge.gguf", 9)
+    const preference = { fastToSmart: 0.5, memoryBudgetBytes: 8 }
+    expect(rankedLocalModelOptions([fits, overBudget, catalog], preference, 10)).toEqual([catalog, fits])
+    expect(rankedLocalModelOptions([fits, catalog], preference, 1)).toEqual([catalog])
+  })
+
   it("ranks installed and downloadable choices together", () => {
     const stored = option("stored", 1, { intelligence: 1, speed: 1, fidelity: 1 }, "stored")
     const downloadable = option("downloadable", 1, { intelligence: 0.5, speed: 0.5, fidelity: 1 })

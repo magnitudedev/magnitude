@@ -62,29 +62,53 @@ export const localModelRankingUtility = (
 export const targetPhysicalMemoryBytes = (hardware: LocalInferenceHardware): number =>
   hardware.memoryDomains.reduce((total, domain) => total + domain.totalBytes, 0)
 
+const withinMemoryBudget = (
+  totalRequiredBytes: number,
+  memoryBudgetBytes: number,
+): boolean => Number.isFinite(memoryBudgetBytes)
+  && totalRequiredBytes <= Math.max(0, memoryBudgetBytes)
+
+/** Fitting discovered models have no ranking scores. They follow ranked catalog options and never invent utility. */
+const fittingDiscoveredOption = (
+  option: LocalModelOption,
+  memoryBudgetBytes: number,
+): readonly LocalModelOption[] => {
+  const model = option.model
+  if (model._tag !== "Discovered" || model.state._tag !== "Ready") return []
+  const serving = model.state.servingState
+  if (serving._tag !== "Assessed"
+    || serving.assessment._tag !== "Fits"
+    || !withinMemoryBudget(serving.assessment.memory.totalRequiredBytes, memoryBudgetBytes)) return []
+  return [option]
+}
+
 export const rankedLocalModelOptions = (
   options: readonly LocalModelOption[],
   preference: LocalModelRankingPreference,
   limit = 10,
-): readonly LocalModelOption[] => options
-  .flatMap((option): readonly { readonly option: LocalModelOption; readonly utility: number }[] => {
-    if (option.model._tag !== "Catalog") return []
-    const serving = option.model.servingState
-    if (serving._tag !== "Assessed"
-      || serving.assessment._tag !== "Fits"
-      || !("rankingScores" in serving)
-      || Option.isNone(serving.rankingScores)
-      || !Number.isFinite(preference.memoryBudgetBytes)
-      || serving.assessment.memory.totalRequiredBytes > Math.max(0, preference.memoryBudgetBytes)) return []
-    return [{
-      option,
-      utility: localModelRankingUtility(serving.rankingScores.value, preference.fastToSmart),
-    }]
-  })
-  .sort((left, right) => right.utility - left.utility
-    || left.option.model.modelId.localeCompare(right.option.model.modelId))
-  .slice(0, Math.max(0, Math.floor(limit)))
-  .map(({ option }) => option)
+): readonly LocalModelOption[] => {
+  const rankedCatalog = options
+    .flatMap((option): readonly { readonly option: LocalModelOption; readonly utility: number }[] => {
+      if (option.model._tag !== "Catalog") return []
+      const serving = option.model.servingState
+      if (serving._tag !== "Assessed"
+        || serving.assessment._tag !== "Fits"
+        || !("rankingScores" in serving)
+        || Option.isNone(serving.rankingScores)
+        || !withinMemoryBudget(serving.assessment.memory.totalRequiredBytes, preference.memoryBudgetBytes)) return []
+      return [{
+        option,
+        utility: localModelRankingUtility(serving.rankingScores.value, preference.fastToSmart),
+      }]
+    })
+    .sort((left, right) => right.utility - left.utility
+      || left.option.model.modelId.localeCompare(right.option.model.modelId))
+    .map(({ option }) => option)
+  const discovered = options
+    .flatMap(option => fittingDiscoveredOption(option, preference.memoryBudgetBytes))
+    .sort((left, right) => left.model.modelId.localeCompare(right.model.modelId))
+  return [...rankedCatalog, ...discovered].slice(0, Math.max(0, Math.floor(limit)))
+}
 
 /** Keep up to two configurations of each catalog base, preserving ranking order. */
 export const featuredCatalogModels = (
