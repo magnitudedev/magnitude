@@ -1,11 +1,11 @@
-//! Tuning cases of the routed (mixture-of-experts) entries. `qwen_routed_route`
-//! serves every row class; the decode entries (`qwen_routed_expand`,
-//! `qwen_routed_output`) are tuned at the decode row points, the grouped
-//! entries (`qwen_routed_group`, `qwen_routed_experts`,
-//! `qwen_routed_combine`) at the grouped ones. Routing tables are synthetic:
+//! Tuning cases of the routed (mixture-of-experts) entries. `routed_route`
+//! serves every row class; the decode entries (`routed_expand`,
+//! `routed_output`) are tuned at the decode row points, the grouped
+//! entries (`routed_group`, `routed_experts`,
+//! `routed_combine`) at the grouped ones. Routing tables are synthetic:
 //! every row selects distinct experts with the uneven expert loads of real
 //! routing (`routes`), and the grouped tables are formed from them exactly as
-//! `qwen_routed_group` forms them.
+//! `routed_group` forms them.
 //!
 //! Route and group write their tables through `&mut` parameters; each
 //! argument set owns those tables as case state.
@@ -17,8 +17,8 @@ use super::{
 use crate::programs::graph::routed::{grouped_blocks, DECODE_ROWS, TILE_ROWS};
 use magnitude_model_contracts::{FeedForwardGeometry, WeightKind, WeightScope};
 use magnitude_model_kernels::{
-    qwen_routed_combine, qwen_routed_expand, qwen_routed_experts, qwen_routed_group,
-    qwen_routed_output, qwen_routed_route,
+    routed_combine, routed_expand, routed_experts, routed_group,
+    routed_output, routed_route,
 };
 use seismic::{Element, Tensor};
 
@@ -81,7 +81,7 @@ fn routes(rows: u64, shape: RoutedShape) -> Vec<i32> {
     routes
 }
 
-/// The tables `qwen_routed_group` forms from `routes`: (order [B, T],
+/// The tables `routed_group` forms from `routes`: (order [B, T],
 /// inverse [M, K], blocks [B]).
 fn group(routes: &[i32], rows: u64, shape: RoutedShape) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>), String> {
     let blocks = grouped_blocks(rows, shape.experts, shape.selected)?;
@@ -116,7 +116,7 @@ fn scores(inputs: &TuningInputs<'_, '_>, rows: u64, shape: RoutedShape, seed: u6
     inputs.activation(Element::f32(), &[rows, shape.selected], seed)
 }
 
-/// `qwen_routed_route`: RMS prologue, router softmax, top-k selection and the
+/// `routed_route`: RMS prologue, router softmax, top-k selection and the
 /// shared expert's coefficient. `SIMDGROUPS` reassociates the router's
 /// reductions (arithmetic); its integer routes are still compared exactly,
 /// so a configuration that flips a near-tie choice on the tuning rows is
@@ -142,8 +142,8 @@ pub(crate) struct RoutedRouteCase {
 }
 
 impl RoutedRouteTuning {
-    fn elements(&self) -> qwen_routed_route::Elements {
-        qwen_routed_route::Elements {
+    fn elements(&self) -> routed_route::Elements {
+        routed_route::Elements {
             NW: self.norm,
             RW: self.router,
             A: self.activation,
@@ -173,7 +173,7 @@ impl RoutedRouteTuning {
 }
 
 impl EntryTuning for RoutedRouteTuning {
-    type Entry = qwen_routed_route::Entry;
+    type Entry = routed_route::Entry;
     type Case = RoutedRouteCase;
 
     fn bindings(&self) -> String {
@@ -217,8 +217,8 @@ impl EntryTuning for RoutedRouteTuning {
             .collect()
     }
 
-    fn args<'a>(case: &'a mut Self::Case) -> qwen_routed_route::Args<'a> {
-        qwen_routed_route::Args {
+    fn args<'a>(case: &'a mut Self::Case) -> routed_route::Args<'a> {
+        routed_route::Args {
             residual: &case.residual,
             norm: &case.norm,
             router: &case.router,
@@ -234,10 +234,10 @@ impl EntryTuning for RoutedRouteTuning {
         vec![&case.routes, &case.scores]
     }
 
-    generated_entry!(qwen_routed_route, this => this.elements());
+    generated_entry!(routed_route, this => this.elements());
 }
 
-/// `qwen_routed_group`: the grouped form's expert tiles, formed from the
+/// `routed_group`: the grouped form's expert tiles, formed from the
 /// routes. Its parameters are mappings.
 pub(crate) struct RoutedGroupTuning {
     pub shape: RoutedShape,
@@ -252,7 +252,7 @@ pub(crate) struct RoutedGroupCase {
 }
 
 impl EntryTuning for RoutedGroupTuning {
-    type Entry = qwen_routed_group::Entry;
+    type Entry = routed_group::Entry;
     type Case = RoutedGroupCase;
 
     fn bindings(&self) -> String {
@@ -285,8 +285,8 @@ impl EntryTuning for RoutedGroupTuning {
         }])
     }
 
-    fn args<'a>(case: &'a mut Self::Case) -> qwen_routed_group::Args<'a> {
-        qwen_routed_group::Args {
+    fn args<'a>(case: &'a mut Self::Case) -> routed_group::Args<'a> {
+        routed_group::Args {
             routes: &case.routes,
             counts: case.counts.tensor_mut(),
             order: case.order.tensor_mut(),
@@ -299,10 +299,10 @@ impl EntryTuning for RoutedGroupTuning {
         vec![&case.counts, &case.order, &case.inverse, &case.blocks]
     }
 
-    generated_entry!(qwen_routed_group);
+    generated_entry!(routed_group);
 }
 
-/// `qwen_routed_expand`: the selected experts' and the shared expert's
+/// `routed_expand`: the selected experts' and the shared expert's
 /// gate/up with SiLU·mul (decode rows).
 pub(crate) struct RoutedExpandTuning {
     pub expert_gate: Element,
@@ -324,8 +324,8 @@ pub(crate) struct RoutedExpandCase {
 }
 
 impl RoutedExpandTuning {
-    fn elements(&self) -> qwen_routed_expand::Elements {
-        qwen_routed_expand::Elements {
+    fn elements(&self) -> routed_expand::Elements {
+        routed_expand::Elements {
             EGW: self.expert_gate,
             EUW: self.expert_up,
             SGW: self.shared_gate,
@@ -336,7 +336,7 @@ impl RoutedExpandTuning {
 }
 
 impl EntryTuning for RoutedExpandTuning {
-    type Entry = qwen_routed_expand::Entry;
+    type Entry = routed_expand::Entry;
     type Case = RoutedExpandCase;
 
     fn bindings(&self) -> String {
@@ -377,8 +377,8 @@ impl EntryTuning for RoutedExpandTuning {
             .collect()
     }
 
-    fn args<'a>(case: &'a mut Self::Case) -> qwen_routed_expand::Args<'a> {
-        qwen_routed_expand::Args {
+    fn args<'a>(case: &'a mut Self::Case) -> routed_expand::Args<'a> {
+        routed_expand::Args {
             normalized: &case.normalized,
             routes: &case.routes,
             expert_gate: &case.expert_gate,
@@ -388,10 +388,10 @@ impl EntryTuning for RoutedExpandTuning {
         }
     }
 
-    generated_entry!(qwen_routed_expand, this => this.elements());
+    generated_entry!(routed_expand, this => this.elements());
 }
 
-/// `qwen_routed_output`: the selected experts' down projections in slot
+/// `routed_output`: the selected experts' down projections in slot
 /// order, the shared expert's, and the residual (decode rows).
 pub(crate) struct RoutedOutputTuning {
     pub expert_down: Element,
@@ -413,8 +413,8 @@ pub(crate) struct RoutedOutputCase {
 }
 
 impl RoutedOutputTuning {
-    fn elements(&self) -> qwen_routed_output::Elements {
-        qwen_routed_output::Elements {
+    fn elements(&self) -> routed_output::Elements {
+        routed_output::Elements {
             EDW: self.expert_down,
             SDW: self.shared_down,
             A: self.activation,
@@ -423,7 +423,7 @@ impl RoutedOutputTuning {
 }
 
 impl EntryTuning for RoutedOutputTuning {
-    type Entry = qwen_routed_output::Entry;
+    type Entry = routed_output::Entry;
     type Case = RoutedOutputCase;
 
     fn bindings(&self) -> String {
@@ -465,8 +465,8 @@ impl EntryTuning for RoutedOutputTuning {
             .collect()
     }
 
-    fn args<'a>(case: &'a mut Self::Case) -> qwen_routed_output::Args<'a> {
-        qwen_routed_output::Args {
+    fn args<'a>(case: &'a mut Self::Case) -> routed_output::Args<'a> {
+        routed_output::Args {
             residual: &case.residual,
             expert_product: &case.expert_product,
             shared_product: &case.shared_product,
@@ -478,10 +478,10 @@ impl EntryTuning for RoutedOutputTuning {
         }
     }
 
-    generated_entry!(qwen_routed_output, this => this.elements());
+    generated_entry!(routed_output, this => this.elements());
 }
 
-/// `qwen_routed_experts`: grouped expert tiles (grouped rows).
+/// `routed_experts`: grouped expert tiles (grouped rows).
 pub(crate) struct RoutedExpertsTuning {
     pub expert_gate: Element,
     pub expert_up: Element,
@@ -501,8 +501,8 @@ pub(crate) struct RoutedExpertsCase {
 }
 
 impl RoutedExpertsTuning {
-    fn elements(&self) -> qwen_routed_experts::Elements {
-        qwen_routed_experts::Elements {
+    fn elements(&self) -> routed_experts::Elements {
+        routed_experts::Elements {
             EGW: self.expert_gate,
             EUW: self.expert_up,
             EDW: self.expert_down,
@@ -512,7 +512,7 @@ impl RoutedExpertsTuning {
 }
 
 impl EntryTuning for RoutedExpertsTuning {
-    type Entry = qwen_routed_experts::Entry;
+    type Entry = routed_experts::Entry;
     type Case = RoutedExpertsCase;
 
     fn bindings(&self) -> String {
@@ -553,8 +553,8 @@ impl EntryTuning for RoutedExpertsTuning {
             .collect()
     }
 
-    fn args<'a>(case: &'a mut Self::Case) -> qwen_routed_experts::Args<'a> {
-        qwen_routed_experts::Args {
+    fn args<'a>(case: &'a mut Self::Case) -> routed_experts::Args<'a> {
+        routed_experts::Args {
             normalized: &case.normalized,
             order: &case.order,
             blocks: &case.blocks,
@@ -564,10 +564,10 @@ impl EntryTuning for RoutedExpertsTuning {
         }
     }
 
-    generated_entry!(qwen_routed_experts, this => this.elements());
+    generated_entry!(routed_experts, this => this.elements());
 }
 
-/// `qwen_routed_combine`: the shared expert over every row with the grouped
+/// `routed_combine`: the shared expert over every row with the grouped
 /// unpermute and the residual (grouped rows).
 pub(crate) struct RoutedCombineTuning {
     pub shared_gate: Element,
@@ -591,8 +591,8 @@ pub(crate) struct RoutedCombineCase {
 }
 
 impl RoutedCombineTuning {
-    fn elements(&self) -> qwen_routed_combine::Elements {
-        qwen_routed_combine::Elements {
+    fn elements(&self) -> routed_combine::Elements {
+        routed_combine::Elements {
             SGW: self.shared_gate,
             SUW: self.shared_up,
             SDW: self.shared_down,
@@ -602,7 +602,7 @@ impl RoutedCombineTuning {
 }
 
 impl EntryTuning for RoutedCombineTuning {
-    type Entry = qwen_routed_combine::Entry;
+    type Entry = routed_combine::Entry;
     type Case = RoutedCombineCase;
 
     fn bindings(&self) -> String {
@@ -648,8 +648,8 @@ impl EntryTuning for RoutedCombineTuning {
             .collect()
     }
 
-    fn args<'a>(case: &'a mut Self::Case) -> qwen_routed_combine::Args<'a> {
-        qwen_routed_combine::Args {
+    fn args<'a>(case: &'a mut Self::Case) -> routed_combine::Args<'a> {
+        routed_combine::Args {
             residual: &case.residual,
             expert_output: &case.expert_output,
             inverse: &case.inverse,
@@ -662,5 +662,5 @@ impl EntryTuning for RoutedCombineTuning {
         }
     }
 
-    generated_entry!(qwen_routed_combine, this => this.elements());
+    generated_entry!(routed_combine, this => this.elements());
 }

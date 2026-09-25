@@ -14,7 +14,7 @@ No backend may silently change numerical modes, replace an unavailable operation
 
 | Backend | Native execution concerns |
 | --- | --- |
-| CPU | Worker/call execution, host address bindings, dependency completion and the required saved/restored floating environment. |
+| CPU | One process-wide worker pool (a participant per physical performance core, the submitter included); a native submission runs as one pool job with a barrier between launches, each launch using at most as many participants as it has work items; host address bindings, dependency completion and the required saved/restored floating environment. |
 | Metal | Pipeline and resource bindings, command encoding/submission, residency where required, synchronization and command completion. |
 | CUDA | Module/function bindings, streams/events, dispatch and synchronization, and any selected native allocation/mapping lifecycle. |
 

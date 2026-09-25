@@ -1,7 +1,7 @@
 // Dense weight import over the [B, N, K] view; one invocation per element in
 // row-major order, over a grid-stride loop (the grid is capped below the
 // 65535-group floor). The Vulkan form of `metal/import_dense.metal`.
-#include "common/element.glsl"
+#include <seismic/element.glsl>
 
 #if defined(SEISMIC_ELEMENT_E_REPRESENTATION_F32)
 #define IMPORT_SOURCE_KIND ELEMENT_F32

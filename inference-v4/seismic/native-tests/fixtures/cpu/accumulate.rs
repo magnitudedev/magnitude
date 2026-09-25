@@ -1,20 +1,19 @@
-// One work item per `WIDTH` elements, matching the GPU kernels bit for bit.
-fn accumulate<const BIAS: u64, const WIDTH: u64>(
-    context: &Context<'_>,
-    group: [u64; 3],
-    _shared: &mut [u8],
-) {
-    let state = context.arg_state();
-    let x = context.arg_x();
-    for lane in 0..WIDTH {
-        let index = group[0] * WIDTH + lane;
-        if index >= context.dim_n() {
-            return;
-        }
-        unsafe {
-            let at = state.pointer.cast::<f32>().add((index * state.strides[0]) as usize);
-            let value = x.pointer.cast::<f32>().add((index * x.strides[0]) as usize).read();
-            at.write(at.read() + (value + BIAS as f32 * 0.5));
+// One work item over all `N` elements in chunks of `WIDTH`, matching the GPU
+// kernels bit for bit. The whole call is a few hundred additions: spreading
+// it over cores would cost more in synchronization than the work itself.
+fn accumulate<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, _group: [u64; 3], _shared: &mut [u8]) {
+    let state = cx.arg_state();
+    let x = cx.arg_x();
+    let (bias, width) = (cx.param_bias(), cx.param_width() as usize);
+    let n = cx.dim_n() as usize;
+    for chunk in 0..n.div_ceil(width) {
+        for lane in 0..width {
+            let index = chunk * width + lane;
+            if index >= n {
+                return;
+            }
+            // SAFETY: the one work item owns the state.
+            unsafe { state.set([index], state.get([index]) + (x.get([index]) + bias as f32 * 0.5)) };
         }
     }
 }

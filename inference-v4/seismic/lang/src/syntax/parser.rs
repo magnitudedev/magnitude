@@ -322,6 +322,14 @@ impl Parser {
             self.expect_op(Op::RParen)?;
             self.expect_newline()?;
         }
+        let mut elements = Vec::new();
+        if self.at_word("elements") {
+            self.bump();
+            self.expect_op(Op::LParen)?;
+            elements = self.comma_list(Self::native_elements)?;
+            self.expect_op(Op::RParen)?;
+            self.expect_newline()?;
+        }
         let mut constraint = None;
         if self.eat_kw(Kw::Where) {
             constraint = Some(self.expr()?);
@@ -356,7 +364,7 @@ impl Parser {
         }
         if launches.is_empty() {
             return Err(self.error(format!(
-                "expected `launch <kernel>:`, found {}; a native declaration lists `static`, `params`, `where`, `scratch`, then one or more launches",
+                "expected `launch <kernel>:`, found {}; a native declaration lists `static`, `params`, `elements`, `where`, `scratch`, then one or more launches",
                 self.peek().describe()
             )));
         }
@@ -367,6 +375,7 @@ impl Parser {
             source,
             statics,
             params,
+            elements,
             constraint,
             scratch,
             launches,
@@ -419,6 +428,21 @@ impl Parser {
             name,
             arithmetic,
             values,
+            span: begin.to(self.prev_span()),
+        })
+    }
+
+    /// `NAME in [DTYPE, ..]`
+    fn native_elements(&mut self) -> PResult<NativeElementsDecl> {
+        let begin = self.span();
+        let name = self.expect_name()?;
+        self.expect_kw(Kw::In)?;
+        self.expect_op(Op::LBracket)?;
+        let dtypes = self.comma_list(Self::expect_name)?;
+        self.expect_op(Op::RBracket)?;
+        Ok(NativeElementsDecl {
+            name,
+            dtypes,
             span: begin.to(self.prev_span()),
         })
     }
@@ -1179,6 +1203,22 @@ mod tests {
         assert_eq!(native.target.name, "metal");
         assert_eq!(native.source, "native/scale.metal");
         assert_eq!(native.launches.len(), 1);
+    }
+
+    #[test]
+    fn cpu_element_coverage_round_trips() {
+        let file = round_trip(
+            "native copy for cpu from \"copy.rs\":\n    params (ROWS in [4, 1])\n    elements (A in [f32, u32], B in [bf16])\n    launch copy:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n",
+        );
+        let [Decl::Native(native)] = file.decls.as_slice() else {
+            panic!("expected one native implementation")
+        };
+        assert_eq!(native.elements.len(), 2);
+        assert_eq!(native.elements[0].name.name, "A");
+        assert_eq!(
+            native.elements[0].dtypes.iter().map(|dtype| dtype.name.as_str()).collect::<Vec<_>>(),
+            ["f32", "u32"]
+        );
     }
 
     #[test]

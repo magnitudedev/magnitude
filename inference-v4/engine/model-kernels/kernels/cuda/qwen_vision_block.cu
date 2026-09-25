@@ -1,9 +1,9 @@
 // qwen_vision_block: one Qwen3-VL vision transformer block over M patch rows
-// of D = H * W (W = 4P). Eight launches (bodies in common/vision.cuh): layer
+// of D = H * W (W = 4P). Eight launches (bodies in lib/vision/vision.cuh): layer
 // norm, QKV GEMM (+ bias), 2D rotation of the queries and keys in place, full
 // attention, output GEMM (+ bias, + the block input), layer norm, up GEMM
 // (+ bias, tanh GELU), down GEMM (+ bias, + the attention residual).
-#include "common/vision.cuh"
+#include "lib/vision/vision.cuh"
 
 using vision::u32;
 using vision::u64;

@@ -1,7 +1,7 @@
 // attention_output: the output projection of the gated attention rows
 // plus the F32 residual.
 #define KERNEL_W0 SEISMIC_OUTPUT_WEIGHT
-#include "common/projection.h"
+#include "lib/projection/projection.h"
 
 typedef element::Act activation;
 

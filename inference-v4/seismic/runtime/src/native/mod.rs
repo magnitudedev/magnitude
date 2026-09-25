@@ -51,7 +51,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-pub use cpu::{CpuInvocation, CpuKernelFn, CpuLaunchVariants, CpuNativeKernels, CpuTensor};
+pub use cpu::{CpuInvocation, CpuKernelFn, CpuLaunchVariants, CpuNativeKernels, CpuVariant};
 
 #[cfg(target_os = "macos")]
 use crate::backends::MetalOpened;
@@ -112,10 +112,7 @@ pub(crate) struct NativeQueue {
 const MINIMUM_SCRATCH_BYTES: u64 = 1;
 
 enum NativeRoute {
-    Cpu {
-        opened: Arc<CpuOpened>,
-        launches: Vec<CpuKernelFn>,
-    },
+    Cpu(cpu::CpuRoute),
     #[cfg(target_os = "macos")]
     Metal {
         opened: Arc<MetalOpened>,
@@ -229,6 +226,100 @@ fn vulkan_geometry(
         .collect()
 }
 
+/// `implementation` as `device` offers it: on a CPU device, with the
+/// Seismic-owned participant count of each launch and the tier appended, their
+/// domains exact for the device (its pool size, the tiers below its detected
+/// one). Appending is idempotent.
+pub(crate) fn on_device(device: &DeviceInner, mut implementation: NativeImplementation) -> NativeImplementation {
+    use seismic_lang::checked::{NativeParameter, NativeParameterRole};
+    let OpenedKind::Cpu(opened) = &device.kind else {
+        return implementation;
+    };
+    if implementation.params.iter().any(|parameter| parameter.role != NativeParameterRole::Declared) {
+        return implementation;
+    }
+    let lower = seismic_native_cpu::Tier::detected()
+        .map(|detected| {
+            detected
+                .at_or_below()
+                .filter(|tier| *tier != detected)
+                .map(|tier| tier.name())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    implementation.params.extend(NativeParameter::cpu_parameters(
+        implementation.launches.len(),
+        opened.executor().workers(),
+        &lower,
+    ));
+    implementation
+}
+
+/// The CPU route of `implementation` (as [`on_device`] offers it) for a
+/// validated `specialization`: the tier it runs at, one function per launch
+/// for that tier and the bound dense elements, the participants of each
+/// launch and the declared parameter values.
+fn cpu_route(
+    opened: &Arc<CpuOpened>,
+    name: &str,
+    kernels: &CpuNativeKernels,
+    implementation: &NativeImplementation,
+    specialization: &NativeSpecialization,
+    bindings: &ElementBindings,
+) -> Result<cpu::CpuRoute, PrepareError> {
+    use seismic_lang::checked::NativeParameterRole;
+    use seismic_native_cpu::Tier;
+    let mut tier = Tier::detected()
+        .ok_or_else(|| preparation(format!("`{name}`: the host has no CPU instruction-set tier")))?;
+    let mut workers = vec![0usize; implementation.launches.len()];
+    let mut params = Vec::new();
+    for parameter in &implementation.params {
+        let value = specialization
+            .param(&parameter.name)
+            .expect("validated specialization values every parameter");
+        match parameter.role {
+            NativeParameterRole::Declared => params.push(value),
+            NativeParameterRole::Workers { launch } => workers[launch as usize] = value as usize,
+            NativeParameterRole::Tier if value == 0 => {}
+            NativeParameterRole::Tier => {
+                let named = NativeParameterRole::TIERS[value as usize - 1];
+                tier = Tier::all()
+                    .iter()
+                    .copied()
+                    .find(|tier| tier.name() == named)
+                    .expect("the device offers only its own tiers");
+            }
+        }
+    }
+    let elements = kernels
+        .elements
+        .iter()
+        .map(|parameter| {
+            let representation = bindings
+                .get(parameter)
+                .expect("admitted bindings bind every element parameter");
+            seismic_lang::registry::representation_info(representation).name
+        })
+        .collect::<Vec<_>>();
+    let launches = (0..implementation.launches.len())
+        .map(|launch| {
+            kernels.function(launch, tier, &elements).ok_or_else(|| {
+                preparation(format!(
+                    "`{name}` launch {launch} has no CPU form for tier `{}` and elements {elements:?}",
+                    tier.name()
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(cpu::CpuRoute {
+        opened: opened.clone(),
+        tier,
+        launches,
+        workers,
+        params,
+    })
+}
+
 fn entry_name(module: &CheckedModule, entry: EntryId) -> String {
     module
         .entries()
@@ -302,6 +393,8 @@ impl NativePrepared {
     ) -> Result<Arc<Self>, PrepareError> {
         let backend = backend_name(&device.kind);
         let name = entry_name(module, entry);
+        let implementation = on_device(device, implementation);
+        let specialization = implementation.with_owned_defaults(specialization);
         implementation
             .validate(&specialization)
             .map_err(|error| preparation(format!("`{name}`: {error}")))?;
@@ -369,35 +462,15 @@ impl NativePrepared {
                         "`{name}` has no compiled CPU native functions in this build"
                     ))
                 })?;
-                let configuration = implementation
-                    .params
-                    .iter()
-                    .map(|parameter| {
-                        specialization
-                            .param(&parameter.name)
-                            .expect("validated specialization values every parameter")
-                    })
-                    .collect::<Vec<_>>();
-                let launches = (0..implementation.launches.len())
-                    .map(|launch| {
-                        kernels.function(launch, &configuration).ok_or_else(|| {
-                            preparation(format!(
-                                "`{name}` launch {launch} has no compiled CPU variant for {configuration:?}"
-                            ))
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                digest.update(format!(
-                    "{:?}",
-                    launches.iter().map(|f| *f as usize).collect::<Vec<_>>()
-                ));
-                (
-                    NativeRoute::Cpu {
-                        opened: opened.clone(),
-                        launches,
-                    },
-                    format!("cpu;{}", std::env::consts::ARCH),
-                )
+                let route = cpu_route(opened, &name, kernels, &implementation, &specialization, &bindings)?;
+                digest.update(kernels.digest.as_bytes());
+                let toolchain = format!(
+                    "cpu;{};{};{}",
+                    std::env::consts::ARCH,
+                    route.tier.name(),
+                    seismic_native_cpu::VERSION
+                );
+                (NativeRoute::Cpu(route), toolchain)
             }
             #[cfg(target_os = "macos")]
             OpenedKind::Metal(opened) => {
@@ -732,7 +805,7 @@ impl NativePrepared {
                     limit(format!("launch `{}` thread count overflows", launch.kernel))
                 })?;
             match &self.route {
-                NativeRoute::Cpu { .. } => {}
+                NativeRoute::Cpu(_) => {}
                 #[cfg(target_os = "macos")]
                 NativeRoute::Metal { opened, pipelines } => {
                     let pipeline = &pipelines[ordinal];
@@ -1423,23 +1496,9 @@ fn encode(
 ) -> Result<RouteSubmission, CallError> {
     let mut buffers = Vec::new();
     match &first.route {
-        NativeRoute::Cpu { opened, .. } => {
-            let started = trace::host_seconds();
-            let mut pointers = Vec::new();
-            let outcome = (|| {
-                for _ in 0..repetitions {
-                    for index in 0..list.count() {
-                        buffers.clear();
-                        let dispatch = list.dispatch(index, &mut buffers);
-                        run_cpu(opened, &dispatch, &buffers, &mut pointers)?;
-                    }
-                }
-                Ok(())
-            })();
-            Ok(RouteSubmission::Cpu {
-                outcome,
-                interval: (started, trace::host_seconds()),
-            })
+        NativeRoute::Cpu(route) => {
+            let (outcome, interval) = cpu::run(&route.opened, list, repetitions);
+            Ok(RouteSubmission::Cpu { outcome, interval })
         }
         #[cfg(target_os = "macos")]
         NativeRoute::Metal { opened, .. } => {
@@ -1508,53 +1567,6 @@ fn encode(
             retained,
         ),
     }
-}
-
-fn run_cpu(
-    opened: &Arc<CpuOpened>,
-    dispatch: &Dispatch<'_>,
-    buffers: &[(&Allocation, u64)],
-    pointers: &mut Vec<*mut u8>,
-) -> Result<(), ExecutionError> {
-    type Cpu = seismic_cpu::Cpu;
-    type Executor = seismic_cpu::Executor;
-    let NativeRoute::Cpu { launches, .. } = &dispatch.kernel.route else {
-        unreachable!("one device has one native route");
-    };
-    pointers.clear();
-    pointers.extend(buffers.iter().map(|(allocation, offset)| {
-        let base = typed_buffer::<Cpu, Executor>(allocation).data_pointer();
-        // SAFETY: tensor views and scratch placements lie inside their
-        // allocations (checked when the views were formed).
-        unsafe { base.add(*offset as usize) }
-    }));
-    let scalars = typed_buffer::<Cpu, Executor>(&dispatch.kernel.scalars)
-        .data_pointer()
-        .cast::<u64>();
-    for (function, launch) in launches.iter().zip(dispatch.launches) {
-        let Some(launch) = launch else { continue };
-        let invocation = CpuInvocation {
-            buffers: pointers,
-            representations: dispatch.representations,
-            words: dispatch.words,
-            scalar_results: scalars,
-            groups: launch.groups,
-            threads: launch.threads,
-        };
-        let [x, y, z] = launch.groups;
-        let items = x
-            .checked_mul(y)
-            .and_then(|items| items.checked_mul(z))
-            .ok_or_else(|| ExecutionError::SubmissionFailed("native CPU grid overflows".into()))?;
-        let body = |index: u64, shared: &mut [u8]| {
-            let coordinate = [index % x, (index / x) % y, index / (x * y)];
-            function(&invocation, coordinate, shared);
-        };
-        opened
-            .executor()
-            .run_native_items(items, launch.shared_bytes, &body)?;
-    }
-    Ok(())
 }
 
 fn validate_output(

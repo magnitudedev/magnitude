@@ -1,6 +1,6 @@
 //! Tuning cases of the recurrent block: the normed segmented input
-//! projection, the in-place state advance (`qwen_recurrent_step` below
-//! [`CHUNKED_ROWS`] rows, `qwen_recurrent_chunk` from there), and the gated
+//! projection, the in-place state advance (`gated_delta_step` below
+//! [`CHUNKED_ROWS`] rows, `gated_delta_chunk` from there), and the gated
 //! output projection.
 //!
 //! The state entries write the layer's window and delta arenas in place. Each
@@ -16,7 +16,7 @@ use super::{
 use crate::programs::graph::recurrent::CHUNKED_ROWS;
 use magnitude_model_contracts::{MixerGeometry, RecurrentHeadMapping, WeightKind, WeightScope};
 use magnitude_model_kernels::{
-    qwen_recurrent_chunk, qwen_recurrent_output, qwen_recurrent_project, qwen_recurrent_step,
+    gated_delta_chunk, gated_delta_output, gated_delta_project, gated_delta_step,
 };
 use seismic::{Element, Tensor};
 
@@ -73,7 +73,7 @@ impl RecurrentShape {
     }
 }
 
-/// `qwen_recurrent_project`: RMS prologue, segmented qkv | z | alpha | beta.
+/// `gated_delta_project`: RMS prologue, segmented qkv | z | alpha | beta.
 pub(crate) struct RecurrentProjectTuning {
     pub norm: Element,
     pub qkv: Element,
@@ -96,8 +96,8 @@ pub(crate) struct RecurrentProjectCase {
 }
 
 impl RecurrentProjectTuning {
-    fn elements(&self) -> qwen_recurrent_project::Elements {
-        qwen_recurrent_project::Elements {
+    fn elements(&self) -> gated_delta_project::Elements {
+        gated_delta_project::Elements {
             NW: self.norm,
             QW: self.qkv,
             GW: self.gate,
@@ -109,7 +109,7 @@ impl RecurrentProjectTuning {
 }
 
 impl EntryTuning for RecurrentProjectTuning {
-    type Entry = qwen_recurrent_project::Entry;
+    type Entry = gated_delta_project::Entry;
     type Case = RecurrentProjectCase;
 
     fn bindings(&self) -> String {
@@ -161,8 +161,8 @@ impl EntryTuning for RecurrentProjectTuning {
             .collect()
     }
 
-    fn args<'a>(case: &'a mut Self::Case) -> qwen_recurrent_project::Args<'a> {
-        qwen_recurrent_project::Args {
+    fn args<'a>(case: &'a mut Self::Case) -> gated_delta_project::Args<'a> {
+        gated_delta_project::Args {
             hidden: &case.hidden,
             input_norm: &case.norm,
             qkv_weight: &case.qkv,
@@ -173,10 +173,10 @@ impl EntryTuning for RecurrentProjectTuning {
         }
     }
 
-    generated_entry!(qwen_recurrent_project, this => this.elements());
+    generated_entry!(gated_delta_project, this => this.elements());
 }
 
-/// `qwen_recurrent_output`: gated per-head RMS · SiLU(z) prologue, output
+/// `gated_delta_output`: gated per-head RMS · SiLU(z) prologue, output
 /// projection, residual.
 pub(crate) struct RecurrentOutputTuning {
     pub recurrent_norm: Element,
@@ -196,8 +196,8 @@ pub(crate) struct RecurrentOutputCase {
 }
 
 impl RecurrentOutputTuning {
-    fn elements(&self) -> qwen_recurrent_output::Elements {
-        qwen_recurrent_output::Elements {
+    fn elements(&self) -> gated_delta_output::Elements {
+        gated_delta_output::Elements {
             RN: self.recurrent_norm,
             OW: self.output,
             A: self.activation,
@@ -206,7 +206,7 @@ impl RecurrentOutputTuning {
 }
 
 impl EntryTuning for RecurrentOutputTuning {
-    type Entry = qwen_recurrent_output::Entry;
+    type Entry = gated_delta_output::Entry;
     type Case = RecurrentOutputCase;
 
     fn bindings(&self) -> String {
@@ -259,8 +259,8 @@ impl EntryTuning for RecurrentOutputTuning {
             .collect()
     }
 
-    fn args<'a>(case: &'a mut Self::Case) -> qwen_recurrent_output::Args<'a> {
-        qwen_recurrent_output::Args {
+    fn args<'a>(case: &'a mut Self::Case) -> gated_delta_output::Args<'a> {
+        gated_delta_output::Args {
             hidden: &case.hidden,
             mixed: &case.mixed,
             projection: &case.projection,
@@ -270,7 +270,7 @@ impl EntryTuning for RecurrentOutputTuning {
         }
     }
 
-    generated_entry!(qwen_recurrent_output, this => this.elements());
+    generated_entry!(gated_delta_output, this => this.elements());
 }
 
 /// What both state entries tune over: the gated delta advance of one
@@ -281,11 +281,11 @@ pub(crate) struct RecurrentState {
     pub epsilon: f32,
 }
 
-/// `qwen_recurrent_step`, for row classes below [`CHUNKED_ROWS`]. Its
+/// `gated_delta_step`, for row classes below [`CHUNKED_ROWS`]. Its
 /// parameters are mappings: every configuration is bit-exact.
 pub(crate) struct RecurrentStepTuning(pub RecurrentState);
 
-/// `qwen_recurrent_chunk`, for row classes of [`CHUNKED_ROWS`] and more.
+/// `gated_delta_chunk`, for row classes of [`CHUNKED_ROWS`] and more.
 pub(crate) struct RecurrentChunkTuning(pub RecurrentState);
 
 /// One argument set of either state entry; they share one contract.
@@ -476,5 +476,5 @@ macro_rules! state_entry {
     };
 }
 
-state_entry!(RecurrentStepTuning, qwen_recurrent_step, |rows| rows < CHUNKED_ROWS);
-state_entry!(RecurrentChunkTuning, qwen_recurrent_chunk, |rows| rows >= CHUNKED_ROWS);
+state_entry!(RecurrentStepTuning, gated_delta_step, |rows| rows < CHUNKED_ROWS);
+state_entry!(RecurrentChunkTuning, gated_delta_chunk, |rows| rows >= CHUNKED_ROWS);

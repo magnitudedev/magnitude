@@ -11,8 +11,8 @@ use super::super::native_target_graph::weight;
 use crate::{native::RoutedKernels, ModelLoadPlan};
 use magnitude_model_contracts::{ExpertGeometry, WeightKind, WeightRole, WeightScope};
 use magnitude_model_kernels::{
-    qwen_routed_combine, qwen_routed_expand, qwen_routed_experts, qwen_routed_group,
-    qwen_routed_output, qwen_routed_route,
+    routed_combine, routed_expand, routed_experts, routed_group,
+    routed_output, routed_route,
 };
 use seismic::{NativeGraph, NativePort, WorkflowTensor};
 
@@ -72,7 +72,7 @@ pub(crate) fn routed(
     let routed = graph
         .enqueue(
             &handle.route,
-            qwen_routed_route::WorkflowArgs {
+            routed_route::WorkflowArgs {
                 residual: residual.into(),
                 norm: (&norm).into(),
                 router: (&router).into(),
@@ -90,7 +90,7 @@ pub(crate) fn routed(
         let expanded = graph
             .enqueue(
                 &handle.expand,
-                qwen_routed_expand::WorkflowArgs {
+                routed_expand::WorkflowArgs {
                     normalized: (&normalized).into(),
                     routes: routes.tensor().into(),
                     expert_gate: (&expert_gate).into(),
@@ -103,7 +103,7 @@ pub(crate) fn routed(
         return Ok(graph
             .enqueue(
                 &handle.output,
-                qwen_routed_output::WorkflowArgs {
+                routed_output::WorkflowArgs {
                     residual: residual.into(),
                     expert_product: (&expanded.r0).into(),
                     shared_product: (&expanded.r1).into(),
@@ -133,7 +133,7 @@ pub(crate) fn routed(
     graph
         .enqueue(
             &handle.group,
-            qwen_routed_group::WorkflowArgs {
+            routed_group::WorkflowArgs {
                 routes: routes.tensor().into(),
                 counts: counts.tensor_mut().into(),
                 order: order.tensor_mut().into(),
@@ -145,7 +145,7 @@ pub(crate) fn routed(
     let experts = graph
         .enqueue(
             &handle.experts,
-            qwen_routed_experts::WorkflowArgs {
+            routed_experts::WorkflowArgs {
                 normalized: (&normalized).into(),
                 order: order.tensor().into(),
                 blocks: block_experts.tensor().into(),
@@ -159,7 +159,7 @@ pub(crate) fn routed(
     Ok(graph
         .enqueue(
             &handle.combine,
-            qwen_routed_combine::WorkflowArgs {
+            routed_combine::WorkflowArgs {
                 residual: residual.into(),
                 expert_output: (&experts).into(),
                 inverse: inverse.tensor().into(),

@@ -6,7 +6,7 @@
 # `tokens` has the `sample_rows` result layout (token, status), so a chained
 # draft step embeds the previous step's selection directly. A failed
 # selection (token -1) embeds token 0; its proposal is discarded by the host.
-fn qwen_draft_rows[M, V, D](tokens: &tensor[M, 2] i32, table: &tensor[V, D] EW,
+fn draft_rows[M, V, D](tokens: &tensor[M, 2] i32, table: &tensor[V, D] EW,
     conditioning: &tensor[M, D] A, embedding_norm: &tensor[D] EN,
     hidden_norm: &tensor[D] HN, combine: &tensor[D, 2 * D] CW,
     epsilon: f32) -> tensor[M, D] f32:
@@ -38,8 +38,8 @@ fn qwen_draft_rows[M, V, D](tokens: &tensor[M, 2] i32, table: &tensor[V, D] EW,
 # weight decoded through the `rows16` packet library), then each simdgroup
 # reduces four combine rows over it. (CUDA holds the joined row in F32 and
 # decodes mma16 lane chunks, hence its larger shared memory.)
-native qwen_draft_rows for metal from "metal/qwen_draft_rows.metal":
-    launch qwen_draft_rows:
+native draft_rows for metal from "metal/draft_rows.metal":
+    launch draft_rows:
         threadgroups (ceil_div(D, 32), M, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (4 * D + 64)
@@ -47,20 +47,36 @@ native qwen_draft_rows for metal from "metal/qwen_draft_rows.metal":
 # Packed tables and combine weights decode whole 64-column k-blocks (every
 # k-quant row is a multiple of 256 columns); the joined row is F32 in shared
 # memory. (Metal holds it in A.)
-native qwen_draft_rows for cuda from "cuda/qwen_draft_rows.cu":
-    launch qwen_draft_rows:
+native draft_rows for cuda from "cuda/draft_rows.cu":
+    launch draft_rows:
         threadgroups (ceil_div(D, 32), M, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (8 * D)
 
 # Vulkan: one workgroup per (32 outputs, row); D is static because it sizes
 # the shared joined row (Vulkan spec §6.2).
-native qwen_draft_rows for vulkan from "vulkan/qwen_draft_rows.comp":
+native draft_rows for vulkan from "vulkan/draft_rows.comp":
     static (D)
-    launch qwen_draft_rows:
+    launch draft_rows:
         threadgroups (ceil_div(D, 32), M, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (4 * D + 64)
+
+# CPU: a join launch writes each row's joined [2D] input (both RMS norms in
+# A) as F32 to scratch; the row launch gives each work item ROWS combine
+# weight rows, projected against every joined row (the CPU projection
+# library, `cpu/lib/projection/projection.rs`).
+native draft_rows for cpu from "cpu/draft_rows.rs":
+    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    scratch quantized bytes (M * ceil_div(2 * D, 256) * 292)
+    scratch joined bytes (M * D * 8)
+    launch draft_rows_join:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (D * 8)
+    launch draft_rows_rows:
+        threadgroups (ceil_div(D, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
 
 
 # The draft head's readout: the vocabulary projection of feature rows that
@@ -128,3 +144,18 @@ native head_logits_rows for vulkan from "vulkan/head_logits_rows.comp":
         threadgroups (ceil_div(V, TILE_N), ceil_div(O, TILE_M), 1)
         threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
         shared_bytes ((TILE_M + TILE_N) * 80)
+
+# CPU: the CPU projection library (`cpu/lib/projection/projection.rs`). A
+# stage launch decodes each feature row as F32 to scratch; the row launch
+# gives each work item ROWS vocabulary weight rows, projected against every
+# staged row.
+native head_logits_rows for cpu from "cpu/head_logits_rows.rs":
+    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    scratch quantized bytes (O * ceil_div(D, 256) * 292)
+    scratch staged bytes (O * D * 4)
+    launch head_logits_rows_stage:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch head_logits_rows_rows:
+        threadgroups (ceil_div(V, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)

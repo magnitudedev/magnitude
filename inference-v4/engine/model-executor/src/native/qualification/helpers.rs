@@ -76,7 +76,7 @@ pub(super) fn qualify_attention(
     let destinations = semantic_i32(device, &[1], &[1], ENTRY, label)?;
     let projected = kernels
         .project
-        .call(qwen_attention_project::Args {
+        .call(gated_attention_project::Args {
             hidden: &residual,
             input_norm: &input_norm,
             query_norm: &query_norm,
@@ -85,7 +85,7 @@ pub(super) fn qualify_attention(
             value_weight: &value,
             epsilon: 1.0e-5,
         })
-        .map_err(|e| qualification_dynamic("qwen_attention_project", label, e))?;
+        .map_err(|e| qualification_dynamic("gated_attention_project", label, e))?;
     let plane = |element: Element, elements: u64| {
         semantic_zeros(device, element, &[2, kv_heads, elements], ENTRY, label)
     };
@@ -119,13 +119,13 @@ pub(super) fn qualify_attention(
     let mixed = match &kernels.history {
         AttentionHistoryKernels::Dense { decode, prefill } => [
             (
-                "qwen_attention_decode",
-                mix!(decode, qwen_attention_decode,
+                "gated_attention_decode",
+                mix!(decode, gated_attention_decode,
                     history_key: activation, width, history_value: activation, width),
             ),
             (
-                "qwen_attention_prefill",
-                mix!(prefill, qwen_attention_prefill,
+                "gated_attention_prefill",
+                mix!(prefill, gated_attention_prefill,
                     history_key: activation, width, history_value: activation, width),
             ),
         ],
@@ -133,16 +133,16 @@ pub(super) fn qualify_attention(
             let pairs = crate::programs::graph::attention::affine_coefficients(width);
             [
                 (
-                    "qwen_attention_decode_k8v4",
-                    mix!(decode, qwen_attention_decode_k8v4,
+                    "gated_attention_decode_k8v4",
+                    mix!(decode, gated_attention_decode_k8v4,
                         history_key_codes: Element::u32(), width / 4,
                         history_key_coefficients: Element::f16(), pairs,
                         history_value_codes: Element::u32(), width / 8,
                         history_value_coefficients: Element::f16(), pairs),
                 ),
                 (
-                    "qwen_attention_prefill_k8v4",
-                    mix!(prefill, qwen_attention_prefill_k8v4,
+                    "gated_attention_prefill_k8v4",
+                    mix!(prefill, gated_attention_prefill_k8v4,
                         history_key_codes: Element::u32(), width / 4,
                         history_key_coefficients: Element::f16(), pairs,
                         history_value_codes: Element::u32(), width / 8,

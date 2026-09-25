@@ -10,7 +10,7 @@
 //     0 success, 1 empty, 2 nonfinite source.
 // The token counter is the vocabulary coordinate, so partitioning never
 // changes a draw and the result is independent of PARTS and WIDTH.
-#include "common/element.glsl"
+#include <seismic/element.glsl>
 
 #define SAMPLE_NO_TOKEN 0xffffffffu
 #define SAMPLE_INF uintBitsToFloat(0x7f800000u)

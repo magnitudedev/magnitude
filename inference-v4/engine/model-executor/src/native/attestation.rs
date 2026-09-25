@@ -69,7 +69,7 @@ pub(crate) struct AttestedHead {
 
 #[derive(Clone)]
 pub(crate) struct AttestedHeadBlock {
-    pub input: NativeKernel<qwen_draft_rows::Entry>,
+    pub input: NativeKernel<draft_rows::Entry>,
     pub attention: AttentionKernels,
     pub dense: DenseKernels,
     pub features: NativeKernel<readout_features_rows::Entry>,
@@ -373,15 +373,15 @@ impl AttestedPrograms {
                 MixerProgramSlot::Attention(binding)
                     if charged_mixers.insert(MixerProgramSlot::Attention(binding)) =>
                 {
-                    bytes += bytes!(qwen_attention_project)
+                    bytes += bytes!(gated_attention_project)
                         + bytes!(attention_output)
                         + match binding.history {
                             KvCodec::Dense => {
-                                bytes!(qwen_attention_decode) + bytes!(qwen_attention_prefill)
+                                bytes!(gated_attention_decode) + bytes!(gated_attention_prefill)
                             }
                             KvCodec::AffineK8V4 => {
-                                bytes!(qwen_attention_decode_k8v4)
-                                    + bytes!(qwen_attention_prefill_k8v4)
+                                bytes!(gated_attention_decode_k8v4)
+                                    + bytes!(gated_attention_prefill_k8v4)
                             }
                             KvCodec::RotatedK4V4 => {
                                 return Err(PlanError::Unsupported("native rotated K4/V4 KV codec"))
@@ -391,10 +391,10 @@ impl AttestedPrograms {
                 MixerProgramSlot::Recurrent(binding)
                     if charged_mixers.insert(MixerProgramSlot::Recurrent(binding)) =>
                 {
-                    bytes += bytes!(qwen_recurrent_project)
-                        + bytes!(qwen_recurrent_step)
-                        + bytes!(qwen_recurrent_chunk)
-                        + bytes!(qwen_recurrent_output)
+                    bytes += bytes!(gated_delta_project)
+                        + bytes!(gated_delta_step)
+                        + bytes!(gated_delta_chunk)
+                        + bytes!(gated_delta_output)
                 }
                 _ => {}
             }
@@ -402,17 +402,17 @@ impl AttestedPrograms {
                 FeedForwardProgramSlot::Dense(binding)
                     if charged_feed_forward.insert(FeedForwardProgramSlot::Dense(binding)) =>
                 {
-                    bytes += bytes!(qwen_dense_expand) + bytes!(qwen_dense_output)
+                    bytes += bytes!(dense_expand) + bytes!(dense_output)
                 }
                 FeedForwardProgramSlot::Routed(binding)
                     if charged_feed_forward.insert(FeedForwardProgramSlot::Routed(binding)) =>
                 {
-                    bytes += bytes!(qwen_routed_route)
-                        + bytes!(qwen_routed_expand)
-                        + bytes!(qwen_routed_output)
-                        + bytes!(qwen_routed_group)
-                        + bytes!(qwen_routed_experts)
-                        + bytes!(qwen_routed_combine)
+                    bytes += bytes!(routed_route)
+                        + bytes!(routed_expand)
+                        + bytes!(routed_output)
+                        + bytes!(routed_group)
+                        + bytes!(routed_experts)
+                        + bytes!(routed_combine)
                 }
                 _ => {}
             }
@@ -426,13 +426,13 @@ impl AttestedPrograms {
             bytes += bytes!(shape_rows) + bytes!(sample_rows);
             for &binding in head.blocks() {
                 if charged_heads.insert(binding) {
-                    bytes += bytes!(qwen_draft_rows)
-                        + bytes!(qwen_attention_project)
-                        + bytes!(qwen_attention_decode)
-                        + bytes!(qwen_attention_prefill)
+                    bytes += bytes!(draft_rows)
+                        + bytes!(gated_attention_project)
+                        + bytes!(gated_attention_decode)
+                        + bytes!(gated_attention_prefill)
                         + bytes!(attention_output)
-                        + bytes!(qwen_dense_expand)
-                        + bytes!(qwen_dense_output)
+                        + bytes!(dense_expand)
+                        + bytes!(dense_output)
                         + bytes!(readout_features_rows)
                         + bytes!(head_logits_rows);
                 }
@@ -553,7 +553,7 @@ impl AttestedPrograms {
                         .attention
                         .get(&binding)
                         .cloned()
-                        .ok_or_else(|| missing("qwen_attention_stages", binding))?,
+                        .ok_or_else(|| missing("gated_attention_stages", binding))?,
                 ),
                 MixerProgramSlot::Recurrent(binding) => AttestedMixer::Recurrent(
                     prepared
@@ -561,7 +561,7 @@ impl AttestedPrograms {
                         .recurrent
                         .get(&binding)
                         .cloned()
-                        .ok_or_else(|| missing("qwen_recurrent_stages", binding))?,
+                        .ok_or_else(|| missing("gated_delta_stages", binding))?,
                 ),
             };
             let feed_forward = match block.feed_forward() {
@@ -571,7 +571,7 @@ impl AttestedPrograms {
                         .dense
                         .get(&binding)
                         .cloned()
-                        .ok_or_else(|| missing("qwen_dense_stages", binding))?,
+                        .ok_or_else(|| missing("dense_stages", binding))?,
                 ),
                 FeedForwardProgramSlot::Routed(binding) => AttestedFeedForward::Routed(
                     prepared
@@ -579,7 +579,7 @@ impl AttestedPrograms {
                         .routed
                         .get(&binding)
                         .cloned()
-                        .ok_or_else(|| missing("qwen_routed_stages", binding))?,
+                        .ok_or_else(|| missing("routed_stages", binding))?,
                 ),
             };
             blocks.push(AttestedTargetBlock {
@@ -630,17 +630,17 @@ impl AttestedPrograms {
                 let mut blocks = Vec::with_capacity(head_plan.blocks().len());
                 for &binding in head_plan.blocks() {
                     blocks.push(AttestedHeadBlock {
-                        input: slot(&handles.input, binding, "qwen_draft_rows")?,
+                        input: slot(&handles.input, binding, "draft_rows")?,
                         attention: handles
                             .attention
                             .get(&binding)
                             .cloned()
-                            .ok_or_else(|| missing("qwen_attention_stages", binding))?,
+                            .ok_or_else(|| missing("gated_attention_stages", binding))?,
                         dense: handles
                             .dense
                             .get(&binding)
                             .cloned()
-                            .ok_or_else(|| missing("qwen_dense_stages", binding))?,
+                            .ok_or_else(|| missing("dense_stages", binding))?,
                         features: slot(&handles.features, binding, "readout_features_rows")?,
                         logits: slot(&handles.logits, binding, "head_logits_rows")?,
                     });

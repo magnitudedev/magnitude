@@ -8,6 +8,7 @@ license.workspace = true
 seismic-lang.workspace = true
 seismic-compiler.workspace = true
 seismic-runtime.workspace = true
+seismic-native-cpu.workspace = true
 seismic-std.workspace = true
 sha2 = "0.10"
 self_cell = "1"

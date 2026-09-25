@@ -1,7 +1,7 @@
 // Dense weight import over the [B, N, K] view; one thread per element in
 // row-major order. The CUDA form of `metal/import_dense.metal`.
 
-#include "common/element.cuh"
+#include "lib/core/activation.cuh"
 
 typedef ELEMENT_OF(SEISMIC_ELEMENT_E) Source;
 typedef ELEMENT_OF(SEISMIC_ELEMENT_U) Destination;

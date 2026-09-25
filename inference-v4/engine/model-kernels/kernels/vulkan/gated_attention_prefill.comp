@@ -1,0 +1,11 @@
+// gated_attention_prefill: streaming attention for prefill rows over dense
+// history. The body (three launches) is `lib/attention/prefill.glsl`.
+#include "lib/attention/prefill.glsl"
+
+attention_history prefill_history() {
+    return attention_dense_history(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY), SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE));
+}
+
+void gated_attention_prefill_prepare() { prefill_prepare(prefill_history()); }
+void gated_attention_prefill_attend() { prefill_attend(prefill_history()); }
+void gated_attention_prefill_merge() { prefill_merge(); }

@@ -1,25 +1,17 @@
-fn scale_rows<const ROWS: u64>(context: &Context<'_>, group: [u64; 3], _shared: &mut [u8]) {
-    let x = context.arg_x();
-    let result = context.result_0();
-    let factor = context.arg_factor();
-    for local in 0..ROWS {
-        let row = group[0] * ROWS + local;
-        if row >= context.dim_m() {
+// One work item per `ROWS` rows.
+fn scale_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
+    let x = cx.arg_x();
+    let result = cx.result_0();
+    let factor = cx.arg_factor();
+    let rows = cx.param_rows();
+    for local in 0..rows {
+        let row = group[0] * rows + local;
+        if row >= cx.dim_m() {
             return;
         }
-        for column in 0..context.dim_n() {
-            unsafe {
-                let value = x
-                    .pointer
-                    .cast::<f32>()
-                    .add((row * x.strides[0] + column * x.strides[1]) as usize)
-                    .read();
-                result
-                    .pointer
-                    .cast::<f32>()
-                    .add((row * result.strides[0] + column * result.strides[1]) as usize)
-                    .write(value * factor);
-            }
+        for column in 0..cx.dim_n() as usize {
+            // SAFETY: each work item writes its own rows.
+            unsafe { result.set([row as usize, column], x.get([row as usize, column]) * factor) };
         }
     }
 }

@@ -198,14 +198,38 @@ fn generated_surface_exposes_planned_and_native_preparation() {
 }
 
 const PARTITIONS: [u64; 3] = [64, 32, 128];
+const CPU_PARTITIONS: [u64; 4] = [32, 8, 64, 1];
 
-/// Every accelerator this host opens.
-fn accelerators() -> Vec<seismic::Device> {
+/// Every accelerator this host opens, then the CPU.
+fn devices() -> Vec<seismic::Device> {
     let catalog = seismic::DeviceCatalog::discover().unwrap();
     [seismic::BackendName::Metal, seismic::BackendName::Cuda, seismic::BackendName::Vulkan]
         .into_iter()
         .filter_map(|backend| catalog.open_backend(backend).ok())
+        .chain(std::iter::once(catalog.open_backend(seismic::BackendName::Cpu).unwrap()))
         .collect()
+}
+
+fn is_cpu(device: &seismic::Device) -> bool {
+    device.backend() == seismic::BackendName::Cpu
+}
+
+/// The partition counts `device`'s native forms declare.
+fn partitions(device: &seismic::Device) -> &'static [u64] {
+    if is_cpu(device) { &CPU_PARTITIONS } else { &PARTITIONS }
+}
+
+/// PARTS on `device`, plus the static dimensions and WIDTH of the CUDA and
+/// Vulkan forms (Metal and the CPU have neither).
+fn specialization_on(device: &seismic::Device, parts: u64, statics: &[(&str, u64)]) -> seismic::NativeSpecialization {
+    let specialization = seismic::NativeSpecialization::new().with_param("PARTS", parts);
+    if matches!(device.backend(), seismic::BackendName::Metal | seismic::BackendName::Cpu) {
+        return specialization;
+    }
+    statics
+        .iter()
+        .fold(specialization, |specialization, (name, value)| specialization.with_static(*name, *value))
+        .with_param("WIDTH", 256)
 }
 
 fn native_shape(device: &seismic::Device, logits: &[f32], rows: usize, vocabulary: usize,
@@ -217,15 +241,7 @@ fn native_shape(device: &seismic::Device, logits: &[f32], rows: usize, vocabular
     let history = seismic::Tensor::from_host(device, seismic::Element::i32(), &[rows as u64, hn as u64],
         &history.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()).unwrap();
     let mut out = seismic::Tensor::zeros(device, seismic::Element::f32(), &[rows as u64, vocabulary as u64]).unwrap();
-    // CUDA and Vulkan fix V and Hn statically and take a WIDTH (Metal has
-    // neither).
-    let mut specialization = seismic::NativeSpecialization::new().with_param("PARTS", parts);
-    if device.backend() != seismic::BackendName::Metal {
-        specialization = specialization
-            .with_static("V", vocabulary as u64)
-            .with_static("Hn", hn as u64)
-            .with_param("WIDTH", 256);
-    }
+    let specialization = specialization_on(device, parts, &[("V", vocabulary as u64), ("Hn", hn as u64)]);
     shape_rows::native_for_device(device, &specialization)
     .unwrap()
     .call(shape_rows::Args { logits: &logits, params: &params, history: &history, out: &mut out })
@@ -244,10 +260,7 @@ fn native_sample(device: &seismic::Device, logits: &[f32], rows: usize, vocabula
         &constrained.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()).unwrap();
     let draws = seismic::Tensor::from_host(device, seismic::Element::u32(), &[rows as u64, 6], &u32_bytes(draws)).unwrap();
     let mut result = seismic::Tensor::zeros(device, seismic::Element::i32(), &[rows as u64, 2]).unwrap();
-    let mut specialization = seismic::NativeSpecialization::new().with_param("PARTS", parts);
-    if device.backend() != seismic::BackendName::Metal {
-        specialization = specialization.with_static("V", vocabulary as u64).with_param("WIDTH", 256);
-    }
+    let specialization = specialization_on(device, parts, &[("V", vocabulary as u64)]);
     sample_rows::native_for_device(device, &specialization)
     .unwrap()
     .call(sample_rows::Args { logits: &logits, mask: &mask, constrained: &constrained, draws: &draws, result: &mut result })
@@ -353,7 +366,7 @@ fn shaping_reference(logits: &[f32], p: &[f32], history: &[i32]) -> (Vec<f32>, V
 
 #[test]
 fn native_shaping_matches_the_host_reference() {
-    for device in accelerators() {
+    for device in devices() {
         native_shaping_matches_the_host_reference_on(&device);
     }
 }
@@ -361,7 +374,7 @@ fn native_shaping_matches_the_host_reference() {
 fn native_shaping_matches_the_host_reference_on(device: &seismic::Device) {
     let (logits, params, history) = fixture();
     let expected = host_reference(&logits, &params, &history);
-    for parts in PARTITIONS {
+    for &parts in partitions(device) {
         let actual = native_shape(device, &logits, ROWS, VOCABULARY, &params, &history, parts);
         assert_values(&actual, &expected);
     }
@@ -369,7 +382,7 @@ fn native_shaping_matches_the_host_reference_on(device: &seismic::Device) {
 
 #[test]
 fn native_shaping_preserves_cross_partition_cutoff_ties_and_history_counts() {
-    for device in accelerators() {
+    for device in devices() {
         cutoff_ties_and_history_counts_on(&device);
     }
 }
@@ -390,7 +403,7 @@ fn cutoff_ties_and_history_counts_on(device: &seismic::Device) {
     history[VOCAB] = 5;
     history[VOCAB + 1] = 300;
     history[VOCAB + 2] = 300;
-    for parts in PARTITIONS {
+    for &parts in partitions(device) {
         let actual = native_shape(device, &logits, 2, VOCAB, &params, &history, parts);
         assert_eq!(actual[5], 4.0);
         assert_eq!(actual[300], f32::NEG_INFINITY);
@@ -404,7 +417,7 @@ fn cutoff_ties_and_history_counts_on(device: &seismic::Device) {
 
 #[test]
 fn native_shaping_matches_the_ordered_semantics_at_full_vocabulary_for_every_partition_count() {
-    for device in accelerators() {
+    for device in devices() {
         ordered_semantics_at_full_vocabulary_on(&device);
     }
 }
@@ -425,8 +438,8 @@ fn ordered_semantics_at_full_vocabulary_on(device: &seismic::Device) {
     for (vocabulary, quantized) in [(248_320usize, false), (248_320, true), (1000, true), (513, false)] {
         let logits = logits_pattern(rows * vocabulary, vocabulary as u64 + u64::from(quantized), quantized);
         let history = (0..rows * 64).map(|i| if i % 3 == 0 { -1 } else { ((i * 7919) % (vocabulary / 2)) as i32 }).collect::<Vec<_>>();
-        let base = native_shape(device, &logits, rows, vocabulary, &params, &history, PARTITIONS[0]);
-        for parts in &PARTITIONS[1..] {
+        let base = native_shape(device, &logits, rows, vocabulary, &params, &history, partitions(device)[0]);
+        for parts in &partitions(device)[1..] {
             let other = native_shape(device,&logits, rows, vocabulary, &params, &history, *parts);
             assert!(other.iter().zip(&base).all(|(a, b)| a.to_bits() == b.to_bits()),
                 "V {vocabulary}: PARTS {parts} changes the result");
@@ -453,7 +466,7 @@ fn ordered_semantics_at_full_vocabulary_on(device: &seismic::Device) {
         let (reference, _) = shaping_reference(&logits, &params, &[-1; 64]);
         let kept = (0..vocabulary).filter(|t| reference[*t] > f32::NEG_INFINITY).collect::<Vec<_>>();
         assert_eq!(kept, (0..kept.len()).collect::<Vec<_>>(), "the reference keeps the lowest indices");
-        for parts in PARTITIONS {
+        for &parts in partitions(device) {
             let out = native_shape(device, &logits, 1, vocabulary, &params, &[-1; 64], parts);
             let survivors = (0..vocabulary).filter(|t| out[*t] > f32::NEG_INFINITY).collect::<Vec<_>>();
             assert_eq!(survivors, kept, "V {vocabulary} top-p {top_p} PARTS {parts}");
@@ -468,7 +481,7 @@ fn ordered_semantics_at_full_vocabulary_on(device: &seismic::Device) {
 
 #[test]
 fn native_sampling_statuses_ties_masks_and_winners_are_partition_invariant() {
-    for device in accelerators() {
+    for device in devices() {
         sampling_statuses_ties_masks_and_winners_on(&device);
     }
 }
@@ -506,8 +519,8 @@ fn sampling_statuses_ties_masks_and_winners_on(device: &seismic::Device) {
         for row in [0usize, 2, 5] {
             draws[row * 6..row * 6 + 6].copy_from_slice(&[1, 0x1234_5678 + row as u32, 0x9abc_def0, 7 + row as u32, 11, 13]);
         }
-        let base = native_sample(device, &logits, rows, vocabulary, &mask, &constrained, &draws, PARTITIONS[0]);
-        for parts in &PARTITIONS[1..] {
+        let base = native_sample(device, &logits, rows, vocabulary, &mask, &constrained, &draws, partitions(device)[0]);
+        for parts in &partitions(device)[1..] {
             assert_eq!(native_sample(device,&logits, rows, vocabulary, &mask, &constrained, &draws, *parts), base,
                 "V {vocabulary}: PARTS {parts} changes the winners");
         }

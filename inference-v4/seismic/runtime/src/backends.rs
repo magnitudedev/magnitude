@@ -592,13 +592,17 @@ impl OpenedKind {
     /// no ordering or closeness.
     pub(crate) fn tuning_identity(&self) -> String {
         match self {
+            // The detected tier fixes which native forms exist, and the CPU
+            // library version their machine code.
             Self::Cpu(device) => {
                 let facts = device.device_description().facts();
                 format!(
-                    "cpu;{};workers {};simd {:?}",
+                    "cpu;{};workers {};simd {:?};tier {};library {}",
                     std::env::consts::ARCH,
                     facts.workers,
-                    facts.simd
+                    facts.simd,
+                    seismic_native_cpu::Tier::detected().map_or("none", |tier| tier.name()),
+                    seismic_native_cpu::VERSION
                 )
             }
             // The OS build ships the Metal compiler, and the NVRTC release
@@ -628,11 +632,19 @@ impl OpenedKind {
 
     pub(crate) fn supports_representation(&self, representation: RepresentationId) -> bool {
         match self {
-            Self::Cpu(device) => device
-                .device_description()
-                .dtypes()
-                .representations
-                .contains(&representation),
+            // Row layouts (`rows16`, the CPU weight layout) are storage for
+            // direct native kernels only, whose weight components read them;
+            // compiled construction refuses them through the profile's
+            // representation set.
+            Self::Cpu(device) => {
+                seismic_lang::registry::representation_info(representation).layout
+                    != seismic_lang::registry::Layout::Packet
+                    || device
+                        .device_description()
+                        .dtypes()
+                        .representations
+                        .contains(&representation)
+            }
             #[cfg(target_os = "macos")]
             // Direct Metal owns raw shared buffers; representation-specific
             // interpretation remains in the authored kernel. A normal

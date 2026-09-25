@@ -4,7 +4,8 @@
 #if defined(SEISMIC_TABLE_KIND_PACKED)
 #define KERNEL_W0 SEISMIC_TABLE
 #endif
-#include "common/packets.cuh"
+#include "lib/core/activation.cuh"
+#include <seismic/packets.cuh>
 
 using element::Act;
 using element::u32;

@@ -10,7 +10,7 @@
 mod cuda_common;
 
 use cuda_common::*;
-use magnitude_model_kernels::qwen_dense_expand;
+use magnitude_model_kernels::dense_expand;
 use seismic::{Element, NativeSpecialization, Tensor};
 use seismic_lang::registry::bf16_round;
 use std::collections::HashMap;
@@ -227,9 +227,9 @@ fn real_4b_projections_match_their_operand_emulation() {
                     let round = |v: f64| f64::from(bf16_round(v as f32));
                     let emulated: Vec<f64> =
                         (0..o * f).map(|i| round(round(silu(round(g[i]))) * round(u[i]))).collect();
-                    let kernel = qwen_dense_expand::native_for_device_with(
+                    let kernel = dense_expand::native_for_device_with(
                         &device,
-                        qwen_dense_expand::Elements {
+                        dense_expand::Elements {
                             NW: Element::f32(),
                             GW: gate_format.resident(),
                             UW: up_format.resident(),
@@ -240,7 +240,7 @@ fn real_4b_projections_match_their_operand_emulation() {
                     .unwrap();
                     let actual: Vec<f64> = read_bf16(
                         &kernel
-                            .call(qwen_dense_expand::Args {
+                            .call(dense_expand::Args {
                                 residual: &residual_tensor,
                                 norm: &norm,
                                 gate_weight: &gate.tensor,

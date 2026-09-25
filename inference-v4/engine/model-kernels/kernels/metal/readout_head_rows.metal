@@ -1,7 +1,7 @@
 // readout_head_rows: final RMS prologue over the `out_rows` hidden rows and the
 // vocabulary projection into F32 logits.
 #define KERNEL_W0 SEISMIC_WEIGHT
-#include "common/projection.h"
+#include "lib/projection/projection.h"
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;

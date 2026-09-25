@@ -311,6 +311,11 @@ representation!(Q5KRows16, "q5k", Rows16, F32, 4);
 representation!(Q6KRows16, "q6k", Rows16, F32, 4);
 representation!(Q8G32SRows16, "q8g32s", Rows16, F32, 2);
 representation!(IQ4G32Rows16, "iq4g32", Rows16, F32, 2);
+representation!(Q4KRows8, "q4k", Rows8, F32, 3);
+representation!(Q5KRows8, "q5k", Rows8, F32, 4);
+representation!(Q6KRows8, "q6k", Rows8, F32, 4);
+representation!(Q8G32SRows8, "q8g32s", Rows8, F32, 2);
+representation!(IQ4G32Rows8, "iq4g32", Rows8, F32, 2);
 representation!(Q4KMma16, "q4k", Mma16, F32, 3);
 representation!(Q5KMma16, "q5k", Mma16, F32, 4);
 representation!(Q6KMma16, "q6k", Mma16, F32, 4);
@@ -337,6 +342,11 @@ pub fn with_representation<V: RepresentationVisitor>(
         ("q6k", registry::Layout::Rows16) => return visitor.visit::<Q6KRows16>(),
         ("q8g32s", registry::Layout::Rows16) => return visitor.visit::<Q8G32SRows16>(),
         ("iq4g32", registry::Layout::Rows16) => return visitor.visit::<IQ4G32Rows16>(),
+        ("q4k", registry::Layout::Rows8) => return visitor.visit::<Q4KRows8>(),
+        ("q5k", registry::Layout::Rows8) => return visitor.visit::<Q5KRows8>(),
+        ("q6k", registry::Layout::Rows8) => return visitor.visit::<Q6KRows8>(),
+        ("q8g32s", registry::Layout::Rows8) => return visitor.visit::<Q8G32SRows8>(),
+        ("iq4g32", registry::Layout::Rows8) => return visitor.visit::<IQ4G32Rows8>(),
         ("q4k", registry::Layout::Mma16) => return visitor.visit::<Q4KMma16>(),
         ("q5k", registry::Layout::Mma16) => return visitor.visit::<Q5KMma16>(),
         ("q6k", registry::Layout::Mma16) => return visitor.visit::<Q6KMma16>(),

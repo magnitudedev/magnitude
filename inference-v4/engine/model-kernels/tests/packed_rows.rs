@@ -1,6 +1,5 @@
 use magnitude_model_kernels::{
-    qwen_recurrent_chunk, qwen_recurrent_output, qwen_recurrent_project,
-    qwen_recurrent_step, repack_weight,
+    gated_delta_chunk, gated_delta_output, gated_delta_project, gated_delta_step, repack_weight,
 };
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
@@ -11,26 +10,49 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
 fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
     let catalog = seismic::DeviceCatalog::discover().unwrap();
-    let device = catalog.open_backend(seismic::BackendName::Metal).unwrap();
+    for backend in [
+        seismic::BackendName::Metal,
+        seismic::BackendName::Cuda,
+        seismic::BackendName::Vulkan,
+        seismic::BackendName::Cpu,
+    ] {
+        let Ok(device) = catalog.open_backend(backend) else {
+            continue;
+        };
+        packed_stages_on(&device);
+    }
+}
+
+fn packed_stages_on(device: &seismic::Device) {
     let q8_external = seismic::Element::named("gguf_q8_0").unwrap();
-    let q8 = seismic::Element::stored("q8g32s", seismic::Layout::Rows16).unwrap();
+    let layout = match device.backend() {
+        seismic::BackendName::Cuda => seismic::Layout::Mma16,
+        _ => seismic::Layout::Rows16,
+    };
+    let q8 = seismic::Element::stored("q8g32s", layout).unwrap();
     let bf16 = seismic::Element::bf16();
     // One key and one value head of width 32 over a 32-wide hidden row, at
     // each entry's first declared configuration.
-    fn declared_defaults<E: seismic::Entry>(device: &seismic::Device) -> seismic::NativeSpecialization {
-        let statics = seismic::NativeSpecialization::new()
-            .with_static("H", 32)
-            .with_static("NK", 1)
-            .with_static("NV", 1)
-            .with_static("W", 32);
-        seismic::generated::native_implementation::<E>(device)
+    fn declared_defaults<E: seismic::Entry>(
+        device: &seismic::Device,
+    ) -> seismic::NativeSpecialization {
+        let implementation = seismic::generated::native_implementation::<E>(device)
             .unwrap()
-            .unwrap()
-            .default_specialization(&statics)
-            .unwrap()
+            .unwrap();
+        let statics = implementation.statics.iter().fold(
+            seismic::NativeSpecialization::new(),
+            |statics, name| {
+                let value = match name.as_str() {
+                    "H" | "W" => 32,
+                    "NK" | "NV" => 1,
+                    _ => panic!("unexpected static {name}"),
+                };
+                statics.with_static(name.clone(), value)
+            },
+        );
+        implementation.default_specialization(&statics).unwrap()
     }
     let resident = |shape: &[u64]| {
         let values = shape.iter().product::<u64>() as usize;
@@ -41,13 +63,20 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
             bytes.extend_from_slice(&[0; 32]);
         }
         let external =
-            seismic::Tensor::from_host(&device, q8_external, &[1, shape[0], shape[1]], &bytes).unwrap();
+            seismic::Tensor::from_host(&device, q8_external, &[1, shape[0], shape[1]], &bytes)
+                .unwrap();
+        let specialization = repack_weight::native_implementation(device)
+            .unwrap()
+            .unwrap()
+            .default_specialization(&seismic::NativeSpecialization::new())
+            .unwrap();
         repack_weight::native_for_device_with(
             &device,
             repack_weight::Elements {
                 E: q8_external,
                 U: q8,
-            }, &seismic::NativeSpecialization::new(),
+            },
+            &specialization,
         )
         .unwrap()
         .call(repack_weight::Args { source: &external })
@@ -71,7 +100,6 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
     let norm = bf16_tensor(&[32], &vec![1.0; 32]);
     let zero_weight = resident(&[32, 32]);
 
-
     // One key and one value head of width 32, a two-tap convolution, and a
     // two-bank state arena (bank 0 read, bank 1 published) with one tape row
     // (u [1, 32] | k [1, 32] | d [1]).
@@ -89,9 +117,9 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
     let rate = tensor(&device, &[1], &[0.0]);
     let time_bias = tensor(&device, &[1], &[0.0]);
     let mut delta = tensor(&device, &[2, 1, 32, 32], &[0.0; 2048]);
-    let projection = qwen_recurrent_project::native_for_device_with(
+    let projection = gated_delta_project::native_for_device_with(
         &device,
-        qwen_recurrent_project::Elements {
+        gated_delta_project::Elements {
             NW: bf16,
             QW: q8,
             GW: q8,
@@ -99,10 +127,10 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
             BW: q8,
             A: bf16,
         },
-        &declared_defaults::<qwen_recurrent_project::Entry>(&device),
+        &declared_defaults::<gated_delta_project::Entry>(&device),
     )
     .unwrap()
-    .call(qwen_recurrent_project::Args {
+    .call(gated_delta_project::Args {
         hidden: &hidden,
         input_norm: &norm,
         qkv_weight: &qkv_weight,
@@ -113,18 +141,31 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
     })
     .unwrap()
     .value;
-    let mixed = qwen_recurrent_step::native_for_device_with(
+    let step_implementation = gated_delta_step::native_implementation(device)
+        .unwrap()
+        .unwrap();
+    let step_statics = step_implementation.statics.iter().fold(
+        seismic::NativeSpecialization::new(),
+        |statics, name| {
+            let value = match name.as_str() {
+                "NK" | "NV" => 1,
+                "W" => 32,
+                "C" => 2,
+                _ => panic!("unexpected static {name}"),
+            };
+            statics.with_static(name.clone(), value)
+        },
+    );
+    let step_specialization = step_implementation
+        .default_specialization(&step_statics)
+        .unwrap();
+    let mixed = gated_delta_step::native_for_device_with(
         &device,
-        qwen_recurrent_step::Elements { A: bf16 },
-        &seismic::NativeSpecialization::new()
-            .with_static("NK", 1)
-            .with_static("NV", 1)
-            .with_static("W", 32)
-            .with_static("C", 2)
-            .with_param("ROWS", 16),
+        gated_delta_step::Elements { A: bf16 },
+        &step_specialization,
     )
     .unwrap()
-    .call(qwen_recurrent_step::Args {
+    .call(gated_delta_step::Args {
         projection: &projection,
         convolution: &convolution,
         rate: &rate,
@@ -142,17 +183,17 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
     })
     .unwrap()
     .value;
-    let recurrent = qwen_recurrent_output::native_for_device_with(
+    let recurrent = gated_delta_output::native_for_device_with(
         &device,
-        qwen_recurrent_output::Elements {
+        gated_delta_output::Elements {
             RN: bf16,
             OW: q8,
             A: bf16,
         },
-        &declared_defaults::<qwen_recurrent_output::Entry>(&device),
+        &declared_defaults::<gated_delta_output::Entry>(&device),
     )
     .unwrap()
-    .call(qwen_recurrent_output::Args {
+    .call(gated_delta_output::Args {
         hidden: &hidden,
         mixed: &mixed,
         projection: &projection,
@@ -163,7 +204,6 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
     .unwrap()
     .value;
     assert_close(&read_f32(&recurrent), &hidden_values);
-
 }
 
 fn i32_bytes(values: &[i32]) -> Vec<u8> {
@@ -202,14 +242,14 @@ fn assert_close(actual: &[f32], expected: &[f32]) {
 
 #[test]
 fn packed_entries_are_the_only_generated_target_surface() {
-    let _ = qwen_recurrent_project::for_device_with;
-    let _ = qwen_recurrent_project::native_for_device_with;
-    let _ = qwen_recurrent_step::for_device_with;
-    let _ = qwen_recurrent_step::native_for_device_with;
-    let _ = qwen_recurrent_chunk::for_device_with;
-    let _ = qwen_recurrent_chunk::native_for_device_with;
-    let _ = qwen_recurrent_output::for_device_with;
-    let _ = qwen_recurrent_output::native_for_device_with;
+    let _ = gated_delta_project::for_device_with;
+    let _ = gated_delta_project::native_for_device_with;
+    let _ = gated_delta_step::for_device_with;
+    let _ = gated_delta_step::native_for_device_with;
+    let _ = gated_delta_chunk::for_device_with;
+    let _ = gated_delta_chunk::native_for_device_with;
+    let _ = gated_delta_output::for_device_with;
+    let _ = gated_delta_output::native_for_device_with;
     let sources = [
         include_str!("../kernels/target.seismic"),
         include_str!("../kernels/dense_rows.seismic"),
@@ -218,13 +258,12 @@ fn packed_entries_are_the_only_generated_target_surface() {
     .concat();
     for obsolete in [
         "qwen_append_rows",
-        "qwen_attention_sequence",
-        "qwen_recurrent_sequence",
-        "qwen_dense_suffix",
-        "qwen_routed_suffix",
+        "gated_attention_sequence",
+        "gated_delta_sequence",
+        "dense_suffix",
+        "routed_suffix",
         "fn route_topk",
         "fn routed_input",
-        "fn routed_output",
     ] {
         assert!(
             !sources.contains(obsolete),

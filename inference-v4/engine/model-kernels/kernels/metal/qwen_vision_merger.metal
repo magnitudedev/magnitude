@@ -1,8 +1,8 @@
 // qwen_vision_merger: layer norm of each of the M * G F32 patch rows (width
 // H) to A, then the up GEMM over G concatenated rows (+ bias, erf GELU) and
 // the down GEMM to the decoder width D (+ bias), published in F32 as the
-// image features. Bodies in common/vision.h and the projection library.
-#include "common/vision.h"
+// image features. Bodies in lib/vision/vision.h and the projection library.
+#include "lib/vision/vision.h"
 
 #if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16)
 typedef element::Bf16 activation;

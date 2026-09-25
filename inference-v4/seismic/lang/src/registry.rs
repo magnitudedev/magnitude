@@ -266,6 +266,8 @@ pub enum IntrinsicNumerics {
 /// - `Rows16`: row-major; each row holds its planes one after another, every
 ///   plane and every row 16 B-aligned, codes split into a low-4-bit plane and
 ///   a high-bit plane (`PackedRowLayout`). The Metal resident layout.
+/// - `Rows8`: eight-row tiles, with each plane interleaved by storage group
+///   across the tile. The CPU resident layout.
 /// - `Mma16`: `Rows16` whose code-plane bytes are permuted, per 16-row tile,
 ///   into `mma.sync.m16n8k16` A-fragment order (`PackedRowLayout::code_bit`).
 ///   The CUDA resident layout.
@@ -273,16 +275,18 @@ pub enum IntrinsicNumerics {
 pub enum Layout {
     Packet,
     Rows16,
+    Rows8,
     Mma16,
 }
 
 impl Layout {
-    pub const ALL: [Layout; 3] = [Layout::Packet, Layout::Rows16, Layout::Mma16];
+    pub const ALL: [Layout; 4] = [Layout::Packet, Layout::Rows16, Layout::Rows8, Layout::Mma16];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Layout::Packet => "packet",
             Layout::Rows16 => "rows16",
+            Layout::Rows8 => "rows8",
             Layout::Mma16 => "mma16",
         }
     }
@@ -583,7 +587,7 @@ pub const MMA_LANES: u64 = 32;
 /// stride and every plane offset are exactly those of `rows16`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackedRowLayout {
-    /// `Rows16` or `Mma16`.
+    /// `Rows16`, `Rows8` or `Mma16`.
     pub layout: Layout,
     /// The representation's packet form: logical group, plane schema and the
     /// packet every conversion produces before placement.
@@ -634,10 +638,11 @@ impl PackedRowLayout {
         self.packet.group
     }
 
-    /// Rows of one `mma16` tile, or 1.
+    /// Rows of one row tile, or 1.
     pub fn tile_rows(&self) -> u64 {
         match self.layout {
             Layout::Mma16 => MMA_TILE_ROWS,
+            Layout::Rows8 => 8,
             Layout::Rows16 => 1,
             Layout::Packet => unreachable!("a row layout is never `packet`"),
         }
@@ -697,9 +702,10 @@ impl PackedRowLayout {
     pub fn storage_units(&self, extents: &[u64]) -> Option<Vec<u64>> {
         let (_, leading) = extents.split_last()?;
         let mut units = leading.to_vec();
-        if self.layout == Layout::Mma16 {
+        if self.tile_rows() > 1 {
             let rows = units.last_mut()?;
-            *rows = rows.div_ceil(MMA_TILE_ROWS).checked_mul(MMA_TILE_ROWS)?;
+            let tile = self.tile_rows();
+            *rows = rows.div_ceil(tile).checked_mul(tile)?;
         }
         units.push(1);
         Some(units)
@@ -718,9 +724,10 @@ impl PackedRowLayout {
     /// extents). The caller established `extents` has a canonical byte count.
     pub fn stored_row(&self, extents: &[u64], row: u64) -> u64 {
         match self.layout {
-            Layout::Mma16 => {
+            Layout::Mma16 | Layout::Rows8 => {
                 let rows = extents[extents.len() - 2];
-                row / rows * rows.div_ceil(MMA_TILE_ROWS) * MMA_TILE_ROWS + row % rows
+                let tile = self.tile_rows();
+                row / rows * rows.div_ceil(tile) * tile + row % rows
             }
             Layout::Rows16 => row,
             Layout::Packet => unreachable!("a row layout is never `packet`"),
@@ -731,6 +738,7 @@ impl PackedRowLayout {
     /// row `row` in code plane `plane`, for rows of `logical_extent` values.
     ///
     /// `rows16`: bit `column * bits` of the row's plane.
+    /// `rows8`: corresponding storage groups of eight rows are adjacent.
     ///
     /// `mma16`: for tile `T` (stored rows `16T..16T+15`), let `V` be the
     /// concatenation, in row order, of the 16 rows' plane payloads
@@ -754,6 +762,14 @@ impl PackedRowLayout {
         let offset = geometry.offsets[plane];
         match self.layout {
             Layout::Rows16 => (row * stride + offset) * 8 + column * bits,
+            Layout::Rows8 => {
+                let group = u64::from(self.packet.group);
+                let group_bytes = u64::from(self.planes[plane].bytes_per_group);
+                let local = column % group;
+                let byte = row / 8 * stride * 8 + offset * 8
+                    + column / group * group_bytes * 8 + row % 8 * group_bytes;
+                byte * 8 + local * bits
+            },
             Layout::Mma16 => {
                 let row_bytes = geometry.bytes_per_row[plane];
                 let (tile, r) = (row / MMA_TILE_ROWS, row % MMA_TILE_ROWS);
@@ -816,8 +832,14 @@ impl PackedRowLayout {
             })
             .expect("every packet plane has one row plane");
         let group_bytes = u64::from(self.planes[index].bytes_per_group);
-        (row * geometry.stride + geometry.offsets[index] + packet * group_bytes + prefix) * 8
-            + u64::from(bit)
+        let byte = match self.layout {
+            Layout::Rows8 => row / 8 * geometry.stride * 8 + geometry.offsets[index] * 8
+                + packet * group_bytes * 8 + row % 8 * group_bytes + prefix,
+            Layout::Rows16 | Layout::Mma16 =>
+                row * geometry.stride + geometry.offsets[index] + packet * group_bytes + prefix,
+            Layout::Packet => unreachable!("a row layout is never `packet`"),
+        };
+        byte * 8 + u64::from(bit)
     }
 
     /// `width` bits of packet-form plane `plane` starting at bit `first`, of
@@ -1240,7 +1262,7 @@ pub(crate) mod internals {
                 .iter()
                 .find(|repr| repr.name == resident)
                 .expect("external conversion names a registered packed representation");
-            for layout in [Layout::Rows16, Layout::Mma16] {
+            for layout in [Layout::Rows16, Layout::Rows8, Layout::Mma16] {
                 let name: &'static str =
                     Box::leak(format!("{resident}@{}", layout.as_str()).into_boxed_str());
                 representations.push(RepresentationInfo {
@@ -1271,6 +1293,7 @@ pub(crate) mod internals {
                         &rows.packet,
                         match rows.layout {
                             Layout::Rows16 => ConversionKind::Row,
+                            Layout::Rows8 => ConversionKind::RowTile { rows: 8 },
                             Layout::Mma16 => ConversionKind::RowTile {
                                 rows: MMA_TILE_ROWS as u32,
                             },
@@ -1566,7 +1589,7 @@ pub(crate) mod internals {
             repr.name
         );
         let group_multiple = match layout {
-            Layout::Rows16 => 1,
+            Layout::Rows16 | Layout::Rows8 => 1,
             Layout::Mma16 => {
                 let block = MMA_KBLOCK as u32;
                 assert!(
@@ -2301,7 +2324,7 @@ mod tests {
                 };
                 let packet = resident_conversion(source_info.id, Layout::Packet).unwrap();
                 let (packet_bytes, expected) = decode(packet);
-                for layout in [Layout::Rows16, Layout::Mma16] {
+                for layout in [Layout::Rows16, Layout::Rows8, Layout::Mma16] {
                     let conversion = resident_conversion(source_info.id, layout).unwrap();
                     let (converted, actual) = decode(conversion);
                     let RepresentationKind::PackedRows(rows) =

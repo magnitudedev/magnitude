@@ -47,7 +47,7 @@ pub use lanes::{
 pub use magnitude_model_batching::{self as batching, Demand, LaunchClass};
 pub use native::{
     attention_points, row_points, AttestedPrograms, CatalogError, CatalogFailure,
-    MissingImplementation, ZeroTuningWeights, PointShape, QualificationCase, QualificationReport,
+    ZeroTuningWeights, PointShape, QualificationCase, QualificationReport,
     TunedEntry, TuningContext, TuningEvent, TuningLimits, TuningObserver, TuningOrigin,
     TuningWeightSource, UnreportedTuning,
     ROTATION_LAYERS, TUNING_CONTEXTS, TUNING_ROWS,

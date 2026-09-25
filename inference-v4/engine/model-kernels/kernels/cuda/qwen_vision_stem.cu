@@ -3,8 +3,8 @@
 // to the weights' 16-bit element in frame-major order [M, 2, C * P * P] (a
 // relative rounding of 2^-11 for f16); the first GEMM stores its F32 product,
 // the second adds it, the bias and the bilinear position-table blend,
-// publishing the F32 residual stream. Bodies in common/vision.cuh.
-#include "common/vision.cuh"
+// publishing the F32 residual stream. Bodies in lib/vision/vision.cuh.
+#include "lib/vision/vision.cuh"
 
 using vision::u32;
 using vision::u64;

@@ -1,9 +1,10 @@
-//! `qwen_draft_rows` on every accelerator the host has, over its resident
-//! layout (Metal `rows16`, CUDA `mma16`): the embedding table and the combine
-//! weight are GGUF Q8_0 packets repacked on the device, and the result is
-//! checked against a host model of the entry's contract.
+//! `draft_rows` on every device the host has (each accelerator and the CPU),
+//! over its resident layout (Metal, Vulkan and CPU `rows16`, CUDA `mma16`):
+//! the embedding table and the combine weight are GGUF Q8_0 packets repacked
+//! to that layout, and the result is checked against a host model of the
+//! entry's contract.
 
-use magnitude_model_kernels::{qwen_draft_rows, repack_weight};
+use magnitude_model_kernels::{draft_rows, repack_weight};
 use seismic::{Device, Element, Layout, NativeSpecialization, Tensor};
 
 fn f16_bits(value: f32) -> u16 {
@@ -19,7 +20,10 @@ struct Random(u64);
 
 impl Random {
     fn next(&mut self) -> u32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (self.0 >> 33) as u32
     }
     fn code(&mut self) -> i8 {
@@ -41,7 +45,13 @@ fn resident_q8(device: &Device) -> Element {
 
 /// A `[rows, columns]` GGUF Q8_0 weight repacked to the resident q8 layout,
 /// and its logical values.
-fn q8_weight(device: &Device, rows: usize, columns: usize, scale: f32, random: &mut Random) -> (Tensor, Vec<f32>) {
+fn q8_weight(
+    device: &Device,
+    rows: usize,
+    columns: usize,
+    scale: f32,
+    random: &mut Random,
+) -> (Tensor, Vec<f32>) {
     assert_eq!(columns % 32, 0);
     let scale_bits = f16_bits(scale);
     let scale = half_to_f32(scale_bits);
@@ -64,7 +74,13 @@ fn q8_weight(device: &Device, rows: usize, columns: usize, scale: f32, random: &
             E: external,
             U: resident_q8(device),
         },
-        &NativeSpecialization::new(),
+        // Declared parameters (the CPU's rows per work item) take their
+        // first values.
+        &repack_weight::native_implementation(device)
+            .unwrap()
+            .expect("repack_weight has a native implementation on every device")
+            .default_specialization(&NativeSpecialization::new())
+            .unwrap(),
     )
     .unwrap()
     .call(repack_weight::Args { source: &source })
@@ -123,11 +139,20 @@ fn reference(
             .map(|v| bf16_round(*v))
             .collect::<Vec<_>>();
         let mut joined = normalized(&embedded, embedding_norm);
-        joined.extend(normalized(&conditioning[row * width..][..width], hidden_norm));
+        joined.extend(normalized(
+            &conditioning[row * width..][..width],
+            hidden_norm,
+        ));
         for output in 0..width {
             let weights = &combine[output * 2 * width..][..2 * width];
             result.push(weights.iter().zip(&joined).map(|(w, x)| w * x).sum());
-            magnitude.push(weights.iter().zip(&joined).map(|(w, x)| (w * x).abs()).sum());
+            magnitude.push(
+                weights
+                    .iter()
+                    .zip(&joined)
+                    .map(|(w, x)| (w * x).abs())
+                    .sum(),
+            );
         }
     }
     (result, magnitude)
@@ -136,7 +161,12 @@ fn reference(
 #[test]
 fn draft_rows_match_the_host_model_over_resident_weights() {
     let catalog = seismic::DeviceCatalog::discover().unwrap();
-    for backend in [seismic::BackendName::Metal, seismic::BackendName::Cuda, seismic::BackendName::Vulkan] {
+    for backend in [
+        seismic::BackendName::Metal,
+        seismic::BackendName::Cuda,
+        seismic::BackendName::Vulkan,
+        seismic::BackendName::Cpu,
+    ] {
         let Ok(device) = catalog.open_backend(backend) else {
             continue;
         };
@@ -146,18 +176,27 @@ fn draft_rows_match_the_host_model_over_resident_weights() {
 
 fn draft_rows_match_on(device: &Device) {
     // Vulkan fixes the width D at preparation (it sizes the shared joined
-    // row); the other backends declare no statics.
-    let implementation = qwen_draft_rows::native_implementation(device)
+    // row); the other backends declare no statics. Declared parameters (the
+    // CPU's weight rows per work item) take their first values.
+    let implementation = draft_rows::native_implementation(device)
         .unwrap()
-        .expect("qwen_draft_rows has a native implementation on every accelerator");
-    let prepare = |width: usize| {
-        let statics = implementation.statics.iter().fold(NativeSpecialization::new(), |statics, name| {
-            assert_eq!(name, "D", "qwen_draft_rows may only fix D");
-            statics.with_static(name.clone(), width as u64)
-        });
-        qwen_draft_rows::native_for_device_with(
+        .expect("draft_rows has a native implementation on every device");
+    let prepare = |width: usize, int8: bool| {
+        let statics =
+            implementation
+                .statics
+                .iter()
+                .fold(NativeSpecialization::new(), |statics, name| {
+                    assert_eq!(name, "D", "draft_rows may only fix D");
+                    statics.with_static(name.clone(), width as u64)
+                });
+        let mut statics = implementation.default_specialization(&statics).unwrap();
+        if device.backend() == seismic::BackendName::Cpu {
+            statics = statics.with_param("INT8", u64::from(int8));
+        }
+        draft_rows::native_for_device_with(
             device,
-            qwen_draft_rows::Elements {
+            draft_rows::Elements {
                 EW: resident_q8(device),
                 A: Element::bf16(),
                 EN: Element::bf16(),
@@ -172,10 +211,11 @@ fn draft_rows_match_on(device: &Device) {
     // Widths of whole 64-column k-blocks, below and past one block's 32
     // outputs, rows 1..3.
     for (width, vocabulary, rows) in [(64, 5, 1), (128, 7, 3), (192, 4, 2)] {
-        let kernel = prepare(width);
+        let kernel = prepare(width, false);
         let mut random = Random(width as u64 * 31 + rows as u64);
         let (table, table_values) = q8_weight(&device, vocabulary, width, 0.03125, &mut random);
-        let (combine, combine_values) = q8_weight(&device, width, 2 * width, 0.0078125, &mut random);
+        let (combine, combine_values) =
+            q8_weight(&device, width, 2 * width, 0.0078125, &mut random);
         let embedding_norm_values = (0..width)
             .map(|_| bf16_round(1.0 + 0.25 * random.symmetric()))
             .collect::<Vec<_>>();
@@ -211,7 +251,7 @@ fn draft_rows_match_on(device: &Device) {
         let embedding_norm = bf16_tensor(&device, &[width as u64], &embedding_norm_values);
         let hidden_norm = bf16_tensor(&device, &[width as u64], &hidden_norm_values);
         let result = kernel
-            .call(qwen_draft_rows::Args {
+            .call(draft_rows::Args {
                 tokens: &tokens,
                 table: &table,
                 conditioning: &conditioning,
@@ -248,6 +288,36 @@ fn draft_rows_match_on(device: &Device) {
                 (actual - expected).abs() <= bound,
                 "{:?} width {width} rows {rows} index {index}: {actual} vs {expected} (bound {bound})",
                 device.backend()
+            );
+        }
+        if device.backend() == seismic::BackendName::Cpu {
+            let quantized = prepare(width, true)
+                .call(draft_rows::Args {
+                    tokens: &tokens,
+                    table: &table,
+                    conditioning: &conditioning,
+                    embedding_norm: &embedding_norm,
+                    hidden_norm: &hidden_norm,
+                    combine: &combine,
+                    epsilon,
+                })
+                .unwrap()
+                .value;
+            let quantized = quantized.read_to_host().unwrap();
+            let quantized = quantized
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let error = actual
+                .iter()
+                .zip(&quantized)
+                .map(|(exact, int8)| (exact - int8).powi(2))
+                .sum::<f32>();
+            let scale = actual.iter().map(|value| value.powi(2)).sum::<f32>();
+            assert!(
+                error <= 0.05f32.powi(2) * scale,
+                "CPU INT8 draft width {width} rows {rows}: relative error {}",
+                (error / scale).sqrt()
             );
         }
     }

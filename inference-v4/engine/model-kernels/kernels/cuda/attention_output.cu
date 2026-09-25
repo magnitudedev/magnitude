@@ -5,7 +5,7 @@
 // `stage_s8`), `gemm` beyond (the heads in place); up to SPLIT_ROWS rows split
 // over K into SPLIT shares of partials that `finalize` sums in part order.
 #define KERNEL_W0 SEISMIC_OUTPUT_WEIGHT
-#include "common/projection.cuh"
+#include "lib/projection/projection.cuh"
 
 constexpr bool S8 = SEISMIC_TUNE_INT8 == 1 && projection::quantizable<packets::W0>;
 using Pro = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;

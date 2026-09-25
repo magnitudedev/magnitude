@@ -4,7 +4,7 @@
 use crate::composition::{ReadyEngine, ResolvedEngineConfiguration};
 use crate::service::EngineService;
 use magnitude_artifacts::Package;
-use magnitude_model_batching::{row_classes, Demand, MAX_CLASS_ROWS};
+use magnitude_model_batching::{Demand, MAX_CLASS_ROWS};
 use magnitude_model_executor::{
     platform::{self, PlatformConfig},
     AttestedPrograms, ComponentLoader, ComponentSelection, ExecutionPlanner, ExecutorDomain,
@@ -277,80 +277,47 @@ pub fn build_native_domain(
         head_state,
     )?;
     let mut domain = domain;
-    warm_up(&mut domain, limits, context)?;
+    warm_up(&mut domain)?;
     Ok((domain, plan))
 }
 
-/// Execute every sealed target row class once, at each request count that
-/// can fill it, before readiness. A class of `rows` is reached by any batch of
-/// more rows than the class below it, up to the batch bound, whose requests
-/// each stay within the context. Each pass runs throwaway requests whose
-/// state advances are aborted, so no request state survives it.
-fn warm_up(domain: &mut ExecutorDomain, limits: ResourceLimits, context: usize) -> Result<(), String> {
+/// Run one throwaway single-row forward before readiness, so a broken device
+/// path fails the load instead of the first request, and the process's
+/// one-time first-forward cost is paid here. Tuning has already executed every
+/// kernel, and no row class carries its own first-use cost, so one row
+/// suffices. The request's state advance is aborted, so no state survives it.
+fn warm_up(domain: &mut ExecutorDomain) -> Result<(), String> {
     let began = std::time::Instant::now();
-    let mut passes = Vec::new();
-    let classes = row_classes(limits.max_batch_rows);
-    for (index, &class) in classes.iter().enumerate() {
-        let below = index.checked_sub(1).map_or(0, |previous| classes[previous]);
-        for slots in 1..=limits.in_flight_requests.min(class) {
-            let rows = class.min(limits.max_batch_rows).min(slots * context);
-            if rows <= below || rows < slots {
-                continue;
-            }
-            let pass = std::time::Instant::now();
-            let requests = (0..slots)
-                .map(|slot| RequestId(u64::MAX - slot as u64))
-                .collect::<Vec<_>>();
-            for &request in &requests {
-                domain.open(request).map_err(|error| error.to_string())?;
-            }
-            let operations = requests
-                .iter()
-                .enumerate()
-                .map(|(slot, &request)| {
-                    let count = rows / slots + usize::from(slot < rows % slots);
-                    Operation::Forward {
-                        request,
-                        kind: WorkKind::Replay,
-                        tokens: vec![TokenId(0); count],
-                        position: 0,
-                        conditioning: None,
-                        demand: Demand::NONE,
-                        select: Vec::new(),
-                        committed: count,
-                    }
-                })
-                .collect::<Vec<_>>();
-            let resources = domain
-                .reserve(&operations)
-                .map_err(|error| format!("warm-up of row class {class} ({rows} rows) x {slots} requests: {error}"))?
-                .into_resources();
-            let ReservedResources::Target(reservation) = resources else {
-                return Err("warm-up forward reserved a non-target lane".into());
-            };
-            let flight = domain
-                .submit_target(&operations, reservation)
-                .map_err(|error| format!("warm-up of row class {class} ({rows} rows) x {slots} requests: {error}"))?;
-            for pending in domain
-                .finish_target(flight)
-                .map_err(|error| format!("warm-up of row class {class} ({rows} rows) x {slots} requests: {error}"))?
-            {
-                domain.abort(pending).map_err(|error| error.to_string())?;
-            }
-            for request in requests {
-                domain.close(request)?;
-            }
-            passes.push(format!(
-                "m{class}x{slots}={:.0}ms",
-                pass.elapsed().as_secs_f64() * 1000.0
-            ));
-        }
+    let request = RequestId(u64::MAX);
+    let failed = |error: String| format!("load warm-up forward: {error}");
+    domain.open(request).map_err(|error| failed(error.to_string()))?;
+    let operations = [Operation::Forward {
+        request,
+        kind: WorkKind::Replay,
+        tokens: vec![TokenId(0)],
+        position: 0,
+        conditioning: None,
+        demand: Demand::NONE,
+        select: Vec::new(),
+        committed: 1,
+    }];
+    let resources = domain
+        .reserve(&operations)
+        .map_err(|error| failed(error.to_string()))?
+        .into_resources();
+    let ReservedResources::Target(reservation) = resources else {
+        return Err(failed("reserved a non-target lane".into()));
+    };
+    let flight = domain
+        .submit_target(&operations, reservation)
+        .map_err(|error| failed(error.to_string()))?;
+    for pending in domain.finish_target(flight).map_err(|error| failed(error.to_string()))? {
+        domain.abort(pending).map_err(|error| failed(error.to_string()))?;
     }
+    domain.close(request)?;
     eprintln!(
-        "magnitude-engine: warmed {} target classes in {:.2} s ({})",
-        passes.len(),
-        began.elapsed().as_secs_f64(),
-        passes.join(" ")
+        "magnitude-engine: warm-up forward in {:.0} ms",
+        began.elapsed().as_secs_f64() * 1000.0
     );
     Ok(())
 }

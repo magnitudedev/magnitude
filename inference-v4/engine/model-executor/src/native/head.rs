@@ -1,7 +1,7 @@
 use super::{AttentionKernels, DenseKernels};
 use crate::HeadBinding;
 use magnitude_model_kernels::{
-    head_logits_rows, qwen_draft_rows, readout_features_rows, sample_rows, shape_rows,
+    head_logits_rows, draft_rows, readout_features_rows, sample_rows, shape_rows,
 };
 use seismic::NativeKernel;
 use std::collections::HashMap;
@@ -26,7 +26,7 @@ pub(crate) fn draft_vocabulary(vocabulary: u64) -> u64 {
 /// native entries needed by that head block.
 #[derive(Debug, Default)]
 pub struct HeadKernels {
-    pub(super) input: HashMap<HeadBinding, NativeKernel<qwen_draft_rows::Entry>>,
+    pub(super) input: HashMap<HeadBinding, NativeKernel<draft_rows::Entry>>,
     pub(super) attention: HashMap<HeadBinding, AttentionKernels>,
     pub(super) dense: HashMap<HeadBinding, DenseKernels>,
     pub(super) features: HashMap<HeadBinding, NativeKernel<readout_features_rows::Entry>>,

@@ -8,8 +8,8 @@
 # Destinations are freshly reserved history rows: no row of the batch sees one
 # of them through `visible`, so the append is independent of every read.
 #
-# A block runs `qwen_attention_project` (normed Q/K/V projection), then
-# `qwen_attention_decode` or `_prefill` (or their `_k8v4` forms over affine
+# A block runs `gated_attention_project` (normed Q/K/V projection), then
+# `gated_attention_decode` or `_prefill` (or their `_k8v4` forms over affine
 # history), then `attention_output` (output projection plus residual).
 
 # query_norm fixes W for the checked flattened KV*G*W projection shape; the
@@ -18,7 +18,7 @@
 # representation. Both backends run the K1 projection library (see
 # `dense.seismic` for its launches; segments enumerate their tile groups or
 # block columns in segment order).
-fn qwen_attention_project[M, D, KV, G, W](hidden: &tensor[M, D] f32,
+fn gated_attention_project[M, D, KV, G, W](hidden: &tensor[M, D] f32,
     input_norm: &tensor[D] NW, query_norm: &tensor[W] f32,
     query_gate_weight: &tensor[KV * G * 2 * W, D] QW,
     key_weight: &tensor[KV * W, D] KW, value_weight: &tensor[KV * W, D] VW, epsilon: f32)
@@ -36,29 +36,29 @@ fn qwen_attention_project[M, D, KV, G, W](hidden: &tensor[M, D] f32,
 # Metal: GEMV below BATCH_FROM rows, batched GEMV to 16, each normalizing its
 # rows in-threadgroup; larger classes stage the normalized rows, then the
 # GEMM. (CUDA: GEMV to 16 rows, INT8 candidate on the GEMM.)
-native qwen_attention_project for metal from "metal/qwen_attention_project.metal":
+native gated_attention_project for metal from "metal/gated_attention_project.metal":
     static (D, KV, G, W)
     params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
             arithmetic BATCH_FROM in [5, 3, 9], BATCH_SIMDGROUPS in [8, 4, 16, 32], BATCH_ROWS in [2, 1, 4],
             TILE_M in [64, 128, 32], TILE_N in [64, 128])
     scratch normalized bytes (M * D * 2) when M > 16
-    launch qwen_attention_project_stage when M > 16:
+    launch gated_attention_project_stage when M > 16:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_attention_project_gemv when M < BATCH_FROM:
+    launch gated_attention_project_gemv when M < BATCH_FROM:
         threadgroups (ceil_div(KV * G * 2 * W, SIMDGROUPS * ROWS * 32 / LANES)
             + 2 * ceil_div(KV * W, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(D, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
-    launch qwen_attention_project_batch when M >= BATCH_FROM and M <= 16:
+    launch gated_attention_project_batch when M >= BATCH_FROM and M <= 16:
         threadgroups (ceil_div(KV * G * 2 * W, BATCH_SIMDGROUPS * BATCH_ROWS * 8)
             + 2 * ceil_div(KV * W, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
         threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
         shared_bytes (16640)
-    launch qwen_attention_project_gemm_small when M > 16 and M <= 64:
+    launch gated_attention_project_gemm_small when M > 16 and M <= 64:
         threadgroups (ceil_div(KV * G * 2 * W, 64) + 2 * ceil_div(KV * W, 64), ceil_div(M, 32), 1)
         threads_per_threadgroup (128, 1, 1)
-    launch qwen_attention_project_gemm when M > 64:
+    launch gated_attention_project_gemm when M > 64:
         threadgroups (ceil_div(KV * G * 2 * W, TILE_N) + 2 * ceil_div(KV * W, TILE_N),
             ceil_div(M, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
@@ -68,30 +68,30 @@ native qwen_attention_project for metal from "metal/qwen_attention_project.metal
 # blocks) to 16, GEMM beyond in the K1 row bands (`gemm_small` to 64 rows with
 # the INT8 candidate, whose q8_1 rows `stage_s8` forms; `gemm` beyond; see
 # `cuda_dense.seismic`). (Metal: batched GEMV class, no INT8 path.)
-native qwen_attention_project for cuda from "cuda/qwen_attention_project.cu":
+native gated_attention_project for cuda from "cuda/gated_attention_project.cu":
     static (D, KV, G, W)
     params (arithmetic KSPLIT in [4, 2, 8], arithmetic INT8 in [0, 1])
     where D % 64 == 0
     scratch staged bytes (M * D * 2) when M > 1
     scratch groups bytes (M * D / 4) when INT8 == 1 and M > 16 and M <= 64
-    launch qwen_attention_project_stage when M > 1 and (M <= 16 or M > 64 or INT8 == 0):
+    launch gated_attention_project_stage when M > 1 and (M <= 16 or M > 64 or INT8 == 0):
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_attention_project_stage_s8 when INT8 == 1 and M > 16 and M <= 64:
+    launch gated_attention_project_stage_s8 when INT8 == 1 and M > 16 and M <= 64:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_attention_project_gemv when M <= 8:
+    launch gated_attention_project_gemv when M <= 8:
         threadgroups (ceil_div(ceil_div(KV * G * 2 * W, 16) + 2 * ceil_div(KV * W, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes ((1 - min(1, M - 1)) * D * 2)
-    launch qwen_attention_project_gemv16 when M > 8 and M <= 16:
+    launch gated_attention_project_gemv16 when M > 8 and M <= 16:
         threadgroups (ceil_div(ceil_div(KV * G * 2 * W, 16) + 2 * ceil_div(KV * W, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_attention_project_gemm_small when M > 16 and M <= 64:
+    launch gated_attention_project_gemm_small when M > 16 and M <= 64:
         threadgroups (ceil_div(ceil_div(KV * G * 2 * W, 16), 8) + 2 * ceil_div(ceil_div(KV * W, 16), 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (64 * 144 + 10240) + 2048)
-    launch qwen_attention_project_gemm when M > 64:
+    launch gated_attention_project_gemm when M > 64:
         threadgroups (ceil_div(ceil_div(KV * G * 2 * W, 16), 8) + 2 * ceil_div(ceil_div(KV * W, 16), 8),
             ceil_div(M, 128), 1)
         threads_per_threadgroup (256, 1, 1)
@@ -104,30 +104,46 @@ native qwen_attention_project for cuda from "cuda/qwen_attention_project.cu":
 # stage launch writing the normalized rows to scratch, then the GEMM over
 # TILE_M x TILE_N tiles (cooperative-matrix f16 multiplies under
 # SEISMIC_HAS_MATRIX, F32 FMAs otherwise). (No batched GEMV class, no INT8.)
-native qwen_attention_project for vulkan from "vulkan/qwen_attention_project.comp":
+native gated_attention_project for vulkan from "vulkan/gated_attention_project.comp":
     static (D, KV, G, W)
     params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
             TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
     where SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch normalized bytes (M * D * 2) when M > 8
-    launch qwen_attention_project_stage when M > 8:
+    launch gated_attention_project_stage when M > 8:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (128)
-    launch qwen_attention_project_gemv when M <= 8:
+    launch gated_attention_project_gemv when M <= 8:
         threadgroups (ceil_div(KV * G * 2 * W, SIMDGROUPS * ROWS * 32 / LANES)
             + 2 * ceil_div(KV * W, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (256 + min(8 * ceil_div(D, 32), 288) * 72)
-    launch qwen_attention_project_gemm when M > 8:
+    launch gated_attention_project_gemm when M > 8:
         threadgroups (ceil_div(KV * G * 2 * W, TILE_N) + 2 * ceil_div(KV * W, TILE_N), ceil_div(M, TILE_M), 1)
         threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
         shared_bytes ((TILE_M + TILE_N) * 80)
 
+# CPU: the CPU projection library (`cpu/lib/projection/projection.rs`). A
+# normalize launch writes each normalized row as F32 to scratch; the row
+# launch enumerates the segments query+gate | key | value, ROWS weight rows
+# per work item, projected against every normalized row.
+native gated_attention_project for cpu from "cpu/gated_attention_project.rs":
+    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    scratch quantized bytes (M * ceil_div(D, 256) * 292)
+    scratch normalized bytes (M * D * 4)
+    launch gated_attention_project_normalize:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (D * 4)
+    launch gated_attention_project_rows:
+        threadgroups (ceil_div(KV * G * 2 * W, ROWS) + 2 * ceil_div(KV * W, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
 # One head row RMS-normalized in F32, its first 2P columns rotated: pair p by
 # the coordinate on axis components[p] at frequencies[p] (a static table the
 # engine derives from the model's rotary base and sections).
-fn qwen_norm_rotary[P, S](x: &tensor[2 * P + S] A, wt: &tensor[2 * P + S] f32,
+fn norm_rotary_table[P, S](x: &tensor[2 * P + S] A, wt: &tensor[2 * P + S] f32,
     coordinates: &tensor[4] i32, components: &tensor[P] i32,
     frequencies: &tensor[P] f32, epsilon: f32) -> tensor[2 * P + S] f32:
     let xf = f32(x)
@@ -147,7 +163,7 @@ fn qwen_norm_rotary[P, S](x: &tensor[2 * P + S] A, wt: &tensor[2 * P + S] f32,
             rotated[i] = normalized[i]
     return rotated
 
-fn qwen_gated_attention[M, T, KV, G, P, S, R](
+fn gated_attention[M, T, KV, G, P, S, R](
     query_gate: &tensor[M, KV * G * 2 * (2 * P + S)] A,
     key: &tensor[M, KV * (2 * P + S)] A, value: &tensor[M, KV * (2 * P + S)] A,
     query_norm: &tensor[2 * P + S] f32, key_norm: &tensor[2 * P + S] f32,
@@ -160,7 +176,7 @@ fn qwen_gated_attention[M, T, KV, G, P, S, R](
     let mut prepared_key = tensor[M, KV, 2 * P + S] A
     for row in 0..M:
         for head in 0..KV:
-            prepared_key[row, head] = qwen_norm_rotary(
+            prepared_key[row, head] = norm_rotary_table(
                 key[row, head * (2 * P + S) : (head + 1) * (2 * P + S)], key_norm,
                 coordinates[row], rotary_components, rotary_frequencies, epsilon)
     let fresh_value = reshape(value, (M, KV, 2 * P + S))
@@ -173,7 +189,7 @@ fn qwen_gated_attention[M, T, KV, G, P, S, R](
             let mut accumulator = tensor[G, 2 * P + S] f32
             for head in 0..G:
                 let first = (kv_head * G + head) * 2 * (2 * P + S)
-                qt[head] = qwen_norm_rotary(query_gate[row, first : first + (2 * P + S)],
+                qt[head] = norm_rotary_table(query_gate[row, first : first + (2 * P + S)],
                     query_norm, coordinates[row], rotary_components, rotary_frequencies,
                     epsilon)
                 maximum[head] = -inf
@@ -215,7 +231,7 @@ fn qwen_gated_attention[M, T, KV, G, P, S, R](
 # query heads, so each K/V row is read once per kv head. Partition 0 also
 # appends the row's K/V. L2: per (query head, row), a fixed-order LSE merge of
 # the row's partitions and the sigmoid gate.
-fn qwen_attention_decode[M, T, KV, G, P, S, R](
+fn gated_attention_decode[M, T, KV, G, P, S, R](
     query_gate: &tensor[M, KV * G * 2 * (2 * P + S)] A,
     key: &tensor[M, KV * (2 * P + S)] A, value: &tensor[M, KV * (2 * P + S)] A,
     query_norm: &tensor[2 * P + S] f32, key_norm: &tensor[2 * P + S] f32,
@@ -225,23 +241,23 @@ fn qwen_attention_decode[M, T, KV, G, P, S, R](
     history_key: &mut tensor[T, KV, 2 * P + S] A,
     history_value: &mut tensor[T, KV, 2 * P + S] A,
     epsilon: f32, scale: f32) -> tensor[M, KV * G, 2 * P + S] A:
-    return qwen_gated_attention[G = G](query_gate, key, value, query_norm, key_norm,
+    return gated_attention[G = G](query_gate, key, value, query_norm, key_norm,
         rotary_components, rotary_frequencies, coordinates, visible, fresh,
         destinations, history_key, history_value, epsilon, scale)
 
 # Metal: partitions of max(SPAN, ceil(keys / PARTS)) keys. (CUDA: equal
 # partitions.)
-native qwen_attention_decode for metal from "metal/qwen_attention_decode.metal":
+native gated_attention_decode for metal from "metal/gated_attention_decode.metal":
     static (KV, G, P, S)
     params (arithmetic SPAN in [32, 64, 128, 256], arithmetic PARTS in [16, 8, 32],
         arithmetic SIMDS in [4, 8])
     scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * G * PARTS * 8)
-    launch qwen_attention_decode_partial:
+    launch gated_attention_decode_partial:
         threadgroups (KV, PARTS, M)
         threads_per_threadgroup (SIMDS * 32, 1, 1)
         shared_bytes ((G + SIMDS) * (2 * P + S) * 4 + SIMDS * G * 8)
-    launch qwen_attention_decode_merge:
+    launch gated_attention_decode_merge:
         threadgroups (KV * G, M, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
 
@@ -250,17 +266,17 @@ native qwen_attention_decode for metal from "metal/qwen_attention_decode.metal":
 # scan contiguous slices of the partition. Head width 2 * P + S is a multiple
 # of 32 up to 256: a warp holds one head vector at W / 32 dimensions per lane.
 # (Metal: partitions with a SPAN minimum.)
-native qwen_attention_decode for cuda from "cuda/qwen_attention_decode.cu":
+native gated_attention_decode for cuda from "cuda/gated_attention_decode.cu":
     static (KV, G, P, S)
     params (arithmetic PARTS in [12, 24, 48], arithmetic WARPS in [4, 8])
     where (2 * P + S) % 32 == 0 and 2 * P + S <= 256
     scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * G * PARTS * 8)
-    launch qwen_attention_decode_partial:
+    launch gated_attention_decode_partial:
         threadgroups (KV, PARTS, M)
         threads_per_threadgroup (WARPS * 32, 1, 1)
         shared_bytes ((G + WARPS) * (2 * P + S) * 4 + WARPS * G * 8)
-    launch qwen_attention_decode_merge:
+    launch gated_attention_decode_merge:
         threadgroups (KV * G, M, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
 
@@ -268,20 +284,43 @@ native qwen_attention_decode for cuda from "cuda/qwen_attention_decode.cu":
 # head, partition, row) of SIMDS subgroups scanning contiguous sub-ranges of
 # the partition, L2 the fixed-order merge and gate. A lane owns W / 32
 # contiguous columns, with a whole number of lanes per rotary half.
-native qwen_attention_decode for vulkan from "vulkan/qwen_attention_decode.comp":
+native gated_attention_decode for vulkan from "vulkan/gated_attention_decode.comp":
     static (KV, G, P, S)
     params (arithmetic SPAN in [32, 64, 128, 256], arithmetic PARTS in [16, 8, 32],
         arithmetic SIMDS in [4, 8])
     where (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0
     scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * G * PARTS * 8)
-    launch qwen_attention_decode_partial:
+    launch gated_attention_decode_partial:
         threadgroups (KV, PARTS, M)
         threads_per_threadgroup (SIMDS * 32, 1, 1)
         shared_bytes ((G + SIMDS) * (2 * P + S) * 4 + SIMDS * G * 8)
-    launch qwen_attention_decode_merge:
+    launch gated_attention_decode_merge:
         threadgroups (KV * G, M, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
+
+# CPU (`cpu/lib/attention/attention.rs`): `prepare` per row (queries and keys
+# into F32 scratch, the K/V append), `attend` per (kv head, partition, row)
+# over partitions of max(128, ceil(keys / PARTS)) keys, `merge` per row (the
+# fixed-order partition merge and the gate).
+native gated_attention_decode for cpu from "cpu/gated_attention_decode.rs":
+    params (arithmetic PARTS in [8, 4, 16, 1])
+    scratch queries bytes (M * KV * G * (2 * P + S) * 4)
+    scratch keys bytes (M * KV * (2 * P + S) * 4)
+    scratch partials bytes (M * KV * PARTS * G * (2 * P + S) * 4)
+    scratch statistics bytes (M * KV * PARTS * G * 8)
+    launch gated_attention_decode_prepare:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (P * 8)
+    launch gated_attention_decode_attend:
+        threadgroups (KV, PARTS, M)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes ((G * 32 + 2 * P + S) * 4)
+    launch gated_attention_decode_merge:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes ((2 * P + S) * 4)
 
 
 # Prefill rows (M >= 16). L1: one simdgroup per (row, query or key head)
@@ -300,7 +339,7 @@ native qwen_attention_decode for vulkan from "vulkan/qwen_attention_decode.comp"
 # partition stores its gated output directly (gate fused into the store);
 # otherwise L3 merges the partitions' (partial output, maximum, denominator)
 # in partition order with the decode merge rule and applies the gate.
-fn qwen_attention_prefill[M, T, KV, G, P, S, R](
+fn gated_attention_prefill[M, T, KV, G, P, S, R](
     query_gate: &tensor[M, KV * G * 2 * (2 * P + S)] A,
     key: &tensor[M, KV * (2 * P + S)] A, value: &tensor[M, KV * (2 * P + S)] A,
     query_norm: &tensor[2 * P + S] f32, key_norm: &tensor[2 * P + S] f32,
@@ -310,13 +349,13 @@ fn qwen_attention_prefill[M, T, KV, G, P, S, R](
     history_key: &mut tensor[T, KV, 2 * P + S] A,
     history_value: &mut tensor[T, KV, 2 * P + S] A,
     epsilon: f32, scale: f32) -> tensor[M, KV * G, 2 * P + S] A:
-    return qwen_gated_attention[G = G](query_gate, key, value, query_norm, key_norm,
+    return gated_attention[G = G](query_gate, key, value, query_norm, key_norm,
         rotary_components, rotary_frequencies, coordinates, visible, fresh,
         destinations, history_key, history_value, epsilon, scale)
 
 # Metal: key partitions plus a `merge` launch when a tile is split (3
 # launches). (CUDA: unsplit, 2 launches.)
-native qwen_attention_prefill for metal from "metal/qwen_attention_prefill.metal":
+native gated_attention_prefill for metal from "metal/gated_attention_prefill.metal":
     static (KV, G, P, S)
     params (arithmetic QT in [16, 8], arithmetic SPLIT_GROUPS in [256, 128, 512, 1])
     scratch queries bytes (ceil_div(M, QT) * QT * KV * G * (2 * P + S) * 2)
@@ -325,14 +364,14 @@ native qwen_attention_prefill for metal from "metal/qwen_attention_prefill.metal
     scratch partials bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV)) * M * KV * G * (2 * P + S) * 4)
     scratch statistics bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV)) * M * KV * G * 8)
     scratch counts bytes (ceil_div(M, QT) * 4)
-    launch qwen_attention_prefill_prepare:
+    launch gated_attention_prefill_prepare:
         threadgroups (ceil_div(ceil_div(M, QT) * QT * KV * (G + 1), 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_attention_prefill_attend:
+    launch gated_attention_prefill_attend:
         threadgroups (ceil_div(M, QT), KV, max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV)))
         threads_per_threadgroup (QT * G * 4, 1, 1)
         shared_bytes (32 * (2 * P + S + 8) * 2 + (R + 1) * 16)
-    launch qwen_attention_prefill_merge when ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV) > 1:
+    launch gated_attention_prefill_merge when ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV) > 1:
         threadgroups (ceil_div(M, QT), KV * G, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
 
@@ -341,17 +380,17 @@ native qwen_attention_prefill for metal from "metal/qwen_attention_prefill.metal
 # tiles of 32 keys are double-buffered next to the query tile in shared
 # memory; prefill tiles are 16-bit rows of whole 16-byte chunks. (Metal: key
 # partitions and a merge launch.)
-native qwen_attention_prefill for cuda from "cuda/qwen_attention_prefill.cu":
+native gated_attention_prefill for cuda from "cuda/gated_attention_prefill.cu":
     static (KV, G, P, S)
     params (arithmetic WARPS in [4, 2])
     where (2 * P + S) % 32 == 0 and 2 * P + S <= 256 and 16 % G == 0
     scratch queries bytes (M * KV * G * (2 * P + S) * 2)
     scratch keys bytes (M * KV * (2 * P + S) * 2)
     scratch values bytes (M * KV * (2 * P + S) * 2)
-    launch qwen_attention_prefill_prepare:
+    launch gated_attention_prefill_prepare:
         threadgroups (ceil_div(M * KV * (G + 1), 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_attention_prefill_attend:
+    launch gated_attention_prefill_attend:
         threadgroups (ceil_div(M * G, WARPS * 16), KV, 1)
         threads_per_threadgroup (WARPS * 32, 1, 1)
         shared_bytes ((WARPS * 16 + 4 * 32) * (2 * P + S) * 2 + (R + 1) * 16)
@@ -362,7 +401,7 @@ native qwen_attention_prefill for cuda from "cuda/qwen_attention_prefill.cu":
 # in two passes (row maxima, then accumulation), 16 matrix rows per subgroup
 # (cooperative matrices under SEISMIC_HAS_MATRIX, F32 FMAs otherwise); L3
 # merges split tiles.
-native qwen_attention_prefill for vulkan from "vulkan/qwen_attention_prefill.comp":
+native gated_attention_prefill for vulkan from "vulkan/gated_attention_prefill.comp":
     static (KV, G, P, S)
     params (arithmetic ROWS in [64, 128], arithmetic SPLIT_GROUPS in [256, 128, 512, 1])
     where (2 * P + S) % 32 == 0 and (2 * P + S <= 64 or (2 * P + S) % 64 == 0) and P % ((2 * P + S) / 32) == 0 and ROWS % G == 0 and ROWS / G <= 32 and 64 * (2 * P + S + 8) + ROWS / 16 * 2048 <= 32768
@@ -372,16 +411,31 @@ native qwen_attention_prefill for vulkan from "vulkan/qwen_attention_prefill.com
     scratch partials bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)) * M * KV * G * (2 * P + S) * 4)
     scratch statistics bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)) * M * KV * G * 8)
     scratch counts bytes (ceil_div(M, ROWS / G) * 4)
-    launch qwen_attention_prefill_prepare:
+    launch gated_attention_prefill_prepare:
         threadgroups (ceil_div(ceil_div(M, ROWS / G) * (ROWS / G) * KV * (G + 1), 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_attention_prefill_attend:
+    launch gated_attention_prefill_attend:
         threadgroups (ceil_div(M, ROWS / G), KV, max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)))
         threads_per_threadgroup (ROWS * 2, 1, 1)
         shared_bytes (64 * (2 * P + S + 8) + ROWS / 16 * 2048)
-    launch qwen_attention_prefill_merge when SPLIT_GROUPS > ceil_div(M, ROWS / G) * KV:
+    launch gated_attention_prefill_merge when SPLIT_GROUPS > ceil_div(M, ROWS / G) * KV:
         threadgroups (ceil_div(M, ROWS / G), KV * G, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
+
+# CPU (`cpu/lib/attention/attention.rs`): `prepare` per row (queries and keys
+# into F32 scratch, the K/V append), `attend` per (row, kv head) over the
+# row's whole key sequence, storing the gated outputs directly.
+native gated_attention_prefill for cpu from "cpu/gated_attention_prefill.rs":
+    scratch queries bytes (M * KV * G * (2 * P + S) * 4)
+    scratch keys bytes (M * KV * (2 * P + S) * 4)
+    launch gated_attention_prefill_prepare:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (P * 8)
+    launch gated_attention_prefill_attend:
+        threadgroups (M, KV, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes ((2 * G + G * (2 * P + S) + G * 32 + 2 * P + S) * 4)
 
 
 # Affine K8/V4 history (the `affine_k8_uniform_v4` KV codec). Every (history
@@ -447,7 +501,7 @@ fn attention_absorb[G, W](qt: &tensor[G, W] A, key: &tensor[W] f32,
             acc[head, column] = fma(p, value[column], acc[head, column] * carry)
         m[head] = next
 
-fn qwen_gated_attention_k8v4[M, T, KV, G, P, S, R](
+fn gated_attention_k8v4[M, T, KV, G, P, S, R](
     query_gate: &tensor[M, KV * G * 2 * (2 * P + S)] A,
     key: &tensor[M, KV * (2 * P + S)] A, value: &tensor[M, KV * (2 * P + S)] A,
     query_norm: &tensor[2 * P + S] f32, key_norm: &tensor[2 * P + S] f32,
@@ -462,7 +516,7 @@ fn qwen_gated_attention_k8v4[M, T, KV, G, P, S, R](
     let mut prepared_key = tensor[M, KV, 2 * P + S] A
     for row in 0..M:
         for head in 0..KV:
-            prepared_key[row, head] = qwen_norm_rotary(
+            prepared_key[row, head] = norm_rotary_table(
                 key[row, head * (2 * P + S) : (head + 1) * (2 * P + S)], key_norm,
                 coordinates[row], rotary_components, rotary_frequencies, epsilon)
     let fresh_value = reshape(value, (M, KV, 2 * P + S))
@@ -480,7 +534,7 @@ fn qwen_gated_attention_k8v4[M, T, KV, G, P, S, R](
             let mut accumulator = tensor[G, 2 * P + S] f32
             for head in 0..G:
                 let first = (kv_head * G + head) * 2 * (2 * P + S)
-                qt[head] = qwen_norm_rotary(query_gate[row, first : first + (2 * P + S)],
+                qt[head] = norm_rotary_table(query_gate[row, first : first + (2 * P + S)],
                     query_norm, coordinates[row], rotary_components, rotary_frequencies,
                     epsilon)
                 maximum[head] = -inf
@@ -522,13 +576,13 @@ fn qwen_gated_attention_k8v4[M, T, KV, G, P, S, R](
     return gated
 
 
-# Decode rows (M <= 8) over affine K8/V4 history: `qwen_attention_decode`'s
+# Decode rows (M <= 8) over affine K8/V4 history: `gated_attention_decode`'s
 # partitioning and merge. Scores against history are corrected, not decoded:
 # the sum over groups of scale * (q . code) + zero * sum(q); the value product
 # accumulates (p * scale) * code and carries sum(p * zero) of each group
 # through the online softmax as a bias added before the partition state is
 # published. Partition 0 appends the row's key and value encoded.
-fn qwen_attention_decode_k8v4[M, T, KV, G, P, S, R](
+fn gated_attention_decode_k8v4[M, T, KV, G, P, S, R](
     query_gate: &tensor[M, KV * G * 2 * (2 * P + S)] A,
     key: &tensor[M, KV * (2 * P + S)] A, value: &tensor[M, KV * (2 * P + S)] A,
     query_norm: &tensor[2 * P + S] f32, key_norm: &tensor[2 * P + S] f32,
@@ -540,72 +594,96 @@ fn qwen_attention_decode_k8v4[M, T, KV, G, P, S, R](
     history_value_codes: &mut tensor[T, KV, (2 * P + S) / 8] u32,
     history_value_coefficients: &mut tensor[T, KV, (2 * P + S) / 16] f16,
     epsilon: f32, scale: f32) -> tensor[M, KV * G, 2 * P + S] A:
-    return qwen_gated_attention_k8v4[G = G](query_gate, key, value, query_norm, key_norm,
+    return gated_attention_k8v4[G = G](query_gate, key, value, query_norm, key_norm,
         rotary_components, rotary_frequencies, coordinates, visible, fresh,
         destinations, history_key_codes, history_key_coefficients, history_value_codes,
         history_value_coefficients, epsilon, scale)
 
 # A lane's W / 32 codes must be whole words or a power-of-two part of one, so
 # W is a power of two.
-native qwen_attention_decode_k8v4 for metal from "metal/qwen_attention_decode_k8v4.metal":
+native gated_attention_decode_k8v4 for metal from "metal/gated_attention_decode_k8v4.metal":
     static (KV, G, P, S)
     params (arithmetic SPAN in [32, 64, 128, 256], arithmetic PARTS in [16, 8, 32],
         arithmetic SIMDS in [4, 8])
     where 2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256
     scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * G * PARTS * 8)
-    launch qwen_attention_decode_k8v4_partial:
+    launch gated_attention_decode_k8v4_partial:
         threadgroups (KV, PARTS, M)
         threads_per_threadgroup (SIMDS * 32, 1, 1)
         shared_bytes ((G + SIMDS) * (2 * P + S) * 4 + SIMDS * G * 8)
-    launch qwen_attention_decode_k8v4_merge:
+    launch gated_attention_decode_k8v4_merge:
         threadgroups (KV * G, M, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
 
-# CUDA: `qwen_attention_decode`'s equal split-KV partitioning; history keys
+# CUDA: `gated_attention_decode`'s equal split-KV partitioning; history keys
 # score against raw codes (per group scale * (q . code) + zero * sum(q)) and
 # values accumulate (p * scale) * code plus the carried bias sum(p * zero). W is a
 # multiple of 32 dividing 256. (Metal: partitions with a SPAN minimum.)
-native qwen_attention_decode_k8v4 for cuda from "cuda/qwen_attention_decode_k8v4.cu":
+native gated_attention_decode_k8v4 for cuda from "cuda/gated_attention_decode_k8v4.cu":
     static (KV, G, P, S)
     params (arithmetic PARTS in [12, 24, 48], arithmetic WARPS in [4, 8])
     where (2 * P + S) % 32 == 0 and 256 % (2 * P + S) == 0
     scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * G * PARTS * 8)
-    launch qwen_attention_decode_k8v4_partial:
+    launch gated_attention_decode_k8v4_partial:
         threadgroups (KV, PARTS, M)
         threads_per_threadgroup (WARPS * 32, 1, 1)
         shared_bytes ((G + WARPS) * (2 * P + S) * 4 + WARPS * G * 8)
-    launch qwen_attention_decode_k8v4_merge:
+    launch gated_attention_decode_k8v4_merge:
         threadgroups (KV * G, M, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
 
 # Vulkan: the Metal form (`vulkan/common/history.glsl`): the dense decode's
 # launches with corrected scores over the codes. A lane's W / 32 codes must be
 # whole words or a power-of-two part of one, so W is a power of two.
-native qwen_attention_decode_k8v4 for vulkan from "vulkan/qwen_attention_decode_k8v4.comp":
+native gated_attention_decode_k8v4 for vulkan from "vulkan/gated_attention_decode_k8v4.comp":
     static (KV, G, P, S)
     params (arithmetic SPAN in [32, 64, 128, 256], arithmetic PARTS in [16, 8, 32],
         arithmetic SIMDS in [4, 8])
     where (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256) and P % ((2 * P + S) / 32) == 0
     scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * G * PARTS * 8)
-    launch qwen_attention_decode_k8v4_partial:
+    launch gated_attention_decode_k8v4_partial:
         threadgroups (KV, PARTS, M)
         threads_per_threadgroup (SIMDS * 32, 1, 1)
         shared_bytes ((G + SIMDS) * (2 * P + S) * 4 + SIMDS * G * 8)
-    launch qwen_attention_decode_k8v4_merge:
+    launch gated_attention_decode_k8v4_merge:
         threadgroups (KV * G, M, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
 
+# CPU: the dense CPU decode's launches; `prepare` appends encoded rows and
+# `attend` decodes history keys and values (F32) as it absorbs them. W must be
+# whole affine groups (a runtime check: CPU dimensions are not static).
+native gated_attention_decode_k8v4 for cpu from "cpu/gated_attention_decode_k8v4.rs":
+    static (P, S)
+    params (arithmetic PARTS in [8, 4, 16, 1])
+    where (2 * P + S) % 32 == 0
+    scratch queries bytes (M * KV * G * (2 * P + S) * 4)
+    scratch keys bytes (M * KV * (2 * P + S) * 4)
+    scratch partials bytes (M * KV * PARTS * G * (2 * P + S) * 4)
+    scratch statistics bytes (M * KV * PARTS * G * 8)
+    launch gated_attention_decode_k8v4_prepare:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes ((4 * P + S) * 4)
+    launch gated_attention_decode_k8v4_attend:
+        threadgroups (KV, PARTS, M)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes ((G * 32 + 2 * P + S) * 4)
+    launch gated_attention_decode_k8v4_merge:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes ((2 * P + S) * 4)
 
-# Prefill rows (M >= 16) over affine K8/V4 history: `qwen_attention_prefill`
+
+# Prefill rows (M >= 16) over affine K8/V4 history: `gated_attention_prefill`
 # with the prepare launch appending encoded rows and every history K/V tile
 # decoded (code * scale + zero, rounded to F16) as it is staged; the products
 # take F16 operands (the codec's coefficient element; queries and fresh rows
 # are activation values, exact in F16 within the codec's range) and read 2.3x
 # fewer history bytes.
-fn qwen_attention_prefill_k8v4[M, T, KV, G, P, S, R](
+fn gated_attention_prefill_k8v4[M, T, KV, G, P, S, R](
     query_gate: &tensor[M, KV * G * 2 * (2 * P + S)] A,
     key: &tensor[M, KV * (2 * P + S)] A, value: &tensor[M, KV * (2 * P + S)] A,
     query_norm: &tensor[2 * P + S] f32, key_norm: &tensor[2 * P + S] f32,
@@ -617,12 +695,12 @@ fn qwen_attention_prefill_k8v4[M, T, KV, G, P, S, R](
     history_value_codes: &mut tensor[T, KV, (2 * P + S) / 8] u32,
     history_value_coefficients: &mut tensor[T, KV, (2 * P + S) / 16] f16,
     epsilon: f32, scale: f32) -> tensor[M, KV * G, 2 * P + S] A:
-    return qwen_gated_attention_k8v4[G = G](query_gate, key, value, query_norm, key_norm,
+    return gated_attention_k8v4[G = G](query_gate, key, value, query_norm, key_norm,
         rotary_components, rotary_frequencies, coordinates, visible, fresh,
         destinations, history_key_codes, history_key_coefficients, history_value_codes,
         history_value_coefficients, epsilon, scale)
 
-native qwen_attention_prefill_k8v4 for metal from "metal/qwen_attention_prefill_k8v4.metal":
+native gated_attention_prefill_k8v4 for metal from "metal/gated_attention_prefill_k8v4.metal":
     static (KV, G, P, S)
     params (arithmetic QT in [16, 8], arithmetic SPLIT_GROUPS in [256, 128, 512, 1])
     where 2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256
@@ -632,33 +710,33 @@ native qwen_attention_prefill_k8v4 for metal from "metal/qwen_attention_prefill_
     scratch partials bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV)) * M * KV * G * (2 * P + S) * 4)
     scratch statistics bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV)) * M * KV * G * 8)
     scratch counts bytes (ceil_div(M, QT) * 4)
-    launch qwen_attention_prefill_k8v4_prepare:
+    launch gated_attention_prefill_k8v4_prepare:
         threadgroups (ceil_div(ceil_div(M, QT) * QT * KV * (G + 1), 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_attention_prefill_k8v4_attend:
+    launch gated_attention_prefill_k8v4_attend:
         threadgroups (ceil_div(M, QT), KV, max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV)))
         threads_per_threadgroup (QT * G * 4, 1, 1)
         shared_bytes (32 * (2 * P + S + 8) * 2 + (R + 1) * 16)
-    launch qwen_attention_prefill_k8v4_merge when ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV) > 1:
+    launch gated_attention_prefill_k8v4_merge when ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV) > 1:
         threadgroups (ceil_div(M, QT), KV * G, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
 
-# CUDA: `qwen_attention_prefill` over affine history (2.3x fewer history
+# CUDA: `gated_attention_prefill` over affine history (2.3x fewer history
 # bytes): the attend launch adds WARPS producer warps that load code tiles and
 # store them decoded to F16 operands while the WARPS MMA warps run the
 # previous tile; the products are the dense entry's in F16. Shared memory:
 # the dense entry's.
-native qwen_attention_prefill_k8v4 for cuda from "cuda/qwen_attention_prefill_k8v4.cu":
+native gated_attention_prefill_k8v4 for cuda from "cuda/gated_attention_prefill_k8v4.cu":
     static (KV, G, P, S)
     params (arithmetic WARPS in [4, 2])
     where (2 * P + S) % 32 == 0 and 256 % (2 * P + S) == 0 and 16 % G == 0
     scratch queries bytes (M * KV * G * (2 * P + S) * 2)
     scratch keys bytes (M * KV * (2 * P + S) * 2)
     scratch values bytes (M * KV * (2 * P + S) * 2)
-    launch qwen_attention_prefill_k8v4_prepare:
+    launch gated_attention_prefill_k8v4_prepare:
         threadgroups (ceil_div(M * KV * (G + 1), 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_attention_prefill_k8v4_attend:
+    launch gated_attention_prefill_k8v4_attend:
         threadgroups (ceil_div(M * G, WARPS * 16), KV, 1)
         threads_per_threadgroup (WARPS * 64, 1, 1)
         shared_bytes ((WARPS * 16 + 4 * 32) * (2 * P + S) * 2 + (R + 1) * 16)
@@ -666,7 +744,7 @@ native qwen_attention_prefill_k8v4 for cuda from "cuda/qwen_attention_prefill_k8
 # Vulkan: the dense prefill's launches (`vulkan/common/prefill.glsl`); the
 # prepare launch appends encoded rows and history tiles decode (rounded to the
 # f16 operand) as they are staged.
-native qwen_attention_prefill_k8v4 for vulkan from "vulkan/qwen_attention_prefill_k8v4.comp":
+native gated_attention_prefill_k8v4 for vulkan from "vulkan/gated_attention_prefill_k8v4.comp":
     static (KV, G, P, S)
     params (arithmetic ROWS in [64, 128], arithmetic SPLIT_GROUPS in [256, 128, 512, 1])
     where (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256) and P % ((2 * P + S) / 32) == 0 and ROWS % G == 0 and ROWS / G <= 32 and 64 * (2 * P + S + 8) + ROWS / 16 * 2048 <= 32768
@@ -676,16 +754,33 @@ native qwen_attention_prefill_k8v4 for vulkan from "vulkan/qwen_attention_prefil
     scratch partials bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)) * M * KV * G * (2 * P + S) * 4)
     scratch statistics bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)) * M * KV * G * 8)
     scratch counts bytes (ceil_div(M, ROWS / G) * 4)
-    launch qwen_attention_prefill_k8v4_prepare:
+    launch gated_attention_prefill_k8v4_prepare:
         threadgroups (ceil_div(ceil_div(M, ROWS / G) * (ROWS / G) * KV * (G + 1), 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_attention_prefill_k8v4_attend:
+    launch gated_attention_prefill_k8v4_attend:
         threadgroups (ceil_div(M, ROWS / G), KV, max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)))
         threads_per_threadgroup (ROWS * 2, 1, 1)
         shared_bytes (64 * (2 * P + S + 8) + ROWS / 16 * 2048)
-    launch qwen_attention_prefill_k8v4_merge when SPLIT_GROUPS > ceil_div(M, ROWS / G) * KV:
+    launch gated_attention_prefill_k8v4_merge when SPLIT_GROUPS > ceil_div(M, ROWS / G) * KV:
         threadgroups (ceil_div(M, ROWS / G), KV * G, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
+
+# CPU: the dense CPU prefill's launches; `prepare` appends encoded rows and
+# `attend` decodes history keys and values (F32) as it absorbs them. W must be
+# whole affine groups (a runtime check: CPU dimensions are not static).
+native gated_attention_prefill_k8v4 for cpu from "cpu/gated_attention_prefill_k8v4.rs":
+    static (P, S)
+    where (2 * P + S) % 32 == 0
+    scratch queries bytes (M * KV * G * (2 * P + S) * 4)
+    scratch keys bytes (M * KV * (2 * P + S) * 4)
+    launch gated_attention_prefill_k8v4_prepare:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes ((4 * P + S) * 4)
+    launch gated_attention_prefill_k8v4_attend:
+        threadgroups (M, KV, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes ((2 * G + G * (2 * P + S) + G * 32 + 2 * P + S) * 4)
 
 
 # The output projection of the Q = KV * G gated attention heads plus the F32
@@ -762,7 +857,7 @@ native attention_output for cuda from "cuda/attention_output.cu":
         threadgroups (ceil_div(M * D, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# Vulkan: the K1 projection (see `qwen_attention_project`): GEMV to 8 rows,
+# Vulkan: the K1 projection (see `gated_attention_project`): GEMV to 8 rows,
 # GEMM beyond with SPLIT-way split-K summed in order by `finalize`.
 native attention_output for vulkan from "vulkan/attention_output.comp":
     static (D, Q, W)
@@ -782,3 +877,18 @@ native attention_output for vulkan from "vulkan/attention_output.comp":
     launch attention_output_finalize when M > 8 and SPLIT > 1:
         threadgroups (ceil_div(M * D, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
+
+# CPU: the CPU projection library (`cpu/lib/projection/projection.rs`). A
+# stage launch writes each row's gated heads as one F32 row to scratch; the
+# row launch gives each work item ROWS output weight rows, projected against
+# every staged row and added to the hidden row.
+native attention_output for cpu from "cpu/attention_output.rs":
+    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    scratch quantized bytes (M * ceil_div(Q * W, 256) * 292)
+    scratch staged bytes (M * Q * W * 4)
+    launch attention_output_stage:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch attention_output_rows:
+        threadgroups (ceil_div(D, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)

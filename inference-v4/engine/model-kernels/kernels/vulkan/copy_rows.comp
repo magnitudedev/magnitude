@@ -4,7 +4,7 @@
 // outside either plane (including -1) are skipped. Elements move as whole
 // words of their size, so every plane (integer planes included) is copied
 // bit for bit.
-#include "common/element.glsl"
+#include <seismic/element.glsl>
 
 #if !defined(SEISMIC_SRC_KIND_DENSE) || !defined(SEISMIC_DST_KIND_DENSE)
 #error "copy_rows supports dense state planes only"

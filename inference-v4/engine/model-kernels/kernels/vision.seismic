@@ -95,6 +95,22 @@ native qwen_vision_stem for vulkan from "vulkan/qwen_vision_stem.comp":
         threads_per_threadgroup (128, 1, 1)
         shared_bytes (10240)
 
+# CPU: L1 stages each patch row's two frames as F32 and blends its position
+# table rows; L2 gives each work item ROWS outputs, their frame weights
+# decoded once, projected against every staged row.
+native qwen_vision_stem for cpu from "cpu/qwen_vision_stem.rs":
+    params (ROWS in [8, 4, 2, 1])
+    scratch pixels bytes (M * 2 * C * P * P * 4)
+    scratch blended bytes (M * H * 4)
+    launch qwen_vision_stem_stage:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (H * 4)
+    launch qwen_vision_stem_rows:
+        threadgroups (ceil_div(H, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes ((H + ROWS * 2 * C * P * P) * 4)
+
 
 # y = x . transpose(weight) + bias, accumulated in F32; publication rounds to
 # the output type.
@@ -323,6 +339,49 @@ native qwen_vision_block for vulkan from "vulkan/qwen_vision_block.comp":
         threads_per_threadgroup (128, 1, 1)
         shared_bytes (10240)
 
+# CPU: the launches of the Metal form, intermediates held as F32 (published
+# ones rounded to A). The projections give each work item ROWS weight rows
+# against every activation row; `residual` holds the input rows (staged by
+# norm1) plus the attention projection; `normalized` serves both norms.
+native qwen_vision_block for cpu from "cpu/qwen_vision_block.rs":
+    params (ROWS in [8, 4, 2, 1])
+    scratch normalized bytes (M * H * 4 * P * 4)
+    scratch projected bytes (M * 3 * H * 4 * P * 4)
+    scratch attended bytes (M * H * 4 * P * 4)
+    scratch residual bytes (M * H * 4 * P * 4)
+    scratch activated bytes (M * F * 4)
+    launch qwen_vision_block_norm1:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (2 * H * 4 * P * 4)
+    launch qwen_vision_block_qkv:
+        threadgroups (ceil_div(3 * H * 4 * P, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (3 * H * 4 * P * 4)
+    launch qwen_vision_block_rotate:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch qwen_vision_block_attend:
+        threadgroups (M, H, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (M * 4)
+    launch qwen_vision_block_output:
+        threadgroups (ceil_div(H * 4 * P, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (H * 4 * P * 4)
+    launch qwen_vision_block_norm2:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (2 * H * 4 * P * 4)
+    launch qwen_vision_block_up:
+        threadgroups (ceil_div(F, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (F * 4)
+    launch qwen_vision_block_down:
+        threadgroups (ceil_div(H * 4 * P, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (H * 4 * P * 4)
+
 
 # The patch merger: layer norm of each F32 patch row, G merged rows
 # concatenated, then an erf-GELU MLP to the decoder width, published in F32
@@ -388,3 +447,22 @@ native qwen_vision_merger for vulkan from "vulkan/qwen_vision_merger.comp":
         threadgroups (ceil_div(D, 64), ceil_div(M, 64), 1)
         threads_per_threadgroup (128, 1, 1)
         shared_bytes (10240)
+
+# CPU: layer norm per patch row, then the two projections, each work item
+# ROWS weight rows against every merged row.
+native qwen_vision_merger for cpu from "cpu/qwen_vision_merger.rs":
+    params (ROWS in [8, 4, 2, 1])
+    scratch normalized bytes (M * G * H * 4)
+    scratch activated bytes (M * G * H * 4)
+    launch qwen_vision_merger_norm:
+        threadgroups (M * G, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (2 * H * 4)
+    launch qwen_vision_merger_up:
+        threadgroups (ceil_div(G * H, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (G * H * 4)
+    launch qwen_vision_merger_down:
+        threadgroups (ceil_div(D, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (D * 4)

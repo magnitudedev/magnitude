@@ -1,7 +1,7 @@
 //! Synchronous execution of the core-owned executable command vocabulary.
 
 use crate::buffer::{AllocationFailure, Buffer};
-use crate::workers::{LaunchFailure, LaunchFrame, Workers};
+use crate::workers::{LaunchFailure, LaunchFrame, NativeSteps, Workers};
 use crate::Cpu;
 use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::executable::{
@@ -39,7 +39,9 @@ impl DeviceService<Cpu> for Device {
 }
 
 pub struct Executor {
+    /// Shared by every CPU device of the process (`open_host`).
     workers: Arc<Mutex<Workers>>,
+    participants: usize,
 }
 
 impl Executor {
@@ -54,57 +56,29 @@ impl Executor {
         crate::profile::profile_for_workers(&mut workers, device)
     }
 
-    /// Run `items` independent work items of an authored native launch on
-    /// the worker pool and return after all complete. Each item receives its
-    /// linear index and a private `shared_bytes` buffer.
-    pub fn run_native_items(
-        &self,
-        items: u64,
-        shared_bytes: u64,
-        body: &(dyn Fn(u64, &mut [u8]) + Sync),
-    ) -> Result<(), ExecutionError> {
-        unsafe extern "C-unwind" fn item(
-            frame: *const LaunchFrame,
-            _barrier: *const crate::workers::TeamBarrier,
-            index: u64,
-            _local: u64,
-            shared: *mut u8,
-            _participant: *mut u8,
-            _register: *mut u8,
-        ) {
-            // SAFETY: `run_native_items` builds the frame from a live body
-            // reference and a shared-byte count, and the pool grows each
-            // team's workgroup scratch to that count before running items.
-            unsafe {
-                let frame = &*frame;
-                let body = &*(frame.buffers as *const &(dyn Fn(u64, &mut [u8]) + Sync));
-                let bytes = *frame.words as usize;
-                let shared = if bytes == 0 {
-                    &mut [][..]
-                } else {
-                    std::slice::from_raw_parts_mut(shared, bytes)
-                };
-                body(index, shared);
-            }
-        }
-        let body: &(dyn Fn(u64, &mut [u8]) + Sync) = body;
-        let words = [shared_bytes];
-        let frame = LaunchFrame {
-            buffers: (&body as *const &(dyn Fn(u64, &mut [u8]) + Sync)).cast(),
-            words: words.as_ptr(),
-            results: std::ptr::null_mut(),
-        };
-        self.workers
-            .lock()
-            .expect("CPU worker-pool lock poisoned")
-            .run(item, &frame, items, 1, shared_bytes, 0, 0)
-            .map_err(launch_error)
+    /// Participants of the worker pool, the submitting thread included.
+    pub fn workers(&self) -> usize {
+        self.participants
     }
 
-    pub(crate) fn from_workers(workers: Workers) -> Self {
-        Self {
-            workers: Arc::new(Mutex::new(workers)),
-        }
+    /// Run a sequence of authored native launches as one pool job and
+    /// return after all complete (see [`NativeSteps`]), with the interval
+    /// the job ran on `clock`. The pool is shared by the process's CPU
+    /// devices, so the interval starts once this job holds it.
+    pub fn run_native(
+        &self,
+        steps: &dyn NativeSteps,
+        clock: fn() -> f64,
+    ) -> (Result<(), ExecutionError>, (f64, f64)) {
+        let mut workers = self.workers.lock().expect("CPU worker-pool lock poisoned");
+        let started = clock();
+        let outcome = workers.run_native(steps).map_err(launch_error);
+        (outcome, (started, clock()))
+    }
+
+    pub(crate) fn from_workers(workers: Arc<Mutex<Workers>>) -> Self {
+        let participants = workers.lock().expect("CPU worker-pool lock poisoned").count();
+        Self { workers, participants }
     }
 }
 

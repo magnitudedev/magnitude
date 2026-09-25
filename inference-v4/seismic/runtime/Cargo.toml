@@ -11,6 +11,7 @@ seismic-compiler.workspace = true
 seismic-native-target.workspace = true
 seismic-metal.workspace = true
 seismic-cpu.workspace = true
+seismic-native-cpu.workspace = true
 seismic-cuda.workspace = true
 opentelemetry = "0.33.0"
 serde.workspace = true

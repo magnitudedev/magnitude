@@ -7,7 +7,7 @@ mod cuda_common;
 
 use cuda_common::*;
 use magnitude_model_kernels::{
-    attention_output, qwen_attention_project, qwen_recurrent_output, qwen_recurrent_project,
+    attention_output, gated_attention_project, gated_delta_output, gated_delta_project,
 };
 use seismic::{Element, Layout, NativeSpecialization, Tensor};
 use seismic_lang::registry::bf16_round;
@@ -93,9 +93,9 @@ fn cuda_recurrent_project_matches_host_model() {
                     place(&mut expected, width, offset, &values, m, n);
                     place(&mut tolerance, width, offset, &bound, m, n);
                 }
-                let projection = qwen_recurrent_project::native_for_device_with(
+                let projection = gated_delta_project::native_for_device_with(
                     &device,
-                    qwen_recurrent_project::Elements {
+                    gated_delta_project::Elements {
                         NW: Element::f32(),
                         QW: element(formats[0]),
                         GW: element(formats[1]),
@@ -106,7 +106,7 @@ fn cuda_recurrent_project_matches_host_model() {
                     &specialization(&[("H", h), ("NK", nk), ("NV", nv), ("W", w)], mapping),
                 )
                 .unwrap()
-                .call(qwen_recurrent_project::Args {
+                .call(gated_delta_project::Args {
                     hidden: &hidden,
                     input_norm: &norm,
                     qkv_weight: &weights[0].tensor,
@@ -216,13 +216,13 @@ fn cuda_recurrent_output_matches_host_model() {
             let norm = f32_tensor(&device, &[case.w as u64], &case.norm);
             for &mapping in mappings(m) {
                 let (expected, tolerance) = case.expected(&output, mapping);
-                let result = qwen_recurrent_output::native_for_device_with(
+                let result = gated_delta_output::native_for_device_with(
                     &device,
-                    qwen_recurrent_output::Elements { A: Element::bf16(), RN: Element::f32(), OW: format.resident() },
+                    gated_delta_output::Elements { A: Element::bf16(), RN: Element::f32(), OW: format.resident() },
                     &specialization(&[("H", case.h), ("NK", case.nk), ("NV", case.nv), ("W", case.w)], mapping),
                 )
                 .unwrap()
-                .call(qwen_recurrent_output::Args {
+                .call(gated_delta_output::Args {
                     hidden: &hidden,
                     mixed: &mixed,
                     projection: &projection,
@@ -271,7 +271,7 @@ fn recurrent_output_host_model_matches_portable_body() {
         let storage = registry::storage(format.representation(), Layout::Mma16).unwrap();
         let logical = module
             .entry(
-                module.entry_named("qwen_recurrent_output").unwrap(),
+                module.entry_named("gated_delta_output").unwrap(),
                 &ElementBindings::new()
                     .bind("A", registry::dense(DType::BF16))
                     .bind("RN", registry::dense(DType::F32))
@@ -300,7 +300,7 @@ fn recurrent_output_host_model_matches_portable_body() {
         ];
         let outcome = interpreter.run(&args).unwrap();
         if let SourceTermination::Failed(failure) = outcome.termination() {
-            panic!("qwen_recurrent_output portable body failed: {failure}");
+            panic!("gated_delta_output portable body failed: {failure}");
         }
         let result = outcome.results().next().unwrap();
         let OutcomeValue::Tensor(values) = result.value() else { panic!("tensor result") };
@@ -336,9 +336,9 @@ fn cuda_attention_project_matches_host_model() {
                     .zip([query, keys, keys])
                     .map(|(weight, n)| rounded_segment(&x, &slack, weight, m, n, d, mapping))
                     .collect();
-                let results = qwen_attention_project::native_for_device_with(
+                let results = gated_attention_project::native_for_device_with(
                     &device,
-                    qwen_attention_project::Elements {
+                    gated_attention_project::Elements {
                         NW: Element::f32(),
                         QW: formats[0].resident(),
                         KW: formats[1].resident(),
@@ -348,7 +348,7 @@ fn cuda_attention_project_matches_host_model() {
                     &specialization(&[("D", d), ("KV", kv), ("G", g), ("W", w)], mapping),
                 )
                 .unwrap()
-                .call(qwen_attention_project::Args {
+                .call(gated_attention_project::Args {
                     hidden: &hidden,
                     input_norm: &norm,
                     query_norm: &query_norm,
@@ -444,9 +444,9 @@ fn cuda_projection_block_timings() {
         let projection = bf16_tensor(&device, &[m as u64, (qkv + z + 2 * nv) as u64], &vec![0.5; m * (qkv + z + 2 * nv)]);
         let recurrent_norm = f32_tensor(&device, &[w as u64], &vec![1.0; w]);
         for &mapping in mappings(m) {
-            let kernel = qwen_recurrent_project::native_for_device_with(
+            let kernel = gated_delta_project::native_for_device_with(
                 &device,
-                qwen_recurrent_project::Elements {
+                gated_delta_project::Elements {
                     NW: Element::f32(),
                     QW: Format::Q5K.resident(),
                     GW: Format::Q4K.resident(),
@@ -459,7 +459,7 @@ fn cuda_projection_block_timings() {
             .unwrap();
             let args = project_weights
                 .iter()
-                .map(|weights| qwen_recurrent_project::Args {
+                .map(|weights| gated_delta_project::Args {
                     hidden: &hidden,
                     input_norm: &norm,
                     qkv_weight: &weights[0],
@@ -477,15 +477,15 @@ fn cuda_projection_block_timings() {
                 project_bytes / measured.median / 1e9,
                 2.0 * (m * h * (qkv + z + 2 * nv)) as f64 / measured.median / 1e12
             );
-            let kernel = qwen_recurrent_output::native_for_device_with(
+            let kernel = gated_delta_output::native_for_device_with(
                 &device,
-                qwen_recurrent_output::Elements { A: Element::bf16(), RN: Element::f32(), OW: Format::Q5K.resident() },
+                gated_delta_output::Elements { A: Element::bf16(), RN: Element::f32(), OW: Format::Q5K.resident() },
                 &specialization(&[("H", h), ("NK", nk), ("NV", nv), ("W", w)], mapping),
             )
             .unwrap();
             let args = output_weights
                 .iter()
-                .map(|weight| qwen_recurrent_output::Args {
+                .map(|weight| gated_delta_output::Args {
                     hidden: &hidden,
                     mixed: &mixed,
                     projection: &projection,

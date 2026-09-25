@@ -96,6 +96,16 @@ impl Printer {
                     });
                     self.out.push_str(")\n");
                 }
+                if !n.elements.is_empty() {
+                    self.indent();
+                    self.out.push_str("elements (");
+                    self.list(&n.elements, |p, elements| {
+                        let _ = write!(p.out, "{} in [", elements.name.name);
+                        p.names(&elements.dtypes);
+                        p.out.push(']');
+                    });
+                    self.out.push_str(")\n");
+                }
                 if let Some(constraint) = &n.constraint {
                     self.indent();
                     self.out.push_str("where ");

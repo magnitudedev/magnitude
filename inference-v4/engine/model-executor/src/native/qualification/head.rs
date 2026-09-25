@@ -18,7 +18,7 @@ impl<'a> QualificationView<'a> {
             let intermediate = self.weight_shape(
                 scope,
                 magnitude_model_contracts::WeightKind::DenseGate,
-                "qwen_dense_expand",
+                "dense_expand",
             )?[0];
             // One (token, status) selection row.
             let tokens = semantic_zeros(device, Element::i32(), &[1, 2], "head", &label)?;
@@ -42,7 +42,7 @@ impl<'a> QualificationView<'a> {
                 semantic_pattern(device, binding.combine, &[hidden, 2 * hidden], "head", &label)?;
             let features = block
                 .input
-                .call(qwen_draft_rows::Args {
+                .call(draft_rows::Args {
                     tokens: &tokens,
                     table: &table,
                     conditioning: &conditioning,
@@ -51,7 +51,7 @@ impl<'a> QualificationView<'a> {
                     combine: &combine,
                     epsilon: 1.0e-5,
                 })
-                .map_err(|error| qualification_dynamic("qwen_draft_rows", &label, error))?
+                .map_err(|error| qualification_dynamic("draft_rows", &label, error))?
                 .value;
             qualify_attention(
                 device,
@@ -81,7 +81,7 @@ impl<'a> QualificationView<'a> {
             let product = block
                 .dense
                 .expand
-                .call(qwen_dense_expand::Args {
+                .call(dense_expand::Args {
                     residual: &attended,
                     norm: &feedforward_norm,
                     gate_weight: &gate,
@@ -89,20 +89,20 @@ impl<'a> QualificationView<'a> {
                     out_rows: &out_rows,
                     eps: 1.0e-5,
                 })
-                .map_err(|error| qualification_dynamic("qwen_dense_expand", &label, error))?
+                .map_err(|error| qualification_dynamic("dense_expand", &label, error))?
                 .value;
             let dense = block
                 .dense
                 .output
-                .call(qwen_dense_output::Args {
+                .call(dense_output::Args {
                     residual: &attended,
                     product: &product,
                     down_weight: &down,
                     out_rows: &out_rows,
                 })
-                .map_err(|error| qualification_dynamic("qwen_dense_output", &label, error))?
+                .map_err(|error| qualification_dynamic("dense_output", &label, error))?
                 .value;
-            require_finite_nonzero_f32(&dense, "qwen_dense_output", &label)?;
+            require_finite_nonzero_f32(&dense, "dense_output", &label)?;
             let output_norm = semantic_ones(device, binding.output_norm, &[hidden], "head", &label)?;
             let projected_features = block
                 .features

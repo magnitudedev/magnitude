@@ -152,6 +152,7 @@ impl Decl {
 /// native NAME for TARGET from "SOURCE":
 ///     static (DIM, ..)
 ///     params ([arithmetic] NAME in [V, ..], ..)
+///     elements (ELEMENT in [DTYPE, ..], ..)
 ///     where CONDITION
 ///     scratch NAME bytes (EXPR) [when CONDITION]
 ///     launch KERNEL [when CONDITION]:
@@ -170,6 +171,9 @@ pub struct NativeDecl {
     /// Entry dimensions fixed at preparation.
     pub statics: Vec<Ident>,
     pub params: Vec<NativeParamDecl>,
+    /// The dense representations a build-time compiled (CPU) form covers,
+    /// per element parameter it monomorphizes.
+    pub elements: Vec<NativeElementsDecl>,
     /// The `where` condition restricting admissible configurations.
     pub constraint: Option<Expr>,
     pub scratch: Vec<NativeScratchDecl>,
@@ -184,6 +188,15 @@ pub struct NativeParamDecl {
     /// The parameter changes the arithmetic order of a row's result.
     pub arithmetic: bool,
     pub values: Vec<u64>,
+    pub span: Span,
+}
+
+/// `NAME in [DTYPE, ..]`: the dense element types one element parameter of a
+/// CPU form is compiled for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeElementsDecl {
+    pub name: Ident,
+    pub dtypes: Vec<Ident>,
     pub span: Span,
 }
 

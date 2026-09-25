@@ -16,7 +16,7 @@
 // The 64-bit histogram lives in the shared region as (low, high) u32 planes:
 // an atomic add to the low word carries into the high word when it wraps, so
 // the sums stay exact without 64-bit shared atomics (a gated device feature).
-#include "common/element.glsl"
+#include <seismic/element.glsl>
 
 // Scratch per row (u32 words): PARTS partition-maximum keys, then the
 // selection state.

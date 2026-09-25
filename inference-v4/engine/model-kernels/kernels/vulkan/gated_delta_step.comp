@@ -1,0 +1,20 @@
+// gated_delta_step (decode, MTP verify and small row classes): the
+// row-sequential gated delta rule with its preparation fused. The Vulkan form
+// of `cuda/gated_delta_step.cu` over `lib/recurrent/recurrent.glsl`.
+//
+// One workgroup per (value head, state-row block, slot); slots are a grid
+// axis. Each subgroup owns ROWS state rows (value coordinates), a lane W / 32
+// columns (key coordinates) of each, held in registers for the whole slot.
+// The state is read from bank previous_bank[slot] and published to
+// following_bank[slot] after the slot's first stop[slot] rows; the window
+// likewise. Grid z = B zeroes the mixed rows no slot covers. ROWS and WARPS
+// never change result bits.
+#include "lib/recurrent/recurrent.glsl"
+
+#if SEISMIC_TUNE_ROWS > RECURRENT_MAX_ROWS
+#error "gated_delta_step holds at most RECURRENT_MAX_ROWS state rows per subgroup"
+#endif
+
+void gated_delta_step() {
+    recurrent_sequential(SEISMIC_TUNE_ROWS);
+}

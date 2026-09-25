@@ -1,13 +1,13 @@
-// `qwen_attention_decode_k8v4` and `qwen_attention_prefill_k8v4` (affine K8/V4
-// history) on every accelerator present: against their portable body (the
+// `gated_attention_decode_k8v4` and `gated_attention_prefill_k8v4` (affine K8/V4
+// history) on every accelerator present and the CPU: against their portable body (the
 // reference interpreter, small shapes) and against a host model of that body
 // (the dense host model over the decoded history, Qwen3.5-4B geometry, long
 // contexts). Timings are ignored tests.
 #![allow(dead_code)]
 
 use magnitude_model_kernels::{
-    qwen_attention_decode, qwen_attention_decode_k8v4, qwen_attention_prefill,
-    qwen_attention_prefill_k8v4,
+    gated_attention_decode, gated_attention_decode_k8v4, gated_attention_prefill,
+    gated_attention_prefill_k8v4,
 };
 use seismic::{BackendName, Device, DeviceCatalog, Element, NativeSpecialization, Tensor};
 use seismic_lang::registry::{f16_bits, f16_to_f32};
@@ -273,12 +273,14 @@ macro_rules! args {
     };
 }
 
-/// The accelerators with k8v4 natives: Metal, CUDA and Vulkan.
-fn accelerators() -> Vec<(BackendName, Device)> {
-    let Ok(catalog) = DeviceCatalog::discover() else { return Vec::new() };
+/// The devices with k8v4 natives: every accelerator present (Metal, CUDA,
+/// Vulkan) and the CPU.
+fn k8v4_devices() -> Vec<Device> {
+    let catalog = DeviceCatalog::discover().unwrap();
     [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]
         .into_iter()
-        .filter_map(|backend| catalog.open_backend(backend).ok().map(|device| (backend, device)))
+        .filter_map(|backend| catalog.open_backend(backend).ok())
+        .chain(std::iter::once(catalog.open_backend(BackendName::Cpu).unwrap()))
         .collect()
 }
 
@@ -289,6 +291,7 @@ fn decode_configs(backend: BackendName) -> Vec<Vec<(&'static str, u64)>> {
             .into_iter()
             .map(|(parts, warps)| vec![("PARTS", parts), ("WARPS", warps)])
             .collect(),
+        BackendName::Cpu => [8, 4, 16, 1].into_iter().map(|parts| vec![("PARTS", parts)]).collect(),
         _ => [(32, 16, 4), (64, 32, 8), (256, 8, 8), (32, 16, 8)]
             .into_iter()
             .map(|(span, parts, simds)| vec![("SPAN", span), ("PARTS", parts), ("SIMDS", simds)])
@@ -300,6 +303,8 @@ fn decode_configs(backend: BackendName) -> Vec<Vec<(&'static str, u64)>> {
 fn prefill_configs(backend: BackendName) -> Vec<Vec<(&'static str, u64)>> {
     match backend {
         BackendName::Cuda => [4, 2].into_iter().map(|warps| vec![("WARPS", warps)]).collect(),
+        // One CPU form, without parameters.
+        BackendName::Cpu => vec![Vec::new()],
         // ROWS = 64 is admissible at every tested geometry (ROWS / G <= 32,
         // and the W = 256 tile fits the shared bound).
         BackendName::Vulkan => [1, 256, 512]
@@ -313,21 +318,28 @@ fn prefill_configs(backend: BackendName) -> Vec<Vec<(&'static str, u64)>> {
     }
 }
 
-fn specialization(geometry: Geometry, params: &[(&'static str, u64)]) -> NativeSpecialization {
-    params
-        .iter()
-        .fold(statics(geometry), |spec, (name, value)| spec.with_param(*name, *value))
+/// The specialization of `params` on `device`: GPU forms take the geometry's
+/// statics; CPU forms have no statics.
+fn specialization_on(device: &Device, geometry: Geometry, params: &[(&'static str, u64)]) -> NativeSpecialization {
+    // The CPU forms fix only the head width, which their codec requires to be
+    // whole 32-column groups.
+    let base = if is_cpu(device) {
+        NativeSpecialization::new().with_static("P", geometry.p as u64).with_static("S", geometry.s as u64)
+    } else {
+        statics(geometry)
+    };
+    params.iter().fold(base, |spec, (name, value)| spec.with_param(*name, *value))
 }
 
 fn decode_kernel(
     device: &Device,
     geometry: Geometry,
     params: &[(&'static str, u64)],
-) -> seismic::NativeKernel<qwen_attention_decode_k8v4::Entry> {
-    qwen_attention_decode_k8v4::native_for_device_with(
+) -> seismic::NativeKernel<gated_attention_decode_k8v4::Entry> {
+    gated_attention_decode_k8v4::native_for_device_with(
         device,
-        qwen_attention_decode_k8v4::Elements { A: Element::bf16() },
-        &specialization(geometry, params),
+        gated_attention_decode_k8v4::Elements { A: Element::bf16() },
+        &specialization_on(device, geometry, params),
     )
     .unwrap()
 }
@@ -336,11 +348,11 @@ fn prefill_kernel(
     device: &Device,
     geometry: Geometry,
     params: &[(&'static str, u64)],
-) -> seismic::NativeKernel<qwen_attention_prefill_k8v4::Entry> {
-    qwen_attention_prefill_k8v4::native_for_device_with(
+) -> seismic::NativeKernel<gated_attention_prefill_k8v4::Entry> {
+    gated_attention_prefill_k8v4::native_for_device_with(
         device,
-        qwen_attention_prefill_k8v4::Elements { A: Element::bf16() },
-        &specialization(geometry, params),
+        gated_attention_prefill_k8v4::Elements { A: Element::bf16() },
+        &specialization_on(device, geometry, params),
     )
     .unwrap()
 }
@@ -512,15 +524,20 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
 #[test]
 fn decode_matches_portable_body() {
     let encoded = Encoded::new(Case::new(GROUPED, 64, 2, &decode_rows(5), 11));
-    check_host_model_against_portable_body("qwen_attention_decode_k8v4", &encoded);
+    check_host_model_against_portable_body("gated_attention_decode_k8v4", &encoded);
+    for device in k8v4_devices() {
+        decode_matches_portable_body_on(&device, &encoded);
+    }
+}
+
+fn decode_matches_portable_body_on(device: &Device, encoded: &Encoded) {
+    let backend = device.backend();
     let expected = encoded.expected();
-    for (backend, device) in accelerators() {
-        for config in decode_configs(backend) {
-            let kernel = decode_kernel(&device, GROUPED, &config);
-            let mut bound = Bound::new(&device, &encoded);
-            let gated = kernel.call(args!(qwen_attention_decode_k8v4, bound, encoded.case)).unwrap().value;
-            check(&format!("{backend:?} grouped decode {config:?}"), &encoded, &gated, &bound, &expected);
-        }
+    for config in decode_configs(backend) {
+        let kernel = decode_kernel(device, GROUPED, &config);
+        let mut bound = Bound::new(device, encoded);
+        let gated = kernel.call(args!(gated_attention_decode_k8v4, bound, encoded.case)).unwrap().value;
+        check(&format!("{backend:?} grouped decode {config:?}"), encoded, &gated, &bound, &expected);
     }
 }
 
@@ -531,50 +548,60 @@ fn prefill_matches_portable_body() {
     // One affine group per vector keeps the interpreter's prefill affordable;
     // the Qwen geometry test covers eight groups.
     let encoded = Encoded::new(Case::new(SMALL, 400, 2, &prefill_rows(20, 300), 23));
-    check_host_model_against_portable_body("qwen_attention_prefill_k8v4", &encoded);
+    check_host_model_against_portable_body("gated_attention_prefill_k8v4", &encoded);
+    for device in k8v4_devices() {
+        prefill_matches_portable_body_on(&device, &encoded);
+    }
+}
+
+fn prefill_matches_portable_body_on(device: &Device, encoded: &Encoded) {
+    let backend = device.backend();
     let expected = encoded.expected();
-    for (backend, device) in accelerators() {
-        for config in prefill_configs(backend) {
-            let kernel = prefill_kernel(&device, SMALL, &config);
-            let mut bound = Bound::new(&device, &encoded);
-            let gated = kernel.call(args!(qwen_attention_prefill_k8v4, bound, encoded.case)).unwrap().value;
-            check(&format!("{backend:?} small prefill {config:?}"), &encoded, &gated, &bound, &expected);
-        }
+    for config in prefill_configs(backend) {
+        let kernel = prefill_kernel(device, SMALL, &config);
+        let mut bound = Bound::new(device, encoded);
+        let gated = kernel.call(args!(gated_attention_prefill_k8v4, bound, encoded.case)).unwrap().value;
+        check(&format!("{backend:?} small prefill {config:?}"), encoded, &gated, &bound, &expected);
     }
 }
 
 #[test]
 fn qwen_geometry_decode_and_prefill_match_host_model() {
-    for (backend, device) in accelerators() {
-        for context in [256, 4096, 16384] {
-            let encoded = Encoded::new(Case::new(QWEN, context + 128, 2, &decode_rows(context as i32 - 40), 5));
-            let expected = encoded.expected();
-            for config in decode_configs(backend) {
-                let kernel = decode_kernel(&device, QWEN, &config);
-                let mut bound = Bound::new(&device, &encoded);
-                let gated = kernel.call(args!(qwen_attention_decode_k8v4, bound, encoded.case)).unwrap().value;
-                check(&format!("{backend:?} decode context {context} {config:?}"), &encoded, &gated, &bound, &expected);
-            }
-            for rows in [1, 8] {
-                let encoded = Encoded::new(Case::new(QWEN, context + rows, 1, &speculative_rows(rows, context as i32), 13));
-                let expected = encoded.expected();
-                let config = &decode_configs(backend)[0];
-                let kernel = decode_kernel(&device, QWEN, config);
-                let mut bound = Bound::new(&device, &encoded);
-                let gated = kernel.call(args!(qwen_attention_decode_k8v4, bound, encoded.case)).unwrap().value;
-                check(&format!("{backend:?} speculative decode {rows} rows context {context} {config:?}"),
-                    &encoded, &gated, &bound, &expected);
-            }
+    for device in k8v4_devices() {
+        qwen_geometry_decode_and_prefill_match_host_model_on(&device);
+    }
+}
+
+fn qwen_geometry_decode_and_prefill_match_host_model_on(device: &Device) {
+    let backend = device.backend();
+    for context in [256, 4096, 16384] {
+        let encoded = Encoded::new(Case::new(QWEN, context + 128, 2, &decode_rows(context as i32 - 40), 5));
+        let expected = encoded.expected();
+        for config in decode_configs(backend) {
+            let kernel = decode_kernel(device, QWEN, &config);
+            let mut bound = Bound::new(device, &encoded);
+            let gated = kernel.call(args!(gated_attention_decode_k8v4, bound, encoded.case)).unwrap().value;
+            check(&format!("{backend:?} decode context {context} {config:?}"), &encoded, &gated, &bound, &expected);
         }
-        for (rows, history) in [(40, 300), (128, 1000), (64, 4096), (48, 16384)] {
-            let encoded = Encoded::new(Case::new(QWEN, history as usize + 256, 2, &prefill_rows(rows, history), 7));
+        for rows in [1, 8] {
+            let encoded = Encoded::new(Case::new(QWEN, context + rows, 1, &speculative_rows(rows, context as i32), 13));
             let expected = encoded.expected();
-            for config in prefill_configs(backend) {
-                let kernel = prefill_kernel(&device, QWEN, &config);
-                let mut bound = Bound::new(&device, &encoded);
-                let gated = kernel.call(args!(qwen_attention_prefill_k8v4, bound, encoded.case)).unwrap().value;
-                check(&format!("{backend:?} prefill {rows} rows after {history} {config:?}"), &encoded, &gated, &bound, &expected);
-            }
+            let config = &decode_configs(backend)[0];
+            let kernel = decode_kernel(device, QWEN, config);
+            let mut bound = Bound::new(device, &encoded);
+            let gated = kernel.call(args!(gated_attention_decode_k8v4, bound, encoded.case)).unwrap().value;
+            check(&format!("{backend:?} speculative decode {rows} rows context {context} {config:?}"),
+                &encoded, &gated, &bound, &expected);
+        }
+    }
+    for (rows, history) in [(40, 300), (128, 1000), (64, 4096), (48, 16384)] {
+        let encoded = Encoded::new(Case::new(QWEN, history as usize + 256, 2, &prefill_rows(rows, history), 7));
+        let expected = encoded.expected();
+        for config in prefill_configs(backend) {
+            let kernel = prefill_kernel(device, QWEN, &config);
+            let mut bound = Bound::new(device, &encoded);
+            let gated = kernel.call(args!(gated_attention_prefill_k8v4, bound, encoded.case)).unwrap().value;
+            check(&format!("{backend:?} prefill {rows} rows after {history} {config:?}"), &encoded, &gated, &bound, &expected);
         }
     }
 }
@@ -625,53 +652,58 @@ macro_rules! dense_args {
 #[test]
 #[ignore]
 fn decode_timing() {
-    for (backend, device) in accelerators() {
-        for context in [1usize, 256, 4096, 16384, 65536] {
-            let rows = [Row {
-                spans: vec![(0, context as i32 - 1)],
-                fresh: (0, 1),
-                destination: context as i32 - 1,
-                position: context as i32 - 1,
-            }];
-            let encoded = Encoded::new(Case::new(QWEN, context + 64, 1, &rows, 3));
-            let mut dense = DenseHistory::new(&device, &encoded.case);
-            for config in decode_configs(backend) {
-                let kernel = decode_kernel(&device, QWEN, &config);
-                let mut bound = Bound::new(&device, &encoded);
-                let affine = kernel
-                    .measure(vec![args!(qwen_attention_decode_k8v4, bound, encoded.case)], &TIMING)
+    for device in k8v4_devices() {
+        decode_timing_on(&device);
+    }
+}
+
+fn decode_timing_on(device: &Device) {
+    let backend = device.backend();
+    for context in [1usize, 256, 4096, 16384, 65536] {
+        let rows = [Row {
+            spans: vec![(0, context as i32 - 1)],
+            fresh: (0, 1),
+            destination: context as i32 - 1,
+            position: context as i32 - 1,
+        }];
+        let encoded = Encoded::new(Case::new(QWEN, context + 64, 1, &rows, 3));
+        let mut dense = DenseHistory::new(device, &encoded.case);
+        for config in decode_configs(backend) {
+            let kernel = decode_kernel(device, QWEN, &config);
+            let mut bound = Bound::new(device, &encoded);
+            let affine = kernel
+                .measure(vec![args!(gated_attention_decode_k8v4, bound, encoded.case)], &TIMING)
+                .unwrap()
+                .median;
+            let affine_bytes =
+                (context * QWEN.kv * (QWEN.w() + QWEN.w() / 2 + 4 * coefficient_elements(QWEN.w()))) as f64;
+            let dense_bytes = (context * QWEN.kv * QWEN.w() * 4) as f64;
+            // The dense entry's domain may not admit this configuration.
+            let dense_time = gated_attention_decode::native_for_device_with(
+                device,
+                gated_attention_decode::Elements { A: Element::bf16() },
+                &specialization_on(device, QWEN, &config),
+            )
+            .ok()
+            .map(|dense_kernel| {
+                dense_kernel
+                    .measure(vec![dense_args!(gated_attention_decode, bound, dense, encoded.case)], &TIMING)
                     .unwrap()
-                    .median;
-                let affine_bytes =
-                    (context * QWEN.kv * (QWEN.w() + QWEN.w() / 2 + 4 * coefficient_elements(QWEN.w()))) as f64;
-                let dense_bytes = (context * QWEN.kv * QWEN.w() * 4) as f64;
-                // The dense entry's domain may not admit this configuration.
-                let dense_time = qwen_attention_decode::native_for_device_with(
-                    &device,
-                    qwen_attention_decode::Elements { A: Element::bf16() },
-                    &specialization(QWEN, &config),
+                    .median
+            });
+            let dense_report = dense_time.map_or("dense not admitted".to_owned(), |dense_time| {
+                format!(
+                    "dense {:.1} us ({:.0} GB/s), k8v4/dense {:.2}",
+                    dense_time * 1e6,
+                    dense_bytes / dense_time / 1e9,
+                    affine / dense_time
                 )
-                .ok()
-                .map(|dense_kernel| {
-                    dense_kernel
-                        .measure(vec![dense_args!(qwen_attention_decode, bound, dense, encoded.case)], &TIMING)
-                        .unwrap()
-                        .median
-                });
-                let dense_report = dense_time.map_or("dense not admitted".to_owned(), |dense_time| {
-                    format!(
-                        "dense {:.1} us ({:.0} GB/s), k8v4/dense {:.2}",
-                        dense_time * 1e6,
-                        dense_bytes / dense_time / 1e9,
-                        affine / dense_time
-                    )
-                });
-                eprintln!(
-                    "{backend:?} decode context {context} {config:?}: k8v4 {:.1} us ({:.0} GB/s), {dense_report}",
-                    affine * 1e6,
-                    affine_bytes / affine / 1e9,
-                );
-            }
+            });
+            eprintln!(
+                "{backend:?} decode context {context} {config:?}: k8v4 {:.1} us ({:.0} GB/s), {dense_report}",
+                affine * 1e6,
+                affine_bytes / affine / 1e9,
+            );
         }
     }
 }
@@ -683,58 +715,63 @@ fn decode_timing() {
 #[test]
 #[ignore]
 fn prefill_timing() {
-    for (backend, device) in accelerators() {
-        let rows_history = match std::env::var("K8V4_PREFILL_SHAPES") {
-            Ok(shapes) => shapes
-                .split(',')
-                .map(|shape| {
-                    let (rows, history) = shape.split_once('x').expect("shape is ROWSxHISTORY");
-                    (rows.parse::<usize>().unwrap(), history.parse::<i32>().unwrap())
-                })
-                .collect::<Vec<_>>(),
-            Err(_) => vec![(128usize, 0i32), (512, 0), (512, 4096), (512, 16384), (512, 65536)],
-        };
-        for (rows, history) in rows_history {
-            let spans = if history > 0 { vec![(0, history)] } else { vec![] };
-            let rows = (0..rows)
-                .map(|row| Row {
-                    spans: spans.clone(),
-                    fresh: (0, row as i32 + 1),
-                    destination: history + row as i32,
-                    position: history + row as i32,
-                })
-                .collect::<Vec<_>>();
-            let pairs = rows.iter().map(|row| (history + row.fresh.1 - row.fresh.0) as f64).sum::<f64>();
-            let flop = pairs * (QWEN.kv * QWEN.g * QWEN.w() * 4) as f64;
-            let encoded = Encoded::new(Case::new(QWEN, history as usize + rows.len(), 1, &rows, 9));
-            let mut dense = DenseHistory::new(&device, &encoded.case);
-            for config in prefill_configs(backend) {
-                let kernel = prefill_kernel(&device, QWEN, &config);
-                let mut bound = Bound::new(&device, &encoded);
-                let affine = kernel
-                    .measure(vec![args!(qwen_attention_prefill_k8v4, bound, encoded.case)], &TIMING)
-                    .unwrap()
-                    .median;
-                let dense_kernel = qwen_attention_prefill::native_for_device_with(
-                    &device,
-                    qwen_attention_prefill::Elements { A: Element::bf16() },
-                    &specialization(QWEN, &config),
-                )
-                .unwrap();
-                let dense_time = dense_kernel
-                    .measure(vec![dense_args!(qwen_attention_prefill, bound, dense, encoded.case)], &TIMING)
-                    .unwrap()
-                    .median;
-                eprintln!(
-                    "{backend:?} prefill {} rows after {history} history {config:?}: k8v4 {:.1} us ({:.2} TFLOP/s), dense {:.1} us ({:.2} TFLOP/s), k8v4/dense {:.2}",
-                    rows.len(),
-                    affine * 1e6,
-                    flop / affine / 1e12,
-                    dense_time * 1e6,
-                    flop / dense_time / 1e12,
-                    affine / dense_time
-                );
-            }
+    for device in k8v4_devices() {
+        prefill_timing_on(&device);
+    }
+}
+
+fn prefill_timing_on(device: &Device) {
+    let backend = device.backend();
+    let rows_history = match std::env::var("K8V4_PREFILL_SHAPES") {
+        Ok(shapes) => shapes
+            .split(',')
+            .map(|shape| {
+                let (rows, history) = shape.split_once('x').expect("shape is ROWSxHISTORY");
+                (rows.parse::<usize>().unwrap(), history.parse::<i32>().unwrap())
+            })
+            .collect::<Vec<_>>(),
+        Err(_) => vec![(128usize, 0i32), (512, 0), (512, 4096), (512, 16384), (512, 65536)],
+    };
+    for (rows, history) in rows_history {
+        let spans = if history > 0 { vec![(0, history)] } else { vec![] };
+        let rows = (0..rows)
+            .map(|row| Row {
+                spans: spans.clone(),
+                fresh: (0, row as i32 + 1),
+                destination: history + row as i32,
+                position: history + row as i32,
+            })
+            .collect::<Vec<_>>();
+        let pairs = rows.iter().map(|row| (history + row.fresh.1 - row.fresh.0) as f64).sum::<f64>();
+        let flop = pairs * (QWEN.kv * QWEN.g * QWEN.w() * 4) as f64;
+        let encoded = Encoded::new(Case::new(QWEN, history as usize + rows.len(), 1, &rows, 9));
+        let mut dense = DenseHistory::new(device, &encoded.case);
+        for config in prefill_configs(backend) {
+            let kernel = prefill_kernel(device, QWEN, &config);
+            let mut bound = Bound::new(device, &encoded);
+            let affine = kernel
+                .measure(vec![args!(gated_attention_prefill_k8v4, bound, encoded.case)], &TIMING)
+                .unwrap()
+                .median;
+            let dense_kernel = gated_attention_prefill::native_for_device_with(
+                device,
+                gated_attention_prefill::Elements { A: Element::bf16() },
+                &specialization_on(device, QWEN, &config),
+            )
+            .unwrap();
+            let dense_time = dense_kernel
+                .measure(vec![dense_args!(gated_attention_prefill, bound, dense, encoded.case)], &TIMING)
+                .unwrap()
+                .median;
+            eprintln!(
+                "{backend:?} prefill {} rows after {history} history {config:?}: k8v4 {:.1} us ({:.2} TFLOP/s), dense {:.1} us ({:.2} TFLOP/s), k8v4/dense {:.2}",
+                rows.len(),
+                affine * 1e6,
+                flop / affine / 1e12,
+                dense_time * 1e6,
+                flop / dense_time / 1e12,
+                affine / dense_time
+            );
         }
     }
 }

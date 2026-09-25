@@ -1,10 +1,10 @@
 // qwen_vision_merger: layer norm of each of the M * G F32 patch rows (width
 // H), then the up GEMM over G concatenated rows (+ bias, erf GELU) and the
 // down GEMM to the decoder width D (+ bias), published in F32. The Vulkan form of
-// `metal/qwen_vision_merger.metal` (bodies in common/vision.glsl and the
+// `metal/qwen_vision_merger.metal` (bodies in lib/vision/vision.glsl and the
 // projection library).
-#include "common/activation.glsl"
-#include "common/vision.glsl"
+#include "lib/core/activation.glsl"
+#include "lib/vision/vision.glsl"
 
 #if !defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) && !defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
 #error "qwen_vision_merger requires a bf16 or f16 activation"

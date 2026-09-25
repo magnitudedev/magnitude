@@ -3,17 +3,16 @@
 //! A specialization fixes the entry's declared static dimensions to this
 //! model's values and chooses its tuning parameters. An entry with tuning
 //! parameters is tuned on the device when the program is prepared (see
-//! `tuning`). An entry the program needs that has no implementation for the
-//! opened device's backend is recorded rather than failing at once, so
-//! preparation reports every missing entry together.
+//! `tuning`). Every entry has an implementation for every backend a device
+//! can have: the kernels crate's build proves it, so preparation never meets
+//! a missing one.
 
-use super::tuning::{EntryTuning, MissingImplementations, Tuner};
+use super::tuning::{EntryTuning, Tuner};
 use super::CatalogFailure;
 use seismic::{Device, Entry, LoadError, NativeImplementation, NativeKernel, NativeSpecialization};
 
 pub(super) struct Specializer<'a> {
     device: &'a Device,
-    missing: MissingImplementations,
     /// A tuning census walks the program to count tuning units; it forms
     /// nothing and every entry comes back `None`.
     census: bool,
@@ -58,36 +57,27 @@ fn statics(
 
 impl<'a> Specializer<'a> {
     pub fn new(device: &'a Device) -> Self {
-        Self {
-            device,
-            missing: MissingImplementations::default(),
-            census: false,
-        }
+        Self { device, census: false }
     }
 
     /// A specializer for a tuning census (with [`Tuner::census`]).
     pub fn census(device: &'a Device) -> Self {
-        Self {
-            device,
-            missing: MissingImplementations::default(),
-            census: true,
-        }
+        Self { device, census: true }
     }
 
-    fn implementation<E: Entry>(
-        &mut self,
-        bindings: &str,
-    ) -> Result<Option<NativeImplementation>, CatalogFailure> {
+    fn implementation<E: Entry>(&self, bindings: &str) -> Result<NativeImplementation, CatalogFailure> {
         let implementation = seismic::generated::native_implementation::<E>(self.device)
             .map_err(|error| failure(E::NAME, bindings, error.to_string()))?;
-        if implementation.is_none() {
-            self.missing.record(E::NAME, bindings);
-        }
-        Ok(implementation)
+        Ok(implementation.unwrap_or_else(|| {
+            panic!(
+                "`{}` has no {} implementation, which the kernels crate's build rules out",
+                E::NAME,
+                self.device.backend().as_str()
+            )
+        }))
     }
 
-    /// Prepare an entry without tuning parameters. `None` when the backend
-    /// has no implementation (recorded).
+    /// Prepare an entry without tuning parameters; `None` during a census.
     pub fn fixed<E: Entry>(
         &mut self,
         bindings: &str,
@@ -97,9 +87,7 @@ impl<'a> Specializer<'a> {
         if self.census {
             return Ok(None);
         }
-        let Some(implementation) = self.implementation::<E>(bindings)? else {
-            return Ok(None);
-        };
+        let implementation = self.implementation::<E>(bindings)?;
         if !implementation.params.is_empty() {
             return Err(failure(
                 E::NAME,
@@ -115,8 +103,7 @@ impl<'a> Specializer<'a> {
 
     /// Prepare an entry through its tuning case: static values from the
     /// case, parameters tuned on the device when the implementation declares
-    /// any. `None` when the backend has no implementation (recorded), and
-    /// always during a tuning census, which forms nothing.
+    /// any. `None` during a tuning census, which forms nothing.
     pub fn tuned<T: EntryTuning>(
         &mut self,
         tuner: &mut Tuner<'_>,
@@ -124,9 +111,7 @@ impl<'a> Specializer<'a> {
     ) -> Result<Option<NativeKernel<T::Entry>>, CatalogFailure> {
         let entry = <T::Entry as Entry>::NAME;
         let bindings = case.bindings();
-        let Some(implementation) = self.implementation::<T::Entry>(&bindings)? else {
-            return Ok(None);
-        };
+        let implementation = self.implementation::<T::Entry>(&bindings)?;
         let values = tuner.statics(case)?;
         let fixed = statics(&implementation, entry, &bindings, &values)?;
         let specialization = if implementation.params.is_empty() {
@@ -140,11 +125,5 @@ impl<'a> Specializer<'a> {
         case.prepare(self.device, &specialization)
             .map(Some)
             .map_err(|error| failure(entry, &bindings, error.to_string()))
-    }
-
-    /// Fails with every required entry that lacks an implementation for
-    /// the backend.
-    pub fn finish(self) -> Result<(), CatalogFailure> {
-        self.missing.finish()
     }
 }

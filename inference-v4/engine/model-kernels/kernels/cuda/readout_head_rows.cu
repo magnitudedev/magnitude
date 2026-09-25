@@ -5,7 +5,7 @@
 // the A rows (`gemm_small` to 64 rows, `gemm` beyond; the 16-bit path: head
 // GEMMs are rare, so the INT8 candidate is not offered).
 #define KERNEL_W0 SEISMIC_WEIGHT
-#include "common/projection.cuh"
+#include "lib/projection/projection.cuh"
 
 using Pro = projection::Rms<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows>;
 using Source = projection::GemvSource<Pro>;

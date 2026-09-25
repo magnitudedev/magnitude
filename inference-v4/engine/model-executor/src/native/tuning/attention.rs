@@ -1,7 +1,7 @@
 //! Tuning cases of the gated attention block: the normed Q/K/V projection,
-//! the fused attention entries of each history codec (`qwen_attention_decode`
-//! and `qwen_attention_decode_k8v4` up to [`DECODE_ROWS`] rows,
-//! `qwen_attention_prefill` and `qwen_attention_prefill_k8v4` beyond) and the
+//! the fused attention entries of each history codec (`gated_attention_decode`
+//! and `gated_attention_decode_k8v4` up to [`DECODE_ROWS`] rows,
+//! `gated_attention_prefill` and `gated_attention_prefill_k8v4` beyond) and the
 //! output projection.
 //!
 //! Attention points cross the rows an entry serves with the served history
@@ -25,13 +25,13 @@ use crate::programs::graph::attention::{
 use crate::AttentionShape;
 use magnitude_model_contracts::{MixerGeometry, RotarySemantics, WeightKind, WeightScope};
 use magnitude_model_kernels::{
-    qwen_attention_decode, qwen_attention_decode_k8v4, attention_output,
-    qwen_attention_prefill, qwen_attention_prefill_k8v4, qwen_attention_project,
+    gated_attention_decode, gated_attention_decode_k8v4, attention_output,
+    gated_attention_prefill, gated_attention_prefill_k8v4, gated_attention_project,
 };
 use seismic::{Element, Tensor};
 use std::ops::Range;
 
-/// `qwen_attention_project`: RMS prologue, fused query+gate | key | value
+/// `gated_attention_project`: RMS prologue, fused query+gate | key | value
 /// projection.
 pub(crate) struct AttentionProjectTuning {
     pub norm: Element,
@@ -55,8 +55,8 @@ pub(crate) struct AttentionProjectCase {
 }
 
 impl AttentionProjectTuning {
-    fn elements(&self) -> qwen_attention_project::Elements {
-        qwen_attention_project::Elements {
+    fn elements(&self) -> gated_attention_project::Elements {
+        gated_attention_project::Elements {
             NW: self.norm,
             QW: self.query_gate,
             KW: self.key,
@@ -67,7 +67,7 @@ impl AttentionProjectTuning {
 }
 
 impl EntryTuning for AttentionProjectTuning {
-    type Entry = qwen_attention_project::Entry;
+    type Entry = gated_attention_project::Entry;
     type Case = AttentionProjectCase;
 
     fn bindings(&self) -> String {
@@ -128,8 +128,8 @@ impl EntryTuning for AttentionProjectTuning {
             .collect()
     }
 
-    fn args<'a>(case: &'a mut Self::Case) -> qwen_attention_project::Args<'a> {
-        qwen_attention_project::Args {
+    fn args<'a>(case: &'a mut Self::Case) -> gated_attention_project::Args<'a> {
+        gated_attention_project::Args {
             hidden: &case.hidden,
             input_norm: &case.input_norm,
             query_norm: &case.query_norm,
@@ -140,7 +140,7 @@ impl EntryTuning for AttentionProjectTuning {
         }
     }
 
-    generated_entry!(qwen_attention_project, this => this.elements());
+    generated_entry!(gated_attention_project, this => this.elements());
 }
 
 /// `attention_output`: output projection plus residual.
@@ -236,16 +236,16 @@ pub(crate) struct AttentionMix {
     pub epsilon: f32,
 }
 
-/// `qwen_attention_decode`, for row classes up to [`DECODE_ROWS`].
+/// `gated_attention_decode`, for row classes up to [`DECODE_ROWS`].
 pub(crate) struct AttentionDecodeTuning(pub AttentionMix);
 
-/// `qwen_attention_prefill`, for row classes beyond [`DECODE_ROWS`].
+/// `gated_attention_prefill`, for row classes beyond [`DECODE_ROWS`].
 pub(crate) struct AttentionPrefillTuning(pub AttentionMix);
 
-/// `qwen_attention_decode_k8v4`, for row classes up to [`DECODE_ROWS`].
+/// `gated_attention_decode_k8v4`, for row classes up to [`DECODE_ROWS`].
 pub(crate) struct AttentionDecodeK8V4Tuning(pub AttentionMix);
 
-/// `qwen_attention_prefill_k8v4`, for row classes beyond [`DECODE_ROWS`].
+/// `gated_attention_prefill_k8v4`, for row classes beyond [`DECODE_ROWS`].
 pub(crate) struct AttentionPrefillK8V4Tuning(pub AttentionMix);
 
 /// One argument set of a fused entry: the inputs every codec shares, and the
@@ -616,7 +616,7 @@ macro_rules! mix_entry {
 
 mix_entry!(
     AttentionDecodeTuning,
-    qwen_attention_decode,
+    gated_attention_decode,
     DenseMixHistory,
     |rows| rows <= DECODE_ROWS,
     |case| {
@@ -626,7 +626,7 @@ mix_entry!(
 );
 mix_entry!(
     AttentionPrefillTuning,
-    qwen_attention_prefill,
+    gated_attention_prefill,
     DenseMixHistory,
     |rows| rows > DECODE_ROWS,
     |case| {
@@ -636,7 +636,7 @@ mix_entry!(
 );
 mix_entry!(
     AttentionDecodeK8V4Tuning,
-    qwen_attention_decode_k8v4,
+    gated_attention_decode_k8v4,
     AffineMixHistory,
     |rows| rows <= DECODE_ROWS,
     |case| {
@@ -648,7 +648,7 @@ mix_entry!(
 );
 mix_entry!(
     AttentionPrefillK8V4Tuning,
-    qwen_attention_prefill_k8v4,
+    gated_attention_prefill_k8v4,
     AffineMixHistory,
     |rows| rows > DECODE_ROWS,
     |case| {

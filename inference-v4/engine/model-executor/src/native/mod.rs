@@ -42,13 +42,13 @@ use crate::{
     ProgramPlan, RecurrentBinding, RoutedBinding,
 };
 use magnitude_model_kernels::{
-    copy_rows, head_logits_rows, import_dense, qwen_attention_decode, qwen_attention_decode_k8v4,
-    attention_output, qwen_attention_prefill, qwen_attention_prefill_k8v4,
-    qwen_attention_project,
-    conditioning_overlay, qwen_dense_expand, qwen_dense_output, qwen_draft_rows,
-    embedding_rows, readout_features_rows, readout_head_rows, qwen_recurrent_chunk, qwen_recurrent_output,
-    qwen_recurrent_project, qwen_recurrent_step, qwen_routed_combine, qwen_routed_expand,
-    qwen_routed_experts, qwen_routed_group, qwen_routed_output, qwen_routed_route,
+    copy_rows, head_logits_rows, import_dense, gated_attention_decode, gated_attention_decode_k8v4,
+    attention_output, gated_attention_prefill, gated_attention_prefill_k8v4,
+    gated_attention_project,
+    conditioning_overlay, dense_expand, dense_output, draft_rows,
+    embedding_rows, readout_features_rows, readout_head_rows, gated_delta_chunk, gated_delta_output,
+    gated_delta_project, gated_delta_step, routed_combine, routed_expand,
+    routed_experts, routed_group, routed_output, routed_route,
     readout_selected_rows, qwen_vision_block, qwen_vision_merger, qwen_vision_stem, repack_weight, sample_rows, shape_rows,
 };
 use seismic::{BackendName, DType, Device, Element, NativeKernel, Tensor};
@@ -73,18 +73,8 @@ impl CatalogError {
     }
 }
 
-/// An entry the program plan requires that has no native implementation
-/// for the opened device's backend.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MissingImplementation {
-    pub entry: &'static str,
-    pub bindings: String,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CatalogFailure {
-    /// Every required entry without an implementation for the backend.
-    MissingImplementations(Vec<MissingImplementation>),
     Preparation {
         entry: &'static str,
         bindings: String,
@@ -107,28 +97,6 @@ impl fmt::Display for CatalogError {
         let path = self.path;
         let backend = self.backend.as_str();
         match &self.failure {
-            CatalogFailure::MissingImplementations(missing) => {
-                let mut entries: Vec<(&str, usize)> = Vec::new();
-                for missing in missing {
-                    match entries.iter_mut().find(|(entry, _)| *entry == missing.entry) {
-                        Some((_, bindings)) => *bindings += 1,
-                        None => entries.push((missing.entry, 1)),
-                    }
-                }
-                write!(
-                    formatter,
-                    "execution path {path} on {backend}: {} required entries have no {backend} implementation: {}",
-                    entries.len(),
-                    entries
-                        .iter()
-                        .map(|(entry, bindings)| match bindings {
-                            1 => (*entry).to_owned(),
-                            count => format!("{entry} ({count} element bindings)"),
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            }
             CatalogFailure::Preparation {
                 entry,
                 bindings,
@@ -240,9 +208,9 @@ mod qualification_tests {
                 .default_specialization(statics)
                 .unwrap()
         }
-        qwen_recurrent_project::native_for_device_with(
+        gated_delta_project::native_for_device_with(
             &device,
-            qwen_recurrent_project::Elements {
+            gated_delta_project::Elements {
                 NW: binding.norm,
                 QW: binding.qkv,
                 GW: binding.gate,
@@ -250,35 +218,35 @@ mod qualification_tests {
                 BW: binding.beta,
                 A: binding.activation,
             },
-            &defaults::<qwen_recurrent_project::Entry>(&device, &projections),
+            &defaults::<gated_delta_project::Entry>(&device, &projections),
         )
         .unwrap();
-        let step = defaults::<qwen_recurrent_step::Entry>(&device, &statics);
-        qwen_recurrent_step::native_for_device_with(
+        let step = defaults::<gated_delta_step::Entry>(&device, &statics);
+        gated_delta_step::native_for_device_with(
             &device,
-            qwen_recurrent_step::Elements {
+            gated_delta_step::Elements {
                 A: binding.activation,
             },
             &step,
         )
         .unwrap();
-        let chunk = defaults::<qwen_recurrent_chunk::Entry>(&device, &statics);
-        qwen_recurrent_chunk::native_for_device_with(
+        let chunk = defaults::<gated_delta_chunk::Entry>(&device, &statics);
+        gated_delta_chunk::native_for_device_with(
             &device,
-            qwen_recurrent_chunk::Elements {
+            gated_delta_chunk::Elements {
                 A: binding.activation,
             },
             &chunk,
         )
         .unwrap();
-        qwen_recurrent_output::native_for_device_with(
+        gated_delta_output::native_for_device_with(
             &device,
-            qwen_recurrent_output::Elements {
+            gated_delta_output::Elements {
                 RN: binding.recurrent_norm,
                 OW: binding.output,
                 A: binding.activation,
             },
-            &defaults::<qwen_recurrent_output::Entry>(&device, &projections),
+            &defaults::<gated_delta_output::Entry>(&device, &projections),
         )
         .unwrap();
     }

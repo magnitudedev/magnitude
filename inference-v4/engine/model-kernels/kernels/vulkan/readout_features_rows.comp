@@ -1,8 +1,8 @@
 // readout_features_rows: the final RMS normalization of the `out_rows` hidden
 // rows, published in the activation type. One workgroup per output row. The
 // Vulkan form of `metal/readout_features_rows.metal`.
-#include "common/activation.glsl"
-#include "common/projection.glsl"
+#include "lib/core/activation.glsl"
+#include "lib/projection/projection.glsl"
 
 #if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
 #define FEATURES_ACT ELEMENT_ACT

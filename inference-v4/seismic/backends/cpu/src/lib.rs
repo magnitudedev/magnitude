@@ -4,10 +4,12 @@
 //! that runs the core-owned command vocabulary over host buffers and the
 //! worker pool.
 //!
-//! Execution model. A launch is a grid of workgroups. The worker pool is
-//! split into teams of `workgroup threads` workers (the profile bounds a
-//! workgroup by the worker count); each team claims workgroups from a
-//! shared counter and its members run one thread of the workgroup each.
+//! Execution model. A launch is a grid of workgroups. The worker pool (one
+//! participant per physical performance core, the submitting thread
+//! included) is split into teams of `workgroup threads` participants (the
+//! profile bounds a workgroup by the participant count); each team claims
+//! workgroups from a shared counter and its members run one thread of the
+//! workgroup each.
 //! A workgroup barrier is a team barrier; workgroup storage is a per-team
 //! scratch and participant storage is a per-worker scratch, both bounded
 //! by the documented scratch policy in the profile. A one-thread workgroup
@@ -43,7 +45,7 @@ pub use profile::{
     HostFacts, HostKernelAbi, ScratchPolicy, SimdTier, BACKEND_REVISION, MAX_ALLOCATION_BYTES,
 };
 pub use registry::registry;
-pub use workers::Workers;
+pub use workers::{NativeStep, NativeSteps, Workers};
 
 use seismic_ir::physical_target::IntrinsicIdentityBuilder;
 use seismic_lang::registry::BackendName;

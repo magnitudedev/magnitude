@@ -118,7 +118,7 @@ mod weights;
 pub(crate) use weights::TuningWeights;
 pub use weights::{TuningWeightSource, ZeroTuningWeights};
 
-use super::{CatalogFailure, MissingImplementation};
+use super::CatalogFailure;
 use crate::kernel_cache::{KernelCache, TuningCacheKey};
 use magnitude_model_batching::{Demand, PackedRowTables, Row, Slot};
 use magnitude_model_contracts::{ModelDefinition, WeightKind, WeightScope};
@@ -1150,34 +1150,6 @@ fn tuned_entry(
         }),
         seconds: began.elapsed().as_secs_f64(),
         time,
-    }
-}
-
-/// Collects every required entry that lacks an implementation for the
-/// backend, so preparation reports all of them at once.
-#[derive(Default)]
-pub(crate) struct MissingImplementations(Vec<MissingImplementation>);
-
-impl MissingImplementations {
-    pub fn record(&mut self, entry: &'static str, bindings: &str) {
-        if !self
-            .0
-            .iter()
-            .any(|missing| missing.entry == entry && missing.bindings == bindings)
-        {
-            self.0.push(MissingImplementation {
-                entry,
-                bindings: bindings.to_owned(),
-            });
-        }
-    }
-
-    pub fn finish(self) -> Result<(), CatalogFailure> {
-        if self.0.is_empty() {
-            Ok(())
-        } else {
-            Err(CatalogFailure::MissingImplementations(self.0))
-        }
     }
 }
 

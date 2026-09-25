@@ -29,9 +29,9 @@
 #
 # Mixed output contract: `mixed[M, NV, W] A` holds the raw recurrent output
 # `S q` per row and value head, rounded to A; rows outside every slot are
-# zero. The gated per-head RMS * SiLU(z) belongs to `qwen_recurrent_output`.
+# zero. The gated per-head RMS * SiLU(z) belongs to `gated_delta_output`.
 
-fn qwen_recurrent_project[M, H, NK, NV, W](hidden: &tensor[M, H] f32,
+fn gated_delta_project[M, H, NK, NV, W](hidden: &tensor[M, H] f32,
     input_norm: &tensor[H] NW, qkv_weight: &tensor[(2 * NK + NV) * W, H] QW,
     gate_weight: &tensor[NV * W, H] GW, alpha_weight: &tensor[NV, H] AW,
     beta_weight: &tensor[NV, H] BW, epsilon: f32)
@@ -72,31 +72,31 @@ fn qwen_recurrent_project[M, H, NK, NV, W](hidden: &tensor[M, H] f32,
 # (17..64 rows at the fixed small-row geometry `_gemm_small`, 32 x 64 tiles;
 # beyond over tuned TILE_M x TILE_N tiles).
 # (CUDA: GEMV to 16 rows, no batched class, GEMM row bands; see below.)
-native qwen_recurrent_project for metal from "metal/qwen_recurrent_project.metal":
+native gated_delta_project for metal from "metal/gated_delta_project.metal":
     static (H, NK, NV, W)
     params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
             arithmetic BATCH_FROM in [5, 3, 9], BATCH_SIMDGROUPS in [8, 4, 16, 32], BATCH_ROWS in [2, 1, 4],
             TILE_M in [64, 128, 32], TILE_N in [64, 128])
     scratch normalized bytes (M * H * 2) when M > 16
-    launch qwen_recurrent_project_stage when M > 16:
+    launch gated_delta_project_stage when M > 16:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_recurrent_project_gemv when M < BATCH_FROM:
+    launch gated_delta_project_gemv when M < BATCH_FROM:
         threadgroups (ceil_div((2 * NK + NV) * W, SIMDGROUPS * ROWS * 32 / LANES)
             + ceil_div(NV * W, SIMDGROUPS * ROWS * 32 / LANES)
             + 2 * ceil_div(NV, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
-    launch qwen_recurrent_project_batch when M >= BATCH_FROM and M <= 16:
+    launch gated_delta_project_batch when M >= BATCH_FROM and M <= 16:
         threadgroups (ceil_div((2 * NK + NV) * W, BATCH_SIMDGROUPS * BATCH_ROWS * 8)
             + ceil_div(NV * W, BATCH_SIMDGROUPS * BATCH_ROWS * 8) + 2 * ceil_div(NV, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
         threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
         shared_bytes (16640)
-    launch qwen_recurrent_project_gemm_small when M > 16 and M <= 64:
+    launch gated_delta_project_gemm_small when M > 16 and M <= 64:
         threadgroups (ceil_div((2 * NK + NV) * W, 64)
             + ceil_div(NV * W, 64) + 2 * ceil_div(NV, 64), ceil_div(M, 32), 1)
         threads_per_threadgroup (128, 1, 1)
-    launch qwen_recurrent_project_gemm when M > 64:
+    launch gated_delta_project_gemm when M > 64:
         threadgroups (ceil_div((2 * NK + NV) * W, TILE_N)
             + ceil_div(NV * W, TILE_N) + 2 * ceil_div(NV, TILE_N), ceil_div(M, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
@@ -106,33 +106,33 @@ native qwen_recurrent_project for metal from "metal/qwen_recurrent_project.metal
 # (`gemm_small` to 64 rows with the INT8 candidate, `gemm` beyond; see
 # `cuda_dense.seismic`); `stage` forms the A rows for M > 1, `stage_s8` the
 # q8_1 rows for the INT8 GEMM. (Metal: batched GEMV class, no INT8 path.)
-native qwen_recurrent_project for cuda from "cuda/qwen_recurrent_project.cu":
+native gated_delta_project for cuda from "cuda/gated_delta_project.cu":
     static (H, NK, NV, W)
     params (arithmetic KSPLIT in [4, 2, 8], arithmetic INT8 in [0, 1])
     where H % 64 == 0
     scratch staged bytes (M * H * 2) when M > 1
     scratch groups bytes (M * H / 4) when INT8 == 1 and M > 16 and M <= 64
-    launch qwen_recurrent_project_stage when M > 1 and (M <= 16 or M > 64 or INT8 == 0):
+    launch gated_delta_project_stage when M > 1 and (M <= 16 or M > 64 or INT8 == 0):
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_recurrent_project_stage_s8 when INT8 == 1 and M > 16 and M <= 64:
+    launch gated_delta_project_stage_s8 when INT8 == 1 and M > 16 and M <= 64:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_recurrent_project_gemv when M <= 8:
+    launch gated_delta_project_gemv when M <= 8:
         threadgroups (ceil_div(ceil_div((2 * NK + NV) * W, 16)
             + ceil_div(NV * W, 16) + 2 * ceil_div(NV, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes ((1 - min(1, M - 1)) * H * 2)
-    launch qwen_recurrent_project_gemv16 when M > 8 and M <= 16:
+    launch gated_delta_project_gemv16 when M > 8 and M <= 16:
         threadgroups (ceil_div(ceil_div((2 * NK + NV) * W, 16)
             + ceil_div(NV * W, 16) + 2 * ceil_div(NV, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_recurrent_project_gemm_small when M > 16 and M <= 64:
+    launch gated_delta_project_gemm_small when M > 16 and M <= 64:
         threadgroups (ceil_div(ceil_div((2 * NK + NV) * W, 16), 8)
             + ceil_div(ceil_div(NV * W, 16), 8) + 2 * ceil_div(ceil_div(NV, 16), 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (64 * 144 + 10240) + 2048)
-    launch qwen_recurrent_project_gemm when M > 64:
+    launch gated_delta_project_gemm when M > 64:
         threadgroups (ceil_div(ceil_div((2 * NK + NV) * W, 16), 8)
             + ceil_div(ceil_div(NV * W, 16), 8) + 2 * ceil_div(ceil_div(NV, 16), 8), ceil_div(M, 128), 1)
         threads_per_threadgroup (256, 1, 1)
@@ -145,27 +145,43 @@ native qwen_recurrent_project for cuda from "cuda/qwen_recurrent_project.cu":
 # stage launch writing the normalized rows to scratch, then the GEMM over
 # TILE_M x TILE_N tiles (cooperative-matrix f16 multiplies under
 # SEISMIC_HAS_MATRIX, F32 FMAs otherwise).
-native qwen_recurrent_project for vulkan from "vulkan/qwen_recurrent_project.comp":
+native gated_delta_project for vulkan from "vulkan/gated_delta_project.comp":
     static (H, NK, NV, W)
     params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
             TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
     where SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch normalized bytes (M * H * 2) when M > 8
-    launch qwen_recurrent_project_stage when M > 8:
+    launch gated_delta_project_stage when M > 8:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (128)
-    launch qwen_recurrent_project_gemv when M <= 8:
+    launch gated_delta_project_gemv when M <= 8:
         threadgroups (ceil_div((2 * NK + NV) * W, SIMDGROUPS * ROWS * 32 / LANES)
             + ceil_div(NV * W, SIMDGROUPS * ROWS * 32 / LANES)
             + 2 * ceil_div(NV, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (256 + min(8 * ceil_div(H, 32), 288) * 72)
-    launch qwen_recurrent_project_gemm when M > 8:
+    launch gated_delta_project_gemm when M > 8:
         threadgroups (ceil_div((2 * NK + NV) * W, TILE_N) + ceil_div(NV * W, TILE_N) + 2 * ceil_div(NV, TILE_N),
             ceil_div(M, TILE_M), 1)
         threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
         shared_bytes ((TILE_M + TILE_N) * 80)
+
+# CPU: the CPU projection library (`cpu/lib/projection/projection.rs`). A
+# normalize launch writes each normalized row as F32 to scratch; the row
+# launch enumerates the segments qkv | z | alpha | beta, ROWS weight rows per
+# work item, projected against every normalized row.
+native gated_delta_project for cpu from "cpu/gated_delta_project.rs":
+    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    scratch quantized bytes (M * ceil_div(H, 256) * 292)
+    scratch normalized bytes (M * H * 4)
+    launch gated_delta_project_normalize:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (H * 4)
+    launch gated_delta_project_rows:
+        threadgroups (ceil_div((2 * NK + NV) * W, ROWS) + ceil_div(NV * W, ROWS) + 2 * ceil_div(NV, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
 
 
 # The sequential semantic oracle shared by both state entries. Per slot, rows
@@ -299,7 +315,7 @@ fn gated_delta_rows[M, B, S, NK, NV, W, C, T](
 # a block of rows in threadgroup memory, then each of its four simdgroups
 # advances ROWS / 4 state rows, W / 32 columns per lane. `ROWS` never changes
 # result bits.
-fn qwen_recurrent_step[M, B, S, NK, NV, W, C, T](
+fn gated_delta_step[M, B, S, NK, NV, W, C, T](
     projection: &tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A,
     convolution: &tensor[(2 * NK + NV) * W, C] f32,
     rate: &tensor[NV] f32, time_bias: &tensor[NV] f32,
@@ -312,11 +328,11 @@ fn qwen_recurrent_step[M, B, S, NK, NV, W, C, T](
     return gated_delta_rows(projection, convolution, rate, time_bias, segments, stop,
         previous_bank, previous_tape, following_bank, window, delta, tape, norm_epsilon, grouped)
 
-native qwen_recurrent_step for metal from "metal/qwen_recurrent_step.metal":
+native gated_delta_step for metal from "metal/gated_delta_step.metal":
     static (NK, NV, W, C)
     params (ROWS in [32, 16, 64])
     where W % 32 == 0 and W <= 1024 and ROWS <= W and W % ROWS == 0
-    launch qwen_recurrent_step:
+    launch gated_delta_step:
         threadgroups (NV, W / ROWS, B)
         threads_per_threadgroup (128, 1, 1)
 
@@ -324,11 +340,11 @@ native qwen_recurrent_step for metal from "metal/qwen_recurrent_step.metal":
 # columns per lane) for the whole slot; grid z adds one layer that zeroes the
 # mixed rows no slot covers. (Metal: lanes advance four rows in flight; the
 # uncovered rows are zeroed by the slot layer.)
-native qwen_recurrent_step for cuda from "cuda/qwen_recurrent_step.cu":
+native gated_delta_step for cuda from "cuda/gated_delta_step.cu":
     static (NK, NV, W, C)
     params (ROWS in [2, 4], WARPS in [4, 8])
     where W % 32 == 0 and W % (ROWS * WARPS) == 0
-    launch qwen_recurrent_step:
+    launch gated_delta_step:
         threadgroups (NV, W / (ROWS * WARPS), B + 1)
         threads_per_threadgroup (WARPS * 32, 1, 1)
 
@@ -336,18 +352,29 @@ native qwen_recurrent_step for cuda from "cuda/qwen_recurrent_step.cu":
 # z = B zeroes the mixed rows no slot covers; each subgroup holds ROWS state
 # rows in registers for the whole slot. ROWS and WARPS never change result
 # bits. Shared: a span's prepared q | k | v channels and gates.
-native qwen_recurrent_step for vulkan from "vulkan/qwen_recurrent_step.comp":
+native gated_delta_step for vulkan from "vulkan/gated_delta_step.comp":
     static (NK, NV, W, C)
     params (ROWS in [2, 4], WARPS in [4, 8])
     where W % 32 == 0 and W % (ROWS * WARPS) == 0 and C <= 8
-    launch qwen_recurrent_step:
+    launch gated_delta_step:
         threadgroups (NV, W / (ROWS * WARPS), B + 1)
         threads_per_threadgroup (WARPS * 32, 1, 1)
         shared_bytes ((8 * (2 * W + ROWS * WARPS) + 16) * 4)
 
+# CPU: a work item per (value head, ROWS state rows, slot) holds its state
+# rows privately for the whole slot and computes each row's prologue itself;
+# grid z = B zeroes the mixed rows no slot covers. ROWS never changes result
+# bits. Private bytes: the state rows, the key head's q and k, the rows' v.
+native gated_delta_step for cpu from "cpu/gated_delta_step.rs":
+    params (ROWS in [32, 16, 64, 128])
+    launch gated_delta_step:
+        threadgroups (NV, ceil_div(W, ROWS), B + 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes ((min(ROWS, W) * W + 2 * W + min(ROWS, W)) * 4)
+
 
 # Chunked state advance for large row classes: the same contract as
-# `qwen_recurrent_step`, computed in the WY form over pieces of at most 8 rows
+# `gated_delta_step`, computed in the WY form over pieces of at most 8 rows
 # (a piece boundary at the stop row). The inputs launch convolves each row of
 # every slot once into the `inputs` scratch (L2-normalized q and k, v, log
 # decay and beta). In the scan launch a threadgroup owns (`ROWS` state rows,
@@ -357,11 +384,11 @@ native qwen_recurrent_step for vulkan from "vulkan/qwen_recurrent_step.comp":
 # with A_ij = beta_i (gamma_i / gamma_j) k_i . k_j (j < i), outputs
 # diag(gamma) Y + (QK^T o D) U, S <- gamma_last S + U^T diag(gamma_last / gamma) K.
 # Slots of at most 16 rows (MTP verify) are not chunked: the scan advances them
-# row-sequentially with `qwen_recurrent_step`'s bits; in a longer slot only
+# row-sequentially with `gated_delta_step`'s bits; in a longer slot only
 # the rows before `stop` are chunked and the rows after it (whose innovations
 # feed the tape) advance row-sequentially from the published state. `ROWS`
 # never changes result bits.
-fn qwen_recurrent_chunk[M, B, S, NK, NV, W, C, T](
+fn gated_delta_chunk[M, B, S, NK, NV, W, C, T](
     projection: &tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A,
     convolution: &tensor[(2 * NK + NV) * W, C] f32,
     rate: &tensor[NV] f32, time_bias: &tensor[NV] f32,
@@ -377,15 +404,15 @@ fn qwen_recurrent_chunk[M, B, S, NK, NV, W, C, T](
 # Metal: `inputs` convolves every row once into scratch, and the scan builds
 # each piece's system in threadgroup memory. (CUDA: `prepare` convolves and
 # forms the systems on tensor cores, then the scan.)
-native qwen_recurrent_chunk for metal from "metal/qwen_recurrent_chunk.metal":
+native gated_delta_chunk for metal from "metal/gated_delta_chunk.metal":
     static (NK, NV, W, C)
     params (ROWS in [128, 64, 32])
     where W % 32 == 0 and W <= 256 and W % ROWS == 0
     scratch inputs bytes (M * ((2 * NK + NV) * W + 2 * NV) * 4)
-    launch qwen_recurrent_chunk_inputs:
+    launch gated_delta_chunk_inputs:
         threadgroups (M, ceil_div(2 * NK + NV, 4), 1)
         threads_per_threadgroup (128, 1, 1)
-    launch qwen_recurrent_chunk_scan:
+    launch gated_delta_chunk_scan:
         threadgroups (W / ROWS, NV, B)
         threads_per_threadgroup (2 * ROWS, 1, 1)
 
@@ -397,15 +424,15 @@ native qwen_recurrent_chunk for metal from "metal/qwen_recurrent_chunk.metal":
 # at most 16 rows have no pieces, and the rows after a stop row none either:
 # they advance row-sequentially in the scan with the step's bits. (Metal: an
 # `inputs` convolution launch; the systems are built in its scan.)
-native qwen_recurrent_chunk for cuda from "cuda/qwen_recurrent_chunk.cu":
+native gated_delta_chunk for cuda from "cuda/gated_delta_chunk.cu":
     static (NK, NV, W, C)
     params (ROWS in [128, 64, 32])
     where W % 32 == 0 and W <= 256 and W % ROWS == 0 and NV % NK == 0 and 8 % (2 + NV / NK) == 0
     scratch pieces bytes ((ceil_div(M, 16) + B) * (NK * 96 * W + NV * (32 * W + 1168)))
-    launch qwen_recurrent_chunk_prepare:
+    launch gated_delta_chunk_prepare:
         threadgroups (ceil_div(M, 16) + B, NK, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_recurrent_chunk_scan:
+    launch gated_delta_chunk_scan:
         threadgroups (W / ROWS, NV, B + 1)
         threads_per_threadgroup (2 * ROWS, 1, 1)
         shared_bytes (3 * (96 * W + 32 * ROWS + 1680) + ROWS / 16 * 16 * 17 * 4)
@@ -416,24 +443,41 @@ native qwen_recurrent_chunk for cuda from "cuda/qwen_recurrent_chunk.cu":
 # short per-lane chains and a group butterfly. Slots of at most 16 rows (MTP
 # verify) and zero-stop slots get the step's bits; the rows after a stop row
 # advance row-sequentially from the published state.
-native qwen_recurrent_chunk for vulkan from "vulkan/qwen_recurrent_chunk.comp":
+native gated_delta_chunk for vulkan from "vulkan/gated_delta_chunk.comp":
     static (NK, NV, W, C)
     params (ROWS in [4, 2], WARPS in [8, 4])
     where W % 32 == 0 and W % (ROWS * WARPS) == 0 and C <= 8
     scratch inputs bytes (M * ((2 * NK + NV) * W + 2 * NV) * 4)
-    launch qwen_recurrent_chunk_inputs:
+    launch gated_delta_chunk_inputs:
         threadgroups (M, ceil_div(2 * NK + NV, 4), 1)
         threads_per_threadgroup (128, 1, 1)
-    launch qwen_recurrent_chunk_scan:
+    launch gated_delta_chunk_scan:
         threadgroups (NV, W / (ROWS * WARPS), B + 1)
         threads_per_threadgroup (WARPS * 32, 1, 1)
         shared_bytes ((8 * (2 * W + ROWS * WARPS) + 16) * 4)
+
+# CPU: `inputs` convolves and normalizes each slot row once into scratch (one
+# work item per row), with the step's arithmetic; the scan advances every
+# slot row-sequentially from the staged rows, a work item per (value head,
+# ROWS state rows, slot) with private state rows, so every slot gets the
+# step's bits (no WY form: on the CPU the sequential rule is the cheaper
+# schedule). Grid z = B zeroes the mixed rows no slot covers.
+native gated_delta_chunk for cpu from "cpu/gated_delta_chunk.rs":
+    params (ROWS in [64, 32, 128])
+    scratch inputs bytes (M * ((2 * NK + NV) * W + 2 * NV) * 4)
+    launch gated_delta_chunk_inputs:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch gated_delta_chunk_scan:
+        threadgroups (NV, ceil_div(W, ROWS), B + 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (min(ROWS, W) * W * 4)
 
 
 # Gated output projection: per row and value head, the mixed values are
 # RMS-normalized over W and scaled by the recurrent norm, gated by SiLU(z),
 # projected, and added to the residual.
-fn qwen_recurrent_output[M, H, NK, NV, W](hidden: &tensor[M, H] f32,
+fn gated_delta_output[M, H, NK, NV, W](hidden: &tensor[M, H] f32,
     mixed: &tensor[M, NV, W] A,
     projection: &tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A,
     recurrent_norm: &tensor[W] RN, output_weight: &tensor[H, NV * W] OW,
@@ -478,7 +522,7 @@ fn qwen_recurrent_output[M, H, NK, NV, W](hidden: &tensor[M, H] f32,
 # rows at the fixed small-row geometry (`_gemm_small`: 32 x 64 tiles, 4-way
 # split-K summed by `finalize_small`), beyond over tuned tiles with SPLIT-way
 # split-K summed by `finalize`. (CUDA: GEMV to 8 rows, INT8 candidate.)
-native qwen_recurrent_output for metal from "metal/qwen_recurrent_output.metal":
+native gated_delta_output for metal from "metal/gated_delta_output.metal":
     static (H, NK, NV, W)
     params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
             arithmetic BATCH_FROM in [5, 3, 9], BATCH_SIMDGROUPS in [8, 4, 16, 32], BATCH_ROWS in [2, 1, 4],
@@ -486,27 +530,27 @@ native qwen_recurrent_output for metal from "metal/qwen_recurrent_output.metal":
     scratch normalized bytes (M * NV * W * 2) when M > 16
     scratch partials bytes (SPLIT * M * H * 4) when M > 64 and SPLIT > 1
     scratch small_partials bytes (4 * M * H * 4) when M > 16 and M <= 64
-    launch qwen_recurrent_output_stage when M > 16:
+    launch gated_delta_output_stage when M > 16:
         threadgroups (M * NV, 1, 1)
         threads_per_threadgroup (32, 1, 1)
-    launch qwen_recurrent_output_gemv when M < BATCH_FROM:
+    launch gated_delta_output_gemv when M < BATCH_FROM:
         threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(NV * W, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
-    launch qwen_recurrent_output_batch when M >= BATCH_FROM and M <= 16:
+    launch gated_delta_output_batch when M >= BATCH_FROM and M <= 16:
         threadgroups (ceil_div(H, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
         threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
         shared_bytes (16640)
-    launch qwen_recurrent_output_gemm_small when M > 16 and M <= 64:
+    launch gated_delta_output_gemm_small when M > 16 and M <= 64:
         threadgroups (ceil_div(H, 64), ceil_div(M, 32), 4)
         threads_per_threadgroup (128, 1, 1)
-    launch qwen_recurrent_output_finalize_small when M > 16 and M <= 64:
+    launch gated_delta_output_finalize_small when M > 16 and M <= 64:
         threadgroups (ceil_div(M * H, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_recurrent_output_gemm when M > 64:
+    launch gated_delta_output_gemm when M > 64:
         threadgroups (ceil_div(H, TILE_N), ceil_div(M, TILE_M), SPLIT)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
-    launch qwen_recurrent_output_finalize when M > 64 and SPLIT > 1:
+    launch gated_delta_output_finalize when M > 64 and SPLIT > 1:
         threadgroups (ceil_div(M * H, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
@@ -516,43 +560,43 @@ native qwen_recurrent_output for metal from "metal/qwen_recurrent_output.metal":
 # or q8_1 from `stage_s8` for the INT8 candidate), `gemm` beyond (A), both
 # split over K into 2 shares summed by `finalize` up to 128 rows (see
 # `cuda_dense.seismic`). (Metal: batched GEMV class, no INT8 path.)
-native qwen_recurrent_output for cuda from "cuda/qwen_recurrent_output.cu":
+native gated_delta_output for cuda from "cuda/gated_delta_output.cu":
     static (H, NK, NV, W)
     params (arithmetic KSPLIT in [4, 2, 8], arithmetic INT8 in [0, 1])
     where NV * W % 64 == 0
     scratch staged bytes (M * NV * W * 2) when M > 1
     scratch groups bytes (M * NV * W / 4) when INT8 == 1 and M > 16 and M <= 64
     scratch partials bytes (2 * M * H * 4) when M > 16 and M <= 128
-    launch qwen_recurrent_output_stage when M > 1 and (M <= 16 or M > 64 or INT8 == 0):
+    launch gated_delta_output_stage when M > 1 and (M <= 16 or M > 64 or INT8 == 0):
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_recurrent_output_stage_s8 when INT8 == 1 and M > 16 and M <= 64:
+    launch gated_delta_output_stage_s8 when INT8 == 1 and M > 16 and M <= 64:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_recurrent_output_gemv when M <= 8:
+    launch gated_delta_output_gemv when M <= 8:
         threadgroups (ceil_div(ceil_div(H, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes ((1 - min(1, M - 1)) * NV * W * 2)
-    launch qwen_recurrent_output_gemv16 when M > 8 and M <= 16:
+    launch gated_delta_output_gemv16 when M > 8 and M <= 16:
         threadgroups (ceil_div(ceil_div(H, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_recurrent_output_gemm_small when M > 16 and M <= 64:
+    launch gated_delta_output_gemm_small when M > 16 and M <= 64:
         threadgroups (ceil_div(ceil_div(H, 16), 8), 1, 1 + min(1, 128 / M))
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (64 * 144 + 10240) + 2048)
-    launch qwen_recurrent_output_gemm when M > 64:
+    launch gated_delta_output_gemm when M > 64:
         threadgroups (ceil_div(ceil_div(H, 16), 8), ceil_div(M, 128), 1 + min(1, 128 / M))
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (2 * (128 * 144 + 10240) + 2048)
-    launch qwen_recurrent_output_finalize when M > 16 and M <= 128:
+    launch gated_delta_output_finalize when M > 16 and M <= 128:
         threadgroups (ceil_div(M * H, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# Vulkan: the K1 projection (see `qwen_recurrent_project`). The GEMV class
+# Vulkan: the K1 projection (see `gated_delta_project`). The GEMV class
 # reduces each head's gated norm across the lanes that stage it; the GEMM
 # class's stage launch runs one subgroup per (head, row), and the down GEMM
 # may split K (SPLIT parts, then an in-order finalize).
-native qwen_recurrent_output for vulkan from "vulkan/qwen_recurrent_output.comp":
+native gated_delta_output for vulkan from "vulkan/gated_delta_output.comp":
     static (H, NK, NV, W)
     params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
             TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64],
@@ -560,18 +604,34 @@ native qwen_recurrent_output for vulkan from "vulkan/qwen_recurrent_output.comp"
     where SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch normalized bytes (M * NV * W * 2) when M > 8
     scratch partials bytes (SPLIT * M * H * 4) when M > 8 and SPLIT > 1
-    launch qwen_recurrent_output_stage when M > 8:
+    launch gated_delta_output_stage when M > 8:
         threadgroups (NV, M, 1)
         threads_per_threadgroup (32, 1, 1)
         shared_bytes (128)
-    launch qwen_recurrent_output_gemv when M <= 8:
+    launch gated_delta_output_gemv when M <= 8:
         threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (256 + min(8 * ceil_div(NV * W, 32), 288) * 72)
-    launch qwen_recurrent_output_gemm when M > 8:
+    launch gated_delta_output_gemm when M > 8:
         threadgroups (ceil_div(H, TILE_N), ceil_div(M, TILE_M), SPLIT)
         threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
         shared_bytes ((TILE_M + TILE_N) * 80)
-    launch qwen_recurrent_output_finalize when M > 8 and SPLIT > 1:
+    launch gated_delta_output_finalize when M > 8 and SPLIT > 1:
         threadgroups (ceil_div(M * H, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
+
+# CPU: the CPU projection library (`cpu/lib/projection/projection.rs`). A
+# stage launch writes each row's gated per-head RMS·SiLU(z) prologue as F32 to
+# scratch; the row launch gives each work item ROWS output weight rows,
+# projected against every staged row and added to the hidden row.
+native gated_delta_output for cpu from "cpu/gated_delta_output.rs":
+    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    scratch quantized bytes (M * ceil_div(NV * W, 256) * 292)
+    scratch staged bytes (M * NV * W * 4)
+    launch gated_delta_output_stage:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (W * 8)
+    launch gated_delta_output_rows:
+        threadgroups (ceil_div(H, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)

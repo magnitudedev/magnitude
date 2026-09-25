@@ -5,7 +5,7 @@
 //     that weight row once per feature row (mma16 lane chunks) and sums the
 //     products in a fixed thread order.
 #define KERNEL_W0 SEISMIC_WEIGHT
-#include "common/projection.cuh"
+#include "lib/projection/projection.cuh"
 
 extern "C" __global__ void readout_selected_rows_stage(SEISMIC_KERNEL_PARAMS) {
     using Pro = projection::Rms<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows>;

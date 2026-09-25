@@ -169,7 +169,7 @@ impl<'a> QualificationView<'a> {
             )?;
             let projection = kernels
                 .project
-                .call(qwen_recurrent_project::Args {
+                .call(gated_delta_project::Args {
                     hidden: &hidden_residual,
                     input_norm: &norm,
                     qkv_weight: &qkv,
@@ -178,11 +178,11 @@ impl<'a> QualificationView<'a> {
                     beta_weight: &beta,
                     epsilon: 1.0e-5,
                 })
-                .map_err(|error| qualification_dynamic("qwen_recurrent_project", &label, error))?
+                .map_err(|error| qualification_dynamic("gated_delta_project", &label, error))?
                 .value;
             let mixed = kernels
                 .step
-                .call(qwen_recurrent_step::Args {
+                .call(gated_delta_step::Args {
                     projection: &projection,
                     convolution: &convolution,
                     rate: &rate,
@@ -198,11 +198,11 @@ impl<'a> QualificationView<'a> {
                     norm_epsilon: 1.0e-5,
                     grouped: false,
                 })
-                .map_err(|error| qualification_dynamic("qwen_recurrent_step", &label, error))?
+                .map_err(|error| qualification_dynamic("gated_delta_step", &label, error))?
                 .value;
             kernels
                 .chunk
-                .call(qwen_recurrent_chunk::Args {
+                .call(gated_delta_chunk::Args {
                     projection: &projection,
                     convolution: &convolution,
                     rate: &rate,
@@ -218,10 +218,10 @@ impl<'a> QualificationView<'a> {
                     norm_epsilon: 1.0e-5,
                     grouped: false,
                 })
-                .map_err(|error| qualification_dynamic("qwen_recurrent_chunk", &label, error))?;
+                .map_err(|error| qualification_dynamic("gated_delta_chunk", &label, error))?;
             let result = kernels
                 .output
-                .call(qwen_recurrent_output::Args {
+                .call(gated_delta_output::Args {
                     hidden: &hidden_residual,
                     mixed: &mixed,
                     projection: &projection,
@@ -229,9 +229,9 @@ impl<'a> QualificationView<'a> {
                     output_weight: &output,
                     epsilon: 1.0e-5,
                 })
-                .map_err(|error| qualification_dynamic("qwen_recurrent_output", &label, error))?
+                .map_err(|error| qualification_dynamic("gated_delta_output", &label, error))?
                 .value;
-            require_f32_values(&result, &hidden_values, "qwen_recurrent_output", &label)?;
+            require_f32_values(&result, &hidden_values, "gated_delta_output", &label)?;
         }
 
         let mut qualified = std::collections::HashSet::new();
@@ -262,7 +262,7 @@ impl<'a> QualificationView<'a> {
             let down = semantic_zeros(device, binding.down, &[hidden, f], "target_dense", &label)?;
             let product = kernels
                 .expand
-                .call(qwen_dense_expand::Args {
+                .call(dense_expand::Args {
                     residual: &hidden_residual,
                     norm: &norm,
                     gate_weight: &gate,
@@ -270,19 +270,19 @@ impl<'a> QualificationView<'a> {
                     out_rows: &out_rows,
                     eps: 1.0e-5,
                 })
-                .map_err(|error| qualification_dynamic("qwen_dense_expand", &label, error))?
+                .map_err(|error| qualification_dynamic("dense_expand", &label, error))?
                 .value;
             let result = kernels
                 .output
-                .call(qwen_dense_output::Args {
+                .call(dense_output::Args {
                     residual: &hidden_residual,
                     product: &product,
                     down_weight: &down,
                     out_rows: &out_rows,
                 })
-                .map_err(|error| qualification_dynamic("qwen_dense_output", &label, error))?
+                .map_err(|error| qualification_dynamic("dense_output", &label, error))?
                 .value;
-            require_f32_values(&result, &hidden_values, "qwen_dense_output", &label)?;
+            require_f32_values(&result, &hidden_values, "dense_output", &label)?;
         }
 
         let mut qualified = std::collections::HashSet::new();
@@ -420,7 +420,7 @@ fn qualify_routed(
         let mut scores = zeros(Element::f32(), &[rows, k])?;
         let routed = kernels
             .route
-            .call(qwen_routed_route::Args {
+            .call(routed_route::Args {
                 residual: &residual,
                 norm: &norm,
                 router: &router,
@@ -430,12 +430,12 @@ fn qualify_routed(
                 eps: 1.0e-5,
                 normalize: 1,
             })
-            .map_err(|error| qualification_dynamic("qwen_routed_route", &label, error))?;
+            .map_err(|error| qualification_dynamic("routed_route", &label, error))?;
         let first = zeros(Element::i32(), &[rows, k])?;
         let result = if rows <= DECODE_ROWS {
             let expanded = kernels
                 .expand
-                .call(qwen_routed_expand::Args {
+                .call(routed_expand::Args {
                     normalized: &routed.r0,
                     routes: &first,
                     expert_gate: &expert_gate,
@@ -443,10 +443,10 @@ fn qualify_routed(
                     shared_gate: &shared_gate,
                     shared_up: &shared_up,
                 })
-                .map_err(|error| qualification_dynamic("qwen_routed_expand", &label, error))?;
+                .map_err(|error| qualification_dynamic("routed_expand", &label, error))?;
             kernels
                 .output
-                .call(qwen_routed_output::Args {
+                .call(routed_output::Args {
                     residual: &residual,
                     expert_product: &expanded.r0,
                     shared_product: &expanded.r1,
@@ -456,28 +456,28 @@ fn qualify_routed(
                     expert_down: &expert_down,
                     shared_down: &shared_down,
                 })
-                .map_err(|error| qualification_dynamic("qwen_routed_output", &label, error))?
+                .map_err(|error| qualification_dynamic("routed_output", &label, error))?
                 .value
         } else {
             let blocks = grouped_blocks(rows, e, k)
-                .map_err(|error| qualification_dynamic("qwen_routed_group", &label, error))?;
+                .map_err(|error| qualification_dynamic("routed_group", &label, error))?;
             let mut counts = zeros(Element::i32(), &[e])?;
             let mut order = zeros(Element::i32(), &[blocks, TILE_ROWS])?;
             let mut inverse = zeros(Element::i32(), &[rows, k])?;
             let mut block_experts = zeros(Element::i32(), &[blocks])?;
             kernels
                 .group
-                .call(qwen_routed_group::Args {
+                .call(routed_group::Args {
                     routes: &first,
                     counts: &mut counts,
                     order: &mut order,
                     inverse: &mut inverse,
                     blocks: &mut block_experts,
                 })
-                .map_err(|error| qualification_dynamic("qwen_routed_group", &label, error))?;
+                .map_err(|error| qualification_dynamic("routed_group", &label, error))?;
             let experts = kernels
                 .experts
-                .call(qwen_routed_experts::Args {
+                .call(routed_experts::Args {
                     normalized: &routed.r0,
                     order: &order,
                     blocks: &block_experts,
@@ -485,11 +485,11 @@ fn qualify_routed(
                     expert_up: &expert_up,
                     expert_down: &expert_down,
                 })
-                .map_err(|error| qualification_dynamic("qwen_routed_experts", &label, error))?
+                .map_err(|error| qualification_dynamic("routed_experts", &label, error))?
                 .value;
             kernels
                 .combine
-                .call(qwen_routed_combine::Args {
+                .call(routed_combine::Args {
                     residual: &residual,
                     expert_output: &experts,
                     inverse: &inverse,
@@ -500,7 +500,7 @@ fn qualify_routed(
                     shared_up: &shared_up,
                     shared_down: &shared_down,
                 })
-                .map_err(|error| qualification_dynamic("qwen_routed_combine", &label, error))?
+                .map_err(|error| qualification_dynamic("routed_combine", &label, error))?
                 .value
         };
         require_f32_values(&result, &values, "qwen_routed", &label)?;

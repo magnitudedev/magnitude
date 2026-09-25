@@ -2059,6 +2059,7 @@ version = "0.1.0"
 dependencies = [
  "seismic-compiler",
  "seismic-lang",
+ "seismic-native-cpu",
  "seismic-runtime",
  "seismic-std",
  "self_cell",
@@ -2070,6 +2071,7 @@ name = "seismic-build"
 version = "0.1.0"
 dependencies = [
  "seismic-lang",
+ "seismic-native-cpu",
  "seismic-std",
  "sha2 0.11.0",
 ]
@@ -2112,6 +2114,7 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "libc",
  "seismic-compiler",
  "seismic-estimator",
  "seismic-ir",
@@ -2187,6 +2190,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "seismic-native-cpu"
+version = "0.1.0"
+dependencies = [
+ "seismic-lang",
+]
+
+[[package]]
 name = "seismic-native-target"
 version = "0.1.0"
 dependencies = [
@@ -2224,6 +2234,7 @@ dependencies = [
  "seismic-ir",
  "seismic-lang",
  "seismic-metal",
+ "seismic-native-cpu",
  "seismic-native-target",
  "seismic-std",
  "seismic-vulkan",

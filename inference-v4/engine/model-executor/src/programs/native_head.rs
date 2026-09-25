@@ -1,10 +1,10 @@
 //! The native draft-head program. One sealed graph per head class runs a
 //! head transaction in a single device submission: the entry pass over the
 //! committed rows, then one chained pass per further proposal. A pass is the
-//! head block (`qwen_draft_rows`, the decoder's attention and dense entries,
+//! head block (`draft_rows`, the decoder's attention and dense entries,
 //! the final norm) and, when drafting, the vocabulary projection and the
 //! position-keyed selection. A chained pass embeds the previous pass's
-//! selection (`sample_rows` result rows are `qwen_draft_rows` token rows) and
+//! selection (`sample_rows` result rows are `draft_rows` token rows) and
 //! conditions on its output feature, so no proposal returns to the host
 //! before the chain ends.
 
@@ -26,7 +26,7 @@ use magnitude_model_contracts::{
     ActivationDType, AttentionGeometry, DecoderGeometry, WeightKind, WeightRole, WeightScope,
 };
 use magnitude_model_kernels::{
-    head_logits_rows, qwen_dense_expand, qwen_dense_output, qwen_draft_rows, readout_features_rows,
+    head_logits_rows, dense_expand, dense_output, draft_rows, readout_features_rows,
 };
 use magnitude_model_state::LayerRef;
 use seismic::{
@@ -267,7 +267,7 @@ impl PreparedHeadGraphs {
                 None => graph
                     .enqueue(
                         &handle.input,
-                        qwen_draft_rows::WorkflowArgs {
+                        draft_rows::WorkflowArgs {
                             tokens: tokens.tensor().into(),
                             table: (&table).into(),
                             conditioning: conditioning.tensor().into(),
@@ -288,7 +288,7 @@ impl PreparedHeadGraphs {
                     graph
                         .enqueue(
                             &handle.input,
-                            qwen_draft_rows::WorkflowArgs {
+                            draft_rows::WorkflowArgs {
                                 tokens: (&selected).into(),
                                 table: (&table).into(),
                                 conditioning: features.into(),
@@ -325,7 +325,7 @@ impl PreparedHeadGraphs {
             let product = graph
                 .enqueue(
                     &handle.dense.expand,
-                    qwen_dense_expand::WorkflowArgs {
+                    dense_expand::WorkflowArgs {
                         residual: (&attended).into(),
                         norm: (&feedforward_norm).into(),
                         gate_weight: (&gate_weight).into(),
@@ -339,7 +339,7 @@ impl PreparedHeadGraphs {
             let dense = graph
                 .enqueue(
                     &handle.dense.output,
-                    qwen_dense_output::WorkflowArgs {
+                    dense_output::WorkflowArgs {
                         residual: (&attended).into(),
                         product: (&product).into(),
                         down_weight: (&down_weight).into(),

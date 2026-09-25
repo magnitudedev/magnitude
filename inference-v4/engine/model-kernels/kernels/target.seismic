@@ -54,9 +54,21 @@ native embedding_rows for vulkan from "vulkan/embedding_rows.comp":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (128, 1, 1)
 
+# CPU: one work item per token row.
+native embedding_rows for cpu from "cpu/embedding_rows.rs":
+    launch embedding_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
 # Vulkan: a grid-stride loop over every element; the x grid is capped at the
 # 65535-group floor (Vulkan spec §5.3).
 native conditioning_overlay for vulkan from "vulkan/conditioning_overlay.comp":
     launch conditioning_overlay:
         threadgroups (min(ceil_div(M * D, 256), 65535), 1, 1)
         threads_per_threadgroup (256, 1, 1)
+
+# CPU: one work item per row.
+native conditioning_overlay for cpu from "cpu/conditioning_overlay.rs":
+    launch conditioning_overlay:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)

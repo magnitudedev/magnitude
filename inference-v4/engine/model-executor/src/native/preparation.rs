@@ -173,7 +173,6 @@ impl NativePreparationCache {
         );
         let glue = preparation.walk(plan)?;
         let Preparation {
-            spec,
             tuner,
             target,
             head,
@@ -181,7 +180,6 @@ impl NativePreparationCache {
             ..
         } = preparation;
         let tuned = tuner.tuned();
-        spec.finish()?;
         Ok(Self {
             owner,
             import,
@@ -489,7 +487,7 @@ impl<'a> Preparation<'a> {
             }
             KvCodec::RotatedK4V4 => {
                 return Err(CatalogFailure::Preparation {
-                    entry: "qwen_attention_decode",
+                    entry: "gated_attention_decode",
                     bindings: format!("{shape:?}"),
                     outcome: "the native path has no rotated K4/V4 history entries".into(),
                 })
@@ -715,9 +713,9 @@ impl<'a> Preparation<'a> {
             let input = fixed!(
                 spec,
                 device,
-                qwen_draft_rows,
+                draft_rows,
                 bindings,
-                qwen_draft_rows::Elements {
+                draft_rows::Elements {
                     EW: b.embedding_table,
                     A: b.activation,
                     EN: b.embedding_norm,

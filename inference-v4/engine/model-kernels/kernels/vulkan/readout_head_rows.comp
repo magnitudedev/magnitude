@@ -1,8 +1,8 @@
 // readout_head_rows: final RMS prologue over the `out_rows` rows, then the
 // vocabulary projection into F32 logits. The Vulkan form of
-// `metal/readout_head_rows.metal` over `common/projection.glsl`.
-#include "common/activation.glsl"
-#include "common/projection.glsl"
+// `metal/readout_head_rows.metal` over `lib/projection/projection.glsl`.
+#include "lib/core/activation.glsl"
+#include "lib/projection/projection.glsl"
 
 #if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
 #define HEAD_ACT ELEMENT_ACT

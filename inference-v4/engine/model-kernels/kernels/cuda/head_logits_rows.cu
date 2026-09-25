@@ -5,7 +5,7 @@
 // to 64 rows, `gemm` beyond; the 16-bit path: head GEMMs are rare, so the
 // INT8 candidate is not offered).
 #define KERNEL_W0 SEISMIC_WEIGHT
-#include "common/projection.cuh"
+#include "lib/projection/projection.cuh"
 
 using Pro = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
 using Epi = projection::Store<element::F32>;

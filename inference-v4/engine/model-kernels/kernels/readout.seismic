@@ -38,6 +38,13 @@ native readout_features_rows for vulkan from "vulkan/readout_features_rows.comp"
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (128)
 
+# CPU: one work item per output row.
+native readout_features_rows for cpu from "cpu/readout_features_rows.rs":
+    launch readout_features_rows:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (D * 8)
+
 
 # The head (K1 projection): final RMS prologue over the `out_rows` rows, then
 # the vocabulary projection into F32 logits.
@@ -134,6 +141,22 @@ native readout_head_rows for vulkan from "vulkan/readout_head_rows.comp":
         threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
         shared_bytes ((TILE_M + TILE_N) * 80)
 
+# CPU: the CPU projection library (`cpu/lib/projection/projection.rs`). A
+# normalize launch writes each normalized row as F32 to scratch; the row
+# launch gives each work item ROWS vocabulary weight rows, projected against
+# every normalized row.
+native readout_head_rows for cpu from "cpu/readout_head_rows.rs":
+    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    scratch quantized bytes (O * ceil_div(D, 256) * 292)
+    scratch normalized bytes (O * D * 4)
+    launch readout_head_rows_normalize:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (D * 4)
+    launch readout_head_rows_rows:
+        threadgroups (ceil_div(V, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
 
 # The head projection restricted to the `selected` vocabulary rows.
 fn readout_selected_rows[M, O, V, D, Sv](hidden: &tensor[M, D] f32,
@@ -214,3 +237,17 @@ native readout_selected_rows for vulkan from "vulkan/readout_selected_rows.comp"
         threadgroups (ceil_div(Sv, TILE_N), ceil_div(O, TILE_M), 1)
         threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
         shared_bytes ((TILE_M + TILE_N) * 80)
+
+# CPU: as `readout_head_rows`, each work item owning ROWS selected vocabulary
+# rows (not adjacent: one single-row component call per row).
+native readout_selected_rows for cpu from "cpu/readout_selected_rows.rs":
+    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    scratch quantized bytes (O * ceil_div(D, 256) * 292)
+    scratch normalized bytes (O * D * 4)
+    launch readout_selected_rows_normalize:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (D * 4)
+    launch readout_selected_rows_rows:
+        threadgroups (ceil_div(Sv, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)

@@ -1,7 +1,7 @@
 // conditioning_overlay: out[row, column] = input[row, column] (F32); one
 // invocation per element over a grid-stride loop (the grid is capped below
 // the 65535-group floor).
-#include "common/element.glsl"
+#include <seismic/element.glsl>
 
 void conditioning_overlay() {
     // `input` and `output` are reserved words in GLSL.

@@ -409,9 +409,10 @@ fn measurement_failure(points: &[TuningPoint<'_>], point: usize, error: CallErro
 }
 
 /// Which parameters each launch reads, as the declaration names them: those
-/// its `when` condition, groups, group extent or shared bytes read. A
-/// parameter no launch names (read only by scratch sizes or the source) is
-/// taken to change every launch.
+/// its `when` condition, groups, group extent or shared bytes read, and on
+/// CPU its participant count. A parameter no launch names (read only by
+/// scratch sizes or the source, or the CPU tier) is taken to change every
+/// launch.
 struct Influence {
     launches: Vec<Vec<String>>,
     everywhere: Vec<String>,
@@ -419,10 +420,8 @@ struct Influence {
 
 impl Influence {
     fn of(implementation: &NativeImplementation) -> Self {
-        let launches = implementation
-            .launches
-            .iter()
-            .map(|launch| launch.parameters())
+        let launches = (0..implementation.launches.len())
+            .map(|launch| implementation.launch_parameters(launch))
             .collect::<Vec<_>>();
         let everywhere = implementation
             .params
@@ -839,15 +838,15 @@ pub fn tune(request: TuneRequest<'_>) -> Result<TuningResult, TuneError> {
     } = request;
     let backend = super::backend_name(&device.kind);
     let entry_name = super::entry_name(module, entry);
-    let mut implementation = module
-        .native_implementation(entry, backend)
-        .cloned()
-        .ok_or_else(|| {
+    let mut implementation = super::on_device(
+        device,
+        module.native_implementation(entry, backend).cloned().ok_or_else(|| {
             TuneError::Declaration(format!(
                 "`{entry_name}` has no native implementation for `{}`",
                 backend.as_str()
             ))
-        })?;
+        })?,
+    );
     if let Strategy::Survey(plan) = &strategy {
         widen(&mut implementation, &plan.domains)?;
     }
@@ -925,9 +924,11 @@ pub fn tune(request: TuneRequest<'_>) -> Result<TuningResult, TuneError> {
 
 /// Digest of everything about an entry's implementation on `device`'s
 /// backend that its tuning depends on besides the device: the declaration
-/// (parameters and their domains, `where`, launches, scratch) and, for Metal
-/// and CUDA, the source rendered for the defaults at these bindings and
-/// static values (the asset with its inlined includes, and the ABI prefix).
+/// (parameters and their domains, `where`, launches, scratch) and, for Metal,
+/// CUDA and Vulkan, the source rendered for the defaults at these bindings
+/// and static values (the asset with its inlined includes, and the ABI
+/// prefix); for CPU, the compiled implementation's digest (its asset, the
+/// CPU library files of its source root and the Seismic CPU library version).
 /// Embedders key stored tuning results with it.
 pub fn implementation_digest(
     device: &Arc<DeviceInner>,
@@ -935,6 +936,7 @@ pub fn implementation_digest(
     entry: EntryId,
     bindings: &ElementBindings,
     statics: &NativeSpecialization,
+    cpu: Option<&'static CpuNativeKernels>,
 ) -> Result<String, TuneError> {
     use sha2::{Digest, Sha256};
     let backend = super::backend_name(&device.kind);
@@ -953,9 +955,15 @@ pub fn implementation_digest(
     let mut digest = Sha256::new();
     digest.update(format!("{implementation:?}").as_bytes());
     // Backends whose implementations are rendered source; CPU implementations
-    // are compiled into the binary and identified by their declaration.
+    // are compiled into the binary and identified by their compiled digest.
     let dialect = match &device.kind {
-        crate::backends::OpenedKind::Cpu(_) => None,
+        crate::backends::OpenedKind::Cpu(_) => {
+            let kernels = cpu.ok_or_else(|| {
+                TuneError::Declaration(format!("`{entry_name}` has no compiled CPU native functions in this build"))
+            })?;
+            digest.update(kernels.digest.as_bytes());
+            None
+        }
         #[cfg(target_os = "macos")]
         crate::backends::OpenedKind::Metal(_) => Some(super::abi::Dialect::Metal),
         crate::backends::OpenedKind::Cuda(_) => Some(super::abi::Dialect::Cuda),

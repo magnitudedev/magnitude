@@ -1,6 +1,6 @@
 //! The vision entries (`qwen_vision_stem`, `qwen_vision_block`,
 //! `qwen_vision_merger`) on the host's accelerator (Metal on macOS, else
-//! CUDA), checked against their portable bodies run by the Seismic
+//! CUDA) and on the CPU, checked against their portable bodies run by the Seismic
 //! interpreter at small shapes, and against a host model of those bodies at
 //! the projector's geometry. Weights are f16 and bias/norm vectors f32 (the
 //! projector file's elements, kept resident as stored); the activation A is
@@ -176,7 +176,8 @@ fn relative_error(label: &str, actual: &[f32], expected: &[f32], maximum: f32, m
     );
 }
 
-/// Metal on macOS, else CUDA; `SEISMIC_TEST_BACKEND=vulkan` selects Vulkan.
+/// The host's accelerator (Metal on macOS, else CUDA;
+/// `SEISMIC_TEST_BACKEND=vulkan` selects Vulkan).
 fn device() -> Device {
     let catalog = seismic::DeviceCatalog::discover().unwrap();
     let backend = match std::env::var("SEISMIC_TEST_BACKEND").ok().as_deref() {
@@ -186,6 +187,27 @@ fn device() -> Device {
         None => seismic::BackendName::Cuda,
     };
     catalog.open_backend(backend).unwrap()
+}
+
+/// The accelerator and the CPU.
+fn devices() -> Vec<Device> {
+    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    vec![device(), catalog.open_backend(seismic::BackendName::Cpu).unwrap()]
+}
+
+fn is_cpu(device: &Device) -> bool {
+    device.backend() == seismic::BackendName::Cpu
+}
+
+/// The specialization of a vision entry on `device`: the GPU forms' static
+/// dimensions, or the CPU form's weight rows per work item.
+fn specialization_on(device: &Device, statics: &[(&str, usize)]) -> NativeSpecialization {
+    if is_cpu(device) {
+        return NativeSpecialization::new().with_param("ROWS", 8);
+    }
+    statics
+        .iter()
+        .fold(NativeSpecialization::new(), |specialization, (name, value)| specialization.with_static(*name, *value as u64))
 }
 
 // ---------------------------------------------------------------------------
@@ -329,10 +351,7 @@ impl Block {
                 DW: self.down_weight.element(),
                 DB: self.down_bias.element(),
             },
-            &NativeSpecialization::new()
-                .with_static("H", self.heads as u64)
-                .with_static("P", self.quarter as u64)
-                .with_static("F", self.intermediate as u64),
+            &specialization_on(device, &[("H", self.heads), ("P", self.quarter), ("F", self.intermediate)]),
         )
         .unwrap()
     }
@@ -431,7 +450,12 @@ impl Block {
 
 #[test]
 fn stem_matches_its_portable_body() {
-    let device = device();
+    for device in devices() {
+        stem_matches_its_portable_body_on(&device);
+    }
+}
+
+fn stem_matches_its_portable_body_on(device: &Device) {
     let module = module();
     let (rows, channels, patch, hidden, table_rows) = (8, 3, 16, 64, 16);
     let mut rng = Rng::new(11);
@@ -461,15 +485,12 @@ fn stem_matches_its_portable_body() {
         ],
     );
     let kernel = qwen_vision_stem::native_for_device_with(
-        &device,
+        device,
         qwen_vision_stem::Elements { W0: weight_0.element(), W1: weight_1.element(), B: bias.element(), PE: table.element() },
-        &NativeSpecialization::new()
-            .with_static("C", channels as u64)
-            .with_static("P", patch as u64)
-            .with_static("H", hidden as u64),
+        &specialization_on(device, &[("C", channels), ("P", patch), ("H", hidden)]),
     )
     .unwrap();
-    let t = |host: &Host| host.tensor(&device);
+    let t = |host: &Host| host.tensor(device);
     let result = kernel
         .call(qwen_vision_stem::Args {
             pixels: &t(&pixels),
@@ -490,12 +511,17 @@ fn stem_matches_its_portable_body() {
 /// body too, so the larger case below can use it.
 #[test]
 fn block_matches_its_portable_body() {
-    let device = device();
+    for device in devices() {
+        block_matches_its_portable_body_on(&device);
+    }
+}
+
+fn block_matches_its_portable_body_on(device: &Device) {
     let module = module();
     let block = Block::new(40, 2, 16, 128, 21);
     let expected = interpret(&module, "qwen_vision_block", &block.bindings(), &block.inputs());
     relative_error("qwen_vision_block host model", &block.host(), &expected, 1e-3, 1e-4);
-    let result = block.run(&device, &block.kernel(&device));
+    let result = block.run(device, &block.kernel(device));
     relative_error("qwen_vision_block", &read_f32(&result), &expected, 5e-3, 5e-4);
 }
 
@@ -503,16 +529,26 @@ fn block_matches_its_portable_body() {
 /// query and key tiles, partial GEMM tiles) against the host model.
 #[test]
 fn block_matches_the_host_model_at_projector_geometry() {
-    let device = device();
+    for device in devices() {
+        block_matches_the_host_model_at_projector_geometry_on(&device);
+    }
+}
+
+fn block_matches_the_host_model_at_projector_geometry_on(device: &Device) {
     let block = Block::new(200, 16, 16, 4096, 31);
     let expected = block.host();
-    let result = block.run(&device, &block.kernel(&device));
+    let result = block.run(device, &block.kernel(device));
     relative_error("qwen_vision_block (projector geometry)", &read_f32(&result), &expected, 5e-3, 5e-4);
 }
 
 #[test]
 fn merger_matches_its_portable_body() {
-    let device = device();
+    for device in devices() {
+        merger_matches_its_portable_body_on(&device);
+    }
+}
+
+fn merger_matches_its_portable_body_on(device: &Device) {
     let module = module();
     let (rows, group, hidden, output) = (6, 4, 64, 96);
     let mut rng = Rng::new(41);
@@ -548,7 +584,7 @@ fn merger_matches_its_portable_body() {
         ],
     );
     let merger = qwen_vision_merger::native_for_device_with(
-        &device,
+        device,
         qwen_vision_merger::Elements {
             A: Element::f16(),
             NW: norm_weight.element(),
@@ -558,13 +594,10 @@ fn merger_matches_its_portable_body() {
             DW: down_weight.element(),
             DB: down_bias.element(),
         },
-        &NativeSpecialization::new()
-            .with_static("G", group as u64)
-            .with_static("H", hidden as u64)
-            .with_static("D", output as u64),
+        &specialization_on(device, &[("G", group), ("H", hidden), ("D", output)]),
     )
     .unwrap();
-    let t = |host: &Host| host.tensor(&device);
+    let t = |host: &Host| host.tensor(device);
     let merged = merger
         .call(qwen_vision_merger::Args {
             hidden: &t(&rows_in),

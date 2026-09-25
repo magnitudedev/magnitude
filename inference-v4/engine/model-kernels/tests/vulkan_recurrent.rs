@@ -1,4 +1,4 @@
-//! The Vulkan `qwen_recurrent_step` / `qwen_recurrent_chunk` against the same
+//! The Vulkan `gated_delta_step` / `gated_delta_chunk` against the same
 //! cases, portable-body oracle and host model as the Metal tests (included
 //! verbatim; their Metal tests skip without a Metal device). The step and the
 //! chunk's row-sequential slots (at most 16 rows, zero stop) share their bits;
@@ -18,12 +18,12 @@ const MAPPINGS: [(u64, u64); 4] = [(2, 4), (4, 4), (2, 8), (4, 8)];
 
 impl Case {
     fn vulkan(&self, device: &Device, activation: Element, chunk: bool, (rows, warps): (u64, u64)) -> Outcome {
-        let specialization = self.statics().with_param("ROWS", rows).with_param("WARPS", warps);
+        let specialization = self.specialization(device, rows).with_param("WARPS", warps);
         let mut t = self.tensors(device, activation);
         let mixed = if chunk {
-            qwen_recurrent_chunk::native_for_device_with(
+            gated_delta_chunk::native_for_device_with(
                 device,
-                qwen_recurrent_chunk::Elements { A: activation },
+                gated_delta_chunk::Elements { A: activation },
                 &specialization,
             )
             .unwrap()
@@ -31,9 +31,9 @@ impl Case {
             .unwrap()
             .value
         } else {
-            qwen_recurrent_step::native_for_device_with(
+            gated_delta_step::native_for_device_with(
                 device,
-                qwen_recurrent_step::Elements { A: activation },
+                gated_delta_step::Elements { A: activation },
                 &specialization,
             )
             .unwrap()

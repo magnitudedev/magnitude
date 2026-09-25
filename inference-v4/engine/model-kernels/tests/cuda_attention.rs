@@ -1,4 +1,4 @@
-//! The CUDA `qwen_attention_decode` / `qwen_attention_prefill` against the
+//! The CUDA `gated_attention_decode` / `gated_attention_prefill` against the
 //! same cases, host model and portable-body pin as the Metal tests (included
 //! verbatim; their Metal tests skip without a Metal device), plus timings.
 
@@ -15,10 +15,10 @@ fn cuda_decode(
     device: &Device,
     geometry: Geometry,
     (parts, warps): (u64, u64),
-) -> seismic::NativeKernel<qwen_attention_decode::Entry> {
-    qwen_attention_decode::native_for_device_with(
+) -> seismic::NativeKernel<gated_attention_decode::Entry> {
+    gated_attention_decode::native_for_device_with(
         device,
-        qwen_attention_decode::Elements { A: Element::bf16() },
+        gated_attention_decode::Elements { A: Element::bf16() },
         &statics(geometry)
             .with_param("PARTS", parts)
             .with_param("WARPS", warps),
@@ -30,10 +30,10 @@ fn cuda_prefill(
     device: &Device,
     geometry: Geometry,
     warps: u64,
-) -> seismic::NativeKernel<qwen_attention_prefill::Entry> {
-    qwen_attention_prefill::native_for_device_with(
+) -> seismic::NativeKernel<gated_attention_prefill::Entry> {
+    gated_attention_prefill::native_for_device_with(
         device,
-        qwen_attention_prefill::Elements { A: Element::bf16() },
+        gated_attention_prefill::Elements { A: Element::bf16() },
         &statics(geometry).with_param("WARPS", warps),
     )
     .unwrap()
@@ -45,7 +45,7 @@ const DECODE_CONFIGS: [(u64, u64); 4] = [(12, 4), (24, 8), (48, 4), (12, 8)];
 fn cuda_decode_matches_portable_body() {
     let Some(device) = cuda() else { return };
     let case = Case::new(SMALL, 64, 2, &decode_rows(5), 11);
-    check_host_model_against_portable_body("qwen_attention_decode", &case);
+    check_host_model_against_portable_body("gated_attention_decode", &case);
     let expected = case.expected();
     for config in DECODE_CONFIGS {
         let kernel = cuda_decode(&device, SMALL, config);
@@ -59,7 +59,7 @@ fn cuda_decode_matches_portable_body() {
 fn cuda_prefill_matches_portable_body() {
     let Some(device) = cuda() else { return };
     let case = Case::new(SMALL, 128, 2, &prefill_rows(20, 23), 23);
-    check_host_model_against_portable_body("qwen_attention_prefill", &case);
+    check_host_model_against_portable_body("gated_attention_prefill", &case);
     let expected = case.expected();
     for warps in [4, 2] {
         let kernel = cuda_prefill(&device, SMALL, warps);
@@ -117,7 +117,7 @@ fn cuda_attention_timings() {
             let kernel = cuda_decode(&device, QWEN, config);
             let args = bounds
                 .iter_mut()
-                .map(|bound| qwen_attention_decode::Args {
+                .map(|bound| gated_attention_decode::Args {
                     query_gate: &bound.query_gate,
                     key: &bound.key,
                     value: &bound.value,
@@ -158,7 +158,7 @@ fn cuda_attention_timings() {
         let mut bound = Bound::new(&device, &case);
         for warps in [4, 2] {
             let kernel = cuda_prefill(&device, QWEN, warps);
-            let args = vec![qwen_attention_prefill::Args {
+            let args = vec![gated_attention_prefill::Args {
                 query_gate: &bound.query_gate,
                 key: &bound.key,
                 value: &bound.value,

@@ -3,7 +3,7 @@
 // F32 product, the second adds it, the bias and the bilinear position-table
 // blend, publishing the F32 residual stream. Pixels enter the matrix units as
 // f16 (a relative rounding of 2^-11).
-#include "common/vision.h"
+#include "lib/vision/vision.h"
 
 typedef vision::dense_packet<ELEMENT_KIND(SEISMIC_TEMPORAL_WEIGHT_0)>::type weight_0_packet;
 typedef vision::dense_packet<ELEMENT_KIND(SEISMIC_TEMPORAL_WEIGHT_1)>::type weight_1_packet;

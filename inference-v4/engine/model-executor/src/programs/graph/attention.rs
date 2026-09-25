@@ -2,8 +2,8 @@
 //! attention entry (q/k norms, partial M-RoPE, K/V append at the rows'
 //! destinations, attention over the visible history spans and fresh rows,
 //! sigmoid gate) and the output projection plus residual. Decode row classes
-//! use the history codec's decode entry (`qwen_attention_decode`,
-//! `qwen_attention_decode_k8v4`); larger classes its prefill entry. Both share
+//! use the history codec's decode entry (`gated_attention_decode`,
+//! `gated_attention_decode_k8v4`); larger classes its prefill entry. Both share
 //! one contract, so their ports have the same geometry.
 //!
 //! The rotary table (the coordinate axis and frequency of every rotated pair)
@@ -15,8 +15,8 @@ use crate::{
 };
 use magnitude_model_contracts::RotarySemantics;
 use magnitude_model_kernels::{
-    qwen_attention_decode, qwen_attention_decode_k8v4, attention_output,
-    qwen_attention_prefill, qwen_attention_prefill_k8v4, qwen_attention_project,
+    gated_attention_decode, gated_attention_decode_k8v4, attention_output,
+    gated_attention_prefill, gated_attention_prefill_k8v4, gated_attention_project,
 };
 use magnitude_model_state::AFFINE_GROUP;
 use seismic::{Element, NativeGraph, NativePort, WorkflowTensor};
@@ -91,7 +91,7 @@ pub(crate) fn attention(
     let projected = graph
         .enqueue(
             &kernels.project,
-            qwen_attention_project::WorkflowArgs {
+            gated_attention_project::WorkflowArgs {
                 hidden: hidden.into(),
                 input_norm: (&weights.input_norm).into(),
                 query_norm: (&weights.query_norm).into(),
@@ -181,14 +181,14 @@ pub(crate) fn attention(
     let decode = block.rows <= DECODE_ROWS;
     let gated = match &kernels.history {
         AttentionHistoryKernels::Dense { decode: kernel, .. } if decode => {
-            mix!(kernel, qwen_attention_decode, history_key, history_value)
+            mix!(kernel, gated_attention_decode, history_key, history_value)
         }
         AttentionHistoryKernels::Dense { prefill: kernel, .. } => {
-            mix!(kernel, qwen_attention_prefill, history_key, history_value)
+            mix!(kernel, gated_attention_prefill, history_key, history_value)
         }
         AttentionHistoryKernels::AffineK8V4 { decode: kernel, .. } if decode => mix!(
             kernel,
-            qwen_attention_decode_k8v4,
+            gated_attention_decode_k8v4,
             history_key_codes,
             history_key_coefficients,
             history_value_codes,
@@ -196,7 +196,7 @@ pub(crate) fn attention(
         ),
         AttentionHistoryKernels::AffineK8V4 { prefill: kernel, .. } => mix!(
             kernel,
-            qwen_attention_prefill_k8v4,
+            gated_attention_prefill_k8v4,
             history_key_codes,
             history_key_coefficients,
             history_value_codes,

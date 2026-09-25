@@ -568,7 +568,7 @@ impl ElementDomain {
         &self.parameters
     }
 
-    pub(crate) fn conversions(&self) -> &[ElementConversion] {
+    pub fn conversions(&self) -> &[ElementConversion] {
         &self.conversions
     }
 
@@ -643,6 +643,9 @@ pub struct NativeImplementation {
     pub statics: Vec<String>,
     /// Tuning parameters, in declaration order.
     pub params: Vec<NativeParameter>,
+    /// On CPU, the dense element types the form is compiled for, for element
+    /// parameters that do not take the default (`f32`, `bf16`, `f16`).
+    pub elements: Vec<NativeElementCoverage>,
     /// The `where` condition restricting admissible parameter
     /// configurations. It reads only static dimensions and parameters.
     pub constraint: Option<NativeCondition>,
@@ -650,6 +653,20 @@ pub struct NativeImplementation {
     pub scratch: Vec<NativeScratch>,
     /// Ordered dispatches of one call. Never empty.
     pub launches: Vec<NativeLaunch>,
+}
+
+/// The dense element types a build-time compiled native form binds one
+/// element parameter to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeElementCoverage {
+    pub parameter: String,
+    pub dtypes: Vec<DType>,
+}
+
+impl NativeElementCoverage {
+    /// The coverage of an element parameter a CPU form stores when its
+    /// declaration lists none: the floating element types.
+    pub const DEFAULT: [DType; 3] = [DType::F32, DType::BF16, DType::F16];
 }
 
 /// A tuning parameter with its finite domain. `values[0]` is the default.
@@ -660,6 +677,64 @@ pub struct NativeParameter {
     /// parameters must produce bit-identical results across their values.
     pub arithmetic: bool,
     pub values: Vec<u64>,
+    pub role: NativeParameterRole,
+}
+
+/// What a native tuning parameter chooses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeParameterRole {
+    /// Declared in the `params` clause; the implementation's source and
+    /// launch geometry read it.
+    Declared,
+    /// Seismic-owned, on CPU devices: how many pool participants claim the
+    /// work items of launch `launch`. `0` is every participant.
+    Workers { launch: u32 },
+    /// Seismic-owned, on CPU devices: the instruction-set tier the
+    /// implementation runs at. `0` is the device's detected tier; `t` is the
+    /// tier of [`NativeParameterRole::TIERS`] ordinal `t - 1`.
+    Tier,
+}
+
+impl NativeParameterRole {
+    /// The tiers a `Tier` parameter value names, by ordinal from 1.
+    pub const TIERS: [&'static str; 5] = ["x86v2", "x86v3", "x86v4", "x86v4vnni", "neon"];
+}
+
+impl NativeParameter {
+    /// The Seismic-owned parameters a CPU device adds to an implementation
+    /// with `launches` launches: one participant count per launch (every
+    /// participant, then each power of two below `participants`), then the
+    /// tier (the detected one, then each tier in `lower`, by
+    /// [`NativeParameterRole::TIERS`] name). Their names contain `.`, which no
+    /// declared parameter name can.
+    pub fn cpu_parameters(launches: usize, participants: usize, lower: &[&str]) -> Vec<NativeParameter> {
+        let counts = std::iter::once(0)
+            .chain((0..).map(|power| 1u64 << power).take_while(|count| *count < participants as u64))
+            .collect::<Vec<_>>();
+        let tiers = std::iter::once(0)
+            .chain(lower.iter().map(|tier| {
+                NativeParameterRole::TIERS
+                    .iter()
+                    .position(|known| known == tier)
+                    .expect("a CPU tier is one of NativeParameterRole::TIERS") as u64
+                    + 1
+            }))
+            .collect();
+        (0..launches)
+            .map(|launch| NativeParameter {
+                name: format!("cpu.workers.{launch}"),
+                arithmetic: false,
+                values: counts.clone(),
+                role: NativeParameterRole::Workers { launch: launch as u32 },
+            })
+            .chain(std::iter::once(NativeParameter {
+                name: "cpu.tier".to_owned(),
+                arithmetic: false,
+                values: tiers,
+                role: NativeParameterRole::Tier,
+            }))
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -892,6 +967,44 @@ impl NativeCondition {
                 right.parameters(out);
             }
         }
+    }
+}
+
+impl NativeImplementation {
+    /// `specialization` with every Seismic-owned parameter it leaves unset at
+    /// its default. Callers choose declared parameters; Seismic-owned ones
+    /// are chosen by tuning or default.
+    pub fn with_owned_defaults(&self, specialization: NativeSpecialization) -> NativeSpecialization {
+        self.params
+            .iter()
+            .filter(|parameter| parameter.role != NativeParameterRole::Declared)
+            .fold(specialization, |specialization, parameter| {
+                if specialization.param(&parameter.name).is_some() {
+                    specialization
+                } else {
+                    specialization.with_param(parameter.name.clone(), parameter.values[0])
+                }
+            })
+    }
+
+    /// The parameters of the `params` clause, in declaration order.
+    pub fn declared_params(&self) -> impl Iterator<Item = &NativeParameter> {
+        self.params
+            .iter()
+            .filter(|parameter| parameter.role == NativeParameterRole::Declared)
+    }
+
+    /// Every tuning parameter launch `launch` reads: those its declaration
+    /// reads, and its Seismic-owned participant count.
+    pub fn launch_parameters(&self, launch: usize) -> Vec<String> {
+        let mut out = self.launches[launch].parameters();
+        out.extend(
+            self.params
+                .iter()
+                .filter(|parameter| parameter.role == NativeParameterRole::Workers { launch: launch as u32 })
+                .map(|parameter| parameter.name.clone()),
+        );
+        out
     }
 }
 
@@ -1468,6 +1581,45 @@ mod native_tests {
         assert!(error
             .to_string()
             .contains("already has a native implementation"));
+    }
+
+    /// `elements` lists the dense types a CPU form compiles a stored element
+    /// parameter for, and is rejected anywhere else.
+    #[test]
+    fn cpu_element_coverage_names_stored_element_parameters() {
+        let check = |native: &str| {
+            let mut sources = SourceSet::default();
+            sources.push(SourceFile {
+                path: "ops.seismic".to_owned(),
+                text: format!(
+                    "fn copy[N](src: &tensor[N] A, dst: &mut tensor[N] A, w: &tensor[N] W):\n    dst[0:N] = src[0:N]\n\nfn widen[N](w: &tensor[N] W) -> tensor[N] U:\n    return repack[U = U](w)\n\n{native}"
+                ),
+            });
+            check_source(sources)
+        };
+        let launch = "    launch copy:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
+        let module = check(&format!("native copy for cpu from \"copy.rs\":\n    elements (A in [f32, u32, i32])\n{launch}"))
+            .expect("CPU element coverage checks");
+        let native = module
+            .native_implementation(module.entry_named("copy").unwrap(), BackendName::Cpu)
+            .expect("cpu native implementation");
+        assert_eq!(
+            native.elements,
+            [NativeElementCoverage { parameter: "A".to_owned(), dtypes: vec![DType::F32, DType::U32, DType::I32] }]
+        );
+        let widen = "    launch widen:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
+        for (native, message) in [
+            (format!("native copy for metal from \"copy.metal\":\n    elements (A in [f32])\n{launch}"), "other backends compile each binding"),
+            (format!("native copy for cpu from \"copy.rs\":\n    elements (B in [f32])\n{launch}"), "`B` is not an element parameter"),
+            (format!("native copy for cpu from \"copy.rs\":\n    elements (W in [f32])\n{launch}"), "`W` is not stored"),
+            (format!("native widen for cpu from \"widen.rs\":\n    elements (U in [f32])\n{widen}"), "`U` is not stored"),
+            (format!("native copy for cpu from \"copy.rs\":\n    elements (A in [f32, f32])\n{launch}"), "`f32` is listed twice"),
+            (format!("native copy for cpu from \"copy.rs\":\n    elements (A in [bool])\n{launch}"), "`bool` is not a CPU element type"),
+            (format!("native copy for cpu from \"copy.rs\":\n    elements (A in [f32], A in [u32])\n{launch}"), "declared twice"),
+        ] {
+            let error = check(&native).expect_err(message).to_string();
+            assert!(error.contains(message), "{message}: {error}");
+        }
     }
 
     #[test]

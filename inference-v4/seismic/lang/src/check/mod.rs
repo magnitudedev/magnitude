@@ -1026,12 +1026,73 @@ fn check_native(
             name: name.clone(),
             arithmetic: param.arithmetic,
             values,
+            role: crate::checked::NativeParameterRole::Declared,
         });
     }
     let parameter_names = params
         .iter()
         .map(|parameter| parameter.name.clone())
         .collect::<Vec<_>>();
+
+    let mut elements: Vec<crate::checked::NativeElementCoverage> = Vec::new();
+    for coverage in &native.elements {
+        let name = &coverage.name.name;
+        if backend != crate::registry::BackendName::Cpu {
+            errors.push((
+                coverage.span,
+                "`elements` declares the element types of a CPU form compiled with the program; other backends compile each binding when it is prepared".to_owned(),
+            ));
+            continue;
+        }
+        let stored = entry.element_domain.parameters().iter().find(|parameter| &parameter.name == name);
+        let converted = entry.element_domain.conversions().iter().any(|conversion| {
+            conversion.target == crate::checked::ElementTarget::Parameter(name.clone())
+        });
+        match stored {
+            None => {
+                errors.push((
+                    coverage.name.span,
+                    format!("`{name}` is not an element parameter of `{}`", entry.name),
+                ));
+                continue;
+            }
+            Some(parameter) if !(parameter.uses.stored || parameter.uses.partial_copy) || converted => {
+                errors.push((
+                    coverage.name.span,
+                    format!(
+                        "`{name}` is not stored by `{}`; a CPU form reads it as a weight or converts into it, for every representation",
+                        entry.name
+                    ),
+                ));
+                continue;
+            }
+            Some(_) => {}
+        }
+        if elements.iter().any(|existing| &existing.parameter == name) {
+            errors.push((coverage.name.span, format!("the elements of `{name}` are declared twice")));
+            continue;
+        }
+        let mut dtypes = Vec::new();
+        for dtype in &coverage.dtypes {
+            match DType::from_name(&dtype.name) {
+                Some(value) if value != DType::Bool => {
+                    if dtypes.contains(&value) {
+                        errors.push((dtype.span, format!("`{}` is listed twice", dtype.name)));
+                    } else {
+                        dtypes.push(value);
+                    }
+                }
+                _ => errors.push((
+                    dtype.span,
+                    format!("`{}` is not a CPU element type; they are f32, bf16, f16, i32 and u32", dtype.name),
+                )),
+            }
+        }
+        elements.push(crate::checked::NativeElementCoverage {
+            parameter: name.clone(),
+            dtypes,
+        });
+    }
 
     let expression = |expr: &crate::syntax::ast::Expr, errors: &mut Vec<(Span, String)>| {
         native_nat_expr(expr, &entry.dimensions, &parameter_names)
@@ -1153,6 +1214,7 @@ fn check_native(
         source_path: native.source.clone(),
         statics,
         params,
+        elements,
         constraint,
         scratch,
         launches,

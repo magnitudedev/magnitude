@@ -138,7 +138,12 @@ impl Module {
                 "inline native assets require base_dir",
             ));
         }
-        seismic_lang::source::capture_assets(&mut checked, base)?;
+        // Native includes of inline assets may resolve only inside `base`.
+        let roots = match base {
+            Some(base) => seismic_lang::source::source_roots(&[base.to_path_buf()])?,
+            None => Vec::new(),
+        };
+        seismic_lang::source::capture_assets(&mut checked, base, &roots)?;
         Ok(Self {
             checked: Arc::new(checked),
         })

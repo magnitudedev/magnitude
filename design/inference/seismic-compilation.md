@@ -77,8 +77,17 @@ architecture, options), asks the store before running NVRTC, loads a stored CUBI
 compiling, and hands every newly formed CUBIN to the store; a stored image the driver refuses is a
 miss and is formed again. Metal and CPU formation do not use the store. For keying the embedder's
 own records of tuning results, Seismic exposes a device tuning identity that includes the Metal OS
-build or the CUDA driver and NVRTC release, and an implementation digest over an entry's
-declaration and the source rendered for it.
+build, the CUDA driver and NVRTC release, or the CPU's detected instruction-set tier and CPU library
+version, and an implementation digest over an entry's declaration and the source rendered for it (on
+CPU, the compiled implementation's digest of its asset, its source root's CPU library files and the
+CPU library version).
+A CPU device executes on one worker pool per process: one participant per physical performance core,
+the submitting thread among them, shared by every CPU device the process opens. A native submission
+is one pool job whatever its launch count: the participants of each launch claim its work items and
+meet the next launch's participants at a barrier, waiting by spinning briefly, then yielding, then
+parking. A launch uses at most as many participants as it has work items, and its participant count
+is a tuning axis. The measured interval of a CPU submission starts when it holds the pool, so a
+submission never measures another's work.
 Standalone native calls use the same checked entry without creating a graph. Their scalar-result
 slots and scratch are the prepared kernel's invocation workspace, which reports both.
 A native graph composes checked native entries, owns the shapes and lifetimes of

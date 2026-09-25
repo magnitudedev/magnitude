@@ -13,7 +13,7 @@
 # activation dtype) before it is weighted; weighted choices accumulate in
 # slot order, then the shared expert, then the residual.
 
-fn qwen_routed_route[M, H, E, K](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
+fn routed_route[M, H, E, K](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
     router: &tensor[E, H] RW, shared_router: &tensor[H] f32,
     routes: &mut tensor[M, K] i32, scores: &mut tensor[M, K] f32,
     eps: f32, normalize: i32) -> (tensor[M, H] A, tensor[M] f32):
@@ -55,21 +55,21 @@ fn qwen_routed_route[M, H, E, K](residual: &tensor[M, H] f32, norm: &tensor[H] N
 #
 # Metal: the GEMM runs on 8x8 F32 simdgroup matrices (128 threads). (CUDA:
 # scalar FMAs over shared tiles, 256 threads.)
-native qwen_routed_route for metal from "metal/qwen_routed_route.metal":
+native routed_route for metal from "metal/routed_route.metal":
     static (H, E, K)
     params (SIMDGROUPS in [8, 4, 2])
     where H % 32 == 0 and E % 32 == 0 and E <= 1024
     scratch logits bytes (M * (E + 1) * 4)
-    launch qwen_routed_route_stage when M > 8:
+    launch routed_route_stage when M > 8:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_routed_route_gemv when M <= 8:
+    launch routed_route_gemv when M <= 8:
         threadgroups (ceil_div(E + 1, SIMDGROUPS), 1, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-    launch qwen_routed_route_gemm when M > 8:
+    launch routed_route_gemm when M > 8:
         threadgroups (ceil_div(E + 1, 32), ceil_div(M, 32), 1)
         threads_per_threadgroup (128, 1, 1)
-    launch qwen_routed_route_select:
+    launch routed_route_select:
         threadgroups (ceil_div(M, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
@@ -77,21 +77,21 @@ native qwen_routed_route for metal from "metal/qwen_routed_route.metal":
 # threads), split over the hidden axis into SPLIT partial planes that the
 # selection sums in order (SPLIT changes the logit summation order, so it is
 # arithmetic). (Metal: F32 simdgroup matrices, unsplit.)
-native qwen_routed_route for cuda from "cuda/qwen_routed_route.cu":
+native routed_route for cuda from "cuda/routed_route.cu":
     static (H, E, K)
     params (SIMDGROUPS in [8, 4, 2], arithmetic SPLIT in [8, 4, 16])
     where H % 32 == 0 and E % 32 == 0 and E <= 1024
     scratch logits bytes (SPLIT * M * (E + 1) * 4)
-    launch qwen_routed_route_stage when M > 8:
+    launch routed_route_stage when M > 8:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_routed_route_gemv when M <= 8:
+    launch routed_route_gemv when M <= 8:
         threadgroups (ceil_div(E + 1, SIMDGROUPS), 1, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-    launch qwen_routed_route_gemm when M > 8:
+    launch routed_route_gemm when M > 8:
         threadgroups (ceil_div(E + 1, 32), ceil_div(M, 32), SPLIT)
         threads_per_threadgroup (256, 1, 1)
-    launch qwen_routed_route_select:
+    launch routed_route_select:
         threadgroups (ceil_div(M, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
@@ -100,31 +100,50 @@ native qwen_routed_route for cuda from "cuda/qwen_routed_route.cu":
 # normalizing in the workgroup, workgroup 0 publishing the normalized rows);
 # larger classes stage the normalized rows once, then a 32 x 32 F32 tile
 # GEMM; selection with one subgroup per row. SIMDGROUPS never changes bits.
-native qwen_routed_route for vulkan from "vulkan/qwen_routed_route.comp":
+native routed_route for vulkan from "vulkan/routed_route.comp":
     static (H, E, K)
     params (SIMDGROUPS in [8, 4, 2])
     where H % 32 == 0 and E % 32 == 0 and E <= 1024
     scratch logits bytes (M * (E + 1) * 4)
-    launch qwen_routed_route_stage when M > 8:
+    launch routed_route_stage when M > 8:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (32)
-    launch qwen_routed_route_gemv when M <= 8:
+    launch routed_route_gemv when M <= 8:
         threadgroups (ceil_div(E + 1, SIMDGROUPS), 1, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (288)
-    launch qwen_routed_route_gemm when M > 8:
+    launch routed_route_gemm when M > 8:
         threadgroups (ceil_div(E + 1, 32), ceil_div(M, 32), 1)
         threads_per_threadgroup (128, 1, 1)
         shared_bytes (9216)
-    launch qwen_routed_route_select:
+    launch routed_route_select:
         threadgroups (ceil_div(M, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
+
+# CPU: each row normalized once (F32 in scratch); ROWS router rows per work
+# item against every row; one row's selection per work item. ROWS never
+# changes result bits.
+native routed_route for cpu from "cpu/routed_route.rs":
+    params (ROWS in [8, 4, 2, 1])
+    scratch normalized bytes (M * H * 4)
+    scratch logits bytes (M * E * 4)
+    launch routed_route_normalize:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (H * 4)
+    launch routed_route_logits:
+        threadgroups (ceil_div(E, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch routed_route_select:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (E * 4)
 
 
 # Decode expansion (M <= 8): each choice's expert gate/up and the shared
 # expert's gate/up, each with SiLU . mul.
-fn qwen_routed_expand[M, H, E, K, F, S](normalized: &tensor[M, H] A,
+fn routed_expand[M, H, E, K, F, S](normalized: &tensor[M, H] A,
     routes: &tensor[M, K] i32, expert_gate: &tensor[E, F, H] EGW,
     expert_up: &tensor[E, F, H] EUW, shared_gate: &tensor[S, H] SGW,
     shared_up: &tensor[S, H] SUW) -> (tensor[M, K, F] A, tensor[M, S] A):
@@ -153,37 +172,51 @@ fn qwen_routed_expand[M, H, E, K, F, S](normalized: &tensor[M, H] A,
 # rows per threadgroup (LANES sets the reduction order, so it is arithmetic);
 # row y < M * K is choice (m, k), row M * K the shared expert. (CUDA: the mma16
 # swap-AB GEMV, TPW tiles per warp group, KSPLIT-way K split.)
-native qwen_routed_expand for metal from "metal/qwen_routed_expand.metal":
+native routed_expand for metal from "metal/routed_expand.metal":
     static (H, K, F, S)
     params (SIMDGROUPS in [2, 4, 8, 16], ROWS in [1, 2, 4], arithmetic LANES in [32, 16])
-    launch qwen_routed_expand:
+    launch routed_expand:
         threadgroups (ceil_div(max(F, S), SIMDGROUPS * ROWS * 32 / LANES), M * K + 1, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
 
 # CUDA: the swap-AB GEMV (TPW tiles per warp group; KSPLIT splits K across
 # the warps of a group and reduces in part order). (Metal: the rows16 GEMV.)
-native qwen_routed_expand for cuda from "cuda/qwen_routed_expand.cu":
+native routed_expand for cuda from "cuda/routed_expand.cu":
     static (H, K, F, S)
     params (TPW in [1, 2], arithmetic KSPLIT in [1, 2, 4])
-    launch qwen_routed_expand:
+    launch routed_expand:
         threadgroups (ceil_div(ceil_div(ceil_div(max(F, S), 16), TPW), 4 / KSPLIT), M * K + 1, 1)
         threads_per_threadgroup (128, 1, 1)
 
 # Vulkan: the Metal form; decode lane groups are whole subgroups.
-native qwen_routed_expand for vulkan from "vulkan/qwen_routed_expand.comp":
+native routed_expand for vulkan from "vulkan/routed_expand.comp":
     static (H, K, F, S)
     params (SIMDGROUPS in [2, 4, 8], ROWS in [1, 2, 4])
-    launch qwen_routed_expand:
+    launch routed_expand:
         threadgroups (ceil_div(max(F, S), SIMDGROUPS * ROWS), M * K + 1, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (256 + min(8 * ceil_div(H, 32), 288) * 72)
+
+# CPU: the normalized rows staged once as F32; work item (x, y) expands ROWS
+# features of choice y < M * K, or of the shared expert (y = M * K) for
+# every row.
+native routed_expand for cpu from "cpu/routed_expand.rs":
+    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    scratch quantized bytes (M * ceil_div(H, 256) * 292)
+    scratch staged bytes (M * H * 4)
+    launch routed_expand_stage:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch routed_expand_rows:
+        threadgroups (ceil_div(max(F, S), ROWS), M * K + 1, 1)
+        threads_per_threadgroup (1, 1, 1)
 
 
 # Decode output (M <= 8): each choice's down projection, published in A,
 # weighted by its score in slot order; then the shared expert's down
 # projection times its coefficient; then the residual.
-fn qwen_routed_output[M, H, E, K, F, S](residual: &tensor[M, H] f32,
+fn routed_output[M, H, E, K, F, S](residual: &tensor[M, H] f32,
     expert_product: &tensor[M, K, F] A, shared_product: &tensor[M, S] A,
     routes: &tensor[M, K] i32, scores: &tensor[M, K] f32,
     coefficient: &tensor[M] f32, expert_down: &tensor[E, H, F] EDW,
@@ -211,31 +244,46 @@ fn qwen_routed_output[M, H, E, K, F, S](residual: &tensor[M, H] f32,
 # the choices in registers. Metal: the rows16 GEMV, lane groups as in the
 # expansion (a K = F or S row of 16-32 packets fills a 16-lane group). (CUDA:
 # the mma16 swap-AB GEMV.)
-native qwen_routed_output for metal from "metal/qwen_routed_output.metal":
+native routed_output for metal from "metal/routed_output.metal":
     static (H, K, F, S)
     params (SIMDGROUPS in [2, 4, 8, 16], ROWS in [1, 2, 4], arithmetic LANES in [32, 16])
-    launch qwen_routed_output:
+    launch routed_output:
         threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), M, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (min(ceil_div(max(F, S), 32), 448) * 64)
 
 # CUDA: the swap-AB GEMV (TPW, KSPLIT as in the expansion). (Metal: the
 # rows16 GEMV.)
-native qwen_routed_output for cuda from "cuda/qwen_routed_output.cu":
+native routed_output for cuda from "cuda/routed_output.cu":
     static (H, K, F, S)
     params (TPW in [1, 2], arithmetic KSPLIT in [1, 2, 4])
-    launch qwen_routed_output:
+    launch routed_output:
         threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M, 1)
         threads_per_threadgroup (128, 1, 1)
 
 # Vulkan: the Metal form; decode lane groups are whole subgroups.
-native qwen_routed_output for vulkan from "vulkan/qwen_routed_output.comp":
+native routed_output for vulkan from "vulkan/routed_output.comp":
     static (H, K, F, S)
     params (SIMDGROUPS in [2, 4, 8], ROWS in [1, 2, 4])
-    launch qwen_routed_output:
+    launch routed_output:
         threadgroups (ceil_div(H, SIMDGROUPS * ROWS), M, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (256 + min(ceil_div(max(F, S), 32), 288) * 72)
+
+# CPU: the products staged once as F32; work item (x, m) owns ROWS output
+# channels of row m and carries their running sum across the choices.
+native routed_output for cpu from "cpu/routed_output.rs":
+    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    scratch expert_q8 bytes (M * K * ceil_div(F, 256) * 292)
+    scratch shared_q8 bytes (M * ceil_div(S, 256) * 292)
+    scratch expert bytes (M * K * F * 4)
+    scratch shared bytes (M * S * 4)
+    launch routed_output_stage:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch routed_output_rows:
+        threadgroups (ceil_div(H, ROWS), M, 1)
+        threads_per_threadgroup (1, 1, 1)
 
 
 # Groups the M x K choices by expert for the tiled expert projections.
@@ -245,7 +293,7 @@ native qwen_routed_output for vulkan from "vulkan/qwen_routed_output.comp":
 # `counts[e]` is the number of choices routed to expert e. Within an expert,
 # choices keep their flat (row, choice) order. B must be at least
 # ceil((M * K + E * (T - 1)) / T), which holds every expert's tiles.
-fn qwen_routed_group[M, E, K, B, T](routes: &tensor[M, K] i32,
+fn routed_group[M, E, K, B, T](routes: &tensor[M, K] i32,
     counts: &mut tensor[E] i32, order: &mut tensor[B, T] i32,
     inverse: &mut tensor[M, K] i32, blocks: &mut tensor[B] i32):
     for block in 0..B:
@@ -272,39 +320,46 @@ fn qwen_routed_group[M, E, K, B, T](routes: &tensor[M, K] i32,
         if lane > 0:
             block = block + 1
 
-native qwen_routed_group for metal from "metal/qwen_routed_group.metal":
+native routed_group for metal from "metal/routed_group.metal":
     static (E, K)
     params (PARTS in [1, 2, 4])
     where E * PARTS <= 1024
-    launch qwen_routed_group:
+    launch routed_group:
         threadgroups (1, 1, 1)
         threads_per_threadgroup (E * PARTS, 1, 1)
         shared_bytes (E * PARTS * 4 + E * 4 + 16 + ceil_div(M * K, 8) * 16)
 
-native qwen_routed_group for cuda from "cuda/qwen_routed_group.cu":
+native routed_group for cuda from "cuda/routed_group.cu":
     static (E, K)
     params (PARTS in [1, 2, 4])
     where E * PARTS <= 1024
-    launch qwen_routed_group:
+    launch routed_group:
         threadgroups (1, 1, 1)
         threads_per_threadgroup (E * PARTS, 1, 1)
         shared_bytes (E * PARTS * 4 + E * 4 + 16 + ceil_div(M * K, 8) * 16)
 
 # Vulkan: the earlier Metal form (per-expert counts, then the ordered walk).
-native qwen_routed_group for vulkan from "vulkan/qwen_routed_group.comp":
+native routed_group for vulkan from "vulkan/routed_group.comp":
     static (E, K)
     params (PARTS in [1, 2, 4])
     where E * PARTS <= 1024
-    launch qwen_routed_group:
+    launch routed_group:
         threadgroups (1, 1, 1)
         threads_per_threadgroup (E * PARTS, 1, 1)
         shared_bytes (E * PARTS * 4 + E * 4 + 16)
+
+# CPU: one work item counts, places the tiles and walks the choices in flat
+# order.
+native routed_group for cpu from "cpu/routed_group.rs":
+    launch routed_group:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
 
 
 # Per-expert tile projections over grouped rows: gate/up with SiLU . mul,
 # then down. Rows of unused blocks and padding rows carry no contract; the
 # combine reads only the positions `inverse` names.
-fn qwen_routed_experts[M, H, E, F, B, T](normalized: &tensor[M, H] A,
+fn routed_experts[M, H, E, F, B, T](normalized: &tensor[M, H] A,
     order: &tensor[B, T] i32, blocks: &tensor[B] i32,
     expert_gate: &tensor[E, F, H] EGW, expert_up: &tensor[E, F, H] EUW,
     expert_down: &tensor[E, H, F] EDW) -> tensor[B, T, H] A:
@@ -334,52 +389,74 @@ fn qwen_routed_experts[M, H, E, F, B, T](normalized: &tensor[M, H] A,
 # Both backends: the paired gate/up GEMM, then the down GEMM, over each
 # block's live rows. Metal: TILE_M x TILE_N simdgroup-matrix tiles. (CUDA:
 # fixed 32 x 128 mma.sync tiles, 3 cp.async stages.)
-native qwen_routed_experts for metal from "metal/qwen_routed_experts.metal":
+native routed_experts for metal from "metal/routed_experts.metal":
     static (H, F)
     params (TILE_M in [32, 64], TILE_N in [128, 64])
     scratch product bytes (B * T * F * 2)
-    launch qwen_routed_experts_expand:
+    launch routed_experts_expand:
         threadgroups (ceil_div(F * 2, TILE_N), B * ceil_div(T, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
-    launch qwen_routed_experts_down:
+    launch routed_experts_down:
         threadgroups (ceil_div(H, TILE_N), B * ceil_div(T, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
 
 # CUDA: 32-row x 128-column block tiles over mma16 weights. (Metal: tunable
 # simdgroup-matrix tiles.)
-native qwen_routed_experts for cuda from "cuda/qwen_routed_experts.cu":
+native routed_experts for cuda from "cuda/routed_experts.cu":
     static (H, F)
     scratch product bytes (B * T * F * 2)
-    launch qwen_routed_experts_expand:
+    launch routed_experts_expand:
         threadgroups (ceil_div(ceil_div(F, 16), 8), ceil_div(T, 32), B)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (32 * 144 + 2 * 10240) + 2 * 4096)
-    launch qwen_routed_experts_down:
+    launch routed_experts_down:
         threadgroups (ceil_div(ceil_div(H, 16), 8), ceil_div(T, 32), B)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (32 * 144 + 10240) + 4096)
 
 # Vulkan: the Metal form on the projection library's GEMM (paired gate/up
 # tiles, then the down tiles).
-native qwen_routed_experts for vulkan from "vulkan/qwen_routed_experts.comp":
+native routed_experts for vulkan from "vulkan/routed_experts.comp":
     static (H, F)
     params (TILE_M in [32, 64], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
     where SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch product bytes (B * T * F * 2)
-    launch qwen_routed_experts_expand:
+    launch routed_experts_expand:
         threadgroups (ceil_div(F * 2, TILE_N), B * ceil_div(T, TILE_M), 1)
         threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
         shared_bytes ((TILE_M + TILE_N) * 80)
-    launch qwen_routed_experts_down:
+    launch routed_experts_down:
         threadgroups (ceil_div(H, TILE_N), B * ceil_div(T, TILE_M), 1)
         threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
         shared_bytes ((TILE_M + TILE_N) * 80)
+
+# CPU: the normalized rows staged once as F32; work item (x, b) owns ROWS
+# features (then ROWS output channels) of block b across its live rows, with
+# the products as F32 in scratch.
+native routed_experts for cpu from "cpu/routed_experts.rs":
+    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    scratch quantized bytes (M * ceil_div(H, 256) * 292)
+    scratch product_q8 bytes (B * T * ceil_div(F, 256) * 292)
+    scratch staged bytes (M * H * 4)
+    scratch product bytes (B * T * F * 4)
+    launch routed_experts_stage:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch routed_experts_expand:
+        threadgroups (ceil_div(F, ROWS), B, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch routed_experts_quantize when INT8 == 1:
+        threadgroups (B * T, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch routed_experts_down:
+        threadgroups (ceil_div(H, ROWS), B, 1)
+        threads_per_threadgroup (1, 1, 1)
 
 
 # The shared expert over every row (gate/up with SiLU . mul, then down), and
 # the grouped expert outputs unpermuted in slot order: publishes
 # residual + selected + round_A(shared) * coefficient.
-fn qwen_routed_combine[M, H, K, B, T, S](residual: &tensor[M, H] f32,
+fn routed_combine[M, H, K, B, T, S](residual: &tensor[M, H] f32,
     expert_output: &tensor[B, T, H] A, inverse: &tensor[M, K] i32,
     scores: &tensor[M, K] f32, normalized: &tensor[M, H] A,
     coefficient: &tensor[M] f32, shared_gate: &tensor[S, H] SGW,
@@ -409,51 +486,73 @@ fn qwen_routed_combine[M, H, K, B, T, S](residual: &tensor[M, H] f32,
 # Metal: the shared gate/up GEMM, the shared down GEMM into scratch
 # (`combine_down`), then an unpermuting pass (3 launches). (CUDA: the down
 # GEMM's epilogue unpermutes, 2 launches.)
-native qwen_routed_combine for metal from "metal/qwen_routed_combine.metal":
+native routed_combine for metal from "metal/routed_combine.metal":
     static (H, K, S)
     params (TILE_M in [64, 128, 32], TILE_N in [64, 128])
     scratch shared_product bytes (M * S * 2)
     scratch shared_output bytes (M * H * 2)
-    launch qwen_routed_combine_shared:
+    launch routed_combine_shared:
         threadgroups (ceil_div(S * 2, TILE_N), ceil_div(M, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
-    launch qwen_routed_combine_down:
+    launch routed_combine_down:
         threadgroups (ceil_div(H, TILE_N), ceil_div(M, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
-    launch qwen_routed_combine:
+    launch routed_combine:
         threadgroups (ceil_div(H, 2048), M, 1)
         threads_per_threadgroup (256, 1, 1)
 
 # CUDA: the shared gate/up GEMM, then the shared down GEMM whose epilogue
 # unpermutes the grouped expert outputs (2 launches). (Metal: 3 launches.)
-native qwen_routed_combine for cuda from "cuda/qwen_routed_combine.cu":
+native routed_combine for cuda from "cuda/routed_combine.cu":
     static (H, K, S)
     scratch shared_product bytes (M * S * 2)
-    launch qwen_routed_combine_shared:
+    launch routed_combine_shared:
         threadgroups (ceil_div(ceil_div(S, 16), 8), ceil_div(M, 64), 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (64 * 144 + 2 * 10240) + 2 * 4096)
-    launch qwen_routed_combine:
+    launch routed_combine:
         threadgroups (ceil_div(ceil_div(H, 16), 8), ceil_div(M, 64), 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (64 * 144 + 10240) + 4096)
 
 # Vulkan: the Metal form (3 launches): the shared expert's paired GEMM, its
 # down GEMM, then the unpermuting combine.
-native qwen_routed_combine for vulkan from "vulkan/qwen_routed_combine.comp":
+native routed_combine for vulkan from "vulkan/routed_combine.comp":
     static (H, K, S)
     params (TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
     where SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch shared_product bytes (M * S * 2)
     scratch shared_output bytes (M * H * 2)
-    launch qwen_routed_combine_shared:
+    launch routed_combine_shared:
         threadgroups (ceil_div(S * 2, TILE_N), ceil_div(M, TILE_M), 1)
         threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
         shared_bytes ((TILE_M + TILE_N) * 80)
-    launch qwen_routed_combine_down:
+    launch routed_combine_down:
         threadgroups (ceil_div(H, TILE_N), ceil_div(M, TILE_M), 1)
         threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
         shared_bytes ((TILE_M + TILE_N) * 80)
-    launch qwen_routed_combine:
+    launch routed_combine:
         threadgroups (ceil_div(H, 2048), M, 1)
         threads_per_threadgroup (256, 1, 1)
+
+# CPU: the normalized rows staged once as F32; ROWS shared features per work
+# item against every row (F32 products in scratch); then ROWS output channels
+# per work item: the shared down projection and the unpermuting combine.
+native routed_combine for cpu from "cpu/routed_combine.rs":
+    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    scratch quantized bytes (M * ceil_div(H, 256) * 292)
+    scratch shared_q8 bytes (M * ceil_div(S, 256) * 292)
+    scratch staged bytes (M * H * 4)
+    scratch shared_product bytes (M * S * 4)
+    launch routed_combine_stage:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch routed_combine_shared:
+        threadgroups (ceil_div(S, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch routed_combine_quantize when INT8 == 1:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch routed_combine:
+        threadgroups (ceil_div(H, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)

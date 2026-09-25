@@ -1,7 +1,7 @@
 // head_logits_rows: the vocabulary projection of already-normalized feature
 // rows (the draft head's readout) into F32 logits.
 #define KERNEL_W0 SEISMIC_WEIGHT
-#include "common/projection.h"
+#include "lib/projection/projection.h"
 
 typedef element::Act activation;
 

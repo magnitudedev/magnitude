@@ -2,7 +2,7 @@
 //! Run only with MAGNITUDE_REAL_RECURRENT_FIXTURE set to its generated directory.
 
 use magnitude_model_kernels::{
-    qwen_recurrent_output, qwen_recurrent_project, qwen_recurrent_step, repack_weight,
+    gated_delta_output, gated_delta_project, gated_delta_step, repack_weight,
 };
 use seismic::{BackendName, Device, DeviceCatalog, Element, Tensor};
 use std::{fs, path::Path};
@@ -126,6 +126,15 @@ fn report(path: &Path, label: &str, actual: Vec<f32>) {
     }
 }
 
+/// Metal and the CPU device.
+fn devices() -> Vec<Device> {
+    let catalog = DeviceCatalog::discover().unwrap();
+    vec![
+        catalog.open_backend(BackendName::Metal).unwrap(),
+        catalog.open_backend(BackendName::Cpu).unwrap(),
+    ]
+}
+
 #[test]
 #[cfg(target_os = "macos")]
 fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf() {
@@ -133,11 +142,23 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf() {
         eprintln!("real GGUF fixture absent; set MAGNITUDE_REAL_RECURRENT_FIXTURE to run oracle");
         return;
     };
-    let path = Path::new(&path);
-    let device = DeviceCatalog::discover()
-        .unwrap()
-        .open_backend(BackendName::Metal)
-        .unwrap();
+    for device in devices() {
+        actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(&device, Path::new(&path));
+    }
+}
+
+/// The step's specialization at the 4B geometry: the statics and 32 state
+/// rows per threadgroup on Metal, 32 state rows per work item on the CPU.
+fn step_specialization(device: &Device) -> seismic::NativeSpecialization {
+    let rows = seismic::NativeSpecialization::new().with_param("ROWS", 32);
+    if device.backend() == BackendName::Cpu {
+        return rows;
+    }
+    rows.with_static("NK", 16).with_static("NV", 32).with_static("W", 128).with_static("C", 4)
+}
+
+fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &Path) {
+    println!("{}:", device.backend().as_str());
     let f32e = Element::f32();
     let bf16 = Element::bf16();
     let q5 = Element::named("q5k").unwrap();
@@ -171,9 +192,9 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf() {
     let tape_row = (32 + 16) * 128 + 32;
     let mut tape = f32_tensor(&device, &[2, 1, tape_row as u64], &vec![0.0; 2 * tape_row]);
 
-    let projection = qwen_recurrent_project::native_for_device_with(
+    let projection = gated_delta_project::native_for_device_with(
         &device,
-        qwen_recurrent_project::Elements {
+        gated_delta_project::Elements {
             NW: f32e,
             QW: q5,
             GW: q4,
@@ -184,7 +205,7 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf() {
         &seismic::NativeSpecialization::new(),
     )
     .unwrap()
-    .call(qwen_recurrent_project::Args {
+    .call(gated_delta_project::Args {
         hidden: &hidden,
         input_norm: &norm,
         qkv_weight: &qkv,
@@ -197,18 +218,13 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf() {
     .value;
     report(path, "projection", read_bf16(&projection));
 
-    let mixed = qwen_recurrent_step::native_for_device_with(
+    let mixed = gated_delta_step::native_for_device_with(
         &device,
-        qwen_recurrent_step::Elements { A: bf16 },
-        &seismic::NativeSpecialization::new()
-            .with_static("NK", 16)
-            .with_static("NV", 32)
-            .with_static("W", 128)
-            .with_static("C", 4)
-            .with_param("ROWS", 32),
+        gated_delta_step::Elements { A: bf16 },
+        &step_specialization(device),
     )
     .unwrap()
-    .call(qwen_recurrent_step::Args {
+    .call(gated_delta_step::Args {
         projection: &projection,
         convolution: &convolution,
         rate: &rate,
@@ -228,9 +244,9 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf() {
     .value;
     report(path, "mixed", read_bf16(&mixed));
     report(path, "delta", read_f32(&delta.slice_leading(1, 2).unwrap()));
-    let projected = qwen_recurrent_output::native_for_device_with(
+    let projected = gated_delta_output::native_for_device_with(
         &device,
-        qwen_recurrent_output::Elements {
+        gated_delta_output::Elements {
             RN: f32e,
             OW: q5,
             A: bf16,
@@ -238,7 +254,7 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf() {
         &seismic::NativeSpecialization::new(),
     )
     .unwrap()
-    .call(qwen_recurrent_output::Args {
+    .call(gated_delta_output::Args {
         hidden: &hidden,
         mixed: &mixed,
         projection: &projection,

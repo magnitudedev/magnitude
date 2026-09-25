@@ -4,45 +4,32 @@ use std::path::{Path, PathBuf};
 
 /// Every entry is implemented on each of these backends, one asset per
 /// backend at `kernels/<backend>/<entry>.<extension>`.
-const BACKENDS: [BackendName; 3] = [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan];
+const BACKENDS: [BackendName; 4] = [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan];
 
-/// `common/` files that exist on only some backends: (path without extension,
-/// the backends that have it, why). Every other `common/` file exists on all
-/// of `BACKENDS`. An entry whose actual presence differs, including one now on
-/// every backend, fails the build so this list cannot go stale.
-const COMMON_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
+/// Files of the per-backend trees that exist on only some backends: (path
+/// relative to `kernels/<backend>/`, without extension; the backends that have
+/// it; why). Every other file — entry asset or library file, at any depth —
+/// exists on all of `BACKENDS`. An exception whose actual presence differs,
+/// including one now on every backend, fails the build so this list cannot go
+/// stale.
+const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     (
-        "attention_prefill",
-        &[BackendName::Cuda],
-        "tensor-core flash prefill body; Metal keeps its prefill in `attention.h`, Vulkan in `prefill.glsl`",
+        "lib/attention/prefill",
+        &[BackendName::Cuda, BackendName::Vulkan],
+        "prefill attention body (CUDA tensor-core flash, Vulkan tiled); Metal keeps its prefill in `attention.h`",
     ),
     (
-        "prefill",
-        &[BackendName::Vulkan],
-        "prefill attention body; Metal keeps it in `attention.h`, CUDA in `attention_prefill.cuh`",
-    ),
-    (
-        "flash",
+        "lib/attention/flash",
         &[BackendName::Vulkan],
         "cooperative-matrix tile pieces shared by the prefill and vision attention bodies",
     ),
     (
-        "history",
-        &[BackendName::Vulkan],
-        "dense and affine K8/V4 history forms; the affine part of Metal `attention.h` and CUDA `attention.cuh`",
-    ),
-    (
-        "activation",
-        &[BackendName::Vulkan],
-        "`ELEMENT_ACT` names A's ABI symbols, which only entries binding A admit; `element::Act` elsewhere",
-    ),
-    (
-        "precise",
+        "lib/core/precise",
         &[BackendName::Vulkan],
         "bounded-error `exp`: Vulkan permits 3 + 2|x| ulp where Metal and CUDA do not",
     ),
     (
-        "rotary",
+        "lib/core/rotary",
         &[BackendName::Vulkan],
         "rotary sin/cos shared by attention and vision; inside `attention.h` / `attention.cuh` elsewhere",
     ),
@@ -66,7 +53,7 @@ fn main() {
         .canonicalize()
         .expect("the kernels directory exists");
     let mut violations = entry_parity(&kernels, &artifacts.natives);
-    violations.extend(common_parity(&kernels));
+    violations.extend(tree_parity(&kernels));
     if !violations.is_empty() {
         panic!(
             "native backend parity failed ({} violations):\n  - {}",
@@ -76,7 +63,7 @@ fn main() {
     }
 }
 
-const fn extension(backend: BackendName) -> &'static str {
+const fn entry_extension(backend: BackendName) -> &'static str {
     match backend {
         BackendName::Cpu => "rs",
         BackendName::Metal => "metal",
@@ -85,7 +72,7 @@ const fn extension(backend: BackendName) -> &'static str {
     }
 }
 
-const fn common_extension(backend: BackendName) -> &'static str {
+const fn library_extension(backend: BackendName) -> &'static str {
     match backend {
         BackendName::Cpu => "rs",
         BackendName::Metal => "h",
@@ -109,7 +96,7 @@ fn entry_parity(kernels: &Path, natives: &[NativeCoverage]) -> Vec<String> {
         for backend in BACKENDS {
             let expected = kernels
                 .join(backend.as_str())
-                .join(format!("{entry}.{}", extension(backend)));
+                .join(format!("{entry}.{}", entry_extension(backend)));
             match assets.get(&backend) {
                 None => violations.push(format!(
                     "entry `{entry}` has no {} implementation (expected `native {entry} for {} from \"{}\"`)",
@@ -130,32 +117,33 @@ fn entry_parity(kernels: &Path, natives: &[NativeCoverage]) -> Vec<String> {
     violations
 }
 
-/// The `common/` trees of `BACKENDS` hold the same files, relative path
-/// without extension, apart from `COMMON_EXCEPTIONS`.
-fn common_parity(kernels: &Path) -> Vec<String> {
+/// The per-backend trees `kernels/<backend>/` of `BACKENDS` hold the same
+/// files — entry assets and library files, at any depth — by relative path
+/// without extension, apart from `TREE_EXCEPTIONS`.
+fn tree_parity(kernels: &Path) -> Vec<String> {
     let mut presence = BTreeMap::<String, BTreeSet<BackendName>>::new();
     let mut violations = Vec::new();
     for backend in BACKENDS {
-        let common = kernels.join(backend.as_str()).join("common");
-        // A file added to or removed from a tree reruns the check.
-        println!("cargo:rerun-if-changed={}", common.display());
+        let tree = kernels.join(backend.as_str());
         let mut files = Vec::new();
-        collect_files(&common, &mut files);
+        collect_files(&tree, &mut files);
         for file in files {
-            let path = relative(&common, &file);
-            if path.extension().and_then(|value| value.to_str()) != Some(common_extension(backend)) {
+            let path = relative(&tree, &file);
+            let extension = path.extension().and_then(|value| value.to_str());
+            if extension != Some(entry_extension(backend)) && extension != Some(library_extension(backend)) {
                 violations.push(format!(
-                    "`{}` is not a `.{}` file",
+                    "`{}` is neither a `.{}` entry asset nor a `.{}` library file",
                     relative(kernels, &file).display(),
-                    common_extension(backend)
+                    entry_extension(backend),
+                    library_extension(backend)
                 ));
                 continue;
             }
-            let stem = path.with_extension("").to_string_lossy().into_owned();
+            let stem = path.with_extension("").to_string_lossy().replace('\\', "/");
             presence.entry(stem).or_default().insert(backend);
         }
     }
-    let exceptions: BTreeMap<&str, (BTreeSet<BackendName>, &str)> = COMMON_EXCEPTIONS
+    let exceptions: BTreeMap<&str, (BTreeSet<BackendName>, &str)> = TREE_EXCEPTIONS
         .iter()
         .map(|(stem, backends, reason)| (*stem, (backends.iter().copied().collect(), *reason)))
         .collect();
@@ -164,12 +152,12 @@ fn common_parity(kernels: &Path) -> Vec<String> {
         match exceptions.get(stem.as_str()) {
             None if complete => {}
             None => violations.push(format!(
-                "`common/{stem}` exists on {} but not on {}; add the counterparts or list it in COMMON_EXCEPTIONS with a reason",
+                "`{stem}` exists on {} but not on {}; add the counterparts or list it in TREE_EXCEPTIONS with a reason",
                 names(backends),
                 names(&BACKENDS.iter().copied().filter(|backend| !backends.contains(backend)).collect())
             )),
             Some((declared, _)) if declared != backends => violations.push(format!(
-                "COMMON_EXCEPTIONS lists `common/{stem}` on {}, but it exists on {}; update or remove the exception",
+                "TREE_EXCEPTIONS lists `{stem}` on {}, but it exists on {}; update or remove the exception",
                 names(declared),
                 names(backends)
             )),
@@ -179,7 +167,7 @@ fn common_parity(kernels: &Path) -> Vec<String> {
     for (stem, (declared, _)) in &exceptions {
         if !presence.contains_key(*stem) {
             violations.push(format!(
-                "COMMON_EXCEPTIONS lists `common/{stem}` on {}, but no backend has it; remove the exception",
+                "TREE_EXCEPTIONS lists `{stem}` on {}, but no backend has it; remove the exception",
                 names(declared)
             ));
         }
@@ -187,7 +175,10 @@ fn common_parity(kernels: &Path) -> Vec<String> {
     violations
 }
 
+/// Every file under `directory`, recursively. Each visited directory is a
+/// rerun trigger, so adding or removing a file reruns the check.
 fn collect_files(directory: &Path, files: &mut Vec<PathBuf>) {
+    println!("cargo:rerun-if-changed={}", directory.display());
     let entries = std::fs::read_dir(directory)
         .unwrap_or_else(|error| panic!("reading {}: {error}", directory.display()));
     for entry in entries {

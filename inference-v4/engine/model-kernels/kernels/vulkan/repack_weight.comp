@@ -10,7 +10,7 @@
 // group's first column also writes that group's coefficients. Code stores
 // are 4- or 16-byte words. Stored-but-unoccupied bytes (plane alignment
 // tails, groups beyond K) are written as zero, so the result is fully defined.
-#include "common/element.glsl"
+#include <seismic/element.glsl>
 
 #if !defined(SEISMIC_ELEMENT_E_KIND_EXTERNAL) || !defined(SEISMIC_ELEMENT_U_LAYOUT_ROWS16)
 #error "repack_weight converts an external GGUF source into rows16 resident storage"

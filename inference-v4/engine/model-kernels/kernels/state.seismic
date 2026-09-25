@@ -26,3 +26,11 @@ native copy_rows for vulkan from "vulkan/copy_rows.comp":
     launch copy_rows:
         threadgroups (min(ceil_div(N * KV * W, 256), 65535), 1, 1)
         threads_per_threadgroup (256, 1, 1)
+
+# CPU: one work item per copied item moves its KV rows as storage words, so
+# every dense plane element, integer planes included, is covered.
+native copy_rows for cpu from "cpu/copy_rows.rs":
+    elements (A in [f32, bf16, f16, u32, i32])
+    launch copy_rows:
+        threadgroups (N, 1, 1)
+        threads_per_threadgroup (1, 1, 1)

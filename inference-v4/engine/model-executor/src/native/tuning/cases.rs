@@ -5,7 +5,7 @@
 
 use super::{row_points, EntryTuning, PointShape, TuningInputs, TuningLimits};
 use magnitude_model_contracts::{WeightKind, WeightScope};
-use magnitude_model_kernels::{qwen_dense_expand, qwen_dense_output};
+use magnitude_model_kernels::{dense_expand, dense_output};
 use seismic::{Element, Tensor};
 
 /// The static dimensions `[rows, columns]` a projection weight fixes, checked
@@ -34,7 +34,7 @@ pub(crate) fn projection_shape(
     shape.ok_or_else(|| "a tuning case needs at least one layer".to_owned())
 }
 
-/// `qwen_dense_expand`: RMS prologue, paired gate/up projection, SiLU·mul.
+/// `dense_expand`: RMS prologue, paired gate/up projection, SiLU·mul.
 pub(crate) struct DenseExpandTuning {
     pub norm: Element,
     pub gate: Element,
@@ -55,8 +55,8 @@ pub(crate) struct DenseExpandCase {
 }
 
 impl DenseExpandTuning {
-    fn elements(&self) -> qwen_dense_expand::Elements {
-        qwen_dense_expand::Elements {
+    fn elements(&self) -> dense_expand::Elements {
+        dense_expand::Elements {
             NW: self.norm,
             GW: self.gate,
             UW: self.up,
@@ -66,7 +66,7 @@ impl DenseExpandTuning {
 }
 
 impl EntryTuning for DenseExpandTuning {
-    type Entry = qwen_dense_expand::Entry;
+    type Entry = dense_expand::Entry;
     type Case = DenseExpandCase;
 
     fn bindings(&self) -> String {
@@ -118,8 +118,8 @@ impl EntryTuning for DenseExpandTuning {
             .collect()
     }
 
-    fn args<'a>(case: &'a mut Self::Case) -> qwen_dense_expand::Args<'a> {
-        qwen_dense_expand::Args {
+    fn args<'a>(case: &'a mut Self::Case) -> dense_expand::Args<'a> {
+        dense_expand::Args {
             residual: &case.residual,
             norm: &case.norm,
             gate_weight: &case.gate,
@@ -129,10 +129,10 @@ impl EntryTuning for DenseExpandTuning {
         }
     }
 
-    generated_entry!(qwen_dense_expand, this => this.elements());
+    generated_entry!(dense_expand, this => this.elements());
 }
 
-/// `qwen_dense_output`: down projection plus residual.
+/// `dense_output`: down projection plus residual.
 pub(crate) struct DenseOutputTuning {
     pub down: Element,
     pub activation: Element,
@@ -147,8 +147,8 @@ pub(crate) struct DenseOutputCase {
 }
 
 impl DenseOutputTuning {
-    fn elements(&self) -> qwen_dense_output::Elements {
-        qwen_dense_output::Elements {
+    fn elements(&self) -> dense_output::Elements {
+        dense_output::Elements {
             DW: self.down,
             A: self.activation,
         }
@@ -156,7 +156,7 @@ impl DenseOutputTuning {
 }
 
 impl EntryTuning for DenseOutputTuning {
-    type Entry = qwen_dense_output::Entry;
+    type Entry = dense_output::Entry;
     type Case = DenseOutputCase;
 
     fn bindings(&self) -> String {
@@ -201,8 +201,8 @@ impl EntryTuning for DenseOutputTuning {
             .collect()
     }
 
-    fn args<'a>(case: &'a mut Self::Case) -> qwen_dense_output::Args<'a> {
-        qwen_dense_output::Args {
+    fn args<'a>(case: &'a mut Self::Case) -> dense_output::Args<'a> {
+        dense_output::Args {
             residual: &case.residual,
             product: &case.product,
             down_weight: &case.down,
@@ -210,5 +210,5 @@ impl EntryTuning for DenseOutputTuning {
         }
     }
 
-    generated_entry!(qwen_dense_output, this => this.elements());
+    generated_entry!(dense_output, this => this.elements());
 }

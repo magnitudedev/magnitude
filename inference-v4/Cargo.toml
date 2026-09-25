@@ -19,6 +19,7 @@ members = [
   "seismic/lang",
   "seismic/ir",
   "seismic/native-target",
+  "seismic/native-cpu",
   "seismic/estimator/core",
   "seismic/estimator/metal",
   "seismic/backends/metal",
@@ -43,6 +44,7 @@ default-members = [
   "seismic/lang",
   "seismic/ir",
   "seismic/native-target",
+  "seismic/native-cpu",
   "seismic/estimator/core",
   "seismic/estimator/metal",
   "seismic/backends/metal",
@@ -65,6 +67,7 @@ license = "UNLICENSED"
 seismic-estimator-metal = { path = "seismic/estimator/metal" }
 seismic-ir = { path = "seismic/ir" }
 seismic-native-target = { path = "seismic/native-target" }
+seismic-native-cpu = { path = "seismic/native-cpu" }
 seismic-estimator = { path = "seismic/estimator/core" }
 serde = { version = "=1.0.229", features = ["derive"] }
 postcard = { version = "=1.1.3", default-features = false, features = ["use-std"] }
@@ -81,6 +84,18 @@ seismic-build = { path = "seismic/build" }
 
 [profile.dev]
 debug = "line-tables-only"
+
+# CPU native kernels compile into the crates below; unoptimized, they are
+# unusable even in tests. The generic Seismic CPU library code is
+# instantiated in the kernel crate, so its level is the kernel crate's.
+[profile.dev.package.magnitude-model-kernels]
+opt-level = 3
+
+[profile.dev.package.seismic-native-cpu]
+opt-level = 3
+
+[profile.dev.package.seismic-native-tests]
+opt-level = 3
 
 [profile.release]
 debug = 1

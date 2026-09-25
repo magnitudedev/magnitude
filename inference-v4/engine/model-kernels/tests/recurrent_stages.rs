@@ -1,6 +1,7 @@
-// Recurrent state entries against their semantic oracle.
+// Recurrent state entries against their semantic oracle, on Metal (when
+// present) and the CPU.
 //
-// `qwen_recurrent_step` and `qwen_recurrent_chunk` share one portable body
+// `gated_delta_step` and `gated_delta_chunk` share one portable body
 // (`gated_delta_rows`). Small geometries run that body in the Seismic
 // interpreter; the real 4B geometry uses an independent f64 host model of the
 // same contract. Every case checks the mixed outputs, the published window
@@ -8,7 +9,7 @@
 // slot's successor changes: accepted banks, the zero seed, and unrelated
 // banks keep their exact bytes.
 
-use magnitude_model_kernels::{qwen_recurrent_chunk, qwen_recurrent_step};
+use magnitude_model_kernels::{gated_delta_chunk, gated_delta_step};
 use seismic::{BackendName, Device, DeviceCatalog, Element, NativeSpecialization, Tensor};
 
 const SENTINEL: f32 = 7.25;
@@ -105,8 +106,8 @@ struct Tensors {
 }
 
 impl Tensors {
-    fn step_args<'a>(&'a mut self, case: &Case) -> qwen_recurrent_step::Args<'a> {
-        qwen_recurrent_step::Args {
+    fn step_args<'a>(&'a mut self, case: &Case) -> gated_delta_step::Args<'a> {
+        gated_delta_step::Args {
             projection: &self.projection,
             convolution: &self.convolution,
             rate: &self.rate,
@@ -124,8 +125,8 @@ impl Tensors {
         }
     }
 
-    fn chunk_args<'a>(&'a mut self, case: &Case) -> qwen_recurrent_chunk::Args<'a> {
-        qwen_recurrent_chunk::Args {
+    fn chunk_args<'a>(&'a mut self, case: &Case) -> gated_delta_chunk::Args<'a> {
+        gated_delta_chunk::Args {
             projection: &self.projection,
             convolution: &self.convolution,
             rate: &self.rate,
@@ -449,7 +450,7 @@ impl Case {
         let module = check_source(sources).unwrap();
         let elements = ElementBindings::new().bind("A", registry::dense(DType::F32));
         let logical = module
-            .entry(module.entry_named("qwen_recurrent_step").unwrap(), &elements)
+            .entry(module.entry_named("gated_delta_step").unwrap(), &elements)
             .unwrap();
         let g = self.geometry;
         let floats = |shape: Vec<usize>, values: &[f32]| {
@@ -581,48 +582,54 @@ impl Case {
         }
     }
 
-    fn statics(&self) -> NativeSpecialization {
+    /// The specialization with `ROWS` state rows per threadgroup (Metal) or
+    /// work item (CPU, whose implementations have no static dimensions).
+    fn specialization(&self, device: &Device, rows: u64) -> NativeSpecialization {
+        if is_cpu(device) {
+            return NativeSpecialization::new().with_param("ROWS", rows);
+        }
         let g = self.geometry;
         NativeSpecialization::new()
             .with_static("NK", g.key_heads as u64)
             .with_static("NV", g.value_heads as u64)
             .with_static("W", g.width as u64)
             .with_static("C", g.convolution as u64)
+            .with_param("ROWS", rows)
     }
 
-    /// The Metal step with `ROWS` state rows per threadgroup.
-    fn metal_step(&self, device: &Device, activation: Element, rows: u64)
-        -> seismic::NativeKernel<qwen_recurrent_step::Entry> {
-        qwen_recurrent_step::native_for_device_with(
+    /// The step with `ROWS` state rows per threadgroup or work item.
+    fn native_step(&self, device: &Device, activation: Element, rows: u64)
+        -> seismic::NativeKernel<gated_delta_step::Entry> {
+        gated_delta_step::native_for_device_with(
             device,
-            qwen_recurrent_step::Elements { A: activation },
-            &self.statics().with_param("ROWS", rows),
+            gated_delta_step::Elements { A: activation },
+            &self.specialization(device, rows),
         )
         .unwrap()
     }
 
-    /// The Metal chunk with `ROWS` state rows per threadgroup.
-    fn metal_chunk(&self, device: &Device, activation: Element, rows: u64)
-        -> seismic::NativeKernel<qwen_recurrent_chunk::Entry> {
-        qwen_recurrent_chunk::native_for_device_with(
+    /// The chunk with `ROWS` state rows per threadgroup or work item.
+    fn native_chunk(&self, device: &Device, activation: Element, rows: u64)
+        -> seismic::NativeKernel<gated_delta_chunk::Entry> {
+        gated_delta_chunk::native_for_device_with(
             device,
-            qwen_recurrent_chunk::Elements { A: activation },
-            &self.statics().with_param("ROWS", rows),
+            gated_delta_chunk::Elements { A: activation },
+            &self.specialization(device, rows),
         )
         .unwrap()
     }
 
-    /// The Metal step (`None`) or the chunk with `ROWS` (`Some`).
+    /// The step (`None`) or the chunk with `ROWS` (`Some`).
     fn native(&self, device: &Device, activation: Element, chunk: Option<u64>) -> Outcome {
         let mut t = self.tensors(device, activation);
         let mixed = match chunk {
             None => self
-                .metal_step(device, activation, 32.min(self.geometry.width as u64))
+                .native_step(device, activation, 32.min(self.geometry.width as u64))
                 .call(t.step_args(self))
                 .unwrap()
                 .value,
             Some(mapping) => self
-                .metal_chunk(device, activation, mapping)
+                .native_chunk(device, activation, mapping)
                 .call(t.chunk_args(self))
                 .unwrap()
                 .value,
@@ -747,8 +754,24 @@ fn metal() -> Option<Device> {
         .and_then(|catalog| catalog.open_backend(BackendName::Metal).ok())
 }
 
-/// The Metal chunk's `ROWS` mappings.
-const METAL_CHUNK_ROWS: [u64; 3] = [128, 64, 32];
+/// Metal when present and the CPU device. (Vulkan's mappings are checked in
+/// `vulkan_recurrent.rs`, CUDA's in `cuda_recurrent.rs`.)
+fn devices() -> Vec<Device> {
+    let catalog = DeviceCatalog::discover().unwrap();
+    catalog
+        .open_backend(BackendName::Metal)
+        .ok()
+        .into_iter()
+        .chain(std::iter::once(catalog.open_backend(BackendName::Cpu).unwrap()))
+        .collect()
+}
+
+fn is_cpu(device: &Device) -> bool {
+    device.backend() == BackendName::Cpu
+}
+
+/// The chunk's `ROWS` mappings on Metal and on the CPU.
+const CHUNK_ROWS: [u64; 3] = [128, 64, 32];
 
 const SMALL: Geometry = Geometry {
     key_heads: 2,
@@ -783,20 +806,25 @@ fn small_cases() -> Vec<(&'static str, Case)> {
 
 #[test]
 fn step_and_chunk_match_the_portable_body() {
-    let Some(device) = metal() else {
-        return;
-    };
+    for device in devices() {
+        step_and_chunk_match_the_portable_body_on(&device);
+    }
+}
+
+fn step_and_chunk_match_the_portable_body_on(device: &Device) {
+    let backend = device.backend().as_str();
     for (label, case) in small_cases() {
+        let label = format!("{backend} {label}");
         let oracle = case.oracle();
         let host = case.host();
         // The f64 host model and the interpreted body agree closely; this
         // pins the host model used for the real geometry below.
         check(&format!("{label}: host vs body"), &case, &host, &oracle, (1e-4, 1e-5));
-        let step = case.native(&device, Element::f32(), None);
+        let step = case.native(device, Element::f32(), None);
         check(&format!("{label}: step"), &case, &step, &oracle, (2e-5, 2e-6));
-        for rows in METAL_CHUNK_ROWS {
+        for rows in CHUNK_ROWS {
             let rows = rows.min(case.geometry.width as u64);
-            let chunked = case.native(&device, Element::f32(), Some(rows));
+            let chunked = case.native(device, Element::f32(), Some(rows));
             check(&format!("{label}: chunk ROWS {rows}"), &case, &chunked, &oracle, (5e-4, 2e-5));
         }
     }
@@ -857,16 +885,21 @@ fn tape_versions_equal_stopped_runs(label: &str, geometry: Geometry, run: &dyn F
 
 #[test]
 fn tape_cases_match_the_portable_body() {
-    let Some(device) = metal() else {
-        return;
-    };
+    for device in devices() {
+        tape_cases_match_the_portable_body_on(&device);
+    }
+}
+
+fn tape_cases_match_the_portable_body_on(device: &Device) {
+    let backend = device.backend().as_str();
     for (label, case) in tape_cases() {
+        let label = format!("{backend} {label}");
         let oracle = case.oracle();
         check(&format!("{label}: host vs body"), &case, &case.host(), &oracle, (1e-4, 1e-5));
-        check(&format!("{label}: step"), &case, &case.native(&device, Element::f32(), None), &oracle, (2e-5, 2e-6));
-        for rows in METAL_CHUNK_ROWS {
+        check(&format!("{label}: step"), &case, &case.native(device, Element::f32(), None), &oracle, (2e-5, 2e-6));
+        for rows in CHUNK_ROWS {
             let rows = rows.min(case.geometry.width as u64);
-            let chunked = case.native(&device, Element::f32(), Some(rows));
+            let chunked = case.native(device, Element::f32(), Some(rows));
             check(&format!("{label}: chunk ROWS {rows}"), &case, &chunked, &oracle, (5e-4, 2e-5));
         }
     }
@@ -874,27 +907,38 @@ fn tape_cases_match_the_portable_body() {
 
 #[test]
 fn tape_versions_equal_runs_that_stopped_there() {
-    let Some(device) = metal() else {
-        return;
-    };
+    for device in devices() {
+        tape_versions_equal_runs_that_stopped_there_on(&device);
+    }
+}
+
+fn tape_versions_equal_runs_that_stopped_there_on(device: &Device) {
     let qwen = Geometry { key_heads: 16, value_heads: 32, width: 128, convolution: 4, banks: 4, tape: 0 };
+    let backend = device.backend().as_str();
     for geometry in [SMALL, qwen] {
-        tape_versions_equal_stopped_runs("step", geometry, &|case| case.native(&device, Element::bf16(), None));
-        tape_versions_equal_stopped_runs("chunk", geometry, &|case| case.native(&device, Element::bf16(), Some(32)));
+        tape_versions_equal_stopped_runs(&format!("{backend} step"), geometry, &|case| {
+            case.native(device, Element::bf16(), None)
+        });
+        tape_versions_equal_stopped_runs(&format!("{backend} chunk"), geometry, &|case| {
+            case.native(device, Element::bf16(), Some(32))
+        });
     }
 }
 
 #[test]
 fn step_row_block_never_changes_bits_and_stop_equals_a_shorter_run() {
-    let Some(device) = metal() else {
-        return;
-    };
+    for device in devices() {
+        step_row_block_never_changes_bits_and_stop_equals_a_shorter_run_on(&device);
+    }
+}
+
+fn step_row_block_never_changes_bits_and_stop_equals_a_shorter_run_on(device: &Device) {
     let slot = |rows, stop| slot(rows, stop, 1, 2);
     let full = Case::new(SMALL, 6, vec![slot(6, 3)], false, 11);
     let mut reference = None;
     for rows in [16u64, 32] {
-        let mut t = full.tensors(&device, Element::f32());
-        let mixed = full.metal_step(&device, Element::f32(), rows).call(t.step_args(&full)).unwrap().value;
+        let mut t = full.tensors(device, Element::f32());
+        let mixed = full.native_step(device, Element::f32(), rows).call(t.step_args(&full)).unwrap().value;
         let outcome = (read(&mixed), read(&t.window), read(&t.delta));
         match &reference {
             None => reference = Some(outcome),
@@ -911,7 +955,7 @@ fn step_row_block_never_changes_bits_and_stop_equals_a_shorter_run() {
     prefix.rows = 3;
     prefix.slots = vec![slot(3, 3)];
     prefix.projection.truncate(3 * SMALL.projection_width());
-    let short = prefix.native(&device, Element::f32(), None);
+    let short = prefix.native(device, Element::f32(), None);
     assert!(
         short.delta.iter().zip(&full_delta).all(|(a, b)| a.to_bits() == b.to_bits()),
         "stop-row state differs from the state of a shorter run"
@@ -924,9 +968,13 @@ fn step_row_block_never_changes_bits_and_stop_equals_a_shorter_run() {
 
 #[test]
 fn real_4b_geometry_step_and_chunk_agree_with_the_host_model() {
-    let Some(device) = metal() else {
-        return;
-    };
+    for device in devices() {
+        real_4b_geometry_step_and_chunk_agree_with_the_host_model_on(&device);
+    }
+}
+
+fn real_4b_geometry_step_and_chunk_agree_with_the_host_model_on(device: &Device) {
+    let backend = device.backend().as_str();
     let geometry = Geometry {
         key_heads: 16,
         value_heads: 32,
@@ -941,14 +989,15 @@ fn real_4b_geometry_step_and_chunk_agree_with_the_host_model() {
         ("prefill 128", 128, vec![slot(128, 128, 1, 3)]),
         ("prefill 512, two slots", 512, vec![slot(300, 211, 1, 3), slot(212, 212, 2, 4)]),
     ] {
+        let label = format!("{backend} {label}");
         let case = Case::new(geometry, rows, slots, false, 21).with_bf16_activations();
         let host = case.host();
-        let step = case.native(&device, Element::bf16(), None);
+        let step = case.native(device, Element::bf16(), None);
         check(&format!("4B {label}: step"), &case, &step, &host, (1e-4, 3e-3));
         if rows >= 16 {
             let mut reference: Option<Outcome> = None;
-            for rows in METAL_CHUNK_ROWS {
-                let chunked = case.native(&device, Element::bf16(), Some(rows));
+            for rows in CHUNK_ROWS {
+                let chunked = case.native(device, Element::bf16(), Some(rows));
                 check(&format!("4B {label}: chunk ROWS {rows}"), &case, &chunked, &host, (1e-3, 3e-3));
                 let (max, rms) = errors(&chunked.mixed, &step.mixed);
                 println!("4B {label}: chunk ROWS {rows} vs step: max {max:.3e} rms {rms:.3e}");
@@ -975,17 +1024,21 @@ fn real_4b_geometry_step_and_chunk_agree_with_the_host_model() {
 /// a request's verify rows never depend on the class.
 #[test]
 fn chunk_short_slots_get_the_step_bits() {
-    let Some(device) = metal() else {
-        return;
-    };
+    for device in devices() {
+        chunk_short_slots_get_the_step_bits_on(&device);
+    }
+}
+
+fn chunk_short_slots_get_the_step_bits_on(device: &Device) {
+    let backend = device.backend().as_str();
     let geometry = Geometry { key_heads: 16, value_heads: 32, width: 128, convolution: 4, banks: 11, tape: 0 };
     let slots = vec![slot(4, 1, 1, 6), slot(16, 9, 2, 7), slot(40, 40, 3, 8), slot(1, 1, 4, 9), slot(7, 0, 5, 10)];
     let case = Case::new(geometry, 70, slots, false, 31).with_bf16_activations();
-    let step = case.native(&device, Element::bf16(), None);
+    let step = case.native(device, Element::bf16(), None);
     let host = case.host();
     let row_elements = geometry.value_heads * geometry.width;
-    for rows in METAL_CHUNK_ROWS {
-        let chunk = case.native(&device, Element::bf16(), Some(rows));
+    for rows in CHUNK_ROWS {
+        let chunk = case.native(device, Element::bf16(), Some(rows));
         let mut first = 0;
         for s in &case.slots {
             let range = first * row_elements..(first + s.rows) * row_elements;
@@ -997,11 +1050,11 @@ fn chunk_short_slots_get_the_step_bits() {
             assert!(
                 step.mixed[range.clone()].iter().zip(&chunk.mixed[range]).all(|(a, b)| a.to_bits() == b.to_bits())
                     && step.delta[bank.clone()].iter().zip(&chunk.delta[bank]).all(|(a, b)| a.to_bits() == b.to_bits()),
-                "chunk ROWS {rows}: a {}-row slot differs from the step",
+                "{backend} chunk ROWS {rows}: a {}-row slot differs from the step",
                 s.rows
             );
         }
-        check(&format!("4B verify mix: chunk ROWS {rows}"), &case, &chunk, &host, (1e-3, 3e-3));
+        check(&format!("{backend} 4B verify mix: chunk ROWS {rows}"), &case, &chunk, &host, (1e-3, 3e-3));
     }
 }
 
@@ -1075,14 +1128,14 @@ fn metal_recurrent_timings() {
             .collect::<Vec<_>>();
         if label.starts_with("step") {
             for step_rows in [32u64, 16, 64] {
-                let kernel = case.metal_step(&device, Element::bf16(), step_rows);
+                let kernel = case.native_step(&device, Element::bf16(), step_rows);
                 let args = rotation.iter_mut().map(|t| t.step_args(&case)).collect();
                 let measured = kernel.measure(args, &options).unwrap();
                 println!("{label} ROWS {step_rows}: {:.1} us", measured.median * 1e6);
             }
         } else {
-            for chunk_rows in METAL_CHUNK_ROWS {
-                let kernel = case.metal_chunk(&device, Element::bf16(), chunk_rows);
+            for chunk_rows in CHUNK_ROWS {
+                let kernel = case.native_chunk(&device, Element::bf16(), chunk_rows);
                 let args = rotation.iter_mut().map(|t| t.chunk_args(&case)).collect();
                 let measured = kernel.measure(args, &options).unwrap();
                 let launches = launch_medians(&device, || {

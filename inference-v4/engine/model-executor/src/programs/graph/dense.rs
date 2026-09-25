@@ -7,7 +7,7 @@ use super::super::native_constants::GraphConstant;
 use super::super::native_target_graph::weight;
 use crate::{ModelLoadPlan, native::DenseKernels};
 use magnitude_model_contracts::{WeightKind, WeightRole, WeightScope};
-use magnitude_model_kernels::{qwen_dense_expand, qwen_dense_output};
+use magnitude_model_kernels::{dense_expand, dense_output};
 use seismic::{NativeGraph, NativePort, WorkflowTensor};
 
 #[allow(clippy::too_many_arguments)]
@@ -30,7 +30,7 @@ pub(crate) fn dense(
     let product = graph
         .enqueue(
             &kernels.expand,
-            qwen_dense_expand::WorkflowArgs {
+            dense_expand::WorkflowArgs {
                 residual: residual.into(),
                 norm: (&norm).into(),
                 gate_weight: (&gate).into(),
@@ -44,7 +44,7 @@ pub(crate) fn dense(
     let output = graph
         .enqueue(
             &kernels.output,
-            qwen_dense_output::WorkflowArgs {
+            dense_output::WorkflowArgs {
                 residual: residual.into(),
                 product: (&product).into(),
                 down_weight: (&down).into(),

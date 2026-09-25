@@ -3,7 +3,7 @@ use super::*;
 use crate::native::import::ImportKernels;
 use crate::planning::tests::{fixture_definition, fixture_manifest};
 use crate::{ComponentSelection, ModelLoadPlan};
-use magnitude_model_kernels::qwen_dense_output;
+use magnitude_model_kernels::dense_output;
 use seismic::{
     BackendName, ConfigurationRecord, DeviceCatalog, Exclusion, LoadError, Outcome,
 };
@@ -122,31 +122,6 @@ fn spaces_up_to_the_complete_size_are_searched_completely_first() {
     assert_eq!(allocate(40, &[24, 24, 8, 1620]), [11, 11, 8, 10]);
 }
 
-#[test]
-fn missing_implementations_are_reported_together_once_each() {
-    let mut missing = MissingImplementations::default();
-    assert!(MissingImplementations::default().finish().is_ok());
-    missing.record("qwen_dense_expand", "b0");
-    missing.record("qwen_attention_decode", "b1");
-    missing.record("qwen_dense_expand", "b0");
-    let Err(CatalogFailure::MissingImplementations(entries)) = missing.finish() else {
-        panic!("missing entries must fail preparation");
-    };
-    assert_eq!(
-        entries,
-        [
-            MissingImplementation {
-                entry: "qwen_dense_expand",
-                bindings: "b0".into()
-            },
-            MissingImplementation {
-                entry: "qwen_attention_decode",
-                bindings: "b1".into()
-            },
-        ]
-    );
-}
-
 fn metal() -> Option<Device> {
     DeviceCatalog::discover()
         .ok()?
@@ -216,7 +191,7 @@ struct FakeArgs {
 }
 
 impl EntryTuning for FakeCase {
-    type Entry = qwen_dense_output::Entry;
+    type Entry = dense_output::Entry;
     type Case = FakeArgs;
 
     fn bindings(&self) -> String {
@@ -244,8 +219,8 @@ impl EntryTuning for FakeCase {
             })
             .collect()
     }
-    fn args<'a>(case: &'a mut FakeArgs) -> qwen_dense_output::Args<'a> {
-        qwen_dense_output::Args {
+    fn args<'a>(case: &'a mut FakeArgs) -> dense_output::Args<'a> {
+        dense_output::Args {
             residual: &case.residual,
             product: &case.product,
             down_weight: &case.down,
@@ -278,7 +253,7 @@ impl EntryTuning for FakeCase {
         assert_eq!(&self.chosen.statics, statics.statics());
         Ok(TuningResult {
             tuning_identity: "fake-device".into(),
-            entry: "qwen_dense_output".into(),
+            entry: "dense_output".into(),
             backend: "metal".into(),
             points: points
                 .iter()
@@ -325,9 +300,9 @@ impl EntryTuning for FakeCase {
         device: &Device,
         specialization: &NativeSpecialization,
     ) -> Result<NativeKernel<Self::Entry>, LoadError> {
-        qwen_dense_output::native_for_device_with(
+        dense_output::native_for_device_with(
             device,
-            qwen_dense_output::Elements {
+            dense_output::Elements {
                 DW: Element::bf16(),
                 A: Element::bf16(),
             },
@@ -358,7 +333,7 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
         max_projected_rows: 8,
         context_tokens: 256,
     };
-    let implementation = seismic::generated::native_implementation::<qwen_dense_output::Entry>(&device)
+    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
         .unwrap()
         .unwrap();
     let statics = implementation.statics.iter().fold(NativeSpecialization::new(), |spec, name| {
@@ -400,7 +375,7 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
     assert!(matches!(
         &events[0],
         TuningEvent::Started {
-            entry: "qwen_dense_output",
+            entry: "dense_output",
             configurations: count,
             points: 3,
             ..
@@ -429,7 +404,7 @@ fn a_stored_tuning_result_is_used_without_tuning_and_a_changed_key_misses() {
     let root = std::env::temp_dir().join(format!("magnitude-tuning-cache-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let cache = KernelCache::open(root.clone(), crate::DEFAULT_KERNEL_CACHE_BYTES).unwrap();
-    let implementation = seismic::generated::native_implementation::<qwen_dense_output::Entry>(&device)
+    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
         .unwrap()
         .unwrap();
     let statics = implementation.statics.iter().fold(NativeSpecialization::new(), |spec, name| {
@@ -507,7 +482,7 @@ fn tuning_a_weight_without_its_import_entry_is_a_typed_failure() {
         repack_weight: HashMap::new(),
     };
     let recorder = Recorder::default();
-    let implementation = seismic::generated::native_implementation::<qwen_dense_output::Entry>(&device)
+    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
         .unwrap()
         .unwrap();
     let statics = implementation.statics.iter().fold(NativeSpecialization::new(), |spec, name| {
@@ -518,7 +493,7 @@ fn tuning_a_weight_without_its_import_entry_is_a_typed_failure() {
         activation: Element::bf16(),
         scopes: vec![WeightScope::TargetBlock(0)],
     };
-    let key = ("qwen_dense_output", case.bindings(), statics.statics().clone());
+    let key = ("dense_output", case.bindings(), statics.statics().clone());
     let mut tuner = Tuner::new(
         &device,
         TuningContext {
@@ -534,7 +509,7 @@ fn tuning_a_weight_without_its_import_entry_is_a_typed_failure() {
     assert!(matches!(
         tuner.tune(&case, &implementation, &statics),
         Err(CatalogFailure::Tuning {
-            entry: "qwen_dense_output",
+            entry: "dense_output",
             ..
         })
     ));
@@ -621,20 +596,4 @@ fn case_state_restores_its_written_rows() {
         .collect::<Vec<_>>();
     assert_eq!(restored, [0.0, 0.0, 2.0, 3.0, 4.0, 5.0, 0.0, 0.0]);
     assert!(initializer(Vec::new()).is_none());
-}
-
-#[test]
-fn missing_implementation_errors_name_the_path_backend_and_entries() {
-    let mut missing = MissingImplementations::default();
-    missing.record("qwen_dense_output", "DW=q4k,A=bf16");
-    missing.record("qwen_dense_output", "DW=q6k,A=bf16");
-    missing.record("sample_rows", "fixed");
-    let failure = missing.finish().unwrap_err();
-    let error = crate::CatalogError::native(BackendName::Cuda, failure);
-    assert_eq!(error.path, crate::ExecutionPath::Native);
-    assert_eq!(
-        error.to_string(),
-        "execution path native on cuda: 2 required entries have no cuda implementation: \
-         qwen_dense_output (2 element bindings), sample_rows"
-    );
 }

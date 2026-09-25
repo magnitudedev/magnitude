@@ -1,4 +1,4 @@
-#include "common/element.h"
+#include "lib/core/activation.h"
 
 typedef ELEMENT_OF(SEISMIC_ELEMENT_E) Source;
 typedef ELEMENT_OF(SEISMIC_ELEMENT_U) Destination;

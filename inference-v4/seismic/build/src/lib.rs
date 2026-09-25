@@ -75,8 +75,8 @@ pub enum BuildError {
         column: usize,
         symbol: String,
     },
-    /// A native asset (or an included file) includes something other than
-    /// its backend's `common/` device library.
+    /// A native asset (or an included file) includes something other than a
+    /// library file of its backend inside the build's source roots.
     NativeInclude(seismic_lang::source::NativeIncludeError),
     /// A Metal implementation binds more buffers than Metal's argument
     /// table holds.
@@ -99,6 +99,9 @@ pub enum BuildError {
     },
     /// A launch names a kernel function the asset does not define.
     NativeKernelMissing { entry: String, kernel: String },
+    /// A CPU library file or CPU native signature the generated Rust cannot
+    /// express.
+    CpuNative { path: PathBuf, reason: String },
 }
 
 impl std::fmt::Display for BuildError {
@@ -138,6 +141,7 @@ impl std::fmt::Display for BuildError {
                 f,
                 "native Vulkan implementation of `{entry}` launches `{kernel}`, but its source defines no `void {kernel}()`"
             ),
+            Self::CpuNative { path, reason } => write!(f, "CPU native source {}: {reason}", path.display()),
         }
     }
 }
@@ -222,7 +226,7 @@ pub struct NativeCoverage {
 
 mod internals {
     use super::*;
-    use seismic_lang::checked::ElementSummary;
+    use seismic_lang::checked::{ElementSummary, ElementTarget, NativeElementCoverage};
     use seismic_lang::registry::{self, CodeInterpretation, PlaneEncoding, RepresentationInfo};
     use std::collections::HashSet;
     use std::fs;
@@ -232,7 +236,15 @@ mod internals {
     /// generated bindings.
     struct EntryNative<'a> {
         entry: seismic_lang::ids::EntryId,
-        cpu: Option<(&'a NativeImplementation, PathBuf)>,
+        cpu: Option<CpuAsset<'a>>,
+    }
+
+    /// A CPU native implementation and its authored source.
+    struct CpuAsset<'a> {
+        definition: &'a NativeImplementation,
+        /// Canonical path of the authored asset, which the bindings include.
+        path: PathBuf,
+        text: &'a str,
     }
 
     pub(super) fn run(build: Build) -> Result<Artifacts, BuildError> {
@@ -255,18 +267,27 @@ mod internals {
         })?;
         for path in loaded.dependencies() { println!("cargo:rerun-if-changed={}", path.display()); }
         for path in build.sources() { println!("cargo:rerun-if-changed={}", path.display()); }
-        // A new `common/` file can satisfy a previously missing include.
-        for asset in &loaded.assets {
-            if !asset.includes.is_empty() {
-                let common = asset.asset.path.parent().expect("canonical asset parent").join("common");
-                println!("cargo:rerun-if-changed={}", common.display());
-            }
-        }
+        // No directory watch is needed: an include resolves from its directive
+        // and the including file alone, so a new file cannot change a successful
+        // build, and a missing include fails the build, which Cargo reruns.
         let checked = &loaded.module;
-        // Captured Metal/CUDA assets carry their `common/` includes inlined,
-        // so the bundle digest below covers every included file.
+        // Captured Metal/CUDA/Vulkan assets carry their includes inlined, so
+        // the bundle digest below covers every included file.
         let encoded = seismic_lang::bundle::encode_checked_bundle(checked);
         let native_assets = resolve_native_assets(checked, &loaded.assets, &output)?;
+        let cpu_assets = native_assets
+            .iter()
+            .filter_map(|native| native.cpu.as_ref().map(|cpu| cpu.path.as_path()))
+            .collect::<Vec<_>>();
+        let cpu_library = if cpu_assets.is_empty() {
+            None
+        } else {
+            let roots = seismic_lang::source::source_roots(build.sources()).map_err(|error| match error {
+                seismic_lang::source::LoadError::Io(error) => BuildError::Io(error),
+                other => BuildError::Environment(format!("{other:?}")),
+            })?;
+            Some(cpu_library(&roots, &cpu_assets)?)
+        };
         // The checked bundle contains the canonical sources, the checked
         // module this build's checker produced (decoded at run time without
         // checking again), bundle format, checker semantic version, registry
@@ -282,7 +303,7 @@ mod internals {
         fs::write(&bundle, encoded).map_err(BuildError::Io)?;
         fs::write(
             &bindings,
-            render(checked, build.module(), &identity, &native_assets),
+            render(checked, build.module(), &identity, &native_assets, cpu_library.as_ref())?,
         )
         .map_err(BuildError::Io)?;
         Ok(Artifacts {
@@ -330,11 +351,15 @@ mod internals {
                 any = true;
                 let source = module.native_asset(entry.id, backend).expect("shared loader captures native assets");
                 let extension = match backend {
-                    // CPU assets are Rust, compiled into the embedding crate.
+                    // CPU assets are Rust, compiled into the embedding crate
+                    // from their authored path, so compiler diagnostics and
+                    // tools point at the authored file.
                     BackendName::Cpu => {
-                        let path = output.join(format!("{}.cpu.rs", entry.name));
-                        fs::write(&path, source).map_err(BuildError::Io)?;
-                        cpu = Some((definition, path));
+                        let files = captured
+                            .iter()
+                            .find(|asset| asset.entry == entry.id && asset.backend == backend)
+                            .expect("shared loader captures every native asset");
+                        cpu = Some(CpuAsset { definition, path: files.asset.path.clone(), text: source });
                         continue;
                     }
                     BackendName::Metal => "metal",
@@ -888,7 +913,8 @@ mod internals {
         name: &str,
         identity: &str,
         native_assets: &[EntryNative<'_>],
-    ) -> String {
+        cpu_library: Option<&CpuLibrary>,
+    ) -> Result<String, BuildError> {
         let mut out = String::new();
         out.push_str("// @generated by seismic-build; do not edit.\n");
         out.push_str(&format!(
@@ -898,19 +924,26 @@ mod internals {
         out.push_str("static __MODULE: seismic::generated::OnceLock<Result<seismic::generated::Module, seismic::CheckedBundleError>> = seismic::generated::OnceLock::new();\n");
         out.push_str("fn module() -> Result<&'static seismic::generated::Module, seismic::CheckedBundleError> { seismic::generated::module_from_bundle(&__MODULE, __BUNDLE) }\n");
         out.push_str(&format!("pub const IDENTITY: &str = {:?};\n", identity));
+        if let Some(library) = cpu_library {
+            render_cpu_library(&mut out, library);
+        }
         for entry in module.entries() {
             let native = native_assets
                 .iter()
                 .find(|native| native.entry == entry.id);
-            render_entry(&mut out, entry, native);
+            render_entry(&mut out, entry, native, cpu_library)?;
         }
-        out
+        Ok(out)
     }
 
-    fn render_entry(out: &mut String, entry: &EntryInfo, native: Option<&EntryNative<'_>>) {
+    fn render_entry(
+        out: &mut String,
+        entry: &EntryInfo,
+        native: Option<&EntryNative<'_>>,
+        cpu_library: Option<&CpuLibrary>,
+    ) -> Result<(), BuildError> {
         let module_name = ident(&entry.name);
         out.push_str(&format!("pub mod {module_name} {{\n"));
-        out.push_str("  use super::*;\n");
         let borrowed = entry.parameters.iter().any(|parameter| {
             matches!(
                 parameter.kind,
@@ -1204,14 +1237,20 @@ mod internals {
             out.push_str("    ])\n  }\n");
         }
         if let Some(native) = native {
-            render_native(out, entry, native);
+            render_native(out, entry, native, cpu_library)?;
         }
         out.push_str("}\n");
+        Ok(())
     }
 
     /// Native entry points, and for a CPU implementation its typed context
-    /// and monomorphized launch table.
-    fn render_native(out: &mut String, entry: &EntryInfo, native: &EntryNative<'_>) {
+    /// and launch table.
+    fn render_native(
+        out: &mut String,
+        entry: &EntryInfo,
+        native: &EntryNative<'_>,
+        cpu_library: Option<&CpuLibrary>,
+    ) -> Result<(), BuildError> {
         let elements = !entry.element_parameters.is_empty();
         let element_list = |out: &mut String| {
             for parameter in &entry.element_parameters {
@@ -1231,37 +1270,282 @@ mod internals {
             out.push_str("  pub fn native_digest_with(device: &seismic::Device, elements: Elements, statics: &seismic::NativeSpecialization) -> Result<String, seismic::TuneError> {\n");
             out.push_str("    seismic::generated::digest_native::<Entry>(device, statics, &[\n");
             element_list(out);
-            out.push_str("    ])\n  }\n");
+            out.push_str(&format!("    ], {cpu})\n  }}\n"));
         } else {
             out.push_str(&format!("  pub fn native_for_device(device: &seismic::Device, specialization: &seismic::NativeSpecialization) -> Result<seismic::NativeKernel<Entry>, seismic::LoadError> {{ seismic::generated::prepare_native::<Entry>(device, specialization, &[], {cpu}) }}\n"));
             out.push_str(&format!("  pub fn native_tune(device: &seismic::Device, statics: &seismic::NativeSpecialization, points: Vec<seismic::TuningPoint<'_, Entry>>, validation: seismic::Validation, strategy: seismic::Strategy) -> Result<seismic::TuningResult, seismic::TuneError> {{ seismic::generated::tune_native::<Entry>(device, statics, &[], {cpu}, points, validation, strategy) }}\n"));
-            out.push_str("  pub fn native_digest(device: &seismic::Device, statics: &seismic::NativeSpecialization) -> Result<String, seismic::TuneError> { seismic::generated::digest_native::<Entry>(device, statics, &[]) }\n");
+            out.push_str(&format!("  pub fn native_digest(device: &seismic::Device, statics: &seismic::NativeSpecialization) -> Result<String, seismic::TuneError> {{ seismic::generated::digest_native::<Entry>(device, statics, &[], {cpu}) }}\n"));
         }
         out.push_str("  /// The checked native implementation for the device's backend.\n");
         out.push_str("  pub fn native_implementation(device: &seismic::Device) -> Result<Option<seismic::NativeImplementation>, seismic::CheckedBundleError> { seismic::generated::native_implementation::<Entry>(device) }\n");
-        if let Some((definition, path)) = &native.cpu {
-            render_cpu_native(out, entry, definition, path);
+        if let Some(cpu) = &native.cpu {
+            let library = cpu_library.expect("a build with a CPU implementation scans its CPU library");
+            render_cpu_native(out, entry, cpu, library)?;
+        }
+        Ok(())
+    }
+
+    /// The CPU library of a build: every `.rs` file of its source roots that
+    /// is not a CPU native asset. Each file is one module of a tree that
+    /// mirrors its directories, so a Rust path between library files, or
+    /// from an asset to a library file, is a path relative to the file.
+    struct CpuLibrary {
+        roots: Vec<PathBuf>,
+        /// Module path (path relative to its root without the extension)
+        /// and canonical path of each file, sorted by module path.
+        files: Vec<(Vec<String>, PathBuf)>,
+        /// Covers every file's module path and contents.
+        digest: [u8; 32],
+    }
+
+    fn cpu_library(roots: &[PathBuf], assets: &[&std::path::Path]) -> Result<CpuLibrary, BuildError> {
+        fn scan(
+            root: &std::path::Path,
+            directory: &std::path::Path,
+            assets: &[&std::path::Path],
+            files: &mut Vec<(Vec<String>, PathBuf)>,
+        ) -> Result<(), BuildError> {
+            // A new library file changes every CPU implementation's module
+            // tree and digest.
+            println!("cargo:rerun-if-changed={}", directory.display());
+            let mut entries = fs::read_dir(directory)
+                .map_err(BuildError::Io)?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(BuildError::Io)?;
+            entries.sort();
+            for path in entries {
+                let hidden = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with('.'));
+                if hidden {
+                    continue;
+                }
+                if path.is_dir() {
+                    scan(root, &path, assets, files)?;
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    let path = path.canonicalize().map_err(BuildError::Io)?;
+                    if assets.contains(&path.as_path()) {
+                        continue;
+                    }
+                    println!("cargo:rerun-if-changed={}", path.display());
+                    let modules = path
+                        .strip_prefix(root)
+                        .expect("a scanned file lies under its root")
+                        .with_extension("")
+                        .components()
+                        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>();
+                    for module in &modules {
+                        if ident(module) != *module {
+                            return Err(BuildError::CpuNative {
+                                path,
+                                reason: format!("`{module}` is not a Rust module name; CPU library paths become module paths"),
+                            });
+                        }
+                    }
+                    files.push((modules, path));
+                }
+            }
+            Ok(())
+        }
+        let mut files = Vec::new();
+        for root in roots {
+            scan(root, root, assets, &mut files)?;
+        }
+        files.sort();
+        if let Some(pair) = files.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+            return Err(BuildError::CpuNative {
+                path: pair[1].1.clone(),
+                reason: format!("its module path `{}` is also `{}`", pair[1].0.join("::"), pair[0].1.display()),
+            });
+        }
+        let mut digest = Sha256::new();
+        for (modules, path) in &files {
+            digest.update(modules.join("/").as_bytes());
+            digest.update([0u8]);
+            digest.update(fs::read(path).map_err(BuildError::Io)?);
+            digest.update([0u8]);
+        }
+        Ok(CpuLibrary {
+            roots: roots.to_vec(),
+            files,
+            digest: digest.finalize().into(),
+        })
+    }
+
+    /// The library module tree, once per bindings module.
+    fn render_cpu_library(out: &mut String, library: &CpuLibrary) {
+        #[derive(Default)]
+        struct Node {
+            file: Option<PathBuf>,
+            children: std::collections::BTreeMap<String, Node>,
+        }
+        fn render(out: &mut String, name: &str, node: &Node, depth: usize) {
+            let indent = "  ".repeat(depth);
+            out.push_str(&format!("{indent}pub mod {name} {{\n"));
+            if let Some(file) = &node.file {
+                out.push_str(&format!("{indent}  include!({:?});\n", file.to_string_lossy()));
+            }
+            for (child, node) in &node.children {
+                render(out, child, node, depth + 1);
+            }
+            out.push_str(&format!("{indent}}}\n"));
+        }
+        let mut tree = Node::default();
+        for (modules, path) in &library.files {
+            let node = modules.iter().fold(&mut tree, |node, module| node.children.entry(module.clone()).or_default());
+            node.file = Some(path.clone());
+        }
+        out.push_str("/// The CPU library files of the build's source roots, one module per file.\n");
+        out.push_str("#[allow(dead_code, unused_imports)]\n");
+        render(out, "cpu_library", &tree, 0);
+    }
+
+    /// The CPU library element type of a dense dtype a CPU form covers.
+    fn cpu_element_type(dtype: DType) -> &'static str {
+        match dtype {
+            DType::F32 => "F32",
+            DType::BF16 => "Bf16",
+            DType::F16 => "F16",
+            DType::I32 => "I32",
+            DType::U32 => "U32",
+            DType::Bool => unreachable!("the checker admits no `bool` CPU element"),
+        }
+    }
+
+    /// How a CPU form binds each element parameter of an entry.
+    struct CpuElements {
+        /// Parameters the entry stores, with the dense types the form is
+        /// monomorphized over (declared, or the floating default).
+        dense: Vec<(String, Vec<DType>)>,
+        /// External sources the entry only converts.
+        external: Vec<String>,
+        /// Conversion targets: packed results written by a conversion.
+        packed: Vec<String>,
+    }
+
+    /// Every other element parameter is only read: a weight operand,
+    /// reaching the kernel through its resolved components.
+    fn cpu_elements(entry: &EntryInfo, definition: &NativeImplementation) -> CpuElements {
+        let domain = &entry.element_domain;
+        let converted = |name: &str| {
+            domain
+                .conversions()
+                .iter()
+                .any(|conversion| conversion.target == ElementTarget::Parameter(name.to_owned()))
+        };
+        let mut elements = CpuElements { dense: Vec::new(), external: Vec::new(), packed: Vec::new() };
+        for parameter in domain.parameters() {
+            let name = parameter.name.clone();
+            if converted(&name) {
+                elements.packed.push(name);
+            } else if parameter.uses.stored || parameter.uses.partial_copy {
+                let dtypes = definition
+                    .elements
+                    .iter()
+                    .find(|coverage| coverage.parameter == name)
+                    .map(|coverage| coverage.dtypes.clone())
+                    .unwrap_or_else(|| NativeElementCoverage::DEFAULT.to_vec());
+                elements.dense.push((name, dtypes));
+            } else if parameter.uses.conversion_source && !parameter.uses.decoded_read {
+                elements.external.push(name);
+            }
+        }
+        elements
+    }
+
+    /// How a CPU kernel views a tensor of one element.
+    enum CpuView {
+        /// A dense element type (`E::A`, `seismic::cpu::F32`).
+        Dense(String),
+        /// Raw integer scalars.
+        Scalars(&'static str),
+        /// A weight operand.
+        Weights,
+        /// An external source a conversion reads.
+        External,
+        /// A packed result a conversion writes.
+        Packed,
+    }
+
+    fn cpu_view(element: &ElementSummary, elements: &CpuElements) -> CpuView {
+        match element {
+            ElementSummary::Parameter(name) if elements.dense.iter().any(|(dense, _)| dense == name) => {
+                CpuView::Dense(format!("E::{}", ident(name)))
+            }
+            ElementSummary::Parameter(name) if elements.external.contains(name) => CpuView::External,
+            ElementSummary::Parameter(name) if elements.packed.contains(name) => CpuView::Packed,
+            ElementSummary::Parameter(_) => CpuView::Weights,
+            ElementSummary::Fixed(name) => match name.as_str() {
+                "f32" => CpuView::Dense("seismic::cpu::F32".to_owned()),
+                "bf16" => CpuView::Dense("seismic::cpu::Bf16".to_owned()),
+                "f16" => CpuView::Dense("seismic::cpu::F16".to_owned()),
+                "i32" => CpuView::Scalars("i32"),
+                "u32" => CpuView::Scalars("u32"),
+                "bool" => CpuView::Scalars("u8"),
+                _ => CpuView::Weights,
+            },
         }
     }
 
     /// The typed CPU view of an entry's native ABI, the authored source, and
-    /// one function per launch and tuning configuration.
+    /// per launch one function per instruction-set tier and dense element
+    /// binding. Tuning parameters are runtime values.
     fn render_cpu_native(
         out: &mut String,
         entry: &EntryInfo,
-        definition: &NativeImplementation,
-        path: &std::path::Path,
-    ) {
+        cpu: &CpuAsset<'_>,
+        library: &CpuLibrary,
+    ) -> Result<(), BuildError> {
+        let definition = cpu.definition;
+        let elements = cpu_elements(entry, definition);
         out.push_str("  pub mod cpu_native {\n");
-        out.push_str("    #![allow(dead_code)]\n");
-        out.push_str("    use seismic::native_cpu::{CpuInvocation, CpuKernelFn, CpuLaunchVariants, CpuNativeKernels, CpuTensor};\n");
-        out.push_str(&format!(
-            "    /// Typed view of the CPU native ABI of `{}`.\n",
-            entry.name
-        ));
-        out.push_str("    #[derive(Clone, Copy)]\n");
-        out.push_str("    pub struct Context<'a> { invocation: &'a CpuInvocation<'a> }\n");
-        out.push_str("    impl<'a> Context<'a> {\n");
+        out.push_str("    #![allow(dead_code, non_camel_case_types, unused_imports, clippy::all)]\n");
+        out.push_str("    use seismic::native_cpu::{CpuInvocation, CpuKernelFn, CpuLaunchVariants, CpuNativeKernels, CpuVariant};\n");
+        out.push_str("    use seismic::cpu::{Dense, Element, Isa};\n");
+        // The asset's own directory: its library neighbours are in scope by
+        // name, so its paths are relative to its file.
+        let directory = library
+            .roots
+            .iter()
+            .filter_map(|root| cpu.path.parent().and_then(|parent| parent.strip_prefix(root).ok()))
+            .min_by_key(|relative| relative.components().count())
+            .map(|relative| {
+                relative
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            });
+        if let Some(directory) = directory {
+            let mut neighbours = library
+                .files
+                .iter()
+                .filter(|(modules, _)| modules.len() > directory.len() && modules[..directory.len()] == directory[..])
+                .map(|(modules, _)| modules[directory.len()].clone())
+                .collect::<Vec<_>>();
+            neighbours.dedup();
+            if !neighbours.is_empty() {
+                let path = std::iter::once("cpu_library".to_owned()).chain(directory).collect::<Vec<_>>().join("::");
+                out.push_str(&format!("    use super::super::{path}::{{{}}};\n", neighbours.join(", ")));
+            }
+        }
+        out.push_str(&format!("    /// The dense element binding of `{}` a CPU form is compiled for.\n", entry.name));
+        out.push_str("    pub trait Elements: 'static {\n");
+        for (element, dtypes) in &elements.dense {
+            // Floating coverage converts through `f32`; wider coverage only
+            // moves storage.
+            let bound = if dtypes.iter().all(|dtype| dtype.is_float()) { "Dense" } else { "Element" };
+            out.push_str(&format!("      type {}: {bound};\n", ident(element)));
+        }
+        out.push_str("    }\n");
+        out.push_str(&format!("    /// Typed view of the CPU native ABI of `{}`.\n", entry.name));
+        out.push_str("    pub struct Context<'a, E: Elements> { invocation: &'a CpuInvocation<'a>, elements: std::marker::PhantomData<E> }\n");
+        out.push_str("    impl<E: Elements> Clone for Context<'_, E> { fn clone(&self) -> Self { *self } }\n");
+        out.push_str("    impl<E: Elements> Copy for Context<'_, E> {}\n");
+        out.push_str("    impl<'a, E: Elements> Context<'a, E> {\n");
+        out.push_str("      fn new(invocation: &'a CpuInvocation<'a>) -> Self { Self { invocation, elements: std::marker::PhantomData } }\n");
         out.push_str("      pub fn groups(&self) -> [u64; 3] { self.invocation.groups() }\n");
         out.push_str("      pub fn threads(&self) -> [u64; 3] { self.invocation.threads() }\n");
         let mut word = 0usize;
@@ -1273,12 +1557,27 @@ mod internals {
             word += 1;
         }
         let mut buffer = 0usize;
-        let tensor = |out: &mut String, name: &str, buffer: usize, word: usize, rank: usize| {
+        let tensor = |out: &mut String, name: &str, view: CpuView, buffer: usize, word: usize, rank: usize| {
             let extents = (0..rank).map(|axis| format!("self.invocation.word({})", word + axis)).collect::<Vec<_>>().join(", ");
             let strides = (0..rank).map(|axis| format!("self.invocation.word({})", word + rank + axis)).collect::<Vec<_>>().join(", ");
-            out.push_str(&format!(
-                "      pub fn {name}(&self) -> CpuTensor<{rank}> {{ CpuTensor {{ pointer: self.invocation.buffer({buffer}), extents: [{extents}], strides: [{strides}], representation: self.invocation.representation({buffer}) }} }}\n"
-            ));
+            let safety = "// SAFETY: the runtime binds every view inside its allocation for the call.";
+            match view {
+                CpuView::Dense(element) => out.push_str(&format!(
+                    "      pub fn {name}(&self) -> seismic::cpu::Tensor<'a, {element}, {rank}> {{ {safety}\n        unsafe {{ seismic::cpu::Tensor::from_raw(self.invocation.buffer({buffer}), [{extents}], [{strides}]) }} }}\n"
+                )),
+                CpuView::Scalars(scalar) => out.push_str(&format!(
+                    "      pub fn {name}(&self) -> seismic::cpu::Scalars<'a, {scalar}, {rank}> {{ {safety}\n        unsafe {{ seismic::cpu::Scalars::from_raw(self.invocation.buffer({buffer}), [{extents}], [{strides}]) }} }}\n"
+                )),
+                CpuView::Weights => out.push_str(&format!(
+                    "      pub fn {name}(&self) -> seismic::cpu::Weights<'a> {{ {safety}\n        unsafe {{ seismic::cpu::Weights::from_tensor(self.invocation.buffer({buffer}), &[{extents}], &[{strides}], self.invocation.weights({buffer})) }} }}\n"
+                )),
+                CpuView::External => out.push_str(&format!(
+                    "      pub fn {name}(&self) -> seismic::cpu::External<'a> {{ {safety}\n        unsafe {{ seismic::cpu::External::from_tensor(self.invocation.buffer({buffer}), &[{extents}], &[{strides}], self.invocation.representation({buffer})) }} }}\n"
+                )),
+                CpuView::Packed => out.push_str(&format!(
+                    "      pub fn {name}(&self) -> seismic::cpu::Packed<'a> {{ {safety}\n        unsafe {{ seismic::cpu::Packed::from_tensor(self.invocation.buffer({buffer}), &[{extents}], &[{strides}], self.invocation.representation({buffer})) }} }}\n"
+                )),
+            }
         };
         for (ordinal, parameter) in entry.parameters.iter().enumerate() {
             let unique = entry
@@ -1293,9 +1592,9 @@ mod internals {
                 format!("arg_{ordinal}")
             };
             match &parameter.kind {
-                ParameterSummaryKind::Tensor { rank, .. } => {
+                ParameterSummaryKind::Tensor { rank, element, .. } => {
                     let rank = *rank as usize;
-                    tensor(out, &name, buffer, word, rank);
+                    tensor(out, &name, cpu_view(element, &elements), buffer, word, rank);
                     buffer += 1;
                     word += rank * 2;
                 }
@@ -1330,9 +1629,19 @@ mod internals {
         let mut scalar = 0usize;
         for (ordinal, result) in entry.results.iter().enumerate() {
             match &result.kind {
-                ResultSummaryKind::Tensor { rank, .. } => {
+                ResultSummaryKind::Tensor { rank, element } => {
                     let rank = *rank as usize;
-                    tensor(out, &format!("result_{ordinal}"), buffer, word, rank);
+                    let view = cpu_view(element, &elements);
+                    if matches!(view, CpuView::Weights | CpuView::External) {
+                        return Err(BuildError::CpuNative {
+                            path: cpu.path.clone(),
+                            reason: format!(
+                                "result {ordinal} of `{}` is read-only storage; CPU kernels write dense or converted results",
+                                entry.name
+                            ),
+                        });
+                    }
+                    tensor(out, &format!("result_{ordinal}"), view, buffer, word, rank);
                     buffer += 1;
                     word += rank * 2;
                 }
@@ -1353,60 +1662,98 @@ mod internals {
         }
         for scratch in &definition.scratch {
             out.push_str(&format!(
-                "      pub fn scratch_{}(&self) -> *mut u8 {{ self.invocation.buffer({buffer}) }}\n",
+                "      pub fn scratch_{}(&self) -> seismic::cpu::Scratch<'a> {{ // SAFETY: the runtime places every scratch buffer for the call, 256-byte aligned.\n        unsafe {{ seismic::cpu::Scratch::from_raw(self.invocation.buffer({buffer})) }} }}\n",
                 ident(&scratch.name).to_lowercase()
             ));
             buffer += 1;
         }
+        for (index, parameter) in definition.declared_params().enumerate() {
+            out.push_str(&format!(
+                "      /// Tuning parameter `{}`.\n      pub fn param_{}(&self) -> u64 {{ self.invocation.param({index}) }}\n",
+                parameter.name,
+                ident(&parameter.name).to_lowercase()
+            ));
+        }
         out.push_str("    }\n");
-        out.push_str(&format!("    include!({:?});\n", path.to_string_lossy()));
-        // One function per launch and configuration of the parameter
-        // domains' cartesian product; `where` filtering happens when a
-        // specialization is prepared.
-        let mut configurations: Vec<Vec<u64>> = vec![Vec::new()];
-        for parameter in &definition.params {
-            configurations = configurations
+        out.push_str(&format!("    include!({:?});\n", cpu.path.to_string_lossy()));
+
+        // One form per dense element binding: every combination of the
+        // dense elements over their covered types.
+        let mut bindings: Vec<Vec<(&str, &str)>> = vec![Vec::new()];
+        for (_, dtypes) in &elements.dense {
+            bindings = bindings
                 .into_iter()
                 .flat_map(|prefix| {
-                    parameter.values.iter().map(move |value| {
-                        let mut configuration = prefix.clone();
-                        configuration.push(*value);
-                        configuration
+                    dtypes.iter().map(move |dtype| {
+                        let mut binding = prefix.clone();
+                        binding.push((dtype.name(), cpu_element_type(*dtype)));
+                        binding
                     })
                 })
                 .collect();
         }
-        out.push_str("    pub static KERNELS: CpuNativeKernels = CpuNativeKernels { launches: &[\n");
-        let mut functions = String::new();
-        for (launch_index, launch) in definition.launches.iter().enumerate() {
-            out.push_str(&format!(
-                "      CpuLaunchVariants {{ kernel: {:?}, variants: &[\n",
-                launch.kernel
-            ));
-            for (variant, configuration) in configurations.iter().enumerate() {
-                let function = format!("launch_{launch_index}_{variant}");
-                let generics = if configuration.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "::<{}>",
-                        configuration.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")
-                    )
-                };
-                functions.push_str(&format!(
-                    "    fn {function}(invocation: &CpuInvocation<'_>, group: [u64; 3], shared: &mut [u8]) {{ {}{generics}(&Context {{ invocation }}, group, shared) }}\n",
-                    launch.kernel
-                ));
-                out.push_str(&format!(
-                    "        (&[{}], {function} as CpuKernelFn),\n",
-                    configuration.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")
-                ));
+        let binding_name = |binding: &[(&str, &str)]| {
+            format!("Elements_{}", binding.iter().map(|(name, _)| *name).collect::<Vec<_>>().join("_"))
+        };
+        for binding in &bindings {
+            let name = binding_name(binding);
+            out.push_str(&format!("    pub struct {name};\n    impl Elements for {name} {{"));
+            for ((element, _), (_, ty)) in elements.dense.iter().zip(binding) {
+                out.push_str(&format!(" type {} = seismic::cpu::{ty};", ident(element)));
             }
-            out.push_str("      ] },\n");
+            out.push_str(" }\n");
         }
-        out.push_str("    ] };\n");
-        out.push_str(&functions);
+
+        // The tier boundaries: each form is a `#[target_feature]` function
+        // of its tier, into which the authored kernel and everything it
+        // calls inline.
+        for tier in seismic_native_cpu::Tier::EVERY {
+            for (launch_index, launch) in definition.launches.iter().enumerate() {
+                for binding in &bindings {
+                    let elements = binding_name(binding);
+                    out.push_str(&format!(
+                        "    #[cfg(target_arch = {arch:?})]\n    #[target_feature(enable = {features:?})]\n    unsafe fn launch_{launch_index}_{tier}_{elements}(invocation: &CpuInvocation<'_>, group: [u64; 3], shared: &mut [u8]) {{\n      // SAFETY: the runtime calls a form only on a device whose detected tier includes the form's.\n      let l = unsafe {{ <seismic::cpu::{token} as Isa>::assume_detected() }};\n      {kernel}::<seismic::cpu::{token}, {elements}>(l, &Context::new(invocation), group, shared)\n    }}\n",
+                        arch = tier.arch(),
+                        features = tier.features(),
+                        tier = tier.name(),
+                        token = tier.token(),
+                        kernel = launch.kernel,
+                    ));
+                }
+            }
+        }
+
+        let mut digest = Sha256::new();
+        digest.update(cpu.text.as_bytes());
+        digest.update(library.digest);
+        digest.update(seismic_native_cpu::VERSION.as_bytes());
+        let digest = hex(&digest.finalize().into());
+        let element_names =
+            elements.dense.iter().map(|(element, _)| format!("{element:?}")).collect::<Vec<_>>().join(", ");
+        for arch in ["x86_64", "aarch64"] {
+            out.push_str(&format!("    #[cfg(target_arch = {arch:?})]\n"));
+            out.push_str(&format!(
+                "    pub static KERNELS: CpuNativeKernels = CpuNativeKernels {{ digest: {digest:?}, elements: &[{element_names}], launches: &[\n"
+            ));
+            for (launch_index, launch) in definition.launches.iter().enumerate() {
+                out.push_str(&format!("      CpuLaunchVariants {{ kernel: {:?}, variants: &[\n", launch.kernel));
+                for tier in seismic_native_cpu::Tier::EVERY.into_iter().filter(|tier| tier.arch() == arch) {
+                    for binding in &bindings {
+                        let names = binding.iter().map(|(name, _)| format!("{name:?}")).collect::<Vec<_>>().join(", ");
+                        out.push_str(&format!(
+                            "        CpuVariant {{ tier: seismic::cpu::Tier::{token}, elements: &[{names}], function: launch_{launch_index}_{tier}_{elements} as CpuKernelFn }},\n",
+                            token = tier.token(),
+                            tier = tier.name(),
+                            elements = binding_name(binding),
+                        ));
+                    }
+                }
+                out.push_str("      ] },\n");
+            }
+            out.push_str("    ] };\n");
+        }
         out.push_str("  }\n");
+        Ok(())
     }
 
     fn parameter_type(kind: &ParameterSummaryKind) -> String {
@@ -1976,7 +2323,7 @@ mod native_tests {
 
     const SPECIALIZED: &str = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for cuda from \"native/scale.cu\":\n    static (N)\n    params (TILE in [32, 64])\n    scratch staging bytes (N * 4)\n    launch scale:\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (TILE, 1, 1)\n\nnative scale for cpu from \"native/scale.rs\":\n    params (TILE in [32, 64], UNROLL in [1, 2, 4])\n    launch scale:\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
 
-    const CPU_SCALE: &str = "fn scale<const TILE: u64, const UNROLL: u64>(context: &Context<'_>, group: [u64; 3], _shared: &mut [u8]) {\n    let x = context.arg_x();\n    let output = context.result_0();\n    for i in group[0] * TILE..((group[0] + 1) * TILE).min(context.dim_n()) {\n        unsafe { output.pointer.cast::<f32>().add(i as usize).write(x.pointer.cast::<f32>().add(i as usize).read()) };\n    }\n    let _ = UNROLL;\n}\n";
+    const CPU_SCALE: &str = "fn scale<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {\n    let (x, output, tile) = (cx.arg_x(), cx.result_0(), cx.param_tile());\n    for i in group[0] * tile..((group[0] + 1) * tile).min(cx.dim_n()) {\n        unsafe { output.set([i as usize], x.get([i as usize])) };\n    }\n    let _ = cx.param_unroll();\n}\n";
 
     #[test]
     fn cuda_assets_admit_tuning_and_scratch_symbols_and_reject_headers() {
@@ -2000,9 +2347,13 @@ mod native_tests {
         let artifacts = build("out").expect("tuning and scratch symbols are generated ABI");
         let generated = fs::read_to_string(&artifacts.bindings).expect("generated bindings");
         assert!(generated.contains("Some(&cpu_native::KERNELS)"));
-        // Two TILE values by three UNROLL values.
-        assert_eq!(generated.matches("as CpuKernelFn").count(), 6);
-        assert!(generated.contains("scale::<64, 4>"));
+        // Tuning parameters are runtime values: one form per tier (four on
+        // x86-64, one on aarch64) of the one launch, none per value.
+        assert_eq!(generated.matches("as CpuKernelFn").count(), 5);
+        assert!(generated.contains("pub fn param_tile(&self) -> u64 { self.invocation.param(0) }"));
+        assert!(generated.contains("pub fn param_unroll(&self) -> u64 { self.invocation.param(1) }"));
+        assert!(generated.contains("#[target_feature(enable = \"sse3,ssse3,sse4.1,sse4.2,popcnt,avx,avx2,fma,f16c,bmi1,bmi2,lzcnt,movbe\")]"));
+        assert!(generated.contains("scale::<seismic::cpu::X86V3, Elements_>"));
 
         fs::write(&cuda, "#include <cuda_fp16.h>\nextern \"C\" __global__ void scale(SEISMIC_KERNEL_PARAMS) {}\n")
             .expect("CUDA fixture");
@@ -2026,7 +2377,7 @@ mod native_tests {
     const SCALE_METAL: &str = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for metal from \"native/scale.metal\":\n    launch scale:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n";
 
     #[test]
-    fn common_includes_are_inlined_validated_and_part_of_identity() {
+    fn includes_are_inlined_validated_and_part_of_identity() {
         let root = fixture("include");
         let source = root.join("ops.seismic");
         fs::write(&source, SCALE_METAL).expect("Seismic fixture");
@@ -2046,7 +2397,7 @@ mod native_tests {
                 .out_dir(root.join(name))
                 .run()
         };
-        let first = build("first").expect("a common include builds");
+        let first = build("first").expect("an include builds");
         let rendered = fs::read_to_string(root.join("first/scale.metal")).expect("rendered asset");
         assert!(rendered.starts_with("#line 1 \"common/copy.h\"\n#define COPY(i)"));
         assert!(!rendered.contains("#include"));
@@ -2065,15 +2416,24 @@ mod native_tests {
             other => panic!("unexpected error: {other}"),
         }
 
-        fs::write(root.join("native/copy.h"), "\n").expect("outside header");
-        fs::write(root.join("native/scale.metal"), "#include \"copy.h\"\nkernel void scale() {}\n")
-            .expect("Metal fixture");
-        match build("outside").expect_err("includes outside common/ are rejected") {
+        // Beside the source root, outside it.
+        let outside = root.with_extension("outside.h");
+        fs::write(&outside, "\n").expect("outside header");
+        fs::write(
+            root.join("native/scale.metal"),
+            format!(
+                "#include \"../../{}\"\nkernel void scale() {{}}\n",
+                outside.file_name().expect("file name").to_string_lossy()
+            ),
+        )
+        .expect("Metal fixture");
+        match build("outside").expect_err("includes outside the source roots are rejected") {
             BuildError::NativeInclude(error) => {
-                assert_eq!(error.reason, seismic_lang::source::NativeIncludeReason::OutsideCommon)
+                assert_eq!(error.reason, seismic_lang::source::NativeIncludeReason::OutsideSourceRoots)
             }
             other => panic!("unexpected error: {other}"),
         }
+        fs::remove_file(&outside).expect("remove outside header");
         fs::remove_dir_all(&root).expect("remove fixture directory");
     }
 

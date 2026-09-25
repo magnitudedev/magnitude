@@ -1,7 +1,7 @@
 // embedding_rows: gather one table row per token and decode it with the
 // packet decoders, published in the activation type and as F32 of that value.
 #define KERNEL_W0 SEISMIC_TABLE
-#include "common/projection.h"
+#include "lib/projection/projection.h"
 
 typedef element::Act activation;
 static_assert(activation::bytes == 2, "embedding_rows requires a bf16 or f16 activation");

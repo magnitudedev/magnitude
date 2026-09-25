@@ -1623,14 +1623,11 @@ mod qualify {
             .flat_map(|(category, &count)| (0..count).map(move |chunk| Work { category, chunk }))
             .collect();
         let batch = options.batch.min(work.len());
-        // The bench seals prefill classes up to PREFILL_ROWS and load warm-up runs each of them
-        // as one request, so the context must hold the largest class, not just n_ctx.
-        let context = n_ctx.max(super::PREFILL_ROWS);
         let mut bench = Bench::open(
             &options.model,
             options.path,
             options.storage_gib,
-            context,
+            n_ctx,
             batch,
             batch * options.verify_width,
             options.kernel_cache.as_deref(),

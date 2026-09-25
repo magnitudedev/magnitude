@@ -11,10 +11,11 @@ use seismic::{
 };
 use seismic_native_tests::{accumulate, gated_sum, scale_rows, split_sum};
 
-/// A search whose budget covers every configuration of the test entries.
+/// A search whose budget covers every configuration of the test entries,
+/// including a CPU device's participant counts and tiers.
 fn search(samples: usize) -> Strategy {
     Strategy::Search(SearchPlan {
-        budget: 100,
+        budget: 10_000,
         settings: SearchSettings {
             improvement: 0.01,
             restarts: 2,
@@ -74,6 +75,16 @@ fn read_f32(tensor: &Tensor) -> Vec<f32> {
 /// agree bit for bit with the ordered reference.
 fn exact_values(n: usize) -> Vec<f32> {
     (0..n).map(|index| ((index % 7) as f32 - 3.0) * 0.25).collect()
+}
+
+/// The declared parameters of a configuration: those Seismic does not own
+/// (Seismic-owned names contain `.`).
+fn declared(params: &std::collections::BTreeMap<String, u64>) -> std::collections::BTreeMap<String, u64> {
+    params
+        .iter()
+        .filter(|(name, _)| !name.contains('.'))
+        .map(|(name, value)| (name.clone(), *value))
+        .collect()
 }
 
 fn statics(n: u64) -> NativeSpecialization {
@@ -280,16 +291,25 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
         )
         .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
         // The budget covers the whole domain: the search reaches every
-        // configuration once, starting from the defaults.
-        assert_eq!(result.configurations.len(), 6);
+        // configuration once, starting from the defaults. The domain is the
+        // declared one (three part counts by two widths) and, on a CPU
+        // device, its participant counts per launch and tiers.
+        let domain = result.parameters.iter().map(|parameter| parameter.values.len()).product::<usize>();
+        assert_eq!(domain % 6, 0);
+        assert_eq!(result.configurations.len(), domain);
         assert!(matches!(
             result.method,
             TuningMethod::Search { stop: SearchStop::Exhausted, .. }
         ));
         assert_eq!(
-            result.configurations[0].configuration.params,
+            declared(&result.configurations[0].configuration.params),
             [("PARTS".to_owned(), 1), ("WIDTH".to_owned(), 32)].into_iter().collect()
         );
+        assert!(result.configurations[0]
+            .configuration
+            .params
+            .iter()
+            .all(|(name, value)| !name.starts_with("cpu.") || *value == 0));
         assert!(result
             .configurations
             .iter()
@@ -323,7 +343,7 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
             }),
         )
         .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
-        assert_eq!(survey.configurations.len(), 6);
+        assert_eq!(survey.configurations.len(), domain);
         for record in &survey.configurations {
             match &record.outcome {
                 Outcome::Measured {

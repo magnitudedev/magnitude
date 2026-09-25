@@ -3,9 +3,9 @@
 // `metal/qwen_vision_stem.metal`, with the CUDA form's conversion launch:
 // L1 converts the F32 pixels to f16 rows [M][2][K] (the GEMM's A operand, as
 // on Metal and CUDA), L2 stores the first frame's F32 product, L3 adds it, the
-// bias and the bilinear position-table blend (`common/vision.glsl`, the Stem
+// bias and the bilinear position-table blend (`lib/vision/vision.glsl`, the Stem
 // epilogue) into the F32 result.
-#include "common/vision.glsl"
+#include "lib/vision/vision.glsl"
 
 #if defined(SEISMIC_TEMPORAL_WEIGHT_0_REPRESENTATION_BF16)
 #define WEIGHT_0_KIND PACKETS_BF16

@@ -8,7 +8,7 @@ use super::super::native_target_graph::weight;
 use crate::{ModelLoadPlan, StateResourcePlan, native::RecurrentKernels};
 use magnitude_model_contracts::{WeightKind, WeightRole, WeightScope};
 use magnitude_model_kernels::{
-    qwen_recurrent_chunk, qwen_recurrent_output, qwen_recurrent_project, qwen_recurrent_step,
+    gated_delta_chunk, gated_delta_output, gated_delta_project, gated_delta_step,
 };
 use seismic::{Element, NativeGraph, NativePort, WorkflowTensor};
 
@@ -106,7 +106,7 @@ pub(crate) fn recurrent(
     let projection = graph
         .enqueue(
             &kernels.project,
-            qwen_recurrent_project::WorkflowArgs {
+            gated_delta_project::WorkflowArgs {
                 hidden: hidden.into(),
                 input_norm: (&input_norm).into(),
                 qkv_weight: (&qkv_weight).into(),
@@ -156,7 +156,7 @@ pub(crate) fn recurrent(
         graph
             .enqueue(
                 &kernels.chunk,
-                qwen_recurrent_chunk::WorkflowArgs {
+                gated_delta_chunk::WorkflowArgs {
                     projection: (&projection).into(),
                     convolution: (&convolution).into(),
                     rate: (&rate).into(),
@@ -179,7 +179,7 @@ pub(crate) fn recurrent(
         graph
             .enqueue(
                 &kernels.step,
-                qwen_recurrent_step::WorkflowArgs {
+                gated_delta_step::WorkflowArgs {
                     projection: (&projection).into(),
                     convolution: (&convolution).into(),
                     rate: (&rate).into(),
@@ -202,7 +202,7 @@ pub(crate) fn recurrent(
     let output = graph
         .enqueue(
             &kernels.output,
-            qwen_recurrent_output::WorkflowArgs {
+            gated_delta_output::WorkflowArgs {
                 hidden: hidden.into(),
                 mixed: (&mixed).into(),
                 projection: (&projection).into(),

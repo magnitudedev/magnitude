@@ -164,6 +164,25 @@ native shape_rows for vulkan from "vulkan/shape_rows.comp":
         threadgroups (PARTS, Sx, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
 
+# Native CPU: prepare gives each work item one of PARTS vocabulary slices of
+# a row (penalties, temperature, slice maximum; the slice's history tokens are
+# staged in its private bytes). filter gives each work item one row: a
+# selection finds the top-k threshold and a sort of the top-k and min-p
+# survivors ranks them for top-p, with the GPU forms' integer masses and
+# exact ceil(top_p * total) target, so every decision is theirs bit for bit
+# and independent of PARTS.
+native shape_rows for cpu from "cpu/shape_rows.rs":
+    params (PARTS in [32, 8, 64, 1])
+    scratch partials bytes (Sx * PARTS * 8)
+    scratch order bytes (Sx * V * 8)
+    launch shape_rows_prepare:
+        threadgroups (PARTS, Sx, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (Hn * 4)
+    launch shape_rows_filter:
+        threadgroups (Sx, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
 # `sample_rows` (portable body in seismic-std).
 # Native Metal: L1 scans PARTS contiguous vocabulary slices per row and keeps
 # (score bits, token, invalid); L2 merges them per row. The maximum score
@@ -205,3 +224,16 @@ native sample_rows for vulkan from "vulkan/sample_rows.comp":
     launch sample_rows_merge:
         threadgroups (ceil_div(M, 32), 1, 1)
         threads_per_threadgroup (32, 1, 1)
+
+# Native CPU: the same two stages, one work item per (slice, row) and one per
+# row merging the slice winners in slice order, so the result is independent
+# of PARTS.
+native sample_rows for cpu from "cpu/sample_rows.rs":
+    params (PARTS in [32, 8, 64, 1])
+    scratch partials bytes (M * PARTS * 12)
+    launch sample_rows_partition:
+        threadgroups (PARTS, M, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch sample_rows_merge:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)

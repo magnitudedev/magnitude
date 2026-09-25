@@ -45,9 +45,12 @@ pub use seismic_runtime::native::trace::{
 /// generated `Context` of their entry instead.
 pub mod native_cpu {
     pub use seismic_runtime::native::{
-        CpuInvocation, CpuKernelFn, CpuLaunchVariants, CpuNativeKernels, CpuTensor,
+        CpuInvocation, CpuKernelFn, CpuLaunchVariants, CpuNativeKernels, CpuVariant,
     };
 }
+
+/// The Seismic CPU library every CPU native kernel builds on.
+pub use seismic_native_cpu as cpu;
 pub use seismic_lang::expr::{BigInt, BigUint};
 pub use seismic_lang::registry::{BackendName, Layout};
 pub use seismic_lang::types::DType;
@@ -1695,6 +1698,7 @@ pub mod generated {
         device: &Device,
         statics: &NativeSpecialization,
         elements: &[(&str, Element)],
+        cpu: Option<&'static native_cpu::CpuNativeKernels>,
     ) -> Result<String, TuneError> {
         let module = E::module().map_err(|error| TuneError::Declaration(error.to_string()))?;
         let entry = E::resolve(module).map_err(|error| TuneError::Declaration(error.to_string()))?;
@@ -1704,6 +1708,7 @@ pub mod generated {
             entry.id(),
             &element_bindings(elements),
             statics,
+            cpu,
         )
     }
 

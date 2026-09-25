@@ -1,0 +1,10 @@
+[package]
+name = "seismic-native-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+seismic-lang.workspace = true

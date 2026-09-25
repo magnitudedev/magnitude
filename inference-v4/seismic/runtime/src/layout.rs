@@ -55,7 +55,7 @@ pub(crate) fn canonical(
                 ExecutionError::AllocationFailed(format!(
                     "`{}` storage requires rank at least {}",
                     info.name,
-                    if rows.layout == seismic_lang::registry::Layout::Mma16 { 2 } else { 1 }
+                    if rows.tile_rows() > 1 { 2 } else { 1 }
                 ))
             };
             let units = rows.storage_units(extents).ok_or_else(|| {
@@ -202,7 +202,7 @@ pub(crate) fn apply_view(
         ViewOperation::Reshape { extents } => {
             if let RepresentationKind::PackedRows(rows) = &representation_info(representation).kind {
                 let geometry = |extents: &[u64]| {
-                    let tail = if rows.layout == seismic_lang::registry::Layout::Mma16 { 2 } else { 1 };
+                    let tail = if rows.tile_rows() > 1 { 2 } else { 1 };
                     extents.len().checked_sub(tail).map(|start| extents[start..].to_vec())
                 };
                 if geometry(extents).is_none() || geometry(extents) != geometry(&source.extents) {
@@ -268,8 +268,8 @@ fn leading_slice(
         RepresentationKind::PackedRows(rows) => {
             // Rank 1 would slice the packing axis; an `mma16` row axis slices
             // in whole tiles.
-            let tiled = rows.layout == seismic_lang::registry::Layout::Mma16 && extents.len() == 2;
-            let tile = seismic_lang::registry::MMA_TILE_ROWS;
+            let tiled = rows.tile_rows() > 1 && extents.len() == 2;
+            let tile = rows.tile_rows();
             if extents.len() == 1
                 || (tiled && (start % tile != 0 || (end != leading && end % tile != 0)))
             {

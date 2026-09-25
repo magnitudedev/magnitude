@@ -1,0 +1,213 @@
+// gated_delta_project: RMS prologue over the F32 residual, then one
+// segmented projection qkv | z | alpha | beta, each segment with its own
+// representation, into one activation row per input row. The Vulkan form of
+// `metal/gated_delta_project.metal` over `lib/projection/projection.glsl`.
+#include "lib/core/activation.glsl"
+#include "lib/projection/projection.glsl"
+
+#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#define PROJECT_ACT ELEMENT_ACT
+#else
+#error "gated_delta_project requires a bf16 or f16 activation"
+#endif
+#if defined(SEISMIC_INPUT_NORM_REPRESENTATION_F32)
+#define PROJECT_NORM ELEMENT_F32
+#elif defined(SEISMIC_INPUT_NORM_REPRESENTATION_F16)
+#define PROJECT_NORM ELEMENT_F16
+#elif defined(SEISMIC_INPUT_NORM_REPRESENTATION_BF16)
+#define PROJECT_NORM ELEMENT_BF16
+#else
+#error "gated_delta_project requires a dense input_norm"
+#endif
+
+#if defined(SEISMIC_QKV_WEIGHT_REPRESENTATION_Q4K)
+#define QKV_KIND PACKETS_Q4K
+#define QKV_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_QKV_WEIGHT)
+#elif defined(SEISMIC_QKV_WEIGHT_REPRESENTATION_Q5K)
+#define QKV_KIND PACKETS_Q5K
+#define QKV_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_QKV_WEIGHT)
+#elif defined(SEISMIC_QKV_WEIGHT_REPRESENTATION_Q6K)
+#define QKV_KIND PACKETS_Q6K
+#define QKV_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_QKV_WEIGHT)
+#elif defined(SEISMIC_QKV_WEIGHT_REPRESENTATION_Q8G32S)
+#define QKV_KIND PACKETS_Q8
+#define QKV_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_QKV_WEIGHT)
+#elif defined(SEISMIC_QKV_WEIGHT_REPRESENTATION_BF16)
+#define QKV_KIND PACKETS_BF16
+#define QKV_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_QKV_WEIGHT, 2)
+#elif defined(SEISMIC_QKV_WEIGHT_REPRESENTATION_F16)
+#define QKV_KIND PACKETS_F16
+#define QKV_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_QKV_WEIGHT, 2)
+#elif defined(SEISMIC_QKV_WEIGHT_REPRESENTATION_F32)
+#define QKV_KIND PACKETS_F32
+#define QKV_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_QKV_WEIGHT, 4)
+#else
+#error "unsupported gated_delta_project qkv_weight representation"
+#endif
+#if defined(SEISMIC_QKV_WEIGHT_KIND_PACKED) && !defined(SEISMIC_QKV_WEIGHT_LAYOUT_ROWS16)
+#error "gated_delta_project requires the rows16 layout for qkv_weight"
+#endif
+
+#if defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q4K)
+#define GATE_KIND PACKETS_Q4K
+#define GATE_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q5K)
+#define GATE_KIND PACKETS_Q5K
+#define GATE_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q6K)
+#define GATE_KIND PACKETS_Q6K
+#define GATE_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q8G32S)
+#define GATE_KIND PACKETS_Q8
+#define GATE_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_BF16)
+#define GATE_KIND PACKETS_BF16
+#define GATE_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_GATE_WEIGHT, 2)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_F16)
+#define GATE_KIND PACKETS_F16
+#define GATE_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_GATE_WEIGHT, 2)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_F32)
+#define GATE_KIND PACKETS_F32
+#define GATE_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_GATE_WEIGHT, 4)
+#else
+#error "unsupported gated_delta_project gate_weight representation"
+#endif
+#if defined(SEISMIC_GATE_WEIGHT_KIND_PACKED) && !defined(SEISMIC_GATE_WEIGHT_LAYOUT_ROWS16)
+#error "gated_delta_project requires the rows16 layout for gate_weight"
+#endif
+
+#if defined(SEISMIC_ALPHA_WEIGHT_REPRESENTATION_Q4K)
+#define ALPHA_KIND PACKETS_Q4K
+#define ALPHA_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_ALPHA_WEIGHT)
+#elif defined(SEISMIC_ALPHA_WEIGHT_REPRESENTATION_Q5K)
+#define ALPHA_KIND PACKETS_Q5K
+#define ALPHA_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_ALPHA_WEIGHT)
+#elif defined(SEISMIC_ALPHA_WEIGHT_REPRESENTATION_Q6K)
+#define ALPHA_KIND PACKETS_Q6K
+#define ALPHA_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_ALPHA_WEIGHT)
+#elif defined(SEISMIC_ALPHA_WEIGHT_REPRESENTATION_Q8G32S)
+#define ALPHA_KIND PACKETS_Q8
+#define ALPHA_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_ALPHA_WEIGHT)
+#elif defined(SEISMIC_ALPHA_WEIGHT_REPRESENTATION_BF16)
+#define ALPHA_KIND PACKETS_BF16
+#define ALPHA_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_ALPHA_WEIGHT, 2)
+#elif defined(SEISMIC_ALPHA_WEIGHT_REPRESENTATION_F16)
+#define ALPHA_KIND PACKETS_F16
+#define ALPHA_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_ALPHA_WEIGHT, 2)
+#elif defined(SEISMIC_ALPHA_WEIGHT_REPRESENTATION_F32)
+#define ALPHA_KIND PACKETS_F32
+#define ALPHA_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_ALPHA_WEIGHT, 4)
+#else
+#error "unsupported gated_delta_project alpha_weight representation"
+#endif
+#if defined(SEISMIC_ALPHA_WEIGHT_KIND_PACKED) && !defined(SEISMIC_ALPHA_WEIGHT_LAYOUT_ROWS16)
+#error "gated_delta_project requires the rows16 layout for alpha_weight"
+#endif
+
+#if defined(SEISMIC_BETA_WEIGHT_REPRESENTATION_Q4K)
+#define BETA_KIND PACKETS_Q4K
+#define BETA_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_BETA_WEIGHT)
+#elif defined(SEISMIC_BETA_WEIGHT_REPRESENTATION_Q5K)
+#define BETA_KIND PACKETS_Q5K
+#define BETA_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_BETA_WEIGHT)
+#elif defined(SEISMIC_BETA_WEIGHT_REPRESENTATION_Q6K)
+#define BETA_KIND PACKETS_Q6K
+#define BETA_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_BETA_WEIGHT)
+#elif defined(SEISMIC_BETA_WEIGHT_REPRESENTATION_Q8G32S)
+#define BETA_KIND PACKETS_Q8
+#define BETA_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_BETA_WEIGHT)
+#elif defined(SEISMIC_BETA_WEIGHT_REPRESENTATION_BF16)
+#define BETA_KIND PACKETS_BF16
+#define BETA_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_BETA_WEIGHT, 2)
+#elif defined(SEISMIC_BETA_WEIGHT_REPRESENTATION_F16)
+#define BETA_KIND PACKETS_F16
+#define BETA_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_BETA_WEIGHT, 2)
+#elif defined(SEISMIC_BETA_WEIGHT_REPRESENTATION_F32)
+#define BETA_KIND PACKETS_F32
+#define BETA_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_BETA_WEIGHT, 4)
+#else
+#error "unsupported gated_delta_project beta_weight representation"
+#endif
+#if defined(SEISMIC_BETA_WEIGHT_KIND_PACKED) && !defined(SEISMIC_BETA_WEIGHT_LAYOUT_ROWS16)
+#error "gated_delta_project requires the rows16 layout for beta_weight"
+#endif
+
+#define PROJECT_K uint(SEISMIC_DIM_H)
+#define PROJECT_QKV_ROWS uint((2ul * SEISMIC_DIM_NK + SEISMIC_DIM_NV) * SEISMIC_DIM_W)
+#define PROJECT_GATE_ROWS uint(SEISMIC_DIM_NV * SEISMIC_DIM_W)
+#define PROJECT_HEAD_ROWS uint(SEISMIC_DIM_NV)
+
+projection_prologue recurrent_project_input() {
+    return projection_rms(PROJECT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN), SEISMIC_HIDDEN_STRIDE_0,
+        SEISMIC_HIDDEN_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_INPUT_NORM), SEISMIC_INPUT_NORM_STRIDE_0, PROJECT_NORM,
+        element_word_f32(SEISMIC_PARAM_EPSILON), PROJECT_K, 0ul);
+}
+
+// Every segment writes its columns of the one result row.
+projection_epilogue recurrent_project_out(uint column) {
+    return projection_store(PROJECT_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
+        SEISMIC_RESULT_0_STRIDE_1, uint64_t(column));
+}
+
+projection_weights recurrent_project_weight(uint64_t base, packets_rows16 geometry) {
+    return projection_weights(base, geometry, PROJECT_K, 0ul);
+}
+
+void gated_delta_project_gemv() {
+    const uint per = projection_gemv_rows(SEISMIC_TUNE_SIMDGROUPS, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES);
+    const uint rows = uint(SEISMIC_DIM_M), tile = gl_WorkGroupID.x;
+    const uint t0 = (PROJECT_QKV_ROWS + per - 1u) / per, t1 = (PROJECT_GATE_ROWS + per - 1u) / per;
+    const uint t2 = (PROJECT_HEAD_ROWS + per - 1u) / per;
+    const projection_prologue x = recurrent_project_input();
+    if (tile < t0) {
+        const projection_weights w = recurrent_project_weight(SEISMIC_PTR(SEISMIC_BUFFER_QKV_WEIGHT), QKV_GEOMETRY);
+        projection_gemv(QKV_KIND, QKV_KIND, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, PROJECTION_NORM_SHARED, x,
+            recurrent_project_out(0u), w, w, rows, PROJECT_QKV_ROWS, PROJECT_K, tile);
+    } else if (tile < t0 + t1) {
+        const projection_weights w = recurrent_project_weight(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT), GATE_GEOMETRY);
+        projection_gemv(GATE_KIND, GATE_KIND, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, PROJECTION_NORM_SHARED, x,
+            recurrent_project_out(PROJECT_QKV_ROWS), w, w, rows, PROJECT_GATE_ROWS, PROJECT_K, tile - t0);
+    } else if (tile < t0 + t1 + t2) {
+        const projection_weights w = recurrent_project_weight(SEISMIC_PTR(SEISMIC_BUFFER_ALPHA_WEIGHT), ALPHA_GEOMETRY);
+        projection_gemv(ALPHA_KIND, ALPHA_KIND, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, PROJECTION_NORM_SHARED,
+            x, recurrent_project_out(PROJECT_QKV_ROWS + PROJECT_GATE_ROWS), w, w, rows, PROJECT_HEAD_ROWS, PROJECT_K,
+            tile - t0 - t1);
+    } else {
+        const projection_weights w = recurrent_project_weight(SEISMIC_PTR(SEISMIC_BUFFER_BETA_WEIGHT), BETA_GEOMETRY);
+        projection_gemv(BETA_KIND, BETA_KIND, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, PROJECTION_NORM_SHARED, x,
+            recurrent_project_out(PROJECT_QKV_ROWS + PROJECT_GATE_ROWS + PROJECT_HEAD_ROWS), w, w, rows,
+            PROJECT_HEAD_ROWS, PROJECT_K, tile - t0 - t1 - t2);
+    }
+}
+
+void gated_delta_project_stage() {
+    projection_stage(recurrent_project_input(), gl_WorkGroupID.x, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED),
+        PROJECT_K);
+}
+
+void gated_delta_project_gemm() {
+    const uint tn = SEISMIC_TUNE_TILE_N;
+    const projection_prologue x = projection_plain(PROJECT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED),
+        uint64_t(PROJECT_K), 1ul, PROJECT_K, 0ul);
+    const uint m = uint(SEISMIC_DIM_M), n = gl_WorkGroupID.x, tm_index = gl_WorkGroupID.y;
+    const uint t0 = (PROJECT_QKV_ROWS + tn - 1u) / tn, t1 = (PROJECT_GATE_ROWS + tn - 1u) / tn;
+    const uint t2 = (PROJECT_HEAD_ROWS + tn - 1u) / tn;
+    if (n < t0)
+        projection_gemm(QKV_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, recurrent_project_out(0u),
+            recurrent_project_weight(SEISMIC_PTR(SEISMIC_BUFFER_QKV_WEIGHT), QKV_GEOMETRY), m, PROJECT_QKV_ROWS,
+            PROJECT_K, tm_index, n, 0xffffffffu);
+    else if (n < t0 + t1)
+        projection_gemm(GATE_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, recurrent_project_out(PROJECT_QKV_ROWS),
+            recurrent_project_weight(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT), GATE_GEOMETRY), m, PROJECT_GATE_ROWS,
+            PROJECT_K, tm_index, n - t0, 0xffffffffu);
+    else if (n < t0 + t1 + t2)
+        projection_gemm(ALPHA_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x,
+            recurrent_project_out(PROJECT_QKV_ROWS + PROJECT_GATE_ROWS),
+            recurrent_project_weight(SEISMIC_PTR(SEISMIC_BUFFER_ALPHA_WEIGHT), ALPHA_GEOMETRY), m, PROJECT_HEAD_ROWS,
+            PROJECT_K, tm_index, n - t0 - t1, 0xffffffffu);
+    else
+        projection_gemm(BETA_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x,
+            recurrent_project_out(PROJECT_QKV_ROWS + PROJECT_GATE_ROWS + PROJECT_HEAD_ROWS),
+            recurrent_project_weight(SEISMIC_PTR(SEISMIC_BUFFER_BETA_WEIGHT), BETA_GEOMETRY), m, PROJECT_HEAD_ROWS,
+            PROJECT_K, tm_index, n - t0 - t1 - t2, 0xffffffffu);
+}

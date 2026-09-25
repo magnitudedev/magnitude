@@ -1,7 +1,7 @@
 // readout_features_rows: the final RMS normalization of the `out_rows` hidden
 // rows, published in the activation type. One threadgroup per output row.
-#include "common/projection.h"
-#include "common/reduce.h"
+#include "lib/projection/projection.h"
+#include "lib/core/reduce.h"
 
 typedef element::Act activation;
 static_assert(activation::bytes == 2, "readout_features_rows requires a bf16 or f16 activation");

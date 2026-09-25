@@ -72,18 +72,52 @@ constants, as do the extents they fix and the row geometry of a row-layout tenso
 packing axis; a tensor whose every extent is static also renders its canonical strides as
 constants and must be bound canonically. Other dimensions, extents, strides, and scalars remain
 invocation words. Native assets do
-not infer representations from byte lengths or reproduce registry layout tables. A Metal or CUDA
-asset may include its backend's shared device library, `common/<name>.h` or `common/<name>.cuh`
-beside the asset; the build inlines, hashes and ABI-validates included files like the asset and
-rejects every other include, vendor and system headers included. A Metal implementation's
+not infer representations from byte lengths or reproduce registry layout tables. A Metal, CUDA or
+Vulkan asset may include library files written for its backend (`.h`, `.cuh`, `.glsl`) with
+`#include "<relative path>"`, resolved relative to the including file; the canonical target must lie
+inside the build's source roots, so directory layout is the library's choice. The build inlines each
+included file once, hashes it into the implementation identity and ABI-validates it like the asset;
+it rejects vendor and system headers, absolute paths, other extensions and files outside the source
+roots. `#include <seismic/<name>>` names Seismic's native library for the backend — dense element
+types, packed-weight decoders and layouts, weight slot bindings — which Seismic owns because it owns
+representation semantics; library files are embedded in Seismic, inlined and hashed like any include,
+and include only each other. A Metal implementation's
 buffers, argument words and scalar slots must fit Metal's 31-entry argument table, checked at
 build and at preparation.
+
+A CPU native asset is Rust compiled into the embedding binary; generated bindings give each entry a
+typed context over its ABI and include the authored file by its path. Elements the entry stores are
+type parameters of the kernel over the dense types the form is compiled for: `f32`, `bf16` and `f16`
+unless the declaration's `elements (A in [..])` clause lists others. A form that covers an integer type
+only moves that element's storage, since its type then has no conversion through `f32`. Elements the
+entry only reads are weight operands, reached through components of their representation. An
+external source the entry only converts, and the packed result of a `repack` into an element
+parameter, are raw row views; the registered conversion between their representations is resolved
+when the kernel runs, and moves codes and coefficients bit for bit. The CPU `Rows8` resident layout
+pads each matrix's row axis to eight and interleaves corresponding code and coefficient storage
+groups across each eight-row tile; conversion owns complete tiles, including zero padding. Because a CPU form is compiled
+with the program, its element coverage is declared; other backends compile each binding at
+preparation, and `elements` is rejected on them. Declared tuning parameters are runtime values.
+CPU weight projections may declare activation INT8 as an arithmetic parameter. Their exact path is
+the default; the INT8 path quantizes each staged activation row once for reuse by its dot components.
+A multi-row prefill component reduces four activation rows against eight weight rows across the
+whole K dimension; each instruction-set tier uses only instructions in its declared feature set.
+The kernel is generic over an instruction-set tier: each form is compiled once per tier of the target
+architecture and per dense element binding, behind the only target-feature boundary, and the runtime
+selects forms at or below the device's detected tier. The representation-specific inner loops are
+Seismic-owned components compiled once per tier, representation and row block and resolved when a
+kernel is prepared; every weight representation a native weight slot binds has them, and the build
+bounds their number. `.rs` files of the build's source roots that no declaration names form a library
+module tree mirroring their directories, visible to CPU assets by relative path; each CPU
+implementation's identity covers its asset, those files and the Seismic CPU library version. Seismic
+adds two tuning parameters of its own to CPU implementations, with domains fixed by the device: the
+participants of each launch and the tier.
 
 `vulkan` is a registered, native-only backend name: it has no compiler target, capabilities or
 intrinsics, so a `lower … for vulkan` body is rejected at checking. A `native … for vulkan`
 declaration is checked, and its `threads_per_threadgroup` and `shared_bytes` may read only static
 dimensions and tuning parameters, because a Vulkan pipeline fixes its group size and shared memory
-when the kernel is prepared. Its assets may include `common/<name>.glsl`. Until a Vulkan ABI prefix
+when the kernel is prepared. Its assets include library files under the same rule. Until a Vulkan ABI prefix
 and runtime exist, the build refuses a Vulkan native implementation (it cannot be ABI-validated),
 and discovery reports a `vulkan` diagnostic that this build has no Vulkan runtime, so a request for a
 Vulkan device fails with that reason.

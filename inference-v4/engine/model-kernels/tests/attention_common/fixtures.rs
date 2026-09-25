@@ -1,7 +1,8 @@
 // Shared fixtures of the gated-attention entry tests (`attention.rs`,
-// `cuda_attention.rs`, `attention_k8v4.rs`), included textually: cases of rows
-// with their controls, projections, weights and dense history, the host model
-// of the portable body, device tensors and the row builders.
+// `cuda_attention.rs`, `attention_k8v4.rs`, `attention_segments.rs`), included
+// textually: cases of rows with their controls, projections, weights and dense
+// history, the host model of the portable body, the devices, device tensors
+// and the row builders.
 
 fn bf16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
@@ -266,11 +267,23 @@ impl Case {
     }
 }
 
-/// Metal on macOS, Vulkan elsewhere (both run the Metal decode/prefill
-/// contract with the same decode parameters); hosts without either skip.
-fn metal() -> Option<Device> {
-    let backend = if cfg!(target_os = "macos") { BackendName::Metal } else { BackendName::Vulkan };
-    DeviceCatalog::discover().ok()?.open_backend(backend).ok()
+/// Metal on macOS, elsewhere Vulkan when present (both run the Metal
+/// decode/prefill contract with the same decode parameters), and the CPU
+/// device.
+fn devices() -> Vec<Device> {
+    let catalog = DeviceCatalog::discover().unwrap();
+    let gpu = if cfg!(target_os = "macos") {
+        Some(catalog.open_backend(BackendName::Metal).unwrap())
+    } else {
+        catalog.open_backend(BackendName::Vulkan).ok()
+    };
+    gpu.into_iter()
+        .chain(std::iter::once(catalog.open_backend(BackendName::Cpu).unwrap()))
+        .collect()
+}
+
+fn is_cpu(device: &Device) -> bool {
+    device.backend() == BackendName::Cpu
 }
 
 fn bf16_tensor(device: &Device, shape: &[usize], values: &[f32]) -> Tensor {

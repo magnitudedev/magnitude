@@ -1,8 +1,8 @@
 // qwen_vision_merger: layer norm of each of the M * G F32 patch rows (width
 // H) to A, then the up GEMM over G concatenated rows (+ bias, erf GELU) and
 // the down GEMM to the decoder width D (+ bias), published in F32 as the image
-// features. Bodies in common/vision.cuh.
-#include "common/vision.cuh"
+// features. Bodies in lib/vision/vision.cuh.
+#include "lib/vision/vision.cuh"
 
 using vision::u32;
 using vision::u64;

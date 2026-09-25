@@ -1,4 +1,4 @@
-//! The CUDA `qwen_recurrent_step` / `qwen_recurrent_chunk` against the same
+//! The CUDA `gated_delta_step` / `gated_delta_chunk` against the same
 //! cases, portable-body oracle and host model as the Metal tests (included
 //! verbatim; their Metal tests skip without a Metal device), plus timings.
 
@@ -19,21 +19,21 @@ enum Mapping {
 
 impl Case {
     fn cuda_step(&self, device: &Device, activation: Element, (rows, warps): (u64, u64))
-        -> seismic::NativeKernel<qwen_recurrent_step::Entry> {
-        qwen_recurrent_step::native_for_device_with(
+        -> seismic::NativeKernel<gated_delta_step::Entry> {
+        gated_delta_step::native_for_device_with(
             device,
-            qwen_recurrent_step::Elements { A: activation },
-            &self.statics().with_param("ROWS", rows).with_param("WARPS", warps),
+            gated_delta_step::Elements { A: activation },
+            &self.specialization(device, rows).with_param("WARPS", warps),
         )
         .unwrap()
     }
 
     fn cuda_chunk(&self, device: &Device, activation: Element, rows: u64)
-        -> seismic::NativeKernel<qwen_recurrent_chunk::Entry> {
-        qwen_recurrent_chunk::native_for_device_with(
+        -> seismic::NativeKernel<gated_delta_chunk::Entry> {
+        gated_delta_chunk::native_for_device_with(
             device,
-            qwen_recurrent_chunk::Elements { A: activation },
-            &self.statics().with_param("ROWS", rows),
+            gated_delta_chunk::Elements { A: activation },
+            &self.specialization(device, rows),
         )
         .unwrap()
     }
@@ -62,9 +62,6 @@ impl Case {
 }
 
 const STEPS: [(u64, u64); 4] = [(2, 4), (4, 4), (2, 8), (4, 8)];
-/// ROWS mappings of the chunk (those up to the geometry's W apply).
-const CHUNK_ROWS: [u64; 3] = [128, 64, 32];
-
 #[test]
 fn cuda_step_and_chunk_match_the_portable_body() {
     let Some(device) = cuda() else { return };

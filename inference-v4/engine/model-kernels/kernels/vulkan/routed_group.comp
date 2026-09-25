@@ -1,0 +1,91 @@
+// Groups the M * K routed choices by expert into T-row tiles. The Vulkan
+// form of `metal/routed_group.metal`. One workgroup; invocation (expert,
+// part) owns the choices of `part` (a contiguous slice of the flat choice
+// order) that route to `expert`. Counting and placement walk the same slice
+// in order, so every expert's rows keep their flat (row, choice) order and
+// the tables are deterministic.
+//
+// Shared u32 words: per-invocation slice counts [E * PARTS], the experts'
+// first blocks [E], then the used block count.
+#include <seismic/element.glsl>
+
+int group_route(uint64_t row, uint64_t choice) {
+    return element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)
+        + (row * SEISMIC_ROUTES_STRIDE_0 + choice * SEISMIC_ROUTES_STRIDE_1) * 4ul);
+}
+
+void group_order_put(uint64_t block, uint64_t lane, int value) {
+    element_i32_put(SEISMIC_PTR(SEISMIC_BUFFER_ORDER)
+            + (block * SEISMIC_ORDER_STRIDE_0 + lane * SEISMIC_ORDER_STRIDE_1) * 4ul,
+        value);
+}
+
+void routed_group() {
+    const uint parts = SEISMIC_TUNE_PARTS;
+    const uint experts = uint(SEISMIC_DIM_E);
+    const uint threads = experts * parts;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint starts = threads;
+    const uint used = starts + experts;
+    const uint expert = tid / parts;
+    const uint part = tid % parts;
+    const uint64_t tile = SEISMIC_DIM_T;
+    const uint64_t choices = SEISMIC_DIM_M * SEISMIC_DIM_K;
+    const uint64_t span = (choices + parts - 1u) / parts;
+    const uint64_t begin = min(uint64_t(part) * span, choices);
+    const uint64_t end = min(begin + span, choices);
+
+    uint count = 0u;
+    for (uint64_t index = begin; index < end; ++index)
+        count += group_route(index / SEISMIC_DIM_K, index % SEISMIC_DIM_K) == int(expert) ? 1u : 0u;
+    seismic_shared_u32[tid] = count;
+    barrier();
+
+    if (tid == 0u) {
+        uint block = 0u;
+        for (uint index = 0u; index < experts; ++index) {
+            seismic_shared_u32[starts + index] = block;
+            uint total = 0u;
+            for (uint slice = 0u; slice < parts; ++slice)
+                total += seismic_shared_u32[index * parts + slice];
+            block += uint((uint64_t(total) + tile - 1ul) / tile);
+        }
+        seismic_shared_u32[used] = block;
+    }
+    barrier();
+
+    uint total = 0u;
+    uint preceding = 0u;
+    for (uint slice = 0u; slice < parts; ++slice) {
+        const uint value = seismic_shared_u32[expert * parts + slice];
+        preceding += slice < part ? value : 0u;
+        total += value;
+    }
+    const uint64_t base = uint64_t(seismic_shared_u32[starts + expert]) * tile;
+    uint64_t position = base + preceding;
+    for (uint64_t index = begin; index < end; ++index) {
+        const uint64_t row = index / SEISMIC_DIM_K;
+        const uint64_t choice = index % SEISMIC_DIM_K;
+        if (group_route(row, choice) != int(expert))
+            continue;
+        group_order_put(position / tile, position % tile, int(row));
+        element_i32_put(SEISMIC_PTR(SEISMIC_BUFFER_INVERSE)
+                + (row * SEISMIC_INVERSE_STRIDE_0 + choice * SEISMIC_INVERSE_STRIDE_1) * 4ul,
+            int(position));
+        ++position;
+    }
+    if (part == 0u) {
+        element_i32_put(SEISMIC_PTR(SEISMIC_BUFFER_COUNTS) + uint64_t(expert) * SEISMIC_COUNTS_STRIDE_0 * 4ul, int(total));
+        const uint64_t tiles = (uint64_t(total) + tile - 1ul) / tile;
+        for (uint64_t padding = base + total; padding < base + tiles * tile; ++padding)
+            group_order_put(padding / tile, padding % tile, -1);
+        const uint64_t first_block = uint64_t(seismic_shared_u32[starts + expert]);
+        for (uint64_t block = first_block; block < first_block + tiles; ++block)
+            element_i32_put(SEISMIC_PTR(SEISMIC_BUFFER_BLOCKS) + block * SEISMIC_BLOCKS_STRIDE_0 * 4ul, int(expert));
+    }
+    for (uint64_t block = uint64_t(seismic_shared_u32[used]) + tid; block < SEISMIC_DIM_B; block += threads) {
+        element_i32_put(SEISMIC_PTR(SEISMIC_BUFFER_BLOCKS) + block * SEISMIC_BLOCKS_STRIDE_0 * 4ul, -1);
+        for (uint64_t lane = 0ul; lane < tile; ++lane)
+            group_order_put(block, lane, -1);
+    }
+}

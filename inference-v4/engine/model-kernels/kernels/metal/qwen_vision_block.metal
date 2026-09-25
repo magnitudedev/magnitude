@@ -1,10 +1,10 @@
 // qwen_vision_block: one Qwen3-VL vision transformer block over M patch rows
 // of D = H * W (W = 4P), the residual stream in F32. Eight launches (bodies in
-// common/vision.h and the projection library): layer norm, QKV GEMM (+ bias),
+// lib/vision/vision.h and the projection library): layer norm, QKV GEMM (+ bias),
 // 2D rotation of the queries and keys in place, full attention, output GEMM
 // (+ bias, + the block input), layer norm, up GEMM (+ bias, tanh GELU), down
 // GEMM (+ bias, + the attention residual).
-#include "common/vision.h"
+#include "lib/vision/vision.h"
 
 #if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16)
 typedef element::Bf16 activation;

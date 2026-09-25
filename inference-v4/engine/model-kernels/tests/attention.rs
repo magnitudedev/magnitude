@@ -1,8 +1,9 @@
-// `qwen_attention_decode` and `qwen_attention_prefill` against their portable
+// `gated_attention_decode` and `gated_attention_prefill` against their portable
 // body (the reference interpreter, small shapes) and against a host model of
-// that body (Qwen3.5-4B geometry, long contexts), on local Metal.
+// that body (Qwen3.5-4B geometry, long contexts), on the local GPU (Metal, or
+// Vulkan elsewhere) and the CPU.
 
-use magnitude_model_kernels::{qwen_attention_decode, qwen_attention_prefill};
+use magnitude_model_kernels::{gated_attention_decode, gated_attention_prefill};
 use seismic::{BackendName, Device, DeviceCatalog, Element, NativeSpecialization, Tensor};
 
 include!("attention_common/fixtures.rs");
@@ -46,47 +47,93 @@ impl Bound {
     }
 }
 
-fn decode_kernel(
+/// The CPU decode's partition counts.
+const CPU_PARTS: [u64; 4] = [8, 4, 16, 1];
+
+/// The decode specializations to run on `device`, labelled: on the GPU the
+/// statics with each (SPAN, PARTS, SIMDS) of `configs`; on CPU (no statics)
+/// each of its declared PARTS.
+fn decode_specializations_on(
     device: &Device,
     geometry: Geometry,
-    (span, parts, simds): (u64, u64, u64),
-) -> seismic::NativeKernel<qwen_attention_decode::Entry> {
-    qwen_attention_decode::native_for_device_with(
+    configs: &[(u64, u64, u64)],
+) -> Vec<(String, NativeSpecialization)> {
+    if is_cpu(device) {
+        return CPU_PARTS
+            .iter()
+            .map(|parts| (format!("Cpu PARTS {parts}"), NativeSpecialization::new().with_param("PARTS", *parts)))
+            .collect();
+    }
+    configs
+        .iter()
+        .map(|&(span, parts, simds)| {
+            (
+                format!("{:?} (SPAN, PARTS, SIMDS) {:?}", device.backend(), (span, parts, simds)),
+                statics(geometry)
+                    .with_param("SPAN", span)
+                    .with_param("PARTS", parts)
+                    .with_param("SIMDS", simds),
+            )
+        })
+        .collect()
+}
+
+/// The prefill specializations to run on `device`, labelled: on the GPU the
+/// statics with each (QT, SPLIT_GROUPS) of `configs`; on CPU its one form
+/// (no statics, no parameters).
+fn prefill_specializations_on(
+    device: &Device,
+    geometry: Geometry,
+    configs: &[(u64, u64)],
+) -> Vec<(String, NativeSpecialization)> {
+    if is_cpu(device) {
+        return vec![("Cpu".to_owned(), NativeSpecialization::new())];
+    }
+    configs
+        .iter()
+        .map(|&(query_tile, split_groups)| {
+            // Vulkan tiles ROWS = 64 matrix rows (query tile x query heads), the
+            // one tile admissible at every tested geometry, whatever QT asks for.
+            let tile = if device.backend() == BackendName::Vulkan { ("ROWS", 64) } else { ("QT", query_tile) };
+            (
+                format!("{:?} (QT, SPLIT_GROUPS) {:?}", device.backend(), (query_tile, split_groups)),
+                statics(geometry).with_param(tile.0, tile.1).with_param("SPLIT_GROUPS", split_groups),
+            )
+        })
+        .collect()
+}
+
+fn decode_kernel(
+    device: &Device,
+    specialization: &NativeSpecialization,
+) -> seismic::NativeKernel<gated_attention_decode::Entry> {
+    gated_attention_decode::native_for_device_with(
         device,
-        qwen_attention_decode::Elements { A: Element::bf16() },
-        &statics(geometry)
-            .with_param("SPAN", span)
-            .with_param("PARTS", parts)
-            .with_param("SIMDS", simds),
+        gated_attention_decode::Elements { A: Element::bf16() },
+        specialization,
     )
     .unwrap()
 }
 
 fn prefill_kernel(
     device: &Device,
-    geometry: Geometry,
-    (query_tile, split_groups): (u64, u64),
-) -> seismic::NativeKernel<qwen_attention_prefill::Entry> {
-    // Vulkan tiles ROWS = 64 matrix rows (query tile x query heads), the one
-    // tile admissible at every tested geometry, whatever QT asks for.
-    let tile = if device.backend() == BackendName::Vulkan { ("ROWS", 64) } else { ("QT", query_tile) };
-    qwen_attention_prefill::native_for_device_with(
+    specialization: &NativeSpecialization,
+) -> seismic::NativeKernel<gated_attention_prefill::Entry> {
+    gated_attention_prefill::native_for_device_with(
         device,
-        qwen_attention_prefill::Elements { A: Element::bf16() },
-        &statics(geometry)
-            .with_param(tile.0, tile.1)
-            .with_param("SPLIT_GROUPS", split_groups),
+        gated_attention_prefill::Elements { A: Element::bf16() },
+        specialization,
     )
     .unwrap()
 }
 
 fn run_decode(
-    kernel: &seismic::NativeKernel<qwen_attention_decode::Entry>,
+    kernel: &seismic::NativeKernel<gated_attention_decode::Entry>,
     bound: &mut Bound,
     case: &Case,
 ) -> Tensor {
     kernel
-        .call(qwen_attention_decode::Args {
+        .call(gated_attention_decode::Args {
             query_gate: &bound.query_gate,
             key: &bound.key,
             value: &bound.value,
@@ -108,12 +155,12 @@ fn run_decode(
 }
 
 fn run_prefill(
-    kernel: &seismic::NativeKernel<qwen_attention_prefill::Entry>,
+    kernel: &seismic::NativeKernel<gated_attention_prefill::Entry>,
     bound: &mut Bound,
     case: &Case,
 ) -> Tensor {
     kernel
-        .call(qwen_attention_prefill::Args {
+        .call(gated_attention_prefill::Args {
             query_gate: &bound.query_gate,
             key: &bound.key,
             value: &bound.value,
@@ -146,7 +193,7 @@ fn check(label: &str, case: &Case, gated: &Tensor, bound: &Bound, expected: &(Ve
         worst = worst.max(error);
         assert!(
             error <= 4.0e-3 + 1.6e-2 * e.abs(),
-            "{label}: gated[{index}] (row {}, head {}, column {}) Metal {a} expected {e}",
+            "{label}: gated[{index}] (row {}, head {}, column {}) device {a} expected {e}",
             index / (case.geometry.kv * case.geometry.g * case.geometry.w()),
             index / case.geometry.w() % (case.geometry.kv * case.geometry.g),
             index % case.geometry.w()
@@ -156,7 +203,7 @@ fn check(label: &str, case: &Case, gated: &Tensor, bound: &Bound, expected: &(Ve
     for (index, (a, e)) in key.iter().zip(&expected.1).enumerate() {
         assert!(
             (a - e).abs() <= 8.0e-3 * e.abs().max(1.0),
-            "{label}: history_key[{index}] Metal {a} expected {e}"
+            "{label}: history_key[{index}] device {a} expected {e}"
         );
     }
     assert_eq!(bf16_values(&bound.history_value), expected.2, "{label}: history_value");
@@ -245,33 +292,43 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
 
 #[test]
 fn decode_matches_portable_body() {
-    let Some(device) = metal() else { return };
     let case = Case::new(SMALL, 64, 2, &decode_rows(5), 11);
-    check_host_model_against_portable_body("qwen_attention_decode", &case);
+    check_host_model_against_portable_body("gated_attention_decode", &case);
+    for device in devices() {
+        decode_matches_portable_body_on(&device, &case);
+    }
+}
+
+fn decode_matches_portable_body_on(device: &Device, case: &Case) {
     let expected = case.expected();
-    for config in [(64, 32, 8), (32, 16, 4), (256, 8, 8)] {
-        let kernel = decode_kernel(&device, SMALL, config);
-        let mut bound = Bound::new(&device, &case);
-        let gated = run_decode(&kernel, &mut bound, &case);
-        check(&format!("small decode {config:?}"), &case, &gated, &bound, &expected);
+    for (config, specialization) in decode_specializations_on(device, SMALL, &[(64, 32, 8), (32, 16, 4), (256, 8, 8)]) {
+        let kernel = decode_kernel(device, &specialization);
+        let mut bound = Bound::new(device, case);
+        let gated = run_decode(&kernel, &mut bound, case);
+        check(&format!("small decode {config}"), case, &gated, &bound, &expected);
     }
 }
 
 #[test]
 fn prefill_matches_portable_body() {
-    let Some(device) = metal() else { return };
     // 300 history rows are 10 key tiles: SPLIT_GROUPS 1 keeps one key
     // partition per query tile; 256 splits the first sequence's history
     // spans over two partitions and merges them, while its short second
     // sequence stays unsplit.
     let case = Case::new(SMALL, 400, 2, &prefill_rows(20, 300), 23);
-    check_host_model_against_portable_body("qwen_attention_prefill", &case);
+    check_host_model_against_portable_body("gated_attention_prefill", &case);
+    for device in devices() {
+        prefill_matches_portable_body_on(&device, &case);
+    }
+}
+
+fn prefill_matches_portable_body_on(device: &Device, case: &Case) {
     let expected = case.expected();
-    for config in [(16, 1), (8, 1), (16, 256), (8, 256)] {
-        let kernel = prefill_kernel(&device, SMALL, config);
-        let mut bound = Bound::new(&device, &case);
-        let gated = run_prefill(&kernel, &mut bound, &case);
-        check(&format!("small prefill (QT, SPLIT_GROUPS) {config:?}"), &case, &gated, &bound, &expected);
+    for (config, specialization) in prefill_specializations_on(device, SMALL, &[(16, 1), (8, 1), (16, 256), (8, 256)]) {
+        let kernel = prefill_kernel(device, &specialization);
+        let mut bound = Bound::new(device, case);
+        let gated = run_prefill(&kernel, &mut bound, case);
+        check(&format!("small prefill {config}"), case, &gated, &bound, &expected);
     }
 }
 
@@ -282,7 +339,13 @@ fn prefill_matches_portable_body() {
 #[test]
 #[ignore]
 fn decode_timing() {
-    let Some(device) = metal() else { return };
+    for device in devices() {
+        decode_timing_on(&device);
+    }
+}
+
+fn decode_timing_on(device: &Device) {
+    let configs = [(32, 16, 4), (32, 8, 4), (64, 8, 4), (64, 16, 4), (128, 16, 4), (32, 16, 8), (64, 32, 4)];
     for context in [1usize, 256, 4096, 16384] {
         let rows = [Row {
             spans: vec![(0, context as i32 - 1)],
@@ -291,12 +354,12 @@ fn decode_timing() {
             position: context as i32 - 1,
         }];
         let case = Case::new(QWEN, context + 64, 1, &rows, 3);
-        for config in [(32, 16, 4), (32, 8, 4), (64, 8, 4), (64, 16, 4), (128, 16, 4), (32, 16, 8), (64, 32, 4)] {
-            let kernel = decode_kernel(&device, QWEN, config);
-            let mut bound = Bound::new(&device, &case);
+        for (config, specialization) in decode_specializations_on(device, QWEN, &configs) {
+            let kernel = decode_kernel(device, &specialization);
+            let mut bound = Bound::new(device, &case);
             let measurement = kernel
                 .measure(
-                    vec![qwen_attention_decode::Args {
+                    vec![gated_attention_decode::Args {
                         query_gate: &bound.query_gate,
                         key: &bound.key,
                         value: &bound.value,
@@ -318,7 +381,7 @@ fn decode_timing() {
                 .unwrap();
             let kv_bytes = (context * QWEN.kv * QWEN.w() * 2 * 2) as f64;
             eprintln!(
-                "decode context {context} SPAN/PARTS/SIMDS {config:?}: {:.1} us (KV read {:.0} GB/s)",
+                "decode context {context} {config}: {:.1} us (KV read {:.0} GB/s)",
                 measurement.median * 1e6,
                 kv_bytes / measurement.median / 1e9
             );
@@ -334,7 +397,12 @@ fn decode_timing() {
 #[test]
 #[ignore]
 fn prefill_timing() {
-    let Some(device) = metal() else { return };
+    for device in devices() {
+        prefill_timing_on(&device);
+    }
+}
+
+fn prefill_timing_on(device: &Device) {
     for (rows, history) in [(128usize, 0i32), (128, 4096), (512, 0), (512, 16384)] {
         let spans = if history > 0 { vec![(0, history)] } else { vec![] };
         let rows = (0..rows)
@@ -351,12 +419,13 @@ fn prefill_timing() {
             .sum::<f64>();
         let flop = pairs * (QWEN.kv * QWEN.g * QWEN.w() * 4) as f64;
         let case = Case::new(QWEN, history as usize + rows.len(), 1, &rows, 9);
-        for config in [(16, 1), (16, 128), (16, 256), (16, 512), (8, 1), (8, 256)] {
-            let kernel = prefill_kernel(&device, QWEN, config);
-            let mut bound = Bound::new(&device, &case);
+        let configs = [(16, 1), (16, 128), (16, 256), (16, 512), (8, 1), (8, 256)];
+        for (config, specialization) in prefill_specializations_on(device, QWEN, &configs) {
+            let kernel = prefill_kernel(device, &specialization);
+            let mut bound = Bound::new(device, &case);
             let measurement = kernel
                 .measure(
-                    vec![qwen_attention_prefill::Args {
+                    vec![gated_attention_prefill::Args {
                         query_gate: &bound.query_gate,
                         key: &bound.key,
                         value: &bound.value,
@@ -377,7 +446,7 @@ fn prefill_timing() {
                 )
                 .unwrap();
             eprintln!(
-                "prefill {} rows after {history} history (QT, SPLIT_GROUPS) {config:?}: {:.1} us ({:.2} TFLOP/s)",
+                "prefill {} rows after {history} history {config}: {:.1} us ({:.2} TFLOP/s)",
                 rows.len(),
                 measurement.median * 1e6,
                 flop / measurement.median / 1e12
@@ -388,16 +457,22 @@ fn prefill_timing() {
 
 #[test]
 fn qwen_geometry_speculative_decode_matches_host_model() {
-    let Some(device) = metal() else { return };
+    for device in devices() {
+        qwen_geometry_speculative_decode_matches_host_model_on(&device);
+    }
+}
+
+fn qwen_geometry_speculative_decode_matches_host_model_on(device: &Device) {
     for context in [256, 4096, 16384] {
         for rows in [1, 8] {
             let case = Case::new(QWEN, context as usize + rows, 1, &speculative_rows(rows, context), 13);
             let expected = case.expected();
-            for config in [(32, 16, 4), (32, 16, 8), (64, 32, 8), (128, 8, 8), (256, 32, 4)] {
-                let kernel = decode_kernel(&device, QWEN, config);
-                let mut bound = Bound::new(&device, &case);
+            let configs = [(32, 16, 4), (32, 16, 8), (64, 32, 8), (128, 8, 8), (256, 32, 4)];
+            for (config, specialization) in decode_specializations_on(device, QWEN, &configs) {
+                let kernel = decode_kernel(device, &specialization);
+                let mut bound = Bound::new(device, &case);
                 let gated = run_decode(&kernel, &mut bound, &case);
-                check(&format!("speculative decode {rows} rows context {context} {config:?}"),
+                check(&format!("speculative decode {rows} rows context {context} {config}"),
                     &case, &gated, &bound, &expected);
             }
         }
@@ -406,7 +481,12 @@ fn qwen_geometry_speculative_decode_matches_host_model() {
 
 #[test]
 fn qwen_geometry_decode_and_prefill_match_host_model() {
-    let Some(device) = metal() else { return };
+    for device in devices() {
+        qwen_geometry_decode_and_prefill_match_host_model_on(&device);
+    }
+}
+
+fn qwen_geometry_decode_and_prefill_match_host_model_on(device: &Device) {
     for (context, configs) in [
         (256, vec![(64, 32, 8), (32, 16, 4)]),
         (4096, vec![(64, 32, 8), (256, 16, 4)]),
@@ -414,11 +494,11 @@ fn qwen_geometry_decode_and_prefill_match_host_model() {
     ] {
         let case = Case::new(QWEN, context + 128, 2, &decode_rows(context as i32 - 40), 5);
         let expected = case.expected();
-        for config in configs {
-            let kernel = decode_kernel(&device, QWEN, config);
-            let mut bound = Bound::new(&device, &case);
+        for (config, specialization) in decode_specializations_on(device, QWEN, &configs) {
+            let kernel = decode_kernel(device, &specialization);
+            let mut bound = Bound::new(device, &case);
             let gated = run_decode(&kernel, &mut bound, &case);
-            check(&format!("decode context {context} {config:?}"), &case, &gated, &bound, &expected);
+            check(&format!("decode context {context} {config}"), &case, &gated, &bound, &expected);
         }
     }
     for (rows, history, configs) in [
@@ -429,11 +509,11 @@ fn qwen_geometry_decode_and_prefill_match_host_model() {
     ] {
         let case = Case::new(QWEN, history as usize + 256, 2, &prefill_rows(rows, history), 7);
         let expected = case.expected();
-        for config in configs {
-            let kernel = prefill_kernel(&device, QWEN, config);
-            let mut bound = Bound::new(&device, &case);
+        for (config, specialization) in prefill_specializations_on(device, QWEN, &configs) {
+            let kernel = prefill_kernel(device, &specialization);
+            let mut bound = Bound::new(device, &case);
             let gated = run_prefill(&kernel, &mut bound, &case);
-            check(&format!("prefill {rows} rows after {history} (QT, SPLIT_GROUPS) {config:?}"), &case, &gated, &bound, &expected);
+            check(&format!("prefill {rows} rows after {history} {config}"), &case, &gated, &bound, &expected);
         }
     }
 }

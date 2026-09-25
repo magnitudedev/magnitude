@@ -92,6 +92,11 @@ fn metal_dense_import_matches_host_for_all_nine_pairs() {
 }
 
 #[test]
+fn cpu_dense_import_matches_host_for_all_nine_pairs() {
+    dense_import_matches_host_for_all_nine_pairs(&device(seismic::BackendName::Cpu).unwrap());
+}
+
+#[test]
 fn cuda_dense_import_matches_host_for_all_nine_pairs() {
     if let Some(device) = device(seismic::BackendName::Cuda) {
         dense_import_matches_host_for_all_nine_pairs(&device);
@@ -101,13 +106,13 @@ fn cuda_dense_import_matches_host_for_all_nine_pairs() {
 #[cfg(target_os = "macos")]
 #[test]
 fn metal_repack_matches_the_registered_conversion_for_every_format_and_layout() {
-    repack_matches_the_registered_conversion(&device(seismic::BackendName::Metal).unwrap(), &seismic::Layout::ALL);
+    repack_matches_the_registered_conversion(&device(seismic::BackendName::Metal).unwrap(), &[seismic::Layout::Rows16, seismic::Layout::Mma16]);
 }
 
 #[test]
 fn cuda_repack_matches_the_registered_conversion_for_every_format_and_layout() {
     if let Some(device) = device(seismic::BackendName::Cuda) {
-        repack_matches_the_registered_conversion(&device, &seismic::Layout::ALL);
+        repack_matches_the_registered_conversion(&device, &[seismic::Layout::Rows16, seismic::Layout::Mma16]);
     }
 }
 
@@ -118,7 +123,13 @@ fn vulkan_dense_import_matches_host_for_all_nine_pairs() {
     }
 }
 
-/// Vulkan repacks into its resident layout, rows16, only.
+/// The CPU repacks into both supported row layouts.
+#[test]
+fn cpu_repack_matches_the_registered_conversion_for_every_format() {
+    repack_matches_the_registered_conversion(&device(seismic::BackendName::Cpu).unwrap(), &[seismic::Layout::Rows16, seismic::Layout::Rows8]);
+}
+
+/// Vulkan repacks into both supported row layouts.
 #[test]
 fn vulkan_repack_matches_the_registered_conversion_for_every_format() {
     if let Some(device) = device(seismic::BackendName::Vulkan) {
@@ -126,38 +137,58 @@ fn vulkan_repack_matches_the_registered_conversion_for_every_format() {
     }
 }
 
+/// The declared-parameter specializations of `import_dense` on `device`:
+/// every CPU row block (the GPU forms declare none).
+fn import_specializations(device: &seismic::Device) -> Vec<seismic::NativeSpecialization> {
+    row_specializations(device, &[16, 4, 64, 1])
+}
+
+/// The specializations of an entry whose CPU form declares only `ROWS` over
+/// `rows`; the GPU forms declare none.
+fn row_specializations(device: &seismic::Device, rows: &[u64]) -> Vec<seismic::NativeSpecialization> {
+    if device.backend() != seismic::BackendName::Cpu {
+        return vec![seismic::NativeSpecialization::new()];
+    }
+    rows.iter()
+        .map(|rows| seismic::NativeSpecialization::new().with_param("ROWS", *rows))
+        .collect()
+}
+
 fn dense_import_matches_host_for_all_nine_pairs(device: &seismic::Device) {
     let device = device.clone();
     let values = [-3.25f32, -0.0, 0.125, 1.5, 19.0];
-    for source_name in ["f32", "f16", "bf16"] {
-        for destination_name in ["f32", "f16", "bf16"] {
-            let source_element = seismic::Element::named(source_name).unwrap();
-            let destination_element = seismic::Element::named(destination_name).unwrap();
-            let source = seismic::Tensor::from_host(
-                &device,
-                source_element,
-                &[1, 1, values.len() as u64],
-                &dense_bytes(source_name, &values),
-            )
-            .unwrap();
-            let elements = import_dense::Elements {
-                E: source_element,
-                U: destination_element,
-            };
-            let native = import_dense::native_for_device_with(
-                &device,
-                elements,
-                &seismic::NativeSpecialization::new(),
-            )
-            .unwrap()
-            .call(import_dense::Args { source: &source })
-            .unwrap()
-            .value;
-            assert_eq!(
-                native.read_to_host().unwrap(),
-                dense_bytes(destination_name, &values),
-                "{source_name}->{destination_name}"
-            );
+    // One row, and 21 rows of the same values over two matrices (rows of
+    // several row blocks).
+    for (matrices, rows) in [(1usize, 1usize), (3, 7)] {
+        let repeated = |bytes: Vec<u8>| bytes.repeat(matrices * rows);
+        for source_name in ["f32", "f16", "bf16"] {
+            for destination_name in ["f32", "f16", "bf16"] {
+                let source_element = seismic::Element::named(source_name).unwrap();
+                let destination_element = seismic::Element::named(destination_name).unwrap();
+                let source = seismic::Tensor::from_host(
+                    &device,
+                    source_element,
+                    &[matrices as u64, rows as u64, values.len() as u64],
+                    &repeated(dense_bytes(source_name, &values)),
+                )
+                .unwrap();
+                for specialization in import_specializations(&device) {
+                    let elements = import_dense::Elements {
+                        E: source_element,
+                        U: destination_element,
+                    };
+                    let native = import_dense::native_for_device_with(&device, elements, &specialization)
+                        .unwrap()
+                        .call(import_dense::Args { source: &source })
+                        .unwrap()
+                        .value;
+                    assert_eq!(
+                        native.read_to_host().unwrap(),
+                        repeated(dense_bytes(destination_name, &values)),
+                        "{source_name}->{destination_name} over {matrices}x{rows} rows"
+                    );
+                }
+            }
         }
     }
 }
@@ -184,7 +215,10 @@ fn repack_matches_the_registered_conversion(device: &seismic::Device, layouts: &
             let expected_values = packet
                 .decode_host(&shape, &packet.repack_host(source_element, &shape, &bytes).unwrap())
                 .unwrap();
-            for &layout in layouts {
+            for (&layout, specialization) in layouts
+                .iter()
+                .flat_map(|layout| row_specializations(&device, &[16, 64, 8]).into_iter().map(move |rows| (layout, rows)))
+            {
                 let destination = seismic::Element::stored(resident, layout).unwrap();
                 let native = repack_weight::native_for_device_with(
                     &device,
@@ -192,14 +226,14 @@ fn repack_matches_the_registered_conversion(device: &seismic::Device, layouts: &
                         E: source_element,
                         U: destination,
                     },
-                    &seismic::NativeSpecialization::new(),
+                    &specialization,
                 )
                 .unwrap()
                 .call(repack_weight::Args { source: &source })
                 .unwrap()
                 .value;
                 let actual = native.read_to_host().unwrap();
-                let label = format!("{source_name} -> {} over {shape:?}", destination.name());
+                let label = format!("{source_name} -> {} over {shape:?} ({specialization:?})", destination.name());
                 assert_eq!(
                     actual,
                     destination.repack_host(source_element, &shape, &bytes).unwrap(),

@@ -5,7 +5,7 @@
 //! CUDA device.
 
 use magnitude_model_kernels::{
-    qwen_dense_expand, qwen_dense_output, embedding_rows, readout_features_rows, readout_head_rows,
+    dense_expand, dense_output, embedding_rows, readout_features_rows, readout_head_rows,
     readout_selected_rows, sample_rows, shape_rows,
 };
 mod cuda_common;
@@ -76,10 +76,10 @@ fn expand_kernel(
     format: Format,
     case: &DenseCase,
     mapping: Mapping,
-) -> seismic::NativeKernel<qwen_dense_expand::Entry> {
-    qwen_dense_expand::native_for_device_with(
+) -> seismic::NativeKernel<dense_expand::Entry> {
+    dense_expand::native_for_device_with(
         device,
-        qwen_dense_expand::Elements {
+        dense_expand::Elements {
             NW: Element::f32(),
             GW: format.resident(),
             UW: format.resident(),
@@ -96,10 +96,10 @@ fn output_kernel(
     h: usize,
     f: usize,
     mapping: Mapping,
-) -> seismic::NativeKernel<qwen_dense_output::Entry> {
-    qwen_dense_output::native_for_device_with(
+) -> seismic::NativeKernel<dense_output::Entry> {
+    dense_output::native_for_device_with(
         device,
-        qwen_dense_output::Elements { DW: format.resident(), A: Element::bf16() },
+        dense_output::Elements { DW: format.resident(), A: Element::bf16() },
         &mapping.params(NativeSpecialization::new().with_static("H", h as u64).with_static("F", f as u64)),
     )
     .unwrap()
@@ -125,7 +125,7 @@ fn cuda_dense_expand_matches_host_model() {
             for &mapping in mappings(o) {
                 let (expected, tolerance) = case.expand(&gate, &up, mapping);
                 let product = expand_kernel(&device, format, &case, mapping)
-                    .call(qwen_dense_expand::Args {
+                    .call(dense_expand::Args {
                         residual: &residual,
                         norm: &norm,
                         gate_weight: &gate.tensor,
@@ -170,7 +170,7 @@ fn cuda_dense_output_matches_host_model() {
                     .map(|i| projected[i].abs() / 256.0 + magnitude[i] * 2e-5 + dequant[i] + 1e-6)
                     .collect();
                 let result = output_kernel(&device, format, h, f, mapping)
-                    .call(qwen_dense_output::Args {
+                    .call(dense_output::Args {
                         residual: &residual,
                         product: &product,
                         down_weight: &down.tensor,
@@ -205,13 +205,13 @@ fn cuda_dense_weights_match_host_model() {
             // INT8 has no effect with dense weights: every mapping runs the
             // 16-bit path.
             let (expected, tolerance) = case.expand(&gate, &up, Mapping { int8: 0, ..mapping });
-            let product = qwen_dense_expand::native_for_device_with(
+            let product = dense_expand::native_for_device_with(
                 &device,
-                qwen_dense_expand::Elements { NW: Element::f32(), GW: bf16, UW: bf16, A: bf16 },
+                dense_expand::Elements { NW: Element::f32(), GW: bf16, UW: bf16, A: bf16 },
                 &spec,
             )
             .unwrap()
-            .call(qwen_dense_expand::Args {
+            .call(dense_expand::Args {
                 residual: &residual,
                 norm: &norm,
                 gate_weight: &gate.tensor,
@@ -231,13 +231,13 @@ fn cuda_dense_weights_match_host_model() {
                 .collect();
             let tolerance: Vec<f64> =
                 (0..o * h).map(|i| projected[i].abs() / 256.0 + magnitude[i] * 2e-5 + 1e-6).collect();
-            let result = qwen_dense_output::native_for_device_with(
+            let result = dense_output::native_for_device_with(
                 &device,
-                qwen_dense_output::Elements { DW: bf16, A: bf16 },
+                dense_output::Elements { DW: bf16, A: bf16 },
                 &spec,
             )
             .unwrap()
-            .call(qwen_dense_output::Args {
+            .call(dense_output::Args {
                 residual: &residual,
                 product: &product,
                 down_weight: &down.tensor,
@@ -267,9 +267,9 @@ fn cuda_gemv_rows_match_single_row_bits() {
         let norm = f32_tensor(&device, &[h as u64], &(0..h).map(|_| rng.uniform(0.25, 1.25)).collect::<Vec<_>>());
         let product_values: Vec<f32> = (0..rows * f).map(|_| bf16_round(rng.uniform(-1.0, 1.0))).collect();
         for &mapping in &GEMV_MAPPINGS {
-            let expand = qwen_dense_expand::native_for_device_with(
+            let expand = dense_expand::native_for_device_with(
                 &device,
-                qwen_dense_expand::Elements { NW: Element::f32(), GW: format.resident(), UW: format.resident(), A: Element::bf16() },
+                dense_expand::Elements { NW: Element::f32(), GW: format.resident(), UW: format.resident(), A: Element::bf16() },
                 &mapping.params(NativeSpecialization::new().with_static("H", h as u64).with_static("F", f as u64)),
             )
             .unwrap();
@@ -279,7 +279,7 @@ fn cuda_gemv_rows_match_single_row_bits() {
                 let product = bf16_tensor(&device, &[o as u64, f as u64], &product_values[first * f..(first + o) * f]);
                 let out_rows = i32_tensor(&device, &[o as u64], &(0..o as i32).collect::<Vec<_>>());
                 let expanded = expand
-                    .call(qwen_dense_expand::Args {
+                    .call(dense_expand::Args {
                         residual: &residual,
                         norm: &norm,
                         gate_weight: &gate.tensor,
@@ -291,7 +291,7 @@ fn cuda_gemv_rows_match_single_row_bits() {
                     .value;
                 let residual_rows = f32_tensor(&device, &[o as u64, h as u64], &vec![0.0; o * h]);
                 let projected = output
-                    .call(qwen_dense_output::Args {
+                    .call(dense_output::Args {
                         residual: &residual_rows,
                         product: &product,
                         down_weight: &down.tensor,
@@ -456,7 +456,7 @@ fn dense_expand_host_model_matches_portable_body() {
         let storage = registry::storage(format.representation(), Layout::Mma16).unwrap();
         let logical = module
             .entry(
-                module.entry_named("qwen_dense_expand").unwrap(),
+                module.entry_named("dense_expand").unwrap(),
                 &ElementBindings::new()
                     .bind("NW", registry::dense(DType::F32))
                     .bind("GW", storage)
@@ -477,7 +477,7 @@ fn dense_expand_host_model_matches_portable_body() {
         ];
         let outcome = interpreter.run(&args).unwrap();
         if let SourceTermination::Failed(failure) = outcome.termination() {
-            panic!("qwen_dense_expand portable body failed: {failure}");
+            panic!("dense_expand portable body failed: {failure}");
         }
         let result = outcome.results().next().unwrap();
         let OutcomeValue::Tensor(product) = result.value() else { panic!("tensor result") };
@@ -776,7 +776,7 @@ fn cuda_projection_timings() {
             for &mapping in mappings(m) {
                 let expand = expand_kernel(&device, format, &case, mapping);
                 let args = (0..rotation)
-                    .map(|r| qwen_dense_expand::Args {
+                    .map(|r| dense_expand::Args {
                         residual: &residual,
                         norm: &norm,
                         gate_weight: &gates[r],
@@ -794,7 +794,7 @@ fn cuda_projection_timings() {
                 );
                 let output = output_kernel(&device, format, h, f, mapping);
                 let args = (0..rotation)
-                    .map(|r| qwen_dense_output::Args {
+                    .map(|r| dense_output::Args {
                         residual: &residual,
                         product: &product,
                         down_weight: &downs[r],
