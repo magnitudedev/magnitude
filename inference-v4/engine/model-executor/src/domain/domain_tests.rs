@@ -2,22 +2,22 @@
 
 use super::*;
 use crate::{
-    AttestedPrograms, ComponentSelection, ExecutionPath, ExecutionPlanner, PlannedMethod,
-    ResourceAllocator, ResourceBudget, ResourceLimits, ResourcePlanner, TargetLaunchCore,
     completion::CompletionWake,
     platform,
     programs::{
-        CompletedHeadWork, CompletedStateWork, CompletedVisionWork,
-        CompletedWork, ProgramSubmission, ReadySubmission,
+        CompletedHeadWork, CompletedStateWork, CompletedVisionWork, CompletedWork,
+        ProgramSubmission, ReadySubmission,
     },
+    AttestedPrograms, ComponentSelection, ExecutionPath, ExecutionPlanner, PlannedMethod,
+    ResourceAllocator, ResourceCapacity, ResourceLimits, ResourcePlanner, TargetLaunchCore,
 };
 use magnitude_artifacts::PackageManifest;
 use magnitude_model_contracts::FamilyId;
 use magnitude_model_state::KvCodec;
 use std::marker::PhantomData;
 use std::sync::{
-    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
 };
 
 /// The planning fixture's model (the smallest geometry every native kernel
@@ -39,7 +39,8 @@ fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>
         &catalog,
         ExecutionPath::Native,
         platform::DeviceRequest::Automatic,
-    ).ok()?;
+    )
+    .ok()?;
     let device = Rc::new(
         catalog
             .open(catalog.resolve(selected.info.selector).unwrap())
@@ -48,6 +49,7 @@ fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>
     let definition = Rc::new(tiny_definition());
     let manifest = tiny_manifest(&definition);
     let limits = ResourceLimits {
+        max_retained_entries: 2,
         active_requests: 2,
         in_flight_requests: 2,
         branch_checkpoints: 0,
@@ -56,10 +58,8 @@ fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>
         max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
         lookahead: false,
     };
-    let budget = ResourceBudget {
-        storage_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
-        retention_bytes: 64 * 1024,
-        safety_reserve_bytes: 16 * 1024 * 1024,
+    let capacity_bytes = ResourceCapacity {
+        domain_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
     };
     let draft = ExecutionPlanner::prepare(
         &selected,
@@ -73,7 +73,6 @@ fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>
         PlannedMethod::Plain,
         KvCodec::Dense,
         limits,
-        budget,
     )
     .unwrap();
     let state = ResourcePlanner::state_plan(
@@ -82,20 +81,20 @@ fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>
         draft.policy().method(),
         KvCodec::Dense,
         limits,
-        budget,
+        capacity_bytes,
     )
     .unwrap();
     let mut programs = AttestedPrograms::prepare_draft(
-            &draft,
-            &device,
-            crate::TuningContext {
-                definition: &definition,
-                weights: &crate::ZeroTuningWeights,
-                observer: &crate::UnreportedTuning,
-                cache: None,
-            },
-        )
-        .unwrap();
+        &draft,
+        &device,
+        crate::TuningContext {
+            definition: &definition,
+            weights: &crate::ZeroTuningWeights,
+            observer: &crate::UnreportedTuning,
+            cache: None,
+        },
+    )
+    .unwrap();
     let target_graphs = programs
         .prepare_target_graphs(&device, draft.load(), &definition.geometry, &state, limits)
         .unwrap();
@@ -188,11 +187,11 @@ impl PendingControl {
 struct PendingCompletion(PendingControl);
 impl Completion for PendingCompletion {
     fn is_complete(&self) -> bool {
-        self.0.0.lock().unwrap().result.is_some()
+        self.0 .0.lock().unwrap().result.is_some()
     }
     fn result(&mut self) -> Result<(), crate::DeviceError> {
         self.0
-            .0
+             .0
             .lock()
             .unwrap()
             .result
@@ -201,7 +200,7 @@ impl Completion for PendingCompletion {
     }
     fn notify(&mut self, wake: CompletionWake) {
         let wake = {
-            let mut state = self.0.0.lock().unwrap();
+            let mut state = self.0 .0.lock().unwrap();
             if state.result.is_some() {
                 Some(wake)
             } else {
@@ -267,7 +266,9 @@ enum TestSubmission<L, W, O> {
     Ready(ReadySubmission<L, W, O>),
     Pending(PendingSubmission<L, W, O>),
 }
-impl<W> crate::programs::SubmittedTarget for TestSubmission<TargetLaunchCore, W, crate::TargetOutput> {
+impl<W> crate::programs::SubmittedTarget
+    for TestSubmission<TargetLaunchCore, W, crate::TargetOutput>
+{
     fn launch(&self) -> &TargetLaunchCore {
         match self {
             Self::Ready(value) => value.launch(),
@@ -313,8 +314,7 @@ impl TestFamily {
     }
 }
 impl ProgramFamily for TestFamily {
-    type TargetSubmission =
-        TestSubmission<TargetLaunchCore, (), crate::TargetOutput>;
+    type TargetSubmission = TestSubmission<TargetLaunchCore, (), crate::TargetOutput>;
     type HeadSubmission = PendingFailureSubmission<CompletedHeadWork>;
     type VisionSubmission = PendingFailureSubmission<CompletedVisionWork>;
     type StateSubmission = PendingFailureSubmission<CompletedStateWork>;
@@ -333,6 +333,7 @@ impl ProgramFamily for TestFamily {
     fn state_is_bound(&self) -> bool {
         true
     }
+    fn unbind_optional(&mut self) {}
     fn submit_target(
         &mut self,
         launch: ValidatedTargetLaunch,
@@ -440,6 +441,25 @@ fn pending_target_request_cancellation_aborts_without_poisoning_then_device_fail
     assert!(failed_domain.finish_target(flight).is_err());
     assert!(failed_domain.fatal_error().is_some());
     assert!(failed_domain.checkpoint(failed_request).is_err());
+}
+
+#[test]
+fn pending_target_state_is_classified_as_in_flight() {
+    let control = PendingControl::default();
+    let Some(mut domain) = fixture(Some(control.clone())) else {
+        return;
+    };
+    let request = RequestId(9);
+    domain.open(request).unwrap();
+    let before = domain.reconcile_memory_charge(&[], &[]).unwrap();
+    let flight = submit_reserved_target(&mut domain, vec![forward(request, 0)]).unwrap();
+    let pending = domain.reconcile_memory_charge(&[], &[]).unwrap();
+    assert!(pending.target_state.in_flight > before.target_state.in_flight);
+    assert_eq!(pending.unattributed, before.unattributed);
+    control.resolve(Ok(()));
+    for outcome in domain.finish_target(flight).unwrap() {
+        domain.abort(outcome).unwrap();
+    }
 }
 
 #[test]

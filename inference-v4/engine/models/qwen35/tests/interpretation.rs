@@ -177,6 +177,78 @@ fn mtp_directory() -> Directory {
     directory
 }
 
+fn routed_mtp_directory() -> Directory {
+    let mut directory = directory(true);
+    directory
+        .metadata
+        .retain(|item| item.name != "qwen35moe.feed_forward_length");
+    directory
+        .metadata
+        .iter_mut()
+        .find(|item| item.name == "qwen35moe.block_count")
+        .unwrap()
+        .value = Value::Scalar(Scalar::Unsigned(3));
+    directory.metadata.push(Metadata {
+        name: "qwen35moe.nextn_predict_layers".into(),
+        value: Value::Scalar(Scalar::Unsigned(1)),
+    });
+    for (name, shape) in [
+        ("nextn.enorm.weight", vec![8]),
+        ("nextn.hnorm.weight", vec![8]),
+        ("nextn.eh_proj.weight", vec![8, 16]),
+        ("attn_norm.weight", vec![8]),
+        ("attn_q.weight", vec![16, 8]),
+        ("attn_k.weight", vec![4, 8]),
+        ("attn_v.weight", vec![4, 8]),
+        ("attn_q_norm.weight", vec![4]),
+        ("attn_k_norm.weight", vec![4]),
+        ("attn_output.weight", vec![8, 8]),
+        ("post_attention_norm.weight", vec![8]),
+        ("ffn_gate_inp.weight", vec![4, 8]),
+        ("ffn_gate_inp_shexp.weight", vec![8]),
+        ("ffn_gate_exps.weight", vec![4, 6, 8]),
+        ("ffn_up_exps.weight", vec![4, 6, 8]),
+        ("ffn_down_exps.weight", vec![4, 8, 6]),
+        ("ffn_gate_shexp.weight", vec![8, 8]),
+        ("ffn_up_shexp.weight", vec![8, 8]),
+        ("ffn_down_shexp.weight", vec![8, 8]),
+        ("nextn.shared_head_norm.weight", vec![8]),
+    ] {
+        directory.tensors.push(TensorDescriptor {
+            name: format!("blk.2.{name}"),
+            shape: shape.clone(),
+            encoding: Encoding::F32,
+            offset: 0,
+            nbytes: shape.iter().product::<u64>() * 4,
+        });
+    }
+    directory
+}
+
+#[test]
+fn routed_mtp_head_uses_expert_roles_without_dense_intermediate_metadata() {
+    let model = inspect_components(
+        &routed_mtp_directory(),
+        None,
+        PackageIdentity {
+            target: ArtifactIdentity([9; 32]),
+            projector: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(model.geometry.blocks.len(), 2);
+    let head = model.head.unwrap();
+    assert_eq!(head.depth(), 1);
+    assert!(matches!(
+        head.blocks[0].feedforward,
+        FeedForwardWeights::Routed(_)
+    ));
+    assert!(matches!(
+        head.blocks[0].feedforward_geometry,
+        FeedForwardGeometry::Routed(_)
+    ));
+}
+
 fn projector() -> Directory {
     let scalar = |name: &str, value: Scalar| Metadata {
         name: name.into(),

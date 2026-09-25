@@ -215,7 +215,10 @@ impl SegmentConstruction {
             successful: environment.successful,
             lexical: environment.lexical,
         };
-        assert!(capacity_pending.is_none(), "unavailable shape construction is not work-budget progress");
+        assert!(
+            capacity_pending.is_none(),
+            "unavailable shape construction is not work-budget progress"
+        );
         let capacity_pending = segment.lower_frame(&mut frames).err();
         let environment = segment.into_environment();
         SegmentStep::Pending(Self {
@@ -237,7 +240,10 @@ impl SegmentConstruction {
 pub(crate) enum ConstructionStep<B: seismic_native_target::TargetFamily> {
     Pending(SourceConstruction<B>),
     Choice(SourceConstruction<B>, crate::candidate_domain::BodyChoice),
-    Unresolved(SourceConstruction<B>, crate::candidate_domain::ConstructionPending),
+    Unresolved(
+        SourceConstruction<B>,
+        crate::candidate_domain::ConstructionPending,
+    ),
     Complete(ConstructedCandidate<B>),
 }
 
@@ -306,9 +312,11 @@ impl<B: seismic_native_target::TargetFamily> SourceConstruction<B> {
 
     fn capacity_pending(&self) -> Option<capacity::CapacityPending> {
         match &self.next {
-            SourceStep::Call { child:Some(child),.. }=>child.capacity_pending(),
-            SourceStep::Segment {progress,..}=>progress.capacity_pending.clone(),
-            _=>None,
+            SourceStep::Call {
+                child: Some(child), ..
+            } => child.capacity_pending(),
+            SourceStep::Segment { progress, .. } => progress.capacity_pending.clone(),
+            _ => None,
         }
     }
 
@@ -331,9 +339,17 @@ impl<B: seismic_native_target::TargetFamily> SourceConstruction<B> {
             return ConstructionStep::Choice(self, choice);
         }
         if let Some(reason) = self.initialization_pending() {
-            return ConstructionStep::Unresolved(self, crate::candidate_domain::ConstructionPending::Initialization(reason));
+            return ConstructionStep::Unresolved(
+                self,
+                crate::candidate_domain::ConstructionPending::Initialization(reason),
+            );
         }
-        if let Some(reason)=self.capacity_pending() { return ConstructionStep::Unresolved(self,crate::candidate_domain::ConstructionPending::Capacity(reason)); }
+        if let Some(reason) = self.capacity_pending() {
+            return ConstructionStep::Unresolved(
+                self,
+                crate::candidate_domain::ConstructionPending::Capacity(reason),
+            );
+        }
         let Self {
             builder,
             values,
@@ -354,9 +370,22 @@ impl<B: seismic_native_target::TargetFamily> SourceConstruction<B> {
             let child = match child.advance(context) {
                 ConstructionStep::Pending(child) => Some(Box::new(child)),
                 ConstructionStep::Unresolved(child, reason) => {
-                    return ConstructionStep::Unresolved(Self { builder, values, mode, computed_producers, regions,
-                        next: SourceStep::Call { resume, progress, bounds, child: Some(Box::new(child)) },
-                    }, reason);
+                    return ConstructionStep::Unresolved(
+                        Self {
+                            builder,
+                            values,
+                            mode,
+                            computed_producers,
+                            regions,
+                            next: SourceStep::Call {
+                                resume,
+                                progress,
+                                bounds,
+                                child: Some(Box::new(child)),
+                            },
+                        },
+                        reason,
+                    );
                 }
                 ConstructionStep::Choice(..) => {
                     unreachable!(
@@ -452,8 +481,15 @@ impl<B: seismic_native_target::TargetFamily> SourceConstruction<B> {
                         progress,
                     });
                     action.step()
-                } else if let Some((value, representation)) = lowerer.pending_representation_view(node) {
-                    unresolved = Some(crate::candidate_domain::ConstructionPending::RepresentationView { value, representation });
+                } else if let Some((value, representation)) =
+                    lowerer.pending_representation_view(node)
+                {
+                    unresolved = Some(
+                        crate::candidate_domain::ConstructionPending::RepresentationView {
+                            value,
+                            representation,
+                        },
+                    );
                     SourceStep::Node { node, resume }
                 } else {
                     let data = function.node(node);
@@ -486,7 +522,14 @@ impl<B: seismic_native_target::TargetFamily> SourceConstruction<B> {
                             // host quantities and reached failures keep their source
                             // operations instead of entering a native-only segment. A
                             // visit's failure ends only that participant.
-                            let progress = lowerer.begin_loop(start, end, captures, body, carries, seismic_ir::schedule::RepeatVisits::Independent);
+                            let progress = lowerer.begin_loop(
+                                start,
+                                end,
+                                captures,
+                                body,
+                                carries,
+                                seismic_ir::schedule::RepeatVisits::Independent,
+                            );
                             regions.push(RegionReturn::Loop { resume, progress });
                             SourceStep::Body(RegionCursor::begin(body))
                         }
@@ -525,7 +568,14 @@ impl<B: seismic_native_target::TargetFamily> SourceConstruction<B> {
                             for dependency in data.dependencies() {
                                 lowerer.materialize_tensor(dependency);
                             }
-                            let progress = lowerer.begin_loop(start, end, captures, body, carries, seismic_ir::schedule::RepeatVisits::Ordered);
+                            let progress = lowerer.begin_loop(
+                                start,
+                                end,
+                                captures,
+                                body,
+                                carries,
+                                seismic_ir::schedule::RepeatVisits::Ordered,
+                            );
                             regions.push(RegionReturn::Loop { resume, progress });
                             SourceStep::Body(RegionCursor::begin(body))
                         }

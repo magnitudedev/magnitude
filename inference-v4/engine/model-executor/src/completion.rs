@@ -1,7 +1,7 @@
 use crate::error::DeviceError;
 use seismic::NativeGraphCompletion;
 use std::{
-    sync::{Arc, Condvar, Mutex, mpsc},
+    sync::{mpsc, Arc, Condvar, Mutex},
     thread,
 };
 
@@ -128,7 +128,9 @@ fn wait_runs(runs: Vec<NativeGraphCompletion>) -> Result<(), DeviceError> {
 impl Completion for DeviceCompletion {
     fn is_complete(&self) -> bool {
         match &self.state {
-            DeviceCompletionState::Held(runs) => runs.iter().all(NativeGraphCompletion::is_complete),
+            DeviceCompletionState::Held(runs) => {
+                runs.iter().all(NativeGraphCompletion::is_complete)
+            }
             DeviceCompletionState::Waiting(shared) => shared
                 .result
                 .lock()
@@ -139,32 +141,33 @@ impl Completion for DeviceCompletion {
     }
 
     fn result(&mut self) -> Result<(), DeviceError> {
-        let observed = match std::mem::replace(
-            &mut self.state,
-            DeviceCompletionState::Observed(Ok(())),
-        ) {
-            DeviceCompletionState::Held(runs) => wait_runs(runs),
-            DeviceCompletionState::Waiting(shared) => {
-                let mut result = shared.result.lock().expect("device completion outcome lock");
-                while result.is_none() {
-                    result = shared
-                        .finished
-                        .wait(result)
+        let observed =
+            match std::mem::replace(&mut self.state, DeviceCompletionState::Observed(Ok(()))) {
+                DeviceCompletionState::Held(runs) => wait_runs(runs),
+                DeviceCompletionState::Waiting(shared) => {
+                    let mut result = shared
+                        .result
+                        .lock()
                         .expect("device completion outcome lock");
+                    while result.is_none() {
+                        result = shared
+                            .finished
+                            .wait(result)
+                            .expect("device completion outcome lock");
+                    }
+                    result
+                        .clone()
+                        .expect("device completion outcome was published")
                 }
-                result.clone().expect("device completion outcome was published")
-            }
-            DeviceCompletionState::Observed(result) => result,
-        };
+                DeviceCompletionState::Observed(result) => result,
+            };
         self.state = DeviceCompletionState::Observed(observed.clone());
         observed
     }
 
     fn notify(&mut self, wake: CompletionWake) {
-        let runs = match std::mem::replace(
-            &mut self.state,
-            DeviceCompletionState::Observed(Ok(())),
-        ) {
+        let runs = match std::mem::replace(&mut self.state, DeviceCompletionState::Observed(Ok(())))
+        {
             DeviceCompletionState::Held(runs) => runs,
             DeviceCompletionState::Observed(result) => {
                 self.state = DeviceCompletionState::Observed(result);

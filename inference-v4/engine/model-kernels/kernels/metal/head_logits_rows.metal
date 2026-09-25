@@ -18,34 +18,45 @@ typedef element::Act activation;
     projection::Store<element::F32> out{logits, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, 0}; \
     projection::Weights<packets::W0> w{weight, KERNEL_W0_LAYOUT(k), k}
 
+#ifdef SEISMIC_FORMING_HEAD_LOGITS_ROWS_GEMV
+template <uint ROWS, uint LANES>
 kernel void head_logits_rows_gemv(HEAD_LOGITS_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     HEAD_LOGITS_OPERANDS;
     uint rows = uint(SEISMIC_DIM_O);
     PROJECTION_FOR_ROWS(rows,
-        projection::gemv<packets::W0, SEISMIC_TUNE_SIMDGROUPS, SEISMIC_TUNE_ROWS, MAXM, SEISMIC_TUNE_LANES>(
-            in, out, w, rows, uint(SEISMIC_DIM_V), k, tile, shared, sg, lane));
+        projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>(
+            in, out, w, rows, uint(SEISMIC_DIM_V), k, tile, shared, simdgroups, sg, lane));
 }
+#endif
 
+#ifdef SEISMIC_FORMING_HEAD_LOGITS_ROWS_BATCH
+template <uint BATCH_ROWS>
 kernel void head_logits_rows_batch(HEAD_LOGITS_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     HEAD_LOGITS_OPERANDS;
-    projection::gemv_batch<packets::W0, SEISMIC_TUNE_BATCH_SIMDGROUPS, SEISMIC_TUNE_BATCH_ROWS>(in, out, w,
-        uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_V), k, tile, shared, sg, lane);
+    projection::gemv_batch_runtime<packets::W0, BATCH_ROWS>(in, out, w,
+        uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_V), k, tile, shared, simdgroups, sg, lane);
 }
+#endif
 
+#ifdef SEISMIC_FORMING_HEAD_LOGITS_ROWS_GEMM
+template <uint TILE_M, uint TILE_N>
 kernel void head_logits_rows_gemm(HEAD_LOGITS_ARGUMENTS,
     uint2 tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    PROJECTION_GEMM_SHARED(shared, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N);
+    PROJECTION_GEMM_SHARED(shared, TILE_M, TILE_N);
     HEAD_LOGITS_OPERANDS;
-    projection::gemm<packets::W0, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N>(in, out, w, uint(SEISMIC_DIM_O),
+    projection::gemm<packets::W0, TILE_M, TILE_N>(in, out, w, uint(SEISMIC_DIM_O),
         uint(SEISMIC_DIM_V), k, tile.y, tile.x, shared, sg, lane);
 }
+#endif

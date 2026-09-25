@@ -41,10 +41,16 @@ fn image_url() -> String {
     let path = std::env::var("VISION_IMAGE")
         .map(PathBuf::from)
         .unwrap_or_else(|_| home("/repos/llama.cpp/tools/mtmd/test-1.jpeg"));
-    format!("data:image/jpeg;base64,{}", base64::encode(std::fs::read(path).unwrap()))
+    format!(
+        "data:image/jpeg;base64,{}",
+        base64::encode(std::fs::read(path).unwrap())
+    )
 }
 
-fn prepare(artifacts: &LoadedArtifacts, images: usize) -> magnitude_model_contracts::PreparedModelInput {
+fn prepare(
+    artifacts: &LoadedArtifacts,
+    images: usize,
+) -> magnitude_model_contracts::PreparedModelInput {
     let mut content = vec![json!({"type":"text","text":"Compare:"})];
     for _ in 0..images {
         content.push(json!({"type":"image_url","image_url":{"url": image_url()}}));
@@ -66,11 +72,19 @@ fn prepare(artifacts: &LoadedArtifacts, images: usize) -> magnitude_model_contra
         media_marker: Some(PLACEHOLDER),
     };
     let prepared = request
-        .prepare(artifacts.templates(), artifacts.tokenizer(), &TemplateSelection::default(), 0, &limits)
+        .prepare(
+            artifacts.templates(),
+            artifacts.tokenizer(),
+            &TemplateSelection::default(),
+            0,
+            &limits,
+        )
         .unwrap();
     assert_eq!(prepared.image_sources.len(), images);
     let policy = MediaSourcePolicy::data_urls_only();
-    artifacts.prepare_input(&prepared, |source| policy.resolve(source)).unwrap()
+    artifacts
+        .prepare_input(&prepared, |source| policy.resolve(source))
+        .unwrap()
 }
 
 #[test]
@@ -85,20 +99,37 @@ fn image_parts_expand_to_conditioned_spans_with_spatial_coordinates() {
         assert_eq!(tokens.len(), 1, "{text} is one token");
         tokens[0]
     };
-    let (start, pad, end) = (token("<|vision_start|>"), token("<|image_pad|>"), token("<|vision_end|>"));
+    let (start, pad, end) = (
+        token("<|vision_start|>"),
+        token("<|image_pad|>"),
+        token("<|vision_end|>"),
+    );
 
     let input = prepare(&artifacts, 1);
-    let [span] = input.layout().spans() else { panic!("one image span") };
-    let [vision] = input.vision() else { panic!("one vision input") };
+    let [span] = input.layout().spans() else {
+        panic!("one image span")
+    };
+    let [vision] = input.vision() else {
+        panic!("one vision input")
+    };
     assert_eq!(span.identity, vision.identity());
     let [t, h, w] = vision.grid();
     assert_eq!(t, 1, "a still image is one temporal patch");
-    assert_eq!(span.end - span.start, h * w / 4, "one row per merged 2 x 2 patch block");
+    assert_eq!(
+        span.end - span.start,
+        h * w / 4,
+        "one row per merged 2 x 2 patch block"
+    );
     let tokens = input.tokens();
     assert_eq!(tokens[span.start - 1], start);
-    assert!(tokens[span.start..span.end].iter().all(|token| *token == pad));
+    assert!(tokens[span.start..span.end]
+        .iter()
+        .all(|token| *token == pad));
     assert_eq!(tokens[span.end], end);
-    assert_eq!(tokens.iter().filter(|token| **token == pad).count(), span.end - span.start);
+    assert_eq!(
+        tokens.iter().filter(|token| **token == pad).count(),
+        span.end - span.start
+    );
 
     // Text before the image counts positions; the image rows share the
     // temporal coordinate and spread over rows and columns; the text after it
@@ -125,13 +156,18 @@ fn image_parts_expand_to_conditioned_spans_with_spatial_coordinates() {
     assert_eq!(again.tokens(), input.tokens());
     assert_eq!(again.layout().spans()[0].identity, span.identity);
     let two = prepare(&artifacts, 2);
-    let [first, second] = two.layout().spans() else { panic!("two image spans") };
+    let [first, second] = two.layout().spans() else {
+        panic!("two image spans")
+    };
     assert_eq!(first.identity, span.identity);
     assert_eq!(second.identity, span.identity);
     assert_eq!(second.end - second.start, span.end - span.start);
     // The second image starts past the first image's extent.
     let first_after = two.coordinates()[first.end][0];
-    assert_eq!(two.coordinates()[second.start][0], first_after + (second.start - first.end) as i32);
+    assert_eq!(
+        two.coordinates()[second.start][0],
+        first_after + (second.start - first.end) as i32
+    );
 }
 
 #[test]

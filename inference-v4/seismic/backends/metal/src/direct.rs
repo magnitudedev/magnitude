@@ -25,6 +25,7 @@ pub const DIRECT_BUFFER_SLOTS: usize = 31;
 
 /// One kernel function of an authored Metal library, compiled into a
 /// pipeline.
+#[derive(Clone)]
 pub struct DirectPipeline {
     state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
@@ -180,7 +181,10 @@ impl LaunchTimestamps {
     }
 
     fn reserve(&self, samples: usize) -> Result<usize, ExecutionError> {
-        let mut next = self.next.lock().expect("timestamp cursor lock is never poisoned");
+        let mut next = self
+            .next
+            .lock()
+            .expect("timestamp cursor lock is never poisoned");
         let first = *next;
         if first + samples > self.capacity {
             return Err(ExecutionError::SubmissionFailed(format!(
@@ -196,7 +200,10 @@ impl LaunchTimestamps {
     /// Release every range. Only valid once every timed batch that reserved
     /// one has been resolved.
     pub fn reset(&self) {
-        *self.next.lock().expect("timestamp cursor lock is never poisoned") = 0;
+        *self
+            .next
+            .lock()
+            .expect("timestamp cursor lock is never poisoned") = 0;
     }
 }
 
@@ -383,7 +390,10 @@ impl DirectBatch {
     }
 }
 
-fn encode_launch(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, launch: &DirectLaunch<'_>) {
+fn encode_launch(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    launch: &DirectLaunch<'_>,
+) {
     encoder.setComputePipelineState(&launch.pipeline.state);
     for (index, (buffer, offset)) in launch.buffers.iter().enumerate() {
         unsafe { encoder.setBuffer_offset_atIndex(Some(buffer.raw()), *offset as usize, index) }

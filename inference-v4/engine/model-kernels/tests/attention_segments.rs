@@ -28,7 +28,10 @@ fn decode_time_by_segment_count_on(device: &Device) {
     let specialization = if is_cpu(device) {
         NativeSpecialization::new().with_param("PARTS", 8)
     } else {
-        statics(QWEN).with_param("SPAN", 32).with_param("PARTS", 16).with_param("SIMDS", 4)
+        statics(QWEN)
+            .with_param("SPAN", 32)
+            .with_param("PARTS", 16)
+            .with_param("SIMDS", 4)
     };
     let kernel = gated_attention_decode::native_for_device_with(
         device,
@@ -65,19 +68,19 @@ fn decode_time_by_segment_count_on(device: &Device) {
                 let case = Case::new(QWEN, arena, segments, &rows, 3);
                 let Geometry { kv, g, p, .. } = case.geometry;
                 let (m, w, t) = (case.rows, case.geometry.w(), case.history_rows);
-                let query_gate = bf16_tensor(device,&[m, kv * g * 2 * w], &case.query_gate);
-                let key = bf16_tensor(device,&[m, kv * w], &case.key);
-                let value = bf16_tensor(device,&[m, kv * w], &case.value);
-                let query_norm = f32_tensor(device,&[w], &case.query_norm);
-                let key_norm = f32_tensor(device,&[w], &case.key_norm);
-                let components = i32_tensor(device,&[p], &case.components);
-                let frequencies = f32_tensor(device,&[p], &case.frequencies);
-                let coordinates = i32_tensor(device,&[m, 4], &case.coordinates);
-                let visible_spans = i32_tensor(device,&[m, case.spans, 2], &case.visible);
-                let fresh = i32_tensor(device,&[m, 2], &case.fresh);
-                let destinations = i32_tensor(device,&[m], &case.destinations);
-                let mut history_key = bf16_tensor(device,&[t, kv, w], &case.history_key);
-                let mut history_value = bf16_tensor(device,&[t, kv, w], &case.history_value);
+                let query_gate = bf16_tensor(device, &[m, kv * g * 2 * w], &case.query_gate);
+                let key = bf16_tensor(device, &[m, kv * w], &case.key);
+                let value = bf16_tensor(device, &[m, kv * w], &case.value);
+                let query_norm = f32_tensor(device, &[w], &case.query_norm);
+                let key_norm = f32_tensor(device, &[w], &case.key_norm);
+                let components = i32_tensor(device, &[p], &case.components);
+                let frequencies = f32_tensor(device, &[p], &case.frequencies);
+                let coordinates = i32_tensor(device, &[m, 4], &case.coordinates);
+                let visible_spans = i32_tensor(device, &[m, case.spans, 2], &case.visible);
+                let fresh = i32_tensor(device, &[m, 2], &case.fresh);
+                let destinations = i32_tensor(device, &[m], &case.destinations);
+                let mut history_key = bf16_tensor(device, &[t, kv, w], &case.history_key);
+                let mut history_value = bf16_tensor(device, &[t, kv, w], &case.history_value);
                 let measurement = kernel
                     .measure(
                         vec![gated_attention_decode::Args {

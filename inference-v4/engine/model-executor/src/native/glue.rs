@@ -1,4 +1,4 @@
-use magnitude_model_kernels::{copy_rows, conditioning_overlay, sample_rows, shape_rows};
+use magnitude_model_kernels::{conditioning_overlay, copy_rows, sample_rows, shape_rows};
 use seismic::NativeKernel;
 
 /// Immutable state, shaping, sampling, and conditioning handles.

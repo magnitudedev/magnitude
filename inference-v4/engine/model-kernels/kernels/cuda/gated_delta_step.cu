@@ -13,20 +13,14 @@
 
 #include "lib/recurrent/recurrent.cuh"
 
-namespace {
-
-using recurrent::Act;
-using recurrent::u64;
-using recurrent::W;
-
-constexpr int ROWS = SEISMIC_TUNE_ROWS;
-constexpr int WARPS = SEISMIC_TUNE_WARPS;
-constexpr int BLOCK_ROWS = ROWS * WARPS;
-static_assert(W % 32 == 0 && W % BLOCK_ROWS == 0, "state rows split evenly");
-
-}  // namespace
-
-extern "C" __global__ void __launch_bounds__(WARPS * 32) gated_delta_step(SEISMIC_KERNEL_PARAMS) {
+#ifdef SEISMIC_FORMING_GATED_DELTA_STEP
+template <unsigned ROWS, unsigned WARPS>
+__global__ void gated_delta_step(SEISMIC_KERNEL_PARAMS) {
+    using recurrent::Act;
+    using recurrent::u64;
+    constexpr int BLOCK_ROWS = ROWS * WARPS;
+    static_assert(recurrent::W % 32 == 0 && recurrent::W % BLOCK_ROWS == 0,
+                  "state rows split evenly");
     const recurrent::Inputs in = RECURRENT_INPUTS();
     recurrent::u8 *mixed = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
     const int head = blockIdx.x;
@@ -55,3 +49,4 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32) gated_delta_step(SEISMI
     recurrent::advance_rows<ROWS, BLOCK_ROWS>(in, slot, slot.lo, head, block_row, true, first_row, state, mixed,
                                               shared);
 }
+#endif

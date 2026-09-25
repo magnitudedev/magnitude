@@ -44,9 +44,12 @@ This route reuses the checked entry contract and public tensor runtime but const
 `RefinedCandidateFamilies`, compiler kernel IR, `CandidateDomain`, `SelectionPolicy`, `ExecutableVariant`,
 `PreparedKernel`, or portable workflow artifacts. It has no solving, duration model, candidate
 selection, retry, or fallback. Its only search is tuning, fast enough to run at program
-preparation: a budgeted local search of the author's declared parameter domain, minimizing one
-weighted device-measured cost (`Σ weight × median`) over the consumer's points. Each parameter's
-values are ordered numerically; neighbours differ by one step in one parameter. The search
+preparation. Entry-wide declarations still use a budgeted local search of the author's declared parameter domain, minimizing one
+weighted device-measured cost (`Σ weight × median`) over the consumer's points. A consumer may
+name a cheaper screening subset with folded weights for candidate exploration. The default and
+screened finalists are then measured and ranked with the original points and weights; output
+validation also covers the original points. The result records the screening definition.
+Each parameter's values are ordered numerically; neighbours differ by one step in one parameter. The search
 evaluates the defaults (and any start configurations the consumer names), then repeatedly forms
 every unvisited neighbour of the current configuration as one parallel batch, measures each, and
 moves to the best while it improves by more than ε; at a local minimum it restarts from the
@@ -54,15 +57,18 @@ unvisited configuration farthest from everything visited. It stops when the cons
 configuration count, never a wall-clock limit) is spent, the space is exhausted, R consecutive
 restarts found nothing better, or the consumer's safety deadline passes. Configurations the
 device cannot form or run cost +∞ and consume budget. The K cheapest configurations and the
-defaults are then re-measured with more samples, alternating round by round, and ranked by those
-costs; the defaults rank first unless the leader beats them by δ. The search is a pure function of
+defaults are then re-measured with more samples across every original point, alternating round by
+round, and ranked by those full-workload costs; the defaults rank first unless the leader beats
+them by δ. Screening can omit a candidate that would have won on the full workload, so it is an
+explicit search policy rather than an exact reduction. The search is a pure function of
 an evaluator's costs, so a recorded evaluator can replay it. Measurement is device time: a
 point's calls are placed once, calibrated so one sample covers a minimum device time, and every
 sample of every point is submitted before any is read. The consumer then prepares the chosen
 specialization explicitly. Validation walks the confirmed ranking until one configuration passes,
-so only the chosen configuration and any that beat it are validated: a configuration whose
-arithmetic parameters equal the defaults' must be bit-identical (else its mapping parameters are
-misclassified), others must agree within the consumer's tolerance, a bound on each dense
+so only the chosen configuration and any that beat it are validated: at each point, a configuration
+with the same active launches and the same arithmetic values read by them must be bit-identical
+(else its mapping parameters are misclassified); other points must agree within the consumer's
+tolerance, a bound on each dense
 result's error norm relative to the reference's norm (reduced-precision operands perturb every
 element by a share of the output's scale, not of its own value). Validation covers every tensor
 an entry writes, results and `&mut` parameters. The tuner never saves or restores state: a tuning
@@ -70,12 +76,33 @@ point whose entry writes in place supplies an initializer that restores those te
 validation run, and a point without one is rejected. A configuration that fails to form, run,
 measure or validate is excluded with its typed reason; only the default configuration is required
 to run. The distinct public handle makes direct-only use structural.
+Launch-scoped declarations use a factored search. The checked declaration gives each parameter
+its launch ownership, including explicit entry-parameter reads by kernels that are absent from
+launch geometry and activity conditions. Active launches, shared parameters and joint `where` restrictions
+determine the groups that must be measured together. The tuner measures every candidate in each
+group at the points where that group contributes work, evaluates boundary parameters that move
+points between launches, then confirms each group's shortlisted candidates against its defaults
+before assembling one choice per group. An independent launch group outside the consumer's
+served points keeps its declared default. Code variants of a Metal launch are
+formed together into one library; a candidate selects immutable formed functions and supplies
+its runtime geometry. A safety deadline leaves unmeasured groups at their defaults and prevents
+that incomplete result from being cached. An interrupted group's already formed candidates are
+measured and ranked; the tuner skips further group confirmation. The assembled choice is
+remeasured and validated against the defaults before it may replace them. The assembled
+candidate and the all-defaults reference are measured in shared sample rounds, so clock drift
+affects both together.
 Seismic performs no file I/O for formed artifacts and knows no cache locations. An embedder that
 keeps them between processes passes an `ArtifactStore` when it opens a device. CUDA formation
 computes a content address over the rendered source and the NVRTC formation (release,
 architecture, options), asks the store before running NVRTC, loads a stored CUBIN instead of
 compiling, and hands every newly formed CUBIN to the store; a stored image the driver refuses is a
-miss and is formed again. Metal and CPU formation do not use the store. For keying the embedder's
+miss and is formed again. Metal and CPU formation do not use the store.
+For launch-scoped CUDA formation, each guarded launch source is addressed separately with its
+requested template expression and NVRTC formation. The stored artifact carries both the CUBIN
+and NVRTC's lowered linker name, which dispatch needs on a cache hit. The factored tuner forms
+all code variants of each CUDA launch in one NVRTC program, then assembles candidate functions
+from those modules.
+For keying the embedder's
 own records of tuning results, Seismic exposes a device tuning identity that includes the Metal OS
 build, the CUDA driver and NVRTC release, or the CPU's detected instruction-set tier and CPU library
 version, and an implementation digest over an entry's declaration and the source rendered for it (on
@@ -97,6 +124,20 @@ physical scratch arena. They are prepared for admitted model dimensions and phys
 classes before the engine becomes ready. Request-dependent external state and resident tensors
 are joined to checked ports while constructing an owned run, before submission. A submitted run
 does not discover an absent tensor, incompatible shape, representation, or alias.
+The checked entry is also the source of tensor-port and result-leaf extents for
+metadata-only planning; the representation registry supplies canonical storage
+bytes. Such tensor facts alone do not establish a graph storage bound or backend
+formation.
+For a graph whose nodes have complete checked storage facts, a backend-free
+draft can follow the same topology and interval placement rules as sealing to
+derive workspace, exported output and upload bytes. A missing native scratch
+choice leaves that draft unsupported. When the declaration gives each scratch
+buffer a complete finite tuning domain, the draft may charge the maximum over
+those choices; this is a safe bound even when the prepared graph selects a
+smaller choice. Resource evidence never establishes that the device can form
+the native implementation.
+Consumers bind each graph entry through a prepared kernel or its exact checked
+element bindings while following that one topology.
 Direct native workflow nodes execute in their checked dependency order within one Metal command
 buffer, or one CUDA stream submission, per workflow submission. Sealing validates each node
 against its entry contract once and fixes its argument words, launch geometry and the storage
@@ -121,7 +162,19 @@ newest submitted device use (host writes) or write (host reads): a device's nati
 run on its one queue (one CUDA stream, one Metal command queue of serial compute passes) and
 complete in commit order, and each submission commits and records its fences under the device's
 order lock, so the newest fence of a kind completes after every earlier one.
-Standalone native calls retain their own submission boundary.
+Standalone native calls retain their own submission boundary. Tensor-result native calls from
+different prepared entries may also form one ordered native batch. Each call keeps its checked
+arguments, results and scratch alive until the batch completes; shared scratch is safe because
+the device executes its launches in submission order. No scalar result crosses this batch API.
+A read-only host mapping may back a shared input tensor on a capable backend.
+One mapped device region owns one allocation and may supply several tensor views.
+That allocation retains the mapping, and submitted work retains the allocation
+through physical completion. Host writes and writable device bindings to these
+tensors are refused. A backend without the mapping capability
+uses an owned upload instead.
+Canonical upload tensors can be filled from a host reader in bounded chunks.
+An incomplete read leaves the tensor unpublished; the caller cannot bind it
+as a native input until the whole physical byte range has been written.
 A device's submission trace (measurement only, one active at a time) records every native
 submission's host encode interval and its device interval on one host clock. At launch detail
 each launch is encoded in its own timestamped encoder (Metal) or between recorded stream events

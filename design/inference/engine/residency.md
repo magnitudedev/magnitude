@@ -16,9 +16,15 @@ the execution path and backend (native Metal and Vulkan `rows16`, native CUDA `m
 `packet`). Import converts through the weight's `[B, N, K]` view, which keeps every layout's row
 geometry; it never flattens a weight.
 
-Each import takes an immutable artifact source, validates its exact WeightPlan, allocates the
-planned resident destination and a one-shot source upload, submits the attested import program,
-and publishes the resident weight only after completion. Failed imports leave no cache entry.
+Each import takes an immutable artifact source and validates its exact WeightPlan. On Metal,
+component weights are visited in source-file order. Consecutive whole tensors whose combined
+range fits the largest source tensor share one page-rounded read-only mapped window and one
+ordered native submission. Their resident destinations are allocated without a host zero-fill;
+the attested import entries write every physical byte, including representation padding.
+The mapped window stays owned through completion. Other backends use a one-shot staged source
+upload, also without a prefill. The source file streams into that upload in bounded chunks, without
+a second whole-tensor host copy. Residency publishes each weight
+only after its submission completes; failed imports leave no cache entry.
 
 The target component is imported before engine readiness. Enabled optional head and vision
 components are held by typed one-shot ComponentLoaders. Each loader owns its import store and

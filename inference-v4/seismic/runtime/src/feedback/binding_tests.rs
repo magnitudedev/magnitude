@@ -154,7 +154,12 @@ fn fresh_partial(x: &tensor[2,2] f32) -> f32:
         .into(),
     }]))
     .unwrap();
-    for (name, expected) in [("zero", 2.0f32), ("strided", 3.0), ("fresh", 16.0), ("fresh_partial",5.0)] {
+    for (name, expected) in [
+        ("zero", 2.0f32),
+        ("strided", 3.0),
+        ("fresh", 16.0),
+        ("fresh_partial", 5.0),
+    ] {
         let kernel = Arc::new(
             crate::api::kernel::prepare(
                 &module,
@@ -216,7 +221,10 @@ fn main() -> f32:
         Ok(_) => panic!("exclusive borrowed storage must not permit access through its root"),
         Err(error) => error,
     };
-    assert!(error.to_string().contains("exclusive tensor borrow"), "{error}");
+    assert!(
+        error.to_string().contains("exclusive tensor borrow"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -269,22 +277,44 @@ fn cpu_repeat_uses_nonzero_offset_and_rectangular_transpose_composition() {
 
 #[test]
 fn cpu_overlapping_store_preserves_rhs_and_root_descriptor() {
-    let module=check_source(SourceSet::new(vec![SourceFile{
-        path:"overlapping-store.seismic".into(),
-        text:"fn main(x: &mut tensor[3] f32) -> f32:\n    x[1:3] = x[0:2]\n    return x[2]\n".into(),
-    }])).unwrap();
-    let catalog=crate::devices::Catalog::discover().unwrap();
-    let device=catalog.open_backend(registry::BackendName::Cpu).unwrap();
-    let kernel=Arc::new(crate::api::kernel::prepare(
-        &module,module.entry_named("main").unwrap(),ElementBindings::default(),&device,
-        PreparationOptions::feedback(PrecisionPolicy::Exact,FeedbackOptions{search_time:Duration::ZERO,..Default::default()}),
-    ).unwrap());
-    let bytes=[1.0f32,2.,3.].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
-    let input=Arc::new(TensorInner::from_host(&device,registry::dense(DType::F32),&[3],&bytes).unwrap());
-    let mut args=EncodedArgs::new();args.push_tensor(input);
-    let mut output=crate::api::kernel::call(&kernel,args).unwrap();
-    let ArgumentValue::F32(actual)=output.take_scalar() else{panic!("expected scalar")};
-    assert_eq!(actual,2.);
+    let module = check_source(SourceSet::new(vec![SourceFile {
+        path: "overlapping-store.seismic".into(),
+        text: "fn main(x: &mut tensor[3] f32) -> f32:\n    x[1:3] = x[0:2]\n    return x[2]\n"
+            .into(),
+    }]))
+    .unwrap();
+    let catalog = crate::devices::Catalog::discover().unwrap();
+    let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
+    let kernel = Arc::new(
+        crate::api::kernel::prepare(
+            &module,
+            module.entry_named("main").unwrap(),
+            ElementBindings::default(),
+            &device,
+            PreparationOptions::feedback(
+                PrecisionPolicy::Exact,
+                FeedbackOptions {
+                    search_time: Duration::ZERO,
+                    ..Default::default()
+                },
+            ),
+        )
+        .unwrap(),
+    );
+    let bytes = [1.0f32, 2., 3.]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let input = Arc::new(
+        TensorInner::from_host(&device, registry::dense(DType::F32), &[3], &bytes).unwrap(),
+    );
+    let mut args = EncodedArgs::new();
+    args.push_tensor(input);
+    let mut output = crate::api::kernel::call(&kernel, args).unwrap();
+    let ArgumentValue::F32(actual) = output.take_scalar() else {
+        panic!("expected scalar")
+    };
+    assert_eq!(actual, 2.);
 }
 
 #[test]
@@ -323,50 +353,124 @@ fn failure_prefix(x: &mut tensor[2,3] f32, index: i32) -> tensor[6] f32:
 fn captured(x: &tensor[3,4] f32) -> tensor[6] f32:
     let y = x[1:3,0:3]
     return copy_view(reshape(y.T, (6,)))
-"#.into(),
-    }])).unwrap();
+"#
+        .into(),
+    }]))
+    .unwrap();
     let catalog = crate::devices::Catalog::discover().unwrap();
     let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
     for (name, shape, expected, expected_input) in [
-        ("transposed", vec![2,3], vec![1.,4.,2.,5.,3.,6.], vec![1.,2.,3.,4.,5.,6.]),
-        ("owned", vec![2,3], vec![1.,4.,2.,5.,3.,6.], vec![1.,2.,3.,4.,5.,6.]),
-        ("write", vec![2,3], vec![1.,9.,2.,5.,3.,6.], vec![1.,2.,3.,9.,5.,6.]),
-        ("empty", vec![2,3], vec![], vec![1.,2.,3.,4.,5.,6.]),
-        ("captured", vec![3,4], vec![5.,9.,6.,10.,7.,11.], (1..=12).map(|x| x as f32).collect()),
+        (
+            "transposed",
+            vec![2, 3],
+            vec![1., 4., 2., 5., 3., 6.],
+            vec![1., 2., 3., 4., 5., 6.],
+        ),
+        (
+            "owned",
+            vec![2, 3],
+            vec![1., 4., 2., 5., 3., 6.],
+            vec![1., 2., 3., 4., 5., 6.],
+        ),
+        (
+            "write",
+            vec![2, 3],
+            vec![1., 9., 2., 5., 3., 6.],
+            vec![1., 2., 3., 9., 5., 6.],
+        ),
+        ("empty", vec![2, 3], vec![], vec![1., 2., 3., 4., 5., 6.]),
+        (
+            "captured",
+            vec![3, 4],
+            vec![5., 9., 6., 10., 7., 11.],
+            (1..=12).map(|x| x as f32).collect(),
+        ),
     ] {
-        let kernel = Arc::new(crate::api::kernel::prepare(
-            &module, module.entry_named(name).unwrap(), ElementBindings::default(), &device,
-            PreparationOptions::feedback(PrecisionPolicy::Exact, FeedbackOptions { search_time: Duration::ZERO, ..Default::default() }),
-        ).unwrap_or_else(|error| panic!("{name}: {error:?}")));
+        let kernel = Arc::new(
+            crate::api::kernel::prepare(
+                &module,
+                module.entry_named(name).unwrap(),
+                ElementBindings::default(),
+                &device,
+                PreparationOptions::feedback(
+                    PrecisionPolicy::Exact,
+                    FeedbackOptions {
+                        search_time: Duration::ZERO,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error:?}")),
+        );
         let count = shape.iter().product::<u64>();
-        let bytes = (1..=count).flat_map(|value| (value as f32).to_le_bytes()).collect::<Vec<_>>();
-        let input = Arc::new(TensorInner::from_host(&device, registry::dense(DType::F32), &shape, &bytes).unwrap());
+        let bytes = (1..=count)
+            .flat_map(|value| (value as f32).to_le_bytes())
+            .collect::<Vec<_>>();
+        let input = Arc::new(
+            TensorInner::from_host(&device, registry::dense(DType::F32), &shape, &bytes).unwrap(),
+        );
         let mut args = EncodedArgs::new();
         args.push_tensor(input.clone());
-        let mut result = crate::api::kernel::call(&kernel, args).unwrap_or_else(|error| panic!("{name}: {error:?}"));
-        let expected = expected.into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
+        let mut result = crate::api::kernel::call(&kernel, args)
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        let expected = expected
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
         let output = result.take_tensor();
         assert_eq!(output.read_to_host().unwrap(), expected, "{name} result");
         if name == "transposed" {
-            let replacement = [11_f32,14.,12.,15.,13.,16.].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
+            let replacement = [11_f32, 14., 12., 15., 13., 16.]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>();
             output.write_from_host(&replacement).unwrap();
             assert_eq!(output.read_to_host().unwrap(), replacement);
         }
-        let expected_input = expected_input.into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
-        assert_eq!(input.read_to_host().unwrap(), expected_input, "{name} backing");
+        let expected_input = expected_input
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            input.read_to_host().unwrap(),
+            expected_input,
+            "{name} backing"
+        );
     }
-    let kernel = Arc::new(crate::api::kernel::prepare(
-        &module, module.entry_named("failure_prefix").unwrap(), ElementBindings::default(), &device,
-        PreparationOptions::feedback(PrecisionPolicy::Exact, FeedbackOptions { search_time: Duration::ZERO, ..Default::default() }),
-    ).unwrap());
-    let bytes = (1..=6).flat_map(|value| (value as f32).to_le_bytes()).collect::<Vec<_>>();
-    let input = Arc::new(TensorInner::from_host(&device, registry::dense(DType::F32), &[2,3], &bytes).unwrap());
+    let kernel = Arc::new(
+        crate::api::kernel::prepare(
+            &module,
+            module.entry_named("failure_prefix").unwrap(),
+            ElementBindings::default(),
+            &device,
+            PreparationOptions::feedback(
+                PrecisionPolicy::Exact,
+                FeedbackOptions {
+                    search_time: Duration::ZERO,
+                    ..Default::default()
+                },
+            ),
+        )
+        .unwrap(),
+    );
+    let bytes = (1..=6)
+        .flat_map(|value| (value as f32).to_le_bytes())
+        .collect::<Vec<_>>();
+    let input = Arc::new(
+        TensorInner::from_host(&device, registry::dense(DType::F32), &[2, 3], &bytes).unwrap(),
+    );
     let mut args = EncodedArgs::new();
     args.push_tensor(input.clone());
     args.push_scalar(crate::api::kernel::EncodedScalar::I32(2));
-    assert!(crate::api::kernel::call(&kernel,args).is_err(), "failed source prefix must not publish a mapped result");
-    let expected = [7_f32,2.,3.,4.,5.,6.].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
-    assert_eq!(input.read_to_host().unwrap(),expected);
+    assert!(
+        crate::api::kernel::call(&kernel, args).is_err(),
+        "failed source prefix must not publish a mapped result"
+    );
+    let expected = [7_f32, 2., 3., 4., 5., 6.]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    assert_eq!(input.read_to_host().unwrap(), expected);
 }
 
 #[test]
@@ -389,21 +493,49 @@ fn partial(x: &tensor[2,3] f32) -> tensor[1] f32:
     result[0] = y[0,0]
     return result
 
-"#.into(),
-    }])).unwrap();
+"#
+        .into(),
+    }]))
+    .unwrap();
     let catalog = crate::devices::Catalog::discover().unwrap();
     let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
-    for (name, expected) in [("carried",vec![1_f32,17.,4.,3.,2.,6.]),("partial",vec![1.])] {
-        let kernel = Arc::new(crate::api::kernel::prepare(
-            &module,module.entry_named(name).unwrap(),ElementBindings::default(),&device,
-            PreparationOptions::feedback(PrecisionPolicy::Exact,FeedbackOptions { search_time: Duration::ZERO,..Default::default() }),
-        ).unwrap());
-        let bytes=(1..=6).flat_map(|value|(value as f32).to_le_bytes()).collect::<Vec<_>>();
-        let input=Arc::new(TensorInner::from_host(&device,registry::dense(DType::F32),&[2,3],&bytes).unwrap());
-        let mut args=EncodedArgs::new();
+    for (name, expected) in [
+        ("carried", vec![1_f32, 17., 4., 3., 2., 6.]),
+        ("partial", vec![1.]),
+    ] {
+        let kernel = Arc::new(
+            crate::api::kernel::prepare(
+                &module,
+                module.entry_named(name).unwrap(),
+                ElementBindings::default(),
+                &device,
+                PreparationOptions::feedback(
+                    PrecisionPolicy::Exact,
+                    FeedbackOptions {
+                        search_time: Duration::ZERO,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap(),
+        );
+        let bytes = (1..=6)
+            .flat_map(|value| (value as f32).to_le_bytes())
+            .collect::<Vec<_>>();
+        let input = Arc::new(
+            TensorInner::from_host(&device, registry::dense(DType::F32), &[2, 3], &bytes).unwrap(),
+        );
+        let mut args = EncodedArgs::new();
         args.push_tensor(input);
-        let mut result=crate::api::kernel::call(&kernel,args).unwrap();
-        assert_eq!(result.take_tensor().read_to_host().unwrap(),expected.into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>(),"{name}");
+        let mut result = crate::api::kernel::call(&kernel, args).unwrap();
+        assert_eq!(
+            result.take_tensor().read_to_host().unwrap(),
+            expected
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+            "{name}"
+        );
     }
 }
 
@@ -415,25 +547,64 @@ fn cpu_return_boundary_rounds_scalar_and_tensor_elements() {
     }])).unwrap();
     let catalog = crate::devices::Catalog::discover().unwrap();
     let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
-    let options = || PreparationOptions::feedback(
-        PrecisionPolicy::Exact,
-        FeedbackOptions { search_time: Duration::ZERO, ..Default::default() },
-    );
+    let options = || {
+        PreparationOptions::feedback(
+            PrecisionPolicy::Exact,
+            FeedbackOptions {
+                search_time: Duration::ZERO,
+                ..Default::default()
+            },
+        )
+    };
 
-    let scalar = Arc::new(crate::api::kernel::prepare(&module, module.entry_named("scalar").unwrap(), ElementBindings::default(), &device, options()).unwrap());
+    let scalar = Arc::new(
+        crate::api::kernel::prepare(
+            &module,
+            module.entry_named("scalar").unwrap(),
+            ElementBindings::default(),
+            &device,
+            options(),
+        )
+        .unwrap(),
+    );
     let mut args = EncodedArgs::new();
-    args.push_scalar(crate::api::kernel::EncodedScalar::F32Bits(1.0006f32.to_bits()));
+    args.push_scalar(crate::api::kernel::EncodedScalar::F32Bits(
+        1.0006f32.to_bits(),
+    ));
     let mut result = crate::api::kernel::call(&scalar, args).unwrap();
-    let ArgumentValue::F16(bits) = result.take_scalar() else { panic!("expected f16 scalar") };
+    let ArgumentValue::F16(bits) = result.take_scalar() else {
+        panic!("expected f16 scalar")
+    };
     assert_eq!(bits, 0x3c01);
 
-    let bytes = [1.0006f32, 2.0].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
+    let bytes = [1.0006f32, 2.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
     for name in ["stored", "tensor"] {
-        let tensor = Arc::new(crate::api::kernel::prepare(&module, module.entry_named(name).unwrap(), ElementBindings::default(), &device, options()).unwrap());
-        let input = Arc::new(TensorInner::from_host(&device, registry::dense(DType::F32), &[2], &bytes).unwrap());
+        let tensor = Arc::new(
+            crate::api::kernel::prepare(
+                &module,
+                module.entry_named(name).unwrap(),
+                ElementBindings::default(),
+                &device,
+                options(),
+            )
+            .unwrap(),
+        );
+        let input = Arc::new(
+            TensorInner::from_host(&device, registry::dense(DType::F32), &[2], &bytes).unwrap(),
+        );
         let mut args = EncodedArgs::new();
         args.push_tensor(input);
         let mut result = crate::api::kernel::call(&tensor, args).unwrap();
-        assert_eq!(result.take_tensor().read_to_host().unwrap(), [0x3c01u16, 0x4000].into_iter().flat_map(u16::to_le_bytes).collect::<Vec<_>>(), "{name}");
+        assert_eq!(
+            result.take_tensor().read_to_host().unwrap(),
+            [0x3c01u16, 0x4000]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+            "{name}"
+        );
     }
 }

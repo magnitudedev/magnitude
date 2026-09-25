@@ -96,7 +96,7 @@ fn each_launch(
     for index in 0..list.count() {
         buffers.clear();
         let dispatch = list.dispatch(index, &mut buffers);
-        let NativeRoute::Cuda { module, .. } = &dispatch.kernel.route else {
+        let NativeRoute::Cuda { functions, .. } = &dispatch.kernel.route else {
             unreachable!("one device has one native route");
         };
         typed.clear();
@@ -107,9 +107,10 @@ fn each_launch(
         );
         let scalars = typed_buffer::<Cuda, Executor>(&dispatch.kernel.scalars);
         for (function, launch) in dispatch.launches.iter().enumerate() {
+            let (module, module_function) = functions.function(function);
             let launch = launch.map(|launch| DirectLaunch {
                 module,
-                function,
+                function: module_function,
                 buffers: &typed,
                 words: dispatch.word_bytes,
                 scalar_results: (scalars, 0),

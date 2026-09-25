@@ -46,23 +46,24 @@ fn reached_geometry(source: &str) -> Result<Vec<Vec<Axis>>, crate::errors::Prepa
     description.limits.max_grid = [65536; 3];
     let device = seismic_native_target::DeviceDescription::new(description).unwrap();
     let registry = crate::realization::demand_driven_tests::registry();
-    let domain = construct_candidate_domain(
-        entry,
-        &device,
-        &registry,
-        &PrecisionPolicy::Exact,
-    )?;
+    let domain = construct_candidate_domain(entry, &device, &registry, &PrecisionPolicy::Exact)?;
     let parts = domain.into_parts();
     let family = &parts.materialized.first().family;
     assert!(
-        family.local_allocations().into_locals().iter().all(Vec::is_empty),
+        family
+            .local_allocations()
+            .into_locals()
+            .iter()
+            .all(Vec::is_empty),
         "private tensors are not launch-local envelopes"
     );
     Ok(family
         .global_allocations()
         .allocations()
         .iter()
-        .filter(|allocation| allocation.acquisition == seismic_ir::storage::AllocationAcquisition::Reached)
+        .filter(|allocation| {
+            allocation.acquisition == seismic_ir::storage::AllocationAcquisition::Reached
+        })
         .map(|allocation| {
             allocation
                 .geometry
@@ -70,10 +71,12 @@ fn reached_geometry(source: &str) -> Result<Vec<Vec<Axis>>, crate::errors::Prepa
                 .expect("a reached tensor owns its geometry")
                 .extents
                 .iter()
-                .map(|axis| match parts.arena.eval_nat_u64(*axis, &Assignment::new()) {
-                    Ok(value) => Axis::Fixed(value),
-                    Err(_) => Axis::Actual(*axis),
-                })
+                .map(
+                    |axis| match parts.arena.eval_nat_u64(*axis, &Assignment::new()) {
+                        Ok(value) => Axis::Fixed(value),
+                        Err(_) => Axis::Actual(*axis),
+                    },
+                )
                 .collect()
         })
         .collect())
@@ -99,7 +102,9 @@ fn probe(input: &tensor[8,2] i32, visible: &tensor[4,2] i32, out: &mut tensor[4]
     // The helper's `M` is the actual checked slice extent of each visit and
     // its `K` the caller's fixed axis.
     assert!(
-        geometry.iter().any(|axes| matches!(axes.as_slice(), [Axis::Actual(_), Axis::Fixed(2)])),
+        geometry
+            .iter()
+            .any(|axes| matches!(axes.as_slice(), [Axis::Actual(_), Axis::Fixed(2)])),
         "{geometry:?}"
     );
 }
@@ -124,7 +129,10 @@ fn source_capacity_preserves_varying_two_dimensional_snapshot_geometry() {
         .filter(|axes| matches!(axes.as_slice(), [Axis::Actual(_), Axis::Actual(_)]))
         .collect::<Vec<_>>();
     assert!(varying.len() >= 2, "{geometry:?}");
-    assert!(varying.iter().all(|axes| *axes == varying[0]), "{geometry:?}");
+    assert!(
+        varying.iter().all(|axes| *axes == varying[0]),
+        "{geometry:?}"
+    );
 }
 
 #[test]
@@ -147,10 +155,17 @@ fn probe(input: &tensor[8,2] i32, visible: &tensor[4,2] i32, out: &mut tensor[4]
     )
     .unwrap();
     for expected in [Axis::Fixed(8), Axis::Fixed(0)] {
-        assert!(geometry.iter().any(|axes| axes.as_slice() == [expected.clone()]), "{geometry:?}");
+        assert!(
+            geometry
+                .iter()
+                .any(|axes| axes.as_slice() == [expected.clone()]),
+            "{geometry:?}"
+        );
     }
     assert!(
-        geometry.iter().any(|axes| matches!(axes.as_slice(), [Axis::Actual(_)])),
+        geometry
+            .iter()
+            .any(|axes| matches!(axes.as_slice(), [Axis::Actual(_)])),
         "{geometry:?}"
     );
 }

@@ -201,7 +201,6 @@ pub(crate) mod demand_driven_tests {
         ChoiceDeclaration, ConstructedCandidateIdentity, ConstructedCandidateParts,
         ImplementationProvenance,
     };
-    use seismic_lang::expr::DecisionId;
     use seismic_ir::construction::{AllocationPlan, Construction};
     use seismic_ir::kernel::{Kernel, KernelId};
     use seismic_ir::physical_target::{
@@ -211,6 +210,7 @@ pub(crate) mod demand_driven_tests {
     };
     use seismic_lang::checked::{check_source, SourceFile, SourceSet};
     use seismic_lang::entry::ElementBindings;
+    use seismic_lang::expr::DecisionId;
     use seismic_lang::expr::{FiniteDomain, PartialAssignment, TargetPredicate};
     use seismic_lang::registry::{BackendName, IntrinsicSignature};
     use seismic_native_target::NativeKernelIdentity;
@@ -302,7 +302,6 @@ pub(crate) mod demand_driven_tests {
         pub(crate) fn form_count(&self) -> usize {
             self.forms.load(Ordering::SeqCst)
         }
-
     }
 
     impl NativeCompiler<FakeTarget> for CountingCompiler {
@@ -645,8 +644,16 @@ pub(crate) mod demand_driven_tests {
         };
         assert_eq!(compiler.form_count(), 4);
         assert_ne!(
-            first.reconciled().as_ref().artifact_instances().collect::<Vec<_>>(),
-            second.reconciled().as_ref().artifact_instances().collect::<Vec<_>>()
+            first
+                .reconciled()
+                .as_ref()
+                .artifact_instances()
+                .collect::<Vec<_>>(),
+            second
+                .reconciled()
+                .as_ref()
+                .artifact_instances()
+                .collect::<Vec<_>>()
         );
     }
 
@@ -716,7 +723,10 @@ pub(crate) mod demand_driven_tests {
         assert_eq!(native.native_kernel_index(shared), Some(1));
         assert_eq!(native.artifact_instances().nth(1), Some(shared_instance));
 
-        assert_eq!(realizer.registry().resolve(target.identity(), native).len(), 2);
+        assert_eq!(
+            realizer.registry().resolve(target.identity(), native).len(),
+            2
+        );
 
         let retry_compiler = CountingCompiler::new();
         retry_compiler.fail_next.store(true, Ordering::SeqCst);
@@ -773,7 +783,10 @@ pub(crate) mod demand_driven_tests {
         };
         assert_eq!(newly_formed.code_bytes, 1);
         assert_eq!(compiler.form_count(), 3);
-        assert_eq!(candidate.reconciled().as_ref().artifact_instances().count(), 2);
+        assert_eq!(
+            candidate.reconciled().as_ref().artifact_instances().count(),
+            2
+        );
     }
 
     #[test]

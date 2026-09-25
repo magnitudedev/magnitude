@@ -54,6 +54,7 @@ pub(super) fn status() -> Result<HostMemoryStatus, ObservationError> {
             bytes: status.ullAvailPhys.min(status.ullAvailPageFile),
             basis: HeadroomBasis::WindowsPhysicalAndCommit,
         },
+        pressure: None,
         limits: job_limits()?,
         limit_visibility: LimitVisibility::Complete,
     })

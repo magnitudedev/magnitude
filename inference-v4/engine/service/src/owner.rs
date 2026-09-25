@@ -1,30 +1,30 @@
 //! Serialized ownership of logical generation and one executor resource domain.
 use super::{
     domain::{
-        DomainCheckpoint, DomainFlight, ExecutorDomain, OperationGroup, group,
-        requirements, submit_group,
+        group, requirements, submit_group, DomainCheckpoint, DomainFlight, ExecutorDomain,
+        OperationGroup,
     },
     policy::{
-        AvailabilityEpoch, Operation as ScheduledOperation, Phase, Scheduler, Selection,
-        ServiceLimits, Victim, order_victims,
+        order_victims, AvailabilityEpoch, Operation as ScheduledOperation, Phase, Scheduler,
+        Selection, ServiceLimits, Victim,
     },
     publication::{
-        CapacityResource, PhysicalTimings, PublicationPermit, PublicationSender, PublicationWake,
-        PublicationWakeKind, PublishError, RequestError, ServiceCapacityError,
+        CapacityResource, ModelUnloadCause, PhysicalTimings, PublicationPermit, PublicationSender,
+        PublicationWake, PublicationWakeKind, PublishError, RequestError, ServiceCapacityError,
     },
     retention::{
         Retention, RetentionCapacity, RetentionKey, RetentionRequest, MIN_BRANCH_GAIN,
         MIN_RETENTION_HIT,
     },
-    round_driver::{RoundError, lower_round, reconcile_forward},
+    round_driver::{lower_round, reconcile_forward, RoundError},
 };
 use magnitude_generation::{
-    DetailedUsage, FinishReason, Generation, OutputToken, RoundStart,
-    WaitReason,
+    DetailedUsage, FinishReason, Generation, OutputToken, RoundStart, WaitReason,
 };
 use magnitude_model_executor::{
-    DomainError, InvariantError, NativeFamily, Operation, Outcome, PhysicalDecision, ProgramFamily,
-    RequestId, ResourceKind, ResourcePlan, SubmitError, WorkKind,
+    DomainError, DomainRequirements, InvariantError, NativeFamily, OpenRequirements, Operation,
+    Outcome, PhysicalDecision, PressureLevel, ProgramFamily, RequestId, ResourceKind, ResourcePlan,
+    SubmitError, WorkKind,
 };
 use magnitude_model_state::ShrinkPolicy;
 use std::{
@@ -117,6 +117,14 @@ fn classify_domain_error(error: DomainError) -> RequestError {
             required: error.required,
             available: error.available,
         }),
+        DomainError::Blind(message) => RequestError::Invariant(InvariantError {
+            context: "device memory observation",
+            detail: message,
+        }),
+        DomainError::Pressure(level) => RequestError::Invariant(InvariantError {
+            context: "platform memory pressure",
+            detail: format!("{level:?}"),
+        }),
         DomainError::Input(error) => RequestError::Input(error),
         DomainError::State(error) => RequestError::State(error),
         DomainError::Device(error) | DomainError::Submit(SubmitError::Device(error)) => {
@@ -138,6 +146,63 @@ pub enum Status {
     Terminal(FinishReason),
 }
 
+/// A request refused before it acquires accepted numerical state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdmissionError {
+    /// A required device-memory observation failed. The caller may retry
+    /// after the platform can report availability again.
+    MemoryObservationUnavailable(String),
+    MemoryPressure(PressureLevel),
+    ModelUnloaded {
+        cause: ModelUnloadCause,
+    },
+    Other(String),
+}
+
+impl std::fmt::Display for AdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MemoryObservationUnavailable(message) => {
+                write!(
+                    formatter,
+                    "device memory observation unavailable: {message}"
+                )
+            }
+            Self::MemoryPressure(level) => {
+                write!(formatter, "platform memory pressure is {level:?}")
+            }
+            Self::ModelUnloaded {
+                cause: ModelUnloadCause::MemoryPressure,
+            } => formatter.write_str("model unloaded due to memory pressure"),
+            Self::Other(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for AdmissionError {}
+
+impl From<String> for AdmissionError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl From<&str> for AdmissionError {
+    fn from(message: &str) -> Self {
+        Self::Other(message.into())
+    }
+}
+
+impl From<DomainError> for AdmissionError {
+    fn from(error: DomainError) -> Self {
+        match error {
+            DomainError::Blind(message) => Self::MemoryObservationUnavailable(message),
+            DomainError::Pressure(level) => Self::MemoryPressure(level),
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
     Submitted,
@@ -145,6 +210,53 @@ pub enum Step {
     Waiting,
     Idle,
     Progress,
+}
+
+const MEMORY_ESCALATION_NS: u64 = 1_000_000_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemoryObservation {
+    Normal,
+    Pressure,
+    Emergency,
+    Blind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemoryCondition {
+    Normal,
+    Pressure,
+    Blind { since: u64 },
+    Emergency { since: u64 },
+    Unloading,
+}
+
+impl MemoryCondition {
+    fn observe(self, observation: MemoryObservation, now: u64) -> Self {
+        if self == Self::Unloading {
+            return self;
+        }
+        match observation {
+            MemoryObservation::Normal => Self::Normal,
+            MemoryObservation::Pressure => Self::Pressure,
+            MemoryObservation::Emergency => match self {
+                Self::Emergency { since } => Self::Emergency { since },
+                _ => Self::Emergency { since: now },
+            },
+            MemoryObservation::Blind => match self {
+                Self::Blind { since } if now.saturating_sub(since) >= MEMORY_ESCALATION_NS => {
+                    Self::Emergency { since: now }
+                }
+                Self::Blind { since } => Self::Blind { since },
+                Self::Emergency { since } => Self::Emergency { since },
+                _ => Self::Blind { since: now },
+            },
+        }
+    }
+
+    fn should_unload(self, now: u64) -> bool {
+        matches!(self, Self::Emergency { since } if now.saturating_sub(since) >= MEMORY_ESCALATION_NS)
+    }
 }
 
 struct ActiveGroup<F: ProgramFamily> {
@@ -176,6 +288,8 @@ pub struct Owner<F: ProgramFamily = NativeFamily> {
     now: u64,
     fatal: Option<String>,
     retention: Retention<DomainCheckpoint>,
+    pressure_release_pending: bool,
+    memory_condition: MemoryCondition,
 }
 
 impl<F: ProgramFamily> Owner<F> {
@@ -223,6 +337,8 @@ impl<F: ProgramFamily> Owner<F> {
             now: 0,
             fatal: None,
             retention: Retention::new(retention_capacity),
+            pressure_release_pending: false,
+            memory_condition: MemoryCondition::Normal,
         })
     }
 
@@ -325,7 +441,77 @@ impl<F: ProgramFamily> Owner<F> {
         Ok(())
     }
 
-    pub fn admit(&mut self, generation: Generation, now: u64) -> Result<RequestId, String> {
+    fn observe_periodic_memory(&mut self, now: u64) -> Result<(), String> {
+        self.time(now)?;
+        if self.memory_condition == MemoryCondition::Unloading {
+            return Ok(());
+        }
+        let observation = Self::memory_observation(self.domain.probe_memory())?;
+        self.memory_condition = self.memory_condition.observe(observation, now);
+        if matches!(
+            observation,
+            MemoryObservation::Normal | MemoryObservation::Blind
+        ) && !matches!(self.memory_condition, MemoryCondition::Emergency { .. })
+        {
+            self.pressure_release_pending = false;
+            return Ok(());
+        }
+        if self
+            .batch
+            .as_ref()
+            .is_some_and(|batch| batch.active.is_some())
+        {
+            self.pressure_release_pending = true;
+            return Ok(());
+        }
+        self.release_pressure_holdings()?;
+        let after = Self::memory_observation(self.domain.probe_memory())?;
+        self.memory_condition = self.memory_condition.observe(after, now);
+        if self.memory_condition.should_unload(now) {
+            self.begin_memory_unload();
+        }
+        Ok(())
+    }
+
+    fn memory_observation(result: Result<(), DomainError>) -> Result<MemoryObservation, String> {
+        match result {
+            Ok(()) => Ok(MemoryObservation::Normal),
+            Err(DomainError::Pressure(PressureLevel::Normal)) => Ok(MemoryObservation::Normal),
+            Err(DomainError::Pressure(PressureLevel::Pressure)) => Ok(MemoryObservation::Pressure),
+            Err(DomainError::Pressure(PressureLevel::Emergency)) => {
+                Ok(MemoryObservation::Emergency)
+            }
+            Err(DomainError::Blind(_)) => Ok(MemoryObservation::Blind),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn release_pressure_holdings(&mut self) -> Result<(), String> {
+        self.relieve_platform_pressure()?;
+        while matches!(self.memory_condition, MemoryCondition::Emergency { .. }) {
+            if matches!(self.domain.probe_memory(), Ok(())) {
+                break;
+            }
+            if !self.evict_victims(&[], false)? {
+                break;
+            }
+            self.domain
+                .shrink_state(ShrinkPolicy::Pressure)
+                .map_err(|error| error.to_string())?;
+        }
+        self.epoch.advance()?;
+        Ok(())
+    }
+
+    fn release_deferred_pressure(&mut self) -> Result<(), String> {
+        if !self.pressure_release_pending {
+            return Ok(());
+        }
+        self.pressure_release_pending = false;
+        self.observe_periodic_memory(self.now)
+    }
+
+    pub fn admit(&mut self, generation: Generation, now: u64) -> Result<RequestId, AdmissionError> {
         self.admit_with(generation, now, |_, _, _| Ok(Vec::new()))
     }
 
@@ -338,7 +524,7 @@ impl<F: ProgramFamily> Owner<F> {
             RequestId,
             &Generation,
         ) -> Result<Vec<Operation>, String>,
-    ) -> Result<RequestId, String> {
+    ) -> Result<RequestId, AdmissionError> {
         self.admit_inner(generation, None, now, |domain, request, generation, _| {
             prepare(domain, request, generation)
         })
@@ -355,7 +541,7 @@ impl<F: ProgramFamily> Owner<F> {
             &Generation,
             Option<usize>,
         ) -> Result<Vec<Operation>, String>,
-    ) -> Result<RequestId, String> {
+    ) -> Result<RequestId, AdmissionError> {
         self.admit_inner(generation, Some(retention), now, prepare)
     }
 
@@ -370,10 +556,18 @@ impl<F: ProgramFamily> Owner<F> {
             &Generation,
             Option<usize>,
         ) -> Result<Vec<Operation>, String>,
-    ) -> Result<RequestId, String> {
+    ) -> Result<RequestId, AdmissionError> {
         self.time(now)?;
+        if self.memory_condition == MemoryCondition::Unloading {
+            return Err(AdmissionError::ModelUnloaded {
+                cause: ModelUnloadCause::MemoryPressure,
+            });
+        }
+        if matches!(self.memory_condition, MemoryCondition::Emergency { .. }) {
+            return Err(AdmissionError::MemoryPressure(PressureLevel::Emergency));
+        }
         if let Some(error) = &self.fatal {
-            return Err(error.clone());
+            return Err(error.clone().into());
         }
         if self.records.len() >= self.scheduler.limits().max_requests {
             return Err("service request limit reached".into());
@@ -385,6 +579,9 @@ impl<F: ProgramFamily> Owner<F> {
         {
             return Err("continued generation requires checkpoint admission".into());
         }
+        // Observe before any resident-slot eviction. A Blind refusal must
+        // leave accepted peers and their numerical holdings intact.
+        self.domain.probe_memory().map_err(AdmissionError::from)?;
         self.ensure_resident_slot()?;
         let id = RequestId(self.next_id);
         self.next_id = self
@@ -413,7 +610,7 @@ impl<F: ProgramFamily> Owner<F> {
             }
         };
         if let Err(error) = opened {
-            let error = error.to_string();
+            let error = AdmissionError::from(error);
             if let Some(fatal) = self.domain.fatal_error().cloned() {
                 self.fail_domain_error(fatal);
             }
@@ -437,7 +634,8 @@ impl<F: ProgramFamily> Owner<F> {
                         self.fail_all(fatal.clone());
                         fatal
                     }
-                });
+                }
+                .into());
             }
         };
         if admission.iter().any(|operation| {
@@ -449,7 +647,8 @@ impl<F: ProgramFamily> Owner<F> {
                 Err(rollback) => format!(
                     "admission returned invalid initial operations; rollback failed: {rollback}"
                 ),
-            });
+            }
+            .into());
         }
         let mut plan = retention_request
             .as_ref()
@@ -551,7 +750,10 @@ impl<F: ProgramFamily> Owner<F> {
         self.records.iter().any(|(&id, record)| {
             id != except
                 && record.branch == Some(position)
-                && record.retention.as_ref().is_some_and(|live| &live.key == key)
+                && record
+                    .retention
+                    .as_ref()
+                    .is_some_and(|live| &live.key == key)
                 && prefilling_toward(&record.generation, position)
         })
     }
@@ -593,7 +795,10 @@ impl<F: ProgramFamily> Owner<F> {
                     return Ok(());
                 }
                 // The request computes the prefix itself instead.
-                self.records.get_mut(&id).expect("waiting request").awaited_prefix = None;
+                self.records
+                    .get_mut(&id)
+                    .expect("waiting request")
+                    .awaited_prefix = None;
                 self.epoch.advance()?;
                 continue;
             }
@@ -629,29 +834,53 @@ impl<F: ProgramFamily> Owner<F> {
         Ok(())
     }
 
-    fn ensure_open_capacity(&mut self) -> Result<(), String> {
+    fn ensure_open_capacity(&mut self) -> Result<(), AdmissionError> {
         let requirements = self.domain.open_requirements();
-        self.domain
-            .provision_open()
-            .map_err(|error| error.to_string())?;
-        while self.domain.can_open(requirements).is_err()
-            && self
-                .retention
-                .evict_one(DomainCheckpoint::exclusive_bytes)?
-                .is_some()
-        {}
-        if self.domain.can_open(requirements).is_ok() {
-            return Ok(());
-        }
-        self.domain.reclaim_idle()?;
-        while self.domain.can_open(requirements).is_err() {
-            if !self.evict_victims(&[], true)? {
-                break;
+        let mut current = self.open_capacity(requirements);
+        if matches!(current, Err(DomainError::Capacity(_))) {
+            self.domain
+                .shrink_state(ShrinkPolicy::Pressure)
+                .map_err(AdmissionError::from)?;
+            current = self.open_capacity(requirements);
+            if matches!(current, Err(DomainError::Capacity(_))) {
+                self.domain.reclaim_idle()?;
+                current = self.open_capacity(requirements);
+            }
+            while matches!(current, Err(DomainError::Capacity(_))) {
+                if self
+                    .retention
+                    .evict_one(DomainCheckpoint::exclusive_bytes)?
+                    .is_none()
+                {
+                    break;
+                }
+                self.domain
+                    .shrink_state(ShrinkPolicy::Pressure)
+                    .map_err(AdmissionError::from)?;
+                current = self.open_capacity(requirements);
+            }
+            if matches!(current, Err(DomainError::Capacity(_))) {
+                self.domain.release_idle_optional_components()?;
+                current = self.open_capacity(requirements);
+            }
+            while matches!(current, Err(DomainError::Capacity(_))) {
+                if !self.evict_victims(&[], true)? {
+                    break;
+                }
+                self.domain
+                    .shrink_state(ShrinkPolicy::Pressure)
+                    .map_err(AdmissionError::from)?;
+                current = self.open_capacity(requirements);
             }
         }
+        current.map_err(AdmissionError::from)
+    }
+
+    fn open_capacity(&mut self, requirements: OpenRequirements) -> Result<(), DomainError> {
+        self.domain.provision_open()?;
         self.domain
             .can_open(requirements)
-            .map_err(|error| error.to_string())
+            .map_err(DomainError::from)
     }
 
     pub fn checkpoint(&mut self, request: RequestId) -> Result<CheckpointId, String> {
@@ -669,9 +898,7 @@ impl<F: ProgramFamily> Owner<F> {
             return Err("cannot checkpoint submitted or releasing work".into());
         }
         let numerical = self.domain.checkpoint(request)?;
-        let generation = record
-            .generation
-            .fork_at(numerical.position())?;
+        let generation = record.generation.fork_at(numerical.position())?;
         let id = CheckpointId(self.next_checkpoint);
         self.next_checkpoint = self
             .next_checkpoint
@@ -817,9 +1044,6 @@ impl<F: ProgramFamily> Owner<F> {
     pub fn retained_entries(&self) -> usize {
         self.retention.len()
     }
-    pub const fn retention_budget_bytes(&self) -> u64 {
-        self.retention.budget_bytes()
-    }
     pub const fn retention_entry_capacity(&self) -> usize {
         self.retention.max_entries()
     }
@@ -908,7 +1132,7 @@ impl<F: ProgramFamily> Owner<F> {
         // Rows the closed request shared with retained checkpoints are now
         // held by retention alone.
         self.retention
-            .enforce_budget(DomainCheckpoint::exclusive_bytes)?;
+            .refresh_charge(DomainCheckpoint::exclusive_bytes)?;
         self.epoch.advance()
     }
 
@@ -1087,6 +1311,36 @@ impl<F: ProgramFamily> Owner<F> {
     fn fail_all_classified(&mut self, error: RequestError) {
         let first = self.fatal.is_none();
         self.fatal.get_or_insert_with(|| format!("{error:?}"));
+        if first {
+            self.terminalize_all(error);
+        }
+    }
+
+    fn begin_memory_unload(&mut self) {
+        if self.memory_condition == MemoryCondition::Unloading {
+            return;
+        }
+        self.memory_condition = MemoryCondition::Unloading;
+        self.terminalize_all(RequestError::ModelUnloaded {
+            cause: ModelUnloadCause::MemoryPressure,
+        });
+    }
+
+    pub fn memory_unload_ready(&mut self) -> bool {
+        self.memory_condition == MemoryCondition::Unloading
+            && self.batch.as_mut().is_none_or(|batch| {
+                batch
+                    .active
+                    .as_mut()
+                    .is_none_or(|active| active.flight.completion().is_complete())
+            })
+    }
+
+    pub fn memory_unloading(&self) -> bool {
+        self.memory_condition == MemoryCondition::Unloading
+    }
+
+    fn terminalize_all(&mut self, error: RequestError) {
         for record in self.records.values_mut() {
             if record.generation.finish_reason().is_none()
                 || record.generation.awaiting_completion()
@@ -1095,26 +1349,24 @@ impl<F: ProgramFamily> Owner<F> {
                 record.error.get_or_insert_with(|| error.clone());
             }
         }
-        if first {
-            for record in self.records.values_mut() {
-                // Only output already accepted by the queue precedes a fatal
-                // terminal. Unpublished generation output is not promoted by
-                // a second, unbounded failure delivery channel.
-                if let Some(sender) = record.publication.take() {
-                    record.generation.discard_output();
-                    record.pending_publication = None;
-                    record.publication_permits.clear();
-                    match record.generation.finish_reason() {
-                        Some(FinishReason::Failed) | None => {
-                            sender.fail(record.error.clone().unwrap_or_else(|| error.clone()));
-                        }
-                        Some(finish) => sender.complete(
-                            finish,
-                            record.generation.detailed_usage(),
-                            record.generation.method_identity().to_owned(),
-                            record.physical_timings,
-                        ),
+        for record in self.records.values_mut() {
+            // Only output already accepted by the queue precedes a terminal
+            // outcome. Unpublished generation output is not promoted by
+            // a second, unbounded failure delivery channel.
+            if let Some(sender) = record.publication.take() {
+                record.generation.discard_output();
+                record.pending_publication = None;
+                record.publication_permits.clear();
+                match record.generation.finish_reason() {
+                    Some(FinishReason::Failed) | None => {
+                        sender.fail(record.error.clone().unwrap_or_else(|| error.clone()));
                     }
+                    Some(finish) => sender.complete(
+                        finish,
+                        record.generation.detailed_usage(),
+                        record.generation.method_identity().to_owned(),
+                        record.physical_timings,
+                    ),
                 }
             }
         }
@@ -1152,6 +1404,9 @@ impl<F: ProgramFamily> Owner<F> {
     }
 
     fn step_inner(&mut self, now: u64) -> Result<Step, String> {
+        if self.memory_condition == MemoryCondition::Unloading {
+            return Ok(Step::Idle);
+        }
         if self.batch.is_some() {
             return self.drive_batch(now);
         }
@@ -1273,7 +1528,8 @@ impl<F: ProgramFamily> Owner<F> {
             None => None,
         };
         let Some(hit) = hit else {
-            self.ensure_open_capacity()?;
+            self.ensure_open_capacity()
+                .map_err(|error| error.to_string())?;
             let reservation = self
                 .domain
                 .reserve_open(request)
@@ -1293,7 +1549,10 @@ impl<F: ProgramFamily> Owner<F> {
             .open_checkpoint_state(request, retained.checkpoint())
             .map_err(|error| error.to_string())?;
         let record = self.records.get_mut(&request).expect("known request");
-        if let Err(error) = record.generation.restored_at(hit.position(), retained.method()) {
+        if let Err(error) = record
+            .generation
+            .restored_at(hit.position(), retained.method())
+        {
             return Err(match self.domain.close(request) {
                 Ok(()) => error,
                 Err(rollback) => format!("{error}; executor rollback failed ({rollback})"),
@@ -1392,6 +1651,10 @@ impl<F: ProgramFamily> Owner<F> {
         }
         if complete {
             self.reconcile_active()?;
+            self.release_deferred_pressure()?;
+            if self.memory_condition == MemoryCondition::Unloading {
+                return Ok(Step::Idle);
+            }
         }
         if self
             .batch
@@ -1446,16 +1709,18 @@ impl<F: ProgramFamily> Owner<F> {
             self.epoch.advance()?;
             return Ok(Step::Progress);
         }
-        // Repacking histories at the segment limit and growing the elastic
-        // state backing within the device limit come before any eviction. A
-        // capacity shortage here is reported by the checks below.
-        match self.domain.provision(queued.operations()) {
-            Ok(()) | Err(DomainError::Capacity(_)) => {}
+        let first_provision = match self.domain.provision(queued.operations()) {
+            Ok(()) => Ok(()),
+            Err(
+                error @ (DomainError::Capacity(_)
+                | DomainError::Blind(_)
+                | DomainError::Pressure(_)),
+            ) => Err(error),
             Err(error) => {
                 self.fail_domain_error(error);
                 return Ok(Step::Progress);
             }
-        }
+        };
         let requirement = match requirements(&self.domain, &queued) {
             Ok(requirement) => requirement,
             Err(error) => {
@@ -1463,7 +1728,15 @@ impl<F: ProgramFamily> Owner<F> {
                 return Ok(Step::Progress);
             }
         };
-        if let Err(mut deficit) = self.domain.can_reserve(&requirement) {
+        // A growth claim and the structural reservation are one capacity
+        // question. Recheck both after each release: free device bytes do not
+        // become committed state rows until provisioning succeeds.
+        let mut current = first_provision.and_then(|_| {
+            self.domain
+                .can_reserve(&requirement)
+                .map_err(DomainError::from)
+        });
+        if matches!(&current, Err(DomainError::Capacity(_))) {
             // Selection is provisional until every exact requirement is
             // available. Memory pressure first releases state backing beyond
             // what the stores need (another store may hold the device memory
@@ -1472,46 +1745,75 @@ impl<F: ProgramFamily> Owner<F> {
             // then idle residency, then eligible live victims. No launch or
             // state transaction exists while these scheduling decisions run.
             match self.domain.shrink_state(ShrinkPolicy::Pressure) {
-                Ok(0) => {}
-                Ok(_) => match self.domain.provision(queued.operations()) {
-                    Ok(()) | Err(DomainError::Capacity(_)) => {}
-                    Err(error) => {
-                        self.fail_domain_error(error);
-                        return Ok(Step::Progress);
-                    }
-                },
+                Ok(_) => current = self.provisioned_capacity(queued.operations(), &requirement),
                 Err(error) => {
                     self.fail_domain_error(error);
                     return Ok(Step::Progress);
                 }
             }
-            while self.domain.can_reserve(&requirement).is_err()
-                && self
+            if matches!(&current, Err(DomainError::Capacity(_))) {
+                self.domain.reclaim_idle()?;
+                current = self.provisioned_capacity(queued.operations(), &requirement);
+            }
+            while matches!(&current, Err(DomainError::Capacity(_))) {
+                if self
                     .retention
                     .evict_one(DomainCheckpoint::exclusive_bytes)?
-                    .is_some()
-            {}
-            self.domain
-                .reclaim_idle()
-                .map_err(|error| error.to_string())?;
+                    .is_none()
+                {
+                    break;
+                }
+                if let Err(error) = self.domain.shrink_state(ShrinkPolicy::Pressure) {
+                    self.fail_domain_error(error);
+                    return Ok(Step::Progress);
+                }
+                current = self.provisioned_capacity(queued.operations(), &requirement);
+            }
+            if matches!(&current, Err(DomainError::Capacity(_))) {
+                self.domain.release_idle_optional_components()?;
+                current = self.provisioned_capacity(queued.operations(), &requirement);
+            }
             let selected = self.batch.as_ref().unwrap().selection.requests().to_vec();
-            while self.domain.can_reserve(&requirement).is_err() {
+            while matches!(&current, Err(DomainError::Capacity(_))) {
                 if !self.evict_victims(&selected, false)? {
                     break;
                 }
+                if let Err(error) = self.domain.shrink_state(ShrinkPolicy::Pressure) {
+                    self.fail_domain_error(error);
+                    return Ok(Step::Progress);
+                }
+                current = self.provisioned_capacity(queued.operations(), &requirement);
             }
-            if let Err(current) = self.domain.can_reserve(&requirement) {
-                deficit = current;
+        }
+        if matches!(&current, Err(DomainError::Pressure(_))) {
+            self.relieve_platform_pressure()?;
+            self.requeue_group(queued);
+            return Ok(Step::Waiting);
+        }
+        match current {
+            Ok(()) => {}
+            Err(DomainError::Blind(_)) => {
+                // Keep the accepted batch intact. A missing observation
+                // revokes the allocation grant but says nothing about which
+                // existing holdings could satisfy this request.
+                self.requeue_group(queued);
+                return Ok(Step::Waiting);
+            }
+            Err(DomainError::Capacity(deficit)) => {
                 return self.capacity_unavailable(
                     queued,
                     deficit.resource,
                     deficit.required,
                     deficit.available,
-                );
+                )
+            }
+            Err(DomainError::Pressure(_)) => unreachable!("pressure handled above"),
+            Err(error) => {
+                self.fail_domain_error(error);
+                return Ok(Step::Progress);
             }
         }
-        let Some(publication_permits) =
-            self.reserve_group_publications(queued.operations())?
+        let Some(publication_permits) = self.reserve_group_publications(queued.operations())?
         else {
             let batch = self.batch.as_mut().unwrap();
             batch.queued.push_front(queued);
@@ -1519,9 +1821,9 @@ impl<F: ProgramFamily> Owner<F> {
             return Ok(Step::Waiting);
         };
         let submitted = submit_group(&mut self.domain, &queued);
-        let operations = queued.into_operations();
         match submitted {
             Ok(flight) => {
+                let operations = queued.into_operations();
                 let mut retention_uses = Vec::new();
                 for request in operations
                     .iter()
@@ -1553,8 +1855,23 @@ impl<F: ProgramFamily> Owner<F> {
                 }));
                 Ok(Step::Progress)
             }
+            Err(DomainError::Blind(_)) => {
+                // The domain can re-observe during reserve after the owner's
+                // preflight. No work was submitted. Give unused publication
+                // permits back, then rebuild groups in case provisioning
+                // changed the domain's grouping state.
+                drop(publication_permits);
+                self.requeue_group(queued);
+                Ok(Step::Waiting)
+            }
+            Err(DomainError::Pressure(_)) => {
+                drop(publication_permits);
+                self.requeue_group(queued);
+                Ok(Step::Waiting)
+            }
             Err(DomainError::Input(error)) => {
-                for request in operations
+                for request in queued
+                    .operations()
                     .iter()
                     .map(Operation::request)
                     .collect::<std::collections::BTreeSet<_>>()
@@ -1584,6 +1901,68 @@ impl<F: ProgramFamily> Owner<F> {
                 self.epoch.advance()?;
                 Ok(Step::Progress)
             }
+        }
+    }
+
+    fn requeue_group(&mut self, queued: OperationGroup) {
+        let regrouped = group(&self.domain, queued.into_operations());
+        let batch = self.batch.as_mut().expect("queued group has a batch");
+        for group in regrouped.into_iter().rev() {
+            batch.queued.push_front(group);
+        }
+    }
+
+    /// Pressure may discard surplus and retained reuse state, never accepted
+    /// live work. Stop as soon as the platform reports Normal or Blind.
+    /// Emergency preemption and model unload require the separate owner
+    /// lifecycle transition; this routine performs only safe release rungs.
+    fn relieve_platform_pressure(&mut self) -> Result<(), String> {
+        self.domain
+            .shrink_state(ShrinkPolicy::Pressure)
+            .map_err(|error| error.to_string())?;
+        if !self.pressure_release_needed() {
+            return Ok(());
+        }
+        self.domain.reclaim_idle()?;
+        while self.pressure_release_needed() {
+            if self
+                .retention
+                .evict_one(DomainCheckpoint::exclusive_bytes)?
+                .is_none()
+            {
+                break;
+            }
+            // Eviction drops claims, but committed rows and banks remain
+            // charged until the stores shrink. Probe the device only after
+            // that physical release has had a chance to complete.
+            self.domain
+                .shrink_state(ShrinkPolicy::Pressure)
+                .map_err(|error| error.to_string())?;
+            self.domain.reclaim_idle()?;
+        }
+        // Optional weights are dormant only after every request has left the
+        // owner. Use the device's actual charge decrease as release credit.
+        if self.records.is_empty()
+            && self.pressure_release_needed()
+            && matches!(
+                self.memory_condition,
+                MemoryCondition::Pressure | MemoryCondition::Emergency { .. }
+            )
+        {
+            self.domain.release_idle_optional_components()?;
+        }
+        Ok(())
+    }
+
+    fn pressure_release_needed(&mut self) -> bool {
+        match self.domain.probe_memory() {
+            Err(DomainError::Pressure(_)) => true,
+            Err(DomainError::Blind(_))
+                if matches!(self.memory_condition, MemoryCondition::Emergency { .. }) =>
+            {
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1626,6 +2005,17 @@ impl<F: ProgramFamily> Owner<F> {
             }
         }
         Ok(Some(reserved))
+    }
+
+    fn provisioned_capacity(
+        &mut self,
+        operations: &[Operation],
+        requirement: &DomainRequirements,
+    ) -> Result<(), DomainError> {
+        self.domain.provision(operations)?;
+        self.domain
+            .can_reserve(requirement)
+            .map_err(DomainError::from)
     }
 
     fn capacity_unavailable(
@@ -1746,10 +2136,10 @@ impl<F: ProgramFamily> Owner<F> {
                     Some(FinishReason::Cancelled | FinishReason::Failed)
                 ) {
                     self.abort_pending(item)?;
-                } else if let Err(error) = self.domain.reconcile(
-                    item,
-                    PhysicalDecision { accepted_rows: 0 },
-                ) {
+                } else if let Err(error) = self
+                    .domain
+                    .reconcile(item, PhysicalDecision { accepted_rows: 0 })
+                {
                     self.fail_domain_outcome(request, error);
                 }
             }
@@ -1976,9 +2366,7 @@ impl<F: ProgramFamily> Owner<F> {
         record.branch = None;
         let tokens = record.generation.prompt()[..branch].to_vec();
         let numerical = self.domain.checkpoint(request)?;
-        let method = self.records[&request]
-            .generation
-            .method_checkpoint()?;
+        let method = self.records[&request].generation.method_checkpoint()?;
         let retained = self.retention.retain(
             self.records[&request]
                 .retention
@@ -2174,6 +2562,10 @@ impl<F: ProgramFamily> Owner<F> {
 }
 
 impl<F: ProgramFamily> super::worker::Driven for Owner<F> {
+    fn periodic(&mut self, now: u64) -> Result<(), String> {
+        self.observe_periodic_memory(now)
+    }
+
     fn publication_wake(
         &mut self,
         request: RequestId,
@@ -2240,7 +2632,47 @@ impl<F: ProgramFamily> super::worker::Driven for Owner<F> {
             self.domain.close(id)?;
             self.records.remove(&id);
         }
-        self.retention.evict_all(DomainCheckpoint::exclusive_bytes)?;
+        self.retention
+            .evict_all(DomainCheckpoint::exclusive_bytes)?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod memory_condition_tests {
+    use super::{MemoryCondition, MemoryObservation, MEMORY_ESCALATION_NS};
+
+    #[test]
+    fn continuous_blind_escalates_then_unloads_after_emergency_interval() {
+        let blind = MemoryCondition::Normal.observe(MemoryObservation::Blind, 7);
+        assert_eq!(blind, MemoryCondition::Blind { since: 7 });
+        let before = blind.observe(MemoryObservation::Blind, 7 + MEMORY_ESCALATION_NS - 1);
+        assert_eq!(before, blind);
+        let emergency = before.observe(MemoryObservation::Blind, 7 + MEMORY_ESCALATION_NS);
+        assert_eq!(
+            emergency,
+            MemoryCondition::Emergency {
+                since: 7 + MEMORY_ESCALATION_NS
+            }
+        );
+        assert!(!emergency.should_unload(7 + 2 * MEMORY_ESCALATION_NS - 1));
+        assert!(emergency.should_unload(7 + 2 * MEMORY_ESCALATION_NS));
+        assert_eq!(
+            emergency.observe(MemoryObservation::Normal, 7 + 2 * MEMORY_ESCALATION_NS),
+            MemoryCondition::Normal
+        );
+    }
+
+    #[test]
+    fn emergency_timer_resets_after_pressure_recovery() {
+        let emergency = MemoryCondition::Normal.observe(MemoryObservation::Emergency, 5);
+        assert_eq!(
+            emergency.observe(MemoryObservation::Emergency, 9),
+            emergency
+        );
+        let pressure = emergency.observe(MemoryObservation::Pressure, 10);
+        assert_eq!(pressure, MemoryCondition::Pressure);
+        let renewed = pressure.observe(MemoryObservation::Emergency, 11);
+        assert_eq!(renewed, MemoryCondition::Emergency { since: 11 });
     }
 }

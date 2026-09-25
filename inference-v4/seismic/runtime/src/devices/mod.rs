@@ -12,11 +12,11 @@
 mod catalog;
 mod host;
 
-pub use crate::memory::{MemoryLimitError, MemoryUsage};
+pub use crate::memory::MemoryUsage;
 pub use catalog::Catalog;
 pub use host::{
     HeadroomBasis, HeadroomEstimate, HostMeasurements, HostMemoryStatus, LimitVisibility,
-    ProcessLimitKind, ProcessMemoryLimit,
+    PressureLevel, ProcessLimitKind, ProcessMemoryLimit,
 };
 
 use seismic_compiler::errors::TargetError;
@@ -121,9 +121,14 @@ impl FromStr for DeviceSelector {
         }
         let mut uuid = [0u8; 16];
         for (index, byte) in uuid.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).map_err(|_| invalid())?;
+            *byte =
+                u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).map_err(|_| invalid())?;
         }
-        Ok(if vulkan { Self::Vulkan { uuid } } else { Self::Cuda { uuid } })
+        Ok(if vulkan {
+            Self::Vulkan { uuid }
+        } else {
+            Self::Cuda { uuid }
+        })
     }
 }
 
@@ -221,6 +226,19 @@ pub struct DeviceInfo {
     pub(crate) descriptor: Arc<crate::backends::Descriptor>,
 }
 
+impl DeviceInfo {
+    /// The device's advisory working-set ceiling, when its backend reports
+    /// one without opening an execution context. This bounds stable fit on
+    /// unified-memory Metal alongside the host RAM domain.
+    pub fn recommended_working_set_bytes(&self) -> Option<u64> {
+        #[cfg(target_os = "macos")]
+        if let crate::backends::Descriptor::Metal { handle } = self.descriptor.as_ref() {
+            return Some(handle.recommended_working_set_bytes());
+        }
+        None
+    }
+}
+
 impl fmt::Debug for DeviceInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeviceInfo")
@@ -282,8 +300,7 @@ impl DeviceTopology {
     }
     /// `None` for an identifier from another revision.
     pub fn device(&self, id: DeviceId) -> Option<&DeviceInfo> {
-        (id.revision == self.revision)
-            .then(|| &self.devices[id.index as usize])
+        (id.revision == self.revision).then(|| &self.devices[id.index as usize])
     }
     /// `None` for an identifier from another revision.
     pub fn pool(&self, id: MemoryPoolId) -> Option<&MemoryPoolInfo> {
@@ -372,7 +389,10 @@ pub enum OpenError {
 impl fmt::Display for OpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Stale(id) => write!(f, "device id {id:?} belongs to an earlier topology revision"),
+            Self::Stale(id) => write!(
+                f,
+                "device id {id:?} belongs to an earlier topology revision"
+            ),
             Self::NoDevice {
                 backend,
                 diagnostics,
@@ -391,7 +411,10 @@ impl fmt::Display for OpenError {
             }
             Self::Backend(error) => write!(f, "{error}"),
             Self::ArtifactStoreConflict(selector) => {
-                write!(f, "device {selector} is already open with a different artifact store")
+                write!(
+                    f,
+                    "device {selector} is already open with a different artifact store"
+                )
             }
         }
     }

@@ -63,7 +63,13 @@ struct SlotCase {
 
 /// A slot reading bank `previous` with no tape rows.
 fn slot(rows: usize, stop: usize, previous: usize, following: usize) -> SlotCase {
-    SlotCase { rows, stop, previous, following, taped: 0 }
+    SlotCase {
+        rows,
+        stop,
+        previous,
+        following,
+        taped: 0,
+    }
 }
 
 struct Case {
@@ -149,7 +155,10 @@ struct Random(u64);
 
 impl Random {
     fn next(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((self.0 >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
     }
 }
@@ -161,7 +170,13 @@ fn bf16_round(value: f32) -> f32 {
 
 impl Case {
     /// Rows are packed after the slots, as the batch packer pads them.
-    fn new(geometry: Geometry, rows: usize, slots: Vec<SlotCase>, grouped: bool, seed: u64) -> Self {
+    fn new(
+        geometry: Geometry,
+        rows: usize,
+        slots: Vec<SlotCase>,
+        grouped: bool,
+        seed: u64,
+    ) -> Self {
         let mut random = Random(seed);
         let width = geometry.projection_width();
         let mut projection = (0..rows * width).map(|_| random.next()).collect::<Vec<_>>();
@@ -179,7 +194,9 @@ impl Case {
         let rate = (0..geometry.value_heads)
             .map(|_| -(0.05 + 0.5 * (random.next() + 1.0)))
             .collect();
-        let time_bias = (0..geometry.value_heads).map(|_| random.next() * 0.5).collect();
+        let time_bias = (0..geometry.value_heads)
+            .map(|_| random.next() * 0.5)
+            .collect();
         let accepted = slots.iter().map(|slot| slot.previous).collect::<Vec<_>>();
         let mut window = vec![SENTINEL; geometry.banks * geometry.window_bank()];
         let mut delta = vec![SENTINEL; geometry.banks * geometry.delta_bank()];
@@ -189,7 +206,8 @@ impl Case {
         tape[..geometry.tape_bank()].fill(0.0);
         for bank in 1..geometry.banks {
             if accepted.contains(&bank) {
-                for value in &mut window[bank * geometry.window_bank()..][..geometry.window_bank()] {
+                for value in &mut window[bank * geometry.window_bank()..][..geometry.window_bank()]
+                {
                     *value = random.next();
                 }
                 for value in &mut delta[bank * geometry.delta_bank()..][..geometry.delta_bank()] {
@@ -199,7 +217,8 @@ impl Case {
                 let nvw = geometry.value_heads * geometry.width;
                 let nkw = geometry.key_heads * geometry.width;
                 for entry in 0..geometry.tape {
-                    let row = &mut tape[bank * geometry.tape_bank() + entry * geometry.tape_row()..]
+                    let row = &mut tape
+                        [bank * geometry.tape_bank() + entry * geometry.tape_row()..]
                         [..geometry.tape_row()];
                     for (index, value) in row.iter_mut().enumerate() {
                         *value = if index < nvw {
@@ -293,7 +312,13 @@ impl Case {
         let (nk, nv, w, c) = (g.key_heads, g.value_heads, g.width, g.convolution);
         let channels = g.channels();
         let width = g.projection_width();
-        let key_of = |head: usize| if self.grouped { head * nk / nv } else { head % nk };
+        let key_of = |head: usize| {
+            if self.grouped {
+                head * nk / nv
+            } else {
+                head % nk
+            }
+        };
         let mut mixed = vec![0.0f32; self.rows * nv * w];
         let mut window = self.window.clone();
         let mut delta = self.delta.clone();
@@ -306,7 +331,8 @@ impl Case {
                 .collect::<Vec<_>>();
             // The version: the bank's state advanced by its first tape rows.
             for entry in 0..slot.taped {
-                let row = &self.tape[slot.previous * g.tape_bank() + entry * g.tape_row()..][..g.tape_row()];
+                let row = &self.tape[slot.previous * g.tape_bank() + entry * g.tape_row()..]
+                    [..g.tape_row()];
                 for head in 0..nv {
                     let decay = row[(nv + nk) * w + head] as f64;
                     let key = &row[nv * w + key_of(head) * w..][..w];
@@ -374,7 +400,8 @@ impl Case {
                     } else {
                         value_head % nk
                     };
-                    let alpha = self.projection[row * width + channels + nv * w + value_head] as f64;
+                    let alpha =
+                        self.projection[row * width + channels + nv * w + value_head] as f64;
                     let beta_input =
                         self.projection[row * width + channels + nv * w + nv + value_head] as f64;
                     let beta = 1.0 / (1.0 + (-beta_input).exp());
@@ -383,8 +410,9 @@ impl Case {
                     let factor = (self.rate[value_head] as f64 * softplus).exp();
                     let query = &prepared[key_head * w..][..w];
                     let key = &prepared[(nk + key_head) * w..][..w];
-                    let entry = (local >= slot.stop && local - slot.stop < taped)
-                        .then(|| slot.following * g.tape_bank() + (local - slot.stop) * g.tape_row());
+                    let entry = (local >= slot.stop && local - slot.stop < taped).then(|| {
+                        slot.following * g.tape_bank() + (local - slot.stop) * g.tape_row()
+                    });
                     if let Some(entry) = entry {
                         tape[entry + (nv + nk) * w + value_head] = factor as f32;
                         for column in 0..w {
@@ -417,8 +445,10 @@ impl Case {
             }
             for row in 0..c - 1 + taped {
                 for channel in 0..channels {
-                    window[slot.following * g.window_bank() + row * channels + channel] =
-                        raw(slot.stop as isize + row as isize - (c as isize - 1), channel);
+                    window[slot.following * g.window_bank() + row * channels + channel] = raw(
+                        slot.stop as isize + row as isize - (c as isize - 1),
+                        channel,
+                    );
                 }
             }
             first += slot.rows;
@@ -481,7 +511,12 @@ impl Case {
             ints(self.slots.iter().map(|slot| slot.stop as i32).collect()),
             ints(self.slots.iter().map(|slot| slot.previous as i32).collect()),
             ints(self.slots.iter().map(|slot| slot.taped as i32).collect()),
-            ints(self.slots.iter().map(|slot| slot.following as i32).collect()),
+            ints(
+                self.slots
+                    .iter()
+                    .map(|slot| slot.following as i32)
+                    .collect(),
+            ),
             floats(vec![g.banks, g.window_rows(), g.channels()], &self.window),
             floats(vec![g.banks, g.value_heads, g.width, g.width], &self.delta),
             floats(vec![g.banks, g.tape, g.tape_row()], &self.tape),
@@ -532,7 +567,10 @@ impl Case {
                 device,
                 Element::f32(),
                 shape,
-                &values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>(),
+                &values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>(),
             )
             .unwrap()
         };
@@ -543,7 +581,10 @@ impl Case {
                     .flat_map(|value| ((bf16_round(*value).to_bits() >> 16) as u16).to_le_bytes())
                     .collect::<Vec<_>>()
             } else {
-                values.iter().flat_map(|value| value.to_le_bytes()).collect()
+                values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect()
             };
             Tensor::from_host(device, activation, shape, &bytes).unwrap()
         };
@@ -552,7 +593,10 @@ impl Case {
                 device,
                 Element::i32(),
                 shape,
-                &values.into_iter().flat_map(i32::to_le_bytes).collect::<Vec<_>>(),
+                &values
+                    .into_iter()
+                    .flat_map(i32::to_le_bytes)
+                    .collect::<Vec<_>>(),
             )
             .unwrap()
         };
@@ -562,23 +606,49 @@ impl Case {
                 &[self.rows as u64, g.projection_width() as u64],
                 &self.projection,
             ),
-            convolution: from_f32(&[g.channels() as u64, g.convolution as u64], &self.convolution),
+            convolution: from_f32(
+                &[g.channels() as u64, g.convolution as u64],
+                &self.convolution,
+            ),
             rate: from_f32(&[g.value_heads as u64], &self.rate),
             time_bias: from_f32(&[g.value_heads as u64], &self.time_bias),
             segments: ints(&[slots + 1, 2], self.segments()),
-            stop: ints(&[slots], self.slots.iter().map(|slot| slot.stop as i32).collect()),
-            previous: ints(&[slots], self.slots.iter().map(|slot| slot.previous as i32).collect()),
-            previous_tape: ints(&[slots], self.slots.iter().map(|slot| slot.taped as i32).collect()),
-            following: ints(&[slots], self.slots.iter().map(|slot| slot.following as i32).collect()),
+            stop: ints(
+                &[slots],
+                self.slots.iter().map(|slot| slot.stop as i32).collect(),
+            ),
+            previous: ints(
+                &[slots],
+                self.slots.iter().map(|slot| slot.previous as i32).collect(),
+            ),
+            previous_tape: ints(
+                &[slots],
+                self.slots.iter().map(|slot| slot.taped as i32).collect(),
+            ),
+            following: ints(
+                &[slots],
+                self.slots
+                    .iter()
+                    .map(|slot| slot.following as i32)
+                    .collect(),
+            ),
             window: from_activation(
                 &[g.banks as u64, g.window_rows() as u64, g.channels() as u64],
                 &self.window,
             ),
             delta: from_f32(
-                &[g.banks as u64, g.value_heads as u64, g.width as u64, g.width as u64],
+                &[
+                    g.banks as u64,
+                    g.value_heads as u64,
+                    g.width as u64,
+                    g.width as u64,
+                ],
                 &self.delta,
             ),
-            tape: from_f32(&[g.banks as u64, g.tape as u64, g.tape_row() as u64], &self.tape),
+            tape: from_f32(
+                &[g.banks as u64, g.tape as u64, g.tape_row() as u64],
+                &self.tape,
+            ),
         }
     }
 
@@ -598,8 +668,12 @@ impl Case {
     }
 
     /// The step with `ROWS` state rows per threadgroup or work item.
-    fn native_step(&self, device: &Device, activation: Element, rows: u64)
-        -> seismic::NativeKernel<gated_delta_step::Entry> {
+    fn native_step(
+        &self,
+        device: &Device,
+        activation: Element,
+        rows: u64,
+    ) -> seismic::NativeKernel<gated_delta_step::Entry> {
         gated_delta_step::native_for_device_with(
             device,
             gated_delta_step::Elements { A: activation },
@@ -609,8 +683,12 @@ impl Case {
     }
 
     /// The chunk with `ROWS` state rows per threadgroup or work item.
-    fn native_chunk(&self, device: &Device, activation: Element, rows: u64)
-        -> seismic::NativeKernel<gated_delta_chunk::Entry> {
+    fn native_chunk(
+        &self,
+        device: &Device,
+        activation: Element,
+        rows: u64,
+    ) -> seismic::NativeKernel<gated_delta_chunk::Entry> {
         gated_delta_chunk::native_for_device_with(
             device,
             gated_delta_chunk::Elements { A: activation },
@@ -623,16 +701,18 @@ impl Case {
     fn native(&self, device: &Device, activation: Element, chunk: Option<u64>) -> Outcome {
         let mut t = self.tensors(device, activation);
         let mixed = match chunk {
-            None => self
-                .native_step(device, activation, 32.min(self.geometry.width as u64))
-                .call(t.step_args(self))
-                .unwrap()
-                .value,
-            Some(mapping) => self
-                .native_chunk(device, activation, mapping)
-                .call(t.chunk_args(self))
-                .unwrap()
-                .value,
+            None => {
+                self.native_step(device, activation, 32.min(self.geometry.width as u64))
+                    .call(t.step_args(self))
+                    .unwrap()
+                    .value
+            }
+            Some(mapping) => {
+                self.native_chunk(device, activation, mapping)
+                    .call(t.chunk_args(self))
+                    .unwrap()
+                    .value
+            }
         };
         Outcome {
             mixed: read(&mixed),
@@ -641,10 +721,6 @@ impl Case {
             tape: read(&t.tape),
         }
     }
-
-    fn successors(&self) -> Vec<usize> {
-        self.slots.iter().map(|slot| slot.following).collect()
-    }
 }
 
 fn read(tensor: &Tensor) -> Vec<f32> {
@@ -652,7 +728,9 @@ fn read(tensor: &Tensor) -> Vec<f32> {
     if tensor.element() == Element::bf16() {
         bytes
             .chunks_exact(2)
-            .map(|word| f32::from_bits(u32::from(u16::from_le_bytes(word.try_into().unwrap())) << 16))
+            .map(|word| {
+                f32::from_bits(u32::from(u16::from_le_bytes(word.try_into().unwrap())) << 16)
+            })
             .collect()
     } else {
         bytes
@@ -666,8 +744,7 @@ fn read(tensor: &Tensor) -> Vec<f32> {
 /// the difference relative to it: the per-layer error measures of the D4 gate.
 fn errors(actual: &[f32], expected: &[f32]) -> (f64, f64) {
     assert_eq!(actual.len(), expected.len());
-    let scale = (expected.iter().map(|v| (*v as f64).powi(2)).sum::<f64>()
-        / expected.len() as f64)
+    let scale = (expected.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / expected.len() as f64)
         .sqrt()
         .max(1e-12);
     let mut max = 0.0f64;
@@ -691,7 +768,11 @@ fn check(label: &str, case: &Case, actual: &Outcome, expected: &Outcome, toleran
     let (max, rms) = errors(&actual.mixed, &expected.mixed);
     println!("{label} mixed: max/rms {max:.3e} rms/rms {rms:.3e}");
     if case.bf16 {
-        let scale = (expected.mixed.iter().map(|v| (*v as f64).powi(2)).sum::<f64>()
+        let scale = (expected
+            .mixed
+            .iter()
+            .map(|v| (*v as f64).powi(2))
+            .sum::<f64>()
             / expected.mixed.len() as f64)
             .sqrt();
         for (index, (a, e)) in actual.mixed.iter().zip(&expected.mixed).enumerate() {
@@ -704,7 +785,10 @@ fn check(label: &str, case: &Case, actual: &Outcome, expected: &Outcome, toleran
         }
         assert!(rms <= tolerance.1, "{label} mixed rms error {rms}");
     } else {
-        assert!(max <= tolerance.0 && rms <= tolerance.1, "{label} mixed error {max} {rms}");
+        assert!(
+            max <= tolerance.0 && rms <= tolerance.1,
+            "{label} mixed error {max} {rms}"
+        );
     }
     for bank in 0..g.banks {
         let window = &actual.window[bank * g.window_bank()..][..g.window_bank()];
@@ -712,7 +796,10 @@ fn check(label: &str, case: &Case, actual: &Outcome, expected: &Outcome, toleran
         let expected_window = &expected.window[bank * g.window_bank()..][..g.window_bank()];
         let expected_delta = &expected.delta[bank * g.delta_bank()..][..g.delta_bank()];
         assert!(
-            window.iter().zip(expected_window).all(|(a, e)| a.to_bits() == e.to_bits()),
+            window
+                .iter()
+                .zip(expected_window)
+                .all(|(a, e)| a.to_bits() == e.to_bits()),
             "{label} window bank {bank} differs"
         );
         let tape = &actual.tape[bank * g.tape_bank()..][..g.tape_bank()];
@@ -726,22 +813,37 @@ fn check(label: &str, case: &Case, actual: &Outcome, expected: &Outcome, toleran
         if let Some(recorded) = recorded {
             let (max, rms) = errors(delta, expected_delta);
             println!("{label} delta bank {bank}: max/rms {max:.3e} rms/rms {rms:.3e}");
-            assert!(max <= tolerance.0 && rms <= tolerance.1, "{label} state error {max} {rms}");
+            assert!(
+                max <= tolerance.0 && rms <= tolerance.1,
+                "{label} state error {max} {rms}"
+            );
             if recorded > 0 {
                 let expected_tape = &expected.tape[bank * g.tape_bank()..][..recorded];
                 let (max, rms) = errors(&tape[..recorded], expected_tape);
                 println!("{label} tape bank {bank}: max/rms {max:.3e} rms/rms {rms:.3e}");
-                assert!(max <= tolerance.0 && rms <= tolerance.1, "{label} tape error {max} {rms}");
+                assert!(
+                    max <= tolerance.0 && rms <= tolerance.1,
+                    "{label} tape error {max} {rms}"
+                );
             }
             assert!(
-                tape[recorded..].iter().zip(&original_tape[recorded..]).all(|(a, e)| a.to_bits() == e.to_bits()),
+                tape[recorded..]
+                    .iter()
+                    .zip(&original_tape[recorded..])
+                    .all(|(a, e)| a.to_bits() == e.to_bits()),
                 "{label} wrote tape rows of bank {bank} past its recorded rows"
             );
         } else {
             let original = &case.delta[bank * g.delta_bank()..][..g.delta_bank()];
             assert!(
-                delta.iter().zip(original).all(|(a, e)| a.to_bits() == e.to_bits())
-                    && tape.iter().zip(original_tape).all(|(a, e)| a.to_bits() == e.to_bits()),
+                delta
+                    .iter()
+                    .zip(original)
+                    .all(|(a, e)| a.to_bits() == e.to_bits())
+                    && tape
+                        .iter()
+                        .zip(original_tape)
+                        .all(|(a, e)| a.to_bits() == e.to_bits()),
                 "{label} wrote bank {bank}, which is not a successor"
             );
         }
@@ -762,7 +864,9 @@ fn devices() -> Vec<Device> {
         .open_backend(BackendName::Metal)
         .ok()
         .into_iter()
-        .chain(std::iter::once(catalog.open_backend(BackendName::Cpu).unwrap()))
+        .chain(std::iter::once(
+            catalog.open_backend(BackendName::Cpu).unwrap(),
+        ))
         .collect()
 }
 
@@ -790,16 +894,34 @@ fn small_cases() -> Vec<(&'static str, Case)> {
         ),
         (
             "short slots shorter than the window, padded rows",
-            Case::new(SMALL, 8, vec![slot(2, 2, 1, 4), slot(1, 1, 2, 5), slot(3, 3, 0, 3)], true, 2),
+            Case::new(
+                SMALL,
+                8,
+                vec![slot(2, 2, 1, 4), slot(1, 1, 2, 5), slot(3, 3, 0, 3)],
+                true,
+                2,
+            ),
         ),
         (
             "interior stop rows and a zero stop",
-            Case::new(SMALL, 16, vec![slot(7, 4, 1, 3), slot(5, 0, 2, 4), slot(4, 1, 1, 5)], false, 3),
+            Case::new(
+                SMALL,
+                16,
+                vec![slot(7, 4, 1, 3), slot(5, 0, 2, 4), slot(4, 1, 1, 5)],
+                false,
+                3,
+            ),
         ),
         (
             "pieces across slots with a stop inside a piece and resets",
-            Case::new(SMALL, 128, vec![slot(70, 33, 1, 4), slot(45, 45, 2, 3)], true, 4)
-                .with_resets(&[5, 40, 71, 100]),
+            Case::new(
+                SMALL,
+                128,
+                vec![slot(70, 33, 1, 4), slot(45, 45, 2, 3)],
+                true,
+                4,
+            )
+            .with_resets(&[5, 40, 71, 100]),
         ),
     ]
 }
@@ -819,13 +941,31 @@ fn step_and_chunk_match_the_portable_body_on(device: &Device) {
         let host = case.host();
         // The f64 host model and the interpreted body agree closely; this
         // pins the host model used for the real geometry below.
-        check(&format!("{label}: host vs body"), &case, &host, &oracle, (1e-4, 1e-5));
+        check(
+            &format!("{label}: host vs body"),
+            &case,
+            &host,
+            &oracle,
+            (1e-4, 1e-5),
+        );
         let step = case.native(device, Element::f32(), None);
-        check(&format!("{label}: step"), &case, &step, &oracle, (2e-5, 2e-6));
+        check(
+            &format!("{label}: step"),
+            &case,
+            &step,
+            &oracle,
+            (2e-5, 2e-6),
+        );
         for rows in CHUNK_ROWS {
             let rows = rows.min(case.geometry.width as u64);
             let chunked = case.native(device, Element::f32(), Some(rows));
-            check(&format!("{label}: chunk ROWS {rows}"), &case, &chunked, &oracle, (5e-4, 2e-5));
+            check(
+                &format!("{label}: chunk ROWS {rows}"),
+                &case,
+                &chunked,
+                &oracle,
+                (5e-4, 2e-5),
+            );
         }
     }
 }
@@ -834,23 +974,43 @@ fn step_and_chunk_match_the_portable_body_on(device: &Device) {
 /// with tape rows, record the rows after their stop row (fewer, exactly, or
 /// more than T), in short and chunked slots, grouped or not.
 fn tape_cases() -> Vec<(&'static str, Case)> {
-    let geometry = Geometry { banks: 7, tape: 3, ..SMALL };
-    let version = |rows, stop, previous, following, taped| SlotCase { rows, stop, previous, following, taped };
+    let geometry = Geometry {
+        banks: 7,
+        tape: 3,
+        ..SMALL
+    };
+    let version = |rows, stop, previous, following, taped| SlotCase {
+        rows,
+        stop,
+        previous,
+        following,
+        taped,
+    };
     vec![
         (
             "verify slots from tape versions",
             Case::new(
                 geometry,
                 16,
-                vec![version(4, 1, 1, 4, 2), version(6, 2, 2, 5, 0), version(3, 3, 3, 6, 3)],
+                vec![
+                    version(4, 1, 1, 4, 2),
+                    version(6, 2, 2, 5, 0),
+                    version(3, 3, 3, 6, 3),
+                ],
                 false,
                 51,
             ),
         ),
         (
             "chunked slots with tails, from tape versions",
-            Case::new(geometry, 64, vec![version(40, 35, 1, 4, 1), version(20, 20, 2, 5, 3)], true, 52)
-                .with_resets(&[7, 45]),
+            Case::new(
+                geometry,
+                64,
+                vec![version(40, 35, 1, 4, 1), version(20, 20, 2, 5, 3)],
+                true,
+                52,
+            )
+            .with_resets(&[7, 45]),
         ),
     ]
 }
@@ -858,28 +1018,55 @@ fn tape_cases() -> Vec<(&'static str, Case)> {
 /// A committed tape version (bank, j) equals a run that published after those
 /// rows: the next advance from either has the same bits. `run` executes a
 /// case on one entry; the tentative advance is a 5-row verify slot (stop 1).
-fn tape_versions_equal_stopped_runs(label: &str, geometry: Geometry, run: &dyn Fn(&Case) -> Outcome) {
+fn tape_versions_equal_stopped_runs(
+    label: &str,
+    geometry: Geometry,
+    run: &dyn Fn(&Case) -> Outcome,
+) {
     let verify = 5;
-    let g = Geometry { banks: 4, tape: verify - 1, ..geometry };
+    let g = Geometry {
+        banks: 4,
+        tape: verify - 1,
+        ..geometry
+    };
     for accepted in 0..verify {
-        let tentative = Case::new(g, verify, vec![slot(verify, 1, 1, 2)], true, 41).with_bf16_activations();
+        let tentative =
+            Case::new(g, verify, vec![slot(verify, 1, 1, 2)], true, 41).with_bf16_activations();
         let first = run(&tentative);
-        let next = SlotCase { rows: 3, stop: 3, previous: 2, following: 3, taped: accepted };
+        let next = SlotCase {
+            rows: 3,
+            stop: 3,
+            previous: 2,
+            following: 3,
+            taped: accepted,
+        };
         let continued = tentative.continued(&first, 3, vec![next], 42);
         let from_tape = run(&continued);
-        let stopped = Case::new(g, verify, vec![slot(verify, 1 + accepted, 1, 2)], true, 41).with_bf16_activations();
+        let stopped = Case::new(g, verify, vec![slot(verify, 1 + accepted, 1, 2)], true, 41)
+            .with_bf16_activations();
         let reference_first = run(&stopped);
         let reference = stopped.continued(&reference_first, 3, vec![slot(3, 3, 2, 3)], 42);
         let expected = run(&reference);
         let bank = |values: &[f32], size: usize| values[3 * size..4 * size].to_vec();
         assert!(
-            from_tape.mixed.iter().zip(&expected.mixed).all(|(a, b)| a.to_bits() == b.to_bits())
+            from_tape
+                .mixed
+                .iter()
+                .zip(&expected.mixed)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
                 && bank(&from_tape.delta, g.delta_bank()) == bank(&expected.delta, g.delta_bank())
-                && bank(&from_tape.window, g.window_bank()) == bank(&expected.window, g.window_bank()),
+                && bank(&from_tape.window, g.window_bank())
+                    == bank(&expected.window, g.window_bank()),
             "{label}: version (bank, {accepted}) differs from a run that stopped after {} rows",
             1 + accepted
         );
-        check(&format!("{label}: from version (bank, {accepted})"), &continued, &from_tape, &continued.host(), (1.5e-2, 3e-3));
+        check(
+            &format!("{label}: from version (bank, {accepted})"),
+            &continued,
+            &from_tape,
+            &continued.host(),
+            (1.5e-2, 3e-3),
+        );
     }
 }
 
@@ -895,12 +1082,30 @@ fn tape_cases_match_the_portable_body_on(device: &Device) {
     for (label, case) in tape_cases() {
         let label = format!("{backend} {label}");
         let oracle = case.oracle();
-        check(&format!("{label}: host vs body"), &case, &case.host(), &oracle, (1e-4, 1e-5));
-        check(&format!("{label}: step"), &case, &case.native(device, Element::f32(), None), &oracle, (2e-5, 2e-6));
+        check(
+            &format!("{label}: host vs body"),
+            &case,
+            &case.host(),
+            &oracle,
+            (1e-4, 1e-5),
+        );
+        check(
+            &format!("{label}: step"),
+            &case,
+            &case.native(device, Element::f32(), None),
+            &oracle,
+            (2e-5, 2e-6),
+        );
         for rows in CHUNK_ROWS {
             let rows = rows.min(case.geometry.width as u64);
             let chunked = case.native(device, Element::f32(), Some(rows));
-            check(&format!("{label}: chunk ROWS {rows}"), &case, &chunked, &oracle, (5e-4, 2e-5));
+            check(
+                &format!("{label}: chunk ROWS {rows}"),
+                &case,
+                &chunked,
+                &oracle,
+                (5e-4, 2e-5),
+            );
         }
     }
 }
@@ -913,7 +1118,14 @@ fn tape_versions_equal_runs_that_stopped_there() {
 }
 
 fn tape_versions_equal_runs_that_stopped_there_on(device: &Device) {
-    let qwen = Geometry { key_heads: 16, value_heads: 32, width: 128, convolution: 4, banks: 4, tape: 0 };
+    let qwen = Geometry {
+        key_heads: 16,
+        value_heads: 32,
+        width: 128,
+        convolution: 4,
+        banks: 4,
+        tape: 0,
+    };
     let backend = device.backend().as_str();
     for geometry in [SMALL, qwen] {
         tape_versions_equal_stopped_runs(&format!("{backend} step"), geometry, &|case| {
@@ -938,12 +1150,20 @@ fn step_row_block_never_changes_bits_and_stop_equals_a_shorter_run_on(device: &D
     let mut reference = None;
     for rows in [16u64, 32] {
         let mut t = full.tensors(device, Element::f32());
-        let mixed = full.native_step(device, Element::f32(), rows).call(t.step_args(&full)).unwrap().value;
+        let mixed = full
+            .native_step(device, Element::f32(), rows)
+            .call(t.step_args(&full))
+            .unwrap()
+            .value;
         let outcome = (read(&mixed), read(&t.window), read(&t.delta));
         match &reference {
             None => reference = Some(outcome),
             Some(reference) => assert!(
-                reference.0.iter().zip(&outcome.0).all(|(a, b)| a.to_bits() == b.to_bits())
+                reference
+                    .0
+                    .iter()
+                    .zip(&outcome.0)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
                     && reference.2 == outcome.2,
                 "ROWS={rows} changed result bits"
             ),
@@ -957,11 +1177,19 @@ fn step_row_block_never_changes_bits_and_stop_equals_a_shorter_run_on(device: &D
     prefix.projection.truncate(3 * SMALL.projection_width());
     let short = prefix.native(device, Element::f32(), None);
     assert!(
-        short.delta.iter().zip(&full_delta).all(|(a, b)| a.to_bits() == b.to_bits()),
+        short
+            .delta
+            .iter()
+            .zip(&full_delta)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
         "stop-row state differs from the state of a shorter run"
     );
     assert!(
-        short.window.iter().zip(&full_window).all(|(a, b)| a.to_bits() == b.to_bits()),
+        short
+            .window
+            .iter()
+            .zip(&full_window)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
         "stop-row window differs from the window of a shorter run"
     );
 }
@@ -985,20 +1213,40 @@ fn real_4b_geometry_step_and_chunk_agree_with_the_host_model_on(device: &Device)
     };
     for (label, rows, slots) in [
         ("decode, one slot", 1, vec![slot(1, 1, 1, 3)]),
-        ("verify, two slots", 8, vec![slot(4, 2, 1, 3), slot(3, 3, 0, 4)]),
+        (
+            "verify, two slots",
+            8,
+            vec![slot(4, 2, 1, 3), slot(3, 3, 0, 4)],
+        ),
         ("prefill 128", 128, vec![slot(128, 128, 1, 3)]),
-        ("prefill 512, two slots", 512, vec![slot(300, 211, 1, 3), slot(212, 212, 2, 4)]),
+        (
+            "prefill 512, two slots",
+            512,
+            vec![slot(300, 211, 1, 3), slot(212, 212, 2, 4)],
+        ),
     ] {
         let label = format!("{backend} {label}");
         let case = Case::new(geometry, rows, slots, false, 21).with_bf16_activations();
         let host = case.host();
         let step = case.native(device, Element::bf16(), None);
-        check(&format!("4B {label}: step"), &case, &step, &host, (1e-4, 3e-3));
+        check(
+            &format!("4B {label}: step"),
+            &case,
+            &step,
+            &host,
+            (1e-4, 3e-3),
+        );
         if rows >= 16 {
             let mut reference: Option<Outcome> = None;
             for rows in CHUNK_ROWS {
                 let chunked = case.native(device, Element::bf16(), Some(rows));
-                check(&format!("4B {label}: chunk ROWS {rows}"), &case, &chunked, &host, (1e-3, 3e-3));
+                check(
+                    &format!("4B {label}: chunk ROWS {rows}"),
+                    &case,
+                    &chunked,
+                    &host,
+                    (1e-3, 3e-3),
+                );
                 let (max, rms) = errors(&chunked.mixed, &step.mixed);
                 println!("4B {label}: chunk ROWS {rows} vs step: max {max:.3e} rms {rms:.3e}");
                 // Both are within one BF16 ulp of the host model per element
@@ -1008,8 +1256,16 @@ fn real_4b_geometry_step_and_chunk_agree_with_the_host_model_on(device: &Device)
                 // ROWS never changes result bits.
                 match &reference {
                     Some(reference) => assert!(
-                        reference.mixed.iter().zip(&chunked.mixed).all(|(a, b)| a.to_bits() == b.to_bits())
-                            && reference.delta.iter().zip(&chunked.delta).all(|(a, b)| a.to_bits() == b.to_bits()),
+                        reference
+                            .mixed
+                            .iter()
+                            .zip(&chunked.mixed)
+                            .all(|(a, b)| a.to_bits() == b.to_bits())
+                            && reference
+                                .delta
+                                .iter()
+                                .zip(&chunked.delta)
+                                .all(|(a, b)| a.to_bits() == b.to_bits()),
                         "4B {label}: chunk ROWS {rows} changed result bits"
                     ),
                     None => reference = Some(chunked),
@@ -1031,8 +1287,21 @@ fn chunk_short_slots_get_the_step_bits() {
 
 fn chunk_short_slots_get_the_step_bits_on(device: &Device) {
     let backend = device.backend().as_str();
-    let geometry = Geometry { key_heads: 16, value_heads: 32, width: 128, convolution: 4, banks: 11, tape: 0 };
-    let slots = vec![slot(4, 1, 1, 6), slot(16, 9, 2, 7), slot(40, 40, 3, 8), slot(1, 1, 4, 9), slot(7, 0, 5, 10)];
+    let geometry = Geometry {
+        key_heads: 16,
+        value_heads: 32,
+        width: 128,
+        convolution: 4,
+        banks: 11,
+        tape: 0,
+    };
+    let slots = vec![
+        slot(4, 1, 1, 6),
+        slot(16, 9, 2, 7),
+        slot(40, 40, 3, 8),
+        slot(1, 1, 4, 9),
+        slot(7, 0, 5, 10),
+    ];
     let case = Case::new(geometry, 70, slots, false, 31).with_bf16_activations();
     let step = case.native(device, Element::bf16(), None);
     let host = case.host();
@@ -1046,22 +1315,37 @@ fn chunk_short_slots_get_the_step_bits_on(device: &Device) {
             if s.rows > 16 {
                 continue;
             }
-            let bank = s.following * geometry.delta_bank()..(s.following + 1) * geometry.delta_bank();
+            let bank =
+                s.following * geometry.delta_bank()..(s.following + 1) * geometry.delta_bank();
             assert!(
-                step.mixed[range.clone()].iter().zip(&chunk.mixed[range]).all(|(a, b)| a.to_bits() == b.to_bits())
-                    && step.delta[bank.clone()].iter().zip(&chunk.delta[bank]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                step.mixed[range.clone()]
+                    .iter()
+                    .zip(&chunk.mixed[range])
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+                    && step.delta[bank.clone()]
+                        .iter()
+                        .zip(&chunk.delta[bank])
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
                 "{backend} chunk ROWS {rows}: a {}-row slot differs from the step",
                 s.rows
             );
         }
-        check(&format!("{backend} 4B verify mix: chunk ROWS {rows}"), &case, &chunk, &host, (1e-3, 3e-3));
+        check(
+            &format!("{backend} 4B verify mix: chunk ROWS {rows}"),
+            &case,
+            &chunk,
+            &host,
+            (1e-3, 3e-3),
+        );
     }
 }
 
 /// The median device time (µs) of each launch of the calls `run` makes, each
 /// launch in its own timed unit, joined as "a + b".
 fn launch_medians(device: &Device, run: impl FnOnce()) -> String {
-    let trace = device.trace_submissions(seismic::TraceDetail::Launches).unwrap();
+    let trace = device
+        .trace_submissions(seismic::TraceDetail::Launches)
+        .unwrap();
     run();
     let mut launches: Vec<Vec<f64>> = Vec::new();
     for submission in trace.collect().unwrap() {
@@ -1102,7 +1386,11 @@ fn metal_recurrent_timings() {
     let slot = |rows, previous, following| slot(rows, rows, previous, following);
     for (label, rows, slots) in [
         ("step 1 row", 1usize, vec![slot(1, 1, 2)]),
-        ("step 8 slots x 1 row", 8, (0..8).map(|s| slot(1, 1 + s, 9 + s)).collect::<Vec<_>>()),
+        (
+            "step 8 slots x 1 row",
+            8,
+            (0..8).map(|s| slot(1, 1 + s, 9 + s)).collect::<Vec<_>>(),
+        ),
         ("step 4 rows", 4, vec![slot(4, 1, 2)]),
         ("step 8 rows", 8, vec![slot(8, 1, 2)]),
         ("step 16 rows", 16, vec![slot(16, 1, 2)]),

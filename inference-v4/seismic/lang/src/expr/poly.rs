@@ -755,8 +755,14 @@ pub(crate) fn natural_difference(arena: &mut ExprArena, a: NatExpr, b: NatExpr) 
     let left = normalize_shared(arena, AnyExpr::Nat(a), &mut memo);
     let right = normalize_shared(arena, AnyExpr::Nat(b), &mut memo);
     let difference = left.sub(&right);
-    let natural = difference.terms.values().all(|coefficient| *coefficient >= 0)
-        && difference.atoms().iter().all(|atom| natural_atom(arena, atom));
+    let natural = difference
+        .terms
+        .values()
+        .all(|coefficient| *coefficient >= 0)
+        && difference
+            .atoms()
+            .iter()
+            .all(|atom| natural_atom(arena, atom));
     (natural && cancels(&left, &right, &difference) && rebuildable(arena, &difference))
         .then(|| intern_nat(arena, &difference))
 }
@@ -783,7 +789,11 @@ pub(crate) fn integer_sum(
     let mut memo = HashMap::new();
     let left = normalize_shared(arena, AnyExpr::Int(a), &mut memo);
     let right = normalize_shared(arena, AnyExpr::Int(b), &mut memo);
-    let sum = if negate_right { left.sub(&right) } else { left.add(&right) };
+    let sum = if negate_right {
+        left.sub(&right)
+    } else {
+        left.add(&right)
+    };
     (cancels(&left, &right, &sum) && rebuildable(arena, &sum)).then(|| intern(arena, &sum))
 }
 
@@ -815,7 +825,10 @@ mod tests {
         let difference = arena.nat_sub(n, m);
         assert!(matches!(
             arena.view(AnyExpr::Nat(difference)),
-            NodeView::Binary { op: crate::expr::BinaryOp::Sub, .. }
+            NodeView::Binary {
+                op: crate::expr::BinaryOp::Sub,
+                ..
+            }
         ));
         assert!(!arena.is_total(AnyExpr::Nat(difference)));
     }
@@ -830,7 +843,10 @@ mod tests {
         let difference = arena.nat_sub(partial, partial);
         assert!(matches!(
             arena.view(AnyExpr::Nat(difference)),
-            NodeView::Binary { op: crate::expr::BinaryOp::Sub, .. }
+            NodeView::Binary {
+                op: crate::expr::BinaryOp::Sub,
+                ..
+            }
         ));
         assert!(!arena.is_total(AnyExpr::Nat(difference)));
     }
@@ -846,12 +862,18 @@ mod tests {
         // `i + i - g` keeps `i`, so it is not rebuilt.
         assert!(matches!(
             arena.view(AnyExpr::Int(difference)),
-            NodeView::Binary { op: crate::expr::BinaryOp::Sub, .. }
+            NodeView::Binary {
+                op: crate::expr::BinaryOp::Sub,
+                ..
+            }
         ));
         let cancelled = arena.int_sub(twice, i);
         assert!(matches!(
             arena.view(AnyExpr::Int(cancelled)),
-            NodeView::Binary { op: crate::expr::BinaryOp::Sub, .. }
+            NodeView::Binary {
+                op: crate::expr::BinaryOp::Sub,
+                ..
+            }
         ));
         let one = arena.int(1);
         let shifted = arena.int_add(g, one);

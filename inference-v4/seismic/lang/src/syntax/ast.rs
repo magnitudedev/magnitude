@@ -151,11 +151,12 @@ impl Decl {
 /// ```text
 /// native NAME for TARGET from "SOURCE":
 ///     static (DIM, ..)
-///     params ([arithmetic] NAME in [V, ..], ..)
+///     params ([code] [arithmetic] NAME in [V, ..], ..)
 ///     elements (ELEMENT in [DTYPE, ..], ..)
 ///     where CONDITION
 ///     scratch NAME bytes (EXPR) [when CONDITION]
 ///     launch KERNEL [when CONDITION]:
+///         params ([code] [arithmetic] NAME in [V, ..], ..)
 ///         threadgroups (X, Y, Z)
 ///         threads_per_threadgroup (X, Y, Z)
 ///         shared_bytes (EXPR)
@@ -185,6 +186,9 @@ pub struct NativeDecl {
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeParamDecl {
     pub name: Ident,
+    /// The parameter changes generated kernel code rather than only launch
+    /// geometry or runtime arguments.
+    pub code: bool,
     /// The parameter changes the arithmetic order of a row's result.
     pub arithmetic: bool,
     pub values: Vec<u64>,
@@ -216,6 +220,10 @@ pub struct NativeLaunchDecl {
     pub kernel: Ident,
     /// The launch runs only when this condition holds.
     pub when: Option<Expr>,
+    /// Parameters local to this launch; names may be reused by other launches.
+    pub params: Vec<NativeParamDecl>,
+    /// Entry parameters read by the kernel but absent from launch expressions.
+    pub reads: Vec<Ident>,
     pub threadgroups: [Expr; 3],
     pub threads_per_threadgroup: [Expr; 3],
     pub shared_bytes: Option<Expr>,

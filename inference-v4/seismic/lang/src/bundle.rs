@@ -34,7 +34,9 @@
 
 use crate::check::ir::{Definition, Family};
 use crate::checked::internals::Module;
-use crate::checked::{check_source, CheckedModule, EntryInfo, NativeImplementation, SourceFile, SourceSet};
+use crate::checked::{
+    check_source, CheckedModule, EntryInfo, NativeImplementation, SourceFile, SourceSet,
+};
 use crate::registry::BackendName;
 use crate::wire::{self, Scope};
 use serde::{Deserialize, Serialize};
@@ -113,9 +115,17 @@ pub fn decode_checked_bundle(bytes: &[u8]) -> Result<CheckedModule, CheckedBundl
             .map_err(|_| wire::WireError("checked section does not decode"))
     })
     .map_err(|_| CheckedBundleError::Corrupt)?;
-    let files = frame.files.into_iter().map(|(path, text)| SourceFile { path, text }).collect();
+    let files = frame
+        .files
+        .into_iter()
+        .map(|(path, text)| SourceFile { path, text })
+        .collect();
     let module = parts
-        .into_module(decoded, crate::ids::ModuleHash::new(frame.semantic_hash), SourceSet::new(files))
+        .into_module(
+            decoded,
+            crate::ids::ModuleHash::new(frame.semantic_hash),
+            SourceSet::new(files),
+        )
         .ok_or(CheckedBundleError::Corrupt)?;
     with_assets(CheckedModule::decoded(module), frame.assets)
 }
@@ -125,9 +135,16 @@ pub fn decode_checked_bundle(bytes: &[u8]) -> Result<CheckedModule, CheckedBundl
 /// checked section. A source section that fails to check is `Corrupt`.
 pub fn check_bundle_sources(bytes: &[u8]) -> Result<CheckedModule, CheckedBundleError> {
     let frame = Frame::read(verified(bytes)?)?;
-    let files = frame.files.into_iter().map(|(path, text)| SourceFile { path, text }).collect();
+    let files = frame
+        .files
+        .into_iter()
+        .map(|(path, text)| SourceFile { path, text })
+        .collect();
     let sources = SourceSet::new(files);
-    let canonical = sources.clone().canonicalized().map_err(|_| CheckedBundleError::Corrupt)?;
+    let canonical = sources
+        .clone()
+        .canonicalized()
+        .map_err(|_| CheckedBundleError::Corrupt)?;
     if canonical != sources {
         return Err(CheckedBundleError::Corrupt);
     }
@@ -143,7 +160,10 @@ pub fn check_bundle_sources(bytes: &[u8]) -> Result<CheckedModule, CheckedBundle
 
 /// The payload of a bundle whose checksum trailer matches.
 fn verified(bytes: &[u8]) -> Result<&[u8], CheckedBundleError> {
-    let split = bytes.len().checked_sub(32).ok_or(CheckedBundleError::Corrupt)?;
+    let split = bytes
+        .len()
+        .checked_sub(32)
+        .ok_or(CheckedBundleError::Corrupt)?;
     let (payload, checksum) = bytes.split_at(split);
     if Sha256::digest(payload)[..] != *checksum {
         return Err(CheckedBundleError::HashMismatch);
@@ -156,7 +176,9 @@ fn with_assets(
     assets: Vec<(String, BackendName, String)>,
 ) -> Result<CheckedModule, CheckedBundleError> {
     for (name, backend, source) in assets {
-        let entry = module.entry_named(&name).ok_or(CheckedBundleError::Corrupt)?;
+        let entry = module
+            .entry_named(&name)
+            .ok_or(CheckedBundleError::Corrupt)?;
         if module.native_asset(entry, backend).is_some() {
             return Err(CheckedBundleError::Corrupt);
         }
@@ -236,12 +258,19 @@ impl CheckedParts {
         let valid = within(decoded.entries, entries.len())
             && within(decoded.functions, definitions.len())
             && within(decoded.families, families.len())
-            && entries.iter().enumerate().all(|(ordinal, entry)| entry.id.index() == ordinal)
+            && entries
+                .iter()
+                .enumerate()
+                .all(|(ordinal, entry)| entry.id.index() == ordinal)
             && unique(entries.iter().map(|entry| entry.name.as_str()))
             && unique(entries.iter().map(|entry| entry.stable))
             && entry_families.len() == entries.len()
             && entry_families.iter().all(|family| *family < families.len())
-            && unique(native_implementations.iter().map(|native| (native.entry, native.backend)));
+            && unique(
+                native_implementations
+                    .iter()
+                    .map(|native| (native.entry, native.backend)),
+            );
         if !valid {
             return None;
         }
@@ -278,7 +307,10 @@ impl CheckedParts {
             entries,
             native_implementations,
             entry_families,
-            definitions: definitions.into_iter().map(|(definition, _)| definition).collect(),
+            definitions: definitions
+                .into_iter()
+                .map(|(definition, _)| definition)
+                .collect(),
             families: families.into_iter().map(|(family, _)| family).collect(),
         })
     }
@@ -317,10 +349,12 @@ impl<'a> Frame<'a> {
         }
         let source_hash = reader.digest()?;
         let semantic_hash = reader.digest()?;
-        let files = reader.counted(|reader| Ok((reader.string()?.to_owned(), reader.string()?.to_owned())))?;
+        let files = reader
+            .counted(|reader| Ok((reader.string()?.to_owned(), reader.string()?.to_owned())))?;
         let assets = reader.counted(|reader| {
             let entry = reader.string()?.to_owned();
-            let backend = BackendName::parse(reader.string()?).ok_or(CheckedBundleError::Corrupt)?;
+            let backend =
+                BackendName::parse(reader.string()?).ok_or(CheckedBundleError::Corrupt)?;
             Ok((entry, backend, reader.string()?.to_owned()))
         })?;
         let length = usize::try_from(reader.u64()?).map_err(|_| CheckedBundleError::Corrupt)?;
@@ -368,14 +402,22 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     fn take(&mut self, length: usize) -> Result<&'a [u8], CheckedBundleError> {
-        let end = self.offset.checked_add(length).ok_or(CheckedBundleError::Corrupt)?;
-        let value = self.bytes.get(self.offset..end).ok_or(CheckedBundleError::Corrupt)?;
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(CheckedBundleError::Corrupt)?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(CheckedBundleError::Corrupt)?;
         self.offset = end;
         Ok(value)
     }
 
     fn array<const N: usize>(&mut self) -> Result<[u8; N], CheckedBundleError> {
-        self.take(N)?.try_into().map_err(|_| CheckedBundleError::Corrupt)
+        self.take(N)?
+            .try_into()
+            .map_err(|_| CheckedBundleError::Corrupt)
     }
 
     fn u32(&mut self) -> Result<u32, CheckedBundleError> {
@@ -455,7 +497,10 @@ mod tests {
         // Two decodes allocate distinct owners, like two checks of one source.
         assert_ne!(first.entries()[0].id, second.entries()[0].id);
         let twice = first.entry_named("twice").unwrap();
-        assert_eq!(first.native_asset(twice, BackendName::Metal), Some("kernel version one"));
+        assert_eq!(
+            first.native_asset(twice, BackendName::Metal),
+            Some("kernel version one")
+        );
         for info in first.entries() {
             first
                 .entry(info.id, &ElementBindings::default())
@@ -483,7 +528,12 @@ mod tests {
             Some(CheckedBundleError::HashMismatch),
             "the header's source hash no longer matches"
         );
-        let hash_at = 8 + 4 + 4 + COMPILER_SEMANTIC_VERSION.len() + 4 + crate::registry::REGISTRY_REVISION.len();
+        let hash_at = 8
+            + 4
+            + 4
+            + COMPILER_SEMANTIC_VERSION.len()
+            + 4
+            + crate::registry::REGISTRY_REVISION.len();
         let broken_sources = SourceSet::new(vec![SourceFile {
             path: "snapshot.seismic".into(),
             text: broken,
@@ -491,7 +541,10 @@ mod tests {
         bytes[hash_at..hash_at + 32].copy_from_slice(&source_hash(&broken_sources));
         let bytes = resealed(bytes);
         assert!(decode_checked_bundle(&bytes).is_ok());
-        assert_eq!(check_bundle_sources(&bytes).err(), Some(CheckedBundleError::Corrupt));
+        assert_eq!(
+            check_bundle_sources(&bytes).err(),
+            Some(CheckedBundleError::Corrupt)
+        );
     }
 
     #[test]
@@ -508,13 +561,25 @@ mod tests {
     #[test]
     fn corruption_and_incompatible_wire_fail_closed() {
         let encoded = encode_checked_bundle(&checked());
-        assert_eq!(decode_checked_bundle(&[]).err(), Some(CheckedBundleError::Corrupt));
-        assert_eq!(decode_checked_bundle(&encoded[..31]).err(), Some(CheckedBundleError::Corrupt));
+        assert_eq!(
+            decode_checked_bundle(&[]).err(),
+            Some(CheckedBundleError::Corrupt)
+        );
+        assert_eq!(
+            decode_checked_bundle(&encoded[..31]).err(),
+            Some(CheckedBundleError::Corrupt)
+        );
         let truncated = resealed(encoded[..encoded.len() - 40].to_vec());
-        assert_eq!(decode_checked_bundle(&truncated).err(), Some(CheckedBundleError::Corrupt));
+        assert_eq!(
+            decode_checked_bundle(&truncated).err(),
+            Some(CheckedBundleError::Corrupt)
+        );
         let mut flipped = encoded.clone();
         flipped[encoded.len() / 2] ^= 1;
-        assert_eq!(decode_checked_bundle(&flipped).err(), Some(CheckedBundleError::HashMismatch));
+        assert_eq!(
+            decode_checked_bundle(&flipped).err(),
+            Some(CheckedBundleError::HashMismatch)
+        );
         let mut version = encoded.clone();
         version[8..12].copy_from_slice(&3u32.to_le_bytes());
         assert_eq!(

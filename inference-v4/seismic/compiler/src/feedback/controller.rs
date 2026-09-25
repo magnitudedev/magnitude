@@ -331,11 +331,15 @@ impl<O> FeedbackEvaluator<O> {
                 candidate.rejected = true;
                 Ok(None)
             }
-            RealizationAdmission::Pending(crate::evaluation::RealizationPending::NumericalAnalysis) => {
+            RealizationAdmission::Pending(
+                crate::evaluation::RealizationPending::NumericalAnalysis,
+            ) => {
                 self.report.numerical_pending_attempts += 1;
                 Ok(None)
             }
-            RealizationAdmission::Pending(crate::evaluation::RealizationPending::NativeBudget) => Ok(None),
+            RealizationAdmission::Pending(crate::evaluation::RealizationPending::NativeBudget) => {
+                Ok(None)
+            }
         }
     }
 
@@ -1282,8 +1286,8 @@ mod tests {
     use super::super::{InvocationParameter, InvocationScope};
     use super::*;
     use crate::evaluation_session::boundary_tests::domain_with_optional;
-    use crate::realization::demand_driven_tests::registry;
     use crate::preparation_budget::{PlanningBudget, PreparationBudget};
+    use crate::realization::demand_driven_tests::registry;
     use crate::realization::demand_driven_tests::{device, CountingCompiler, FakeTarget};
     use seismic_lang::expr::{compiled::InvocationValues, SymbolValue};
 

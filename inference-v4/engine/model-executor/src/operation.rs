@@ -549,8 +549,14 @@ pub struct RowResult {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    Forward { rows: Vec<RowResult> },
+    Forward {
+        rows: Vec<RowResult>,
+    },
     /// One selection per requested proposal, in chain order.
-    Head { proposals: Vec<Selected> },
-    Encode { features: FeatureRef },
+    Head {
+        proposals: Vec<Selected>,
+    },
+    Encode {
+        features: FeatureRef,
+    },
 }

@@ -61,8 +61,14 @@ fn main() -> ExitCode {
 }
 
 fn load(paths: Vec<PathBuf>, include_std: bool) -> Result<CheckedModule, String> {
-    let prelude = if include_std { seismic_std::sources() } else { SourceSet::default() };
-    seismic_lang::source::load(&paths, prelude).map(|loaded| loaded.module).map_err(|e|e.to_string())
+    let prelude = if include_std {
+        seismic_std::sources()
+    } else {
+        SourceSet::default()
+    };
+    seismic_lang::source::load(&paths, prelude)
+        .map(|loaded| loaded.module)
+        .map_err(|e| e.to_string())
 }
 
 fn print_entries(module: &CheckedModule) {

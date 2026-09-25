@@ -285,7 +285,12 @@ pub(super) fn encoded_bytes(
             .bytes(rows, *last as u64)
             .ok_or("packed tensor size overflow")?,
         RepresentationKind::PackedRows(layout) => layout
-            .bytes(&shape.iter().map(|extent| *extent as u64).collect::<Vec<_>>())
+            .bytes(
+                &shape
+                    .iter()
+                    .map(|extent| *extent as u64)
+                    .collect::<Vec<_>>(),
+            )
             .ok_or("row-layout tensor size overflow or rank below its layout's")?,
         RepresentationKind::External(layout) => rows
             .checked_mul((*last as u64).div_ceil(u64::from(layout.logical_group)))
@@ -315,11 +320,18 @@ fn decode(
                 .div_ceil(layout.group as usize),
         },
         RepresentationKind::PackedRows(layout) => {
-            let extents = shape.iter().map(|extent| *extent as u64).collect::<Vec<_>>();
+            let extents = shape
+                .iter()
+                .map(|extent| *extent as u64)
+                .collect::<Vec<_>>();
             PlaneStorage::Rows {
                 layout,
                 geometry: layout
-                    .geometry(*extents.last().expect("row layout storage has a packing axis"))
+                    .geometry(
+                        *extents
+                            .last()
+                            .expect("row layout storage has a packing axis"),
+                    )
                     .expect("admitted row-layout storage has a row geometry"),
                 extents,
             }
@@ -448,7 +460,11 @@ impl PlaneStorage<'_> {
             } => {
                 let start = (row * packets_per_row + packet) * layout.packet_size as usize
                     + schema.offset as usize;
-                read_bits(&bytes[start..start + schema.bytes_per_group as usize], first as usize, width)
+                read_bits(
+                    &bytes[start..start + schema.bytes_per_group as usize],
+                    first as usize,
+                    width,
+                )
             }
             Self::Rows {
                 layout,
@@ -460,8 +476,12 @@ impl PlaneStorage<'_> {
             }
         };
         match &schema.encoding {
-            PlaneEncoding::Packed { .. } | PlaneEncoding::FloatCode { .. } => ReferenceScalar::U32(raw),
-            PlaneEncoding::Dense(dtype) => read_dense(*dtype, &raw.to_le_bytes()[..dtype.bytes() as usize]),
+            PlaneEncoding::Packed { .. } | PlaneEncoding::FloatCode { .. } => {
+                ReferenceScalar::U32(raw)
+            }
+            PlaneEncoding::Dense(dtype) => {
+                read_dense(*dtype, &raw.to_le_bytes()[..dtype.bytes() as usize])
+            }
         }
     }
 }

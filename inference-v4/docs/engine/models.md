@@ -16,7 +16,7 @@ advances to model-owned Seismic programs.**
 
 ## Loading and weight ownership
 
-- Validate geometry, role coverage, shapes, encoding, and artifact identity before
+- Validate geometry, role coverage, shapes, encoding, and package ownership before
   admitting numerical execution.
 - GGUF and MLX/Safetensors adapters describe source data; they do not select kernels.
 - Express imports, decoding, conversion, and relayout through typed Seismic operations.
@@ -31,7 +31,14 @@ Device-free artifact interpretation is shared by embedded callers, measurement,
 and explicit serving composition. Local MLX/Safetensors directories and GGUF files
 produce the same architecture description and numerical loading contract. Format
 adapters supply tokenizer and template metadata from the corresponding artifact;
-serving does not substitute metadata from a different source. Serving validates tokenizer/projection identity,
+the GGUF package is opened once and shared with its numerical worker. Package and
+component identities are process-local identities of those open files, not content
+digests. A persistent content identity, if needed, comes from acquisition rather
+than a weight scan during engine loading. Host tokenizer and template preparation
+may run while the numerical worker prepares, with readiness published only after
+both sides succeed.
+
+Serving does not substitute metadata from a different source. Serving validates tokenizer/projection identity,
 context and host limits before importing weights, and establishes the execution
 owner's storage budget before numerical loading. Device creation and hardware
 settings belong to the host composition root; loading does not invent a profile.
@@ -69,6 +76,9 @@ compositions. Seismic owns their physical implementations.
   distinct operations. Residual, normalized, projected, and activated compact
   intermediates retain their publication boundaries throughout the block.
 - Packed weights and KV retain their declared decode semantics through computation.
+- Qwen draft head blocks may use dense or routed feed-forward weights. Routed
+  heads use the same expert and shared-expert equations as routed target blocks;
+  they do not require a dense feed-forward width in the artifact header.
 - Fresh K/V participates in the current computation before persistent encoding;
   committed history is interpreted through its selected codec.
 - Codec identity includes packing, metadata precision, and any rotation/codebook

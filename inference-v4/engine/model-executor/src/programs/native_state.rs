@@ -2,13 +2,15 @@
 
 use super::{ReadySubmission, StateProgram};
 use crate::{
-    DeviceError, InvariantError, NativeGraphWorkspaceLease, StateLaunchCore, StateWork,
-    SubmitError, ValidatedStateLaunch, native::AttestedState,
+    native::AttestedState, programs::graph::draft::GraphDraft, DeviceError, InvariantError,
+    NativeGraphWorkspaceLease, StateLaunchCore, StateStorePlan, StateWork, SubmitError,
+    ValidatedStateLaunch,
 };
 use magnitude_model_kernels::copy_rows;
 use seismic::{
-    Device, Element, NativeGraphBindings, NativeGraphFamily, NativeGraphFamilySlot,
-    NativeGraphOutputs, NativeGraphPlan, NativePort, Tensor,
+    BackendName, Device, Element, NativeGraphBindings, NativeGraphFamily, NativeGraphFamilySlot,
+    NativeGraphMetadata, NativeGraphOutputs, NativeGraphPlan, NativeGraphStorageBytes, NativePort,
+    Tensor,
 };
 use std::rc::Rc;
 
@@ -25,6 +27,42 @@ pub struct NativeStateProgram {
     graphs: Rc<PreparedStateCopyGraphs>,
 }
 
+/// The exact state-copy classes prepared for the target and optional head
+/// state planes. Assessment uses this list before opening a device.
+pub(crate) fn state_copy_classes(
+    target: &StateStorePlan,
+    head: Option<&StateStorePlan>,
+    row_classes: &[u64],
+) -> Result<Vec<StateCopyGraphClass>, String> {
+    let mut classes = Vec::new();
+    for state in std::iter::once(target).chain(head) {
+        for component in &state.history_components {
+            for plane in component.planes() {
+                let width = u64::try_from(plane.row_elements)
+                    .map_err(|_| "state plane width exceeds u64")?;
+                let extents = vec![
+                    u64::try_from(state.history_rows)
+                        .map_err(|_| "state history rows exceed u64")?,
+                    1,
+                    width,
+                ];
+                for &rows in row_classes {
+                    let class = StateCopyGraphClass {
+                        element: Element::dense(plane.dtype),
+                        source_extents: extents.clone(),
+                        destination_extents: extents.clone(),
+                        map_rows: rows,
+                    };
+                    if !classes.contains(&class) {
+                        classes.push(class);
+                    }
+                }
+            }
+        }
+    }
+    Ok(classes)
+}
+
 impl NativeStateProgram {
     pub(crate) fn new(graphs: Rc<PreparedStateCopyGraphs>) -> Self {
         Self { graphs }
@@ -39,10 +77,9 @@ impl NativeStateProgram {
         match work {
             StateWork::Copy(advance) => {
                 let binding = advance.bindings();
-                let first = binding
-                    .copies
-                    .first()
-                    .ok_or_else(|| invalid("empty copy mapping"))?;
+                if binding.copies.is_empty() {
+                    return Err(invalid("empty copy mapping"));
+                }
                 let bytes = |indices: &[usize]| {
                     indices
                         .iter()
@@ -136,17 +173,7 @@ impl PreparedStateCopyGraphs {
     ) -> Result<Self, SubmitError> {
         let mut variants = Vec::new();
         for class in classes {
-            if class.map_rows == 0 {
-                return Err(invalid("state copy graph has no mapped rows"));
-            }
-            if class.source_extents.len() != 3 || class.destination_extents.len() != 3 {
-                return Err(invalid("state copy graph requires rank-three planes"));
-            }
-            if class.source_extents[1..] != class.destination_extents[1..] {
-                return Err(invalid(
-                    "state copy graph source and destination plane geometry differ",
-                ));
-            }
+            validate_class(&class).map_err(invalid)?;
             if variants
                 .iter()
                 .any(|variant: &PreparedStateCopyGraph| variant.class == class)
@@ -159,52 +186,9 @@ impl PreparedStateCopyGraphs {
                 .find(|(element, _)| *element == class.element)
                 .map(|(_, kernel)| kernel)
                 .ok_or_else(|| invalid("state copy graph specialization is absent"))?;
-            let mut graph = target_device.native_graph();
-            let source = graph
-                .port(class.element, &class.source_extents)
-                .map_err(device)?;
-            let destination = graph
-                .port(class.element, &class.destination_extents)
-                .map_err(device)?;
-            let from = graph
-                .input_for(
-                    kernel,
-                    "from",
-                    &[
-                        ("N", class.map_rows),
-                        ("TS", class.source_extents[0]),
-                        ("TD", class.destination_extents[0]),
-                        ("KV", class.source_extents[1]),
-                        ("W", class.source_extents[2]),
-                    ],
-                )
-                .map_err(device)?;
-            let to = graph
-                .input_for(
-                    kernel,
-                    "to",
-                    &[
-                        ("N", class.map_rows),
-                        ("TS", class.source_extents[0]),
-                        ("TD", class.destination_extents[0]),
-                        ("KV", class.source_extents[1]),
-                        ("W", class.source_extents[2]),
-                    ],
-                )
-                .map_err(device)?;
-            let mut destination_tensor = destination.tensor().clone();
-            graph
-                .enqueue(
-                    kernel,
-                    copy_rows::WorkflowArgs {
-                        src: source.tensor().into(),
-                        dst: (&mut destination_tensor).into(),
-                        from: from.tensor().into(),
-                        to: to.tensor().into(),
-                    },
-                )
-                .map_err(device)?;
-            let plan = graph.seal().map_err(device)?;
+            let (plan, source, destination, from, to) =
+                copy_graph_topology(target_device.native_graph(), kernel, &class)
+                    .map_err(device)?;
             variants.push(PreparedStateCopyGraph {
                 class,
                 plan,
@@ -235,12 +219,6 @@ impl PreparedStateCopyGraphs {
 
     pub fn family(&self) -> &NativeGraphFamily {
         &self.family
-    }
-
-    pub(crate) fn plans(&self) -> impl Iterator<Item = (&StateCopyGraphClass, &NativeGraphPlan)> {
-        self.variants
-            .iter()
-            .map(|variant| (&variant.class, &variant.plan))
     }
 
     pub(crate) fn plan(
@@ -292,6 +270,71 @@ impl PreparedStateCopyGraphs {
     }
 }
 
+fn validate_class(class: &StateCopyGraphClass) -> Result<(), &'static str> {
+    if class.map_rows == 0 {
+        return Err("state copy graph has no mapped rows");
+    }
+    if class.source_extents.len() != 3 || class.destination_extents.len() != 3 {
+        return Err("state copy graph requires rank-three planes");
+    }
+    if class.source_extents[1..] != class.destination_extents[1..] {
+        return Err("state copy graph source and destination plane geometry differ");
+    }
+    Ok(())
+}
+
+fn copy_graph_topology<'a, G: GraphDraft + 'a>(
+    mut graph: G,
+    entry: G::Binding<'a, copy_rows::Entry>,
+    class: &StateCopyGraphClass,
+) -> Result<(G::Plan, NativePort, NativePort, NativePort, NativePort), String> {
+    let source = graph.port(class.element, &class.source_extents)?;
+    let destination = graph.port(class.element, &class.destination_extents)?;
+    let dimensions = [
+        ("N", class.map_rows),
+        ("TS", class.source_extents[0]),
+        ("TD", class.destination_extents[0]),
+        ("KV", class.source_extents[1]),
+        ("W", class.source_extents[2]),
+    ];
+    let from = graph.input_for(entry, "from", &dimensions)?;
+    let to = graph.input_for(entry, "to", &dimensions)?;
+    let mut destination_tensor = destination.tensor().clone();
+    graph.enqueue::<copy_rows::Entry>(
+        entry,
+        &dimensions,
+        copy_rows::WorkflowArgs {
+            src: source.tensor().into(),
+            dst: (&mut destination_tensor).into(),
+            from: from.tensor().into(),
+            to: to.tensor().into(),
+        },
+    )?;
+    Ok((graph.seal()?, source, destination, from, to))
+}
+
+pub(crate) fn checked_copy_family_storage(
+    backend: BackendName,
+    classes: impl IntoIterator<Item = StateCopyGraphClass>,
+) -> Result<NativeGraphStorageBytes, String> {
+    let mut family: Option<NativeGraphStorageBytes> = None;
+    for class in classes {
+        validate_class(&class).map_err(str::to_owned)?;
+        let elements = [("A", class.element)];
+        let (storage, _, _, _, _) =
+            copy_graph_topology(NativeGraphMetadata::new(backend), &elements, &class)?;
+        match &mut family {
+            Some(maximum) => {
+                maximum.workspace = maximum.workspace.max(storage.workspace);
+                maximum.output = maximum.output.max(storage.output);
+                maximum.upload = maximum.upload.max(storage.upload);
+            }
+            None => family = Some(storage),
+        }
+    }
+    family.ok_or_else(|| "state copy graph family has no classes".into())
+}
+
 impl StateProgram for NativeStateProgram {
     type Submission = ReadySubmission<StateLaunchCore, NativeGraphWorkspaceLease, ()>;
     fn submit(
@@ -307,5 +350,33 @@ impl StateProgram for NativeStateProgram {
         }
         let (core, graph_workspace) = launch.into_submission_parts();
         Ok(ReadySubmission::new(core, graph_workspace, ()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_copy_family_uses_independent_storage_maxima() {
+        let small = StateCopyGraphClass {
+            element: Element::f32(),
+            source_extents: vec![8, 1, 4],
+            destination_extents: vec![8, 1, 4],
+            map_rows: 1,
+        };
+        let large = StateCopyGraphClass {
+            map_rows: 2,
+            ..small.clone()
+        };
+        let family =
+            checked_copy_family_storage(BackendName::Cpu, [small.clone(), large.clone()]).unwrap();
+        let one = checked_copy_family_storage(BackendName::Cpu, [small]).unwrap();
+        let two = checked_copy_family_storage(BackendName::Cpu, [large]).unwrap();
+        assert_eq!(family.workspace, one.workspace.max(two.workspace));
+        assert_eq!(family.output, one.output.max(two.output));
+        assert_eq!(family.upload, one.upload.max(two.upload));
+        assert!(two.upload > one.upload);
+        assert!(family.upload >= 2 * 2 * 4);
     }
 }

@@ -673,8 +673,11 @@ impl CodeInterpretation {
         let value = crate::reference_math::evaluate(
             &recipe,
             &[crate::reference_math::ReferenceScalar::U32(raw)],
-        ).expect("registry code interpretation is total");
-        let crate::reference_math::ReferenceScalar::I32(value) = value else { unreachable!() };
+        )
+        .expect("registry code interpretation is total");
+        let crate::reference_math::ReferenceScalar::I32(value) = value else {
+            unreachable!()
+        };
         value
     }
 }

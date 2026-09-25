@@ -7,10 +7,10 @@
 
 use crate::device::MetalDevice;
 use crate::facts::{
-    ARGUMENT_TABLE_ENTRIES, LanguageVersion, MSL_GRID_INDEX_MAX, MatrixCombination, MetalFacts,
-    MetalFamily, RESERVED_ARGUMENT_ENTRIES,
+    LanguageVersion, MatrixCombination, MetalFacts, MetalFamily, ARGUMENT_TABLE_ENTRIES,
+    MSL_GRID_INDEX_MAX, RESERVED_ARGUMENT_ENTRIES,
 };
-use crate::{BACKEND_REVISION, Metal};
+use crate::{Metal, BACKEND_REVISION};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSProcessInfo, NSString};
 use objc2_metal::{
@@ -28,7 +28,7 @@ use seismic_ir::physical_target::{
     KernelAbiLayout, KernelAbiModel, LocalRealization, LocalRealizationPolicy,
     NumericalEnvironment, TargetLimits, VectorSupport,
 };
-use seismic_lang::registry::{self, BackendName, REGISTRY_REVISION, RepresentationKind};
+use seismic_lang::registry::{self, BackendName, RepresentationKind, REGISTRY_REVISION};
 use seismic_lang::types::DType;
 use seismic_native_target::{CompatibilityIdentity, DeviceDescription};
 use sha2::{Digest, Sha256};
@@ -38,7 +38,9 @@ use std::time::Instant;
 
 pub const PROBE_SUITE_REVISION: &str = "seismic-metal-probes-v2";
 
-fn addressable_resources(_: &MetalFacts) -> Vec<seismic_ir::physical_target::AddressableResourceClass> {
+fn addressable_resources(
+    _: &MetalFacts,
+) -> Vec<seismic_ir::physical_target::AddressableResourceClass> {
     Vec::new()
 }
 

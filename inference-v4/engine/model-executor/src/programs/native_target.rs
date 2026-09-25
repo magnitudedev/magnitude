@@ -3,17 +3,18 @@
 //! and the returned submission owns the launch until completion is observed.
 
 use super::{
-    DeviceSubmission, TargetProgram,
-    native_target_graph::{BlockControlPorts, BlockStatePorts, BoundTargetGraphs, EntryTokens},
-    graph::readout::{BoundTargetReadoutGraphs, ReadoutClass, ReadoutKind, shapes, write_selection},
+    graph::readout::{
+        shapes, write_selection, BoundTargetReadoutGraphs, ReadoutClass, ReadoutKind,
+    },
     graph::recurrent::RECURRENT_COMPONENTS,
+    native_target_graph::{BlockControlPorts, BlockStatePorts, BoundTargetGraphs, EntryTokens},
+    DeviceSubmission, TargetProgram,
 };
 use crate::{
-    ConditioningRef, ConditioningSlice, DeviceError, GraphOutputTensor, InvariantError,
-    NativeGraphOutputLease, NativeGraphWorkspaceLease, SubmitError, TargetGraphOutputLease,
-    TargetGraphWorkspaceLease, TargetLaunchCore, TargetLaunchWorkspace, TargetTokens,
-    ValidatedTargetLaunch,
-    completion::CompletionWaiter, native::AttestedState,
+    completion::CompletionWaiter, native::AttestedState, ConditioningRef, ConditioningSlice,
+    DeviceError, GraphOutputTensor, InvariantError, NativeGraphOutputLease,
+    NativeGraphWorkspaceLease, SubmitError, TargetGraphOutputLease, TargetGraphWorkspaceLease,
+    TargetLaunchCore, TargetLaunchWorkspace, TargetTokens, ValidatedTargetLaunch,
 };
 use magnitude_model_batching::{Demand, TargetBatchUpload};
 use magnitude_model_contracts::{DecoderGeometry, MixerGeometry};
@@ -56,11 +57,9 @@ fn i32_bytes(values: &[i32]) -> Vec<u8> {
 /// Observe every run, even after a failure, so none is still executing when
 /// the caller regains the storage the runs use. The first failure is reported.
 fn wait_all(completions: Vec<NativeGraphCompletion>) -> Result<(), SubmitError> {
-    completions
-        .into_iter()
-        .fold(Ok(()), |outcome, completion| {
-            outcome.and(completion.wait().map_err(device))
-        })
+    completions.into_iter().fold(Ok(()), |outcome, completion| {
+        outcome.and(completion.wait().map_err(device))
+    })
 }
 
 /// Submits a step's runs in sequences of doubling length (1, 2, 4, … runs):
@@ -86,7 +85,10 @@ impl StepSubmitter {
         }
     }
 
-    fn queue(&mut self, ready: seismic::ReadyNativeGraphRun<'_>) -> Result<NativeGraphOutputs, SubmitError> {
+    fn queue(
+        &mut self,
+        ready: seismic::ReadyNativeGraphRun<'_>,
+    ) -> Result<NativeGraphOutputs, SubmitError> {
         let outputs = ready.queue(&mut self.sequence).map_err(device)?;
         self.queued += 1;
         if self.queued == self.limit {
@@ -223,6 +225,10 @@ impl RowState<'_> {
 }
 
 impl NativeTargetProgram {
+    pub(crate) fn constant_bytes(&self) -> Result<u64, &'static str> {
+        self.graphs.constant_bytes()
+    }
+
     pub(crate) fn new(
         device: Device,
         state: AttestedState,
@@ -732,13 +738,8 @@ impl NativeTargetProgram {
             }
         }
         let (readout_workspace, readout_output) = readout;
-        let result = self.graph_readout(
-            batch,
-            &hidden,
-            readout_workspace,
-            readout_output,
-            submitter,
-        )?;
+        let result =
+            self.graph_readout(batch, &hidden, readout_workspace, readout_output, submitter)?;
         let last_commit = Instant::now();
         // Every consumer of the final hidden rows is queued, so its output
         // slot returns to the lease; the device queue orders any reuse.

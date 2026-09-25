@@ -4,9 +4,9 @@
 
 use crate::*;
 use seismic_ir::kernel::{ops::ClosedOpView, Kernel};
+use seismic_ir::physical_target::{KernelEmissionLayout, PhysicalDialect};
 use seismic_ir::schedule::Launch;
 use seismic_ir::storage::LaunchLocalLayout;
-use seismic_ir::physical_target::{KernelEmissionLayout, PhysicalDialect};
 use seismic_lang::expr::ExprArena;
 
 /// Pure backend analytical vocabulary. It declares the complete backend service
@@ -162,8 +162,14 @@ pub fn estimate<B: PhysicalDialect, M: ExecutionModel<B> + ?Sized>(
         for (block, multiplicity) in data.blocks().iter().zip(data.block_multiplicity()) {
             for op in &block.ops {
                 let closed = kernel.closed_op(op, &emission);
-                let cost =
-                    profile.operation_cost(arena, kernel, &emission, launch, local_layout, closed)?;
+                let cost = profile.operation_cost(
+                    arena,
+                    kernel,
+                    &emission,
+                    launch,
+                    local_layout,
+                    closed,
+                )?;
                 let demands = match cost {
                     OperationCost::Demands(demands) => Some(demands),
                     OperationCost::Elided(_) => None,
@@ -201,15 +207,30 @@ pub fn estimate<B: PhysicalDialect, M: ExecutionModel<B> + ?Sized>(
         let mut result = Fragment::empty(arena);
         for step in steps {
             let item = match step {
-                seismic_ir::schedule::ScheduleStep::Imported { body, .. } => sequence(profile, arena, launches, body)?,
-                seismic_ir::schedule::ScheduleStep::BeginAllocationInstance { .. } => Fragment::service(
-                    profile, arena, core(CoreService::AllocationInstance), one,
-                    DemandMode::DependencyLatency, InvocationProvenance::HostSchedule,
-                ),
-                seismic_ir::schedule::ScheduleStep::PublishTensor { .. } | seismic_ir::schedule::ScheduleStep::BindArgumentTensor { .. } => Fragment::service(
-                    profile, arena, core(CoreService::TensorPublication), one,
-                    DemandMode::DependencyLatency, InvocationProvenance::HostSchedule,
-                ),
+                seismic_ir::schedule::ScheduleStep::Imported { body, .. } => {
+                    sequence(profile, arena, launches, body)?
+                }
+                seismic_ir::schedule::ScheduleStep::BeginAllocationInstance { .. } => {
+                    Fragment::service(
+                        profile,
+                        arena,
+                        core(CoreService::AllocationInstance),
+                        one,
+                        DemandMode::DependencyLatency,
+                        InvocationProvenance::HostSchedule,
+                    )
+                }
+                seismic_ir::schedule::ScheduleStep::PublishTensor { .. }
+                | seismic_ir::schedule::ScheduleStep::BindArgumentTensor { .. } => {
+                    Fragment::service(
+                        profile,
+                        arena,
+                        core(CoreService::TensorPublication),
+                        one,
+                        DemandMode::DependencyLatency,
+                        InvocationProvenance::HostSchedule,
+                    )
+                }
                 seismic_ir::schedule::ScheduleStep::Launch(id) => {
                     launches[id.index() as usize].clone()
                 }
@@ -245,7 +266,9 @@ pub fn estimate<B: PhysicalDialect, M: ExecutionModel<B> + ?Sized>(
                     DemandMode::DependencyLatency,
                     InvocationProvenance::HostSchedule,
                 ),
-                seismic_ir::schedule::ScheduleStep::EvaluateHost(_) => return Err(ModelLimitation::HostQuantityWidth),
+                seismic_ir::schedule::ScheduleStep::EvaluateHost(_) => {
+                    return Err(ModelLimitation::HostQuantityWidth)
+                }
                 seismic_ir::schedule::ScheduleStep::Check(_) => Fragment::service(
                     profile,
                     arena,
@@ -343,11 +366,11 @@ mod tests {
     use super::*;
     use seismic_ir::construction::{AllocationPlan, Construction};
     use seismic_ir::kernel::ops::{ConstantValue, ValueType};
-    use seismic_ir::region::Product;
-    use seismic_ir::schedule::RepeatVisits;
     use seismic_ir::physical_target::{
         IntrinsicIdentityBuilder, IntrinsicNumericalSemantics, KernelWordLayout, VectorSupport,
     };
+    use seismic_ir::region::Product;
+    use seismic_ir::schedule::RepeatVisits;
     use seismic_lang::expr::Assignment;
     use seismic_lang::types::DType;
 
@@ -478,10 +501,20 @@ mod tests {
             let outer_end = arena.nat(2);
             let empty = arena.bool(false);
             let outer = construction.begin_value_repeat(
-                &mut arena, 0, outer_start, outer_end, RepeatVisits::Ordered, Product::Unit,
+                &mut arena,
+                0,
+                outer_start,
+                outer_end,
+                RepeatVisits::Ordered,
+                Product::Unit,
             );
             let inner = construction.begin_value_repeat(
-                &mut arena, outer.body(), start, end, RepeatVisits::Ordered, Product::Unit,
+                &mut arena,
+                outer.body(),
+                start,
+                end,
+                RepeatVisits::Ordered,
+                Product::Unit,
             );
             let mut body = construction.schedule(&mut arena, inner.body());
             let id = body.launch(Launch {
@@ -588,7 +621,12 @@ mod tests {
         let complete_a = schedule.launch(launch(complete_kernel));
         let complete_b = schedule.launch(launch(complete_kernel));
         let repeat = construction.begin_value_repeat(
-            &mut arena, 0, zero, two, RepeatVisits::Ordered, Product::Unit,
+            &mut arena,
+            0,
+            zero,
+            two,
+            RepeatVisits::Ordered,
+            Product::Unit,
         );
         construction.schedule(&mut arena, repeat.body()).branch(
             condition,
@@ -613,7 +651,10 @@ mod tests {
         let assessment = estimate(&model, &mut arena, executable.view()).unwrap();
 
         let mut complete_assignment = Assignment::new();
-        complete_assignment.bind(branch_symbol, seismic_lang::expr::SymbolValue::Nat(0u32.into()));
+        complete_assignment.bind(
+            branch_symbol,
+            seismic_lang::expr::SymbolValue::Nat(0u32.into()),
+        );
         let complete_complement = arena
             .eval_duration(assessment.estimate(), &complete_assignment)
             .unwrap();
@@ -623,7 +664,10 @@ mod tests {
         );
 
         let mut incomplete_assignment = Assignment::new();
-        incomplete_assignment.bind(branch_symbol, seismic_lang::expr::SymbolValue::Nat(1u32.into()));
+        incomplete_assignment.bind(
+            branch_symbol,
+            seismic_lang::expr::SymbolValue::Nat(1u32.into()),
+        );
         let total = arena
             .eval_duration(assessment.estimate(), &incomplete_assignment)
             .unwrap();

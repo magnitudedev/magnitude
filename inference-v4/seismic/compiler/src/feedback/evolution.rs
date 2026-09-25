@@ -242,8 +242,8 @@ pub(super) fn finite_coordinates<T: TargetFamily>(
 mod tests {
     use super::*;
     use crate::evaluation_session::boundary_tests::domain_with_optional;
-    use crate::realization::demand_driven_tests::registry;
     use crate::realization::demand_driven_tests::device;
+    use crate::realization::demand_driven_tests::registry;
 
     #[test]
     fn bounded_enumeration_is_complete_or_explicitly_unknown() {
@@ -271,7 +271,14 @@ mod tests {
         let mut random = Random(19);
         assert!(parent.choices().is_empty());
         assert!(propose(&domain, Some(&parent), None, Operator::Mutate, &mut random).is_none());
-        assert!(propose(&domain, Some(&parent), None, Operator::Compound, &mut random).is_none());
+        assert!(propose(
+            &domain,
+            Some(&parent),
+            None,
+            Operator::Compound,
+            &mut random
+        )
+        .is_none());
         let general = domain.canonicalize(domain.universal_proposal()).unwrap();
         for _ in 0..32 {
             let child = propose(

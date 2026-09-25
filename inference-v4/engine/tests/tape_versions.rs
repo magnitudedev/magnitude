@@ -11,7 +11,7 @@
 use magnitude_engine::{
     build_native_domain,
     composition::EngineConfiguration,
-    options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, StoragePolicy},
+    options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection},
 };
 use magnitude_model_executor::{
     platform::DeviceRequest, Demand, ExecutionPath, ExecutorDomain, Operation, Outcome,
@@ -31,7 +31,6 @@ const PROMPT: usize = 40;
 
 fn open_domain() -> Option<(ExecutorDomain, usize)> {
     let model = PathBuf::from(std::env::var_os("MAGNITUDE_TEST_MTP_GGUF")?);
-    let storage_bytes = 8u64 << 30;
     let resolved = EngineConfiguration {
         package: PackageOptions {
             target: model,
@@ -52,11 +51,6 @@ fn open_domain() -> Option<(ExecutorDomain, usize)> {
             decode_share: 0.5,
             locality_seconds: 1.0,
         },
-        storage: StoragePolicy {
-            storage_bytes,
-            retention_bytes: Some(0),
-            safety_reserve_bytes: 1 << 30,
-        },
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
         control_capacity: 64,
@@ -65,7 +59,8 @@ fn open_domain() -> Option<(ExecutorDomain, usize)> {
     .resolve()
     .unwrap();
     let vocabulary = resolved.manifest.definition.geometry.vocabulary as usize;
-    let (domain, _) = build_native_domain(&resolved.manifest).unwrap();
+    let package = resolved.artifacts.shared_package();
+    let (domain, _) = build_native_domain(&resolved.manifest, package).unwrap();
     Some((domain, vocabulary))
 }
 
@@ -115,7 +110,12 @@ fn advance(
         panic!("a forward returns forward rows");
     };
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: accepted })
+        .reconcile(
+            pending,
+            PhysicalDecision {
+                accepted_rows: accepted,
+            },
+        )
         .unwrap();
     sequence.position += accepted;
     rows
@@ -131,7 +131,15 @@ fn continuation(
     (0..steps)
         .map(|_| {
             let token = tokens(vocabulary, sequence.position, 1);
-            let rows = advance(domain, sequence, WorkKind::Decode, token, Demand::LOGITS, 1, 1);
+            let rows = advance(
+                domain,
+                sequence,
+                WorkKind::Decode,
+                token,
+                Demand::LOGITS,
+                1,
+                1,
+            );
             rows[0]
                 .logits
                 .as_ref()
@@ -158,7 +166,15 @@ fn round(
     let rows = 1 + usize::from(PROPOSALS);
     let committed = if taped { 1 } else { accepted };
     let tokens = tokens(vocabulary, sequence.position, rows);
-    advance(domain, sequence, WorkKind::Replay, tokens, Demand::NONE, committed, accepted);
+    advance(
+        domain,
+        sequence,
+        WorkKind::Replay,
+        tokens,
+        Demand::NONE,
+        committed,
+        accepted,
+    );
 }
 
 #[test]
@@ -178,7 +194,15 @@ fn tape_versions_continue_exactly_like_runs_that_stopped_there() {
     let (mut taped, mut stopped) = (open(1), open(2));
     for sequence in [&mut taped, &mut stopped] {
         let prompt = tokens(vocabulary, 0, PROMPT);
-        advance(&mut domain, sequence, WorkKind::Prefill, prompt, Demand::NONE, PROMPT, PROMPT);
+        advance(
+            &mut domain,
+            sequence,
+            WorkKind::Prefill,
+            prompt,
+            Demand::NONE,
+            PROMPT,
+            PROMPT,
+        );
     }
     // Rounds accepting every count the tape can hold, including a version
     // read by the next round (a round directly after a round).
@@ -198,7 +222,10 @@ fn tape_versions_continue_exactly_like_runs_that_stopped_there() {
     round(&mut domain, &mut stopped, vocabulary, false, 4);
     let expected = continuation(&mut domain, &mut stopped, vocabulary, 3);
     let actual = continuation(&mut domain, &mut taped, vocabulary, 3);
-    assert!(expected == actual, "continuation after a 4-row prefix differs");
+    assert!(
+        expected == actual,
+        "continuation after a 4-row prefix differs"
+    );
     domain.close(taped.request).unwrap();
     domain.close(stopped.request).unwrap();
 }

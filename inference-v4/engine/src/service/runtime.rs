@@ -4,9 +4,11 @@ use magnitude_generation::{DetailedUsage, FinishReason, Method, OutputToken};
 use magnitude_model_contracts::PreparedModelInput;
 use magnitude_model_executor::{ExecutorDomain, ProgramFamily, RequestId, ResourcePlan};
 use magnitude_service::{
-    owner::{Owner, Status},
+    owner::{AdmissionError, Owner, Status},
     protocol::{AdmitRequest, CapacityStatus, WorkerCommand, WorkerReply},
-    publication::{Publication, PublicationQueue, PublicationReceiver, PublicationWake},
+    publication::{
+        ModelUnloadCause, Publication, PublicationQueue, PublicationReceiver, PublicationWake,
+    },
     retention::{RetentionKey, RetentionRequest},
     worker::{self, CompletionWake, Drive, Driven, Worker, WorkerWakeHandle},
 };
@@ -25,11 +27,25 @@ pub struct OutputBatch {
 }
 
 struct ExecutionOwner<F: ProgramFamily> {
-    owner: Owner<F>,
+    owner: Option<Owner<F>>,
     method: Arc<dyn Method>,
     wakes: Option<WorkerWakeHandle>,
 }
+impl<F: ProgramFamily> ExecutionOwner<F> {
+    fn shed_unloaded_owner(&mut self) {
+        if self.owner.as_mut().is_some_and(Owner::memory_unload_ready) {
+            self.owner.take();
+        }
+    }
+}
 impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
+    fn periodic(&mut self, now: u64) -> Result<(), String> {
+        if let Some(owner) = self.owner.as_mut() {
+            <Owner<F> as Driven>::periodic(owner, now)?;
+        }
+        self.shed_unloaded_owner();
+        Ok(())
+    }
     fn install_wake_handle(&mut self, wakes: WorkerWakeHandle) {
         self.wakes = Some(wakes);
     }
@@ -39,14 +55,41 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
         wake: PublicationWake,
         _now: u64,
     ) -> Result<(), String> {
-        self.owner.publication_wake(request, wake)
+        match self.owner.as_mut() {
+            Some(owner) => owner.publication_wake(request, wake),
+            None => Ok(()),
+        }
     }
     fn command(&mut self, command: WorkerCommand, now: u64) -> Result<WorkerReply, String> {
+        self.shed_unloaded_owner();
+        let Some(owner) = self.owner.as_mut() else {
+            return match command {
+                WorkerCommand::Admit(_) => Ok(WorkerReply::AdmissionRefused(
+                    AdmissionError::ModelUnloaded {
+                        cause: ModelUnloadCause::MemoryPressure,
+                    },
+                )),
+                WorkerCommand::Capacity => Ok(WorkerReply::Capacity(CapacityStatus {
+                    active: 0,
+                    limit: 0,
+                })),
+                WorkerCommand::Cancel { .. } | WorkerCommand::Stop { .. } => {
+                    Ok(WorkerReply::Acknowledged)
+                }
+                _ => Err("model unloaded due to memory pressure".into()),
+            };
+        };
         match command {
-            WorkerCommand::Check => match self.owner.fatal_error() {
-                Some(error) => Err(error.to_owned()),
-                None => Ok(WorkerReply::Acknowledged),
-            },
+            WorkerCommand::Check => {
+                if owner.memory_unloading() {
+                    Err("model unloaded due to memory pressure".into())
+                } else {
+                    match owner.fatal_error() {
+                        Some(error) => Err(error.to_owned()),
+                        None => Ok(WorkerReply::Acknowledged),
+                    }
+                }
+            }
             WorkerCommand::Admit(AdmitRequest {
                 seed,
                 input,
@@ -60,8 +103,8 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                     return Err("generation seed does not match prepared input".into());
                 }
                 let generation = seed.into_generation(self.method.clone())?;
-                let request = match retention {
-                    Some(retention) => self.owner.admit_retained_with(
+                let admitted = match retention {
+                    Some(retention) => owner.admit_retained_with(
                         generation,
                         retention,
                         now,
@@ -69,12 +112,14 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                             Some(_) => domain.install_retained_input(request, input),
                             None => domain.install_input(request, input),
                         },
-                    )?,
-                    None => self
-                        .owner
-                        .admit_with(generation, now, move |domain, request, _| {
-                            domain.install_input(request, input)
-                        })?,
+                    ),
+                    None => owner.admit_with(generation, now, move |domain, request, _| {
+                        domain.install_input(request, input)
+                    }),
+                };
+                let request = match admitted {
+                    Ok(request) => request,
+                    Err(error) => return Ok(WorkerReply::AdmissionRefused(error)),
                 };
                 let wakes = self
                     .wakes
@@ -84,23 +129,24 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                 let (sender, receiver) = PublicationQueue::bounded(output_capacity, move |wake| {
                     wakes.publication(request, wake);
                 })?;
-                self.owner
-                    .attach_publication(request, sender, output_capacity)?;
+                owner.attach_publication(request, sender, output_capacity)?;
                 Ok(WorkerReply::Admitted { request, receiver })
             }
             WorkerCommand::Stop { request } => {
-                self.owner.stop(request)?;
+                owner.stop(request)?;
                 Ok(WorkerReply::Acknowledged)
             }
             WorkerCommand::Cancel { request } => {
-                self.owner.release(request)?;
+                owner.release(request)?;
                 Ok(WorkerReply::Acknowledged)
             }
-            WorkerCommand::Status { request } => {
-                Ok(WorkerReply::Status(self.owner.status(request)?))
-            }
+            WorkerCommand::Status { request } => Ok(WorkerReply::Status(owner.status(request)?)),
             WorkerCommand::Capacity => {
-                let (active, limit) = self.owner.request_capacity();
+                let (active, limit) = if owner.memory_unloading() {
+                    (0, 0)
+                } else {
+                    owner.request_capacity()
+                };
                 Ok(WorkerReply::Capacity(CapacityStatus { active, limit }))
             }
             WorkerCommand::Close => {
@@ -109,16 +155,27 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
         }
     }
     fn advance(&mut self, now: u64, wake: CompletionWake) -> Result<Drive, String> {
-        <Owner<F> as Driven>::advance(&mut self.owner, now, wake)
+        self.shed_unloaded_owner();
+        let result = match self.owner.as_mut() {
+            Some(owner) => <Owner<F> as Driven>::advance(owner, now, wake),
+            None => Ok(Drive::Idle),
+        };
+        self.shed_unloaded_owner();
+        result
     }
     fn failed(&mut self, error: &str) {
-        <Owner<F> as Driven>::failed(&mut self.owner, error);
+        if let Some(owner) = self.owner.as_mut() {
+            <Owner<F> as Driven>::failed(owner, error);
+        }
     }
     fn failure(&self) -> Option<&str> {
-        <Owner<F> as Driven>::failure(&self.owner)
+        self.owner.as_ref().and_then(<Owner<F> as Driven>::failure)
     }
     fn shutdown(&mut self) -> Result<bool, String> {
-        <Owner<F> as Driven>::shutdown(&mut self.owner)
+        match self.owner.as_mut() {
+            Some(owner) => <Owner<F> as Driven>::shutdown(owner),
+            None => Ok(true),
+        }
     }
 }
 
@@ -132,32 +189,24 @@ impl EngineService {
     /// Production construction seam. The same immutable plan is handed to the
     /// numerical factory for every physical allocation and to the service
     /// owner for retention/capacity limits before readiness is published.
-    pub(crate) fn spawn_planned_domain<F: ProgramFamily + 'static>(
+    pub(crate) fn spawn_planned_domain<F: ProgramFamily + 'static, H>(
         factory: impl FnOnce(&ExecutionManifest) -> Result<(ExecutorDomain<F>, ResourcePlan), String>
             + Send
             + 'static,
         manifest: ExecutionManifest,
         method: Arc<dyn Method>,
         control_capacity: usize,
-        retention: Option<RetentionKey>,
-    ) -> Result<(Self, ReadyInfo), String> {
+        host: impl FnOnce() -> Result<(H, Option<RetentionKey>), String>,
+    ) -> Result<(Self, ReadyInfo, H), String> {
         let method_identity = method.identity().to_owned();
-        let (worker, ready) = Worker::spawn_ready(
+        let (worker, ready, (host, retention)) = Worker::spawn_ready_with(
             move || {
                 let (domain, plan) = factory(&manifest)?;
-                if plan.storage_bytes() != manifest.storage.storage_bytes
-                    || plan.retention_budget_bytes() != manifest.storage.retention_bytes
-                    || plan.bytes().safety_reserve != manifest.storage.safety_reserve_bytes
-                {
-                    return Err(
-                        "resource plan differs from the execution manifest storage policy".into(),
-                    );
-                }
                 if domain.execution_path() != manifest.path {
                     return Err("executor domain differs from the planned execution path".into());
                 }
                 let backend = domain.execution_backend();
-                let mut owner = Owner::with_resource_plan(domain, manifest.service.clone(), &plan)?;
+                let owner = Owner::with_resource_plan(domain, manifest.service.clone(), &plan)?;
                 let ready = ReadyInfo {
                     package: manifest.package.identity.clone(),
                     model: manifest.model.clone(),
@@ -168,7 +217,7 @@ impl EngineService {
                 };
                 Ok((
                     Box::new(ExecutionOwner {
-                        owner,
+                        owner: Some(owner),
                         method,
                         wakes: None,
                     }) as Box<dyn Driven>,
@@ -176,13 +225,14 @@ impl EngineService {
                 ))
             },
             control_capacity,
+            host,
         )?;
         let service = Self {
             worker,
             retention,
             method_identity,
         };
-        Ok((service, ready))
+        Ok((service, ready, host))
     }
 
     pub fn client(&self) -> EngineClient {
@@ -224,7 +274,7 @@ impl EngineClient {
         seed: magnitude_generation::GenerationSeed,
         input: PreparedModelInput,
         output_capacity: usize,
-    ) -> Result<EngineRequest, String> {
+    ) -> Result<EngineRequest, AdmissionError> {
         let retention = self
             .retention
             .as_ref()
@@ -239,7 +289,7 @@ impl EngineClient {
         input: PreparedModelInput,
         retention: RetentionRequest,
         output_capacity: usize,
-    ) -> Result<EngineRequest, String> {
+    ) -> Result<EngineRequest, AdmissionError> {
         self.admit_inner(seed, input, Some(retention), output_capacity)
             .await
     }
@@ -249,7 +299,7 @@ impl EngineClient {
         input: PreparedModelInput,
         retention: Option<RetentionRequest>,
         output_capacity: usize,
-    ) -> Result<EngineRequest, String> {
+    ) -> Result<EngineRequest, AdmissionError> {
         if output_capacity == 0 {
             return Err("request output capacity must be positive".into());
         }
@@ -265,12 +315,10 @@ impl EngineClient {
                 output_capacity,
             }))?
             .await?;
-        let WorkerReply::Admitted {
-            request: id,
-            receiver,
-        } = reply
-        else {
-            return Err("execution worker returned an invalid admission reply".into());
+        let (id, receiver) = match reply {
+            WorkerReply::Admitted { request, receiver } => (request, receiver),
+            WorkerReply::AdmissionRefused(error) => return Err(error),
+            _ => return Err("execution worker returned an invalid admission reply".into()),
         };
         Ok(EngineRequest {
             client: self.worker.clone(),

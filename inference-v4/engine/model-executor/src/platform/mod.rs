@@ -10,11 +10,10 @@ mod qualification;
 mod selection;
 
 pub use policy::{
-    admit_growth, assessment_capacity, host_planning_reserve, MemoryConstraint,
-    MemoryPolicyError, DEDICATED_PLANNING_RESERVE,
+    assessment_capacity, growth_availability, refresh_allocation_ceiling, GrowthAvailability,
+    MemoryConstraint, MemoryPolicyError,
 };
 pub use qualification::{
-    open_selected, select_device, BudgetError, MemoryRequirements, OpenedPlatform,
-    PlatformConfig, PlatformError, QualifiedPlatform, SelectedDevice,
+    open_selected, select_device, OpenedPlatform, PlatformConfig, PlatformError, SelectedDevice,
 };
 pub use selection::{select, DeviceRequest, DeviceRequestParseError, SelectionError};

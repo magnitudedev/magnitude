@@ -14,10 +14,32 @@ program slots, method capabilities, service policy, and all device resources. Th
 topology is both the complete requirement set and the construction recipe. Program construction
 attests every exact slot and returns typed callable groups; execution never queries a handle map or
 coarse coverage class after readiness.
+Metadata-only model assessment derives resident weight bytes and per-token history and recurrent
+bank bytes from this same model load plan and state layout, for a one-conversation workload at the
+lesser of supported context and 100,000 tokens. It does not read weight payloads or open a device.
+The recurrent fit charge includes the accepted bank, one in-flight successor and the pristine seed.
+Those exact model terms alone do not establish fit: prepared scratch, startup transients and the
+device's capacity must be accounted for before publishing a fit result. If the exact resident
+terms alone exceed stable capacity, assessment may reject fit immediately; passing that lower
+bound never proves fit.
+The same header-only program plan derives exact prepared native invocation storage and the
+production qualification/import startup upper bound. These remain partial bounds until Seismic
+graph resource pools have a backend-specific upper bound; assessment does not infer positive fit
+from the partial bounds. Exact invocation storage strengthens the no-fit lower bound; the startup
+upper bound does not.
+Speed assessment measures shipped native defaults on synthetic device-resident inputs separately
+from model loading. It retains the device and formed-program identity, workload geometry and raw
+timings. A missing measurement or a measured pair that does not establish a physical cost supplies
+no speed prediction; real-model validation cannot be used to fit a correction factor.
 The composition root prepares complete Seismic workflows for the admitted model geometry and
 finite launch classes, imports the target component, allocates the storage reported by those
 workflows, and publishes readiness only after those steps succeed. The engine does not maintain a
 second numerical tensor-shape description.
+Device assessment uses the allocation domain's total capacity, bounded by
+applicable process limits and Metal's recommended working set. Admission of new holdings uses fresh available
+memory observations for that domain. Neither calculation subtracts a fixed
+planning reserve; already charged allocations are excluded from observed
+availability and are not subtracted again.
 The native execution path is backend-neutral: the host names a device (a backend or an exact
 selector) or asks for automatic selection, which considers accelerators only and treats several
 fitting devices as an explicit ambiguity; the path then executes on the opened device's backend,
@@ -27,10 +49,9 @@ error names the path and the backend.
 Native entries with declared tuning parameters are tuned on the opened device during this
 preparation, on the first load for each tuning key: each such entry registers a tuning case
 that supplies static values from model geometry, weighted tuning points over the shape classes that
-entry serves (the row classes of its graph path, crossed with served history lengths for attention;
-projected-row classes for the readout; a few representative row classes are measured, each
-carrying its neighbours' shares), rotations over real resident weights of distinct layers for
-weight-streaming decode rows,
+entry serves (every row class of its graph path, crossed with served history lengths for attention;
+projected-row classes for the readout, each retaining its own step-time share), rotations over real
+resident weights of distinct layers for weight-streaming decode rows,
 control tables packed by the batch builder. Every entry is validated with one engine-wide
 tolerance, a defect guard derived from an error model, not the precision gate: it admits every arithmetic option an
 entry declares (down to q8_1 activations) with margin, and is looser than anything the end-to-end
@@ -40,19 +61,25 @@ in place (recurrent state arenas, KV history, routing tables, selection outputs)
 state: its written region is restored before each configuration's validation run, and real state
 is never bound. An entry that declares parameters without a case fails preparation; there are no
 engine-side default parameter values. An entry prepared again with identical element bindings and
-static values reuses the load's first tuning result. Tuning is bounded by a configuration count,
-not by time: a census first counts the model's tuning units (entry, element bindings, static
-values) and their admissible configurations, and a per-model budget is shared equally among them,
-a unit smaller than its share returning the rest to the others. A safety stop on the whole
+static values reuses the load's first tuning result. Entry-wide declarations still use a
+configuration budget: a census counts the model's tuning units (entry, element bindings, static
+values) and their admissible configurations, and shares a per-model budget among them. A
+launch-scoped declaration instead searches every candidate of each independent launch group;
+its boundary choices and group candidates do not spend that budget. A safety stop on the whole
 preparation's tuning (a wall-clock limit for pathological machines) ends every search early with
-the best configuration found; it is reported as a warning and its results are not stored.
+the best completed choice, leaving unfinished groups at their defaults; it is reported as a
+warning and its results are not stored.
+On CPU, expensive projection cases screen candidates at a few representative rows with folded
+row shares. The default and shortlisted configurations are still confirmed, ranked and validated
+at every served row; the full workload remains the final objective.
 The engine owns every cache, under a directory the host names (`--cache-dir`; without one nothing
 is cached). It holds CUDA images Seismic formed, through the device's artifact store, and one
 tuning result per tuning key. The key is a digest over the device and toolchain identity (Metal OS
 build; CUDA driver and NVRTC release), the unit, the implementation digest (declaration and
 rendered source), and the search definition (search version, budget, settings, point labels and
-weights, validation rule, sample time). A hit prepares the stored choice with no forming,
-measuring or validation for tuning; its key pins everything validation depended on. Keys are
+weights, screening points and folded weights, validation rule, sample time). A hit prepares the
+stored choice with no forming, measuring or validation for tuning; its key pins everything
+validation depended on. Keys are
 content addresses, so nothing is invalidated: changed inputs give new keys. Writes go through a
 temporary file renamed into place; an entry that cannot be read or parsed, or whose configuration
 the implementation does not admit, is a miss and is rewritten; opening the cache evicts the least
@@ -79,12 +106,13 @@ plain decoding; acceptance over the logits a verification produced remains exact
 
 The resource plan authorizes persistent weights and state, including the permanently pristine
 recurrent zero seed, concurrent typed workspaces, outputs
-that outlive workspaces, variable retention capacities, optional component residency, and the
+that outlive workspaces, structural retention slots bounded by service request capacity and
+the device domain, optional component residency, and the
 qualification/startup peak. Persistent allocation follows planning. Qualification scratch is
 released before readiness. Execution receives plan-issued leases and cannot allocate general
 scratch outside the plan.
-Variable retained feature tensors are allocated by ResourceAllocator only after an exact byte
-charge against the planned retention limit; their ownership claim refunds that charge on drop.
+Variable retained feature tensors require a fitting heap claim. Retained checkpoints occupy
+finite slots and release their physical charge when their final owner drops them.
 
 Seismic composes native checked entries into prepared workflows for decoder blocks and other
 numerical units. Its checked entry contracts derive graph-local mutable scratch, host-uploaded
@@ -98,8 +126,9 @@ memory), so writing a step's controls never waits for the device, and they are t
 so every step binds the same storage per block and CUDA replays each block's instantiated graph.
 Activation never allocates; an activation that finds every region still in flight is a typed
 failure, not growth.
-Resident imports use one-shot destinations and startup upload storage derived from their checked
-contracts. The engine charges Seismic's reported native invocation, intermediate, and result
+Resident imports use one-shot destinations. Metal maps source-file windows shared by ordered
+imports; the transient is bounded by the largest planned source tensor plus host-page rounding.
+Other backends use a one-shot staged source upload. The engine charges Seismic's reported native invocation, intermediate, and result
 storage; it does not author parallel tensor recipes or look up named intermediates during a
 request.
 
@@ -119,8 +148,11 @@ GEMV bound) or, for larger classes, grouped tables and grouped expert outputs: c
 expert into tile-aligned blocks whose capacity derives from the class, the selected-expert count and
 the tile rows, so no table is uploaded per step and no host readback sizes a launch. Seismic prepares an
 exact workflow for the selected physical batch class, so a small decode batch does not execute the
-maximum class width. Linear projection stages use cooperative subgroup reductions for the smallest
-row classes and subgroup matrix operations above them. A decode projection, normalization prologue
+maximum class width. Draft head blocks use their declared dense or routed feed-forward geometry
+and the same routed numerical composition as target blocks. Header assessment includes the head's
+routed weights, program entries, and class-dependent workspace before residency begins. Linear
+projection stages use cooperative subgroup reductions for the smallest row classes and subgroup
+matrix operations above them. A decode projection, normalization prologue
 included, is one launch: each workgroup reduces its few rows' norms while staging them. Larger classes
 normalize once per row into entry scratch, never per output tile. A monolithic entry that recomputes normalization,
 projection, routing, or softmax for each output coordinate is not an admissible production program.

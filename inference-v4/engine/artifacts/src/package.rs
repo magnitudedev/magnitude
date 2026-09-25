@@ -1,13 +1,10 @@
 use crate::{
-    gguf::{GgufArtifact, TensorDescriptor},
+    gguf::{self, Directory, GgufArtifact, TensorDescriptor},
     ArtifactIdentity, Error, PackageIdentity, TemplatePayload, TokenizerPayload,
 };
 use std::path::{Path, PathBuf};
 
-/// Device-free description of one immutable package component.
-///
-/// The canonical path is transport, not identity. A worker must reopen the
-/// path and prove that the content identity still matches before using it.
+/// Device-free description of one opened package component.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ComponentManifest {
     pub path: PathBuf,
@@ -16,13 +13,61 @@ pub struct ComponentManifest {
     pub tensors: Vec<TensorDescriptor>,
 }
 
-/// Exact package admitted by the host and safe to move to the numerical
-/// worker. It contains no open file, mapping, device, or other live resource.
+/// Description of the package admitted by the host. The opened package itself
+/// is shared with the numerical worker so all reads use the admitted files.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackageManifest {
     pub identity: PackageIdentity,
     pub target: ComponentManifest,
     pub projector: Option<ComponentManifest>,
+}
+
+/// Validated package metadata when tensor payloads have not been downloaded.
+/// It cannot be used as an import source: the open `Package` remains the
+/// authority for payload-backed execution.
+#[derive(Debug)]
+pub struct PackageHeaders {
+    target: Directory,
+    projector: Option<Directory>,
+    identity: PackageIdentity,
+}
+
+impl PackageHeaders {
+    /// Inspect a target header and an optional explicit projector header.
+    /// Neither tensor payload is read or required to exist.
+    pub fn open(target: impl AsRef<Path>, projector: Option<&Path>) -> Result<Self, Error> {
+        let target_path = target.as_ref();
+        if let Some(projector_path) = projector {
+            if target_path.canonicalize()? == projector_path.canonicalize()? {
+                return Err(Error::Invalid(
+                    "target and projector must be distinct package components".into(),
+                ));
+            }
+        }
+        let target = gguf::inspect_header(target_path)?;
+        let projector = projector.map(gguf::inspect_header).transpose()?;
+        let identity = PackageIdentity {
+            target: ArtifactIdentity::for_open(),
+            projector: projector.as_ref().map(|_| ArtifactIdentity::for_open()),
+        };
+        Ok(Self {
+            target,
+            projector,
+            identity,
+        })
+    }
+
+    pub fn target(&self) -> &Directory {
+        &self.target
+    }
+
+    pub fn projector(&self) -> Option<&Directory> {
+        self.projector.as_ref()
+    }
+
+    pub fn identity(&self) -> PackageIdentity {
+        self.identity
+    }
 }
 
 /// A target GGUF and its optional projector component.
@@ -69,13 +114,12 @@ impl Package {
         }
         let target = GgufArtifact::open(target_path)?;
         let projector = projector_path.map(GgufArtifact::open).transpose()?;
-        if projector
-            .as_ref()
-            .is_some_and(|projector| projector.identity() == target.identity())
-        {
-            return Err(Error::Invalid(
-                "target and projector components have identical content identity".into(),
-            ));
+        if let Some(projector) = &projector {
+            if same_file(target.source(), projector.source())? {
+                return Err(Error::Invalid(
+                    "target and projector must be distinct package components".into(),
+                ));
+            }
         }
         let identity = PackageIdentity {
             target: target.identity(),
@@ -122,24 +166,22 @@ impl Package {
             projector: self.projector.as_ref().map(component_manifest),
         }
     }
+}
 
-    /// Reopen the exact components selected by the host and reject a path
-    /// replacement or inventory change before numerical construction begins.
-    pub fn reopen(manifest: &PackageManifest) -> Result<Self, Error> {
-        let package = Self::open_paths(
-            &manifest.target.path,
-            manifest
-                .projector
-                .as_ref()
-                .map(|component| component.path.as_path()),
-        )?;
-        let reopened = package.manifest();
-        if reopened != *manifest {
-            return Err(Error::Invalid(
-                "package components changed after host admission".into(),
-            ));
-        }
-        Ok(package)
+fn same_file(
+    left: &std::sync::Arc<crate::FileSource>,
+    right: &std::sync::Arc<crate::FileSource>,
+) -> Result<bool, Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let left = left.metadata()?;
+        let right = right.metadata()?;
+        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(left.path() == right.path())
     }
 }
 

@@ -66,7 +66,11 @@ impl ConstructionTraversal {
                     self.frontier.push_back(coordinate);
                     break;
                 }
-                Materialization::Pending(ConstructionPending::Initialization(_) | ConstructionPending::Capacity(_) | ConstructionPending::RepresentationView { .. }) => {
+                Materialization::Pending(
+                    ConstructionPending::Initialization(_)
+                    | ConstructionPending::Capacity(_)
+                    | ConstructionPending::RepresentationView { .. },
+                ) => {
                     self.unresolved.push(coordinate);
                 }
                 Materialization::Ready(_) | Materialization::Excluded(_) => {}
@@ -80,8 +84,8 @@ mod tests {
     use super::*;
     #[test]
     fn allowance_pause_rotates_pending_paths_without_declaring_completion() {
-        use crate::realization::demand_driven_tests::registry;
         use crate::realization::demand_driven_tests::device;
+        use crate::realization::demand_driven_tests::registry;
         use seismic_lang::checked::{check_source, SourceFile, SourceSet};
         let module = check_source(SourceSet::new(vec![SourceFile {
             path: "construction-fairness.seismic".into(),

@@ -62,7 +62,8 @@ fn repacked(
         repack_weight::Elements {
             E: source_element,
             U: resident_element,
-        }, &seismic::NativeSpecialization::new(),
+        },
+        &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(repack_weight::Args { source: &input })
@@ -73,13 +74,21 @@ fn repacked(
 }
 
 fn read_f32(actual: &Tensor) -> Vec<f32> {
-    actual.read_to_host().unwrap().chunks_exact(4)
-        .map(|word| f32::from_le_bytes(word.try_into().unwrap())).collect()
+    actual
+        .read_to_host()
+        .unwrap()
+        .chunks_exact(4)
+        .map(|word| f32::from_le_bytes(word.try_into().unwrap()))
+        .collect()
 }
 
 fn read_bf16(actual: &Tensor) -> Vec<f32> {
-    actual.read_to_host().unwrap().chunks_exact(2)
-        .map(|word| f32::from_bits(u32::from(u16::from_le_bytes(word.try_into().unwrap())) << 16)).collect()
+    actual
+        .read_to_host()
+        .unwrap()
+        .chunks_exact(2)
+        .map(|word| f32::from_bits(u32::from(u16::from_le_bytes(word.try_into().unwrap())) << 16))
+        .collect()
 }
 
 fn report(path: &Path, label: &str, actual: Vec<f32>) {
@@ -120,8 +129,10 @@ fn report(path: &Path, label: &str, actual: Vec<f32>) {
                 "output" => (0.001, 0.00015),
                 _ => panic!("unexpected recurrent stage {label}"),
             };
-            assert!(max <= max_limit && rms <= rms_limit,
-                "{label} departs from CPU BF16 reference: max={max}, rms={rms}");
+            assert!(
+                max <= max_limit && rms <= rms_limit,
+                "{label} departs from CPU BF16 reference: max={max}, rms={rms}"
+            );
         }
     }
 }
@@ -154,7 +165,10 @@ fn step_specialization(device: &Device) -> seismic::NativeSpecialization {
     if device.backend() == BackendName::Cpu {
         return rows;
     }
-    rows.with_static("NK", 16).with_static("NV", 32).with_static("W", 128).with_static("C", 4)
+    rows.with_static("NK", 16)
+        .with_static("NV", 32)
+        .with_static("W", 128)
+        .with_static("C", 4)
 }
 
 fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &Path) {
@@ -180,7 +194,10 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
             &device,
             Element::i32(),
             shape,
-            &values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>(),
+            &values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>(),
         )
         .unwrap()
     };

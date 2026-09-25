@@ -49,8 +49,8 @@ fn total_elementwise(
 ) -> bool {
     match primitive {
         PrimitiveId::Constant(_) | PrimitiveId::Select => true,
-        _=>source_scalar::recipe(function,primitive,inputs)
-            .is_some_and(|recipe|recipe.failures().is_empty()),
+        _ => source_scalar::recipe(function, primitive, inputs)
+            .is_some_and(|recipe| recipe.failures().is_empty()),
     }
 }
 

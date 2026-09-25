@@ -194,7 +194,11 @@ impl<'a> Checker<'a> {
     /// The only constructor of `PrimitiveFailure`: `ProvedAbsent` when the
     /// primitive's scalar recipe has no failure outputs, or when its divisor
     /// or shift count is proved in range here.
-    pub fn primitive_failure(&mut self, id: &PrimitiveId, operands: &[CheckedExpr]) -> PrimitiveFailure {
+    pub fn primitive_failure(
+        &mut self,
+        id: &PrimitiveId,
+        operands: &[CheckedExpr],
+    ) -> PrimitiveFailure {
         let proved = |proof: bool| {
             if proof {
                 PrimitiveFailure::ProvedAbsent
@@ -237,7 +241,11 @@ impl<'a> Checker<'a> {
                 else {
                     return PrimitiveFailure::ProvedAbsent;
                 };
-                proved(reference_math::scalar_recipe(operation, &types).failures().is_empty())
+                proved(
+                    reference_math::scalar_recipe(operation, &types)
+                        .failures()
+                        .is_empty(),
+                )
             }
         }
     }
@@ -285,13 +293,21 @@ impl<'a> Checker<'a> {
                 for (item, hint) in items.iter().zip(hints) {
                     let item = self.expr(item, hint)?;
                     if item.ty.is_void() {
-                        self.error(DiagnosticRule::Type, item.span, "`void` is not a tuple component");
+                        self.error(
+                            DiagnosticRule::Type,
+                            item.span,
+                            "`void` is not a tuple component",
+                        );
                         return None;
                     }
                     out.push(item);
                 }
                 if out.is_empty() {
-                    self.error(DiagnosticRule::Type, e.span, "an empty tuple is not a value");
+                    self.error(
+                        DiagnosticRule::Type,
+                        e.span,
+                        "an empty tuple is not a value",
+                    );
                     return None;
                 }
                 if out.len() == 1 {
@@ -312,7 +328,10 @@ impl<'a> Checker<'a> {
                         self.error(
                             DiagnosticRule::Type,
                             endpoint.span,
-                            format!("a range endpoint is an integer, found {}", self.shown(&endpoint.ty)),
+                            format!(
+                                "a range endpoint is an integer, found {}",
+                                self.shown(&endpoint.ty)
+                            ),
                         );
                         return None;
                     }
@@ -420,9 +439,10 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
-        let symbolic = dtype
-            .is_int()
-            .then(|| self.arena.int(i64::try_from(value).expect("word literal fits i64")));
+        let symbolic = dtype.is_int().then(|| {
+            self.arena
+                .int(i64::try_from(value).expect("word literal fits i64"))
+        });
         Some(self.scalar_expr(
             CheckedExprKind::Literal(reference_math::integer_literal(dtype, value)),
             dtype,
@@ -596,7 +616,11 @@ impl<'a> Checker<'a> {
                 return None;
             }
             other => {
-                self.error(DiagnosticRule::Type, span, format!("cannot index a {}", self.shown(other)));
+                self.error(
+                    DiagnosticRule::Type,
+                    span,
+                    format!("cannot index a {}", self.shown(other)),
+                );
                 return None;
             }
         };
@@ -674,9 +698,11 @@ impl<'a> Checker<'a> {
                     let width = static_width(&self.arena, &start, &end);
                     let (kept, checks) = match (lo, hi) {
                         (Some(lo), Some(hi)) => {
-                            let check_start = self.require_in_bounds(lo, span, "range start may be negative");
+                            let check_start =
+                                self.require_in_bounds(lo, span, "range start may be negative");
                             let order = self.arena.int_sub(hi, lo);
-                            let check_order = self.require_in_bounds(order, span, "range may be reversed");
+                            let check_order =
+                                self.require_in_bounds(order, span, "range may be reversed");
                             let tail = self.arena.int_sub(extent, hi);
                             let check_end = self.require_in_bounds(
                                 tail,
@@ -692,7 +718,10 @@ impl<'a> Checker<'a> {
                                 let realized = self.arena.int_sub(order, w);
                                 !super::prove::zero(&self.arena, &self.facts, realized)
                             });
-                            (width.unwrap_or(order), (check_start, check_order, check_end, check_width))
+                            (
+                                width.unwrap_or(order),
+                                (check_start, check_order, check_end, check_width),
+                            )
                         }
                         (_, _) => {
                             let kept = match width {
@@ -728,7 +757,10 @@ impl<'a> Checker<'a> {
                                     self.arena.int_symbol(symbol)
                                 }
                             };
-                            (kept, (start.is_some(), true, end.is_some(), width.is_some()))
+                            (
+                                kept,
+                                (start.is_some(), true, end.is_some(), width.is_some()),
+                            )
                         }
                     };
                     axes.push(kept);
@@ -770,7 +802,8 @@ impl<'a> Checker<'a> {
         indices: &[ast::Index],
         span: Span,
     ) -> Option<CheckedExpr> {
-        let (_, checked, selected) = self.select_indices(LocalId::new(0), &base.ty, indices, span)?;
+        let (_, checked, selected) =
+            self.select_indices(LocalId::new(0), &base.ty, indices, span)?;
         let element = checked
             .iter()
             .all(|i| matches!(i, CheckedIndex::Point { .. }));
@@ -876,7 +909,10 @@ impl<'a> Checker<'a> {
             self.error(
                 DiagnosticRule::Resolution,
                 elem.span,
-                format!("`{}` is not a dtype or an element parameter of this declaration", elem.name),
+                format!(
+                    "`{}` is not a dtype or an element parameter of this declaration",
+                    elem.name
+                ),
             );
             return None;
         };
@@ -975,7 +1011,11 @@ impl<'a> Checker<'a> {
                     return None;
                 }
                 ValueType::Void => {
-                    self.error(DiagnosticRule::Type, operand.span, format!("{what} is not defined on void"));
+                    self.error(
+                        DiagnosticRule::Type,
+                        operand.span,
+                        format!("{what} is not defined on void"),
+                    );
                     return None;
                 }
                 other => match other.scalar_dtype() {
@@ -997,14 +1037,21 @@ impl<'a> Checker<'a> {
     /// L10, §2.3.6 (2): every operand whose elements differ from `target`,
     /// and every element-parameter tensor operand, is wrapped in an explicit
     /// `Cast(target)`, elementwise for a tensor. No later layer promotes.
-    pub fn promote_operands(&mut self, operands: Vec<CheckedExpr>, target: DType) -> Vec<CheckedExpr> {
+    pub fn promote_operands(
+        &mut self,
+        operands: Vec<CheckedExpr>,
+        target: DType,
+    ) -> Vec<CheckedExpr> {
         operands
             .into_iter()
             .map(|operand| {
                 let (differs, ty) = match &operand.ty {
                     ValueType::Tensor(tensor) => (
                         tensor.elem != Elem::Dtype(target),
-                        ValueType::Tensor(TensorType::new(tensor.axes.clone(), Elem::Dtype(target))),
+                        ValueType::Tensor(TensorType::new(
+                            tensor.axes.clone(),
+                            Elem::Dtype(target),
+                        )),
                     ),
                     ValueType::Scalar(dtype) => (*dtype != target, ValueType::Scalar(target)),
                     _ => (false, operand.ty.clone()),
@@ -1069,7 +1116,9 @@ impl<'a> Checker<'a> {
                 .elem
                 .dense_dtype()
                 .is_some_and(|dtype| domain.admits_dtype(dtype)),
-            other => other.scalar_dtype().is_some_and(|dtype| domain.admits_dtype(dtype)),
+            other => other
+                .scalar_dtype()
+                .is_some_and(|dtype| domain.admits_dtype(dtype)),
         };
         if !admitted {
             let hint = if op == UnaryOp::BitNot && inner.ty.scalar_dtype() == Some(DType::Bool) {
@@ -1090,7 +1139,11 @@ impl<'a> Checker<'a> {
         }
         if quantity(&inner.ty) {
             let Some(value) = inner.sym else {
-                self.error(DiagnosticRule::Type, span, "quantity negation requires an exact integer value");
+                self.error(
+                    DiagnosticRule::Type,
+                    span,
+                    "quantity negation requires an exact integer value",
+                );
                 return None;
             };
             let zero = self.arena.int(0);
@@ -1181,7 +1234,11 @@ impl<'a> Checker<'a> {
                 l = self.quantity_to_word(l, dtype);
             } else {
                 let (Some(a), Some(b)) = (l.sym, r.sym) else {
-                    self.error(DiagnosticRule::Type, span, "quantity operation requires exact integer values");
+                    self.error(
+                        DiagnosticRule::Type,
+                        span,
+                        "quantity operation requires exact integer values",
+                    );
                     return None;
                 };
                 let sym = match op {
@@ -1203,7 +1260,11 @@ impl<'a> Checker<'a> {
                 return Some(self.primitive_expr(
                     PrimitiveId::Binary(op),
                     vec![l, r],
-                    if is_cmp { ValueType::Scalar(DType::Bool) } else { ValueType::Integer },
+                    if is_cmp {
+                        ValueType::Scalar(DType::Bool)
+                    } else {
+                        ValueType::Integer
+                    },
                     sym,
                     span,
                 ));
@@ -1251,7 +1312,11 @@ impl<'a> Checker<'a> {
                 .and_then(|value| super::prove::constant(&self.arena, value))
                 .is_some_and(|n| !(0..32).contains(&n))
             {
-                self.error(DiagnosticRule::Type, r.span, "integer shift count must be in 0..32");
+                self.error(
+                    DiagnosticRule::Type,
+                    r.span,
+                    "integer shift count must be in 0..32",
+                );
                 return None;
             }
         } else {
@@ -1315,7 +1380,12 @@ impl<'a> Checker<'a> {
     /// L31: prove a quantity position `value >= 0` over its one symbol `sym`.
     /// The goal is reported in the source spelling of `value`: an inline
     /// element read has a symbol of its own that no name renders.
-    pub fn require_position_nonneg(&mut self, value: &CheckedExpr, sym: IntExpr, what: &str) -> bool {
+    pub fn require_position_nonneg(
+        &mut self,
+        value: &CheckedExpr,
+        sym: IntExpr,
+        what: &str,
+    ) -> bool {
         if super::prove::nonneg(&self.arena, &self.facts, sym) {
             return true;
         }
@@ -1350,7 +1420,10 @@ impl<'a> Checker<'a> {
         let exact = match &mut expr.kind {
             CheckedExprKind::Primitive { id, operands, .. } => {
                 let taken = std::mem::take(operands);
-                *operands = taken.into_iter().map(|operand| self.word_value(operand)).collect();
+                *operands = taken
+                    .into_iter()
+                    .map(|operand| self.word_value(operand))
+                    .collect();
                 self.exact_word(id, operands, dtype)
             }
             _ => None,
@@ -1369,13 +1442,24 @@ impl<'a> Checker<'a> {
 
     /// The exact integer expression of a word operation, if it has one
     /// (`word_value`'s table).
-    fn exact_word(&mut self, id: &PrimitiveId, operands: &[CheckedExpr], dtype: DType) -> Option<IntExpr> {
+    fn exact_word(
+        &mut self,
+        id: &PrimitiveId,
+        operands: &[CheckedExpr],
+        dtype: DType,
+    ) -> Option<IntExpr> {
         if let Some(value) = self.folded_word(id, operands) {
             return Some(value);
         }
-        let symbols = operands.iter().map(|operand| operand.sym).collect::<Option<Vec<_>>>()?;
+        let symbols = operands
+            .iter()
+            .map(|operand| operand.sym)
+            .collect::<Option<Vec<_>>>()?;
         match (id, symbols.as_slice()) {
-            (PrimitiveId::Binary(op @ (BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)), &[a, b]) => {
+            (
+                PrimitiveId::Binary(op @ (BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)),
+                &[a, b],
+            ) => {
                 let value = match op {
                     BinaryOp::Add => self.arena.int_add(a, b),
                     BinaryOp::Sub => self.arena.int_sub(a, b),
@@ -1398,9 +1482,7 @@ impl<'a> Checker<'a> {
                 let value = self.arena.int_sub(zero, a);
                 self.in_word_range(value, dtype).then_some(value)
             }
-            (PrimitiveId::Cast(_), &[a])
-                if word(&operands[0].ty) || quantity(&operands[0].ty) =>
-            {
+            (PrimitiveId::Cast(_), &[a]) if word(&operands[0].ty) || quantity(&operands[0].ty) => {
                 self.in_word_range(a, dtype).then_some(a)
             }
             _ => None,
@@ -1416,10 +1498,12 @@ impl<'a> Checker<'a> {
         for operand in operands {
             let input = match (&operand.kind, &operand.ty) {
                 (CheckedExprKind::Literal(value), _) => *value,
-                (_, ValueType::Scalar(dtype @ (DType::I32 | DType::U32))) => reference_math::integer_literal(
-                    *dtype,
-                    i128::from(super::prove::constant(&self.arena, operand.sym?)?),
-                ),
+                (_, ValueType::Scalar(dtype @ (DType::I32 | DType::U32))) => {
+                    reference_math::integer_literal(
+                        *dtype,
+                        i128::from(super::prove::constant(&self.arena, operand.sym?)?),
+                    )
+                }
                 (_, ty) if quantity(ty) => {
                     let ScalarOp::Cast(dtype) = operation else {
                         return None;
@@ -1469,7 +1553,10 @@ impl<'a> Checker<'a> {
                     self.error(
                         DiagnosticRule::Type,
                         span,
-                        format!("`.T` transposes a rank-2 tensor or view, found {}", self.shown(&base.ty)),
+                        format!(
+                            "`.T` transposes a rank-2 tensor or view, found {}",
+                            self.shown(&base.ty)
+                        ),
                     );
                     return None;
                 };
@@ -1484,7 +1571,11 @@ impl<'a> Checker<'a> {
                 };
                 let id = PrimitiveId::Transpose;
                 if !primitive(&id).accepts(&[base.ty.clone()]) {
-                    self.error(DiagnosticRule::Type, span, format!("`.T` is not defined on {}", self.shown(&base.ty)));
+                    self.error(
+                        DiagnosticRule::Type,
+                        span,
+                        format!("`.T` is not defined on {}", self.shown(&base.ty)),
+                    );
                     return None;
                 }
                 Some(self.primitive_expr(id, vec![base], ValueType::Tensor(t), None, span))
@@ -1601,7 +1692,11 @@ impl<'a> Checker<'a> {
                 ))
             }
             other => {
-                self.error(DiagnosticRule::Type, name.span, format!("unknown attribute `{other}`"));
+                self.error(
+                    DiagnosticRule::Type,
+                    name.span,
+                    format!("unknown attribute `{other}`"),
+                );
                 None
             }
         }
@@ -1627,7 +1722,11 @@ impl<'a> Checker<'a> {
     /// to 0/1, and a numeric value never converts to bool.
     pub fn cast(&mut self, dtype: DType, args: &[ast::Arg], span: Span) -> Option<CheckedExpr> {
         let [ast::Arg { name: None, value }] = args else {
-            self.error(DiagnosticRule::Type, span, format!("`{}(x)` takes one argument", dtype.name()));
+            self.error(
+                DiagnosticRule::Type,
+                span,
+                format!("`{}(x)` takes one argument", dtype.name()),
+            );
             return None;
         };
         if dtype == DType::Bool {
@@ -1720,7 +1819,11 @@ impl<'a> Checker<'a> {
             unproved.push(format!("{text} <= {}", self.render(last)));
         }
         if !unproved.is_empty() {
-            let kind = if word(&value.ty) { "a data word" } else { "a quantity" };
+            let kind = if word(&value.ty) {
+                "a data word"
+            } else {
+                "a quantity"
+            };
             let target = self.shown(&ValueType::Index { bound });
             self.error(
                 DiagnosticRule::Type,
@@ -1829,12 +1932,17 @@ mod word_value_tests {
     fn rows(source: &str, input: TensorData) -> Vec<f64> {
         let module = check(source).unwrap_or_else(|error| panic!("{source}\n{error}"));
         let entry = module
-            .entry(module.entry_named("probe").unwrap(), &ElementBindings::default())
+            .entry(
+                module.entry_named("probe").unwrap(),
+                &ElementBindings::default(),
+            )
             .unwrap();
         let mut interpreter = Interpreter::new(&entry);
         let input = interpreter.add_tensor(input);
         let out = interpreter.add_tensor(TensorData::dense(DType::F32, vec![3], vec![0.0; 3]));
-        let outcome = interpreter.run(&[Arg::Tensor(input), Arg::Tensor(out)]).unwrap();
+        let outcome = interpreter
+            .run(&[Arg::Tensor(input), Arg::Tensor(out)])
+            .unwrap();
         let out = outcome.inputs().nth(1).unwrap();
         (0..3).map(|row| out.tensor().read(row).unwrap()).collect()
     }
@@ -1849,10 +1957,22 @@ mod word_value_tests {
         let computed = "fn probe[R](lens: &tensor[R] i32, out: &mut tensor[R] f32):\n    parallel for r in 0..R:\n        let w = lens[r] + 1\n        if w >= 0:\n";
         let converted = "fn probe[R](x: &tensor[R] f32, out: &mut tensor[R] f32):\n    parallel for r in 0..R:\n        let w = i32(x[r] * 3.0)\n        if w >= 0:\n";
         // X1 r6 w19d, w19, w08b, w19b.
-        assert_eq!(rows(&format!("{computed}{COUNT_ALLOCATED}"), lens()), [3.0, 0.0, 7.0]);
-        assert_eq!(rows(&format!("{computed}{COUNT_LOOP}"), lens()), [3.0, 0.0, 7.0]);
-        assert_eq!(rows(&format!("{converted}{COUNT_ALLOCATED}"), scaled()), [3.0, 0.0, 2.0]);
-        assert_eq!(rows(&format!("{converted}{COUNT_LOOP}"), scaled()), [3.0, 0.0, 2.0]);
+        assert_eq!(
+            rows(&format!("{computed}{COUNT_ALLOCATED}"), lens()),
+            [3.0, 0.0, 7.0]
+        );
+        assert_eq!(
+            rows(&format!("{computed}{COUNT_LOOP}"), lens()),
+            [3.0, 0.0, 7.0]
+        );
+        assert_eq!(
+            rows(&format!("{converted}{COUNT_ALLOCATED}"), scaled()),
+            [3.0, 0.0, 2.0]
+        );
+        assert_eq!(
+            rows(&format!("{converted}{COUNT_LOOP}"), scaled()),
+            [3.0, 0.0, 2.0]
+        );
         // X1 r6 w06a: an inline word remainder is exact under `0 <= n`.
         let remainder = "fn probe[R](lens: &tensor[R] i32, out: &mut tensor[R] f32):\n    parallel for r in 0..R:\n        let n = lens[r]\n        if n >= 0:\n            if n < 8:\n                let mut t = tensor[n % 8] f32\n                t[:] = ones_like(t)\n                out[r] = reduce(t, 0, sum)\n";
         assert_eq!(rows(remainder, lens()), [2.0, 0.0, 6.0]);
@@ -1882,7 +2002,10 @@ mod word_value_tests {
         let guarded = "fn probe(lens: &tensor[1] i32, y: &tensor[8] f32) -> f32:\n    let n = lens[0]\n    let mut r = 0.0\n    if n >= 0:\n        if n < 8:\n            let j = index[8](n)\n            r = y[j]\n    return r\n";
         let module = check(guarded).unwrap();
         let entry = module
-            .entry(module.entry_named("probe").unwrap(), &ElementBindings::default())
+            .entry(
+                module.entry_named("probe").unwrap(),
+                &ElementBindings::default(),
+            )
             .unwrap();
         let mut interpreter = Interpreter::new(&entry);
         let lens = interpreter.add_tensor(TensorData::dense(DType::I32, vec![1], vec![5.0]));
@@ -1891,7 +2014,9 @@ mod word_value_tests {
             vec![8],
             (0..8).map(f64::from).collect(),
         ));
-        let outcome = interpreter.run(&[Arg::Tensor(lens), Arg::Tensor(y)]).unwrap();
+        let outcome = interpreter
+            .run(&[Arg::Tensor(lens), Arg::Tensor(y)])
+            .unwrap();
         assert!(matches!(
             outcome.results().next().unwrap().value(),
             OutcomeValue::Scalar(ReferenceScalar::F32(bits)) if f32::from_bits(bits) == 5.0
@@ -1902,7 +2027,10 @@ mod word_value_tests {
         assert!(error.contains("prove `0 <= n` and `n <= 7`"), "{error}");
         let unbounded = "fn probe(x: &tensor[8] i32, y: &tensor[8] f32) -> f32:\n    let r = index(x[0])\n    return y[r]\n";
         let error = check(unbounded).unwrap_err();
-        assert!(error.contains("`index` needs its bound: `index[B](w)`"), "{error}");
+        assert!(
+            error.contains("`index` needs its bound: `index[B](w)`"),
+            "{error}"
+        );
     }
 
     #[test]

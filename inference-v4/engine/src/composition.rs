@@ -6,7 +6,7 @@ use magnitude_artifacts::{ImageProcessor, InputLayout, Package, TokenId};
 use magnitude_chat::{
     artifacts::{gguf_byte_bpe, gguf_templates},
     wire::PreparedGeneration,
-    ByteBpeTokenizer, SpecialTokens, TemplateBundle,
+    ByteBpeTokenizer, PreparedVocabulary, SpecialTokens, TemplateBundle,
 };
 use magnitude_model_contracts::{
     ModelDefinition, ModelInputAdapter, PreparedModelInput, TokenPlan,
@@ -20,11 +20,9 @@ use magnitude_service::ServiceLimits;
 use std::path::{Path, PathBuf};
 use std::{rc::Rc, sync::Arc};
 
-use crate::options::{
-    ExecutionManifest, ModelPolicy, PackageOptions, ReadyInfo, ResolvedStoragePolicy, StoragePolicy,
-};
+use crate::options::{ExecutionManifest, ModelPolicy, PackageOptions, ReadyInfo};
 use crate::{
-    chat::{CacheLimits, Vocabulary},
+    chat::CacheLimits,
     service::EngineService,
     serving::{Config as ServerConfig, CountInput, Server},
 };
@@ -109,13 +107,54 @@ impl MediaSourcePolicy {
 }
 
 pub struct LoadedArtifacts {
-    package: Package,
+    package: Arc<Package>,
     definition: ModelDefinition,
     declared_context_limit: u64,
-    tokenizer: ByteBpeTokenizer,
+    tokenizer: Arc<ByteBpeTokenizer>,
     templates: TemplateBundle,
     media: Option<ImageProcessor>,
     input_adapter: QwenInputAdapter,
+}
+
+/// Package and model interpretation needed to admit a numerical worker.
+/// Host-only tokenizer and template construction is completed during loading.
+pub struct PreparedArtifacts {
+    package: Arc<Package>,
+    definition: ModelDefinition,
+    declared_context_limit: u64,
+}
+
+impl PreparedArtifacts {
+    fn from_package(package: Package) -> Result<Self, String> {
+        let definition = inspect_package(&package).map_err(|error| error.to_string())?;
+        let declared_context_limit = definition.geometry.context_limit;
+        Ok(Self {
+            package: Arc::new(package),
+            definition,
+            declared_context_limit,
+        })
+    }
+
+    pub fn package(&self) -> &Package {
+        &self.package
+    }
+
+    pub fn shared_package(&self) -> Arc<Package> {
+        self.package.clone()
+    }
+
+    pub fn definition(&self) -> &ModelDefinition {
+        &self.definition
+    }
+
+    pub(crate) fn finish(self) -> Result<LoadedArtifacts, String> {
+        let Self {
+            package,
+            definition,
+            declared_context_limit,
+        } = self;
+        LoadedArtifacts::from_prepared(package, definition, declared_context_limit)
+    }
 }
 
 /// Host-owned inputs to engine construction. Resolving this value performs all
@@ -129,7 +168,6 @@ pub struct EngineConfiguration {
     /// state to this limit. `None` serves the artifact's declared maximum.
     pub context_tokens: Option<usize>,
     pub service: ServiceLimits,
-    pub storage: StoragePolicy,
     pub path: ExecutionPath,
     /// The device the numerical worker opens; the native path runs on its
     /// backend.
@@ -145,7 +183,7 @@ pub struct EngineConfiguration {
 /// on the host, while the owned device-free manifest is sent to the numerical
 /// worker. Neither side reparses the other's representation.
 pub struct ResolvedEngineConfiguration {
-    pub artifacts: LoadedArtifacts,
+    pub artifacts: PreparedArtifacts,
     pub manifest: ExecutionManifest,
     pub control_capacity: usize,
 }
@@ -154,6 +192,7 @@ pub struct ResolvedEngineConfiguration {
 /// numerical service owns its device, package mapping, weights, and executors.
 pub struct ReadyEngine {
     artifacts: LoadedArtifacts,
+    vocabulary: PreparedVocabulary,
     service: EngineService,
     ready: ReadyInfo,
 }
@@ -161,11 +200,13 @@ pub struct ReadyEngine {
 impl ReadyEngine {
     pub(crate) fn new(
         artifacts: LoadedArtifacts,
+        vocabulary: PreparedVocabulary,
         service: EngineService,
         ready: ReadyInfo,
     ) -> Self {
         Self {
             artifacts,
+            vocabulary,
             service,
             ready,
         }
@@ -204,8 +245,7 @@ impl ReadyEngine {
             templates,
             media,
         } = self.artifacts;
-        let tokenizer = Arc::new(tokenizer);
-        let vocabulary = Vocabulary::new(tokenizer.clone(), expected_vocabulary, constraint_cache)?;
+        let vocabulary = self.vocabulary.with_cache_limits(constraint_cache);
         let count_context_tokens = usize::try_from(declared_context_limit)
             .map_err(|_| "artifact context limit exceeds host domain")?;
         let mut count_definition = definition.clone();
@@ -259,19 +299,17 @@ impl EngineConfiguration {
             return Err("engine control capacity must be positive".into());
         }
         let package = self.package.open().map_err(|error| error.to_string())?;
-        let mut artifacts = LoadedArtifacts::from_package(package)?;
+        let mut artifacts = PreparedArtifacts::from_package(package)?;
         artifacts.definition.geometry.context_limit = resolve_served_context(
             self.context_tokens,
             artifacts.definition.geometry.context_limit,
         )?;
         let model = self.model.resolve(artifacts.definition())?;
-        let storage: ResolvedStoragePolicy = self.storage.resolve()?;
         let manifest = ExecutionManifest::new(
             artifacts.package().manifest(),
             artifacts.definition().clone(),
             model,
             self.service,
-            storage,
             self.path,
             self.device,
             self.kernel_cache,
@@ -325,11 +363,19 @@ impl LoadedArtifacts {
     }
 
     fn from_package(package: Package) -> Result<Self, String> {
-        let definition = inspect_package(&package).map_err(|error| error.to_string())?;
-        let declared_context_limit = definition.geometry.context_limit;
+        PreparedArtifacts::from_package(package)?.finish()
+    }
+
+    fn from_prepared(
+        package: Arc<Package>,
+        definition: ModelDefinition,
+        declared_context_limit: u64,
+    ) -> Result<Self, String> {
         let artifact_identity = definition.artifact_identity.target.to_string();
-        let tokenizer =
-            ByteBpeTokenizer::new(gguf_byte_bpe(package.tokenizer(), artifact_identity)?)?;
+        let tokenizer = Arc::new(ByteBpeTokenizer::new(gguf_byte_bpe(
+            package.tokenizer(),
+            artifact_identity,
+        )?)?);
         if u64::try_from(tokenizer.vocabulary()).ok() != Some(definition.geometry.vocabulary) {
             return Err("tokenizer vocabulary differs from model vocabulary".into());
         }
@@ -373,12 +419,20 @@ impl LoadedArtifacts {
         &self.package
     }
 
+    pub fn shared_package(&self) -> Arc<Package> {
+        self.package.clone()
+    }
+
     pub fn definition(&self) -> &ModelDefinition {
         &self.definition
     }
 
     pub fn tokenizer(&self) -> &ByteBpeTokenizer {
-        &self.tokenizer
+        self.tokenizer.as_ref()
+    }
+
+    pub(crate) fn shared_tokenizer(&self) -> Arc<ByteBpeTokenizer> {
+        self.tokenizer.clone()
     }
 
     pub fn templates(&self) -> &TemplateBundle {
@@ -392,7 +446,7 @@ impl LoadedArtifacts {
     pub fn prepare_input(
         &self,
         request: &PreparedGeneration,
-        mut resolve: impl FnMut(&str) -> Result<Vec<u8>, String>,
+        resolve: impl FnMut(&str) -> Result<Vec<u8>, String>,
     ) -> Result<PreparedModelInput, String> {
         prepare_with_media(
             &self.definition,

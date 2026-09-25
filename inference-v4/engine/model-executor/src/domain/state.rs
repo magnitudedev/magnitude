@@ -1,12 +1,273 @@
 //! state lifecycle for the executor domain.
 
 use super::*;
+use magnitude_model_state::{
+    GrowthChoice, Holder, RowDemand, StateHoldingCensus, StatePressureShrinkShape,
+};
+
+/// A comparison with Seismic's live charge. `unattributed` remains explicit
+/// for any storage whose owner has not yet been classified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryChargeReconciliation {
+    pub charged: u64,
+    pub target_state: StateHoldingCensus,
+    pub head_state: Option<StateHoldingCensus>,
+    pub graph_pools: u64,
+    pub owned_media: u64,
+    pub target_weights: u64,
+    pub optional_weights: u64,
+    pub prepared_programs: u64,
+    pub bound_constants: u64,
+    pub external_pins: u64,
+    pub unattributed: u64,
+}
+
+impl MemoryChargeReconciliation {
+    pub fn complete(self) -> bool {
+        self.unattributed == 0
+    }
+}
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
+    pub fn pressure_state_shape(
+        &self,
+    ) -> Result<(StatePressureShrinkShape, Option<StatePressureShrinkShape>), String> {
+        Ok((
+            self.target_store
+                .pressure_shrink_shape()
+                .map_err(|error| error.to_string())?,
+            self.head_store
+                .as_ref()
+                .map(|store| store.pressure_shrink_shape())
+                .transpose()
+                .map_err(|error| error.to_string())?,
+        ))
+    }
+    /// Release bound optional components after the owner has drained all
+    /// requests. The measured ledger delta is the only released-byte credit;
+    /// shared target tensors remain cached by the head loader.
+    pub fn release_idle_optional_components(&mut self) -> Result<u64, String> {
+        if !self.target.is_empty()
+            || !self.head.is_empty()
+            || !self.input.is_empty()
+            || self.lookahead.is_some()
+        {
+            return Ok(0);
+        }
+        let before = self.domain.device().memory_usage().charged;
+        self.family.unbind_optional();
+        if let Some(loader) = &self.head_loader {
+            loader.unload();
+        }
+        if let Some(loader) = &self.vision_loader {
+            loader.unload();
+        }
+        self.sync_optional_holding()?;
+        let after = self.domain.device().memory_usage().charged;
+        before
+            .checked_sub(after)
+            .ok_or_else(|| "optional component release increased Seismic's charge".to_owned())
+    }
+
+    pub fn reconcile_memory_charge(
+        &self,
+        live_checkpoints: &[&DomainCheckpoint],
+        retained: &[&DomainCheckpoint],
+    ) -> Result<MemoryChargeReconciliation, String> {
+        let (target_state, head_state) = self.state_holding_census(live_checkpoints, retained)?;
+        let state = target_state
+            .total()
+            .checked_add(head_state.map_or(0, StateHoldingCensus::total))
+            .ok_or("state charge sum overflows")?;
+        let graph_pools = self.resources.committed_bytes()?;
+        let owned_media = self.owned_media_bytes(live_checkpoints, retained)?;
+        let target_weights = self.family.target_weight_bytes()?;
+        // The head loader inherits the target cache so tied weights are
+        // represented by the same allocation. Vision has its own cache.
+        let head_weights = self
+            .head_loader
+            .as_ref()
+            .map(|loader| {
+                loader
+                    .resident_bytes()?
+                    .checked_sub(target_weights)
+                    .ok_or("head residency cache omits a target allocation")
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let vision_weights = self
+            .vision_loader
+            .as_ref()
+            .map(|loader| loader.resident_bytes())
+            .transpose()?
+            .unwrap_or(0);
+        let optional_weights = head_weights
+            .checked_add(vision_weights)
+            .ok_or("optional resident charge overflows")?;
+        let prepared_programs = self.family.prepared_program_bytes()?;
+        let bound_constants = self.family.bound_constant_bytes()?;
+        let external_pins = self
+            .target_store
+            .external_pinned_bytes()
+            .map_err(|error| error.to_string())?
+            .checked_add(
+                self.head_store
+                    .as_ref()
+                    .map(|store| store.external_pinned_bytes())
+                    .transpose()
+                    .map_err(|error| error.to_string())?
+                    .unwrap_or(0),
+            )
+            .ok_or("external pin charge overflows")?;
+        let classified = state
+            .checked_add(graph_pools)
+            .and_then(|bytes| bytes.checked_add(owned_media))
+            .and_then(|bytes| bytes.checked_add(target_weights))
+            .and_then(|bytes| bytes.checked_add(optional_weights))
+            .and_then(|bytes| bytes.checked_add(prepared_programs))
+            .and_then(|bytes| bytes.checked_add(bound_constants))
+            .and_then(|bytes| bytes.checked_add(external_pins))
+            .ok_or("classified charge sum overflows")?;
+        let charged = self.domain.device().memory_usage().charged;
+        let unattributed = charged
+            .checked_sub(classified)
+            .ok_or("classified holdings exceed Seismic's charge")?;
+        Ok(MemoryChargeReconciliation {
+            charged,
+            target_state,
+            head_state,
+            graph_pools,
+            owned_media,
+            target_weights,
+            optional_weights,
+            prepared_programs,
+            bound_constants,
+            external_pins,
+            unattributed,
+        })
+    }
+
+    /// Count each standalone feature allocation once across live requests and
+    /// checkpoints. Graph-backed features already belong to a sealed output
+    /// arena in `graph_pools` and must not be counted again.
+    fn owned_media_bytes(
+        &self,
+        live_checkpoints: &[&DomainCheckpoint],
+        retained: &[&DomainCheckpoint],
+    ) -> Result<u64, String> {
+        let inputs = self.input.values().chain(
+            live_checkpoints
+                .iter()
+                .chain(retained.iter())
+                .filter_map(|checkpoint| checkpoint.input.as_ref()),
+        );
+        let mut seen: Vec<&Tensor> = Vec::new();
+        let mut bytes = 0u64;
+        for feature in inputs.flat_map(|input| {
+            input
+                .images
+                .values()
+                .filter_map(|image| image.features.as_ref())
+        }) {
+            if feature.allocation().is_graph_backed() {
+                continue;
+            }
+            let tensor = feature
+                .allocation()
+                .tensor()
+                .map_err(|error| error.to_string())?;
+            if seen.iter().any(|other| other.shares_allocation(tensor)) {
+                continue;
+            }
+            bytes = bytes
+                .checked_add(tensor.storage_bytes())
+                .ok_or("owned media charge overflows")?;
+            seen.push(tensor);
+        }
+        Ok(bytes)
+    }
+
+    /// Account for each state arena from current requests, checkpoints, and
+    /// the store's registered submitted transactions. Unregistered omissions
+    /// remain an error rather than being mislabeled as surplus.
+    pub fn state_holding_census(
+        &self,
+        live_checkpoints: &[&DomainCheckpoint],
+        retained: &[&DomainCheckpoint],
+    ) -> Result<(StateHoldingCensus, Option<StateHoldingCensus>), String> {
+        let target_live = self
+            .target
+            .values()
+            .map(Holder::State)
+            .chain(
+                live_checkpoints
+                    .iter()
+                    .map(|checkpoint| Holder::Checkpoint(&checkpoint.target)),
+            )
+            .collect::<Vec<_>>();
+        let target_retained = retained
+            .iter()
+            .map(|checkpoint| Holder::Checkpoint(&checkpoint.target))
+            .collect::<Vec<_>>();
+        let target = self
+            .target_store
+            .holding_census(&target_live, &target_retained, &[])
+            .map_err(|error| error.to_string())?;
+        let head = self
+            .head_store
+            .as_ref()
+            .map(|store| {
+                let live = self
+                    .head
+                    .values()
+                    .map(Holder::State)
+                    .chain(
+                        live_checkpoints
+                            .iter()
+                            .map(|checkpoint| {
+                                checkpoint
+                                    .head
+                                    .as_ref()
+                                    .map(Holder::Checkpoint)
+                                    .ok_or("live checkpoint has no head state")
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                    )
+                    .collect::<Vec<_>>();
+                let retained = retained
+                    .iter()
+                    .map(|checkpoint| {
+                        checkpoint
+                            .head
+                            .as_ref()
+                            .map(Holder::Checkpoint)
+                            .ok_or("retained checkpoint has no head state")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                store
+                    .holding_census(&live, &retained, &[])
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?;
+        Ok((target, head))
+    }
+
+    /// A lazy component import can briefly hold an upload tensor alongside
+    /// the resident weights. Admit that peak before the importer allocates.
+    pub(super) fn grant_component_growth(
+        &mut self,
+        resident_bytes: u64,
+        upload_peak: u64,
+    ) -> Result<(), DomainError> {
+        let required = resident_bytes
+            .checked_add(upload_peak)
+            .ok_or_else(|| DomainError::Input("component import claim overflows".into()))?;
+        self.grant_device_growth(required)
+    }
+
     /// Commit state backing for a launch before its capacity check: the rows
     /// and successor banks its operations will claim, placed so histories
-    /// keep growing in place. A device limit leaves the backing unchanged and
-    /// the capacity check reports the shortage.
+    /// keep growing in place. A refused minimum grant returns a byte deficit.
     /// Histories at the segment limit are repacked first.
     pub fn provision(&mut self, operations: &[Operation]) -> Result<(), DomainError> {
         // A group claiming the queued lookahead needs nothing; any other
@@ -47,12 +308,173 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         }
         if !target.is_empty() {
-            self.target_store.provision(&target, target_banks)?;
+            self.grant_state_growth(self.target_store.clone(), &target, target_banks)?;
         }
-        if let (Some(store), false) = (&self.head_store, head.is_empty()) {
-            store.provision(&head, head.len())?;
+        if !head.is_empty() {
+            if let Some(store) = self.head_store.clone() {
+                self.grant_state_growth(store, &head, head.len())?;
+            }
+        }
+        match operations.first() {
+            Some(Operation::Head { .. }) if !self.family.head_is_bound() => {
+                let binding_constants = self
+                    .head_loader
+                    .as_ref()
+                    .ok_or_else(|| DomainError::Input("head component is disabled".into()))?
+                    .binding_constant_bytes()
+                    .map_err(DomainError::Input)?;
+                self.grant_component_growth(
+                    self.execution.resources().bytes().head_weights,
+                    self.execution
+                        .load()
+                        .head_upload_peak_bytes()?
+                        .max(binding_constants),
+                )?;
+            }
+            Some(Operation::Encode { .. }) if !self.family.vision_is_bound() => {
+                self.grant_component_growth(
+                    self.execution.resources().bytes().vision_weights,
+                    self.execution.load().vision_upload_peak_bytes()?,
+                )?;
+            }
+            _ => {}
         }
         Ok(())
+    }
+
+    /// Grant elastic state growth from a fresh domain observation. Seismic's
+    /// charge ledger remains authoritative: its limit enforces the grant on
+    /// every physical allocation, including a temporary reallocation peak.
+    fn grant_state_growth(
+        &mut self,
+        store: Rc<StateStore>,
+        demands: &[RowDemand],
+        banks: usize,
+    ) -> Result<(), DomainError> {
+        for choice in [GrowthChoice::Preferred, GrowthChoice::Minimum] {
+            let claim = store.growth_claim(demands, banks)?;
+            let required = match choice {
+                GrowthChoice::Preferred => claim.preferred_bytes,
+                GrowthChoice::Minimum => claim.minimum_bytes,
+            };
+            if required != 0 {
+                if let Err(error) = self.grant_device_growth(required) {
+                    if choice == GrowthChoice::Preferred {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+            // Keep the peak reserved while the store performs its fallible
+            // physical operation. Seismic measures the resulting charge; the
+            // existing static holding is then resized from committed backing
+            // instead of creating another holding for the same bytes.
+            let claim = if required == 0 {
+                None
+            } else {
+                Some(
+                    self.memory
+                        .borrow_mut()
+                        .claim(crate::memory::MemoryNeed {
+                            minimum_bytes: required,
+                            preferred_bytes: required,
+                            class: crate::memory::HoldingClass::Model,
+                        })
+                        .map_err(|error| {
+                            DomainError::Blind(format!("state peak claim rejected: {error:?}"))
+                        })?
+                        .id,
+                )
+            };
+            let provisioned = store.provision_with_growth(demands, banks, choice);
+            if let Some(claim) = claim {
+                self.memory
+                    .borrow_mut()
+                    .cancel_claim(claim)
+                    .map_err(|error| {
+                        DomainError::invariant(format!("state peak claim lost: {error:?}"))
+                    })?;
+            }
+            match provisioned {
+                Ok(()) => {
+                    self.refresh_memory().map_err(DomainError::Blind)?;
+                    self.sync_static_holding().map_err(DomainError::Input)?;
+                    return Ok(());
+                }
+                Err(error)
+                    if choice == GrowthChoice::Preferred
+                        && matches!(
+                            error,
+                            magnitude_model_state::Error::Tensor(seismic::TensorError::Execution(
+                                seismic::ExecutionError::AllocationCapacity { .. }
+                                    | seismic::ExecutionError::AllocationFailed(_)
+                            ))
+                        ) =>
+                {
+                    continue
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        unreachable!("minimum state growth either succeeds or returns a deficit")
+    }
+
+    /// Refresh the Seismic allocation ceiling for one peak physical claim.
+    /// The observation excludes existing charges, so only the added peak is
+    /// compared with available bytes.
+    pub fn probe_memory(&mut self) -> Result<(), DomainError> {
+        self.grant_device_growth(0)
+    }
+
+    pub(super) fn grant_device_growth(&mut self, required: u64) -> Result<(), DomainError> {
+        if self.memory_catalog.is_none() {
+            let catalog = seismic::DeviceCatalog::discover().map_err(|error| {
+                let device = self.domain.device();
+                device.set_memory_limit(Some(device.memory_usage().charged));
+                DomainError::Blind(error.to_string())
+            })?;
+            self.memory_catalog = Some(catalog);
+        }
+        let device = self.domain.device();
+        crate::platform::refresh_allocation_ceiling(
+            self.memory_catalog.as_ref().expect("catalog initialized"),
+            device,
+        )
+        .map_err(|error| match error {
+            crate::platform::MemoryPolicyError::Pressure(level) => DomainError::Pressure(level),
+            other => DomainError::Blind(other.to_string()),
+        })?;
+        // Seismic enforces the ceiling; the engine heap owns the admission
+        // decision over the same observed headroom.
+        self.refresh_memory().map_err(DomainError::Blind)?;
+        let action = self
+            .memory
+            .borrow()
+            .decide(crate::memory::MemoryNeed {
+                minimum_bytes: required,
+                preferred_bytes: required,
+                class: crate::memory::HoldingClass::Surplus,
+            })
+            .map_err(|error| DomainError::Blind(format!("memory policy: {error:?}")))?;
+        match action {
+            crate::memory::MemoryAction::Grant { bytes } if bytes >= required => Ok(()),
+            crate::memory::MemoryAction::Reject { available, .. } => Err(crate::CapacityError {
+                resource: crate::ResourceKind::DeviceMemory,
+                required,
+                available,
+            }
+            .into()),
+            crate::memory::MemoryAction::Grant { bytes } => Err(crate::CapacityError {
+                resource: crate::ResourceKind::DeviceMemory,
+                required,
+                available: bytes,
+            }
+            .into()),
+            crate::memory::MemoryAction::ReleaseRequired { .. }
+            | crate::memory::MemoryAction::Wait => {
+                Err(DomainError::Pressure(seismic::PressureLevel::Pressure))
+            }
+        }
     }
 
     /// Repack the target history of a request at the visible segment limit
@@ -72,7 +494,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .iter()
             .map(|(_, count)| count)
             .sum::<usize>();
-        self.target_store.provision(
+        self.grant_state_growth(
+            self.target_store.clone(),
             &[magnitude_model_state::RowDemand { after: None, rows }],
             0,
         )?;
@@ -116,15 +539,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         };
         let inputs = StateLaunchInputs::new(batch, StateWork::Copy(compaction), workspace);
-        let launch = match ValidatedStateLaunch::new(
-            inputs,
-            &self.target_store,
-            None,
-            self.domain.id(),
-        ) {
-            Ok(launch) => launch,
-            Err((_, error)) => return Err(self.fatal_invariant(error.to_string())),
-        };
+        let launch =
+            match ValidatedStateLaunch::new(inputs, &self.target_store, None, self.domain.id()) {
+                Ok(launch) => launch,
+                Err((_, error)) => return Err(self.fatal_invariant(error.to_string())),
+            };
         let submission = match self.family.submit_state(launch) {
             Ok(submission) => submission,
             Err((error, _)) => {
@@ -151,12 +570,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Commit the successor banks a newly opened request needs.
-    pub fn provision_open(&self) -> Result<(), DomainError> {
+    pub fn provision_open(&mut self) -> Result<(), DomainError> {
         let requirements = self.open_requirements();
-        self.target_store.provision(&[], requirements.target_banks())?;
-        if let Some(store) = &self.head_store {
-            store.provision(&[], requirements.head_banks())?;
+        self.grant_state_growth(self.target_store.clone(), &[], requirements.target_banks())?;
+        if let Some(store) = self.head_store.clone() {
+            self.grant_state_growth(store, &[], requirements.head_banks())?;
         }
+        self.sync_static_holding().map_err(DomainError::Input)?;
         Ok(())
     }
 
@@ -174,7 +594,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if let Some(store) = &self.head_store {
             released += store.shrink(policy)?;
         }
+        self.sync_static_holding().map_err(DomainError::Input)?;
         Ok(released)
     }
-
 }

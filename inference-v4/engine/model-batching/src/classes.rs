@@ -159,7 +159,11 @@ mod tests {
 
     #[test]
     fn prefill_rows_round_to_multiples_of_64() {
-        let class = |rows| LaunchClass::covering(rows, 1, Demand::NONE, 512).unwrap().rows();
+        let class = |rows| {
+            LaunchClass::covering(rows, 1, Demand::NONE, 512)
+                .unwrap()
+                .rows()
+        };
         assert_eq!(class(33), 64);
         assert_eq!(class(64), 64);
         assert_eq!(class(65), 128);

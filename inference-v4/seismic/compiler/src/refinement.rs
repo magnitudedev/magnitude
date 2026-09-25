@@ -3,11 +3,9 @@
 //! Candidate definitions and resumable construction belong to CandidateDomain.
 //! This module supplies the physical storage transition and immutable payload.
 
-pub(crate) use crate::implementation::candidate::{
-    validate_choice_declarations, PublishedResult,
-};
 #[cfg(test)]
 pub(crate) use crate::implementation::candidate::ConstructedCandidateParts;
+pub(crate) use crate::implementation::candidate::{validate_choice_declarations, PublishedResult};
 pub use crate::implementation::candidate::{
     ChoiceDeclaration, ChoiceKind, ConstructedCandidate, ConstructedCandidateIdentity,
     ImplementationProvenance, PhysicalChoice,
@@ -124,9 +122,9 @@ mod tests {
     use seismic_ir::{
         construction::Construction,
         kernel::ops::AddressableResourceHandle,
+        physical_target::{IntrinsicIdentityBuilder, IntrinsicNumericalSemantics, PhysicalDialect},
         repr::{DenseF32, Representation},
         storage::GlobalBufferKind,
-        physical_target::{IntrinsicIdentityBuilder, IntrinsicNumericalSemantics, PhysicalDialect},
     };
     use seismic_lang::expr::{Assignment, ExprArena, SymbolValue};
     use std::collections::BTreeSet;
@@ -194,7 +192,10 @@ mod tests {
         for values in assignments(&domains) {
             let mut assignment = Assignment::new();
             for ((choice, _), &value) in choices.iter().zip(&values) {
-                assignment.bind(arena.decision_symbol(*choice), SymbolValue::Int((value).into()));
+                assignment.bind(
+                    arena.decision_symbol(*choice),
+                    SymbolValue::Int((value).into()),
+                );
             }
             if constraints
                 .iter()
@@ -232,7 +233,10 @@ mod tests {
                 arena.decision_symbol(second),
                 SymbolValue::Int((second_value).into()),
             );
-            assignment.bind(arena.decision_symbol(third), SymbolValue::Int((third_value).into()));
+            assignment.bind(
+                arena.decision_symbol(third),
+                SymbolValue::Int((third_value).into()),
+            );
             assignment
         };
         assert!(constraints

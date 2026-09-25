@@ -45,8 +45,9 @@ pub fn compile(
     kernel: &str,
     environment: seal::Environment,
 ) -> Result<Vec<u32>, NativeCompilationError> {
-    let compiler = glslang::Compiler::acquire()
-        .ok_or_else(|| NativeCompilationError::ToolchainFailure("glslang could not be initialized".into()))?;
+    let compiler = glslang::Compiler::acquire().ok_or_else(|| {
+        NativeCompilationError::ToolchainFailure("glslang could not be initialized".into())
+    })?;
     let text = glslang::ShaderSource::from(source);
     let options = glslang::CompilerOptions {
         source_language: glslang::SourceLanguage::GLSL,
@@ -58,8 +59,14 @@ pub fn compile(
         messages: glslang::ShaderMessage::DEFAULT,
     };
     let defines = [("SEISMIC_KERNEL", Some(kernel))];
-    let input = glslang::ShaderInput::new(&text, glslang::ShaderStage::Compute, &options, Some(&defines[..]), None)
-        .map_err(toolchain)?;
+    let input = glslang::ShaderInput::new(
+        &text,
+        glslang::ShaderStage::Compute,
+        &options,
+        Some(&defines[..]),
+        None,
+    )
+    .map_err(toolchain)?;
     let shader = glslang::Shader::new(compiler, input).map_err(toolchain)?;
     let compiled = shader.compile().map_err(toolchain)?;
     let sealed = seal::seal(&compiled, environment)
@@ -102,10 +109,17 @@ fn clean(module: &[u32]) -> Result<Vec<u32>, NativeCompilationError> {
         ..Default::default()
     };
     optimizer
-        .optimize(module, &mut |message: spirv_tools::error::Message| messages.push(message.message), Some(options))
+        .optimize(
+            module,
+            &mut |message: spirv_tools::error::Message| messages.push(message.message),
+            Some(options),
+        )
         .map(|binary| binary.as_words().to_vec())
         .map_err(|error| {
-            NativeCompilationError::MalformedToolchainOutput(format!("{error}: {}", messages.join("; ")))
+            NativeCompilationError::MalformedToolchainOutput(format!(
+                "{error}: {}",
+                messages.join("; ")
+            ))
         })
 }
 
@@ -161,7 +175,8 @@ impl DirectModule {
             // Stored modules precede the `OpFmaKHR` binding, which the
             // linked validator does not know.
             let words = if facts.shader_fma.float32 {
-                seal::fma_khr(&words).map_err(|error| NativeCompilationError::MalformedToolchainOutput(error.0))?
+                seal::fma_khr(&words)
+                    .map_err(|error| NativeCompilationError::MalformedToolchainOutput(error.0))?
             } else {
                 words
             };
@@ -171,12 +186,28 @@ impl DirectModule {
         Ok(module)
     }
 
-    fn pipeline(&self, words: &[u32], kernel: &Kernel<'_>) -> Result<vk::Pipeline, NativeCompilationError> {
+    fn pipeline(
+        &self,
+        words: &[u32],
+        kernel: &Kernel<'_>,
+    ) -> Result<vk::Pipeline, NativeCompilationError> {
         let inner = &self.device.inner;
         let device = &inner.device;
-        let shader = unsafe { device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None) }
-            .map_err(|error| toolchain(format!("vkCreateShaderModule of `{}` failed: {error}", kernel.name)))?;
-        let values = kernel.threads.iter().chain(kernel.constants).copied().collect::<Vec<u32>>();
+        let shader = unsafe {
+            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None)
+        }
+        .map_err(|error| {
+            toolchain(format!(
+                "vkCreateShaderModule of `{}` failed: {error}",
+                kernel.name
+            ))
+        })?;
+        let values = kernel
+            .threads
+            .iter()
+            .chain(kernel.constants)
+            .copied()
+            .collect::<Vec<u32>>();
         let entries = (0..values.len() as u32)
             .map(|id| vk::SpecializationMapEntry {
                 constant_id: id,
@@ -185,9 +216,11 @@ impl DirectModule {
             })
             .collect::<Vec<_>>();
         let data = bytes_of(&values);
-        let specialization = vk::SpecializationInfo::default().map_entries(&entries).data(&data);
-        let mut subgroup =
-            vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(SUBGROUP_WIDTH);
+        let specialization = vk::SpecializationInfo::default()
+            .map_entries(&entries)
+            .data(&data);
+        let mut subgroup = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+            .required_subgroup_size(SUBGROUP_WIDTH);
         // Full subgroups are required whenever the X extent allows it (a
         // multiple of 32); smaller groups run one partial subgroup, as a
         // partial CUDA warp does.
@@ -203,12 +236,17 @@ impl DirectModule {
             .name(c"main")
             .specialization_info(&specialization)
             .push_next(&mut subgroup);
-        let info = vk::ComputePipelineCreateInfo::default().stage(stage).layout(inner.layout);
+        let info = vk::ComputePipelineCreateInfo::default()
+            .stage(stage)
+            .layout(inner.layout);
         let created = unsafe { device.create_compute_pipelines(inner.cache, &[info], None) };
         unsafe { device.destroy_shader_module(shader, None) };
-        created
-            .map(|pipelines| pipelines[0])
-            .map_err(|(_, error)| toolchain(format!("vkCreateComputePipelines of `{}` failed: {error}", kernel.name)))
+        created.map(|pipelines| pipelines[0]).map_err(|(_, error)| {
+            toolchain(format!(
+                "vkCreateComputePipelines of `{}` failed: {error}",
+                kernel.name
+            ))
+        })
     }
 
     pub(crate) fn pipeline_handle(&self, launch: usize) -> vk::Pipeline {

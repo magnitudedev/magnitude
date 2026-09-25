@@ -206,10 +206,11 @@ void main() {
 
     #[test]
     fn rounded_helpers_match_the_host_oracle() {
-        let Some(description) = seismic_vulkan::discover()
-            .ok()
-            .and_then(|devices| devices.into_iter().find(|device| device.floor.is_ok() && device.facts.is_gpu()))
-        else {
+        let Some(description) = seismic_vulkan::discover().ok().and_then(|devices| {
+            devices
+                .into_iter()
+                .find(|device| device.floor.is_ok() && device.facts.is_gpu())
+        }) else {
             eprintln!("no Vulkan GPU meets the floor");
             return;
         };
@@ -236,14 +237,38 @@ void main() {
         .expect("the numerics kernel forms");
 
         let specials = [
-            0.0f32, -0.0, 1.0, -1.0, 3.0, 0.1, 1e-45, -1e-45, 1.1754942e-38, 1.1754944e-38, 2.3509887e-38,
-            3.4028235e38, -3.4028235e38, 1e30, 1e-30, 7.0e-39, f32::INFINITY, f32::NEG_INFINITY, f32::NAN,
-            1.0000001, 0.99999994, 16777215.0, 1.5e-44,
+            0.0f32,
+            -0.0,
+            1.0,
+            -1.0,
+            3.0,
+            0.1,
+            1e-45,
+            -1e-45,
+            1.1754942e-38,
+            1.1754944e-38,
+            2.3509887e-38,
+            3.4028235e38,
+            -3.4028235e38,
+            1e30,
+            1e-30,
+            7.0e-39,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            1.0000001,
+            0.99999994,
+            16777215.0,
+            1.5e-44,
         ];
         let mut cases = Vec::new();
         for a in specials {
             for b in specials {
-                cases.push((a, b, specials[(a.to_bits() ^ b.to_bits()) as usize % specials.len()]));
+                cases.push((
+                    a,
+                    b,
+                    specials[(a.to_bits() ^ b.to_bits()) as usize % specials.len()],
+                ));
             }
         }
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
@@ -260,7 +285,9 @@ void main() {
             let b = f32::from_bits((word >> 32) as u32);
             let c = f32::from_bits(next() as u32);
             cases.push((a, b, c));
-            let scale = |value: f32, word: u64| value.abs().max(1e-30).min(1e30) * if word & 1 == 0 { 1.0 } else { -1.0 };
+            let scale = |value: f32, word: u64| {
+                value.abs().max(1e-30).min(1e30) * if word & 1 == 0 { 1.0 } else { -1.0 }
+            };
             cases.push((scale(a, word), scale(b, word >> 1), scale(c, word >> 2)));
         }
         let count = cases.len() as u32;
@@ -284,9 +311,14 @@ void main() {
                 groups: [u64::from(count.div_ceil(64)), 1, 1],
             })
             .expect("launch");
-        batch.commit().and_then(|submission| submission.finish()).expect("run");
+        batch
+            .commit()
+            .and_then(|submission| submission.finish())
+            .expect("run");
         let mut results = vec![0u8; cases.len() * 16];
-        device.read(&data, bytes.len() as u64, &mut results).expect("download");
+        device
+            .read(&data, bytes.len() as u64, &mut results)
+            .expect("download");
         // Without `DenormPreserve 32` the driver's default applies (NVIDIA:
         // flush to zero, §7.3): `fma` with a subnormal operand or result is
         // then outside the oracle. The integer paths preserve subnormals.
@@ -294,16 +326,28 @@ void main() {
         let subnormal = |value: f32| value.is_subnormal();
         let mut failures = Vec::new();
         for (index, (a, b, c)) in cases.iter().enumerate() {
-            let fma_defined =
-                !flushes || ![*a, *b, *c, a.mul_add(*b, *c), a * b].into_iter().any(subnormal);
+            let fma_defined = !flushes
+                || ![*a, *b, *c, a.mul_add(*b, *c), a * b]
+                    .into_iter()
+                    .any(subnormal);
             let word = |slot: usize| {
                 let at = index * 16 + slot * 4;
                 u32::from_le_bytes(results[at..at + 4].try_into().expect("four bytes"))
             };
             let checks = [
                 ("div", same(a / b, word(0)), (a / b).to_bits(), word(0)),
-                ("sqrt", same(a.abs().sqrt(), word(1)), a.abs().sqrt().to_bits(), word(1)),
-                ("fma", !fma_defined || same(a.mul_add(*b, *c), word(2)), a.mul_add(*b, *c).to_bits(), word(2)),
+                (
+                    "sqrt",
+                    same(a.abs().sqrt(), word(1)),
+                    a.abs().sqrt().to_bits(),
+                    word(1),
+                ),
+                (
+                    "fma",
+                    !fma_defined || same(a.mul_add(*b, *c), word(2)),
+                    a.mul_add(*b, *c).to_bits(),
+                    word(2),
+                ),
                 ("bf16", bf16(*a) == word(3), bf16(*a), word(3)),
             ];
             for (name, ok, expected, actual) in checks {
@@ -323,7 +367,12 @@ void main() {
             failures.len(),
             cases.len(),
             device.facts().name,
-            failures.iter().take(20).cloned().collect::<Vec<_>>().join("\n")
+            failures
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
 }

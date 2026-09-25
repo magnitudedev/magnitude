@@ -129,7 +129,11 @@ pub fn f32_to_f16(value: f32) -> u16 {
     let exponent = ((bits >> 23) & 0xff) as i32;
     let mantissa = bits & 0x007f_ffff;
     if exponent == 0xff {
-        let payload = if mantissa == 0 { 0 } else { 0x0200 | (mantissa >> 13) as u16 };
+        let payload = if mantissa == 0 {
+            0
+        } else {
+            0x0200 | (mantissa >> 13) as u16
+        };
         return sign | 0x7c00 | payload;
     }
     let unbiased = exponent - 127;

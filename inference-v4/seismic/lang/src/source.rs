@@ -23,12 +23,30 @@ use std::path::{Path, PathBuf};
 /// name's extension selects its backend (`.h` Metal, `.cuh` CUDA, `.glsl`
 /// Vulkan).
 pub const NATIVE_LIBRARY: &[(&str, &str)] = &[
-    ("element.h", include_str!("../native-library/metal/element.h")),
-    ("packets.h", include_str!("../native-library/metal/packets.h")),
-    ("element.cuh", include_str!("../native-library/cuda/element.cuh")),
-    ("packets.cuh", include_str!("../native-library/cuda/packets.cuh")),
-    ("element.glsl", include_str!("../native-library/vulkan/element.glsl")),
-    ("packets.glsl", include_str!("../native-library/vulkan/packets.glsl")),
+    (
+        "element.h",
+        include_str!("../native-library/metal/element.h"),
+    ),
+    (
+        "packets.h",
+        include_str!("../native-library/metal/packets.h"),
+    ),
+    (
+        "element.cuh",
+        include_str!("../native-library/cuda/element.cuh"),
+    ),
+    (
+        "packets.cuh",
+        include_str!("../native-library/cuda/packets.cuh"),
+    ),
+    (
+        "element.glsl",
+        include_str!("../native-library/vulkan/element.glsl"),
+    ),
+    (
+        "packets.glsl",
+        include_str!("../native-library/vulkan/packets.glsl"),
+    ),
 ];
 
 #[derive(Debug)]
@@ -499,7 +517,10 @@ impl Expansion<'_> {
             return Err(NativeIncludeReason::Malformed);
         }
         let extension_matches = |name: &str| {
-            Path::new(name).extension().and_then(|extension| extension.to_str()) == Some(self.extension)
+            Path::new(name)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some(self.extension)
         };
         if angled {
             let Some(name) = target.strip_prefix("seismic/") else {
@@ -568,7 +589,9 @@ mod tests {
             &root,
             "#include \"common/a.h\"\n#include \"common/b.h\" // again\nBODY\n",
         );
-        let Expanded { source, includes, .. } = expand_includes(&asset, "h", &[root.clone()]).unwrap();
+        let Expanded {
+            source, includes, ..
+        } = expand_includes(&asset, "h", &[root.clone()]).unwrap();
         assert_eq!(
             source,
             "#line 1 \"common/a.h\"\n#line 1 \"common/b.h\"\nB\n#line 2 \"common/a.h\"\nA\n#line 2 \"kernel.metal\"\n\nBODY\n"
@@ -592,7 +615,9 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("metal/common/element.h"), "ELEMENT\n").unwrap();
         let asset = asset(&root, "#include \"attention/softmax.h\"\nBODY\n");
-        let Expanded { source, includes, .. } = expand_includes(&asset, "h", &[root.clone()]).unwrap();
+        let Expanded {
+            source, includes, ..
+        } = expand_includes(&asset, "h", &[root.clone()]).unwrap();
         assert_eq!(
             source,
             "#line 1 \"attention/softmax.h\"\n#line 1 \"common/element.h\"\nELEMENT\n#line 2 \"attention/softmax.h\"\nSOFTMAX\n#line 2 \"kernel.metal\"\nBODY\n"
@@ -605,13 +630,22 @@ mod tests {
     fn vulkan_assets_inline_glsl_files() {
         let root = fixture("vulkan");
         std::fs::create_dir_all(root.join("vulkan/common")).unwrap();
-        std::fs::write(root.join("vulkan/common/reduce.glsl"), "float reduce_sum(float x) { return x; }\n").unwrap();
+        std::fs::write(
+            root.join("vulkan/common/reduce.glsl"),
+            "float reduce_sum(float x) { return x; }\n",
+        )
+        .unwrap();
         std::fs::write(root.join("vulkan/common/other.h"), "X\n").unwrap();
         let path = root.join("vulkan/kernel.comp");
         let text = "#include \"common/reduce.glsl\"\nvoid kernel() {}\n";
         std::fs::write(&path, text).unwrap();
-        let asset = NativeAssetFile { path, text: text.to_owned() };
-        let Expanded { source, includes, .. } = expand_includes(&asset, "glsl", &[root.clone()]).unwrap();
+        let asset = NativeAssetFile {
+            path,
+            text: text.to_owned(),
+        };
+        let Expanded {
+            source, includes, ..
+        } = expand_includes(&asset, "glsl", &[root.clone()]).unwrap();
         assert_eq!(
             source,
             "#line 1 \"common/reduce.glsl\"\nfloat reduce_sum(float x) { return x; }\n#line 2 \"kernel.comp\"\nvoid kernel() {}\n"
@@ -643,19 +677,32 @@ mod tests {
     #[test]
     fn inlines_seismic_library_files_once_without_filesystem_dependencies() {
         let root = fixture("library");
-        std::fs::write(root.join("metal/common/lib.h"), "#include <seismic/element.h>\nLIB\n").unwrap();
+        std::fs::write(
+            root.join("metal/common/lib.h"),
+            "#include <seismic/element.h>\nLIB\n",
+        )
+        .unwrap();
         // packets.h includes element.h itself; each library file is inlined once.
         let asset = asset(
             &root,
             "#include <seismic/packets.h>\n#include \"common/lib.h\"\n#include <seismic/element.h>\nBODY\n",
         );
-        let Expanded { source, includes, library } =
-            expand_includes(&asset, "h", &[root.clone()]).unwrap();
+        let Expanded {
+            source,
+            includes,
+            library,
+        } = expand_includes(&asset, "h", &[root.clone()]).unwrap();
         assert_eq!(library, ["packets.h", "element.h"]);
-        assert_eq!(includes.len(), 1, "library files are not filesystem includes");
+        assert_eq!(
+            includes.len(),
+            1,
+            "library files are not filesystem includes"
+        );
         assert!(source.starts_with("#line 1 \"seismic/packets.h\"\n"));
         assert!(source.contains("#line 1 \"seismic/element.h\"\n"));
-        assert!(!source.lines().any(|line| line.trim_start().starts_with("#include")));
+        assert!(!source
+            .lines()
+            .any(|line| line.trim_start().starts_with("#include")));
         assert_eq!(source.matches("struct Rows16 {").count(), 1);
         assert_eq!(source.matches("#define ELEMENT_OF(prefix)").count(), 1);
         assert!(source.ends_with("\nBODY\n"));
@@ -688,17 +735,44 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("metal/common/link.h")).unwrap();
         let escape = format!("#include \"../../{outside_name}\"\n");
         let mut cases = vec![
-            ("#include <metal_stdlib>\n".to_owned(), NativeIncludeReason::System),
+            (
+                "#include <metal_stdlib>\n".to_owned(),
+                NativeIncludeReason::System,
+            ),
             (escape, NativeIncludeReason::OutsideSourceRoots),
-            ("#include \"/tmp/a.h\"\n".to_owned(), NativeIncludeReason::Absolute),
-            ("#include \"common/a.cuh\"\n".to_owned(), NativeIncludeReason::Extension),
-            ("#include \"common/missing.h\"\n".to_owned(), NativeIncludeReason::Missing),
-            ("#import \"common/a.h\"\n".to_owned(), NativeIncludeReason::Malformed),
-            ("#include COMMON_HEADER\n".to_owned(), NativeIncludeReason::Malformed),
+            (
+                "#include \"/tmp/a.h\"\n".to_owned(),
+                NativeIncludeReason::Absolute,
+            ),
+            (
+                "#include \"common/a.cuh\"\n".to_owned(),
+                NativeIncludeReason::Extension,
+            ),
+            (
+                "#include \"common/missing.h\"\n".to_owned(),
+                NativeIncludeReason::Missing,
+            ),
+            (
+                "#import \"common/a.h\"\n".to_owned(),
+                NativeIncludeReason::Malformed,
+            ),
+            (
+                "#include COMMON_HEADER\n".to_owned(),
+                NativeIncludeReason::Malformed,
+            ),
             ("#include \"\"\n".to_owned(), NativeIncludeReason::Malformed),
-            ("#include <seismic/missing.h>\n".to_owned(), NativeIncludeReason::Missing),
-            ("#include <seismic/element.cuh>\n".to_owned(), NativeIncludeReason::Extension),
-            ("#include <seismic/element.h\n".to_owned(), NativeIncludeReason::Malformed),
+            (
+                "#include <seismic/missing.h>\n".to_owned(),
+                NativeIncludeReason::Missing,
+            ),
+            (
+                "#include <seismic/element.cuh>\n".to_owned(),
+                NativeIncludeReason::Extension,
+            ),
+            (
+                "#include <seismic/element.h\n".to_owned(),
+                NativeIncludeReason::Malformed,
+            ),
         ];
         #[cfg(unix)]
         cases.push((

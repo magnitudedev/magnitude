@@ -1,7 +1,7 @@
 //! The native draft-head program. One sealed graph per head class runs a
 //! head transaction in a single device submission: the entry pass over the
 //! committed rows, then one chained pass per further proposal. A pass is the
-//! head block (`draft_rows`, the decoder's attention and dense entries,
+//! head block (`draft_rows`, the decoder's attention and feed-forward entries,
 //! the final norm) and, when drafting, the vocabulary projection and the
 //! position-keyed selection. A chained pass embeds the previous pass's
 //! selection (`sample_rows` result rows are `draft_rows` token rows) and
@@ -10,28 +10,39 @@
 
 use super::{DeviceSubmission, HeadProgram};
 use crate::{
-    DeviceError, GraphOutputTensor, HeadLaunchCore, InvariantError, ModelLoadPlan,
-    NativeGraphOutputLease, NativeGraphWorkspaceLease, ResidentHead, ResidentWeight, SubmitError,
-    ValidatedHeadLaunch,
     completion::CompletionWaiter,
-    native::{AttestedHead, draft_vocabulary},
+    native::{draft_vocabulary, AttestedFeedForward, AttestedHead, AttestedHeadBlock},
     programs::{
-        graph::attention::{self as attention_graph, AttentionBlock, AttentionWeights},
-        graph::readout::{self, SelectionPorts, shapes},
-        native_constants::{ConstantTensors, GraphConstant},
+        graph::attention::{
+            self as attention_graph, AttentionBlock, AttentionGraphEntries, AttentionWeights,
+            CheckedAttentionEntries,
+        },
+        graph::dense::{dimensions as dense_dimensions, CheckedDenseEntries, DenseGraphEntries},
+        graph::draft::GraphDraft,
+        graph::readout::{self, shapes, SelectionPorts},
+        graph::routed::{self, CheckedRoutedEntries, RoutedGraphEntries},
+        native_constants::{
+            distinct_storage_bytes, CheckedGraphFamilyResources, CheckedGraphResources,
+            ConstantTensors, GraphConstant,
+        },
     },
+    DeviceError, FeedForwardProgramSlot, GraphOutputTensor, HeadBinding, HeadLaunchCore,
+    InvariantError, ModelLoadPlan, NativeGraphOutputLease, NativeGraphWorkspaceLease, ResidentHead,
+    ResidentWeight, ResourceLimits, SubmitError, ValidatedHeadLaunch,
 };
-use magnitude_model_batching::{MAX_CLASS_SEGMENTS, TargetBatchUpload, row_class};
+use magnitude_model_batching::{row_class, TargetBatchUpload, MAX_CLASS_SEGMENTS};
 use magnitude_model_contracts::{
-    ActivationDType, AttentionGeometry, DecoderGeometry, WeightKind, WeightRole, WeightScope,
+    ActivationDType, AttentionGeometry, DecoderGeometry, ExpertGeometry, WeightKind, WeightRole,
+    WeightScope,
 };
 use magnitude_model_kernels::{
-    head_logits_rows, dense_expand, dense_output, draft_rows, readout_features_rows,
+    dense_expand, dense_output, draft_rows, head_logits_rows, readout_features_rows, sample_rows,
+    shape_rows,
 };
 use magnitude_model_state::LayerRef;
 use seismic::{
-    BoundNativeGraphPlan, Device, Element, NativeGraphFamily, NativeGraphPlan, NativePort, Tensor,
-    WorkflowTensor,
+    BackendName, BoundNativeGraphPlan, Device, Element, NativeGraph, NativeGraphFamily,
+    NativeGraphMetadata, NativeGraphPlan, NativePort, Tensor, WorkflowTensor,
 };
 use std::{collections::BTreeMap, rc::Rc};
 
@@ -74,6 +85,65 @@ pub(crate) struct HeadGraphClass {
     pub shaped: bool,
 }
 
+/// The admitted head classes used by both prepared formation and metadata
+/// assessment. A causal head has one pass; a drafting head chains up to the
+/// method's proposal bound.
+pub(crate) fn head_graph_classes(
+    limits: ResourceLimits,
+    history_rows: u64,
+    proposals: usize,
+) -> Result<Vec<HeadGraphClass>, String> {
+    let row_classes = magnitude_model_batching::row_classes(limits.max_batch_rows)
+        .into_iter()
+        .map(|rows| rows as u64)
+        .collect::<Vec<_>>();
+    let max_rows = *row_classes
+        .last()
+        .ok_or_else(|| format!("batch row bound {} has no row class", limits.max_batch_rows))?;
+    let slot_bound = limits.in_flight_requests.min(limits.max_batch_rows);
+    let slot_classes = magnitude_model_batching::row_classes(slot_bound)
+        .into_iter()
+        .map(|slots| slots as u64)
+        .collect::<Vec<_>>();
+    let mut classes = Vec::new();
+    for &entry_rows in &row_classes {
+        for &slots in slot_classes.iter().filter(|slots| **slots <= entry_rows) {
+            classes.push(HeadGraphClass {
+                entry_rows,
+                slots,
+                history_rows,
+                steps: 0,
+                shaped: false,
+            });
+        }
+    }
+    for &slots in &slot_classes {
+        let entry_bound = row_class(
+            (slots as usize)
+                .saturating_mul(proposals + 1)
+                .min(max_rows as usize),
+        )
+        .ok_or("head entry row bound has no class")? as u64;
+        for &entry_rows in row_classes
+            .iter()
+            .filter(|rows| **rows >= slots && **rows <= entry_bound)
+        {
+            for steps in 1..=proposals as u64 {
+                for shaped in [false, true] {
+                    classes.push(HeadGraphClass {
+                        entry_rows,
+                        slots,
+                        history_rows,
+                        steps,
+                        shaped,
+                    });
+                }
+            }
+        }
+    }
+    Ok(classes)
+}
+
 /// The per-run inputs of one pass.
 struct PassPorts {
     coordinates: NativePort,
@@ -85,8 +155,112 @@ struct PassPorts {
     selection: Option<SelectionPorts>,
 }
 
-struct PreparedHeadGraph {
-    plan: NativeGraphPlan,
+struct HeadGraphEntries<'a, G: GraphDraft + 'a> {
+    input: G::Binding<'a, draft_rows::Entry>,
+    attention: AttentionGraphEntries<'a, G>,
+    feed_forward: HeadFeedForwardEntries<'a, G>,
+    features: G::Binding<'a, readout_features_rows::Entry>,
+    logits: G::Binding<'a, head_logits_rows::Entry>,
+    shape: G::Binding<'a, shape_rows::Entry>,
+    sample: G::Binding<'a, sample_rows::Entry>,
+}
+
+enum HeadFeedForwardEntries<'a, G: GraphDraft + 'a> {
+    Dense(DenseGraphEntries<'a, G>),
+    Routed(RoutedGraphEntries<'a, G>),
+}
+
+impl<'a> HeadGraphEntries<'a, NativeGraph> {
+    fn prepared(block: &'a AttestedHeadBlock, head: &'a AttestedHead) -> Self {
+        Self {
+            input: &block.input,
+            attention: (&block.attention).into(),
+            feed_forward: match &block.feed_forward {
+                AttestedFeedForward::Dense(handles) => {
+                    HeadFeedForwardEntries::Dense(handles.into())
+                }
+                AttestedFeedForward::Routed(handles) => {
+                    HeadFeedForwardEntries::Routed(handles.into())
+                }
+            },
+            features: &block.features,
+            logits: &block.logits,
+            shape: &head.shape,
+            sample: &head.sample,
+        }
+    }
+}
+
+struct CheckedHeadEntries {
+    input: [(&'static str, Element); 5],
+    attention: CheckedAttentionEntries,
+    feed_forward: CheckedHeadFeedForwardEntries,
+    features: [(&'static str, Element); 2],
+    logits: [(&'static str, Element); 2],
+    selection: [(&'static str, Element); 0],
+}
+
+enum CheckedHeadFeedForwardEntries {
+    Dense(CheckedDenseEntries),
+    Routed(CheckedRoutedEntries),
+}
+
+impl CheckedHeadEntries {
+    fn new(binding: HeadBinding) -> Self {
+        Self {
+            input: [
+                ("EW", binding.embedding_table),
+                ("A", binding.activation),
+                ("EN", binding.embedding_norm),
+                ("HN", binding.hidden_norm),
+                ("CW", binding.combine),
+            ],
+            attention: CheckedAttentionEntries::new(crate::AttentionBinding {
+                shape: binding.attention_shape,
+                norm: binding.input_norm,
+                query_gate: binding.query_gate,
+                key: binding.key,
+                value: binding.value,
+                output: binding.attention_output,
+                activation: binding.activation,
+                history: magnitude_model_state::KvCodec::Dense,
+            }),
+            feed_forward: match binding.feed_forward {
+                FeedForwardProgramSlot::Dense(binding) => {
+                    CheckedHeadFeedForwardEntries::Dense(CheckedDenseEntries::new(binding))
+                }
+                FeedForwardProgramSlot::Routed(binding) => {
+                    CheckedHeadFeedForwardEntries::Routed(CheckedRoutedEntries::new(binding))
+                }
+            },
+            features: [("NW", binding.output_norm), ("A", binding.activation)],
+            logits: [("OW", binding.projection), ("A", binding.activation)],
+            selection: [],
+        }
+    }
+
+    fn entries(&self) -> Result<HeadGraphEntries<'_, NativeGraphMetadata>, String> {
+        Ok(HeadGraphEntries {
+            input: &self.input,
+            attention: self.attention.entries()?,
+            feed_forward: match &self.feed_forward {
+                CheckedHeadFeedForwardEntries::Dense(entries) => {
+                    HeadFeedForwardEntries::Dense(entries.entries())
+                }
+                CheckedHeadFeedForwardEntries::Routed(entries) => {
+                    HeadFeedForwardEntries::Routed(entries.entries())
+                }
+            },
+            features: &self.features,
+            logits: &self.logits,
+            shape: &self.selection,
+            sample: &self.selection,
+        })
+    }
+}
+
+struct HeadGraphParts<P> {
+    plan: P,
     tokens: NativePort,
     conditioning: NativePort,
     out_rows: NativePort,
@@ -100,6 +274,8 @@ struct PreparedHeadGraph {
     output: WorkflowTensor,
 }
 
+type PreparedHeadGraph = HeadGraphParts<NativeGraphPlan>;
+
 pub struct PreparedHeadGraphs {
     classes: BTreeMap<HeadGraphClass, PreparedHeadGraph>,
     family: NativeGraphFamily,
@@ -108,25 +284,360 @@ pub struct PreparedHeadGraphs {
 pub(crate) struct BoundHeadGraphs {
     prepared: Rc<PreparedHeadGraphs>,
     bound: BTreeMap<HeadGraphClass, BoundNativeGraphPlan>,
+    constants: Vec<Tensor>,
 }
 
-fn planned_weight(
-    graph: &mut seismic::NativeGraph,
+fn planned_weight<G: GraphDraft>(
+    graph: &mut G,
     load: &ModelLoadPlan,
     role: WeightRole,
     weights: &mut Vec<(WeightRole, NativePort)>,
-) -> Result<WorkflowTensor, SubmitError> {
+) -> Result<WorkflowTensor, String> {
     let plan = load
         .weights()
         .find(|plan| plan.role == role)
-        .ok_or_else(|| invalid(format!("planned head weight {role:?} is absent")))?;
-    let port = graph.port(plan.resident, &plan.shape).map_err(device)?;
+        .ok_or_else(|| format!("planned head weight {role:?} is absent"))?;
+    let port = graph.port(plan.resident, &plan.shape)?;
     let tensor = port.tensor().clone();
     weights.push((role, port));
     Ok(tensor)
 }
 
+fn head_graph_topology<'a, G: GraphDraft + 'a>(
+    mut graph: G,
+    entries: HeadGraphEntries<'a, G>,
+    load: &ModelLoadPlan,
+    geometry: &DecoderGeometry,
+    attention: &AttentionGeometry,
+    feed_forward: FeedForwardProgramSlot,
+    class: HeadGraphClass,
+) -> Result<HeadGraphParts<G::Plan>, String> {
+    if class.entry_rows == 0
+        || class.slots == 0
+        || class.slots > class.entry_rows
+        || class.history_rows == 0
+        || (class.steps == 0 && class.shaped)
+    {
+        return Err(format!("head graph class {class:?} is inconsistent"));
+    }
+    let hidden = geometry.hidden;
+    let vocabulary = geometry.vocabulary;
+    let epsilon = geometry.epsilon as f32;
+    let mut weights = Vec::new();
+    macro_rules! weight {
+        ($scope:expr, $kind:expr) => {
+            planned_weight(
+                &mut graph,
+                load,
+                WeightRole {
+                    scope: $scope,
+                    kind: $kind,
+                },
+                &mut weights,
+            )?
+        };
+    }
+    let head = WeightScope::HeadBlock(0);
+    let table = weight!(WeightScope::Target, WeightKind::Embedding);
+    let embedding_norm = weight!(head, WeightKind::HeadEmbeddingNorm);
+    let hidden_norm = weight!(head, WeightKind::HeadHiddenNorm);
+    let combine = weight!(head, WeightKind::HeadCombine);
+    let attention_weights = AttentionWeights {
+        input_norm: weight!(head, WeightKind::InputNorm),
+        query_norm: weight!(head, WeightKind::QueryNorm),
+        key_norm: weight!(head, WeightKind::KeyNorm),
+        query_gate: weight!(head, WeightKind::QueryGate),
+        key: weight!(head, WeightKind::Key),
+        value: weight!(head, WeightKind::Value),
+        output: weight!(head, WeightKind::AttentionOutput),
+    };
+    let output_norm = weight!(head, WeightKind::OutputNorm);
+    let draft_vocabulary = draft_vocabulary(vocabulary);
+    let projection = (class.steps > 0)
+        .then(|| -> Result<_, String> {
+            let plan = load
+                .weights()
+                .find(|plan| {
+                    plan.role
+                        == WeightRole {
+                            scope: WeightScope::Target,
+                            kind: WeightKind::Output,
+                        }
+                })
+                .ok_or_else(|| "planned output weight is absent".to_owned())?;
+            graph.port(plan.resident, &[draft_vocabulary, hidden])
+        })
+        .transpose()?;
+
+    let entry_dims = [("M", class.entry_rows), ("V", vocabulary), ("D", hidden)];
+    let tokens = graph.input_for(entries.input, "tokens", &entry_dims)?;
+    let conditioning = graph.input_for(entries.input, "conditioning", &entry_dims)?;
+    let out_rows = graph.input_for(
+        entries.features,
+        "out_rows",
+        &[("M", class.entry_rows), ("O", class.slots), ("D", hidden)],
+    )?;
+    let mut selections = (class.steps > 0)
+        .then(|| {
+            graph.local_for(
+                entries.sample,
+                "result",
+                &[("M", class.steps * class.slots), ("V", draft_vocabulary)],
+            )
+        })
+        .transpose()?;
+    let mut constants = Vec::new();
+    let mut passes = Vec::new();
+    let mut entry_features = None;
+    let mut previous: Option<WorkflowTensor> = None;
+    for pass in 0..class.steps.max(1) {
+        let rows = if pass == 0 {
+            class.entry_rows
+        } else {
+            class.slots
+        };
+        let input = match &previous {
+            None => {
+                graph
+                    .enqueue(
+                        entries.input,
+                        &[("M", rows), ("V", vocabulary), ("D", hidden)],
+                        draft_rows::WorkflowArgs {
+                            tokens: tokens.tensor().into(),
+                            table: (&table).into(),
+                            conditioning: conditioning.tensor().into(),
+                            embedding_norm: (&embedding_norm).into(),
+                            hidden_norm: (&hidden_norm).into(),
+                            combine: (&combine).into(),
+                            epsilon,
+                        },
+                    )?
+                    .value
+            }
+            Some(features) => {
+                let selected = selections
+                    .as_ref()
+                    .ok_or_else(|| "chained pass without selections".to_owned())?
+                    .tensor()
+                    .slice_leading((pass - 1) * class.slots, pass * class.slots);
+                graph
+                    .enqueue(
+                        entries.input,
+                        &[("M", rows), ("V", vocabulary), ("D", hidden)],
+                        draft_rows::WorkflowArgs {
+                            tokens: (&selected).into(),
+                            table: (&table).into(),
+                            conditioning: features.into(),
+                            embedding_norm: (&embedding_norm).into(),
+                            hidden_norm: (&hidden_norm).into(),
+                            combine: (&combine).into(),
+                            epsilon,
+                        },
+                    )?
+                    .value
+            }
+        };
+        let (attended, state, controls) = attention_graph::attention(
+            &mut graph,
+            entries.attention,
+            &attention_weights,
+            &mut constants,
+            &input,
+            AttentionBlock {
+                rows,
+                hidden,
+                segments: HEAD_SEGMENTS,
+                history_rows: class.history_rows,
+                heads: attention.heads,
+                kv_heads: attention.kv_heads,
+                width: attention.width,
+                rotary: &attention.rotary,
+                epsilon,
+                activation: activation(geometry.activation_dtype),
+            },
+        )?;
+        let advanced = match (&entries.feed_forward, feed_forward) {
+            (HeadFeedForwardEntries::Dense(entries), FeedForwardProgramSlot::Dense(_)) => {
+                let feedforward_norm = weight!(head, WeightKind::FeedForwardNorm);
+                let gate_weight = weight!(head, WeightKind::DenseGate);
+                let up_weight = weight!(head, WeightKind::DenseUp);
+                let down_weight = weight!(head, WeightKind::DenseDown);
+                let dense_rows = GraphConstant::identity(&mut graph, rows)?;
+                let dense_dims = dense_dimensions(load, head, rows)?;
+                let product = graph
+                    .enqueue(
+                        entries.expand,
+                        &dense_dims,
+                        dense_expand::WorkflowArgs {
+                            residual: (&attended).into(),
+                            norm: (&feedforward_norm).into(),
+                            gate_weight: (&gate_weight).into(),
+                            up_weight: (&up_weight).into(),
+                            out_rows: dense_rows.port().tensor().into(),
+                            eps: epsilon,
+                        },
+                    )?
+                    .value;
+                let output = graph
+                    .enqueue(
+                        entries.output,
+                        &dense_dims,
+                        dense_output::WorkflowArgs {
+                            residual: (&attended).into(),
+                            product: (&product).into(),
+                            down_weight: (&down_weight).into(),
+                            out_rows: dense_rows.port().tensor().into(),
+                        },
+                    )?
+                    .value;
+                constants.push(dense_rows);
+                output
+            }
+            (HeadFeedForwardEntries::Routed(entries), FeedForwardProgramSlot::Routed(binding)) => {
+                let shape = ExpertGeometry {
+                    count: binding.experts,
+                    selected: binding.selected,
+                    intermediate: binding.features,
+                    shared_intermediate: binding.shared,
+                    normalize_selected: binding.normalize_selected,
+                };
+                routed::routed(
+                    &mut graph,
+                    RoutedGraphEntries {
+                        route: entries.route,
+                        expand: entries.expand,
+                        output: entries.output,
+                        group: entries.group,
+                        experts: entries.experts,
+                        combine: entries.combine,
+                    },
+                    load,
+                    head,
+                    &mut weights,
+                    &attended,
+                    rows,
+                    hidden,
+                    &shape,
+                    epsilon,
+                )?
+            }
+            _ => return Err("head feed-forward entries and plan disagree".into()),
+        };
+        // The entry pass reads each slot's last entry row; a chained
+        // pass has one row per slot.
+        let chained_rows = (pass > 0)
+            .then(|| GraphConstant::identity(&mut graph, class.slots))
+            .transpose()?;
+        let features = graph
+            .enqueue(
+                entries.features,
+                &[("M", rows), ("O", class.slots), ("D", hidden)],
+                readout_features_rows::WorkflowArgs {
+                    hidden: (&advanced).into(),
+                    norm: (&output_norm).into(),
+                    out_rows: chained_rows
+                        .as_ref()
+                        .map_or(out_rows.tensor(), |rows| rows.port().tensor())
+                        .into(),
+                    epsilon,
+                },
+            )?
+            .value;
+        constants.extend(chained_rows);
+        let selection = match (&projection, selections.as_mut()) {
+            (Some(projection), Some(selections)) => {
+                let logits = graph
+                    .enqueue(
+                        entries.logits,
+                        &[("O", class.slots), ("V", draft_vocabulary), ("D", hidden)],
+                        head_logits_rows::WorkflowArgs {
+                            features: (&features).into(),
+                            weight: projection.tensor().into(),
+                        },
+                    )?
+                    .value;
+                let mut result = selections
+                    .tensor()
+                    .slice_leading(pass * class.slots, (pass + 1) * class.slots);
+                Some(readout::sample(
+                    &mut graph,
+                    entries.shape,
+                    entries.sample,
+                    draft_vocabulary,
+                    (&logits).into(),
+                    class.slots,
+                    class.shaped,
+                    (&mut result).into(),
+                )?)
+            }
+            _ => None,
+        };
+        passes.push(PassPorts {
+            coordinates: controls.coordinates,
+            visible: controls.visible,
+            fresh: controls.fresh,
+            destinations: controls.destinations,
+            planes: state.planes,
+            selection,
+        });
+        if pass == 0 {
+            entry_features = Some(features.clone());
+        }
+        previous = Some(features);
+    }
+    let output = match &selections {
+        Some(selections) => selections.tensor().clone(),
+        None => entry_features.ok_or_else(|| "head graph has no entry pass".to_owned())?,
+    };
+    graph.export(&output)?;
+    let plan = graph.seal()?;
+    Ok(HeadGraphParts {
+        plan,
+        tokens,
+        conditioning,
+        out_rows,
+        passes,
+        constants,
+        weights,
+        projection,
+        output,
+    })
+}
+
+pub(crate) fn checked_head_family_storage(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    geometry: &DecoderGeometry,
+    attention: &AttentionGeometry,
+    binding: HeadBinding,
+    classes: impl IntoIterator<Item = HeadGraphClass>,
+) -> Result<CheckedGraphResources, String> {
+    let checked = CheckedHeadEntries::new(binding);
+    let mut family = CheckedGraphFamilyResources::new();
+    for class in classes {
+        let graph = head_graph_topology(
+            NativeGraphMetadata::new(backend),
+            checked.entries()?,
+            load,
+            geometry,
+            attention,
+            binding.feed_forward,
+            class,
+        )?;
+        family.include(graph.plan, graph.constants);
+    }
+    family.finish()
+}
+
 impl PreparedHeadGraphs {
+    pub fn binding_constant_bytes(&self) -> Result<u64, String> {
+        distinct_storage_bytes(
+            self.classes
+                .values()
+                .flat_map(|graph| graph.constants.iter()),
+        )
+    }
+
     pub(crate) fn prepare(
         target_device: &Device,
         kernels: &AttestedHead,
@@ -140,7 +651,8 @@ impl PreparedHeadGraphs {
             if prepared.contains_key(&class) {
                 return Err(invalid("head graph class is duplicated"));
             }
-            let graph = Self::prepare_class(target_device, kernels, load, geometry, attention, class)?;
+            let graph =
+                Self::prepare_class(target_device, kernels, load, geometry, attention, class)?;
             prepared.insert(class, graph);
         }
         if prepared.is_empty() {
@@ -165,273 +677,20 @@ impl PreparedHeadGraphs {
         attention: &AttentionGeometry,
         class: HeadGraphClass,
     ) -> Result<PreparedHeadGraph, SubmitError> {
-        if class.entry_rows == 0
-            || class.slots == 0
-            || class.slots > class.entry_rows
-            || class.history_rows == 0
-            || (class.steps == 0 && class.shaped)
-        {
-            return Err(invalid(format!("head graph class {class:?} is inconsistent")));
-        }
-        let handle = kernels
+        let block = kernels
             .blocks
             .first()
             .ok_or_else(|| invalid("attested head block is absent"))?;
-        let hidden = geometry.hidden;
-        let vocabulary = geometry.vocabulary;
-        let epsilon = geometry.epsilon as f32;
-        let mut graph = target_device.native_graph();
-        let mut weights = Vec::new();
-        macro_rules! weight {
-            ($scope:expr, $kind:expr) => {
-                planned_weight(
-                    &mut graph,
-                    load,
-                    WeightRole {
-                        scope: $scope,
-                        kind: $kind,
-                    },
-                    &mut weights,
-                )?
-            };
-        }
-        let head = WeightScope::HeadBlock(0);
-        let table = weight!(WeightScope::Target, WeightKind::Embedding);
-        let embedding_norm = weight!(head, WeightKind::HeadEmbeddingNorm);
-        let hidden_norm = weight!(head, WeightKind::HeadHiddenNorm);
-        let combine = weight!(head, WeightKind::HeadCombine);
-        let attention_weights = AttentionWeights {
-            input_norm: weight!(head, WeightKind::InputNorm),
-            query_norm: weight!(head, WeightKind::QueryNorm),
-            key_norm: weight!(head, WeightKind::KeyNorm),
-            query_gate: weight!(head, WeightKind::QueryGate),
-            key: weight!(head, WeightKind::Key),
-            value: weight!(head, WeightKind::Value),
-            output: weight!(head, WeightKind::AttentionOutput),
-        };
-        let feedforward_norm = weight!(head, WeightKind::FeedForwardNorm);
-        let gate_weight = weight!(head, WeightKind::DenseGate);
-        let up_weight = weight!(head, WeightKind::DenseUp);
-        let down_weight = weight!(head, WeightKind::DenseDown);
-        let output_norm = weight!(head, WeightKind::OutputNorm);
-        let draft_vocabulary = draft_vocabulary(vocabulary);
-        let projection = (class.steps > 0)
-            .then(|| -> Result<_, SubmitError> {
-                let plan = load
-                    .weights()
-                    .find(|plan| {
-                        plan.role
-                            == WeightRole {
-                                scope: WeightScope::Target,
-                                kind: WeightKind::Output,
-                            }
-                    })
-                    .ok_or_else(|| invalid("planned output weight is absent"))?;
-                graph
-                    .port(plan.resident, &[draft_vocabulary, hidden])
-                    .map_err(device)
-            })
-            .transpose()?;
-
-        let entry_dims = [("M", class.entry_rows), ("V", vocabulary), ("D", hidden)];
-        let tokens = graph
-            .input_for(&handle.input, "tokens", &entry_dims)
-            .map_err(device)?;
-        let conditioning = graph
-            .input_for(&handle.input, "conditioning", &entry_dims)
-            .map_err(device)?;
-        let out_rows = graph
-            .input_for(
-                &handle.features,
-                "out_rows",
-                &[("M", class.entry_rows), ("O", class.slots), ("D", hidden)],
-            )
-            .map_err(device)?;
-        let mut selections = (class.steps > 0)
-            .then(|| {
-                graph.local_for(
-                    &kernels.sample,
-                    "result",
-                    &[("M", class.steps * class.slots), ("V", draft_vocabulary)],
-                )
-            })
-            .transpose()
-            .map_err(device)?;
-        let mut constants = Vec::new();
-        let mut passes = Vec::new();
-        let mut entry_features = None;
-        let mut previous: Option<WorkflowTensor> = None;
-        for pass in 0..class.steps.max(1) {
-            let rows = if pass == 0 { class.entry_rows } else { class.slots };
-            let input = match &previous {
-                None => graph
-                    .enqueue(
-                        &handle.input,
-                        draft_rows::WorkflowArgs {
-                            tokens: tokens.tensor().into(),
-                            table: (&table).into(),
-                            conditioning: conditioning.tensor().into(),
-                            embedding_norm: (&embedding_norm).into(),
-                            hidden_norm: (&hidden_norm).into(),
-                            combine: (&combine).into(),
-                            epsilon,
-                        },
-                    )
-                    .map_err(device)?
-                    .value,
-                Some(features) => {
-                    let selected = selections
-                        .as_ref()
-                        .ok_or_else(|| invalid("chained pass without selections"))?
-                        .tensor()
-                        .slice_leading((pass - 1) * class.slots, pass * class.slots);
-                    graph
-                        .enqueue(
-                            &handle.input,
-                            draft_rows::WorkflowArgs {
-                                tokens: (&selected).into(),
-                                table: (&table).into(),
-                                conditioning: features.into(),
-                                embedding_norm: (&embedding_norm).into(),
-                                hidden_norm: (&hidden_norm).into(),
-                                combine: (&combine).into(),
-                                epsilon,
-                            },
-                        )
-                        .map_err(device)?
-                        .value
-                }
-            };
-            let (attended, state, controls) = attention_graph::attention(
-                &mut graph,
-                &handle.attention,
-                &attention_weights,
-                &mut constants,
-                &input,
-                AttentionBlock {
-                    rows,
-                    segments: HEAD_SEGMENTS,
-                    history_rows: class.history_rows,
-                    heads: attention.heads,
-                    kv_heads: attention.kv_heads,
-                    width: attention.width,
-                    rotary: &attention.rotary,
-                    epsilon,
-                    activation: activation(geometry.activation_dtype),
-                },
-            )
-            .map_err(invalid)?;
-            let dense_rows = GraphConstant::identity(&mut graph, rows).map_err(invalid)?;
-            let product = graph
-                .enqueue(
-                    &handle.dense.expand,
-                    dense_expand::WorkflowArgs {
-                        residual: (&attended).into(),
-                        norm: (&feedforward_norm).into(),
-                        gate_weight: (&gate_weight).into(),
-                        up_weight: (&up_weight).into(),
-                        out_rows: dense_rows.port().tensor().into(),
-                        eps: epsilon,
-                    },
-                )
-                .map_err(device)?
-                .value;
-            let dense = graph
-                .enqueue(
-                    &handle.dense.output,
-                    dense_output::WorkflowArgs {
-                        residual: (&attended).into(),
-                        product: (&product).into(),
-                        down_weight: (&down_weight).into(),
-                        out_rows: dense_rows.port().tensor().into(),
-                    },
-                )
-                .map_err(device)?
-                .value;
-            constants.push(dense_rows);
-            // The entry pass reads each slot's last entry row; a chained
-            // pass has one row per slot.
-            let chained_rows = (pass > 0)
-                .then(|| GraphConstant::identity(&mut graph, class.slots))
-                .transpose()
-                .map_err(invalid)?;
-            let features = graph
-                .enqueue(
-                    &handle.features,
-                    readout_features_rows::WorkflowArgs {
-                        hidden: (&dense).into(),
-                        norm: (&output_norm).into(),
-                        out_rows: chained_rows
-                            .as_ref()
-                            .map_or(out_rows.tensor(), |rows| rows.port().tensor())
-                            .into(),
-                        epsilon,
-                    },
-                )
-                .map_err(device)?
-                .value;
-            constants.extend(chained_rows);
-            let selection = match (&projection, selections.as_mut()) {
-                (Some(projection), Some(selections)) => {
-                    let logits = graph
-                        .enqueue(
-                            &handle.logits,
-                            head_logits_rows::WorkflowArgs {
-                                features: (&features).into(),
-                                weight: projection.tensor().into(),
-                            },
-                        )
-                        .map_err(device)?
-                        .value;
-                    let mut result = selections
-                        .tensor()
-                        .slice_leading(pass * class.slots, (pass + 1) * class.slots);
-                    Some(
-                        readout::sample(
-                            &mut graph,
-                            &kernels.shape,
-                            &kernels.sample,
-                            draft_vocabulary,
-                            (&logits).into(),
-                            class.slots,
-                            class.shaped,
-                            (&mut result).into(),
-                        )
-                        .map_err(invalid)?,
-                    )
-                }
-                _ => None,
-            };
-            passes.push(PassPorts {
-                coordinates: controls.coordinates,
-                visible: controls.visible,
-                fresh: controls.fresh,
-                destinations: controls.destinations,
-                planes: state.planes,
-                selection,
-            });
-            if pass == 0 {
-                entry_features = Some(features.clone());
-            }
-            previous = Some(features);
-        }
-        let output = match &selections {
-            Some(selections) => selections.tensor().clone(),
-            None => entry_features.ok_or_else(|| invalid("head graph has no entry pass"))?,
-        };
-        graph.export(&output).map_err(device)?;
-        let plan = graph.seal().map_err(device)?;
-        Ok(PreparedHeadGraph {
-            plan,
-            tokens,
-            conditioning,
-            out_rows,
-            passes,
-            constants,
-            weights,
-            projection,
-            output,
-        })
+        head_graph_topology(
+            target_device.native_graph(),
+            HeadGraphEntries::prepared(block, kernels),
+            load,
+            geometry,
+            attention,
+            block.binding.feed_forward,
+            class,
+        )
+        .map_err(invalid)
     }
 
     pub fn family(&self) -> &NativeGraphFamily {
@@ -483,11 +742,20 @@ impl PreparedHeadGraphs {
         Ok(BoundHeadGraphs {
             prepared: self.clone(),
             bound,
+            constants: uploaded.into_tensors(),
         })
     }
 }
 
 impl BoundHeadGraphs {
+    fn constant_bytes(&self) -> Result<u64, &'static str> {
+        self.constants.iter().try_fold(0u64, |bytes, tensor| {
+            bytes
+                .checked_add(tensor.storage_bytes())
+                .ok_or("head graph constant charge overflows")
+        })
+    }
+
     fn class(
         &self,
         class: HeadGraphClass,
@@ -529,9 +797,21 @@ fn resident_head_weight(
                 WeightKind::Value => &block.attention.value,
                 WeightKind::AttentionOutput => &block.attention.output,
                 WeightKind::FeedForwardNorm => &block.feedforward_norm,
-                WeightKind::DenseGate => &block.feedforward.gate,
-                WeightKind::DenseUp => &block.feedforward.up,
-                WeightKind::DenseDown => &block.feedforward.down,
+                kind @ (WeightKind::DenseGate
+                | WeightKind::DenseUp
+                | WeightKind::DenseDown
+                | WeightKind::Router
+                | WeightKind::SharedRouter
+                | WeightKind::ExpertGate
+                | WeightKind::ExpertUp
+                | WeightKind::ExpertDown
+                | WeightKind::SharedGate
+                | WeightKind::SharedUp
+                | WeightKind::SharedDown) => block.feedforward.weight(kind).ok_or_else(|| {
+                    invalid(format!(
+                        "head feed-forward role {kind:?} disagrees with its variant"
+                    ))
+                })?,
                 WeightKind::OutputNorm => &block.output_norm,
                 _ => return Err(invalid(format!("head weight role {role:?} is invalid"))),
             }
@@ -575,10 +855,13 @@ impl PassControls {
             }
         }
         let padded = |values: &[[i32; 2]], fill: [i32; 2]| {
-            i32_bytes(
-                (0..rows)
-                    .flat_map(|row| values.get(row).filter(|_| row < actual).copied().unwrap_or(fill)),
-            )
+            i32_bytes((0..rows).flat_map(|row| {
+                values
+                    .get(row)
+                    .filter(|_| row < actual)
+                    .copied()
+                    .unwrap_or(fill)
+            }))
         };
         Ok(Self {
             coordinates: i32_bytes((0..rows).flat_map(|row| {
@@ -590,9 +873,13 @@ impl PassControls {
             })),
             visible: i32_bytes(visible),
             fresh: padded(pass.fresh, [0, 0]),
-            destinations: i32_bytes(
-                (0..rows).map(|row| if row < actual { pass.destinations[row] } else { -1 }),
-            ),
+            destinations: i32_bytes((0..rows).map(|row| {
+                if row < actual {
+                    pass.destinations[row]
+                } else {
+                    -1
+                }
+            })),
         })
     }
 }
@@ -604,6 +891,10 @@ pub struct NativeHeadProgram {
 }
 
 impl NativeHeadProgram {
+    pub(crate) fn constant_bytes(&self) -> Result<u64, &'static str> {
+        self.graphs.constant_bytes()
+    }
+
     pub(crate) fn new(
         geometry: DecoderGeometry,
         graphs: BoundHeadGraphs,
@@ -662,7 +953,9 @@ impl NativeHeadProgram {
         let mut bindings = bound.bindings();
         for pass in &graph.passes {
             if pass.planes.len() != planes.len() {
-                return Err(invalid("head history planes differ from the attention entry"));
+                return Err(invalid(
+                    "head history planes differ from the attention entry",
+                ));
             }
             for (port, plane) in pass.planes.iter().zip(&planes) {
                 bindings.set(port, plane).map_err(device)?;
@@ -676,7 +969,9 @@ impl NativeHeadProgram {
             conditioning.extend_from_slice(rows.bytes());
         }
         if conditioning.len() != entry.actual_rows * row_bytes {
-            return Err(invalid("head conditioning bytes differ from the entry rows"));
+            return Err(invalid(
+                "head conditioning bytes differ from the entry rows",
+            ));
         }
         conditioning.resize(entry_rows * row_bytes, 0);
         let mut active = workspace.slot_mut().activate(&graph.plan).map_err(device)?;
@@ -708,7 +1003,9 @@ impl NativeHeadProgram {
             active
                 .write_input(&ports.visible, &controls.visible)
                 .map_err(device)?;
-            active.write_input(&ports.fresh, &controls.fresh).map_err(device)?;
+            active
+                .write_input(&ports.fresh, &controls.fresh)
+                .map_err(device)?;
             active
                 .write_input(&ports.destinations, &controls.destinations)
                 .map_err(device)?;
@@ -718,7 +1015,9 @@ impl NativeHeadProgram {
             }
         }
         let mut output = output;
-        let outputs = output.activate(&graph.plan).map_err(SubmitError::Invariant)?;
+        let outputs = output
+            .activate(&graph.plan)
+            .map_err(SubmitError::Invariant)?;
         let (outputs, completion) = active
             .attach(bindings, outputs)
             .and_then(|ready| ready.submit())
@@ -736,7 +1035,8 @@ impl NativeHeadProgram {
 }
 
 impl HeadProgram for NativeHeadProgram {
-    type Submission = DeviceSubmission<HeadLaunchCore, NativeGraphWorkspaceLease, Option<GraphOutputTensor>>;
+    type Submission =
+        DeviceSubmission<HeadLaunchCore, NativeGraphWorkspaceLease, Option<GraphOutputTensor>>;
 
     fn submit(
         &mut self,

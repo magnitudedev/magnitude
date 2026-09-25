@@ -87,7 +87,10 @@ impl HeadLaunchInputs {
             .enumerate()
         {
             let chain = self.batch.chain_destinations(index);
-            let written = chain.iter().filter(|destination| **destination >= 0).count();
+            let written = chain
+                .iter()
+                .filter(|destination| **destination >= 0)
+                .count();
             if !advance.belongs_to(store) || slot.rows() + written != advance.rows() {
                 return Err(invalid(format!(
                     "slot {index} differs from its state advance"
@@ -111,7 +114,12 @@ impl HeadLaunchInputs {
                 .destinations()
                 .iter()
                 .copied()
-                .chain(chain.iter().copied().filter(|destination| *destination >= 0))
+                .chain(
+                    chain
+                        .iter()
+                        .copied()
+                        .filter(|destination| *destination >= 0),
+                )
                 .collect::<Vec<_>>();
             if packed != expected {
                 return Err(invalid(format!("slot {index} destinations differ")));

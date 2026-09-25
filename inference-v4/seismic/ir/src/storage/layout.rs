@@ -55,9 +55,12 @@ pub fn addressed_span_u64(
     if units.contains(&0) {
         return Some((0, width));
     }
-    let last = units.iter().zip(strides).try_fold(0u64, |offset, (extent, stride)| {
-        offset.checked_add((extent - 1).checked_mul(*stride)?)
-    })?;
+    let last = units
+        .iter()
+        .zip(strides)
+        .try_fold(0u64, |offset, (extent, stride)| {
+            offset.checked_add((extent - 1).checked_mul(*stride)?)
+        })?;
     Some((last.checked_add(1)?.checked_mul(width)?, width))
 }
 

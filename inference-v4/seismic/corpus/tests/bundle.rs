@@ -13,7 +13,10 @@ fn sources(directory: &Path, found: &mut Vec<PathBuf>) {
         let path = entry.expect("a scenario directory entry").path();
         if path.is_dir() {
             sources(&path, found);
-        } else if path.extension().is_some_and(|extension| extension == "seismic") {
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "seismic")
+        {
             found.push(path);
         }
     }
@@ -29,17 +32,31 @@ fn checked_scenarios_round_trip_through_bundles() {
     let mut failures = Vec::new();
     for path in paths {
         let text = std::fs::read_to_string(&path).expect("the scenario reads");
-        let name = path.strip_prefix(&root).expect("under the root").display().to_string();
+        let name = path
+            .strip_prefix(&root)
+            .expect("under the root")
+            .display()
+            .to_string();
         // The header decides whether the standard library is linked; a
         // header the corpus parser rejects is the matrix suite's failure.
-        let Ok(parsed) = std::panic::catch_unwind(|| scenario::parse(ScenarioName::new(name.clone()), &text))
+        let Ok(parsed) =
+            std::panic::catch_unwind(|| scenario::parse(ScenarioName::new(name.clone()), &text))
         else {
             continue;
         };
-        let mut sources = if parsed.include_std { seismic_std::sources() } else { SourceSet::default() };
-        sources.push(SourceFile { path: name.clone(), text: parsed.source.clone() });
+        let mut sources = if parsed.include_std {
+            seismic_std::sources()
+        } else {
+            SourceSet::default()
+        };
+        sources.push(SourceFile {
+            path: name.clone(),
+            text: parsed.source.clone(),
+        });
         // Scenarios that expect a source error have no checked module.
-        let Ok(checked) = check_source(sources) else { continue };
+        let Ok(checked) = check_source(sources) else {
+            continue;
+        };
         let encoded = encode_checked_bundle(&checked);
         match decode_checked_bundle(&encoded) {
             Ok(decoded) if encode_checked_bundle(&decoded) == encoded => round_tripped += 1,
@@ -47,7 +64,12 @@ fn checked_scenarios_round_trip_through_bundles() {
             Err(error) => failures.push(format!("{name}: {error}")),
         }
     }
-    assert!(failures.is_empty(), "{} scenario(s) fail:\n{}", failures.len(), failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "{} scenario(s) fail:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
     assert!(round_tripped > 0);
     eprintln!("{round_tripped} checked scenarios round-trip");
 }

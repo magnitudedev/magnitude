@@ -67,9 +67,7 @@ pub fn literal_bits(dtype: DType, literal: Literal) -> Result<u64, String> {
         (DType::Bool, Literal::Bool(value)) => u32::from(value),
         (DType::Bool, Literal::Bits(bits @ (0 | 1))) => bits as u32,
         (_, Literal::Bits(bits)) if dtype != DType::Bool && bits >> width == 0 => bits as u32,
-        (dtype, Literal::Decimal(value)) if dtype.is_float() => {
-            float_literal(dtype, value).bits()
-        }
+        (dtype, Literal::Decimal(value)) if dtype.is_float() => float_literal(dtype, value).bits(),
         (dtype, Literal::Integer(value)) if dtype.is_float() => {
             integer_literal(dtype, value).bits()
         }
@@ -79,12 +77,7 @@ pub fn literal_bits(dtype: DType, literal: Literal) -> Result<u64, String> {
         (DType::U32, Literal::Integer(value)) if u32::try_from(value).is_ok() => {
             integer_literal(DType::U32, value).bits()
         }
-        _ => {
-            return Err(format!(
-                "{literal:?} is not a {} element",
-                dtype.name()
-            ))
-        }
+        _ => return Err(format!("{literal:?} is not a {} element", dtype.name())),
     };
     Ok(u64::from(bits))
 }
@@ -216,9 +209,18 @@ mod tests {
 
     #[test]
     fn dense_fills_follow_the_grammar() {
-        let args = generated("f32[3]=seq ; i32[4]=0,2,-1,3 ; bool[3]=seq ; f16[1]=0x3c00", 0);
-        assert_eq!(tensor(&args[0]), [0f32, 1.0, 2.0].map(f32::to_le_bytes).concat());
-        assert_eq!(tensor(&args[1]), [0i32, 2, -1, 3].map(i32::to_le_bytes).concat());
+        let args = generated(
+            "f32[3]=seq ; i32[4]=0,2,-1,3 ; bool[3]=seq ; f16[1]=0x3c00",
+            0,
+        );
+        assert_eq!(
+            tensor(&args[0]),
+            [0f32, 1.0, 2.0].map(f32::to_le_bytes).concat()
+        );
+        assert_eq!(
+            tensor(&args[1]),
+            [0i32, 2, -1, 3].map(i32::to_le_bytes).concat()
+        );
         assert_eq!(tensor(&args[2]), [0, 1, 0]);
         assert_eq!(tensor(&args[3]), [0x00, 0x3c]);
     }
@@ -233,7 +235,10 @@ mod tests {
                 _ => panic!("scalar"),
             })
             .collect();
-        assert_eq!(bits, [0x3a00_0800, 0x3e00, 0x8000, (-7i32) as u32 as u64, 1]);
+        assert_eq!(
+            bits,
+            [0x3a00_0800, 0x3e00, 0x8000, (-7i32) as u32 as u64, 1]
+        );
         assert!(literal_bits(DType::I32, Literal::Integer(1 << 40)).is_err());
         assert!(literal_bits(DType::U32, Literal::Decimal(1.5)).is_err());
     }

@@ -1,7 +1,7 @@
 //! Closed typed-kernel to Metal pipeline compilation.
 
 use crate::command::Pipeline;
-use crate::{Metal, render};
+use crate::{render, Metal};
 use objc2_foundation::NSString;
 use objc2_metal::{MTLDevice, MTLLibrary};
 use seismic_ir::kernel::Kernel;
@@ -78,9 +78,11 @@ pub(crate) fn compile_kernel(
         })
         .and_then(|bytes| {
             bytes.checked_add(
-                layout.words.addressable_resources.len()
-                    * std::mem::size_of::<seismic_ir::physical_target::AddressableResourceWordLayout>(),
-            )
+                    layout.words.addressable_resources.len()
+                        * std::mem::size_of::<
+                            seismic_ir::physical_target::AddressableResourceWordLayout,
+                        >(),
+                )
         })
         .and_then(|bytes| bytes.checked_add(source_text.len()))
         .and_then(|bytes| bytes.checked_add(rendered.name.len()))

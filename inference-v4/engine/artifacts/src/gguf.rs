@@ -6,7 +6,7 @@
 use crate::{ArtifactIdentity, Error, FileSource};
 use std::{
     collections::HashSet,
-    io::{Read, Seek, SeekFrom},
+    io::{BufReader, Read, Seek, SeekFrom},
     path::Path,
     sync::Arc,
 };
@@ -312,6 +312,28 @@ pub fn read_directory<R: Read + Seek>(
     source: &mut R,
     header_limit: u64,
 ) -> Result<Directory, Error> {
+    read_directory_with_payload(source, header_limit, true)
+}
+
+/// Inspect a downloaded GGUF header bundle before weight payloads exist.
+/// Header bounds, tensor geometry, offsets, and non-overlap are validated;
+/// only the physical presence of declared tensor bytes is deferred.
+pub fn inspect_header(path: impl AsRef<Path>) -> Result<Directory, Error> {
+    let source = FileSource::open(path)?;
+    let directory = read_directory_with_payload(
+        &mut BufReader::with_capacity(1 << 20, source.reader()),
+        DEFAULT_HEADER_LIMIT,
+        false,
+    )?;
+    directory.require_execution_byte_order()?;
+    Ok(directory)
+}
+
+fn read_directory_with_payload<R: Read + Seek>(
+    source: &mut R,
+    header_limit: u64,
+    require_payload: bool,
+) -> Result<Directory, Error> {
     let size = source.seek(SeekFrom::End(0))?;
     source.seek(SeekFrom::Start(0))?;
     let mut reader = Reader {
@@ -417,7 +439,7 @@ pub fn read_directory<R: Read + Seek>(
         let next = start
             .checked_add(tensor.nbytes)
             .ok_or_else(|| invalid("GGUF tensor end overflows"))?;
-        if start < end || next > size {
+        if start < end || (require_payload && next > size) {
             return Err(invalid(format!(
                 "overlapping or truncated tensor {:?}",
                 tensor.name
@@ -466,9 +488,12 @@ pub struct GgufArtifact {
 impl GgufArtifact {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let source = Arc::new(FileSource::open(path)?);
-        let directory = read_directory(&mut source.reader(), DEFAULT_HEADER_LIMIT)?;
+        let directory = read_directory(
+            &mut BufReader::with_capacity(1 << 20, source.reader()),
+            DEFAULT_HEADER_LIMIT,
+        )?;
         directory.require_execution_byte_order()?;
-        let identity = source.digest()?;
+        let identity = ArtifactIdentity::for_open();
         Ok(Self {
             directory,
             source,

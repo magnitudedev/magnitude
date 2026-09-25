@@ -175,7 +175,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 Ok([
                     i32_of(start, "history start")?,
                     i32_of(
-                        start.checked_add(count).ok_or("head history end overflow")?,
+                        start
+                            .checked_add(count)
+                            .ok_or("head history end overflow")?,
                         "history end",
                     )?,
                 ])
@@ -207,7 +209,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .iter()
             .enumerate()
             .map(|(index, token)| {
-                row(index, i32::try_from(token.0).map_err(|_| "head token exceeds i32")?, history.clone())
+                row(
+                    index,
+                    i32::try_from(token.0).map_err(|_| "head token exceeds i32")?,
+                    history.clone(),
+                )
             })
             .collect::<Result<Vec<_>, String>>()?;
         // Chained row j sees the history, the entry rows, and the chained
@@ -276,17 +282,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             ));
         }
         let selected = match selections {
-            Some(selections) => decode_selected(
-                &selections
-                    .tensor()
-                    .read_to_host()
-                    .map_err(|error| DomainError::Device(crate::DeviceError::Transfer(error.to_string())))?,
-            )
-            .map_err(DomainError::invariant)?,
+            Some(selections) => {
+                decode_selected(&selections.tensor().read_to_host().map_err(|error| {
+                    DomainError::Device(crate::DeviceError::Transfer(error.to_string()))
+                })?)
+                .map_err(DomainError::invariant)?
+            }
             None => Vec::new(),
         };
         let slot_class = selected.len().checked_div(flight.steps).unwrap_or(0);
-        if flight.steps != 0 && (slot_class < slots || selected.len() != flight.steps * slot_class) {
+        if flight.steps != 0 && (slot_class < slots || selected.len() != flight.steps * slot_class)
+        {
             return Err(DomainError::invariant(
                 "head selections differ from the batch's steps and slots",
             ));
@@ -297,20 +303,22 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .into_iter()
             .zip(advances)
             .enumerate()
-            .map(|(slot, ((request, rows, proposals), advance))| PendingOperationOutcome {
-                request,
-                outcome: Outcome::Head {
-                    proposals: (0..proposals)
-                        .map(|step| selected[step * slot_class + slot])
-                        .collect(),
+            .map(
+                |(slot, ((request, rows, proposals), advance))| PendingOperationOutcome {
+                    request,
+                    outcome: Outcome::Head {
+                        proposals: (0..proposals)
+                            .map(|step| selected[step * slot_class + slot])
+                            .collect(),
+                    },
+                    advance: Some(advance),
+                    rows: advance_rows(rows, proposals),
+                    committed_rows: rows,
+                    kind: WorkKind::Decode,
+                    physical_duration: duration,
+                    image: None,
                 },
-                advance: Some(advance),
-                rows: advance_rows(rows, proposals),
-                committed_rows: rows,
-                kind: WorkKind::Decode,
-                physical_duration: duration,
-                image: None,
-            })
+            )
             .collect())
     }
 }

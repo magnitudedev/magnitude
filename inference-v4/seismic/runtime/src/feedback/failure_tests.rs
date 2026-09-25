@@ -30,7 +30,9 @@ fn validate_failure<T: TargetFamily, E: NativeExecutor<T>>(
         ],
     };
     let request = || ObservationRequest {
-        candidate: prepared.kernel.candidate_for_variant(prepared.kernel.select(&case.values)),
+        candidate: prepared
+            .kernel
+            .candidate_for_variant(prepared.kernel.select(&case.values)),
         reference: reference.as_view(),
         executable: prepared.kernel.variants().first(),
         precision: &PrecisionPolicy::Exact,
@@ -102,7 +104,12 @@ fn native_failure(backend: registry::BackendName) {
     let device = catalog.open_backend(backend).unwrap();
     let module=check_source(SourceSet::new(vec![SourceFile {path:"failed-native-outcome.seismic".into(),text:
         "fn probe(dst: &mut tensor[2] i32, divisor: i32):\n    dst[0] = 7\n    let unused = 42 / divisor\n    dst[1] = 9\n\nfn before_alloc(dst: &mut tensor[2] i32, divisor: i32):\n    parallel for i in 0..1:\n        dst[i] = 7\n        let stopped = 42 / divisor\n        let mut local = tensor[1] i32\n        local[0] = 29\n        dst[i+1] = local[0]\n\nfn before_store(dst: &mut tensor[2] i32, divisor: i32):\n    dst[0] = 7\n    let failed_rhs = dst / divisor\n    dst[:] = failed_rhs\n\nfn returned(dst: &mut tensor[2] i32, divisor: i32) -> tensor[2] i32:\n    dst[0] = 7\n    return dst + dst\n".into()}])).unwrap();
-    for (name, failed) in [("probe", true), ("before_alloc", true), ("before_store", true), ("returned", false)] {
+    for (name, failed) in [
+        ("probe", true),
+        ("before_alloc", true),
+        ("before_store", true),
+        ("returned", false),
+    ] {
         let id = module.entry_named(name).unwrap();
         let reference = module.entry(id, &ElementBindings::default()).unwrap();
         let kernel = crate::api::kernel::prepare(
@@ -148,25 +155,52 @@ fn reached_private_allocation_preserves_prefix(source: &str) {
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "reached-private.seismic".into(),
         text: source.into(),
-    }])).unwrap();
+    }]))
+    .unwrap();
     let kernel = crate::api::kernel::prepare(
-        &module, module.entry_named("main").unwrap(), ElementBindings::default(), &device,
-        PreparationOptions::feedback(PrecisionPolicy::Exact, FeedbackOptions {
-            search_time: Duration::ZERO, ..Default::default()
-        }),
-    ).unwrap();
-    let output = Arc::new(TensorInner::from_host(
-        &device, registry::dense(DType::I32), &[1], &0i32.to_le_bytes(),
-    ).unwrap());
+        &module,
+        module.entry_named("main").unwrap(),
+        ElementBindings::default(),
+        &device,
+        PreparationOptions::feedback(
+            PrecisionPolicy::Exact,
+            FeedbackOptions {
+                search_time: Duration::ZERO,
+                ..Default::default()
+            },
+        ),
+    )
+    .unwrap();
+    let output = Arc::new(
+        TensorInner::from_host(
+            &device,
+            registry::dense(DType::I32),
+            &[1],
+            &0i32.to_le_bytes(),
+        )
+        .unwrap(),
+    );
     let baseline = device.memory_usage().charged;
-    device.set_memory_limit(Some(baseline + 4096)).unwrap();
+    device.set_memory_limit(Some(baseline + 4096));
     let mut args = EncodedArgs::new();
     args.push_tensor(output.clone());
     args.push_scalar(crate::api::kernel::EncodedScalar::I32(0));
-    let error = crate::api::kernel::call(&Arc::new(kernel), args).err().expect("division fails after the first allocation");
-    assert!(matches!(error, crate::api::CallError::Execution(ExecutionError::DataCheckFailed(_))), "{error:?}");
+    let error = crate::api::kernel::call(&Arc::new(kernel), args)
+        .err()
+        .expect("division fails after the first allocation");
+    assert!(
+        matches!(
+            error,
+            crate::api::CallError::Execution(ExecutionError::DataCheckFailed(_))
+        ),
+        "{error:?}"
+    );
     assert_eq!(output.read_to_host().unwrap(), 7i32.to_le_bytes());
-    assert_eq!(device.memory_usage().charged, baseline, "failed run released its private backing");
+    assert_eq!(
+        device.memory_usage().charged,
+        baseline,
+        "failed run released its private backing"
+    );
 }
 
 #[test]
@@ -185,23 +219,45 @@ fn reached_geometry_outcome(source: &str, with_inputs: bool, expected: &[i32]) {
     let catalog = crate::devices::Catalog::discover().unwrap();
     let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
     let module = check_source(SourceSet::new(vec![SourceFile {
-        path: "reached-geometry.seismic".into(), text: source.into(),
-    }])).unwrap();
-    let kernel = Arc::new(crate::api::kernel::prepare(
-        &module, module.entry_named("probe").unwrap(), ElementBindings::default(), &device,
-        PreparationOptions::feedback(PrecisionPolicy::Exact, FeedbackOptions {
-            search_time: Duration::ZERO, ..Default::default()
-        }),
-    ).unwrap());
-    let tensor = |shape: &[u64], data: &[i32]| Arc::new(TensorInner::from_host(
-        &device, registry::dense(DType::I32), shape,
-        &data.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>(),
-    ).unwrap());
+        path: "reached-geometry.seismic".into(),
+        text: source.into(),
+    }]))
+    .unwrap();
+    let kernel = Arc::new(
+        crate::api::kernel::prepare(
+            &module,
+            module.entry_named("probe").unwrap(),
+            ElementBindings::default(),
+            &device,
+            PreparationOptions::feedback(
+                PrecisionPolicy::Exact,
+                FeedbackOptions {
+                    search_time: Duration::ZERO,
+                    ..Default::default()
+                },
+            ),
+        )
+        .unwrap(),
+    );
+    let tensor = |shape: &[u64], data: &[i32]| {
+        Arc::new(
+            TensorInner::from_host(
+                &device,
+                registry::dense(DType::I32),
+                shape,
+                &data
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        )
+    };
     let output = tensor(&[4], &[0; 4]);
     let input = tensor(&[8, 2], &[0; 16]);
     let visible = tensor(&[4, 2], &[0, 0, 1, 4, 0, 8, 4, 5]);
     let baseline = device.memory_usage().charged;
-    device.set_memory_limit(Some(baseline + 4096)).unwrap();
+    device.set_memory_limit(Some(baseline + 4096));
     let mut args = EncodedArgs::new();
     if with_inputs {
         args.push_tensor(input.clone());
@@ -210,14 +266,22 @@ fn reached_geometry_outcome(source: &str, with_inputs: bool, expected: &[i32]) {
     args.push_tensor(output.clone());
     crate::api::kernel::call(&kernel, args).unwrap();
     let bytes = output.read_to_host().unwrap();
-    let actual = bytes.chunks_exact(4).map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap())).collect::<Vec<_>>();
+    let actual = bytes
+        .chunks_exact(4)
+        .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect::<Vec<_>>();
     assert_eq!(actual, expected);
-    assert_eq!(device.memory_usage().charged, baseline, "completed region releases private instances");
+    assert_eq!(
+        device.memory_usage().charged,
+        baseline,
+        "completed region releases private instances"
+    );
 }
 
 #[test]
 fn cpu_reached_helper_geometry_follows_actual_slice() {
-    reached_geometry_outcome(r#"fn seed[M,K](x: &tensor[M,K] i32) -> i32:
+    reached_geometry_outcome(
+        r#"fn seed[M,K](x: &tensor[M,K] i32) -> i32:
     let mut scratch = tensor[M,K] i32
     scratch[:] = ones_like(scratch)
     return reduce(reduce(scratch, 1, sum), 0, sum)
@@ -228,24 +292,32 @@ fn probe(input: &tensor[8,2] i32, visible: &tensor[4,2] i32, out: &mut tensor[4]
         let hi = visible[i,1]
         if hi > lo:
             out[i] = seed(input[lo:hi,:])
-"#, true, &[0, 6, 16, 2]);
+"#,
+        true,
+        &[0, 6, 16, 2],
+    );
 }
 
 #[test]
 fn cpu_reached_snapshot_preserves_varying_axes_and_old_contents() {
-    reached_geometry_outcome(r#"fn probe(out: &mut tensor[4] i32):
+    reached_geometry_outcome(
+        r#"fn probe(out: &mut tensor[4] i32):
     parallel for i in 0..4:
         let mut local = tensor[i+1,i+2] i32
         local[:] = ones_like(local)
         let captured = local + local
         local[0,0] = 7
         out[i] = captured[0,0] + captured[i,i+1]
-"#, false, &[4, 4, 4, 4]);
+"#,
+        false,
+        &[4, 4, 4, 4],
+    );
 }
 
 #[test]
 fn cpu_reached_helper_geometry_composes_transpose_empty_and_full_views() {
-    reached_geometry_outcome(r#"fn seed[N](x: &tensor[N] i32) -> i32 where N >= 0:
+    reached_geometry_outcome(
+        r#"fn seed[N](x: &tensor[N] i32) -> i32 where N >= 0:
     let scratch = ones_like(x)
     return reduce(scratch, 0, sum)
 
@@ -258,12 +330,16 @@ fn probe(input: &tensor[8,2] i32, visible: &tensor[4,2] i32, out: &mut tensor[4]
         let empty = seed(input[0:0,1])
         let full = seed(input[:,1])
         out[i] = dynamic + empty + full
-"#, true, &[8, 11, 16, 9]);
+"#,
+        true,
+        &[8, 11, 16, 9],
+    );
 }
 
 #[test]
 fn cpu_reached_branch_result_keeps_selected_instance_across_visits() {
-    reached_geometry_outcome(r#"fn probe(out: &mut tensor[4] i32):
+    reached_geometry_outcome(
+        r#"fn probe(out: &mut tensor[4] i32):
     for i in 0..4:
         let mut selected = tensor[2] i32
         selected[:] = ones_like(selected)
@@ -272,5 +348,8 @@ fn cpu_reached_branch_result_keeps_selected_instance_across_visits() {
             replacement[:] = ones_like(replacement) * 7
             selected = replacement
         out[i] = selected[0]
-"#, false, &[7, 1, 7, 1]);
+"#,
+        false,
+        &[7, 1, 7, 1],
+    );
 }

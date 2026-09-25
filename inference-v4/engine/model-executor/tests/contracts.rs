@@ -183,6 +183,8 @@ fn head_conditioning_rows_must_match_its_entry_rows() {
     assert_eq!(drafting.demand(), Demand::SELECT);
     assert_eq!(head(1, 1, 0).demand(), Demand::NONE);
     assert!(magnitude_model_executor::FeatureRows::new(vec![0u8; 5].into(), 2).is_err());
-    assert!(rows(2).concat(&rows(1)).is_ok_and(|joined| joined.rows() == 3));
+    assert!(rows(2)
+        .concat(&rows(1))
+        .is_ok_and(|joined| joined.rows() == 3));
     assert!(rows(3).slice(1, 3).is_err());
 }

@@ -17,9 +17,11 @@ mod source;
 pub use error::Error;
 pub use identity::{ArtifactIdentity, PackageIdentity};
 pub use layout::{BoundaryRule, InputLayout, InputSpan};
-pub use package::{ComponentManifest, Package, PackageManifest};
+pub use package::{ComponentManifest, Package, PackageHeaders, PackageManifest};
 pub use payload::{TemplatePayload, TemplateSource, TokenizerPayload};
 pub use preprocessing::{ImageProcessor, ImageProcessorConfig, MAX_IMAGES_PER_REQUEST};
+#[cfg(unix)]
+pub use source::MappedWindow;
 pub use source::{FileSource, SourceReader};
 pub use token::TokenId;
 

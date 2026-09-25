@@ -37,12 +37,11 @@ native repack_weight for cuda from "cuda/repack_weight.cu":
         threadgroups (ceil_div(K, 256) * 8, ceil_div(N, 16), B)
         threads_per_threadgroup (32, 1, 1)
 
-# CPU: each work item converts whole eight-row tiles within one [N, K]
-# matrix. The destination may be rows16 or the interleaved rows8 resident layout.
+# CPU: each work item converts one eight-row tile within one [N, K]
+# matrix. This tile is the physical write unit of interleaved rows8 storage.
 native repack_weight for cpu from "cpu/repack_weight.rs":
-    params (ROWS in [16, 64, 8])
     launch repack_weight:
-        threadgroups (ceil_div(N, ROWS), B, 1)
+        threadgroups (ceil_div(N, 8), B, 1)
         threads_per_threadgroup (1, 1, 1)
 
 # Vulkan: a grid-stride loop over every element; the x grid is capped at the
@@ -52,12 +51,11 @@ native import_dense for vulkan from "vulkan/import_dense.comp":
         threadgroups (min(ceil_div(B * N * K, 256), 65535), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# CPU: each work item decodes ROWS source rows of the [B, N, K] view to F32
+# CPU: each work item decodes 16 source rows of the [B, N, K] view to F32
 # (its private bytes) and stores them rounded to U.
 native import_dense for cpu from "cpu/import_dense.rs":
-    params (ROWS in [16, 4, 64, 1])
     launch import_dense:
-        threadgroups (ceil_div(B * N, ROWS), 1, 1)
+        threadgroups (ceil_div(B * N, 16), 1, 1)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (K * 4)
 

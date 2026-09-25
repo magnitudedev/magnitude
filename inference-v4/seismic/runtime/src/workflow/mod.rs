@@ -123,7 +123,10 @@ pub enum ScalarValue {
     U32(u32),
     Bool(bool),
     Index(seismic_lang::expr::BigUint),
-    Range { start: seismic_lang::expr::BigUint, end: seismic_lang::expr::BigUint },
+    Range {
+        start: seismic_lang::expr::BigUint,
+        end: seismic_lang::expr::BigUint,
+    },
 }
 
 impl ScalarValue {
@@ -243,7 +246,10 @@ pub(crate) enum Acquisition {
 }
 impl Acquisition {
     pub(crate) fn initial_bytes(self) -> Option<u64> {
-        match self { Self::Invocation(bytes) => Some(bytes), Self::ReachedPrivate => None }
+        match self {
+            Self::Invocation(bytes) => Some(bytes),
+            Self::ReachedPrivate => None,
+        }
     }
 }
 
@@ -421,10 +427,12 @@ impl<S, E> WorkflowPlanDraft<S, E> {
     pub(crate) fn bindings_ready(&self, bindings: &[ArgumentBinding]) -> bool {
         bindings.iter().all(|binding| match binding {
             ArgumentBinding::External(_) => true,
-            ArgumentBinding::Result(result) | ArgumentBinding::View { result, .. }
+            ArgumentBinding::Result(result)
+            | ArgumentBinding::View { result, .. }
             | ArgumentBinding::ResultView { result, .. } => matches!(
                 self.resolve_result(*result),
-                Ok(ValueDescriptor::Tensor(_)) | Ok(ValueDescriptor::Scalar(ScalarDescriptor::HostReady(_)))
+                Ok(ValueDescriptor::Tensor(_))
+                    | Ok(ValueDescriptor::Scalar(ScalarDescriptor::HostReady(_)))
             ),
         })
     }
@@ -439,8 +447,12 @@ impl<S, E> WorkflowPlanDraft<S, E> {
         bind: impl FnOnce(Vec<ValueDescriptor>) -> Result<BoundInvocation<S>, E>,
     ) -> Result<BoundInvocation<S>, PlanError<E>> {
         let previous = self.lifetimes.clone();
-        let result = bindings.iter().cloned().map(|binding| self.resolve_binding(binding, node))
-            .collect::<Result<Vec<_>, _>>().and_then(|arguments| bind(arguments).map_err(PlanError::Policy));
+        let result = bindings
+            .iter()
+            .cloned()
+            .map(|binding| self.resolve_binding(binding, node))
+            .collect::<Result<Vec<_>, _>>()
+            .and_then(|arguments| bind(arguments).map_err(PlanError::Policy));
         // Insertion owns graph lifetime changes. Preparing an invocation only
         // proves that its present argument descriptors can select/bind it.
         self.lifetimes = previous;
@@ -510,7 +522,9 @@ impl<S, E> WorkflowPlanDraft<S, E> {
                     ));
                 }
                 (ValueDescriptor::PendingTensor { .. }, _) => {
-                    return Err(PlanError::InvalidPolicyDescription("pending output cannot bind an invocation"));
+                    return Err(PlanError::InvalidPolicyDescription(
+                        "pending output cannot bind an invocation",
+                    ));
                 }
             }
         }
@@ -548,11 +562,21 @@ impl<S, E> WorkflowPlanDraft<S, E> {
                 lifetime,
             });
             if let Some(bytes) = allocation.acquisition.initial_bytes() {
-                coalesce_identical_access(&mut accesses, ResourceAccess {
-                    resource, range: ByteRange { offset: 0, len: bytes }, mode: AccessMode::ReadWrite,
-                });
+                coalesce_identical_access(
+                    &mut accesses,
+                    ResourceAccess {
+                        resource,
+                        range: ByteRange {
+                            offset: 0,
+                            len: bytes,
+                        },
+                        mode: AccessMode::ReadWrite,
+                    },
+                );
             } else if !matches!(allocation.kind, AllocationKind::Temporary) {
-                return Err(PlanError::InvalidPolicyDescription("reached backing must be invocation-private"));
+                return Err(PlanError::InvalidPolicyDescription(
+                    "reached backing must be invocation-private",
+                ));
             }
             // An unpublished node-local resource has no cross-node access edge.
             // Its allocation identity and lifetime still belong to this graph.
@@ -634,8 +658,17 @@ impl<S, E> WorkflowPlanDraft<S, E> {
         private_resources: &[ResourceRequirement],
         accesses: &mut Vec<ResourceAccess>,
     ) -> Result<ValueDescriptor, PlanError<E>> {
-        if let OutputDescription::ProducedTensor { device, representation, rank } = description {
-            return Ok(ValueDescriptor::PendingTensor { device, representation, rank });
+        if let OutputDescription::ProducedTensor {
+            device,
+            representation,
+            rank,
+        } = description
+        {
+            return Ok(ValueDescriptor::PendingTensor {
+                device,
+                representation,
+                rank,
+            });
         }
         let OutputDescription::Tensor {
             device,
@@ -725,7 +758,11 @@ impl<S, E> WorkflowPlanDraft<S, E> {
                 };
                 if !(ByteRange {
                     offset: 0,
-                    len: source.acquisition.initial_bytes().ok_or(PlanError::InvalidPolicyDescription("reached private backing cannot be published"))?,
+                    len: source.acquisition.initial_bytes().ok_or(
+                        PlanError::InvalidPolicyDescription(
+                            "reached private backing cannot be published",
+                        ),
+                    )?,
                 })
                 .contains(range)
                 {
@@ -771,7 +808,8 @@ impl<S, E> WorkflowPlanDraft<S, E> {
                 let value = self.resolve_result(reference)?.clone();
                 if matches!(
                     value,
-                    ValueDescriptor::Scalar(ScalarDescriptor::DeviceProduced) | ValueDescriptor::PendingTensor { .. }
+                    ValueDescriptor::Scalar(ScalarDescriptor::DeviceProduced)
+                        | ValueDescriptor::PendingTensor { .. }
                 ) {
                     return Err(PlanError::HostBoundaryRequired(reference));
                 }
@@ -863,16 +901,31 @@ impl<S, E> WorkflowPlanDraft<S, E> {
         tensor: TensorDescriptor,
     ) -> Result<(), PlanError<E>> {
         let expected = self.resolve_result(reference)?;
-        let ValueDescriptor::PendingTensor { device, representation, rank } = expected else {
-            return Err(PlanError::InvalidPolicyDescription("tensor result was already published or has another type"));
+        let ValueDescriptor::PendingTensor {
+            device,
+            representation,
+            rank,
+        } = expected
+        else {
+            return Err(PlanError::InvalidPolicyDescription(
+                "tensor result was already published or has another type",
+            ));
         };
-        if *device != tensor.device || *representation != tensor.representation || *rank != tensor.extents.len() {
-            return Err(PlanError::InvalidPolicyDescription("published tensor differs from its result schema"));
+        if *device != tensor.device
+            || *representation != tensor.representation
+            || *rank != tensor.extents.len()
+        {
+            return Err(PlanError::InvalidPolicyDescription(
+                "published tensor differs from its result schema",
+            ));
         }
         validate_tensor(&tensor)?;
-        let lifetime = self.lifetimes.get_mut(&tensor.resource).ok_or(
-            PlanError::InvalidPolicyDescription("published backing is not owned by the workflow"),
-        )?;
+        let lifetime =
+            self.lifetimes
+                .get_mut(&tensor.resource)
+                .ok_or(PlanError::InvalidPolicyDescription(
+                    "published backing is not owned by the workflow",
+                ))?;
         lifetime.end = lifetime.end.max(next_boundary(reference.node)?);
         let value = ValueDescriptor::Tensor(tensor);
         self.outputs[reference.node as usize][reference.output as usize] = value.clone();
@@ -902,8 +955,17 @@ impl<S, E> WorkflowPlanDraft<S, E> {
                 // capacity at a later invocation. All alignments are powers of
                 // two, so their maximum satisfies every declaration.
                 existing.acquisition = Acquisition::Invocation(
-                    existing.acquisition.initial_bytes().expect("persistent backing is initially acquired")
-                        .max(requirement.acquisition.initial_bytes().expect("persistent backing is initially acquired")));
+                    existing
+                        .acquisition
+                        .initial_bytes()
+                        .expect("persistent backing is initially acquired")
+                        .max(
+                            requirement
+                                .acquisition
+                                .initial_bytes()
+                                .expect("persistent backing is initially acquired"),
+                        ),
+                );
                 existing.alignment = existing.alignment.max(requirement.alignment);
                 existing.lifetime.first = existing.lifetime.first.min(requirement.lifetime.first);
                 existing.lifetime.end = existing.lifetime.end.max(requirement.lifetime.end);
@@ -965,7 +1027,9 @@ fn validate_alignment<E>(alignment: u64) -> Result<(), PlanError<E>> {
 
 fn validate_value<E>(value: &ValueDescriptor) -> Result<(), PlanError<E>> {
     if matches!(value, ValueDescriptor::PendingTensor { .. }) {
-        return Err(PlanError::InvalidPolicyDescription("unpublished tensor cannot be an external value"));
+        return Err(PlanError::InvalidPolicyDescription(
+            "unpublished tensor cannot be an external value",
+        ));
     }
     if let ValueDescriptor::Tensor(tensor) = value {
         validate_tensor(tensor)?;
@@ -1102,26 +1166,52 @@ mod tests {
     #[test]
     fn ready_independent_root_binds_without_waiting_for_an_earlier_dependent() {
         let mut draft = WorkflowPlanDraft::new();
-        let output = draft.push(policy(0, 0, vec![OutputDescription::ProducedTensor {
-            device: DeviceIdentity(1), representation: representation(), rank: 1,
-        }]), vec![]).unwrap()[0];
+        let output = draft
+            .push(
+                policy(
+                    0,
+                    0,
+                    vec![OutputDescription::ProducedTensor {
+                        device: DeviceIdentity(1),
+                        representation: representation(),
+                        rank: 1,
+                    }],
+                ),
+                vec![],
+            )
+            .unwrap()[0];
         let dependent = vec![ArgumentBinding::Result(output)];
         assert!(!draft.bindings_ready(&dependent));
         let independent = policy(2, 0, vec![]);
         assert!(draft.bindings_ready(&[]));
-        let prepared = draft.prepare_at(2, &[], |arguments| independent.evaluate(arguments)).unwrap();
+        let prepared = draft
+            .prepare_at(2, &[], |arguments| independent.evaluate(arguments))
+            .unwrap();
         assert_eq!(prepared.selection, 2);
         assert_eq!(independent.evaluations.get(), 1);
-        assert_eq!(draft.nodes.len(), 1, "prebinding does not change node ordinals or execute the root");
-        assert!(draft.requirements.is_empty(), "prebinding reserves no speculative backing");
+        assert_eq!(
+            draft.nodes.len(),
+            1,
+            "prebinding does not change node ordinals or execute the root"
+        );
+        assert!(
+            draft.requirements.is_empty(),
+            "prebinding reserves no speculative backing"
+        );
     }
 
     #[test]
     fn produced_tensor_binds_dependents_only_after_actual_publication() {
         let mut draft = WorkflowPlanDraft::new();
-        let mut producer = policy(0, 0, vec![OutputDescription::ProducedTensor {
-            device: DeviceIdentity(1), representation: representation(), rank: 1,
-        }]);
+        let mut producer = policy(
+            0,
+            0,
+            vec![OutputDescription::ProducedTensor {
+                device: DeviceIdentity(1),
+                representation: representation(),
+                rank: 1,
+            }],
+        );
         producer.allocations.push(AllocationDescription {
             kind: AllocationKind::Temporary,
             acquisition: Acquisition::ReachedPrivate,
@@ -1129,22 +1219,35 @@ mod tests {
         });
         let output = draft.push(producer, vec![]).unwrap()[0];
         let consumer = policy(1, 1, vec![]);
-        assert!(matches!(draft.push(consumer.clone(), vec![ArgumentBinding::Result(output)]),
-            Err(PlanError::HostBoundaryRequired(_))));
+        assert!(matches!(
+            draft.push(consumer.clone(), vec![ArgumentBinding::Result(output)]),
+            Err(PlanError::HostBoundaryRequired(_))
+        ));
         assert_eq!(consumer.evaluations.get(), 0);
         let backing = draft.nodes[0].private_resources[0].resource;
         let actual = TensorDescriptor {
-            device: DeviceIdentity(1), resource: backing,
-            representation: representation(), extents: vec![3], strides: vec![2],
+            device: DeviceIdentity(1),
+            resource: backing,
+            representation: representation(),
+            extents: vec![3],
+            strides: vec![2],
             range: ByteRange { offset: 4, len: 20 },
         };
         draft.publish_tensor(output, actual.clone()).unwrap();
         assert!(draft.publish_tensor(output, actual.clone()).is_err());
-        draft.push(consumer.clone(), vec![ArgumentBinding::Result(output)]).unwrap();
+        draft
+            .push(consumer.clone(), vec![ArgumentBinding::Result(output)])
+            .unwrap();
         assert_eq!(consumer.evaluations.get(), 1);
-        assert_eq!(draft.nodes[1].arguments, vec![ValueDescriptor::Tensor(actual)]);
+        assert_eq!(
+            draft.nodes[1].arguments,
+            vec![ValueDescriptor::Tensor(actual)]
+        );
         assert_eq!(draft.nodes[1].dependencies, vec![0]);
-        assert_eq!(draft.requirements[&backing].acquisition, Acquisition::ReachedPrivate);
+        assert_eq!(
+            draft.requirements[&backing].acquisition,
+            Acquisition::ReachedPrivate
+        );
     }
 
     #[test]
@@ -1217,23 +1320,44 @@ mod tests {
         let requirement = &plan.nodes()[0].private_resources[0];
         assert_eq!(requirement.acquisition.initial_bytes(), None);
         assert_eq!(requirement.lifetime, Lifetime { first: 0, end: 1 });
-        assert_eq!(plan.requirements().get(&requirement.resource), Some(requirement));
-        assert!(plan.nodes()[0].accesses.is_empty(), "unpublished node-local backing has no cross-node hazard");
+        assert_eq!(
+            plan.requirements().get(&requirement.resource),
+            Some(requirement)
+        );
+        assert!(
+            plan.nodes()[0].accesses.is_empty(),
+            "unpublished node-local backing has no cross-node hazard"
+        );
     }
 
     #[test]
     fn reached_private_requirement_cannot_masquerade_as_a_published_result() {
         let mut draft = WorkflowPlanDraft::new();
-        let mut producer = policy(0, 0, vec![OutputDescription::Tensor {
-            device: DeviceIdentity(1), representation: representation(), extents: vec![1], strides: vec![1],
-            storage: TensorStorage::Private { allocation: 0, range: ByteRange { offset: 0, len: 4 } },
-        }]);
+        let mut producer = policy(
+            0,
+            0,
+            vec![OutputDescription::Tensor {
+                device: DeviceIdentity(1),
+                representation: representation(),
+                extents: vec![1],
+                strides: vec![1],
+                storage: TensorStorage::Private {
+                    allocation: 0,
+                    range: ByteRange { offset: 0, len: 4 },
+                },
+            }],
+        );
         producer.allocations.push(AllocationDescription {
-            kind: AllocationKind::Temporary, acquisition: Acquisition::ReachedPrivate, alignment: 4,
+            kind: AllocationKind::Temporary,
+            acquisition: Acquisition::ReachedPrivate,
+            alignment: 4,
         });
-        assert!(matches!(draft.push(producer, vec![]), Err(PlanError::InvalidPolicyDescription(
-            "reached private backing cannot be published"
-        ))));
+        assert!(matches!(
+            draft.push(producer, vec![]),
+            Err(PlanError::InvalidPolicyDescription(
+                "reached private backing cannot be published"
+            ))
+        ));
     }
 
     #[test]

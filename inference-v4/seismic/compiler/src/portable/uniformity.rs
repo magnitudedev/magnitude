@@ -249,15 +249,23 @@ impl Inference<'_> {
                     values.insert(output, v.under(control));
                 }
                 SemanticNodeView::Alloc { extents, output } => {
-                    let v = Value { scalar: U::Varying, axes: extents.iter().map(|id| scalar(values,*id)).collect(), members: vec![] };
-                    values.insert(output,v.under(control));
+                    let v = Value {
+                        scalar: U::Varying,
+                        axes: extents.iter().map(|id| scalar(values, *id)).collect(),
+                        members: vec![],
+                    };
+                    values.insert(output, v.under(control));
                 }
-                SemanticNodeView::Fill { like: input, output, .. }
+                SemanticNodeView::Fill {
+                    like: input,
+                    output,
+                    ..
+                }
                 | SemanticNodeView::Copy { input, output }
                 | SemanticNodeView::RepresentationConvert { input, output, .. } => {
-                    let mut v = value(values,input);
+                    let mut v = value(values, input);
                     v.scalar = U::Varying;
-                    values.insert(output,v.under(control));
+                    values.insert(output, v.under(control));
                 }
                 SemanticNodeView::Reduce { output, .. } => {
                     let v = self.shaped(function, values, output, control);
@@ -276,7 +284,7 @@ impl Inference<'_> {
                             v.axes = permutation.iter().map(|i| v.axes[*i as usize]).collect();
                         }
                         ViewTransform::Reshape { .. } => {
-                            v.axes = extents.iter().map(|id| scalar(values,*id)).collect();
+                            v.axes = extents.iter().map(|id| scalar(values, *id)).collect();
                         }
                         ViewTransform::Plane { .. } => {
                             v = self.shaped(function, values, output, control);
@@ -623,7 +631,13 @@ fn probe(x: i32, times: range[4]) -> i32:
             let successful =
                 inference.successful_values(function, function.root(), &values, U::Workgroup);
             assert_eq!(scalar(&successful, function.results()[0]), input);
-            inference.region_with(function, function.root(), &mut values, U::Workgroup, Meaning::Physical);
+            inference.region_with(
+                function,
+                function.root(),
+                &mut values,
+                U::Workgroup,
+                Meaning::Physical,
+            );
             assert_eq!(scalar(&values, function.results()[0]), input,
                 "the second carry must inherit the first carry's later scope, including through a call");
         }

@@ -507,7 +507,10 @@ pub(crate) struct MemoryLocation {
 impl MemoryLocation {
     fn device(ordinal: c_int) -> Self {
         // CU_MEM_LOCATION_TYPE_DEVICE
-        Self { kind: 1, id: ordinal }
+        Self {
+            kind: 1,
+            id: ordinal,
+        }
     }
 }
 
@@ -632,13 +635,29 @@ impl Reservation {
             .expect("reservation granule lock is never poisoned");
         let wanted = bytes.div_ceil(self.granularity);
         let address = |index: usize| self.base + (index * self.granularity) as u64;
+        let previous = granules.len();
         while granules.len() > wanted {
             let index = granules.len() - 1;
             unsafe {
-                driver.check(unmap(address(index), self.granularity), "unmap")?;
-                driver.check(release(granules[index]), "physical release")?;
+                if let Err(error) = driver.check(unmap(address(index), self.granularity), "unmap") {
+                    if granules.len() == previous {
+                        return Err(error);
+                    }
+                    panic!("CUDA reservation unmap failed after partial shrink: {error}");
+                }
+                // Once unmapped, the physical handle is no longer usable by
+                // the old view. Releasing it must succeed for the shrink to
+                // return as an ordinary recoverable result.
+                driver
+                    .check(release(granules[index]), "physical release")
+                    .unwrap_or_else(|error| {
+                        panic!("CUDA reservation release failed after unmap: {error}")
+                    });
             }
             granules.pop();
+        }
+        if wanted < previous {
+            return Ok(());
         }
         let first_new = granules.len();
         if wanted == first_new {
@@ -710,7 +729,10 @@ impl Drop for Reservation {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for (index, handle) in granules.iter().enumerate() {
                 unsafe {
-                    unmap(self.base + (index * self.granularity) as u64, self.granularity);
+                    unmap(
+                        self.base + (index * self.granularity) as u64,
+                        self.granularity,
+                    );
                     release(*handle);
                 }
             }
@@ -736,7 +758,11 @@ pub(crate) fn upload(context: &Context, pointer: u64, bytes: &[u8]) -> Result<()
 }
 
 /// Synchronous device-to-host copy from `pointer`.
-pub(crate) fn download(context: &Context, pointer: u64, bytes: &mut [u8]) -> Result<(), DriverError> {
+pub(crate) fn download(
+    context: &Context,
+    pointer: u64,
+    bytes: &mut [u8],
+) -> Result<(), DriverError> {
     if bytes.is_empty() {
         return Ok(());
     }
@@ -837,7 +863,9 @@ impl Graph {
 
 impl Drop for Graph {
     fn drop(&mut self) {
-        if let (Some(destroy), Ok(_current)) = (self.context.driver.graph_destroy, self.context.enter()) {
+        if let (Some(destroy), Ok(_current)) =
+            (self.context.driver.graph_destroy, self.context.enter())
+        {
             unsafe {
                 destroy(self.raw);
             }

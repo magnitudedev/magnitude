@@ -5,11 +5,12 @@
 
 use seismic::{
     Availability, BackendName, CallError, Device, DeviceCatalog, Element, Exclusion,
-    InvocationError, MeasureOptions, NativeGraphFamily, NativeSpecialization, Outcome, SearchPlan,
-    SearchSettings, SearchStop, Strategy, SurveyPlan, Tensor, TraceDetail, TuneError,
-    TuningInitializer, TuningMethod, TuningPoint, Validation,
+    InvocationError, MeasureOptions, NativeGraphFamily, NativeSpecialization, Outcome,
+    ScreeningPoint, SearchPlan, SearchSettings, SearchStop, Strategy, SurveyPlan, Tensor,
+    TraceDetail, TuneError, TuningInitializer, TuningMethod, TuningPoint, Validation,
 };
-use seismic_native_tests::{accumulate, gated_sum, scale_rows, split_sum};
+use seismic_native_tests::{accumulate, gated_sum, scale_rows, scoped_scale, split_sum};
+use std::time::{Duration, Instant};
 
 /// A search whose budget covers every configuration of the test entries,
 /// including a CPU device's participant counts and tiers.
@@ -30,6 +31,7 @@ fn search(samples: usize) -> Strategy {
         min_sample_seconds: 0.005,
         start: Vec::new(),
         deadline: None,
+        screening: Vec::new(),
     })
 }
 
@@ -37,19 +39,24 @@ fn search(samples: usize) -> Strategy {
 fn devices() -> Vec<Device> {
     let catalog = DeviceCatalog::discover().expect("device discovery");
     let topology = catalog.topology();
-    let devices = [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]
-        .into_iter()
-        .filter(|backend| {
-            topology.devices().iter().any(|device| {
-                device.backend == *backend && matches!(device.availability, Availability::Available)
-            })
+    let devices = [
+        BackendName::Cpu,
+        BackendName::Metal,
+        BackendName::Cuda,
+        BackendName::Vulkan,
+    ]
+    .into_iter()
+    .filter(|backend| {
+        topology.devices().iter().any(|device| {
+            device.backend == *backend && matches!(device.availability, Availability::Available)
         })
-        .map(|backend| {
-            catalog
-                .open_backend(backend)
-                .unwrap_or_else(|error| panic!("available {backend:?} device must open: {error}"))
-        })
-        .collect::<Vec<_>>();
+    })
+    .map(|backend| {
+        catalog
+            .open_backend(backend)
+            .unwrap_or_else(|error| panic!("available {backend:?} device must open: {error}"))
+    })
+    .collect::<Vec<_>>();
     eprintln!(
         "native route backends: {:?}",
         devices.iter().map(Device::backend).collect::<Vec<_>>()
@@ -58,7 +65,10 @@ fn devices() -> Vec<Device> {
 }
 
 fn f32_tensor(device: &Device, extents: &[u64], values: &[f32]) -> Tensor {
-    let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
     Tensor::from_host(device, Element::f32(), extents, &bytes).expect("host tensor")
 }
 
@@ -74,12 +84,16 @@ fn read_f32(tensor: &Tensor) -> Vec<f32> {
 /// Values whose every partial sum is exact in f32, so all configurations
 /// agree bit for bit with the ordered reference.
 fn exact_values(n: usize) -> Vec<f32> {
-    (0..n).map(|index| ((index % 7) as f32 - 3.0) * 0.25).collect()
+    (0..n)
+        .map(|index| ((index % 7) as f32 - 3.0) * 0.25)
+        .collect()
 }
 
 /// The declared parameters of a configuration: those Seismic does not own
 /// (Seismic-owned names contain `.`).
-fn declared(params: &std::collections::BTreeMap<String, u64>) -> std::collections::BTreeMap<String, u64> {
+fn declared(
+    params: &std::collections::BTreeMap<String, u64>,
+) -> std::collections::BTreeMap<String, u64> {
     params
         .iter()
         .filter(|(name, _)| !name.contains('.'))
@@ -92,6 +106,141 @@ fn statics(n: u64) -> NativeSpecialization {
 }
 
 #[test]
+fn metal_launch_scopes_form_and_execute_independently() {
+    let catalog = DeviceCatalog::discover().expect("device discovery");
+    let Ok(device) = catalog.open_backend(BackendName::Metal) else {
+        return;
+    };
+    let implementation = scoped_scale::native_implementation(&device)
+        .unwrap()
+        .expect("Metal has the scoped fixture");
+    let defaults = implementation
+        .default_specialization(&NativeSpecialization::new())
+        .unwrap();
+    for (rows, launch, code, width) in [
+        (7usize, 0, 1, 32),
+        (7, 0, 2, 64),
+        (35, 1, 4, 64),
+        (35, 1, 8, 128),
+    ] {
+        let specialization = defaults
+            .clone()
+            .with_launch_param(launch, "ROWS", code)
+            .with_launch_param(launch, "WIDTH", width);
+        let kernel = scoped_scale::native_for_device(&device, &specialization)
+            .expect("each scoped Metal specialization forms");
+        let values = exact_values(rows);
+        let x = f32_tensor(&device, &[rows as u64], &values);
+        let result = kernel
+            .call(scoped_scale::Args { x: &x })
+            .expect("scoped call");
+        let expected = values.iter().map(|value| value * 2.0).collect::<Vec<_>>();
+        assert_eq!(read_f32(&result.value), expected);
+    }
+}
+
+#[test]
+fn metal_scoped_tuning_searches_launches_separately() {
+    let catalog = DeviceCatalog::discover().expect("device discovery");
+    let Ok(device) = catalog.open_backend(BackendName::Metal) else {
+        return;
+    };
+    let small = f32_tensor(&device, &[7], &exact_values(7));
+    let large = f32_tensor(&device, &[35], &exact_values(35));
+    let points = vec![
+        TuningPoint {
+            label: "m7".into(),
+            weight: 1.0,
+            class: None,
+            rotation: vec![scoped_scale::Args { x: &small }],
+            initialize: None,
+        },
+        TuningPoint {
+            label: "m35".into(),
+            weight: 1.0,
+            class: None,
+            rotation: vec![scoped_scale::Args { x: &large }],
+            initialize: None,
+        },
+    ];
+    let result = scoped_scale::native_tune(
+        &device,
+        &NativeSpecialization::new(),
+        points,
+        Validation::BitExact,
+        search(2),
+    )
+    .expect("factored Metal tuning");
+    assert!(matches!(
+        result.method,
+        TuningMethod::Factored {
+            groups: 2,
+            candidates: 8,
+            complete: true
+        }
+    ));
+    assert_eq!(result.overall.launches.len(), 2);
+    let kernel =
+        scoped_scale::native_for_device(&device, &result.overall.specialization()).unwrap();
+    for (tensor, count) in [(&small, 7), (&large, 35)] {
+        let result = kernel.call(scoped_scale::Args { x: tensor }).unwrap();
+        assert_eq!(
+            read_f32(&result.value),
+            exact_values(count)
+                .iter()
+                .map(|value| value * 2.0)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn metal_scoped_tuning_expired_deadline_keeps_defaults_incomplete() {
+    let catalog = DeviceCatalog::discover().expect("device discovery");
+    let Ok(device) = catalog.open_backend(BackendName::Metal) else {
+        return;
+    };
+    let small = f32_tensor(&device, &[7], &exact_values(7));
+    let large = f32_tensor(&device, &[35], &exact_values(35));
+    let points = vec![
+        TuningPoint {
+            label: "m7".into(),
+            weight: 1.0,
+            class: None,
+            rotation: vec![scoped_scale::Args { x: &small }],
+            initialize: None,
+        },
+        TuningPoint {
+            label: "m35".into(),
+            weight: 1.0,
+            class: None,
+            rotation: vec![scoped_scale::Args { x: &large }],
+            initialize: None,
+        },
+    ];
+    let Strategy::Search(mut plan) = search(1) else {
+        unreachable!()
+    };
+    plan.deadline = Some(Instant::now() - Duration::from_secs(1));
+    let result = scoped_scale::native_tune(
+        &device,
+        &NativeSpecialization::new(),
+        points,
+        Validation::BitExact,
+        Strategy::Search(plan),
+    )
+    .expect("expired factored search returns its usable defaults");
+    assert!(matches!(
+        result.method,
+        TuningMethod::Factored {
+            complete: false,
+            ..
+        }
+    ));
+    assert_eq!(result.overall, result.configurations[0].configuration);
+}
+
+#[test]
 fn every_admissible_split_sum_configuration_matches_the_reference() {
     for device in devices() {
         let n = 1000usize;
@@ -101,12 +250,16 @@ fn every_admissible_split_sum_configuration_matches_the_reference() {
         let implementation = split_sum::native_implementation(&device)
             .expect("bundle")
             .expect("split_sum has an implementation on every backend");
-        let configurations = implementation.admissible(&statics(n as u64)).expect("statics");
+        let configurations = implementation
+            .admissible(&statics(n as u64))
+            .expect("statics");
         // Three part counts by two widths, all admissible at N = 1000.
         assert_eq!(configurations.len(), 6, "{}", device.backend().as_str());
         for configuration in configurations {
-            let kernel = split_sum::native_for_device(&device, &configuration)
-                .unwrap_or_else(|error| panic!("{configuration:?} on {:?}: {error}", device.backend()));
+            let kernel =
+                split_sum::native_for_device(&device, &configuration).unwrap_or_else(|error| {
+                    panic!("{configuration:?} on {:?}: {error}", device.backend())
+                });
             let result = kernel.call(split_sum::Args { x: &x }).expect("call");
             assert_eq!(
                 read_f32(&result.value),
@@ -125,7 +278,9 @@ fn where_filters_configurations_at_small_static_values() {
         let admissible = implementation.admissible(&statics(2)).unwrap();
         // PARTS <= N keeps parts 1 and 2 at N = 2.
         assert_eq!(admissible.len(), 4);
-        assert!(admissible.iter().all(|configuration| configuration.param("PARTS") != Some(4)));
+        assert!(admissible
+            .iter()
+            .all(|configuration| configuration.param("PARTS") != Some(4)));
         let inadmissible = statics(2).with_param("PARTS", 4).with_param("WIDTH", 32);
         assert!(split_sum::native_for_device(&device, &inadmissible).is_err());
     }
@@ -177,11 +332,15 @@ fn a_call_whose_static_dimension_differs_is_rejected() {
 fn graph_runs_submit_without_waiting_and_keep_their_inputs() {
     for device in devices() {
         let (m, n) = (5u64, 37u64);
-        let kernel =
-            scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 2))
-                .unwrap();
+        let kernel = scale_rows::native_for_device(
+            &device,
+            &NativeSpecialization::new().with_param("ROWS", 2),
+        )
+        .unwrap();
         let mut graph = device.native_graph();
-        let input = graph.input_for(&kernel, "x", &[("M", m), ("N", n)]).unwrap();
+        let input = graph
+            .input_for(&kernel, "x", &[("M", m), ("N", n)])
+            .unwrap();
         let first = graph
             .enqueue(
                 &kernel,
@@ -211,7 +370,10 @@ fn graph_runs_submit_without_waiting_and_keep_their_inputs() {
             let values = (0..m * n)
                 .map(|index| (index + run * 1000) as f32)
                 .collect::<Vec<_>>();
-            let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+            let bytes = values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>();
             let outputs = family.new_output_slot().unwrap().activate(&plan).unwrap();
             let mut active = slot.activate(&plan).unwrap();
             active.write_input(&input, &bytes).unwrap();
@@ -294,16 +456,25 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
         // configuration once, starting from the defaults. The domain is the
         // declared one (three part counts by two widths) and, on a CPU
         // device, its participant counts per launch and tiers.
-        let domain = result.parameters.iter().map(|parameter| parameter.values.len()).product::<usize>();
+        let domain = result
+            .parameters
+            .iter()
+            .map(|parameter| parameter.values.len())
+            .product::<usize>();
         assert_eq!(domain % 6, 0);
         assert_eq!(result.configurations.len(), domain);
         assert!(matches!(
             result.method,
-            TuningMethod::Search { stop: SearchStop::Exhausted, .. }
+            TuningMethod::Search {
+                stop: SearchStop::Exhausted,
+                ..
+            }
         ));
         assert_eq!(
             declared(&result.configurations[0].configuration.params),
-            [("PARTS".to_owned(), 1), ("WIDTH".to_owned(), 32)].into_iter().collect()
+            [("PARTS".to_owned(), 1), ("WIDTH".to_owned(), 32)]
+                .into_iter()
+                .collect()
         );
         assert!(result.configurations[0]
             .configuration
@@ -318,16 +489,29 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
         // re-measured.
         assert!(result.configurations.iter().any(|record| {
             record.configuration == result.overall
-                && matches!(record.outcome, Outcome::Measured { validated: true, .. })
+                && matches!(
+                    record.outcome,
+                    Outcome::Measured {
+                        validated: true,
+                        ..
+                    }
+                )
         }));
         assert!(result.configurations.iter().any(|record| matches!(
             &record.outcome,
             Outcome::Measured { confirmed, .. } if confirmed.len() == 2
         )));
         // The tuned configuration prepares and runs.
-        let kernel = split_sum::native_for_device(&device, &result.overall.specialization()).unwrap();
-        let value = kernel.call(split_sum::Args { x: &inputs[0] }).unwrap().value;
-        assert_eq!(read_f32(&value), [exact_values(n as usize).iter().sum::<f32>()]);
+        let kernel =
+            split_sum::native_for_device(&device, &result.overall.specialization()).unwrap();
+        let value = kernel
+            .call(split_sum::Args { x: &inputs[0] })
+            .unwrap()
+            .value;
+        assert_eq!(
+            read_f32(&value),
+            [exact_values(n as usize).iter().sum::<f32>()]
+        );
 
         // A survey measures and validates every configuration with every
         // sample recorded.
@@ -360,6 +544,77 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
     }
 }
 
+#[test]
+fn screened_search_confirms_and_validates_the_full_workload() {
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Cpu)
+        .unwrap();
+    let n = 4096u64;
+    let short = f32_tensor(&device, &[n], &exact_values(n as usize));
+    let long = f32_tensor(&device, &[n], &exact_values(n as usize));
+    let points = vec![
+        TuningPoint {
+            label: "short".into(),
+            weight: 1.0,
+            class: None,
+            rotation: vec![split_sum::Args { x: &short }],
+            initialize: None,
+        },
+        TuningPoint {
+            label: "long".into(),
+            weight: 3.0,
+            class: None,
+            rotation: vec![split_sum::Args { x: &long }],
+            initialize: None,
+        },
+    ];
+    let Strategy::Search(mut plan) = search(1) else {
+        unreachable!()
+    };
+    plan.budget = 3;
+    plan.screening = vec![ScreeningPoint {
+        index: 0,
+        weight: 4.0,
+    }];
+    let result = split_sum::native_tune(
+        &device,
+        &statics(n),
+        points,
+        Validation::BitExact,
+        Strategy::Search(plan),
+    )
+    .unwrap();
+    assert_eq!(result.points.len(), 2);
+    assert!(matches!(
+        &result.method,
+        TuningMethod::Search { screening, .. }
+            if screening == &[ScreeningPoint { index: 0, weight: 4.0 }]
+    ));
+    let measured = result
+        .configurations
+        .iter()
+        .filter_map(|record| match &record.outcome {
+            Outcome::Measured {
+                points, confirmed, ..
+            } => Some((points, confirmed)),
+            Outcome::Excluded(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(measured.iter().all(|(points, _)| points.len() == 1));
+    assert!(measured.iter().any(|(_, confirmed)| confirmed.len() == 2));
+    assert!(measured
+        .iter()
+        .any(|(_, confirmed)| confirmed.iter().any(|point| point.point == "long")));
+    assert!(result.configurations.iter().any(|record| matches!(
+        &record.outcome,
+        Outcome::Measured {
+            validated: true,
+            ..
+        }
+    )));
+}
+
 /// A graph node whose port contradicts the kernel's static dimension is
 /// rejected when the graph is sealed, not when it runs.
 #[test]
@@ -373,7 +628,12 @@ fn a_graph_whose_static_dimension_differs_is_rejected_at_seal() {
         let mut graph = device.native_graph();
         let input = graph.input_for(&kernel, "x", &[("N", 63)]).unwrap();
         let result = graph
-            .enqueue(&kernel, split_sum::WorkflowArgs { x: input.tensor().into() })
+            .enqueue(
+                &kernel,
+                split_sum::WorkflowArgs {
+                    x: input.tensor().into(),
+                },
+            )
             .unwrap();
         graph.export(&result.value).unwrap();
         match graph.seal() {
@@ -385,8 +645,14 @@ fn a_graph_whose_static_dimension_differs_is_rejected_at_seal() {
                 assert_eq!(dimension, "N");
                 assert_eq!(expected, 64);
             }
-            Err(other) => panic!("{:?}: expected a static-dimension error, got {other}", device.backend()),
-            Ok(_) => panic!("{:?}: a contradicted static dimension sealed", device.backend()),
+            Err(other) => panic!(
+                "{:?}: expected a static-dimension error, got {other}",
+                device.backend()
+            ),
+            Ok(_) => panic!(
+                "{:?}: a contradicted static dimension sealed",
+                device.backend()
+            ),
         }
     }
 }
@@ -406,10 +672,20 @@ fn graph_nodes_with_scratch_run_from_the_slot_workspace() {
         let first_input = graph.input_for(&kernel, "x", &[("N", n)]).unwrap();
         let second_input = graph.input_for(&kernel, "x", &[("N", n)]).unwrap();
         let first = graph
-            .enqueue(&kernel, split_sum::WorkflowArgs { x: first_input.tensor().into() })
+            .enqueue(
+                &kernel,
+                split_sum::WorkflowArgs {
+                    x: first_input.tensor().into(),
+                },
+            )
             .unwrap();
         let second = graph
-            .enqueue(&kernel, split_sum::WorkflowArgs { x: second_input.tensor().into() })
+            .enqueue(
+                &kernel,
+                split_sum::WorkflowArgs {
+                    x: second_input.tensor().into(),
+                },
+            )
             .unwrap();
         graph.export(&first.value).unwrap();
         graph.export(&second.value).unwrap();
@@ -422,9 +698,16 @@ fn graph_nodes_with_scratch_run_from_the_slot_workspace() {
                 .map(|index| ((index + run) % 5) as f32 - 2.0)
                 .collect::<Vec<_>>();
             let second_values = exact_values(n as usize);
-            let bytes = |values: &[f32]| values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
-            slot.write_input(&first_input, &bytes(&first_values)).unwrap();
-            slot.write_input(&second_input, &bytes(&second_values)).unwrap();
+            let bytes = |values: &[f32]| {
+                values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>()
+            };
+            slot.write_input(&first_input, &bytes(&first_values))
+                .unwrap();
+            slot.write_input(&second_input, &bytes(&second_values))
+                .unwrap();
             let (outputs, completion) = slot
                 .attach(plan.bindings(), plan.new_outputs().unwrap())
                 .unwrap()
@@ -469,19 +752,37 @@ fn scale_chain(
     nodes: usize,
     m: u64,
     n: u64,
-) -> (seismic::NativeGraphPlan, seismic::NativePort, seismic::WorkflowTensor) {
+) -> (
+    seismic::NativeGraphPlan,
+    seismic::NativePort,
+    seismic::WorkflowTensor,
+) {
     let kernel =
         scale_rows::native_for_device(device, &NativeSpecialization::new().with_param("ROWS", 1))
             .unwrap();
     let mut graph = device.native_graph();
-    let input = graph.input_for(&kernel, "x", &[("M", m), ("N", n)]).unwrap();
+    let input = graph
+        .input_for(&kernel, "x", &[("M", m), ("N", n)])
+        .unwrap();
     let mut value = graph
-        .enqueue(&kernel, scale_rows::WorkflowArgs { x: input.tensor().into(), factor: chain_factor(0) })
+        .enqueue(
+            &kernel,
+            scale_rows::WorkflowArgs {
+                x: input.tensor().into(),
+                factor: chain_factor(0),
+            },
+        )
         .unwrap()
         .value;
     for node in 1..nodes {
         value = graph
-            .enqueue(&kernel, scale_rows::WorkflowArgs { x: (&value).into(), factor: chain_factor(node) })
+            .enqueue(
+                &kernel,
+                scale_rows::WorkflowArgs {
+                    x: (&value).into(),
+                    factor: chain_factor(node),
+                },
+            )
             .unwrap()
             .value;
     }
@@ -497,8 +798,13 @@ fn a_graph_submission_encodes_every_node_into_one_encoder() {
         let nodes = 8;
         let (m, n) = (3u64, 50u64);
         let (plan, input, value) = scale_chain(&device, nodes, m, n);
-        let values = (0..m * n).map(|index| index as f32 * 0.25).collect::<Vec<_>>();
-        let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+        let values = (0..m * n)
+            .map(|index| index as f32 * 0.25)
+            .collect::<Vec<_>>();
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
         let mut slot = plan.new_slot().unwrap();
         let mut run = |detail: TraceDetail| {
             let trace = device.trace_submissions(detail).unwrap();
@@ -517,13 +823,24 @@ fn a_graph_submission_encodes_every_node_into_one_encoder() {
         assert_eq!(serial, chained(&values, nodes), "{:?}", device.backend());
         assert_eq!(serial, separate, "{:?}", device.backend());
         for trace in [&serial_trace, &separate_trace] {
-            assert_eq!(trace.len(), 1, "{:?}: one submission per run", device.backend());
+            assert_eq!(
+                trace.len(),
+                1,
+                "{:?}: one submission per run",
+                device.backend()
+            );
             assert_eq!(trace[0].launches.len(), nodes);
         }
         if device.backend() != BackendName::Cpu {
             // Only the per-launch form has a timed unit (encoder) per launch.
-            assert!(serial_trace[0].launches.iter().all(|launch| launch.device.is_none()));
-            assert!(separate_trace[0].launches.iter().all(|launch| launch.device.is_some()));
+            assert!(serial_trace[0]
+                .launches
+                .iter()
+                .all(|launch| launch.device.is_none()));
+            assert!(separate_trace[0]
+                .launches
+                .iter()
+                .all(|launch| launch.device.is_some()));
         }
     }
 }
@@ -539,13 +856,21 @@ fn a_sequence_submits_chained_runs_as_one_unit_in_queue_order() {
         let (m, n) = (3u64, 64u64);
         let blocks = 5;
         let (entry, input, entry_value) = scale_chain(&device, 1, m, n);
-        let scale =
-            scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
-                .unwrap();
+        let scale = scale_rows::native_for_device(
+            &device,
+            &NativeSpecialization::new().with_param("ROWS", 1),
+        )
+        .unwrap();
         let mut graph = device.native_graph();
         let x = graph.port(Element::f32(), &[m, n]).unwrap();
         let tripled = graph
-            .enqueue(&scale, scale_rows::WorkflowArgs { x: x.tensor().into(), factor: 3.0 })
+            .enqueue(
+                &scale,
+                scale_rows::WorkflowArgs {
+                    x: x.tensor().into(),
+                    factor: 3.0,
+                },
+            )
             .unwrap()
             .value;
         graph.export(&tripled).unwrap();
@@ -563,7 +888,10 @@ fn a_sequence_submits_chained_runs_as_one_unit_in_queue_order() {
             let values = (0..m * n)
                 .map(|index| (index + step * 7) as f32 * 0.25)
                 .collect::<Vec<_>>();
-            let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+            let bytes = values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>();
             let trace = device.trace_submissions(TraceDetail::Submissions).unwrap();
             let mut sequence = device.native_sequence();
             let mut active = entry_slot.activate(&entry).unwrap();
@@ -587,7 +915,11 @@ fn a_sequence_submits_chained_runs_as_one_unit_in_queue_order() {
                     .unwrap()
                     .attach(
                         bindings,
-                        block_outputs[parity].take().unwrap().activate(&block).unwrap(),
+                        block_outputs[parity]
+                            .take()
+                            .unwrap()
+                            .activate(&block)
+                            .unwrap(),
                     )
                     .unwrap()
                     .queue(&mut sequence)
@@ -602,13 +934,23 @@ fn a_sequence_submits_chained_runs_as_one_unit_in_queue_order() {
             let completion = sequence.submit().unwrap();
             completion.wait().unwrap();
             let submissions = trace.collect().unwrap();
-            assert_eq!(submissions.len(), 1, "{:?}: one submission per step", device.backend());
+            assert_eq!(
+                submissions.len(),
+                1,
+                "{:?}: one submission per step",
+                device.backend()
+            );
             assert_eq!(submissions[0].launches.len(), 1 + blocks);
             let expected = values
                 .iter()
                 .map(|value| value * 3f32.powi(blocks as i32))
                 .collect::<Vec<_>>();
-            assert_eq!(read_f32(&hidden), expected, "step {step} on {:?}", device.backend());
+            assert_eq!(
+                read_f32(&hidden),
+                expected,
+                "step {step} on {:?}",
+                device.backend()
+            );
             drop(hidden);
             entry_output = Some(entry_outputs.recycle().unwrap());
             for (parity, outputs) in pending.into_iter().enumerate() {
@@ -636,7 +978,10 @@ fn runs_rebinding_the_same_storage_read_their_own_inputs() {
             let values = (0..m * n)
                 .map(|index| (index + run * 100) as f32 * 0.5)
                 .collect::<Vec<_>>();
-            let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+            let bytes = values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>();
             let mut active = slot.activate(&plan).unwrap();
             active.write_input(&input, &bytes).unwrap();
             let (outputs, completion) = active
@@ -664,8 +1009,13 @@ fn a_host_read_before_completion_returns_the_final_bytes() {
         let (m, n) = (64u64, 1024u64);
         let nodes = 64;
         let (plan, input, value) = scale_chain(&device, nodes, m, n);
-        let values = (0..m * n).map(|index| (index % 1000) as f32).collect::<Vec<_>>();
-        let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+        let values = (0..m * n)
+            .map(|index| (index % 1000) as f32)
+            .collect::<Vec<_>>();
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
         let mut slot = plan.new_slot().unwrap();
         slot.write_input(&input, &bytes).unwrap();
         let (outputs, completion) = slot
@@ -674,7 +1024,11 @@ fn a_host_read_before_completion_returns_the_final_bytes() {
             .submit()
             .unwrap();
         let read = read_f32(&outputs.exported(&value).unwrap());
-        assert!(completion.is_complete(), "{:?}: the read waited", device.backend());
+        assert!(
+            completion.is_complete(),
+            "{:?}: the read waited",
+            device.backend()
+        );
         completion.wait().unwrap();
         assert_eq!(read, chained(&values, nodes), "{:?}", device.backend());
     }
@@ -696,7 +1050,12 @@ fn standalone_scratch_is_charged_to_the_invocation_workspace() {
             let value = kernel.call(split_sum::Args { x: &x }).unwrap().value;
             assert_eq!(read_f32(&value), [exact_values(64).iter().sum::<f32>()]);
             // Four f32 partials, reused by the second call.
-            assert_eq!(kernel.invocation_workspace_bytes(), before + 16, "{:?}", device.backend());
+            assert_eq!(
+                kernel.invocation_workspace_bytes(),
+                before + 16,
+                "{:?}",
+                device.backend()
+            );
         }
     }
 }
@@ -717,7 +1076,10 @@ fn tuning_rejects_shared_mutable_state_without_an_initializer() {
             label: "rows".into(),
             weight: 1.0,
             class: None,
-            rotation: vec![accumulate::Args { state: &mut state, x: &x }],
+            rotation: vec![accumulate::Args {
+                state: &mut state,
+                x: &x,
+            }],
             initialize: None,
         }];
         match accumulate::native_tune(
@@ -753,7 +1115,10 @@ fn tuning_validates_in_place_parameters_and_excludes_misclassified_ones() {
             label: "rows".into(),
             weight: 1.0,
             class: None,
-            rotation: vec![accumulate::Args { state: &mut state, x: &x }],
+            rotation: vec![accumulate::Args {
+                state: &mut state,
+                x: &x,
+            }],
             initialize: Some(initialize),
         }];
         let result = accumulate::native_tune(
@@ -769,7 +1134,13 @@ fn tuning_validates_in_place_parameters_and_excludes_misclassified_ones() {
         // and never validated; it is never chosen.
         for record in &result.configurations {
             match (record.configuration.params["BIAS"], &record.outcome) {
-                (0, Outcome::Measured { .. }) | (1, Outcome::Measured { validated: false, .. }) => {}
+                (0, Outcome::Measured { .. })
+                | (
+                    1,
+                    Outcome::Measured {
+                        validated: false, ..
+                    },
+                ) => {}
                 (1, Outcome::Excluded(Exclusion::MisclassifiedParameter { point, reference })) => {
                     assert_eq!(point, "rows");
                     assert_eq!(reference.params["BIAS"], 0);
@@ -788,13 +1159,21 @@ fn tuning_validates_in_place_parameters_and_excludes_misclassified_ones() {
 fn external_bindings_are_checked_at_attach() {
     for device in devices() {
         let (m, n) = (2u64, 40u64);
-        let scale =
-            scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
-                .unwrap();
+        let scale = scale_rows::native_for_device(
+            &device,
+            &NativeSpecialization::new().with_param("ROWS", 1),
+        )
+        .unwrap();
         let mut graph = device.native_graph();
         let x = graph.port(Element::f32(), &[m, n]).unwrap();
         let doubled = graph
-            .enqueue(&scale, scale_rows::WorkflowArgs { x: x.tensor().into(), factor: 2.0 })
+            .enqueue(
+                &scale,
+                scale_rows::WorkflowArgs {
+                    x: x.tensor().into(),
+                    factor: 2.0,
+                },
+            )
             .unwrap()
             .value;
         graph.export(&doubled).unwrap();
@@ -804,7 +1183,9 @@ fn external_bindings_are_checked_at_attach() {
         let wrong = f32_tensor(&device, &[m, n + 1], &vec![0.0; (m * (n + 1)) as usize]);
         assert!(matches!(
             plan.bind_static(&[(&x, &wrong)]),
-            Err(CallError::Workflow(seismic::WorkflowError::NativePortMismatch { port: 0 }))
+            Err(CallError::Workflow(
+                seismic::WorkflowError::NativePortMismatch { port: 0 }
+            ))
         ));
         let bound = plan.bind_static(&[(&x, &input)]).unwrap();
         let mut slot = plan.new_slot().unwrap();
@@ -819,21 +1200,28 @@ fn external_bindings_are_checked_at_attach() {
             assert_eq!(read_f32(&outputs.exported(&doubled).unwrap()), expected);
         }
         assert!(matches!(
-            slot.attach(plan.bindings(), plan.new_outputs().unwrap()).err(),
-            Some(CallError::Workflow(seismic::WorkflowError::NativePortUnbound { port: 0 }))
+            slot.attach(plan.bindings(), plan.new_outputs().unwrap())
+                .err(),
+            Some(CallError::Workflow(
+                seismic::WorkflowError::NativePortUnbound { port: 0 }
+            ))
         ));
         let mut bindings = plan.bindings();
         bindings.set(&x, &wrong).unwrap();
         assert!(matches!(
             slot.attach(bindings, plan.new_outputs().unwrap()).err(),
-            Some(CallError::Workflow(seismic::WorkflowError::NativePortMismatch { port: 0 }))
+            Some(CallError::Workflow(
+                seismic::WorkflowError::NativePortMismatch { port: 0 }
+            ))
         ));
 
         // `accumulate` requires `state` and `x` to be disjoint; both are
         // external ports, so only the run's bindings can violate it.
         let accumulate = accumulate::native_for_device(
             &device,
-            &NativeSpecialization::new().with_param("BIAS", 0).with_param("WIDTH", 32),
+            &NativeSpecialization::new()
+                .with_param("BIAS", 0)
+                .with_param("WIDTH", 32),
         )
         .unwrap();
         let mut graph = device.native_graph();
@@ -842,7 +1230,10 @@ fn external_bindings_are_checked_at_attach() {
         graph
             .enqueue(
                 &accumulate,
-                accumulate::WorkflowArgs { state: state.tensor_mut().into(), x: addend.tensor().into() },
+                accumulate::WorkflowArgs {
+                    state: state.tensor_mut().into(),
+                    x: addend.tensor().into(),
+                },
             )
             .unwrap();
         let plan = graph.seal().unwrap();
@@ -855,7 +1246,10 @@ fn external_bindings_are_checked_at_attach() {
             Some(CallError::Invocation(InvocationError::IllegalAliasing { first, second })) => {
                 assert_eq!([first.as_str(), second.as_str()], ["state", "x"]);
             }
-            other => panic!("{:?}: expected illegal aliasing, got {other:?}", device.backend()),
+            other => panic!(
+                "{:?}: expected illegal aliasing, got {other:?}",
+                device.backend()
+            ),
         }
         let separate = f32_tensor(&device, &[n], &vec![2.0; n as usize]);
         let mut bindings = plan.bindings();
@@ -867,7 +1261,12 @@ fn external_bindings_are_checked_at_attach() {
             .submit()
             .unwrap();
         completion.wait().unwrap();
-        assert_eq!(read_f32(&shared), vec![3.0; n as usize], "{:?}", device.backend());
+        assert_eq!(
+            read_f32(&shared),
+            vec![3.0; n as usize],
+            "{:?}",
+            device.backend()
+        );
     }
 }
 
@@ -886,7 +1285,10 @@ fn portable_gated_sum(values: &[f32]) -> f32 {
     }]))
     .expect("the conditional fixture checks");
     let logical = module
-        .entry(module.entry_named("gated_sum").unwrap(), &ElementBindings::default())
+        .entry(
+            module.entry_named("gated_sum").unwrap(),
+            &ElementBindings::default(),
+        )
         .unwrap();
     let mut interpreter = Interpreter::new(&logical);
     let x = interpreter.add_tensor(TensorData::dense(
@@ -906,8 +1308,11 @@ fn portable_gated_sum(values: &[f32]) -> f32 {
 }
 
 fn gated(device: &Device, small: u64) -> seismic::NativeKernel<gated_sum::Entry> {
-    gated_sum::native_for_device(device, &NativeSpecialization::new().with_param("SMALL", small))
-        .unwrap_or_else(|error| panic!("{:?}: SMALL {small}: {error}", device.backend()))
+    gated_sum::native_for_device(
+        device,
+        &NativeSpecialization::new().with_param("SMALL", small),
+    )
+    .unwrap_or_else(|error| panic!("{:?}: SMALL {small}: {error}", device.backend()))
 }
 
 /// Exactly one of `gated_sum`'s two launches is active for every shape: the
@@ -921,7 +1326,12 @@ fn conditional_launches_run_only_the_active_launch() {
         // (N, SMALL, active launch ordinal). Vulkan forms group memory at
         // preparation, so SMALL = 2^20 (4 MiB staged) does not prepare there
         // (`inactive_launches_are_exempt_from_device_limits`).
-        let cases = [(10u64, 64u64, 0usize), (64, 64, 0), (200, 64, 1), (200, 1_048_576, 0)];
+        let cases = [
+            (10u64, 64u64, 0usize),
+            (64, 64, 0),
+            (200, 64, 1),
+            (200, 1_048_576, 0),
+        ];
         let cases = cases
             .into_iter()
             .filter(|(_, small, _)| device.backend() != BackendName::Vulkan || *small == 64);
@@ -938,7 +1348,10 @@ fn conditional_launches_run_only_the_active_launch() {
             assert_eq!(submissions.len(), 1, "{case}");
             let launches = &submissions[0].launches;
             assert_eq!(
-                launches.iter().map(|launch| launch.launch).collect::<Vec<_>>(),
+                launches
+                    .iter()
+                    .map(|launch| launch.launch)
+                    .collect::<Vec<_>>(),
                 [0, 1],
                 "{case}: inactive launches keep their ordinal"
             );
@@ -950,13 +1363,21 @@ fn conditional_launches_run_only_the_active_launch() {
             let mut graph = device.native_graph();
             let input = graph.input_for(&kernel, "x", &[("N", n)]).unwrap();
             let sum = graph
-                .enqueue(&kernel, gated_sum::WorkflowArgs { x: input.tensor().into() })
+                .enqueue(
+                    &kernel,
+                    gated_sum::WorkflowArgs {
+                        x: input.tensor().into(),
+                    },
+                )
                 .unwrap()
                 .value;
             graph.export(&sum).unwrap();
             let plan = graph.seal().unwrap();
             let mut slot = plan.new_slot().unwrap();
-            let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+            let bytes = values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>();
             slot.write_input(&input, &bytes).unwrap();
             let (outputs, completion) = slot
                 .attach(plan.bindings(), plan.new_outputs().unwrap())
@@ -964,7 +1385,11 @@ fn conditional_launches_run_only_the_active_launch() {
                 .submit()
                 .unwrap();
             completion.wait().unwrap();
-            assert_eq!(read_f32(&outputs.exported(&sum).unwrap()), [expected], "{case}: graph");
+            assert_eq!(
+                read_f32(&outputs.exported(&sum).unwrap()),
+                [expected],
+                "{case}: graph"
+            );
         }
     }
 }
@@ -980,10 +1405,18 @@ fn inactive_launches_are_exempt_from_device_limits() {
         let n = 1u64 << 17;
         let values = exact_values(n as usize);
         let x = f32_tensor(&device, &[n], &values);
-        let value = gated(&device, 64).call(gated_sum::Args { x: &x }).unwrap().value;
+        let value = gated(&device, 64)
+            .call(gated_sum::Args { x: &x })
+            .unwrap()
+            .value;
         // Every partial sum of these values is exact, so any order agrees
         // with the portable body's.
-        assert_eq!(read_f32(&value), [values.iter().sum::<f32>()], "{:?}", device.backend());
+        assert_eq!(
+            read_f32(&value),
+            [values.iter().sum::<f32>()],
+            "{:?}",
+            device.backend()
+        );
         if device.backend() == BackendName::Cpu {
             // The CPU route has no group-memory limit.
             continue;
@@ -1009,8 +1442,14 @@ fn inactive_launches_are_exempt_from_device_limits() {
                 "{:?}: {error}",
                 device.backend()
             ),
-            Err(other) => panic!("{:?}: expected a device-limit error, got {other}", device.backend()),
-            Ok(_) => panic!("{:?}: an active launch beyond the group-memory limit ran", device.backend()),
+            Err(other) => panic!(
+                "{:?}: expected a device-limit error, got {other}",
+                device.backend()
+            ),
+            Ok(_) => panic!(
+                "{:?}: an active launch beyond the group-memory limit ran",
+                device.backend()
+            ),
         }
     }
 }
@@ -1026,18 +1465,38 @@ fn inactive_scratch_is_charged_the_minimum() {
             let values = exact_values(n as usize);
             let x = f32_tensor(&device, &[n], &values);
             let value = kernel.call(gated_sum::Args { x: &x }).unwrap().value;
-            assert_eq!(read_f32(&value), [portable_gated_sum(&values)], "{:?} N {n}", device.backend());
+            assert_eq!(
+                read_f32(&value),
+                [portable_gated_sum(&values)],
+                "{:?} N {n}",
+                device.backend()
+            );
         };
         call(10);
-        assert_eq!(kernel.invocation_workspace_bytes(), before + 1, "{:?}", device.backend());
+        assert_eq!(
+            kernel.invocation_workspace_bytes(),
+            before + 1,
+            "{:?}",
+            device.backend()
+        );
         call(200);
-        assert_eq!(kernel.invocation_workspace_bytes(), before + 800, "{:?}", device.backend());
+        assert_eq!(
+            kernel.invocation_workspace_bytes(),
+            before + 800,
+            "{:?}",
+            device.backend()
+        );
 
         let workspace = |n: u64| {
             let mut graph = device.native_graph();
             let input = graph.input_for(&kernel, "x", &[("N", n)]).unwrap();
             let sum = graph
-                .enqueue(&kernel, gated_sum::WorkflowArgs { x: input.tensor().into() })
+                .enqueue(
+                    &kernel,
+                    gated_sum::WorkflowArgs {
+                        x: input.tensor().into(),
+                    },
+                )
                 .unwrap()
                 .value;
             graph.export(&sum).unwrap();
@@ -1048,7 +1507,7 @@ fn inactive_scratch_is_charged_the_minimum() {
     }
 }
 
-/// A reserved tensor backs only its leading committed rows. Recommitting
+// A reserved tensor backs only its leading committed rows. Recommitting
 /// keeps them (device work bound afterwards reads them) and zero-fills the
 /// rows it adds, including rows released by a shrink and backed again (CUDA
 /// resizes its reserved address range in place, reusing granules).
@@ -1065,7 +1524,12 @@ fn a_reserved_tensor_recommits_keeping_its_rows() {
                 .map(|index| (index % 97) as f32 * 0.5 + 1.0)
                 .collect::<Vec<_>>()
         };
-        let bytes = |values: &[f32]| values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+        let bytes = |values: &[f32]| {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
         let with_zeros = |values: &[f32], count: u64| {
             let mut all = values.to_vec();
             all.resize((count * n) as usize, 0.0);
@@ -1073,34 +1537,59 @@ fn a_reserved_tensor_recommits_keeping_its_rows() {
         };
         let reserved = Tensor::reserved(&device, Element::f32(), &[rows, n], 8).unwrap();
         assert_eq!(reserved.committed_rows(), 8, "{backend:?}");
-        assert_eq!(reserved.resizes_in_place(), backend == BackendName::Cuda, "{backend:?}");
-        assert!(reserved.read_to_host().is_err(), "{backend:?}: host access past the committed rows");
+        assert_eq!(
+            reserved.resizes_in_place(),
+            backend == BackendName::Cuda,
+            "{backend:?}"
+        );
+        assert!(
+            reserved.read_to_host().is_err(),
+            "{backend:?}: host access past the committed rows"
+        );
         let first = row_values(8);
-        reserved.slice_leading(0, 8).unwrap().write_from_host(&bytes(&first)).unwrap();
+        reserved
+            .slice_leading(0, 8)
+            .unwrap()
+            .write_from_host(&bytes(&first))
+            .unwrap();
 
         let grown = reserved.recommitted(grow).unwrap();
         drop(reserved);
         assert_eq!(grown.committed_rows(), grow, "{backend:?}");
-        assert_eq!(read_f32(&grown.slice_leading(0, grow).unwrap()), with_zeros(&first, grow), "{backend:?}");
+        assert_eq!(
+            read_f32(&grown.slice_leading(0, grow).unwrap()),
+            with_zeros(&first, grow),
+            "{backend:?}"
+        );
         grown
             .slice_leading(8, grow)
             .unwrap()
             .write_from_host(&bytes(&row_values(grow - 8)))
             .unwrap();
 
-        let scale =
-            scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
-                .unwrap();
+        let scale = scale_rows::native_for_device(
+            &device,
+            &NativeSpecialization::new().with_param("ROWS", 1),
+        )
+        .unwrap();
         let mut graph = device.native_graph();
         let x = graph.port(Element::f32(), &[8, n]).unwrap();
         let tripled = graph
-            .enqueue(&scale, scale_rows::WorkflowArgs { x: x.tensor().into(), factor: 3.0 })
+            .enqueue(
+                &scale,
+                scale_rows::WorkflowArgs {
+                    x: x.tensor().into(),
+                    factor: 3.0,
+                },
+            )
             .unwrap()
             .value;
         graph.export(&tripled).unwrap();
         let plan = graph.seal().unwrap();
         let mut bindings = plan.bindings();
-        bindings.set(&x, &grown.slice_leading(0, 8).unwrap()).unwrap();
+        bindings
+            .set(&x, &grown.slice_leading(0, 8).unwrap())
+            .unwrap();
         let (outputs, completion) = plan
             .new_slot()
             .unwrap()
@@ -1118,7 +1607,11 @@ fn a_reserved_tensor_recommits_keeping_its_rows() {
         let shrunk = grown.recommitted(shrink).unwrap();
         drop(grown);
         assert_eq!(shrunk.committed_rows(), shrink, "{backend:?}");
-        assert_eq!(shrunk.resizes_in_place(), backend == BackendName::Cuda, "{backend:?}");
+        assert_eq!(
+            shrunk.resizes_in_place(),
+            backend == BackendName::Cuda,
+            "{backend:?}"
+        );
         let regrown = shrunk.recommitted(regrow).unwrap();
         drop(shrunk);
         assert_eq!(
@@ -1126,5 +1619,97 @@ fn a_reserved_tensor_recommits_keeping_its_rows() {
             with_zeros(&first[..(shrink * n) as usize], regrow),
             "{backend:?}: rows released and backed again read zero"
         );
+    }
+}
+
+/// A held view keeps its original physical allocation and charge. Recommit
+/// must form separate backing in that case, even on CUDA VMM.
+#[test]
+fn a_reserved_tensor_recommits_away_from_a_held_view() {
+    for device in devices() {
+        let old = Tensor::reserved(&device, Element::f32(), &[128, 256], 64).unwrap();
+        let held = old.slice_leading(0, 1).unwrap();
+        let expected = (0..256).map(|value| value as f32).collect::<Vec<_>>();
+        let encoded = expected
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        held.clone().write_from_host(&encoded).unwrap();
+        let prior = old.observe_storage();
+        let old_charge = prior.charged_bytes().unwrap();
+        let baseline = device.memory_usage().charged;
+        device.set_memory_limit(Some(baseline));
+        assert!(old.recommitted(16).is_err());
+        assert_eq!(device.memory_usage().charged, baseline);
+        assert_eq!(prior.charged_bytes(), Some(old_charge));
+        device.set_memory_limit(None);
+        let new = old.recommitted(16).unwrap();
+        assert!(!new.shares_allocation(&old));
+        if device.backend() == BackendName::Cuda {
+            assert!(new.resizes_in_place());
+        }
+        assert_eq!(prior.charged_bytes(), Some(old_charge));
+        assert_eq!(
+            device.memory_usage().charged,
+            baseline + new.storage_bytes()
+        );
+        drop(old);
+        assert_eq!(prior.charged_bytes(), Some(old_charge));
+        assert_eq!(read_f32(&held), expected);
+        drop(held);
+        assert_eq!(prior.charged_bytes(), None);
+        assert_eq!(
+            device.memory_usage().charged,
+            baseline + new.storage_bytes() - old_charge
+        );
+    }
+}
+
+#[test]
+fn an_exclusive_reserved_tensor_shrinks_under_its_existing_charge() {
+    for device in devices() {
+        let old = Tensor::reserved(&device, Element::f32(), &[128, 256], 64).unwrap();
+        let before = device.memory_usage().charged;
+        let old_charge = old.storage_bytes();
+        device.set_memory_limit(Some(before));
+        let result = old.recommitted(16);
+        device.set_memory_limit(None);
+        if device.backend() == BackendName::Cuda {
+            let new = result.unwrap();
+            assert_eq!(new.committed_rows(), 16);
+            assert_eq!(
+                device.memory_usage().charged,
+                before - old_charge + new.storage_bytes()
+            );
+        } else {
+            assert!(result.is_err());
+        }
+    }
+}
+
+#[test]
+fn a_failed_second_recommit_preserves_the_first_plane() {
+    for device in devices() {
+        let first = Tensor::reserved(&device, Element::f32(), &[128, 256], 64).unwrap();
+        let second = Tensor::reserved(&device, Element::f32(), &[128, 256], 64).unwrap();
+        let original = (0..256).map(|value| value as f32).collect::<Vec<_>>();
+        let encoded = original
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        first
+            .slice_leading(0, 1)
+            .unwrap()
+            .write_from_host(&encoded)
+            .unwrap();
+        let baseline = device.memory_usage().charged;
+        let first_grown = first.recommitted(96).unwrap();
+        let with_first_growth = device.memory_usage().charged;
+        device.set_memory_limit(Some(with_first_growth));
+        assert!(second.recommitted(96).is_err());
+        device.set_memory_limit(None);
+        drop(first_grown);
+        assert_eq!(device.memory_usage().charged, baseline);
+        assert_eq!(read_f32(&first.slice_leading(0, 1).unwrap()), original);
     }
 }

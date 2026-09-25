@@ -230,8 +230,11 @@ impl AnalyticalModelDefinition<Cuda> for CudaAnalyticalModel {
                     let [_, inner] = a.extents.as_slice() else {
                         panic!("closed CUDA matrix left operand is not rank two")
                     };
-                    let exact = |value| kernel.exact_nat(value)
-                        .ok_or(ModelLimitation::DeviceExtent { value });
+                    let exact = |value| {
+                        kernel
+                            .exact_nat(value)
+                            .ok_or(ModelLimitation::DeviceExtent { value })
+                    };
                     let (rows, columns, inner) = (exact(*rows)?, exact(*columns)?, exact(*inner)?);
                     if *elem == seismic_lang::types::DType::F32 {
                         let units = arena.nat_product(&[rows, columns, inner]);
@@ -265,8 +268,11 @@ impl AnalyticalModelDefinition<Cuda> for CudaAnalyticalModel {
                     let [_, inner] = a.extents.as_slice() else {
                         panic!("closed CUDA NVFP4 left operand is not rank two")
                     };
-                    let exact = |value| kernel.exact_nat(value)
-                        .ok_or(ModelLimitation::DeviceExtent { value });
+                    let exact = |value| {
+                        kernel
+                            .exact_nat(value)
+                            .ok_or(ModelLimitation::DeviceExtent { value })
+                    };
                     let (rows, columns, inner) = (exact(*rows)?, exact(*columns)?, exact(*inner)?);
                     let m_tile = arena.nat(128);
                     let n_tile = arena.nat(8);

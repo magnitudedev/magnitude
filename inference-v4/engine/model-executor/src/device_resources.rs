@@ -55,6 +55,12 @@ pub(crate) struct FeatureAllocation {
 }
 
 impl FeatureAllocation {
+    /// Graph results borrow an already charged output arena from a sealed
+    /// pool; standalone feature tensors own their charge directly.
+    pub(crate) fn is_graph_backed(&self) -> bool {
+        matches!(self.tensor.as_ref(), Some(TensorBacking::Graph(_)))
+    }
+
     pub fn tensor(&self) -> Result<&Tensor, ResourceError> {
         self.tensor
             .as_ref()

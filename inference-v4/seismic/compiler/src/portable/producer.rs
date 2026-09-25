@@ -100,12 +100,24 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
         let direct_axes = match self.function.value(value).origin {
             ValueOrigin::Node(node) => match self.function.node(node).view() {
                 SemanticNodeView::Alloc { extents, .. }
-                | SemanticNodeView::View { extents, transform: ViewTransform::Reshape { .. }, .. } => {
-                    Some(extents.iter().map(|id| { let value = self.scalar(*id); portable_index(self.kernel,value) }).collect::<Vec<_>>())
-                }
+                | SemanticNodeView::View {
+                    extents,
+                    transform: ViewTransform::Reshape { .. },
+                    ..
+                } => Some(
+                    extents
+                        .iter()
+                        .map(|id| {
+                            let value = self.scalar(*id);
+                            portable_index(self.kernel, value)
+                        })
+                        .collect::<Vec<_>>(),
+                ),
                 SemanticNodeView::Fill { like: input, .. }
                 | SemanticNodeView::Copy { input, .. }
-                | SemanticNodeView::RepresentationConvert { input, .. } => Some(self.tensor(input).axes),
+                | SemanticNodeView::RepresentationConvert { input, .. } => {
+                    Some(self.tensor(input).axes)
+                }
                 _ => None,
             },
             _ => None,
@@ -116,7 +128,9 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
             .copied()
             .enumerate()
             .map(|(ordinal, axis)| {
-                if let Some(actual) = &direct_axes { return ResultAxis::Bound(actual[ordinal]); }
+                if let Some(actual) = &direct_axes {
+                    return ResultAxis::Bound(actual[ordinal]);
+                }
                 let bound = self.values.iter().find_map(|(id, bound)| {
                     if id.function() != self.function.id() {
                         return None;
@@ -192,13 +206,23 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
 impl TensorResult<PreparedArg> {
     pub(super) fn map_captures(&self, map: &mut impl FnMut(PreparedArg) -> PreparedArg) -> Self {
         Self {
-            value: self.value, tensor: self.tensor.clone(), capacity: self.capacity.clone(),
-            captures: self.captures.iter().map(|(id,value)|(*id,map(*value))).collect(),
-            axes: self.axes.iter().map(|axis|match axis {
-                ResultAxis::Bound(value)=>ResultAxis::Bound(map(*value)),
-                ResultAxis::Expression=>ResultAxis::Expression,
-                ResultAxis::Unavailable(reason)=>ResultAxis::Unavailable(*reason),
-            }).collect(),
+            value: self.value,
+            tensor: self.tensor.clone(),
+            capacity: self.capacity.clone(),
+            captures: self
+                .captures
+                .iter()
+                .map(|(id, value)| (*id, map(*value)))
+                .collect(),
+            axes: self
+                .axes
+                .iter()
+                .map(|axis| match axis {
+                    ResultAxis::Bound(value) => ResultAxis::Bound(map(*value)),
+                    ResultAxis::Expression => ResultAxis::Expression,
+                    ResultAxis::Unavailable(reason) => ResultAxis::Unavailable(*reason),
+                })
+                .collect(),
         }
     }
     pub(super) fn instantiate<B: seismic_native_target::TargetFamily>(

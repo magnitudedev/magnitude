@@ -9,9 +9,7 @@
 #define KERNEL_W1 SEISMIC_SHARED_DOWN
 #include "lib/routed/routed.cuh"
 
-using Shape = projection::GemvShape<4, SEISMIC_TUNE_TPW, SEISMIC_TUNE_KSPLIT, 1>;
 using Pro = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
-constexpr int CARRIED = 2 * SEISMIC_TUNE_TPW;
 
 // The carried slot of channel n: its tile within the group and its row half.
 __device__ __forceinline__ unsigned routed_slot(projection::u64 n, projection::u64 first) {
@@ -40,7 +38,11 @@ struct FinalEpi {
     }
 };
 
-extern "C" __global__ void routed_output(SEISMIC_KERNEL_PARAMS) {
+#ifdef SEISMIC_FORMING_ROUTED_OUTPUT
+template <int TPW, int KSPLIT>
+__global__ void routed_output(SEISMIC_KERNEL_PARAMS) {
+    using Shape = projection::GemvShape<4, TPW, KSPLIT, 1>;
+    constexpr int CARRIED = 2 * TPW;
     __shared__ projection::GemvShared<Shape, Pro> shared;
     const projection::u64 group = Shape::tile_group();
     if (group >= projection::gemv_groups<Shape>(SEISMIC_DIM_H))
@@ -80,3 +82,4 @@ extern "C" __global__ void routed_output(SEISMIC_KERNEL_PARAMS) {
     projection::gemv_segment<Shape>(shared, pro, 1u, SEISMIC_DIM_S / 64, group, SEISMIC_DIM_H,
                             KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_DOWN)), projection::NoWeight{}, epi);
 }
+#endif

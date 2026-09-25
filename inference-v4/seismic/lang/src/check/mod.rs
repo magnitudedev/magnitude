@@ -15,14 +15,14 @@ mod expr;
 mod initialization;
 #[cfg(test)]
 mod initialization_tests;
-#[cfg(test)]
-mod stable_identity_tests;
 pub(crate) mod ir;
 mod ownership;
 #[cfg(test)]
 mod ownership_tests;
 pub(crate) mod prove;
 pub(crate) mod resolve;
+#[cfg(test)]
+mod stable_identity_tests;
 mod stmt;
 pub(crate) mod xfer;
 
@@ -188,7 +188,10 @@ impl<'a> Checker<'a> {
         for element in tensor_elements(&c.sig.result.clone()) {
             c.elements.stored(element);
         }
-        let contract = env.resolved.families[declared.family.index()].contract.index() == def;
+        let contract = env.resolved.families[declared.family.index()]
+            .contract
+            .index()
+            == def;
         if contract {
             c.signature_totality();
         }
@@ -331,12 +334,22 @@ impl<'a> Checker<'a> {
     }
 
     /// Prove `e >= 0`, or report `what` with the unproved goal.
-    pub fn require_nonneg(&mut self, rule: DiagnosticRule, e: IntExpr, span: Span, what: &str) -> bool {
+    pub fn require_nonneg(
+        &mut self,
+        rule: DiagnosticRule,
+        e: IntExpr,
+        span: Span,
+        what: &str,
+    ) -> bool {
         if prove::nonneg(&self.arena, &self.facts, e) {
             return true;
         }
         let rendered = self.render(e);
-        self.error(rule, span, format!("{what}: cannot prove `{rendered} >= 0`"));
+        self.error(
+            rule,
+            span,
+            format!("{what}: cannot prove `{rendered} >= 0`"),
+        );
         false
     }
 
@@ -350,7 +363,10 @@ impl<'a> Checker<'a> {
             .iter()
             .map(|parameter| (parameter.ty.clone(), parameter.span))
             .collect::<Vec<_>>();
-        types.push((self.sig.result.clone(), self.env.resolved.declared[self.def].name_span));
+        types.push((
+            self.sig.result.clone(),
+            self.env.resolved.declared[self.def].name_span,
+        ));
         for (ty, span) in types {
             for extent in type_extents(&ty) {
                 for divisor in divisors(&self.arena, extent) {
@@ -564,7 +580,9 @@ impl<'a> Checker<'a> {
                     declared_at,
                     format!(
                         "capability `{}.{}` is required but not used",
-                        crate::registry::capability_info(capability).backend.as_str(),
+                        crate::registry::capability_info(capability)
+                            .backend
+                            .as_str(),
                         crate::registry::capability_info(capability).name
                     ),
                 );
@@ -671,8 +689,12 @@ fn check_definition(env: &Env, def: usize) -> CheckedOutcome {
     let mut c = Checker::new(env, def);
     let initialization_facts = c.facts.clone();
     let (mut root, mut result) = c.function_body(declared.body, declared.name_span);
-    let initialization = initialization::check(&mut c, &mut root, &mut result, initialization_facts);
-    let contract = env.resolved.families[declared.family.index()].contract.index() == def;
+    let initialization =
+        initialization::check(&mut c, &mut root, &mut result, initialization_facts);
+    let contract = env.resolved.families[declared.family.index()]
+        .contract
+        .index()
+        == def;
     let plan = if contract {
         match dimensions::plan_dimensions(&c.arena, &c.sig.dimensions, &c.sig.params) {
             Ok(plan) => Some(plan),
@@ -724,7 +746,11 @@ pub(crate) fn check_program(
     // L20: every recursion is one diagnostic, and every definition that
     // reaches no recursion is still checked.
     let (order, cycles) = resolved.call_graph.bottom_up_order();
-    diagnostics.extend(cycles.iter().map(|cycle| cycle.diagnostic(&resolved.declared)));
+    diagnostics.extend(
+        cycles
+            .iter()
+            .map(|cycle| cycle.diagnostic(&resolved.declared)),
+    );
     let mut outcomes: Vec<Option<CheckedOutcome>> = (0..count).map(|_| None).collect();
     for def in order {
         let env = Env {
@@ -750,7 +776,11 @@ pub(crate) fn check_program(
     }
     // Without a recursion, the order holds every definition.
     let mut outcomes = outcomes.into_iter().flatten().collect::<Vec<_>>();
-    assert_eq!(outcomes.len(), count, "definition checking order omitted a body");
+    assert_eq!(
+        outcomes.len(),
+        count,
+        "definition checking order omitted a body"
+    );
     let families = resolved
         .families
         .iter()
@@ -825,7 +855,9 @@ pub(crate) fn check_closed(
     for (file, source) in sources.files().iter().enumerate() {
         match crate::syntax::parse(&source.text) {
             Ok(ast) => parsed.push((file, ast)),
-            Err(diagnostic) => parse_diagnostics.push(SourceDiagnostic::located(source, diagnostic)),
+            Err(diagnostic) => {
+                parse_diagnostics.push(SourceDiagnostic::located(source, diagnostic))
+            }
         }
     }
     if let Some(diagnostics) = Diagnostics::new(parse_diagnostics) {
@@ -991,7 +1023,10 @@ fn check_native(
                 ),
             ));
         } else if statics.contains(&name.name) {
-            errors.push((name.span, format!("static dimension `{}` is listed twice", name.name)));
+            errors.push((
+                name.span,
+                format!("static dimension `{}` is listed twice", name.name),
+            ));
         } else {
             statics.push(name.name.clone());
         }
@@ -1000,15 +1035,28 @@ fn check_native(
     let mut params: Vec<NativeParameter> = Vec::new();
     for param in &native.params {
         let name = &param.name.name;
+        if backend == crate::registry::BackendName::Cpu && param.code {
+            errors.push((
+                param.span,
+                "CPU native parameters are runtime values; `code` is for compiled GPU kernels"
+                    .to_owned(),
+            ));
+        }
         if entry.dimensions.contains(name) {
             errors.push((
                 param.name.span,
-                format!("native parameter `{name}` shadows a dimension of `{}`", entry.name),
+                format!(
+                    "native parameter `{name}` shadows a dimension of `{}`",
+                    entry.name
+                ),
             ));
             continue;
         }
         if params.iter().any(|existing| &existing.name == name) {
-            errors.push((param.name.span, format!("native parameter `{name}` is declared twice")));
+            errors.push((
+                param.name.span,
+                format!("native parameter `{name}` is declared twice"),
+            ));
             continue;
         }
         let mut values: Vec<u64> = Vec::new();
@@ -1024,6 +1072,7 @@ fn check_native(
         }
         params.push(NativeParameter {
             name: name.clone(),
+            code: param.code,
             arithmetic: param.arithmetic,
             values,
             role: crate::checked::NativeParameterRole::Declared,
@@ -1044,7 +1093,11 @@ fn check_native(
             ));
             continue;
         }
-        let stored = entry.element_domain.parameters().iter().find(|parameter| &parameter.name == name);
+        let stored = entry
+            .element_domain
+            .parameters()
+            .iter()
+            .find(|parameter| &parameter.name == name);
         let converted = entry.element_domain.conversions().iter().any(|conversion| {
             conversion.target == crate::checked::ElementTarget::Parameter(name.clone())
         });
@@ -1056,7 +1109,9 @@ fn check_native(
                 ));
                 continue;
             }
-            Some(parameter) if !(parameter.uses.stored || parameter.uses.partial_copy) || converted => {
+            Some(parameter)
+                if !(parameter.uses.stored || parameter.uses.partial_copy) || converted =>
+            {
                 errors.push((
                     coverage.name.span,
                     format!(
@@ -1069,7 +1124,10 @@ fn check_native(
             Some(_) => {}
         }
         if elements.iter().any(|existing| &existing.parameter == name) {
-            errors.push((coverage.name.span, format!("the elements of `{name}` are declared twice")));
+            errors.push((
+                coverage.name.span,
+                format!("the elements of `{name}` are declared twice"),
+            ));
             continue;
         }
         let mut dtypes = Vec::new();
@@ -1084,7 +1142,10 @@ fn check_native(
                 }
                 _ => errors.push((
                     dtype.span,
-                    format!("`{}` is not a CPU element type; they are f32, bf16, f16, i32 and u32", dtype.name),
+                    format!(
+                        "`{}` is not a CPU element type; they are f32, bf16, f16, i32 and u32",
+                        dtype.name
+                    ),
                 )),
             }
         }
@@ -1106,15 +1167,27 @@ fn check_native(
                      expr: &Option<crate::syntax::ast::Expr>,
                      errors: &mut Vec<(Span, String)>| match expr {
         None => Some(None),
-        Some(expr) => {
-            native_condition(clause, expr, &entry.dimensions, &parameter_names)
-                .map_err(|error| errors.push(error))
-                .ok()
-                .map(Some)
-        }
+        Some(expr) => native_condition(clause, expr, &entry.dimensions, &parameter_names)
+            .map_err(|error| errors.push(error))
+            .ok()
+            .map(Some),
     };
 
-    let constraint = condition("where", &native.constraint, &mut errors).flatten();
+    let launch_names = native
+        .launches
+        .iter()
+        .flat_map(|launch| launch.params.iter().map(|param| param.name.name.clone()))
+        .collect::<Vec<_>>();
+    let where_names = parameter_names
+        .iter()
+        .cloned()
+        .chain(launch_names.iter().cloned())
+        .collect::<Vec<_>>();
+    let constraint = native.constraint.as_ref().and_then(|expr| {
+        native_condition("where", expr, &entry.dimensions, &where_names)
+            .map_err(|error| errors.push(error))
+            .ok()
+    });
     if let (Some(constraint), Some(expr)) = (&constraint, &native.constraint) {
         let mut read = Vec::new();
         constraint.dimensions(&mut read);
@@ -1126,11 +1199,62 @@ fn check_native(
                 ),
             ));
         }
+        fn conjuncts<'a>(
+            condition: &'a crate::checked::NativeCondition,
+            out: &mut Vec<&'a crate::checked::NativeCondition>,
+        ) {
+            match condition {
+                crate::checked::NativeCondition::And(left, right) => {
+                    conjuncts(left, out);
+                    conjuncts(right, out);
+                }
+                other => out.push(other),
+            }
+        }
+        let mut parts = Vec::new();
+        conjuncts(constraint, &mut parts);
+        for part in parts {
+            let mut names = Vec::new();
+            part.parameters(&mut names);
+            let mut owner = None;
+            for name in names {
+                let owners = native
+                    .launches
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, launch)| {
+                        launch
+                            .params
+                            .iter()
+                            .any(|parameter| parameter.name.name == name)
+                            .then_some(index)
+                    })
+                    .collect::<Vec<_>>();
+                if owners.len() > 1 {
+                    errors.push((
+                        expr.span,
+                        format!("native `where` parameter `{name}` is ambiguous across launches"),
+                    ));
+                } else if let Some(launch) = owners.first().copied() {
+                    if owner.is_some_and(|previous| previous != launch) {
+                        errors.push((
+                            expr.span,
+                            "one native `where` conjunct may read parameters of only one launch"
+                                .to_owned(),
+                        ));
+                    }
+                    owner = Some(launch);
+                }
+            }
+        }
     }
 
     let mut scratch: Vec<NativeScratch> = Vec::new();
     for buffer in &native.scratch {
-        if scratch.iter().any(|existing| existing.name == buffer.name.name) {
+        if scratch
+            .iter()
+            .any(|existing| existing.name == buffer.name.name)
+        {
             errors.push((
                 buffer.name.span,
                 format!("scratch buffer `{}` is declared twice", buffer.name.name),
@@ -1150,17 +1274,93 @@ fn check_native(
 
     let mut launches = Vec::new();
     for launch in &native.launches {
-        let when = condition("when", &launch.when, &mut errors);
+        let mut launch_params: Vec<NativeParameter> = Vec::new();
+        for param in &launch.params {
+            let name = &param.name.name;
+            if backend == crate::registry::BackendName::Cpu && param.code {
+                errors.push((
+                    param.span,
+                    "CPU native parameters are runtime values; `code` is for compiled GPU kernels"
+                        .to_owned(),
+                ));
+            }
+            if entry.dimensions.contains(name) || parameter_names.contains(name) {
+                errors.push((
+                    param.name.span,
+                    format!("launch parameter `{name}` shadows an entry dimension or parameter"),
+                ));
+                continue;
+            }
+            if launch_params.iter().any(|existing| &existing.name == name) {
+                errors.push((
+                    param.name.span,
+                    format!("launch parameter `{name}` is declared twice"),
+                ));
+                continue;
+            }
+            let mut values = Vec::new();
+            for value in &param.values {
+                if values.contains(value) {
+                    errors.push((
+                        param.span,
+                        format!("launch parameter `{name}` lists {value} twice"),
+                    ));
+                } else {
+                    values.push(*value);
+                }
+            }
+            launch_params.push(NativeParameter {
+                name: name.clone(),
+                code: param.code,
+                arithmetic: param.arithmetic,
+                values,
+                role: crate::checked::NativeParameterRole::Declared,
+            });
+        }
+        let mut reads = Vec::new();
+        for read in &launch.reads {
+            if !parameter_names.contains(&read.name) {
+                errors.push((
+                    read.span,
+                    format!("kernel read `{}` is not an entry parameter", read.name),
+                ));
+            } else if reads.contains(&read.name) {
+                errors.push((
+                    read.span,
+                    format!("kernel read `{}` is declared twice", read.name),
+                ));
+            } else {
+                reads.push(read.name.clone());
+            }
+        }
+        let launch_names = parameter_names
+            .iter()
+            .cloned()
+            .chain(launch_params.iter().map(|param| param.name.clone()))
+            .collect::<Vec<_>>();
+        let launch_expression = |expr: &crate::syntax::ast::Expr,
+                                 errors: &mut Vec<(Span, String)>| {
+            native_nat_expr(expr, &entry.dimensions, &launch_names)
+                .map_err(|message| errors.push((expr.span, message)))
+                .ok()
+        };
+        let when = match &launch.when {
+            None => Some(None),
+            Some(expr) => native_condition("when", expr, &entry.dimensions, &launch_names)
+                .map_err(|error| errors.push(error))
+                .ok()
+                .map(Some),
+        };
         let groups = launch
             .threadgroups
             .each_ref()
-            .map(|expr| expression(expr, &mut errors));
+            .map(|expr| launch_expression(expr, &mut errors));
         let group_extent = launch
             .threads_per_threadgroup
             .each_ref()
-            .map(|expr| expression(expr, &mut errors));
+            .map(|expr| launch_expression(expr, &mut errors));
         let shared_bytes = match &launch.shared_bytes {
-            Some(expr) => expression(expr, &mut errors),
+            Some(expr) => launch_expression(expr, &mut errors),
             None => Some(NativeNatExpr::Constant(0)),
         };
         let (
@@ -1181,7 +1381,12 @@ fn check_native(
                 (&ez, &launch.threads_per_threadgroup[2]),
             ]
             .into_iter()
-            .chain(launch.shared_bytes.as_ref().map(|expr| (&shared_bytes, expr)));
+            .chain(
+                launch
+                    .shared_bytes
+                    .as_ref()
+                    .map(|expr| (&shared_bytes, expr)),
+            );
             for (checked, expr) in fixed {
                 let mut read = Vec::new();
                 checked.dimensions(&mut read);
@@ -1197,6 +1402,8 @@ fn check_native(
         }
         launches.push(NativeLaunch {
             kernel: launch.kernel.name.clone(),
+            params: launch_params,
+            reads,
             when,
             groups: [x, y, z],
             group_extent: [ex, ey, ez],
@@ -1351,14 +1558,20 @@ pub(super) fn result_leaves(ty: &ValueType) -> Vec<(Vec<u32>, &ValueType)> {
         match ty {
             ValueType::Tuple(items) => {
                 for (ordinal, item) in items.iter().enumerate() {
-                    path.push(u32::try_from(ordinal).expect("tuple has more than u32::MAX elements"));
+                    path.push(
+                        u32::try_from(ordinal).expect("tuple has more than u32::MAX elements"),
+                    );
                     walk(item, path, leaves);
                     path.pop();
                 }
             }
             ValueType::Void => {}
-            ValueType::Integer => unreachable!("mathematical integer has no source result spelling"),
-            ValueType::Opaque { .. } => panic!("backend-opaque result escaped an exported portable entry"),
+            ValueType::Integer => {
+                unreachable!("mathematical integer has no source result spelling")
+            }
+            ValueType::Opaque { .. } => {
+                panic!("backend-opaque result escaped an exported portable entry")
+            }
             _ => leaves.push((path.clone(), ty)),
         }
     }
@@ -1408,7 +1621,9 @@ fn entry_info(
                 element: element_summary(&tensor.elem),
             },
             ValueType::Scalar(dtype) => ParameterSummaryKind::Scalar(*dtype),
-            ValueType::Integer => unreachable!("mathematical integer has no source parameter spelling"),
+            ValueType::Integer => {
+                unreachable!("mathematical integer has no source parameter spelling")
+            }
             ValueType::Index { .. } => ParameterSummaryKind::Index,
             ValueType::Range { .. } => ParameterSummaryKind::Range,
             ValueType::Void => return,
@@ -1465,7 +1680,9 @@ fn entry_info(
                 element: element_summary(&t.elem),
             },
             ValueType::Scalar(d) => S::Scalar(*d),
-            ValueType::Integer => unreachable!("mathematical integer has no source signature spelling"),
+            ValueType::Integer => {
+                unreachable!("mathematical integer has no source signature spelling")
+            }
             ValueType::Index { .. } => S::Index,
             ValueType::Range { .. } => S::Range,
             ValueType::Opaque { .. } => unreachable!("opaque portable signature"),

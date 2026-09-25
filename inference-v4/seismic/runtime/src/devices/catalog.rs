@@ -100,7 +100,11 @@ impl Catalog {
 
     /// Open with `options`. A device already open is shared as it was
     /// opened; asking it for a different artifact store is an error.
-    pub fn open_with(&self, id: DeviceId, options: DeviceOptions) -> Result<Arc<DeviceInner>, OpenError> {
+    pub fn open_with(
+        &self,
+        id: DeviceId,
+        options: DeviceOptions,
+    ) -> Result<Arc<DeviceInner>, OpenError> {
         // Holding this lock through acquisition makes opening atomic: two
         // callers cannot create independent services or profiles for the
         // same descriptor. A dropped device may be opened and profiled
@@ -147,7 +151,11 @@ impl Catalog {
     /// discovery order. Managed selection chooses by model requirements.
     pub fn open_backend(&self, backend: BackendName) -> Result<Arc<DeviceInner>, OpenError> {
         let topology = self.topology();
-        let Some(device) = topology.devices().iter().find(|device| device.backend == backend) else {
+        let Some(device) = topology
+            .devices()
+            .iter()
+            .find(|device| device.backend == backend)
+        else {
             return Err(OpenError::NoDevice {
                 backend,
                 diagnostics: topology
@@ -277,7 +285,10 @@ mod tests {
             panic!("host CPU backing is established")
         };
         assert!(memory.allocates_host_memory());
-        assert_eq!(topology.pool(memory.allocation_pool), Some(topology.host_pool()));
+        assert_eq!(
+            topology.pool(memory.allocation_pool),
+            Some(topology.host_pool())
+        );
         assert!(topology.host_pool().capacity_bytes > 0);
         // The address-size limit is an allocation limit, never capacity.
         assert!(memory.max_allocation_bytes > topology.host_pool().capacity_bytes);
@@ -293,7 +304,9 @@ mod tests {
         assert_eq!(after.device(id).unwrap().selector, DeviceSelector::HostCpu);
         assert_eq!(
             catalog.resolve(DeviceSelector::Cuda { uuid: [0xff; 16] }),
-            Err(ResolveError::Missing(DeviceSelector::Cuda { uuid: [0xff; 16] }))
+            Err(ResolveError::Missing(DeviceSelector::Cuda {
+                uuid: [0xff; 16]
+            }))
         );
     }
 

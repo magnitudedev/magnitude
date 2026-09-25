@@ -64,8 +64,18 @@ impl<T> Product<T> {
         match self {
             Self::Unit => 0,
             Self::Leaf(value) => leaf(value),
-            Self::Range(a,b) => 2 * std::mem::size_of::<Self>() + a.retained_heap_bytes(leaf) + b.retained_heap_bytes(leaf),
-            Self::Tuple(values) => values.capacity() * std::mem::size_of::<Self>() + values.iter().map(|value|value.retained_heap_bytes(leaf)).sum::<usize>(),
+            Self::Range(a, b) => {
+                2 * std::mem::size_of::<Self>()
+                    + a.retained_heap_bytes(leaf)
+                    + b.retained_heap_bytes(leaf)
+            }
+            Self::Tuple(values) => {
+                values.capacity() * std::mem::size_of::<Self>()
+                    + values
+                        .iter()
+                        .map(|value| value.retained_heap_bytes(leaf))
+                        .sum::<usize>()
+            }
         }
     }
 
@@ -73,8 +83,15 @@ impl<T> Product<T> {
         Ok(match self {
             Self::Unit => Product::Unit,
             Self::Leaf(value) => Product::Leaf(f(value)?),
-            Self::Range(start, end) => Product::Range(Box::new(start.try_map(f)?), Box::new(end.try_map(f)?)),
-            Self::Tuple(values) => Product::Tuple(values.iter().map(|value| value.try_map(f)).collect::<Result<_, _>>()?),
+            Self::Range(start, end) => {
+                Product::Range(Box::new(start.try_map(f)?), Box::new(end.try_map(f)?))
+            }
+            Self::Tuple(values) => Product::Tuple(
+                values
+                    .iter()
+                    .map(|value| value.try_map(f))
+                    .collect::<Result<_, _>>()?,
+            ),
         })
     }
     pub fn map<U>(&self, f: &mut impl FnMut(&T) -> U) -> Product<U> {
@@ -108,10 +125,21 @@ pub struct BranchResult {
     pub(crate) result: ValueDestination,
 }
 impl BranchResult {
-    pub fn then_value(&self) -> ValueOperand { self.then_value }
-    pub fn else_value(&self) -> ValueOperand { self.else_value }
-    pub fn result(&self) -> ValueDestination { self.result }
-    pub(crate) fn remap(&self, view: impl Fn(AnyBufferView) -> AnyBufferView, slot: impl Fn(AnyScalarSlot) -> AnyScalarSlot, quantity: impl Fn(HostQuantitySlot) -> HostQuantitySlot) -> Self {
+    pub fn then_value(&self) -> ValueOperand {
+        self.then_value
+    }
+    pub fn else_value(&self) -> ValueOperand {
+        self.else_value
+    }
+    pub fn result(&self) -> ValueDestination {
+        self.result
+    }
+    pub(crate) fn remap(
+        &self,
+        view: impl Fn(AnyBufferView) -> AnyBufferView,
+        slot: impl Fn(AnyScalarSlot) -> AnyScalarSlot,
+        quantity: impl Fn(HostQuantitySlot) -> HostQuantitySlot,
+    ) -> Self {
         let operand = |value| match value {
             ValueOperand::Tensor(value) => ValueOperand::Tensor(view(value)),
             other => other,
@@ -121,7 +149,11 @@ impl BranchResult {
             ValueDestination::Scalar(value) => ValueDestination::Scalar(slot(value)),
             ValueDestination::Quantity(value) => ValueDestination::Quantity(quantity(value)),
         };
-        Self { then_value: operand(self.then_value), else_value: operand(self.else_value), result }
+        Self {
+            then_value: operand(self.then_value),
+            else_value: operand(self.else_value),
+            result,
+        }
     }
 }
 
@@ -215,22 +247,40 @@ pub(crate) fn collect_carries<'a>(
     }
 }
 
-pub(crate) fn collect_tensor_definitions(steps: &[crate::schedule::ScheduleStep], definitions: &mut Vec<(AnyBufferView, AnyBufferView)>) {
+pub(crate) fn collect_tensor_definitions(
+    steps: &[crate::schedule::ScheduleStep],
+    definitions: &mut Vec<(AnyBufferView, AnyBufferView)>,
+) {
     use crate::schedule::ScheduleStep;
     for step in steps {
         match step {
-            ScheduleStep::BeginAllocationInstance { source, result } | ScheduleStep::BindArgumentTensor { source, result } => definitions.push((*source, *result)),
-            ScheduleStep::Imported { body, .. } | ScheduleStep::Repeat { body, .. } => collect_tensor_definitions(body, definitions),
-            ScheduleStep::If { then_steps, else_steps, results, .. } => {
-                collect_tensor_definitions(then_steps, definitions); collect_tensor_definitions(else_steps, definitions);
-                results.visit(&mut |result| if let ValueDestination::Tensor(destination) = result.result() {
-                    for operand in [result.then_value(), result.else_value()] {
-                        let ValueOperand::Tensor(source) = operand else { unreachable!("closed branch product kind") };
-                        definitions.push((source, destination));
+            ScheduleStep::BeginAllocationInstance { source, result }
+            | ScheduleStep::BindArgumentTensor { source, result } => {
+                definitions.push((*source, *result))
+            }
+            ScheduleStep::Imported { body, .. } | ScheduleStep::Repeat { body, .. } => {
+                collect_tensor_definitions(body, definitions)
+            }
+            ScheduleStep::If {
+                then_steps,
+                else_steps,
+                results,
+                ..
+            } => {
+                collect_tensor_definitions(then_steps, definitions);
+                collect_tensor_definitions(else_steps, definitions);
+                results.visit(&mut |result| {
+                    if let ValueDestination::Tensor(destination) = result.result() {
+                        for operand in [result.then_value(), result.else_value()] {
+                            let ValueOperand::Tensor(source) = operand else {
+                                unreachable!("closed branch product kind")
+                            };
+                            definitions.push((source, destination));
+                        }
                     }
                 });
             }
-            _ => {},
+            _ => {}
         }
     }
 }
@@ -260,11 +310,15 @@ pub(crate) fn possible_backings(
                     return Some(());
                 }
                 let mut defined = false;
-                for (source, _) in definitions.iter().filter(|(_, result)| views[result.index() as usize].base == ViewBase::TensorValue(id)) {
+                for (source, _) in definitions.iter().filter(|(_, result)| {
+                    views[result.index() as usize].base == ViewBase::TensorValue(id)
+                }) {
                     defined = true;
                     visit(*source, views, products, definitions, visiting, roots)?;
                 }
-                if defined { return Some(()); }
+                if defined {
+                    return Some(());
+                }
                 let product = products.iter().find(|carry| [carry.header(),carry.result()].into_iter().any(|destination| {
                     matches!(destination,ValueDestination::Tensor(value) if views[value.index() as usize].base == ViewBase::TensorValue(id))
                 }))?;
@@ -279,6 +333,13 @@ pub(crate) fn possible_backings(
         Some(())
     }
     let mut roots = BTreeSet::new();
-    visit(view, views, products, definitions, &mut BTreeSet::new(), &mut roots)?;
+    visit(
+        view,
+        views,
+        products,
+        definitions,
+        &mut BTreeSet::new(),
+        &mut roots,
+    )?;
     Some(roots.into_iter().collect())
 }

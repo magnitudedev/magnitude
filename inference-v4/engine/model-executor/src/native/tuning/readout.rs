@@ -8,19 +8,131 @@
 //! a single argument set.
 
 use super::cases::projection_shape;
-use crate::native::draft_vocabulary;
 use super::{
-    served_row_points, CaseState, EntryTuning, PointShape, TuningInputs, TuningLimits,
+    row_points, served_row_points, CaseState, EntryTuning, PointShape, TuningInputs, TuningLimits,
 };
+use crate::native::draft_vocabulary;
 use magnitude_model_batching::{HISTORY_WIDTH, SHAPING_WIDTH};
 use magnitude_model_contracts::{WeightKind, WeightScope};
 use magnitude_model_kernels::{
-    head_logits_rows, readout_head_rows, readout_selected_rows, sample_rows, shape_rows,
+    draft_rows, head_logits_rows, readout_head_rows, readout_selected_rows, sample_rows, shape_rows,
 };
 use seismic::{Element, Tensor};
 
 /// Candidate tokens of a `readout_selected_rows` tuning point.
 const SELECTED_TOKENS: u64 = 256;
+
+/// The MTP input's fused embedding, two RMS norms and combine projection.
+pub(crate) struct DraftRowsTuning {
+    pub embedding: Element,
+    pub embedding_norm: Element,
+    pub hidden_norm: Element,
+    pub combine: Element,
+    pub activation: Element,
+    pub scopes: Vec<WeightScope>,
+    pub epsilon: f32,
+}
+
+pub(crate) struct DraftRowsCase {
+    tokens: Tensor,
+    table: Tensor,
+    conditioning: Tensor,
+    embedding_norm: Tensor,
+    hidden_norm: Tensor,
+    combine: Tensor,
+    epsilon: f32,
+}
+
+impl EntryTuning for DraftRowsTuning {
+    type Entry = draft_rows::Entry;
+    type Case = DraftRowsCase;
+
+    fn bindings(&self) -> String {
+        format!(
+            "EW={},EN={},HN={},CW={},A={}",
+            self.embedding.name(),
+            self.embedding_norm.name(),
+            self.hidden_norm.name(),
+            self.combine.name(),
+            self.activation.name()
+        )
+    }
+
+    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+        let (hidden, joined) = projection_shape(inputs, &self.scopes, WeightKind::HeadCombine)?;
+        if joined != 2 * hidden {
+            return Err("the draft combine weight does not have two hidden inputs".into());
+        }
+        Ok(vec![("D", hidden)])
+    }
+
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        row_points(limits)
+    }
+
+    fn rotation(
+        &self,
+        inputs: &mut TuningInputs<'_, '_>,
+        point: &PointShape,
+    ) -> Result<Vec<Self::Case>, String> {
+        let table = inputs.weight(WeightScope::Target, WeightKind::Embedding)?;
+        let [vocabulary, hidden] = table.extents()[..] else {
+            return Err("the draft embedding table is not a matrix".into());
+        };
+        if vocabulary == 0 {
+            return Err("the draft embedding table is empty".into());
+        }
+        TuningInputs::rotation_scopes(&self.scopes, point)
+            .into_iter()
+            .enumerate()
+            .map(|(index, scope)| {
+                let tokens = (0..point.rows)
+                    .map(|row| {
+                        i32::try_from((row + index as u64) % vocabulary)
+                            .map(|token| [token, 0])
+                            .map_err(|_| "the draft vocabulary exceeds i32")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                Ok(DraftRowsCase {
+                    tokens: inputs.i32s(&[point.rows, 2], &tokens)?,
+                    table: table.clone(),
+                    conditioning: inputs.activation(
+                        self.activation,
+                        &[point.rows, hidden],
+                        index as u64 + 1,
+                    )?,
+                    embedding_norm: inputs.weight(scope, WeightKind::HeadEmbeddingNorm)?,
+                    hidden_norm: inputs.weight(scope, WeightKind::HeadHiddenNorm)?,
+                    combine: inputs.weight(scope, WeightKind::HeadCombine)?,
+                    epsilon: self.epsilon,
+                })
+            })
+            .collect()
+    }
+
+    fn args<'a>(case: &'a mut Self::Case) -> draft_rows::Args<'a> {
+        draft_rows::Args {
+            tokens: &case.tokens,
+            table: &case.table,
+            conditioning: &case.conditioning,
+            embedding_norm: &case.embedding_norm,
+            hidden_norm: &case.hidden_norm,
+            combine: &case.combine,
+            epsilon: case.epsilon,
+        }
+    }
+
+    generated_entry!(draft_rows, this => draft_rows::Elements {
+        EW: this.embedding,
+        A: this.activation,
+        EN: this.embedding_norm,
+        HN: this.hidden_norm,
+        CW: this.combine,
+    });
+}
 
 /// The projected-row points of the readout.
 fn projected_points(limits: TuningLimits) -> Vec<PointShape> {
@@ -318,7 +430,9 @@ impl EntryTuning for ShapeRowsTuning {
         let shaping: [f32; SHAPING_WIDTH] = [0.7, 20.0, 0.95, 0.05, 1.1, 0.2, 0.1, 0.0];
         let params = (0..rows).flat_map(|_| shaping).collect::<Vec<_>>();
         let history = (0..rows * HISTORY_WIDTH as u64)
-            .map(|index| i32::try_from(index * 7919 % vocabulary).map_err(|_| "vocabulary exceeds i32"))
+            .map(|index| {
+                i32::try_from(index * 7919 % vocabulary).map_err(|_| "vocabulary exceeds i32")
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let out = inputs.scratch(Element::f32(), &[rows, vocabulary])?;
         Ok(vec![ShapeRowsCase {
@@ -392,7 +506,10 @@ impl EntryTuning for SampleRowsTuning {
             mask: inputs.u32s(&[rows, words], &vec![u32::MAX; (rows * words) as usize])?,
             // Every other row constrained: both the masked and the free
             // path are measured.
-            constrained: inputs.i32s(&[rows], &(0..rows).map(|row| (row % 2) as i32).collect::<Vec<_>>())?,
+            constrained: inputs.i32s(
+                &[rows],
+                &(0..rows).map(|row| (row % 2) as i32).collect::<Vec<_>>(),
+            )?,
             draws: inputs.u32s(&[rows, 6], &draws)?,
             result: inputs.state(result, 0..rows)?,
         }])

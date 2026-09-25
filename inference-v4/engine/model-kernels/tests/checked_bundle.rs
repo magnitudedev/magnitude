@@ -21,7 +21,10 @@ fn embedded_kernel_bundle_round_trips_byte_identically() {
         decoded.entries().len(),
         started.elapsed()
     );
-    assert!(encode_checked_bundle(&decoded) == BUNDLE, "decode, encode is not the identity");
+    assert!(
+        encode_checked_bundle(&decoded) == BUNDLE,
+        "decode, encode is not the identity"
+    );
 }
 
 /// Slow: runs the checker over the whole kernel library.
@@ -36,8 +39,18 @@ fn embedded_kernel_bundle_matches_its_checked_sources() {
     assert_eq!(decoded.entries().len(), checked.entries().len());
     for (decoded, checked) in decoded.entries().iter().zip(checked.entries()) {
         assert_eq!(
-            (&decoded.name, &decoded.stable, &decoded.parameter_types, &decoded.element_domain),
-            (&checked.name, &checked.stable, &checked.parameter_types, &checked.element_domain)
+            (
+                &decoded.name,
+                &decoded.stable,
+                &decoded.parameter_types,
+                &decoded.element_domain
+            ),
+            (
+                &checked.name,
+                &checked.stable,
+                &checked.parameter_types,
+                &checked.element_domain
+            )
         );
     }
 }

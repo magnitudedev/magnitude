@@ -46,7 +46,10 @@ impl Rng {
         Self(seed ^ 0x9e37_79b9_7f4a_7c15)
     }
     fn next(&mut self) -> u32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (self.0 >> 33) as u32
     }
     fn below(&mut self, bound: usize) -> usize {
@@ -78,7 +81,9 @@ fn activations(rng: &mut Rng, rows: usize, width: usize, scale: f32) -> Vec<f32>
 }
 
 fn uniform(rng: &mut Rng, count: usize, low: f32, high: f32) -> Vec<f32> {
-    (0..count).map(|_| low + (high - low) * (rng.unit() + 1.0) * 0.5).collect()
+    (0..count)
+        .map(|_| low + (high - low) * (rng.unit() + 1.0) * 0.5)
+        .collect()
 }
 
 fn dense_bytes(element: Element, values: &[f32]) -> Vec<u8> {
@@ -88,7 +93,10 @@ fn dense_bytes(element: Element, values: &[f32]) -> Vec<u8> {
             .iter()
             .flat_map(|v| ((bf16_round(*v).to_bits() >> 16) as u16).to_le_bytes())
             .collect(),
-        "f16" => values.iter().flat_map(|v| f16_bits(*v).to_le_bytes()).collect(),
+        "f16" => values
+            .iter()
+            .flat_map(|v| f16_bits(*v).to_le_bytes())
+            .collect(),
         other => panic!("no dense encoding for {other}"),
     }
 }
@@ -188,12 +196,17 @@ impl Format {
     fn block(self, rng: &mut Rng) -> Vec<u8> {
         let f16 = |value: f32| f16_bits(value).to_le_bytes();
         let mut block = Vec::new();
-        let factor = |rng: &mut Rng, low: f32, high: f32| low + (high - low) * (rng.unit() + 1.0) * 0.5;
+        let factor =
+            |rng: &mut Rng, low: f32, high: f32| low + (high - low) * (rng.unit() + 1.0) * 0.5;
         match self {
             Self::Q4K | Self::Q5K => {
                 block.extend(f16(factor(rng, 0.0005, 0.003)));
                 block.extend(f16(factor(rng, 0.0, 0.002)));
-                let bytes = if self == Self::Q4K { 12 + 128 } else { 12 + 32 + 128 };
+                let bytes = if self == Self::Q4K {
+                    12 + 128
+                } else {
+                    12 + 32 + 128
+                };
                 block.extend((0..bytes).map(|_| rng.byte()));
             }
             Self::Q6K => {
@@ -314,7 +327,11 @@ impl Gguf {
         }
         assert!(at <= read, "GGUF header exceeds the read window");
         let data = (at as u64).div_ceil(alignment) * alignment;
-        Self { path: path.to_path_buf(), data, tensors }
+        Self {
+            path: path.to_path_buf(),
+            data,
+            tensors,
+        }
     }
 
     fn read(&self, offset: u64, len: usize) -> Vec<u8> {
@@ -332,7 +349,11 @@ impl Gguf {
         let format = Format::from_gguf(*kind);
         let k = dims[0] as usize;
         let row_bytes = k / format.block_values() * format.block_bytes();
-        (format, k, self.read(offset + (first * row_bytes) as u64, rows * row_bytes))
+        (
+            format,
+            k,
+            self.read(offset + (first * row_bytes) as u64, rows * row_bytes),
+        )
     }
 
     fn f32s(&self, name: &str) -> Vec<f32> {
@@ -355,7 +376,11 @@ impl Gguf {
 #[derive(Clone)]
 enum Arg {
     Shared(Tensor),
-    Mutable { element: Element, shape: Vec<u64>, bytes: Vec<u8> },
+    Mutable {
+        element: Element,
+        shape: Vec<u64>,
+        bytes: Vec<u8>,
+    },
     Scalar(Scalar),
 }
 
@@ -398,7 +423,11 @@ impl Ctx {
         Arg::Shared(self.tensor(element, shape, &dense_bytes(element, values)))
     }
     fn dense_mut(&self, element: Element, shape: &[u64], values: &[f32]) -> Arg {
-        Arg::Mutable { element, shape: shape.to_vec(), bytes: dense_bytes(element, values) }
+        Arg::Mutable {
+            element,
+            shape: shape.to_vec(),
+            bytes: dense_bytes(element, values),
+        }
     }
     fn ints(&self, shape: &[u64], values: &[i32]) -> Arg {
         Arg::Shared(self.tensor(Element::i32(), shape, &i32_bytes(values)))
@@ -419,11 +448,18 @@ impl Ctx {
     /// of a packed weight is far too slow at model widths).
     fn dense_weight(&self, shape: &[u64], seed: u64, element: Element) -> Tensor {
         let mut rng = Rng::new(seed);
-        let values = uniform(&mut rng, shape.iter().product::<u64>() as usize, -0.04, 0.04);
+        let values = uniform(
+            &mut rng,
+            shape.iter().product::<u64>() as usize,
+            -0.04,
+            0.04,
+        );
         self.tensor(element, shape, &dense_bytes(element, &values))
     }
     fn gguf(&self) -> &Gguf {
-        self.gguf.as_ref().expect("GOLDEN_GGUF names the pinned Qwen3.5-4B Q4_K_M file")
+        self.gguf
+            .as_ref()
+            .expect("GOLDEN_GGUF names the pinned Qwen3.5-4B Q4_K_M file")
     }
     /// Rows of a real GGUF matrix, resident; or a dense weight of its shape.
     fn real(&self, name: &str, rows: usize, dense: Option<Element>) -> (Tensor, Format) {
@@ -431,19 +467,31 @@ impl Ctx {
         let (format, k) = (Format::from_gguf(*kind), dims[0]);
         if let Some(element) = dense {
             let shape = [rows as u64, k];
-            return (self.dense_weight(&shape, name.len() as u64 * 131 + rows as u64, element), format);
+            return (
+                self.dense_weight(&shape, name.len() as u64 * 131 + rows as u64, element),
+                format,
+            );
         }
         let key = (name.to_string(), rows);
         if let Some(cached) = self.weights.borrow().get(&key) {
             return cached.clone();
         }
         let (format, k, external) = self.gguf().rows(name, 0, rows);
-        let weight = (self.packed(format, &[rows as u64, k as u64], &external), format);
+        let weight = (
+            self.packed(format, &[rows as u64, k as u64], &external),
+            format,
+        );
         self.weights.borrow_mut().insert(key, weight.clone());
         weight
     }
     /// A synthetic packed weight (rank 2 or 3), or a dense one.
-    fn synthetic(&self, format: Format, shape: &[u64], seed: u64, dense: Option<Element>) -> Tensor {
+    fn synthetic(
+        &self,
+        format: Format,
+        shape: &[u64],
+        seed: u64,
+        dense: Option<Element>,
+    ) -> Tensor {
         if let Some(element) = dense {
             return self.dense_weight(shape, seed, element);
         }
@@ -474,11 +522,25 @@ fn out_rows(m: usize, o: usize) -> Vec<i32> {
     if o == m {
         return (0..m as i32).collect();
     }
-    (0..o).map(|i| if i + 1 == o { m - 1 } else { i * m / o } as i32).collect()
+    (0..o)
+        .map(|i| if i + 1 == o { m - 1 } else { i * m / o } as i32)
+        .collect()
 }
 
-const PROJECTION_ROWS: [(usize, usize); 12] =
-    [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (8, 8), (9, 9), (12, 4), (33, 33), (40, 17), (64, 64), (130, 130)];
+const PROJECTION_ROWS: [(usize, usize); 12] = [
+    (1, 1),
+    (2, 2),
+    (3, 3),
+    (4, 4),
+    (5, 5),
+    (8, 8),
+    (9, 9),
+    (12, 4),
+    (33, 33),
+    (40, 17),
+    (64, 64),
+    (130, 130),
+];
 
 fn bf16() -> Element {
     Element::bf16()
@@ -529,7 +591,11 @@ fn dense_expand(ctx: &Ctx) -> Vec<Variant> {
                 .map(|&(m, o)| Case {
                     label: format!("m{m}o{o}"),
                     args: vec![
-                        ctx.dense(f32e(), &[m as u64, HIDDEN as u64], &activations(&mut rng, m, HIDDEN, 1.0)),
+                        ctx.dense(
+                            f32e(),
+                            &[m as u64, HIDDEN as u64],
+                            &activations(&mut rng, m, HIDDEN, 1.0),
+                        ),
                         norm.clone(),
                         Arg::Shared(gate.clone()),
                         Arg::Shared(up.clone()),
@@ -540,7 +606,12 @@ fn dense_expand(ctx: &Ctx) -> Vec<Variant> {
                 .collect();
             Variant {
                 label: label.into(),
-                elements: vec![("NW", nw), ("GW", weight_element(gf)), ("UW", weight_element(uf)), ("A", a)],
+                elements: vec![
+                    ("NW", nw),
+                    ("GW", weight_element(gf)),
+                    ("UW", weight_element(uf)),
+                    ("A", a),
+                ],
                 statics: vec![("H", HIDDEN as u64), ("F", FFN as u64)],
                 every_configuration: every,
                 cases,
@@ -560,8 +631,16 @@ fn dense_output(ctx: &Ctx) -> Vec<Variant> {
                 .map(|&(m, o)| Case {
                     label: format!("m{m}o{o}"),
                     args: vec![
-                        ctx.dense(f32e(), &[m as u64, HIDDEN as u64], &activations(&mut rng, m, HIDDEN, 1.0)),
-                        ctx.dense(a, &[o as u64, FFN as u64], &activations(&mut rng, o, FFN, 0.3)),
+                        ctx.dense(
+                            f32e(),
+                            &[m as u64, HIDDEN as u64],
+                            &activations(&mut rng, m, HIDDEN, 1.0),
+                        ),
+                        ctx.dense(
+                            a,
+                            &[o as u64, FFN as u64],
+                            &activations(&mut rng, o, FFN, 0.3),
+                        ),
                         Arg::Shared(down.clone()),
                         ctx.ints(&[o as u64], &out_rows(m, o)),
                     ],
@@ -579,7 +658,11 @@ fn dense_output(ctx: &Ctx) -> Vec<Variant> {
 }
 
 fn rows_only() -> Vec<usize> {
-    PROJECTION_ROWS.iter().filter(|(m, o)| m == o).map(|(m, _)| *m).collect()
+    PROJECTION_ROWS
+        .iter()
+        .filter(|(m, o)| m == o)
+        .map(|(m, _)| *m)
+        .collect()
 }
 
 fn attention_project(ctx: &Ctx) -> Vec<Variant> {
@@ -598,7 +681,11 @@ fn attention_project(ctx: &Ctx) -> Vec<Variant> {
                 .map(|m| Case {
                     label: format!("m{m}"),
                     args: vec![
-                        ctx.dense(f32e(), &[m as u64, HIDDEN as u64], &activations(&mut rng, m, HIDDEN, 1.0)),
+                        ctx.dense(
+                            f32e(),
+                            &[m as u64, HIDDEN as u64],
+                            &activations(&mut rng, m, HIDDEN, 1.0),
+                        ),
                         norm.clone(),
                         query_norm.clone(),
                         Arg::Shared(q.clone()),
@@ -610,8 +697,19 @@ fn attention_project(ctx: &Ctx) -> Vec<Variant> {
                 .collect();
             Variant {
                 label: label.into(),
-                elements: vec![("NW", nw), ("QW", element(qf)), ("KW", element(kf)), ("VW", element(vf)), ("A", a)],
-                statics: vec![("D", HIDDEN as u64), ("KV", KV as u64), ("G", GROUP as u64), ("W", HEAD as u64)],
+                elements: vec![
+                    ("NW", nw),
+                    ("QW", element(qf)),
+                    ("KW", element(kf)),
+                    ("VW", element(vf)),
+                    ("A", a),
+                ],
+                statics: vec![
+                    ("D", HIDDEN as u64),
+                    ("KV", KV as u64),
+                    ("G", GROUP as u64),
+                    ("W", HEAD as u64),
+                ],
                 every_configuration: every,
                 cases,
             }
@@ -631,8 +729,16 @@ fn attention_output(ctx: &Ctx) -> Vec<Variant> {
                 .map(|m| Case {
                     label: format!("m{m}"),
                     args: vec![
-                        ctx.dense(f32e(), &[m as u64, HIDDEN as u64], &activations(&mut rng, m, HIDDEN, 1.0)),
-                        ctx.dense(a, &[m as u64, q as u64, HEAD as u64], &activations(&mut rng, m, q * HEAD, 0.5)),
+                        ctx.dense(
+                            f32e(),
+                            &[m as u64, HIDDEN as u64],
+                            &activations(&mut rng, m, HIDDEN, 1.0),
+                        ),
+                        ctx.dense(
+                            a,
+                            &[m as u64, q as u64, HEAD as u64],
+                            &activations(&mut rng, m, q * HEAD, 0.5),
+                        ),
                         Arg::Shared(weight.clone()),
                     ],
                 })
@@ -670,10 +776,30 @@ fn speculative_rows(rows: usize, context: i32) -> Vec<AttentionRow> {
 
 fn mixed_decode_rows(base: i32) -> Vec<AttentionRow> {
     vec![
-        AttentionRow { spans: vec![(0, base), (base + 7, base + 19)], fresh: (0, 1), destination: base + 40, position: base + 12 },
-        AttentionRow { spans: vec![(0, base), (base + 7, base + 19)], fresh: (0, 2), destination: base + 41, position: base + 13 },
-        AttentionRow { spans: vec![(base + 20, base + 33)], fresh: (2, 3), destination: -1, position: 13 },
-        AttentionRow { spans: vec![], fresh: (0, 0), destination: -1, position: 0 },
+        AttentionRow {
+            spans: vec![(0, base), (base + 7, base + 19)],
+            fresh: (0, 1),
+            destination: base + 40,
+            position: base + 12,
+        },
+        AttentionRow {
+            spans: vec![(0, base), (base + 7, base + 19)],
+            fresh: (0, 2),
+            destination: base + 41,
+            position: base + 13,
+        },
+        AttentionRow {
+            spans: vec![(base + 20, base + 33)],
+            fresh: (2, 3),
+            destination: -1,
+            position: 13,
+        },
+        AttentionRow {
+            spans: vec![],
+            fresh: (0, 0),
+            destination: -1,
+            position: 0,
+        },
     ]
 }
 
@@ -683,10 +809,19 @@ fn prefill_rows(rows: usize, history: i32) -> Vec<AttentionRow> {
         .map(|row| {
             let r = row as i32;
             if row + 2 >= rows {
-                AttentionRow { spans: vec![], fresh: (0, 0), destination: -1, position: 0 }
+                AttentionRow {
+                    spans: vec![],
+                    fresh: (0, 0),
+                    destination: -1,
+                    position: 0,
+                }
             } else if row < boundary {
                 AttentionRow {
-                    spans: if history == 0 { vec![] } else { vec![(0, history / 2), (history / 2 + 9, history)] },
+                    spans: if history == 0 {
+                        vec![]
+                    } else {
+                        vec![(0, history / 2), (history / 2 + 9, history)]
+                    },
                     fresh: (0, r + 1),
                     destination: if row % 5 == 3 { -1 } else { history + 64 + r },
                     position: history - 9 + r,
@@ -694,7 +829,11 @@ fn prefill_rows(rows: usize, history: i32) -> Vec<AttentionRow> {
             } else {
                 let first = boundary as i32;
                 AttentionRow {
-                    spans: if history == 0 { vec![] } else { vec![(history + 3, history + 17)] },
+                    spans: if history == 0 {
+                        vec![]
+                    } else {
+                        vec![(history + 3, history + 17)]
+                    },
                     fresh: (first, r + 1),
                     destination: history + 64 + r,
                     position: 14 + r - first,
@@ -704,7 +843,15 @@ fn prefill_rows(rows: usize, history: i32) -> Vec<AttentionRow> {
         .collect()
 }
 
-fn attention_case(ctx: &Ctx, a: Element, label: String, history: usize, spans: usize, rows: &[AttentionRow], seed: u64) -> Case {
+fn attention_case(
+    ctx: &Ctx,
+    a: Element,
+    label: String,
+    history: usize,
+    spans: usize,
+    rows: &[AttentionRow],
+    seed: u64,
+) -> Case {
     let mut rng = Rng::new(seed);
     let m = rows.len();
     let w = 2 * PAIRS + (HEAD - 2 * PAIRS);
@@ -735,24 +882,55 @@ fn attention_case(ctx: &Ctx, a: Element, label: String, history: usize, spans: u
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let values = |rng: &mut Rng, count: usize, scale: f32| (0..count).map(|_| rng.unit() * scale).collect::<Vec<_>>();
+    let values = |rng: &mut Rng, count: usize, scale: f32| {
+        (0..count).map(|_| rng.unit() * scale).collect::<Vec<_>>()
+    };
     let (m64, w64, t64) = (m as u64, w as u64, history as u64);
     Case {
         label,
         args: vec![
-            ctx.dense(a, &[m64, (heads * 2 * w) as u64], &values(&mut rng, m * heads * 2 * w, 2.0)),
-            ctx.dense(a, &[m64, (KV * w) as u64], &values(&mut rng, m * KV * w, 2.0)),
-            ctx.dense(a, &[m64, (KV * w) as u64], &values(&mut rng, m * KV * w, 1.0)),
+            ctx.dense(
+                a,
+                &[m64, (heads * 2 * w) as u64],
+                &values(&mut rng, m * heads * 2 * w, 2.0),
+            ),
+            ctx.dense(
+                a,
+                &[m64, (KV * w) as u64],
+                &values(&mut rng, m * KV * w, 2.0),
+            ),
+            ctx.dense(
+                a,
+                &[m64, (KV * w) as u64],
+                &values(&mut rng, m * KV * w, 1.0),
+            ),
             ctx.norm("blk.3.attn_q_norm.weight", f32e()),
             ctx.norm("blk.3.attn_k_norm.weight", f32e()),
             ctx.ints(&[PAIRS as u64], &components),
             ctx.dense(f32e(), &[PAIRS as u64], &frequencies),
             ctx.ints(&[m64, 4], &coordinates),
             ctx.ints(&[m64, spans as u64, 2], &visible),
-            ctx.ints(&[m64, 2], &rows.iter().flat_map(|r| [r.fresh.0, r.fresh.1]).collect::<Vec<_>>()),
-            ctx.ints(&[m64], &rows.iter().map(|r| r.destination).collect::<Vec<_>>()),
-            ctx.dense_mut(a, &[t64, KV as u64, w64], &values(&mut rng, history * KV * w, 3.0)),
-            ctx.dense_mut(a, &[t64, KV as u64, w64], &values(&mut rng, history * KV * w, 1.0)),
+            ctx.ints(
+                &[m64, 2],
+                &rows
+                    .iter()
+                    .flat_map(|r| [r.fresh.0, r.fresh.1])
+                    .collect::<Vec<_>>(),
+            ),
+            ctx.ints(
+                &[m64],
+                &rows.iter().map(|r| r.destination).collect::<Vec<_>>(),
+            ),
+            ctx.dense_mut(
+                a,
+                &[t64, KV as u64, w64],
+                &values(&mut rng, history * KV * w, 3.0),
+            ),
+            ctx.dense_mut(
+                a,
+                &[t64, KV as u64, w64],
+                &values(&mut rng, history * KV * w, 1.0),
+            ),
             f32s(1e-6),
             f32s(1.0 / (w as f32).sqrt()),
         ],
@@ -760,7 +938,12 @@ fn attention_case(ctx: &Ctx, a: Element, label: String, history: usize, spans: u
 }
 
 fn attention_statics() -> Vec<(&'static str, u64)> {
-    vec![("KV", KV as u64), ("G", GROUP as u64), ("P", PAIRS as u64), ("S", (HEAD - 2 * PAIRS) as u64)]
+    vec![
+        ("KV", KV as u64),
+        ("G", GROUP as u64),
+        ("P", PAIRS as u64),
+        ("S", (HEAD - 2 * PAIRS) as u64),
+    ]
 }
 
 fn attention_decode(ctx: &Ctx) -> Vec<Variant> {
@@ -768,13 +951,51 @@ fn attention_decode(ctx: &Ctx) -> Vec<Variant> {
         .into_iter()
         .map(|(label, a, every)| {
             let cases = vec![
-                attention_case(ctx, a, "spec1@256".into(), 256 + 64, 1, &speculative_rows(1, 256), 11),
-                attention_case(ctx, a, "spec8@4096".into(), 4096 + 64, 1, &speculative_rows(8, 4096), 12),
-                attention_case(ctx, a, "mixed4@300".into(), 300 + 128, 2, &mixed_decode_rows(300), 13),
-                attention_case(ctx, a, "spec2@16384".into(), 16384 + 64, 1, &speculative_rows(2, 16384), 14),
+                attention_case(
+                    ctx,
+                    a,
+                    "spec1@256".into(),
+                    256 + 64,
+                    1,
+                    &speculative_rows(1, 256),
+                    11,
+                ),
+                attention_case(
+                    ctx,
+                    a,
+                    "spec8@4096".into(),
+                    4096 + 64,
+                    1,
+                    &speculative_rows(8, 4096),
+                    12,
+                ),
+                attention_case(
+                    ctx,
+                    a,
+                    "mixed4@300".into(),
+                    300 + 128,
+                    2,
+                    &mixed_decode_rows(300),
+                    13,
+                ),
+                attention_case(
+                    ctx,
+                    a,
+                    "spec2@16384".into(),
+                    16384 + 64,
+                    1,
+                    &speculative_rows(2, 16384),
+                    14,
+                ),
                 attention_case(ctx, a, "spec1@1".into(), 64, 1, &speculative_rows(1, 1), 15),
             ];
-            Variant { label: label.into(), elements: vec![("A", a)], statics: attention_statics(), every_configuration: every, cases }
+            Variant {
+                label: label.into(),
+                elements: vec![("A", a)],
+                statics: attention_statics(),
+                every_configuration: every,
+                cases,
+            }
         })
         .collect()
 }
@@ -787,10 +1008,24 @@ fn attention_prefill(ctx: &Ctx) -> Vec<Variant> {
                 .into_iter()
                 .enumerate()
                 .map(|(i, (rows, history))| {
-                    attention_case(ctx, a, format!("m{rows}@{history}"), history + 256, 2, &prefill_rows(rows, history as i32), 20 + i as u64)
+                    attention_case(
+                        ctx,
+                        a,
+                        format!("m{rows}@{history}"),
+                        history + 256,
+                        2,
+                        &prefill_rows(rows, history as i32),
+                        20 + i as u64,
+                    )
                 })
                 .collect();
-            Variant { label: label.into(), elements: vec![("A", a)], statics: attention_statics(), every_configuration: every, cases }
+            Variant {
+                label: label.into(),
+                elements: vec![("A", a)],
+                statics: attention_statics(),
+                every_configuration: every,
+                cases,
+            }
         })
         .collect()
 }
@@ -804,7 +1039,12 @@ fn recurrent_width() -> usize {
 }
 
 fn recurrent_statics_projection() -> Vec<(&'static str, u64)> {
-    vec![("H", HIDDEN as u64), ("NK", KEY_HEADS as u64), ("NV", VALUE_HEADS as u64), ("W", STATE as u64)]
+    vec![
+        ("H", HIDDEN as u64),
+        ("NK", KEY_HEADS as u64),
+        ("NV", VALUE_HEADS as u64),
+        ("W", STATE as u64),
+    ]
 }
 
 fn recurrent_project(ctx: &Ctx) -> Vec<Variant> {
@@ -823,7 +1063,11 @@ fn recurrent_project(ctx: &Ctx) -> Vec<Variant> {
                 .map(|m| Case {
                     label: format!("m{m}"),
                     args: vec![
-                        ctx.dense(f32e(), &[m as u64, HIDDEN as u64], &activations(&mut rng, m, HIDDEN, 1.0)),
+                        ctx.dense(
+                            f32e(),
+                            &[m as u64, HIDDEN as u64],
+                            &activations(&mut rng, m, HIDDEN, 1.0),
+                        ),
                         norm.clone(),
                         Arg::Shared(qkv.clone()),
                         Arg::Shared(gate.clone()),
@@ -863,9 +1107,21 @@ fn recurrent_output(ctx: &Ctx) -> Vec<Variant> {
                 .map(|m| Case {
                     label: format!("m{m}"),
                     args: vec![
-                        ctx.dense(f32e(), &[m as u64, HIDDEN as u64], &activations(&mut rng, m, HIDDEN, 1.0)),
-                        ctx.dense(a, &[m as u64, VALUE_HEADS as u64, STATE as u64], &activations(&mut rng, m, VALUE_HEADS * STATE, 0.2)),
-                        ctx.dense(a, &[m as u64, recurrent_width() as u64], &activations(&mut rng, m, recurrent_width(), 1.0)),
+                        ctx.dense(
+                            f32e(),
+                            &[m as u64, HIDDEN as u64],
+                            &activations(&mut rng, m, HIDDEN, 1.0),
+                        ),
+                        ctx.dense(
+                            a,
+                            &[m as u64, VALUE_HEADS as u64, STATE as u64],
+                            &activations(&mut rng, m, VALUE_HEADS * STATE, 0.2),
+                        ),
+                        ctx.dense(
+                            a,
+                            &[m as u64, recurrent_width() as u64],
+                            &activations(&mut rng, m, recurrent_width(), 1.0),
+                        ),
                         norm.clone(),
                         Arg::Shared(weight.clone()),
                         f32s(1e-6),
@@ -874,7 +1130,11 @@ fn recurrent_output(ctx: &Ctx) -> Vec<Variant> {
                 .collect();
             Variant {
                 label: label.into(),
-                elements: vec![("RN", nw), ("OW", dense.unwrap_or_else(|| ctx.resident(wf))), ("A", a)],
+                elements: vec![
+                    ("RN", nw),
+                    ("OW", dense.unwrap_or_else(|| ctx.resident(wf))),
+                    ("A", a),
+                ],
                 statics: recurrent_statics_projection(),
                 every_configuration: every,
                 cases,
@@ -891,7 +1151,16 @@ struct Slot {
     following: usize,
 }
 
-fn recurrent_case(ctx: &Ctx, a: Element, label: &str, rows: usize, slots: &[Slot], banks: usize, grouped: bool, seed: u64) -> Case {
+fn recurrent_case(
+    ctx: &Ctx,
+    a: Element,
+    label: &str,
+    rows: usize,
+    slots: &[Slot],
+    banks: usize,
+    grouped: bool,
+    seed: u64,
+) -> Case {
     let mut rng = Rng::new(seed);
     let channels = recurrent_channels();
     let width = recurrent_width();
@@ -941,14 +1210,39 @@ fn recurrent_case(ctx: &Ctx, a: Element, label: &str, rows: usize, slots: &[Slot
             ctx.dense(a, &[rows as u64, width as u64], &projection),
             ctx.dense(f32e(), &[channels as u64, CONVOLUTION as u64], &convolution),
             ctx.dense(f32e(), &[VALUE_HEADS as u64], &gguf.f32s("blk.0.ssm_a")),
-            ctx.dense(f32e(), &[VALUE_HEADS as u64], &gguf.f32s("blk.0.ssm_dt.bias")),
+            ctx.dense(
+                f32e(),
+                &[VALUE_HEADS as u64],
+                &gguf.f32s("blk.0.ssm_dt.bias"),
+            ),
             ctx.ints(&[b + 1, 2], &segments),
-            ctx.ints(&[b], &slots.iter().map(|s| s.stop as i32).collect::<Vec<_>>()),
-            ctx.ints(&[b], &slots.iter().map(|s| s.previous as i32).collect::<Vec<_>>()),
+            ctx.ints(
+                &[b],
+                &slots.iter().map(|s| s.stop as i32).collect::<Vec<_>>(),
+            ),
+            ctx.ints(
+                &[b],
+                &slots.iter().map(|s| s.previous as i32).collect::<Vec<_>>(),
+            ),
             ctx.ints(&[b], &vec![0; slots.len()]),
-            ctx.ints(&[b], &slots.iter().map(|s| s.following as i32).collect::<Vec<_>>()),
-            ctx.dense_mut(a, &[banks as u64, (CONVOLUTION - 1 + TAPE) as u64, channels as u64], &window),
-            ctx.dense_mut(f32e(), &[banks as u64, VALUE_HEADS as u64, STATE as u64, STATE as u64], &delta),
+            ctx.ints(
+                &[b],
+                &slots.iter().map(|s| s.following as i32).collect::<Vec<_>>(),
+            ),
+            ctx.dense_mut(
+                a,
+                &[
+                    banks as u64,
+                    (CONVOLUTION - 1 + TAPE) as u64,
+                    channels as u64,
+                ],
+                &window,
+            ),
+            ctx.dense_mut(
+                f32e(),
+                &[banks as u64, VALUE_HEADS as u64, STATE as u64, STATE as u64],
+                &delta,
+            ),
             ctx.dense_mut(f32e(), &[banks as u64, TAPE as u64, tape_row as u64], &tape),
             f32s(1e-6 * STATE as f32),
             Arg::Scalar(Scalar::Bool(grouped)),
@@ -957,23 +1251,69 @@ fn recurrent_case(ctx: &Ctx, a: Element, label: &str, rows: usize, slots: &[Slot
 }
 
 fn recurrent_state(ctx: &Ctx) -> Vec<Variant> {
-    let slot = |rows, stop, previous, following| Slot { rows, stop, previous, following };
+    let slot = |rows, stop, previous, following| Slot {
+        rows,
+        stop,
+        previous,
+        following,
+    };
     [("bf16", bf16(), true), ("f32", f32e(), false)]
         .into_iter()
         .map(|(label, a, every)| {
             let mut cases = vec![
                 recurrent_case(ctx, a, "m1", 1, &[slot(1, 1, 1, 3)], 5, false, 31),
-                recurrent_case(ctx, a, "m8x2", 8, &[slot(4, 2, 1, 3), slot(3, 3, 0, 4)], 5, false, 32),
-                recurrent_case(ctx, a, "m8x8", 8, &(0..8).map(|i| slot(1, 1, i % 3, 8 + i)).collect::<Vec<_>>(), 16, true, 33),
+                recurrent_case(
+                    ctx,
+                    a,
+                    "m8x2",
+                    8,
+                    &[slot(4, 2, 1, 3), slot(3, 3, 0, 4)],
+                    5,
+                    false,
+                    32,
+                ),
+                recurrent_case(
+                    ctx,
+                    a,
+                    "m8x8",
+                    8,
+                    &(0..8).map(|i| slot(1, 1, i % 3, 8 + i)).collect::<Vec<_>>(),
+                    16,
+                    true,
+                    33,
+                ),
                 recurrent_case(ctx, a, "m16g", 16, &[slot(16, 16, 2, 3)], 5, true, 34),
                 recurrent_case(ctx, a, "m128", 128, &[slot(128, 128, 1, 3)], 5, false, 35),
-                recurrent_case(ctx, a, "m300x2", 300, &[slot(170, 101, 1, 3), slot(130, 0, 2, 4)], 5, false, 36),
+                recurrent_case(
+                    ctx,
+                    a,
+                    "m300x2",
+                    300,
+                    &[slot(170, 101, 1, 3), slot(130, 0, 2, 4)],
+                    5,
+                    false,
+                    36,
+                ),
             ];
-            cases.push(recurrent_case(ctx, a, "m20stop0", 20, &[slot(19, 0, 0, 1)], 3, false, 37));
+            cases.push(recurrent_case(
+                ctx,
+                a,
+                "m20stop0",
+                20,
+                &[slot(19, 0, 0, 1)],
+                3,
+                false,
+                37,
+            ));
             Variant {
                 label: label.into(),
                 elements: vec![("A", a)],
-                statics: vec![("NK", KEY_HEADS as u64), ("NV", VALUE_HEADS as u64), ("W", STATE as u64), ("C", CONVOLUTION as u64)],
+                statics: vec![
+                    ("NK", KEY_HEADS as u64),
+                    ("NV", VALUE_HEADS as u64),
+                    ("W", STATE as u64),
+                    ("C", CONVOLUTION as u64),
+                ],
                 every_configuration: every,
                 cases,
             }
@@ -982,30 +1322,53 @@ fn recurrent_state(ctx: &Ctx) -> Vec<Variant> {
 }
 
 fn readout_rows() -> Vec<(usize, usize)> {
-    vec![(1, 1), (2, 2), (3, 3), (5, 4), (8, 8), (9, 9), (40, 17), (64, 64)]
+    vec![
+        (1, 1),
+        (2, 2),
+        (3, 3),
+        (5, 4),
+        (8, 8),
+        (9, 9),
+        (40, 17),
+        (64, 64),
+    ]
 }
 
 fn features_rows(ctx: &Ctx) -> Vec<Variant> {
-    [("bf16", bf16(), f32e()), ("f16", f16(), bf16()), ("f32", f32e(), f16())]
-        .into_iter()
-        .map(|(label, a, nw)| {
-            let norm = ctx.norm("output_norm.weight", nw);
-            let mut rng = Rng::new(7);
-            let cases = readout_rows()
-                .into_iter()
-                .map(|(m, o)| Case {
-                    label: format!("m{m}o{o}"),
-                    args: vec![
-                        ctx.dense(f32e(), &[m as u64, HIDDEN as u64], &activations(&mut rng, m, HIDDEN, 1.0)),
-                        norm.clone(),
-                        ctx.ints(&[o as u64], &out_rows(m, o)),
-                        f32s(1e-6),
-                    ],
-                })
-                .collect();
-            Variant { label: label.into(), elements: vec![("NW", nw), ("A", a)], statics: vec![("D", HIDDEN as u64)], every_configuration: true, cases }
-        })
-        .collect()
+    [
+        ("bf16", bf16(), f32e()),
+        ("f16", f16(), bf16()),
+        ("f32", f32e(), f16()),
+    ]
+    .into_iter()
+    .map(|(label, a, nw)| {
+        let norm = ctx.norm("output_norm.weight", nw);
+        let mut rng = Rng::new(7);
+        let cases = readout_rows()
+            .into_iter()
+            .map(|(m, o)| Case {
+                label: format!("m{m}o{o}"),
+                args: vec![
+                    ctx.dense(
+                        f32e(),
+                        &[m as u64, HIDDEN as u64],
+                        &activations(&mut rng, m, HIDDEN, 1.0),
+                    ),
+                    norm.clone(),
+                    ctx.ints(&[o as u64], &out_rows(m, o)),
+                    f32s(1e-6),
+                ],
+            })
+            .collect();
+        Variant {
+            label: label.into(),
+            elements: vec![("NW", nw), ("A", a)],
+            statics: vec![("D", HIDDEN as u64)],
+            every_configuration: true,
+            cases,
+        }
+    })
+    .collect()
 }
 
 fn head_rows(ctx: &Ctx) -> Vec<Variant> {
@@ -1020,7 +1383,11 @@ fn head_rows(ctx: &Ctx) -> Vec<Variant> {
                 .map(|&(m, o)| Case {
                     label: format!("m{m}o{o}"),
                     args: vec![
-                        ctx.dense(f32e(), &[m as u64, HIDDEN as u64], &activations(&mut rng, m, HIDDEN, 1.0)),
+                        ctx.dense(
+                            f32e(),
+                            &[m as u64, HIDDEN as u64],
+                            &activations(&mut rng, m, HIDDEN, 1.0),
+                        ),
                         norm.clone(),
                         Arg::Shared(weight.clone()),
                         ctx.ints(&[o as u64], &out_rows(m, o)),
@@ -1030,7 +1397,11 @@ fn head_rows(ctx: &Ctx) -> Vec<Variant> {
                 .collect();
             Variant {
                 label: label.into(),
-                elements: vec![("NW", nw), ("OW", dense.unwrap_or_else(|| ctx.resident(wf))), ("A", a)],
+                elements: vec![
+                    ("NW", nw),
+                    ("OW", dense.unwrap_or_else(|| ctx.resident(wf))),
+                    ("A", a),
+                ],
                 statics: vec![("V", VOCABULARY_SLICE as u64), ("D", HIDDEN as u64)],
                 every_configuration: every,
                 cases,
@@ -1050,11 +1421,17 @@ fn selected_rows(ctx: &Ctx) -> Vec<Variant> {
                 .iter()
                 .flat_map(|&(m, o)| [(m, o, 37usize), (m, o, 300)])
                 .map(|(m, o, sv)| {
-                    let selected = (0..sv).map(|_| rng.below(VOCABULARY_SLICE) as i32).collect::<Vec<_>>();
+                    let selected = (0..sv)
+                        .map(|_| rng.below(VOCABULARY_SLICE) as i32)
+                        .collect::<Vec<_>>();
                     Case {
                         label: format!("m{m}o{o}s{sv}"),
                         args: vec![
-                            ctx.dense(f32e(), &[m as u64, HIDDEN as u64], &activations(&mut rng, m, HIDDEN, 1.0)),
+                            ctx.dense(
+                                f32e(),
+                                &[m as u64, HIDDEN as u64],
+                                &activations(&mut rng, m, HIDDEN, 1.0),
+                            ),
                             norm.clone(),
                             Arg::Shared(weight.clone()),
                             ctx.ints(&[o as u64], &out_rows(m, o)),
@@ -1066,7 +1443,11 @@ fn selected_rows(ctx: &Ctx) -> Vec<Variant> {
                 .collect();
             Variant {
                 label: label.into(),
-                elements: vec![("NW", nw), ("OW", dense.unwrap_or_else(|| ctx.resident(wf))), ("A", a)],
+                elements: vec![
+                    ("NW", nw),
+                    ("OW", dense.unwrap_or_else(|| ctx.resident(wf))),
+                    ("A", a),
+                ],
                 statics: vec![("V", VOCABULARY_SLICE as u64), ("D", HIDDEN as u64)],
                 every_configuration: every,
                 cases,
@@ -1086,7 +1467,11 @@ fn head_logits_rows(ctx: &Ctx) -> Vec<Variant> {
                 .map(|o| Case {
                     label: format!("o{o}"),
                     args: vec![
-                        ctx.dense(a, &[o as u64, HIDDEN as u64], &activations(&mut rng, o, HIDDEN, 1.0)),
+                        ctx.dense(
+                            a,
+                            &[o as u64, HIDDEN as u64],
+                            &activations(&mut rng, o, HIDDEN, 1.0),
+                        ),
                         Arg::Shared(weight.clone()),
                     ],
                 })
@@ -1113,7 +1498,12 @@ fn draft_rows(ctx: &Ctx) -> Vec<Variant> {
     .map(|(label, a, norm_element, dense, combine_format)| {
         let (table, tf) = ctx.real("token_embd.weight", VOCABULARY_SLICE, dense);
         let combine_format = combine_format.unwrap_or(Format::Q4K);
-        let combine = ctx.synthetic(combine_format, &[HIDDEN as u64, 2 * HIDDEN as u64], 41, dense);
+        let combine = ctx.synthetic(
+            combine_format,
+            &[HIDDEN as u64, 2 * HIDDEN as u64],
+            41,
+            dense,
+        );
         let element = |f: Format| dense.unwrap_or_else(|| ctx.resident(f));
         let mut rng = Rng::new(11);
         let cases = [1usize, 2, 4, 8, 16]
@@ -1121,9 +1511,18 @@ fn draft_rows(ctx: &Ctx) -> Vec<Variant> {
             .map(|m| Case {
                 label: format!("m{m}"),
                 args: vec![
-                    ctx.ints(&[m as u64], &(0..m).map(|_| rng.below(VOCABULARY_SLICE) as i32).collect::<Vec<_>>()),
+                    ctx.ints(
+                        &[m as u64],
+                        &(0..m)
+                            .map(|_| rng.below(VOCABULARY_SLICE) as i32)
+                            .collect::<Vec<_>>(),
+                    ),
                     Arg::Shared(table.clone()),
-                    ctx.dense(a, &[m as u64, HIDDEN as u64], &activations(&mut rng, m, HIDDEN, 1.0)),
+                    ctx.dense(
+                        a,
+                        &[m as u64, HIDDEN as u64],
+                        &activations(&mut rng, m, HIDDEN, 1.0),
+                    ),
                     ctx.norm("output_norm.weight", norm_element),
                     ctx.norm("blk.0.attn_norm.weight", norm_element),
                     Arg::Shared(combine.clone()),
@@ -1170,7 +1569,9 @@ fn embedding_rows(ctx: &Ctx) -> Vec<Variant> {
                     // (token, status) rows, the `sample_rows` result layout.
                     ctx.ints(
                         &[m as u64, 2],
-                        &(0..m).flat_map(|_| [rng.below(VOCABULARY_SLICE) as i32, 0]).collect::<Vec<_>>(),
+                        &(0..m)
+                            .flat_map(|_| [rng.below(VOCABULARY_SLICE) as i32, 0])
+                            .collect::<Vec<_>>(),
                     ),
                 ],
             })
@@ -1203,7 +1604,11 @@ fn routes(rows: usize, experts: usize, seed: u64) -> Vec<i32> {
     for row in 0..rows {
         let mut chosen = Vec::new();
         while chosen.len() < ROUTED_CHOICES {
-            let candidate = if row % 3 == 0 { rng.below(ROUTED_CHOICES + 3) } else { rng.below(experts) } as i32;
+            let candidate = if row % 3 == 0 {
+                rng.below(ROUTED_CHOICES + 3)
+            } else {
+                rng.below(experts)
+            } as i32;
             if !chosen.contains(&candidate) {
                 chosen.push(candidate);
             }
@@ -1244,47 +1649,75 @@ fn host_group(routes: &[i32], experts: usize, blocks: usize) -> (Vec<i32>, Vec<i
 }
 
 fn routed_route(ctx: &Ctx) -> Vec<Variant> {
-    [("bf16", bf16(), f32e(), bf16(), true), ("f32", f32e(), bf16(), f32e(), false), ("f16", f16(), f32e(), f16(), false)]
-        .into_iter()
-        .map(|(label, a, nw, rw, every)| {
-            let mut rng = Rng::new(13);
-            let router = ctx.dense(rw, &[ROUTED_EXPERTS as u64, ROUTED_HIDDEN as u64], &uniform(&mut rng, ROUTED_EXPERTS * ROUTED_HIDDEN, -0.05, 0.05));
-            let norm = ctx.dense(nw, &[ROUTED_HIDDEN as u64], &uniform(&mut rng, ROUTED_HIDDEN, 0.5, 1.5));
-            let shared = ctx.dense(f32e(), &[ROUTED_HIDDEN as u64], &uniform(&mut rng, ROUTED_HIDDEN, -0.05, 0.05));
-            let cases = [1usize, 3, 8, 9, 64]
-                .into_iter()
-                .flat_map(|m| [(m, 1), (m, 0)])
-                .map(|(m, normalize)| {
-                    let mut residual = activations(&mut rng, m, ROUTED_HIDDEN, 1.0);
-                    if m > 1 {
-                        // Two identical rows exercise routing ties identically.
-                        let (first, rest) = residual.split_at_mut(ROUTED_HIDDEN);
-                        rest[..ROUTED_HIDDEN].copy_from_slice(first);
-                    }
-                    Case {
-                        label: format!("m{m}n{normalize}"),
-                        args: vec![
-                            ctx.dense(f32e(), &[m as u64, ROUTED_HIDDEN as u64], &residual),
-                            norm.clone(),
-                            router.clone(),
-                            shared.clone(),
-                            Arg::Mutable { element: Element::i32(), shape: vec![m as u64, ROUTED_CHOICES as u64], bytes: i32_bytes(&vec![-7; m * ROUTED_CHOICES]) },
-                            ctx.dense_mut(f32e(), &[m as u64, ROUTED_CHOICES as u64], &vec![-3.0; m * ROUTED_CHOICES]),
-                            f32s(1e-6),
-                            i32s(normalize),
-                        ],
-                    }
-                })
-                .collect();
-            Variant {
-                label: label.into(),
-                elements: vec![("NW", nw), ("RW", rw), ("A", a)],
-                statics: vec![("H", ROUTED_HIDDEN as u64), ("E", ROUTED_EXPERTS as u64), ("K", ROUTED_CHOICES as u64)],
-                every_configuration: every,
-                cases,
-            }
-        })
-        .collect()
+    [
+        ("bf16", bf16(), f32e(), bf16(), true),
+        ("f32", f32e(), bf16(), f32e(), false),
+        ("f16", f16(), f32e(), f16(), false),
+    ]
+    .into_iter()
+    .map(|(label, a, nw, rw, every)| {
+        let mut rng = Rng::new(13);
+        let router = ctx.dense(
+            rw,
+            &[ROUTED_EXPERTS as u64, ROUTED_HIDDEN as u64],
+            &uniform(&mut rng, ROUTED_EXPERTS * ROUTED_HIDDEN, -0.05, 0.05),
+        );
+        let norm = ctx.dense(
+            nw,
+            &[ROUTED_HIDDEN as u64],
+            &uniform(&mut rng, ROUTED_HIDDEN, 0.5, 1.5),
+        );
+        let shared = ctx.dense(
+            f32e(),
+            &[ROUTED_HIDDEN as u64],
+            &uniform(&mut rng, ROUTED_HIDDEN, -0.05, 0.05),
+        );
+        let cases = [1usize, 3, 8, 9, 64]
+            .into_iter()
+            .flat_map(|m| [(m, 1), (m, 0)])
+            .map(|(m, normalize)| {
+                let mut residual = activations(&mut rng, m, ROUTED_HIDDEN, 1.0);
+                if m > 1 {
+                    // Two identical rows exercise routing ties identically.
+                    let (first, rest) = residual.split_at_mut(ROUTED_HIDDEN);
+                    rest[..ROUTED_HIDDEN].copy_from_slice(first);
+                }
+                Case {
+                    label: format!("m{m}n{normalize}"),
+                    args: vec![
+                        ctx.dense(f32e(), &[m as u64, ROUTED_HIDDEN as u64], &residual),
+                        norm.clone(),
+                        router.clone(),
+                        shared.clone(),
+                        Arg::Mutable {
+                            element: Element::i32(),
+                            shape: vec![m as u64, ROUTED_CHOICES as u64],
+                            bytes: i32_bytes(&vec![-7; m * ROUTED_CHOICES]),
+                        },
+                        ctx.dense_mut(
+                            f32e(),
+                            &[m as u64, ROUTED_CHOICES as u64],
+                            &vec![-3.0; m * ROUTED_CHOICES],
+                        ),
+                        f32s(1e-6),
+                        i32s(normalize),
+                    ],
+                }
+            })
+            .collect();
+        Variant {
+            label: label.into(),
+            elements: vec![("NW", nw), ("RW", rw), ("A", a)],
+            statics: vec![
+                ("H", ROUTED_HIDDEN as u64),
+                ("E", ROUTED_EXPERTS as u64),
+                ("K", ROUTED_CHOICES as u64),
+            ],
+            every_configuration: every,
+            cases,
+        }
+    })
+    .collect()
 }
 
 /// The routed expert weights: (gate, up, down, shared gate, shared up,
@@ -1295,9 +1728,22 @@ struct RoutedWeights {
 }
 
 fn routed_weights(ctx: &Ctx, formats: [Format; 6], dense: Option<Element>) -> RoutedWeights {
-    let (e, h, f, s) = (ROUTED_EXPERTS_SMALL as u64, ROUTED_HIDDEN as u64, ROUTED_FFN as u64, ROUTED_SHARED as u64);
-    let shapes: [Vec<u64>; 6] = [vec![e, f, h], vec![e, f, h], vec![e, h, f], vec![s, h], vec![s, h], vec![h, s]];
-    let tensors = std::array::from_fn(|i| ctx.synthetic(formats[i], &shapes[i], 50 + i as u64, dense));
+    let (e, h, f, s) = (
+        ROUTED_EXPERTS_SMALL as u64,
+        ROUTED_HIDDEN as u64,
+        ROUTED_FFN as u64,
+        ROUTED_SHARED as u64,
+    );
+    let shapes: [Vec<u64>; 6] = [
+        vec![e, f, h],
+        vec![e, f, h],
+        vec![e, h, f],
+        vec![s, h],
+        vec![s, h],
+        vec![h, s],
+    ];
+    let tensors =
+        std::array::from_fn(|i| ctx.synthetic(formats[i], &shapes[i], 50 + i as u64, dense));
     let elements = std::array::from_fn(|i| dense.unwrap_or_else(|| ctx.resident(formats[i])));
     RoutedWeights { tensors, elements }
 }
@@ -1323,8 +1769,15 @@ fn routed_expand(ctx: &Ctx) -> Vec<Variant> {
                 .map(|m| Case {
                     label: format!("m{m}"),
                     args: vec![
-                        ctx.dense(a, &[m as u64, ROUTED_HIDDEN as u64], &activations(&mut rng, m, ROUTED_HIDDEN, 1.0)),
-                        ctx.ints(&[m as u64, ROUTED_CHOICES as u64], &routes(m, ROUTED_EXPERTS_SMALL, 60 + m as u64)),
+                        ctx.dense(
+                            a,
+                            &[m as u64, ROUTED_HIDDEN as u64],
+                            &activations(&mut rng, m, ROUTED_HIDDEN, 1.0),
+                        ),
+                        ctx.ints(
+                            &[m as u64, ROUTED_CHOICES as u64],
+                            &routes(m, ROUTED_EXPERTS_SMALL, 60 + m as u64),
+                        ),
                         Arg::Shared(weights.tensors[0].clone()),
                         Arg::Shared(weights.tensors[1].clone()),
                         Arg::Shared(weights.tensors[3].clone()),
@@ -1335,8 +1788,19 @@ fn routed_expand(ctx: &Ctx) -> Vec<Variant> {
             let el = weights.elements;
             Variant {
                 label: label.into(),
-                elements: vec![("EGW", el[0]), ("EUW", el[1]), ("SGW", el[3]), ("SUW", el[4]), ("A", a)],
-                statics: vec![("H", ROUTED_HIDDEN as u64), ("K", ROUTED_CHOICES as u64), ("F", ROUTED_FFN as u64), ("S", ROUTED_SHARED as u64)],
+                elements: vec![
+                    ("EGW", el[0]),
+                    ("EUW", el[1]),
+                    ("SGW", el[3]),
+                    ("SUW", el[4]),
+                    ("A", a),
+                ],
+                statics: vec![
+                    ("H", ROUTED_HIDDEN as u64),
+                    ("K", ROUTED_CHOICES as u64),
+                    ("F", ROUTED_FFN as u64),
+                    ("S", ROUTED_SHARED as u64),
+                ],
                 every_configuration: every,
                 cases,
             }
@@ -1357,11 +1821,30 @@ fn routed_output(ctx: &Ctx) -> Vec<Variant> {
                     Case {
                         label: format!("m{m}"),
                         args: vec![
-                            ctx.dense(f32e(), &[m as u64, ROUTED_HIDDEN as u64], &activations(&mut rng, m, ROUTED_HIDDEN, 1.0)),
-                            ctx.dense(a, &[m as u64, k as u64, ROUTED_FFN as u64], &activations(&mut rng, m * k, ROUTED_FFN, 0.3)),
-                            ctx.dense(a, &[m as u64, ROUTED_SHARED as u64], &activations(&mut rng, m, ROUTED_SHARED, 0.3)),
-                            ctx.ints(&[m as u64, k as u64], &routes(m, ROUTED_EXPERTS_SMALL, 70 + m as u64)),
-                            ctx.dense(f32e(), &[m as u64, k as u64], &uniform(&mut rng, m * k, 0.0, 0.3)),
+                            ctx.dense(
+                                f32e(),
+                                &[m as u64, ROUTED_HIDDEN as u64],
+                                &activations(&mut rng, m, ROUTED_HIDDEN, 1.0),
+                            ),
+                            ctx.dense(
+                                a,
+                                &[m as u64, k as u64, ROUTED_FFN as u64],
+                                &activations(&mut rng, m * k, ROUTED_FFN, 0.3),
+                            ),
+                            ctx.dense(
+                                a,
+                                &[m as u64, ROUTED_SHARED as u64],
+                                &activations(&mut rng, m, ROUTED_SHARED, 0.3),
+                            ),
+                            ctx.ints(
+                                &[m as u64, k as u64],
+                                &routes(m, ROUTED_EXPERTS_SMALL, 70 + m as u64),
+                            ),
+                            ctx.dense(
+                                f32e(),
+                                &[m as u64, k as u64],
+                                &uniform(&mut rng, m * k, 0.0, 0.3),
+                            ),
                             ctx.dense(f32e(), &[m as u64], &uniform(&mut rng, m, 0.1, 0.9)),
                             Arg::Shared(weights.tensors[2].clone()),
                             Arg::Shared(weights.tensors[5].clone()),
@@ -1373,7 +1856,12 @@ fn routed_output(ctx: &Ctx) -> Vec<Variant> {
             Variant {
                 label: label.into(),
                 elements: vec![("EDW", el[2]), ("SDW", el[5]), ("A", a)],
-                statics: vec![("H", ROUTED_HIDDEN as u64), ("K", ROUTED_CHOICES as u64), ("F", ROUTED_FFN as u64), ("S", ROUTED_SHARED as u64)],
+                statics: vec![
+                    ("H", ROUTED_HIDDEN as u64),
+                    ("K", ROUTED_CHOICES as u64),
+                    ("F", ROUTED_FFN as u64),
+                    ("S", ROUTED_SHARED as u64),
+                ],
                 every_configuration: every,
                 cases,
             }
@@ -1391,10 +1879,26 @@ fn routed_group(ctx: &Ctx) -> Vec<Variant> {
                 label: format!("m{m}e{e}"),
                 args: vec![
                     ctx.ints(&[m as u64, k as u64], &routes(m, e, 80 + m as u64)),
-                    Arg::Mutable { element: Element::i32(), shape: vec![e as u64], bytes: i32_bytes(&vec![-5; e]) },
-                    Arg::Mutable { element: Element::i32(), shape: vec![b as u64, ROUTED_TILE as u64], bytes: i32_bytes(&vec![-5; b * ROUTED_TILE]) },
-                    Arg::Mutable { element: Element::i32(), shape: vec![m as u64, k as u64], bytes: i32_bytes(&vec![-5; m * k]) },
-                    Arg::Mutable { element: Element::i32(), shape: vec![b as u64], bytes: i32_bytes(&vec![-5; b]) },
+                    Arg::Mutable {
+                        element: Element::i32(),
+                        shape: vec![e as u64],
+                        bytes: i32_bytes(&vec![-5; e]),
+                    },
+                    Arg::Mutable {
+                        element: Element::i32(),
+                        shape: vec![b as u64, ROUTED_TILE as u64],
+                        bytes: i32_bytes(&vec![-5; b * ROUTED_TILE]),
+                    },
+                    Arg::Mutable {
+                        element: Element::i32(),
+                        shape: vec![m as u64, k as u64],
+                        bytes: i32_bytes(&vec![-5; m * k]),
+                    },
+                    Arg::Mutable {
+                        element: Element::i32(),
+                        shape: vec![b as u64],
+                        bytes: i32_bytes(&vec![-5; b]),
+                    },
                 ],
             }
         })
@@ -1433,7 +1937,11 @@ fn routed_experts(ctx: &Ctx) -> Vec<Variant> {
                     Case {
                         label: format!("m{m}"),
                         args: vec![
-                            ctx.dense(a, &[m as u64, ROUTED_HIDDEN as u64], &activations(&mut rng, m, ROUTED_HIDDEN, 1.0)),
+                            ctx.dense(
+                                a,
+                                &[m as u64, ROUTED_HIDDEN as u64],
+                                &activations(&mut rng, m, ROUTED_HIDDEN, 1.0),
+                            ),
                             ctx.ints(&[b as u64, ROUTED_TILE as u64], &order),
                             ctx.ints(&[b as u64], &blocks),
                             Arg::Shared(weights.tensors[0].clone()),
@@ -1472,11 +1980,27 @@ fn routed_combine(ctx: &Ctx) -> Vec<Variant> {
                     Case {
                         label: format!("m{m}"),
                         args: vec![
-                            ctx.dense(f32e(), &[m as u64, ROUTED_HIDDEN as u64], &activations(&mut rng, m, ROUTED_HIDDEN, 1.0)),
-                            ctx.dense(a, &[b as u64, ROUTED_TILE as u64, ROUTED_HIDDEN as u64], &activations(&mut rng, b * ROUTED_TILE, ROUTED_HIDDEN, 0.2)),
+                            ctx.dense(
+                                f32e(),
+                                &[m as u64, ROUTED_HIDDEN as u64],
+                                &activations(&mut rng, m, ROUTED_HIDDEN, 1.0),
+                            ),
+                            ctx.dense(
+                                a,
+                                &[b as u64, ROUTED_TILE as u64, ROUTED_HIDDEN as u64],
+                                &activations(&mut rng, b * ROUTED_TILE, ROUTED_HIDDEN, 0.2),
+                            ),
                             ctx.ints(&[m as u64, k as u64], &inverse),
-                            ctx.dense(f32e(), &[m as u64, k as u64], &uniform(&mut rng, m * k, 0.0, 0.3)),
-                            ctx.dense(a, &[m as u64, ROUTED_HIDDEN as u64], &activations(&mut rng, m, ROUTED_HIDDEN, 1.0)),
+                            ctx.dense(
+                                f32e(),
+                                &[m as u64, k as u64],
+                                &uniform(&mut rng, m * k, 0.0, 0.3),
+                            ),
+                            ctx.dense(
+                                a,
+                                &[m as u64, ROUTED_HIDDEN as u64],
+                                &activations(&mut rng, m, ROUTED_HIDDEN, 1.0),
+                            ),
                             ctx.dense(f32e(), &[m as u64], &uniform(&mut rng, m, 0.1, 0.9)),
                             Arg::Shared(weights.tensors[3].clone()),
                             Arg::Shared(weights.tensors[4].clone()),
@@ -1489,7 +2013,11 @@ fn routed_combine(ctx: &Ctx) -> Vec<Variant> {
             Variant {
                 label: label.into(),
                 elements: vec![("SGW", el[3]), ("SUW", el[4]), ("SDW", el[5]), ("A", a)],
-                statics: vec![("H", ROUTED_HIDDEN as u64), ("K", k as u64), ("S", ROUTED_SHARED as u64)],
+                statics: vec![
+                    ("H", ROUTED_HIDDEN as u64),
+                    ("K", k as u64),
+                    ("S", ROUTED_SHARED as u64),
+                ],
                 every_configuration: every,
                 cases,
             }
@@ -1527,8 +2055,18 @@ fn shape_rows(ctx: &Ctx) -> Vec<Variant> {
                 .into_iter()
                 .map(|sx| {
                     let hn = 24;
-                    let history = (0..sx * hn).map(|i| if i % 5 == 4 { -1 } else { rng.below(v.min(300)) as i32 }).collect::<Vec<_>>();
-                    let rows = (0..sx).flat_map(|r| params[(r + 1) % 6]).collect::<Vec<_>>();
+                    let history = (0..sx * hn)
+                        .map(|i| {
+                            if i % 5 == 4 {
+                                -1
+                            } else {
+                                rng.below(v.min(300)) as i32
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let rows = (0..sx)
+                        .flat_map(|r| params[(r + 1) % 6])
+                        .collect::<Vec<_>>();
                     Case {
                         label: format!("s{sx}"),
                         args: vec![
@@ -1540,7 +2078,13 @@ fn shape_rows(ctx: &Ctx) -> Vec<Variant> {
                     }
                 })
                 .collect();
-            Variant { label: format!("v{v}"), elements: vec![], statics: vec![("V", v as u64), ("Hn", 24)], every_configuration: true, cases }
+            Variant {
+                label: format!("v{v}"),
+                elements: vec![],
+                statics: vec![("V", v as u64), ("Hn", 24)],
+                every_configuration: true,
+                cases,
+            }
         })
         .collect()
 }
@@ -1554,53 +2098,93 @@ fn sample_rows(ctx: &Ctx) -> Vec<Variant> {
             let cases = [1usize, 5]
                 .into_iter()
                 .map(|m| {
-                    let mask = (0..m * words).map(|_| rng.next() | 0x0101_0101).collect::<Vec<u32>>();
+                    let mask = (0..m * words)
+                        .map(|_| rng.next() | 0x0101_0101)
+                        .collect::<Vec<u32>>();
                     let constrained = (0..m).map(|r| (r % 2) as i32).collect::<Vec<_>>();
                     let draws = (0..m)
-                        .flat_map(|r| [if r % 3 == 0 { 0 } else { 1 }, 1234 + r as u32, 99, r as u32, 7, 0])
+                        .flat_map(|r| {
+                            [
+                                if r % 3 == 0 { 0 } else { 1 },
+                                1234 + r as u32,
+                                99,
+                                r as u32,
+                                7,
+                                0,
+                            ]
+                        })
                         .collect::<Vec<u32>>();
                     Case {
                         label: format!("m{m}"),
                         args: vec![
                             ctx.dense(f32e(), &[m as u64, v as u64], &logits(&mut rng, m, v)),
-                            Arg::Shared(ctx.tensor(Element::u32(), &[m as u64, words as u64], &u32_bytes(&mask))),
+                            Arg::Shared(ctx.tensor(
+                                Element::u32(),
+                                &[m as u64, words as u64],
+                                &u32_bytes(&mask),
+                            )),
                             ctx.ints(&[m as u64], &constrained),
-                            Arg::Shared(ctx.tensor(Element::u32(), &[m as u64, 6], &u32_bytes(&draws))),
-                            Arg::Mutable { element: Element::i32(), shape: vec![m as u64, 2], bytes: i32_bytes(&vec![-9; 2 * m]) },
+                            Arg::Shared(ctx.tensor(
+                                Element::u32(),
+                                &[m as u64, 6],
+                                &u32_bytes(&draws),
+                            )),
+                            Arg::Mutable {
+                                element: Element::i32(),
+                                shape: vec![m as u64, 2],
+                                bytes: i32_bytes(&vec![-9; 2 * m]),
+                            },
                         ],
                     }
                 })
                 .collect();
-            Variant { label: format!("v{v}"), elements: vec![], statics: vec![("V", v as u64)], every_configuration: true, cases }
-        })
-        .collect()
-}
-
-fn import_dense(ctx: &Ctx) -> Vec<Variant> {
-    [(f32e(), bf16()), (f32e(), f16()), (bf16(), f32e()), (f16(), f32e()), (bf16(), bf16()), (f32e(), f32e()), (f16(), bf16())]
-        .into_iter()
-        .map(|(e, u)| {
-            let mut rng = Rng::new(20);
-            let cases = [[1u64, 1, 2560], [1, 37, 768], [3, 16, 512]]
-                .into_iter()
-                .map(|shape| {
-                    let n = shape.iter().product::<u64>() as usize;
-                    let mut values = activations(&mut rng, 1, n, 3.0);
-                    values[0] = 1.0e30;
-                    values[1] = -0.0;
-                    values[2] = 7.0e-41;
-                    Case { label: format!("{shape:?}"), args: vec![ctx.dense(e, &shape, &values)] }
-                })
-                .collect();
             Variant {
-                label: format!("{}-{}", e.name(), u.name()),
-                elements: vec![("E", e), ("U", u)],
-                statics: vec![],
+                label: format!("v{v}"),
+                elements: vec![],
+                statics: vec![("V", v as u64)],
                 every_configuration: true,
                 cases,
             }
         })
         .collect()
+}
+
+fn import_dense(ctx: &Ctx) -> Vec<Variant> {
+    [
+        (f32e(), bf16()),
+        (f32e(), f16()),
+        (bf16(), f32e()),
+        (f16(), f32e()),
+        (bf16(), bf16()),
+        (f32e(), f32e()),
+        (f16(), bf16()),
+    ]
+    .into_iter()
+    .map(|(e, u)| {
+        let mut rng = Rng::new(20);
+        let cases = [[1u64, 1, 2560], [1, 37, 768], [3, 16, 512]]
+            .into_iter()
+            .map(|shape| {
+                let n = shape.iter().product::<u64>() as usize;
+                let mut values = activations(&mut rng, 1, n, 3.0);
+                values[0] = 1.0e30;
+                values[1] = -0.0;
+                values[2] = 7.0e-41;
+                Case {
+                    label: format!("{shape:?}"),
+                    args: vec![ctx.dense(e, &shape, &values)],
+                }
+            })
+            .collect();
+        Variant {
+            label: format!("{}-{}", e.name(), u.name()),
+            elements: vec![("E", e), ("U", u)],
+            statics: vec![],
+            every_configuration: true,
+            cases,
+        }
+    })
+    .collect()
 }
 
 fn repack_weight(ctx: &Ctx) -> Vec<Variant> {
@@ -1613,8 +2197,17 @@ fn repack_weight(ctx: &Ctx) -> Vec<Variant> {
                 .into_iter()
                 .map(|shape| {
                     let n = shape.iter().product::<u64>() as usize;
-                    let external = (0..n / format.block_values()).flat_map(|_| format.block(&mut rng)).collect::<Vec<_>>();
-                    Case { label: format!("{shape:?}"), args: vec![Arg::Shared(ctx.tensor(format.external(), &shape, &external))] }
+                    let external = (0..n / format.block_values())
+                        .flat_map(|_| format.block(&mut rng))
+                        .collect::<Vec<_>>();
+                    Case {
+                        label: format!("{shape:?}"),
+                        args: vec![Arg::Shared(ctx.tensor(
+                            format.external(),
+                            &shape,
+                            &external,
+                        ))],
+                    }
                 })
                 .collect();
             Variant {
@@ -1633,26 +2226,52 @@ fn copy_rows(ctx: &Ctx) -> Vec<Variant> {
         .into_iter()
         .map(|element| {
             let mut rng = Rng::new(22);
-            let cases = [(2usize, 6usize, 5usize, 4usize, 64usize), (5, 40, 40, 4, 256), (1, 3, 9, 1, 12)]
-                .into_iter()
-                .map(|(n, ts, td, kv, w)| {
-                    let bytes_per = if element.name() == "bf16" || element.name() == "f16" { 2 } else { 4 };
-                    let src = (0..ts * kv * w * bytes_per).map(|_| rng.byte()).collect::<Vec<_>>();
-                    let dst = (0..td * kv * w * bytes_per).map(|_| rng.byte()).collect::<Vec<_>>();
-                    let from = (0..n).map(|i| ((i * 7 + 1) % ts) as i32).collect::<Vec<_>>();
-                    let to = (0..n).map(|i| ((i * 3 + 2) % td) as i32).collect::<Vec<_>>();
-                    Case {
-                        label: format!("n{n}ts{ts}td{td}kv{kv}w{w}"),
-                        args: vec![
-                            Arg::Shared(ctx.tensor(element, &[ts as u64, kv as u64, w as u64], &src)),
-                            Arg::Mutable { element, shape: vec![td as u64, kv as u64, w as u64], bytes: dst },
-                            ctx.ints(&[n as u64], &from),
-                            ctx.ints(&[n as u64], &to),
-                        ],
-                    }
-                })
-                .collect();
-            Variant { label: element.name().into(), elements: vec![("A", element)], statics: vec![], every_configuration: true, cases }
+            let cases = [
+                (2usize, 6usize, 5usize, 4usize, 64usize),
+                (5, 40, 40, 4, 256),
+                (1, 3, 9, 1, 12),
+            ]
+            .into_iter()
+            .map(|(n, ts, td, kv, w)| {
+                let bytes_per = if element.name() == "bf16" || element.name() == "f16" {
+                    2
+                } else {
+                    4
+                };
+                let src = (0..ts * kv * w * bytes_per)
+                    .map(|_| rng.byte())
+                    .collect::<Vec<_>>();
+                let dst = (0..td * kv * w * bytes_per)
+                    .map(|_| rng.byte())
+                    .collect::<Vec<_>>();
+                let from = (0..n)
+                    .map(|i| ((i * 7 + 1) % ts) as i32)
+                    .collect::<Vec<_>>();
+                let to = (0..n)
+                    .map(|i| ((i * 3 + 2) % td) as i32)
+                    .collect::<Vec<_>>();
+                Case {
+                    label: format!("n{n}ts{ts}td{td}kv{kv}w{w}"),
+                    args: vec![
+                        Arg::Shared(ctx.tensor(element, &[ts as u64, kv as u64, w as u64], &src)),
+                        Arg::Mutable {
+                            element,
+                            shape: vec![td as u64, kv as u64, w as u64],
+                            bytes: dst,
+                        },
+                        ctx.ints(&[n as u64], &from),
+                        ctx.ints(&[n as u64], &to),
+                    ],
+                }
+            })
+            .collect();
+            Variant {
+                label: element.name().into(),
+                elements: vec![("A", element)],
+                statics: vec![],
+                every_configuration: true,
+                cases,
+            }
         })
         .collect()
 }
@@ -1664,12 +2283,22 @@ fn conditioning_overlay(ctx: &Ctx) -> Vec<Variant> {
         .map(|(m, d)| Case {
             label: format!("m{m}d{d}"),
             args: vec![
-                ctx.dense(f32e(), &[m as u64, d as u64], &activations(&mut rng, m, d, 2.0)),
+                ctx.dense(
+                    f32e(),
+                    &[m as u64, d as u64],
+                    &activations(&mut rng, m, d, 2.0),
+                ),
                 ctx.dense_mut(f32e(), &[m as u64, d as u64], &vec![5.0; m * d]),
             ],
         })
         .collect();
-    vec![Variant { label: "f32".into(), elements: vec![], statics: vec![], every_configuration: true, cases }]
+    vec![Variant {
+        label: "f32".into(),
+        elements: vec![],
+        statics: vec![],
+        every_configuration: true,
+        cases,
+    }]
 }
 
 fn vision_stem(ctx: &Ctx) -> Vec<Variant> {
@@ -1684,12 +2313,31 @@ fn vision_stem(ctx: &Ctx) -> Vec<Variant> {
                 .map(|m| Case {
                     label: format!("m{m}"),
                     args: vec![
-                        ctx.dense(f32e(), &[m as u64, c as u64, 2, p as u64, p as u64], &uniform(&mut rng, m * c * 2 * p * p, -1.0, 1.0)),
-                        ctx.dense(w, &[h as u64, c as u64, p as u64, p as u64], &uniform(&mut rng, p * p * c * h, -0.05, 0.05)),
-                        ctx.dense(w, &[h as u64, c as u64, p as u64, p as u64], &uniform(&mut rng, p * p * c * h, -0.05, 0.05)),
+                        ctx.dense(
+                            f32e(),
+                            &[m as u64, c as u64, 2, p as u64, p as u64],
+                            &uniform(&mut rng, m * c * 2 * p * p, -1.0, 1.0),
+                        ),
+                        ctx.dense(
+                            w,
+                            &[h as u64, c as u64, p as u64, p as u64],
+                            &uniform(&mut rng, p * p * c * h, -0.05, 0.05),
+                        ),
+                        ctx.dense(
+                            w,
+                            &[h as u64, c as u64, p as u64, p as u64],
+                            &uniform(&mut rng, p * p * c * h, -0.05, 0.05),
+                        ),
                         ctx.dense(b, &[h as u64], &uniform(&mut rng, h, -0.1, 0.1)),
-                        ctx.dense(b, &[l as u64, h as u64], &uniform(&mut rng, h * l, -0.5, 0.5)),
-                        ctx.ints(&[m as u64, 4], &(0..m * 4).map(|i| (i * 5 % l) as i32).collect::<Vec<_>>()),
+                        ctx.dense(
+                            b,
+                            &[l as u64, h as u64],
+                            &uniform(&mut rng, h * l, -0.5, 0.5),
+                        ),
+                        ctx.ints(
+                            &[m as u64, 4],
+                            &(0..m * 4).map(|i| (i * 5 % l) as i32).collect::<Vec<_>>(),
+                        ),
                         ctx.dense(f32e(), &[m as u64, 4], &uniform(&mut rng, m * 4, 0.0, 0.5)),
                     ],
                 })
@@ -1709,100 +2357,151 @@ fn vision_block(ctx: &Ctx) -> Vec<Variant> {
     // Two heads of 64 (the kernels specialize on H, P, F).
     let (h, p, f) = (2usize, 16usize, 128usize);
     let width = h * 4 * p;
-    [("f16", f16(), f16(), f32e()), ("bf16", bf16(), bf16(), bf16())]
-        .into_iter()
-        .map(|(label, a, w, n)| {
-            let mut rng = Rng::new(25);
-            let cases = [2usize, 70]
-                .into_iter()
-                .map(|m| {
-                    let mut vector = |len: usize, low: f32, high: f32, element: Element| ctx.dense(element, &[len as u64], &uniform(&mut rng, len, low, high));
-                    let n1w = vector(width, 0.5, 1.5, n);
-                    let n1b = vector(width, -0.1, 0.1, n);
-                    let qb = vector(3 * width, -0.1, 0.1, n);
-                    let pb = vector(width, -0.1, 0.1, n);
-                    let n2w = vector(width, 0.5, 1.5, n);
-                    let n2b = vector(width, -0.1, 0.1, n);
-                    let ub = vector(f, -0.1, 0.1, n);
-                    let db = vector(width, -0.1, 0.1, n);
-                    Case {
-                        label: format!("m{m}"),
-                        args: vec![
-                            ctx.dense(f32e(), &[m as u64, h as u64, 4, p as u64], &uniform(&mut rng, m * width, -1.0, 1.0)),
-                            ctx.ints(&[m as u64, 2], &(0..m * 2).map(|i| (i % 9) as i32).collect::<Vec<_>>()),
-                            n1w,
-                            n1b,
-                            ctx.dense(w, &[3 * width as u64, width as u64], &uniform(&mut rng, width * 3 * width, -0.1, 0.1)),
-                            qb,
-                            ctx.dense(w, &[width as u64, width as u64], &uniform(&mut rng, width * width, -0.1, 0.1)),
-                            pb,
-                            n2w,
-                            n2b,
-                            ctx.dense(w, &[f as u64, width as u64], &uniform(&mut rng, width * f, -0.1, 0.1)),
-                            ub,
-                            ctx.dense(w, &[width as u64, f as u64], &uniform(&mut rng, f * width, -0.1, 0.1)),
-                            db,
-                            f32s(1e-6),
-                        ],
-                    }
-                })
-                .collect();
-            Variant {
-                label: label.into(),
-                elements: vec![
-                    ("N1W", n),
-                    ("N1B", n),
-                    ("QW", w),
-                    ("QB", n),
-                    ("PW", w),
-                    ("PB", n),
-                    ("N2W", n),
-                    ("N2B", n),
-                    ("UW", w),
-                    ("UB", n),
-                    ("DW", w),
-                    ("DB", n),
-                    ("A", a),
-                ],
-                statics: vec![("H", h as u64), ("P", p as u64), ("F", f as u64)],
-                every_configuration: true,
-                cases,
-            }
-        })
-        .collect()
+    [
+        ("f16", f16(), f16(), f32e()),
+        ("bf16", bf16(), bf16(), bf16()),
+    ]
+    .into_iter()
+    .map(|(label, a, w, n)| {
+        let mut rng = Rng::new(25);
+        let cases = [2usize, 70]
+            .into_iter()
+            .map(|m| {
+                let mut vector = |len: usize, low: f32, high: f32, element: Element| {
+                    ctx.dense(element, &[len as u64], &uniform(&mut rng, len, low, high))
+                };
+                let n1w = vector(width, 0.5, 1.5, n);
+                let n1b = vector(width, -0.1, 0.1, n);
+                let qb = vector(3 * width, -0.1, 0.1, n);
+                let pb = vector(width, -0.1, 0.1, n);
+                let n2w = vector(width, 0.5, 1.5, n);
+                let n2b = vector(width, -0.1, 0.1, n);
+                let ub = vector(f, -0.1, 0.1, n);
+                let db = vector(width, -0.1, 0.1, n);
+                Case {
+                    label: format!("m{m}"),
+                    args: vec![
+                        ctx.dense(
+                            f32e(),
+                            &[m as u64, h as u64, 4, p as u64],
+                            &uniform(&mut rng, m * width, -1.0, 1.0),
+                        ),
+                        ctx.ints(
+                            &[m as u64, 2],
+                            &(0..m * 2).map(|i| (i % 9) as i32).collect::<Vec<_>>(),
+                        ),
+                        n1w,
+                        n1b,
+                        ctx.dense(
+                            w,
+                            &[3 * width as u64, width as u64],
+                            &uniform(&mut rng, width * 3 * width, -0.1, 0.1),
+                        ),
+                        qb,
+                        ctx.dense(
+                            w,
+                            &[width as u64, width as u64],
+                            &uniform(&mut rng, width * width, -0.1, 0.1),
+                        ),
+                        pb,
+                        n2w,
+                        n2b,
+                        ctx.dense(
+                            w,
+                            &[f as u64, width as u64],
+                            &uniform(&mut rng, width * f, -0.1, 0.1),
+                        ),
+                        ub,
+                        ctx.dense(
+                            w,
+                            &[width as u64, f as u64],
+                            &uniform(&mut rng, f * width, -0.1, 0.1),
+                        ),
+                        db,
+                        f32s(1e-6),
+                    ],
+                }
+            })
+            .collect();
+        Variant {
+            label: label.into(),
+            elements: vec![
+                ("N1W", n),
+                ("N1B", n),
+                ("QW", w),
+                ("QB", n),
+                ("PW", w),
+                ("PB", n),
+                ("N2W", n),
+                ("N2B", n),
+                ("UW", w),
+                ("UB", n),
+                ("DW", w),
+                ("DB", n),
+                ("A", a),
+            ],
+            statics: vec![("H", h as u64), ("P", p as u64), ("F", f as u64)],
+            every_configuration: true,
+            cases,
+        }
+    })
+    .collect()
 }
 
 fn vision_merger(ctx: &Ctx) -> Vec<Variant> {
     let (g, h, d) = (4usize, 32usize, 48usize);
-    [("f16", f16(), f16(), f32e()), ("bf16", bf16(), bf16(), bf16())]
-        .into_iter()
-        .map(|(label, a, w, n)| {
-            let mut rng = Rng::new(26);
-            let cases = [1usize, 3]
-                .into_iter()
-                .map(|m| Case {
-                    label: format!("m{m}"),
-                    args: vec![
-                        ctx.dense(f32e(), &[(m * g) as u64, h as u64], &uniform(&mut rng, m * g * h, -1.0, 1.0)),
-                        ctx.dense(n, &[h as u64], &uniform(&mut rng, h, 0.5, 1.5)),
-                        ctx.dense(n, &[h as u64], &uniform(&mut rng, h, -0.1, 0.1)),
-                        ctx.dense(w, &[(g * h) as u64, (g * h) as u64], &uniform(&mut rng, g * h * g * h, -0.2, 0.2)),
-                        ctx.dense(n, &[(g * h) as u64], &uniform(&mut rng, g * h, -0.1, 0.1)),
-                        ctx.dense(w, &[d as u64, (g * h) as u64], &uniform(&mut rng, g * h * d, -0.2, 0.2)),
-                        ctx.dense(n, &[d as u64], &uniform(&mut rng, d, -0.1, 0.1)),
-                        f32s(1e-6),
-                    ],
-                })
-                .collect();
-            Variant {
-                label: label.into(),
-                elements: vec![("NW", n), ("NB", n), ("UW", w), ("UB", n), ("DW", w), ("DB", n), ("A", a)],
-                statics: vec![("G", g as u64), ("H", h as u64), ("D", d as u64)],
-                every_configuration: true,
-                cases,
-            }
-        })
-        .collect()
+    [
+        ("f16", f16(), f16(), f32e()),
+        ("bf16", bf16(), bf16(), bf16()),
+    ]
+    .into_iter()
+    .map(|(label, a, w, n)| {
+        let mut rng = Rng::new(26);
+        let cases = [1usize, 3]
+            .into_iter()
+            .map(|m| Case {
+                label: format!("m{m}"),
+                args: vec![
+                    ctx.dense(
+                        f32e(),
+                        &[(m * g) as u64, h as u64],
+                        &uniform(&mut rng, m * g * h, -1.0, 1.0),
+                    ),
+                    ctx.dense(n, &[h as u64], &uniform(&mut rng, h, 0.5, 1.5)),
+                    ctx.dense(n, &[h as u64], &uniform(&mut rng, h, -0.1, 0.1)),
+                    ctx.dense(
+                        w,
+                        &[(g * h) as u64, (g * h) as u64],
+                        &uniform(&mut rng, g * h * g * h, -0.2, 0.2),
+                    ),
+                    ctx.dense(n, &[(g * h) as u64], &uniform(&mut rng, g * h, -0.1, 0.1)),
+                    ctx.dense(
+                        w,
+                        &[d as u64, (g * h) as u64],
+                        &uniform(&mut rng, g * h * d, -0.2, 0.2),
+                    ),
+                    ctx.dense(n, &[d as u64], &uniform(&mut rng, d, -0.1, 0.1)),
+                    f32s(1e-6),
+                ],
+            })
+            .collect();
+        Variant {
+            label: label.into(),
+            elements: vec![
+                ("NW", n),
+                ("NB", n),
+                ("UW", w),
+                ("UB", n),
+                ("DW", w),
+                ("DB", n),
+                ("A", a),
+            ],
+            statics: vec![("G", g as u64), ("H", h as u64), ("D", d as u64)],
+            every_configuration: true,
+            cases,
+        }
+    })
+    .collect()
 }
 
 /// A harness entry: a stable id (golden file name), the function names it
@@ -1818,37 +2517,223 @@ struct EntrySpec {
 }
 
 const ENTRIES: &[EntrySpec] = &[
-    EntrySpec { id: "dense_expand", names: &["dense_expand"], family: "projection", library: true, build: dense_expand },
-    EntrySpec { id: "dense_output", names: &["dense_output"], family: "projection", library: true, build: dense_output },
-    EntrySpec { id: "attention_project", names: &["gated_attention_project"], family: "attention", library: true, build: attention_project },
-    EntrySpec { id: "attention_output", names: &["attention_output"], family: "attention", library: true, build: attention_output },
-    EntrySpec { id: "attention_decode", names: &["gated_attention_decode"], family: "attention", library: false, build: attention_decode },
-    EntrySpec { id: "attention_prefill", names: &["gated_attention_prefill"], family: "attention", library: false, build: attention_prefill },
-    EntrySpec { id: "recurrent_project", names: &["gated_delta_project"], family: "recurrent", library: true, build: recurrent_project },
-    EntrySpec { id: "recurrent_output", names: &["gated_delta_output"], family: "recurrent", library: true, build: recurrent_output },
-    EntrySpec { id: "recurrent_step", names: &["gated_delta_step"], family: "recurrent", library: false, build: recurrent_state },
-    EntrySpec { id: "recurrent_chunk", names: &["gated_delta_chunk"], family: "recurrent", library: false, build: recurrent_state },
-    EntrySpec { id: "features_rows", names: &["readout_features_rows", "qwen_features_rows"], family: "readout", library: true, build: features_rows },
-    EntrySpec { id: "head_rows", names: &["readout_head_rows", "qwen_head_rows"], family: "readout", library: true, build: head_rows },
-    EntrySpec { id: "selected_rows", names: &["readout_selected_rows", "qwen_selected_rows"], family: "readout", library: true, build: selected_rows },
-    EntrySpec { id: "head_logits_rows", names: &["head_logits_rows"], family: "readout", library: true, build: head_logits_rows },
-    EntrySpec { id: "draft_rows", names: &["draft_rows"], family: "readout", library: true, build: draft_rows },
-    EntrySpec { id: "embedding_rows", names: &["embedding_rows", "qwen_embedding_rows"], family: "readout", library: true, build: embedding_rows },
-    EntrySpec { id: "routed_route", names: &["routed_route"], family: "routed", library: false, build: routed_route },
-    EntrySpec { id: "routed_expand", names: &["routed_expand"], family: "routed", library: true, build: routed_expand },
-    EntrySpec { id: "routed_output", names: &["routed_output"], family: "routed", library: true, build: routed_output },
-    EntrySpec { id: "routed_group", names: &["routed_group"], family: "routed", library: false, build: routed_group },
-    EntrySpec { id: "routed_experts", names: &["routed_experts"], family: "routed", library: true, build: routed_experts },
-    EntrySpec { id: "routed_combine", names: &["routed_combine"], family: "routed", library: true, build: routed_combine },
-    EntrySpec { id: "shape_rows", names: &["shape_rows"], family: "sampling", library: false, build: shape_rows },
-    EntrySpec { id: "sample_rows", names: &["sample_rows"], family: "sampling", library: false, build: sample_rows },
-    EntrySpec { id: "import_dense", names: &["import_dense"], family: "import", library: false, build: import_dense },
-    EntrySpec { id: "repack_weight", names: &["repack_weight"], family: "import", library: false, build: repack_weight },
-    EntrySpec { id: "copy_rows", names: &["copy_rows"], family: "state", library: false, build: copy_rows },
-    EntrySpec { id: "conditioning_overlay", names: &["conditioning_overlay", "qwen_conditioning_overlay"], family: "state", library: false, build: conditioning_overlay },
-    EntrySpec { id: "vision_stem", names: &["qwen_vision_stem"], family: "vision", library: false, build: vision_stem },
-    EntrySpec { id: "vision_block", names: &["qwen_vision_block"], family: "vision", library: false, build: vision_block },
-    EntrySpec { id: "vision_merger", names: &["qwen_vision_merger"], family: "vision", library: false, build: vision_merger },
+    EntrySpec {
+        id: "dense_expand",
+        names: &["dense_expand"],
+        family: "projection",
+        library: true,
+        build: dense_expand,
+    },
+    EntrySpec {
+        id: "dense_output",
+        names: &["dense_output"],
+        family: "projection",
+        library: true,
+        build: dense_output,
+    },
+    EntrySpec {
+        id: "attention_project",
+        names: &["gated_attention_project"],
+        family: "attention",
+        library: true,
+        build: attention_project,
+    },
+    EntrySpec {
+        id: "attention_output",
+        names: &["attention_output"],
+        family: "attention",
+        library: true,
+        build: attention_output,
+    },
+    EntrySpec {
+        id: "attention_decode",
+        names: &["gated_attention_decode"],
+        family: "attention",
+        library: false,
+        build: attention_decode,
+    },
+    EntrySpec {
+        id: "attention_prefill",
+        names: &["gated_attention_prefill"],
+        family: "attention",
+        library: false,
+        build: attention_prefill,
+    },
+    EntrySpec {
+        id: "recurrent_project",
+        names: &["gated_delta_project"],
+        family: "recurrent",
+        library: true,
+        build: recurrent_project,
+    },
+    EntrySpec {
+        id: "recurrent_output",
+        names: &["gated_delta_output"],
+        family: "recurrent",
+        library: true,
+        build: recurrent_output,
+    },
+    EntrySpec {
+        id: "recurrent_step",
+        names: &["gated_delta_step"],
+        family: "recurrent",
+        library: false,
+        build: recurrent_state,
+    },
+    EntrySpec {
+        id: "recurrent_chunk",
+        names: &["gated_delta_chunk"],
+        family: "recurrent",
+        library: false,
+        build: recurrent_state,
+    },
+    EntrySpec {
+        id: "features_rows",
+        names: &["readout_features_rows", "qwen_features_rows"],
+        family: "readout",
+        library: true,
+        build: features_rows,
+    },
+    EntrySpec {
+        id: "head_rows",
+        names: &["readout_head_rows", "qwen_head_rows"],
+        family: "readout",
+        library: true,
+        build: head_rows,
+    },
+    EntrySpec {
+        id: "selected_rows",
+        names: &["readout_selected_rows", "qwen_selected_rows"],
+        family: "readout",
+        library: true,
+        build: selected_rows,
+    },
+    EntrySpec {
+        id: "head_logits_rows",
+        names: &["head_logits_rows"],
+        family: "readout",
+        library: true,
+        build: head_logits_rows,
+    },
+    EntrySpec {
+        id: "draft_rows",
+        names: &["draft_rows"],
+        family: "readout",
+        library: true,
+        build: draft_rows,
+    },
+    EntrySpec {
+        id: "embedding_rows",
+        names: &["embedding_rows", "qwen_embedding_rows"],
+        family: "readout",
+        library: true,
+        build: embedding_rows,
+    },
+    EntrySpec {
+        id: "routed_route",
+        names: &["routed_route"],
+        family: "routed",
+        library: false,
+        build: routed_route,
+    },
+    EntrySpec {
+        id: "routed_expand",
+        names: &["routed_expand"],
+        family: "routed",
+        library: true,
+        build: routed_expand,
+    },
+    EntrySpec {
+        id: "routed_output",
+        names: &["routed_output"],
+        family: "routed",
+        library: true,
+        build: routed_output,
+    },
+    EntrySpec {
+        id: "routed_group",
+        names: &["routed_group"],
+        family: "routed",
+        library: false,
+        build: routed_group,
+    },
+    EntrySpec {
+        id: "routed_experts",
+        names: &["routed_experts"],
+        family: "routed",
+        library: true,
+        build: routed_experts,
+    },
+    EntrySpec {
+        id: "routed_combine",
+        names: &["routed_combine"],
+        family: "routed",
+        library: true,
+        build: routed_combine,
+    },
+    EntrySpec {
+        id: "shape_rows",
+        names: &["shape_rows"],
+        family: "sampling",
+        library: false,
+        build: shape_rows,
+    },
+    EntrySpec {
+        id: "sample_rows",
+        names: &["sample_rows"],
+        family: "sampling",
+        library: false,
+        build: sample_rows,
+    },
+    EntrySpec {
+        id: "import_dense",
+        names: &["import_dense"],
+        family: "import",
+        library: false,
+        build: import_dense,
+    },
+    EntrySpec {
+        id: "repack_weight",
+        names: &["repack_weight"],
+        family: "import",
+        library: false,
+        build: repack_weight,
+    },
+    EntrySpec {
+        id: "copy_rows",
+        names: &["copy_rows"],
+        family: "state",
+        library: false,
+        build: copy_rows,
+    },
+    EntrySpec {
+        id: "conditioning_overlay",
+        names: &["conditioning_overlay", "qwen_conditioning_overlay"],
+        family: "state",
+        library: false,
+        build: conditioning_overlay,
+    },
+    EntrySpec {
+        id: "vision_stem",
+        names: &["qwen_vision_stem"],
+        family: "vision",
+        library: false,
+        build: vision_stem,
+    },
+    EntrySpec {
+        id: "vision_block",
+        names: &["qwen_vision_block"],
+        family: "vision",
+        library: false,
+        build: vision_block,
+    },
+    EntrySpec {
+        id: "vision_merger",
+        names: &["qwen_vision_merger"],
+        family: "vision",
+        library: false,
+        build: vision_merger,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -1858,7 +2743,11 @@ const ENTRIES: &[EntrySpec] = &[
 /// Every configuration when the domain has at most 48; otherwise the
 /// defaults, each single-parameter variation of them and 8 pseudo-random
 /// configurations. Inadmissible configurations (`where`) are dropped.
-fn configurations(native: &NativeImplementation, statics: &[(&str, u64)], seed: &str) -> Vec<Vec<(String, u64)>> {
+fn configurations(
+    native: &NativeImplementation,
+    statics: &[(&str, u64)],
+    seed: &str,
+) -> Vec<Vec<(String, u64)>> {
     let params = &native.params;
     let total = params.iter().map(|p| p.values.len()).product::<usize>();
     let default = params.iter().map(|p| p.values[0]).collect::<Vec<_>>();
@@ -1871,7 +2760,14 @@ fn configurations(native: &NativeImplementation, statics: &[(&str, u64)], seed: 
     if total <= 48 {
         let mut index = vec![0usize; params.len()];
         loop {
-            push(index.iter().zip(params).map(|(i, p)| p.values[*i]).collect(), &mut chosen);
+            push(
+                index
+                    .iter()
+                    .zip(params)
+                    .map(|(i, p)| p.values[*i])
+                    .collect(),
+                &mut chosen,
+            );
             let mut digit = 0;
             loop {
                 if digit == params.len() {
@@ -1897,14 +2793,29 @@ fn configurations(native: &NativeImplementation, statics: &[(&str, u64)], seed: 
                 push(config, &mut chosen);
             }
         }
-        let mut rng = Rng::new(seed.bytes().fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b))));
+        let mut rng = Rng::new(
+            seed.bytes()
+                .fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b))),
+        );
         for _ in 0..8 {
-            push(params.iter().map(|p| p.values[rng.below(p.values.len())]).collect(), &mut chosen);
+            push(
+                params
+                    .iter()
+                    .map(|p| p.values[rng.below(p.values.len())])
+                    .collect(),
+                &mut chosen,
+            );
         }
     }
     chosen
         .into_iter()
-        .map(|config| params.iter().map(|p| p.name.clone()).zip(config).collect::<Vec<_>>())
+        .map(|config| {
+            params
+                .iter()
+                .map(|p| p.name.clone())
+                .zip(config)
+                .collect::<Vec<_>>()
+        })
         .filter(|config| native.validate(&specialization(statics, config)).is_ok())
         .collect()
 }
@@ -1912,8 +2823,12 @@ fn configurations(native: &NativeImplementation, statics: &[(&str, u64)], seed: 
 fn specialization(statics: &[(&str, u64)], config: &[(String, u64)]) -> NativeSpecialization {
     let with_statics = statics
         .iter()
-        .fold(NativeSpecialization::new(), |s, (name, value)| s.with_static(*name, *value));
-    config.iter().fold(with_statics, |s, (name, value)| s.with_param(name.clone(), *value))
+        .fold(NativeSpecialization::new(), |s, (name, value)| {
+            s.with_static(*name, *value)
+        });
+    config.iter().fold(with_statics, |s, (name, value)| {
+        s.with_param(name.clone(), *value)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1941,26 +2856,44 @@ fn outputs(function: &Function, args: &[Value], result: Value, out: &mut Vec<(St
     }
     flatten(result, &mut 0, out);
     for ((name, ty), value) in function.parameters().iter().zip(args) {
-        if let (SignatureType::Tensor { access: TensorAccess::Mutable, .. }, Value::Tensor(tensor)) = (ty, value) {
+        if let (
+            SignatureType::Tensor {
+                access: TensorAccess::Mutable,
+                ..
+            },
+            Value::Tensor(tensor),
+        ) = (ty, value)
+        {
             out.push((name.clone(), tensor.read().unwrap()));
         }
     }
 }
 
-fn run(ctx: &Ctx, kernel: &seismic::dynamic::Kernel, case: &Case) -> Result<Vec<(String, String)>, String> {
+fn run(
+    ctx: &Ctx,
+    kernel: &seismic::dynamic::Kernel,
+    case: &Case,
+) -> Result<Vec<(String, String)>, String> {
     let args = case
         .args
         .iter()
         .map(|arg| match arg {
             Arg::Shared(tensor) => Value::Tensor(tensor.clone()),
-            Arg::Mutable { element, shape, bytes } => Value::Tensor(ctx.tensor(*element, shape, bytes)),
+            Arg::Mutable {
+                element,
+                shape,
+                bytes,
+            } => Value::Tensor(ctx.tensor(*element, shape, bytes)),
             Arg::Scalar(scalar) => Value::Scalar(scalar.clone()),
         })
         .collect::<Vec<_>>();
     let result = kernel.call(&args).map_err(|e| format!("ERR {}", e.kind))?;
     let mut out = Vec::new();
     outputs(kernel.function(), &args, result, &mut out);
-    Ok(out.into_iter().map(|(name, bytes)| (name, hash(&bytes))).collect())
+    Ok(out
+        .into_iter()
+        .map(|(name, bytes)| (name, hash(&bytes)))
+        .collect())
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -1975,8 +2908,21 @@ struct Report {
     nondeterministic: Vec<String>,
 }
 
-fn run_entry(ctx: &Ctx, checked: &CheckedModule, module: &Module, spec: &EntrySpec, mode: Mode, dir: &Path, report: &mut Report) {
-    let Some(name) = spec.names.iter().copied().find(|name| checked.entry_named(name).is_some()) else {
+fn run_entry(
+    ctx: &Ctx,
+    checked: &CheckedModule,
+    module: &Module,
+    spec: &EntrySpec,
+    mode: Mode,
+    dir: &Path,
+    report: &mut Report,
+) {
+    let Some(name) = spec
+        .names
+        .iter()
+        .copied()
+        .find(|name| checked.entry_named(name).is_some())
+    else {
         panic!("{}: none of {:?} is an entry", spec.id, spec.names);
     };
     let id = checked.entry_named(name).unwrap();
@@ -2001,11 +2947,23 @@ fn run_entry(ctx: &Ctx, checked: &CheckedModule, module: &Module, spec: &EntrySp
         if !variant.every_configuration {
             configs.truncate(3);
         }
-        let elements = variant.elements.iter().map(|(n, e)| (n.to_string(), *e)).collect::<BTreeMap<_, _>>();
+        let elements = variant
+            .elements
+            .iter()
+            .map(|(n, e)| (n.to_string(), *e))
+            .collect::<BTreeMap<_, _>>();
         for config in &configs {
-            let config_label = config.iter().map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join(",");
+            let config_label = config
+                .iter()
+                .map(|(n, v)| format!("{n}={v}"))
+                .collect::<Vec<_>>()
+                .join(",");
             let prefix = format!("{}|{}", variant.label, config_label);
-            let kernel = match function.prepare_native(&ctx.device, elements.clone(), specialization(&statics, config)) {
+            let kernel = match function.prepare_native(
+                &ctx.device,
+                elements.clone(),
+                specialization(&statics, config),
+            ) {
                 Ok(kernel) => kernel,
                 Err(error) => {
                     lines.insert(format!("{prefix}|prepare"), format!("ERR {}", error.kind));
@@ -2020,16 +2978,31 @@ fn run_entry(ctx: &Ctx, checked: &CheckedModule, module: &Module, spec: &EntrySp
                 let key = format!("{prefix}|{}", case.label);
                 match run(ctx, &kernel, case) {
                     Ok(outputs) => {
-                        let again = if mode == Mode::Record { Some(run(ctx, &kernel, case)) } else { None };
+                        let again = if mode == Mode::Record {
+                            Some(run(ctx, &kernel, case))
+                        } else {
+                            None
+                        };
                         for (output, digest) in &outputs {
                             let stable = match &again {
-                                Some(Ok(second)) => second.iter().any(|(n, d)| n == output && d == digest),
+                                Some(Ok(second)) => {
+                                    second.iter().any(|(n, d)| n == output && d == digest)
+                                }
                                 _ => true,
                             };
                             if !stable {
-                                report.nondeterministic.push(format!("{}: {key}|{output}", spec.id));
+                                report
+                                    .nondeterministic
+                                    .push(format!("{}: {key}|{output}", spec.id));
                             }
-                            lines.insert(format!("{key}|{output}"), if stable { digest.clone() } else { "NONDET".into() });
+                            lines.insert(
+                                format!("{key}|{output}"),
+                                if stable {
+                                    digest.clone()
+                                } else {
+                                    "NONDET".into()
+                                },
+                            );
                         }
                     }
                     Err(error) => {
@@ -2052,7 +3025,8 @@ fn run_entry(ctx: &Ctx, checked: &CheckedModule, module: &Module, spec: &EntrySp
             std::fs::write(&path, text).unwrap();
         }
         Mode::Compare => {
-            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             let golden = text
                 .lines()
                 .map(|line| {
@@ -2068,7 +3042,10 @@ fn run_entry(ctx: &Ctx, checked: &CheckedModule, module: &Module, spec: &EntrySp
                     continue;
                 }
                 if expected != actual {
-                    report.mismatches.push(format!("{}: {key}: golden {expected:?} now {actual:?}", spec.id));
+                    report.mismatches.push(format!(
+                        "{}: {key}: golden {expected:?} now {actual:?}",
+                        spec.id
+                    ));
                 }
             }
         }
@@ -2102,32 +3079,60 @@ fn golden() {
     };
     let (backend, device) = backends
         .into_iter()
-        .find_map(|backend| catalog.open_backend(backend).ok().map(|device| (backend, device)))
+        .find_map(|backend| {
+            catalog
+                .open_backend(backend)
+                .ok()
+                .map(|device| (backend, device))
+        })
         .expect("a device of the selected backend");
-    let dir = PathBuf::from(std::env::var("GOLDEN_DIR").expect("GOLDEN_DIR")).join(format!("{backend:?}").to_lowercase());
+    let dir = PathBuf::from(std::env::var("GOLDEN_DIR").expect("GOLDEN_DIR"))
+        .join(format!("{backend:?}").to_lowercase());
     std::fs::create_dir_all(&dir).unwrap();
     let families = std::env::var("GOLDEN_FAMILIES").unwrap_or_else(|_| "all".into());
     let families = families.split(',').map(str::trim).collect::<Vec<_>>();
-    let entries = std::env::var("GOLDEN_ENTRIES").ok().filter(|list| !list.is_empty());
-    let entries = entries.as_deref().map(|list| list.split(',').map(str::trim).collect::<Vec<_>>());
+    let entries = std::env::var("GOLDEN_ENTRIES")
+        .ok()
+        .filter(|list| !list.is_empty());
+    let entries = entries
+        .as_deref()
+        .map(|list| list.split(',').map(str::trim).collect::<Vec<_>>());
     let gguf = std::env::var_os("GOLDEN_GGUF").map(|path| Gguf::open(Path::new(&path)));
-    let ctx = Ctx { device, backend, gguf, weights: Default::default() };
+    let ctx = Ctx {
+        device,
+        backend,
+        gguf,
+        weights: Default::default(),
+    };
     // A harness built from a snapshot of the tree may check the live sources.
     let kernels = std::env::var_os("GOLDEN_KERNELS")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernels"));
     // `GOLDEN_SOURCES` names the declaration files to load (so another
     // family's in-progress declarations cannot block a run); default: all.
-    let sources = match std::env::var("GOLDEN_SOURCES").ok().filter(|list| !list.is_empty()) {
-        Some(list) => list.split(',').map(|name| kernels.join(name.trim())).collect::<Vec<_>>(),
+    let sources = match std::env::var("GOLDEN_SOURCES")
+        .ok()
+        .filter(|list| !list.is_empty())
+    {
+        Some(list) => list
+            .split(',')
+            .map(|name| kernels.join(name.trim()))
+            .collect::<Vec<_>>(),
         None => vec![kernels],
     };
-    let checked = seismic_lang::source::load(&sources, seismic_std::sources()).unwrap().module;
+    let checked = seismic_lang::source::load(&sources, seismic_std::sources())
+        .unwrap()
+        .module;
     let module = Module::load(&sources, true).unwrap();
-    let mut report = Report { compared: 0, mismatches: Vec::new(), nondeterministic: Vec::new() };
+    let mut report = Report {
+        compared: 0,
+        mismatches: Vec::new(),
+        nondeterministic: Vec::new(),
+    };
     for spec in ENTRIES {
-        let selected = families.iter().any(|family| *family == "all" || *family == spec.family || (*family == "library" && spec.library))
-            && entries.as_ref().is_none_or(|list| list.contains(&spec.id));
+        let selected = families.iter().any(|family| {
+            *family == "all" || *family == spec.family || (*family == "library" && spec.library)
+        }) && entries.as_ref().is_none_or(|list| list.contains(&spec.id));
         if selected {
             run_entry(&ctx, &checked, &module, spec, mode, &dir, &mut report);
         }
@@ -2139,7 +3144,15 @@ fn golden() {
         for line in &report.mismatches {
             println!("MISMATCH {line}");
         }
-        println!("compared {} keys, {} mismatches", report.compared, report.mismatches.len());
-        assert!(report.mismatches.is_empty(), "{} golden mismatches", report.mismatches.len());
+        println!(
+            "compared {} keys, {} mismatches",
+            report.compared,
+            report.mismatches.len()
+        );
+        assert!(
+            report.mismatches.is_empty(),
+            "{} golden mismatches",
+            report.mismatches.len()
+        );
     }
 }

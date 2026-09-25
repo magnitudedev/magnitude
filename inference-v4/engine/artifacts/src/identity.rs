@@ -1,9 +1,22 @@
 use serde::Serialize;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Content identity of one immutable artifact component.
+static NEXT_COMPONENT: AtomicU64 = AtomicU64::new(1);
+
+/// Process-local identity of one opened artifact component.
+///
+/// This value does not attest file contents and must not key persistent caches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ArtifactIdentity(pub [u8; 32]);
+
+impl ArtifactIdentity {
+    pub(crate) fn for_open() -> Self {
+        let mut value = [0; 32];
+        value[..8].copy_from_slice(&NEXT_COMPONENT.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+        Self(value)
+    }
+}
 
 impl fmt::Display for ArtifactIdentity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -20,10 +33,10 @@ impl Serialize for ArtifactIdentity {
     }
 }
 
-/// Identity of the package admitted by the engine.
+/// Process-local identity of the package admitted by the engine.
 ///
-/// Component boundaries are retained instead of hashing the concatenated bytes,
-/// so diagnostics and cache keys can identify which component changed.
+/// Component boundaries remain distinct so in-process consumers can identify
+/// target and projector resources separately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PackageIdentity {
     pub target: ArtifactIdentity,

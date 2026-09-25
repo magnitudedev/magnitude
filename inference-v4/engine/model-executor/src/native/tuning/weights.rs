@@ -4,8 +4,7 @@
 
 use crate::{
     native::{import::ImportKernels, AttestedImport},
-    ArtifactComponent, ArtifactComponentKind, ModelLoadPlan, Stored,
-    WeightPlan,
+    ArtifactComponent, ArtifactComponentKind, ModelLoadPlan, Stored, WeightPlan,
 };
 use magnitude_artifacts::{gguf::GgufArtifact, Package};
 use magnitude_model_contracts::{WeightKind, WeightRole, WeightScope};
@@ -53,7 +52,11 @@ impl TuningWeightSource for ZeroTuningWeights {
             .source
             .canonical_byte_len(&[logical_count(&weight.shape)?])
             .map_err(|error| error.to_string())?;
-        Ok(vec![0; usize::try_from(bytes).map_err(|_| "weight bytes exceed usize")?])
+        Ok(vec![
+            0;
+            usize::try_from(bytes)
+                .map_err(|_| "weight bytes exceed usize")?
+        ])
     }
 }
 

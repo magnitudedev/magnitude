@@ -2,9 +2,9 @@
 
 use crate::construction::ExecutableIr;
 use crate::kernel::Kernel;
+use crate::physical_target::PhysicalDialect;
 use crate::schedule::{Launch, ParametricSchedule};
 use crate::storage::LaunchLocalLayout;
-use crate::physical_target::PhysicalDialect;
 
 /// Resources derived together from one normalized launch and its exact kernel.
 /// Callers can inspect these facts but cannot assemble or replace them.
@@ -34,8 +34,8 @@ impl LaunchResources {
         policy: crate::physical_target::LocalRealizationPolicy,
         abi: &impl crate::physical_target::KernelAbiModel<T>,
     ) -> Self {
-        use crate::storage::{LaunchLocalKind, LaunchScratchRequirements, ScratchRequirement};
         use crate::physical_target::LocalRealization;
+        use crate::storage::{LaunchLocalKind, LaunchScratchRequirements, ScratchRequirement};
         let layout = crate::storage::derive_launch_local_layout(
             arena,
             kernel.locals(),

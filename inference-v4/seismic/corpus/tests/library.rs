@@ -1,6 +1,8 @@
 //! The standard library and `engine/model-kernels/kernels` entries through the public API
 //! (design A10 §2.8; `engine.invocations` is A9's Tier 0).
-use crate::common::{check_call, corpus_path, device, element_named, policy_name, prepare, Selection};
+use crate::common::{
+    check_call, corpus_path, device, element_named, policy_name, prepare, Selection,
+};
 use seismic::dynamic::Module;
 use seismic::BackendName;
 use seismic_corpus::library::{self, LibraryFile};
@@ -17,21 +19,30 @@ fn engine_module() -> Module {
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&directory)
         .unwrap_or_else(|e| panic!("{}: {e}", directory.display()))
         .map(|entry| entry.expect("engine kernels entry").path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "seismic"))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "seismic")
+        })
         .collect();
     paths.sort();
     Module::load(&paths, true).unwrap_or_else(|e| panic!("engine kernels load: {e}"))
 }
 
 fn names(module: &Module) -> BTreeSet<String> {
-    module.functions().iter().map(|f| f.name().to_owned()).collect()
+    module
+        .functions()
+        .iter()
+        .map(|f| f.name().to_owned())
+        .collect()
 }
 
 #[test]
 fn every_library_entry_has_an_invocation() {
     let std_entries = names(&std_module());
-    let engine_entries: BTreeSet<String> =
-        names(&engine_module()).difference(&std_entries).cloned().collect();
+    let engine_entries: BTreeSet<String> = names(&engine_module())
+        .difference(&std_entries)
+        .cloned()
+        .collect();
     let mut missing = Vec::new();
     for (file, entries) in [
         ("library/std.invocations", &std_entries),
@@ -42,7 +53,11 @@ fn every_library_entry_has_an_invocation() {
             .into_iter()
             .map(|invocation| invocation.entry)
             .collect();
-        missing.extend(entries.difference(&invoked).map(|entry| format!("{file}: {entry}")));
+        missing.extend(
+            entries
+                .difference(&invoked)
+                .map(|entry| format!("{file}: {entry}")),
+        );
     }
     assert!(
         missing.is_empty(),
@@ -73,9 +88,17 @@ fn run_library(module: &Module, file: &str, backend: BackendName) {
             .collect();
         for policy in PolicySet::BOTH.policies() {
             let context = format!("{context} {}", policy_name(&policy));
-            match prepare(&function, &device, elements.clone(), &policy, &Selection::Baseline) {
+            match prepare(
+                &function,
+                &device,
+                elements.clone(),
+                &policy,
+                &Selection::Baseline,
+            ) {
                 Ok((kernel, _)) => {
-                    if let Err(e) = check_call(&kernel, &device, &invocation.arguments, None, &policy) {
+                    if let Err(e) =
+                        check_call(&kernel, &device, &invocation.arguments, None, &policy)
+                    {
                         failures.push(format!("{context}: {e}"));
                     }
                 }
@@ -104,11 +127,19 @@ fn std_entries_metal() {
 
 #[test]
 fn engine_entries_cpu() {
-    run_library(&engine_module(), "library/engine.invocations", BackendName::Cpu);
+    run_library(
+        &engine_module(),
+        "library/engine.invocations",
+        BackendName::Cpu,
+    );
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 fn engine_entries_metal() {
-    run_library(&engine_module(), "library/engine.invocations", BackendName::Metal);
+    run_library(
+        &engine_module(),
+        "library/engine.invocations",
+        BackendName::Metal,
+    );
 }

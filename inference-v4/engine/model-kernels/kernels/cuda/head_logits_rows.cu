@@ -15,10 +15,10 @@ using Epi = projection::Store<element::F32>;
 #define EPILOGUE Epi{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0, 0}
 
 // The GEMV over NB column blocks of 8 rows.
-template <int NB>
+template <int NB, int KSPLIT>
 __device__ __forceinline__ void logits_gemv(const Pro &features, unsigned O, unsigned long long D,
                                             unsigned long long V, const packets::W0 &head, const Epi &epi) {
-    using Shape = projection::GemvShape<8, 1, SEISMIC_TUNE_KSPLIT, NB>;
+    using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
     __shared__ projection::GemvShared<Shape, Pro> shared;
     const unsigned long long group = Shape::tile_group();
     if (group < projection::gemv_groups<Shape>(V))
@@ -37,20 +37,30 @@ __device__ __forceinline__ void logits_gemm(const projection::u8 *features, unsi
                                            nullptr, O, D, blockIdx.x, V, head, projection::NoWeight{}, epi);
 }
 
-extern "C" __global__ void head_logits_rows_gemv(SEISMIC_KERNEL_PARAMS) {
-    logits_gemv<1>(FEATURES, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
+#ifdef SEISMIC_FORMING_HEAD_LOGITS_ROWS_GEMV
+template <unsigned KSPLIT>
+__global__ void head_logits_rows_gemv(SEISMIC_KERNEL_PARAMS) {
+    logits_gemv<1, KSPLIT>(FEATURES, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
 }
+#endif
 
-extern "C" __global__ void head_logits_rows_gemv16(SEISMIC_KERNEL_PARAMS) {
-    logits_gemv<2>(FEATURES, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
+#ifdef SEISMIC_FORMING_HEAD_LOGITS_ROWS_GEMV16
+template <unsigned KSPLIT>
+__global__ void head_logits_rows_gemv16(SEISMIC_KERNEL_PARAMS) {
+    logits_gemv<2, KSPLIT>(FEATURES, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
 }
+#endif
 
+#ifdef SEISMIC_FORMING_HEAD_LOGITS_ROWS_GEMM_SMALL
 extern "C" __global__ void head_logits_rows_gemm_small(SEISMIC_KERNEL_PARAMS) {
     logits_gemm<projection::SmallGemm>(SEISMIC_PTR(SEISMIC_BUFFER_FEATURES), SEISMIC_FEATURES_STRIDE_0,
                                        (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
 }
+#endif
 
+#ifdef SEISMIC_FORMING_HEAD_LOGITS_ROWS_GEMM
 extern "C" __global__ void head_logits_rows_gemm(SEISMIC_KERNEL_PARAMS) {
     logits_gemm<projection::LargeGemm>(SEISMIC_PTR(SEISMIC_BUFFER_FEATURES), SEISMIC_FEATURES_STRIDE_0,
                                        (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
 }
+#endif

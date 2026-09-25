@@ -9,6 +9,7 @@ use std::{cell::RefCell, rc::Rc};
 
 pub struct NativeGraphPool {
     domain: ResourceDomainId,
+    committed_bytes: u64,
     workspace: Rc<RefCell<Vec<NativeGraphFamilySlot>>>,
     output: Rc<RefCell<Vec<NativeGraphFamilyOutputSlot>>>,
 }
@@ -31,6 +32,7 @@ impl NativeGraphPool {
             .map_err(|error| super::AllocationError::Device(error.to_string()))?;
         Ok(Self {
             domain,
+            committed_bytes: charge.committed_bytes,
             workspace: Rc::new(RefCell::new(workspace)),
             output: Rc::new(RefCell::new(output)),
         })
@@ -38,6 +40,12 @@ impl NativeGraphPool {
 
     pub fn domain(&self) -> &ResourceDomainId {
         &self.domain
+    }
+
+    /// Physical arenas owned by this pool, including slots currently lent
+    /// to a submission or a published output view.
+    pub fn committed_bytes(&self) -> u64 {
+        self.committed_bytes
     }
 
     pub fn available_workspace(&self) -> usize {

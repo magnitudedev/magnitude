@@ -10,7 +10,7 @@ mod templates;
 mod tokenizer;
 pub mod wire;
 
-pub use constraints::{CacheLimits, ConstraintState, Vocabulary};
+pub use constraints::{CacheLimits, ConstraintState, PreparedVocabulary, Vocabulary};
 pub use magnitude_generation::{
     DetailedUsage, FinishReason, Options, OutputToken, Sampling, TokenId,
 };

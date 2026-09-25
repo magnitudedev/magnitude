@@ -1,14 +1,19 @@
 use super::super::*;
-use crate::programs::graph::routed::{grouped_blocks, DECODE_ROWS, TILE_ROWS};
 use super::*;
+use crate::programs::graph::routed::{grouped_blocks, DECODE_ROWS, TILE_ROWS};
 
 impl<'a> QualificationView<'a> {
     pub(super) fn qualify_target(&self, device: &Device) -> Result<(), CatalogFailure> {
         let out_rows = semantic_i32(device, &[1], &[0], "target", "out_rows")?;
         let hidden = self.geometry.hidden;
         let hidden_values = vec![1.0_f32; hidden as usize];
-        let hidden_residual =
-            semantic_f32(device, &[1, hidden], &hidden_values, "target", "hidden residual")?;
+        let hidden_residual = semantic_f32(
+            device,
+            &[1, hidden],
+            &hidden_values,
+            "target",
+            "hidden residual",
+        )?;
 
         for binding in [self.plan.target().embedding()] {
             let label = format!("{binding:?}");
@@ -121,10 +126,20 @@ impl<'a> QualificationView<'a> {
                 "target_recurrent",
                 &label,
             )?;
-            let rate =
-                semantic_zeros(device, Element::f32(), &[value_heads], "target_recurrent", &label)?;
-            let time_bias =
-                semantic_zeros(device, Element::f32(), &[value_heads], "target_recurrent", &label)?;
+            let rate = semantic_zeros(
+                device,
+                Element::f32(),
+                &[value_heads],
+                "target_recurrent",
+                &label,
+            )?;
+            let time_bias = semantic_zeros(
+                device,
+                Element::f32(),
+                &[value_heads],
+                "target_recurrent",
+                &label,
+            )?;
             let recurrent_norm = semantic_zeros(
                 device,
                 binding.recurrent_norm,
@@ -247,7 +262,11 @@ impl<'a> QualificationView<'a> {
                 FeedForwardProgramSlot::Dense(binding),
                 AttestedFeedForward::Dense(kernels),
                 magnitude_model_contracts::FeedForwardGeometry::Dense { intermediate },
-            ) = (slot.feed_forward(), &attested.feed_forward, &block.feedforward)
+            ) = (
+                slot.feed_forward(),
+                &attested.feed_forward,
+                &block.feedforward,
+            )
             else {
                 continue;
             };
@@ -360,12 +379,10 @@ impl<'a> QualificationView<'a> {
             require_zero_result(&selected_result, "readout_selected_rows", &label)?;
         }
 
-        for (binding, kernel) in self
-            .plan
-            .target()
-            .features()
-            .zip(self.programs.target.features.as_ref())
-        {
+        if let (Some(binding), Some(kernel)) = (
+            self.plan.target().features(),
+            self.programs.target.features.as_ref(),
+        ) {
             let label = format!("{binding:?}");
             let norm = semantic_ones(device, binding.norm, &[hidden], "target_features", &label)?;
             let result = kernel
@@ -387,7 +404,7 @@ impl<'a> QualificationView<'a> {
 /// statically) with zero weights, so both forms leave the residual unchanged.
 /// The route runs over the full expert range; the projections read expert 0
 /// of one-expert tensors through all-zero routes.
-fn qualify_routed(
+pub(super) fn qualify_routed(
     device: &Device,
     binding: RoutedBinding,
     kernels: &RoutedKernels,

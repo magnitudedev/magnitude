@@ -5,7 +5,7 @@
 #   reference_matrix.sh llama  <gguf> <model-tag> <out-dir> <llama-bin-dir>
 #   reference_matrix.sh v3     <gguf> <model-tag> <out-dir> <v3-python> <v3-source> <backend> <memory-gib> \
 #                              [contexts] [prefill-lengths] [concurrent-sequences]
-#   reference_matrix.sh v4     <gguf> <model-tag> <out-dir> <forward_bench-binary> <storage-gib> \
+#   reference_matrix.sh v4     <gguf> <model-tag> <out-dir> <forward_bench-binary> \
 #                              [contexts] [prefill-lengths] [concurrent-sequences]
 #   reference_matrix.sh probes <out-dir> <probe-dir>
 #
@@ -13,7 +13,7 @@
 #   reference_matrix.sh llama-long <gguf> <model-tag> <out-dir> <llama-bin-dir> <H>
 #   reference_matrix.sh v3-long    <gguf> <model-tag> <out-dir> <v3-python> <v3-source> <backend> \
 #                                  <memory-gib> <H> <dense-bf16|v3-default>
-#   reference_matrix.sh v4-long    <gguf> <model-tag> <out-dir> <forward_bench-binary> <storage-gib> <H>
+#   reference_matrix.sh v4-long    <gguf> <model-tag> <out-dir> <forward_bench-binary> <H>
 #
 # Cells: decode at 256/4k/16k, prefill 32/128/512, concurrent 1/2/4/8 at 4k; the long cells at
 # 64k are assessed periodically, not every run (owner instruction 2026-09-24).
@@ -62,13 +62,13 @@ case $engine in
     ;;
   v4)
     # Optional trailing cell sets as for v3; an empty concurrent set skips that run.
-    G=$1 TAG=$2 OUT=$3 BIN=$4 STORAGE=$5
-    CONTEXTS=${6-256,4096,16384} PREFILL=${7-32,128,512} SEQUENCES=${8-1,2,4,8}
+    G=$1 TAG=$2 OUT=$3 BIN=$4
+    CONTEXTS=${5-256,4096,16384} PREFILL=${6-32,128,512} SEQUENCES=${7-1,2,4,8}
     mkdir -p "$OUT"
-    "$BIN" bench --model "$G" --storage-gib "$STORAGE" --cells decode,prefill \
+    "$BIN" bench --model "$G" --cells decode,prefill \
       --context "$CONTEXTS" --prefill "$PREFILL" --output "$OUT/v4-$host-$TAG.json"
     if [ -n "$SEQUENCES" ]; then
-      "$BIN" bench --model "$G" --storage-gib "$STORAGE" --cells concurrent \
+      "$BIN" bench --model "$G" --cells concurrent \
         --context 4096 --sequences "$SEQUENCES" --output "$OUT/v4-$host-$TAG-concurrent.json"
     fi
     ;;
@@ -95,9 +95,9 @@ case $engine in
       --output "$OUT/v3-$host-$TAG-prefill-$H.json"
     ;;
   v4-long)
-    G=$1 TAG=$2 OUT=$3 BIN=$4 STORAGE=$5 H=$6
+    G=$1 TAG=$2 OUT=$3 BIN=$4 H=$5
     mkdir -p "$OUT"
-    "$BIN" bench --model "$G" --storage-gib "$STORAGE" --cells decode,prefill \
+    "$BIN" bench --model "$G" --cells decode,prefill \
       --context "$H" --prefill 512 --prefill-history "$H" --output "$OUT/v4-$host-$TAG-long-$H.json"
     ;;
   probes)

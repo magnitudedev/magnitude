@@ -1697,7 +1697,10 @@ mod tests {
                 AssignmentStep::Assignment(assignment) => {
                     let selected = assignment.value(decision).unwrap();
                     let mut values = Assignment::new();
-                    values.bind(arena.decision_symbol(decision), SymbolValue::Int(selected.into()));
+                    values.bind(
+                        arena.decision_symbol(decision),
+                        SymbolValue::Int(selected.into()),
+                    );
                     let direct = arena.eval_duration(objective, &values).unwrap().upper();
                     ordered.push((selected, direct));
                 }

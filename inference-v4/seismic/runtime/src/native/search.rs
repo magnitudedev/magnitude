@@ -90,7 +90,10 @@ impl Cost {
                 .enumerate()
                 .map(|(point, key)| {
                     let class = classes[point];
-                    (key, weight[class] * weights[point] * medians[point] / time[class])
+                    (
+                        key,
+                        weight[class] * weights[point] * medians[point] / time[class],
+                    )
                 })
                 .collect(),
         )
@@ -125,7 +128,9 @@ pub fn classes<'n>(names: impl IntoIterator<Item = Option<&'n str>>) -> Vec<usiz
     names
         .into_iter()
         .map(|name| {
-            if let Some(&(_, class)) = name.and_then(|name| named.iter().find(|(known, _)| *known == name)) {
+            if let Some(&(_, class)) =
+                name.and_then(|name| named.iter().find(|(known, _)| *known == name))
+            {
                 return class;
             }
             let class = count;
@@ -183,9 +188,14 @@ impl std::fmt::Display for SearchSpaceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Undeclared(values) => {
-                write!(f, "configuration {values:?} does not match the declared parameters")
+                write!(
+                    f,
+                    "configuration {values:?} does not match the declared parameters"
+                )
             }
-            Self::DefaultInadmissible => f.write_str("the all-defaults configuration is inadmissible"),
+            Self::DefaultInadmissible => {
+                f.write_str("the all-defaults configuration is inadmissible")
+            }
         }
     }
 }
@@ -404,7 +414,11 @@ impl<E: Evaluator> State<'_, E> {
             return;
         }
         let results = self.evaluator.evaluate(&fresh);
-        assert_eq!(results.len(), fresh.len(), "an evaluator answers every configuration");
+        assert_eq!(
+            results.len(),
+            fresh.len(),
+            "an evaluator answers every configuration"
+        );
         for (index, result) in fresh.into_iter().zip(results) {
             self.record(index, result);
         }
@@ -423,7 +437,10 @@ impl<E: Evaluator> State<'_, E> {
         let mut neighbors = Vec::new();
         for (parameter, (_, values)) in space.parameters.iter().enumerate() {
             let step = origin[parameter];
-            let moves = [step.checked_sub(1), (step as usize + 1 < values.len()).then_some(step + 1)];
+            let moves = [
+                step.checked_sub(1),
+                (step as usize + 1 < values.len()).then_some(step + 1),
+            ];
             for target in moves.into_iter().flatten() {
                 let mut coordinates = origin.clone();
                 coordinates[parameter] = target;
@@ -508,7 +525,10 @@ pub fn search(
     if state.evaluator.expired() {
         state.stop = Some(SearchStop::Expired);
         let results = state.evaluator.evaluate(&[default]);
-        let result = results.into_iter().next().expect("an evaluator answers every configuration");
+        let result = results
+            .into_iter()
+            .next()
+            .expect("an evaluator answers every configuration");
         state.record(default, result);
     } else {
         state.evaluate(&starts);
@@ -517,7 +537,9 @@ pub fn search(
     // A budget covering the whole space measures all of it: the walk could
     // converge on a local minimum while budget is left.
     if state.stop.is_none() && state.budget == space.len() {
-        let rest = (0..space.len()).filter(|index| !state.visited(*index)).collect::<Vec<_>>();
+        let rest = (0..space.len())
+            .filter(|index| !state.visited(*index))
+            .collect::<Vec<_>>();
         state.evaluate(&rest);
     }
     if state.stop.is_none() {
@@ -542,7 +564,10 @@ pub fn search(
     }
     let stop = state.stop.unwrap_or(SearchStop::Converged);
     let State {
-        evaluated, costs, evaluator, ..
+        evaluated,
+        costs,
+        evaluator,
+        ..
     } = state;
 
     // Confirm the cheapest measured configurations against the defaults.
@@ -551,12 +576,18 @@ pub fn search(
         .filter(|(index, result)| *index != default && result.is_ok())
         .map(|(index, _)| *index)
         .collect::<Vec<_>>();
-    cheapest.sort_by(|left, right| total(costs[left].as_ref()).total_cmp(&total(costs[right].as_ref())));
+    cheapest.sort_by(|left, right| {
+        total(costs[left].as_ref()).total_cmp(&total(costs[right].as_ref()))
+    });
     cheapest.truncate(settings.confirmed);
     let finalists = std::iter::once(default).chain(cheapest).collect::<Vec<_>>();
     let confirmed = if finalists.len() > 1 {
         let results = evaluator.confirm(&finalists);
-        assert_eq!(results.len(), finalists.len(), "an evaluator confirms every finalist");
+        assert_eq!(
+            results.len(),
+            finalists.len(),
+            "an evaluator confirms every finalist"
+        );
         finalists.iter().copied().zip(results).collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -763,7 +794,13 @@ mod tests {
         fn cost(&self, index: usize) -> Result<Cost, Exclusion> {
             let values = self.space.values(index);
             let cost = values["A"] as f64;
-            Ok(Cost::new(vec![(PointKey { launches: vec![0], values }, cost)]))
+            Ok(Cost::new(vec![(
+                PointKey {
+                    launches: vec![0],
+                    values,
+                },
+                cost,
+            )]))
         }
     }
 
@@ -791,7 +828,13 @@ mod tests {
     #[test]
     fn a_finalist_that_cannot_be_confirmed_leaves_the_ranking() {
         let space = space(&[("A", &[4, 1, 2, 3])]);
-        let trace = search(&space, &[], 10, &settings(), &mut Unconfirmable { space: &space });
+        let trace = search(
+            &space,
+            &[],
+            10,
+            &settings(),
+            &mut Unconfirmable { space: &space },
+        );
         let ranked = trace
             .ranking
             .iter()

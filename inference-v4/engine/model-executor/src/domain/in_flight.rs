@@ -52,7 +52,7 @@ pub struct TargetFlight<S: ProgramSubmission<CompletedWork = crate::CompletedTar
     /// For a claimed lookahead, per slot: the accepted state its successor
     /// advance attaches to at finish, or `None` for a slot nobody claimed
     /// (its rows are discarded). `None` for an ordinary flight.
-    pub(super) continuation: Option<Vec<Option<SequenceState>>>,
+    pub(super) continuation: Option<Vec<Option<InFlightState>>>,
 }
 
 impl<S: ProgramSubmission<CompletedWork = crate::CompletedTargetWork>> TargetFlight<S> {

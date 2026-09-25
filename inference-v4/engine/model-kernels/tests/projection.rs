@@ -6,10 +6,10 @@
 
 use magnitude_model_kernels::{
     attention_output, dense_expand, dense_output, embedding_rows, gated_attention_project,
-    gated_delta_output, gated_delta_project, readout_features_rows, readout_head_rows,
-    readout_selected_rows,
+    gated_delta_output, gated_delta_project, head_logits_rows, readout_features_rows,
+    readout_head_rows, readout_selected_rows,
 };
-use seismic::{Device, Element, NativeSpecialization, Tensor};
+use seismic::{BackendName, Device, Element, NativeSpecialization, Tensor};
 use seismic_lang::{
     checked::{check_source, CheckedModule, SourceFile},
     entry::ElementBindings,
@@ -229,14 +229,30 @@ impl Weight {
         .unwrap()
     }
     fn tensor_rows8(&self, device: &Device) -> Tensor {
-        if self.repr == Repr::Bf16 { return self.tensor(device); }
+        if self.repr == Repr::Bf16 {
+            return self.tensor(device);
+        }
         let shape = [self.rows as u64, self.k as u64];
-        let registry::RepresentationKind::PackedRows(source) = &registry::representation_info(self.repr.storage()).kind else { unreachable!() };
-        let resident = registry::representation_info(registry::storage(self.repr.name(), registry::Layout::Rows8).unwrap());
-        let registry::RepresentationKind::PackedRows(destination) = &resident.kind else { unreachable!() };
+        let registry::RepresentationKind::PackedRows(source) =
+            &registry::representation_info(self.repr.storage()).kind
+        else {
+            unreachable!()
+        };
+        let resident = registry::representation_info(
+            registry::storage(self.repr.name(), registry::Layout::Rows8).unwrap(),
+        );
+        let registry::RepresentationKind::PackedRows(destination) = &resident.kind else {
+            unreachable!()
+        };
         let packets = source.packets(&shape, &self.bytes);
         let bytes = destination.place(&shape, &packets);
-        Tensor::from_host(device, Element::stored(self.repr.name(), registry::Layout::Rows8).unwrap(), &shape, &bytes).unwrap()
+        Tensor::from_host(
+            device,
+            Element::stored(self.repr.name(), registry::Layout::Rows8).unwrap(),
+            &shape,
+            &bytes,
+        )
+        .unwrap()
     }
     fn oracle(&self) -> TensorData {
         match self.repr {
@@ -664,6 +680,154 @@ fn split_specialization_on(
     specialization_on(device, statics, mapping).with_param("SPLIT", mapping.split)
 }
 
+struct ProjectionLaunches {
+    gemv: usize,
+    batch: usize,
+    gemm: usize,
+}
+
+fn scoped_projection_specialization_on(
+    device: &Device,
+    statics: &[(&str, usize)],
+    mapping: Mapping,
+    launches: ProjectionLaunches,
+    split: bool,
+) -> NativeSpecialization {
+    if device.backend() != BackendName::Metal {
+        return if split {
+            split_specialization_on(device, statics, mapping)
+        } else {
+            specialization_on(device, statics, mapping)
+        };
+    }
+    let choice = statics
+        .iter()
+        .fold(NativeSpecialization::new(), |choice, (name, value)| {
+            choice.with_static(*name, *value as u64)
+        })
+        .with_param("BATCH_FROM", mapping.batch_from)
+        .with_launch_param(launches.gemv, "SIMDGROUPS", mapping.simdgroups)
+        .with_launch_param(launches.gemv, "ROWS", mapping.rows)
+        .with_launch_param(launches.gemv, "LANES", mapping.lanes)
+        .with_launch_param(launches.batch, "BATCH_SIMDGROUPS", mapping.batch_simdgroups)
+        .with_launch_param(launches.batch, "BATCH_ROWS", mapping.batch_rows)
+        .with_launch_param(launches.gemm, "TILE_M", mapping.tile_m)
+        .with_launch_param(launches.gemm, "TILE_N", mapping.tile_n);
+    if split {
+        choice.with_param("SPLIT", mapping.split)
+    } else {
+        choice
+    }
+}
+
+fn dense_output_specialization_on(
+    device: &Device,
+    statics: &[(&str, usize)],
+    mapping: Mapping,
+) -> NativeSpecialization {
+    scoped_projection_specialization_on(
+        device,
+        statics,
+        mapping,
+        ProjectionLaunches {
+            gemv: 0,
+            batch: 1,
+            gemm: 4,
+        },
+        true,
+    )
+}
+
+fn gated_delta_output_specialization_on(
+    device: &Device,
+    statics: &[(&str, usize)],
+    mapping: Mapping,
+) -> NativeSpecialization {
+    scoped_projection_specialization_on(
+        device,
+        statics,
+        mapping,
+        ProjectionLaunches {
+            gemv: 1,
+            batch: 2,
+            gemm: 5,
+        },
+        true,
+    )
+}
+
+fn attention_output_specialization_on(
+    device: &Device,
+    statics: &[(&str, usize)],
+    mapping: Mapping,
+) -> NativeSpecialization {
+    scoped_projection_specialization_on(
+        device,
+        statics,
+        mapping,
+        ProjectionLaunches {
+            gemv: 0,
+            batch: 1,
+            gemm: 4,
+        },
+        true,
+    )
+}
+
+fn dense_expand_specialization_on(
+    device: &Device,
+    statics: &[(&str, usize)],
+    mapping: Mapping,
+) -> NativeSpecialization {
+    scoped_projection_specialization_on(
+        device,
+        statics,
+        mapping,
+        ProjectionLaunches {
+            gemv: 1,
+            batch: 2,
+            gemm: 4,
+        },
+        false,
+    )
+}
+
+fn readout_projection_specialization_on(
+    device: &Device,
+    statics: &[(&str, usize)],
+    mapping: Mapping,
+) -> NativeSpecialization {
+    scoped_projection_specialization_on(
+        device,
+        statics,
+        mapping,
+        ProjectionLaunches {
+            gemv: 1,
+            batch: 2,
+            gemm: 3,
+        },
+        false,
+    )
+}
+
+fn head_logits_specialization_on(
+    device: &Device,
+    statics: &[(&str, usize)],
+    mapping: Mapping,
+) -> NativeSpecialization {
+    scoped_projection_specialization_on(
+        device,
+        statics,
+        mapping,
+        ProjectionLaunches {
+            gemv: 0,
+            batch: 1,
+            gemm: 2,
+        },
+        false,
+    )
+}
+
 const ROW_CLASSES: [usize; 9] = [1, 2, 3, 8, 9, 16, 17, 64, 128];
 
 /// The decode and verify rows checked at the pinned Qwen3.5 4B geometry: the
@@ -849,7 +1013,7 @@ fn dense_expand_native(
             UW: up.repr.element(),
             A: act.element(),
         },
-        &specialization_on(device, &[("H", h), ("F", f)], mapping),
+        &dense_expand_specialization_on(device, &[("H", h), ("F", f)], mapping),
     )
     .unwrap();
     let out = kernel
@@ -1004,6 +1168,40 @@ fn dense_expand_matches_the_host_reference_across_row_classes_on(device: &Device
     }
 }
 
+#[test]
+fn metal_dense_expand_scoped_launches_match_the_host() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let act = Act::Bf16;
+    let (h, f) = (256, 128);
+    let gate = weight(Repr::Q4k, f, h, 61, 1.0);
+    let up = weight(Repr::Q4k, f, h, 62, 1.0);
+    let norm = norm_values(h, 63);
+    for rows in [1usize, 8, 32, 128] {
+        let mut rng = Rng::new(rows as u64);
+        let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
+        let out_rows = (0..rows as i32).collect::<Vec<_>>();
+        let (expected, bound) = under(rows, || {
+            dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6)
+        });
+        for mapping in [MAPPINGS[0], MAPPINGS[2]] {
+            let actual = dense_expand_native(
+                &device, act, &gate, &up, &residual, rows, &norm, &out_rows, 1e-6, mapping,
+            );
+            assert_within(
+                &format!("scoped dense_expand rows {rows} {mapping:?}"),
+                &actual,
+                &expected,
+                &bound,
+            );
+        }
+    }
+}
+
 fn dense_output_native(
     device: &Device,
     act: Act,
@@ -1031,7 +1229,7 @@ fn dense_output_native_arithmetic(
     int8: bool,
 ) -> Vec<f32> {
     let (h, f) = (down.rows, down.k);
-    let mut specialization = split_specialization_on(device, &[("H", h), ("F", f)], mapping);
+    let mut specialization = dense_output_specialization_on(device, &[("H", h), ("F", f)], mapping);
     if is_cpu(device) {
         specialization = specialization.with_param("INT8", u64::from(int8));
     }
@@ -1041,7 +1239,9 @@ fn dense_output_native_arithmetic(
             A: act.element(),
             DW: if is_cpu(device) && down.repr != Repr::Bf16 {
                 Element::stored(down.repr.name(), registry::Layout::Rows8).unwrap()
-            } else { down.repr.element() },
+            } else {
+                down.repr.element()
+            },
         },
         &specialization,
     )
@@ -1050,7 +1250,11 @@ fn dense_output_native_arithmetic(
         .call(dense_output::Args {
             residual: &f32_tensor(device, &[rows, h], residual),
             product: &act_tensor(device, act, &[out_rows.len(), f], product),
-            down_weight: &if is_cpu(device) { down.tensor_rows8(device) } else { down.tensor(device) },
+            down_weight: &if is_cpu(device) {
+                down.tensor_rows8(device)
+            } else {
+                down.tensor(device)
+            },
             out_rows: &i32_tensor(device, &[out_rows.len()], out_rows),
         })
         .unwrap()
@@ -1079,7 +1283,10 @@ fn cpu_int8_dense_output_agrees_with_exact_projection() {
         rows,
         &product,
         &out_rows,
-        Mapping { rows: 8, ..MAPPINGS[0] },
+        Mapping {
+            rows: 8,
+            ..MAPPINGS[0]
+        },
         false,
     );
     let int8 = dense_output_native_arithmetic(
@@ -1090,7 +1297,10 @@ fn cpu_int8_dense_output_agrees_with_exact_projection() {
         rows,
         &product,
         &out_rows,
-        Mapping { rows: 8, ..MAPPINGS[0] },
+        Mapping {
+            rows: 8,
+            ..MAPPINGS[0]
+        },
         true,
     );
     let error = exact
@@ -1130,6 +1340,49 @@ fn dense_output_reference(
 fn dense_output_matches_its_portable_body_and_the_host_reference() {
     for device in devices() {
         dense_output_matches_its_portable_body_and_the_host_reference_on(&device);
+    }
+}
+
+#[test]
+fn metal_dense_output_scoped_launches_match_the_host() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let act = Act::Bf16;
+    let (h, f) = (40, 256);
+    let down = weight(Repr::Q4k, h, f, 31, 1.0);
+    for rows in [1usize, 8, 32, 128] {
+        let mut rng = Rng::new(rows as u64);
+        let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
+        let product = (0..rows * f)
+            .map(|_| act.round(rng.symmetric()))
+            .collect::<Vec<_>>();
+        let out_rows = (0..rows as i32).collect::<Vec<_>>();
+        let (expected, bound) = under(rows, || {
+            dense_output_reference(act, &down, &residual, &product, &out_rows)
+        });
+        let splits: &[u64] = if rows == 128 { &[1, 2, 4] } else { &[1] };
+        for &split in splits {
+            let actual = dense_output_native(
+                &device,
+                act,
+                &down,
+                &residual,
+                rows,
+                &product,
+                &out_rows,
+                gemm_mapping(64, 64, split),
+            );
+            assert_within(
+                &format!("scoped dense_output rows {rows} split {split}"),
+                &actual,
+                &expected,
+                &bound,
+            );
+        }
     }
 }
 
@@ -1335,15 +1588,35 @@ fn recurrent_project_matches_its_portable_body_and_the_host_reference() {
     }
 }
 
+#[test]
+fn metal_gated_delta_project_scoped_launches_match_the_host() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    recurrent_project_cases_on(&device, true);
+}
+
 fn recurrent_project_matches_its_portable_body_and_the_host_reference_on(device: &Device) {
+    recurrent_project_cases_on(device, false);
+}
+
+fn recurrent_project_cases_on(device: &Device, scoped: bool) {
     let module = module();
     let act = Act::Bf16;
     // A small geometry over every mapping, then the pinned 4B geometry over
     // the decode and verify rows with the decode mapping.
-    for (h, nk, nv, w, four_b) in [
-        (512usize, 2usize, 4usize, 32usize, false),
-        (2560, 16, 32, 128, true),
-    ] {
+    let geometries = if scoped {
+        vec![(256usize, 1usize, 1usize, 64usize, false)]
+    } else {
+        vec![
+            (512usize, 2usize, 4usize, 32usize, false),
+            (2560, 16, 32, 128, true),
+        ]
+    };
+    for (h, nk, nv, w, four_b) in geometries {
         let rows_of = [(2 * nk + nv) * w, nv * w, nv, nv];
         let total: usize = rows_of.iter().sum();
         let reprs = [Repr::Q5k, Repr::Q4k, Repr::Q8, Repr::Q8];
@@ -1379,10 +1652,16 @@ fn recurrent_project_matches_its_portable_body_and_the_host_reference_on(device:
                     BW: reprs[3].element(),
                     A: act.element(),
                 },
-                &specialization_on(
+                &scoped_projection_specialization_on(
                     device,
                     &[("H", h), ("NK", nk), ("NV", nv), ("W", w)],
                     mapping,
+                    ProjectionLaunches {
+                        gemv: 1,
+                        batch: 2,
+                        gemm: 4,
+                    },
+                    false,
                 ),
             )
             .unwrap();
@@ -1400,8 +1679,12 @@ fn recurrent_project_matches_its_portable_body_and_the_host_reference_on(device:
                 .value;
             read_act(act, &out)
         };
-        let (row_classes, mappings) = checked_classes(four_b);
-        let portable_rows: &[usize] = if four_b { &[] } else { &[3, 17] };
+        let (row_classes, mappings) = if scoped {
+            (vec![1, 8, 32, 128], vec![MAPPINGS[0], MAPPINGS[2]])
+        } else {
+            checked_classes(four_b)
+        };
+        let portable_rows: &[usize] = if four_b || scoped { &[] } else { &[3, 17] };
         for &rows in portable_rows {
             let mut rng = Rng::new(rows as u64 + 3);
             let hidden = (0..rows * h)
@@ -1465,20 +1748,44 @@ fn recurrent_output_matches_its_portable_body_and_the_host_reference() {
     }
 }
 
+#[test]
+fn metal_gated_delta_output_scoped_launches_match_the_host() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    recurrent_output_cases_on(&device, true);
+}
+
 fn recurrent_output_matches_its_portable_body_and_the_host_reference_on(device: &Device) {
+    recurrent_output_cases_on(device, false);
+}
+
+fn recurrent_output_cases_on(device: &Device, scoped: bool) {
     let module = module();
     let act = Act::Bf16;
     // A small geometry over every representation and mapping, then the pinned
     // 4B geometry (q5k) over the decode and verify rows.
-    for (h, nk, nv, w, four_b) in [
-        (300usize, 1usize, 2usize, 128usize, false),
-        (2560, 16, 32, 128, true),
-    ] {
+    let geometries = if scoped {
+        vec![(300usize, 1usize, 2usize, 128usize, false)]
+    } else {
+        vec![
+            (300usize, 1usize, 2usize, 128usize, false),
+            (2560, 16, 32, 128, true),
+        ]
+    };
+    for (h, nk, nv, w, four_b) in geometries {
         let k = nv * w;
         let total = (2 * nk + nv) * w + nv * w + 2 * nv;
         let z0 = (2 * nk + nv) * w;
-        let (row_classes, mappings) = checked_classes(four_b);
-        let reprs: &[Repr] = if four_b {
+        let (row_classes, mappings) = if scoped {
+            (vec![1, 8, 32, 128], vec![MAPPINGS[0], MAPPINGS[2]])
+        } else {
+            checked_classes(four_b)
+        };
+        let reprs: &[Repr] = if four_b || scoped {
             &[Repr::Q5k]
         } else {
             &[Repr::Q5k, Repr::Q6k, Repr::Bf16]
@@ -1544,7 +1851,7 @@ fn recurrent_output_matches_its_portable_body_and_the_host_reference_on(device: 
                         OW: repr.element(),
                         A: act.element(),
                     },
-                    &split_specialization_on(
+                    &gated_delta_output_specialization_on(
                         device,
                         &[("H", h), ("NK", nk), ("NV", nv), ("W", w)],
                         mapping,
@@ -1564,7 +1871,7 @@ fn recurrent_output_matches_its_portable_body_and_the_host_reference_on(device: 
                     .value;
                 read_f32(&out)
             };
-            let portable_rows: &[usize] = if four_b { &[] } else { &[2, 12] };
+            let portable_rows: &[usize] = if four_b || scoped { &[] } else { &[2, 12] };
             for &rows in portable_rows {
                 let (hidden, projection, mixed) = case(rows);
                 let outcome = interpret(
@@ -1615,20 +1922,43 @@ fn recurrent_output_matches_its_portable_body_and_the_host_reference_on(device: 
 #[test]
 fn attention_projections_match_their_portable_bodies_and_the_host_reference() {
     for device in devices() {
-        attention_projections_match_their_portable_bodies_and_the_host_reference_on(&device);
+        attention_projections_match_their_portable_bodies_and_the_host_reference_on(&device, false);
     }
 }
 
-fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(device: &Device) {
+#[test]
+fn metal_attention_scoped_launches_match_the_host() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    attention_projections_match_their_portable_bodies_and_the_host_reference_on(&device, true);
+}
+
+fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
+    device: &Device,
+    scoped: bool,
+) {
     let module = module();
     let act = Act::Bf16;
     // A small geometry over every mapping, then the pinned 4B geometry over
     // the decode and verify rows with the decode mapping.
-    for (d, kv, g, w, four_b) in [
-        (512usize, 2usize, 2usize, 64usize, false),
-        (2560, 4, 4, 256, true),
-    ] {
-        let (row_classes, mappings) = checked_classes(four_b);
+    let geometries = if scoped {
+        vec![(256usize, 1usize, 4usize, 64usize, false)]
+    } else {
+        vec![
+            (512usize, 2usize, 2usize, 64usize, false),
+            (2560, 4, 4, 256, true),
+        ]
+    };
+    for (d, kv, g, w, four_b) in geometries {
+        let (row_classes, mappings) = if scoped {
+            (vec![1, 8, 32, 128], vec![MAPPINGS[0], MAPPINGS[2]])
+        } else {
+            checked_classes(four_b)
+        };
         let rows_of = [kv * g * 2 * w, kv * w, kv * w];
         let reprs = [Repr::Q4k, Repr::Q4k, Repr::Q6k];
         let weights = (0..3)
@@ -1646,7 +1976,17 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(d
                     VW: reprs[2].element(),
                     A: act.element(),
                 },
-                &specialization_on(device, &[("D", d), ("KV", kv), ("G", g), ("W", w)], mapping),
+                &scoped_projection_specialization_on(
+                    device,
+                    &[("D", d), ("KV", kv), ("G", g), ("W", w)],
+                    mapping,
+                    ProjectionLaunches {
+                        gemv: 1,
+                        batch: 2,
+                        gemm: 4,
+                    },
+                    false,
+                ),
             )
             .unwrap();
             let out = kernel
@@ -1686,7 +2026,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(d
             }
             out
         };
-        let portable_rows: &[usize] = if four_b { &[] } else { &[2, 16] };
+        let portable_rows: &[usize] = if four_b || scoped { &[] } else { &[2, 16] };
         for &rows in portable_rows {
             let mut rng = Rng::new(rows as u64 + 5);
             let hidden = (0..rows * d)
@@ -1745,7 +2085,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(d
         }
         // Output projection over Q = KV * G gated heads.
         let q = kv * g;
-        let reprs: &[Repr] = if four_b {
+        let reprs: &[Repr] = if four_b || scoped {
             &[Repr::Q4k]
         } else {
             &[Repr::Q4k, Repr::Q8, Repr::Bf16]
@@ -1760,7 +2100,11 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(d
                         A: act.element(),
                         OW: repr.element(),
                     },
-                    &split_specialization_on(device, &[("D", d_out), ("Q", q), ("W", w)], mapping),
+                    &attention_output_specialization_on(
+                        device,
+                        &[("D", d_out), ("Q", q), ("W", w)],
+                        mapping,
+                    ),
                 )
                 .unwrap();
                 let out = kernel
@@ -1793,7 +2137,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(d
                 let gated = (0..rows * k)
                     .map(|_| act.round(rng.symmetric()))
                     .collect::<Vec<_>>();
-                if !four_b && (rows == 3 || rows == 16) {
+                if !four_b && !scoped && (rows == 3 || rows == 16) {
                     let (_, bound) = under(rows, || reference(&hidden, &gated, rows));
                     let outcome = interpret(
                         &module,
@@ -1830,21 +2174,112 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(d
 #[test]
 fn readout_entries_match_their_portable_bodies_and_the_host_reference() {
     for device in devices() {
-        readout_entries_match_their_portable_bodies_and_the_host_reference_on(&device);
+        readout_entries_match_their_portable_bodies_and_the_host_reference_on(&device, false);
     }
 }
 
-fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(device: &Device) {
+#[test]
+fn metal_readout_scoped_launches_match_the_host() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    readout_entries_match_their_portable_bodies_and_the_host_reference_on(&device, true);
+}
+
+#[test]
+fn metal_head_logits_scoped_launches_match_the_host() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    head_logits_scoped_launches_match_the_host(&device);
+}
+
+fn head_logits_scoped_launches_match_the_host(device: &Device) {
+    let act = Act::Bf16;
+    let (v, d) = (256usize, 256usize);
+    let head = weight(Repr::Q6k, v, d, 81, 1.0);
+    for rows in [1usize, 8, 32, 128] {
+        let mut rng = Rng::new(rows as u64 + 31);
+        let features = (0..rows * d)
+            .map(|_| act.round(rng.symmetric()))
+            .collect::<Vec<_>>();
+        let mut expected = Vec::with_capacity(rows * v);
+        for row in 0..rows {
+            for column in 0..v {
+                expected.push(dot(&features[row * d..(row + 1) * d], head.row(column)));
+            }
+        }
+        let values = expected.iter().map(|(value, _)| *value).collect::<Vec<_>>();
+        let bounds = expected
+            .iter()
+            .map(|(_, magnitude)| reassociation(rows) * magnitude + 1e-7)
+            .collect::<Vec<_>>();
+        for mapping in [MAPPINGS[0], MAPPINGS[2]] {
+            let kernel = head_logits_rows::native_for_device_with(
+                device,
+                head_logits_rows::Elements {
+                    A: act.element(),
+                    OW: Repr::Q6k.element(),
+                },
+                &head_logits_specialization_on(device, &[("V", v), ("D", d)], mapping),
+            )
+            .unwrap();
+            let logits = kernel
+                .call(head_logits_rows::Args {
+                    features: &act_tensor(device, act, &[rows, d], &features),
+                    weight: &head.tensor(device),
+                })
+                .unwrap()
+                .value;
+            assert_within(
+                &format!("head_logits O {rows} {mapping:?}"),
+                &read_f32(&logits),
+                &values,
+                &bounds,
+            );
+        }
+    }
+}
+
+fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
+    device: &Device,
+    scoped: bool,
+) {
     let module = module();
     let act = Act::Bf16;
-    let (v, d) = (1000usize, 512usize);
-    for repr in [Repr::Q6k, Repr::Q4k, Repr::Q8] {
+    let (v, d) = if scoped {
+        (256usize, 256usize)
+    } else {
+        (1000usize, 512usize)
+    };
+    let reprs: &[Repr] = if scoped {
+        &[Repr::Q6k]
+    } else {
+        &[Repr::Q6k, Repr::Q4k, Repr::Q8]
+    };
+    let output_classes: &[usize] = if scoped {
+        &[1, 8, 32, 128]
+    } else {
+        &ROW_CLASSES
+    };
+    let mappings: &[Mapping] = if scoped {
+        &[MAPPINGS[0], MAPPINGS[2]]
+    } else {
+        &MAPPINGS
+    };
+    for &repr in reprs {
         let head = weight(repr, v, d, 80, 1.0);
         let norm = norm_values(d, 8);
         let selected = (0..37)
             .map(|i| ((i * 37 + 11) % v) as i32)
             .collect::<Vec<_>>();
-        for outputs in ROW_CLASSES {
+        for &outputs in output_classes {
             let rows = outputs.max(2) + 1;
             let mut rng = Rng::new(outputs as u64 + 13);
             let hidden = (0..rows * d)
@@ -1906,7 +2341,7 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(device:
                     .map(|(magnitude, rest)| reassociation(outputs) * magnitude + rest)
                     .collect::<Vec<_>>()
             };
-            for mapping in MAPPINGS {
+            for &mapping in mappings {
                 let head_native = readout_head_rows::native_for_device_with(
                     &device,
                     readout_head_rows::Elements {
@@ -1914,7 +2349,7 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(device:
                         OW: repr.element(),
                         A: act.element(),
                     },
-                    &specialization_on(device, &[("V", v), ("D", d)], mapping),
+                    &readout_projection_specialization_on(device, &[("V", v), ("D", d)], mapping),
                 )
                 .unwrap()
                 .call(readout_head_rows::Args {
@@ -1939,7 +2374,7 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(device:
                         OW: repr.element(),
                         A: act.element(),
                     },
-                    &specialization_on(device, &[("V", v), ("D", d)], mapping),
+                    &readout_projection_specialization_on(device, &[("V", v), ("D", d)], mapping),
                 )
                 .unwrap()
                 .call(readout_selected_rows::Args {
@@ -1959,7 +2394,7 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(device:
                     &bounds(&chosen_bound),
                 );
             }
-            if outputs == 2 && repr == Repr::Q6k {
+            if !scoped && outputs == 2 && repr == Repr::Q6k {
                 let bindings = [
                     ("NW", registry::dense(DType::BF16)),
                     ("OW", repr.storage()),
@@ -2213,7 +2648,7 @@ fn timing_on(device: &Device) {
                         A: a,
                         DW: repr.element(),
                     },
-                    &split_specialization_on(device, &[("H", h), ("F", f)], mapping),
+                    &dense_output_specialization_on(device, &[("H", h), ("F", f)], mapping),
                 )
                 .unwrap();
                 let rotation = weights
@@ -2263,7 +2698,7 @@ fn timing_on(device: &Device) {
                         UW: repr.element(),
                         A: a,
                     },
-                    &specialization_on(device, &[("H", h), ("F", f)], mapping),
+                    &dense_expand_specialization_on(device, &[("H", h), ("F", f)], mapping),
                 )
                 .unwrap();
                 let rotation = weights
@@ -2333,10 +2768,16 @@ fn timing_on(device: &Device) {
                         BW: reprs[3].element(),
                         A: a,
                     },
-                    &specialization_on(
+                    &scoped_projection_specialization_on(
                         device,
                         &[("H", h), ("NK", nk), ("NV", nv), ("W", w)],
                         mapping,
+                        ProjectionLaunches {
+                            gemv: 1,
+                            batch: 2,
+                            gemm: 4,
+                        },
+                        false,
                     ),
                 )
                 .unwrap();
@@ -2404,7 +2845,7 @@ fn timing_on(device: &Device) {
                         OW: repr.element(),
                         A: a,
                     },
-                    &split_specialization_on(
+                    &gated_delta_output_specialization_on(
                         device,
                         &[("H", h), ("NK", nk), ("NV", nv), ("W", w)],
                         mapping,
@@ -2484,10 +2925,16 @@ fn timing_on(device: &Device) {
                         VW: reprs[2].element(),
                         A: a,
                     },
-                    &specialization_on(
+                    &scoped_projection_specialization_on(
                         device,
                         &[("D", d), ("KV", kv), ("G", g), ("W", w)],
                         mapping,
+                        ProjectionLaunches {
+                            gemv: 1,
+                            batch: 2,
+                            gemm: 4,
+                        },
+                        false,
                     ),
                 )
                 .unwrap();
@@ -2538,7 +2985,11 @@ fn timing_on(device: &Device) {
                         A: a,
                         OW: repr.element(),
                     },
-                    &split_specialization_on(device, &[("D", d), ("Q", q), ("W", w)], mapping),
+                    &attention_output_specialization_on(
+                        device,
+                        &[("D", d), ("Q", q), ("W", w)],
+                        mapping,
+                    ),
                 )
                 .unwrap();
                 let rotation = weights
@@ -2611,7 +3062,7 @@ fn timing_on(device: &Device) {
                         OW: repr.element(),
                         A: a,
                     },
-                    &specialization_on(device, &[("V", v), ("D", d)], mapping),
+                    &readout_projection_specialization_on(device, &[("V", v), ("D", d)], mapping),
                 )
                 .unwrap();
                 let rotation = vec![readout_head_rows::Args {

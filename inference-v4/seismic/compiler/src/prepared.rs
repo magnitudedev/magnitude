@@ -792,16 +792,20 @@ mod descriptor_tests {
         };
         assert!(internals::valid_tensor_descriptor(&descriptor));
         assert!(!internals::valid_tensor_descriptor(&TensorDescriptor {
-            byte_len: 20, ..descriptor.clone()
+            byte_len: 20,
+            ..descriptor.clone()
         }));
         assert!(!internals::valid_tensor_descriptor(&TensorDescriptor {
-            byte_offset: 2, ..descriptor.clone()
+            byte_offset: 2,
+            ..descriptor.clone()
         }));
         assert!(!internals::valid_tensor_descriptor(&TensorDescriptor {
-            strides: vec![u64::MAX, 2], ..descriptor.clone()
+            strides: vec![u64::MAX, 2],
+            ..descriptor.clone()
         }));
         assert!(!internals::valid_tensor_descriptor(&TensorDescriptor {
-            byte_offset: u64::MAX - 3, ..descriptor
+            byte_offset: u64::MAX - 3,
+            ..descriptor
         }));
     }
 }

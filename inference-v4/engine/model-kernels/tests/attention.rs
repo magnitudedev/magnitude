@@ -61,14 +61,23 @@ fn decode_specializations_on(
     if is_cpu(device) {
         return CPU_PARTS
             .iter()
-            .map(|parts| (format!("Cpu PARTS {parts}"), NativeSpecialization::new().with_param("PARTS", *parts)))
+            .map(|parts| {
+                (
+                    format!("Cpu PARTS {parts}"),
+                    NativeSpecialization::new().with_param("PARTS", *parts),
+                )
+            })
             .collect();
     }
     configs
         .iter()
         .map(|&(span, parts, simds)| {
             (
-                format!("{:?} (SPAN, PARTS, SIMDS) {:?}", device.backend(), (span, parts, simds)),
+                format!(
+                    "{:?} (SPAN, PARTS, SIMDS) {:?}",
+                    device.backend(),
+                    (span, parts, simds)
+                ),
                 statics(geometry)
                     .with_param("SPAN", span)
                     .with_param("PARTS", parts)
@@ -94,10 +103,20 @@ fn prefill_specializations_on(
         .map(|&(query_tile, split_groups)| {
             // Vulkan tiles ROWS = 64 matrix rows (query tile x query heads), the
             // one tile admissible at every tested geometry, whatever QT asks for.
-            let tile = if device.backend() == BackendName::Vulkan { ("ROWS", 64) } else { ("QT", query_tile) };
+            let tile = if device.backend() == BackendName::Vulkan {
+                ("ROWS", 64)
+            } else {
+                ("QT", query_tile)
+            };
             (
-                format!("{:?} (QT, SPLIT_GROUPS) {:?}", device.backend(), (query_tile, split_groups)),
-                statics(geometry).with_param(tile.0, tile.1).with_param("SPLIT_GROUPS", split_groups),
+                format!(
+                    "{:?} (QT, SPLIT_GROUPS) {:?}",
+                    device.backend(),
+                    (query_tile, split_groups)
+                ),
+                statics(geometry)
+                    .with_param(tile.0, tile.1)
+                    .with_param("SPLIT_GROUPS", split_groups),
             )
         })
         .collect()
@@ -184,7 +203,13 @@ fn run_prefill(
 /// Gated outputs agree within bf16 publication plus reduced-precision query
 /// staging; histories agree exactly except for keys, which may differ by one
 /// bf16 step from transcendental rounding.
-fn check(label: &str, case: &Case, gated: &Tensor, bound: &Bound, expected: &(Vec<f32>, Vec<f32>, Vec<f32>)) {
+fn check(
+    label: &str,
+    case: &Case,
+    gated: &Tensor,
+    bound: &Bound,
+    expected: &(Vec<f32>, Vec<f32>, Vec<f32>),
+) {
     let actual = bf16_values(gated);
     assert_eq!(actual.len(), expected.0.len(), "{label}: gated shape");
     let mut worst = 0.0f32;
@@ -206,7 +231,11 @@ fn check(label: &str, case: &Case, gated: &Tensor, bound: &Bound, expected: &(Ve
             "{label}: history_key[{index}] device {a} expected {e}"
         );
     }
-    assert_eq!(bf16_values(&bound.history_value), expected.2, "{label}: history_value");
+    assert_eq!(
+        bf16_values(&bound.history_value),
+        expected.2,
+        "{label}: history_value"
+    );
     eprintln!("{label}: max |gated error| {worst:.2e}");
 }
 
@@ -215,7 +244,7 @@ fn check(label: &str, case: &Case, gated: &Tensor, bound: &Bound, expected: &(Ve
 /// reach.
 fn check_host_model_against_portable_body(entry: &str, case: &Case) {
     use seismic_lang::{
-        checked::{SourceFile, check_source},
+        checked::{check_source, SourceFile},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -244,7 +273,11 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
     let floats = |values: &[f32]| values.iter().map(|x| f64::from(*x)).collect::<Vec<_>>();
     let ints = |values: &[i32]| values.iter().map(|x| f64::from(*x)).collect::<Vec<_>>();
     let args = vec![
-        tensor(DType::BF16, vec![m, kv * g * 2 * w], floats(&case.query_gate)),
+        tensor(
+            DType::BF16,
+            vec![m, kv * g * 2 * w],
+            floats(&case.query_gate),
+        ),
         tensor(DType::BF16, vec![m, kv * w], floats(&case.key)),
         tensor(DType::BF16, vec![m, kv * w], floats(&case.value)),
         tensor(DType::F32, vec![w], floats(&case.query_norm)),
@@ -277,8 +310,14 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
         );
     }
     let inputs = outcome.inputs().collect::<Vec<_>>();
-    for (ordinal, expected, name) in [(11, &expected.1, "history_key"), (12, &expected.2, "history_value")] {
-        let input = inputs.iter().find(|input| input.ordinal() == ordinal).unwrap();
+    for (ordinal, expected, name) in [
+        (11, &expected.1, "history_key"),
+        (12, &expected.2, "history_value"),
+    ] {
+        let input = inputs
+            .iter()
+            .find(|input| input.ordinal() == ordinal)
+            .unwrap();
         let tensor = input.tensor();
         for (index, e) in expected.iter().enumerate() {
             let a = tensor.read(index).unwrap() as f32;
@@ -301,11 +340,19 @@ fn decode_matches_portable_body() {
 
 fn decode_matches_portable_body_on(device: &Device, case: &Case) {
     let expected = case.expected();
-    for (config, specialization) in decode_specializations_on(device, SMALL, &[(64, 32, 8), (32, 16, 4), (256, 8, 8)]) {
+    for (config, specialization) in
+        decode_specializations_on(device, SMALL, &[(64, 32, 8), (32, 16, 4), (256, 8, 8)])
+    {
         let kernel = decode_kernel(device, &specialization);
         let mut bound = Bound::new(device, case);
         let gated = run_decode(&kernel, &mut bound, case);
-        check(&format!("small decode {config}"), case, &gated, &bound, &expected);
+        check(
+            &format!("small decode {config}"),
+            case,
+            &gated,
+            &bound,
+            &expected,
+        );
     }
 }
 
@@ -324,11 +371,19 @@ fn prefill_matches_portable_body() {
 
 fn prefill_matches_portable_body_on(device: &Device, case: &Case) {
     let expected = case.expected();
-    for (config, specialization) in prefill_specializations_on(device, SMALL, &[(16, 1), (8, 1), (16, 256), (8, 256)]) {
+    for (config, specialization) in
+        prefill_specializations_on(device, SMALL, &[(16, 1), (8, 1), (16, 256), (8, 256)])
+    {
         let kernel = prefill_kernel(device, &specialization);
         let mut bound = Bound::new(device, case);
         let gated = run_prefill(&kernel, &mut bound, case);
-        check(&format!("small prefill {config}"), case, &gated, &bound, &expected);
+        check(
+            &format!("small prefill {config}"),
+            case,
+            &gated,
+            &bound,
+            &expected,
+        );
     }
 }
 
@@ -345,7 +400,15 @@ fn decode_timing() {
 }
 
 fn decode_timing_on(device: &Device) {
-    let configs = [(32, 16, 4), (32, 8, 4), (64, 8, 4), (64, 16, 4), (128, 16, 4), (32, 16, 8), (64, 32, 4)];
+    let configs = [
+        (32, 16, 4),
+        (32, 8, 4),
+        (64, 8, 4),
+        (64, 16, 4),
+        (128, 16, 4),
+        (32, 16, 8),
+        (64, 32, 4),
+    ];
     for context in [1usize, 256, 4096, 16384] {
         let rows = [Row {
             spans: vec![(0, context as i32 - 1)],
@@ -404,7 +467,11 @@ fn prefill_timing() {
 
 fn prefill_timing_on(device: &Device) {
     for (rows, history) in [(128usize, 0i32), (128, 4096), (512, 0), (512, 16384)] {
-        let spans = if history > 0 { vec![(0, history)] } else { vec![] };
+        let spans = if history > 0 {
+            vec![(0, history)]
+        } else {
+            vec![]
+        };
         let rows = (0..rows)
             .map(|row| Row {
                 spans: spans.clone(),
@@ -465,15 +532,32 @@ fn qwen_geometry_speculative_decode_matches_host_model() {
 fn qwen_geometry_speculative_decode_matches_host_model_on(device: &Device) {
     for context in [256, 4096, 16384] {
         for rows in [1, 8] {
-            let case = Case::new(QWEN, context as usize + rows, 1, &speculative_rows(rows, context), 13);
+            let case = Case::new(
+                QWEN,
+                context as usize + rows,
+                1,
+                &speculative_rows(rows, context),
+                13,
+            );
             let expected = case.expected();
-            let configs = [(32, 16, 4), (32, 16, 8), (64, 32, 8), (128, 8, 8), (256, 32, 4)];
+            let configs = [
+                (32, 16, 4),
+                (32, 16, 8),
+                (64, 32, 8),
+                (128, 8, 8),
+                (256, 32, 4),
+            ];
             for (config, specialization) in decode_specializations_on(device, QWEN, &configs) {
                 let kernel = decode_kernel(device, &specialization);
                 let mut bound = Bound::new(device, &case);
                 let gated = run_decode(&kernel, &mut bound, &case);
-                check(&format!("speculative decode {rows} rows context {context} {config}"),
-                    &case, &gated, &bound, &expected);
+                check(
+                    &format!("speculative decode {rows} rows context {context} {config}"),
+                    &case,
+                    &gated,
+                    &bound,
+                    &expected,
+                );
             }
         }
     }
@@ -498,7 +582,13 @@ fn qwen_geometry_decode_and_prefill_match_host_model_on(device: &Device) {
             let kernel = decode_kernel(device, &specialization);
             let mut bound = Bound::new(device, &case);
             let gated = run_decode(&kernel, &mut bound, &case);
-            check(&format!("decode context {context} {config}"), &case, &gated, &bound, &expected);
+            check(
+                &format!("decode context {context} {config}"),
+                &case,
+                &gated,
+                &bound,
+                &expected,
+            );
         }
     }
     for (rows, history, configs) in [
@@ -507,13 +597,25 @@ fn qwen_geometry_decode_and_prefill_match_host_model_on(device: &Device) {
         (64, 4096, vec![(16, 256), (8, 512)]),
         (48, 16384, vec![(16, 256), (8, 128)]),
     ] {
-        let case = Case::new(QWEN, history as usize + 256, 2, &prefill_rows(rows, history), 7);
+        let case = Case::new(
+            QWEN,
+            history as usize + 256,
+            2,
+            &prefill_rows(rows, history),
+            7,
+        );
         let expected = case.expected();
         for (config, specialization) in prefill_specializations_on(device, QWEN, &configs) {
             let kernel = prefill_kernel(device, &specialization);
             let mut bound = Bound::new(device, &case);
             let gated = run_prefill(&kernel, &mut bound, &case);
-            check(&format!("prefill {rows} rows after {history} {config}"), &case, &gated, &bound, &expected);
+            check(
+                &format!("prefill {rows} rows after {history} {config}"),
+                &case,
+                &gated,
+                &bound,
+                &expected,
+            );
         }
     }
 }

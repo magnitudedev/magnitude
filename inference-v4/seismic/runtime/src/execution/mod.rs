@@ -24,7 +24,9 @@ type SubmittedExecution<T, E> = <Submission<T, E> as NativeSubmission<T>>::Execu
 /// A result descriptor whose layout and allocation have already been closed
 /// by admission. Decoding cannot consult an executable expression.
 pub(crate) enum AdmittedOutput {
-    PendingTensor { path: Vec<u32> },
+    PendingTensor {
+        path: Vec<u32>,
+    },
     Tensor {
         allocation: Arc<Allocation>,
         byte_offset: u64,
@@ -105,7 +107,10 @@ impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedRun<T, E> {
         }
     }
 
-    pub(crate) fn set_continuation(&mut self, continuation: crate::driver::workflow::native::WorkflowContinuation<T, E>) {
+    pub(crate) fn set_continuation(
+        &mut self,
+        continuation: crate::driver::workflow::native::WorkflowContinuation<T, E>,
+    ) {
         self.continuation = Some(continuation);
     }
 
@@ -128,7 +133,12 @@ impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedRun<T, E> {
         let mut ordinal = 0usize;
         while ordinal < self.nodes.len() {
             let node = &mut self.nodes[ordinal];
-            if let Err(error) = node.command.issue(&mut self.submission, &self.device, &mut self.retained, &self.opened) {
+            if let Err(error) = node.command.issue(
+                &mut self.submission,
+                &self.device,
+                &mut self.retained,
+                &self.opened,
+            ) {
                 match error {
                     ExecutionError::DataCheckFailed(failure) => {
                         termination = SourceTermination::Failed(failure)
@@ -139,9 +149,14 @@ impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedRun<T, E> {
             }
             let published = match node.command.published_tensors(&self.retained) {
                 Ok(published) => published,
-                Err(error) => { issued = Err(error); break; }
+                Err(error) => {
+                    issued = Err(error);
+                    break;
+                }
             };
-            let mut published = published.into_iter().collect::<std::collections::BTreeMap<_, _>>();
+            let mut published = published
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
             for output in &mut node.outputs {
                 if let AdmittedOutput::PendingTensor { path } = output {
                     let Some(value) = published.remove(path) else {
@@ -153,16 +168,30 @@ impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedRun<T, E> {
                     *output = value;
                 }
             }
-            if issued.is_err() { break; }
+            if issued.is_err() {
+                break;
+            }
             if let Some(continuation) = &mut self.continuation {
-                if let Err(error) = self.submission.complete_prefix() { issued = Err(error); break; }
-                if let Err(error) = continuation.completed(ordinal as u32, node, self.opened.identity(), &mut self.retained) {
-                    deferred_error = Some(error); break;
+                if let Err(error) = self.submission.complete_prefix() {
+                    issued = Err(error);
+                    break;
+                }
+                if let Err(error) = continuation.completed(
+                    ordinal as u32,
+                    node,
+                    self.opened.identity(),
+                    &mut self.retained,
+                ) {
+                    deferred_error = Some(error);
+                    break;
                 }
                 match continuation.next(&self.opened, &mut self.retained) {
                     Ok(Some(next)) => self.nodes.push(next),
                     Ok(None) => {}
-                    Err(error) => { deferred_error = Some(error); break; }
+                    Err(error) => {
+                        deferred_error = Some(error);
+                        break;
+                    }
                 }
             }
             ordinal += 1;
@@ -182,7 +211,9 @@ impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedRun<T, E> {
         );
         let completion = finish_issue(completion, issued).map_err(CallError::Execution)?;
         if let Some(error) = deferred_error {
-            completion.complete_and_take().map_err(CallError::Execution)?;
+            completion
+                .complete_and_take()
+                .map_err(CallError::Execution)?;
             return Err(error);
         }
         Ok(SubmittedRun {
@@ -233,8 +264,11 @@ pub(crate) struct CompletedRun<T: TargetFamily, E: NativeExecutor<T>> {
 }
 impl<T: TargetFamily, E: NativeExecutor<T>> CompletedRun<T, E> {
     pub(crate) fn allocated_bytes(&self) -> u64 {
-        self.state.nodes.iter().map(AdmittedNode::allocated_bytes).fold(
-            self.state.retained.reached_allocated(), u64::saturating_add)
+        self.state
+            .nodes
+            .iter()
+            .map(AdmittedNode::allocated_bytes)
+            .fold(self.state.retained.reached_allocated(), u64::saturating_add)
     }
     pub(crate) fn read_tensor(
         &self,

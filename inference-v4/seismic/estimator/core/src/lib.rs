@@ -503,7 +503,9 @@ pub enum ProvenElision {
 /// This does not reject the executable or invent a zero-cost contribution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelLimitation {
-    DeviceExtent { value: seismic_ir::kernel::ops::ErasedValue },
+    DeviceExtent {
+        value: seismic_ir::kernel::ops::ErasedValue,
+    },
     HostQuantityWidth,
 }
 

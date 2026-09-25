@@ -1,6 +1,6 @@
 use magnitude_artifacts::{
     gguf::{self, ByteOrder, Encoding, Scalar, Value},
-    Error, Package,
+    Error, Package, PackageHeaders,
 };
 use std::{
     io::{Cursor, Read, Seek, SeekFrom},
@@ -154,6 +154,23 @@ fn directory_is_bounded_portable_and_preserves_metadata() {
 }
 
 #[test]
+fn header_inspection_accepts_declared_weights_without_payload() {
+    let root = temporary_directory("header-only");
+    let path = root.join("header.gguf");
+    let full = container(false, &[entry()], &[]);
+    let directory =
+        gguf::read_directory(&mut Cursor::new(&full), gguf::DEFAULT_HEADER_LIMIT).unwrap();
+    std::fs::write(&path, &full[..directory.data_offset as usize]).unwrap();
+    let inspected = gguf::inspect_header(&path).unwrap();
+    assert_eq!(inspected.tensors, directory.tensors);
+    let headers = PackageHeaders::open(&path, None).unwrap();
+    assert_eq!(headers.target().tensors, directory.tensors);
+    assert_eq!(headers.identity().projector, None);
+    assert!(gguf::GgufArtifact::open(&path).is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn package_keeps_payloads_generic_and_composes_component_identity() {
     let root = temporary_directory("package");
     let target_path = root.join("model.gguf");
@@ -221,7 +238,7 @@ fn package_keeps_payloads_generic_and_composes_component_identity() {
 }
 
 #[test]
-fn package_manifest_reopens_only_the_admitted_content() {
+fn opened_package_remains_bound_to_admitted_file() {
     let root = temporary_directory("manifest-race");
     let path = root.join("model.gguf");
     let admitted = container(
@@ -234,7 +251,6 @@ fn package_manifest_reopens_only_the_admitted_content() {
     let package = Package::open_without_projector(&path).unwrap();
     let manifest = package.manifest();
     assert!(manifest.target.path.is_absolute());
-    assert_eq!(Package::reopen(&manifest).unwrap().manifest(), manifest);
 
     let replacement = root.join("replacement.gguf");
     std::fs::write(
@@ -248,12 +264,46 @@ fn package_manifest_reopens_only_the_admitted_content() {
     .unwrap();
     std::fs::rename(replacement, &path).unwrap();
 
-    assert!(matches!(
-        Package::reopen(&manifest),
-        Err(Error::Invalid(message)) if message == "package components changed after host admission"
-    ));
+    assert_ne!(
+        Package::open_without_projector(&path).unwrap().identity(),
+        package.identity()
+    );
     // The already-open package still refers to the admitted source and payload.
     assert_eq!(package.manifest(), manifest);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn hardlinked_components_are_rejected() {
+    let root = temporary_directory("hardlinked-components");
+    let target = root.join("model.gguf");
+    let projector = root.join("mmproj-model.gguf");
+    std::fs::write(&target, container(false, &[entry()], &[])).unwrap();
+    std::fs::hard_link(&target, &projector).unwrap();
+    assert!(matches!(
+        Package::open_with_projector(&target, &projector),
+        Err(Error::Invalid(message)) if message.contains("distinct package components")
+    ));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn mapped_window_keeps_open_source_after_path_replacement() {
+    let root = temporary_directory("mapped-window");
+    let path = root.join("source.bin");
+    let original = (0..8193).map(|n| (n % 251) as u8).collect::<Vec<_>>();
+    std::fs::write(&path, &original).unwrap();
+    let source = std::sync::Arc::new(magnitude_artifacts::FileSource::open(&path).unwrap());
+    let window = source.map_window(17, 4097).unwrap();
+    assert_eq!(window.data(), &original[17..4114]);
+    assert_eq!(window.as_ref().as_ref().as_ptr() as usize % 4096, 0);
+    assert!(window.mapped_len() >= window.data_offset() + window.data_len());
+    std::fs::write(root.join("replacement.bin"), b"replacement").unwrap();
+    std::fs::rename(root.join("replacement.bin"), &path).unwrap();
+    drop(source);
+    assert_eq!(window.data(), &original[17..4114]);
     std::fs::remove_dir_all(root).unwrap();
 }
 

@@ -623,7 +623,11 @@ pub fn inspect_components(
     let head = if speculative == 0 {
         None
     } else {
-        let head_intermediate = m.integer("feed_forward_length")?;
+        let head_intermediate = if experts.is_none() {
+            Some(m.integer("feed_forward_length")?)
+        } else {
+            None
+        };
         let mut head_blocks = Vec::with_capacity(speculative as usize);
         for offset in 0..speculative {
             let index = layer_count + offset;
@@ -658,10 +662,49 @@ pub fn inspect_components(
                     )?,
                 },
                 feedforward_norm: weight("post_attention_norm.weight", &[g.hidden])?,
-                feedforward: DenseFeedForwardWeights {
-                    gate: weight("ffn_gate.weight", &[head_intermediate, g.hidden])?,
-                    up: weight("ffn_up.weight", &[head_intermediate, g.hidden])?,
-                    down: weight("ffn_down.weight", &[g.hidden, head_intermediate])?,
+                feedforward_geometry: if let Some(shape) = &experts {
+                    FeedForwardGeometry::Routed(shape.clone())
+                } else {
+                    FeedForwardGeometry::Dense {
+                        intermediate: head_intermediate.unwrap(),
+                    }
+                },
+                feedforward: if let Some(shape) = &experts {
+                    FeedForwardWeights::Routed(Box::new(RoutedFeedForwardWeights {
+                        router: weight("ffn_gate_inp.weight", &[shape.count, g.hidden])?,
+                        shared_router: weight("ffn_gate_inp_shexp.weight", &[g.hidden])?,
+                        expert_gate: weight(
+                            "ffn_gate_exps.weight",
+                            &[shape.count, shape.intermediate, g.hidden],
+                        )?,
+                        expert_up: weight(
+                            "ffn_up_exps.weight",
+                            &[shape.count, shape.intermediate, g.hidden],
+                        )?,
+                        expert_down: weight(
+                            "ffn_down_exps.weight",
+                            &[shape.count, g.hidden, shape.intermediate],
+                        )?,
+                        shared_gate: weight(
+                            "ffn_gate_shexp.weight",
+                            &[shape.shared_intermediate, g.hidden],
+                        )?,
+                        shared_up: weight(
+                            "ffn_up_shexp.weight",
+                            &[shape.shared_intermediate, g.hidden],
+                        )?,
+                        shared_down: weight(
+                            "ffn_down_shexp.weight",
+                            &[g.hidden, shape.shared_intermediate],
+                        )?,
+                    }))
+                } else {
+                    let intermediate = head_intermediate.unwrap();
+                    FeedForwardWeights::Dense(Box::new(DenseFeedForwardWeights {
+                        gate: weight("ffn_gate.weight", &[intermediate, g.hidden])?,
+                        up: weight("ffn_up.weight", &[intermediate, g.hidden])?,
+                        down: weight("ffn_down.weight", &[g.hidden, intermediate])?,
+                    }))
                 },
                 output_norm: weight("nextn.shared_head_norm.weight", &[g.hidden])?,
             });

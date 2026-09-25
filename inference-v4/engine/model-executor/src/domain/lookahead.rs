@@ -134,11 +134,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let mut sources = (0..flight.requests.len()).map(|_| None).collect::<Vec<_>>();
         // `claim_slots` found every claimed request's accepted state.
         for (operation, slot) in operations.iter().zip(slots) {
-            sources[slot] = self.target.remove(&operation.request());
+            sources[slot] = self
+                .target
+                .remove(&operation.request())
+                .map(InFlightState::new);
         }
         flight.continuation = Some(sources);
         if self.trace_lookahead {
-            eprintln!("lookahead claimed flight={} slots={}", flight.id, operations.len());
+            eprintln!(
+                "lookahead claimed flight={} slots={}",
+                flight.id,
+                operations.len()
+            );
         }
         Ok(flight)
     }
@@ -246,7 +253,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let mut slots = Vec::with_capacity(predicted.len());
         for (operation, advance) in predicted.iter().zip(&advances) {
-            let (slot, slices) = self.target_slot(operation, advance).map_err(DomainError::Input)?;
+            let (slot, slices) = self
+                .target_slot(operation, advance)
+                .map_err(DomainError::Input)?;
             if !slices.is_empty() {
                 return Ok(());
             }
@@ -260,7 +269,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         )
         .map_err(|error| DomainError::Input(error.to_string()))?;
         let rows = batch.class().rows() as u64;
-        if selected.tensor().extents().first().is_none_or(|extent| *extent < rows) {
+        if selected
+            .tensor()
+            .extents()
+            .first()
+            .is_none_or(|extent| *extent < rows)
+        {
             return Ok(());
         }
         let tokens = selected
@@ -274,7 +288,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             || readout.available_output() == 0
         {
             if self.trace_lookahead {
-                eprintln!("lookahead skipped after={}: no free launch leases", flight.id);
+                eprintln!(
+                    "lookahead skipped after={}: no free launch leases",
+                    flight.id
+                );
             }
             return Ok(());
         }
@@ -328,7 +345,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .collect();
         let id = self.flight_id();
         if self.trace_lookahead {
-            eprintln!("lookahead queued flight={id} after={} slots={count}", flight.id);
+            eprintln!(
+                "lookahead queued flight={id} after={} slots={count}",
+                flight.id
+            );
         }
         self.lookahead = Some(Lookahead {
             flight: TargetFlight {

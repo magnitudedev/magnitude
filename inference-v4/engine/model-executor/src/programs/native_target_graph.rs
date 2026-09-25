@@ -3,28 +3,33 @@
 //! edge and intermediate allocation.
 
 use crate::{
-    ModelLoadPlan, ResidentBlockWeights, ResidentFeedForwardWeights, ResidentMixerWeights,
-    ResidentTarget, ResidentWeight, ResourceLimits, StateResourcePlan,
-    native::{
-        AttestedFeedForward, AttestedMixer, AttestedTarget, AttestedTargetBlock,
+    native::{AttestedFeedForward, AttestedMixer, AttestedTarget, AttestedTargetBlock},
+    programs::graph::attention::{
+        attention, AttentionBlock, AttentionWeights, CheckedAttentionEntries,
     },
-    programs::graph::attention::{AttentionBlock, AttentionWeights, attention},
-    programs::graph::dense::dense,
+    programs::graph::dense::{dense, CheckedDenseEntries},
+    programs::graph::draft::GraphDraft,
     programs::graph::recurrent::{
-        RECURRENT_COMPONENTS, RecurrentBlock, RecurrentControlPorts, RecurrentStatePorts, recurrent,
+        recurrent, CheckedRecurrentEntries, RecurrentBlock, RecurrentControlPorts,
+        RecurrentStatePorts, RECURRENT_COMPONENTS,
     },
-    programs::native_constants::{ConstantTensors, GraphConstant},
+    programs::native_constants::{
+        distinct_storage_bytes, CheckedGraphFamilyResources, CheckedGraphResources,
+        ConstantTensors, GraphConstant,
+    },
+    FeedForwardProgramSlot, MixerProgramSlot, ModelLoadPlan, ResidentBlockWeights,
+    ResidentMixerWeights, ResidentTarget, ResidentWeight, ResourceLimits, StateResourcePlan,
+    TargetBlockProgramSlot, TargetProgramPlan,
 };
 use magnitude_model_batching::MAX_CLASS_SEGMENTS;
 use magnitude_model_contracts::{
     DecoderGeometry, FeedForwardGeometry, MixerGeometry, RecurrentHeadMapping, WeightKind,
     WeightRole, WeightScope,
 };
-use magnitude_model_kernels::{
-    embedding_rows, };
+use magnitude_model_kernels::embedding_rows;
 use seismic::{
-    BoundNativeGraphPlan, Device, Element, NativeGraph, NativeGraphFamily, NativeGraphPlan,
-    NativePort, WorkflowTensor,
+    BackendName, BoundNativeGraphPlan, Device, Element, NativeGraphFamily, NativeGraphMetadata,
+    NativeGraphPlan, NativeGraphStorageBytes, NativePort, WorkflowTensor,
 };
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -98,6 +103,14 @@ fn block_graph_shapes(
 }
 
 impl PreparedTargetGraphs {
+    pub fn binding_constant_bytes(&self) -> Result<u64, String> {
+        distinct_storage_bytes(
+            self.classes
+                .values()
+                .flat_map(|graphs| graphs.iter().flat_map(|graph| graph.constants.iter())),
+        )
+    }
+
     pub(crate) fn prepare(
         device: &Device,
         handles: &AttestedTarget,
@@ -261,7 +274,11 @@ impl PreparedTargetGraphs {
                         let weight = block_weight(block, role.kind)?;
                         Ok((port, weight.tensor()))
                     })
-                    .chain(constant_tensors.iter().map(|(port, tensor)| Ok((*port, tensor))))
+                    .chain(
+                        constant_tensors
+                            .iter()
+                            .map(|(port, tensor)| Ok((*port, tensor))),
+                    )
                     .collect::<Result<Vec<_>, String>>()?;
                 class_bound.push(graph.plan.bind_static(&fixed).map_err(|error| {
                     format!("target graph static binding class {class:?} block {index}: {error}")
@@ -273,6 +290,7 @@ impl PreparedTargetGraphs {
             prepared: self.clone(),
             entry_bound,
             bound,
+            constants: constants.into_tensors(),
         })
     }
 }
@@ -281,9 +299,18 @@ pub(crate) struct BoundTargetGraphs {
     pub prepared: PreparedTargetGraphs,
     pub entry_bound: BTreeMap<(u64, EntryTokens), BoundNativeGraphPlan>,
     pub bound: BTreeMap<(u64, u64, u64), Vec<BoundNativeGraphPlan>>,
+    constants: Vec<seismic::Tensor>,
 }
 
 impl BoundTargetGraphs {
+    pub(crate) fn constant_bytes(&self) -> Result<u64, &'static str> {
+        self.constants.iter().try_fold(0u64, |bytes, tensor| {
+            bytes
+                .checked_add(tensor.storage_bytes())
+                .ok_or("target graph constant charge overflows")
+        })
+    }
+
     pub(crate) fn entry(
         &self,
         rows: u64,
@@ -350,55 +377,87 @@ impl PreparedTargetEntryGraph {
         rows: u64,
         source: EntryTokens,
     ) -> Result<Self, String> {
-        let mut graph = device.native_graph();
-        let mut weights = Vec::new();
-        let table_tensor = weight(
-            &mut graph,
-            load,
-            WeightScope::Target,
-            WeightKind::Embedding,
-            &mut weights,
+        let weight = embedding_weight(load)?;
+        let (plan, table, tokens, hidden) = entry_graph_topology(
+            device.native_graph(),
+            embedding,
+            weight,
+            geometry,
+            rows,
+            source,
         )?;
-        let table = weights
-            .pop()
-            .ok_or("target embedding weight port is absent")?
-            .1;
-        let tokens = match source {
-            EntryTokens::Uploaded => graph
-                .input_for(
-                    embedding,
-                    "tokens",
-                    &[
-                        ("M", rows),
-                        ("V", geometry.vocabulary),
-                        ("D", geometry.hidden),
-                    ],
-                )
-                .map_err(|error| error.to_string())?,
-            EntryTokens::Selected => graph
-                .port(Element::i32(), &[rows, 2])
-                .map_err(|error| error.to_string())?,
-        };
-        let result = graph
-            .enqueue(
-                embedding,
-                embedding_rows::WorkflowArgs {
-                    table: (&table_tensor).into(),
-                    tokens: tokens.tensor().into(),
-                },
-            )
-            .map_err(|error| error.to_string())?;
-        graph
-            .export(&result.r1)
-            .map_err(|error| error.to_string())?;
-        let plan = graph.seal().map_err(|error| error.to_string())?;
         Ok(Self {
             plan,
             table,
             tokens,
-            hidden: result.r1,
+            hidden,
         })
     }
+}
+
+fn embedding_weight(load: &ModelLoadPlan) -> Result<&crate::WeightPlan, String> {
+    let role = WeightRole {
+        scope: WeightScope::Target,
+        kind: WeightKind::Embedding,
+    };
+    load.weights()
+        .find(|weight| weight.role == role)
+        .ok_or_else(|| "target embedding weight is absent".into())
+}
+
+fn entry_graph_topology<'a, G: GraphDraft + 'a>(
+    mut graph: G,
+    embedding: G::Binding<'a, embedding_rows::Entry>,
+    weight: &crate::WeightPlan,
+    geometry: &DecoderGeometry,
+    rows: u64,
+    source: EntryTokens,
+) -> Result<(G::Plan, NativePort, NativePort, WorkflowTensor), String> {
+    let table = graph.port(weight.resident, &weight.shape)?;
+    let dimensions = [
+        ("M", rows),
+        ("V", geometry.vocabulary),
+        ("D", geometry.hidden),
+    ];
+    let tokens = match source {
+        EntryTokens::Uploaded => graph.input_for(embedding, "tokens", &dimensions)?,
+        EntryTokens::Selected => graph.port(Element::i32(), &[rows, 2])?,
+    };
+    let result = graph.enqueue::<embedding_rows::Entry>(
+        embedding,
+        &dimensions,
+        embedding_rows::WorkflowArgs {
+            table: table.tensor().into(),
+            tokens: tokens.tensor().into(),
+        },
+    )?;
+    graph.export(&result.r1)?;
+    let plan = graph.seal()?;
+    Ok((plan, table, tokens, result.r1))
+}
+
+pub(crate) fn checked_entry_graph_storage(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    geometry: &DecoderGeometry,
+    rows: u64,
+    uploaded: bool,
+) -> Result<NativeGraphStorageBytes, String> {
+    let weight = embedding_weight(load)?;
+    let elements = [("EW", weight.resident), ("A", activation(geometry))];
+    let (storage, _, _, _) = entry_graph_topology(
+        NativeGraphMetadata::new(backend),
+        &elements,
+        weight,
+        geometry,
+        rows,
+        if uploaded {
+            EntryTokens::Uploaded
+        } else {
+            EntryTokens::Selected
+        },
+    )?;
+    Ok(storage)
 }
 
 fn block_weight(block: &ResidentBlockWeights, kind: WeightKind) -> Result<&ResidentWeight, String> {
@@ -465,50 +524,20 @@ fn block_weight(block: &ResidentBlockWeights, kind: WeightKind) -> Result<&Resid
             ResidentMixerWeights::Recurrent(weights) => &weights.output,
             _ => return Err("recurrent weight on attention block".into()),
         },
-        WeightKind::DenseGate => match &block.feedforward {
-            ResidentFeedForwardWeights::Dense(weights) => &weights.gate,
-            _ => return Err("dense weight on routed block".into()),
-        },
-        WeightKind::DenseUp => match &block.feedforward {
-            ResidentFeedForwardWeights::Dense(weights) => &weights.up,
-            _ => return Err("dense weight on routed block".into()),
-        },
-        WeightKind::DenseDown => match &block.feedforward {
-            ResidentFeedForwardWeights::Dense(weights) => &weights.down,
-            _ => return Err("dense weight on routed block".into()),
-        },
-        WeightKind::Router => match &block.feedforward {
-            ResidentFeedForwardWeights::Routed(weights) => &weights.router,
-            _ => return Err("routed weight on dense block".into()),
-        },
-        WeightKind::SharedRouter => match &block.feedforward {
-            ResidentFeedForwardWeights::Routed(weights) => &weights.shared_router,
-            _ => return Err("routed weight on dense block".into()),
-        },
-        WeightKind::ExpertGate => match &block.feedforward {
-            ResidentFeedForwardWeights::Routed(weights) => &weights.expert_gate,
-            _ => return Err("routed weight on dense block".into()),
-        },
-        WeightKind::ExpertUp => match &block.feedforward {
-            ResidentFeedForwardWeights::Routed(weights) => &weights.expert_up,
-            _ => return Err("routed weight on dense block".into()),
-        },
-        WeightKind::ExpertDown => match &block.feedforward {
-            ResidentFeedForwardWeights::Routed(weights) => &weights.expert_down,
-            _ => return Err("routed weight on dense block".into()),
-        },
-        WeightKind::SharedGate => match &block.feedforward {
-            ResidentFeedForwardWeights::Routed(weights) => &weights.shared_gate,
-            _ => return Err("routed weight on dense block".into()),
-        },
-        WeightKind::SharedUp => match &block.feedforward {
-            ResidentFeedForwardWeights::Routed(weights) => &weights.shared_up,
-            _ => return Err("routed weight on dense block".into()),
-        },
-        WeightKind::SharedDown => match &block.feedforward {
-            ResidentFeedForwardWeights::Routed(weights) => &weights.shared_down,
-            _ => return Err("routed weight on dense block".into()),
-        },
+        kind @ (WeightKind::DenseGate
+        | WeightKind::DenseUp
+        | WeightKind::DenseDown
+        | WeightKind::Router
+        | WeightKind::SharedRouter
+        | WeightKind::ExpertGate
+        | WeightKind::ExpertUp
+        | WeightKind::ExpertDown
+        | WeightKind::SharedGate
+        | WeightKind::SharedUp
+        | WeightKind::SharedDown) => block
+            .feedforward
+            .weight(kind)
+            .ok_or_else(|| format!("feed-forward role {kind:?} disagrees with block variant"))?,
         _ => {
             return Err(format!(
                 "weight kind {kind:?} does not belong to a decoder block"
@@ -548,8 +577,8 @@ pub(crate) enum BlockControlPorts {
     Recurrent(RecurrentControlPorts),
 }
 
-pub(crate) fn weight(
-    graph: &mut NativeGraph,
+pub(crate) fn weight<G: GraphDraft>(
+    graph: &mut G,
     load: &ModelLoadPlan,
     scope: WeightScope,
     kind: WeightKind,
@@ -621,12 +650,13 @@ impl PreparedTargetBlockGraph {
                 };
                 let (mixed, state, controls) = attention(
                     &mut graph,
-                    kernels,
+                    kernels.into(),
                     &attention_weights,
                     &mut constants,
                     hidden.tensor(),
                     AttentionBlock {
                         rows,
+                        hidden: geometry.hidden,
                         segments,
                         history_rows,
                         heads: shape.heads,
@@ -651,7 +681,7 @@ impl PreparedTargetBlockGraph {
             (MixerGeometry::Recurrent(shape), AttestedMixer::Recurrent(kernels)) => {
                 let (mixed, state, controls) = recurrent(
                     &mut graph,
-                    kernels,
+                    kernels.into(),
                     state,
                     load,
                     scope,
@@ -659,6 +689,7 @@ impl PreparedTargetBlockGraph {
                     hidden.tensor(),
                     RecurrentBlock {
                         rows,
+                        hidden: geometry.hidden,
                         slots,
                         key_heads: shape.key_heads,
                         value_heads: shape.value_heads,
@@ -680,7 +711,7 @@ impl PreparedTargetBlockGraph {
         let output = match (&block.feedforward, &handle.feed_forward) {
             (FeedForwardGeometry::Dense { .. }, AttestedFeedForward::Dense(kernels)) => dense(
                 &mut graph,
-                kernels,
+                kernels.into(),
                 load,
                 scope,
                 &mut weights,
@@ -692,7 +723,7 @@ impl PreparedTargetBlockGraph {
             (FeedForwardGeometry::Routed(shape), AttestedFeedForward::Routed(kernels)) => {
                 super::graph::routed::routed(
                     &mut graph,
-                    kernels,
+                    kernels.into(),
                     load,
                     scope,
                     &mut weights,
@@ -719,3 +750,190 @@ impl PreparedTargetBlockGraph {
     }
 }
 
+/// Check the production block topology from its planned entry bindings
+/// without forming kernels or allocating device storage. Both routes call the
+/// same attention, recurrent, dense and routed graph constructors.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn checked_block_graph_resources(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    geometry: &DecoderGeometry,
+    state: &StateResourcePlan,
+    slot: TargetBlockProgramSlot,
+    block_index: usize,
+    rows: u64,
+    segments: u64,
+    slots: u64,
+    history_rows: u64,
+) -> Result<(NativeGraphStorageBytes, Vec<GraphConstant>), String> {
+    let block = geometry
+        .blocks
+        .get(block_index)
+        .ok_or("target block geometry is absent")?;
+    let scope = WeightScope::TargetBlock(
+        u32::try_from(block_index).map_err(|_| "target block index exceeds u32")?,
+    );
+    let mut graph = NativeGraphMetadata::new(backend);
+    let mut weights = Vec::new();
+    let mut constants = Vec::new();
+    let hidden = GraphDraft::port(&mut graph, Element::f32(), &[rows, geometry.hidden])?;
+    let component_index = geometry.blocks[..block_index]
+        .iter()
+        .filter(|block| matches!(block.mixer, MixerGeometry::Recurrent(_)))
+        .count()
+        * RECURRENT_COMPONENTS;
+    let mixed = match (&block.mixer, slot.mixer()) {
+        (MixerGeometry::Attention(shape), MixerProgramSlot::Attention(binding)) => {
+            let mut weight = |kind| weight(&mut graph, load, scope, kind, &mut weights);
+            let attention_weights = AttentionWeights {
+                input_norm: weight(WeightKind::InputNorm)?,
+                query_norm: weight(WeightKind::QueryNorm)?,
+                key_norm: weight(WeightKind::KeyNorm)?,
+                query_gate: weight(WeightKind::QueryGate)?,
+                key: weight(WeightKind::Key)?,
+                value: weight(WeightKind::Value)?,
+                output: weight(WeightKind::AttentionOutput)?,
+            };
+            let checked = CheckedAttentionEntries::new(binding);
+            attention(
+                &mut graph,
+                checked.entries()?,
+                &attention_weights,
+                &mut constants,
+                hidden.tensor(),
+                AttentionBlock {
+                    rows,
+                    hidden: geometry.hidden,
+                    segments,
+                    history_rows,
+                    heads: shape.heads,
+                    kv_heads: shape.kv_heads,
+                    width: shape.width,
+                    rotary: &shape.rotary,
+                    epsilon: geometry.epsilon as f32,
+                    activation: activation(geometry),
+                },
+            )?
+            .0
+        }
+        (MixerGeometry::Recurrent(shape), MixerProgramSlot::Recurrent(binding)) => {
+            let checked = CheckedRecurrentEntries::new(binding);
+            recurrent(
+                &mut graph,
+                checked.entries(),
+                state,
+                load,
+                scope,
+                &mut weights,
+                hidden.tensor(),
+                RecurrentBlock {
+                    rows,
+                    hidden: geometry.hidden,
+                    slots,
+                    key_heads: shape.key_heads,
+                    value_heads: shape.value_heads,
+                    width: shape.width,
+                    convolution_width: shape.convolution_width,
+                    grouped: matches!(shape.head_mapping, RecurrentHeadMapping::Grouped),
+                    epsilon: geometry.epsilon as f32,
+                    component_index,
+                },
+            )?
+            .0
+        }
+        _ => return Err("target block geometry and planned mixer disagree".into()),
+    };
+    let output = match (&block.feedforward, slot.feed_forward()) {
+        (FeedForwardGeometry::Dense { .. }, FeedForwardProgramSlot::Dense(binding)) => {
+            let checked = CheckedDenseEntries::new(binding);
+            dense(
+                &mut graph,
+                checked.entries(),
+                load,
+                scope,
+                &mut weights,
+                &mut constants,
+                &mixed,
+                rows,
+                geometry.epsilon as f32,
+            )?
+        }
+        (FeedForwardGeometry::Routed(shape), FeedForwardProgramSlot::Routed(binding)) => {
+            let checked = super::graph::routed::CheckedRoutedEntries::new(binding);
+            super::graph::routed::routed(
+                &mut graph,
+                checked.entries(),
+                load,
+                scope,
+                &mut weights,
+                &mixed,
+                rows,
+                geometry.hidden,
+                shape,
+                geometry.epsilon as f32,
+            )?
+        }
+        _ => return Err("target block geometry and planned feed-forward disagree".into()),
+    };
+    GraphDraft::export(&mut graph, &output)?;
+    Ok((GraphDraft::seal(graph)?, constants))
+}
+
+/// The same decoder class ladder as `PreparedTargetGraphs::prepare`. The
+/// family takes independent maxima because its workspace, output and upload
+/// holdings may peak in different members.
+pub(crate) fn checked_target_family_storage(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    geometry: &DecoderGeometry,
+    state: &StateResourcePlan,
+    plan: &TargetProgramPlan,
+    limits: ResourceLimits,
+) -> Result<CheckedGraphResources, String> {
+    if plan.blocks().len() != geometry.blocks.len() {
+        return Err("planned target block count disagrees with geometry".into());
+    }
+    let max_slots = u64::try_from(limits.in_flight_requests)
+        .map_err(|_| "target request slot bound exceeds u64")?;
+    let history_rows = u64::try_from(state.target_state().history_rows)
+        .map_err(|_| "target history row bound exceeds u64")?;
+    let shapes = block_graph_shapes(load, geometry, state)?;
+    let distinct_blocks = (0..shapes.len())
+        .filter(|&index| !(0..index).any(|earlier| shapes[earlier] == shapes[index]))
+        .collect::<Vec<_>>();
+    let mut family = CheckedGraphFamilyResources::new();
+    for rows in magnitude_model_batching::row_classes(limits.max_batch_rows)
+        .into_iter()
+        .map(|rows| rows as u64)
+    {
+        for uploaded in [true, false] {
+            family.include(
+                checked_entry_graph_storage(backend, load, geometry, rows, uploaded)?,
+                [],
+            );
+        }
+        let mut segments = 1u64;
+        while segments <= MAX_CLASS_SEGMENTS as u64 {
+            for slots in 1..=max_slots {
+                for &index in &distinct_blocks {
+                    let slot = plan.blocks()[index];
+                    let (storage, constants) = checked_block_graph_resources(
+                        backend,
+                        load,
+                        geometry,
+                        state,
+                        slot,
+                        index,
+                        rows,
+                        segments,
+                        slots,
+                        history_rows,
+                    )?;
+                    family.include(storage, constants);
+                }
+            }
+            segments *= 2;
+        }
+    }
+    family.finish()
+}

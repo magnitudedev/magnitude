@@ -8,15 +8,16 @@
 //! gather node precedes any readout entry.
 
 use crate::{
-    DeviceError, InvariantError, ModelLoadPlan, ResidentTarget, ResourceLimits, SubmitError,
-    native::AttestedTarget,
+    native::AttestedTarget, programs::graph::draft::GraphDraft, DeviceError, InvariantError,
+    ModelLoadPlan, ResidentTarget, ResourceLimits, SubmitError,
 };
 use magnitude_model_batching::TargetBatchUpload;
 use magnitude_model_contracts::{DecoderGeometry, WeightKind, WeightRole, WeightScope};
 use magnitude_model_kernels::{readout_features_rows, readout_head_rows, sample_rows, shape_rows};
 use seismic::{
-    BoundNativeGraphPlan, Device, Element, NativeGraphFamily, NativeGraphPlan, NativeKernel,
-    NativePort, WorkflowTensor, WorkflowTensorMut, WorkflowTensorRef,
+    BackendName, BoundNativeGraphPlan, Device, Element, NativeGraphFamily, NativeGraphMetadata,
+    NativeGraphPlan, NativeGraphStorageBytes, NativePort, WorkflowTensor, WorkflowTensorMut,
+    WorkflowTensorRef,
 };
 use std::collections::BTreeMap;
 
@@ -33,7 +34,9 @@ pub(crate) enum ReadoutKind {
     Logits,
     /// Sampling of the leading selected logits rows; `shaped` graphs run
     /// `shape_rows` first, the others sample the logits as projected.
-    Selection { shaped: bool },
+    Selection {
+        shaped: bool,
+    },
 }
 
 /// Whether `shape_rows` changes a row with these shaping parameters
@@ -59,7 +62,6 @@ pub(crate) struct ReadoutClass {
 
 #[derive(Clone)]
 pub(crate) struct PreparedTargetReadoutGraph {
-    pub class: ReadoutClass,
     pub plan: NativeGraphPlan,
     pub hidden: NativePort,
     pub norm: NativePort,
@@ -86,6 +88,57 @@ pub(crate) struct BoundTargetReadoutGraphs {
     bound: BTreeMap<ReadoutClass, BoundNativeGraphPlan>,
 }
 
+fn readout_classes(limits: ResourceLimits) -> Result<Vec<ReadoutClass>, String> {
+    let row_classes = magnitude_model_batching::row_classes(limits.max_batch_rows);
+    if row_classes.is_empty() {
+        return Err(format!(
+            "readout row bound {} has no row class",
+            limits.max_batch_rows
+        ));
+    }
+    // Outputs, projected and selected rows are subsets of a class's rows
+    // and use the same ladder.
+    let ladder = |bound: usize| -> Vec<u64> {
+        magnitude_model_batching::row_classes(bound)
+            .into_iter()
+            .map(|rows| rows as u64)
+            .collect()
+    };
+    let mut classes = Vec::new();
+    for rows in row_classes.into_iter().map(|rows| rows as u64) {
+        for outputs in ladder(rows as usize) {
+            classes.push(ReadoutClass {
+                rows,
+                outputs,
+                projected: 0,
+                selected: 0,
+                kind: ReadoutKind::Features,
+            });
+            for projected in ladder((outputs as usize).min(limits.max_projected_rows)) {
+                classes.push(ReadoutClass {
+                    rows,
+                    outputs,
+                    projected,
+                    selected: 0,
+                    kind: ReadoutKind::Logits,
+                });
+                for selected in ladder(projected as usize) {
+                    for shaped in [false, true] {
+                        classes.push(ReadoutClass {
+                            rows,
+                            outputs,
+                            projected,
+                            selected,
+                            kind: ReadoutKind::Selection { shaped },
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(classes)
+}
+
 impl PreparedTargetReadoutGraphs {
     pub(crate) fn prepare(
         device: &Device,
@@ -94,21 +147,6 @@ impl PreparedTargetReadoutGraphs {
         geometry: &DecoderGeometry,
         limits: ResourceLimits,
     ) -> Result<Self, String> {
-        let row_classes = magnitude_model_batching::row_classes(limits.max_batch_rows);
-        if row_classes.is_empty() {
-            return Err(format!(
-                "readout row bound {} has no row class",
-                limits.max_batch_rows
-            ));
-        }
-        // Outputs, projected and selected rows are subsets of a class's rows
-        // and use the same ladder.
-        let ladder = |bound: usize| -> Vec<u64> {
-            magnitude_model_batching::row_classes(bound)
-                .into_iter()
-                .map(|rows| rows as u64)
-                .collect()
-        };
         let role = |kind| WeightRole {
             scope: WeightScope::Target,
             kind,
@@ -131,36 +169,8 @@ impl PreparedTargetReadoutGraphs {
             classes.insert(class, variant);
             Ok(())
         };
-        for rows in row_classes.iter().map(|&rows| rows as u64) {
-            for outputs in ladder(rows as usize) {
-                add(ReadoutClass {
-                    rows,
-                    outputs,
-                    projected: 0,
-                    selected: 0,
-                    kind: ReadoutKind::Features,
-                })?;
-                for projected in ladder((outputs as usize).min(limits.max_projected_rows)) {
-                    add(ReadoutClass {
-                        rows,
-                        outputs,
-                        projected,
-                        selected: 0,
-                        kind: ReadoutKind::Logits,
-                    })?;
-                    for selected in ladder(projected as usize) {
-                        for shaped in [false, true] {
-                            add(ReadoutClass {
-                                rows,
-                                outputs,
-                                projected,
-                                selected,
-                                kind: ReadoutKind::Selection { shaped },
-                            })?;
-                        }
-                    }
-                }
-            }
+        for class in readout_classes(limits)? {
+            add(class)?;
         }
         let family = NativeGraphFamily::new(&plans).map_err(|error| error.to_string())?;
         Ok(Self {
@@ -258,91 +268,41 @@ impl PreparedTargetReadoutGraph {
         weight_plan: &crate::WeightPlan,
         class: ReadoutClass,
     ) -> Result<Self, String> {
-        let mut graph = device.native_graph();
-        let hidden = graph
-            .port(Element::f32(), &[class.rows, geometry.hidden])
-            .map_err(|error| error.to_string())?;
-        let norm = graph
-            .port(norm_plan.resident, &norm_plan.shape)
-            .map_err(|error| error.to_string())?;
-        let epsilon = geometry.epsilon as f32;
-        let out_rows = graph
-            .input_for(
-                &target.readout.features,
-                "out_rows",
-                &[("M", class.rows), ("O", class.outputs), ("D", geometry.hidden)],
-            )
-            .map_err(error)?;
-        let features = graph
-            .enqueue(
-                &target.readout.features,
-                readout_features_rows::WorkflowArgs {
-                    hidden: hidden.tensor().into(),
-                    norm: norm.tensor().into(),
-                    out_rows: out_rows.tensor().into(),
-                    epsilon,
-                },
-            )
-            .map_err(error)?
-            .value;
-        graph.export(&features).map_err(error)?;
+        let (mut graph, hidden, norm, out_rows, features) = feature_topology(
+            device.native_graph(),
+            &target.readout.features,
+            geometry,
+            norm_plan,
+            class,
+        )?;
         let mut weight = None;
         let mut logit_rows = None;
         let mut logits = None;
         let mut selection = None;
         let mut selected = None;
         if class.kind != ReadoutKind::Features {
-            let projection = graph
-                .port(weight_plan.resident, &weight_plan.shape)
-                .map_err(|error| error.to_string())?;
-            let rows = graph
-                .input_for(
-                    &target.readout.head,
-                    "out_rows",
-                    &[
-                        ("M", class.rows),
-                        ("O", class.projected),
-                        ("V", geometry.vocabulary),
-                        ("D", geometry.hidden),
-                    ],
-                )
-                .map_err(error)?;
-            let projected = graph
-                .enqueue(
-                    &target.readout.head,
-                    readout_head_rows::WorkflowArgs {
-                        hidden: hidden.tensor().into(),
-                        norm: norm.tensor().into(),
-                        weight: projection.tensor().into(),
-                        out_rows: rows.tensor().into(),
-                        epsilon,
-                    },
-                )
-                .map_err(error)?
-                .value;
-            graph.export(&projected).map_err(error)?;
-            if let ReadoutKind::Selection { shaped } = class.kind {
-                let mut sampled = graph
-                    .local_for(
-                        &target.sample,
-                        "result",
-                        &[("M", class.selected), ("V", geometry.vocabulary)],
-                    )
-                    .map_err(error)?;
-                let leading = projected.slice_leading(0, class.selected);
-                let ports = sample(
-                    &mut graph,
+            let (projected_graph, projection, rows, projected) = projected_topology(
+                graph,
+                &target.readout.head,
+                geometry,
+                weight_plan,
+                class,
+                &hidden,
+                &norm,
+            )?;
+            graph = projected_graph;
+            if let ReadoutKind::Selection { .. } = class.kind {
+                let (selection_graph, ports, sampled) = selected_topology(
+                    graph,
                     &target.shape,
                     &target.sample,
-                    geometry.vocabulary,
-                    (&leading).into(),
-                    class.selected,
-                    shaped,
-                    sampled.tensor_mut().into(),
+                    geometry,
+                    class,
+                    &projected,
                 )?;
-                graph.export(sampled.tensor()).map_err(error)?;
+                graph = selection_graph;
                 selection = Some(ports);
-                selected = Some(sampled.tensor().clone());
+                selected = Some(sampled);
             }
             weight = Some(projection);
             logit_rows = Some(rows);
@@ -350,7 +310,6 @@ impl PreparedTargetReadoutGraph {
         }
         let plan = graph.seal().map_err(error)?;
         Ok(Self {
-            class,
             plan,
             hidden,
             norm,
@@ -363,17 +322,280 @@ impl PreparedTargetReadoutGraph {
             selected,
         })
     }
+}
 
+/// The same feature prefix is used by feature-only and projected readout
+/// graphs. The checked route seals this prefix only for the feature class.
+fn feature_topology<'a, G: GraphDraft + 'a>(
+    mut graph: G,
+    entry: G::Binding<'a, readout_features_rows::Entry>,
+    geometry: &DecoderGeometry,
+    norm_plan: &crate::WeightPlan,
+    class: ReadoutClass,
+) -> Result<(G, NativePort, NativePort, NativePort, WorkflowTensor), String> {
+    let hidden = graph.port(Element::f32(), &[class.rows, geometry.hidden])?;
+    let norm = graph.port(norm_plan.resident, &norm_plan.shape)?;
+    let dimensions = [
+        ("M", class.rows),
+        ("O", class.outputs),
+        ("D", geometry.hidden),
+    ];
+    let out_rows = graph.input_for(entry, "out_rows", &dimensions)?;
+    let features = graph
+        .enqueue::<readout_features_rows::Entry>(
+            entry,
+            &dimensions,
+            readout_features_rows::WorkflowArgs {
+                hidden: hidden.tensor().into(),
+                norm: norm.tensor().into(),
+                out_rows: out_rows.tensor().into(),
+                epsilon: geometry.epsilon as f32,
+            },
+        )?
+        .value;
+    graph.export(&features)?;
+    Ok((graph, hidden, norm, out_rows, features))
+}
+
+fn projected_topology<'a, G: GraphDraft + 'a>(
+    mut graph: G,
+    entry: G::Binding<'a, readout_head_rows::Entry>,
+    geometry: &DecoderGeometry,
+    weight_plan: &crate::WeightPlan,
+    class: ReadoutClass,
+    hidden: &NativePort,
+    norm: &NativePort,
+) -> Result<(G, NativePort, NativePort, WorkflowTensor), String> {
+    let weight = graph.port(weight_plan.resident, &weight_plan.shape)?;
+    let dimensions = [
+        ("M", class.rows),
+        ("O", class.projected),
+        ("V", geometry.vocabulary),
+        ("D", geometry.hidden),
+    ];
+    let rows = graph.input_for(entry, "out_rows", &dimensions)?;
+    let logits = graph
+        .enqueue::<readout_head_rows::Entry>(
+            entry,
+            &dimensions,
+            readout_head_rows::WorkflowArgs {
+                hidden: hidden.tensor().into(),
+                norm: norm.tensor().into(),
+                weight: weight.tensor().into(),
+                out_rows: rows.tensor().into(),
+                epsilon: geometry.epsilon as f32,
+            },
+        )?
+        .value;
+    graph.export(&logits)?;
+    Ok((graph, weight, rows, logits))
+}
+
+fn selected_topology<'a, G: GraphDraft + 'a>(
+    mut graph: G,
+    shape: G::Binding<'a, shape_rows::Entry>,
+    sampler: G::Binding<'a, sample_rows::Entry>,
+    geometry: &DecoderGeometry,
+    class: ReadoutClass,
+    logits: &WorkflowTensor,
+) -> Result<(G, SelectionPorts, WorkflowTensor), String> {
+    let ReadoutKind::Selection { shaped } = class.kind else {
+        return Err("selection topology requires a selection class".into());
+    };
+    let mut result = graph.local_for(
+        sampler,
+        "result",
+        &[("M", class.selected), ("V", geometry.vocabulary)],
+    )?;
+    let leading = logits.slice_leading(0, class.selected);
+    let ports = sample(
+        &mut graph,
+        shape,
+        sampler,
+        geometry.vocabulary,
+        (&leading).into(),
+        class.selected,
+        shaped,
+        result.tensor_mut().into(),
+    )?;
+    graph.export(result.tensor())?;
+    Ok((graph, ports, result.tensor().clone()))
+}
+
+fn checked_readout_class_storage(
+    backend: BackendName,
+    geometry: &DecoderGeometry,
+    norm_plan: &crate::WeightPlan,
+    weight_plan: Option<&crate::WeightPlan>,
+    class: ReadoutClass,
+) -> Result<NativeGraphStorageBytes, String> {
+    let activation = match geometry.activation_dtype {
+        magnitude_model_contracts::ActivationDType::F16 => Element::f16(),
+        magnitude_model_contracts::ActivationDType::BF16 => Element::bf16(),
+    };
+    let feature_elements = [("NW", norm_plan.resident), ("A", activation)];
+    let (graph, hidden, norm, _, _) = feature_topology(
+        NativeGraphMetadata::new(backend),
+        &feature_elements,
+        geometry,
+        norm_plan,
+        class,
+    )?;
+    let graph = if class.kind == ReadoutKind::Features {
+        graph
+    } else {
+        let weight_plan = weight_plan.ok_or("projected readout weight is absent")?;
+        let head_elements = [
+            ("NW", norm_plan.resident),
+            ("OW", weight_plan.resident),
+            ("A", activation),
+        ];
+        let (graph, _, _, logits) = projected_topology(
+            graph,
+            &head_elements,
+            geometry,
+            weight_plan,
+            class,
+            &hidden,
+            &norm,
+        )?;
+        if matches!(class.kind, ReadoutKind::Selection { .. }) {
+            let sample_elements: [(&str, Element); 0] = [];
+            let (graph, _, _) = selected_topology(
+                graph,
+                &sample_elements,
+                &sample_elements,
+                geometry,
+                class,
+                &logits,
+            )?;
+            graph
+        } else {
+            graph
+        }
+    };
+    graph.seal().map_err(error)
+}
+
+#[cfg(test)]
+pub(crate) fn checked_projected_graph_storage(
+    backend: BackendName,
+    geometry: &DecoderGeometry,
+    norm_plan: &crate::WeightPlan,
+    weight_plan: &crate::WeightPlan,
+    rows: u64,
+    outputs: u64,
+    projected: u64,
+) -> Result<NativeGraphStorageBytes, String> {
+    checked_readout_class_storage(
+        backend,
+        geometry,
+        norm_plan,
+        Some(weight_plan),
+        ReadoutClass {
+            rows,
+            outputs,
+            projected,
+            selected: 0,
+            kind: ReadoutKind::Logits,
+        },
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn checked_selection_graph_storage(
+    backend: BackendName,
+    geometry: &DecoderGeometry,
+    norm_plan: &crate::WeightPlan,
+    weight_plan: &crate::WeightPlan,
+    rows: u64,
+    outputs: u64,
+    projected: u64,
+    selected: u64,
+    shaped: bool,
+) -> Result<NativeGraphStorageBytes, String> {
+    checked_readout_class_storage(
+        backend,
+        geometry,
+        norm_plan,
+        Some(weight_plan),
+        ReadoutClass {
+            rows,
+            outputs,
+            projected,
+            selected,
+            kind: ReadoutKind::Selection { shaped },
+        },
+    )
+}
+
+pub(crate) fn checked_readout_family_storage(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    geometry: &DecoderGeometry,
+    limits: ResourceLimits,
+) -> Result<NativeGraphStorageBytes, String> {
+    let weight = |kind| {
+        load.weights()
+            .find(|weight| {
+                weight.role
+                    == WeightRole {
+                        scope: WeightScope::Target,
+                        kind,
+                    }
+            })
+            .ok_or_else(|| format!("readout {kind:?} weight is absent"))
+    };
+    let norm = weight(WeightKind::OutputNorm)?;
+    let projection = weight(WeightKind::Output)?;
+    let mut family: Option<NativeGraphStorageBytes> = None;
+    for class in readout_classes(limits)? {
+        let storage =
+            checked_readout_class_storage(backend, geometry, norm, Some(projection), class)?;
+        match &mut family {
+            Some(maximum) => {
+                maximum.workspace = maximum.workspace.max(storage.workspace);
+                maximum.output = maximum.output.max(storage.output);
+                maximum.upload = maximum.upload.max(storage.upload);
+            }
+            None => family = Some(storage),
+        }
+    }
+    family.ok_or_else(|| "readout graph family has no classes".into())
+}
+
+#[cfg(test)]
+pub(crate) fn checked_features_graph_storage(
+    backend: BackendName,
+    geometry: &DecoderGeometry,
+    norm_plan: &crate::WeightPlan,
+    rows: u64,
+    outputs: u64,
+) -> Result<NativeGraphStorageBytes, String> {
+    checked_readout_class_storage(
+        backend,
+        geometry,
+        norm_plan,
+        None,
+        ReadoutClass {
+            rows,
+            outputs,
+            projected: 0,
+            selected: 0,
+            kind: ReadoutKind::Features,
+        },
+    )
 }
 
 /// Sampling of `rows` logits rows into `result`, after `shape_rows` when
 /// `shaped`. The target readout and the draft head select through this one
 /// node sequence and control layout.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn sample(
-    graph: &mut seismic::NativeGraph,
-    shape: &NativeKernel<shape_rows::Entry>,
-    sample: &NativeKernel<sample_rows::Entry>,
+pub(crate) fn sample<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    shape: G::Binding<'a, shape_rows::Entry>,
+    sample: G::Binding<'a, sample_rows::Entry>,
     vocabulary: u64,
     logits: WorkflowTensorRef<'_>,
     rows: u64,
@@ -381,56 +603,51 @@ pub(crate) fn sample(
     result: WorkflowTensorMut<'_>,
 ) -> Result<SelectionPorts, String> {
     let sample_dims = [("M", rows), ("V", vocabulary)];
-    let mask = graph.input_for(sample, "mask", &sample_dims).map_err(error)?;
-    let constrained = graph
-        .input_for(sample, "constrained", &sample_dims)
-        .map_err(error)?;
-    let draws = graph.input_for(sample, "draws", &sample_dims).map_err(error)?;
+    let mask = graph.input_for(sample, "mask", &sample_dims)?;
+    let constrained = graph.input_for(sample, "constrained", &sample_dims)?;
+    let draws = graph.input_for(sample, "draws", &sample_dims)?;
     let shaping = if shaped {
         let shape_dims = [("Sx", rows), ("V", vocabulary), ("Hn", HISTORY_TOKENS)];
-        let parameters = graph.input_for(shape, "params", &shape_dims).map_err(error)?;
-        let history = graph.input_for(shape, "history", &shape_dims).map_err(error)?;
-        let mut out = graph.local_for(shape, "out", &shape_dims).map_err(error)?;
-        graph
-            .enqueue(
-                shape,
-                shape_rows::WorkflowArgs {
-                    logits,
-                    params: parameters.tensor().into(),
-                    history: history.tensor().into(),
-                    out: out.tensor_mut().into(),
-                },
-            )
-            .map_err(error)?;
-        graph
-            .enqueue(
-                sample,
-                sample_rows::WorkflowArgs {
-                    logits: out.tensor().into(),
-                    mask: mask.tensor().into(),
-                    constrained: constrained.tensor().into(),
-                    draws: draws.tensor().into(),
-                    result,
-                },
-            )
-            .map_err(error)?;
+        let parameters = graph.input_for(shape, "params", &shape_dims)?;
+        let history = graph.input_for(shape, "history", &shape_dims)?;
+        let mut out = graph.local_for(shape, "out", &shape_dims)?;
+        graph.enqueue::<shape_rows::Entry>(
+            shape,
+            &shape_dims,
+            shape_rows::WorkflowArgs {
+                logits,
+                params: parameters.tensor().into(),
+                history: history.tensor().into(),
+                out: out.tensor_mut().into(),
+            },
+        )?;
+        graph.enqueue::<sample_rows::Entry>(
+            sample,
+            &sample_dims,
+            sample_rows::WorkflowArgs {
+                logits: out.tensor().into(),
+                mask: mask.tensor().into(),
+                constrained: constrained.tensor().into(),
+                draws: draws.tensor().into(),
+                result,
+            },
+        )?;
         Some(ShapingPorts {
             parameters,
             history,
         })
     } else {
-        graph
-            .enqueue(
-                sample,
-                sample_rows::WorkflowArgs {
-                    logits,
-                    mask: mask.tensor().into(),
-                    constrained: constrained.tensor().into(),
-                    draws: draws.tensor().into(),
-                    result,
-                },
-            )
-            .map_err(error)?;
+        graph.enqueue::<sample_rows::Entry>(
+            sample,
+            &sample_dims,
+            sample_rows::WorkflowArgs {
+                logits,
+                mask: mask.tensor().into(),
+                constrained: constrained.tensor().into(),
+                draws: draws.tensor().into(),
+                result,
+            },
+        )?;
         None
     };
     Ok(SelectionPorts {

@@ -74,7 +74,9 @@ mod tests {
                 Err(error) => panic!("a device meeting the floor opens: {error}"),
             };
             let buffer = device.allocate(1 << 20, 256).expect("allocation");
-            let bytes = (0..1u32 << 18).flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+            let bytes = (0..1u32 << 18)
+                .flat_map(|word| word.to_le_bytes())
+                .collect::<Vec<_>>();
             device.write(&buffer, 0, &bytes).expect("host write");
             let mut back = vec![0u8; bytes.len()];
             device.read(&buffer, 0, &mut back).expect("host read");
@@ -86,7 +88,8 @@ mod tests {
             probe::multiply_add(&device).expect("fma is fused and a*b+c is not contracted");
             // fp32 rounds to nearest even whether RTE 32 is declared or
             // probed at open.
-            probe::rounding(&device).expect("fp32 add, multiply and conversion round to nearest even");
+            probe::rounding(&device)
+                .expect("fp32 add, multiply and conversion round to nearest even");
         }
     }
 
@@ -104,9 +107,18 @@ mod tests {
             version_profile: None,
             messages: glslang::ShaderMessage::DEFAULT,
         };
-        let input = glslang::ShaderInput::new::<(&str, Option<&str>)>(&text, glslang::ShaderStage::Compute, &options, None, None)
-            .expect("input");
-        let compiled = glslang::Shader::new(compiler, input).expect("shader").compile().expect("compile");
+        let input = glslang::ShaderInput::new::<(&str, Option<&str>)>(
+            &text,
+            glslang::ShaderStage::Compute,
+            &options,
+            None,
+            None,
+        )
+        .expect("input");
+        let compiled = glslang::Shader::new(compiler, input)
+            .expect("shader")
+            .compile()
+            .expect("compile");
         let (missing, environment) = seal::unsealed(&compiled).expect("module");
         assert!(missing >= 4 && !environment);
         let declared = seal::Environment {
@@ -117,7 +129,14 @@ mod tests {
         assert_eq!(seal::unsealed(&sealed).expect("module"), (0, true));
         // The probed environment leaves out only `RoundingModeRTE 32`
         // (4 words).
-        let probed = seal::seal(&compiled, seal::Environment { rounding_rte_32: false, ..declared }).expect("seal");
+        let probed = seal::seal(
+            &compiled,
+            seal::Environment {
+                rounding_rte_32: false,
+                ..declared
+            },
+        )
+        .expect("seal");
         assert_eq!(seal::unsealed(&probed).expect("module"), (0, false));
         assert_eq!(probed.len(), sealed.len() - 4);
         formation::validate(&probed).expect("a sealed module validates");

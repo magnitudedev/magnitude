@@ -64,6 +64,9 @@ struct Nvrtc {
     log: unsafe extern "C" fn(Program, *mut c_char) -> NvrtcResult,
     cubin_size: unsafe extern "C" fn(Program, *mut usize) -> NvrtcResult,
     cubin: unsafe extern "C" fn(Program, *mut c_char) -> NvrtcResult,
+    add_name_expression: unsafe extern "C" fn(Program, *const c_char) -> NvrtcResult,
+    get_lowered_name:
+        unsafe extern "C" fn(Program, *const c_char, *mut *const c_char) -> NvrtcResult,
     arch_count: unsafe extern "C" fn(*mut c_int) -> NvrtcResult,
     archs: unsafe extern "C" fn(*mut c_int) -> NvrtcResult,
     /// `(major, minor)` as reported by the loaded library.
@@ -161,6 +164,8 @@ fn load_from(directory: &Path) -> Result<Nvrtc, ToolchainUnavailable> {
         log: symbol!("nvrtcGetProgramLog"),
         cubin_size: symbol!("nvrtcGetCUBINSize"),
         cubin: symbol!("nvrtcGetCUBIN"),
+        add_name_expression: symbol!("nvrtcAddNameExpression"),
+        get_lowered_name: symbol!("nvrtcGetLoweredName"),
         arch_count: symbol!("nvrtcGetNumSupportedArchs"),
         archs: symbol!("nvrtcGetSupportedArchs"),
         release,
@@ -286,6 +291,8 @@ impl std::fmt::Display for Formation {
 pub struct Cubin {
     pub image: Vec<u8>,
     pub formation: Formation,
+    /// Linker symbols in the same order as the requested name expressions.
+    pub lowered_names: Vec<String>,
 }
 
 /// The formation NVRTC of the resolved directory applies for
@@ -319,11 +326,31 @@ pub fn release() -> Result<(u32, u32), NvrtcError> {
 pub fn compile_cubin(source: &str, name: &str, architecture: u32) -> Result<Cubin, NvrtcError> {
     Nvrtc::get()
         .map_err(NvrtcError::Unavailable)?
-        .compile(source, name, architecture)
+        .compile(source, name, architecture, &[])
+}
+
+/// Compile template kernel instances named by C++ expressions. NVRTC gives
+/// their linker symbols back in request order; callers retain those symbols
+/// alongside the image when caching the result.
+pub fn compile_cubin_named(
+    source: &str,
+    name: &str,
+    architecture: u32,
+    expressions: &[&str],
+) -> Result<Cubin, NvrtcError> {
+    Nvrtc::get()
+        .map_err(NvrtcError::Unavailable)?
+        .compile(source, name, architecture, expressions)
 }
 
 impl Nvrtc {
-    fn compile(&self, source: &str, name: &str, architecture: u32) -> Result<Cubin, NvrtcError> {
+    fn compile(
+        &self,
+        source: &str,
+        name: &str,
+        architecture: u32,
+        expressions: &[&str],
+    ) -> Result<Cubin, NvrtcError> {
         let nvrtc = self;
         let supported = nvrtc.supported_architectures()?;
         if !supported.contains(&architecture) {
@@ -359,6 +386,20 @@ impl Nvrtc {
             }
         }
         let owned = Owned(nvrtc, program);
+        let names = expressions
+            .iter()
+            .map(|expression| {
+                CString::new(*expression).map_err(|_| NvrtcError::Compilation {
+                    log: "native kernel name expression contains a NUL byte".into(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for expression in &names {
+            nvrtc.check(
+                unsafe { (nvrtc.add_name_expression)(owned.1, expression.as_ptr()) },
+                "add name expression",
+            )?;
+        }
         let arch = CString::new(format!("-arch=sm_{architecture}")).expect("no NUL");
         let fixed = COMPILE_OPTIONS
             .iter()
@@ -382,6 +423,24 @@ impl Nvrtc {
                 ),
             });
         }
+        let lowered_names = names
+            .iter()
+            .map(|expression| {
+                let mut lowered = std::ptr::null();
+                nvrtc.check(
+                    unsafe { (nvrtc.get_lowered_name)(owned.1, expression.as_ptr(), &mut lowered) },
+                    "get lowered name",
+                )?;
+                if lowered.is_null() {
+                    return Err(NvrtcError::Compilation {
+                        log: "NVRTC returned a null lowered kernel name".into(),
+                    });
+                }
+                Ok(unsafe { CStr::from_ptr(lowered) }
+                    .to_string_lossy()
+                    .into_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut size = 0usize;
         nvrtc.check(
             unsafe { (nvrtc.cubin_size)(owned.1, &mut size) },
@@ -394,6 +453,7 @@ impl Nvrtc {
         )?;
         Ok(Cubin {
             image,
+            lowered_names,
             formation: Formation {
                 release: nvrtc.release,
                 architecture,
@@ -446,9 +506,21 @@ mod tests {
                 "extern \"C\" __global__ void probe(float *out) { out[threadIdx.x] = 1.0f; }",
                 "probe.cu",
                 architecture,
+                &[],
             )
             .expect("probe compiles");
         assert!(!cubin.image.is_empty());
+        let templated = nvrtc
+            .compile(
+                "template<int N> __global__ void probe(float *out) { out[threadIdx.x] = N; }",
+                "probe-template.cu",
+                architecture,
+                &["probe<2>", "probe<4>"],
+            )
+            .expect("named template instances compile");
+        assert_eq!(templated.lowered_names.len(), 2);
+        assert_ne!(templated.lowered_names[0], templated.lowered_names[1]);
+        assert!(templated.lowered_names.iter().all(|name| !name.is_empty()));
         let builtins = builtins_library(nvrtc.release.0, nvrtc.release.1);
         let maps = std::fs::read_to_string("/proc/self/maps").expect("process maps");
         let mapped = maps

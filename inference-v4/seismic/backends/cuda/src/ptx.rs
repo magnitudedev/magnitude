@@ -7,11 +7,11 @@ use crate::profile::CudaFacts;
 use crate::Cuda;
 use seismic_ir::kernel::ops::*;
 use seismic_ir::kernel::{BlockId, Kernel};
-use seismic_ir::storage::LaunchLocalKind;
 use seismic_ir::physical_target::{
     DenseRepresentationGeometry, KernelEmissionLayout, PackedRepresentationGeometry,
     ReadableRepresentationGeometry,
 };
+use seismic_ir::storage::LaunchLocalKind;
 use seismic_lang::intrinsics::{AtomicOp, MathOp, ReduceOp};
 use seismic_lang::registry::{
     CodeInterpretation, DecodeStep, FloatCodeFormat, PlaneEncoding, PlaneInfo, PlaneRepackRecipe,
@@ -3789,9 +3789,17 @@ mod tests {
     }
     #[test]
     fn source_float_cast_recipe_emits_word_operations_not_native_conversions() {
-        use seismic_ir::{construction::Construction, physical_target::{KernelWordLayout, VectorSupport}};
+        use seismic_ir::{
+            construction::Construction,
+            physical_target::{KernelWordLayout, VectorSupport},
+        };
         let facts = facts();
-        for (from, to) in [(DType::F16,DType::F32),(DType::BF16,DType::F32),(DType::F32,DType::F16),(DType::F32,DType::BF16)] {
+        for (from, to) in [
+            (DType::F16, DType::F32),
+            (DType::BF16, DType::F32),
+            (DType::F32, DType::F16),
+            (DType::F32, DType::BF16),
+        ] {
             let mut arena = seismic_lang::expr::ExprArena::new();
             let mut construction = Construction::<Cuda>::new(&mut arena, vec![], false, 0);
             let vectors = VectorSupport::default();
@@ -3802,22 +3810,41 @@ mod tests {
                 DType::F32 => ConstantValue::F32(f32::from_bits(0xff800001)),
                 _ => unreachable!(),
             };
-            let input = builder.constant(constant,ValueType::Scalar(from));
-            builder.cast(input,ValueType::Scalar(to));
+            let input = builder.constant(constant, ValueType::Scalar(from));
+            builder.cast(input, ValueType::Scalar(to));
             builder.close();
             let kernel = &construction.kernels()[0];
             let layout = KernelEmissionLayout {
-                words: KernelWordLayout::for_kernel(kernel), bindings: vec![], locals: vec![],
-                addressable_resources: vec![], scalar_args: vec![], result_types: vec![],
+                words: KernelWordLayout::for_kernel(kernel),
+                bindings: vec![],
+                locals: vec![],
+                addressable_resources: vec![],
+                scalar_args: vec![],
+                result_types: vec![],
             };
-            assert!(kernel.block(kernel.root()).ops.iter().all(|op| !matches!(kernel.closed_op(op,&layout),ClosedOpView::Cast { .. })), "source scalar conversion must expand its recipe");
-            let mut emitter = Emitter::new(&facts,kernel,&layout);
+            assert!(
+                kernel
+                    .block(kernel.root())
+                    .ops
+                    .iter()
+                    .all(|op| !matches!(kernel.closed_op(op, &layout), ClosedOpView::Cast { .. })),
+                "source scalar conversion must expand its recipe"
+            );
+            let mut emitter = Emitter::new(&facts, kernel, &layout);
             emitter.collect(kernel.root());
             emitter.header("source_cast");
             emitter.emit_block(kernel.root());
             assert!(emitter.text.contains("and.b32"));
-            for forbidden in ["cvt.f32.f16","cvt.f32.bf16","cvt.rn.f16.f32","cvt.rn.bf16.f32"] {
-                assert!(!emitter.text.contains(forbidden), "{from:?}->{to:?}: {forbidden}");
+            for forbidden in [
+                "cvt.f32.f16",
+                "cvt.f32.bf16",
+                "cvt.rn.f16.f32",
+                "cvt.rn.bf16.f32",
+            ] {
+                assert!(
+                    !emitter.text.contains(forbidden),
+                    "{from:?}->{to:?}: {forbidden}"
+                );
             }
         }
     }
@@ -3826,8 +3853,10 @@ mod tests {
     fn selected_launch_descriptor_survives_closure_and_normalization() {
         use seismic_ir::{
             construction::{AllocationPlan, Construction},
+            physical_target::{
+                LocalRealization, LocalRealizationPolicy, PhysicalDialect, VectorSupport,
+            },
             schedule::{Launch, LaunchParticipation},
-            physical_target::{LocalRealization, LocalRealizationPolicy, PhysicalDialect, VectorSupport},
         };
         let mut facts = facts();
         facts.cooperative_launch = false;
@@ -3912,9 +3941,10 @@ mod tests {
                 emitter.load_to(&name, value.ty, "%address", dtype);
                 emitter.scalar_arg(value.value, 0, seismic_ir::repr::ScalarKind::Scalar(dtype));
                 emitter.copy_value(*value, value.value);
-                let geometry =
-                    seismic_ir::physical_target::RepresentationGeometry::of(seismic_lang::registry::dense(dtype))
-                        .dense();
+                let geometry = seismic_ir::physical_target::RepresentationGeometry::of(
+                    seismic_lang::registry::dense(dtype),
+                )
+                .dense();
                 emitter.write_address("%address", &geometry, &name);
                 emitter.store_slot(0, seismic_ir::repr::ScalarKind::Scalar(dtype), *value);
             }

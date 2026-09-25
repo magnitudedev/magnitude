@@ -5,7 +5,12 @@
 //! recognizes an artifact and assembles these contracts; common engine crates
 //! consume them without depending on that family.
 
-use magnitude_artifacts::{ImageProcessorConfig, PackageIdentity};
+use magnitude_artifacts::ImageProcessorConfig;
+// The closed input contract carries these generic values across the service
+// boundary; consumers need not depend on artifact preparation itself.
+pub use magnitude_artifacts::{
+    ArtifactIdentity, BoundaryRule, InputLayout, InputSpan, PackageIdentity, TokenId,
+};
 use serde::Serialize;
 use std::{error, fmt};
 
@@ -395,7 +400,8 @@ pub struct HeadBlock {
     pub input_norm: WeightDescriptor,
     pub attention: AttentionWeights,
     pub feedforward_norm: WeightDescriptor,
-    pub feedforward: DenseFeedForwardWeights,
+    pub feedforward_geometry: FeedForwardGeometry,
+    pub feedforward: FeedForwardWeights,
     pub output_norm: WeightDescriptor,
 }
 
@@ -470,29 +476,91 @@ impl HeadWeights {
                 "draft head attention output",
             )?;
 
-            let intermediate = block
-                .feedforward
-                .gate
-                .shape
-                .first()
-                .copied()
-                .filter(|dimension| *dimension > 0)
-                .ok_or_else(|| DefinitionError::new("invalid draft head feed-forward shape"))?;
-            expect_shape(
-                &block.feedforward.gate,
-                &[intermediate, decoder.hidden],
-                "draft head feed-forward gate",
-            )?;
-            expect_shape(
-                &block.feedforward.up,
-                &[intermediate, decoder.hidden],
-                "draft head feed-forward up projection",
-            )?;
-            expect_shape(
-                &block.feedforward.down,
-                &[decoder.hidden, intermediate],
-                "draft head feed-forward down projection",
-            )?;
+            match (&block.feedforward_geometry, &block.feedforward) {
+                (
+                    FeedForwardGeometry::Dense { intermediate },
+                    FeedForwardWeights::Dense(weights),
+                ) => {
+                    if *intermediate == 0 {
+                        return Err(DefinitionError::new(
+                            "invalid draft head feed-forward shape",
+                        ));
+                    }
+                    expect_shape(
+                        &weights.gate,
+                        &[*intermediate, decoder.hidden],
+                        "draft head feed-forward gate",
+                    )?;
+                    expect_shape(
+                        &weights.up,
+                        &[*intermediate, decoder.hidden],
+                        "draft head feed-forward up projection",
+                    )?;
+                    expect_shape(
+                        &weights.down,
+                        &[decoder.hidden, *intermediate],
+                        "draft head feed-forward down projection",
+                    )?;
+                }
+                (FeedForwardGeometry::Routed(shape), FeedForwardWeights::Routed(weights)) => {
+                    if [
+                        shape.count,
+                        shape.selected,
+                        shape.intermediate,
+                        shape.shared_intermediate,
+                    ]
+                    .contains(&0)
+                        || shape.selected > shape.count
+                    {
+                        return Err(DefinitionError::new("invalid draft head expert geometry"));
+                    }
+                    expect_shape(
+                        &weights.router,
+                        &[shape.count, decoder.hidden],
+                        "draft head router",
+                    )?;
+                    expect_shape(
+                        &weights.shared_router,
+                        &[decoder.hidden],
+                        "draft head shared router",
+                    )?;
+                    expect_shape(
+                        &weights.expert_gate,
+                        &[shape.count, shape.intermediate, decoder.hidden],
+                        "draft head expert gate",
+                    )?;
+                    expect_shape(
+                        &weights.expert_up,
+                        &[shape.count, shape.intermediate, decoder.hidden],
+                        "draft head expert up",
+                    )?;
+                    expect_shape(
+                        &weights.expert_down,
+                        &[shape.count, decoder.hidden, shape.intermediate],
+                        "draft head expert down",
+                    )?;
+                    expect_shape(
+                        &weights.shared_gate,
+                        &[shape.shared_intermediate, decoder.hidden],
+                        "draft head shared gate",
+                    )?;
+                    expect_shape(
+                        &weights.shared_up,
+                        &[shape.shared_intermediate, decoder.hidden],
+                        "draft head shared up",
+                    )?;
+                    expect_shape(
+                        &weights.shared_down,
+                        &[decoder.hidden, shape.shared_intermediate],
+                        "draft head shared down",
+                    )?;
+                }
+                _ => {
+                    return Err(DefinitionError::new(
+                        "draft head feed-forward geometry and weights disagree",
+                    ))
+                }
+            }
         }
         Ok(())
     }

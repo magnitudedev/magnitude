@@ -1,8 +1,7 @@
 //! Configuration split by authority and resolution time.
 //!
 //! Package selection is resolved by the host. Model policy is resolved against
-//! a validated family definition. Storage policy is resolved against the
-//! selected device budget. The resulting execution manifest is the only value
+//! a validated family definition. The resulting execution manifest is the only value
 //! transported into the numerical worker.
 
 use magnitude_artifacts::{Package, PackageIdentity, PackageManifest};
@@ -76,41 +75,6 @@ impl Default for ModelPolicy {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StoragePolicy {
-    pub storage_bytes: u64,
-    /// `None` resolves to fifteen percent of storage remaining after reserve.
-    pub retention_bytes: Option<u64>,
-    pub safety_reserve_bytes: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ResolvedStoragePolicy {
-    pub storage_bytes: u64,
-    pub retention_bytes: u64,
-    pub safety_reserve_bytes: u64,
-}
-
-impl StoragePolicy {
-    pub fn resolve(self) -> Result<ResolvedStoragePolicy, String> {
-        if self.storage_bytes == 0 || self.safety_reserve_bytes >= self.storage_bytes {
-            return Err("storage policy requires usable device storage".into());
-        }
-        let usable = self.storage_bytes - self.safety_reserve_bytes;
-        let retention_bytes = self
-            .retention_bytes
-            .unwrap_or_else(|| usable / 100 * 15 + (usable % 100) * 15 / 100);
-        if retention_bytes > usable {
-            return Err("retention budget exceeds usable device storage".into());
-        }
-        Ok(ResolvedStoragePolicy {
-            storage_bytes: self.storage_bytes,
-            retention_bytes,
-            safety_reserve_bytes: self.safety_reserve_bytes,
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResolvedMethod {
     Plain,
     Mtp {
@@ -179,7 +143,6 @@ pub struct ExecutionManifest {
     pub definition: ModelDefinition,
     pub model: ResolvedModelPolicy,
     pub service: ServiceLimits,
-    pub storage: ResolvedStoragePolicy,
     pub path: ExecutionPath,
     pub device: DeviceRequest,
     /// The kernel cache directory the host names; `None` caches nothing.
@@ -190,13 +153,13 @@ pub struct ExecutionManifest {
 /// committed the complete resource plan and qualified execution pack.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResourcePlanSummary {
-    pub storage_bytes: u64,
-    pub retention_budget_bytes: u64,
-    pub allocated_bytes: u64,
+    pub domain_capacity_bytes: u64,
+    /// Planned charges when every selected component is resident, not the
+    /// opened device's current Seismic charge.
+    pub planned_bytes: u64,
     pub immutable_bytes: u64,
     pub state_bytes: u64,
     pub scratch_bytes: u64,
-    pub safety_reserve_bytes: u64,
     pub active_sequences: usize,
     pub in_flight_sequences: usize,
     pub retained_sequences: usize,
@@ -209,9 +172,8 @@ impl ResourcePlanSummary {
         let bytes = plan.bytes();
         let capacity = plan.capacity();
         Ok(Self {
-            storage_bytes: plan.storage_bytes(),
-            retention_budget_bytes: plan.retention_budget_bytes(),
-            allocated_bytes: bytes.total()?,
+            domain_capacity_bytes: plan.domain_capacity_bytes(),
+            planned_bytes: bytes.total()?,
             immutable_bytes: bytes
                 .target_weights
                 .checked_add(bytes.head_weights)
@@ -222,7 +184,6 @@ impl ResourcePlanSummary {
                 .checked_add(bytes.recurrent_banks)
                 .ok_or("state resource summary overflow")?,
             scratch_bytes: bytes.scratch,
-            safety_reserve_bytes: bytes.safety_reserve,
             active_sequences: capacity.active,
             in_flight_sequences: capacity.in_flight,
             retained_sequences: capacity.retained,
@@ -249,7 +210,6 @@ impl ExecutionManifest {
         definition: ModelDefinition,
         model: ResolvedModelPolicy,
         service: ServiceLimits,
-        storage: ResolvedStoragePolicy,
         path: ExecutionPath,
         device: DeviceRequest,
         kernel_cache: Option<PathBuf>,
@@ -264,7 +224,6 @@ impl ExecutionManifest {
             definition,
             model,
             service,
-            storage,
             path,
             device,
             kernel_cache,
@@ -372,7 +331,8 @@ mod tests {
                 input_norm: weight("hin", &[2]),
                 attention: attention(),
                 feedforward_norm: weight("hfn", &[2]),
-                feedforward: dense(),
+                feedforward_geometry: FeedForwardGeometry::Dense { intermediate: 4 },
+                feedforward: FeedForwardWeights::Dense(Box::new(dense())),
                 output_norm: weight("hon", &[2]),
             }],
         });
@@ -431,28 +391,6 @@ mod tests {
         assert!(options.resolve(&definition(true)).is_err());
         options.method = ModelMethod::Plain;
         assert!(options.resolve(&definition(true)).is_err());
-    }
-
-    #[test]
-    fn storage_policy_resolves_independently() {
-        assert_eq!(
-            StoragePolicy {
-                storage_bytes: 1_000,
-                retention_bytes: None,
-                safety_reserve_bytes: 100,
-            }
-            .resolve()
-            .unwrap()
-            .retention_bytes,
-            135
-        );
-        assert!(StoragePolicy {
-            storage_bytes: 100,
-            retention_bytes: Some(91),
-            safety_reserve_bytes: 10,
-        }
-        .resolve()
-        .is_err());
     }
 
     #[test]

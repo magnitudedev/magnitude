@@ -65,8 +65,11 @@ pub(crate) fn canonical(
                     unaddressable(info.name, extents)
                 }
             })?;
-            let (strides, _) = row_major(&units).ok_or_else(|| unaddressable(info.name, extents))?;
-            let byte_len = rows.bytes(extents).ok_or_else(|| unaddressable(info.name, extents))?;
+            let (strides, _) =
+                row_major(&units).ok_or_else(|| unaddressable(info.name, extents))?;
+            let byte_len = rows
+                .bytes(extents)
+                .ok_or_else(|| unaddressable(info.name, extents))?;
             Ok(Layout {
                 strides,
                 byte_len,
@@ -121,11 +124,13 @@ pub(crate) fn transfer_ranges(
     if host_len == 0 {
         return Ok(());
     }
-    seismic_ir::storage::addressed_span_u64(representation, extents, strides).ok_or_else(invalid)?;
+    seismic_ir::storage::addressed_span_u64(representation, extents, strides)
+        .ok_or_else(invalid)?;
     if strides == canonical.strides {
         return transfer(0, 0..host_len);
     }
-    let (units, width) = seismic_ir::storage::concrete_storage_units(representation, extents).ok_or_else(invalid)?;
+    let (units, width) =
+        seismic_ir::storage::concrete_storage_units(representation, extents).ok_or_else(invalid)?;
     let host_width = usize::try_from(width).map_err(|_| invalid())?;
     for linear in 0..canonical.byte_len / width {
         let mut remaining = linear;
@@ -157,7 +162,11 @@ pub(crate) fn validates_view(
     byte_len: u64,
 ) -> bool {
     seismic_ir::storage::valid_concrete_view(
-        representation, extents, strides, byte_offset, byte_len,
+        representation,
+        extents,
+        strides,
+        byte_offset,
+        byte_len,
     )
 }
 
@@ -180,7 +189,13 @@ pub(crate) fn apply_view(
 ) -> Result<ViewGeometry, TensorError> {
     match operation {
         ViewOperation::LeadingSlice { start, end } => {
-            let slice = leading_slice(representation, &source.extents, &source.strides, *start, *end)?;
+            let slice = leading_slice(
+                representation,
+                &source.extents,
+                &source.strides,
+                *start,
+                *end,
+            )?;
             let byte_offset = source
                 .byte_offset
                 .checked_add(slice.relative_offset)
@@ -200,10 +215,14 @@ pub(crate) fn apply_view(
         // A reshape reinterprets contiguous row-major storage; a strided view
         // has no reshape that is still a view of the same elements.
         ViewOperation::Reshape { extents } => {
-            if let RepresentationKind::PackedRows(rows) = &representation_info(representation).kind {
+            if let RepresentationKind::PackedRows(rows) = &representation_info(representation).kind
+            {
                 let geometry = |extents: &[u64]| {
                     let tail = if rows.tile_rows() > 1 { 2 } else { 1 };
-                    extents.len().checked_sub(tail).map(|start| extents[start..].to_vec())
+                    extents
+                        .len()
+                        .checked_sub(tail)
+                        .map(|start| extents[start..].to_vec())
                 };
                 if geometry(extents).is_none() || geometry(extents) != geometry(&source.extents) {
                     return Err(TensorError::RowLayoutReshape {
@@ -258,7 +277,11 @@ fn leading_slice(
             end,
         });
     }
-    assert_eq!(extents.len(), strides.len(), "a tensor view has one stride per axis");
+    assert_eq!(
+        extents.len(),
+        strides.len(),
+        "a tensor view has one stride per axis"
+    );
     let (group, width) = match &info.kind {
         RepresentationKind::Dense(dtype) => (1, u64::from(dtype.bytes())),
         RepresentationKind::Packed(packet) => (packet.group, u64::from(packet.packet_size)),
@@ -420,7 +443,11 @@ mod tests {
         for (start, end) in [(1, 32), (32, 33)] {
             assert_eq!(
                 leading_slice(representation, &[65], &[1], start, end).err(),
-                Some(TensorError::UnalignedPacketSlice { group: 32, start, end })
+                Some(TensorError::UnalignedPacketSlice {
+                    group: 32,
+                    start,
+                    end
+                })
             );
         }
     }
@@ -437,27 +464,42 @@ mod tests {
         let reshaped = apply_view(
             representation,
             geometry(vec![3, 1]),
-            &ViewOperation::Reshape { extents: vec![3, 2] },
+            &ViewOperation::Reshape {
+                extents: vec![3, 2],
+            },
         )
         .unwrap();
-        assert_eq!((reshaped.strides, reshaped.byte_offset, reshaped.byte_len), (vec![2, 1], 8, 24));
+        assert_eq!(
+            (reshaped.strides, reshaped.byte_offset, reshaped.byte_len),
+            (vec![2, 1], 8, 24)
+        );
         assert_eq!(
             apply_view(
                 representation,
                 geometry(vec![1, 2]),
-                &ViewOperation::Reshape { extents: vec![3, 2] },
+                &ViewOperation::Reshape {
+                    extents: vec![3, 2]
+                },
             )
             .err(),
-            Some(TensorError::ReshapeLayout { extents: vec![2, 3], strides: vec![1, 2] })
+            Some(TensorError::ReshapeLayout {
+                extents: vec![2, 3],
+                strides: vec![1, 2]
+            })
         );
         assert_eq!(
             apply_view(
                 representation,
                 geometry(vec![3, 1]),
-                &ViewOperation::Reshape { extents: vec![4, 2] },
+                &ViewOperation::Reshape {
+                    extents: vec![4, 2]
+                },
             )
             .err(),
-            Some(TensorError::ReshapeStorage { current_bytes: 24, requested_bytes: 32 })
+            Some(TensorError::ReshapeStorage {
+                current_bytes: 24,
+                requested_bytes: 32
+            })
         );
         let sliced = apply_view(
             representation,
@@ -465,6 +507,9 @@ mod tests {
             &ViewOperation::LeadingSlice { start: 1, end: 2 },
         )
         .unwrap();
-        assert_eq!((sliced.extents, sliced.byte_offset, sliced.byte_len), (vec![1, 3], 20, 12));
+        assert_eq!(
+            (sliced.extents, sliced.byte_offset, sliced.byte_len),
+            (vec![1, 3], 20, 12)
+        );
     }
 }

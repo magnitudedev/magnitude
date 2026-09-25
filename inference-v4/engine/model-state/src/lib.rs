@@ -4,6 +4,7 @@
 mod advance;
 mod codec;
 mod layout;
+pub mod placement;
 
 pub use advance::{
     CodecConversionStep, OwnedAdvanceBindings, OwnedAdvanceResolution, OwnedCodecAdvance,
@@ -12,12 +13,13 @@ pub use advance::{
 };
 
 pub use codec::{
-    AFFINE_GROUP, Codec, CodecIdentity, CodecSpec, ComponentDescriptor, KvCodec, LayerRef,
-    LayoutError, PlaneDescriptor, PlaneName, VectorKind,
+    Codec, CodecIdentity, CodecSpec, ComponentDescriptor, KvCodec, LayerRef, LayoutError,
+    PlaneDescriptor, PlaneName, VectorKind, AFFINE_GROUP,
 };
 pub use layout::ModelStateLayout;
 
-use seismic::{DType, Device, Element, Tensor};
+use placement::{AllocationId, Generation, LogicalId, PhysicalSlot, Placement};
+use seismic::{DType, Device, Element, Tensor, TensorStorageObserver};
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
@@ -99,7 +101,8 @@ pub struct ComponentSpec {
     pub dtype: DType,
 }
 impl ComponentSpec {
-    fn bytes(&self) -> Result<usize, String> {
+    /// Physical bytes in one component of a recurrent state bank.
+    pub fn bytes(&self) -> Result<usize, String> {
         if self.shape.is_empty() || self.shape.contains(&0) || !self.dtype.is_float() {
             return Err("state components require nonempty floating tensors".into());
         }
@@ -228,11 +231,7 @@ impl Arena {
     /// to grow into in place. Rows only frozen histories (checkpoints)
     /// reference are packed after. Reference counts are unchanged. Returns
     /// the row moves `(from, to, count)`.
-    fn relayout(
-        &mut self,
-        rows: usize,
-        gaps: &BTreeMap<u64, usize>,
-    ) -> Vec<(usize, usize, usize)> {
+    fn relayout(&mut self, rows: usize, gaps: &BTreeMap<u64, usize>) -> Vec<(usize, usize, usize)> {
         let mut order = self
             .entries
             .iter()
@@ -259,10 +258,7 @@ impl Arena {
                             continue;
                         }
                     }
-                    let stop = placed
-                        .range(row..end)
-                        .next()
-                        .map_or(end, |(&from, _)| from);
+                    let stop = placed.range(row..end).next().map_or(end, |(&from, _)| from);
                     placed.insert(row, (stop - row, next));
                     next += stop - row;
                     row = stop;
@@ -386,7 +382,10 @@ impl Arena {
             return;
         }
         let (start, count) = self.free.pop().expect("a released tail is a free hole");
-        debug_assert!(start <= to && start + count == from, "released rows are free");
+        debug_assert!(
+            start <= to && start + count == from,
+            "released rows are free"
+        );
         if start < to {
             self.free.push((start, to - start));
         }
@@ -679,7 +678,10 @@ impl Claims {
 }
 
 /// The first `keep` rows of `ranges` and the remainder.
-fn split_ranges(ranges: &[(usize, usize)], keep: usize) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+fn split_ranges(
+    ranges: &[(usize, usize)],
+    keep: usize,
+) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
     let mut remaining = keep;
     let (mut head, mut tail) = (Vec::new(), Vec::new());
     for &(start, count) in ranges {
@@ -770,21 +772,30 @@ pub const ZERO_SEED_BANK: usize = 0;
 
 struct BankPoolInner {
     capacity: usize,
-    free: RefCell<BTreeSet<usize>>,
+    placement: RefCell<Placement>,
+    next_logical: Cell<u64>,
+    next_allocation: Cell<u64>,
 }
 
-/// A claim on one arena row of every recurrent component. Dropping the last
-/// handle returns the row to the free list; the storage itself stays in the
-/// store's arenas.
+/// A stable logical claim on one row of every recurrent component. The
+/// published placement alone decides which physical row holds it.
 struct BankClaim {
     pool: Rc<BankPoolInner>,
-    index: usize,
+    id: LogicalId,
 }
 
 impl Drop for BankClaim {
     fn drop(&mut self) {
-        if self.index != ZERO_SEED_BANK {
-            self.pool.free.borrow_mut().insert(self.index);
+        if self.id != LogicalId(0) {
+            let published = self.pool.placement.borrow().clone();
+            let mut resources = published.resources().clone();
+            assert!(
+                resources.remove(&self.id).is_some(),
+                "bank claim has a placement"
+            );
+            *self.pool.placement.borrow_mut() = published
+                .with_resources(resources)
+                .expect("bank release preserves placement invariants");
         }
     }
 }
@@ -794,65 +805,117 @@ struct BankHandle(Rc<BankClaim>);
 
 impl BankHandle {
     fn index(&self) -> usize {
-        self.0.index
+        self.0
+            .pool
+            .placement
+            .borrow()
+            .resolve(self.0.id)
+            .expect("live bank has a physical placement")
+            .index
     }
 }
 
-/// Committed banks: the zero seed plus writable banks `1..committed`, handed
-/// out lowest first so the committed tail empties and can be released.
+/// Logical bank ownership and its published physical placement. The zero
+/// seed is permanently claimed; writable rows are acquired lowest first.
 struct BankPool {
     inner: Rc<BankPoolInner>,
 }
 
 impl BankPool {
     fn new(capacity: BankCapacity, committed: usize) -> Result<(Self, BankHandle), Error> {
+        let placement = Placement::new(
+            Generation(0),
+            BTreeMap::from([(AllocationId(0), committed)]),
+            BTreeMap::from([(
+                LogicalId(0),
+                PhysicalSlot {
+                    allocation: AllocationId(0),
+                    index: ZERO_SEED_BANK,
+                },
+            )]),
+        )
+        .map_err(|error| Error::Request(format!("invalid initial bank placement: {error:?}")))?;
         let inner = Rc::new(BankPoolInner {
             capacity: capacity.total()?,
-            free: RefCell::new((1..committed).collect()),
+            placement: RefCell::new(placement),
+            next_logical: Cell::new(1),
+            next_allocation: Cell::new(1),
         });
         let seed = BankHandle(Rc::new(BankClaim {
             pool: inner.clone(),
-            index: ZERO_SEED_BANK,
+            id: LogicalId(0),
         }));
         Ok((Self { inner }, seed))
     }
 
     fn acquire(&self) -> Result<BankHandle, Error> {
-        let index = self
-            .inner
-            .free
-            .borrow_mut()
-            .pop_first()
+        let published = self.inner.placement.borrow().clone();
+        let allocation = published
+            .resolve(LogicalId(0))
+            .expect("seed placement")
+            .allocation;
+        let occupied = published
+            .resources()
+            .values()
+            .map(|slot| slot.index)
+            .collect::<BTreeSet<_>>();
+        let index = (1..self.committed())
+            .find(|index| !occupied.contains(index))
             .ok_or(Error::BanksExhausted {
                 capacity: self.inner.capacity,
             })?;
+        let id = LogicalId(self.inner.next_logical.get());
+        let mut resources = published.resources().clone();
+        resources.insert(id, PhysicalSlot { allocation, index });
+        *self.inner.placement.borrow_mut() = published
+            .with_resources(resources)
+            .map_err(|error| Error::Request(format!("bank acquisition placement: {error:?}")))?;
+        self.inner
+            .next_logical
+            .set(id.0.checked_add(1).expect("bank logical id exhausted"));
         Ok(BankHandle(Rc::new(BankClaim {
             pool: self.inner.clone(),
-            index,
+            id,
         })))
     }
 
+    fn committed(&self) -> usize {
+        let placement = self.inner.placement.borrow();
+        let allocation = placement
+            .resolve(LogicalId(0))
+            .expect("seed placement")
+            .allocation;
+        placement
+            .allocation_capacity(allocation)
+            .expect("current bank allocation")
+    }
+
     fn available(&self) -> usize {
-        self.inner.free.borrow().len()
+        self.committed() - self.inner.placement.borrow().resources().len()
     }
 
-    /// The fewest committed banks that keep every claimed bank.
     fn required(&self, committed: usize) -> usize {
-        let free = self.inner.free.borrow();
-        (1..committed)
-            .rev()
-            .find(|bank| !free.contains(bank))
+        let placement = self.inner.placement.borrow();
+        let allocation = placement
+            .resolve(LogicalId(0))
+            .expect("seed placement")
+            .allocation;
+        placement
+            .highest_occupied_slot(allocation)
             .map_or(1, |bank| bank + 1)
+            .min(committed)
     }
 
-    /// Commit banks `from..to` (growth) or release them (`to < from`, all free).
     fn resize(&self, from: usize, to: usize) {
-        let mut free = self.inner.free.borrow_mut();
-        if to > from {
-            free.extend(from..to);
-        } else {
-            free.retain(|bank| *bank < to);
-        }
+        assert_eq!(self.committed(), from);
+        let published = self.inner.placement.borrow().clone();
+        let allocation = published
+            .resolve(LogicalId(0))
+            .expect("seed placement")
+            .allocation;
+        *self.inner.placement.borrow_mut() = published
+            .with_capacity(allocation, to)
+            .expect("bank resize preserves every live placement");
     }
 }
 
@@ -885,16 +948,57 @@ fn grown(committed: usize, required: usize, granule: usize, reserved: usize) -> 
         .min(reserved)
 }
 
-/// A physical allocation failure of the elastic backing: the device limit or
-/// memory is exhausted, which is capacity, not a fault.
-fn allocation_capacity(error: &seismic::TensorError) -> bool {
+fn allocation_capacity(error: &Error) -> bool {
     matches!(
         error,
-        seismic::TensorError::Execution(
+        Error::Tensor(seismic::TensorError::Execution(
             seismic::ExecutionError::AllocationCapacity { .. }
                 | seismic::ExecutionError::AllocationFailed(_)
-        )
+        ))
     )
+}
+
+/// Form replacements that need separate storage before changing any CUDA
+/// reservation in place. If a mixed set cannot allocate its replacements,
+/// every original plane remains physically intact. In-place growth retains
+/// its own rollback link until this complete vector is published.
+fn recommit_planes(planes: &[Tensor], leading: u64) -> Result<Vec<Tensor>, Error> {
+    let mut replacements = vec![None; planes.len()];
+    if planes
+        .first()
+        .is_some_and(|plane| leading < plane.committed_rows())
+    {
+        // Unmapping a CUDA tail destroys its contents. Prepare every other
+        // plane first, then shrink at most one reservation in place as the
+        // final fallible operation. Prefer the largest plane to minimize
+        // temporary replacement charge.
+        let final_shrink = planes
+            .iter()
+            .enumerate()
+            .filter(|(_, plane)| plane.can_recommit_in_place())
+            .max_by_key(|(_, plane)| plane.storage_bytes())
+            .map(|(index, _)| index);
+        for (index, plane) in planes.iter().enumerate() {
+            if Some(index) != final_shrink {
+                replacements[index] = Some(plane.recommitted_separately(leading)?);
+            }
+        }
+        if let Some(index) = final_shrink {
+            replacements[index] = Some(planes[index].recommitted(leading)?);
+        }
+    } else {
+        for in_place in [false, true] {
+            for (index, plane) in planes.iter().enumerate() {
+                if plane.can_recommit_in_place() == in_place {
+                    replacements[index] = Some(plane.recommitted(leading)?);
+                }
+            }
+        }
+    }
+    Ok(replacements
+        .into_iter()
+        .map(|plane| plane.expect("every state plane has a replacement"))
+        .collect())
 }
 
 fn leading_extents(leading: usize, rest: &[usize]) -> Result<Vec<u64>, Error> {
@@ -920,24 +1024,82 @@ struct Backing {
 /// later (advances, compactions, conversions). The backing may be
 /// recommitted only while none exists: a reallocating backend gives the store
 /// new tensors, and a captured old one would receive writes nobody reads.
-#[derive(Clone)]
-struct Transactions(Rc<Cell<usize>>);
+#[derive(Default)]
+struct TransactionClaims {
+    active: usize,
+    histories: BTreeMap<u64, usize>,
+    banks: BTreeMap<usize, usize>,
+}
 
-struct Transaction(Rc<Cell<usize>>);
+#[derive(Clone)]
+struct Transactions(Rc<RefCell<TransactionClaims>>);
+
+struct Transaction {
+    claims: Rc<RefCell<TransactionClaims>>,
+    histories: Vec<u64>,
+    banks: Vec<usize>,
+}
 
 impl Transactions {
     fn begin(&self) -> Transaction {
-        self.0.set(self.0.get() + 1);
-        Transaction(self.0.clone())
+        self.0.borrow_mut().active += 1;
+        Transaction {
+            claims: self.0.clone(),
+            histories: Vec::new(),
+            banks: Vec::new(),
+        }
     }
     fn idle(&self) -> bool {
-        self.0.get() == 0
+        self.0.borrow().active == 0
+    }
+}
+
+impl Transaction {
+    fn track(&mut self, claims: &Claims, bank: &BankHandle) {
+        self.track_history(claims);
+        self.track_bank(bank);
+    }
+    fn track_history(&mut self, claims: &Claims) {
+        self.histories.push(claims.id);
+        *self
+            .claims
+            .borrow_mut()
+            .histories
+            .entry(claims.id)
+            .or_default() += 1;
+    }
+    fn track_bank(&mut self, bank: &BankHandle) {
+        self.banks.push(bank.index());
+        *self
+            .claims
+            .borrow_mut()
+            .banks
+            .entry(bank.index())
+            .or_default() += 1;
     }
 }
 
 impl Drop for Transaction {
     fn drop(&mut self) {
-        self.0.set(self.0.get() - 1);
+        let mut tracked = self.claims.borrow_mut();
+        tracked.active -= 1;
+        for id in &self.histories {
+            let count = tracked
+                .histories
+                .get_mut(id)
+                .expect("tracked history claim");
+            *count -= 1;
+            if *count == 0 {
+                tracked.histories.remove(id);
+            }
+        }
+        for index in &self.banks {
+            let count = tracked.banks.get_mut(index).expect("tracked bank claim");
+            *count -= 1;
+            if *count == 0 {
+                tracked.banks.remove(index);
+            }
+        }
     }
 }
 /// History rows are a shared arena; recurrent components are arenas of banks,
@@ -957,6 +1119,7 @@ pub struct StateStore {
     recurrent_bank_bytes: u64,
     component_specs: Vec<ComponentSpec>,
     backing: RefCell<Backing>,
+    retired_storage: RefCell<Vec<TensorStorageObserver>>,
     arena: Rc<RefCell<Arena>>,
     banks: BankPool,
     zero_seed: BankHandle,
@@ -989,7 +1152,149 @@ pub struct RowDemand {
     pub after: Option<usize>,
     pub rows: usize,
 }
+
+/// Additional Seismic charge needed at the peak of elastic state growth.
+/// A reallocating backend briefly holds old and new backing together, so
+/// these amounts include that transient, not merely the final byte increase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateGrowthClaim {
+    pub minimum_bytes: u64,
+    pub preferred_bytes: u64,
+}
+
+/// A physical census of one state store. Shared rows and recurrent banks are
+/// assigned to the strongest holder class, without charging aliases twice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StateHoldingCensus {
+    pub surplus: u64,
+    pub retained: u64,
+    pub live: u64,
+    pub in_flight: u64,
+    pub model_seed: u64,
+}
+
+/// Read-only shape of a pressure shrink, including the peak new charge needed
+/// before old history or recurrent planes can be released.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatePressureShrinkShape {
+    pub committed_rows: usize,
+    pub referenced_rows: usize,
+    pub highest_referenced_row: usize,
+    pub target_rows: usize,
+    pub committed_banks: usize,
+    pub claimed_banks: usize,
+    pub target_banks: usize,
+    pub active_transactions: usize,
+    pub history_peak_bytes: u64,
+    pub bank_peak_bytes: u64,
+    pub bank_in_place_ready: bool,
+}
+
+fn history_shrink_target(referenced: usize, policy: ShrinkPolicy) -> usize {
+    let headroom = match policy {
+        ShrinkPolicy::Idle => 1,
+        ShrinkPolicy::Pressure => HEADROOM_DIVISOR,
+    };
+    (referenced + referenced / headroom)
+        .max(HISTORY_GRANULE)
+        .div_ceil(HISTORY_GRANULE)
+        * HISTORY_GRANULE
+}
+
+impl StateHoldingCensus {
+    pub fn total(self) -> u64 {
+        self.surplus + self.retained + self.live + self.in_flight + self.model_seed
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrowthChoice {
+    Minimum,
+    Preferred,
+}
+
+struct HistoryGrowthPlan {
+    target: usize,
+    relayout: bool,
+    demanded: BTreeMap<u64, usize>,
+    total: usize,
+}
 impl StateStore {
+    pub fn pressure_shrink_shape(&self) -> Result<StatePressureShrinkShape, Error> {
+        let arena = self.arena.borrow();
+        let backing = self.backing.borrow();
+        let highest_referenced_row = arena
+            .runs
+            .last_key_value()
+            .map_or(0, |(start, run)| start + run.count);
+        let target_rows = history_shrink_target(arena.referenced, ShrinkPolicy::Pressure);
+        let committed_rows = backing.rows;
+        let committed_banks = backing.banks;
+        let claimed_banks = committed_banks - 1 - self.banks.available();
+        let dense_target_banks = 1 + claimed_banks + self.owners.get() + BANK_GRANULE;
+        let relocation_needed = dense_target_banks < self.banks.required(committed_banks)
+            && dense_target_banks < committed_banks;
+        let target_banks = dense_target_banks;
+        let bank_in_place_ready = !relocation_needed
+            && Rc::strong_count(&backing.recurrent) == 1
+            && backing.recurrent.iter().all(Tensor::can_recommit_in_place);
+        let replacement_peak = |planes: &[Tensor], target: usize| -> Result<u64, Error> {
+            let in_place = planes
+                .iter()
+                .enumerate()
+                .filter(|(_, plane)| plane.can_recommit_in_place())
+                .max_by_key(|(_, plane)| plane.storage_bytes())
+                .map(|(index, _)| index);
+            planes
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| Some(*index) != in_place)
+                .try_fold(0u64, |total, (_, plane)| {
+                    let rows = plane.committed_rows();
+                    let bytes = plane
+                        .storage_bytes()
+                        .checked_div(rows)
+                        .and_then(|row| row.checked_mul(target as u64))
+                        .ok_or_else(|| {
+                            Error::Request("pressure replacement peak overflows".into())
+                        })?;
+                    total
+                        .checked_add(bytes)
+                        .ok_or_else(|| Error::Request("pressure replacement peak overflows".into()))
+                })
+        };
+        let history_peak_bytes = if committed_rows <= target_rows {
+            0
+        } else if highest_referenced_row > target_rows {
+            (target_rows as u64)
+                .checked_mul(self.total_history_row_bytes)
+                .ok_or_else(|| Error::Request("pressure relayout peak overflows".into()))?
+        } else {
+            replacement_peak(&backing.history, target_rows)?
+        };
+        let bank_peak_bytes = if relocation_needed {
+            (target_banks as u64)
+                .checked_mul(self.recurrent_bank_bytes)
+                .ok_or_else(|| Error::Request("bank relocation peak overflows".into()))?
+        } else if committed_banks > target_banks && !bank_in_place_ready {
+            replacement_peak(&backing.recurrent, target_banks)?
+        } else {
+            0
+        };
+        Ok(StatePressureShrinkShape {
+            committed_rows,
+            referenced_rows: arena.referenced,
+            highest_referenced_row,
+            target_rows,
+            committed_banks,
+            claimed_banks,
+            target_banks,
+            active_transactions: self.transactions.0.borrow().active,
+            history_peak_bytes,
+            bank_peak_bytes,
+            bank_in_place_ready,
+        })
+    }
     pub fn new(
         device: Rc<Device>,
         context_capacity: usize,
@@ -1050,11 +1355,12 @@ impl StateStore {
                 recurrent,
                 banks: committed_banks,
             }),
+            retired_storage: RefCell::new(Vec::new()),
             arena: Rc::new(RefCell::new(Arena::new(0))),
             banks,
             zero_seed,
             owners: Cell::new(0),
-            transactions: Transactions(Rc::new(Cell::new(0))),
+            transactions: Transactions(Rc::new(RefCell::new(TransactionClaims::default()))),
             relayouts: Cell::new(Relayouts::default()),
             recommits: Cell::new(0),
         }))
@@ -1090,6 +1396,152 @@ impl StateStore {
             .chain(backing.recurrent.iter())
             .map(Tensor::storage_bytes)
             .sum()
+    }
+
+    /// Old backing still charged because a caller holds a tensor view after
+    /// this store recommitted or relaid out. The weak observers neither pin
+    /// the allocations nor invent a charge: each live byte count comes from
+    /// Seismic's physical allocation.
+    pub fn external_pinned_bytes(&self) -> Result<u64, Error> {
+        let backing = self.backing.borrow();
+        let current = backing
+            .history
+            .iter()
+            .chain(backing.recurrent.iter())
+            .map(|tensor| tensor.observe_storage().identity())
+            .collect::<BTreeSet<_>>();
+        let mut seen = BTreeSet::new();
+        let mut retired = self.retired_storage.borrow_mut();
+        retired.retain(|storage| storage.charged_bytes().is_some());
+        retired
+            .iter()
+            .filter(|storage| !current.contains(&storage.identity()))
+            .filter(|storage| seen.insert(storage.identity()))
+            .filter_map(TensorStorageObserver::charged_bytes)
+            .try_fold(0u64, |total, bytes| {
+                total
+                    .checked_add(bytes)
+                    .ok_or_else(|| Error::Request("external state pin charge overflows".into()))
+            })
+    }
+
+    fn record_retired_storage(&self, storage: Vec<TensorStorageObserver>) {
+        let mut retired = self.retired_storage.borrow_mut();
+        retired.extend(storage);
+        retired.retain(|allocation| allocation.charged_bytes().is_some());
+    }
+    /// Classify committed state backing from its actual row and bank claims.
+    /// Every registered holder must be supplied or owned by an outstanding
+    /// transaction. An untracked omission is an error rather than surplus.
+    pub fn holding_census(
+        self: &Rc<Self>,
+        live: &[Holder<'_>],
+        retained: &[Holder<'_>],
+        in_flight: &[Holder<'_>],
+    ) -> Result<StateHoldingCensus, Error> {
+        let holders = live
+            .iter()
+            .chain(retained)
+            .chain(in_flight)
+            .collect::<Vec<_>>();
+        let arena = self.arena.borrow();
+        let mut supplied = BTreeSet::new();
+        let mut banks = BTreeSet::new();
+        for holder in &holders {
+            if !Rc::ptr_eq(self, holder.store()) {
+                return Err(Error::Request(
+                    "state census holder belongs to another store".into(),
+                ));
+            }
+            if !supplied.insert(holder.claims().id) {
+                return Err(Error::Request(
+                    "state census holder appears more than once".into(),
+                ));
+            }
+            banks.insert(holder.bank().index());
+        }
+        let tracked = self.transactions.0.borrow();
+        if live
+            .iter()
+            .chain(retained)
+            .any(|holder| tracked.histories.contains_key(&holder.claims().id))
+        {
+            return Err(Error::Request(
+                "state census marks a submitted history as live or retained".into(),
+            ));
+        }
+        if arena
+            .entries
+            .keys()
+            .any(|id| !supplied.contains(id) && !tracked.histories.contains_key(id))
+        {
+            return Err(Error::Request(
+                "state census omits a registered history claim".into(),
+            ));
+        }
+        let (rows, committed_banks) = self.committed();
+        let placement = self.banks.inner.placement.borrow();
+        let occupied_banks = placement
+            .resources()
+            .values()
+            .map(|slot| slot.index)
+            .collect::<BTreeSet<_>>();
+        if (1..committed_banks).any(|bank| {
+            occupied_banks.contains(&bank)
+                && !banks.contains(&bank)
+                && !tracked.banks.contains_key(&bank)
+        }) {
+            return Err(Error::Request(
+                "state census omits a recurrent bank claim".into(),
+            ));
+        }
+        let occupied_rows = u64::try_from(arena.referenced)
+            .map_err(|_| Error::Request("occupied row count exceeds u64".into()))?;
+        let used_banks = u64::try_from(
+            (1..committed_banks)
+                .filter(|bank| occupied_banks.contains(bank))
+                .count(),
+        )
+        .map_err(|_| Error::Request("occupied bank count exceeds u64".into()))?;
+        let occupied = occupied_rows
+            .checked_mul(self.total_history_row_bytes)
+            .and_then(|history| {
+                used_banks
+                    .checked_mul(self.recurrent_bank_bytes)
+                    .and_then(|bank| history.checked_add(bank))
+            })
+            .ok_or_else(|| Error::Request("state census byte count overflow".into()))?;
+        let model_seed = self.recurrent_bank_bytes;
+        let committed = self.committed_bytes();
+        let surplus = committed
+            .checked_sub(occupied)
+            .and_then(|bytes| bytes.checked_sub(model_seed))
+            .ok_or_else(|| Error::Request("state census exceeds Seismic charged backing".into()))?;
+        drop(placement);
+        drop(arena);
+        drop(tracked);
+        let retained_only = self.exclusive_bytes(retained)?;
+        let non_flight = live.iter().chain(retained).copied().collect::<Vec<_>>();
+        let in_flight_bytes = occupied
+            .checked_sub(self.exclusive_bytes(&non_flight)?)
+            .ok_or_else(|| Error::Request("state census flight exceeds occupied bytes".into()))?;
+        let live_bytes = occupied
+            .checked_sub(retained_only)
+            .and_then(|bytes| bytes.checked_sub(in_flight_bytes))
+            .ok_or_else(|| Error::Request("state census classes overlap".into()))?;
+        let census = StateHoldingCensus {
+            surplus,
+            retained: retained_only,
+            live: live_bytes,
+            in_flight: in_flight_bytes,
+            model_seed,
+        };
+        if census.total() != committed || rows < self.occupied_rows() {
+            return Err(Error::Request(
+                "state census does not reconcile to committed backing".into(),
+            ));
+        }
+        Ok(census)
     }
     pub fn history_capacity(&self) -> usize {
         self.history_capacity
@@ -1131,28 +1583,106 @@ impl StateStore {
     /// rows the demands need beyond the free committed rows, plus the rows a
     /// history ending at the committed frontier needs to keep growing in
     /// place, and `banks` free successor banks. Growth is geometric and
-    /// bounded by the reservation; a device limit leaves the backing as it is
-    /// and the caller's capacity check reports the shortage. Nothing changes
-    /// while a transaction holds this store's tensors.
+    /// bounded by the reservation. A refused allocation returns a capacity
+    /// error without publishing tentative backing or changing accepted state.
+    /// Nothing changes while a transaction holds this store's tensors.
     pub fn provision(&self, demands: &[RowDemand], banks: usize) -> Result<(), Error> {
+        self.provision_with_growth(demands, banks, GrowthChoice::Preferred)
+    }
+
+    /// A read-only claim for the additional peak charge of a launch's state
+    /// growth. The minimum commits only rows and banks the launch needs; the
+    /// preferred amount includes geometric headroom and eligible relayout.
+    pub fn growth_claim(
+        &self,
+        demands: &[RowDemand],
+        banks: usize,
+    ) -> Result<StateGrowthClaim, Error> {
+        Ok(StateGrowthClaim {
+            minimum_bytes: self.growth_bytes(demands, banks, GrowthChoice::Minimum)?,
+            preferred_bytes: self.growth_bytes(demands, banks, GrowthChoice::Preferred)?,
+        })
+    }
+
+    fn growth_bytes(
+        &self,
+        demands: &[RowDemand],
+        banks: usize,
+        choice: GrowthChoice,
+    ) -> Result<u64, Error> {
+        if !self.transactions.idle() {
+            return Ok(0);
+        }
+        let history = self.history_growth_plan(demands, choice)?;
+        let backing = self.backing.borrow();
+        let bank_target = self.bank_growth_target(banks, choice)?;
+        let bytes = |rows: usize, row_bytes: u64| {
+            u64::try_from(rows)
+                .ok()
+                .and_then(|rows| rows.checked_mul(row_bytes))
+                .ok_or_else(|| Error::Request("state growth byte count overflow".into()))
+        };
+        let history_net = bytes(
+            history.target.saturating_sub(backing.rows),
+            self.total_history_row_bytes,
+        )?;
+        // The full replacement remains the safe claim for a backing that may
+        // have external views or require a relayout. An exclusive CUDA VMM
+        // recommit transfers its old charge and uses only the delta, so this
+        // claim can be conservative until exclusivity is part of the plan.
+        let history_peak = if history.relayout || history.target > backing.rows {
+            bytes(history.target, self.total_history_row_bytes)?
+        } else {
+            history_net
+        };
+        let bank_net = bytes(
+            bank_target.saturating_sub(backing.banks),
+            self.recurrent_bank_bytes,
+        )?;
+        let bank_peak = if bank_target > backing.banks {
+            bytes(bank_target, self.recurrent_bank_bytes)?
+        } else {
+            bank_net
+        };
+        Ok(history_peak.max(
+            history_net
+                .checked_add(bank_peak)
+                .ok_or_else(|| Error::Request("state growth peak overflow".into()))?,
+        ))
+    }
+
+    pub fn provision_with_growth(
+        &self,
+        demands: &[RowDemand],
+        banks: usize,
+        choice: GrowthChoice,
+    ) -> Result<(), Error> {
         if !self.transactions.idle() {
             return Ok(());
         }
         if !self.components.is_empty() {
-            self.provision_history(demands)?;
+            self.provision_history(demands, choice)?;
         }
         let shortage = banks.saturating_sub(self.banks.available());
         if shortage != 0 && self.has_recurrent_components() {
-            let committed = self.backing.borrow().banks;
-            let target = grown(
-                committed,
-                committed + shortage,
-                BANK_GRANULE,
-                self.bank_capacity.storage_total()?,
-            );
+            let target = self.bank_growth_target(banks, choice)?;
             self.recommit_banks(target)?;
         }
         Ok(())
+    }
+
+    fn bank_growth_target(&self, banks: usize, choice: GrowthChoice) -> Result<usize, Error> {
+        let committed = self.backing.borrow().banks;
+        let shortage = banks.saturating_sub(self.banks.available());
+        if shortage == 0 || !self.has_recurrent_components() {
+            return Ok(committed);
+        }
+        let required = committed.saturating_add(shortage);
+        let reserved = self.bank_capacity.storage_total()?;
+        Ok(match choice {
+            GrowthChoice::Minimum => required.min(reserved),
+            GrowthChoice::Preferred => grown(committed, required, BANK_GRANULE, reserved),
+        })
     }
 
     /// History backing for a launch's demands. Every sequence history must
@@ -1163,10 +1693,19 @@ impl StateStore {
     /// Backends that reallocate on growth pay that copy anyway, so every
     /// growth there is a relayout; a backend that resizes in place grows
     /// in place and relays out only for a history without room.
-    fn provision_history(&self, demands: &[RowDemand]) -> Result<(), Error> {
+    fn history_growth_plan(
+        &self,
+        demands: &[RowDemand],
+        choice: GrowthChoice,
+    ) -> Result<HistoryGrowthPlan, Error> {
         let total = demands.iter().map(|demand| demand.rows).sum::<usize>();
-        if total == 0 {
-            return Ok(());
+        if total == 0 || self.components.is_empty() {
+            return Ok(HistoryGrowthPlan {
+                target: self.backing.borrow().rows,
+                relayout: false,
+                demanded: BTreeMap::new(),
+                total: 0,
+            });
         }
         let (committed, in_place) = {
             let backing = self.backing.borrow();
@@ -1191,11 +1730,20 @@ impl StateStore {
                 .map_or(committed, |(start, _)| *start);
             (arena.referenced, growing, frontier)
         };
-        let required = referenced + total + referenced / HEADROOM_DIVISOR;
-        let target = if required > committed {
-            grown(committed, required, HISTORY_GRANULE, self.history_capacity)
-        } else {
-            committed
+        let required = referenced.saturating_add(total);
+        let target = match choice {
+            GrowthChoice::Minimum => required.max(committed).min(self.history_capacity),
+            GrowthChoice::Preferred
+                if required.saturating_add(referenced / HEADROOM_DIVISOR) > committed =>
+            {
+                grown(
+                    committed,
+                    required.saturating_add(referenced / HEADROOM_DIVISOR),
+                    HISTORY_GRANULE,
+                    self.history_capacity,
+                )
+            }
+            GrowthChoice::Preferred => committed,
         };
         // A history without room that a relayout can give room to. In-place
         // growth extends the free rows after the frontier history.
@@ -1210,21 +1758,35 @@ impl StateStore {
                 arena.room_at(end) + extension < rows && arena.owns_its_end(id)
             })
         };
-        let slack = target.saturating_sub(referenced + total);
+        let slack = target.saturating_sub(required);
         let relayout = referenced != 0
             && ((target > committed && !in_place)
-                || (stranded && slack >= referenced / RELAYOUT_SLACK_DIVISOR));
-        if relayout {
-            let demanded = growing
+                || (stranded
+                    && (choice == GrowthChoice::Minimum
+                        || slack >= referenced / RELAYOUT_SLACK_DIVISOR)));
+        Ok(HistoryGrowthPlan {
+            target,
+            relayout,
+            demanded: growing
                 .into_iter()
                 .map(|(id, (_, rows))| (id, rows))
-                .collect::<BTreeMap<_, _>>();
-            if self.relayout_history(target, &demanded, total)? {
-                return Ok(());
-            }
+                .collect(),
+            total,
+        })
+    }
+
+    fn provision_history(&self, demands: &[RowDemand], choice: GrowthChoice) -> Result<(), Error> {
+        let plan = self.history_growth_plan(demands, choice)?;
+        if plan.total == 0 {
+            return Ok(());
         }
-        if target > committed {
-            self.recommit_history(target)?;
+        let committed = self.backing.borrow().rows;
+        if plan.relayout {
+            self.relayout_history(plan.target, &plan.demanded, plan.total)?;
+            return Ok(());
+        }
+        if plan.target > committed {
+            self.recommit_history(plan.target)?;
         }
         Ok(())
     }
@@ -1233,18 +1795,21 @@ impl StateStore {
     /// [`Arena::relayout`], copying the referenced rows into new planes. The
     /// free rows beyond `demand` become growth room: each demanding history
     /// gets its demand, and every live history a share of the rest in
-    /// proportion to the rows it may still grow (up to the context). `false`
-    /// when the device refuses the allocation; nothing changes then.
+    /// proportion to the rows it may still grow (up to the context).
     fn relayout_history(
         &self,
         rows: usize,
         demanded: &BTreeMap<u64, usize>,
         demand: usize,
-    ) -> Result<bool, Error> {
+    ) -> Result<(), Error> {
         let mut backing = self.backing.borrow_mut();
         let mut arena = self.arena.borrow().clone();
-        let Some(spare) = rows.checked_sub(arena.referenced + demand) else {
-            return Ok(false);
+        let required = arena.referenced.saturating_add(demand);
+        let Some(spare) = rows.checked_sub(required) else {
+            return Err(Error::Capacity {
+                required: (required as u64).saturating_mul(self.total_history_row_bytes),
+                available_bytes: (rows as u64).saturating_mul(self.total_history_row_bytes),
+            });
         };
         let rooms = arena
             .entries
@@ -1257,7 +1822,10 @@ impl StateStore {
             .into_iter()
             .map(|(id, room)| {
                 let share = (spare as u128 * room as u128 / total_room as u128) as usize;
-                (id, demanded.get(&id).copied().unwrap_or(0) + share.min(room))
+                (
+                    id,
+                    demanded.get(&id).copied().unwrap_or(0) + share.min(room),
+                )
             })
             .collect::<BTreeMap<_, _>>();
         let moves = arena
@@ -1270,21 +1838,26 @@ impl StateStore {
             .iter()
             .map(|plane| plane.relocated(rows as u64, &moves))
             .collect::<Result<Vec<_>, _>>();
-        let planes = match planes {
-            Ok(planes) => planes,
-            Err(error) if allocation_capacity(&error) => return Ok(false),
-            Err(error) => return Err(error.into()),
-        };
-        let copied = moves.iter().map(|(_, _, count)| *count as usize).sum::<usize>();
+        let planes = planes?;
+        let copied = moves
+            .iter()
+            .map(|(_, _, count)| *count as usize)
+            .sum::<usize>();
+        let retired = backing
+            .history
+            .iter()
+            .map(Tensor::observe_storage)
+            .collect();
         *self.arena.borrow_mut() = arena;
         backing.history = planes;
+        self.record_retired_storage(retired);
         backing.rows = rows;
         let stats = self.relayouts.get();
         self.relayouts.set(Relayouts {
             count: stats.count + 1,
             rows: stats.rows + copied,
         });
-        Ok(true)
+        Ok(())
     }
 
     /// History relayouts performed so far and the rows they copied.
@@ -1311,11 +1884,10 @@ impl StateStore {
         // Idle keeps the room growth would give the rows in use again (a
         // relayout copies every live row, so it must not recur as requests
         // come and go); pressure keeps only the growth headroom.
-        let headroom = match policy {
-            ShrinkPolicy::Idle => 1,
-            ShrinkPolicy::Pressure => HEADROOM_DIVISOR,
-        };
-        let before = self.committed_bytes();
+        // An earlier backing may still be pinned by a caller that holds a
+        // tensor view. Only the device ledger can say how much was actually
+        // released; the change in the store's current backing is insufficient.
+        let before = self.device.memory_usage().charged;
         let (rows, banks) = self.committed();
         let (top, referenced) = {
             let arena = self.arena.borrow();
@@ -1325,26 +1897,43 @@ impl StateStore {
                 .map_or(0, |(start, run)| start + run.count);
             (top, arena.referenced)
         };
-        let needed = (referenced + referenced / headroom)
-            .max(HISTORY_GRANULE)
-            .div_ceil(HISTORY_GRANULE)
-            * HISTORY_GRANULE;
+        let needed = history_shrink_target(referenced, policy);
         if rows != 0 && release(rows, needed) {
-            if top <= needed {
-                self.recommit_history(needed)?;
+            let result = if top <= needed {
+                self.recommit_history(needed)
             } else {
-                self.relayout_history(needed, &BTreeMap::new(), 0)?;
+                self.relayout_history(needed, &BTreeMap::new(), 0)
+            };
+            if let Err(error) = result {
+                if !allocation_capacity(&error) {
+                    return Err(error);
+                }
             }
         }
         if self.has_recurrent_components() {
             let claimed = banks - 1 - self.banks.available();
-            let needed = (1 + claimed + self.owners.get() + BANK_GRANULE)
-                .max(self.banks.required(banks));
+            let dense_needed = 1 + claimed + self.owners.get() + BANK_GRANULE;
+            if policy == ShrinkPolicy::Pressure
+                && dense_needed < self.banks.required(banks)
+                && dense_needed < banks
+            {
+                if let Err(error) = self.relocate_banks(dense_needed) {
+                    if !allocation_capacity(&error) {
+                        return Err(error);
+                    }
+                }
+            }
+            let needed = dense_needed.max(self.banks.required(self.committed().1));
+            let banks = self.committed().1;
             if release(banks, needed) {
-                self.recommit_banks(needed)?;
+                if let Err(error) = self.recommit_banks(needed) {
+                    if !allocation_capacity(&error) {
+                        return Err(error);
+                    }
+                }
             }
         }
-        Ok(before.saturating_sub(self.committed_bytes()))
+        Ok(before.saturating_sub(self.device.memory_usage().charged))
     }
 
     /// Recommit every history plane to `rows` leading rows. The arena gains
@@ -1369,19 +1958,17 @@ impl StateStore {
                 })
                 .collect::<Result<Vec<_>, _>>()
         } else {
-            backing
-                .history
-                .iter()
-                .map(|plane| plane.recommitted(rows as u64).map_err(Error::from))
-                .collect::<Result<Vec<_>, _>>()
+            recommit_planes(&backing.history, rows as u64)
         };
-        let planes = match planes {
-            Ok(planes) => planes,
-            Err(Error::Tensor(error)) if allocation_capacity(&error) => return Ok(()),
-            Err(error) => return Err(error),
-        };
+        let planes = planes?;
+        let retired = backing
+            .history
+            .iter()
+            .map(Tensor::observe_storage)
+            .collect();
         self.arena.borrow_mut().resize(backing.rows, rows);
         backing.history = planes;
+        self.record_retired_storage(retired);
         backing.rows = rows;
         self.recommits.set(self.recommits.get() + 1);
         Ok(())
@@ -1393,23 +1980,97 @@ impl StateStore {
         self.recommits.get()
     }
 
+    /// Prepare a complete dense destination while the old backing and
+    /// placement remain published. Every plane is copied before either the
+    /// physical backing or its placement generation changes.
+    fn relocate_banks(&self, target: usize) -> Result<(), Error> {
+        assert!(
+            self.transactions.idle(),
+            "bank relocation requires an idle store"
+        );
+        let mut backing = self.backing.borrow_mut();
+        let published = self.banks.inner.placement.borrow().clone();
+        let allocation = AllocationId(self.banks.inner.next_allocation.get());
+        let plan = published
+            .plan_dense_prefix(allocation, target)
+            .map_err(|error| Error::Request(format!("bank relocation plan: {error:?}")))?;
+        let moves = plan
+            .copies()
+            .iter()
+            .map(|copy| (copy.from.index as u64, copy.to.index as u64, 1u64))
+            .collect::<Vec<_>>();
+        let destination = backing
+            .recurrent
+            .iter()
+            .map(|plane| plane.relocated(target as u64, &moves).map_err(Error::from))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut transaction = plan.begin();
+        for index in 0..transaction.copies().len() {
+            transaction
+                .mark_copied(index)
+                .map_err(|error| Error::Request(format!("bank relocation copy: {error:?}")))?;
+        }
+        let retired = backing
+            .recurrent
+            .iter()
+            .map(Tensor::observe_storage)
+            .collect();
+        transaction
+            .commit(&mut self.banks.inner.placement.borrow_mut())
+            .map_err(|error| Error::Request(format!("bank relocation commit: {error:?}")))?;
+        self.banks.inner.next_allocation.set(
+            allocation
+                .0
+                .checked_add(1)
+                .expect("bank allocation id exhausted"),
+        );
+        backing.recurrent = destination.into();
+        backing.banks = target;
+        self.record_retired_storage(retired);
+        self.recommits.set(self.recommits.get() + 1);
+        Ok(())
+    }
+
     fn recommit_banks(&self, banks: usize) -> Result<(), Error> {
         let mut backing = self.backing.borrow_mut();
         if banks == backing.banks {
             return Ok(());
         }
-        let arenas = backing
+        if banks < backing.banks {
+            if let Some(planes) = Rc::get_mut(&mut backing.recurrent) {
+                if planes.iter().all(Tensor::can_recommit_in_place) {
+                    // The released bank tail is free. Publish each CUDA VMM
+                    // shrink immediately, so no second plane needs a peak
+                    // replacement allocation under pressure. A driver error
+                    // after the first publication cannot be reported as a
+                    // recoverable old backing.
+                    let mut published = 0;
+                    for plane in planes {
+                        let replacement = match plane.recommitted(banks as u64) {
+                            Ok(replacement) => replacement,
+                            Err(error) if published == 0 => return Err(error.into()),
+                            Err(error) => panic!("partial in-place bank shrink failed: {error}"),
+                        };
+                        let old = std::mem::replace(plane, replacement);
+                        drop(old);
+                        published += 1;
+                    }
+                    self.banks.resize(backing.banks, banks);
+                    backing.banks = banks;
+                    self.recommits.set(self.recommits.get() + 1);
+                    return Ok(());
+                }
+            }
+        }
+        let arenas: Rc<[Tensor]> = recommit_planes(&backing.recurrent, banks as u64)?.into();
+        let retired = backing
             .recurrent
             .iter()
-            .map(|arena| arena.recommitted(banks as u64))
-            .collect::<Result<Rc<[Tensor]>, _>>();
-        let arenas = match arenas {
-            Ok(arenas) => arenas,
-            Err(error) if allocation_capacity(&error) => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
+            .map(Tensor::observe_storage)
+            .collect();
         self.banks.resize(backing.banks, banks);
         backing.recurrent = arenas;
+        self.record_retired_storage(retired);
         backing.banks = banks;
         self.recommits.set(self.recommits.get() + 1);
         Ok(())
@@ -1547,7 +2208,22 @@ impl StateStore {
             return Ok(Claims::new(&self.arena, vec![]));
         }
         let after = history.and_then(Claims::end);
-        self.provision(&[RowDemand { after, rows: count }], 0)?;
+        let needs_preparation = {
+            let arena = self.arena.borrow();
+            arena.available() < count
+                || (self.transactions.idle()
+                    && history.is_some_and(|claim| {
+                        after.is_some_and(|end| {
+                            arena.room_at(end) < count && arena.owns_its_end(claim.id)
+                        })
+                    }))
+        };
+        // Exact row demand can require a same-size relayout even when free
+        // rows suffice in total. Prepare that layout before reserving a
+        // transaction; Seismic still enforces any physical peak charge.
+        if needs_preparation {
+            self.provision(&[RowDemand { after, rows: count }], 0)?;
+        }
         let after = history.and_then(Claims::end);
         let mut arena = self.arena.borrow_mut();
         let available_rows = arena.available();
@@ -1567,7 +2243,9 @@ impl StateStore {
     /// A free successor bank, committing more banks first when none is free
     /// and no transaction holds this store's tensors.
     fn successor_bank(&self) -> Result<BankHandle, Error> {
-        self.provision(&[], 1)?;
+        if self.banks.available() == 0 {
+            self.provision(&[], 1)?;
+        }
         self.banks.acquire()
     }
 
@@ -1772,6 +2450,29 @@ pub struct StateCheckpoint {
     bank: BankHandle,
     tape: usize,
 }
+
+/// An accepted state temporarily owned by a submitted continuation rather
+/// than the domain's request map. Its history and bank remain in the
+/// in-flight census until the continuation reconciles or is dropped.
+pub struct InFlightState {
+    state: SequenceState,
+    _transaction: Transaction,
+}
+
+impl InFlightState {
+    pub fn new(state: SequenceState) -> Self {
+        let mut transaction = state.store.begin_transaction();
+        transaction.track(&state.claims, &state.bank);
+        Self {
+            state,
+            _transaction: transaction,
+        }
+    }
+
+    pub fn into_state(self) -> SequenceState {
+        self.state
+    }
+}
 impl Drop for StateCheckpoint {
     fn drop(&mut self) {
         self.store.owners.set(self.store.owners.get() - 1);
@@ -1939,7 +2640,10 @@ mod tests {
         // the 8-row branch own 5..12; all three own everything.
         assert_eq!(arena.borrow().exclusive_rows(&[(0, 12)]), 4);
         assert_eq!(arena.borrow().exclusive_rows(&[(0, 12), (0, 8)]), 7);
-        assert_eq!(arena.borrow().exclusive_rows(&[(0, 12), (0, 8), (0, 5)]), 12);
+        assert_eq!(
+            arena.borrow().exclusive_rows(&[(0, 12), (0, 8), (0, 5)]),
+            12
+        );
         assert_eq!(arena.borrow().exclusive_rows(&[(0, 5)]), 0);
         drop(path);
         assert_eq!(arena.borrow().referenced, 8);
@@ -2122,7 +2826,9 @@ mod tests {
         assert_eq!(original, ZERO_SEED_BANK);
         let checkpoint = state.checkpoint();
 
-        let advance = OwnedStateAdvance::begin_speculative(state, 3, 1).ok().unwrap();
+        let advance = OwnedStateAdvance::begin_speculative(state, 3, 1)
+            .ok()
+            .unwrap();
         assert_eq!(advance.bindings().previous_bank, original);
         assert_ne!(advance.bindings().following_bank, original);
         assert!(advance.bindings().recurrent[0].shares_allocation(&store.recurrent_arenas()[0]));
@@ -2132,7 +2838,9 @@ mod tests {
         assert_eq!(state.bank_index(), original);
         assert_eq!(store.occupied_rows(), 0);
 
-        let advance = OwnedStateAdvance::begin_speculative(state, 3, 1).ok().unwrap();
+        let advance = OwnedStateAdvance::begin_speculative(state, 3, 1)
+            .ok()
+            .unwrap();
         let successor = advance.bindings().following_bank;
         let OwnedAdvanceResolution::Committed(state) = advance.commit(2).ok().unwrap() else {
             panic!("an accepted prefix commits as a tape version");
@@ -2175,7 +2883,7 @@ mod tests {
             return;
         };
         let store = StateStore::new(
-            device,
+            device.clone(),
             64,
             256,
             vec![dense_component(1)],
@@ -2215,6 +2923,35 @@ mod tests {
             assert_eq!(branch.history_ranges().len(), 2);
         }
         assert_eq!(store.occupied_rows(), 24 + 8 + 6 + 3);
+        let census = store
+            .holding_census(
+                &[Holder::State(&a), Holder::State(&b), Holder::State(&c)],
+                &[Holder::Checkpoint(&system), Holder::Checkpoint(&a_turn)],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(census.retained, bank);
+        assert_eq!(census.live, (24 + 8 + 6 + 3) * row + 3 * bank);
+        assert_eq!(census.total(), store.committed_bytes());
+        assert_eq!(census.total(), device.memory_usage().charged);
+        let submitted = store
+            .holding_census(
+                &[Holder::State(&b), Holder::State(&c)],
+                &[Holder::Checkpoint(&system), Holder::Checkpoint(&a_turn)],
+                &[Holder::State(&a)],
+            )
+            .unwrap();
+        assert_eq!(submitted.in_flight, 32 * row + bank);
+        assert_eq!(submitted.live, (6 + 3) * row + 2 * bank);
+        assert_eq!(submitted.retained, bank);
+        assert_eq!(submitted.total(), store.committed_bytes());
+        assert!(store
+            .holding_census(
+                &[Holder::State(&a), Holder::State(&b)],
+                &[Holder::Checkpoint(&system), Holder::Checkpoint(&a_turn)],
+                &[],
+            )
+            .is_err());
         // Alone, each live request owns only its private tail and its bank.
         assert_eq!(
             store.exclusive_bytes(&[Holder::State(&b)]).unwrap(),
@@ -2225,7 +2962,19 @@ mod tests {
         let retained = [Holder::Checkpoint(&system), Holder::Checkpoint(&a_turn)];
         assert_eq!(store.exclusive_bytes(&retained).unwrap(), bank);
         drop(a);
-        assert_eq!(store.exclusive_bytes(&retained).unwrap(), 8 * row + 2 * bank);
+        let after_a = store
+            .holding_census(
+                &[Holder::State(&b), Holder::State(&c)],
+                &[Holder::Checkpoint(&system), Holder::Checkpoint(&a_turn)],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(after_a.retained, 8 * row + 2 * bank);
+        assert_eq!(after_a.total(), store.committed_bytes());
+        assert_eq!(
+            store.exclusive_bytes(&retained).unwrap(),
+            8 * row + 2 * bank
+        );
         drop((b, c));
         assert_eq!(
             store.exclusive_bytes(&retained).unwrap(),
@@ -2420,7 +3169,9 @@ mod tests {
             .unwrap();
         let left = OwnedStateAdvance::begin(left, 2).ok().unwrap();
         let right = OwnedStateAdvance::begin(right, 1).ok().unwrap();
-        let parent = OwnedStateAdvance::begin_speculative(parent, 3, 1).ok().unwrap();
+        let parent = OwnedStateAdvance::begin_speculative(parent, 3, 1)
+            .ok()
+            .unwrap();
         let successors = [&left, &right, &parent].map(|advance| advance.bindings().following_bank);
         for (index, advance) in [&left, &right, &parent].into_iter().enumerate() {
             let bindings = advance.bindings();
@@ -2444,8 +3195,9 @@ mod tests {
         assert_eq!(fork.bank_index(), left.bank_index());
         assert_eq!(parent.bank_index(), successors[2]);
         assert_eq!(parent.tape_rows(), 1);
-        assert!(!readable(&[&left, &right, &fork], &[&root, &branch])
-            .contains(&parent.bank_index()));
+        assert!(
+            !readable(&[&left, &right, &fork], &[&root, &branch]).contains(&parent.bank_index())
+        );
         let advance = OwnedStateAdvance::begin(fork, 1).ok().unwrap();
         let following = advance.bindings().following_bank;
         assert_ne!(following, ZERO_SEED_BANK);
@@ -2638,6 +3390,37 @@ mod tests {
         assert_eq!(state.history_ranges().len(), 17);
     }
 
+    #[test]
+    fn minimum_growth_claim_accounts_for_fragmented_history_relayout() {
+        let Some(device) = cpu_device() else {
+            return;
+        };
+        let store = StateStore::new(
+            device.clone(),
+            64,
+            64,
+            vec![dense_component(1)],
+            vec![],
+            BankCapacity {
+                active: 1,
+                in_flight: 1,
+                retained: 0,
+            },
+        )
+        .unwrap();
+        let (state, _fillers) = fragmented(&store, &[(40, 8), (50, 9)]);
+        let demand = [state.demand(9)];
+        let claim = store.growth_claim(&demand, 0).unwrap();
+        assert!(claim.minimum_bytes > 0);
+        let charged = device.memory_usage().charged;
+        device.set_memory_limit(Some(charged + claim.minimum_bytes));
+        store
+            .provision_with_growth(&demand, 0, GrowthChoice::Minimum)
+            .unwrap();
+        assert_eq!(store.relayouts().count, 1);
+        assert!(OwnedStateAdvance::begin(state, 9).is_ok());
+    }
+
     /// Repacking restores adjacency with one bounded copy: a long shared
     /// prefix stays in place and only the recent decode runs move, joining
     /// into one run; a checkpoint on the prefix keeps seeing the same rows.
@@ -2660,7 +3443,13 @@ mod tests {
         )
         .unwrap();
         store
-            .provision(&[RowDemand { after: None, rows: 1024 }], 0)
+            .provision(
+                &[RowDemand {
+                    after: None,
+                    rows: 1024,
+                }],
+                0,
+            )
             .unwrap();
         // A 200-row prefix (retained by a checkpoint), then 15 one-row runs
         // separated by rows other histories hold.
@@ -2684,7 +3473,10 @@ mod tests {
         };
         assert_eq!(compaction.rows(), 15);
         let copy = &compaction.copies()[0];
-        assert_eq!(copy.from, (0..15).map(|run| 300 + 2 * run).collect::<Vec<_>>());
+        assert_eq!(
+            copy.from,
+            (0..15).map(|run| 300 + 2 * run).collect::<Vec<_>>()
+        );
         // The first free run that fits is the one right after the prefix.
         assert_eq!(copy.to, (200..215).collect::<Vec<_>>());
         let state = compaction.commit();
@@ -2949,34 +3741,122 @@ mod tests {
         assert!(grown > base);
         // Without transactions, growth commits more rows and banks and keeps
         // the accepted rows' contents.
-        store
-            .provision(&[state.demand(5000)], 8)
-            .unwrap();
+        let demand = [state.demand(5000)];
+        let claim = store.growth_claim(&demand, 8).unwrap();
+        assert!(claim.preferred_bytes >= claim.minimum_bytes);
+        assert!(claim.minimum_bytes > 0);
+        let previous_limit = device.memory_usage().limit;
+        device.set_memory_limit(Some(charged() + claim.minimum_bytes - 1));
+        assert!(matches!(
+            store.provision_with_growth(&demand, 8, GrowthChoice::Minimum),
+            Err(Error::Tensor(seismic::TensorError::Execution(
+                seismic::ExecutionError::AllocationCapacity { .. }
+            )))
+        ));
+        assert_eq!(store.committed().0, rows);
+        assert_eq!(state.history_ranges(), [(0, 1000)]);
+        device.set_memory_limit(previous_limit);
+        store.provision(&demand, 8).unwrap();
         let (rows, banks) = store.committed();
         assert!(rows >= 6000 && rows < 16384, "committed {rows} rows");
         assert!(banks >= 9, "committed {banks} banks");
         assert!(charged() > grown);
         let plane = store.history_planes().unwrap()[0].buffer.clone();
         assert_eq!(
-            plane.slice_leading(0, 1000).unwrap().read_to_host().unwrap(),
+            plane
+                .slice_leading(0, 1000)
+                .unwrap()
+                .read_to_host()
+                .unwrap(),
             written
         );
         assert_eq!(state.history_ranges(), [(0, 1000)]);
-        drop(plane);
-        // Nothing above the history is referenced: shrinking returns the
-        // tail's bytes to the device ledger.
+        // A caller can still pin the old history tensor while the store
+        // shrinks. Credit only the ledger decrease, which excludes its bytes.
         let before = charged();
         let released = store.shrink(ShrinkPolicy::Idle).unwrap();
-        assert!(released > 0);
-        assert_eq!(charged(), before - released);
+        assert_eq!(released, before.saturating_sub(charged()));
         assert!(store.committed().0 < rows);
         assert!(store.committed().0 >= 1000);
+        assert_eq!(
+            store.external_pinned_bytes().unwrap(),
+            plane.storage_bytes()
+        );
+        let pinned_charge = charged();
+        drop(plane);
+        assert!(charged() < pinned_charge);
+        assert_eq!(store.external_pinned_bytes().unwrap(), 0);
         drop(state);
         // Idle hysteresis keeps a small backing; pressure releases it all.
         store.shrink(ShrinkPolicy::Pressure).unwrap();
         assert_eq!(store.committed(), (HISTORY_GRANULE, 3));
         assert!(store.release_idle().unwrap() > 0);
         assert_eq!(charged(), base);
+    }
+
+    /// A failed second CUDA history-plane growth must leave the published
+    /// StateStore backing and both original planes usable at their old size.
+    #[test]
+    fn failed_second_cuda_plane_growth_keeps_published_history() {
+        let Some(device) = DeviceCatalog::discover()
+            .ok()
+            .and_then(|catalog| catalog.open_backend(BackendName::Cuda).ok())
+            .map(Rc::new)
+        else {
+            return;
+        };
+        eprintln!("StateStore rollback backend: {}", device.backend().as_str());
+        let store = StateStore::new(
+            device.clone(),
+            512,
+            512,
+            vec![dense_component(4096)],
+            vec![],
+            BankCapacity {
+                active: 1,
+                in_flight: 1,
+                retained: 0,
+            },
+        )
+        .unwrap();
+        store.recommit_history(128).unwrap();
+        let encoded = (0..4096u32)
+            .flat_map(|value| (value as f32).to_le_bytes())
+            .collect::<Vec<_>>();
+        {
+            let backing = store.backing.borrow();
+            for plane in &backing.history {
+                plane
+                    .slice_leading(0, 1)
+                    .unwrap()
+                    .write_from_host(&encoded)
+                    .unwrap();
+            }
+        }
+        let baseline = device.memory_usage().charged;
+        let tentative = store.backing.borrow().history[0].recommitted(256).unwrap();
+        let first_delta = device.memory_usage().charged - baseline;
+        assert!(first_delta > 0, "the first CUDA plane must grow physically");
+        drop(tentative);
+        assert_eq!(device.memory_usage().charged, baseline);
+        device.set_memory_limit(Some(baseline + first_delta));
+        assert!(matches!(
+            store.recommit_history(256),
+            Err(Error::Tensor(seismic::TensorError::Execution(
+                seismic::ExecutionError::AllocationCapacity { .. }
+            )))
+        ));
+        device.set_memory_limit(None);
+        assert_eq!(store.committed().0, 128);
+        assert_eq!(device.memory_usage().charged, baseline);
+        let backing = store.backing.borrow();
+        for plane in &backing.history {
+            assert_eq!(plane.committed_rows(), 128);
+            assert_eq!(
+                plane.slice_leading(0, 1).unwrap().read_to_host().unwrap(),
+                encoded
+            );
+        }
     }
 
     /// Regression (chost 15:36): shrinking after every step released the
@@ -3030,7 +3910,10 @@ mod tests {
         }
         // Only geometric growth: the rows grow 500 -> 800, the banks once.
         let changes = store.recommits() + store.relayouts().count - settled;
-        assert!(changes <= 3, "300 decode steps changed the backing {changes} times");
+        assert!(
+            changes <= 3,
+            "300 decode steps changed the backing {changes} times"
+        );
     }
 
     /// Shrinking relays out live rows stranded high in the backing: the
@@ -3100,7 +3983,20 @@ mod tests {
         let before = (store.committed().0, device.memory_usage().charged);
         let occupied = store.occupied_rows();
         assert_eq!(occupied, 100 + 50 + 20);
+        let shape = store.pressure_shrink_shape().unwrap();
+        assert_eq!(shape.referenced_rows, occupied);
+        assert!(shape.highest_referenced_row > shape.target_rows);
+        assert!(shape.history_peak_bytes > 0);
+        assert_eq!(shape.active_transactions, 0);
         let relayouts = store.relayouts().count;
+        // The live rows sit above the low hole. Releasing this surplus
+        // requires a fresh relayout backing; a tight peak charge cannot
+        // perform that copy, even though the final backing would be smaller.
+        device.set_memory_limit(Some(before.1));
+        assert_eq!(store.shrink(ShrinkPolicy::Pressure).unwrap(), 0);
+        assert_eq!(store.committed().0, before.0);
+        assert_eq!(store.relayouts().count, relayouts);
+        device.set_memory_limit(None);
         let released = store.shrink(ShrinkPolicy::Idle).unwrap();
         assert_eq!(store.relayouts().count, relayouts + 1);
         assert!(released > 0);
@@ -3113,6 +4009,100 @@ mod tests {
         assert_eq!(read(long.history_ranges()), expected(150));
         assert_eq!(read(short.history_ranges()), expected(120));
         assert_eq!(read(system.history_ranges()), expected(100));
+    }
+
+    #[test]
+    fn pressure_compacts_claimed_banks_before_releasing_the_tail() {
+        let Some(device) = cpu_device() else {
+            return;
+        };
+        let store = StateStore::new(
+            device.clone(),
+            64,
+            256,
+            vec![],
+            vec![
+                ComponentSpec {
+                    shape: vec![4],
+                    dtype: DType::F32,
+                },
+                ComponentSpec {
+                    shape: vec![8],
+                    dtype: DType::F32,
+                },
+            ],
+            BankCapacity {
+                active: 8,
+                in_flight: 1,
+                retained: 0,
+            },
+        )
+        .unwrap();
+        store.recommit_banks(10).unwrap();
+        let mut claims = (0..9)
+            .map(|_| Some(store.banks.acquire().unwrap()))
+            .collect::<Vec<_>>();
+        let kept = [2usize, 5, 9];
+        for &index in &kept {
+            for (plane_index, plane) in store.recurrent_arenas().iter().enumerate() {
+                let bytes = vec![index as u8 + plane_index as u8; (4 + 4 * plane_index) * 4];
+                plane
+                    .slice_leading(index as u64, index as u64 + 1)
+                    .unwrap()
+                    .write_from_host(&bytes)
+                    .unwrap();
+            }
+        }
+        for index in 1..=9 {
+            if !kept.contains(&index) {
+                drop(claims[index - 1].take());
+            }
+        }
+        let charged = device.memory_usage().charged;
+        device.set_memory_limit(Some(charged));
+        assert_eq!(store.shrink(ShrinkPolicy::Pressure).unwrap(), 0);
+        assert_eq!(store.committed().1, 10);
+        let remapped = kept.map(|index| claims[index - 1].as_ref().unwrap().index());
+        assert_eq!(
+            remapped, kept,
+            "failed peak allocation leaves placement intact"
+        );
+        // The first destination plane fits, but the second does not. Its
+        // failure must discard the first copy without publishing placement.
+        device.set_memory_limit(Some(charged + 6 * 16));
+        assert_eq!(store.shrink(ShrinkPolicy::Pressure).unwrap(), 0);
+        assert_eq!(store.committed().1, 10);
+        assert_eq!(device.memory_usage().charged, charged);
+        assert_eq!(
+            kept.map(|index| claims[index - 1].as_ref().unwrap().index()),
+            kept
+        );
+        for old in kept {
+            for (plane_index, plane) in store.recurrent_arenas().iter().enumerate() {
+                let bytes = plane
+                    .slice_leading(old as u64, old as u64 + 1)
+                    .unwrap()
+                    .read_to_host()
+                    .unwrap();
+                assert_eq!(bytes, vec![old as u8 + plane_index as u8; bytes.len()]);
+            }
+        }
+        device.set_memory_limit(None);
+        assert!(store.shrink(ShrinkPolicy::Pressure).unwrap() > 0);
+        assert_eq!(store.committed().1, 6);
+        let remapped = kept.map(|index| claims[index - 1].as_ref().unwrap().index());
+        assert_eq!(remapped, [1, 2, 3]);
+        for (old, new) in kept.into_iter().zip(remapped) {
+            for (plane_index, plane) in store.recurrent_arenas().iter().enumerate() {
+                let bytes = plane
+                    .slice_leading(new as u64, new as u64 + 1)
+                    .unwrap()
+                    .read_to_host()
+                    .unwrap();
+                assert_eq!(bytes, vec![old as u8 + plane_index as u8; bytes.len()]);
+            }
+        }
+        assert!(device.memory_usage().charged < charged);
     }
 
     struct Interleaved {
@@ -3142,9 +4132,17 @@ mod tests {
             eprintln!(
                 "interleaved active={active} contexts={contexts}: segments={} relayouts={} \
                  copied={} written={} peak_committed={} of {reserved}",
-                run.segments, run.relayouts.count, run.relayouts.rows, run.written, run.peak_committed
+                run.segments,
+                run.relayouts.count,
+                run.relayouts.rows,
+                run.written,
+                run.peak_committed
             );
-            assert!(run.decode_steps > 100, "requests ran {} decode steps", run.decode_steps);
+            assert!(
+                run.decode_steps > 100,
+                "requests ran {} decode steps",
+                run.decode_steps
+            );
             assert_eq!(
                 run.segments, 1,
                 "{active} requests in {contexts} contexts reached {} segments",

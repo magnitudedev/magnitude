@@ -71,7 +71,9 @@ pub fn run_public(name: &str, backend: BackendName, selection: Selection) {
                     "{name}: expected a source error containing {diagnostic:?}, got {}: {}",
                     e.kind, e.message
                 ),
-                Ok(_) => panic!("{name}: the checker accepts a program it must reject ({diagnostic:?})"),
+                Ok(_) => {
+                    panic!("{name}: the checker accepts a program it must reject ({diagnostic:?})")
+                }
             }
             return;
         }
@@ -101,7 +103,9 @@ pub fn run_public(name: &str, backend: BackendName, selection: Selection) {
             let preparation = prepare(&function, &device, BTreeMap::new(), &policy, &selection);
             let elapsed = start.elapsed();
             if let Some(bound) = scenario.preparation_bound.filter(|bound| elapsed > *bound) {
-                failures.push(format!("{context}: preparation took {elapsed:?}, bound {bound:?}"));
+                failures.push(format!(
+                    "{context}: preparation took {elapsed:?}, bound {bound:?}"
+                ));
             }
             let (kernel, session) = match preparation {
                 Ok(prepared) => prepared,
@@ -112,7 +116,9 @@ pub fn run_public(name: &str, backend: BackendName, selection: Selection) {
             };
             let run = |kernel: &Kernel, stage: &str, failures: &mut Vec<String>| {
                 for (index, call) in calls.iter().enumerate() {
-                    if let Err(e) = check_call(kernel, &device, &call.arguments, call.termination, &policy) {
+                    if let Err(e) =
+                        check_call(kernel, &device, &call.arguments, call.termination, &policy)
+                    {
                         failures.push(format!("{context} invocation {index}{stage}: {e}"));
                     }
                 }
@@ -128,7 +134,10 @@ pub fn run_public(name: &str, backend: BackendName, selection: Selection) {
     }
     for (index, invocation) in invocations.iter().enumerate() {
         if let Err(e) = check_oracle(&scenario, &device, invocation) {
-            failures.push(format!("oracle {} invocation {index}: {e}", invocation.entry));
+            failures.push(format!(
+                "oracle {} invocation {index}: {e}",
+                invocation.entry
+            ));
         }
     }
     assert!(failures.is_empty(), "{name}:\n{}", failures.join("\n"));
@@ -198,7 +207,10 @@ pub fn check_call(
 fn refused_index_width(called: Result<Value, seismic::dynamic::Error>) -> Result<(), String> {
     match called {
         Err(e) if e.message.contains("IndexWidth") => Ok(()),
-        Err(e) => Err(format!("expected an IndexWidth refusal, got {}: {}", e.kind, e.message)),
+        Err(e) => Err(format!(
+            "expected an IndexWidth refusal, got {}: {}",
+            e.kind, e.message
+        )),
         Ok(_) => Err("expected an IndexWidth refusal, the call returned".into()),
     }
 }
@@ -207,13 +219,18 @@ fn unconstrained_termination(
     called: Result<Value, seismic::dynamic::Error>,
     termination: Option<Termination>,
 ) -> Result<(), String> {
-    let source_failure = |e: &seismic::dynamic::Error| e.kind == "ExecutionError" && e.message.starts_with("check failed at ");
+    let source_failure = |e: &seismic::dynamic::Error| {
+        e.kind == "ExecutionError" && e.message.starts_with("check failed at ")
+    };
     match (called, termination) {
         (Ok(_), None | Some(Termination::Returned)) => Ok(()),
         (Err(e), None | Some(Termination::Failed)) if source_failure(&e) => Ok(()),
         (Err(e), Some(Termination::InvalidInvocation)) if e.kind == "InvocationError" => Ok(()),
         (Ok(_), expected) => Err(format!("expected {expected:?}, the call returned")),
-        (Err(e), expected) => Err(format!("expected {expected:?}, got {}: {}", e.kind, e.message)),
+        (Err(e), expected) => Err(format!(
+            "expected {expected:?}, got {}: {}",
+            e.kind, e.message
+        )),
     }
 }
 
@@ -228,7 +245,10 @@ fn verdict(report: &CheckReport) -> Result<(), String> {
 fn invalid_invocation(checked: Result<CheckReport, seismic::dynamic::Error>) -> Result<(), String> {
     match checked {
         Err(e) if e.kind == "InvocationError" => Ok(()),
-        Err(e) => Err(format!("expected an invalid invocation, got {}: {}", e.kind, e.message)),
+        Err(e) => Err(format!(
+            "expected an invalid invocation, got {}: {}",
+            e.kind, e.message
+        )),
         Ok(report) => Err(format!(
             "expected an invalid invocation, got check {}: {}",
             report.status, report.diagnostic
@@ -256,7 +276,11 @@ fn generate_all(device: &Device, specs: &[ArgumentSpec]) -> Result<Vec<Generated
 
 /// Builds the entry's argument values from flat specs, in parameter order;
 /// tuple parameters consume one spec per leaf. Type agreement is the API's to check.
-pub fn arguments(device: &Device, function: &Function, specs: &[ArgumentSpec]) -> Result<Vec<Value>, String> {
+pub fn arguments(
+    device: &Device,
+    function: &Function,
+    specs: &[ArgumentSpec],
+) -> Result<Vec<Value>, String> {
     let mut generated = generate_all(device, specs)?.into_iter();
     let values = function
         .parameters()
@@ -296,7 +320,13 @@ fn value(
             } => {
                 let tensor = Tensor::from_host(device, element_named(&element), &shape, &bytes)
                     .map_err(|e| format!("{parameter}: {e}"))?;
-                if matches!(ty, SignatureType::Tensor { access: TensorAccess::Owned, .. }) {
+                if matches!(
+                    ty,
+                    SignatureType::Tensor {
+                        access: TensorAccess::Owned,
+                        ..
+                    }
+                ) {
                     Value::Move(tensor)
                 } else {
                     Value::Tensor(tensor)
@@ -320,7 +350,11 @@ fn value(
 
 /// Step 5: the interpreter's own termination class and pinned values, compared
 /// bit for bit. This checks the oracle, which the differential check cannot.
-fn check_oracle(scenario: &Scenario, device: &Device, invocation: &Invocation) -> Result<(), String> {
+fn check_oracle(
+    scenario: &Scenario,
+    device: &Device,
+    invocation: &Invocation,
+) -> Result<(), String> {
     match invocation.termination {
         None if invocation.pins.is_empty() => return Ok(()),
         // A device limit, not a source outcome: the interpreter is not run.
@@ -360,7 +394,9 @@ fn check_oracle(scenario: &Scenario, device: &Device, invocation: &Invocation) -
                     .map(|extent| usize::try_from(*extent).map_err(|e| e.to_string()))
                     .collect::<Result<Vec<_>, _>>()?;
                 let data = match registry::representation_info(representation).kind {
-                    RepresentationKind::Dense(dtype) => TensorData::dense_from_bytes(dtype, shape, bytes),
+                    RepresentationKind::Dense(dtype) => {
+                        TensorData::dense_from_bytes(dtype, shape, bytes)
+                    }
                     _ => TensorData::encoded(representation, shape, bytes),
                 }?;
                 Arg::Tensor(interpreter.add_tensor(data))
@@ -374,7 +410,11 @@ fn check_oracle(scenario: &Scenario, device: &Device, invocation: &Invocation) -
             }
         });
     }
-    let outcome = match interpreter.run_bounded_with_memory(&oracle_args, CHECK_WORK_UNITS, CHECK_MEMORY_BYTES) {
+    let outcome = match interpreter.run_bounded_with_memory(
+        &oracle_args,
+        CHECK_WORK_UNITS,
+        CHECK_MEMORY_BYTES,
+    ) {
         Err(OracleError::InvalidInvocation(reason)) => {
             return match (invocation.termination, invocation.pins.is_empty()) {
                 (Some(Termination::InvalidInvocation), true) => Ok(()),
@@ -388,8 +428,13 @@ fn check_oracle(scenario: &Scenario, device: &Device, invocation: &Invocation) -
         seismic_lang::failure::SourceTermination::Returned(_) => Termination::Returned,
         seismic_lang::failure::SourceTermination::Failed(_) => Termination::Failed,
     };
-    if let Some(expected) = invocation.termination.filter(|expected| *expected != termination) {
-        return Err(format!("the interpreter terminates {termination:?}, expected {expected:?}"));
+    if let Some(expected) = invocation
+        .termination
+        .filter(|expected| *expected != termination)
+    {
+        return Err(format!(
+            "the interpreter terminates {termination:?}, expected {expected:?}"
+        ));
     }
     for pin in &invocation.pins {
         let actual = match &pin.subject {
@@ -413,8 +458,13 @@ fn check_oracle(scenario: &Scenario, device: &Device, invocation: &Invocation) -
                 let bits = match value {
                     OutcomeValue::Tensor(reader) => tensor_bits(pin, &reader)?,
                     OutcomeValue::Scalar(scalar) => {
-                        if !pin.shape.is_empty() || registry::dense(scalar.dtype()) != pin_representation(pin) {
-                            return Err(format!("result {path:?} is a {} scalar", scalar.dtype().name()));
+                        if !pin.shape.is_empty()
+                            || registry::dense(scalar.dtype()) != pin_representation(pin)
+                        {
+                            return Err(format!(
+                                "result {path:?} is a {} scalar",
+                                scalar.dtype().name()
+                            ));
                         }
                         vec![u64::from(scalar.bits())]
                     }

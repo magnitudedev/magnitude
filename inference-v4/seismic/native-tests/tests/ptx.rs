@@ -9,15 +9,16 @@ use seismic::{
 };
 use seismic_native_tests::{
     ptx_approximate, ptx_cp_async, ptx_dp4a_s8, ptx_dp4a_u8s8, ptx_ldmatrix, ptx_ldmatrix_trans,
-    ptx_load_nc, ptx_mma_m16n8k16, ptx_mma_m16n8k32_s8, ptx_pack, ptx_redux_s32, ptx_redux_u32, ptx_rounded,
-    ptx_shuffle, ptx_unpack,
+    ptx_load_nc, ptx_mma_m16n8k16, ptx_mma_m16n8k32_s8, ptx_pack, ptx_redux_s32, ptx_redux_u32,
+    ptx_rounded, ptx_shuffle, ptx_unpack,
 };
 use std::time::Instant;
 
 fn cuda_devices() -> Vec<Device> {
     let catalog = DeviceCatalog::discover().expect("device discovery");
     let available = catalog.topology().devices().iter().any(|device| {
-        device.backend == BackendName::Cuda && matches!(device.availability, Availability::Available)
+        device.backend == BackendName::Cuda
+            && matches!(device.availability, Availability::Available)
     });
     if !available {
         eprintln!("no available CUDA device; the CUDA device-library fixtures do not run");
@@ -47,15 +48,24 @@ fn tensor(device: &Device, element: Element, extents: &[u64], bytes: Vec<u8>) ->
 }
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    values.iter().flat_map(|value| value.to_le_bytes()).collect()
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
 }
 
 fn i32_bytes(values: &[i32]) -> Vec<u8> {
-    values.iter().flat_map(|value| value.to_le_bytes()).collect()
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
 }
 
 fn u16_bytes(values: &[u16]) -> Vec<u8> {
-    values.iter().flat_map(|value| value.to_le_bytes()).collect()
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
 }
 
 fn words<const N: usize>(tensor: &Tensor) -> Vec<[u8; N]> {
@@ -68,15 +78,24 @@ fn words<const N: usize>(tensor: &Tensor) -> Vec<[u8; N]> {
 }
 
 fn read_f32(tensor: &Tensor) -> Vec<f32> {
-    words::<4>(tensor).into_iter().map(f32::from_le_bytes).collect()
+    words::<4>(tensor)
+        .into_iter()
+        .map(f32::from_le_bytes)
+        .collect()
 }
 
 fn read_i32(tensor: &Tensor) -> Vec<i32> {
-    words::<4>(tensor).into_iter().map(i32::from_le_bytes).collect()
+    words::<4>(tensor)
+        .into_iter()
+        .map(i32::from_le_bytes)
+        .collect()
 }
 
 fn read_u16(tensor: &Tensor) -> Vec<u16> {
-    words::<2>(tensor).into_iter().map(u16::from_le_bytes).collect()
+    words::<2>(tensor)
+        .into_iter()
+        .map(u16::from_le_bytes)
+        .collect()
 }
 
 /// A deterministic sequence (SplitMix64).
@@ -177,7 +196,8 @@ fn mma_m16n8k16_matches_the_f32_reference_for_f16_and_bf16() {
             ("f16", Element::f16(), f16_bits as fn(f32) -> u16),
             ("bf16", Element::bf16(), bf16_bits as fn(f32) -> u16),
         ] {
-            let encoded = |values: &[f32]| u16_bytes(&values.iter().map(|v| encode(*v)).collect::<Vec<_>>());
+            let encoded =
+                |values: &[f32]| u16_bytes(&values.iter().map(|v| encode(*v)).collect::<Vec<_>>());
             let a_tensor = tensor(&device, element, &[16, k as u64], encoded(&a));
             let b_tensor = tensor(&device, element, &[8, k as u64], encoded(&b));
             let kernel = formed(&format!("ptx_mma_m16n8k16 {name}"), || {
@@ -206,8 +226,12 @@ fn mma_m16n8k32_s8_matches_the_integer_reference() {
     for device in cuda_devices() {
         let k = 96usize;
         let mut sequence = Sequence(7);
-        let a = (0..16 * k).map(|_| sequence.between(-128, 127)).collect::<Vec<_>>();
-        let b = (0..8 * k).map(|_| sequence.between(-128, 127)).collect::<Vec<_>>();
+        let a = (0..16 * k)
+            .map(|_| sequence.between(-128, 127))
+            .collect::<Vec<_>>();
+        let b = (0..8 * k)
+            .map(|_| sequence.between(-128, 127))
+            .collect::<Vec<_>>();
         let expected = (0..16 * 8)
             .map(|index| {
                 let (i, j) = (index / 8, index % 8);
@@ -234,7 +258,9 @@ fn mma_m16n8k32_s8_matches_the_integer_reference() {
 fn ldmatrix_fragments_reproduce_and_transpose_every_matrix() {
     for device in cuda_devices() {
         // 256 distinct exactly representable values.
-        let values = (0..256).map(|index| f16_bits(index as f32)).collect::<Vec<_>>();
+        let values = (0..256)
+            .map(|index| f16_bits(index as f32))
+            .collect::<Vec<_>>();
         let x = tensor(&device, Element::f16(), &[4, 8, 8], u16_bytes(&values));
         let transposed = (0..256)
             .map(|index| {
@@ -257,7 +283,9 @@ fn ldmatrix_fragments_reproduce_and_transpose_every_matrix() {
                     &specialization,
                 )
             });
-            let result = trans.call(ptx_ldmatrix_trans::Args { x: &x }).expect("call");
+            let result = trans
+                .call(ptx_ldmatrix_trans::Args { x: &x })
+                .expect("call");
             assert_eq!(read_u16(&result.value), transposed, "x{count}.trans");
         }
     }
@@ -267,7 +295,9 @@ fn ldmatrix_fragments_reproduce_and_transpose_every_matrix() {
 fn cp_async_pipelines_copy_with_a_zero_filled_tail() {
     for device in cuda_devices() {
         for n in [5003usize, 1000, 3] {
-            let values = (0..n).map(|index| index as f32 * 0.5 - 7.0).collect::<Vec<_>>();
+            let values = (0..n)
+                .map(|index| index as f32 * 0.5 - 7.0)
+                .collect::<Vec<_>>();
             let x = tensor(&device, Element::f32(), &[n as u64], f32_bytes(&values));
             for stages in [1u64, 2, 3] {
                 let kernel = formed(&format!("ptx_cp_async stages {stages} n {n}"), || {
@@ -278,7 +308,10 @@ fn cp_async_pipelines_copy_with_a_zero_filled_tail() {
                 });
                 let result = kernel.call(ptx_cp_async::Args { x: &x }).expect("call");
                 let copied = read_f32(&result.value);
-                assert!(!copied[0].is_nan(), "stages {stages}, n {n}: zero fill did not happen");
+                assert!(
+                    !copied[0].is_nan(),
+                    "stages {stages}, n {n}: zero fill did not happen"
+                );
                 assert_eq!(copied, values, "stages {stages}, n {n}");
             }
         }
@@ -289,17 +322,26 @@ fn cp_async_pipelines_copy_with_a_zero_filled_tail() {
 fn non_coherent_loads_and_prefetch_copy_every_element() {
     for device in cuda_devices() {
         for n in [5003usize, 4096, 2, 1] {
-            let values = (0..n).map(|index| (index as f32).sqrt()).collect::<Vec<_>>();
+            let values = (0..n)
+                .map(|index| (index as f32).sqrt())
+                .collect::<Vec<_>>();
             let x = tensor(&device, Element::f32(), &[n as u64], f32_bytes(&values));
             for no_allocate in [0u64, 1] {
-                let kernel = formed(&format!("ptx_load_nc no_allocate {no_allocate} n {n}"), || {
-                    ptx_load_nc::native_for_device(
-                        &device,
-                        &NativeSpecialization::new().with_param("NO_ALLOCATE", no_allocate),
-                    )
-                });
+                let kernel = formed(
+                    &format!("ptx_load_nc no_allocate {no_allocate} n {n}"),
+                    || {
+                        ptx_load_nc::native_for_device(
+                            &device,
+                            &NativeSpecialization::new().with_param("NO_ALLOCATE", no_allocate),
+                        )
+                    },
+                );
                 let result = kernel.call(ptx_load_nc::Args { x: &x }).expect("call");
-                assert_eq!(read_f32(&result.value), values, "no_allocate {no_allocate}, n {n}");
+                assert_eq!(
+                    read_f32(&result.value),
+                    values,
+                    "no_allocate {no_allocate}, n {n}"
+                );
             }
         }
     }
@@ -343,8 +385,12 @@ fn redux_matches_the_integer_reference_for_signed_and_unsigned() {
     for device in cuda_devices() {
         let w = 4usize;
         let mut sequence = Sequence(11);
-        let signed = (0..w * 32).map(|_| sequence.between(-1000, 1000)).collect::<Vec<_>>();
-        let unsigned = (0..w * 32).map(|_| sequence.between(0, 100_000)).collect::<Vec<_>>();
+        let signed = (0..w * 32)
+            .map(|_| sequence.between(-1000, 1000))
+            .collect::<Vec<_>>();
+        let unsigned = (0..w * 32)
+            .map(|_| sequence.between(0, 100_000))
+            .collect::<Vec<_>>();
         let expected = |values: &[i32]| {
             values
                 .chunks_exact(32)
@@ -370,7 +416,12 @@ fn redux_matches_the_integer_reference_for_signed_and_unsigned() {
             ptx_redux_u32::native_for_device(&device, &NativeSpecialization::new())
         })
         .call(ptx_redux_u32::Args {
-            x: &tensor(&device, Element::u32(), &[w as u64, 32], i32_bytes(&unsigned)),
+            x: &tensor(
+                &device,
+                Element::u32(),
+                &[w as u64, 32],
+                i32_bytes(&unsigned),
+            ),
         })
         .expect("call");
         assert_eq!(read_i32(&u32.value), expected(&unsigned));
@@ -382,10 +433,18 @@ fn dp4a_matches_the_byte_dot_product_reference() {
     for device in cuda_devices() {
         let n = 1000usize;
         let mut sequence = Sequence(3);
-        let signed = (0..n * 4).map(|_| sequence.between(-128, 127)).collect::<Vec<_>>();
-        let unsigned = (0..n * 4).map(|_| sequence.between(0, 255)).collect::<Vec<_>>();
-        let b = (0..n * 4).map(|_| sequence.between(-128, 127)).collect::<Vec<_>>();
-        let acc = (0..n).map(|_| sequence.between(-100_000, 100_000)).collect::<Vec<_>>();
+        let signed = (0..n * 4)
+            .map(|_| sequence.between(-128, 127))
+            .collect::<Vec<_>>();
+        let unsigned = (0..n * 4)
+            .map(|_| sequence.between(0, 255))
+            .collect::<Vec<_>>();
+        let b = (0..n * 4)
+            .map(|_| sequence.between(-128, 127))
+            .collect::<Vec<_>>();
+        let acc = (0..n)
+            .map(|_| sequence.between(-100_000, 100_000))
+            .collect::<Vec<_>>();
         let reference = |a: &[i32]| {
             (0..n)
                 .map(|i| acc[i] + (0..4).map(|j| a[i * 4 + j] * b[i * 4 + j]).sum::<i32>())
@@ -407,7 +466,12 @@ fn dp4a_matches_the_byte_dot_product_reference() {
             ptx_dp4a_u8s8::native_for_device(&device, &NativeSpecialization::new())
         })
         .call(ptx_dp4a_u8s8::Args {
-            a: &tensor(&device, Element::i32(), &[n as u64, 4], i32_bytes(&unsigned)),
+            a: &tensor(
+                &device,
+                Element::i32(),
+                &[n as u64, 4],
+                i32_bytes(&unsigned),
+            ),
             b: &b_tensor,
             acc: &acc_tensor,
         })
@@ -425,7 +489,11 @@ fn pairs_pack_with_nearest_even_rounding_and_unpack_exactly() {
         let mut values = (0..4096)
             .map(|_| {
                 let magnitude = 2f32.powi(sequence.between(-30, 17)) * (1.0 + sequence.unit());
-                if sequence.next() & 1 == 0 { magnitude } else { -magnitude }
+                if sequence.next() & 1 == 0 {
+                    magnitude
+                } else {
+                    -magnitude
+                }
             })
             .collect::<Vec<_>>();
         values.extend([
@@ -436,7 +504,12 @@ fn pairs_pack_with_nearest_even_rounding_and_unpack_exactly() {
             0.0,
             -0.0,
         ]);
-        let x = tensor(&device, Element::f32(), &[values.len() as u64], f32_bytes(&values));
+        let x = tensor(
+            &device,
+            Element::f32(),
+            &[values.len() as u64],
+            f32_bytes(&values),
+        );
         for (name, element, encode) in [
             ("f16", Element::f16(), f16_bits as fn(f32) -> u16),
             ("bf16", Element::bf16(), bf16_bits as fn(f32) -> u16),
@@ -449,7 +522,10 @@ fn pairs_pack_with_nearest_even_rounding_and_unpack_exactly() {
                 )
             });
             let result = kernel.call(ptx_pack::Args { x: &x }).expect("call");
-            let expected = values.iter().map(|value| encode(*value)).collect::<Vec<_>>();
+            let expected = values
+                .iter()
+                .map(|value| encode(*value))
+                .collect::<Vec<_>>();
             assert_eq!(read_u16(&result.value), expected, "{name}");
         }
         // Every non-NaN 16-bit pattern widens exactly.
@@ -467,7 +543,9 @@ fn pairs_pack_with_nearest_even_rounding_and_unpack_exactly() {
                 (|bits: u16| bits & 0x7f80 == 0x7f80 && bits & 0x7f != 0) as fn(u16) -> bool,
             ),
         ] {
-            let mut patterns = (0..=u16::MAX).filter(|bits| !is_nan(*bits)).collect::<Vec<_>>();
+            let mut patterns = (0..=u16::MAX)
+                .filter(|bits| !is_nan(*bits))
+                .collect::<Vec<_>>();
             if patterns.len() % 2 == 1 {
                 patterns.push(0);
             }
@@ -480,12 +558,21 @@ fn pairs_pack_with_nearest_even_rounding_and_unpack_exactly() {
             });
             let result = kernel
                 .call(ptx_unpack::Args {
-                    x: &tensor(&device, element, &[patterns.len() as u64], u16_bytes(&patterns)),
+                    x: &tensor(
+                        &device,
+                        element,
+                        &[patterns.len() as u64],
+                        u16_bytes(&patterns),
+                    ),
                 })
                 .expect("call");
             let widened = read_f32(&result.value);
             for (bits, value) in patterns.iter().zip(widened) {
-                assert_eq!(value.to_bits(), decode(*bits).to_bits(), "{name} {bits:#06x}");
+                assert_eq!(
+                    value.to_bits(),
+                    decode(*bits).to_bits(),
+                    "{name} {bits:#06x}"
+                );
             }
         }
     }
@@ -498,7 +585,11 @@ fn rounded_arithmetic_is_correctly_rounded_including_subnormals() {
         let mut sequence = Sequence(13);
         let mut draw = || {
             let magnitude = 2f32.powi(sequence.between(-140, 60)) * (1.0 + sequence.unit());
-            if sequence.next() & 1 == 0 { magnitude } else { -magnitude }
+            if sequence.next() & 1 == 0 {
+                magnitude
+            } else {
+                -magnitude
+            }
         };
         let a = (0..n).map(|_| draw()).collect::<Vec<_>>();
         let b = (0..n).map(|_| draw()).collect::<Vec<_>>();
@@ -535,7 +626,9 @@ fn approximate_functions_stay_within_their_documented_error() {
     for device in cuda_devices() {
         let n = 4096usize;
         let mut sequence = Sequence(17);
-        let x = (0..n).map(|_| 0.01 + 8.0 * sequence.unit()).collect::<Vec<_>>();
+        let x = (0..n)
+            .map(|_| 0.01 + 8.0 * sequence.unit())
+            .collect::<Vec<_>>();
         let kernel = formed("ptx_approximate", || {
             ptx_approximate::native_for_device(&device, &NativeSpecialization::new())
         });

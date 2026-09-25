@@ -19,13 +19,16 @@ static HOST: Mutex<Weak<Mutex<Workers>>> = Mutex::new(Weak::new());
 
 pub fn open_host() -> Result<OpenedCpu, TargetError> {
     let workers = {
-        let mut host = HOST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut host = HOST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match host.upgrade() {
             Some(workers) => workers,
             None => {
-                let workers = Arc::new(Mutex::new(
-                    Workers::host().map_err(|error| TargetError::DeviceUnavailable(error.to_string()))?,
-                ));
+                let workers =
+                    Arc::new(Mutex::new(Workers::host().map_err(|error| {
+                        TargetError::DeviceUnavailable(error.to_string())
+                    })?));
                 *host = Arc::downgrade(&workers);
                 workers
             }

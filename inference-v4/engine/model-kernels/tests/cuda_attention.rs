@@ -51,7 +51,13 @@ fn cuda_decode_matches_portable_body() {
         let kernel = cuda_decode(&device, SMALL, config);
         let mut bound = Bound::new(&device, &case);
         let gated = run_decode(&kernel, &mut bound, &case);
-        check(&format!("cuda small decode {config:?}"), &case, &gated, &bound, &expected);
+        check(
+            &format!("cuda small decode {config:?}"),
+            &case,
+            &gated,
+            &bound,
+            &expected,
+        );
     }
 }
 
@@ -65,7 +71,13 @@ fn cuda_prefill_matches_portable_body() {
         let kernel = cuda_prefill(&device, SMALL, warps);
         let mut bound = Bound::new(&device, &case);
         let gated = run_prefill(&kernel, &mut bound, &case);
-        check(&format!("cuda small prefill WARPS={warps}"), &case, &gated, &bound, &expected);
+        check(
+            &format!("cuda small prefill WARPS={warps}"),
+            &case,
+            &gated,
+            &bound,
+            &expected,
+        );
     }
 }
 
@@ -79,17 +91,35 @@ fn cuda_qwen_geometry_decode_and_prefill_match_host_model() {
             let kernel = cuda_decode(&device, QWEN, config);
             let mut bound = Bound::new(&device, &case);
             let gated = run_decode(&kernel, &mut bound, &case);
-            check(&format!("cuda decode context {context} {config:?}"), &case, &gated, &bound, &expected);
+            check(
+                &format!("cuda decode context {context} {config:?}"),
+                &case,
+                &gated,
+                &bound,
+                &expected,
+            );
         }
     }
     for (rows, history) in [(40, 300), (128, 1000)] {
-        let case = Case::new(QWEN, history as usize + 256, 2, &prefill_rows(rows, history), 7);
+        let case = Case::new(
+            QWEN,
+            history as usize + 256,
+            2,
+            &prefill_rows(rows, history),
+            7,
+        );
         let expected = case.expected();
         for warps in [4, 2] {
             let kernel = cuda_prefill(&device, QWEN, warps);
             let mut bound = Bound::new(&device, &case);
             let gated = run_prefill(&kernel, &mut bound, &case);
-            check(&format!("cuda prefill {rows} rows WARPS={warps}"), &case, &gated, &bound, &expected);
+            check(
+                &format!("cuda prefill {rows} rows WARPS={warps}"),
+                &case,
+                &gated,
+                &bound,
+                &expected,
+            );
         }
     }
 }
@@ -102,7 +132,10 @@ fn cuda_qwen_geometry_decode_and_prefill_match_host_model() {
 #[ignore = "timing; run explicitly on the measurement host"]
 fn cuda_attention_timings() {
     let Some(device) = cuda() else { return };
-    let options = seismic::MeasureOptions { samples: 15, min_sample_seconds: 0.002 };
+    let options = seismic::MeasureOptions {
+        samples: 15,
+        min_sample_seconds: 0.002,
+    };
     for context in [256usize, 4096, 16384] {
         let rows = vec![Row {
             spans: vec![(0, context as i32 - 1)],
@@ -112,7 +145,9 @@ fn cuda_attention_timings() {
         }];
         let case = Case::new(QWEN, context, 1, &rows, 3);
         let rotation = if context >= 4096 { 3 } else { 1 };
-        let mut bounds = (0..rotation).map(|_| Bound::new(&device, &case)).collect::<Vec<_>>();
+        let mut bounds = (0..rotation)
+            .map(|_| Bound::new(&device, &case))
+            .collect::<Vec<_>>();
         for config in DECODE_CONFIGS {
             let kernel = cuda_decode(&device, QWEN, config);
             let args = bounds
@@ -145,7 +180,11 @@ fn cuda_attention_timings() {
         }
     }
     for (rows, history) in [(128usize, 1024i32), (128, 0)] {
-        let spans = if history > 0 { vec![(0, history)] } else { vec![] };
+        let spans = if history > 0 {
+            vec![(0, history)]
+        } else {
+            vec![]
+        };
         let rows_spec = (0..rows)
             .map(|row| Row {
                 spans: spans.clone(),

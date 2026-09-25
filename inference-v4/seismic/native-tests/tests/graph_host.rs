@@ -20,15 +20,24 @@ const RUNS: usize = 200;
 fn devices() -> Vec<Device> {
     let catalog = DeviceCatalog::discover().expect("device discovery");
     let topology = catalog.topology();
-    [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]
-        .into_iter()
-        .filter(|backend| {
-            topology.devices().iter().any(|device| {
-                device.backend == *backend && matches!(device.availability, Availability::Available)
-            })
+    [
+        BackendName::Cpu,
+        BackendName::Metal,
+        BackendName::Cuda,
+        BackendName::Vulkan,
+    ]
+    .into_iter()
+    .filter(|backend| {
+        topology.devices().iter().any(|device| {
+            device.backend == *backend && matches!(device.availability, Availability::Available)
         })
-        .map(|backend| catalog.open_backend(backend).expect("available device opens"))
-        .collect()
+    })
+    .map(|backend| {
+        catalog
+            .open_backend(backend)
+            .expect("available device opens")
+    })
+    .collect()
 }
 
 fn median(values: &mut [f64]) -> f64 {
@@ -41,18 +50,32 @@ fn median(values: &mut [f64]) -> f64 {
 fn host_time_per_run_of_a_300_node_graph() {
     for device in devices() {
         let (m, n) = (1u64, 8u64);
-        let kernel =
-            scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
-                .unwrap();
+        let kernel = scale_rows::native_for_device(
+            &device,
+            &NativeSpecialization::new().with_param("ROWS", 1),
+        )
+        .unwrap();
         let mut graph = device.native_graph();
         let input = graph.port(Element::f32(), &[m, n]).unwrap();
         let mut value = graph
-            .enqueue(&kernel, scale_rows::WorkflowArgs { x: input.tensor().into(), factor: 1.0 })
+            .enqueue(
+                &kernel,
+                scale_rows::WorkflowArgs {
+                    x: input.tensor().into(),
+                    factor: 1.0,
+                },
+            )
             .unwrap()
             .value;
         for _ in 1..NODES {
             value = graph
-                .enqueue(&kernel, scale_rows::WorkflowArgs { x: (&value).into(), factor: 1.0 })
+                .enqueue(
+                    &kernel,
+                    scale_rows::WorkflowArgs {
+                        x: (&value).into(),
+                        factor: 1.0,
+                    },
+                )
                 .unwrap()
                 .value;
         }

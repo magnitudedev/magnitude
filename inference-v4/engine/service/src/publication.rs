@@ -35,6 +35,11 @@ pub struct ServiceCapacityError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelUnloadCause {
+    MemoryPressure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RequestError {
     Input(String),
     State(magnitude_model_state::Error),
@@ -42,6 +47,7 @@ pub enum RequestError {
     Device(DeviceError),
     Invariant(InvariantError),
     WorkerClosed,
+    ModelUnloaded { cause: ModelUnloadCause },
 }
 
 /// Elapsed native work measured per request from submission through completion.

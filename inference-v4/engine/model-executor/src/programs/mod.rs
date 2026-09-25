@@ -10,11 +10,11 @@ pub(crate) mod native_target_graph;
 pub(crate) mod native_vision;
 mod submission;
 
+pub use graph::readout::PreparedTargetReadoutGraphs;
 pub use native_head::PreparedHeadGraphs;
 pub use native_state::PreparedStateCopyGraphs;
 pub use native_target::{CommitSpan, TargetOutput, TargetReadoutGraphResult};
 pub use native_target_graph::{PreparedTargetGraphs, SealReport};
-pub use graph::readout::PreparedTargetReadoutGraphs;
 pub use native_vision::PreparedVisionGraphs;
 pub use submission::{
     CompletedWork, DeviceSubmission, ProgramSubmission, ReadySubmission, SubmittedTarget,

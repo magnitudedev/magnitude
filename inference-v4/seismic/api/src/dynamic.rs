@@ -501,16 +501,19 @@ impl Kernel {
     pub fn call(&self, args: &[Value]) -> Result<Value, Error> {
         match self.call_outcome_limited(args, None)? {
             seismic_lang::failure::SourceTermination::Returned(value) => Ok(value),
-            seismic_lang::failure::SourceTermination::Failed(failure) => Err(
-                Error::from(ExecutionError::DataCheckFailed(failure)),
-            ),
+            seismic_lang::failure::SourceTermination::Failed(failure) => {
+                Err(Error::from(ExecutionError::DataCheckFailed(failure)))
+            }
         }
     }
     fn call_outcome_limited(
         &self,
         args: &[Value],
         allocation_limit: Option<u64>,
-    ) -> Result<seismic_lang::failure::SourceTermination<Value, seismic_compiler::errors::CheckFailure>, Error> {
+    ) -> Result<
+        seismic_lang::failure::SourceTermination<Value, seismic_compiler::errors::CheckFailure>,
+        Error,
+    > {
         if args.len() != self.function.parameters().len() {
             return Err(Error::new("TypeError", "wrong argument count"));
         }
@@ -540,32 +543,43 @@ impl Kernel {
                 }
                 runtime::enqueue(&mut draft, kernel, workflow_args)
                     .map_err(|e| Error::from(CallError::Workflow(e)))?;
-                let bound = runtime::bind_workflow(draft)?.with_allocation_limit(allocation_limit.unwrap_or(u64::MAX));
+                let bound = runtime::bind_workflow(draft)?
+                    .with_allocation_limit(allocation_limit.unwrap_or(u64::MAX));
                 let admitted = runtime::admit_workflow(bound)?;
                 for t in &moves {
                     t.commit();
                 }
                 match runtime::submit_workflow(admitted)?.outcome()? {
                     seismic_lang::failure::SourceTermination::Returned(mut groups) => {
-                        assert_eq!(groups.len(), 1, "one dynamic invocation has one result group");
+                        assert_eq!(
+                            groups.len(),
+                            1,
+                            "one dynamic invocation has one result group"
+                        );
                         seismic_lang::failure::SourceTermination::Returned(groups.pop().unwrap())
                     }
-                    seismic_lang::failure::SourceTermination::Failed(failure) => seismic_lang::failure::SourceTermination::Failed(failure),
+                    seismic_lang::failure::SourceTermination::Failed(failure) => {
+                        seismic_lang::failure::SourceTermination::Failed(failure)
+                    }
                 }
             }
-            KernelKind::Native(kernel) => {
-                seismic_lang::failure::SourceTermination::Returned(
-                    runtime::call_native_with_commit(kernel, encoded, || {
-                        for t in &moves { t.commit(); }
-                    })?.into_values()
-                )
-            }
+            KernelKind::Native(kernel) => seismic_lang::failure::SourceTermination::Returned(
+                runtime::call_native_with_commit(kernel, encoded, || {
+                    for t in &moves {
+                        t.commit();
+                    }
+                })?
+                .into_values(),
+            ),
         };
         match result {
-            seismic_lang::failure::SourceTermination::Returned(values) => decode(
-                self.function.result_type(), &mut values.into_iter(),
-            ).map(seismic_lang::failure::SourceTermination::Returned),
-            seismic_lang::failure::SourceTermination::Failed(failure) => Ok(seismic_lang::failure::SourceTermination::Failed(failure)),
+            seismic_lang::failure::SourceTermination::Returned(values) => {
+                decode(self.function.result_type(), &mut values.into_iter())
+                    .map(seismic_lang::failure::SourceTermination::Returned)
+            }
+            seismic_lang::failure::SourceTermination::Failed(failure) => {
+                Ok(seismic_lang::failure::SourceTermination::Failed(failure))
+            }
         }
     }
 }

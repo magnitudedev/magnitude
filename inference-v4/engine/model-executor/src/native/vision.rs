@@ -16,7 +16,11 @@ impl VisionStatics {
     pub fn of(geometry: &magnitude_model_contracts::VisionGeometry) -> Self {
         let hidden = geometry.hidden;
         Self {
-            stem: [("C", geometry.channels), ("P", geometry.patch), ("H", hidden)],
+            stem: [
+                ("C", geometry.channels),
+                ("P", geometry.patch),
+                ("H", hidden),
+            ],
             block: [
                 ("H", geometry.heads),
                 ("P", hidden / geometry.heads / 4),

@@ -22,8 +22,18 @@ pub(super) enum Node {
     /// including equality with itself at an analysis demand boundary.
     Opaque(usize),
     Iteration(u32),
-    Header { depth:u32, ordinal:u32, kind:ScalarKind },
-    Fold { start:Term, end:Term, initial:Vec<Term>, next:Vec<Term>, output:u32 },
+    Header {
+        depth: u32,
+        ordinal: u32,
+        kind: ScalarKind,
+    },
+    Fold {
+        start: Term,
+        end: Term,
+        initial: Vec<Term>,
+        next: Vec<Term>,
+        output: u32,
+    },
     Input(seismic_lang::expr::SymbolId, ScalarKind),
     Constant(ReferenceScalar),
     Natural(u64),
@@ -40,7 +50,11 @@ pub(super) enum Node {
     NaturalMul(Term, Term),
     NaturalDiv(Term, u32),
     NaturalRem(Term, u32),
-    PackedBits { root: ViewBase, bit: Term, width: u32 },
+    PackedBits {
+        root: ViewBase,
+        bit: Term,
+        width: u32,
+    },
     Read(Place),
 }
 
@@ -60,7 +74,10 @@ pub(super) enum Effect {
     /// The independent visits `i in [0, extent)` of a parallel map, each
     /// writing `place(i) := value(i)` (`i` is the map's iteration term).
     /// Independence makes their order unobservable.
-    Map { extent: Term, writes: Vec<(Place, Term)> },
+    Map {
+        extent: Term,
+        writes: Vec<(Place, Term)>,
+    },
 }
 
 #[derive(Clone)]
@@ -74,7 +91,9 @@ pub(super) enum MemoryWrite {
         pattern: seismic_ir::schedule::FillValue,
     },
     /// Elements of `root` a parallel map wrote.
-    Map { root: ViewBase },
+    Map {
+        root: ViewBase,
+    },
 }
 impl MemoryWrite {
     pub(super) fn root(&self) -> ViewBase {
@@ -101,7 +120,10 @@ impl PathDomain {
             return false;
         }
         let predicate = terms.under(predicate, &self.predicates);
-        matches!(terms.nodes[predicate.0], Node::Constant(ReferenceScalar::Bool(true)))
+        matches!(
+            terms.nodes[predicate.0],
+            Node::Constant(ReferenceScalar::Bool(true))
+        )
     }
 }
 
@@ -128,17 +150,40 @@ impl Terms {
         let mut pending = vec![term];
         let mut seen = std::collections::HashSet::new();
         while let Some(term) = pending.pop() {
-            if !seen.insert(term) { continue; }
+            if !seen.insert(term) {
+                continue;
+            }
             match &self.nodes[term.0] {
                 Node::Opaque(_) => return true,
-                Node::Input(..) | Node::Constant(_) | Node::Natural(_) | Node::Iteration(_) | Node::Header{..} => {},
-                Node::Fold{start,end,initial,next,..} => { pending.extend([*start,*end]); pending.extend(initial); pending.extend(next); },
-                Node::Word(_, a, b) | Node::Compare(_, a, b) | Node::And(a, b)
-                | Node::NaturalAdd(a, b) | Node::NaturalMul(a, b) => pending.extend([*a, *b]),
+                Node::Input(..)
+                | Node::Constant(_)
+                | Node::Natural(_)
+                | Node::Iteration(_)
+                | Node::Header { .. } => {}
+                Node::Fold {
+                    start,
+                    end,
+                    initial,
+                    next,
+                    ..
+                } => {
+                    pending.extend([*start, *end]);
+                    pending.extend(initial);
+                    pending.extend(next);
+                }
+                Node::Word(_, a, b)
+                | Node::Compare(_, a, b)
+                | Node::And(a, b)
+                | Node::NaturalAdd(a, b)
+                | Node::NaturalMul(a, b) => pending.extend([*a, *b]),
                 Node::Select(condition, yes, no) => pending.extend([*condition, *yes, *no]),
-                Node::Not(value) | Node::Bits(value) | Node::FromBits(value, _)
-                | Node::NaturalFromWord(value, _) | Node::WordFromNatural(value, _)
-                | Node::NaturalDiv(value, _) | Node::NaturalRem(value, _) => pending.push(*value),
+                Node::Not(value)
+                | Node::Bits(value)
+                | Node::FromBits(value, _)
+                | Node::NaturalFromWord(value, _)
+                | Node::WordFromNatural(value, _)
+                | Node::NaturalDiv(value, _)
+                | Node::NaturalRem(value, _) => pending.push(*value),
                 Node::PackedBits { bit, .. } => pending.push(*bit),
                 Node::Read(place) => pending.push(place.byte),
             }
@@ -175,13 +220,33 @@ impl Terms {
                     Node::NaturalFromWord(a, dtype) => {
                         self.node(Node::NaturalFromWord(get(a), dtype))
                     }
-                    Node::WordFromNatural(a,dtype) => self.word_from_natural(get(a),dtype),
+                    Node::WordFromNatural(a, dtype) => self.word_from_natural(get(a), dtype),
                     Node::NaturalAdd(a, b) => self.natural_binary(false, get(a), get(b)),
                     Node::NaturalMul(a, b) => self.natural_binary(true, get(a), get(b)),
-                    Node::NaturalDiv(value, divisor) => self.natural_div_rem(false,get(value),divisor),
-                    Node::NaturalRem(value, divisor) => self.natural_div_rem(true,get(value),divisor),
-                    Node::PackedBits{root,bit,width} => self.node(Node::PackedBits{root,bit:get(bit),width}),
-                    Node::Fold{start,end,initial,next,output} => self.node(Node::Fold{start:get(start),end:get(end),initial:initial.into_iter().map(get).collect(),next:next.into_iter().map(get).collect(),output}),
+                    Node::NaturalDiv(value, divisor) => {
+                        self.natural_div_rem(false, get(value), divisor)
+                    }
+                    Node::NaturalRem(value, divisor) => {
+                        self.natural_div_rem(true, get(value), divisor)
+                    }
+                    Node::PackedBits { root, bit, width } => self.node(Node::PackedBits {
+                        root,
+                        bit: get(bit),
+                        width,
+                    }),
+                    Node::Fold {
+                        start,
+                        end,
+                        initial,
+                        next,
+                        output,
+                    } => self.node(Node::Fold {
+                        start: get(start),
+                        end: get(end),
+                        initial: initial.into_iter().map(get).collect(),
+                        next: next.into_iter().map(get).collect(),
+                        output,
+                    }),
                     Node::Read(mut place) => {
                         place.byte = get(place.byte);
                         self.node(Node::Read(place))
@@ -320,11 +385,11 @@ impl Terms {
                 | Node::NaturalMul(..)
         )
     }
-    pub(super) fn word_from_natural(&mut self, value:Term, dtype:DType) -> Term {
+    pub(super) fn word_from_natural(&mut self, value: Term, dtype: DType) -> Term {
         if let Node::Natural(value) = self.nodes[value.0] {
-            return self.scalar(ReferenceScalar::from_bits(dtype,value as u32));
+            return self.scalar(ReferenceScalar::from_bits(dtype, value as u32));
         }
-        self.node(Node::WordFromNatural(value,dtype))
+        self.node(Node::WordFromNatural(value, dtype))
     }
     pub(super) fn natural_binary(&mut self, multiply: bool, a: Term, b: Term) -> Term {
         let (left, right) = (&self.nodes[a.0], &self.nodes[b.0]);
@@ -451,15 +516,19 @@ impl<'a> Analysis<'a> {
     fn define_tensor_roots(&mut self, steps: &[ScheduleStep]) {
         for step in steps {
             match step {
-                ScheduleStep::BindArgumentTensor { source, result } | ScheduleStep::BeginAllocationInstance { source, result } => {
+                ScheduleStep::BindArgumentTensor { source, result }
+                | ScheduleStep::BeginAllocationInstance { source, result } => {
                     let ViewBase::TensorValue(id) = self.storage.view(*result).base else {
                         panic!("tensor definition result is not a tensor value")
                     };
-                    self.tensor_roots.insert(id.index(), self.storage.view(*source).base);
+                    self.tensor_roots
+                        .insert(id.index(), self.storage.view(*source).base);
                     // An argument's physical strides are invocation inputs.
                     if matches!(step, ScheduleStep::BindArgumentTensor { .. }) {
                         for stride in &self.storage.view(*result).strides {
-                            if let seismic_lang::expr::NodeView::Symbol(symbol) = self.expressions.view((*stride).into()) {
+                            if let seismic_lang::expr::NodeView::Symbol(symbol) =
+                                self.expressions.view((*stride).into())
+                            {
                                 let input = self.terms.node(Node::Input(symbol, ScalarKind::Nat64));
                                 self.inputs.insert(symbol, input);
                             }
@@ -467,7 +536,11 @@ impl<'a> Analysis<'a> {
                     }
                 }
                 ScheduleStep::Imported { body, .. } => self.define_tensor_roots(body),
-                ScheduleStep::If { then_steps, else_steps, .. } => {
+                ScheduleStep::If {
+                    then_steps,
+                    else_steps,
+                    ..
+                } => {
                     self.define_tensor_roots(then_steps);
                     self.define_tensor_roots(else_steps);
                 }
@@ -481,13 +554,21 @@ impl<'a> Analysis<'a> {
     pub(super) fn storage_root(&self, base: ViewBase) -> Result<ViewBase> {
         match base {
             ViewBase::Allocation(_) => Ok(base),
-            ViewBase::TensorValue(id) => self.tensor_roots.get(&id.index()).copied()
+            ViewBase::TensorValue(id) => self
+                .tensor_roots
+                .get(&id.index())
+                .copied()
                 .ok_or("selected allocation-instance relation is unfinished"),
         }
     }
     /// Discharge access geometry from the actual coordinate and view terms.
     /// Unknown entailment is unfinished safety, including for discarded reads.
-    pub(super) fn coordinates_in_bounds(&mut self, view: AnyBufferView, indices: &[Term], state: &State) -> Result<()> {
+    pub(super) fn coordinates_in_bounds(
+        &mut self,
+        view: AnyBufferView,
+        indices: &[Term],
+        state: &State,
+    ) -> Result<()> {
         let extents = self.storage.view(view).extents.clone();
         if indices.len() != extents.len() {
             return Err("actual memory index rank differs");
@@ -502,11 +583,20 @@ impl<'a> Analysis<'a> {
         Ok(())
     }
 
-    pub(super) fn place(&mut self, view: AnyBufferView, indices: &[Term], state: &State) -> Result<Place> {
+    pub(super) fn place(
+        &mut self,
+        view: AnyBufferView,
+        indices: &[Term],
+        state: &State,
+    ) -> Result<Place> {
         self.coordinates_in_bounds(view, indices, state)?;
         let root = self.storage_root(self.storage.view(view).base)?;
         let layout = self.storage.view(view);
-        if !matches!(layout.mapping, seismic_ir::storage::ViewMapping::Direct | seismic_ir::storage::ViewMapping::WholeAllocation) {
+        if !matches!(
+            layout.mapping,
+            seismic_ir::storage::ViewMapping::Direct
+                | seismic_ir::storage::ViewMapping::WholeAllocation
+        ) {
             return Err("transformed place relation is unfinished");
         }
         let RepresentationKind::Dense(dtype) =
@@ -533,8 +623,12 @@ impl<'a> Analysis<'a> {
         let mut value = self.terms.node(Node::Read(place.clone()));
         for written in &state.writes {
             if written.root() != place.root {
-                let (ViewBase::Allocation(a),ViewBase::Allocation(b)) = (written.root(),place.root) else { return Err("selected allocation alias relation is unfinished"); };
-                if self.storage.allocations_may_overlap(a,b) {
+                let (ViewBase::Allocation(a), ViewBase::Allocation(b)) =
+                    (written.root(), place.root)
+                else {
+                    return Err("selected allocation alias relation is unfinished");
+                };
+                if self.storage.allocations_may_overlap(a, b) {
                     return Err("cross-root mutable alias relation is unfinished");
                 }
                 continue;
@@ -550,7 +644,9 @@ impl<'a> Analysis<'a> {
         written: &MemoryWrite,
     ) -> Result<Term> {
         match written {
-            MemoryWrite::Map { .. } => return Err("read after a parallel map relation is unfinished"),
+            MemoryWrite::Map { .. } => {
+                return Err("read after a parallel map relation is unfinished")
+            }
             MemoryWrite::Conditional(condition, write) => {
                 let replacement = self.read_after_write(place, value, write)?;
                 value = self.terms.select(*condition, replacement, value);
@@ -628,8 +724,10 @@ impl<'a> Analysis<'a> {
             // An invocation dimension is one input natural, shared by both
             // projections.
             NodeView::Symbol(symbol)
-                if matches!(self.expressions.symbol_kind(symbol), seismic_lang::expr::SymbolKind::CallDimension(_))
-                    && !slots.contains_key(&symbol) =>
+                if matches!(
+                    self.expressions.symbol_kind(symbol),
+                    seismic_lang::expr::SymbolKind::CallDimension(_)
+                ) && !slots.contains_key(&symbol) =>
             {
                 let input = self.terms.node(Node::Input(symbol, ScalarKind::Nat64));
                 *self.inputs.entry(symbol).or_insert(input)
@@ -684,8 +782,14 @@ impl<'a> Analysis<'a> {
             }
             // A natural is the same mathematical value as an integer; the
             // converse holds only for a natural-valued term.
-            NodeView::Unary { op: seismic_lang::expr::UnaryOp::IntFromNat, operand } => self.expression(operand, slots)?,
-            NodeView::Unary { op: seismic_lang::expr::UnaryOp::NatFromInt, operand } => {
+            NodeView::Unary {
+                op: seismic_lang::expr::UnaryOp::IntFromNat,
+                operand,
+            } => self.expression(operand, slots)?,
+            NodeView::Unary {
+                op: seismic_lang::expr::UnaryOp::NatFromInt,
+                operand,
+            } => {
                 let value = self.expression(operand, slots)?;
                 self.terms.exact_natural(value)?
             }
@@ -702,361 +806,442 @@ impl<'a> Analysis<'a> {
     ) -> Result<Vec<Term>> {
         for operation in &kernel.block(block).ops {
             if let Op::Yield { values: yields } = operation {
-                return yields.iter().map(|value| values.get(value).copied().ok_or("physical operand unavailable")).collect();
+                return yields
+                    .iter()
+                    .map(|value| {
+                        values
+                            .get(value)
+                            .copied()
+                            .ok_or("physical operand unavailable")
+                    })
+                    .collect();
             }
             let assignment = (|| -> Result<Option<(ops::ErasedValue, Term)>> {
-                let get = |value: &ops::ErasedValue| values.get(value).copied().ok_or("physical operand unavailable");
+                let get = |value: &ops::ErasedValue| {
+                    values
+                        .get(value)
+                        .copied()
+                        .ok_or("physical operand unavailable")
+                };
                 Ok(match operation {
-
-                Op::Constant { out, value } => Some((
-                    *out,
-                    match value {
-                        ops::ConstantValue::F32(value) => {
-                            self.terms.scalar(ReferenceScalar::F32(value.to_bits()))
-                        }
-                        ops::ConstantValue::F16(value) => {
-                            self.terms.scalar(ReferenceScalar::F16(*value))
-                        }
-                        ops::ConstantValue::BF16(value) => {
-                            self.terms.scalar(ReferenceScalar::BF16(*value))
-                        }
-                        ops::ConstantValue::U32(value) => {
-                            self.terms.scalar(ReferenceScalar::U32(*value))
-                        }
-                        ops::ConstantValue::I32(value) => {
-                            self.terms.scalar(ReferenceScalar::I32(*value))
-                        }
-                        ops::ConstantValue::Bool(value) => self.terms.boolean(*value),
-                        ops::ConstantValue::Index(value) => self.terms.node(Node::Natural(*value)),
-                    },
-                )),
-                Op::ScalarArg { out, index } => {
-                    let (symbol, _) = kernel.interface().scalar_args[*index as usize];
-                    Some((
+                    Op::Constant { out, value } => Some((
                         *out,
-                        *state
-                            .slots
-                            .get(&symbol)
-                            .or_else(|| self.inputs.get(&symbol))
-                            .ok_or("physical scalar input unavailable")?,
-                    ))
-                }
-                Op::NatArg { out, index } => Some((
-                    *out,
-                    self.expression(
-                        kernel.interface().nat_args[*index as usize].into(),
-                        &state.slots,
-                    )?,
-                )),
-                Op::Extent { out, place, axis } => {
-                    let ops::PlaceRef::Global { slot } = place else {
-                        return Err("local extent relation is unfinished");
-                    };
-                    let view = kernel.interface().bindings[slot.ordinal() as usize].view;
-                    Some((
+                        match value {
+                            ops::ConstantValue::F32(value) => {
+                                self.terms.scalar(ReferenceScalar::F32(value.to_bits()))
+                            }
+                            ops::ConstantValue::F16(value) => {
+                                self.terms.scalar(ReferenceScalar::F16(*value))
+                            }
+                            ops::ConstantValue::BF16(value) => {
+                                self.terms.scalar(ReferenceScalar::BF16(*value))
+                            }
+                            ops::ConstantValue::U32(value) => {
+                                self.terms.scalar(ReferenceScalar::U32(*value))
+                            }
+                            ops::ConstantValue::I32(value) => {
+                                self.terms.scalar(ReferenceScalar::I32(*value))
+                            }
+                            ops::ConstantValue::Bool(value) => self.terms.boolean(*value),
+                            ops::ConstantValue::Index(value) => {
+                                self.terms.node(Node::Natural(*value))
+                            }
+                        },
+                    )),
+                    Op::ScalarArg { out, index } => {
+                        let (symbol, _) = kernel.interface().scalar_args[*index as usize];
+                        Some((
+                            *out,
+                            *state
+                                .slots
+                                .get(&symbol)
+                                .or_else(|| self.inputs.get(&symbol))
+                                .ok_or("physical scalar input unavailable")?,
+                        ))
+                    }
+                    Op::NatArg { out, index } => Some((
                         *out,
                         self.expression(
-                            self.storage.view(view).extents[*axis as usize].into(),
+                            kernel.interface().nat_args[*index as usize].into(),
                             &state.slots,
                         )?,
-                    ))
-                }
-                Op::Geometry { out, kind: ops::GeometryValue::GlobalId(0) } => {
-                    let lane = self.lane.ok_or("participant geometry outside a lane relation")?;
-                    Some((*out, lane.participant))
-                }
-                Op::Binary { op, out, a, b } if kernel.value_type(*out) == ValueType::Index => {
-                    let (a, b) = (get(a)?, get(b)?);
-                    let value = match op {
-                        ops::BinaryOp::Add => self.terms.natural_binary(false, a, b),
-                        ops::BinaryOp::Mul => self.terms.natural_binary(true, a, b),
-                        ops::BinaryOp::Sub => match (&self.terms.nodes[a.0], &self.terms.nodes[b.0]) {
-                            (_, Node::Natural(0)) => a,
-                            (Node::Natural(x), Node::Natural(y)) if x >= y => self.terms.node(Node::Natural(x - y)),
-                            _ if a == b => self.terms.node(Node::Natural(0)),
-                            _ => return Err("natural subtraction relation is unfinished"),
-                        },
-                        ops::BinaryOp::Min => match (&self.terms.nodes[a.0], &self.terms.nodes[b.0]) {
-                            (Node::Natural(x), Node::Natural(y)) => self.terms.node(Node::Natural(*x.min(y))),
-                            // An active lane's participant is below the logical
-                            // bound; an inactive one is at or beyond it.
-                            _ => match self.lane {
-                                Some(lane) if (lane.participant, lane.bound) == (a, b) || (lane.participant, lane.bound) == (b, a) => {
-                                    if lane.active { lane.participant } else { lane.bound }
-                                }
-                                _ => return Err("natural minimum relation is unfinished"),
-                            },
-                        },
-                        _ => return Err("natural operation relation is unfinished"),
-                    };
-                    Some((*out, value))
-                }
-                Op::Binary { op, out, a, b }
-                    if kernel.value_type(*out) == ValueType::Scalar(DType::U32) =>
-                {
-                    let operation = match op {
-                        ops::BinaryOp::Add => WordOp::Add,
-                        ops::BinaryOp::Sub => WordOp::Sub,
-                        _ => {
-                            return Err(
-                                "physical word operation has no terminal reference relation",
-                            )
-                        }
-                    };
-                    Some((
-                        *out,
-                        self.terms.node(Node::Word(operation, get(a)?, get(b)?)),
-                    ))
-                }
-                Op::Bit { op, out, a, b }
-                    if kernel.value_type(*out) == ValueType::Scalar(DType::U32) =>
-                {
-                    let operation = match op {
-                        ops::BitOp::And => WordOp::And,
-                        ops::BitOp::Or => WordOp::Or,
-                        ops::BitOp::Xor => WordOp::Xor,
-                        ops::BitOp::Shl => WordOp::Shl,
-                        ops::BitOp::Shr => WordOp::Shr,
-                    };
-                    Some((
-                        *out,
-                        self.terms.node(Node::Word(operation, get(a)?, get(b)?)),
-                    ))
-                }
-                Op::Cmp { op, out, a, b }
-                    if matches!(
-                        kernel.value_type(*a),
-                        ValueType::Scalar(DType::U32) | ValueType::Index | ValueType::Bool
-                    ) =>
-                {
-                    let operation = match op {
-                        ops::CmpOp::Eq => reference::CmpOp::Eq,
-                        ops::CmpOp::Ne => reference::CmpOp::Ne,
-                        ops::CmpOp::Lt => reference::CmpOp::Lt,
-                        ops::CmpOp::Le => reference::CmpOp::Le,
-                        ops::CmpOp::Gt => reference::CmpOp::Gt,
-                        ops::CmpOp::Ge => reference::CmpOp::Ge,
-                    };
-                    Some((*out, self.terms.compare(operation, get(a)?, get(b)?)))
-                }
-                Op::ScalarBits { out, a } => Some((
-                    *out,
-                    self.terms.bits(get(a)?, dtype(kernel.value_type(*a))?),
-                )),
-                Op::ScalarFromBits { out, a } => Some((
-                    *out,
-                    self.terms
-                        .from_bits(get(a)?, dtype(kernel.value_type(*out))?),
-                )),
-                Op::Bitcast { out, a, to } => {
-                    let value = self.terms.bits(get(a)?, dtype(kernel.value_type(*a))?);
-                    Some((*out, self.terms.from_bits(value, dtype(*to)?)))
-                }
-                Op::Cast {
-                    out,
-                    a,
-                    to: ValueType::Index,
-                } => Some((
-                    *out,
-                    self.terms.natural(get(a)?, dtype(kernel.value_type(*a))?)?,
-                )),
-                Op::Cast { out, a, to: ValueType::Scalar(dtype @ (DType::I32 | DType::U32)) }
-                    if kernel.value_type(*a) == ValueType::Index => {
-                    Some((*out,self.terms.word_from_natural(get(a)?,*dtype)))
-                }
-                Op::Read {
-                    out, place, index, ..
-                } => {
-                    let ops::PlaceRef::Global { slot } = place else {
-                        return Err("local place relation is unfinished");
-                    };
-                    let view = kernel.interface().bindings[slot.ordinal() as usize].view;
-                    let coordinates = index.iter().map(get).collect::<Result<Vec<_>>>()?;
-                    let place = self.place(view, &coordinates, state)?;
-                    Some((*out, self.read(state, place)?))
-                }
-                Op::ReadPlaneField { out, place, plane, field, index } => {
-                    let ops::PlaceRef::Global {slot} = place else { return Err("local packed field relation is unfinished"); };
-                    let view = kernel.interface().bindings[slot.ordinal() as usize].view;
-                    let coordinates = index.iter().map(get).collect::<Result<Vec<_>>>()?;
-                    Some((*out,self.plane_field(view,&coordinates,*plane,*field,state)?))
-                }
-                Op::Write {
-                    place,
-                    index,
-                    value,
-                    ..
-                } => {
-                    let ops::PlaceRef::Global { slot } = place else {
-                        return Err("local place relation is unfinished");
-                    };
-                    let view = kernel.interface().bindings[slot.ordinal() as usize].view;
-                    let coordinates = index.iter().map(get).collect::<Result<Vec<_>>>()?;
-                    let place = self.place(view, &coordinates, state)?;
-                    self.write(state, place, get(value)?);
-                    None
-                }
-                Op::Atomic {
-                    op,
-                    place,
-                    index,
-                    value,
-                    ..
-                } => {
-                    let ops::PlaceRef::Global { slot } = place else {
-                        return Err("local atomic relation is unfinished");
-                    };
-                    let view = kernel.interface().bindings[slot.ordinal() as usize].view;
-                    let coordinates = index.iter().map(get).collect::<Result<Vec<_>>>()?;
-                    let place = self.place(view, &coordinates, state)?;
-                    if place.dtype != DType::U32 {
-                        return Err("non-word atomic relation is unfinished");
+                    )),
+                    Op::Extent { out, place, axis } => {
+                        let ops::PlaceRef::Global { slot } = place else {
+                            return Err("local extent relation is unfinished");
+                        };
+                        let view = kernel.interface().bindings[slot.ordinal() as usize].view;
+                        Some((
+                            *out,
+                            self.expression(
+                                self.storage.view(view).extents[*axis as usize].into(),
+                                &state.slots,
+                            )?,
+                        ))
                     }
-                    let replacement = get(value)?;
-                    let previous = self.read(state, place.clone())?;
-                    let value = match op {
-                        seismic_lang::intrinsics::AtomicOp::Max
-                            if matches!(
-                                self.terms.nodes[previous.0],
-                                Node::Constant(ReferenceScalar::U32(0))
-                            ) =>
-                        {
-                            replacement
-                        }
-                        seismic_lang::intrinsics::AtomicOp::Max
-                        | seismic_lang::intrinsics::AtomicOp::Min => {
-                            let condition = self.terms.compare(
-                                if *op == seismic_lang::intrinsics::AtomicOp::Max {
-                                    reference::CmpOp::Ge
-                                } else {
-                                    reference::CmpOp::Le
-                                },
-                                previous,
-                                replacement,
-                            );
-                            self.terms.select(condition, previous, replacement)
-                        }
-                        _ => return Err("atomic operation relation is unfinished"),
-                    };
-                    self.write(state, place, value);
-                    None
-                }
-                Op::Select { out, cond, a, b } => {
-                    Some((*out, self.terms.select(get(cond)?, get(a)?, get(b)?)))
-                }
-                Op::Logic { op, out, a, b } => {
-                    let value = match op {
-                        ops::LogicOp::And => self.terms.and(get(a)?, get(b)?),
-                        ops::LogicOp::Or => {
-                            let truth = self.terms.boolean(true);
-                            self.terms.select(get(a)?, truth, get(b)?)
-                        }
-                    };
-                    Some((*out, value))
-                }
-                Op::Not { out, a } => Some((*out, self.terms.not(get(a)?))),
-                Op::StoreSlot { slot, value, .. } => {
-                    state.slots.insert(
-                        kernel.interface().result_slots[*slot as usize].symbol(),
-                        get(value)?,
-                    );
-                    None
-                }
-                Op::Repeat { start, end, binder, carries_in, carry_params, body, outs } => {
-                    let start = get(start)?;
-                    let end = get(end)?;
-                    let initial = carries_in.iter().map(get).collect::<Result<Vec<_>>>()?;
-                    let results = self.scalar_kernel_repeat(kernel, start, end, *binder, initial, carry_params, *body, values, state)?;
-                    if results.len() != outs.len() { return Err("repeat result arity differs"); }
-                    for (out, result) in outs.iter().zip(results) { values.insert(*out, result); }
-                    None
-                }
-                Op::Branch {
-                    cond,
-                    then,
-                    otherwise,
-                    outs,
-                } => {
-                    let condition = get(cond)?;
-                    // A condition the path already decides executes one arm.
-                    let opposite = self.terms.not(condition);
-                    let decided = if state.path.establishes(&mut self.terms, condition) {
-                        Some(*then)
-                    } else if state.path.establishes(&mut self.terms, opposite) {
-                        Some(*otherwise)
-                    } else {
+                    Op::Geometry {
+                        out,
+                        kind: ops::GeometryValue::GlobalId(0),
+                    } => {
+                        let lane = self
+                            .lane
+                            .ok_or("participant geometry outside a lane relation")?;
+                        Some((*out, lane.participant))
+                    }
+                    Op::Binary { op, out, a, b } if kernel.value_type(*out) == ValueType::Index => {
+                        let (a, b) = (get(a)?, get(b)?);
+                        let value = match op {
+                            ops::BinaryOp::Add => self.terms.natural_binary(false, a, b),
+                            ops::BinaryOp::Mul => self.terms.natural_binary(true, a, b),
+                            ops::BinaryOp::Sub => {
+                                match (&self.terms.nodes[a.0], &self.terms.nodes[b.0]) {
+                                    (_, Node::Natural(0)) => a,
+                                    (Node::Natural(x), Node::Natural(y)) if x >= y => {
+                                        self.terms.node(Node::Natural(x - y))
+                                    }
+                                    _ if a == b => self.terms.node(Node::Natural(0)),
+                                    _ => return Err("natural subtraction relation is unfinished"),
+                                }
+                            }
+                            ops::BinaryOp::Min => {
+                                match (&self.terms.nodes[a.0], &self.terms.nodes[b.0]) {
+                                    (Node::Natural(x), Node::Natural(y)) => {
+                                        self.terms.node(Node::Natural(*x.min(y)))
+                                    }
+                                    // An active lane's participant is below the logical
+                                    // bound; an inactive one is at or beyond it.
+                                    _ => match self.lane {
+                                        Some(lane)
+                                            if (lane.participant, lane.bound) == (a, b)
+                                                || (lane.participant, lane.bound) == (b, a) =>
+                                        {
+                                            if lane.active {
+                                                lane.participant
+                                            } else {
+                                                lane.bound
+                                            }
+                                        }
+                                        _ => return Err("natural minimum relation is unfinished"),
+                                    },
+                                }
+                            }
+                            _ => return Err("natural operation relation is unfinished"),
+                        };
+                        Some((*out, value))
+                    }
+                    Op::Binary { op, out, a, b }
+                        if kernel.value_type(*out) == ValueType::Scalar(DType::U32) =>
+                    {
+                        let operation =
+                            match op {
+                                ops::BinaryOp::Add => WordOp::Add,
+                                ops::BinaryOp::Sub => WordOp::Sub,
+                                _ => return Err(
+                                    "physical word operation has no terminal reference relation",
+                                ),
+                            };
+                        Some((
+                            *out,
+                            self.terms.node(Node::Word(operation, get(a)?, get(b)?)),
+                        ))
+                    }
+                    Op::Bit { op, out, a, b }
+                        if kernel.value_type(*out) == ValueType::Scalar(DType::U32) =>
+                    {
+                        let operation = match op {
+                            ops::BitOp::And => WordOp::And,
+                            ops::BitOp::Or => WordOp::Or,
+                            ops::BitOp::Xor => WordOp::Xor,
+                            ops::BitOp::Shl => WordOp::Shl,
+                            ops::BitOp::Shr => WordOp::Shr,
+                        };
+                        Some((
+                            *out,
+                            self.terms.node(Node::Word(operation, get(a)?, get(b)?)),
+                        ))
+                    }
+                    Op::Cmp { op, out, a, b }
+                        if matches!(
+                            kernel.value_type(*a),
+                            ValueType::Scalar(DType::U32) | ValueType::Index | ValueType::Bool
+                        ) =>
+                    {
+                        let operation = match op {
+                            ops::CmpOp::Eq => reference::CmpOp::Eq,
+                            ops::CmpOp::Ne => reference::CmpOp::Ne,
+                            ops::CmpOp::Lt => reference::CmpOp::Lt,
+                            ops::CmpOp::Le => reference::CmpOp::Le,
+                            ops::CmpOp::Gt => reference::CmpOp::Gt,
+                            ops::CmpOp::Ge => reference::CmpOp::Ge,
+                        };
+                        Some((*out, self.terms.compare(operation, get(a)?, get(b)?)))
+                    }
+                    Op::ScalarBits { out, a } => Some((
+                        *out,
+                        self.terms.bits(get(a)?, dtype(kernel.value_type(*a))?),
+                    )),
+                    Op::ScalarFromBits { out, a } => Some((
+                        *out,
+                        self.terms
+                            .from_bits(get(a)?, dtype(kernel.value_type(*out))?),
+                    )),
+                    Op::Bitcast { out, a, to } => {
+                        let value = self.terms.bits(get(a)?, dtype(kernel.value_type(*a))?);
+                        Some((*out, self.terms.from_bits(value, dtype(*to)?)))
+                    }
+                    Op::Cast {
+                        out,
+                        a,
+                        to: ValueType::Index,
+                    } => Some((
+                        *out,
+                        self.terms.natural(get(a)?, dtype(kernel.value_type(*a))?)?,
+                    )),
+                    Op::Cast {
+                        out,
+                        a,
+                        to: ValueType::Scalar(dtype @ (DType::I32 | DType::U32)),
+                    } if kernel.value_type(*a) == ValueType::Index => {
+                        Some((*out, self.terms.word_from_natural(get(a)?, *dtype)))
+                    }
+                    Op::Read {
+                        out, place, index, ..
+                    } => {
+                        let ops::PlaceRef::Global { slot } = place else {
+                            return Err("local place relation is unfinished");
+                        };
+                        let view = kernel.interface().bindings[slot.ordinal() as usize].view;
+                        let coordinates = index.iter().map(get).collect::<Result<Vec<_>>>()?;
+                        let place = self.place(view, &coordinates, state)?;
+                        Some((*out, self.read(state, place)?))
+                    }
+                    Op::ReadPlaneField {
+                        out,
+                        place,
+                        plane,
+                        field,
+                        index,
+                    } => {
+                        let ops::PlaceRef::Global { slot } = place else {
+                            return Err("local packed field relation is unfinished");
+                        };
+                        let view = kernel.interface().bindings[slot.ordinal() as usize].view;
+                        let coordinates = index.iter().map(get).collect::<Result<Vec<_>>>()?;
+                        Some((
+                            *out,
+                            self.plane_field(view, &coordinates, *plane, *field, state)?,
+                        ))
+                    }
+                    Op::Write {
+                        place,
+                        index,
+                        value,
+                        ..
+                    } => {
+                        let ops::PlaceRef::Global { slot } = place else {
+                            return Err("local place relation is unfinished");
+                        };
+                        let view = kernel.interface().bindings[slot.ordinal() as usize].view;
+                        let coordinates = index.iter().map(get).collect::<Result<Vec<_>>>()?;
+                        let place = self.place(view, &coordinates, state)?;
+                        self.write(state, place, get(value)?);
                         None
-                    };
-                    if let Some(arm) = decided {
-                        let results = self.physical_block(kernel, arm, &mut values.clone(), state)?;
-                        if outs.len() != results.len() {
+                    }
+                    Op::Atomic {
+                        op,
+                        place,
+                        index,
+                        value,
+                        ..
+                    } => {
+                        let ops::PlaceRef::Global { slot } = place else {
+                            return Err("local atomic relation is unfinished");
+                        };
+                        let view = kernel.interface().bindings[slot.ordinal() as usize].view;
+                        let coordinates = index.iter().map(get).collect::<Result<Vec<_>>>()?;
+                        let place = self.place(view, &coordinates, state)?;
+                        if place.dtype != DType::U32 {
+                            return Err("non-word atomic relation is unfinished");
+                        }
+                        let replacement = get(value)?;
+                        let previous = self.read(state, place.clone())?;
+                        let value = match op {
+                            seismic_lang::intrinsics::AtomicOp::Max
+                                if matches!(
+                                    self.terms.nodes[previous.0],
+                                    Node::Constant(ReferenceScalar::U32(0))
+                                ) =>
+                            {
+                                replacement
+                            }
+                            seismic_lang::intrinsics::AtomicOp::Max
+                            | seismic_lang::intrinsics::AtomicOp::Min => {
+                                let condition = self.terms.compare(
+                                    if *op == seismic_lang::intrinsics::AtomicOp::Max {
+                                        reference::CmpOp::Ge
+                                    } else {
+                                        reference::CmpOp::Le
+                                    },
+                                    previous,
+                                    replacement,
+                                );
+                                self.terms.select(condition, previous, replacement)
+                            }
+                            _ => return Err("atomic operation relation is unfinished"),
+                        };
+                        self.write(state, place, value);
+                        None
+                    }
+                    Op::Select { out, cond, a, b } => {
+                        Some((*out, self.terms.select(get(cond)?, get(a)?, get(b)?)))
+                    }
+                    Op::Logic { op, out, a, b } => {
+                        let value = match op {
+                            ops::LogicOp::And => self.terms.and(get(a)?, get(b)?),
+                            ops::LogicOp::Or => {
+                                let truth = self.terms.boolean(true);
+                                self.terms.select(get(a)?, truth, get(b)?)
+                            }
+                        };
+                        Some((*out, value))
+                    }
+                    Op::Not { out, a } => Some((*out, self.terms.not(get(a)?))),
+                    Op::StoreSlot { slot, value, .. } => {
+                        state.slots.insert(
+                            kernel.interface().result_slots[*slot as usize].symbol(),
+                            get(value)?,
+                        );
+                        None
+                    }
+                    Op::Repeat {
+                        start,
+                        end,
+                        binder,
+                        carries_in,
+                        carry_params,
+                        body,
+                        outs,
+                    } => {
+                        let start = get(start)?;
+                        let end = get(end)?;
+                        let initial = carries_in.iter().map(get).collect::<Result<Vec<_>>>()?;
+                        let results = self.scalar_kernel_repeat(
+                            kernel,
+                            start,
+                            end,
+                            *binder,
+                            initial,
+                            carry_params,
+                            *body,
+                            values,
+                            state,
+                        )?;
+                        if results.len() != outs.len() {
+                            return Err("repeat result arity differs");
+                        }
+                        for (out, result) in outs.iter().zip(results) {
+                            values.insert(*out, result);
+                        }
+                        None
+                    }
+                    Op::Branch {
+                        cond,
+                        then,
+                        otherwise,
+                        outs,
+                    } => {
+                        let condition = get(cond)?;
+                        // A condition the path already decides executes one arm.
+                        let opposite = self.terms.not(condition);
+                        let decided = if state.path.establishes(&mut self.terms, condition) {
+                            Some(*then)
+                        } else if state.path.establishes(&mut self.terms, opposite) {
+                            Some(*otherwise)
+                        } else {
+                            None
+                        };
+                        if let Some(arm) = decided {
+                            let results =
+                                self.physical_block(kernel, arm, &mut values.clone(), state)?;
+                            if outs.len() != results.len() {
+                                return Err("branch result arity differs");
+                            }
+                            for (out, value) in outs.iter().zip(results) {
+                                values.insert(*out, value);
+                            }
+                            return Ok(None);
+                        }
+                        let mut yes = state.clone();
+                        let mut no = state.clone();
+                        yes.path.enter_arm(condition, true);
+                        no.path.enter_arm(condition, false);
+                        let yes_values =
+                            self.physical_block(kernel, *then, &mut values.clone(), &mut yes)?;
+                        let no_values =
+                            self.physical_block(kernel, *otherwise, &mut values.clone(), &mut no)?;
+                        if yes.effects.len() != state.effects.len()
+                            || no.effects.len() != state.effects.len()
+                        {
+                            return Err("conditional observable effect relation is unfinished");
+                        }
+                        let prior = state.writes.len();
+                        state.writes.extend(
+                            yes.writes
+                                .into_iter()
+                                .skip(prior)
+                                .map(|write| MemoryWrite::Conditional(condition, Box::new(write))),
+                        );
+                        let opposite = self.terms.not(condition);
+                        state.writes.extend(
+                            no.writes
+                                .into_iter()
+                                .skip(prior)
+                                .map(|write| MemoryWrite::Conditional(opposite, Box::new(write))),
+                        );
+                        for (symbol, yes) in yes.slots {
+                            let no = *no
+                                .slots
+                                .get(&symbol)
+                                .ok_or("branch slot lacks a complete definition")?;
+                            state
+                                .slots
+                                .insert(symbol, self.terms.select(condition, yes, no));
+                        }
+                        if outs.len() != yes_values.len() || outs.len() != no_values.len() {
                             return Err("branch result arity differs");
                         }
-                        for (out, value) in outs.iter().zip(results) {
-                            values.insert(*out, value);
+                        for ((out, yes), no) in outs.iter().zip(yes_values).zip(no_values) {
+                            values.insert(*out, self.terms.select(condition, yes, no));
                         }
-                        return Ok(None);
+                        None
                     }
-                    let mut yes = state.clone();
-                    let mut no = state.clone();
-                    yes.path.enter_arm(condition, true);
-                    no.path.enter_arm(condition, false);
-                    let yes_values =
-                        self.physical_block(kernel, *then, &mut values.clone(), &mut yes)?;
-                    let no_values =
-                        self.physical_block(kernel, *otherwise, &mut values.clone(), &mut no)?;
-                    if yes.effects.len() != state.effects.len()
-                        || no.effects.len() != state.effects.len()
-                    {
-                        return Err("conditional observable effect relation is unfinished");
+                    Op::Yield { .. } => unreachable!("handled before scalar projection"),
+                    _ => {
+                        return Err(
+                            "physical state, control or native operation relation is unfinished",
+                        )
                     }
-                    let prior = state.writes.len();
-                    state.writes.extend(
-                        yes.writes
-                            .into_iter()
-                            .skip(prior)
-                            .map(|write| MemoryWrite::Conditional(condition, Box::new(write))),
-                    );
-                    let opposite = self.terms.not(condition);
-                    state.writes.extend(
-                        no.writes
-                            .into_iter()
-                            .skip(prior)
-                            .map(|write| MemoryWrite::Conditional(opposite, Box::new(write))),
-                    );
-                    for (symbol, yes) in yes.slots {
-                        let no = *no
-                            .slots
-                            .get(&symbol)
-                            .ok_or("branch slot lacks a complete definition")?;
-                        state
-                            .slots
-                            .insert(symbol, self.terms.select(condition, yes, no));
-                    }
-                    if outs.len() != yes_values.len() || outs.len() != no_values.len() {
-                        return Err("branch result arity differs");
-                    }
-                    for ((out, yes), no) in outs.iter().zip(yes_values).zip(no_values) {
-                        values.insert(*out, self.terms.select(condition, yes, no));
-                    }
-                    None
-                }
-                Op::Yield { .. } => unreachable!("handled before scalar projection"),
-                _ => {
-                    return Err(
-                        "physical state, control or native operation relation is unfinished",
-                    )
-                }
                 })
             })();
             let assignment = match assignment {
                 Ok(value) => value,
-                Err(_) if matches!(operation,
-                    Op::Math { .. } | Op::Fma { .. } | Op::VectorFma { .. }
-                    | Op::Bitcast { .. } | Op::ScalarBits { .. } | Op::ScalarFromBits { .. }
-                    | Op::VectorSplat { .. } | Op::VectorFromLanes { .. }
-                    | Op::Cmp { .. } | Op::Select { .. } | Op::Logic { .. } | Op::Not { .. }
-                ) => {
+                Err(_)
+                    if matches!(
+                        operation,
+                        Op::Math { .. }
+                            | Op::Fma { .. }
+                            | Op::VectorFma { .. }
+                            | Op::Bitcast { .. }
+                            | Op::ScalarBits { .. }
+                            | Op::ScalarFromBits { .. }
+                            | Op::VectorSplat { .. }
+                            | Op::VectorFromLanes { .. }
+                            | Op::Cmp { .. }
+                            | Op::Select { .. }
+                            | Op::Logic { .. }
+                            | Op::Not { .. }
+                    ) =>
+                {
                     // These closed register operations are total and have no
                     // access, participation, or failure effect. An unsupported
                     // numerical result may be opaque; memory/control operations
@@ -1085,12 +1270,21 @@ impl<'a> Analysis<'a> {
     ) -> Result<()> {
         for step in steps {
             match step {
-                ScheduleStep::Repeat { symbol, start, end, body, visits: seismic_ir::schedule::RepeatVisits::Independent, .. } => {
+                ScheduleStep::Repeat {
+                    symbol,
+                    start,
+                    end,
+                    body,
+                    visits: seismic_ir::schedule::RepeatVisits::Independent,
+                    ..
+                } => {
                     let start = self.expression((*start).into(), &state.slots)?;
                     let end = self.expression((*end).into(), &state.slots)?;
                     let extent = match (&self.terms.nodes[start.0], &self.terms.nodes[end.0]) {
                         (Node::Natural(0), _) => end,
-                        (Node::Natural(a), Node::Natural(b)) => self.terms.node(Node::Natural(b.saturating_sub(*a))),
+                        (Node::Natural(a), Node::Natural(b)) => {
+                            self.terms.node(Node::Natural(b.saturating_sub(*a)))
+                        }
                         _ => return Err("offset parallel map relation is unfinished"),
                     };
                     self.map_visit(state, extent, &mut |analysis, visit, lane| {
@@ -1101,10 +1295,19 @@ impl<'a> Analysis<'a> {
                         Ok(())
                     })?;
                 }
-                ScheduleStep::Repeat { symbol, start, end, body, carries, .. } => {
+                ScheduleStep::Repeat {
+                    symbol,
+                    start,
+                    end,
+                    body,
+                    carries,
+                    ..
+                } => {
                     let start = self.expression((*start).into(), &state.slots)?;
                     let end = self.expression((*end).into(), &state.slots)?;
-                    self.scalar_schedule_repeat(schedule, kernels, *symbol, start, end, body, carries, state)?;
+                    self.scalar_schedule_repeat(
+                        schedule, kernels, *symbol, start, end, body, carries, state,
+                    )?;
                 }
                 ScheduleStep::Imported { body, .. } => {
                     self.schedule(schedule, kernels, body, state)?
@@ -1112,10 +1315,16 @@ impl<'a> Analysis<'a> {
                 ScheduleStep::Launch(id) => {
                     let launch = schedule.launch(*id);
                     let kernel = kernels.kernel(launch.kernel);
-                    let single = launch.grid.iter().chain(&launch.workgroup).all(|expression| matches!(
-                        self.expressions.view((*expression).into()),
-                        seismic_lang::expr::NodeView::NatConst(1)
-                    ));
+                    let single = launch
+                        .grid
+                        .iter()
+                        .chain(&launch.workgroup)
+                        .all(|expression| {
+                            matches!(
+                                self.expressions.view((*expression).into()),
+                                seismic_lang::expr::NodeView::NatConst(1)
+                            )
+                        });
                     if single {
                         self.physical_block(kernel, kernel.root(), &mut HashMap::new(), state)?;
                     } else {
@@ -1197,7 +1406,6 @@ impl<'a> Analysis<'a> {
         }
         Ok(())
     }
-
 }
 
 pub(super) fn dtype(ty: ValueType) -> Result<DType> {
@@ -1218,8 +1426,12 @@ mod tests {
         use seismic_ir::construction::{AllocationPlan, Construction};
         let mut arena = ExprArena::default();
         let mut construction = Construction::<FakeTarget>::new(&mut arena, vec![], false, 0);
-        let unknown_slot = construction.schedule_state().slot_any(&mut arena, ScalarKind::Scalar(DType::F32));
-        let literal_slot = construction.schedule_state().slot_any(&mut arena, ScalarKind::Scalar(DType::U32));
+        let unknown_slot = construction
+            .schedule_state()
+            .slot_any(&mut arena, ScalarKind::Scalar(DType::F32));
+        let literal_slot = construction
+            .schedule_state()
+            .slot_any(&mut arena, ScalarKind::Scalar(DType::U32));
         let vectors = seismic_ir::physical_target::VectorSupport::default();
         let mut kernel = construction.portable_kernel(&mut arena, &(), &[], &vectors);
         let unknown_output = kernel.result_slot(unknown_slot);
@@ -1231,15 +1443,28 @@ mod tests {
         kernel.store_slot(literal_output, literal);
         kernel.close();
         let token = construction.schedule(&mut arena, 0).close();
-        let executable = construction.close(token).normalize_launches(&mut arena, 1024, 64).unwrap().analyze_allocations().apply_allocation_plan(&mut arena, AllocationPlan::distinct()).finish();
+        let executable = construction
+            .close(token)
+            .normalize_launches(&mut arena, 1024, 64)
+            .unwrap()
+            .analyze_allocations()
+            .apply_allocation_plan(&mut arena, AllocationPlan::distinct())
+            .finish();
         let mut analysis = Analysis::new(&arena, executable.storage(), &[]);
         let (_, kernel) = executable.kernels().kernels().next().unwrap();
         let mut state = State::default();
-        analysis.physical_block(kernel, kernel.root(), &mut HashMap::new(), &mut state).unwrap();
-        assert!(analysis.terms.contains_opaque(state.slots[&unknown_slot.symbol()]));
+        analysis
+            .physical_block(kernel, kernel.root(), &mut HashMap::new(), &mut state)
+            .unwrap();
+        assert!(analysis
+            .terms
+            .contains_opaque(state.slots[&unknown_slot.symbol()]));
         let literal = state.slots[&literal_slot.symbol()];
         assert!(!analysis.terms.contains_opaque(literal));
-        assert!(matches!(analysis.terms.nodes[literal.0], Node::Constant(ReferenceScalar::U32(3))));
+        assert!(matches!(
+            analysis.terms.nodes[literal.0],
+            Node::Constant(ReferenceScalar::U32(3))
+        ));
     }
 
     #[test]
@@ -1253,8 +1478,16 @@ mod tests {
         let extent = arena.nat(1);
         let bytes = arena.nat(4);
         let zero = arena.nat(0);
-        let allocation = construction.storage_mut().allocate(GlobalBufferKind::Arena, bytes, 4);
-        let ordinal = construction.storage_mut().dense_view(&mut arena, allocation, representation, zero, vec![extent]);
+        let allocation = construction
+            .storage_mut()
+            .allocate(GlobalBufferKind::Arena, bytes, 4);
+        let ordinal = construction.storage_mut().dense_view(
+            &mut arena,
+            allocation,
+            representation,
+            zero,
+            vec![extent],
+        );
         let view = construction.view(ordinal, representation);
         let vectors = seismic_ir::physical_target::VectorSupport::default();
         let mut kernel = construction.portable_kernel(&mut arena, &(), &[], &vectors);
@@ -1266,10 +1499,26 @@ mod tests {
         let mut schedule = construction.schedule(&mut arena, 0);
         schedule.launch_sequential(kernel);
         let token = schedule.close();
-        let executable = construction.close(token).normalize_launches(&mut arena, 1024, 64).unwrap().analyze_allocations().apply_allocation_plan(&mut arena, AllocationPlan::distinct()).finish();
+        let executable = construction
+            .close(token)
+            .normalize_launches(&mut arena, 1024, 64)
+            .unwrap()
+            .analyze_allocations()
+            .apply_allocation_plan(&mut arena, AllocationPlan::distinct())
+            .finish();
         let mut analysis = Analysis::new(&arena, executable.storage(), &[]);
         let (_, kernel) = executable.kernels().kernels().next().unwrap();
-        assert_eq!(analysis.physical_block(kernel, kernel.root(), &mut HashMap::new(), &mut State::default()).unwrap_err(), "actual memory coordinate safety is not established");
+        assert_eq!(
+            analysis
+                .physical_block(
+                    kernel,
+                    kernel.root(),
+                    &mut HashMap::new(),
+                    &mut State::default()
+                )
+                .unwrap_err(),
+            "actual memory coordinate safety is not established"
+        );
     }
 
     #[test]
@@ -1287,7 +1536,10 @@ mod tests {
         no.path.enter_arm(within, false);
         assert!(yes.path.establishes(&mut terms, within));
         assert!(!no.path.establishes(&mut terms, within));
-        assert!(!before.path.establishes(&mut terms, within), "an arm premise does not escape its join");
+        assert!(
+            !before.path.establishes(&mut terms, within),
+            "an arm premise does not escape its join"
+        );
         let unknown = terms.opaque();
         let unknown_bound = terms.compare(reference::CmpOp::Lt, unknown, extent);
         yes.path.enter_arm(unknown_bound, true);
@@ -1305,14 +1557,24 @@ mod tests {
         assert!(terms.contains_opaque(unavailable));
         assert!(terms.contains_opaque(dependent));
         let self_comparison = terms.compare(reference::CmpOp::Eq, unavailable, unavailable);
-        assert!(terms.contains_opaque(self_comparison), "opaque identity is not a value proof");
+        assert!(
+            terms.contains_opaque(self_comparison),
+            "opaque identity is not a value proof"
+        );
         let mut arena = ExprArena::default();
-        let condition_symbol = arena.schedule_slot(0, seismic_lang::expr::SymbolSort::Scalar(DType::Bool));
-        let condition = terms.node(Node::Input(condition_symbol, ScalarKind::Scalar(DType::Bool)));
+        let condition_symbol =
+            arena.schedule_slot(0, seismic_lang::expr::SymbolSort::Scalar(DType::Bool));
+        let condition = terms.node(Node::Input(
+            condition_symbol,
+            ScalarKind::Scalar(DType::Bool),
+        ));
         let guarded = terms.select(condition, dependent, one);
         assert!(terms.contains_opaque(guarded));
         let known = terms.compare(reference::CmpOp::Le, one, one);
         assert!(!terms.contains_opaque(known));
-        assert!(matches!(terms.nodes[known.0], Node::Constant(ReferenceScalar::Bool(true))));
+        assert!(matches!(
+            terms.nodes[known.0],
+            Node::Constant(ReferenceScalar::Bool(true))
+        ));
     }
 }

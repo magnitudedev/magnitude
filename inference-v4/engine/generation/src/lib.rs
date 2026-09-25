@@ -20,7 +20,7 @@ pub use method::{
 pub use mtp::Mtp;
 pub use plain::Plain;
 pub use round::{MethodUpdate, RoundAcceptance, RoundForward, RoundState};
-pub use shaping::{HISTORY_WIDTH, selection_history, verification_selects};
+pub use shaping::{selection_history, verification_selects, HISTORY_WIDTH};
 use std::{
     collections::{BTreeSet, VecDeque},
     sync::Arc,
@@ -718,7 +718,10 @@ impl Generation {
         if self.round.is_some() {
             return Err("method work cannot reconcile while a target round is suspended".into());
         }
-        let Operation::Head { request, tokens, .. } = operation else {
+        let Operation::Head {
+            request, tokens, ..
+        } = operation
+        else {
             return Err("only a head transaction reconciles into method state".into());
         };
         if let magnitude_model_executor::Outcome::Head { proposals } = outcome {
@@ -980,7 +983,11 @@ impl Generation {
     /// Called after the execution owner releases numerical state. Logical history,
     /// grammar, queued output, and terminal decisions remain available.
     pub fn evicted(&mut self) -> Result<(), String> {
-        self.reconciliation_target = self.accepted_position;
+        // Restore exactly the numerical prefix that existed before eviction.
+        // A live decode normally has one accepted successor that has not yet
+        // been fed through the model; replaying that token here would advance
+        // past the point from which the next decode must start.
+        self.reconciliation_target = self.resident_position;
         self.round = None;
         self.method.evict();
         self.resident = false;
@@ -1022,8 +1029,7 @@ impl Generation {
     /// Fork reconciled logical state at the executor's independently checked
     /// numerical checkpoint position.
     pub fn fork_at(&self, numerical_position: usize) -> Result<Self, String> {
-        if self.round.is_some() || !self.resident || numerical_position != self.resident_position
-        {
+        if self.round.is_some() || !self.resident || numerical_position != self.resident_position {
             return Err("checkpoint requires matching reconciled resident state".into());
         }
         let constraint = self

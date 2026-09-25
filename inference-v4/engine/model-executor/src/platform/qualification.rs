@@ -1,72 +1,16 @@
-use super::policy::{admit_growth, assessment_capacity, MemoryPolicyError};
+use super::policy::{assessment_capacity, refresh_allocation_ceiling, MemoryPolicyError};
 use super::selection::{select, DeviceRequest, SelectionError};
-use crate::{AttestedPrograms, CatalogError, ExecutionPath};
+use crate::{CatalogError, ExecutionPath};
 use seismic::{
-    ArtifactStore, BackendName, Device, DeviceCatalog, DeviceInfo, DeviceOptions, DeviceSelector,
-    MemoryLimitError, ObservationError, OpenError, ResolveError,
+    ArtifactStore, Device, DeviceCatalog, DeviceInfo, DeviceOptions, DeviceSelector,
+    ObservationError, OpenError, ResolveError,
 };
 use std::fmt;
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct MemoryRequirements {
-    pub immutable_weights: u64,
-    pub state: u64,
-    pub scratch: u64,
-    pub safety_margin: u64,
-}
-
-impl MemoryRequirements {
-    pub fn total(self) -> Result<u64, BudgetError> {
-        self.immutable_weights
-            .checked_add(self.state)
-            .and_then(|value| value.checked_add(self.scratch))
-            .and_then(|value| value.checked_add(self.safety_margin))
-            .ok_or(BudgetError::Overflow)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BudgetError {
-    Overflow,
-    ZeroBudget,
-    Insufficient {
-        required: u64,
-        storage_bytes: u64,
-        immutable_weights: u64,
-        state: u64,
-        scratch: u64,
-        safety_margin: u64,
-    },
-}
-
-impl fmt::Display for BudgetError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Overflow => formatter.write_str("device budget arithmetic overflow"),
-            Self::ZeroBudget => formatter.write_str("device storage budget is zero"),
-            Self::Insufficient {
-                required,
-                storage_bytes,
-                immutable_weights,
-                state,
-                scratch,
-                safety_margin,
-            } => write!(
-                formatter,
-                "device budget {storage_bytes} is below required {required} bytes (weights {immutable_weights}, state {state}, scratch {scratch}, safety {safety_margin})"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for BudgetError {}
-
 #[derive(Clone)]
 pub struct PlatformConfig {
     pub path: ExecutionPath,
-    /// The engine's requested Seismic allocation budget for the device.
-    pub storage_bytes: u64,
     /// Where the device keeps formed kernels between loads.
     pub artifacts: Option<Arc<dyn ArtifactStore>>,
 }
@@ -80,20 +24,10 @@ pub struct SelectedDevice {
 }
 
 /// The selected device, resolved and opened in the executing process,
-/// admitted against its fresh observations and bounded by the budget.
-/// Final requirements are admitted after Seismic derives graph storage.
+/// admitted against its fresh observations.
 pub struct OpenedPlatform {
     selector: DeviceSelector,
-    storage_bytes: u64,
     device: Device,
-}
-
-pub struct QualifiedPlatform {
-    pub selector: DeviceSelector,
-    pub storage_bytes: u64,
-    pub requirements: MemoryRequirements,
-    pub device: Device,
-    pub programs: AttestedPrograms,
 }
 
 impl OpenedPlatform {
@@ -101,42 +35,12 @@ impl OpenedPlatform {
         &self.device
     }
 
-    pub fn admit(
-        self,
-        requirements: MemoryRequirements,
-        programs: AttestedPrograms,
-    ) -> Result<QualifiedPlatform, PlatformError> {
-        let required = requirements.total().map_err(PlatformError::Budget)?;
-        if required > self.storage_bytes {
-            return Err(PlatformError::Budget(BudgetError::Insufficient {
-                required,
-                storage_bytes: self.storage_bytes,
-                immutable_weights: requirements.immutable_weights,
-                state: requirements.state,
-                scratch: requirements.scratch,
-                safety_margin: requirements.safety_margin,
-            }));
-        }
-        Ok(QualifiedPlatform {
-            selector: self.selector,
-            storage_bytes: self.storage_bytes,
-            requirements,
-            device: self.device,
-            programs,
-        })
+    pub fn selector(&self) -> DeviceSelector {
+        self.selector
     }
-}
 
-impl fmt::Debug for QualifiedPlatform {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("QualifiedPlatform")
-            .field("selector", &self.selector)
-            .field("storage_bytes", &self.storage_bytes)
-            .field("requirements", &self.requirements)
-            .field("device", &self.device)
-            .field("program_path", &self.programs.path())
-            .finish()
+    pub fn into_device(self) -> Device {
+        self.device
     }
 }
 
@@ -147,17 +51,9 @@ pub enum PlatformError {
     Memory(MemoryPolicyError),
     Resolve(ResolveError),
     Open(OpenError),
-    Budget(BudgetError),
     Policy {
         path: ExecutionPath,
         outcome: String,
-    },
-    MemoryLimit {
-        path: ExecutionPath,
-        backend: BackendName,
-        selector: DeviceSelector,
-        storage_bytes: u64,
-        error: MemoryLimitError,
     },
     Qualification(CatalogError),
 }
@@ -170,21 +66,9 @@ impl fmt::Display for PlatformError {
             Self::Memory(error) => write!(formatter, "{error}"),
             Self::Resolve(error) => write!(formatter, "{error}"),
             Self::Open(error) => write!(formatter, "{error}"),
-            Self::Budget(error) => write!(formatter, "{error}"),
             Self::Policy { path, outcome } => {
                 write!(formatter, "platform rejected path {path}: {outcome}")
             }
-            Self::MemoryLimit {
-                path,
-                backend,
-                selector,
-                storage_bytes,
-                error,
-            } => write!(
-                formatter,
-                "failed to set {storage_bytes}-byte limit for {path} ({}) on {selector}: {error}",
-                backend.as_str()
-            ),
             Self::Qualification(error) => write!(formatter, "{error}"),
         }
     }
@@ -212,8 +96,8 @@ pub fn select_device(
     })
 }
 
-/// Resolve the selected identity in this process's catalog, open it, admit
-/// the budget against fresh scoped observations, and enforce it in Seismic.
+/// Resolve the selected identity in this process's catalog, open it, set a
+/// ceiling from fresh scoped availability, and enforce it in Seismic.
 /// Never substitutes another device.
 pub fn open_selected(
     catalog: &DeviceCatalog,
@@ -221,9 +105,6 @@ pub fn open_selected(
     config: PlatformConfig,
 ) -> Result<OpenedPlatform, PlatformError> {
     enforce_phase_one(config.path)?;
-    if config.storage_bytes == 0 {
-        return Err(PlatformError::Budget(BudgetError::ZeroBudget));
-    }
     let id = catalog.resolve(selector).map_err(PlatformError::Resolve)?;
     let device = catalog
         .open_with(
@@ -233,21 +114,8 @@ pub fn open_selected(
             },
         )
         .map_err(PlatformError::Open)?;
-    admit_growth(catalog, &device, config.storage_bytes).map_err(PlatformError::Memory)?;
-    device
-        .set_memory_limit(Some(config.storage_bytes))
-        .map_err(|error| PlatformError::MemoryLimit {
-            path: config.path,
-            backend: device.backend(),
-            selector,
-            storage_bytes: config.storage_bytes,
-            error,
-        })?;
-    Ok(OpenedPlatform {
-        selector,
-        storage_bytes: config.storage_bytes,
-        device,
-    })
+    refresh_allocation_ceiling(catalog, &device).map_err(PlatformError::Memory)?;
+    Ok(OpenedPlatform { selector, device })
 }
 
 fn enforce_phase_one(path: ExecutionPath) -> Result<(), PlatformError> {
@@ -277,26 +145,6 @@ mod tests {
     }
 
     #[test]
-    fn requirement_accounting_is_exact_and_checked() {
-        let requirements = MemoryRequirements {
-            immutable_weights: 100,
-            state: 200,
-            scratch: 300,
-            safety_margin: 100,
-        };
-        assert_eq!(requirements.total(), Ok(700));
-        assert!(matches!(
-            MemoryRequirements {
-                immutable_weights: u64::MAX,
-                state: 1,
-                ..Default::default()
-            }
-            .total(),
-            Err(BudgetError::Overflow)
-        ));
-    }
-
-    #[test]
     fn opening_an_unknown_selector_never_substitutes_a_device() {
         let catalog = DeviceCatalog::discover().unwrap();
         let missing = DeviceSelector::Metal { registry_id: 0 };
@@ -306,7 +154,6 @@ mod tests {
                 missing,
                 PlatformConfig {
                     path: ExecutionPath::Native,
-                    storage_bytes: 1,
                     artifacts: None,
                 },
             ),

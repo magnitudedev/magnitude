@@ -2,7 +2,9 @@
 //! A definition's uses become its `ElementDomain`, the only owner of which
 //! representations each element parameter may be bound to.
 
-use crate::checked::{ElementConversion, ElementDomain, ElementParameter, ElementTarget, ElementUses};
+use crate::checked::{
+    ElementConversion, ElementDomain, ElementParameter, ElementTarget, ElementUses,
+};
 use crate::types::Elem;
 use std::collections::BTreeMap;
 

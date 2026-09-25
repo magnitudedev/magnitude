@@ -48,10 +48,16 @@ struct Rng(u64);
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        Self(seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407))
+        Self(
+            seed.wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407),
+        )
     }
     fn next(&mut self) -> u32 {
-        self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         (self.0 >> 33) as u32
     }
     fn symmetric(&mut self) -> f32 {
@@ -75,9 +81,19 @@ impl Host {
         assert_eq!(shape.iter().product::<usize>(), values.len());
         let values = values
             .into_iter()
-            .map(|value| if dtype == DType::F16 { round_a(value) } else { value })
+            .map(|value| {
+                if dtype == DType::F16 {
+                    round_a(value)
+                } else {
+                    value
+                }
+            })
             .collect();
-        Self { dtype, shape: shape.to_vec(), values }
+        Self {
+            dtype,
+            shape: shape.to_vec(),
+            values,
+        }
     }
     fn random(dtype: DType, shape: &[usize], scale: f32, rng: &mut Rng) -> Self {
         let values = rng.values(shape.iter().product(), scale);
@@ -102,11 +118,19 @@ impl Host {
                 other => panic!("unsupported host dtype {other:?}"),
             })
             .collect::<Vec<_>>();
-        let shape = self.shape.iter().map(|extent| *extent as u64).collect::<Vec<_>>();
+        let shape = self
+            .shape
+            .iter()
+            .map(|extent| *extent as u64)
+            .collect::<Vec<_>>();
         Tensor::from_host(device, Element::dense(self.dtype), &shape, &bytes).unwrap()
     }
     fn oracle(&self) -> TensorData {
-        TensorData::dense(self.dtype, self.shape.clone(), self.values.iter().map(|v| f64::from(*v)).collect())
+        TensorData::dense(
+            self.dtype,
+            self.shape.clone(),
+            self.values.iter().map(|v| f64::from(*v)).collect(),
+        )
     }
 }
 
@@ -136,11 +160,20 @@ enum Input<'a> {
     F32(f32),
 }
 
-fn interpret(module: &CheckedModule, name: &str, bindings: &[(&str, DType)], inputs: &[Input<'_>]) -> Vec<f32> {
+fn interpret(
+    module: &CheckedModule,
+    name: &str,
+    bindings: &[(&str, DType)],
+    inputs: &[Input<'_>],
+) -> Vec<f32> {
     let elements = bindings
         .iter()
-        .fold(ElementBindings::new(), |elements, (name, dtype)| elements.bind(name, registry::dense(*dtype)));
-    let logical = module.entry(module.entry_named(name).unwrap(), &elements).unwrap();
+        .fold(ElementBindings::new(), |elements, (name, dtype)| {
+            elements.bind(name, registry::dense(*dtype))
+        });
+    let logical = module
+        .entry(module.entry_named(name).unwrap(), &elements)
+        .unwrap();
     let mut interpreter = Interpreter::new(&logical);
     let arguments = inputs
         .iter()
@@ -150,26 +183,43 @@ fn interpret(module: &CheckedModule, name: &str, bindings: &[(&str, DType)], inp
         })
         .collect::<Vec<_>>();
     let started = Instant::now();
-    let outcome: OracleOutcome = interpreter.run(&arguments).unwrap_or_else(|error| panic!("{name}: {error}"));
+    let outcome: OracleOutcome = interpreter
+        .run(&arguments)
+        .unwrap_or_else(|error| panic!("{name}: {error}"));
     if let SourceTermination::Failed(failure) = outcome.termination() {
         panic!("{name} failed: {failure}");
     }
-    eprintln!("{name}: portable body in {:.1} s", started.elapsed().as_secs_f64());
+    eprintln!(
+        "{name}: portable body in {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
     let result = outcome.results().next().unwrap();
-    let OutcomeValue::Tensor(tensor) = result.value() else { panic!("tensor result") };
-    (0..tensor.element_count()).map(|i| tensor.read(i).unwrap() as f32).collect()
+    let OutcomeValue::Tensor(tensor) = result.value() else {
+        panic!("tensor result")
+    };
+    (0..tensor.element_count())
+        .map(|i| tensor.read(i).unwrap() as f32)
+        .collect()
 }
 
 /// Error of `actual` against `expected` relative to the RMS of `expected`:
 /// the maximum and the mean must stay within the bounds.
 fn relative_error(label: &str, actual: &[f32], expected: &[f32], maximum: f32, mean: f32) {
     assert_eq!(actual.len(), expected.len(), "{label}: result length");
-    let rms = (expected.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / expected.len() as f64).sqrt();
-    let errors = actual.iter().zip(expected).map(|(a, e)| f64::from((a - e).abs()) / rms).collect::<Vec<_>>();
+    let rms = (expected.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / expected.len() as f64)
+        .sqrt();
+    let errors = actual
+        .iter()
+        .zip(expected)
+        .map(|(a, e)| f64::from((a - e).abs()) / rms)
+        .collect::<Vec<_>>();
     let worst = errors.iter().copied().fold(0.0, f64::max);
     let average = errors.iter().sum::<f64>() / errors.len() as f64;
     eprintln!("{label}: rms {rms:.4}, max error {worst:.2e} rms, mean {average:.2e} rms");
-    assert!(actual.iter().all(|value| value.is_finite()), "{label}: non-finite result");
+    assert!(
+        actual.iter().all(|value| value.is_finite()),
+        "{label}: non-finite result"
+    );
     assert!(
         worst <= f64::from(maximum) && average <= f64::from(mean),
         "{label}: max {worst:.2e} (bound {maximum:.0e}), mean {average:.2e} (bound {mean:.0e})"
@@ -192,7 +242,10 @@ fn device() -> Device {
 /// The accelerator and the CPU.
 fn devices() -> Vec<Device> {
     let catalog = seismic::DeviceCatalog::discover().unwrap();
-    vec![device(), catalog.open_backend(seismic::BackendName::Cpu).unwrap()]
+    vec![
+        device(),
+        catalog.open_backend(seismic::BackendName::Cpu).unwrap(),
+    ]
 }
 
 fn is_cpu(device: &Device) -> bool {
@@ -205,9 +258,10 @@ fn specialization_on(device: &Device, statics: &[(&str, usize)]) -> NativeSpecia
     if is_cpu(device) {
         return NativeSpecialization::new().with_param("ROWS", 8);
     }
-    statics
-        .iter()
-        .fold(NativeSpecialization::new(), |specialization, (name, value)| specialization.with_static(*name, *value as u64))
+    statics.iter().fold(
+        NativeSpecialization::new(),
+        |specialization, (name, value)| specialization.with_static(*name, *value as u64),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +310,10 @@ fn host_linear(x: &[f32], k: usize, weight: &Host, bias: &Host) -> Vec<f32> {
         .flat_map(|row| {
             (0..n).map(move |output| {
                 let w = &weight.values[output * k..(output + 1) * k];
-                row.iter().zip(w).fold(0.0f32, |acc, (a, b)| a.mul_add(*b, acc)) + bias.values[output]
+                row.iter()
+                    .zip(w)
+                    .fold(0.0f32, |acc, (a, b)| a.mul_add(*b, acc))
+                    + bias.values[output]
             })
         })
         .collect()
@@ -272,8 +329,16 @@ impl Block {
         let mut rng = Rng::new(seed);
         let d = heads * 4 * quarter;
         let side = (rows as f64).sqrt().ceil() as usize;
-        let coordinates = (0..rows).flat_map(|row| [(row / side) as f32, (row % side) as f32]).collect();
-        let norm = |rng: &mut Rng| Host::new(DType::F32, &[d], rng.values(d, 0.2).iter().map(|v| 1.0 + v).collect());
+        let coordinates = (0..rows)
+            .flat_map(|row| [(row / side) as f32, (row % side) as f32])
+            .collect();
+        let norm = |rng: &mut Rng| {
+            Host::new(
+                DType::F32,
+                &[d],
+                rng.values(d, 0.2).iter().map(|v| 1.0 + v).collect(),
+            )
+        };
         Self {
             heads,
             quarter,
@@ -351,12 +416,23 @@ impl Block {
                 DW: self.down_weight.element(),
                 DB: self.down_bias.element(),
             },
-            &specialization_on(device, &[("H", self.heads), ("P", self.quarter), ("F", self.intermediate)]),
+            &specialization_on(
+                device,
+                &[
+                    ("H", self.heads),
+                    ("P", self.quarter),
+                    ("F", self.intermediate),
+                ],
+            ),
         )
         .unwrap()
     }
 
-    fn run(&self, device: &Device, kernel: &seismic::NativeKernel<qwen_vision_block::Entry>) -> Tensor {
+    fn run(
+        &self,
+        device: &Device,
+        kernel: &seismic::NativeKernel<qwen_vision_block::Entry>,
+    ) -> Tensor {
         let t = |host: &Host| host.tensor(device);
         kernel
             .call(qwen_vision_block::Args {
@@ -387,20 +463,29 @@ impl Block {
         let d = self.heads * w;
         let p = self.quarter;
         let hidden = &self.hidden.values;
-        let normalized = host_layer_norm(hidden, d, &self.norm1_weight.values, &self.norm1_bias.values);
+        let normalized = host_layer_norm(
+            hidden,
+            d,
+            &self.norm1_weight.values,
+            &self.norm1_bias.values,
+        );
         let mut projected = host_linear(&normalized, d, &self.qkv_weight, &self.qkv_bias)
             .into_iter()
             .map(round_a)
             .collect::<Vec<_>>();
         for row in 0..rows {
-            let coordinates = [self.coordinates.values[row * 2], self.coordinates.values[row * 2 + 1]];
+            let coordinates = [
+                self.coordinates.values[row * 2],
+                self.coordinates.values[row * 2 + 1],
+            ];
             for part in 0..2 {
                 for head in 0..self.heads {
                     let at = row * 3 * d + part * d + head * w;
                     let source = projected[at..at + w].to_vec();
                     for i in 0..w {
                         let pair = i % (2 * p);
-                        let angle = coordinates[pair / p] * (-(10000f32.ln()) * (pair % p) as f32 / p as f32).exp();
+                        let angle = coordinates[pair / p]
+                            * (-(10000f32.ln()) * (pair % p) as f32 / p as f32).exp();
                         let (s, c) = angle.sin_cos();
                         projected[at + i] = round_a(if i < 2 * p {
                             source[i] * c - source[i + 2 * p] * s
@@ -419,11 +504,17 @@ impl Block {
                 let scores = (0..rows)
                     .map(|key| {
                         let k = &projected[key * 3 * d + d + head * w..][..w];
-                        q.iter().zip(k).fold(0.0f32, |acc, (a, b)| a.mul_add(*b, acc)) * scale
+                        q.iter()
+                            .zip(k)
+                            .fold(0.0f32, |acc, (a, b)| a.mul_add(*b, acc))
+                            * scale
                     })
                     .collect::<Vec<_>>();
                 let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let weights = scores.iter().map(|s| (s - maximum).exp()).collect::<Vec<_>>();
+                let weights = scores
+                    .iter()
+                    .map(|s| (s - maximum).exp())
+                    .collect::<Vec<_>>();
                 let denominator = weights.iter().sum::<f32>();
                 for j in 0..w {
                     let acc = (0..rows).fold(0.0f32, |acc, key| {
@@ -434,13 +525,27 @@ impl Block {
             }
         }
         let mixed = host_linear(&attended, d, &self.projection_weight, &self.projection_bias);
-        let residual = hidden.iter().zip(&mixed).map(|(h, m)| h + m).collect::<Vec<_>>();
-        let normalized = host_layer_norm(&residual, d, &self.norm2_weight.values, &self.norm2_bias.values);
+        let residual = hidden
+            .iter()
+            .zip(&mixed)
+            .map(|(h, m)| h + m)
+            .collect::<Vec<_>>();
+        let normalized = host_layer_norm(
+            &residual,
+            d,
+            &self.norm2_weight.values,
+            &self.norm2_bias.values,
+        );
         let activated = host_linear(&normalized, d, &self.up_weight, &self.up_bias)
             .into_iter()
             .map(|up| round_a(host_gelu_tanh(round_a(up))))
             .collect::<Vec<_>>();
-        let down = host_linear(&activated, self.intermediate, &self.down_weight, &self.down_bias);
+        let down = host_linear(
+            &activated,
+            self.intermediate,
+            &self.down_weight,
+            &self.down_bias,
+        );
         residual.iter().zip(&down).map(|(r, d)| r + d).collect()
     }
 }
@@ -459,21 +564,49 @@ fn stem_matches_its_portable_body_on(device: &Device) {
     let module = module();
     let (rows, channels, patch, hidden, table_rows) = (8, 3, 16, 64, 16);
     let mut rng = Rng::new(11);
-    let pixels = Host::random(DType::F32, &[rows, channels, 2, patch, patch], 1.0, &mut rng);
-    let weight_0 = Host::random(DType::F16, &[hidden, channels, patch, patch], 0.04, &mut rng);
-    let weight_1 = Host::random(DType::F16, &[hidden, channels, patch, patch], 0.04, &mut rng);
+    let pixels = Host::random(
+        DType::F32,
+        &[rows, channels, 2, patch, patch],
+        1.0,
+        &mut rng,
+    );
+    let weight_0 = Host::random(
+        DType::F16,
+        &[hidden, channels, patch, patch],
+        0.04,
+        &mut rng,
+    );
+    let weight_1 = Host::random(
+        DType::F16,
+        &[hidden, channels, patch, patch],
+        0.04,
+        &mut rng,
+    );
     let bias = Host::random(DType::F32, &[hidden], 0.3, &mut rng);
     let table = Host::random(DType::F32, &[table_rows, hidden], 1.0, &mut rng);
     let indices = Host::new(
         DType::I32,
         &[rows, 4],
-        (0..rows * 4).map(|_| (rng.next() % table_rows as u32) as f32).collect(),
+        (0..rows * 4)
+            .map(|_| (rng.next() % table_rows as u32) as f32)
+            .collect(),
     );
-    let coefficients = Host::new(DType::F32, &[rows, 4], (0..rows * 4).map(|_| (rng.symmetric() + 1.0) / 2.0).collect());
+    let coefficients = Host::new(
+        DType::F32,
+        &[rows, 4],
+        (0..rows * 4)
+            .map(|_| (rng.symmetric() + 1.0) / 2.0)
+            .collect(),
+    );
     let expected = interpret(
         &module,
         "qwen_vision_stem",
-        &[("W0", DType::F16), ("W1", DType::F16), ("B", DType::F32), ("PE", DType::F32)],
+        &[
+            ("W0", DType::F16),
+            ("W1", DType::F16),
+            ("B", DType::F32),
+            ("PE", DType::F32),
+        ],
         &[
             Input::Tensor(&pixels),
             Input::Tensor(&weight_0),
@@ -486,7 +619,12 @@ fn stem_matches_its_portable_body_on(device: &Device) {
     );
     let kernel = qwen_vision_stem::native_for_device_with(
         device,
-        qwen_vision_stem::Elements { W0: weight_0.element(), W1: weight_1.element(), B: bias.element(), PE: table.element() },
+        qwen_vision_stem::Elements {
+            W0: weight_0.element(),
+            W1: weight_1.element(),
+            B: bias.element(),
+            PE: table.element(),
+        },
         &specialization_on(device, &[("C", channels), ("P", patch), ("H", hidden)]),
     )
     .unwrap();
@@ -503,7 +641,13 @@ fn stem_matches_its_portable_body_on(device: &Device) {
         })
         .unwrap()
         .value;
-    relative_error("qwen_vision_stem", &read_f32(&result), &expected, 2e-3, 2e-4);
+    relative_error(
+        "qwen_vision_stem",
+        &read_f32(&result),
+        &expected,
+        2e-3,
+        2e-4,
+    );
 }
 
 /// Two heads of width 64 over 40 rows (a partial query tile, a partial key
@@ -519,10 +663,27 @@ fn block_matches_its_portable_body() {
 fn block_matches_its_portable_body_on(device: &Device) {
     let module = module();
     let block = Block::new(40, 2, 16, 128, 21);
-    let expected = interpret(&module, "qwen_vision_block", &block.bindings(), &block.inputs());
-    relative_error("qwen_vision_block host model", &block.host(), &expected, 1e-3, 1e-4);
+    let expected = interpret(
+        &module,
+        "qwen_vision_block",
+        &block.bindings(),
+        &block.inputs(),
+    );
+    relative_error(
+        "qwen_vision_block host model",
+        &block.host(),
+        &expected,
+        1e-3,
+        1e-4,
+    );
     let result = block.run(device, &block.kernel(device));
-    relative_error("qwen_vision_block", &read_f32(&result), &expected, 5e-3, 5e-4);
+    relative_error(
+        "qwen_vision_block",
+        &read_f32(&result),
+        &expected,
+        5e-3,
+        5e-4,
+    );
 }
 
 /// The projector's geometry (16 heads of 64, F 4096) over 200 rows (several
@@ -538,7 +699,13 @@ fn block_matches_the_host_model_at_projector_geometry_on(device: &Device) {
     let block = Block::new(200, 16, 16, 4096, 31);
     let expected = block.host();
     let result = block.run(device, &block.kernel(device));
-    relative_error("qwen_vision_block (projector geometry)", &read_f32(&result), &expected, 5e-3, 5e-4);
+    relative_error(
+        "qwen_vision_block (projector geometry)",
+        &read_f32(&result),
+        &expected,
+        5e-3,
+        5e-4,
+    );
 }
 
 #[test]
@@ -554,7 +721,11 @@ fn merger_matches_its_portable_body_on(device: &Device) {
     let mut rng = Rng::new(41);
     let width = group * hidden;
     let rows_in = Host::random(DType::F32, &[rows * group, hidden], 2.0, &mut rng);
-    let norm_weight = Host::new(DType::F32, &[hidden], rng.values(hidden, 0.2).iter().map(|v| 1.0 + v).collect());
+    let norm_weight = Host::new(
+        DType::F32,
+        &[hidden],
+        rng.values(hidden, 0.2).iter().map(|v| 1.0 + v).collect(),
+    );
     let norm_bias = Host::random(DType::F32, &[hidden], 0.1, &mut rng);
     let up_weight = Host::weight(width, width, 2.0, &mut rng);
     let up_bias = Host::random(DType::F32, &[width], 0.2, &mut rng);
@@ -611,7 +782,13 @@ fn merger_matches_its_portable_body_on(device: &Device) {
         })
         .unwrap()
         .value;
-    relative_error("qwen_vision_merger", &read_f32(&merged), &expected, 5e-3, 5e-4);
+    relative_error(
+        "qwen_vision_merger",
+        &read_f32(&merged),
+        &expected,
+        5e-3,
+        5e-4,
+    );
 }
 
 /// A real projector forward: the whole tower (stem, every block, merger) on
@@ -625,10 +802,16 @@ fn merger_matches_its_portable_body_on(device: &Device) {
 #[test]
 #[ignore]
 fn projector_forward_matches_the_f64_reference() {
-    let directory = std::path::PathBuf::from(std::env::var("VISION_FIXTURE").expect("VISION_FIXTURE"));
+    let directory =
+        std::path::PathBuf::from(std::env::var("VISION_FIXTURE").expect("VISION_FIXTURE"));
     let device = device();
     let read = |name: &str| std::fs::read(directory.join(name)).unwrap();
-    let f32s = |bytes: &[u8]| bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+    let f32s = |bytes: &[u8]| {
+        bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect::<Vec<_>>()
+    };
     let blob = read("weights.bin");
     let index = String::from_utf8(read("weights.txt")).unwrap();
     let weights = index
@@ -641,24 +824,39 @@ fn projector_forward_matches_the_f64_reference() {
                 other => panic!("unexpected dtype {other}"),
             };
             let offset = fields[2].parse::<usize>().unwrap();
-            let shape = fields[3..].iter().map(|f| f.parse::<u64>().unwrap()).collect::<Vec<_>>();
+            let shape = fields[3..]
+                .iter()
+                .map(|f| f.parse::<u64>().unwrap())
+                .collect::<Vec<_>>();
             let length = shape.iter().product::<u64>() as usize * bytes;
-            let tensor = Tensor::from_host(&device, element, &shape, &blob[offset..offset + length]).unwrap();
+            let tensor =
+                Tensor::from_host(&device, element, &shape, &blob[offset..offset + length])
+                    .unwrap();
             (fields[0].to_owned(), tensor)
         })
         .collect::<std::collections::HashMap<_, _>>();
     let w = |name: &str| &weights[name];
     let rows = read("pixels.bin").len() / (3 * 2 * 16 * 16 * 4);
     let (hidden, heads, quarter, intermediate, output) = (1024u64, 16u64, 16u64, 4096u64, 2560u64);
-    let tensor = |name: &str, element: Element, shape: &[u64]| Tensor::from_host(&device, element, shape, &read(name)).unwrap();
+    let tensor = |name: &str, element: Element, shape: &[u64]| {
+        Tensor::from_host(&device, element, shape, &read(name)).unwrap()
+    };
     let pixels = tensor("pixels.bin", Element::f32(), &[rows as u64, 3, 2, 16, 16]);
     let coordinates = tensor("coordinates.bin", Element::i32(), &[rows as u64, 2]);
     let indices = tensor("indices.bin", Element::i32(), &[rows as u64, 4]);
     let coefficients = tensor("coefficients.bin", Element::f32(), &[rows as u64, 4]);
     let stem = qwen_vision_stem::native_for_device_with(
         &device,
-        qwen_vision_stem::Elements { W0: Element::f16(), W1: Element::f16(), B: Element::f32(), PE: Element::f32() },
-        &NativeSpecialization::new().with_static("C", 3).with_static("P", 16).with_static("H", hidden),
+        qwen_vision_stem::Elements {
+            W0: Element::f16(),
+            W1: Element::f16(),
+            B: Element::f32(),
+            PE: Element::f32(),
+        },
+        &NativeSpecialization::new()
+            .with_static("C", 3)
+            .with_static("P", 16)
+            .with_static("H", hidden),
     )
     .unwrap();
     let block = qwen_vision_block::native_for_device_with(
@@ -678,7 +876,10 @@ fn projector_forward_matches_the_f64_reference() {
             DW: Element::f16(),
             DB: Element::f32(),
         },
-        &NativeSpecialization::new().with_static("H", heads).with_static("P", quarter).with_static("F", intermediate),
+        &NativeSpecialization::new()
+            .with_static("H", heads)
+            .with_static("P", quarter)
+            .with_static("F", intermediate),
     )
     .unwrap();
     let merger = qwen_vision_merger::native_for_device_with(
@@ -692,7 +893,10 @@ fn projector_forward_matches_the_f64_reference() {
             DW: Element::f16(),
             DB: Element::f32(),
         },
-        &NativeSpecialization::new().with_static("G", 4).with_static("H", hidden).with_static("D", output),
+        &NativeSpecialization::new()
+            .with_static("G", 4)
+            .with_static("H", hidden)
+            .with_static("D", output),
     )
     .unwrap();
     let forward = || {
@@ -754,12 +958,21 @@ fn projector_forward_matches_the_f64_reference() {
         })
         .collect::<Vec<_>>();
     times.sort_by(f64::total_cmp);
-    eprintln!("projector forward M {rows}: median {:.1} ms (min {:.1}), standalone calls", times[2], times[0]);
+    eprintln!(
+        "projector forward M {rows}: median {:.1} ms (min {:.1}), standalone calls",
+        times[2], times[0]
+    );
     let reference = f32s(&read("reference.bin"));
     let llama = f32s(&read("llama_policy.bin"));
     let report = |label: &str, actual: &[f32]| {
-        let rms = (reference.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / reference.len() as f64).sqrt();
-        let error = (actual.iter().zip(&reference).map(|(a, e)| f64::from(a - e).powi(2)).sum::<f64>()
+        let rms = (reference.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>()
+            / reference.len() as f64)
+            .sqrt();
+        let error = (actual
+            .iter()
+            .zip(&reference)
+            .map(|(a, e)| f64::from(a - e).powi(2))
+            .sum::<f64>()
             / reference.len() as f64)
             .sqrt()
             / rms;
@@ -768,7 +981,11 @@ fn projector_forward_matches_the_f64_reference() {
             .chunks_exact(d)
             .zip(reference.chunks_exact(d))
             .map(|(a, e)| {
-                let dot = a.iter().zip(e).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum::<f64>();
+                let dot = a
+                    .iter()
+                    .zip(e)
+                    .map(|(x, y)| f64::from(*x) * f64::from(*y))
+                    .sum::<f64>();
                 let na = a.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
                 let ne = e.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
                 dot / (na * ne)
@@ -843,5 +1060,8 @@ fn block_time_at_projector_geometry() {
         })
         .collect::<Vec<_>>();
     times.sort_by(f64::total_cmp);
-    eprintln!("qwen_vision_block M 1200: median {:.2} ms (min {:.2}) per call incl. readback", times[5], times[0]);
+    eprintln!(
+        "qwen_vision_block M 1200: median {:.2} ms (min {:.2}) per call incl. readback",
+        times[5], times[0]
+    );
 }

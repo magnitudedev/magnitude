@@ -48,9 +48,6 @@ using recurrent::W;
 
 constexpr int PIECE = 16;
 constexpr int GROUP = NV / NK;
-constexpr int ROWS = SEISMIC_TUNE_ROWS;
-constexpr int SCAN_WARPS = ROWS / 16;
-constexpr int SCAN_THREADS = SCAN_WARPS * 32;
 constexpr int PREPARE_THREADS = 256;
 constexpr int PREPARE_WARPS = PREPARE_THREADS / 32;
 constexpr int CPL = W / 32;  // channels per lane
@@ -58,7 +55,7 @@ constexpr int CPL = W / 32;  // channels per lane
 // warp convolves.
 constexpr int PARTS = 2 + GROUP;
 constexpr int ROW_RUN = PIECE * PARTS / PREPARE_WARPS;
-static_assert(NV % NK == 0 && W % 32 == 0 && ROWS % 16 == 0 && W % ROWS == 0, "chunk geometry");
+static_assert(NV % NK == 0 && W % 32 == 0, "chunk geometry");
 static_assert(PIECE * PIECE == PREPARE_THREADS, "one prepare thread per (t, s) pair");
 static_assert(PREPARE_WARPS % PARTS == 0 && PIECE % (PREPARE_WARPS / PARTS) == 0,
               "prepare warps split evenly over vectors and rows");
@@ -151,7 +148,8 @@ __device__ __forceinline__ void split_tiles(const float (&left)[4], const float 
 
 }  // namespace
 
-extern "C" __global__ void __launch_bounds__(PREPARE_THREADS) gated_delta_chunk_prepare(SEISMIC_KERNEL_PARAMS) {
+#ifdef SEISMIC_FORMING_GATED_DELTA_CHUNK_PREPARE
+__global__ void gated_delta_chunk_prepare(SEISMIC_KERNEL_PARAMS) {
     const recurrent::Inputs in = RECURRENT_INPUTS();
     u8 *pieces = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PIECES);
     const int key_head = blockIdx.y;
@@ -348,14 +346,17 @@ extern "C" __global__ void __launch_bounds__(PREPARE_THREADS) gated_delta_chunk_
     }
 }
 
+#endif
+
 namespace {
 
 // One piece's operands in shared memory: q|k|k_low rows [16][3W] (row pitch
 // padded by 8 halfs so ldmatrix rows fall in distinct banks), the block's v
 // columns [16][ROWS], Tb and D [16][16] f16, gamma, tail, last.
 constexpr int QK_PITCH = QK_WIDTH + 8;
-constexpr int V_PITCH = ROWS + 8;
+template <unsigned ROWS>
 struct Stage {
+    static constexpr int V_PITCH = ROWS + 8;
     u16 qk[PIECE * QK_PITCH];
     u16 v[PIECE * V_PITCH];
     u16 td[2 * PIECE * PIECE];
@@ -363,9 +364,6 @@ struct Stage {
 };
 // Pieces in flight: the scan computes one while the next STAGES - 1 load.
 constexpr int STAGES = 3;
-static_assert(sizeof(Stage) == 96 * W + 32 * ROWS + 1680, "the declaration's shared_bytes");
-static_assert(sizeof(recurrent::SequentialShared<ROWS>) <= STAGES * sizeof(Stage),
-              "the sequential advance fits the stage ring");
 
 // Eight consecutive elements of E from F32, with 16-byte stores.
 template <class E>
@@ -382,8 +380,11 @@ __device__ __forceinline__ void store_row8(u8 *base, u64 index, const float (&va
     }
 }
 
-__device__ __forceinline__ void stage_piece(Stage &stage, u8 *pieces, int piece, int key_head,
+template <unsigned ROWS>
+__device__ __forceinline__ void stage_piece(Stage<ROWS> &stage, u8 *pieces, int piece, int key_head,
                                             int head, int row0) {
+    constexpr int V_PITCH = Stage<ROWS>::V_PITCH;
+    constexpr int SCAN_THREADS = ROWS * 2;
     const u8 *qk = qk_rows(pieces, piece, key_head);
     const u8 *rec_bytes = record(pieces, piece, head);
     constexpr int QK_CHUNKS = PIECE * QK_WIDTH * 2 / 16;
@@ -414,7 +415,16 @@ __device__ __forceinline__ void stage_piece(Stage &stage, u8 *pieces, int piece,
 
 }  // namespace
 
-extern "C" __global__ void __launch_bounds__(SCAN_THREADS) gated_delta_chunk_scan(SEISMIC_KERNEL_PARAMS) {
+#ifdef SEISMIC_FORMING_GATED_DELTA_CHUNK_SCAN
+template <unsigned ROWS>
+__global__ void gated_delta_chunk_scan(SEISMIC_KERNEL_PARAMS) {
+    constexpr int SCAN_THREADS = ROWS * 2;
+    constexpr int V_PITCH = Stage<ROWS>::V_PITCH;
+    static_assert(ROWS % 16 == 0 && W % ROWS == 0, "chunk scan geometry");
+    static_assert(sizeof(Stage<ROWS>) == 96 * W + 32 * ROWS + 1680,
+                  "the declaration's shared_bytes");
+    static_assert(sizeof(recurrent::SequentialShared<ROWS>) <= STAGES * sizeof(Stage<ROWS>),
+                  "the sequential advance fits the stage ring");
     const recurrent::Inputs in = RECURRENT_INPUTS();
     u8 *pieces = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PIECES);
     u8 *mixed = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
@@ -495,23 +505,23 @@ extern "C" __global__ void __launch_bounds__(SCAN_THREADS) gated_delta_chunk_sca
     };
     if (slot.stop == 0) publish();
 
-    Stage *stages = reinterpret_cast<Stage *>(scan_shared);
+    Stage<ROWS> *stages = reinterpret_cast<Stage<ROWS> *>(scan_shared);
     float (*transpose)[17] =
-        reinterpret_cast<float (*)[17]>(scan_shared + STAGES * sizeof(Stage)) + 16 * warp;
+        reinterpret_cast<float (*)[17]>(scan_shared + STAGES * sizeof(Stage<ROWS>)) + 16 * warp;
     const int count = recurrent::pieces_before<PIECE>(slot);
     const int base = first_piece(in, slot_index);
     // One commit group per piece slot, empty past the last piece.
 #pragma unroll
     for (int ahead = 0; ahead < STAGES - 1; ++ahead) {
-        if (ahead < count) stage_piece(stages[ahead], pieces, base + ahead, key_head, head, row0);
+        if (ahead < count) stage_piece<ROWS>(stages[ahead], pieces, base + ahead, key_head, head, row0);
         seismic_cp_async_commit();
     }
     for (int local = 0; local < count; ++local) {
         const recurrent::Piece piece = recurrent::piece_of<PIECE>(slot, local);
-        const Stage &stage = stages[local % STAGES];
+        const Stage<ROWS> &stage = stages[local % STAGES];
         const int ahead = local + STAGES - 1;
         if (ahead < count)
-            stage_piece(stages[ahead % STAGES], pieces, base + ahead, key_head, head, row0);
+            stage_piece<ROWS>(stages[ahead % STAGES], pieces, base + ahead, key_head, head, row0);
         seismic_cp_async_commit();
         seismic_cp_async_wait<STAGES - 1>();
         __syncthreads();
@@ -648,3 +658,4 @@ extern "C" __global__ void __launch_bounds__(SCAN_THREADS) gated_delta_chunk_sca
                                           sequential);
     }
 }
+#endif

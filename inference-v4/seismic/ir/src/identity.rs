@@ -476,19 +476,28 @@ impl CanonicalIdentity for () {
 
 impl CanonicalIdentity for seismic_lang::failure::SourceFailure {
     fn encode_identity(&self, out: &mut StructureDigest) {
+        use seismic_lang::entry::CheckReason;
         use seismic_lang::failure::SourceFailureCause;
         use seismic_lang::reference_math::ScalarFailure;
-        use seismic_lang::entry::CheckReason;
         out.bytes(b"source-failure");
         out.bytes(self.event.body().digest());
-        for ordinal in self.event.position() { out.u32(ordinal); }
+        for ordinal in self.event.position() {
+            out.u32(ordinal);
+        }
         match &self.cause {
-            SourceFailureCause::Scalar(ScalarFailure::IntegerDivisionByZero) => out.bytes(b"division-zero"),
-            SourceFailureCause::Scalar(ScalarFailure::SignedDivisionOverflow) => out.bytes(b"division-overflow"),
+            SourceFailureCause::Scalar(ScalarFailure::IntegerDivisionByZero) => {
+                out.bytes(b"division-zero")
+            }
+            SourceFailureCause::Scalar(ScalarFailure::SignedDivisionOverflow) => {
+                out.bytes(b"division-overflow")
+            }
             SourceFailureCause::Scalar(ScalarFailure::ShiftCount) => out.bytes(b"shift-count"),
             SourceFailureCause::Check(CheckReason::IndexBound) => out.bytes(b"index-bound"),
             SourceFailureCause::Check(CheckReason::RangeOrder) => out.bytes(b"range-order"),
-            SourceFailureCause::Check(CheckReason::Custom(message)) => { out.bytes(b"custom-check"); out.bytes(message.as_bytes()); }
+            SourceFailureCause::Check(CheckReason::Custom(message)) => {
+                out.bytes(b"custom-check");
+                out.bytes(message.as_bytes());
+            }
         }
     }
 }

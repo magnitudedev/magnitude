@@ -1,7 +1,7 @@
 use magnitude_generation::{OutputToken, TokenId};
-use magnitude_model_executor::RequestId;
+use magnitude_model_executor::{DomainError, PressureLevel, RequestId};
 use magnitude_service::{
-    owner::Status,
+    owner::{AdmissionError, Status},
     protocol::{CapacityStatus, WorkerCommand, WorkerReply},
     publication::{Publication, PublicationQueue, PublicationWakeKind},
     worker::{CompletionWake, Drive, Driven, Worker, WorkerWakeHandle},
@@ -14,6 +14,49 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
+
+#[test]
+fn blind_admission_crosses_the_worker_as_a_typed_refusal() {
+    struct Blind;
+    impl Driven for Blind {
+        fn command(&mut self, _: WorkerCommand, _: u64) -> Result<WorkerReply, String> {
+            Ok(WorkerReply::AdmissionRefused(AdmissionError::from(
+                DomainError::Blind("host status unavailable".into()),
+            )))
+        }
+        fn advance(&mut self, _: u64, _: CompletionWake) -> Result<Drive, String> {
+            Ok(Drive::Idle)
+        }
+        fn failed(&mut self, _: &str) {}
+        fn failure(&self) -> Option<&str> {
+            None
+        }
+        fn shutdown(&mut self) -> Result<bool, String> {
+            Ok(true)
+        }
+    }
+    let mut worker = Worker::spawn(|| Ok(Box::new(Blind)), 1).unwrap();
+    let reply = worker
+        .client()
+        .dispatch(WorkerCommand::Check)
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert!(matches!(
+        reply,
+        WorkerReply::AdmissionRefused(AdmissionError::MemoryObservationUnavailable(message))
+            if message == "host status unavailable"
+    ));
+    worker.close();
+}
+
+#[test]
+fn platform_pressure_is_a_typed_admission_refusal() {
+    assert_eq!(
+        AdmissionError::from(DomainError::Pressure(PressureLevel::Emergency)),
+        AdmissionError::MemoryPressure(PressureLevel::Emergency)
+    );
+}
 
 #[derive(Default)]
 struct Shared {

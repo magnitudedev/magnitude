@@ -12,12 +12,12 @@ mod vision;
 pub(crate) use attestation::AttestedImport;
 pub use attestation::AttestedPrograms;
 pub(crate) use attestation::{
-    AttestedFeedForward, AttestedHead, AttestedMixer, AttestedState, AttestedTarget,
-    AttestedTargetBlock, AttestedVision,
+    AttestedFeedForward, AttestedHead, AttestedHeadBlock, AttestedMixer, AttestedState,
+    AttestedTarget, AttestedTargetBlock, AttestedVision,
 };
 use glue::GlueKernels;
-use head::HeadKernels;
 pub(crate) use head::draft_vocabulary;
+use head::HeadKernels;
 pub(crate) use import::ImportKernels;
 use preparation::NativePreparationCache;
 use qualification::QualificationView;
@@ -26,15 +26,15 @@ pub(crate) use target::{
     AttentionHistoryKernels, AttentionKernels, DenseKernels, ReadoutKernels, RecurrentKernels,
     RoutedKernels,
 };
-pub use tuning::{
-    attention_points, row_points, ZeroTuningWeights, PointShape, TunedEntry, TuningContext,
-    TuningEvent, TuningLimits, TuningObserver, TuningOrigin, TuningWeightSource, UnreportedTuning, ROTATION_LAYERS,
-    TUNING_CONTEXTS, TUNING_ROWS,
-};
 #[cfg(feature = "pinned-tuning")]
 pub use tuning::pinned as pinned_tuning;
 #[cfg(feature = "tuning-survey")]
 pub use tuning::survey as tuning_survey;
+pub use tuning::{
+    attention_points, row_points, PointShape, TunedEntry, TuningContext, TuningEvent, TuningLimits,
+    TuningObserver, TuningOrigin, TuningWeightSource, UnreportedTuning, ZeroTuningWeights,
+    ROTATION_LAYERS, TUNING_CONTEXTS, TUNING_ROWS,
+};
 use vision::VisionKernels;
 
 use crate::{
@@ -42,14 +42,13 @@ use crate::{
     ProgramPlan, RecurrentBinding, RoutedBinding,
 };
 use magnitude_model_kernels::{
-    copy_rows, head_logits_rows, import_dense, gated_attention_decode, gated_attention_decode_k8v4,
-    attention_output, gated_attention_prefill, gated_attention_prefill_k8v4,
-    gated_attention_project,
-    conditioning_overlay, dense_expand, dense_output, draft_rows,
-    embedding_rows, readout_features_rows, readout_head_rows, gated_delta_chunk, gated_delta_output,
-    gated_delta_project, gated_delta_step, routed_combine, routed_expand,
-    routed_experts, routed_group, routed_output, routed_route,
-    readout_selected_rows, qwen_vision_block, qwen_vision_merger, qwen_vision_stem, repack_weight, sample_rows, shape_rows,
+    attention_output, conditioning_overlay, copy_rows, dense_expand, dense_output, draft_rows,
+    embedding_rows, gated_attention_decode, gated_attention_decode_k8v4, gated_attention_prefill,
+    gated_attention_prefill_k8v4, gated_attention_project, gated_delta_chunk, gated_delta_output,
+    gated_delta_project, gated_delta_step, head_logits_rows, import_dense, qwen_vision_block,
+    qwen_vision_merger, qwen_vision_stem, readout_features_rows, readout_head_rows,
+    readout_selected_rows, repack_weight, routed_combine, routed_expand, routed_experts,
+    routed_group, routed_output, routed_route, sample_rows, shape_rows,
 };
 use seismic::{BackendName, DType, Device, Element, NativeKernel, Tensor};
 use std::{collections::HashMap, fmt};
@@ -173,7 +172,8 @@ mod qualification_tests {
             return;
         };
         // Native Metal residents use the rows16 layout.
-        let rows16 = |representation| Element::stored(representation, seismic::Layout::Rows16).unwrap();
+        let rows16 =
+            |representation| Element::stored(representation, seismic::Layout::Rows16).unwrap();
         let q4k = rows16("q4k");
         let q5k = rows16("q5k");
         let q8 = rows16("q8g32s");

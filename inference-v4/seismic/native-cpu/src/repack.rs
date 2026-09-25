@@ -38,7 +38,11 @@ trait Conversion {
 fn k_local(packet: &[u8], j: usize, field: usize) -> u128 {
     let low = packet[4 + field * 4 + j % 4];
     let high = packet[12 + j % 4];
-    u128::from(if j < 4 { low & 63 } else { ((high >> (4 * field)) & 15) | ((low >> 6) << 4) })
+    u128::from(if j < 4 {
+        low & 63
+    } else {
+        ((high >> (4 * field)) & 15) | ((low >> 6) << 4)
+    })
 }
 
 /// The registry's packed local coefficients of a k-quant group: sixteen
@@ -209,9 +213,15 @@ unsafe fn convert_row<C: Conversion>(source: *const u8, row: *mut u8, k: usize) 
             _ => {}
         }
         if C::SCALE_BYTES > 0 {
-            C::scales(packet, &mut out[geometry.scales + g * C::SCALE_BYTES..][..C::SCALE_BYTES]);
+            C::scales(
+                packet,
+                &mut out[geometry.scales + g * C::SCALE_BYTES..][..C::SCALE_BYTES],
+            );
         }
-        C::supers(packet, &mut out[geometry.supers + g * C::SUPER_BYTES..][..C::SUPER_BYTES]);
+        C::supers(
+            packet,
+            &mut out[geometry.supers + g * C::SUPER_BYTES..][..C::SUPER_BYTES],
+        );
     }
 }
 
@@ -231,7 +241,11 @@ pub struct RowConversion {
     convert: unsafe fn(*const u8, *mut u8, usize),
 }
 
-const fn conversion<C: Conversion>(target: &'static str, rows8: bool, planes: &'static [usize]) -> RowConversion {
+const fn conversion<C: Conversion>(
+    target: &'static str,
+    rows8: bool,
+    planes: &'static [usize],
+) -> RowConversion {
     RowConversion {
         source: C::SOURCE,
         target,
@@ -264,7 +278,9 @@ pub fn conversions() -> &'static [RowConversion] {
 
 /// The conversion of `source` into `target`, when one is registered.
 pub fn resolve(source: &str, target: &str) -> Option<&'static RowConversion> {
-    CONVERSIONS.iter().find(|conversion| conversion.source == source && conversion.target == target)
+    CONVERSIONS
+        .iter()
+        .find(|conversion| conversion.source == source && conversion.target == target)
 }
 
 /// Leading-axis row addressing shared by [`External`] and [`Packed`]: a
@@ -275,7 +291,10 @@ fn canonical_rows(extents: &[u64], strides: &[u64], row_stride: u64) -> usize {
     assert!(rank >= 1, "a converted operand has a value axis");
     let mut expected = row_stride;
     for axis in (0..rank - 1).rev() {
-        assert_eq!(strides[axis], expected, "a converted operand's rows are canonical");
+        assert_eq!(
+            strides[axis], expected,
+            "a converted operand's rows are canonical"
+        );
         expected *= extents[axis];
     }
     extents[..rank - 1].iter().product::<u64>() as usize
@@ -303,7 +322,12 @@ impl<'a> External<'a> {
     /// # Safety
     /// `base`, `extents` and `strides` describe a tensor of `representation`
     /// valid for `'a`.
-    pub unsafe fn from_tensor(base: *const u8, extents: &[u64], strides: &[u64], representation: &'static str) -> Self {
+    pub unsafe fn from_tensor(
+        base: *const u8,
+        extents: &[u64],
+        strides: &[u64],
+        representation: &'static str,
+    ) -> Self {
         let k = extents[extents.len() - 1];
         let group = CONVERSIONS
             .iter()
@@ -311,7 +335,14 @@ impl<'a> External<'a> {
             .unwrap_or_else(|| panic!("`{representation}` is not a registered external source"))
             .group as u64;
         let rows = canonical_rows(extents, strides, k.div_ceil(group));
-        Self { base, rows, k: k as usize, representation, matrix_rows: extents[extents.len() - 2] as usize, life: PhantomData }
+        Self {
+            base,
+            rows,
+            k: k as usize,
+            representation,
+            matrix_rows: extents[extents.len() - 2] as usize,
+            life: PhantomData,
+        }
     }
 
     pub fn rows(&self) -> usize {
@@ -345,7 +376,12 @@ impl<'a> Packed<'a> {
     /// # Safety
     /// `base`, `extents` and `strides` describe a tensor of `representation`
     /// valid for `'a`.
-    pub unsafe fn from_tensor(base: *mut u8, extents: &[u64], strides: &[u64], representation: &'static str) -> Self {
+    pub unsafe fn from_tensor(
+        base: *mut u8,
+        extents: &[u64],
+        strides: &[u64],
+        representation: &'static str,
+    ) -> Self {
         let rows = if representation.ends_with("@rows8") {
             let rank = extents.len();
             assert!(rank >= 2, "Rows8 requires a row axis");
@@ -353,13 +389,24 @@ impl<'a> Packed<'a> {
             let mut expected = 1u64;
             for axis in (0..rank - 1).rev() {
                 assert_eq!(strides[axis], expected, "Rows8 tile strides");
-                expected *= if axis == rank - 2 { extents[axis].div_ceil(8) * 8 } else { extents[axis] };
+                expected *= if axis == rank - 2 {
+                    extents[axis].div_ceil(8) * 8
+                } else {
+                    extents[axis]
+                };
             }
             extents[..rank - 1].iter().product::<u64>() as usize
         } else {
             canonical_rows(extents, strides, 1)
         };
-        Self { base, rows, k: extents[extents.len() - 1] as usize, representation, matrix_rows: extents[extents.len() - 2] as usize, life: PhantomData }
+        Self {
+            base,
+            rows,
+            k: extents[extents.len() - 1] as usize,
+            representation,
+            matrix_rows: extents[extents.len() - 2] as usize,
+            life: PhantomData,
+        }
     }
 
     pub fn rows(&self) -> usize {
@@ -376,19 +423,32 @@ impl<'a> Packed<'a> {
 /// # Safety
 /// No other work item writes these rows of `destination` in the launch.
 pub unsafe fn rows(source: &External<'_>, destination: &Packed<'_>, rows: std::ops::Range<usize>) {
-    let conversion = resolve(source.representation, destination.representation).unwrap_or_else(|| {
-        panic!("no CPU conversion of `{}` into `{}`", source.representation, destination.representation)
-    });
+    let conversion =
+        resolve(source.representation, destination.representation).unwrap_or_else(|| {
+            panic!(
+                "no CPU conversion of `{}` into `{}`",
+                source.representation, destination.representation
+            )
+        });
     assert_eq!(source.k, destination.k, "a conversion keeps the row length");
-    assert!(rows.end <= source.rows && rows.end <= destination.rows, "rows {rows:?} outside the operands");
+    assert!(
+        rows.end <= source.rows && rows.end <= destination.rows,
+        "rows {rows:?} outside the operands"
+    );
     let source_row = source.k.div_ceil(conversion.group) * conversion.packet_bytes;
     let target_row = (conversion.geometry)(destination.k, 0).stride;
     assert_eq!(source.matrix_rows, destination.matrix_rows);
     if conversion.rows8 {
         let n = source.matrix_rows;
-        assert!(rows.start / n == (rows.end - 1) / n, "a Rows8 work item stays within one matrix");
+        assert!(
+            rows.start / n == (rows.end - 1) / n,
+            "a Rows8 work item stays within one matrix"
+        );
         assert_eq!(rows.start % n % 8, 0, "a Rows8 work item starts on a tile");
-        assert!(rows.end % n == 0 || rows.end % n % 8 == 0, "a Rows8 work item ends on a tile");
+        assert!(
+            rows.end % n == 0 || rows.end % n % 8 == 0,
+            "a Rows8 work item ends on a tile"
+        );
         let groups = source.k.div_ceil(conversion.group);
         let geometry = (conversion.geometry)(destination.k, 0);
         let mut offsets = [0usize; 4];
@@ -402,11 +462,22 @@ pub unsafe fn rows(source: &External<'_>, destination: &Packed<'_>, rows: std::o
             let in_matrix = first % n;
             let tile = matrix * n.div_ceil(8) + in_matrix / 8;
             // SAFETY: this work item owns the entire tile, including its padded rows.
-            let output = unsafe { std::slice::from_raw_parts_mut(destination.base.add(tile * 8 * target_row), 8 * target_row) };
+            let output = unsafe {
+                std::slice::from_raw_parts_mut(
+                    destination.base.add(tile * 8 * target_row),
+                    8 * target_row,
+                )
+            };
             output.fill(0);
             for r in 0..(rows.end - first).min(8) {
                 let mut packed = vec![0u8; geometry.stride];
-                unsafe { (conversion.convert)(source.base.add((first + r) * source_row), packed.as_mut_ptr(), source.k) };
+                unsafe {
+                    (conversion.convert)(
+                        source.base.add((first + r) * source_row),
+                        packed.as_mut_ptr(),
+                        source.k,
+                    )
+                };
                 for (plane, bytes) in conversion.planes.iter().enumerate() {
                     for group in 0..groups {
                         let from = offsets[plane] + group * bytes;
@@ -420,7 +491,13 @@ pub unsafe fn rows(source: &External<'_>, destination: &Packed<'_>, rows: std::o
         for row in rows {
             // SAFETY: the row lies inside both operands (`from_tensor`); the
             // caller owns its destination row.
-            unsafe { (conversion.convert)(source.base.add(row * source_row), destination.base.add(row * target_row), source.k) };
+            unsafe {
+                (conversion.convert)(
+                    source.base.add(row * source_row),
+                    destination.base.add(row * target_row),
+                    source.k,
+                )
+            };
         }
     }
 }
@@ -461,20 +538,51 @@ mod tests {
                 )
                 .expect("registered conversion")
                 .id;
-                let expected = seismic_lang::interp::repack(id, &[rows, k], &source).expect("registry repack");
+                let expected =
+                    seismic_lang::interp::repack(id, &[rows, k], &source).expect("registry repack");
                 let stride = (conversion.geometry)(k, 0).stride;
-                let stored_rows = if conversion.rows8 { rows.div_ceil(8) * 8 } else { rows };
+                let stored_rows = if conversion.rows8 {
+                    rows.div_ceil(8) * 8
+                } else {
+                    rows
+                };
                 let mut out = vec![0xa5u8; stored_rows * stride];
                 if conversion.rows8 {
-                    let from = unsafe { External::from_tensor(source.as_ptr(), &[rows as u64, k as u64], &[packets as u64, 1], conversion.source) };
-                    let to = unsafe { Packed::from_tensor(out.as_mut_ptr(), &[rows as u64, k as u64], &[1, 1], conversion.target) };
+                    let from = unsafe {
+                        External::from_tensor(
+                            source.as_ptr(),
+                            &[rows as u64, k as u64],
+                            &[packets as u64, 1],
+                            conversion.source,
+                        )
+                    };
+                    let to = unsafe {
+                        Packed::from_tensor(
+                            out.as_mut_ptr(),
+                            &[rows as u64, k as u64],
+                            &[1, 1],
+                            conversion.target,
+                        )
+                    };
                     unsafe { super::rows(&from, &to, 0..rows) };
                 } else {
                     for row in 0..rows {
-                        unsafe { (conversion.convert)(source.as_ptr().add(row * packets * conversion.packet_bytes), out.as_mut_ptr().add(row * stride), k) };
+                        unsafe {
+                            (conversion.convert)(
+                                source.as_ptr().add(row * packets * conversion.packet_bytes),
+                                out.as_mut_ptr().add(row * stride),
+                                k,
+                            )
+                        };
                     }
                 }
-                assert_eq!(out.len(), expected.len(), "{} -> {} k {k}", conversion.source, conversion.target);
+                assert_eq!(
+                    out.len(),
+                    expected.len(),
+                    "{} -> {} k {k}",
+                    conversion.source,
+                    conversion.target
+                );
                 if let Some(at) = out.iter().zip(&expected).position(|(a, b)| a != b) {
                     let word = at / 4 * 4;
                     panic!(

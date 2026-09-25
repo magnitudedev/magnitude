@@ -80,7 +80,11 @@ impl Buffer {
                 bytes: backed,
             } => {
                 assert_within(offset, bytes.len(), *backed, "upload_at");
-                driver::upload(reservation.context(), reservation.base + offset as u64, bytes)
+                driver::upload(
+                    reservation.context(),
+                    reservation.base + offset as u64,
+                    bytes,
+                )
             }
         }
     }
@@ -97,7 +101,11 @@ impl Buffer {
                 bytes: backed,
             } => {
                 assert_within(offset, bytes.len(), *backed, "download_at");
-                driver::download(reservation.context(), reservation.base + offset as u64, bytes)
+                driver::download(
+                    reservation.context(),
+                    reservation.base + offset as u64,
+                    bytes,
+                )
             }
         }
     }

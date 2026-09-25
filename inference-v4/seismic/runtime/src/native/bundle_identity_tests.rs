@@ -11,7 +11,9 @@
 
 use super::abi::{render_source, vulkan::VulkanFeatures, Dialect};
 use seismic_lang::bundle::{decode_checked_bundle, encode_checked_bundle};
-use seismic_lang::checked::{CheckedModule, ElementParameter, NativeImplementation, NativeSpecialization};
+use seismic_lang::checked::{
+    CheckedModule, ElementParameter, NativeImplementation, NativeSpecialization,
+};
 use seismic_lang::entry::ElementBindings;
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::registry::{self, BackendName, Layout};
@@ -79,18 +81,28 @@ fn bindings(
 
 /// A deterministic admissible specialization of `native`.
 fn specialization(native: &NativeImplementation) -> NativeSpecialization {
-    const VALUES: [u64; 14] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 2560, 4096];
+    const VALUES: [u64; 14] = [
+        1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 2560, 4096,
+    ];
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
     for _ in 0..20_000 {
-        let statics = native.statics.iter().fold(NativeSpecialization::new(), |statics, name| {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            statics.with_static(name.as_str(), VALUES[(state >> 33) as usize % VALUES.len()])
-        });
+        let statics = native
+            .statics
+            .iter()
+            .fold(NativeSpecialization::new(), |statics, name| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                statics.with_static(name.as_str(), VALUES[(state >> 33) as usize % VALUES.len()])
+            });
         if let Ok(specialization) = native.default_specialization(&statics) {
             return specialization;
         }
     }
-    panic!("no admissible specialization of `{}` found", native.source_path)
+    panic!(
+        "no admissible specialization of `{}` found",
+        native.source_path
+    )
 }
 
 /// Slow: checks the whole engine kernel library. Run it in release with
@@ -98,7 +110,8 @@ fn specialization(native: &NativeImplementation) -> NativeSpecialization {
 #[test]
 #[ignore]
 fn decoded_kernel_bundle_forms_identical_native_sources() {
-    let kernels = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../engine/model-kernels/kernels");
+    let kernels =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../engine/model-kernels/kernels");
     let checked = seismic_lang::source::load(&[kernels], seismic_std::sources())
         .expect("the engine kernel library checks")
         .module;
@@ -113,11 +126,15 @@ fn decoded_kernel_bundle_forms_identical_native_sources() {
     let mut compared = 0;
     let mut native_entries = 0;
     for info in checked.entries() {
-        let decoded_entry = decoded.entry_named(&info.name).expect("the decoded module has the entry");
+        let decoded_entry = decoded
+            .entry_named(&info.name)
+            .expect("the decoded module has the entry");
         let natives: Vec<_> = dialects
             .iter()
             .filter_map(|(backend, dialect)| {
-                checked.native_implementation(info.id, *backend).map(|native| (*backend, *dialect, native))
+                checked
+                    .native_implementation(info.id, *backend)
+                    .map(|native| (*backend, *dialect, native))
             })
             .collect();
         if natives.is_empty() {
@@ -130,13 +147,22 @@ fn decoded_kernel_bundle_forms_identical_native_sources() {
         if admissible.is_empty() {
             // An import from an external representation, outside the Qwen
             // storage set: any registered representation the entry builds for.
-            let every: Vec<_> = registry::representations().iter().map(|info| info.id).collect();
-            admissible = bindings(parameters, &every, |bound| checked.entry(info.id, bound).is_ok());
+            let every: Vec<_> = registry::representations()
+                .iter()
+                .map(|info| info.id)
+                .collect();
+            admissible = bindings(parameters, &every, |bound| {
+                checked.entry(info.id, bound).is_ok()
+            });
         }
         assert!(!admissible.is_empty(), "`{}` admits no binding", info.name);
         for bound in &admissible {
-            let from_source = checked.entry(info.id, bound).expect("the checked entry builds");
-            let from_bundle = decoded.entry(decoded_entry, bound).expect("the decoded entry builds");
+            let from_source = checked
+                .entry(info.id, bound)
+                .expect("the checked entry builds");
+            let from_bundle = decoded
+                .entry(decoded_entry, bound)
+                .expect("the decoded entry builds");
             for (backend, dialect, native) in &natives {
                 let decoded_native = decoded
                     .native_implementation(decoded_entry, *backend)
@@ -144,7 +170,10 @@ fn decoded_kernel_bundle_forms_identical_native_sources() {
                 assert_eq!(native.launches, decoded_native.launches);
                 let specialization = specialization(native);
                 let asset = |module: &CheckedModule, entry| {
-                    module.native_asset(entry, *backend).expect("the asset is captured").to_owned()
+                    module
+                        .native_asset(entry, *backend)
+                        .expect("the asset is captured")
+                        .to_owned()
                 };
                 let expected = render_source(
                     *dialect,

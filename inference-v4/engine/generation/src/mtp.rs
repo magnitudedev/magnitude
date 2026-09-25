@@ -9,8 +9,8 @@
 //! executor chains the proposals on the device.
 
 use crate::{
-    Method, MethodCheckpoint, MethodCheckpointError, MethodEffects, MethodRequirements,
-    MethodState, MtpCheckpoint, Propose, Verification, method::PendingRows,
+    method::PendingRows, Method, MethodCheckpoint, MethodCheckpointError, MethodEffects,
+    MethodRequirements, MethodState, MtpCheckpoint, Propose, Verification,
 };
 use magnitude_model_executor::{
     Demand, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, Operation, Outcome, RequestId,
@@ -203,7 +203,8 @@ impl MethodState for MtpState {
         if !rest.is_empty() {
             self.append(
                 rest.to_vec(),
-                rows.slice(0, rest.len()).map_err(|error| error.to_string())?,
+                rows.slice(0, rest.len())
+                    .map_err(|error| error.to_string())?,
             )?;
         }
         let last = rows
@@ -260,8 +261,7 @@ impl MethodState for MtpState {
             .features
             .ok_or("MTP verification requires target features")?;
         let accepted = verification.accepted;
-        if verification.inputs.is_empty() || accepted == 0 || accepted > verification.inputs.len()
-        {
+        if verification.inputs.is_empty() || accepted == 0 || accepted > verification.inputs.len() {
             return Err("MTP verification prefix is invalid".into());
         }
         // After a replay the last replayed row's feature selected the anchor.
@@ -302,7 +302,9 @@ impl MethodState for MtpState {
             Operation::Head {
                 tokens, proposals, ..
             },
-            Outcome::Head { proposals: selected },
+            Outcome::Head {
+                proposals: selected,
+            },
         ) = (&head, outcome)
         else {
             return Err("MTP head outcome has the wrong kind".into());

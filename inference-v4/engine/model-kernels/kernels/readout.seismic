@@ -66,22 +66,23 @@ fn readout_head_rows[M, O, V, D](hidden: &tensor[M, D] f32,
 # normalized rows, then the GEMM. (CUDA: GEMV up to 8 rows, no batched launch.)
 native readout_head_rows for metal from "metal/readout_head_rows.metal":
     static (V, D)
-    params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
-            arithmetic BATCH_FROM in [5, 3, 9], BATCH_SIMDGROUPS in [8, 4, 16, 32], BATCH_ROWS in [2, 1, 4],
-            TILE_M in [64, 128, 32], TILE_N in [64, 128])
+    params (arithmetic BATCH_FROM in [5, 3, 9])
     scratch normalized bytes (O * D * 2) when O > 16
     launch readout_head_rows_stage when O > 16:
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch readout_head_rows_gemv when O < BATCH_FROM:
+        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32])
         threadgroups (ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(D, 32) * (min(O, 2) + 2 * min(O / 3, 1) + 4 * min(O / 5, 1)), 448) * 64)
     launch readout_head_rows_batch when O >= BATCH_FROM and O <= 16:
+        params (BATCH_SIMDGROUPS in [8, 4, 16, 32], code BATCH_ROWS in [2, 1, 4])
         threadgroups (ceil_div(V, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
         threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
         shared_bytes (16640)
     launch readout_head_rows_gemm when O > 16:
+        params (code TILE_M in [64, 128, 32], code TILE_N in [64, 128])
         threadgroups (ceil_div(V, TILE_N), ceil_div(O, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
 
@@ -92,17 +93,18 @@ native readout_head_rows for metal from "metal/readout_head_rows.metal":
 # row classes.)
 native readout_head_rows for cuda from "cuda/readout_head_rows.cu":
     static (V, D)
-    params (arithmetic KSPLIT in [4, 2, 8])
     where D % 64 == 0
     scratch staged bytes (O * D * 2) when O > 1
     launch readout_head_rows_stage when O > 1:
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch readout_head_rows_gemv when O <= 8:
+        params (code arithmetic KSPLIT in [4, 2, 8])
         threadgroups (ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes ((1 - min(1, O - 1)) * D * 2)
     launch readout_head_rows_gemv16 when O > 8 and O <= 16:
+        params (code arithmetic KSPLIT in [4, 2, 8])
         threadgroups (ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch readout_head_rows_gemm_small when O > 16 and O <= 64:
@@ -184,22 +186,23 @@ fn readout_selected_rows[M, O, V, D, Sv](hidden: &tensor[M, D] f32,
 # (CUDA: a custom per-vocabulary-row kernel.)
 native readout_selected_rows for metal from "metal/readout_selected_rows.metal":
     static (V, D)
-    params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
-            arithmetic BATCH_FROM in [5, 3, 9], BATCH_SIMDGROUPS in [8, 4, 16, 32], BATCH_ROWS in [2, 1, 4],
-            TILE_M in [64, 128, 32], TILE_N in [64, 128])
+    params (arithmetic BATCH_FROM in [5, 3, 9])
     scratch normalized bytes (O * D * 2) when O > 16
     launch readout_selected_rows_stage when O > 16:
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch readout_selected_rows_gemv when O < BATCH_FROM:
+        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32])
         threadgroups (ceil_div(Sv, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(D, 32) * (min(O, 2) + 2 * min(O / 3, 1) + 4 * min(O / 5, 1)), 448) * 64)
     launch readout_selected_rows_batch when O >= BATCH_FROM and O <= 16:
+        params (BATCH_SIMDGROUPS in [8, 4, 16, 32], code BATCH_ROWS in [2, 1, 4])
         threadgroups (ceil_div(Sv, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
         threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
         shared_bytes (16640)
     launch readout_selected_rows_gemm when O > 16:
+        params (code TILE_M in [64, 128, 32], code TILE_N in [64, 128])
         threadgroups (ceil_div(Sv, TILE_N), ceil_div(O, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
 

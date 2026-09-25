@@ -174,8 +174,8 @@ fn routed_expand[M, H, E, K, F, S](normalized: &tensor[M, H] A,
 # swap-AB GEMV, TPW tiles per warp group, KSPLIT-way K split.)
 native routed_expand for metal from "metal/routed_expand.metal":
     static (H, K, F, S)
-    params (SIMDGROUPS in [2, 4, 8, 16], ROWS in [1, 2, 4], arithmetic LANES in [32, 16])
     launch routed_expand:
+        params (SIMDGROUPS in [2, 4, 8, 16], code ROWS in [1, 2, 4], code arithmetic LANES in [32, 16])
         threadgroups (ceil_div(max(F, S), SIMDGROUPS * ROWS * 32 / LANES), M * K + 1, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
@@ -184,8 +184,8 @@ native routed_expand for metal from "metal/routed_expand.metal":
 # the warps of a group and reduces in part order). (Metal: the rows16 GEMV.)
 native routed_expand for cuda from "cuda/routed_expand.cu":
     static (H, K, F, S)
-    params (TPW in [1, 2], arithmetic KSPLIT in [1, 2, 4])
     launch routed_expand:
+        params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
         threadgroups (ceil_div(ceil_div(ceil_div(max(F, S), 16), TPW), 4 / KSPLIT), M * K + 1, 1)
         threads_per_threadgroup (128, 1, 1)
 
@@ -246,8 +246,8 @@ fn routed_output[M, H, E, K, F, S](residual: &tensor[M, H] f32,
 # the mma16 swap-AB GEMV.)
 native routed_output for metal from "metal/routed_output.metal":
     static (H, K, F, S)
-    params (SIMDGROUPS in [2, 4, 8, 16], ROWS in [1, 2, 4], arithmetic LANES in [32, 16])
     launch routed_output:
+        params (SIMDGROUPS in [2, 4, 8, 16], code ROWS in [1, 2, 4], code arithmetic LANES in [32, 16])
         threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), M, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (min(ceil_div(max(F, S), 32), 448) * 64)
@@ -256,8 +256,8 @@ native routed_output for metal from "metal/routed_output.metal":
 # rows16 GEMV.)
 native routed_output for cuda from "cuda/routed_output.cu":
     static (H, K, F, S)
-    params (TPW in [1, 2], arithmetic KSPLIT in [1, 2, 4])
     launch routed_output:
+        params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
         threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M, 1)
         threads_per_threadgroup (128, 1, 1)
 

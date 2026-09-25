@@ -66,8 +66,10 @@ mod tests {
     use super::*;
     use crate::construction::Construction;
     use crate::kernel::ops::Op;
+    use crate::physical_target::{
+        IntrinsicIdentityBuilder, IntrinsicNumericalSemantics, VectorSupport,
+    };
     use crate::storage::GlobalBufferKind;
-    use crate::physical_target::{IntrinsicIdentityBuilder, IntrinsicNumericalSemantics, VectorSupport};
     use seismic_lang::expr::ExprArena;
 
     #[derive(Debug)]

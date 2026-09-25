@@ -1,4 +1,4 @@
-//! Seismic graph slots for numerical execution and an owned import upload.
+//! Seismic graph slots for numerical execution and owned import sources.
 
 mod graph;
 pub use graph::{
@@ -6,14 +6,17 @@ pub use graph::{
     NativeGraphWorkspaceLease, TargetGraphOutputLease, TargetGraphPool, TargetGraphWorkspaceLease,
 };
 
+use crate::Stored;
 use crate::{
     ExecutionPlan, InvariantError, PreparedHeadGraphs, PreparedStateCopyGraphs,
     PreparedTargetGraphs, PreparedTargetReadoutGraphs, PreparedVisionGraphs, ResourceDomainId,
     WeightPlan,
 };
+use magnitude_artifacts::FileSource;
 use magnitude_model_batching::LaunchClass;
-use seismic::{Device, Tensor};
+use seismic::{BackendName, Device, HostRegion, ReadOnlyMappedRegion, Tensor};
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PoolClass {
@@ -23,13 +26,112 @@ pub enum PoolClass {
     Import { bytes: u64 },
 }
 
-/// One exact, plan-backed upload tensor owned through import submission.
-/// It is released when the completed submission drops the lease.
+/// One plan-backed source tensor owned through import completion. On Metal it
+/// views an immutable artifact mapping; other backends own a staged upload.
 pub struct ImportWorkspaceLease {
     domain: ResourceDomainId,
     class: PoolClass,
     bytes: u64,
-    upload: Tensor,
+    source: ImportSource,
+}
+
+enum ImportSource {
+    Mapped(Tensor),
+    Staged(Tensor),
+}
+
+/// One page-rounded artifact range charged once and shared by the source
+/// tensor views of an ordered import batch.
+pub(crate) struct ImportWindow {
+    source: Arc<FileSource>,
+    start: u64,
+    end: u64,
+    data_offset: u64,
+    region: ReadOnlyMappedRegion,
+}
+
+impl ImportWindow {
+    #[cfg(unix)]
+    pub(crate) fn new(
+        execution: &ExecutionPlan,
+        device: &Device,
+        source: Arc<FileSource>,
+        start: u64,
+        end: u64,
+    ) -> Result<Self, AllocationError> {
+        let invalid = |detail: &str| {
+            AllocationError::Plan(InvariantError {
+                context: "import window",
+                detail: detail.into(),
+            })
+        };
+        if device.backend() != BackendName::Metal || end <= start {
+            return Err(invalid(
+                "a mapped window requires Metal and a nonempty range",
+            ));
+        }
+        let window = source
+            .map_window(start, end - start)
+            .map_err(|error| AllocationError::Device(error.to_string()))?;
+        if window.mapped_len() as u64 > execution.resources().qualification_peak_bytes() {
+            return Err(invalid("mapped source exceeds admitted import transient"));
+        }
+        let pointer = std::ptr::NonNull::new(window.as_ref().as_ref().as_ptr() as *mut u8)
+            .ok_or_else(|| invalid("mapped artifact window has no address"))?;
+        // SAFETY: the window owns the immutable mapped range through every
+        // device view and every in-flight submission using it.
+        let host = unsafe { HostRegion::new(pointer, window.mapped_len(), window.clone()) };
+        let region = ReadOnlyMappedRegion::new(device, host)
+            .map_err(|error| AllocationError::Device(error.to_string()))?;
+        Ok(Self {
+            source,
+            start,
+            end,
+            data_offset: window.data_offset() as u64,
+            region,
+        })
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn new(
+        _execution: &ExecutionPlan,
+        _device: &Device,
+        _source: Arc<FileSource>,
+        _start: u64,
+        _end: u64,
+    ) -> Result<Self, AllocationError> {
+        Err(AllocationError::Device(
+            "mapped import windows require a Unix host".into(),
+        ))
+    }
+
+    pub(crate) fn tensor(
+        &self,
+        stored: &Stored,
+        weight: &WeightPlan,
+        count: u64,
+    ) -> Result<Tensor, AllocationError> {
+        let (source, offset, length) = stored.file_range();
+        let end = offset.checked_add(length).ok_or_else(|| {
+            AllocationError::Plan(InvariantError {
+                context: "import window",
+                detail: "source range overflows".into(),
+            })
+        })?;
+        if !Arc::ptr_eq(source, &self.source) || offset < self.start || end > self.end {
+            return Err(AllocationError::Plan(InvariantError {
+                context: "import window",
+                detail: "source tensor lies outside its mapped window".into(),
+            }));
+        }
+        self.region
+            .tensor(
+                weight.source,
+                &[count],
+                self.data_offset + offset - self.start,
+            )
+            .map_err(|error| AllocationError::Device(error.to_string()))
+    }
 }
 
 impl ImportWorkspaceLease {
@@ -42,11 +144,16 @@ impl ImportWorkspaceLease {
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
-    pub fn upload(&self) -> &Tensor {
-        &self.upload
+    pub fn source(&self) -> &Tensor {
+        match &self.source {
+            ImportSource::Mapped(tensor) | ImportSource::Staged(tensor) => tensor,
+        }
     }
-    pub fn upload_mut(&mut self) -> &mut Tensor {
-        &mut self.upload
+    pub fn staged_mut(&mut self) -> Option<&mut Tensor> {
+        match &mut self.source {
+            ImportSource::Mapped(_) => None,
+            ImportSource::Staged(tensor) => Some(tensor),
+        }
     }
 }
 
@@ -78,8 +185,8 @@ impl fmt::Display for AllocationError {
 
 impl std::error::Error for AllocationError {}
 
-/// Numerical graph slots authorized by one ResourcePlan. One-shot import
-/// uploads are allocated separately during component materialization.
+/// Numerical graph slots authorized by one ResourcePlan. Import sources are
+/// allocated separately during component materialization.
 pub struct AllocatedResources {
     domain: ResourceDomainId,
     target_graph: NativeGraphPool,
@@ -90,6 +197,25 @@ pub struct AllocatedResources {
 }
 
 impl AllocatedResources {
+    /// Sealed graph arenas remain owned by these pools while their slots are
+    /// lent to launches or output views.
+    pub fn committed_bytes(&self) -> Result<u64, &'static str> {
+        [
+            Some(&self.target_graph),
+            Some(&self.target_readout_graph),
+            self.head_graph.as_ref(),
+            self.vision_graph.as_ref(),
+            Some(&self.state_graph),
+        ]
+        .into_iter()
+        .flatten()
+        .try_fold(0u64, |bytes, pool| {
+            bytes
+                .checked_add(pool.committed_bytes())
+                .ok_or("graph pool charge overflows")
+        })
+    }
+
     pub fn domain(&self) -> &ResourceDomainId {
         &self.domain
     }
@@ -116,10 +242,12 @@ pub struct ResourceAllocator;
 
 impl ResourceAllocator {
     /// Imports are serialized at startup or optional-component materialization.
-    /// Each upload owns one exact source tensor until physical completion.
-    pub fn import_workspace(
+    /// Each lease owns its source tensor until physical completion.
+    pub(crate) fn import_workspace(
         execution: &ExecutionPlan,
         weight: &WeightPlan,
+        stored: &Stored,
+        window: Option<&ImportWindow>,
         device: &Device,
         domain: ResourceDomainId,
     ) -> Result<ImportWorkspaceLease, AllocationError> {
@@ -138,17 +266,49 @@ impl ResourceAllocator {
             .try_fold(1u64, |count, extent| count.checked_mul(*extent))
             .ok_or_else(|| invalid("weight element count overflows"))?;
         if weight.source_bytes > execution.resources().qualification_peak_bytes() {
-            return Err(invalid("source upload exceeds admitted startup transient bytes"));
+            return Err(invalid(
+                "source upload exceeds admitted startup transient bytes",
+            ));
         }
-        let upload = Tensor::zeros(device, weight.source, &[count])
-            .map_err(|error| AllocationError::Device(error.to_string()))?;
-        if !upload.belongs_to(device)
-            || upload.element() != weight.source
-            || upload.extents() != [count]
-            || upload.byte_len() != weight.source_bytes
-            || upload.storage_bytes() != weight.source_bytes
+        let staged = || {
+            // SAFETY: NativeImportProgram fills this exact tensor with
+            // write_from_host before binding it as a kernel source.
+            unsafe { Tensor::uninitialized(device, weight.source, &[count]) }
+                .map(ImportSource::Staged)
+                .map_err(|error| AllocationError::Device(error.to_string()))
+        };
+        let source = if let Some(window) = window {
+            ImportSource::Mapped(window.tensor(stored, weight, count)?)
+        } else if device.backend() == BackendName::Metal {
+            #[cfg(unix)]
+            {
+                let (file, offset, length) = stored.file_range();
+                let end = offset
+                    .checked_add(length)
+                    .ok_or_else(|| invalid("source range overflows"))?;
+                let mapped = ImportWindow::new(execution, device, file.clone(), offset, end)?;
+                ImportSource::Mapped(mapped.tensor(stored, weight, count)?)
+            }
+            #[cfg(not(unix))]
+            {
+                staged()?
+            }
+        } else {
+            staged()?
+        };
+        let tensor = match &source {
+            ImportSource::Mapped(tensor) | ImportSource::Staged(tensor) => tensor,
+        };
+        if !tensor.belongs_to(device)
+            || tensor.element() != weight.source
+            || tensor.extents() != [count]
+            || tensor.byte_len() != weight.source_bytes
+            || matches!(&source, ImportSource::Staged(_))
+                && tensor.storage_bytes() != weight.source_bytes
         {
-            return Err(invalid("upload tensor differs from the admitted source contract"));
+            return Err(invalid(
+                "source tensor differs from the admitted import contract",
+            ));
         }
         Ok(ImportWorkspaceLease {
             domain,
@@ -156,7 +316,7 @@ impl ResourceAllocator {
                 bytes: weight.source_bytes,
             },
             bytes: weight.source_bytes,
-            upload,
+            source,
         })
     }
 
@@ -204,12 +364,15 @@ impl ResourceAllocator {
                     .into(),
             }));
         }
-        let target_readout_graph =
-            NativeGraphPool::new(domain.clone(), target_readout_graphs.family(), readout_charge)?;
+        let target_readout_graph = NativeGraphPool::new(
+            domain.clone(),
+            target_readout_graphs.family(),
+            readout_charge,
+        )?;
         let head_graph = match (head_graphs, plan.head_graph()) {
-            (Some(graphs), Some(charge)) if admitted(graphs.family(), charge) => {
-                Some(NativeGraphPool::new(domain.clone(), graphs.family(), charge)?)
-            }
+            (Some(graphs), Some(charge)) if admitted(graphs.family(), charge) => Some(
+                NativeGraphPool::new(domain.clone(), graphs.family(), charge)?,
+            ),
             (None, None) => None,
             _ => {
                 return Err(AllocationError::Plan(InvariantError {
@@ -219,9 +382,9 @@ impl ResourceAllocator {
             }
         };
         let vision_graph = match (vision_graphs, plan.vision_graph()) {
-            (Some(graphs), Some(charge)) if admitted(graphs.family(), charge) => {
-                Some(NativeGraphPool::new(domain.clone(), graphs.family(), charge)?)
-            }
+            (Some(graphs), Some(charge)) if admitted(graphs.family(), charge) => Some(
+                NativeGraphPool::new(domain.clone(), graphs.family(), charge)?,
+            ),
             (None, None) => None,
             _ => {
                 return Err(AllocationError::Plan(InvariantError {
@@ -237,7 +400,8 @@ impl ResourceAllocator {
                 detail: "prepared state graph differs from admitted Seismic footprint".into(),
             }));
         }
-        let state_graph = NativeGraphPool::new(domain.clone(), state_graphs.family(), state_charge)?;
+        let state_graph =
+            NativeGraphPool::new(domain.clone(), state_graphs.family(), state_charge)?;
         let allocated = AllocatedResources {
             domain: domain.clone(),
             target_graph,

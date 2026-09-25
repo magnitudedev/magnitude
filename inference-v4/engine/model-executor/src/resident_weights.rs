@@ -1,7 +1,7 @@
 //! Family-neutral materialization of a validated model definition.
 //!
 //! The family adapter names semantic roles in [`ModelDefinition`]. This module
-//! applies the engine-wide storage policy to those roles and imports every
+//! applies the planned resident representation to those roles and imports every
 //! weight through [`ResidencyStore`]. It deliberately contains no model-name,
 //! tensor-name, or family-specific branching.
 
@@ -11,7 +11,7 @@ use magnitude_model_contracts::{
     ActivationDType, AttentionWeights, BlockWeights, DenseFeedForwardWeights, FeedForwardWeights,
     FusedQkvWeights, HeadBlock, HeadWeights, LayerNormWeights, MixerWeights, ModelDefinition,
     RecurrentWeights, RoutedFeedForwardWeights, VisionAttentionWeights, VisionBlockWeights,
-    VisionDescription, VisionFeedForwardWeights, VisionMergerWeights,
+    VisionDescription, VisionFeedForwardWeights, VisionMergerWeights, WeightKind,
 };
 use seismic::DType;
 use std::{error, fmt};
@@ -104,6 +104,25 @@ pub enum ResidentFeedForwardWeights {
     Routed(Box<ResidentRoutedFeedForwardWeights>),
 }
 
+impl ResidentFeedForwardWeights {
+    pub(crate) fn weight(&self, kind: WeightKind) -> Option<&ResidentWeight> {
+        match (self, kind) {
+            (Self::Dense(weights), WeightKind::DenseGate) => Some(&weights.gate),
+            (Self::Dense(weights), WeightKind::DenseUp) => Some(&weights.up),
+            (Self::Dense(weights), WeightKind::DenseDown) => Some(&weights.down),
+            (Self::Routed(weights), WeightKind::Router) => Some(&weights.router),
+            (Self::Routed(weights), WeightKind::SharedRouter) => Some(&weights.shared_router),
+            (Self::Routed(weights), WeightKind::ExpertGate) => Some(&weights.expert_gate),
+            (Self::Routed(weights), WeightKind::ExpertUp) => Some(&weights.expert_up),
+            (Self::Routed(weights), WeightKind::ExpertDown) => Some(&weights.expert_down),
+            (Self::Routed(weights), WeightKind::SharedGate) => Some(&weights.shared_gate),
+            (Self::Routed(weights), WeightKind::SharedUp) => Some(&weights.shared_up),
+            (Self::Routed(weights), WeightKind::SharedDown) => Some(&weights.shared_down),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ResidentBlockWeights {
     pub input_norm: ResidentWeight,
@@ -120,7 +139,7 @@ pub struct ResidentHeadBlock {
     pub input_norm: ResidentWeight,
     pub attention: ResidentAttentionWeights,
     pub feedforward_norm: ResidentWeight,
-    pub feedforward: ResidentDenseFeedForwardWeights,
+    pub feedforward: ResidentFeedForwardWeights,
     pub output_norm: ResidentWeight,
 }
 
@@ -201,6 +220,72 @@ pub struct ResidentTarget {
     pub output: ResidentWeight,
 }
 
+impl ResidentTarget {
+    /// Visit the materialized target weights, including tied roles. Callers
+    /// that count physical storage must deduplicate shared allocations.
+    pub(crate) fn visit_weights<'a>(&'a self, mut visit: impl FnMut(&'a ResidentWeight)) {
+        visit(&self.embedding);
+        for block in &self.blocks {
+            visit(&block.input_norm);
+            match &block.mixer {
+                ResidentMixerWeights::Attention(weights) => {
+                    visit(&weights.query_gate);
+                    visit(&weights.key);
+                    visit(&weights.value);
+                    visit(&weights.query_norm);
+                    visit(&weights.key_norm);
+                    visit(&weights.output);
+                }
+                ResidentMixerWeights::Recurrent(weights) => {
+                    visit(&weights.query_key_value);
+                    visit(&weights.gate);
+                    visit(&weights.alpha);
+                    visit(&weights.beta);
+                    visit(&weights.convolution);
+                    visit(&weights.decay);
+                    visit(&weights.time_bias);
+                    visit(&weights.norm);
+                    visit(&weights.output);
+                }
+            }
+            visit(&block.feedforward_norm);
+            match &block.feedforward {
+                ResidentFeedForwardWeights::Dense(weights) => {
+                    visit(&weights.gate);
+                    visit(&weights.up);
+                    visit(&weights.down);
+                }
+                ResidentFeedForwardWeights::Routed(weights) => {
+                    visit(&weights.router);
+                    visit(&weights.shared_router);
+                    visit(&weights.expert_gate);
+                    visit(&weights.expert_up);
+                    visit(&weights.expert_down);
+                    visit(&weights.shared_gate);
+                    visit(&weights.shared_up);
+                    visit(&weights.shared_down);
+                }
+            }
+        }
+        visit(&self.output_norm);
+        visit(&self.output);
+    }
+
+    pub(crate) fn storage_bytes(&self) -> Result<u64, &'static str> {
+        let mut seen = Vec::<&seismic::Tensor>::new();
+        let mut total = Some(0u64);
+        self.visit_weights(|weight| {
+            let tensor = weight.tensor();
+            if seen.iter().any(|other| other.shares_allocation(tensor)) {
+                return;
+            }
+            total = total.and_then(|bytes| bytes.checked_add(tensor.storage_bytes()));
+            seen.push(tensor);
+        });
+        total.ok_or("resident target charge overflows")
+    }
+}
+
 pub(crate) fn import_target(
     definition: &ModelDefinition,
     package: &Package,
@@ -265,7 +350,7 @@ pub(crate) fn import_optional_vision(
         .transpose()
 }
 
-fn validate_definition_package(
+pub(crate) fn validate_definition_package(
     definition: &ModelDefinition,
     package: &Package,
 ) -> Result<(), ResidencyError> {
@@ -298,7 +383,7 @@ fn validate_projector_binding(
     }
 }
 
-fn activation_dtype(dtype: ActivationDType) -> DType {
+pub(crate) fn activation_dtype(dtype: ActivationDType) -> DType {
     match dtype {
         ActivationDType::F16 => DType::F16,
         ActivationDType::BF16 => DType::BF16,
@@ -416,7 +501,14 @@ fn materialize_head_block(
         input_norm: residency.import_gguf(artifact, &block.input_norm, activation)?,
         attention: import_attention(residency, artifact, &block.attention, activation)?,
         feedforward_norm: residency.import_gguf(artifact, &block.feedforward_norm, activation)?,
-        feedforward: import_dense(residency, artifact, &block.feedforward, activation)?,
+        feedforward: match &block.feedforward {
+            FeedForwardWeights::Dense(weights) => ResidentFeedForwardWeights::Dense(Box::new(
+                import_dense(residency, artifact, weights, activation)?,
+            )),
+            FeedForwardWeights::Routed(weights) => ResidentFeedForwardWeights::Routed(Box::new(
+                import_routed(residency, artifact, weights, activation)?,
+            )),
+        },
         output_norm: residency.import_gguf(artifact, &block.output_norm, activation)?,
     })
 }

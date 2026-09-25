@@ -169,7 +169,9 @@ macro_rules! cost {
 /// renderer consumes. Unsupported vector operations still have semantics so
 /// adding vector support cannot create a late hole; the empty profile vector
 /// matrix prevents them from entering a Metal kernel today.
-pub fn operation_cost<B: seismic_ir::physical_target::PhysicalDialect<Intrinsic = MetalIntrinsic>>(
+pub fn operation_cost<
+    B: seismic_ir::physical_target::PhysicalDialect<Intrinsic = MetalIntrinsic>,
+>(
     arena: &mut ExprArena,
     kernel: &seismic_ir::kernel::Kernel<B>,
     op: ClosedOpView<'_, B>,
@@ -387,8 +389,11 @@ pub fn operation_cost<B: seismic_ir::physical_target::PhysicalDialect<Intrinsic 
                 // the cooperative instruction and staging traffic once for
                 // the complete launch; core must not multiply it by the
                 // reflected SIMD width or by the chosen grid.
-                let exact = |value| kernel.exact_nat(value)
-                    .ok_or(ModelLimitation::DeviceExtent { value });
+                let exact = |value| {
+                    kernel
+                        .exact_nat(value)
+                        .ok_or(ModelLimitation::DeviceExtent { value })
+                };
                 let rows = exact(left.extents[0])?;
                 let inner = exact(left.extents[1])?;
                 let columns = exact(right.extents[1])?;
@@ -500,9 +505,12 @@ mod tests {
     fn matrix_demand_uses_actual_value_extents_and_reports_device_extents() {
         use seismic_ir::kernel::ops::{LogicalTensorMap, PlaceRef};
         use seismic_ir::storage::LaunchLocalKind;
-        use seismic_lang::{registry, expr::Assignment};
+        use seismic_lang::{expr::Assignment, registry};
         let capability = registry::capability(registry::BackendName::Metal, "matrix").unwrap();
-        let signature = registry::intrinsics(capability).iter().find(|s| s.name == "matmul").unwrap();
+        let signature = registry::intrinsics(capability)
+            .iter()
+            .find(|s| s.name == "matmul")
+            .unwrap();
         let mut arena = ExprArena::default();
         let capacity = arena.nat(32);
         let mut construction = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
@@ -521,27 +529,56 @@ mod tests {
         let kernel = &construction.kernels()[0];
         let map = |extents| LogicalTensorMap {
             base: PlaceRef::Local { index: 0 },
-            representation: registry::dense(DType::F32), extents, steps: vec![],
+            representation: registry::dense(DType::F32),
+            extents,
+            steps: vec![],
         };
         for (actual_rows, unavailable) in [(rows, false), (device_rows, true)] {
             let left = map(vec![actual_rows, inner]);
             let right = map(vec![inner, columns]);
             let into = map(vec![actual_rows, columns]);
             let operation = MetalIntrinsic::Matrix {
-                scratch_left: left.clone(), scratch_right: right.clone(),
-                scratch_accumulator: into.clone(), left, right, into,
-                addend: None, element: DType::F32, accumulator: DType::F32, output: DType::F32,
+                scratch_left: left.clone(),
+                scratch_right: right.clone(),
+                scratch_accumulator: into.clone(),
+                left,
+                right,
+                into,
+                addend: None,
+                element: DType::F32,
+                accumulator: DType::F32,
+                output: DType::F32,
             };
-            let cost = operation_cost(&mut arena, kernel, ClosedOpView::Intrinsic {
-                intrinsic: signature.id, signature, op: &operation,
-                outputs: vec![], arguments: vec![], mapping_dependencies: vec![],
-            });
+            let cost = operation_cost(
+                &mut arena,
+                kernel,
+                ClosedOpView::Intrinsic {
+                    intrinsic: signature.id,
+                    signature,
+                    op: &operation,
+                    outputs: vec![],
+                    arguments: vec![],
+                    mapping_dependencies: vec![],
+                },
+            );
             if unavailable {
-                assert!(matches!(cost, Err(ModelLimitation::DeviceExtent { value }) if value == device_rows));
+                assert!(
+                    matches!(cost, Err(ModelLimitation::DeviceExtent { value }) if value == device_rows)
+                );
             } else {
-                let OperationCost::Demands(cost) = cost.unwrap() else { panic!("matrix work cannot be elided") };
-                let matrix = cost.iter().find(|d| d.class == MetalService::Matrix).unwrap();
-                assert_eq!(arena.eval_nat_u64(matrix.units, &Assignment::new()).unwrap(), 4);
+                let OperationCost::Demands(cost) = cost.unwrap() else {
+                    panic!("matrix work cannot be elided")
+                };
+                let matrix = cost
+                    .iter()
+                    .find(|d| d.class == MetalService::Matrix)
+                    .unwrap();
+                assert_eq!(
+                    arena
+                        .eval_nat_u64(matrix.units, &Assignment::new())
+                        .unwrap(),
+                    4
+                );
             }
         }
     }

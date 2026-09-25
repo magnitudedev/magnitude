@@ -77,8 +77,14 @@ impl Executor {
     }
 
     pub(crate) fn from_workers(workers: Arc<Mutex<Workers>>) -> Self {
-        let participants = workers.lock().expect("CPU worker-pool lock poisoned").count();
-        Self { workers, participants }
+        let participants = workers
+            .lock()
+            .expect("CPU worker-pool lock poisoned")
+            .count();
+        Self {
+            workers,
+            participants,
+        }
     }
 }
 
@@ -353,7 +359,9 @@ fn view_range(
 ) -> Result<*mut u8, ExecutionError> {
     let resolved = env.resolve_view(view)?;
     if bytes > resolved.byte_span {
-        return Err(ExecutionError::ConstructionContradiction("CPU transfer exceeds resolved view".into()));
+        return Err(ExecutionError::ConstructionContradiction(
+            "CPU transfer exceeds resolved view".into(),
+        ));
     }
     Ok(unsafe {
         resolved.buffer.data_pointer().add(to_usize(
@@ -391,8 +399,11 @@ fn fill(destination: *mut u8, bytes: u64, value: FillValue) {
 }
 
 fn encode_symbol(value: SymbolValue) -> Result<u64, ExecutionError> {
-    value.try_word64().map_err(|error| ExecutionError::ConstructionContradiction(
-        format!("native scalar ABI quantity does not fit its planned word: {error:?}")))
+    value.try_word64().map_err(|error| {
+        ExecutionError::ConstructionContradiction(format!(
+            "native scalar ABI quantity does not fit its planned word: {error:?}"
+        ))
+    })
 }
 
 fn allocation_error(error: AllocationFailure) -> ExecutionError {

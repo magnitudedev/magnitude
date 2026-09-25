@@ -22,11 +22,11 @@ using Epi = projection::Store<element::F32>;
 #define EPILOGUE Epi{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0, 0}
 
 // The GEMV over NB column blocks of 8 rows.
-template <int NB>
+template <int NB, int KSPLIT>
 __device__ __forceinline__ void head_gemv(const Pro &pro, projection::u8 *row, const projection::u8 *staged, unsigned O,
                                           unsigned long long D, unsigned long long V, const packets::W0 &head,
                                           const Epi &epi) {
-    using Shape = projection::GemvShape<8, 1, SEISMIC_TUNE_KSPLIT, NB>;
+    using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
     __shared__ projection::GemvShared<Shape, Source::type> shared;
     const Source::type x = Source::make(pro, row, O, D, staged);
     const unsigned long long group = Shape::tile_group();
@@ -44,24 +44,36 @@ __device__ __forceinline__ void head_gemm(const projection::u8 *staged, unsigned
                                            D, blockIdx.x, V, head, projection::NoWeight{}, epi);
 }
 
+#ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_STAGE
 extern "C" __global__ void readout_head_rows_stage(SEISMIC_KERNEL_PARAMS) {
     projection::stage_row<false>(PROLOGUE, blockIdx.x, SEISMIC_DIM_D, STAGING, nullptr);
 }
+#endif
 
-extern "C" __global__ void readout_head_rows_gemv(SEISMIC_KERNEL_PARAMS) {
+#ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMV
+template <unsigned KSPLIT>
+__global__ void readout_head_rows_gemv(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ uint4 dynamic_shared[];
-    head_gemv<1>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, (unsigned)SEISMIC_DIM_O,
+    head_gemv<1, KSPLIT>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, (unsigned)SEISMIC_DIM_O,
                  SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
 }
+#endif
 
-extern "C" __global__ void readout_head_rows_gemv16(SEISMIC_KERNEL_PARAMS) {
-    head_gemv<2>(PROLOGUE, nullptr, STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
+#ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMV16
+template <unsigned KSPLIT>
+__global__ void readout_head_rows_gemv16(SEISMIC_KERNEL_PARAMS) {
+    head_gemv<2, KSPLIT>(PROLOGUE, nullptr, STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
 }
+#endif
 
+#ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMM_SMALL
 extern "C" __global__ void readout_head_rows_gemm_small(SEISMIC_KERNEL_PARAMS) {
     head_gemm<projection::SmallGemm>(STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
 }
+#endif
 
+#ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMM
 extern "C" __global__ void readout_head_rows_gemm(SEISMIC_KERNEL_PARAMS) {
     head_gemm<projection::LargeGemm>(STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
 }
+#endif

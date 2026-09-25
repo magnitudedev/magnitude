@@ -1,9 +1,9 @@
 use crate::Metal;
 use seismic_estimator::{AnalyticalModelDefinition, OperationCost};
 use seismic_ir::kernel::{ops::ClosedOpView, Kernel};
+use seismic_ir::physical_target::KernelEmissionLayout;
 use seismic_ir::schedule::Launch;
 use seismic_ir::storage::LaunchLocalLayout;
-use seismic_ir::physical_target::KernelEmissionLayout;
 use std::collections::BTreeSet;
 
 pub struct MetalAnalyticalModel;

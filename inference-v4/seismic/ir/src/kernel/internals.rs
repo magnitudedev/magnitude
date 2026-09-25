@@ -17,20 +17,18 @@
 
 use super::ops::{
     self, BarrierScope, BinaryOp, Binding, BindingAccess, BitOp, Block, CmpOp, ErasedValue,
-    GeometryValue, IntrinsicResources, KernelInterface, LogicOp, MathPrecision,
-    Op, PlaceRef, ResourceFacts, UnaryOp, ValueSchema, ValueType,
+    GeometryValue, IntrinsicResources, KernelInterface, LogicOp, MathPrecision, Op, PlaceRef,
+    ResourceFacts, UnaryOp, ValueSchema, ValueType,
 };
 use super::{BindingSlot, BlockId, Kernel, KernelArena, KernelId};
 use crate::identity::OwnerToken;
+use crate::physical_target::PhysicalDialect;
 use crate::schedule::AnyScalarSlot;
 use crate::storage::{LaunchLocalKind, LocalAllocation};
-use crate::physical_target::PhysicalDialect;
 use seismic_lang::expr::{ExprArena, NatExpr, SymbolId};
 use seismic_lang::ids::{IntrinsicId, RepresentationId};
 use seismic_lang::intrinsics::{AtomicOp, MathOp};
-use seismic_lang::registry::{
-    self, IntrinsicResultType, IntrinsicUniformity, RepresentationKind,
-};
+use seismic_lang::registry::{self, IntrinsicResultType, IntrinsicUniformity, RepresentationKind};
 use seismic_lang::types::DType;
 
 // ---------------------------------------------------------------------------
@@ -705,7 +703,9 @@ impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
         operation: seismic_lang::reference_math::ScalarOp,
         operands: &[PortableValue],
         alive: PortableValue,
-        destination: impl FnMut(seismic_lang::reference_math::ScalarFailure) -> (PortableTensor, PortableValue),
+        destination: impl FnMut(
+            seismic_lang::reference_math::ScalarFailure,
+        ) -> (PortableTensor, PortableValue),
     ) -> (PortableValue, PortableValue) {
         super::reference_math::continue_scalar(self, operation, operands, alive, destination)
     }
@@ -1183,14 +1183,19 @@ impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
     /// keeps the identity of its backing; distinct participant locals are
     /// disjoint, while external argument aliases follow the entry contract.
     pub fn tensors_may_overlap(&self, a: &PortableTensor, b: &PortableTensor) -> bool {
-        match (self.checked_place(a.place).place, self.checked_place(b.place).place) {
+        match (
+            self.checked_place(a.place).place,
+            self.checked_place(b.place).place,
+        ) {
             (PlaceRef::Local { index: a }, PlaceRef::Local { index: b }) => a == b,
             (PlaceRef::Local { .. }, PlaceRef::Global { .. })
             | (PlaceRef::Global { .. }, PlaceRef::Local { .. }) => false,
             (PlaceRef::Global { slot: a }, PlaceRef::Global { slot: b }) => {
                 let a = self.inner.state.bindings[a.index() as usize].view;
                 let b = self.inner.state.bindings[b.index() as usize].view;
-                self.inner.storage.may_overlap_views(self.inner.schedule, a, b)
+                self.inner
+                    .storage
+                    .may_overlap_views(self.inner.schedule, a, b)
             }
         }
     }
@@ -1505,13 +1510,18 @@ impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
                     let zero = self.index_constant(0);
                     step.dense_coordinates(&index, zero, |op, a, b| {
                         use crate::tensor_view::CoordinateOp;
-                        self.binary(match op {
-                            CoordinateOp::Add => BinaryOp::Add,
-                            CoordinateOp::Mul => BinaryOp::Mul,
-                            CoordinateOp::Div => BinaryOp::Div,
-                            CoordinateOp::Rem => BinaryOp::Rem,
-                        }, a, b)
-                    }).expect("plane handled by representation resolver")
+                        self.binary(
+                            match op {
+                                CoordinateOp::Add => BinaryOp::Add,
+                                CoordinateOp::Mul => BinaryOp::Mul,
+                                CoordinateOp::Div => BinaryOp::Div,
+                                CoordinateOp::Rem => BinaryOp::Rem,
+                            },
+                            a,
+                            b,
+                        )
+                    })
+                    .expect("plane handled by representation resolver")
                 }
             };
         }
@@ -2808,9 +2818,12 @@ impl<B: PhysicalDialect> KernelData<B> {
         assert_eq!(v.kernel, self.kernel, "value belongs to another kernel");
         match self.values.get(v.index() as usize) {
             Some(value) => {
-                assert_eq!(v.block, value.block, "value carries the wrong defining block");
+                assert_eq!(
+                    v.block, value.block,
+                    "value carries the wrong defining block"
+                );
                 value
-            },
+            }
             None => panic!(
                 "{v:?} is outside its kernel of {} values",
                 self.values.len()

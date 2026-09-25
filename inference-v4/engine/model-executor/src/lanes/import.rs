@@ -1,4 +1,4 @@
-//! One-shot planned resident import with an owned destination tensor.
+//! One-shot planned resident import with an owned source and destination.
 
 use crate::{
     ImportArtifactTensor, ImportWorkspaceLease, InvariantError, PoolClass, ResourceDomainId,
@@ -95,22 +95,23 @@ impl ValidatedImportLaunch {
             .shape
             .iter()
             .try_fold(1u64, |count, extent| count.checked_mul(*extent));
-        let upload = inputs.workspace.upload();
-        let upload_matches = upload.element() == inputs.plan.source
-            && count.is_some_and(|count| upload.extents() == [count])
-            && upload.byte_len() == inputs.plan.source_bytes
-            && upload.storage_bytes() == inputs.workspace.bytes();
+        let source_tensor = inputs.workspace.source();
+        let source_matches = source_tensor.element() == inputs.plan.source
+            && count.is_some_and(|count| source_tensor.extents() == [count])
+            && source_tensor.byte_len() == inputs.plan.source_bytes
+            && source_tensor.belongs_to(&inputs.destination.tensor().device());
         let valid = inputs.source.artifact() == inputs.plan.component.identity
             && inputs.source.stored().shape() == inputs.plan.shape
             && inputs.source.stored().source_element() == Some(inputs.plan.source)
             && inputs.source.stored().source_bytes() == inputs.plan.source_bytes
             && inputs.destination.identity() == &inputs.plan.storage_identity()
             && inputs.workspace.domain() == domain
-            && inputs.workspace.class() == (PoolClass::Import {
-                bytes: inputs.plan.source_bytes,
-            })
+            && inputs.workspace.class()
+                == (PoolClass::Import {
+                    bytes: inputs.plan.source_bytes,
+                })
             && inputs.workspace.bytes() == inputs.plan.source_bytes
-            && upload_matches;
+            && source_matches;
         if !valid {
             return Err((
                 inputs,

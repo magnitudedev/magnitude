@@ -105,7 +105,10 @@ impl<'a> QualificationView<'a> {
         Ok(())
     }
 
-    pub(super) fn qualify_conditioning_overlay(&self, device: &Device) -> Result<(), CatalogFailure> {
+    pub(super) fn qualify_conditioning_overlay(
+        &self,
+        device: &Device,
+    ) -> Result<(), CatalogFailure> {
         let input = tensor_f32(
             device,
             &[1, 2],

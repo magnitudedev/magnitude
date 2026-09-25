@@ -1,6 +1,6 @@
 use crate::{
-    Constraint, Demand, MethodRequirements, Sampling, SelectSpec, Shaping, TokenId, WorkKind,
-    accept_prefix, verification_selects,
+    accept_prefix, verification_selects, Constraint, Demand, MethodRequirements, Sampling,
+    SelectSpec, Shaping, TokenId, WorkKind,
 };
 use magnitude_model_executor::{ConditioningRef, Operation, RequestId};
 use std::collections::BTreeSet;

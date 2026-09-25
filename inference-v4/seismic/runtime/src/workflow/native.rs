@@ -24,7 +24,13 @@ struct PlannedNode<T: TargetFamily, E: NativeExecutor<T>> {
     allocations: Vec<PlannedAllocation>,
 }
 impl<T: TargetFamily, E: NativeExecutor<T>> Clone for PlannedNode<T, E> {
-    fn clone(&self) -> Self { Self { selected: self.selected.clone(), values: self.values.clone(), allocations: self.allocations.clone() } }
+    fn clone(&self) -> Self {
+        Self {
+            selected: self.selected.clone(),
+            values: self.values.clone(),
+            allocations: self.allocations.clone(),
+        }
+    }
 }
 
 enum InvocationTarget<T: TargetFamily, E: NativeExecutor<T>> {
@@ -37,20 +43,44 @@ enum InvocationTarget<T: TargetFamily, E: NativeExecutor<T>> {
 
 impl<T: TargetFamily, E: NativeExecutor<T>> InvocationTarget<T, E> {
     fn persistent_inventory(&self, keys: &mut BTreeMap<(u64, usize, usize), Arc<PersistentTable>>) {
-        let mut include = |owner, variant, executable: &ExecutableVariant<T, E::Handle>, table: &Arc<PersistentTable>| {
+        let mut include = |owner,
+                           variant,
+                           executable: &ExecutableVariant<T, E::Handle>,
+                           table: &Arc<PersistentTable>| {
             for (slot, allocation) in executable.allocations().iter().enumerate() {
-                if matches!(allocation.kind, ExecutableAllocationKind::Global(ExecutableGlobalAllocationKind::Persistent)) {
-                    keys.entry((owner, variant, slot)).or_insert_with(|| table.clone());
+                if matches!(
+                    allocation.kind,
+                    ExecutableAllocationKind::Global(ExecutableGlobalAllocationKind::Persistent)
+                ) {
+                    keys.entry((owner, variant, slot))
+                        .or_insert_with(|| table.clone());
                 }
             }
         };
         match self {
             Self::Policy(kernel) => {
-                for (variant, executable) in kernel.prepared.kernel.variants().as_slice().iter().enumerate() {
-                    include(kernel.prepared.identity, variant, executable, &kernel.prepared.persistent);
+                for (variant, executable) in kernel
+                    .prepared
+                    .kernel
+                    .variants()
+                    .as_slice()
+                    .iter()
+                    .enumerate()
+                {
+                    include(
+                        kernel.prepared.identity,
+                        variant,
+                        executable,
+                        &kernel.prepared.persistent,
+                    );
                 }
             }
-            Self::Candidate { selected, .. } => include(selected.owner, selected.variant, &selected.executable, &selected.persistent),
+            Self::Candidate { selected, .. } => include(
+                selected.owner,
+                selected.variant,
+                &selected.executable,
+                &selected.persistent,
+            ),
         }
     }
 }
@@ -140,8 +170,12 @@ impl<T: TargetFamily, E: NativeExecutor<T>> PreparedPolicy for InvocationTarget<
                 _ => {
                     let slot = private_allocations.len();
                     let acquisition = match allocation.acquisition {
-                        seismic_compiler::executable::AllocationAcquisition::Invocation => Acquisition::Invocation(evaluated_bytes(allocation, &invocation)?),
-                        seismic_compiler::executable::AllocationAcquisition::Reached => Acquisition::ReachedPrivate,
+                        seismic_compiler::executable::AllocationAcquisition::Invocation => {
+                            Acquisition::Invocation(evaluated_bytes(allocation, &invocation)?)
+                        }
+                        seismic_compiler::executable::AllocationAcquisition::Reached => {
+                            Acquisition::ReachedPrivate
+                        }
                     };
                     let kind = match &allocation.kind {
                         ExecutableAllocationKind::Global(
@@ -168,12 +202,14 @@ impl<T: TargetFamily, E: NativeExecutor<T>> PreparedPolicy for InvocationTarget<
         let mut outputs = Vec::with_capacity(executable.bindings().results.len());
         for (_, result) in &executable.bindings().results {
             outputs.push(match result {
-                ExecutableResultBinding::Buffer { representation, rank } =>
-                    OutputDescription::ProducedTensor {
-                        device: device.identity(),
-                        representation: *representation,
-                        rank: *rank,
-                    },
+                ExecutableResultBinding::Buffer {
+                    representation,
+                    rank,
+                } => OutputDescription::ProducedTensor {
+                    device: device.identity(),
+                    representation: *representation,
+                    rank: *rank,
+                },
                 ExecutableResultBinding::Scalar { .. }
                 | ExecutableResultBinding::Quantity { .. }
                 | ExecutableResultBinding::Range { .. } => {
@@ -242,13 +278,19 @@ fn evaluated_bytes(
     let candidates = allocation.byte_candidates();
     let mut required = seismic_lang::expr::BigUint::default();
     for bytes in std::iter::once(candidates.first()).chain(candidates.rest().iter()) {
-        let bytes = bytes.evaluate(values).map_err(|error| CallError::Execution(
-            ExecutionError::ConstructionContradiction(format!("upfront allocation size is undefined: {error:?}"))))?;
+        let bytes = bytes.evaluate(values).map_err(|error| {
+            CallError::Execution(ExecutionError::ConstructionContradiction(format!(
+                "upfront allocation size is undefined: {error:?}"
+            )))
+        })?;
         required = required.max(bytes);
     }
-    u64::try_from(&required).map_err(|_| CallError::Invocation(InvocationError::AllocationCapacity {
-        required, available: u64::MAX,
-    }))
+    u64::try_from(&required).map_err(|_| {
+        CallError::Invocation(InvocationError::AllocationCapacity {
+            required,
+            available: u64::MAX,
+        })
+    })
 }
 
 struct QueuedNode<T: TargetFamily, E: NativeExecutor<T>> {
@@ -291,8 +333,13 @@ impl<T: TargetFamily, E: NativeExecutor<T>> WorkflowContinuation<T, E> {
         let first = self.planner.nodes.len();
         for (offset, queued) in self.queued.iter_mut().enumerate() {
             if queued.prepared.is_none() && self.planner.bindings_ready(&queued.bindings) {
-                queued.prepared = Some(self.planner.prepare_at((first + offset) as u32, &queued.bindings,
-                    |arguments| queued.target.evaluate(arguments)).map_err(plan_error)?);
+                queued.prepared = Some(
+                    self.planner
+                        .prepare_at((first + offset) as u32, &queued.bindings, |arguments| {
+                            queued.target.evaluate(arguments)
+                        })
+                        .map_err(plan_error)?,
+                );
             }
         }
         Ok(())
@@ -300,53 +347,119 @@ impl<T: TargetFamily, E: NativeExecutor<T>> WorkflowContinuation<T, E> {
 
     fn bind_next(&mut self) -> Result<bool, CallError> {
         self.prebind_ready()?;
-        let Some(queued) = self.queued.pop_front() else { return Ok(false); };
+        let Some(queued) = self.queued.pop_front() else {
+            return Ok(false);
+        };
         match queued.prepared {
-            Some(prepared) => { self.planner.bind_and_insert(queued.bindings, |_| Ok(prepared)).map_err(plan_error)?; }
-            None => { self.planner.push(queued.target, queued.bindings).map_err(plan_error)?; }
+            Some(prepared) => {
+                self.planner
+                    .bind_and_insert(queued.bindings, |_| Ok(prepared))
+                    .map_err(plan_error)?;
+            }
+            None => {
+                self.planner
+                    .push(queued.target, queued.bindings)
+                    .map_err(plan_error)?;
+            }
         }
         Ok(true)
     }
-    pub(crate) fn next(&mut self, device: &Arc<Opened<T, E>>, resources: &mut AdmittedResources)
-        -> Result<Option<AdmittedNode<T, E>>, CallError> {
+    pub(crate) fn next(
+        &mut self,
+        device: &Arc<Opened<T, E>>,
+        resources: &mut AdmittedResources,
+    ) -> Result<Option<AdmittedNode<T, E>>, CallError> {
         if self.planner.bound_node(self.next_node).is_none() {
-            if !self.bind_next()? { return Ok(None); }
+            if !self.bind_next()? {
+                return Ok(None);
+            }
         }
-        let node = self.planner.bound_node(self.next_node).expect("node just bound").clone();
+        let node = self
+            .planner
+            .bound_node(self.next_node)
+            .expect("node just bound")
+            .clone();
         let admitted = admit_reached_node(node, &mut self.physical, device, resources)?;
         self.next_node += 1;
         Ok(Some(admitted))
     }
 
-    pub(crate) fn completed(&mut self, ordinal: u32, completed: &AdmittedNode<T, E>, device: seismic_compiler::prepared::DeviceIdentity, resources: &mut AdmittedResources) -> Result<(), CallError> {
-        let planned = self.planner.bound_node(ordinal).expect("completed node was bound");
+    pub(crate) fn completed(
+        &mut self,
+        ordinal: u32,
+        completed: &AdmittedNode<T, E>,
+        device: seismic_compiler::prepared::DeviceIdentity,
+        resources: &mut AdmittedResources,
+    ) -> Result<(), CallError> {
+        let planned = self
+            .planner
+            .bound_node(ordinal)
+            .expect("completed node was bound");
         let mut publications = Vec::new();
         let mut retained_slots = std::collections::BTreeSet::new();
-        for ((path, _), output) in planned.selection.selected.executable.bindings().results.iter().zip(&completed.outputs) {
-            let AdmittedOutput::Tensor { allocation, byte_offset, byte_len, representation, extents, strides } = output else { continue; };
+        for ((path, _), output) in planned
+            .selection
+            .selected
+            .executable
+            .bindings()
+            .results
+            .iter()
+            .zip(&completed.outputs)
+        {
+            let AdmittedOutput::Tensor {
+                allocation,
+                byte_offset,
+                byte_len,
+                representation,
+                extents,
+                strides,
+            } = output
+            else {
+                continue;
+            };
             retained_slots.insert(resources.slot_for(allocation));
-            let index = completed.command.published_allocation(path).ok_or_else(|| CallError::Execution(
-                ExecutionError::ConstructionContradiction("tensor result has no executed publication".into()),
-            ))?;
+            let index = completed
+                .command
+                .published_allocation(path)
+                .ok_or_else(|| {
+                    CallError::Execution(ExecutionError::ConstructionContradiction(
+                        "tensor result has no executed publication".into(),
+                    ))
+                })?;
             let resource = match planned.selection.allocations[index] {
                 PlannedAllocation::Argument { argument } => {
-                    let crate::driver::workflow::ValueDescriptor::Tensor(tensor) = &planned.arguments[argument] else {
+                    let crate::driver::workflow::ValueDescriptor::Tensor(tensor) =
+                        &planned.arguments[argument]
+                    else {
                         unreachable!("tensor publication references a tensor argument")
                     };
                     tensor.resource
                 }
                 PlannedAllocation::Private { slot, .. } => planned.private_resources[slot].resource,
             };
-            publications.push((allocation.clone(), TensorDescriptor {
-                device, resource,
-                representation: *representation, extents: extents.clone(), strides: strides.clone(),
-                range: ByteRange { offset: *byte_offset, len: *byte_len },
-            }));
+            publications.push((
+                allocation.clone(),
+                TensorDescriptor {
+                    device,
+                    resource,
+                    representation: *representation,
+                    extents: extents.clone(),
+                    strides: strides.clone(),
+                    range: ByteRange {
+                        offset: *byte_offset,
+                        len: *byte_len,
+                    },
+                },
+            ));
         }
         for (index, allocation) in planned.selection.allocations.iter().enumerate() {
-            let PlannedAllocation::Private { slot, .. } = allocation else { continue; };
+            let PlannedAllocation::Private { slot, .. } = allocation else {
+                continue;
+            };
             let resource = planned.private_resources[*slot].resource;
-            if matches!(resource, ResourceId::Persistent { .. }) { continue; }
+            if matches!(resource, ResourceId::Persistent { .. }) {
+                continue;
+            }
             let slot = completed.command.allocation_slot(index);
             if !retained_slots.contains(&slot) {
                 // The caller completed this entire native prefix. No output
@@ -359,10 +472,14 @@ impl<T: TargetFamily, E: NativeExecutor<T>> WorkflowContinuation<T, E> {
         let mut tensor_publications = publications.into_iter();
         for (output, value) in completed.outputs.iter().enumerate() {
             if matches!(value, AdmittedOutput::Tensor { .. }) {
-                let (backing, descriptor) = tensor_publications.next().expect("one descriptor per tensor output");
+                let (backing, descriptor) = tensor_publications
+                    .next()
+                    .expect("one descriptor per tensor output");
                 self.physical.insert(descriptor.resource, backing);
                 let reference = self.planner.output(ordinal, output as u32);
-                self.planner.publish_tensor(reference, descriptor).map_err(plan_error)?;
+                self.planner
+                    .publish_tensor(reference, descriptor)
+                    .map_err(plan_error)?;
             }
         }
         Ok(())
@@ -383,14 +500,21 @@ fn preclaim_resources<T: TargetFamily, E: NativeExecutor<T>>(
         let mut wait = None;
         for (key, table) in keys {
             match table.preclaim_availability((key.1, key.2)) {
-                PersistentAvailability::Grow { old } => { snapshots.insert(*key, old); }
-                PersistentAvailability::Wait => { wait = Some((*key, table.clone())); break; }
+                PersistentAvailability::Grow { old } => {
+                    snapshots.insert(*key, old);
+                }
+                PersistentAvailability::Wait => {
+                    wait = Some((*key, table.clone()));
+                    break;
+                }
             }
         }
         if let Some((key, table)) = wait {
             drop(guard);
             table.wait_until_preclaimable((key.1, key.2));
-        } else { break (snapshots, guard); }
+        } else {
+            break (snapshots, guard);
+        }
     };
     let mut requests = BTreeMap::new();
     for allocation in external.values() {
@@ -399,12 +523,20 @@ fn preclaim_resources<T: TargetFamily, E: NativeExecutor<T>>(
     for old in snapshots.values().filter_map(Option::as_ref) {
         merge_access_request(&mut requests, old.allocation.clone(), true, true);
     }
-    let access = requests.into_values()
-        .map(|(allocation, write, _)| allocation.acquire(write)).collect();
-    let claims = keys.iter().map(|(key, table)| (*key, table.claim_growth((key.1, key.2)))).collect();
-    let reservation = device.memory.reserve(0).map_err(|capacity| CallError::Invocation(
-        InvocationError::AllocationCapacity { required: capacity.required.into(), available: capacity.available },
-    ))?;
+    let access = requests
+        .into_values()
+        .map(|(allocation, write, _)| allocation.acquire(write))
+        .collect();
+    let claims = keys
+        .iter()
+        .map(|(key, table)| (*key, table.claim_growth((key.1, key.2))))
+        .collect();
+    let reservation = device.memory.reserve(0).map_err(|capacity| {
+        CallError::Invocation(InvocationError::AllocationCapacity {
+            required: capacity.required.into(),
+            available: capacity.available,
+        })
+    })?;
     let mut resources = AdmittedResources::new(reservation, access);
     resources.retain_preclaims(claims);
     drop(guard);
@@ -419,57 +551,119 @@ fn admit_reached_node<T: TargetFamily, E: NativeExecutor<T>>(
 ) -> Result<AdmittedNode<T, E>, CallError> {
     let mut demands = Vec::new();
     for requirement in &node.private_resources {
-        let Some(bytes) = requirement.acquisition.initial_bytes() else { continue; };
-        if let ResourceId::Persistent { owner, variant, slot } = requirement.resource {
+        let Some(bytes) = requirement.acquisition.initial_bytes() else {
+            continue;
+        };
+        if let ResourceId::Persistent {
+            owner,
+            variant,
+            slot,
+        } = requirement.resource
+        {
             let key = (owner, variant as usize, slot as usize);
-            if let Some(binding) = resources.preclaimed_binding(key).filter(|binding| binding.capacity >= bytes) {
+            if let Some(binding) = resources
+                .preclaimed_binding(key)
+                .filter(|binding| binding.capacity >= bytes)
+            {
                 physical.insert(requirement.resource, binding.allocation.clone());
                 continue;
             }
-        } else if physical.contains_key(&requirement.resource) { continue; }
+        } else if physical.contains_key(&requirement.resource) {
+            continue;
+        }
         demands.push((requirement, bytes));
     }
-    let exact = demands.iter().fold(seismic_lang::expr::BigUint::default(), |sum, (_, bytes)| sum + *bytes);
-    let required = u64::try_from(&exact).map_err(|_| CallError::Invocation(
-        InvocationError::AllocationCapacity { required: exact, available: u64::MAX },
-    ))?;
-    resources.check_reached_capacity(required).map_err(CallError::Execution)?;
-    let mut reservation = device.memory.reserve(required).map_err(|capacity| CallError::Invocation(
-        InvocationError::AllocationCapacity { required: capacity.required.into(), available: capacity.available },
-    ))?;
+    let exact = demands
+        .iter()
+        .fold(seismic_lang::expr::BigUint::default(), |sum, (_, bytes)| {
+            sum + *bytes
+        });
+    let required = u64::try_from(&exact).map_err(|_| {
+        CallError::Invocation(InvocationError::AllocationCapacity {
+            required: exact,
+            available: u64::MAX,
+        })
+    })?;
+    resources
+        .check_reached_capacity(required)
+        .map_err(CallError::Execution)?;
+    let mut reservation = device.memory.reserve(required).map_err(|capacity| {
+        CallError::Invocation(InvocationError::AllocationCapacity {
+            required: capacity.required.into(),
+            available: capacity.available,
+        })
+    })?;
     let mut replacements = Vec::new();
     for (requirement, bytes) in demands {
-        let allocation = device.allocate_reserved(bytes, requirement.alignment, &mut reservation).map_err(CallError::Execution)?;
-        if let ResourceId::Persistent { owner, variant, slot } = requirement.resource {
+        let allocation = device
+            .allocate_reserved(bytes, requirement.alignment, &mut reservation)
+            .map_err(CallError::Execution)?;
+        if let ResourceId::Persistent {
+            owner,
+            variant,
+            slot,
+        } = requirement.resource
+        {
             let key = (owner, variant as usize, slot as usize);
             if let Some(old) = resources.preclaimed_binding(key) {
-                copy_between::<T, E>(&*device.service, typed_buffer::<T, E>(&old.allocation),
-                    typed_buffer::<T, E>(&allocation), old.capacity).map_err(CallError::Execution)?;
+                copy_between::<T, E>(
+                    &*device.service,
+                    typed_buffer::<T, E>(&old.allocation),
+                    typed_buffer::<T, E>(&allocation),
+                    old.capacity,
+                )
+                .map_err(CallError::Execution)?;
             }
-            replacements.push((key, PersistentBinding { allocation: allocation.clone(), capacity: bytes }));
+            replacements.push((
+                key,
+                PersistentBinding {
+                    allocation: allocation.clone(),
+                    capacity: bytes,
+                },
+            ));
         }
         let identity = allocation.identity();
-        let permit = allocation.try_acquire(true).expect("fresh reached backing cannot have another access owner");
+        let permit = allocation
+            .try_acquire(true)
+            .expect("fresh reached backing cannot have another access owner");
         resources.declare_private(identity);
         resources.install_private(identity, permit);
         physical.insert(requirement.resource, allocation);
     }
     let selected = node.selection.selected.clone();
-    let requirements = node.private_resources.iter().map(|requirement| (requirement.resource, requirement.clone())).collect();
+    let requirements = node
+        .private_resources
+        .iter()
+        .map(|requirement| (requirement.resource, requirement.clone()))
+        .collect();
     let mut span = Timed::start("seismic.workflow.reached-admit", Vec::new());
-    let (mut staged, outputs) = stage_planned(&selected.executable, node, &requirements, physical, &mut span, 0)
-        .map_err(CallError::Execution)?;
+    let (mut staged, outputs) = stage_planned(
+        &selected.executable,
+        node,
+        &requirements,
+        physical,
+        &mut span,
+        0,
+    )
+    .map_err(CallError::Execution)?;
     for binding in &mut staged.buffers {
         if let PhysicalBufferBinding::Bound { allocation, .. } = binding {
-            let backing = physical.values().find(|backing| backing.identity() == *allocation)
+            let backing = physical
+                .values()
+                .find(|backing| backing.identity() == *allocation)
                 .expect("staged backing came from the physical resource map");
             *allocation = resources.slot_for(backing);
         }
     }
     // No fallible preparation remains for this node. Before this point an
     // error drops fresh backing while preserving every claimed prior value.
-    for (key, binding) in replacements { resources.install_preclaimed(key, binding); }
-    Ok(AdmittedNode::new(AdmittedCommand::new(selected, staged), outputs))
+    for (key, binding) in replacements {
+        resources.install_preclaimed(key, binding);
+    }
+    Ok(AdmittedNode::new(
+        AdmittedCommand::new(selected, staged),
+        outputs,
+    ))
 }
 
 impl<T: TargetFamily, E: NativeExecutor<T>> WorkflowGraphDraft<T, E> {
@@ -489,6 +683,29 @@ impl<T: TargetFamily, E: NativeExecutor<T>> WorkflowGraphDraft<T, E> {
     ) -> Result<PendingWorkflowResults, crate::api::WorkflowError> {
         if !Arc::ptr_eq(&kernel.prepared.device, &self.device) {
             return Err(crate::api::WorkflowError::CrossWorkflowResult);
+        }
+        for (parameter, argument) in kernel
+            .prepared
+            .kernel
+            .schema()
+            .parameters()
+            .iter()
+            .zip(args.arguments())
+        {
+            if let (
+                ParameterKind::Tensor {
+                    access: TensorAccess::Owned | TensorAccess::Mutable,
+                    ..
+                },
+                EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::External(tensor)),
+            ) = (&parameter.kind, argument)
+            {
+                if tensor.allocation().storage().read_only() {
+                    return Err(crate::api::WorkflowError::ReadOnlyTensor {
+                        parameter: parameter.name.clone(),
+                    });
+                }
+            }
         }
         for argument in args.arguments() {
             let reference = match argument {
@@ -548,9 +765,10 @@ impl<T: TargetFamily, E: NativeExecutor<T>> WorkflowGraphDraft<T, E> {
                     EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::Result(reference)) => {
                         ArgumentBinding::Result(output_ref(reference))
                     }
-                    EncodedWorkflowArgument::Tensor(
-                        WorkflowTensorArgument::ResultView { result, operations },
-                    ) => ArgumentBinding::ResultView {
+                    EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::ResultView {
+                        result,
+                        operations,
+                    }) => ArgumentBinding::ResultView {
                         result: output_ref(result),
                         operations,
                     },
@@ -566,9 +784,18 @@ impl<T: TargetFamily, E: NativeExecutor<T>> WorkflowGraphDraft<T, E> {
             }
             let target = InvocationTarget::Policy(queued.kernel);
             target.persistent_inventory(&mut keys);
-            pending.push_back(QueuedInvocation { target, bindings, prepared: None });
+            pending.push_back(QueuedInvocation {
+                target,
+                bindings,
+                prepared: None,
+            });
         }
-        let mut continuation = WorkflowContinuation { planner, queued: pending, physical, next_node: 0 };
+        let mut continuation = WorkflowContinuation {
+            planner,
+            queued: pending,
+            physical,
+            next_node: 0,
+        };
         assert!(continuation.bind_next()?);
         Ok(BoundWorkflowGraph {
             continuation,
@@ -581,12 +808,21 @@ impl<T: TargetFamily, E: NativeExecutor<T>> WorkflowGraphDraft<T, E> {
 
 impl<T: TargetFamily, E: NativeExecutor<T>> BoundWorkflowGraph<T, E> {
     pub(crate) fn initial_allocation_bytes(&self) -> u64 {
-        self.continuation.planner.bound_node(0).expect("bound first node").private_resources.iter()
-            .try_fold(0u64, |total, requirement| total.checked_add(requirement.acquisition.initial_bytes().unwrap_or(0)))
+        self.continuation
+            .planner
+            .bound_node(0)
+            .expect("bound first node")
+            .private_resources
+            .iter()
+            .try_fold(0u64, |total, requirement| {
+                total.checked_add(requirement.acquisition.initial_bytes().unwrap_or(0))
+            })
             .unwrap_or(u64::MAX)
     }
 
-    pub(crate) fn set_allocation_limit(&mut self, limit: u64) { self.allocation_limit = limit; }
+    pub(crate) fn set_allocation_limit(&mut self, limit: u64) {
+        self.allocation_limit = limit;
+    }
 
     pub(crate) fn admit(self) -> Result<AdmittedRun<T, E>, CallError> {
         let limit = self.allocation_limit;
@@ -594,17 +830,29 @@ impl<T: TargetFamily, E: NativeExecutor<T>> BoundWorkflowGraph<T, E> {
     }
 
     fn admit_with_limit(mut self, limit: u64) -> Result<AdmittedRun<T, E>, CallError> {
-        let mut resources = preclaim_resources(&self.device, &self.keys, &self.continuation.physical)?;
+        let mut resources =
+            preclaim_resources(&self.device, &self.keys, &self.continuation.physical)?;
         resources.set_reached_budget(limit);
-        let submission = self.device.begin_submission().map_err(CallError::Execution)?;
-        let first = self.continuation.next(&self.device, &mut resources)?.expect("first node is already bound");
+        let submission = self
+            .device
+            .begin_submission()
+            .map_err(CallError::Execution)?;
+        let first = self
+            .continuation
+            .next(&self.device, &mut resources)?
+            .expect("first node is already bound");
         let identity = self.continuation.planner.identity.raw();
-        let mut run = AdmittedRun::new(identity, self.device.service_arc(), self.device,
-            vec![first], resources, submission);
+        let mut run = AdmittedRun::new(
+            identity,
+            self.device.service_arc(),
+            self.device,
+            vec![first],
+            resources,
+            submission,
+        );
         run.set_continuation(self.continuation);
         Ok(run)
     }
-
 }
 
 pub(crate) fn call_one<T: TargetFamily + 'static, E: NativeExecutor<T>>(
@@ -661,15 +909,25 @@ pub(crate) fn admit_trial<T: TargetFamily, E: NativeExecutor<T>>(
         .into_iter()
         .map(ArgumentBinding::External)
         .collect();
-    let target = InvocationTarget::Candidate { device: device.clone(), selected };
+    let target = InvocationTarget::Candidate {
+        device: device.clone(),
+        selected,
+    };
     let mut keys = BTreeMap::new();
     target.persistent_inventory(&mut keys);
     planner.push(target, bindings).map_err(plan_error)?;
     BoundWorkflowGraph {
-        continuation: WorkflowContinuation { planner, queued: std::collections::VecDeque::new(), physical, next_node: 0 },
-        keys, allocation_limit, device: device.clone(),
-    }.admit_with_limit(allocation_limit)
-
+        continuation: WorkflowContinuation {
+            planner,
+            queued: std::collections::VecDeque::new(),
+            physical,
+            next_node: 0,
+        },
+        keys,
+        allocation_limit,
+        device: device.clone(),
+    }
+    .admit_with_limit(allocation_limit)
 }
 
 fn output_ref(reference: crate::api::kernel::WorkflowResultRef) -> OutputRef {
@@ -759,7 +1017,9 @@ fn stage_planned<T: TargetFamily, E: NativeExecutor<T>>(
                     base_offset: tensor.range.offset,
                     accessible_bytes: tensor.range.len,
                     tensor: Some(seismic_compiler::executable::RuntimeTensorGeometry {
-                        representation: tensor.representation, extents: tensor.extents.clone(), strides: tensor.strides.clone(),
+                        representation: tensor.representation,
+                        extents: tensor.extents.clone(),
+                        strides: tensor.strides.clone(),
                     }),
                 });
             }
@@ -767,7 +1027,10 @@ fn stage_planned<T: TargetFamily, E: NativeExecutor<T>>(
                 let local = &node.private_resources[slot];
                 let requirement = requirements.get(&local.resource).unwrap_or(local);
                 if requirement.acquisition == Acquisition::ReachedPrivate {
-                    buffers.push(PhysicalBufferBinding::Reached { slot: fresh_allocation_identity(), alignment: requirement.alignment });
+                    buffers.push(PhysicalBufferBinding::Reached {
+                        slot: fresh_allocation_identity(),
+                        alignment: requirement.alignment,
+                    });
                     continue;
                 }
                 let allocation = physical
@@ -782,7 +1045,10 @@ fn stage_planned<T: TargetFamily, E: NativeExecutor<T>>(
                     allocation: allocation.identity(),
                     base_offset: 0,
                     tensor: None,
-                    accessible_bytes: requirement.acquisition.initial_bytes().expect("initial resource requirement"),
+                    accessible_bytes: requirement
+                        .acquisition
+                        .initial_bytes()
+                        .expect("initial resource requirement"),
                 });
             }
         }
@@ -810,58 +1076,66 @@ fn close_admitted_outputs<T: TargetFamily, E: NativeExecutor<T>>(
     descriptors
         .iter()
         .zip(&executable.bindings().results)
-        .map(|(descriptor, (path, binding))| match (descriptor, binding) {
-            (
-                crate::driver::workflow::ValueDescriptor::PendingTensor { .. },
-                ExecutableResultBinding::Buffer { .. },
-            ) => Ok(AdmittedOutput::PendingTensor { path: path.clone() }),
-            (
-                crate::driver::workflow::ValueDescriptor::Tensor(tensor),
-                ExecutableResultBinding::Buffer { .. },
-            ) => {
-                let allocation = physical.get(&tensor.resource).cloned().ok_or_else(|| {
-                    ExecutionError::AllocationFailed(
-                        "bound output descriptor has no admitted allocation".to_owned(),
-                    )
-                })?;
-                Ok(AdmittedOutput::Tensor {
-                    allocation,
-                    byte_offset: tensor.range.offset,
-                    byte_len: tensor.range.len,
-                    representation: tensor.representation,
-                    extents: tensor.extents.clone(),
-                    strides: tensor.strides.clone(),
-                })
-            }
-            (
-                crate::driver::workflow::ValueDescriptor::Scalar(ScalarDescriptor::DeviceProduced),
-                ExecutableResultBinding::Scalar { slot },
-            ) => Ok(AdmittedOutput::Scalar(match slot.kind() {
-                seismic_ir::repr::ScalarKind::Scalar(dtype) => AdmittedScalarOutput::Value {
-                    dtype,
+        .map(
+            |(descriptor, (path, binding))| match (descriptor, binding) {
+                (
+                    crate::driver::workflow::ValueDescriptor::PendingTensor { .. },
+                    ExecutableResultBinding::Buffer { .. },
+                ) => Ok(AdmittedOutput::PendingTensor { path: path.clone() }),
+                (
+                    crate::driver::workflow::ValueDescriptor::Tensor(tensor),
+                    ExecutableResultBinding::Buffer { .. },
+                ) => {
+                    let allocation = physical.get(&tensor.resource).cloned().ok_or_else(|| {
+                        ExecutionError::AllocationFailed(
+                            "bound output descriptor has no admitted allocation".to_owned(),
+                        )
+                    })?;
+                    Ok(AdmittedOutput::Tensor {
+                        allocation,
+                        byte_offset: tensor.range.offset,
+                        byte_len: tensor.range.len,
+                        representation: tensor.representation,
+                        extents: tensor.extents.clone(),
+                        strides: tensor.strides.clone(),
+                    })
+                }
+                (
+                    crate::driver::workflow::ValueDescriptor::Scalar(
+                        ScalarDescriptor::DeviceProduced,
+                    ),
+                    ExecutableResultBinding::Scalar { slot },
+                ) => Ok(AdmittedOutput::Scalar(match slot.kind() {
+                    seismic_ir::repr::ScalarKind::Scalar(dtype) => AdmittedScalarOutput::Value {
+                        dtype,
+                        symbol: slot.symbol(),
+                    },
+                    seismic_ir::repr::ScalarKind::Nat64 => AdmittedScalarOutput::Index {
+                        symbol: slot.symbol(),
+                    },
+                })),
+                (
+                    crate::driver::workflow::ValueDescriptor::Scalar(
+                        ScalarDescriptor::DeviceProduced,
+                    ),
+                    ExecutableResultBinding::Quantity { slot },
+                ) => Ok(AdmittedOutput::Scalar(AdmittedScalarOutput::Index {
                     symbol: slot.symbol(),
-                },
-                seismic_ir::repr::ScalarKind::Nat64 => AdmittedScalarOutput::Index {
-                    symbol: slot.symbol(),
-                },
-            })),
-            (
-                crate::driver::workflow::ValueDescriptor::Scalar(ScalarDescriptor::DeviceProduced),
-                ExecutableResultBinding::Quantity { slot },
-            ) => Ok(AdmittedOutput::Scalar(AdmittedScalarOutput::Index {
-                symbol: slot.symbol(),
-            })),
-            (
-                crate::driver::workflow::ValueDescriptor::Scalar(ScalarDescriptor::DeviceProduced),
-                ExecutableResultBinding::Range { start, end },
-            ) => Ok(AdmittedOutput::Scalar(AdmittedScalarOutput::Range {
-                start: start.symbol(),
-                end: end.symbol(),
-            })),
-            _ => Err(ExecutionError::AllocationFailed(
-                "bound output descriptor kind disagrees with executable result".to_owned(),
-            )),
-        })
+                })),
+                (
+                    crate::driver::workflow::ValueDescriptor::Scalar(
+                        ScalarDescriptor::DeviceProduced,
+                    ),
+                    ExecutableResultBinding::Range { start, end },
+                ) => Ok(AdmittedOutput::Scalar(AdmittedScalarOutput::Range {
+                    start: start.symbol(),
+                    end: end.symbol(),
+                })),
+                _ => Err(ExecutionError::AllocationFailed(
+                    "bound output descriptor kind disagrees with executable result".to_owned(),
+                )),
+            },
+        )
         .collect()
 }
 
@@ -873,15 +1147,20 @@ mod preclaim_tests {
     fn opposite_graph_key_orders_preclaim_without_deadlock_or_unused_capacity() {
         let catalog = crate::devices::Catalog::discover().unwrap();
         let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
-        let crate::backends::OpenedKind::Cpu(opened) = &device.kind else { unreachable!() };
+        let crate::backends::OpenedKind::Cpu(opened) = &device.kind else {
+            unreachable!()
+        };
         let first = opened.allocate_storage(16, 4).unwrap();
         let second = opened.allocate_storage(16, 4).unwrap();
         let table = Arc::new(PersistentTable::new());
         let mut prior = table.claim_growth((0, 0));
-        prior.install_reached(PersistentBinding { allocation: second.clone(), capacity: 16 });
+        prior.install_reached(PersistentBinding {
+            allocation: second.clone(),
+            capacity: 16,
+        });
         drop(prior);
         let baseline = opened.memory_usage().charged;
-        opened.memory.set_limit(Some(baseline)).unwrap();
+        opened.memory.set_limit(Some(baseline));
         let gate = Arc::new(std::sync::Barrier::new(3));
         let (send, receive) = std::sync::mpsc::channel();
         let mut workers = Vec::new();
@@ -898,7 +1177,11 @@ mod preclaim_tests {
                     keys.insert((1, 0, slot), table.clone());
                 }
                 let mut external = BTreeMap::new();
-                let allocations = if reverse { [second, first] } else { [first, second] };
+                let allocations = if reverse {
+                    [second, first]
+                } else {
+                    [first, second]
+                };
                 for (index, allocation) in allocations.into_iter().enumerate() {
                     external.insert(ResourceId::External(index as u64), allocation);
                 }
@@ -914,9 +1197,18 @@ mod preclaim_tests {
             }));
         }
         gate.wait();
-        for _ in 0..2 { receive.recv_timeout(std::time::Duration::from_secs(5)).expect("preclaim admission deadlocked"); }
-        for worker in workers { worker.join().unwrap(); }
-        assert!(matches!(table.preclaim_availability((0, 1)), PersistentAvailability::Grow { old: None }));
+        for _ in 0..2 {
+            receive
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("preclaim admission deadlocked");
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(matches!(
+            table.preclaim_availability((0, 1)),
+            PersistentAvailability::Grow { old: None }
+        ));
         assert_eq!(opened.memory_usage().charged, baseline);
     }
 }

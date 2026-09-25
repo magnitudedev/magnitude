@@ -49,7 +49,9 @@ impl Cursor<'_> {
     fn value(&mut self, kind: u32) -> Option<u64> {
         match kind {
             0 | 1 | 7 => Some(u64::from(self.take(1)[0])),
-            2 | 3 => Some(u64::from(u16::from_le_bytes(self.take(2).try_into().unwrap()))),
+            2 | 3 => Some(u64::from(u16::from_le_bytes(
+                self.take(2).try_into().unwrap(),
+            ))),
             4 | 5 | 6 => Some(u64::from(self.u32())),
             8 => {
                 self.string();
@@ -72,7 +74,10 @@ impl Cursor<'_> {
 impl Gguf {
     fn open(path: &str) -> Self {
         let bytes = fs::read(path).unwrap();
-        let mut cursor = Cursor { bytes: &bytes, at: 0 };
+        let mut cursor = Cursor {
+            bytes: &bytes,
+            at: 0,
+        };
         assert_eq!(cursor.take(4), b"GGUF");
         cursor.u32();
         let count = cursor.u64();
@@ -95,7 +100,11 @@ impl Gguf {
             tensors.insert(name, (kind, dims, offset));
         }
         let data = (cursor.at as u64).div_ceil(alignment) * alignment;
-        Self { data: data as usize, tensors, bytes }
+        Self {
+            data: data as usize,
+            tensors,
+            bytes,
+        }
     }
 
     /// The external format and raw bytes of rows [first, first + rows) of a
@@ -118,7 +127,11 @@ impl Gguf {
         };
         let row_bytes = k / format.block_values() * block_bytes;
         let start = self.data + offset + first * row_bytes;
-        (format, k, self.bytes[start..start + rows * row_bytes].to_vec())
+        (
+            format,
+            k,
+            self.bytes[start..start + rows * row_bytes].to_vec(),
+        )
     }
 
     fn f32s(&self, name: &str) -> Vec<f32> {
@@ -126,18 +139,33 @@ impl Gguf {
         assert_eq!(*kind, 0, "{name} is not F32");
         let n = dims.iter().product::<u64>() as usize;
         let start = self.data + offset;
-        self.bytes[start..start + 4 * n].chunks_exact(4).map(|w| f32::from_le_bytes(w.try_into().unwrap())).collect()
+        self.bytes[start..start + 4 * n]
+            .chunks_exact(4)
+            .map(|w| f32::from_le_bytes(w.try_into().unwrap()))
+            .collect()
     }
 }
 
 /// A resident mma16 weight from raw GGUF rows.
-fn real_weight(device: &seismic::Device, format: Format, rows: usize, k: usize, external: &[u8]) -> Weight {
+fn real_weight(
+    device: &seismic::Device,
+    format: Format,
+    rows: usize,
+    k: usize,
+    external: &[u8],
+) -> Weight {
     let shape = [rows as u64, k as u64];
     let resident = format.resident();
-    let bytes = resident.repack_host(Element::named(format.external()).unwrap(), &shape, external).unwrap();
+    let bytes = resident
+        .repack_host(Element::named(format.external()).unwrap(), &shape, external)
+        .unwrap();
     let values = resident.decode_host(&shape, &bytes).unwrap();
     let tensor = Tensor::from_host(device, resident, &shape, &bytes).unwrap();
-    Weight { tensor, values, bytes }
+    Weight {
+        tensor,
+        values,
+        bytes,
+    }
 }
 
 /// Token-embedding rows as a residual, with `outliers` channels scaled up the
@@ -145,9 +173,19 @@ fn real_weight(device: &seismic::Device, format: Format, rows: usize, k: usize, 
 fn residual(gguf: &Gguf, m: usize, outliers: bool) -> Vec<f32> {
     let (format, k, external) = gguf.rows("token_embd.weight", 1000, m);
     let packet = Element::named(format.representation()).unwrap();
-    let bytes = packet.repack_host(Element::named(format.external()).unwrap(), &[m as u64, k as u64], &external).unwrap();
-    let mut values: Vec<f32> =
-        packet.decode_host(&[m as u64, k as u64], &bytes).unwrap().into_iter().map(|v| v as f32 * 40.0).collect();
+    let bytes = packet
+        .repack_host(
+            Element::named(format.external()).unwrap(),
+            &[m as u64, k as u64],
+            &external,
+        )
+        .unwrap();
+    let mut values: Vec<f32> = packet
+        .decode_host(&[m as u64, k as u64], &bytes)
+        .unwrap()
+        .into_iter()
+        .map(|v| v as f32 * 40.0)
+        .collect();
     if outliers {
         for row in 0..m {
             for channel in [7usize, 911, 1700, 2301] {
@@ -167,12 +205,23 @@ struct Error {
 fn relative(a: &[f64], b: &[f64], reference: &[f64]) -> Error {
     let scale = (reference.iter().map(|v| v * v).sum::<f64>() / reference.len() as f64).sqrt();
     let rms = (a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f64>() / a.len() as f64).sqrt();
-    let max = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
-    Error { rms: rms / scale, max: max / scale }
+    let max = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f64::max);
+    Error {
+        rms: rms / scale,
+        max: max / scale,
+    }
 }
 
 fn mapping_label(mapping: Mapping, rows: usize) -> String {
-    let path = if mapping.quantizes(rows) { "int8" } else { "16-bit" };
+    let path = if mapping.quantizes(rows) {
+        "int8"
+    } else {
+        "16-bit"
+    };
     let kernel = if rows <= GEMV_ROWS {
         "gemv"
     } else if rows <= SMALL_GEMM_ROWS {
@@ -196,11 +245,29 @@ fn real_4b_projections_match_their_operand_emulation() {
     // Real matrices as the gate and up streams: (gate, first row, up, first
     // row, rows).
     let pairs = [
-        ("blk.0.ffn_gate.weight", 0usize, "blk.0.ffn_up.weight", 0usize, 512usize),
-        ("blk.0.attn_qkv.weight", 512, "blk.0.attn_qkv.weight", 6144, 512),
+        (
+            "blk.0.ffn_gate.weight",
+            0usize,
+            "blk.0.ffn_up.weight",
+            0usize,
+            512usize,
+        ),
+        (
+            "blk.0.attn_qkv.weight",
+            512,
+            "blk.0.attn_qkv.weight",
+            6144,
+            512,
+        ),
         ("token_embd.weight", 20000, "token_embd.weight", 90000, 512),
         ("blk.0.ssm_alpha.weight", 0, "blk.0.ssm_beta.weight", 0, 32),
-        ("blk.3.ffn_gate.weight", 4096, "blk.3.ffn_up.weight", 4096, 512),
+        (
+            "blk.3.ffn_gate.weight",
+            4096,
+            "blk.3.ffn_up.weight",
+            4096,
+            512,
+        ),
     ];
     let mut failures = Vec::new();
     for (gate_name, gate_first, up_name, up_first, f) in pairs {
@@ -218,15 +285,17 @@ fn real_4b_projections_match_their_operand_emulation() {
                 let out_rows = i32_tensor(&device, &[o as u64], &(0..o as i32).collect::<Vec<_>>());
                 let (g_exact, _) = project(&exact, &gate.values, o, f, h);
                 let (u_exact, _) = project(&exact, &up.values, o, f, h);
-                let reference: Vec<f64> = (0..o * f).map(|i| silu(g_exact[i]) * u_exact[i]).collect();
+                let reference: Vec<f64> =
+                    (0..o * f).map(|i| silu(g_exact[i]) * u_exact[i]).collect();
                 for &mapping in mappings(o) {
                     let (x, _) = operand_rows(&exact, h, mapping);
                     let (g, _) = project(&x, &gate.values, o, f, h);
                     let (u, _) = project(&x, &up.values, o, f, h);
                     // The operand path and the epilogue's bf16 roundings.
                     let round = |v: f64| f64::from(bf16_round(v as f32));
-                    let emulated: Vec<f64> =
-                        (0..o * f).map(|i| round(round(silu(round(g[i]))) * round(u[i]))).collect();
+                    let emulated: Vec<f64> = (0..o * f)
+                        .map(|i| round(round(silu(round(g[i]))) * round(u[i])))
+                        .collect();
                     let kernel = dense_expand::native_for_device_with(
                         &device,
                         dense_expand::Elements {
@@ -235,7 +304,11 @@ fn real_4b_projections_match_their_operand_emulation() {
                             UW: up_format.resident(),
                             A: Element::bf16(),
                         },
-                        &mapping.params(NativeSpecialization::new().with_static("H", h as u64).with_static("F", f as u64)),
+                        &mapping.dense_expand_params(
+                            NativeSpecialization::new()
+                                .with_static("H", h as u64)
+                                .with_static("F", f as u64),
+                        ),
                     )
                     .unwrap();
                     let actual: Vec<f64> = read_bf16(
@@ -273,13 +346,23 @@ fn real_4b_projections_match_their_operand_emulation() {
                     // on the 16-bit GEMM the weights' dequantization to bf16
                     // (2^-9 of each weight, not emulated; 1.9-5.0e-3 of the
                     // output RMS on these rows).
-                    let limit = if o > GEMV_ROWS && !mapping.quantizes(o) { 8e-3 } else { 1e-3 };
+                    let limit = if o > GEMV_ROWS && !mapping.quantizes(o) {
+                        8e-3
+                    } else {
+                        1e-3
+                    };
                     if departure.rms > limit {
-                        failures.push(format!("{gate_name} outliers={outliers} O={o} {}", mapping_label(mapping, o)));
+                        failures.push(format!(
+                            "{gate_name} outliers={outliers} O={o} {}",
+                            mapping_label(mapping, o)
+                        ));
                     }
                 }
             }
         }
     }
-    assert!(failures.is_empty(), "paths departing from their emulation: {failures:?}");
+    assert!(
+        failures.is_empty(),
+        "paths departing from their emulation: {failures:?}"
+    );
 }

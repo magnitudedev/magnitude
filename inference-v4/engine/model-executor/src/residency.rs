@@ -4,19 +4,29 @@
 //! their logical descriptor, imports them through the once-prepared execution
 //! path, and owns the sole cache of resulting device tensors.
 
+use crate::programs::native_import::NativeImportProgram;
 use crate::programs::ProgramSubmission;
+use crate::resources::ImportWindow;
 use crate::{resident_element, source_element};
 use crate::{
     AllocationError, ExecutionPlan, ImportLaunchInputs, ImportProgram, InvariantError,
     ResidentWeightSlot, ResourceAllocator, ResourceDomainId, SubmitError, ValidatedImportLaunch,
+    WeightPlan, WeightStorageIdentity,
 };
 use magnitude_artifacts::{
     gguf::{Encoding, GgufArtifact},
     Error as ArtifactError, FileSource,
 };
 use magnitude_model_contracts::WeightDescriptor;
-use seismic::{DType, Device, Element, Tensor};
-use std::{cell::RefCell, collections::HashMap, fmt, rc::Rc, sync::Arc};
+use seismic::{DType, Device, Element, NativeTensorBatch, Tensor, TraceDetail, TracedSubmission};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashMap, HashSet},
+    fmt,
+    rc::Rc,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 #[derive(Debug)]
 pub enum WeightImportError {
@@ -128,6 +138,18 @@ impl ImportArtifactTensor {
 }
 
 impl Stored {
+    pub(crate) fn file_range(&self) -> (&Arc<FileSource>, u64, u64) {
+        match self {
+            Self::Dense(tensor) => (&tensor.source, tensor.offset, tensor.nbytes),
+            Self::GgmlBlocks {
+                source,
+                offset,
+                nbytes,
+                ..
+            } => (source, *offset, *nbytes),
+        }
+    }
+
     pub fn shape(&self) -> &[u64] {
         match self {
             Self::Dense(tensor) => &tensor.shape,
@@ -209,6 +231,38 @@ struct ResidencyKey {
     resident: Element,
 }
 
+enum ImportPreparation {
+    Resident(ResidentWeight),
+    Pending {
+        key: ResidencyKey,
+        descriptor: WeightDescriptor,
+        launch: ValidatedImportLaunch,
+        program: NativeImportProgram,
+    },
+}
+
+struct OrderedImport {
+    plan: WeightPlan,
+    source: Arc<FileSource>,
+    offset: u64,
+    end: u64,
+    target: DType,
+}
+
+/// Coarse host costs of the most recent mapped component import. The caller
+/// can use these alongside its total import duration to identify work outside
+/// mapping, preparation, submission, waiting, and publication.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MappedImportReport {
+    pub windows: usize,
+    pub weights: usize,
+    pub mapping: Duration,
+    pub preparing: Duration,
+    pub submitting: Duration,
+    pub waiting: Duration,
+    pub publishing: Duration,
+}
+
 /// Sole cache and importer for one planned device. Resident components are
 /// assembled from this store before their numerical programs are bound.
 pub struct ResidencyStore {
@@ -217,6 +271,7 @@ pub struct ResidencyStore {
     execution: ExecutionPlan,
     domain: ResourceDomainId,
     resident: HashMap<ResidencyKey, ResidentWeight>,
+    mapped_import: MappedImportReport,
 }
 
 impl ResidencyStore {
@@ -240,6 +295,7 @@ impl ResidencyStore {
             execution,
             domain,
             resident: HashMap::new(),
+            mapped_import: MappedImportReport::default(),
         })
     }
 
@@ -254,6 +310,21 @@ impl ResidencyStore {
     }
     pub fn is_empty(&self) -> bool {
         self.resident.is_empty()
+    }
+
+    /// Charges of completed resident imports held by this cache. Tied roles
+    /// share one key and one allocation; a failed component import may leave
+    /// a partial set, which this observation still counts exactly.
+    pub fn resident_bytes(&self) -> Result<u64, &'static str> {
+        self.resident.values().try_fold(0u64, |bytes, weight| {
+            bytes
+                .checked_add(weight.tensor.storage_bytes())
+                .ok_or("resident cache charge overflows")
+        })
+    }
+
+    pub fn mapped_import_report(&self) -> MappedImportReport {
+        self.mapped_import
     }
 
     /// Imports a dense weight into the element its admitted plan chose.
@@ -285,6 +356,36 @@ impl ResidencyStore {
         descriptor: &WeightDescriptor,
         target: DType,
     ) -> Result<ResidentWeight, WeightImportError> {
+        let (key, descriptor, launch, mut program) =
+            match self.prepare_gguf(artifact, descriptor, target, None)? {
+                ImportPreparation::Resident(weight) => return Ok(weight),
+                ImportPreparation::Pending {
+                    key,
+                    descriptor,
+                    launch,
+                    program,
+                } => (key, descriptor, launch, program),
+            };
+        let submission = program
+            .submit(launch)
+            .map_err(|(error, _launch)| WeightImportError::Submit(error))?;
+        let completed = submission.finish().map_err(WeightImportError::Completion)?;
+        let (_, destination) = completed.into_parts();
+        let weight = ResidentWeight {
+            descriptor,
+            tensor: destination.into_tensor(),
+        };
+        self.resident.insert(key, weight.clone());
+        Ok(weight)
+    }
+
+    fn prepare_gguf(
+        &self,
+        artifact: &GgufArtifact,
+        descriptor: &WeightDescriptor,
+        target: DType,
+        window: Option<&ImportWindow>,
+    ) -> Result<ImportPreparation, WeightImportError> {
         let planned = self
             .execution
             .weights()
@@ -345,15 +446,24 @@ impl ResidencyStore {
                     "resident tensor has a conflicting logical descriptor",
                 ));
             }
-            return Ok(weight.clone());
+            return Ok(ImportPreparation::Resident(weight.clone()));
         }
-        let tensor = Tensor::zeros(&self.device, planned.resident, &planned.shape)
-            .map_err(|error| WeightImportError::Device(error.to_string()))?;
+        let tensor = if self.device.backend() == seismic::BackendName::Metal {
+            // SAFETY: the attested import's only result is this tensor. Both
+            // Metal import kernels write every physical byte, including the
+            // packed layout's row and plane padding, before submission returns.
+            unsafe { Tensor::uninitialized(&self.device, planned.resident, &planned.shape) }
+        } else {
+            Tensor::zeros(&self.device, planned.resident, &planned.shape)
+        }
+        .map_err(|error| WeightImportError::Device(error.to_string()))?;
         let destination = ResidentWeightSlot::new(&planned, &self.device, tensor)
             .map_err(WeightImportError::Invariant)?;
         let workspace = ResourceAllocator::import_workspace(
             &self.execution,
             &planned,
+            stored,
+            window,
             &self.device,
             self.domain.clone(),
         )
@@ -363,21 +473,163 @@ impl ResidencyStore {
             &self.domain,
         )
         .map_err(|(_, error)| WeightImportError::Invariant(error))?;
-        let mut program = self
+        let program = self
             .programs
             .bind_import(&planned)
             .map_err(WeightImportError::Attestation)?;
-        let submission = program
-            .submit(launch)
-            .map_err(|(error, _launch)| WeightImportError::Submit(error))?;
-        let completed = submission.finish().map_err(WeightImportError::Completion)?;
-        let (_, destination) = completed.into_parts();
-        let weight = ResidentWeight {
+        Ok(ImportPreparation::Pending {
+            key,
             descriptor: descriptor.clone(),
-            tensor: destination.into_tensor(),
-        };
-        self.resident.insert(key, weight.clone());
-        Ok(weight)
+            launch,
+            program,
+        })
+    }
+
+    /// Import one component in source-file order. Whole adjacent tensors
+    /// share a mapped window and one ordered native submission. Semantic
+    /// assembly below then reads the completed weights from the sole cache.
+    fn preload_component(
+        &mut self,
+        artifact: &GgufArtifact,
+        weights: &[WeightPlan],
+        activation: DType,
+    ) -> Result<(), WeightImportError> {
+        if self.device.backend() != seismic::BackendName::Metal || weights.is_empty() {
+            return Ok(());
+        }
+        let mut seen = HashSet::<WeightStorageIdentity>::new();
+        let mut ordered = Vec::new();
+        for plan in weights {
+            if !seen.insert(plan.storage_identity()) {
+                continue;
+            }
+            let tensor = ImportArtifactTensor::from_gguf(artifact, &plan.descriptor)?;
+            let (source, offset, length) = tensor.stored().file_range();
+            let end = offset
+                .checked_add(length)
+                .ok_or_else(|| invalid("source range overflows"))?;
+            ordered.push(OrderedImport {
+                plan: plan.clone(),
+                source: source.clone(),
+                offset,
+                end,
+                target: plan.resident.dtype().unwrap_or(activation),
+            });
+        }
+        ordered.sort_by_key(|item| item.offset);
+        let largest = ordered
+            .iter()
+            .map(|item| item.plan.source_bytes)
+            .max()
+            .unwrap_or(0);
+        let mut report = MappedImportReport::default();
+        // Measurement only: timed Metal encoders change the device path, so
+        // these numbers attribute work but are not production load timings.
+        let trace_window = std::env::var("MAGNITUDE_TRACE_IMPORT_WINDOW")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok());
+        let mut first = 0;
+        while first < ordered.len() {
+            let source = ordered[first].source.clone();
+            let start = ordered[first].offset;
+            let mut end = ordered[first].end;
+            let mut last = first + 1;
+            while last < ordered.len()
+                && Arc::ptr_eq(&source, &ordered[last].source)
+                && ordered[last].end.saturating_sub(start) <= largest
+            {
+                end = end.max(ordered[last].end);
+                last += 1;
+            }
+            let mapping = Instant::now();
+            let window = ImportWindow::new(&self.execution, &self.device, source, start, end)
+                .map_err(WeightImportError::Allocation)?;
+            report.mapping += mapping.elapsed();
+            report.windows += 1;
+            let mut batch = NativeTensorBatch::new(&self.device);
+            let mut pending = Vec::new();
+            let mut traced_weights = Vec::new();
+            let preparing = Instant::now();
+            for item in &ordered[first..last] {
+                match self.prepare_gguf(
+                    artifact,
+                    &item.plan.descriptor,
+                    item.target,
+                    Some(&window),
+                )? {
+                    ImportPreparation::Resident(_) => {}
+                    ImportPreparation::Pending {
+                        key,
+                        descriptor,
+                        launch,
+                        program,
+                    } => {
+                        let launch = program
+                            .enqueue(&mut batch, launch)
+                            .map_err(|(error, _)| WeightImportError::Submit(error))?;
+                        if trace_window == Some(report.windows - 1) {
+                            traced_weights.push((
+                                item.plan.descriptor.name.clone(),
+                                item.plan.source.name().to_owned(),
+                                item.plan.source_bytes,
+                            ));
+                        }
+                        pending.push((key, descriptor, launch));
+                    }
+                }
+            }
+            report.preparing += preparing.elapsed();
+            if !pending.is_empty() {
+                report.weights += pending.len();
+                let trace = if trace_window == Some(report.windows - 1) {
+                    match self.device.trace_submissions(TraceDetail::Launches) {
+                        Ok(trace) => Some(trace),
+                        Err(error) => {
+                            eprintln!("magnitude-engine: import trace unavailable: {error}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let submitting = Instant::now();
+                let completion = batch.submit().map_err(|error| {
+                    WeightImportError::Submit(SubmitError::Device(crate::DeviceError::Execution(
+                        error.to_string(),
+                    )))
+                })?;
+                report.submitting += submitting.elapsed();
+                let waiting = Instant::now();
+                completion.wait().map_err(|error| {
+                    WeightImportError::Completion(crate::DeviceError::Execution(error.to_string()))
+                })?;
+                report.waiting += waiting.elapsed();
+                if let Some(trace) = trace {
+                    match trace.collect() {
+                        Ok(submissions) => {
+                            report_timed_import(report.windows - 1, &traced_weights, &submissions)
+                        }
+                        Err(error) => eprintln!("magnitude-engine: import trace failed: {error}"),
+                    }
+                }
+                let publishing = Instant::now();
+                for (key, descriptor, launch) in pending {
+                    let (_, workspace, destination) = launch.into_submission_parts();
+                    drop(workspace);
+                    self.resident.insert(
+                        key,
+                        ResidentWeight {
+                            descriptor,
+                            tensor: destination.into_tensor(),
+                        },
+                    );
+                }
+                report.publishing += publishing.elapsed();
+            }
+            first = last;
+        }
+        self.mapped_import = report;
+        Ok(())
     }
 
     pub fn load_target(
@@ -385,6 +637,13 @@ impl ResidencyStore {
         definition: &magnitude_model_contracts::ModelDefinition,
         package: &magnitude_artifacts::Package,
     ) -> Result<crate::ResidentTarget, crate::ResidencyError> {
+        crate::resident_weights::validate_definition_package(definition, package)?;
+        let weights = self.execution.load().target().to_vec();
+        self.preload_component(
+            package.target(),
+            &weights,
+            crate::resident_weights::activation_dtype(definition.geometry.activation_dtype),
+        )?;
         crate::resident_weights::import_target(definition, package, self)
     }
 
@@ -393,6 +652,14 @@ impl ResidencyStore {
         definition: &magnitude_model_contracts::ModelDefinition,
         package: &magnitude_artifacts::Package,
     ) -> Result<Option<crate::ResidentHead>, crate::ResidencyError> {
+        crate::resident_weights::validate_definition_package(definition, package)?;
+        if let Some(weights) = self.execution.load().head().map(|weights| weights.to_vec()) {
+            self.preload_component(
+                package.target(),
+                &weights,
+                crate::resident_weights::activation_dtype(definition.geometry.activation_dtype),
+            )?;
+        }
         crate::resident_weights::import_optional_head(definition, package, self)
     }
 
@@ -401,7 +668,62 @@ impl ResidencyStore {
         definition: &magnitude_model_contracts::ModelDefinition,
         package: &magnitude_artifacts::Package,
     ) -> Result<Option<crate::ResidentVision>, crate::ResidencyError> {
+        crate::resident_weights::validate_definition_package(definition, package)?;
+        if let (Some(weights), Some(projector)) = (
+            self.execution
+                .load()
+                .vision()
+                .map(|weights| weights.to_vec()),
+            package.projector(),
+        ) {
+            self.preload_component(projector, &weights, DType::F32)?;
+        }
         crate::resident_weights::import_optional_vision(definition, package, self)
+    }
+}
+
+/// Attribution only. Timed encoders add overhead, and one import entry has
+/// one launch today. Keep a mismatch diagnostic rather than affecting load.
+fn report_timed_import(
+    window: usize,
+    weights: &[(String, String, u64)],
+    submissions: &[TracedSubmission],
+) {
+    let launches = submissions
+        .iter()
+        .flat_map(|submission| &submission.launches)
+        .collect::<Vec<_>>();
+    if launches.len() != weights.len() {
+        eprintln!(
+            "magnitude-engine: timed import window {window}: {} launches for {} weights",
+            launches.len(),
+            weights.len()
+        );
+        return;
+    }
+    let mut by_format = BTreeMap::<String, (usize, u64, f64)>::new();
+    let mut slowest = Vec::new();
+    for (launch, (name, format, bytes)) in launches.into_iter().zip(weights) {
+        let seconds = launch.device.map_or(0.0, |(start, end)| end - start);
+        let entry = by_format.entry(format.clone()).or_default();
+        entry.0 += 1;
+        entry.1 += bytes;
+        entry.2 += seconds;
+        slowest.push((seconds, name, format, bytes));
+    }
+    eprintln!("magnitude-engine: timed import window {window} (measurement encoders)");
+    for (format, (count, bytes, seconds)) in by_format {
+        eprintln!(
+            "magnitude-engine: import format={format} weights={count} source_bytes={bytes} device_ms={:.3}",
+            seconds * 1000.0
+        );
+    }
+    slowest.sort_by(|a, b| b.0.total_cmp(&a.0));
+    for (seconds, name, format, bytes) in slowest.into_iter().take(10) {
+        eprintln!(
+            "magnitude-engine: import slow_weight={name} format={format} source_bytes={bytes} device_ms={:.3}",
+            seconds * 1000.0
+        );
     }
 }
 
@@ -418,16 +740,20 @@ type ComponentImport<T> = fn(
 pub struct ComponentLoader<T: Clone> {
     store: RefCell<ResidencyStore>,
     definition: Rc<magnitude_model_contracts::ModelDefinition>,
-    package: Rc<magnitude_artifacts::Package>,
+    package: std::sync::Arc<magnitude_artifacts::Package>,
     import: ComponentImport<T>,
     cached: RefCell<Option<Result<T, Rc<crate::ResidencyError>>>>,
 }
 
 impl<T: Clone> ComponentLoader<T> {
+    pub fn resident_bytes(&self) -> Result<u64, &'static str> {
+        self.store.borrow().resident_bytes()
+    }
+
     fn new(
         store: ResidencyStore,
         definition: Rc<magnitude_model_contracts::ModelDefinition>,
-        package: Rc<magnitude_artifacts::Package>,
+        package: std::sync::Arc<magnitude_artifacts::Package>,
         import: ComponentImport<T>,
     ) -> Self {
         Self {
@@ -462,10 +788,41 @@ impl<T: Clone> ComponentLoader<T> {
 }
 
 impl ComponentLoader<crate::ResidentHead> {
+    /// Drop only imports introduced by the head. Target weights sharing the
+    /// cache stay resident and retain their original storage identity.
+    pub fn unload(&self) {
+        let loaded = matches!(&*self.cached.borrow(), Some(Ok(_)));
+        if loaded {
+            *self.cached.borrow_mut() = None;
+        }
+        let mut store = self.store.borrow_mut();
+        let target = store
+            .execution
+            .load()
+            .target()
+            .iter()
+            .map(|weight| ResidencyKey {
+                artifact: weight.component.identity,
+                name: weight.descriptor.name.clone(),
+                resident: weight.resident,
+            })
+            .collect::<HashSet<_>>();
+        store.resident.retain(|key, _| target.contains(key));
+    }
+
+    pub fn binding_constant_bytes(&self) -> Result<u64, String> {
+        self.store
+            .borrow()
+            .programs
+            .head_graphs()
+            .ok_or("head graph family was not prepared")?
+            .binding_constant_bytes()
+    }
+
     pub fn head(
         store: ResidencyStore,
         definition: Rc<magnitude_model_contracts::ModelDefinition>,
-        package: Rc<magnitude_artifacts::Package>,
+        package: std::sync::Arc<magnitude_artifacts::Package>,
     ) -> Result<Self, WeightImportError> {
         if definition.head.is_none() {
             return Err(invalid(
@@ -482,10 +839,18 @@ impl ComponentLoader<crate::ResidentHead> {
 }
 
 impl ComponentLoader<crate::ResidentVision> {
+    pub fn unload(&self) {
+        let loaded = matches!(&*self.cached.borrow(), Some(Ok(_)));
+        if loaded {
+            *self.cached.borrow_mut() = None;
+        }
+        self.store.borrow_mut().resident.clear();
+    }
+
     pub fn vision(
         store: ResidencyStore,
         definition: Rc<magnitude_model_contracts::ModelDefinition>,
-        package: Rc<magnitude_artifacts::Package>,
+        package: std::sync::Arc<magnitude_artifacts::Package>,
     ) -> Result<Self, WeightImportError> {
         if definition.vision.is_none() {
             return Err(invalid(

@@ -82,7 +82,10 @@ fn generated_surface_is_one_dense_import_and_one_exact_repack() {
 
 /// The opened device of `backend`, when this host has one.
 fn device(backend: seismic::BackendName) -> Option<seismic::Device> {
-    seismic::DeviceCatalog::discover().ok()?.open_backend(backend).ok()
+    seismic::DeviceCatalog::discover()
+        .ok()?
+        .open_backend(backend)
+        .ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -106,13 +109,19 @@ fn cuda_dense_import_matches_host_for_all_nine_pairs() {
 #[cfg(target_os = "macos")]
 #[test]
 fn metal_repack_matches_the_registered_conversion_for_every_format_and_layout() {
-    repack_matches_the_registered_conversion(&device(seismic::BackendName::Metal).unwrap(), &[seismic::Layout::Rows16, seismic::Layout::Mma16]);
+    repack_matches_the_registered_conversion(
+        &device(seismic::BackendName::Metal).unwrap(),
+        &[seismic::Layout::Rows16, seismic::Layout::Mma16],
+    );
 }
 
 #[test]
 fn cuda_repack_matches_the_registered_conversion_for_every_format_and_layout() {
     if let Some(device) = device(seismic::BackendName::Cuda) {
-        repack_matches_the_registered_conversion(&device, &[seismic::Layout::Rows16, seismic::Layout::Mma16]);
+        repack_matches_the_registered_conversion(
+            &device,
+            &[seismic::Layout::Rows16, seismic::Layout::Mma16],
+        );
     }
 }
 
@@ -126,7 +135,10 @@ fn vulkan_dense_import_matches_host_for_all_nine_pairs() {
 /// The CPU repacks into both supported row layouts.
 #[test]
 fn cpu_repack_matches_the_registered_conversion_for_every_format() {
-    repack_matches_the_registered_conversion(&device(seismic::BackendName::Cpu).unwrap(), &[seismic::Layout::Rows16, seismic::Layout::Rows8]);
+    repack_matches_the_registered_conversion(
+        &device(seismic::BackendName::Cpu).unwrap(),
+        &[seismic::Layout::Rows16, seismic::Layout::Rows8],
+    );
 }
 
 /// Vulkan repacks into both supported row layouts.
@@ -145,7 +157,10 @@ fn import_specializations(device: &seismic::Device) -> Vec<seismic::NativeSpecia
 
 /// The specializations of an entry whose CPU form declares only `ROWS` over
 /// `rows`; the GPU forms declare none.
-fn row_specializations(device: &seismic::Device, rows: &[u64]) -> Vec<seismic::NativeSpecialization> {
+fn row_specializations(
+    device: &seismic::Device,
+    rows: &[u64],
+) -> Vec<seismic::NativeSpecialization> {
     if device.backend() != seismic::BackendName::Cpu {
         return vec![seismic::NativeSpecialization::new()];
     }
@@ -177,11 +192,12 @@ fn dense_import_matches_host_for_all_nine_pairs(device: &seismic::Device) {
                         E: source_element,
                         U: destination_element,
                     };
-                    let native = import_dense::native_for_device_with(&device, elements, &specialization)
-                        .unwrap()
-                        .call(import_dense::Args { source: &source })
-                        .unwrap()
-                        .value;
+                    let native =
+                        import_dense::native_for_device_with(&device, elements, &specialization)
+                            .unwrap()
+                            .call(import_dense::Args { source: &source })
+                            .unwrap()
+                            .value;
                     assert_eq!(
                         native.read_to_host().unwrap(),
                         repeated(dense_bytes(destination_name, &values)),
@@ -203,22 +219,23 @@ fn repack_matches_the_registered_conversion(device: &seismic::Device, layouts: &
     for (source_name, resident) in FORMATS {
         let source_element = seismic::Element::named(source_name).unwrap();
         let group = source_element.logical_group().unwrap();
-        for shape in [
-            [1, 17, 3 * group],
-            [3, 5, 2 * group - 8],
-            [2, 16, group],
-        ] {
+        for shape in [[1, 17, 3 * group], [3, 5, 2 * group - 8], [2, 16, group]] {
             let length = source_element.canonical_byte_len(&shape).unwrap();
             let bytes = source_bytes(length, shape[1] as u32);
-            let source = seismic::Tensor::from_host(&device, source_element, &shape, &bytes).unwrap();
+            let source =
+                seismic::Tensor::from_host(&device, source_element, &shape, &bytes).unwrap();
             let packet = seismic::Element::stored(resident, seismic::Layout::Packet).unwrap();
             let expected_values = packet
-                .decode_host(&shape, &packet.repack_host(source_element, &shape, &bytes).unwrap())
+                .decode_host(
+                    &shape,
+                    &packet.repack_host(source_element, &shape, &bytes).unwrap(),
+                )
                 .unwrap();
-            for (&layout, specialization) in layouts
-                .iter()
-                .flat_map(|layout| row_specializations(&device, &[16, 64, 8]).into_iter().map(move |rows| (layout, rows)))
-            {
+            for (&layout, specialization) in layouts.iter().flat_map(|layout| {
+                row_specializations(&device, &[16, 64, 8])
+                    .into_iter()
+                    .map(move |rows| (layout, rows))
+            }) {
                 let destination = seismic::Element::stored(resident, layout).unwrap();
                 let native = repack_weight::native_for_device_with(
                     &device,
@@ -233,16 +250,27 @@ fn repack_matches_the_registered_conversion(device: &seismic::Device, layouts: &
                 .unwrap()
                 .value;
                 let actual = native.read_to_host().unwrap();
-                let label = format!("{source_name} -> {} over {shape:?} ({specialization:?})", destination.name());
+                let label = format!(
+                    "{source_name} -> {} over {shape:?} ({specialization:?})",
+                    destination.name()
+                );
                 assert_eq!(
                     actual,
-                    destination.repack_host(source_element, &shape, &bytes).unwrap(),
+                    destination
+                        .repack_host(source_element, &shape, &bytes)
+                        .unwrap(),
                     "{label}"
                 );
                 let values = destination.decode_host(&shape, &actual).unwrap();
                 assert_eq!(
-                    values.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
-                    expected_values.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                    values
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected_values
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
                     "{label}"
                 );
             }

@@ -4,8 +4,8 @@
 
 use super::{BindingSlot, BlockId};
 use crate::identity::OwnerToken;
-use crate::storage::LaunchLocalKind;
 use crate::physical_target::PhysicalDialect;
+use crate::storage::LaunchLocalKind;
 use seismic_lang::expr::{NatExpr, SymbolId};
 use seismic_lang::ids::{CapabilityId, IntrinsicId, RepresentationId};
 use seismic_lang::intrinsics::{AtomicOp, MathOp};
@@ -202,7 +202,8 @@ pub type ClosedDensePlace = ClosedPlace<crate::physical_target::DenseRepresentat
 pub type ClosedPackedPlace = ClosedPlace<crate::physical_target::PackedRepresentationGeometry>;
 pub type ClosedExternalGlobalPlace =
     ClosedGlobalPlace<crate::physical_target::ExternalRepresentationGeometry>;
-pub type ClosedPackedGlobalPlace = ClosedGlobalPlace<crate::physical_target::PackedRepresentationGeometry>;
+pub type ClosedPackedGlobalPlace =
+    ClosedGlobalPlace<crate::physical_target::PackedRepresentationGeometry>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ClosedPlaceWords {

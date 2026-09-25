@@ -9,17 +9,116 @@
 //! The rotary table (the coordinate axis and frequency of every rotated pair)
 //! is a graph constant, bound once with the weights.
 
+use super::draft::GraphDraft;
+use crate::AttentionBinding;
 use crate::{
     native::{AttentionHistoryKernels, AttentionKernels},
     programs::native_constants::GraphConstant,
 };
 use magnitude_model_contracts::RotarySemantics;
 use magnitude_model_kernels::{
-    gated_attention_decode, gated_attention_decode_k8v4, attention_output,
-    gated_attention_prefill, gated_attention_prefill_k8v4, gated_attention_project,
+    attention_output, gated_attention_decode, gated_attention_decode_k8v4, gated_attention_prefill,
+    gated_attention_prefill_k8v4, gated_attention_project,
 };
+use magnitude_model_state::KvCodec;
 use magnitude_model_state::AFFINE_GROUP;
-use seismic::{Element, NativeGraph, NativePort, WorkflowTensor};
+use seismic::{Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
+
+pub(crate) struct AttentionGraphEntries<'a, G: GraphDraft + 'a> {
+    pub project: G::Binding<'a, gated_attention_project::Entry>,
+    pub history: AttentionHistoryEntries<'a, G>,
+    pub output: G::Binding<'a, attention_output::Entry>,
+}
+
+impl<'a, G: GraphDraft + 'a> Copy for AttentionGraphEntries<'a, G> {}
+impl<'a, G: GraphDraft + 'a> Clone for AttentionGraphEntries<'a, G> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+pub(crate) enum AttentionHistoryEntries<'a, G: GraphDraft + 'a> {
+    Dense {
+        decode: G::Binding<'a, gated_attention_decode::Entry>,
+        prefill: G::Binding<'a, gated_attention_prefill::Entry>,
+    },
+    AffineK8V4 {
+        decode: G::Binding<'a, gated_attention_decode_k8v4::Entry>,
+        prefill: G::Binding<'a, gated_attention_prefill_k8v4::Entry>,
+    },
+}
+
+impl<'a, G: GraphDraft + 'a> Copy for AttentionHistoryEntries<'a, G> {}
+impl<'a, G: GraphDraft + 'a> Clone for AttentionHistoryEntries<'a, G> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a> From<&'a AttentionKernels> for AttentionGraphEntries<'a, NativeGraph> {
+    fn from(kernels: &'a AttentionKernels) -> Self {
+        let history = match &kernels.history {
+            AttentionHistoryKernels::Dense { decode, prefill } => {
+                AttentionHistoryEntries::Dense { decode, prefill }
+            }
+            AttentionHistoryKernels::AffineK8V4 { decode, prefill } => {
+                AttentionHistoryEntries::AffineK8V4 { decode, prefill }
+            }
+        };
+        Self {
+            project: &kernels.project,
+            history,
+            output: &kernels.output,
+        }
+    }
+}
+
+/// Entry element assignments from the same program binding used by native
+/// preparation. The checked graph obtains all shapes from the entries.
+pub(crate) struct CheckedAttentionEntries {
+    project: [(&'static str, Element); 5],
+    mix: [(&'static str, Element); 1],
+    output: [(&'static str, Element); 2],
+    history: KvCodec,
+}
+
+impl CheckedAttentionEntries {
+    pub(crate) fn new(binding: AttentionBinding) -> Self {
+        Self {
+            project: [
+                ("NW", binding.norm),
+                ("QW", binding.query_gate),
+                ("KW", binding.key),
+                ("VW", binding.value),
+                ("A", binding.activation),
+            ],
+            mix: [("A", binding.activation)],
+            output: [("OW", binding.output), ("A", binding.activation)],
+            history: binding.history,
+        }
+    }
+
+    pub(crate) fn entries(&self) -> Result<AttentionGraphEntries<'_, NativeGraphMetadata>, String> {
+        let history = match self.history {
+            KvCodec::Dense => AttentionHistoryEntries::Dense {
+                decode: &self.mix[..],
+                prefill: &self.mix[..],
+            },
+            KvCodec::AffineK8V4 => AttentionHistoryEntries::AffineK8V4 {
+                decode: &self.mix[..],
+                prefill: &self.mix[..],
+            },
+            KvCodec::RotatedK4V4 => {
+                return Err("rotated K4/V4 has no native attention entry".into())
+            }
+        };
+        Ok(AttentionGraphEntries {
+            project: &self.project,
+            history,
+            output: &self.output,
+        })
+    }
+}
 
 /// Row classes up to this size attend with the decode entry; larger classes
 /// use the prefill entry.
@@ -45,6 +144,7 @@ pub(crate) struct AttentionWeights {
 /// Geometry of one attention block at one graph class.
 pub(crate) struct AttentionBlock<'a> {
     pub rows: u64,
+    pub hidden: u64,
     pub segments: u64,
     pub history_rows: u64,
     pub heads: u64,
@@ -74,9 +174,9 @@ pub(crate) struct AttentionControlPorts {
     pub destinations: NativePort,
 }
 
-pub(crate) fn attention(
-    graph: &mut NativeGraph,
-    kernels: &AttentionKernels,
+pub(crate) fn attention<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    kernels: AttentionGraphEntries<'a, G>,
     weights: &AttentionWeights,
     constants: &mut Vec<GraphConstant>,
     hidden: &WorkflowTensor,
@@ -90,7 +190,14 @@ pub(crate) fn attention(
     let group = block.heads / block.kv_heads;
     let projected = graph
         .enqueue(
-            &kernels.project,
+            kernels.project,
+            &[
+                ("M", block.rows),
+                ("D", block.hidden),
+                ("KV", block.kv_heads),
+                ("G", group),
+                ("W", block.width),
+            ],
             gated_attention_project::WorkflowArgs {
                 hidden: hidden.into(),
                 input_norm: (&weights.input_norm).into(),
@@ -111,16 +218,13 @@ pub(crate) fn attention(
         ("S", block.width - 2 * pairs),
         ("R", block.segments),
     ];
-    let input = |graph: &mut NativeGraph, name: &str| {
-        match &kernels.history {
-            AttentionHistoryKernels::Dense { decode, .. } => {
-                graph.input_for(decode, name, &dimensions)
-            }
-            AttentionHistoryKernels::AffineK8V4 { decode, .. } => {
-                graph.input_for(decode, name, &dimensions)
-            }
+    let input = |graph: &mut G, name: &str| match &kernels.history {
+        AttentionHistoryEntries::Dense { decode, .. } => {
+            graph.input_for(*decode, name, &dimensions)
         }
-        .map_err(|error| error.to_string())
+        AttentionHistoryEntries::AffineK8V4 { decode, .. } => {
+            graph.input_for(*decode, name, &dimensions)
+        }
     };
     let controls = AttentionControlPorts {
         coordinates: input(graph, "coordinates")?,
@@ -131,16 +235,14 @@ pub(crate) fn attention(
     let components = GraphConstant::i32(graph, &rotary_components(block.rotary)?)?;
     let frequencies = GraphConstant::f32(graph, &rotary_frequencies(block.rotary))?;
     let mut plane = |element: Element, elements: u64| {
-        graph
-            .port(element, &[block.history_rows, block.kv_heads, elements])
-            .map_err(|error| error.to_string())
+        graph.port(element, &[block.history_rows, block.kv_heads, elements])
     };
     let mut planes = match &kernels.history {
-        AttentionHistoryKernels::Dense { .. } => vec![
+        AttentionHistoryEntries::Dense { .. } => vec![
             plane(block.activation, block.width)?,
             plane(block.activation, block.width)?,
         ],
-        AttentionHistoryKernels::AffineK8V4 { .. } => vec![
+        AttentionHistoryEntries::AffineK8V4 { .. } => vec![
             plane(Element::u32(), block.width / 4)?,
             plane(Element::f16(), affine_coefficients(block.width))?,
             plane(Element::u32(), block.width / 8)?,
@@ -156,7 +258,8 @@ pub(crate) fn attention(
             };
             graph
                 .enqueue(
-                    $kernel,
+                    *$kernel,
+                    &dimensions,
                     $module::WorkflowArgs {
                         query_gate: (&projected.r0).into(),
                         key: (&projected.r1).into(),
@@ -174,19 +277,21 @@ pub(crate) fn attention(
                         scale,
                     },
                 )
-                .map_err(|error| error.to_string())?
+                ?
                 .value
         }};
     }
     let decode = block.rows <= DECODE_ROWS;
     let gated = match &kernels.history {
-        AttentionHistoryKernels::Dense { decode: kernel, .. } if decode => {
+        AttentionHistoryEntries::Dense { decode: kernel, .. } if decode => {
             mix!(kernel, gated_attention_decode, history_key, history_value)
         }
-        AttentionHistoryKernels::Dense { prefill: kernel, .. } => {
+        AttentionHistoryEntries::Dense {
+            prefill: kernel, ..
+        } => {
             mix!(kernel, gated_attention_prefill, history_key, history_value)
         }
-        AttentionHistoryKernels::AffineK8V4 { decode: kernel, .. } if decode => mix!(
+        AttentionHistoryEntries::AffineK8V4 { decode: kernel, .. } if decode => mix!(
             kernel,
             gated_attention_decode_k8v4,
             history_key_codes,
@@ -194,7 +299,9 @@ pub(crate) fn attention(
             history_value_codes,
             history_value_coefficients
         ),
-        AttentionHistoryKernels::AffineK8V4 { prefill: kernel, .. } => mix!(
+        AttentionHistoryEntries::AffineK8V4 {
+            prefill: kernel, ..
+        } => mix!(
             kernel,
             gated_attention_prefill_k8v4,
             history_key_codes,
@@ -205,7 +312,13 @@ pub(crate) fn attention(
     };
     let mixed = graph
         .enqueue(
-            &kernels.output,
+            kernels.output,
+            &[
+                ("M", block.rows),
+                ("D", block.hidden),
+                ("Q", block.heads),
+                ("W", block.width),
+            ],
             attention_output::WorkflowArgs {
                 hidden: hidden.into(),
                 gated: (&gated).into(),

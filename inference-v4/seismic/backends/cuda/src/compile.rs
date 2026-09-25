@@ -135,7 +135,9 @@ fn layout_metadata_bytes(layout: &KernelEmissionLayout) -> Result<u64, NativeCom
         .and_then(|bytes| {
             bytes.checked_add(
                 layout.addressable_resources.len()
-                    * std::mem::size_of::<seismic_ir::physical_target::AddressableResourceEmissionLayout>(),
+                    * std::mem::size_of::<
+                        seismic_ir::physical_target::AddressableResourceEmissionLayout,
+                    >(),
             )
         })
         .and_then(|bytes| {

@@ -29,6 +29,7 @@ fn service_sources_do_not_import_forbidden_implementation_layers() {
         include_str!("../src/owner.rs"),
         include_str!("../src/policy.rs"),
         include_str!("../src/round_driver.rs"),
+        include_str!("../src/retention.rs"),
         include_str!("../src/worker.rs"),
     ]
     .join("\n");

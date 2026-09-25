@@ -17,10 +17,10 @@ use seismic_ir::kernel::ops::{
     StoreElection, UnaryOp, ValueType,
 };
 use seismic_ir::kernel::{BlockId, Kernel};
-use seismic_ir::storage::LaunchLocalKind;
 use seismic_ir::physical_target::{
     DenseRepresentationGeometry, KernelEmissionLayout, PackedRepresentationGeometry,
 };
+use seismic_ir::storage::LaunchLocalKind;
 use seismic_lang::intrinsics::MathOp;
 use seismic_lang::registry::{PlaneEncoding, PlaneInfo, PlaneRepackRecipe, RepackExpr};
 use seismic_lang::types::DType;
@@ -670,7 +670,12 @@ impl Emitter<'_, '_> {
                         .iter()
                         .map(|value| self.value(value.value()))
                         .collect::<Vec<_>>();
-                    let value = self.read_plane(&place, plane as usize, &coordinates, self.value(element.value()));
+                    let value = self.read_plane(
+                        &place,
+                        plane as usize,
+                        &coordinates,
+                        self.value(element.value()),
+                    );
                     self.define(out.value, value);
                 }
                 ClosedOpView::RepresentationConvertPacket {
@@ -1428,24 +1433,45 @@ impl Emitter<'_, '_> {
         result.expect("typed vectors have at least one lane")
     }
 
-    fn read_plane(&mut self, place: &ClosedPackedPlace, plane: usize, coordinates: &[Value], element: Value) -> Value {
+    fn read_plane(
+        &mut self,
+        place: &ClosedPackedPlace,
+        plane: usize,
+        coordinates: &[Value],
+        element: Value,
+    ) -> Value {
         let (packet, geometry, _) = self.address(place, coordinates);
         let schema = &geometry.layout.planes[plane];
-        let base = self.builder.ins().iadd_imm(packet, i64::from(schema.offset));
-        let offset = self.builder.ins().imul_imm(element, i64::from(schema.storage_element_bytes()));
+        let base = self
+            .builder
+            .ins()
+            .iadd_imm(packet, i64::from(schema.offset));
+        let offset = self
+            .builder
+            .ins()
+            .imul_imm(element, i64::from(schema.storage_element_bytes()));
         if let PlaneEncoding::Dense(dtype) = schema.encoding {
             let address = self.builder.ins().iadd(base, offset);
             return self.load_element(address, dtype);
         }
         let mut output = self.builder.ins().iconst(types::I32, 0);
-        let last = self.builder.ins().iconst(types::I64, i64::from(schema.bytes_per_group - 1));
+        let last = self
+            .builder
+            .ins()
+            .iconst(types::I64, i64::from(schema.bytes_per_group - 1));
         let zero = output;
         for byte in 0..schema.storage_element_bytes() {
             let position = self.builder.ins().iadd_imm(offset, i64::from(byte));
-            let within = self.builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, position, last);
+            let within = self
+                .builder
+                .ins()
+                .icmp(IntCC::UnsignedLessThanOrEqual, position, last);
             let safe = self.builder.ins().select(within, position, last);
             let address = self.builder.ins().iadd(base, safe);
-            let loaded = self.builder.ins().load(types::I8, MemFlags::trusted(), address, 0);
+            let loaded = self
+                .builder
+                .ins()
+                .load(types::I8, MemFlags::trusted(), address, 0);
             let loaded = self.builder.ins().uextend(types::I32, loaded);
             let loaded = self.builder.ins().select(within, loaded, zero);
             let shifted = self.builder.ins().ishl_imm(loaded, i64::from(byte * 8));

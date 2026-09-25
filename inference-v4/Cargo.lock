@@ -1224,6 +1224,7 @@ name = "magnitude-artifacts"
 version = "0.1.0"
 dependencies = [
  "image",
+ "libc",
  "serde",
  "sha2 0.11.0",
 ]
@@ -1251,6 +1252,7 @@ dependencies = [
  "bytes",
  "hyper",
  "hyper-util",
+ "libc",
  "magnitude-artifacts",
  "magnitude-chat",
  "magnitude-generation",
@@ -1301,6 +1303,7 @@ dependencies = [
 name = "magnitude-model-executor"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "magnitude-artifacts",
  "magnitude-model-batching",
  "magnitude-model-contracts",
@@ -1342,7 +1345,6 @@ dependencies = [
 name = "magnitude-service"
 version = "0.1.0"
 dependencies = [
- "magnitude-artifacts",
  "magnitude-generation",
  "magnitude-model-contracts",
  "magnitude-model-executor",
@@ -2177,6 +2179,7 @@ dependencies = [
 name = "seismic-metal"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "objc2",
  "objc2-foundation",
  "objc2-metal",
@@ -2239,6 +2242,7 @@ dependencies = [
  "seismic-std",
  "seismic-vulkan",
  "serde",
+ "serde_json",
  "sha2 0.11.0",
  "windows-sys 0.61.2",
 ]

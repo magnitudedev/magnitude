@@ -112,11 +112,20 @@ impl<'a, E: Element, const RANK: usize> Tensor<'a, E, RANK> {
     /// must be contiguous.
     #[inline(always)]
     pub fn row(&self, index: [usize; RANK]) -> &'a [E::Storage] {
-        assert_eq!(self.strides[RANK - 1], 1, "a row view needs a unit innermost stride");
+        assert_eq!(
+            self.strides[RANK - 1],
+            1,
+            "a row view needs a unit innermost stride"
+        );
         let mut start = index;
         start[RANK - 1] = 0;
         // SAFETY: `from_raw`'s contract; the row lies inside the view.
-        unsafe { std::slice::from_raw_parts(self.base.add(self.offset_row(start)), self.extents[RANK - 1]) }
+        unsafe {
+            std::slice::from_raw_parts(
+                self.base.add(self.offset_row(start)),
+                self.extents[RANK - 1],
+            )
+        }
     }
 
     /// The same row, writable.
@@ -126,10 +135,19 @@ impl<'a, E: Element, const RANK: usize> Tensor<'a, E, RANK> {
     #[inline(always)]
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn row_mut(&self, index: [usize; RANK]) -> &'a mut [E::Storage] {
-        assert_eq!(self.strides[RANK - 1], 1, "a row view needs a unit innermost stride");
+        assert_eq!(
+            self.strides[RANK - 1],
+            1,
+            "a row view needs a unit innermost stride"
+        );
         let mut start = index;
         start[RANK - 1] = 0;
-        unsafe { std::slice::from_raw_parts_mut(self.base.add(self.offset_row(start)), self.extents[RANK - 1]) }
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.base.add(self.offset_row(start)),
+                self.extents[RANK - 1],
+            )
+        }
     }
 
     #[inline(always)]
@@ -145,8 +163,15 @@ impl<'a, E: Element, const RANK: usize> Tensor<'a, E, RANK> {
     /// `length` contiguous elements of the innermost row from `index`.
     #[inline(always)]
     pub fn span(&self, index: [usize; RANK], length: usize) -> &'a [E::Storage] {
-        assert_eq!(self.strides[RANK - 1], 1, "a span needs a unit innermost stride");
-        assert!(index[RANK - 1] + length <= self.extents[RANK - 1], "span outside its row");
+        assert_eq!(
+            self.strides[RANK - 1],
+            1,
+            "a span needs a unit innermost stride"
+        );
+        assert!(
+            index[RANK - 1] + length <= self.extents[RANK - 1],
+            "span outside its row"
+        );
         // SAFETY: `from_raw`'s contract; the span lies inside its row.
         unsafe { std::slice::from_raw_parts(self.base.add(self.offset(index)), length) }
     }
@@ -159,8 +184,15 @@ impl<'a, E: Element, const RANK: usize> Tensor<'a, E, RANK> {
     #[inline(always)]
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn span_mut(&self, index: [usize; RANK], length: usize) -> &'a mut [E::Storage] {
-        assert_eq!(self.strides[RANK - 1], 1, "a span needs a unit innermost stride");
-        assert!(index[RANK - 1] + length <= self.extents[RANK - 1], "span outside its row");
+        assert_eq!(
+            self.strides[RANK - 1],
+            1,
+            "a span needs a unit innermost stride"
+        );
+        assert!(
+            index[RANK - 1] + length <= self.extents[RANK - 1],
+            "span outside its row"
+        );
         unsafe { std::slice::from_raw_parts_mut(self.base.add(self.offset(index)), length) }
     }
 }
@@ -182,7 +214,11 @@ impl<'a, T: Copy, const RANK: usize> Scalars<'a, T, RANK> {
     /// The innermost row at `index`, which must be contiguous.
     #[inline(always)]
     pub fn row(&self, index: [usize; RANK]) -> &'a [T] {
-        assert_eq!(self.strides[RANK - 1], 1, "a row view needs a unit innermost stride");
+        assert_eq!(
+            self.strides[RANK - 1],
+            1,
+            "a row view needs a unit innermost stride"
+        );
         let mut start = index;
         start[RANK - 1] = 0;
         let offset = self.offset_row(start);
@@ -194,7 +230,11 @@ impl<'a, T: Copy, const RANK: usize> Scalars<'a, T, RANK> {
     #[inline(always)]
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn row_mut(&self, index: [usize; RANK]) -> &'a mut [T] {
-        assert_eq!(self.strides[RANK - 1], 1, "a row view needs a unit innermost stride");
+        assert_eq!(
+            self.strides[RANK - 1],
+            1,
+            "a row view needs a unit innermost stride"
+        );
         let mut start = index;
         start[RANK - 1] = 0;
         let offset = self.offset_row(start);
@@ -226,7 +266,10 @@ impl<'a> Scratch<'a> {
     /// # Safety
     /// `base` is valid for `'a` and aligned to 256 bytes.
     pub unsafe fn from_raw(base: *mut u8) -> Self {
-        Self { base, life: PhantomData }
+        Self {
+            base,
+            life: PhantomData,
+        }
     }
 
     /// `length` elements of `T` from byte `offset`.
@@ -250,7 +293,12 @@ impl<'a> Scratch<'a> {
 /// pool aligns for any scalar).
 #[inline(always)]
 pub fn floats(bytes: &mut [u8], count: usize) -> &mut [f32] {
-    assert!(bytes.len() >= 4 * count, "{count} floats need {} private bytes; the launch has {}", 4 * count, bytes.len());
+    assert!(
+        bytes.len() >= 4 * count,
+        "{count} floats need {} private bytes; the launch has {}",
+        4 * count,
+        bytes.len()
+    );
     // SAFETY: every bit pattern is an `f32`; `align_to_mut` places only
     // aligned whole values in the middle part.
     let (head, middle, _) = unsafe { bytes.align_to_mut::<f32>() };

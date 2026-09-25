@@ -8,11 +8,12 @@
 //! memory holds every buffer address, then the scalar-result address, then
 //! the words; the single push constant is the block's address.
 
+use super::plan::ParameterAddress;
 use seismic_lang::checked::{NativeImplementation, NativeSpecialization};
-use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::entry::{
     CallSchema, ElementBindings, LogicalEntry, ParameterKind, ResultKind, TensorAccess,
 };
+use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::registry;
@@ -65,6 +66,44 @@ pub(crate) fn word_count(schema: &CallSchema) -> usize {
                 ResultKind::Range { .. } | ResultKind::Scalar(_) | ResultKind::Index { .. } => 0,
             })
             .sum::<usize>()
+}
+
+/// A launch-scoped implementation passes its non-code choices in the native
+/// argument words. Each launch source sees its own local names; all launches
+/// share the same word layout so one call can dispatch several of them.
+pub(crate) fn runtime_parameters(implementation: &NativeImplementation) -> Vec<ParameterAddress> {
+    if !implementation.launch_scoped() {
+        return Vec::new();
+    }
+    implementation
+        .params
+        .iter()
+        .filter(|parameter| !parameter.code)
+        .map(|parameter| ParameterAddress::Entry(parameter.name.clone()))
+        .chain(
+            implementation
+                .launches
+                .iter()
+                .enumerate()
+                .flat_map(|(ordinal, launch)| {
+                    launch
+                        .params
+                        .iter()
+                        .filter(|parameter| !parameter.code)
+                        .map(move |parameter| ParameterAddress::Launch {
+                            ordinal,
+                            name: parameter.name.clone(),
+                        })
+                }),
+        )
+        .collect()
+}
+
+pub(crate) fn native_word_count(
+    schema: &CallSchema,
+    implementation: &NativeImplementation,
+) -> usize {
+    word_count(schema) + runtime_parameters(implementation).len()
 }
 
 /// Argument slots an implementation binds: its buffers (tensor parameters,
@@ -141,7 +180,13 @@ pub(crate) fn static_geometry(
     let tensor = |representation: RepresentationId, axes: &[seismic_lang::expr::NatExpr]| {
         let extents = axes
             .iter()
-            .map(|axis| logical.arena().compile_nat(*axis).evaluate_u64(&values).ok())
+            .map(|axis| {
+                logical
+                    .arena()
+                    .compile_nat(*axis)
+                    .evaluate_u64(&values)
+                    .ok()
+            })
             .collect::<Vec<_>>();
         let strides = extents
             .iter()
@@ -189,6 +234,90 @@ pub(crate) fn render_source(
     specialization: &NativeSpecialization,
     asset: &str,
 ) -> String {
+    render_source_with(
+        dialect,
+        logical,
+        bindings,
+        implementation,
+        specialization,
+        asset,
+        None,
+    )
+}
+
+/// One Metal launch source. The asset guards each templated kernel with its
+/// `SEISMIC_FORMING_<kernel>` name. Code variants become explicit template
+/// instantiations in one library; runtime parameter values never enter it.
+pub(crate) fn render_metal_launch_source(
+    logical: &LogicalEntry,
+    bindings: &ElementBindings,
+    implementation: &NativeImplementation,
+    specialization: &NativeSpecialization,
+    asset: &str,
+    launch_source: &super::plan::LaunchSource,
+) -> String {
+    let kernel = &implementation.launches[launch_source.ordinal].kernel;
+    let mut source = render_source_with(
+        Dialect::Metal,
+        logical,
+        bindings,
+        implementation,
+        specialization,
+        asset,
+        Some(kernel),
+    );
+    for variant in &launch_source.code_variants {
+        if variant.is_empty() {
+            continue;
+        }
+        let values = variant
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let suffix = variant
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join("_");
+        source.push_str(&format!(
+            "\ntemplate [[host_name(\"{kernel}${suffix}\")]] [[kernel]] decltype({kernel}<{values}>) {kernel}<{values}>;\n"
+        ));
+    }
+    source
+}
+
+/// One CUDA launch source. The asset guards templated kernels with their
+/// `SEISMIC_FORMING_<kernel>` names; NVRTC requests the required instances by
+/// name expression and supplies their lowered linker names after compilation.
+pub(crate) fn render_cuda_launch_source(
+    logical: &LogicalEntry,
+    bindings: &ElementBindings,
+    implementation: &NativeImplementation,
+    specialization: &NativeSpecialization,
+    asset: &str,
+    ordinal: usize,
+) -> String {
+    render_source_with(
+        Dialect::Cuda,
+        logical,
+        bindings,
+        implementation,
+        specialization,
+        asset,
+        Some(&implementation.launches[ordinal].kernel),
+    )
+}
+
+fn render_source_with(
+    dialect: Dialect,
+    logical: &LogicalEntry,
+    bindings: &ElementBindings,
+    implementation: &NativeImplementation,
+    specialization: &NativeSpecialization,
+    asset: &str,
+    forming: Option<&str>,
+) -> String {
     let schema = logical.schema();
     let geometry = static_geometry(logical, specialization);
     let mut prefix = match dialect {
@@ -204,11 +333,18 @@ pub(crate) fn render_source(
             representation,
         );
     }
-    for (name, value) in specialization.params() {
+    if let Some(kernel) = forming {
         prefix.push_str(&format!(
-            "#define SEISMIC_TUNE_{} {value}\n",
-            native_macro(name)
+            "#define SEISMIC_FORMING_{} 1\n",
+            native_macro(kernel)
         ));
+    } else {
+        for (name, value) in specialization.params() {
+            prefix.push_str(&format!(
+                "#define SEISMIC_TUNE_{} {value}\n",
+                native_macro(name)
+            ));
+        }
     }
     let mut buffer = 0usize;
     let mut word = 0usize;
@@ -324,6 +460,34 @@ pub(crate) fn render_source(
             };
         }
     }
+    let runtime_parameters = if forming.is_some() {
+        runtime_parameters(implementation)
+    } else {
+        Vec::new()
+    };
+    if let Some(kernel) = forming {
+        let current = implementation
+            .launches
+            .iter()
+            .position(|launch| launch.kernel == kernel)
+            .expect("forming guard names a declared launch");
+        let reads = implementation.launches[current].parameters();
+        for (offset, address) in runtime_parameters.iter().enumerate() {
+            let name = match address {
+                ParameterAddress::Entry(name) if reads.contains(name) => Some(name),
+                ParameterAddress::Launch { ordinal, name } if *ordinal == current => Some(name),
+                _ => None,
+            };
+            if let Some(name) = name {
+                prefix.push_str(&format!(
+                    "#define SEISMIC_RUNTIME_{} (seismic_words[{}])\n",
+                    native_macro(name),
+                    word + offset,
+                ));
+            }
+        }
+        word += runtime_parameters.len();
+    }
     for scratch in &implementation.scratch {
         prefix.push_str(&format!(
             "#define SEISMIC_BUFFER_SCRATCH_{} {buffer}\n",
@@ -338,16 +502,16 @@ pub(crate) fn render_source(
         .iter()
         .filter_map(|parameter| match &parameter.kind {
             ParameterKind::Tensor { access, .. } => Some(*access == TensorAccess::Shared),
-            ParameterKind::Scalar { .. } | ParameterKind::Index { .. } | ParameterKind::Range { .. } => {
-                None
-            }
+            ParameterKind::Scalar { .. }
+            | ParameterKind::Index { .. }
+            | ParameterKind::Range { .. } => None,
         })
         .chain(std::iter::repeat(false))
         .take(buffer);
     #[cfg(any(not(target_os = "macos"), test))]
     if let Dialect::Vulkan(_) = dialect {
         prefix.push_str(&vulkan::tail(buffer, read_only));
-        debug_assert_eq!(word, word_count(schema));
+        debug_assert_eq!(word, word_count(schema) + runtime_parameters.len());
         prefix.push_str(asset);
         prefix.push_str(vulkan::SUFFIX);
         return prefix;
@@ -377,7 +541,7 @@ pub(crate) fn render_source(
         prefix.push_str("#define SEISMIC_PTR_(index) seismic_buffer_##index\n#define SEISMIC_PTR(index) SEISMIC_PTR_(index)\n");
         prefix.push_str("#define SEISMIC_SCALAR_RESULTS seismic_scalar_results\n");
     }
-    debug_assert_eq!(word, word_count(schema));
+    debug_assert_eq!(word, word_count(schema) + runtime_parameters.len());
     prefix.push_str(asset);
     prefix
 }
@@ -653,7 +817,11 @@ mod tests {
     const PROBE: &str = "fn probe[N, K](x: &tensor[N, K] E) -> tensor[1] f32:\n    let mut output = tensor[1] f32\n    for i in 0..1:\n        output[i] = f32(x[0, 0])\n    return output\n\nnative probe for cuda from \"probe.cu\":\n    static (K)\n    params (TILE in [4, 8])\n    scratch partials bytes (N * 4)\n    launch probe:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (TILE, 1, 1)\n";
 
     fn render(dialect: Dialect, representation: &str) -> String {
-        render_with(dialect, representation, NativeSpecialization::new().with_static("K", 64))
+        render_with(
+            dialect,
+            representation,
+            NativeSpecialization::new().with_static("K", 64),
+        )
     }
 
     fn render_with(
@@ -684,6 +852,85 @@ mod tests {
             &specialization,
             "\n// asset\n",
         )
+    }
+
+    #[test]
+    fn metal_launch_source_contains_only_its_form_and_code_instantiations() {
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "probe.seismic".to_owned(),
+            text: PROBE.to_owned(),
+        }]))
+        .unwrap();
+        let entry = module.entries()[0].id;
+        let bindings = ElementBindings::new().bind("E", registry::representation("f32").unwrap());
+        let logical = module.entry(entry, &bindings).unwrap();
+        let implementation = module
+            .native_implementation(entry, BackendName::Cuda)
+            .unwrap();
+        let specialization = NativeSpecialization::new()
+            .with_static("K", 64)
+            .with_param("TILE", 4);
+        let source = render_metal_launch_source(
+            &logical,
+            &bindings,
+            implementation,
+            &specialization,
+            "\n#ifdef SEISMIC_FORMING_PROBE\ntemplate <uint TILE> kernel void probe() {}\n#endif\n",
+            &super::super::plan::LaunchSource {
+                ordinal: 0,
+                code_variants: vec![vec![4], vec![8]],
+            },
+        );
+        assert!(source.contains("#define SEISMIC_FORMING_PROBE 1\n"));
+        assert!(!source.contains("SEISMIC_TUNE_TILE"));
+        assert!(source.contains("host_name(\"probe$4\")"));
+        assert!(source.contains("host_name(\"probe$8\")"));
+    }
+
+    #[test]
+    fn scoped_runtime_words_have_stable_entry_then_launch_offsets() {
+        let text = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (SPLIT in [1, 2])\n    launch small when N < 16:\n        params (WIDTH in [32, 64], code ROWS in [1, 2])\n        reads (SPLIT)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n    launch large when N >= 16:\n        params (WIDTH in [64, 128])\n        threadgroups (ceil_div(N, WIDTH), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n";
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "scale.seismic".into(),
+            text: text.into(),
+        }]))
+        .unwrap();
+        let entry = module.entry_named("scale").unwrap();
+        let bindings = ElementBindings::default();
+        let logical = module.entry(entry, &bindings).unwrap();
+        let implementation = module
+            .native_implementation(entry, BackendName::Metal)
+            .unwrap();
+        let defaults = implementation
+            .default_specialization(&NativeSpecialization::new())
+            .unwrap();
+        let base = word_count(logical.schema());
+        assert_eq!(
+            native_word_count(logical.schema(), implementation),
+            base + 3
+        );
+        let source = render_metal_launch_source(
+            &logical,
+            &bindings,
+            implementation,
+            &defaults,
+            "\n#ifdef SEISMIC_FORMING_SMALL\ntemplate <uint ROWS> kernel void small() {}\n#endif\n",
+            &super::super::plan::LaunchSource {
+                ordinal: 0,
+                code_variants: vec![vec![1], vec![2]],
+            },
+        );
+        assert!(source.contains(&format!(
+            "#define SEISMIC_RUNTIME_SPLIT (seismic_words[{base}])\n"
+        )));
+        assert!(source.contains(&format!(
+            "#define SEISMIC_RUNTIME_WIDTH (seismic_words[{}])\n",
+            base + 1
+        )));
+        assert!(!source.contains(&format!(
+            "#define SEISMIC_RUNTIME_WIDTH (seismic_words[{}])\n",
+            base + 2
+        )));
     }
 
     #[test]
@@ -744,7 +991,10 @@ mod tests {
             while let Some(&c) = chars.peek() {
                 if c.is_ascii_alphanumeric() || c == '_' {
                     let mut word = String::new();
-                    while let Some(&c) = chars.peek().filter(|c| c.is_ascii_alphanumeric() || **c == '_') {
+                    while let Some(&c) = chars
+                        .peek()
+                        .filter(|c| c.is_ascii_alphanumeric() || **c == '_')
+                    {
                         word.push(c);
                         chars.next();
                     }
@@ -756,7 +1006,12 @@ mod tests {
                     chars.next();
                 }
             }
-            fn expr(tokens: &[String], at: &mut usize, macros: &std::collections::HashMap<&str, &str>, k: u64) -> u64 {
+            fn expr(
+                tokens: &[String],
+                at: &mut usize,
+                macros: &std::collections::HashMap<&str, &str>,
+                k: u64,
+            ) -> u64 {
                 let mut value = term(tokens, at, macros, k);
                 while *at < tokens.len() && (tokens[*at] == "+" || tokens[*at] == "-") {
                     let op = tokens[*at].clone();
@@ -766,7 +1021,12 @@ mod tests {
                 }
                 value
             }
-            fn term(tokens: &[String], at: &mut usize, macros: &std::collections::HashMap<&str, &str>, k: u64) -> u64 {
+            fn term(
+                tokens: &[String],
+                at: &mut usize,
+                macros: &std::collections::HashMap<&str, &str>,
+                k: u64,
+            ) -> u64 {
                 let mut value = atom(tokens, at, macros, k);
                 while *at < tokens.len() && (tokens[*at] == "*" || tokens[*at] == "/") {
                     let op = tokens[*at].clone();
@@ -776,7 +1036,12 @@ mod tests {
                 }
                 value
             }
-            fn atom(tokens: &[String], at: &mut usize, macros: &std::collections::HashMap<&str, &str>, k: u64) -> u64 {
+            fn atom(
+                tokens: &[String],
+                at: &mut usize,
+                macros: &std::collections::HashMap<&str, &str>,
+                k: u64,
+            ) -> u64 {
                 let token = tokens[*at].clone();
                 *at += 1;
                 if token == "(" {
@@ -795,15 +1060,26 @@ mod tests {
             expr(&tokens, &mut at, macros, k)
         }
         for k in [256u64, 512, 2560, 9216] {
-            assert_eq!(eval(macros["SEISMIC_X_ROW_STRIDE_BYTES"], &macros, k), rows.row_stride_bytes(k).unwrap());
+            assert_eq!(
+                eval(macros["SEISMIC_X_ROW_STRIDE_BYTES"], &macros, k),
+                rows.row_stride_bytes(k).unwrap()
+            );
             for (index, plane) in rows.planes.iter().enumerate() {
                 let name = native_macro(plane.name);
                 assert_eq!(
-                    eval(macros[format!("SEISMIC_X_PLANE_{name}_ROW_OFFSET").as_str()], &macros, k),
+                    eval(
+                        macros[format!("SEISMIC_X_PLANE_{name}_ROW_OFFSET").as_str()],
+                        &macros,
+                        k
+                    ),
                     rows.plane_row_offset(index, k).unwrap()
                 );
                 assert_eq!(
-                    eval(macros[format!("SEISMIC_X_PLANE_{name}_BYTES_PER_ROW").as_str()], &macros, k),
+                    eval(
+                        macros[format!("SEISMIC_X_PLANE_{name}_BYTES_PER_ROW").as_str()],
+                        &macros,
+                        k
+                    ),
                     rows.plane_bytes_per_row(index, k).unwrap()
                 );
             }
@@ -822,7 +1098,9 @@ mod tests {
         let fixed = render_with(
             Dialect::Cuda,
             "f32",
-            NativeSpecialization::new().with_static("K", 64).with_static("N", 3),
+            NativeSpecialization::new()
+                .with_static("K", 64)
+                .with_static("N", 3),
         );
         assert!(fixed.contains("#define SEISMIC_X_EXTENT_0 ((unsigned long long)3)\n"));
         assert!(fixed.contains("#define SEISMIC_X_STRIDE_0 ((unsigned long long)64)\n"));
@@ -941,7 +1219,10 @@ mod tests {
 
     #[test]
     fn vulkan_shared_views_cover_the_region() {
-        assert_eq!(vulkan::shared_view_lengths(10), vec![3, 5, 5, 10, 5, 3, 3, 1]);
+        assert_eq!(
+            vulkan::shared_view_lengths(10),
+            vec![3, 5, 5, 10, 5, 3, 3, 1]
+        );
         assert_eq!(vulkan::shared_footprint(10), 16);
         assert_eq!(vulkan::shared_footprint(0), 16);
         assert_eq!(vulkan::shared_footprint(256), 256);
@@ -968,9 +1249,20 @@ void probe() {
     seismic_u64(SEISMIC_SCALAR_RESULTS)[0].v = seismic_words[0];
 }
 ";
-        for representation in ["f32", "bf16", "q6k@rows16", "q5k@rows16", "q8g32", "gguf_q4_k"] {
-            let source = render_with(Dialect::Vulkan(VULKAN_FEATURES), representation, NativeSpecialization::new())
-                .replace("\n// asset\n", ASSET);
+        for representation in [
+            "f32",
+            "bf16",
+            "q6k@rows16",
+            "q5k@rows16",
+            "q8g32",
+            "gguf_q4_k",
+        ] {
+            let source = render_with(
+                Dialect::Vulkan(VULKAN_FEATURES),
+                representation,
+                NativeSpecialization::new(),
+            )
+            .replace("\n// asset\n", ASSET);
             let environment = seismic_vulkan::seal::Environment {
                 rounding_rte_32: true,
                 denorm_preserve_32: true,

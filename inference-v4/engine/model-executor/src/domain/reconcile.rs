@@ -75,7 +75,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Err(self.fatal_invariant("target outcome has no owned target advance"));
         };
         match advance.commit(decision.accepted_rows) {
-            Ok(OwnedAdvanceResolution::Aborted(state) | OwnedAdvanceResolution::Committed(state)) => {
+            Ok(
+                OwnedAdvanceResolution::Aborted(state) | OwnedAdvanceResolution::Committed(state),
+            ) => {
                 self.target.insert(request, state);
                 Ok(())
             }

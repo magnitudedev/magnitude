@@ -73,7 +73,9 @@ pub(crate) enum Descriptor {
         uuid: [u8; 16],
     },
     #[cfg(not(target_os = "macos"))]
-    Vulkan { uuid: [u8; 16] },
+    Vulkan {
+        uuid: [u8; 16],
+    },
 }
 
 /// One backend device as enumerated, before the catalog assigns snapshot
@@ -91,7 +93,9 @@ pub(crate) struct DiscoveredDevice {
 /// The backing a backend establishes from its native facts.
 pub(crate) enum DiscoveredMemory {
     /// Allocations are host RAM (CPU; qualified unified-memory GPU).
-    Host { max_allocation_bytes: u64 },
+    Host {
+        max_allocation_bytes: u64,
+    },
     /// Allocations consume a device-local pool with its own capacity.
     Dedicated {
         capacity_bytes: u64,
@@ -99,7 +103,9 @@ pub(crate) enum DiscoveredMemory {
         ledger: LedgerKey,
         max_allocation_bytes: u64,
     },
-    Unsupported { reason: String },
+    Unsupported {
+        reason: String,
+    },
 }
 
 pub(crate) struct BackendDiscovery {
@@ -253,11 +259,14 @@ impl BoundWorkflowKind {
             Self::Cuda(workflow) => workflow.set_allocation_limit(limit),
         }
     }
-    pub(crate) fn initial_allocation_bytes(&self)->u64 {match self {
-        Self::Cpu(w)=>w.initial_allocation_bytes(),
-        #[cfg(target_os="macos")] Self::Metal(w)=>w.initial_allocation_bytes(),
-        Self::Cuda(w)=>w.initial_allocation_bytes(),
-    }}
+    pub(crate) fn initial_allocation_bytes(&self) -> u64 {
+        match self {
+            Self::Cpu(w) => w.initial_allocation_bytes(),
+            #[cfg(target_os = "macos")]
+            Self::Metal(w) => w.initial_allocation_bytes(),
+            Self::Cuda(w) => w.initial_allocation_bytes(),
+        }
+    }
 
     pub(crate) fn admit(self) -> Result<AdmittedWorkflowKind, CallError> {
         match self {
@@ -310,8 +319,9 @@ pub(crate) fn discover() -> BackendDiscovery {
             }
         } else {
             DiscoveredMemory::Unsupported {
-                reason: "Metal memory backing is qualified only for unified memory on Apple silicon"
-                    .into(),
+                reason:
+                    "Metal memory backing is qualified only for unified memory on Apple silicon"
+                        .into(),
             }
         };
         devices.push(DiscoveredDevice {
@@ -463,7 +473,9 @@ pub(crate) fn open(
             )))
         }
         #[cfg(not(target_os = "macos"))]
-        Descriptor::Vulkan { uuid } => OpenedKind::Vulkan(Arc::new(VulkanOpened::open(*uuid, &info, memory)?)),
+        Descriptor::Vulkan { uuid } => {
+            OpenedKind::Vulkan(Arc::new(VulkanOpened::open(*uuid, &info, memory)?))
+        }
     };
     Ok(Arc::new(DeviceInner {
         info,
@@ -561,10 +573,7 @@ impl OpenedKind {
         }
     }
 
-    pub(crate) fn set_memory_limit(
-        &self,
-        limit: Option<u64>,
-    ) -> Result<(), crate::memory::MemoryLimitError> {
+    pub(crate) fn set_memory_limit(&self, limit: Option<u64>) {
         match self {
             Self::Cpu(device) => device.set_memory_limit(limit),
             #[cfg(target_os = "macos")]
@@ -611,7 +620,11 @@ impl OpenedKind {
             #[cfg(target_os = "macos")]
             Self::Metal(device) => {
                 let facts = device.device_description().facts();
-                format!("{};os {}", facts.tuning_material(), facts.operating_system())
+                format!(
+                    "{};os {}",
+                    facts.tuning_material(),
+                    facts.operating_system()
+                )
             }
             Self::Cuda(device) => {
                 let facts = device.device_description().facts();
@@ -704,13 +717,33 @@ impl OpenedKind {
             Self::Cpu(device) => device.allocate_storage(bytes, alignment),
             #[cfg(target_os = "macos")]
             Self::Metal(device) => device.allocate_storage(bytes, alignment),
-            Self::Cuda(device) => {
-                device.allocate_storage_with(bytes, alignment, |service| {
-                    service.allocate_mapped(bytes)
-                })
-            }
+            Self::Cuda(device) => device
+                .allocate_storage_with(bytes, alignment, |service| service.allocate_mapped(bytes)),
             #[cfg(not(target_os = "macos"))]
             Self::Vulkan(device) => device.allocate_upload(bytes, alignment),
+        }
+    }
+
+    pub(crate) fn map_read_only_host_region(
+        &self,
+        region: crate::api::HostRegion,
+        alignment: u64,
+    ) -> Result<Arc<driver::Allocation>, ExecutionError> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Metal(device) => {
+                let bytes = region.len() as u64;
+                device.allocate_read_only_storage_with(bytes, alignment, |service| unsafe {
+                    service.wrap_read_only_host_mapping(
+                        region.pointer(),
+                        region.len(),
+                        region.owner(),
+                    )
+                })
+            }
+            _ => Err(ExecutionError::AllocationFailed(
+                "read-only host mapping is unavailable on this backend".into(),
+            )),
         }
     }
 
@@ -757,19 +790,28 @@ impl OpenedKind {
         allocation: &Arc<driver::Allocation>,
         committed: u64,
         alignment: u64,
+        exclusive_view: bool,
     ) -> Result<Option<Arc<driver::Allocation>>, ExecutionError> {
         let Self::Cuda(device) = self else {
             return Ok(None);
         };
         let buffer = driver::typed_buffer::<seismic_cuda::Cuda, seismic_cuda::Executor>(allocation);
-        if !buffer.is_reserved() {
+        if !buffer.is_reserved()
+            || !exclusive_view
+            || Arc::strong_count(allocation) != 1
+            || allocation.has_live_predecessor()
+        {
             return Ok(None);
         }
         let _exclusive = allocation.acquire(true);
         device
-            .allocate_storage_with(committed, alignment, |service| {
-                service.recommit(buffer, committed)
-            })
+            .recommit_storage_with(
+                allocation,
+                committed,
+                alignment,
+                |service| service.recommit(buffer, committed),
+                |service, current, old_bytes| service.recommit(current, old_bytes).map(|_| ()),
+            )
             .map(Some)
     }
 

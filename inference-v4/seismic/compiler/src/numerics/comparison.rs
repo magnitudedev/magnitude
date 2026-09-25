@@ -30,7 +30,8 @@ pub fn compare_element_bits(
     if !dtype.is_float() {
         return ElementComparison {
             accepted: reference == actual,
-            absolute_error: (discrete_value(dtype, reference) - discrete_value(dtype, actual)).abs(),
+            absolute_error: (discrete_value(dtype, reference) - discrete_value(dtype, actual))
+                .abs(),
             ..Default::default()
         };
     }
@@ -91,7 +92,9 @@ impl FloatDifference {
         let minimum_normal = match dtype {
             DType::F32 | DType::BF16 => 2.0_f64.powi(-126),
             DType::F16 => 2.0_f64.powi(-14),
-            DType::I32 | DType::U32 | DType::Bool => unreachable!("{dtype} is not a floating dtype"),
+            DType::I32 | DType::U32 | DType::Bool => {
+                unreachable!("{dtype} is not a floating dtype")
+            }
         };
         let subnormal = |value: f64| value != 0.0 && value.abs() < minimum_normal;
         let absolute_error = (reference_value - actual_value).abs();
@@ -258,7 +261,12 @@ mod tests {
 
     const F32_ONE: u32 = 0x3f80_0000;
 
-    fn tolerance(absolute: f64, relative: f64, relative_floor: f64, ulps: Option<u64>) -> Tolerance {
+    fn tolerance(
+        absolute: f64,
+        relative: f64,
+        relative_floor: f64,
+        ulps: Option<u64>,
+    ) -> Tolerance {
         Tolerance {
             absolute: Limit::new(absolute).unwrap(),
             relative: Limit::new(relative).unwrap(),
@@ -283,18 +291,43 @@ mod tests {
     #[test]
     fn nan_payload_is_observed_only_by_exact() {
         let (reference, actual) = (0x7fc0_0000, 0x7fc0_1234);
-        assert!(!accepts(&PrecisionPolicy::Exact, DType::F32, reference, actual));
+        assert!(!accepts(
+            &PrecisionPolicy::Exact,
+            DType::F32,
+            reference,
+            actual
+        ));
         assert!(accepts(
             &bounded(Tolerance::EXACT, SpecialPolicy::PRESERVE),
             DType::F32,
             reference,
             actual
         ));
-        assert!(accepts(&PrecisionPolicy::Unconstrained, DType::F32, reference, actual));
+        assert!(accepts(
+            &PrecisionPolicy::Unconstrained,
+            DType::F32,
+            reference,
+            actual
+        ));
         // The same holds for the narrow formats.
-        assert!(!accepts(&PrecisionPolicy::Exact, DType::F16, 0x7e00, 0x7e01));
-        assert!(!accepts(&PrecisionPolicy::Exact, DType::BF16, 0x7fc0, 0xffc0));
-        assert!(accepts(&PrecisionPolicy::Exact, DType::BF16, 0x7fc0, 0x7fc0));
+        assert!(!accepts(
+            &PrecisionPolicy::Exact,
+            DType::F16,
+            0x7e00,
+            0x7e01
+        ));
+        assert!(!accepts(
+            &PrecisionPolicy::Exact,
+            DType::BF16,
+            0x7fc0,
+            0xffc0
+        ));
+        assert!(accepts(
+            &PrecisionPolicy::Exact,
+            DType::BF16,
+            0x7fc0,
+            0x7fc0
+        ));
     }
 
     #[test]
@@ -330,7 +363,14 @@ mod tests {
     #[test]
     fn ulps_are_steps_of_the_dtype_bit_pattern() {
         let measure = |dtype, reference, actual| {
-            compare_element_bits(&PrecisionPolicy::Unconstrained, "value", dtype, reference, actual).ulps
+            compare_element_bits(
+                &PrecisionPolicy::Unconstrained,
+                "value",
+                dtype,
+                reference,
+                actual,
+            )
+            .ulps
         };
         // Adjacent values, including across zero, in each format's own encoding.
         assert_eq!(measure(DType::F16, 0x3c00, 0x3c01), 1);
@@ -357,10 +397,16 @@ mod tests {
             for pair in ranked.windows(2) {
                 let ((low_rank, low), (high_rank, high)) = (pair[0], pair[1]);
                 if low_rank == high_rank {
-                    assert!(low == 0.0 && high == 0.0, "{dtype}: {low} and {high} share rank {low_rank}");
+                    assert!(
+                        low == 0.0 && high == 0.0,
+                        "{dtype}: {low} and {high} share rank {low_rank}"
+                    );
                 } else {
                     assert_eq!(high_rank, low_rank + 1, "{dtype}: ranks are dense");
-                    assert!(low < high, "{dtype}: rank {low_rank} ({low}) precedes {high_rank} ({high})");
+                    assert!(
+                        low < high,
+                        "{dtype}: rank {low_rank} ({low}) precedes {high_rank} ({high})"
+                    );
                 }
             }
         }
@@ -448,7 +494,25 @@ mod tests {
         let exact = PrecisionPolicy::Exact;
         assert!(!compare_element(&exact, "value", DType::F16, -0.0, 0.0).accepted);
         assert!(compare_element(&exact, "value", DType::F16, f64::NAN, f64::NAN).accepted);
-        assert!(!compare_element(&exact, "value", DType::F16, f64::INFINITY, f64::NEG_INFINITY).accepted);
-        assert!(!compare_element(&PrecisionPolicy::Unconstrained, "value", DType::I32, 1.0, 2.0).accepted);
+        assert!(
+            !compare_element(
+                &exact,
+                "value",
+                DType::F16,
+                f64::INFINITY,
+                f64::NEG_INFINITY
+            )
+            .accepted
+        );
+        assert!(
+            !compare_element(
+                &PrecisionPolicy::Unconstrained,
+                "value",
+                DType::I32,
+                1.0,
+                2.0
+            )
+            .accepted
+        );
     }
 }

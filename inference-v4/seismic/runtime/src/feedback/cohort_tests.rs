@@ -1,7 +1,7 @@
 //! Checked source control through ordinary preparation and native execution.
 use super::*;
 use seismic_compiler::feedback::FeedbackOptions;
-use seismic_lang::checked::{SourceFile, SourceSet, check_source};
+use seismic_lang::checked::{check_source, SourceFile, SourceSet};
 use seismic_lang::entry::ElementBindings;
 
 fn source_products_and_failures(backend: registry::BackendName) {

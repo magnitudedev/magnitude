@@ -100,7 +100,8 @@ fn interpret(entry: &str, inputs: &[Input]) -> (Option<String>, Vec<(usize, Vec<
         path: MODULE_PATH.into(),
         text: MODULE.into(),
     });
-    let checked = check_source(sources).unwrap_or_else(|e| panic!("the resource module must check: {e}"));
+    let checked =
+        check_source(sources).unwrap_or_else(|e| panic!("the resource module must check: {e}"));
     let info = checked
         .entries()
         .iter()
@@ -114,7 +115,10 @@ fn interpret(entry: &str, inputs: &[Input]) -> (Option<String>, Vec<(usize, Vec<
         .iter()
         .map(|input| match input {
             Input::Tensor {
-                dtype, shape, bytes, ..
+                dtype,
+                shape,
+                bytes,
+                ..
             } => {
                 let shape = shape.iter().map(|extent| *extent as usize).collect();
                 let data = TensorData::dense_from_bytes(*dtype, shape, bytes.clone())
@@ -157,7 +161,10 @@ fn run_under_budget(backend: BackendName, entry: &str, inputs: &[Input], budget:
         .iter()
         .map(|input| match input {
             Input::Tensor {
-                element, shape, bytes, ..
+                element,
+                shape,
+                bytes,
+                ..
             } => Value::Tensor(
                 Tensor::from_host(&device, element.clone(), shape, bytes)
                     .unwrap_or_else(|e| panic!("{entry}: {e}")),
@@ -167,9 +174,7 @@ fn run_under_budget(backend: BackendName, entry: &str, inputs: &[Input], budget:
         .collect();
     let usage = device.memory_usage();
     let base = usage.charged;
-    device
-        .set_memory_limit(Some(base + budget))
-        .unwrap_or_else(|e| panic!("{entry}: {e}"));
+    device.set_memory_limit(Some(base + budget));
     let function = module.function(entry).expect("declared entry");
     let (kernel, _) = prepare(
         &function,
@@ -230,9 +235,7 @@ fn run_under_budget(backend: BackendName, entry: &str, inputs: &[Input], budget:
         base,
         "{entry}: the run did not release every backing it acquired"
     );
-    device
-        .set_memory_limit(usage.limit)
-        .unwrap_or_else(|e| panic!("{entry}: restoring the limit: {e}"));
+    device.set_memory_limit(usage.limit);
     Run { failed, tensors }
 }
 
@@ -247,7 +250,10 @@ fn reached_allocation_does_not_reserve_unvisited_iterations(backend: BackendName
         &[i32_tensor(&[0]), Input::I32(0)],
         4096,
     );
-    assert!(run.failed, "`1 / divisor` with divisor 0 is a source failure");
+    assert!(
+        run.failed,
+        "`1 / divisor` with divisor 0 is a source failure"
+    );
     assert_eq!(run.tensors[0], i32_bytes(&[7]));
 }
 
@@ -261,7 +267,10 @@ fn no_backing_after_source_failure(backend: BackendName) {
         &[i32_tensor(&[0]), Input::I32(0)],
         4096,
     );
-    assert!(run.failed, "`1 / divisor` with divisor 0 is a source failure");
+    assert!(
+        run.failed,
+        "`1 / divisor` with divisor 0 is a source failure"
+    );
     assert_eq!(run.tensors[0], i32_bytes(&[7]));
 }
 
@@ -271,7 +280,11 @@ fn participant_copies(backend: BackendName, rows: usize, columns: usize, budget:
     let run = run_under_budget(
         backend,
         "participant_copies",
-        &[f32_tensor(&vec![1.0; columns]), f32_tensor(&s), f32_tensor(&vec![0.0; rows])],
+        &[
+            f32_tensor(&vec![1.0; columns]),
+            f32_tensor(&s),
+            f32_tensor(&vec![0.0; rows]),
+        ],
         budget,
     );
     assert!(!run.failed, "participant_copies has no failing operation");

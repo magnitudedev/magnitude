@@ -403,12 +403,21 @@ impl Parser {
         }
     }
 
-    /// `[arithmetic] NAME in [V, ..]`
+    /// `[code] [arithmetic] NAME in [V, ..]`
     fn native_param(&mut self) -> PResult<NativeParamDecl> {
         let begin = self.span();
-        let arithmetic = matches!(self.peek_at(1), Tok::Name(_)) && self.at_word("arithmetic");
-        if arithmetic {
-            self.bump();
+        let mut code = false;
+        let mut arithmetic = false;
+        loop {
+            if self.at_word("code") && !code {
+                self.bump();
+                code = true;
+            } else if self.at_word("arithmetic") && !arithmetic {
+                self.bump();
+                arithmetic = true;
+            } else {
+                break;
+            }
         }
         let name = self.expect_name()?;
         self.expect_kw(Kw::In)?;
@@ -426,6 +435,7 @@ impl Parser {
         self.expect_op(Op::RBracket)?;
         Ok(NativeParamDecl {
             name,
+            code,
             arithmetic,
             values,
             span: begin.to(self.prev_span()),
@@ -463,6 +473,24 @@ impl Parser {
         let when = self.native_when()?;
         self.expect_op(Op::Colon)?;
         self.native_block_start("launch")?;
+        let mut params = Vec::new();
+        if self.at_word("params") {
+            self.bump();
+            self.expect_op(Op::LParen)?;
+            params = self.comma_list(Self::native_param)?;
+            self.expect_op(Op::RParen)?;
+            self.expect_newline()?;
+        }
+        let reads = if self.at_word("reads") {
+            self.bump();
+            self.expect_op(Op::LParen)?;
+            let reads = self.comma_list(Self::expect_name)?;
+            self.expect_op(Op::RParen)?;
+            self.expect_newline()?;
+            reads
+        } else {
+            Vec::new()
+        };
         let threadgroups = self.native_launch_property("threadgroups")?;
         self.expect_newline()?;
         let threads_per_threadgroup = self.native_launch_property("threads_per_threadgroup")?;
@@ -481,6 +509,8 @@ impl Parser {
         Ok(NativeLaunchDecl {
             kernel,
             when,
+            params,
+            reads,
             threadgroups,
             threads_per_threadgroup,
             shared_bytes,
@@ -1216,7 +1246,11 @@ mod tests {
         assert_eq!(native.elements.len(), 2);
         assert_eq!(native.elements[0].name.name, "A");
         assert_eq!(
-            native.elements[0].dtypes.iter().map(|dtype| dtype.name.as_str()).collect::<Vec<_>>(),
+            native.elements[0]
+                .dtypes
+                .iter()
+                .map(|dtype| dtype.name.as_str())
+                .collect::<Vec<_>>(),
             ["f32", "u32"]
         );
     }
@@ -1233,7 +1267,10 @@ mod tests {
         assert_eq!(native.params.len(), 2);
         assert!(native.params[0].arithmetic);
         assert!(matches!(
-            native.constraint.as_ref().map(|constraint| &constraint.kind),
+            native
+                .constraint
+                .as_ref()
+                .map(|constraint| &constraint.kind),
             Some(ExprKind::Binary {
                 op: BinaryOp::And,
                 ..
@@ -1245,6 +1282,31 @@ mod tests {
     }
 
     #[test]
+    fn launch_parameters_round_trip_with_reused_names() {
+        let file = round_trip(
+            "native project for metal from \"project.metal\":\n    params (BATCH_FROM in [5, 3])\n    launch gemv when O < BATCH_FROM:\n        params (SIMDGROUPS in [16, 8], code arithmetic ROWS in [1, 2])\n        threadgroups (ceil_div(H, SIMDGROUPS * ROWS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n    launch batch when O >= BATCH_FROM:\n        params (SIMDGROUPS in [8, 4])\n        threadgroups (ceil_div(H, SIMDGROUPS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n",
+        );
+        let [Decl::Native(native)] = file.decls.as_slice() else {
+            panic!("expected one native implementation")
+        };
+        assert_eq!(native.launches[0].params[0].name.name, "SIMDGROUPS");
+        assert!(native.launches[0].params[1].code);
+        assert!(native.launches[0].params[1].arithmetic);
+        assert_eq!(native.launches[1].params[0].name.name, "SIMDGROUPS");
+    }
+
+    #[test]
+    fn launch_kernel_reads_round_trip() {
+        let file = round_trip(
+            "native project for cuda from \"project.cu\":\n    params (code arithmetic INT8 in [0, 1])\n    launch project:\n        reads (INT8)\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n",
+        );
+        let [Decl::Native(native)] = file.decls.as_slice() else {
+            panic!("expected one native implementation")
+        };
+        assert_eq!(native.launches[0].reads[0].name, "INT8");
+    }
+
+    #[test]
     fn conditional_native_launches_and_scratch_round_trip() {
         let file = round_trip(
             "native rows for metal from \"rows.metal\":\n    params (SPLIT in [1, 2])\n    where SPLIT == 1 or (SPLIT > 1 and SPLIT < 4)\n    scratch normalized bytes (O * H * 2) when O > 8\n    scratch partials bytes (SPLIT * O * 4) when (SPLIT > 1 or O >= 9) and O != 0\n    launch rows_normalize when O > 8:\n        threadgroups (O, 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n    launch rows_gemv when O <= 2 or (INT8 == 1 and O <= 8):\n        threadgroups (ceil_div(F, 8), 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n        shared_bytes (O * 72)\n    launch rows_merge:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n",
@@ -1253,18 +1315,30 @@ mod tests {
             panic!("expected one native implementation")
         };
         assert!(matches!(
-            native.constraint.as_ref().map(|constraint| &constraint.kind),
-            Some(ExprKind::Binary { op: BinaryOp::Or, .. })
+            native
+                .constraint
+                .as_ref()
+                .map(|constraint| &constraint.kind),
+            Some(ExprKind::Binary {
+                op: BinaryOp::Or,
+                ..
+            })
         ));
         assert!(native.scratch.iter().all(|scratch| scratch.when.is_some()));
         assert!(matches!(
             native.scratch[1].when.as_ref().map(|when| &when.kind),
-            Some(ExprKind::Binary { op: BinaryOp::And, .. })
+            Some(ExprKind::Binary {
+                op: BinaryOp::And,
+                ..
+            })
         ));
         assert!(native.launches[0].when.is_some());
         assert!(matches!(
             native.launches[1].when.as_ref().map(|when| &when.kind),
-            Some(ExprKind::Binary { op: BinaryOp::Or, .. })
+            Some(ExprKind::Binary {
+                op: BinaryOp::Or,
+                ..
+            })
         ));
         assert!(native.launches[2].when.is_none());
         let printed = print(&file);
@@ -1272,7 +1346,10 @@ mod tests {
             printed.contains("when (SPLIT > 1 or O >= 9) and O != 0\n"),
             "{printed}"
         );
-        assert!(printed.contains("launch rows_gemv when O <= 2 or INT8 == 1 and O <= 8:\n"), "{printed}");
+        assert!(
+            printed.contains("launch rows_gemv when O <= 2 or INT8 == 1 and O <= 8:\n"),
+            "{printed}"
+        );
     }
 
     #[test]

@@ -28,6 +28,9 @@ opentelemetry = "0.33.0"
 opentelemetry_sdk = "0.33.0"
 opentelemetry-otlp = { version = "0.33.0", features = ["http-json", "reqwest"] }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "=0.2.189"
+
 [features]
 # Development-only: lets the `forward_bench` example record tuned
 # configurations and replay them in a later run (bit-exact comparisons).

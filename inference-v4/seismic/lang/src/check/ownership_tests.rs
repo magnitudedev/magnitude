@@ -130,19 +130,31 @@ fn tuple_tensor_carry_requires_the_same_inductive_initialized_region() {
 #[test]
 fn overlapping_store_preserves_root_descriptor_and_snapshots_rhs() {
     use crate::entry::ElementBindings;
-    use crate::interp::{Arg,Interpreter,TensorData,OutcomeValue};
+    use crate::interp::{Arg, Interpreter, OutcomeValue, TensorData};
     use crate::reference_math::ReferenceScalar;
     use crate::types::DType;
-    let module=check_source(SourceSet::new(vec![SourceFile{path:"overlapping-store.seismic".into(),text:"fn probe(x: &mut tensor[3] f32) -> f32:\n    x[1:3] = x[0:2]\n    return x[2]\n".into()}])).unwrap();
-    let entry=module.entry(module.entry_named("probe").unwrap(),&ElementBindings::default()).unwrap();
-    let mut oracle=Interpreter::new(&entry);
-    let input=oracle.add_tensor(TensorData::dense(DType::F32,vec![3],vec![1.,2.,3.]));
-    let outcome=oracle.run(&[Arg::Tensor(input)]).unwrap();
-    assert!(matches!(outcome.results().next().unwrap().value(),OutcomeValue::Scalar(ReferenceScalar::F32(value)) if value==2.0f32.to_bits()));
-    let actual=outcome.inputs().next().unwrap();
-    assert_eq!(actual.tensor().shape(),&[3]);
-    assert_eq!(actual.tensor().read(1).unwrap(),1.);
-    assert_eq!(actual.tensor().read(2).unwrap(),2.);
+    let module = check_source(SourceSet::new(vec![SourceFile {
+        path: "overlapping-store.seismic".into(),
+        text: "fn probe(x: &mut tensor[3] f32) -> f32:\n    x[1:3] = x[0:2]\n    return x[2]\n"
+            .into(),
+    }]))
+    .unwrap();
+    let entry = module
+        .entry(
+            module.entry_named("probe").unwrap(),
+            &ElementBindings::default(),
+        )
+        .unwrap();
+    let mut oracle = Interpreter::new(&entry);
+    let input = oracle.add_tensor(TensorData::dense(DType::F32, vec![3], vec![1., 2., 3.]));
+    let outcome = oracle.run(&[Arg::Tensor(input)]).unwrap();
+    assert!(
+        matches!(outcome.results().next().unwrap().value(),OutcomeValue::Scalar(ReferenceScalar::F32(value)) if value==2.0f32.to_bits())
+    );
+    let actual = outcome.inputs().next().unwrap();
+    assert_eq!(actual.tensor().shape(), &[3]);
+    assert_eq!(actual.tensor().read(1).unwrap(), 1.);
+    assert_eq!(actual.tensor().read(2).unwrap(), 2.);
 }
 
 #[test]

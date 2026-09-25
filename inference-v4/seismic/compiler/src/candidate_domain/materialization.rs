@@ -1,9 +1,9 @@
 //! Owned, bounded construction. This module has no traversal policy: a caller
 //! chooses a source path and supplies the work allowance for this advance.
 
+use super::SourceEntryBorrow;
 use super::*;
 use crate::implementation::ConstructionContext;
-use super::SourceEntryBorrow;
 use crate::portable::construction::{ConstructionStep, SourceConstruction};
 use std::time::{Duration, Instant};
 
@@ -154,16 +154,12 @@ impl<B: seismic_native_target::TargetFamily> CandidateDomain<'_, B> {
         if coordinate == &self.general_construction() {
             return Materialization::Ready(self.general_construction());
         }
-        let Some(_) = self
-            .families
-            .iter()
-            .find(|family| {
-                let function = self.source_program.function(family.body);
-                family.identity == coordinate.root.body
-                    && function.source_definition() == coordinate.root.source_definition
-                    && self.source_program.subject() == &coordinate.root.subject
-            })
-        else {
+        let Some(_) = self.families.iter().find(|family| {
+            let function = self.source_program.function(family.body);
+            family.identity == coordinate.root.body
+                && function.source_definition() == coordinate.root.source_definition
+                && self.source_program.subject() == &coordinate.root.subject
+        }) else {
             return Materialization::Excluded(ConstructionExclusion::UnknownBody);
         };
         if !self.root_selections().contains(&coordinate.root) {
@@ -280,7 +276,13 @@ impl<B: seismic_native_target::TargetFamily> CandidateDomain<'_, B> {
                     }
                 }
                 ConstructionStep::Unresolved(next, reason) => {
-                    self.materializations.insert(coordinate.clone(), Progress::Suspended(Suspended { source: next, selected }));
+                    self.materializations.insert(
+                        coordinate.clone(),
+                        Progress::Suspended(Suspended {
+                            source: next,
+                            selected,
+                        }),
+                    );
                     return Materialization::Pending(reason);
                 }
                 ConstructionStep::Complete(candidate) => {

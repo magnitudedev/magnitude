@@ -1,5 +1,4 @@
 //! Controlled resident trials use ordinary selected-executable admission.
-use seismic_lang::failure::SourceTermination;
 use super::*;
 use seismic_compiler::feedback::{
     CaseArgument, ControlledObserver, Observation, ObservationError, ObservationRequest,
@@ -8,6 +7,7 @@ use seismic_compiler::numerics::{
     compare_outcome, Comparison, ComparisonError, ObservedInput, ObservedInvocation,
     ObservedResult, ObservedTensor, ObservedValue, ValidationCase, ValidationObservation,
 };
+use seismic_lang::failure::SourceTermination;
 use seismic_lang::interp::{Arg, Interpreter, OracleOutcome, TensorData};
 use seismic_lang::types::DType;
 use std::time::{Duration, Instant};
@@ -406,7 +406,9 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
             let live = total.saturating_add(expected.as_ref().unwrap().retained_payload_bytes());
             // The completed owner retains admission permits and backing until
             // all observable prefix state has been copied into this observation.
-            let actual = capture_invocation(&request, termination, &inputs, live, |tensor| completed.read_tensor(tensor))?;
+            let actual = capture_invocation(&request, termination, &inputs, live, |tensor| {
+                completed.read_tensor(tensor)
+            })?;
             drop(completed);
             if validation.is_some() {
                 diagnostic = Some(ValidationObservation {
@@ -460,7 +462,9 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
             checking_time += check.elapsed();
             if stopped {
                 if validation.is_none() {
-                    return Err(ObservationError::Unsupported("completed source failure has no timing sample".into()));
+                    return Err(ObservationError::Unsupported(
+                        "completed source failure has no timing sample".into(),
+                    ));
                 }
                 break;
             }
@@ -636,7 +640,13 @@ fn packed_input(
 
 fn call_error(error: CallError) -> ObservationError {
     match error {
-        CallError::Execution(ExecutionError::AllocationCapacity { required, available }) => ObservationError::Capacity { required, limit: available },
+        CallError::Execution(ExecutionError::AllocationCapacity {
+            required,
+            available,
+        }) => ObservationError::Capacity {
+            required,
+            limit: available,
+        },
         CallError::Execution(error) => ObservationError::Execution(error),
         CallError::Invocation(InvocationError::AllocationCapacity {
             required,
@@ -827,7 +837,10 @@ fn capture_invocation<T: TargetFamily, H>(
         }
     } else if let SourceTermination::Failed(failure) = &termination {
         bytes = bytes.saturating_add(std::mem::size_of_val(failure) as u64);
-        if let seismic_lang::failure::SourceFailureCause::Check(seismic_lang::entry::CheckReason::Custom(text)) = &failure.cause {
+        if let seismic_lang::failure::SourceFailureCause::Check(
+            seismic_lang::entry::CheckReason::Custom(text),
+        ) = &failure.cause
+        {
             bytes = bytes.saturating_add(text.capacity() as u64);
         }
     }
@@ -904,7 +917,9 @@ mod tests {
     fn decode(dtype: DType, bytes: &[u8]) -> f64 {
         match dtype {
             DType::F32 => f32::from_le_bytes(bytes.try_into().unwrap()) as f64,
-            DType::F16 => registry::f16_to_f32(u16::from_le_bytes(bytes.try_into().unwrap())) as f64,
+            DType::F16 => {
+                registry::f16_to_f32(u16::from_le_bytes(bytes.try_into().unwrap())) as f64
+            }
             DType::BF16 => {
                 f32::from_bits((u16::from_le_bytes(bytes.try_into().unwrap()) as u32) << 16) as f64
             }
@@ -1091,7 +1106,9 @@ mod tests {
                     .collect(),
             };
             let request = ObservationRequest {
-                candidate: prepared.kernel.candidate_for_variant(prepared.kernel.select(&values)),
+                candidate: prepared
+                    .kernel
+                    .candidate_for_variant(prepared.kernel.select(&values)),
                 reference: logical.as_view(),
                 executable: prepared.kernel.variants().first(),
                 deadline: None,
@@ -1357,7 +1374,9 @@ mod tests {
         let catalog = crate::devices::Catalog::discover().unwrap();
         let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
         let foreign_catalog = crate::devices::Catalog::discover().unwrap();
-        let foreign = foreign_catalog.open_backend(registry::BackendName::Cpu).unwrap();
+        let foreign = foreign_catalog
+            .open_backend(registry::BackendName::Cpu)
+            .unwrap();
         assert_ne!(device.kind.identity(), foreign.kind.identity());
         let module = check_source(SourceSet::new(vec![SourceFile {
             path: "binding-device.seismic".into(),

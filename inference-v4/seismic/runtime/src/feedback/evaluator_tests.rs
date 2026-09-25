@@ -311,7 +311,8 @@ lower probe(indices: &tensor[64] i32, later: &tensor[64] i32, input: &tensor[1] 
         let buffers = variant
             .allocations()
             .iter()
-            .enumerate().map(|(ordinal, allocation)| {
+            .enumerate()
+            .map(|(ordinal, allocation)| {
                 let bytes: u64 = std::iter::once(allocation.byte_candidates().first())
                     .chain(allocation.byte_candidates().rest())
                     .map(|n| n.evaluate(&values).unwrap())
@@ -331,11 +332,25 @@ lower probe(indices: &tensor[64] i32, later: &tensor[64] i32, input: &tensor[1] 
                     )
                     .unwrap();
                 RuntimeBuffer {
-                    tensor: variant.bindings().arguments.iter().flatten().find(|view| view.allocation_index() == ordinal).map(|view| seismic_compiler::executable::RuntimeTensorGeometry {
-                        representation: view.representation,
-                        extents: view.extents.iter().map(|value| value.evaluate_u64(&values).unwrap()).collect(),
-                        strides: view.strides.iter().map(|value| value.evaluate_u64(&values).unwrap()).collect(),
-                    }),
+                    tensor: variant
+                        .bindings()
+                        .arguments
+                        .iter()
+                        .flatten()
+                        .find(|view| view.allocation_index() == ordinal)
+                        .map(|view| seismic_compiler::executable::RuntimeTensorGeometry {
+                            representation: view.representation,
+                            extents: view
+                                .extents
+                                .iter()
+                                .map(|value| value.evaluate_u64(&values).unwrap())
+                                .collect(),
+                            strides: view
+                                .strides
+                                .iter()
+                                .map(|value| value.evaluate_u64(&values).unwrap())
+                                .collect(),
+                        }),
                     buffer,
                     base_offset: 0,
                     accessible_bytes: bytes,
@@ -486,7 +501,8 @@ fn cpu_public_evaluator_selects_and_executes_an_independent_body() {
     let buffers = variant
         .allocations()
         .iter()
-        .enumerate().map(|(ordinal, allocation)| {
+        .enumerate()
+        .map(|(ordinal, allocation)| {
             let bytes: u64 = std::iter::once(allocation.byte_candidates().first())
                 .chain(allocation.byte_candidates().rest())
                 .map(|n| n.evaluate(&values).unwrap())
@@ -507,11 +523,25 @@ fn cpu_public_evaluator_selects_and_executes_an_independent_body() {
                 )
                 .unwrap();
             RuntimeBuffer {
-                tensor: variant.bindings().arguments.iter().flatten().find(|view| view.allocation_index() == ordinal).map(|view| seismic_compiler::executable::RuntimeTensorGeometry {
-                    representation: view.representation,
-                    extents: view.extents.iter().map(|value| value.evaluate_u64(&values).unwrap()).collect(),
-                    strides: view.strides.iter().map(|value| value.evaluate_u64(&values).unwrap()).collect(),
-                }),
+                tensor: variant
+                    .bindings()
+                    .arguments
+                    .iter()
+                    .flatten()
+                    .find(|view| view.allocation_index() == ordinal)
+                    .map(|view| seismic_compiler::executable::RuntimeTensorGeometry {
+                        representation: view.representation,
+                        extents: view
+                            .extents
+                            .iter()
+                            .map(|value| value.evaluate_u64(&values).unwrap())
+                            .collect(),
+                        strides: view
+                            .strides
+                            .iter()
+                            .map(|value| value.evaluate_u64(&values).unwrap())
+                            .collect(),
+                    }),
                 buffer,
                 base_offset: 0,
                 accessible_bytes: bytes,

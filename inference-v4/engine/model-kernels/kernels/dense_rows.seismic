@@ -37,18 +37,18 @@ fn dense_expand[M, O, H, F](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
 
 native dense_expand for metal from "metal/dense_expand.metal":
     static (H, F)
-    params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
-            arithmetic BATCH_FROM in [5, 3, 9], BATCH_SIMDGROUPS in [8, 4, 16, 32], BATCH_ROWS in [2, 1, 4],
-            TILE_M in [64, 128, 32], TILE_N in [64, 128])
+    params (arithmetic BATCH_FROM in [5, 3, 9])
     scratch normalized bytes (O * H * 2) when O > 16
     launch dense_expand_normalize when O > 16:
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch dense_expand_gemv when O < BATCH_FROM:
+        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32])
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(H, 32) * (min(O, 2) + 2 * min(O / 3, 1) + 4 * min(O / 5, 1)), 448) * 64)
     launch dense_expand_batch when O >= BATCH_FROM and O <= 16:
+        params (BATCH_SIMDGROUPS in [8, 4, 16, 32], code BATCH_ROWS in [2, 1, 4])
         threadgroups (ceil_div(F, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
         threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
         shared_bytes (16640)
@@ -56,6 +56,7 @@ native dense_expand for metal from "metal/dense_expand.metal":
         threadgroups (ceil_div(F, 32), ceil_div(O, 32), 1)
         threads_per_threadgroup (128, 1, 1)
     launch dense_expand_gemm when O > 64:
+        params (code TILE_M in [64, 128, 32], code TILE_N in [64, 128])
         threadgroups (ceil_div(F, TILE_N / 2), ceil_div(O, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
 
@@ -99,16 +100,16 @@ fn dense_output[M, O, H, F](residual: &tensor[M, H] f32,
 
 native dense_output for metal from "metal/dense_output.metal":
     static (H, F)
-    params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
-            arithmetic BATCH_FROM in [5, 3, 9], BATCH_SIMDGROUPS in [8, 4, 16, 32], BATCH_ROWS in [2, 1, 4],
-            TILE_M in [64, 128, 32], TILE_N in [64, 128], arithmetic SPLIT in [1, 2, 4])
+    params (arithmetic BATCH_FROM in [5, 3, 9], arithmetic SPLIT in [1, 2, 4])
     scratch partials bytes (SPLIT * O * H * 4) when O > 64 and SPLIT > 1
     scratch small_partials bytes (4 * O * H * 4) when O > 16 and O <= 64
     launch dense_output_gemv when O < BATCH_FROM:
+        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32])
         threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(F, 32) * (min(O, 2) + 2 * min(O / 3, 1) + 4 * min(O / 5, 1)), 448) * 64)
     launch dense_output_batch when O >= BATCH_FROM and O <= 16:
+        params (BATCH_SIMDGROUPS in [8, 4, 16, 32], code BATCH_ROWS in [2, 1, 4])
         threadgroups (ceil_div(H, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
         threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
         shared_bytes (16640)
@@ -119,6 +120,7 @@ native dense_output for metal from "metal/dense_output.metal":
         threadgroups (ceil_div(O * H, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch dense_output_gemm when O > 64:
+        params (code TILE_M in [64, 128, 32], code TILE_N in [64, 128])
         threadgroups (ceil_div(H, TILE_N), ceil_div(O, TILE_M), SPLIT)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
     launch dense_output_reduce when O > 64 and SPLIT > 1:

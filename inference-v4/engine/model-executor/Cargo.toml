@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+libc = "0.2"
 magnitude-artifacts = { path = "../artifacts" }
 magnitude-model-batching = { path = "../model-batching" }
 magnitude-model-contracts = { path = "../model-contracts" }

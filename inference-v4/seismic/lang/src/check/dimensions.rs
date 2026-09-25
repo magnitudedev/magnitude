@@ -127,7 +127,13 @@ pub(crate) fn plan_dimensions(
         .collect::<Vec<_>>();
     let specs = dimensions
         .iter()
-        .map(|dimension| (dimension.name.as_str(), dimension.symbol, dimension.admits_zero))
+        .map(|dimension| {
+            (
+                dimension.name.as_str(),
+                dimension.symbol,
+                dimension.admits_zero,
+            )
+        })
         .collect::<Vec<_>>();
     let nodes = observations
         .iter()
@@ -144,10 +150,14 @@ pub(crate) fn plan_dimensions(
     let known = |known: InferenceKnown| match known {
         InferenceKnown::Observation(index) => Known::Observation(observations[index].0.clone()),
         InferenceKnown::Expression(AnyExpr::Int(expression)) => {
-            match (super::prove::constant(arena, expression), arena.view(AnyExpr::Int(expression))) {
+            match (
+                super::prove::constant(arena, expression),
+                arena.view(AnyExpr::Int(expression)),
+            ) {
                 (Some(value), _) => Known::Constant(value),
                 (None, NodeView::Symbol(symbol)) => Known::Dimension(
-                    u32::try_from(ordinal(symbol)).expect("signature has more than u32::MAX dimensions"),
+                    u32::try_from(ordinal(symbol))
+                        .expect("signature has more than u32::MAX dimensions"),
                 ),
                 (None, _) => Known::Expression(expression),
             }
@@ -174,7 +184,10 @@ pub(crate) fn plan_dimensions(
         })
         .collect();
     Ok(DimensionPlan {
-        dimensions: dimensions.iter().map(|dimension| dimension.symbol).collect(),
+        dimensions: dimensions
+            .iter()
+            .map(|dimension| dimension.symbol)
+            .collect(),
         steps,
     })
 }
@@ -205,8 +218,9 @@ pub(crate) fn apply_at_call(
             | InverseOp::DivideExact(known)) = operation;
             let known = match known {
                 Known::Observation(axis) => actual(axis),
-                Known::Dimension(dimension) => solved[*dimension as usize]
-                    .expect("plan uses a dimension before its step"),
+                Known::Dimension(dimension) => {
+                    solved[*dimension as usize].expect("plan uses a dimension before its step")
+                }
                 Known::Constant(constant) => caller.int(*constant),
                 Known::Expression(expression) => {
                     let mut map = |symbol: SymbolId, _: &mut ExprArena| {

@@ -161,12 +161,12 @@ impl SubmissionTrace {
                     .map_err(TraceError::Execution)?,
             ),
             #[cfg(target_os = "macos")]
-            OpenedKind::Metal(opened) if detail == TraceDetail::Launches => Timeline::Metal(
-                Arc::new(
+            OpenedKind::Metal(opened) if detail == TraceDetail::Launches => {
+                Timeline::Metal(Arc::new(
                     seismic_metal::LaunchTimestamps::new(opened.service(), LAUNCH_SAMPLES)
                         .map_err(TraceError::Execution)?,
-                ),
-            ),
+                ))
+            }
             _ => Timeline::Host,
         };
         let sink = Arc::new(TraceSink {
@@ -174,7 +174,10 @@ impl SubmissionTrace {
             timeline,
             pending: Mutex::new(Vec::new()),
         });
-        let mut active = device.trace.lock().expect("trace slot lock is never poisoned");
+        let mut active = device
+            .trace
+            .lock()
+            .expect("trace slot lock is never poisoned");
         if active.is_some() {
             return Err(TraceError::AlreadyActive);
         }

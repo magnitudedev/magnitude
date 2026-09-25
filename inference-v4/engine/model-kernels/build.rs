@@ -4,7 +4,12 @@ use std::path::{Path, PathBuf};
 
 /// Every entry is implemented on each of these backends, one asset per
 /// backend at `kernels/<backend>/<entry>.<extension>`.
-const BACKENDS: [BackendName; 4] = [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan];
+const BACKENDS: [BackendName; 4] = [
+    BackendName::Cpu,
+    BackendName::Metal,
+    BackendName::Cuda,
+    BackendName::Vulkan,
+];
 
 /// Files of the per-backend trees that exist on only some backends: (path
 /// relative to `kernels/<backend>/`, without extension; the backends that have
@@ -130,7 +135,9 @@ fn tree_parity(kernels: &Path) -> Vec<String> {
         for file in files {
             let path = relative(&tree, &file);
             let extension = path.extension().and_then(|value| value.to_str());
-            if extension != Some(entry_extension(backend)) && extension != Some(library_extension(backend)) {
+            if extension != Some(entry_extension(backend))
+                && extension != Some(library_extension(backend))
+            {
                 violations.push(format!(
                     "`{}` is neither a `.{}` entry asset nor a `.{}` library file",
                     relative(kernels, &file).display(),

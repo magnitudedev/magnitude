@@ -37,55 +37,62 @@ typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
     projection::Store<activation> value_out{value, SEISMIC_RESULT_2_STRIDE_0,           \
         SEISMIC_RESULT_2_STRIDE_1, 0}
 
+#ifdef SEISMIC_FORMING_GATED_ATTENTION_PROJECT_GEMV
+template <uint ROWS, uint LANES>
 kernel void gated_attention_project_gemv(ATTENTION_PROJECT_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     ATTENTION_PROJECT_OPERANDS;
-    constexpr uint SG = SEISMIC_TUNE_SIMDGROUPS, R = SEISMIC_TUNE_ROWS, L = SEISMIC_TUNE_LANES;
-    constexpr uint per = projection::gemv_threadgroup_rows<SG, R, L>();
+    uint per = simdgroups * ROWS * (32u / LANES);
     uint rows = uint(SEISMIC_DIM_M);
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
-    projection::threadgroup_squares<SG>(in, rows, squares, sg, lane);
+    projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
     projection::SharedNorm<decltype(in)> x{in, squares};
     uint t0 = (query_rows + per - 1) / per, t1 = (kv_rows + per - 1) / per;
     if (tile < t0) {
-        PROJECTION_FOR_ROWS(rows, projection::gemv<packets::W0, SG, R, MAXM, L>(
-            x, query_out, query_w, rows, query_rows, k, tile, shared, sg, lane));
+        PROJECTION_FOR_ROWS(rows, projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>(
+            x, query_out, query_w, rows, query_rows, k, tile, shared, simdgroups, sg, lane));
     } else if (tile < t0 + t1) {
-        PROJECTION_FOR_ROWS(rows, projection::gemv<packets::W1, SG, R, MAXM, L>(
-            x, key_out, key_w, rows, kv_rows, k, tile - t0, shared, sg, lane));
+        PROJECTION_FOR_ROWS(rows, projection::gemv_runtime<packets::W1, ROWS, MAXM, LANES>(
+            x, key_out, key_w, rows, kv_rows, k, tile - t0, shared, simdgroups, sg, lane));
     } else {
-        PROJECTION_FOR_ROWS(rows, projection::gemv<packets::W2, SG, R, MAXM, L>(
-            x, value_out, value_w, rows, kv_rows, k, tile - t0 - t1, shared, sg, lane));
+        PROJECTION_FOR_ROWS(rows, projection::gemv_runtime<packets::W2, ROWS, MAXM, LANES>(
+            x, value_out, value_w, rows, kv_rows, k, tile - t0 - t1, shared, simdgroups, sg, lane));
     }
 }
+#endif
 
+#ifdef SEISMIC_FORMING_GATED_ATTENTION_PROJECT_BATCH
+template <uint BATCH_ROWS>
 kernel void gated_attention_project_batch(ATTENTION_PROJECT_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     ATTENTION_PROJECT_OPERANDS;
-    constexpr uint SG = SEISMIC_TUNE_BATCH_SIMDGROUPS, R = SEISMIC_TUNE_BATCH_ROWS;
-    constexpr uint per = projection::gemv_batch_threadgroup_rows<SG, R>();
+    uint per = simdgroups * BATCH_ROWS * 8u;
     uint rows = uint(SEISMIC_DIM_M);
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
-    projection::threadgroup_squares<SG>(in, rows, squares, sg, lane);
+    projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
     projection::SharedNorm<decltype(in)> x{in, squares};
     uint t0 = (query_rows + per - 1) / per, t1 = (kv_rows + per - 1) / per;
     if (tile < t0)
-        projection::gemv_batch<packets::W0, SG, R>(x, query_out, query_w, rows, query_rows, k, tile, shared, sg,
-            lane);
+        projection::gemv_batch_runtime<packets::W0, BATCH_ROWS>(x, query_out, query_w, rows, query_rows, k,
+            tile, shared, simdgroups, sg, lane);
     else if (tile < t0 + t1)
-        projection::gemv_batch<packets::W1, SG, R>(x, key_out, key_w, rows, kv_rows, k, tile - t0, shared, sg,
-            lane);
+        projection::gemv_batch_runtime<packets::W1, BATCH_ROWS>(x, key_out, key_w, rows, kv_rows, k,
+            tile - t0, shared, simdgroups, sg, lane);
     else
-        projection::gemv_batch<packets::W2, SG, R>(x, value_out, value_w, rows, kv_rows, k, tile - t0 - t1,
-            shared, sg, lane);
+        projection::gemv_batch_runtime<packets::W2, BATCH_ROWS>(x, value_out, value_w, rows, kv_rows, k,
+            tile - t0 - t1, shared, simdgroups, sg, lane);
 }
+#endif
 
+#ifdef SEISMIC_FORMING_GATED_ATTENTION_PROJECT_STAGE
 kernel void gated_attention_project_stage(ATTENTION_PROJECT_ARGUMENTS,
     uint item [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
@@ -93,6 +100,7 @@ kernel void gated_attention_project_stage(ATTENTION_PROJECT_ARGUMENTS,
     ATTENTION_PROJECT_OPERANDS;
     projection::device_normalize<256>(in, item, normalized, k, norms, thread_index);
 }
+#endif
 
 #define ATTENTION_PROJECT_GEMM(TM, TN)                                                  \
     PROJECTION_GEMM_SHARED(shared, TM, TN);                                             \
@@ -110,16 +118,21 @@ kernel void gated_attention_project_stage(ATTENTION_PROJECT_ARGUMENTS,
             sg, lane)
 
 // 17..64 rows: the fixed small-row tile.
+#ifdef SEISMIC_FORMING_GATED_ATTENTION_PROJECT_GEMM_SMALL
 kernel void gated_attention_project_gemm_small(ATTENTION_PROJECT_ARGUMENTS,
     uint2 tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     ATTENTION_PROJECT_GEMM(projection::small_tile_m, projection::small_tile_n);
 }
+#endif
 
+#ifdef SEISMIC_FORMING_GATED_ATTENTION_PROJECT_GEMM
+template <uint TILE_M, uint TILE_N>
 kernel void gated_attention_project_gemm(ATTENTION_PROJECT_ARGUMENTS,
     uint2 tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    ATTENTION_PROJECT_GEMM(SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N);
+    ATTENTION_PROJECT_GEMM(TILE_M, TILE_N);
 }
+#endif

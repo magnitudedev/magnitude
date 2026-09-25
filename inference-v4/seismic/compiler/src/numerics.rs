@@ -1,10 +1,10 @@
 //! Numerical applicability follows the selected source construction.
 //! A required body executes the checked operations; a replacement needs an
 //! established whole-outcome relation before it can be admitted.
-use seismic_lang::expr::{BoolExpr, ExprArena};
-use seismic_lang::precision::{PrecisionPolicy, Tolerance};
 use crate::portable::outcome_relation::{self, DerivedOutcome};
+use seismic_lang::expr::{BoolExpr, ExprArena};
 pub use seismic_lang::precision;
+use seismic_lang::precision::{PrecisionPolicy, Tolerance};
 
 /// Resolution of the actual selected body and all of its selected callees.
 /// This is produced only by source construction, never by observations.
@@ -14,15 +14,18 @@ pub struct NumericalApplicability {
 }
 impl NumericalApplicability {
     pub(crate) fn required_source() -> Self {
-        Self { derived: DerivedOutcome::Exact }
+        Self {
+            derived: DerivedOutcome::Exact,
+        }
     }
 
     pub(crate) fn selected_child(&mut self, child: &Self) {
         if matches!(self.derived, DerivedOutcome::Exact) {
             self.derived = match child.derived {
                 DerivedOutcome::Exact => DerivedOutcome::Exact,
-                DerivedOutcome::DiscreteProvenFloatingUnbounded =>
-                    DerivedOutcome::Pending("nonexact helper replacement has no composed whole-entry analysis"),
+                DerivedOutcome::DiscreteProvenFloatingUnbounded => DerivedOutcome::Pending(
+                    "nonexact helper replacement has no composed whole-entry analysis",
+                ),
                 DerivedOutcome::Pending(reason) => DerivedOutcome::Pending(reason),
             };
         }
@@ -39,26 +42,36 @@ impl NumericalApplicability {
         if !matches!(children.derived, DerivedOutcome::Exact) {
             return children.clone();
         }
-        Self { derived: outcome_relation::derive(arena,program,function,bindings,executable) }
+        Self {
+            derived: outcome_relation::derive(arena, program, function, bindings, executable),
+        }
     }
-    pub fn is_exact(&self) -> bool { matches!(self.derived,DerivedOutcome::Exact) }
+    pub fn is_exact(&self) -> bool {
+        matches!(self.derived, DerivedOutcome::Exact)
+    }
     pub fn pending_reason(&self) -> Option<&'static str> {
         match self.derived {
             DerivedOutcome::Pending(reason) => Some(reason),
-            DerivedOutcome::DiscreteProvenFloatingUnbounded => Some("floating numerical bound is not established"),
+            DerivedOutcome::DiscreteProvenFloatingUnbounded => {
+                Some("floating numerical bound is not established")
+            }
             DerivedOutcome::Exact => None,
         }
     }
-    pub(crate) fn basis(&self, policy:&PrecisionPolicy) -> Option<NumericalBasis> {
-        match (&self.derived,policy) {
-            (DerivedOutcome::Exact,_) => Some(NumericalBasis::Exact),
-            (DerivedOutcome::DiscreteProvenFloatingUnbounded,PrecisionPolicy::Unconstrained) => Some(NumericalBasis::Unknown),
+    pub(crate) fn basis(&self, policy: &PrecisionPolicy) -> Option<NumericalBasis> {
+        match (&self.derived, policy) {
+            (DerivedOutcome::Exact, _) => Some(NumericalBasis::Exact),
+            (DerivedOutcome::DiscreteProvenFloatingUnbounded, PrecisionPolicy::Unconstrained) => {
+                Some(NumericalBasis::Unknown)
+            }
             _ => None,
         }
     }
     #[cfg(test)]
     pub(crate) fn unresolved_fixture() -> Self {
-        Self { derived:DerivedOutcome::Pending("native-only fixture has no checked outcome") }
+        Self {
+            derived: DerivedOutcome::Pending("native-only fixture has no checked outcome"),
+        }
     }
 }
 
@@ -96,12 +109,22 @@ pub enum NumericalBasis {
 /// Policy projection of construction-owned applicability. An unresolved
 /// alternative remains structural domain membership, never an executable grant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct StructuralNumericalObligation { analytic: BoolExpr }
-impl StructuralNumericalObligation {
-    pub fn analytic_predicate(self) -> BoolExpr { self.analytic }
+pub struct StructuralNumericalObligation {
+    analytic: BoolExpr,
 }
-pub fn structural_obligation(arena:&mut ExprArena, applicability:&NumericalApplicability, policy:&PrecisionPolicy) -> StructuralNumericalObligation {
-    StructuralNumericalObligation { analytic:arena.bool(applicability.basis(policy).is_some()) }
+impl StructuralNumericalObligation {
+    pub fn analytic_predicate(self) -> BoolExpr {
+        self.analytic
+    }
+}
+pub fn structural_obligation(
+    arena: &mut ExprArena,
+    applicability: &NumericalApplicability,
+    policy: &PrecisionPolicy,
+) -> StructuralNumericalObligation {
+    StructuralNumericalObligation {
+        analytic: arena.bool(applicability.basis(policy).is_some()),
+    }
 }
 
 mod internals {

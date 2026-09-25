@@ -11,14 +11,12 @@
 //! argument set owns those tables as case state.
 
 use super::{
-    row_points, served_row_points, CaseState, EntryTuning, PointShape, TuningInputs,
-    TuningLimits,
+    row_points, served_row_points, CaseState, EntryTuning, PointShape, TuningInputs, TuningLimits,
 };
 use crate::programs::graph::routed::{grouped_blocks, DECODE_ROWS, TILE_ROWS};
 use magnitude_model_contracts::{FeedForwardGeometry, WeightKind, WeightScope};
 use magnitude_model_kernels::{
-    routed_combine, routed_expand, routed_experts, routed_group,
-    routed_output, routed_route,
+    routed_combine, routed_expand, routed_experts, routed_group, routed_output, routed_route,
 };
 use seismic::{Element, Tensor};
 
@@ -83,7 +81,11 @@ fn routes(rows: u64, shape: RoutedShape) -> Vec<i32> {
 
 /// The tables `routed_group` forms from `routes`: (order [B, T],
 /// inverse [M, K], blocks [B]).
-fn group(routes: &[i32], rows: u64, shape: RoutedShape) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>), String> {
+fn group(
+    routes: &[i32],
+    rows: u64,
+    shape: RoutedShape,
+) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>), String> {
     let blocks = grouped_blocks(rows, shape.experts, shape.selected)?;
     let tile = TILE_ROWS as usize;
     let mut order = vec![-1; blocks as usize * tile];
@@ -112,7 +114,12 @@ fn group(routes: &[i32], rows: u64, shape: RoutedShape) -> Result<(Vec<i32>, Vec
     Ok((order, inverse, table))
 }
 
-fn scores(inputs: &TuningInputs<'_, '_>, rows: u64, shape: RoutedShape, seed: u64) -> Result<Tensor, String> {
+fn scores(
+    inputs: &TuningInputs<'_, '_>,
+    rows: u64,
+    shape: RoutedShape,
+    seed: u64,
+) -> Result<Tensor, String> {
     inputs.activation(Element::f32(), &[rows, shape.selected], seed)
 }
 
@@ -187,14 +194,22 @@ impl EntryTuning for RoutedRouteTuning {
 
     fn statics(&self, _: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.shape;
-        Ok(vec![("H", shape.hidden), ("E", shape.experts), ("K", shape.selected)])
+        Ok(vec![
+            ("H", shape.hidden),
+            ("E", shape.experts),
+            ("K", shape.selected),
+        ])
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
         row_points(limits)
     }
 
-    fn rotation(&self, inputs: &mut TuningInputs<'_, '_>, point: &PointShape) -> Result<Vec<Self::Case>, String> {
+    fn rotation(
+        &self,
+        inputs: &mut TuningInputs<'_, '_>,
+        point: &PointShape,
+    ) -> Result<Vec<Self::Case>, String> {
         let (shape, rows) = (self.shape, point.rows);
         let normalize = i32::from(self.normalize(inputs)?);
         TuningInputs::rotation_scopes(&self.scopes, point)
@@ -204,7 +219,11 @@ impl EntryTuning for RoutedRouteTuning {
                 let routes = inputs.scratch(Element::i32(), &[rows, shape.selected])?;
                 let scores = inputs.scratch(Element::f32(), &[rows, shape.selected])?;
                 Ok(RoutedRouteCase {
-                    residual: inputs.activation(Element::f32(), &[rows, shape.hidden], index as u64 + 1)?,
+                    residual: inputs.activation(
+                        Element::f32(),
+                        &[rows, shape.hidden],
+                        index as u64 + 1,
+                    )?,
                     norm: inputs.weight(scope, WeightKind::FeedForwardNorm)?,
                     router: inputs.weight(scope, WeightKind::Router)?,
                     shared_router: inputs.weight(scope, WeightKind::SharedRouter)?,
@@ -269,7 +288,11 @@ impl EntryTuning for RoutedGroupTuning {
 
     /// One argument set: the tables are small and stay cache resident in a
     /// real step as well.
-    fn rotation(&self, inputs: &mut TuningInputs<'_, '_>, point: &PointShape) -> Result<Vec<Self::Case>, String> {
+    fn rotation(
+        &self,
+        inputs: &mut TuningInputs<'_, '_>,
+        point: &PointShape,
+    ) -> Result<Vec<Self::Case>, String> {
         let (shape, rows) = (self.shape, point.rows);
         let blocks = grouped_blocks(rows, shape.experts, shape.selected)?;
         let table = |extents: &[u64]| -> Result<CaseState, String> {
@@ -352,22 +375,36 @@ impl EntryTuning for RoutedExpandTuning {
 
     fn statics(&self, _: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.shape;
-        Ok(vec![("H", shape.hidden), ("K", shape.selected), ("F", shape.features), ("S", shape.shared)])
+        Ok(vec![
+            ("H", shape.hidden),
+            ("K", shape.selected),
+            ("F", shape.features),
+            ("S", shape.shared),
+        ])
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
         decode_points(limits)
     }
 
-    fn rotation(&self, inputs: &mut TuningInputs<'_, '_>, point: &PointShape) -> Result<Vec<Self::Case>, String> {
+    fn rotation(
+        &self,
+        inputs: &mut TuningInputs<'_, '_>,
+        point: &PointShape,
+    ) -> Result<Vec<Self::Case>, String> {
         let shape = self.shape;
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
             .enumerate()
             .map(|(index, scope)| {
                 Ok(RoutedExpandCase {
-                    normalized: inputs.activation(self.activation, &[point.rows, shape.hidden], index as u64 + 1)?,
-                    routes: inputs.i32s(&[point.rows, shape.selected], &routes(point.rows, shape))?,
+                    normalized: inputs.activation(
+                        self.activation,
+                        &[point.rows, shape.hidden],
+                        index as u64 + 1,
+                    )?,
+                    routes: inputs
+                        .i32s(&[point.rows, shape.selected], &routes(point.rows, shape))?,
                     expert_gate: inputs.weight(scope, WeightKind::ExpertGate)?,
                     expert_up: inputs.weight(scope, WeightKind::ExpertUp)?,
                     shared_gate: inputs.weight(scope, WeightKind::SharedGate)?,
@@ -437,14 +474,23 @@ impl EntryTuning for RoutedOutputTuning {
 
     fn statics(&self, _: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.shape;
-        Ok(vec![("H", shape.hidden), ("K", shape.selected), ("F", shape.features), ("S", shape.shared)])
+        Ok(vec![
+            ("H", shape.hidden),
+            ("K", shape.selected),
+            ("F", shape.features),
+            ("S", shape.shared),
+        ])
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
         decode_points(limits)
     }
 
-    fn rotation(&self, inputs: &mut TuningInputs<'_, '_>, point: &PointShape) -> Result<Vec<Self::Case>, String> {
+    fn rotation(
+        &self,
+        inputs: &mut TuningInputs<'_, '_>,
+        point: &PointShape,
+    ) -> Result<Vec<Self::Case>, String> {
         let (shape, rows) = (self.shape, point.rows);
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
@@ -453,8 +499,16 @@ impl EntryTuning for RoutedOutputTuning {
                 let seed = 8 * index as u64;
                 Ok(RoutedOutputCase {
                     residual: inputs.activation(Element::f32(), &[rows, shape.hidden], seed + 1)?,
-                    expert_product: inputs.activation(self.activation, &[rows, shape.selected, shape.features], seed + 2)?,
-                    shared_product: inputs.activation(self.activation, &[rows, shape.shared], seed + 3)?,
+                    expert_product: inputs.activation(
+                        self.activation,
+                        &[rows, shape.selected, shape.features],
+                        seed + 2,
+                    )?,
+                    shared_product: inputs.activation(
+                        self.activation,
+                        &[rows, shape.shared],
+                        seed + 3,
+                    )?,
                     routes: inputs.i32s(&[rows, shape.selected], &routes(rows, shape))?,
                     scores: scores(inputs, rows, shape, seed + 4)?,
                     coefficient: inputs.activation(Element::f32(), &[rows], seed + 5)?,
@@ -533,7 +587,11 @@ impl EntryTuning for RoutedExpertsTuning {
         grouped_points(limits)
     }
 
-    fn rotation(&self, inputs: &mut TuningInputs<'_, '_>, point: &PointShape) -> Result<Vec<Self::Case>, String> {
+    fn rotation(
+        &self,
+        inputs: &mut TuningInputs<'_, '_>,
+        point: &PointShape,
+    ) -> Result<Vec<Self::Case>, String> {
         let (shape, rows) = (self.shape, point.rows);
         let (order, _, table) = group(&routes(rows, shape), rows, shape)?;
         let blocks = table.len() as u64;
@@ -542,7 +600,11 @@ impl EntryTuning for RoutedExpertsTuning {
             .enumerate()
             .map(|(index, scope)| {
                 Ok(RoutedExpertsCase {
-                    normalized: inputs.activation(self.activation, &[rows, shape.hidden], index as u64 + 1)?,
+                    normalized: inputs.activation(
+                        self.activation,
+                        &[rows, shape.hidden],
+                        index as u64 + 1,
+                    )?,
                     order: inputs.i32s(&[blocks, TILE_ROWS], &order)?,
                     blocks: inputs.i32s(&[blocks], &table)?,
                     expert_gate: inputs.weight(scope, WeightKind::ExpertGate)?,
@@ -617,14 +679,22 @@ impl EntryTuning for RoutedCombineTuning {
 
     fn statics(&self, _: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.shape;
-        Ok(vec![("H", shape.hidden), ("K", shape.selected), ("S", shape.shared)])
+        Ok(vec![
+            ("H", shape.hidden),
+            ("K", shape.selected),
+            ("S", shape.shared),
+        ])
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
         grouped_points(limits)
     }
 
-    fn rotation(&self, inputs: &mut TuningInputs<'_, '_>, point: &PointShape) -> Result<Vec<Self::Case>, String> {
+    fn rotation(
+        &self,
+        inputs: &mut TuningInputs<'_, '_>,
+        point: &PointShape,
+    ) -> Result<Vec<Self::Case>, String> {
         let (shape, rows) = (self.shape, point.rows);
         let (_, inverse, table) = group(&routes(rows, shape), rows, shape)?;
         let blocks = table.len() as u64;
@@ -635,10 +705,18 @@ impl EntryTuning for RoutedCombineTuning {
                 let seed = 8 * index as u64;
                 Ok(RoutedCombineCase {
                     residual: inputs.activation(Element::f32(), &[rows, shape.hidden], seed + 1)?,
-                    expert_output: inputs.activation(self.activation, &[blocks, TILE_ROWS, shape.hidden], seed + 2)?,
+                    expert_output: inputs.activation(
+                        self.activation,
+                        &[blocks, TILE_ROWS, shape.hidden],
+                        seed + 2,
+                    )?,
                     inverse: inputs.i32s(&[rows, shape.selected], &inverse)?,
                     scores: scores(inputs, rows, shape, seed + 3)?,
-                    normalized: inputs.activation(self.activation, &[rows, shape.hidden], seed + 4)?,
+                    normalized: inputs.activation(
+                        self.activation,
+                        &[rows, shape.hidden],
+                        seed + 4,
+                    )?,
                     coefficient: inputs.activation(Element::f32(), &[rows], seed + 5)?,
                     shared_gate: inputs.weight(scope, WeightKind::SharedGate)?,
                     shared_up: inputs.weight(scope, WeightKind::SharedUp)?,

@@ -3,7 +3,9 @@
 //! and storage behind the shared allocation core.
 
 use super::{Descriptor, DiscoveredDevice, DiscoveredMemory};
-use crate::devices::{Availability, CapacityBasis, DeviceInfo, DeviceKind, DeviceSelector, LedgerKey, OpenError};
+use crate::devices::{
+    Availability, CapacityBasis, DeviceInfo, DeviceKind, DeviceSelector, LedgerKey, OpenError,
+};
 use crate::driver::{self, Allocation, AllocationLimits, Storage};
 use crate::memory::{MemoryDomain, MemoryUsage};
 use crate::native::abi::vulkan::VulkanFeatures;
@@ -36,7 +38,11 @@ pub(super) fn discovered(description: seismic_vulkan::Description) -> Discovered
     DiscoveredDevice {
         selector: DeviceSelector::Vulkan { uuid: facts.uuid },
         name: facts.name.clone(),
-        kind: if facts.is_gpu() { DeviceKind::Gpu } else { DeviceKind::Cpu },
+        kind: if facts.is_gpu() {
+            DeviceKind::Gpu
+        } else {
+            DeviceKind::Cpu
+        },
         backend: BackendName::Vulkan,
         availability: match description.floor {
             Ok(()) => Availability::Available,
@@ -55,7 +61,11 @@ pub(crate) struct VulkanOpened {
 }
 
 impl VulkanOpened {
-    pub(super) fn open(uuid: [u8; 16], info: &DeviceInfo, memory: Arc<MemoryDomain>) -> Result<Self, OpenError> {
+    pub(super) fn open(
+        uuid: [u8; 16],
+        info: &DeviceInfo,
+        memory: Arc<MemoryDomain>,
+    ) -> Result<Self, OpenError> {
         let service = seismic_vulkan::Device::open(uuid).map_err(|error| match error {
             seismic_vulkan::OpenError::Missing => OpenError::IdentityChanged(info.selector),
             other => OpenError::Backend(TargetError::DeviceUnavailable(other.to_string())),
@@ -91,7 +101,7 @@ impl VulkanOpened {
         self.memory.usage()
     }
 
-    pub(crate) fn set_memory_limit(&self, limit: Option<u64>) -> Result<(), crate::memory::MemoryLimitError> {
+    pub(crate) fn set_memory_limit(&self, limit: Option<u64>) {
         self.memory.set_limit(limit)
     }
 
@@ -114,12 +124,24 @@ impl VulkanOpened {
         })
     }
 
-    pub(crate) fn allocate(&self, bytes: u64, alignment: u64) -> Result<Arc<Allocation>, ExecutionError> {
-        self.allocate_with(bytes, alignment, |service| service.allocate(bytes, alignment))
+    pub(crate) fn allocate(
+        &self,
+        bytes: u64,
+        alignment: u64,
+    ) -> Result<Arc<Allocation>, ExecutionError> {
+        self.allocate_with(bytes, alignment, |service| {
+            service.allocate(bytes, alignment)
+        })
     }
 
-    pub(crate) fn allocate_upload(&self, bytes: u64, alignment: u64) -> Result<Arc<Allocation>, ExecutionError> {
-        self.allocate_with(bytes, alignment, |service| service.allocate_upload(bytes, alignment))
+    pub(crate) fn allocate_upload(
+        &self,
+        bytes: u64,
+        alignment: u64,
+    ) -> Result<Arc<Allocation>, ExecutionError> {
+        self.allocate_with(bytes, alignment, |service| {
+            service.allocate_upload(bytes, alignment)
+        })
     }
 }
 

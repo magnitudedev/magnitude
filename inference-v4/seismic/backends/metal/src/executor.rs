@@ -12,9 +12,9 @@ use seismic_compiler::executable::{
     ExecutableAllocationId, ExecutableCommand, ExecutableKernelId, ExecutionEnvironment,
     KernelAbiBindings, NativeExecution, NativeExecutor, NativeSubmission, RuntimeBuffer,
 };
+use seismic_ir::physical_target::KernelAbiAllocationRole;
 use seismic_ir::schedule::{AnyScalarSlot, FillValue};
 use seismic_ir::storage::LaunchLocalKind;
-use seismic_ir::physical_target::KernelAbiAllocationRole;
 use seismic_lang::expr::SymbolValue;
 
 pub struct MetalExecutor {
@@ -572,7 +572,7 @@ mod completion_tests {
                 &mut submission,
                 &pipeline,
                 &RuntimeBuffer {
-            tensor: None,
+                    tensor: None,
                     buffer: buffer.clone(),
                     base_offset: offset,
                     accessible_bytes: 16,
@@ -654,6 +654,9 @@ fn abi_buffer<'a>(
     env.buffer(abi.allocation(role))
 }
 fn encode_symbol(value: SymbolValue) -> Result<u64, ExecutionError> {
-    value.try_word64().map_err(|error| ExecutionError::ConstructionContradiction(
-        format!("native scalar ABI quantity does not fit its planned word: {error:?}")))
+    value.try_word64().map_err(|error| {
+        ExecutionError::ConstructionContradiction(format!(
+            "native scalar ABI quantity does not fit its planned word: {error:?}"
+        ))
+    })
 }

@@ -48,9 +48,8 @@ impl Device {
         (m.charged, m.limit, m.pool_charged)
     }
     fn set_memory_limit(&self, bytes: Option<u64>) -> PyResult<()> {
-        self.inner
-            .set_memory_limit(bytes)
-            .map_err(|e| error(d::Error::new("TensorError", e)))
+        self.inner.set_memory_limit(bytes);
+        Ok(())
     }
     fn __repr__(&self) -> String {
         format!("Device({}, {:?})", self.backend(), self.name())
@@ -232,8 +231,8 @@ impl Scalar {
                     .map_err(|_| pyo3::exceptions::PyOverflowError::new_err("u32 word"))?,
             ),
             "bool" if word <= 1 => d::Scalar::Bool(word != 0),
-            "index" => d::Scalar::Index(word),
-            "range" => d::Scalar::Range(word, end),
+            "index" => d::Scalar::Index(word.into()),
+            "range" => d::Scalar::Range(word.into(), end.into()),
             _ => {
                 return Err(pyo3::exceptions::PyValueError::new_err(
                     "invalid scalar kind or word",
@@ -285,8 +284,24 @@ fn result(py: Python<'_>, v: d::Value) -> PyResult<Py<PyAny>> {
                 d::Scalar::I32(v) => ("i32", v as u32 as u64, 0),
                 d::Scalar::U32(v) => ("u32", v as u64, 0),
                 d::Scalar::Bool(v) => ("bool", v as u64, 0),
-                d::Scalar::Index(v) => ("index", v, 0),
-                d::Scalar::Range(a, b) => ("range", a, b),
+                d::Scalar::Index(v) => (
+                    "index",
+                    u64::try_from(v).map_err(|_| {
+                        pyo3::exceptions::PyOverflowError::new_err("index does not fit in u64")
+                    })?,
+                    0,
+                ),
+                d::Scalar::Range(a, b) => (
+                    "range",
+                    u64::try_from(a).map_err(|_| {
+                        pyo3::exceptions::PyOverflowError::new_err(
+                            "range start does not fit in u64",
+                        )
+                    })?,
+                    u64::try_from(b).map_err(|_| {
+                        pyo3::exceptions::PyOverflowError::new_err("range end does not fit in u64")
+                    })?,
+                ),
             };
             (k, a, b).into_pyobject(py)?.into_any().unbind()
         }

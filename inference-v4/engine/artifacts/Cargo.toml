@@ -8,3 +8,6 @@ license.workspace = true
 image = { version = "=0.25.8", default-features = false, features = ["jpeg", "png", "webp"] }
 serde.workspace = true
 sha2 = "=0.11.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -99,7 +99,10 @@ mod tests {
         let (significand, scale) = if exponent == 0 {
             (fraction, 1 - bias - fraction_bits)
         } else {
-            (fraction | (1 << fraction_bits), exponent - bias - fraction_bits)
+            (
+                fraction | (1 << fraction_bits),
+                exponent - bias - fraction_bits,
+            )
         };
         sign * f64::from(significand) * 2f64.powi(scale)
     }
@@ -205,7 +208,11 @@ mod tests {
                 } else {
                     nearest_even_to(to, value)
                 };
-                assert_eq!(convert_bits(from, to, bits), expected, "{from:?} {bits:#06x}");
+                assert_eq!(
+                    convert_bits(from, to, bits),
+                    expected,
+                    "{from:?} {bits:#06x}"
+                );
             }
         }
     }
@@ -254,7 +261,11 @@ mod tests {
                 } else {
                     nearest_even_to(dtype, value)
                 };
-                assert_eq!(convert_bits(DType::F32, dtype, bits), expected, "{bits:#010x}");
+                assert_eq!(
+                    convert_bits(DType::F32, dtype, bits),
+                    expected,
+                    "{bits:#010x}"
+                );
             }
         }
     }
@@ -276,19 +287,40 @@ mod tests {
             for bits in 0..=0xffffu32 {
                 let value = narrow_value(from, bits);
                 for to in [DType::I32, DType::U32] {
-                    assert_eq!(convert_bits(from, to, bits), expected(value, to), "{from:?}");
+                    assert_eq!(
+                        convert_bits(from, to, bits),
+                        expected(value, to),
+                        "{from:?}"
+                    );
                 }
             }
         }
         let mut samples = Samples(3);
         let edges = [
-            0x4f00_0000, 0xcf00_0000, 0x4eff_ffff, 0xcf00_0001, 0x4f80_0000, 0x4f7f_ffff,
-            0x7f80_0000, 0xff80_0000, 0x7fc0_1234, 0x8000_0000, 0x3f7f_ffff, 0xbf7f_ffff,
+            0x4f00_0000,
+            0xcf00_0000,
+            0x4eff_ffff,
+            0xcf00_0001,
+            0x4f80_0000,
+            0x4f7f_ffff,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc0_1234,
+            0x8000_0000,
+            0x3f7f_ffff,
+            0xbf7f_ffff,
         ];
-        for bits in edges.into_iter().chain((0..(1 << 16)).map(|_| samples.next() as u32)) {
+        for bits in edges
+            .into_iter()
+            .chain((0..(1 << 16)).map(|_| samples.next() as u32))
+        {
             let value = f64::from(f32::from_bits(bits));
             for to in [DType::I32, DType::U32] {
-                assert_eq!(convert_bits(DType::F32, to, bits), expected(value, to), "{bits:#010x}");
+                assert_eq!(
+                    convert_bits(DType::F32, to, bits),
+                    expected(value, to),
+                    "{bits:#010x}"
+                );
             }
         }
     }
@@ -296,18 +328,44 @@ mod tests {
     #[test]
     fn integers_and_booleans_convert_through_the_recipe() {
         let mut samples = Samples(4);
-        let edges = [0u32, 1, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff, 0x0100_0001, 0x0100_0003];
-        for bits in edges.into_iter().chain((0..(1 << 14)).map(|_| samples.next() as u32)) {
+        let edges = [
+            0u32,
+            1,
+            0x7fff_ffff,
+            0x8000_0000,
+            0xffff_ffff,
+            0x0100_0001,
+            0x0100_0003,
+        ];
+        for bits in edges
+            .into_iter()
+            .chain((0..(1 << 14)).map(|_| samples.next() as u32))
+        {
             let signed = f64::from(bits as i32);
             let unsigned = f64::from(bits);
-            assert_eq!(convert_bits(DType::I32, DType::F32, bits), (bits as i32 as f32).to_bits());
-            assert_eq!(convert_bits(DType::U32, DType::F32, bits), (bits as f32).to_bits());
+            assert_eq!(
+                convert_bits(DType::I32, DType::F32, bits),
+                (bits as i32 as f32).to_bits()
+            );
+            assert_eq!(
+                convert_bits(DType::U32, DType::F32, bits),
+                (bits as f32).to_bits()
+            );
             for dtype in [DType::F16, DType::BF16] {
-                assert_eq!(convert_bits(DType::I32, dtype, bits), nearest_even_to(dtype, signed));
-                assert_eq!(convert_bits(DType::U32, dtype, bits), nearest_even_to(dtype, unsigned));
+                assert_eq!(
+                    convert_bits(DType::I32, dtype, bits),
+                    nearest_even_to(dtype, signed)
+                );
+                assert_eq!(
+                    convert_bits(DType::U32, dtype, bits),
+                    nearest_even_to(dtype, unsigned)
+                );
             }
             assert_eq!(convert_bits(DType::I32, DType::U32, bits), bits);
-            assert_eq!(convert_bits(DType::U32, DType::Bool, bits), u32::from(bits != 0));
+            assert_eq!(
+                convert_bits(DType::U32, DType::Bool, bits),
+                u32::from(bits != 0)
+            );
         }
         for dtype in FLOATS {
             assert_eq!(convert_bits(DType::Bool, dtype, 1), quantize(dtype, 1.0));
@@ -330,7 +388,11 @@ mod tests {
                 }
                 continue;
             }
-            assert_eq!(quantize(DType::F32, value), (value as f32).to_bits(), "{value:e}");
+            assert_eq!(
+                quantize(DType::F32, value),
+                (value as f32).to_bits(),
+                "{value:e}"
+            );
         }
         for dtype in [DType::F16, DType::BF16] {
             let infinity = if dtype == DType::F16 { 0x7c00 } else { 0x7f80 };
@@ -414,26 +476,39 @@ mod tests {
         let mut samples = Samples(7);
         for _ in 0..(1 << 16) {
             let a = samples.next() as u32;
-            let b = if samples.next() & 1 == 0 { a ^ 0x8000_0000 } else { samples.next() as u32 };
+            let b = if samples.next() & 1 == 0 {
+                a ^ 0x8000_0000
+            } else {
+                samples.next() as u32
+            };
             for op in OPS {
                 let (x, y) = (f32::from_bits(a), f32::from_bits(b));
-                assert_eq!(compare_bits(op, DType::F32, a, b), expected(op, x.into(), y.into()));
-                assert_eq!(compare_bits(op, DType::I32, a, b), match op {
-                    CmpOp::Eq => a == b,
-                    CmpOp::Ne => a != b,
-                    CmpOp::Lt => (a as i32) < (b as i32),
-                    CmpOp::Le => (a as i32) <= (b as i32),
-                    CmpOp::Gt => (a as i32) > (b as i32),
-                    CmpOp::Ge => (a as i32) >= (b as i32),
-                });
-                assert_eq!(compare_bits(op, DType::U32, a, b), match op {
-                    CmpOp::Eq => a == b,
-                    CmpOp::Ne => a != b,
-                    CmpOp::Lt => a < b,
-                    CmpOp::Le => a <= b,
-                    CmpOp::Gt => a > b,
-                    CmpOp::Ge => a >= b,
-                });
+                assert_eq!(
+                    compare_bits(op, DType::F32, a, b),
+                    expected(op, x.into(), y.into())
+                );
+                assert_eq!(
+                    compare_bits(op, DType::I32, a, b),
+                    match op {
+                        CmpOp::Eq => a == b,
+                        CmpOp::Ne => a != b,
+                        CmpOp::Lt => (a as i32) < (b as i32),
+                        CmpOp::Le => (a as i32) <= (b as i32),
+                        CmpOp::Gt => (a as i32) > (b as i32),
+                        CmpOp::Ge => (a as i32) >= (b as i32),
+                    }
+                );
+                assert_eq!(
+                    compare_bits(op, DType::U32, a, b),
+                    match op {
+                        CmpOp::Eq => a == b,
+                        CmpOp::Ne => a != b,
+                        CmpOp::Lt => a < b,
+                        CmpOp::Le => a <= b,
+                        CmpOp::Gt => a > b,
+                        CmpOp::Ge => a >= b,
+                    }
+                );
             }
         }
     }

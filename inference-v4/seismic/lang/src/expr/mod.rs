@@ -17,9 +17,9 @@
 
 use crate::ids::{DimensionId, ParameterId};
 use crate::types::DType;
+pub use num_bigint::{BigInt, BigUint};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-pub use num_bigint::{BigInt, BigUint};
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
 
@@ -228,12 +228,17 @@ pub struct LoopBinderId {
     index: u32,
 }
 
-arena_handle_wire!(TargetConstant, TargetConstantId, |owner, index| TargetConstantId {
+arena_handle_wire!(TargetConstant, TargetConstantId, |owner, index| {
+    TargetConstantId { owner, index }
+});
+arena_handle_wire!(Decision, DecisionId, |owner, index| DecisionId {
     owner,
     index
 });
-arena_handle_wire!(Decision, DecisionId, |owner, index| DecisionId { owner, index });
-arena_handle_wire!(LoopBinder, LoopBinderId, |owner, index| LoopBinderId { owner, index });
+arena_handle_wire!(LoopBinder, LoopBinderId, |owner, index| LoopBinderId {
+    owner,
+    index
+});
 
 /// The sort of a symbol's value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -758,15 +763,23 @@ impl ExprArena {
     }
     /// Checked projection for a consumer whose physical natural representation is u64.
     pub fn eval_nat_u64(&self, node: NatExpr, values: &Assignment) -> Result<u64, EvalError> {
-        self.eval_nat(node, values)?.try_into().map_err(|_| EvalError::Unrepresentable)
+        self.eval_nat(node, values)?
+            .try_into()
+            .map_err(|_| EvalError::Unrepresentable)
     }
     /// Checked projection for a consumer whose physical signed representation is i64.
     pub fn eval_int_i64(&self, node: IntExpr, values: &Assignment) -> Result<i64, EvalError> {
-        self.eval_int(node, values)?.try_into().map_err(|_| EvalError::Unrepresentable)
+        self.eval_int(node, values)?
+            .try_into()
+            .map_err(|_| EvalError::Unrepresentable)
     }
     /// Embed an arbitrary exact constant in the same expression DAG.
-    pub fn nat_exact(&mut self, value: BigUint) -> NatExpr { self.inner.nat_exact(value) }
-    pub fn int_exact(&mut self, value: BigInt) -> IntExpr { self.inner.int_exact(value) }
+    pub fn nat_exact(&mut self, value: BigUint) -> NatExpr {
+        self.inner.nat_exact(value)
+    }
+    pub fn int_exact(&mut self, value: BigInt) -> IntExpr {
+        self.inner.int_exact(value)
+    }
     pub fn eval_bool(&self, node: BoolExpr, values: &Assignment) -> Result<bool, EvalError> {
         self.inner.eval_bool(node, values)
     }
@@ -1069,7 +1082,9 @@ impl<T: ScalarSort> Expr<sort::Scalar<T>> {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RootName {
     /// An actual scalar/quantity operand of a structured region result.
-    RegionOperand { operand: u32 },
+    RegionOperand {
+        operand: u32,
+    },
     /// Byte size of one global allocation.
     AllocationBytes {
         allocation: u32,
@@ -1384,15 +1399,17 @@ impl SymbolValue {
             Self::Int(value) => value.bits(),
             _ => 0,
         };
-        std::mem::size_of::<Self>().saturating_add(
-            usize::try_from(bits.div_ceil(8)).unwrap_or(usize::MAX))
+        std::mem::size_of::<Self>()
+            .saturating_add(usize::try_from(bits.div_ceil(8)).unwrap_or(usize::MAX))
     }
     /// Encode an existing single-word native ABI slot. Quantity values are
     /// checked before encoding; this is never a mathematical truncation.
     pub fn try_word64(self) -> Result<u64, EvalError> {
         Ok(match self {
             Self::Nat(value) => value.try_into().map_err(|_| EvalError::Unrepresentable)?,
-            Self::Int(value) => i64::try_from(value).map_err(|_| EvalError::Unrepresentable)? as u64,
+            Self::Int(value) => {
+                i64::try_from(value).map_err(|_| EvalError::Unrepresentable)? as u64
+            }
             Self::F32(value) => u64::from(value.to_bits()),
             Self::F16(value) | Self::BF16(value) => u64::from(value),
             Self::I32(value) => u64::from(value as u32),
@@ -1543,13 +1560,24 @@ mod exact_value_tests {
         let mut invocation = compiled::InvocationValues::new();
         invocation.bind(symbol, SymbolValue::Int(huge.clone()));
         assert_eq!(arena.eval_int(restored, &values).unwrap(), huge);
-        assert_eq!(arena.compile_int(restored).evaluate(&invocation).unwrap(), huge);
+        assert_eq!(
+            arena.compile_int(restored).evaluate(&invocation).unwrap(),
+            huge
+        );
         let partial = arena.partial(restored, &values);
         assert_eq!(arena.eval_int(partial, &Assignment::new()).unwrap(), huge);
         let captured = arena.compile_int_with(restored, &values);
         assert!(captured.reads().is_empty());
-        assert_eq!(captured.evaluate(&compiled::InvocationValues::new()).unwrap(), huge);
-        assert_eq!(captured.evaluate_i64(&compiled::InvocationValues::new()), Err(EvalError::Unrepresentable));
+        assert_eq!(
+            captured
+                .evaluate(&compiled::InvocationValues::new())
+                .unwrap(),
+            huge
+        );
+        assert_eq!(
+            captured.evaluate_i64(&compiled::InvocationValues::new()),
+            Err(EvalError::Unrepresentable)
+        );
     }
 
     #[test]
@@ -1560,11 +1588,20 @@ mod exact_value_tests {
         let values = compiled::InvocationValues::new();
         let compiled = arena.compile_nat(value);
         assert_eq!(compiled.evaluate(&values).unwrap(), huge);
-        assert_eq!(compiled.evaluate_u64(&values), Err(EvalError::Unrepresentable));
-        assert_eq!(SymbolValue::Nat(huge).try_word64(), Err(EvalError::Unrepresentable));
+        assert_eq!(
+            compiled.evaluate_u64(&values),
+            Err(EvalError::Unrepresentable)
+        );
+        assert_eq!(
+            SymbolValue::Nat(huge).try_word64(),
+            Err(EvalError::Unrepresentable)
+        );
         let negative = arena.int_exact(-(BigInt::from(1u32) << 100usize));
         let invalid = arena.nat_from_int(negative);
-        assert_eq!(arena.eval_nat(invalid, &Assignment::new()), Err(EvalError::NegativeNat));
+        assert_eq!(
+            arena.eval_nat(invalid, &Assignment::new()),
+            Err(EvalError::NegativeNat)
+        );
     }
 }
 
@@ -1583,7 +1620,10 @@ mod invocation_tests {
         assert_eq!(arena.call_stride_symbol(parameter, 1), stride);
         assert_ne!(arena.call_stride_symbol(parameter, 0), stride);
         assert_ne!(arena.call_stride_symbol(other, 1), stride);
-        assert_eq!(arena.symbol_kind(stride), SymbolKind::CallStride(parameter, 1));
+        assert_eq!(
+            arena.symbol_kind(stride),
+            SymbolKind::CallStride(parameter, 1)
+        );
         assert_eq!(arena.symbol_sort(stride), SymbolSort::Nat);
         assert!(arena.symbol_kind(stride).is_invocation());
 
@@ -1606,7 +1646,10 @@ mod invocation_tests {
         let stride = arena.call_stride_symbol(ParameterId::new(schema, 0), 0);
         let stride = arena.nat_symbol(stride);
         let scalar = arena.call_scalar(
-            ScalarArgument { parameter: ParameterId::new(schema, 1), component: ScalarComponent::Value },
+            ScalarArgument {
+                parameter: ParameterId::new(schema, 1),
+                component: ScalarComponent::Value,
+            },
             SymbolSort::Nat,
         );
         let scalar = arena.nat_symbol(scalar);
@@ -1805,8 +1848,14 @@ mod tests {
             let b = arena.int(b);
             let q = arena.int_div(a, b);
             let r = arena.int_rem(a, b);
-            assert_eq!(arena.eval_int_i64(q, &Assignment::new()).unwrap(), expected_q);
-            assert_eq!(arena.eval_int_i64(r, &Assignment::new()).unwrap(), expected_r);
+            assert_eq!(
+                arena.eval_int_i64(q, &Assignment::new()).unwrap(),
+                expected_q
+            );
+            assert_eq!(
+                arena.eval_int_i64(r, &Assignment::new()).unwrap(),
+                expected_r
+            );
         }
         // The mathematical quotient is representable as a Nat even though it
         // exceeds the signed word used for these two source constants.
@@ -1814,7 +1863,10 @@ mod tests {
         let minus_one = arena.int(-1);
         let q = arena.int_div(min, minus_one);
         let q = arena.nat_from_int(q);
-        assert_eq!(arena.eval_nat_u64(q, &Assignment::new()).unwrap(), 1_u64 << 63);
+        assert_eq!(
+            arena.eval_nat_u64(q, &Assignment::new()).unwrap(),
+            1_u64 << 63
+        );
     }
 
     #[test]
@@ -1860,7 +1912,10 @@ mod tests {
         let three = arena.nat(3);
         let total = arena.nat_fold(FoldOp::Sum, binder, three, large);
         let recovered = arena.nat_div(total, large);
-        assert_eq!(arena.eval_nat_u64(recovered, &Assignment::new()).unwrap(), 3);
+        assert_eq!(
+            arena.eval_nat_u64(recovered, &Assignment::new()).unwrap(),
+            3
+        );
         assert_eq!(
             arena
                 .compile_nat(recovered)
@@ -1872,7 +1927,10 @@ mod tests {
         let zero = arena.int(0);
         let negative = arena.int_sub(zero, signed);
         let quotient = arena.int_div(negative, signed);
-        assert_eq!(arena.eval_int_i64(quotient, &Assignment::new()).unwrap(), -1);
+        assert_eq!(
+            arena.eval_int_i64(quotient, &Assignment::new()).unwrap(),
+            -1
+        );
     }
 
     #[test]
@@ -1893,7 +1951,10 @@ mod tests {
         let seven = arena.int(7);
         let resolved = arena.resolve_runtime_values(expression, &[(value, seven)]);
         assert!(arena.free_symbols(resolved.into()).is_empty());
-        assert_eq!(arena.eval_int_i64(resolved, &Assignment::new()).unwrap(), 45);
+        assert_eq!(
+            arena.eval_int_i64(resolved, &Assignment::new()).unwrap(),
+            45
+        );
         assert!(!arena.free_symbols(resolved.into()).contains(&symbol));
         assert!(arena.eval_int_i64(expression, &Assignment::new()).is_err());
     }

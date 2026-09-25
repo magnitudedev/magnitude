@@ -335,22 +335,24 @@ where
                 locals,
                 op,
             )
-            .map(|cost| cost.map_services(|service| {
-                let state = self
-                    .services
-                    .iter()
-                    .find(|(candidate, _)| *candidate == service)
-                    .map(|(_, state)| *state)
-                    .unwrap_or_else(|| {
-                        panic!("analytical service vocabulary omitted an emitted variant")
-                    });
-                if !matches!(state, seismic_estimator::AnalyticalServiceState::Available) {
-                    panic!("target-closed analytical operation emitted an unavailable service")
-                }
-                seismic_estimator::ServiceClassId::new(
-                    seismic_estimator::AnalyticalService::stable_name(service),
-                )
-            }))
+            .map(|cost| {
+                cost.map_services(|service| {
+                    let state = self
+                        .services
+                        .iter()
+                        .find(|(candidate, _)| *candidate == service)
+                        .map(|(_, state)| *state)
+                        .unwrap_or_else(|| {
+                            panic!("analytical service vocabulary omitted an emitted variant")
+                        });
+                    if !matches!(state, seismic_estimator::AnalyticalServiceState::Available) {
+                        panic!("target-closed analytical operation emitted an unavailable service")
+                    }
+                    seismic_estimator::ServiceClassId::new(
+                        seismic_estimator::AnalyticalService::stable_name(service),
+                    )
+                })
+            })
     }
 }
 
@@ -500,11 +502,7 @@ impl<T: seismic_native_target::TargetFamily> AnalyticalEvaluator<'_, T> {
                 provenance,
                 PerformanceObjective::LATENCY,
                 |arena, executable| {
-                    evaluate_executable(
-                        self.context.model.as_ref(),
-                        arena,
-                        executable,
-                    )
+                    evaluate_executable(self.context.model.as_ref(), arena, executable)
                 },
             )
             .map_err(|error| match error {

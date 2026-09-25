@@ -51,9 +51,14 @@ impl Analysis<'_> {
                 roots.push(write.root());
             }
         }
-        state.writes.extend(roots.into_iter().map(|root| MemoryWrite::Map { root }));
+        state
+            .writes
+            .extend(roots.into_iter().map(|root| MemoryWrite::Map { root }));
         if !observed.is_empty() {
-            state.effects.push(Effect::Map { extent, writes: observed });
+            state.effects.push(Effect::Map {
+                extent,
+                writes: observed,
+            });
         }
         Ok(())
     }
@@ -72,13 +77,22 @@ impl Analysis<'_> {
             return Err("participant-map relation of an authored launch is unfinished");
         };
         if base.is_chunked()
-            || launch.grid[1..].iter().chain(&launch.workgroup[1..]).any(|axis| {
-                !matches!(self.expressions.view((*axis).into()), seismic_lang::expr::NodeView::NatConst(1))
-            })
+            || launch.grid[1..]
+                .iter()
+                .chain(&launch.workgroup[1..])
+                .any(|axis| {
+                    !matches!(
+                        self.expressions.view((*axis).into()),
+                        seismic_lang::expr::NodeView::NatConst(1)
+                    )
+                })
         {
             return Err("chunked or multi-axis participant-map relation is unfinished");
         }
-        if !matches!(self.expressions.view(base.value().into()), seismic_lang::expr::NodeView::NatConst(0)) {
+        if !matches!(
+            self.expressions.view(base.value().into()),
+            seismic_lang::expr::NodeView::NatConst(0)
+        ) {
             return Err("offset participant-map relation is unfinished");
         }
         let extent = self.expression(extent.into(), &state.slots)?;
@@ -86,17 +100,29 @@ impl Analysis<'_> {
         let mut inert = state.clone();
         let (effects, writes) = (inert.effects.len(), inert.writes.len());
         let beyond = self.terms.opaque();
-        self.lane = Some(Lane { participant: beyond, bound: extent, active: false });
+        self.lane = Some(Lane {
+            participant: beyond,
+            bound: extent,
+            active: false,
+        });
         let result = self.physical_block(kernel, kernel.root(), &mut HashMap::new(), &mut inert);
         self.lane = None;
         result?;
-        if inert.effects.len() != effects || inert.writes.len() != writes
-            || inert.slots.iter().any(|(symbol, value)| state.slots.get(symbol) != Some(value))
+        if inert.effects.len() != effects
+            || inert.writes.len() != writes
+            || inert
+                .slots
+                .iter()
+                .any(|(symbol, value)| state.slots.get(symbol) != Some(value))
         {
             return Err("an inactive participant's inertness is not established");
         }
         self.map_visit(state, extent, &mut |analysis, participant, lane| {
-            analysis.lane = Some(Lane { participant, bound: extent, active: true });
+            analysis.lane = Some(Lane {
+                participant,
+                bound: extent,
+                active: true,
+            });
             let result = analysis.physical_block(kernel, kernel.root(), &mut HashMap::new(), lane);
             analysis.lane = None;
             result.map(|_| ())

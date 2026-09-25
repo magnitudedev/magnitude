@@ -15,13 +15,12 @@ pub use layout::{
     addressed_span_u64, concrete_storage_units, representation_alignment, valid_concrete_view,
 };
 pub use local::{
-    derive_launch_local_layout, LaunchAbiRequirement, LaunchLocalKind,
-    LaunchLocalLayout, LaunchScratchRequirements, LocalAllocation, LocalLayout,
-    ScratchRequirement,
+    derive_launch_local_layout, LaunchAbiRequirement, LaunchLocalKind, LaunchLocalLayout,
+    LaunchScratchRequirements, LocalAllocation, LocalLayout, ScratchRequirement,
 };
 
 use crate::identity::OwnerToken;
-use seismic_lang::expr::{CmpOp, AnyExpr, DecisionId, ExprArena, NatExpr, NodeView};
+use seismic_lang::expr::{AnyExpr, CmpOp, DecisionId, ExprArena, NatExpr, NodeView};
 use seismic_lang::ids::{ParameterId, RepresentationId, SemanticValueId};
 use seismic_lang::registry::{self, RepresentationKind};
 use std::fmt;
@@ -139,22 +138,10 @@ pub struct ScheduleUse {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ScheduleRegionEdge {
-    IfThen {
-        node: u32,
-        parent_ordinal: u32,
-    },
-    IfElse {
-        node: u32,
-        parent_ordinal: u32,
-    },
-    RepeatBody {
-        node: u32,
-        parent_ordinal: u32,
-    },
-    Imported {
-        node: u32,
-        parent_ordinal: u32,
-    },
+    IfThen { node: u32, parent_ordinal: u32 },
+    IfElse { node: u32, parent_ordinal: u32 },
+    RepeatBody { node: u32, parent_ordinal: u32 },
+    Imported { node: u32, parent_ordinal: u32 },
 }
 
 /// Exact structured use set of one global allocation. Empty means the
@@ -291,9 +278,10 @@ impl GlobalAllocationTopology {
                 .allocations
                 .iter()
                 .map(|allocation| {
-                    allocation.geometry.as_ref().map_or(0, |geometry|
-                        (geometry.extents.capacity() + geometry.strides.capacity()) * std::mem::size_of::<NatExpr>())
-                        + allocation.liveness.uses.capacity() * std::mem::size_of::<ScheduleUse>()
+                    allocation.geometry.as_ref().map_or(0, |geometry| {
+                        (geometry.extents.capacity() + geometry.strides.capacity())
+                            * std::mem::size_of::<NatExpr>()
+                    }) + allocation.liveness.uses.capacity() * std::mem::size_of::<ScheduleUse>()
                         + allocation
                             .liveness
                             .uses
@@ -663,7 +651,10 @@ impl TopologyBuilder {
             addressed_bytes(arena, &layout)
         };
         let allocation = self.allocate(
-            GlobalBufferKind::Imported { value: parameter, source },
+            GlobalBufferKind::Imported {
+                value: parameter,
+                source,
+            },
             bytes,
             representation_alignment(source.representation()),
         );
@@ -677,7 +668,9 @@ impl TopologyBuilder {
 
     /// Derived from reached publication operations by allocation analysis.
     pub(crate) fn set_result_publications(&mut self, publications: Vec<ResultViewPublication>) {
-        for publication in &publications { self.assert_owner(publication.view.owner()); }
+        for publication in &publications {
+            self.assert_owner(publication.view.owner());
+        }
         self.result_views = publications;
     }
 
@@ -696,7 +689,9 @@ impl TopologyBuilder {
         let layout = &mut self.views[view as usize];
         layout.mapping = ViewMapping::WholeAllocation;
         self.allocations[allocation.index() as usize].geometry = Some(TensorGeometry {
-            representation, extents: layout.extents.clone(), strides: layout.strides.clone(),
+            representation,
+            extents: layout.extents.clone(),
+            strides: layout.strides.clone(),
         });
         (allocation, view)
     }
@@ -736,7 +731,10 @@ impl TopologyBuilder {
         use crate::tensor_view::{SliceAxis, ViewStep};
         let backing = *view.backing();
         if !view.steps().is_empty()
-            && !matches!(registry::representation_info(backing.representation()).kind, RepresentationKind::Dense(_))
+            && !matches!(
+                registry::representation_info(backing.representation()).kind,
+                RepresentationKind::Dense(_)
+            )
         {
             return false;
         }
@@ -745,8 +743,14 @@ impl TopologyBuilder {
         for step in view.steps() {
             match step {
                 ViewStep::Transpose(permutation) => {
-                    extents = permutation.iter().map(|axis| extents[*axis as usize]).collect();
-                    strides = permutation.iter().map(|axis| strides[*axis as usize]).collect();
+                    extents = permutation
+                        .iter()
+                        .map(|axis| extents[*axis as usize])
+                        .collect();
+                    strides = permutation
+                        .iter()
+                        .map(|axis| strides[*axis as usize])
+                        .collect();
                 }
                 ViewStep::Slice(axes) => {
                     let mut next_extents = Vec::new();
@@ -754,7 +758,9 @@ impl TopologyBuilder {
                     for (axis, selection) in axes.iter().enumerate() {
                         match selection {
                             SliceAxis::Point(_) => continue,
-                            SliceAxis::Range { start, end } => next_extents.push(arena.nat_sub(*end,*start)),
+                            SliceAxis::Range { start, end } => {
+                                next_extents.push(arena.nat_sub(*end, *start))
+                            }
                             SliceAxis::Full => next_extents.push(extents[axis]),
                         }
                         next_strides.push(strides[axis]);
@@ -764,9 +770,11 @@ impl TopologyBuilder {
                 }
                 ViewStep::Reshape { from, to } if from == to => {}
                 ViewStep::Reshape { from, to } => {
-                    if strides != dense_strides(arena,backing.representation(),from) { return false; }
+                    if strides != dense_strides(arena, backing.representation(), from) {
+                        return false;
+                    }
                     extents = to.clone();
-                    strides = dense_strides(arena,backing.representation(),to);
+                    strides = dense_strides(arena, backing.representation(), to);
                 }
                 ViewStep::Plane { .. } => return false,
             }
@@ -780,29 +788,37 @@ impl TopologyBuilder {
         view: &crate::tensor_view::TensorView<AnyBufferView, NatExpr>,
     ) -> Option<AnyBufferView> {
         use crate::tensor_view::{SliceAxis, ViewStep};
-        if !self.can_project_affine_view(arena,view) { return None; }
-        let backing=*view.backing();
+        if !self.can_project_affine_view(arena, view) {
+            return None;
+        }
+        let backing = *view.backing();
         let mut actual = backing;
         for step in view.steps() {
             let index = match step {
-                ViewStep::Transpose(permutation) => self.transpose_view(actual,permutation),
+                ViewStep::Transpose(permutation) => self.transpose_view(actual, permutation),
                 ViewStep::Slice(axes) => {
-                    let selections = axes.iter().map(|axis| match axis {
-                        SliceAxis::Full => ViewSelection::Full,
-                        SliceAxis::Point(value) => ViewSelection::Point(*value),
-                        SliceAxis::Range { start, end } => ViewSelection::Range { start:*start,end:*end },
-                    }).collect::<Vec<_>>();
-                    self.slice_view(arena,actual,&selections)
+                    let selections = axes
+                        .iter()
+                        .map(|axis| match axis {
+                            SliceAxis::Full => ViewSelection::Full,
+                            SliceAxis::Point(value) => ViewSelection::Point(*value),
+                            SliceAxis::Range { start, end } => ViewSelection::Range {
+                                start: *start,
+                                end: *end,
+                            },
+                        })
+                        .collect::<Vec<_>>();
+                    self.slice_view(arena, actual, &selections)
                 }
                 ViewStep::Reshape { from, to } if from == to => continue,
                 ViewStep::Reshape { to, .. } => {
-                    let zero=arena.nat(0);
-                    let strides=dense_strides(arena,backing.representation(),to);
-                    self.subview(arena,actual.index(),zero,to.clone(),strides)
+                    let zero = arena.nat(0);
+                    let strides = dense_strides(arena, backing.representation(), to);
+                    self.subview(arena, actual.index(), zero, to.clone(), strides)
                 }
                 ViewStep::Plane { .. } => unreachable!("projection checked before mutation"),
             };
-            actual=AnyBufferView::new(self.owner,index,backing.representation());
+            actual = AnyBufferView::new(self.owner, index, backing.representation());
         }
         Some(actual)
     }
@@ -926,7 +942,11 @@ impl TopologyBuilder {
 
     /// A tensor value whose geometry is exactly its allocation's canonical
     /// geometry (the same extent and stride expressions).
-    pub(crate) fn instance_view(&mut self, arena: &mut ExprArena, source: AnyBufferView) -> AnyBufferView {
+    pub(crate) fn instance_view(
+        &mut self,
+        arena: &mut ExprArena,
+        source: AnyBufferView,
+    ) -> AnyBufferView {
         let layout = self.view_layout(source).clone();
         assert!(matches!(layout.mapping, ViewMapping::WholeAllocation));
         let value = self.region_view(arena, layout.representation, layout.extents, layout.strides);
@@ -1034,7 +1054,11 @@ impl TopologyBuilder {
                 self.assert_owner(view.owner());
                 bases.push(Base::External(view));
             } else {
-                let imported = self.allocate(allocation.kind.clone(), allocation.bytes, allocation.alignment);
+                let imported = self.allocate(
+                    allocation.kind.clone(),
+                    allocation.bytes,
+                    allocation.alignment,
+                );
                 self.allocations[imported.index() as usize].geometry = allocation.geometry.clone();
                 bases.push(Base::Imported(imported));
             }
@@ -1111,14 +1135,22 @@ impl TopologyBuilder {
                 }
                 Base::Imported(allocation) => {
                     let whole = matches!(layout.mapping, ViewMapping::WholeAllocation);
-                    let index = self.strided_view(arena, *allocation, layout.representation,
-                        layout.offset, layout.extents, layout.strides);
+                    let index = self.strided_view(
+                        arena,
+                        *allocation,
+                        layout.representation,
+                        layout.offset,
+                        layout.extents,
+                        layout.strides,
+                    );
                     if whole {
-                        assert!(self.allocations[allocation.index() as usize].geometry.is_some());
+                        assert!(self.allocations[allocation.index() as usize]
+                            .geometry
+                            .is_some());
                         self.views[index as usize].mapping = ViewMapping::WholeAllocation;
                     }
                     index
-                },
+                }
             };
             remap.push(AnyBufferView::new(self.owner, index, layout.representation));
         }
@@ -1164,7 +1196,11 @@ impl TopologyBuilder {
             count,
             "one instance capacity per allocation"
         );
-        assert_eq!(acquisitions.len(), count, "one acquisition timing per allocation");
+        assert_eq!(
+            acquisitions.len(),
+            count,
+            "one acquisition timing per allocation"
+        );
         let mut acquisitions = acquisitions.into_iter();
         let mut instances = instances.into_iter();
         let mut pending = self.allocations.into_iter();
@@ -1232,11 +1268,7 @@ fn allocation_overlap(
     }
 }
 
-pub fn addressed_axis_span(
-    arena: &mut ExprArena,
-    extent: NatExpr,
-    stride: NatExpr,
-) -> NatExpr {
+pub fn addressed_axis_span(arena: &mut ExprArena, extent: NatExpr, stride: NatExpr) -> NatExpr {
     if matches!(arena.view(AnyExpr::Nat(stride)), NodeView::NatConst(0)) {
         return stride;
     }
@@ -1248,10 +1280,7 @@ pub fn addressed_axis_span(
 
 /// Exclusive byte end of the furthest element reachable through a view.
 /// A zero-extent view addresses no bytes and therefore ends at its offset.
-pub fn addressed_bytes(
-    arena: &mut ExprArena,
-    layout: &BufferViewLayout,
-) -> NatExpr {
+pub fn addressed_bytes(arena: &mut ExprArena, layout: &BufferViewLayout) -> NatExpr {
     assert_eq!(
         layout.extents.len(),
         layout.strides.len(),
@@ -1303,7 +1332,6 @@ pub fn addressed_bytes(
     arena.nat_select(empty, layout.offset, end)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1313,10 +1341,22 @@ mod tests {
     fn concrete_view_footprint_handles_packed_units_and_empty_axes() {
         let packed = registry::representation("q8g32").unwrap();
         let (_, packet_bytes) = concrete_storage_units(packed, &[33]).unwrap();
-        assert!(valid_concrete_view(packed, &[33], &[1], 0, 2 * packet_bytes));
+        assert!(valid_concrete_view(
+            packed,
+            &[33],
+            &[1],
+            0,
+            2 * packet_bytes
+        ));
         assert!(!valid_concrete_view(packed, &[33], &[1], 0, packet_bytes));
         assert!(valid_concrete_view(packed, &[0], &[u64::MAX], 0, 0));
-        assert!(!valid_concrete_view(DenseF32::id(), &[3], &[u64::MAX], 0, 12));
+        assert!(!valid_concrete_view(
+            DenseF32::id(),
+            &[3],
+            &[u64::MAX],
+            0,
+            12
+        ));
     }
 
     #[test]
@@ -1326,20 +1366,44 @@ mod tests {
         let representation = DenseF32::id();
         let three = arena.nat(3);
         let zero = arena.nat(0);
-        let (allocation, whole) = child.tensor(&mut arena, GlobalBufferKind::Arena, representation, vec![three]);
+        let (allocation, whole) = child.tensor(
+            &mut arena,
+            GlobalBufferKind::Arena,
+            representation,
+            vec![three],
+        );
         let arbitrary = child.dense_view(&mut arena, allocation, representation, zero, vec![three]);
-        assert!(matches!(child.views[whole as usize].mapping, ViewMapping::WholeAllocation));
-        assert!(matches!(child.views[arbitrary as usize].mapping, ViewMapping::Direct));
-        let child = child.close(vec![AllocationLiveness::new(vec![])], vec![None], vec![1], vec![AllocationAcquisition::Reached]);
+        assert!(matches!(
+            child.views[whole as usize].mapping,
+            ViewMapping::WholeAllocation
+        ));
+        assert!(matches!(
+            child.views[arbitrary as usize].mapping,
+            ViewMapping::Direct
+        ));
+        let child = child.close(
+            vec![AllocationLiveness::new(vec![])],
+            vec![None],
+            vec![1],
+            vec![AllocationAcquisition::Reached],
+        );
         let mut parent = TopologyBuilder::new(OwnerToken::fresh(), vec![], false);
         let remap = parent.import(&mut arena, child, &[]);
         let layout = parent.view_layout(remap[whole as usize]);
         assert!(matches!(layout.mapping, ViewMapping::WholeAllocation));
-        let ViewBase::Allocation(id) = layout.base else { panic!("whole view lost allocation"); };
-        let geometry = parent.allocations[id.index() as usize].geometry.as_ref().unwrap();
+        let ViewBase::Allocation(id) = layout.base else {
+            panic!("whole view lost allocation");
+        };
+        let geometry = parent.allocations[id.index() as usize]
+            .geometry
+            .as_ref()
+            .unwrap();
         assert_eq!(geometry.extents, layout.extents);
         assert_eq!(geometry.strides, layout.strides);
-        assert!(matches!(parent.view_layout(remap[arbitrary as usize]).mapping, ViewMapping::Direct));
+        assert!(matches!(
+            parent.view_layout(remap[arbitrary as usize]).mapping,
+            ViewMapping::Direct
+        ));
     }
 
     #[test]
@@ -1354,12 +1418,28 @@ mod tests {
         let three = arena.nat(3);
         let four = arena.nat(4);
         let six = arena.nat(6);
-        let (_, index) = storage.tensor(&mut arena, GlobalBufferKind::Persistent, representation, vec![three, four]);
+        let (_, index) = storage.tensor(
+            &mut arena,
+            GlobalBufferKind::Persistent,
+            representation,
+            vec![three, four],
+        );
         let backing = AnyBufferView::new(storage.owner, index, representation);
-        let map = TensorView::new(backing, vec![three, four]).slice(vec![
-            SliceAxis::Range { start: one, end: three },
-            SliceAxis::Range { start: zero, end: three },
-        ], |end, start| arena.nat_sub(end, start)).transpose(vec![1, 0]);
+        let map = TensorView::new(backing, vec![three, four])
+            .slice(
+                vec![
+                    SliceAxis::Range {
+                        start: one,
+                        end: three,
+                    },
+                    SliceAxis::Range {
+                        start: zero,
+                        end: three,
+                    },
+                ],
+                |end, start| arena.nat_sub(end, start),
+            )
+            .transpose(vec![1, 0]);
         let actual = storage.affine_view(&mut arena, &map).unwrap();
         let layout = storage.view_layout(actual);
         assert_eq!(layout.offset, arena.nat(16));
@@ -1368,7 +1448,11 @@ mod tests {
         let nonaffine = map.reshape(vec![six]);
         let before = storage.views.len();
         assert!(storage.affine_view(&mut arena, &nonaffine).is_none());
-        assert_eq!(storage.views.len(), before, "failed projection must not partially construct views");
+        assert_eq!(
+            storage.views.len(),
+            before,
+            "failed projection must not partially construct views"
+        );
     }
 
     #[test]
@@ -1377,8 +1461,11 @@ mod tests {
         let module = check_source(SourceSet::new(vec![SourceFile {
             path: "capture.seismic".into(),
             text: "fn probe(x: &tensor[2,3] f32):\n    let y = x[0,0]\n".into(),
-        }])).unwrap();
-        let entry = module.entry(module.entry_named("probe").unwrap(), &Default::default()).unwrap();
+        }]))
+        .unwrap();
+        let entry = module
+            .entry(module.entry_named("probe").unwrap(), &Default::default())
+            .unwrap();
         let parameter = entry.schema().parameters()[0].value;
         let mut arena = ExprArena::default();
         let mut parent = TopologyBuilder::new(OwnerToken::fresh(), vec![], false);
@@ -1386,26 +1473,51 @@ mod tests {
         let one = arena.nat(1);
         let three = arena.nat(3);
         let four = arena.nat(4);
-        let (_, whole) = parent.tensor(&mut arena, GlobalBufferKind::Persistent, representation, vec![three, four]);
+        let (_, whole) = parent.tensor(
+            &mut arena,
+            GlobalBufferKind::Persistent,
+            representation,
+            vec![three, four],
+        );
         let whole = AnyBufferView::new(parent.owner, whole, representation);
-        let sliced = parent.slice_view(&mut arena, whole, &[
-            ViewSelection::Range { start: one, end: three },
-            ViewSelection::Range { start: one, end: four },
-        ]);
+        let sliced = parent.slice_view(
+            &mut arena,
+            whole,
+            &[
+                ViewSelection::Range {
+                    start: one,
+                    end: three,
+                },
+                ViewSelection::Range {
+                    start: one,
+                    end: four,
+                },
+            ],
+        );
         let sliced = AnyBufferView::new(parent.owner, sliced, representation);
         let mut child = TopologyBuilder::new(OwnerToken::fresh(), vec![], true);
         let proxy = child.capture_view(&mut arena, &parent, sliced, parameter);
         assert_eq!(child.allocations[0].bytes, arena.nat(28));
         assert_eq!(child.view_layout(proxy).offset, arena.nat(0));
         let transposed = child.transpose_view(proxy, &[1, 0]);
-        let child = child.close(vec![AllocationLiveness::new(vec![])], vec![None], vec![1], vec![AllocationAcquisition::Invocation]);
+        let child = child.close(
+            vec![AllocationLiveness::new(vec![])],
+            vec![None],
+            vec![1],
+            vec![AllocationAcquisition::Invocation],
+        );
         let remap = parent.import(&mut arena, child, &[]);
         assert_eq!(remap[proxy.index() as usize], sliced);
         let result = parent.view_layout(remap[transposed as usize]);
         assert_eq!(result.offset, arena.nat(20));
         assert_eq!(result.strides, vec![one, four]);
-        assert!(matches!(&result.mapping, ViewMapping::Transpose { source, .. } if *source == sliced));
-        assert!(matches!(parent.view_layout(sliced).mapping, ViewMapping::Slice { .. }));
+        assert!(
+            matches!(&result.mapping, ViewMapping::Transpose { source, .. } if *source == sliced)
+        );
+        assert!(matches!(
+            parent.view_layout(sliced).mapping,
+            ViewMapping::Slice { .. }
+        ));
     }
 
     #[test]
@@ -1440,7 +1552,12 @@ mod tests {
         );
         let sliced = AnyBufferView::new(child.owner, sliced, representation);
         let transposed = child.transpose_view(sliced, &[1, 0]);
-        let child = child.close(vec![AllocationLiveness::new(vec![])], vec![None], vec![1], vec![AllocationAcquisition::Invocation]);
+        let child = child.close(
+            vec![AllocationLiveness::new(vec![])],
+            vec![None],
+            vec![1],
+            vec![AllocationAcquisition::Invocation],
+        );
         let mut parent = TopologyBuilder::new(OwnerToken::fresh(), vec![], false);
         let remap = parent.import(&mut arena, child, &[]);
         let layout = parent.view_layout(remap[sliced.index() as usize]);
@@ -1481,7 +1598,12 @@ mod tests {
             vec![four, two],
             vec![one, four],
         );
-        let child = child.close(vec![AllocationLiveness::new(vec![])], vec![None], vec![1], vec![AllocationAcquisition::Invocation]);
+        let child = child.close(
+            vec![AllocationLiveness::new(vec![])],
+            vec![None],
+            vec![1],
+            vec![AllocationAcquisition::Invocation],
+        );
         let mut parent = TopologyBuilder::new(OwnerToken::fresh(), vec![], false);
         let remap = parent.import(&mut arena, child, &[]);
         assert!(parent.view_layout(remap[whole as usize]).contiguous);

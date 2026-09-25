@@ -101,7 +101,8 @@ fn copy_word_plane_rows(device: &seismic::Device) {
             .collect::<Vec<_>>()
     };
     let src = seismic::Tensor::from_host(&device, element, &[4, 2, 3], &source_bytes).unwrap();
-    let mut dst = seismic::Tensor::from_host(&device, element, &[4, 2, 3], &sentinel_bytes).unwrap();
+    let mut dst =
+        seismic::Tensor::from_host(&device, element, &[4, 2, 3], &sentinel_bytes).unwrap();
     let from =
         seismic::Tensor::from_host(&device, seismic::Element::i32(), &[2], &indices(&[3, 1]))
             .unwrap();
@@ -141,11 +142,18 @@ fn devices() -> Vec<seismic::Device> {
         catalog.open_backend(seismic::BackendName::Vulkan).ok()
     };
     gpu.into_iter()
-        .chain(std::iter::once(catalog.open_backend(seismic::BackendName::Cpu).unwrap()))
+        .chain(std::iter::once(
+            catalog.open_backend(seismic::BackendName::Cpu).unwrap(),
+        ))
         .collect()
 }
 
-fn assert_native_two_byte_plane_copy(device: &seismic::Device, element: seismic::Element, source: &[u16], sentinel: u16) {
+fn assert_native_two_byte_plane_copy(
+    device: &seismic::Device,
+    element: seismic::Element,
+    source: &[u16],
+    sentinel: u16,
+) {
     let source_bytes = source
         .iter()
         .flat_map(|value| value.to_le_bytes())
@@ -235,20 +243,10 @@ fn native_copy_into_larger_aggregate_uses_independent_row_bounds_on(device: &sei
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>()
     };
-    let src = seismic::Tensor::from_host(
-        &device,
-        element,
-        &[1, 1, 4],
-        &words(&[2, 3, 5, 7]),
-    )
-    .unwrap();
-    let mut dst = seismic::Tensor::from_host(
-        &device,
-        element,
-        &[3, 1, 4],
-        &words(&[99; 12]),
-    )
-    .unwrap();
+    let src =
+        seismic::Tensor::from_host(&device, element, &[1, 1, 4], &words(&[2, 3, 5, 7])).unwrap();
+    let mut dst =
+        seismic::Tensor::from_host(&device, element, &[3, 1, 4], &words(&[99; 12])).unwrap();
     let from =
         seismic::Tensor::from_host(&device, seismic::Element::i32(), &[1], &0_i32.to_le_bytes())
             .unwrap();

@@ -83,6 +83,7 @@ pub(super) fn status() -> Result<HostMemoryStatus, ObservationError> {
             bytes: headroom,
             basis: HeadroomBasis::MachFreeAndInactivePages,
         },
+        pressure: None,
         limits: Vec::new(),
         limit_visibility: LimitVisibility::Complete,
     })

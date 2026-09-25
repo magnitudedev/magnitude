@@ -10,15 +10,15 @@
 
 use super::cases::projection_shape;
 use super::{
-    row_points, served_row_points, CaseState, EntryTuning, PointShape, TuningInputs,
-    TuningLimits,
+    cpu_projection_screening, row_points, served_row_points, CaseState, EntryTuning, PointShape,
+    TuningInputs, TuningLimits,
 };
 use crate::programs::graph::recurrent::CHUNKED_ROWS;
 use magnitude_model_contracts::{MixerGeometry, RecurrentHeadMapping, WeightKind, WeightScope};
 use magnitude_model_kernels::{
     gated_delta_chunk, gated_delta_output, gated_delta_project, gated_delta_step,
 };
-use seismic::{Element, Tensor};
+use seismic::{Device, Element, ScreeningPoint, Tensor};
 
 /// Banks of a tuning arena: the zero seed, the bank the slot reads and the
 /// bank it publishes to.
@@ -133,6 +133,10 @@ impl EntryTuning for RecurrentProjectTuning {
         row_points(limits)
     }
 
+    fn screening(&self, device: &Device, points: &[PointShape]) -> Vec<ScreeningPoint> {
+        cpu_projection_screening(device, points)
+    }
+
     fn rotation(
         &self,
         inputs: &mut TuningInputs<'_, '_>,
@@ -225,6 +229,10 @@ impl EntryTuning for RecurrentOutputTuning {
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
         row_points(limits)
+    }
+
+    fn screening(&self, device: &Device, points: &[PointShape]) -> Vec<ScreeningPoint> {
+        cpu_projection_screening(device, points)
     }
 
     fn rotation(
@@ -346,9 +354,10 @@ impl RecurrentState {
             .get(index as usize)
             .map(|block| &block.mixer)
         {
-            Some(MixerGeometry::Recurrent(geometry)) => {
-                Ok(matches!(geometry.head_mapping, RecurrentHeadMapping::Grouped))
-            }
+            Some(MixerGeometry::Recurrent(geometry)) => Ok(matches!(
+                geometry.head_mapping,
+                RecurrentHeadMapping::Grouped
+            )),
             _ => Err(format!("block {index} has no recurrent mixer")),
         }
     }
@@ -376,7 +385,11 @@ impl RecurrentState {
         let banks = slots as u64;
         let window = inputs.activation(
             self.activation,
-            &[TUNING_BANKS, shape.convolution_width - 1 + TUNING_TAPE_ROWS, shape.channels()],
+            &[
+                TUNING_BANKS,
+                shape.convolution_width - 1 + TUNING_TAPE_ROWS,
+                shape.channels(),
+            ],
             seed + 2,
         )?;
         let delta = inputs.activation(
@@ -476,5 +489,7 @@ macro_rules! state_entry {
     };
 }
 
-state_entry!(RecurrentStepTuning, gated_delta_step, |rows| rows < CHUNKED_ROWS);
-state_entry!(RecurrentChunkTuning, gated_delta_chunk, |rows| rows >= CHUNKED_ROWS);
+state_entry!(RecurrentStepTuning, gated_delta_step, |rows| rows
+    < CHUNKED_ROWS);
+state_entry!(RecurrentChunkTuning, gated_delta_chunk, |rows| rows
+    >= CHUNKED_ROWS);

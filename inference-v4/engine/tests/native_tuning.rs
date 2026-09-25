@@ -14,8 +14,8 @@ use magnitude_artifacts::Package;
 use magnitude_model_executor::{
     platform::{self, DeviceRequest, PlatformConfig},
     AttestedPrograms, ComponentSelection, ExecutionPath, ExecutionPlanner, KernelCache,
-    PlannedMethod, ResourceBudget, ResourceLimits, TunedEntry, TuningContext, TuningOrigin,
-    UnreportedTuning, DEFAULT_KERNEL_CACHE_BYTES,
+    PlannedMethod, ResourceLimits, TunedEntry, TuningContext, TuningOrigin, UnreportedTuning,
+    DEFAULT_KERNEL_CACHE_BYTES,
 };
 use magnitude_model_state::KvCodec;
 use seismic::{BackendName, DeviceCatalog};
@@ -39,7 +39,6 @@ const PINNED_35B: [&str; 1] = [
 /// load must tune without defect.
 fn prepare_every_entry(
     candidates: &[&str],
-    storage_gib: u64,
     cache: Option<Arc<KernelCache>>,
     loads: usize,
 ) -> (BackendName, Vec<Vec<TunedEntry>>) {
@@ -56,6 +55,7 @@ fn prepare_every_entry(
     let package = Package::open_without_projector(&path).unwrap();
     let definition = magnitude_model_qwen35::inspect_package(&package).unwrap();
     let limits = ResourceLimits {
+        max_retained_entries: 0,
         active_requests: 1,
         in_flight_requests: 1,
         branch_checkpoints: 1,
@@ -64,7 +64,6 @@ fn prepare_every_entry(
         max_images_per_request: 1,
         lookahead: false,
     };
-    let storage_bytes = storage_gib << 30;
     let draft = ExecutionPlanner::prepare(
         &selected,
         &package.manifest(),
@@ -77,11 +76,6 @@ fn prepare_every_entry(
         PlannedMethod::Plain,
         KvCodec::Dense,
         limits,
-        ResourceBudget {
-            storage_bytes,
-            retention_bytes: 0,
-            safety_reserve_bytes: 1 << 30,
-        },
     )
     .unwrap();
     let opened = platform::open_selected(
@@ -89,7 +83,6 @@ fn prepare_every_entry(
         draft.device().selector(),
         PlatformConfig {
             path: ExecutionPath::Native,
-            storage_bytes,
             artifacts: cache
                 .clone()
                 .map(|cache| cache as Arc<dyn seismic::ArtifactStore>),
@@ -135,7 +128,11 @@ fn prepare_every_entry(
         eprintln!(
             "{backend:?} {} load {load}: prepared in {seconds:.2} s, {:.2} s tuning {} entries",
             path.file_name().unwrap().to_string_lossy(),
-            programs.tuned().iter().map(|tuned| tuned.seconds).sum::<f64>(),
+            programs
+                .tuned()
+                .iter()
+                .map(|tuned| tuned.seconds)
+                .sum::<f64>(),
             programs.tuned().len()
         );
         tunings.push(programs.tuned().to_vec());
@@ -143,7 +140,12 @@ fn prepare_every_entry(
     let defective = tunings[0]
         .iter()
         .filter(|tuned| tuned.measured == 0 || tuned.defects > 0)
-        .map(|tuned| format!("{} [{}]: {:?}", tuned.entry, tuned.bindings, tuned.first_defect))
+        .map(|tuned| {
+            format!(
+                "{} [{}]: {:?}",
+                tuned.entry, tuned.bindings, tuned.first_defect
+            )
+        })
         .collect::<Vec<_>>();
     assert!(defective.is_empty(), "{defective:#?}");
     (backend, tunings)
@@ -152,13 +154,13 @@ fn prepare_every_entry(
 #[test]
 #[ignore = "reads the pinned 4B GGUF; needs Metal or CUDA"]
 fn the_pinned_4b_tunes_every_entry_once_on_real_weights() {
-    prepare_every_entry(&PINNED_4B, 16, None, 1);
+    prepare_every_entry(&PINNED_4B, None, 1);
 }
 
 #[test]
 #[ignore = "reads the pinned 35B GGUF; needs Metal or CUDA and ~24 GiB"]
 fn the_pinned_35b_tunes_every_entry_once_on_real_weights() {
-    prepare_every_entry(&PINNED_35B, 22, None, 1);
+    prepare_every_entry(&PINNED_35B, None, 1);
 }
 
 /// Tuning spec §C and §E4 check 2: the first load with an empty kernel cache
@@ -168,18 +170,23 @@ fn the_pinned_35b_tunes_every_entry_once_on_real_weights() {
 #[test]
 #[ignore = "reads the pinned 4B GGUF; needs Metal or CUDA"]
 fn the_pinned_4b_uses_stored_tuning_on_its_second_load() {
-    let root = std::env::temp_dir().join(format!("magnitude-kernel-cache-4b-{}", std::process::id()));
+    let root =
+        std::env::temp_dir().join(format!("magnitude-kernel-cache-4b-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let cache = Arc::new(KernelCache::open(root.clone(), DEFAULT_KERNEL_CACHE_BYTES).unwrap());
-    let (backend, loads) = prepare_every_entry(&PINNED_4B, 16, Some(cache), 2);
+    let (backend, loads) = prepare_every_entry(&PINNED_4B, Some(cache), 2);
     let files = |directory: &str| std::fs::read_dir(root.join(directory)).unwrap().count();
     let (first, second) = (&loads[0], &loads[1]);
-    assert!(first.iter().all(|tuned| tuned.origin == TuningOrigin::Searched));
+    assert!(first
+        .iter()
+        .all(|tuned| tuned.origin == TuningOrigin::Searched));
     assert_eq!(files("tuning"), first.len());
-    assert!(second.iter().all(|tuned| tuned.origin == TuningOrigin::Stored
-        && tuned.time.forming_seconds == 0.0
-        && tuned.time.measuring_seconds == 0.0
-        && tuned.time.validating_seconds == 0.0));
+    assert!(second
+        .iter()
+        .all(|tuned| tuned.origin == TuningOrigin::Stored
+            && tuned.time.forming_seconds == 0.0
+            && tuned.time.measuring_seconds == 0.0
+            && tuned.time.validating_seconds == 0.0));
     let choices = |load: &[TunedEntry]| {
         load.iter()
             .map(|tuned| (tuned.entry, tuned.bindings.clone(), tuned.overall.clone()))

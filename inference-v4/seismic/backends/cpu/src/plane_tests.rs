@@ -1,5 +1,5 @@
 //! Execute target storage-plane views through the production typed builder/JIT.
-use crate::{Cpu, compile, open_host, workers::LaunchFrame};
+use crate::{compile, open_host, workers::LaunchFrame, Cpu};
 use seismic_ir::construction::Construction;
 use seismic_ir::kernel::dynamic::PortableSliceAxis;
 use seismic_ir::storage::GlobalBufferKind;
@@ -167,22 +167,34 @@ fn rectangular_transpose_reshape_preserves_read_and_write_coordinates() {
     let target = &opened.device;
     let mut arena = ExprArena::default();
     let mut construction = Construction::<Cpu>::new(
-        &mut arena, vec![], false, target.addressable_resources().len(),
+        &mut arena,
+        vec![],
+        false,
+        target.addressable_resources().len(),
     );
     let two = arena.nat(2);
     let three = arena.nat(3);
     let six = arena.nat(6);
     let representation = registry::dense(DType::F32);
     let (_, source) = construction.storage_mut().tensor(
-        &mut arena, GlobalBufferKind::Arena, representation, vec![two, three],
+        &mut arena,
+        GlobalBufferKind::Arena,
+        representation,
+        vec![two, three],
     );
     let (_, output) = construction.storage_mut().tensor(
-        &mut arena, GlobalBufferKind::Arena, representation, vec![six],
+        &mut arena,
+        GlobalBufferKind::Arena,
+        representation,
+        vec![six],
     );
     let source = construction.view(source, representation);
     let output = construction.view(output, representation);
     let mut builder = construction.portable_kernel(
-        &mut arena, target.facts(), target.addressable_resources(), target.vectors(),
+        &mut arena,
+        target.facts(),
+        target.addressable_resources(),
+        target.vectors(),
     );
     let source = builder.arg_view(source, true);
     let output = builder.arg_view(output, true);
@@ -203,16 +215,45 @@ fn rectangular_transpose_reshape_preserves_read_and_write_coordinates() {
     let emission = target.kernel_emission_layout(kernel);
     let native = compile::compile_kernel(target, kernel, &emission).unwrap();
     let mut words = vec![0u64; emission.words.total as usize];
-    for (binding, fields) in emission.words.bindings.iter().zip([vec![2,3,3,1], vec![6,1]]) {
-        words[binding.first as usize..binding.first as usize + fields.len()].copy_from_slice(&fields);
+    for (binding, fields) in emission
+        .words
+        .bindings
+        .iter()
+        .zip([vec![2, 3, 3, 1], vec![6, 1]])
+    {
+        words[binding.first as usize..binding.first as usize + fields.len()]
+            .copy_from_slice(&fields);
     }
-    let mut input = [1f32,2.,3.,4.,5.,6.];
-    let mut output = [0f32;6];
-    let buffers = [input.as_mut_ptr().cast::<u8>(), output.as_mut_ptr().cast::<u8>()];
-    let frame = LaunchFrame { buffers: buffers.as_ptr(), words: words.as_ptr(), results: std::ptr::null_mut() };
+    let mut input = [1f32, 2., 3., 4., 5., 6.];
+    let mut output = [0f32; 6];
+    let buffers = [
+        input.as_mut_ptr().cast::<u8>(),
+        output.as_mut_ptr().cast::<u8>(),
+    ];
+    let frame = LaunchFrame {
+        buffers: buffers.as_ptr(),
+        words: words.as_ptr(),
+        results: std::ptr::null_mut(),
+    };
     unsafe {
-        (native.kernel.entry)(&frame, std::ptr::null(), 0, 0, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+        (native.kernel.entry)(
+            &frame,
+            std::ptr::null(),
+            0,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
     }
-    assert_eq!(input, [1.,2.,3.,9.,5.,6.], "write must reach transposed backing coordinate");
-    assert_eq!(output, [1.,9.,2.,5.,3.,6.], "reshape follows logical source flatten order");
+    assert_eq!(
+        input,
+        [1., 2., 3., 9., 5., 6.],
+        "write must reach transposed backing coordinate"
+    );
+    assert_eq!(
+        output,
+        [1., 9., 2., 5., 3., 6.],
+        "reshape follows logical source flatten order"
+    );
 }

@@ -17,7 +17,13 @@ fn vulkan() -> Option<Device> {
 const MAPPINGS: [(u64, u64); 4] = [(2, 4), (4, 4), (2, 8), (4, 8)];
 
 impl Case {
-    fn vulkan(&self, device: &Device, activation: Element, chunk: bool, (rows, warps): (u64, u64)) -> Outcome {
+    fn vulkan(
+        &self,
+        device: &Device,
+        activation: Element,
+        chunk: bool,
+        (rows, warps): (u64, u64),
+    ) -> Outcome {
         let specialization = self.specialization(device, rows).with_param("WARPS", warps);
         let mut t = self.tensors(device, activation);
         let mixed = if chunk {
@@ -51,7 +57,9 @@ impl Case {
 
     /// Every slot advances row-sequentially in the chunk entry too.
     fn sequential_in_chunk(&self) -> bool {
-        self.slots.iter().all(|slot| slot.rows <= 16 || slot.stop == 0)
+        self.slots
+            .iter()
+            .all(|slot| slot.rows <= 16 || slot.stop == 0)
     }
 }
 
@@ -69,17 +77,38 @@ fn vulkan_step_and_chunk_match_the_portable_body() {
         }
         let oracle = case.oracle();
         let mut reference: Option<Outcome> = None;
-        for mapping in MAPPINGS.into_iter().filter(|(rows, warps)| case.geometry.width as u64 % (rows * warps) == 0) {
+        for mapping in MAPPINGS
+            .into_iter()
+            .filter(|(rows, warps)| case.geometry.width as u64 % (rows * warps) == 0)
+        {
             let step = case.vulkan(&device, Element::f32(), false, mapping);
-            check(&format!("{label}: vulkan step {mapping:?}"), &case, &step, &oracle, (2e-5, 2e-6));
+            check(
+                &format!("{label}: vulkan step {mapping:?}"),
+                &case,
+                &step,
+                &oracle,
+                (2e-5, 2e-6),
+            );
             let chunk = case.vulkan(&device, Element::f32(), true, mapping);
-            check(&format!("{label}: vulkan chunk {mapping:?}"), &case, &chunk, &oracle, (5e-4, 2e-5));
+            check(
+                &format!("{label}: vulkan chunk {mapping:?}"),
+                &case,
+                &chunk,
+                &oracle,
+                (5e-4, 2e-5),
+            );
             if case.sequential_in_chunk() {
-                assert!(same_bits(&step, &chunk), "{label}: vulkan chunk {mapping:?} differs from the step");
+                assert!(
+                    same_bits(&step, &chunk),
+                    "{label}: vulkan chunk {mapping:?} differs from the step"
+                );
             }
             match &reference {
                 Some(reference) => {
-                    assert!(same_bits(reference, &chunk), "{label}: vulkan chunk {mapping:?} changed result bits")
+                    assert!(
+                        same_bits(reference, &chunk),
+                        "{label}: vulkan chunk {mapping:?} changed result bits"
+                    )
                 }
                 None => reference = Some(chunk),
             }
@@ -90,14 +119,25 @@ fn vulkan_step_and_chunk_match_the_portable_body() {
 #[test]
 fn vulkan_mapping_never_changes_bits_and_stop_equals_a_shorter_run() {
     let Some(device) = vulkan() else { return };
-    let wide = Geometry { key_heads: 2, value_heads: 4, width: 128, convolution: 4, banks: 3, tape: 0 };
+    let wide = Geometry {
+        key_heads: 2,
+        value_heads: 4,
+        width: 128,
+        convolution: 4,
+        banks: 3,
+        tape: 0,
+    };
     let slot = |rows, stop| slot(rows, stop, 1, 2);
     let full = Case::new(wide, 6, vec![slot(6, 3)], false, 11);
     let reference = full.vulkan(&device, Element::f32(), false, MAPPINGS[0]);
     for mapping in MAPPINGS {
         for chunk in [false, true] {
             let outcome = full.vulkan(&device, Element::f32(), chunk, mapping);
-            assert!(same_bits(&reference, &outcome), "{} {mapping:?} changed result bits", if chunk { "chunk" } else { "step" });
+            assert!(
+                same_bits(&reference, &outcome),
+                "{} {mapping:?} changed result bits",
+                if chunk { "chunk" } else { "step" }
+            );
         }
     }
     let mut prefix = Case::new(wide, 6, vec![slot(6, 3)], false, 11);
@@ -106,11 +146,19 @@ fn vulkan_mapping_never_changes_bits_and_stop_equals_a_shorter_run() {
     prefix.projection.truncate(3 * wide.projection_width());
     let short = prefix.vulkan(&device, Element::f32(), false, MAPPINGS[0]);
     assert!(
-        short.delta.iter().zip(&reference.delta).all(|(a, b)| a.to_bits() == b.to_bits()),
+        short
+            .delta
+            .iter()
+            .zip(&reference.delta)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
         "stop-row state differs from the state of a shorter run"
     );
     assert!(
-        short.window.iter().zip(&reference.window).all(|(a, b)| a.to_bits() == b.to_bits()),
+        short
+            .window
+            .iter()
+            .zip(&reference.window)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
         "stop-row window differs from the window of a shorter run"
     );
 }
@@ -129,22 +177,45 @@ fn vulkan_real_4b_geometry_step_and_chunk_agree_with_the_host_model() {
     let Some(device) = vulkan() else { return };
     for (label, rows, slots) in [
         ("decode, one slot", 1, vec![slot(1, 1, 1, 3)]),
-        ("verify, two slots", 8, vec![slot(4, 2, 1, 3), slot(3, 3, 0, 4)]),
+        (
+            "verify, two slots",
+            8,
+            vec![slot(4, 2, 1, 3), slot(3, 3, 0, 4)],
+        ),
         ("prefill 128", 128, vec![slot(128, 128, 1, 3)]),
-        ("prefill 512, two slots", 512, vec![slot(300, 211, 1, 3), slot(212, 212, 2, 4)]),
+        (
+            "prefill 512, two slots",
+            512,
+            vec![slot(300, 211, 1, 3), slot(212, 212, 2, 4)],
+        ),
     ] {
         let case = Case::new(QWEN_4B, rows, slots, false, 21).with_bf16_activations();
         let host = case.host();
         let step = case.vulkan(&device, Element::bf16(), false, MAPPINGS[0]);
-        check(&format!("4B {label}: vulkan step"), &case, &step, &host, (1.5e-2, 3e-3));
+        check(
+            &format!("4B {label}: vulkan step"),
+            &case,
+            &step,
+            &host,
+            (1.5e-2, 3e-3),
+        );
         let mut reference: Option<Outcome> = None;
         for mapping in MAPPINGS {
             let chunk = case.vulkan(&device, Element::bf16(), true, mapping);
             if case.sequential_in_chunk() {
-                assert!(same_bits(&step, &chunk), "4B {label}: vulkan chunk {mapping:?} differs from the step");
+                assert!(
+                    same_bits(&step, &chunk),
+                    "4B {label}: vulkan chunk {mapping:?} differs from the step"
+                );
                 continue;
             }
-            check(&format!("4B {label}: vulkan chunk {mapping:?}"), &case, &chunk, &host, (1.5e-2, 3e-3));
+            check(
+                &format!("4B {label}: vulkan chunk {mapping:?}"),
+                &case,
+                &chunk,
+                &host,
+                (1.5e-2, 3e-3),
+            );
             let (max, rms) = errors(&chunk.mixed, &step.mixed);
             println!("4B {label}: vulkan chunk {mapping:?} vs step: max {max:.3e} rms {rms:.3e}");
             // Both are within one BF16 ulp of the host model per element, so
@@ -152,7 +223,10 @@ fn vulkan_real_4b_geometry_step_and_chunk_agree_with_the_host_model() {
             assert!(max <= 4e-2 && rms <= 3e-3);
             match &reference {
                 Some(reference) => {
-                    assert!(same_bits(reference, &chunk), "4B {label}: vulkan chunk {mapping:?} changed result bits")
+                    assert!(
+                        same_bits(reference, &chunk),
+                        "4B {label}: vulkan chunk {mapping:?} changed result bits"
+                    )
                 }
                 None => reference = Some(chunk),
             }
@@ -165,8 +239,21 @@ fn vulkan_real_4b_geometry_step_and_chunk_agree_with_the_host_model() {
 #[test]
 fn vulkan_chunk_short_slots_get_the_step_bits() {
     let Some(device) = vulkan() else { return };
-    let geometry = Geometry { key_heads: 16, value_heads: 32, width: 128, convolution: 4, banks: 11, tape: 0 };
-    let slots = vec![slot(4, 1, 1, 6), slot(16, 9, 2, 7), slot(40, 40, 3, 8), slot(1, 1, 4, 9), slot(7, 0, 5, 10)];
+    let geometry = Geometry {
+        key_heads: 16,
+        value_heads: 32,
+        width: 128,
+        convolution: 4,
+        banks: 11,
+        tape: 0,
+    };
+    let slots = vec![
+        slot(4, 1, 1, 6),
+        slot(16, 9, 2, 7),
+        slot(40, 40, 3, 8),
+        slot(1, 1, 4, 9),
+        slot(7, 0, 5, 10),
+    ];
     let case = Case::new(geometry, 70, slots, false, 31).with_bf16_activations();
     let step = case.vulkan(&device, Element::bf16(), false, MAPPINGS[0]);
     let host = case.host();
@@ -180,15 +267,28 @@ fn vulkan_chunk_short_slots_get_the_step_bits() {
             if s.rows > 16 {
                 continue;
             }
-            let bank = s.following * geometry.delta_bank()..(s.following + 1) * geometry.delta_bank();
+            let bank =
+                s.following * geometry.delta_bank()..(s.following + 1) * geometry.delta_bank();
             assert!(
-                step.mixed[range.clone()].iter().zip(&chunk.mixed[range]).all(|(a, b)| a.to_bits() == b.to_bits())
-                    && step.delta[bank.clone()].iter().zip(&chunk.delta[bank]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                step.mixed[range.clone()]
+                    .iter()
+                    .zip(&chunk.mixed[range])
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+                    && step.delta[bank.clone()]
+                        .iter()
+                        .zip(&chunk.delta[bank])
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
                 "chunk {mapping:?}: a {}-row slot differs from the step",
                 s.rows
             );
         }
-        check(&format!("4B verify mix: vulkan chunk {mapping:?}"), &case, &chunk, &host, (1.5e-2, 3e-3));
+        check(
+            &format!("4B verify mix: vulkan chunk {mapping:?}"),
+            &case,
+            &chunk,
+            &host,
+            (1.5e-2, 3e-3),
+        );
     }
 }
 
@@ -197,14 +297,32 @@ fn vulkan_tape_cases_match_the_portable_body() {
     let Some(device) = vulkan() else { return };
     for (label, case) in tape_cases() {
         let oracle = case.oracle();
-        for mapping in MAPPINGS.into_iter().filter(|(rows, warps)| case.geometry.width as u64 % (rows * warps) == 0) {
+        for mapping in MAPPINGS
+            .into_iter()
+            .filter(|(rows, warps)| case.geometry.width as u64 % (rows * warps) == 0)
+        {
             let step = case.vulkan(&device, Element::f32(), false, mapping);
-            check(&format!("{label}: vulkan step {mapping:?}"), &case, &step, &oracle, (2e-5, 2e-6));
+            check(
+                &format!("{label}: vulkan step {mapping:?}"),
+                &case,
+                &step,
+                &oracle,
+                (2e-5, 2e-6),
+            );
             let chunk = case.vulkan(&device, Element::f32(), true, mapping);
-            check(&format!("{label}: vulkan chunk {mapping:?}"), &case, &chunk, &oracle, (5e-4, 2e-5));
+            check(
+                &format!("{label}: vulkan chunk {mapping:?}"),
+                &case,
+                &chunk,
+                &oracle,
+                (5e-4, 2e-5),
+            );
             if case.sequential_in_chunk() {
                 assert!(
-                    step.tape.iter().zip(&chunk.tape).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    step.tape
+                        .iter()
+                        .zip(&chunk.tape)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
                     "{label}: vulkan chunk {mapping:?} records a different tape"
                 );
             }

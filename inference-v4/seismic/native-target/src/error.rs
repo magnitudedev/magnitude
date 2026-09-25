@@ -56,10 +56,7 @@ pub enum ToolchainUnavailable {
     /// The toolchain's directory could not be determined.
     Unlocated { reason: String },
     /// The library is absent from the resolved directory.
-    Missing {
-        library: String,
-        directory: PathBuf,
-    },
+    Missing { library: String, directory: PathBuf },
     /// The library is present but cannot be loaded or lacks an entry point.
     Unusable {
         library: String,

@@ -19,7 +19,9 @@
 //! absolute weighted medians, every point measured afresh for every
 //! configuration, margins relative to the whole cost.
 
-use super::search::{self, Cost, Evaluator, ParameterValues, PointKey, SearchSettings, SearchSpace};
+use super::search::{
+    self, Cost, Evaluator, ParameterValues, PointKey, SearchSettings, SearchSpace,
+};
 use super::tune::{Exclusion, Outcome, TuningResult};
 use std::collections::HashMap;
 
@@ -69,8 +71,13 @@ pub enum RecordingError {
 impl std::fmt::Display for RecordingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Space(detail) => write!(f, "the survey's configurations do not form its space: {detail}"),
-            Self::Empty { point } => write!(f, "a surveyed configuration has no samples at `{point}`"),
+            Self::Space(detail) => write!(
+                f,
+                "the survey's configurations do not form its space: {detail}"
+            ),
+            Self::Empty { point } => {
+                write!(f, "a surveyed configuration has no samples at `{point}`")
+            }
             Self::DefaultExcluded => f.write_str("the survey excluded the defaults"),
         }
     }
@@ -128,9 +135,17 @@ impl Recording {
                 ),
             };
         }
-        let weights = result.points.iter().map(|point| point.weight).collect::<Vec<_>>();
+        let weights = result
+            .points
+            .iter()
+            .map(|point| point.weight)
+            .collect::<Vec<_>>();
         let classes = search::classes(result.points.iter().map(|point| point.class.as_deref()));
-        let labels = result.points.iter().map(|point| point.label.clone()).collect();
+        let labels = result
+            .points
+            .iter()
+            .map(|point| point.label.clone())
+            .collect();
         let reference = points[space.default_index()]
             .as_ref()
             .ok_or(RecordingError::DefaultExcluded)?
@@ -186,7 +201,9 @@ impl Recording {
     /// the overall best configuration is at that point.
     pub fn gaps(&self) -> Vec<PointGap> {
         let best = self.best();
-        let overall = self.points[best].as_ref().expect("the best configuration was measured");
+        let overall = self.points[best]
+            .as_ref()
+            .expect("the best configuration was measured");
         self.labels
             .iter()
             .enumerate()
@@ -195,7 +212,9 @@ impl Recording {
                     .points
                     .iter()
                     .enumerate()
-                    .filter_map(|(index, points)| points.as_ref().map(|points| (index, points[point].time)))
+                    .filter_map(|(index, points)| {
+                        points.as_ref().map(|points| (index, points[point].time))
+                    })
                     .min_by(|left, right| left.1.total_cmp(&right.1))
                     .expect("the defaults were measured");
                 PointGap {
@@ -273,7 +292,9 @@ impl Recorded<'_> {
 
     /// The cost of `index` from `medians` at its points.
     fn cost(&self, index: usize, medians: &[f64], reference: &[f64]) -> Cost {
-        let points = self.recording.points[index].as_ref().expect("a costed configuration was measured");
+        let points = self.recording.points[index]
+            .as_ref()
+            .expect("a costed configuration was measured");
         match self.objective {
             Objective::Keyed => Cost::relative(
                 points.iter().map(|point| point.key.clone()).collect(),
@@ -348,16 +369,21 @@ impl Evaluator for Recorded<'_> {
         let results = batch
             .iter()
             .map(|&index| {
-                let Some(medians) = self.medians(index, self.settings.samples, &mut measured) else {
-                    self.curve.push(self.cheapest.map_or(f64::INFINITY, |(_, best)| {
-                        self.recording.excess(best)
-                    }));
+                let Some(medians) = self.medians(index, self.settings.samples, &mut measured)
+                else {
+                    self.curve.push(
+                        self.cheapest
+                            .map_or(f64::INFINITY, |(_, best)| self.recording.excess(best)),
+                    );
                     return Err(Self::excluded());
                 };
                 if index == self.recording.space.default_index() {
                     self.reference = Some(self.reference_of(&medians));
                 }
-                let reference = self.reference.as_ref().expect("the defaults are evaluated first");
+                let reference = self
+                    .reference
+                    .as_ref()
+                    .expect("the defaults are evaluated first");
                 let cost = self.cost(index, &medians, reference);
                 if self.cheapest.is_none_or(|(total, _)| cost.total() < total) {
                     self.cheapest = Some((cost.total(), index));
@@ -377,7 +403,10 @@ impl Evaluator for Recorded<'_> {
             .iter()
             .map(|&index| self.medians(index, self.settings.confirmation_samples, &mut shared))
             .collect::<Vec<_>>();
-        let Some(reference) = medians[0].as_ref().map(|medians| self.reference_of(medians)) else {
+        let Some(reference) = medians[0]
+            .as_ref()
+            .map(|medians| self.reference_of(medians))
+        else {
             return finalists.iter().map(|_| Err(Self::excluded())).collect();
         };
         finalists
@@ -412,7 +441,11 @@ pub struct Replay {
 impl Replay {
     /// The fraction of runs whose choice is within `excess` of the best.
     pub fn within(&self, excess: f64) -> f64 {
-        self.chosen.iter().filter(|chosen| **chosen <= excess).count() as f64 / self.chosen.len() as f64
+        self.chosen
+            .iter()
+            .filter(|chosen| **chosen <= excess)
+            .count() as f64
+            / self.chosen.len() as f64
     }
 
     /// The smallest evaluation count after which at least `fraction` of the
@@ -424,7 +457,12 @@ impl Replay {
             let reached = self
                 .curves
                 .iter()
-                .filter(|curve| curve.get(count - 1).or(curve.last()).is_some_and(|excess_at| *excess_at <= excess))
+                .filter(|curve| {
+                    curve
+                        .get(count - 1)
+                        .or(curve.last())
+                        .is_some_and(|excess_at| *excess_at <= excess)
+                })
                 .count();
             reached as f64 >= fraction * self.curves.len() as f64
         })
@@ -487,8 +525,9 @@ mod tests {
         let mut configurations = Vec::new();
         for a in [1u64, 2, 3, 4] {
             for b in [1u64, 2] {
-                let values: ParameterValues =
-                    [("A".to_string(), a), ("B".to_string(), b)].into_iter().collect();
+                let values: ParameterValues = [("A".to_string(), a), ("B".to_string(), b)]
+                    .into_iter()
+                    .collect();
                 let point = |label: &str, name: &str, base: f64, spread: f64| PointMeasurement {
                     point: label.into(),
                     key: PointKey {
@@ -497,7 +536,9 @@ mod tests {
                     },
                     median_seconds: base,
                     deviation_seconds: 0.0,
-                    samples: (0..15).map(|sample| base * (1.0 + spread * ((sample % 5) as f64 - 2.0))).collect(),
+                    samples: (0..15)
+                        .map(|sample| base * (1.0 + spread * ((sample % 5) as f64 - 2.0)))
+                        .collect(),
                     repetitions: 1,
                     rotation_bytes: 0,
                 };
@@ -505,6 +546,7 @@ mod tests {
                     configuration: Configuration {
                         statics: Default::default(),
                         params: values.clone(),
+                        launches: Vec::new(),
                     },
                     outcome: Outcome::Measured {
                         artifact: String::new(),
@@ -534,11 +576,13 @@ mod tests {
             parameters: vec![
                 DeclaredParameter {
                     name: "A".into(),
+                    launch: None,
                     arithmetic: false,
                     values: vec![1, 2, 3, 4],
                 },
                 DeclaredParameter {
                     name: "B".into(),
+                    launch: None,
                     arithmetic: false,
                     values: vec![1, 2],
                 },
@@ -547,6 +591,7 @@ mod tests {
             overall: Configuration {
                 statics: Default::default(),
                 params: Default::default(),
+                launches: Vec::new(),
             },
             method: TuningMethod::Survey { samples: 15 },
             time: TuningTime::default(),

@@ -5,12 +5,67 @@
 //! bank it publishes to.
 
 use super::super::native_target_graph::weight;
-use crate::{ModelLoadPlan, StateResourcePlan, native::RecurrentKernels};
+use super::draft::GraphDraft;
+use crate::{native::RecurrentKernels, ModelLoadPlan, RecurrentBinding, StateResourcePlan};
 use magnitude_model_contracts::{WeightKind, WeightRole, WeightScope};
 use magnitude_model_kernels::{
     gated_delta_chunk, gated_delta_output, gated_delta_project, gated_delta_step,
 };
-use seismic::{Element, NativeGraph, NativePort, WorkflowTensor};
+use seismic::{Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
+
+pub(crate) struct RecurrentGraphEntries<'a, G: GraphDraft + 'a> {
+    pub project: G::Binding<'a, gated_delta_project::Entry>,
+    pub step: G::Binding<'a, gated_delta_step::Entry>,
+    pub chunk: G::Binding<'a, gated_delta_chunk::Entry>,
+    pub output: G::Binding<'a, gated_delta_output::Entry>,
+}
+
+impl<'a> From<&'a RecurrentKernels> for RecurrentGraphEntries<'a, NativeGraph> {
+    fn from(kernels: &'a RecurrentKernels) -> Self {
+        Self {
+            project: &kernels.project,
+            step: &kernels.step,
+            chunk: &kernels.chunk,
+            output: &kernels.output,
+        }
+    }
+}
+
+pub(crate) struct CheckedRecurrentEntries {
+    project: [(&'static str, Element); 6],
+    state: [(&'static str, Element); 1],
+    output: [(&'static str, Element); 3],
+}
+
+impl CheckedRecurrentEntries {
+    pub(crate) fn new(binding: RecurrentBinding) -> Self {
+        Self {
+            project: [
+                ("NW", binding.norm),
+                ("QW", binding.qkv),
+                ("GW", binding.gate),
+                ("AW", binding.alpha),
+                ("BW", binding.beta),
+                ("A", binding.activation),
+            ],
+            state: [("A", binding.activation)],
+            output: [
+                ("RN", binding.recurrent_norm),
+                ("OW", binding.output),
+                ("A", binding.activation),
+            ],
+        }
+    }
+
+    pub(crate) fn entries(&self) -> RecurrentGraphEntries<'_, NativeGraphMetadata> {
+        RecurrentGraphEntries {
+            project: &self.project,
+            step: &self.state,
+            chunk: &self.state,
+            output: &self.output,
+        }
+    }
+}
 
 /// Row classes at or above this size advance state with the chunked entry;
 /// smaller classes use the row-sequential step. The chunked entry advances
@@ -44,6 +99,7 @@ pub(crate) struct RecurrentControlPorts {
 /// Geometry of one recurrent block at one graph class.
 pub(crate) struct RecurrentBlock {
     pub rows: u64,
+    pub hidden: u64,
     pub slots: u64,
     pub key_heads: u64,
     pub value_heads: u64,
@@ -56,9 +112,9 @@ pub(crate) struct RecurrentBlock {
     pub component_index: usize,
 }
 
-pub(crate) fn recurrent(
-    graph: &mut NativeGraph,
-    kernels: &RecurrentKernels,
+pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    kernels: RecurrentGraphEntries<'a, G>,
     state: &StateResourcePlan,
     load: &ModelLoadPlan,
     scope: WeightScope,
@@ -67,11 +123,23 @@ pub(crate) fn recurrent(
     block: RecurrentBlock,
 ) -> Result<(WorkflowTensor, RecurrentStatePorts, RecurrentControlPorts), String> {
     let input_norm = weight(graph, load, scope, WeightKind::InputNorm, weights)?;
-    let qkv_weight = weight(graph, load, scope, WeightKind::RecurrentQueryKeyValue, weights)?;
+    let qkv_weight = weight(
+        graph,
+        load,
+        scope,
+        WeightKind::RecurrentQueryKeyValue,
+        weights,
+    )?;
     let gate_weight = weight(graph, load, scope, WeightKind::RecurrentGate, weights)?;
     let alpha_weight = weight(graph, load, scope, WeightKind::RecurrentAlpha, weights)?;
     let beta_weight = weight(graph, load, scope, WeightKind::RecurrentBeta, weights)?;
-    let convolution = weight(graph, load, scope, WeightKind::RecurrentConvolution, weights)?;
+    let convolution = weight(
+        graph,
+        load,
+        scope,
+        WeightKind::RecurrentConvolution,
+        weights,
+    )?;
     let rate = weight(graph, load, scope, WeightKind::RecurrentDecay, weights)?;
     let time_bias = weight(graph, load, scope, WeightKind::RecurrentTimeBias, weights)?;
     let recurrent_norm = weight(graph, load, scope, WeightKind::RecurrentNorm, weights)?;
@@ -95,9 +163,7 @@ pub(crate) fn recurrent(
                 u64::try_from(*extent).map_err(|_| "recurrent state extent exceeds u64".to_owned())
             }))
             .collect::<Result<Vec<_>, String>>()?;
-        graph
-            .port(Element::dense(component.dtype), &extents)
-            .map_err(|error| error.to_string())
+        graph.port(Element::dense(component.dtype), &extents)
     };
     let mut window = arena(block.component_index, "window")?;
     let mut delta = arena(block.component_index + 1, "delta")?;
@@ -105,7 +171,14 @@ pub(crate) fn recurrent(
 
     let projection = graph
         .enqueue(
-            &kernels.project,
+            kernels.project,
+            &[
+                ("M", block.rows),
+                ("H", block.hidden),
+                ("NK", block.key_heads),
+                ("NV", block.value_heads),
+                ("W", block.width),
+            ],
             gated_delta_project::WorkflowArgs {
                 hidden: hidden.into(),
                 input_norm: (&input_norm).into(),
@@ -138,11 +211,7 @@ pub(crate) fn recurrent(
     ];
     // The step and chunk entries share one contract, so their inputs have the
     // same geometry whichever advances this class.
-    let input = |graph: &mut NativeGraph, name: &str| {
-        graph
-            .input_for(&kernels.step, name, &dimensions)
-            .map_err(|error| error.to_string())
-    };
+    let input = |graph: &mut G, name: &str| graph.input_for(kernels.step, name, &dimensions);
     let controls = RecurrentControlPorts {
         segments: input(graph, "segments")?,
         stop: input(graph, "stop")?,
@@ -155,7 +224,8 @@ pub(crate) fn recurrent(
     let mixed = if block.rows >= CHUNKED_ROWS {
         graph
             .enqueue(
-                &kernels.chunk,
+                kernels.chunk,
+                &dimensions,
                 gated_delta_chunk::WorkflowArgs {
                     projection: (&projection).into(),
                     convolution: (&convolution).into(),
@@ -178,7 +248,8 @@ pub(crate) fn recurrent(
     } else {
         graph
             .enqueue(
-                &kernels.step,
+                kernels.step,
+                &dimensions,
                 gated_delta_step::WorkflowArgs {
                     projection: (&projection).into(),
                     convolution: (&convolution).into(),
@@ -201,7 +272,14 @@ pub(crate) fn recurrent(
     };
     let output = graph
         .enqueue(
-            &kernels.output,
+            kernels.output,
+            &[
+                ("M", block.rows),
+                ("H", block.hidden),
+                ("NK", block.key_heads),
+                ("NV", block.value_heads),
+                ("W", block.width),
+            ],
             gated_delta_output::WorkflowArgs {
                 hidden: hidden.into(),
                 mixed: (&mixed).into(),
@@ -213,5 +291,13 @@ pub(crate) fn recurrent(
         )
         .map_err(|error| error.to_string())?
         .value;
-    Ok((output, RecurrentStatePorts { window, delta, tape }, controls))
+    Ok((
+        output,
+        RecurrentStatePorts {
+            window,
+            delta,
+            tape,
+        },
+        controls,
+    ))
 }

@@ -2,14 +2,12 @@
 //! Every lane keeps its concrete submission type through completion and finish.
 
 use crate::programs::{
-    CompletedHeadWork, CompletedStateWork, CompletedTargetWork,
-    CompletedVisionWork, HeadProgram, ProgramSubmission, StateProgram, SubmittedTarget,
-    TargetProgram, VisionProgram,
+    CompletedHeadWork, CompletedStateWork, CompletedTargetWork, CompletedVisionWork, HeadProgram,
+    ProgramSubmission, StateProgram, SubmittedTarget, TargetProgram, VisionProgram,
 };
 use crate::{
     AttestedPrograms, ResidentHead, ResidentTarget, ResidentVision, SubmitError,
-    ValidatedHeadLaunch, ValidatedStateLaunch, ValidatedTargetLaunch,
-    ValidatedVisionLaunch,
+    ValidatedHeadLaunch, ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch,
 };
 use magnitude_model_contracts::{DecoderGeometry, ModelDefinition};
 use std::rc::Rc;
@@ -35,6 +33,21 @@ pub trait ProgramFamily: 'static {
     fn head_is_bound(&self) -> bool;
     fn vision_is_bound(&self) -> bool;
     fn state_is_bound(&self) -> bool;
+    fn unbind_optional(&mut self);
+
+    /// Physical target tensors held by the bound family. Test families with
+    /// no resident model have no target charge.
+    fn target_weight_bytes(&self) -> Result<u64, &'static str> {
+        Ok(0)
+    }
+
+    fn prepared_program_bytes(&self) -> Result<u64, &'static str> {
+        Ok(0)
+    }
+
+    fn bound_constant_bytes(&self) -> Result<u64, &'static str> {
+        Ok(0)
+    }
 
     fn submit_target(
         &mut self,
@@ -56,6 +69,7 @@ pub trait ProgramFamily: 'static {
 
 pub struct NativeFamily {
     programs: Rc<AttestedPrograms>,
+    resident: ResidentTarget,
     target: crate::programs::native_target::NativeTargetProgram,
     state: crate::programs::native_state::NativeStateProgram,
     head: Option<crate::programs::native_head::NativeHeadProgram>,
@@ -68,12 +82,20 @@ impl NativeFamily {
         resident: ResidentTarget,
         geometry: DecoderGeometry,
     ) -> Result<Self, String> {
+        let binding_constants = programs
+            .target_graphs()
+            .ok_or("target graph family was not prepared")?
+            .binding_constant_bytes()?;
         let target = programs
-            .bind_target(resident, geometry)
+            .bind_target(resident.clone(), geometry)
             .map_err(|error| error.to_string())?;
+        if target.constant_bytes()? != binding_constants {
+            return Err("bound target graph constants differ from the claimed charge".into());
+        }
         let state = programs.bind_state();
         Ok(Self {
             programs,
+            resident,
             target,
             state,
             head: None,
@@ -98,11 +120,19 @@ impl ProgramFamily for NativeFamily {
         definition: &ModelDefinition,
     ) -> Result<(), String> {
         if self.head.is_none() {
-            self.head = Some(
-                self.programs
-                    .bind_head(resident, definition)
-                    .map_err(|error| error.to_string())?,
-            );
+            let binding_constants = self
+                .programs
+                .head_graphs()
+                .ok_or("head graph family was not prepared")?
+                .binding_constant_bytes()?;
+            let head = self
+                .programs
+                .bind_head(resident, definition)
+                .map_err(|error| error.to_string())?;
+            if head.constant_bytes()? != binding_constants {
+                return Err("bound head graph constants differ from the claimed charge".into());
+            }
+            self.head = Some(head);
         }
         Ok(())
     }
@@ -128,6 +158,32 @@ impl ProgramFamily for NativeFamily {
     }
     fn state_is_bound(&self) -> bool {
         true
+    }
+
+    fn unbind_optional(&mut self) {
+        self.head = None;
+        self.vision = None;
+    }
+
+    fn target_weight_bytes(&self) -> Result<u64, &'static str> {
+        self.resident.storage_bytes()
+    }
+
+    fn prepared_program_bytes(&self) -> Result<u64, &'static str> {
+        self.programs.device_storage_bytes()
+    }
+
+    fn bound_constant_bytes(&self) -> Result<u64, &'static str> {
+        self.target
+            .constant_bytes()?
+            .checked_add(
+                self.head
+                    .as_ref()
+                    .map(|head| head.constant_bytes())
+                    .transpose()?
+                    .unwrap_or(0),
+            )
+            .ok_or("bound graph constant charge overflows")
     }
 
     fn submit_target(

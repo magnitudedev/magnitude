@@ -113,10 +113,8 @@ pub trait Method: Send + Sync {
     fn requires(&self) -> MethodRequirements;
     /// The most proposals one round may draft.
     fn proposals(&self) -> usize;
-    fn create(
-        &self,
-        checkpoint: Option<&MethodCheckpoint>,
-    ) -> Result<Box<dyn MethodState>, String>;
+    fn create(&self, checkpoint: Option<&MethodCheckpoint>)
+        -> Result<Box<dyn MethodState>, String>;
 }
 
 /// Per-request method state remains confined to its owner thread.

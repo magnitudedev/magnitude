@@ -7,7 +7,9 @@
 //! storage: its buffer addresses, the scalar-result address, then its words.
 //! The launch's only push constant is the block's address.
 
-use crate::device::{barrier, call, Device, Recording, Retired, RetiredCommand, ARGUMENT_CHUNK_BYTES};
+use crate::device::{
+    barrier, call, Device, Recording, Retired, RetiredCommand, ARGUMENT_CHUNK_BYTES,
+};
 use crate::formation::DirectModule;
 use crate::memory::{Buffer, Range};
 use ash::vk;
@@ -43,12 +45,19 @@ impl Arguments {
     }
 
     /// Write the block of `launch` and return its device address.
-    fn write(&mut self, device: &Device, recording: &mut Recording, launch: &DirectLaunch<'_>) -> Result<u64, ExecutionError> {
+    fn write(
+        &mut self,
+        device: &Device,
+        recording: &mut Recording,
+        launch: &DirectLaunch<'_>,
+    ) -> Result<u64, ExecutionError> {
         let mut block = Vec::with_capacity((launch.buffers.len() + 1) * 8 + launch.words.len());
         for (buffer, offset) in launch.buffers {
             block.extend_from_slice(&(buffer.address() + offset).to_le_bytes());
         }
-        block.extend_from_slice(&(launch.scalar_results.0.address() + launch.scalar_results.1).to_le_bytes());
+        block.extend_from_slice(
+            &(launch.scalar_results.0.address() + launch.scalar_results.1).to_le_bytes(),
+        );
         block.extend_from_slice(launch.words);
         let bytes = block.len() as u64;
         if bytes > ARGUMENT_CHUNK_BYTES {
@@ -83,8 +92,18 @@ unsafe fn record_launch(
     if !first {
         compute_barrier(raw, command);
     }
-    raw.cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, launch.module.pipeline_handle(launch.function));
-    raw.cmd_push_constants(command, device.inner.layout, vk::ShaderStageFlags::COMPUTE, 0, &address.to_le_bytes());
+    raw.cmd_bind_pipeline(
+        command,
+        vk::PipelineBindPoint::COMPUTE,
+        launch.module.pipeline_handle(launch.function),
+    );
+    raw.cmd_push_constants(
+        command,
+        device.inner.layout,
+        vk::ShaderStageFlags::COMPUTE,
+        0,
+        &address.to_le_bytes(),
+    );
     raw.cmd_dispatch(command, groups[0], groups[1], groups[2]);
 }
 
@@ -119,12 +138,20 @@ fn groups(device: &Device, launch: &DirectLaunch<'_>) -> Result<Option<[u32; 3]>
     Ok(Some(groups))
 }
 
-fn begin(device: &Device, command: vk::CommandBuffer, flags: vk::CommandBufferUsageFlags, inheritance: Option<&vk::CommandBufferInheritanceInfo<'_>>) -> Result<(), ExecutionError> {
+fn begin(
+    device: &Device,
+    command: vk::CommandBuffer,
+    flags: vk::CommandBufferUsageFlags,
+    inheritance: Option<&vk::CommandBufferInheritanceInfo<'_>>,
+) -> Result<(), ExecutionError> {
     let mut info = vk::CommandBufferBeginInfo::default().flags(flags);
     if let Some(inheritance) = inheritance {
         info = info.inheritance_info(inheritance);
     }
-    call(unsafe { device.inner.device.begin_command_buffer(command, &info) }, "vkBeginCommandBuffer")
+    call(
+        unsafe { device.inner.device.begin_command_buffer(command, &info) },
+        "vkBeginCommandBuffer",
+    )
 }
 
 /// Forms a [`DirectGraph`]: the launches of one submission, in order, with
@@ -154,7 +181,12 @@ impl DirectGraphBuilder {
             launched: false,
         };
         let inheritance = vk::CommandBufferInheritanceInfo::default();
-        let begun = begin(device, command, vk::CommandBufferUsageFlags::SIMULTANEOUS_USE, Some(&inheritance));
+        let begun = begin(
+            device,
+            command,
+            vk::CommandBufferUsageFlags::SIMULTANEOUS_USE,
+            Some(&inheritance),
+        );
         // Released before an error drops the builder, whose graph retires
         // under this lock.
         drop(recording);
@@ -162,7 +194,10 @@ impl DirectGraphBuilder {
     }
 
     fn command(&self) -> vk::CommandBuffer {
-        self.graph.as_ref().expect("a live builder holds its graph").command
+        self.graph
+            .as_ref()
+            .expect("a live builder holds its graph")
+            .command
     }
 
     /// Append a launch after every launch added before it; an empty grid
@@ -173,7 +208,16 @@ impl DirectGraphBuilder {
         };
         let mut recording = self.device.recording();
         let address = self.arguments.write(&self.device, &mut recording, launch)?;
-        unsafe { record_launch(&self.device, self.command(), launch, address, groups, !self.launched) };
+        unsafe {
+            record_launch(
+                &self.device,
+                self.command(),
+                launch,
+                address,
+                groups,
+                !self.launched,
+            )
+        };
         self.launched = true;
         Ok(())
     }
@@ -182,7 +226,10 @@ impl DirectGraphBuilder {
         let mut graph = self.graph.take().expect("a live builder holds its graph");
         graph.arguments = std::mem::take(&mut self.arguments.chunks);
         let recording = self.device.recording();
-        let ended = call(unsafe { self.device.inner.device.end_command_buffer(graph.command) }, "vkEndCommandBuffer");
+        let ended = call(
+            unsafe { self.device.inner.device.end_command_buffer(graph.command) },
+            "vkEndCommandBuffer",
+        );
         drop(recording);
         ended.map(|()| DirectGraph {
             inner: std::sync::Arc::new(graph),
@@ -264,7 +311,11 @@ impl DirectBatch {
         Self::create(device, queries, Some(Vec::with_capacity(launches)))
     }
 
-    fn create(device: &Device, queries: u32, marks: Option<Vec<Option<u32>>>) -> Result<Self, ExecutionError> {
+    fn create(
+        device: &Device,
+        queries: u32,
+        marks: Option<Vec<Option<u32>>>,
+    ) -> Result<Self, ExecutionError> {
         let mut recording = device.recording();
         let command = device.command(&mut recording, vk::CommandBufferLevel::PRIMARY)?;
         let pool = match device.queries(&mut recording, queries) {
@@ -285,7 +336,12 @@ impl DirectBatch {
             replayed: Vec::new(),
             committed: false,
         };
-        let begun = begin(device, command, vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT, None);
+        let begun = begin(
+            device,
+            command,
+            vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+            None,
+        );
         if begun.is_ok() {
             let raw = &device.inner.device;
             unsafe {
@@ -343,10 +399,22 @@ impl DirectBatch {
                 unsafe { compute_barrier(&device.inner.device, self.command) };
             }
             let mark = self.timestamp();
-            self.marks.as_mut().expect("a timed batch has marks").push(Some(mark));
+            self.marks
+                .as_mut()
+                .expect("a timed batch has marks")
+                .push(Some(mark));
             unsafe { record_launch(&device, self.command, launch, address, groups, true) };
         } else {
-            unsafe { record_launch(&device, self.command, launch, address, groups, !self.launched) };
+            unsafe {
+                record_launch(
+                    &device,
+                    self.command,
+                    launch,
+                    address,
+                    groups,
+                    !self.launched,
+                )
+            };
         }
         self.launched = true;
         Ok(())
@@ -383,11 +451,16 @@ impl DirectBatch {
                 vk::PipelineStageFlags2::COMPUTE_SHADER,
                 vk::AccessFlags2::SHADER_WRITE,
                 vk::PipelineStageFlags2::HOST | vk::PipelineStageFlags2::ALL_COMMANDS,
-                vk::AccessFlags2::HOST_READ | vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+                vk::AccessFlags2::HOST_READ
+                    | vk::AccessFlags2::MEMORY_READ
+                    | vk::AccessFlags2::MEMORY_WRITE,
             );
         }
         let end = self.timestamp();
-        let ended = call(unsafe { raw.end_command_buffer(self.command) }, "vkEndCommandBuffer");
+        let ended = call(
+            unsafe { raw.end_command_buffer(self.command) },
+            "vkEndCommandBuffer",
+        );
         drop(recording);
         ended?;
         let value = self.device.submit(self.command)?;
@@ -436,7 +509,10 @@ pub struct TimelineAnchor {
 }
 
 impl TimelineAnchor {
-    pub fn record(device: &Device, host_clock: impl FnOnce() -> f64) -> Result<Self, ExecutionError> {
+    pub fn record(
+        device: &Device,
+        host_clock: impl FnOnce() -> f64,
+    ) -> Result<Self, ExecutionError> {
         let batch = DirectBatch::new(device)?;
         let submission = batch.commit()?;
         submission.finish()?;
@@ -524,21 +600,28 @@ impl DirectSubmission {
     pub fn device_seconds(&self) -> Result<f64, ExecutionError> {
         let values = self.timestamps(self.end + 1)?;
         let limits = self.device.facts().limits;
-        let ticks = values[self.end as usize].wrapping_sub(values[0]) & mask(limits.timestamp_valid_bits);
+        let ticks =
+            values[self.end as usize].wrapping_sub(values[0]) & mask(limits.timestamp_valid_bits);
         Ok(ticks as f64 * limits.timestamp_period / 1e9)
     }
 
     /// The completed batch's device interval on the anchor's host clock.
     pub fn device_interval(&self, anchor: &TimelineAnchor) -> Result<(f64, f64), ExecutionError> {
         let values = self.timestamps(self.end + 1)?;
-        Ok((anchor.place(values[0]), anchor.place(values[self.end as usize])))
+        Ok((
+            anchor.place(values[0]),
+            anchor.place(values[self.end as usize]),
+        ))
     }
 
     /// For a timed batch, each `launch` call's device interval on the
     /// anchor's host clock, in launch order (`None` for an empty launch). A
     /// launch ends where the next recorded launch (or the batch) ends.
     /// `None` for a production batch.
-    pub fn launch_intervals(&self, anchor: &TimelineAnchor) -> Result<Option<Vec<Option<(f64, f64)>>>, ExecutionError> {
+    pub fn launch_intervals(
+        &self,
+        anchor: &TimelineAnchor,
+    ) -> Result<Option<Vec<Option<(f64, f64)>>>, ExecutionError> {
         let Some(marks) = &self.marks else {
             return Ok(None);
         };
@@ -549,8 +632,16 @@ impl DirectSubmission {
                 intervals.push(None);
                 continue;
             };
-            let end = marks[index + 1..].iter().flatten().next().copied().unwrap_or(self.end);
-            intervals.push(Some((anchor.place(values[*mark as usize]), anchor.place(values[end as usize]))));
+            let end = marks[index + 1..]
+                .iter()
+                .flatten()
+                .next()
+                .copied()
+                .unwrap_or(self.end);
+            intervals.push(Some((
+                anchor.place(values[*mark as usize]),
+                anchor.place(values[end as usize]),
+            )));
         }
         Ok(Some(intervals))
     }

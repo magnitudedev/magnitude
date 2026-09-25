@@ -12,7 +12,8 @@ pub const LANES: usize = 8;
 /// `((l0 + l4) + (l2 + l6)) + ((l1 + l5) + (l3 + l7))`.
 #[inline(always)]
 pub fn combine(lanes: [f32; LANES]) -> f32 {
-    ((lanes[0] + lanes[4]) + (lanes[2] + lanes[6])) + ((lanes[1] + lanes[5]) + (lanes[3] + lanes[7]))
+    ((lanes[0] + lanes[4]) + (lanes[2] + lanes[6]))
+        + ((lanes[1] + lanes[5]) + (lanes[3] + lanes[7]))
 }
 
 /// `sum(values)`.
@@ -57,7 +58,10 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     let (a, b) = (&a[..length], &b[..length]);
     let mut lanes = [0.0f32; LANES];
     let full = length / LANES * LANES;
-    for (a, b) in a[..full].chunks_exact(LANES).zip(b[..full].chunks_exact(LANES)) {
+    for (a, b) in a[..full]
+        .chunks_exact(LANES)
+        .zip(b[..full].chunks_exact(LANES))
+    {
         for lane in 0..LANES {
             lanes[lane] = a[lane].mul_add(b[lane], lanes[lane]);
         }
@@ -105,7 +109,10 @@ mod tests {
             lanes[index % LANES] += value;
         }
         assert_eq!(sum(&values).to_bits(), combine(lanes).to_bits());
-        assert_eq!(dot(&values, &values).to_bits(), sum_squares(&values).to_bits());
+        assert_eq!(
+            dot(&values, &values).to_bits(),
+            sum_squares(&values).to_bits()
+        );
     }
 
     #[test]

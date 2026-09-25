@@ -11,8 +11,6 @@
 #define KERNEL_W3 SEISMIC_BETA_WEIGHT
 #include "lib/projection/projection.cuh"
 
-constexpr bool S8 =
-    SEISMIC_TUNE_INT8 == 1 && projection::quantizable<packets::W0, packets::W1, packets::W2, packets::W3>;
 using Pro = projection::Rms<ELEMENT_OF(SEISMIC_INPUT_NORM), projection::AllRows>;
 using Source = projection::GemvSource<Pro>;
 using Out = projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
@@ -32,12 +30,12 @@ using Out = projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
 
 // The segmented GEMV over NB column blocks of 8 rows: segment rows `rows`,
 // weights `w0..w3`, epilogues `out` (each placing its segment's columns).
-template <int NB>
+template <int NB, int KSPLIT>
 __device__ __forceinline__ void project_gemv(const Pro &pro, projection::u8 *row, const projection::u8 *staged,
                                              unsigned M, unsigned long long H, const unsigned long long (&rows)[4],
                                              const packets::W0 &w0, const packets::W1 &w1, const packets::W2 &w2,
                                              const packets::W3 &w3, const Out (&out)[4]) {
-    using Shape = projection::GemvShape<8, 1, SEISMIC_TUNE_KSPLIT, NB>;
+    using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
     __shared__ projection::GemvShared<Shape, Source::type> shared;
     const Source::type x = Source::make(pro, row, M, H, staged);
     const unsigned long long kblocks = H / 64;
@@ -98,38 +96,57 @@ __device__ __forceinline__ void project_gemm(const projection::u8 *staged, const
     }
 }
 
-extern "C" __global__ void gated_delta_project_stage(SEISMIC_KERNEL_PARAMS) {
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_STAGE
+template <unsigned INT8>
+__global__ void gated_delta_project_stage(SEISMIC_KERNEL_PARAMS) {
     projection::stage_row<false>(PROLOGUE, blockIdx.x, SEISMIC_DIM_H, STAGING, GROUPS);
 }
+#endif
 
-extern "C" __global__ void gated_delta_project_stage_s8(SEISMIC_KERNEL_PARAMS) {
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_STAGE_S8
+template <unsigned INT8>
+__global__ void gated_delta_project_stage_s8(SEISMIC_KERNEL_PARAMS) {
+    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1, packets::W2, packets::W3>;
     projection::stage_row<S8>(PROLOGUE, blockIdx.x, SEISMIC_DIM_H, STAGING, GROUPS);
 }
+#endif
 
-extern "C" __global__ void gated_delta_project_gemv(SEISMIC_KERNEL_PARAMS) {
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMV
+template <unsigned KSPLIT>
+__global__ void gated_delta_project_gemv(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ uint4 dynamic_shared[];
     const unsigned long long rows[4] = SEGMENT_ROWS;
     const Out out[4] = SEGMENT_OUT;
-    project_gemv<1>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, (unsigned)SEISMIC_DIM_M,
+    project_gemv<1, KSPLIT>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, (unsigned)SEISMIC_DIM_M,
                     SEISMIC_DIM_H, rows, WEIGHTS, out);
 }
+#endif
 
-extern "C" __global__ void gated_delta_project_gemv16(SEISMIC_KERNEL_PARAMS) {
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMV16
+template <unsigned KSPLIT>
+__global__ void gated_delta_project_gemv16(SEISMIC_KERNEL_PARAMS) {
     const unsigned long long rows[4] = SEGMENT_ROWS;
     const Out out[4] = SEGMENT_OUT;
-    project_gemv<2>(PROLOGUE, nullptr, STAGING, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows, WEIGHTS, out);
+    project_gemv<2, KSPLIT>(PROLOGUE, nullptr, STAGING, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows, WEIGHTS, out);
 }
+#endif
 
-extern "C" __global__ void gated_delta_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMM_SMALL
+template <unsigned INT8>
+__global__ void gated_delta_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
+    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1, packets::W2, packets::W3>;
     const unsigned long long rows[4] = SEGMENT_ROWS;
     const Out out[4] = SEGMENT_OUT;
     project_gemm<projection::SmallGemm, S8>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows, WEIGHTS,
                                             out);
 }
+#endif
 
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMM
 extern "C" __global__ void gated_delta_project_gemm(SEISMIC_KERNEL_PARAMS) {
     const unsigned long long rows[4] = SEGMENT_ROWS;
     const Out out[4] = SEGMENT_OUT;
     project_gemm<projection::LargeGemm, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows, WEIGHTS,
                                                out);
 }
+#endif

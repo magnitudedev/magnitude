@@ -5,7 +5,10 @@
 //! non-generic root facade.
 
 use crate::publication::PublicationReceiver;
-use crate::{owner::Status, retention::RetentionRequest};
+use crate::{
+    owner::{AdmissionError, Status},
+    retention::RetentionRequest,
+};
 use magnitude_generation::GenerationSeed;
 use magnitude_model_contracts::PreparedModelInput;
 use magnitude_model_executor::RequestId;
@@ -38,6 +41,7 @@ pub enum WorkerReply {
         request: RequestId,
         receiver: PublicationReceiver,
     },
+    AdmissionRefused(AdmissionError),
     Status(Status),
     Capacity(CapacityStatus),
     Acknowledged,

@@ -153,7 +153,10 @@ pub enum ExecutionError {
     DataCheckFailed(CheckFailure),
     AllocationFailed(String),
     /// Resource refusal after the invocation's source prefix may have executed.
-    AllocationCapacity { required: seismic_lang::expr::BigUint, available: u64 },
+    AllocationCapacity {
+        required: seismic_lang::expr::BigUint,
+        available: u64,
+    },
     /// A closed executable violated a compiler-owned construction premise.
     ConstructionContradiction(String),
     SubmissionFailed(String),
@@ -307,8 +310,16 @@ impl fmt::Display for ExecutionError {
                 write!(f, "check failed at {}:{}: {}", c.path, c.line, c.failure)
             }
             Self::AllocationFailed(s) => write!(f, "allocation failed: {s}"),
-            Self::AllocationCapacity { required, available } => write!(f, "allocation requires {required} bytes; {available} bytes available"),
-            Self::ConstructionContradiction(detail) => write!(f, "closed executable construction contradiction: {detail}"),
+            Self::AllocationCapacity {
+                required,
+                available,
+            } => write!(
+                f,
+                "allocation requires {required} bytes; {available} bytes available"
+            ),
+            Self::ConstructionContradiction(detail) => {
+                write!(f, "closed executable construction contradiction: {detail}")
+            }
             Self::SubmissionFailed(s) => write!(f, "submission failed: {s}"),
             Self::SynchronizationFailed(s) => write!(f, "synchronization failed: {s}"),
             Self::DeviceLost(s) => write!(f, "device lost: {s}"),

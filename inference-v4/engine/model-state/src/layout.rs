@@ -44,7 +44,8 @@ impl ModelStateLayout {
                     head_geometry = Some((kv_heads, width));
                 }
                 MixerGeometry::Recurrent(recurrent) => {
-                    target_recurrent.extend(recurrent_components(recurrent, activation, tape_rows)?);
+                    target_recurrent
+                        .extend(recurrent_components(recurrent, activation, tape_rows)?);
                 }
             }
         }

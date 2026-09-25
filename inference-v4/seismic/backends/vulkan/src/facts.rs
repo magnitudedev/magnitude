@@ -146,7 +146,10 @@ pub struct Facts {
 
 impl Facts {
     pub fn is_gpu(&self) -> bool {
-        matches!(self.device_type, DeviceType::Discrete | DeviceType::Integrated)
+        matches!(
+            self.device_type,
+            DeviceType::Discrete | DeviceType::Integrated
+        )
     }
 
     /// The formation-identity part the device determines (§7.5), including
@@ -158,9 +161,21 @@ impl Facts {
             self.driver_version,
             hex(&self.pipeline_cache_uuid),
             u8::from(self.matrix),
-            if self.denorm_preserve_32 { "preserve" } else { "default" },
-            if self.rounding_rte_32 { "declared" } else { "probed" },
-            if self.shader_fma.float32 { "khr" } else { "glsl" }
+            if self.denorm_preserve_32 {
+                "preserve"
+            } else {
+                "default"
+            },
+            if self.rounding_rte_32 {
+                "declared"
+            } else {
+                "probed"
+            },
+            if self.shader_fma.float32 {
+                "khr"
+            } else {
+                "glsl"
+            }
         )
     }
 
@@ -220,7 +235,11 @@ pub(crate) fn describe(instance: &Instance, physical: vk::PhysicalDevice) -> Des
         .iter()
         .map(|extension| text(&extension.extension_name))
         .collect::<Vec<_>>();
-    let has = |name: &CStr| extensions.iter().any(|extension| extension.as_bytes() == name.to_bytes());
+    let has = |name: &CStr| {
+        extensions
+            .iter()
+            .any(|extension| extension.as_bytes() == name.to_bytes())
+    };
 
     let mut v11 = vk::PhysicalDeviceVulkan11Properties::default();
     let mut v12 = vk::PhysicalDeviceVulkan12Properties::default();
@@ -412,7 +431,8 @@ pub(crate) fn describe(instance: &Instance, physical: vk::PhysicalDevice) -> Des
 /// with f16 x f16 -> f32 and s8 x s8 -> s32.
 fn matrix_shapes(instance: &Instance, physical: vk::PhysicalDevice) -> bool {
     let loader = ash::khr::cooperative_matrix::Instance::new(instance.entry(), instance.raw());
-    let Ok(shapes) = (unsafe { loader.get_physical_device_cooperative_matrix_properties(physical) })
+    let Ok(shapes) =
+        (unsafe { loader.get_physical_device_cooperative_matrix_properties(physical) })
     else {
         return false;
     };

@@ -2,14 +2,10 @@
 
 use super::{
     ArtifactComponent, ArtifactComponentKind, CapabilityPlan, ComponentPlan, ComponentSelection,
-    ModelLoadPlan, PlannedMethod, ProgramPlan, ResourceBudget, ResourceLimits, ResourcePlan,
-    WeightPlan, MAX_DRAFT_PROPOSALS,
+    ModelLoadPlan, PlannedMethod, ProgramPlan, ResourceLimits, ResourcePlan, WeightPlan,
+    MAX_DRAFT_PROPOSALS,
 };
-use crate::{
-    error::{CapacityError, PlanError, ResourceKind},
-    platform::SelectedDevice,
-    ExecutionPath,
-};
+use crate::{error::PlanError, platform::SelectedDevice, ExecutionPath};
 use magnitude_artifacts::PackageManifest;
 use magnitude_model_contracts::ModelDefinition;
 use magnitude_model_state::KvCodec;
@@ -38,7 +34,7 @@ impl PlannedDevice {
         &self.name
     }
 
-    /// Stable capacity minus the planning reserve at planning time.
+    /// Stable capacity of the selected allocation domain at planning time.
     pub fn assessment_capacity_bytes(&self) -> u64 {
         self.assessment_capacity_bytes
     }
@@ -51,7 +47,6 @@ pub struct ResolvedPolicy {
     codec: KvCodec,
     selection: ComponentSelection,
     limits: ResourceLimits,
-    budget: ResourceBudget,
 }
 
 impl ResolvedPolicy {
@@ -73,10 +68,6 @@ impl ResolvedPolicy {
 
     pub fn limits(&self) -> ResourceLimits {
         self.limits
-    }
-
-    pub fn budget(&self) -> ResourceBudget {
-        self.budget
     }
 }
 
@@ -130,15 +121,9 @@ impl ExecutionPlanDraft {
             .checked_add(resources.bytes().head_weights)
             .and_then(|bytes| bytes.checked_add(resources.bytes().vision_weights))
             .ok_or(PlanError::Arithmetic("resident weight byte count overflow"))?;
-        if planned_weight_bytes == 0
-            || resources
-                .bytes()
-                .total()
-                .map_err(PlanError::ResourcePlanning)?
-                > self.policy.budget.storage_bytes
-        {
+        if planned_weight_bytes == 0 {
             return Err(PlanError::Topology(
-                "resource charges disagree with storage policy",
+                "resource plan has no resident target weights",
             ));
         }
         Ok(ExecutionPlan {
@@ -199,17 +184,9 @@ impl ExecutionPlanner {
         method: PlannedMethod,
         codec: KvCodec,
         limits: ResourceLimits,
-        budget: ResourceBudget,
     ) -> Result<ExecutionPlanDraft, PlanError> {
         if path == ExecutionPath::Native && codec == KvCodec::RotatedK4V4 {
             return Err(PlanError::Unsupported("native rotated K4/V4 KV codec"));
-        }
-        if budget.storage_bytes > device.assessment_capacity_bytes {
-            return Err(PlanError::Resource(CapacityError {
-                resource: ResourceKind::DeviceMemory,
-                required: budget.storage_bytes,
-                available: device.assessment_capacity_bytes,
-            }));
         }
         if selection.head != matches!(method, PlannedMethod::Mtp { .. }) {
             return Err(PlanError::Topology("method and head selection disagree"));
@@ -298,7 +275,6 @@ impl ExecutionPlanner {
                 codec,
                 selection,
                 limits,
-                budget,
             },
         })
     }

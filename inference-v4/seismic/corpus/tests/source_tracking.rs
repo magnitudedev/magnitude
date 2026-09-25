@@ -20,11 +20,22 @@ fn no_source_file_is_ignored() {
     let workspace = corpus_path("../..");
     let output = Command::new("git")
         .current_dir(&workspace)
-        .args(["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--"])
+        .args([
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+            "--",
+        ])
         .args(TREES)
         .output()
         .expect("git runs in the workspace checkout");
-    assert!(output.status.success(), "git ls-files failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "git ls-files failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let lost: Vec<String> = output
         .stdout
         .split(|byte| *byte == 0)

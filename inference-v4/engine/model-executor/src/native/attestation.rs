@@ -1,13 +1,13 @@
 //! Ordered callable native slots constructed from the one ProgramPlan.
 //! Preparation is the only place a checked binding lookup is permitted.
 
-use super::*;
-use crate::{
-    ExecutionPlanDraft, FeedForwardProgramSlot, ImportProgramSlot, MixerProgramSlot,
-    PlanError, PlannedDevice, ProgramPlan,
-};
 use super::preparation::PreparationInputs;
 use super::tuning::{TunedEntry, TuningContext, TuningLimits};
+use super::*;
+use crate::{
+    ExecutionPlanDraft, FeedForwardProgramSlot, HeadBinding, ImportProgramSlot, MixerProgramSlot,
+    PlanError, PlannedDevice, ProgramPlan,
+};
 use magnitude_model_kernels::{import_dense, repack_weight};
 use magnitude_model_state::KvCodec;
 use std::{collections::HashSet, rc::Rc};
@@ -69,9 +69,10 @@ pub(crate) struct AttestedHead {
 
 #[derive(Clone)]
 pub(crate) struct AttestedHeadBlock {
+    pub binding: HeadBinding,
     pub input: NativeKernel<draft_rows::Entry>,
     pub attention: AttentionKernels,
-    pub dense: DenseKernels,
+    pub feed_forward: AttestedFeedForward,
     pub features: NativeKernel<readout_features_rows::Entry>,
     pub logits: NativeKernel<head_logits_rows::Entry>,
 }
@@ -176,49 +177,8 @@ impl AttestedPrograms {
                 .ok_or("head graph requires target attention geometry")?;
             let history_rows =
                 u64::try_from(state.history_rows).map_err(|_| "head history rows exceed u64")?;
-            let slot_bound = limits.in_flight_requests.min(limits.max_batch_rows);
-            let slot_classes = magnitude_model_batching::row_classes(slot_bound)
-                .into_iter()
-                .map(|slots| slots as u64)
-                .collect::<Vec<_>>();
-            let mut classes = Vec::new();
-            // Causal-only heads (catch-up after prefill or while not
-            // drafting) over any row class.
-            for &entry_rows in &row_classes {
-                for &slots in slot_classes.iter().filter(|slots| **slots <= entry_rows) {
-                    classes.push(crate::programs::native_head::HeadGraphClass {
-                        entry_rows,
-                        slots,
-                        history_rows,
-                        steps: 0,
-                        shaped: false,
-                    });
-                }
-            }
-            // Drafting heads: each slot enters at most `proposals + 1`
-            // committed rows (its accepted verification prefix and anchor).
-            for &slots in &slot_classes {
-                let entry_bound = magnitude_model_batching::row_class(
-                    (slots as usize).saturating_mul(proposals + 1).min(max_rows as usize),
-                )
-                .ok_or("head entry row bound has no class")? as u64;
-                for &entry_rows in row_classes
-                    .iter()
-                    .filter(|rows| **rows >= slots && **rows <= entry_bound)
-                {
-                    for steps in 1..=proposals as u64 {
-                        for shaped in [false, true] {
-                            classes.push(crate::programs::native_head::HeadGraphClass {
-                                entry_rows,
-                                slots,
-                                history_rows,
-                                steps,
-                                shaped,
-                            });
-                        }
-                    }
-                }
-            }
+            let classes =
+                crate::programs::native_head::head_graph_classes(limits, history_rows, proposals)?;
             self.head_graphs = Some(Rc::new(
                 crate::programs::native_head::PreparedHeadGraphs::prepare(
                     device,
@@ -254,32 +214,11 @@ impl AttestedPrograms {
                 .map_err(|error| error.to_string())?,
             ));
         }
-        let mut state_classes = Vec::new();
-        for state in std::iter::once(target_state).chain(head_state) {
-            for component in &state.history_components {
-                for plane in component.planes() {
-                    let width = u64::try_from(plane.row_elements)
-                        .map_err(|_| "state plane width exceeds u64")?;
-                    let extents = vec![
-                        u64::try_from(state.history_rows)
-                            .map_err(|_| "state history rows exceed u64")?,
-                        1,
-                        width,
-                    ];
-                    for &rows in &row_classes {
-                        let class = crate::programs::native_state::StateCopyGraphClass {
-                            element: Element::dense(plane.dtype),
-                            source_extents: extents.clone(),
-                            destination_extents: extents.clone(),
-                            map_rows: rows,
-                        };
-                        if !state_classes.contains(&class) {
-                            state_classes.push(class);
-                        }
-                    }
-                }
-            }
-        }
+        let state_classes = crate::programs::native_state::state_copy_classes(
+            target_state,
+            head_state,
+            &row_classes,
+        )?;
         self.state_graphs = Some(Rc::new(
             crate::programs::native_state::PreparedStateCopyGraphs::prepare(
                 device,
@@ -417,7 +356,9 @@ impl AttestedPrograms {
                 _ => {}
             }
         }
-        bytes += bytes!(readout_features_rows) + bytes!(readout_head_rows) + bytes!(readout_selected_rows);
+        bytes += bytes!(readout_features_rows)
+            + bytes!(readout_head_rows)
+            + bytes!(readout_selected_rows);
         if target.features().is_some() {
             bytes += bytes!(readout_features_rows);
         }
@@ -431,10 +372,21 @@ impl AttestedPrograms {
                         + bytes!(gated_attention_decode)
                         + bytes!(gated_attention_prefill)
                         + bytes!(attention_output)
-                        + bytes!(dense_expand)
-                        + bytes!(dense_output)
                         + bytes!(readout_features_rows)
                         + bytes!(head_logits_rows);
+                    match binding.feed_forward {
+                        FeedForwardProgramSlot::Dense(_) => {
+                            bytes += bytes!(dense_expand) + bytes!(dense_output)
+                        }
+                        FeedForwardProgramSlot::Routed(_) => {
+                            bytes += bytes!(routed_route)
+                                + bytes!(routed_expand)
+                                + bytes!(routed_output)
+                                + bytes!(routed_group)
+                                + bytes!(routed_experts)
+                                + bytes!(routed_combine)
+                        }
+                    }
                 }
             }
         }
@@ -630,17 +582,29 @@ impl AttestedPrograms {
                 let mut blocks = Vec::with_capacity(head_plan.blocks().len());
                 for &binding in head_plan.blocks() {
                     blocks.push(AttestedHeadBlock {
+                        binding,
                         input: slot(&handles.input, binding, "draft_rows")?,
                         attention: handles
                             .attention
                             .get(&binding)
                             .cloned()
                             .ok_or_else(|| missing("gated_attention_stages", binding))?,
-                        dense: handles
-                            .dense
-                            .get(&binding)
-                            .cloned()
-                            .ok_or_else(|| missing("dense_stages", binding))?,
+                        feed_forward: match binding.feed_forward {
+                            FeedForwardProgramSlot::Dense(_) => AttestedFeedForward::Dense(
+                                handles
+                                    .dense
+                                    .get(&binding)
+                                    .cloned()
+                                    .ok_or_else(|| missing("dense_stages", binding))?,
+                            ),
+                            FeedForwardProgramSlot::Routed(_) => AttestedFeedForward::Routed(
+                                handles
+                                    .routed
+                                    .get(&binding)
+                                    .cloned()
+                                    .ok_or_else(|| missing("routed_stages", binding))?,
+                            ),
+                        },
                         features: slot(&handles.features, binding, "readout_features_rows")?,
                         logits: slot(&handles.logits, binding, "head_logits_rows")?,
                     });
@@ -693,15 +657,16 @@ impl AttestedPrograms {
                     .ok_or_else(|| missing("copy_rows", element))?,
             ));
         }
-        let state =
-            AttestedState {
-                copies,
-                conditioning: Some(
-                    prepared.glue.conditioning_overlay.clone().ok_or_else(|| {
-                        missing("conditioning_overlay", "target conditioning")
-                    })?,
-                ),
-            };
+        let state = AttestedState {
+            copies,
+            conditioning: Some(
+                prepared
+                    .glue
+                    .conditioning_overlay
+                    .clone()
+                    .ok_or_else(|| missing("conditioning_overlay", "target conditioning"))?,
+            ),
+        };
         let mut imports = Vec::with_capacity(topology.imports().len());
         for &binding in topology.imports() {
             let handle = match binding {
@@ -818,6 +783,14 @@ impl AttestedPrograms {
                 bytes += u128::from(handles.expand.invocation_workspace_bytes())
                     + u128::from(handles.output.invocation_workspace_bytes());
             }
+            for handles in head.routed.values() {
+                bytes += u128::from(handles.route.invocation_workspace_bytes())
+                    + u128::from(handles.expand.invocation_workspace_bytes())
+                    + u128::from(handles.output.invocation_workspace_bytes())
+                    + u128::from(handles.group.invocation_workspace_bytes())
+                    + u128::from(handles.experts.invocation_workspace_bytes())
+                    + u128::from(handles.combine.invocation_workspace_bytes());
+            }
             charge!(head.features.values());
             charge!(head.logits.values());
             charge!(head.shape.iter());
@@ -870,58 +843,52 @@ impl AttestedPrograms {
         }
         FIXTURES + scopes.into_values().max().unwrap_or(0)
     }
-    pub(crate) fn target(&self) -> &AttestedTarget {
-        &self.target
-    }
     pub(crate) fn bind_target(
         &self,
         model: crate::ResidentTarget,
         geometry: magnitude_model_contracts::DecoderGeometry,
     ) -> Result<crate::programs::native_target::NativeTargetProgram, CatalogError> {
         (|| -> Result<crate::programs::native_target::NativeTargetProgram, CatalogFailure> {
-        if model.blocks.len() != self.target.blocks.len()
-            || model.blocks.len() != geometry.blocks.len()
-        {
-            return Err(missing("target", "resident topology"));
-        }
-        let graphs = self
-            .target_graphs
-            .as_ref()
-            .ok_or_else(|| missing("target", "prepared graphs"))?
-            .bind_weights(&model)
+            if model.blocks.len() != self.target.blocks.len()
+                || model.blocks.len() != geometry.blocks.len()
+            {
+                return Err(missing("target", "resident topology"));
+            }
+            let graphs = self
+                .target_graphs
+                .as_ref()
+                .ok_or_else(|| missing("target", "prepared graphs"))?
+                .bind_weights(&model)
+                .map_err(|error| CatalogFailure::Preparation {
+                    entry: "target_graph",
+                    bindings: "resident decoder weights".into(),
+                    outcome: error,
+                })?;
+            let readout_graphs = self
+                .target_readout_graphs
+                .as_ref()
+                .ok_or_else(|| missing("target", "prepared readout graphs"))?
+                .clone()
+                .bind_weights(&model)
+                .map_err(|error| CatalogFailure::Preparation {
+                    entry: "target_readout_graph",
+                    bindings: "resident readout weights".into(),
+                    outcome: error,
+                })?;
+            crate::programs::native_target::NativeTargetProgram::new(
+                model.output_norm.tensor().device(),
+                self.state.clone(),
+                geometry,
+                graphs,
+                readout_graphs,
+            )
             .map_err(|error| CatalogFailure::Preparation {
-                entry: "target_graph",
-                bindings: "resident decoder weights".into(),
-                outcome: error,
-            })?;
-        let readout_graphs = self
-            .target_readout_graphs
-            .as_ref()
-            .ok_or_else(|| missing("target", "prepared readout graphs"))?
-            .clone()
-            .bind_weights(&model)
-            .map_err(|error| CatalogFailure::Preparation {
-                entry: "target_readout_graph",
-                bindings: "resident readout weights".into(),
-                outcome: error,
-            })?;
-        crate::programs::native_target::NativeTargetProgram::new(
-            model.output_norm.tensor().device(),
-            self.state.clone(),
-            geometry,
-            graphs,
-            readout_graphs,
-        )
-        .map_err(|error| CatalogFailure::Preparation {
-            entry: "target_graph_controls",
-            bindings: "sealed attention rotary controls".into(),
-            outcome: error.to_string(),
-        })
-    })()
+                entry: "target_graph_controls",
+                bindings: "sealed attention rotary controls".into(),
+                outcome: error.to_string(),
+            })
+        })()
         .map_err(|failure| CatalogError::native(self.backend, failure))
-    }
-    pub(crate) fn head(&self) -> Option<&AttestedHead> {
-        self.head.as_ref()
     }
     pub(crate) fn bind_head(
         &self,
@@ -929,32 +896,32 @@ impl AttestedPrograms {
         definition: &magnitude_model_contracts::ModelDefinition,
     ) -> Result<crate::programs::native_head::NativeHeadProgram, CatalogError> {
         (|| -> Result<crate::programs::native_head::NativeHeadProgram, CatalogFailure> {
-        let head = self
-            .head
-            .as_ref()
-            .ok_or_else(|| missing("head", "disabled"))?;
-        if head.blocks.len() != 1
-            || resident.blocks.len() != 1
-            || definition
+            let head = self
                 .head
                 .as_ref()
-                .is_none_or(|description| description.depth() != 1)
-        {
-            return Err(missing("head", "native single-block topology"));
-        }
-        let graphs = self
-            .head_graphs
-            .as_ref()
-            .ok_or_else(|| missing("head", "prepared native graphs"))?
-            .bind_weights(&resident)
-            .map_err(|error| missing("head", error))?;
-        crate::programs::native_head::NativeHeadProgram::new(definition.geometry.clone(), graphs)
+                .ok_or_else(|| missing("head", "disabled"))?;
+            if head.blocks.len() != 1
+                || resident.blocks.len() != 1
+                || definition
+                    .head
+                    .as_ref()
+                    .is_none_or(|description| description.depth() != 1)
+            {
+                return Err(missing("head", "native single-block topology"));
+            }
+            let graphs = self
+                .head_graphs
+                .as_ref()
+                .ok_or_else(|| missing("head", "prepared native graphs"))?
+                .bind_weights(&resident)
+                .map_err(|error| missing("head", error))?;
+            crate::programs::native_head::NativeHeadProgram::new(
+                definition.geometry.clone(),
+                graphs,
+            )
             .map_err(|error| missing("head", error))
-    })()
+        })()
         .map_err(|failure| CatalogError::native(self.backend, failure))
-    }
-    pub(crate) fn vision(&self) -> Option<&AttestedVision> {
-        self.vision.as_ref()
     }
     pub(crate) fn bind_vision(
         &self,
@@ -962,35 +929,32 @@ impl AttestedPrograms {
         definition: &magnitude_model_contracts::ModelDefinition,
     ) -> Result<crate::programs::native_vision::NativeVisionProgram, CatalogError> {
         (|| -> Result<crate::programs::native_vision::NativeVisionProgram, CatalogFailure> {
-        let vision = self
-            .vision
-            .as_ref()
-            .ok_or_else(|| missing("vision", "disabled"))?;
-        let description = definition
-            .vision
-            .as_ref()
-            .ok_or_else(|| missing("vision", "description"))?;
-        if vision.blocks.len() != resident.blocks.len()
-            || vision.blocks.len() != description.blocks.len()
-            || resident.patch_embeddings.len() != 2
-        {
-            return Err(missing("vision", "resident topology"));
-        }
-        let graphs = self
-            .vision_graphs
-            .as_ref()
-            .ok_or_else(|| missing("vision", "prepared native graphs"))?
-            .clone()
-            .bind_weights(&resident)
-            .map_err(|error| missing("vision", error))?;
-        Ok(crate::programs::native_vision::NativeVisionProgram::new(
-            graphs,
-        ))
-    })()
+            let vision = self
+                .vision
+                .as_ref()
+                .ok_or_else(|| missing("vision", "disabled"))?;
+            let description = definition
+                .vision
+                .as_ref()
+                .ok_or_else(|| missing("vision", "description"))?;
+            if vision.blocks.len() != resident.blocks.len()
+                || vision.blocks.len() != description.blocks.len()
+                || resident.patch_embeddings.len() != 2
+            {
+                return Err(missing("vision", "resident topology"));
+            }
+            let graphs = self
+                .vision_graphs
+                .as_ref()
+                .ok_or_else(|| missing("vision", "prepared native graphs"))?
+                .clone()
+                .bind_weights(&resident)
+                .map_err(|error| missing("vision", error))?;
+            Ok(crate::programs::native_vision::NativeVisionProgram::new(
+                graphs,
+            ))
+        })()
         .map_err(|failure| CatalogError::native(self.backend, failure))
-    }
-    pub(crate) fn state(&self) -> &AttestedState {
-        &self.state
     }
     pub(crate) fn bind_state(&self) -> crate::programs::native_state::NativeStateProgram {
         crate::programs::native_state::NativeStateProgram::new(
@@ -1000,9 +964,6 @@ impl AttestedPrograms {
                 .clone(),
         )
     }
-    pub(crate) fn imports(&self) -> &[(ImportProgramSlot, AttestedImport)] {
-        &self.imports
-    }
     /// Bind one already planned semantic weight to its exact import entry.
     /// This happens during loader construction, never during a numerical call.
     pub(crate) fn bind_import(
@@ -1010,30 +971,140 @@ impl AttestedPrograms {
         weight: &crate::WeightPlan,
     ) -> Result<crate::programs::native_import::NativeImportProgram, CatalogError> {
         (|| -> Result<crate::programs::native_import::NativeImportProgram, CatalogFailure> {
-        let requested = if let (Some(source), Some(resident)) =
-            (weight.source.dtype(), weight.resident.dtype())
-        {
-            ImportProgramSlot::Dense { source, resident }
-        } else {
-            ImportProgramSlot::Repack {
-                source: weight.source,
-                resident: weight.resident,
-            }
-        };
-        let (_, handle) = self
-            .imports
-            .iter()
-            .find(|(slot, _)| *slot == requested)
-            .ok_or_else(|| missing("weight_import", requested))?;
-        Ok(crate::programs::native_import::NativeImportProgram::new(
-            weight.storage_identity(),
-            handle.clone(),
-        ))
-    })()
+            let requested = if let (Some(source), Some(resident)) =
+                (weight.source.dtype(), weight.resident.dtype())
+            {
+                ImportProgramSlot::Dense { source, resident }
+            } else {
+                ImportProgramSlot::Repack {
+                    source: weight.source,
+                    resident: weight.resident,
+                }
+            };
+            let (_, handle) = self
+                .imports
+                .iter()
+                .find(|(slot, _)| *slot == requested)
+                .ok_or_else(|| missing("weight_import", requested))?;
+            Ok(crate::programs::native_import::NativeImportProgram::new(
+                weight.storage_identity(),
+                handle.clone(),
+            ))
+        })()
         .map_err(|failure| CatalogError::native(self.backend, failure))
     }
     pub fn invocation_workspace_bytes(&self) -> u64 {
         self.invocation_workspace_bytes
+    }
+    pub(crate) fn device_storage_bytes(&self) -> Result<u64, &'static str> {
+        let mut seen = HashSet::new();
+        let mut bytes = self.owner.storage_bytes();
+        macro_rules! charge {
+            ($handle:expr) => {{
+                let handle = $handle;
+                if seen.insert(handle.prepared_storage_identity()) {
+                    bytes = bytes
+                        .checked_add(handle.invocation_workspace_bytes())
+                        .ok_or("prepared program charge overflows")?;
+                }
+            }};
+        }
+        macro_rules! attention {
+            ($handles:expr) => {{
+                let handles = $handles;
+                charge!(&handles.project);
+                match &handles.history {
+                    super::target::AttentionHistoryKernels::Dense { decode, prefill } => {
+                        charge!(decode);
+                        charge!(prefill);
+                    }
+                    super::target::AttentionHistoryKernels::AffineK8V4 { decode, prefill } => {
+                        charge!(decode);
+                        charge!(prefill);
+                    }
+                }
+                charge!(&handles.output);
+            }};
+        }
+        macro_rules! dense {
+            ($handles:expr) => {{
+                let handles = $handles;
+                charge!(&handles.expand);
+                charge!(&handles.output);
+            }};
+        }
+        charge!(&self.target.embedding);
+        for block in &self.target.blocks {
+            match &block.mixer {
+                AttestedMixer::Attention(handles) => attention!(handles),
+                AttestedMixer::Recurrent(handles) => {
+                    charge!(&handles.project);
+                    charge!(&handles.step);
+                    charge!(&handles.chunk);
+                    charge!(&handles.output);
+                }
+            }
+            match &block.feed_forward {
+                AttestedFeedForward::Dense(handles) => dense!(handles),
+                AttestedFeedForward::Routed(handles) => {
+                    charge!(&handles.route);
+                    charge!(&handles.expand);
+                    charge!(&handles.output);
+                    charge!(&handles.group);
+                    charge!(&handles.experts);
+                    charge!(&handles.combine);
+                }
+            }
+        }
+        charge!(&self.target.readout.features);
+        charge!(&self.target.readout.head);
+        if let Some(features) = &self.target.features {
+            charge!(features);
+        }
+        charge!(&self.target.selected);
+        charge!(&self.target.shape);
+        charge!(&self.target.sample);
+        if let Some(head) = &self.head {
+            for block in &head.blocks {
+                charge!(&block.input);
+                attention!(&block.attention);
+                match &block.feed_forward {
+                    AttestedFeedForward::Dense(handles) => dense!(handles),
+                    AttestedFeedForward::Routed(handles) => {
+                        charge!(&handles.route);
+                        charge!(&handles.expand);
+                        charge!(&handles.output);
+                        charge!(&handles.group);
+                        charge!(&handles.experts);
+                        charge!(&handles.combine);
+                    }
+                }
+                charge!(&block.features);
+                charge!(&block.logits);
+            }
+            charge!(&head.shape);
+            charge!(&head.sample);
+        }
+        if let Some(vision) = &self.vision {
+            charge!(&vision.stem);
+            for block in &vision.blocks {
+                charge!(block);
+            }
+            charge!(&vision.merger);
+        }
+        for (_, copy) in &self.state.copies {
+            charge!(copy);
+        }
+        if let Some(conditioning) = &self.state.conditioning {
+            charge!(conditioning);
+        }
+        for (_, import) in &self.imports {
+            match import {
+                AttestedImport::Dense(handle) => charge!(handle),
+                AttestedImport::Repack(handle) => charge!(handle),
+            }
+        }
+        Ok(bytes)
     }
     pub fn qualification(&self) -> &QualificationReport {
         &self.report

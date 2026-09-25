@@ -101,7 +101,9 @@ fn chain_matches_composed_entry(backend: BackendName) {
     let f = Fixture::new(backend, MODULE);
     let x = f.f32s(&[1.5, -2.0, 3.25, 0.5]);
     let mut workflow = Workflow::new(&f.device);
-    let doubled = workflow.enqueue(f.kernel("twice"), vec![external(&x)]).unwrap();
+    let doubled = workflow
+        .enqueue(f.kernel("twice"), vec![external(&x)])
+        .unwrap();
     let sum = workflow.enqueue(f.kernel("total"), vec![doubled]).unwrap();
     let chained = resolved(workflow.run(sum).unwrap());
     let direct = f.kernel("composed").call(&[Value::Tensor(x)]).unwrap();
@@ -113,12 +115,19 @@ fn device_scalar_result_feeds_next_node(backend: BackendName) {
     let f = Fixture::new(backend, MODULE);
     let x = f.f32s(&[1.5, -2.0, 3.25, 0.5]);
     let mut workflow = Workflow::new(&f.device);
-    let head = workflow.enqueue(f.kernel("first"), vec![external(&x)]).unwrap();
-    let scaled = workflow.enqueue(f.kernel("scale"), vec![external(&x), head]).unwrap();
+    let head = workflow
+        .enqueue(f.kernel("first"), vec![external(&x)])
+        .unwrap();
+    let scaled = workflow
+        .enqueue(f.kernel("scale"), vec![external(&x), head])
+        .unwrap();
     let chained = resolved(workflow.run(scaled).unwrap());
     let direct = f
         .kernel("scale")
-        .call(&[Value::Tensor(x), Value::Scalar(Scalar::F32(1.5f32.to_bits()))])
+        .call(&[
+            Value::Tensor(x),
+            Value::Scalar(Scalar::F32(1.5f32.to_bits())),
+        ])
         .unwrap();
     assert_eq!(tensor_bytes(&chained), tensor_bytes(&direct));
 }
@@ -128,12 +137,19 @@ fn diamond_resolves(backend: BackendName) {
     let f = Fixture::new(backend, MODULE);
     let x = f.f32s(&[1.5, -2.0, 3.25, 0.5]);
     let mut workflow = Workflow::new(&f.device);
-    let doubled = workflow.enqueue(f.kernel("twice"), vec![external(&x)]).unwrap();
-    let sum = workflow.enqueue(f.kernel("total"), vec![doubled.clone()]).unwrap();
+    let doubled = workflow
+        .enqueue(f.kernel("twice"), vec![external(&x)])
+        .unwrap();
+    let sum = workflow
+        .enqueue(f.kernel("total"), vec![doubled.clone()])
+        .unwrap();
     let head = workflow.enqueue(f.kernel("first"), vec![doubled]).unwrap();
-    let scaled = workflow.enqueue(f.kernel("scale"), vec![external(&x), head.clone()]).unwrap();
-    let WorkflowValue::Tuple(outputs) =
-        workflow.run(WorkflowValue::Tuple(vec![sum, head, scaled])).unwrap()
+    let scaled = workflow
+        .enqueue(f.kernel("scale"), vec![external(&x), head.clone()])
+        .unwrap();
+    let WorkflowValue::Tuple(outputs) = workflow
+        .run(WorkflowValue::Tuple(vec![sum, head, scaled]))
+        .unwrap()
     else {
         panic!("a tuple of outputs resolves to a tuple");
     };
@@ -142,7 +158,10 @@ fn diamond_resolves(backend: BackendName) {
     let doubled = f.kernel("twice").call(&[Value::Tensor(x.clone())]).unwrap();
     let sum = f.kernel("total").call(&[doubled.clone()]).unwrap();
     let head = f.kernel("first").call(&[doubled]).unwrap();
-    let scaled = f.kernel("scale").call(&[Value::Tensor(x), head.clone()]).unwrap();
+    let scaled = f
+        .kernel("scale")
+        .call(&[Value::Tensor(x), head.clone()])
+        .unwrap();
     assert_eq!(f32_bits(&outputs[0]), f32_bits(&sum));
     assert_eq!(f32_bits(&outputs[1]), f32_bits(&head));
     assert_eq!(tensor_bytes(&outputs[2]), tensor_bytes(&scaled));
@@ -159,10 +178,15 @@ fn failed_node_keeps_prefix_and_stops(backend: BackendName) {
     workflow
         .enqueue(
             f.kernel("write_then_divide"),
-            vec![external(&out), WorkflowValue::External(Value::Scalar(Scalar::I32(0)))],
+            vec![
+                external(&out),
+                WorkflowValue::External(Value::Scalar(Scalar::I32(0))),
+            ],
         )
         .unwrap();
-    let doubled = workflow.enqueue(f.kernel("twice"), vec![external(&x)]).unwrap();
+    let doubled = workflow
+        .enqueue(f.kernel("twice"), vec![external(&x)])
+        .unwrap();
     let error = match workflow.run(doubled) {
         Err(error) => error,
         Ok(_) => panic!("the workflow must report node 0's source failure"),
@@ -177,8 +201,12 @@ fn pick_then_read(backend: BackendName, picked: i32) -> Result<Value, seismic::d
     let x = f.i32s(&[picked, 0, 0, 0, 0, 0, 0, 0]);
     let t = f.f32s(&[10.0, 20.0, 30.0, 40.0]);
     let mut workflow = Workflow::new(&f.device);
-    let index = workflow.enqueue(f.kernel("pick8"), vec![external(&x)]).unwrap();
-    let read = workflow.enqueue(f.kernel("at4"), vec![external(&t), index]).unwrap();
+    let index = workflow
+        .enqueue(f.kernel("pick8"), vec![external(&x)])
+        .unwrap();
+    let read = workflow
+        .enqueue(f.kernel("at4"), vec![external(&t), index])
+        .unwrap();
     workflow.run(read).map(resolved)
 }
 
@@ -221,9 +249,14 @@ fn failed_node_skips_at_issue_nodes(backend: BackendName) {
         Ok(_) => panic!("the workflow must report node 0's source failure"),
     };
     assert_eq!(error.kind, "ExecutionError", "{}", error.message);
-    let bytes = |values: [i32; 2]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let bytes =
+        |values: [i32; 2]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
     assert_eq!(out.read().unwrap(), bytes([7, 0]));
-    assert_eq!(out2.read().unwrap(), bytes([0, 0]), "node 1 executed after node 0 failed");
+    assert_eq!(
+        out2.read().unwrap(),
+        bytes([0, 0]),
+        "node 1 executed after node 0 failed"
+    );
 }
 
 macro_rules! workflow_tests {

@@ -57,15 +57,24 @@ fn statics(
 
 impl<'a> Specializer<'a> {
     pub fn new(device: &'a Device) -> Self {
-        Self { device, census: false }
+        Self {
+            device,
+            census: false,
+        }
     }
 
     /// A specializer for a tuning census (with [`Tuner::census`]).
     pub fn census(device: &'a Device) -> Self {
-        Self { device, census: true }
+        Self {
+            device,
+            census: true,
+        }
     }
 
-    fn implementation<E: Entry>(&self, bindings: &str) -> Result<NativeImplementation, CatalogFailure> {
+    fn implementation<E: Entry>(
+        &self,
+        bindings: &str,
+    ) -> Result<NativeImplementation, CatalogFailure> {
         let implementation = seismic::generated::native_implementation::<E>(self.device)
             .map_err(|error| failure(E::NAME, bindings, error.to_string()))?;
         Ok(implementation.unwrap_or_else(|| {
@@ -88,7 +97,7 @@ impl<'a> Specializer<'a> {
             return Ok(None);
         }
         let implementation = self.implementation::<E>(bindings)?;
-        if !implementation.params.is_empty() {
+        if implementation.has_tuning_parameters() {
             return Err(failure(
                 E::NAME,
                 bindings,
@@ -114,7 +123,7 @@ impl<'a> Specializer<'a> {
         let implementation = self.implementation::<T::Entry>(&bindings)?;
         let values = tuner.statics(case)?;
         let fixed = statics(&implementation, entry, &bindings, &values)?;
-        let specialization = if implementation.params.is_empty() {
+        let specialization = if !implementation.has_tuning_parameters() {
             fixed
         } else {
             tuner.tune(case, &implementation, &fixed)?

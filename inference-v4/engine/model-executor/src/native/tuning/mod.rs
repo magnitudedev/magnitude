@@ -109,10 +109,10 @@ pub(crate) mod cases;
 #[cfg(feature = "pinned-tuning")]
 pub mod pinned;
 pub(crate) mod readout;
+pub(crate) mod recurrent;
+pub(crate) mod routed;
 #[cfg(feature = "tuning-survey")]
 pub mod survey;
-pub(crate) mod routed;
-pub(crate) mod recurrent;
 mod weights;
 
 pub(crate) use weights::TuningWeights;
@@ -124,9 +124,9 @@ use magnitude_model_batching::{Demand, PackedRowTables, Row, Slot};
 use magnitude_model_contracts::{ModelDefinition, WeightKind, WeightScope};
 use seismic::{
     Configuration, DType, Device, Element, NativeImplementation, NativeKernel,
-    NativeSpecialization, ParameterValues, SearchPlan, SearchSettings, SearchStop, Strategy,
-    Tensor, TensorError, TuneError, TuningInitializer, TuningMethod, TuningPoint, TuningResult,
-    TuningTime, Validation,
+    NativeSpecialization, ParameterValues, ScreeningPoint, SearchPlan, SearchSettings, SearchStop,
+    Strategy, Tensor, TensorError, TuneError, TuningInitializer, TuningMethod, TuningPoint,
+    TuningResult, TuningTime, Validation,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
@@ -135,12 +135,6 @@ use std::time::{Duration, Instant};
 
 /// The row counts whose shares of step time weigh the objective (§5.3).
 pub const TUNING_ROWS: [u64; 10] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
-/// The row counts measured: one decode row, a verification/concurrency
-/// batch, a small prefill chunk, and two large ones up to the largest row
-/// class (`MAX_CLASS_ROWS`). Every row count of
-/// [`TUNING_ROWS`] an entry serves lends its share to the nearest (in
-/// log2, ties to the larger) representative the entry serves.
-pub const REPRESENTATIVE_ROWS: [u64; 5] = [1, 4, 32, 256, 512];
 /// History lengths of attention tuning points (§5.3).
 pub const TUNING_CONTEXTS: [u64; 4] = [256, 4096, 16384, 65536];
 /// Distinct layers a decode-row rotation cycles through where the model has
@@ -194,7 +188,13 @@ pub const ARITHMETIC_TOLERANCE: Validation = Validation::Relative { error: 0.05 
 ///    samples spread widely is excluded.
 /// 4: points of one class (the same rows at different history lengths)
 ///    split their weight by real time.
-pub const SEARCH_VERSION: u32 = 4;
+/// 5: measure every served row class rather than folding shares into a few
+///    representative rows.
+/// 9: one device measurement serves duplicate point/active-set keys within a
+///    factored sweep, removing noise differences between identical work.
+pub const SEARCH_VERSION: u32 = 9;
+/// Version of the CPU projection screening policy in keys that use it.
+const CPU_PROJECTION_SCREENING_VERSION: u32 = 3;
 /// Configurations one model's tuning may evaluate in all (`B_model`,
 /// §D3), allocated by [`allocate`].
 pub const MODEL_BUDGET: usize = 100;
@@ -212,6 +212,26 @@ pub const SEARCH_SETTINGS: SearchSettings = SearchSettings {
     samples: 3,
     confirmation_samples: 7,
 };
+
+/// CPU projection screening uses one sample and five finalist samples: a
+/// replay of 31 stored CPU searches preserved every seven-sample winner at
+/// five, while three samples changed one winner. Metal uses the same one
+/// screening sample and five finalist samples.
+fn search_settings(device: &seismic::Device, screening: &[ScreeningPoint]) -> SearchSettings {
+    let mut settings = SEARCH_SETTINGS;
+    if !screening.is_empty() {
+        settings.samples = 1;
+        settings.confirmation_samples = 5;
+    } else if device.backend() == seismic::BackendName::Metal {
+        // Metal candidates screen with one sample. The default and leading
+        // candidates get five fresh confirmation samples; the recorded replay
+        // matched every seven-sample winner while removing two measurements
+        // from every finalist and validation point.
+        settings.samples = 1;
+        settings.confirmation_samples = 5;
+    }
+    settings
+}
 /// Minimum device time of one sample; device timestamps resolve
 /// microseconds.
 pub const MIN_SAMPLE_SECONDS: f64 = 0.0002;
@@ -281,12 +301,10 @@ pub fn row_points(limits: TuningLimits) -> Vec<PointShape> {
     served_row_points(limits.max_rows, |_| true)
 }
 
-/// Row points up to `bound` among the row counts an entry serves: the
-/// representatives of those row counts, each weighted by the shares of the
-/// row counts nearest to it. An entry whose served rows all lie beyond the
-/// bound is still prepared (its graph classes do not exist, but the kernel
-/// set is complete); its smallest served row count stands in as the single
-/// point.
+/// Every row point an entry serves up to `bound`. An entry whose served rows
+/// all lie beyond the bound is still prepared (its graph classes do not
+/// exist, but the kernel set is complete); its smallest served row count
+/// stands in as the single point.
 pub fn served_row_points(bound: u64, serves: impl Fn(u64) -> bool) -> Vec<PointShape> {
     let served = TUNING_ROWS
         .into_iter()
@@ -297,7 +315,7 @@ pub fn served_row_points(bound: u64, serves: impl Fn(u64) -> bool) -> Vec<PointS
         .copied()
         .filter(|rows| *rows <= bound)
         .collect::<Vec<_>>();
-    let Some(&largest) = within.last() else {
+    if within.is_empty() {
         return served
             .into_iter()
             .take(1)
@@ -306,34 +324,49 @@ pub fn served_row_points(bound: u64, serves: impl Fn(u64) -> bool) -> Vec<PointS
                 ..row_point(rows)
             })
             .collect();
-    };
-    let representatives = REPRESENTATIVE_ROWS
-        .into_iter()
-        .filter(|rows| within.contains(rows))
-        .collect::<Vec<_>>();
-    let representatives = if representatives.is_empty() {
-        vec![largest]
-    } else {
-        representatives
-    };
-    let distance = |rows: u64, to: u64| (rows.ilog2() as i64 - to.ilog2() as i64).abs();
-    let mut points = representatives
+    }
+    normalized(within.into_iter().map(row_point).collect())
+}
+
+/// Screen the expensive CPU projection spaces on a small row sample. The
+/// tuner confirms the default and finalists on every original row point.
+pub(crate) fn cpu_projection_screening(
+    device: &Device,
+    points: &[PointShape],
+) -> Vec<ScreeningPoint> {
+    if device.backend() != seismic::BackendName::Cpu || points.len() <= 4 {
+        return Vec::new();
+    }
+    const ROWS: [u64; 4] = [1, 8, 32, 128];
+    let representatives = points
         .iter()
-        .map(|&rows| PointShape {
+        .enumerate()
+        .filter_map(|(index, point)| ROWS.contains(&point.rows).then_some(index))
+        .collect::<Vec<_>>();
+    if representatives.is_empty() {
+        return Vec::new();
+    }
+    let mut screening = representatives
+        .iter()
+        .map(|index| ScreeningPoint {
+            index: *index,
             weight: 0.0,
-            ..row_point(rows)
         })
         .collect::<Vec<_>>();
-    for rows in within {
-        // Ties go to the larger representative: two rows are a batch.
-        let nearest = points
+    for point in points {
+        let nearest = screening
             .iter_mut()
-            .rev()
-            .min_by_key(|point| distance(rows, point.rows))
-            .expect("an entry has at least one representative");
-        nearest.weight += row_share(rows);
+            .min_by_key(|candidate| {
+                let rows = points[candidate.index].rows;
+                (
+                    (point.rows.ilog2() as i32 - rows.ilog2() as i32).abs(),
+                    u64::MAX - rows,
+                )
+            })
+            .expect("the screening set is nonempty");
+        nearest.weight += point.weight;
     }
-    normalized(points)
+    screening
 }
 
 /// `rows` crossed with the history lengths the engine serves.
@@ -425,6 +458,10 @@ pub(crate) trait EntryTuning {
     /// The value of every dimension the model fixes.
     fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String>;
     fn points(&self, limits: TuningLimits) -> Vec<PointShape>;
+    /// Empty uses the complete served workload for every search measurement.
+    fn screening(&self, _device: &Device, _points: &[PointShape]) -> Vec<ScreeningPoint> {
+        Vec::new()
+    }
     /// The argument sets of one point, cycling distinct layers.
     fn rotation(
         &self,
@@ -449,6 +486,12 @@ pub(crate) trait EntryTuning {
     ) -> Result<TuningResult, TuneError>;
     /// The entry's generated `native_digest[_with]`.
     fn digest(&self, device: &Device, statics: &NativeSpecialization) -> Result<String, TuneError>;
+    /// Check a stored choice against the same device-augmented declaration
+    /// that native preparation uses.
+    fn stored_valid(&self, device: &Device, specialization: &NativeSpecialization) -> bool {
+        seismic::generated::native_specialization_valid::<Self::Entry>(device, specialization)
+            .unwrap_or(false)
+    }
     /// The entry's generated `native_for_device[_with]`.
     fn prepare(
         &self,
@@ -566,7 +609,12 @@ impl TuningInputs<'_, '_> {
     }
 
     /// A deterministic pseudo-random activation in [-1, 1).
-    pub fn activation(&self, element: Element, extents: &[u64], seed: u64) -> Result<Tensor, String> {
+    pub fn activation(
+        &self,
+        element: Element,
+        extents: &[u64],
+        seed: u64,
+    ) -> Result<Tensor, String> {
         let count = element_count(extents)?;
         let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
         let values = (0..count).map(|_| {
@@ -580,7 +628,9 @@ impl TuningInputs<'_, '_> {
             Some(DType::BF16) => values
                 .flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes())
                 .collect(),
-            Some(DType::F16) => values.flat_map(|value| f16_bits(value).to_le_bytes()).collect(),
+            Some(DType::F16) => values
+                .flat_map(|value| f16_bits(value).to_le_bytes())
+                .collect(),
             _ => {
                 return Err(format!(
                     "tuning activations support f32, bf16 and f16, not {}",
@@ -593,21 +643,30 @@ impl TuningInputs<'_, '_> {
 
     /// An `i32` tensor of `values`.
     pub fn i32s(&self, extents: &[u64], values: &[i32]) -> Result<Tensor, String> {
-        let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
         Tensor::from_host(self.device, Element::i32(), extents, &bytes)
             .map_err(|error| error.to_string())
     }
 
     /// A `u32` tensor of `values`.
     pub fn u32s(&self, extents: &[u64], values: &[u32]) -> Result<Tensor, String> {
-        let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
         Tensor::from_host(self.device, Element::u32(), extents, &bytes)
             .map_err(|error| error.to_string())
     }
 
     /// An `f32` tensor of `values`.
     pub fn f32s(&self, extents: &[u64], values: &[f32]) -> Result<Tensor, String> {
-        let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
         Tensor::from_host(self.device, Element::f32(), extents, &bytes)
             .map_err(|error| error.to_string())
     }
@@ -742,16 +801,24 @@ type TuningKey = (&'static str, String, BTreeMap<String, u64>);
 /// the rest is split equally among the larger units ([`share`]). When they
 /// do not all fit, every unit shares `total` equally.
 pub fn allocate(total: usize, sizes: &[usize]) -> Vec<usize> {
-    let small = sizes.iter().map(|size| (*size).max(1)).filter(|size| *size <= COMPLETE_SIZE);
+    let small = sizes
+        .iter()
+        .map(|size| (*size).max(1))
+        .filter(|size| *size <= COMPLETE_SIZE);
     let complete = small.clone().sum::<usize>();
     let large = sizes.iter().filter(|size| **size > COMPLETE_SIZE).count();
     if complete + large > total {
         return share(total, sizes);
     }
-    let large_units = (0..sizes.len()).filter(|unit| sizes[*unit] > COMPLETE_SIZE).collect::<Vec<_>>();
+    let large_units = (0..sizes.len())
+        .filter(|unit| sizes[*unit] > COMPLETE_SIZE)
+        .collect::<Vec<_>>();
     let large_budgets = share(
         total - complete,
-        &large_units.iter().map(|unit| sizes[*unit]).collect::<Vec<_>>(),
+        &large_units
+            .iter()
+            .map(|unit| sizes[*unit])
+            .collect::<Vec<_>>(),
     );
     let mut budgets = sizes.iter().map(|size| (*size).max(1)).collect::<Vec<_>>();
     for (unit, budget) in large_units.into_iter().zip(large_budgets) {
@@ -831,7 +898,13 @@ impl<'a> Tuner<'a> {
         limits: TuningLimits,
         weights: TuningWeights<'a>,
     ) -> Self {
-        Self::with(device, context, limits, weights, Allocation::Census(Vec::new()))
+        Self::with(
+            device,
+            context,
+            limits,
+            weights,
+            Allocation::Census(Vec::new()),
+        )
     }
 
     pub fn new(
@@ -841,7 +914,13 @@ impl<'a> Tuner<'a> {
         weights: TuningWeights<'a>,
         budgets: TuningBudgets,
     ) -> Self {
-        Self::with(device, context, limits, weights, Allocation::Budgets(budgets.0))
+        Self::with(
+            device,
+            context,
+            limits,
+            weights,
+            Allocation::Budgets(budgets.0),
+        )
     }
 
     fn with(
@@ -935,6 +1014,7 @@ impl<'a> Tuner<'a> {
         if shapes.is_empty() {
             return Err(failure("the engine's bounds admit no tuning point".into()));
         }
+        let screening = case.screening(self.device, &shapes);
         let declaration = format!("{entry}:{:?}", implementation.params);
         let began = Instant::now();
         let survey = survey_plan(entry);
@@ -951,10 +1031,11 @@ impl<'a> Tuner<'a> {
                     &digest,
                     budget,
                     &shapes,
+                    &screening,
                 ));
-                let hit = cache
-                    .tuning(&key)
-                    .filter(|result| implementation.validate(&result.overall.specialization()).is_ok());
+                let hit = cache.tuning(&key).filter(|result| {
+                    case.stored_valid(self.device, &result.overall.specialization())
+                });
                 Some((cache, key, hit))
             }
             None => None,
@@ -1003,10 +1084,16 @@ impl<'a> Tuner<'a> {
             Some(plan) => Strategy::Survey(plan),
             None => Strategy::Search(SearchPlan {
                 budget,
-                settings: SEARCH_SETTINGS,
+                settings: search_settings(self.device, &screening),
                 min_sample_seconds: MIN_SAMPLE_SECONDS,
-                start: self.winners.get(&declaration).cloned().into_iter().collect(),
+                start: self
+                    .winners
+                    .get(&declaration)
+                    .cloned()
+                    .into_iter()
+                    .collect(),
                 deadline: Some(self.deadline),
+                screening,
             }),
         };
         let result = case
@@ -1024,6 +1111,9 @@ impl<'a> Tuner<'a> {
             TuningMethod::Search {
                 stop: SearchStop::Expired,
                 ..
+            } | TuningMethod::Factored {
+                complete: false,
+                ..
             }
         );
         // A search the safety stop ended is not the search its key names.
@@ -1037,14 +1127,20 @@ impl<'a> Tuner<'a> {
     }
 
     /// Record a unit's outcome and report it.
-    fn finish(&mut self, key: TuningKey, declaration: String, tuned: TunedEntry) -> NativeSpecialization {
+    fn finish(
+        &mut self,
+        key: TuningKey,
+        declaration: String,
+        tuned: TunedEntry,
+    ) -> NativeSpecialization {
         self.context
             .observer
             .event(&TuningEvent::Finished(tuned.clone()));
         let chosen = tuned.overall.specialization();
         #[cfg(feature = "pinned-tuning")]
         pinned::record(&key, &chosen);
-        self.winners.insert(declaration, tuned.overall.params.clone());
+        self.winners
+            .insert(declaration, tuned.overall.params.clone());
         self.tuned.push(tuned);
         self.chosen.insert(key, chosen.clone());
         chosen
@@ -1062,11 +1158,12 @@ impl<'a> Tuner<'a> {
             weights: &mut self.weights,
             shared: &mut shared,
         };
-        case.statics(&inputs).map_err(|outcome| CatalogFailure::Preparation {
-            entry: <T::Entry as seismic::Entry>::NAME,
-            bindings: case.bindings(),
-            outcome,
-        })
+        case.statics(&inputs)
+            .map_err(|outcome| CatalogFailure::Preparation {
+                entry: <T::Entry as seismic::Entry>::NAME,
+                bindings: case.bindings(),
+                outcome,
+            })
     }
 }
 
@@ -1093,6 +1190,7 @@ fn tuning_key_material(
     digest: &str,
     budget: usize,
     shapes: &[PointShape],
+    screening: &[ScreeningPoint],
 ) -> String {
     let points = shapes
         .iter()
@@ -1102,10 +1200,16 @@ fn tuning_key_material(
         })
         .collect::<Vec<_>>()
         .join(",");
+    let settings = search_settings(device, screening);
+    let screening = if screening.is_empty() {
+        String::new()
+    } else {
+        format!("\nscreening cpu-projection-{CPU_PROJECTION_SCREENING_VERSION} {screening:?}")
+    };
     format!(
         "device {}\nentry {entry}\nbindings {bindings}\nstatics {:?}\nimplementation {digest}\n\
-         search {SEARCH_VERSION}\nbudget {budget}\nsettings {SEARCH_SETTINGS:?}\n\
-         points {points}\nvalidation {ARITHMETIC_TOLERANCE:?}\nmin sample {MIN_SAMPLE_SECONDS:?}",
+         search {SEARCH_VERSION}\nbudget {budget}\nsettings {settings:?}\n\
+         points {points}{screening}\nvalidation {ARITHMETIC_TOLERANCE:?}\nmin sample {MIN_SAMPLE_SECONDS:?}",
         device.tuning_identity(),
         statics.statics(),
     )
@@ -1129,7 +1233,7 @@ fn tuned_entry(
             result.time.clone(),
             match &result.method {
                 TuningMethod::Search { budget, stop, .. } => Some((*budget, *stop)),
-                TuningMethod::Survey { .. } => None,
+                TuningMethod::Survey { .. } | TuningMethod::Factored { .. } => None,
             },
         ),
     };

@@ -389,9 +389,12 @@ mod tests {
 
     #[test]
     fn dense_and_affine_plane_arithmetic_is_exact() {
-        let dense =
-            ComponentDescriptor::new(LayerRef::Target(2), CodecSpec::dense(DType::F16, 128, 64), 1)
-                .unwrap();
+        let dense = ComponentDescriptor::new(
+            LayerRef::Target(2),
+            CodecSpec::dense(DType::F16, 128, 64),
+            1,
+        )
+        .unwrap();
         assert_eq!(
             dense
                 .planes()
@@ -442,30 +445,73 @@ mod tests {
     #[test]
     fn head_vectors_split_into_affine_groups() {
         // Qwen3.5-4B attention history: 4 kv heads of 256, 8 groups each.
-        let affine =
-            ComponentDescriptor::new(LayerRef::Target(3), KvCodec::AffineK8V4.spec(DType::BF16, 256, 256), 4)
-                .unwrap();
+        let affine = ComponentDescriptor::new(
+            LayerRef::Target(3),
+            KvCodec::AffineK8V4.spec(DType::BF16, 256, 256),
+            4,
+        )
+        .unwrap();
         assert_eq!(
             affine
                 .planes()
                 .iter()
-                .map(|plane| (plane.vector, plane.name, plane.dtype, plane.row_extents.clone(), plane.row_bytes))
+                .map(|plane| (
+                    plane.vector,
+                    plane.name,
+                    plane.dtype,
+                    plane.row_extents.clone(),
+                    plane.row_bytes
+                ))
                 .collect::<Vec<_>>(),
             vec![
-                (VectorKind::Key, PlaneName::Codes, DType::U32, vec![4, 64], 1024),
-                (VectorKind::Key, PlaneName::Coefficients, DType::F16, vec![4, 16], 128),
-                (VectorKind::Value, PlaneName::Codes, DType::U32, vec![4, 32], 512),
-                (VectorKind::Value, PlaneName::Coefficients, DType::F16, vec![4, 16], 128),
+                (
+                    VectorKind::Key,
+                    PlaneName::Codes,
+                    DType::U32,
+                    vec![4, 64],
+                    1024
+                ),
+                (
+                    VectorKind::Key,
+                    PlaneName::Coefficients,
+                    DType::F16,
+                    vec![4, 16],
+                    128
+                ),
+                (
+                    VectorKind::Value,
+                    PlaneName::Codes,
+                    DType::U32,
+                    vec![4, 32],
+                    512
+                ),
+                (
+                    VectorKind::Value,
+                    PlaneName::Coefficients,
+                    DType::F16,
+                    vec![4, 16],
+                    128
+                ),
             ]
         );
         assert_eq!(affine.row_bytes().unwrap(), 1792);
         assert!(matches!(
-            ComponentDescriptor::new(LayerRef::Target(3), KvCodec::AffineK8V4.spec(DType::BF16, 48, 48), 1),
-            Err(LayoutError::InvalidGroup { width: 48, group: AFFINE_GROUP })
+            ComponentDescriptor::new(
+                LayerRef::Target(3),
+                KvCodec::AffineK8V4.spec(DType::BF16, 48, 48),
+                1
+            ),
+            Err(LayoutError::InvalidGroup {
+                width: 48,
+                group: AFFINE_GROUP
+            })
         ));
-        let dense =
-            ComponentDescriptor::new(LayerRef::Target(3), KvCodec::Dense.spec(DType::BF16, 256, 256), 4)
-                .unwrap();
+        let dense = ComponentDescriptor::new(
+            LayerRef::Target(3),
+            KvCodec::Dense.spec(DType::BF16, 256, 256),
+            4,
+        )
+        .unwrap();
         assert_eq!(dense.planes()[0].row_extents, [4, 256]);
         assert_eq!(dense.row_bytes().unwrap(), 4096);
         assert!(matches!(

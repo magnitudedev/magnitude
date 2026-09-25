@@ -6,7 +6,8 @@ use super::tuning::{
     },
     cases::{DenseExpandTuning, DenseOutputTuning},
     readout::{
-        HeadLogitsTuning, HeadRowsTuning, SampleRowsTuning, SelectedRowsTuning, ShapeRowsTuning,
+        DraftRowsTuning, HeadLogitsTuning, HeadRowsTuning, SampleRowsTuning, SelectedRowsTuning,
+        ShapeRowsTuning,
     },
     recurrent::{
         RecurrentChunkTuning, RecurrentOutputTuning, RecurrentProjectTuning, RecurrentShape,
@@ -49,7 +50,7 @@ pub(super) struct PreparationInputs<'a> {
 /// when the backend has no implementation, which the specializer records.
 macro_rules! fixed {
     ($spec:expr, $device:expr, $module:ident, $bindings:expr, $elements:expr) => {
-        fixed!($spec, $device, $module, $bindings, $elements, statics &[])
+        fixed!($spec, $device, $module, $bindings, $elements, statics & [])
     };
     ($spec:expr, $device:expr, $module:ident, $bindings:expr, $elements:expr, statics $statics:expr) => {
         $spec.fixed::<$module::Entry>(&$bindings, $statics, |specialization| {
@@ -159,7 +160,12 @@ impl NativePreparationCache {
             plan,
             tuning,
             Specializer::census(device),
-            Tuner::census(device, tuning, limits, TuningWeights::new(device, load, tuning.weights, &import)),
+            Tuner::census(
+                device,
+                tuning,
+                limits,
+                TuningWeights::new(device, load, tuning.weights, &import),
+            ),
         );
         census.walk(plan)?;
         let budgets = census.tuner.budgets();
@@ -462,37 +468,38 @@ impl<'a> Preparation<'a> {
             scopes: scopes.clone(),
             epsilon: self.epsilon,
         };
-        let history = match history {
-            KvCodec::Dense => {
-                let decode = self
-                    .spec
-                    .tuned(&mut self.tuner, &AttentionDecodeTuning(mix()))?;
-                let prefill = self
-                    .spec
-                    .tuned(&mut self.tuner, &AttentionPrefillTuning(mix()))?;
-                decode
-                    .zip(prefill)
-                    .map(|(decode, prefill)| AttentionHistoryKernels::Dense { decode, prefill })
-            }
-            KvCodec::AffineK8V4 => {
-                let decode = self
-                    .spec
-                    .tuned(&mut self.tuner, &AttentionDecodeK8V4Tuning(mix()))?;
-                let prefill = self
-                    .spec
-                    .tuned(&mut self.tuner, &AttentionPrefillK8V4Tuning(mix()))?;
-                decode.zip(prefill).map(|(decode, prefill)| {
-                    AttentionHistoryKernels::AffineK8V4 { decode, prefill }
-                })
-            }
-            KvCodec::RotatedK4V4 => {
-                return Err(CatalogFailure::Preparation {
-                    entry: "gated_attention_decode",
-                    bindings: format!("{shape:?}"),
-                    outcome: "the native path has no rotated K4/V4 history entries".into(),
-                })
-            }
-        };
+        let history =
+            match history {
+                KvCodec::Dense => {
+                    let decode = self
+                        .spec
+                        .tuned(&mut self.tuner, &AttentionDecodeTuning(mix()))?;
+                    let prefill = self
+                        .spec
+                        .tuned(&mut self.tuner, &AttentionPrefillTuning(mix()))?;
+                    decode
+                        .zip(prefill)
+                        .map(|(decode, prefill)| AttentionHistoryKernels::Dense { decode, prefill })
+                }
+                KvCodec::AffineK8V4 => {
+                    let decode = self
+                        .spec
+                        .tuned(&mut self.tuner, &AttentionDecodeK8V4Tuning(mix()))?;
+                    let prefill = self
+                        .spec
+                        .tuned(&mut self.tuner, &AttentionPrefillK8V4Tuning(mix()))?;
+                    decode.zip(prefill).map(|(decode, prefill)| {
+                        AttentionHistoryKernels::AffineK8V4 { decode, prefill }
+                    })
+                }
+                KvCodec::RotatedK4V4 => {
+                    return Err(CatalogFailure::Preparation {
+                        entry: "gated_attention_decode",
+                        bindings: format!("{shape:?}"),
+                        outcome: "the native path has no rotated K4/V4 history entries".into(),
+                    })
+                }
+            };
         let output = self.spec.tuned(
             &mut self.tuner,
             &AttentionOutputTuning {
@@ -674,16 +681,21 @@ impl<'a> Preparation<'a> {
             },
         )?;
         Ok(match (route, expand, output, group, experts, combine) {
-            (Some(route), Some(expand), Some(output), Some(group), Some(experts), Some(combine)) => {
-                Some(RoutedKernels {
-                    route,
-                    expand,
-                    output,
-                    group,
-                    experts,
-                    combine,
-                })
-            }
+            (
+                Some(route),
+                Some(expand),
+                Some(output),
+                Some(group),
+                Some(experts),
+                Some(combine),
+            ) => Some(RoutedKernels {
+                route,
+                expand,
+                output,
+                group,
+                experts,
+                combine,
+            }),
             _ => None,
         })
     }
@@ -699,7 +711,6 @@ impl<'a> Preparation<'a> {
                 .enumerate()
                 .map(|(index, binding)| (*binding, head_scope(index))),
         );
-        let device = self.device;
         for &b in head_plan.blocks() {
             if self
                 .head
@@ -709,21 +720,18 @@ impl<'a> Preparation<'a> {
                 continue;
             }
             let bindings = format!("{b:?}");
-            let spec = &mut self.spec;
-            let input = fixed!(
-                spec,
-                device,
-                draft_rows,
-                bindings,
-                draft_rows::Elements {
-                    EW: b.embedding_table,
-                    A: b.activation,
-                    EN: b.embedding_norm,
-                    HN: b.hidden_norm,
-                    CW: b.combine,
+            let input = self.spec.tuned(
+                &mut self.tuner,
+                &DraftRowsTuning {
+                    embedding: b.embedding_table,
+                    embedding_norm: b.embedding_norm,
+                    hidden_norm: b.hidden_norm,
+                    combine: b.combine,
+                    activation: b.activation,
+                    scopes: layers.scopes(b),
+                    epsilon: self.epsilon,
                 },
-                statics &[("D", b.attention_shape.hidden)]
-            );
+            )?;
             let attention = self.attention(
                 b.attention_shape,
                 b.input_norm,
@@ -736,14 +744,21 @@ impl<'a> Preparation<'a> {
                 KvCodec::Dense,
                 layers.scopes(b),
             )?;
-            let dense = self.dense(
-                b.feedforward_norm,
-                b.gate,
-                b.up,
-                b.down,
-                b.activation,
-                layers.scopes(b),
-            )?;
+            let feed_forward = match b.feed_forward {
+                FeedForwardProgramSlot::Dense(binding) => self
+                    .dense(
+                        binding.norm,
+                        binding.gate,
+                        binding.up,
+                        binding.down,
+                        binding.activation,
+                        layers.scopes(b),
+                    )?
+                    .map(AttestedFeedForward::Dense),
+                FeedForwardProgramSlot::Routed(binding) => self
+                    .routed(binding, layers.scopes(b))?
+                    .map(AttestedFeedForward::Routed),
+            };
             let features = self.features(&bindings, b.output_norm, b.activation)?;
             let logits = self.spec.tuned(
                 &mut self.tuner,
@@ -756,12 +771,24 @@ impl<'a> Preparation<'a> {
                 .head
                 .as_mut()
                 .expect("a head plan creates the head group");
-            if let (Some(input), Some(attention), Some(dense), Some(features), Some(logits)) =
-                (input, attention, dense, features, logits)
+            if let (
+                Some(input),
+                Some(attention),
+                Some(feed_forward),
+                Some(features),
+                Some(logits),
+            ) = (input, attention, feed_forward, features, logits)
             {
                 head.input.insert(b, input);
                 head.attention.insert(b, attention);
-                head.dense.insert(b, dense);
+                match feed_forward {
+                    AttestedFeedForward::Dense(dense) => {
+                        head.dense.insert(b, dense);
+                    }
+                    AttestedFeedForward::Routed(routed) => {
+                        head.routed.insert(b, routed);
+                    }
+                }
                 head.features.insert(b, features);
                 head.logits.insert(b, logits);
             }
@@ -807,7 +834,7 @@ impl<'a> Preparation<'a> {
                 B: b.bias,
                 PE: b.position,
             },
-            statics &statics.stem
+            statics & statics.stem
         ) {
             vision.stem.insert(b, kernel);
         }
@@ -835,7 +862,7 @@ impl<'a> Preparation<'a> {
                     DW: b.down,
                     DB: b.down_bias,
                 },
-                statics &statics.block
+                statics & statics.block
             ) {
                 vision.blocks.insert(b, kernel);
             }
@@ -855,7 +882,7 @@ impl<'a> Preparation<'a> {
                 DW: b.output,
                 DB: b.output_bias,
             },
-            statics &statics.merger
+            statics & statics.merger
         ) {
             vision.merger.insert(b, kernel);
         }

@@ -11,14 +11,14 @@
 pub mod bundle;
 pub mod checked;
 pub mod entry;
-pub mod failure;
 pub mod expr;
+pub mod failure;
 pub mod ids;
 pub mod registry;
 
 mod check;
-pub mod intrinsics;
 pub mod initialization;
+pub mod intrinsics;
 pub mod precision;
 pub mod reference_math;
 pub(crate) mod repr;

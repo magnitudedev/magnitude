@@ -11,30 +11,45 @@ fn reached_quantity_arithmetic_and_word_cast_share_the_source_schedule() {
 
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "exact-quantity.seismic".into(),
-        text: "fn probe(i: index[1000000000]) -> i32:\n    let q = i * i * i\n    return i32(q)\n".into(),
-    }])).unwrap();
-    let entry = module.entry(module.entry_named("probe").unwrap(), &Default::default()).unwrap();
+        text: "fn probe(i: index[1000000000]) -> i32:\n    let q = i * i * i\n    return i32(q)\n"
+            .into(),
+    }]))
+    .unwrap();
+    let entry = module
+        .entry(module.entry_named("probe").unwrap(), &Default::default())
+        .unwrap();
     let ParameterKind::Index { symbol: input, .. } = entry.schema().parameters()[0].kind else {
         panic!("checked input is not an Index")
     };
     let device = device();
     let registry = registry();
     let domain = construct_candidate_domain(
-        entry, &device, &registry,
+        entry,
+        &device,
+        &registry,
         &seismic_lang::precision::PrecisionPolicy::Exact,
-    ).unwrap();
-    let candidate = domain.read_materialized(&domain.general_construction()).unwrap();
+    )
+    .unwrap();
+    let candidate = domain
+        .read_materialized(&domain.general_construction())
+        .unwrap();
     let steps = candidate.candidate().schedule().steps();
-    assert!(steps.iter().any(|step| matches!(step, ScheduleStep::EvaluateHost(value)
+    assert!(steps
+        .iter()
+        .any(|step| matches!(step, ScheduleStep::EvaluateHost(value)
         if matches!(value.value, HostValueExpr::Integer(_)))));
-    assert!(steps.iter().any(|step| matches!(step, ScheduleStep::EvaluateHost(value)
+    assert!(steps
+        .iter()
+        .any(|step| matches!(step, ScheduleStep::EvaluateHost(value)
         if matches!(value.value, HostValueExpr::Word { dtype: DType::I32, .. }))));
     let mut values = Assignment::new();
     values.bind(input, SymbolValue::Nat(999_999_999u64.into()));
     let mut exact = None;
     let mut word = None;
     for step in steps {
-        let ScheduleStep::EvaluateHost(evaluation) = step else { continue };
+        let ScheduleStep::EvaluateHost(evaluation) = step else {
+            continue;
+        };
         let (value, destination) = (evaluation.value, evaluation.to);
         match (value, destination) {
             (HostValueExpr::Integer(expression), HostValueDestination::Quantity(slot)) => {
@@ -42,7 +57,13 @@ fn reached_quantity_arithmetic_and_word_cast_share_the_source_schedule() {
                 exact = Some(value.clone());
                 values.bind(slot.symbol(), SymbolValue::Int(value));
             }
-            (HostValueExpr::Word { dtype: DType::I32, value }, HostValueDestination::Native(_)) => {
+            (
+                HostValueExpr::Word {
+                    dtype: DType::I32,
+                    value,
+                },
+                HostValueDestination::Native(_),
+            ) => {
                 word = Some(domain.arena().eval_int(value, &values).unwrap());
             }
             _ => {}
@@ -102,8 +123,13 @@ lower probe(x: &tensor[1] f32, pair: (f32, range[4])) -> (tensor[1] f32, (f32, r
         .unwrap();
     let parameters = entry.schema().parameters().to_vec();
     let results = entry.schema().results().to_vec();
-    assert_eq!(results.iter().map(|result| result.path.as_slice()).collect::<Vec<_>>(),
-        vec![&[0][..], &[1, 0][..], &[1, 1][..]]);
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.path.as_slice())
+            .collect::<Vec<_>>(),
+        vec![&[0][..], &[1, 0][..], &[1, 1][..]]
+    );
     let mut domain = construct_candidate_domain(
         entry,
         &device,
@@ -160,7 +186,10 @@ lower probe(x: &tensor[1] f32, pair: (f32, range[4])) -> (tensor[1] f32, (f32, r
         Some(parameters[0].id),
         "the common entry ABI binds the checked source coordinate"
     );
-    assert_eq!(candidate.bindings().arena.parameters.len(), parameters.len());
+    assert_eq!(
+        candidate.bindings().arena.parameters.len(),
+        parameters.len()
+    );
 }
 
 #[test]
@@ -302,53 +331,112 @@ fn probe(left: &mut tensor[1] f32, right: &mut tensor[1] f32):
         .collect::<Vec<_>>();
     write_roots.sort();
     write_roots.dedup();
-    assert_eq!(write_roots.len(), 2, "the two Unit calls write different actual arguments");
+    assert_eq!(
+        write_roots.len(),
+        2,
+        "the two Unit calls write different actual arguments"
+    );
 }
 
 #[test]
 fn stored_unaligned_packed_slice_is_unresolved_but_logical_reads_construct() {
-    use crate::candidate_domain::{construct_candidate_domain, BodyMapping, ConstructionAllowance, ConstructionCoordinate, ConstructionPending, Materialization};
+    use crate::candidate_domain::{
+        construct_candidate_domain, BodyMapping, ConstructionAllowance, ConstructionCoordinate,
+        ConstructionPending, Materialization,
+    };
     use seismic_lang::checked::{check_source, SourceFile, SourceSet};
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "packed-view-map.seismic".into(),
         text: "fn probe(w: &tensor[128] q4g64) -> f32:\n    return w[1]\n\nlower probe(w: &tensor[128] q4g64) -> f32 for cpu:\n    let view = w[1:65]\n    return view[0]\n".into(),
     }])).unwrap();
-    let entry = module.entry(module.entry_named("probe").unwrap(), &Default::default()).unwrap();
+    let entry = module
+        .entry(module.entry_named("probe").unwrap(), &Default::default())
+        .unwrap();
     let device = device();
     let registry = crate::realization::demand_driven_tests::registry();
-    let mut domain = construct_candidate_domain(entry, &device, &registry, &seismic_lang::precision::PrecisionPolicy::Exact).unwrap();
-    let authored = domain.root_selections().into_iter().find(|body| body.mapping == BodyMapping::Authored).unwrap();
+    let mut domain = construct_candidate_domain(
+        entry,
+        &device,
+        &registry,
+        &seismic_lang::precision::PrecisionPolicy::Exact,
+    )
+    .unwrap();
+    let authored = domain
+        .root_selections()
+        .into_iter()
+        .find(|body| body.mapping == BodyMapping::Authored)
+        .unwrap();
     let coordinate = ConstructionCoordinate::root(authored);
     let mut previous = None;
     for _ in 0..2 {
-        let result = domain.advance(&coordinate, ConstructionAllowance { work_units: 100_000, wall_time: std::time::Duration::from_secs(30) });
-        let Materialization::Pending(reason @ ConstructionPending::RepresentationView { .. }) = result.state else {
-            panic!("stored packed map must remain unresolved: {:?}", result.state);
+        let result = domain.advance(
+            &coordinate,
+            ConstructionAllowance {
+                work_units: 100_000,
+                wall_time: std::time::Duration::from_secs(30),
+            },
+        );
+        let Materialization::Pending(reason @ ConstructionPending::RepresentationView { .. }) =
+            result.state
+        else {
+            panic!(
+                "stored packed map must remain unresolved: {:?}",
+                result.state
+            );
         };
         if let Some(previous) = &previous {
-            assert_eq!(&reason, previous, "retry must retain the same source value/cursor");
-            assert_eq!(result.work_units, 1, "retry must suspend at that node without lowering another step");
+            assert_eq!(
+                &reason, previous,
+                "retry must retain the same source value/cursor"
+            );
+            assert_eq!(
+                result.work_units, 1,
+                "retry must suspend at that node without lowering another step"
+            );
         }
         previous = Some(reason);
-        assert!(domain.read_materialized(&coordinate).is_err(), "an unresolved view must not publish physical IR");
+        assert!(
+            domain.read_materialized(&coordinate).is_err(),
+            "an unresolved view must not publish physical IR"
+        );
     }
 }
 
 #[test]
 fn partially_initialized_nonaffine_carry_constructs_raw_storage_relocation() {
-    use crate::candidate_domain::{construct_candidate_domain, ConstructionAllowance, Materialization};
+    use crate::candidate_domain::{
+        construct_candidate_domain, ConstructionAllowance, Materialization,
+    };
     use seismic_lang::checked::{check_source, SourceFile, SourceSet};
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "partial-map-carry.seismic".into(),
         text: "fn probe() -> f32:\n    let mut y = tensor[2,3] f32\n    y[0,0] = 7.0\n    for i in 0..1:\n        y = reshape(y.T, (2,3))\n    return y[0,0]\n".into(),
     }])).unwrap();
-    let entry = module.entry(module.entry_named("probe").unwrap(), &Default::default()).unwrap();
+    let entry = module
+        .entry(module.entry_named("probe").unwrap(), &Default::default())
+        .unwrap();
     let device = device();
     let registry = crate::realization::demand_driven_tests::registry();
-    let mut domain = construct_candidate_domain(entry, &device, &registry, &seismic_lang::precision::PrecisionPolicy::Exact).unwrap();
+    let mut domain = construct_candidate_domain(
+        entry,
+        &device,
+        &registry,
+        &seismic_lang::precision::PrecisionPolicy::Exact,
+    )
+    .unwrap();
     let coordinate = domain.general_construction();
-    let result = domain.advance(&coordinate, ConstructionAllowance { work_units: 100_000, wall_time: std::time::Duration::from_secs(30) });
-    assert!(matches!(result.state, Materialization::Ready(_)), "partial mapped storage must construct without reading unspecified elements: {:?}", result.state);
+    let result = domain.advance(
+        &coordinate,
+        ConstructionAllowance {
+            work_units: 100_000,
+            wall_time: std::time::Duration::from_secs(30),
+        },
+    );
+    assert!(
+        matches!(result.state, Materialization::Ready(_)),
+        "partial mapped storage must construct without reading unspecified elements: {:?}",
+        result.state
+    );
 }
 
 #[test]
@@ -361,21 +449,42 @@ fn mixed_quantity_comparison_uses_the_checked_explicit_cast() {
         text: "fn word(i: index[4294967296], x: i32) -> bool:\n    return i < x\n\nfn quantity(i: index[4294967296], x: i32) -> bool:\n    return i < 0\n".into(),
     }])).unwrap();
     for (name, expected, casts) in [("word", true, 1), ("quantity", false, 0)] {
-        let entry = module.entry(module.entry_named(name).unwrap(), &Default::default()).unwrap();
+        let entry = module
+            .entry(module.entry_named(name).unwrap(), &Default::default())
+            .unwrap();
         let device = device();
         let registry = crate::realization::demand_driven_tests::registry();
         let domain = crate::candidate_domain::construct_candidate_domain(
-            entry, &device, &registry, &seismic_lang::precision::PrecisionPolicy::Exact,
-        ).unwrap();
-        let candidate = domain.read_materialized(&domain.general_construction()).unwrap();
+            entry,
+            &device,
+            &registry,
+            &seismic_lang::precision::PrecisionPolicy::Exact,
+        )
+        .unwrap();
+        let candidate = domain
+            .read_materialized(&domain.general_construction())
+            .unwrap();
         let emitted_casts = candidate.candidate().schedule().steps().iter().filter(|step| matches!(step,
             seismic_ir::schedule::ScheduleStep::EvaluateHost(value)
             if matches!(value.value, seismic_ir::schedule::HostValueExpr::Word { dtype: DType::I32, .. })
         )).count();
-        assert_eq!(emitted_casts, casts, "{name}: only the checked word boundary emits a cast");
-        let entry = module.entry(module.entry_named(name).unwrap(), &Default::default()).unwrap();
+        assert_eq!(
+            emitted_casts, casts,
+            "{name}: only the checked word boundary emits a cast"
+        );
+        let entry = module
+            .entry(module.entry_named(name).unwrap(), &Default::default())
+            .unwrap();
         let oracle = Interpreter::new(&entry);
-        let outcome = oracle.run(&[Arg::Index(2147483648_u64.into()), Arg::Scalar(ReferenceScalar::I32(0))]).unwrap();
-        assert!(matches!(outcome.results().next().unwrap().value(), OutcomeValue::Scalar(ReferenceScalar::Bool(value)) if value == expected), "{name}");
+        let outcome = oracle
+            .run(&[
+                Arg::Index(2147483648_u64.into()),
+                Arg::Scalar(ReferenceScalar::I32(0)),
+            ])
+            .unwrap();
+        assert!(
+            matches!(outcome.results().next().unwrap().value(), OutcomeValue::Scalar(ReferenceScalar::Bool(value)) if value == expected),
+            "{name}"
+        );
     }
 }

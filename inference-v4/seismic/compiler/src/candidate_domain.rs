@@ -8,10 +8,10 @@
 
 mod construction_choice;
 mod materialization;
+pub use crate::portable::capacity::{CapacityPending, CapacityReason};
 pub use construction_choice::{
     BodyChoice, BodyMapping, BodySelection, CallLocation, CallPath, ConstructionCoordinate,
 };
-pub use crate::portable::capacity::{CapacityPending, CapacityReason};
 pub use materialization::{
     ConstructionAdvance, ConstructionAllowance, ConstructionExclusion, ConstructionPending,
     Materialization, MaterializedRead,
@@ -305,12 +305,12 @@ pub(crate) struct SourceEntryBorrow<'a> {
 }
 
 impl<'a> SourceEntryBorrow<'a> {
-    fn new(
-        arena: &'a mut ExprArena,
-        program: &'a SemanticProgram,
-        schema: &'a CallSchema,
-    ) -> Self {
-        Self { arena, program, schema }
+    fn new(arena: &'a mut ExprArena, program: &'a SemanticProgram, schema: &'a CallSchema) -> Self {
+        Self {
+            arena,
+            program,
+            schema,
+        }
     }
 
     pub(crate) fn into_parts(self) -> (&'a mut ExprArena, &'a SemanticProgram, &'a CallSchema) {
@@ -814,7 +814,10 @@ pub(crate) fn canonical_choice_binding(
             .get(&decision)
             .copied()
             .ok_or(CoordinateError::MissingChoice(decision))?;
-        assignment.bind(arena.decision_symbol(decision), SymbolValue::Int((value).into()));
+        assignment.bind(
+            arena.decision_symbol(decision),
+            SymbolValue::Int((value).into()),
+        );
         canonical.push((decision, value));
     }
     Ok((assignment, canonical))
@@ -971,7 +974,10 @@ pub(crate) mod internals {
             fixed.bind(*symbol, value.clone());
         }
         for (decision, value) in general_choices(arena, family) {
-            fixed.bind(arena.decision_symbol(decision), SymbolValue::Int((value).into()));
+            fixed.bind(
+                arena.decision_symbol(decision),
+                SymbolValue::Int((value).into()),
+            );
         }
         let target_domain = arena.partial(target_domain, &fixed);
         let semantic = arena.partial(family.semantic_coverage().node(), &fixed);
@@ -996,8 +1002,11 @@ pub(crate) mod internals {
     ) -> DomainCandidate<T> {
         let semantic = family.semantic_coverage().node();
         let hard = family.hard_constraints();
-        let numerical =
-            crate::numerics::structural_obligation(arena, family.numerical_applicability(), precision);
+        let numerical = crate::numerics::structural_obligation(
+            arena,
+            family.numerical_applicability(),
+            precision,
+        );
         let conjuncts = vec![
             DomainConstraint {
                 origin: ConstraintOrigin::Invocation,
@@ -1135,8 +1144,8 @@ mod candidate_domain_tests {
 
     #[test]
     fn family_definitions_do_not_depend_on_optional_construction_allowance() {
-        use crate::realization::demand_driven_tests::registry;
         use crate::realization::demand_driven_tests::device;
+        use crate::realization::demand_driven_tests::registry;
         use seismic_lang::checked::{check_source, SourceFile, SourceSet};
         use seismic_lang::entry::ElementBindings;
         let module = check_source(SourceSet::new(vec![SourceFile {
@@ -1153,8 +1162,7 @@ mod candidate_domain_tests {
                     &ElementBindings::default(),
                 )
                 .unwrap();
-            construct_candidate_domain(entry, &target, &registry, &PrecisionPolicy::Exact)
-                .unwrap()
+            construct_candidate_domain(entry, &target, &registry, &PrecisionPolicy::Exact).unwrap()
         };
         let unvisited = build();
         let mut visited = build();
@@ -1190,8 +1198,8 @@ mod candidate_domain_tests {
 
     #[test]
     fn equal_body_labels_cannot_select_a_different_checked_source() {
-        use crate::realization::demand_driven_tests::registry;
         use crate::realization::demand_driven_tests::device;
+        use crate::realization::demand_driven_tests::registry;
         use seismic_lang::checked::{check_source, SourceFile, SourceSet};
         use seismic_lang::entry::ElementBindings;
         use std::time::Duration;
@@ -1205,10 +1213,12 @@ mod candidate_domain_tests {
             }]))
             .unwrap();
             let entry = module
-                .entry(module.entry_named("probe").unwrap(), &ElementBindings::default())
+                .entry(
+                    module.entry_named("probe").unwrap(),
+                    &ElementBindings::default(),
+                )
                 .unwrap();
-            construct_candidate_domain(entry, &target, &registry, &PrecisionPolicy::Exact)
-                .unwrap()
+            construct_candidate_domain(entry, &target, &registry, &PrecisionPolicy::Exact).unwrap()
         };
         let left = build("1.0");
         let mut right = build("2.0");
@@ -1252,8 +1262,7 @@ mod candidate_domain_tests {
                     &ElementBindings::default(),
                 )
                 .unwrap();
-            construct_candidate_domain(entry, &target, &registry, &PrecisionPolicy::Exact)
-                .unwrap()
+            construct_candidate_domain(entry, &target, &registry, &PrecisionPolicy::Exact).unwrap()
         };
         fn finish(
             domain: &mut CandidateDomain<'_, FakeTarget>,
@@ -1375,8 +1384,8 @@ mod candidate_domain_tests {
     #[test]
     fn constructed_handle_pins_data_and_expressions_after_cache_eviction() {
         use crate::evaluation_session::boundary_tests::domain_with_optional;
-        use crate::realization::demand_driven_tests::registry;
         use crate::realization::demand_driven_tests::device;
+        use crate::realization::demand_driven_tests::registry;
         let target = device();
         let registry = registry();
         let (mut domain, coordinate) = domain_with_optional(&target, &registry);

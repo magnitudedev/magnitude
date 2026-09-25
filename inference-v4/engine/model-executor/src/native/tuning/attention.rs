@@ -16,8 +16,8 @@
 
 use super::cases::projection_shape;
 use super::{
-    row_points, served_row_points, with_contexts, CaseState, EntryTuning, PointShape,
-    TuningInputs, TuningLimits,
+    cpu_projection_screening, row_points, served_row_points, with_contexts, CaseState, EntryTuning,
+    PointShape, TuningInputs, TuningLimits,
 };
 use crate::programs::graph::attention::{
     affine_coefficients, rotary_components, rotary_frequencies, DECODE_ROWS,
@@ -25,10 +25,10 @@ use crate::programs::graph::attention::{
 use crate::AttentionShape;
 use magnitude_model_contracts::{MixerGeometry, RotarySemantics, WeightKind, WeightScope};
 use magnitude_model_kernels::{
-    gated_attention_decode, gated_attention_decode_k8v4, attention_output,
-    gated_attention_prefill, gated_attention_prefill_k8v4, gated_attention_project,
+    attention_output, gated_attention_decode, gated_attention_decode_k8v4, gated_attention_prefill,
+    gated_attention_prefill_k8v4, gated_attention_project,
 };
-use seismic::{Element, Tensor};
+use seismic::{Device, Element, ScreeningPoint, Tensor};
 use std::ops::Range;
 
 /// `gated_attention_project`: RMS prologue, fused query+gate | key | value
@@ -100,6 +100,10 @@ impl EntryTuning for AttentionProjectTuning {
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
         row_points(limits)
+    }
+
+    fn screening(&self, device: &Device, points: &[PointShape]) -> Vec<ScreeningPoint> {
+        cpu_projection_screening(device, points)
     }
 
     fn rotation(
@@ -187,6 +191,10 @@ impl EntryTuning for AttentionOutputTuning {
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
         row_points(limits)
+    }
+
+    fn screening(&self, device: &Device, points: &[PointShape]) -> Vec<ScreeningPoint> {
+        cpu_projection_screening(device, points)
     }
 
     fn rotation(
@@ -307,7 +315,9 @@ impl MixHistory for DenseMixHistory {
                 inputs.activation(mix.activation, &[rows, shape.kv_heads, shape.width], seed)
             })?;
             inputs.state(
-                plane.slice_leading(0, view).map_err(|error| error.to_string())?,
+                plane
+                    .slice_leading(0, view)
+                    .map_err(|error| error.to_string())?,
                 appended.clone(),
             )
         };
@@ -384,14 +394,16 @@ impl MixHistory for AffineMixHistory {
         appended: Range<u64>,
     ) -> Result<Self, String> {
         let shape = mix.shape;
-        let mut plane = |name: &str,
-                         build: &dyn Fn(&TuningInputs<'_, '_>) -> Result<Tensor, String>| {
-            let plane = inputs.shared(format!("{name}-c{context}"), |inputs| build(inputs))?;
-            inputs.state(
-                plane.slice_leading(0, view).map_err(|error| error.to_string())?,
-                appended.clone(),
-            )
-        };
+        let mut plane =
+            |name: &str, build: &dyn Fn(&TuningInputs<'_, '_>) -> Result<Tensor, String>| {
+                let plane = inputs.shared(format!("{name}-c{context}"), |inputs| build(inputs))?;
+                inputs.state(
+                    plane
+                        .slice_leading(0, view)
+                        .map_err(|error| error.to_string())?,
+                    appended.clone(),
+                )
+            };
         let pairs = [rows, shape.kv_heads, affine_coefficients(shape.width)];
         Ok(Self {
             key_codes: plane("history_key_codes", &|inputs| {
@@ -499,7 +511,12 @@ impl AttentionMix {
         let components = rotary_components(&rotary)?;
         let frequencies = rotary_frequencies(&rotary);
         let pairs = components.len() as u64;
-        let coordinates = tables.coordinates.iter().flatten().copied().collect::<Vec<_>>();
+        let coordinates = tables
+            .coordinates
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
         let visible = tables
             .visible
             .iter()

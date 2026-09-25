@@ -2,17 +2,16 @@
 
 use super::{ReadySubmission, VisionProgram};
 use crate::{
-    DeviceError, GraphOutputTensor, InvariantError, ModelLoadPlan, NativeGraphOutputLease,
-    NativeGraphWorkspaceLease, ResidentVision, ResidentWeight, SubmitError, ValidatedVisionLaunch,
-    VisionLaunchCore, WeightPlan, native::AttestedVision,
+    native::AttestedVision, programs::graph::draft::GraphDraft, DeviceError, GraphOutputTensor,
+    InvariantError, ModelLoadPlan, NativeGraphOutputLease, NativeGraphWorkspaceLease,
+    ResidentVision, ResidentWeight, SubmitError, ValidatedVisionLaunch, VisionLaunchCore,
+    VisionProgramPlan, WeightPlan,
 };
 use magnitude_model_contracts::{VisionGeometry, WeightKind, WeightRole, WeightScope};
-use magnitude_model_kernels::{
-    qwen_vision_block, qwen_vision_merger, qwen_vision_stem,
-};
+use magnitude_model_kernels::{qwen_vision_block, qwen_vision_merger, qwen_vision_stem};
 use seismic::{
-    BoundNativeGraphPlan, Device, NativeGraphFamily, NativeGraphFamilySlot, NativeGraphPlan,
-    NativePort, WorkflowTensor,
+    BackendName, BoundNativeGraphPlan, Device, NativeGraphFamily, NativeGraphFamilySlot,
+    NativeGraphMetadata, NativeGraphPlan, NativeGraphStorageBytes, NativePort, WorkflowTensor,
 };
 use std::rc::Rc;
 
@@ -34,8 +33,8 @@ fn planned_vision_weight_plan(
         .ok_or_else(|| invalid(format!("planned vision weight {role:?} is absent")))
 }
 
-fn planned_vision_weight(
-    graph: &mut seismic::NativeGraph,
+fn planned_vision_weight<G: GraphDraft>(
+    graph: &mut G,
     load: &ModelLoadPlan,
     role: WeightRole,
     weights: &mut Vec<(WeightRole, NativePort)>,
@@ -45,6 +44,326 @@ fn planned_vision_weight(
     let tensor = port.tensor().clone();
     weights.push((role, port));
     Ok(tensor)
+}
+
+struct VisionEntries<'a, G: GraphDraft + 'a> {
+    stem: G::Binding<'a, qwen_vision_stem::Entry>,
+    blocks: Vec<G::Binding<'a, qwen_vision_block::Entry>>,
+    merger: G::Binding<'a, qwen_vision_merger::Entry>,
+}
+
+struct VisionGraphPorts {
+    pixels: NativePort,
+    positions: NativePort,
+    rotation: NativePort,
+    coordinates: NativePort,
+    weights: Vec<(WeightRole, NativePort)>,
+    features: WorkflowTensor,
+}
+
+fn vision_graph_topology<'a, G: GraphDraft + 'a>(
+    mut graph: G,
+    entries: VisionEntries<'a, G>,
+    load: &ModelLoadPlan,
+    geometry: &VisionGeometry,
+    decoder_hidden: u64,
+    rows: u64,
+) -> Result<(G::Plan, VisionGraphPorts), SubmitError> {
+    let merge = geometry
+        .merge
+        .checked_mul(geometry.merge)
+        .ok_or_else(|| invalid("vision merge area overflow"))?;
+    let four_heads = geometry
+        .heads
+        .checked_mul(4)
+        .ok_or_else(|| invalid("vision attention width overflow"))?;
+    if merge == 0 || four_heads == 0 || geometry.hidden % four_heads != 0 {
+        return Err(invalid("vision graph geometry is not divisible"));
+    }
+    if rows == 0 || rows % merge != 0 {
+        return Err(invalid(
+            "vision graph patch class is not a positive merge-area multiple",
+        ));
+    }
+    if entries.blocks.is_empty() {
+        return Err(invalid("vision graph has no block entry"));
+    }
+    let head_width = geometry.hidden / four_heads;
+    let merger_hidden = merge
+        .checked_mul(geometry.hidden)
+        .ok_or_else(|| invalid("vision merger hidden width overflow"))?;
+    let merger_output = planned_vision_weight_plan(
+        load,
+        WeightRole {
+            scope: WeightScope::Vision,
+            kind: WeightKind::MergerOutput,
+        },
+    )?;
+    let merger_bias = planned_vision_weight_plan(
+        load,
+        WeightRole {
+            scope: WeightScope::Vision,
+            kind: WeightKind::MergerOutputBias,
+        },
+    )?;
+    if merger_output.shape != [decoder_hidden, merger_hidden]
+        || merger_bias.shape != [decoder_hidden]
+    {
+        return Err(invalid(
+            "vision merger output does not match the decoder hidden width",
+        ));
+    }
+
+    let mut weights = Vec::new();
+    macro_rules! weight {
+        ($scope:expr, $kind:expr) => {
+            planned_vision_weight(
+                &mut graph,
+                load,
+                WeightRole {
+                    scope: $scope,
+                    kind: $kind,
+                },
+                &mut weights,
+            )?
+        };
+    }
+    let position = planned_vision_weight_plan(
+        load,
+        WeightRole {
+            scope: WeightScope::Vision,
+            kind: WeightKind::PositionEmbedding,
+        },
+    )?;
+    let stem_dims = [
+        ("M", rows),
+        ("C", geometry.channels),
+        ("P", geometry.patch),
+        ("H", geometry.hidden),
+        ("L", position.shape[0]),
+    ];
+    let pixels = graph
+        .input_for(entries.stem, "pixels", &stem_dims)
+        .map_err(device)?;
+    let positions = graph
+        .input_for(entries.stem, "indices", &stem_dims)
+        .map_err(device)?;
+    let rotation = graph
+        .input_for(entries.stem, "coefficients", &stem_dims)
+        .map_err(device)?;
+    let temporal_weight_0 = weight!(WeightScope::VisionPatch(0), WeightKind::PatchEmbedding);
+    let temporal_weight_1 = weight!(WeightScope::VisionPatch(1), WeightKind::PatchEmbedding);
+    let bias = weight!(WeightScope::Vision, WeightKind::PatchBias);
+    let table = weight!(WeightScope::Vision, WeightKind::PositionEmbedding);
+    let stem = graph
+        .enqueue::<qwen_vision_stem::Entry>(
+            entries.stem,
+            &stem_dims,
+            qwen_vision_stem::WorkflowArgs {
+                pixels: pixels.tensor().into(),
+                temporal_weight_0: (&temporal_weight_0).into(),
+                temporal_weight_1: (&temporal_weight_1).into(),
+                bias: (&bias).into(),
+                table: (&table).into(),
+                indices: positions.tensor().into(),
+                coefficients: rotation.tensor().into(),
+            },
+        )
+        .map_err(device)?
+        .value;
+    let first_intermediate = planned_vision_weight_plan(
+        load,
+        WeightRole {
+            scope: WeightScope::VisionBlock(0),
+            kind: WeightKind::FeedForwardUpBias,
+        },
+    )?
+    .shape[0];
+    let block_dims = [
+        ("M", rows),
+        ("H", geometry.heads),
+        ("P", head_width),
+        ("F", first_intermediate),
+    ];
+    let coordinates = graph
+        .input_for(entries.blocks[0], "coordinates", &block_dims)
+        .map_err(device)?;
+    let mut hidden = stem;
+    for (index, entry) in entries.blocks.iter().copied().enumerate() {
+        let scope = WeightScope::VisionBlock(index as u32);
+        let intermediate = planned_vision_weight_plan(
+            load,
+            WeightRole {
+                scope,
+                kind: WeightKind::FeedForwardUpBias,
+            },
+        )?
+        .shape[0];
+        let dimensions = [
+            ("M", rows),
+            ("H", geometry.heads),
+            ("P", head_width),
+            ("F", intermediate),
+        ];
+        let norm1_weight = weight!(scope, WeightKind::InputNormWeight);
+        let norm1_bias = weight!(scope, WeightKind::InputNormBias);
+        let qkv_weight = weight!(scope, WeightKind::FusedQkvWeight);
+        let qkv_bias = weight!(scope, WeightKind::FusedQkvBias);
+        let projection_weight = weight!(scope, WeightKind::AttentionOutput);
+        let projection_bias = weight!(scope, WeightKind::AttentionOutputBias);
+        let norm2_weight = weight!(scope, WeightKind::FeedForwardNormWeight);
+        let norm2_bias = weight!(scope, WeightKind::FeedForwardNormBias);
+        let up_weight = weight!(scope, WeightKind::DenseUp);
+        let up_bias = weight!(scope, WeightKind::FeedForwardUpBias);
+        let down_weight = weight!(scope, WeightKind::DenseDown);
+        let down_bias = weight!(scope, WeightKind::FeedForwardDownBias);
+        let hidden_view = hidden.reshape(&[rows, geometry.heads, 4, head_width]);
+        hidden = graph
+            .enqueue::<qwen_vision_block::Entry>(
+                entry,
+                &dimensions,
+                qwen_vision_block::WorkflowArgs {
+                    hidden: (&hidden_view).into(),
+                    coordinates: coordinates.tensor().into(),
+                    norm1_weight: (&norm1_weight).into(),
+                    norm1_bias: (&norm1_bias).into(),
+                    qkv_weight: (&qkv_weight).into(),
+                    qkv_bias: (&qkv_bias).into(),
+                    projection_weight: (&projection_weight).into(),
+                    projection_bias: (&projection_bias).into(),
+                    norm2_weight: (&norm2_weight).into(),
+                    norm2_bias: (&norm2_bias).into(),
+                    up_weight: (&up_weight).into(),
+                    up_bias: (&up_bias).into(),
+                    down_weight: (&down_weight).into(),
+                    down_bias: (&down_bias).into(),
+                    epsilon: geometry.epsilon as f32,
+                },
+            )
+            .map_err(device)?
+            .value;
+    }
+    let norm_weight = weight!(WeightScope::Vision, WeightKind::NormWeight);
+    let norm_bias = weight!(WeightScope::Vision, WeightKind::NormBias);
+    let up_weight = weight!(WeightScope::Vision, WeightKind::MergerHidden);
+    let up_bias = weight!(WeightScope::Vision, WeightKind::MergerHiddenBias);
+    let down_weight = weight!(WeightScope::Vision, WeightKind::MergerOutput);
+    let down_bias = weight!(WeightScope::Vision, WeightKind::MergerOutputBias);
+    let merger_dims = [
+        ("M", rows / merge),
+        ("G", merge),
+        ("H", geometry.hidden),
+        ("D", decoder_hidden),
+    ];
+    let features = graph
+        .enqueue::<qwen_vision_merger::Entry>(
+            entries.merger,
+            &merger_dims,
+            qwen_vision_merger::WorkflowArgs {
+                hidden: (&hidden).into(),
+                norm_weight: (&norm_weight).into(),
+                norm_bias: (&norm_bias).into(),
+                up_weight: (&up_weight).into(),
+                up_bias: (&up_bias).into(),
+                down_weight: (&down_weight).into(),
+                down_bias: (&down_bias).into(),
+                epsilon: geometry.epsilon as f32,
+            },
+        )
+        .map_err(device)?
+        .value;
+    graph.export(&features).map_err(device)?;
+    let plan = graph.seal().map_err(device)?;
+    Ok((
+        plan,
+        VisionGraphPorts {
+            pixels,
+            positions,
+            rotation,
+            coordinates,
+            weights,
+            features,
+        },
+    ))
+}
+
+pub(crate) fn checked_vision_family_storage(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    geometry: &VisionGeometry,
+    decoder_hidden: u64,
+    plan: &VisionProgramPlan,
+    patch_rows: impl IntoIterator<Item = u64>,
+) -> Result<NativeGraphStorageBytes, String> {
+    let patch = plan.patch();
+    let stem_elements = [
+        ("W0", patch.temporal_weight_0),
+        ("W1", patch.temporal_weight_1),
+        ("B", patch.bias),
+        ("PE", patch.position),
+    ];
+    let block_elements = plan
+        .blocks()
+        .iter()
+        .map(|block| {
+            vec![
+                ("A", block.activation),
+                ("N1W", block.input_norm_weight),
+                ("N1B", block.input_norm_bias),
+                ("QW", block.qkv_weight),
+                ("QB", block.qkv_bias),
+                ("PW", block.attention_output),
+                ("PB", block.attention_output_bias),
+                ("N2W", block.feedforward_norm_weight),
+                ("N2B", block.feedforward_norm_bias),
+                ("UW", block.up),
+                ("UB", block.up_bias),
+                ("DW", block.down),
+                ("DB", block.down_bias),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let merger = plan.merger();
+    let merger_elements = [
+        ("A", merger.activation),
+        ("NW", merger.output_norm_weight),
+        ("NB", merger.output_norm_bias),
+        ("UW", merger.hidden),
+        ("UB", merger.hidden_bias),
+        ("DW", merger.output),
+        ("DB", merger.output_bias),
+    ];
+    let mut seen = Vec::new();
+    let mut family: Option<NativeGraphStorageBytes> = None;
+    for rows in patch_rows {
+        if seen.contains(&rows) {
+            return Err("vision graph patch class is duplicated".into());
+        }
+        seen.push(rows);
+        let entries = VisionEntries {
+            stem: &stem_elements[..],
+            blocks: block_elements.iter().map(Vec::as_slice).collect(),
+            merger: &merger_elements[..],
+        };
+        let (storage, _) = vision_graph_topology(
+            NativeGraphMetadata::new(backend),
+            entries,
+            load,
+            geometry,
+            decoder_hidden,
+            rows,
+        )
+        .map_err(|error| error.to_string())?;
+        match &mut family {
+            Some(maximum) => {
+                maximum.workspace = maximum.workspace.max(storage.workspace);
+                maximum.output = maximum.output.max(storage.output);
+                maximum.upload = maximum.upload.max(storage.upload);
+            }
+            None => family = Some(storage),
+        }
+    }
+    family.ok_or_else(|| "vision graph family has no exact patch class".into())
 }
 pub struct NativeVisionProgram {
     graphs: BoundVisionGraphs,
@@ -143,204 +462,36 @@ impl PreparedVisionGraphs {
         decoder_hidden: u64,
         patch_rows: impl IntoIterator<Item = u64>,
     ) -> Result<Self, SubmitError> {
-        let merge = geometry
-            .merge
-            .checked_mul(geometry.merge)
-            .ok_or_else(|| invalid("vision merge area overflow"))?;
-        let four_heads = geometry
-            .heads
-            .checked_mul(4)
-            .ok_or_else(|| invalid("vision attention width overflow"))?;
-        if merge == 0 || four_heads == 0 || geometry.hidden % four_heads != 0 {
-            return Err(invalid("vision graph geometry is not divisible"));
-        }
-        let head_width = geometry.hidden / four_heads;
-        let merger_hidden = merge
-            .checked_mul(geometry.hidden)
-            .ok_or_else(|| invalid("vision merger hidden width overflow"))?;
-        let merger_output = planned_vision_weight_plan(
-            load,
-            WeightRole {
-                scope: WeightScope::Vision,
-                kind: WeightKind::MergerOutput,
-            },
-        )?;
-        let merger_bias = planned_vision_weight_plan(
-            load,
-            WeightRole {
-                scope: WeightScope::Vision,
-                kind: WeightKind::MergerOutputBias,
-            },
-        )?;
-        if merger_output.shape != [decoder_hidden, merger_hidden]
-            || merger_bias.shape != [decoder_hidden]
-        {
-            return Err(invalid(
-                "vision merger output does not match the decoder hidden width",
-            ));
-        }
         let mut variants = Vec::new();
         for rows in patch_rows {
-            if rows == 0 || rows % merge != 0 {
-                return Err(invalid(
-                    "vision graph patch class is not a positive merge-area multiple",
-                ));
-            }
             if variants
                 .iter()
                 .any(|variant: &PreparedVisionGraph| variant.patch_rows == rows)
             {
                 return Err(invalid("vision graph patch class is duplicated"));
             }
-            let mut graph = target_device.native_graph();
-            let mut weights = Vec::new();
-            macro_rules! weight {
-                ($scope:expr, $kind:expr) => {
-                    planned_vision_weight(
-                        &mut graph,
-                        load,
-                        WeightRole {
-                            scope: $scope,
-                            kind: $kind,
-                        },
-                        &mut weights,
-                    )?
-                };
-            }
-            let position = planned_vision_weight_plan(
+            let entries = VisionEntries {
+                stem: &handles.stem,
+                blocks: handles.blocks.iter().collect(),
+                merger: &handles.merger,
+            };
+            let (plan, ports) = vision_graph_topology(
+                target_device.native_graph(),
+                entries,
                 load,
-                WeightRole {
-                    scope: WeightScope::Vision,
-                    kind: WeightKind::PositionEmbedding,
-                },
+                geometry,
+                decoder_hidden,
+                rows,
             )?;
-            let stem_dims = [
-                ("M", rows),
-                ("C", geometry.channels),
-                ("P", geometry.patch),
-                ("H", geometry.hidden),
-                ("L", position.shape[0]),
-            ];
-            let pixels = graph
-                .input_for(&handles.stem, "pixels", &stem_dims)
-                .map_err(device)?;
-            let positions = graph
-                .input_for(&handles.stem, "indices", &stem_dims)
-                .map_err(device)?;
-            let rotation = graph
-                .input_for(&handles.stem, "coefficients", &stem_dims)
-                .map_err(device)?;
-            let temporal_weight_0 =
-                weight!(WeightScope::VisionPatch(0), WeightKind::PatchEmbedding);
-            let temporal_weight_1 =
-                weight!(WeightScope::VisionPatch(1), WeightKind::PatchEmbedding);
-            let bias = weight!(WeightScope::Vision, WeightKind::PatchBias);
-            let table = weight!(WeightScope::Vision, WeightKind::PositionEmbedding);
-            let stem = graph
-                .enqueue(
-                    &handles.stem,
-                    qwen_vision_stem::WorkflowArgs {
-                        pixels: pixels.tensor().into(),
-                        temporal_weight_0: (&temporal_weight_0).into(),
-                        temporal_weight_1: (&temporal_weight_1).into(),
-                        bias: (&bias).into(),
-                        table: (&table).into(),
-                        indices: positions.tensor().into(),
-                        coefficients: rotation.tensor().into(),
-                    },
-                )
-                .map_err(device)?
-                .value;
-            let first_intermediate = planned_vision_weight_plan(
-                load,
-                WeightRole {
-                    scope: WeightScope::VisionBlock(0),
-                    kind: WeightKind::FeedForwardUpBias,
-                },
-            )?
-            .shape[0];
-            let block_dims = [
-                ("M", rows),
-                ("H", geometry.heads),
-                ("P", head_width),
-                ("F", first_intermediate),
-            ];
-            let coordinates = graph
-                .input_for(&handles.blocks[0], "coordinates", &block_dims)
-                .map_err(device)?;
-            let mut hidden = stem;
-            for (index, handle) in handles.blocks.iter().enumerate() {
-                let scope = WeightScope::VisionBlock(index as u32);
-                let norm1_weight = weight!(scope, WeightKind::InputNormWeight);
-                let norm1_bias = weight!(scope, WeightKind::InputNormBias);
-                let qkv_weight = weight!(scope, WeightKind::FusedQkvWeight);
-                let qkv_bias = weight!(scope, WeightKind::FusedQkvBias);
-                let projection_weight = weight!(scope, WeightKind::AttentionOutput);
-                let projection_bias = weight!(scope, WeightKind::AttentionOutputBias);
-                let norm2_weight = weight!(scope, WeightKind::FeedForwardNormWeight);
-                let norm2_bias = weight!(scope, WeightKind::FeedForwardNormBias);
-                let up_weight = weight!(scope, WeightKind::DenseUp);
-                let up_bias = weight!(scope, WeightKind::FeedForwardUpBias);
-                let down_weight = weight!(scope, WeightKind::DenseDown);
-                let down_bias = weight!(scope, WeightKind::FeedForwardDownBias);
-                let hidden_view = hidden.reshape(&[rows, geometry.heads, 4, head_width]);
-                hidden = graph
-                    .enqueue(
-                        handle,
-                        qwen_vision_block::WorkflowArgs {
-                            hidden: (&hidden_view).into(),
-                            coordinates: coordinates.tensor().into(),
-                            norm1_weight: (&norm1_weight).into(),
-                            norm1_bias: (&norm1_bias).into(),
-                            qkv_weight: (&qkv_weight).into(),
-                            qkv_bias: (&qkv_bias).into(),
-                            projection_weight: (&projection_weight).into(),
-                            projection_bias: (&projection_bias).into(),
-                            norm2_weight: (&norm2_weight).into(),
-                            norm2_bias: (&norm2_bias).into(),
-                            up_weight: (&up_weight).into(),
-                            up_bias: (&up_bias).into(),
-                            down_weight: (&down_weight).into(),
-                            down_bias: (&down_bias).into(),
-                            epsilon: geometry.epsilon as f32,
-                        },
-                    )
-                    .map_err(device)?
-                    .value;
-            }
-            let norm_weight = weight!(WeightScope::Vision, WeightKind::NormWeight);
-            let norm_bias = weight!(WeightScope::Vision, WeightKind::NormBias);
-            let up_weight = weight!(WeightScope::Vision, WeightKind::MergerHidden);
-            let up_bias = weight!(WeightScope::Vision, WeightKind::MergerHiddenBias);
-            let down_weight = weight!(WeightScope::Vision, WeightKind::MergerOutput);
-            let down_bias = weight!(WeightScope::Vision, WeightKind::MergerOutputBias);
-            let features = graph
-                .enqueue(
-                    &handles.merger,
-                    qwen_vision_merger::WorkflowArgs {
-                        hidden: (&hidden).into(),
-                        norm_weight: (&norm_weight).into(),
-                        norm_bias: (&norm_bias).into(),
-                        up_weight: (&up_weight).into(),
-                        up_bias: (&up_bias).into(),
-                        down_weight: (&down_weight).into(),
-                        down_bias: (&down_bias).into(),
-                        epsilon: geometry.epsilon as f32,
-                    },
-                )
-                .map_err(device)?
-                .value;
-            graph.export(&features).map_err(device)?;
-            let plan = graph.seal().map_err(device)?;
             variants.push(PreparedVisionGraph {
                 patch_rows: rows,
                 plan,
-                pixels,
-                positions,
-                rotation,
-                coordinates,
-                weights,
-                features,
+                pixels: ports.pixels,
+                positions: ports.positions,
+                rotation: ports.rotation,
+                coordinates: ports.coordinates,
+                weights: ports.weights,
+                features: ports.features,
             });
         }
         if variants.is_empty() {
@@ -388,20 +539,6 @@ impl PreparedVisionGraphs {
             prepared: self.clone(),
             variants,
         })
-    }
-
-    pub(crate) fn plans(&self) -> impl Iterator<Item = (u64, &NativeGraphPlan)> {
-        self.variants
-            .iter()
-            .map(|variant| (variant.patch_rows, &variant.plan))
-    }
-
-    pub(crate) fn plan(&self, patch_rows: u64) -> Result<&NativeGraphPlan, SubmitError> {
-        self.variants
-            .iter()
-            .find(|variant| variant.patch_rows == patch_rows)
-            .map(|variant| &variant.plan)
-            .ok_or_else(|| invalid("vision graph patch class was not prepared"))
     }
 
     pub(crate) fn run(

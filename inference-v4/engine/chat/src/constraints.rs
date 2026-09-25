@@ -49,12 +49,17 @@ pub struct Vocabulary {
     limits: CacheLimits,
     cache_hits: u64,
 }
-impl Vocabulary {
-    pub fn new(
-        tokenizer: Arc<ByteBpeTokenizer>,
-        projection: usize,
-        limits: CacheLimits,
-    ) -> Result<Self, String> {
+/// Device-free vocabulary work that can run while the numerical worker loads.
+/// Cache policy is attached only when a serving instance is constructed.
+pub struct PreparedVocabulary {
+    tokenizer: Arc<ByteBpeTokenizer>,
+    factory: ParserFactory,
+    usable: Arc<[u32]>,
+    projection: usize,
+}
+
+impl PreparedVocabulary {
+    pub fn new(tokenizer: Arc<ByteBpeTokenizer>, projection: usize) -> Result<Self, String> {
         if projection < tokenizer.vocabulary()
             || projection > u32::MAX as usize
             || tokenizer.stop_tokens().is_empty()
@@ -102,11 +107,31 @@ impl Vocabulary {
             factory,
             usable: usable.into(),
             projection,
+        })
+    }
+
+    pub fn with_cache_limits(self, limits: CacheLimits) -> Vocabulary {
+        Vocabulary {
+            tokenizer: self.tokenizer,
+            factory: self.factory,
+            usable: self.usable,
+            projection: self.projection,
             cache: VecDeque::new(),
             cache_bytes: 0,
             limits,
             cache_hits: 0,
-        })
+        }
+    }
+}
+
+impl Vocabulary {
+    pub fn new(
+        tokenizer: Arc<ByteBpeTokenizer>,
+        projection: usize,
+        limits: CacheLimits,
+    ) -> Result<Self, String> {
+        PreparedVocabulary::new(tokenizer, projection)
+            .map(|prepared| prepared.with_cache_limits(limits))
     }
     pub fn projection(&self) -> usize {
         self.projection

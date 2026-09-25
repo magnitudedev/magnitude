@@ -348,13 +348,17 @@ impl NameCallGraph {
         // Components come callees first, so a component's callees outside
         // it are decided before it.
         for component in components {
-            let recursive = component.len() > 1 || self.callees[component[0]].contains(&component[0]);
+            let recursive =
+                component.len() > 1 || self.callees[component[0]].contains(&component[0]);
             if recursive {
                 cycles.push(self.cycle_through(&component));
                 for &definition in &component {
                     blocked[definition] = true;
                 }
-            } else if self.callees[component[0]].iter().any(|&callee| blocked[callee]) {
+            } else if self.callees[component[0]]
+                .iter()
+                .any(|&callee| blocked[callee])
+            {
                 blocked[component[0]] = true;
             } else {
                 order.push(component[0]);

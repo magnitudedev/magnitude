@@ -11,8 +11,7 @@
 
 use crate::ExecutionPath;
 use seismic::{
-    Availability, BackendName, DeviceInfo, DeviceKind, DeviceMemory, DeviceSelector,
-    DeviceTopology,
+    Availability, BackendName, DeviceInfo, DeviceKind, DeviceMemory, DeviceSelector, DeviceTopology,
 };
 use std::{fmt, str::FromStr};
 
@@ -264,7 +263,11 @@ mod tests {
     fn automatic_selection_leaves_shadowed_and_software_vulkan_devices_out() {
         let catalog = seismic::DeviceCatalog::discover().unwrap();
         let topology = catalog.topology();
-        for device in topology.devices().iter().filter(|device| device.backend == BackendName::Vulkan) {
+        for device in topology
+            .devices()
+            .iter()
+            .filter(|device| device.backend == BackendName::Vulkan)
+        {
             let DeviceSelector::Vulkan { uuid } = device.selector else {
                 panic!("a Vulkan device has a Vulkan selector")
             };

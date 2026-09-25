@@ -47,7 +47,11 @@ impl<'a> QualificationView<'a> {
             .find(|weight| weight.role.scope == scope && weight.role.kind == kind)
             .map(|weight| weight.shape.as_slice())
             .ok_or_else(|| {
-                qualification(entry, "fixture", format!("the load plan has no {kind:?} weight in {scope:?}"))
+                qualification(
+                    entry,
+                    "fixture",
+                    format!("the load plan has no {kind:?} weight in {scope:?}"),
+                )
             })
     }
 
@@ -65,9 +69,13 @@ impl<'a> QualificationView<'a> {
             };
             let bindings = dense_binding_name(*source_dtype, *target_dtype);
             let source_bytes = one_bytes(*source_dtype);
-            let source =
-                Tensor::from_host(device, Element::dense(*source_dtype), &[1, 1, 1], &source_bytes)
-                    .map_err(|error| qualification_dynamic("import_dense", &bindings, error))?;
+            let source = Tensor::from_host(
+                device,
+                Element::dense(*source_dtype),
+                &[1, 1, 1],
+                &source_bytes,
+            )
+            .map_err(|error| qualification_dynamic("import_dense", &bindings, error))?;
             let destination = handle
                 .call(import_dense::Args { source: &source })
                 .map(|results| results.value)
@@ -123,7 +131,9 @@ impl<'a> QualificationView<'a> {
                 .repack_host(*source_element, &shape, &bytes)
                 .ok_or_else(|| failure("no registered conversion for the binding".into()))?;
             if result.element() != *target_element || output != expected {
-                return Err(failure("repack differs from the registered conversion".into()));
+                return Err(failure(
+                    "repack differs from the registered conversion".into(),
+                ));
             }
         }
         self.qualify_shape_rows(device)?;

@@ -84,9 +84,15 @@ impl<'a> Checker<'a> {
 
     /// The function body: its root block and its one result (L5). `return`
     /// is legal only as the last statement of the top-level block.
-    pub fn function_body(&mut self, b: &ast::Block, span: Span) -> (CheckedBlock, Vec<CheckedExpr>) {
+    pub fn function_body(
+        &mut self,
+        b: &ast::Block,
+        span: Span,
+    ) -> (CheckedBlock, Vec<CheckedExpr>) {
         let (statements, tail) = match b.stmts.split_last() {
-            Some((last, rest)) if matches!(last.kind, ast::StmtKind::Return(_)) => (rest, Some(last)),
+            Some((last, rest)) if matches!(last.kind, ast::StmtKind::Return(_)) => {
+                (rest, Some(last))
+            }
             _ => (b.stmts.as_slice(), None),
         };
         let root = self.statements(statements);
@@ -193,7 +199,12 @@ impl<'a> Checker<'a> {
 
     /// A `let`. Every failure poisons the pattern, so later uses of its
     /// names are not reported again.
-    fn bind(&mut self, pattern: &ast::Pattern, value: &ast::Expr, state: bool) -> Option<CheckedStmt> {
+    fn bind(
+        &mut self,
+        pattern: &ast::Pattern,
+        value: &ast::Expr,
+        state: bool,
+    ) -> Option<CheckedStmt> {
         let bound = self.bind_value(pattern, value, state);
         if bound.is_none() {
             self.poison(pattern);
@@ -211,7 +222,11 @@ impl<'a> Checker<'a> {
         let value = self.expr(value, None)?;
         let value = self.word_value(value);
         if value.ty.is_void() {
-            self.error(DiagnosticRule::Type, value.span, "cannot bind a call that returns nothing");
+            self.error(
+                DiagnosticRule::Type,
+                value.span,
+                "cannot bind a call that returns nothing",
+            );
             return None;
         }
         let moves = match self.binding_moves(&value) {
@@ -440,7 +455,10 @@ impl<'a> Checker<'a> {
                     self.index_position(value, *bound, span)
                 }
             }
-            (ValueType::Index { bound }, ValueType::Integer | ValueType::Scalar(DType::I32 | DType::U32)) => {
+            (
+                ValueType::Index { bound },
+                ValueType::Integer | ValueType::Scalar(DType::I32 | DType::U32),
+            ) => {
                 let span = value.span;
                 self.index_position(value, *bound, span)
             }
@@ -461,7 +479,9 @@ impl<'a> Checker<'a> {
                 }
                 Some(value)
             }
-            (ValueType::Tuple(targets), ValueType::Tuple(values)) if targets.len() == values.len() => {
+            (ValueType::Tuple(targets), ValueType::Tuple(values))
+                if targets.len() == values.len() =>
+            {
                 let targets = targets.as_slice().to_vec();
                 let parts = (0..targets.len())
                     .map(|index| super::ownership::project(&value, index))
@@ -509,11 +529,20 @@ impl<'a> Checker<'a> {
         self.binary_exprs(binary, current, value, span)
     }
 
-    fn assign(&mut self, target: &ast::Expr, op: AssignOp, value: &ast::Expr) -> Option<CheckedStmt> {
+    fn assign(
+        &mut self,
+        target: &ast::Expr,
+        op: AssignOp,
+        value: &ast::Expr,
+    ) -> Option<CheckedStmt> {
         match &target.kind {
             A::Tuple(places) => {
                 if op != AssignOp::Assign {
-                    self.error(DiagnosticRule::Type, target.span, "tuple assignment uses `=`");
+                    self.error(
+                        DiagnosticRule::Type,
+                        target.span,
+                        "tuple assignment uses `=`",
+                    );
                     return None;
                 }
                 let mut targets = Vec::new();
@@ -602,8 +631,12 @@ impl<'a> Checker<'a> {
                     CheckedPlace::Element { .. } => Destination::Install,
                     _ => Destination::Rebind,
                 };
-                let value =
-                    self.destination_value(&ty, value, destination, &format!("`{}` has type", name.name))?;
+                let value = self.destination_value(
+                    &ty,
+                    value,
+                    destination,
+                    &format!("`{}` has type", name.name),
+                )?;
                 let root = self.write_place(&place, target.span)?;
                 if let Err(error) = self.assignment_ownership(&place, &value) {
                     self.error(DiagnosticRule::Ownership, value.span, error);
@@ -714,7 +747,10 @@ impl<'a> Checker<'a> {
                         self.error(
                             DiagnosticRule::Type,
                             value.span,
-                            format!("cannot assign {shown} to an element of dtype {}", dtype.name()),
+                            format!(
+                                "cannot assign {shown} to an element of dtype {}",
+                                dtype.name()
+                            ),
                         );
                         return None;
                     }
@@ -770,7 +806,11 @@ impl<'a> Checker<'a> {
             }
             CheckedPlace::Element { root, .. } => {
                 if !self.writable_place(root) {
-                    self.error(DiagnosticRule::Ownership, span, "tensor place does not permit exclusive writes");
+                    self.error(
+                        DiagnosticRule::Ownership,
+                        span,
+                        "tensor place does not permit exclusive writes",
+                    );
                     return None;
                 }
                 self.write(root.local, root.local, span)
@@ -876,7 +916,9 @@ impl<'a> Checker<'a> {
                 id: crate::intrinsics::PrimitiveId::Binary(BinaryOp::And | BinaryOp::Or),
                 operands,
                 ..
-            } => operands.iter().all(|operand| self.uniform_condition(operand)),
+            } => operands
+                .iter()
+                .all(|operand| self.uniform_condition(operand)),
             CheckedExprKind::Primitive {
                 id: crate::intrinsics::PrimitiveId::Unary(UnaryOp::Not),
                 operands,
@@ -905,7 +947,12 @@ impl<'a> Checker<'a> {
         self.divergence.last().copied() == Some(0)
     }
 
-    fn if_stmt(&mut self, cond: &ast::Expr, then: &ast::Block, els: Option<&ast::Block>) -> Option<CheckedStmt> {
+    fn if_stmt(
+        &mut self,
+        cond: &ast::Expr,
+        then: &ast::Block,
+        els: Option<&ast::Block>,
+    ) -> Option<CheckedStmt> {
         let cond = self.expr(cond, Some(&ValueType::Scalar(DType::Bool)))?;
         match &cond.ty {
             ValueType::Scalar(DType::Bool) => {}
@@ -934,9 +981,11 @@ impl<'a> Checker<'a> {
                     return None;
                 }
                 let symbol = self.symbols.get(&id).copied().or_else(|| {
-                    symbols_before.get(&id).and_then(|value| match self.arena.view((*value).into()) {
-                        crate::expr::NodeView::Symbol(symbol) => Some(symbol),
-                        _ => None,
+                    symbols_before.get(&id).and_then(|value| {
+                        match self.arena.view((*value).into()) {
+                            crate::expr::NodeView::Symbol(symbol) => Some(symbol),
+                            _ => None,
+                        }
                     })
                 })?;
                 Some((id, symbol))
@@ -1051,7 +1100,12 @@ impl<'a> Checker<'a> {
                     Box::new(self.condition(&operands[1])),
                 ),
                 (
-                    BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge,
+                    BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge,
                     Some(l),
                     Some(r),
                 ) => Condition::Compare(*op, l, r),
@@ -1095,12 +1149,20 @@ impl<'a> Checker<'a> {
             return None;
         }
         let [target] = targets else {
-            self.error(DiagnosticRule::Type, iter.span, "a range binds exactly one name");
+            self.error(
+                DiagnosticRule::Type,
+                iter.span,
+                "a range binds exactly one name",
+            );
             return None;
         };
         let range = self.expr(iter, None)?;
         let ValueType::Range { bound } = range.ty.clone() else {
-            self.error(DiagnosticRule::Type, iter.span, "a range loop source is a `range[N]` value");
+            self.error(
+                DiagnosticRule::Type,
+                iter.span,
+                "a range loop source is a `range[N]` value",
+            );
             return None;
         };
         let (start, end, lo, hi, binder_bound) = match &range.kind {
@@ -1109,8 +1171,12 @@ impl<'a> Checker<'a> {
                 operands,
                 ..
             } if operands.len() == 2 => {
-                let lo = operands[0].sym.expect("a checked range endpoint has its symbol");
-                let hi = operands[1].sym.expect("a checked range endpoint has its symbol");
+                let lo = operands[0]
+                    .sym
+                    .expect("a checked range endpoint has its symbol");
+                let hi = operands[1]
+                    .sym
+                    .expect("a checked range endpoint has its symbol");
                 (operands[0].clone(), operands[1].clone(), lo, hi, hi)
             }
             _ => {
@@ -1321,7 +1387,11 @@ impl<'a> Checker<'a> {
             };
             for place in places {
                 if !returned_places.insert(place) {
-                    self.error(DiagnosticRule::Ownership, e.span, "owned tensor leaf is returned more than once");
+                    self.error(
+                        DiagnosticRule::Ownership,
+                        e.span,
+                        "owned tensor leaf is returned more than once",
+                    );
                     return None;
                 }
             }
@@ -1330,5 +1400,4 @@ impl<'a> Checker<'a> {
         }
         Some(result)
     }
-
 }

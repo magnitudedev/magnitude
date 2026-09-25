@@ -23,8 +23,8 @@ use seismic_ir::kernel::ops::{
 };
 use seismic_ir::kernel::{BlockId, Kernel};
 use seismic_ir::metal::MetalIntrinsic;
-use seismic_ir::storage::LaunchLocalKind;
 use seismic_ir::physical_target::KernelEmissionLayout;
+use seismic_ir::storage::LaunchLocalKind;
 use seismic_lang::intrinsics::{AtomicOp, MathOp, ReduceOp};
 use seismic_lang::registry::{
     CodeInterpretation, DecodeStep, FloatCodeFormat, PlaneEncoding, PlaneRepackRecipe, RepackExpr,
@@ -512,10 +512,9 @@ impl<'a> Renderer<'a> {
                                 RepresentationKind::External(layout) => {
                                     format!("(ulong({coord}) / {}ul)", layout.logical_group)
                                 }
-                                RepresentationKind::PackedRows(_) => panic!(
-                                    "{}",
-                                    seismic_lang::registry::ROW_LAYOUT_IS_NATIVE_ONLY
-                                ),
+                                RepresentationKind::PackedRows(_) => {
+                                    panic!("{}", seismic_lang::registry::ROW_LAYOUT_IS_NATIVE_ONLY)
+                                }
                             }
                         } else {
                             format!("ulong({coord})")
@@ -571,10 +570,9 @@ impl<'a> Renderer<'a> {
                                 RepresentationKind::External(layout) => {
                                     format!("(ulong({coord}) / {}ul)", layout.logical_group)
                                 }
-                                RepresentationKind::PackedRows(_) => panic!(
-                                    "{}",
-                                    seismic_lang::registry::ROW_LAYOUT_IS_NATIVE_ONLY
-                                ),
+                                RepresentationKind::PackedRows(_) => {
+                                    panic!("{}", seismic_lang::registry::ROW_LAYOUT_IS_NATIVE_ONLY)
+                                }
                                 RepresentationKind::Dense(_) => format!("ulong({coord})"),
                             }
                         } else {

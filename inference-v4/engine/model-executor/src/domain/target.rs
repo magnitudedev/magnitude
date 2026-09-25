@@ -363,7 +363,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             let advance = match (advance, source) {
                 (TentativeAdvance::Accepted(advance), None) => advance,
                 (TentativeAdvance::Successor(successor), Some(Some(state))) => {
-                    match successor.attach(state) {
+                    match successor.attach(state.into_state()) {
                         Ok(advance) => advance,
                         Err((state, error)) => {
                             self.target.insert(request, state);

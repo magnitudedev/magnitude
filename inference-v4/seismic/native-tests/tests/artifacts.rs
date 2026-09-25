@@ -41,7 +41,12 @@ impl RecordingStore {
 
 impl ArtifactStore for RecordingStore {
     fn get(&self, kind: ArtifactKind, key: &ArtifactKey) -> Option<Vec<u8>> {
-        let found = self.entries.lock().unwrap().get(&(kind, key.clone())).cloned();
+        let found = self
+            .entries
+            .lock()
+            .unwrap()
+            .get(&(kind, key.clone()))
+            .cloned();
         let mut counts = self.counts.lock().unwrap();
         counts.gets += 1;
         counts.hits += usize::from(found.is_some());
@@ -89,7 +94,10 @@ fn devices_of(backends: &[BackendName], store: &Arc<RecordingStore>) -> Vec<Devi
 }
 
 fn devices(store: &Arc<RecordingStore>) -> Vec<Device> {
-    devices_of(&[BackendName::Cpu, BackendName::Metal, BackendName::Cuda], store)
+    devices_of(
+        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
+        store,
+    )
 }
 
 /// Form and run the defaults of `split_sum` at N = 1000.
@@ -103,7 +111,9 @@ fn form_and_run(device: &Device) {
         .expect("statics");
     let kernel = split_sum::native_for_device(device, &defaults)
         .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
-    let bytes = (0..n).flat_map(|_| 1.0f32.to_le_bytes()).collect::<Vec<_>>();
+    let bytes = (0..n)
+        .flat_map(|_| 1.0f32.to_le_bytes())
+        .collect::<Vec<_>>();
     let x = Tensor::from_host(device, Element::f32(), &[n], &bytes).expect("host tensor");
     let sum = kernel.call(split_sum::Args { x: &x }).expect("call").value;
     let sum = f32::from_le_bytes(sum.read_to_host().expect("read")[..4].try_into().unwrap());
@@ -113,7 +123,10 @@ fn form_and_run(device: &Device) {
 #[test]
 fn cuda_images_are_kept_in_the_embedders_store_and_a_refused_image_is_a_miss() {
     let store = Arc::new(RecordingStore::default());
-    let backends = devices(&store).iter().map(Device::backend).collect::<Vec<_>>();
+    let backends = devices(&store)
+        .iter()
+        .map(Device::backend)
+        .collect::<Vec<_>>();
     let cuda = backends.contains(&BackendName::Cuda);
 
     // First formation: a miss, formed by NVRTC and stored.
@@ -122,24 +135,49 @@ fn cuda_images_are_kept_in_the_embedders_store_and_a_refused_image_is_a_miss() {
     }
     let first = store.counts();
     if !cuda {
-        assert_eq!(first, Counts::default(), "only CUDA formation uses the store");
+        assert_eq!(
+            first,
+            Counts::default(),
+            "only CUDA formation uses the store"
+        );
         return;
     }
-    assert_eq!(first, Counts { gets: 1, hits: 0, puts: 1 });
+    assert_eq!(
+        first,
+        Counts {
+            gets: 1,
+            hits: 0,
+            puts: 1
+        }
+    );
 
     // A fresh device forms the same source and formation: the stored image
     // is loaded and NVRTC does not run (nothing is stored again).
     for device in devices(&store) {
         form_and_run(&device);
     }
-    assert_eq!(store.counts(), Counts { gets: 2, hits: 1, puts: 1 });
+    assert_eq!(
+        store.counts(),
+        Counts {
+            gets: 2,
+            hits: 1,
+            puts: 1
+        }
+    );
 
     // A stored image the driver refuses is a miss: formed and stored again.
     store.corrupt();
     for device in devices(&store) {
         form_and_run(&device);
     }
-    assert_eq!(store.counts(), Counts { gets: 3, hits: 2, puts: 2 });
+    assert_eq!(
+        store.counts(),
+        Counts {
+            gets: 3,
+            hits: 2,
+            puts: 2
+        }
+    );
 }
 
 /// Vulkan keeps each launch's sealed SPIR-V (two launches of `split_sum`);
@@ -153,14 +191,35 @@ fn spirv_modules_are_kept_in_the_embedders_store_and_an_invalid_module_is_a_miss
     for device in devices_of(&[BackendName::Vulkan], &store) {
         form_and_run(&device);
     }
-    assert_eq!(store.counts(), Counts { gets: 2, hits: 0, puts: 2 });
+    assert_eq!(
+        store.counts(),
+        Counts {
+            gets: 2,
+            hits: 0,
+            puts: 2
+        }
+    );
     for device in devices_of(&[BackendName::Vulkan], &store) {
         form_and_run(&device);
     }
-    assert_eq!(store.counts(), Counts { gets: 4, hits: 2, puts: 2 });
+    assert_eq!(
+        store.counts(),
+        Counts {
+            gets: 4,
+            hits: 2,
+            puts: 2
+        }
+    );
     store.corrupt();
     for device in devices_of(&[BackendName::Vulkan], &store) {
         form_and_run(&device);
     }
-    assert_eq!(store.counts(), Counts { gets: 6, hits: 4, puts: 4 });
+    assert_eq!(
+        store.counts(),
+        Counts {
+            gets: 6,
+            hits: 4,
+            puts: 4
+        }
+    );
 }

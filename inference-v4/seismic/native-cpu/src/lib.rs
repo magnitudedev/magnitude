@@ -36,10 +36,10 @@ pub use weights::RowGeometry;
 #[cfg(target_arch = "aarch64")]
 pub use isa::Neon;
 #[cfg(target_arch = "x86_64")]
-pub use isa::{X86V2, X86V3, X86V4, X86V4Vnni};
+pub use isa::{X86V4Vnni, X86V2, X86V3, X86V4};
 
 /// The version of this library, part of every CPU implementation digest.
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+cpu-library-1");
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+cpu-library-2");
 
 /// A bound weight operand: a tensor of a weight representation whose rows
 /// are read through its resolved components.
@@ -74,7 +74,9 @@ impl<'a> Weights<'a> {
             base,
             rows,
             k,
-            geometry: RowGeometry { base: base as usize, matrix_rows: rows.max(1), ..kernels.geometry(k, dense_stride) },
+            geometry: kernels
+                .geometry(k, dense_stride)
+                .with_base(base, rows.max(1)),
             kernels,
             life: std::marker::PhantomData,
         }
@@ -99,7 +101,11 @@ impl<'a> Weights<'a> {
         let dense_stride = if kernels.dense_bytes == 0 {
             0
         } else {
-            assert_eq!(strides[rank - 1], 1, "a dense weight operand has contiguous rows");
+            assert_eq!(
+                strides[rank - 1],
+                1,
+                "a dense weight operand has contiguous rows"
+            );
             for axis in 0..rank.saturating_sub(2) {
                 assert_eq!(
                     strides[axis],
@@ -114,7 +120,11 @@ impl<'a> Weights<'a> {
             }
         };
         let mut view = unsafe { Self::from_raw(base, rows.max(1), k, dense_stride, kernels) };
-        view.geometry.matrix_rows = if rank >= 2 { extents[rank - 2] as usize } else { 1 };
+        view.geometry.matrix_rows = if rank >= 2 {
+            extents[rank - 2] as usize
+        } else {
+            1
+        };
         view
     }
 
@@ -136,17 +146,36 @@ impl<'a> Weights<'a> {
     pub fn decode_row(&self, row: usize, out: &mut [f32]) {
         assert!(row < self.rows, "row {row} of {}", self.rows);
         // SAFETY: the row lies inside the operand (`from_raw`).
-        unsafe { self.kernels.decode(self.base.add(row * self.geometry.stride), &self.geometry, self.k, out) }
+        unsafe {
+            self.kernels.decode(
+                self.base.add(row * self.geometry.stride),
+                &self.geometry,
+                self.k,
+                out,
+            )
+        }
     }
 
     /// `out[r] = (row first + r) · x` for a block of `out.len()` rows (1, 2,
     /// 4 or 8): one component call across the whole row.
     #[inline(always)]
     pub fn dot(&self, first: usize, x: &[f32], out: &mut [f32]) {
-        assert!(first + out.len() <= self.rows, "rows {first}..{} of {}", first + out.len(), self.rows);
+        assert!(
+            first + out.len() <= self.rows,
+            "rows {first}..{} of {}",
+            first + out.len(),
+            self.rows
+        );
         assert_eq!(x.len(), self.k, "activation length");
         // SAFETY: the block lies inside the operand (`from_raw`).
-        unsafe { self.kernels.dot(self.base.add(first * self.geometry.stride), &self.geometry, x, out) }
+        unsafe {
+            self.kernels.dot(
+                self.base.add(first * self.geometry.stride),
+                &self.geometry,
+                x,
+                out,
+            )
+        }
     }
 
     /// Four quantized activation rows by eight weight rows.
@@ -154,15 +183,36 @@ impl<'a> Weights<'a> {
     pub fn gemm_q8(&self, first: usize, x: &[quant::Q8Block], out: &mut [f32; 32]) {
         assert!(first + 8 <= self.rows);
         // SAFETY: the eight rows lie inside the operand.
-        unsafe { self.kernels.gemm_q8(self.base.add(first * self.geometry.stride), &self.geometry, x, self.k, out) }
+        unsafe {
+            self.kernels.gemm_q8(
+                self.base.add(first * self.geometry.stride),
+                &self.geometry,
+                x,
+                self.k,
+                out,
+            )
+        }
     }
 
     /// As [`Weights::dot`], against an activation row quantized into `x`
     /// (`quant::blocks(k)` blocks, see [`quant`]).
     #[inline(always)]
     pub fn dot_q8(&self, first: usize, x: &[quant::Q8Block], out: &mut [f32]) {
-        assert!(first + out.len() <= self.rows, "rows {first}..{} of {}", first + out.len(), self.rows);
+        assert!(
+            first + out.len() <= self.rows,
+            "rows {first}..{} of {}",
+            first + out.len(),
+            self.rows
+        );
         // SAFETY: the block lies inside the operand (`from_raw`).
-        unsafe { self.kernels.dot_q8(self.base.add(first * self.geometry.stride), &self.geometry, x, self.k, out) }
+        unsafe {
+            self.kernels.dot_q8(
+                self.base.add(first * self.geometry.stride),
+                &self.geometry,
+                x,
+                self.k,
+                out,
+            )
+        }
     }
 }

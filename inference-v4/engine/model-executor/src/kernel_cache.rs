@@ -41,7 +41,10 @@ const DIRECTORIES: [&str; 3] = [CUDA, VULKAN, TUNING];
 #[derive(Debug)]
 pub enum KernelCacheError {
     /// The cache directory could not be created.
-    Create { path: PathBuf, error: std::io::Error },
+    Create {
+        path: PathBuf,
+        error: std::io::Error,
+    },
 }
 
 impl std::fmt::Display for KernelCacheError {
@@ -123,7 +126,9 @@ impl KernelCache {
         let directory = path.parent().expect("cache entries live in a directory");
         let temporary = directory.join(format!(
             ".{}.{}.{}.tmp",
-            path.file_name().expect("cache entries have names").to_string_lossy(),
+            path.file_name()
+                .expect("cache entries have names")
+                .to_string_lossy(),
             std::process::id(),
             self.writes.fetch_add(1, Ordering::Relaxed)
         ));
@@ -219,7 +224,11 @@ mod tests {
         let root = scratch("corrupt");
         let cache = KernelCache::open(root.clone(), DEFAULT_KERNEL_CACHE_BYTES).unwrap();
         let key = TuningCacheKey::of("material");
-        fs::write(root.join(TUNING).join(format!("{}.json", key.as_str())), b"{ not json").unwrap();
+        fs::write(
+            root.join(TUNING).join(format!("{}.json", key.as_str())),
+            b"{ not json",
+        )
+        .unwrap();
         assert!(cache.tuning(&key).is_none());
         let path = cache.entry(TUNING, key.as_str(), "json");
         cache.write(&path, b"rewritten");
@@ -242,7 +251,8 @@ mod tests {
         cache.write(&old, &[0; 600]);
         cache.write(&recent, &[0; 600]);
         let file = fs::File::options().write(true).open(&old).unwrap();
-        file.set_modified(SystemTime::now() - Duration::from_secs(3600)).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
         drop(KernelCache::open(root.clone(), 1000).unwrap());
         assert!(!old.exists());
         assert!(recent.exists());

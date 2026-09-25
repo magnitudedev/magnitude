@@ -81,20 +81,7 @@ impl Printer {
                 }
                 if !n.params.is_empty() {
                     self.indent();
-                    self.out.push_str("params (");
-                    self.list(&n.params, |p, param| {
-                        if param.arithmetic {
-                            p.out.push_str("arithmetic ");
-                        }
-                        let values = param
-                            .values
-                            .iter()
-                            .map(u64::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let _ = write!(p.out, "{} in [{values}]", param.name.name);
-                    });
-                    self.out.push_str(")\n");
+                    self.native_params(&n.params);
                 }
                 if !n.elements.is_empty() {
                     self.indent();
@@ -132,6 +119,16 @@ impl Printer {
                     }
                     self.out.push_str(":\n");
                     self.level += 1;
+                    if !launch.params.is_empty() {
+                        self.indent();
+                        self.native_params(&launch.params);
+                    }
+                    if !launch.reads.is_empty() {
+                        self.indent();
+                        self.out.push_str("reads (");
+                        self.list(&launch.reads, |p, name| p.out.push_str(&name.name));
+                        self.out.push_str(")\n");
+                    }
                     self.indent();
                     self.out.push_str("threadgroups (");
                     self.list(&launch.threadgroups, |p, expr| p.expr(expr, 0));
@@ -151,6 +148,26 @@ impl Printer {
                 self.level -= 1;
             }
         }
+    }
+
+    fn native_params(&mut self, params: &[NativeParamDecl]) {
+        self.out.push_str("params (");
+        self.list(params, |p, param| {
+            if param.code {
+                p.out.push_str("code ");
+            }
+            if param.arithmetic {
+                p.out.push_str("arithmetic ");
+            }
+            let values = param
+                .values
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(p.out, "{} in [{values}]", param.name.name);
+        });
+        self.out.push_str(")\n");
     }
 
     fn signature(&mut self, s: &Signature) {

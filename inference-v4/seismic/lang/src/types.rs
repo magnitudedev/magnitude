@@ -345,13 +345,27 @@ mod tests {
         let (n, n_expr) = arena.template_dimension(0);
         let one = arena.int(1);
         let shorter = arena.int_sub(n_expr, one);
-        let name = |symbol: SymbolId| if symbol == n { "N".to_string() } else { format!("{symbol:?}") };
+        let name = |symbol: SymbolId| {
+            if symbol == n {
+                "N".to_string()
+            } else {
+                format!("{symbol:?}")
+            }
+        };
         let tensor = |axis| ValueType::Tensor(TensorType::new(vec![axis], Elem::Dtype(DType::F32)));
-        assert_eq!(tensor(n_expr).with_shapes(&arena, &name).to_string(), "tensor[N] f32");
-        // Extents print in the prover's normal form, as every shape diagnostic does.
-        assert_eq!(tensor(shorter).with_shapes(&arena, &name).to_string(), "tensor[-1 + N] f32");
         assert_eq!(
-            ValueType::Index { bound: n_expr }.with_shapes(&arena, &name).to_string(),
+            tensor(n_expr).with_shapes(&arena, &name).to_string(),
+            "tensor[N] f32"
+        );
+        // Extents print in the prover's normal form, as every shape diagnostic does.
+        assert_eq!(
+            tensor(shorter).with_shapes(&arena, &name).to_string(),
+            "tensor[-1 + N] f32"
+        );
+        assert_eq!(
+            ValueType::Index { bound: n_expr }
+                .with_shapes(&arena, &name)
+                .to_string(),
             "index[N]"
         );
         assert_eq!(tensor(shorter).to_string(), "tensor[_] f32");

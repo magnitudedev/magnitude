@@ -3,14 +3,17 @@
 use magnitude_engine::{
     chat::CacheLimits,
     composition::{EngineConfiguration, MediaSourcePolicy},
-    options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, StoragePolicy},
+    options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection},
     service::ServiceLimits,
     serving::Config as ServerConfig,
     telemetry::{Telemetry, DEFAULT_TRACES_ENDPOINT},
 };
 use magnitude_model_executor::{platform::DeviceRequest, ExecutionPath};
 use magnitude_model_state::KvCodec;
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 struct Options {
     target: PathBuf,
@@ -19,7 +22,6 @@ struct Options {
     port: u16,
     served_model: String,
     context_tokens: Option<usize>,
-    storage_bytes: u64,
     max_batch: usize,
     output_capacity: usize,
     method: ModelMethod,
@@ -52,7 +54,6 @@ fn parse() -> Result<Options, String> {
     let mut port = 8080;
     let mut served_model = None;
     let mut context_tokens = None;
-    let mut storage_gib = 28_u64;
     let mut max_batch = 1_usize;
     let mut output_capacity = 256_usize;
     let mut method = ModelMethod::Auto;
@@ -83,11 +84,6 @@ fn parse() -> Result<Options, String> {
                         .parse()
                         .map_err(|e| format!("{e}"))?,
                 )
-            }
-            "--storage-gib" => {
-                storage_gib = value(&flag, &mut args)?
-                    .parse()
-                    .map_err(|e| format!("{e}"))?
             }
             "--max-batch" => {
                 max_batch = value(&flag, &mut args)?
@@ -126,7 +122,7 @@ fn parse() -> Result<Options, String> {
             "--help" | "-h" => {
                 println!(
                     "magnitude-engine --model TARGET.gguf [--projector PROJECTOR.gguf | --no-projector] \
-                     [--host ADDR] [--port N] [--served-model NAME] [--context-tokens N] [--storage-gib N] \
+                     [--host ADDR] [--port N] [--served-model NAME] [--context-tokens N] \
                      [--max-batch N] [--output-capacity N] [--method auto|plain|mtp] \
                      [--mtp-proposals N] [--kv-codec dense|affine-k8v4] [--lookahead on|off] \
                      [--telemetry URL] \
@@ -144,11 +140,8 @@ fn parse() -> Result<Options, String> {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "qwen".to_owned())
     });
-    let storage_bytes = storage_gib
-        .checked_mul(1_u64 << 30)
-        .ok_or("storage budget exceeds u64")?;
-    if storage_bytes == 0 || context_tokens == Some(0) || max_batch == 0 || output_capacity == 0 {
-        return Err("storage, context, max batch, and output capacity must be positive".into());
+    if context_tokens == Some(0) || max_batch == 0 || output_capacity == 0 {
+        return Err("context, max batch, and output capacity must be positive".into());
     }
     Ok(Options {
         target,
@@ -157,7 +150,6 @@ fn parse() -> Result<Options, String> {
         port,
         served_model,
         context_tokens,
-        storage_bytes,
         max_batch,
         output_capacity,
         method,
@@ -178,6 +170,7 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    let load_started = Instant::now();
     let options = parse()?;
     let _telemetry = Telemetry::open(&options.telemetry_endpoint);
     let service = ServiceLimits {
@@ -188,7 +181,6 @@ fn run() -> Result<(), String> {
         decode_share: 0.5,
         locality_seconds: 1.0,
     };
-    let safety_reserve_bytes = (options.storage_bytes / 10).min(1_u64 << 30);
     let resolved = EngineConfiguration {
         package: PackageOptions {
             target: options.target,
@@ -202,24 +194,29 @@ fn run() -> Result<(), String> {
         },
         context_tokens: options.context_tokens,
         service,
-        storage: StoragePolicy {
-            storage_bytes: options.storage_bytes,
-            retention_bytes: None,
-            safety_reserve_bytes,
-        },
         path: ExecutionPath::Native,
         device: options.device,
         control_capacity: 256,
         kernel_cache: options.kernel_cache,
     }
     .resolve()?;
+    eprintln!(
+        "magnitude-engine: host admission in {:.2} s",
+        load_started.elapsed().as_secs_f64()
+    );
     let context_tokens = usize::try_from(resolved.artifacts.definition().geometry.context_limit)
         .map_err(|_| "model context limit exceeds host domain")?;
     let vocabulary = usize::try_from(resolved.artifacts.definition().geometry.vocabulary)
         .map_err(|_| "model vocabulary exceeds host domain")?;
     let method = resolved.manifest.model.method.policy();
+    let worker_started = Instant::now();
     let ready = resolved.start()?;
+    eprintln!(
+        "magnitude-engine: worker readiness in {:.2} s",
+        worker_started.elapsed().as_secs_f64()
+    );
     let backend = ready.ready_info().backend;
+    let host_started = Instant::now();
     let server = ready.into_server(
         MediaSourcePolicy::data_urls_only(),
         CacheLimits {
@@ -241,6 +238,10 @@ fn run() -> Result<(), String> {
             request_timeout: Duration::from_secs(900),
         },
     )?;
+    eprintln!(
+        "magnitude-engine: host serving setup in {:.2} s",
+        host_started.elapsed().as_secs_f64()
+    );
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -260,6 +261,7 @@ fn run() -> Result<(), String> {
             options.max_batch
         );
         eprintln!("magnitude-engine: serving http://{address}/v1/chat/completions");
+        eprintln!("magnitude-engine: load to serving in {:.2} s", load_started.elapsed().as_secs_f64());
         server.serve(listener, std::future::pending::<()>()).await
     }))
 }

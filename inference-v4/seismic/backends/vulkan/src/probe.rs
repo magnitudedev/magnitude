@@ -33,8 +33,16 @@ layout(buffer_reference, scalar, buffer_reference_align = 4) buffer bits_t { uin
 
 /// Form `probe` of `body` with `threads` invocations in one group, run it
 /// over `input` words, and read `outputs` words written after them.
-fn run(device: &Device, body: &str, threads: u32, input: &[u32], outputs: usize) -> Result<Vec<u32>, OpenError> {
-    let failed = |error: &dyn std::fmt::Display| OpenError::Creation(format!("a numerical probe failed: {error}"));
+fn run(
+    device: &Device,
+    body: &str,
+    threads: u32,
+    input: &[u32],
+    outputs: usize,
+) -> Result<Vec<u32>, OpenError> {
+    let failed = |error: &dyn std::fmt::Display| {
+        OpenError::Creation(format!("a numerical probe failed: {error}"))
+    };
     let source = format!("{PRELUDE}{body}\nvoid main() {{\n    SEISMIC_KERNEL();\n}}\n");
     let module = DirectModule::form(
         device,
@@ -50,8 +58,13 @@ fn run(device: &Device, body: &str, threads: u32, input: &[u32], outputs: usize)
     .map_err(|error| failed(&format!("{error:?}")))?;
     let bytes = ((input.len() + outputs) * 4) as u64;
     let values = device.allocate(bytes, 16).map_err(|error| failed(&error))?;
-    let input_bytes = input.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
-    device.write(&values, 0, &input_bytes).map_err(|error| failed(&error))?;
+    let input_bytes = input
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    device
+        .write(&values, 0, &input_bytes)
+        .map_err(|error| failed(&error))?;
     let mut batch = DirectBatch::new(device).map_err(|error| failed(&error))?;
     batch
         .launch(&DirectLaunch {
@@ -150,7 +163,11 @@ fn nearest_even([a, b, n]: [u32; 3]) -> [(Rounded, u32); 4] {
 }
 
 pub(crate) fn rounding(device: &Device) -> Result<(), OpenError> {
-    let input = ROUNDING_WITNESSES.iter().flatten().copied().collect::<Vec<_>>();
+    let input = ROUNDING_WITNESSES
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
     let results = run(device, ROUNDING, 32, &input, 4 * ROUNDING_WITNESSES.len())?;
     for (witness, actual) in ROUNDING_WITNESSES.iter().zip(results.chunks_exact(4)) {
         for ((operation, expected), actual) in nearest_even(*witness).into_iter().zip(actual) {
@@ -184,7 +201,10 @@ mod tests {
         };
         let mut distinguishing = 0;
         for witness in ROUNDING_WITNESSES {
-            let (a, b) = (f64::from(f32::from_bits(witness[0])), f64::from(f32::from_bits(witness[1])));
+            let (a, b) = (
+                f64::from(f32::from_bits(witness[0])),
+                f64::from(f32::from_bits(witness[1])),
+            );
             let n = witness[2];
             for (exact, (_, expected)) in [a + b, a * b, f64::from(n as i32), f64::from(n)]
                 .into_iter()
@@ -195,6 +215,9 @@ mod tests {
                 }
             }
         }
-        assert!(distinguishing >= 10, "{distinguishing} results tell nearest-even from truncation");
+        assert!(
+            distinguishing >= 10,
+            "{distinguishing} results tell nearest-even from truncation"
+        );
     }
 }

@@ -3,12 +3,13 @@
 //! Every entry is one checkpoint on a token path: the interpreted tokens up to
 //! its position and the media identities conditioned before it. Entries on
 //! one path share their physical prefix (the state store references rows,
-//! not copies), so the retention budget prices the whole retained set by the
-//! bytes it alone holds: a shared prefix is charged once, and not at all
+//! not copies), so the meter prices the whole retained set by the bytes it
+//! alone holds: a shared prefix is charged once, and not at all
 //! while a live request still shares it.
-use magnitude_artifacts::{InputLayout, PackageIdentity, TokenId};
 use magnitude_generation::MethodCheckpoint;
-use magnitude_model_contracts::{PreparedModelInput, TokenPlan};
+use magnitude_model_contracts::{
+    InputLayout, PackageIdentity, PreparedModelInput, TokenId, TokenPlan,
+};
 use magnitude_model_executor::ResourcePlan;
 use magnitude_model_state::CodecIdentity;
 use std::sync::Arc;
@@ -22,21 +23,16 @@ pub const MIN_BRANCH_GAIN: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetentionCapacity {
-    pub max_bytes: u64,
     pub max_entries: usize,
 }
 
 impl RetentionCapacity {
     pub const fn disabled() -> Self {
-        Self {
-            max_bytes: 0,
-            max_entries: 0,
-        }
+        Self { max_entries: 0 }
     }
 
     pub fn from_resource_plan(plan: &ResourcePlan) -> Self {
         Self {
-            max_bytes: plan.retention_budget_bytes(),
             max_entries: plan.capacity().retention_entries,
         }
     }
@@ -216,10 +212,6 @@ impl<C> Retention<C> {
         }
     }
 
-    pub const fn budget_bytes(&self) -> u64 {
-        self.capacity.max_bytes
-    }
-
     pub const fn max_entries(&self) -> usize {
         self.capacity.max_entries
     }
@@ -317,7 +309,7 @@ impl<C> Retention<C> {
             return Err("retained state is not on its request's interpreted input".into());
         }
         let conditioning = request.conditioning_at(position)?.to_vec();
-        if self.capacity.max_bytes == 0 || self.capacity.max_entries == 0 {
+        if self.capacity.max_entries == 0 {
             return Ok(false);
         }
         if let Some(existing) = self.entries.iter().position(|entry| {
@@ -346,8 +338,7 @@ impl<C> Retention<C> {
         });
         loop {
             let charged = self.measure(&meter)?;
-            if charged <= self.capacity.max_bytes && self.entries.len() <= self.capacity.max_entries
-            {
+            if self.entries.len() <= self.capacity.max_entries {
                 self.charged = charged;
                 return Ok(true);
             }
@@ -408,24 +399,20 @@ impl<C> Retention<C> {
     }
 
     /// Re-price the retained set after its sharers changed (a live request
-    /// that shared a retained prefix ended, so the set alone now holds it) and
-    /// evict least-recently-used entries until it fits the budget again.
-    pub fn enforce_budget(
+    /// that shared a retained prefix ended, so the set alone now holds it).
+    pub fn refresh_charge(
         &mut self,
         meter: impl Fn(&[&C]) -> Result<u64, String>,
     ) -> Result<(), String> {
-        loop {
-            self.charged = self.measure(&meter)?;
-            if self.charged <= self.capacity.max_bytes
-                || self.evict_one_except(None, &meter)?.is_none()
-            {
-                return Ok(());
-            }
-        }
+        self.charged = self.measure(&meter)?;
+        Ok(())
     }
 
     /// Release every entry without submitted uses.
-    pub fn evict_all(&mut self, meter: impl Fn(&[&C]) -> Result<u64, String>) -> Result<u64, String> {
+    pub fn evict_all(
+        &mut self,
+        meter: impl Fn(&[&C]) -> Result<u64, String>,
+    ) -> Result<u64, String> {
         let mut released = 0u64;
         while let Some(bytes) = self.evict_one_except(None, &meter)? {
             released = released.saturating_add(bytes);
@@ -462,11 +449,13 @@ impl<C> Retention<C> {
             .iter()
             .map(|entry| &entry.checkpoint)
             .collect::<Vec<_>>();
-        self.entries.iter().try_fold(meter(&checkpoints)?, |total, entry| {
-            total
-                .checked_add(entry.method.retained_bytes())
-                .ok_or_else(|| "retention charge overflow".to_owned())
-        })
+        self.entries
+            .iter()
+            .try_fold(meter(&checkpoints)?, |total, entry| {
+                total
+                    .checked_add(entry.method.retained_bytes())
+                    .ok_or_else(|| "retention charge overflow".to_owned())
+            })
     }
 
     fn tick(&mut self) -> Result<u64, String> {
@@ -481,14 +470,11 @@ impl<C> Retention<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magnitude_artifacts::{BoundaryRule, InputLayout, InputSpan};
+    use magnitude_model_contracts::{ArtifactIdentity, BoundaryRule, InputLayout, InputSpan};
     use std::collections::{BTreeMap, BTreeSet};
 
-    const fn capacity(max_bytes: u64, max_entries: usize) -> RetentionCapacity {
-        RetentionCapacity {
-            max_bytes,
-            max_entries,
-        }
+    const fn capacity(max_entries: usize) -> RetentionCapacity {
+        RetentionCapacity { max_entries }
     }
 
     thread_local! {
@@ -579,7 +565,7 @@ mod tests {
     fn key() -> RetentionKey {
         RetentionKey::new(
             PackageIdentity {
-                target: magnitude_artifacts::ArtifactIdentity([1; 32]),
+                target: ArtifactIdentity([1; 32]),
                 projector: None,
             },
             TokenizerIdentity::new("tokenizer").unwrap(),
@@ -613,7 +599,7 @@ mod tests {
         RetentionRequest::from_token_plan(
             RetentionKey::new(
                 PackageIdentity {
-                    target: magnitude_artifacts::ArtifactIdentity([artifact; 32]),
+                    target: ArtifactIdentity([artifact; 32]),
                     projector: None,
                 },
                 TokenizerIdentity::new("tokenizer").unwrap(),
@@ -664,7 +650,7 @@ mod tests {
 
     #[test]
     fn index_selects_the_deepest_prefix_entry_and_enforces_minimum_hit() {
-        let mut retention = Retention::new(capacity(1_000, 8));
+        let mut retention = Retention::new(capacity(8));
         let target = text_request(96, "artifact");
         assert!(retain(&mut retention, &target, 63, rows(0..63)));
         assert!(retain(&mut retention, &target, 64, rows(0..64)));
@@ -684,7 +670,10 @@ mod tests {
         // A resumed request must compute the row it samples from: only
         // entries below the bound are hits.
         let below = |retention: &mut Retention<_>, before| {
-            retention.lookup(&target, before).unwrap().map(|hit| hit.position())
+            retention
+                .lookup(&target, before)
+                .unwrap()
+                .map(|hit| hit.position())
         };
         assert_eq!(below(&mut retention, 81), Some(80));
         assert_eq!(below(&mut retention, 80), Some(64));
@@ -696,9 +685,15 @@ mod tests {
         let source = text_request(64, "artifact");
         let mut terminal = source.tokens.clone();
         terminal.extend((64..72).map(TokenId));
-        let mut retention = Retention::new(capacity(1_000, 8));
+        let mut retention = Retention::new(capacity(8));
         assert!(retention
-            .retain(&source, terminal, rows(0..72), MethodCheckpoint::Plain, meter)
+            .retain(
+                &source,
+                terminal,
+                rows(0..72),
+                MethodCheckpoint::Plain,
+                meter
+            )
             .unwrap());
 
         let target = text_request(80, "artifact");
@@ -712,7 +707,7 @@ mod tests {
     /// a request shares a path that has no checkpoint at the divergence.
     #[test]
     fn divergent_requests_share_the_deepest_common_checkpoint() {
-        let mut retention = Retention::new(capacity(10_000, 8));
+        let mut retention = Retention::new(capacity(8));
         let first = chat(200, 1, 260);
         // First turn ended; only its prompt end and terminal are retained.
         assert!(retain(&mut retention, &first, 260, rows(0..260)));
@@ -730,7 +725,7 @@ mod tests {
 
     #[test]
     fn identical_paths_are_retained_once() {
-        let mut retention = Retention::new(capacity(1_000, 8));
+        let mut retention = Retention::new(capacity(8));
         let request = text_request(100, "artifact");
         assert!(retain(&mut retention, &request, 100, rows(0..100)));
         assert!(!retain(&mut retention, &request, 100, rows(500..600)));
@@ -759,7 +754,7 @@ mod tests {
             RetentionRequest::from_token_plan(key(), &plan).unwrap()
         };
         let source = conditioned("source");
-        let mut retention = Retention::new(capacity(1_000, 8));
+        let mut retention = Retention::new(capacity(8));
         assert!(retain(&mut retention, &source, 80, rows(0..80)));
 
         let changed = conditioned("changed");
@@ -770,8 +765,8 @@ mod tests {
     }
 
     #[test]
-    fn budget_evicts_oldest_use_and_never_evicts_submitted_entries() {
-        let mut retention = Retention::new(capacity(128, 8));
+    fn entry_limit_evicts_oldest_use_and_never_evicts_submitted_entries() {
+        let mut retention = Retention::new(capacity(2));
         let first = text_request(64, "first");
         let second = text_request(64, "second");
         let third = text_request(64, "third");
@@ -790,12 +785,17 @@ mod tests {
     }
 
     #[test]
-    fn a_shared_path_fits_a_budget_its_entries_would_exceed_separately() {
-        // Three checkpoints on one 100-row path cost 100 rows, not 300.
-        let mut retention = Retention::new(capacity(100, 8));
+    fn a_shared_path_is_metered_once() {
+        // Three checkpoints on one 100-row path hold 100 rows, not 300.
+        let mut retention = Retention::new(capacity(8));
         let path = text_request(100, "artifact");
         for position in [64, 80, 100] {
-            assert!(retain(&mut retention, &path, position, rows(0..position as u32)));
+            assert!(retain(
+                &mut retention,
+                &path,
+                position,
+                rows(0..position as u32)
+            ));
         }
         assert_eq!(retention.len(), 3);
         assert_eq!(retention.charged_bytes(), 100);
@@ -805,8 +805,8 @@ mod tests {
     }
 
     #[test]
-    fn numerical_entry_capacity_evicts_even_when_byte_budget_has_room() {
-        let mut retention = Retention::new(capacity(1_000, 2));
+    fn numerical_entry_capacity_evicts() {
+        let mut retention = Retention::new(capacity(2));
         let first = text_request(64, "first");
         let second = text_request(64, "second");
         let third = text_request(64, "third");
@@ -822,7 +822,7 @@ mod tests {
 
     #[test]
     fn submitted_entries_can_block_count_capacity_without_overcommit() {
-        let mut retention = Retention::new(capacity(1_000, 1));
+        let mut retention = Retention::new(capacity(1));
         let first = text_request(64, "first");
         let second = text_request(64, "second");
         assert!(retain(&mut retention, &first, 64, rows(0..1)));

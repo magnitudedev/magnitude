@@ -8,8 +8,13 @@ applies_to:
 
 # Model input boundary
 
-Artifact preparation owns package and payload identity, decoding, and bounded generic media. It
-does not assign model-family coordinates or position-table interpolation. A family adapter consumes
+Artifact preparation owns process-local package identity, payload interpretation,
+decoding, and bounded generic media. It may inspect a bounded header bundle
+before weight payloads exist; this validates
+metadata, tensor geometry, and declared non-overlapping ranges without claiming
+that the payloads are present. Executable package admission requires the full
+payload ranges. Artifact preparation does not assign model-family coordinates or
+position-table interpolation. A family adapter consumes
 the model definition, token plan, and generic prepared media to create one closed numerical input
 contract. The contract contains the final token coordinates, media spans, patch order, attention
 coordinates, and position-encoding interpolation indices and coefficients needed by execution.

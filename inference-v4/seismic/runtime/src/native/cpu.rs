@@ -53,7 +53,12 @@ pub struct CpuNativeKernels {
 impl CpuNativeKernels {
     /// The function of launch `launch` for `tier` and the dense element
     /// binding `elements`.
-    pub(crate) fn function(&self, launch: usize, tier: Tier, elements: &[&str]) -> Option<CpuKernelFn> {
+    pub(crate) fn function(
+        &self,
+        launch: usize,
+        tier: Tier,
+        elements: &[&str],
+    ) -> Option<CpuKernelFn> {
         self.launches
             .get(launch)?
             .variants
@@ -172,7 +177,13 @@ impl NativeSteps for Steps<'_> {
         let [x, y, _] = step.invocation.groups;
         // SAFETY: the route selected the function for a tier the device has
         // (`CpuRoute::tier`, validated at preparation).
-        unsafe { (step.function)(&step.invocation, [item % x, (item / x) % y, item / (x * y)], shared) };
+        unsafe {
+            (step.function)(
+                &step.invocation,
+                [item % x, (item / x) % y, item / (x * y)],
+                shared,
+            )
+        };
     }
 }
 
@@ -224,12 +235,9 @@ fn calls<'l>(
             // allocations (checked when the views were formed).
             unsafe { base.add(*offset as usize) }
         }));
-        weights.extend(
-            dispatch
-                .representations
-                .iter()
-                .map(|representation| seismic_native_cpu::components::resolve(route.tier, representation)),
-        );
+        weights.extend(dispatch.representations.iter().map(|representation| {
+            seismic_native_cpu::components::resolve(route.tier, representation)
+        }));
         let scalars = typed_buffer::<Cpu, Executor>(&dispatch.kernel.scalars)
             .data_pointer()
             .cast::<u64>();
@@ -250,12 +258,19 @@ fn steps<'a>(
         let NativeRoute::Cpu(route) = &dispatch.kernel.route else {
             unreachable!("one device has one native route");
         };
-        for ((function, workers), launch) in route.launches.iter().zip(&route.workers).zip(dispatch.launches) {
+        for ((function, workers), launch) in route
+            .launches
+            .iter()
+            .zip(&route.workers)
+            .zip(dispatch.launches)
+        {
             let Some(launch) = launch else { continue };
             let items = launch.groups[0]
                 .checked_mul(launch.groups[1])
                 .and_then(|items| items.checked_mul(launch.groups[2]))
-                .ok_or_else(|| ExecutionError::SubmissionFailed("native CPU grid overflows".into()))?;
+                .ok_or_else(|| {
+                    ExecutionError::SubmissionFailed("native CPU grid overflows".into())
+                })?;
             steps.push(Step {
                 function: *function,
                 invocation: CpuInvocation {
@@ -270,7 +285,11 @@ fn steps<'a>(
                 },
                 items,
                 shared_bytes: launch.shared_bytes,
-                workers: if *workers == 0 { participants } else { *workers },
+                workers: if *workers == 0 {
+                    participants
+                } else {
+                    *workers
+                },
             });
         }
     }

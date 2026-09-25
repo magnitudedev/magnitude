@@ -59,17 +59,38 @@ pub(super) fn qualify_attention(
         .collect::<Vec<_>>();
     let residual = semantic_f32(device, &[1, hidden], &residual_values, ENTRY, label)?;
     let input_norm = semantic_zeros(device, elements.input_norm, &[hidden], ENTRY, label)?;
-    let query_gate =
-        semantic_zeros(device, elements.query_gate, &[heads * 2 * width, hidden], ENTRY, label)?;
-    let key = semantic_zeros(device, elements.key, &[kv_heads * width, hidden], ENTRY, label)?;
-    let value = semantic_zeros(device, elements.value, &[kv_heads * width, hidden], ENTRY, label)?;
-    let output = semantic_zeros(device, elements.output, &[hidden, heads * width], ENTRY, label)?;
+    let query_gate = semantic_zeros(
+        device,
+        elements.query_gate,
+        &[heads * 2 * width, hidden],
+        ENTRY,
+        label,
+    )?;
+    let key = semantic_zeros(
+        device,
+        elements.key,
+        &[kv_heads * width, hidden],
+        ENTRY,
+        label,
+    )?;
+    let value = semantic_zeros(
+        device,
+        elements.value,
+        &[kv_heads * width, hidden],
+        ENTRY,
+        label,
+    )?;
+    let output = semantic_zeros(
+        device,
+        elements.output,
+        &[hidden, heads * width],
+        ENTRY,
+        label,
+    )?;
     let query_norm = semantic_zeros(device, Element::f32(), &[width], ENTRY, label)?;
     let key_norm = semantic_zeros(device, Element::f32(), &[width], ENTRY, label)?;
-    let rotary_components =
-        semantic_zeros(device, Element::i32(), &[rotary_pairs], ENTRY, label)?;
-    let rotary_frequencies =
-        semantic_zeros(device, Element::f32(), &[rotary_pairs], ENTRY, label)?;
+    let rotary_components = semantic_zeros(device, Element::i32(), &[rotary_pairs], ENTRY, label)?;
+    let rotary_frequencies = semantic_zeros(device, Element::f32(), &[rotary_pairs], ENTRY, label)?;
     let coordinates = semantic_zeros(device, Element::i32(), &[1, 4], ENTRY, label)?;
     let visible = semantic_i32(device, &[1, 1, 2], &[0, 1], ENTRY, label)?;
     let fresh = semantic_i32(device, &[1, 2], &[0, 1], ENTRY, label)?;
@@ -294,25 +315,60 @@ pub(super) fn semantic_pattern(
     // converted by the registry's host reference into the element's
     // (representation, layout): the fixture follows every layout's geometry.
     let (source, packet) = match element.representation() {
-        "q8g32s" => ("gguf_q8_0", unit_packet(34, &[(0, &[0x00, 0x3c]), (2, &[1; 32])])),
+        "q8g32s" => (
+            "gguf_q8_0",
+            unit_packet(34, &[(0, &[0x00, 0x3c]), (2, &[1; 32])]),
+        ),
         // d = 1, dmin = 0, sub-block scales 1 and minima 0, codes 1.
         "q4k" => (
             "gguf_q4_k",
-            unit_packet(144, &[(0, &[0x00, 0x3c]), (4, &[1; 4]), (12, &[1; 4]), (16, &[0x11; 128])]),
+            unit_packet(
+                144,
+                &[
+                    (0, &[0x00, 0x3c]),
+                    (4, &[1; 4]),
+                    (12, &[1; 4]),
+                    (16, &[0x11; 128]),
+                ],
+            ),
         ),
         "q5k" => (
             "gguf_q5_k",
-            unit_packet(176, &[(0, &[0x00, 0x3c]), (4, &[1; 4]), (12, &[1; 4]), (48, &[0x11; 128])]),
+            unit_packet(
+                176,
+                &[
+                    (0, &[0x00, 0x3c]),
+                    (4, &[1; 4]),
+                    (12, &[1; 4]),
+                    (48, &[0x11; 128]),
+                ],
+            ),
         ),
         // Codes 33 (low nibble 1, high bits 2) at scale 1 and d = 1.
         "q6k" => (
             "gguf_q6_k",
-            unit_packet(210, &[(0, &[0x11; 128]), (128, &[0xaa; 64]), (192, &[1; 16]), (208, &[0x00, 0x3c])]),
+            unit_packet(
+                210,
+                &[
+                    (0, &[0x11; 128]),
+                    (128, &[0xaa; 64]),
+                    (192, &[1; 16]),
+                    (208, &[0x00, 0x3c]),
+                ],
+            ),
         ),
         // Table code 8 (value 1) at sub-scale 33 - 32 = 1 and d = 1.
         "iq4g32" => (
             "gguf_iq4_xs",
-            unit_packet(136, &[(0, &[0x00, 0x3c]), (2, &[0xaa, 0xaa]), (4, &[0x11; 4]), (8, &[0x88; 128])]),
+            unit_packet(
+                136,
+                &[
+                    (0, &[0x00, 0x3c]),
+                    (2, &[0xaa, 0xaa]),
+                    (4, &[0x11; 4]),
+                    (8, &[0x88; 128]),
+                ],
+            ),
         ),
         name => {
             return Err(qualification_dynamic(
@@ -326,17 +382,20 @@ pub(super) fn semantic_pattern(
     let length = source
         .canonical_byte_len(extents)
         .map_err(|error| qualification_dynamic(entry, bindings, error))?;
-    let source_bytes = packet
-        .iter()
-        .copied()
-        .cycle()
-        .take(usize::try_from(length).map_err(|_| {
-            qualification_dynamic(entry, bindings, "fixture storage exceeds usize")
-        })?)
-        .collect::<Vec<_>>();
+    let source_bytes =
+        packet
+            .iter()
+            .copied()
+            .cycle()
+            .take(usize::try_from(length).map_err(|_| {
+                qualification_dynamic(entry, bindings, "fixture storage exceeds usize")
+            })?)
+            .collect::<Vec<_>>();
     let pattern = element
         .repack_host(source, extents, &source_bytes)
-        .ok_or_else(|| qualification_dynamic(entry, bindings, "no registered fixture conversion"))?;
+        .ok_or_else(|| {
+            qualification_dynamic(entry, bindings, "no registered fixture conversion")
+        })?;
     let mut tensor = semantic_zeros(device, element, extents, entry, bindings)?;
     tensor
         .write_from_host(&pattern)
@@ -433,50 +492,6 @@ pub(super) fn require_finite_nonzero(
             entry,
             bindings,
             "semantic fixture was not finite and nonzero",
-        ));
-    }
-    Ok(())
-}
-
-pub(super) fn require_dense_values(
-    tensor: &Tensor,
-    expected: &[f32],
-    entry: &'static str,
-    bindings: &str,
-) -> Result<(), CatalogFailure> {
-    let actual = read_dense_values(tensor, entry, bindings)?;
-    if actual.len() != expected.len()
-        || actual
-            .iter()
-            .zip(expected)
-            .any(|(actual, expected)| (actual - expected).abs() > 0.05)
-    {
-        return Err(qualification_dynamic(
-            entry,
-            bindings,
-            "semantic fixture result mismatch",
-        ));
-    }
-    Ok(())
-}
-
-pub(super) fn require_not_dense_values(
-    tensor: &Tensor,
-    rejected: &[f32],
-    entry: &'static str,
-    bindings: &str,
-) -> Result<(), CatalogFailure> {
-    let actual = read_dense_values(tensor, entry, bindings)?;
-    if actual.len() == rejected.len()
-        && actual
-            .iter()
-            .zip(rejected)
-            .all(|(actual, rejected)| (actual - rejected).abs() <= 0.01)
-    {
-        return Err(qualification_dynamic(
-            entry,
-            bindings,
-            "semantic fixture did not exercise the projection",
         ));
     }
     Ok(())

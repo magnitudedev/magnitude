@@ -259,7 +259,10 @@ impl<B: seismic_native_target::TargetFamily> Inference<'_, '_, '_, '_, '_, B> {
         let upper = arena.int_cmp(seismic_lang::expr::CmpOp::Le, interval.upper, max);
         let fits = arena.all(&[lower, upper]);
         let truth = arena.bool(true);
-        Ok(arena.eval_bool(fits, &seismic_lang::expr::Assignment::new()).ok() == Some(true)
+        Ok(arena
+            .eval_bool(fits, &seismic_lang::expr::Assignment::new())
+            .ok()
+            == Some(true)
             || arena.entails(truth, fits))
     }
 

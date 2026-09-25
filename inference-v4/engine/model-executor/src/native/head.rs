@@ -1,7 +1,7 @@
-use super::{AttentionKernels, DenseKernels};
+use super::{AttentionKernels, DenseKernels, RoutedKernels};
 use crate::HeadBinding;
 use magnitude_model_kernels::{
-    head_logits_rows, draft_rows, readout_features_rows, sample_rows, shape_rows,
+    draft_rows, head_logits_rows, readout_features_rows, sample_rows, shape_rows,
 };
 use seismic::NativeKernel;
 use std::collections::HashMap;
@@ -29,6 +29,7 @@ pub struct HeadKernels {
     pub(super) input: HashMap<HeadBinding, NativeKernel<draft_rows::Entry>>,
     pub(super) attention: HashMap<HeadBinding, AttentionKernels>,
     pub(super) dense: HashMap<HeadBinding, DenseKernels>,
+    pub(super) routed: HashMap<HeadBinding, RoutedKernels>,
     pub(super) features: HashMap<HeadBinding, NativeKernel<readout_features_rows::Entry>>,
     pub(super) logits: HashMap<HeadBinding, NativeKernel<head_logits_rows::Entry>>,
     /// Token selection over the draft vocabulary, shared by every block.

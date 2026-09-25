@@ -24,8 +24,9 @@ use super::{
     median, median_of, CallError, MeasureOptions, Measurement, NativeBoundCall, NativePrepared,
     NativeSubmission, StandaloneCalls,
 };
-use crate::api::kernel::EncodedArgs;
-use std::collections::BTreeMap;
+use crate::api::kernel::{EncodedArgs, EncodedOutputs};
+use crate::api::tensor::TensorInner;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// One point's calls, placed once and submitted for every sample.
@@ -59,6 +60,25 @@ impl PointTiming {
         kernel: &Arc<NativePrepared>,
         rotation: Vec<EncodedArgs>,
     ) -> Result<Self, CallError> {
+        Self::place(kernel, rotation, None)
+    }
+
+    /// Place a candidate against a point's shared result storage. Group
+    /// sweeps submit one timing at a time and wait for its completion, so a
+    /// later candidate can safely write the same buffers.
+    pub(crate) fn reusing_outputs(
+        kernel: &Arc<NativePrepared>,
+        rotation: Vec<EncodedArgs>,
+        outputs: &mut Vec<Vec<Arc<TensorInner>>>,
+    ) -> Result<Self, CallError> {
+        Self::place(kernel, rotation, Some(outputs))
+    }
+
+    fn place(
+        kernel: &Arc<NativePrepared>,
+        rotation: Vec<EncodedArgs>,
+        mut outputs: Option<&mut Vec<Vec<Arc<TensorInner>>>>,
+    ) -> Result<Self, CallError> {
         if rotation.is_empty() {
             return Err(CallError::Workflow(crate::api::WorkflowError::Empty));
         }
@@ -69,20 +89,40 @@ impl PointTiming {
                 .expect("native standalone-call lock poisoned");
             rotation
                 .into_iter()
-                .map(|args| kernel.prepare_call(&mut standalone, args, None))
+                .enumerate()
+                .map(|(index, args)| {
+                    let supplied =
+                        outputs
+                            .as_ref()
+                            .and_then(|pool| pool.get(index))
+                            .map(|tensors| {
+                                let mut encoded = EncodedOutputs::new();
+                                for tensor in tensors {
+                                    encoded.push_tensor(tensor.clone());
+                                }
+                                encoded
+                            });
+                    let call = kernel.prepare_call(&mut standalone, args, supplied)?;
+                    if let Some(pool) = outputs.as_mut() {
+                        if index == pool.len() {
+                            pool.push(call.results.clone());
+                        }
+                    }
+                    Ok(call)
+                })
                 .collect::<Result<Vec<_>, _>>()?
         };
-        let mut distinct = BTreeMap::new();
+        let mut distinct = HashSet::new();
         for call in &calls {
             for (allocation, _) in &call.access {
-                distinct.insert(allocation.identity(), allocation.bytes());
+                distinct.insert((allocation.identity(), allocation.bytes()));
             }
         }
         Ok(Self {
             kernel: kernel.clone(),
             calls,
             repetitions: None,
-            rotation_bytes: distinct.values().sum(),
+            rotation_bytes: distinct.into_iter().map(|(_, bytes)| bytes).sum(),
             samples: Vec::new(),
         })
     }
@@ -98,7 +138,9 @@ impl PointTiming {
                     .iter()
                     .enumerate()
                     .filter(|(_, geometry)| {
-                        geometry.is_some_and(|geometry| geometry.groups.iter().all(|groups| *groups > 0))
+                        geometry.is_some_and(|geometry| {
+                            geometry.groups.iter().all(|groups| *groups > 0)
+                        })
                     })
                     .map(|(ordinal, _)| ordinal)
             })
@@ -183,7 +225,10 @@ pub(crate) fn warm(point: &PointTiming) -> Result<(), CallError> {
             1
         }
     };
-    let mut spent = point.submit_passes(passes(WARM_MIN_SECONDS))?.submission.device_seconds()?;
+    let mut spent = point
+        .submit_passes(passes(WARM_MIN_SECONDS))?
+        .submission
+        .device_seconds()?;
     let chunk = passes(WARM_CHUNK_SECONDS);
     let mut previous = f64::INFINITY;
     while spent < WARM_LIMIT_SECONDS {
@@ -223,7 +268,10 @@ fn collect(
 /// Bring every point to at least `options.samples` samples: an uncalibrated
 /// point first gets its calibrating pass, then samples are taken round by
 /// round (each point once per round).
-pub(crate) fn sample(points: &mut [PointTiming], options: &MeasureOptions) -> Result<(), PointFailure> {
+pub(crate) fn sample(
+    points: &mut [PointTiming],
+    options: &MeasureOptions,
+) -> Result<(), PointFailure> {
     let uncalibrated = (0..points.len())
         .filter(|&point| points[point].repetitions.is_none())
         .collect::<Vec<_>>();
@@ -234,7 +282,11 @@ pub(crate) fn sample(points: &mut [PointTiming], options: &MeasureOptions) -> Re
         .collect::<Vec<_>>();
     let rounds = missing.iter().copied().max().unwrap_or(0);
     let order = (0..rounds)
-        .flat_map(|round| (0..missing.len()).filter(|&point| round < missing[point]).collect::<Vec<_>>())
+        .flat_map(|round| {
+            (0..missing.len())
+                .filter(|&point| round < missing[point])
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
     collect(points, &order, options.min_sample_seconds)
 }

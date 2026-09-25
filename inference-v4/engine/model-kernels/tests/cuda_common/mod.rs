@@ -7,14 +7,20 @@ use seismic::{BackendName, Device, DeviceCatalog, Element, Layout, Tensor};
 use seismic_lang::registry::{bf16_round, f16_bits};
 
 pub fn cuda() -> Option<Device> {
-    DeviceCatalog::discover().ok()?.open_backend(BackendName::Cuda).ok()
+    DeviceCatalog::discover()
+        .ok()?
+        .open_backend(BackendName::Cuda)
+        .ok()
 }
 
 pub struct Rng(pub u64);
 
 impl Rng {
     pub fn next(&mut self) -> u32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (self.0 >> 33) as u32
     }
     pub fn byte(&mut self) -> u8 {
@@ -62,7 +68,11 @@ impl Format {
             Format::Q4K | Format::Q5K => {
                 block.extend(f16(rng.uniform(0.0005, 0.003)));
                 block.extend(f16(rng.uniform(0.0, 0.002)));
-                let bytes = if matches!(self, Format::Q4K) { 12 + 128 } else { 12 + 32 + 128 };
+                let bytes = if matches!(self, Format::Q4K) {
+                    12 + 128
+                } else {
+                    12 + 32 + 128
+                };
                 block.extend((0..bytes).map(|_| rng.byte()));
             }
             Format::Q6K => {
@@ -100,24 +110,41 @@ pub fn weight(device: &Device, format: Format, rows: usize, k: usize, rng: &mut 
     let shape = [rows as u64, k as u64];
     let resident = format.resident();
     let bytes = resident
-        .repack_host(Element::named(format.external()).unwrap(), &shape, &external)
+        .repack_host(
+            Element::named(format.external()).unwrap(),
+            &shape,
+            &external,
+        )
         .expect("registered GGUF -> mma16 conversion");
     let values = resident.decode_host(&shape, &bytes).unwrap();
     let tensor = Tensor::from_host(device, resident, &shape, &bytes).unwrap();
-    Weight { tensor, values, bytes }
+    Weight {
+        tensor,
+        values,
+        bytes,
+    }
 }
 
 /// A dense bf16 weight [rows, k] (row-major, as dense GGUF weights are
 /// resident) and its values.
 pub fn dense_weight(device: &Device, rows: usize, k: usize, rng: &mut Rng) -> Weight {
-    let values: Vec<f32> = (0..rows * k).map(|_| bf16_round(rng.uniform(-0.05, 0.05))).collect();
+    let values: Vec<f32> = (0..rows * k)
+        .map(|_| bf16_round(rng.uniform(-0.05, 0.05)))
+        .collect();
     let tensor = bf16_tensor(device, &[rows as u64, k as u64], &values);
     let bytes = tensor.read_to_host().unwrap();
-    Weight { tensor, values: values.iter().map(|v| f64::from(*v)).collect(), bytes }
+    Weight {
+        tensor,
+        values: values.iter().map(|v| f64::from(*v)).collect(),
+        bytes,
+    }
 }
 
 pub fn f32_tensor(device: &Device, shape: &[u64], values: &[f32]) -> Tensor {
-    let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+    let bytes = values
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect::<Vec<_>>();
     Tensor::from_host(device, Element::f32(), shape, &bytes).unwrap()
 }
 pub fn bf16_tensor(device: &Device, shape: &[u64], values: &[f32]) -> Tensor {
@@ -128,11 +155,17 @@ pub fn bf16_tensor(device: &Device, shape: &[u64], values: &[f32]) -> Tensor {
     Tensor::from_host(device, Element::bf16(), shape, &bytes).unwrap()
 }
 pub fn i32_tensor(device: &Device, shape: &[u64], values: &[i32]) -> Tensor {
-    let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+    let bytes = values
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect::<Vec<_>>();
     Tensor::from_host(device, Element::i32(), shape, &bytes).unwrap()
 }
 pub fn u32_tensor(device: &Device, shape: &[u64], values: &[u32]) -> Tensor {
-    let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+    let bytes = values
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect::<Vec<_>>();
     Tensor::from_host(device, Element::u32(), shape, &bytes).unwrap()
 }
 pub fn read_f32(tensor: &Tensor) -> Vec<f32> {
@@ -200,7 +233,6 @@ pub fn silu(x: f64) -> f64 {
     x / (1.0 + (-x).exp())
 }
 
-
 /// The largest row count the CUDA K1 GEMV serves (`projection::GEMV_ROWS`);
 /// larger counts run the GEMM.
 pub const GEMV_ROWS: usize = 16;
@@ -218,14 +250,58 @@ pub struct Mapping {
 }
 
 impl Mapping {
-    /// The specialization params of a K1 entry declaring KSPLIT and INT8.
+    /// Entry-wide K1 projection parameters outside the dense pair.
     pub fn params(self, spec: seismic::NativeSpecialization) -> seismic::NativeSpecialization {
-        spec.with_param("KSPLIT", self.ksplit).with_param("INT8", self.int8)
-    }
-    /// The specialization params of a head entry (KSPLIT only; its GEMMs
-    /// are the 16-bit path).
-    pub fn head_params(self, spec: seismic::NativeSpecialization) -> seismic::NativeSpecialization {
         spec.with_param("KSPLIT", self.ksplit)
+            .with_param("INT8", self.int8)
+    }
+    /// Dense expansion owns KSPLIT on its two GEMV launches.
+    pub fn dense_expand_params(
+        self,
+        spec: seismic::NativeSpecialization,
+    ) -> seismic::NativeSpecialization {
+        spec.with_param("INT8", self.int8)
+            .with_launch_param(2, "KSPLIT", self.ksplit)
+            .with_launch_param(3, "KSPLIT", self.ksplit)
+    }
+    /// Dense output owns KSPLIT on its two GEMV launches.
+    pub fn dense_output_params(
+        self,
+        spec: seismic::NativeSpecialization,
+    ) -> seismic::NativeSpecialization {
+        spec.with_param("INT8", self.int8)
+            .with_launch_param(1, "KSPLIT", self.ksplit)
+            .with_launch_param(2, "KSPLIT", self.ksplit)
+    }
+    /// Attention output owns KSPLIT on its two GEMV launches.
+    pub fn attention_output_params(
+        self,
+        spec: seismic::NativeSpecialization,
+    ) -> seismic::NativeSpecialization {
+        spec.with_param("INT8", self.int8)
+            .with_launch_param(1, "KSPLIT", self.ksplit)
+            .with_launch_param(2, "KSPLIT", self.ksplit)
+    }
+    /// Attention projection owns KSPLIT on its two GEMV launches.
+    pub fn gated_attention_project_params(
+        self,
+        spec: seismic::NativeSpecialization,
+    ) -> seismic::NativeSpecialization {
+        spec.with_param("INT8", self.int8)
+            .with_launch_param(2, "KSPLIT", self.ksplit)
+            .with_launch_param(3, "KSPLIT", self.ksplit)
+    }
+    /// Recurrent projection and output entries share the two GEMV launch indices.
+    pub fn recurrent_params(
+        self,
+        spec: seismic::NativeSpecialization,
+    ) -> seismic::NativeSpecialization {
+        self.gated_attention_project_params(spec)
+    }
+    /// Readout head GEMVs own KSPLIT on launches 1 and 2.
+    pub fn head_params(self, spec: seismic::NativeSpecialization) -> seismic::NativeSpecialization {
+        spec.with_launch_param(1, "KSPLIT", self.ksplit)
+            .with_launch_param(2, "KSPLIT", self.ksplit)
     }
     /// Whether `rows` rows run the INT8 path (only the small-band GEMM has
     /// one).
@@ -242,17 +318,27 @@ pub const GEMV_MAPPINGS: [Mapping; 4] = [
     Mapping { ksplit: 4, int8: 1 },
 ];
 /// GEMM mappings: both operand paths (the large band ignores INT8).
-pub const GEMM_MAPPINGS: [Mapping; 2] = [Mapping { ksplit: 4, int8: 0 }, Mapping { ksplit: 4, int8: 1 }];
+pub const GEMM_MAPPINGS: [Mapping; 2] = [
+    Mapping { ksplit: 4, int8: 0 },
+    Mapping { ksplit: 4, int8: 1 },
+];
 
 pub fn mappings(m: usize) -> &'static [Mapping] {
-    if m <= GEMV_ROWS { &GEMV_MAPPINGS } else { &GEMM_MAPPINGS }
+    if m <= GEMV_ROWS {
+        &GEMV_MAPPINGS
+    } else {
+        &GEMM_MAPPINGS
+    }
 }
 
 /// The row counts of a timing sweep: `CUDA_TIMING_ROWS` (comma-separated)
 /// or `default`.
 pub fn timing_rows(default: &[usize]) -> Vec<usize> {
     match std::env::var("CUDA_TIMING_ROWS") {
-        Ok(list) => list.split(',').map(|rows| rows.trim().parse().expect("CUDA_TIMING_ROWS: row counts")).collect(),
+        Ok(list) => list
+            .split(',')
+            .map(|rows| rows.trim().parse().expect("CUDA_TIMING_ROWS: row counts"))
+            .collect(),
         Err(_) => default.to_vec(),
     }
 }
@@ -282,10 +368,16 @@ pub fn quantize(x: &[f32], k: usize) -> (Vec<f32>, Vec<f32>) {
     let mut half_steps = vec![0.0; x.len()];
     for group in (0..x.len()).step_by(32) {
         debug_assert_eq!(group % k % 32, 0);
-        let maximum = x[group..group + 32].iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+        let maximum = x[group..group + 32]
+            .iter()
+            .fold(0.0f32, |acc, v| acc.max(v.abs()));
         let d = maximum / 127.0;
         for i in group..group + 32 {
-            values[i] = if d == 0.0 { 0.0 } else { d * (x[i] / d).round_ties_even() };
+            values[i] = if d == 0.0 {
+                0.0
+            } else {
+                d * (x[i] / d).round_ties_even()
+            };
             half_steps[i] = d / 2.0;
         }
     }
@@ -298,8 +390,9 @@ pub fn slack_bound(slack: &[f32], w: &[f64], m: usize, n: usize, k: usize) -> Ve
     let mut out = vec![0.0; m * n];
     for row in 0..m {
         for col in 0..n {
-            out[row * n + col] =
-                (0..k).map(|c| f64::from(slack[row * k + c]) * w[col * k + c].abs()).sum::<f64>();
+            out[row * n + col] = (0..k)
+                .map(|c| f64::from(slack[row * k + c]) * w[col * k + c].abs())
+                .sum::<f64>();
         }
     }
     out
@@ -309,15 +402,30 @@ pub fn slack_bound(slack: &[f32], w: &[f64], m: usize, n: usize, k: usize) -> Ve
 /// not on the INT8 path): each weight becomes round_A(code * round_A(scale)
 /// - round_A(bias)), off by at most 2^-9 (|code * scale| + |bias| + |value|)
 /// <= 2^-7 max_row |w| in bf16; zero on every other path.
-pub fn dequant_bound(x: &[f32], w: &[f64], m: usize, n: usize, k: usize, mapping: Mapping) -> Vec<f64> {
+pub fn dequant_bound(
+    x: &[f32],
+    w: &[f64],
+    m: usize,
+    n: usize,
+    k: usize,
+    mapping: Mapping,
+) -> Vec<f64> {
     if m <= GEMV_ROWS || mapping.quantizes(m) {
         return vec![0.0; m * n];
     }
-    let maximum: Vec<f64> =
-        (0..n).map(|col| w[col * k..(col + 1) * k].iter().fold(0.0f64, |a, v| a.max(v.abs()))).collect();
+    let maximum: Vec<f64> = (0..n)
+        .map(|col| {
+            w[col * k..(col + 1) * k]
+                .iter()
+                .fold(0.0f64, |a, v| a.max(v.abs()))
+        })
+        .collect();
     let mut out = vec![0.0; m * n];
     for row in 0..m {
-        let magnitude: f64 = x[row * k..(row + 1) * k].iter().map(|v| f64::from(v.abs())).sum();
+        let magnitude: f64 = x[row * k..(row + 1) * k]
+            .iter()
+            .map(|v| f64::from(v.abs()))
+            .sum();
         for col in 0..n {
             out[row * n + col] = magnitude * maximum[col] / 128.0;
         }
@@ -330,7 +438,11 @@ pub fn dequant_bound(x: &[f32], w: &[f64], m: usize, n: usize, k: usize, mapping
 /// quantization step on the INT8 path, where a tie resolved differently
 /// before quantization moves a value by up to one step).
 pub fn operand_rows(x: &[f32], k: usize, mapping: Mapping) -> (Vec<f32>, Vec<f32>) {
-    if mapping.quantizes(x.len() / k) { quantize(x, k) } else { (x.to_vec(), vec![0.0; x.len()]) }
+    if mapping.quantizes(x.len() / k) {
+        quantize(x, k)
+    } else {
+        (x.to_vec(), vec![0.0; x.len()])
+    }
 }
 
 pub fn check(label: &str, actual: &[f32], expected: &[f64], tolerance: &[f64]) {
@@ -338,7 +450,12 @@ pub fn check(label: &str, actual: &[f32], expected: &[f64], tolerance: &[f64]) {
     let mut worst = (0.0f64, 0usize);
     for i in 0..actual.len() {
         let ratio = (f64::from(actual[i]) - expected[i]).abs() / tolerance[i];
-        assert!(ratio.is_finite(), "{label}[{i}]: {} vs {}", actual[i], expected[i]);
+        assert!(
+            ratio.is_finite(),
+            "{label}[{i}]: {} vs {}",
+            actual[i],
+            expected[i]
+        );
         if ratio > worst.0 {
             worst = (ratio, i);
         }
@@ -353,7 +470,6 @@ pub fn check(label: &str, actual: &[f32], expected: &[f64], tolerance: &[f64]) {
         worst.0
     );
 }
-
 
 /// A zero-filled resident weight for timings: device time does not depend on
 /// weight values, and the host conversion of 4B-sized weights is slow.

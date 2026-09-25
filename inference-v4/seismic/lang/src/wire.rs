@@ -51,12 +51,16 @@ pub(crate) struct ArenaExtent([u32; ArenaHandle::COUNT]);
 
 impl ArenaExtent {
     pub(crate) fn with(mut self, kind: ArenaHandle, count: usize) -> Result<Self, WireError> {
-        self.0[kind.slot()] = u32::try_from(count).map_err(|_| WireError("arena extent exceeds u32"))?;
+        self.0[kind.slot()] =
+            u32::try_from(count).map_err(|_| WireError("arena extent exceeds u32"))?;
         Ok(self)
     }
 
     fn covers(self, reached: Self) -> bool {
-        self.0.iter().zip(reached.0).all(|(defined, reached)| reached <= *defined)
+        self.0
+            .iter()
+            .zip(reached.0)
+            .all(|(defined, reached)| reached <= *defined)
     }
 }
 
@@ -209,22 +213,32 @@ pub(crate) fn decode<T>(
     })
 }
 
-fn encoding<T>(use_context: impl FnOnce(&mut Encoding) -> Result<T, WireError>) -> Result<T, WireError> {
+fn encoding<T>(
+    use_context: impl FnOnce(&mut Encoding) -> Result<T, WireError>,
+) -> Result<T, WireError> {
     ENCODING.with(|cell| match cell.borrow_mut().as_mut() {
         Some(context) => use_context(context),
-        None => Err(WireError("semantic handles serialize only inside a checked-bundle encode")),
+        None => Err(WireError(
+            "semantic handles serialize only inside a checked-bundle encode",
+        )),
     })
 }
 
-fn decoding<T>(use_context: impl FnOnce(&mut Decoding) -> Result<T, WireError>) -> Result<T, WireError> {
+fn decoding<T>(
+    use_context: impl FnOnce(&mut Decoding) -> Result<T, WireError>,
+) -> Result<T, WireError> {
     DECODING.with(|cell| match cell.borrow_mut().as_mut() {
         Some(context) => use_context(context),
-        None => Err(WireError("semantic handles deserialize only inside a checked-bundle decode")),
+        None => Err(WireError(
+            "semantic handles deserialize only inside a checked-bundle decode",
+        )),
     })
 }
 
 fn reach(extent: &mut u32, ordinal: u32) -> Result<(), WireError> {
-    let end = ordinal.checked_add(1).ok_or(WireError("handle ordinal overflows"))?;
+    let end = ordinal
+        .checked_add(1)
+        .ok_or(WireError("handle ordinal overflows"))?;
     *extent = (*extent).max(end);
     Ok(())
 }
@@ -232,9 +246,9 @@ fn reach(extent: &mut u32, ordinal: u32) -> Result<(), WireError> {
 /// Encoding: `owner` must be the encoded module's.
 pub(crate) fn encode_module(owner: ModuleId) -> Result<(), WireError> {
     encoding(|context| {
-        (context.module == owner)
-            .then_some(())
-            .ok_or(WireError("checked module holds an entry handle of another module"))
+        (context.module == owner).then_some(()).ok_or(WireError(
+            "checked module holds an entry handle of another module",
+        ))
     })
 }
 
@@ -249,9 +263,9 @@ pub(crate) fn decode_module(ordinal: u32) -> Result<ModuleId, WireError> {
 /// Encoding: `owner` must be the encoded module's program.
 pub(crate) fn encode_program(owner: ProgramId) -> Result<(), WireError> {
     encoding(|context| {
-        (context.program == owner)
-            .then_some(())
-            .ok_or(WireError("checked module holds a program handle of another program"))
+        (context.program == owner).then_some(()).ok_or(WireError(
+            "checked module holds a program handle of another program",
+        ))
     })
 }
 
@@ -267,7 +281,10 @@ pub(crate) fn decode_program(kind: ProgramHandle, ordinal: u32) -> Result<Progra
     })
 }
 
-fn slot<Owner: Copy + Eq + std::hash::Hash>(slots: &mut HashMap<Owner, u32>, owner: Owner) -> Result<u32, WireError> {
+fn slot<Owner: Copy + Eq + std::hash::Hash>(
+    slots: &mut HashMap<Owner, u32>,
+    owner: Owner,
+) -> Result<u32, WireError> {
     let next = u32::try_from(slots.len()).map_err(|_| WireError("owner slots exceed u32"))?;
     Ok(*slots.entry(owner).or_insert(next))
 }
@@ -279,7 +296,11 @@ pub(crate) fn encode_arena(owner: ArenaId) -> Result<u32, WireError> {
 
 /// Decoding: the owner of arena slot `slot`, recording that a `kind` handle
 /// with `ordinal` reaches into it. Slots are dense in first-appearance order.
-pub(crate) fn decode_arena(slot: u32, kind: ArenaHandle, ordinal: u32) -> Result<ArenaId, WireError> {
+pub(crate) fn decode_arena(
+    slot: u32,
+    kind: ArenaHandle,
+    ordinal: u32,
+) -> Result<ArenaId, WireError> {
     decoding(|context| {
         if let Some(scope) = context.scope.as_mut() {
             scope.name(slot)?;
@@ -362,7 +383,8 @@ pub(crate) fn deserialize_dimension<'de, D: serde::Deserializer<'de>>(
 ) -> Result<u32, D::Error> {
     use serde::de::Error as _;
     let ordinal = <u32 as serde::Deserialize>::deserialize(deserializer)?;
-    decoding(|context| reach(&mut scope(context)?.dimensions, ordinal)).map_err(D::Error::custom)?;
+    decoding(|context| reach(&mut scope(context)?.dimensions, ordinal))
+        .map_err(D::Error::custom)?;
     Ok(ordinal)
 }
 
@@ -378,16 +400,20 @@ where
         fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str("a sequence of scoped elements")
         }
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Self::Value, A::Error> {
             use serde::de::Error as _;
             let set = |scope: Option<Scope>| {
-                decoding(|context| {
-                    Ok(std::mem::replace(&mut context.scope, scope))
-                })
+                decoding(|context| Ok(std::mem::replace(&mut context.scope, scope)))
             };
             let mut elements = Vec::new();
             loop {
-                if set(Some(Scope::default())).map_err(A::Error::custom)?.is_some() {
+                if set(Some(Scope::default()))
+                    .map_err(A::Error::custom)?
+                    .is_some()
+                {
                     return Err(A::Error::custom("scoped elements do not nest"));
                 }
                 let element = sequence.next_element::<T>();
@@ -410,8 +436,10 @@ mod tests {
     use crate::expr::{ExprArena, IntExpr};
 
     fn encoded(handle: IntExpr, arena: &ExprArena) -> Vec<u8> {
-        encode(ModuleId::fresh(), ProgramId::fresh(), || postcard::to_stdvec(&(handle, arena)))
-            .expect("the pair encodes")
+        encode(ModuleId::fresh(), ProgramId::fresh(), || {
+            postcard::to_stdvec(&(handle, arena))
+        })
+        .expect("the pair encodes")
     }
 
     fn decoded(bytes: &[u8]) -> Result<(IntExpr, ExprArena), WireError> {
@@ -431,7 +459,10 @@ mod tests {
         let (second, _) = decoded(&bytes).unwrap();
         assert_ne!(first, handle);
         assert_ne!(first, second);
-        assert!(matches!(first_arena.view(first.into()), crate::expr::NodeView::IntConst(7)));
+        assert!(matches!(
+            first_arena.view(first.into()),
+            crate::expr::NodeView::IntConst(7)
+        ));
         assert_eq!(encoded(first, &first_arena), bytes);
     }
 
@@ -447,10 +478,16 @@ mod tests {
         // arena to slot 0 makes the handle name node 9 of a one-node arena.
         assert_eq!(&bytes[..3], &[0, 9, 1]);
         bytes[2] = 0;
-        assert_eq!(decoded(&bytes).err(), Some(WireError("arena handle out of range")));
+        assert_eq!(
+            decoded(&bytes).err(),
+            Some(WireError("arena handle out of range"))
+        );
         // Unrenamed, the handle names an arena the bytes never define.
         let bytes = encoded(handle, &small);
-        assert_eq!(decoded(&bytes).err(), Some(WireError("handle of an undefined arena")));
+        assert_eq!(
+            decoded(&bytes).err(),
+            Some(WireError("handle of an undefined arena"))
+        );
     }
 
     #[test]

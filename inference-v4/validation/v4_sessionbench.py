@@ -81,7 +81,8 @@ def main() -> None:
         "--workload", choices=("retrieval", "prose-continue", "prose-repeat"), default="retrieval"
     )
     parser.add_argument("--startup-timeout", type=int, default=900)
-    parser.add_argument("--storage-gib", type=int, default=28)
+    parser.add_argument("--device", default="auto", help="V4 device selector, such as cpu or metal")
+    parser.add_argument("--cache-dir", type=Path, help="persistent V4 kernel and tuning cache")
     parser.add_argument("--method", choices=("auto", "plain", "mtp"), default="auto")
     parser.add_argument("--mtp-proposals", type=int,
                         help="MTP proposal width (default: the engine's)")
@@ -89,11 +90,12 @@ def main() -> None:
     if args.mtp_proposals is not None and args.method != "mtp":
         parser.error("--mtp-proposals requires --method mtp")
     if any(value <= 0 for value in (
-        args.context, args.repeat, args.startup_timeout, args.storage_gib
+        args.context, args.repeat, args.startup_timeout
     )):
-        parser.error("context, repeat, startup timeout, and storage GiB must be positive")
+        parser.error("context, repeat, and startup timeout must be positive")
     source = args.source.resolve(strict=True)
     binary = args.binary.resolve(strict=True)
+    cache_dir = args.cache_dir.expanduser().absolute() if args.cache_dir else None
     # Keep the GGUF filename when a snapshot entry is a symlink into a
     # content-addressed cache. resolve() would replace its suffix with the
     # blob hash even though the same local file is opened and verified.
@@ -160,7 +162,8 @@ def main() -> None:
                 "workload": args.workload,
                 "repeat": args.repeat,
                 "startup_timeout_seconds": args.startup_timeout,
-                "storage_gib": args.storage_gib,
+                "device": args.device,
+                "cache_dir": str(cache_dir) if cache_dir else None,
                 "method": args.method,
                 "mtp_proposals": args.mtp_proposals,
                 "count_endpoint": "/v1/count",
@@ -204,7 +207,8 @@ def main() -> None:
                 "--host", "127.0.0.1", "--port", str(port),
                 "--served-model", self.served_model(),
                 "--context-tokens", str(context),
-                "--storage-gib", str(args.storage_gib),
+                "--device", args.device,
+                *(["--cache-dir", str(cache_dir)] if cache_dir else []),
                 "--max-batch", str(parallel),
                 "--output-capacity", "256",
                 "--method", args.method,

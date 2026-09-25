@@ -2050,11 +2050,9 @@ mod tests {
     fn paired_gpu_confidence_rejects_a_nonpositive_round_mean() {
         let small = [1_200; 4];
         let large = [1_000; 4];
-        assert!(
-            paired_difference_confidence_interval(&small, &large, 10, 0)
-                .unwrap()
-                .is_none()
-        );
+        assert!(paired_difference_confidence_interval(&small, &large, 10, 0)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -42,62 +42,70 @@ typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
     projection::Store<activation> beta_out{result, SEISMIC_RESULT_0_STRIDE_0,           \
         SEISMIC_RESULT_0_STRIDE_1, qkv_rows + gate_rows + head_rows}
 
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMV
+template <uint ROWS, uint LANES>
 kernel void gated_delta_project_gemv(RECURRENT_PROJECT_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     RECURRENT_PROJECT_OPERANDS;
-    constexpr uint SG = SEISMIC_TUNE_SIMDGROUPS, R = SEISMIC_TUNE_ROWS, L = SEISMIC_TUNE_LANES;
-    constexpr uint per = projection::gemv_threadgroup_rows<SG, R, L>();
+    uint per = simdgroups * ROWS * (32u / LANES);
     uint rows = uint(SEISMIC_DIM_M);
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
-    projection::threadgroup_squares<SG>(in, rows, squares, sg, lane);
+    projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
     projection::SharedNorm<decltype(in)> x{in, squares};
     uint t0 = (qkv_rows + per - 1) / per, t1 = (gate_rows + per - 1) / per;
     uint t2 = (head_rows + per - 1) / per;
     if (tile < t0) {
-        PROJECTION_FOR_ROWS(rows, projection::gemv<packets::W0, SG, R, MAXM, L>(
-            x, qkv_out, qkv, rows, qkv_rows, k, tile, shared, sg, lane));
+        PROJECTION_FOR_ROWS(rows, projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>(
+            x, qkv_out, qkv, rows, qkv_rows, k, tile, shared, simdgroups, sg, lane));
     } else if (tile < t0 + t1) {
-        PROJECTION_FOR_ROWS(rows, projection::gemv<packets::W1, SG, R, MAXM, L>(
-            x, gate_out, gate, rows, gate_rows, k, tile - t0, shared, sg, lane));
+        PROJECTION_FOR_ROWS(rows, projection::gemv_runtime<packets::W1, ROWS, MAXM, LANES>(
+            x, gate_out, gate, rows, gate_rows, k, tile - t0, shared, simdgroups, sg, lane));
     } else if (tile < t0 + t1 + t2) {
-        PROJECTION_FOR_ROWS(rows, projection::gemv<packets::W2, SG, R, MAXM, L>(
-            x, alpha_out, alpha, rows, head_rows, k, tile - t0 - t1, shared, sg, lane));
+        PROJECTION_FOR_ROWS(rows, projection::gemv_runtime<packets::W2, ROWS, MAXM, LANES>(
+            x, alpha_out, alpha, rows, head_rows, k, tile - t0 - t1, shared, simdgroups, sg, lane));
     } else {
-        PROJECTION_FOR_ROWS(rows, projection::gemv<packets::W3, SG, R, MAXM, L>(
-            x, beta_out, beta, rows, head_rows, k, tile - t0 - t1 - t2, shared, sg, lane));
+        PROJECTION_FOR_ROWS(rows, projection::gemv_runtime<packets::W3, ROWS, MAXM, LANES>(
+            x, beta_out, beta, rows, head_rows, k, tile - t0 - t1 - t2, shared, simdgroups, sg, lane));
     }
 }
+#endif
 
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_BATCH
+template <uint BATCH_ROWS>
 kernel void gated_delta_project_batch(RECURRENT_PROJECT_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     RECURRENT_PROJECT_OPERANDS;
-    constexpr uint SG = SEISMIC_TUNE_BATCH_SIMDGROUPS, R = SEISMIC_TUNE_BATCH_ROWS;
-    constexpr uint per = projection::gemv_batch_threadgroup_rows<SG, R>();
+    uint per = simdgroups * BATCH_ROWS * 8u;
     uint rows = uint(SEISMIC_DIM_M);
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
-    projection::threadgroup_squares<SG>(in, rows, squares, sg, lane);
+    projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
     projection::SharedNorm<decltype(in)> x{in, squares};
     uint t0 = (qkv_rows + per - 1) / per, t1 = (gate_rows + per - 1) / per;
     uint t2 = (head_rows + per - 1) / per;
     if (tile < t0)
-        projection::gemv_batch<packets::W0, SG, R>(x, qkv_out, qkv, rows, qkv_rows, k, tile, shared, sg, lane);
+        projection::gemv_batch_runtime<packets::W0, BATCH_ROWS>(x, qkv_out, qkv, rows, qkv_rows, k,
+            tile, shared, simdgroups, sg, lane);
     else if (tile < t0 + t1)
-        projection::gemv_batch<packets::W1, SG, R>(x, gate_out, gate, rows, gate_rows, k, tile - t0, shared, sg,
-            lane);
+        projection::gemv_batch_runtime<packets::W1, BATCH_ROWS>(x, gate_out, gate, rows, gate_rows, k,
+            tile - t0, shared, simdgroups, sg, lane);
     else if (tile < t0 + t1 + t2)
-        projection::gemv_batch<packets::W2, SG, R>(x, alpha_out, alpha, rows, head_rows, k, tile - t0 - t1,
-            shared, sg, lane);
+        projection::gemv_batch_runtime<packets::W2, BATCH_ROWS>(x, alpha_out, alpha, rows, head_rows, k,
+            tile - t0 - t1, shared, simdgroups, sg, lane);
     else
-        projection::gemv_batch<packets::W3, SG, R>(x, beta_out, beta, rows, head_rows, k, tile - t0 - t1 - t2,
-            shared, sg, lane);
+        projection::gemv_batch_runtime<packets::W3, BATCH_ROWS>(x, beta_out, beta, rows, head_rows, k,
+            tile - t0 - t1 - t2, shared, simdgroups, sg, lane);
 }
+#endif
 
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_STAGE
 kernel void gated_delta_project_stage(RECURRENT_PROJECT_ARGUMENTS,
     uint item [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
@@ -105,6 +113,7 @@ kernel void gated_delta_project_stage(RECURRENT_PROJECT_ARGUMENTS,
     RECURRENT_PROJECT_OPERANDS;
     projection::device_normalize<256>(in, item, normalized, k, norms, thread_index);
 }
+#endif
 
 #define RECURRENT_PROJECT_GEMM(TM, TN)                                                  \
     PROJECTION_GEMM_SHARED(shared, TM, TN);                                             \
@@ -125,16 +134,21 @@ kernel void gated_delta_project_stage(RECURRENT_PROJECT_ARGUMENTS,
             shared, sg, lane)
 
 // 17..64 rows: the fixed small-row tile.
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMM_SMALL
 kernel void gated_delta_project_gemm_small(RECURRENT_PROJECT_ARGUMENTS,
     uint2 tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     RECURRENT_PROJECT_GEMM(projection::small_tile_m, projection::small_tile_n);
 }
+#endif
 
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMM
+template <uint TILE_M, uint TILE_N>
 kernel void gated_delta_project_gemm(RECURRENT_PROJECT_ARGUMENTS,
     uint2 tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    RECURRENT_PROJECT_GEMM(SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N);
+    RECURRENT_PROJECT_GEMM(TILE_M, TILE_N);
 }
+#endif

@@ -16,4 +16,5 @@ sha2 = "=0.11.0"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSError", "NSArray", "NSObject", "NSRange", "NSProcessInfo", "NSData"] }
-objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLLibrary", "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder", "MTLComputeCommandEncoder", "MTLBlitCommandEncoder", "MTLComputePipeline", "MTLBuffer", "MTLResource", "MTLTypes", "MTLAllocation", "MTLPipeline", "MTLCounters", "MTLComputePass", "objc2-core-foundation"] }
+objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLLibrary", "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder", "MTLComputeCommandEncoder", "MTLBlitCommandEncoder", "MTLComputePipeline", "MTLBuffer", "MTLResource", "MTLTypes", "MTLAllocation", "MTLPipeline", "MTLCounters", "MTLComputePass", "objc2-core-foundation", "block2"] }
+libc = "0.2"

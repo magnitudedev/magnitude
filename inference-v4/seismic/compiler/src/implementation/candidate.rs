@@ -7,9 +7,9 @@
 use crate::numerics::NumericalApplicability;
 use seismic_ir::{
     kernel::KernelArena,
+    physical_target::PhysicalDialect,
     schedule::{AnyScalarSlot, ParametricSchedule},
     storage::{GlobalAllocationTopology, LocalAllocationTopology},
-    physical_target::PhysicalDialect,
 };
 use seismic_lang::{
     expr::{AnyExpr, BoolExpr, DecisionId, SymbolKind, TargetPredicate},

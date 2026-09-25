@@ -8,7 +8,6 @@
 //! made it; aliases of one allocation are views, never additional charges.
 //! This is process accounting, not an OS-wide reservation.
 
-use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Seismic-owned charges and enforced limits. This is not global driver or
@@ -23,23 +22,6 @@ pub struct MemoryUsage {
     /// allocations reside in the same physical pool, including `charged`.
     pub pool_charged: u64,
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MemoryLimitError {
-    pub limit: u64,
-    pub charged: u64,
-}
-
-impl fmt::Display for MemoryLimitError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "memory limit {} is below {} retained bytes",
-            self.limit, self.charged
-        )
-    }
-}
-impl std::error::Error for MemoryLimitError {}
 
 /// Process-wide charges against one physical memory pool.
 pub(crate) struct PoolLedger {
@@ -99,16 +81,12 @@ impl MemoryDomain {
         }
     }
 
-    pub(crate) fn set_limit(&self, limit: Option<u64>) -> Result<(), MemoryLimitError> {
+    pub(crate) fn set_limit(&self, limit: Option<u64>) {
         let mut state = self.state();
-        if let Some(limit) = limit.filter(|limit| *limit < state.charged) {
-            return Err(MemoryLimitError {
-                limit,
-                charged: state.charged,
-            });
-        }
+        // A falling platform limit cannot revoke allocations already held by
+        // the device. Keep the lower limit so every further reservation is
+        // refused until releases bring the charge back below it.
         state.limit = limit;
-        Ok(())
     }
 
     pub(crate) fn reserve(
@@ -179,6 +157,21 @@ impl MemoryReservation {
             bytes,
         }
     }
+
+    /// Transfer an already reserved increase into the charge for one
+    /// physical allocation whose backing is being resized in place.
+    pub(crate) fn extend(&mut self, charge: &mut MemoryCharge, bytes: u64) {
+        assert!(Arc::ptr_eq(&self.domain, &charge.domain));
+        let increased = charge
+            .bytes
+            .checked_add(bytes)
+            .expect("recommit charge overflow");
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes)
+            .expect("recommit exceeded reservation");
+        charge.bytes = increased;
+    }
 }
 
 impl Drop for MemoryReservation {
@@ -194,6 +187,19 @@ impl Drop for MemoryReservation {
 pub(crate) struct MemoryCharge {
     domain: Arc<MemoryDomain>,
     bytes: u64,
+}
+
+impl MemoryCharge {
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub(crate) fn shrink(&mut self, bytes: u64) {
+        assert!(bytes <= self.bytes);
+        self.domain
+            .release(self.bytes - bytes, "in-place recommit release");
+        self.bytes = bytes;
+    }
 }
 
 impl Drop for MemoryCharge {
@@ -215,7 +221,7 @@ mod tests {
         for limit in 0..8 {
             for requested in 0..10 {
                 let domain = domain();
-                domain.set_limit(Some(limit)).unwrap();
+                domain.set_limit(Some(limit));
                 let reservation = domain.reserve(requested);
                 if requested > limit {
                     assert!(reservation.is_err());
@@ -226,7 +232,7 @@ mod tests {
                 for transferred in 0..=requested {
                     // Each iteration replays the production reserve/take/drop operations.
                     let domain = self::domain();
-                    domain.set_limit(Some(limit)).unwrap();
+                    domain.set_limit(Some(limit));
                     let mut reservation = domain.reserve(requested).unwrap();
                     let charge = reservation.take(transferred);
                     assert_eq!(domain.usage().charged, requested);
@@ -242,14 +248,51 @@ mod tests {
     }
 
     #[test]
-    fn overflow_and_limit_changes_leave_existing_reservations_intact() {
+    fn resized_charge_transfers_only_growth_and_releases_shrink() {
+        let domain = domain();
+        domain.set_limit(Some(24));
+        let mut initial = domain.reserve(16).unwrap();
+        let mut charge = initial.take(16);
+        drop(initial);
+        assert_eq!(domain.usage().charged, 16);
+        let mut growth = domain.reserve(8).unwrap();
+        growth.extend(&mut charge, 8);
+        drop(growth);
+        assert_eq!(charge.bytes(), 24);
+        assert_eq!(domain.usage().charged, 24);
+        charge.shrink(8);
+        assert_eq!(domain.usage().charged, 8);
+        drop(charge);
+        assert_eq!(domain.usage().charged, 0);
+    }
+
+    #[test]
+    fn overflow_and_lower_limit_leave_existing_reservations_intact() {
         let domain = domain();
         let reservation = domain.reserve(u64::MAX).unwrap();
         assert!(domain.reserve(1).is_err());
-        assert!(domain.set_limit(Some(0)).is_err());
+        domain.set_limit(Some(0));
         assert_eq!(domain.usage().charged, u64::MAX);
-        assert_eq!(domain.usage().limit, None);
+        assert_eq!(domain.usage().limit, Some(0));
+        assert!(domain.reserve(1).is_err());
         drop(reservation);
+        assert_eq!(domain.usage().charged, 0);
+    }
+
+    #[test]
+    fn lower_limit_blocks_growth_until_charges_fall_below_it() {
+        let domain = domain();
+        let first = domain.reserve(4).unwrap();
+        let second = domain.reserve(4).unwrap();
+        domain.set_limit(Some(5));
+        assert_eq!(domain.usage().charged, 8);
+        assert_eq!(domain.reserve(1).err().unwrap().available, 0);
+        drop(second);
+        assert_eq!(domain.usage().charged, 4);
+        assert_eq!(domain.reserve(2).err().unwrap().available, 1);
+        let growth = domain.reserve(1).unwrap();
+        drop(growth);
+        drop(first);
         assert_eq!(domain.usage().charged, 0);
     }
 
@@ -258,7 +301,7 @@ mod tests {
         let pool = PoolLedger::new();
         let metal = MemoryDomain::new(pool.clone());
         let cpu = MemoryDomain::new(pool.clone());
-        metal.set_limit(Some(8)).unwrap();
+        metal.set_limit(Some(8));
         let mut gpu = metal.reserve(6).unwrap();
         let _gpu = gpu.take(6);
         let host = cpu.reserve(5).unwrap();
@@ -280,7 +323,7 @@ mod tests {
     #[test]
     fn concurrent_reservations_cannot_both_spend_the_same_capacity() {
         let domain = domain();
-        domain.set_limit(Some(10)).unwrap();
+        domain.set_limit(Some(10));
         let ready = std::sync::Barrier::new(3);
         let release = std::sync::Barrier::new(3);
         std::thread::scope(|scope| {

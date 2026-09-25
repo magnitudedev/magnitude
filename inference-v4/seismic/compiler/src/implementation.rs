@@ -12,22 +12,25 @@
 //! products. Owned continuations may pause this construction, but do not expose
 //! arbitrary IR authorship or replay a requested source value out of order.
 
-pub(crate) mod native;
-pub(crate) mod candidate;
 mod call;
+pub(crate) mod candidate;
+pub(crate) mod native;
 pub(crate) use call::CallConstruction;
 pub(crate) use internals::BuilderState;
 
 use crate::numerics::NumericalApplicability;
+use crate::target::{CompilerRegistry, TargetConstants};
 use candidate::{
     ChoiceDeclaration, ConstructedCandidate, ConstructedCandidateIdentity,
     ConstructedCandidateParts, ImplementationProvenance, PublishedResult, ResultPublication,
 };
-use crate::target::{CompilerRegistry, TargetConstants};
 use seismic_ir::construction::Construction;
 use seismic_ir::kernel::KernelArena;
 use seismic_ir::repr::ScalarKind;
-use seismic_ir::schedule::{AnyScalarSlot, ClosedSchedule, HostQuantityKind, HostQuantitySlot, ParametricSchedule, ScheduleBuilder};
+use seismic_ir::schedule::{
+    AnyScalarSlot, ClosedSchedule, HostQuantityKind, HostQuantitySlot, ParametricSchedule,
+    ScheduleBuilder,
+};
 use seismic_ir::storage::{
     AnyBufferView, GlobalAllocationId, GlobalAllocationTopology, LocalAllocationTopology,
 };
@@ -244,10 +247,17 @@ fn native_hard_constraints<B: seismic_native_target::TargetFamily>(
     }
     use seismic_ir::schedule::{RequirementPoint, ScheduleStep};
     let storage = family.global_allocations();
-    schedule.scoped_requirements(arena, storage.views(), &mut |arena, point| match point {
-        RequirementPoint::Step(ScheduleStep::Launch(id)) => launch_requirements[id.index() as usize],
-        _ => arena.bool(true),
-    }, &mut |arena, step| acquisition_established(arena, storage, step))
+    schedule.scoped_requirements(
+        arena,
+        storage.views(),
+        &mut |arena, point| match point {
+            RequirementPoint::Step(ScheduleStep::Launch(id)) => {
+                launch_requirements[id.index() as usize]
+            }
+            _ => arena.bool(true),
+        },
+        &mut |arena, step| acquisition_established(arena, storage, step),
+    )
 }
 
 /// A successful acquisition establishes that its allocation's geometry is
@@ -258,7 +268,9 @@ fn acquisition_established(
     step: &seismic_ir::schedule::ScheduleStep,
 ) -> BoolExpr {
     if let seismic_ir::schedule::ScheduleStep::BeginAllocationInstance { source, .. } = step {
-        if let seismic_ir::storage::ViewBase::Allocation(id) = storage.views()[source.index() as usize].base {
+        if let seismic_ir::storage::ViewBase::Allocation(id) =
+            storage.views()[source.index() as usize].base
+        {
             return arena.side_conditions(storage.allocation(id).bytes.into());
         }
     }
@@ -381,7 +393,9 @@ impl<B: seismic_native_target::TargetFamily> Implementation<B> {
     pub(crate) fn assignment_identity(&self) -> [u8; 32] {
         self.assignment_identity
     }
-    pub(crate) fn native_index_bits(&self) -> u32 { self.family.native_index_bits }
+    pub(crate) fn native_index_bits(&self) -> u32 {
+        self.family.native_index_bits
+    }
 
     pub fn global_allocations(&self) -> &GlobalAllocationTopology {
         self.family.global_allocations()
@@ -697,7 +711,14 @@ impl<'a, B: seismic_native_target::TargetFamily> ConstructionContext<'a, B> {
         precision: &'a PrecisionPolicy,
     ) -> Self {
         let (arena, program, _) = entry.into_parts();
-        Self { arena, program, target, registry, constants, precision }
+        Self {
+            arena,
+            program,
+            target,
+            registry,
+            constants,
+            precision,
+        }
     }
 
     pub(crate) fn program(&self) -> &'a SemanticProgram {
@@ -737,7 +758,11 @@ pub(crate) fn begin_source_construction<'a, B: seismic_native_target::TargetFami
             "portable body requires a source-owned mapping"
         ),
         CandidateKind::Lowering { backend } | CandidateKind::Helper { backend } => {
-            assert_eq!(backend, B::NAME, "authored body targets a different backend");
+            assert_eq!(
+                backend,
+                B::NAME,
+                "authored body targets a different backend"
+            );
             assert_eq!(
                 mode,
                 crate::portable::SemanticMode::AuthoredBackend,
@@ -969,17 +994,29 @@ impl<'a, B: seismic_native_target::TargetFamily> ImplementationBuilder<'a, B> {
         self.inner.function
     }
 
-    pub(crate) fn portable_allocate_tensor_axes(&mut self, value: SemanticValueId, axes: Vec<NatExpr>) -> AnyBufferView {
-        self.inner.portable_allocate_tensor_axes(value,axes)
+    pub(crate) fn portable_allocate_tensor_axes(
+        &mut self,
+        value: SemanticValueId,
+        axes: Vec<NatExpr>,
+    ) -> AnyBufferView {
+        self.inner.portable_allocate_tensor_axes(value, axes)
     }
-    pub(crate) fn portable_relocate_tensor(&mut self, source: &crate::portable::initialization::StoredView, destination: AnyBufferView) {
+    pub(crate) fn portable_relocate_tensor(
+        &mut self,
+        source: &crate::portable::initialization::StoredView,
+        destination: AnyBufferView,
+    ) {
         self.inner.portable_relocate_tensor(source, destination)
     }
     pub(crate) fn portable_publish_tensor(&mut self, value: SemanticValueId, view: AnyBufferView) {
         self.inner.portable_publish_tensor(value, view)
     }
-    pub(crate) fn portable_views_may_overlap(&self, left: AnyBufferView, right: AnyBufferView) -> bool {
-        self.inner.portable_views_may_overlap(left,right)
+    pub(crate) fn portable_views_may_overlap(
+        &self,
+        left: AnyBufferView,
+        right: AnyBufferView,
+    ) -> bool {
+        self.inner.portable_views_may_overlap(left, right)
     }
     pub(crate) fn allocate_tensor_product(
         &mut self,
@@ -993,7 +1030,10 @@ impl<'a, B: seismic_native_target::TargetFamily> ImplementationBuilder<'a, B> {
     pub(crate) fn portable_publish(&mut self, value: SemanticValueId) -> ScalarPublication {
         self.inner.portable_publish(value)
     }
-    pub(crate) fn portable_affine_view(&mut self, view: &crate::portable::initialization::StoredView) -> Option<AnyBufferView> {
+    pub(crate) fn portable_affine_view(
+        &mut self,
+        view: &crate::portable::initialization::StoredView,
+    ) -> Option<AnyBufferView> {
         self.inner.portable_affine_view(view)
     }
 
@@ -1052,11 +1092,17 @@ impl<'a, B: seismic_native_target::TargetFamily> ImplementationBuilder<'a, B> {
     }
 
     pub(crate) fn finish_value_branch(
-        &mut self, branch: ScheduleBranch,
+        &mut self,
+        branch: ScheduleBranch,
         then_values: seismic_ir::region::Product<seismic_ir::region::ValueOperand>,
         else_values: seismic_ir::region::Product<seismic_ir::region::ValueOperand>,
     ) -> seismic_ir::region::Product<seismic_ir::region::ValueDestination> {
-        let destination = self.inner.finish_value_branch(branch.parent, branch.first_region, then_values, else_values);
+        let destination = self.inner.finish_value_branch(
+            branch.parent,
+            branch.first_region,
+            then_values,
+            else_values,
+        );
         self.finish_source_branch(branch);
         destination
     }
@@ -1100,27 +1146,46 @@ mod internals {
         function: &SemanticFunction,
         parameter: &ContractParameter,
     ) -> &'a seismic_lang::entry::Parameter {
-        let formal = function.parameters().iter().find(|formal| formal.value == parameter.value)
+        let formal = function
+            .parameters()
+            .iter()
+            .find(|formal| formal.value == parameter.value)
             .expect("contract parameter belongs to the selected body");
-        let seismic_lang::entry::FunctionParameterOrigin::Source { ordinal, path } = &formal.origin else {
+        let seismic_lang::entry::FunctionParameterOrigin::Source { ordinal, path } = &formal.origin
+        else {
             panic!("public entry schema contains a captured helper dimension")
         };
-        let actual = schema.parameters().iter().find(|actual|
-            actual.source == *ordinal && actual.path == *path)
+        let actual = schema
+            .parameters()
+            .iter()
+            .find(|actual| actual.source == *ordinal && actual.path == *path)
             .expect("checked body parameter has its entry ABI coordinate");
         use seismic_lang::entry::TensorAccess;
         match (&parameter.ty, &actual.kind) {
-            (SemanticType::Tensor(tensor), ParameterKind::Tensor { access, representation, axes }) => {
+            (
+                SemanticType::Tensor(tensor),
+                ParameterKind::Tensor {
+                    access,
+                    representation,
+                    axes,
+                },
+            ) => {
                 assert_eq!(tensor.representation, *representation);
                 assert_eq!(&tensor.axes, axes);
-                assert!(matches!((parameter.access, access),
+                assert!(matches!(
+                    (parameter.access, access),
                     (ParameterAccess::Owned, TensorAccess::Owned)
-                    | (ParameterAccess::Shared, TensorAccess::Shared)
-                    | (ParameterAccess::Mutable, TensorAccess::Mutable)));
+                        | (ParameterAccess::Shared, TensorAccess::Shared)
+                        | (ParameterAccess::Mutable, TensorAccess::Mutable)
+                ));
             }
-            (SemanticType::Scalar(expected), ParameterKind::Scalar { dtype, .. }) => assert_eq!(expected, dtype),
+            (SemanticType::Scalar(expected), ParameterKind::Scalar { dtype, .. }) => {
+                assert_eq!(expected, dtype)
+            }
             (SemanticType::Index { bound: expected }, ParameterKind::Index { bound, .. })
-            | (SemanticType::Range { bound: expected }, ParameterKind::Range { bound, .. }) => assert_eq!(expected, bound),
+            | (SemanticType::Range { bound: expected }, ParameterKind::Range { bound, .. }) => {
+                assert_eq!(expected, bound)
+            }
             _ => panic!("checked body parameter differs from the entry ABI type"),
         }
         actual
@@ -1130,7 +1195,9 @@ mod internals {
     /// the IR owner before the remaining compiler metadata has been finalized;
     /// deref keeps the open-phase implementation uncluttered without exposing
     /// an optional lifecycle in the public IR API.
-    pub(super) struct OpenConstruction<B: seismic_native_target::TargetFamily>(Option<Construction<B>>);
+    pub(super) struct OpenConstruction<B: seismic_native_target::TargetFamily>(
+        Option<Construction<B>>,
+    );
     impl<B: seismic_native_target::TargetFamily> OpenConstruction<B> {
         fn new(construction: Construction<B>) -> Self {
             Self(Some(construction))
@@ -1174,27 +1241,52 @@ mod internals {
             value: &crate::portable::initialization::StoredTensor,
             _: &crate::portable::BindingPath,
         ) -> crate::portable::initialization::StoredTensor {
-            let view = value.view.map(|view| self.remap_view(*view), |value| *value);
+            let view = value
+                .view
+                .map(|view| self.remap_view(*view), |value| *value);
             crate::portable::initialization::StoredTensor {
                 view,
                 ..value.clone()
             }
         }
-        fn remap_slot(&mut self, source: AnyScalarSlot, _: &crate::portable::BindingPath) -> AnyScalarSlot {
+        fn remap_slot(
+            &mut self,
+            source: AnyScalarSlot,
+            _: &crate::portable::BindingPath,
+        ) -> AnyScalarSlot {
             *self
                 .slots
                 .entry(source)
                 .or_insert_with(|| self.construction.schedule_state().capture_slot(source))
         }
-        fn remap_quantity_slot(&mut self, source: HostQuantitySlot, _: &crate::portable::BindingPath) -> HostQuantitySlot {
-            *self
-                .quantities
-                .entry(source)
-                .or_insert_with(|| self.construction.schedule_state().capture_quantity_slot(source))
+        fn remap_quantity_slot(
+            &mut self,
+            source: HostQuantitySlot,
+            _: &crate::portable::BindingPath,
+        ) -> HostQuantitySlot {
+            *self.quantities.entry(source).or_insert_with(|| {
+                self.construction
+                    .schedule_state()
+                    .capture_quantity_slot(source)
+            })
         }
-        fn remap_prepared(&mut self, value: crate::portable::PreparedArg, _: &crate::portable::BindingPath) -> crate::portable::PreparedArg { value }
-        fn remap_axis(&mut self, value: NatExpr, _: &crate::portable::BindingPath) -> NatExpr { value }
-        fn remap_selector(&mut self, value: crate::portable::BindingSelector, _: &crate::portable::BindingPath) -> crate::portable::BindingSelector { value }
+        fn remap_prepared(
+            &mut self,
+            value: crate::portable::PreparedArg,
+            _: &crate::portable::BindingPath,
+        ) -> crate::portable::PreparedArg {
+            value
+        }
+        fn remap_axis(&mut self, value: NatExpr, _: &crate::portable::BindingPath) -> NatExpr {
+            value
+        }
+        fn remap_selector(
+            &mut self,
+            value: crate::portable::BindingSelector,
+            _: &crate::portable::BindingPath,
+        ) -> crate::portable::BindingSelector {
+            value
+        }
     }
     impl<B: seismic_native_target::TargetFamily> CaptureBindings<'_, B> {
         fn remap_view(&mut self, source: AnyBufferView) -> AnyBufferView {
@@ -1306,24 +1398,44 @@ mod internals {
         ) -> Self {
             let mut contract = FunctionContract::derive(function);
             if let Some(schema) = root_schema {
-                assert_eq!(contract.parameters.len(), schema.parameters().len(), "checked root parameter arity");
-                assert_eq!(contract.results.len(), schema.results().len(), "checked root result arity");
+                assert_eq!(
+                    contract.parameters.len(),
+                    schema.parameters().len(),
+                    "checked root parameter arity"
+                );
+                assert_eq!(
+                    contract.results.len(),
+                    schema.results().len(),
+                    "checked root result arity"
+                );
                 for (result, leaf) in contract.results.iter_mut().zip(schema.results()) {
                     use seismic_lang::entry::ResultKind;
                     match (&result.ty, &leaf.kind) {
-                        (SemanticType::Tensor(tensor), ResultKind::Tensor { representation, axes }) => {
+                        (
+                            SemanticType::Tensor(tensor),
+                            ResultKind::Tensor {
+                                representation,
+                                axes,
+                            },
+                        ) => {
                             assert_eq!(tensor.representation, *representation);
                             assert_eq!(tensor.axes.len(), axes.len());
                         }
-                        (SemanticType::Scalar(expected), ResultKind::Scalar(actual)) => assert_eq!(expected, actual),
+                        (SemanticType::Scalar(expected), ResultKind::Scalar(actual)) => {
+                            assert_eq!(expected, actual)
+                        }
                         (SemanticType::Index { .. }, ResultKind::Index { .. })
-                        | (SemanticType::Range { .. }, ResultKind::Range { .. }) => {},
+                        | (SemanticType::Range { .. }, ResultKind::Range { .. }) => {}
                         _ => panic!("checked body result differs from the entry ABI type"),
                     }
                     match (&mut result.ty, &leaf.kind) {
-                        (SemanticType::Tensor(tensor), ResultKind::Tensor { axes, .. }) => tensor.axes.clone_from(axes),
+                        (SemanticType::Tensor(tensor), ResultKind::Tensor { axes, .. }) => {
+                            tensor.axes.clone_from(axes)
+                        }
                         (SemanticType::Index { bound: actual }, ResultKind::Index { bound })
-                        | (SemanticType::Range { bound: actual }, ResultKind::Range { bound }) => *actual = *bound,
+                        | (SemanticType::Range { bound: actual }, ResultKind::Range { bound }) => {
+                            *actual = *bound
+                        }
                         _ => {}
                     }
                     result.paths = vec![leaf.path.clone()];
@@ -1349,7 +1461,8 @@ mod internals {
             );
             let mut value_views = HashMap::new();
             let mut scalar_symbols = HashMap::new();
-            let mut pending_result_paths: HashMap<SemanticValueId, Vec<(Vec<u32>, Vec<NatExpr>)>> = HashMap::new();
+            let mut pending_result_paths: HashMap<SemanticValueId, Vec<(Vec<u32>, Vec<NatExpr>)>> =
+                HashMap::new();
             for parameter in &contract.parameters {
                 if matches!(site, CallSite::Spliced { .. }) {
                     continue;
@@ -1362,12 +1475,24 @@ mod internals {
                             value: parameter.value,
                             abi,
                         };
-                        let bytes = seismic_ir::storage::tensor_bytes(arena, tensor.representation, &tensor.axes);
-                        let allocation = construction.storage_mut().allocate(kind, bytes,
-                            seismic_ir::storage::representation_alignment(tensor.representation));
+                        let bytes = seismic_ir::storage::tensor_bytes(
+                            arena,
+                            tensor.representation,
+                            &tensor.axes,
+                        );
+                        let allocation = construction.storage_mut().allocate(
+                            kind,
+                            bytes,
+                            seismic_ir::storage::representation_alignment(tensor.representation),
+                        );
                         let zero = arena.nat(0);
-                        let view = construction.storage_mut().dense_view(arena, allocation,
-                            tensor.representation, zero, tensor.axes.clone());
+                        let view = construction.storage_mut().dense_view(
+                            arena,
+                            allocation,
+                            tensor.representation,
+                            zero,
+                            tensor.axes.clone(),
+                        );
                         let source = construction.view(view, tensor.representation);
                         let actual = construction.bind_argument_tensor(arena, source);
                         value_views.insert(parameter.value, actual);
@@ -1478,9 +1603,16 @@ mod internals {
             if matches!(site, CallSite::Root) {
                 for result in &contract.results {
                     if let SemanticType::Tensor(tensor) = &result.ty {
-                        pending_result_paths.entry(result.value).or_default().extend(
-                            result.paths.iter().cloned().map(|path| (path, tensor.axes.clone()))
-                        );
+                        pending_result_paths
+                            .entry(result.value)
+                            .or_default()
+                            .extend(
+                                result
+                                    .paths
+                                    .iter()
+                                    .cloned()
+                                    .map(|path| (path, tensor.axes.clone())),
+                            );
                     }
                 }
             }
@@ -1585,23 +1717,47 @@ mod internals {
             );
             (kernel, &self.state.bindings)
         }
-        pub(crate) fn portable_allocate_tensor_axes(&mut self, value: SemanticValueId, axes: Vec<NatExpr>) -> AnyBufferView {
-            if let Some(view)=self.state.physical.value_views.get(&value).copied() { return view; }
-            let SemanticType::Tensor(mut tensor)=self.function.value(value).ty.clone() else { panic!("tensor allocation has scalar type") };
-            tensor.axes=axes;
-            let view=self.allocate_tensor_product(&tensor);
-            self.state.physical.value_views.insert(value,view);
+        pub(crate) fn portable_allocate_tensor_axes(
+            &mut self,
+            value: SemanticValueId,
+            axes: Vec<NatExpr>,
+        ) -> AnyBufferView {
+            if let Some(view) = self.state.physical.value_views.get(&value).copied() {
+                return view;
+            }
+            let SemanticType::Tensor(mut tensor) = self.function.value(value).ty.clone() else {
+                panic!("tensor allocation has scalar type")
+            };
+            tensor.axes = axes;
+            let view = self.allocate_tensor_product(&tensor);
+            self.state.physical.value_views.insert(value, view);
             view
         }
         /// Relocate dense storage without interpreting unspecified elements as
         /// source values. The same logical map used by kernel accesses derives
         /// byte addresses; the reached Copy owns their physical validity.
-        pub(crate) fn portable_relocate_tensor(&mut self, source: &crate::portable::initialization::StoredView, destination: AnyBufferView) {
+        pub(crate) fn portable_relocate_tensor(
+            &mut self,
+            source: &crate::portable::initialization::StoredView,
+            destination: AnyBufferView,
+        ) {
             use seismic_ir::{region::Product, tensor_view::CoordinateOp};
             let backing = *source.backing();
-            let source_layout = self.state.construction.storage().view_layout(backing).clone();
-            let destination_layout = self.state.construction.storage().view_layout(destination).clone();
-            let seismic_lang::registry::RepresentationKind::Dense(dtype) = seismic_lang::registry::representation_info(backing.representation()).kind else {
+            let source_layout = self
+                .state
+                .construction
+                .storage()
+                .view_layout(backing)
+                .clone();
+            let destination_layout = self
+                .state
+                .construction
+                .storage()
+                .view_layout(destination)
+                .clone();
+            let seismic_lang::registry::RepresentationKind::Dense(dtype) =
+                seismic_lang::registry::representation_info(backing.representation()).kind
+            else {
                 panic!("raw logical relocation requires dense storage")
             };
             assert_eq!(backing.representation(), destination.representation());
@@ -1611,8 +1767,15 @@ mod internals {
             let count = self.arena.nat_product(source.extents());
             // No coordinate exists for an empty tensor. Avoid constructing
             // division by a statically zero axis even inside an unvisited body.
-            if count == zero { return; }
-            let repeat = self.begin_value_repeat(zero, count, seismic_ir::schedule::RepeatVisits::Ordered, Product::Unit);
+            if count == zero {
+                return;
+            }
+            let repeat = self.begin_value_repeat(
+                zero,
+                count,
+                seismic_ir::schedule::RepeatVisits::Ordered,
+                Product::Unit,
+            );
             let linear = repeat.binding().index;
             let mut remaining = linear;
             let mut indices = vec![zero; source.extents().len()];
@@ -1620,47 +1783,89 @@ mod internals {
                 indices[axis] = self.arena.nat_rem(remaining, source.extents()[axis]);
                 remaining = self.arena.nat_div(remaining, source.extents()[axis]);
             }
-            let indices = source.dense_coordinates(&indices, zero, |op, a, b| match op {
-                CoordinateOp::Add => self.arena.nat_add(a,b),
-                CoordinateOp::Mul => self.arena.nat_mul(a,b),
-                CoordinateOp::Div => self.arena.nat_div(a,b),
-                CoordinateOp::Rem => self.arena.nat_rem(a,b),
-            }).expect("dense relocation cannot contain plane projection");
+            let indices = source
+                .dense_coordinates(&indices, zero, |op, a, b| match op {
+                    CoordinateOp::Add => self.arena.nat_add(a, b),
+                    CoordinateOp::Mul => self.arena.nat_mul(a, b),
+                    CoordinateOp::Div => self.arena.nat_div(a, b),
+                    CoordinateOp::Rem => self.arena.nat_rem(a, b),
+                })
+                .expect("dense relocation cannot contain plane projection");
             let mut source_element = zero;
             for (index, stride) in indices.iter().zip(&source_layout.strides) {
-                let offset = self.arena.nat_mul(*index,*stride);
-                source_element = self.arena.nat_add(source_element,offset);
+                let offset = self.arena.nat_mul(*index, *stride);
+                source_element = self.arena.nat_add(source_element, offset);
             }
             let width = self.arena.nat(u64::from(dtype.bytes()));
-            let source_offset = self.arena.nat_mul(source_element,width);
-            let destination_offset = self.arena.nat_mul(linear,width);
-            let source_index = self.state.construction.storage_mut().subview(self.arena,backing.index(),source_offset,vec![],vec![]);
-            let destination_index = self.state.construction.storage_mut().subview(self.arena,destination.index(),destination_offset,vec![],vec![]);
-            let source_element = self.state.construction.view(source_index,backing.representation());
-            let destination_element = self.state.construction.view(destination_index,destination.representation());
-            self.schedule().copy_any(source_element,destination_element);
-            self.finish_value_repeat(repeat,Product::Unit);
+            let source_offset = self.arena.nat_mul(source_element, width);
+            let destination_offset = self.arena.nat_mul(linear, width);
+            let source_index = self.state.construction.storage_mut().subview(
+                self.arena,
+                backing.index(),
+                source_offset,
+                vec![],
+                vec![],
+            );
+            let destination_index = self.state.construction.storage_mut().subview(
+                self.arena,
+                destination.index(),
+                destination_offset,
+                vec![],
+                vec![],
+            );
+            let source_element = self
+                .state
+                .construction
+                .view(source_index, backing.representation());
+            let destination_element = self
+                .state
+                .construction
+                .view(destination_index, destination.representation());
+            self.schedule()
+                .copy_any(source_element, destination_element);
+            self.finish_value_repeat(repeat, Product::Unit);
         }
-        pub(crate) fn portable_publish_tensor(&mut self, value: SemanticValueId, view: AnyBufferView) {
-            let paths = self.state.pending_result_paths.get(&value)
-                .expect("root tensor publication has no declared result path").clone();
+        pub(crate) fn portable_publish_tensor(
+            &mut self,
+            value: SemanticValueId,
+            view: AnyBufferView,
+        ) {
+            let paths = self
+                .state
+                .pending_result_paths
+                .get(&value)
+                .expect("root tensor publication has no declared result path")
+                .clone();
             for (path, declared_axes) in paths {
-                self.state.construction.schedule(self.arena, self.state.schedule_region)
+                self.state
+                    .construction
+                    .schedule(self.arena, self.state.schedule_region)
                     .publish_tensor(view, path, declared_axes);
             }
         }
-        pub(crate) fn portable_views_may_overlap(&self, left: AnyBufferView, right: AnyBufferView) -> bool {
-            self.state.construction.may_overlap_views(left,right)
+        pub(crate) fn portable_views_may_overlap(
+            &self,
+            left: AnyBufferView,
+            right: AnyBufferView,
+        ) -> bool {
+            self.state.construction.may_overlap_views(left, right)
         }
         pub(crate) fn allocate_tensor_product(
             &mut self,
             tensor: &seismic_lang::entry::TensorSemantics,
         ) -> AnyBufferView {
             let (_, index) = self.state.construction.storage_mut().tensor(
-                self.arena, GlobalBufferKind::Arena, tensor.representation, tensor.axes.clone(),
+                self.arena,
+                GlobalBufferKind::Arena,
+                tensor.representation,
+                tensor.axes.clone(),
             );
             let view = self.state.construction.view(index, tensor.representation);
-            self.state.construction.begin_tensor_instance(self.arena, self.state.schedule_region, view)
+            self.state.construction.begin_tensor_instance(
+                self.arena,
+                self.state.schedule_region,
+                view,
+            )
         }
         pub(crate) fn portable_binding(&self, value: SemanticValueId) -> PhysicalBinding {
             self.portable_existing_binding(value)
@@ -1730,8 +1935,14 @@ mod internals {
             self.state.physical.result_slots.insert(value, publication);
             publication
         }
-        pub(crate) fn portable_affine_view(&mut self, view: &crate::portable::initialization::StoredView) -> Option<AnyBufferView> {
-            self.state.construction.storage_mut().affine_view(self.arena,view)
+        pub(crate) fn portable_affine_view(
+            &mut self,
+            view: &crate::portable::initialization::StoredView,
+        ) -> Option<AnyBufferView> {
+            self.state
+                .construction
+                .storage_mut()
+                .affine_view(self.arena, view)
         }
         pub(crate) fn portable_layout(
             &self,
@@ -1803,11 +2014,19 @@ mod internals {
                 .begin_branch(self.state.schedule_region, condition)
         }
         pub(crate) fn finish_value_branch(
-            &mut self, parent: u32, then_region: u32,
+            &mut self,
+            parent: u32,
+            then_region: u32,
             then_values: seismic_ir::region::Product<seismic_ir::region::ValueOperand>,
             else_values: seismic_ir::region::Product<seismic_ir::region::ValueOperand>,
         ) -> seismic_ir::region::Product<seismic_ir::region::ValueDestination> {
-            self.state.construction.finish_value_branch(self.arena, parent, then_region, then_values, else_values)
+            self.state.construction.finish_value_branch(
+                self.arena,
+                parent,
+                then_region,
+                then_values,
+                else_values,
+            )
         }
         pub(crate) fn begin_value_repeat(
             &mut self,
@@ -1834,7 +2053,11 @@ mod internals {
                 .construction
                 .finish_value_repeat(repeat.product, backedge)
         }
-        pub(super) fn close(mut self, closed: ClosedSchedule, mode: crate::portable::SemanticMode) -> ConstructedCandidate<B> {
+        pub(super) fn close(
+            mut self,
+            closed: ClosedSchedule,
+            mode: crate::portable::SemanticMode,
+        ) -> ConstructedCandidate<B> {
             let coverage = self.state.semantic_coverage;
             let allocation_ids = (0..self.state.construction.storage().allocation_count())
                 .map(|ordinal| self.state.construction.allocation(ordinal))
@@ -1885,21 +2108,23 @@ mod internals {
             let raw_constraints = self.arena.all(&self.state.constraints);
             let side_conditions = self.arena.side_conditions(AnyExpr::Bool(raw_constraints));
             let hard_constraints = self.arena.and(side_conditions, raw_constraints);
-            let required = self.program.families().any(|(_, family)| {
-                family.reference().function() == self.function.id()
-            });
-            let numerical_applicability = if required && mode == crate::portable::SemanticMode::Portable {
-                self.state.numerical_children.clone()
-            } else {
-                NumericalApplicability::selected_replacement(
-                    self.arena,
-                    self.program,
-                    self.function,
-                    &self.state.bindings,
-                    &executable,
-                    &self.state.numerical_children,
-                )
-            };
+            let required = self
+                .program
+                .families()
+                .any(|(_, family)| family.reference().function() == self.function.id());
+            let numerical_applicability =
+                if required && mode == crate::portable::SemanticMode::Portable {
+                    self.state.numerical_children.clone()
+                } else {
+                    NumericalApplicability::selected_replacement(
+                        self.arena,
+                        self.program,
+                        self.function,
+                        &self.state.bindings,
+                        &executable,
+                        &self.state.numerical_children,
+                    )
+                };
             let roots = self.register_roots(
                 executable.storage(),
                 &allocation_ids,
@@ -1936,14 +2161,28 @@ mod internals {
                 for path in &result.paths {
                     let binding = match &result.ty {
                         SemanticType::Tensor(tensor) => {
-                            let publications = executable.storage().result_views().iter()
-                                .filter(|publication| &publication.path == path).collect::<Vec<_>>();
-                            assert!(!publications.is_empty(), "closed result tensor path has no publication operation");
-                            assert!(publications.iter().all(|publication| {
-                                let view = executable.storage().view(publication.view);
-                                view.representation == tensor.representation && view.extents.len() == tensor.axes.len()
-                            }), "source result publication changed its declared tensor type");
-                            PublishedResult::Buffer { representation: tensor.representation, rank: tensor.axes.len() }
+                            let publications = executable
+                                .storage()
+                                .result_views()
+                                .iter()
+                                .filter(|publication| &publication.path == path)
+                                .collect::<Vec<_>>();
+                            assert!(
+                                !publications.is_empty(),
+                                "closed result tensor path has no publication operation"
+                            );
+                            assert!(
+                                publications.iter().all(|publication| {
+                                    let view = executable.storage().view(publication.view);
+                                    view.representation == tensor.representation
+                                        && view.extents.len() == tensor.axes.len()
+                                }),
+                                "source result publication changed its declared tensor type"
+                            );
+                            PublishedResult::Buffer {
+                                representation: tensor.representation,
+                                rank: tensor.axes.len(),
+                            }
                         }
                         SemanticType::Scalar(_) => {
                             let ScalarPublication::Scalar(slot) = self
@@ -2079,15 +2318,20 @@ mod internals {
                 // exact geometry and byte demand. Rechecking its own span as
                 // `bytes <= bytes` introduces reached tensor slots into an
                 // invocation guard without establishing any new property.
-                if matches!(layout.mapping, seismic_ir::storage::ViewMapping::WholeAllocation) {
+                if matches!(
+                    layout.mapping,
+                    seismic_ir::storage::ViewMapping::WholeAllocation
+                ) {
                     view_requirements.push(self.arena.bool(true));
                     continue;
                 }
-                if let seismic_ir::storage::ViewMapping::Transpose { source, .. } = &layout.mapping {
+                if let seismic_ir::storage::ViewMapping::Transpose { source, .. } = &layout.mapping
+                {
                     view_requirements.push(view_requirements[source.index() as usize]);
                     continue;
                 }
-                if matches!(layout.base, seismic_ir::storage::ViewBase::TensorValue(id) if id.index() as usize == view_ordinal) {
+                if matches!(layout.base, seismic_ir::storage::ViewBase::TensorValue(id) if id.index() as usize == view_ordinal)
+                {
                     view_requirements.push(self.arena.bool(true));
                     continue;
                 }
@@ -2188,9 +2432,11 @@ mod internals {
                         .chain(local.strides.iter().copied())
                         .chain(std::iter::once(local.bytes))
                     {
-                        self.state
-                            .constraints
-                            .push(self.arena.nat_cmp(CmpOp::Le, value, max_index));
+                        self.state.constraints.push(self.arena.nat_cmp(
+                            CmpOp::Le,
+                            value,
+                            max_index,
+                        ));
                     }
                 }
                 for total in [
@@ -2303,40 +2549,68 @@ mod internals {
                 let defined = self.arena.side_conditions(predicate.into());
                 launch_constraints.push(self.arena.and(defined, predicate));
             }
-            let scoped = schedule.scoped_requirements(self.arena, storage.views(), &mut |arena, point| {
-                use seismic_ir::schedule::RequirementPoint;
-                let mut terms = Vec::new();
-                match point {
-                    RequirementPoint::Step(ScheduleStep::Launch(id)) => {
-                        terms.push(launch_constraints[id.index() as usize]);
-                        let mut views = Vec::new();
-                        for binding in &kernels[schedule.launch(*id).kernel.index() as usize].interface().bindings {
-                            views.push(view_requirements[binding.view.index() as usize]);
+            let scoped = schedule.scoped_requirements(
+                self.arena,
+                storage.views(),
+                &mut |arena, point| {
+                    use seismic_ir::schedule::RequirementPoint;
+                    let mut terms = Vec::new();
+                    match point {
+                        RequirementPoint::Step(ScheduleStep::Launch(id)) => {
+                            terms.push(launch_constraints[id.index() as usize]);
+                            let mut views = Vec::new();
+                            for binding in &kernels[schedule.launch(*id).kernel.index() as usize]
+                                .interface()
+                                .bindings
+                            {
+                                views.push(view_requirements[binding.view.index() as usize]);
+                            }
+                            let views = arena.all(&views);
+                            let reached = arena.not(schedule.launch(*id).empty);
+                            terms.push(arena.implies(reached, views));
                         }
-                        let views = arena.all(&views);
-                        let reached = arena.not(schedule.launch(*id).empty);
-                        terms.push(arena.implies(reached, views));
+                        RequirementPoint::Step(ScheduleStep::Copy(copy)) => {
+                            terms.push(view_requirements[copy.source.index() as usize]);
+                            terms.push(view_requirements[copy.destination.index() as usize]);
+                        }
+                        RequirementPoint::Step(ScheduleStep::Fill(fill)) => {
+                            terms.push(view_requirements[fill.destination.index() as usize])
+                        }
+                        RequirementPoint::Step(ScheduleStep::ScalarRead(read)) => {
+                            terms.push(view_requirements[read.source.index() as usize])
+                        }
+                        RequirementPoint::Step(ScheduleStep::PublishTensor { view, .. }) => {
+                            terms.push(view_requirements[view.index() as usize])
+                        }
+                        RequirementPoint::BranchResult(results, then) => {
+                            results.visit(&mut |result| {
+                                if let seismic_ir::region::ValueOperand::Tensor(view) = if then {
+                                    result.then_value()
+                                } else {
+                                    result.else_value()
+                                } {
+                                    terms.push(view_requirements[view.index() as usize]);
+                                }
+                            })
+                        }
+                        RequirementPoint::RepeatInitial(carries) => carries.visit(&mut |carry| {
+                            if let seismic_ir::region::ValueOperand::Tensor(view) = carry.initial()
+                            {
+                                terms.push(view_requirements[view.index() as usize]);
+                            }
+                        }),
+                        RequirementPoint::RepeatBackedge(carries) => carries.visit(&mut |carry| {
+                            if let seismic_ir::region::ValueOperand::Tensor(view) = carry.backedge()
+                            {
+                                terms.push(view_requirements[view.index() as usize]);
+                            }
+                        }),
+                        _ => {}
                     }
-                    RequirementPoint::Step(ScheduleStep::Copy(copy)) => {
-                        terms.push(view_requirements[copy.source.index() as usize]);
-                        terms.push(view_requirements[copy.destination.index() as usize]);
-                    }
-                    RequirementPoint::Step(ScheduleStep::Fill(fill)) => terms.push(view_requirements[fill.destination.index() as usize]),
-                    RequirementPoint::Step(ScheduleStep::ScalarRead(read)) => terms.push(view_requirements[read.source.index() as usize]),
-                    RequirementPoint::Step(ScheduleStep::PublishTensor { view, .. }) => terms.push(view_requirements[view.index() as usize]),
-                    RequirementPoint::BranchResult(results, then) => results.visit(&mut |result| {
-                        if let seismic_ir::region::ValueOperand::Tensor(view) = if then { result.then_value() } else { result.else_value() } { terms.push(view_requirements[view.index() as usize]); }
-                    }),
-                    RequirementPoint::RepeatInitial(carries) => carries.visit(&mut |carry| {
-                        if let seismic_ir::region::ValueOperand::Tensor(view) = carry.initial() { terms.push(view_requirements[view.index() as usize]); }
-                    }),
-                    RequirementPoint::RepeatBackedge(carries) => carries.visit(&mut |carry| {
-                        if let seismic_ir::region::ValueOperand::Tensor(view) = carry.backedge() { terms.push(view_requirements[view.index() as usize]); }
-                    }),
-                    _ => {}
-                }
-                arena.all(&terms)
-            }, &mut |arena, step| acquisition_established(arena, storage, step));
+                    arena.all(&terms)
+                },
+                &mut |arena, step| acquisition_established(arena, storage, step),
+            );
             self.state.constraints.push(scoped);
         }
 
@@ -2345,45 +2619,78 @@ mod internals {
             schedule: &ParametricSchedule<B>,
             storage: &seismic_ir::storage::TopologyBuilder,
         ) {
-            let scoped = schedule.scoped_requirements(self.arena, storage.views(), &mut |arena, point| {
-                use seismic_ir::schedule::RequirementPoint;
-                let mut terms = Vec::new();
-                let (views, bytes) = match point {
-                    RequirementPoint::Step(ScheduleStep::Copy(copy)) => {
-                        let source = storage.view_layout(copy.source);
-                        let destination = storage.view_layout(copy.destination);
-                        assert_eq!(source.representation, destination.representation, "copy representation mismatch");
-                        assert_eq!(source.extents.len(), destination.extents.len(), "copy rank mismatch");
-                        for (left, right) in source.extents.iter().zip(&destination.extents) {
-                            terms.push(arena.nat_cmp(CmpOp::Eq, *left, *right));
+            let scoped = schedule.scoped_requirements(
+                self.arena,
+                storage.views(),
+                &mut |arena, point| {
+                    use seismic_ir::schedule::RequirementPoint;
+                    let mut terms = Vec::new();
+                    let (views, bytes) = match point {
+                        RequirementPoint::Step(ScheduleStep::Copy(copy)) => {
+                            let source = storage.view_layout(copy.source);
+                            let destination = storage.view_layout(copy.destination);
+                            assert_eq!(
+                                source.representation, destination.representation,
+                                "copy representation mismatch"
+                            );
+                            assert_eq!(
+                                source.extents.len(),
+                                destination.extents.len(),
+                                "copy rank mismatch"
+                            );
+                            for (left, right) in source.extents.iter().zip(&destination.extents) {
+                                terms.push(arena.nat_cmp(CmpOp::Eq, *left, *right));
+                            }
+                            (vec![copy.source, copy.destination], copy.bytes)
                         }
-                        (vec![copy.source, copy.destination], copy.bytes)
-                    }
-                    RequirementPoint::Step(ScheduleStep::Fill(fill)) => (vec![fill.destination], fill.bytes),
-                    RequirementPoint::Step(ScheduleStep::PublishTensor { view, declared_axes, .. }) => {
-                        let actual = storage.view_layout(*view);
-                        assert_eq!(actual.extents.len(), declared_axes.len(), "published result rank changed");
-                        for (reached, declared) in actual.extents.iter().zip(declared_axes) {
-                            terms.push(arena.nat_cmp(CmpOp::Eq, *reached, *declared));
+                        RequirementPoint::Step(ScheduleStep::Fill(fill)) => {
+                            (vec![fill.destination], fill.bytes)
                         }
-                        return arena.all(&terms);
+                        RequirementPoint::Step(ScheduleStep::PublishTensor {
+                            view,
+                            declared_axes,
+                            ..
+                        }) => {
+                            let actual = storage.view_layout(*view);
+                            assert_eq!(
+                                actual.extents.len(),
+                                declared_axes.len(),
+                                "published result rank changed"
+                            );
+                            for (reached, declared) in actual.extents.iter().zip(declared_axes) {
+                                terms.push(arena.nat_cmp(CmpOp::Eq, *reached, *declared));
+                            }
+                            return arena.all(&terms);
+                        }
+                        _ => return arena.bool(true),
+                    };
+                    terms.extend(
+                        views
+                            .into_iter()
+                            .map(|view| {
+                                let layout = storage.view_layout(view);
+                                let payload = seismic_ir::storage::tensor_bytes(
+                                    arena,
+                                    layout.representation,
+                                    &layout.extents,
+                                );
+                                arena.nat_cmp(CmpOp::Le, bytes, payload)
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    arena.all(&terms)
+                },
+                &mut |arena, step| {
+                    if let ScheduleStep::BeginAllocationInstance { source: view, .. } = step {
+                        if let seismic_ir::storage::ViewBase::Allocation(id) =
+                            storage.view_layout(*view).base
+                        {
+                            return arena.side_conditions(storage.allocation_bytes(id).into());
+                        }
                     }
-                    _ => return arena.bool(true),
-                };
-                terms.extend(views.into_iter().map(|view| {
-                    let layout = storage.view_layout(view);
-                    let payload = seismic_ir::storage::tensor_bytes(arena, layout.representation, &layout.extents);
-                    arena.nat_cmp(CmpOp::Le, bytes, payload)
-                }).collect::<Vec<_>>());
-                arena.all(&terms)
-            }, &mut |arena, step| {
-                if let ScheduleStep::BeginAllocationInstance { source: view, .. } = step {
-                    if let seismic_ir::storage::ViewBase::Allocation(id) = storage.view_layout(*view).base {
-                        return arena.side_conditions(storage.allocation_bytes(id).into());
-                    }
-                }
-                arena.bool(true)
-            });
+                    arena.bool(true)
+                },
+            );
             self.state.constraints.push(scoped);
         }
 
@@ -2630,27 +2937,56 @@ mod internals {
                 host_eval: &mut u32,
                 publication: &mut u32,
             ) {
-                fn operand_root(arena: &mut ExprArena, value: seismic_ir::region::ValueOperand, roots: &mut Vec<seismic_lang::expr::RootId>, ordinal: &mut u32) {
-                    use seismic_ir::region::{ValueOperand,ScalarOperand,QuantityOperand};
+                fn operand_root(
+                    arena: &mut ExprArena,
+                    value: seismic_ir::region::ValueOperand,
+                    roots: &mut Vec<seismic_lang::expr::RootId>,
+                    ordinal: &mut u32,
+                ) {
+                    use seismic_ir::region::{QuantityOperand, ScalarOperand, ValueOperand};
                     let expression = match value {
                         ValueOperand::Tensor(_) => return,
-                        ValueOperand::Scalar(ScalarOperand::Natural(value)) | ValueOperand::Quantity(QuantityOperand::Natural(value)) => AnyExpr::Nat(value),
-                        ValueOperand::Quantity(QuantityOperand::Integer(value)) => AnyExpr::Int(value),
-                        ValueOperand::Scalar(ScalarOperand::Word { symbol, dtype }) => match dtype {
-                            DType::F32 => arena.scalar_symbol::<seismic_lang::expr::F32>(symbol).into(),
-                            DType::F16 => arena.scalar_symbol::<seismic_lang::expr::F16>(symbol).into(),
-                            DType::BF16 => arena.scalar_symbol::<seismic_lang::expr::BF16>(symbol).into(),
-                            DType::I32 => arena.scalar_symbol::<seismic_lang::expr::I32>(symbol).into(),
-                            DType::U32 => arena.scalar_symbol::<seismic_lang::expr::U32>(symbol).into(),
-                            DType::Bool => arena.scalar_symbol::<seismic_lang::expr::BoolScalar>(symbol).into(),
-                        },
+                        ValueOperand::Scalar(ScalarOperand::Natural(value))
+                        | ValueOperand::Quantity(QuantityOperand::Natural(value)) => {
+                            AnyExpr::Nat(value)
+                        }
+                        ValueOperand::Quantity(QuantityOperand::Integer(value)) => {
+                            AnyExpr::Int(value)
+                        }
+                        ValueOperand::Scalar(ScalarOperand::Word { symbol, dtype }) => {
+                            match dtype {
+                                DType::F32 => arena
+                                    .scalar_symbol::<seismic_lang::expr::F32>(symbol)
+                                    .into(),
+                                DType::F16 => arena
+                                    .scalar_symbol::<seismic_lang::expr::F16>(symbol)
+                                    .into(),
+                                DType::BF16 => arena
+                                    .scalar_symbol::<seismic_lang::expr::BF16>(symbol)
+                                    .into(),
+                                DType::I32 => arena
+                                    .scalar_symbol::<seismic_lang::expr::I32>(symbol)
+                                    .into(),
+                                DType::U32 => arena
+                                    .scalar_symbol::<seismic_lang::expr::U32>(symbol)
+                                    .into(),
+                                DType::Bool => arena
+                                    .scalar_symbol::<seismic_lang::expr::BoolScalar>(symbol)
+                                    .into(),
+                            }
+                        }
                     };
-                    roots.push(arena.root(RootName::RegionOperand { operand: *ordinal }, expression));
-                    *ordinal = ordinal.checked_add(1).expect("region operand identity space exhausted");
+                    roots.push(
+                        arena.root(RootName::RegionOperand { operand: *ordinal }, expression),
+                    );
+                    *ordinal = ordinal
+                        .checked_add(1)
+                        .expect("region operand identity space exhausted");
                 }
                 for step in steps {
                     match step {
-                        ScheduleStep::BeginAllocationInstance { .. } | ScheduleStep::BindArgumentTensor { .. }
+                        ScheduleStep::BeginAllocationInstance { .. }
+                        | ScheduleStep::BindArgumentTensor { .. }
                         | ScheduleStep::Launch(_)
                         | ScheduleStep::Copy(_)
                         | ScheduleStep::Fill(_)
@@ -2658,14 +2994,29 @@ mod internals {
                         | ScheduleStep::Check(_) => {}
                         ScheduleStep::PublishTensor { declared_axes, .. } => {
                             let step = *publication;
-                            *publication = publication.checked_add(1).expect("publication root ordinal space exhausted");
+                            *publication = publication
+                                .checked_add(1)
+                                .expect("publication root ordinal space exhausted");
                             for (axis, value) in declared_axes.iter().enumerate() {
-                                roots.push(arena.root(RootName::PublishedExtent { step, axis: axis as u32 }, AnyExpr::Nat(*value)));
+                                roots.push(arena.root(
+                                    RootName::PublishedExtent {
+                                        step,
+                                        axis: axis as u32,
+                                    },
+                                    AnyExpr::Nat(*value),
+                                ));
                             }
                         }
-                        ScheduleStep::Imported { body, .. } => {
-                            schedule_roots(arena, body, roots, control, repeat, scalar_read, host_eval, publication)
-                        }
+                        ScheduleStep::Imported { body, .. } => schedule_roots(
+                            arena,
+                            body,
+                            roots,
+                            control,
+                            repeat,
+                            scalar_read,
+                            host_eval,
+                            publication,
+                        ),
                         ScheduleStep::EvaluateHost(evaluation) => {
                             let step = *host_eval;
                             *host_eval = (*host_eval)
@@ -2674,9 +3025,15 @@ mod internals {
                             let value = match evaluation.value {
                                 seismic_ir::schedule::HostValueExpr::Integer(value)
                                 | seismic_ir::schedule::HostValueExpr::Word { value, .. }
-                                | seismic_ir::schedule::HostValueExpr::Float { value, .. } => AnyExpr::Int(value),
-                                seismic_ir::schedule::HostValueExpr::Natural(value) => AnyExpr::Nat(value),
-                                seismic_ir::schedule::HostValueExpr::Bool(value) => AnyExpr::Bool(value),
+                                | seismic_ir::schedule::HostValueExpr::Float { value, .. } => {
+                                    AnyExpr::Int(value)
+                                }
+                                seismic_ir::schedule::HostValueExpr::Natural(value) => {
+                                    AnyExpr::Nat(value)
+                                }
+                                seismic_ir::schedule::HostValueExpr::Bool(value) => {
+                                    AnyExpr::Bool(value)
+                                }
                             };
                             roots.push(arena.root(RootName::HostEvaluation { step }, value));
                         }
@@ -2701,7 +3058,11 @@ mod internals {
                             else_steps,
                             results,
                         } => {
-                            results.visit(&mut |result| for operand in [result.then_value(),result.else_value()] { operand_root(arena,operand,roots,host_eval); });
+                            results.visit(&mut |result| {
+                                for operand in [result.then_value(), result.else_value()] {
+                                    operand_root(arena, operand, roots, host_eval);
+                                }
+                            });
                             let id = *control;
                             *control = (*control)
                                 .checked_add(1)
@@ -2710,13 +3071,39 @@ mod internals {
                                 RootName::ScheduleCondition { control: id },
                                 AnyExpr::Bool(*condition),
                             ));
-                            schedule_roots(arena, then_steps, roots, control, repeat, scalar_read, host_eval, publication);
-                            schedule_roots(arena, else_steps, roots, control, repeat, scalar_read, host_eval, publication);
+                            schedule_roots(
+                                arena,
+                                then_steps,
+                                roots,
+                                control,
+                                repeat,
+                                scalar_read,
+                                host_eval,
+                                publication,
+                            );
+                            schedule_roots(
+                                arena,
+                                else_steps,
+                                roots,
+                                control,
+                                repeat,
+                                scalar_read,
+                                host_eval,
+                                publication,
+                            );
                         }
                         ScheduleStep::Repeat {
-                            start, end, body, carries, ..
+                            start,
+                            end,
+                            body,
+                            carries,
+                            ..
                         } => {
-                            carries.visit(&mut |carry| for operand in [carry.initial(),carry.backedge()] { operand_root(arena,operand,roots,host_eval); });
+                            carries.visit(&mut |carry| {
+                                for operand in [carry.initial(), carry.backedge()] {
+                                    operand_root(arena, operand, roots, host_eval);
+                                }
+                            });
                             let id = *repeat;
                             *repeat = (*repeat)
                                 .checked_add(1)
@@ -2730,12 +3117,22 @@ mod internals {
                             roots.push(
                                 arena.root(RootName::RepeatEnd { repeat: id }, AnyExpr::Nat(*end)),
                             );
-                            schedule_roots(arena, body, roots, control, repeat, scalar_read, host_eval, publication);
+                            schedule_roots(
+                                arena,
+                                body,
+                                roots,
+                                control,
+                                repeat,
+                                scalar_read,
+                                host_eval,
+                                publication,
+                            );
                         }
                     }
                 }
             }
-            let (mut control, mut repeat, mut scalar_read, mut host_eval, mut publication) = (0, 0, 0, 0, 0);
+            let (mut control, mut repeat, mut scalar_read, mut host_eval, mut publication) =
+                (0, 0, 0, 0, 0);
             schedule_roots(
                 self.arena,
                 schedule.steps(),
@@ -2881,7 +3278,10 @@ mod internals {
             );
             digest.hashed(&view.extents.len());
             digest.hashed(&view.contiguous);
-            digest.hashed(&matches!(view.mapping, seismic_ir::storage::ViewMapping::WholeAllocation));
+            digest.hashed(&matches!(
+                view.mapping,
+                seismic_ir::storage::ViewMapping::WholeAllocation
+            ));
         }
         digest.hashed(&storage.result_views().len());
         for publication in storage.result_views() {
@@ -3414,29 +3814,72 @@ mod internals {
         builder: &Builder<'_, B>,
         steps: &[ScheduleStep],
     ) {
-        fn product<T>(digest: &mut seismic_ir::identity::StructureDigest, value: &seismic_ir::region::Product<T>, leaf: &mut impl FnMut(&mut seismic_ir::identity::StructureDigest,&T)) {
+        fn product<T>(
+            digest: &mut seismic_ir::identity::StructureDigest,
+            value: &seismic_ir::region::Product<T>,
+            leaf: &mut impl FnMut(&mut seismic_ir::identity::StructureDigest, &T),
+        ) {
             use seismic_ir::region::Product;
             match value {
-                Product::Unit=>digest.bytes(b"unit"),
-                Product::Leaf(value)=>{digest.bytes(b"leaf");leaf(digest,value);},
-                Product::Range(a,b)=>{digest.bytes(b"range");product(digest,a,leaf);product(digest,b,leaf);},
-                Product::Tuple(values)=>{digest.bytes(b"tuple");digest.hashed(&values.len());for value in values {product(digest,value,leaf);}},
+                Product::Unit => digest.bytes(b"unit"),
+                Product::Leaf(value) => {
+                    digest.bytes(b"leaf");
+                    leaf(digest, value);
+                }
+                Product::Range(a, b) => {
+                    digest.bytes(b"range");
+                    product(digest, a, leaf);
+                    product(digest, b, leaf);
+                }
+                Product::Tuple(values) => {
+                    digest.bytes(b"tuple");
+                    digest.hashed(&values.len());
+                    for value in values {
+                        product(digest, value, leaf);
+                    }
+                }
             }
         }
-        fn operand(digest: &mut seismic_ir::identity::StructureDigest, value: seismic_ir::region::ValueOperand) {
+        fn operand(
+            digest: &mut seismic_ir::identity::StructureDigest,
+            value: seismic_ir::region::ValueOperand,
+        ) {
             use seismic_ir::region::ValueOperand;
             match value {
-                ValueOperand::Tensor(view)=>{digest.bytes(b"tensor");digest.hashed(&view.index());},
-                ValueOperand::Scalar(value)=>{digest.bytes(b"scalar");digest.hashed(&value.kind());},
-                ValueOperand::Quantity(value)=>{digest.bytes(match value.kind() { seismic_ir::schedule::HostQuantityKind::Natural=>b"natural", seismic_ir::schedule::HostQuantityKind::Integer=>b"integer" });},
+                ValueOperand::Tensor(view) => {
+                    digest.bytes(b"tensor");
+                    digest.hashed(&view.index());
+                }
+                ValueOperand::Scalar(value) => {
+                    digest.bytes(b"scalar");
+                    digest.hashed(&value.kind());
+                }
+                ValueOperand::Quantity(value) => {
+                    digest.bytes(match value.kind() {
+                        seismic_ir::schedule::HostQuantityKind::Natural => b"natural",
+                        seismic_ir::schedule::HostQuantityKind::Integer => b"integer",
+                    });
+                }
             }
         }
-        fn destination(digest: &mut seismic_ir::identity::StructureDigest, value: seismic_ir::region::ValueDestination) {
+        fn destination(
+            digest: &mut seismic_ir::identity::StructureDigest,
+            value: seismic_ir::region::ValueDestination,
+        ) {
             use seismic_ir::region::ValueDestination;
             match value {
-                ValueDestination::Tensor(view)=>{digest.bytes(b"tensor");digest.hashed(&view.index());},
-                ValueDestination::Scalar(slot)=>{digest.bytes(b"scalar");digest.hashed(&slot.index());},
-                ValueDestination::Quantity(slot)=>{digest.bytes(b"quantity");digest.hashed(&slot.index());},
+                ValueDestination::Tensor(view) => {
+                    digest.bytes(b"tensor");
+                    digest.hashed(&view.index());
+                }
+                ValueDestination::Scalar(slot) => {
+                    digest.bytes(b"scalar");
+                    digest.hashed(&slot.index());
+                }
+                ValueDestination::Quantity(slot) => {
+                    digest.bytes(b"quantity");
+                    digest.hashed(&slot.index());
+                }
             }
         }
         digest.hashed(&steps.len());
@@ -3446,9 +3889,17 @@ mod internals {
                     digest.bytes(b"imported");
                     digest_schedule(digest, builder, body);
                 }
-                ScheduleStep::BeginAllocationInstance { source, result } | ScheduleStep::BindArgumentTensor { source, result } => {
-                    digest.bytes(if matches!(step, ScheduleStep::BeginAllocationInstance { .. }) { b"begin-tensor" } else { b"argument-tensor" });
-                    digest.hashed(&source.index()); digest.hashed(&result.index());
+                ScheduleStep::BeginAllocationInstance { source, result }
+                | ScheduleStep::BindArgumentTensor { source, result } => {
+                    digest.bytes(
+                        if matches!(step, ScheduleStep::BeginAllocationInstance { .. }) {
+                            b"begin-tensor"
+                        } else {
+                            b"argument-tensor"
+                        },
+                    );
+                    digest.hashed(&source.index());
+                    digest.hashed(&result.index());
                 }
                 ScheduleStep::PublishTensor { view, path, .. } => {
                     digest.bytes(b"publish-tensor");
@@ -3532,13 +3983,22 @@ mod internals {
                     ..
                 } => {
                     digest.bytes(b"if");
-                    product(digest,results,&mut |digest,result| {operand(digest,result.then_value());operand(digest,result.else_value());destination(digest,result.result());});
+                    product(digest, results, &mut |digest, result| {
+                        operand(digest, result.then_value());
+                        operand(digest, result.else_value());
+                        destination(digest, result.result());
+                    });
                     digest_schedule(digest, builder, then_steps);
                     digest_schedule(digest, builder, else_steps);
                 }
                 ScheduleStep::Repeat { body, carries, .. } => {
                     digest.bytes(b"repeat");
-                    product(digest,carries,&mut |digest,carry| {operand(digest,carry.initial());destination(digest,carry.header());operand(digest,carry.backedge());destination(digest,carry.result());});
+                    product(digest, carries, &mut |digest, carry| {
+                        operand(digest, carry.initial());
+                        destination(digest, carry.header());
+                        operand(digest, carry.backedge());
+                        destination(digest, carry.result());
+                    });
                     digest_schedule(digest, builder, body);
                 }
             }

@@ -37,7 +37,7 @@ mod backends;
 mod driver;
 mod execution;
 mod layout;
-pub mod native;
 mod memory;
+pub mod native;
 mod resources;
 mod telemetry;

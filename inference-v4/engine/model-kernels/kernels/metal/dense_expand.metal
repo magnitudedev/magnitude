@@ -27,36 +27,45 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
         uint(SEISMIC_DIM_H)};                                                           \
     projection::Weights<packets::W1> up{up_weight, KERNEL_W1_LAYOUT(SEISMIC_DIM_H), uint(SEISMIC_DIM_H)}
 
+#ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMV
+template <uint ROWS, uint LANES>
 kernel void dense_expand_gemv(DENSE_EXPAND_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     DENSE_EXPAND_OPERANDS;
     uint rows = uint(SEISMIC_DIM_O);
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
-    projection::threadgroup_squares<SEISMIC_TUNE_SIMDGROUPS>(in, rows, squares, sg, lane);
+    projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
     projection::SharedNorm<decltype(in)> x{in, squares};
     PROJECTION_FOR_ROWS(rows,
-        projection::gemv_paired<packets::W0, packets::W1, SEISMIC_TUNE_SIMDGROUPS, SEISMIC_TUNE_ROWS, MAXM,
-            SEISMIC_TUNE_LANES>(
-            x, out, gate, up, rows, uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile, shared, sg, lane));
+        projection::gemv_paired_runtime<packets::W0, packets::W1, ROWS, MAXM, LANES>(
+            x, out, gate, up, rows, uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile, shared,
+            simdgroups, sg, lane));
 }
+#endif
 
+#ifdef SEISMIC_FORMING_DENSE_EXPAND_BATCH
+template <uint BATCH_ROWS>
 kernel void dense_expand_batch(DENSE_EXPAND_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     DENSE_EXPAND_OPERANDS;
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
-    projection::threadgroup_squares<SEISMIC_TUNE_BATCH_SIMDGROUPS>(in, uint(SEISMIC_DIM_O), squares, sg, lane);
+    projection::threadgroup_squares_runtime(in, uint(SEISMIC_DIM_O), squares, simdgroups, sg, lane);
     projection::SharedNorm<decltype(in)> x{in, squares};
-    projection::gemv_batch_paired<packets::W0, packets::W1, SEISMIC_TUNE_BATCH_SIMDGROUPS,
-        SEISMIC_TUNE_BATCH_ROWS>(x, out,
-        gate, up, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile, shared, sg, lane);
+    projection::gemv_batch_paired_runtime<packets::W0, packets::W1, BATCH_ROWS>(x, out,
+        gate, up, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile, shared,
+        simdgroups, sg, lane);
 }
+#endif
 
+#ifdef SEISMIC_FORMING_DENSE_EXPAND_NORMALIZE
 kernel void dense_expand_normalize(DENSE_EXPAND_ARGUMENTS,
     uint item [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
@@ -64,6 +73,7 @@ kernel void dense_expand_normalize(DENSE_EXPAND_ARGUMENTS,
     DENSE_EXPAND_OPERANDS;
     projection::device_normalize<256>(in, item, normalized, uint(SEISMIC_DIM_H), norms, thread_index);
 }
+#endif
 
 #define DENSE_EXPAND_GEMM(TM, TN)                                                       \
     PROJECTION_GEMM_SHARED(shared, TM, TN);                                             \
@@ -73,16 +83,21 @@ kernel void dense_expand_normalize(DENSE_EXPAND_ARGUMENTS,
         uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile.y, tile.x, shared, sg, lane)
 
 // 17..64 rows: the fixed small-row tile.
+#ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMM_SMALL
 kernel void dense_expand_gemm_small(DENSE_EXPAND_ARGUMENTS,
     uint2 tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     DENSE_EXPAND_GEMM(projection::small_tile_m, projection::small_tile_n);
 }
+#endif
 
+#ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMM
+template <uint TILE_M, uint TILE_N>
 kernel void dense_expand_gemm(DENSE_EXPAND_ARGUMENTS,
     uint2 tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    DENSE_EXPAND_GEMM(SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N);
+    DENSE_EXPAND_GEMM(TILE_M, TILE_N);
 }
+#endif

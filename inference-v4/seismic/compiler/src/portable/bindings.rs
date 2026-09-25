@@ -84,8 +84,13 @@ pub(super) enum TensorDefinitionValue<P, V, I, T, C> {
     },
 }
 
-pub(super) type SegmentTensor =
-    TensorDefinition<SegmentStorage, SegmentBound, PortableValue, SegmentViewTransform, PortableValue>;
+pub(super) type SegmentTensor = TensorDefinition<
+    SegmentStorage,
+    SegmentBound,
+    PortableValue,
+    SegmentViewTransform,
+    PortableValue,
+>;
 
 /// Total construction environment for one checked function. Owner and
 /// ordinal checks are concentrated here; lowering sites never join raw IDs
@@ -100,7 +105,8 @@ pub(super) struct SemanticBindings {
     /// The exact meaning of a Boolean slot a host comparison of exact
     /// quantities defined in this environment (`slot == (a < b)`). Its
     /// operands are single-assignment values that dominate every use.
-    pub(super) host_conditions: std::collections::HashMap<seismic_lang::expr::SymbolId, seismic_lang::expr::BoolExpr>,
+    pub(super) host_conditions:
+        std::collections::HashMap<seismic_lang::expr::SymbolId, seismic_lang::expr::BoolExpr>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -139,7 +145,6 @@ pub(crate) fn initialization_context<'a>(
     }
     context
 }
-
 
 #[derive(Clone, Debug)]
 pub(super) enum BindingValue {
@@ -215,7 +220,11 @@ impl BindingArena {
         }
     }
 
-    pub(super) fn unresolved(&self, id: BindingId, selections: &BindingSelections) -> Option<BindingSelector> {
+    pub(super) fn unresolved(
+        &self,
+        id: BindingId,
+        selections: &BindingSelections,
+    ) -> Option<BindingSelector> {
         fn tensor(
             arena: &BindingArena,
             plan: &StreamTensorPlan,
@@ -231,7 +240,11 @@ impl BindingArena {
                 }
                 TensorDefinitionValue::Reduce { input, .. } => tensor(arena, input, selections),
                 TensorDefinitionValue::View { base, .. } => tensor(arena, base, selections),
-                TensorDefinitionValue::Selected { then, otherwise, .. } => tensor(arena, then, selections).or_else(|| tensor(arena, otherwise, selections)),
+                TensorDefinitionValue::Selected {
+                    then, otherwise, ..
+                } => {
+                    tensor(arena, then, selections).or_else(|| tensor(arena, otherwise, selections))
+                }
             }
         }
         fn bound(
@@ -279,30 +292,48 @@ impl BindingArena {
         for (_, value) in &options {
             assert_eq!(value.owner, self.owner);
         }
-        if options.iter().all(|(_, value)| *value == first || self.same_value(*value, first)) {
+        if options
+            .iter()
+            .all(|(_, value)| *value == first || self.same_value(*value, first))
+        {
             return first;
         }
         let id = BindingId {
             owner: self.owner,
             index: self.nodes.len(),
         };
-        self.nodes.push(BindingValue::Selected { selector, options });
+        self.nodes
+            .push(BindingValue::Selected { selector, options });
         id
     }
 
     /// Every value a binding may hold after its selections: one value when
     /// the dominating arms decide it, otherwise every option of each
     /// undecided selection (a join the caller transports as one product).
-    pub(super) fn possible_values(&self, id: BindingId, selections: &BindingSelections) -> Vec<Bound> {
-        assert_eq!(id.owner, self.owner, "binding belongs to another construction");
+    pub(super) fn possible_values(
+        &self,
+        id: BindingId,
+        selections: &BindingSelections,
+    ) -> Vec<Bound> {
+        assert_eq!(
+            id.owner, self.owner,
+            "binding belongs to another construction"
+        );
         match &self.nodes[id.index] {
             BindingValue::Value(value) => vec![value.clone()],
             BindingValue::Selected { selector, options } => match selections.get(selector) {
                 Some(value) => self.possible_values(
-                    options.iter().find(|(option, _)| option == value).expect("selected binding option is complete").1,
+                    options
+                        .iter()
+                        .find(|(option, _)| option == value)
+                        .expect("selected binding option is complete")
+                        .1,
                     selections,
                 ),
-                None => options.iter().flat_map(|(_, option)| self.possible_values(*option, selections)).collect(),
+                None => options
+                    .iter()
+                    .flat_map(|(_, option)| self.possible_values(*option, selections))
+                    .collect(),
             },
         }
     }
@@ -315,8 +346,12 @@ impl BindingArena {
             match (a, b) {
                 (Bound::Scalar(a), Bound::Scalar(b)) => a == b,
                 (Bound::Unit, Bound::Unit) => true,
-                (Bound::Range { start: a, end: b }, Bound::Range { start: c, end: d }) => same(a, c) && same(b, d),
-                (Bound::Tuple(a), Bound::Tuple(b)) => a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same(a, b)),
+                (Bound::Range { start: a, end: b }, Bound::Range { start: c, end: d }) => {
+                    same(a, c) && same(b, d)
+                }
+                (Bound::Tuple(a), Bound::Tuple(b)) => {
+                    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same(a, b))
+                }
                 _ => false,
             }
         }
@@ -391,7 +426,11 @@ pub(crate) type BindingPath = Vec<(BindingSelector, i64)>;
 pub(crate) trait BindingPhysicalImport {
     fn remap_tensor(&mut self, value: &StoredTensor, path: &BindingPath) -> StoredTensor;
     fn remap_slot(&mut self, slot: AnyScalarSlot, path: &BindingPath) -> AnyScalarSlot;
-    fn remap_quantity_slot(&mut self, slot: seismic_ir::schedule::HostQuantitySlot, path: &BindingPath) -> seismic_ir::schedule::HostQuantitySlot;
+    fn remap_quantity_slot(
+        &mut self,
+        slot: seismic_ir::schedule::HostQuantitySlot,
+        path: &BindingPath,
+    ) -> seismic_ir::schedule::HostQuantitySlot;
     fn remap_prepared(&mut self, value: PreparedArg, path: &BindingPath) -> PreparedArg;
     fn remap_axis(&mut self, value: NatExpr, path: &BindingPath) -> NatExpr;
     fn remap_selector(&mut self, value: BindingSelector, path: &BindingPath) -> BindingSelector;
@@ -401,7 +440,11 @@ impl BindingArena {
     /// Visit the storage retained by complete products, including the captured
     /// operands of deferred producers. Historical source associations are not
     /// live products and do not acquire final initialized contents.
-    pub(super) fn visit_stored(&self, products: &[BindingId], visit: &mut impl FnMut(&StoredTensor)) {
+    pub(super) fn visit_stored(
+        &self,
+        products: &[BindingId],
+        visit: &mut impl FnMut(&StoredTensor),
+    ) {
         fn tensor(
             value: &StreamTensorPlan,
             arena: &BindingArena,
@@ -419,7 +462,9 @@ impl BindingArena {
                 }
                 TensorDefinitionValue::Reduce { input, .. } => tensor(input, arena, seen, visit),
                 TensorDefinitionValue::View { base, .. } => tensor(base, arena, seen, visit),
-                TensorDefinitionValue::Selected { then, otherwise, .. } => {
+                TensorDefinitionValue::Selected {
+                    then, otherwise, ..
+                } => {
                     tensor(then, arena, seen, visit);
                     tensor(otherwise, arena, seen, visit);
                 }
@@ -433,9 +478,13 @@ impl BindingArena {
         ) {
             match value {
                 Bound::Tensor(TensorRealization::Stored(value)) => visit(value),
-                Bound::Tensor(TensorRealization::Computed(value)) => tensor(value, arena, seen, visit),
+                Bound::Tensor(TensorRealization::Computed(value)) => {
+                    tensor(value, arena, seen, visit)
+                }
                 Bound::Tuple(values) => {
-                    for value in values { bound(value, arena, seen, visit); }
+                    for value in values {
+                        bound(value, arena, seen, visit);
+                    }
                 }
                 Bound::Range { start, end } => {
                     bound(start, arena, seen, visit);
@@ -451,16 +500,22 @@ impl BindingArena {
             visit: &mut impl FnMut(&StoredTensor),
         ) {
             assert_eq!(id.owner, arena.owner);
-            if !seen.insert(id) { return; }
+            if !seen.insert(id) {
+                return;
+            }
             match &arena.nodes[id.index] {
                 BindingValue::Value(value) => bound(value, arena, seen, visit),
                 BindingValue::Selected { options, .. } => {
-                    for (_, id) in options { node(*id, arena, seen, visit); }
+                    for (_, id) in options {
+                        node(*id, arena, seen, visit);
+                    }
                 }
             }
         }
         let mut seen = std::collections::HashSet::new();
-        for id in products { node(*id, self, &mut seen, visit); }
+        for id in products {
+            node(*id, self, &mut seen, visit);
+        }
     }
 
     pub(crate) fn import_bindings(
@@ -487,20 +542,26 @@ impl BindingArena {
         ) -> ScalarBinding {
             match value {
                 ScalarBinding::Published(slot) => {
-                    ScalarBinding::Published(physical.remap_slot(slot,path))
+                    ScalarBinding::Published(physical.remap_slot(slot, path))
                 }
                 ScalarBinding::Quantity(slot) => {
-                    ScalarBinding::Quantity(physical.remap_quantity_slot(slot,path))
+                    ScalarBinding::Quantity(physical.remap_quantity_slot(slot, path))
                 }
-                ScalarBinding::Value { symbol,dtype } => match physical.remap_prepared(PreparedArg::Scalar(symbol,dtype),path) {
-                    PreparedArg::Scalar(symbol,dtype)=>ScalarBinding::Value {symbol,dtype},
-                    _=>unreachable!("physical remap preserves scalar category"),
+                ScalarBinding::Value { symbol, dtype } => match physical
+                    .remap_prepared(PreparedArg::Scalar(symbol, dtype), path)
+                {
+                    PreparedArg::Scalar(symbol, dtype) => ScalarBinding::Value { symbol, dtype },
+                    _ => unreachable!("physical remap preserves scalar category"),
                 },
-                ScalarBinding::Integer(value) => match physical.remap_prepared(PreparedArg::Integer(value),path) {
-                    PreparedArg::Integer(value)=>ScalarBinding::Integer(value),
-                    _=>unreachable!("physical remap preserves quantity category"),
-                },
-                ScalarBinding::Index(value)=>ScalarBinding::Index(physical.remap_axis(value,path)),
+                ScalarBinding::Integer(value) => {
+                    match physical.remap_prepared(PreparedArg::Integer(value), path) {
+                        PreparedArg::Integer(value) => ScalarBinding::Integer(value),
+                        _ => unreachable!("physical remap preserves quantity category"),
+                    }
+                }
+                ScalarBinding::Index(value) => {
+                    ScalarBinding::Index(physical.remap_axis(value, path))
+                }
             }
         }
         fn tensor(
@@ -527,10 +588,12 @@ impl BindingArena {
                             StreamBoundPlan::Tensor(value) => StreamBoundPlan::Tensor(tensor(
                                 value, child, parent, remap, physical, path,
                             )),
-                            StreamBoundPlan::Scalar(value) => StreamBoundPlan::Scalar(physical.remap_prepared(*value,path)),
+                            StreamBoundPlan::Scalar(value) => {
+                                StreamBoundPlan::Scalar(physical.remap_prepared(*value, path))
+                            }
                         })
                         .collect(),
-                    result: result.map_captures(&mut |value|physical.remap_prepared(value,path)),
+                    result: result.map_captures(&mut |value| physical.remap_prepared(value, path)),
                 },
                 TensorDefinitionValue::Reduce {
                     op,
@@ -543,28 +606,50 @@ impl BindingArena {
                     axis: *axis,
                     input_dtype: *input_dtype,
                     input: tensor(input, child, parent, remap, physical, path),
-                    result: result.map_captures(&mut |value|physical.remap_prepared(value,path)),
+                    result: result.map_captures(&mut |value| physical.remap_prepared(value, path)),
                 },
                 TensorDefinitionValue::View { base, transform } => TensorDefinitionValue::View {
                     base: tensor(base, child, parent, remap, physical, path),
                     transform: match transform {
-                        StreamViewPlan::Transpose(permutation)=>StreamViewPlan::Transpose(permutation.clone()),
-                        StreamViewPlan::Reshape=>StreamViewPlan::Reshape,
-                        StreamViewPlan::Slice(axes)=>StreamViewPlan::Slice(axes.iter().map(|axis|match axis {
-                            StreamSliceAxisPlan::Full=>StreamSliceAxisPlan::Full,
-                            StreamSliceAxisPlan::Point(value)=>StreamSliceAxisPlan::Point(physical.remap_prepared(*value,path)),
-                            StreamSliceAxisPlan::Range {start}=>StreamSliceAxisPlan::Range {start:physical.remap_prepared(*start,path)},
-                        }).collect()),
+                        StreamViewPlan::Transpose(permutation) => {
+                            StreamViewPlan::Transpose(permutation.clone())
+                        }
+                        StreamViewPlan::Reshape => StreamViewPlan::Reshape,
+                        StreamViewPlan::Slice(axes) => StreamViewPlan::Slice(
+                            axes.iter()
+                                .map(|axis| match axis {
+                                    StreamSliceAxisPlan::Full => StreamSliceAxisPlan::Full,
+                                    StreamSliceAxisPlan::Point(value) => {
+                                        StreamSliceAxisPlan::Point(
+                                            physical.remap_prepared(*value, path),
+                                        )
+                                    }
+                                    StreamSliceAxisPlan::Range { start } => {
+                                        StreamSliceAxisPlan::Range {
+                                            start: physical.remap_prepared(*start, path),
+                                        }
+                                    }
+                                })
+                                .collect(),
+                        ),
                     },
                 },
-                TensorDefinitionValue::Selected { condition, then, otherwise } => TensorDefinitionValue::Selected {
-                    condition: physical.remap_prepared(*condition,path),
+                TensorDefinitionValue::Selected {
+                    condition,
+                    then,
+                    otherwise,
+                } => TensorDefinitionValue::Selected {
+                    condition: physical.remap_prepared(*condition, path),
                     then: tensor(then, child, parent, remap, physical, path),
                     otherwise: tensor(otherwise, child, parent, remap, physical, path),
                 },
             };
             Arc::new(StreamTensorPlan {
-                axes: source.axes.iter().map(|axis|physical.remap_axis(*axis,path)).collect(),
+                axes: source
+                    .axes
+                    .iter()
+                    .map(|axis| physical.remap_axis(*axis, path))
+                    .collect(),
                 value,
             })
         }
@@ -578,11 +663,13 @@ impl BindingArena {
         ) -> Bound {
             match value {
                 Bound::Tensor(TensorRealization::Stored(view)) => {
-                    Bound::stored(physical.remap_tensor(&view,path))
+                    Bound::stored(physical.remap_tensor(&view, path))
                 }
-                Bound::Tensor(TensorRealization::Computed(plan)) => Bound::Tensor(
-                    TensorRealization::Computed(tensor(&plan, child, parent, remap, physical, path)),
-                ),
+                Bound::Tensor(TensorRealization::Computed(plan)) => {
+                    Bound::Tensor(TensorRealization::Computed(tensor(
+                        &plan, child, parent, remap, physical, path,
+                    )))
+                }
                 Bound::Scalar(value) => Bound::Scalar(scalar(value, physical, path)),
                 Bound::Range { start, end } => Bound::Range {
                     start: Box::new(bound(*start, child, parent, remap, physical, path)),
@@ -605,7 +692,10 @@ impl BindingArena {
             physical: &mut impl BindingPhysicalImport,
             path: &BindingPath,
         ) -> BindingId {
-            if let Some(mapped) = remap.get(&(id, Vec::new())).or_else(||remap.get(&(id,path.clone()))) {
+            if let Some(mapped) = remap
+                .get(&(id, Vec::new()))
+                .or_else(|| remap.get(&(id, path.clone())))
+            {
                 return *mapped;
             }
             assert_eq!(
@@ -621,14 +711,18 @@ impl BindingArena {
                     let options = options
                         .iter()
                         .map(|(value, binding)| {
-                            let mut selected=path.clone(); selected.push((*selector,*value));
-                            (*value, node(*binding, child, parent, remap, physical, &selected))
+                            let mut selected = path.clone();
+                            selected.push((*selector, *value));
+                            (
+                                *value,
+                                node(*binding, child, parent, remap, physical, &selected),
+                            )
                         })
                         .collect();
-                    parent.selected_value(physical.remap_selector(*selector,path), options)
+                    parent.selected_value(physical.remap_selector(*selector, path), options)
                 }
             };
-            remap.insert((id,path.clone()), mapped);
+            remap.insert((id, path.clone()), mapped);
             mapped
         }
         results
@@ -658,19 +752,39 @@ impl FrozenBindings {
         }
         impl BindingPhysicalImport for ScheduleImport<'_> {
             fn remap_tensor(&mut self, value: &StoredTensor, _: &BindingPath) -> StoredTensor {
-                let view = value.view.map(|view| self.physical.remap_view(*view), |value| *value);
+                let view = value
+                    .view
+                    .map(|view| self.physical.remap_view(*view), |value| *value);
                 let root = self.storage.view_layout(*view.backing()).base;
-                StoredTensor { view, root, initialized_view: value.initialized_view.clone() }
+                StoredTensor {
+                    view,
+                    root,
+                    initialized_view: value.initialized_view.clone(),
+                }
             }
             fn remap_slot(&mut self, slot: AnyScalarSlot, _: &BindingPath) -> AnyScalarSlot {
                 self.physical.remap_slot(slot)
             }
-            fn remap_quantity_slot(&mut self, slot: seismic_ir::schedule::HostQuantitySlot, _: &BindingPath) -> seismic_ir::schedule::HostQuantitySlot {
+            fn remap_quantity_slot(
+                &mut self,
+                slot: seismic_ir::schedule::HostQuantitySlot,
+                _: &BindingPath,
+            ) -> seismic_ir::schedule::HostQuantitySlot {
                 self.physical.remap_quantity_slot(slot)
             }
-            fn remap_prepared(&mut self, value: PreparedArg, _: &BindingPath) -> PreparedArg { value }
-            fn remap_axis(&mut self, value: NatExpr, _: &BindingPath) -> NatExpr { value }
-            fn remap_selector(&mut self, value: BindingSelector, _: &BindingPath) -> BindingSelector { value }
+            fn remap_prepared(&mut self, value: PreparedArg, _: &BindingPath) -> PreparedArg {
+                value
+            }
+            fn remap_axis(&mut self, value: NatExpr, _: &BindingPath) -> NatExpr {
+                value
+            }
+            fn remap_selector(
+                &mut self,
+                value: BindingSelector,
+                _: &BindingPath,
+            ) -> BindingSelector {
+                value
+            }
         }
         // Only storage retained by escaping products crosses the initialized
         // contents boundary. Parameter effects have already advanced the
@@ -691,7 +805,9 @@ impl FrozenBindings {
         // including Unit effects. Only escaping result values need physical
         // remapping into the parent's binding arena.
         parent.import_bindings(
-            &self.arena, &self.arena.results, &parameters,
+            &self.arena,
+            &self.arena.results,
+            &parameters,
             &mut ScheduleImport { physical, storage },
         )
     }
@@ -731,9 +847,17 @@ impl SemanticBindings {
     pub(super) fn bind(&mut self, arena: &mut BindingArena, value: SemanticValueId, bound: Bound) {
         let slot = self.slot(value);
         let binding = arena.insert(bound);
-        assert!(self.values[slot].replace(binding).is_none(), "semantic value was bound twice");
+        assert!(
+            self.values[slot].replace(binding).is_none(),
+            "semantic value was bound twice"
+        );
     }
-    pub(super) fn rebind(&mut self, arena: &mut BindingArena, value: SemanticValueId, bound: Bound) {
+    pub(super) fn rebind(
+        &mut self,
+        arena: &mut BindingArena,
+        value: SemanticValueId,
+        bound: Bound,
+    ) {
         let slot = self.slot(value);
         // A new residence is scoped to this lexical environment. In particular
         // constructing one branch cannot change its sibling's inherited value.
@@ -757,7 +881,10 @@ impl Bound {
         }
     }
 
-    pub(super) fn from_binding(binding: PhysicalBinding, tensor: impl FnOnce(AnyBufferView) -> StoredTensor) -> Self {
+    pub(super) fn from_binding(
+        binding: PhysicalBinding,
+        tensor: impl FnOnce(AnyBufferView) -> StoredTensor,
+    ) -> Self {
         match binding {
             PhysicalBinding::View { view, .. } => Self::stored(tensor(view)),
             PhysicalBinding::Scalar(value) => Self::Scalar(value),

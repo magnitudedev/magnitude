@@ -4,6 +4,7 @@
 
 use crate::identity::OwnerToken;
 use crate::kernel::{internals, Kernel, KernelArena};
+use crate::physical_target::{AddressableResourceClass, PhysicalDialect, VectorSupport};
 use crate::schedule::{
     AnyScalarSlot, ClosedSchedule, ImportedBindings, ParametricSchedule, ScheduleBuilder,
     ScheduleConstruction,
@@ -13,7 +14,6 @@ use crate::storage::{
     AllocationLiveness, AnyBufferView, GlobalAllocationId, GlobalAllocationTopology,
     LocalAllocationTopology, TopologyBuilder,
 };
-use crate::physical_target::{AddressableResourceClass, PhysicalDialect, VectorSupport};
 use seismic_lang::expr::{BoolExpr, DecisionId, ExprArena, NatExpr};
 use seismic_lang::ids::{ParameterId, RepresentationId};
 
@@ -158,26 +158,50 @@ impl<B: PhysicalDialect> Construction<B> {
         self.storage.may_overlap_views(&self.schedule, a, b)
     }
 
-    pub fn bind_argument_tensor(&mut self, arena: &mut ExprArena, source: AnyBufferView) -> AnyBufferView {
+    pub fn bind_argument_tensor(
+        &mut self,
+        arena: &mut ExprArena,
+        source: AnyBufferView,
+    ) -> AnyBufferView {
         let layout = self.storage.view_layout(source).clone();
-        assert!(matches!(layout.base, crate::storage::ViewBase::Allocation(id)
-            if matches!(self.storage.allocation_kind(id), GlobalBufferKind::Argument { .. })));
-        let mut values = |rank| (0..rank).map(|_| {
-            let slot = self.schedule.quantity_slot(arena, crate::schedule::HostQuantityKind::Natural);
-            arena.nat_symbol(slot.symbol())
-        }).collect::<Vec<_>>();
+        assert!(
+            matches!(layout.base, crate::storage::ViewBase::Allocation(id)
+            if matches!(self.storage.allocation_kind(id), GlobalBufferKind::Argument { .. }))
+        );
+        let mut values = |rank| {
+            (0..rank)
+                .map(|_| {
+                    let slot = self
+                        .schedule
+                        .quantity_slot(arena, crate::schedule::HostQuantityKind::Natural);
+                    arena.nat_symbol(slot.symbol())
+                })
+                .collect::<Vec<_>>()
+        };
         // Admission already validates argument axes against this instantiated contract.
         // Only the physical strides are discovered from the actual backing.
         let strides = values(layout.strides.len());
-        let result = self.storage.region_view(arena, layout.representation, layout.extents, strides);
+        let result =
+            self.storage
+                .region_view(arena, layout.representation, layout.extents, strides);
         self.schedule(arena, 0).bind_argument_tensor(source, result);
         result
     }
 
     /// Define one stored tensor value only on successful reached acquisition.
-    pub fn begin_tensor_instance(&mut self, arena: &mut ExprArena, region: u32, source: AnyBufferView) -> AnyBufferView {
-        assert!(matches!(self.storage.view_layout(source).mapping, crate::storage::ViewMapping::WholeAllocation),
-            "reached tensor creation requires allocation-owned geometry");
+    pub fn begin_tensor_instance(
+        &mut self,
+        arena: &mut ExprArena,
+        region: u32,
+        source: AnyBufferView,
+    ) -> AnyBufferView {
+        assert!(
+            matches!(
+                self.storage.view_layout(source).mapping,
+                crate::storage::ViewMapping::WholeAllocation
+            ),
+            "reached tensor creation requires allocation-owned geometry"
+        );
         // The instance's geometry is its allocation's geometry: the same
         // extent and stride expressions, evaluated where the instance is
         // acquired. Every operand of those expressions is defined once per
@@ -188,35 +212,46 @@ impl<B: PhysicalDialect> Construction<B> {
         // their acquired values for as long as this instance is in scope, and
         // every obligation over the instance is stated over its source.
         let result = self.storage.instance_view(arena, source);
-        self.schedule(arena, region).begin_allocation_instance(source, result);
+        self.schedule(arena, region)
+            .begin_allocation_instance(source, result);
         result
     }
 
-    fn value_destinations(&mut self, arena: &mut ExprArena, source: &crate::region::Product<crate::region::ValueOperand>) -> crate::region::Product<crate::region::ValueDestination> {
+    fn value_destinations(
+        &mut self,
+        arena: &mut ExprArena,
+        source: &crate::region::Product<crate::region::ValueOperand>,
+    ) -> crate::region::Product<crate::region::ValueDestination> {
         use crate::region::{ValueDestination, ValueOperand};
         source.map(&mut |value| match *value {
-                ValueOperand::Scalar(value) => {
-                    ValueDestination::Scalar(self.schedule.slot_any(arena, value.kind()))
-                }
-                ValueOperand::Quantity(value) => {
-                    ValueDestination::Quantity(self.schedule.quantity_slot(arena, value.kind()))
-                }
-                ValueOperand::Tensor(view) => {
-                    let layout = self.storage.view_layout(view).clone();
-                    let mut geometry = |rank: usize| (0..rank).map(|_| {
-                        let slot = self.schedule.quantity_slot(arena, crate::schedule::HostQuantityKind::Natural);
-                        arena.nat_symbol(slot.symbol())
-                    }).collect::<Vec<_>>();
-                    let extents = geometry(layout.extents.len());
-                    let strides = geometry(layout.strides.len());
-                    ValueDestination::Tensor(self.storage.region_view(
-                        arena,
-                        layout.representation,
-                        extents,
-                        strides,
-                    ))
-                }
-            })
+            ValueOperand::Scalar(value) => {
+                ValueDestination::Scalar(self.schedule.slot_any(arena, value.kind()))
+            }
+            ValueOperand::Quantity(value) => {
+                ValueDestination::Quantity(self.schedule.quantity_slot(arena, value.kind()))
+            }
+            ValueOperand::Tensor(view) => {
+                let layout = self.storage.view_layout(view).clone();
+                let mut geometry = |rank: usize| {
+                    (0..rank)
+                        .map(|_| {
+                            let slot = self
+                                .schedule
+                                .quantity_slot(arena, crate::schedule::HostQuantityKind::Natural);
+                            arena.nat_symbol(slot.symbol())
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let extents = geometry(layout.extents.len());
+                let strides = geometry(layout.strides.len());
+                ValueDestination::Tensor(self.storage.region_view(
+                    arena,
+                    layout.representation,
+                    extents,
+                    strides,
+                ))
+            }
+        })
     }
 
     pub fn begin_value_repeat(
@@ -233,7 +268,9 @@ impl<B: PhysicalDialect> Construction<B> {
             initial.visit(&mut |_| carried += 1);
             assert_eq!(carried, 0, "independent visits carry no products");
         }
-        let (body, binding) = self.schedule.begin_repeat(arena, parent, start, end, visits);
+        let (body, binding) = self
+            .schedule
+            .begin_repeat(arena, parent, start, end, visits);
         self.schedule.open_repeat_products(body);
         let header = self.value_destinations(arena, &initial);
         let result = self.value_destinations(arena, &initial);
@@ -247,37 +284,74 @@ impl<B: PhysicalDialect> Construction<B> {
     }
 
     pub fn finish_value_branch(
-        &mut self, arena: &mut ExprArena, parent: u32, then_region: u32,
+        &mut self,
+        arena: &mut ExprArena,
+        parent: u32,
+        then_region: u32,
         then_values: crate::region::Product<crate::region::ValueOperand>,
         else_values: crate::region::Product<crate::region::ValueOperand>,
     ) -> crate::region::Product<crate::region::ValueDestination> {
         use crate::region::{BranchResult, Product, ValueDestination, ValueOperand};
-        fn combine(a: Product<ValueOperand>, b: Product<ValueOperand>, destination: Product<ValueDestination>, storage: &TopologyBuilder) -> Product<BranchResult> {
+        fn combine(
+            a: Product<ValueOperand>,
+            b: Product<ValueOperand>,
+            destination: Product<ValueDestination>,
+            storage: &TopologyBuilder,
+        ) -> Product<BranchResult> {
             match (a, b, destination) {
                 (Product::Unit, Product::Unit, Product::Unit) => Product::Unit,
                 (Product::Leaf(a), Product::Leaf(b), Product::Leaf(result)) => {
-                    match (a,b) {
-                        (ValueOperand::Tensor(a),ValueOperand::Tensor(b)) => {
-                            assert_eq!(a.representation(),b.representation(),"branch tensor representation changed");
-                            assert_eq!(storage.view_layout(a).extents.len(), storage.view_layout(b).extents.len(),"branch tensor rank changed");
+                    match (a, b) {
+                        (ValueOperand::Tensor(a), ValueOperand::Tensor(b)) => {
+                            assert_eq!(
+                                a.representation(),
+                                b.representation(),
+                                "branch tensor representation changed"
+                            );
+                            assert_eq!(
+                                storage.view_layout(a).extents.len(),
+                                storage.view_layout(b).extents.len(),
+                                "branch tensor rank changed"
+                            );
                         }
-                        (ValueOperand::Scalar(a),ValueOperand::Scalar(b)) => assert_eq!(a.kind(),b.kind(),"branch scalar kind changed"),
-                        (ValueOperand::Quantity(a),ValueOperand::Quantity(b)) => assert_eq!(a.kind(),b.kind(),"branch quantity kind changed"),
+                        (ValueOperand::Scalar(a), ValueOperand::Scalar(b)) => {
+                            assert_eq!(a.kind(), b.kind(), "branch scalar kind changed")
+                        }
+                        (ValueOperand::Quantity(a), ValueOperand::Quantity(b)) => {
+                            assert_eq!(a.kind(), b.kind(), "branch quantity kind changed")
+                        }
                         _ => panic!("branch result leaf kind changed"),
                     }
-                    Product::Leaf(BranchResult { then_value: a, else_value: b, result })
+                    Product::Leaf(BranchResult {
+                        then_value: a,
+                        else_value: b,
+                        result,
+                    })
                 }
-                (Product::Range(a,b),Product::Range(c,d),Product::Range(e,f)) => Product::Range(Box::new(combine(*a,*c,*e,storage)),Box::new(combine(*b,*d,*f,storage))),
-                (Product::Tuple(a),Product::Tuple(b),Product::Tuple(c)) => {
-                    assert_eq!(a.len(),b.len()); assert_eq!(a.len(),c.len());
-                    Product::Tuple(a.into_iter().zip(b).zip(c).map(|((a,b),c)|combine(a,b,c,storage)).collect())
+                (Product::Range(a, b), Product::Range(c, d), Product::Range(e, f)) => {
+                    Product::Range(
+                        Box::new(combine(*a, *c, *e, storage)),
+                        Box::new(combine(*b, *d, *f, storage)),
+                    )
+                }
+                (Product::Tuple(a), Product::Tuple(b), Product::Tuple(c)) => {
+                    assert_eq!(a.len(), b.len());
+                    assert_eq!(a.len(), c.len());
+                    Product::Tuple(
+                        a.into_iter()
+                            .zip(b)
+                            .zip(c)
+                            .map(|((a, b), c)| combine(a, b, c, storage))
+                            .collect(),
+                    )
                 }
                 _ => panic!("branch result product changed shape"),
             }
         }
         let destination = self.value_destinations(arena, &then_values);
         let products = combine(then_values, else_values, destination.clone(), &self.storage);
-        self.schedule.finish_branch_products(parent, then_region, products);
+        self.schedule
+            .finish_branch_products(parent, then_region, products);
         destination
     }
 
@@ -532,15 +606,31 @@ impl<B: PhysicalDialect> NormalizedConstruction<B> {
     /// the exact tables from which these facts were derived.
     pub fn analyze_allocations(self) -> AnalyzedConstruction<B> {
         let mut sealed = self.sealed;
-        fn publications(steps: &[crate::schedule::ScheduleStep], output: &mut Vec<crate::storage::ResultViewPublication>) {
+        fn publications(
+            steps: &[crate::schedule::ScheduleStep],
+            output: &mut Vec<crate::storage::ResultViewPublication>,
+        ) {
             use crate::schedule::ScheduleStep;
             for step in steps {
                 match step {
-                    ScheduleStep::PublishTensor { view, path, bytes, .. } => output.push(crate::storage::ResultViewPublication {
-                        view: *view, path: path.clone(), bytes: *bytes,
+                    ScheduleStep::PublishTensor {
+                        view, path, bytes, ..
+                    } => output.push(crate::storage::ResultViewPublication {
+                        view: *view,
+                        path: path.clone(),
+                        bytes: *bytes,
                     }),
-                    ScheduleStep::Imported { body, .. } | ScheduleStep::Repeat { body, .. } => publications(body, output),
-                    ScheduleStep::If { then_steps, else_steps, .. } => { publications(then_steps, output); publications(else_steps, output); }
+                    ScheduleStep::Imported { body, .. } | ScheduleStep::Repeat { body, .. } => {
+                        publications(body, output)
+                    }
+                    ScheduleStep::If {
+                        then_steps,
+                        else_steps,
+                        ..
+                    } => {
+                        publications(then_steps, output);
+                        publications(else_steps, output);
+                    }
                     _ => {}
                 }
             }
@@ -580,37 +670,67 @@ impl<B: PhysicalDialect> NormalizedConstruction<B> {
             sealed.storage.views(),
             sealed.storage.allocation_count() as usize,
         );
-        fn definitions(steps: &[crate::schedule::ScheduleStep], views: &[crate::storage::BufferViewLayout], reached: &mut std::collections::BTreeSet<u32>) {
+        fn definitions(
+            steps: &[crate::schedule::ScheduleStep],
+            views: &[crate::storage::BufferViewLayout],
+            reached: &mut std::collections::BTreeSet<u32>,
+        ) {
             use crate::schedule::ScheduleStep;
             for step in steps {
                 match step {
                     ScheduleStep::BeginAllocationInstance { source: view, .. } => {
-                        if let crate::storage::ViewBase::Allocation(id) = views[view.index() as usize].base {
+                        if let crate::storage::ViewBase::Allocation(id) =
+                            views[view.index() as usize].base
+                        {
                             reached.insert(id.index());
                         }
                     }
-                    ScheduleStep::Imported { body, .. } | ScheduleStep::Repeat { body, .. } => definitions(body, views, reached),
-                    ScheduleStep::If { then_steps, else_steps, .. } => {
-                        definitions(then_steps, views, reached); definitions(else_steps, views, reached);
+                    ScheduleStep::Imported { body, .. } | ScheduleStep::Repeat { body, .. } => {
+                        definitions(body, views, reached)
+                    }
+                    ScheduleStep::If {
+                        then_steps,
+                        else_steps,
+                        ..
+                    } => {
+                        definitions(then_steps, views, reached);
+                        definitions(else_steps, views, reached);
                     }
                     _ => {}
                 }
             }
         }
         let mut reached = std::collections::BTreeSet::new();
-        definitions(sealed.schedule.steps(), sealed.storage.views(), &mut reached);
-        let published = sealed.storage.result_views().iter().flat_map(|publication| {
-            sealed.schedule.backing_allocations(sealed.storage.views(), publication.view)
-        }).map(|allocation| allocation.index()).collect::<std::collections::BTreeSet<_>>();
-        let acquisitions = (0..sealed.storage.allocation_count()).map(|index| {
-            let allocation = GlobalAllocationId::new(sealed.owner, index);
-            if matches!(sealed.storage.allocation_kind(allocation), GlobalBufferKind::Arena)
-                && reached.contains(&index) {
-                AllocationAcquisition::Reached
-            } else {
-                AllocationAcquisition::Invocation
-            }
-        }).collect::<Vec<_>>();
+        definitions(
+            sealed.schedule.steps(),
+            sealed.storage.views(),
+            &mut reached,
+        );
+        let published = sealed
+            .storage
+            .result_views()
+            .iter()
+            .flat_map(|publication| {
+                sealed
+                    .schedule
+                    .backing_allocations(sealed.storage.views(), publication.view)
+            })
+            .map(|allocation| allocation.index())
+            .collect::<std::collections::BTreeSet<_>>();
+        let acquisitions = (0..sealed.storage.allocation_count())
+            .map(|index| {
+                let allocation = GlobalAllocationId::new(sealed.owner, index);
+                if matches!(
+                    sealed.storage.allocation_kind(allocation),
+                    GlobalBufferKind::Arena
+                ) && reached.contains(&index)
+                {
+                    AllocationAcquisition::Reached
+                } else {
+                    AllocationAcquisition::Invocation
+                }
+            })
+            .collect::<Vec<_>>();
         let candidates: Vec<_> = (0..sealed.storage.allocation_count())
             .map(|index| GlobalAllocationId::new(sealed.owner, index))
             .filter(|id| {
@@ -630,12 +750,15 @@ impl<B: PhysicalDialect> NormalizedConstruction<B> {
                 relations.push(AllocationRelation {
                     left,
                     right,
-                    storage_compatible: acquisitions[left.index() as usize] == acquisitions[right.index() as usize]
+                    storage_compatible: acquisitions[left.index() as usize]
+                        == acquisitions[right.index() as usize]
                         && reuse_compatible(&sealed.storage, left, right),
-                    lifetimes_interfere: published.contains(&left.index()) || published.contains(&right.index()) || lifetimes_interfere(
-                        &liveness[left.index() as usize],
-                        &liveness[right.index() as usize],
-                    ),
+                    lifetimes_interfere: published.contains(&left.index())
+                        || published.contains(&right.index())
+                        || lifetimes_interfere(
+                            &liveness[left.index() as usize],
+                            &liveness[right.index() as usize],
+                        ),
                 });
             }
         }
@@ -844,7 +967,12 @@ impl<B: PhysicalDialect> StoragePlannedConstruction<B> {
         } = self.analyzed.closed;
         let executable = ExecutableIr {
             owner,
-            storage: storage.close(self.analyzed.liveness, self.slots, self.analyzed.instances, self.analyzed.acquisitions),
+            storage: storage.close(
+                self.analyzed.liveness,
+                self.slots,
+                self.analyzed.instances,
+                self.analyzed.acquisitions,
+            ),
             kernels: internals::arena_from_kernels(owner, kernels),
             schedule,
             allocation_constraints: self.mandatory_constraints,
@@ -1057,8 +1185,8 @@ fn mutually_exclusive(a: &crate::storage::ScheduleUse, b: &crate::storage::Sched
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repr::{DenseF16, DenseF32, Representation};
     use crate::physical_target::{IntrinsicIdentityBuilder, IntrinsicNumericalSemantics};
+    use crate::repr::{DenseF16, DenseF32, Representation};
     use std::panic::{catch_unwind, AssertUnwindSafe};
     #[derive(Debug)]
     struct Dialect;
@@ -1091,10 +1219,19 @@ mod tests {
         }
     }
 
-    fn instance_tensor(construction: &mut Construction<Dialect>, arena: &mut ExprArena, extent: u64) -> AnyBufferView {
+    fn instance_tensor(
+        construction: &mut Construction<Dialect>,
+        arena: &mut ExprArena,
+        extent: u64,
+    ) -> AnyBufferView {
         let representation = seismic_lang::registry::dense(seismic_lang::types::DType::F32);
         let extent = arena.nat(extent);
-        let (_, index) = construction.storage_mut().tensor(arena, GlobalBufferKind::Arena, representation, vec![extent]);
+        let (_, index) = construction.storage_mut().tensor(
+            arena,
+            GlobalBufferKind::Arena,
+            representation,
+            vec![extent],
+        );
         construction.view(index, representation)
     }
 
@@ -1127,41 +1264,73 @@ mod tests {
         let mut arena = ExprArena::default();
         let mut construction = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
         let fixed = arena.nat(2);
-        let local = construction.schedule(&mut arena, 0).quantity_slot(crate::schedule::HostQuantityKind::Natural);
+        let local = construction
+            .schedule(&mut arena, 0)
+            .quantity_slot(crate::schedule::HostQuantityKind::Natural);
         let dynamic = arena.nat_symbol(local.symbol());
         let representation = seismic_lang::registry::dense(seismic_lang::types::DType::F32);
-        let (_, index) = construction.storage_mut().tensor(&mut arena, GlobalBufferKind::Arena, representation, vec![fixed, dynamic]);
+        let (_, index) = construction.storage_mut().tensor(
+            &mut arena,
+            GlobalBufferKind::Arena,
+            representation,
+            vec![fixed, dynamic],
+        );
         let source = construction.view(index, representation);
         let result = construction.begin_tensor_instance(&mut arena, 0, source);
-        let (source, layout) = (construction.storage.view_layout(source), construction.storage.view_layout(result));
+        let (source, layout) = (
+            construction.storage.view_layout(source),
+            construction.storage.view_layout(result),
+        );
         // Invocation-fixed and execution-local axes alike: the instance's
         // extents and strides are its allocation's own expressions.
         assert_eq!(layout.extents, [fixed, dynamic]);
         assert_eq!(layout.strides, source.strides);
         assert!(layout.contiguous);
-        assert!(matches!(layout.base, crate::storage::ViewBase::TensorValue(_)));
+        assert!(matches!(
+            layout.base,
+            crate::storage::ViewBase::TensorValue(_)
+        ));
     }
 
     #[test]
     fn branch_product_retains_both_possible_origins_with_actual_geometry() {
-        use crate::region::{Product,ValueOperand,ValueDestination};
-        let mut arena=ExprArena::default();
-        let mut construction=Construction::<Dialect>::new(&mut arena,vec![],false,0);
-        let condition=arena.bool(true);
-        let (then_region,else_region)=construction.schedule_state().begin_branch(0,condition);
-        let a=instance_tensor(&mut construction,&mut arena,2);
-        let b=instance_tensor(&mut construction,&mut arena,5);
-        let a=construction.begin_tensor_instance(&mut arena,then_region,a);
-        let b=construction.begin_tensor_instance(&mut arena,else_region,b);
-        let result=construction.finish_value_branch(&mut arena,0,then_region,Product::Leaf(ValueOperand::Tensor(a)),Product::Leaf(ValueOperand::Tensor(b)));
-        let Product::Leaf(ValueDestination::Tensor(result))=result else {panic!("tensor product")};
-        assert_ne!(construction.storage.view_layout(a).extents,construction.storage.view_layout(result).extents);
-        let close=construction.schedule(&mut arena,0).close();
-        let closed=construction.close(close);
-        let roots=closed.schedule.backing_allocations(closed.storage.views(),result);
-        assert_eq!(roots.len(),2,"both actual arm origins feed the destination");
-        let crate::schedule::ScheduleStep::If { results,.. }=&closed.schedule.steps()[0] else {panic!("branch")};
-        assert!(matches!(results,Product::Leaf(_)));
+        use crate::region::{Product, ValueDestination, ValueOperand};
+        let mut arena = ExprArena::default();
+        let mut construction = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
+        let condition = arena.bool(true);
+        let (then_region, else_region) = construction.schedule_state().begin_branch(0, condition);
+        let a = instance_tensor(&mut construction, &mut arena, 2);
+        let b = instance_tensor(&mut construction, &mut arena, 5);
+        let a = construction.begin_tensor_instance(&mut arena, then_region, a);
+        let b = construction.begin_tensor_instance(&mut arena, else_region, b);
+        let result = construction.finish_value_branch(
+            &mut arena,
+            0,
+            then_region,
+            Product::Leaf(ValueOperand::Tensor(a)),
+            Product::Leaf(ValueOperand::Tensor(b)),
+        );
+        let Product::Leaf(ValueDestination::Tensor(result)) = result else {
+            panic!("tensor product")
+        };
+        assert_ne!(
+            construction.storage.view_layout(a).extents,
+            construction.storage.view_layout(result).extents
+        );
+        let close = construction.schedule(&mut arena, 0).close();
+        let closed = construction.close(close);
+        let roots = closed
+            .schedule
+            .backing_allocations(closed.storage.views(), result);
+        assert_eq!(
+            roots.len(),
+            2,
+            "both actual arm origins feed the destination"
+        );
+        let crate::schedule::ScheduleStep::If { results, .. } = &closed.schedule.steps()[0] else {
+            panic!("branch")
+        };
+        assert!(matches!(results, Product::Leaf(_)));
     }
 
     #[test]
@@ -1212,11 +1381,14 @@ mod tests {
                 closed.storage.views(),
                 closed.storage.allocation_count() as usize,
             );
-            let ViewBase::Allocation(next_root) = closed.storage.view_layout(next_source).base else {
+            let ViewBase::Allocation(next_root) = closed.storage.view_layout(next_source).base
+            else {
                 unreachable!()
             };
-            assert!(instances[next_root.index() as usize] >= 4,
-                "all value locations and simultaneous transfer temporaries are bounded");
+            assert!(
+                instances[next_root.index() as usize] >= 4,
+                "all value locations and simultaneous transfer temporaries are bounded"
+            );
             assert!(
                 closed
                     .schedule
@@ -1263,7 +1435,9 @@ mod tests {
     #[test]
     fn repeat_transports_exact_integer_through_host_slots() {
         use crate::region::{Product, QuantityOperand, ValueDestination, ValueOperand};
-        use crate::schedule::{HostEvaluation, HostQuantityKind, HostValueDestination, HostValueExpr, ScheduleStep};
+        use crate::schedule::{
+            HostEvaluation, HostQuantityKind, HostValueDestination, HostValueExpr, ScheduleStep,
+        };
         let mut arena = ExprArena::default();
         let mut construction = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
         let max = arena.int(i64::MAX);
@@ -1272,27 +1446,44 @@ mod tests {
         let start = arena.nat(0);
         let end = arena.nat(2);
         let repeat = construction.begin_value_repeat(
-            &mut arena, 0, start, end, crate::schedule::RepeatVisits::Ordered,
+            &mut arena,
+            0,
+            start,
+            end,
+            crate::schedule::RepeatVisits::Ordered,
             Product::Leaf(ValueOperand::Quantity(QuantityOperand::Integer(initial))),
         );
-        let Product::Leaf(ValueDestination::Quantity(header)) = repeat.header() else { panic!("exact header") };
+        let Product::Leaf(ValueDestination::Quantity(header)) = repeat.header() else {
+            panic!("exact header")
+        };
         assert_eq!(header.kind(), HostQuantityKind::Integer);
         let header_value = arena.int_symbol(header.symbol());
         let next = arena.int_add(header_value, one);
-        let next_slot = construction.schedule(&mut arena, repeat.body()).quantity_slot(HostQuantityKind::Integer);
-        construction.schedule(&mut arena, repeat.body()).evaluate_host(HostEvaluation {
-            value: HostValueExpr::Integer(next),
-            to: HostValueDestination::Quantity(next_slot),
-            failure: None,
-        });
+        let next_slot = construction
+            .schedule(&mut arena, repeat.body())
+            .quantity_slot(HostQuantityKind::Integer);
+        construction
+            .schedule(&mut arena, repeat.body())
+            .evaluate_host(HostEvaluation {
+                value: HostValueExpr::Integer(next),
+                to: HostValueDestination::Quantity(next_slot),
+                failure: None,
+            });
         let backedge = arena.int_symbol(next_slot.symbol());
-        let result = construction.finish_value_repeat(repeat, Product::Leaf(ValueOperand::Quantity(QuantityOperand::Integer(backedge))));
-        let Product::Leaf(ValueDestination::Quantity(result)) = result else { panic!("exact result") };
+        let result = construction.finish_value_repeat(
+            repeat,
+            Product::Leaf(ValueOperand::Quantity(QuantityOperand::Integer(backedge))),
+        );
+        let Product::Leaf(ValueDestination::Quantity(result)) = result else {
+            panic!("exact result")
+        };
         assert_eq!(result.kind(), HostQuantityKind::Integer);
         let close = construction.schedule(&mut arena, 0).close();
         let closed = construction.close(close);
         assert_eq!(closed.schedule.quantity_slots().len(), 3);
-        assert!(matches!(&closed.schedule.steps()[0], ScheduleStep::Repeat { body, .. } if matches!(body.as_slice(), [ScheduleStep::EvaluateHost(_)])));
+        assert!(
+            matches!(&closed.schedule.steps()[0], ScheduleStep::Repeat { body, .. } if matches!(body.as_slice(), [ScheduleStep::EvaluateHost(_)]))
+        );
     }
 
     #[test]
@@ -1305,7 +1496,14 @@ mod tests {
         let inside = instance_tensor(&mut construction, &mut arena, 16);
         construction.begin_tensor_instance(&mut arena, 0, outside);
         let zero = arena.nat(0);
-        let repeat = construction.begin_value_repeat(&mut arena, 0, zero, zero, crate::schedule::RepeatVisits::Ordered, Product::Unit);
+        let repeat = construction.begin_value_repeat(
+            &mut arena,
+            0,
+            zero,
+            zero,
+            crate::schedule::RepeatVisits::Ordered,
+            Product::Unit,
+        );
         construction.begin_tensor_instance(&mut arena, repeat.body(), inside);
         construction.finish_value_repeat(repeat, Product::Unit);
         let close = construction.schedule(&mut arena, 0).close();
@@ -1320,7 +1518,9 @@ mod tests {
             panic!("repeat")
         };
         assert_eq!(start, end);
-        assert!(matches!(body[0],ScheduleStep::BeginAllocationInstance { source: value, .. } if value==inside));
+        assert!(
+            matches!(body[0],ScheduleStep::BeginAllocationInstance { source: value, .. } if value==inside)
+        );
         let views = closed.storage.views();
         let crate::storage::ViewBase::Allocation(outside_root) =
             views[outside.index() as usize].base
@@ -1631,38 +1831,61 @@ mod tests {
         let vectors = VectorSupport::default();
         let mut builder = child.portable_kernel(&mut arena, &(), &[], &vectors);
         let representation = registry::dense(DType::F32);
-        let backing = builder.local_tensor(LaunchLocalKind::Participant, representation, vec![four]);
+        let backing =
+            builder.local_tensor(LaunchLocalKind::Participant, representation, vec![four]);
         let zero = builder.index_constant(0);
         let one = builder.index_constant(1);
         let three = builder.index_constant(3);
         let lane = builder.local_id(0);
-        let dynamic = builder.tensor_slice(backing.clone(), vec![PortableSliceAxis::Range {
-            start: zero, end: lane,
-        }]);
+        let dynamic = builder.tensor_slice(
+            backing.clone(),
+            vec![PortableSliceAxis::Range {
+                start: zero,
+                end: lane,
+            }],
+        );
         // This constructor previously panicked while demanding a second NatExpr map.
         builder.semantic_place(dynamic, representation, 1, false);
-        let host = builder.tensor_slice(backing, vec![PortableSliceAxis::Range {
-            start: one, end: three,
-        }]);
+        let host = builder.tensor_slice(
+            backing,
+            vec![PortableSliceAxis::Range {
+                start: one,
+                end: three,
+            }],
+        );
         let extent = builder.tensor_extents(&host)[0];
         builder.close();
         let kernel = &child.kernels()[0];
         assert_eq!(kernel.exact_nat(lane.raw), None);
         let exact = kernel.exact_nat(extent.raw).unwrap();
-        assert_eq!(arena.eval_nat_u64(exact, &seismic_lang::expr::Assignment::new()).unwrap(), 2);
+        assert_eq!(
+            arena
+                .eval_nat_u64(exact, &seismic_lang::expr::Assignment::new())
+                .unwrap(),
+            2
+        );
         let token = child.schedule(&mut arena, 0).close();
-        let child = child.close(token).normalize_launches(&mut arena, 64, 64).unwrap()
-            .analyze_allocations().apply_allocation_plan(&mut arena, AllocationPlan::distinct())
-            .finish().into_importable().unwrap();
+        let child = child
+            .close(token)
+            .normalize_launches(&mut arena, 64, 64)
+            .unwrap()
+            .analyze_allocations()
+            .apply_allocation_plan(&mut arena, AllocationPlan::distinct())
+            .finish()
+            .into_importable()
+            .unwrap();
         let mut parent = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
         parent.import(&mut arena, 0, child, &[]);
         let kernel = &parent.kernels()[0];
-        let imported = kernel.blocks().iter().flat_map(|block| &block.ops).find_map(|op| {
-            match op {
+        let imported = kernel
+            .blocks()
+            .iter()
+            .flat_map(|block| &block.ops)
+            .find_map(|op| match op {
                 Op::Binary { out, .. } if out.ordinal() == extent.raw.ordinal() => Some(*out),
                 _ => None,
-            }
-        }).unwrap();
+            })
+            .unwrap();
         assert_eq!(kernel.exact_nat(imported), Some(exact));
         assert!(catch_unwind(AssertUnwindSafe(|| kernel.exact_nat(extent.raw))).is_err());
     }
@@ -1685,7 +1908,12 @@ mod tests {
         let kernel = &construction.kernels()[0];
         for (value, expected) in [(sum, 0), (product, u64::MAX - 1), (difference, u64::MAX)] {
             let expression = kernel.exact_nat(value.raw).unwrap();
-            assert_eq!(arena.eval_nat_u64(expression, &seismic_lang::expr::Assignment::new()).unwrap(), expected);
+            assert_eq!(
+                arena
+                    .eval_nat_u64(expression, &seismic_lang::expr::Assignment::new())
+                    .unwrap(),
+                expected
+            );
         }
     }
 
@@ -2142,27 +2370,51 @@ mod tests {
             let mut construction = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
             let n = arena.nat(8);
             let (first_id, first_index) = construction.storage_mut().tensor(
-                &mut arena, GlobalBufferKind::Arena, DenseF32::id(), vec![n]);
+                &mut arena,
+                GlobalBufferKind::Arena,
+                DenseF32::id(),
+                vec![n],
+            );
             let (second_id, second_index) = construction.storage_mut().tensor(
-                &mut arena, GlobalBufferKind::Arena, DenseF32::id(), vec![n]);
+                &mut arena,
+                GlobalBufferKind::Arena,
+                DenseF32::id(),
+                vec![n],
+            );
             let first = construction.view(first_index, DenseF32::id());
             let second = construction.view(second_index, DenseF32::id());
             let first_value = construction.begin_tensor_instance(&mut arena, 0, first);
             let mut schedule = construction.schedule(&mut arena, 0);
             schedule.fill_constant_any(first_value, seismic_lang::intrinsics::FillConstant::Zero);
-            if published { schedule.publish_tensor(first_value, vec![0], vec![n]); }
+            if published {
+                schedule.publish_tensor(first_value, vec![0], vec![n]);
+            }
             // Compiler-owned status-like storage has no source instance transition.
             schedule.fill_constant_any(second, seismic_lang::intrinsics::FillConstant::Zero);
             let closed = schedule.close();
-            let analyzed = construction.close(closed).normalize_launches(&mut arena, u64::MAX, 64)
-                .unwrap().analyze_allocations();
+            let analyzed = construction
+                .close(closed)
+                .normalize_launches(&mut arena, u64::MAX, 64)
+                .unwrap()
+                .analyze_allocations();
             let expected = AllocationAcquisition::Reached;
             assert_eq!(analyzed.acquisitions[first_id.index() as usize], expected);
-            assert_eq!(analyzed.acquisitions[second_id.index() as usize], AllocationAcquisition::Invocation);
-            assert_eq!(analyzed.allocation_relations()[0].storage_compatible(), false,
-                "mixed acquisition timing must not share a physical slot");
-            let executable = analyzed.apply_allocation_plan(&mut arena, AllocationPlan::distinct()).finish();
-            assert_eq!(executable.storage().allocation(first_id).acquisition, expected);
+            assert_eq!(
+                analyzed.acquisitions[second_id.index() as usize],
+                AllocationAcquisition::Invocation
+            );
+            assert_eq!(
+                analyzed.allocation_relations()[0].storage_compatible(),
+                false,
+                "mixed acquisition timing must not share a physical slot"
+            );
+            let executable = analyzed
+                .apply_allocation_plan(&mut arena, AllocationPlan::distinct())
+                .finish();
+            assert_eq!(
+                executable.storage().allocation(first_id).acquisition,
+                expected
+            );
         }
     }
 
@@ -2324,22 +2576,32 @@ mod tests {
     }
     #[test]
     fn imported_host_quantity_keeps_its_expression_identity_and_remaps_its_slot() {
-        use crate::schedule::{HostEvaluation, HostQuantityKind, HostValueDestination, HostValueExpr, ScheduleStep};
+        use crate::schedule::{
+            HostEvaluation, HostQuantityKind, HostValueDestination, HostValueExpr, ScheduleStep,
+        };
         let mut arena = ExprArena::default();
         let mut child = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
         let max = arena.int(i64::MAX);
         let one = arena.int(1);
         let exact = arena.int_add(max, one);
-        let child_slot = child.schedule(&mut arena, 0).quantity_slot(HostQuantityKind::Integer);
+        let child_slot = child
+            .schedule(&mut arena, 0)
+            .quantity_slot(HostQuantityKind::Integer);
         child.schedule(&mut arena, 0).evaluate_host(HostEvaluation {
             value: HostValueExpr::Integer(exact),
             to: HostValueDestination::Quantity(child_slot),
             failure: None,
         });
         let token = child.schedule(&mut arena, 0).close();
-        let child = child.close(token).normalize_launches(&mut arena, u64::MAX, 64).unwrap()
-            .analyze_allocations().apply_allocation_plan(&mut arena, AllocationPlan::distinct())
-            .finish().into_importable().unwrap();
+        let child = child
+            .close(token)
+            .normalize_launches(&mut arena, u64::MAX, 64)
+            .unwrap()
+            .analyze_allocations()
+            .apply_allocation_plan(&mut arena, AllocationPlan::distinct())
+            .finish()
+            .into_importable()
+            .unwrap();
         let mut parent = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
         let bindings = parent.import(&mut arena, 0, child, &[]);
         let mapped = bindings.remap_quantity_slot(child_slot);
@@ -2347,22 +2609,42 @@ mod tests {
         assert_eq!(mapped.symbol(), child_slot.symbol());
         let token = parent.schedule(&mut arena, 0).close();
         let parent = parent.close(token);
-        let [ScheduleStep::Imported { body, .. }] = parent.schedule.steps() else { panic!("import scope") };
-        assert!(matches!(body.as_slice(), [ScheduleStep::EvaluateHost(value)] if matches!(value.to, HostValueDestination::Quantity(slot) if slot == mapped)));
+        let [ScheduleStep::Imported { body, .. }] = parent.schedule.steps() else {
+            panic!("import scope")
+        };
+        assert!(
+            matches!(body.as_slice(), [ScheduleStep::EvaluateHost(value)] if matches!(value.to, HostValueDestination::Quantity(slot) if slot == mapped))
+        );
     }
-    fn exact_host_child(arena: &mut ExprArena) -> (ImportableExecutableIr<Dialect>, crate::schedule::HostQuantitySlot) {
-        use crate::schedule::{HostEvaluation, HostQuantityKind, HostValueDestination, HostValueExpr};
+    fn exact_host_child(
+        arena: &mut ExprArena,
+    ) -> (
+        ImportableExecutableIr<Dialect>,
+        crate::schedule::HostQuantitySlot,
+    ) {
+        use crate::schedule::{
+            HostEvaluation, HostQuantityKind, HostValueDestination, HostValueExpr,
+        };
         let mut child = Construction::<Dialect>::new(arena, vec![], false, 0);
         let value = arena.int(7);
-        let slot = child.schedule(arena, 0).quantity_slot(HostQuantityKind::Integer);
+        let slot = child
+            .schedule(arena, 0)
+            .quantity_slot(HostQuantityKind::Integer);
         child.schedule(arena, 0).evaluate_host(HostEvaluation {
             value: HostValueExpr::Integer(value),
-            to: HostValueDestination::Quantity(slot), failure: None,
+            to: HostValueDestination::Quantity(slot),
+            failure: None,
         });
         let token = child.schedule(arena, 0).close();
-        let child = child.close(token).normalize_launches(arena, u64::MAX, 64).unwrap()
-            .analyze_allocations().apply_allocation_plan(arena, AllocationPlan::distinct())
-            .finish().into_importable().unwrap();
+        let child = child
+            .close(token)
+            .normalize_launches(arena, u64::MAX, 64)
+            .unwrap()
+            .analyze_allocations()
+            .apply_allocation_plan(arena, AllocationPlan::distinct())
+            .finish()
+            .into_importable()
+            .unwrap();
         (child, slot)
     }
 
@@ -2372,45 +2654,80 @@ mod tests {
         let mut arena = ExprArena::default();
         let (first, first_slot) = exact_host_child(&mut arena);
         let (second, second_slot) = exact_host_child(&mut arena);
-        assert_eq!(arena.symbol_kind(first_slot.symbol()), arena.symbol_kind(second_slot.symbol()));
+        assert_eq!(
+            arena.symbol_kind(first_slot.symbol()),
+            arena.symbol_kind(second_slot.symbol())
+        );
         let mut parent = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
-        let first = parent.import(&mut arena, 0, first, &[]).remap_quantity_slot(first_slot);
-        let second = parent.import(&mut arena, 0, second, &[]).remap_quantity_slot(second_slot);
-        assert_eq!(arena.symbol_kind(first.symbol()), SymbolKind::ScheduleSlot(0));
-        assert_eq!(arena.symbol_kind(second.symbol()), SymbolKind::ScheduleSlot(1));
+        let first = parent
+            .import(&mut arena, 0, first, &[])
+            .remap_quantity_slot(first_slot);
+        let second = parent
+            .import(&mut arena, 0, second, &[])
+            .remap_quantity_slot(second_slot);
+        assert_eq!(
+            arena.symbol_kind(first.symbol()),
+            SymbolKind::ScheduleSlot(0)
+        );
+        assert_eq!(
+            arena.symbol_kind(second.symbol()),
+            SymbolKind::ScheduleSlot(1)
+        );
         let first_value = arena.int_symbol(first.symbol());
         let second_value = arena.int_symbol(second.symbol());
         let first_root = arena.root(RootName::HostEvaluation { step: 0 }, first_value.into());
         let second_root = arena.root(RootName::HostEvaluation { step: 0 }, second_value.into());
-        assert_ne!(arena.canonical_digest(&[first_root]), arena.canonical_digest(&[second_root]));
+        assert_ne!(
+            arena.canonical_digest(&[first_root]),
+            arena.canonical_digest(&[second_root])
+        );
     }
 
     #[test]
     fn borrowed_parent_quantity_reuses_its_owner_slot_when_child_is_spliced() {
-        use crate::schedule::{HostEvaluation, HostQuantityKind, HostValueDestination, HostValueExpr};
+        use crate::schedule::{
+            HostEvaluation, HostQuantityKind, HostValueDestination, HostValueExpr,
+        };
         use seismic_lang::expr::SymbolKind;
         let mut arena = ExprArena::default();
         let mut parent = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
-        let parent_slot = parent.schedule(&mut arena, 0).quantity_slot(HostQuantityKind::Integer);
+        let parent_slot = parent
+            .schedule(&mut arena, 0)
+            .quantity_slot(HostQuantityKind::Integer);
         let mut child = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
         let borrowed = child.schedule_state().capture_quantity_slot(parent_slot);
-        let result = child.schedule(&mut arena, 0).quantity_slot(HostQuantityKind::Integer);
+        let result = child
+            .schedule(&mut arena, 0)
+            .quantity_slot(HostQuantityKind::Integer);
         let captured = arena.int_symbol(borrowed.symbol());
         let one = arena.int(1);
         let next = arena.int_add(captured, one);
         child.schedule(&mut arena, 0).evaluate_host(HostEvaluation {
             value: HostValueExpr::Integer(next),
-            to: HostValueDestination::Quantity(result), failure: None,
+            to: HostValueDestination::Quantity(result),
+            failure: None,
         });
         let token = child.schedule(&mut arena, 0).close();
-        let child = child.close(token).normalize_launches(&mut arena, u64::MAX, 64).unwrap()
-            .analyze_allocations().apply_allocation_plan(&mut arena, AllocationPlan::distinct())
-            .finish().into_importable().unwrap();
+        let child = child
+            .close(token)
+            .normalize_launches(&mut arena, u64::MAX, 64)
+            .unwrap()
+            .analyze_allocations()
+            .apply_allocation_plan(&mut arena, AllocationPlan::distinct())
+            .finish()
+            .into_importable()
+            .unwrap();
         let bindings = parent.import(&mut arena, 0, child, &[]);
         assert_eq!(bindings.remap_quantity_slot(borrowed), parent_slot);
         let mapped_result = bindings.remap_quantity_slot(result);
-        assert_eq!(arena.symbol_kind(parent_slot.symbol()), SymbolKind::ScheduleSlot(0));
-        assert_eq!(arena.symbol_kind(mapped_result.symbol()), SymbolKind::ScheduleSlot(1));
+        assert_eq!(
+            arena.symbol_kind(parent_slot.symbol()),
+            SymbolKind::ScheduleSlot(0)
+        );
+        assert_eq!(
+            arena.symbol_kind(mapped_result.symbol()),
+            SymbolKind::ScheduleSlot(1)
+        );
         let token = parent.schedule(&mut arena, 0).close();
         let parent = parent.close(token);
         assert_eq!(parent.schedule.quantity_slots().len(), 2);
@@ -2421,22 +2738,40 @@ mod tests {
         use crate::schedule::HostQuantityKind;
         let mut arena = ExprArena::default();
         let mut root = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
-        let owned = root.schedule(&mut arena, 0).quantity_slot(HostQuantityKind::Integer);
+        let owned = root
+            .schedule(&mut arena, 0)
+            .quantity_slot(HostQuantityKind::Integer);
         let mut middle = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
         let borrowed = middle.schedule_state().capture_quantity_slot(owned);
         let mut child = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
         let twice_borrowed = child.schedule_state().capture_quantity_slot(borrowed);
         let token = child.schedule(&mut arena, 0).close();
-        let child = child.close(token).normalize_launches(&mut arena, u64::MAX, 64).unwrap()
-            .analyze_allocations().apply_allocation_plan(&mut arena, AllocationPlan::distinct())
-            .finish().into_importable().unwrap();
-        let child_binding = middle.import(&mut arena, 0, child, &[]).remap_quantity_slot(twice_borrowed);
+        let child = child
+            .close(token)
+            .normalize_launches(&mut arena, u64::MAX, 64)
+            .unwrap()
+            .analyze_allocations()
+            .apply_allocation_plan(&mut arena, AllocationPlan::distinct())
+            .finish()
+            .into_importable()
+            .unwrap();
+        let child_binding = middle
+            .import(&mut arena, 0, child, &[])
+            .remap_quantity_slot(twice_borrowed);
         assert_eq!(child_binding, borrowed);
         let token = middle.schedule(&mut arena, 0).close();
-        let middle = middle.close(token).normalize_launches(&mut arena, u64::MAX, 64).unwrap()
-            .analyze_allocations().apply_allocation_plan(&mut arena, AllocationPlan::distinct())
-            .finish().into_importable().unwrap();
-        let root_binding = root.import(&mut arena, 0, middle, &[]).remap_quantity_slot(borrowed);
+        let middle = middle
+            .close(token)
+            .normalize_launches(&mut arena, u64::MAX, 64)
+            .unwrap()
+            .analyze_allocations()
+            .apply_allocation_plan(&mut arena, AllocationPlan::distinct())
+            .finish()
+            .into_importable()
+            .unwrap();
+        let root_binding = root
+            .import(&mut arena, 0, middle, &[])
+            .remap_quantity_slot(borrowed);
         assert_eq!(root_binding, owned);
         let token = root.schedule(&mut arena, 0).close();
         let root = root.close(token);
@@ -2449,18 +2784,40 @@ mod tests {
         let mut arena = ExprArena::default();
         let (child, child_slot) = exact_host_child(&mut arena);
         let mut middle = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
-        middle.schedule(&mut arena, 0).slot_any(crate::repr::ScalarKind::Nat64);
-        let middle_slot = middle.import(&mut arena, 0, child, &[]).remap_quantity_slot(child_slot);
-        assert_eq!(arena.symbol_kind(middle_slot.symbol()), SymbolKind::ScheduleSlot(1));
+        middle
+            .schedule(&mut arena, 0)
+            .slot_any(crate::repr::ScalarKind::Nat64);
+        let middle_slot = middle
+            .import(&mut arena, 0, child, &[])
+            .remap_quantity_slot(child_slot);
+        assert_eq!(
+            arena.symbol_kind(middle_slot.symbol()),
+            SymbolKind::ScheduleSlot(1)
+        );
         let token = middle.schedule(&mut arena, 0).close();
-        let middle = middle.close(token).normalize_launches(&mut arena, u64::MAX, 64).unwrap()
-            .analyze_allocations().apply_allocation_plan(&mut arena, AllocationPlan::distinct())
-            .finish().into_importable().unwrap();
+        let middle = middle
+            .close(token)
+            .normalize_launches(&mut arena, u64::MAX, 64)
+            .unwrap()
+            .analyze_allocations()
+            .apply_allocation_plan(&mut arena, AllocationPlan::distinct())
+            .finish()
+            .into_importable()
+            .unwrap();
         let mut parent = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
-        parent.schedule(&mut arena, 0).slot_any(crate::repr::ScalarKind::Nat64);
-        parent.schedule(&mut arena, 0).slot_any(crate::repr::ScalarKind::Nat64);
-        let final_slot = parent.import(&mut arena, 0, middle, &[]).remap_quantity_slot(middle_slot);
-        assert_eq!(arena.symbol_kind(final_slot.symbol()), SymbolKind::ScheduleSlot(3));
+        parent
+            .schedule(&mut arena, 0)
+            .slot_any(crate::repr::ScalarKind::Nat64);
+        parent
+            .schedule(&mut arena, 0)
+            .slot_any(crate::repr::ScalarKind::Nat64);
+        let final_slot = parent
+            .import(&mut arena, 0, middle, &[])
+            .remap_quantity_slot(middle_slot);
+        assert_eq!(
+            arena.symbol_kind(final_slot.symbol()),
+            SymbolKind::ScheduleSlot(3)
+        );
     }
 
     #[test]
@@ -2470,13 +2827,21 @@ mod tests {
             let mut arena = ExprArena::default();
             if unrelated {
                 let mut other = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
-                other.schedule(&mut arena, 0).slot_any(crate::repr::ScalarKind::Nat64);
-                other.schedule(&mut arena, 0).slot_any(crate::repr::ScalarKind::Nat64);
+                other
+                    .schedule(&mut arena, 0)
+                    .slot_any(crate::repr::ScalarKind::Nat64);
+                other
+                    .schedule(&mut arena, 0)
+                    .slot_any(crate::repr::ScalarKind::Nat64);
             }
             let (child, child_slot) = exact_host_child(&mut arena);
             let mut parent = Construction::<Dialect>::new(&mut arena, vec![], false, 0);
-            parent.schedule(&mut arena, 0).slot_any(crate::repr::ScalarKind::Nat64);
-            let imported = parent.import(&mut arena, 0, child, &[]).remap_quantity_slot(child_slot);
+            parent
+                .schedule(&mut arena, 0)
+                .slot_any(crate::repr::ScalarKind::Nat64);
+            let imported = parent
+                .import(&mut arena, 0, child, &[])
+                .remap_quantity_slot(child_slot);
             let value = arena.int_symbol(imported.symbol());
             let root = arena.root(RootName::HostEvaluation { step: 0 }, value.into());
             arena.canonical_digest(&[root])

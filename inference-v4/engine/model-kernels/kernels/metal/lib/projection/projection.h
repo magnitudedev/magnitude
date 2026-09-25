@@ -200,16 +200,22 @@ inline void device_normalize(thread const In &in, uint item, device uchar *x, ui
 // loads meanwhile).
 #define PROJECTION_SQUARES_SHARED(name, slots) threadgroup float name[16 * (slots)]
 
-template <uint SG, typename In>
-inline void threadgroup_squares(thread const In &in, uint m_rows, threadgroup float *squares, uint sg,
-    uint lane) {
+template <typename In>
+inline void threadgroup_squares_runtime(thread const In &in, uint m_rows, threadgroup float *squares,
+    uint simdgroups, uint sg, uint lane) {
     uint slots = in.groups() * In::parts;
-    for (uint item = sg; item < m_rows * slots; item += SG) {
+    for (uint item = sg; item < m_rows * slots; item += simdgroups) {
         uint slot = item % slots;
         float sum = simd_sum(in.squares(item / slots, slot / In::parts, slot % In::parts, lane));
         if (lane == 0)
             squares[item] = sum;
     }
+}
+
+template <uint SG, typename In>
+inline void threadgroup_squares(thread const In &in, uint m_rows, threadgroup float *squares, uint sg,
+    uint lane) {
+    threadgroup_squares_runtime(in, m_rows, squares, SG, sg, lane);
 }
 
 // The sum of PARTS partial square sums in a fixed pairwise tree.
@@ -396,15 +402,15 @@ inline float gemv_group_sum(float value) {
 // (a multiple of LANES). Weight packets are double-buffered in registers: a
 // lane loads its next packet before accumulating the current one, and its
 // first packet before the staging, so the weight stream never waits on it.
-template <typename W, typename U, bool PAIRED, uint SG, uint R, uint MAXM, uint LANES, typename In,
+template <typename W, typename U, bool PAIRED, uint R, uint MAXM, uint LANES, typename In,
     typename Out>
 inline void gemv_body(thread const In &in, thread const Out &out, thread const Weights<W> &w,
     thread const Weights<U> &u, uint m_rows, uint rows, uint k, uint tile,
-    threadgroup uchar *shared, uint sg, uint lane) {
+    threadgroup uchar *shared, uint simdgroups, uint sg, uint lane) {
     static_assert(LANES == 32 || LANES == 16 || LANES == 8, "a GEMV lane group is 8, 16 or 32 lanes");
     typedef typename In::activation A;
     uint group = lane / LANES, sub = lane % LANES;
-    uint first_row = ((tile * SG + sg) * (32u / LANES) + group) * R;
+    uint first_row = ((tile * simdgroups + sg) * (32u / LANES) + group) * R;
     bool active = first_row < rows;
     uint packets = (k + 31u) / 32u;
     gemv_packets<W, U, PAIRED, R> current, next;
@@ -422,7 +428,7 @@ inline void gemv_body(thread const In &in, thread const Out &out, thread const W
         // call's reads of the threadgroup memory finish before this one
         // writes it.
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        gemv_stage<MAXM>(in, m_rows, first, count, words, sg * 32u + lane, SG * 32u);
+        gemv_stage<MAXM>(in, m_rows, first, count, words, sg * 32u + lane, simdgroups * 32u);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (active) {
             for (uint local = sub; local < count; local += LANES) {
@@ -448,14 +454,30 @@ inline void gemv_body(thread const In &in, thread const Out &out, thread const W
 template <typename W, uint SG, uint R, uint MAXM, uint LANES = 32, typename In, typename Out>
 inline void gemv(thread const In &in, thread const Out &out, thread const Weights<W> &w,
     uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared, uint sg, uint lane) {
-    gemv_body<W, W, false, SG, R, MAXM, LANES>(in, out, w, w, m_rows, rows, k, tile, shared, sg, lane);
+    gemv_body<W, W, false, R, MAXM, LANES>(in, out, w, w, m_rows, rows, k, tile, shared, SG, sg, lane);
+}
+
+template <typename W, uint R, uint MAXM, uint LANES = 32, typename In, typename Out>
+inline void gemv_runtime(thread const In &in, thread const Out &out, thread const Weights<W> &w,
+    uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared,
+    uint simdgroups, uint sg, uint lane) {
+    gemv_body<W, W, false, R, MAXM, LANES>(in, out, w, w, m_rows, rows, k, tile, shared,
+        simdgroups, sg, lane);
 }
 
 template <typename G, typename U, uint SG, uint R, uint MAXM, uint LANES = 32, typename In, typename Out>
 inline void gemv_paired(thread const In &in, thread const Out &out, thread const Weights<G> &gate,
     thread const Weights<U> &up, uint m_rows, uint rows, uint k, uint tile,
     threadgroup uchar *shared, uint sg, uint lane) {
-    gemv_body<G, U, true, SG, R, MAXM, LANES>(in, out, gate, up, m_rows, rows, k, tile, shared, sg, lane);
+    gemv_body<G, U, true, R, MAXM, LANES>(in, out, gate, up, m_rows, rows, k, tile, shared, SG, sg, lane);
+}
+
+template <typename G, typename U, uint R, uint MAXM, uint LANES = 32, typename In, typename Out>
+inline void gemv_paired_runtime(thread const In &in, thread const Out &out, thread const Weights<G> &gate,
+    thread const Weights<U> &up, uint m_rows, uint rows, uint k, uint tile,
+    threadgroup uchar *shared, uint simdgroups, uint sg, uint lane) {
+    gemv_body<G, U, true, R, MAXM, LANES>(in, out, gate, up, m_rows, rows, k, tile, shared,
+        simdgroups, sg, lane);
 }
 
 // Instantiate a GEMV body for the activation-row bound MAXM in {1, 2, 4, 8}.
@@ -917,16 +939,16 @@ inline void gemv_batch_packet(thread simdgroup_float8x8 (&acc)[NB], thread const
     }
 }
 
-template <typename W, typename U, bool PAIRED, uint SG, uint R, uint NB, uint BYTES, typename In, typename Out>
+template <typename W, typename U, bool PAIRED, uint R, uint NB, uint BYTES, typename In, typename Out>
 inline void gemv_batch_body(thread const In &in, thread const Out &out, thread const Weights<W> &w,
     thread const Weights<U> &u, uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared,
-    uint sg, uint lane) {
+    uint simdgroups, uint sg, uint lane) {
     constexpr uint chunk = gemv_batch_chunk<NB, BYTES>();
     constexpr uint pitch = chunk + 4u;
     threadgroup float *staged = reinterpret_cast<threadgroup float *>(shared);
     ushort2 at = fragment_coordinate(lane);
     uint pair_index = at.x / 2u;
-    uint first_row = (tile * SG + sg) * R * 8u;
+    uint first_row = (tile * simdgroups + sg) * R * 8u;
     bool active = first_row < rows;
     uint thread_index = sg * 32u + lane;
     uint row[R];
@@ -954,7 +976,7 @@ inline void gemv_batch_body(thread const In &in, thread const Out &out, thread c
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint item = thread_index; item < 8u * NB * 4u * packets; item += SG * 32u) {
+        for (uint item = thread_index; item < 8u * NB * 4u * packets; item += simdgroups * 32u) {
             uint m = item / (4u * packets), g = item % (4u * packets);
             float4 even = float4(0.0f), odd = float4(0.0f);
             if (m < m_rows)
@@ -1013,9 +1035,21 @@ template <typename W, uint SG, uint R, uint BYTES = gemv_batch_shared_bytes, typ
 inline void gemv_batch(thread const In &in, thread const Out &out, thread const Weights<W> &w, uint m_rows,
     uint rows, uint k, uint tile, threadgroup uchar *shared, uint sg, uint lane) {
     if (m_rows <= 8)
-        gemv_batch_body<W, W, false, SG, R, 1, BYTES>(in, out, w, w, m_rows, rows, k, tile, shared, sg, lane);
+        gemv_batch_body<W, W, false, R, 1, BYTES>(in, out, w, w, m_rows, rows, k, tile, shared, SG, sg, lane);
     else
-        gemv_batch_body<W, W, false, SG, R, 2, BYTES>(in, out, w, w, m_rows, rows, k, tile, shared, sg, lane);
+        gemv_batch_body<W, W, false, R, 2, BYTES>(in, out, w, w, m_rows, rows, k, tile, shared, SG, sg, lane);
+}
+
+template <typename W, uint R, uint BYTES = gemv_batch_shared_bytes, typename In, typename Out>
+inline void gemv_batch_runtime(thread const In &in, thread const Out &out, thread const Weights<W> &w,
+    uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared, uint simdgroups,
+    uint sg, uint lane) {
+    if (m_rows <= 8)
+        gemv_batch_body<W, W, false, R, 1, BYTES>(in, out, w, w, m_rows, rows, k, tile, shared,
+            simdgroups, sg, lane);
+    else
+        gemv_batch_body<W, W, false, R, 2, BYTES>(in, out, w, w, m_rows, rows, k, tile, shared,
+            simdgroups, sg, lane);
 }
 
 template <typename G, typename U, uint SG, uint R, uint BYTES = gemv_batch_shared_bytes, typename In, typename Out>
@@ -1023,9 +1057,21 @@ inline void gemv_batch_paired(thread const In &in, thread const Out &out, thread
     thread const Weights<U> &up, uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared,
     uint sg, uint lane) {
     if (m_rows <= 8)
-        gemv_batch_body<G, U, true, SG, R, 1, BYTES>(in, out, gate, up, m_rows, rows, k, tile, shared, sg, lane);
+        gemv_batch_body<G, U, true, R, 1, BYTES>(in, out, gate, up, m_rows, rows, k, tile, shared, SG, sg, lane);
     else
-        gemv_batch_body<G, U, true, SG, R, 2, BYTES>(in, out, gate, up, m_rows, rows, k, tile, shared, sg, lane);
+        gemv_batch_body<G, U, true, R, 2, BYTES>(in, out, gate, up, m_rows, rows, k, tile, shared, SG, sg, lane);
+}
+
+template <typename G, typename U, uint R, uint BYTES = gemv_batch_shared_bytes, typename In, typename Out>
+inline void gemv_batch_paired_runtime(thread const In &in, thread const Out &out, thread const Weights<G> &gate,
+    thread const Weights<U> &up, uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared,
+    uint simdgroups, uint sg, uint lane) {
+    if (m_rows <= 8)
+        gemv_batch_body<G, U, true, R, 1, BYTES>(in, out, gate, up, m_rows, rows, k, tile, shared,
+            simdgroups, sg, lane);
+    else
+        gemv_batch_body<G, U, true, R, 2, BYTES>(in, out, gate, up, m_rows, rows, k, tile, shared,
+            simdgroups, sg, lane);
 }
 
 } // namespace projection

@@ -70,7 +70,9 @@ pub(super) fn plan(entry: &str) -> Option<SurveyPlan> {
 /// allocated to it.
 pub(super) fn record(key: &TuningKey, budget: usize, result: &TuningResult) -> Result<(), String> {
     let guard = SURVEY.lock().expect("tuning survey lock poisoned");
-    let survey = guard.as_ref().expect("a survey result implies an installed survey");
+    let survey = guard
+        .as_ref()
+        .expect("a survey result implies an installed survey");
     let (entry, bindings, statics) = key;
     let instance = crate::kernel_cache::TuningCacheKey::of(&format!("{bindings}{statics:?}"));
     let path = survey
@@ -112,13 +114,17 @@ pub fn replay_report(directory: &std::path::Path) -> Result<String, String> {
         .map(|entry| entry.map(|entry| entry.path()))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("reading {}: {error}", directory.display()))?;
-    files.retain(|path| path.extension().is_some_and(|extension| extension == "json"));
+    files.retain(|path| {
+        path.extension()
+            .is_some_and(|extension| extension == "json")
+    });
     files.sort();
     let settings = super::SEARCH_SETTINGS;
     let mut report = String::new();
     let percent = |value: f64| format!("{:.1}%", 100.0 * value);
     for path in files {
-        let text = std::fs::read(&path).map_err(|error| format!("reading {}: {error}", path.display()))?;
+        let text =
+            std::fs::read(&path).map_err(|error| format!("reading {}: {error}", path.display()))?;
         let record: serde_json::Value = serde_json::from_slice(&text)
             .map_err(|error| format!("parsing {}: {error}", path.display()))?;
         let field = |name: &str| {
@@ -131,7 +137,8 @@ pub fn replay_report(directory: &std::path::Path) -> Result<String, String> {
             .map_err(|error| format!("parsing {}: {error}", path.display()))?;
         let budget = field("budget")?
             .as_u64()
-            .ok_or_else(|| format!("{}: `budget` is not a count", path.display()))? as usize;
+            .ok_or_else(|| format!("{}: `budget` is not a count", path.display()))?
+            as usize;
         let recording =
             Recording::new(&result).map_err(|error| format!("{}: {error}", path.display()))?;
         let space = recording.space().len();
@@ -151,10 +158,14 @@ pub fn replay_report(directory: &std::path::Path) -> Result<String, String> {
             "| objective | budget | within 1% | within 2% | within 5% | median excess | p95 excess | evaluated | n95 (2%) |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|"
         )
         .expect("writing to a string");
-        for (name, objective) in [("keyed (production)", Objective::Keyed), ("separate (previous)", Objective::Separate)] {
+        for (name, objective) in [
+            ("keyed (production)", Objective::Keyed),
+            ("separate (previous)", Objective::Separate),
+        ] {
             for budget in [budget, space] {
                 let replayed = replay(&recording, budget, &settings, objective, REPLAY_RUNS);
-                let evaluated = replayed.evaluated.iter().sum::<usize>() as f64 / REPLAY_RUNS as f64;
+                let evaluated =
+                    replayed.evaluated.iter().sum::<usize>() as f64 / REPLAY_RUNS as f64;
                 writeln!(
                     report,
                     "| {name} | {budget} | {} | {} | {} | {} | {} | {evaluated:.1} | {} |",
@@ -191,7 +202,8 @@ pub fn replay_report(directory: &std::path::Path) -> Result<String, String> {
         }
         let weighted = gaps.iter().map(|gap| gap.weight * gap.gap()).sum::<f64>()
             / gaps.iter().map(|gap| gap.weight).sum::<f64>();
-        writeln!(report, "\nWeighted per-point gap: {}\n", percent(weighted)).expect("writing to a string");
+        writeln!(report, "\nWeighted per-point gap: {}\n", percent(weighted))
+            .expect("writing to a string");
     }
     Ok(report)
 }

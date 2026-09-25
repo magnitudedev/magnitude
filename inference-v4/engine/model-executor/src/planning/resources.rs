@@ -1,4 +1,4 @@
-use super::{weight_bytes_by_component, ModelLoadPlan, PlannedMethod};
+use super::{source_import_peak_bytes, weight_bytes_by_component, ModelLoadPlan, PlannedMethod};
 use crate::{
     PreparedHeadGraphs, PreparedStateCopyGraphs, PreparedTargetGraphs, PreparedTargetReadoutGraphs,
     PreparedVisionGraphs,
@@ -16,12 +16,13 @@ pub struct RetentionCapacityPlan {
     pub submitted_successors: usize,
     pub branch_checkpoints: usize,
     pub retained_prefixes: usize,
-    pub retained_prefix_bytes: u64,
     pub retained_media_features: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResourceLimits {
+    /// Maximum number of prefix entries the service can retain.
+    pub max_retained_entries: usize,
     pub active_requests: usize,
     pub in_flight_requests: usize,
     /// Maximum method branch checkpoints that can be resident concurrently.
@@ -37,10 +38,9 @@ pub struct ResourceLimits {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ResourceBudget {
-    pub storage_bytes: u64,
-    pub retention_bytes: u64,
-    pub safety_reserve_bytes: u64,
+pub struct ResourceCapacity {
+    /// Stable capacity of the selected device's physical allocation domain.
+    pub domain_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,7 +65,6 @@ pub struct ResourceBytes {
     /// Fixed native argument/result buffers owned by every attested entry.
     pub prepared_programs: u64,
     pub scratch: u64,
-    pub safety_reserve: u64,
 }
 
 /// A Seismic-derived physical family charge. The engine chooses concurrency;
@@ -107,6 +106,24 @@ impl FamilyFootprint {
 }
 
 impl NativeGraphCharge {
+    pub(crate) fn from_checked(
+        storage: seismic::NativeGraphStorageBytes,
+        runs_in_flight: usize,
+        workspace_slots: usize,
+        output_slots: usize,
+    ) -> Result<Self, String> {
+        Self::from_footprint(
+            FamilyFootprint {
+                workspace_bytes: storage.workspace,
+                output_bytes: storage.output,
+                upload_bytes: storage.upload,
+                runs_in_flight,
+            },
+            workspace_slots,
+            output_slots,
+        )
+    }
+
     fn from_prepared(graphs: &PreparedTargetGraphs, in_flight: usize) -> Result<Self, String> {
         let output_slots = in_flight
             .checked_mul(2)
@@ -131,7 +148,11 @@ impl NativeGraphCharge {
         let output_slots = active
             .checked_add(in_flight)
             .ok_or("target readout output slot count overflow")?;
-        Self::from_footprint(FamilyFootprint::serial(graphs.family()), in_flight, output_slots)
+        Self::from_footprint(
+            FamilyFootprint::serial(graphs.family()),
+            in_flight,
+            output_slots,
+        )
     }
 
     fn from_footprint(
@@ -183,6 +204,23 @@ pub struct StateStorePlan {
 }
 
 impl StateStorePlan {
+    /// Physical recurrent backing committed by `StateStore::new` before any
+    /// request opens. History is reserved but has no committed rows yet.
+    pub fn initial_committed_bytes(&self) -> Result<u64, String> {
+        let reserved = self
+            .bank_capacity
+            .storage_total()
+            .map_err(|error| error.to_string())?;
+        let banks = if self.recurrent_components.is_empty() {
+            reserved
+        } else {
+            magnitude_model_state::initial_banks(reserved)
+        };
+        self.recurrent_bank_bytes
+            .checked_mul(banks as u64)
+            .ok_or_else(|| "initial recurrent backing byte count overflow".into())
+    }
+
     pub fn allocate(&self, device: Rc<Device>) -> Result<Rc<StateStore>, String> {
         let store = StateStore::new(
             device,
@@ -221,7 +259,6 @@ impl ResourceBytes {
             self.recurrent_banks,
             self.prepared_programs,
             self.scratch,
-            self.safety_reserve,
         ]
         .into_iter()
         .try_fold(0u64, |total, bytes| total.checked_add(bytes))
@@ -233,8 +270,7 @@ impl ResourceBytes {
 /// relevant projection of this value rather than recomputing capacity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResourcePlan {
-    pub(super) storage_bytes: u64,
-    retention_budget_bytes: u64,
+    pub(super) domain_capacity_bytes: u64,
     capacity: StateCapacityPlan,
     target_state: StateStorePlan,
     head_state: Option<StateStorePlan>,
@@ -255,11 +291,8 @@ impl ResourcePlan {
     pub(crate) fn qualification_peak_bytes(&self) -> u64 {
         self.qualification_peak_bytes
     }
-    pub fn storage_bytes(&self) -> u64 {
-        self.storage_bytes
-    }
-    pub fn retention_budget_bytes(&self) -> u64 {
-        self.retention_budget_bytes
+    pub fn domain_capacity_bytes(&self) -> u64 {
+        self.domain_capacity_bytes
     }
     pub fn capacity(&self) -> StateCapacityPlan {
         self.capacity
@@ -306,7 +339,6 @@ impl ResourcePlan {
                     .branch_checkpoints
                     .checked_add(self.capacity.retention_entries)
                     .ok_or("retention slot count overflow")?
-            || self.retention.retained_prefix_bytes != self.retention_budget_bytes
         {
             return Err("resource plan retention capacities disagree with service limits".into());
         }
@@ -319,10 +351,10 @@ impl ResourcePlan {
             .steady_committed_bytes
             .checked_add(self.qualification_peak_bytes)
             .ok_or("startup peak byte count overflow")?;
-        if self.startup_peak_bytes > self.storage_bytes {
+        if self.startup_peak_bytes > self.domain_capacity_bytes {
             return Err(format!(
                 "resource plan startup peak {} exceeds {} bytes",
-                self.startup_peak_bytes, self.storage_bytes
+                self.startup_peak_bytes, self.domain_capacity_bytes
             ));
         }
         Ok(self)
@@ -366,19 +398,6 @@ impl ResourcePlan {
             .map(|plan| plan.allocate(device))
             .transpose()
     }
-
-    pub fn memory_requirements(&self) -> crate::platform::MemoryRequirements {
-        crate::platform::MemoryRequirements {
-            immutable_weights: self.bytes.target_weights
-                + self.bytes.head_weights
-                + self.bytes.vision_weights,
-            state: self.bytes.history + self.bytes.recurrent_banks,
-            scratch: self.bytes.scratch
-                + self.bytes.prepared_programs
-                + self.qualification_peak_bytes,
-            safety_margin: self.bytes.safety_reserve,
-        }
-    }
 }
 
 pub struct ResourcePlanner;
@@ -392,7 +411,7 @@ pub struct StateResourcePlan {
     load: ModelLoadPlan,
     codec: KvCodec,
     limits: ResourceLimits,
-    budget: ResourceBudget,
+    capacity_bytes: ResourceCapacity,
     capacity: StateCapacityPlan,
     target_state: StateStorePlan,
     head_state: Option<StateStorePlan>,
@@ -403,6 +422,10 @@ pub struct StateResourcePlan {
 }
 
 impl StateResourcePlan {
+    pub fn retention(&self) -> RetentionCapacityPlan {
+        self.retention
+    }
+
     pub fn capacity(&self) -> StateCapacityPlan {
         self.capacity
     }
@@ -423,7 +446,7 @@ impl ResourcePlanner {
         method: PlannedMethod,
         codec: KvCodec,
         limits: ResourceLimits,
-        budget: ResourceBudget,
+        capacity_bytes: ResourceCapacity,
     ) -> Result<StateResourcePlan, String> {
         if limits.active_requests == 0
             || limits.in_flight_requests == 0
@@ -437,11 +460,8 @@ impl ResourcePlanner {
         if limits.max_images_per_request > magnitude_artifacts::MAX_IMAGES_PER_REQUEST {
             return Err("planned image limit exceeds preprocessing capacity".into());
         }
-        if budget.storage_bytes == 0
-            || budget.safety_reserve_bytes >= budget.storage_bytes
-            || budget.retention_bytes > budget.storage_bytes - budget.safety_reserve_bytes
-        {
-            return Err("invalid resource storage budget".into());
+        if capacity_bytes.domain_bytes == 0 {
+            return Err("device domain has zero capacity".into());
         }
         let layout = ModelStateLayout::derive(
             &definition.geometry,
@@ -457,22 +477,12 @@ impl ResourcePlanner {
         let checkpoint_history_row_bytes = target_history_row_bytes
             .checked_add(head_history_row_bytes)
             .ok_or("history row byte count overflow")?;
-        let recurrent_bank_bytes = layout
-            .target_recurrent
-            .iter()
-            .try_fold(0u64, |total, component| {
-                let values = component.shape.iter().try_fold(1u64, |count, extent| {
-                    count.checked_mul(u64::try_from(*extent).ok()?)
-                })?;
-                total.checked_add(values.checked_mul(u64::from(component.dtype.bytes()))?)
-            })
-            .ok_or("recurrent bank byte count overflow")?;
+        let recurrent_bank_bytes = recurrent_bank_bytes(&layout.target_recurrent)?;
         let context = usize::try_from(definition.geometry.context_limit)
             .map_err(|_| "context limit exceeds host domain")?;
         // Generation methods keep their carried feature rows on the host, so
         // a retained entry charges only numerical state. Entries on one path
-        // share their history rows (the retention budget prices the retained
-        // set's own bytes), so an entry's marginal state is its recurrent
+        // share their history rows, so an entry's marginal state is its recurrent
         // bank; without recurrent state it is a full context of history.
         let retained_entry_bytes = if recurrent_bank_bytes != 0 {
             recurrent_bank_bytes
@@ -481,16 +491,39 @@ impl ResourcePlanner {
                 .checked_mul(definition.geometry.context_limit)
                 .ok_or("checkpoint state byte count overflow")?
         };
+        let base_banks = limits
+            .active_requests
+            .checked_add(
+                limits
+                    .in_flight_requests
+                    .checked_mul(1 + usize::from(limits.lookahead))
+                    .ok_or("in-flight bank count overflow")?,
+            )
+            .and_then(|banks| banks.checked_add(limits.branch_checkpoints))
+            .ok_or("base bank count overflow")?;
         let retention_entries = if retained_entry_bytes == 0 {
             0
         } else {
-            usize::try_from(budget.retention_bytes / retained_entry_bytes)
-                .map_err(|_| "retained checkpoint count exceeds host domain")?
+            let domain_entries =
+                usize::try_from(capacity_bytes.domain_bytes / retained_entry_bytes)
+                    .unwrap_or(usize::MAX);
+            let domain_entries = if recurrent_bank_bytes == 0 {
+                domain_entries
+            } else {
+                domain_entries.saturating_sub(base_banks)
+            };
+            limits.max_retained_entries.min(domain_entries)
         };
         let retained = limits
             .branch_checkpoints
             .checked_add(retention_entries)
             .ok_or("retained numerical capacity overflow")?;
+        let history_bound =
+            usize::try_from(capacity_bytes.domain_bytes / checkpoint_history_row_bytes.max(1))
+                .unwrap_or(usize::MAX);
+        if checkpoint_history_row_bytes != 0 && history_bound < context {
+            return Err("one context exceeds the device domain's history capacity".into());
+        }
         let capacity = StateCapacityPlan {
             active: limits.active_requests,
             in_flight: limits.in_flight_requests,
@@ -499,7 +532,7 @@ impl ResourcePlanner {
             retention_entries,
             // The history reservation (graphs are sealed over it; backing is
             // committed on demand): a context for every owner, but never more
-            // rows than the storage budget could ever back.
+            // rows than the device's stable domain capacity could ever back.
             history_rows: limits
                 .active_requests
                 .checked_add(limits.in_flight_requests)
@@ -507,13 +540,7 @@ impl ResourcePlanner {
                 .and_then(|owners| owners.checked_mul(context))
                 .and_then(|rows| rows.checked_add(limits.max_batch_rows))
                 .ok_or("history row capacity overflow")?
-                .min(
-                    usize::try_from(
-                        (budget.storage_bytes - budget.safety_reserve_bytes)
-                            / checkpoint_history_row_bytes.max(1),
-                    )
-                    .unwrap_or(usize::MAX),
-                )
+                .min(history_bound)
                 .max(context),
         };
         // With lookahead a request has a step and its successor in flight.
@@ -575,7 +602,6 @@ impl ResourcePlanner {
             submitted_successors: capacity.in_flight,
             branch_checkpoints: capacity.branch_checkpoints,
             retained_prefixes: capacity.retention_entries,
-            retained_prefix_bytes: budget.retention_bytes,
             retained_media_features: if load.vision.is_some() {
                 capacity
                     .active
@@ -592,7 +618,7 @@ impl ResourcePlanner {
             load: load.clone(),
             codec,
             limits,
-            budget,
+            capacity_bytes,
             capacity,
             target_state,
             head_state,
@@ -614,7 +640,7 @@ impl ResourcePlanner {
         let definition = &state.definition;
         let load = &state.load;
         let limits = state.limits;
-        let budget = state.budget;
+        let capacity_bytes = state.capacity_bytes;
         let qualification_peak = crate::AttestedPrograms::qualification_peak_bytes(load);
         let source_import_peak = load
             .target
@@ -624,6 +650,7 @@ impl ResourcePlanner {
             .map(|weight| weight.source_bytes)
             .max()
             .unwrap_or(0);
+        let source_import_peak = source_import_peak_bytes(source_import_peak)?;
         let qualification_peak_bytes = qualification_peak.max(source_import_peak);
         // A lookahead is one more target launch in flight.
         let target_launches = limits
@@ -688,13 +715,12 @@ impl ResourcePlanner {
             recurrent_banks: state.recurrent_banks_bytes,
             prepared_programs,
             scratch,
-            safety_reserve: budget.safety_reserve_bytes,
         };
         let required = bytes.total()?;
         if std::env::var_os("MAGNITUDE_TRACE_RESOURCES").is_some() {
             eprintln!(
-                "resource plan budget={} required={} qualification_peak={} weights=[{},{},{}] history={} recurrent_banks={} prepared_programs={} scratch={} safety_reserve={} graph=[target:{},readout:{},head:{},vision:{},state:{}]",
-                budget.storage_bytes,
+                "resource plan domain_capacity={} required={} qualification_peak={} weights=[{},{},{}] history={} recurrent_banks={} prepared_programs={} scratch={} graph=[target:{},readout:{},head:{},vision:{},state:{}]",
+                capacity_bytes.domain_bytes,
                 required,
                 qualification_peak_bytes,
                 bytes.target_weights,
@@ -704,7 +730,6 @@ impl ResourcePlanner {
                 bytes.recurrent_banks,
                 bytes.prepared_programs,
                 bytes.scratch,
-                bytes.safety_reserve,
                 target_graph.committed_bytes,
                 target_readout_graph.committed_bytes,
                 head_graph.map_or(0, |graph| graph.committed_bytes),
@@ -712,15 +737,14 @@ impl ResourcePlanner {
                 state_graph.committed_bytes,
             );
         }
-        if required > budget.storage_bytes {
+        if required > capacity_bytes.domain_bytes {
             return Err(format!(
-                "resource plan requires {required} bytes but the device budget is {}",
-                budget.storage_bytes
+                "resource plan requires {required} bytes but the device domain has {}",
+                capacity_bytes.domain_bytes
             ));
         }
         ResourcePlan {
-            storage_bytes: budget.storage_bytes,
-            retention_budget_bytes: budget.retention_bytes,
+            domain_capacity_bytes: capacity_bytes.domain_bytes,
             capacity: state.capacity,
             target_state: state.target_state,
             head_state: state.head_state,
@@ -751,15 +775,7 @@ fn state_store_plan(
     let history_bytes = history_row_bytes
         .checked_mul(u64::try_from(history_rows).map_err(|_| "history rows exceed u64")?)
         .ok_or("history allocation byte count overflow")?;
-    let recurrent_bank_bytes = recurrent_components
-        .iter()
-        .try_fold(0_u64, |total, component| {
-            let values = component.shape.iter().try_fold(1_u64, |count, extent| {
-                count.checked_mul(u64::try_from(*extent).ok()?)
-            })?;
-            total.checked_add(values.checked_mul(u64::from(component.dtype.bytes()))?)
-        })
-        .ok_or("recurrent bank byte count overflow")?;
+    let recurrent_bank_bytes = recurrent_bank_bytes(&recurrent_components)?;
     let recurrent_pool_bytes = recurrent_bank_bytes
         .checked_mul(
             u64::try_from(
@@ -784,7 +800,7 @@ fn state_store_plan(
     })
 }
 
-fn history_row_bytes(
+pub(super) fn history_row_bytes(
     components: &[magnitude_model_state::ComponentDescriptor],
 ) -> Result<u64, String> {
     components
@@ -797,4 +813,14 @@ fn history_row_bytes(
                 )
                 .ok_or_else(|| "history row byte count overflow".into())
         })
+}
+
+pub(super) fn recurrent_bank_bytes(components: &[ComponentSpec]) -> Result<u64, String> {
+    components.iter().try_fold(0u64, |total, component| {
+        let bytes = u64::try_from(component.bytes()?)
+            .map_err(|_| "recurrent component bytes exceed u64")?;
+        total
+            .checked_add(bytes)
+            .ok_or_else(|| "recurrent bank byte count overflow".into())
+    })
 }

@@ -31,6 +31,14 @@ Every history plane is indexed by that same row, with one codec group per (row, 
 a plane is `[rows, kv heads, elements]`. Dense history has one activation plane per vector kind;
 affine history has a code plane and one coefficient plane of (scale, zero) pairs, so placement,
 compaction and conversion treat every codec's planes alike.
+Elastic backing growth is admitted before an advance. Its minimum is the rows
+and successor banks the launch needs, including relayout when fragmentation
+prevents the demanded history from growing contiguously; its preferred grant includes geometric
+headroom and optional relayout. The claim covers the peak Seismic charge,
+including the old and new backing held together during reallocation. If the
+preferred grant cannot fit, the store tries the minimum. A refused minimum
+leaves accepted numerical state intact and returns an explicit memory deficit
+to the request owner for reclamation and retry.
 Every newly created sequence begins from one immutable, pristine zero recurrent bank. It may share
 that seed with other new sequences; the first and every later advance reserves a distinct writable
 successor. Returned successor banks never become the initial state of another sequence. The zero
@@ -51,6 +59,10 @@ An interior accepted prefix with recurrent state requires numerical repair befor
 can be published or checkpointed. State compaction, copying, and codec conversion follow the same
 submit, complete, finish, reconcile lifecycle. Cancellation, submission failure, device failure,
 and teardown release reservations through ownership.
+Preemption releases physical request state while preserving accepted logical tokens. Restoration
+replays only to the numerical position that existed before eviction. An accepted successor that
+has not yet been consumed numerically remains the input for the next ordinary decode; replay must
+not consume it early or advance beyond that numerical boundary.
 
 Codec conversion reserves destination history before submission. One transaction owns both
 stores' sequence claims, all source and destination plane buffers, both recurrent banks, and a

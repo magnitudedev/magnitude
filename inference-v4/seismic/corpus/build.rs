@@ -52,7 +52,10 @@ fn collect(root: &Path, directory: &Path, scenarios: &mut Vec<(String, String)>)
             .path();
         if path.is_dir() {
             collect(root, &path, scenarios);
-        } else if path.extension().is_some_and(|extension| extension == "seismic") {
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "seismic")
+        {
             let name = path
                 .with_extension("")
                 .strip_prefix(root)
@@ -61,8 +64,8 @@ fn collect(root: &Path, directory: &Path, scenarios: &mut Vec<(String, String)>)
                 .map(|c| c.as_os_str().to_str().expect("scenario paths are UTF-8"))
                 .collect::<Vec<_>>()
                 .join("/");
-            let text =
-                std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             scenarios.push((name, text));
         }
     }
@@ -72,7 +75,9 @@ fn collect(root: &Path, directory: &Path, scenarios: &mut Vec<(String, String)>)
 fn test_identifier(name: &str) -> String {
     let identifier = name.replace('/', "__").replace('-', "_");
     assert!(
-        identifier.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        identifier
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
             && identifier.starts_with(|c: char| c.is_ascii_alphabetic()),
         "scenario `{name}`: paths use letters, digits, `-`, `_` and `/` and start with a letter"
     );

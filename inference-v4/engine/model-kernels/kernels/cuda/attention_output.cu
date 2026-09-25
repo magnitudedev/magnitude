@@ -7,7 +7,6 @@
 #define KERNEL_W0 SEISMIC_OUTPUT_WEIGHT
 #include "lib/projection/projection.cuh"
 
-constexpr bool S8 = SEISMIC_TUNE_INT8 == 1 && projection::quantizable<packets::W0>;
 using Pro = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
 using Epi = projection::Residual<projection::AllRows>;
 
@@ -25,30 +24,43 @@ using Epi = projection::Residual<projection::AllRows>;
     }
 
 // The GEMV over NB column blocks of 8 rows.
-template <int NB>
+template <int NB, int KSPLIT>
 __device__ __forceinline__ void output_gemv(const Pro &heads, unsigned M, unsigned long long K, unsigned long long D,
                                             const packets::W0 &output, const Epi &epi) {
-    using Shape = projection::GemvShape<8, 1, SEISMIC_TUNE_KSPLIT, NB>;
+    using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
     __shared__ projection::GemvShared<Shape, Pro> shared;
     const unsigned long long group = Shape::tile_group();
     if (group < projection::gemv_groups<Shape>(D))
         projection::gemv_segment<Shape>(shared, heads, M, K / 64, group, D, output, projection::NoWeight{}, epi);
 }
 
-extern "C" __global__ void attention_output_stage_s8(SEISMIC_KERNEL_PARAMS) {
+#ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_STAGE_S8
+template <unsigned INT8>
+__global__ void attention_output_stage_s8(SEISMIC_KERNEL_PARAMS) {
+    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
     static_assert(!Pro::STAGED, "the 16-bit path reads the heads in place");
     projection::stage_row<S8>(GATED_ROWS, blockIdx.x, HEADS, STAGING, GROUPS);
 }
+#endif
 
-extern "C" __global__ void attention_output_gemv(SEISMIC_KERNEL_PARAMS) {
-    output_gemv<1>(GATED_ROWS, (unsigned)SEISMIC_DIM_M, HEADS, SEISMIC_DIM_D, OUTPUT, EPILOGUE);
+#ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV
+template <unsigned KSPLIT>
+__global__ void attention_output_gemv(SEISMIC_KERNEL_PARAMS) {
+    output_gemv<1, KSPLIT>(GATED_ROWS, (unsigned)SEISMIC_DIM_M, HEADS, SEISMIC_DIM_D, OUTPUT, EPILOGUE);
 }
+#endif
 
-extern "C" __global__ void attention_output_gemv16(SEISMIC_KERNEL_PARAMS) {
-    output_gemv<2>(GATED_ROWS, (unsigned)SEISMIC_DIM_M, HEADS, SEISMIC_DIM_D, OUTPUT, EPILOGUE);
+#ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV16
+template <unsigned KSPLIT>
+__global__ void attention_output_gemv16(SEISMIC_KERNEL_PARAMS) {
+    output_gemv<2, KSPLIT>(GATED_ROWS, (unsigned)SEISMIC_DIM_M, HEADS, SEISMIC_DIM_D, OUTPUT, EPILOGUE);
 }
+#endif
 
-extern "C" __global__ void attention_output_gemm_small(SEISMIC_KERNEL_PARAMS) {
+#ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMM_SMALL
+template <unsigned INT8>
+__global__ void attention_output_gemm_small(SEISMIC_KERNEL_PARAMS) {
+    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
     extern __shared__ uint4 dynamic_shared[];
     if (blockIdx.x < projection::gemm_columns(SEISMIC_DIM_D))
         projection::gemm_run_split<projection::SmallGemm, S8>(
@@ -56,7 +68,9 @@ extern "C" __global__ void attention_output_gemm_small(SEISMIC_KERNEL_PARAMS) {
             S8 ? HEADS : SEISMIC_GATED_STRIDE_0, GROUPS, (unsigned)SEISMIC_DIM_M, HEADS, blockIdx.x, SEISMIC_DIM_D,
             OUTPUT, EPILOGUE, PARTIALS);
 }
+#endif
 
+#ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMM
 extern "C" __global__ void attention_output_gemm(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ uint4 dynamic_shared[];
     if (blockIdx.x < projection::gemm_columns(SEISMIC_DIM_D))
@@ -65,9 +79,12 @@ extern "C" __global__ void attention_output_gemm(SEISMIC_KERNEL_PARAMS) {
             SEISMIC_GATED_STRIDE_0, GROUPS, (unsigned)SEISMIC_DIM_M, HEADS, blockIdx.x, SEISMIC_DIM_D, OUTPUT,
             EPILOGUE, PARTIALS);
 }
+#endif
 
+#ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_FINALIZE
 extern "C" __global__ void attention_output_finalize(SEISMIC_KERNEL_PARAMS) {
     const Epi epi = EPILOGUE;
     projection::split_finalize<1>(PARTIALS, projection::SPLIT, SEISMIC_DIM_M, SEISMIC_DIM_D,
                                   [&](unsigned m, unsigned long long n, float value, float) { epi(m, n, value, 0.0f); });
 }
+#endif

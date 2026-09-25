@@ -3,12 +3,11 @@ use crate::{
     RecurrentBinding, RoutedBinding,
 };
 use magnitude_model_kernels::{
-    gated_attention_decode, gated_attention_decode_k8v4, attention_output,
-    gated_attention_prefill, gated_attention_prefill_k8v4, gated_attention_project, dense_expand, dense_output, embedding_rows,
-    readout_features_rows, readout_head_rows,
-    gated_delta_chunk, gated_delta_output, gated_delta_project, gated_delta_step,
-    routed_combine, routed_expand,
-    routed_experts, routed_group, routed_output, routed_route, readout_selected_rows,
+    attention_output, dense_expand, dense_output, embedding_rows, gated_attention_decode,
+    gated_attention_decode_k8v4, gated_attention_prefill, gated_attention_prefill_k8v4,
+    gated_attention_project, gated_delta_chunk, gated_delta_output, gated_delta_project,
+    gated_delta_step, readout_features_rows, readout_head_rows, readout_selected_rows,
+    routed_combine, routed_expand, routed_experts, routed_group, routed_output, routed_route,
 };
 use seismic::NativeKernel;
 use std::collections::HashMap;

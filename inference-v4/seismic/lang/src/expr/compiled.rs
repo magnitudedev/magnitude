@@ -6,8 +6,8 @@
 //! generated call bindings.
 
 use super::{DurationEstimate, EvalError, PartialAssignment, SymbolId, SymbolValue};
-use std::fmt;
 use num_bigint::{BigInt, BigUint};
+use std::fmt;
 
 /// Symbol values supplied by one invocation: call dimensions from tensor
 /// descriptors, call scalars from arguments, target constants from the
@@ -97,14 +97,18 @@ pub type CompiledDuration = Compiled<DurationEstimate>;
 impl Compiled<BigUint> {
     /// Explicit finite projection at an address, allocation, launch, or ABI consumer.
     pub fn evaluate_u64(&self, values: &InvocationValues) -> Result<u64, EvalError> {
-        self.evaluate(values)?.try_into().map_err(|_| EvalError::Unrepresentable)
+        self.evaluate(values)?
+            .try_into()
+            .map_err(|_| EvalError::Unrepresentable)
     }
 }
 
 impl Compiled<BigInt> {
     /// Explicit finite projection; mathematical evaluation itself remains exact.
     pub fn evaluate_i64(&self, values: &InvocationValues) -> Result<i64, EvalError> {
-        self.evaluate(values)?.try_into().map_err(|_| EvalError::Unrepresentable)
+        self.evaluate(values)?
+            .try_into()
+            .map_err(|_| EvalError::Unrepresentable)
     }
 }
 

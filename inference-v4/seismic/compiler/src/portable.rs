@@ -4,45 +4,45 @@
 //! emits a sequential, one-participant schedule whose only choices are the
 //! source program's structured control. Backend factories are optimized peers.
 
-pub(crate) mod initialization;
-pub(crate) mod construction;
-mod streaming;
-mod uniformity;
-mod products;
-mod cohort;
-mod source_control;
-mod source_scalar;
-mod producer;
 pub(crate) mod capacity;
 #[cfg(test)]
 mod capacity_tests;
+mod cohort;
+pub(crate) mod construction;
+pub(crate) mod initialization;
+mod producer;
+mod products;
+mod source_control;
+mod source_scalar;
+mod streaming;
+mod uniformity;
 use producer::{SegmentStorage, StorageOrigin};
-mod snapshot;
-pub(crate) mod outcome_relation;
-mod closed_scalar;
 mod bindings;
-mod quantity;
 mod calls;
+mod closed_scalar;
+pub(crate) mod outcome_relation;
+mod quantity;
 mod regions;
-use bindings::{
-    Bound, LoopConstruction, SegmentBound, SegmentTensor, SemanticBindings, TensorDefinition,
-    TensorDefinitionValue, TensorRealization,
-};
+mod snapshot;
 pub use bindings::BindingId;
 pub(crate) use bindings::{
     initialization_context, BindingArena, BindingPath, BindingPhysicalImport, BindingSelections,
     BindingSelector, FrozenBindings,
 };
-use source_scalar::{SourceChecks, SourceStatuses};
+use bindings::{
+    Bound, LoopConstruction, SegmentBound, SegmentTensor, SemanticBindings, TensorDefinition,
+    TensorDefinitionValue, TensorRealization,
+};
 use seismic_lang::failure::{SourceFailure, SourceFailureCause};
+use source_scalar::{SourceChecks, SourceStatuses};
 
-
-use initialization::{StoredView, StoredTensor, StorageContents, CallArgument};
-use seismic_lang::initialization::{InitializationArgument, InitializationContext, InitializationState};
+use initialization::{CallArgument, StorageContents, StoredTensor, StoredView};
+use seismic_lang::initialization::{
+    InitializationArgument, InitializationContext, InitializationState,
+};
 
 use crate::implementation::{
-    ImplementationBuilder, PhysicalBinding,
-    ScalarBinding, ScalarPublication,
+    ImplementationBuilder, PhysicalBinding, ScalarBinding, ScalarPublication,
 };
 use crate::refinement::ConstructedCandidate;
 use seismic_ir::kernel::dynamic::{
@@ -53,15 +53,17 @@ use seismic_ir::kernel::ops::{
     SemanticIntrinsicCall, SemanticIntrinsicOperand, SemanticIntrinsicResult,
     SemanticIntrinsicSink, UnaryOp, ValueType,
 };
-use seismic_ir::schedule::{AnyScalarSlot, HostEvaluation, HostValueDestination, HostValueExpr, LaunchParticipation};
+use seismic_ir::schedule::{
+    AnyScalarSlot, HostEvaluation, HostValueDestination, HostValueExpr, LaunchParticipation,
+};
 use seismic_ir::storage::{AnyBufferView, LaunchLocalKind};
 use seismic_lang::entry::{
     CheckReason, LoopKind, RegionKind, ScalarRef, SemanticFunction, SemanticNodeView, SemanticType,
     SliceAxis, TensorSemantics, TensorStorage, ValueOrigin, ViewTransform,
 };
 use seismic_lang::expr::{
-    AnyExpr, BinaryOp as ExprBinary, ExprArena, FiniteDomain, FoldOp, IntExpr, LoopBinderId, NaryOp,
-    NatExpr, NodeView, SymbolKind, SymbolSort, UnaryOp as ExprUnary,
+    AnyExpr, BinaryOp as ExprBinary, ExprArena, FiniteDomain, FoldOp, IntExpr, LoopBinderId,
+    NaryOp, NatExpr, NodeView, SymbolKind, SymbolSort, UnaryOp as ExprUnary,
 };
 use seismic_lang::ids::{FamilyId, FunctionId, IntrinsicId, NodeId, RegionId, SemanticValueId};
 use seismic_lang::intrinsics::{reduce_schema, MathOp, PrimitiveId, ReduceOp};
@@ -83,20 +85,36 @@ pub(crate) enum SemanticMode {
 pub(crate) fn construct_general<B: seismic_native_target::TargetFamily>(
     mut state: construction::SourceConstruction<B>,
     mut context: crate::implementation::ConstructionContext<'_, B>,
-) -> Result<(ConstructedCandidate<B>, Vec<(crate::candidate_domain::CallPath, crate::candidate_domain::BodySelection)>), crate::errors::PreparationError> {
+) -> Result<
+    (
+        ConstructedCandidate<B>,
+        Vec<(
+            crate::candidate_domain::CallPath,
+            crate::candidate_domain::BodySelection,
+        )>,
+    ),
+    crate::errors::PreparationError,
+> {
     let mut calls = Vec::new();
     loop {
         match state.advance(&mut context) {
             construction::ConstructionStep::Pending(next) => state = next,
             construction::ConstructionStep::Choice(mut next, choice) => {
                 let selected = choice.alternatives[0].clone();
-                assert_eq!(selected.mapping, crate::candidate_domain::BodyMapping::Sequential,
-                    "required construction must select a portable reference child");
+                assert_eq!(
+                    selected.mapping,
+                    crate::candidate_domain::BodyMapping::Sequential,
+                    "required construction must select a portable reference child"
+                );
                 calls.push((choice.path, selected.clone()));
                 next.select(selected);
                 state = next;
             }
-            construction::ConstructionStep::Unresolved(_, reason) => return Err(crate::errors::PreparationError::UnfinishedConstruction(reason)),
+            construction::ConstructionStep::Unresolved(_, reason) => {
+                return Err(crate::errors::PreparationError::UnfinishedConstruction(
+                    reason,
+                ))
+            }
             construction::ConstructionStep::Complete(candidate) => return Ok((candidate, calls)),
         }
     }
@@ -148,7 +166,9 @@ impl SegmentTensor {
     ) -> registry::IntrinsicUniformity {
         let geometry = uniformity::all(self.axes.iter().map(|v| kernel.uniformity(*v)));
         let input = match &self.value {
-            TensorDefinitionValue::Physical(tensor) => kernel.tensor_address_uniformity(&tensor.tensor),
+            TensorDefinitionValue::Physical(tensor) => {
+                kernel.tensor_address_uniformity(&tensor.tensor)
+            }
             TensorDefinitionValue::Reduce { input, .. } => {
                 input.reduction_uniformity(kernel, coordinates)
             }
@@ -173,7 +193,11 @@ impl SegmentTensor {
                     _ => unreachable!("elementwise operand kind"),
                 }))
             }
-            TensorDefinitionValue::Selected { condition, then, otherwise } => uniformity::all([
+            TensorDefinitionValue::Selected {
+                condition,
+                then,
+                otherwise,
+            } => uniformity::all([
                 kernel.uniformity(*condition),
                 then.reduction_uniformity(kernel, coordinates),
                 otherwise.reduction_uniformity(kernel, coordinates),
@@ -204,17 +228,21 @@ impl SegmentTensor {
         );
         match &self.value {
             TensorDefinitionValue::Physical(value) => kernel.tensor_read(&value.tensor, index),
-            TensorDefinitionValue::Selected { condition, then, otherwise } => {
-                kernel.branch(*condition,
-                    |kernel| vec![then.read(kernel, index)],
-                    |kernel| vec![otherwise.read(kernel, index)])[0]
-            }
+            TensorDefinitionValue::Selected {
+                condition,
+                then,
+                otherwise,
+            } => kernel.branch(
+                *condition,
+                |kernel| vec![then.read(kernel, index)],
+                |kernel| vec![otherwise.read(kernel, index)],
+            )[0],
             TensorDefinitionValue::Elementwise {
                 primitive,
                 inputs,
                 result,
             } => {
-                let arguments=segment_elementwise_arguments(kernel,inputs,index);
+                let arguments = segment_elementwise_arguments(kernel, inputs, index);
                 let output = SemanticType::Scalar(element_dtype(result.tensor.representation));
                 let value = lower_scalar_primitive(kernel, primitive, &arguments, &output);
                 let storage_type = value_type(element_dtype(result.tensor.representation));
@@ -358,7 +386,8 @@ enum SegmentCapture {
     Unit,
 }
 
-type StreamTensorPlan = TensorDefinition<BindingId, StreamBoundPlan, NatExpr, StreamViewPlan, PreparedArg>;
+type StreamTensorPlan =
+    TensorDefinition<BindingId, StreamBoundPlan, NatExpr, StreamViewPlan, PreparedArg>;
 
 #[derive(Clone, Debug)]
 enum StreamBoundPlan {
@@ -370,7 +399,9 @@ type StreamViewPlan = TensorViewTransform<PreparedArg>;
 type StreamSliceAxisPlan = TensorSliceAxis<PreparedArg>;
 
 fn stored_view_in_kernel<B: seismic_native_target::TargetFamily>(
-    kernel: &mut PortableBuilder<'_, B>, view: &StoredView, writable: bool,
+    kernel: &mut PortableBuilder<'_, B>,
+    view: &StoredView,
+    writable: bool,
 ) -> PortableTensor {
     let place = kernel.arg_view(*view.backing(), writable);
     view.map(|_| place, |value| kernel.nat_arg(*value))
@@ -387,7 +418,10 @@ fn instantiate_stream_tensor<B: seismic_native_target::TargetFamily>(
             match bindings.get(bindings.selected(*binding, selections)) {
                 Bound::Tensor(TensorRealization::Stored(view)) => {
                     let tensor = stored_view_in_kernel(kernel, &view.view, false);
-                    TensorDefinitionValue::Physical(SegmentStorage { tensor, origin: StorageOrigin::Parameter(view.clone()) })
+                    TensorDefinitionValue::Physical(SegmentStorage {
+                        tensor,
+                        origin: StorageOrigin::Parameter(view.clone()),
+                    })
                 }
                 Bound::Tensor(TensorRealization::Computed(plan)) => {
                     return instantiate_stream_tensor(kernel, &plan, bindings, selections);
@@ -429,10 +463,18 @@ fn instantiate_stream_tensor<B: seismic_native_target::TargetFamily>(
             )),
             result: result.instantiate(kernel),
         },
-        TensorDefinitionValue::Selected { condition, then, otherwise } => TensorDefinitionValue::Selected {
+        TensorDefinitionValue::Selected {
+            condition,
+            then,
+            otherwise,
+        } => TensorDefinitionValue::Selected {
             condition: prepared_kernel_arg(kernel, *condition),
-            then: Arc::new(instantiate_stream_tensor(kernel, then, bindings, selections)),
-            otherwise: Arc::new(instantiate_stream_tensor(kernel, otherwise, bindings, selections)),
+            then: Arc::new(instantiate_stream_tensor(
+                kernel, then, bindings, selections,
+            )),
+            otherwise: Arc::new(instantiate_stream_tensor(
+                kernel, otherwise, bindings, selections,
+            )),
         },
         TensorDefinitionValue::View { base, transform } => {
             let base = Arc::new(instantiate_stream_tensor(
@@ -472,7 +514,9 @@ fn prepared_kernel_arg<B: seismic_native_target::TargetFamily>(
 ) -> PortableValue {
     match argument {
         PreparedArg::Index(value) => kernel.nat_arg(value),
-        PreparedArg::Integer(_) => panic!("unbounded Integer cannot enter a fixed native kernel argument"),
+        PreparedArg::Integer(_) => {
+            panic!("unbounded Integer cannot enter a fixed native kernel argument")
+        }
         PreparedArg::Scalar(symbol, dtype) => kernel.scalar_arg(symbol, dtype),
     }
 }
@@ -511,9 +555,19 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                 let bound = Bound::from_binding(physical, |view| {
                     let layout = builder.portable_layout(view);
                     let root = layout.base;
-                    let axes = layout.extents.iter().map(|axis| builder.arena().int_from_nat(*axis)).collect::<Vec<_>>();
-                    let view=StoredView::new(view, layout.extents);
-                    values.contents.root(&mut InitializationContext::new(builder.arena()), root, view, &axes, InitializationState::full())
+                    let axes = layout
+                        .extents
+                        .iter()
+                        .map(|axis| builder.arena().int_from_nat(*axis))
+                        .collect::<Vec<_>>();
+                    let view = StoredView::new(view, layout.extents);
+                    values.contents.root(
+                        &mut InitializationContext::new(builder.arena()),
+                        root,
+                        view,
+                        &axes,
+                        InitializationState::full(),
+                    )
                 });
                 values.bind(builder.bindings_mut(), parameter.value, bound);
                 builder
@@ -607,24 +661,53 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
 
     fn node_selection(&self, id: NodeId) -> Option<BindingSelector> {
         if self.may_clobber(id) {
-            if let Some(selector) = self.values.values.iter().flatten().find_map(|binding| self.builder.bindings().unresolved(*binding, &self.values.selections)) {
+            if let Some(selector) = self.values.values.iter().flatten().find_map(|binding| {
+                self.builder
+                    .bindings()
+                    .unresolved(*binding, &self.values.selections)
+            }) {
                 return Some(selector);
             }
         }
-        self.function.node(id).dependencies().into_iter().find_map(|value| {
-            self.values.contains(value).then(|| self.builder.bindings().unresolved(self.values.handle(value), &self.values.selections)).flatten()
-        })
+        self.function
+            .node(id)
+            .dependencies()
+            .into_iter()
+            .find_map(|value| {
+                self.values
+                    .contains(value)
+                    .then(|| {
+                        self.builder
+                            .bindings()
+                            .unresolved(self.values.handle(value), &self.values.selections)
+                    })
+                    .flatten()
+            })
     }
 
-    fn begin_selected_binding(&mut self, selector: BindingSelector) -> construction::SelectedConstruction {
+    fn begin_selected_binding(
+        &mut self,
+        selector: BindingSelector,
+    ) -> construction::SelectedConstruction {
         let inherited = self.values.clone();
         let (selected, schedule) = self.builder.begin_source_selection(selector);
         self.values.selections.insert(selector, selected);
-        construction::SelectedConstruction { selector, schedule, inherited, selected, outcomes: Vec::new() }
+        construction::SelectedConstruction {
+            selector,
+            schedule,
+            inherited,
+            selected,
+            outcomes: Vec::new(),
+        }
     }
 
-    fn next_selected_binding(&mut self, mut progress: construction::SelectedConstruction) -> Option<construction::SelectedConstruction> {
-        progress.outcomes.push((progress.selected, self.values.clone()));
+    fn next_selected_binding(
+        &mut self,
+        mut progress: construction::SelectedConstruction,
+    ) -> Option<construction::SelectedConstruction> {
+        progress
+            .outcomes
+            .push((progress.selected, self.values.clone()));
         if let Some(selected) = self.builder.next_source_branch(&mut progress.schedule) {
             progress.selected = selected;
             self.values = progress.inherited.clone();
@@ -636,8 +719,11 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         let selector = progress.selector;
         let outcomes = progress.outcomes;
         self.values.contents.branch(
-            &mut InitializationContext::new(self.builder.arena()), selector, &self.values.binders,
-            &outcomes[0].1.contents, &outcomes[1].1.contents,
+            &mut InitializationContext::new(self.builder.arena()),
+            selector,
+            &self.values.binders,
+            &outcomes[0].1.contents,
+            &outcomes[1].1.contents,
         );
         for (source, _) in self.function.values() {
             let slot = self.values.slot(source);
@@ -688,12 +774,33 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         }
     }
 
-    fn pending_representation_view(&self, node: NodeId) -> Option<(SemanticValueId, seismic_lang::ids::RepresentationId)> {
-        let SemanticNodeView::View { base, transform: ViewTransform::Slice { .. }, output, .. } = self.function.node(node).view() else { return None; };
-        if !matches!(self.bound(base), Bound::Tensor(TensorRealization::Stored(_))) { return None; }
-        let SemanticType::Tensor(tensor) = &self.function.value(base).ty else { unreachable!() };
-        (!matches!(registry::representation_info(tensor.representation).kind, RepresentationKind::Dense(_)))
-            .then_some((output, tensor.representation))
+    fn pending_representation_view(
+        &self,
+        node: NodeId,
+    ) -> Option<(SemanticValueId, seismic_lang::ids::RepresentationId)> {
+        let SemanticNodeView::View {
+            base,
+            transform: ViewTransform::Slice { .. },
+            output,
+            ..
+        } = self.function.node(node).view()
+        else {
+            return None;
+        };
+        if !matches!(
+            self.bound(base),
+            Bound::Tensor(TensorRealization::Stored(_))
+        ) {
+            return None;
+        }
+        let SemanticType::Tensor(tensor) = &self.function.value(base).ty else {
+            unreachable!()
+        };
+        (!matches!(
+            registry::representation_info(tensor.representation).kind,
+            RepresentationKind::Dense(_)
+        ))
+        .then_some((output, tensor.representation))
     }
 
     fn lower_node_resolved(&mut self, id: NodeId) {
@@ -701,10 +808,14 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         let node = self.function.node(id);
         let computed_value = match node.view() {
             SemanticNodeView::Elementwise { .. } => true,
-            SemanticNodeView::View { base, .. } => matches!(self.bound(base), Bound::Tensor(TensorRealization::Computed(_))),
+            SemanticNodeView::View { base, .. } => matches!(
+                self.bound(base),
+                Bound::Tensor(TensorRealization::Computed(_))
+            ),
             _ => false,
         };
-        if computed_value && matches!(node.view(),SemanticNodeView::Elementwise{output,..}|SemanticNodeView::View{output,..} if self.computed_producers.contains(&output))
+        if computed_value
+            && matches!(node.view(),SemanticNodeView::Elementwise{output,..}|SemanticNodeView::View{output,..} if self.computed_producers.contains(&output))
         {
             let output = match node.view() {
                 SemanticNodeView::Elementwise { output, .. }
@@ -756,14 +867,21 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                 unreachable!("source control is resumed by its owning construction frame")
             }
             SemanticNodeView::Alloc { extents, output } => {
-                let axes=extents.iter().map(|value|self.scalar_ref_nat(&ScalarRef::Value(*value))).collect();
-                let view = self.builder.portable_allocate_tensor_axes(output,axes);
+                let axes = extents
+                    .iter()
+                    .map(|value| self.scalar_ref_nat(&ScalarRef::Value(*value)))
+                    .collect();
+                let view = self.builder.portable_allocate_tensor_axes(output, axes);
                 let bound = self.stored_allocation(output, view, InitializationState::empty());
                 self.values.bind(self.builder.bindings_mut(), output, bound);
             }
-            SemanticNodeView::Fill { value, like, output } => {
-                let axes=self.bound(like).tensor().extents().to_vec();
-                let view = self.builder.portable_allocate_tensor_axes(output,axes);
+            SemanticNodeView::Fill {
+                value,
+                like,
+                output,
+            } => {
+                let axes = self.bound(like).tensor().extents().to_vec();
+                let view = self.builder.portable_allocate_tensor_axes(output, axes);
                 self.builder.schedule().fill_constant_any(view, value);
                 let bound = self.stored_allocation(output, view, InitializationState::full());
                 self.values.bind(self.builder.bindings_mut(), output, bound);
@@ -834,16 +952,29 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
     }
 
     fn stored_allocation(
-        &mut self, value: SemanticValueId, view: AnyBufferView, initial: InitializationState,
+        &mut self,
+        value: SemanticValueId,
+        view: AnyBufferView,
+        initial: InitializationState,
     ) -> Bound {
         let SemanticType::Tensor(_) = &self.function.value(value).ty else {
             panic!("stored allocation has a non-tensor semantic value")
         };
-        let layout=self.builder.portable_layout(view);
-        let root=layout.base;
-        let axes = layout.extents.iter().map(|axis| self.builder.arena().int_from_nat(*axis)).collect::<Vec<_>>();
+        let layout = self.builder.portable_layout(view);
+        let root = layout.base;
+        let axes = layout
+            .extents
+            .iter()
+            .map(|axis| self.builder.arena().int_from_nat(*axis))
+            .collect::<Vec<_>>();
         let mut context = InitializationContext::new(self.builder.arena());
-        Bound::stored(self.values.contents.root(&mut context, root, StoredView::new(view, layout.extents.clone()), &axes, initial))
+        Bound::stored(self.values.contents.root(
+            &mut context,
+            root,
+            StoredView::new(view, layout.extents.clone()),
+            &axes,
+            initial,
+        ))
     }
 
     fn bound(&self, value: SemanticValueId) -> Bound {
@@ -856,14 +987,18 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
     fn kernel_arg(kernel: &mut PortableBuilder<'_, B>, arg: PreparedArg) -> PortableValue {
         match arg {
             PreparedArg::Index(value) => kernel.nat_arg(value),
-            PreparedArg::Integer(_) => panic!("unbounded Integer cannot enter a fixed native kernel argument"),
+            PreparedArg::Integer(_) => {
+                panic!("unbounded Integer cannot enter a fixed native kernel argument")
+            }
             PreparedArg::Scalar(symbol, dtype) => kernel.scalar_arg(symbol, dtype),
         }
     }
 
     fn output_target(&mut self, value: SemanticValueId) -> Bound {
         match self.function.value(value).ty.clone() {
-            SemanticType::Tensor(_) => unreachable!("tensor destinations are constructed from actual operand geometry"),
+            SemanticType::Tensor(_) => {
+                unreachable!("tensor destinations are constructed from actual operand geometry")
+            }
             SemanticType::Scalar(_) => {
                 let ScalarPublication::Scalar(slot) = self.builder.portable_publish(value) else {
                     panic!("scalar has range publication")
@@ -897,8 +1032,16 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             (Bound::Tensor(source), Bound::Tensor(target)) => {
                 if source.stored() != target.stored() {
                     self.copy_tensor(source.stored(), target.stored());
-                    let (TensorRealization::Stored(source), TensorRealization::Stored(target)) = (source, target) else { unreachable!("assignment was physically realized") };
-                    self.values.contents.copy_allocation(&mut InitializationContext::new(self.builder.arena()), source, target);
+                    let (TensorRealization::Stored(source), TensorRealization::Stored(target)) =
+                        (source, target)
+                    else {
+                        unreachable!("assignment was physically realized")
+                    };
+                    self.values.contents.copy_allocation(
+                        &mut InitializationContext::new(self.builder.arena()),
+                        source,
+                        target,
+                    );
                 }
             }
             (Bound::Unit, Bound::Unit) => {}
@@ -944,8 +1087,14 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
     fn copy_tensor(&mut self, source: StoredView, destination: StoredView) {
         let source_layout = self.builder.portable_layout(*source.backing());
         let destination_layout = self.builder.portable_layout(*destination.backing());
-        if source.steps().is_empty() && destination.steps().is_empty() && source_layout.contiguous && destination_layout.contiguous {
-            self.builder.schedule().copy_any(*source.backing(), *destination.backing());
+        if source.steps().is_empty()
+            && destination.steps().is_empty()
+            && source_layout.contiguous
+            && destination_layout.contiguous
+        {
+            self.builder
+                .schedule()
+                .copy_any(*source.backing(), *destination.backing());
             return;
         }
         assert_eq!(
@@ -1028,9 +1177,14 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         };
 
         let axes = match &signature.result {
-            registry::IntrinsicResultType::Owned { axes, .. } => axes.iter().map(|projection| {
-                self.bound(inputs[projection.argument as usize]).tensor().extents()[projection.axis as usize]
-            }).collect::<Vec<_>>(),
+            registry::IntrinsicResultType::Owned { axes, .. } => axes
+                .iter()
+                .map(|projection| {
+                    self.bound(inputs[projection.argument as usize])
+                        .tensor()
+                        .extents()[projection.axis as usize]
+                })
+                .collect::<Vec<_>>(),
             _ => panic!("whole-tensor intrinsic requires an owned tensor result"),
         };
         let scalar_target = match signature.result {
@@ -1038,9 +1192,10 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             _ => None,
         };
         let owned_target = match signature.result {
-            registry::IntrinsicResultType::Owned { .. } => {
-                Some(self.builder.portable_allocate_tensor_axes(output, axes.clone()))
-            }
+            registry::IntrinsicResultType::Owned { .. } => Some(
+                self.builder
+                    .portable_allocate_tensor_axes(output, axes.clone()),
+            ),
             _ => None,
         };
         let mut prepared = Vec::with_capacity(inputs.len());
@@ -1175,7 +1330,11 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                 );
             }
             registry::IntrinsicResultType::Owned { .. } => {
-                let bound = self.stored_allocation(output, owned_target.expect("owned intrinsic has a target"), InitializationState::full());
+                let bound = self.stored_allocation(
+                    output,
+                    owned_target.expect("owned intrinsic has a target"),
+                    InitializationState::full(),
+                );
                 self.values.bind(self.builder.bindings_mut(), output, bound);
             }
             registry::IntrinsicResultType::Void => {
@@ -1190,8 +1349,16 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
 
     fn lower_copy(&mut self, input: SemanticValueId, output: SemanticValueId) {
         let source = self.bound(input).tensor();
-        let destination = self.builder.portable_allocate_tensor_axes(output, source.extents().to_vec());
-        self.copy_tensor(source, StoredView::new(destination, self.builder.portable_layout(destination).extents));
+        let destination = self
+            .builder
+            .portable_allocate_tensor_axes(output, source.extents().to_vec());
+        self.copy_tensor(
+            source,
+            StoredView::new(
+                destination,
+                self.builder.portable_layout(destination).extents,
+            ),
+        );
         let bound = self.stored_allocation(output, destination, InitializationState::full());
         self.values.bind(self.builder.bindings_mut(), output, bound);
     }
@@ -1206,7 +1373,9 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             unreachable!("representation conversion lowering received another node")
         };
         let source = self.bound(input).tensor();
-        let destination_view = self.builder.portable_allocate_tensor_axes(output, source.extents().to_vec());
+        let destination_view = self
+            .builder
+            .portable_allocate_tensor_axes(output, source.extents().to_vec());
         let recipe = registry::representation_conversion_info(conversion);
         assert_eq!(source.backing().representation(), recipe.source);
         assert_eq!(destination_view.representation(), recipe.destination);
@@ -1284,16 +1453,29 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         let view = match transform {
             ViewTransform::Identity => base,
             ViewTransform::Transpose { permutation } => base.transpose(permutation.clone()),
-            ViewTransform::Reshape { .. } => base.reshape(extents.iter().map(|value|self.scalar_ref_nat(&ScalarRef::Value(*value))).collect()),
+            ViewTransform::Reshape { .. } => base.reshape(
+                extents
+                    .iter()
+                    .map(|value| self.scalar_ref_nat(&ScalarRef::Value(*value)))
+                    .collect(),
+            ),
             ViewTransform::Slice { axes } => self.lower_slice_view(base, axes),
             ViewTransform::Plane { .. } => panic!("physical plane escaped into portable source"),
         };
         let initialized_view = match transform {
             ViewTransform::Identity => stored.initialized_view.clone(),
-            ViewTransform::Transpose { permutation } => InitializationContext::new(self.builder.arena()).permute(&stored.initialized_view, permutation),
+            ViewTransform::Transpose { permutation } => {
+                InitializationContext::new(self.builder.arena())
+                    .permute(&stored.initialized_view, permutation)
+            }
             ViewTransform::Reshape { .. } => {
-                let axes = view.extents().iter().map(|axis| self.builder.arena().int_from_nat(*axis)).collect::<Vec<_>>();
-                InitializationContext::new(self.builder.arena()).reshape(&stored.initialized_view, &axes)
+                let axes = view
+                    .extents()
+                    .iter()
+                    .map(|axis| self.builder.arena().int_from_nat(*axis))
+                    .collect::<Vec<_>>();
+                InitializationContext::new(self.builder.arena())
+                    .reshape(&stored.initialized_view, &axes)
             }
             ViewTransform::Slice { axes } => {
                 let mut selections = Vec::with_capacity(axes.len());
@@ -1305,31 +1487,51 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                             (Some(self.builder.arena().int_from_nat(value)), None, true)
                         }
                         SliceAxis::Range { start, end, .. } => {
-                            let start = start.as_ref().map(|value| { let value = self.scalar_ref_nat(value); self.builder.arena().int_from_nat(value) });
-                            let end = end.as_ref().map(|value| { let value = self.scalar_ref_nat(value); self.builder.arena().int_from_nat(value) });
+                            let start = start.as_ref().map(|value| {
+                                let value = self.scalar_ref_nat(value);
+                                self.builder.arena().int_from_nat(value)
+                            });
+                            let end = end.as_ref().map(|value| {
+                                let value = self.scalar_ref_nat(value);
+                                self.builder.arena().int_from_nat(value)
+                            });
                             (start, end, false)
                         }
                     });
                 }
-                InitializationContext::new(self.builder.arena()).slice(&stored.initialized_view, &selections)
+                InitializationContext::new(self.builder.arena())
+                    .slice(&stored.initialized_view, &selections)
             }
             ViewTransform::Plane { .. } => unreachable!(),
         };
         let alias = self.values.contents.alias(&stored, view, initialized_view);
-        self.values.bind(self.builder.bindings_mut(), out, Bound::stored(alias));
+        self.values
+            .bind(self.builder.bindings_mut(), out, Bound::stored(alias));
     }
 
     fn lower_slice_view(&mut self, base: StoredView, axes: &[SliceAxis]) -> StoredView {
         use seismic_ir::tensor_view::SliceAxis as Selection;
-        let selections = axes.iter().enumerate().map(|(axis, selection)| match selection {
-            SliceAxis::Full => Selection::Full,
-            SliceAxis::Point { value, .. } => Selection::Point(self.scalar_ref_nat(value)),
-            SliceAxis::Range { start, end, .. } => Selection::Range {
-                start: start.as_ref().map(|value| self.scalar_ref_nat(value)).unwrap_or_else(|| self.builder.arena().nat(0)),
-                end: end.as_ref().map(|value| self.scalar_ref_nat(value)).unwrap_or(base.extents()[axis]),
-            },
-        }).collect();
-        base.slice(selections, |end, start| self.builder.arena().nat_sub(end, start))
+        let selections = axes
+            .iter()
+            .enumerate()
+            .map(|(axis, selection)| match selection {
+                SliceAxis::Full => Selection::Full,
+                SliceAxis::Point { value, .. } => Selection::Point(self.scalar_ref_nat(value)),
+                SliceAxis::Range { start, end, .. } => Selection::Range {
+                    start: start
+                        .as_ref()
+                        .map(|value| self.scalar_ref_nat(value))
+                        .unwrap_or_else(|| self.builder.arena().nat(0)),
+                    end: end
+                        .as_ref()
+                        .map(|value| self.scalar_ref_nat(value))
+                        .unwrap_or(base.extents()[axis]),
+                },
+            })
+            .collect();
+        base.slice(selections, |end, start| {
+            self.builder.arena().nat_sub(end, start)
+        })
     }
 
     fn scalar_ref_nat(&mut self, value: &ScalarRef) -> NatExpr {
@@ -1338,23 +1540,29 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             ScalarRef::Value(value) => match self.prepared(&self.bound(*value)) {
                 PreparedArg::Index(value) => value,
                 PreparedArg::Integer(value) => self.builder.arena().nat_from_int(value),
-                PreparedArg::Scalar(symbol,dtype) => {
+                PreparedArg::Scalar(symbol, dtype) => {
                     // The checked slice continuation establishes nonnegative,
                     // in-range coordinates. Preserve the actual source word;
                     // never substitute its producer's unbounded algebra.
-                    let integer=match dtype {
-                        DType::I32=> {
-                            let word=self.builder.arena().scalar_symbol::<seismic_lang::expr::I32>(symbol);
+                    let integer = match dtype {
+                        DType::I32 => {
+                            let word = self
+                                .builder
+                                .arena()
+                                .scalar_symbol::<seismic_lang::expr::I32>(symbol);
                             self.builder.arena().int_from_scalar(word)
                         }
-                        DType::U32=> {
-                            let word=self.builder.arena().scalar_symbol::<seismic_lang::expr::U32>(symbol);
+                        DType::U32 => {
+                            let word = self
+                                .builder
+                                .arena()
+                                .scalar_symbol::<seismic_lang::expr::U32>(symbol);
                             self.builder.arena().int_from_scalar(word)
                         }
-                        _=>panic!("checked slice bound is not an integer word"),
+                        _ => panic!("checked slice bound is not an integer word"),
                     };
                     self.builder.arena().nat_from_int(integer)
-                },
+                }
             },
         }
     }
@@ -1399,18 +1607,31 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         output: SemanticValueId,
         atomic: Option<seismic_lang::intrinsics::AtomicOp>,
     ) {
-        let Bound::Tensor(TensorRealization::Stored(stored)) = self.bound(place) else { panic!("write needs stored place") };
+        let Bound::Tensor(TensorRealization::Stored(stored)) = self.bound(place) else {
+            panic!("write needs stored place")
+        };
         let base = stored.view.clone();
-        let selections = indices.iter().map(|value| {
-            let bound = self.bound(*value);
-            let InitializationArgument::Integer(index) = self.initialization_scalar(&bound) else {
-                panic!("checked element index has no integer value")
-            };
-            (Some(index), None, true)
-        }).collect::<Vec<_>>();
-        let initialized_view = InitializationContext::new(self.builder.arena()).slice(&stored.initialized_view, &selections);
-        let point = self.values.contents.alias(&stored, base.clone(), initialized_view);
-        self.values.contents.write(&mut InitializationContext::new(self.builder.arena()), &point);
+        let selections = indices
+            .iter()
+            .map(|value| {
+                let bound = self.bound(*value);
+                let InitializationArgument::Integer(index) = self.initialization_scalar(&bound)
+                else {
+                    panic!("checked element index has no integer value")
+                };
+                (Some(index), None, true)
+            })
+            .collect::<Vec<_>>();
+        let initialized_view = InitializationContext::new(self.builder.arena())
+            .slice(&stored.initialized_view, &selections);
+        let point = self
+            .values
+            .contents
+            .alias(&stored, base.clone(), initialized_view);
+        self.values.contents.write(
+            &mut InitializationContext::new(self.builder.arena()),
+            &point,
+        );
         let mut args = indices
             .iter()
             .map(|value| PreparedArg::Index(self.scalar_ref_nat(&ScalarRef::Value(*value))))
@@ -1463,7 +1684,11 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         self.builder.schedule().check_any(
             slot,
             CheckSite {
-                failure: SourceFailure::at(self.function, node, SourceFailureCause::Check(reason.clone())),
+                failure: SourceFailure::at(
+                    self.function,
+                    node,
+                    SourceFailureCause::Check(reason.clone()),
+                ),
                 path: self.function.name().to_owned(),
                 line: span.start,
             },
@@ -1476,19 +1701,26 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         value: SemanticValueId,
         output: SemanticValueId,
     ) {
-        let Bound::Tensor(TensorRealization::Stored(stored)) = self.bound(destination_value) else { panic!("store needs stored destination") };
+        let Bound::Tensor(TensorRealization::Stored(stored)) = self.bound(destination_value) else {
+            panic!("store needs stored destination")
+        };
         let destination = stored.view.clone();
         let mut source = self.bound(value).tensor();
-        if self.builder.portable_views_may_overlap(*source.backing(),*destination.backing()) {
+        if self
+            .builder
+            .portable_views_may_overlap(*source.backing(), *destination.backing())
+        {
             // Store evaluates its complete RHS before writing the selected place.
             // A selected descriptor may alias even when its view handle differs.
-            let axes=source.extents().to_vec();
-            let snapshot=self.builder.allocate_tensor_product(&TensorSemantics {
-                representation: source.backing().representation(), axes: axes.clone(), storage: TensorStorage::Owned,
+            let axes = source.extents().to_vec();
+            let snapshot = self.builder.allocate_tensor_product(&TensorSemantics {
+                representation: source.backing().representation(),
+                axes: axes.clone(),
+                storage: TensorStorage::Owned,
             });
-            let snapshot=StoredView::new(snapshot,axes);
-            self.copy_tensor(source,snapshot.clone());
-            source=snapshot;
+            let snapshot = StoredView::new(snapshot, axes);
+            self.copy_tensor(source, snapshot.clone());
+            source = snapshot;
         }
         self.copy_tensor(source, destination);
         let base = match &self.function.value(destination_value).ty {
@@ -1498,22 +1730,34 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             }) => self.bound(*base),
             _ => panic!("store destination is not an explicit writable view"),
         };
-        self.values.contents.write(&mut InitializationContext::new(self.builder.arena()), &stored);
+        self.values.contents.write(
+            &mut InitializationContext::new(self.builder.arena()),
+            &stored,
+        );
         self.values.bind(self.builder.bindings_mut(), output, base);
     }
 
-    fn broadcast_axes<'v>(&mut self, inputs: impl Iterator<Item=&'v [NatExpr]>) -> Vec<NatExpr> {
+    fn broadcast_axes<'v>(&mut self, inputs: impl Iterator<Item = &'v [NatExpr]>) -> Vec<NatExpr> {
         let inputs = inputs.collect::<Vec<_>>();
-        let rank = inputs.iter().map(|axes| axes.len()).max().expect("tensor operation has a tensor operand");
+        let rank = inputs
+            .iter()
+            .map(|axes| axes.len())
+            .max()
+            .expect("tensor operation has a tensor operand");
         let one = self.builder.arena().nat(1);
-        let mut output = vec![one;rank];
+        let mut output = vec![one; rank];
         for input in inputs {
-            let skip = rank-input.len();
-            for (target,source) in output[skip..].iter_mut().zip(input) {
+            let skip = rank - input.len();
+            for (target, source) in output[skip..].iter_mut().zip(input) {
                 // An axis broadcast with itself is itself.
-                if *target == *source { continue; }
-                let singleton = self.builder.arena().nat_cmp(seismic_lang::expr::CmpOp::Eq,*target,one);
-                *target = self.builder.arena().nat_select(singleton,*source,*target);
+                if *target == *source {
+                    continue;
+                }
+                let singleton =
+                    self.builder
+                        .arena()
+                        .nat_cmp(seismic_lang::expr::CmpOp::Eq, *target, one);
+                *target = self.builder.arena().nat_select(singleton, *source, *target);
             }
         }
         output
@@ -1537,27 +1781,34 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let input_axes = input_bounds.iter().map(|bound| match bound {
-            Bound::Tensor(value) => Some(value.stored().extents().to_vec()),
-            _ => None,
-        }).collect::<Vec<_>>();
+        let input_axes = input_bounds
+            .iter()
+            .map(|bound| match bound {
+                Bound::Tensor(value) => Some(value.stored().extents().to_vec()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         let axes = self.broadcast_axes(input_axes.iter().flatten().map(Vec::as_slice));
-        let destination = self.builder.portable_allocate_tensor_axes(out, axes.clone());
+        let destination = self
+            .builder
+            .portable_allocate_tensor_axes(out, axes.clone());
         let parallel_domain = if self.mode != SemanticMode::AuthoredBackend {
             let extent = self.builder.arena().nat_product(&axes);
             Some(self.independent_domain(extent, "portable elementwise workgroup size"))
         } else {
             None
         };
-        let checks=source_scalar::checks(self.function,node,primitive,inputs);
-        let statuses=self.builder.portable_source_statuses(checks.len());
+        let checks = source_scalar::checks(self.function, node, primitive, inputs);
+        let statuses = self.builder.portable_source_statuses(checks.len());
         let mut kernel = self.builder.portable_kernel();
-        let status_words=segment_check_statuses(&mut kernel,&checks,&statuses);
+        let status_words = segment_check_statuses(&mut kernel, &checks, &statuses);
         let output = kernel.arg_view(destination, true);
         let places = input_bounds
             .iter()
             .map(|bound| match bound {
-                Bound::Tensor(value) => Some(stored_view_in_kernel(&mut kernel, &value.stored(), false)),
+                Bound::Tensor(value) => {
+                    Some(stored_view_in_kernel(&mut kernel, &value.stored(), false))
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1565,37 +1816,61 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             .into_iter()
             .map(|arg| arg.map(|arg| Self::kernel_arg(&mut kernel, arg)))
             .collect::<Vec<_>>();
-        let mut emit = |kernel: &mut PortableBuilder<'_, B>, index: &[PortableValue],alive:PortableValue| {
-            kernel.branch(alive,|kernel| {
-            let mut args = Vec::new();
-            for ((place, scalar), source_axes) in
-                places.iter().zip(&scalars).zip(&input_axes)
-            {
-                if let Some(place) = place {
-                    let source_axes = source_axes.as_ref().expect("tensor input has no axes");
-                    let skip = index.len() - source_axes.len();
-                    let source_index = index[skip..]
-                        .iter().zip(source_axes).map(|(value, extent)| {
-                            let extent = kernel.nat_arg(*extent);
-                            let one = kernel.index_constant(1);
-                            let zero = kernel.index_constant(0);
-                            let singleton = kernel.cmp(CmpOp::Eq,extent,one);
-                            kernel.select(singleton,zero,*value)
-                        }).collect::<Vec<_>>();
-                    args.push(kernel.tensor_read(place, &source_index));
-                } else {
-                    args.push(scalar.expect("elementwise input is neither tensor nor scalar"));
-                }
-            }
-            let (value,successful) = source_scalar::lower(
-                kernel, self.function, node, &status_words, alive, primitive, &args,
-                &SemanticType::Scalar(element_dtype(destination.representation())),
-            );
-            kernel.branch(successful,|kernel| { kernel.write(output,index,value);Vec::new() },|_|Vec::new());
-            vec![successful]
-            },|_|vec![alive])[0]
-        };
-        let alive=kernel.constant(ConstantValue::Bool(true),ValueType::Bool);
+        let mut emit =
+            |kernel: &mut PortableBuilder<'_, B>, index: &[PortableValue], alive: PortableValue| {
+                kernel.branch(
+                    alive,
+                    |kernel| {
+                        let mut args = Vec::new();
+                        for ((place, scalar), source_axes) in
+                            places.iter().zip(&scalars).zip(&input_axes)
+                        {
+                            if let Some(place) = place {
+                                let source_axes =
+                                    source_axes.as_ref().expect("tensor input has no axes");
+                                let skip = index.len() - source_axes.len();
+                                let source_index = index[skip..]
+                                    .iter()
+                                    .zip(source_axes)
+                                    .map(|(value, extent)| {
+                                        let extent = kernel.nat_arg(*extent);
+                                        let one = kernel.index_constant(1);
+                                        let zero = kernel.index_constant(0);
+                                        let singleton = kernel.cmp(CmpOp::Eq, extent, one);
+                                        kernel.select(singleton, zero, *value)
+                                    })
+                                    .collect::<Vec<_>>();
+                                args.push(kernel.tensor_read(place, &source_index));
+                            } else {
+                                args.push(
+                                    scalar.expect("elementwise input is neither tensor nor scalar"),
+                                );
+                            }
+                        }
+                        let (value, successful) = source_scalar::lower(
+                            kernel,
+                            self.function,
+                            node,
+                            &status_words,
+                            alive,
+                            primitive,
+                            &args,
+                            &SemanticType::Scalar(element_dtype(destination.representation())),
+                        );
+                        kernel.branch(
+                            successful,
+                            |kernel| {
+                                kernel.write(output, index, value);
+                                Vec::new()
+                            },
+                            |_| Vec::new(),
+                        );
+                        vec![successful]
+                    },
+                    |_| vec![alive],
+                )[0]
+            };
+        let alive = kernel.constant(ConstantValue::Bool(true), ValueType::Bool);
         let mut logical_base = None;
         if let Some(domain) = parallel_domain {
             let (linear, base) = logical_global_id(&mut kernel, true, domain.parallel_extent);
@@ -1610,14 +1885,17 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                 active,
                 |kernel| {
                     let index = unravel_index(kernel, linear, &axis_values);
-                    emit(kernel, &index,alive);
+                    emit(kernel, &index, alive);
                     Vec::new()
                 },
                 |_| Vec::new(),
             );
         } else {
-            let axes=axes.iter().map(|axis|kernel.nat_arg(*axis)).collect::<Vec<_>>();
-            source_scalar::nested(&mut kernel,&axes,0,&mut Vec::new(),alive,&mut emit);
+            let axes = axes
+                .iter()
+                .map(|axis| kernel.nat_arg(*axis))
+                .collect::<Vec<_>>();
+            source_scalar::nested(&mut kernel, &axes, 0, &mut Vec::new(), alive, &mut emit);
         }
         let kernel = kernel.close();
         if let Some(domain) = parallel_domain {
@@ -1625,7 +1903,7 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         } else {
             self.builder.schedule().launch_sequential(kernel);
         }
-        source_scalar::finish(self.builder,self.function.name(),checks,statuses);
+        source_scalar::finish(self.builder, self.function.name(), checks, statuses);
         let bound = self.stored_allocation(out, destination, InitializationState::full());
         self.values.bind(self.builder.bindings_mut(), out, bound);
     }
@@ -1680,7 +1958,9 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                 tensor.axes = axes.clone();
                 let result = self.bind_tensor_result(value, tensor);
                 TensorDefinitionValue::Elementwise {
-                    primitive: primitive.clone(), inputs, result,
+                    primitive: primitive.clone(),
+                    inputs,
+                    result,
                 }
             }
             SemanticNodeView::View {
@@ -1690,16 +1970,25 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                 output,
             } => {
                 assert_eq!(output, value, "streamed view output mismatch");
-                if matches!(transform,ViewTransform::Reshape { .. }) {
-                    axes=extents.iter().map(|value|self.scalar_ref_nat(&ScalarRef::Value(*value))).collect();
+                if matches!(transform, ViewTransform::Reshape { .. }) {
+                    axes = extents
+                        .iter()
+                        .map(|value| self.scalar_ref_nat(&ScalarRef::Value(*value)))
+                        .collect();
                 }
                 let base = self.stream_tensor_plan(base);
                 match transform {
                     ViewTransform::Identity => return base,
                     ViewTransform::Transpose { permutation } => {
-                        axes = permutation.iter().map(|axis| base.axes[*axis as usize]).collect();
-                        TensorDefinitionValue::View { base, transform: StreamViewPlan::Transpose(permutation.clone()) }
-                    },
+                        axes = permutation
+                            .iter()
+                            .map(|axis| base.axes[*axis as usize])
+                            .collect();
+                        TensorDefinitionValue::View {
+                            base,
+                            transform: StreamViewPlan::Transpose(permutation.clone()),
+                        }
+                    }
                     ViewTransform::Reshape { .. } => TensorDefinitionValue::View {
                         base,
                         transform: StreamViewPlan::Reshape,
@@ -1711,9 +2000,15 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                                 SliceAxis::Full => actual.push(base.axes[axis]),
                                 SliceAxis::Point { .. } => (),
                                 SliceAxis::Range { start, end, .. } => {
-                                    let start = start.as_ref().map(|value| self.scalar_ref_nat(value)).unwrap_or_else(|| self.builder.arena().nat(0));
-                                    let end = end.as_ref().map(|value| self.scalar_ref_nat(value)).unwrap_or(base.axes[axis]);
-                                    actual.push(self.builder.arena().nat_sub(end,start));
+                                    let start = start
+                                        .as_ref()
+                                        .map(|value| self.scalar_ref_nat(value))
+                                        .unwrap_or_else(|| self.builder.arena().nat(0));
+                                    let end = end
+                                        .as_ref()
+                                        .map(|value| self.scalar_ref_nat(value))
+                                        .unwrap_or(base.axes[axis]);
+                                    actual.push(self.builder.arena().nat_sub(end, start));
                                 }
                             }
                         }
@@ -1773,7 +2068,6 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         self.launch_semantic(kernel, domain, binding);
     }
 
-
     fn stream_scalar_ref(&mut self, value: &ScalarRef) -> PreparedArg {
         match value {
             ScalarRef::Static(value) => PreparedArg::Index(*value),
@@ -1792,11 +2086,16 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         let input_axes = source_plan.axes.clone();
         let mut output_axes = input_axes.clone();
         output_axes.remove(axis as usize);
-        let destination = if matches!(self.function.value(out).ty,SemanticType::Tensor(_)) {
-            let view = self.builder.portable_allocate_tensor_axes(out,output_axes.clone());
-            self.stored_allocation(out,view,InitializationState::empty())
+        let destination = if matches!(self.function.value(out).ty, SemanticType::Tensor(_)) {
+            let view = self
+                .builder
+                .portable_allocate_tensor_axes(out, output_axes.clone());
+            self.stored_allocation(out, view, InitializationState::empty())
         } else {
-            assert!(output_axes.is_empty(), "scalar reduction retains no logical axes");
+            assert!(
+                output_axes.is_empty(),
+                "scalar reduction retains no logical axes"
+            );
             self.output_target(out)
         };
         let input_dtype = match &self.function.value(input_value).ty {
@@ -2043,7 +2342,12 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         let cohort_scope = cohort::Scope::region(function, body, &helpers);
         let cohort = cohort_scope.map(|_| cohort::Cohort::new(&mut kernel, domain));
         let active = if let Some(scope) = cohort_scope {
-            cohort.as_ref().unwrap().membership(&mut kernel, scope, domain.parallel_extent, logical_base)
+            cohort.as_ref().unwrap().membership(
+                &mut kernel,
+                scope,
+                domain.parallel_extent,
+                logical_base,
+            )
         } else {
             let end_arg = kernel.nat_arg(end);
             kernel.cmp(CmpOp::Lt, binder, end_arg)
@@ -2051,23 +2355,66 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         let branch = kernel.begin_branch(active);
         let alive = kernel.constant(ConstantValue::Bool(true), ValueType::Bool);
         let mut segment = SegmentLowerer {
-            function, program, kernel: &mut kernel, values, helpers: &helpers, checks: &check_tensors,
-            target, registry, domain, alive, cohort: cohort.as_ref(), successful: uniformity::Values::new(), lexical: registry::IntrinsicUniformity::Workgroup,
+            function,
+            program,
+            kernel: &mut kernel,
+            values,
+            helpers: &helpers,
+            checks: &check_tensors,
+            target,
+            registry,
+            domain,
+            alive,
+            cohort: cohort.as_ref(),
+            successful: uniformity::Values::new(),
+            lexical: registry::IntrinsicUniformity::Workgroup,
         };
         segment.initialize_successful_values(body);
         let environment = segment.into_environment();
-        assert!(carries.is_empty(), "checked parallel loops cannot carry reassigned state");
+        assert!(
+            carries.is_empty(),
+            "checked parallel loops cannot carry reassigned state"
+        );
         construction::SegmentConstruction {
-            capacity_pending: None,            cursor: kernel.suspend(), environment, branch,
+            capacity_pending: None,
+            cursor: kernel.suspend(),
+            environment,
+            branch,
             frames: vec![source_control::SegmentFrame::region(body)],
-            helpers: helpers.into_iter().map(|(family, function)| (family, function.id())).collect(),
-            checks: check_tensors, cohort, domain, logical_base,
-            completion: construction::SegmentCompletion { checks, check_statuses, start, end, body, captures: capture_values.to_vec() },
+            helpers: helpers
+                .into_iter()
+                .map(|(family, function)| (family, function.id()))
+                .collect(),
+            checks: check_tensors,
+            cohort,
+            domain,
+            logical_base,
+            completion: construction::SegmentCompletion {
+                checks,
+                check_statuses,
+                start,
+                end,
+                body,
+                captures: capture_values.to_vec(),
+            },
         }
     }
 
-    fn finish_parallel_segment(&mut self, kernel: seismic_ir::kernel::KernelId, domain: SegmentLaunchDomain, logical_base: Option<seismic_ir::kernel::dynamic::LogicalIndexBinding>, completion: construction::SegmentCompletion) {
-        let construction::SegmentCompletion { checks, check_statuses, start, end, body, captures } = completion;
+    fn finish_parallel_segment(
+        &mut self,
+        kernel: seismic_ir::kernel::KernelId,
+        domain: SegmentLaunchDomain,
+        logical_base: Option<seismic_ir::kernel::dynamic::LogicalIndexBinding>,
+        completion: construction::SegmentCompletion,
+    ) {
+        let construction::SegmentCompletion {
+            checks,
+            check_statuses,
+            start,
+            end,
+            body,
+            captures,
+        } = completion;
         self.launch_semantic(kernel, domain, logical_base);
         source_scalar::finish(self.builder, self.function.name(), checks, check_statuses);
         let mut loop_values = vec![Bound::Scalar(ScalarBinding::Index(start))];
@@ -2075,8 +2422,21 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         let arguments = self.initialization_arguments(&loop_values);
         let start_integer = self.builder.arena().int_from_nat(start);
         let end_integer = self.builder.arena().int_from_nat(end);
-        let mut context = initialization_context(self.builder.arena(), &self.values.selections, &self.values.binders);
-        self.values.contents.loop_exit(&mut context, self.function.region(body).loop_initialization().expect("loop owns checked initialization"), &arguments, start_integer, end_integer);
+        let mut context = initialization_context(
+            self.builder.arena(),
+            &self.values.selections,
+            &self.values.binders,
+        );
+        self.values.contents.loop_exit(
+            &mut context,
+            self.function
+                .region(body)
+                .loop_initialization()
+                .expect("loop owns checked initialization"),
+            &arguments,
+            start_integer,
+            end_integer,
+        );
     }
 
     /// Finds loop-body parameters whose storage is written by the body's
@@ -2202,14 +2562,21 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                         );
                     }
                 }
-                SemanticNodeView::Primitive { primitive, inputs, .. }
-                | SemanticNodeView::Elementwise { primitive, inputs, .. } => {
-                    for check in source_scalar::checks(function,id,primitive,inputs) {
-                        if !checks.iter().any(|(site,_)|*site==check.0) { checks.push(check); }
+                SemanticNodeView::Primitive {
+                    primitive, inputs, ..
+                }
+                | SemanticNodeView::Elementwise {
+                    primitive, inputs, ..
+                } => {
+                    for check in source_scalar::checks(function, id, primitive, inputs) {
+                        if !checks.iter().any(|(site, _)| *site == check.0) {
+                            checks.push(check);
+                        }
                     }
                 }
                 SemanticNodeView::Check { reason, .. } => {
-                    let site = SourceFailure::at(function, id, SourceFailureCause::Check(reason.clone()));
+                    let site =
+                        SourceFailure::at(function, id, SourceFailureCause::Check(reason.clone()));
                     if !checks.iter().any(|(existing, _)| *existing == site) {
                         checks.push((site, node.span()));
                     }
@@ -2234,7 +2601,9 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                 contract: value.clone(),
                 writable,
             },
-            Bound::Tensor(TensorRealization::Computed(_)) => unreachable!("segment captures are materialized"),
+            Bound::Tensor(TensorRealization::Computed(_)) => {
+                unreachable!("segment captures are materialized")
+            }
             Bound::Scalar(_) => SegmentCapture::Scalar(self.prepared(bound)),
             Bound::Range { start, end } => SegmentCapture::Range {
                 start: Box::new(self.segment_capture_plan(start, false)),
@@ -2249,7 +2618,6 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             Bound::Unit => SegmentCapture::Unit,
         }
     }
-
 }
 
 struct SegmentLowerer<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> {
@@ -2381,7 +2749,10 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
                             panic!("checked plane view requires packed physical storage")
                         };
                         let physical = self.kernel.tensor_plane(physical.tensor, *plane);
-                        SegmentTensor::physical(self.kernel, SegmentStorage::source(result.unwrap(), physical))
+                        SegmentTensor::physical(
+                            self.kernel,
+                            SegmentStorage::source(result.unwrap(), physical),
+                        )
                     }
                     ViewTransform::Transpose { permutation } => SegmentTensor {
                         axes: permutation
@@ -2394,7 +2765,13 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
                         },
                     },
                     ViewTransform::Reshape { .. } => {
-                        let axes = extents.iter().map(|value| { let value=self.scalar(*value); portable_index(self.kernel,value) }).collect();
+                        let axes = extents
+                            .iter()
+                            .map(|value| {
+                                let value = self.scalar(*value);
+                                portable_index(self.kernel, value)
+                            })
+                            .collect();
                         SegmentTensor {
                             axes,
                             value: TensorDefinitionValue::View {
@@ -2480,10 +2857,7 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
                     value = self.kernel.cast(value, destination_type);
                 }
                 self.kernel.tensor_write(&tensor, &indices, value);
-                self.values.insert(
-                    output,
-                    self.bound(place),
-                );
+                self.values.insert(output, self.bound(place));
             }
             SemanticNodeView::Store {
                 destination,
@@ -2509,10 +2883,7 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
                     .collect::<Vec<_>>();
                 self.kernel
                     .tensor_atomic(op, &tensor, &indices, self.scalar(value));
-                self.values.insert(
-                    output,
-                    self.bound(place),
-                );
+                self.values.insert(output, self.bound(place));
             }
             SemanticNodeView::Extent {
                 tensor,
@@ -2542,10 +2913,18 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
             | SemanticNodeView::Check { .. } => {
                 unreachable!("segment control nodes are consumed by the continuation walker")
             }
-            SemanticNodeView::Loop { .. } => unreachable!("segment loops are consumed by their owned continuation"),
-            SemanticNodeView::Alloc { output, .. } => self.lower_local_alloc(output, result.unwrap()),
-            SemanticNodeView::Fill { value, output, .. } => self.lower_local_fill(value, output, result.unwrap()),
-            SemanticNodeView::Copy { input, output } => self.lower_local_copy(input, output, result.unwrap()),
+            SemanticNodeView::Loop { .. } => {
+                unreachable!("segment loops are consumed by their owned continuation")
+            }
+            SemanticNodeView::Alloc { output, .. } => {
+                self.lower_local_alloc(output, result.unwrap())
+            }
+            SemanticNodeView::Fill { value, output, .. } => {
+                self.lower_local_fill(value, output, result.unwrap())
+            }
+            SemanticNodeView::Copy { input, output } => {
+                self.lower_local_copy(input, output, result.unwrap())
+            }
             SemanticNodeView::RepresentationConvert { .. } => {
                 panic!("representation conversion cannot be nested in a participant segment")
             }
@@ -2614,8 +2993,14 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
                     .map(|value| self.scalar(*value))
                     .collect::<Vec<_>>();
                 let (value, successful) = source_scalar::lower(
-                    self.kernel, self.function, node, self.checks, self.alive,
-                    primitive, &arguments, &self.function.value(output).ty,
+                    self.kernel,
+                    self.function,
+                    node,
+                    self.checks,
+                    self.alive,
+                    primitive,
+                    &arguments,
+                    &self.function.value(output).ty,
                 );
                 self.alive = successful;
                 self.values.insert(output, SegmentBound::Scalar(value));
@@ -2634,23 +3019,58 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
         let SemanticType::Tensor(output_type) = &self.function.value(output).ty else {
             panic!("checked elementwise output is not a tensor")
         };
-        if !source_scalar::checks(self.function,node,primitive,inputs).is_empty() {
-            let storage=self.local_tensor(result);
-            let tensor=&storage.tensor;
-            let axes=self.kernel.tensor_extents(&tensor).to_vec();
-            let arguments=inputs.iter().map(|value|self.bound(*value)).collect::<Vec<_>>();
-            let output_type=SemanticType::Scalar(element_dtype(output_type.representation));
-            let statuses=self.checks;
-            let mut emit=|kernel:&mut PortableBuilder<'_,B>,index:&[PortableValue],alive:PortableValue| {
-                kernel.branch(alive,|kernel| {
-                    let args=segment_elementwise_arguments(kernel,&arguments,index);
-                    let (value,successful)=source_scalar::lower(kernel,self.function,node,statuses,alive,primitive,&args,&output_type);
-                    kernel.branch(successful,|kernel| {kernel.tensor_write(&tensor,index,value);Vec::new()},|_|Vec::new());
-                    vec![successful]
-                },|_|vec![alive])[0]
+        if !source_scalar::checks(self.function, node, primitive, inputs).is_empty() {
+            let storage = self.local_tensor(result);
+            let tensor = &storage.tensor;
+            let axes = self.kernel.tensor_extents(&tensor).to_vec();
+            let arguments = inputs
+                .iter()
+                .map(|value| self.bound(*value))
+                .collect::<Vec<_>>();
+            let output_type = SemanticType::Scalar(element_dtype(output_type.representation));
+            let statuses = self.checks;
+            let mut emit = |kernel: &mut PortableBuilder<'_, B>,
+                            index: &[PortableValue],
+                            alive: PortableValue| {
+                kernel.branch(
+                    alive,
+                    |kernel| {
+                        let args = segment_elementwise_arguments(kernel, &arguments, index);
+                        let (value, successful) = source_scalar::lower(
+                            kernel,
+                            self.function,
+                            node,
+                            statuses,
+                            alive,
+                            primitive,
+                            &args,
+                            &output_type,
+                        );
+                        kernel.branch(
+                            successful,
+                            |kernel| {
+                                kernel.tensor_write(&tensor, index, value);
+                                Vec::new()
+                            },
+                            |_| Vec::new(),
+                        );
+                        vec![successful]
+                    },
+                    |_| vec![alive],
+                )[0]
             };
-            self.alive=source_scalar::nested(self.kernel,&axes,0,&mut Vec::new(),self.alive,&mut emit);
-            self.values.insert(output,SegmentBound::Tensor(SegmentTensor::physical(self.kernel,storage)));
+            self.alive = source_scalar::nested(
+                self.kernel,
+                &axes,
+                0,
+                &mut Vec::new(),
+                self.alive,
+                &mut emit,
+            );
+            self.values.insert(
+                output,
+                SegmentBound::Tensor(SegmentTensor::physical(self.kernel, storage)),
+            );
             return;
         }
         let axes = result.axes(self.kernel);
@@ -2718,12 +3138,22 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
     ) {
         let destination_tensor = self.physical_tensor(destination);
         let mut source = self.tensor(value);
-        if source.reads_overlap(self.kernel,std::slice::from_ref(&destination_tensor)) {
-            let SemanticType::Tensor(tensor)=&self.function.value(value).ty else {unreachable!("store RHS is a tensor")};
-            let snapshot=result.snapshot_storage(self.kernel,&source.axes);
-            let dtype=registry::representation_info(tensor.representation).decoded;
-            segment_copy_tensor(self.kernel,&source,&snapshot,dtype,&source.axes,0,&mut Vec::new());
-            source=SegmentTensor::physical(self.kernel,SegmentStorage::source(result,snapshot));
+        if source.reads_overlap(self.kernel, std::slice::from_ref(&destination_tensor)) {
+            let SemanticType::Tensor(tensor) = &self.function.value(value).ty else {
+                unreachable!("store RHS is a tensor")
+            };
+            let snapshot = result.snapshot_storage(self.kernel, &source.axes);
+            let dtype = registry::representation_info(tensor.representation).decoded;
+            segment_copy_tensor(
+                self.kernel,
+                &source,
+                &snapshot,
+                dtype,
+                &source.axes,
+                0,
+                &mut Vec::new(),
+            );
+            source = SegmentTensor::physical(self.kernel, SegmentStorage::source(result, snapshot));
         }
         let axes = self.kernel.tensor_extents(&destination_tensor).to_vec();
         let SemanticType::Tensor(destination_type) = &self.function.value(destination).ty else {
@@ -2750,12 +3180,16 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
     }
 
     fn local_tensor(&mut self, result: producer::TensorResult<PortableValue>) -> SegmentStorage {
-        let axes=result.axes(self.kernel);
-        let tensor=result.snapshot_storage(self.kernel,&axes);
-        SegmentStorage::source(result,tensor)
+        let axes = result.axes(self.kernel);
+        let tensor = result.snapshot_storage(self.kernel, &axes);
+        SegmentStorage::source(result, tensor)
     }
 
-    fn lower_local_alloc(&mut self, output: SemanticValueId, result: producer::TensorResult<PortableValue>) {
+    fn lower_local_alloc(
+        &mut self,
+        output: SemanticValueId,
+        result: producer::TensorResult<PortableValue>,
+    ) {
         let storage = self.local_tensor(result);
         self.values.insert(
             output,
@@ -2789,7 +3223,12 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
         );
     }
 
-    fn lower_local_copy(&mut self, input: SemanticValueId, output: SemanticValueId, result: producer::TensorResult<PortableValue>) {
+    fn lower_local_copy(
+        &mut self,
+        input: SemanticValueId,
+        output: SemanticValueId,
+        result: producer::TensorResult<PortableValue>,
+    ) {
         let source = self.tensor(input);
         let storage = self.local_tensor(result);
         let tensor = &storage.tensor;
@@ -2883,8 +3322,6 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
         };
         self.values.insert(output, value);
     }
-
-
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2897,14 +3334,8 @@ pub(crate) enum PreparedArg {
 #[derive(Clone)]
 enum IntrinsicPrepared {
     Scalar(PreparedArg, DType, bool),
-    Place(
-        StoredView,
-        seismic_lang::ids::RepresentationId,
-        u32,
-        bool,
-    ),
+    Place(StoredView, seismic_lang::ids::RepresentationId, u32, bool),
 }
-
 
 fn merge_exact<T: Copy + PartialEq>(slot: &mut Option<T>, value: Option<T>, what: &str) {
     let Some(value) = value else { return };
@@ -2924,7 +3355,13 @@ fn segment_capture<B: seismic_native_target::TargetFamily>(
     match bound {
         SegmentCapture::Tensor { contract, writable } => {
             let tensor = stored_view_in_kernel(kernel, &contract.view, *writable);
-            SegmentBound::Tensor(SegmentTensor::physical(kernel, SegmentStorage { tensor, origin: StorageOrigin::Parameter(contract.clone()) }))
+            SegmentBound::Tensor(SegmentTensor::physical(
+                kernel,
+                SegmentStorage {
+                    tensor,
+                    origin: StorageOrigin::Parameter(contract.clone()),
+                },
+            ))
         }
         SegmentCapture::Scalar(argument) => SegmentBound::Scalar(match argument {
             PreparedArg::Index(expression) => kernel.nat_arg(*expression),
@@ -2977,27 +3414,40 @@ fn segment_check_statuses<B: seismic_native_target::TargetFamily>(
                 status.view, first.view,
                 "one segment owns one status allocation"
             );
-            (id.clone(), (tensor.clone(), kernel.index_constant(status.index)))
+            (
+                id.clone(),
+                (tensor.clone(), kernel.index_constant(status.index)),
+            )
         })
         .collect()
 }
 
-fn segment_elementwise_arguments<B:seismic_native_target::TargetFamily>(
-    kernel:&mut PortableBuilder<'_,B>,inputs:&[SegmentBound],index:&[PortableValue]) -> Vec<PortableValue> {
-    inputs.iter().map(|input|match input {
-        SegmentBound::Scalar(value)=>*value,
-        SegmentBound::Tensor(tensor)=> {
-            let skip=index.len()-tensor.axes.len();
-            let one=kernel.index_constant(1);
-            let zero=kernel.index_constant(0);
-            let coordinates=index[skip..].iter().zip(&tensor.axes).map(|(value,extent)| {
-                let broadcast=kernel.cmp(CmpOp::Eq,*extent,one);
-                kernel.select(broadcast,zero,*value)
-            }).collect::<Vec<_>>();
-            tensor.read(kernel,&coordinates)
-        }
-        _=>panic!("elementwise expression input is not scalar or tensor"),
-    }).collect()
+fn segment_elementwise_arguments<B: seismic_native_target::TargetFamily>(
+    kernel: &mut PortableBuilder<'_, B>,
+    inputs: &[SegmentBound],
+    index: &[PortableValue],
+) -> Vec<PortableValue> {
+    inputs
+        .iter()
+        .map(|input| match input {
+            SegmentBound::Scalar(value) => *value,
+            SegmentBound::Tensor(tensor) => {
+                let skip = index.len() - tensor.axes.len();
+                let one = kernel.index_constant(1);
+                let zero = kernel.index_constant(0);
+                let coordinates = index[skip..]
+                    .iter()
+                    .zip(&tensor.axes)
+                    .map(|(value, extent)| {
+                        let broadcast = kernel.cmp(CmpOp::Eq, *extent, one);
+                        kernel.select(broadcast, zero, *value)
+                    })
+                    .collect::<Vec<_>>();
+                tensor.read(kernel, &coordinates)
+            }
+            _ => panic!("elementwise expression input is not scalar or tensor"),
+        })
+        .collect()
 }
 
 fn segment_copy_tensor<B: seismic_native_target::TargetFamily>(
@@ -3136,7 +3586,10 @@ fn host_integer(arena: &mut ExprArena, bound: &Bound) -> IntExpr {
 /// host evaluation of exact quantities defined it, otherwise its slot.
 fn condition_expr(
     arena: &mut ExprArena,
-    host_conditions: &std::collections::HashMap<seismic_lang::expr::SymbolId, seismic_lang::expr::BoolExpr>,
+    host_conditions: &std::collections::HashMap<
+        seismic_lang::expr::SymbolId,
+        seismic_lang::expr::BoolExpr,
+    >,
     bound: &Bound,
 ) -> seismic_lang::expr::BoolExpr {
     let PreparedArg::Scalar(symbol, DType::Bool) = prepare_scalar(arena, bound.scalar()) else {
@@ -3385,7 +3838,9 @@ fn capture_expr(
         let bound = values.get(bindings, value);
         match prepare_scalar(arena, bound.scalar()) {
             PreparedArg::Index(value) => CapturedExpr::NatArgument(value),
-            PreparedArg::Integer(_) => panic!("exact Integer requires a reached host operation before native capture"),
+            PreparedArg::Integer(_) => {
+                panic!("exact Integer requires a reached host operation before native capture")
+            }
             PreparedArg::Scalar(symbol, dtype) => CapturedExpr::ScalarArgument(symbol, dtype),
         }
     })
@@ -3484,9 +3939,7 @@ fn native_natural_expr(expression: CapturedExpr) -> Option<CapturedExpr> {
         CapturedExpr::Bool(value) => CapturedExpr::Bool(value),
         CapturedExpr::NatArgument(value) => CapturedExpr::NatArgument(value),
         CapturedExpr::Binder(value) => CapturedExpr::Binder(value),
-        CapturedExpr::Value(value) if value.ty() == ValueType::Index => {
-            CapturedExpr::Value(value)
-        }
+        CapturedExpr::Value(value) if value.ty() == ValueType::Index => CapturedExpr::Value(value),
         CapturedExpr::Unary(ExprUnary::IntFromNat | ExprUnary::NatFromInt, value) => {
             native_natural_expr(*value)?
         }
@@ -3500,7 +3953,10 @@ fn native_natural_expr(expression: CapturedExpr) -> Option<CapturedExpr> {
         ),
         CapturedExpr::Nary(op, values) => CapturedExpr::Nary(
             op,
-            values.into_iter().map(native_natural_expr).collect::<Option<Vec<_>>>()?,
+            values
+                .into_iter()
+                .map(native_natural_expr)
+                .collect::<Option<Vec<_>>>()?,
         ),
         CapturedExpr::Select(condition, yes, no) => CapturedExpr::Select(
             Box::new(native_natural_expr(*condition)?),

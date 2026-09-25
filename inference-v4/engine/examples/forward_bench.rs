@@ -25,7 +25,7 @@
 //!
 //! ```text
 //! forward_bench bench --model M.gguf --output out.json [--path native]
-//!     [--storage-gib 16] [--cells decode,prefill,concurrent]
+//!     [--cells decode,prefill,concurrent]
 //!     [--context 256,4096,16384] [--prefill 32,128,512] [--prefill-history 0]
 //!     [--sequences 1,2,4,8]
 //!     [--warm 16] [--steps 32] [--attribution-steps 4]
@@ -51,14 +51,14 @@
 use magnitude_engine::{
     build_native_domain,
     composition::EngineConfiguration,
-    options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, StoragePolicy},
+    options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection},
 };
 use magnitude_model_contracts::DecoderGeometry;
-use magnitude_model_state::KvCodec;
 use magnitude_model_executor::{
     Demand, DomainError, ExecutionPath, ExecutorDomain, Operation, Outcome, PhysicalDecision,
     RequestId, Sampling, SelectSpec, Shaping, TokenId, WorkKind,
 };
+use magnitude_model_state::KvCodec;
 use magnitude_service::{
     domain::{self as service_domain, DomainFlight},
     ServiceLimits,
@@ -89,7 +89,9 @@ fn run() -> Result<(), String> {
     #[cfg(feature = "tuning-survey")]
     tuning_survey::extract(&mut args)?;
     let mut args = args.into_iter();
-    let mode = args.next().ok_or("usage: forward_bench bench|qualify ...")?;
+    let mode = args
+        .next()
+        .ok_or("usage: forward_bench bench|qualify ...")?;
     let options = Options::parse(args)?;
     let outcome = match mode.as_str() {
         "bench" => bench(&options),
@@ -196,8 +198,8 @@ mod tuning_pin {
     fn read(path: &std::path::Path) -> Result<Vec<PinnedConfiguration>, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|error| format!("reading {}: {error}", path.display()))?;
-        let entries: Vec<Value> = serde_json::from_str(&text)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let entries: Vec<Value> =
+            serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
         let malformed = || format!("{}: malformed tuning pin", path.display());
         let map = |value: &Value| -> Result<BTreeMap<String, u64>, String> {
             value
@@ -211,7 +213,10 @@ mod tuning_pin {
             .iter()
             .map(|entry| {
                 let text = |field: &str| {
-                    entry[field].as_str().map(str::to_owned).ok_or_else(malformed)
+                    entry[field]
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(malformed)
                 };
                 Ok(PinnedConfiguration {
                     entry: text("entry")?,
@@ -266,7 +271,11 @@ mod tuning_survey {
         };
         let samples = flags
             .remove("--tuning-survey-samples")
-            .map(|value| value.parse().map_err(|_| "--tuning-survey-samples requires a count"))
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|_| "--tuning-survey-samples requires a count")
+            })
             .transpose()?
             .unwrap_or(15);
         let entries = flags
@@ -284,7 +293,11 @@ mod tuning_survey {
                     .ok_or("--tuning-survey-widen takes ENTRY:P=v,v,..;Q=v,..")?;
                 let values = values
                     .split(',')
-                    .map(|value| value.parse::<u64>().map_err(|_| format!("{value:?} is not a count")))
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| format!("{value:?} is not a count"))
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 domains
                     .entry(entry.to_owned())
@@ -310,7 +323,6 @@ pub(crate) struct Options {
     model: PathBuf,
     output: PathBuf,
     path: ExecutionPath,
-    storage_gib: u64,
     cells: Vec<String>,
     contexts: Vec<usize>,
     prefills: Vec<usize>,
@@ -363,7 +375,6 @@ impl Options {
             model: PathBuf::new(),
             output: PathBuf::new(),
             path: ExecutionPath::Native,
-            storage_gib: 16,
             cells: vec!["decode".into(), "prefill".into(), "concurrent".into()],
             contexts: vec![256, 4096, 16384],
             prefills: vec![32, 128, 512],
@@ -395,11 +406,6 @@ impl Options {
                         other => return Err(format!("unsupported execution path {other:?}")),
                     }
                 }
-                "--storage-gib" => {
-                    options.storage_gib = value()?
-                        .parse()
-                        .map_err(|_| "--storage-gib requires a count")?
-                }
                 "--cells" => options.cells = value()?.split(',').map(str::to_owned).collect(),
                 "--context" => options.contexts = list(&value()?)?,
                 "--prefill" => options.prefills = list(&value()?)?,
@@ -410,7 +416,9 @@ impl Options {
                         .parse()
                         .map_err(|_| "--prefill-history requires a count")?
                 }
-                "--warm" => options.warm = value()?.parse().map_err(|_| "--warm requires a count")?,
+                "--warm" => {
+                    options.warm = value()?.parse().map_err(|_| "--warm requires a count")?
+                }
                 "--steps" => {
                     options.steps = value()?.parse().map_err(|_| "--steps requires a count")?
                 }
@@ -441,7 +449,9 @@ impl Options {
                 "--label" => options.label = Some(value()?),
                 "--cache-dir" => options.kernel_cache = Some(PathBuf::from(value()?)),
                 "--kv-codec" => options.kv_codec = value()?.parse()?,
-                "--device" => options.device = value()?.parse().map_err(|error| format!("{error}"))?,
+                "--device" => {
+                    options.device = value()?.parse().map_err(|error| format!("{error}"))?
+                }
                 "--lookahead" => {
                     options.lookahead = match value()?.as_str() {
                         "on" => true,
@@ -472,7 +482,10 @@ impl Options {
             return Err("--lookahead on needs --decode-tokens selected".into());
         }
         for cell in &options.cells {
-            if !matches!(cell.as_str(), "decode" | "prefill" | "concurrent" | "verify") {
+            if !matches!(
+                cell.as_str(),
+                "decode" | "prefill" | "concurrent" | "verify"
+            ) {
                 return Err(format!("unknown cell {cell:?}"));
             }
         }
@@ -518,7 +531,6 @@ impl Bench {
     pub(crate) fn open(
         model: &std::path::Path,
         path: ExecutionPath,
-        storage_gib: u64,
         context_tokens: usize,
         max_batch: usize,
         decode_rows: usize,
@@ -527,9 +539,6 @@ impl Bench {
         device: magnitude_model_executor::platform::DeviceRequest,
         lookahead: bool,
     ) -> Result<Self, String> {
-        let storage_bytes = storage_gib
-            .checked_mul(1 << 30)
-            .ok_or("storage budget exceeds u64")?;
         let resolved = EngineConfiguration {
             package: PackageOptions {
                 target: model.to_path_buf(),
@@ -550,11 +559,6 @@ impl Bench {
                 decode_share: 0.5,
                 locality_seconds: 1.0,
             },
-            storage: StoragePolicy {
-                storage_bytes,
-                retention_bytes: Some(0),
-                safety_reserve_bytes: (storage_bytes / 10).min(1 << 30),
-            },
             path,
             device,
             control_capacity: 256,
@@ -564,7 +568,8 @@ impl Bench {
         let vocabulary = usize::try_from(resolved.manifest.definition.geometry.vocabulary)
             .map_err(|_| "vocabulary exceeds host domain")?;
         let geometry = resolved.manifest.definition.geometry.clone();
-        let (domain, _) = build_native_domain(&resolved.manifest)?;
+        let package = resolved.artifacts.shared_package();
+        let (domain, _) = build_native_domain(&resolved.manifest, package)?;
         let device = domain.resources().device().clone();
         Ok(Self {
             domain,
@@ -584,7 +589,9 @@ impl Bench {
     pub(crate) fn open_sequence(&mut self) -> Result<Sequence, String> {
         let request = RequestId(self.next_request);
         self.next_request += 1;
-        self.domain.open(request).map_err(|error| error.to_string())?;
+        self.domain
+            .open(request)
+            .map_err(|error| error.to_string())?;
         Ok(Sequence {
             request,
             position: 0,
@@ -613,7 +620,9 @@ impl Bench {
     }
 
     pub(crate) fn forced(&self, start: usize, rows: usize) -> Vec<TokenId> {
-        (start..start + rows).map(|position| self.token(position)).collect()
+        (start..start + rows)
+            .map(|position| self.token(position))
+            .collect()
     }
 
     fn greedy(position: usize) -> SelectSpec {
@@ -688,7 +697,10 @@ impl Bench {
                 return Err("step outcome order differs from its sequences".into());
             }
             if let Outcome::Forward { rows } = pending.outcome() {
-                sequence.selected = rows.last().and_then(|row| row.selected).map(|row| row.token);
+                sequence.selected = rows
+                    .last()
+                    .and_then(|row| row.selected)
+                    .map(|row| row.token);
             }
             outcomes.push(pending.outcome().clone());
             let rows = pending.rows();
@@ -909,7 +921,9 @@ fn measure(
         // Under lookahead the trace is collected once per window: a per-step
         // collect would wait for the step queued behind this one.
         let per_step = (!bench.lookahead).then_some(trace);
-        bench.step(operations, &mut refs, per_step).map(|(step, _)| step)
+        bench
+            .step(operations, &mut refs, per_step)
+            .map(|(step, _)| step)
     };
     let collect = |trace: &SubmissionTrace| trace.collect().map_err(|error| error.to_string());
     let trace = traced(bench, TraceDetail::Submissions)?;
@@ -974,7 +988,11 @@ fn measure(
 
 /// Device time over a window of consecutive steps: busy is the union of the
 /// submissions' device intervals clipped to the window, idle the rest.
-fn window_summary(steps: usize, (start, end): (f64, f64), submissions: &[TracedSubmission]) -> Value {
+fn window_summary(
+    steps: usize,
+    (start, end): (f64, f64),
+    submissions: &[TracedSubmission],
+) -> Value {
     let busy = union(
         submissions
             .iter()
@@ -1145,7 +1163,6 @@ fn bench(options: &Options) -> Result<(), String> {
     let mut bench = Bench::open(
         &options.model,
         options.path,
-        options.storage_gib,
         context_tokens,
         max_batch,
         max_batch * widest,
@@ -1185,7 +1202,10 @@ fn bench(options: &Options) -> Result<(), String> {
         for &context in &options.contexts {
             eprintln!("decode context={context}");
             let cell = decode_cell(&mut bench, options, context, 1)?;
-            eprintln!("  median {:.3} ms", cell["median_ms"].as_f64().unwrap_or(f64::NAN));
+            eprintln!(
+                "  median {:.3} ms",
+                cell["median_ms"].as_f64().unwrap_or(f64::NAN)
+            );
             report["decode"].as_array_mut().expect("array").push(cell);
             write(&report)?;
         }
@@ -1194,7 +1214,10 @@ fn bench(options: &Options) -> Result<(), String> {
         for &rows in &options.prefills {
             eprintln!("prefill rows={rows}");
             let cell = prefill_cell(&mut bench, options, rows)?;
-            eprintln!("  median {:.3} ms", cell["median_ms"].as_f64().unwrap_or(f64::NAN));
+            eprintln!(
+                "  median {:.3} ms",
+                cell["median_ms"].as_f64().unwrap_or(f64::NAN)
+            );
             report["prefill"].as_array_mut().expect("array").push(cell);
             write(&report)?;
         }
@@ -1206,9 +1229,14 @@ fn bench(options: &Options) -> Result<(), String> {
                 let cell = decode_cell(&mut bench, options, context, count)?;
                 eprintln!(
                     "  {:.1} tok/s",
-                    cell["aggregate_tokens_per_second"].as_f64().unwrap_or(f64::NAN)
+                    cell["aggregate_tokens_per_second"]
+                        .as_f64()
+                        .unwrap_or(f64::NAN)
                 );
-                report["concurrent"].as_array_mut().expect("array").push(cell);
+                report["concurrent"]
+                    .as_array_mut()
+                    .expect("array")
+                    .push(cell);
                 write(&report)?;
             }
         }
@@ -1218,7 +1246,10 @@ fn bench(options: &Options) -> Result<(), String> {
             for &width in &options.widths {
                 eprintln!("verify width={width} context={context}");
                 let cell = verify_cell(&mut bench, options, context, width)?;
-                eprintln!("  median {:.3} ms", cell["median_ms"].as_f64().unwrap_or(f64::NAN));
+                eprintln!(
+                    "  median {:.3} ms",
+                    cell["median_ms"].as_f64().unwrap_or(f64::NAN)
+                );
                 report["verify"].as_array_mut().expect("array").push(cell);
                 write(&report)?;
             }
@@ -1282,7 +1313,9 @@ fn verify_cell(
 /// `--kl-divergence-base` file, with llama.cpp's own KL and same-top
 /// definitions (`validation/precision/README.md` documents the file).
 mod qualify {
-    use super::{host, Bench, DecoderGeometry, Demand, Operation, Options, Outcome, Sequence, WorkKind};
+    use super::{
+        host, Bench, DecoderGeometry, Demand, Operation, Options, Outcome, Sequence, WorkKind,
+    };
     use magnitude_model_contracts::FeedForwardGeometry;
     use magnitude_model_executor::TokenId;
     use serde_json::json;
@@ -1304,7 +1337,8 @@ mod qualify {
 
     fn read_i32s(file: &mut File, count: usize) -> Result<Vec<i32>, String> {
         let mut bytes = vec![0u8; count * 4];
-        file.read_exact(&mut bytes).map_err(|error| error.to_string())?;
+        file.read_exact(&mut bytes)
+            .map_err(|error| error.to_string())?;
         Ok(bytes
             .chunks_exact(4)
             .map(|word| i32::from_le_bytes(word.try_into().expect("four bytes")))
@@ -1316,9 +1350,13 @@ mod qualify {
             let mut file =
                 File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
             let mut magic = [0u8; 8];
-            file.read_exact(&mut magic).map_err(|error| error.to_string())?;
+            file.read_exact(&mut magic)
+                .map_err(|error| error.to_string())?;
             if &magic != b"_logits_" {
-                return Err(format!("{} is not a llama.cpp logits base file", path.display()));
+                return Err(format!(
+                    "{} is not a llama.cpp logits base file",
+                    path.display()
+                ));
             }
             let header = read_i32s(&mut file, 3)?;
             let count = |value: i32| usize::try_from(value).map_err(|_| "negative header field");
@@ -1358,8 +1396,8 @@ mod qualify {
 
         /// Decoded base log-probabilities of one stored row.
         fn row(&mut self, chunk: usize, row: usize) -> Result<Vec<f32>, String> {
-            let offset = self.rows_offset
-                + (self.row_bytes * (chunk * self.evaluated() + row)) as u64;
+            let offset =
+                self.rows_offset + (self.row_bytes * (chunk * self.evaluated() + row)) as u64;
             self.file
                 .seek(SeekFrom::Start(offset))
                 .map_err(|error| error.to_string())?;
@@ -1527,7 +1565,8 @@ mod qualify {
         fn summary(&self) -> serde_json::Value {
             let count = self.divergences.len() as f64;
             let mean = self.mean_kld();
-            let variance = self.divergences.iter().map(|kl| kl * kl).sum::<f64>() / count - mean * mean;
+            let variance =
+                self.divergences.iter().map(|kl| kl * kl).sum::<f64>() / count - mean * mean;
             let same_top = self.same_top();
             let mut sorted = self.divergences.clone();
             sorted.sort_by(f64::total_cmp);
@@ -1605,7 +1644,9 @@ mod qualify {
             .ok_or("qualify requires --reference <directory of prose/code/tool_json .bin>")?;
         let mut bases = CATEGORIES
             .iter()
-            .map(|name| BaseFile::open(&directory.join(format!("{name}.bin"))).map(|base| (*name, base)))
+            .map(|name| {
+                BaseFile::open(&directory.join(format!("{name}.bin"))).map(|base| (*name, base))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let n_ctx = bases[0].1.n_ctx;
         for (name, base) in &bases {
@@ -1626,7 +1667,6 @@ mod qualify {
         let mut bench = Bench::open(
             &options.model,
             options.path,
-            options.storage_gib,
             n_ctx,
             batch,
             batch * options.verify_width,
@@ -1660,14 +1700,22 @@ mod qualify {
         let mut scores = Vec::with_capacity(work.len());
         for (index, items) in work.chunks(batch).enumerate() {
             scores.extend(score(&mut bench, &mut bases, items, options.verify_width)?);
-            eprintln!("scored {} of {} chunks (batch {index})", scores.len(), work.len());
+            eprintln!(
+                "scored {} of {} chunks (batch {index})",
+                scores.len(),
+                work.len()
+            );
         }
         let evaluated = bases[0].1.evaluated();
         let mut done: Vec<(&str, Positions)> = Vec::new();
         for (category, (name, _)) in bases.iter().enumerate() {
             let mut positions = Positions::default();
             let mut per_chunk = Vec::with_capacity(chunks[category]);
-            for (item, score) in work.iter().zip(&scores).filter(|(item, _)| item.category == category) {
+            for (item, score) in work
+                .iter()
+                .zip(&scores)
+                .filter(|(item, _)| item.category == category)
+            {
                 positions.extend(&score.positions);
                 per_chunk.push(json!({
                     "chunk": item.chunk,
@@ -1763,7 +1811,12 @@ mod qualify {
                 }
                 budget -= rows;
                 let piece = tokens[sequence.position..sequence.position + rows].to_vec();
-                operations.push(Bench::forward(sequence, WorkKind::Prefill, piece, Demand::NONE));
+                operations.push(Bench::forward(
+                    sequence,
+                    WorkKind::Prefill,
+                    piece,
+                    Demand::NONE,
+                ));
                 advancing.push(sequence);
             }
             bench.step(operations, &mut advancing, None)?;

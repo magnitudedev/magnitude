@@ -1,5 +1,4 @@
 use crate::Error;
-use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
@@ -8,7 +7,62 @@ use std::{
     fs::File,
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::Arc,
 };
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+
+/// A page-aligned, read-only window of one open artifact. The page-rounded
+/// mapping is exposed separately from the requested byte range so a device
+/// can wrap the mapping and address a tensor within it.
+#[cfg(unix)]
+pub struct MappedWindow {
+    _source: Arc<FileSource>,
+    pointer: std::ptr::NonNull<u8>,
+    mapped_len: usize,
+    data_offset: usize,
+    data_len: usize,
+}
+
+#[cfg(unix)]
+unsafe impl Send for MappedWindow {}
+#[cfg(unix)]
+unsafe impl Sync for MappedWindow {}
+
+#[cfg(unix)]
+impl MappedWindow {
+    pub fn data_offset(&self) -> usize {
+        self.data_offset
+    }
+    pub fn data_len(&self) -> usize {
+        self.data_len
+    }
+    pub fn mapped_len(&self) -> usize {
+        self.mapped_len
+    }
+    pub fn data(&self) -> &[u8] {
+        &self.as_ref()[self.data_offset..self.data_offset + self.data_len]
+    }
+}
+
+#[cfg(unix)]
+impl AsRef<[u8]> for MappedWindow {
+    fn as_ref(&self) -> &[u8] {
+        // The mapping is read-only, stays live through this owner, and its
+        // page-rounded length was checked against the host address domain.
+        unsafe { std::slice::from_raw_parts(self.pointer.as_ptr(), self.mapped_len) }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for MappedWindow {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.pointer.as_ptr().cast(), self.mapped_len);
+        }
+    }
+}
 
 /// An open view of a regular artifact file.
 ///
@@ -44,6 +98,67 @@ impl FileSource {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn metadata(&self) -> Result<std::fs::Metadata, Error> {
+        Ok(self.file.metadata()?)
+    }
+
+    /// Map a nonempty source range read-only. The mapping owns this open file
+    /// and may outlive path replacement or the package that created it.
+    #[cfg(unix)]
+    pub fn map_window(
+        self: &Arc<Self>,
+        offset: u64,
+        length: u64,
+    ) -> Result<Arc<MappedWindow>, Error> {
+        let end = offset
+            .checked_add(length)
+            .filter(|end| length != 0 && *end <= self.size)
+            .ok_or_else(|| {
+                Error::Invalid("mapped artifact range is empty or outside the file".into())
+            })?;
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page = u64::try_from(page)
+            .map_err(|_| Error::Invalid("host page size is unavailable".into()))?;
+        let mapped_start = offset / page * page;
+        let mapped_end = end
+            .checked_add(page - 1)
+            .map(|end| end / page * page)
+            .ok_or_else(|| Error::Invalid("mapped artifact range overflows".into()))?;
+        let mapped_len = usize::try_from(mapped_end - mapped_start).map_err(|_| {
+            Error::Invalid("mapped artifact range exceeds host address space".into())
+        })?;
+        let file_offset = libc::off_t::try_from(mapped_start).map_err(|_| {
+            Error::Invalid("mapped artifact offset exceeds host file domain".into())
+        })?;
+        let pointer = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                mapped_len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                self.file.as_raw_fd(),
+                file_offset,
+            )
+        };
+        if pointer == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error().into());
+        }
+        let Some(pointer) = std::ptr::NonNull::new(pointer.cast()) else {
+            unsafe { libc::munmap(std::ptr::null_mut(), mapped_len) };
+            return Err(Error::Invalid(
+                "host mapping returned a null address".into(),
+            ));
+        };
+        Ok(Arc::new(MappedWindow {
+            _source: self.clone(),
+            pointer,
+            mapped_len,
+            data_offset: usize::try_from(offset - mapped_start)
+                .expect("offset lies within mapped range"),
+            data_len: usize::try_from(length).expect("mapped length fits host address space"),
+        }))
     }
 
     pub fn read_into(&self, offset: u64, out: &mut [u8]) -> Result<(), Error> {
@@ -95,20 +210,6 @@ impl FileSource {
             source: self,
             offset: 0,
         }
-    }
-
-    pub fn digest(&self) -> Result<crate::ArtifactIdentity, Error> {
-        let mut digest = Sha256::new();
-        let mut reader = self.reader();
-        let mut buffer = vec![0; 8 * 1024 * 1024];
-        loop {
-            let count = reader.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            digest.update(&buffer[..count]);
-        }
-        Ok(crate::ArtifactIdentity(digest.finalize().into()))
     }
 }
 

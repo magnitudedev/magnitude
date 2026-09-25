@@ -252,10 +252,7 @@ where
         planning_budget: &PlanningBudget,
     ) -> Result<Self, PreparationError> {
         let domain = crate::candidate_domain::construct_candidate_domain(
-            entry,
-            device,
-            registry,
-            precision,
+            entry, device, registry, precision,
         )?;
         Self::from_domain(
             domain,
@@ -362,7 +359,9 @@ where
                 RealizationPending::NativeBudget,
             ));
         }
-        let attempt = self.realizer.realize(&mut self.domain.arena_mut(), realization);
+        let attempt = self
+            .realizer
+            .realize(&mut self.domain.arena_mut(), realization);
         let outcome = match attempt {
             Ok(outcome) => outcome,
             Err(failure) => {
@@ -414,7 +413,8 @@ where
 
         let (precision, target_domain, constants) = self.domain.numerical_context();
         let implementation = realized.reconciled().clone();
-        let fixed = crate::frozen::plan_assignment(&self.domain.arena(), &constants, &implementation);
+        let fixed =
+            crate::frozen::plan_assignment(&self.domain.arena(), &constants, &implementation);
         let safe_guard = {
             let mut arena = self.domain.arena_mut();
             let guard = arena.all(&[checked.constraint(), implementation.hard_constraints()]);
@@ -436,14 +436,24 @@ where
                 arena: &arena,
                 constants,
             };
-            crate::executable::compile_variant(
-                freeze(&context, implementation.clone(), fixed, safe_guard),
-            )
+            crate::executable::compile_variant(freeze(
+                &context,
+                implementation.clone(),
+                fixed,
+                safe_guard,
+            ))
         };
-        let admission_policy = if checked.is_universal() { &seismic_lang::precision::PrecisionPolicy::Exact } else { &precision };
-        let Some(retained) = compiled.accept_numerically(&mut self.domain.arena_mut(), admission_policy)
+        let admission_policy = if checked.is_universal() {
+            &seismic_lang::precision::PrecisionPolicy::Exact
+        } else {
+            &precision
+        };
+        let Some(retained) =
+            compiled.accept_numerically(&mut self.domain.arena_mut(), admission_policy)
         else {
-            return Ok(RealizationAdmission::Pending(RealizationPending::NumericalAnalysis));
+            return Ok(RealizationAdmission::Pending(
+                RealizationPending::NumericalAnalysis,
+            ));
         };
         let reference = PreparedCandidateId {
             preparation: self.id,
@@ -570,7 +580,8 @@ where
             ));
         }
         if !required
-            && selection.candidate_operands().len() as u64 > self.planning_budget.executable_variants
+            && selection.candidate_operands().len() as u64
+                > self.planning_budget.executable_variants
         {
             return Err(PreparationError::Planning(
                 crate::planning::PlanningError::BudgetExceeded {
@@ -644,9 +655,7 @@ pub(crate) mod boundary_tests {
     use super::*;
     use crate::evaluation::EvaluationProvenance;
     use crate::planning::{OptimizationCompletion, PlanningBudgetReport};
-    use crate::realization::demand_driven_tests::{
-        device, registry, CountingCompiler, FakeTarget,
-    };
+    use crate::realization::demand_driven_tests::{device, registry, CountingCompiler, FakeTarget};
     use seismic_lang::checked::{check_source, SourceFile, SourceSet};
     use seismic_lang::entry::ElementBindings;
     use seismic_lang::expr::compiled::InvocationValues;
@@ -691,15 +700,51 @@ pub(crate) mod boundary_tests {
         authored_domain(device,registry,"fn probe(x: f32) -> f32:\n    return x\n\nlower probe(x: f32) -> f32 for cpu:\n    return x\n", PrecisionPolicy::Exact)
     }
 
-    fn authored_domain<'ctx>(device:&'ctx seismic_native_target::DeviceDescription<FakeTarget>,registry:&'ctx CompilerRegistry<FakeTarget>,source:&str,precision:PrecisionPolicy) -> (CandidateDomain<'ctx,FakeTarget>,CandidateCoordinate) {
-        use crate::candidate_domain::{BodyMapping,ConstructionCoordinate,ConstructionAllowance,Materialization};
-        let module=check_source(SourceSet::new(vec![SourceFile{path:"session-outcome.seismic".into(),text:source.into()}])).unwrap();
-        let entry=module.entry(module.entry_named("probe").unwrap(),&ElementBindings::default()).unwrap();
-        let mut domain=crate::candidate_domain::construct_candidate_domain(entry,device,registry,&precision).unwrap();
-        let selection=domain.root_selections().into_iter().find(|body|body.mapping==BodyMapping::Authored).unwrap();
-        let Materialization::Ready(construction)=domain.advance(&ConstructionCoordinate::root(selection),ConstructionAllowance{work_units:100_000,wall_time:std::time::Duration::from_secs(30)}).state else {panic!("authored construction did not finish")};
-        let coordinate=domain.canonicalize(domain.proposal(construction,Vec::new())).unwrap();
-        (domain,coordinate)
+    fn authored_domain<'ctx>(
+        device: &'ctx seismic_native_target::DeviceDescription<FakeTarget>,
+        registry: &'ctx CompilerRegistry<FakeTarget>,
+        source: &str,
+        precision: PrecisionPolicy,
+    ) -> (CandidateDomain<'ctx, FakeTarget>, CandidateCoordinate) {
+        use crate::candidate_domain::{
+            BodyMapping, ConstructionAllowance, ConstructionCoordinate, Materialization,
+        };
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "session-outcome.seismic".into(),
+            text: source.into(),
+        }]))
+        .unwrap();
+        let entry = module
+            .entry(
+                module.entry_named("probe").unwrap(),
+                &ElementBindings::default(),
+            )
+            .unwrap();
+        let mut domain = crate::candidate_domain::construct_candidate_domain(
+            entry, device, registry, &precision,
+        )
+        .unwrap();
+        let selection = domain
+            .root_selections()
+            .into_iter()
+            .find(|body| body.mapping == BodyMapping::Authored)
+            .unwrap();
+        let Materialization::Ready(construction) = domain
+            .advance(
+                &ConstructionCoordinate::root(selection),
+                ConstructionAllowance {
+                    work_units: 100_000,
+                    wall_time: std::time::Duration::from_secs(30),
+                },
+            )
+            .state
+        else {
+            panic!("authored construction did not finish")
+        };
+        let coordinate = domain
+            .canonicalize(domain.proposal(construction, Vec::new()))
+            .unwrap();
+        (domain, coordinate)
     }
 
     fn report() -> PlanningReport {
@@ -709,7 +754,9 @@ pub(crate) mod boundary_tests {
         }
     }
 
-    fn identity(device: &seismic_native_target::DeviceDescription<FakeTarget>) -> EvaluationIdentity {
+    fn identity(
+        device: &seismic_native_target::DeviceDescription<FakeTarget>,
+    ) -> EvaluationIdentity {
         let provenance = EvaluationProvenance::new([4; 32], [5; 32]);
         EvaluationIdentity::new(device.identity().clone(), provenance)
     }
@@ -854,19 +901,59 @@ pub(crate) mod boundary_tests {
 
     #[test]
     fn derived_outcome_drives_policy_and_explanation_without_empirical_promotion() {
-        let device=device(); let registry=registry(); let compiler=CountingCompiler::new();
-        for precision in [PrecisionPolicy::Exact, PrecisionPolicy::bounded(seismic_lang::precision::Tolerance::EXACT), PrecisionPolicy::Unconstrained] {
+        let device = device();
+        let registry = registry();
+        let compiler = CountingCompiler::new();
+        for precision in [
+            PrecisionPolicy::Exact,
+            PrecisionPolicy::bounded(seismic_lang::precision::Tolerance::EXACT),
+            PrecisionPolicy::Unconstrained,
+        ] {
             let (domain,optional)=authored_domain(&device,&registry,"fn probe(x: f32) -> f32:\n    return x\n\nlower probe(x: f32) -> f32 for cpu:\n    return 3.0\n",precision.clone());
-            let mut session=EvaluationSession::from_domain(domain,&registry,&compiler,&(),&device,&PreparationBudget::default(),&PlanningBudget::default()).unwrap();
-            let universal=general(&mut session);
-            let result=session.realize_checked(&optional).unwrap();
-            if matches!(precision,PrecisionPolicy::Unconstrained) {
-                let RealizationAdmission::Ready(id)=result else {panic!("floating-only difference must be admitted under Unconstrained")};
-                let prepared=session.finalize(policy(&session,vec![universal,id]).unwrap(),identity(&device),report()).unwrap();
-                assert!(matches!(prepared.variants().iter().nth(1).unwrap().numerical().regions[0].basis,crate::numerics::NumericalBasis::Unknown));
+            let mut session = EvaluationSession::from_domain(
+                domain,
+                &registry,
+                &compiler,
+                &(),
+                &device,
+                &PreparationBudget::default(),
+                &PlanningBudget::default(),
+            )
+            .unwrap();
+            let universal = general(&mut session);
+            let result = session.realize_checked(&optional).unwrap();
+            if matches!(precision, PrecisionPolicy::Unconstrained) {
+                let RealizationAdmission::Ready(id) = result else {
+                    panic!("floating-only difference must be admitted under Unconstrained")
+                };
+                let prepared = session
+                    .finalize(
+                        policy(&session, vec![universal, id]).unwrap(),
+                        identity(&device),
+                        report(),
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    prepared
+                        .variants()
+                        .iter()
+                        .nth(1)
+                        .unwrap()
+                        .numerical()
+                        .regions[0]
+                        .basis,
+                    crate::numerics::NumericalBasis::Unknown
+                ));
             } else {
-                assert_eq!(result,RealizationAdmission::Pending(RealizationPending::NumericalAnalysis));
-                assert_eq!(session.realize_checked(&optional).unwrap(),result,"reobservation cannot enlarge applicability");
+                assert_eq!(
+                    result,
+                    RealizationAdmission::Pending(RealizationPending::NumericalAnalysis)
+                );
+                assert_eq!(
+                    session.realize_checked(&optional).unwrap(),
+                    result,
+                    "reobservation cannot enlarge applicability"
+                );
             }
         }
     }
@@ -1104,16 +1191,44 @@ pub(crate) mod boundary_tests {
     }
     #[test]
     fn unresolved_numerics_remain_structural_without_exposing_an_executable() {
-        let device=device(); let registry=registry(); let compiler=CountingCompiler::new();
+        let device = device();
+        let registry = registry();
+        let compiler = CountingCompiler::new();
         let (domain,optional)=authored_domain(&device,&registry,"fn probe(x: u32) -> u32:\n    return x\n\nlower probe(x: u32) -> u32 for cpu:\n    return 3\n",PrecisionPolicy::Unconstrained);
-        let mut session=EvaluationSession::from_domain(domain,&registry,&compiler,&(),&device,&PreparationBudget::default(),&PlanningBudget::default()).unwrap();
-        let universal=general(&mut session);
-        assert_eq!(session.realize_checked(&optional).unwrap(),RealizationAdmission::Pending(RealizationPending::NumericalAnalysis));
-        let formed=compiler.form_count();
-        assert_eq!(session.realize_checked(&optional).unwrap(),RealizationAdmission::Pending(RealizationPending::NumericalAnalysis));
-        assert_eq!(compiler.form_count(),formed,"pending reasoning reuses native artifacts");
-        assert!(!session.inspect(&optional).unwrap().rejected,"unknown is not native rejection");
-        assert_eq!(session.candidates.len(),1,"unresolved candidates have no executable handle");
-        policy(&session,vec![universal]).unwrap();
+        let mut session = EvaluationSession::from_domain(
+            domain,
+            &registry,
+            &compiler,
+            &(),
+            &device,
+            &PreparationBudget::default(),
+            &PlanningBudget::default(),
+        )
+        .unwrap();
+        let universal = general(&mut session);
+        assert_eq!(
+            session.realize_checked(&optional).unwrap(),
+            RealizationAdmission::Pending(RealizationPending::NumericalAnalysis)
+        );
+        let formed = compiler.form_count();
+        assert_eq!(
+            session.realize_checked(&optional).unwrap(),
+            RealizationAdmission::Pending(RealizationPending::NumericalAnalysis)
+        );
+        assert_eq!(
+            compiler.form_count(),
+            formed,
+            "pending reasoning reuses native artifacts"
+        );
+        assert!(
+            !session.inspect(&optional).unwrap().rejected,
+            "unknown is not native rejection"
+        );
+        assert_eq!(
+            session.candidates.len(),
+            1,
+            "unresolved candidates have no executable handle"
+        );
+        policy(&session, vec![universal]).unwrap();
     }
 }

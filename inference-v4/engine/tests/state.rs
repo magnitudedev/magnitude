@@ -25,7 +25,12 @@ fn bank(store: &StateStore, index: usize) -> Tensor {
         .unwrap()
 }
 fn history_component(width: usize, dtype: DType) -> ComponentDescriptor {
-    ComponentDescriptor::new(LayerRef::Target(0), CodecSpec::dense(dtype, width, width), 1).unwrap()
+    ComponentDescriptor::new(
+        LayerRef::Target(0),
+        CodecSpec::dense(dtype, width, width),
+        1,
+    )
+    .unwrap()
 }
 fn store(history: bool, values: bool) -> Rc<StateStore> {
     StateStore::new(
@@ -101,7 +106,11 @@ fn failed_and_aborted_work_cannot_publish_or_recycle_early() {
     assert_eq!(bindings.destinations, [0, 1, 2, 3, 4]);
     assert_eq!(store.occupied_rows(), 5);
     write(&bank(&store, bindings.following_bank), &[0xff; 16]).unwrap();
-    write(&bindings.history[0].buffer.slice_leading(0, 1).unwrap(), &[0x33; 16]).unwrap();
+    write(
+        &bindings.history[0].buffer.slice_leading(0, 1).unwrap(),
+        &[0x33; 16],
+    )
+    .unwrap();
     // A failed physical submission returns ownership for abort, never commit.
     assert_eq!(store.occupied_rows(), 5);
     let state = advance.abort();
@@ -110,7 +119,11 @@ fn failed_and_aborted_work_cannot_publish_or_recycle_early() {
     let after = read(&original);
     assert_eq!(before, after);
     let advance = OwnedStateAdvance::begin(state, 5).ok().unwrap();
-    write(&bank(&store, advance.bindings().following_bank), &[0x22; 16]).unwrap();
+    write(
+        &bank(&store, advance.bindings().following_bank),
+        &[0x22; 16],
+    )
+    .unwrap();
     let state = advance.abort();
     assert_eq!(read(&bank(&store, state.bank_index())), before);
     assert_eq!(state.position(), 0);
@@ -127,7 +140,11 @@ fn accepted_component_versions_survive_checkpoint_and_fork() {
     let child = checkpoint.fork();
     let advance = OwnedStateAdvance::begin(parent, 1).ok().unwrap();
     assert_ne!(advance.bindings().following_bank, child.bank_index());
-    write(&bank(&store, advance.bindings().following_bank), &[0x22; 16]).unwrap();
+    write(
+        &bank(&store, advance.bindings().following_bank),
+        &[0x22; 16],
+    )
+    .unwrap();
     let OwnedAdvanceResolution::Committed(parent) = advance.commit_all().ok().unwrap() else {
         panic!("full advance must commit");
     };
@@ -272,7 +289,7 @@ fn context_and_anticipation_bounds() {
     state.anticipate(3).unwrap();
     assert_eq!(state.expected_end(), 12);
     assert!(state.anticipate(17).is_err());
-    let Err((mut state, _)) = OwnedStateAdvance::begin(state, 0) else {
+    let Err((state, _)) = OwnedStateAdvance::begin(state, 0) else {
         panic!("zero-row advance must fail");
     };
     let Err((mut state, _)) = OwnedStateAdvance::begin(state, 17) else {
@@ -291,7 +308,12 @@ fn reclamation_counts_selected_handles_once_and_respects_checkpoint_pins() {
     let store = store(true, true);
     let reclaimable = |states: &[&SequenceState]| {
         store
-            .exclusive_bytes(&states.iter().map(|state| Holder::State(state)).collect::<Vec<_>>())
+            .exclusive_bytes(
+                &states
+                    .iter()
+                    .map(|state| Holder::State(state))
+                    .collect::<Vec<_>>(),
+            )
             .unwrap()
     };
     // One history row (32 bytes) and one bank (16 bytes).
@@ -340,7 +362,10 @@ fn owned_advances_reconcile_independently_after_shared_completion() {
     assert!(first_bindings.history[0]
         .buffer
         .shares_allocation(&second_bindings.history[0].buffer));
-    assert_ne!(first_bindings.following_bank, second_bindings.following_bank);
+    assert_ne!(
+        first_bindings.following_bank,
+        second_bindings.following_bank
+    );
     assert!(first_bindings.recurrent[0].shares_allocation(&second_bindings.recurrent[0]));
     assert!(first_bindings
         .destinations
@@ -364,7 +389,11 @@ fn owned_advances_reconcile_independently_after_shared_completion() {
         .unwrap();
     let first_advance = OwnedStateAdvance::begin(first, 1).ok().unwrap();
     let second_advance = OwnedStateAdvance::begin(second, 1).ok().unwrap();
-    write(&bank(&store, first_advance.bindings().following_bank), &[3; 16]).unwrap();
+    write(
+        &bank(&store, first_advance.bindings().following_bank),
+        &[3; 16],
+    )
+    .unwrap();
     // A shared failed submission aborts both owned advances.
     let first = first_advance.abort();
     let second = second_advance.abort();

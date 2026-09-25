@@ -8,11 +8,13 @@
 #define KERNEL_W3 SEISMIC_SHARED_UP
 #include "lib/routed/routed.cuh"
 
-using Shape = projection::GemvShape<4, SEISMIC_TUNE_TPW, SEISMIC_TUNE_KSPLIT, 1>;
 using Pro = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
 using Epi = projection::SiluMul<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
 
-extern "C" __global__ void routed_expand(SEISMIC_KERNEL_PARAMS) {
+#ifdef SEISMIC_FORMING_ROUTED_EXPAND
+template <int TPW, int KSPLIT>
+__global__ void routed_expand(SEISMIC_KERNEL_PARAMS) {
+    using Shape = projection::GemvShape<4, TPW, KSPLIT, 1>;
     __shared__ projection::GemvShared<Shape, Pro> shared;
     const projection::u8 *normalized = SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED);
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
@@ -44,3 +46,4 @@ extern "C" __global__ void routed_expand(SEISMIC_KERNEL_PARAMS) {
                             KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE)),
                             KERNEL_W3_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP)), epi);
 }
+#endif

@@ -3,16 +3,16 @@
 
 use super::weights::activation_dtype;
 use super::{
-    planned_element, AttentionBinding, AttentionShape, DenseBinding, EmbeddingBinding, FeaturesBinding,
-    HeadBinding, ReadoutBinding, RecurrentBinding, RoutedBinding, VisionBlockBinding,
-    VisionMergerBinding, VisionPatchBinding, WeightPlan,
+    planned_element, AttentionBinding, AttentionShape, DenseBinding, EmbeddingBinding,
+    FeaturesBinding, HeadBinding, ReadoutBinding, RecurrentBinding, RoutedBinding,
+    VisionBlockBinding, VisionMergerBinding, VisionPatchBinding, WeightPlan,
 };
 use crate::error::PlanError;
-use magnitude_model_state::KvCodec;
 use magnitude_model_contracts::{
     AttentionGeometry, FeedForwardGeometry, MixerGeometry, ModelDefinition, RotarySemantics,
 };
 use magnitude_model_contracts::{FeedForwardWeights, MixerWeights, WeightKind, WeightScope};
+use magnitude_model_state::KvCodec;
 use seismic::{DType, Element};
 use std::collections::HashSet;
 
@@ -299,7 +299,12 @@ pub(super) fn derive_program_plan(
         );
         let mixer = match &block.mixer {
             MixerWeights::Attention(_) => MixerProgramSlot::Attention(AttentionBinding {
-                shape: match definition.geometry.blocks.get(index).map(|block| &block.mixer) {
+                shape: match definition
+                    .geometry
+                    .blocks
+                    .get(index)
+                    .map(|block| &block.mixer)
+                {
                     Some(MixerGeometry::Attention(geometry)) => {
                         attention_shape(definition.geometry.hidden, geometry)?
                     }
@@ -362,21 +367,22 @@ pub(super) fn derive_program_plan(
                     return Err(PlanError::Topology("routed program slot geometry differs"));
                 };
                 FeedForwardProgramSlot::Routed(RoutedBinding {
-                hidden: definition.geometry.hidden,
-                experts: geometry.count,
-                selected: geometry.selected,
-                features: geometry.intermediate,
-                shared: geometry.shared_intermediate,
-                norm: lookup(target, scope, WeightKind::FeedForwardNorm)?,
-                router: lookup(target, scope, WeightKind::Router)?,
-                expert_gate: lookup(target, scope, WeightKind::ExpertGate)?,
-                expert_up: lookup(target, scope, WeightKind::ExpertUp)?,
-                expert_down: lookup(target, scope, WeightKind::ExpertDown)?,
-                shared_gate: lookup(target, scope, WeightKind::SharedGate)?,
-                shared_up: lookup(target, scope, WeightKind::SharedUp)?,
-                shared_down: lookup(target, scope, WeightKind::SharedDown)?,
-                activation: active_element,
-            })
+                    hidden: definition.geometry.hidden,
+                    experts: geometry.count,
+                    selected: geometry.selected,
+                    features: geometry.intermediate,
+                    shared: geometry.shared_intermediate,
+                    normalize_selected: geometry.normalize_selected,
+                    norm: lookup(target, scope, WeightKind::FeedForwardNorm)?,
+                    router: lookup(target, scope, WeightKind::Router)?,
+                    expert_gate: lookup(target, scope, WeightKind::ExpertGate)?,
+                    expert_up: lookup(target, scope, WeightKind::ExpertUp)?,
+                    expert_down: lookup(target, scope, WeightKind::ExpertDown)?,
+                    shared_gate: lookup(target, scope, WeightKind::SharedGate)?,
+                    shared_up: lookup(target, scope, WeightKind::SharedUp)?,
+                    shared_down: lookup(target, scope, WeightKind::SharedDown)?,
+                    activation: active_element,
+                })
             }
         };
         blocks.push(TargetBlockProgramSlot::new(mixer, feed_forward));
@@ -401,6 +407,7 @@ pub(super) fn derive_program_plan(
             let mut slots =
                 Vec::with_capacity(definition.head.as_ref().map_or(0, |head| head.depth()));
             for index in 0..definition.head.as_ref().map_or(0, |head| head.depth()) {
+                let head_block = &definition.head.as_ref().expect("head is selected").blocks[index];
                 let scope = WeightScope::HeadBlock(
                     u32::try_from(index)
                         .map_err(|_| PlanError::Arithmetic("head block index exceeds u32"))?,
@@ -414,8 +421,12 @@ pub(super) fn derive_program_plan(
                             MixerGeometry::Attention(geometry) => Some(geometry),
                             MixerGeometry::Recurrent(_) => None,
                         })
-                        .ok_or(PlanError::Topology("head requires target attention geometry"))
-                        .and_then(|geometry| attention_shape(definition.geometry.hidden, geometry))?,
+                        .ok_or(PlanError::Topology(
+                            "head requires target attention geometry",
+                        ))
+                        .and_then(|geometry| {
+                            attention_shape(definition.geometry.hidden, geometry)
+                        })?,
                     embedding_table: lookup(target, WeightScope::Target, WeightKind::Embedding)?,
                     embedding_norm: lookup(weights, scope, WeightKind::HeadEmbeddingNorm)?,
                     hidden_norm: lookup(weights, scope, WeightKind::HeadHiddenNorm)?,
@@ -425,10 +436,42 @@ pub(super) fn derive_program_plan(
                     key: lookup(weights, scope, WeightKind::Key)?,
                     value: lookup(weights, scope, WeightKind::Value)?,
                     attention_output: lookup(weights, scope, WeightKind::AttentionOutput)?,
-                    feedforward_norm: lookup(weights, scope, WeightKind::FeedForwardNorm)?,
-                    gate: lookup(weights, scope, WeightKind::DenseGate)?,
-                    up: lookup(weights, scope, WeightKind::DenseUp)?,
-                    down: lookup(weights, scope, WeightKind::DenseDown)?,
+                    feed_forward: match (&head_block.feedforward_geometry, &head_block.feedforward)
+                    {
+                        (FeedForwardGeometry::Dense { .. }, FeedForwardWeights::Dense(_)) => {
+                            FeedForwardProgramSlot::Dense(DenseBinding {
+                                norm: lookup(weights, scope, WeightKind::FeedForwardNorm)?,
+                                gate: lookup(weights, scope, WeightKind::DenseGate)?,
+                                up: lookup(weights, scope, WeightKind::DenseUp)?,
+                                down: lookup(weights, scope, WeightKind::DenseDown)?,
+                                activation: active_element,
+                            })
+                        }
+                        (FeedForwardGeometry::Routed(shape), FeedForwardWeights::Routed(_)) => {
+                            FeedForwardProgramSlot::Routed(RoutedBinding {
+                                hidden: definition.geometry.hidden,
+                                experts: shape.count,
+                                selected: shape.selected,
+                                features: shape.intermediate,
+                                shared: shape.shared_intermediate,
+                                normalize_selected: shape.normalize_selected,
+                                norm: lookup(weights, scope, WeightKind::FeedForwardNorm)?,
+                                router: lookup(weights, scope, WeightKind::Router)?,
+                                expert_gate: lookup(weights, scope, WeightKind::ExpertGate)?,
+                                expert_up: lookup(weights, scope, WeightKind::ExpertUp)?,
+                                expert_down: lookup(weights, scope, WeightKind::ExpertDown)?,
+                                shared_gate: lookup(weights, scope, WeightKind::SharedGate)?,
+                                shared_up: lookup(weights, scope, WeightKind::SharedUp)?,
+                                shared_down: lookup(weights, scope, WeightKind::SharedDown)?,
+                                activation: active_element,
+                            })
+                        }
+                        _ => {
+                            return Err(PlanError::Topology(
+                                "head feed-forward geometry and weights disagree",
+                            ))
+                        }
+                    },
                     output_norm: lookup(weights, scope, WeightKind::OutputNorm)?,
                     projection: lookup(target, WeightScope::Target, WeightKind::Output)?,
                     activation: active_element,
@@ -522,7 +565,9 @@ fn attention_shape(hidden: u64, geometry: &AttentionGeometry) -> Result<Attentio
     let RotarySemantics::Interleaved { width: rotary, .. } = &geometry.rotary;
     if geometry.kv_heads == 0 || geometry.heads % geometry.kv_heads != 0 || *rotary > geometry.width
     {
-        return Err(PlanError::Topology("attention heads or rotary width are inconsistent"));
+        return Err(PlanError::Topology(
+            "attention heads or rotary width are inconsistent",
+        ));
     }
     Ok(AttentionShape {
         hidden,

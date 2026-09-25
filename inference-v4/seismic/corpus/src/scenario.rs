@@ -27,7 +27,10 @@ impl ScenarioName {
     }
     /// The first path component: the scenario's source family (`history`, `areas`, ...).
     pub fn top_directory(&self) -> &str {
-        self.0.split('/').next().expect("split yields one component")
+        self.0
+            .split('/')
+            .next()
+            .expect("split yields one component")
     }
 }
 
@@ -260,21 +263,23 @@ pub fn load_all(root: &Path) -> Vec<Scenario> {
 /// The scenario `<root>/<name>.seismic`.
 pub fn load(root: &Path, name: ScenarioName) -> Scenario {
     let path = root.join(format!("{}.seismic", name.as_str()));
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     parse(name, &text)
 }
 
 fn collect_names(root: &Path, directory: &Path, names: &mut Vec<ScenarioName>) {
-    let entries = std::fs::read_dir(directory)
-        .unwrap_or_else(|e| panic!("{}: {e}", directory.display()));
+    let entries =
+        std::fs::read_dir(directory).unwrap_or_else(|e| panic!("{}: {e}", directory.display()));
     for entry in entries {
         let path = entry
             .unwrap_or_else(|e| panic!("{}: {e}", directory.display()))
             .path();
         if path.is_dir() {
             collect_names(root, &path, names);
-        } else if path.extension().is_some_and(|extension| extension == "seismic") {
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "seismic")
+        {
             let relative = path
                 .with_extension("")
                 .strip_prefix(root)
@@ -449,7 +454,11 @@ impl Header {
             }
             Keyword::GeneralLaunchesAtMost => {
                 let bound = parse_number(rest)?;
-                set_once(&mut self.general_launch_bound, bound, "general-launches-at-most")
+                set_once(
+                    &mut self.general_launch_bound,
+                    bound,
+                    "general-launches-at-most",
+                )
             }
             Keyword::PrepareWithinMs => {
                 let bound = Duration::from_millis(u64::from(parse_number::<u32>(rest)?));
@@ -575,7 +584,11 @@ pub fn parse_origins(text: &str) -> Result<Vec<Origin>, String> {
 
 fn parse_origin(text: &str) -> Result<Origin, String> {
     let malformed = || format!("`{text}` is not an origin");
-    let non_empty = |part: &str| (!part.is_empty()).then(|| part.to_owned()).ok_or_else(malformed);
+    let non_empty = |part: &str| {
+        (!part.is_empty())
+            .then(|| part.to_owned())
+            .ok_or_else(malformed)
+    };
     if let Some(rest) = text.strip_prefix("test:") {
         let mut parts = rest.split(':');
         let (Some(crate_name), Some(path), Some(function), None) =
@@ -630,7 +643,9 @@ pub fn parse_arguments(text: &str) -> Result<Vec<ArgumentSpec>, String> {
     if text.trim().is_empty() {
         return Ok(Vec::new());
     }
-    text.split(';').map(|arg| parse_argument(arg.trim())).collect()
+    text.split(';')
+        .map(|arg| parse_argument(arg.trim()))
+        .collect()
 }
 
 fn parse_argument(text: &str) -> Result<ArgumentSpec, String> {
@@ -659,8 +674,8 @@ fn parse_argument(text: &str) -> Result<ArgumentSpec, String> {
     let (dtype, value) = text
         .split_once(':')
         .ok_or_else(|| format!("`{text}` is not an argument"))?;
-    let dtype = ScalarDtype::from_name(dtype)
-        .ok_or_else(|| format!("`{dtype}` is not a scalar dtype"))?;
+    let dtype =
+        ScalarDtype::from_name(dtype).ok_or_else(|| format!("`{dtype}` is not a scalar dtype"))?;
     let value = parse_literal(value)?;
     inputs::literal_bits(dtype.dtype(), value)?;
     Ok(ArgumentSpec::Scalar { dtype, value })
@@ -714,7 +729,9 @@ pub fn element_count(shape: &[u64]) -> Option<u64> {
     if shape.contains(&0) {
         return Some(0);
     }
-    shape.iter().try_fold(1u64, |count, extent| count.checked_mul(*extent))
+    shape
+        .iter()
+        .try_fold(1u64, |count, extent| count.checked_mul(*extent))
 }
 
 fn check_fill(element: &str, shape: &[u64], fill: &Fill) -> Result<(), String> {
@@ -909,8 +926,14 @@ mod tests {
         );
         assert_eq!(invocations[1].entry, "second");
         assert_eq!(invocations[1].termination, Some(Termination::Failed));
-        assert_eq!(invocations[1].arguments[2], ArgumentSpec::Range { start: 0, end: 0 });
-        assert_eq!(invocations[1].pins[1].subject, PinSubject::Result(vec![0, 1]));
+        assert_eq!(
+            invocations[1].arguments[2],
+            ArgumentSpec::Range { start: 0, end: 0 }
+        );
+        assert_eq!(
+            invocations[1].pins[1].subject,
+            PinSubject::Result(vec![0, 1])
+        );
         assert_eq!(invocations[1].pins[1].values, [Literal::Bits(0x5f000000)]);
     }
 
@@ -945,7 +968,9 @@ mod tests {
     #[test]
     fn rejected_scenario_and_defaults() {
         let s = scenario("# rejected: \"early return\"\nfn probe():\n    return\n");
-        assert!(matches!(&s.class, ScenarioClass::Rejected { diagnostic } if diagnostic == "early return"));
+        assert!(
+            matches!(&s.class, ScenarioClass::Rejected { diagnostic } if diagnostic == "early return")
+        );
         assert!(!s.include_std);
         assert_eq!(s.policies, PolicySet::BOTH);
         assert!(s.backends.contains(BackendName::Cpu) && s.backends.contains(BackendName::Metal));
@@ -1007,7 +1032,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "test/scenario:3: header line `# invoke: f32[1]=zero` follows source")]
+    #[should_panic(
+        expected = "test/scenario:3: header line `# invoke: f32[1]=zero` follows source"
+    )]
     fn header_line_after_source_panics() {
         scenario("# invoke:\nfn probe():\n    # invoke: f32[1]=zero\n    return\n");
     }

@@ -24,6 +24,10 @@ pub use seismic_lang::checked::{
     NativeParameter, NativeScratch, NativeSpecialization, NativeSpecializationError,
 };
 pub use seismic_lang::precision::PrecisionPolicy;
+/// Numerical comparison helpers used by validation frontends.
+pub mod testing {
+    pub use seismic_compiler::numerics::{compare_element, ElementComparison};
+}
 pub use seismic_runtime::artifacts::{ArtifactKey, ArtifactKind, ArtifactStore, DeviceOptions};
 /// Replay of the tuning search against recorded surveys (development).
 pub use seismic_runtime::native::replay;
@@ -31,15 +35,46 @@ pub use seismic_runtime::native::search::{
     search, Cost, Evaluator, ParameterValues, PointKey, SearchSettings, SearchSpace,
     SearchSpaceError, SearchStop, SearchTrace,
 };
-pub use seismic_runtime::native::tune::{
-    Configuration, ConfigurationRecord, DeclaredParameter, Exclusion, Outcome, PointMeasurement,
-    PointRecord, SearchPlan, Strategy, SurveyPlan, TuneError, TuningInitializer, TuningMethod,
-    TuningResult, TuningTime, Validation,
-};
-pub use seismic_runtime::native::{MeasureOptions, Measurement, NativeArtifactIdentity};
 pub use seismic_runtime::native::trace::{
     host_seconds, SubmissionTrace, TraceDetail, TraceError, TracedLaunch, TracedSubmission,
 };
+pub use seismic_runtime::native::tune::{
+    Configuration, ConfigurationRecord, DeclaredParameter, Exclusion, Outcome, PointMeasurement,
+    PointRecord, ScreeningPoint, SearchPlan, Strategy, SurveyPlan, TuneError, TuningInitializer,
+    TuningMethod, TuningResult, TuningTime, Validation,
+};
+pub use seismic_runtime::native::{MeasureOptions, Measurement, NativeArtifactIdentity};
+
+/// Result of checking one native entry's element bindings without device
+/// formation. Acceptance proves only checked source semantics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeBindingCheck {
+    AcceptedByCheckedEntry,
+    Unsupported(String),
+}
+
+/// One checked tensor port or result before device or native implementation formation.
+/// The byte count uses the registered canonical representation layout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeTensorMetadata {
+    pub element: Element,
+    pub extents: Vec<u64>,
+    pub canonical_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeTensorParameterCheck {
+    Checked(NativeTensorMetadata),
+    Unsupported(String),
+}
+
+/// Checked result leaves in schema order; `None` is a scalar leaf. Native
+/// graph formation still has to reject scalar results and validate the node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeTensorResultsCheck {
+    Checked(Vec<Option<NativeTensorMetadata>>),
+    Unsupported(String),
+}
 
 /// The CPU native ABI that generated bindings wrap. Kernel authors use the
 /// generated `Context` of their entry instead.
@@ -49,19 +84,20 @@ pub mod native_cpu {
     };
 }
 
-/// The Seismic CPU library every CPU native kernel builds on.
-pub use seismic_native_cpu as cpu;
 pub use seismic_lang::expr::{BigInt, BigUint};
 pub use seismic_lang::registry::{BackendName, Layout};
 pub use seismic_lang::types::DType;
+/// The Seismic CPU library every CPU native kernel builds on.
+pub use seismic_native_cpu as cpu;
+pub use seismic_runtime::api::HostRegion;
 pub use seismic_runtime::api::{CallError, OutputError, TensorError, WorkflowError};
 pub use seismic_runtime::devices::{
     Availability, CapacityBasis, DeviceId, DeviceInfo, DeviceKind, DeviceMeasurements,
     DeviceMemory, DeviceMemoryInfo, DeviceMemoryStatus, DeviceSelector, DeviceTopology,
     DiscoveryDiagnostic, DiscoveryError, HeadroomBasis, HeadroomEstimate, HostMeasurements,
-    HostMemoryStatus, LimitVisibility, MemoryLimitError, MemoryPoolId, MemoryPoolInfo,
-    MemoryPoolKind, MemoryUsage, ObservationError, OpenError, ProcessLimitKind,
-    ProcessMemoryLimit, ResolveError, SelectorParseError,
+    HostMemoryStatus, LimitVisibility, MemoryPoolId, MemoryPoolInfo, MemoryPoolKind, MemoryUsage,
+    ObservationError, OpenError, PressureLevel, ProcessLimitKind, ProcessMemoryLimit, ResolveError,
+    SelectorParseError,
 };
 
 use seismic_compiler::prepared::ArgumentValue;
@@ -102,12 +138,16 @@ impl DeviceCatalog {
     /// Open with `options` (for example an artifact store). A device already
     /// open is shared; asking it for a different store is an error.
     pub fn open_with(&self, id: DeviceId, options: DeviceOptions) -> Result<Device, OpenError> {
-        self.inner.open_with(id, options).map(|inner| Device { inner })
+        self.inner
+            .open_with(id, options)
+            .map(|inner| Device { inner })
     }
     /// Low-level control: opens the first discovered device of a backend.
     /// Managed callers select by requirements and open by identity.
     pub fn open_backend(&self, backend: BackendName) -> Result<Device, OpenError> {
-        self.inner.open_backend(backend).map(|inner| Device { inner })
+        self.inner
+            .open_backend(backend)
+            .map(|inner| Device { inner })
     }
     pub fn host_memory_status(&self) -> Result<HostMemoryStatus, ObservationError> {
         self.inner.host_memory_status()
@@ -169,7 +209,7 @@ impl Device {
         self.inner.memory_usage()
     }
     /// Enforce a requested allocation budget on this device's allocations.
-    pub fn set_memory_limit(&self, limit: Option<u64>) -> Result<(), MemoryLimitError> {
+    pub fn set_memory_limit(&self, limit: Option<u64>) {
         self.inner.set_memory_limit(limit)
     }
     /// Samples this device's backend memory observation.
@@ -225,7 +265,9 @@ impl Element {
     pub fn logical_group(&self) -> Option<u64> {
         match &seismic_lang::registry::representation_info(self.0).kind {
             seismic_lang::registry::RepresentationKind::Dense(_) => None,
-            seismic_lang::registry::RepresentationKind::Packed(layout) => Some(u64::from(layout.group)),
+            seismic_lang::registry::RepresentationKind::Packed(layout) => {
+                Some(u64::from(layout.group))
+            }
             seismic_lang::registry::RepresentationKind::PackedRows(layout) => {
                 Some(u64::from(layout.group()))
             }
@@ -353,12 +395,80 @@ impl BF16 {
 
 /// A device tensor: an owned allocation or a view, with device identity,
 /// representation, extents and strides (§14.3). Shapes come from here.
+/// One read-only host window wrapped by the device. Every tensor view shares
+/// one allocation and one charge; submitted work retains that allocation and
+/// its host mapping until completion.
+pub struct ReadOnlyMappedRegion {
+    inner: seismic_runtime::api::tensor::MappedRegionInner,
+}
+
+impl ReadOnlyMappedRegion {
+    pub fn new(device: &Device, region: HostRegion) -> Result<Self, TensorError> {
+        seismic_runtime::api::tensor::MappedRegionInner::new(device.inner(), region)
+            .map(|inner| Self { inner })
+    }
+
+    pub fn tensor(
+        &self,
+        element: Element,
+        extents: &[u64],
+        byte_offset: u64,
+    ) -> Result<Tensor, TensorError> {
+        self.inner
+            .tensor(element.id(), extents, byte_offset)
+            .map(|inner| Tensor {
+                inner: Arc::new(inner),
+            })
+    }
+}
+
 #[derive(Clone)]
 pub struct Tensor {
     inner: Arc<seismic_runtime::api::tensor::TensorInner>,
 }
 
+/// A weak view of one tensor's physical storage. It never pins the
+/// allocation; callers can classify storage still charged after ownership
+/// moves without maintaining a second byte ledger.
+pub struct TensorStorageObserver {
+    inner: seismic_runtime::api::tensor::TensorStorageObserver,
+}
+
+impl TensorStorageObserver {
+    pub fn identity(&self) -> u64 {
+        self.inner.identity()
+    }
+
+    pub fn charged_bytes(&self) -> Option<u64> {
+        self.inner.charged_bytes()
+    }
+}
+
 impl Tensor {
+    /// Allocate without initializing storage. A pure-output kernel can use
+    /// this to avoid a host zero-fill before writing the result.
+    ///
+    /// # Safety
+    /// Every byte of the tensor's physical layout, including padding, must
+    /// be initialized before the tensor is read or passed as a device input.
+    pub unsafe fn uninitialized(
+        device: &Device,
+        element: Element,
+        extents: &[u64],
+    ) -> Result<Tensor, TensorError> {
+        // SAFETY: the caller upholds the complete-initialization contract.
+        unsafe {
+            seismic_runtime::api::tensor::TensorInner::uninitialized(
+                device.inner(),
+                element.id(),
+                extents,
+            )
+        }
+        .map(|inner| Tensor {
+            inner: Arc::new(inner),
+        })
+    }
+
     /// A zero-filled owned tensor.
     pub fn zeros(
         device: &Device,
@@ -420,16 +530,43 @@ impl Tensor {
     /// submitted device write of this tensor completes); new rows are zero.
     /// The result is a new allocation: work bound to `self` is not ordered
     /// with work bound to the result, so the owner switches only between
-    /// submissions.
+    /// submissions. An in-place growth can be abandoned while the old tensor
+    /// is live; dropping the new tensor restores its former backed prefix.
+    /// A successful in-place shrink must be published by dropping the old
+    /// tensor, since the released tail's contents cannot be restored.
     pub fn recommitted(&self, committed: u64) -> Result<Tensor, TensorError> {
-        self.inner.recommitted(committed).map(|inner| Tensor {
-            inner: Arc::new(inner),
-        })
+        self.inner
+            .recommitted(committed, self.can_recommit_in_place())
+            .map(|inner| Tensor {
+                inner: Arc::new(inner),
+            })
+    }
+    /// Recommit into separate backing even when this tensor owns a reserved
+    /// address. This lets an owner prepare a multi-tensor replacement before
+    /// releasing any old rows through an in-place shrink.
+    pub fn recommitted_separately(&self, committed: u64) -> Result<Tensor, TensorError> {
+        self.inner
+            .recommitted(committed, false)
+            .map(|inner| Tensor {
+                inner: Arc::new(inner),
+            })
+    }
+    /// Copy one committed leading row into another row of this tensor. The
+    /// destination may be an unclaimed arena slot; the source is never
+    /// modified. Copies through a bounded host window without new device
+    /// storage, so state owners can compact free banks under memory pressure.
+    pub fn copy_committed_leading_row(&self, from: u64, to: u64) -> Result<(), TensorError> {
+        self.inner.copy_committed_leading_row(from, to)
     }
     /// Whether [`Tensor::recommitted`] keeps this tensor's address: the backend
     /// reserved its address range (CUDA virtual memory management).
     pub fn resizes_in_place(&self) -> bool {
         self.inner.resizes_in_place()
+    }
+    /// Whether this tensor currently has sole ownership of its reserved
+    /// backing, allowing a recommit without a second physical allocation.
+    pub fn can_recommit_in_place(&self) -> bool {
+        Arc::strong_count(&self.inner) == 1 && self.inner.can_recommit_in_place()
     }
     /// The same reserved shape with `committed` leading rows backed by a new
     /// allocation holding the rows `moves` names: each `(from, to, rows)`
@@ -437,7 +574,11 @@ impl Tensor {
     /// of this tensor completes) to rows `[to, to + rows)`; every other row is
     /// zero. The address always changes, so the owner switches only between
     /// submissions.
-    pub fn relocated(&self, committed: u64, moves: &[(u64, u64, u64)]) -> Result<Tensor, TensorError> {
+    pub fn relocated(
+        &self,
+        committed: u64,
+        moves: &[(u64, u64, u64)],
+    ) -> Result<Tensor, TensorError> {
         self.inner.relocated(committed, moves).map(|inner| Tensor {
             inner: Arc::new(inner),
         })
@@ -450,6 +591,12 @@ impl Tensor {
     /// exclusion makes this safe even when other views share the allocation.
     pub fn write_from_host(&mut self, bytes: &[u8]) -> Result<(), TensorError> {
         self.inner.write_from_host(bytes)
+    }
+    /// Fill all physical bytes of a canonical upload tensor from `reader`
+    /// with bounded scratch, rather than materializing a second whole tensor.
+    /// On error the tensor is only partly initialized and must not be used.
+    pub fn write_from_reader(&mut self, reader: &mut dyn std::io::Read) -> Result<(), TensorError> {
+        self.inner.write_from_reader(reader)
     }
     pub fn device(&self) -> Device {
         Device {
@@ -483,6 +630,11 @@ impl Tensor {
     }
     pub fn storage_bytes(&self) -> u64 {
         self.inner.storage_bytes()
+    }
+    pub fn observe_storage(&self) -> TensorStorageObserver {
+        TensorStorageObserver {
+            inner: self.inner.observe_storage(),
+        }
     }
     pub fn belongs_to(&self, device: &Device) -> bool {
         Arc::ptr_eq(self.inner.device(), device.inner())
@@ -826,6 +978,48 @@ pub struct NativeKernel<E: Entry> {
     marker: std::marker::PhantomData<E>,
 }
 
+/// Tensor-result native calls from any prepared entries on one device,
+/// encoded in order and completed with one device wait.
+pub struct NativeTensorBatch {
+    inner: seismic_runtime::api::kernel::NativeTensorBatchAny,
+}
+
+pub struct NativeTensorBatchCompletion {
+    inner: seismic_runtime::api::kernel::NativeTensorBatchCompletionAny,
+}
+
+impl NativeTensorBatch {
+    pub fn new(device: &Device) -> Self {
+        Self {
+            inner: seismic_runtime::api::kernel::NativeTensorBatchAny::new(device.inner()),
+        }
+    }
+
+    pub fn push<E: Entry>(
+        &mut self,
+        kernel: &NativeKernel<E>,
+        args: E::Args<'_>,
+        outputs: E::OutputArgs<'_>,
+    ) -> Result<(), CallError> {
+        self.inner
+            .push(&kernel.inner, E::encode(args), E::encode_outputs(outputs))
+    }
+
+    pub fn submit(self) -> Result<NativeTensorBatchCompletion, CallError> {
+        self.inner
+            .submit()
+            .map(|inner| NativeTensorBatchCompletion { inner })
+    }
+}
+
+impl NativeTensorBatchCompletion {
+    /// Observe completion and any device failure. Dropping an unobserved
+    /// completion still waits so its mapped inputs stay alive.
+    pub fn wait(self) -> Result<(), CallError> {
+        self.inner.wait()
+    }
+}
+
 /// One workload for native tuning: argument sets cycled by measurement, the
 /// first also used for validation, and the point's share of the objective.
 pub struct TuningPoint<'a, E: Entry> {
@@ -847,6 +1041,319 @@ pub struct TuningPoint<'a, E: Entry> {
 /// checked entry contracts and owns its storage plan.
 pub struct NativeGraph {
     inner: seismic_runtime::native::graph::NativeGraphDraft,
+}
+
+/// Backend-free storage projection of a native graph. The caller follows the
+/// same checked topology as a prepared graph. Native scratch uses the largest
+/// checked charge across the declaration's finite tuning choices.
+pub struct NativeGraphMetadata {
+    backend: BackendName,
+    inner: seismic_runtime::native::graph::NativeGraphMetadataDraft,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeGraphMetadataError {
+    Bundle(CheckedBundleError),
+    Unsupported(String),
+    Tensor(TensorError),
+    Call(CallError),
+    Workflow(WorkflowError),
+}
+
+impl fmt::Display for NativeGraphMetadataError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bundle(error) => write!(f, "{error}"),
+            Self::Unsupported(reason) => write!(f, "{reason}"),
+            Self::Tensor(error) => write!(f, "{error}"),
+            Self::Call(error) => write!(f, "{error}"),
+            Self::Workflow(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for NativeGraphMetadataError {}
+
+pub use seismic_runtime::native::graph::NativeGraphStorageBytes;
+
+fn checked_native_scratch_bound(
+    scratch_buffers: &[NativeScratch],
+    tuning_parameters: &[NativeParameter],
+    dimensions: &[(&str, u64)],
+) -> Result<Vec<u64>, String> {
+    fn maximum(
+        scratch: &NativeScratch,
+        dimensions: &[(&str, u64)],
+        parameters: &[&NativeParameter],
+        values: &mut Vec<u64>,
+        index: usize,
+    ) -> Result<u64, String> {
+        if let Some(parameter) = parameters.get(index) {
+            let mut largest = 0;
+            for &value in &parameter.values {
+                values.push(value);
+                largest = largest.max(maximum(scratch, dimensions, parameters, values, index + 1)?);
+                values.pop();
+            }
+            return Ok(largest);
+        }
+        let dimension = |name: &str| {
+            dimensions
+                .iter()
+                .find(|(candidate, _)| *candidate == name)
+                .map(|(_, value)| *value)
+        };
+        let parameter = |name: &str| {
+            parameters
+                .iter()
+                .position(|candidate| candidate.name == name)
+                .map(|index| values[index])
+        };
+        let active = scratch
+            .when
+            .as_ref()
+            .map(|condition| condition.holds(&dimension, &parameter))
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .unwrap_or(true);
+        if !active {
+            return Ok(1);
+        }
+        scratch
+            .bytes
+            .evaluate(&dimension, &parameter)
+            .map(|bytes| bytes.max(1))
+            .map_err(|error| error.to_string())
+    }
+
+    scratch_buffers
+        .iter()
+        .map(|scratch| {
+            let mut names = Vec::new();
+            scratch.bytes.parameters(&mut names);
+            if let Some(condition) = &scratch.when {
+                condition.parameters(&mut names);
+            }
+            let parameters = names
+                .iter()
+                .map(|name| {
+                    tuning_parameters
+                        .iter()
+                        .find(|parameter| &parameter.name == name)
+                        .ok_or_else(|| {
+                            format!("scratch `{}` has unknown parameter `{name}`", scratch.name)
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if parameters
+                .iter()
+                .any(|parameter| parameter.values.is_empty())
+            {
+                return Err(format!(
+                    "scratch `{}` has an empty tuning domain",
+                    scratch.name
+                ));
+            }
+            maximum(scratch, dimensions, &parameters, &mut Vec::new(), 0)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod metadata_scratch_tests {
+    use super::*;
+    use seismic_lang::checked::NativeParameterRole;
+
+    #[test]
+    fn scratch_bound_covers_conditional_tuning_choices() {
+        let parameter = NativeParameter {
+            name: "tile".into(),
+            code: false,
+            arithmetic: false,
+            values: vec![1, 4],
+            role: NativeParameterRole::Declared,
+        };
+        let scratch = NativeScratch {
+            name: "staged".into(),
+            bytes: NativeNatExpr::Mul(
+                Box::new(NativeNatExpr::Dimension("D".into())),
+                Box::new(NativeNatExpr::Parameter("tile".into())),
+            ),
+            when: Some(NativeCondition::Compare {
+                comparison: NativeComparison::Gt,
+                left: NativeNatExpr::Parameter("tile".into()),
+                right: NativeNatExpr::Constant(1),
+            }),
+        };
+        assert_eq!(
+            checked_native_scratch_bound(&[scratch], &[parameter], &[("D", 4)]).unwrap(),
+            vec![16]
+        );
+    }
+}
+
+impl NativeGraphMetadata {
+    pub fn new(backend: BackendName) -> Self {
+        Self {
+            backend,
+            inner: seismic_runtime::native::graph::NativeGraphMetadataDraft::new(),
+        }
+    }
+
+    pub fn port(
+        &mut self,
+        element: Element,
+        extents: &[u64],
+    ) -> Result<NativePort, NativeGraphMetadataError> {
+        let inner = self
+            .inner
+            .port(element.id(), extents, false, false)
+            .map_err(NativeGraphMetadataError::Tensor)?;
+        Ok(NativePort {
+            tensor: WorkflowTensor {
+                inner: inner.reference(),
+            },
+            inner,
+        })
+    }
+
+    pub fn input_for<E: Entry>(
+        &mut self,
+        elements: &[(&str, Element)],
+        parameter: &str,
+        dimensions: &[(&str, u64)],
+    ) -> Result<NativePort, NativeGraphMetadataError> {
+        let metadata = match generated::checked_native_tensor_parameter::<E>(
+            self.backend,
+            elements,
+            parameter,
+            dimensions,
+        )
+        .map_err(NativeGraphMetadataError::Bundle)?
+        {
+            NativeTensorParameterCheck::Checked(metadata) => metadata,
+            NativeTensorParameterCheck::Unsupported(reason) => {
+                return Err(NativeGraphMetadataError::Unsupported(reason));
+            }
+        };
+        let inner = self
+            .inner
+            .port(metadata.element.id(), &metadata.extents, true, true)
+            .map_err(NativeGraphMetadataError::Tensor)?;
+        Ok(NativePort {
+            tensor: WorkflowTensor {
+                inner: inner.reference(),
+            },
+            inner,
+        })
+    }
+
+    pub fn local_for<E: Entry>(
+        &mut self,
+        elements: &[(&str, Element)],
+        parameter: &str,
+        dimensions: &[(&str, u64)],
+    ) -> Result<NativePort, NativeGraphMetadataError> {
+        let metadata = match generated::checked_native_tensor_parameter::<E>(
+            self.backend,
+            elements,
+            parameter,
+            dimensions,
+        )
+        .map_err(NativeGraphMetadataError::Bundle)?
+        {
+            NativeTensorParameterCheck::Checked(metadata) => metadata,
+            NativeTensorParameterCheck::Unsupported(reason) => {
+                return Err(NativeGraphMetadataError::Unsupported(reason));
+            }
+        };
+        let inner = self
+            .inner
+            .port(metadata.element.id(), &metadata.extents, true, false)
+            .map_err(NativeGraphMetadataError::Tensor)?;
+        Ok(NativePort {
+            tensor: WorkflowTensor {
+                inner: inner.reference(),
+            },
+            inner,
+        })
+    }
+
+    pub fn prewrite(&mut self, port: &NativePort) -> Result<(), NativeGraphMetadataError> {
+        self.inner
+            .prewrite(port.inner)
+            .map_err(NativeGraphMetadataError::Workflow)
+    }
+
+    pub fn enqueue<E: Entry>(
+        &mut self,
+        elements: &[(&str, Element)],
+        dimensions: &[(&str, u64)],
+        args: E::WorkflowArgs<'_>,
+    ) -> Result<E::WorkflowResults, NativeGraphMetadataError> {
+        let implementation = generated::native_implementation_for_backend::<E>(self.backend)
+            .map_err(NativeGraphMetadataError::Bundle)?
+            .ok_or_else(|| {
+                NativeGraphMetadataError::Unsupported(format!(
+                    "`{}` has no native implementation",
+                    E::NAME
+                ))
+            })?;
+        let scratch = checked_native_scratch_bound(
+            &implementation.scratch,
+            &implementation.params,
+            dimensions,
+        )
+        .map_err(|reason| {
+            NativeGraphMetadataError::Unsupported(format!("`{}` scratch bound: {reason}", E::NAME))
+        })?;
+        let results =
+            match generated::checked_native_tensor_results::<E>(self.backend, elements, dimensions)
+                .map_err(NativeGraphMetadataError::Bundle)?
+            {
+                NativeTensorResultsCheck::Checked(results) => results,
+                NativeTensorResultsCheck::Unsupported(reason) => {
+                    return Err(NativeGraphMetadataError::Unsupported(reason));
+                }
+            };
+        let shapes = results
+            .into_iter()
+            .map(|result| result.map(|metadata| (metadata.element.id(), metadata.extents)))
+            .collect();
+        let parameters = match generated::checked_native_tensor_parameters::<E>(
+            self.backend,
+            elements,
+            dimensions,
+        )
+        .map_err(NativeGraphMetadataError::Bundle)?
+        {
+            NativeTensorResultsCheck::Checked(parameters) => parameters,
+            NativeTensorResultsCheck::Unsupported(reason) => {
+                return Err(NativeGraphMetadataError::Unsupported(reason));
+            }
+        };
+        let parameter_shapes = parameters
+            .into_iter()
+            .map(|parameter| parameter.map(|metadata| (metadata.element.id(), metadata.extents)))
+            .collect();
+        let pending = self
+            .inner
+            .enqueue(E::encode_workflow(args), parameter_shapes, shapes, scratch)
+            .map_err(NativeGraphMetadataError::Call)?;
+        Ok(E::decode_workflow(pending))
+    }
+
+    pub fn export(&mut self, result: &WorkflowTensor) -> Result<(), NativeGraphMetadataError> {
+        self.inner
+            .export(result.inner)
+            .map_err(NativeGraphMetadataError::Workflow)
+    }
+
+    pub fn seal(self) -> Result<NativeGraphStorageBytes, NativeGraphMetadataError> {
+        self.inner
+            .seal()
+            .map_err(NativeGraphMetadataError::Workflow)
+    }
 }
 
 #[derive(Clone)]
@@ -1156,9 +1663,12 @@ impl ReadyNativeGraphRun<'_> {
     /// once; host reads of exported tensors wait for this run. The
     /// completion reports its outcome.
     pub fn submit(self) -> Result<(NativeGraphOutputs, NativeGraphCompletion), CallError> {
-        self.inner
-            .submit()
-            .map(|(inner, completion)| (NativeGraphOutputs { inner }, NativeGraphCompletion { inner: completion }))
+        self.inner.submit().map(|(inner, completion)| {
+            (
+                NativeGraphOutputs { inner },
+                NativeGraphCompletion { inner: completion },
+            )
+        })
     }
 
     /// Append this run to `sequence` instead of submitting it: every run
@@ -1166,7 +1676,10 @@ impl ReadyNativeGraphRun<'_> {
     /// queue order. The outputs may be bound into later queued runs at
     /// once; host reads of them are valid only after the sequence is
     /// submitted.
-    pub fn queue(self, sequence: &mut NativeGraphSequence) -> Result<NativeGraphOutputs, CallError> {
+    pub fn queue(
+        self,
+        sequence: &mut NativeGraphSequence,
+    ) -> Result<NativeGraphOutputs, CallError> {
         self.inner
             .queue(&mut sequence.inner)
             .map(|inner| NativeGraphOutputs { inner })
@@ -1306,6 +1819,13 @@ impl<E: Entry> Kernel<E> {
 }
 
 impl<E: Entry> NativeKernel<E> {
+    /// Identity of the prepared storage shared by clones and by typed slots.
+    /// Intended for ownership accounting; it has no cross-process meaning.
+    #[doc(hidden)]
+    pub fn prepared_storage_identity(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
+    }
+
     /// Allocation-free planning charge before this checked specialization is
     /// prepared. The value is generated from its checked entry schema.
     pub const fn planned_invocation_workspace_bytes() -> u64 {
@@ -1437,7 +1957,22 @@ pub mod generated {
     /// Opaque checked module token used only by generated bindings. Consumers
     /// can name the type because Rust trait implementations must, but cannot
     /// inspect or construct the compiler artifact it owns.
-    pub struct Module(seismic_lang::checked::CheckedModule);
+    pub struct Module {
+        checked: seismic_lang::checked::CheckedModule,
+        /// A checked entry's semantics depend only on its entry identity and
+        /// element bindings. Graph metadata asks for many port shapes under
+        /// the same binding, so retain a bounded set of these immutable
+        /// monomorphizations instead of rebuilding one per port and node.
+        logical_entries: std::sync::Mutex<std::collections::VecDeque<LogicalEntryCacheItem>>,
+    }
+
+    struct LogicalEntryCacheItem {
+        entry: seismic_lang::ids::EntryId,
+        bindings: seismic_lang::entry::ElementBindings,
+        logical: Arc<seismic_lang::entry::LogicalEntry>,
+    }
+
+    const LOGICAL_ENTRY_CACHE_CAPACITY: usize = 64;
 
     /// Opaque proof that a generated entry name resolved in its own checked
     /// module. Generated code can pass it back to Seismic, but consumers
@@ -1467,12 +2002,89 @@ pub mod generated {
     }
 
     impl Module {
+        fn new(checked: seismic_lang::checked::CheckedModule) -> Self {
+            Self {
+                checked,
+                logical_entries: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            }
+        }
+
         pub(crate) fn checked(&self) -> &seismic_lang::checked::CheckedModule {
-            &self.0
+            &self.checked
         }
         #[doc(hidden)]
         pub fn entry_named(&self, name: &str) -> Option<EntryToken> {
-            self.0.entry_named(name).map(EntryToken)
+            self.checked.entry_named(name).map(EntryToken)
+        }
+
+        fn logical_entry(
+            &self,
+            entry: seismic_lang::ids::EntryId,
+            bindings: &seismic_lang::entry::ElementBindings,
+        ) -> Result<Arc<seismic_lang::entry::LogicalEntry>, seismic_lang::checked::SourceError>
+        {
+            if let Some(logical) = self
+                .logical_entries
+                .lock()
+                .expect("checked-entry cache mutex poisoned")
+                .iter()
+                .find(|item| item.entry == entry && item.bindings == *bindings)
+                .map(|item| item.logical.clone())
+            {
+                return Ok(logical);
+            }
+            let logical = Arc::new(self.checked.entry(entry, bindings)?);
+            let mut cache = self
+                .logical_entries
+                .lock()
+                .expect("checked-entry cache mutex poisoned");
+            if let Some(item) = cache
+                .iter()
+                .find(|item| item.entry == entry && item.bindings == *bindings)
+            {
+                return Ok(item.logical.clone());
+            }
+            if cache.len() == LOGICAL_ENTRY_CACHE_CAPACITY {
+                cache.pop_front();
+            }
+            cache.push_back(LogicalEntryCacheItem {
+                entry,
+                bindings: bindings.clone(),
+                logical: logical.clone(),
+            });
+            Ok(logical)
+        }
+
+        #[cfg(test)]
+        fn cached_logical_entries(&self) -> usize {
+            self.logical_entries
+                .lock()
+                .expect("checked-entry cache mutex poisoned")
+                .len()
+        }
+    }
+
+    #[cfg(test)]
+    mod logical_entry_cache_tests {
+        use super::*;
+        use seismic_lang::checked::{check_source, SourceFile, SourceSet};
+
+        #[test]
+        fn reuses_one_semantic_entry_per_element_binding() {
+            let source = SourceSet::new(vec![SourceFile {
+                path: "cache.seismic".into(),
+                text:
+                    "fn copy[N](input: &tensor[N] A) -> tensor[N] A:\n    return to_owned(input)\n"
+                        .into(),
+            }]);
+            let module = Module::new(check_source(source).unwrap());
+            let entry = module.entry_named("copy").unwrap().id();
+            let f32_binding =
+                seismic_lang::entry::ElementBindings::new().bind("A", Element::f32().id());
+            let first = module.logical_entry(entry, &f32_binding).unwrap();
+            let again = module.logical_entry(entry, &f32_binding).unwrap();
+            assert!(Arc::ptr_eq(&first, &again));
+            assert_eq!(module.cached_logical_entries(), 1);
         }
     }
 
@@ -1677,19 +2289,223 @@ pub mod generated {
         elements: &[(&str, Element)],
         cpu: Option<&'static native_cpu::CpuNativeKernels>,
     ) -> Result<NativeKernel<E>, LoadError> {
-        NativeKernel::prepare(device, specialization.clone(), element_bindings(elements), cpu)
+        NativeKernel::prepare(
+            device,
+            specialization.clone(),
+            element_bindings(elements),
+            cpu,
+        )
+    }
+
+    /// The checked native implementation of an entry for a backend, without
+    /// opening a device. Metadata-only assessment can inspect the same
+    /// declaration that execution later prepares.
+    pub fn native_implementation_for_backend<E: Entry>(
+        backend: BackendName,
+    ) -> Result<Option<NativeImplementation>, CheckedBundleError> {
+        let module = E::module()?;
+        let entry = E::resolve(module)?;
+        Ok(module
+            .checked()
+            .native_implementation(entry.id(), backend)
+            .cloned())
+    }
+
+    /// Check an entry's exact element bindings with the same checked-module
+    /// operation used by native preparation, without opening a device or
+    /// forming backend code. A successful check proves the semantic binding,
+    /// not that a backend compiler can form the native implementation.
+    pub fn checked_native_binding<E: Entry>(
+        backend: BackendName,
+        elements: &[(&str, Element)],
+    ) -> Result<NativeBindingCheck, CheckedBundleError> {
+        let module = E::module()?;
+        let entry = E::resolve(module)?;
+        if module
+            .checked()
+            .native_implementation(entry.id(), backend)
+            .is_none()
+        {
+            return Ok(NativeBindingCheck::Unsupported(format!(
+                "`{}` has no native implementation for `{}`",
+                E::NAME,
+                backend.as_str()
+            )));
+        }
+        Ok(module
+            .logical_entry(entry.id(), &element_bindings(elements))
+            .map(|_| NativeBindingCheck::AcceptedByCheckedEntry)
+            .unwrap_or_else(|error| NativeBindingCheck::Unsupported(error.to_string())))
+    }
+
+    /// Resolve one native graph port from the checked entry and registry,
+    /// without opening a device or preparing a native kernel. This checks a
+    /// port's semantic shape and canonical storage, not graph liveness or
+    /// backend formation.
+    pub fn checked_native_tensor_parameter<E: Entry>(
+        backend: BackendName,
+        elements: &[(&str, Element)],
+        parameter: &str,
+        dimensions: &[(&str, u64)],
+    ) -> Result<NativeTensorParameterCheck, CheckedBundleError> {
+        let module = E::module()?;
+        let entry = E::resolve(module)?;
+        if module
+            .checked()
+            .native_implementation(entry.id(), backend)
+            .is_none()
+        {
+            return Ok(NativeTensorParameterCheck::Unsupported(format!(
+                "`{}` has no native implementation for `{}`",
+                E::NAME,
+                backend.as_str()
+            )));
+        }
+        let logical = match module.logical_entry(entry.id(), &element_bindings(elements)) {
+            Ok(logical) => logical,
+            Err(error) => return Ok(NativeTensorParameterCheck::Unsupported(error.to_string())),
+        };
+        let shape = match logical.tensor_parameter_shape(parameter, dimensions) {
+            Ok(shape) => shape,
+            Err(error) => return Ok(NativeTensorParameterCheck::Unsupported(error.to_string())),
+        };
+        let element = Element(shape.representation);
+        let canonical_bytes = match element.canonical_byte_len(&shape.extents) {
+            Ok(bytes) => bytes,
+            Err(error) => return Ok(NativeTensorParameterCheck::Unsupported(error.to_string())),
+        };
+        Ok(NativeTensorParameterCheck::Checked(NativeTensorMetadata {
+            element,
+            extents: shape.extents,
+            canonical_bytes,
+        }))
+    }
+
+    /// Resolve checked result storage for a native entry at exact dimensions.
+    /// This does not account for the result's graph lifetime or placement.
+    pub fn checked_native_tensor_results<E: Entry>(
+        backend: BackendName,
+        elements: &[(&str, Element)],
+        dimensions: &[(&str, u64)],
+    ) -> Result<NativeTensorResultsCheck, CheckedBundleError> {
+        let module = E::module()?;
+        let entry = E::resolve(module)?;
+        if module
+            .checked()
+            .native_implementation(entry.id(), backend)
+            .is_none()
+        {
+            return Ok(NativeTensorResultsCheck::Unsupported(format!(
+                "`{}` has no native implementation for `{}`",
+                E::NAME,
+                backend.as_str()
+            )));
+        }
+        let logical = match module.logical_entry(entry.id(), &element_bindings(elements)) {
+            Ok(logical) => logical,
+            Err(error) => return Ok(NativeTensorResultsCheck::Unsupported(error.to_string())),
+        };
+        let shapes = match logical.tensor_result_shapes(dimensions) {
+            Ok(shapes) => shapes,
+            Err(error) => return Ok(NativeTensorResultsCheck::Unsupported(error.to_string())),
+        };
+        let mut results = Vec::with_capacity(shapes.len());
+        for shape in shapes {
+            let Some(shape) = shape else {
+                results.push(None);
+                continue;
+            };
+            let element = Element(shape.representation);
+            let canonical_bytes = match element.canonical_byte_len(&shape.extents) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Ok(NativeTensorResultsCheck::Unsupported(error.to_string()));
+                }
+            };
+            results.push(Some(NativeTensorMetadata {
+                element,
+                extents: shape.extents,
+                canonical_bytes,
+            }));
+        }
+        Ok(NativeTensorResultsCheck::Checked(results))
+    }
+
+    /// Parameter shapes in checked schema order, for a metadata graph node.
+    /// Scalar parameters have no tensor descriptor.
+    pub fn checked_native_tensor_parameters<E: Entry>(
+        backend: BackendName,
+        elements: &[(&str, Element)],
+        dimensions: &[(&str, u64)],
+    ) -> Result<NativeTensorResultsCheck, CheckedBundleError> {
+        use seismic_lang::entry::ParameterKind;
+
+        let module = E::module()?;
+        let entry = E::resolve(module)?;
+        if module
+            .checked()
+            .native_implementation(entry.id(), backend)
+            .is_none()
+        {
+            return Ok(NativeTensorResultsCheck::Unsupported(format!(
+                "`{}` has no native implementation for `{}`",
+                E::NAME,
+                backend.as_str()
+            )));
+        }
+        let logical = match module.logical_entry(entry.id(), &element_bindings(elements)) {
+            Ok(logical) => logical,
+            Err(error) => return Ok(NativeTensorResultsCheck::Unsupported(error.to_string())),
+        };
+        let mut parameters = Vec::with_capacity(logical.schema().parameters().len());
+        for parameter in logical.schema().parameters() {
+            if !matches!(&parameter.kind, ParameterKind::Tensor { .. }) {
+                parameters.push(None);
+                continue;
+            }
+            let shape = match logical.tensor_parameter_shape(&parameter.name, dimensions) {
+                Ok(shape) => shape,
+                Err(error) => {
+                    return Ok(NativeTensorResultsCheck::Unsupported(error.to_string()));
+                }
+            };
+            let element = Element(shape.representation);
+            let canonical_bytes = match element.canonical_byte_len(&shape.extents) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Ok(NativeTensorResultsCheck::Unsupported(error.to_string()));
+                }
+            };
+            parameters.push(Some(NativeTensorMetadata {
+                element,
+                extents: shape.extents,
+                canonical_bytes,
+            }));
+        }
+        Ok(NativeTensorResultsCheck::Checked(parameters))
     }
 
     /// The checked native implementation of an entry for a device's backend.
     pub fn native_implementation<E: Entry>(
         device: &Device,
     ) -> Result<Option<NativeImplementation>, CheckedBundleError> {
+        native_implementation_for_backend::<E>(device.backend())
+    }
+
+    /// Validate a stored native choice against the opened device's complete
+    /// parameter domain, including Seismic-owned CPU workers and ISA tier.
+    pub fn native_specialization_valid<E: Entry>(
+        device: &Device,
+        specialization: &NativeSpecialization,
+    ) -> Result<bool, CheckedBundleError> {
         let module = E::module()?;
         let entry = E::resolve(module)?;
-        Ok(module
-            .checked()
-            .native_implementation(entry.id(), device.backend())
-            .cloned())
+        Ok(seismic_runtime::native::specialization_valid(
+            device.inner(),
+            module.checked(),
+            entry.id(),
+            specialization,
+        ))
     }
 
     /// Digest of the entry's implementation for `device`'s backend at these
@@ -1701,7 +2517,8 @@ pub mod generated {
         cpu: Option<&'static native_cpu::CpuNativeKernels>,
     ) -> Result<String, TuneError> {
         let module = E::module().map_err(|error| TuneError::Declaration(error.to_string()))?;
-        let entry = E::resolve(module).map_err(|error| TuneError::Declaration(error.to_string()))?;
+        let entry =
+            E::resolve(module).map_err(|error| TuneError::Declaration(error.to_string()))?;
         seismic_runtime::native::tune::implementation_digest(
             device.inner(),
             module.checked(),
@@ -1722,7 +2539,8 @@ pub mod generated {
         strategy: Strategy,
     ) -> Result<TuningResult, TuneError> {
         let module = E::module().map_err(|error| TuneError::Declaration(error.to_string()))?;
-        let entry = E::resolve(module).map_err(|error| TuneError::Declaration(error.to_string()))?;
+        let entry =
+            E::resolve(module).map_err(|error| TuneError::Declaration(error.to_string()))?;
         seismic_runtime::native::tune::tune(seismic_runtime::native::tune::TuneRequest {
             device: device.inner(),
             module: module.checked(),
@@ -1783,7 +2601,9 @@ pub mod generated {
         cell: &'static OnceLock<Result<Module, CheckedBundleError>>,
         bytes: &'static [u8],
     ) -> Result<&'static Module, CheckedBundleError> {
-        match cell.get_or_init(|| seismic_lang::bundle::decode_checked_bundle(bytes).map(Module)) {
+        match cell
+            .get_or_init(|| seismic_lang::bundle::decode_checked_bundle(bytes).map(Module::new))
+        {
             Ok(module) => Ok(module),
             Err(error) => Err(error.clone()),
         }
@@ -1794,4 +2614,6 @@ pub mod generated {
 pub mod dynamic;
 
 /// Numerical policy values shared by every host language.
-pub mod precision { pub use seismic_lang::precision::*; }
+pub mod precision {
+    pub use seismic_lang::precision::*;
+}

@@ -56,10 +56,21 @@ pub struct HostMemoryStatus {
     /// The platform's defined headroom estimate. It is an estimate of
     /// allocatable RAM, never exact physical availability.
     pub headroom: HeadroomEstimate,
+    /// An OS-defined pressure signal, when this platform path supplies one.
+    /// Absence is distinct from Normal and must not be reported as evidence
+    /// that the host is free of pressure.
+    pub pressure: Option<PressureLevel>,
     /// Process and environment limits that apply to this process.
     pub limits: Vec<ProcessMemoryLimit>,
     /// Whether every applicable limit could be observed.
     pub limit_visibility: LimitVisibility,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PressureLevel {
+    Normal,
+    Pressure,
+    Emergency,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

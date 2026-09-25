@@ -852,8 +852,14 @@ pub(crate) fn capability_rows() -> Vec<CapabilityRow> {
         IntrinsicParticipation, IntrinsicUniformity,
     };
     const MATRIX_AXES: &[crate::registry::IntrinsicResultAxis] = &[
-        crate::registry::IntrinsicResultAxis { argument: 0, axis: 0 },
-        crate::registry::IntrinsicResultAxis { argument: 1, axis: 1 },
+        crate::registry::IntrinsicResultAxis {
+            argument: 0,
+            axis: 0,
+        },
+        crate::registry::IntrinsicResultAxis {
+            argument: 1,
+            axis: 1,
+        },
     ];
     /// The fixed workgroup size of the CUDA NVFP4 block-scaled matrix rows.
     const NVFP4_WORKGROUP: u32 = 128;
@@ -1114,7 +1120,10 @@ mod tests {
         let neg = unary_operand_domain(UnaryOp::Neg);
         for dtype in DType::ALL {
             assert_eq!(not.admits_dtype(dtype), dtype == DType::Bool);
-            assert_eq!(bit_not.admits_dtype(dtype), matches!(dtype, DType::I32 | DType::U32));
+            assert_eq!(
+                bit_not.admits_dtype(dtype),
+                matches!(dtype, DType::I32 | DType::U32)
+            );
             assert_eq!(neg.admits_dtype(dtype), dtype != DType::Bool);
         }
         assert!(neg.admits_quantity());

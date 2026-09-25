@@ -12,8 +12,8 @@ use seismic_compiler::executable::{
     ExecutableAllocationId, ExecutableCommand, ExecutableKernelId, ExecutionEnvironment,
     KernelAbiBindings, NativeExecution, NativeExecutor, NativeSubmission, RuntimeBuffer,
 };
-use seismic_ir::schedule::{AnyScalarSlot, FillValue};
 use seismic_ir::physical_target::KernelAbiAllocationRole;
+use seismic_ir::schedule::{AnyScalarSlot, FillValue};
 use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::SymbolValue;
 use std::ffi::{c_int, c_void};
@@ -99,10 +99,16 @@ impl Device {
     /// Device memory over a reserved address range of `reserved` bytes, with
     /// the leading `committed` bytes backed and zeroed. [`Device::recommit`]
     /// changes the backed prefix without moving it.
-    pub fn allocate_reserved(&self, committed: u64, reserved: u64) -> Result<Buffer, ExecutionError> {
+    pub fn allocate_reserved(
+        &self,
+        committed: u64,
+        reserved: u64,
+    ) -> Result<Buffer, ExecutionError> {
         let host = |bytes: u64| {
             usize::try_from(bytes).map_err(|_| {
-                ExecutionError::AllocationFailed("CUDA reservation exceeds host address space".into())
+                ExecutionError::AllocationFailed(
+                    "CUDA reservation exceeds host address space".into(),
+                )
             })
         };
         let (committed, reserved) = (host(committed)?, host(reserved)?);
@@ -132,10 +138,25 @@ impl Device {
                     reservation.reserved
                 ))
             })?;
-        reservation.commit(committed).map_err(allocation_error)?;
         let kept = buffer.len() as usize;
         if committed > kept {
-            self.zero(reservation.base + kept as u64, committed - kept)?;
+            reservation.commit(committed).map_err(allocation_error)?;
+            if let Err(error) = self.zero(reservation.base + kept as u64, committed - kept) {
+                // The new granules are not published yet. Restore the old
+                // prefix before returning so its backing and charge agree.
+                reservation.commit(kept).unwrap_or_else(|rollback| {
+                    panic!(
+                        "CUDA recommit zero failed ({error}); backing rollback failed ({rollback})"
+                    )
+                });
+                return Err(error);
+            }
+        } else {
+            // This backend has no ordinary allocation failure on shrink.
+            // Driver failures after the first unmap cannot be reported while
+            // leaving the old allocation valid, so `commit` treats them as
+            // fatal rather than handing back a mismatched old view.
+            reservation.commit(committed).map_err(allocation_error)?;
         }
         Ok(Buffer::reserved(reservation.clone(), committed))
     }
@@ -722,8 +743,11 @@ fn evaluate(value: &seismic_lang::expr::compiled::CompiledNat, values: &Invocati
         .unwrap_or_else(|error| panic!("prepared CUDA expression failed evaluation: {error:?}"))
 }
 fn encode_symbol(value: SymbolValue) -> Result<u64, ExecutionError> {
-    value.try_word64().map_err(|error| ExecutionError::ConstructionContradiction(
-        format!("native scalar ABI quantity does not fit its planned word: {error:?}")))
+    value.try_word64().map_err(|error| {
+        ExecutionError::ConstructionContradiction(format!(
+            "native scalar ABI quantity does not fit its planned word: {error:?}"
+        ))
+    })
 }
 fn allocation_error(error: DriverError) -> ExecutionError {
     if error.is_device_loss() {

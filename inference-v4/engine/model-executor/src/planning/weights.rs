@@ -1,15 +1,18 @@
-use super::{ArtifactComponent, ArtifactComponentKind, ComponentSelection, ProgramPlan};
+use super::{
+    ArtifactComponent, ArtifactComponentKind, ComponentSelection, FeedForwardProgramSlot,
+    ProgramPlan,
+};
 use crate::error::PlanError;
+use crate::ExecutionPath;
 use magnitude_artifacts::{
     gguf::{Encoding, TensorDescriptor},
-    PackageManifest,
+    ArtifactIdentity, PackageHeaders, PackageIdentity, PackageManifest,
 };
 use magnitude_model_contracts::{
     ActivationDType, AttentionWeights, BlockWeights, DenseFeedForwardWeights, FeedForwardWeights,
     LayerNormWeights, MixerWeights, ModelDefinition, RecurrentWeights, RoutedFeedForwardWeights,
     VisionDescription, WeightDescriptor, WeightKind, WeightRole, WeightScope,
 };
-use crate::ExecutionPath;
 use magnitude_model_state::KvCodec;
 use seismic::{BackendName, DType, Element, Layout};
 use std::collections::{HashMap, HashSet};
@@ -108,6 +111,7 @@ pub struct RoutedBinding {
     pub selected: u64,
     pub features: u64,
     pub shared: u64,
+    pub normalize_selected: bool,
     pub norm: Element,
     pub router: Element,
     pub expert_gate: Element,
@@ -144,10 +148,7 @@ pub struct HeadBinding {
     pub key: Element,
     pub value: Element,
     pub attention_output: Element,
-    pub feedforward_norm: Element,
-    pub gate: Element,
-    pub up: Element,
-    pub down: Element,
+    pub feed_forward: FeedForwardProgramSlot,
     pub output_norm: Element,
     pub projection: Element,
     pub activation: Element,
@@ -194,6 +195,65 @@ pub struct ModelLoadPlan {
     pub(super) target: Vec<WeightPlan>,
     pub(super) head: Option<Vec<WeightPlan>>,
     pub(super) vision: Option<Vec<WeightPlan>>,
+}
+
+impl ModelLoadPlan {
+    /// Peak upload backing while the target component is imported.
+    pub fn target_upload_peak_bytes(&self) -> Result<u64, String> {
+        let source = self
+            .target
+            .iter()
+            .map(|weight| weight.source_bytes)
+            .max()
+            .unwrap_or(0);
+        source_import_peak_bytes(source)
+    }
+
+    /// Peak upload allocation while importing a lazy optional component.
+    pub fn head_upload_peak_bytes(&self) -> Result<u64, String> {
+        let source = self
+            .head
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|weight| weight.source_bytes)
+            .max()
+            .unwrap_or(0);
+        source_import_peak_bytes(source)
+    }
+
+    pub fn vision_upload_peak_bytes(&self) -> Result<u64, String> {
+        let source = self
+            .vision
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|weight| weight.source_bytes)
+            .max()
+            .unwrap_or(0);
+        source_import_peak_bytes(source)
+    }
+}
+
+pub(super) fn source_import_peak_bytes(source_bytes: u64) -> Result<u64, String> {
+    if source_bytes == 0 {
+        return Ok(0);
+    }
+    // The importer learns the source file offset at load. Bound a host-page
+    // aligned mapping with both a leading and a trailing partial page.
+    #[cfg(unix)]
+    {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page =
+            u64::try_from(page).map_err(|_| "host page size is unavailable for import planning")?;
+        source_bytes
+            .checked_add(page.checked_mul(2).ok_or("import page bound overflow")?)
+            .ok_or_else(|| "import window bound overflow".into())
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(source_bytes)
+    }
 }
 
 pub(super) fn weight_bytes_by_component(load: &ModelLoadPlan) -> Result<[u64; 3], String> {
@@ -276,13 +336,63 @@ impl ModelLoadPlan {
         selection: ComponentSelection,
         layout: Layout,
     ) -> Result<Self, String> {
+        Self::derive_components(
+            manifest.identity,
+            &manifest.target.tensors,
+            manifest
+                .projector
+                .as_ref()
+                .map(|projector| (projector.identity, projector.tensors.as_slice())),
+            definition,
+            selection,
+            layout,
+        )
+    }
+
+    /// Plan resident representations from a pre-download header bundle.
+    /// The resulting plan describes bytes and formats but cannot import
+    /// weights until a payload-backed `Package` is opened separately.
+    pub fn derive_headers(
+        headers: &PackageHeaders,
+        definition: &ModelDefinition,
+        selection: ComponentSelection,
+        layout: Layout,
+    ) -> Result<Self, String> {
+        let identity = headers.identity();
+        let projector = headers
+            .projector()
+            .map(|directory| {
+                identity
+                    .projector
+                    .map(|component| (component, directory.tensors.as_slice()))
+                    .ok_or_else(|| "projector header has no component identity".to_owned())
+            })
+            .transpose()?;
+        Self::derive_components(
+            identity,
+            &headers.target().tensors,
+            projector,
+            definition,
+            selection,
+            layout,
+        )
+    }
+
+    fn derive_components(
+        identity: PackageIdentity,
+        target_tensors: &[TensorDescriptor],
+        projector: Option<(ArtifactIdentity, &[TensorDescriptor])>,
+        definition: &ModelDefinition,
+        selection: ComponentSelection,
+        layout: Layout,
+    ) -> Result<Self, String> {
         definition.validate().map_err(|error| error.to_string())?;
-        if manifest.identity != definition.artifact_identity {
+        if identity != definition.artifact_identity {
             return Err("load plan package identity mismatch".into());
         }
         let target_component = ArtifactComponent {
             kind: ArtifactComponentKind::Target,
-            identity: manifest.target.identity,
+            identity: identity.target,
         };
         let target_form = ResidentForm {
             activation: activation_dtype(definition.geometry.activation_dtype),
@@ -291,7 +401,7 @@ impl ModelLoadPlan {
         let mut target = Vec::new();
         push_weight(
             &mut target,
-            &manifest.target.tensors,
+            target_tensors,
             target_component,
             WeightScope::Target,
             WeightKind::Embedding,
@@ -302,7 +412,7 @@ impl ModelLoadPlan {
             let index = u32::try_from(index).map_err(|_| "target block index exceeds u32")?;
             append_block(
                 &mut target,
-                &manifest.target.tensors,
+                target_tensors,
                 target_component,
                 WeightScope::TargetBlock(index),
                 block,
@@ -311,7 +421,7 @@ impl ModelLoadPlan {
         }
         push_weight(
             &mut target,
-            &manifest.target.tensors,
+            target_tensors,
             target_component,
             WeightScope::Target,
             WeightKind::OutputNorm,
@@ -320,7 +430,7 @@ impl ModelLoadPlan {
         )?;
         push_weight(
             &mut target,
-            &manifest.target.tensors,
+            target_tensors,
             target_component,
             WeightScope::Target,
             WeightKind::Output,
@@ -331,7 +441,7 @@ impl ModelLoadPlan {
         if selection.head && definition.head.is_none() {
             return Err("head execution was selected without a head definition".into());
         }
-        if manifest.projector.is_some() != definition.vision.is_some() {
+        if projector.is_some() != definition.vision.is_some() {
             return Err("projector component and vision definition disagree".into());
         }
         if selection.vision && definition.vision.is_none() {
@@ -355,7 +465,7 @@ impl ModelLoadPlan {
                     ] {
                         push_weight(
                             &mut plans,
-                            &manifest.target.tensors,
+                            target_tensors,
                             target_component,
                             scope,
                             kind,
@@ -365,7 +475,7 @@ impl ModelLoadPlan {
                     }
                     append_attention(
                         &mut plans,
-                        &manifest.target.tensors,
+                        target_tensors,
                         target_component,
                         scope,
                         &block.attention,
@@ -373,24 +483,34 @@ impl ModelLoadPlan {
                     )?;
                     push_weight(
                         &mut plans,
-                        &manifest.target.tensors,
+                        target_tensors,
                         target_component,
                         scope,
                         WeightKind::FeedForwardNorm,
                         &block.feedforward_norm,
                         target_form,
                     )?;
-                    append_dense(
-                        &mut plans,
-                        &manifest.target.tensors,
-                        target_component,
-                        scope,
-                        &block.feedforward,
-                        target_form,
-                    )?;
+                    match &block.feedforward {
+                        FeedForwardWeights::Dense(weights) => append_dense(
+                            &mut plans,
+                            target_tensors,
+                            target_component,
+                            scope,
+                            weights,
+                            target_form,
+                        )?,
+                        FeedForwardWeights::Routed(weights) => append_routed(
+                            &mut plans,
+                            target_tensors,
+                            target_component,
+                            scope,
+                            weights,
+                            target_form,
+                        )?,
+                    }
                     push_weight(
                         &mut plans,
-                        &manifest.target.tensors,
+                        target_tensors,
                         target_component,
                         scope,
                         WeightKind::OutputNorm,
@@ -407,15 +527,13 @@ impl ModelLoadPlan {
             .then_some(definition.vision.as_ref())
             .flatten()
             .map(|vision| {
-                let component_manifest = manifest
-                    .projector
-                    .as_ref()
-                    .ok_or("vision definition requires a projector component")?;
+                let (projector_identity, projector_tensors) =
+                    projector.ok_or("vision definition requires a projector component")?;
                 let component = ArtifactComponent {
                     kind: ArtifactComponentKind::Projector,
-                    identity: component_manifest.identity,
+                    identity: projector_identity,
                 };
-                plan_vision(component_manifest.tensors.as_slice(), component, vision, layout)
+                plan_vision(projector_tensors, component, vision, layout)
             })
             .transpose()?;
         validate_unique_roles(
@@ -511,13 +629,14 @@ fn push_weight(
     }
     let source = source_element(stored.encoding)
         .ok_or_else(|| format!("unsupported source encoding {:?}", stored.encoding))?;
-    let resident = resident_element(stored.encoding, dense_resident, form.layout).ok_or_else(|| {
-        format!(
-            "{:?} has no resident form in the `{}` layout",
-            stored.encoding,
-            form.layout.as_str()
-        )
-    })?;
+    let resident =
+        resident_element(stored.encoding, dense_resident, form.layout).ok_or_else(|| {
+            format!(
+                "{:?} has no resident form in the `{}` layout",
+                stored.encoding,
+                form.layout.as_str()
+            )
+        })?;
     let source_bytes = representation_bytes(source, &stored.shape)?;
     if source_bytes != stored.nbytes {
         return Err(format!(
@@ -986,13 +1105,19 @@ mod representation_byte_tests {
         ] {
             for layout in Layout::ALL {
                 let element = resident_element(encoding, DType::BF16, layout).unwrap();
-                assert_eq!((element.representation(), element.layout()), (representation, layout));
+                assert_eq!(
+                    (element.representation(), element.layout()),
+                    (representation, layout)
+                );
             }
         }
         assert_eq!(
             resident_element(Encoding::F16, DType::BF16, Layout::Rows16),
             Some(Element::bf16())
         );
-        assert_eq!(resident_element(Encoding::Q3K, DType::BF16, Layout::Rows16), None);
+        assert_eq!(
+            resident_element(Encoding::Q3K, DType::BF16, Layout::Rows16),
+            None
+        );
     }
 }

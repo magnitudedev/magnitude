@@ -31,9 +31,7 @@ use seismic_compiler::{
     prepare_analytically, OptimizationCompletion, PlanningBudget, PreparationBudget,
 };
 use seismic_lang::checked::CheckedModule;
-use seismic_lang::entry::{
-    CallSchema, ElementBindings, ParameterKind, TensorAccess,
-};
+use seismic_lang::entry::{CallSchema, ElementBindings, ParameterKind, TensorAccess};
 use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::{EntryId, ModuleHash, RepresentationId, StableEntryId};
@@ -174,10 +172,7 @@ where
     pub(crate) fn memory_usage(&self) -> MemoryUsage {
         self.memory.usage()
     }
-    pub(crate) fn set_memory_limit(
-        &self,
-        limit: Option<u64>,
-    ) -> Result<(), crate::memory::MemoryLimitError> {
+    pub(crate) fn set_memory_limit(&self, limit: Option<u64>) {
         self.memory.set_limit(limit)
     }
     pub(crate) fn allocate_storage(
@@ -185,7 +180,9 @@ where
         bytes: u64,
         alignment: u64,
     ) -> Result<Arc<Allocation>, ExecutionError> {
-        self.allocate_storage_with(bytes, alignment, |service| service.allocate(bytes, alignment))
+        self.allocate_storage_with(bytes, alignment, |service| {
+            service.allocate(bytes, alignment)
+        })
     }
 
     /// Charge and allocate storage whose buffer `make` forms, for backends
@@ -197,7 +194,95 @@ where
         make: impl FnOnce(&Service<T, E>) -> Result<Buffer<T, E>, ExecutionError>,
     ) -> Result<Arc<Allocation>, ExecutionError> {
         let mut reservation = reserve(&self.memory, bytes)?;
-        self.allocate_reserved_with(bytes, alignment, &mut reservation, make)
+        self.allocate_reserved_with(bytes, alignment, &mut reservation, false, make)
+    }
+
+    /// Recommit an exclusively owned reserved allocation. The backend keeps
+    /// its physical reservation, so only growth needs a new ledger grant;
+    /// shrink releases the difference after the backend has unmapped it.
+    pub(crate) fn recommit_storage_with(
+        self: &Arc<Self>,
+        old: &Arc<Allocation>,
+        bytes: u64,
+        alignment: u64,
+        make: impl FnOnce(&Service<T, E>) -> Result<Buffer<T, E>, ExecutionError>,
+        undo_growth: impl Fn(&Service<T, E>, &Buffer<T, E>, u64) -> Result<(), ExecutionError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Result<Arc<Allocation>, ExecutionError> {
+        let limits = self.device_description().limits();
+        let natural_max = if limits.max_index_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << limits.max_index_bits) - 1
+        };
+        let maximum = limits.max_allocation_bytes.min(natural_max);
+        if bytes > maximum {
+            return Err(ExecutionError::AllocationCapacity {
+                required: bytes.into(),
+                available: maximum,
+            });
+        }
+        if !alignment.is_power_of_two() || alignment > limits.max_allocation_alignment {
+            return Err(ExecutionError::ConstructionContradiction(format!(
+                "allocation alignment {alignment} exceeds target contract {}",
+                limits.max_allocation_alignment
+            )));
+        }
+        debug_assert_eq!(old.charged_bytes(), Some(old.bytes));
+        let growth = bytes.saturating_sub(old.bytes);
+        let mut grant = (growth != 0)
+            .then(|| reserve(&self.memory, growth))
+            .transpose()?;
+        let buffer = make(&self.service)?;
+        let rollback = (growth != 0).then(|| {
+            let service = self.service.clone();
+            let buffer = buffer.clone();
+            let old_bytes = old.bytes;
+            Box::new(move || undo_growth(&service, &buffer, old_bytes))
+                as Box<dyn Fn() -> Result<(), ExecutionError> + Send + Sync>
+        });
+        let storage = Box::new(TypedStorage::<T, E> {
+            service: self.service.clone(),
+            buffer,
+            read_only: false,
+        });
+        // `make` has finished the backend resize. Transfer the sole old
+        // charge only after that point; a recoverable failure leaves both
+        // the previous allocation and its charge intact.
+        let mut guard = old.charge.lock().expect("allocation charge lock poisoned");
+        let mut charge = guard
+            .take()
+            .expect("exclusive recommit must own its prior charge");
+        if growth != 0 {
+            grant
+                .as_mut()
+                .expect("growth grant exists")
+                .extend(&mut charge, growth);
+        } else {
+            charge.shrink(bytes);
+        }
+        let replacement = Allocation::new_recommitted(
+            fresh_allocation_identity(),
+            bytes,
+            charge,
+            storage,
+            old,
+            rollback,
+        );
+        drop(guard);
+        Ok(replacement)
+    }
+
+    pub(crate) fn allocate_read_only_storage_with(
+        self: &Arc<Self>,
+        bytes: u64,
+        alignment: u64,
+        make: impl FnOnce(&Service<T, E>) -> Result<Buffer<T, E>, ExecutionError>,
+    ) -> Result<Arc<Allocation>, ExecutionError> {
+        let mut reservation = reserve(&self.memory, bytes)?;
+        self.allocate_reserved_with(bytes, alignment, &mut reservation, true, make)
     }
 
     pub(crate) fn allocate_reserved(
@@ -206,7 +291,7 @@ where
         alignment: u64,
         reservation: &mut MemoryReservation,
     ) -> Result<Arc<Allocation>, ExecutionError> {
-        self.allocate_reserved_with(bytes, alignment, reservation, |service| {
+        self.allocate_reserved_with(bytes, alignment, reservation, false, |service| {
             service.allocate(bytes, alignment)
         })
     }
@@ -216,10 +301,15 @@ where
         bytes: u64,
         alignment: u64,
         reservation: &mut MemoryReservation,
+        read_only: bool,
         make: impl FnOnce(&Service<T, E>) -> Result<Buffer<T, E>, ExecutionError>,
     ) -> Result<Arc<Allocation>, ExecutionError> {
         let limits = self.device_description().limits();
-        let natural_max = if limits.max_index_bits >= 64 { u64::MAX } else { (1u64 << limits.max_index_bits) - 1 };
+        let natural_max = if limits.max_index_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << limits.max_index_bits) - 1
+        };
         let limits = AllocationLimits {
             max_allocation_bytes: limits.max_allocation_bytes.min(natural_max),
             max_allocation_alignment: limits.max_allocation_alignment,
@@ -229,6 +319,7 @@ where
             Ok(Box::new(TypedStorage::<T, E> {
                 service: self.service.clone(),
                 buffer,
+                read_only,
             }))
         })
     }
@@ -242,11 +333,16 @@ pub(crate) struct AllocationLimits {
 }
 
 /// Reserve `bytes` in `memory` for an allocation.
-pub(crate) fn reserve(memory: &Arc<MemoryDomain>, bytes: u64) -> Result<MemoryReservation, ExecutionError> {
-    memory.reserve(bytes).map_err(|capacity| ExecutionError::AllocationCapacity {
-        required: capacity.required.into(),
-        available: capacity.available,
-    })
+pub(crate) fn reserve(
+    memory: &Arc<MemoryDomain>,
+    bytes: u64,
+) -> Result<MemoryReservation, ExecutionError> {
+    memory
+        .reserve(bytes)
+        .map_err(|capacity| ExecutionError::AllocationCapacity {
+            required: capacity.required.into(),
+            available: capacity.available,
+        })
 }
 
 /// The backend-neutral allocation core: check `bytes` and `alignment`
@@ -260,14 +356,24 @@ pub(crate) fn allocate_reserved(
     make: impl FnOnce() -> Result<Box<dyn Storage>, ExecutionError>,
 ) -> Result<Arc<Allocation>, ExecutionError> {
     if bytes > limits.max_allocation_bytes {
-        return Err(ExecutionError::AllocationCapacity { required: bytes.into(), available: limits.max_allocation_bytes });
+        return Err(ExecutionError::AllocationCapacity {
+            required: bytes.into(),
+            available: limits.max_allocation_bytes,
+        });
     }
     if !alignment.is_power_of_two() || alignment > limits.max_allocation_alignment {
         return Err(ExecutionError::ConstructionContradiction(format!(
-            "allocation alignment {alignment} exceeds target contract {}", limits.max_allocation_alignment)));
+            "allocation alignment {alignment} exceeds target contract {}",
+            limits.max_allocation_alignment
+        )));
     }
     let storage = make()?;
-    Ok(Allocation::new(fresh_allocation_identity(), bytes, reservation.take(bytes), storage))
+    Ok(Allocation::new(
+        fresh_allocation_identity(),
+        bytes,
+        reservation.take(bytes),
+        storage,
+    ))
 }
 
 pub(crate) fn capability_summaries<T: TargetFamily>(device: &DeviceDescription<T>) -> Vec<String> {
@@ -290,11 +396,15 @@ pub(crate) trait Storage: Send + Sync {
     fn read(&self, offset: u64, into: &mut [u8]) -> Result<(), ExecutionError>;
     fn write(&self, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError>;
     fn as_any(&self) -> &dyn Any;
+    fn read_only(&self) -> bool {
+        false
+    }
 }
 
 struct TypedStorage<T: TargetFamily, E: NativeExecutor<T>> {
     service: Arc<Service<T, E>>,
     buffer: Buffer<T, E>,
+    read_only: bool,
 }
 
 impl<T: TargetFamily, E: NativeExecutor<T>> Storage for TypedStorage<T, E> {
@@ -302,10 +412,18 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Storage for TypedStorage<T, E> {
         self.service.read(&self.buffer, offset, into)
     }
     fn write(&self, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
+        if self.read_only {
+            return Err(ExecutionError::SubmissionFailed(
+                "write to read-only mapped storage".into(),
+            ));
+        }
         self.service.write(&self.buffer, offset, bytes)
     }
     fn as_any(&self) -> &dyn Any {
         self
+    }
+    fn read_only(&self) -> bool {
+        self.read_only
     }
 }
 
@@ -313,7 +431,11 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Storage for TypedStorage<T, E> {
 pub(crate) struct Allocation {
     identity: u64,
     bytes: u64,
-    _charge: MemoryCharge,
+    charge: Mutex<Option<MemoryCharge>>,
+    // An in-place replacement is tentative while its old allocation lives.
+    // Dropping unpublished growth restores the old physical prefix and charge.
+    predecessor: Option<Weak<Allocation>>,
+    rollback_growth: Option<Box<dyn Fn() -> Result<(), ExecutionError> + Send + Sync>>,
     storage: Box<dyn Storage>,
     access: Mutex<AllocationAccess>,
     access_changed: Condvar,
@@ -345,10 +467,18 @@ impl AllocationAccess {
     /// Forget completed fences. The newest use completes last, so once it
     /// has, no device work uses the allocation.
     fn prune(&mut self) {
-        if self.last_write.as_ref().is_some_and(|fence| fence.is_complete()) {
+        if self
+            .last_write
+            .as_ref()
+            .is_some_and(|fence| fence.is_complete())
+        {
             self.last_write = None;
         }
-        if self.last_use.as_ref().is_some_and(|fence| fence.is_complete()) {
+        if self
+            .last_use
+            .as_ref()
+            .is_some_and(|fence| fence.is_complete())
+        {
             self.last_use = None;
             self.last_write = None;
         }
@@ -375,7 +505,29 @@ impl Allocation {
         Arc::new(Self {
             identity,
             bytes,
-            _charge: charge,
+            charge: Mutex::new(Some(charge)),
+            predecessor: None,
+            rollback_growth: None,
+            storage,
+            access: Mutex::new(AllocationAccess::default()),
+            access_changed: Condvar::new(),
+        })
+    }
+
+    fn new_recommitted(
+        identity: u64,
+        bytes: u64,
+        charge: MemoryCharge,
+        storage: Box<dyn Storage>,
+        predecessor: &Arc<Self>,
+        rollback_growth: Option<Box<dyn Fn() -> Result<(), ExecutionError> + Send + Sync>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            identity,
+            bytes,
+            charge: Mutex::new(Some(charge)),
+            predecessor: Some(Arc::downgrade(predecessor)),
+            rollback_growth,
             storage,
             access: Mutex::new(AllocationAccess::default()),
             access_changed: Condvar::new(),
@@ -386,6 +538,16 @@ impl Allocation {
     }
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
+    }
+    pub(crate) fn charged_bytes(&self) -> Option<u64> {
+        self.charge
+            .lock()
+            .expect("allocation charge lock poisoned")
+            .as_ref()
+            .map(MemoryCharge::bytes)
+    }
+    pub(crate) fn has_live_predecessor(&self) -> bool {
+        self.predecessor.as_ref().and_then(Weak::upgrade).is_some()
     }
     pub(crate) fn storage(&self) -> &dyn Storage {
         &*self.storage
@@ -489,7 +651,10 @@ impl Allocation {
             .access
             .lock()
             .expect("tensor allocation access lock poisoned");
-        if state.writer || (write && state.readers != 0) || state.conflicting_device(write).is_some() {
+        if state.writer
+            || (write && state.readers != 0)
+            || state.conflicting_device(write).is_some()
+        {
             return None;
         }
         Some(self.grant(state, write))
@@ -506,6 +671,27 @@ impl Drop for Allocation {
         if let Some(fence) = state.last_use.take() {
             fence.wait_complete();
         }
+        // The caller publishes by dropping the predecessor after all planes
+        // are ready. If it is still live, this replacement was abandoned.
+        let Some(old) = self.predecessor.as_ref().and_then(Weak::upgrade) else {
+            return;
+        };
+        if let Some(rollback) = self.rollback_growth.as_ref() {
+            rollback()
+                .unwrap_or_else(|error| panic!("CUDA in-place growth rollback failed: {error}"));
+        } else {
+            assert_eq!(self.bytes, old.bytes, "discarded in-place shrink");
+        }
+        let mut charge = self
+            .charge
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("discarded recommit must own its charge");
+        charge.shrink(old.bytes);
+        let mut prior = old.charge.lock().expect("allocation charge lock poisoned");
+        assert!(prior.is_none(), "recommit predecessor already has a charge");
+        *prior = Some(charge);
     }
 }
 
@@ -521,10 +707,22 @@ impl AllocationPermit {
     pub(crate) fn owns(&self, allocation: &Arc<Allocation>) -> bool {
         Arc::ptr_eq(&self.allocation, allocation)
     }
-    pub(crate) fn read(&self, allocation: &Arc<Allocation>, offset: u64, into: &mut [u8]) -> Result<(), ExecutionError> {
-        assert!(self.owns(allocation), "allocation read uses a different allocation's permit");
-        assert!(offset.checked_add(into.len() as u64).is_some_and(|end| end <= allocation.bytes()),
-            "allocation read exceeds its admitted backing");
+    pub(crate) fn read(
+        &self,
+        allocation: &Arc<Allocation>,
+        offset: u64,
+        into: &mut [u8],
+    ) -> Result<(), ExecutionError> {
+        assert!(
+            self.owns(allocation),
+            "allocation read uses a different allocation's permit"
+        );
+        assert!(
+            offset
+                .checked_add(into.len() as u64)
+                .is_some_and(|end| end <= allocation.bytes()),
+            "allocation read exceeds its admitted backing"
+        );
         self.allocation.storage().read(offset, into)
     }
 }
@@ -552,7 +750,9 @@ impl Drop for AllocationPermit {
     }
 }
 
-pub(crate) fn typed_buffer<T: TargetFamily, E: NativeExecutor<T>>(allocation: &Allocation) -> &Buffer<T, E> {
+pub(crate) fn typed_buffer<T: TargetFamily, E: NativeExecutor<T>>(
+    allocation: &Allocation,
+) -> &Buffer<T, E> {
     &allocation.storage.as_any().downcast_ref::<TypedStorage<T, E>>()
         .unwrap_or_else(|| panic!("Tensor allocation backend invariant violated after successful WrongDevice validation"))
         .buffer
@@ -659,7 +859,9 @@ where
             let analytical = opened.analytical().map_err(|error| {
                 PrepareError::Preparation(
                     seismic_compiler::errors::PreparationError::NativeCompilation(
-                        seismic_native_target::NativeCompilationError::ToolchainFailure(error.to_string()),
+                        seismic_native_target::NativeCompilationError::ToolchainFailure(
+                            error.to_string(),
+                        ),
                     ),
                 )
             })?;
@@ -842,8 +1044,16 @@ pub(crate) struct PreparedHandle<T: TargetFamily, E: NativeExecutor<T>> {
 /// Executable allocation binding into the run-owned physical resource table.
 /// This carries no backing ownership; aliases share the same admitted slot.
 pub(crate) enum PhysicalBufferBinding {
-    Bound { allocation: u64, base_offset: u64, accessible_bytes: u64, tensor: Option<seismic_compiler::executable::RuntimeTensorGeometry> },
-    Reached { slot: u64, alignment: u64 },
+    Bound {
+        allocation: u64,
+        base_offset: u64,
+        accessible_bytes: u64,
+        tensor: Option<seismic_compiler::executable::RuntimeTensorGeometry>,
+    },
+    Reached {
+        slot: u64,
+        alignment: u64,
+    },
 }
 
 struct IssuedResources<'a, T: TargetFamily, E: NativeExecutor<T>> {
@@ -853,11 +1063,21 @@ struct IssuedResources<'a, T: TargetFamily, E: NativeExecutor<T>> {
     buffers: Vec<Option<RuntimeBuffer<Buffer<T, E>>>>,
 }
 
-impl<T: TargetFamily, E: NativeExecutor<T>> seismic_compiler::executable::ExecutionResources<Buffer<T, E>> for IssuedResources<'_, T, E> {
-    fn buffer(&self, allocation: seismic_compiler::executable::ExecutableAllocationId) -> &RuntimeBuffer<Buffer<T, E>> {
-        self.buffers[allocation.ordinal()].as_ref().expect("planned allocation used before its reached acquisition")
+impl<T: TargetFamily, E: NativeExecutor<T>>
+    seismic_compiler::executable::ExecutionResources<Buffer<T, E>> for IssuedResources<'_, T, E>
+{
+    fn buffer(
+        &self,
+        allocation: seismic_compiler::executable::ExecutableAllocationId,
+    ) -> &RuntimeBuffer<Buffer<T, E>> {
+        self.buffers[allocation.ordinal()]
+            .as_ref()
+            .expect("planned allocation used before its reached acquisition")
     }
-    fn retire_completed_instances(&mut self, allocations: &[seismic_compiler::executable::ExecutableAllocationId]) {
+    fn retire_completed_instances(
+        &mut self,
+        allocations: &[seismic_compiler::executable::ExecutableAllocationId],
+    ) {
         for allocation in allocations {
             let index = allocation.ordinal();
             if let PhysicalBufferBinding::Reached { slot, .. } = self.bindings[index] {
@@ -868,14 +1088,33 @@ impl<T: TargetFamily, E: NativeExecutor<T>> seismic_compiler::executable::Execut
             }
         }
     }
-    fn acquire_instance(&mut self, allocation: seismic_compiler::executable::ExecutableAllocationId, bytes: u64, alignment: u64) -> Result<(), ExecutionError> {
+    fn acquire_instance(
+        &mut self,
+        allocation: seismic_compiler::executable::ExecutableAllocationId,
+        bytes: u64,
+        alignment: u64,
+    ) -> Result<(), ExecutionError> {
         let index = allocation.ordinal();
-        let PhysicalBufferBinding::Reached { slot, alignment: planned_alignment } = self.bindings[index] else {
-            assert!(self.buffers[index].as_ref().expect("initial backing absent").accessible_bytes >= bytes,
-                "reached instance exceeds initial backing");
+        let PhysicalBufferBinding::Reached {
+            slot,
+            alignment: planned_alignment,
+        } = self.bindings[index]
+        else {
+            assert!(
+                self.buffers[index]
+                    .as_ref()
+                    .expect("initial backing absent")
+                    .accessible_bytes
+                    >= bytes,
+                "reached instance exceeds initial backing"
+            );
             return Ok(());
         };
-        if self.owner.private_backing(slot).is_some_and(|backing| backing.bytes() >= bytes) {
+        if self
+            .owner
+            .private_backing(slot)
+            .is_some_and(|backing| backing.bytes() >= bytes)
+        {
             return Ok(());
         }
         // The schedule has completed all prior users and excluded retained
@@ -883,9 +1122,18 @@ impl<T: TargetFamily, E: NativeExecutor<T>> seismic_compiler::executable::Execut
         self.buffers[index] = None;
         self.owner.retire_private(slot);
         self.owner.check_reached_capacity(bytes)?;
-        let backing = self.device.allocate_storage(bytes, alignment.max(planned_alignment))?;
-        let permit = backing.try_acquire(true).expect("fresh private backing cannot have an access owner");
-        let buffer = RuntimeBuffer { tensor: None, buffer: typed_buffer::<T, E>(&backing).clone(), base_offset: 0, accessible_bytes: bytes };
+        let backing = self
+            .device
+            .allocate_storage(bytes, alignment.max(planned_alignment))?;
+        let permit = backing
+            .try_acquire(true)
+            .expect("fresh private backing cannot have an access owner");
+        let buffer = RuntimeBuffer {
+            tensor: None,
+            buffer: typed_buffer::<T, E>(&backing).clone(),
+            base_offset: 0,
+            accessible_bytes: bytes,
+        };
         self.owner.install_private(slot, permit);
         self.buffers[index] = Some(buffer);
         Ok(())
@@ -921,7 +1169,11 @@ pub(crate) struct AdmittedCommand<T: TargetFamily, E: NativeExecutor<T>> {
 
 impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedCommand<T, E> {
     pub(crate) fn new(selected: Arc<SelectedExecutable<T, E>>, staged: Staged) -> Self {
-        Self { selected, staged, published: Vec::new() }
+        Self {
+            selected,
+            staged,
+            published: Vec::new(),
+        }
     }
     pub(crate) fn allocated_bytes(&self) -> u64 {
         self.staged.allocated_bytes
@@ -933,7 +1185,9 @@ impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedCommand<T, E> {
         &self.selected.output_device
     }
     pub(crate) fn published_allocation(&self, path: &[u32]) -> Option<usize> {
-        self.published.iter().find(|publication| publication.path == path)
+        self.published
+            .iter()
+            .find(|publication| publication.path == path)
             .map(|publication| publication.allocation.ordinal())
     }
     pub(crate) fn allocation_slot(&self, index: usize) -> u64 {
@@ -946,27 +1200,36 @@ impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedCommand<T, E> {
         &self,
         resources: &AdmittedResources,
     ) -> Result<Vec<(Vec<u32>, crate::execution::AdmittedOutput)>, ExecutionError> {
-        self.published.iter().map(|publication| {
-            let key = match self.staged.buffers[publication.allocation.ordinal()] {
-                PhysicalBufferBinding::Bound { allocation, .. } => allocation,
-                PhysicalBufferBinding::Reached { slot, .. } => slot,
-            };
-            let allocation = resources.allocation(key).clone();
-            if !publication.byte_offset.checked_add(publication.bytes)
-                .is_some_and(|end| end <= allocation.bytes()) {
-                return Err(ExecutionError::ConstructionContradiction(
-                    "published tensor exceeds its actual backing".into(),
-                ));
-            }
-            Ok((publication.path.clone(), crate::execution::AdmittedOutput::Tensor {
-                allocation,
-                byte_offset: publication.byte_offset,
-                byte_len: publication.bytes,
-                representation: publication.representation,
-                extents: publication.extents.clone(),
-                strides: publication.strides.clone(),
-            }))
-        }).collect()
+        self.published
+            .iter()
+            .map(|publication| {
+                let key = match self.staged.buffers[publication.allocation.ordinal()] {
+                    PhysicalBufferBinding::Bound { allocation, .. } => allocation,
+                    PhysicalBufferBinding::Reached { slot, .. } => slot,
+                };
+                let allocation = resources.allocation(key).clone();
+                if !publication
+                    .byte_offset
+                    .checked_add(publication.bytes)
+                    .is_some_and(|end| end <= allocation.bytes())
+                {
+                    return Err(ExecutionError::ConstructionContradiction(
+                        "published tensor exceeds its actual backing".into(),
+                    ));
+                }
+                Ok((
+                    publication.path.clone(),
+                    crate::execution::AdmittedOutput::Tensor {
+                        allocation,
+                        byte_offset: publication.byte_offset,
+                        byte_len: publication.bytes,
+                        representation: publication.representation,
+                        extents: publication.extents.clone(),
+                        strides: publication.strides.clone(),
+                    },
+                ))
+            })
+            .collect()
     }
     pub(crate) fn issue(
         &mut self,
@@ -975,21 +1238,50 @@ impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedCommand<T, E> {
         resources: &mut AdmittedResources,
         opened: &Arc<Opened<T, E>>,
     ) -> Result<(), ExecutionError> {
-        let buffers = self.staged.buffers.iter().map(|binding| match binding {
-            PhysicalBufferBinding::Bound { allocation, base_offset, accessible_bytes, tensor } => {
-                let allocation = resources.allocation(*allocation);
-                assert!(base_offset.checked_add(*accessible_bytes).is_some_and(|end| end <= allocation.bytes()),
-                    "staged binding exceeds its admitted physical slot");
-                Some(RuntimeBuffer { tensor: tensor.clone(), buffer: typed_buffer::<T, E>(allocation).clone(), base_offset: *base_offset, accessible_bytes: *accessible_bytes })
-            }
-            PhysicalBufferBinding::Reached { slot, .. } => {
-                resources.declare_private(*slot);
-                resources.private_backing(*slot).map(|allocation| RuntimeBuffer {
-                    tensor: None, buffer: typed_buffer::<T, E>(allocation).clone(), base_offset: 0, accessible_bytes: allocation.bytes(),
-                })
-            }
-        }).collect();
-        let mut resources = IssuedResources { owner: resources, device: opened, bindings: &self.staged.buffers, buffers };
+        let buffers = self
+            .staged
+            .buffers
+            .iter()
+            .map(|binding| match binding {
+                PhysicalBufferBinding::Bound {
+                    allocation,
+                    base_offset,
+                    accessible_bytes,
+                    tensor,
+                } => {
+                    let allocation = resources.allocation(*allocation);
+                    assert!(
+                        base_offset
+                            .checked_add(*accessible_bytes)
+                            .is_some_and(|end| end <= allocation.bytes()),
+                        "staged binding exceeds its admitted physical slot"
+                    );
+                    Some(RuntimeBuffer {
+                        tensor: tensor.clone(),
+                        buffer: typed_buffer::<T, E>(allocation).clone(),
+                        base_offset: *base_offset,
+                        accessible_bytes: *accessible_bytes,
+                    })
+                }
+                PhysicalBufferBinding::Reached { slot, .. } => {
+                    resources.declare_private(*slot);
+                    resources
+                        .private_backing(*slot)
+                        .map(|allocation| RuntimeBuffer {
+                            tensor: None,
+                            buffer: typed_buffer::<T, E>(allocation).clone(),
+                            base_offset: 0,
+                            accessible_bytes: allocation.bytes(),
+                        })
+                }
+            })
+            .collect();
+        let mut resources = IssuedResources {
+            owner: resources,
+            device: opened,
+            bindings: &self.staged.buffers,
+            buffers,
+        };
         self.published = execute_variant(
             &self.selected.executable,
             submission,
@@ -1025,7 +1317,10 @@ impl<T: TargetFamily, E: NativeExecutor<T>> PreparedHandle<T, E> {
 }
 
 /// Access collection for the deliberately separate authored-native route.
-pub(crate) fn collect_native_access(schema: &CallSchema, args: &EncodedArgs) -> Vec<(Arc<Allocation>, bool)> {
+pub(crate) fn collect_native_access(
+    schema: &CallSchema,
+    args: &EncodedArgs,
+) -> Vec<(Arc<Allocation>, bool)> {
     let mut merged: BTreeMap<u64, (Arc<Allocation>, bool)> = BTreeMap::new();
     for (parameter, tensor) in schema.parameters().iter().zip(args.tensors()) {
         let (ParameterKind::Tensor { access, .. }, Some(tensor)) = (&parameter.kind, tensor) else {
@@ -1068,12 +1363,72 @@ mod feedback;
 #[cfg(test)]
 mod physical_slot_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct EmptyStorage;
     impl Storage for EmptyStorage {
-        fn read(&self, _: u64, _: &mut [u8]) -> Result<(), ExecutionError> { Ok(()) }
-        fn write(&self, _: u64, _: &[u8]) -> Result<(), ExecutionError> { Ok(()) }
-        fn as_any(&self) -> &dyn Any { self }
+        fn read(&self, _: u64, _: &mut [u8]) -> Result<(), ExecutionError> {
+            Ok(())
+        }
+        fn write(&self, _: u64, _: &[u8]) -> Result<(), ExecutionError> {
+            Ok(())
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn discarded_in_place_growth_restores_predecessor_charge() {
+        let memory = MemoryDomain::new(crate::memory::PoolLedger::new());
+        let mut initial = memory.reserve(8).unwrap();
+        let old = Allocation::new(1, 8, initial.take(8), Box::new(EmptyStorage));
+        drop(initial);
+        let mut growth = memory.reserve(8).unwrap();
+        let mut charge = old.charge.lock().unwrap().take().unwrap();
+        growth.extend(&mut charge, 8);
+        drop(growth);
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let observed = rollbacks.clone();
+        let tentative = Allocation::new_recommitted(
+            2,
+            16,
+            charge,
+            Box::new(EmptyStorage),
+            &old,
+            Some(Box::new(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })),
+        );
+        assert_eq!(memory.usage().charged, 16);
+        assert_eq!(old.charged_bytes(), None);
+        drop(tentative);
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(old.charged_bytes(), Some(8));
+        assert_eq!(memory.usage().charged, 8);
+        drop(old);
+        assert_eq!(memory.usage().charged, 0);
+
+        let mut initial = memory.reserve(8).unwrap();
+        let old = Allocation::new(3, 8, initial.take(8), Box::new(EmptyStorage));
+        drop(initial);
+        let mut growth = memory.reserve(8).unwrap();
+        let mut charge = old.charge.lock().unwrap().take().unwrap();
+        growth.extend(&mut charge, 8);
+        drop(growth);
+        let published = Allocation::new_recommitted(
+            4,
+            16,
+            charge,
+            Box::new(EmptyStorage),
+            &old,
+            Some(Box::new(|| panic!("published growth must not roll back"))),
+        );
+        drop(old);
+        assert_eq!(published.charged_bytes(), Some(16));
+        drop(published);
+        assert_eq!(memory.usage().charged, 0);
     }
 
     #[test]
@@ -1087,7 +1442,9 @@ mod physical_slot_tests {
         drop(allocation);
         assert_eq!(memory.usage().charged, 16);
         assert!(resources.allocation(1).try_acquire(false).is_none());
-        assert!(resources.access(resources.allocation(1)).owns(resources.allocation(1)));
+        assert!(resources
+            .access(resources.allocation(1))
+            .owns(resources.allocation(1)));
         drop(resources);
         assert!(weak.upgrade().is_none());
         assert_eq!(memory.usage().charged, 0);
@@ -1097,13 +1454,23 @@ mod physical_slot_tests {
     fn native_allocation_owner_enforces_target_limits_without_leaking_reservation() {
         let catalog = crate::devices::Catalog::discover().unwrap();
         let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
-        let crate::backends::OpenedKind::Cpu(opened) = &device.kind else { unreachable!() };
+        let crate::backends::OpenedKind::Cpu(opened) = &device.kind else {
+            unreachable!()
+        };
         let baseline = opened.memory_usage().charged;
         let maximum = opened.device_description().limits().max_allocation_bytes;
-        let error = opened.allocate_storage(maximum.checked_add(1).unwrap(), 4).err().expect("target limit is enforced before allocating");
-        assert!(matches!(error, ExecutionError::AllocationCapacity { required, available } if required == (maximum + 1).into() && available == maximum));
+        let error = opened
+            .allocate_storage(maximum.checked_add(1).unwrap(), 4)
+            .err()
+            .expect("target limit is enforced before allocating");
+        assert!(
+            matches!(error, ExecutionError::AllocationCapacity { required, available } if required == (maximum + 1).into() && available == maximum)
+        );
         assert_eq!(opened.memory_usage().charged, baseline);
-        assert!(matches!(opened.allocate_storage(4, 0), Err(ExecutionError::ConstructionContradiction(_))));
+        assert!(matches!(
+            opened.allocate_storage(4, 0),
+            Err(ExecutionError::ConstructionContradiction(_))
+        ));
         assert_eq!(opened.memory_usage().charged, baseline);
     }
 
@@ -1122,8 +1489,18 @@ mod physical_slot_tests {
         resources.check_reached_capacity(16).unwrap();
         resources.install_private(100, first.acquire(true));
         drop(first);
-        assert_eq!(resources.check_reached_capacity(16), Err(ExecutionError::AllocationCapacity { required: 16u64.into(), available: 8 }));
-        assert!(resources.private_backing(100).unwrap().try_acquire(false).is_none());
+        assert_eq!(
+            resources.check_reached_capacity(16),
+            Err(ExecutionError::AllocationCapacity {
+                required: 16u64.into(),
+                available: 8
+            })
+        );
+        assert!(resources
+            .private_backing(100)
+            .unwrap()
+            .try_acquire(false)
+            .is_none());
         resources.retire_private(100);
         assert_eq!(memory.usage().charged, 0);
         resources.check_reached_capacity(24).unwrap();
@@ -1139,10 +1516,12 @@ mod physical_slot_tests {
     #[test]
     fn completed_dead_bank_releases_device_capacity_without_releasing_live_bank() {
         let memory = MemoryDomain::new(crate::memory::PoolLedger::new());
-        memory.set_limit(Some(24)).unwrap();
+        memory.set_limit(Some(24));
         let mut resources = AdmittedResources::new(memory.reserve(0).unwrap(), vec![]);
         resources.set_reached_budget(24);
-        for slot in [100, 101, 102] { resources.declare_private(slot); }
+        for slot in [100, 101, 102] {
+            resources.declare_private(slot);
+        }
         let make = |id, bytes| {
             let mut reservation = memory.reserve(bytes).unwrap();
             Allocation::new(id, bytes, reservation.take(bytes), Box::new(EmptyStorage))
@@ -1167,7 +1546,11 @@ mod physical_slot_tests {
         resources.install_private(102, replacement.acquire(true));
         drop(replacement);
         assert_eq!(memory.usage().charged, 24);
-        assert!(resources.private_backing(101).unwrap().try_acquire(false).is_none());
+        assert!(resources
+            .private_backing(101)
+            .unwrap()
+            .try_acquire(false)
+            .is_none());
         assert!(memory.reserve(1).is_err());
         drop(resources);
         assert_eq!(memory.usage().charged, 0);
@@ -1183,7 +1566,9 @@ mod physical_slot_tests {
         let published = resources.allocation(1).clone();
         drop(resources);
         assert_eq!(memory.usage().charged, 16);
-        let read = published.try_acquire(false).expect("completed run released its exclusive access");
+        let read = published
+            .try_acquire(false)
+            .expect("completed run released its exclusive access");
         drop(read);
         drop(published);
         assert_eq!(memory.usage().charged, 0);

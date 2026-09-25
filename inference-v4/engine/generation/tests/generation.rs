@@ -242,11 +242,9 @@ fn prepared_transition_does_not_change_live_generation_until_commit() {
         reject: Some(TokenId(12)),
     })));
     start(&mut generation, 2);
-    assert!(
-        generation
-            .prepare_round_transition(RequestId(1), &[TokenId(12)], None, &mut Rows)
-            .is_err()
-    );
+    assert!(generation
+        .prepare_round_transition(RequestId(1), &[TokenId(12)], None, &mut Rows)
+        .is_err());
     assert_eq!(generation.finish_reason(), None);
     assert_eq!(generation.resident_position(), 0);
     assert!(generation.awaiting_completion());
@@ -298,6 +296,8 @@ fn eviction_discards_suspended_work_and_replays_through_rounds() {
     }
     assert_eq!(generation.resident_position(), 2);
     assert_eq!(generation.generated(), [TokenId(10)]);
+    let decode = start(&mut generation, 1);
+    assert_eq!(decode.kind, WorkKind::Decode);
 }
 
 #[test]
@@ -306,17 +306,20 @@ fn eviction_resumes_from_a_retained_prefix_and_replays_the_rest() {
     prefill(&mut generation, 10);
     let checkpoint = generation.method_checkpoint().unwrap();
     generation.evicted().unwrap();
-    // Accepted input: the prompt and the sampled token, three rows.
+    // Accepted input includes the sampled successor, while the numerical
+    // prefix still ends at the two consumed prompt rows.
     assert!(generation.restored_at(4, &checkpoint).is_err());
     generation.restored_at(1, &checkpoint).unwrap();
     assert!(generation.restored_at(1, &checkpoint).is_err());
     assert_eq!(generation.resident_position(), 1);
     let replay = start(&mut generation, 4);
     assert_eq!(replay.kind, WorkKind::Replay);
-    assert_eq!(replay.tokens, [TokenId(2), TokenId(10)]);
+    assert_eq!(replay.tokens, [TokenId(2)]);
     resolve(&mut generation, &[], None);
-    assert_eq!(generation.resident_position(), 3);
+    assert_eq!(generation.resident_position(), 2);
     assert_eq!(generation.generated(), [TokenId(10)]);
+    let decode = start(&mut generation, 1);
+    assert_eq!(decode.kind, WorkKind::Decode);
 }
 
 fn mtp_generation(prompt: &[u32], proposals: u8) -> Generation {
@@ -383,7 +386,10 @@ fn prefill_chunks_enter_target_conditioned_pairs_and_keep_the_anchor() {
         panic!("a non-final chunk enters its complete pairs")
     };
     let (tokens, rows, position, proposals) = head_parts(head);
-    assert_eq!((tokens, rows, position), (vec![TokenId(2)], vec![(5, 0)], 0));
+    assert_eq!(
+        (tokens, rows, position),
+        (vec![TokenId(2)], vec![(5, 0)], 0)
+    );
     assert!(proposals.is_empty());
     reconcile_head(&mut generation, head, &[]);
     // Final chunk: row 3 selects 10. Pairs (3, f5.1) are entered; the anchor
@@ -394,14 +400,20 @@ fn prefill_chunks_enter_target_conditioned_pairs_and_keep_the_anchor() {
         panic!("the final chunk enters all but the anchor")
     };
     let (tokens, rows, position, _) = head_parts(head);
-    assert_eq!((tokens, rows, position), (vec![TokenId(3)], vec![(5, 1)], 1));
+    assert_eq!(
+        (tokens, rows, position),
+        (vec![TokenId(3)], vec![(5, 1)], 1)
+    );
     reconcile_head(&mut generation, head, &[]);
     generation.take(4).unwrap();
     let RoundStart::Method(draft) = generation.start_round(request, 4).unwrap() else {
         panic!("decode drafts first")
     };
     let (tokens, rows, position, proposals) = head_parts(&draft[0]);
-    assert_eq!((tokens, rows, position), (vec![TokenId(10)], vec![(6, 0)], 2));
+    assert_eq!(
+        (tokens, rows, position),
+        (vec![TokenId(10)], vec![(6, 0)], 2)
+    );
     // Proposal selections share the target's keys at the same output rows.
     assert_eq!(
         proposals
@@ -506,15 +518,13 @@ fn checkpoints_carry_host_rows_and_restore_at_their_target_boundary() {
 fn mtp_choice_requires_an_injected_factory() {
     let mut configured = options();
     configured.method = MethodChoice::Mtp { proposals: 2 };
-    assert!(
-        Generation::new(
-            vec![TokenId(1), TokenId(2)],
-            InputLayout::new(2, vec![]).unwrap(),
-            configured,
-            None,
-        )
-        .is_err()
-    );
+    assert!(Generation::new(
+        vec![TokenId(1), TokenId(2)],
+        InputLayout::new(2, vec![]).unwrap(),
+        configured,
+        None,
+    )
+    .is_err());
 }
 
 struct PrimeMethod {

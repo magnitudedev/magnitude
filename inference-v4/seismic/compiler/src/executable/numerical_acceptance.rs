@@ -12,16 +12,28 @@ impl<T: TargetFamily> CompiledCandidate<T> {
         arena: &mut ExprArena,
         policy: &PrecisionPolicy,
     ) -> Option<RetainedCandidate<T>> {
-        let basis = self.implementation.numerical_applicability().basis(policy)?;
+        let basis = self
+            .implementation
+            .numerical_applicability()
+            .basis(policy)?;
         let guard = arena.compile_bool_with(self.safety, &self.fixed);
-        if guard.reads().is_empty() && !guard.evaluate(&InvocationValues::new()).expect("closed candidate guard") {
+        if guard.reads().is_empty()
+            && !guard
+                .evaluate(&InvocationValues::new())
+                .expect("closed candidate guard")
+        {
             return None;
         }
         Some(RetainedCandidate {
             body: self.body.clone(),
             native: self.native.clone(),
             admission: Arc::new(NumericalAcceptance {
-                assessment: NumericalAssessment { regions:vec![NumericalRegion {scope:guard.clone(),basis}] },
+                assessment: NumericalAssessment {
+                    regions: vec![NumericalRegion {
+                        scope: guard.clone(),
+                        basis,
+                    }],
+                },
                 guard,
             }),
         })

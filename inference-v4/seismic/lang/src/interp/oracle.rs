@@ -1434,7 +1434,10 @@ pub(crate) fn repack_bytes(
     // `destination` is the packet form; a row layout places it.
     match destination_kind {
         RepresentationKind::PackedRows(layout) => layout.place(
-            &shape.iter().map(|extent| *extent as u64).collect::<Vec<_>>(),
+            &shape
+                .iter()
+                .map(|extent| *extent as u64)
+                .collect::<Vec<_>>(),
             &destination,
         ),
         _ => destination,

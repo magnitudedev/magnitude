@@ -5,21 +5,20 @@
 use crate::batching::{
     Draw, DrawKind, Row, Select, Shaping as RowShaping, Slot, ValidatedTargetBatch,
 };
+use crate::memory::{HoldingClass, HoldingId, MemoryHeap, MemoryObservation, Pressure};
 use crate::programs::ProgramSubmission;
 use crate::{
     AllocatedResources, AttestedPrograms, CapacityError, Completion, ComponentLoader,
-    ExecutionPlan, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, GroupKey,
-    HeadLaunchInputs, ImageRef, NativeGraphOutputLease, NativeGraphWorkspaceLease, Operation,
-    Outcome, PoolClass, ProgramIdentity, RequestId, ResidentHead, ResidentVision, ResourceDomain,
-    ResourceDomainId, ResourceKind, RowResult, Selected, StateLaunchInputs, StateWork,
-    TargetLaunchInputs, TargetTokens,
-    ValidatedHeadLaunch,
-    ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch, VisionLaunchInputs,
-    WorkKind,
+    ExecutionPlan, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, GroupKey, HeadLaunchInputs,
+    ImageRef, NativeGraphOutputLease, NativeGraphWorkspaceLease, Operation, Outcome, PoolClass,
+    ProgramIdentity, RequestId, ResidentHead, ResidentVision, ResourceDomain, ResourceDomainId,
+    ResourceKind, RowResult, Selected, StateLaunchInputs, StateWork, TargetLaunchInputs,
+    TargetTokens, ValidatedHeadLaunch, ValidatedStateLaunch, ValidatedTargetLaunch,
+    ValidatedVisionLaunch, VisionLaunchInputs, WorkKind,
 };
 use magnitude_model_contracts::{ModelDefinition, PreparedModelInput, TextCoordinateSemantics};
 use magnitude_model_state::{
-    Holder, OwnedAdvanceResolution, OwnedCompaction, OwnedCompactionPreparation,
+    Holder, InFlightState, OwnedAdvanceResolution, OwnedCompaction, OwnedCompactionPreparation,
     OwnedStateAdvance, SequenceState, StateCheckpoint, StateStore, TentativeAdvance,
 };
 use seismic::Tensor;
@@ -42,9 +41,11 @@ pub use family::{NativeFamily, ProgramFamily};
 use in_flight::decode_selected;
 pub use in_flight::{HeadFlight, TargetFlight, VisionFlight};
 pub use ownership::{OpenRequirements, OpenReservation};
+pub use state::MemoryChargeReconciliation;
 pub use target::TargetHostTiming;
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     rc::Rc,
     time::{Duration, Instant},
@@ -59,6 +60,12 @@ pub struct PhysicalDecision {
 #[derive(Clone, Debug)]
 pub enum DomainError {
     Capacity(crate::CapacityError),
+    /// A required device-memory observation failed. This is not a demand
+    /// deficit: reclaiming another request cannot make the reading valid.
+    Blind(String),
+    /// The platform reports actual pressure; request growth waits while
+    /// reclaimable holdings are released.
+    Pressure(seismic::PressureLevel),
     Input(String),
     State(magnitude_model_state::Error),
     Submit(crate::SubmitError),
@@ -79,6 +86,8 @@ impl std::fmt::Display for DomainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Capacity(error) => error.fmt(f),
+            Self::Blind(message) => write!(f, "device memory observation unavailable: {message}"),
+            Self::Pressure(level) => write!(f, "platform memory pressure is {level:?}"),
             Self::Input(message) => f.write_str(message),
             Self::State(error) => error.fmt(f),
             Self::Submit(error) => error.fmt(f),
@@ -115,6 +124,23 @@ impl From<crate::SubmitError> for DomainError {
 impl From<magnitude_model_state::Error> for DomainError {
     fn from(error: magnitude_model_state::Error) -> Self {
         match error {
+            magnitude_model_state::Error::Tensor(seismic::TensorError::Execution(
+                seismic::ExecutionError::AllocationCapacity {
+                    required,
+                    available,
+                },
+            )) => Self::Capacity(crate::CapacityError {
+                resource: crate::ResourceKind::DeviceMemory,
+                required: u64::try_from(&required).unwrap_or(u64::MAX),
+                available,
+            }),
+            magnitude_model_state::Error::Tensor(seismic::TensorError::Execution(
+                seismic::ExecutionError::AllocationFailed(_),
+            )) => Self::Capacity(crate::CapacityError {
+                resource: crate::ResourceKind::DeviceMemory,
+                required: 1,
+                available: 0,
+            }),
             magnitude_model_state::Error::Capacity {
                 required,
                 available_bytes,
@@ -302,8 +328,15 @@ impl DomainCheckpoint {
                 .ok_or("checkpoint byte count overflow")?;
         }
         let mut media: Vec<&Tensor> = Vec::new();
-        for input in set.iter().filter_map(|checkpoint| checkpoint.input.as_ref()) {
-            for feature in input.images.values().filter_map(|image| image.features.as_ref()) {
+        for input in set
+            .iter()
+            .filter_map(|checkpoint| checkpoint.input.as_ref())
+        {
+            for feature in input
+                .images
+                .values()
+                .filter_map(|image| image.features.as_ref())
+            {
                 let tensor = feature
                     .allocation()
                     .tensor()
@@ -328,6 +361,10 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     definition: Rc<ModelDefinition>,
     resources: AllocatedResources,
     domain: ResourceDomain,
+    memory_catalog: Option<seismic::DeviceCatalog>,
+    memory: Rc<RefCell<MemoryHeap>>,
+    static_holding: Option<HoldingId>,
+    optional_holding: Option<HoldingId>,
     target_store: Rc<StateStore>,
     head_store: Option<Rc<StateStore>>,
     family: F,
@@ -354,6 +391,27 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
 }
 
 impl ExecutorDomain<NativeFamily> {
+    /// Reuse the worker's selected-device catalog for subsequent live memory
+    /// observations instead of rediscovering devices on the first request.
+    pub fn install_memory_catalog(&mut self, catalog: seismic::DeviceCatalog) {
+        self.memory_catalog = Some(catalog);
+    }
+
+    /// Classify the allocations that are already physically committed before
+    /// any request reservation begins. The byte total comes from the actual
+    /// graph pools and state stores; Seismic remains the charge authority.
+    pub fn register_allocated_holdings(&mut self) -> Result<HoldingId, String> {
+        self.refresh_memory()?;
+        let static_bytes = self.static_holding_bytes()?;
+        let holding = self
+            .memory
+            .borrow_mut()
+            .insert(static_bytes, HoldingClass::Model)
+            .map_err(|error| format!("static memory holding rejected: {error:?}"))?;
+        self.static_holding = Some(holding);
+        Ok(holding)
+    }
+
     pub fn new(
         execution: Rc<ExecutionPlan>,
         definition: Rc<ModelDefinition>,
@@ -391,6 +449,135 @@ impl ExecutorDomain<NativeFamily> {
 }
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
+    /// Return every byte that remains resident as part of the model's static
+    /// footprint.  This is the single accounting path used both when the
+    /// holding is first registered and whenever lazy state/program binding
+    /// changes the footprint.
+    fn static_holding_bytes(&self) -> Result<u64, String> {
+        let mut bytes = self
+            .resources
+            .committed_bytes()
+            .map_err(|error| error.to_owned())?;
+        bytes = bytes
+            .checked_add(self.target_store.committed_bytes())
+            .ok_or_else(|| "static holding byte count overflow".to_owned())?;
+        if let Some(store) = &self.head_store {
+            bytes = bytes
+                .checked_add(store.committed_bytes())
+                .ok_or_else(|| "static holding byte count overflow".to_owned())?;
+        }
+        Ok(bytes)
+    }
+
+    pub(super) fn sync_optional_holding(&mut self) -> Result<(), String> {
+        if !self.memory.borrow().is_observed() {
+            return Ok(());
+        }
+        let target_weights = self.family.target_weight_bytes()?;
+        let head_weights = self
+            .head_loader
+            .as_ref()
+            .map(|loader| {
+                loader
+                    .resident_bytes()?
+                    .checked_sub(target_weights)
+                    .ok_or("head residency cache omits a target allocation")
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let vision_weights = self
+            .vision_loader
+            .as_ref()
+            .map(|loader| loader.resident_bytes())
+            .transpose()?
+            .unwrap_or(0);
+        let bound_constants = self.family.bound_constant_bytes()?;
+        let bytes = head_weights
+            .checked_add(vision_weights)
+            .and_then(|weights| weights.checked_add(bound_constants))
+            .ok_or_else(|| "optional holding byte count overflow".to_owned())?;
+        match (self.optional_holding, bytes) {
+            (Some(id), 0) => {
+                self.memory
+                    .borrow_mut()
+                    .remove(id)
+                    .map_err(|error| format!("optional holding release rejected: {error:?}"))?;
+                self.optional_holding = None;
+            }
+            (Some(id), bytes) => self
+                .memory
+                .borrow_mut()
+                .resize(id, bytes)
+                .map_err(|error| format!("optional holding update rejected: {error:?}"))?,
+            (None, 0) => {}
+            (None, bytes) => {
+                let id = self
+                    .memory
+                    .borrow_mut()
+                    .insert(bytes, HoldingClass::Dormant)
+                    .map_err(|error| format!("optional holding rejected: {error:?}"))?;
+                self.optional_holding = Some(id);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn sync_static_holding(&mut self) -> Result<(), String> {
+        let Some(holding) = self.static_holding else {
+            return Ok(());
+        };
+        let bytes = self.static_holding_bytes()?;
+        self.memory
+            .borrow_mut()
+            .resize(holding, bytes)
+            .map_err(|error| format!("static memory holding update rejected: {error:?}"))
+    }
+
+    /// Refresh the engine policy view from the same device facts used to set
+    /// Seismic's allocation ceiling. Seismic remains the physical charge
+    /// authority; this heap only classifies ownership and issues claims.
+    pub fn refresh_memory(&mut self) -> Result<(), String> {
+        let catalog = self
+            .memory_catalog
+            .as_ref()
+            .ok_or_else(|| "memory catalog has not been installed".to_owned())?;
+        let device = self.domain.device();
+        let capacity = crate::platform::assessment_capacity(
+            &catalog.topology(),
+            device.info(),
+            &catalog
+                .host_memory_status()
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let (available_bytes, pressure) =
+            match crate::platform::growth_availability(catalog, device) {
+                Ok(available) => (available.bytes, Pressure::Normal),
+                Err(crate::platform::MemoryPolicyError::Pressure(level)) => {
+                    let pressure = match level {
+                        seismic::PressureLevel::Emergency => Pressure::Emergency,
+                        seismic::PressureLevel::Pressure => Pressure::Pressure,
+                        _ => Pressure::Blind,
+                    };
+                    (0, pressure)
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+        self.memory
+            .borrow_mut()
+            .observe(MemoryObservation {
+                capacity_bytes: capacity,
+                available_bytes,
+                charged_bytes: device.memory_usage().charged,
+                pressure,
+            })
+            .map_err(|error| format!("memory observation rejected: {error:?}"))
+    }
+
+    pub fn memory(&self) -> std::cell::Ref<'_, MemoryHeap> {
+        self.memory.borrow()
+    }
+
     pub fn requirements(
         &self,
         operations: &[Operation],
@@ -644,6 +831,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     pub fn reserve(&mut self, operations: &[Operation]) -> Result<DomainReservation, DomainError> {
+        if self.memory_catalog.is_some() {
+            self.refresh_memory().map_err(DomainError::Input)?;
+        }
         let requirements = self.requirements(operations)?;
         if requirements.claim {
             let slots = self
@@ -654,6 +844,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 resources: ReservedResources::Target(TargetGraphReservation::Claim(slots)),
             });
         }
+        // Commit the selected group's numerical backing before a lazy
+        // component import. Provisioning grants the physical growth peak
+        // through the heap before any backing allocation.
+        self.provision(operations)?;
+        self.sync_static_holding().map_err(DomainError::Input)?;
         match requirements.lane {
             ReservationLane::Head if !self.family.head_is_bound() => {
                 let resident = self
@@ -675,8 +870,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             _ => {}
         }
-        // Every advance of the group begins against backing committed now.
-        self.provision(operations)?;
+        self.sync_static_holding().map_err(DomainError::Input)?;
+        self.sync_optional_holding().map_err(DomainError::Input)?;
         self.can_reserve(&requirements)
             .map_err(DomainError::Capacity)?;
         let invariant = |detail: &str, error: CapacityError| {
@@ -705,15 +900,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 let readout_output = readout
                     .acquire_output()
                     .map_err(|error| invariant("target readout output", error))?;
-                ReservedResources::Target(TargetGraphReservation::Launch(
-                    TargetLaunchReservation {
-                        advances: Vec::with_capacity(operations.len()),
-                        graph_workspace,
-                        graph_outputs,
-                        readout_workspace,
-                        readout_output,
-                    },
-                ))
+                ReservedResources::Target(TargetGraphReservation::Launch(TargetLaunchReservation {
+                    advances: Vec::with_capacity(operations.len()),
+                    graph_workspace,
+                    graph_outputs,
+                    readout_workspace,
+                    readout_output,
+                }))
             }
             ReservationLane::Head => {
                 let graph = self.resources.head_graph().expect("checked head graph");
@@ -741,10 +934,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         let mut resources = resources;
         match &mut resources {
-            ReservedResources::Target(TargetGraphReservation::Launch(TargetLaunchReservation {
-                advances,
-                ..
-            })) => {
+            ReservedResources::Target(TargetGraphReservation::Launch(
+                TargetLaunchReservation { advances, .. },
+            )) => {
                 for operation in operations {
                     let request = operation.request();
                     let state = self
@@ -822,6 +1014,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             definition,
             resources,
             domain: ResourceDomain::new(id, device),
+            memory_catalog: None,
+            memory: Rc::new(RefCell::new(MemoryHeap::new())),
+            static_holding: None,
+            optional_holding: None,
             target_store,
             head_store,
             family,

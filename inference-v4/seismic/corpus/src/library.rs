@@ -28,8 +28,7 @@ pub struct LibraryInvocation {
 }
 
 pub fn load(path: &Path) -> LibraryFile {
-    let text = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     parse(&path.display().to_string(), &text)
 }
 
@@ -125,7 +124,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "std.invocations:1: `# origin:H-24` is not `# origin: <origin> ...`")]
     fn origin_without_space_panics() {
-        parse("std.invocations", "# origin:H-24\nargmax_row: i32[1]=zero\n");
+        parse(
+            "std.invocations",
+            "# origin:H-24\nargmax_row: i32[1]=zero\n",
+        );
     }
 
     #[test]
@@ -137,6 +139,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "engine.invocations:2: `# origin:` is not followed by an invocation")]
     fn dangling_origin_panics() {
-        parse("engine.invocations", "argmax_row: i32[1]=zero\n# origin: H-27\n");
+        parse(
+            "engine.invocations",
+            "argmax_row: i32[1]=zero\n# origin: H-27\n",
+        );
     }
 }

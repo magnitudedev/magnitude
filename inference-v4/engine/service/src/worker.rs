@@ -14,7 +14,7 @@ use std::{
     sync::{Arc, Condvar, Mutex},
     task::{Context, Poll, Waker},
     thread::{self, JoinHandle},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 pub enum Drive {
@@ -39,6 +39,11 @@ pub trait Driven {
         Err("execution domain does not implement publication wakes".into())
     }
     fn advance(&mut self, now: u64, wake: CompletionWake) -> Result<Drive, String>;
+    /// Runs on the worker thread even while a submitted flight is outstanding.
+    /// The owner must not release storage held by that flight here.
+    fn periodic(&mut self, _now: u64) -> Result<(), String> {
+        Ok(())
+    }
     fn failed(&mut self, error: &str);
     fn failure(&self) -> Option<&str>;
     fn shutdown(&mut self) -> Result<bool, String>;
@@ -223,6 +228,17 @@ impl Worker {
         factory: impl FnOnce() -> Result<(Box<dyn Driven>, R), String> + Send + 'static,
         capacity: usize,
     ) -> Result<(Self, R), String> {
+        let (worker, ready, ()) = Self::spawn_ready_with(factory, capacity, || Ok(()))?;
+        Ok((worker, ready))
+    }
+
+    /// Construct host artifacts on the caller while the execution thread
+    /// builds its domain, then wait for both sides before publishing readiness.
+    pub fn spawn_ready_with<R: Send + 'static, H>(
+        factory: impl FnOnce() -> Result<(Box<dyn Driven>, R), String> + Send + 'static,
+        capacity: usize,
+        host: impl FnOnce() -> Result<H, String>,
+    ) -> Result<(Self, R, H), String> {
         if capacity == 0 {
             return Err("execution control capacity must be positive".into());
         }
@@ -268,19 +284,13 @@ impl Worker {
                 }
             })
             .map_err(|error| error.to_string())?;
-        match receive.recv().map_err(|error| error.to_string())? {
-            Ok(readiness) => Ok((
-                Self {
-                    mailbox,
-                    thread: Some(thread),
-                },
-                readiness,
-            )),
-            Err(error) => {
-                let _ = thread.join();
-                Err(error)
-            }
-        }
+        let worker = Self {
+            mailbox,
+            thread: Some(thread),
+        };
+        let host = host()?;
+        let readiness = receive.recv().map_err(|error| error.to_string())??;
+        Ok((worker, readiness, host))
     }
     pub fn client(&self) -> Client {
         Client {
@@ -355,6 +365,7 @@ fn run(owner: &mut dyn Driven, mailbox: &Arc<Mailbox>) {
         Stop,
         Cleanup(WorkerCommand),
         Control(Envelope),
+        Tick,
     }
     let start = Instant::now();
     let now = || start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
@@ -362,6 +373,8 @@ fn run(owner: &mut dyn Driven, mailbox: &Arc<Mailbox>) {
     let mut serial = 0u64;
     let mut drive = true;
     let mut stopping = false;
+    let observation_interval = Duration::from_millis(100);
+    let mut next_observation = Instant::now() + observation_interval;
     loop {
         if !stopping {
             if let Some(error) = owner.failure().map(str::to_owned) {
@@ -378,6 +391,15 @@ fn run(owner: &mut dyn Driven, mailbox: &Arc<Mailbox>) {
                     break;
                 }
             }
+        }
+        if !stopping && Instant::now() >= next_observation {
+            if let Err(error) = owner.periodic(now()) {
+                owner.failed(&error);
+                mailbox.close(&error);
+                stopping = true;
+                continue;
+            }
+            next_observation = Instant::now() + observation_interval;
         }
         let event = {
             let mut state = mailbox.state.lock().unwrap();
@@ -401,13 +423,28 @@ fn run(owner: &mut dyn Driven, mailbox: &Arc<Mailbox>) {
                 if drive && waiting.is_none() {
                     break None;
                 }
-                state = mailbox.changed.wait(state).unwrap();
+                let (next, elapsed) = mailbox
+                    .changed
+                    .wait_timeout(
+                        state,
+                        next_observation.saturating_duration_since(Instant::now()),
+                    )
+                    .unwrap();
+                state = next;
+                if elapsed.timed_out() {
+                    break Some(Event::Tick);
+                }
             }
         };
         match event {
             Some(Event::Stop) => {
                 stopping = true;
                 continue;
+            }
+            Some(Event::Tick) => {
+                // A blind memory observation needs a fresh claim attempt even
+                // when no command or completion arrives to move the epoch.
+                drive = waiting.is_none();
             }
             Some(Event::Completion(id)) => {
                 if waiting != Some(id) {
@@ -507,5 +544,117 @@ fn run(owner: &mut dyn Driven, mailbox: &Arc<Mailbox>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct Idle;
+
+    impl Driven for Idle {
+        fn advance(&mut self, _: u64, _: CompletionWake) -> Result<Drive, String> {
+            Ok(Drive::Idle)
+        }
+        fn failed(&mut self, _: &str) {}
+        fn failure(&self) -> Option<&str> {
+            None
+        }
+        fn shutdown(&mut self) -> Result<bool, String> {
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn host_construction_runs_before_worker_readiness() {
+        let (started, observe_start) = mpsc::sync_channel(1);
+        let (finish, allow_finish) = mpsc::sync_channel(1);
+        let (mut worker, ready, host) = Worker::spawn_ready_with(
+            move || {
+                started.send(()).unwrap();
+                allow_finish
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(|error| error.to_string())?;
+                Ok((Box::new(Idle) as Box<dyn Driven>, 7))
+            },
+            1,
+            move || {
+                observe_start
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(|error| error.to_string())?;
+                finish.send(()).unwrap();
+                Ok(9)
+            },
+        )
+        .unwrap();
+        assert_eq!((ready, host), (7, 9));
+        worker.close();
+    }
+
+    #[test]
+    fn idle_owner_gets_periodic_retry_without_a_command() {
+        struct Retry {
+            attempts: usize,
+            retried: mpsc::SyncSender<()>,
+        }
+        impl Driven for Retry {
+            fn advance(&mut self, _: u64, _: CompletionWake) -> Result<Drive, String> {
+                self.attempts += 1;
+                if self.attempts == 2 {
+                    self.retried.send(()).unwrap();
+                }
+                Ok(Drive::Idle)
+            }
+            fn failed(&mut self, _: &str) {}
+            fn failure(&self) -> Option<&str> {
+                None
+            }
+            fn shutdown(&mut self) -> Result<bool, String> {
+                Ok(true)
+            }
+        }
+        let (retried, observed) = mpsc::sync_channel(1);
+        let mut worker = Worker::spawn(
+            move || {
+                Ok(Box::new(Retry {
+                    attempts: 0,
+                    retried,
+                }))
+            },
+            1,
+        )
+        .unwrap();
+        observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.close();
+    }
+
+    #[test]
+    fn observes_periodically_while_a_submission_is_outstanding() {
+        struct InFlight {
+            observed: mpsc::Sender<()>,
+        }
+        impl Driven for InFlight {
+            fn advance(&mut self, _: u64, _: CompletionWake) -> Result<Drive, String> {
+                Ok(Drive::AwaitingCompletion)
+            }
+            fn periodic(&mut self, _: u64) -> Result<(), String> {
+                self.observed.send(()).unwrap();
+                Ok(())
+            }
+            fn failed(&mut self, _: &str) {}
+            fn failure(&self) -> Option<&str> {
+                None
+            }
+            fn shutdown(&mut self) -> Result<bool, String> {
+                Ok(true)
+            }
+        }
+        let (observed, receiver) = mpsc::channel();
+        let mut worker = Worker::spawn(move || Ok(Box::new(InFlight { observed })), 1).unwrap();
+        receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.close();
     }
 }

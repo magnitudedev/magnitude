@@ -29,7 +29,11 @@ impl<B: seismic_native_target::TargetFamily> CallConstruction<B> {
             .is_none()
             .then(|| crate::candidate_domain::BodyChoice {
                 path: crate::candidate_domain::CallPath(vec![self.location.clone()]),
-                alternatives: self.bodies.iter().map(|body| body.selection.clone()).collect(),
+                alternatives: self
+                    .bodies
+                    .iter()
+                    .map(|body| body.selection.clone())
+                    .collect(),
             })
     }
     pub(crate) fn select(&mut self, selection: crate::candidate_domain::BodySelection) {
@@ -196,9 +200,7 @@ impl<'a, B: seismic_native_target::TargetFamily> internals::Builder<'a, B> {
             // do not, the construction stays a typed Initialization pending
             // instead of splicing a call it cannot account for.
             let initialization = contents.applicable(
-                &mut crate::portable::initialization_context(
-                    self.arena, selections, binders,
-                ),
+                &mut crate::portable::initialization_context(self.arena, selections, binders),
                 function.initialization(),
                 reference_function.initialization(),
                 initialized_arguments,
@@ -220,7 +222,11 @@ impl<'a, B: seismic_native_target::TargetFamily> internals::Builder<'a, B> {
             };
             bodies.push(CallBody {
                 candidate: candidate.clone(),
-                selection: crate::candidate_domain::BodySelection::new(self.program, function, mode),
+                selection: crate::candidate_domain::BodySelection::new(
+                    self.program,
+                    function,
+                    mode,
+                ),
                 initialization: initialization.clone(),
             });
             if candidate.kind == CandidateKind::Portable {
@@ -357,12 +363,10 @@ impl<'a, B: seismic_native_target::TargetFamily> internals::Builder<'a, B> {
             .unwrap_or_else(|error| {
                 panic!("spliced child produced a root-only executable: {error:?}")
             });
-        let imported = self.state.construction.import(
-            self.arena,
-            self.state.schedule_region,
-            child_ir,
-            &[],
-        );
+        let imported =
+            self.state
+                .construction
+                .import(self.arena, self.state.schedule_region, child_ir, &[]);
         let results = parts.bindings.import_into(
             &mut self.state.bindings,
             &parameter_bindings,
@@ -376,7 +380,9 @@ impl<'a, B: seismic_native_target::TargetFamily> internals::Builder<'a, B> {
             "child complete result arity differs"
         );
         self.state.choices.extend(parts.choices);
-        self.state.numerical_children.selected_child(&parts.numerical_applicability);
+        self.state
+            .numerical_children
+            .selected_child(&parts.numerical_applicability);
         self.state.callees.push(parts.provenance.root);
         self.state.callees.extend(parts.provenance.callees);
         self.state.constraints.push(parts.semantic_coverage.node());

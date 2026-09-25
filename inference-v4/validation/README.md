@@ -55,8 +55,10 @@ Use `--suite single` for a short smoke run. Use `--context 65536` with the
 `context` suite for the longer context pass. `--workload prose-repeat` (the
 default benchmark: the same 256-token output at every context) and
 `--workload prose-continue` select the Moby Dick fixtures; `--workload retrieval`
-selects the pinned RULER-derived retrieval fixture. `--storage-gib` and `--method`
-pass directly to the V4 binary. The result's `v4-launcher.json` records the
+selects the pinned RULER-derived retrieval fixture. `--device`, `--method` and
+`--cache-dir` pass directly to the V4 binary. Use `--device cpu` when comparing
+against llama.cpp launched with `--n-gpu-layers 0` on the same host. The result's
+`v4-launcher.json` records the
 V4 source hash and per-file hashes (Rust, Seismic, Metal, Cargo inputs,
 validation Python, and the complete vendored native template build tree,
 including C++ sources, headers, and provenance), plus a separate V3 Session

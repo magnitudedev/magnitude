@@ -318,7 +318,9 @@ impl Shared {
                 .clone()
                 .expect("participant 0 parks only inside a job")
         } else {
-            self.threads.get().expect("pool threads are registered before any job")[ordinal - 1]
+            self.threads
+                .get()
+                .expect("pool threads are registered before any job")[ordinal - 1]
                 .clone()
         }
     }
@@ -441,7 +443,9 @@ pub struct NativeStep {
 impl NativeStep {
     /// Participants `0..active()` claim the step's items.
     fn active(&self) -> usize {
-        self.workers.min(usize::try_from(self.items).unwrap_or(usize::MAX)).max(1)
+        self.workers
+            .min(usize::try_from(self.items).unwrap_or(usize::MAX))
+            .max(1)
     }
 }
 
@@ -506,7 +510,10 @@ impl Job for NativeJob<'_> {
                 // SAFETY: the pool grew this participant's scratch to at
                 // least `shared_bytes` before publishing the job.
                 let bytes = unsafe {
-                    std::slice::from_raw_parts_mut(self.scratch[ordinal], step.shared_bytes as usize)
+                    std::slice::from_raw_parts_mut(
+                        self.scratch[ordinal],
+                        step.shared_bytes as usize,
+                    )
                 };
                 // Participant `ordinal` owns item `ordinal`; the items past
                 // the first `active` are claimed. A step with no more items
@@ -514,7 +521,8 @@ impl Job for NativeJob<'_> {
                 let mut item = ordinal as u64;
                 while item < step.items && !shared.cancelled() {
                     self.steps.run(index, item, bytes);
-                    item = active as u64 + self.state[index].claimed.fetch_add(1, Ordering::Relaxed);
+                    item =
+                        active as u64 + self.state[index].claimed.fetch_add(1, Ordering::Relaxed);
                 }
             }
             if index + 1 < count && !self.boundary(shared, ordinal, index, active) {
@@ -672,7 +680,12 @@ impl Workers {
         }
         shared
             .threads
-            .set(threads.iter().map(|thread| thread.thread().clone()).collect())
+            .set(
+                threads
+                    .iter()
+                    .map(|thread| thread.thread().clone())
+                    .collect(),
+            )
             .unwrap_or_else(|_| unreachable!("registered once, here"));
         let dangling = || vec![std::ptr::NonNull::<u8>::dangling().as_ptr(); count];
         Ok(Workers {
@@ -718,10 +731,12 @@ impl Workers {
             let job: *const (dyn Job + 'static) = unsafe { std::mem::transmute(job) };
             unsafe { *shared.job.get() = Some(Published(job)) };
             shared.remaining.store(participants - 1, Ordering::SeqCst);
-            let epoch = (shared.published.load(Ordering::SeqCst) >> PARTICIPANT_BITS).wrapping_add(1);
-            shared
-                .published
-                .store(epoch << PARTICIPANT_BITS | participants as u64, Ordering::SeqCst);
+            let epoch =
+                (shared.published.load(Ordering::SeqCst) >> PARTICIPANT_BITS).wrapping_add(1);
+            shared.published.store(
+                epoch << PARTICIPANT_BITS | participants as u64,
+                Ordering::SeqCst,
+            );
             shared.wake_range(1..participants);
         }
         {
@@ -766,18 +781,40 @@ impl Workers {
                 "PreparedKernel coverage invariant violated: a launch asks for {team_size} workgroup threads on a profile of {participants} workers"
             ),
         };
-        let teams = (participants / team_size).min(usize::try_from(workgroups).unwrap_or(usize::MAX));
-        for (scratch, base) in self.team_scratch.iter_mut().zip(&mut self.team_bases).take(teams) {
-            scratch.grow(workgroup_scratch_bytes).map_err(LaunchFailure::Scratch)?;
+        let teams =
+            (participants / team_size).min(usize::try_from(workgroups).unwrap_or(usize::MAX));
+        for (scratch, base) in self
+            .team_scratch
+            .iter_mut()
+            .zip(&mut self.team_bases)
+            .take(teams)
+        {
+            scratch
+                .grow(workgroup_scratch_bytes)
+                .map_err(LaunchFailure::Scratch)?;
             *base = scratch.base;
         }
         let members = teams * team_size;
-        for (scratch, base) in self.worker_scratch.iter_mut().zip(&mut self.worker_bases).take(members) {
-            scratch.grow(participant_scratch_bytes).map_err(LaunchFailure::Scratch)?;
+        for (scratch, base) in self
+            .worker_scratch
+            .iter_mut()
+            .zip(&mut self.worker_bases)
+            .take(members)
+        {
+            scratch
+                .grow(participant_scratch_bytes)
+                .map_err(LaunchFailure::Scratch)?;
             *base = scratch.base;
         }
-        for (scratch, base) in self.register_scratch.iter_mut().zip(&mut self.register_bases).take(members) {
-            scratch.grow(register_scratch_bytes).map_err(LaunchFailure::Scratch)?;
+        for (scratch, base) in self
+            .register_scratch
+            .iter_mut()
+            .zip(&mut self.register_bases)
+            .take(members)
+        {
+            scratch
+                .grow(register_scratch_bytes)
+                .map_err(LaunchFailure::Scratch)?;
             *base = scratch.base;
         }
         for team in self.shared.teams.iter().take(teams) {
@@ -785,17 +822,20 @@ impl Workers {
             team.kernel.reset(team_size);
             team.current.store(0, Ordering::Release);
         }
-        self.execute(&LaunchJob {
-            entry,
-            frame,
-            workgroups,
-            team_size,
-            teams,
-            next: AtomicU64::new(0),
-            team_scratch: self.team_bases.as_ptr(),
-            worker_scratch: self.worker_bases.as_ptr(),
-            register_scratch: self.register_bases.as_ptr(),
-        }, members);
+        self.execute(
+            &LaunchJob {
+                entry,
+                frame,
+                workgroups,
+                team_size,
+                teams,
+                next: AtomicU64::new(0),
+                team_scratch: self.team_bases.as_ptr(),
+                worker_scratch: self.worker_bases.as_ptr(),
+                register_scratch: self.register_bases.as_ptr(),
+            },
+            members,
+        );
         Ok(())
     }
 
@@ -833,7 +873,10 @@ impl Workers {
             state.claimed.store(0, Ordering::Relaxed);
             state.arrived.store(0, Ordering::Relaxed);
         }
-        let participants = (0..count).map(|index| steps.step(index).active()).max().unwrap_or(1);
+        let participants = (0..count)
+            .map(|index| steps.step(index).active())
+            .max()
+            .unwrap_or(1);
         self.execute(
             &NativeJob {
                 steps,
@@ -896,10 +939,15 @@ fn physical_performance_cores() -> Option<usize> {
     let online = parse_cpu_list(read("/sys/devices/system/cpu/online")?.trim());
     let mut cores = BTreeSet::new();
     for cpu in online {
-        if performance.as_ref().is_some_and(|performance| !performance.contains(&cpu)) {
+        if performance
+            .as_ref()
+            .is_some_and(|performance| !performance.contains(&cpu))
+        {
             continue;
         }
-        let siblings = read(&format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"))?;
+        let siblings = read(&format!(
+            "/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+        ))?;
         cores.insert(siblings.trim().to_owned());
     }
     (!cores.is_empty()).then_some(cores.len())
@@ -916,7 +964,9 @@ fn physical_performance_cores() -> Option<usize> {
 #[cfg(target_os = "macos")]
 fn prefer_performance_cores() {
     // SAFETY: sets the calling thread's own class; no pointers.
-    unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
+    };
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -935,12 +985,16 @@ impl SubmitterClass {
         let mut current = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
         let mut priority = 0;
         // SAFETY: reads the calling thread's own class into locals.
-        unsafe { libc::pthread_get_qos_class_np(libc::pthread_self(), &mut current, &mut priority) };
+        unsafe {
+            libc::pthread_get_qos_class_np(libc::pthread_self(), &mut current, &mut priority)
+        };
         if matches!(current, libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE) {
             return Self { saved: None };
         }
         prefer_performance_cores();
-        Self { saved: Some(current) }
+        Self {
+            saved: Some(current),
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1044,7 +1098,11 @@ mod tests {
         let mut workers = Workers::new(1).expect("pool");
         let job = counting(&workers, &[3, 4]);
         workers.run_native(&job).expect("run");
-        assert!(job.hits.iter().flatten().all(|hit| hit.load(Ordering::SeqCst) == 1));
+        assert!(job
+            .hits
+            .iter()
+            .flatten()
+            .all(|hit| hit.load(Ordering::SeqCst) == 1));
     }
 
     #[test]
@@ -1055,7 +1113,11 @@ mod tests {
                 3
             }
             fn step(&self, _: usize) -> NativeStep {
-                NativeStep { items: 64, shared_bytes: 0, workers: 3 }
+                NativeStep {
+                    items: 64,
+                    shared_bytes: 0,
+                    workers: 3,
+                }
             }
             fn run(&self, index: usize, item: u64, _: &mut [u8]) {
                 if index == 1 && item == 7 {
@@ -1071,7 +1133,11 @@ mod tests {
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"item failed"));
         let job = counting(&workers, &[9, 9, 9]);
         workers.run_native(&job).expect("run");
-        assert!(job.hits.iter().flatten().all(|hit| hit.load(Ordering::SeqCst) == 1));
+        assert!(job
+            .hits
+            .iter()
+            .flatten()
+            .all(|hit| hit.load(Ordering::SeqCst) == 1));
     }
 
     #[test]
@@ -1082,7 +1148,11 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
             let job = counting(&workers, &[16, 16]);
             workers.run_native(&job).expect("run");
-            assert!(job.hits.iter().flatten().all(|hit| hit.load(Ordering::SeqCst) == 1));
+            assert!(job
+                .hits
+                .iter()
+                .flatten()
+                .all(|hit| hit.load(Ordering::SeqCst) == 1));
         }
     }
 
@@ -1091,10 +1161,17 @@ mod tests {
         let mut workers = Workers::new(4).expect("pool");
         let job = counting(&workers, &[16, 16]);
         workers.run_native(&job).expect("run");
-        let parked = || workers.shared.parked[1..].iter().all(|parked| parked.load(Ordering::SeqCst));
+        let parked = || {
+            workers.shared.parked[1..]
+                .iter()
+                .all(|parked| parked.load(Ordering::SeqCst))
+        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !parked() {
-            assert!(std::time::Instant::now() < deadline, "an idle pool thread kept running");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an idle pool thread kept running"
+            );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
@@ -1112,7 +1189,11 @@ mod tests {
                 self.steps
             }
             fn step(&self, _: usize) -> NativeStep {
-                NativeStep { items: self.items, shared_bytes: 0, workers: self.workers }
+                NativeStep {
+                    items: self.items,
+                    shared_bytes: 0,
+                    workers: self.workers,
+                }
             }
             fn run(&self, _: usize, item: u64, _: &mut [u8]) {
                 std::hint::black_box(item);
@@ -1122,7 +1203,11 @@ mod tests {
         let count = workers.count();
         for items in [2, 3, 4, 6, 8, 12] {
             // Samples of about 5 ms, as the tuner takes them.
-            let job = Tiny { steps: 20_000, items, workers: count };
+            let job = Tiny {
+                steps: 20_000,
+                items,
+                workers: count,
+            };
             let mut samples = (0..15)
                 .map(|_| {
                     let started = std::time::Instant::now();
@@ -1132,7 +1217,10 @@ mod tests {
                 .collect::<Vec<_>>();
             samples.sort_by(f64::total_cmp);
             let median = samples[7];
-            let mut deviations = samples.iter().map(|sample| (sample - median).abs()).collect::<Vec<_>>();
+            let mut deviations = samples
+                .iter()
+                .map(|sample| (sample - median).abs())
+                .collect::<Vec<_>>();
             deviations.sort_by(f64::total_cmp);
             eprintln!(
                 "{items} items, 20000 steps: median {:.2} ms, MAD {:.1}%, range {:.2}..{:.2} ms",
@@ -1143,7 +1231,11 @@ mod tests {
             );
         }
         for items in [1, 2, 3, 4, 5, 6, 8, 12, 64] {
-            let job = Tiny { steps: 2_000, items, workers: count };
+            let job = Tiny {
+                steps: 2_000,
+                items,
+                workers: count,
+            };
             let parks = PARKS.load(Ordering::Relaxed);
             let mut samples = (0..12)
                 .map(|_| {
@@ -1167,6 +1259,11 @@ mod tests {
     fn the_host_pool_counts_physical_performance_cores() {
         let cores = performance_cores().expect("host parallelism");
         assert!(cores >= 1);
-        assert!(cores <= std::thread::available_parallelism().expect("host parallelism").get());
+        assert!(
+            cores
+                <= std::thread::available_parallelism()
+                    .expect("host parallelism")
+                    .get()
+        );
     }
 }

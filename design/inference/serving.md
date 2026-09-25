@@ -15,6 +15,11 @@ and owns model execution, state, scheduling, sampling and token constraints.
 Rendered tokens and a constraint description cross the worker boundary; live
 tokenizers, parsers and device objects do not.
 
+The host prepares the tokenizer, templates and grammar vocabulary while the
+numerical worker loads. The prepared vocabulary is bound to serving cache
+limits after worker readiness; parser construction is not on the serving
+critical path.
+
 The host resolves one explicit served-context bound within the artifact's declared capability.
 That bound is part of the resolved model definition shared by input preparation, numerical planning,
 state allocation, readiness, and request validation. Context-bound memory is sized to the served

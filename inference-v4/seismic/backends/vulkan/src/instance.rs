@@ -10,7 +10,10 @@ pub enum LoaderError {
     Missing(String),
     /// The loader supports only Vulkan 1.0.
     Version(u32),
-    Call { call: &'static str, result: vk::Result },
+    Call {
+        call: &'static str,
+        result: vk::Result,
+    },
 }
 
 impl fmt::Display for LoaderError {
@@ -39,14 +42,19 @@ pub struct Instance {
 
 /// The process's instance, or why the loader is unusable.
 pub(crate) fn instance() -> Result<&'static Instance, LoaderError> {
-    static INSTANCE: std::sync::OnceLock<Result<Instance, LoaderError>> = std::sync::OnceLock::new();
-    INSTANCE.get_or_init(Instance::create).as_ref().map_err(Clone::clone)
+    static INSTANCE: std::sync::OnceLock<Result<Instance, LoaderError>> =
+        std::sync::OnceLock::new();
+    INSTANCE
+        .get_or_init(Instance::create)
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 impl Instance {
     fn create() -> Result<Self, LoaderError> {
         // SAFETY: loading the system Vulkan loader library.
-        let entry = unsafe { ash::Entry::load() }.map_err(|error| LoaderError::Missing(error.to_string()))?;
+        let entry = unsafe { ash::Entry::load() }
+            .map_err(|error| LoaderError::Missing(error.to_string()))?;
         let version = unsafe { entry.try_enumerate_instance_version() }
             .map_err(|result| LoaderError::Call {
                 call: "vkEnumerateInstanceVersion",
@@ -61,10 +69,11 @@ impl Instance {
             .engine_name(c"seismic")
             .api_version(vk::API_VERSION_1_3);
         let info = vk::InstanceCreateInfo::default().application_info(&application);
-        let instance = unsafe { entry.create_instance(&info, None) }.map_err(|result| LoaderError::Call {
-            call: "vkCreateInstance",
-            result,
-        })?;
+        let instance =
+            unsafe { entry.create_instance(&info, None) }.map_err(|result| LoaderError::Call {
+                call: "vkCreateInstance",
+                result,
+            })?;
         Ok(Self { entry, instance })
     }
 
@@ -83,4 +92,3 @@ impl Instance {
         })
     }
 }
-

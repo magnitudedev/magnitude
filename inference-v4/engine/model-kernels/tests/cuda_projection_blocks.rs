@@ -15,11 +15,12 @@ use seismic_lang::registry::bf16_round;
 const ROWS: [usize; 8] = [1, 3, 8, 12, 16, 17, 40, 128];
 
 /// The specialization of an entry.
-fn specialization(statics: &[(&str, usize)], mapping: Mapping) -> NativeSpecialization {
-    let spec = statics
+fn statics_specialization(statics: &[(&str, usize)]) -> NativeSpecialization {
+    statics
         .iter()
-        .fold(NativeSpecialization::new(), |spec, (name, value)| spec.with_static(*name, *value as u64));
-    mapping.params(spec)
+        .fold(NativeSpecialization::new(), |spec, (name, value)| {
+            spec.with_static(*name, *value as u64)
+        })
 }
 
 /// One segment's expected A-rounded projection and tolerance over operand
@@ -45,7 +46,8 @@ fn rounded_segment(
 /// Columns [offset, offset + n) of every row of a [m, width] expectation.
 fn place(target: &mut [f64], width: usize, offset: usize, source: &[f64], m: usize, n: usize) {
     for row in 0..m {
-        target[row * width + offset..row * width + offset + n].copy_from_slice(&source[row * n..(row + 1) * n]);
+        target[row * width + offset..row * width + offset + n]
+            .copy_from_slice(&source[row * n..(row + 1) * n]);
     }
 }
 
@@ -60,7 +62,12 @@ fn cuda_recurrent_project_matches_host_model() {
     // 4B MTP GGUF's mix (qkv q6k, alpha/beta F32 in the file: dense, resident
     // bf16). `None` is a dense bf16 weight.
     let mixes: [[Option<Format>; 4]; 3] = [
-        [Some(Format::Q5K), Some(Format::Q4K), Some(Format::Q8), Some(Format::Q8)],
+        [
+            Some(Format::Q5K),
+            Some(Format::Q4K),
+            Some(Format::Q8),
+            Some(Format::Q8),
+        ],
         [Some(Format::Q6K); 4],
         [Some(Format::Q6K), Some(Format::Q4K), None, None],
     ];
@@ -84,11 +91,19 @@ fn cuda_recurrent_project_matches_host_model() {
             let norm = f32_tensor(&device, &[h as u64], &norm_values);
             for &mapping in mappings(m) {
                 // INT8 has no effect when any weight is dense.
-                let path = if formats.contains(&None) { Mapping { int8: 0, ..mapping } } else { mapping };
+                let path = if formats.contains(&None) {
+                    Mapping { int8: 0, ..mapping }
+                } else {
+                    mapping
+                };
                 let (x, slack) = operand_rows(&normed, h, path);
                 let mut expected = vec![0.0; m * width];
                 let mut tolerance = vec![0.0; m * width];
-                for (weight, (offset, n)) in weights.iter().zip([(0, qkv), (qkv, z), (qkv + z, nv), (qkv + z + nv, nv)]) {
+                for (weight, (offset, n)) in
+                    weights
+                        .iter()
+                        .zip([(0, qkv), (qkv, z), (qkv + z, nv), (qkv + z + nv, nv)])
+                {
                     let (values, bound) = rounded_segment(&x, &slack, weight, m, n, h, path);
                     place(&mut expected, width, offset, &values, m, n);
                     place(&mut tolerance, width, offset, &bound, m, n);
@@ -103,7 +118,12 @@ fn cuda_recurrent_project_matches_host_model() {
                         BW: element(formats[3]),
                         A: Element::bf16(),
                     },
-                    &specialization(&[("H", h), ("NK", nk), ("NV", nv), ("W", w)], mapping),
+                    &mapping.recurrent_params(statics_specialization(&[
+                        ("H", h),
+                        ("NK", nk),
+                        ("NV", nv),
+                        ("W", w),
+                    ])),
                 )
                 .unwrap()
                 .call(gated_delta_project::Args {
@@ -134,7 +154,9 @@ fn gated(mixed: &[f32], z: &[f32], norm: &[f32], m: usize, nv: usize, w: usize) 
     for row in 0..m {
         for head in 0..nv {
             let base = row * nv * w + head * w;
-            let squares = mixed[base..base + w].iter().fold(0.0f32, |acc, v| v.mul_add(*v, acc));
+            let squares = mixed[base..base + w]
+                .iter()
+                .fold(0.0f32, |acc, v| v.mul_add(*v, acc));
             let inverse = 1.0 / (squares / w as f32 + EPSILON).sqrt();
             for c in 0..w {
                 let normalized = bf16_round(mixed[base + c] * inverse * norm[c]);
@@ -170,8 +192,12 @@ impl RecurrentOutputCase {
             nv,
             w,
             hidden: (0..m * h).map(|_| rng.uniform(-2.0, 2.0)).collect(),
-            mixed: (0..m * nv * w).map(|_| bf16_round(rng.uniform(-1.5, 1.5))).collect(),
-            projection: (0..m * width).map(|_| bf16_round(rng.uniform(-4.0, 4.0))).collect(),
+            mixed: (0..m * nv * w)
+                .map(|_| bf16_round(rng.uniform(-1.5, 1.5)))
+                .collect(),
+            projection: (0..m * width)
+                .map(|_| bf16_round(rng.uniform(-4.0, 4.0)))
+                .collect(),
             norm: (0..w).map(|_| rng.uniform(0.5, 1.5)).collect(),
         }
     }
@@ -182,7 +208,8 @@ impl RecurrentOutputCase {
         let offset = (2 * self.nk + self.nv) * self.w;
         (0..self.m)
             .flat_map(|row| {
-                self.projection[row * self.width() + offset..row * self.width() + offset + self.nv * self.w]
+                self.projection
+                    [row * self.width() + offset..row * self.width() + offset + self.nv * self.w]
                     .iter()
                     .copied()
             })
@@ -190,13 +217,21 @@ impl RecurrentOutputCase {
     }
     fn expected(&self, weight: &Weight, mapping: Mapping) -> (Vec<f64>, Vec<f64>) {
         let k = self.nv * self.w;
-        let (x, slack) = operand_rows(&gated(&self.mixed, &self.z(), &self.norm, self.m, self.nv, self.w), k, mapping);
+        let (x, slack) = operand_rows(
+            &gated(&self.mixed, &self.z(), &self.norm, self.m, self.nv, self.w),
+            k,
+            mapping,
+        );
         let (projected, magnitude) = project(&x, &weight.values, self.m, self.h, k);
         let bound = slack_bound(&slack, &weight.values, self.m, self.h, k);
         let dequant = dequant_bound(&x, &weight.values, self.m, self.h, k, mapping);
-        let expected = (0..self.m * self.h).map(|i| f64::from(self.hidden[i]) + projected[i]).collect();
+        let expected = (0..self.m * self.h)
+            .map(|i| f64::from(self.hidden[i]) + projected[i])
+            .collect();
         let tolerance = (0..self.m * self.h)
-            .map(|i| projected[i].abs() / 256.0 + magnitude[i] * 2.5e-4 + bound[i] + dequant[i] + 1e-6)
+            .map(|i| {
+                projected[i].abs() / 256.0 + magnitude[i] * 2.5e-4 + bound[i] + dequant[i] + 1e-6
+            })
             .collect();
         (expected, tolerance)
     }
@@ -211,15 +246,29 @@ fn cuda_recurrent_output_matches_host_model() {
             let case = RecurrentOutputCase::new(m, &mut rng);
             let output = weight(&device, format, case.h, case.nv * case.w, &mut rng);
             let hidden = f32_tensor(&device, &[m as u64, case.h as u64], &case.hidden);
-            let mixed = bf16_tensor(&device, &[m as u64, case.nv as u64, case.w as u64], &case.mixed);
-            let projection = bf16_tensor(&device, &[m as u64, case.width() as u64], &case.projection);
+            let mixed = bf16_tensor(
+                &device,
+                &[m as u64, case.nv as u64, case.w as u64],
+                &case.mixed,
+            );
+            let projection =
+                bf16_tensor(&device, &[m as u64, case.width() as u64], &case.projection);
             let norm = f32_tensor(&device, &[case.w as u64], &case.norm);
             for &mapping in mappings(m) {
                 let (expected, tolerance) = case.expected(&output, mapping);
                 let result = gated_delta_output::native_for_device_with(
                     &device,
-                    gated_delta_output::Elements { A: Element::bf16(), RN: Element::f32(), OW: format.resident() },
-                    &specialization(&[("H", case.h), ("NK", case.nk), ("NV", case.nv), ("W", case.w)], mapping),
+                    gated_delta_output::Elements {
+                        A: Element::bf16(),
+                        RN: Element::f32(),
+                        OW: format.resident(),
+                    },
+                    &mapping.recurrent_params(statics_specialization(&[
+                        ("H", case.h),
+                        ("NK", case.nk),
+                        ("NV", case.nv),
+                        ("W", case.w),
+                    ])),
                 )
                 .unwrap()
                 .call(gated_delta_output::Args {
@@ -281,7 +330,11 @@ fn recurrent_output_host_model_matches_portable_body() {
         let mut interpreter = Interpreter::new(&logical);
         let floats = |values: &[f32]| values.iter().map(|x| f64::from(*x)).collect::<Vec<_>>();
         let args = vec![
-            Arg::Tensor(interpreter.add_tensor(TensorData::dense(DType::F32, vec![case.m, case.h], floats(&case.hidden)))),
+            Arg::Tensor(interpreter.add_tensor(TensorData::dense(
+                DType::F32,
+                vec![case.m, case.h],
+                floats(&case.hidden),
+            ))),
             Arg::Tensor(interpreter.add_tensor(TensorData::dense(
                 DType::BF16,
                 vec![case.m, case.nv, case.w],
@@ -292,10 +345,21 @@ fn recurrent_output_host_model_matches_portable_body() {
                 vec![case.m, case.width()],
                 floats(&case.projection),
             ))),
-            Arg::Tensor(interpreter.add_tensor(TensorData::dense(DType::F32, vec![case.w], floats(&case.norm)))),
-            Arg::Tensor(interpreter.add_tensor(
-                TensorData::encoded(storage, vec![case.h, case.nv * case.w], output.bytes.clone()).unwrap(),
-            )),
+            Arg::Tensor(interpreter.add_tensor(TensorData::dense(
+                DType::F32,
+                vec![case.w],
+                floats(&case.norm),
+            ))),
+            Arg::Tensor(
+                interpreter.add_tensor(
+                    TensorData::encoded(
+                        storage,
+                        vec![case.h, case.nv * case.w],
+                        output.bytes.clone(),
+                    )
+                    .unwrap(),
+                ),
+            ),
             Arg::Scalar(ReferenceScalar::F32(EPSILON.to_bits())),
         ];
         let outcome = interpreter.run(&args).unwrap();
@@ -303,9 +367,18 @@ fn recurrent_output_host_model_matches_portable_body() {
             panic!("gated_delta_output portable body failed: {failure}");
         }
         let result = outcome.results().next().unwrap();
-        let OutcomeValue::Tensor(values) = result.value() else { panic!("tensor result") };
-        let actual: Vec<f32> = (0..case.m * case.h).map(|i| values.read(i).unwrap() as f32).collect();
-        check(&format!("portable recurrent output {format:?}"), &actual, &expected, &tolerance);
+        let OutcomeValue::Tensor(values) = result.value() else {
+            panic!("tensor result")
+        };
+        let actual: Vec<f32> = (0..case.m * case.h)
+            .map(|i| values.read(i).unwrap() as f32)
+            .collect();
+        check(
+            &format!("portable recurrent output {format:?}"),
+            &actual,
+            &expected,
+            &tolerance,
+        );
     }
 }
 
@@ -345,7 +418,12 @@ fn cuda_attention_project_matches_host_model() {
                         VW: formats[2].resident(),
                         A: Element::bf16(),
                     },
-                    &specialization(&[("D", d), ("KV", kv), ("G", g), ("W", w)], mapping),
+                    &mapping.gated_attention_project_params(statics_specialization(&[
+                        ("D", d),
+                        ("KV", kv),
+                        ("G", g),
+                        ("W", w),
+                    ])),
                 )
                 .unwrap()
                 .call(gated_attention_project::Args {
@@ -358,9 +436,11 @@ fn cuda_attention_project_matches_host_model() {
                     epsilon: EPSILON,
                 })
                 .unwrap();
-                for (name, tensor, (values, tolerance)) in
-                    [("query_gate", &results.r0, &expected[0]), ("key", &results.r1, &expected[1]), ("value", &results.r2, &expected[2])]
-                {
+                for (name, tensor, (values, tolerance)) in [
+                    ("query_gate", &results.r0, &expected[0]),
+                    ("key", &results.r1, &expected[1]),
+                    ("value", &results.r2, &expected[2]),
+                ] {
                     check(
                         &format!("attention project {name} {formats:?} M={m} {mapping:?}"),
                         &read_bf16(tensor),
@@ -381,7 +461,9 @@ fn cuda_attention_output_matches_host_model() {
     for format in Format::ALL {
         let output = weight(&device, format, d, q * w, &mut rng);
         for m in ROWS {
-            let gated_values: Vec<f32> = (0..m * q * w).map(|_| bf16_round(rng.uniform(-1.0, 1.0))).collect();
+            let gated_values: Vec<f32> = (0..m * q * w)
+                .map(|_| bf16_round(rng.uniform(-1.0, 1.0)))
+                .collect();
             let hidden_values: Vec<f32> = (0..m * d).map(|_| rng.uniform(-2.0, 2.0)).collect();
             let gated_tensor = bf16_tensor(&device, &[m as u64, q as u64, w as u64], &gated_values);
             let hidden = f32_tensor(&device, &[m as u64, d as u64], &hidden_values);
@@ -389,18 +471,31 @@ fn cuda_attention_output_matches_host_model() {
                 // The heads are exact input, so the INT8 emulation is exact too.
                 let (x, _) = operand_rows(&gated_values, q * w, mapping);
                 let (projected, magnitude) = project(&x, &output.values, m, d, q * w);
-                let expected: Vec<f64> = (0..m * d).map(|i| f64::from(hidden_values[i]) + projected[i]).collect();
+                let expected: Vec<f64> = (0..m * d)
+                    .map(|i| f64::from(hidden_values[i]) + projected[i])
+                    .collect();
                 let dequant = dequant_bound(&x, &output.values, m, d, q * w, mapping);
                 let tolerance: Vec<f64> = (0..m * d)
                     .map(|i| projected[i].abs() / 256.0 + magnitude[i] * 2e-5 + dequant[i] + 1e-6)
                     .collect();
                 let result = attention_output::native_for_device_with(
                     &device,
-                    attention_output::Elements { A: Element::bf16(), OW: format.resident() },
-                    &specialization(&[("D", d), ("Q", q), ("W", w)], mapping),
+                    attention_output::Elements {
+                        A: Element::bf16(),
+                        OW: format.resident(),
+                    },
+                    &mapping.attention_output_params(statics_specialization(&[
+                        ("D", d),
+                        ("Q", q),
+                        ("W", w),
+                    ])),
                 )
                 .unwrap()
-                .call(attention_output::Args { hidden: &hidden, gated: &gated_tensor, output_weight: &output.tensor })
+                .call(attention_output::Args {
+                    hidden: &hidden,
+                    gated: &gated_tensor,
+                    output_weight: &output.tensor,
+                })
                 .unwrap()
                 .value;
                 check(
@@ -420,7 +515,10 @@ fn cuda_attention_output_matches_host_model() {
 #[ignore = "timing; run explicitly on the measurement host"]
 fn cuda_projection_block_timings() {
     let Some(device) = cuda() else { return };
-    let options = seismic::MeasureOptions { samples: 15, min_sample_seconds: 0.002 };
+    let options = seismic::MeasureOptions {
+        samples: 15,
+        min_sample_seconds: 0.002,
+    };
     let (h, nk, nv, w) = (2560usize, 16usize, 32usize, 128usize);
     let (qkv, z) = ((2 * nk + nv) * w, nv * w);
     let rotation = 4;
@@ -434,14 +532,24 @@ fn cuda_projection_block_timings() {
             ]
         })
         .collect();
-    let output_weights: Vec<Tensor> = (0..rotation * 2).map(|_| timing_weight(&device, Format::Q5K, h, z)).collect();
+    let output_weights: Vec<Tensor> = (0..rotation * 2)
+        .map(|_| timing_weight(&device, Format::Q5K, h, z))
+        .collect();
     let project_bytes: f64 = project_weights[0].iter().map(|t| t.byte_len() as f64).sum();
     let output_bytes = output_weights[0].byte_len() as f64;
     for m in timing_rows(&[1, 8, 32, 128, 512]) {
         let hidden = f32_tensor(&device, &[m as u64, h as u64], &vec![0.5; m * h]);
         let norm = f32_tensor(&device, &[h as u64], &vec![1.0; h]);
-        let mixed = bf16_tensor(&device, &[m as u64, nv as u64, w as u64], &vec![0.25; m * z]);
-        let projection = bf16_tensor(&device, &[m as u64, (qkv + z + 2 * nv) as u64], &vec![0.5; m * (qkv + z + 2 * nv)]);
+        let mixed = bf16_tensor(
+            &device,
+            &[m as u64, nv as u64, w as u64],
+            &vec![0.25; m * z],
+        );
+        let projection = bf16_tensor(
+            &device,
+            &[m as u64, (qkv + z + 2 * nv) as u64],
+            &vec![0.5; m * (qkv + z + 2 * nv)],
+        );
         let recurrent_norm = f32_tensor(&device, &[w as u64], &vec![1.0; w]);
         for &mapping in mappings(m) {
             let kernel = gated_delta_project::native_for_device_with(
@@ -454,7 +562,12 @@ fn cuda_projection_block_timings() {
                     BW: Format::Q8.resident(),
                     A: Element::bf16(),
                 },
-                &specialization(&[("H", h), ("NK", nk), ("NV", nv), ("W", w)], mapping),
+                &mapping.recurrent_params(statics_specialization(&[
+                    ("H", h),
+                    ("NK", nk),
+                    ("NV", nv),
+                    ("W", w),
+                ])),
             )
             .unwrap();
             let args = project_weights
@@ -479,8 +592,17 @@ fn cuda_projection_block_timings() {
             );
             let kernel = gated_delta_output::native_for_device_with(
                 &device,
-                gated_delta_output::Elements { A: Element::bf16(), RN: Element::f32(), OW: Format::Q5K.resident() },
-                &specialization(&[("H", h), ("NK", nk), ("NV", nv), ("W", w)], mapping),
+                gated_delta_output::Elements {
+                    A: Element::bf16(),
+                    RN: Element::f32(),
+                    OW: Format::Q5K.resident(),
+                },
+                &mapping.recurrent_params(statics_specialization(&[
+                    ("H", h),
+                    ("NK", nk),
+                    ("NV", nv),
+                    ("W", w),
+                ])),
             )
             .unwrap();
             let args = output_weights

@@ -32,7 +32,12 @@ fn sources() -> Vec<(PathBuf, String)> {
             let entries =
                 std::fs::read_dir(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             for entry in entries {
-                walk(&entry.unwrap_or_else(|e| panic!("{}: {e}", path.display())).path(), files);
+                walk(
+                    &entry
+                        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+                        .path(),
+                    files,
+                );
             }
         } else if path.extension().is_some_and(|extension| extension == "rs") {
             let text =
@@ -56,7 +61,11 @@ fn scan(violation: impl Fn(&str) -> Option<String>) -> Vec<String> {
     let root = corpus_path("../..");
     let mut hits = Vec::new();
     for (path, text) in sources() {
-        let path = path.strip_prefix(&root).unwrap_or(&path).display().to_string();
+        let path = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
         for (index, line) in text.lines().enumerate() {
             if let Some(note) = violation(line) {
                 hits.push(format!("{path}:{}: {}{note}", index + 1, line.trim()));
@@ -77,14 +86,20 @@ fn assert_none(what: &str, hits: Vec<String>) {
 
 #[test]
 fn no_ignored_tests() {
-    assert_none("ignored test(s)", scan(|line| line.contains(concat!("#[", "ignore")).then(String::new)));
+    assert_none(
+        "ignored test(s)",
+        scan(|line| line.contains(concat!("#[", "ignore")).then(String::new)),
+    );
 }
 
 #[test]
 fn no_stack_override() {
     assert_none(
         "stack override(s)",
-        scan(|line| line.contains(concat!("RUST_MIN", "_STACK")).then(String::new)),
+        scan(|line| {
+            line.contains(concat!("RUST_MIN", "_STACK"))
+                .then(String::new)
+        }),
     );
 }
 
@@ -94,8 +109,9 @@ fn no_dead_code_allowances() {
         "dead-code allowance(s)",
         scan(|line| {
             let line: String = line.split_whitespace().collect();
-            (line.contains(concat!("allow(", "dead_code")) || line.contains(concat!("allow(", "unused")))
-                .then(String::new)
+            (line.contains(concat!("allow(", "dead_code"))
+                || line.contains(concat!("allow(", "unused")))
+            .then(String::new)
         }),
     );
 }
@@ -117,14 +133,24 @@ fn forbidden_symbols() -> Vec<(String, String)> {
     for list in lists {
         let text =
             std::fs::read_to_string(&list).unwrap_or_else(|e| panic!("{}: {e}", list.display()));
-        let owner = list.file_name().expect("listed file").to_string_lossy().into_owned();
+        let owner = list
+            .file_name()
+            .expect("listed file")
+            .to_string_lossy()
+            .into_owned();
         for (index, line) in text.lines().enumerate() {
-            let symbol = line.split('#').next().expect("split yields one part").trim();
+            let symbol = line
+                .split('#')
+                .next()
+                .expect("split yields one part")
+                .trim();
             if symbol.is_empty() {
                 continue;
             }
             assert!(
-                symbol.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                symbol
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_'),
                 "{owner}:{}: `{symbol}` is not one identifier",
                 index + 1
             );

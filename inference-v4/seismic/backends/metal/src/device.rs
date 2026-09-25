@@ -14,6 +14,7 @@ use objc2_metal::{
 use seismic_compiler::errors::{ExecutionError, TargetError};
 use seismic_compiler::executable::DeviceService;
 use std::fmt;
+use std::{any::Any, ptr::NonNull, sync::Arc};
 
 /// A retained `MTLDevice`. `MTLDevice` is `Send + Sync`; identity is the
 /// device's registry id.
@@ -102,6 +103,8 @@ impl fmt::Debug for DeviceHandle {
 pub struct MetalBuffer {
     buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     len: u64,
+    _host_owner: Option<Arc<dyn Any + Send + Sync>>,
+    read_only: bool,
 }
 
 unsafe impl Send for MetalBuffer {}
@@ -143,6 +146,10 @@ impl MetalBuffer {
     }
 
     pub(crate) fn write_bytes(&self, offset: u64, bytes: &[u8]) {
+        assert!(
+            !self.read_only,
+            "cannot write to a read-only mapped Metal buffer"
+        );
         let destination = self.host_range(offset, bytes.len());
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), destination, bytes.len()) };
     }
@@ -165,6 +172,10 @@ unsafe impl Sync for MetalDevice {}
 
 impl MetalDevice {
     pub fn open(handle: DeviceHandle) -> Result<Self, TargetError> {
+        // Compilation is shared by every native entry formed on this device.
+        // Metal defaults to a small compiler pool; allow the system to scale
+        // compilation concurrency to the machine before forming any kernels.
+        handle.raw().setShouldMaximizeConcurrentCompilation(true);
         let queue = handle.raw().newCommandQueue().ok_or_else(|| {
             TargetError::DeviceUnavailable("could not create a Metal command queue".into())
         })?;
@@ -193,7 +204,60 @@ impl MetalDevice {
             .ok_or_else(|| {
                 ExecutionError::AllocationFailed(format!("Metal refused a {bytes}-byte buffer"))
             })?;
-        Ok(MetalBuffer { buffer, len: bytes })
+        Ok(MetalBuffer {
+            buffer,
+            len: bytes,
+            _host_owner: None,
+            read_only: false,
+        })
+    }
+
+    /// Wrap an immutable, page-aligned host mapping. The retained owner keeps
+    /// the mapping live until the final Metal buffer reference is released,
+    /// including references held by an in-flight command buffer.
+    ///
+    /// # Safety
+    /// `pointer..pointer+length` must remain mapped and unchanged for the
+    /// owner's lifetime. `pointer` and `length` must be host-page aligned.
+    pub unsafe fn wrap_read_only_host_mapping(
+        &self,
+        pointer: NonNull<u8>,
+        length: usize,
+        owner: Arc<dyn Any + Send + Sync>,
+    ) -> Result<MetalBuffer, ExecutionError> {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page = usize::try_from(page).map_err(|_| {
+            ExecutionError::AllocationFailed("host page size is unavailable".into())
+        })?;
+        if length == 0 || pointer.as_ptr() as usize % page != 0 || length % page != 0 {
+            return Err(ExecutionError::AllocationFailed(
+                "Metal host mapping is not page-aligned".into(),
+            ));
+        }
+        if length > self.handle.max_allocation_bytes() as usize {
+            return Err(ExecutionError::AllocationFailed(
+                "Metal host mapping exceeds maximum buffer length".into(),
+            ));
+        }
+        let buffer = unsafe {
+            self.handle
+                .raw()
+                .newBufferWithBytesNoCopy_length_options_deallocator(
+                    pointer.cast(),
+                    length,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
+        }
+        .ok_or_else(|| {
+            ExecutionError::AllocationFailed("Metal refused a read-only host mapping".into())
+        })?;
+        Ok(MetalBuffer {
+            buffer,
+            len: length as u64,
+            _host_owner: Some(owner),
+            read_only: true,
+        })
     }
 }
 
@@ -213,6 +277,11 @@ impl DeviceService<Metal> for MetalDevice {
         offset: u64,
         bytes: &[u8],
     ) -> Result<(), ExecutionError> {
+        if buffer.read_only {
+            return Err(ExecutionError::SubmissionFailed(
+                "write to a read-only mapped Metal buffer".into(),
+            ));
+        }
         buffer.write_bytes(offset, bytes);
         Ok(())
     }
@@ -229,5 +298,68 @@ impl DeviceService<Metal> for MetalDevice {
 
     fn buffer_len(&self, buffer: &Self::Buffer) -> u64 {
         buffer.len
+    }
+}
+
+#[cfg(test)]
+mod mapped_tests {
+    use super::*;
+
+    struct Mapping {
+        pointer: NonNull<u8>,
+        len: usize,
+    }
+    unsafe impl Send for Mapping {}
+    unsafe impl Sync for Mapping {}
+    impl Drop for Mapping {
+        fn drop(&mut self) {
+            unsafe {
+                libc::munmap(self.pointer.as_ptr().cast(), self.len);
+            }
+        }
+    }
+
+    #[test]
+    fn read_only_file_like_mapping_is_retained_by_metal_buffer() {
+        let Ok(handle) = DeviceHandle::system_default() else {
+            return;
+        };
+        let device = MetalDevice::open(handle).unwrap();
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let pointer = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(pointer, libc::MAP_FAILED);
+        let pointer = NonNull::new(pointer.cast::<u8>()).unwrap();
+        unsafe {
+            *pointer.as_ptr() = 73;
+        }
+        assert_eq!(
+            unsafe { libc::mprotect(pointer.as_ptr().cast(), page, libc::PROT_READ) },
+            0
+        );
+        let mapping = Arc::new(Mapping { pointer, len: page });
+        let weak = Arc::downgrade(&mapping);
+        let buffer =
+            unsafe { device.wrap_read_only_host_mapping(pointer, page, mapping.clone()) }.unwrap();
+        drop(mapping);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(
+            buffer.raw().contents().as_ptr() as usize,
+            pointer.as_ptr() as usize
+        );
+        let mut byte = [0];
+        buffer.read_bytes(0, &mut byte);
+        assert_eq!(byte, [73]);
+        assert!(device.write(&buffer, 0, &[1]).is_err());
+        drop(buffer);
+        assert!(weak.upgrade().is_none());
     }
 }

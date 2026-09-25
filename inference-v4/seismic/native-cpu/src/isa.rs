@@ -25,7 +25,13 @@ pub enum Tier {
 
 impl Tier {
     /// Every tier of every architecture, as code generators enumerate them.
-    pub const EVERY: [Tier; 5] = [Tier::X86V2, Tier::X86V3, Tier::X86V4, Tier::X86V4Vnni, Tier::Neon];
+    pub const EVERY: [Tier; 5] = [
+        Tier::X86V2,
+        Tier::X86V3,
+        Tier::X86V4,
+        Tier::X86V4Vnni,
+        Tier::Neon,
+    ];
 
     /// The `target_arch` of the tier.
     pub const fn arch(self) -> &'static str {
@@ -101,18 +107,26 @@ impl Tier {
 
     /// The highest tier of this architecture the host supports.
     pub fn detected() -> Option<Tier> {
-        Tier::all().iter().rev().copied().find(|tier| tier.is_detected())
+        Tier::all()
+            .iter()
+            .rev()
+            .copied()
+            .find(|tier| tier.is_detected())
     }
 
     /// Every tier at or below `self` that the host supports: the tier axis a
     /// device offers the tuner.
     pub fn at_or_below(self) -> impl Iterator<Item = Tier> {
-        Tier::all().iter().copied().filter(move |tier| *tier <= self && tier.is_detected())
+        Tier::all()
+            .iter()
+            .copied()
+            .filter(move |tier| *tier <= self && tier.is_detected())
     }
 }
 
 pub const X86V2_FEATURES: &str = "sse3,ssse3,sse4.1,sse4.2,popcnt";
-pub const X86V3_FEATURES: &str = "sse3,ssse3,sse4.1,sse4.2,popcnt,avx,avx2,fma,f16c,bmi1,bmi2,lzcnt,movbe";
+pub const X86V3_FEATURES: &str =
+    "sse3,ssse3,sse4.1,sse4.2,popcnt,avx,avx2,fma,f16c,bmi1,bmi2,lzcnt,movbe";
 pub const X86V4_FEATURES: &str =
     "sse3,ssse3,sse4.1,sse4.2,popcnt,avx,avx2,fma,f16c,bmi1,bmi2,lzcnt,movbe,avx512f,avx512cd,avx512bw,avx512dq,avx512vl";
 pub const X86V4VNNI_FEATURES: &str =
@@ -164,13 +178,22 @@ macro_rules! tier {
 }
 
 #[cfg(target_arch = "x86_64")]
-tier!(X86V2, X86V2, X86V2_FEATURES, ["sse3", "ssse3", "sse4.1", "sse4.2", "popcnt"], is_x86_feature_detected);
+tier!(
+    X86V2,
+    X86V2,
+    X86V2_FEATURES,
+    ["sse3", "ssse3", "sse4.1", "sse4.2", "popcnt"],
+    is_x86_feature_detected
+);
 #[cfg(target_arch = "x86_64")]
 tier!(
     X86V3,
     X86V3,
     X86V3_FEATURES,
-    ["sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "avx", "avx2", "fma", "f16c", "bmi1", "bmi2", "lzcnt", "movbe"],
+    [
+        "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "avx", "avx2", "fma", "f16c", "bmi1",
+        "bmi2", "lzcnt", "movbe"
+    ],
     is_x86_feature_detected
 );
 #[cfg(target_arch = "x86_64")]
@@ -179,8 +202,8 @@ tier!(
     X86V4,
     X86V4_FEATURES,
     [
-        "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "avx", "avx2", "fma", "f16c", "bmi1", "bmi2", "lzcnt",
-        "movbe", "avx512f", "avx512cd", "avx512bw", "avx512dq", "avx512vl"
+        "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "avx", "avx2", "fma", "f16c", "bmi1",
+        "bmi2", "lzcnt", "movbe", "avx512f", "avx512cd", "avx512bw", "avx512dq", "avx512vl"
     ],
     is_x86_feature_detected
 );
@@ -190,13 +213,36 @@ tier!(
     X86V4Vnni,
     X86V4VNNI_FEATURES,
     [
-        "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "avx", "avx2", "fma", "f16c", "bmi1", "bmi2", "lzcnt",
-        "movbe", "avx512f", "avx512cd", "avx512bw", "avx512dq", "avx512vl", "avx512vnni"
+        "sse3",
+        "ssse3",
+        "sse4.1",
+        "sse4.2",
+        "popcnt",
+        "avx",
+        "avx2",
+        "fma",
+        "f16c",
+        "bmi1",
+        "bmi2",
+        "lzcnt",
+        "movbe",
+        "avx512f",
+        "avx512cd",
+        "avx512bw",
+        "avx512dq",
+        "avx512vl",
+        "avx512vnni"
     ],
     is_x86_feature_detected
 );
 #[cfg(target_arch = "aarch64")]
-tier!(Neon, Neon, NEON_FEATURES, ["neon"], is_aarch64_feature_detected);
+tier!(
+    Neon,
+    Neon,
+    NEON_FEATURES,
+    ["neon"],
+    is_aarch64_feature_detected
+);
 
 #[cfg(test)]
 mod tests {
@@ -213,7 +259,11 @@ mod tests {
     #[test]
     fn feature_strings_are_cumulative() {
         for pair in Tier::all().windows(2) {
-            assert!(pair[1].features().starts_with(pair[0].features()), "{:?}", pair);
+            assert!(
+                pair[1].features().starts_with(pair[0].features()),
+                "{:?}",
+                pair
+            );
         }
     }
 }

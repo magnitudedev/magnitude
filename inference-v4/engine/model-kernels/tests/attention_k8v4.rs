@@ -21,7 +21,12 @@ const VALUE_BITS: u32 = 4;
 const GROUP: usize = 32;
 
 /// Two affine groups per head vector, for the decode portable-body comparison.
-const GROUPED: Geometry = Geometry { kv: 2, g: 2, p: 8, s: 48 };
+const GROUPED: Geometry = Geometry {
+    kv: 2,
+    g: 2,
+    p: 8,
+    s: 48,
+};
 
 /// F16 coefficient elements of one head vector: a (scale, zero) pair per
 /// group.
@@ -43,7 +48,11 @@ fn encode(x: &[f32], bits: u32) -> (Vec<u32>, Vec<u16>) {
         let high = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let zero = f16_bits(low);
         let scale = f16_bits((high - low) / levels as f32);
-        let inverse = if f16_to_f32(scale) > 0.0 { 1.0 / f16_to_f32(scale) } else { 0.0 };
+        let inverse = if f16_to_f32(scale) > 0.0 {
+            1.0 / f16_to_f32(scale)
+        } else {
+            0.0
+        };
         for (offset, value) in values.iter().enumerate() {
             let i = group * GROUP + offset;
             let code = ((value - f16_to_f32(zero)).mul_add(inverse, 0.5) as u32).min(levels);
@@ -102,7 +111,12 @@ impl Planes {
         let (kw, vw) = (w * KEY_BITS as usize / 32, w * VALUE_BITS as usize / 32);
         let c = coefficient_elements(w);
         (
-            decode(&self.key_codes[vector * kw..][..kw], &self.key_coefficients[vector * c..][..c], KEY_BITS, w),
+            decode(
+                &self.key_codes[vector * kw..][..kw],
+                &self.key_coefficients[vector * c..][..c],
+                KEY_BITS,
+                w,
+            ),
             decode(
                 &self.value_codes[vector * vw..][..vw],
                 &self.value_coefficients[vector * c..][..c],
@@ -160,13 +174,19 @@ impl Encoded {
 
 fn u32_tensor(device: &Device, shape: &[usize], values: &[u32]) -> Tensor {
     let shape = shape.iter().map(|x| *x as u64).collect::<Vec<_>>();
-    let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
     Tensor::from_host(device, Element::u32(), &shape, &bytes).unwrap()
 }
 
 fn f16_tensor(device: &Device, shape: &[usize], bits: &[u16]) -> Tensor {
     let shape = shape.iter().map(|x| *x as u64).collect::<Vec<_>>();
-    let bytes = bits.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+    let bytes = bits
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
     Tensor::from_host(device, Element::f16(), &shape, &bytes).unwrap()
 }
 
@@ -280,7 +300,9 @@ fn k8v4_devices() -> Vec<Device> {
     [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]
         .into_iter()
         .filter_map(|backend| catalog.open_backend(backend).ok())
-        .chain(std::iter::once(catalog.open_backend(BackendName::Cpu).unwrap()))
+        .chain(std::iter::once(
+            catalog.open_backend(BackendName::Cpu).unwrap(),
+        ))
         .collect()
 }
 
@@ -291,7 +313,10 @@ fn decode_configs(backend: BackendName) -> Vec<Vec<(&'static str, u64)>> {
             .into_iter()
             .map(|(parts, warps)| vec![("PARTS", parts), ("WARPS", warps)])
             .collect(),
-        BackendName::Cpu => [8, 4, 16, 1].into_iter().map(|parts| vec![("PARTS", parts)]).collect(),
+        BackendName::Cpu => [8, 4, 16, 1]
+            .into_iter()
+            .map(|parts| vec![("PARTS", parts)])
+            .collect(),
         _ => [(32, 16, 4), (64, 32, 8), (256, 8, 8), (32, 16, 8)]
             .into_iter()
             .map(|(span, parts, simds)| vec![("SPAN", span), ("PARTS", parts), ("SIMDS", simds)])
@@ -302,7 +327,10 @@ fn decode_configs(backend: BackendName) -> Vec<Vec<(&'static str, u64)>> {
 /// Declared prefill configurations of `backend`.
 fn prefill_configs(backend: BackendName) -> Vec<Vec<(&'static str, u64)>> {
     match backend {
-        BackendName::Cuda => [4, 2].into_iter().map(|warps| vec![("WARPS", warps)]).collect(),
+        BackendName::Cuda => [4, 2]
+            .into_iter()
+            .map(|warps| vec![("WARPS", warps)])
+            .collect(),
         // One CPU form, without parameters.
         BackendName::Cpu => vec![Vec::new()],
         // ROWS = 64 is admissible at every tested geometry (ROWS / G <= 32,
@@ -320,15 +348,23 @@ fn prefill_configs(backend: BackendName) -> Vec<Vec<(&'static str, u64)>> {
 
 /// The specialization of `params` on `device`: GPU forms take the geometry's
 /// statics; CPU forms have no statics.
-fn specialization_on(device: &Device, geometry: Geometry, params: &[(&'static str, u64)]) -> NativeSpecialization {
+fn specialization_on(
+    device: &Device,
+    geometry: Geometry,
+    params: &[(&'static str, u64)],
+) -> NativeSpecialization {
     // The CPU forms fix only the head width, which their codec requires to be
     // whole 32-column groups.
     let base = if is_cpu(device) {
-        NativeSpecialization::new().with_static("P", geometry.p as u64).with_static("S", geometry.s as u64)
+        NativeSpecialization::new()
+            .with_static("P", geometry.p as u64)
+            .with_static("S", geometry.s as u64)
     } else {
         statics(geometry)
     };
-    params.iter().fold(base, |spec, (name, value)| spec.with_param(*name, *value))
+    params
+        .iter()
+        .fold(base, |spec, (name, value)| spec.with_param(*name, *value))
 }
 
 fn decode_kernel(
@@ -362,7 +398,13 @@ fn prefill_kernel(
 /// untouched; appended vectors decode within one code step of the host
 /// model's encoding (the key may differ by one bf16 step from transcendental
 /// rounding, which can move a code).
-fn check(label: &str, encoded: &Encoded, gated: &Tensor, bound: &Bound, expected: &(Vec<f32>, Planes)) {
+fn check(
+    label: &str,
+    encoded: &Encoded,
+    gated: &Tensor,
+    bound: &Bound,
+    expected: &(Vec<f32>, Planes),
+) {
     let case = &encoded.case;
     let geometry = case.geometry;
     let actual = bf16_values(gated);
@@ -384,7 +426,9 @@ fn check(label: &str, encoded: &Encoded, gated: &Tensor, bound: &Bound, expected
         .destinations
         .iter()
         .filter(|destination| **destination >= 0)
-        .flat_map(|destination| (0..geometry.kv).map(move |head| *destination as usize * geometry.kv + head))
+        .flat_map(|destination| {
+            (0..geometry.kv).map(move |head| *destination as usize * geometry.kv + head)
+        })
         .collect::<Vec<_>>();
     let w = geometry.w();
     for vector in 0..case.history_rows * geometry.kv {
@@ -395,8 +439,10 @@ fn check(label: &str, encoded: &Encoded, gated: &Tensor, bound: &Bound, expected
                 let step = |coefficients: &[u16]| {
                     f16_to_f32(coefficients[vector * coefficient_elements(w) + column / GROUP * 2])
                 };
-                let (key_step, value_step) =
-                    (step(&expected.1.key_coefficients), step(&expected.1.value_coefficients));
+                let (key_step, value_step) = (
+                    step(&expected.1.key_coefficients),
+                    step(&expected.1.value_coefficients),
+                );
                 assert!(
                     (key[column] - expected_key[column]).abs()
                         <= 1.01 * key_step + 8.0e-3 * expected_key[column].abs().max(1.0),
@@ -412,7 +458,11 @@ fn check(label: &str, encoded: &Encoded, gated: &Tensor, bound: &Bound, expected
                 );
             }
         } else {
-            assert_eq!((key, value), (expected_key, expected_value), "{label}: vector {vector} was not appended to");
+            assert_eq!(
+                (key, value),
+                (expected_key, expected_value),
+                "{label}: vector {vector} was not appended to"
+            );
         }
     }
     eprintln!("{label}: max |gated error| {worst:.2e}");
@@ -424,7 +474,7 @@ fn check(label: &str, encoded: &Encoded, gated: &Tensor, bound: &Bound, expected
 /// tolerance.
 fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
     use seismic_lang::{
-        checked::{SourceFile, check_source},
+        checked::{check_source, SourceFile},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -454,10 +504,19 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
     let floats = |values: &[f32]| values.iter().map(|x| f64::from(*x)).collect::<Vec<_>>();
     let ints = |values: &[i32]| values.iter().map(|x| f64::from(*x)).collect::<Vec<_>>();
     let unsigned = |values: &[u32]| values.iter().map(|x| f64::from(*x)).collect::<Vec<_>>();
-    let halves = |values: &[u16]| values.iter().map(|x| f64::from(f16_to_f32(*x))).collect::<Vec<_>>();
+    let halves = |values: &[u16]| {
+        values
+            .iter()
+            .map(|x| f64::from(f16_to_f32(*x)))
+            .collect::<Vec<_>>()
+    };
     let planes = &encoded.planes;
     let args = vec![
-        tensor(DType::BF16, vec![m, kv * g * 2 * w], floats(&case.query_gate)),
+        tensor(
+            DType::BF16,
+            vec![m, kv * g * 2 * w],
+            floats(&case.query_gate),
+        ),
         tensor(DType::BF16, vec![m, kv * w], floats(&case.key)),
         tensor(DType::BF16, vec![m, kv * w], floats(&case.value)),
         tensor(DType::F32, vec![w], floats(&case.query_norm)),
@@ -469,9 +528,21 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
         tensor(DType::I32, vec![m, 2], ints(&case.fresh)),
         tensor(DType::I32, vec![m], ints(&case.destinations)),
         tensor(DType::U32, vec![t, kv, w / 4], unsigned(&planes.key_codes)),
-        tensor(DType::F16, vec![t, kv, coefficient_elements(w)], halves(&planes.key_coefficients)),
-        tensor(DType::U32, vec![t, kv, w / 8], unsigned(&planes.value_codes)),
-        tensor(DType::F16, vec![t, kv, coefficient_elements(w)], halves(&planes.value_coefficients)),
+        tensor(
+            DType::F16,
+            vec![t, kv, coefficient_elements(w)],
+            halves(&planes.key_coefficients),
+        ),
+        tensor(
+            DType::U32,
+            vec![t, kv, w / 8],
+            unsigned(&planes.value_codes),
+        ),
+        tensor(
+            DType::F16,
+            vec![t, kv, coefficient_elements(w)],
+            halves(&planes.value_coefficients),
+        ),
         Arg::Scalar(ReferenceScalar::F32(case.epsilon.to_bits())),
         Arg::Scalar(ReferenceScalar::F32(case.scale.to_bits())),
     ];
@@ -493,9 +564,14 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
     }
     let inputs = outcome.inputs().collect::<Vec<_>>();
     let read = |ordinal: usize| {
-        let input = inputs.iter().find(|input| input.ordinal() == ordinal).unwrap();
+        let input = inputs
+            .iter()
+            .find(|input| input.ordinal() == ordinal)
+            .unwrap();
         let tensor = input.tensor();
-        (0..tensor.element_count()).map(|index| tensor.read(index).unwrap()).collect::<Vec<_>>()
+        (0..tensor.element_count())
+            .map(|index| tensor.read(index).unwrap())
+            .collect::<Vec<_>>()
     };
     let portable = Planes {
         key_codes: read(11).into_iter().map(|x| x as u32).collect(),
@@ -503,16 +579,24 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
         value_codes: read(13).into_iter().map(|x| x as u32).collect(),
         value_coefficients: read(14).into_iter().map(|x| f16_bits(x as f32)).collect(),
     };
-    assert_eq!(portable.value_codes, expected.1.value_codes, "{entry} portable value codes");
-    assert_eq!(portable.value_coefficients, expected.1.value_coefficients, "{entry} portable value coefficients");
+    assert_eq!(
+        portable.value_codes, expected.1.value_codes,
+        "{entry} portable value codes"
+    );
+    assert_eq!(
+        portable.value_coefficients, expected.1.value_coefficients,
+        "{entry} portable value coefficients"
+    );
     for vector in 0..t * kv {
         let (key, _) = portable.decoded(case.geometry, vector);
         let (expected_key, _) = expected.1.decoded(case.geometry, vector);
         for column in 0..w {
-            let step =
-                f16_to_f32(expected.1.key_coefficients[vector * coefficient_elements(w) + column / GROUP * 2]);
+            let step = f16_to_f32(
+                expected.1.key_coefficients[vector * coefficient_elements(w) + column / GROUP * 2],
+            );
             assert!(
-                (key[column] - expected_key[column]).abs() <= 1.01 * step + 8.0e-3 * expected_key[column].abs().max(1.0),
+                (key[column] - expected_key[column]).abs()
+                    <= 1.01 * step + 8.0e-3 * expected_key[column].abs().max(1.0),
                 "{entry} portable key vector {vector}[{column}] {}, host model {}",
                 key[column],
                 expected_key[column]
@@ -536,8 +620,17 @@ fn decode_matches_portable_body_on(device: &Device, encoded: &Encoded) {
     for config in decode_configs(backend) {
         let kernel = decode_kernel(device, GROUPED, &config);
         let mut bound = Bound::new(device, encoded);
-        let gated = kernel.call(args!(gated_attention_decode_k8v4, bound, encoded.case)).unwrap().value;
-        check(&format!("{backend:?} grouped decode {config:?}"), encoded, &gated, &bound, &expected);
+        let gated = kernel
+            .call(args!(gated_attention_decode_k8v4, bound, encoded.case))
+            .unwrap()
+            .value;
+        check(
+            &format!("{backend:?} grouped decode {config:?}"),
+            encoded,
+            &gated,
+            &bound,
+            &expected,
+        );
     }
 }
 
@@ -560,8 +653,17 @@ fn prefill_matches_portable_body_on(device: &Device, encoded: &Encoded) {
     for config in prefill_configs(backend) {
         let kernel = prefill_kernel(device, SMALL, &config);
         let mut bound = Bound::new(device, encoded);
-        let gated = kernel.call(args!(gated_attention_prefill_k8v4, bound, encoded.case)).unwrap().value;
-        check(&format!("{backend:?} small prefill {config:?}"), encoded, &gated, &bound, &expected);
+        let gated = kernel
+            .call(args!(gated_attention_prefill_k8v4, bound, encoded.case))
+            .unwrap()
+            .value;
+        check(
+            &format!("{backend:?} small prefill {config:?}"),
+            encoded,
+            &gated,
+            &bound,
+            &expected,
+        );
     }
 }
 
@@ -575,33 +677,77 @@ fn qwen_geometry_decode_and_prefill_match_host_model() {
 fn qwen_geometry_decode_and_prefill_match_host_model_on(device: &Device) {
     let backend = device.backend();
     for context in [256, 4096, 16384] {
-        let encoded = Encoded::new(Case::new(QWEN, context + 128, 2, &decode_rows(context as i32 - 40), 5));
+        let encoded = Encoded::new(Case::new(
+            QWEN,
+            context + 128,
+            2,
+            &decode_rows(context as i32 - 40),
+            5,
+        ));
         let expected = encoded.expected();
         for config in decode_configs(backend) {
             let kernel = decode_kernel(device, QWEN, &config);
             let mut bound = Bound::new(device, &encoded);
-            let gated = kernel.call(args!(gated_attention_decode_k8v4, bound, encoded.case)).unwrap().value;
-            check(&format!("{backend:?} decode context {context} {config:?}"), &encoded, &gated, &bound, &expected);
+            let gated = kernel
+                .call(args!(gated_attention_decode_k8v4, bound, encoded.case))
+                .unwrap()
+                .value;
+            check(
+                &format!("{backend:?} decode context {context} {config:?}"),
+                &encoded,
+                &gated,
+                &bound,
+                &expected,
+            );
         }
         for rows in [1, 8] {
-            let encoded = Encoded::new(Case::new(QWEN, context + rows, 1, &speculative_rows(rows, context as i32), 13));
+            let encoded = Encoded::new(Case::new(
+                QWEN,
+                context + rows,
+                1,
+                &speculative_rows(rows, context as i32),
+                13,
+            ));
             let expected = encoded.expected();
             let config = &decode_configs(backend)[0];
             let kernel = decode_kernel(device, QWEN, config);
             let mut bound = Bound::new(device, &encoded);
-            let gated = kernel.call(args!(gated_attention_decode_k8v4, bound, encoded.case)).unwrap().value;
-            check(&format!("{backend:?} speculative decode {rows} rows context {context} {config:?}"),
-                &encoded, &gated, &bound, &expected);
+            let gated = kernel
+                .call(args!(gated_attention_decode_k8v4, bound, encoded.case))
+                .unwrap()
+                .value;
+            check(
+                &format!("{backend:?} speculative decode {rows} rows context {context} {config:?}"),
+                &encoded,
+                &gated,
+                &bound,
+                &expected,
+            );
         }
     }
     for (rows, history) in [(40, 300), (128, 1000), (64, 4096), (48, 16384)] {
-        let encoded = Encoded::new(Case::new(QWEN, history as usize + 256, 2, &prefill_rows(rows, history), 7));
+        let encoded = Encoded::new(Case::new(
+            QWEN,
+            history as usize + 256,
+            2,
+            &prefill_rows(rows, history),
+            7,
+        ));
         let expected = encoded.expected();
         for config in prefill_configs(backend) {
             let kernel = prefill_kernel(device, QWEN, &config);
             let mut bound = Bound::new(device, &encoded);
-            let gated = kernel.call(args!(gated_attention_prefill_k8v4, bound, encoded.case)).unwrap().value;
-            check(&format!("{backend:?} prefill {rows} rows after {history} {config:?}"), &encoded, &gated, &bound, &expected);
+            let gated = kernel
+                .call(args!(gated_attention_prefill_k8v4, bound, encoded.case))
+                .unwrap()
+                .value;
+            check(
+                &format!("{backend:?} prefill {rows} rows after {history} {config:?}"),
+                &encoded,
+                &gated,
+                &bound,
+                &expected,
+            );
         }
     }
 }
@@ -672,11 +818,16 @@ fn decode_timing_on(device: &Device) {
             let kernel = decode_kernel(device, QWEN, &config);
             let mut bound = Bound::new(device, &encoded);
             let affine = kernel
-                .measure(vec![args!(gated_attention_decode_k8v4, bound, encoded.case)], &TIMING)
+                .measure(
+                    vec![args!(gated_attention_decode_k8v4, bound, encoded.case)],
+                    &TIMING,
+                )
                 .unwrap()
                 .median;
-            let affine_bytes =
-                (context * QWEN.kv * (QWEN.w() + QWEN.w() / 2 + 4 * coefficient_elements(QWEN.w()))) as f64;
+            let affine_bytes = (context
+                * QWEN.kv
+                * (QWEN.w() + QWEN.w() / 2 + 4 * coefficient_elements(QWEN.w())))
+                as f64;
             let dense_bytes = (context * QWEN.kv * QWEN.w() * 4) as f64;
             // The dense entry's domain may not admit this configuration.
             let dense_time = gated_attention_decode::native_for_device_with(
@@ -687,7 +838,15 @@ fn decode_timing_on(device: &Device) {
             .ok()
             .map(|dense_kernel| {
                 dense_kernel
-                    .measure(vec![dense_args!(gated_attention_decode, bound, dense, encoded.case)], &TIMING)
+                    .measure(
+                        vec![dense_args!(
+                            gated_attention_decode,
+                            bound,
+                            dense,
+                            encoded.case
+                        )],
+                        &TIMING,
+                    )
                     .unwrap()
                     .median
             });
@@ -727,13 +886,26 @@ fn prefill_timing_on(device: &Device) {
             .split(',')
             .map(|shape| {
                 let (rows, history) = shape.split_once('x').expect("shape is ROWSxHISTORY");
-                (rows.parse::<usize>().unwrap(), history.parse::<i32>().unwrap())
+                (
+                    rows.parse::<usize>().unwrap(),
+                    history.parse::<i32>().unwrap(),
+                )
             })
             .collect::<Vec<_>>(),
-        Err(_) => vec![(128usize, 0i32), (512, 0), (512, 4096), (512, 16384), (512, 65536)],
+        Err(_) => vec![
+            (128usize, 0i32),
+            (512, 0),
+            (512, 4096),
+            (512, 16384),
+            (512, 65536),
+        ],
     };
     for (rows, history) in rows_history {
-        let spans = if history > 0 { vec![(0, history)] } else { vec![] };
+        let spans = if history > 0 {
+            vec![(0, history)]
+        } else {
+            vec![]
+        };
         let rows = (0..rows)
             .map(|row| Row {
                 spans: spans.clone(),
@@ -742,7 +914,10 @@ fn prefill_timing_on(device: &Device) {
                 position: history + row as i32,
             })
             .collect::<Vec<_>>();
-        let pairs = rows.iter().map(|row| (history + row.fresh.1 - row.fresh.0) as f64).sum::<f64>();
+        let pairs = rows
+            .iter()
+            .map(|row| (history + row.fresh.1 - row.fresh.0) as f64)
+            .sum::<f64>();
         let flop = pairs * (QWEN.kv * QWEN.g * QWEN.w() * 4) as f64;
         let encoded = Encoded::new(Case::new(QWEN, history as usize + rows.len(), 1, &rows, 9));
         let mut dense = DenseHistory::new(device, &encoded.case);
@@ -750,7 +925,10 @@ fn prefill_timing_on(device: &Device) {
             let kernel = prefill_kernel(device, QWEN, &config);
             let mut bound = Bound::new(device, &encoded);
             let affine = kernel
-                .measure(vec![args!(gated_attention_prefill_k8v4, bound, encoded.case)], &TIMING)
+                .measure(
+                    vec![args!(gated_attention_prefill_k8v4, bound, encoded.case)],
+                    &TIMING,
+                )
                 .unwrap()
                 .median;
             let dense_kernel = gated_attention_prefill::native_for_device_with(
@@ -760,7 +938,15 @@ fn prefill_timing_on(device: &Device) {
             )
             .unwrap();
             let dense_time = dense_kernel
-                .measure(vec![dense_args!(gated_attention_prefill, bound, dense, encoded.case)], &TIMING)
+                .measure(
+                    vec![dense_args!(
+                        gated_attention_prefill,
+                        bound,
+                        dense,
+                        encoded.case
+                    )],
+                    &TIMING,
+                )
                 .unwrap()
                 .median;
             eprintln!(

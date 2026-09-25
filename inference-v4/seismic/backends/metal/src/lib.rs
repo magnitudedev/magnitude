@@ -48,7 +48,7 @@ pub use command::Pipeline;
 pub use compile::NativeCandidate;
 pub use device::{DeviceHandle, MetalBuffer, MetalDevice};
 pub use direct::{
-    host_seconds, DirectBatch, LaunchTimestamps, DirectLaunch, DirectPipeline, DirectSubmission,
+    host_seconds, DirectBatch, DirectLaunch, DirectPipeline, DirectSubmission, LaunchTimestamps,
     DIRECT_BUFFER_SLOTS, DIRECT_WORD_BYTES_LIMIT,
 };
 pub use executor::MetalExecutor;

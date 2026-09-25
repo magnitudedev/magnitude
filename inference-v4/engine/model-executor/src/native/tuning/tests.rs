@@ -3,10 +3,8 @@ use super::*;
 use crate::native::import::ImportKernels;
 use crate::planning::tests::{fixture_definition, fixture_manifest};
 use crate::{ComponentSelection, ModelLoadPlan};
-use magnitude_model_kernels::dense_output;
-use seismic::{
-    BackendName, ConfigurationRecord, DeviceCatalog, Exclusion, LoadError, Outcome,
-};
+use magnitude_model_kernels::{dense_output, shape_rows};
+use seismic::{BackendName, ConfigurationRecord, DeviceCatalog, Exclusion, LoadError, Outcome};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -17,18 +15,50 @@ const LIMITS: TuningLimits = TuningLimits {
 };
 
 #[test]
+fn stored_cpu_choice_accepts_device_owned_parameters() {
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Cpu)
+        .unwrap();
+    let implementation = seismic::generated::native_implementation::<shape_rows::Entry>(&device)
+        .unwrap()
+        .unwrap();
+    let choice = implementation
+        .default_specialization(&NativeSpecialization::new())
+        .unwrap()
+        .with_param("cpu.tier", 0)
+        .with_param("cpu.workers.0", 0)
+        .with_param("cpu.workers.1", 0);
+    assert!(implementation.validate(&choice).is_err());
+    assert!(
+        seismic::generated::native_specialization_valid::<shape_rows::Entry>(&device, &choice)
+            .unwrap()
+    );
+}
+
+#[test]
 fn row_points_follow_the_shape_ladder_and_normalize_weights() {
     let points = row_points(LIMITS);
     assert_eq!(
         points.iter().map(|point| point.rows).collect::<Vec<_>>(),
-        REPRESENTATIVE_ROWS
+        TUNING_ROWS
     );
     let total = points.iter().map(|point| point.weight).sum::<f64>();
     assert!((total - 1.0).abs() < 1e-12);
-    // Each representative carries the shares of its nearest row counts:
-    // 1; 2, 4, 8; 16, 32, 64; 128, 256; 512.
+    // Each served row class retains its own share of step time.
     let weights = points.iter().map(|point| point.weight).collect::<Vec<_>>();
-    for (weight, expected) in weights.iter().zip([0.40, 0.20, 0.175, 0.15, 0.075]) {
+    for (weight, expected) in weights.iter().zip([
+        0.40,
+        0.20 / 3.0,
+        0.20 / 3.0,
+        0.20 / 3.0,
+        0.05,
+        0.05,
+        0.075,
+        0.075,
+        0.075,
+        0.075,
+    ]) {
         assert!((weight - expected).abs() < 1e-12, "{weights:?}");
     }
     let bounded = row_points(TuningLimits {
@@ -37,21 +67,110 @@ fn row_points_follow_the_shape_ladder_and_normalize_weights() {
     });
     assert_eq!(
         bounded.iter().map(|point| point.rows).collect::<Vec<_>>(),
-        [1, 4, 32]
+        [1, 2, 4, 8, 16, 32]
     );
     assert!((bounded.iter().map(|point| point.weight).sum::<f64>() - 1.0).abs() < 1e-12);
 }
 
 #[test]
+fn cpu_projection_screening_folds_shares_but_preserves_served_points() {
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Cpu)
+        .unwrap();
+    let points = row_points(LIMITS);
+    let screening = cpu_projection_screening(&device, &points);
+    assert_eq!(
+        screening
+            .iter()
+            .map(|point| points[point.index].rows)
+            .collect::<Vec<_>>(),
+        [1, 8, 32, 128]
+    );
+    for (point, expected) in screening
+        .iter()
+        .zip([0.40 + 0.20 / 3.0, 0.40 / 3.0, 0.10, 0.30])
+    {
+        assert!((point.weight - expected).abs() < 1e-12, "{screening:?}");
+    }
+    assert!((screening.iter().map(|point| point.weight).sum::<f64>() - 1.0).abs() < 1e-12);
+    assert_eq!(points.len(), 10);
+    assert!((points.iter().map(|point| point.weight).sum::<f64>() - 1.0).abs() < 1e-12);
+}
+
+#[test]
+fn screening_policy_is_part_of_the_tuning_cache_identity() {
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Cpu)
+        .unwrap();
+    let points = row_points(LIMITS);
+    let full = tuning_key_material(
+        &device,
+        "dense_output",
+        "A=bf16",
+        &NativeSpecialization::new(),
+        "same-implementation",
+        7,
+        &points,
+        &[],
+    );
+    let screened = tuning_key_material(
+        &device,
+        "dense_output",
+        "A=bf16",
+        &NativeSpecialization::new(),
+        "same-implementation",
+        7,
+        &points,
+        &cpu_projection_screening(&device, &points),
+    );
+    assert_ne!(full, screened);
+    assert!(!full.contains("\nscreening "));
+    assert!(screened.contains("\nscreening cpu-projection-3 "));
+    assert!(full.contains("samples: 3"));
+    assert!(screened.contains("samples: 1"));
+    assert!(full.contains("confirmation_samples: 7"));
+    assert!(screened.contains("confirmation_samples: 5"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_sample_policy_is_part_of_the_tuning_cache_identity() {
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Metal)
+        .unwrap();
+    let key = tuning_key_material(
+        &device,
+        "dense_output",
+        "A=bf16",
+        &NativeSpecialization::new(),
+        "same-implementation",
+        7,
+        &row_points(LIMITS),
+        &[],
+    );
+    assert!(key.contains("search 9"));
+    assert!(key.contains("samples: 1"));
+    assert!(key.contains("confirmation_samples: 5"));
+    assert!(key.contains("confirmed: 3"));
+}
+
+#[test]
 fn attention_points_cross_rows_with_served_contexts() {
     let points = attention_points(LIMITS);
-    assert_eq!(points.len(), REPRESENTATIVE_ROWS.len() * 3, "64k exceeds the served context");
+    assert_eq!(
+        points.len(),
+        TUNING_ROWS.len() * 3,
+        "64k exceeds the served context"
+    );
     assert!(points.iter().all(|point| point.context.unwrap() <= 16384));
     assert_eq!(points[0].label, "m1-c256");
     // The history lengths of one row point form its class.
     assert_eq!(points[0].class.as_deref(), Some("m1"));
     assert_eq!(points[2].class.as_deref(), Some("m1"));
-    assert_eq!(points[3].class.as_deref(), Some("m4"));
+    assert_eq!(points[3].class.as_deref(), Some("m2"));
     assert!((points.iter().map(|point| point.weight).sum::<f64>() - 1.0).abs() < 1e-12);
     let short = attention_points(TuningLimits {
         max_rows: 1,
@@ -67,16 +186,19 @@ fn served_points_keep_an_entry_whose_rows_exceed_the_bound() {
     let chunked = served_row_points(512, |rows| rows >= 16);
     assert_eq!(
         chunked.iter().map(|point| point.rows).collect::<Vec<_>>(),
-        [32, 256, 512]
+        [16, 32, 64, 128, 256, 512]
     );
     let decode = served_row_points(512, |rows| rows <= 8);
     assert_eq!(
         decode.iter().map(|point| point.rows).collect::<Vec<_>>(),
-        [1, 4]
+        [1, 2, 4, 8]
     );
-    // A bound between representatives folds the rest into the largest.
+    // A bound admits only the served rows at or below it.
     let short = served_row_points(16, |rows| rows >= 16);
-    assert_eq!(short.iter().map(|point| point.rows).collect::<Vec<_>>(), [16]);
+    assert_eq!(
+        short.iter().map(|point| point.rows).collect::<Vec<_>>(),
+        [16]
+    );
     assert!((chunked.iter().map(|point| point.weight).sum::<f64>() - 1.0).abs() < 1e-12);
     let stand_in = served_row_points(8, |rows| rows >= 16);
     assert_eq!(stand_in.len(), 1);
@@ -167,17 +289,38 @@ struct FakeCase {
 impl FakeCase {
     /// A case choosing the defaults with `ROWS` 2 (admissible, not the
     /// default).
-    fn new(implementation: &NativeImplementation, statics: &NativeSpecialization, digest: &str) -> Self {
+    fn new(
+        implementation: &NativeImplementation,
+        statics: &NativeSpecialization,
+        digest: &str,
+    ) -> Self {
         let chosen = implementation
             .default_specialization(statics)
             .unwrap()
-            .with_param("ROWS", 2);
+            .with_launch_param(0, "ROWS", 2);
         Self {
             seen: RefCell::new(Vec::new()),
             digest: digest.into(),
             chosen: Configuration {
                 statics: chosen.statics().clone(),
                 params: chosen.params().clone(),
+                launches: implementation
+                    .launches
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, launch)| {
+                        launch
+                            .params
+                            .iter()
+                            .map(|parameter| {
+                                (
+                                    parameter.name.clone(),
+                                    chosen.launch_param(ordinal, &parameter.name).unwrap(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .collect(),
             },
         }
     }
@@ -241,15 +384,8 @@ impl EntryTuning for FakeCase {
                 .iter()
                 .map(|point| (point.label.clone(), point.weight, point.rotation.len())),
         );
-        let rejected = Configuration {
-            params: self
-                .chosen
-                .params
-                .iter()
-                .map(|(name, value)| (name.clone(), if name == "ROWS" { 4 } else { *value }))
-                .collect(),
-            ..self.chosen.clone()
-        };
+        let mut rejected = self.chosen.clone();
+        rejected.launches[0].insert("ROWS".into(), 4);
         assert_eq!(&self.chosen.statics, statics.statics());
         Ok(TuningResult {
             tuning_identity: "fake-device".into(),
@@ -288,11 +424,16 @@ impl EntryTuning for FakeCase {
                 budget: 2,
                 settings: SEARCH_SETTINGS,
                 stop: SearchStop::Exhausted,
+                screening: Vec::new(),
             },
             time: TuningTime::default(),
         })
     }
-    fn digest(&self, _device: &Device, _statics: &NativeSpecialization) -> Result<String, TuneError> {
+    fn digest(
+        &self,
+        _device: &Device,
+        _statics: &NativeSpecialization,
+    ) -> Result<String, TuneError> {
         Ok(self.digest.clone())
     }
     fn prepare(
@@ -336,9 +477,12 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
     let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
         .unwrap()
         .unwrap();
-    let statics = implementation.statics.iter().fold(NativeSpecialization::new(), |spec, name| {
-        spec.with_static(name.clone(), if name == "H" { 8 } else { 16 })
-    });
+    let statics = implementation
+        .statics
+        .iter()
+        .fold(NativeSpecialization::new(), |spec, name| {
+            spec.with_static(name.clone(), if name == "H" { 8 } else { 16 })
+        });
     let case = FakeCase::new(&implementation, &statics, "fake");
     let configurations = implementation.admissible(&statics).unwrap().len();
     // A census counts the unit without tuning it.
@@ -349,7 +493,10 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
         TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
     );
     let default = census.tune(&case, &implementation, &statics).unwrap();
-    assert_eq!(default, implementation.default_specialization(&statics).unwrap());
+    assert_eq!(
+        default,
+        implementation.default_specialization(&statics).unwrap()
+    );
     assert!(case.seen.borrow().is_empty() && recorder.0.borrow().is_empty());
     let budgets = census.budgets();
     assert_eq!(
@@ -364,20 +511,24 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
         budgets,
     );
     let chosen = tuner.tune(&case, &implementation, &statics).unwrap();
-    assert_eq!(chosen.param("ROWS"), Some(2));
+    assert_eq!(chosen.launch_param(0, "ROWS"), Some(2));
     let seen = case.seen.borrow();
     assert_eq!(
-        seen.iter().map(|(label, _, _)| label.as_str()).collect::<Vec<_>>(),
-        ["m1", "m4", "m32"]
+        seen.iter()
+            .map(|(label, _, _)| label.as_str())
+            .collect::<Vec<_>>(),
+        ["m1", "m2", "m4", "m8", "m16", "m32", "m64"]
     );
-    assert!(seen.iter().all(|(_, _, rotation)| *rotation == ROTATION_LAYERS));
+    assert!(seen
+        .iter()
+        .all(|(_, _, rotation)| *rotation == ROTATION_LAYERS));
     let events = recorder.0.borrow();
     assert!(matches!(
         &events[0],
         TuningEvent::Started {
             entry: "dense_output",
             configurations: count,
-            points: 3,
+            points: 7,
             ..
         } if *count == configurations
     ));
@@ -407,9 +558,12 @@ fn a_stored_tuning_result_is_used_without_tuning_and_a_changed_key_misses() {
     let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
         .unwrap()
         .unwrap();
-    let statics = implementation.statics.iter().fold(NativeSpecialization::new(), |spec, name| {
-        spec.with_static(name.clone(), if name == "H" { 8 } else { 16 })
-    });
+    let statics = implementation
+        .statics
+        .iter()
+        .fold(NativeSpecialization::new(), |spec, name| {
+            spec.with_static(name.clone(), if name == "H" { 8 } else { 16 })
+        });
     let limits = TuningLimits {
         max_rows: 64,
         max_projected_rows: 8,
@@ -450,11 +604,20 @@ fn a_stored_tuning_result_is_used_without_tuning_and_a_changed_key_misses() {
     let again = FakeCase::new(&implementation, &statics, "implementation a");
     let (stored, started) = load_once(&again, limits);
     assert_eq!(stored.origin, TuningOrigin::Stored);
-    assert!(!started && again.seen.borrow().is_empty(), "a stored result is not tuned");
+    assert!(
+        !started && again.seen.borrow().is_empty(),
+        "a stored result is not tuned"
+    );
     assert_eq!(stored.overall, searched.overall);
-    assert_eq!(stored.overall.params["ROWS"], 2);
-    assert_eq!((stored.measured, stored.excluded), (searched.measured, searched.excluded));
-    assert_eq!((stored.search, stored.time.clone()), (None, TuningTime::default()));
+    assert_eq!(stored.overall.launches[0]["ROWS"], 2);
+    assert_eq!(
+        (stored.measured, stored.excluded),
+        (searched.measured, searched.excluded)
+    );
+    assert_eq!(
+        (stored.search, stored.time.clone()),
+        (None, TuningTime::default())
+    );
     assert_eq!(stored_results(), 1);
 
     // A changed implementation digest, and changed tuning points, are new
@@ -466,7 +629,10 @@ fn a_stored_tuning_result_is_used_without_tuning_and_a_changed_key_misses() {
         ..limits
     };
     let rebounded = FakeCase::new(&implementation, &statics, "implementation a");
-    assert_eq!(load_once(&rebounded, narrower).0.origin, TuningOrigin::Searched);
+    assert_eq!(
+        load_once(&rebounded, narrower).0.origin,
+        TuningOrigin::Searched
+    );
     assert_eq!(stored_results(), 3);
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -485,9 +651,12 @@ fn tuning_a_weight_without_its_import_entry_is_a_typed_failure() {
     let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
         .unwrap()
         .unwrap();
-    let statics = implementation.statics.iter().fold(NativeSpecialization::new(), |spec, name| {
-        spec.with_static(name.clone(), 8)
-    });
+    let statics = implementation
+        .statics
+        .iter()
+        .fold(NativeSpecialization::new(), |spec, name| {
+            spec.with_static(name.clone(), 8)
+        });
     let case = DenseOutputTuning {
         down: Element::bf16(),
         activation: Element::bf16(),
@@ -550,7 +719,9 @@ fn tuning_batches_are_packed_by_the_batch_builder() {
     let activation = inputs.activation(Element::bf16(), &[4, 4], 1).unwrap();
     assert_eq!(activation.extents(), [4, 4]);
     let first = inputs
-        .shared("arena".into(), |inputs| inputs.scratch(Element::f32(), &[4]))
+        .shared("arena".into(), |inputs| {
+            inputs.scratch(Element::f32(), &[4])
+        })
         .unwrap();
     let again = inputs
         .shared("arena".into(), |_| Err("built twice".into()))
@@ -583,10 +754,7 @@ fn case_state_restores_its_written_rows() {
     let tensor = inputs.f32s(&[4, 2], &values).unwrap();
     let mut state = inputs.state(tensor, 1..3).unwrap();
     let mut other = state.share();
-    other
-        .tensor_mut()
-        .write_from_host(&[0u8; 32])
-        .unwrap();
+    other.tensor_mut().write_from_host(&[0u8; 32]).unwrap();
     let mut restore = initializer(vec![&state]).unwrap();
     restore().unwrap();
     let bytes = state.tensor_mut().read_to_host().unwrap();

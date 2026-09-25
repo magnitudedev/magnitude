@@ -114,8 +114,8 @@ pub struct Matrix {
 
 impl Matrix {
     pub fn load(path: &Path) -> Self {
-        let text = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let text =
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         Self::parse(&text)
     }
 

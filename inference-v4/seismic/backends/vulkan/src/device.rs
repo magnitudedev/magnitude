@@ -35,12 +35,20 @@ pub enum OpenError {
     /// `a * b + c` of the same operands is not one fused operation (or the
     /// expression is contracted), so `seismic_fma_rn` cannot be bound: the
     /// device fails the floor (§16.1). The bits of both witness results.
-    MultiplyAdd { fma: u32, separate: u32 },
+    MultiplyAdd {
+        fma: u32,
+        separate: u32,
+    },
     /// Where modules do not declare `RoundingModeRTE 32`, the device's
     /// default fp32 rounding of `operation` is not round-to-nearest-even on
     /// the witness `operands` (a, b, integer): the device fails the floor
     /// (§16.1). The expected and actual result bits.
-    Rounding { operation: Rounded, operands: [u32; 3], expected: u32, actual: u32 },
+    Rounding {
+        operation: Rounded,
+        operands: [u32; 3],
+        expected: u32,
+        actual: u32,
+    },
 }
 
 /// An fp32 operation whose rounding the open-time probe checks.
@@ -211,8 +219,16 @@ impl Device {
         self.allocate_kind(StorageKind::Upload, bytes, alignment)
     }
 
-    fn allocate_kind(&self, kind: StorageKind, bytes: u64, alignment: u64) -> Result<Buffer, ExecutionError> {
-        let range = self.inner.memory.allocate(&self.inner.device, kind, bytes, alignment)?;
+    fn allocate_kind(
+        &self,
+        kind: StorageKind,
+        bytes: u64,
+        alignment: u64,
+    ) -> Result<Buffer, ExecutionError> {
+        let range = self
+            .inner
+            .memory
+            .allocate(&self.inner.device, kind, bytes, alignment)?;
         Ok(Buffer::new(self.inner.clone(), range))
     }
 
@@ -228,21 +244,30 @@ impl Device {
         let mut done = 0usize;
         while done < bytes.len() {
             let length = (bytes.len() - done).min(STAGING_BYTES as usize);
-            let _staging = self.transfer(|staging| {
-                staging.write_mapped(0, &bytes[done..done + length]);
-                vk::BufferCopy {
-                    src_offset: staging.offset(),
-                    dst_offset: range.offset() + offset + done as u64,
-                    size: length as u64,
-                }
-            }, range, true)?;
+            let _staging = self.transfer(
+                |staging| {
+                    staging.write_mapped(0, &bytes[done..done + length]);
+                    vk::BufferCopy {
+                        src_offset: staging.offset(),
+                        dst_offset: range.offset() + offset + done as u64,
+                        size: length as u64,
+                    }
+                },
+                range,
+                true,
+            )?;
             done += length;
         }
         Ok(())
     }
 
     /// Host read; see [`Device::write`].
-    pub fn read(&self, buffer: &Buffer, offset: u64, into: &mut [u8]) -> Result<(), ExecutionError> {
+    pub fn read(
+        &self,
+        buffer: &Buffer,
+        offset: u64,
+        into: &mut [u8],
+    ) -> Result<(), ExecutionError> {
         let range = buffer.range();
         if range.mapped().is_some() {
             range.read_mapped(offset, into);
@@ -251,11 +276,15 @@ impl Device {
         let mut done = 0usize;
         while done < into.len() {
             let length = (into.len() - done).min(STAGING_BYTES as usize);
-            let staging = self.transfer(|staging| vk::BufferCopy {
-                src_offset: range.offset() + offset + done as u64,
-                dst_offset: staging.offset(),
-                size: length as u64,
-            }, range, false)?;
+            let staging = self.transfer(
+                |staging| vk::BufferCopy {
+                    src_offset: range.offset() + offset + done as u64,
+                    dst_offset: staging.offset(),
+                    size: length as u64,
+                },
+                range,
+                false,
+            )?;
             staging
                 .as_ref()
                 .expect("a transfer leaves its staging in place")
@@ -277,7 +306,10 @@ impl Device {
     ) -> Result<MutexGuard<'_, Option<Staging>>, ExecutionError> {
         let inner = &self.inner;
         let device = &inner.device;
-        let mut guard = inner.staging.lock().expect("staging lock is never poisoned");
+        let mut guard = inner
+            .staging
+            .lock()
+            .expect("staging lock is never poisoned");
         if guard.is_none() {
             *guard = Some(inner.create_staging()?);
         }
@@ -297,7 +329,8 @@ impl Device {
             call(
                 device.begin_command_buffer(
                     command,
-                    &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                 ),
                 "vkBeginCommandBuffer",
             )?;
@@ -316,7 +349,9 @@ impl Device {
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_WRITE,
                 vk::PipelineStageFlags2::HOST | vk::PipelineStageFlags2::ALL_COMMANDS,
-                vk::AccessFlags2::HOST_READ | vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+                vk::AccessFlags2::HOST_READ
+                    | vk::AccessFlags2::MEMORY_READ
+                    | vk::AccessFlags2::MEMORY_WRITE,
             );
             call(device.end_command_buffer(command), "vkEndCommandBuffer")?;
         }
@@ -339,7 +374,11 @@ impl Device {
             .command_buffer_infos(&commands)
             .signal_semaphore_infos(&signal);
         call(
-            unsafe { inner.device.queue_submit2(queue.raw, &[submit], vk::Fence::null()) },
+            unsafe {
+                inner
+                    .device
+                    .queue_submit2(queue.raw, &[submit], vk::Fence::null())
+            },
             "vkQueueSubmit2",
         )?;
         queue.next += 1;
@@ -349,18 +388,32 @@ impl Device {
     /// The timeline value every completed submission has reached. A failed
     /// query means the work cannot make progress: it reads as complete.
     pub(crate) fn completed(&self) -> u64 {
-        unsafe { self.inner.device.get_semaphore_counter_value(self.inner.timeline) }.unwrap_or(u64::MAX)
+        unsafe {
+            self.inner
+                .device
+                .get_semaphore_counter_value(self.inner.timeline)
+        }
+        .unwrap_or(u64::MAX)
     }
 
     pub(crate) fn wait(&self, value: u64) -> Result<(), ExecutionError> {
         let semaphores = [self.inner.timeline];
         let values = [value];
-        let info = vk::SemaphoreWaitInfo::default().semaphores(&semaphores).values(&values);
-        call(unsafe { self.inner.device.wait_semaphores(&info, u64::MAX) }, "vkWaitSemaphores")
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        call(
+            unsafe { self.inner.device.wait_semaphores(&info, u64::MAX) },
+            "vkWaitSemaphores",
+        )
     }
 
     pub(crate) fn recording(&self) -> MutexGuard<'_, Recording> {
-        let mut recording = self.inner.recording.lock().expect("recording lock is never poisoned");
+        let mut recording = self
+            .inner
+            .recording
+            .lock()
+            .expect("recording lock is never poisoned");
         let completed = self.completed();
         let mut index = 0;
         while index < recording.retired.len() {
@@ -369,7 +422,9 @@ impl Device {
                 match retired.command {
                     RetiredCommand::Primary(command) => recording.free_commands.push(command),
                     RetiredCommand::Secondary(command) => unsafe {
-                        self.inner.device.free_command_buffers(recording.pool, &[command])
+                        self.inner
+                            .device
+                            .free_command_buffers(recording.pool, &[command])
                     },
                 }
                 recording.free_queries.extend(retired.queries);
@@ -382,11 +437,19 @@ impl Device {
     }
 
     /// A primary command buffer, reset and ready to begin.
-    pub(crate) fn command(&self, recording: &mut Recording, level: vk::CommandBufferLevel) -> Result<vk::CommandBuffer, ExecutionError> {
+    pub(crate) fn command(
+        &self,
+        recording: &mut Recording,
+        level: vk::CommandBufferLevel,
+    ) -> Result<vk::CommandBuffer, ExecutionError> {
         if level == vk::CommandBufferLevel::PRIMARY {
             if let Some(command) = recording.free_commands.pop() {
                 call(
-                    unsafe { self.inner.device.reset_command_buffer(command, vk::CommandBufferResetFlags::empty()) },
+                    unsafe {
+                        self.inner
+                            .device
+                            .reset_command_buffer(command, vk::CommandBufferResetFlags::empty())
+                    },
                     "vkResetCommandBuffer",
                 )?;
                 return Ok(command);
@@ -396,30 +459,49 @@ impl Device {
             .command_pool(recording.pool)
             .level(level)
             .command_buffer_count(1);
-        call(unsafe { self.inner.device.allocate_command_buffers(&info) }, "vkAllocateCommandBuffers")
-            .map(|commands| commands[0])
+        call(
+            unsafe { self.inner.device.allocate_command_buffers(&info) },
+            "vkAllocateCommandBuffers",
+        )
+        .map(|commands| commands[0])
     }
 
     /// A timestamp query pool of at least `queries` queries.
-    pub(crate) fn queries(&self, recording: &mut Recording, queries: u32) -> Result<(vk::QueryPool, u32), ExecutionError> {
-        if let Some(index) = recording.free_queries.iter().position(|(_, capacity)| *capacity >= queries) {
+    pub(crate) fn queries(
+        &self,
+        recording: &mut Recording,
+        queries: u32,
+    ) -> Result<(vk::QueryPool, u32), ExecutionError> {
+        if let Some(index) = recording
+            .free_queries
+            .iter()
+            .position(|(_, capacity)| *capacity >= queries)
+        {
             return Ok(recording.free_queries.swap_remove(index));
         }
         let info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP)
             .query_count(queries);
-        call(unsafe { self.inner.device.create_query_pool(&info, None) }, "vkCreateQueryPool")
-            .map(|pool| (pool, queries))
+        call(
+            unsafe { self.inner.device.create_query_pool(&info, None) },
+            "vkCreateQueryPool",
+        )
+        .map(|pool| (pool, queries))
     }
 
     /// An argument chunk in upload storage.
-    pub(crate) fn argument_chunk(&self, recording: &mut Recording) -> Result<Range, ExecutionError> {
+    pub(crate) fn argument_chunk(
+        &self,
+        recording: &mut Recording,
+    ) -> Result<Range, ExecutionError> {
         match recording.free_chunks.pop() {
             Some(chunk) => Ok(chunk),
-            None => self
-                .inner
-                .memory
-                .allocate(&self.inner.device, StorageKind::Upload, ARGUMENT_CHUNK_BYTES, 256),
+            None => self.inner.memory.allocate(
+                &self.inner.device,
+                StorageKind::Upload,
+                ARGUMENT_CHUNK_BYTES,
+                256,
+            ),
         }
     }
 
@@ -445,7 +527,11 @@ impl Device {
         };
         let memory = properties.memory_properties;
         let heap = (0..memory.memory_heap_count as usize)
-            .filter(|index| memory.memory_heaps[*index].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+            .filter(|index| {
+                memory.memory_heaps[*index]
+                    .flags
+                    .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+            })
             .max_by_key(|index| memory.memory_heaps[*index].size)
             .expect("the floor requires a device-local heap");
         MemoryBudget {
@@ -469,7 +555,10 @@ pub(crate) unsafe fn barrier(
         .src_access_mask(source_access)
         .dst_stage_mask(destination_stage)
         .dst_access_mask(destination_access)];
-    device.cmd_pipeline_barrier2(command, &vk::DependencyInfo::default().memory_barriers(&barriers));
+    device.cmd_pipeline_barrier2(
+        command,
+        &vk::DependencyInfo::default().memory_barriers(&barriers),
+    );
 }
 
 fn creation<T>(result: Result<T, vk::Result>, what: &str) -> Result<T, OpenError> {
@@ -477,7 +566,11 @@ fn creation<T>(result: Result<T, vk::Result>, what: &str) -> Result<T, OpenError
 }
 
 impl Inner {
-    fn create(instance: &'static Instance, physical: vk::PhysicalDevice, facts: Facts) -> Result<Self, OpenError> {
+    fn create(
+        instance: &'static Instance,
+        physical: vk::PhysicalDevice,
+        facts: Facts,
+    ) -> Result<Self, OpenError> {
         let raw = instance.raw();
         let mut extensions: Vec<&CStr> = facts::FLOOR_EXTENSIONS.to_vec();
         if facts.matrix {
@@ -489,7 +582,10 @@ impl Inner {
         if facts.shader_fma.float32 {
             extensions.push(facts::SHADER_FMA_EXTENSION);
         }
-        let extension_names = extensions.iter().map(|name| name.as_ptr()).collect::<Vec<_>>();
+        let extension_names = extensions
+            .iter()
+            .map(|name| name.as_ptr())
+            .collect::<Vec<_>>();
         let mut shader_fma = facts::ShaderFmaFeatures::default();
         shader_fma.float16 = facts.shader_fma.float16.into();
         shader_fma.float32 = facts.shader_fma.float32.into();
@@ -500,10 +596,12 @@ impl Inner {
             .workgroup_memory_explicit_layout_scalar_block_layout(true)
             .workgroup_memory_explicit_layout8_bit_access(true)
             .workgroup_memory_explicit_layout16_bit_access(true);
-        let mut cooperative = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
-        let mut atomic_float =
-            vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default().shader_buffer_float32_atomic_add(true);
-        let mut f11 = vk::PhysicalDeviceVulkan11Features::default().storage_buffer16_bit_access(true);
+        let mut cooperative =
+            vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
+        let mut atomic_float = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default()
+            .shader_buffer_float32_atomic_add(true);
+        let mut f11 =
+            vk::PhysicalDeviceVulkan11Features::default().storage_buffer16_bit_access(true);
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(true)
             .shader_int8(true)
@@ -523,7 +621,11 @@ impl Inner {
             .compute_full_subgroups(true)
             .shader_integer_dot_product(true);
         let mut features = vk::PhysicalDeviceFeatures2::default()
-            .features(vk::PhysicalDeviceFeatures::default().shader_int64(true).shader_int16(true))
+            .features(
+                vk::PhysicalDeviceFeatures::default()
+                    .shader_int64(true)
+                    .shader_int16(true),
+            )
             .push_next(&mut f11)
             .push_next(&mut f12)
             .push_next(&mut f13)
@@ -545,7 +647,10 @@ impl Inner {
             .queue_create_infos(&queues)
             .enabled_extension_names(&extension_names)
             .push_next(&mut features);
-        let device = creation(unsafe { raw.create_device(physical, &info, None) }, "vkCreateDevice")?;
+        let device = creation(
+            unsafe { raw.create_device(physical, &info, None) },
+            "vkCreateDevice",
+        )?;
         // From here every created object is destroyed by `Drop` (null
         // handles are ignored), so partial construction cleans up.
         let queue = unsafe { device.get_device_queue(facts.queue_family, 0) };
@@ -564,7 +669,10 @@ impl Inner {
             layout: vk::PipelineLayout::null(),
             cache: vk::PipelineCache::null(),
             timeline: vk::Semaphore::null(),
-            queue: Mutex::new(Queue { raw: queue, next: 1 }),
+            queue: Mutex::new(Queue {
+                raw: queue,
+                next: 1,
+            }),
             recording: Mutex::new(Recording {
                 pool: vk::CommandPool::null(),
                 free_commands: Vec::new(),
@@ -582,7 +690,12 @@ impl Inner {
             .offset(0)
             .size(8)];
         inner.layout = creation(
-            unsafe { device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&ranges), None) },
+            unsafe {
+                device.create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&ranges),
+                    None,
+                )
+            },
             "vkCreatePipelineLayout",
         )?;
         inner.cache = creation(
@@ -593,42 +706,65 @@ impl Inner {
             .semaphore_type(vk::SemaphoreType::TIMELINE)
             .initial_value(0);
         inner.timeline = creation(
-            unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut timeline), None) },
+            unsafe {
+                device.create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(&mut timeline),
+                    None,
+                )
+            },
             "vkCreateSemaphore",
         )?;
         let pool = creation(
-            unsafe { device.create_command_pool(&command_pool_info(inner.facts.queue_family), None) },
+            unsafe {
+                device.create_command_pool(&command_pool_info(inner.facts.queue_family), None)
+            },
             "vkCreateCommandPool",
         )?;
-        inner.recording.get_mut().expect("recording lock is never poisoned").pool = pool;
+        inner
+            .recording
+            .get_mut()
+            .expect("recording lock is never poisoned")
+            .pool = pool;
         Ok(inner)
     }
 
     fn create_staging(&self) -> Result<Staging, ExecutionError> {
         let device = &self.device;
         let pool = call(
-            unsafe { device.create_command_pool(&command_pool_info(self.facts.queue_family), None) },
+            unsafe {
+                device.create_command_pool(&command_pool_info(self.facts.queue_family), None)
+            },
             "vkCreateCommandPool",
         )?;
         let info = vk::CommandBufferAllocateInfo::default()
             .command_pool(pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
-        let command = match call(unsafe { device.allocate_command_buffers(&info) }, "vkAllocateCommandBuffers") {
+        let command = match call(
+            unsafe { device.allocate_command_buffers(&info) },
+            "vkAllocateCommandBuffers",
+        ) {
             Ok(commands) => commands[0],
             Err(error) => {
                 unsafe { device.destroy_command_pool(pool, None) };
                 return Err(error);
             }
         };
-        let range = match self.memory.allocate(device, StorageKind::Staging, STAGING_BYTES, 256) {
+        let range = match self
+            .memory
+            .allocate(device, StorageKind::Staging, STAGING_BYTES, 256)
+        {
             Ok(range) => range,
             Err(error) => {
                 unsafe { device.destroy_command_pool(pool, None) };
                 return Err(error);
             }
         };
-        Ok(Staging { pool, command, range })
+        Ok(Staging {
+            pool,
+            command,
+            range,
+        })
     }
 }
 
@@ -643,7 +779,10 @@ impl Drop for Inner {
         let device = &self.device;
         unsafe {
             let _ = device.device_wait_idle();
-            let recording = self.recording.get_mut().expect("recording lock is never poisoned");
+            let recording = self
+                .recording
+                .get_mut()
+                .expect("recording lock is never poisoned");
             for retired in recording.retired.drain(..) {
                 recording.free_queries.extend(retired.queries);
             }
@@ -651,7 +790,12 @@ impl Drop for Inner {
                 device.destroy_query_pool(pool, None);
             }
             device.destroy_command_pool(recording.pool, None);
-            if let Some(staging) = self.staging.get_mut().expect("staging lock is never poisoned").take() {
+            if let Some(staging) = self
+                .staging
+                .get_mut()
+                .expect("staging lock is never poisoned")
+                .take()
+            {
                 device.destroy_command_pool(staging.pool, None);
             }
             self.memory.destroy(device);

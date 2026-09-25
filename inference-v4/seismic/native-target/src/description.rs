@@ -2,8 +2,8 @@ use crate::TargetDescriptionError;
 use seismic_ir::kernel::Kernel;
 use seismic_ir::physical_target::{
     AddressableResourceClass, AddressableResourceEmissionLayout, BindingEmissionLayout,
-    DataTypeSupport, KernelAbiLayout, KernelAbiModel, PhysicalDialect, KernelEmissionLayout,
-    KernelWordLayout, LocalEmissionLayout, LocalRealizationPolicy, NumericalEnvironment,
+    DataTypeSupport, KernelAbiLayout, KernelAbiModel, KernelEmissionLayout, KernelWordLayout,
+    LocalEmissionLayout, LocalRealizationPolicy, NumericalEnvironment, PhysicalDialect,
     RepresentationGeometry, ResourceClassId, TargetLimits, VectorSupport,
 };
 use seismic_lang::ids::{CapabilityId, IntrinsicId};

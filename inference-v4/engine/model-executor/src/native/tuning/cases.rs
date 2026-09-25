@@ -3,10 +3,12 @@
 //! shapes and model geometry, and builds every argument set from real
 //! resident weights of distinct layers plus case-owned activations.
 
-use super::{row_points, EntryTuning, PointShape, TuningInputs, TuningLimits};
+use super::{
+    cpu_projection_screening, row_points, EntryTuning, PointShape, TuningInputs, TuningLimits,
+};
 use magnitude_model_contracts::{WeightKind, WeightScope};
 use magnitude_model_kernels::{dense_expand, dense_output};
-use seismic::{Element, Tensor};
+use seismic::{Device, Element, ScreeningPoint, Tensor};
 
 /// The static dimensions `[rows, columns]` a projection weight fixes, checked
 /// to agree across every layer that shares the specialization.
@@ -91,6 +93,10 @@ impl EntryTuning for DenseExpandTuning {
         row_points(limits)
     }
 
+    fn screening(&self, device: &Device, points: &[PointShape]) -> Vec<ScreeningPoint> {
+        cpu_projection_screening(device, points)
+    }
+
     fn rotation(
         &self,
         inputs: &mut TuningInputs<'_, '_>,
@@ -170,6 +176,10 @@ impl EntryTuning for DenseOutputTuning {
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
         row_points(limits)
+    }
+
+    fn screening(&self, device: &Device, points: &[PointShape]) -> Vec<ScreeningPoint> {
+        cpu_projection_screening(device, points)
     }
 
     fn rotation(

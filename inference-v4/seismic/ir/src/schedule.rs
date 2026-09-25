@@ -6,10 +6,10 @@
 
 use crate::identity::OwnerToken;
 use crate::kernel::KernelId;
+use crate::physical_target::PhysicalDialect;
 use crate::region::{BranchResult, Product, RepeatCarry};
 use crate::repr::ScalarKind;
 use crate::storage::{AnyBufferView, BufferViewLayout, ScheduleRegionEdge, ScheduleUse};
-use crate::physical_target::PhysicalDialect;
 use seismic_lang::expr::{BoolExpr, ExprArena, IntExpr, LoopBinderId, NatExpr, SymbolId};
 use seismic_lang::types::DType;
 use std::marker::PhantomData;
@@ -23,7 +23,10 @@ pub struct AnyScalarSlot {
     capture: Option<SlotCapture>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct SlotCapture { owner: OwnerToken, index: u32 }
+struct SlotCapture {
+    owner: OwnerToken,
+    index: u32,
+}
 impl AnyScalarSlot {
     pub fn index(&self) -> u32 {
         self.index
@@ -73,10 +76,16 @@ pub enum HostValueExpr {
     Integer(IntExpr),
     Natural(NatExpr),
     Bool(BoolExpr),
-    Word { dtype: DType, value: IntExpr },
+    Word {
+        dtype: DType,
+        value: IntExpr,
+    },
     /// The language's float conversion of an exact integer (C1-19: one RNE
     /// rounding of the mathematical value to `dtype`).
-    Float { dtype: DType, value: IntExpr },
+    Float {
+        dtype: DType,
+        value: IntExpr,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -94,12 +103,24 @@ pub struct HostEvaluation {
     pub failure: Option<crate::kernel::ops::CheckSite>,
 }
 impl HostQuantitySlot {
-    pub fn kind(self) -> HostQuantityKind { self.kind }
-    pub fn symbol(self) -> SymbolId { self.symbol }
-    pub fn index(self) -> u32 { self.index }
-    pub(crate) fn owner(self) -> OwnerToken { self.owner }
+    pub fn kind(self) -> HostQuantityKind {
+        self.kind
+    }
+    pub fn symbol(self) -> SymbolId {
+        self.symbol
+    }
+    pub fn index(self) -> u32 {
+        self.index
+    }
+    pub(crate) fn owner(self) -> OwnerToken {
+        self.owner
+    }
     pub(crate) fn remap(self, owner: OwnerToken, index: u32) -> Self {
-        Self { owner, index, ..self }
+        Self {
+            owner,
+            index,
+            ..self
+        }
     }
 }
 
@@ -328,11 +349,22 @@ pub enum ScheduleStep {
     },
     /// Reached construction of one stored value. Selects its actual backing
     /// instance and acquires storage here when the allocation plan is reached.
-    BeginAllocationInstance { source: AnyBufferView, result: AnyBufferView },
-    BindArgumentTensor { source: AnyBufferView, result: AnyBufferView },
+    BeginAllocationInstance {
+        source: AnyBufferView,
+        result: AnyBufferView,
+    },
+    BindArgumentTensor {
+        source: AnyBufferView,
+        result: AnyBufferView,
+    },
     /// Capture the actual result descriptor at its successful source point.
     /// Visibility to the caller still requires successful terminal completion.
-    PublishTensor { view: AnyBufferView, path: Vec<u32>, bytes: NatExpr, declared_axes: Vec<NatExpr> },
+    PublishTensor {
+        view: AnyBufferView,
+        path: Vec<u32>,
+        bytes: NatExpr,
+        declared_axes: Vec<NatExpr>,
+    },
     Launch(LaunchId),
     Copy(BufferCopy),
     Fill(BufferFill),
@@ -416,10 +448,13 @@ impl<B: PhysicalDialect> ParametricSchedule<B> {
         // Count an additional copy for simultaneous old/next product capture.
         // These are bank identities only; reached bytes are never multiplied.
         for (ordinal, layout) in views.iter().enumerate() {
-            if !matches!(layout.base, ViewBase::TensorValue(id) if id.index() as usize == ordinal) { continue; }
+            if !matches!(layout.base, ViewBase::TensorValue(id) if id.index() as usize == ordinal) {
+                continue;
+            }
             let view = AnyBufferView::new(self.owner, ordinal as u32, layout.representation);
             for root in self.backing_allocations(views, view) {
-                retained[root.index() as usize] = retained[root.index() as usize].checked_add(2)
+                retained[root.index() as usize] = retained[root.index() as usize]
+                    .checked_add(2)
                     .expect("tensor value pool count exceeds u32");
             }
         }
@@ -666,7 +701,8 @@ impl<B: PhysicalDialect> ParametricSchedule<B> {
                         arena.nat_select(nonempty, maximum, zero)
                     }),
                     ScheduleStep::Launch(_)
-                    | ScheduleStep::BeginAllocationInstance { .. } | ScheduleStep::BindArgumentTensor { .. }
+                    | ScheduleStep::BeginAllocationInstance { .. }
+                    | ScheduleStep::BindArgumentTensor { .. }
                     | ScheduleStep::PublishTensor { .. }
                     | ScheduleStep::Copy(_)
                     | ScheduleStep::Fill(_)
@@ -748,9 +784,19 @@ impl<B: PhysicalDialect> ParametricSchedule<B> {
                     HostValueDestination::Native(slot) => slot.symbol(),
                 }),
                 ScheduleStep::Launch(_) => out.extend_from_slice(native),
-                ScheduleStep::Imported { body, .. } => body.iter().for_each(|step| written(step, native, out)),
-                ScheduleStep::If { then_steps, else_steps, results, .. } => {
-                    then_steps.iter().chain(else_steps).for_each(|step| written(step, native, out));
+                ScheduleStep::Imported { body, .. } => {
+                    body.iter().for_each(|step| written(step, native, out))
+                }
+                ScheduleStep::If {
+                    then_steps,
+                    else_steps,
+                    results,
+                    ..
+                } => {
+                    then_steps
+                        .iter()
+                        .chain(else_steps)
+                        .for_each(|step| written(step, native, out));
                     results.visit(&mut |result| destination(result.result(), out));
                 }
                 ScheduleStep::Repeat { body, carries, .. } => {
@@ -760,13 +806,21 @@ impl<B: PhysicalDialect> ParametricSchedule<B> {
                         destination(carry.result(), out);
                     });
                 }
-                ScheduleStep::BeginAllocationInstance { .. } | ScheduleStep::BindArgumentTensor { .. }
-                | ScheduleStep::PublishTensor { .. } | ScheduleStep::Copy(_) | ScheduleStep::Fill(_)
+                ScheduleStep::BeginAllocationInstance { .. }
+                | ScheduleStep::BindArgumentTensor { .. }
+                | ScheduleStep::PublishTensor { .. }
+                | ScheduleStep::Copy(_)
+                | ScheduleStep::Fill(_)
                 | ScheduleStep::Check(_) => {}
             }
         }
         fn expire(arena: &ExprArena, facts: &mut Vec<BoolExpr>, written: &[SymbolId]) {
-            facts.retain(|fact| !arena.free_symbols((*fact).into()).iter().any(|symbol| written.contains(symbol)));
+            facts.retain(|fact| {
+                !arena
+                    .free_symbols((*fact).into())
+                    .iter()
+                    .any(|symbol| written.contains(symbol))
+            });
         }
         /// Product-level invariant: a tensor destination axis whose every
         /// incoming value has the same geometry expression, over operands the
@@ -781,19 +835,37 @@ impl<B: PhysicalDialect> ParametricSchedule<B> {
             equal: &[(SymbolId, NatExpr)],
             out: &mut Vec<(SymbolId, NatExpr)>,
         ) {
-            let (ValueOperand::Tensor(a), ValueOperand::Tensor(b)) = (sources[0], sources[1]) else { return };
+            let (ValueOperand::Tensor(a), ValueOperand::Tensor(b)) = (sources[0], sources[1])
+            else {
+                return;
+            };
             let (a, b) = (&views[a.index() as usize], &views[b.index() as usize]);
-            let axes = |layout: &BufferViewLayout| layout.extents.iter().chain(&layout.strides).copied().collect::<Vec<_>>();
+            let axes = |layout: &BufferViewLayout| {
+                layout
+                    .extents
+                    .iter()
+                    .chain(&layout.strides)
+                    .copied()
+                    .collect::<Vec<_>>()
+            };
             let (a, b) = (axes(a), axes(b));
             for (axis, (value, other)) in a.iter().zip(&b).enumerate() {
-                if value != other || arena.free_symbols((*value).into()).iter().any(|symbol| writes.contains(symbol)) {
+                if value != other
+                    || arena
+                        .free_symbols((*value).into())
+                        .iter()
+                        .any(|symbol| writes.contains(symbol))
+                {
                     continue;
                 }
                 let value = arena.substitute_nat(*value, equal);
                 for destination in destinations {
-                    let ValueDestination::Tensor(view) = destination else { continue };
+                    let ValueDestination::Tensor(view) = destination else {
+                        continue;
+                    };
                     let slot = axes(&views[view.index() as usize])[axis];
-                    let seismic_lang::expr::NodeView::Symbol(symbol) = arena.view(slot.into()) else {
+                    let seismic_lang::expr::NodeView::Symbol(symbol) = arena.view(slot.into())
+                    else {
                         panic!("region product geometry is not its destination slot")
                     };
                     out.push((symbol, value));
@@ -815,56 +887,164 @@ impl<B: PhysicalDialect> ParametricSchedule<B> {
             for step in steps {
                 let mut writes = Vec::new();
                 written(step, native, &mut writes);
-                let compound = matches!(step, ScheduleStep::If { .. } | ScheduleStep::Repeat { .. }
-                    | ScheduleStep::Imported { .. });
+                let compound = matches!(
+                    step,
+                    ScheduleStep::If { .. }
+                        | ScheduleStep::Repeat { .. }
+                        | ScheduleStep::Imported { .. }
+                );
                 if compound {
                     expire(arena, &mut established_facts, &writes);
                 }
                 let facts = arena.all(&established_facts);
-                let require = |arena: &mut ExprArena, requirement: &mut dyn FnMut(&mut ExprArena, RequirementPoint<'_>) -> BoolExpr,
-                    point: RequirementPoint<'_>, equal: &[(SymbolId, NatExpr)]| {
+                let require = |arena: &mut ExprArena,
+                               requirement: &mut dyn FnMut(
+                    &mut ExprArena,
+                    RequirementPoint<'_>,
+                ) -> BoolExpr,
+                               point: RequirementPoint<'_>,
+                               equal: &[(SymbolId, NatExpr)]| {
                     let term = requirement(arena, point);
                     arena.substitute_nat(term, equal)
                 };
                 let term = match step {
-                    ScheduleStep::Imported { body, .. } => visit(arena, views, body, established_facts.clone(), equal.clone(), native, requirement, established),
-                    ScheduleStep::If { condition, then_steps, else_steps, results } => {
+                    ScheduleStep::Imported { body, .. } => visit(
+                        arena,
+                        views,
+                        body,
+                        established_facts.clone(),
+                        equal.clone(),
+                        native,
+                        requirement,
+                        established,
+                    ),
+                    ScheduleStep::If {
+                        condition,
+                        then_steps,
+                        else_steps,
+                        results,
+                    } => {
                         let condition = arena.substitute_nat(*condition, &equal);
                         let mut then_facts = established_facts.clone();
                         then_facts.push(condition);
-                        let a = visit(arena, views, then_steps, then_facts, equal.clone(), native, requirement, established);
-                        let yielded_a = require(arena, requirement, RequirementPoint::BranchResult(results, true), &equal);
+                        let a = visit(
+                            arena,
+                            views,
+                            then_steps,
+                            then_facts,
+                            equal.clone(),
+                            native,
+                            requirement,
+                            established,
+                        );
+                        let yielded_a = require(
+                            arena,
+                            requirement,
+                            RequirementPoint::BranchResult(results, true),
+                            &equal,
+                        );
                         let a = arena.and(a, yielded_a);
                         let mut else_facts = established_facts.clone();
                         else_facts.push(arena.not(condition));
-                        let b = visit(arena, views, else_steps, else_facts, equal.clone(), native, requirement, established);
-                        let yielded_b = require(arena, requirement, RequirementPoint::BranchResult(results, false), &equal);
+                        let b = visit(
+                            arena,
+                            views,
+                            else_steps,
+                            else_facts,
+                            equal.clone(),
+                            native,
+                            requirement,
+                            established,
+                        );
+                        let yielded_b = require(
+                            arena,
+                            requirement,
+                            RequirementPoint::BranchResult(results, false),
+                            &equal,
+                        );
                         let b = arena.and(b, yielded_b);
                         let mut joined = Vec::new();
-                        results.visit(&mut |result| product_axes(arena, views, [result.then_value(), result.else_value()],
-                            &[result.result()], &writes, &equal, &mut joined));
+                        results.visit(&mut |result| {
+                            product_axes(
+                                arena,
+                                views,
+                                [result.then_value(), result.else_value()],
+                                &[result.result()],
+                                &writes,
+                                &equal,
+                                &mut joined,
+                            )
+                        });
                         let term = arena.and(a, b);
                         equal.extend(joined);
                         term
                     }
-                    ScheduleStep::Repeat { binder, symbol, start, end, body, carries, .. } => {
-                        let initial = require(arena, requirement, RequirementPoint::RepeatInitial(carries), &equal);
+                    ScheduleStep::Repeat {
+                        binder,
+                        symbol,
+                        start,
+                        end,
+                        body,
+                        carries,
+                        ..
+                    } => {
+                        let initial = require(
+                            arena,
+                            requirement,
+                            RequirementPoint::RepeatInitial(carries),
+                            &equal,
+                        );
                         terms.push(arena.implies(facts, initial));
                         let mut header = equal.clone();
                         let mut result = Vec::new();
                         carries.visit(&mut |carry| {
-                            product_axes(arena, views, [carry.initial(), carry.backedge()], &[carry.header()], &writes, &equal, &mut header);
-                            product_axes(arena, views, [carry.initial(), carry.backedge()], &[carry.result()], &writes, &equal, &mut result);
+                            product_axes(
+                                arena,
+                                views,
+                                [carry.initial(), carry.backedge()],
+                                &[carry.header()],
+                                &writes,
+                                &equal,
+                                &mut header,
+                            );
+                            product_axes(
+                                arena,
+                                views,
+                                [carry.initial(), carry.backedge()],
+                                &[carry.result()],
+                                &writes,
+                                &equal,
+                                &mut result,
+                            );
                         });
-                        let body = visit(arena, views, body, established_facts.clone(), header.clone(), native, requirement, established);
-                        let backedge = require(arena, requirement, RequirementPoint::RepeatBackedge(carries), &header);
+                        let body = visit(
+                            arena,
+                            views,
+                            body,
+                            established_facts.clone(),
+                            header.clone(),
+                            native,
+                            requirement,
+                            established,
+                        );
+                        let backedge = require(
+                            arena,
+                            requirement,
+                            RequirementPoint::RepeatBackedge(carries),
+                            &header,
+                        );
                         let body = arena.and(body, backedge);
                         equal.extend(result);
-                        if matches!(arena.view(body.into()), seismic_lang::expr::NodeView::BoolConst(true)) { body }
-                        else {
+                        if matches!(
+                            arena.view(body.into()),
+                            seismic_lang::expr::NodeView::BoolConst(true)
+                        ) {
+                            body
+                        } else {
                             let zero = arena.nat(0);
                             let one = arena.nat(1);
-                            let nonempty = arena.nat_cmp(seismic_lang::expr::CmpOp::Gt, *end, *start);
+                            let nonempty =
+                                arena.nat_cmp(seismic_lang::expr::CmpOp::Gt, *end, *start);
                             if !arena.free_symbols(body.into()).contains(symbol) {
                                 let body = arena.implies(nonempty, body);
                                 terms.push(arena.implies(facts, body));
@@ -872,7 +1052,13 @@ impl<B: PhysicalDialect> ParametricSchedule<B> {
                             }
                             let extent = arena.nat_sub(*end, *start);
                             let violation = arena.nat_select(body, zero, one);
-                            let worst = arena.nat_fold_range(seismic_lang::expr::FoldOp::Max, *binder, *start, extent, violation);
+                            let worst = arena.nat_fold_range(
+                                seismic_lang::expr::FoldOp::Max,
+                                *binder,
+                                *start,
+                                extent,
+                                violation,
+                            );
                             let holds = arena.nat_cmp(seismic_lang::expr::CmpOp::Eq, worst, zero);
                             arena.implies(nonempty, holds)
                         }
@@ -890,8 +1076,21 @@ impl<B: PhysicalDialect> ParametricSchedule<B> {
             }
             arena.all(&terms)
         }
-        let native = self.slots.iter().map(|slot| slot.symbol()).collect::<Vec<_>>();
-        visit(arena, views, &self.steps, Vec::new(), Vec::new(), &native, requirement, established)
+        let native = self
+            .slots
+            .iter()
+            .map(|slot| slot.symbol())
+            .collect::<Vec<_>>();
+        visit(
+            arena,
+            views,
+            &self.steps,
+            Vec::new(),
+            Vec::new(),
+            &native,
+            requirement,
+            established,
+        )
     }
 
     pub fn retained_bytes(&self) -> usize {
@@ -906,11 +1105,15 @@ impl<B: PhysicalDialect> ParametricSchedule<B> {
                             else_steps,
                             results,
                             ..
-                        } => steps(then_steps).saturating_add(steps(else_steps)).saturating_add(results.retained_heap_bytes(&|_|0)),
+                        } => steps(then_steps)
+                            .saturating_add(steps(else_steps))
+                            .saturating_add(results.retained_heap_bytes(&|_| 0)),
                         ScheduleStep::Imported { scope, body } => steps(body).saturating_add(
                             scope.at.region.capacity() * std::mem::size_of::<ScheduleRegionEdge>(),
                         ),
-                        ScheduleStep::Repeat { body, carries, .. } => steps(body).saturating_add(carries.retained_heap_bytes(&|_|0)),
+                        ScheduleStep::Repeat { body, carries, .. } => {
+                            steps(body).saturating_add(carries.retained_heap_bytes(&|_| 0))
+                        }
                         ScheduleStep::ScalarRead(read) => read
                             .index
                             .capacity()
@@ -920,7 +1123,10 @@ impl<B: PhysicalDialect> ParametricSchedule<B> {
                                     .capacity()
                                     .saturating_mul(std::mem::size_of::<BoolExpr>()),
                             ),
-                        ScheduleStep::EvaluateHost(value) => value.failure.as_ref().map_or(0, |site| site.path.capacity()),
+                        ScheduleStep::EvaluateHost(value) => value
+                            .failure
+                            .as_ref()
+                            .map_or(0, |site| site.path.capacity()),
                         _ => 0,
                     })
                 }))
@@ -1145,11 +1351,27 @@ impl<B: PhysicalDialect> ScheduleConstruction<B> {
         });
         (then_region, else_region)
     }
-    pub(crate) fn finish_branch_products(&mut self, parent: u32, then_region: u32, products: Product<BranchResult>) {
-        let step = self.regions[parent as usize].steps.iter_mut().find(|step| matches!(step,
-            RegionStep::If { then_region: region, .. } if *region == then_region)).expect("branch belongs to parent region");
-        let RegionStep::If { results, .. } = step else { unreachable!() };
-        assert!(matches!(results, Product::Unit), "branch results already closed");
+    pub(crate) fn finish_branch_products(
+        &mut self,
+        parent: u32,
+        then_region: u32,
+        products: Product<BranchResult>,
+    ) {
+        let step = self.regions[parent as usize]
+            .steps
+            .iter_mut()
+            .find(|step| {
+                matches!(step,
+            RegionStep::If { then_region: region, .. } if *region == then_region)
+            })
+            .expect("branch belongs to parent region");
+        let RegionStep::If { results, .. } = step else {
+            unreachable!()
+        };
+        assert!(
+            matches!(results, Product::Unit),
+            "branch results already closed"
+        );
         *results = products;
     }
 
@@ -1209,11 +1431,20 @@ impl<B: PhysicalDialect> ScheduleConstruction<B> {
         for region in &self.regions {
             for step in &region.steps {
                 match step {
-                    RegionStep::Leaf(ScheduleStep::BeginAllocationInstance { source, result } | ScheduleStep::BindArgumentTensor { source, result }) => definitions.push((*source, *result)),
-                    RegionStep::If { results, .. } => results.visit(&mut |result| if let crate::region::ValueDestination::Tensor(destination) = result.result() {
-                        for value in [result.then_value(),result.else_value()] {
-                            let crate::region::ValueOperand::Tensor(source) = value else { unreachable!("branch product kind") };
-                            definitions.push((source,destination));
+                    RegionStep::Leaf(
+                        ScheduleStep::BeginAllocationInstance { source, result }
+                        | ScheduleStep::BindArgumentTensor { source, result },
+                    ) => definitions.push((*source, *result)),
+                    RegionStep::If { results, .. } => results.visit(&mut |result| {
+                        if let crate::region::ValueDestination::Tensor(destination) =
+                            result.result()
+                        {
+                            for value in [result.then_value(), result.else_value()] {
+                                let crate::region::ValueOperand::Tensor(source) = value else {
+                                    unreachable!("branch product kind")
+                                };
+                                definitions.push((source, destination));
+                            }
                         }
                     }),
                     RegionStep::Repeat {
@@ -1275,7 +1506,10 @@ impl<B: PhysicalDialect> ScheduleConstruction<B> {
         );
         let index = self.slots.len() as u32;
         let symbol = arena.schedule_slot(self.next_slot_symbol, kind.sort());
-        self.next_slot_symbol = self.next_slot_symbol.checked_add(1).expect("schedule slot symbol space exhausted");
+        self.next_slot_symbol = self
+            .next_slot_symbol
+            .checked_add(1)
+            .expect("schedule slot symbol space exhausted");
         let slot = AnyScalarSlot {
             owner: self.owner,
             index,
@@ -1291,11 +1525,23 @@ impl<B: PhysicalDialect> ScheduleConstruction<B> {
         arena: &mut ExprArena,
         kind: HostQuantityKind,
     ) -> HostQuantitySlot {
-        assert!(!self.closed, "a closed schedule cannot allocate a quantity slot");
+        assert!(
+            !self.closed,
+            "a closed schedule cannot allocate a quantity slot"
+        );
         let index = self.quantity_slots.len() as u32;
         let symbol = arena.schedule_slot(self.next_slot_symbol, kind.sort());
-        self.next_slot_symbol = self.next_slot_symbol.checked_add(1).expect("schedule slot symbol space exhausted");
-        let slot = HostQuantitySlot { owner: self.owner, index, kind, symbol, capture: None };
+        self.next_slot_symbol = self
+            .next_slot_symbol
+            .checked_add(1)
+            .expect("schedule slot symbol space exhausted");
+        let slot = HostQuantitySlot {
+            owner: self.owner,
+            index,
+            kind,
+            symbol,
+            capture: None,
+        };
         self.quantity_slots.push(slot);
         slot
     }
@@ -1309,36 +1555,68 @@ impl<B: PhysicalDialect> ScheduleConstruction<B> {
             !self.closed,
             "a closed schedule cannot capture a result slot"
         );
-        assert_ne!(source.owner, self.owner, "capture must come from another construction");
+        assert_ne!(
+            source.owner, self.owner,
+            "capture must come from another construction"
+        );
         let slot = AnyScalarSlot {
             owner: self.owner,
             index: self.slots.len() as u32,
-            capture: Some(source.capture.unwrap_or(SlotCapture { owner: source.owner, index: source.index })),
+            capture: Some(source.capture.unwrap_or(SlotCapture {
+                owner: source.owner,
+                index: source.index,
+            })),
             ..source
         };
         self.slots.push(slot);
-        self.next_slot_symbol = self.next_slot_symbol.checked_add(1).expect("schedule slot symbol space exhausted");
+        self.next_slot_symbol = self
+            .next_slot_symbol
+            .checked_add(1)
+            .expect("schedule slot symbol space exhausted");
         slot
     }
     pub fn capture_quantity_slot(&mut self, source: HostQuantitySlot) -> HostQuantitySlot {
-        assert!(!self.closed, "a closed schedule cannot capture a quantity slot");
-        assert_ne!(source.owner, self.owner, "capture must come from another construction");
+        assert!(
+            !self.closed,
+            "a closed schedule cannot capture a quantity slot"
+        );
+        assert_ne!(
+            source.owner, self.owner,
+            "capture must come from another construction"
+        );
         let mut slot = source.remap(self.owner, self.quantity_slots.len() as u32);
-        slot.capture = Some(source.capture.unwrap_or(SlotCapture { owner: source.owner, index: source.index }));
+        slot.capture = Some(source.capture.unwrap_or(SlotCapture {
+            owner: source.owner,
+            index: source.index,
+        }));
         self.quantity_slots.push(slot);
-        self.next_slot_symbol = self.next_slot_symbol.checked_add(1).expect("schedule slot symbol space exhausted");
+        self.next_slot_symbol = self
+            .next_slot_symbol
+            .checked_add(1)
+            .expect("schedule slot symbol space exhausted");
         slot
     }
     fn splice_slot(&mut self, arena: &mut ExprArena, source: AnyScalarSlot) -> AnyScalarSlot {
-        assert!(!self.closed, "a closed schedule cannot splice a result slot");
+        assert!(
+            !self.closed,
+            "a closed schedule cannot splice a result slot"
+        );
         if let Some(capture) = source.capture {
             if capture.owner == self.owner {
                 let original = self.slots[capture.index as usize];
-                assert_eq!((original.symbol, original.kind), (source.symbol, source.kind), "captured slot changed before its owner was reached");
+                assert_eq!(
+                    (original.symbol, original.kind),
+                    (source.symbol, source.kind),
+                    "captured slot changed before its owner was reached"
+                );
                 return original;
             }
             if let Some(existing) = self.slots.iter().find(|slot| slot.capture == Some(capture)) {
-                assert_eq!((existing.symbol, existing.kind), (source.symbol, source.kind), "one borrowed slot has conflicting definitions");
+                assert_eq!(
+                    (existing.symbol, existing.kind),
+                    (source.symbol, source.kind),
+                    "one borrowed slot has conflicting definitions"
+                );
                 return *existing;
             }
         } else {
@@ -1346,19 +1624,41 @@ impl<B: PhysicalDialect> ScheduleConstruction<B> {
         }
         let slot = source.remap(self.owner, self.slots.len() as u32);
         self.slots.push(slot);
-        self.next_slot_symbol = self.next_slot_symbol.checked_add(1).expect("schedule slot symbol space exhausted");
+        self.next_slot_symbol = self
+            .next_slot_symbol
+            .checked_add(1)
+            .expect("schedule slot symbol space exhausted");
         slot
     }
-    fn splice_quantity_slot(&mut self, arena: &mut ExprArena, source: HostQuantitySlot) -> HostQuantitySlot {
-        assert!(!self.closed, "a closed schedule cannot splice a quantity slot");
+    fn splice_quantity_slot(
+        &mut self,
+        arena: &mut ExprArena,
+        source: HostQuantitySlot,
+    ) -> HostQuantitySlot {
+        assert!(
+            !self.closed,
+            "a closed schedule cannot splice a quantity slot"
+        );
         if let Some(capture) = source.capture {
             if capture.owner == self.owner {
                 let original = self.quantity_slots[capture.index as usize];
-                assert_eq!((original.symbol, original.kind), (source.symbol, source.kind), "captured quantity changed before its owner was reached");
+                assert_eq!(
+                    (original.symbol, original.kind),
+                    (source.symbol, source.kind),
+                    "captured quantity changed before its owner was reached"
+                );
                 return original;
             }
-            if let Some(existing) = self.quantity_slots.iter().find(|slot| slot.capture == Some(capture)) {
-                assert_eq!((existing.symbol, existing.kind), (source.symbol, source.kind), "one borrowed quantity has conflicting definitions");
+            if let Some(existing) = self
+                .quantity_slots
+                .iter()
+                .find(|slot| slot.capture == Some(capture))
+            {
+                assert_eq!(
+                    (existing.symbol, existing.kind),
+                    (source.symbol, source.kind),
+                    "one borrowed quantity has conflicting definitions"
+                );
                 return *existing;
             }
         } else {
@@ -1366,7 +1666,10 @@ impl<B: PhysicalDialect> ScheduleConstruction<B> {
         }
         let slot = source.remap(self.owner, self.quantity_slots.len() as u32);
         self.quantity_slots.push(slot);
-        self.next_slot_symbol = self.next_slot_symbol.checked_add(1).expect("schedule slot symbol space exhausted");
+        self.next_slot_symbol = self
+            .next_slot_symbol
+            .checked_add(1)
+            .expect("schedule slot symbol space exhausted");
         slot
     }
 
@@ -1413,7 +1716,9 @@ impl<B: PhysicalDialect> ScheduleConstruction<B> {
             match step {
                 RegionStep::Leaf(step) => {
                     match &step {
-                        ScheduleStep::BeginAllocationInstance { source: view, .. } | ScheduleStep::BindArgumentTensor { source: view, .. } | ScheduleStep::PublishTensor { view, .. } => direct.push((*view, at)),
+                        ScheduleStep::BeginAllocationInstance { source: view, .. }
+                        | ScheduleStep::BindArgumentTensor { source: view, .. }
+                        | ScheduleStep::PublishTensor { view, .. } => direct.push((*view, at)),
                         ScheduleStep::Launch(id) => launches.push((*id, at)),
                         ScheduleStep::Copy(copy) => {
                             direct.push((copy.source, at.clone()));
@@ -1421,7 +1726,9 @@ impl<B: PhysicalDialect> ScheduleConstruction<B> {
                         }
                         ScheduleStep::Fill(fill) => direct.push((fill.destination, at)),
                         ScheduleStep::ScalarRead(read) => direct.push((read.source, at)),
-                        ScheduleStep::ScalarMove(_) | ScheduleStep::EvaluateHost(_) | ScheduleStep::Check(_) => {}
+                        ScheduleStep::ScalarMove(_)
+                        | ScheduleStep::EvaluateHost(_)
+                        | ScheduleStep::Check(_) => {}
                         ScheduleStep::Imported { .. }
                         | ScheduleStep::If { .. }
                         | ScheduleStep::Repeat { .. } => {
@@ -1440,8 +1747,20 @@ impl<B: PhysicalDialect> ScheduleConstruction<B> {
                     results,
                 } => {
                     for (region, then) in [(then_region, true), (else_region, false)] {
-                        let at = ScheduleUse { owner: self.owner, region: self.regions[region as usize].path.clone(), ordinal: self.regions[region as usize].steps.len() as u32 };
-                        results.visit(&mut |result| if let crate::region::ValueOperand::Tensor(view) = if then { result.then_value() } else { result.else_value() } { direct.push((view, at.clone())); });
+                        let at = ScheduleUse {
+                            owner: self.owner,
+                            region: self.regions[region as usize].path.clone(),
+                            ordinal: self.regions[region as usize].steps.len() as u32,
+                        };
+                        results.visit(&mut |result| {
+                            if let crate::region::ValueOperand::Tensor(view) = if then {
+                                result.then_value()
+                            } else {
+                                result.else_value()
+                            } {
+                                direct.push((view, at.clone()));
+                            }
+                        });
                     }
                     out.push(ScheduleStep::If {
                         condition,
@@ -1449,7 +1768,7 @@ impl<B: PhysicalDialect> ScheduleConstruction<B> {
                         else_steps: self.lower_region(else_region, direct, launches),
                         results,
                     });
-                },
+                }
                 RegionStep::Repeat {
                     binder,
                     symbol,
@@ -1571,7 +1890,13 @@ impl<B: PhysicalDialect> ScheduleConstruction<B> {
         let map_slot = |slot: AnyScalarSlot| slots[slot.index as usize];
         let map_quantity_slot = |slot: HostQuantitySlot| quantity_slots[slot.index as usize];
         let map_launch = |launch: LaunchId| launches[launch.index() as usize];
-        let steps = remap_steps(child.steps, map_view, map_slot, map_quantity_slot, map_launch);
+        let steps = remap_steps(
+            child.steps,
+            map_view,
+            map_slot,
+            map_quantity_slot,
+            map_launch,
+        );
         let direct = child
             .direct_view_uses
             .into_iter()
@@ -1723,7 +2048,11 @@ impl ImportedBindings {
         self.slots[source.index() as usize]
     }
     pub fn remap_quantity_slot(&self, source: HostQuantitySlot) -> HostQuantitySlot {
-        assert_eq!(source.owner(), self.source_owner, "quantity slot belongs to another imported child");
+        assert_eq!(
+            source.owner(),
+            self.source_owner,
+            "quantity slot belongs to another imported child"
+        );
         self.quantity_slots[source.index() as usize]
     }
 }
@@ -1743,12 +2072,28 @@ fn remap_steps(
                 body: remap_steps(body, view, slot, quantity_slot, launch),
             },
             ScheduleStep::BeginAllocationInstance { source, result } => {
-                ScheduleStep::BeginAllocationInstance { source: view(source), result: view(result) }
+                ScheduleStep::BeginAllocationInstance {
+                    source: view(source),
+                    result: view(result),
+                }
             }
             ScheduleStep::BindArgumentTensor { source, result } => {
-                ScheduleStep::BindArgumentTensor { source: view(source), result: view(result) }
+                ScheduleStep::BindArgumentTensor {
+                    source: view(source),
+                    result: view(result),
+                }
             }
-            ScheduleStep::PublishTensor { view: value, path, bytes, declared_axes } => ScheduleStep::PublishTensor { view: view(value), path, bytes, declared_axes },
+            ScheduleStep::PublishTensor {
+                view: value,
+                path,
+                bytes,
+                declared_axes,
+            } => ScheduleStep::PublishTensor {
+                view: view(value),
+                path,
+                bytes,
+                declared_axes,
+            },
             ScheduleStep::Launch(id) => ScheduleStep::Launch(launch(id)),
             ScheduleStep::Copy(copy) => ScheduleStep::Copy(BufferCopy {
                 source: view(copy.source),
@@ -1766,7 +2111,9 @@ fn remap_steps(
             }),
             ScheduleStep::EvaluateHost(mut evaluation) => {
                 evaluation.to = match evaluation.to {
-                    HostValueDestination::Quantity(to) => HostValueDestination::Quantity(quantity_slot(to)),
+                    HostValueDestination::Quantity(to) => {
+                        HostValueDestination::Quantity(quantity_slot(to))
+                    }
                     HostValueDestination::Native(to) => HostValueDestination::Native(slot(to)),
                 };
                 ScheduleStep::EvaluateHost(evaluation)
@@ -1843,13 +2190,22 @@ impl<'a, B: PhysicalDialect> ScheduleBuilder<'a, B> {
         self.inner.state.quantity_slot(self.inner.arena, kind)
     }
     pub fn quantity_slot_symbol(&mut self, slot: HostQuantitySlot) -> SymbolId {
-        assert_eq!(slot.owner(), self.inner.state.owner, "quantity slot belongs to another construction");
+        assert_eq!(
+            slot.owner(),
+            self.inner.state.owner,
+            "quantity slot belongs to another construction"
+        );
         slot.symbol()
     }
     pub fn evaluate_host(&mut self, evaluation: HostEvaluation) -> ScheduleUse {
         if let Some(site) = &evaluation.failure {
             assert!(
-                matches!(site.failure.cause, seismic_lang::failure::SourceFailureCause::Scalar(seismic_lang::reference_math::ScalarFailure::IntegerDivisionByZero)),
+                matches!(
+                    site.failure.cause,
+                    seismic_lang::failure::SourceFailureCause::Scalar(
+                        seismic_lang::reference_math::ScalarFailure::IntegerDivisionByZero
+                    )
+                ),
                 "host evaluation may own only its source integer division failure"
             );
         }
@@ -1867,12 +2223,18 @@ impl<'a, B: PhysicalDialect> ScheduleBuilder<'a, B> {
                 assert_eq!(to.owner(), self.inner.state.owner);
             }
             (HostValueExpr::Word { dtype, .. }, HostValueDestination::Native(to)) => {
-                assert!(matches!(dtype, DType::I32 | DType::U32), "host word projection needs an integer scalar dtype");
+                assert!(
+                    matches!(dtype, DType::I32 | DType::U32),
+                    "host word projection needs an integer scalar dtype"
+                );
                 assert_eq!(to.kind(), ScalarKind::Scalar(dtype));
                 assert_eq!(to.owner(), self.inner.state.owner);
             }
             (HostValueExpr::Float { dtype, .. }, HostValueDestination::Native(to)) => {
-                assert!(dtype.is_float(), "host float conversion needs a float scalar dtype");
+                assert!(
+                    dtype.is_float(),
+                    "host float conversion needs a float scalar dtype"
+                );
                 assert_eq!(to.kind(), ScalarKind::Scalar(dtype));
                 assert_eq!(to.owner(), self.inner.state.owner);
             }
@@ -1888,13 +2250,27 @@ impl<'a, B: PhysicalDialect> ScheduleBuilder<'a, B> {
     pub fn slot_symbol_any(&mut self, slot: AnyScalarSlot) -> SymbolId {
         self.inner.slot_symbol(slot)
     }
-    pub fn begin_allocation_instance(&mut self, view: AnyBufferView, result: AnyBufferView) -> ScheduleUse {
+    pub fn begin_allocation_instance(
+        &mut self,
+        view: AnyBufferView,
+        result: AnyBufferView,
+    ) -> ScheduleUse {
         self.inner.begin_allocation_instance(view, result)
     }
-    pub(crate) fn bind_argument_tensor(&mut self, source: AnyBufferView, result: AnyBufferView) -> ScheduleUse {
-        self.inner.leaf(ScheduleStep::BindArgumentTensor { source, result })
+    pub(crate) fn bind_argument_tensor(
+        &mut self,
+        source: AnyBufferView,
+        result: AnyBufferView,
+    ) -> ScheduleUse {
+        self.inner
+            .leaf(ScheduleStep::BindArgumentTensor { source, result })
     }
-    pub fn publish_tensor(&mut self, view: AnyBufferView, path: Vec<u32>, declared_axes: Vec<NatExpr>) -> ScheduleUse {
+    pub fn publish_tensor(
+        &mut self,
+        view: AnyBufferView,
+        path: Vec<u32>,
+        declared_axes: Vec<NatExpr>,
+    ) -> ScheduleUse {
         self.inner.publish_tensor(view, path, declared_axes)
     }
     pub fn copy_any(&mut self, source: AnyBufferView, destination: AnyBufferView) -> ScheduleUse {
@@ -2055,7 +2431,11 @@ mod internals {
             );
             self.leaf(ScheduleStep::Launch(launch))
         }
-        pub(super) fn begin_allocation_instance(&mut self, view: AnyBufferView, result: AnyBufferView) -> ScheduleUse {
+        pub(super) fn begin_allocation_instance(
+            &mut self,
+            view: AnyBufferView,
+            result: AnyBufferView,
+        ) -> ScheduleUse {
             self.assert_owner(view.owner());
             assert!(
                 matches!(
@@ -2064,15 +2444,32 @@ mod internals {
                 ),
                 "allocation occurrence must define actual storage"
             );
-            self.leaf(ScheduleStep::BeginAllocationInstance { source: view, result })
+            self.leaf(ScheduleStep::BeginAllocationInstance {
+                source: view,
+                result,
+            })
         }
-        pub(super) fn publish_tensor(&mut self, view: AnyBufferView, path: Vec<u32>, declared_axes: Vec<NatExpr>) -> ScheduleUse {
+        pub(super) fn publish_tensor(
+            &mut self,
+            view: AnyBufferView,
+            path: Vec<u32>,
+            declared_axes: Vec<NatExpr>,
+        ) -> ScheduleUse {
             self.assert_owner(view.owner());
             let layout = &self.views[view.index() as usize];
-            assert_eq!(layout.extents.len(), declared_axes.len(), "published tensor rank differs from declaration");
+            assert_eq!(
+                layout.extents.len(),
+                declared_axes.len(),
+                "published tensor rank differs from declaration"
+            );
             let end = crate::storage::addressed_bytes(self.arena, layout);
             let bytes = self.arena.nat_sub(end, layout.offset);
-            self.leaf(ScheduleStep::PublishTensor { view, path, bytes, declared_axes })
+            self.leaf(ScheduleStep::PublishTensor {
+                view,
+                path,
+                bytes,
+                declared_axes,
+            })
         }
         pub(super) fn copy(
             &mut self,
@@ -2277,11 +2674,22 @@ mod tests {
     use seismic_lang::expr::{Assignment, SymbolValue};
 
     /// Per-launch obligations lifted through their lexical scopes.
-    fn launch_requirements<B: PhysicalDialect>(schedule: &ParametricSchedule<B>, arena: &mut ExprArena, requirements: &[BoolExpr]) -> BoolExpr {
-        schedule.scoped_requirements(arena, &[], &mut |arena, point| match point {
-            RequirementPoint::Step(ScheduleStep::Launch(id)) => requirements[id.index() as usize],
-            _ => arena.bool(true),
-        }, &mut |arena, _| arena.bool(true))
+    fn launch_requirements<B: PhysicalDialect>(
+        schedule: &ParametricSchedule<B>,
+        arena: &mut ExprArena,
+        requirements: &[BoolExpr],
+    ) -> BoolExpr {
+        schedule.scoped_requirements(
+            arena,
+            &[],
+            &mut |arena, point| match point {
+                RequirementPoint::Step(ScheduleStep::Launch(id)) => {
+                    requirements[id.index() as usize]
+                }
+                _ => arena.bool(true),
+            },
+            &mut |arena, _| arena.bool(true),
+        )
     }
 
     #[derive(Debug)]
@@ -2321,19 +2729,35 @@ mod tests {
         let value = arena.int_symbol(symbol);
         let zero = arena.int(0);
         let fact = arena.int_cmp(seismic_lang::expr::CmpOp::Ge, value, zero);
-        let slot = HostQuantitySlot { owner, index: 0, kind: HostQuantityKind::Integer, symbol, capture: None };
+        let slot = HostQuantitySlot {
+            owner,
+            index: 0,
+            kind: HostQuantityKind::Integer,
+            symbol,
+            capture: None,
+        };
         let view = AnyBufferView::new(owner, 0, seismic_lang::registry::dense(DType::I32));
-        let begin = ScheduleStep::BeginAllocationInstance { source: view, result: view };
+        let begin = ScheduleStep::BeginAllocationInstance {
+            source: view,
+            result: view,
+        };
         let usage = ScheduleStep::Launch(LaunchId::new(owner, 0));
         let mut schedule = ParametricSchedule::<Dialect> {
-            owner, next_control: 0, launches: Vec::new(), slots: Vec::new(),
-            quantity_slots: vec![slot], steps: Vec::new(), direct_view_uses: Vec::new(),
+            owner,
+            next_control: 0,
+            launches: Vec::new(),
+            slots: Vec::new(),
+            quantity_slots: vec![slot],
+            steps: Vec::new(),
+            direct_view_uses: Vec::new(),
             launch_uses: Vec::new(),
         };
         let mut values = Assignment::new();
         values.bind(symbol, SymbolValue::Int((-1).into()));
         let check = |schedule: &ParametricSchedule<Dialect>, arena: &mut ExprArena| {
-            let predicate = schedule.scoped_requirements(arena, &[],
+            let predicate = schedule.scoped_requirements(
+                arena,
+                &[],
                 &mut |arena, point| match point {
                     RequirementPoint::Step(ScheduleStep::Launch(_)) => fact,
                     _ => arena.bool(true),
@@ -2341,21 +2765,33 @@ mod tests {
                 &mut |arena, step| match step {
                     ScheduleStep::BeginAllocationInstance { .. } => fact,
                     _ => arena.bool(true),
-                });
+                },
+            );
             arena.eval_bool(predicate, &values).unwrap()
         };
         schedule.steps = vec![begin.clone(), usage.clone()];
         assert!(check(&schedule, &mut arena));
         schedule.steps = vec![usage.clone(), begin.clone()];
         assert!(!check(&schedule, &mut arena));
-        schedule.steps = vec![begin.clone(), ScheduleStep::EvaluateHost(HostEvaluation {
-            value: HostValueExpr::Integer(arena.int(-1)),
-            to: HostValueDestination::Quantity(slot), failure: None,
-        }), usage.clone()];
+        schedule.steps = vec![
+            begin.clone(),
+            ScheduleStep::EvaluateHost(HostEvaluation {
+                value: HostValueExpr::Integer(arena.int(-1)),
+                to: HostValueDestination::Quantity(slot),
+                failure: None,
+            }),
+            usage.clone(),
+        ];
         assert!(!check(&schedule, &mut arena));
-        schedule.steps = vec![ScheduleStep::If {
-            condition: fact, then_steps: vec![begin], else_steps: Vec::new(), results: Product::Unit,
-        }, usage];
+        schedule.steps = vec![
+            ScheduleStep::If {
+                condition: fact,
+                then_steps: vec![begin],
+                else_steps: Vec::new(),
+                results: Product::Unit,
+            },
+            usage,
+        ];
         assert!(!check(&schedule, &mut arena));
     }
 
@@ -2455,7 +2891,10 @@ mod tests {
         let bytes = arena.nat_add(base, one);
         let reserved = schedule.launch_reservation(&mut arena, 0, bytes);
         assert!(arena.free_symbols(reserved.into()).is_empty());
-        assert_eq!(arena.eval_nat_u64(reserved, &Assignment::new()).unwrap(), 17);
+        assert_eq!(
+            arena.eval_nat_u64(reserved, &Assignment::new()).unwrap(),
+            17
+        );
 
         // An outer semantic loop and the generated chunk loop must both be
         // closed over before admission evaluates the reservation.
@@ -2476,7 +2915,10 @@ mod tests {
         }];
         let reserved = schedule.launch_reservation(&mut arena, 0, bytes);
         assert!(arena.free_symbols(reserved.into()).is_empty());
-        assert_eq!(arena.eval_nat_u64(reserved, &Assignment::new()).unwrap(), 20);
+        assert_eq!(
+            arena.eval_nat_u64(reserved, &Assignment::new()).unwrap(),
+            20
+        );
         let ScheduleStep::Repeat { end, .. } = &mut schedule.steps[0] else {
             unreachable!()
         };
@@ -2492,17 +2934,31 @@ mod tests {
         // expression laziness. Initial carried products are still evaluated.
         let zero = arena.nat(0);
         let partial = arena.nat_div(one, zero);
-        let lifted = schedule.scoped_requirements(&mut arena, &[], &mut |arena, point| match point {
-            RequirementPoint::Step(_) | RequirementPoint::RepeatBackedge(_) => arena.nat_cmp(seismic_lang::expr::CmpOp::Eq, partial, zero),
-            RequirementPoint::RepeatInitial(_) | RequirementPoint::BranchResult(_, _) => arena.bool(true),
-        }, &mut |arena, _| arena.bool(true));
+        let lifted = schedule.scoped_requirements(
+            &mut arena,
+            &[],
+            &mut |arena, point| match point {
+                RequirementPoint::Step(_) | RequirementPoint::RepeatBackedge(_) => {
+                    arena.nat_cmp(seismic_lang::expr::CmpOp::Eq, partial, zero)
+                }
+                RequirementPoint::RepeatInitial(_) | RequirementPoint::BranchResult(_, _) => {
+                    arena.bool(true)
+                }
+            },
+            &mut |arena, _| arena.bool(true),
+        );
         assert!(arena.eval_bool(lifted, &Assignment::new()).unwrap());
         let defined = arena.side_conditions(lifted.into());
         assert!(arena.eval_bool(defined, &Assignment::new()).unwrap());
-        let invalid_initial = schedule.scoped_requirements(&mut arena, &[], &mut |arena, point|
-            arena.bool(!matches!(point, RequirementPoint::RepeatInitial(_))),
-            &mut |arena, _| arena.bool(true));
-        assert!(!arena.eval_bool(invalid_initial, &Assignment::new()).unwrap());
+        let invalid_initial = schedule.scoped_requirements(
+            &mut arena,
+            &[],
+            &mut |arena, point| arena.bool(!matches!(point, RequirementPoint::RepeatInitial(_))),
+            &mut |arena, _| arena.bool(true),
+        );
+        assert!(!arena
+            .eval_bool(invalid_initial, &Assignment::new())
+            .unwrap());
     }
 
     #[test]

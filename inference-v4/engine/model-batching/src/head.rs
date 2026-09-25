@@ -7,7 +7,9 @@
 //! slot, whose token and conditioning are the previous pass's selection and
 //! output feature on the device.
 
-use crate::{Demand, LaunchClass, PackError, Row, Select, Slot, TargetBatchUpload, ValidatedTargetBatch};
+use crate::{
+    Demand, LaunchClass, PackError, Row, Select, Slot, TargetBatchUpload, ValidatedTargetBatch,
+};
 
 /// One request's head rows.
 #[derive(Clone, Debug, PartialEq)]

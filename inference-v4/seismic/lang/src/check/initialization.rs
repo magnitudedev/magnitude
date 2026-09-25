@@ -2,10 +2,10 @@
 //! run before a checked definition is published. Regions describe actual
 //! logical coordinates; no runtime storage or compiler-side certificate exists.
 use super::{ir, prove, xfer, CheckedOutcome, Checker};
+use crate::checked::DiagnosticRule;
 use crate::expr::{AnyExpr, ExprArena, IntExpr, SymbolId};
 pub(super) use crate::initialization::InitializationContract as Contract;
 use crate::initialization::RegionMapping;
-use crate::checked::DiagnosticRule;
 use crate::initialization::{
     Bound, Condition, Exit, InitializationView, ParameterAccess, ParameterPart, ParameterPath,
     Path, Region, RegionOps, Requirement, VisitSeparation,
@@ -1477,10 +1477,7 @@ fn available_contract(source: &CheckedOutcome) -> Option<&Contract> {
 
 /// Call argument values in the family's parameter order (L3).
 fn ordered_arguments(order: &[usize], arguments: &[Value]) -> Vec<Value> {
-    order
-        .iter()
-        .map(|&i| arguments[i].clone())
-        .collect()
+    order.iter().map(|&i| arguments[i].clone()).collect()
 }
 
 struct CallMapping<'borrow, 'checker, 'env, 'source> {
@@ -1606,7 +1603,10 @@ impl Initialization<'_, '_> {
                 Value::Tensor(_) | Value::Void => {}
             }
         }
-        let mut symbols = self.dimension_symbols().into_iter().collect::<BTreeSet<_>>();
+        let mut symbols = self
+            .dimension_symbols()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
         symbols.extend(self.binders.iter().copied());
         for value in entry.values.values() {
             value_symbols(value, self.arena_ref(), &mut symbols);
@@ -1742,14 +1742,7 @@ impl Initialization<'_, '_> {
                 }
                 let extents = entry.roots[&left.root].axes.clone();
                 if !self.distinct_visit_accesses_separate(
-                    left,
-                    right,
-                    symbol,
-                    start,
-                    end,
-                    facts,
-                    &captured,
-                    &extents,
+                    left, right, symbol, start, end, facts, &captured, &extents,
                 ) {
                     return Err(overlap);
                 }
@@ -2422,7 +2415,9 @@ impl RegionOps for Initialization<'_, '_> {
         &self.checker.arena
     }
     fn fresh_variable(&mut self) -> SymbolId {
-        self.checker.arena.proof_variable(crate::expr::SymbolSort::Int)
+        self.checker
+            .arena
+            .proof_variable(crate::expr::SymbolSort::Int)
     }
 }
 

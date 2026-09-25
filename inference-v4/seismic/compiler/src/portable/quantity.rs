@@ -21,7 +21,10 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         {
             let literal = match primitive {
                 PrimitiveId::Symbolic(expression)
-                    if invocation_evaluable(self.builder.arena(), (*expression).into()) => Some(*expression),
+                    if invocation_evaluable(self.builder.arena(), (*expression).into()) =>
+                {
+                    Some(*expression)
+                }
                 PrimitiveId::Constant(ReferenceScalar::I32(value)) => {
                     Some(self.builder.arena().int(i64::from(*value)))
                 }
@@ -31,12 +34,18 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                 _ => None,
             };
             if let Some(literal) = literal {
-                self.values.bind(self.builder.bindings_mut(), out,
-                    Bound::Scalar(ScalarBinding::Integer(literal)));
+                self.values.bind(
+                    self.builder.bindings_mut(),
+                    out,
+                    Bound::Scalar(ScalarBinding::Integer(literal)),
+                );
                 return;
             }
         }
-        let operands = inputs.iter().map(|value| self.bound(*value)).collect::<Vec<_>>();
+        let operands = inputs
+            .iter()
+            .map(|value| self.bound(*value))
+            .collect::<Vec<_>>();
         let target = self.output_target(out);
         let arena = self.builder.arena();
         let integer = match primitive {
@@ -73,8 +82,12 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         let (value, to) = match &target {
             Bound::Scalar(ScalarBinding::Quantity(slot)) => {
                 let value = match slot.kind() {
-                    seismic_ir::schedule::HostQuantityKind::Integer => HostValueExpr::Integer(integer),
-                    seismic_ir::schedule::HostQuantityKind::Natural => HostValueExpr::Natural(arena.nat_from_int(integer)),
+                    seismic_ir::schedule::HostQuantityKind::Integer => {
+                        HostValueExpr::Integer(integer)
+                    }
+                    seismic_ir::schedule::HostQuantityKind::Natural => {
+                        HostValueExpr::Natural(arena.nat_from_int(integer))
+                    }
                 };
                 (value, HostValueDestination::Quantity(*slot))
             }
@@ -102,10 +115,18 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                             seismic_lang::reference_math::ScalarOp::Cast(dtype),
                             &[(dtype, integer)],
                         );
-                        HostValueExpr::Word { dtype, value: typed }
+                        HostValueExpr::Word {
+                            dtype,
+                            value: typed,
+                        }
                     }
-                    (dtype, PrimitiveId::Cast(_)) if dtype.is_float() => HostValueExpr::Float { dtype, value: integer },
-                    other => panic!("checked exact-to-word operation lacks its typed conversion: {other:?}"),
+                    (dtype, PrimitiveId::Cast(_)) if dtype.is_float() => HostValueExpr::Float {
+                        dtype,
+                        value: integer,
+                    },
+                    other => panic!(
+                        "checked exact-to-word operation lacks its typed conversion: {other:?}"
+                    ),
                 };
                 (value, HostValueDestination::Native(*slot))
             }
@@ -115,7 +136,9 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             let failure = SourceFailure::at(
                 self.function,
                 node,
-                SourceFailureCause::Scalar(seismic_lang::reference_math::ScalarFailure::IntegerDivisionByZero),
+                SourceFailureCause::Scalar(
+                    seismic_lang::reference_math::ScalarFailure::IntegerDivisionByZero,
+                ),
             );
             Some(CheckSite {
                 failure,
@@ -128,7 +151,9 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         if let (HostValueExpr::Bool(condition), HostValueDestination::Native(slot)) = (value, to) {
             self.values.host_conditions.insert(slot.symbol(), condition);
         }
-        self.builder.schedule().evaluate_host(HostEvaluation { value, to, failure });
+        self.builder
+            .schedule()
+            .evaluate_host(HostEvaluation { value, to, failure });
         self.values.bind(self.builder.bindings_mut(), out, target);
     }
 
@@ -158,20 +183,29 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         } else {
             None
         };
-        let checks=source_scalar::checks(self.function,node,primitive,inputs);
-        let statuses=self.builder.portable_source_statuses(checks.len());
+        let checks = source_scalar::checks(self.function, node, primitive, inputs);
+        let statuses = self.builder.portable_source_statuses(checks.len());
         let mut kernel = self.builder.portable_kernel();
-        let status_words=segment_check_statuses(&mut kernel,&checks,&statuses);
+        let status_words = segment_check_statuses(&mut kernel, &checks, &statuses);
         let args = args
             .into_iter()
             .map(|arg| Self::kernel_arg(&mut kernel, arg))
             .collect::<Vec<_>>();
-        let alive=kernel.constant(ConstantValue::Bool(true),ValueType::Bool);
+        let alive = kernel.constant(ConstantValue::Bool(true), ValueType::Bool);
         let value = if let Some(expression) = symbolic {
             lower_captured_expr(&mut kernel, &expression)
         } else {
-            source_scalar::lower(&mut kernel, self.function, node, &status_words, alive,
-                primitive, &args, &self.function.value(out).ty).0
+            source_scalar::lower(
+                &mut kernel,
+                self.function,
+                node,
+                &status_words,
+                alive,
+                primitive,
+                &args,
+                &self.function.value(out).ty,
+            )
+            .0
         };
         let storage = slot.kind().value_type();
         let value = if value.ty() != storage {
@@ -180,10 +214,10 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             value
         };
         let destination = kernel.result_slot(slot);
-        kernel.store_slot(destination,value);
+        kernel.store_slot(destination, value);
         let kernel = kernel.close();
         self.builder.schedule().launch_sequential(kernel);
-        source_scalar::finish(self.builder,self.function.name(),checks,statuses);
+        source_scalar::finish(self.builder, self.function.name(), checks, statuses);
         self.values.bind(self.builder.bindings_mut(), out, target);
     }
 
@@ -212,11 +246,17 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                                     Some(self.builder.arena().int_from_nat(value))
                                 }
                                 SymbolSort::Scalar(DType::I32) => {
-                                    let value = self.builder.arena().scalar_symbol::<seismic_lang::expr::I32>(symbol);
+                                    let value = self
+                                        .builder
+                                        .arena()
+                                        .scalar_symbol::<seismic_lang::expr::I32>(symbol);
                                     Some(self.builder.arena().int_from_scalar(value))
                                 }
                                 SymbolSort::Scalar(DType::U32) => {
-                                    let value = self.builder.arena().scalar_symbol::<seismic_lang::expr::U32>(symbol);
+                                    let value = self
+                                        .builder
+                                        .arena()
+                                        .scalar_symbol::<seismic_lang::expr::U32>(symbol);
                                     Some(self.builder.arena().int_from_scalar(value))
                                 }
                                 SymbolSort::Scalar(_) => None,
@@ -290,12 +330,15 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                 panic!("structural primitive survived semantic canonicalization: {primitive:?}")
             }
             _ => {
-                if matches!(self.function.value(output).ty, SemanticType::Integer | SemanticType::Index { .. })
-                    || inputs.iter().any(|value| matches!(
+                if matches!(
+                    self.function.value(output).ty,
+                    SemanticType::Integer | SemanticType::Index { .. }
+                ) || inputs.iter().any(|value| {
+                    matches!(
                         self.function.value(*value).ty,
                         SemanticType::Integer | SemanticType::Index { .. }
-                    ))
-                {
+                    )
+                }) {
                     self.emit_host_scalar(node, primitive, inputs, output);
                 } else {
                     self.emit_scalar(node, primitive, inputs, output);
@@ -304,9 +347,16 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         }
     }
 
-    pub(super) fn lower_extent(&mut self, tensor: SemanticValueId, axis: u32, output: SemanticValueId) {
+    pub(super) fn lower_extent(
+        &mut self,
+        tensor: SemanticValueId,
+        axis: u32,
+        output: SemanticValueId,
+    ) {
         let view = self.bound(tensor).tensor();
-        let value = *view.extents().get(axis as usize)
+        let value = *view
+            .extents()
+            .get(axis as usize)
             .expect("checked extent axis exceeds actual view rank");
         // An axis fixed for the whole invocation is its own exact value, as
         // for an invocation-evaluable index expression. Public results still
@@ -316,11 +366,14 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         {
             let direct = match self.function.value(output).ty {
                 SemanticType::Index { .. } => Some(ScalarBinding::Index(value)),
-                SemanticType::Integer => Some(ScalarBinding::Integer(self.builder.arena().int_from_nat(value))),
+                SemanticType::Integer => Some(ScalarBinding::Integer(
+                    self.builder.arena().int_from_nat(value),
+                )),
                 _ => None,
             };
             if let Some(direct) = direct {
-                self.values.bind(self.builder.bindings_mut(), output, Bound::Scalar(direct));
+                self.values
+                    .bind(self.builder.bindings_mut(), output, Bound::Scalar(direct));
                 return;
             }
         }
@@ -328,15 +381,18 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         let (value, to) = match &target {
             Bound::Scalar(ScalarBinding::Quantity(slot)) => (
                 match slot.kind() {
-                    seismic_ir::schedule::HostQuantityKind::Natural => HostValueExpr::Natural(value),
+                    seismic_ir::schedule::HostQuantityKind::Natural => {
+                        HostValueExpr::Natural(value)
+                    }
                     seismic_ir::schedule::HostQuantityKind::Integer => {
                         HostValueExpr::Integer(self.builder.arena().int_from_nat(value))
                     }
                 },
                 HostValueDestination::Quantity(*slot),
             ),
-            Bound::Scalar(ScalarBinding::Published(slot)) if
-                slot.kind() == seismic_ir::repr::ScalarKind::Scalar(DType::I32) => {
+            Bound::Scalar(ScalarBinding::Published(slot))
+                if slot.kind() == seismic_ir::repr::ScalarKind::Scalar(DType::I32) =>
+            {
                 // `extent` is a source i32 value. The selected view supplies
                 // its actual logical axis, and the language cast owns wrapping.
                 let exact = self.builder.arena().int_from_nat(value);
@@ -344,8 +400,13 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                     seismic_lang::reference_math::ScalarOp::Cast(DType::I32),
                     &[(DType::I32, exact)],
                 );
-                (HostValueExpr::Word { dtype: DType::I32, value: word },
-                 HostValueDestination::Native(*slot))
+                (
+                    HostValueExpr::Word {
+                        dtype: DType::I32,
+                        value: word,
+                    },
+                    HostValueDestination::Native(*slot),
+                )
             }
             _ => panic!("checked extent result has no typed scalar publication"),
         };
@@ -361,9 +422,13 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
 
 /// Only invocation symbols: call values, target constants and decisions.
 fn invocation_evaluable(arena: &ExprArena, expression: AnyExpr) -> bool {
-    arena.free_symbols(expression).iter().all(|symbol| matches!(
-        arena.symbol_kind(*symbol),
-        SymbolKind::CallDimension(_) | SymbolKind::CallScalar(_)
-            | SymbolKind::TargetConstant(_) | SymbolKind::Decision(_)
-    ))
+    arena.free_symbols(expression).iter().all(|symbol| {
+        matches!(
+            arena.symbol_kind(*symbol),
+            SymbolKind::CallDimension(_)
+                | SymbolKind::CallScalar(_)
+                | SymbolKind::TargetConstant(_)
+                | SymbolKind::Decision(_)
+        )
+    })
 }

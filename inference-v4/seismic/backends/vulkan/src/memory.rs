@@ -47,11 +47,17 @@ unsafe impl Sync for Block {}
 
 impl Block {
     fn take(&self, bytes: u64, alignment: u64) -> Option<u64> {
-        let mut free = self.free.lock().expect("block free list lock is never poisoned");
-        let (index, start) = free.iter().enumerate().find_map(|(index, (offset, size))| {
-            let start = offset.next_multiple_of(alignment);
-            (start + bytes <= offset + size).then_some((index, start))
-        })?;
+        let mut free = self
+            .free
+            .lock()
+            .expect("block free list lock is never poisoned");
+        let (index, start) = free
+            .iter()
+            .enumerate()
+            .find_map(|(index, (offset, size))| {
+                let start = offset.next_multiple_of(alignment);
+                (start + bytes <= offset + size).then_some((index, start))
+            })?;
         let (offset, size) = free.remove(index);
         if start + bytes < offset + size {
             free.insert(index, (start + bytes, offset + size - start - bytes));
@@ -64,7 +70,10 @@ impl Block {
 
     /// Return a range; true when the block is entirely free afterwards.
     fn give(&self, offset: u64, bytes: u64) -> bool {
-        let mut free = self.free.lock().expect("block free list lock is never poisoned");
+        let mut free = self
+            .free
+            .lock()
+            .expect("block free list lock is never poisoned");
         let index = free.partition_point(|(start, _)| *start < offset);
         free.insert(index, (offset, bytes));
         if index + 1 < free.len() && free[index].0 + free[index].1 == free[index + 1].0 {
@@ -98,20 +107,29 @@ impl Memory {
     ) -> Result<Self, String> {
         let types = &properties.memory_types[..properties.memory_type_count as usize];
         let find = |required: vk::MemoryPropertyFlags, preferred: vk::MemoryPropertyFlags| {
-            let candidates =
-                || types.iter().enumerate().filter(move |(_, kind)| kind.property_flags.contains(required));
+            let candidates = || {
+                types
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, kind)| kind.property_flags.contains(required))
+            };
             candidates()
                 .find(|(_, kind)| kind.property_flags.contains(preferred))
                 .or_else(|| candidates().next())
                 .map(|(index, kind)| (index as u32, kind.property_flags))
         };
-        let visible = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let visible =
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
         let local = vk::MemoryPropertyFlags::DEVICE_LOCAL;
         // Unified memory (integrated GPUs, lavapipe): the device-local heap
         // is host-visible, so device storage is mapped too.
         let unified = facts.host_visible_device_local_bytes == facts.device_local_bytes;
-        let device = if unified { find(local | visible, local | visible) } else { find(local, local) }
-            .ok_or("no device-local memory type")?;
+        let device = if unified {
+            find(local | visible, local | visible)
+        } else {
+            find(local, local)
+        }
+        .ok_or("no device-local memory type")?;
         // A small BAR window (typically 256 MiB) is not spent on upload
         // regions; ReBAR/SAM and unified memory are.
         let upload = if facts.host_visible_device_local_bytes > 256 << 20 {
@@ -166,15 +184,32 @@ impl Memory {
         let found = blocks
             .iter()
             .filter(|block| !block.dedicated)
-            .find_map(|block| block.take(bytes, alignment).map(|offset| (block.clone(), offset)));
+            .find_map(|block| {
+                block
+                    .take(bytes, alignment)
+                    .map(|offset| (block.clone(), offset))
+            });
         let (block, offset) = match found {
             Some(found) => found,
             None => {
-                let largest = blocks.iter().filter(|block| !block.dedicated).map(|block| block.bytes).max();
-                let size = largest.map_or(FIRST_BLOCK_BYTES, |largest| largest * 2).min(self.block_cap);
+                let largest = blocks
+                    .iter()
+                    .filter(|block| !block.dedicated)
+                    .map(|block| block.bytes)
+                    .max();
+                let size = largest
+                    .map_or(FIRST_BLOCK_BYTES, |largest| largest * 2)
+                    .min(self.block_cap);
                 let dedicated = bytes > size;
-                let block = create_block(device, pool, if dedicated { bytes } else { size }, dedicated)?;
-                let offset = block.take(bytes, alignment).expect("a new block holds its first allocation");
+                let block = create_block(
+                    device,
+                    pool,
+                    if dedicated { bytes } else { size },
+                    dedicated,
+                )?;
+                let offset = block
+                    .take(bytes, alignment)
+                    .expect("a new block holds its first allocation");
                 blocks.push(block.clone());
                 (block, offset)
             }
@@ -191,7 +226,11 @@ impl Memory {
     pub(crate) fn release(&self, device: &ash::Device, range: &Range) {
         let empty = range.block.give(range.offset, range.bytes);
         if empty && range.block.dedicated {
-            let mut blocks = self.pool(range.kind).blocks.lock().expect("pool lock is never poisoned");
+            let mut blocks = self
+                .pool(range.kind)
+                .blocks
+                .lock()
+                .expect("pool lock is never poisoned");
             blocks.retain(|block| !Arc::ptr_eq(block, &range.block));
             destroy_block(device, &range.block);
         }
@@ -200,7 +239,12 @@ impl Memory {
     /// Destroy every block. The device is idle and no allocation lives.
     pub(crate) fn destroy(&self, device: &ash::Device) {
         for pool in &self.pools {
-            for block in pool.blocks.lock().expect("pool lock is never poisoned").drain(..) {
+            for block in pool
+                .blocks
+                .lock()
+                .expect("pool lock is never poisoned")
+                .drain(..)
+            {
                 destroy_block(device, &block);
             }
         }
@@ -214,7 +258,12 @@ fn destroy_block(device: &ash::Device, block: &Block) {
     }
 }
 
-fn create_block(device: &ash::Device, pool: &Pool, bytes: u64, dedicated: bool) -> Result<Arc<Block>, ExecutionError> {
+fn create_block(
+    device: &ash::Device,
+    pool: &Pool,
+    bytes: u64,
+    dedicated: bool,
+) -> Result<Arc<Block>, ExecutionError> {
     let allocation = |error: ExecutionError| match error {
         ExecutionError::SubmissionFailed(message) => ExecutionError::AllocationFailed(message),
         other => other,
@@ -228,7 +277,11 @@ fn create_block(device: &ash::Device, pool: &Pool, bytes: u64, dedicated: bool) 
                 | vk::BufferUsageFlags::TRANSFER_DST,
         )
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let buffer = call(unsafe { device.create_buffer(&info, None) }, "vkCreateBuffer").map_err(allocation)?;
+    let buffer = call(
+        unsafe { device.create_buffer(&info, None) },
+        "vkCreateBuffer",
+    )
+    .map_err(allocation)?;
     let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
     if requirements.memory_type_bits & (1 << pool.memory_type) == 0 {
         unsafe { device.destroy_buffer(buffer, None) };
@@ -237,7 +290,8 @@ fn create_block(device: &ash::Device, pool: &Pool, bytes: u64, dedicated: bool) 
             pool.memory_type
         )));
     }
-    let mut flags = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+    let mut flags =
+        vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
     let allocate = vk::MemoryAllocateInfo::default()
         .allocation_size(requirements.size)
         .memory_type_index(pool.memory_type)
@@ -253,15 +307,22 @@ fn create_block(device: &ash::Device, pool: &Pool, bytes: u64, dedicated: bool) 
                         available: 0,
                     }
                 }
-                other => ExecutionError::AllocationFailed(format!("vkAllocateMemory failed: {other}")),
+                other => {
+                    ExecutionError::AllocationFailed(format!("vkAllocateMemory failed: {other}"))
+                }
             });
         }
     };
-    let bound = call(unsafe { device.bind_buffer_memory(buffer, memory, 0) }, "vkBindBufferMemory");
+    let bound = call(
+        unsafe { device.bind_buffer_memory(buffer, memory, 0) },
+        "vkBindBufferMemory",
+    );
     let mapped = bound.and_then(|()| {
         if pool.mapped {
             call(
-                unsafe { device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) },
+                unsafe {
+                    device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                },
                 "vkMapMemory",
             )
             .map(|pointer| pointer.cast::<u8>())
@@ -279,8 +340,9 @@ fn create_block(device: &ash::Device, pool: &Pool, bytes: u64, dedicated: bool) 
             return Err(allocation(error));
         }
     };
-    let address =
-        unsafe { device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer)) };
+    let address = unsafe {
+        device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
+    };
     Ok(Arc::new(Block {
         memory,
         buffer,
@@ -321,22 +383,37 @@ impl Range {
 
     /// The range's bytes through the persistent mapping, when mapped.
     pub(crate) fn mapped(&self) -> Option<*mut u8> {
-        (!self.block.mapped.is_null()).then(|| unsafe { self.block.mapped.add(self.offset as usize) })
+        (!self.block.mapped.is_null())
+            .then(|| unsafe { self.block.mapped.add(self.offset as usize) })
     }
 
     /// Host write of mapped storage: a plain memory write.
     pub(crate) fn write_mapped(&self, offset: u64, bytes: &[u8]) {
-        let base = self.mapped().expect("write_mapped precondition: the storage is mapped");
-        assert!(offset + bytes.len() as u64 <= self.bytes, "mapped write exceeds its range");
+        let base = self
+            .mapped()
+            .expect("write_mapped precondition: the storage is mapped");
+        assert!(
+            offset + bytes.len() as u64 <= self.bytes,
+            "mapped write exceeds its range"
+        );
         // SAFETY: the bytes lie inside this range of the mapping.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(offset as usize), bytes.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(offset as usize), bytes.len())
+        };
     }
 
     pub(crate) fn read_mapped(&self, offset: u64, into: &mut [u8]) {
-        let base = self.mapped().expect("read_mapped precondition: the storage is mapped");
-        assert!(offset + into.len() as u64 <= self.bytes, "mapped read exceeds its range");
+        let base = self
+            .mapped()
+            .expect("read_mapped precondition: the storage is mapped");
+        assert!(
+            offset + into.len() as u64 <= self.bytes,
+            "mapped read exceeds its range"
+        );
         // SAFETY: the bytes lie inside this range of the mapping.
-        unsafe { std::ptr::copy_nonoverlapping(base.add(offset as usize), into.as_mut_ptr(), into.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(base.add(offset as usize), into.as_mut_ptr(), into.len())
+        };
     }
 }
 

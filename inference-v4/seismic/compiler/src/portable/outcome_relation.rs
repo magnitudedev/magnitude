@@ -33,19 +33,28 @@ impl Value {
     fn flatten(&self, terms: &mut Vec<Term>) -> Result<()> {
         match self {
             Self::Scalar(value) => terms.push(*value),
-            Self::Range(start,end) => terms.extend([*start,*end]),
-            Self::Tuple(values) => for value in values { value.flatten(terms)?; },
+            Self::Range(start, end) => terms.extend([*start, *end]),
+            Self::Tuple(values) => {
+                for value in values {
+                    value.flatten(terms)?;
+                }
+            }
             Self::Unit => (),
             Self::Tensor(_) => return Err("tensor recurrence relation is unfinished"),
         }
         Ok(())
     }
-    fn replace(&self, terms: &mut impl Iterator<Item=Term>) -> Result<Self> {
+    fn replace(&self, terms: &mut impl Iterator<Item = Term>) -> Result<Self> {
         let mut next = || terms.next().ok_or("scalar product arity differs");
         Ok(match self {
             Self::Scalar(_) => Self::Scalar(next()?),
-            Self::Range(..) => Self::Range(next()?,next()?),
-            Self::Tuple(values) => Self::Tuple(values.iter().map(|value|value.replace(terms)).collect::<Result<_>>()?),
+            Self::Range(..) => Self::Range(next()?, next()?),
+            Self::Tuple(values) => Self::Tuple(
+                values
+                    .iter()
+                    .map(|value| value.replace(terms))
+                    .collect::<Result<_>>()?,
+            ),
             Self::Unit => Self::Unit,
             Self::Tensor(_) => return Err("tensor recurrence relation is unfinished"),
         })
@@ -101,7 +110,12 @@ impl Analysis<'_> {
             Bound::Tensor(TensorRealization::Stored(value)) => {
                 let root = self.storage_root(value.root)?;
                 self.external.insert(root);
-                Value::Tensor(*value.view.direct_backing().ok_or("mapped input relation is unfinished")?)
+                Value::Tensor(
+                    *value
+                        .view
+                        .direct_backing()
+                        .ok_or("mapped input relation is unfinished")?,
+                )
             }
             Bound::Tensor(TensorRealization::Computed(_)) => {
                 return Err("deferred tensor input relation is unfinished")
@@ -123,7 +137,16 @@ impl Analysis<'_> {
             .map(|(formal, value)| (formal.value, value.clone()))
             .collect::<HashMap<_, _>>();
         self.source_region(program, function, function.root(), &mut values, state)?;
-        function.results().iter().map(|result| values.get(result).cloned().ok_or("source result unavailable")).collect()
+        function
+            .results()
+            .iter()
+            .map(|result| {
+                values
+                    .get(result)
+                    .cloned()
+                    .ok_or("source result unavailable")
+            })
+            .collect()
     }
 
     fn source_region(
@@ -158,8 +181,16 @@ impl Analysis<'_> {
                             // RuntimeValue symbols, not inferred from output bounds.
                             let mut operands = state.slots.clone();
                             for symbol in self.expressions.free_symbols((*expression).into()) {
-                                if let SymbolKind::RuntimeValue(value) = self.expressions.symbol_kind(symbol) {
-                                    operands.insert(symbol, values.get(&value).ok_or("source quantity operand unavailable")?.scalar()?);
+                                if let SymbolKind::RuntimeValue(value) =
+                                    self.expressions.symbol_kind(symbol)
+                                {
+                                    operands.insert(
+                                        symbol,
+                                        values
+                                            .get(&value)
+                                            .ok_or("source quantity operand unavailable")?
+                                            .scalar()?,
+                                    );
                                 }
                             }
                             Value::Scalar(self.expression((*expression).into(), &operands)?)
@@ -264,8 +295,10 @@ impl Analysis<'_> {
                     let extent = self.storage.view(*view).extents[axis as usize];
                     let term = self.expression(extent.into(), &state.slots)?;
                     let term = match function.value(output).ty {
-                        SemanticType::Scalar(dtype @ (DType::I32|DType::U32)) => self.terms.word_from_natural(term,dtype),
-                        SemanticType::Index{..} => term,
+                        SemanticType::Scalar(dtype @ (DType::I32 | DType::U32)) => {
+                            self.terms.word_from_natural(term, dtype)
+                        }
+                        SemanticType::Index { .. } => term,
                         _ => return Err("source extent has no established scalar meaning"),
                     };
                     values.insert(output, Value::Scalar(term));
@@ -303,9 +336,15 @@ impl Analysis<'_> {
                     self.write(state, place, values[&value].scalar()?);
                     values.insert(output, Value::Tensor(view));
                 }
-                SemanticNodeView::Loop { kind, start, end, captures, body, carries, .. }
-                    if kind == seismic_lang::entry::LoopKind::Parallel =>
-                {
+                SemanticNodeView::Loop {
+                    kind,
+                    start,
+                    end,
+                    captures,
+                    body,
+                    carries,
+                    ..
+                } if kind == seismic_lang::entry::LoopKind::Parallel => {
                     if !carries.is_empty() {
                         return Err("checked parallel loops carry no products");
                     }
@@ -313,15 +352,28 @@ impl Analysis<'_> {
                     let end = self.source_index(function, end, values)?;
                     let extent = match (&self.terms.nodes[start.0], &self.terms.nodes[end.0]) {
                         (Node::Natural(0), _) => end,
-                        (Node::Natural(a), Node::Natural(b)) => self.terms.node(Node::Natural(b.saturating_sub(*a))),
+                        (Node::Natural(a), Node::Natural(b)) => {
+                            self.terms.node(Node::Natural(b.saturating_sub(*a)))
+                        }
                         _ => return Err("offset parallel map relation is unfinished"),
                     };
                     let body_region = function.region(body);
-                    let (binder, parameters) = body_region.parameters().split_first().ok_or("source loop binder unavailable")?;
-                    if parameters.len() != captures.len() { return Err("source loop capture arity differs"); }
+                    let (binder, parameters) = body_region
+                        .parameters()
+                        .split_first()
+                        .ok_or("source loop binder unavailable")?;
+                    if parameters.len() != captures.len() {
+                        return Err("source loop capture arity differs");
+                    }
                     let mut iteration = values.clone();
                     for (parameter, capture) in parameters.iter().zip(captures) {
-                        iteration.insert(*parameter, values.get(capture).cloned().ok_or("source loop capture unavailable")?);
+                        iteration.insert(
+                            *parameter,
+                            values
+                                .get(capture)
+                                .cloned()
+                                .ok_or("source loop capture unavailable")?,
+                        );
                     }
                     let binder = *binder;
                     self.map_visit(state, extent, &mut |analysis, visit, lane| {
@@ -331,22 +383,45 @@ impl Analysis<'_> {
                         analysis.source_region(program, function, body, &mut iteration, lane)
                     })?;
                 }
-                SemanticNodeView::Loop { start, end, captures, body, carries, .. } => {
+                SemanticNodeView::Loop {
+                    start,
+                    end,
+                    captures,
+                    body,
+                    carries,
+                    ..
+                } => {
                     let start = self.source_index(function, start, values)?;
                     let end = self.source_index(function, end, values)?;
                     let depth = self.loop_depth;
                     let body_region = function.region(body);
                     let mut iteration = values.clone();
-                    let (binder, parameters) = body_region.parameters().split_first().ok_or("source loop binder unavailable")?;
-                    if parameters.len() != captures.len() { return Err("source loop capture arity differs"); }
-                    for (parameter, capture) in parameters.iter().zip(captures) {
-                        iteration.insert(*parameter, values.get(capture).cloned().ok_or("source loop capture unavailable")?);
+                    let (binder, parameters) = body_region
+                        .parameters()
+                        .split_first()
+                        .ok_or("source loop binder unavailable")?;
+                    if parameters.len() != captures.len() {
+                        return Err("source loop capture arity differs");
                     }
-                    iteration.insert(*binder, Value::Scalar(self.terms.node(Node::Iteration(depth))));
+                    for (parameter, capture) in parameters.iter().zip(captures) {
+                        iteration.insert(
+                            *parameter,
+                            values
+                                .get(capture)
+                                .cloned()
+                                .ok_or("source loop capture unavailable")?,
+                        );
+                    }
+                    iteration.insert(
+                        *binder,
+                        Value::Scalar(self.terms.node(Node::Iteration(depth))),
+                    );
                     let mut initial = Vec::new();
                     let mut schemas = Vec::new();
                     for carry in carries {
-                        let value = values.get(&carry.initial).ok_or("source initial carry unavailable")?;
+                        let value = values
+                            .get(&carry.initial)
+                            .ok_or("source initial carry unavailable")?;
                         let ty = &function.value(carry.parameter).ty;
                         let header = self.source_header(value, ty, depth, &mut initial)?;
                         schemas.push(header.clone());
@@ -354,21 +429,34 @@ impl Analysis<'_> {
                     }
                     let mut body_state = state.clone();
                     self.loop_depth += 1;
-                    let body_result = self.source_region(program, function, body, &mut iteration, &mut body_state);
+                    let body_result = self.source_region(
+                        program,
+                        function,
+                        body,
+                        &mut iteration,
+                        &mut body_state,
+                    );
                     self.loop_depth = depth;
                     body_result?;
-                    if body_state.writes.len() != state.writes.len() || body_state.effects.len() != state.effects.len() {
+                    if body_state.writes.len() != state.writes.len()
+                        || body_state.effects.len() != state.effects.len()
+                    {
                         return Err("source stateful recurrence relation is unfinished");
                     }
                     let mut next = Vec::new();
                     for carry in carries {
-                        iteration.get(&carry.yielded).ok_or("source next carry unavailable")?.flatten(&mut next)?;
+                        iteration
+                            .get(&carry.yielded)
+                            .ok_or("source next carry unavailable")?
+                            .flatten(&mut next)?;
                     }
                     let mut folded = self.terms.fold(start, end, initial, next).into_iter();
                     for (carry, schema) in carries.iter().zip(schemas) {
                         values.insert(carry.result, schema.replace(&mut folded)?);
                     }
-                    if folded.next().is_some() { return Err("source carry result arity differs"); }
+                    if folded.next().is_some() {
+                        return Err("source carry result arity differs");
+                    }
                 }
                 SemanticNodeView::Check { condition, reason } => {
                     let failed = self.terms.not(values[&condition].scalar()?);
@@ -389,8 +477,16 @@ impl Analysis<'_> {
     }
 
     /// One checked element coordinate as a natural term.
-    fn source_coordinate(&mut self, function: &SemanticFunction, values: &HashMap<SemanticValueId, Value>, index: SemanticValueId) -> Result<Term> {
-        let value = values.get(&index).ok_or("source coordinate unavailable")?.scalar()?;
+    fn source_coordinate(
+        &mut self,
+        function: &SemanticFunction,
+        values: &HashMap<SemanticValueId, Value>,
+        index: SemanticValueId,
+    ) -> Result<Term> {
+        let value = values
+            .get(&index)
+            .ok_or("source coordinate unavailable")?
+            .scalar()?;
         match function.value(index).ty {
             SemanticType::Scalar(dtype) => self.terms.natural(value, dtype),
             SemanticType::Index { .. } => self.terms.natural(value, DType::U32),
@@ -399,34 +495,77 @@ impl Analysis<'_> {
         }
     }
 
-    fn source_index(&mut self, function: &SemanticFunction, value: SemanticValueId, values: &HashMap<SemanticValueId, Value>) -> Result<Term> {
-        let term = values.get(&value).ok_or("source index unavailable")?.scalar()?;
+    fn source_index(
+        &mut self,
+        function: &SemanticFunction,
+        value: SemanticValueId,
+        values: &HashMap<SemanticValueId, Value>,
+    ) -> Result<Term> {
+        let term = values
+            .get(&value)
+            .ok_or("source index unavailable")?
+            .scalar()?;
         match function.value(value).ty {
             SemanticType::Index { .. } => Ok(term),
-            SemanticType::Scalar(dtype @ (DType::U32 | DType::I32)) => self.terms.natural(term, dtype),
+            SemanticType::Scalar(dtype @ (DType::U32 | DType::I32)) => {
+                self.terms.natural(term, dtype)
+            }
             _ => Err("source mathematical index relation is unfinished"),
         }
     }
 
-    fn source_header(&mut self, value: &Value, ty: &SemanticType, depth: u32, initial: &mut Vec<Term>) -> Result<Value> {
+    fn source_header(
+        &mut self,
+        value: &Value,
+        ty: &SemanticType,
+        depth: u32,
+        initial: &mut Vec<Term>,
+    ) -> Result<Value> {
         Ok(match (value, ty) {
             (Value::Scalar(value), SemanticType::Scalar(dtype)) => {
                 let ordinal = initial.len() as u32;
                 initial.push(*value);
-                Value::Scalar(self.terms.node(Node::Header { depth, ordinal, kind: ScalarKind::Scalar(*dtype) }))
+                Value::Scalar(self.terms.node(Node::Header {
+                    depth,
+                    ordinal,
+                    kind: ScalarKind::Scalar(*dtype),
+                }))
             }
             (Value::Scalar(value), SemanticType::Index { .. }) => {
                 let ordinal = initial.len() as u32;
                 initial.push(*value);
-                Value::Scalar(self.terms.node(Node::Header { depth, ordinal, kind: ScalarKind::Nat64 }))
+                Value::Scalar(self.terms.node(Node::Header {
+                    depth,
+                    ordinal,
+                    kind: ScalarKind::Nat64,
+                }))
             }
-            (Value::Tuple(values), SemanticType::Tuple(types)) if values.len() == types.len() => Value::Tuple(values.iter().zip(types).map(|(v,t)|self.source_header(v,t,depth,initial)).collect::<Result<_>>()?),
+            (Value::Tuple(values), SemanticType::Tuple(types)) if values.len() == types.len() => {
+                Value::Tuple(
+                    values
+                        .iter()
+                        .zip(types)
+                        .map(|(v, t)| self.source_header(v, t, depth, initial))
+                        .collect::<Result<_>>()?,
+                )
+            }
             (Value::Unit, SemanticType::Void) => Value::Unit,
-            (Value::Range(start,end), SemanticType::Range { .. }) => {
+            (Value::Range(start, end), SemanticType::Range { .. }) => {
                 let ordinal = initial.len() as u32;
-                initial.extend([*start,*end]);
-                Value::Range(self.terms.node(Node::Header { depth, ordinal, kind: ScalarKind::Nat64 }),self.terms.node(Node::Header { depth, ordinal:ordinal+1, kind: ScalarKind::Nat64 }))
-            },
+                initial.extend([*start, *end]);
+                Value::Range(
+                    self.terms.node(Node::Header {
+                        depth,
+                        ordinal,
+                        kind: ScalarKind::Nat64,
+                    }),
+                    self.terms.node(Node::Header {
+                        depth,
+                        ordinal: ordinal + 1,
+                        kind: ScalarKind::Nat64,
+                    }),
+                )
+            }
             _ => return Err("source carry product relation is unfinished"),
         })
     }
@@ -462,7 +601,9 @@ impl Analysis<'_> {
                     Value::Scalar(analysis.expression(expression.into(), slots)?)
                 }
                 Bound::Scalar(ScalarBinding::Quantity(_)) => {
-                    return Err("exact host quantity comparison is not an alternative-analysis rule")
+                    return Err(
+                        "exact host quantity comparison is not an alternative-analysis rule",
+                    )
                 }
                 Bound::Range { start, end } => Value::Range(
                     value(analysis, *start, slots)?.scalar()?,
@@ -530,11 +671,16 @@ pub(crate) fn derive<B: seismic_native_target::TargetFamily>(
                 Effect::Write(place, value) => vec![(Some(place), *value)],
                 Effect::Failure(value, _) => vec![(None, *value)],
                 Effect::Map { extent, writes } => std::iter::once((None, *extent))
-                    .chain(writes.iter().map(|(place, value)| (Some(place), *value))).collect(),
+                    .chain(writes.iter().map(|(place, value)| (Some(place), *value)))
+                    .collect(),
             };
             for (place, value) in observed {
-                if place.is_some_and(|place| analysis.terms.contains_opaque(place.byte)) { return Err("opaque observed write address"); }
-                if analysis.terms.contains_opaque(value) { return Err("opaque observed state or failure value"); }
+                if place.is_some_and(|place| analysis.terms.contains_opaque(place.byte)) {
+                    return Err("opaque observed write address");
+                }
+                if analysis.terms.contains_opaque(value) {
+                    return Err("opaque observed state or failure value");
+                }
             }
         }
         if source.effects.len() != physical.effects.len() {
@@ -552,11 +698,21 @@ pub(crate) fn derive<B: seismic_native_target::TargetFamily>(
                     successful.push((*expected, false));
                     successful.push((*actual, false));
                 }
-                (Effect::Map { extent: expected_extent, writes: expected }, Effect::Map { extent: actual_extent, writes: actual })
-                    if expected_extent == actual_extent && expected.len() == actual.len()
-                        && expected.iter().zip(actual).all(|((a, _), (b, _))| a == b) =>
+                (
+                    Effect::Map {
+                        extent: expected_extent,
+                        writes: expected,
+                    },
+                    Effect::Map {
+                        extent: actual_extent,
+                        writes: actual,
+                    },
+                ) if expected_extent == actual_extent
+                    && expected.len() == actual.len()
+                    && expected.iter().zip(actual).all(|((a, _), (b, _))| a == b) =>
                 {
-                    for ((place, expected_value), (_, actual_value)) in expected.iter().zip(actual) {
+                    for ((place, expected_value), (_, actual_value)) in expected.iter().zip(actual)
+                    {
                         if analysis.terms.under(*expected_value, &successful)
                             != analysis.terms.under(*actual_value, &successful)
                         {
@@ -605,15 +761,21 @@ pub(crate) fn derive<B: seismic_native_target::TargetFamily>(
         for value in expected.iter_mut().chain(&mut actual) {
             restrict(value, &mut analysis.terms, &successful);
         }
-        fn opaque(value:&Value,terms:&Terms) -> bool {
+        fn opaque(value: &Value, terms: &Terms) -> bool {
             match value {
                 Value::Scalar(value) => terms.contains_opaque(*value),
-                Value::Range(a,b) => terms.contains_opaque(*a)||terms.contains_opaque(*b),
-                Value::Tuple(values) => values.iter().any(|value|opaque(value,terms)),
+                Value::Range(a, b) => terms.contains_opaque(*a) || terms.contains_opaque(*b),
+                Value::Tuple(values) => values.iter().any(|value| opaque(value, terms)),
                 _ => false,
             }
         }
-        if actual.iter().chain(&expected).any(|value|opaque(value,&analysis.terms)) { return Err("opaque returned value"); }
+        if actual
+            .iter()
+            .chain(&expected)
+            .any(|value| opaque(value, &analysis.terms))
+        {
+            return Err("opaque returned value");
+        }
         if actual == expected && !floating_difference {
             return Ok(DerivedOutcome::Exact);
         }
@@ -710,16 +872,28 @@ mod tests {
     #[test]
     fn independent_participants_relate_to_the_parallel_map_visits() {
         let map = "fn probe(input: &tensor[4] f32, out: &mut tensor[4] f32):\n    parallel for i in 0..4:\n        out[i] = input[i] + 1.0\n";
-        assert_eq!(analyze_mapped(map, Some(BodyMapping::Independent)), DerivedOutcome::Exact);
+        assert_eq!(
+            analyze_mapped(map, Some(BodyMapping::Independent)),
+            DerivedOutcome::Exact
+        );
         assert_eq!(analyze_mapped(map, None), DerivedOutcome::Exact);
         let symbolic = "fn probe[N](input: &tensor[N] f32, out: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        out[i] = input[i] * 2.0\n";
-        assert_eq!(analyze_mapped(symbolic, Some(BodyMapping::Independent)), DerivedOutcome::Exact);
+        assert_eq!(
+            analyze_mapped(symbolic, Some(BodyMapping::Independent)),
+            DerivedOutcome::Exact
+        );
         // A later read of mapped storage stays unfinished, and so does a
         // different authored participant map.
         let later = "fn probe(input: &tensor[4] f32, out: &mut tensor[4] f32) -> f32:\n    parallel for i in 0..4:\n        out[i] = input[i]\n    return out[0]\n";
-        assert!(matches!(analyze_mapped(later, Some(BodyMapping::Independent)), DerivedOutcome::Pending(_)));
+        assert!(matches!(
+            analyze_mapped(later, Some(BodyMapping::Independent)),
+            DerivedOutcome::Pending(_)
+        ));
         let authored = format!("{map}\nlower probe(input: &tensor[4] f32, out: &mut tensor[4] f32) for cpu:\n    parallel for i in 0..4:\n        out[i] = input[i] + 2.0\n");
-        assert_ne!(analyze_mapped(&authored, Some(BodyMapping::Authored)), DerivedOutcome::Exact);
+        assert_ne!(
+            analyze_mapped(&authored, Some(BodyMapping::Authored)),
+            DerivedOutcome::Exact
+        );
     }
 
     #[test]

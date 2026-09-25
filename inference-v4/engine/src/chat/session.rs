@@ -55,7 +55,10 @@ impl<'a> Session<'a> {
     ) -> Result<Self, String> {
         let parser = TokenChatStream::new(&prepared.chat, tokenizer, stops, max_output_bytes)?;
         let capacity = prepared.options.output_capacity;
-        let request = client.admit(seed, input, capacity).await?;
+        let request = client
+            .admit(seed, input, capacity)
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             request: Some(request),
             parser,

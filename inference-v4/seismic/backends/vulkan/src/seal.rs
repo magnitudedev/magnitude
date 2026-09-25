@@ -49,7 +49,9 @@ const CAPABILITY_ROUNDING_MODE_RTE: u32 = 4467;
 /// exact; `OpFAdd`, `OpFSub`, `OpFMul`, `OpFDiv`, `OpFRem`, `OpFMod`,
 /// `OpVectorTimesScalar`, `OpMatrixTimesScalar`, `OpVectorTimesMatrix`,
 /// `OpMatrixTimesVector`, `OpMatrixTimesMatrix`, `OpOuterProduct`, `OpDot`.
-const FLOAT_ARITHMETIC: [u32; 13] = [129, 131, 133, 136, 140, 141, 142, 143, 144, 145, 146, 147, 148];
+const FLOAT_ARITHMETIC: [u32; 13] = [
+    129, 131, 133, 136, 140, 141, 142, 143, 144, 145, 146, 147, 148,
+];
 
 /// Instructions of the logical-layout sections before the annotations:
 /// capabilities, extensions, imports, memory model, entry points, execution
@@ -81,7 +83,9 @@ fn instructions(module: &[u32]) -> Result<Vec<Instruction>, MalformedModule> {
     while at < module.len() {
         let words = (module[at] >> 16) as usize;
         if words == 0 || at + words > module.len() {
-            return Err(MalformedModule(format!("instruction at word {at} has length {words}")));
+            return Err(MalformedModule(format!(
+                "instruction at word {at} has length {words}"
+            )));
         }
         instructions.push(Instruction {
             start: at,
@@ -96,7 +100,9 @@ fn instructions(module: &[u32]) -> Result<Vec<Instruction>, MalformedModule> {
 /// Seal `module` for Seismic's numerical environment.
 pub fn seal(module: &[u32], environment: Environment) -> Result<Vec<u32>, MalformedModule> {
     let instructions = instructions(module)?;
-    let words = |instruction: &Instruction| &module[instruction.start..instruction.start + instruction.words];
+    let words = |instruction: &Instruction| {
+        &module[instruction.start..instruction.start + instruction.words]
+    };
     let entry = instructions
         .iter()
         .find(|instruction| instruction.opcode == OP_ENTRY_POINT)
@@ -125,7 +131,10 @@ pub fn seal(module: &[u32], environment: Environment) -> Result<Vec<u32>, Malfor
         (MODE_SIGNED_ZERO_INF_NAN_PRESERVE, 16),
         (MODE_SIGNED_ZERO_INF_NAN_PRESERVE, 32),
     ];
-    let mut wanted_capabilities = vec![CAPABILITY_ROUNDING_MODE_RTE, CAPABILITY_SIGNED_ZERO_INF_NAN_PRESERVE];
+    let mut wanted_capabilities = vec![
+        CAPABILITY_ROUNDING_MODE_RTE,
+        CAPABILITY_SIGNED_ZERO_INF_NAN_PRESERVE,
+    ];
     if environment.rounding_rte_32 {
         wanted_modes.push((MODE_ROUNDING_MODE_RTE, 32));
     }
@@ -161,14 +170,17 @@ pub fn seal(module: &[u32], environment: Environment) -> Result<Vec<u32>, Malfor
             .map(|instruction| instruction.start + instruction.words)
             .max()
     };
-    let capability_at = after(&[OP_CAPABILITY]).ok_or_else(|| MalformedModule("no capability".into()))?;
+    let capability_at =
+        after(&[OP_CAPABILITY]).ok_or_else(|| MalformedModule("no capability".into()))?;
     let mode_at = after(&[OP_ENTRY_POINT, OP_EXECUTION_MODE]).expect("an entry point was found");
     let decoration_at = instructions
         .iter()
         .find(|instruction| !HEADER_SECTIONS.contains(&instruction.opcode))
         .map_or(module.len(), |instruction| instruction.start);
 
-    let mut sealed = Vec::with_capacity(module.len() + new_capabilities.len() + new_modes.len() + new_decorations.len());
+    let mut sealed = Vec::with_capacity(
+        module.len() + new_capabilities.len() + new_modes.len() + new_decorations.len(),
+    );
     sealed.extend_from_slice(&module[..capability_at]);
     sealed.extend_from_slice(&new_capabilities);
     sealed.extend_from_slice(&module[capability_at..mode_at]);
@@ -204,11 +216,14 @@ fn string_words(text: &str) -> Vec<u32> {
 /// §16.1). Run after validation: the linked SPIRV-Tools predates the opcode.
 pub fn fma_khr(module: &[u32]) -> Result<Vec<u32>, MalformedModule> {
     let instructions = instructions(module)?;
-    let words = |instruction: &Instruction| &module[instruction.start..instruction.start + instruction.words];
+    let words = |instruction: &Instruction| {
+        &module[instruction.start..instruction.start + instruction.words]
+    };
     let import = instructions
         .iter()
         .find(|instruction| {
-            instruction.opcode == OP_EXT_INST_IMPORT && literal_string(&words(instruction)[2..]) == "GLSL.std.450"
+            instruction.opcode == OP_EXT_INST_IMPORT
+                && literal_string(&words(instruction)[2..]) == "GLSL.std.450"
         })
         .map(|instruction| words(instruction)[1]);
     let capability_at = instructions
@@ -223,11 +238,24 @@ pub fn fma_khr(module: &[u32]) -> Result<Vec<u32>, MalformedModule> {
     let name = string_words("SPV_KHR_fma");
     rewritten.push(((1 + name.len() as u32) << 16) | OP_EXTENSION);
     rewritten.extend(name);
-    for instruction in instructions.iter().filter(|instruction| instruction.start >= capability_at) {
+    for instruction in instructions
+        .iter()
+        .filter(|instruction| instruction.start >= capability_at)
+    {
         let words = words(instruction);
-        if instruction.opcode == OP_EXT_INST && Some(words[3]) == import && words[4] == GLSL_STD_450_FMA {
+        if instruction.opcode == OP_EXT_INST
+            && Some(words[3]) == import
+            && words[4] == GLSL_STD_450_FMA
+        {
             // Result type, result id, a, b, c.
-            rewritten.extend([(6 << 16) | OP_FMA_KHR, words[1], words[2], words[5], words[6], words[7]]);
+            rewritten.extend([
+                (6 << 16) | OP_FMA_KHR,
+                words[1],
+                words[2],
+                words[5],
+                words[6],
+                words[7],
+            ]);
         } else {
             rewritten.extend_from_slice(words);
         }
@@ -240,7 +268,9 @@ pub fn fma_khr(module: &[u32]) -> Result<Vec<u32>, MalformedModule> {
 /// lack (for tests).
 pub fn unsealed(module: &[u32]) -> Result<(usize, bool), MalformedModule> {
     let instructions = instructions(module)?;
-    let words = |instruction: &Instruction| &module[instruction.start..instruction.start + instruction.words];
+    let words = |instruction: &Instruction| {
+        &module[instruction.start..instruction.start + instruction.words]
+    };
     let decorated = instructions
         .iter()
         .filter(|instruction| {

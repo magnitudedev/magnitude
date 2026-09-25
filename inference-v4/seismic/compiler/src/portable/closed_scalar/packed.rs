@@ -45,7 +45,11 @@ impl Analysis<'_> {
         self.coordinates_in_bounds(view, indices, state)?;
         let root = self.storage_root(self.storage.view(view).base)?;
         let layout = self.storage.view(view);
-        if !matches!(layout.mapping, seismic_ir::storage::ViewMapping::Direct | seismic_ir::storage::ViewMapping::WholeAllocation) {
+        if !matches!(
+            layout.mapping,
+            seismic_ir::storage::ViewMapping::Direct
+                | seismic_ir::storage::ViewMapping::WholeAllocation
+        ) {
             return Err("transformed packed place relation is unfinished");
         }
         let RepresentationKind::Packed(packet) =
@@ -86,18 +90,13 @@ impl Analysis<'_> {
                 let width = self.terms.node(Node::Natural(u64::from(dtype.bytes())));
                 let displacement = self.terms.natural_binary(true, entry, width);
                 let byte = self.terms.natural_binary(false, base, displacement);
-                self.read(
-                    state,
-                    Place {
-                        root,
-                        byte,
-                        dtype,
-                    },
-                )
+                self.read(state, Place { root, byte, dtype })
             }
             registry::PlaneEncoding::Packed { .. } | registry::PlaneEncoding::FloatCode { .. } => {
-                if state.writes.iter().any(|write| match (write.root(),root) {
-                    (ViewBase::Allocation(a),ViewBase::Allocation(b)) => self.storage.allocations_may_overlap(a,b),
+                if state.writes.iter().any(|write| match (write.root(), root) {
+                    (ViewBase::Allocation(a), ViewBase::Allocation(b)) => {
+                        self.storage.allocations_may_overlap(a, b)
+                    }
                     _ => true,
                 }) {
                     return Err("modified packed field relation is unfinished");

@@ -41,6 +41,8 @@ struct FinalEpi {
 
 } // namespace routed
 
+#ifdef SEISMIC_FORMING_ROUTED_OUTPUT
+template <uint ROWS, uint LANES>
 kernel void routed_output(
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],
     device const uchar *expert_product [[buffer(SEISMIC_BUFFER_EXPERT_PRODUCT)]],
@@ -54,16 +56,16 @@ kernel void routed_output(
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     threadgroup uchar *shared [[threadgroup(0)]],
     uint2 group [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint SG = SEISMIC_TUNE_SIMDGROUPS;
-    constexpr uint R = SEISMIC_TUNE_ROWS;
-    constexpr uint L = SEISMIC_TUNE_LANES;
+    constexpr uint R = ROWS;
+    constexpr uint L = LANES;
     typedef routed::Act A;
     const uint tile = group.x;
     const ulong m = group.y;
     // The R output channels of this lane's group (the GEMV's row ownership).
-    const uint first = ((tile * SG + sg) * (32u / L) + lane / L) * R;
+    const uint first = ((tile * simdgroups + sg) * (32u / L) + lane / L) * R;
     float selected[R];
     for (uint r = 0; r < R; ++r) selected[r] = 0.0f;
 
@@ -76,8 +78,8 @@ kernel void routed_output(
             routed::expert_row(expert, SEISMIC_DIM_H), SEISMIC_DIM_F);
         const routed::SelectEpi<R> out{selected, first,
             scores[m * SEISMIC_SCORES_STRIDE_0 + k * SEISMIC_SCORES_STRIDE_1]};
-        projection::gemv<packets::W0, SG, R, 1, L>(in, out, down, 1, SEISMIC_DIM_H, SEISMIC_DIM_F, tile,
-            shared, sg, lane);
+        projection::gemv_runtime<packets::W0, R, 1, L>(in, out, down, 1, SEISMIC_DIM_H, SEISMIC_DIM_F, tile,
+            shared, simdgroups, sg, lane);
     }
 
     const auto in = routed::activation(shared_product + m * SEISMIC_SHARED_PRODUCT_STRIDE_0 * A::bytes, 0,
@@ -87,6 +89,7 @@ kernel void routed_output(
     const routed::FinalEpi<R> out{selected, first, value + m * SEISMIC_RESULT_0_STRIDE_0,
         SEISMIC_RESULT_0_STRIDE_1, residual + m * SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1,
         coefficient[m * SEISMIC_COEFFICIENT_STRIDE_0]};
-    projection::gemv<packets::W1, SG, R, 1, L>(in, out, down, 1, SEISMIC_DIM_H, SEISMIC_DIM_S, tile, shared,
-        sg, lane);
+    projection::gemv_runtime<packets::W1, R, 1, L>(in, out, down, 1, SEISMIC_DIM_H, SEISMIC_DIM_S, tile, shared,
+        simdgroups, sg, lane);
 }
+#endif

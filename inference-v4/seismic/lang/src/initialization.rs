@@ -2049,7 +2049,9 @@ impl<'a> InitializationContext<'a> {
             NodeView::Cmp { op, lhs, rhs } => {
                 let (a, b) = match (lhs, rhs) {
                     (AnyExpr::Int(a), AnyExpr::Int(b)) => (a, b),
-                    (AnyExpr::Nat(a), AnyExpr::Nat(b)) => (self.arena.int_from_nat(a), self.arena.int_from_nat(b)),
+                    (AnyExpr::Nat(a), AnyExpr::Nat(b)) => {
+                        (self.arena.int_from_nat(a), self.arena.int_from_nat(b))
+                    }
                     _ => return Condition::Actual(value, binders.to_vec()),
                 };
                 let op = match op {
@@ -2062,9 +2064,10 @@ impl<'a> InitializationContext<'a> {
                 };
                 Condition::Compare(op, a, b)
             }
-            NodeView::Unary { op: crate::expr::UnaryOp::Not, operand: AnyExpr::Bool(inner) } => {
-                Condition::Not(Box::new(self.actual_condition(inner, binders)))
-            }
+            NodeView::Unary {
+                op: crate::expr::UnaryOp::Not,
+                operand: AnyExpr::Bool(inner),
+            } => Condition::Not(Box::new(self.actual_condition(inner, binders))),
             _ => Condition::Actual(value, binders.to_vec()),
         }
     }
@@ -2350,8 +2353,12 @@ impl RegionMapping for EntryMapping<'_, '_, '_> {
 impl InitializationContract {
     /// `symbol` is the value of the integer semantic parameter `ordinal`.
     pub(crate) fn bind_integer_parameter(&mut self, symbol: SymbolId, ordinal: usize) {
-        assert!(self.symbols.iter().all(|(prior, _)| *prior != symbol), "contract symbol bound twice");
-        self.symbols.push((symbol, ParameterPart::Integer(ParameterPath::root(ordinal))));
+        assert!(
+            self.symbols.iter().all(|(prior, _)| *prior != symbol),
+            "contract symbol bound twice"
+        );
+        self.symbols
+            .push((symbol, ParameterPart::Integer(ParameterPath::root(ordinal))));
     }
     /// Entry instantiation remaps all contract coordinates into the same arena
     /// as the semantic body, and uses its existing canonical parameter leaves.

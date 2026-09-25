@@ -1091,7 +1091,10 @@ pub(super) fn operation(b: &Recipe, op: ScalarOp, args: &[V]) -> V {
         ScalarOp::Unary(SourceUnary::BitNot) => assert!(args[0].ty.is_int()),
         ScalarOp::Unary(SourceUnary::Neg) => assert!(args[0].ty.is_numeric()),
         ScalarOp::IntegerToFloat(to) => {
-            assert!(to.is_float(), "integer_to_float target must be a float dtype");
+            assert!(
+                to.is_float(),
+                "integer_to_float target must be a float dtype"
+            );
             assert!(
                 args.iter().all(|a| a.ty == DType::U32),
                 "integer_to_float operands are U32 words"

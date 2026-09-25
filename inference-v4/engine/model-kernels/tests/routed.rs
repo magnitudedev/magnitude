@@ -875,7 +875,6 @@ fn bf16_round(value: f32) -> f32 {
 /// Weights and inputs of one routed block at real packed representations.
 struct Routed {
     hidden: usize,
-    experts: usize,
     choices: usize,
     features: usize,
     shared: usize,
@@ -1028,7 +1027,6 @@ fn host_reference_matches_portable_decode_body() {
     let (normalized, coefficient, routes, scores) = block.route(&module);
     let routed = Routed {
         hidden: block.hidden,
-        experts: block.experts,
         choices: block.choices,
         features: block.features,
         shared: block.shared,
@@ -1209,7 +1207,6 @@ impl PackedBlock {
         Self {
             routed: Routed {
                 hidden: Self::HIDDEN,
-                experts: Self::EXPERTS,
                 choices: Self::CHOICES,
                 features: Self::FEATURES,
                 shared: Self::SHARED,
@@ -1309,6 +1306,25 @@ fn decode_mappings(device: &seismic::Device) -> Vec<Vec<(&'static str, u64)>> {
     }
 }
 
+/// Metal and CUDA decode projections own their parameters on their sole launch.
+fn decode_specialization(
+    device: &seismic::Device,
+    statics: &[(&str, u64)],
+    mapping: &[(&'static str, u64)],
+) -> seismic::NativeSpecialization {
+    if matches!(
+        device.backend(),
+        seismic::BackendName::Metal | seismic::BackendName::Cuda
+    ) {
+        return mapping
+            .iter()
+            .fold(specialize(statics, &[]), |choice, (name, value)| {
+                choice.with_launch_param(0, *name, *value)
+            });
+    }
+    specialization_on(device, statics, mapping)
+}
+
 /// Mapping parameters of the grouped entries on the device's backend.
 fn grouped_mappings(device: &seismic::Device) -> Vec<Vec<(&'static str, u64)>> {
     match device.backend() {
@@ -1357,6 +1373,20 @@ fn native_decode_expand_and_output_match_reference() {
 }
 
 fn native_decode_expand_and_output_match_reference_on(device: &seismic::Device, int8: bool) {
+    native_decode_expand_and_output_match_reference_rows(
+        device,
+        int8,
+        &[1, 3, 8],
+        decode_mappings(device),
+    );
+}
+
+fn native_decode_expand_and_output_match_reference_rows(
+    device: &seismic::Device,
+    int8: bool,
+    row_counts: &[usize],
+    mappings: Vec<Vec<(&'static str, u64)>>,
+) {
     let block = PackedBlock::new(&device);
     let (h, k, f, s) = (
         PackedBlock::HIDDEN as u64,
@@ -1364,7 +1394,7 @@ fn native_decode_expand_and_output_match_reference_on(device: &seismic::Device, 
         PackedBlock::FEATURES as u64,
         PackedBlock::SHARED as u64,
     );
-    for rows in [1usize, 3, 8] {
+    for &rows in row_counts {
         let routing = PackedBlock::routing(rows, 50 + rows as u32);
         let m = rows as u64;
         let (expert, shared) = block.routed.expand(&routing, bf16_round);
@@ -1376,10 +1406,10 @@ fn native_decode_expand_and_output_match_reference_on(device: &seismic::Device, 
         let residual = f32_tensor(&device, &[m, h], &routing.residual);
         let expert_product = bf16_tensor(&device, &[m, k, f], &expert);
         let shared_product = bf16_tensor(&device, &[m, s], &shared);
-        for mapping in decode_mappings(&device) {
+        for mapping in &mappings {
             let label = format!("rows {rows} mapping {mapping:?} INT8 {int8}");
             let mut specialization =
-                specialization_on(device, &[("H", h), ("K", k), ("F", f), ("S", s)], &mapping);
+                decode_specialization(device, &[("H", h), ("K", k), ("F", f), ("S", s)], &mapping);
             if is_cpu(device) {
                 specialization = specialization.with_param("INT8", u64::from(int8));
             }
@@ -1452,6 +1482,220 @@ fn native_decode_expand_and_output_match_reference_on(device: &seismic::Device, 
             );
         }
     }
+}
+
+#[test]
+#[ignore]
+fn cuda_scoped_routed_decode_matches_reference_for_all_code_variants() {
+    let Some(device) = native_device() else {
+        return;
+    };
+    if device.backend() != seismic::BackendName::Cuda {
+        return;
+    }
+    let mappings = [1u64, 2]
+        .into_iter()
+        .flat_map(|tpw| {
+            [1u64, 2, 4]
+                .into_iter()
+                .map(move |split| vec![("TPW", tpw), ("KSPLIT", split)])
+        })
+        .collect();
+    native_decode_expand_and_output_match_reference_rows(&device, false, &[1], mappings);
+}
+
+#[test]
+#[ignore]
+fn cuda_scoped_routed_expand_tunes_declared_candidates() {
+    let Some(device) = native_device() else {
+        return;
+    };
+    if device.backend() != seismic::BackendName::Cuda {
+        return;
+    }
+    let block = PackedBlock::new(&device);
+    let (h, k, f, s) = (
+        PackedBlock::HIDDEN as u64,
+        PackedBlock::CHOICES as u64,
+        PackedBlock::FEATURES as u64,
+        PackedBlock::SHARED as u64,
+    );
+    let rows = [1usize, 3, 8];
+    let inputs = rows
+        .iter()
+        .map(|rows| {
+            let routing = PackedBlock::routing(*rows, 70 + *rows as u32);
+            (
+                bf16_tensor(&device, &[*rows as u64, h], &routing.normalized),
+                i32_tensor(&device, &[*rows as u64, k], &routing.routes),
+            )
+        })
+        .collect::<Vec<_>>();
+    let points = rows
+        .iter()
+        .zip(&inputs)
+        .map(|(rows, (normalized, routes))| seismic::TuningPoint {
+            label: format!("rows{rows}"),
+            weight: 1.0,
+            class: None,
+            rotation: vec![routed_expand::Args {
+                normalized,
+                routes,
+                expert_gate: &block.expert_gate,
+                expert_up: &block.expert_up,
+                shared_gate: &block.shared_gate,
+                shared_up: &block.shared_up,
+            }],
+            initialize: None,
+        })
+        .collect();
+    let search = seismic::Strategy::Search(seismic::SearchPlan {
+        budget: 24,
+        settings: seismic::SearchSettings {
+            improvement: 0.01,
+            restarts: 2,
+            confirmed: 3,
+            default_margin: 0.02,
+            samples: 5,
+            confirmation_samples: 5,
+        },
+        min_sample_seconds: 0.001,
+        start: Vec::new(),
+        deadline: None,
+        screening: Vec::new(),
+    });
+    let statics = specialize(&[("H", h), ("K", k), ("F", f), ("S", s)], &[]);
+    let result = routed_expand::native_tune_with(
+        &device,
+        routed_expand::Elements {
+            A: seismic::Element::bf16(),
+            EGW: element(&device, "q4k"),
+            EUW: element(&device, "q4k"),
+            SGW: element(&device, "q8g32s"),
+            SUW: element(&device, "q8g32s"),
+        },
+        &statics,
+        points,
+        seismic::Validation::Relative { error: 0.05 },
+        search,
+    )
+    .unwrap();
+    assert!(matches!(
+        &result.method,
+        seismic::TuningMethod::Factored {
+            groups: 1,
+            candidates: 6,
+            complete: true
+        }
+    ));
+    assert_eq!(result.defects().count(), 0);
+    println!(
+        "routed_expand CUDA BF16: choice {:?}, method {:?}, time {:?}, records {}",
+        result.overall.launches,
+        result.method,
+        result.time,
+        result.configurations.len()
+    );
+}
+
+#[test]
+#[ignore]
+fn cuda_scoped_routed_output_tunes_declared_candidates() {
+    let Some(device) = native_device() else {
+        return;
+    };
+    if device.backend() != seismic::BackendName::Cuda {
+        return;
+    }
+    let block = PackedBlock::new(&device);
+    let (h, k, f, s) = (
+        PackedBlock::HIDDEN as u64,
+        PackedBlock::CHOICES as u64,
+        PackedBlock::FEATURES as u64,
+        PackedBlock::SHARED as u64,
+    );
+    let rows = [1usize, 3, 8];
+    let inputs = rows
+        .iter()
+        .map(|rows| {
+            let routing = PackedBlock::routing(*rows, 80 + *rows as u32);
+            let (expert, shared) = block.routed.expand(&routing, bf16_round);
+            let m = *rows as u64;
+            (
+                f32_tensor(&device, &[m, h], &routing.residual),
+                bf16_tensor(&device, &[m, k, f], &expert),
+                bf16_tensor(&device, &[m, s], &shared),
+                i32_tensor(&device, &[m, k], &routing.routes),
+                f32_tensor(&device, &[m, k], &routing.scores),
+                f32_tensor(&device, &[m], &routing.coefficient),
+            )
+        })
+        .collect::<Vec<_>>();
+    let points = rows
+        .iter()
+        .zip(&inputs)
+        .map(|(rows, input)| seismic::TuningPoint {
+            label: format!("rows{rows}"),
+            weight: 1.0,
+            class: None,
+            rotation: vec![routed_output::Args {
+                residual: &input.0,
+                expert_product: &input.1,
+                shared_product: &input.2,
+                routes: &input.3,
+                scores: &input.4,
+                coefficient: &input.5,
+                expert_down: &block.expert_down,
+                shared_down: &block.shared_down,
+            }],
+            initialize: None,
+        })
+        .collect();
+    let search = seismic::Strategy::Search(seismic::SearchPlan {
+        budget: 24,
+        settings: seismic::SearchSettings {
+            improvement: 0.01,
+            restarts: 2,
+            confirmed: 3,
+            default_margin: 0.02,
+            samples: 5,
+            confirmation_samples: 5,
+        },
+        min_sample_seconds: 0.001,
+        start: Vec::new(),
+        deadline: None,
+        screening: Vec::new(),
+    });
+    let statics = specialize(&[("H", h), ("K", k), ("F", f), ("S", s)], &[]);
+    let result = routed_output::native_tune_with(
+        &device,
+        routed_output::Elements {
+            A: seismic::Element::bf16(),
+            EDW: element(&device, "q5k"),
+            SDW: element(&device, "q8g32s"),
+        },
+        &statics,
+        points,
+        seismic::Validation::Relative { error: 0.05 },
+        search,
+    )
+    .unwrap();
+    assert!(matches!(
+        &result.method,
+        seismic::TuningMethod::Factored {
+            groups: 1,
+            candidates: 6,
+            complete: true
+        }
+    ));
+    assert_eq!(result.defects().count(), 0);
+    println!(
+        "routed_output CUDA BF16: choice {:?}, method {:?}, time {:?}, records {}",
+        result.overall.launches,
+        result.method,
+        result.time,
+        result.configurations.len()
+    );
 }
 
 #[test]
@@ -1647,7 +1891,6 @@ impl Qwen35b {
         Self {
             routed: Routed {
                 hidden: h,
-                experts: Self::USED,
                 choices: Self::CHOICES,
                 features: f,
                 shared: s,
@@ -2008,7 +2251,7 @@ fn native_35b_geometry_chain_matches_reference_on(device: &seismic::Device) {
         for mapping in decode_mappings(&device) {
             let label = format!("35B decode rows {rows} mapping {mapping:?}");
             let mut specialization =
-                specialization_on(device, &[("H", h), ("K", k), ("F", f), ("S", s)], &mapping);
+                decode_specialization(device, &[("H", h), ("K", k), ("F", f), ("S", s)], &mapping);
             if is_cpu(device) {
                 specialization = specialization.with_param("INT8", 0);
             }
@@ -2279,6 +2522,32 @@ fn routed_kernel_timings() {
         min_sample_seconds: 0.002,
         domains: Default::default(),
     });
+    // A scoped launch uses the exhaustive factored search; the legacy
+    // whole-entry survey cannot address launch parameters.
+    let decode_measure = || {
+        if matches!(
+            device.backend(),
+            seismic::BackendName::Metal | seismic::BackendName::Cuda
+        ) {
+            seismic::Strategy::Search(seismic::SearchPlan {
+                budget: 24,
+                settings: seismic::SearchSettings {
+                    improvement: 0.01,
+                    restarts: 2,
+                    confirmed: 3,
+                    default_margin: 0.02,
+                    samples: 7,
+                    confirmation_samples: 7,
+                },
+                min_sample_seconds: 0.002,
+                start: Vec::new(),
+                deadline: None,
+                screening: Vec::new(),
+            })
+        } else {
+            measure.clone()
+        }
+    };
     let validation = seismic::Validation::Relative { error: 0.05 };
     let statics = |pairs: &[(&str, u64)]| {
         pairs.iter().fold(
@@ -2406,7 +2675,7 @@ fn routed_kernel_timings() {
             &decode_statics,
             points,
             validation,
-            measure.clone(),
+            decode_measure(),
         )
         .unwrap(),
     );
@@ -2445,7 +2714,7 @@ fn routed_kernel_timings() {
             &decode_statics,
             points,
             validation,
-            measure.clone(),
+            decode_measure(),
         )
         .unwrap(),
     );

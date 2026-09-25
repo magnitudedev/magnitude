@@ -10,6 +10,8 @@
 #define KERNEL_W3 SEISMIC_SHARED_UP
 #include "lib/routed/routed.h"
 
+#ifdef SEISMIC_FORMING_ROUTED_EXPAND
+template <uint ROWS, uint LANES>
 kernel void routed_expand(
     device const uchar *normalized [[buffer(SEISMIC_BUFFER_NORMALIZED)]],
     device const int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
@@ -22,13 +24,13 @@ kernel void routed_expand(
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     threadgroup uchar *shared [[threadgroup(0)]],
     uint2 group [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint SG = SEISMIC_TUNE_SIMDGROUPS;
-    constexpr uint R = SEISMIC_TUNE_ROWS;
-    constexpr uint L = SEISMIC_TUNE_LANES;
+    constexpr uint R = ROWS;
+    constexpr uint L = LANES;
     // Weight rows per threadgroup.
-    constexpr uint TILE = projection::gemv_threadgroup_rows<SG, R, L>();
+    const uint TILE = simdgroups * R * (32u / L);
     typedef routed::Act A;
     const uint tile = group.x;
     const ulong choices = SEISMIC_DIM_M * SEISMIC_DIM_K;
@@ -46,8 +48,8 @@ kernel void routed_expand(
         const projection::SiluMul<A> out{expert_product
             + (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * A::bytes,
             0, SEISMIC_RESULT_0_STRIDE_2};
-        projection::gemv_paired<packets::W0, packets::W1, SG, R, 1, L>(in, out, gate, up, 1,
-            SEISMIC_DIM_F, SEISMIC_DIM_H, tile, shared, sg, lane);
+        projection::gemv_paired_runtime<packets::W0, packets::W1, R, 1, L>(in, out, gate, up, 1,
+            SEISMIC_DIM_F, SEISMIC_DIM_H, tile, shared, simdgroups, sg, lane);
         return;
     }
 
@@ -62,6 +64,7 @@ kernel void routed_expand(
         SEISMIC_RESULT_1_STRIDE_1};
     const uint rows = uint(SEISMIC_DIM_M);
     PROJECTION_FOR_ROWS(rows,
-        (projection::gemv_paired<packets::W2, packets::W3, SG, R, MAXM, L>(in, out, gate, up, rows,
-            SEISMIC_DIM_S, SEISMIC_DIM_H, tile, shared, sg, lane)));
+        (projection::gemv_paired_runtime<packets::W2, packets::W3, R, MAXM, L>(in, out, gate, up, rows,
+            SEISMIC_DIM_S, SEISMIC_DIM_H, tile, shared, simdgroups, sg, lane)));
 }
+#endif

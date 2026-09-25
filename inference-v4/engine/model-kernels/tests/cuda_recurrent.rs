@@ -18,22 +18,41 @@ enum Mapping {
 }
 
 impl Case {
-    fn cuda_step(&self, device: &Device, activation: Element, (rows, warps): (u64, u64))
-        -> seismic::NativeKernel<gated_delta_step::Entry> {
+    fn cuda_step(
+        &self,
+        device: &Device,
+        activation: Element,
+        (rows, warps): (u64, u64),
+    ) -> seismic::NativeKernel<gated_delta_step::Entry> {
         gated_delta_step::native_for_device_with(
             device,
             gated_delta_step::Elements { A: activation },
-            &self.specialization(device, rows).with_param("WARPS", warps),
+            &NativeSpecialization::new()
+                .with_static("NK", self.geometry.key_heads as u64)
+                .with_static("NV", self.geometry.value_heads as u64)
+                .with_static("W", self.geometry.width as u64)
+                .with_static("C", self.geometry.convolution as u64)
+                .with_launch_param(0, "ROWS", rows)
+                .with_launch_param(0, "WARPS", warps),
         )
         .unwrap()
     }
 
-    fn cuda_chunk(&self, device: &Device, activation: Element, rows: u64)
-        -> seismic::NativeKernel<gated_delta_chunk::Entry> {
+    fn cuda_chunk(
+        &self,
+        device: &Device,
+        activation: Element,
+        rows: u64,
+    ) -> seismic::NativeKernel<gated_delta_chunk::Entry> {
         gated_delta_chunk::native_for_device_with(
             device,
             gated_delta_chunk::Elements { A: activation },
-            &self.specialization(device, rows),
+            &NativeSpecialization::new()
+                .with_static("NK", self.geometry.key_heads as u64)
+                .with_static("NV", self.geometry.value_heads as u64)
+                .with_static("W", self.geometry.width as u64)
+                .with_static("C", self.geometry.convolution as u64)
+                .with_launch_param(1, "ROWS", rows),
         )
         .unwrap()
     }
@@ -41,16 +60,18 @@ impl Case {
     fn cuda(&self, device: &Device, activation: Element, mapping: Mapping) -> Outcome {
         let mut t = self.tensors(device, activation);
         let mixed = match mapping {
-            Mapping::Step(rows, warps) => self
-                .cuda_step(device, activation, (rows, warps))
-                .call(t.step_args(self))
-                .unwrap()
-                .value,
-            Mapping::Chunk(rows) => self
-                .cuda_chunk(device, activation, rows)
-                .call(t.chunk_args(self))
-                .unwrap()
-                .value,
+            Mapping::Step(rows, warps) => {
+                self.cuda_step(device, activation, (rows, warps))
+                    .call(t.step_args(self))
+                    .unwrap()
+                    .value
+            }
+            Mapping::Chunk(rows) => {
+                self.cuda_chunk(device, activation, rows)
+                    .call(t.chunk_args(self))
+                    .unwrap()
+                    .value
+            }
         };
         Outcome {
             mixed: read(&mixed),
@@ -69,14 +90,29 @@ fn cuda_step_and_chunk_match_the_portable_body() {
         let oracle = case.oracle();
         for mapping in STEPS {
             let step = case.cuda(&device, Element::f32(), Mapping::Step(mapping.0, mapping.1));
-            check(&format!("{label}: cuda step {mapping:?}"), &case, &step, &oracle, (2e-5, 2e-6));
+            check(
+                &format!("{label}: cuda step {mapping:?}"),
+                &case,
+                &step,
+                &oracle,
+                (2e-5, 2e-6),
+            );
         }
         // The chunked form runs its state products on f16 tensor-core
         // operands (2^-11 relative rounding) with F32 accumulation, so it is
         // held to f16-operand tolerances.
-        for rows in CHUNK_ROWS.into_iter().filter(|rows| *rows <= case.geometry.width as u64) {
+        for rows in CHUNK_ROWS
+            .into_iter()
+            .filter(|rows| *rows <= case.geometry.width as u64)
+        {
             let chunked = case.cuda(&device, Element::f32(), Mapping::Chunk(rows));
-            check(&format!("{label}: cuda chunk ROWS {rows}"), &case, &chunked, &oracle, (1e-2, 1e-3));
+            check(
+                &format!("{label}: cuda chunk ROWS {rows}"),
+                &case,
+                &chunked,
+                &oracle,
+                (1e-2, 1e-3),
+            );
         }
     }
 }
@@ -90,20 +126,43 @@ fn cuda_mapping_never_changes_bits_and_stop_equals_a_shorter_run() {
     for mapping in STEPS {
         let outcome = full.cuda(&device, Element::f32(), Mapping::Step(mapping.0, mapping.1));
         assert!(
-            reference.mixed.iter().zip(&outcome.mixed).all(|(a, b)| a.to_bits() == b.to_bits())
-                && reference.delta.iter().zip(&outcome.delta).all(|(a, b)| a.to_bits() == b.to_bits()),
+            reference
+                .mixed
+                .iter()
+                .zip(&outcome.mixed)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+                && reference
+                    .delta
+                    .iter()
+                    .zip(&outcome.delta)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
             "step {mapping:?} changed result bits"
         );
     }
     // The chunk's ROWS never changes bits either (W 128 admits every ROWS).
-    let wide = Geometry { key_heads: 2, value_heads: 4, width: 128, convolution: 4, banks: 3, tape: 4 };
+    let wide = Geometry {
+        key_heads: 2,
+        value_heads: 4,
+        width: 128,
+        convolution: 4,
+        banks: 3,
+        tape: 4,
+    };
     let long = Case::new(wide, 100, vec![slot(100, 70)], true, 12);
     let first = long.cuda(&device, Element::f32(), Mapping::Chunk(CHUNK_ROWS[0]));
     for rows in &CHUNK_ROWS[1..] {
         let other = long.cuda(&device, Element::f32(), Mapping::Chunk(*rows));
         assert!(
-            first.mixed.iter().zip(&other.mixed).all(|(a, b)| a.to_bits() == b.to_bits())
-                && first.delta.iter().zip(&other.delta).all(|(a, b)| a.to_bits() == b.to_bits()),
+            first
+                .mixed
+                .iter()
+                .zip(&other.mixed)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+                && first
+                    .delta
+                    .iter()
+                    .zip(&other.delta)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
             "chunk ROWS {rows} changed result bits"
         );
     }
@@ -113,11 +172,19 @@ fn cuda_mapping_never_changes_bits_and_stop_equals_a_shorter_run() {
     prefix.projection.truncate(3 * SMALL.projection_width());
     let short = prefix.cuda(&device, Element::f32(), Mapping::Step(2, 4));
     assert!(
-        short.delta.iter().zip(&reference.delta).all(|(a, b)| a.to_bits() == b.to_bits()),
+        short
+            .delta
+            .iter()
+            .zip(&reference.delta)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
         "stop-row state differs from the state of a shorter run"
     );
     assert!(
-        short.window.iter().zip(&reference.window).all(|(a, b)| a.to_bits() == b.to_bits()),
+        short
+            .window
+            .iter()
+            .zip(&reference.window)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
         "stop-row window differs from the window of a shorter run"
     );
 }
@@ -128,8 +195,17 @@ fn cuda_mapping_never_changes_bits_and_stop_equals_a_shorter_run() {
 #[test]
 fn cuda_chunk_short_slots_get_the_step_bits() {
     let Some(device) = cuda() else { return };
-    let geometry = Geometry { banks: 11, ..QWEN_4B };
-    let slots = vec![slot(4, 1, 1, 6), slot(16, 9, 2, 7), slot(40, 40, 3, 8), slot(1, 1, 4, 9), slot(7, 0, 5, 10)];
+    let geometry = Geometry {
+        banks: 11,
+        ..QWEN_4B
+    };
+    let slots = vec![
+        slot(4, 1, 1, 6),
+        slot(16, 9, 2, 7),
+        slot(40, 40, 3, 8),
+        slot(1, 1, 4, 9),
+        slot(7, 0, 5, 10),
+    ];
     let case = Case::new(geometry, 70, slots, false, 31).with_bf16_activations();
     let step = case.cuda(&device, Element::bf16(), Mapping::Step(2, 4));
     let host = case.host();
@@ -146,14 +222,99 @@ fn cuda_chunk_short_slots_get_the_step_bits() {
             }
             let bank = s.following * g.delta_bank()..(s.following + 1) * g.delta_bank();
             assert!(
-                step.mixed[range.clone()].iter().zip(&chunk.mixed[range]).all(|(a, b)| a.to_bits() == b.to_bits())
-                    && step.delta[bank.clone()].iter().zip(&chunk.delta[bank]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                step.mixed[range.clone()]
+                    .iter()
+                    .zip(&chunk.mixed[range])
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+                    && step.delta[bank.clone()]
+                        .iter()
+                        .zip(&chunk.delta[bank])
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
                 "chunk ROWS {rows}: a {}-row slot differs from the step",
                 s.rows
             );
         }
-        check(&format!("4B verify mix: cuda chunk ROWS {rows}"), &case, &chunk, &host, (1.5e-2, 3e-3));
+        check(
+            &format!("4B verify mix: cuda chunk ROWS {rows}"),
+            &case,
+            &chunk,
+            &host,
+            (1.5e-2, 3e-3),
+        );
     }
+}
+
+#[test]
+#[ignore = "focused CUDA tuning; run explicitly on an idle device"]
+fn cuda_recurrent_scoped_tuning_completes() {
+    let Some(device) = cuda() else { return };
+    let geometry = Geometry {
+        banks: 3,
+        ..QWEN_4B
+    };
+    let case = Case::new(geometry, 32, vec![slot(32, 32, 1, 2)], false, 41).with_bf16_activations();
+    let mut tensors = case.tensors(&device, Element::bf16());
+    let mut window = tensors.window.clone();
+    let mut delta = tensors.delta.clone();
+    let mut tape = tensors.tape.clone();
+    let initial_window = window.read_to_host().unwrap();
+    let initial_delta = delta.read_to_host().unwrap();
+    let initial_tape = tape.read_to_host().unwrap();
+    let statics = NativeSpecialization::new()
+        .with_static("NK", geometry.key_heads as u64)
+        .with_static("NV", geometry.value_heads as u64)
+        .with_static("W", geometry.width as u64)
+        .with_static("C", geometry.convolution as u64);
+    let search = || {
+        seismic::Strategy::Search(seismic::SearchPlan {
+            budget: 16,
+            settings: seismic::SearchSettings {
+                improvement: 0.01,
+                restarts: 2,
+                confirmed: 3,
+                default_margin: 0.02,
+                samples: 3,
+                confirmation_samples: 5,
+            },
+            min_sample_seconds: 0.0002,
+            start: Vec::new(),
+            deadline: None,
+            screening: Vec::new(),
+        })
+    };
+    let points = vec![seismic::TuningPoint {
+        label: "rows32".into(),
+        weight: 1.0,
+        class: None,
+        rotation: vec![tensors.chunk_args(&case)],
+        initialize: Some(Box::new(move || {
+            window.write_from_host(&initial_window)?;
+            delta.write_from_host(&initial_delta)?;
+            tape.write_from_host(&initial_tape)
+        })),
+    }];
+    let result = gated_delta_chunk::native_tune_with(
+        &device,
+        gated_delta_chunk::Elements { A: Element::bf16() },
+        &statics,
+        points,
+        seismic::Validation::Relative { error: 0.05 },
+        search(),
+    )
+    .unwrap();
+    assert!(matches!(
+        result.method,
+        seismic::TuningMethod::Factored {
+            groups: 1,
+            candidates: 3,
+            complete: true
+        }
+    ));
+    assert_eq!(result.defects().count(), 0);
+    println!(
+        "chunk CUDA choice {:?}, time {:?}",
+        result.overall.launches, result.time
+    );
 }
 
 #[test]
@@ -163,11 +324,26 @@ fn cuda_tape_cases_match_the_portable_body() {
         let oracle = case.oracle();
         for mapping in STEPS {
             let step = case.cuda(&device, Element::f32(), Mapping::Step(mapping.0, mapping.1));
-            check(&format!("{label}: cuda step {mapping:?}"), &case, &step, &oracle, (2e-5, 2e-6));
+            check(
+                &format!("{label}: cuda step {mapping:?}"),
+                &case,
+                &step,
+                &oracle,
+                (2e-5, 2e-6),
+            );
         }
-        for rows in CHUNK_ROWS.into_iter().filter(|rows| *rows <= case.geometry.width as u64) {
+        for rows in CHUNK_ROWS
+            .into_iter()
+            .filter(|rows| *rows <= case.geometry.width as u64)
+        {
             let chunked = case.cuda(&device, Element::f32(), Mapping::Chunk(rows));
-            check(&format!("{label}: cuda chunk ROWS {rows}"), &case, &chunked, &oracle, (1e-2, 1e-3));
+            check(
+                &format!("{label}: cuda chunk ROWS {rows}"),
+                &case,
+                &chunked,
+                &oracle,
+                (1e-2, 1e-3),
+            );
         }
     }
 }
@@ -199,18 +375,38 @@ fn cuda_real_4b_geometry_step_and_chunk_agree_with_the_host_model() {
     let Some(device) = cuda() else { return };
     for (label, rows, slots) in [
         ("decode, one slot", 1, vec![slot(1, 1, 1, 3)]),
-        ("verify, two slots", 8, vec![slot(4, 2, 1, 3), slot(3, 3, 0, 4)]),
+        (
+            "verify, two slots",
+            8,
+            vec![slot(4, 2, 1, 3), slot(3, 3, 0, 4)],
+        ),
         ("prefill 128", 128, vec![slot(128, 128, 1, 3)]),
-        ("prefill 512, two slots", 512, vec![slot(300, 211, 1, 3), slot(212, 212, 2, 4)]),
+        (
+            "prefill 512, two slots",
+            512,
+            vec![slot(300, 211, 1, 3), slot(212, 212, 2, 4)],
+        ),
     ] {
         let case = Case::new(QWEN_4B, rows, slots, false, 21).with_bf16_activations();
         let host = case.host();
         let step = case.cuda(&device, Element::bf16(), Mapping::Step(2, 4));
-        check(&format!("4B {label}: cuda step"), &case, &step, &host, (1.5e-2, 3e-3));
+        check(
+            &format!("4B {label}: cuda step"),
+            &case,
+            &step,
+            &host,
+            (1.5e-2, 3e-3),
+        );
         if rows >= 16 {
             for rows in CHUNK_ROWS {
                 let chunked = case.cuda(&device, Element::bf16(), Mapping::Chunk(rows));
-                check(&format!("4B {label}: cuda chunk ROWS {rows}"), &case, &chunked, &host, (1.5e-2, 3e-3));
+                check(
+                    &format!("4B {label}: cuda chunk ROWS {rows}"),
+                    &case,
+                    &chunked,
+                    &host,
+                    (1.5e-2, 3e-3),
+                );
             }
         }
     }
@@ -225,7 +421,10 @@ fn cuda_real_4b_geometry_step_and_chunk_agree_with_the_host_model() {
 #[ignore = "timing; run explicitly on the measurement host"]
 fn cuda_recurrent_timings() {
     let Some(device) = cuda() else { return };
-    let options = seismic::MeasureOptions { samples: 15, min_sample_seconds: 0.002 };
+    let options = seismic::MeasureOptions {
+        samples: 15,
+        min_sample_seconds: 0.002,
+    };
     // Slots of `per_slot` rows each: decode (1 row), MTP verify (2-16 rows
     // per request, alone and 8 requests batched) and prefill.
     for (slots, per_slot) in [
@@ -249,7 +448,9 @@ fn cuda_recurrent_timings() {
         let geometry = Geometry { banks, ..QWEN_4B };
         let rows = slots.len() * per_slot;
         let case = Case::new(geometry, rows, slots, false, 5).with_bf16_activations();
-        let mut rotation = (0..16).map(|_| case.tensors(&device, Element::bf16())).collect::<Vec<_>>();
+        let mut rotation = (0..16)
+            .map(|_| case.tensors(&device, Element::bf16()))
+            .collect::<Vec<_>>();
         if per_slot <= 16 {
             for mapping in STEPS {
                 let kernel = case.cuda_step(&device, Element::bf16(), mapping);
@@ -263,7 +464,10 @@ fn cuda_recurrent_timings() {
                 let kernel = case.cuda_chunk(&device, Element::bf16(), mapping);
                 let args = rotation.iter_mut().map(|t| t.chunk_args(&case)).collect();
                 let measured = kernel.measure(args, &options).unwrap();
-                println!("{label}: chunk ROWS {mapping} {:.1} us", measured.median * 1e6);
+                println!(
+                    "{label}: chunk ROWS {mapping} {:.1} us",
+                    measured.median * 1e6
+                );
             }
         }
     }
@@ -277,7 +481,10 @@ fn cuda_recurrent_timings() {
 fn cuda_recurrent_profile_launches() {
     let Some(device) = cuda() else { return };
     let slot = |rows| slot(rows, rows, 1, 2);
-    let geometry = Geometry { banks: 3, ..QWEN_4B };
+    let geometry = Geometry {
+        banks: 3,
+        ..QWEN_4B
+    };
     let decode = Case::new(geometry, 1, vec![slot(1)], false, 5).with_bf16_activations();
     let step = decode.cuda_step(&device, Element::bf16(), (4, 8));
     for _ in 0..3 {

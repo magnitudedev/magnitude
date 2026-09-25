@@ -27,9 +27,9 @@ use crate::intrinsics::{AtomicOp, PrimitiveId, ReduceOp};
 use crate::registry::BackendName;
 use crate::span::Span;
 use crate::types::DType;
-use std::collections::BTreeMap;
 use num_bigint::BigUint;
 use num_traits::{CheckedSub, Zero};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -478,7 +478,9 @@ impl CompiledDimensionInferencePlan {
         // is solved later. Validate the original equations only after the full
         // triangular solve, retaining their partial-operation checks.
         for step in &self.steps {
-            if step.axis.evaluate(values).ok() != Some(BigUint::from(observations[step.observation])) {
+            if step.axis.evaluate(values).ok()
+                != Some(BigUint::from(observations[step.observation]))
+            {
                 return Err(DimensionInferenceFailure {
                     observation: step.observation,
                 });
@@ -617,6 +619,39 @@ pub struct LogicalEntry {
     program: SemanticProgram,
 }
 
+/// A tensor parameter's checked semantic shape, before any target layout or
+/// native implementation is chosen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckedTensorShape {
+    pub representation: RepresentationId,
+    pub extents: Vec<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckedTensorShapeError {
+    UnknownParameter(String),
+    NotTensor(String),
+    MissingDimension(String),
+    Evaluation(crate::expr::EvalError),
+}
+
+impl std::fmt::Display for CheckedTensorShapeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownParameter(name) => write!(f, "checked entry has no parameter `{name}`"),
+            Self::NotTensor(name) => write!(f, "checked parameter `{name}` is not a tensor"),
+            Self::MissingDimension(name) => {
+                write!(f, "checked tensor shape omitted dimension `{name}`")
+            }
+            Self::Evaluation(error) => {
+                write!(f, "checked tensor shape evaluation failed: {error:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CheckedTensorShapeError {}
+
 /// Borrowed checked semantics over the owning expression arena. Preparation
 /// can retain the source program while extending that same arena with compiler
 /// expressions; reference evaluation requires neither an arena copy nor a
@@ -658,6 +693,92 @@ impl<'a> LogicalEntryView<'a> {
 }
 
 impl LogicalEntry {
+    fn tensor_dimension_values(
+        &self,
+        dimensions: &[(&str, u64)],
+    ) -> Result<InvocationValues, CheckedTensorShapeError> {
+        let mut values = InvocationValues::new();
+        for dimension in self.schema.dimensions() {
+            let value = dimensions
+                .iter()
+                .find(|(candidate, _)| *candidate == dimension.name)
+                .map(|(_, value)| *value)
+                .ok_or_else(|| CheckedTensorShapeError::MissingDimension(dimension.name.clone()))?;
+            values.bind(dimension.symbol, SymbolValue::Nat(value.into()));
+        }
+        Ok(values)
+    }
+
+    fn tensor_shape(
+        &self,
+        representation: RepresentationId,
+        axes: &[NatExpr],
+        values: &InvocationValues,
+    ) -> Result<CheckedTensorShape, CheckedTensorShapeError> {
+        let extents = axes
+            .iter()
+            .map(|axis| {
+                self.arena
+                    .compile_nat(*axis)
+                    .evaluate_u64(values)
+                    .map_err(CheckedTensorShapeError::Evaluation)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(CheckedTensorShape {
+            representation,
+            extents,
+        })
+    }
+
+    /// Evaluate a tensor parameter from the monomorphized checked schema.
+    /// Graph preparation and metadata-only graph planning share this source
+    /// for representation and logical extents; storage layout belongs to the
+    /// registry and the chosen backend.
+    pub fn tensor_parameter_shape(
+        &self,
+        name: &str,
+        dimensions: &[(&str, u64)],
+    ) -> Result<CheckedTensorShape, CheckedTensorShapeError> {
+        let parameter = self
+            .schema
+            .parameters()
+            .iter()
+            .find(|parameter| parameter.name == name)
+            .ok_or_else(|| CheckedTensorShapeError::UnknownParameter(name.to_owned()))?;
+        let ParameterKind::Tensor {
+            representation,
+            axes,
+            ..
+        } = &parameter.kind
+        else {
+            return Err(CheckedTensorShapeError::NotTensor(name.to_owned()));
+        };
+        let values = self.tensor_dimension_values(dimensions)?;
+        self.tensor_shape(*representation, axes, &values)
+    }
+
+    /// Evaluate every tensor result leaf in schema order. Scalar leaves stay
+    /// `None`; native graphs reject them when they seal nodes.
+    pub fn tensor_result_shapes(
+        &self,
+        dimensions: &[(&str, u64)],
+    ) -> Result<Vec<Option<CheckedTensorShape>>, CheckedTensorShapeError> {
+        let values = self.tensor_dimension_values(dimensions)?;
+        self.schema
+            .results()
+            .iter()
+            .map(|result| match &result.kind {
+                ResultKind::Tensor {
+                    representation,
+                    axes,
+                } => self.tensor_shape(*representation, axes, &values).map(Some),
+                ResultKind::Scalar(_) | ResultKind::Index { .. } | ResultKind::Range { .. } => {
+                    Ok(None)
+                }
+            })
+            .collect()
+    }
+
     pub fn as_view(&self) -> LogicalEntryView<'_> {
         LogicalEntryView::from_parts(&self.schema, self.domain, &self.arena, &self.program)
     }
@@ -694,8 +815,11 @@ impl LogicalEntry {
                             component: crate::expr::ScalarComponent::Value,
                         })
                     );
-                    assert_eq!(arena.symbol_sort(*symbol), crate::expr::SymbolSort::Scalar(*dtype),
-                        "call scalar must retain its declared source word sort");
+                    assert_eq!(
+                        arena.symbol_sort(*symbol),
+                        crate::expr::SymbolSort::Scalar(*dtype),
+                        "call scalar must retain its declared source word sort"
+                    );
                 }
                 ParameterKind::Index { bound, symbol } => {
                     let _ = arena.view(AnyExpr::Nat(*bound));
@@ -1865,12 +1989,10 @@ impl SemanticNode {
                 inputs,
                 outputs,
             },
-            NodeKind::Alloc => {
-                NodeData::Alloc {
-                    extents: inputs,
-                    output: one_output(outputs, "alloc"),
-                }
-            }
+            NodeKind::Alloc => NodeData::Alloc {
+                extents: inputs,
+                output: one_output(outputs, "alloc"),
+            },
             NodeKind::Fill { value } => {
                 let [like] = inputs.as_slice() else {
                     panic!("checked fill node needs its evaluated shape source")
@@ -2354,7 +2476,11 @@ impl NodeData {
                 extents,
                 output: *output,
             },
-            Self::Fill { value, like, output } => SemanticNodeView::Fill {
+            Self::Fill {
+                value,
+                like,
+                output,
+            } => SemanticNodeView::Fill {
                 value: *value,
                 like: *like,
                 output: *output,
@@ -2495,7 +2621,10 @@ fn node_dependencies(node: SemanticNodeView<'_>) -> Vec<SemanticValueId> {
         | SemanticNodeView::Copy { input, .. }
         | SemanticNodeView::RepresentationConvert { input, .. } => values.push(input),
         SemanticNodeView::View {
-            base, extents, transform, ..
+            base,
+            extents,
+            transform,
+            ..
         } => {
             values.push(base);
             values.extend_from_slice(extents);
@@ -3401,8 +3530,14 @@ mod dimension_inference_tests {
 
         let mut values = InvocationValues::new();
         plan.infer(&[5, 2], &mut values).unwrap();
-        assert_eq!(values.get(x_symbol), Some(SymbolValue::Nat(BigUint::from(3u32))));
-        assert_eq!(values.get(y_symbol), Some(SymbolValue::Nat(BigUint::from(2u32))));
+        assert_eq!(
+            values.get(x_symbol),
+            Some(SymbolValue::Nat(BigUint::from(3u32)))
+        );
+        assert_eq!(
+            values.get(y_symbol),
+            Some(SymbolValue::Nat(BigUint::from(2u32)))
+        );
     }
 
     #[test]
@@ -3467,5 +3602,34 @@ mod checked_program_subject_tests {
         map.insert(left, 1);
         map.insert(right, 2);
         assert_eq!(map.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod tensor_shape_tests {
+    use super::*;
+    use crate::checked::{check_source, SourceFile, SourceSet};
+
+    #[test]
+    fn checked_parameter_and_result_share_dimension_values() {
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "shapes.seismic".into(),
+            text: "fn copy[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n"
+                .into(),
+        }]))
+        .unwrap();
+        let entry = module
+            .entry(module.entry_named("copy").unwrap(), &ElementBindings::new())
+            .unwrap();
+        let parameter = entry.tensor_parameter_shape("x", &[("N", 7)]).unwrap();
+        assert_eq!(parameter.extents, vec![7]);
+        assert_eq!(
+            entry.tensor_result_shapes(&[("N", 7)]).unwrap(),
+            vec![Some(parameter)]
+        );
+        assert!(matches!(
+            entry.tensor_result_shapes(&[]),
+            Err(CheckedTensorShapeError::MissingDimension(name)) if name == "N"
+        ));
     }
 }

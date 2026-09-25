@@ -648,16 +648,28 @@ mod budget_tests {
     /// mathematical integer.
     #[test]
     fn quantity_to_float_rounds_the_mathematical_integer_once() {
-        let entry = entry("fn probe[N](x: &tensor[N] f32) -> (f32, f16):\n    return f32(N), f16(N)\n");
-        for (n, single, half) in [(5, 5f32.to_bits(), 0x4500), (2049, 2049f32.to_bits(), 0x6800), (65520, 65520f32.to_bits(), 0x7c00)] {
+        let entry =
+            entry("fn probe[N](x: &tensor[N] f32) -> (f32, f16):\n    return f32(N), f16(N)\n");
+        for (n, single, half) in [
+            (5, 5f32.to_bits(), 0x4500),
+            (2049, 2049f32.to_bits(), 0x6800),
+            (65520, 65520f32.to_bits(), 0x7c00),
+        ] {
             let mut interpreter = Interpreter::new(&entry);
             let x = interpreter.add_tensor(TensorData::dense(DType::F32, vec![n], vec![0.0; n]));
             let outcome = interpreter.run(&[Arg::Tensor(x)]).unwrap();
-            let values = outcome.results().map(|result| match result.value() {
-                OutcomeValue::Scalar(value) => value,
-                _ => panic!("scalar results"),
-            }).collect::<Vec<_>>();
-            assert_eq!(values, [ReferenceScalar::F32(single), ReferenceScalar::F16(half)], "N = {n}");
+            let values = outcome
+                .results()
+                .map(|result| match result.value() {
+                    OutcomeValue::Scalar(value) => value,
+                    _ => panic!("scalar results"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                values,
+                [ReferenceScalar::F32(single), ReferenceScalar::F16(half)],
+                "N = {n}"
+            );
         }
     }
 
@@ -798,7 +810,11 @@ mod budget_tests {
             let index =
                 interpreter.add_tensor(TensorData::dense(DType::F32, vec![2], vec![1., 2.]));
             let outcome = interpreter
-                .run(&[Arg::Tensor(index), Arg::Tensor(index), Arg::Range(0u8.into(), u32::try_from(times).unwrap().into())])
+                .run(&[
+                    Arg::Tensor(index),
+                    Arg::Tensor(index),
+                    Arg::Range(0u8.into(), u32::try_from(times).unwrap().into()),
+                ])
                 .unwrap();
             assert_eq!(outcome.tensors.len(), 1);
             assert_eq!(outcome.inputs().count(), 2);
@@ -830,7 +846,13 @@ mod budget_tests {
                 vec![1., 2., 3., 4.],
             ));
             let outcome = interpreter
-                .run(&[Arg::Tensor(input), Arg::Range(u32::try_from(start).unwrap().into(), u32::try_from(end).unwrap().into())])
+                .run(&[
+                    Arg::Tensor(input),
+                    Arg::Range(
+                        u32::try_from(start).unwrap().into(),
+                        u32::try_from(end).unwrap().into(),
+                    ),
+                ])
                 .unwrap();
             assert!(
                 matches!(outcome.results().next().unwrap().value(), OutcomeValue::Scalar(ReferenceScalar::F32(actual)) if f32::from_bits(actual) as f64 == expected)

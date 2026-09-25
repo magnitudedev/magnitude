@@ -3,6 +3,7 @@
 //! Component, weight, program, capability, and resource authorities are
 //! separated below; this module only reexports their stable contracts.
 
+mod assessment;
 mod capabilities;
 mod components;
 mod execution_plan;
@@ -10,6 +11,10 @@ mod programs;
 mod resources;
 mod weights;
 
+pub use assessment::{
+    AssessmentBindingEvidence, AssessmentFit, AssessmentFitVerdict, AssessmentGraphResourceBounds,
+    AssessmentHeaderBounds, AssessmentMemoryBounds, AssessmentMemoryTerms, StreamingCost,
+};
 pub use capabilities::{CapabilityPlan, PlannedMethod, MAX_DRAFT_PROPOSALS};
 pub use components::{ArtifactComponent, ArtifactComponentKind, ComponentPlan, ComponentSelection};
 pub use execution_plan::{
@@ -20,17 +25,17 @@ pub use programs::{
     StateProgramPlan, TargetBlockProgramSlot, TargetProgramPlan, VisionProgramPlan,
 };
 pub use resources::{
-    NativeGraphCharge, ResourceBudget, ResourceBytes, ResourceLimits, ResourcePlan,
+    NativeGraphCharge, ResourceBytes, ResourceCapacity, ResourceLimits, ResourcePlan,
     ResourcePlanner, RetentionCapacityPlan, StateCapacityPlan, StateResourcePlan, StateStorePlan,
 };
 pub use weights::{
-    resident_element, resident_layout, source_element, AttentionBinding, AttentionShape, DenseBinding,
-    EmbeddingBinding,
-    FeaturesBinding, HeadBinding, ModelLoadPlan, ReadoutBinding, RecurrentBinding, RoutedBinding,
-    VisionBlockBinding, VisionMergerBinding, VisionPatchBinding, WeightPlan, WeightStorageIdentity,
+    resident_element, resident_layout, source_element, AttentionBinding, AttentionShape,
+    DenseBinding, EmbeddingBinding, FeaturesBinding, HeadBinding, ModelLoadPlan, ReadoutBinding,
+    RecurrentBinding, RoutedBinding, VisionBlockBinding, VisionMergerBinding, VisionPatchBinding,
+    WeightPlan, WeightStorageIdentity,
 };
 
-use weights::{planned_element, weight_bytes_by_component};
+use weights::{planned_element, source_import_peak_bytes, weight_bytes_by_component};
 #[cfg(test)]
 use weights::{resident_dtype, validate_unique_roles};
 
@@ -162,7 +167,9 @@ pub(crate) mod tests {
                             axis_pattern: vec![0],
                         },
                     }),
-                    feedforward: FeedForwardGeometry::Dense { intermediate: FEATURES },
+                    feedforward: FeedForwardGeometry::Dense {
+                        intermediate: FEATURES,
+                    },
                 }],
             },
             embedding: descriptor("embedding", &[VOCABULARY, HIDDEN]),
@@ -235,18 +242,19 @@ pub(crate) mod tests {
     /// many slots to reserve, but no test supplies intermediate tensor shapes.
     fn prepared_resource_plan() -> Option<ResourcePlan> {
         let catalog = seismic::DeviceCatalog::discover().ok()?;
-        let selected =
-            crate::platform::select_device(
-                &catalog,
-                crate::ExecutionPath::Native,
-                crate::platform::DeviceRequest::Automatic,
-            ).ok()?;
+        let selected = crate::platform::select_device(
+            &catalog,
+            crate::ExecutionPath::Native,
+            crate::platform::DeviceRequest::Automatic,
+        )
+        .ok()?;
         let device = catalog
             .open(catalog.resolve(selected.info.selector).unwrap())
             .unwrap();
         let definition = fixture_definition();
         let manifest = fixture_manifest(&definition);
         let limits = ResourceLimits {
+            max_retained_entries: 2,
             active_requests: 2,
             in_flight_requests: 2,
             branch_checkpoints: 0,
@@ -255,10 +263,8 @@ pub(crate) mod tests {
             max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
             lookahead: false,
         };
-        let budget = ResourceBudget {
-            storage_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
-            retention_bytes: 64 * 1024,
-            safety_reserve_bytes: 16 * 1024 * 1024,
+        let capacity_bytes = ResourceCapacity {
+            domain_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
         };
         let draft = ExecutionPlanner::prepare(
             &selected,
@@ -272,7 +278,6 @@ pub(crate) mod tests {
             PlannedMethod::Plain,
             KvCodec::Dense,
             limits,
-            budget,
         )
         .unwrap();
         let state = ResourcePlanner::state_plan(
@@ -281,7 +286,7 @@ pub(crate) mod tests {
             draft.policy().method(),
             KvCodec::Dense,
             limits,
-            budget,
+            capacity_bytes,
         )
         .unwrap();
         let mut programs = crate::AttestedPrograms::prepare_draft(
@@ -367,11 +372,11 @@ pub(crate) mod tests {
             return;
         };
         let mut below = plan.clone();
-        below.storage_bytes = plan.startup_peak_bytes() - 1;
+        below.domain_capacity_bytes = plan.startup_peak_bytes() - 1;
         assert!(below.validate().unwrap_err().contains("startup peak"));
         let mut exact = plan;
-        exact.storage_bytes = exact.startup_peak_bytes();
-        let admitted_bytes = exact.storage_bytes;
+        exact.domain_capacity_bytes = exact.startup_peak_bytes();
+        let admitted_bytes = exact.domain_capacity_bytes;
         assert_eq!(
             exact.validate().unwrap().startup_peak_bytes(),
             admitted_bytes

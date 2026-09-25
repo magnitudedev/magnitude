@@ -292,7 +292,9 @@ impl Layout {
     }
 
     pub fn parse(name: &str) -> Option<Layout> {
-        Layout::ALL.into_iter().find(|layout| layout.as_str() == name)
+        Layout::ALL
+            .into_iter()
+            .find(|layout| layout.as_str() == name)
     }
 }
 
@@ -493,10 +495,13 @@ impl PackedPacketLayout {
             .checked_mul(self.packet_extent(logical_extent))
             .expect("packet count of a tensor with a canonical byte count fits u64");
         if planes.len() != self.planes.len()
-            || !self
-                .planes
-                .iter()
-                .all(|plane| planes.iter().filter(|(name, _)| *name == plane.name).count() == 1)
+            || !self.planes.iter().all(|plane| {
+                planes
+                    .iter()
+                    .filter(|(name, _)| *name == plane.name)
+                    .count()
+                    == 1
+            })
         {
             return Err(PlaneAssemblyError::PlaneSet);
         }
@@ -526,7 +531,8 @@ impl PackedPacketLayout {
             .collect::<Result<_, _>>()?;
         let mut canonical = vec![
             0u8;
-            usize::try_from(total).expect("canonical packet bytes fit the host address space")
+            usize::try_from(total)
+                .expect("canonical packet bytes fit the host address space")
         ];
         let packet_size = self.packet_size as usize;
         for (plane, bytes) in self.planes.iter().zip(supplied) {
@@ -766,10 +772,12 @@ impl PackedRowLayout {
                 let group = u64::from(self.packet.group);
                 let group_bytes = u64::from(self.planes[plane].bytes_per_group);
                 let local = column % group;
-                let byte = row / 8 * stride * 8 + offset * 8
-                    + column / group * group_bytes * 8 + row % 8 * group_bytes;
+                let byte = row / 8 * stride * 8
+                    + offset * 8
+                    + column / group * group_bytes * 8
+                    + row % 8 * group_bytes;
                 byte * 8 + local * bits
-            },
+            }
             Layout::Mma16 => {
                 let row_bytes = geometry.bytes_per_row[plane];
                 let (tile, r) = (row / MMA_TILE_ROWS, row % MMA_TILE_ROWS);
@@ -824,7 +832,9 @@ impl PackedRowLayout {
                     let position = planes.iter().position(|member| *member as usize == plane)?;
                     let prefix = planes[..position]
                         .iter()
-                        .map(|member| u64::from(self.packet.planes[*member as usize].bytes_per_group))
+                        .map(|member| {
+                            u64::from(self.packet.planes[*member as usize].bytes_per_group)
+                        })
                         .sum::<u64>();
                     Some((index, prefix))
                 }
@@ -833,10 +843,16 @@ impl PackedRowLayout {
             .expect("every packet plane has one row plane");
         let group_bytes = u64::from(self.planes[index].bytes_per_group);
         let byte = match self.layout {
-            Layout::Rows8 => row / 8 * geometry.stride * 8 + geometry.offsets[index] * 8
-                + packet * group_bytes * 8 + row % 8 * group_bytes + prefix,
-            Layout::Rows16 | Layout::Mma16 =>
-                row * geometry.stride + geometry.offsets[index] + packet * group_bytes + prefix,
+            Layout::Rows8 => {
+                row / 8 * geometry.stride * 8
+                    + geometry.offsets[index] * 8
+                    + packet * group_bytes * 8
+                    + row % 8 * group_bytes
+                    + prefix
+            }
+            Layout::Rows16 | Layout::Mma16 => {
+                row * geometry.stride + geometry.offsets[index] + packet * group_bytes + prefix
+            }
             Layout::Packet => unreachable!("a row layout is never `packet`"),
         };
         byte * 8 + u64::from(bit)
@@ -869,8 +885,11 @@ impl PackedRowLayout {
     pub fn place(&self, extents: &[u64], packets: &[u8]) -> Vec<u8> {
         let mut bytes = vec![
             0u8;
-            usize::try_from(self.bytes(extents).expect("row layout tensor has a canonical byte count"))
-                .expect("row layout bytes fit the host address space")
+            usize::try_from(
+                self.bytes(extents)
+                    .expect("row layout tensor has a canonical byte count")
+            )
+            .expect("row layout bytes fit the host address space")
         ];
         self.visit_packet_bits(extents, packets.len(), |source, destination| {
             let bit = (packets[source / 8] >> (source % 8)) & 1;
@@ -882,7 +901,9 @@ impl PackedRowLayout {
     /// The packet-form bytes of canonical layout bytes: the inverse of
     /// `place` over logical rows and groups.
     pub fn packets(&self, extents: &[u64], bytes: &[u8]) -> Vec<u8> {
-        let (&extent, leading) = extents.split_last().expect("row layout tensor has a packing axis");
+        let (&extent, leading) = extents
+            .split_last()
+            .expect("row layout tensor has a packing axis");
         let rows: u64 = leading.iter().product();
         let length = rows * self.packet.packet_extent(extent) * u64::from(self.packet.packet_size);
         let mut packets = vec![0u8; length as usize];
@@ -900,7 +921,9 @@ impl PackedRowLayout {
         packet_bytes: usize,
         mut visit: impl FnMut(usize, usize),
     ) {
-        let (&extent, leading) = extents.split_last().expect("row layout tensor has a packing axis");
+        let (&extent, leading) = extents
+            .split_last()
+            .expect("row layout tensor has a packing axis");
         let rows: u64 = leading.iter().product();
         let packets_per_row = self.packet.packet_extent(extent);
         let packet_size = u64::from(self.packet.packet_size);
@@ -1058,7 +1081,9 @@ pub fn canonical_bytes(id: RepresentationId, extents: &[u64]) -> Option<u64> {
     match &representation_info(id).kind {
         RepresentationKind::Dense(dtype) => extents
             .iter()
-            .try_fold(u64::from(dtype.bytes()), |bytes, extent| bytes.checked_mul(*extent)),
+            .try_fold(u64::from(dtype.bytes()), |bytes, extent| {
+                bytes.checked_mul(*extent)
+            }),
         RepresentationKind::Packed(layout) => {
             let (rows, last) = rows_and_last()?;
             layout.bytes(rows, last)
@@ -1083,7 +1108,10 @@ pub fn dense(dtype: DType) -> RepresentationId {
 pub fn plane_element_dtype(representation: RepresentationId, plane: &str) -> DType {
     let info = representation_info(representation);
     let RepresentationKind::Packed(layout) = &info.kind else {
-        panic!("plane view of the non-packed representation `{}`", info.name)
+        panic!(
+            "plane view of the non-packed representation `{}`",
+            info.name
+        )
     };
     layout
         .planes
@@ -1367,13 +1395,21 @@ pub(crate) mod internals {
                 };
                 if let IntrinsicResultType::Owned { axes, .. } = &result {
                     for projection in *axes {
-                        let (_, operand) = row.arguments.get(projection.argument as usize)
+                        let (_, operand) = row
+                            .arguments
+                            .get(projection.argument as usize)
                             .expect("result axis selects an actual intrinsic argument");
                         let rank = match operand {
-                            RowOperand::Readable(_, rank) | RowOperand::ReadableRepresentation(_, rank) => *rank,
-                            RowOperand::Scalar(_) => panic!("result axis cannot select a scalar argument"),
+                            RowOperand::Readable(_, rank)
+                            | RowOperand::ReadableRepresentation(_, rank) => *rank,
+                            RowOperand::Scalar(_) => {
+                                panic!("result axis cannot select a scalar argument")
+                            }
                         };
-                        assert!(projection.axis < rank, "result axis lies within its argument rank");
+                        assert!(
+                            projection.axis < rank,
+                            "result axis lies within its argument rank"
+                        );
                     }
                 }
                 if let IntrinsicExecution::WholeTensor {
@@ -1436,7 +1472,8 @@ pub(crate) mod internals {
                                 .collect::<Vec<_>>()
                         };
                         assert!(
-                            rows.iter().all(|other| categories(*other) != categories(id)),
+                            rows.iter()
+                                .all(|other| categories(*other) != categories(id)),
                             "two rows of one intrinsic overload declare the same operands"
                         );
                         rows.push(id);
@@ -1569,8 +1606,18 @@ pub(crate) mod internals {
                 content: RowPlaneContent::Groups { planes: scales },
             });
         }
-        let supers = coefficients(&["scale_factor", "bias_factor", "scale", "bias", "block_scale"]);
-        assert!(!supers.is_empty(), "`{}` has no super coefficients", repr.name);
+        let supers = coefficients(&[
+            "scale_factor",
+            "bias_factor",
+            "scale",
+            "bias",
+            "block_scale",
+        ]);
+        assert!(
+            !supers.is_empty(),
+            "`{}` has no super coefficients",
+            repr.name
+        );
         planes.push(RowPlaneInfo {
             name: "supers",
             bytes_per_group: group_bytes(&supers),
@@ -1906,7 +1953,10 @@ pub(crate) mod internals {
         let (start, end) = t.capability_ranges[backend as usize];
         &t.capabilities[start..end]
     }
-    pub(super) fn intrinsic_overloads(capability: CapabilityId, name: &str) -> &'static [IntrinsicId] {
+    pub(super) fn intrinsic_overloads(
+        capability: CapabilityId,
+        name: &str,
+    ) -> &'static [IntrinsicId] {
         tables()
             .overloads
             .iter()
@@ -2109,7 +2159,10 @@ mod tests {
             }
         );
         let lane = intrinsic_overloads(subgroup, "lane_index")[0];
-        assert_eq!(intrinsic_denotation(lane), IntrinsicDenotation::ParticipantIndex);
+        assert_eq!(
+            intrinsic_denotation(lane),
+            IntrinsicDenotation::ParticipantIndex
+        );
         let cuda_matrix = capability(BackendName::Cuda, "matrix").unwrap();
         for name in ["nvfp4_matmul", "nvfp4_matmul_add"] {
             for id in intrinsic_overloads(cuda_matrix, name) {
@@ -2126,7 +2179,10 @@ mod tests {
         for info in representations() {
             if let RepresentationKind::Packed(layout) = &info.kind {
                 for plane in &layout.planes {
-                    assert_eq!(plane_element_dtype(info.id, plane.name), plane.storage_dtype);
+                    assert_eq!(
+                        plane_element_dtype(info.id, plane.name),
+                        plane.storage_dtype
+                    );
                 }
             }
         }
@@ -2170,7 +2226,11 @@ mod tests {
         for (layout, name, kind) in [
             (Layout::Packet, "q4k", ConversionKind::Packet),
             (Layout::Rows16, "q4k@rows16", ConversionKind::Row),
-            (Layout::Mma16, "q4k@mma16", ConversionKind::RowTile { rows: 16 }),
+            (
+                Layout::Mma16,
+                "q4k@mma16",
+                ConversionKind::RowTile { rows: 16 },
+            ),
         ] {
             let conversion = resident_conversion(q4_k, layout).unwrap();
             assert_eq!(conversion.destination, representation(name).unwrap());
@@ -2224,26 +2284,45 @@ mod tests {
         );
         assert_eq!(
             plane_set("q5k@rows16"),
-            [("codes_lo", 128), ("codes_hi", 32), ("scales", 12), ("supers", 4)]
+            [
+                ("codes_lo", 128),
+                ("codes_hi", 32),
+                ("scales", 12),
+                ("supers", 4)
+            ]
         );
         assert_eq!(
             plane_set("q6k@rows16"),
-            [("codes_lo", 128), ("codes_hi", 64), ("scales", 16), ("supers", 2)]
+            [
+                ("codes_lo", 128),
+                ("codes_hi", 64),
+                ("scales", 16),
+                ("supers", 2)
+            ]
         );
         assert_eq!(plane_set("q8g32s@rows16"), [("codes", 32), ("supers", 2)]);
-        assert_eq!(plane_set("iq4g32@rows16"), [("codes_lo", 128), ("supers", 32)]);
+        assert_eq!(
+            plane_set("iq4g32@rows16"),
+            [("codes_lo", 128), ("supers", 32)]
+        );
         // Qwen3.5 K = 2560: codes 1280 | scales 120 -> 128 | supers 40 -> 48.
         let q4k = row_layout("q4k@rows16");
         assert_eq!(q4k.plane_row_offset(1, 2560), Some(1280));
         assert_eq!(q4k.plane_row_offset(2, 2560), Some(1408));
         assert_eq!(q4k.row_stride_bytes(2560), Some(1456));
-        assert_eq!(canonical_bytes(representation("q4k@rows16").unwrap(), &[3, 2560]), Some(3 * 1456));
+        assert_eq!(
+            canonical_bytes(representation("q4k@rows16").unwrap(), &[3, 2560]),
+            Some(3 * 1456)
+        );
         // A q8 row of three groups: 96 code bytes, 6 super bytes -> 16.
         let q8 = row_layout("q8g32s@rows16");
         assert_eq!(q8.row_stride_bytes(96), Some(112));
         // mma16 pads rows per matrix and q8 rows to whole 64-column k-blocks.
         let q8_mma = representation("q8g32s@mma16").unwrap();
-        assert_eq!(row_layout("q8g32s@mma16").row_stride_bytes(96), Some(128 + 16));
+        assert_eq!(
+            row_layout("q8g32s@mma16").row_stride_bytes(96),
+            Some(128 + 16)
+        );
         assert_eq!(canonical_bytes(q8_mma, &[2, 17, 96]), Some(2 * 32 * 144));
         assert_eq!(canonical_bytes(q8_mma, &[96]), None);
     }
@@ -2275,9 +2354,12 @@ mod tests {
                     for register in 0..4u64 {
                         for half in 0..2u64 {
                             let row = g + 8 * (register & 1);
-                            let column = 64 * block + 16 * step + 2 * t + 8 * (register >> 1) + half;
-                            let v = (block * 32 + lane) * 128 + 32 * step + 4 * (register + 4 * half);
-                            let expected = (v / 8 / row_bytes * stride + v / 8 % row_bytes) * 8 + v % 8;
+                            let column =
+                                64 * block + 16 * step + 2 * t + 8 * (register >> 1) + half;
+                            let v =
+                                (block * 32 + lane) * 128 + 32 * step + 4 * (register + 4 * half);
+                            let expected =
+                                (v / 8 / row_bytes * stride + v / 8 % row_bytes) * 8 + v % 8;
                             assert_eq!(layout.code_bit(&geometry, 0, row, column), expected);
                         }
                     }
@@ -2291,7 +2373,9 @@ mod tests {
         let length = canonical_bytes(source, shape).unwrap() as usize;
         (0..length)
             .map(|index| {
-                let x = (index as u32).wrapping_add(seed).wrapping_mul(2_654_435_761);
+                let x = (index as u32)
+                    .wrapping_add(seed)
+                    .wrapping_mul(2_654_435_761);
                 (x >> 13) as u8
             })
             .collect()
@@ -2312,14 +2396,24 @@ mod tests {
                 unreachable!()
             };
             let group = u64::from(external.logical_group);
-            for shape in [vec![17, 3 * group], vec![2, 3, 2 * group - 8], vec![1, group]] {
-                let host_shape = shape.iter().map(|extent| *extent as usize).collect::<Vec<_>>();
+            for shape in [
+                vec![17, 3 * group],
+                vec![2, 3, 2 * group - 8],
+                vec![1, group],
+            ] {
+                let host_shape = shape
+                    .iter()
+                    .map(|extent| *extent as usize)
+                    .collect::<Vec<_>>();
                 let bytes = source_bytes(source_info.id, &shape, shape[0] as u32);
                 let decode = |conversion: &RepresentationConversion| {
                     let converted = repack(conversion.id, &host_shape, &bytes).unwrap();
-                    let data =
-                        TensorData::encoded(conversion.destination, host_shape.clone(), converted.clone())
-                            .unwrap();
+                    let data = TensorData::encoded(
+                        conversion.destination,
+                        host_shape.clone(),
+                        converted.clone(),
+                    )
+                    .unwrap();
                     (converted, data.values().unwrap())
                 };
                 let packet = resident_conversion(source_info.id, Layout::Packet).unwrap();
@@ -2335,8 +2429,14 @@ mod tests {
                     assert_eq!(rows.packets(&shape, &converted), packet_bytes);
                     assert_eq!(rows.place(&shape, &packet_bytes), converted);
                     assert_eq!(
-                        actual.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
-                        expected.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                        actual
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
+                        expected
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
                         "{} -> {} over {shape:?}",
                         source_info.name,
                         representation_info(conversion.destination).name
@@ -2427,7 +2527,12 @@ mod tests {
             Err(PlaneAssemblyError::PlaneSet)
         );
         assert_eq!(
-            assemble(&[("words", &words), ("scale", &scale), ("bias", &bias), ("extra", &bias)]),
+            assemble(&[
+                ("words", &words),
+                ("scale", &scale),
+                ("bias", &bias),
+                ("extra", &bias)
+            ]),
             Err(PlaneAssemblyError::PlaneSet)
         );
         assert_eq!(

@@ -308,8 +308,7 @@ prefill of the first 65 tokens, then 64 teacher-forced one-row decodes with
 logits exported, compared with the stored rows by llama.cpp's KL and same-top
 definitions. The report is rewritten after each category; with all three it
 carries `overall` and a `d4` verdict (each threshold, value, pass). `--chunks N`
-caps the chunks per category for a quick look. `--storage-gib` must hold the
-model (35B: 25 on an M4 Max, 30 on a GB10). The 35B F32 reference is
+caps the chunks per category for a quick look. The 35B F32 reference is
 `ref-cpu-f32-35b-b8680` (139 GB F32 GGUF, larger than RAM; built with
 `--extra -b 2048 -ub 2048` so each pass streams the file once). On a shared host, hold the GPU
 lock for the run. First result (2026-09-24, local M4 Max, Metal): mean KL

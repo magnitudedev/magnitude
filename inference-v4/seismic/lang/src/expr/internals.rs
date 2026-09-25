@@ -38,16 +38,15 @@ use super::{
     DurationExpr, DurationTerm, ErasedScalarExpr, EvalError, Expr, ExprDigest, FiniteDomain,
     FoldOp, IntExpr, LoopBinderId, NaryOp, NatExpr, NodeView, PartialAssignment, RootId, RootName,
     ScalarArgument, ScalarComponent, ScalarExpr, ScalarSort, SymbolId, SymbolKind, SymbolSort,
-    SymbolValue, TargetConstantId,
-    UnaryOp,
+    SymbolValue, TargetConstantId, UnaryOp,
 };
 use crate::reference_math::{self, ReferenceScalar, ScalarOp};
 use crate::types::DType;
 use num_bigint::{BigInt, BigUint};
 use num_traits::{Euclid, One, Signed, Zero};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use serde::{Deserialize, Serialize};
 
 fn handle<Sort>(owner: ArenaId, index: u32) -> Expr<Sort> {
     Expr {
@@ -347,7 +346,9 @@ impl Arena {
                         AnyExpr::Scalar(_) => matches!(sorts[position], Sort::Scalar(_)),
                     };
                 if !earlier {
-                    return Err(WireError("arena node operand is not an earlier node of its sort"));
+                    return Err(WireError(
+                        "arena node operand is not an earlier node of its sort",
+                    ));
                 }
             }
             match node {
@@ -360,10 +361,14 @@ impl Arena {
                 return Err(WireError("arena interns one node twice"));
             }
         }
-        fn unique<K: Eq + std::hash::Hash, V>(pairs: Vec<(K, V)>) -> Result<HashMap<K, V>, WireError> {
+        fn unique<K: Eq + std::hash::Hash, V>(
+            pairs: Vec<(K, V)>,
+        ) -> Result<HashMap<K, V>, WireError> {
             let length = pairs.len();
             let map: HashMap<K, V> = pairs.into_iter().collect();
-            (map.len() == length).then_some(map).ok_or(WireError("arena map repeats a key"))
+            (map.len() == length)
+                .then_some(map)
+                .ok_or(WireError("arena map repeats a key"))
         }
         Ok(Arena {
             id,
@@ -506,7 +511,8 @@ impl Arena {
             return i;
         }
         let unguarded_total = self.node_total(&node, &self.unguarded_total);
-        let total = unguarded_total || self.node_total(&node, &self.total) || self.guarded_total(&node);
+        let total =
+            unguarded_total || self.node_total(&node, &self.total) || self.guarded_total(&node);
         let free = self.node_free(&node);
         let i = u32::try_from(self.nodes.len())
             .unwrap_or_else(|_| panic!("ExprArena node identity space exhausted"));
@@ -570,9 +576,7 @@ impl Arena {
                 .into_iter()
                 .all(child_total);
         }
-        let children_total = Self::children(node)
-            .into_iter()
-            .all(child_total);
+        let children_total = Self::children(node).into_iter().all(child_total);
         if !children_total {
             return false;
         }
@@ -617,7 +621,12 @@ impl Arena {
     /// operand whose guard establishes every side condition of the right
     /// operand, evaluation cannot fail.
     fn guarded_total(&mut self, node: &Node) -> bool {
-        let Node::Binary { op, lhs: AnyExpr::Bool(a), rhs: AnyExpr::Bool(b) } = *node else {
+        let Node::Binary {
+            op,
+            lhs: AnyExpr::Bool(a),
+            rhs: AnyExpr::Bool(b),
+        } = *node
+        else {
             return false;
         };
         if !matches!(op, BinaryOp::And | BinaryOp::Implies | BinaryOp::Or) || !self.expr_total(a) {
@@ -631,7 +640,11 @@ impl Arena {
 
     fn conjuncts(&self, predicate: BoolExpr, out: &mut Vec<BoolExpr>) {
         match *self.node(self.expr_index(predicate)) {
-            Node::Binary { op: BinaryOp::And, lhs: AnyExpr::Bool(lhs), rhs: AnyExpr::Bool(rhs) } => {
+            Node::Binary {
+                op: BinaryOp::And,
+                lhs: AnyExpr::Bool(lhs),
+                rhs: AnyExpr::Bool(rhs),
+            } => {
                 self.conjuncts(lhs, out);
                 self.conjuncts(rhs, out);
             }
@@ -649,10 +662,16 @@ impl Arena {
         let holds = |arena: &Self, facts: &[BoolExpr], condition: BoolExpr| {
             arena.bool_of(condition) == Some(true)
                 || facts.contains(&condition)
-                || facts.iter().any(|fact| arena.nat_upper_bound_dominates(*fact, condition, facts))
+                || facts
+                    .iter()
+                    .any(|fact| arena.nat_upper_bound_dominates(*fact, condition, facts))
         };
         match self.node(i).clone() {
-            Node::Binary { op: op @ (BinaryOp::And | BinaryOp::Implies | BinaryOp::Or), lhs: AnyExpr::Bool(a), rhs: AnyExpr::Bool(b) } => {
+            Node::Binary {
+                op: op @ (BinaryOp::And | BinaryOp::Implies | BinaryOp::Or),
+                lhs: AnyExpr::Bool(a),
+                rhs: AnyExpr::Bool(b),
+            } => {
                 if !self.defined_under(facts, self.expr_index(a)) {
                     return false;
                 }
@@ -663,7 +682,11 @@ impl Arena {
                 facts.truncate(before);
                 defined
             }
-            Node::Select { cond, then, otherwise } => {
+            Node::Select {
+                cond,
+                then,
+                otherwise,
+            } => {
                 if !self.defined_under(facts, self.expr_index(cond)) {
                     return false;
                 }
@@ -677,7 +700,10 @@ impl Arena {
                 facts.truncate(before);
                 then && otherwise
             }
-            Node::Unary { op: UnaryOp::NatFromInt, operand: AnyExpr::Int(value) } => {
+            Node::Unary {
+                op: UnaryOp::NatFromInt,
+                operand: AnyExpr::Int(value),
+            } => {
                 if !self.defined_under(facts, self.expr_index(value)) {
                     return false;
                 }
@@ -685,15 +711,26 @@ impl Arena {
                 let condition = self.int_cmp(CmpOp::Ge, value, zero);
                 holds(self, facts, condition)
             }
-            Node::Binary { op: BinaryOp::Sub, lhs: AnyExpr::Nat(a), rhs: AnyExpr::Nat(b) } => {
-                if !self.defined_under(facts, self.expr_index(a)) || !self.defined_under(facts, self.expr_index(b)) {
+            Node::Binary {
+                op: BinaryOp::Sub,
+                lhs: AnyExpr::Nat(a),
+                rhs: AnyExpr::Nat(b),
+            } => {
+                if !self.defined_under(facts, self.expr_index(a))
+                    || !self.defined_under(facts, self.expr_index(b))
+                {
                     return false;
                 }
                 let condition = self.nat_cmp(CmpOp::Le, b, a);
                 holds(self, facts, condition)
             }
-            node @ (Node::Unary { op: UnaryOp::ScalarIntegerDefined, .. } | Node::ScalarInteger { .. }
-            | Node::Fold { .. } | Node::Duration(_)) => {
+            node @ (Node::Unary {
+                op: UnaryOp::ScalarIntegerDefined,
+                ..
+            }
+            | Node::ScalarInteger { .. }
+            | Node::Fold { .. }
+            | Node::Duration(_)) => {
                 let _ = node;
                 false
             }
@@ -702,13 +739,18 @@ impl Arena {
                 // unless `node_total` names a condition (a non-constant
                 // divisor); those stay undecided here.
                 let children = Self::children(&node);
-                if !children.into_iter().all(|child| { let child = self.index(child); self.defined_under(facts, child) }) {
+                if !children.into_iter().all(|child| {
+                    let child = self.index(child);
+                    self.defined_under(facts, child)
+                }) {
                     return false;
                 }
                 match node {
-                    Node::Binary { op: BinaryOp::Div | BinaryOp::CeilDiv | BinaryOp::Rem | BinaryOp::AlignUp, rhs, .. } => {
-                        self.nonzero_const(self.index(rhs))
-                    }
+                    Node::Binary {
+                        op: BinaryOp::Div | BinaryOp::CeilDiv | BinaryOp::Rem | BinaryOp::AlignUp,
+                        rhs,
+                        ..
+                    } => self.nonzero_const(self.index(rhs)),
                     _ => true,
                 }
             }
@@ -883,7 +925,10 @@ impl Arena {
     pub(super) fn rebase_schedule_slot(&mut self, symbol: SymbolId, ordinal: u32) {
         let index = self.symbol_index(symbol);
         let record = self.symbols.get_mut(index).expect(SYMBOL_OUT_OF_ARENA);
-        assert!(matches!(record.kind, SymbolKind::ScheduleSlot(_)), "only a schedule slot may be rebased");
+        assert!(
+            matches!(record.kind, SymbolKind::ScheduleSlot(_)),
+            "only a schedule slot may be rebased"
+        );
         record.kind = SymbolKind::ScheduleSlot(ordinal);
     }
     pub(super) fn symbol_kind(&self, symbol: SymbolId) -> SymbolKind {
@@ -958,7 +1003,9 @@ impl Arena {
         if value.is_negative() {
             let zero = self.int_const(0);
             self.int_sub(zero, magnitude)
-        } else { magnitude }
+        } else {
+            magnitude
+        }
     }
 
     pub(super) fn nat_const(&mut self, v: u64) -> NatExpr {
@@ -1629,7 +1676,11 @@ impl Arena {
             return self.bool_const(true);
         }
         match self.node(self.expr_index(predicate)).clone() {
-            Node::Cmp { op, lhs: AnyExpr::Nat(x), rhs: AnyExpr::Nat(y) } => {
+            Node::Cmp {
+                op,
+                lhs: AnyExpr::Nat(x),
+                rhs: AnyExpr::Nat(y),
+            } => {
                 if x == y {
                     return self.bool_const(reflexive(op));
                 }
@@ -1654,8 +1705,16 @@ impl Arena {
                 }
                 predicate
             }
-            Node::Cmp { op, lhs: AnyExpr::Int(x), rhs: AnyExpr::Int(y) } if x == y => self.bool_const(reflexive(op)),
-            Node::Binary { op: op @ (BinaryOp::And | BinaryOp::Implies | BinaryOp::Or), lhs: AnyExpr::Bool(x), rhs: AnyExpr::Bool(y) } => {
+            Node::Cmp {
+                op,
+                lhs: AnyExpr::Int(x),
+                rhs: AnyExpr::Int(y),
+            } if x == y => self.bool_const(reflexive(op)),
+            Node::Binary {
+                op: op @ (BinaryOp::And | BinaryOp::Implies | BinaryOp::Or),
+                lhs: AnyExpr::Bool(x),
+                rhs: AnyExpr::Bool(y),
+            } => {
                 // The right operand is evaluated only under its guard.
                 let guard = if op == BinaryOp::Or { self.not(x) } else { x };
                 let before = facts.len();
@@ -1673,7 +1732,10 @@ impl Arena {
                     _ => self.or(x, y),
                 }
             }
-            Node::Unary { op: UnaryOp::Not, operand: AnyExpr::Bool(x) } => {
+            Node::Unary {
+                op: UnaryOp::Not,
+                operand: AnyExpr::Bool(x),
+            } => {
                 let x = self.assume_defined(facts, x);
                 self.not(x)
             }
@@ -2008,7 +2070,11 @@ impl Arena {
     fn nat_constant_lower(&self, expression: NatExpr) -> u64 {
         match self.node(self.expr_index(expression)) {
             Node::NatConst(value) => *value,
-            Node::Binary { op, lhs: AnyExpr::Nat(a), rhs: AnyExpr::Nat(b) } => {
+            Node::Binary {
+                op,
+                lhs: AnyExpr::Nat(a),
+                rhs: AnyExpr::Nat(b),
+            } => {
                 let (a, b) = (self.nat_constant_lower(*a), self.nat_constant_lower(*b));
                 match op {
                     BinaryOp::Max => a.max(b),
@@ -2018,9 +2084,11 @@ impl Arena {
                     _ => 0,
                 }
             }
-            Node::Select { then: AnyExpr::Nat(a), otherwise: AnyExpr::Nat(b), .. } => {
-                self.nat_constant_lower(*a).min(self.nat_constant_lower(*b))
-            }
+            Node::Select {
+                then: AnyExpr::Nat(a),
+                otherwise: AnyExpr::Nat(b),
+                ..
+            } => self.nat_constant_lower(*a).min(self.nat_constant_lower(*b)),
             _ => 0,
         }
     }
@@ -3237,7 +3305,11 @@ impl Arena {
     ) -> Expr<Sort> {
         let mut expressions = HashMap::new();
         for (symbol, value) in values {
-            assert_eq!(self.record(*symbol).sort, SymbolSort::Nat, "natural substitution of a non-natural symbol");
+            assert_eq!(
+                self.record(*symbol).sort,
+                SymbolSort::Nat,
+                "natural substitution of a non-natural symbol"
+            );
             expressions.insert(*symbol, self.expr_index(*value));
         }
         let node = self.expr_index(node);
@@ -3813,8 +3885,13 @@ impl Arena {
         let retained_bytes = program
             .retained_metadata_bytes()
             .saturating_add(captured.capacity() * std::mem::size_of::<(SymbolId, SymbolValue)>())
-            .saturating_add(captured.iter().fold(0usize, |bytes, (_, value)| bytes.saturating_add(
-                value.retained_metadata_bytes().saturating_sub(std::mem::size_of::<SymbolValue>()))));
+            .saturating_add(captured.iter().fold(0usize, |bytes, (_, value)| {
+                bytes.saturating_add(
+                    value
+                        .retained_metadata_bytes()
+                        .saturating_sub(std::mem::size_of::<SymbolValue>()),
+                )
+            }));
         Compiled::new(
             reads,
             retained_bytes,
@@ -3849,10 +3926,18 @@ impl Arena {
     pub(super) fn compile_duration(&self, n: DurationExpr) -> Compiled<DurationEstimate> {
         self.compile(self.expr_index(n), to_duration)
     }
-    pub(super) fn compile_nat_with(&self, n: NatExpr, fixed: &PartialAssignment) -> Compiled<BigUint> {
+    pub(super) fn compile_nat_with(
+        &self,
+        n: NatExpr,
+        fixed: &PartialAssignment,
+    ) -> Compiled<BigUint> {
         self.compile_with(self.expr_index(n), fixed, to_nat)
     }
-    pub(super) fn compile_int_with(&self, n: IntExpr, fixed: &PartialAssignment) -> Compiled<BigInt> {
+    pub(super) fn compile_int_with(
+        &self,
+        n: IntExpr,
+        fixed: &PartialAssignment,
+    ) -> Compiled<BigInt> {
         self.compile_with(self.expr_index(n), fixed, to_int)
     }
     pub(super) fn compile_bool_with(

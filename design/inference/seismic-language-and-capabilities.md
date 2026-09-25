@@ -62,6 +62,13 @@ shape, and reference-semantic contract. Generated callers select this distinct p
 `native_for_device`. A native kernel may be called directly or composed into a prepared native
 workflow through the same checked entry contract. Native workflow composition does not make the
 native implementation a portable compiler candidate.
+The checked bundle exposes whether such a declaration exists for a backend without opening a
+device. Declaration presence does not establish that a particular element binding or runtime
+kernel can be prepared or executed.
+For launch-scoped native implementations, a launch declares entry tuning parameters read by its
+kernel when its geometry and activity condition do not already expose those reads. This declaration
+determines which launch receives a code variant or a runtime argument and which tuning choices are
+coupled. An undeclared entry parameter cannot silently affect a scoped kernel's code.
 
 Direct Metal source receives a generated ABI prefix after element parameters are bound. The
 prefix derives representation descriptors exclusively from the semantic registry for every bound
@@ -210,12 +217,26 @@ implementation. It is closed integer arithmetic over the attached function's inf
 and is consumed only by the direct native runtime; it is not visible to portable bodies, lowerings,
 static calls, or compiler planning.
 
-A native launch and a native scratch buffer may be conditional (`launch K when C:`, `scratch S bytes
+A native declaration has entry parameters shared by launches and parameters scoped to one launch.
+Launches may reuse parameter names; a launch's condition and geometry see only its own parameters,
+entry parameters, and dimensions. Scratch sees entry parameters and dimensions. A parameter marked
+`code` changes its launch's generated code; other parameters are supplied at launch time. For a
+launch-scoped Metal implementation, non-code entry parameters and then non-code parameters of
+each launch occupy trailing ABI argument words in declaration order. A launch source sees its
+own local names as `SEISMIC_RUNTIME_<NAME>` at those offsets; it may instead read a device built-in
+when the value is already
+part of launch geometry. A native
+Metal launch with scoped parameters has a forming guard for its kernel, and its template header
+lists the code parameters it receives, entry parameters before local parameters, in declaration
+order. The build checks both before formation.
+The source does not use entry-wide tuning macros for such a declaration. A native
+launch and a native scratch buffer may be conditional (`launch K when C:`, `scratch S bytes
 (E) when C`). A condition is comparisons of that same integer arithmetic joined by `and` and `or`;
-it reads every entry dimension and tuning parameter and is evaluated with the launch geometry (per
-standalone call, once per node when a native graph is sealed). The same condition form restricts
-tuning configurations in `where`, which reads only static dimensions and parameters. An inactive
-launch is neither encoded nor checked against pipeline or device limits, its geometry is not
+it is evaluated with the launch geometry (per standalone call, once per node when a native graph
+is sealed). The same condition form restricts tuning configurations in `where`, which reads only
+static dimensions and parameters. `where` may combine conjuncts from different launches, but each
+conjunct reads local parameters from at most one launch; a reused local name is ambiguous there.
+An inactive launch is neither encoded nor checked against pipeline or device limits, its geometry is not
 evaluated, and it keeps its ordinal (formed functions and trace entries stay in declaration order;
 a trace records it as an empty launch). An inactive scratch buffer keeps its ABI slot at the minimum
 charge without evaluating its size. A call whose launches are all inactive is legal and does nothing.
