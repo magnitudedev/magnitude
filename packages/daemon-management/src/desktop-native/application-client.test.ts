@@ -3,18 +3,76 @@ import { FileSystem } from "@effect/platform"
 import { Effect, Fiber, Ref, Schedule, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import { ApplicationSnapshot } from "@magnitudedev/sdk/desktop-host"
-import { ApplicationControlUnavailable } from "./application-control"
+import { ApplicationControlClosed, ApplicationControlFailed, ApplicationControlUnavailable } from "./application-control"
 import { launchApplicationProcess, makeApplicationClient } from "./application-client"
 
 const ready = Schema.decodeUnknownSync(ApplicationSnapshot)({
   version: 1, pid: 42, endpoint: "http://127.0.0.1:11101",
-  tray: { _tag: "Registered" },
+  owner: { _tag: "Desktop", tray: { _tag: "Registered" } },
   service: { _tag: "Ready", health: { service: "magnitude-acn", version: "0.0.14", revision: 1, id: "child", pid: 43, rpcVersion: 1, state: { _tag: "Ready" } } },
 })
 const starting = Schema.decodeUnknownSync(ApplicationSnapshot)({ ...ready, service: { _tag: "Starting", attempt: 1 } })
 const stopped = Schema.decodeUnknownSync(ApplicationSnapshot)({ ...ready, service: { _tag: "Stopping" } })
 
 describe("desktop client startup", () => {
+  it("launches desktop for explicit Open over a headless owner and waits for desktop observation", async () => {
+    await Effect.runPromise(Effect.gen(function* () {
+      let launched = false
+      let observations = 0
+      const client = makeApplicationClient({
+        launch: (intent, observe) => Effect.sync(() => {
+          expect(intent).toBe("ShowWindow")
+          launched = true
+        }).pipe(Effect.zipRight(observe)),
+        request: () => Effect.sync(() => {
+          observations++
+          return launched && observations >= 3 ? ready : { ...ready, owner: { _tag: "Headless" as const } }
+        }),
+      })
+      expect((yield* client.ensure("ShowWindow")).owner._tag).toBe("Desktop")
+      expect(launched).toBe(true)
+      expect(observations).toBe(3)
+    }))
+  })
+
+  it("waits through a closed headless connection during an already launched takeover", async () => {
+    let requests = 0
+    let launches = 0
+    const client = makeApplicationClient({
+      launch: (_, observe) => Effect.sync(() => { launches++ }).pipe(Effect.zipRight(observe)),
+      request: () => Effect.gen(function* () {
+        requests++
+        if (requests === 1) return { ...ready, owner: { _tag: "Headless" as const } }
+        if (requests === 2) return yield* new ApplicationControlClosed()
+        if (requests === 3) return yield* new ApplicationControlUnavailable({ message: "retiring" })
+        return ready
+      }),
+    })
+    expect(await Effect.runPromise(client.ensure("ShowWindow"))).toEqual(ready)
+    expect(launches).toBe(1)
+    expect(requests).toBe(4)
+  })
+
+  it("does not launch on an initially closed connection or hide a malformed takeover reply", async () => {
+    let launches = 0
+    const initiallyClosed = makeApplicationClient({
+      launch: (_, observe) => Effect.sync(() => { launches++ }).pipe(Effect.zipRight(observe)),
+      request: () => new ApplicationControlClosed(),
+    })
+    expect((await Effect.runPromise(initiallyClosed.ensure("ShowWindow").pipe(Effect.either)))._tag).toBe("Left")
+    expect(launches).toBe(0)
+    const malformed = makeApplicationClient({
+      launch: (_, observe) => Effect.sync(() => { launches++ }).pipe(Effect.zipRight(observe)),
+      request: () => Effect.suspend(() => launches === 0
+        ? Effect.succeed({ ...ready, owner: { _tag: "Headless" as const } })
+        : new ApplicationControlFailed({ message: "Invalid control frame" })),
+    })
+    const result = await Effect.runPromise(malformed.ensure("ShowWindow").pipe(Effect.either))
+    expect(result._tag).toBe("Left")
+    if (result._tag === "Left") expect(result.left.message).toBe("Invalid control frame")
+    expect(launches).toBe(1)
+  })
+
   it("observes an existing application without launching or showing another instance", async () => {
     await Effect.runPromise(Effect.gen(function* () {
       const launches = yield* Ref.make(0)

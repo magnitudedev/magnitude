@@ -16,7 +16,7 @@ Choose **Intel / AMD (x64)** for an x86-64 processor or **ARM64** for an ARM64 p
 
 ## Requirements
 
-Magnitude requires **glibc 2.35 or later** and a graphical desktop. Ubuntu 22.04 and Debian 12 meet the glibc requirement. An RPM download does not imply compatibility with every Red Hat release: RHEL 9's glibc 2.34 is below this minimum.
+Magnitude requires **glibc 2.35 or later**. Ubuntu 22.04 and Debian 12 meet the glibc requirement. An RPM download does not imply compatibility with every Red Hat release: RHEL 9's glibc 2.34 is below this minimum. The desktop window needs a graphical session; `magnitude serve` can run without one, including over SSH.
 
 Your package manager installs required desktop libraries. GPU inference also needs a supported driver; see [Hardware](/hardware). Alpine/musl packages are not available.
 
@@ -39,14 +39,8 @@ sudo dnf install ./magnitude-desktop.rpm
 
 Open **Magnitude** from your applications menu and follow [Quick start](/get-started).
 
-## Background operation and updates
-
-Closing the window keeps inference running. Enable **Launch at login** in Settings to start Magnitude when you sign in. This is desktop login startup, not a system service that starts before login.
-
-Some desktop environments don't display a tray icon. Reopen Magnitude from your applications menu; use **Quit Magnitude** to stop it.
+## Updates and removal
 
 App updates use your system package manager and may ask for authorization. Use **Settings → Application updates** for the available actions.
-
-## Uninstall
 
 Remove Magnitude through your distribution's software manager. Downloaded models and settings live in `~/.magnitude` and are separate from the installed application package.

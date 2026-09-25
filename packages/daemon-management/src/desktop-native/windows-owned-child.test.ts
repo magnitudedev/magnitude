@@ -30,7 +30,7 @@ const fixture = (peer = 42, earlyExit: number | null = null) => {
   }) }))
   return { observed, layer: Layer.merge(jobs, pipes) }
 }
-const command = { executable: "C:\\Magnitude\\magnitude-service.exe", arguments: [], environment: { MAGNITUDE_OWNER_PIPE: "caller-value" } }
+const command = { output: "DiagnosticTail" as const, executable: "C:\\Magnitude\\magnitude-service.exe", arguments: [], environment: { MAGNITUDE_OWNER_PIPE: "caller-value" } }
 describe("Windows owned service composition (simulated native boundary)", () => {
   it("fences the control peer, retains diagnostics, encodes commands and retires the owned job", async () => {
     const test = fixture()

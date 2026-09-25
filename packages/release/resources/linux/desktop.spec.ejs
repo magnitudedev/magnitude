@@ -43,7 +43,14 @@ set -eu
 %preun
 set -eu
 [ "$1" -eq 0 ] || exit 0
+if ! (
 @MAGNITUDE_INSTALL_BEGIN@
+); then
+  # DNF can remove automatic dependencies even when this package's removal fails.
+  touch /var/lib/magnitude-desktop/installing
+  echo 'Package removal was interrupted. Quit Magnitude, then reinstall its package before starting it again.' >&2
+  exit 1
+fi
 
 %postun
 set -eu

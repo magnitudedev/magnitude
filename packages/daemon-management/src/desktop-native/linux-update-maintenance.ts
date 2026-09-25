@@ -1,6 +1,7 @@
 import { FileSystem } from "@effect/platform"
 import { Effect, Option, Schema, Stream } from "effect"
 import { basename, dirname, join, parse } from "node:path"
+import { createRequire } from "node:module"
 import { decodePublisherPublicKey, updateInstallerFilename } from "@magnitudedev/release/hosted-update"
 import { LinuxPackageUpdateFailed, makeLinuxPackageInstaller } from "./linux-update-package"
 
@@ -9,16 +10,30 @@ import { PreparedUpdate } from "./prepared-update"
 const Trust = Schema.Struct({ keyId: Schema.NonEmptyString, publicKey: Schema.NonEmptyString })
 const installedCli = "/usr/lib/magnitude-desktop/resources/magnitude"
 
+export const guardLinuxInstallerParent = Effect.try({
+  try: () => {
+    const native = createRequire(import.meta.url)("/usr/lib/magnitude-desktop/resources/desktop-host.node") as { guardInstallerParent(descriptor: number): void }
+    native.guardInstallerParent(0)
+  },
+  catch: () => new LinuxPackageUpdateFailed({ message: "The installer could not retain the foreground command's lifetime." }),
+})
+
+export const linuxUpdateCallerUid = (environment: Readonly<Record<string, string | undefined>>) => Effect.gen(function* () {
+  const value = environment.PKEXEC_UID ?? environment.SUDO_UID
+  if (value === undefined || !/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))
+    || (environment.PKEXEC_UID !== undefined && environment.SUDO_UID !== undefined && environment.PKEXEC_UID !== environment.SUDO_UID)) {
+    return yield* new LinuxPackageUpdateFailed({ message: "System authorization did not identify the requesting user." })
+  }
+  return Number(value)
+})
+
 /** A private entry of the installed CLI. No caller-provided key can authorize a package. */
 export const installLinuxApplicationUpdate = (requestPath: string, currentVersion: string) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   if (process.platform !== "linux" || process.getuid?.() !== 0 || (yield* fs.realPath(process.execPath)) !== installedCli) {
     return yield* new LinuxPackageUpdateFailed({ message: "Run application updates through the installed Magnitude desktop." })
   }
-  const callerUid = Number(process.env.PKEXEC_UID)
-  if (!Number.isSafeInteger(callerUid) || callerUid <= 0) {
-    return yield* new LinuxPackageUpdateFailed({ message: "The desktop authorization did not identify the requesting user." })
-  }
+  const callerUid = yield* linuxUpdateCallerUid(process.env)
   const trustPath = join(dirname(installedCli), "update-trust.json")
   for (let path = trustPath; ; path = dirname(path)) {
     const info = yield* fs.stat(path)

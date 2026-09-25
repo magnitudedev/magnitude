@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto"
-import { Effect, Fiber, Ref, Stream } from "effect"
+import { Effect, Fiber, Stream } from "effect"
+import { makeChildOutput } from "./child-output"
 import { DesktopChildEvent, DesktopOwnerCommand } from "@magnitudedev/acn-protocol/desktop-control"
 import { JsonLineChannelFailed, receiveJsonLines, sendJsonLine } from "@magnitudedev/utils/json-line-channel"
 import { ProcessStartIdentitySchema } from "@magnitudedev/utils/process-groups"
@@ -19,12 +20,12 @@ export const makeWindowsOwnedChildSpawner = Effect.gen(function* () {
     const controlName = yield* Effect.sync(() => WindowsPipeName.make(`\\\\.\\pipe\\magnitude-child-${randomUUID()}`))
     const output = yield* pipes.bind(outputName, true).pipe(Effect.mapError(error => spawnFailure(error.message)))
     const control = yield* pipes.bind(controlName, true).pipe(Effect.mapError(error => spawnFailure(error.message)))
-    const tail = yield* Ref.make("")
+    const diagnostics = yield* makeChildOutput(command.output)
     const diagnosticReader = yield* output.accept.pipe(Effect.zipRight(Stream.repeatEffect(output.read).pipe(
       Stream.takeWhile(bytes => bytes.length > 0),
-      Stream.runForEach(chunk => Ref.update(tail, text => Buffer.concat([Buffer.from(text), chunk]).subarray(-16384).toString("utf8"))),
+      Stream.runForEach(diagnostics.append),
     )), Effect.forkScoped)
-    const encoded = yield* encodeWindowsCommand({ ...command, environment: {
+    const encoded = yield* encodeWindowsCommand({ executable: command.executable, arguments: command.arguments, environment: {
       ...command.environment, MAGNITUDE_OWNER_PIPE: controlName,
     } }).pipe(Effect.mapError(error => spawnFailure(error.message)))
     const job = yield* Effect.acquireRelease(jobs.spawn(encoded, { _tag: "Diagnostics", output: outputName }).pipe(Effect.mapError(error => spawnFailure(error.message))),
@@ -40,7 +41,7 @@ export const makeWindowsOwnedChildSpawner = Effect.gen(function* () {
       identity: { pid: observed.pid, processStartIdentity: ProcessStartIdentitySchema.make(observed.creationTime) },
       stop: job.retire("10 seconds").pipe(Effect.mapError(error => new OwnedChildRetirementFailed({ pid: observed.pid, message: error.message }))),
       exit: job.exit.pipe(Effect.mapError(error => new OwnedChildObservationFailed({ pid: observed.pid, message: error.message }))),
-      diagnosticTail: Ref.get(tail),
+      diagnosticTail: diagnostics.diagnosticTail,
       events: Stream.merge(receiveJsonLines(channel, DesktopChildEvent), Stream.fromEffect(Fiber.join(diagnosticReader)).pipe(
         Stream.drain, Stream.mapError(error => new JsonLineChannelFailed({ message: error.message })),
       )),

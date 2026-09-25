@@ -11,8 +11,8 @@ void magnitude_owned_close(magnitude_owned_process *owned) {
   memset(owned, 0, sizeof(*owned));
 }
 
-DWORD magnitude_owned_spawn(const WCHAR *executable, WCHAR *command_line, void *environment,
-    HANDLE input, HANDLE output, HANDLE error, magnitude_owned_process *result) {
+static DWORD spawn(const WCHAR *executable, WCHAR *command_line, void *environment,
+    const WCHAR *directory, DWORD creation_flags, BOOL contained, HANDLE input, HANDLE output, HANDLE error, magnitude_owned_process *result) {
   magnitude_owned_process owned = {0};
   STARTUPINFOEXW startup = {0};
   PROCESS_INFORMATION process = {0};
@@ -35,25 +35,28 @@ DWORD magnitude_owned_spawn(const WCHAR *executable, WCHAR *command_line, void *
     while (found < inherited_count && inherited[found] != standard[index]) ++found;
     if (found == inherited_count) inherited[inherited_count++] = standard[index];
   }
-  owned.job = CreateJobObjectW(NULL, NULL);
-  if (!owned.job) return GetLastError();
-  limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-  if (!SetInformationJobObject(owned.job, JobObjectExtendedLimitInformation, &limits, (DWORD)sizeof(limits)) ||
-      !SetHandleInformation(owned.job, HANDLE_FLAG_INHERIT, 0)) {
-    failure = GetLastError(); goto cleanup;
+  if (contained) {
+    owned.job = CreateJobObjectW(NULL, NULL);
+    if (!owned.job) return GetLastError();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(owned.job, JobObjectExtendedLimitInformation, &limits, (DWORD)sizeof(limits)) ||
+        !SetHandleInformation(owned.job, HANDLE_FLAG_INHERIT, 0)) {
+      failure = GetLastError(); goto cleanup;
+    }
   }
-  InitializeProcThreadAttributeList(NULL, 2, 0, &bytes);
+  DWORD attribute_count = contained ? 2 : 1;
+  InitializeProcThreadAttributeList(NULL, attribute_count, 0, &bytes);
   if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || !bytes) {
     failure = ERROR_INVALID_PARAMETER; goto cleanup;
   }
   startup.lpAttributeList = malloc(bytes);
   if (!startup.lpAttributeList) { failure = ERROR_NOT_ENOUGH_MEMORY; goto cleanup; }
-  if (!InitializeProcThreadAttributeList(startup.lpAttributeList, 2, 0, &bytes)) {
+  if (!InitializeProcThreadAttributeList(startup.lpAttributeList, attribute_count, 0, &bytes)) {
     failure = GetLastError(); goto cleanup;
   }
   attributes_initialized = TRUE;
-  if (!UpdateProcThreadAttribute(startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
-          &owned.job, sizeof(owned.job), NULL, NULL) ||
+  if ((contained && !UpdateProcThreadAttribute(startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+          &owned.job, sizeof(owned.job), NULL, NULL)) ||
       !UpdateProcThreadAttribute(startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
           inherited, inherited_count * sizeof(HANDLE), NULL, NULL)) {
     failure = GetLastError(); goto cleanup;
@@ -65,8 +68,8 @@ DWORD magnitude_owned_spawn(const WCHAR *executable, WCHAR *command_line, void *
   startup.StartupInfo.hStdError = error;
   /* Association occurs inside creation. No create-suspended/assign/resume orphan window. */
   if (!CreateProcessW(executable, command_line, NULL, NULL, TRUE,
-      EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-      environment, NULL, &startup.StartupInfo, &process)) {
+      EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | creation_flags,
+      environment, directory, &startup.StartupInfo, &process)) {
     failure = GetLastError(); goto cleanup;
   }
   owned.process = process.hProcess;
@@ -77,6 +80,27 @@ cleanup:
   free(startup.lpAttributeList);
   if (failure) magnitude_owned_close(&owned);
   else *result = owned;
+  return failure;
+}
+
+DWORD magnitude_owned_spawn(const WCHAR *executable, WCHAR *command_line, void *environment,
+    HANDLE input, HANDLE output, HANDLE error, magnitude_owned_process *result) {
+  return spawn(executable, command_line, environment, NULL, CREATE_NO_WINDOW, TRUE, input, output, error, result);
+}
+
+DWORD magnitude_owned_spawn_foreground(const WCHAR *executable, WCHAR *command_line,
+    const WCHAR *directory, HANDLE input, HANDLE output, HANDLE error, magnitude_owned_process *result) {
+  if (!directory || !*directory) return ERROR_INVALID_PARAMETER;
+  return spawn(executable, command_line, NULL, directory, 0, TRUE, input, output, error, result);
+}
+
+DWORD magnitude_unowned_spawn_foreground(const WCHAR *executable, WCHAR *command_line,
+    const WCHAR *directory, HANDLE input, HANDLE output, HANDLE error, HANDLE *process) {
+  if (!directory || !*directory || !process) return ERROR_INVALID_PARAMETER;
+  *process = NULL;
+  magnitude_owned_process child = {0};
+  DWORD failure = spawn(executable, command_line, NULL, directory, 0, FALSE, input, output, error, &child);
+  if (!failure) *process = child.process;
   return failure;
 }
 

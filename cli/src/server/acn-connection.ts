@@ -1,15 +1,17 @@
-import { desktopServiceOrigin, startDesktopApplication } from "./application"
+import { desktopApplication, desktopServiceOrigin } from "./application"
 import { FetchHttpClient } from "@effect/platform"
 import { MagnitudeClient } from "@magnitudedev/sdk"
 import { makeFirstPartyConnection } from "@magnitudedev/client-common"
-import { Effect, Layer } from "effect"
+import { Effect, Layer, Schema } from "effect"
+
+export class NoServiceRunning extends Schema.TaggedError<NoServiceRunning>()("NoServiceRunning", {}) {
+  override get message() { return "No Magnitude service is running. Open the Magnitude desktop app or run `magnitude serve`." }
+}
 
 /** Connection whose startup requires an already-usable service. */
-export const existingAcnConnection = makeFirstPartyConnection(
-  MagnitudeClient.layer({ origin: desktopServiceOrigin, autoStart: false }).pipe(Layer.provide(FetchHttpClient.layer)),
+export const existingAcnConnection = desktopApplication.observe.pipe(
+  Effect.catchTag("ApplicationControlUnavailable", () => Effect.fail(new NoServiceRunning())),
+  Effect.zipRight(makeFirstPartyConnection(
+    MagnitudeClient.layer({ origin: desktopServiceOrigin, autoStart: false }).pipe(Layer.provide(FetchHttpClient.layer)),
+  )),
 )
-
-/** A headless request may initially start the desktop in the background, never a separate daemon. */
-export const headlessAcnConnection = Effect.flatMap(startDesktopApplication, () => makeFirstPartyConnection(
-  MagnitudeClient.layer({ origin: desktopServiceOrigin, autoStart: false }).pipe(Layer.provide(FetchHttpClient.layer)),
-))

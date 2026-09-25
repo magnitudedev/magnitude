@@ -70,6 +70,61 @@ int wmain(void) {
   acl(update_directory, private_directory, TRUE);
   require(DeleteFileW(update_file) && RemoveDirectoryW(update_directory), "clean update permissions fixture");
 
+  BOOL retired = TRUE;
+  require(magnitude_recover_update_directory(update_directory, &retired) == ERROR_SUCCESS && !retired, "fresh update directory needs no recovery");
+  require(magnitude_recover_update_directory(update_directory, &retired) == ERROR_SUCCESS && !retired, "private update directory needs no recovery");
+  acl(update_directory, everyone, TRUE);
+  require(magnitude_recover_update_directory(update_directory, &retired) != ERROR_SUCCESS && !retired, "recovery refuses broad ACLs");
+  acl(update_directory, private_directory, TRUE);
+  require(RemoveDirectoryW(update_directory), "remove private fixture");
+  /* Model the user-owned cache independently of the runner's temporary ACL and
+   * elevated-token default owner. The child still inherits its actual ACL. */
+  WCHAR cache_parent[32768];
+  require(swprintf(cache_parent, 32768, L"%ls\\cache-parent", cwd) > 0, "cache parent path");
+  require(magnitude_prepare_private_directory(cache_parent) == ERROR_SUCCESS, "create cache fixture parent");
+  require(swprintf(update_directory, 32768, L"%ls\\updates", cache_parent) > 0, "inherited cache path");
+  require(swprintf(update_file, 32768, L"%ls\\key.pem", update_directory) > 0, "unknown cache path");
+  PSID cache_owner = NULL; BOOL owner_defaulted;
+  SECURITY_DESCRIPTOR inherited_descriptor;
+  require(GetSecurityDescriptorOwner(private_directory, &cache_owner, &owner_defaulted), "read fixture owner");
+  WCHAR *cache_sid = NULL, cache_sddl[512]; PSECURITY_DESCRIPTOR cache_acl = NULL;
+  require(ConvertSidToStringSidW(cache_owner, &cache_sid), "format cache owner");
+  require(swprintf(cache_sddl, 512, L"D:P(A;OICI;FA;;;%ls)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", cache_sid) > 0,
+    "format known cache permissions");
+  LocalFree(cache_sid);
+  require(ConvertStringSecurityDescriptorToSecurityDescriptorW(cache_sddl, SDDL_REVISION_1, &cache_acl, NULL),
+    "create known cache ACL");
+  acl(cache_parent, cache_acl, TRUE);
+  LocalFree(cache_acl);
+  require(InitializeSecurityDescriptor(&inherited_descriptor, SECURITY_DESCRIPTOR_REVISION) &&
+    SetSecurityDescriptorOwner(&inherited_descriptor, cache_owner, FALSE), "set inherited cache owner");
+  SECURITY_ATTRIBUTES inherited_attributes = { sizeof(inherited_attributes), &inherited_descriptor, FALSE };
+  require(CreateDirectoryW(update_directory, &inherited_attributes), "create inherited old cache");
+  HANDLE unknown = CreateFileW(update_file, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+  require(unknown != INVALID_HANDLE_VALUE, "create unknown cache entry"); CloseHandle(unknown);
+  require(magnitude_recover_update_directory(update_directory, &retired) != ERROR_SUCCESS && !retired, "unknown cache contents are preserved");
+  require(GetFileAttributesW(update_file) != INVALID_FILE_ATTRIBUTES, "unknown file survives refusal");
+  require(DeleteFileW(update_file), "remove unknown fixture");
+  require(swprintf(update_file, 32768, L"%ls\\update.json", update_directory) > 0, "old record path");
+  HANDLE record = CreateFileW(update_file, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+  require(record != INVALID_HANDLE_VALUE, "create old cache record"); CloseHandle(record);
+  DWORD recovery_error = magnitude_recover_update_directory(update_directory, &retired);
+  SetLastError(recovery_error);
+  require(recovery_error == ERROR_SUCCESS && retired, "retire inherited cache");
+  require(magnitude_prepare_private_directory(update_directory) == ERROR_SUCCESS, "replacement has private ACL");
+  require(GetFileAttributesW(update_file) == INVALID_FILE_ATTRIBUTES, "old cache record cannot authorize installation");
+  require(magnitude_recover_update_directory(update_directory, &retired) == ERROR_SUCCESS && !retired, "recovery is repeatable");
+  require(RemoveDirectoryW(update_directory), "remove fresh cache");
+  require(swprintf(update_link, 32768, L"%ls\\updates-retired-*", cache_parent) > 0, "retired directory pattern");
+  WIN32_FIND_DATAW found;
+  HANDLE search = FindFirstFileW(update_link, &found);
+  require(search != INVALID_HANDLE_VALUE, "old cache retained separately");
+  require(swprintf(update_directory, 32768, L"%ls\\%ls", cache_parent, found.cFileName) > 0, "retired path");
+  FindClose(search);
+  require(swprintf(update_file, 32768, L"%ls\\update.json", update_directory) > 0, "retired record path");
+  require(DeleteFileW(update_file) && RemoveDirectoryW(update_directory), "old cache contents preserved for explicit cleanup");
+  require(RemoveDirectoryW(cache_parent), "remove cache fixture parent");
+
   acl(lock_path, everyone, TRUE);
   rejects(lock_path, "reject broad file permissions");
   acl(lock_path, private_file, TRUE);

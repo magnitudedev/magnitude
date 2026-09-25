@@ -27,16 +27,18 @@ must be resolved explicitly; uninstall removes only registration owned by that i
 
 ## Headless control
 
-`magnitude update` and `magnitude update check` request a fresh check from the desktop owner.
+`magnitude update` and `magnitude update check` request a fresh check from the application owner.
 `magnitude update status` observes current update state without starting the application.
 `magnitude update download` explicitly admits a download of the selected offer. It acknowledges
 admission and directs the caller to status; download completion belongs to the owner.
-`magnitude update install` requires a prepared update and explicitly authorizes stopping the model
-and service, installing and restarting the application.
+`magnitude update install` requires a prepared update. Desktop may stop its model and service to
+install and restart; a running Headless owner refuses installation without stopping.
 
-Active update commands may ensure the desktop in the background, independently of inference
-readiness. They never open or focus its window. The CLI neither creates a polling timer, downloads
-a second release, invokes npm, nor independently replaces the service. Cancellation of a CLI connection does not cancel an admitted download.
+Update commands never launch Desktop. With no owner, status observes persisted preparation without
+creating state; finite check, download and discard retain maintenance ownership. A finite download
+waits for verified preparation and scratch cleanup. Only a running owner retains a polling timer.
+The CLI never updates separately from the application. Cancellation of a CLI connection does not
+cancel a download admitted by a running owner.
 
 Local application control carries the same typed update state as the renderer. A failed command
 returns a bounded product error. A check can wait for the bounded network result; other update

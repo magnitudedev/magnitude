@@ -11,7 +11,7 @@ const run = Effect.gen(function* () {
   const makensis = yield* Config.string("MAGNITUDE_INSTALLER_TEST_NSIS")
   const app = join(root, "fixture-app")
   yield* fs.makeDirectory(join(app, "resources"), { recursive: true })
-  for (const file of ["Magnitude.exe", "resources/magnitude.exe", "resources/magnitude-service.exe"]) {
+  for (const file of ["Magnitude.exe", "resources/magnitude.exe", "resources/magnitude-launcher.exe", "resources/magnitude-service.exe"]) {
     yield* fs.copyFile(join(root, "windows-installer-test.exe"), join(app, file))
   }
   yield* fs.copyFile(join(root, "MagnitudeInstallGuard.dll"), join(app, "resources/desktop-host.node"))

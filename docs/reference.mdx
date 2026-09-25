@@ -1,31 +1,31 @@
 ---
 title: "CLI reference"
-description: "Control the installed Magnitude app from your terminal."
+description: "Run Magnitude, manage models, and install updates from your terminal."
 ---
 
-The desktop app includes the `magnitude` CLI. Open the app once, then open a new terminal and run:
+The Magnitude installation includes the `magnitude` CLI. In a new terminal, run:
 
 ```sh
 magnitude --help
 ```
 
-Running `magnitude` without a subcommand prints help. Setup and model browsing are available in the desktop app; no npm installation is required.
+Running `magnitude` without a subcommand prints help. No npm installation is required.
+
+## Run Magnitude
+
+| Command | Purpose |
+| --- | --- |
+| `magnitude app open` | Show the desktop window. |
+| `magnitude serve` | Run the service in the foreground without opening Desktop. |
+| `magnitude status` | Check whether Magnitude is running and inspect service and model status. |
+
+Model, catalog, hardware, and connection setup commands require a running Desktop or `magnitude serve`.
+Stop a foreground server with Ctrl+C. Opening Desktop takes over from a foreground server.
+Only one Desktop or `serve` instance can run under the same user account. Fully quit Desktop or stop the existing `serve` command before starting another server. See [Remote server](/remote-server) for setup.
+
+Use **Launch at login** in Desktop Settings for login startup, and **Quit Magnitude** to stop Desktop.
 
 ## Find and download models
-
-```sh
-magnitude hardware
-magnitude catalog recommendations --preference balanced --limit 5
-magnitude catalog list
-```
-
-Copy the exact model ID from the output, then replace `MODEL_ID` below:
-
-```sh
-magnitude catalog show "MODEL_ID"
-magnitude catalog pull "MODEL_ID"
-magnitude models status "MODEL_ID"
-```
 
 Assessment and downloads run in the background. Use status commands to check progress.
 
@@ -58,30 +58,19 @@ Prefix each command with `magnitude`. Recommendation preferences are `fastest`, 
 
 Harness IDs: `pi`, `opencode`, `hermes`, `openclaw`, `codex`, `claude-code`, `oh-my-pi`, and `cline`. See [Integrations](/integrations/overview) for agent-specific instructions.
 
-## App and background service
-
-| Command | Purpose |
-| --- | --- |
-| `magnitude app open` | Show the desktop window. |
-| `magnitude service start` | Start the app in the background and wait for its service. |
-| `magnitude service status` | Inspect service and active-model status. |
-| `magnitude service stop` | Stop Magnitude without disabling launch at login. |
-| `magnitude service install` | Enable launch at login and start in the background. |
-| `magnitude service uninstall` | Disable launch at login and stop Magnitude. |
-
-`service uninstall` does **not** uninstall the desktop app or delete your models. The CLI controls the desktop-owned service; it is not a separate server installation.
-
 ## Updates
 
 | Command | Purpose |
 | --- | --- |
-| `magnitude update` or `magnitude update check` | Check for a newer desktop release. |
+| `magnitude update` or `magnitude update check` | Check for a newer Magnitude release. |
 | `magnitude update status` | Read update state without starting the app. |
-| `magnitude update download` | Start downloading the available update. |
-| `magnitude update install` | Install a prepared update and restart Magnitude. |
+| `magnitude update download` | Download the available update and wait until it is ready to install. |
+| `magnitude update install` | Install a prepared update; stop inference and restart Desktop if it was running. |
 | `magnitude update discard` | Remove a retained update download. |
 
-Downloading is asynchronous; check `magnitude update status` for progress. Installing stops the current model and service. These commands update the desktop, bundled service, and CLI together.
+These commands update Desktop, the server, and CLI together. Checking, downloading, inspecting, or discarding an update does not open Desktop.
+
+`update install` refuses to interrupt a running `serve` command. Stop the server first. Installation leaves a stopped server stopped; run `magnitude serve` afterward. A prepared update is also installed at the next startup unless an earlier installation attempt failed. Failed attempts require an explicit `update install` retry. Linux installation may require administrator authorization.
 
 ## Help
 

@@ -16,8 +16,8 @@ import { Console, Effect, Option, Schema } from "effect"
 import { dirname, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { buildLocalIcn } from "../inference/scripts/build-local"
-import { headlessAcnConnection } from "../cli/src/server/acn-connection"
-import { desktopServiceOrigin } from "../cli/src/server/application"
+import { existingAcnConnection } from "../cli/src/server/acn-connection"
+import { desktopServiceOrigin, startDesktopApplication } from "../cli/src/server/application"
 import { BunSqliteDriverLayer } from "@magnitudedev/daemon-management/bun"
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..")
@@ -110,7 +110,8 @@ const program = Effect.scoped(Effect.gen(function* () {
   yield* Command.make("bun", "run", "build").pipe(Command.workingDirectory(resolve(projectRoot, "desktop")), Command.exitCode,
     Effect.flatMap(code => code === 0 ? Effect.void : Effect.fail(new PiDevelopmentFailed({ message: "Could not build the development desktop" }))))
   yield* Console.log("Ensuring the Magnitude development app is running in the background...")
-  const acnConnection = yield* headlessAcnConnection
+  yield* startDesktopApplication
+  const acnConnection = yield* existingAcnConnection
   yield* acnConnection.startup.awaitReady.pipe(
     Effect.mapError((error) => new PiDevelopmentFailed({
       message: `Could not start the development Magnitude service: ${formatConnectionError(error)}`,

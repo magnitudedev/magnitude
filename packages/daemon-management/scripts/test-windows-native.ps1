@@ -20,12 +20,23 @@ try {
   & (Join-Path $testRoot 'windows-job-test.exe')
   if ($LASTEXITCODE -ne 0) { throw 'Native Windows containment acceptance failed.' }
   & cl.exe /nologo /W4 /WX /O2 /std:c11 /D_WIN32_WINNT=0x0A00 /D_CRT_SECURE_NO_WARNINGS `
+    (Join-Path $packageRoot 'native\windows-job.c') (Join-Path $packageRoot 'native\windows-cli-launcher.c') `
+    (Join-Path $packageRoot 'native\windows-cli-launcher-test.c') /Fe:windows-cli-launcher-test.exe
+  if ($LASTEXITCODE -ne 0) { throw 'Native Windows foreground launcher compilation failed.' }
+  & (Join-Path $testRoot 'windows-cli-launcher-test.exe')
+  if ($LASTEXITCODE -ne 0) { throw 'Native Windows foreground launcher acceptance failed.' }
+  & cl.exe /nologo /W4 /WX /O2 /std:c11 /D_WIN32_WINNT=0x0A00 /D_CRT_SECURE_NO_WARNINGS `
     (Join-Path $packageRoot 'native\windows-security.c') (Join-Path $packageRoot 'native\windows-pipe.c') (Join-Path $packageRoot 'native\windows-pipe-test.c') /Fe:windows-pipe-test.exe /link advapi32.lib
   if ($LASTEXITCODE -ne 0) { throw 'Native Windows pipe compilation failed.' }
   & (Join-Path $testRoot 'windows-pipe-test.exe')
   if ($LASTEXITCODE -ne 0) { throw 'Native Windows pipe acceptance failed.' }
   $addon = Join-Path $testRoot 'desktop-host.node'
   & (Join-Path $PSScriptRoot 'build-windows-native.ps1') -Headers $Headers -NodeLibrary $NodeLibrary -Output $addon
+  $updateDirectoryFixture = Join-Path $packageRoot 'src\desktop-native\fixtures\windows-update-directory.cjs'
+  & node $updateDirectoryFixture $addon
+  if ($LASTEXITCODE -ne 0) { throw 'Node update directory recovery acceptance failed.' }
+  & bun $updateDirectoryFixture $addon
+  if ($LASTEXITCODE -ne 0) { throw 'Bun update directory recovery acceptance failed.' }
   $embeddedFixture = Join-Path $testRoot 'windows-embedded.cjs'
   Copy-Item (Join-Path $packageRoot 'src\desktop-native\fixtures\windows-embedded.cjs') $embeddedFixture
   $embeddedExecutable = Join-Path $testRoot 'embedded-native.exe'

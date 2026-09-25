@@ -12,10 +12,13 @@ EXPORTS
   RollbackReplacement=_RollbackReplacement@0
   FinishReplacement=_FinishReplacement@4
   RecoverReplacement=_RecoverReplacement@8
+  RetirePreviousForRemoval=_RetirePreviousForRemoval@0
   AcquireRemovalExecutable=_AcquireRemovalExecutable@4
   RemovePayload=_RemovePayload@8
   RemoveOwnedStartup=_RemoveOwnedStartup@4
   RemoveRegistration=_RemoveRegistration@4
   RemoveRemovalExecutable=_RemoveRemovalExecutable@0
+  RemoveCliLauncher=_RemoveCliLauncher@4
+  InstallCliLauncher=_InstallCliLauncher@8
   ConfigureCliPath=_ConfigureCliPath@12
-  RemovePreviousCliCommands=_RemovePreviousCliCommands@12
+  RemovePreviousCliCommands=_RemovePreviousCliCommands@16

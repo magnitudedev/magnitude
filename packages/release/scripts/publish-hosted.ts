@@ -1,12 +1,12 @@
 import { FileSystem, FetchHttpClient } from "@effect/platform"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
-import { Config, Effect, Option, Redacted, Runtime } from "effect"
+import { Config, Effect, Option, Redacted, Runtime, Schema } from "effect"
 import { createPublicKey } from "node:crypto"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { Pool } from "pg"
 import { acquireRelease } from "../src/acquisition"
-import { decodePublisherPrivateKey, decodePublisherPublicKey, PublisherKeyId } from "../src/hosted-update/manifest"
+import { decodePublisherPrivateKey, decodePublisherPublicKey, PublisherKeyId, PublishedUpdate } from "../src/hosted-update/manifest"
 import { hostedDesktopManifests, HostedCandidateInvalid } from "../src/hosted-update/release-candidate"
 import { verifyGithubRelease } from "../src/hosted-update/github-release"
 import { postgresReleasePublicationStore } from "../src/hosted-update/postgres-publication"
@@ -39,6 +39,9 @@ const run = Effect.scoped(Effect.gen(function* () {
   }, catch: () => new ReleasePublicationFailed({ stage: "database" }) }), pool => Effect.promise(() => pool.end()))
   const envelopes = yield* publishHostedRelease({ artifacts: manifests, keyId: PublisherKeyId.make("magnitude-2026-01"), privateKey,
   }).pipe(Effect.provideService(ReleasePublicationStore, postgresReleasePublicationStore(pool, "magnitude_distribution", new Map([["magnitude-2026-01", publicKey]]))))
+  const installationRecords = yield* Config.option(Config.string("MAGNITUDE_INSTALL_PUBLICATIONS_OUTPUT"))
+  if (Option.isSome(installationRecords)) yield* fs.writeFileString(installationRecords.value,
+    yield* Schema.encode(Schema.parseJson(Schema.Array(PublishedUpdate)))(envelopes))
   yield* Effect.logInfo("Accepted desktop release published to Magnitude", { version, artifacts: envelopes.length })
 }))
 BunRuntime.runMain(run.pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer])))

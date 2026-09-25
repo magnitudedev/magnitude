@@ -26,8 +26,9 @@ const run = Effect.gen(function* () {
   ))({ platform: process.platform, arch: process.arch })
   const output = resolve(yield* Config.string("MAGNITUDE_ACCEPTANCE_OUTPUT"))
   yield* fs.makeDirectory(output, { recursive: true })
-  const configPath = join(output, "update-acceptance.json")
-  yield* fs.writeFileString(configPath, yield* Schema.encode(Schema.parseJson(Schema.Struct({ origin: Schema.String, keyId: Schema.String, publicKey: Schema.String,
+  const suppliedConfiguration = yield* Config.option(Config.string("MAGNITUDE_ACCEPTANCE_CONFIG"))
+  const configPath = Option.getOrElse(suppliedConfiguration, () => join(output, "update-acceptance.json"))
+  if (Option.isNone(suppliedConfiguration)) yield* fs.writeFileString(configPath, yield* Schema.encode(Schema.parseJson(Schema.Struct({ origin: Schema.String, keyId: Schema.String, publicKey: Schema.String,
     windowsPublisher: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
   })) )({
     origin: "https://magnitude-update-acceptance.vercel.app",
@@ -45,7 +46,8 @@ const run = Effect.gen(function* () {
     yield* command([process.execPath, "run", "build"], join(root, "desktop"))
     const bunTarget = `bun-${target.platform === "win32" ? "windows" : target.platform}-${target.arch}`
     const service = yield* Effect.tryPromise({ try: () => buildAcnBinary(bunTarget), catch: () => new AcceptanceBuildFailed({ message: "Service compilation failed" }) })
-    const cli = yield* Effect.tryPromise({ try: () => buildCliBinary(bunTarget), catch: () => new AcceptanceBuildFailed({ message: "CLI compilation failed" }) })
+    const bootstrapTrust = yield* Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ publicKey: Schema.String })))(yield* fs.readFileString(configPath))
+    const cli = yield* Effect.tryPromise({ try: () => buildCliBinary(bunTarget, bootstrapTrust.publicKey), catch: () => new AcceptanceBuildFailed({ message: "CLI compilation failed" }) })
     const release = yield* Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ revision: Schema.Number })))(yield* fs.readFileString(join(root, "packages/release/release-plan.json")))
     const apps = yield* buildDesktopApplication({ service, cli, version, revision: release.revision, outputDirectory: join(output, "application") })
     const app = target.platform === "darwin" ? join(apps[0]!, "Magnitude.app") : apps[0]!
@@ -57,11 +59,14 @@ const run = Effect.gen(function* () {
     if (cliVersion.trim() !== version) return yield* new AcceptanceBuildFailed({ message: "Application and bundled CLI versions differ" })
     if (target.platform === "darwin") {
       // Separate Launch Services identity; the executable, service and native installation path are real.
-      yield* command(["/usr/libexec/PlistBuddy", "-c", "Set :CFBundleIdentifier dev.magnitude.desktop.update-acceptance", join(app, "Contents/Info.plist")])
+      const standardIdentity = yield* Config.boolean("MAGNITUDE_ACCEPTANCE_STANDARD_BUNDLE_ID").pipe(Config.withDefault(false))
+      if (!standardIdentity) yield* command(["/usr/libexec/PlistBuddy", "-c", "Set :CFBundleIdentifier dev.magnitude.desktop.update-acceptance", join(app, "Contents/Info.plist")])
       yield* buildDesktopDmg({ app, output: join(output, "artifacts"), host: "darwin-arm64" })
     } else if (target.platform === "win32") {
       const thumbprint = yield* Config.string("MAGNITUDE_ACCEPTANCE_WINDOWS_CERTIFICATE")
-      const sign = (path: string) => command(["pwsh", "-NoProfile", "-File", join(root, "packages/release/scripts/acceptance/sign-windows.ps1"), "-Path", path, "-Thumbprint", thumbprint])
+      const timestamp = yield* Config.option(Config.string("MAGNITUDE_ACCEPTANCE_TIMESTAMP_SERVER"))
+      const sign = (path: string) => command(["pwsh", "-NoProfile", "-File", join(root, "packages/release/scripts/acceptance/sign-windows.ps1"), "-Path", path, "-Thumbprint", thumbprint,
+        ...Option.match(timestamp, { onNone: () => [] as string[], onSome: server => ["-TimestampServer", server] })])
       yield* sign(app)
       // Signing must preserve the compiled runtime as well as the publisher identity.
       for (const [executable, argument] of [[`magnitude${extension}`, "--version"], [`${ACN_EXECUTABLE_NAME}${extension}`, "version"]]) {

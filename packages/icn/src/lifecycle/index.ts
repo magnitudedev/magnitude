@@ -483,7 +483,10 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
         pid: Number(process.pid),
         code,
         output: diagnostic,
-      })))
+      }))),
+      Effect.tapErrorTag("IcnExitedBeforeReady", error => error.output.trim()
+        ? Effect.logError("Inference process exited before readiness", error.output)
+        : Effect.void),
     );
     const startupResult = yield* Effect.raceFirst(
       Deferred.await(startupRecord),

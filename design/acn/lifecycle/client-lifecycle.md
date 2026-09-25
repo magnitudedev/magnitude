@@ -31,16 +31,11 @@ Every probe observes a usable service, ready or still starting, or an unusable o
 undecodable, or the wrong protocol. An unusable service may invoke an injected
 `MagnitudeServiceStarter`. The SDK invokes it at most once per admission occurrence, observes
 progress, then verifies public readiness; after it has run, only a transient absence is tolerated
-and any other answer is final. The host starter ensures the desktop application in the background; it never replaces a daemon independently. The plugin asks the installed CLI. An already-starting service is observed without
-invoking another starter. Connect-only clients omit that capability and fail with the typed error.
-The default absolute admission deadline is ten minutes, including starter execution and health
-waiting. Each health request has a two-second bound.
-
-The CLI starter requires only the abstract Effect Platform CommandExecutor. It runs argv
-`magnitude service start`, drains human output, retains bounded stderr for errors, and owns the
-command's cancellation. It neither uses a shell string nor parses a model-control JSON protocol.
-Missing executable, failed command, unavailable service, malformed health, and protocol mismatch
-remain distinguishable failures.
+and any other answer is final. An already-starting service is observed without invoking another
+starter. CLI and plugin clients are connect-only: they omit startup authority and report unavailable
+services without launching an application or subprocess. Malformed health and protocol mismatch
+remain distinguishable failures. The default absolute admission deadline is ten minutes, including
+starter execution and health waiting. Each health request has a two-second bound.
 
 Privileged first-party hosts can supply a direct starter backed by private daemon-management.
 That package owns native desktop discovery/control, exact child supervision,

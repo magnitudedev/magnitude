@@ -15,8 +15,13 @@ import { unixPrivateFilePermissions } from "./private-files"
 
 vi.mock("node:child_process", () => ({ spawn: vi.fn() }))
 afterEach(() => { vi.unstubAllGlobals(); vi.clearAllMocks() })
-const request = (directory: string): LinuxUpdateHandoffRequest => ({ stateDirectory: join(directory, "state"), dataDirectory: directory, showWindow: false,
+const request = (directory: string): LinuxUpdateHandoffRequest => ({ stateDirectory: join(directory, "state"), dataDirectory: directory, continuation: { _tag: "Desktop", showWindow: false },
   release: { version: "2.0.0", bytes: 1, sha256: "a".repeat(64), signature: "A".repeat(86) + "==" } })
+
+it("leaves caller continuation to the invoking command without launching Desktop", async () => {
+  await Effect.runPromise(relaunchLinuxAfterUpdate({ ...request("/tmp/unused"), continuation: { _tag: "Caller" } }))
+  expect(spawn).not.toHaveBeenCalled()
+})
 
 describe("Linux update handoff", () => {
   it("keeps the lifetime pipe open after handing off install intent", async () => {

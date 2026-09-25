@@ -11,8 +11,32 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
-static void retire(void) { kill(-getpid(), SIGKILL); _exit(91); }
+static void retire(void) {
+#ifdef __linux__
+  /* Package tools may form new groups. Retain orphaned descendants until every child is reaped. */
+  for (;;) {
+    char path[96];
+    snprintf(path, sizeof(path), "/proc/self/task/%ld/children", (long)getpid());
+    FILE *children = fopen(path, "r");
+    if (children) {
+      long pid;
+      while (fscanf(children, "%ld", &pid) == 1) if (pid > 0) kill((pid_t)pid, SIGKILL);
+      fclose(children);
+    }
+    int status;
+    pid_t child;
+    do { child = waitpid(-1, &status, WNOHANG); } while (child > 0);
+    if (child < 0 && errno == ECHILD) _exit(91);
+    poll(NULL, 0, 10);
+  }
+#else
+  kill(-getpid(), SIGKILL); _exit(91);
+#endif
+}
 static int channel(int fd) {
   struct stat status;
   return fstat(fd, &status) == 0 && (S_ISFIFO(status.st_mode) || S_ISSOCK(status.st_mode));
@@ -29,6 +53,9 @@ static void parent_check(int timeout) {
 }
 int main(int argc, char **argv) {
   if (argc < 2 || getpid() != getpgrp() || !channel(3) || !channel(4)) return 125;
+#ifdef __linux__
+  if (prctl(PR_SET_CHILD_SUBREAPER, 1) != 0) return 125;
+#endif
   parent_check(0);
   pid_t child = fork();
   if (child < 0) return 125;

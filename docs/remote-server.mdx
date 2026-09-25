@@ -1,0 +1,116 @@
+---
+title: "Remote server"
+description: "Run models on a dedicated machine and use them from another computer."
+---
+
+Use a machine such as a Mac Studio or DGX Spark for inference while your agent runs on your laptop. The server needs to be reachable from your laptop, through your local network or a private network such as Tailscale.
+
+## Install on the server
+
+Install Magnitude for [macOS](/installation/macos), [Linux](/installation/linux), or [Windows](/installation/windows). The package includes the `magnitude` CLI. Run the commands below on the server, using SSH if needed.
+
+On macOS, if the command is not registered in your shell, use `/Applications/Magnitude.app/Contents/Resources/magnitude` in place of `magnitude`.
+
+## Configure network access
+
+Edit `~/.magnitude/config.json`, or `%USERPROFILE%\.magnitude\config.json` on Windows. Create the directory and file if they do not exist. Add this `network` object, keeping any other settings:
+
+```json
+{
+  "network": {
+    "enabled": true,
+    "bind": "SERVER_IP",
+    "apiKey": "YOUR_SECRET_KEY",
+    "requireApiKey": true
+  }
+}
+```
+
+Replace `SERVER_IP` with the server's local-network or Tailscale IP address. Replace `YOUR_SECRET_KEY` with a long, randomly generated secret. Use the same key on your laptop. Settings apply when Magnitude starts.
+
+For Desktop Settings, other addresses, or an SSH tunnel that does not require Network access, see [Network access](/api/network-access).
+
+## Start Magnitude and download a model
+
+Fully quit Magnitude Desktop if it is running, then start the server:
+
+```sh
+magnitude serve
+```
+
+Keep this terminal open. In another terminal on the server:
+
+```sh
+magnitude status
+magnitude hardware
+magnitude catalog recommendations --preference balanced --limit 5
+```
+
+If recommendations are not ready, run `magnitude catalog status` to check preparation, then request recommendations again. Copy a model ID from the output and download it:
+
+```sh
+magnitude catalog pull "MODEL_ID"
+magnitude models status "MODEL_ID"
+```
+
+Check status until the download finishes. Magnitude loads the model on the first inference request. To load it ahead of time, run `magnitude models load "MODEL_ID"`.
+
+## Connect from your laptop
+
+Use these settings in your agent or app:
+
+| Setting | Value |
+| --- | --- |
+| OpenAI-compatible base URL | `http://SERVER_IP:10100/inference/v1` |
+| API key | The key you saved on the server |
+| Model | The exact model ID you downloaded |
+
+Use your agent's [configuration instructions](/api/network-access#configure-the-app-or-agent), then [check the connection](/api/network-access#check-the-connection) from your laptop. Run model-management commands on the server.
+
+## Keep the server running
+
+`magnitude serve` runs in the foreground. Ctrl+C stops it. An SSH terminal is not a persistent service; use a service manager to keep serving after disconnecting or restarting the machine.
+
+Opening Magnitude Desktop stops the foreground server and takes over serving.
+
+### Linux: systemd
+
+Create the user-service directory with `mkdir -p ~/.config/systemd/user`, then save this as `~/.config/systemd/user/magnitude-headless.service`:
+
+```ini
+[Unit]
+Description=Magnitude headless server
+
+[Service]
+ExecStart=/usr/bin/magnitude serve
+Restart=on-failure
+RestartSec=1
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
+```
+
+Stop any `magnitude serve` command you started manually, then enable the service:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now magnitude-headless.service
+```
+
+For startup before login and operation after logout, enable lingering for your account with
+`loginctl enable-linger "$USER"`; your system may require administrator authorization.
+Use `journalctl --user -u magnitude-headless.service` for logs and
+`systemctl --user stop magnitude-headless.service` to stop it. `Restart=on-failure` recovers from
+a crash without restarting after a successful transfer to the desktop.
+
+### macOS and Windows
+
+For operation while signed in, you can use Desktop with **Launch at login** enabled and close its window. Desktop's **Launch at login** does not start a headless server.
+
+## Update the server
+
+Magnitude can download updates while serving. It never stops a running headless server to install them. When an update is prepared, stop the server and start it again to apply the update before serving.
+
+For manual installation or a failed update, see [CLI reference](/reference#updates). For a systemd service, stop its unit before installation and start the unit afterward.

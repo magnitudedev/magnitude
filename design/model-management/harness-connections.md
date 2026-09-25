@@ -263,14 +263,14 @@ cannot erase completed transcript entries. Cancellation and failure do not appen
 cleanup restores Pi's default working message and prevents late events from appending to another session.
 
 The extension bundles the private SDK and owns one SDK scope, inference observer, and live-row timer.
-Model commands use existing RPC; the injected SDK starter runs `magnitude service start` when needed.
+Model commands use existing RPC against an already-running service and never start the application.
 The SDK checks the exact RPC version and instance identity. Development connections use their
 explicitly injected package source and retain content-integrity and package-ownership checks.
 User-owned packages are not replaced or removed. The retained extension's protocol-mismatch sync
 uses that explicit development source; normal desktop connections do not repair or upgrade an
 extension. The SDK itself does not own plugin repair or CLI upgrades.
 
-The extension owns the starter and sync commands' scoped lifetimes. Disposing it cancels
+The extension owns its connection and sync commands' scoped lifetimes. Disposing it cancels
 pending work; terminal request handles and older runs cannot mutate newer presentation. Presentation
 failures do not prevent inference. Installed Magnitude models are selected through Pi's native
 `/model` selector; inference requests load the selected model on demand. The extension does not
@@ -293,8 +293,9 @@ including after reload. Changing Pi's agent directory alone does not isolate sha
 It builds the extension and runs the checkout's inference runtime and suppresses successful
 native-build diagnostics while preserving complete failure diagnostics. It inherits the caller's
 environment but does not start a telemetry collector or enable tracing itself.
-The development launcher uses the same background desktop admission as the headless CLI. The
-desktop owns its service and inference tree independently of the Pi session. Exiting Pi closes
+The development launcher explicitly ensures its development Desktop before constructing the
+connect-only client. Ordinary CLI and plugin operations cannot launch Desktop. The desktop owns
+its service and inference tree independently of the Pi session. Exiting Pi closes
 Pi's scoped process and temporary connection resources; it does not stop or replace a separately
 owned installed daemon or reconstruct a previous daemon state.
 

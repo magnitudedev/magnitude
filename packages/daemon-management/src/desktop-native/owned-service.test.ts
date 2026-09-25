@@ -25,7 +25,7 @@ const setup = Effect.gen(function* () {
       stop: Ref.update(stops, value => value + 1),
     }
   }) })
-  const service = yield* makeOwnedService({ executable: "test", arguments: [], environment: {} }, 1).pipe(Effect.provideService(OwnedChildSpawner, spawner))
+  const service = yield* makeOwnedService({ output: "DiagnosticTail" as const, executable: "test", arguments: [], environment: {} }, 1).pipe(Effect.provideService(OwnedChildSpawner, spawner))
   return { service, events, exit, commands, launches, stops }
 })
 const run = <A, E>(effect: Effect.Effect<A, E, import("effect").Scope.Scope>) => Effect.runPromise(Effect.scoped(effect).pipe(Effect.provide(TestContext.TestContext)))
@@ -41,7 +41,7 @@ describe("desktop-owned service supervision", () => {
         diagnosticTail: Effect.succeed("private child stack trace"),
         send: () => Effect.void, stop: Effect.void,
       }) })
-      const service = yield* makeOwnedService({ executable: "test", arguments: [], environment: {} }, 1).pipe(
+      const service = yield* makeOwnedService({ output: "DiagnosticTail" as const, executable: "test", arguments: [], environment: {} }, 1).pipe(
         Effect.provideService(OwnedChildSpawner, spawner),
       )
       yield* TestClock.adjust("8 seconds")
@@ -69,7 +69,7 @@ describe("desktop-owned service supervision", () => {
         ) : Effect.void,
       }
     }) })
-    const service = yield* makeOwnedService({ executable: "test", arguments: [], environment: {} }, 1).pipe(
+    const service = yield* makeOwnedService({ output: "DiagnosticTail" as const, executable: "test", arguments: [], environment: {} }, 1).pipe(
       Effect.provideService(OwnedChildSpawner, spawner),
     )
     yield* TestClock.adjust("8 seconds")

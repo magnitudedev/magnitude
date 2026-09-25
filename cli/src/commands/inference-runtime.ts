@@ -23,7 +23,7 @@ import {
   type ModelId,
 } from "@magnitudedev/sdk"
 import { Data, Effect, Option, Schema } from "effect"
-import { headlessAcnConnection } from "../server/acn-connection"
+import { existingAcnConnection } from "../server/acn-connection"
 import {
   describeLocalHardware,
   formatContext,
@@ -43,7 +43,7 @@ class ModelCommandError extends Data.TaggedError("ModelCommandError")<{
 
 const withClient = <A>(use: (client: CliModelsClient) => Effect.Effect<A, unknown>) =>
   Effect.scoped(Effect.gen(function* () {
-    const connection = yield* headlessAcnConnection
+    const connection = yield* existingAcnConnection
     return yield* use(connection.client)
   }))
 

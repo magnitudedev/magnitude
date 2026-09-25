@@ -11,7 +11,7 @@ On the same computer, `ADDRESS` is `127.0.0.1` and no API key is needed. Send an
 
 ## From another device
 
-The user turns on Network access in Magnitude Settings. That setting shows the address to use and an API key. Send the key as `Authorization: Bearer KEY` or `x-api-key: KEY`. Only inference is available from other devices; model management and `/rpc` are not.
+Enable Network access in Magnitude Settings, or set `network.enabled`, `network.bind`, and `network.apiKey` in `~/.magnitude/config.json` on the server. Use an IP address assigned to the server and a long, randomly generated key. Restart Magnitude after changes. The address can be on a local network or a private network such as Tailscale. Send the key as `Authorization: Bearer KEY` or `x-api-key: KEY`. Only inference is available from other devices; model management and `/rpc` are not.
 
 Check the connection:
 
@@ -24,6 +24,34 @@ curl -H "Authorization: Bearer KEY" http://ADDRESS:10100/inference/v1/models
 | Connection refused | Network access is off, or the chosen address does not include this network. |
 | 401 | Missing or changed API key. |
 | 421 | Hostname not accepted. Use an IP address, or the user adds the name to `network.allowedHosts` in `~/.magnitude/config.json`. |
+
+## Remote inference server
+
+On the remote computer, run `magnitude serve` and leave that terminal running. Use another SSH
+session for commands such as `magnitude models status` and `magnitude models load <model-id>`.
+
+For direct access, enable Network access and use the server address and API key in your client. To connect through SSH without enabling Network access, open a tunnel on your own computer:
+
+```sh
+ssh -N -L 10101:127.0.0.1:10100 user@server
+```
+
+Keep the tunnel running and use `http://127.0.0.1:10101/inference/v1` locally. No Magnitude API key
+is needed through this loopback tunnel. Model management commands still run on the remote computer.
+Ctrl+C stops the foreground server. Opening Magnitude Desktop on that computer transfers ownership
+to Desktop and ends the foreground command.
+
+An available update never interrupts the server. When it reports a prepared update, stop the server
+and run `magnitude serve` again to install it before serving. On Linux, installation can remain
+deferred when system authorization is unavailable. Stop the server and run `magnitude update install`
+from a terminal to authorize installation or explicitly retry a failed attempt, then start it again.
+
+When using a service manager, configure restart on failure rather than unconditional restart:
+successful Desktop takeover ends `serve` normally and should leave it stopped. For a systemd user
+service, use `Restart=on-failure` and `KillMode=control-group`. Enable user lingering if the server
+must run before login or after logout. A foreground SSH session is not a persistent service;
+disconnecting it stops its process tree. Stop the service-manager unit before an explicit update
+installation, then start the unit afterward.
 
 ## WSL
 

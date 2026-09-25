@@ -3,6 +3,12 @@ import { DesktopUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { renderApplicationUpdate } from "./update-runtime"
 const state = (transfer: DesktopUpdateState["transfer"], check: DesktopUpdateState["check"] = { _tag: "Succeeded", at: 1 }) => DesktopUpdateState.make({ transfer, check, preference: { _tag: "Known", autoDownload: false } })
 describe("headless application update output", () => {
+  it("gives owner-specific installation instructions without suggesting a live server restart", () => {
+    const ready = state({ _tag: "Ready", version: "2.0.0" })
+    expect(renderApplicationUpdate(ready, "Headless")).toBe("Magnitude 2.0.0 is ready to install.\nStop the server, then run: magnitude serve\n")
+    expect(renderApplicationUpdate(ready, "None")).toBe("Magnitude 2.0.0 is ready to install.\nInstall: magnitude update install\n")
+    expect(renderApplicationUpdate(ready, "Desktop")).toContain("Install and restart: magnitude update install")
+  })
   it("distinguishes available, downloading and prepared updates with exact next commands", () => {
     expect(renderApplicationUpdate(state({ _tag: "Available", version: "2.0.0", bytes: 17800000000 }))).toContain("17.8 GB")
     expect(renderApplicationUpdate(state({ _tag: "Available", version: "2.0.0", bytes: 100 }))).toContain("magnitude update download")

@@ -3,23 +3,27 @@ title: "Troubleshooting"
 description: "Find the problem and take the next useful action."
 ---
 
-Start with **Status** in Magnitude. It distinguishes service startup from model loading and downloads.
+Start with **Status** in Desktop or `magnitude status` in a terminal. It distinguishes service startup from model loading and downloads.
 
 ## The service won't start
 
-Read the error on Status and use **Retry service** when offered. If it reports an occupied port, close the application using that port before retrying. Do not start another standalone Magnitude daemon.
+Read the error on Status and use **Retry service** when offered. If it reports an occupied port, close the application using that port before retrying. For a headless server, read the error printed by `magnitude serve`.
 
 For terminal diagnostics:
 
 ```sh
-magnitude service status
+magnitude status
 ```
+
+## Another Magnitude instance is running
+
+Fully quit Desktop before starting `magnitude serve`. Closing its window can leave it running. If another `serve` command is running, stop that command before starting another.
 
 ## Magnitude command not found
 
-Open the desktop app once, then open a **new terminal** and run `magnitude --help`.
+Open a **new terminal** and run `magnitude --help`.
 
-- **macOS:** the app registers its CLI through `~/.magnitude/bin` and supported shell startup files.
+- **macOS:** open Desktop once to register the CLI in your shell. Without a graphical session, run `/Applications/Magnitude.app/Contents/Resources/magnitude` directly.
 - **Windows:** the installer updates your user PATH; existing terminals may retain the old PATH. Rerun the installer if command registration failed.
 - **Linux:** install the desktop package through your package manager; it owns `/usr/bin/magnitude`.
 
@@ -61,7 +65,7 @@ See your [integration guide](/integrations/overview) for specific model-selectio
 
 ## My agent runs in WSL, a container, or on another computer
 
-Connections cannot detect or configure agents there. Configure the agent by hand with the base URL and API key from **Settings → Network access**; see [Other devices](/api/other-devices). If the connection is refused, network access is off or the chosen address does not include that network. A `401` means the key is missing or changed. A `421 Invalid Host header` means the request used a hostname Magnitude does not accept; see [Other devices](/api/other-devices#troubleshooting).
+Connections cannot configure agents there. Use the server's base URL and API key in the agent's configuration. See [Network access](/api/network-access) for connection options and errors, or [Windows and WSL](/api/windows-wsl) for WSL networking.
 
 ## My models disappeared after changing the model folder
 
@@ -73,9 +77,13 @@ Open **Settings → Application updates** and read the error. Use **Retry update
 
 On Linux, installation may require package-manager authorization. Do not quit the installer while it is replacing the app.
 
+## Windows cannot save an update
+
+Versions 0.1.4 and 0.1.5 can fail with “The downloaded update could not be saved.” Install a newer version containing the fix using its Windows installer. The affected versions cannot install the fix through their updater. Deleting the updates folder does not repair it; keep your models and settings.
+
 ## There's no tray icon
 
-Some Linux desktops do not provide a supported tray host. Open Magnitude from the applications menu. You can stop it with **Quit Magnitude** or `magnitude service stop`.
+Some Linux desktops do not provide a supported tray host. Open Magnitude from the applications menu. You can stop it with **Quit Magnitude**.
 
 ## Responses are slower than expected
 

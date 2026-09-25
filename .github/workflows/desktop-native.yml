@@ -26,19 +26,140 @@ on:
       - "bun.lock"
       - "packages/release/scripts/build/cli.ts"
       - "packages/release/scripts/build/desktop*.ts"
+      - "packages/release/scripts/build/installation-*.ts"
+      - "packages/release/scripts/acceptance/**"
       - "packages/release/resources/linux/**"
+      - "packages/release/resources/install.*"
+      - "packages/release/src/hosted-update/**"
+      - "packages/release/src/client-update/**"
       - "packages/release/src/executables.ts"
       - "packages/release/package.json"
       - "packages/daemon-management/scripts/*.ps1"
       - "packages/daemon-management/src/desktop-native/fixtures/windows-*"
       - ".github/workflows/desktop-native.yml"
   workflow_dispatch:
+    inputs:
+      signed_mac_installer:
+        description: Exercise the custom installer with signed and notarized disposable macOS apps
+        type: boolean
+        default: false
+      signed_windows_installer:
+        description: Exercise Windows packaged startup updates with a disposable test publisher
+        type: boolean
+        default: false
   workflow_call:
 
 permissions:
   contents: read
 
 jobs:
+  macos-update-primitives:
+    runs-on: blacksmith-12vcpu-macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+      - name: Exercise isolated exchange, recovery and foreground continuation
+        run: |
+          cc -std=c11 -D_DARWIN_C_SOURCE -Wall -Wextra -Werror -O2 \
+            -mmacosx-version-min=13.0 \
+            packages/daemon-management/native/test/mac-update-primitives.c \
+            -o "$RUNNER_TEMP/mac-update-primitives"
+          "$RUNNER_TEMP/mac-update-primitives"
+      - name: Exercise private archive extraction and metadata preservation
+        run: |
+          cc -std=c11 -D_DARWIN_C_SOURCE -Wall -Wextra -Werror -O2 \
+            -mmacosx-version-min=13.0 \
+            packages/daemon-management/native/mac-update-extract.c -larchive \
+            -o "$RUNNER_TEMP/mac-update-extract"
+          python3 packages/daemon-management/native/test/mac-update-extract.py "$RUNNER_TEMP/mac-update-extract"
+      - name: Build native bundle verification
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          bun packages/version/scripts/generate-version.ts
+          bun packages/daemon-management/scripts/build-native.ts
+      - name: Check full-install script generation
+        working-directory: packages/release
+        run: bunx --bun vitest run scripts/build/installation-scripts.test.ts scripts/build/installation-distribution.test.ts
+      - name: Exercise sealed bundle and nested signature verification
+        working-directory: packages/daemon-management
+        run: >-
+          bunx --bun vitest run
+          src/desktop-native/mac-update-*.test.ts
+          src/desktop-native/mac-installer-helper.test.ts
+          src/desktop-native/mac-headless-installation-admission.test.ts
+          src/desktop-native/unix-continuation.test.ts
+          src/desktop-native/guarded-command.test.ts
+          src/application-update/mac-*.test.ts
+
+  macos-signed-installer:
+    if: github.event_name == 'workflow_dispatch' && inputs.signed_mac_installer
+    needs: macos-update-primitives
+    environment: apple-release
+    runs-on: blacksmith-12vcpu-macos-15
+    timeout-minutes: 90
+    env:
+      MAGNITUDE_APPLE_DISTRIBUTION: developer-id
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+      - run: |
+          bun install --frozen-lockfile --ignore-scripts
+          bun packages/version/scripts/generate-version.ts
+      - name: Import Apple signing credentials
+        run: bash packages/release/scripts/apple/credentials.sh
+        env:
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_NOTARY_API_KEY_P8: ${{ secrets.APPLE_NOTARY_API_KEY_P8 }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+      - name: Exercise signed private-helper installation and native publisher acceptance
+        env:
+          MAGNITUDE_HEADLESS_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/magnitude-headless-signed
+          MAGNITUDE_ACCEPTANCE_ICN_VERSION: "0.1.5"
+          MAGNITUDE_ACCEPTANCE_CPU_ONLY: "true"
+        shell: bash
+        run: |
+          set -o pipefail
+          bun packages/release/scripts/acceptance/test-mac-headless-installer.ts 2>&1 | tee "$RUNNER_TEMP/mac-headless-installer.log"
+          test -s "$MAGNITUDE_HEADLESS_ACCEPTANCE_OUTPUT/result.json"
+      - name: Retain signed fixtures and verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-headless-installer-evidence
+          path: |
+            ${{ runner.temp }}/mac-headless-installer.log
+            ${{ runner.temp }}/magnitude-headless-signed/result.json
+            ${{ runner.temp }}/magnitude-headless-signed/configuration.json
+            ${{ runner.temp }}/magnitude-headless-signed/*/release.json
+            ${{ runner.temp }}/magnitude-headless-signed/script-hosting/install/**/*.json
+            ${{ runner.temp }}/magnitude-headless-signed/script-hosting/mac-script-result.txt
+            ${{ runner.temp }}/magnitude-headless-signed/script-hosting/mac-script-evidence.*/*.log
+            ${{ runner.temp }}/magnitude-headless-signed/script-hosting/mac-script-evidence.*/*.txt
+            ${{ runner.temp }}/magnitude-headless-signed/script-serve/*.json
+            ${{ runner.temp }}/magnitude-headless-signed/script-serve/*.txt
+            ${{ runner.temp }}/magnitude-headless-signed/*/artifacts/*.zip
+            ${{ runner.temp }}/magnitude-headless-signed/*/artifacts/*.json
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Remove temporary signing keychain
+        if: always()
+        run: |
+          if [ -n "${APPLE_RELEASE_KEYCHAIN:-}" ]; then
+            security delete-keychain "$APPLE_RELEASE_KEYCHAIN"
+          fi
+
   linux-native-ownership:
     strategy:
       fail-fast: false
@@ -80,6 +201,7 @@ jobs:
         run: |
           systemctl --user show-environment > /dev/null
           bunx --bun vitest run src/desktop-native/native.test.ts src/desktop-native/owned-child.test.ts src/desktop-native/login-startup.test.ts
+          bunx --bun vitest run src/desktop-native/unix-continuation.test.ts src/desktop-native/guarded-command.test.ts src/desktop-native/linux-update-maintenance.test.ts src/desktop-native/linux-update-package.test.ts src/application-update/linux-foreground-update.test.ts
       - name: Exercise Linux process identity and exit races
         working-directory: packages/utils
         run: bunx --bun vitest run src/process-groups/exact-process.test.ts src/process-groups/exact-process-linux.test.ts
@@ -115,7 +237,7 @@ jobs:
 
   windows-job-containment:
     runs-on: blacksmith-8vcpu-windows-2025
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -151,6 +273,9 @@ jobs:
       - name: Compile and exercise native ownership and Node/Bun pipe interoperability
         shell: pwsh
         run: ./packages/daemon-management/scripts/test-windows-native.ps1 -Headers $env:MAGNITUDE_NODE_HEADERS -NodeLibrary $env:MAGNITUDE_NODE_LIBRARY
+      - name: Verify foreground installation admission and failed-update retention
+        working-directory: packages/daemon-management
+        run: bunx --bun vitest run src/application-update/windows-foreground-update.test.ts
 
       - name: Exercise Rust atomic child creation and descendant retirement
         working-directory: inference
@@ -171,15 +296,28 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Windows CLI version failed.' }
           & $cli --help
           if ($LASTEXITCODE -ne 0) { throw 'Windows CLI help failed.' }
-          $status = & $cli service status
+          $status = & $cli status
           if ($LASTEXITCODE -ne 0 -or ($status -join "`n") -notmatch 'Runtime\s+Stopped') { throw 'Passive Windows CLI status failed.' }
-          & $cli service stop
-          if ($LASTEXITCODE -ne 0) { throw 'Already-stopped Windows CLI stop failed.' }
           if (Test-Path $env:MAGNITUDE_DESKTOP_STATE_DIR) { throw 'Passive commands created application ownership state.' }
           $PSNativeCommandUseErrorActionPreference = $false
-          $start = & $cli service start 2>&1
+          $start = & $cli app open 2>&1
           if ($LASTEXITCODE -eq 0) { throw 'Missing desktop unexpectedly started.' }
           $failure = $start -join "`n"
           if ($failure -notmatch 'Magnitude desktop is not installed at' -or $failure -match 'invalid\\environment-profile') { throw 'CLI did not resolve the missing desktop through the native known folder.' }
           if (Test-Path $env:MAGNITUDE_DESKTOP_STATE_DIR) { throw 'Missing installation created ownership state.' }
           exit 0
+      - name: Exercise signed Windows finite and foreground updates
+        if: github.event_name == 'workflow_dispatch' && inputs.signed_windows_installer
+        shell: pwsh
+        env:
+          MAGNITUDE_HEADLESS_ACCEPTANCE_OUTPUT: C:\magnitude-headless-test
+          MAGNITUDE_ACCEPTANCE_ICN_VERSION: "0.1.5"
+          MAGNITUDE_ACCEPTANCE_SESSION: headless
+        run: ./packages/release/scripts/acceptance/test-windows-headless.ps1
+      - name: Retain Windows packaged update evidence
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.signed_windows_installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-headless-installer-evidence
+          path: C:\magnitude-headless-test\result.json
+          if-no-files-found: warn

@@ -108,7 +108,7 @@ static void remove_installation_fixture(LPCWSTR root) {
   memcpy(&variable, &pointer, sizeof(variable)); \
 } while (0)
 static void check_replacement(HMODULE library) {
-  DWORD (WINAPI *hold)(void), (WINAPI *rollback)(void);
+  DWORD (WINAPI *hold)(void), (WINAPI *rollback)(void), (WINAPI *retire_previous)(void);
   DWORD (WINAPI *create_stage)(LPWSTR, DWORD);
   DWORD (WINAPI *begin)(LPCWSTR, LPCWSTR, LPCWSTR);
   DWORD (WINAPI *finish)(LPCWSTR);
@@ -117,6 +117,8 @@ static void check_replacement(HMODULE library) {
   RESOLVE_FUNCTION(library, create_stage, "CreateStage");
   RESOLVE_FUNCTION(library, begin, "BeginReplacement");
   RESOLVE_FUNCTION(library, rollback, "RollbackReplacement");
+  RESOLVE_FUNCTION(library, retire_previous, "RetirePreviousForRemoval");
+  require(retire_previous() == ERROR_INVALID_HANDLE, "previous removal requires the exact installed uninstaller");
   RESOLVE_FUNCTION(library, finish, "FinishReplacement");
   RESOLVE_FUNCTION(library, validate, "ValidateOwnedInstallation");
   WCHAR originalState[32768];
@@ -231,12 +233,70 @@ static void check_cli_path(HMODULE library, HKEY isolated) {
   puts("PASS actual installer DLL: CLI PATH registration, idempotence, and owned-only removal");
 }
 
+static void check_cli_launcher(HMODULE library) {
+  typedef DWORD (WINAPI *InstallLauncher)(LPCWSTR, LPCWSTR);
+  InstallLauncher install;
+  DWORD (WINAPI *remove_launcher)(LPCWSTR);
+  RESOLVE_FUNCTION(library, install, "InstallCliLauncher");
+  RESOLVE_FUNCTION(library, remove_launcher, "RemoveCliLauncher");
+  WCHAR source[32768], directory[32768], executable[32768], command[32768];
+  require(GetModuleFileNameW(NULL, source, 32768) > 0, "read mapped fixture image");
+  require(GetCurrentDirectoryW(32768, directory) > 0 && wcslen(directory) < 32000, "launcher fixture directory");
+  wcscat(directory, L"\\cli launcher");
+  swprintf(executable, 32768, L"%ls\\magnitude.exe", directory);
+  require_success(install(source, directory), "publish initial native launcher");
+  WCHAR ready_name[128];
+  swprintf(ready_name, 128, L"Local\\MagnitudeLauncherTest-%lu", GetCurrentProcessId());
+  HANDLE ready = CreateEventW(NULL, TRUE, FALSE, ready_name);
+  require(ready != NULL, "create launcher readiness event");
+  swprintf(command, 32768, L"\"%ls\" --launcher-image-probe %ls", executable, ready_name);
+  STARTUPINFOW startup = {sizeof(startup)};
+  PROCESS_INFORMATION child = {0};
+  require(CreateProcessW(executable, command, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &startup, &child), "map installed launcher image");
+  CloseHandle(child.hThread);
+  require(WaitForSingleObject(ready, 10000) == WAIT_OBJECT_0, "wait for the mapped launcher to finish loading");
+  CloseHandle(ready);
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    require_success(install(source, directory), "replace launcher while original image remains mapped");
+    require(WaitForSingleObject(child.hProcess, 0) == WAIT_TIMEOUT, "launcher publication preserves existing command");
+  }
+  require(remove_launcher(directory) != ERROR_SUCCESS && GetFileAttributesW(executable) != INVALID_FILE_ATTRIBUTES, "mapped retired launcher defers removal without deleting current command");
+  require(TerminateProcess(child.hProcess, 0), "retire owned launcher fixture");
+  require(WaitForSingleObject(child.hProcess, 10000) == WAIT_OBJECT_0, "observe fixture retirement");
+  CloseHandle(child.hProcess);
+  require_success(install(source, directory), "retire inactive launcher images on next publication");
+  swprintf(command, 32768, L"%ls\\magnitude-retired-{00000000-0000-0000-0000-000000000001}.exe", directory);
+  require(MoveFileW(executable, command), "simulate interruption after retiring the current launcher");
+  WCHAR abandoned[32768];
+  swprintf(abandoned, 32768, L"%ls\\magnitude-incoming-{00000000-0000-0000-0000-000000000001}.exe", directory);
+  require(CopyFileW(source, abandoned, TRUE), "simulate an unpublished incoming launcher");
+  require_success(install(source, directory), "repair an interrupted launcher publication");
+  require(GetFileAttributesW(executable) != INVALID_FILE_ATTRIBUTES &&
+    GetFileAttributesW(command) == INVALID_FILE_ATTRIBUTES && GetFileAttributesW(abandoned) == INVALID_FILE_ATTRIBUTES,
+    "repair publishes the command and retires abandoned images");
+  swprintf(command, 32768, L"%ls\\notes.txt", directory);
+  write_fixture(command, L"preserve");
+  require(remove_launcher(directory) == ERROR_DIR_NOT_EMPTY && GetFileAttributesW(executable) != INVALID_FILE_ATTRIBUTES, "unknown command-directory files preserve the installed launcher");
+  require(DeleteFileW(command), "retire owned unexpected-file fixture");
+  require_success(remove_launcher(directory), "remove launcher and all inactive images");
+  require_success(remove_launcher(directory), "repeat command removal is harmless");
+  puts("PASS actual installer DLL: repeated launcher publication preserves mapped commands and retires old images");
+}
+
 int wmain(int argc, wchar_t **argv) {
+  if (argc == 3 && !wcscmp(argv[1], L"--launcher-image-probe")) {
+    HANDLE ready = OpenEventW(EVENT_MODIFY_STATE, FALSE, argv[2]);
+    require(ready != NULL && SetEvent(ready), "signal mapped launcher readiness");
+    CloseHandle(ready);
+    Sleep(60000);
+    return 0;
+  }
   require(argc == 2 || argc == 3, "expected absolute helper DLL path and optional interruption mode");
   HMODULE library = LoadLibraryW(argv[1]); require(library != NULL, "load actual x86 helper DLL");
   if (argc == 3) { check_interrupted_replacement(library, argv[2]); return 0; }
   check_inventory(library);
   check_replacement(library);
+  check_cli_launcher(library);
   typedef DWORD (WINAPI *RemoveStartup)(LPCWSTR);
   RemoveStartup remove_startup;
   FARPROC symbol = GetProcAddress(library, "RemoveOwnedStartup");

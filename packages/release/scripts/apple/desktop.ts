@@ -130,7 +130,7 @@ export const signDesktopApplication = (app: string) => Effect.gen(function* () {
         ...(signing.mode === "adhoc" ? { timestamp: "none" } : {}),
         entitlements: join(resources, file.endsWith(`/${ACN_EXECUTABLE_NAME}`) || file.endsWith("/resources/magnitude") || file.endsWith("/Resources/magnitude")
           ? "bun.entitlements.plist"
-          : (/\.(node|dylib|framework)$/.test(file) || file.endsWith("/magnitude-command")) ? "library.entitlements.plist" : "electron.entitlements.plist"),
+          : (/\.(node|dylib|framework)$/.test(file) || file.endsWith("/magnitude-command") || file.endsWith("/magnitude-extract")) ? "library.entitlements.plist" : "electron.entitlements.plist"),
       }),
     }),
     catch: error => new AppleDistributionFailed({ message: `Could not sign desktop application: ${String(error)}` }),
