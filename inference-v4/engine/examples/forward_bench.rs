@@ -30,8 +30,11 @@
 //!     [--sequences 1,2,4,8]
 //!     [--warm 16] [--steps 32] [--attribution-steps 4]
 //! forward_bench qualify --model M.gguf --reference REF_DIR --output out.json
-//!     [--chunks N] [--label NAME] [--verify-width W]
+//!     [--chunks N] [--label NAME] [--verify-width W] [--batch B]
 //! ```
+//!
+//! `qualify` decodes up to B chunks (across categories) together in each
+//! step and compares their rows against the reference in parallel.
 //!
 //! Either mode takes `--cache-dir DIR`, the engine's kernel cache (compiled
 //! kernels and tuning results); without it every load forms and tunes every
@@ -324,6 +327,8 @@ pub(crate) struct Options {
     /// `qualify`: scored rows per teacher-forced step; above 1 they run as one
     /// verification forward (the MTP verify shapes) instead of single-row decodes.
     verify_width: usize,
+    /// `qualify`: chunks decoded together per step (`--batch`, default 32).
+    batch: usize,
     label: Option<String>,
     /// The kernel cache directory (`--cache-dir`); none caches nothing.
     kernel_cache: Option<PathBuf>,
@@ -371,6 +376,7 @@ impl Options {
             reference: None,
             chunks: None,
             verify_width: 1,
+            batch: 32,
             label: None,
             kernel_cache: None,
             kv_codec: KvCodec::AffineK8V4,
@@ -424,6 +430,13 @@ impl Options {
                         .ok()
                         .filter(|width| *width > 0)
                         .ok_or("--verify-width requires a positive count")?
+                }
+                "--batch" => {
+                    options.batch = value()?
+                        .parse()
+                        .ok()
+                        .filter(|batch| *batch > 0)
+                        .ok_or("--batch requires a positive count")?
                 }
                 "--label" => options.label = Some(value()?),
                 "--cache-dir" => options.kernel_cache = Some(PathBuf::from(value()?)),
@@ -1269,7 +1282,7 @@ fn verify_cell(
 /// `--kl-divergence-base` file, with llama.cpp's own KL and same-top
 /// definitions (`validation/precision/README.md` documents the file).
 mod qualify {
-    use super::{host, Bench, DecoderGeometry, Demand, Operation, Options, Outcome, WorkKind};
+    use super::{host, Bench, DecoderGeometry, Demand, Operation, Options, Outcome, Sequence, WorkKind};
     use magnitude_model_contracts::FeedForwardGeometry;
     use magnitude_model_executor::TokenId;
     use serde_json::json;
@@ -1583,8 +1596,8 @@ mod qualify {
     }
 
     /// Qualifies every category of a reference directory in one engine load
-    /// (tuning at load dominates start-up), rewriting the report after each
-    /// category.
+    /// (tuning at load dominates start-up), decoding up to `--batch` chunks of
+    /// any category together per step.
     pub(super) fn run(options: &Options) -> Result<(), String> {
         let directory = options
             .reference
@@ -1600,6 +1613,16 @@ mod qualify {
                 return Err(format!("{name}: reference chunk geometry differs"));
             }
         }
+        let chunks: Vec<usize> = bases
+            .iter()
+            .map(|(_, base)| options.chunks.unwrap_or(base.n_chunk).min(base.n_chunk))
+            .collect();
+        let work: Vec<Work> = chunks
+            .iter()
+            .enumerate()
+            .flat_map(|(category, &count)| (0..count).map(move |chunk| Work { category, chunk }))
+            .collect();
+        let batch = options.batch.min(work.len());
         // The bench seals prefill classes up to PREFILL_ROWS and load warm-up runs each of them
         // as one request, so the context must hold the largest class, not just n_ctx.
         let context = n_ctx.max(super::PREFILL_ROWS);
@@ -1608,108 +1631,190 @@ mod qualify {
             options.path,
             options.storage_gib,
             context,
-            1,
-            options.verify_width,
+            batch,
+            batch * options.verify_width,
             options.kernel_cache.as_deref(),
             options.kv_codec,
             options.device,
             false,
         )?;
         let limits = limits(&bench.geometry)?;
-        let mut report = json!({
-            "tool": "engine/examples/forward_bench.rs qualify",
-            "protocol": "V4 native target: prefill of the chunk's first n_ctx/2 tokens (in PREFILL_ROWS chunks), then teacher-forced decode with LOGITS demand for each evaluated position; KL(base || V4) over base log-probs above -16 nats and first-index argmax agreement, as llama-perplexity --kl-divergence",
-            "label": options.label,
-            "kv_codec": options.kv_codec.identity(),
-            "verify_width": options.verify_width,
-            "host": host(),
-            "model": options.model,
-            "reference": directory,
-            "n_ctx": n_ctx,
-            "categories": {},
-        });
-        let mut done: Vec<(&str, Positions)> = Vec::new();
-        for (name, base) in &mut bases {
+        for (name, base) in &bases {
             if bench.vocabulary != base.n_vocab {
                 return Err(format!(
                     "{name}: reference vocabulary {} differs from the model's {}",
                     base.n_vocab, bench.vocabulary
                 ));
             }
-            let chunks = options.chunks.unwrap_or(base.n_chunk).min(base.n_chunk);
-            let (positions, per_chunk) =
-                category(&mut bench, base, chunks, options.verify_width, name)?;
+        }
+        let mut report = json!({
+            "tool": "engine/examples/forward_bench.rs qualify",
+            "protocol": "V4 native target: prefill of the chunk's first n_ctx/2 tokens (in PREFILL_ROWS chunks), then teacher-forced decode with LOGITS demand for each evaluated position; KL(base || V4) over base log-probs above -16 nats and first-index argmax agreement, as llama-perplexity --kl-divergence",
+            "label": options.label,
+            "kv_codec": options.kv_codec.identity(),
+            "verify_width": options.verify_width,
+            "batch": batch,
+            "host": host(),
+            "model": options.model,
+            "reference": directory,
+            "n_ctx": n_ctx,
+            "categories": {},
+        });
+        let mut scores = Vec::with_capacity(work.len());
+        for (index, items) in work.chunks(batch).enumerate() {
+            scores.extend(score(&mut bench, &mut bases, items, options.verify_width)?);
+            eprintln!("scored {} of {} chunks (batch {index})", scores.len(), work.len());
+        }
+        let evaluated = bases[0].1.evaluated();
+        let mut done: Vec<(&str, Positions)> = Vec::new();
+        for (category, (name, _)) in bases.iter().enumerate() {
+            let mut positions = Positions::default();
+            let mut per_chunk = Vec::with_capacity(chunks[category]);
+            for (item, score) in work.iter().zip(&scores).filter(|(item, _)| item.category == category) {
+                positions.extend(&score.positions);
+                per_chunk.push(json!({
+                    "chunk": item.chunk,
+                    "mean_kld": score.positions.mean_kld(),
+                    "same_top": score.positions.same_top(),
+                    "span_rows": SPAN,
+                    "span_mean_kld": score.span_means(evaluated),
+                }));
+            }
             let mut summary = positions.summary();
-            summary["chunks"] = json!(chunks);
+            summary["chunks"] = json!(chunks[category]);
             summary["per_chunk"] = json!(per_chunk);
             report["categories"][*name] = summary;
             done.push((*name, positions));
-            if done.len() == CATEGORIES.len() {
-                let mut overall = Positions::default();
-                for (_, positions) in &done {
-                    overall.extend(positions);
-                }
-                report["overall"] = overall.summary();
-                if n_ctx == D4_N_CTX {
-                    report["d4"] = verdict(limits, &done, &overall);
-                }
-            }
-            std::fs::write(
-                &options.output,
-                serde_json::to_string_pretty(&report).expect("report serializes"),
-            )
-            .map_err(|error| format!("writing {}: {error}", options.output.display()))?;
         }
-        Ok(())
+        let mut overall = Positions::default();
+        for (_, positions) in &done {
+            overall.extend(positions);
+        }
+        report["overall"] = overall.summary();
+        if n_ctx == D4_N_CTX {
+            report["d4"] = verdict(limits, &done, &overall);
+        }
+        std::fs::write(
+            &options.output,
+            serde_json::to_string_pretty(&report).expect("report serializes"),
+        )
+        .map_err(|error| format!("writing {}: {error}", options.output.display()))
     }
 
     /// Scored rows per `span_mean_kld` entry of a chunk.
     const SPAN: usize = 512;
 
-    fn category(
+    /// One reference chunk to score: its category (index into the bases) and chunk.
+    struct Work {
+        category: usize,
+        chunk: usize,
+    }
+
+    /// One chunk's per-position results and its KL per SPAN scored rows, which
+    /// locates where along the history a long-context divergence starts.
+    struct ChunkScore {
+        positions: Positions,
+        span_kl: Vec<f64>,
+    }
+
+    impl ChunkScore {
+        fn span_means(&self, evaluated: usize) -> Vec<f64> {
+            self.span_kl
+                .iter()
+                .enumerate()
+                .map(|(span, total)| total / (evaluated - span * SPAN).min(SPAN) as f64)
+                .collect()
+        }
+    }
+
+    /// The teacher-forced step of `forced` rows: a single-row decode, or above
+    /// one row a verification forward (the MTP verify shapes).
+    fn scored(sequence: &Sequence, forced: Vec<TokenId>) -> Operation {
+        if forced.len() == 1 {
+            return Bench::forward(sequence, WorkKind::Decode, forced, Demand::LOGITS);
+        }
+        Operation::Forward {
+            request: sequence.request,
+            kind: WorkKind::Verify,
+            position: sequence.position,
+            conditioning: None,
+            demand: Demand::LOGITS | Demand::SELECT,
+            select: (0..forced.len())
+                .map(|offset| Bench::greedy(sequence.position + offset))
+                .collect(),
+            committed: forced.len(),
+            tokens: forced,
+        }
+    }
+
+    /// Prefills every sequence's history (`tokens[..first]`), packing pieces of
+    /// several sequences into each step up to PREFILL_ROWS rows.
+    fn prefill(
         bench: &mut Bench,
-        base: &mut BaseFile,
-        chunks: usize,
-        width: usize,
-        name: &str,
-    ) -> Result<(Positions, Vec<serde_json::Value>), String> {
-        let mut positions = Positions::default();
-        let mut per_chunk = Vec::with_capacity(chunks);
-        for chunk in 0..chunks {
-            let tokens = base.chunk_tokens(chunk)?;
-            let first = base.first();
-            let mut sequence = bench.open_sequence()?;
-            for rows in tokens[..first].chunks(super::PREFILL_ROWS) {
-                let prefill =
-                    Bench::forward(&sequence, WorkKind::Prefill, rows.to_vec(), Demand::NONE);
-                bench.step(vec![prefill], &mut [&mut sequence], None)?;
+        sequences: &mut [Sequence],
+        tokens: &[Vec<TokenId>],
+        first: usize,
+    ) -> Result<(), String> {
+        while sequences.iter().any(|sequence| sequence.position < first) {
+            let mut budget = super::PREFILL_ROWS;
+            let mut operations = Vec::new();
+            let mut advancing = Vec::new();
+            for (sequence, tokens) in sequences.iter_mut().zip(tokens) {
+                let rows = (first - sequence.position).min(super::PREFILL_ROWS);
+                if rows == 0 || rows > budget {
+                    continue;
+                }
+                budget -= rows;
+                let piece = tokens[sequence.position..sequence.position + rows].to_vec();
+                operations.push(Bench::forward(sequence, WorkKind::Prefill, piece, Demand::NONE));
+                advancing.push(sequence);
             }
-            let (mut chunk_kl, mut chunk_same) = (0.0, 0usize);
-            // Mean KL per SPAN scored rows, to locate where along the history a
-            // long-context divergence starts.
-            let mut span_kl = vec![0.0; base.evaluated().div_ceil(SPAN)];
-            let mut row = 0;
-            while row < base.evaluated() {
-                let group = width.min(base.evaluated() - row);
-                let forced = tokens[first + row..first + row + group].to_vec();
-                let step = if group == 1 {
-                    Bench::forward(&sequence, WorkKind::Decode, forced, Demand::LOGITS)
-                } else {
-                    Operation::Forward {
-                        request: sequence.request,
-                        kind: WorkKind::Verify,
-                        tokens: forced,
-                        position: sequence.position,
-                        conditioning: None,
-                        demand: Demand::LOGITS | Demand::SELECT,
-                        select: (0..group)
-                            .map(|offset| Bench::greedy(sequence.position + offset))
-                            .collect(),
-                        committed: group,
-                    }
-                };
-                let (_, outcomes) = bench.step(vec![step], &mut [&mut sequence], None)?;
-                let [Outcome::Forward { rows }] = outcomes.as_slice() else {
+            bench.step(operations, &mut advancing, None)?;
+        }
+        Ok(())
+    }
+
+    /// Scores `items` together: every chunk's history is prefilled on its own
+    /// sequence, then every sequence advances by `width` forced rows per step,
+    /// and each step's rows are compared against the reference in parallel.
+    fn score(
+        bench: &mut Bench,
+        bases: &mut [(&str, BaseFile)],
+        items: &[Work],
+        width: usize,
+    ) -> Result<Vec<ChunkScore>, String> {
+        let (first, evaluated) = (bases[0].1.first(), bases[0].1.evaluated());
+        let mut sequences = Vec::with_capacity(items.len());
+        let mut tokens = Vec::with_capacity(items.len());
+        for item in items {
+            tokens.push(bases[item.category].1.chunk_tokens(item.chunk)?);
+            sequences.push(bench.open_sequence()?);
+        }
+        prefill(bench, &mut sequences, &tokens, first)?;
+        let mut scores: Vec<ChunkScore> = items
+            .iter()
+            .map(|_| ChunkScore {
+                positions: Positions::default(),
+                span_kl: vec![0.0; evaluated.div_ceil(SPAN)],
+            })
+            .collect();
+        let threads = std::thread::available_parallelism().map_or(1, usize::from);
+        let mut row = 0;
+        while row < evaluated {
+            let group = width.min(evaluated - row);
+            let operations = sequences
+                .iter()
+                .zip(&tokens)
+                .map(|(sequence, tokens)| {
+                    scored(sequence, tokens[first + row..first + row + group].to_vec())
+                })
+                .collect();
+            let mut advancing: Vec<&mut Sequence> = sequences.iter_mut().collect();
+            let (_, outcomes) = bench.step(operations, &mut advancing, None)?;
+            // (item, scored row, reference log-probabilities, V4 logits)
+            let mut pairs = Vec::with_capacity(items.len() * group);
+            for (index, outcome) in outcomes.iter().enumerate() {
+                let Outcome::Forward { rows } = outcome else {
                     return Err("scored step returned a non-forward outcome".into());
                 };
                 if rows.len() != group {
@@ -1722,39 +1827,41 @@ mod qualify {
                         .ok_or("scored step returned no logits")?
                         .read_to_host()
                         .map_err(|error| error.to_string())?;
+                    let base = &mut bases[items[index].category].1;
                     if logits.len() != base.n_vocab {
                         return Err("logits row width differs from the vocabulary".into());
                     }
-                    let reference = base.row(chunk, row + offset)?;
-                    let (kl, top) = compare(&reference, &logits);
-                    positions.push(kl, top, top_gap(&reference));
-                    chunk_kl += kl;
-                    chunk_same += usize::from(top);
-                    span_kl[(row + offset) / SPAN] += kl;
+                    let reference = base.row(items[index].chunk, row + offset)?;
+                    pairs.push((index, row + offset, reference, logits));
                 }
-                row += group;
             }
-            bench.close(sequence)?;
-            let spans = span_kl
-                .iter()
-                .enumerate()
-                .map(|(span, total)| {
-                    total / (base.evaluated() - span * SPAN).min(SPAN) as f64
-                })
-                .collect::<Vec<_>>();
-            per_chunk.push(json!({
-                "chunk": chunk,
-                "mean_kld": chunk_kl / base.evaluated() as f64,
-                "same_top": chunk_same as f64 / base.evaluated() as f64,
-                "span_rows": SPAN,
-                "span_mean_kld": spans,
-            }));
-            eprintln!(
-                "{name} chunk {chunk}: running mean KLD {:.6}, same top {:.4}",
-                positions.mean_kld(),
-                positions.same_top()
-            );
+            let compared: Vec<(f64, bool, f32)> = std::thread::scope(|scope| {
+                pairs
+                    .chunks(pairs.len().div_ceil(threads))
+                    .map(|part| {
+                        scope.spawn(move || {
+                            part.iter()
+                                .map(|(_, _, reference, logits)| {
+                                    let (kl, top) = compare(reference, logits);
+                                    (kl, top, top_gap(reference))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .flat_map(|handle| handle.join().expect("comparison thread"))
+                    .collect()
+            });
+            for ((index, position, ..), (kl, top, gap)) in pairs.iter().zip(compared) {
+                scores[*index].positions.push(kl, top, gap);
+                scores[*index].span_kl[position / SPAN] += kl;
+            }
+            row += group;
         }
-        Ok((positions, per_chunk))
+        for sequence in sequences {
+            bench.close(sequence)?;
+        }
+        Ok(scores)
     }
 }
