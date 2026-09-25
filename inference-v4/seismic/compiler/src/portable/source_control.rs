@@ -55,7 +55,7 @@ pub(super) struct SegmentRepeat {
     scope: Option<cohort::Scope>,
 }
 
-impl<'s, 'k, 'f, 'r, B: seismic_target::TargetFamily> SegmentLowerer<'s, 'k, 'f, 'r, B> {
+impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 'k, 'f, 'r, B> {
     pub(super) fn initialize_successful_values(&mut self, region: RegionId) {
         let inputs = self
             .values

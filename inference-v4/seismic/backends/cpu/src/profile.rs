@@ -13,14 +13,14 @@ use seismic_compiler::target::{
 };
 use seismic_estimator::ProfileAcquisitionMetrics;
 use seismic_ir::kernel::Kernel;
-use seismic_ir::target::{
+use seismic_ir::physical_target::{
     DataTypeSupport, KernelAbiFootprint, KernelAbiLayout, KernelAbiModel, LocalRealization,
     LocalRealizationPolicy, NumericalEnvironment, TargetLimits, VectorOperationClass,
     VectorSupport, VectorSupportEntry,
 };
 use seismic_lang::registry::{self as language_registry, BackendName, REGISTRY_REVISION};
 use seismic_lang::types::DType;
-use seismic_target::CompatibilityIdentity;
+use seismic_native_target::CompatibilityIdentity;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::time::Instant;
@@ -104,7 +104,7 @@ pub struct HostFacts {
 
 pub(crate) fn profile_for_workers(
     workers: &mut crate::workers::Workers,
-    device: std::sync::Arc<seismic_target::DeviceDescription<Cpu>>,
+    device: std::sync::Arc<seismic_native_target::DeviceDescription<Cpu>>,
 ) -> Result<seismic_compiler::evaluation::AnalyticalEvaluationContext<Cpu>, TargetError> {
     let total_started = Instant::now();
     let probe_started = Instant::now();
@@ -131,7 +131,7 @@ pub(crate) fn profile_for_workers(
 
 pub(crate) fn device_for_workers(
     pool: &crate::workers::Workers,
-) -> Result<std::sync::Arc<seismic_target::DeviceDescription<Cpu>>, TargetError> {
+) -> Result<std::sync::Arc<seismic_native_target::DeviceDescription<Cpu>>, TargetError> {
     let workers = u32::try_from(pool.count())
         .map_err(|_| TargetError::UnsupportedDevice("CPU worker count exceeds u32::MAX".into()))?;
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

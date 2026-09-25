@@ -2,7 +2,7 @@
 //! emission layout are compiler-owned.
 
 use crate::driver::{Handle, Module};
-use seismic_ir::target::KernelEmissionLayout;
+use seismic_ir::physical_target::KernelEmissionLayout;
 use std::sync::Arc;
 
 #[repr(C)]

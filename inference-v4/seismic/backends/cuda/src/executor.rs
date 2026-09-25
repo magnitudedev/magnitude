@@ -13,7 +13,7 @@ use seismic_compiler::executable::{
     KernelAbiBindings, NativeExecution, NativeExecutor, NativeSubmission, RuntimeBuffer,
 };
 use seismic_ir::schedule::{AnyScalarSlot, FillValue};
-use seismic_ir::target::KernelAbiAllocationRole;
+use seismic_ir::physical_target::KernelAbiAllocationRole;
 use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::SymbolValue;
 use std::ffi::{c_int, c_void};

@@ -11,7 +11,7 @@
 //! [`Kernel`].
 
 use crate::identity::OwnerToken;
-use crate::target::PhysicalDialect;
+use crate::physical_target::PhysicalDialect;
 
 pub mod ops;
 mod representation;
@@ -193,7 +193,7 @@ impl<B: PhysicalDialect> Kernel<B> {
     pub fn closed_addressable_resource(
         &self,
         handle: ops::AddressableResourceHandle,
-        emission: &crate::target::KernelEmissionLayout,
+        emission: &crate::physical_target::KernelEmissionLayout,
     ) -> ops::ClosedAddressableResource {
         let lease = self.addressable_resource(handle);
         let layout = emission
@@ -223,7 +223,7 @@ impl<B: PhysicalDialect> Kernel<B> {
     pub fn closed_place(
         &self,
         place: ops::PlaceRef,
-        emission: &crate::target::KernelEmissionLayout,
+        emission: &crate::physical_target::KernelEmissionLayout,
     ) -> ops::ClosedPlace {
         match place {
             ops::PlaceRef::Global { slot } => {
@@ -279,7 +279,7 @@ impl<B: PhysicalDialect> Kernel<B> {
     pub fn closed_dense_place(
         &self,
         place: ops::PlaceRef,
-        emission: &crate::target::KernelEmissionLayout,
+        emission: &crate::physical_target::KernelEmissionLayout,
     ) -> ops::ClosedDensePlace {
         let closed = self.closed_place(place, emission);
         let geometry = closed.geometry.dense();
@@ -289,7 +289,7 @@ impl<B: PhysicalDialect> Kernel<B> {
     pub fn closed_readable_place(
         &self,
         place: ops::PlaceRef,
-        emission: &crate::target::KernelEmissionLayout,
+        emission: &crate::physical_target::KernelEmissionLayout,
     ) -> ops::ClosedReadablePlace {
         let closed = self.closed_place(place, emission);
         let geometry = closed.geometry.readable();
@@ -299,7 +299,7 @@ impl<B: PhysicalDialect> Kernel<B> {
     fn closed_global_place(
         &self,
         slot: BindingSlot,
-        emission: &crate::target::KernelEmissionLayout,
+        emission: &crate::physical_target::KernelEmissionLayout,
     ) -> ops::ClosedGlobalPlace {
         let binding = &self.interface().bindings[slot.ordinal() as usize];
         let layout = &emission.bindings[slot.ordinal() as usize];
@@ -317,7 +317,7 @@ impl<B: PhysicalDialect> Kernel<B> {
     pub fn closed_op<'a>(
         &'a self,
         op: &'a ops::Op<B>,
-        emission: &crate::target::KernelEmissionLayout,
+        emission: &crate::physical_target::KernelEmissionLayout,
     ) -> ops::ClosedOpView<'a, B> {
         use ops::{ClosedBoolValue as Bool, ClosedIndexValue as Index, ClosedOpView as Closed, Op};
         let value = |raw| self.closed_value(raw);

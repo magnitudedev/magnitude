@@ -8,7 +8,7 @@ use seismic_compiler::errors::TargetError;
 pub struct OpenedCpu {
     pub service: Device,
     pub executor: Executor,
-    pub device: std::sync::Arc<seismic_target::DeviceDescription<Cpu>>,
+    pub device: std::sync::Arc<seismic_native_target::DeviceDescription<Cpu>>,
 }
 
 pub fn open_host() -> Result<OpenedCpu, TargetError> {

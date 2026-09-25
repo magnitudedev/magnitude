@@ -13,7 +13,7 @@ use seismic_lang::expr::{
     PartialAssignment, SymbolId, SymbolSort, SymbolValue,
 };
 use seismic_lang::types::DType;
-use seismic_target::TargetFamily;
+use seismic_native_target::TargetFamily;
 use std::collections::{HashSet, VecDeque};
 
 #[derive(Clone, Debug)]

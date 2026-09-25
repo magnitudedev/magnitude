@@ -6,7 +6,7 @@ use seismic_compiler::evaluation::AnalyticalEvaluationContext;
 
 pub struct OpenedCuda {
     pub service: Device,
-    pub device: std::sync::Arc<seismic_target::DeviceDescription<Cuda>>,
+    pub device: std::sync::Arc<seismic_native_target::DeviceDescription<Cuda>>,
 }
 
 pub fn open(ordinal: u32) -> Result<OpenedCuda, ExecutionError> {
@@ -18,7 +18,7 @@ pub fn open(ordinal: u32) -> Result<OpenedCuda, ExecutionError> {
 
 pub fn open_analytical(
     service: &Device,
-    device: std::sync::Arc<seismic_target::DeviceDescription<Cuda>>,
+    device: std::sync::Arc<seismic_native_target::DeviceDescription<Cuda>>,
 ) -> Result<AnalyticalEvaluationContext<Cuda>, TargetError> {
     crate::profile::profile_for_opened(
         service.ordinal(),

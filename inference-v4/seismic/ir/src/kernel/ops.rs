@@ -5,7 +5,7 @@
 use super::{BindingSlot, BlockId};
 use crate::identity::OwnerToken;
 use crate::storage::LaunchLocalKind;
-use crate::target::PhysicalDialect;
+use crate::physical_target::PhysicalDialect;
 use seismic_lang::expr::{NatExpr, SymbolId};
 use seismic_lang::ids::{CapabilityId, IntrinsicId, RepresentationId};
 use seismic_lang::intrinsics::{AtomicOp, MathOp};
@@ -141,7 +141,7 @@ pub enum ClosedPlaceKind {
 /// One fully resolved place. Representation/rank/address-space facts are
 /// attached once by core and never reconstructed by native emitters.
 #[derive(Clone, Debug)]
-pub struct ClosedPlace<G = crate::target::RepresentationGeometry> {
+pub struct ClosedPlace<G = crate::physical_target::RepresentationGeometry> {
     pub raw: PlaceRef,
     pub kind: ClosedPlaceKind,
     pub representation: RepresentationId,
@@ -149,7 +149,7 @@ pub struct ClosedPlace<G = crate::target::RepresentationGeometry> {
     pub extents: Vec<NatExpr>,
     pub geometry: G,
     pub words: ClosedPlaceWords,
-    pub realization: Option<crate::target::LocalRealization>,
+    pub realization: Option<crate::physical_target::LocalRealization>,
 }
 
 impl<G> ClosedPlace<G> {
@@ -171,7 +171,7 @@ impl<G> ClosedPlace<G> {
 /// intrinsically global (such as one-shot representation conversion) use
 /// this projection so native emitters never branch on a local alternative.
 #[derive(Clone, Debug)]
-pub struct ClosedGlobalPlace<G = crate::target::RepresentationGeometry> {
+pub struct ClosedGlobalPlace<G = crate::physical_target::RepresentationGeometry> {
     pub slot: BindingSlot,
     pub access: BindingAccess,
     pub buffer_ordinal: u32,
@@ -179,7 +179,7 @@ pub struct ClosedGlobalPlace<G = crate::target::RepresentationGeometry> {
     pub rank: u32,
     pub extents: Vec<NatExpr>,
     pub geometry: G,
-    pub words: crate::target::BindingWordLayout,
+    pub words: crate::physical_target::BindingWordLayout,
 }
 
 impl<G> ClosedGlobalPlace<G> {
@@ -197,17 +197,17 @@ impl<G> ClosedGlobalPlace<G> {
     }
 }
 
-pub type ClosedReadablePlace = ClosedPlace<crate::target::ReadableRepresentationGeometry>;
-pub type ClosedDensePlace = ClosedPlace<crate::target::DenseRepresentationGeometry>;
-pub type ClosedPackedPlace = ClosedPlace<crate::target::PackedRepresentationGeometry>;
+pub type ClosedReadablePlace = ClosedPlace<crate::physical_target::ReadableRepresentationGeometry>;
+pub type ClosedDensePlace = ClosedPlace<crate::physical_target::DenseRepresentationGeometry>;
+pub type ClosedPackedPlace = ClosedPlace<crate::physical_target::PackedRepresentationGeometry>;
 pub type ClosedExternalGlobalPlace =
-    ClosedGlobalPlace<crate::target::ExternalRepresentationGeometry>;
-pub type ClosedPackedGlobalPlace = ClosedGlobalPlace<crate::target::PackedRepresentationGeometry>;
+    ClosedGlobalPlace<crate::physical_target::ExternalRepresentationGeometry>;
+pub type ClosedPackedGlobalPlace = ClosedGlobalPlace<crate::physical_target::PackedRepresentationGeometry>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ClosedPlaceWords {
-    Binding(crate::target::BindingWordLayout),
-    Local(crate::target::LocalWordLayout),
+    Binding(crate::physical_target::BindingWordLayout),
+    Local(crate::physical_target::LocalWordLayout),
 }
 
 /// An index value whose category was proved when the kernel was closed.
@@ -907,12 +907,12 @@ impl AddressableResourceHandle {
 #[derive(Clone, Debug)]
 pub struct AddressableResourceLease {
     pub handle: AddressableResourceHandle,
-    pub class_id: crate::target::ResourceClassId,
-    pub class: crate::target::AddressableResourceClass,
+    pub class_id: crate::physical_target::ResourceClassId,
+    pub class: crate::physical_target::AddressableResourceClass,
     pub offset_units: NatExpr,
     pub units: NatExpr,
     pub alignment_units: u64,
-    pub lifetime: crate::target::ResourceLifetime,
+    pub lifetime: crate::physical_target::ResourceLifetime,
 }
 
 /// Native-emission projection of one lease. Symbolic offset/extent values
@@ -921,12 +921,12 @@ pub struct AddressableResourceLease {
 #[derive(Clone, Debug)]
 pub struct ClosedAddressableResource {
     pub handle: AddressableResourceHandle,
-    pub class_id: crate::target::ResourceClassId,
-    pub class: crate::target::AddressableResourceClass,
+    pub class_id: crate::physical_target::ResourceClassId,
+    pub class: crate::physical_target::AddressableResourceClass,
     pub offset_word: u32,
     pub units_word: u32,
     pub alignment_units: u64,
-    pub lifetime: crate::target::ResourceLifetime,
+    pub lifetime: crate::physical_target::ResourceLifetime,
 }
 
 /// Registry-typed operands passed by the one core semantic walker to a

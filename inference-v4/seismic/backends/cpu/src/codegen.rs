@@ -8,7 +8,7 @@ use cranelift_codegen::{
     settings::{self, Configurable},
 };
 use seismic_compiler::errors::TargetError;
-use seismic_target::NativeCompilationError;
+use seismic_native_target::NativeCompilationError;
 use std::collections::BTreeMap;
 
 /// The host code-generation policy: compiler version, target triple,

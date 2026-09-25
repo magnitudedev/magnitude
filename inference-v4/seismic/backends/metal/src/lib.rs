@@ -34,9 +34,9 @@ mod services;
 mod test_support;
 
 use objc2_metal::MTLComputePipelineState;
-use seismic_ir::target::IntrinsicIdentityBuilder;
+use seismic_ir::physical_target::IntrinsicIdentityBuilder;
 use seismic_lang::registry::BackendName;
-use seismic_target::{
+use seismic_native_target::{
     DeviceDescription, NativeArtifactMetrics, NativeCompilationError, NativeKernelDescription,
     NativeKernelIdentity, NativeKernelReflection, NativeLaunchDomain, NativeNumericalModeIdentity,
     NativeResourceUsage, NativeResources,
@@ -72,7 +72,7 @@ pub struct MetalLaunchMode;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MetalNumericalMode;
 
-impl seismic_ir::target::PhysicalDialect for Metal {
+impl seismic_ir::physical_target::PhysicalDialect for Metal {
     type LaunchDescriptor = MetalLaunchMode;
     fn ordinary_launch() -> Self::LaunchDescriptor {
         MetalLaunchMode
@@ -100,12 +100,12 @@ impl seismic_ir::target::PhysicalDialect for Metal {
         _facts: &Self::Facts,
         signature: &seismic_lang::registry::IntrinsicSignature,
         intrinsic: &Self::Intrinsic,
-    ) -> seismic_ir::target::IntrinsicNumericalSemantics {
+    ) -> seismic_ir::physical_target::IntrinsicNumericalSemantics {
         intrinsic::numerical_semantics(signature, intrinsic)
     }
 }
 
-impl seismic_target::TargetFamily for Metal {
+impl seismic_native_target::TargetFamily for Metal {
     type KernelAbi = profile::MetalKernelAbi;
     type NativeNumericalMode = MetalNumericalMode;
     type NativeProperties = ();
@@ -124,7 +124,7 @@ pub(crate) fn native_launch_constraints(
     launch: &seismic_ir::schedule::Launch<Metal>,
     _locals: &seismic_ir::storage::LaunchLocalLayout,
     kernel: &seismic_ir::kernel::Kernel<Metal>,
-    native: &seismic_target::NativeKernelDescription<Metal>,
+    native: &seismic_native_target::NativeKernelDescription<Metal>,
 ) -> Vec<seismic_lang::expr::BoolExpr> {
     fn contains_matrix(
         kernel: &seismic_ir::kernel::Kernel<Metal>,
@@ -159,7 +159,7 @@ pub(crate) fn native_launch_constraints(
     ]
 }
 
-impl seismic_target::NativeCompiler<Metal> for MetalNativeCompiler {
+impl seismic_native_target::NativeCompiler<Metal> for MetalNativeCompiler {
     type Context = DeviceHandle;
     type Candidate = NativeCandidate;
     type Handle = Pipeline;
@@ -168,7 +168,7 @@ impl seismic_target::NativeCompiler<Metal> for MetalNativeCompiler {
         context: &Self::Context,
         target: &DeviceDescription<Metal>,
         kernel: &seismic_ir::kernel::Kernel<Metal>,
-        layout: &seismic_ir::target::KernelEmissionLayout,
+        layout: &seismic_ir::physical_target::KernelEmissionLayout,
     ) -> Result<Self::Candidate, NativeCompilationError> {
         compile::compile_kernel(context, target, kernel, layout)
     }
@@ -176,7 +176,7 @@ impl seismic_target::NativeCompiler<Metal> for MetalNativeCompiler {
         &self,
         target: &DeviceDescription<Metal>,
         kernel: &seismic_ir::kernel::Kernel<Metal>,
-        _layout: &seismic_ir::target::KernelEmissionLayout,
+        _layout: &seismic_ir::physical_target::KernelEmissionLayout,
         candidate: Self::Candidate,
     ) -> Result<NativeKernelReflection<Metal, Self::Handle>, NativeCompilationError> {
         let reflection_started = Instant::now();
@@ -222,7 +222,7 @@ impl seismic_target::NativeCompiler<Metal> for MetalNativeCompiler {
             launch: NativeLaunchDomain {
                 modes: vec![MetalLaunchMode],
                 subgroup_width: Some(subgroup_width),
-                cluster: seismic_target::NativeClusterDomain::NotApplicable,
+                cluster: seismic_native_target::NativeClusterDomain::NotApplicable,
                 max_grid: target.limits().max_grid,
                 max_workgroup_size: target.limits().max_workgroup_size,
                 max_workgroup_threads: pipeline_threads,

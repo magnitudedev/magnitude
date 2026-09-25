@@ -5,7 +5,7 @@
 //! materialization. Keeping them distinct prevents structural/native work from
 //! silently spending solver and policy-retention resources.
 
-use seismic_target::NativeArtifactMetrics;
+use seismic_native_target::NativeArtifactMetrics;
 use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

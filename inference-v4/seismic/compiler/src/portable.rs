@@ -80,7 +80,7 @@ pub(crate) enum SemanticMode {
 }
 /// The required driver uses the same constructor as optional exploration. It
 /// supplies the checked reference child at each choice and records that path.
-pub(crate) fn construct_general<B: seismic_target::TargetFamily>(
+pub(crate) fn construct_general<B: seismic_native_target::TargetFamily>(
     mut state: construction::SourceConstruction<B>,
     mut context: crate::implementation::ConstructionContext<'_, B>,
 ) -> Result<(ConstructedCandidate<B>, Vec<(crate::candidate_domain::CallPath, crate::candidate_domain::BodySelection)>), crate::errors::PreparationError> {
@@ -105,7 +105,7 @@ pub(crate) fn construct_general<B: seismic_target::TargetFamily>(
 /// Returns the launch-global logical coordinate. Universal portable kernels
 /// receive a compiler-owned base argument so later schedule specialization can
 /// split one semantic launch without changing the kernel's meaning.
-fn logical_global_id<B: seismic_target::TargetFamily>(
+fn logical_global_id<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     compiler_owned: bool,
     extent: NatExpr,
@@ -141,7 +141,7 @@ type SegmentSliceAxis = TensorSliceAxis<PortableValue>;
 impl SegmentTensor {
     /// A reduction does not modify its captured input versions. Derive its
     /// recurrence scope from those actual addresses and element coordinates.
-    fn reduction_uniformity<B: seismic_target::TargetFamily>(
+    fn reduction_uniformity<B: seismic_native_target::TargetFamily>(
         &self,
         kernel: &PortableBuilder<'_, B>,
         coordinates: registry::IntrinsicUniformity,
@@ -182,7 +182,7 @@ impl SegmentTensor {
         uniformity::all([geometry, input, coordinates])
     }
 
-    fn physical<B: seismic_target::TargetFamily>(
+    fn physical<B: seismic_native_target::TargetFamily>(
         kernel: &PortableBuilder<'_, B>,
         value: SegmentStorage,
     ) -> Self {
@@ -192,7 +192,7 @@ impl SegmentTensor {
         }
     }
 
-    fn read<B: seismic_target::TargetFamily>(
+    fn read<B: seismic_native_target::TargetFamily>(
         &self,
         kernel: &mut PortableBuilder<'_, B>,
         index: &[PortableValue],
@@ -369,14 +369,14 @@ enum StreamBoundPlan {
 type StreamViewPlan = TensorViewTransform<PreparedArg>;
 type StreamSliceAxisPlan = TensorSliceAxis<PreparedArg>;
 
-fn stored_view_in_kernel<B: seismic_target::TargetFamily>(
+fn stored_view_in_kernel<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>, view: &StoredView, writable: bool,
 ) -> PortableTensor {
     let place = kernel.arg_view(*view.backing(), writable);
     view.map(|_| place, |value| kernel.nat_arg(*value))
 }
 
-fn instantiate_stream_tensor<B: seismic_target::TargetFamily>(
+fn instantiate_stream_tensor<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     plan: &StreamTensorPlan,
     bindings: &BindingArena,
@@ -466,7 +466,7 @@ fn instantiate_stream_tensor<B: seismic_target::TargetFamily>(
     SegmentTensor { axes, value }
 }
 
-fn prepared_kernel_arg<B: seismic_target::TargetFamily>(
+fn prepared_kernel_arg<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     argument: PreparedArg,
 ) -> PortableValue {
@@ -477,7 +477,7 @@ fn prepared_kernel_arg<B: seismic_target::TargetFamily>(
     }
 }
 
-struct Lowerer<'f, 'b, B: seismic_target::TargetFamily> {
+struct Lowerer<'f, 'b, B: seismic_native_target::TargetFamily> {
     function: &'f SemanticFunction,
     builder: &'b mut ImplementationBuilder<'f, B>,
     values: SemanticBindings,
@@ -485,7 +485,7 @@ struct Lowerer<'f, 'b, B: seismic_target::TargetFamily> {
     computed_producers: BTreeSet<SemanticValueId>,
 }
 
-impl<'f, 'b, B: seismic_target::TargetFamily> Lowerer<'f, 'b, B> {
+impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
     fn launch_semantic(
         &mut self,
         kernel: seismic_ir::kernel::KernelId,
@@ -2252,14 +2252,14 @@ impl<'f, 'b, B: seismic_target::TargetFamily> Lowerer<'f, 'b, B> {
 
 }
 
-struct SegmentLowerer<'s, 'k, 'f, 'r, B: seismic_target::TargetFamily> {
+struct SegmentLowerer<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> {
     function: &'f SemanticFunction,
     program: &'f seismic_lang::entry::SemanticProgram,
     kernel: &'s mut PortableBuilder<'k, B>,
     values: BTreeMap<SemanticValueId, SegmentBound>,
     helpers: &'r BTreeMap<FamilyId, &'f SemanticFunction>,
     checks: &'r SourceStatuses,
-    target: &'f seismic_target::DeviceDescription<B>,
+    target: &'f seismic_native_target::DeviceDescription<B>,
     registry: &'f crate::target::CompilerRegistry<B>,
     domain: SegmentLaunchDomain,
     alive: PortableValue,
@@ -2268,7 +2268,7 @@ struct SegmentLowerer<'s, 'k, 'f, 'r, B: seismic_target::TargetFamily> {
     lexical: registry::IntrinsicUniformity,
 }
 
-impl<'s, 'k, 'f, 'r, B: seismic_target::TargetFamily> SegmentLowerer<'s, 'k, 'f, 'r, B> {
+impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 'k, 'f, 'r, B> {
     fn bound(&self, value: SemanticValueId) -> SegmentBound {
         self.values
             .get(&value)
@@ -2291,7 +2291,7 @@ impl<'s, 'k, 'f, 'r, B: seismic_target::TargetFamily> SegmentLowerer<'s, 'k, 'f,
     }
 
     fn physical_tensor(&mut self, value: SemanticValueId) -> PortableTensor {
-        fn place<B: seismic_target::TargetFamily>(
+        fn place<B: seismic_native_target::TargetFamily>(
             kernel: &mut PortableBuilder<'_, B>,
             tensor: SegmentTensor,
         ) -> PortableTensor {
@@ -2917,7 +2917,7 @@ fn merge_exact<T: Copy + PartialEq>(slot: &mut Option<T>, value: Option<T>, what
     }
 }
 
-fn segment_capture<B: seismic_target::TargetFamily>(
+fn segment_capture<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     bound: &SegmentCapture,
 ) -> SegmentBound {
@@ -2958,7 +2958,7 @@ fn bind_segment_region_parameters(
     }
 }
 
-fn segment_check_statuses<B: seismic_target::TargetFamily>(
+fn segment_check_statuses<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     checks: &[(SourceFailure, seismic_lang::span::Span)],
     statuses: &[crate::implementation::PortableSourceStatus],
@@ -2982,7 +2982,7 @@ fn segment_check_statuses<B: seismic_target::TargetFamily>(
         .collect()
 }
 
-fn segment_elementwise_arguments<B:seismic_target::TargetFamily>(
+fn segment_elementwise_arguments<B:seismic_native_target::TargetFamily>(
     kernel:&mut PortableBuilder<'_,B>,inputs:&[SegmentBound],index:&[PortableValue]) -> Vec<PortableValue> {
     inputs.iter().map(|input|match input {
         SegmentBound::Scalar(value)=>*value,
@@ -3000,7 +3000,7 @@ fn segment_elementwise_arguments<B:seismic_target::TargetFamily>(
     }).collect()
 }
 
-fn segment_copy_tensor<B: seismic_target::TargetFamily>(
+fn segment_copy_tensor<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     source: &SegmentTensor,
     destination: &PortableTensor,
@@ -3038,7 +3038,7 @@ fn segment_copy_tensor<B: seismic_target::TargetFamily>(
     });
 }
 
-fn segment_fill_tensor<B: seismic_target::TargetFamily>(
+fn segment_fill_tensor<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     destination: &PortableTensor,
     axes: &[PortableValue],
@@ -3060,7 +3060,7 @@ fn segment_fill_tensor<B: seismic_target::TargetFamily>(
     });
 }
 
-fn unravel_index<B: seismic_target::TargetFamily>(
+fn unravel_index<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     mut linear: PortableValue,
     axes: &[PortableValue],
@@ -3156,7 +3156,7 @@ fn index_expr(arena: &mut ExprArena, bound: &Bound) -> NatExpr {
     value
 }
 
-fn nested<B: seismic_target::TargetFamily>(
+fn nested<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     axes: &[NatExpr],
     axis: usize,
@@ -3185,7 +3185,7 @@ fn reduction_index(
     out.insert(axis, reduction);
     out
 }
-fn zero_of<B: seismic_target::TargetFamily>(
+fn zero_of<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     ty: ValueType,
 ) -> PortableValue {
@@ -3202,7 +3202,7 @@ fn zero_of<B: seismic_target::TargetFamily>(
     }
 }
 
-fn one_of<B: seismic_target::TargetFamily>(
+fn one_of<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     ty: ValueType,
 ) -> PortableValue {
@@ -3224,7 +3224,7 @@ fn one_of<B: seismic_target::TargetFamily>(
     }
 }
 
-fn portable_index<B: seismic_target::TargetFamily>(
+fn portable_index<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     value: PortableValue,
 ) -> PortableValue {
@@ -3235,7 +3235,7 @@ fn portable_index<B: seismic_target::TargetFamily>(
     }
 }
 
-fn scalar_bits<B: seismic_target::TargetFamily>(
+fn scalar_bits<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     dtype: DType,
     bits: u32,
@@ -3252,7 +3252,7 @@ fn scalar_bits<B: seismic_target::TargetFamily>(
     kernel.constant(value, ty)
 }
 
-fn lower_scalar_primitive<B: seismic_target::TargetFamily>(
+fn lower_scalar_primitive<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     primitive: &PrimitiveId,
     args: &[PortableValue],
@@ -3319,7 +3319,7 @@ fn lower_scalar_primitive<B: seismic_target::TargetFamily>(
     }
 }
 
-fn lower_constant<B: seismic_target::TargetFamily>(
+fn lower_constant<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     value: ReferenceScalar,
     output: &SemanticType,
@@ -3533,7 +3533,7 @@ fn direct_native_natural_expr(expression: &CapturedExpr) -> bool {
         _ => false,
     }
 }
-fn captured_uniformity<B: seismic_target::TargetFamily>(
+fn captured_uniformity<B: seismic_native_target::TargetFamily>(
     kernel: &PortableBuilder<'_, B>,
     expression: &CapturedExpr,
     binders: &BTreeMap<LoopBinderId, registry::IntrinsicUniformity>,
@@ -3584,13 +3584,13 @@ fn captured_uniformity<B: seismic_target::TargetFamily>(
         }
     }
 }
-fn lower_captured_expr<B: seismic_target::TargetFamily>(
+fn lower_captured_expr<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     expression: &CapturedExpr,
 ) -> PortableValue {
     lower_captured_expr_with(kernel, expression, &mut BTreeMap::new())
 }
-fn lower_captured_expr_with<B: seismic_target::TargetFamily>(
+fn lower_captured_expr_with<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     expression: &CapturedExpr,
     binders: &mut BTreeMap<LoopBinderId, PortableValue>,

@@ -2,7 +2,7 @@
 //! exceptional cases live only in seismic-lang; this module maps its vocabulary.
 use super::internals::{PortableBuilder, PortableValue};
 use super::ops::{self, ValueType};
-use crate::target::PhysicalDialect;
+use crate::physical_target::PhysicalDialect;
 use seismic_lang::intrinsics::MathOp;
 use seismic_lang::reference_math as reference;
 use seismic_lang::types::DType;

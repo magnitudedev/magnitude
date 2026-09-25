@@ -13,17 +13,17 @@ pub(crate) fn realize_kernel<T, C>(
     target: &DeviceDescription<T>,
 ) -> Result<
     (
-        seismic_target::NativeKernel<T, C::Handle>,
-        seismic_target::NativeArtifactMetrics,
+        seismic_native_target::NativeKernel<T, C::Handle>,
+        seismic_native_target::NativeArtifactMetrics,
     ),
     crate::errors::PreparationError,
 >
 where
-    T: seismic_target::TargetFamily,
-    C: seismic_target::NativeCompiler<T>,
+    T: seismic_native_target::TargetFamily,
+    C: seismic_native_target::NativeCompiler<T>,
 {
-    let formation = seismic_target::form_native_kernel(compiler, context, target, kernel)
-        .and_then(|candidate| seismic_target::reconcile_native_kernel(compiler, candidate))
+    let formation = seismic_native_target::form_native_kernel(compiler, context, target, kernel)
+        .and_then(|candidate| seismic_native_target::reconcile_native_kernel(compiler, candidate))
         .map_err(crate::errors::PreparationError::NativeCompilation)?;
     Ok(formation.into_parts())
 }

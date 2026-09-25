@@ -28,17 +28,17 @@ impl AnalyticalModelDefinition<Cuda> for CudaAnalyticalModel {
 
     fn operation_cost(
         &self,
-        _facts: &<Cuda as seismic_ir::target::PhysicalDialect>::Facts,
+        _facts: &<Cuda as seismic_ir::physical_target::PhysicalDialect>::Facts,
         _supported_intrinsics: &BTreeSet<seismic_lang::ids::IntrinsicId>,
         arena: &mut seismic_lang::expr::ExprArena,
         kernel: &seismic_ir::kernel::Kernel<Cuda>,
-        _emission: &seismic_ir::target::KernelEmissionLayout,
+        _emission: &seismic_ir::physical_target::KernelEmissionLayout,
         _launch: &seismic_ir::schedule::Launch<Cuda>,
         _locals: &seismic_ir::storage::LaunchLocalLayout,
         op: seismic_ir::kernel::ops::ClosedOpView<'_, Cuda>,
     ) -> Result<OperationCost<Self::Service>, ModelLimitation> {
         use seismic_ir::kernel::ops::{ClosedOpView, ClosedPlace, ClosedPlaceKind, ValueType};
-        use seismic_ir::target::LocalRealization;
+        use seismic_ir::physical_target::LocalRealization;
 
         fn demand(
             class: CudaService,

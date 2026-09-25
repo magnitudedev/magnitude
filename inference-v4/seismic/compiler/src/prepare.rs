@@ -12,11 +12,11 @@ use crate::prepared::{PreparedKernel, SelectionFunction};
 use crate::target::CompilerRegistry;
 use seismic_lang::entry::LogicalEntry;
 use seismic_lang::precision::PrecisionPolicy;
-use seismic_target::NativeCompiler;
+use seismic_native_target::NativeCompiler;
 
 impl<T, C> CandidateEvaluator<T, C> for AnalyticalEvaluator<'_, T>
 where
-    T: seismic_target::TargetFamily,
+    T: seismic_native_target::TargetFamily,
     C: NativeCompiler<T>,
 {
     fn evaluate(
@@ -102,7 +102,7 @@ pub fn prepare_analytically<T, C>(
     planning_budget: &PlanningBudget,
 ) -> Result<PreparedKernel<T, C::Handle>, PreparationError>
 where
-    T: seismic_target::TargetFamily,
+    T: seismic_native_target::TargetFamily,
     C: NativeCompiler<T>,
 {
     let mut session = EvaluationSession::new(
@@ -126,7 +126,7 @@ pub fn prepare_with_evaluator<T, C, E>(
     evaluator: &mut E,
 ) -> Result<PreparedKernel<T, C::Handle>, PreparationError>
 where
-    T: seismic_target::TargetFamily,
+    T: seismic_native_target::TargetFamily,
     C: NativeCompiler<T>,
     E: CandidateEvaluator<T, C>,
 {
@@ -143,7 +143,7 @@ pub(crate) fn evaluate_and_finalize<T, C, E>(
     std::time::Duration,
 )
 where
-    T: seismic_target::TargetFamily,
+    T: seismic_native_target::TargetFamily,
     C: NativeCompiler<T>,
     E: CandidateEvaluator<T, C>,
 {

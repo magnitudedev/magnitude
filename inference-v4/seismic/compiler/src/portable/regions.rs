@@ -2,7 +2,7 @@
 //! products, region parameters and root result publication.
 use super::*;
 
-impl<'f, 'b, B: seismic_target::TargetFamily> Lowerer<'f, 'b, B> {
+impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
     pub(super) fn materialize_tensor(&mut self, value: SemanticValueId) {
         let Bound::Tensor(TensorRealization::Computed(plan)) = self.values.get(self.builder.bindings(), value) else { return; };
         let destination = self.builder.portable_allocate_tensor_axes(value, plan.axes.clone());

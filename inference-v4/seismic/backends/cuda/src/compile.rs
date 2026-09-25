@@ -7,8 +7,8 @@ use crate::driver::{
 };
 use crate::{ptx, Cuda};
 use seismic_ir::kernel::Kernel;
-use seismic_ir::target::KernelEmissionLayout;
-use seismic_target::{DeviceDescription, NativeCompilationError};
+use seismic_ir::physical_target::KernelEmissionLayout;
+use seismic_native_target::{DeviceDescription, NativeCompilationError};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Instant;
@@ -123,19 +123,19 @@ fn layout_metadata_bytes(layout: &KernelEmissionLayout) -> Result<u64, NativeCom
         .and_then(|bytes| {
             bytes.checked_add(
                 layout.bindings.len()
-                    * std::mem::size_of::<seismic_ir::target::BindingEmissionLayout>(),
+                    * std::mem::size_of::<seismic_ir::physical_target::BindingEmissionLayout>(),
             )
         })
         .and_then(|bytes| {
             bytes.checked_add(
                 layout.locals.len()
-                    * std::mem::size_of::<seismic_ir::target::LocalEmissionLayout>(),
+                    * std::mem::size_of::<seismic_ir::physical_target::LocalEmissionLayout>(),
             )
         })
         .and_then(|bytes| {
             bytes.checked_add(
                 layout.addressable_resources.len()
-                    * std::mem::size_of::<seismic_ir::target::AddressableResourceEmissionLayout>(),
+                    * std::mem::size_of::<seismic_ir::physical_target::AddressableResourceEmissionLayout>(),
             )
         })
         .and_then(|bytes| {

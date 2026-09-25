@@ -45,7 +45,7 @@ pub struct Executor {
 impl Executor {
     pub fn analytical(
         &self,
-        device: Arc<seismic_target::DeviceDescription<Cpu>>,
+        device: Arc<seismic_native_target::DeviceDescription<Cpu>>,
     ) -> Result<
         seismic_compiler::evaluation::AnalyticalEvaluationContext<Cpu>,
         seismic_compiler::errors::TargetError,

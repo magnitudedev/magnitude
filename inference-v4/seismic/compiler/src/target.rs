@@ -11,8 +11,8 @@
 //! compiler-policy registrations separately from native formation, analytical
 //! estimation, and execution services.
 
-use seismic_ir::target::*;
-use seismic_target::{
+use seismic_ir::physical_target::*;
+use seismic_native_target::{
     CompatibilityIdentity, DeviceDescription, DeviceDescriptionIdentity,
     NumericalEnvironmentIdentity,
 };
@@ -40,7 +40,7 @@ pub struct ExecutionProfileIdentity {
 /// validates these facts and derives the capability sets in the immutable target
 /// description.
 #[derive(Debug)]
-pub struct DiscoveredTarget<T: seismic_target::TargetFamily> {
+pub struct DiscoveredTarget<T: seismic_native_target::TargetFamily> {
     pub identity: CompatibilityIdentity,
     pub limits: TargetLimits,
     pub dtypes: DataTypeSupport,
@@ -54,7 +54,7 @@ pub struct DiscoveredTarget<T: seismic_target::TargetFamily> {
 /// Per-open measured execution behavior. This type owns no legality,
 /// capability, numerical, ABI, or native-kernel facts.
 #[derive(Debug)]
-pub struct ExecutionProfile<T: seismic_target::TargetFamily> {
+pub struct ExecutionProfile<T: seismic_native_target::TargetFamily> {
     identity: ExecutionProfileIdentity,
     services: Vec<ServiceDefinition>,
     acquisition: ProfileAcquisitionMetrics,
@@ -63,7 +63,7 @@ pub struct ExecutionProfile<T: seismic_target::TargetFamily> {
 }
 
 #[derive(Debug)]
-pub struct ExecutionProfileParts<T: seismic_target::TargetFamily> {
+pub struct ExecutionProfileParts<T: seismic_native_target::TargetFamily> {
     device: Arc<DeviceDescription<T>>,
     probe_suite_revision: &'static str,
     services: Vec<ServiceDefinition>,
@@ -71,7 +71,7 @@ pub struct ExecutionProfileParts<T: seismic_target::TargetFamily> {
     composition_qualification: CompositionQualificationParts,
 }
 
-impl<T: seismic_target::TargetFamily> ExecutionProfileParts<T> {
+impl<T: seismic_native_target::TargetFamily> ExecutionProfileParts<T> {
     pub fn new(
         device: Arc<DeviceDescription<T>>,
         probe_suite_revision: &'static str,
@@ -96,7 +96,7 @@ impl<T: seismic_target::TargetFamily> ExecutionProfileParts<T> {
 /// Closes discovered target facts against the independently owned compiler
 /// registry and returns immutable target truth. The registry is consumed only
 /// while deriving supported capabilities and is not retained by the result.
-pub fn assemble_device_description<T: seismic_target::TargetFamily>(
+pub fn assemble_device_description<T: seismic_native_target::TargetFamily>(
     discovered: DiscoveredTarget<T>,
     registry: &CompilerRegistry<T>,
 ) -> Result<DeviceDescription<T>, TargetError> {
@@ -104,14 +104,14 @@ pub fn assemble_device_description<T: seismic_target::TargetFamily>(
 }
 
 /// Binds every target constant the compiler may reference into one arena.
-pub fn bind_target_constants<T: seismic_target::TargetFamily>(
+pub fn bind_target_constants<T: seismic_native_target::TargetFamily>(
     device: &DeviceDescription<T>,
     arena: &mut ExprArena,
 ) -> TargetConstants {
     internals::bind_constants(device, arena)
 }
 
-impl<T: seismic_target::TargetFamily> ExecutionProfile<T> {
+impl<T: seismic_native_target::TargetFamily> ExecutionProfile<T> {
     pub(crate) fn assemble(
         required_services: BTreeSet<ServiceClassId>,
         parts: ExecutionProfileParts<T>,
@@ -180,7 +180,7 @@ impl TargetConstants {
 
 /// One complete intrinsic implementation row. The type requires both the
 /// launch-requirement callback and lowering callback for every registered id.
-pub struct IntrinsicImplementation<T: seismic_target::TargetFamily> {
+pub struct IntrinsicImplementation<T: seismic_native_target::TargetFamily> {
     pub id: IntrinsicId,
     pub launch_requirements: fn(
         &DeviceDescription<T>,
@@ -197,7 +197,7 @@ pub struct IntrinsicImplementation<T: seismic_target::TargetFamily> {
     ),
 }
 
-impl<T: seismic_target::TargetFamily> fmt::Debug for IntrinsicImplementation<T> {
+impl<T: seismic_native_target::TargetFamily> fmt::Debug for IntrinsicImplementation<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IntrinsicImplementation")
             .field("id", &self.id)
@@ -207,7 +207,7 @@ impl<T: seismic_target::TargetFamily> fmt::Debug for IntrinsicImplementation<T> 
 
 /// One capability registration: its complete intrinsic implementation rows
 /// and the target predicate that selects a subset for one device.
-pub struct CapabilityRegistration<T: seismic_target::TargetFamily> {
+pub struct CapabilityRegistration<T: seismic_native_target::TargetFamily> {
     pub capability: CapabilityId,
     /// Every intrinsic implementation owned by this capability.
     pub implementations: Vec<IntrinsicImplementation<T>>,
@@ -217,7 +217,7 @@ pub struct CapabilityRegistration<T: seismic_target::TargetFamily> {
     pub supported: fn(&T::Facts, &TargetLimits, &DataTypeSupport) -> BTreeSet<IntrinsicId>,
 }
 
-impl<T: seismic_target::TargetFamily> fmt::Debug for CapabilityRegistration<T> {
+impl<T: seismic_native_target::TargetFamily> fmt::Debug for CapabilityRegistration<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CapabilityRegistration")
             .field("capability", &self.capability)
@@ -228,7 +228,7 @@ impl<T: seismic_target::TargetFamily> fmt::Debug for CapabilityRegistration<T> {
 /// The sealed static registry of one backend, assembled once at compiler
 /// initialization. Duplicate ids, a signature without an emitter, or an
 /// emitter without a signature are startup panics (§4.2, §13.3.1).
-pub struct CompilerRegistryParts<T: seismic_target::TargetFamily> {
+pub struct CompilerRegistryParts<T: seismic_native_target::TargetFamily> {
     pub capabilities: Vec<CapabilityRegistration<T>>,
 
     pub native_launch_constraints: fn(
@@ -237,17 +237,17 @@ pub struct CompilerRegistryParts<T: seismic_target::TargetFamily> {
         &seismic_ir::schedule::Launch<T>,
         &seismic_ir::storage::LaunchLocalLayout,
         &seismic_ir::kernel::Kernel<T>,
-        &seismic_target::NativeKernelDescription<T>,
+        &seismic_native_target::NativeKernelDescription<T>,
     ) -> Vec<seismic_lang::expr::BoolExpr>,
     pub addressable_resources: fn(&T::Facts) -> Vec<AddressableResourceClass>,
     pub emitted_intrinsics: BTreeSet<IntrinsicId>,
 }
 
-pub struct CompilerRegistry<T: seismic_target::TargetFamily> {
+pub struct CompilerRegistry<T: seismic_native_target::TargetFamily> {
     inner: internals::Registry<T>,
 }
 
-impl<T: seismic_target::TargetFamily> CompilerRegistry<T> {
+impl<T: seismic_native_target::TargetFamily> CompilerRegistry<T> {
     /// Assembles and seals. Panics on an inconsistent registration set.
     pub fn assemble(parts: CompilerRegistryParts<T>) -> Self {
         Self {
@@ -271,13 +271,13 @@ impl<T: seismic_target::TargetFamily> CompilerRegistry<T> {
         launch: &seismic_ir::schedule::Launch<T>,
         locals: &seismic_ir::storage::LaunchLocalLayout,
         kernel: &seismic_ir::kernel::Kernel<T>,
-        native: &seismic_target::NativeKernelDescription<T>,
+        native: &seismic_native_target::NativeKernelDescription<T>,
     ) -> Vec<seismic_lang::expr::BoolExpr> {
         (self.inner.native_launch_constraints)(target, arena, launch, locals, kernel, native)
     }
 }
 
-impl<T: seismic_target::TargetFamily> fmt::Debug for CompilerRegistry<T> {
+impl<T: seismic_native_target::TargetFamily> fmt::Debug for CompilerRegistry<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CompilerRegistry").finish()
     }
@@ -295,7 +295,7 @@ mod internals {
     use super::*;
     use seismic_lang::registry;
 
-    pub(super) struct Registry<T: seismic_target::TargetFamily> {
+    pub(super) struct Registry<T: seismic_native_target::TargetFamily> {
         capabilities: Vec<CapabilityRegistration<T>>,
 
         pub(super) native_launch_constraints: fn(
@@ -304,12 +304,12 @@ mod internals {
             &seismic_ir::schedule::Launch<T>,
             &seismic_ir::storage::LaunchLocalLayout,
             &seismic_ir::kernel::Kernel<T>,
-            &seismic_target::NativeKernelDescription<T>,
+            &seismic_native_target::NativeKernelDescription<T>,
         ) -> Vec<seismic_lang::expr::BoolExpr>,
         addressable_resources: fn(&T::Facts) -> Vec<AddressableResourceClass>,
     }
 
-    impl<T: seismic_target::TargetFamily> Registry<T> {
+    impl<T: seismic_native_target::TargetFamily> Registry<T> {
         /// Seals one backend's registrations. Panics (§13.3.1) on:
         /// a capability registered twice; a capability of another backend;
         /// a capability advertised with no implemented signature; an
@@ -403,7 +403,7 @@ mod internals {
     /// `TargetError::UnsupportedDevice`; nothing in the compiler models a
     /// target without these facts.
     fn check_floor(
-        parts: &DiscoveredTarget<impl seismic_target::TargetFamily>,
+        parts: &DiscoveredTarget<impl seismic_native_target::TargetFamily>,
     ) -> Result<(), TargetError> {
         let unsupported = |reason: String| TargetError::UnsupportedDevice(reason);
         let limits = &parts.limits;
@@ -500,7 +500,7 @@ mod internals {
     /// capability and intrinsic sets are derived from the sealed registry's
     /// predicates over the facts. A predicate that names a signature its
     /// registration does not implement is a registry bug (§13.3.1).
-    pub(super) fn assemble<T: seismic_target::TargetFamily>(
+    pub(super) fn assemble<T: seismic_native_target::TargetFamily>(
         parts: DiscoveredTarget<T>,
         registry: &CompilerRegistry<T>,
     ) -> Result<DeviceDescription<T>, TargetError> {
@@ -601,7 +601,7 @@ mod internals {
             backend: T::NAME,
             fingerprint: numerical.finalize().into(),
         };
-        DeviceDescription::new(seismic_target::DeviceDescriptionParts {
+        DeviceDescription::new(seismic_native_target::DeviceDescriptionParts {
             identity,
             compatibility,
             numerical_environment,
@@ -619,7 +619,7 @@ mod internals {
         .map_err(|error| TargetError::UnsupportedDevice(error.to_string()))
     }
 
-    pub(super) fn assemble_execution<T: seismic_target::TargetFamily>(
+    pub(super) fn assemble_execution<T: seismic_native_target::TargetFamily>(
         required: BTreeSet<ServiceClassId>,
         mut parts: ExecutionProfileParts<T>,
     ) -> Result<ExecutionProfile<T>, TargetError> {
@@ -1154,7 +1154,7 @@ mod internals {
         })
     }
 
-    pub(super) fn bind_constants<T: seismic_target::TargetFamily>(
+    pub(super) fn bind_constants<T: seismic_native_target::TargetFamily>(
         profile: &DeviceDescription<T>,
         arena: &mut ExprArena,
     ) -> TargetConstants {

@@ -17,7 +17,7 @@ use crate::realization::{
 use crate::target::CompilerRegistry;
 use seismic_lang::expr::compiled::CompiledPredicate;
 use seismic_lang::expr::{ExprArena, PartialAssignment};
-use seismic_target::NativeCompiler;
+use seismic_native_target::NativeCompiler;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -132,12 +132,12 @@ impl<P> PreparedPortfolio<P> {
     }
 }
 
-struct ImplementationReconciler<'a, T: seismic_target::TargetFamily> {
-    target: &'a seismic_target::DeviceDescription<T>,
+struct ImplementationReconciler<'a, T: seismic_native_target::TargetFamily> {
+    target: &'a seismic_native_target::DeviceDescription<T>,
     registry: &'a CompilerRegistry<T>,
 }
 
-impl<T: seismic_target::TargetFamily> NativeCandidateReconciler<T>
+impl<T: seismic_native_target::TargetFamily> NativeCandidateReconciler<T>
     for ImplementationReconciler<'_, T>
 {
     type Output = Implementation<T>;
@@ -160,7 +160,7 @@ impl<T: seismic_target::TargetFamily> NativeCandidateReconciler<T>
     }
 }
 
-struct PreparedCandidate<T: seismic_target::TargetFamily, H> {
+struct PreparedCandidate<T: seismic_native_target::TargetFamily, H> {
     universal: bool,
     fixed: PartialAssignment,
     retained: RetainedCandidate<T>,
@@ -169,13 +169,13 @@ struct PreparedCandidate<T: seismic_target::TargetFamily, H> {
 
 pub struct EvaluationSession<'a, T, C>
 where
-    T: seismic_target::TargetFamily,
+    T: seismic_native_target::TargetFamily,
     C: NativeCompiler<T>,
 {
     id: u64,
     domain: CandidateDomain<'a, T>,
     invocation: std::sync::Arc<InvocationContract>,
-    device: &'a seismic_target::DeviceDescription<T>,
+    device: &'a seismic_native_target::DeviceDescription<T>,
     realizer: Realizer<'a, T, C, ImplementationReconciler<'a, T>>,
     accounting: PreparationBudgetTracker,
     planning_budget: PlanningBudget,
@@ -188,7 +188,7 @@ where
 
 impl<'a, T, C> EvaluationSession<'a, T, C>
 where
-    T: seismic_target::TargetFamily,
+    T: seismic_native_target::TargetFamily,
     C: NativeCompiler<T>,
 {
     pub(crate) fn from_domain(
@@ -196,7 +196,7 @@ where
         registry: &'a CompilerRegistry<T>,
         compiler: &'a C,
         native_context: &'a C::Context,
-        device: &'a seismic_target::DeviceDescription<T>,
+        device: &'a seismic_native_target::DeviceDescription<T>,
         preparation_budget: &PreparationBudget,
         planning_budget: &PlanningBudget,
     ) -> Result<Self, PreparationError> {
@@ -243,7 +243,7 @@ where
     /// substitute a different registry after construction has begun.
     pub fn new(
         entry: seismic_lang::entry::LogicalEntry,
-        device: &'a seismic_target::DeviceDescription<T>,
+        device: &'a seismic_native_target::DeviceDescription<T>,
         registry: &'a CompilerRegistry<T>,
         compiler: &'a C,
         native_context: &'a C::Context,
@@ -653,14 +653,14 @@ pub(crate) mod boundary_tests {
     use seismic_lang::precision::PrecisionPolicy;
 
     fn domain<'ctx>(
-        device: &'ctx seismic_target::DeviceDescription<FakeTarget>,
+        device: &'ctx seismic_native_target::DeviceDescription<FakeTarget>,
         registry: &'ctx CompilerRegistry<FakeTarget>,
     ) -> CandidateDomain<'ctx, FakeTarget> {
         domain_source(device, registry, "fn probe(x: f32) -> f32:\n    return x\n")
     }
 
     fn domain_source<'ctx>(
-        device: &'ctx seismic_target::DeviceDescription<FakeTarget>,
+        device: &'ctx seismic_native_target::DeviceDescription<FakeTarget>,
         registry: &'ctx CompilerRegistry<FakeTarget>,
         source: &str,
     ) -> CandidateDomain<'ctx, FakeTarget> {
@@ -685,13 +685,13 @@ pub(crate) mod boundary_tests {
     }
 
     pub(crate) fn domain_with_optional<'ctx>(
-        device: &'ctx seismic_target::DeviceDescription<FakeTarget>,
+        device: &'ctx seismic_native_target::DeviceDescription<FakeTarget>,
         registry: &'ctx CompilerRegistry<FakeTarget>,
     ) -> (CandidateDomain<'ctx, FakeTarget>, CandidateCoordinate) {
         authored_domain(device,registry,"fn probe(x: f32) -> f32:\n    return x\n\nlower probe(x: f32) -> f32 for cpu:\n    return x\n", PrecisionPolicy::Exact)
     }
 
-    fn authored_domain<'ctx>(device:&'ctx seismic_target::DeviceDescription<FakeTarget>,registry:&'ctx CompilerRegistry<FakeTarget>,source:&str,precision:PrecisionPolicy) -> (CandidateDomain<'ctx,FakeTarget>,CandidateCoordinate) {
+    fn authored_domain<'ctx>(device:&'ctx seismic_native_target::DeviceDescription<FakeTarget>,registry:&'ctx CompilerRegistry<FakeTarget>,source:&str,precision:PrecisionPolicy) -> (CandidateDomain<'ctx,FakeTarget>,CandidateCoordinate) {
         use crate::candidate_domain::{BodyMapping,ConstructionCoordinate,ConstructionAllowance,Materialization};
         let module=check_source(SourceSet::new(vec![SourceFile{path:"session-outcome.seismic".into(),text:source.into()}])).unwrap();
         let entry=module.entry(module.entry_named("probe").unwrap(),&ElementBindings::default()).unwrap();
@@ -709,7 +709,7 @@ pub(crate) mod boundary_tests {
         }
     }
 
-    fn identity(device: &seismic_target::DeviceDescription<FakeTarget>) -> EvaluationIdentity {
+    fn identity(device: &seismic_native_target::DeviceDescription<FakeTarget>) -> EvaluationIdentity {
         let provenance = EvaluationProvenance::new([4; 32], [5; 32]);
         EvaluationIdentity::new(device.identity().clone(), provenance)
     }
@@ -834,7 +834,7 @@ pub(crate) mod boundary_tests {
         description.limits.max_argument_bytes = 4096;
         description.limits.max_workgroup_bytes = 4096;
         description.limits.max_grid = [1024; 3];
-        let device = seismic_target::DeviceDescription::new(description).unwrap();
+        let device = seismic_native_target::DeviceDescription::new(description).unwrap();
         let registry = registry();
         let domain = domain_source(&device, &registry,
             "fn twice(x: &tensor[4] f32) -> tensor[4] f32:\n    return x + x\n\nfn total(x: &tensor[4] f32) -> f32:\n    return reduce(x, 0, sum)\n\nfn probe(x: &tensor[4] f32) -> f32:\n    return total(twice(x))\n");

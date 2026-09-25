@@ -5,8 +5,8 @@ use crate::{Metal, render};
 use objc2_foundation::NSString;
 use objc2_metal::{MTLDevice, MTLLibrary};
 use seismic_ir::kernel::Kernel;
-use seismic_ir::target::KernelEmissionLayout;
-use seismic_target::{DeviceDescription, NativeCompilationError};
+use seismic_ir::physical_target::KernelEmissionLayout;
+use seismic_native_target::{DeviceDescription, NativeCompilationError};
 use sha2::{Digest, Sha256};
 use std::time::Instant;
 
@@ -67,19 +67,19 @@ pub(crate) fn compile_kernel(
         .and_then(|bytes| {
             bytes.checked_add(
                 layout.words.bindings.len()
-                    * std::mem::size_of::<seismic_ir::target::BindingWordLayout>(),
+                    * std::mem::size_of::<seismic_ir::physical_target::BindingWordLayout>(),
             )
         })
         .and_then(|bytes| {
             bytes.checked_add(
                 layout.words.locals.len()
-                    * std::mem::size_of::<seismic_ir::target::LocalWordLayout>(),
+                    * std::mem::size_of::<seismic_ir::physical_target::LocalWordLayout>(),
             )
         })
         .and_then(|bytes| {
             bytes.checked_add(
                 layout.words.addressable_resources.len()
-                    * std::mem::size_of::<seismic_ir::target::AddressableResourceWordLayout>(),
+                    * std::mem::size_of::<seismic_ir::physical_target::AddressableResourceWordLayout>(),
             )
         })
         .and_then(|bytes| bytes.checked_add(source_text.len()))

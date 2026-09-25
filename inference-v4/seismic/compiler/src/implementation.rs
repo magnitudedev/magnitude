@@ -42,7 +42,7 @@ use seismic_lang::ids::{FamilyId, NodeId, RegionId, SemanticValueId, StableFunct
 use seismic_lang::precision::PrecisionPolicy;
 use seismic_lang::registry::BackendName;
 use seismic_lang::types::DType;
-use seismic_target::DeviceDescription;
+use seismic_native_target::DeviceDescription;
 use std::fmt;
 use std::sync::Arc;
 
@@ -58,7 +58,7 @@ pub struct ImplementationIdentity {
 /// Universal launch specialization uses only reflected native legality.
 /// Performance evaluation is owned by `evaluation` after the whole candidate
 /// domain has been sealed and cannot change executable structure.
-pub(crate) fn reconcile_candidate_with_descriptions<B: seismic_target::TargetFamily>(
+pub(crate) fn reconcile_candidate_with_descriptions<B: seismic_native_target::TargetFamily>(
     family: Arc<ConstructedCandidate<B>>,
     assignment: seismic_lang::expr::PartialAssignment,
     arena: &mut ExprArena,
@@ -172,7 +172,7 @@ mod implementation_invariant_tests {
     }
 }
 
-fn native_hard_constraints<B: seismic_target::TargetFamily>(
+fn native_hard_constraints<B: seismic_native_target::TargetFamily>(
     arena: &mut ExprArena,
     target: &DeviceDescription<B>,
     registry: &CompilerRegistry<B>,
@@ -349,7 +349,7 @@ pub(crate) fn expression_detail(arena: &ExprArena, expression: AnyExpr, depth: u
 /// kernel has a reconciled native artifact and all reflected limits have
 /// already been folded into `hard_constraints`.
 #[derive(Debug)]
-pub struct Implementation<B: seismic_target::TargetFamily> {
+pub struct Implementation<B: seismic_native_target::TargetFamily> {
     family: Arc<ConstructedCandidate<B>>,
     identity: ImplementationIdentity,
     assignment_identity: [u8; 32],
@@ -358,7 +358,7 @@ pub struct Implementation<B: seismic_target::TargetFamily> {
     native: Arc<crate::realization::RealizedNativeSet<B>>,
 }
 
-impl<B: seismic_target::TargetFamily> Implementation<B> {
+impl<B: seismic_native_target::TargetFamily> Implementation<B> {
     pub fn identity(&self) -> &ImplementationIdentity {
         &self.identity
     }
@@ -414,7 +414,7 @@ impl<B: seismic_target::TargetFamily> Implementation<B> {
     }
 }
 
-pub(crate) fn validate_universal_implementation<B: seismic_target::TargetFamily>(
+pub(crate) fn validate_universal_implementation<B: seismic_native_target::TargetFamily>(
     implementation: &Implementation<B>,
     arena: &mut ExprArena,
     target_domain: BoolExpr,
@@ -672,13 +672,13 @@ impl ScheduleRepeat {
 
 /// The one way to build an implementation. Created while closing a candidate
 /// domain.
-pub(crate) struct ImplementationBuilder<'a, B: seismic_target::TargetFamily> {
+pub(crate) struct ImplementationBuilder<'a, B: seismic_native_target::TargetFamily> {
     inner: internals::Builder<'a, B>,
 }
 
 /// A temporary borrow of the immutable construction inputs and the domain's
 /// expression owner. Suspended physical state contains none of these borrows.
-pub(crate) struct ConstructionContext<'a, B: seismic_target::TargetFamily> {
+pub(crate) struct ConstructionContext<'a, B: seismic_native_target::TargetFamily> {
     arena: &'a mut ExprArena,
     program: &'a SemanticProgram,
     target: &'a DeviceDescription<B>,
@@ -687,7 +687,7 @@ pub(crate) struct ConstructionContext<'a, B: seismic_target::TargetFamily> {
     precision: &'a PrecisionPolicy,
 }
 
-impl<'a, B: seismic_target::TargetFamily> ConstructionContext<'a, B> {
+impl<'a, B: seismic_native_target::TargetFamily> ConstructionContext<'a, B> {
     /// Resume only against the checked entry retained by the candidate domain.
     pub(crate) fn for_resume(
         entry: crate::candidate_domain::SourceEntryBorrow<'a>,
@@ -707,7 +707,7 @@ impl<'a, B: seismic_target::TargetFamily> ConstructionContext<'a, B> {
 
 /// The candidate domain can start source construction, but cannot acquire an
 /// unrestricted physical builder. Only the source cursor owns that builder.
-pub(crate) fn begin_source_construction<'a, B: seismic_target::TargetFamily>(
+pub(crate) fn begin_source_construction<'a, B: seismic_native_target::TargetFamily>(
     entry: crate::candidate_domain::SourceEntryBorrow<'a>,
     selection: crate::candidate_domain::BodySelection,
     target: &'a DeviceDescription<B>,
@@ -767,7 +767,7 @@ pub(crate) fn begin_source_construction<'a, B: seismic_target::TargetFamily>(
     crate::portable::construction::SourceConstruction::begin(builder, mode)
 }
 
-impl<'a, B: seismic_target::TargetFamily> ImplementationBuilder<'a, B> {
+impl<'a, B: seismic_native_target::TargetFamily> ImplementationBuilder<'a, B> {
     pub(crate) fn suspend(self) -> BuilderState<B> {
         self.inner.state
     }
@@ -1130,8 +1130,8 @@ mod internals {
     /// the IR owner before the remaining compiler metadata has been finalized;
     /// deref keeps the open-phase implementation uncluttered without exposing
     /// an optional lifecycle in the public IR API.
-    pub(super) struct OpenConstruction<B: seismic_target::TargetFamily>(Option<Construction<B>>);
-    impl<B: seismic_target::TargetFamily> OpenConstruction<B> {
+    pub(super) struct OpenConstruction<B: seismic_native_target::TargetFamily>(Option<Construction<B>>);
+    impl<B: seismic_native_target::TargetFamily> OpenConstruction<B> {
         fn new(construction: Construction<B>) -> Self {
             Self(Some(construction))
         }
@@ -1141,7 +1141,7 @@ mod internals {
                 .expect("builder construction is consumed exactly once at close")
         }
     }
-    impl<B: seismic_target::TargetFamily> std::ops::Deref for OpenConstruction<B> {
+    impl<B: seismic_native_target::TargetFamily> std::ops::Deref for OpenConstruction<B> {
         type Target = Construction<B>;
         fn deref(&self) -> &Self::Target {
             self.0
@@ -1149,7 +1149,7 @@ mod internals {
                 .expect("builder construction is available before close")
         }
     }
-    impl<B: seismic_target::TargetFamily> std::ops::DerefMut for OpenConstruction<B> {
+    impl<B: seismic_native_target::TargetFamily> std::ops::DerefMut for OpenConstruction<B> {
         fn deref_mut(&mut self) -> &mut Self::Target {
             self.0
                 .as_mut()
@@ -1157,7 +1157,7 @@ mod internals {
         }
     }
 
-    struct CaptureBindings<'a, B: seismic_target::TargetFamily> {
+    struct CaptureBindings<'a, B: seismic_native_target::TargetFamily> {
         construction: &'a mut Construction<B>,
         arena: &'a mut ExprArena,
         storage: &'a seismic_ir::storage::TopologyBuilder,
@@ -1166,7 +1166,7 @@ mod internals {
         slots: HashMap<AnyScalarSlot, AnyScalarSlot>,
         quantities: HashMap<HostQuantitySlot, HostQuantitySlot>,
     }
-    impl<B: seismic_target::TargetFamily> crate::portable::BindingPhysicalImport
+    impl<B: seismic_native_target::TargetFamily> crate::portable::BindingPhysicalImport
         for CaptureBindings<'_, B>
     {
         fn remap_tensor(
@@ -1196,7 +1196,7 @@ mod internals {
         fn remap_axis(&mut self, value: NatExpr, _: &crate::portable::BindingPath) -> NatExpr { value }
         fn remap_selector(&mut self, value: crate::portable::BindingSelector, _: &crate::portable::BindingPath) -> crate::portable::BindingSelector { value }
     }
-    impl<B: seismic_target::TargetFamily> CaptureBindings<'_, B> {
+    impl<B: seismic_native_target::TargetFamily> CaptureBindings<'_, B> {
         fn remap_view(&mut self, source: AnyBufferView) -> AnyBufferView {
             if let Some(view) = self.views.get(&source) {
                 return *view;
@@ -1221,7 +1221,7 @@ mod internals {
 
     /// All mutable physical construction state. No borrowed arena, source body
     /// or target context survives when construction is suspended.
-    pub(crate) struct BuilderState<B: seismic_target::TargetFamily> {
+    pub(crate) struct BuilderState<B: seismic_native_target::TargetFamily> {
         function: seismic_lang::ids::FunctionId,
         pub(super) construction: OpenConstruction<B>,
         contract: FunctionContract,
@@ -1238,13 +1238,13 @@ mod internals {
         pub(super) call_occurrences: HashMap<NodeId, u32>,
     }
 
-    impl<B: seismic_target::TargetFamily> BuilderState<B> {
+    impl<B: seismic_native_target::TargetFamily> BuilderState<B> {
         pub(crate) fn function(&self) -> seismic_lang::ids::FunctionId {
             self.function
         }
     }
 
-    pub(super) struct Builder<'a, B: seismic_target::TargetFamily> {
+    pub(super) struct Builder<'a, B: seismic_native_target::TargetFamily> {
         pub(super) state: BuilderState<B>,
         pub(super) arena: &'a mut ExprArena,
         pub(super) program: &'a SemanticProgram,
@@ -1255,7 +1255,7 @@ mod internals {
         pub(super) precision: &'a PrecisionPolicy,
     }
 
-    impl<'a, B: seismic_target::TargetFamily> Builder<'a, B> {
+    impl<'a, B: seismic_native_target::TargetFamily> Builder<'a, B> {
         pub(super) fn into_parts(self) -> (BuilderState<B>, ConstructionContext<'a, B>) {
             (
                 self.state,
@@ -2766,7 +2766,7 @@ mod internals {
     /// is irrelevant to this axis's address contribution.
     pub(super) use seismic_ir::storage::addressed_bytes;
 
-    fn digest_structure<B: seismic_target::TargetFamily>(
+    fn digest_structure<B: seismic_native_target::TargetFamily>(
         digest: &mut seismic_ir::identity::StructureDigest,
         builder: &Builder<'_, B>,
         storage: &seismic_ir::storage::GlobalAllocationTopology,
@@ -2939,7 +2939,7 @@ mod internals {
         }
     }
 
-    fn digest_kernel<B: seismic_target::TargetFamily>(
+    fn digest_kernel<B: seismic_native_target::TargetFamily>(
         digest: &mut seismic_ir::identity::StructureDigest,
         kernel: &seismic_ir::kernel::Kernel<B>,
     ) {
@@ -3409,7 +3409,7 @@ mod internals {
         digest.hashed(data.resource_facts());
     }
 
-    fn digest_schedule<B: seismic_target::TargetFamily>(
+    fn digest_schedule<B: seismic_native_target::TargetFamily>(
         digest: &mut seismic_ir::identity::StructureDigest,
         builder: &Builder<'_, B>,
         steps: &[ScheduleStep],

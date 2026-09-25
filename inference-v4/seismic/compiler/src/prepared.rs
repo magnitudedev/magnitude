@@ -162,9 +162,9 @@ impl CandidateIndex {
 }
 
 #[derive(Debug)]
-pub struct PreparedKernel<T: seismic_target::TargetFamily, H> {
+pub struct PreparedKernel<T: seismic_native_target::TargetFamily, H> {
     semantic_events: Arc<SemanticEventManifest>,
-    device: seismic_target::DeviceDescriptionIdentity,
+    device: seismic_native_target::DeviceDescriptionIdentity,
     evaluation: crate::evaluation::EvaluationIdentity,
     invocation: Arc<InvocationContract>,
     selection: SelectionFunction,
@@ -172,11 +172,11 @@ pub struct PreparedKernel<T: seismic_target::TargetFamily, H> {
     planning_report: crate::planning::PlanningReport,
 }
 
-impl<T: seismic_target::TargetFamily, H> PreparedKernel<T, H> {
+impl<T: seismic_native_target::TargetFamily, H> PreparedKernel<T, H> {
     /// Packages the preparation-owned policy and its diagnostic report.
     pub(crate) fn prepare(
         semantic_events: Arc<SemanticEventManifest>,
-        device: seismic_target::DeviceDescriptionIdentity,
+        device: seismic_native_target::DeviceDescriptionIdentity,
         evaluation: crate::evaluation::EvaluationIdentity,
         invocation: Arc<InvocationContract>,
         selection: SelectionFunction,
@@ -206,7 +206,7 @@ impl<T: seismic_target::TargetFamily, H> PreparedKernel<T, H> {
     pub fn semantic_event_manifest(&self) -> &SemanticEventManifest {
         &self.semantic_events
     }
-    pub fn device_identity(&self) -> &seismic_target::DeviceDescriptionIdentity {
+    pub fn device_identity(&self) -> &seismic_native_target::DeviceDescriptionIdentity {
         &self.device
     }
     pub fn evaluation_identity(&self) -> &crate::evaluation::EvaluationIdentity {
@@ -359,7 +359,7 @@ impl InvocationContract {
         }
     }
 
-    pub(crate) fn compile<T: seismic_target::TargetFamily>(
+    pub(crate) fn compile<T: seismic_native_target::TargetFamily>(
         domain: &crate::candidate_domain::CandidateDomain<'_, T>,
     ) -> Self {
         let arena = domain.arena();
@@ -414,7 +414,7 @@ pub fn validate_invocation(
 mod internals {
     use super::*;
 
-    pub(super) fn select<T: seismic_target::TargetFamily, H>(
+    pub(super) fn select<T: seismic_native_target::TargetFamily, H>(
         kernel: &PreparedKernel<T, H>,
         values: &InvocationValues,
     ) -> VariantIndex {

@@ -28,7 +28,7 @@ impl NumericalApplicability {
         }
     }
 
-    pub(crate) fn selected_replacement<B: seismic_target::TargetFamily>(
+    pub(crate) fn selected_replacement<B: seismic_native_target::TargetFamily>(
         arena: &ExprArena,
         program: &seismic_lang::entry::SemanticProgram,
         function: &seismic_lang::entry::SemanticFunction,

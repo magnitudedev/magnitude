@@ -235,7 +235,7 @@ impl LaunchScratchBindings {
 pub struct KernelAbiBindings {
     allocations: Box<
         [(
-            seismic_ir::target::KernelAbiAllocationRole,
+            seismic_ir::physical_target::KernelAbiAllocationRole,
             ExecutableAllocationId,
         )],
     >,
@@ -244,7 +244,7 @@ pub struct KernelAbiBindings {
 impl KernelAbiBindings {
     pub fn allocation(
         &self,
-        role: seismic_ir::target::KernelAbiAllocationRole,
+        role: seismic_ir::physical_target::KernelAbiAllocationRole,
     ) -> ExecutableAllocationId {
         self.allocations
             .iter()
@@ -256,7 +256,7 @@ impl KernelAbiBindings {
 /// Core-owned executable command vocabulary. Backends compile kernels and
 /// execute these commands; they cannot invent or reinterpret schedule facts.
 #[derive(Debug)]
-pub enum ExecutableCommand<B: seismic_target::TargetFamily> {
+pub enum ExecutableCommand<B: seismic_native_target::TargetFamily> {
     Launch {
         kernel: ExecutableKernelId,
         descriptor: B::LaunchDescriptor,
@@ -357,7 +357,7 @@ pub enum ExecutableAllocationKind {
     },
     KernelAbi {
         launch: u32,
-        role: seismic_ir::target::KernelAbiAllocationRole,
+        role: seismic_ir::physical_target::KernelAbiAllocationRole,
     },
 }
 
@@ -414,9 +414,9 @@ pub struct CallBindingTable {
 }
 
 /// Handle-free executable content produced by planning.
-struct CompiledVariantBody<B: seismic_target::TargetFamily> {
+struct CompiledVariantBody<B: seismic_native_target::TargetFamily> {
     invocation: std::sync::Arc<crate::prepared::InvocationContract>,
-    device: seismic_target::DeviceDescriptionIdentity,
+    device: seismic_native_target::DeviceDescriptionIdentity,
     native_index_bits: u32,
     identity: VariantIdentity,
     allocations: Vec<AllocationPlan>,
@@ -451,7 +451,7 @@ impl NumericalAcceptance {
 }
 
 /// Execution-safe compilation output. It is not a selectable candidate.
-pub(crate) struct CompiledCandidate<B: seismic_target::TargetFamily> {
+pub(crate) struct CompiledCandidate<B: seismic_native_target::TargetFamily> {
     body: std::sync::Arc<CompiledVariantBody<B>>,
     native: std::sync::Arc<crate::realization::RealizedNativeSet<B>>,
     safety: seismic_lang::expr::BoolExpr,
@@ -462,22 +462,22 @@ pub(crate) struct CompiledCandidate<B: seismic_target::TargetFamily> {
 mod numerical_acceptance;
 
 /// One selected, fully lowered variant before native handles are attached.
-pub struct RetainedCandidate<B: seismic_target::TargetFamily> {
+pub struct RetainedCandidate<B: seismic_native_target::TargetFamily> {
     body: std::sync::Arc<CompiledVariantBody<B>>,
     admission: std::sync::Arc<NumericalAcceptance>,
     native: std::sync::Arc<crate::realization::RealizedNativeSet<B>>,
 }
 
 /// One native executable variant.
-pub struct ExecutableVariant<T: seismic_target::TargetFamily, H> {
+pub struct ExecutableVariant<T: seismic_native_target::TargetFamily, H> {
     candidate_id: crate::evaluation_session::PreparedCandidateId,
     body: std::sync::Arc<CompiledVariantBody<T>>,
     guard: std::sync::Arc<RuntimePredicate>,
     numerical: std::sync::Arc<NumericalAssessment>,
-    kernels: Vec<std::sync::Arc<seismic_target::NativeKernel<T, H>>>,
+    kernels: Vec<std::sync::Arc<seismic_native_target::NativeKernel<T, H>>>,
 }
 
-impl<T: seismic_target::TargetFamily> Clone for RetainedCandidate<T> {
+impl<T: seismic_native_target::TargetFamily> Clone for RetainedCandidate<T> {
     fn clone(&self) -> Self {
         Self {
             body: self.body.clone(),
@@ -487,7 +487,7 @@ impl<T: seismic_target::TargetFamily> Clone for RetainedCandidate<T> {
     }
 }
 
-impl<T: seismic_target::TargetFamily, H> Clone for ExecutableVariant<T, H> {
+impl<T: seismic_native_target::TargetFamily, H> Clone for ExecutableVariant<T, H> {
     fn clone(&self) -> Self {
         Self {
             candidate_id: self.candidate_id,
@@ -499,7 +499,7 @@ impl<T: seismic_target::TargetFamily, H> Clone for ExecutableVariant<T, H> {
     }
 }
 
-impl<T: seismic_target::TargetFamily, H> ExecutableVariant<T, H> {
+impl<T: seismic_native_target::TargetFamily, H> ExecutableVariant<T, H> {
     /// Exact formation outcome selected in this preparation, across evaluation
     /// and publication. Semantic digests may label several such outcomes.
     pub fn prepared_candidate_id(&self) -> crate::evaluation_session::PreparedCandidateId {
@@ -510,7 +510,7 @@ impl<T: seismic_target::TargetFamily, H> ExecutableVariant<T, H> {
         &self.body.invocation
     }
 
-    pub fn device_identity(&self) -> &seismic_target::DeviceDescriptionIdentity {
+    pub fn device_identity(&self) -> &seismic_native_target::DeviceDescriptionIdentity {
         &self.body.device
     }
     pub fn identity(&self) -> &VariantIdentity {
@@ -536,7 +536,7 @@ impl<T: seismic_target::TargetFamily, H> ExecutableVariant<T, H> {
     }
 }
 
-impl<T: seismic_target::TargetFamily, H> fmt::Debug for ExecutableVariant<T, H> {
+impl<T: seismic_native_target::TargetFamily, H> fmt::Debug for ExecutableVariant<T, H> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExecutableVariant")
             .field("identity", self.identity())
@@ -548,7 +548,7 @@ impl<T: seismic_target::TargetFamily, H> fmt::Debug for ExecutableVariant<T, H> 
 /// The only FrozenPlan -> executable transition. Core consumes every closed
 /// fact and compiles evaluators and bindings around the already-reflected
 /// native kernels owned by the implementation.
-pub(crate) fn compile_variant<B: seismic_target::TargetFamily>(
+pub(crate) fn compile_variant<B: seismic_native_target::TargetFamily>(
     plan: FrozenPlan<'_, B>,
 ) -> CompiledCandidate<B> {
     let parts = plan.into_exact_parts();
@@ -631,7 +631,7 @@ pub(crate) fn compile_variant<B: seismic_target::TargetFamily>(
     }
 }
 
-impl<B: seismic_target::TargetFamily> RetainedCandidate<B> {
+impl<B: seismic_native_target::TargetFamily> RetainedCandidate<B> {
     pub(crate) fn native_instances(&self) -> impl Iterator<Item = crate::realization::NativeArtifactInstanceId> + '_ {
         self.native.artifact_instances()
     }
@@ -663,13 +663,13 @@ pub(crate) trait EvaluatedVariant {
     fn selection_guard(&self) -> &RuntimePredicate;
 }
 
-impl<B: seismic_target::TargetFamily> EvaluatedVariant for RetainedCandidate<B> {
+impl<B: seismic_native_target::TargetFamily> EvaluatedVariant for RetainedCandidate<B> {
     fn selection_guard(&self) -> &RuntimePredicate {
         self.guard()
     }
 }
 
-impl<T: seismic_target::TargetFamily, H> EvaluatedVariant for ExecutableVariant<T, H> {
+impl<T: seismic_native_target::TargetFamily, H> EvaluatedVariant for ExecutableVariant<T, H> {
     fn selection_guard(&self) -> &RuntimePredicate {
         self.guard()
     }
@@ -712,7 +712,7 @@ pub(crate) fn select_candidate_index<V: EvaluatedVariant>(
     selected
 }
 
-impl<B: seismic_target::TargetFamily> CompiledVariantBody<B> {
+impl<B: seismic_native_target::TargetFamily> CompiledVariantBody<B> {
     fn retained_metadata_bytes(&self) -> usize {
         fn vec_storage<T>(value: &Vec<T>) -> usize {
             value.capacity().saturating_mul(std::mem::size_of::<T>())
@@ -720,7 +720,7 @@ impl<B: seismic_target::TargetFamily> CompiledVariantBody<B> {
         fn view(value: &CompiledBufferView) -> usize {
             vec_storage(&value.extents).saturating_add(vec_storage(&value.strides))
         }
-        fn command<B: seismic_target::TargetFamily>(value: &ExecutableCommand<B>) -> usize {
+        fn command<B: seismic_native_target::TargetFamily>(value: &ExecutableCommand<B>) -> usize {
             match value {
                 ExecutableCommand::Launch {
                     bindings,
@@ -748,7 +748,7 @@ impl<B: seismic_target::TargetFamily> CompiledVariantBody<B> {
                     )
                     .saturating_add(vec_storage(addressable_resources))
                     .saturating_add(abi.allocations.len().saturating_mul(std::mem::size_of::<(
-                        seismic_ir::target::KernelAbiAllocationRole,
+                        seismic_ir::physical_target::KernelAbiAllocationRole,
                         ExecutableAllocationId,
                     )>())),
                 ExecutableCommand::Copy {
@@ -777,7 +777,7 @@ impl<B: seismic_target::TargetFamily> CompiledVariantBody<B> {
                 _=>0,
             }
         }
-        fn steps<B: seismic_target::TargetFamily>(values: &[NativeStep<B>]) -> usize {
+        fn steps<B: seismic_native_target::TargetFamily>(values: &[NativeStep<B>]) -> usize {
             values
                 .len()
                 .saturating_mul(std::mem::size_of::<NativeStep<B>>())
@@ -841,7 +841,7 @@ impl<B: seismic_target::TargetFamily> CompiledVariantBody<B> {
     }
 }
 
-pub(crate) fn materialize_variant<T: seismic_target::TargetFamily, H>(
+pub(crate) fn materialize_variant<T: seismic_native_target::TargetFamily, H>(
     planned: &RetainedCandidate<T>,
     registry: &crate::realization::RealizationRegistry<T, H>,
     candidate_id: crate::evaluation_session::PreparedCandidateId,
@@ -859,7 +859,7 @@ pub(crate) fn materialize_variant<T: seismic_target::TargetFamily, H>(
     }
 }
 
-impl<T: seismic_target::TargetFamily> CompiledCandidate<T> {
+impl<T: seismic_native_target::TargetFamily> CompiledCandidate<T> {
     pub(crate) fn fixed(&self) -> &seismic_lang::expr::PartialAssignment {
         &self.fixed
     }
@@ -1086,7 +1086,7 @@ fn compile_view(
     }
 }
 
-fn compile_steps<B: seismic_target::TargetFamily>(
+fn compile_steps<B: seismic_native_target::TargetFamily>(
     native_set: &crate::realization::RealizedNativeSet<B>,
     arena: &seismic_lang::expr::ExprArena,
     fixed: &seismic_lang::expr::PartialAssignment,
@@ -1374,7 +1374,7 @@ fn compile_steps<B: seismic_target::TargetFamily>(
 }
 
 /// Device services a backend provides to the generic runtime.
-pub trait DeviceService<T: seismic_target::TargetFamily>: Send + Sync + 'static {
+pub trait DeviceService<T: seismic_native_target::TargetFamily>: Send + Sync + 'static {
     type Buffer: Clone + Send + Sync + 'static;
     fn allocate(&self, bytes: u64, alignment: u64) -> Result<Self::Buffer, ExecutionError>;
     fn write(&self, buffer: &Self::Buffer, offset: u64, bytes: &[u8])
@@ -1427,7 +1427,7 @@ pub struct ResolvedBufferView<'a, T> {
 
 /// Values available to a command during execution: invocation symbols and
 /// the current schedule slot values (bound as symbols).
-pub struct ExecutionEnvironment<'a, T: seismic_target::TargetFamily, H, D: DeviceService<T>> {
+pub struct ExecutionEnvironment<'a, T: seismic_native_target::TargetFamily, H, D: DeviceService<T>> {
     device: &'a D,
     native_index_bits: u32,
     /// Allocation index -> buffer.
@@ -1437,10 +1437,10 @@ pub struct ExecutionEnvironment<'a, T: seismic_target::TargetFamily, H, D: Devic
     tensor_values: std::collections::BTreeMap<u32, TensorDescriptor>,
     issued_banks: std::collections::BTreeSet<ExecutableAllocationId>,
     published: std::collections::BTreeMap<Vec<u32>, ExecutedTensorPublication>,
-    kernels: &'a [std::sync::Arc<seismic_target::NativeKernel<T, H>>],
+    kernels: &'a [std::sync::Arc<seismic_native_target::NativeKernel<T, H>>],
 }
 
-impl<'a, T: seismic_target::TargetFamily, H, D: DeviceService<T>>
+impl<'a, T: seismic_native_target::TargetFamily, H, D: DeviceService<T>>
     ExecutionEnvironment<'a, T, H, D>
 {
     fn region_operand(&self, operand: &CompiledRegionOperand) -> Result<RegionValue, ExecutionError> {
@@ -1663,7 +1663,7 @@ impl<'a, T: seismic_target::TargetFamily, H, D: DeviceService<T>>
 /// Concurrency-safe factory for invocation-owned native submissions. The
 /// executor itself is never mutably borrowed across execution or completion;
 /// every admitted run owns a distinct submission value.
-pub trait NativeExecutor<T: seismic_target::TargetFamily>: Send + Sync + 'static {
+pub trait NativeExecutor<T: seismic_native_target::TargetFamily>: Send + Sync + 'static {
     /// The execution-side type of an already formed native artifact. Formation
     /// remains owned by the independently injected `NativeCompiler` service.
     type Handle: Send + Sync + 'static;
@@ -1676,7 +1676,7 @@ pub trait NativeExecutor<T: seismic_target::TargetFamily>: Send + Sync + 'static
 /// Backend submission state owned by exactly one admitted run. Its infallible
 /// transfer into an execution owner preserves the lifetime boundary after
 /// partially issued work.
-pub trait NativeSubmission<T: seismic_target::TargetFamily>: Send + 'static {
+pub trait NativeSubmission<T: seismic_native_target::TargetFamily>: Send + 'static {
     type Handle: Send + Sync + 'static;
     type Device: DeviceService<T>;
     type Execution: NativeExecution;
@@ -1717,7 +1717,7 @@ pub fn execute_variant<T, S>(
     values: &mut InvocationValues,
 ) -> Result<Vec<ExecutedTensorPublication>, ExecutionError>
 where
-    T: seismic_target::TargetFamily,
+    T: seismic_native_target::TargetFamily,
     S: NativeSubmission<T>,
 {
     let mut environment = ExecutionEnvironment {
@@ -1790,7 +1790,7 @@ fn execute_schedule<T, S>(
     env: &mut ExecutionEnvironment<'_, T, S::Handle, S::Device>,
 ) -> Result<(), ExecutionError>
 where
-    T: seismic_target::TargetFamily,
+    T: seismic_native_target::TargetFamily,
     S: NativeSubmission<T>,
 {
     for step in steps {
@@ -1984,7 +1984,7 @@ where
                 if !matches!(results, seismic_ir::region::Product::Unit) {
                     env.retire_tensor_definitions(branch);
                 }
-                fn install<B: seismic_target::TargetFamily, H, D: DeviceService<B>>(env: &mut ExecutionEnvironment<'_,B,H,D>, results: &seismic_ir::region::Product<CompiledBranchResult>, values: &seismic_ir::region::Product<RegionValue>) {
+                fn install<B: seismic_native_target::TargetFamily, H, D: DeviceService<B>>(env: &mut ExecutionEnvironment<'_,B,H,D>, results: &seismic_ir::region::Product<CompiledBranchResult>, values: &seismic_ir::region::Product<RegionValue>) {
                     use seismic_ir::region::Product;
                     match (results, values) {
                         (Product::Unit,Product::Unit)=>(),

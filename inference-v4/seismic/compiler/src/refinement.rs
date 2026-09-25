@@ -16,7 +16,7 @@ pub use crate::implementation::candidate::{
 use seismic_ir::construction::{
     AllocationPlan, AllocationSlotChoice, AnalyzedConstruction, StoragePlannedConstruction,
 };
-use seismic_ir::target::PhysicalDialect;
+use seismic_ir::physical_target::PhysicalDialect;
 use seismic_lang::expr::{BoolExpr, CmpOp, DecisionId, ExprArena, FiniteDomain};
 
 /// Whether refinement should expose physical-slot reuse as a finite candidate
@@ -126,7 +126,7 @@ mod tests {
         kernel::ops::AddressableResourceHandle,
         repr::{DenseF32, Representation},
         storage::GlobalBufferKind,
-        target::{IntrinsicIdentityBuilder, IntrinsicNumericalSemantics, PhysicalDialect},
+        physical_target::{IntrinsicIdentityBuilder, IntrinsicNumericalSemantics, PhysicalDialect},
     };
     use seismic_lang::expr::{Assignment, ExprArena, SymbolValue};
     use std::collections::BTreeSet;

@@ -19,7 +19,7 @@ use objc2_metal::{
     MTLSize,
 };
 use seismic_ir::kernel::ops::SubgroupCombine;
-use seismic_ir::target::{NativeFloatBehavior, NativeFloatOp};
+use seismic_ir::physical_target::{NativeFloatBehavior, NativeFloatOp};
 use seismic_lang::intrinsics::MathOp;
 use seismic_lang::reference_math::{
     evaluate, float_literal, scalar_recipe, ReferenceScalar, ScalarOp,
@@ -202,7 +202,7 @@ fn fragment_formats_are_the_matrix_combinations() {
 /// run over a whole operand set. Values travel as their bit patterns.
 struct NativeProbe {
     device: MetalDevice,
-    description: std::sync::Arc<seismic_target::DeviceDescription<crate::Metal>>,
+    description: std::sync::Arc<seismic_native_target::DeviceDescription<crate::Metal>>,
 }
 
 /// Lanes per threadgroup; operand sets are padded to a multiple of it.

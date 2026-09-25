@@ -57,7 +57,7 @@ impl<C> TensorResult<C> {
     }
 }
 
-impl<'f, 'b, B: seismic_target::TargetFamily> Lowerer<'f, 'b, B> {
+impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
     pub(super) fn bind_tensor_result(
         &mut self,
         value: SemanticValueId,
@@ -91,7 +91,7 @@ impl<'f, 'b, B: seismic_target::TargetFamily> Lowerer<'f, 'b, B> {
     }
 }
 
-impl<'s, 'k, 'f, 'r, B: seismic_target::TargetFamily> SegmentLowerer<'s, 'k, 'f, 'r, B> {
+impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 'k, 'f, 'r, B> {
     pub(super) fn bind_tensor_result(
         &mut self,
         value: SemanticValueId,
@@ -201,7 +201,7 @@ impl TensorResult<PreparedArg> {
             }).collect(),
         }
     }
-    pub(super) fn instantiate<B: seismic_target::TargetFamily>(
+    pub(super) fn instantiate<B: seismic_native_target::TargetFamily>(
         &self,
         kernel: &mut PortableBuilder<'_, B>,
     ) -> TensorResult<PortableValue> {
@@ -253,7 +253,7 @@ impl TensorResult<PreparedArg> {
 impl TensorResult<PortableValue> {
     /// Reserve the checked successful-path envelope, then retain the actual
     /// logical axes in the ordinary zero-origin slice of that backing.
-    pub(super) fn snapshot_storage<B: seismic_target::TargetFamily>(
+    pub(super) fn snapshot_storage<B: seismic_native_target::TargetFamily>(
         &self,
         kernel: &mut PortableBuilder<'_, B>,
         axes: &[PortableValue],
@@ -278,7 +278,7 @@ impl TensorResult<PortableValue> {
         )
     }
 
-    fn capture_axis<B: seismic_target::TargetFamily>(
+    fn capture_axis<B: seismic_native_target::TargetFamily>(
         &self,
         kernel: &mut PortableBuilder<'_, B>,
         axis: NatExpr,
@@ -293,7 +293,7 @@ impl TensorResult<PortableValue> {
             )
         })
     }
-    pub(super) fn axes<B: seismic_target::TargetFamily>(
+    pub(super) fn axes<B: seismic_native_target::TargetFamily>(
         &self,
         kernel: &mut PortableBuilder<'_, B>,
     ) -> Vec<PortableValue> {
@@ -389,7 +389,7 @@ impl SegmentStorage {
         }
         fields
     }
-    pub(super) fn with_scalar_fields<B: seismic_target::TargetFamily>(
+    pub(super) fn with_scalar_fields<B: seismic_native_target::TargetFamily>(
         &self,
         kernel: &mut PortableBuilder<'_, B>,
         fields: &mut impl Iterator<Item = PortableValue>,
@@ -433,7 +433,7 @@ impl<C> TensorResult<C> {
             })
     }
 }
-impl<'s, 'k, 'f, 'r, B: seismic_target::TargetFamily> SegmentLowerer<'s, 'k, 'f, 'r, B> {
+impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 'k, 'f, 'r, B> {
     /// Build this operation's concrete result before emitting any allocation or
     /// source guard. An unresolved reservation leaves the source cursor here.
     pub(super) fn node_tensor_result(

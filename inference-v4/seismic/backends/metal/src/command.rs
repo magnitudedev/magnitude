@@ -13,7 +13,7 @@ pub struct Pipeline {
     /// The minimal native ABI metadata retained by the executable. Geometry,
     /// representations, storage topology, and resource facts remain owned by
     /// the consumed core plan and are not mirrored here.
-    pub(crate) words: seismic_ir::target::KernelWordLayout,
+    pub(crate) words: seismic_ir::physical_target::KernelWordLayout,
 }
 
 // MTLComputePipelineState is immutable and documented as thread-safe.

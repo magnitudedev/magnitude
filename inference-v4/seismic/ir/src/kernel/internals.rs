@@ -24,7 +24,7 @@ use super::{BindingSlot, BlockId, Kernel, KernelArena, KernelId};
 use crate::identity::OwnerToken;
 use crate::schedule::AnyScalarSlot;
 use crate::storage::{LaunchLocalKind, LocalAllocation};
-use crate::target::PhysicalDialect;
+use crate::physical_target::PhysicalDialect;
 use seismic_lang::expr::{ExprArena, NatExpr, SymbolId};
 use seismic_lang::ids::{IntrinsicId, RepresentationId};
 use seismic_lang::intrinsics::{AtomicOp, MathOp};
@@ -153,8 +153,8 @@ pub(crate) struct Builder<'a, B: PhysicalDialect> {
     kernels: &'a mut Vec<Kernel<B>>,
     state: &'a mut KernelState<B>,
     target_facts: &'a B::Facts,
-    resource_classes: &'a [crate::target::AddressableResourceClass],
-    vector_support: &'a crate::target::VectorSupport,
+    resource_classes: &'a [crate::physical_target::AddressableResourceClass],
+    vector_support: &'a crate::physical_target::VectorSupport,
     block: BlockId,
 }
 
@@ -242,8 +242,8 @@ pub(crate) fn open_portable<'a, B: PhysicalDialect>(
     kernels: &'a mut Vec<Kernel<B>>,
     state: &'a mut KernelState<B>,
     target_facts: &'a B::Facts,
-    resource_classes: &'a [crate::target::AddressableResourceClass],
-    vector_support: &'a crate::target::VectorSupport,
+    resource_classes: &'a [crate::physical_target::AddressableResourceClass],
+    vector_support: &'a crate::physical_target::VectorSupport,
 ) -> PortableBuilder<'a, B> {
     state.assert_closed();
     let kernel = kernels.len() as u32;
@@ -279,8 +279,8 @@ pub(crate) fn resume_portable<'a, B: PhysicalDialect>(
     kernels: &'a mut Vec<Kernel<B>>,
     state: &'a mut KernelState<B>,
     target_facts: &'a B::Facts,
-    resource_classes: &'a [crate::target::AddressableResourceClass],
-    vector_support: &'a crate::target::VectorSupport,
+    resource_classes: &'a [crate::physical_target::AddressableResourceClass],
+    vector_support: &'a crate::physical_target::VectorSupport,
     cursor: PortableCursor,
 ) -> PortableBuilder<'a, B> {
     assert_eq!(
@@ -1945,10 +1945,10 @@ fn a_type<B: PhysicalDialect>(builder: &Builder<'_, B>, value: ErasedValue) -> V
 impl<'a, B: PhysicalDialect> Builder<'a, B> {
     fn allocate_addressable_resource(
         &mut self,
-        class_id: crate::target::ResourceClassId,
+        class_id: crate::physical_target::ResourceClassId,
         units: NatExpr,
         alignment_units: u64,
-        lifetime: crate::target::ResourceLifetime,
+        lifetime: crate::physical_target::ResourceLifetime,
     ) -> ops::AddressableResourceHandle {
         let class = self
             .resource_classes
@@ -2359,7 +2359,7 @@ impl<'a, B: PhysicalDialect> Builder<'a, B> {
                 references != 0,
                 "addressable-resource lease has no intrinsic owner"
             );
-            if lease.lifetime == crate::target::ResourceLifetime::Operation {
+            if lease.lifetime == crate::physical_target::ResourceLifetime::Operation {
                 assert_eq!(
                     references, 1,
                     "operation-lifetime addressable resource is referenced by more than one intrinsic"
@@ -2442,10 +2442,10 @@ impl<'s, 'k, B: PhysicalDialect> ops::SemanticIntrinsicSink<'s, 'k, B> {
 
     pub fn addressable_resource(
         &mut self,
-        class: crate::target::ResourceClassId,
+        class: crate::physical_target::ResourceClassId,
         units: NatExpr,
         alignment_units: u64,
-        lifetime: crate::target::ResourceLifetime,
+        lifetime: crate::physical_target::ResourceLifetime,
     ) -> ops::AddressableResourceHandle {
         self.builder
             .inner

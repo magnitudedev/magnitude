@@ -90,7 +90,7 @@ fn scalar(values: &Values, id: SemanticValueId) -> U {
     value(values, id).scalar
 }
 
-pub(super) fn bound<B: seismic_target::TargetFamily>(
+pub(super) fn bound<B: seismic_native_target::TargetFamily>(
     kernel: &PortableBuilder<'_, B>,
     bound: &SegmentBound,
 ) -> Value {

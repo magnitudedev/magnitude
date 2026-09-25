@@ -4,7 +4,7 @@ use super::*;
 
 /// Owned call construction progress. Child bodies and physical payloads belong
 /// to this lexical call; no borrowed parent builder survives a pause.
-pub(crate) struct CallConstruction<B: seismic_target::TargetFamily> {
+pub(crate) struct CallConstruction<B: seismic_native_target::TargetFamily> {
     call: NodeId,
     location: crate::candidate_domain::CallLocation,
     arguments: Vec<ValueBinding>,
@@ -20,7 +20,7 @@ struct CallBody {
     initialization: Result<(), seismic_lang::initialization::InitializationFailure>,
 }
 
-impl<B: seismic_target::TargetFamily> CallConstruction<B> {
+impl<B: seismic_native_target::TargetFamily> CallConstruction<B> {
     pub(crate) fn location(&self) -> &crate::candidate_domain::CallLocation {
         &self.location
     }
@@ -90,7 +90,7 @@ fn source_node_path(function: &SemanticFunction, target: NodeId) -> Vec<u32> {
     path
 }
 
-impl<'a, B: seismic_target::TargetFamily> ImplementationBuilder<'a, B> {
+impl<'a, B: seismic_native_target::TargetFamily> ImplementationBuilder<'a, B> {
     pub(crate) fn begin_call(
         &mut self,
         call: NodeId,
@@ -147,7 +147,7 @@ impl<'a, B: seismic_target::TargetFamily> ImplementationBuilder<'a, B> {
     }
 }
 
-impl<'a, B: seismic_target::TargetFamily> internals::Builder<'a, B> {
+impl<'a, B: seismic_native_target::TargetFamily> internals::Builder<'a, B> {
     pub(super) fn begin_call(
         &mut self,
         call: NodeId,

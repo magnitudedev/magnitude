@@ -25,7 +25,7 @@ use seismic_compiler::feedback::PreparationOptions;
 use seismic_lang::checked::CheckedModule;
 use seismic_lang::entry::ElementBindings;
 use seismic_lang::ids::{EntryId, RepresentationId};
-use seismic_target::TargetFamily;
+use seismic_native_target::TargetFamily;
 use std::sync::Arc;
 
 type CpuExecutor = seismic_cpu::Executor;
@@ -889,7 +889,7 @@ fn prepare<T, E, C>(
 where
     T: TargetFamily,
     E: NativeExecutor<T>,
-    C: seismic_target::NativeCompiler<T, Handle = E::Handle>,
+    C: seismic_native_target::NativeCompiler<T, Handle = E::Handle>,
 {
     let prepared = driver::prepare(
         device,

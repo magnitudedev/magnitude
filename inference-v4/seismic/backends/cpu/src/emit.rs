@@ -18,13 +18,13 @@ use seismic_ir::kernel::ops::{
 };
 use seismic_ir::kernel::{BlockId, Kernel};
 use seismic_ir::storage::LaunchLocalKind;
-use seismic_ir::target::{
+use seismic_ir::physical_target::{
     DenseRepresentationGeometry, KernelEmissionLayout, PackedRepresentationGeometry,
 };
 use seismic_lang::intrinsics::MathOp;
 use seismic_lang::registry::{PlaneEncoding, PlaneInfo, PlaneRepackRecipe, RepackExpr};
 use seismic_lang::types::DType;
-use seismic_target::NativeCompilationError;
+use seismic_native_target::NativeCompilationError;
 use std::collections::{BTreeSet, HashMap};
 
 pub(crate) struct Import {

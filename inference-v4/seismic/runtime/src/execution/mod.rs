@@ -15,7 +15,7 @@ use seismic_compiler::prepared::ArgumentValue;
 use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::failure::SourceTermination;
-use seismic_target::TargetFamily;
+use seismic_native_target::TargetFamily;
 use std::sync::Arc;
 
 type Submission<T, E> = <E as NativeExecutor<T>>::Submission;

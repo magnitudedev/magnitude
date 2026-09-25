@@ -82,10 +82,10 @@ fn invalid_public_transitions_do_not_compile() {
         .parent()
         .expect("compiler crate has a subsystem directory")
         .join("lang");
-    let target = compiler
+    let native_target = compiler
         .parent()
         .expect("compiler crate has a subsystem directory")
-        .join("target");
+        .join("native-target");
     let root = std::env::temp_dir().join(format!(
         "seismic-compiler-compile-fail-{}",
         std::process::id()
@@ -97,7 +97,7 @@ fn invalid_public_transitions_do_not_compile() {
 
     let mismatches: Vec<String> = CASES
         .iter()
-        .filter_map(|case| run_case(&root, &compiler, &lang, &target, case))
+        .filter_map(|case| run_case(&root, &compiler, &lang, &native_target, case))
         .collect();
 
     fs::remove_dir_all(&root).expect("remove compile-fail directory");
@@ -115,7 +115,7 @@ fn run_case(
     root: &Path,
     compiler: &Path,
     lang: &Path,
-    target: &Path,
+    native_target: &Path,
     case: &Case,
 ) -> Option<String> {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -126,12 +126,12 @@ fn run_case(
     fs::create_dir_all(directory.join("src")).expect("create fixture source directory");
     fs::copy(&fixture, directory.join("src/main.rs")).expect("copy compile-fail fixture");
     let manifest = format!(
-        "[package]\nname = \"seismic-compile-fail-{}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n\n[dependencies]\nseismic-compiler = {{ path = {:?} }}\nseismic-lang = {{ path = {:?} }}\nseismic-ir = {{ path = {:?} }}\nseismic-target = {{ path = {:?} }}\n",
+        "[package]\nname = \"seismic-compile-fail-{}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n\n[dependencies]\nseismic-compiler = {{ path = {:?} }}\nseismic-lang = {{ path = {:?} }}\nseismic-ir = {{ path = {:?} }}\nseismic-native-target = {{ path = {:?} }}\n",
         case.name,
         compiler,
         lang,
         compiler.parent().unwrap().join("ir"),
-        target,
+        native_target,
     );
     fs::write(directory.join("Cargo.toml"), manifest).expect("write fixture manifest");
 

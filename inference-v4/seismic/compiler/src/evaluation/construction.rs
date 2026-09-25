@@ -5,7 +5,7 @@ use crate::candidate_domain::{
     CandidateDomain, ConstructionAllowance, ConstructionCoordinate, ConstructionPending,
     Materialization,
 };
-use seismic_target::TargetFamily;
+use seismic_native_target::TargetFamily;
 use std::collections::VecDeque;
 use std::time::Duration;
 

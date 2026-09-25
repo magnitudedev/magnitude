@@ -7,7 +7,7 @@ use crate::preparation_budget::{PlanningBudget, PreparationBudget};
 use crate::prepared::PreparedKernel;
 use crate::target::CompilerRegistry;
 use seismic_lang::{entry::LogicalEntry, precision::PrecisionPolicy};
-use seismic_target::{DeviceDescription, NativeCompiler, TargetFamily};
+use seismic_native_target::{DeviceDescription, NativeCompiler, TargetFamily};
 use std::time::{Duration, Instant};
 
 /// An in-process search campaign. Returned kernels own only their executable

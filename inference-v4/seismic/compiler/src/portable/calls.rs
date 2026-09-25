@@ -2,7 +2,7 @@
 //! the implementation builder's call construction.
 use super::*;
 
-impl<'f, 'b, B: seismic_target::TargetFamily> Lowerer<'f, 'b, B> {
+impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
     pub(super) fn initialization_scalar(&mut self, bound: &Bound) -> InitializationArgument {
         match bound {
             Bound::Scalar(scalar) => match prepare_scalar(self.builder.arena(), *scalar) {

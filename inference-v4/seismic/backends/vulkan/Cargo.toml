@@ -8,7 +8,7 @@ license.workspace = true
 # and Windows only; dependents gate it with `cfg(not(target_os = "macos"))`.
 [dependencies]
 seismic-compiler.workspace = true
-seismic-target.workspace = true
+seismic-native-target.workspace = true
 ash = "=0.38.0"
 glslang = "=0.8.1"
 spirv-tools = "=0.13.3"

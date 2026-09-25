@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 const TREES: &[&str] = &[
     "seismic/lang",
     "seismic/ir",
-    "seismic/target",
+    "seismic/native-target",
     "seismic/compiler",
     "seismic/runtime",
     "seismic/api",

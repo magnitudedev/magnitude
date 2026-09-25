@@ -54,7 +54,7 @@ fn reached_quantity_arithmetic_and_word_cast_share_the_source_schedule() {
 }
 
 pub(super) fn device(
-) -> seismic_target::DeviceDescription<crate::realization::demand_driven_tests::FakeTarget> {
+) -> seismic_native_target::DeviceDescription<crate::realization::demand_driven_tests::FakeTarget> {
     let mut description = crate::realization::demand_driven_tests::device_parts();
     description
         .dtypes
@@ -75,7 +75,7 @@ pub(super) fn device(
     description.limits.max_argument_bytes = 4096;
     description.limits.max_workgroup_bytes = 4096;
     description.limits.max_grid = [1024; 3];
-    seismic_target::DeviceDescription::new(description).unwrap()
+    seismic_native_target::DeviceDescription::new(description).unwrap()
 }
 
 #[test]

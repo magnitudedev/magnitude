@@ -1,4 +1,4 @@
-use seismic_target::{NativeCompiler, NativeKernelCandidate, TargetFamily};
+use seismic_native_target::{NativeCompiler, NativeKernelCandidate, TargetFamily};
 
 fn fabricate<T, C>() -> NativeKernelCandidate<'static, T, C::Candidate>
 where

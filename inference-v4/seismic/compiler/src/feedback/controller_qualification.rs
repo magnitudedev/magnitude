@@ -1,7 +1,7 @@
 // Included only in controller's test module. The production controller owns all
 // proposals, compilation ordering, observations, confirmation and publication.
 fn coupled_domain<'ctx>(
-    device: &'ctx seismic_target::DeviceDescription<FakeTarget>,
+    device: &'ctx seismic_native_target::DeviceDescription<FakeTarget>,
     registry: &'ctx crate::target::CompilerRegistry<FakeTarget>,
 ) -> crate::candidate_domain::CandidateDomain<'ctx, FakeTarget> {
     use crate::refinement::{ChoiceDeclaration, ConstructedCandidate};
@@ -18,7 +18,7 @@ fn coupled_domain<'ctx>(
         .test_into_parts();
     let arena = &mut parts.arena;
     let mut construction = Construction::<FakeTarget>::new(arena, vec![], false, 0);
-    let vectors = seismic_ir::target::VectorSupport::default();
+    let vectors = seismic_ir::physical_target::VectorSupport::default();
     let kernel = construction
         .portable_kernel(arena, &(), &[], &vectors)
         .close();
@@ -76,10 +76,10 @@ impl NativeCompiler<FakeTarget> for CostlyCompiler {
     fn form(
         &self,
         context: &(),
-        target: &seismic_target::DeviceDescription<FakeTarget>,
+        target: &seismic_native_target::DeviceDescription<FakeTarget>,
         kernel: &seismic_ir::kernel::Kernel<FakeTarget>,
-        layout: &seismic_ir::target::KernelEmissionLayout,
-    ) -> Result<Self::Candidate, seismic_target::NativeCompilationError> {
+        layout: &seismic_ir::physical_target::KernelEmissionLayout,
+    ) -> Result<Self::Candidate, seismic_native_target::NativeCompilationError> {
         let started = Instant::now();
         let candidate = self.0.form(context, target, kernel, layout)?;
         std::thread::sleep(Duration::from_micros(if candidate % 3 == 0 {
@@ -91,18 +91,18 @@ impl NativeCompiler<FakeTarget> for CostlyCompiler {
     }
     fn reflect(
         &self,
-        target: &seismic_target::DeviceDescription<FakeTarget>,
+        target: &seismic_native_target::DeviceDescription<FakeTarget>,
         kernel: &seismic_ir::kernel::Kernel<FakeTarget>,
-        layout: &seismic_ir::target::KernelEmissionLayout,
+        layout: &seismic_ir::physical_target::KernelEmissionLayout,
         candidate: Self::Candidate,
     ) -> Result<
-        seismic_target::NativeKernelReflection<FakeTarget, usize>,
-        seismic_target::NativeCompilationError,
+        seismic_native_target::NativeKernelReflection<FakeTarget, usize>,
+        seismic_native_target::NativeCompilationError,
     > {
         let reflection = self.0.reflect(target, kernel, layout, candidate.0)?;
         let mut metrics = reflection.metrics();
         metrics.compilation_ns = candidate.1.as_nanos() as u64;
-        Ok(seismic_target::NativeKernelReflection::new(
+        Ok(seismic_native_target::NativeKernelReflection::new(
             candidate.0,
             reflection.description().clone(),
             metrics,

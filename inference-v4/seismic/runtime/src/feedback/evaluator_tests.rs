@@ -51,7 +51,7 @@ use seismic_lang::expr::compiled::{constant_predicate, InvocationValues};
 use seismic_lang::precision::PrecisionPolicy;
 use seismic_lang::{registry, types::DType};
 use seismic_metal::{DeviceHandle, Metal, MetalBuffer, MetalDevice, MetalExecutor, Pipeline};
-use seismic_target::{
+use seismic_native_target::{
     DeviceDescription, NativeCompilationError, NativeCompiler, NativeKernelReflection, TargetFamily,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -172,7 +172,7 @@ impl NativeCompiler<Metal> for RecordingCompiler {
         context: &DeviceHandle,
         target: &DeviceDescription<Metal>,
         kernel: &seismic_ir::kernel::Kernel<Metal>,
-        layout: &seismic_ir::target::KernelEmissionLayout,
+        layout: &seismic_ir::physical_target::KernelEmissionLayout,
     ) -> Result<Self::Candidate, NativeCompilationError> {
         seismic_metal::native_compiler().form(context, target, kernel, layout)
     }
@@ -180,7 +180,7 @@ impl NativeCompiler<Metal> for RecordingCompiler {
         &self,
         target: &DeviceDescription<Metal>,
         kernel: &seismic_ir::kernel::Kernel<Metal>,
-        layout: &seismic_ir::target::KernelEmissionLayout,
+        layout: &seismic_ir::physical_target::KernelEmissionLayout,
         candidate: Self::Candidate,
     ) -> Result<NativeKernelReflection<Metal, Pipeline>, NativeCompilationError> {
         let result = seismic_metal::native_compiler().reflect(target, kernel, layout, candidate)?;

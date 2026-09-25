@@ -1,4 +1,4 @@
-use seismic_target::{NativeCompiler, NativeKernel, NativeKernelCandidate, TargetFamily};
+use seismic_native_target::{NativeCompiler, NativeKernel, NativeKernelCandidate, TargetFamily};
 
 fn consume_reflected<T: TargetFamily, H>(_kernel: &NativeKernel<T, H>) {}
 

@@ -8,7 +8,7 @@ license.workspace = true
 seismic-ir.workspace = true
 seismic-estimator.workspace = true
 seismic-lang.workspace = true
-seismic-target.workspace = true
+seismic-native-target.workspace = true
 seismic-compiler.workspace = true
 libloading = "0.8.9"
 sha2 = "=0.11.0"

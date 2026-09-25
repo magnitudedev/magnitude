@@ -29,12 +29,12 @@ pub use profile::{
 pub use registry::registry;
 
 use seismic_estimator::ServiceClassId;
-use seismic_ir::target::{
+use seismic_ir::physical_target::{
     AddressableResourceClass, AddressableResourceRealization, IntrinsicIdentityBuilder,
     ResourceOwnershipScope,
 };
 use seismic_lang::registry::BackendName;
-use seismic_target::{
+use seismic_native_target::{
     ClusterPortability, DeviceDescription, NativeArtifactMetrics, NativeClusterDomain,
     NativeCompilationError, NativeKernelDescription, NativeKernelIdentity, NativeKernelReflection,
     NativeLaunchDomain, NativeNumericalModeIdentity, NativeResourceUsage, NativeResources,
@@ -132,7 +132,7 @@ fn active_blocks_expression(
     selected
 }
 
-impl seismic_ir::target::PhysicalDialect for Cuda {
+impl seismic_ir::physical_target::PhysicalDialect for Cuda {
     type LaunchDescriptor = CudaLaunchMode;
     fn launch_for_participation(
         facts: &CudaFacts,
@@ -235,8 +235,8 @@ impl seismic_ir::target::PhysicalDialect for Cuda {
         _facts: &Self::Facts,
         signature: &seismic_lang::registry::IntrinsicSignature,
         _intrinsic: &Self::Intrinsic,
-    ) -> seismic_ir::target::IntrinsicNumericalSemantics {
-        seismic_ir::target::IntrinsicNumericalSemantics {
+    ) -> seismic_ir::physical_target::IntrinsicNumericalSemantics {
+        seismic_ir::physical_target::IntrinsicNumericalSemantics {
             arithmetic: signature.numerical.clone(),
             // Every emitted PTX operation uses the non-`.ftz` form. The
             // target advertises no implicit flush relaxation for these
@@ -260,7 +260,7 @@ impl seismic_ir::target::PhysicalDialect for Cuda {
     }
 }
 
-impl seismic_target::TargetFamily for Cuda {
+impl seismic_native_target::TargetFamily for Cuda {
     type KernelAbi = CudaKernelAbi;
     type NativeNumericalMode = CudaNumericalMode;
     type NativeProperties = OccupancyRelation;
@@ -279,7 +279,7 @@ pub(crate) fn native_launch_constraints(
     launch: &seismic_ir::schedule::Launch<Cuda>,
     locals: &seismic_ir::storage::LaunchLocalLayout,
     _kernel: &seismic_ir::kernel::Kernel<Cuda>,
-    native: &seismic_target::NativeKernelDescription<Cuda>,
+    native: &seismic_native_target::NativeKernelDescription<Cuda>,
 ) -> Vec<seismic_lang::expr::BoolExpr> {
     let facts = target.facts();
     let threads = arena.nat_product(&launch.workgroup);
@@ -439,7 +439,7 @@ pub(crate) fn lower_semantic_intrinsic(
                     class,
                     tensor_memory_units,
                     32,
-                    seismic_ir::target::ResourceLifetime::Operation,
+                    seismic_ir::physical_target::ResourceLifetime::Operation,
                 );
                 if call.signature.name == "nvfp4_matmul" {
                     CudaIntrinsic::NvFp4Matmul {
@@ -468,7 +468,7 @@ pub(crate) fn lower_semantic_intrinsic(
     panic!("CUDA semantic lowering received an intrinsic from another capability namespace")
 }
 
-impl seismic_target::NativeCompiler<Cuda> for CudaNativeCompiler {
+impl seismic_native_target::NativeCompiler<Cuda> for CudaNativeCompiler {
     type Context = ();
     type Candidate = NativeCandidate;
     type Handle = CompiledKernel;
@@ -477,7 +477,7 @@ impl seismic_target::NativeCompiler<Cuda> for CudaNativeCompiler {
         _context: &Self::Context,
         target: &DeviceDescription<Cuda>,
         kernel: &seismic_ir::kernel::Kernel<Cuda>,
-        layout: &seismic_ir::target::KernelEmissionLayout,
+        layout: &seismic_ir::physical_target::KernelEmissionLayout,
     ) -> Result<Self::Candidate, NativeCompilationError> {
         compile::compile_kernel(target, kernel, layout)
     }
@@ -485,7 +485,7 @@ impl seismic_target::NativeCompiler<Cuda> for CudaNativeCompiler {
         &self,
         target: &DeviceDescription<Cuda>,
         kernel: &seismic_ir::kernel::Kernel<Cuda>,
-        _layout: &seismic_ir::target::KernelEmissionLayout,
+        _layout: &seismic_ir::physical_target::KernelEmissionLayout,
         candidate: Self::Candidate,
     ) -> Result<NativeKernelReflection<Cuda, Self::Handle>, NativeCompilationError> {
         let reflection_started = Instant::now();

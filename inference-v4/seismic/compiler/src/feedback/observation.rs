@@ -4,7 +4,7 @@ use crate::prepared::InvocationContract;
 use seismic_lang::expr::{compiled::InvocationValues, SymbolValue};
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::precision::PrecisionPolicy;
-use seismic_target::TargetFamily;
+use seismic_native_target::TargetFamily;
 use std::time::Duration;
 
 #[derive(Clone, Debug)]

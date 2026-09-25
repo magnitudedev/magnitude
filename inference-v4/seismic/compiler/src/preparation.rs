@@ -8,7 +8,7 @@
 use crate::candidate_domain::CandidateCoordinate;
 use crate::target::CompilerRegistry;
 use seismic_lang::precision::PrecisionPolicy;
-use seismic_target::{DeviceDescription, NativeCompiler, TargetFamily};
+use seismic_native_target::{DeviceDescription, NativeCompiler, TargetFamily};
 
 #[derive(Clone, Debug, Default)]
 pub struct PreparationOptions {

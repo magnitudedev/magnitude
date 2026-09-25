@@ -50,11 +50,11 @@ pub struct ConstructionAdvance {
 }
 
 /// A bounded immutable read of constructed physical data in its owning arena.
-pub struct MaterializedRead<'a, B: seismic_target::TargetFamily> {
+pub struct MaterializedRead<'a, B: seismic_native_target::TargetFamily> {
     candidate: &'a DomainCandidate<B>,
     arena: RwLockReadGuard<'a, ExprArena>,
 }
-impl<B: seismic_target::TargetFamily> MaterializedRead<'_, B> {
+impl<B: seismic_native_target::TargetFamily> MaterializedRead<'_, B> {
     pub fn arena(&self) -> &ExprArena {
         &self.arena
     }
@@ -69,15 +69,15 @@ impl<B: seismic_target::TargetFamily> MaterializedRead<'_, B> {
     }
 }
 
-pub(super) struct Suspended<B: seismic_target::TargetFamily> {
+pub(super) struct Suspended<B: seismic_native_target::TargetFamily> {
     source: SourceConstruction<B>,
     selected: Vec<(CallPath, BodySelection)>,
 }
-pub(super) enum Progress<B: seismic_target::TargetFamily> {
+pub(super) enum Progress<B: seismic_native_target::TargetFamily> {
     Suspended(Suspended<B>),
     Complete(ConstructionCoordinate),
 }
-impl<B: seismic_target::TargetFamily> std::fmt::Debug for Progress<B> {
+impl<B: seismic_native_target::TargetFamily> std::fmt::Debug for Progress<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Suspended(_) => f.write_str("Suspended source construction"),
@@ -86,7 +86,7 @@ impl<B: seismic_target::TargetFamily> std::fmt::Debug for Progress<B> {
     }
 }
 
-impl<B: seismic_target::TargetFamily> CandidateDomain<'_, B> {
+impl<B: seismic_native_target::TargetFamily> CandidateDomain<'_, B> {
     pub fn read_materialized(
         &self,
         coordinate: &ConstructionCoordinate,

@@ -45,9 +45,9 @@ pub use profile::{
 pub use registry::registry;
 pub use workers::Workers;
 
-use seismic_ir::target::IntrinsicIdentityBuilder;
+use seismic_ir::physical_target::IntrinsicIdentityBuilder;
 use seismic_lang::registry::BackendName;
-use seismic_target::{
+use seismic_native_target::{
     DeviceDescription, NativeArtifactMetrics, NativeCompilationError, NativeKernelDescription,
     NativeKernelIdentity, NativeKernelReflection, NativeLaunchDomain, NativeNumericalModeIdentity,
     NativeResourceUsage, NativeResources,
@@ -72,7 +72,7 @@ pub struct CpuLaunchMode;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CpuNumericalMode;
 
-impl seismic_ir::target::PhysicalDialect for Cpu {
+impl seismic_ir::physical_target::PhysicalDialect for Cpu {
     type LaunchDescriptor = CpuLaunchMode;
     fn ordinary_launch() -> Self::LaunchDescriptor {
         CpuLaunchMode
@@ -93,7 +93,7 @@ impl seismic_ir::target::PhysicalDialect for Cpu {
         _facts: &Self::Facts,
         _signature: &seismic_lang::registry::IntrinsicSignature,
         intrinsic: &Self::Intrinsic,
-    ) -> seismic_ir::target::IntrinsicNumericalSemantics {
+    ) -> seismic_ir::physical_target::IntrinsicNumericalSemantics {
         match *intrinsic {}
     }
 
@@ -104,7 +104,7 @@ impl seismic_ir::target::PhysicalDialect for Cpu {
     }
 }
 
-impl seismic_target::TargetFamily for Cpu {
+impl seismic_native_target::TargetFamily for Cpu {
     type KernelAbi = HostKernelAbi;
     type NativeNumericalMode = CpuNumericalMode;
     type NativeProperties = ();
@@ -117,7 +117,7 @@ pub fn native_compiler() -> &'static CpuNativeCompiler {
     &CPU_NATIVE_COMPILER
 }
 
-impl seismic_target::NativeCompiler<Cpu> for CpuNativeCompiler {
+impl seismic_native_target::NativeCompiler<Cpu> for CpuNativeCompiler {
     type Context = ();
     type Candidate = NativeCandidate;
     type Handle = CompiledKernel;
@@ -126,7 +126,7 @@ impl seismic_target::NativeCompiler<Cpu> for CpuNativeCompiler {
         _context: &Self::Context,
         target: &DeviceDescription<Cpu>,
         kernel: &seismic_ir::kernel::Kernel<Cpu>,
-        layout: &seismic_ir::target::KernelEmissionLayout,
+        layout: &seismic_ir::physical_target::KernelEmissionLayout,
     ) -> Result<Self::Candidate, NativeCompilationError> {
         compile::compile_kernel(target, kernel, layout)
     }
@@ -134,7 +134,7 @@ impl seismic_target::NativeCompiler<Cpu> for CpuNativeCompiler {
         &self,
         target: &DeviceDescription<Cpu>,
         kernel: &seismic_ir::kernel::Kernel<Cpu>,
-        _layout: &seismic_ir::target::KernelEmissionLayout,
+        _layout: &seismic_ir::physical_target::KernelEmissionLayout,
         candidate: Self::Candidate,
     ) -> Result<NativeKernelReflection<Cpu, Self::Handle>, NativeCompilationError> {
         let reflection_started = Instant::now();
@@ -150,7 +150,7 @@ impl seismic_target::NativeCompiler<Cpu> for CpuNativeCompiler {
             launch: NativeLaunchDomain {
                 modes: vec![CpuLaunchMode],
                 subgroup_width: None,
-                cluster: seismic_target::NativeClusterDomain::NotApplicable,
+                cluster: seismic_native_target::NativeClusterDomain::NotApplicable,
                 max_grid: target.limits().max_grid,
                 max_workgroup_size: target.limits().max_workgroup_size,
                 max_workgroup_threads: target.limits().max_workgroup_threads,

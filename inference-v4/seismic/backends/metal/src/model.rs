@@ -3,7 +3,7 @@ use seismic_estimator::{AnalyticalModelDefinition, OperationCost};
 use seismic_ir::kernel::{ops::ClosedOpView, Kernel};
 use seismic_ir::schedule::Launch;
 use seismic_ir::storage::LaunchLocalLayout;
-use seismic_ir::target::KernelEmissionLayout;
+use seismic_ir::physical_target::KernelEmissionLayout;
 use std::collections::BTreeSet;
 
 pub struct MetalAnalyticalModel;
@@ -17,7 +17,7 @@ impl AnalyticalModelDefinition<Metal> for MetalAnalyticalModel {
 
     fn service_state(
         &self,
-        facts: &<Metal as seismic_ir::target::PhysicalDialect>::Facts,
+        facts: &<Metal as seismic_ir::physical_target::PhysicalDialect>::Facts,
         supported_intrinsics: &BTreeSet<seismic_lang::ids::IntrinsicId>,
         service: Self::Service,
     ) -> seismic_estimator::AnalyticalServiceState {
@@ -36,7 +36,7 @@ impl AnalyticalModelDefinition<Metal> for MetalAnalyticalModel {
 
     fn operation_cost(
         &self,
-        _facts: &<Metal as seismic_ir::target::PhysicalDialect>::Facts,
+        _facts: &<Metal as seismic_ir::physical_target::PhysicalDialect>::Facts,
         _supported_intrinsics: &BTreeSet<seismic_lang::ids::IntrinsicId>,
         arena: &mut seismic_lang::expr::ExprArena,
         kernel: &Kernel<Metal>,

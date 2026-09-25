@@ -8,7 +8,7 @@ use crate::refinement::{ChoiceDeclaration, ConstructedCandidate, ConstructedCand
 use crate::target::ExecutionProfile;
 use seismic_estimator::FactProvenance;
 use seismic_lang::expr::{AnyExpr, ExprArena, SymbolKind};
-use seismic_target::{DeviceDescription, DeviceDescriptionIdentity};
+use seismic_native_target::{DeviceDescription, DeviceDescriptionIdentity};
 use sha2::Digest;
 use std::sync::Arc;
 
@@ -56,22 +56,22 @@ impl EvaluationProvenance {
 
 /// Read-only executable projection granted to evaluators. Native handles,
 /// reflected artifacts, and execution services are intentionally absent.
-pub struct TargetClosedExecutableView<'a, K: seismic_ir::target::PhysicalDialect> {
+pub struct TargetClosedExecutableView<'a, K: seismic_ir::physical_target::PhysicalDialect> {
     identity: &'a ConstructedCandidateIdentity,
     execution: seismic_ir::execution::ClosedExecutionView<'a, K>,
     choices: &'a [ChoiceDeclaration],
     constraints: &'a [crate::candidate_domain::DomainConstraint],
 }
 
-impl<K: seismic_ir::target::PhysicalDialect> Copy for TargetClosedExecutableView<'_, K> {}
+impl<K: seismic_ir::physical_target::PhysicalDialect> Copy for TargetClosedExecutableView<'_, K> {}
 
-impl<K: seismic_ir::target::PhysicalDialect> Clone for TargetClosedExecutableView<'_, K> {
+impl<K: seismic_ir::physical_target::PhysicalDialect> Clone for TargetClosedExecutableView<'_, K> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a, T: seismic_target::TargetFamily> TargetClosedExecutableView<'a, T> {
+impl<'a, T: seismic_native_target::TargetFamily> TargetClosedExecutableView<'a, T> {
     pub(crate) fn new(
         family: &'a ConstructedCandidate<T>,
         constraints: &'a [crate::candidate_domain::DomainConstraint],
@@ -85,7 +85,7 @@ impl<'a, T: seismic_target::TargetFamily> TargetClosedExecutableView<'a, T> {
     }
 }
 
-impl<'a, K: seismic_ir::target::PhysicalDialect> TargetClosedExecutableView<'a, K> {
+impl<'a, K: seismic_ir::physical_target::PhysicalDialect> TargetClosedExecutableView<'a, K> {
     pub fn identity(&self) -> &'a ConstructedCandidateIdentity {
         self.identity
     }
@@ -246,8 +246,8 @@ pub use crate::realization::{CandidateRejection, NativeArtifactRequestKey, Nativ
 /// analytical and feedback implementations return this same policy type.
 pub trait CandidateEvaluator<T, C>
 where
-    T: seismic_target::TargetFamily,
-    C: seismic_target::NativeCompiler<T>,
+    T: seismic_native_target::TargetFamily,
+    C: seismic_native_target::NativeCompiler<T>,
 {
     fn evaluate(
         &mut self,
@@ -267,7 +267,7 @@ where
 /// operation transfer is bound into the model, then seals device, observations,
 /// and model together.
 #[derive(Clone)]
-pub struct AnalyticalEvaluationContext<T: seismic_target::TargetFamily> {
+pub struct AnalyticalEvaluationContext<T: seismic_native_target::TargetFamily> {
     device: Arc<DeviceDescription<T>>,
     profile: Arc<ExecutionProfile<T>>,
     model: Arc<dyn seismic_estimator::ExecutionModel<T> + Send + Sync>,
@@ -275,7 +275,7 @@ pub struct AnalyticalEvaluationContext<T: seismic_target::TargetFamily> {
 }
 
 struct BoundAnalyticalModel<
-    T: seismic_target::TargetFamily,
+    T: seismic_native_target::TargetFamily,
     D: seismic_estimator::AnalyticalModelDefinition<T>,
 > {
     device: Arc<DeviceDescription<T>>,
@@ -286,7 +286,7 @@ struct BoundAnalyticalModel<
 
 impl<T, D> seismic_estimator::ServiceModel for BoundAnalyticalModel<T, D>
 where
-    T: seismic_target::TargetFamily,
+    T: seismic_native_target::TargetFamily,
     D: seismic_estimator::AnalyticalModelDefinition<T>,
 {
     fn service(
@@ -305,13 +305,13 @@ where
 
 impl<T, D> seismic_estimator::ExecutionModel<T> for BoundAnalyticalModel<T, D>
 where
-    T: seismic_target::TargetFamily,
+    T: seismic_native_target::TargetFamily,
     D: seismic_estimator::AnalyticalModelDefinition<T>,
 {
     fn emission_layout(
         &self,
         kernel: &seismic_ir::kernel::Kernel<T>,
-    ) -> seismic_ir::target::KernelEmissionLayout {
+    ) -> seismic_ir::physical_target::KernelEmissionLayout {
         self.device.kernel_emission_layout(kernel)
     }
 
@@ -319,7 +319,7 @@ where
         &self,
         arena: &mut ExprArena,
         kernel: &seismic_ir::kernel::Kernel<T>,
-        emission: &seismic_ir::target::KernelEmissionLayout,
+        emission: &seismic_ir::physical_target::KernelEmissionLayout,
         launch: &seismic_ir::schedule::Launch<T>,
         locals: &seismic_ir::storage::LaunchLocalLayout,
         op: seismic_ir::kernel::ops::ClosedOpView<'_, T>,
@@ -354,7 +354,7 @@ where
     }
 }
 
-impl<T: seismic_target::TargetFamily> AnalyticalEvaluationContext<T> {
+impl<T: seismic_native_target::TargetFamily> AnalyticalEvaluationContext<T> {
     pub fn assemble<D>(
         parts: crate::target::ExecutionProfileParts<T>,
         definition: D,
@@ -440,7 +440,7 @@ impl<T: seismic_target::TargetFamily> AnalyticalEvaluationContext<T> {
     }
 }
 
-impl<T: seismic_target::TargetFamily> std::fmt::Debug for AnalyticalEvaluationContext<T> {
+impl<T: seismic_native_target::TargetFamily> std::fmt::Debug for AnalyticalEvaluationContext<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AnalyticalEvaluationContext")
             .field("device", &self.device.identity())
@@ -451,17 +451,17 @@ impl<T: seismic_target::TargetFamily> std::fmt::Debug for AnalyticalEvaluationCo
 
 /// Analytical strategy over one coherently assembled context. Candidate
 /// construction and native admission remain supplied by the shared session.
-pub struct AnalyticalEvaluator<'a, T: seismic_target::TargetFamily> {
+pub struct AnalyticalEvaluator<'a, T: seismic_native_target::TargetFamily> {
     context: &'a AnalyticalEvaluationContext<T>,
 }
 
-impl<'a, T: seismic_target::TargetFamily> AnalyticalEvaluator<'a, T> {
+impl<'a, T: seismic_native_target::TargetFamily> AnalyticalEvaluator<'a, T> {
     pub fn new(context: &'a AnalyticalEvaluationContext<T>) -> Self {
         Self { context }
     }
 }
 
-impl<T: seismic_target::TargetFamily> AnalyticalEvaluator<'_, T> {
+impl<T: seismic_native_target::TargetFamily> AnalyticalEvaluator<'_, T> {
     pub(crate) fn evaluate_domain(
         &self,
         domain: &mut CandidateDomain<'_, T>,
@@ -514,7 +514,7 @@ impl<T: seismic_target::TargetFamily> AnalyticalEvaluator<'_, T> {
     }
 }
 
-fn evaluate_executable<T: seismic_target::TargetFamily>(
+fn evaluate_executable<T: seismic_native_target::TargetFamily>(
     model: &(dyn seismic_estimator::ExecutionModel<T> + Send + Sync),
     arena: &mut ExprArena,
     executable: TargetClosedExecutableView<'_, T>,
@@ -557,7 +557,7 @@ fn evaluate_executable<T: seismic_target::TargetFamily>(
     })
 }
 
-impl<B: seismic_target::TargetFamily> CandidateDomain<'_, B> {
+impl<B: seismic_native_target::TargetFamily> CandidateDomain<'_, B> {
     /// Attach analytical expressions without taking ownership of the structural domain.
     pub(crate) fn try_evaluate_total<E>(
         &mut self,
@@ -607,7 +607,7 @@ impl<B: seismic_target::TargetFamily> CandidateDomain<'_, B> {
     }
 }
 
-fn validate_performance_model<K: seismic_ir::target::PhysicalDialect>(
+fn validate_performance_model<K: seismic_ir::physical_target::PhysicalDialect>(
     arena: &ExprArena,
     executable: TargetClosedExecutableView<'_, K>,
     objective: PerformanceObjective,
@@ -644,7 +644,7 @@ fn validate_performance_model<K: seismic_ir::target::PhysicalDialect>(
 }
 
 #[derive(Debug)]
-pub(crate) struct AnalyticalDomainModel<B: seismic_target::TargetFamily> {
+pub(crate) struct AnalyticalDomainModel<B: seismic_native_target::TargetFamily> {
     pub(crate) evaluation: EvaluationIdentity,
     pub(crate) universal: EvaluatedCandidate<B>,
     pub(crate) optimized: Vec<EvaluatedCandidate<B>>,
@@ -652,7 +652,7 @@ pub(crate) struct AnalyticalDomainModel<B: seismic_target::TargetFamily> {
 }
 
 #[derive(Debug)]
-pub(crate) struct EvaluatedCandidate<B: seismic_target::TargetFamily> {
+pub(crate) struct EvaluatedCandidate<B: seismic_native_target::TargetFamily> {
     pub(crate) candidate: DomainCandidate<B>,
     pub(crate) performance: CandidatePerformanceModel,
 }

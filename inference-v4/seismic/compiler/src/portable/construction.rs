@@ -7,7 +7,7 @@
 use super::*;
 use crate::implementation::{BuilderState, CallConstruction, ConstructionContext, ScheduleBranch};
 
-pub(crate) struct SourceConstruction<B: seismic_target::TargetFamily> {
+pub(crate) struct SourceConstruction<B: seismic_native_target::TargetFamily> {
     builder: BuilderState<B>,
     values: SemanticBindings,
     mode: SemanticMode,
@@ -37,7 +37,7 @@ impl RegionCursor {
     }
 }
 
-enum SourceStep<B: seismic_target::TargetFamily> {
+enum SourceStep<B: seismic_native_target::TargetFamily> {
     Body(RegionCursor),
     Node {
         node: NodeId,
@@ -65,7 +65,7 @@ enum Continuation {
     Close,
 }
 impl Continuation {
-    fn step<B: seismic_target::TargetFamily>(self) -> SourceStep<B> {
+    fn step<B: seismic_native_target::TargetFamily>(self) -> SourceStep<B> {
         match self {
             Self::Body(cursor) => SourceStep::Body(cursor),
             Self::SelectedArm => SourceStep::SelectedArm,
@@ -80,7 +80,7 @@ enum SelectedAction {
     Publish,
 }
 impl SelectedAction {
-    fn step<B: seismic_target::TargetFamily>(self) -> SourceStep<B> {
+    fn step<B: seismic_native_target::TargetFamily>(self) -> SourceStep<B> {
         match self {
             Self::Node(node) => SourceStep::Node {
                 node,
@@ -165,7 +165,7 @@ pub(super) enum SegmentStep {
 }
 
 impl SegmentConstruction {
-    pub(super) fn advance<B: seismic_target::TargetFamily>(
+    pub(super) fn advance<B: seismic_native_target::TargetFamily>(
         self,
         builder: &mut ImplementationBuilder<'_, B>,
     ) -> SegmentStep {
@@ -234,14 +234,14 @@ impl SegmentConstruction {
     }
 }
 
-pub(crate) enum ConstructionStep<B: seismic_target::TargetFamily> {
+pub(crate) enum ConstructionStep<B: seismic_native_target::TargetFamily> {
     Pending(SourceConstruction<B>),
     Choice(SourceConstruction<B>, crate::candidate_domain::BodyChoice),
     Unresolved(SourceConstruction<B>, crate::candidate_domain::ConstructionPending),
     Complete(ConstructedCandidate<B>),
 }
 
-impl<B: seismic_target::TargetFamily> SourceConstruction<B> {
+impl<B: seismic_native_target::TargetFamily> SourceConstruction<B> {
     pub(crate) fn begin<'a>(
         mut builder: ImplementationBuilder<'a, B>,
         mode: SemanticMode,

@@ -9,7 +9,7 @@ use crate::kernel::KernelId;
 use crate::region::{BranchResult, Product, RepeatCarry};
 use crate::repr::ScalarKind;
 use crate::storage::{AnyBufferView, BufferViewLayout, ScheduleRegionEdge, ScheduleUse};
-use crate::target::PhysicalDialect;
+use crate::physical_target::PhysicalDialect;
 use seismic_lang::expr::{BoolExpr, ExprArena, IntExpr, LoopBinderId, NatExpr, SymbolId};
 use seismic_lang::types::DType;
 use std::marker::PhantomData;
@@ -2296,7 +2296,7 @@ mod tests {
         fn ordinary_launch() {}
         fn write_intrinsic_identity(
             op: &NoIntrinsic,
-            _: &mut crate::target::IntrinsicIdentityBuilder,
+            _: &mut crate::physical_target::IntrinsicIdentityBuilder,
         ) {
             match *op {}
         }
@@ -2304,7 +2304,7 @@ mod tests {
             _: &(),
             _: &seismic_lang::registry::IntrinsicSignature,
             op: &NoIntrinsic,
-        ) -> crate::target::IntrinsicNumericalSemantics {
+        ) -> crate::physical_target::IntrinsicNumericalSemantics {
             match *op {}
         }
         fn intrinsic_addressable_resources(

@@ -4,7 +4,7 @@
 
 use crate::executable::ExecutableVariant;
 use seismic_lang::expr::compiled::InvocationValues;
-use seismic_target::TargetFamily;
+use seismic_native_target::TargetFamily;
 use std::sync::Arc;
 use std::time::Duration;
 

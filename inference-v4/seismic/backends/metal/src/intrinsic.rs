@@ -9,7 +9,7 @@ use crate::Metal;
 use seismic_compiler::target::{CapabilityRegistration, IntrinsicImplementation};
 use seismic_ir::kernel::ops::IntrinsicResources;
 use seismic_ir::metal::MetalIntrinsic;
-use seismic_ir::target::{DataTypeSupport, TargetLimits};
+use seismic_ir::physical_target::{DataTypeSupport, TargetLimits};
 use seismic_lang::expr::{ExprArena, NatExpr};
 use seismic_lang::ids::{CapabilityId, IntrinsicId};
 use seismic_lang::intrinsics::ReduceOp;
@@ -22,8 +22,8 @@ use std::collections::BTreeSet;
 pub(crate) fn numerical_semantics(
     signature: &IntrinsicSignature,
     intrinsic: &MetalIntrinsic,
-) -> seismic_ir::target::IntrinsicNumericalSemantics {
-    seismic_ir::target::IntrinsicNumericalSemantics {
+) -> seismic_ir::physical_target::IntrinsicNumericalSemantics {
+    seismic_ir::physical_target::IntrinsicNumericalSemantics {
         arithmetic: signature.numerical.clone(),
         // Native subgroup matrix arithmetic is allowed to flush subnormal
         // accumulator/intermediate values by Metal. Shuffle/lane queries do
@@ -41,7 +41,7 @@ pub(crate) fn numerical_semantics(
 }
 
 pub(crate) fn lower_semantic(
-    _target: &seismic_target::DeviceDescription<Metal>,
+    _target: &seismic_native_target::DeviceDescription<Metal>,
     _domain: &seismic_ir::kernel::ops::SegmentLaunchDomain,
     call: seismic_ir::kernel::ops::SemanticIntrinsicCall<'_>,
     sink: &mut seismic_ir::kernel::ops::SemanticIntrinsicSink<'_, '_, Metal>,
@@ -134,7 +134,7 @@ pub(crate) fn lower_semantic(
 }
 
 pub(crate) fn semantic_requirements(
-    _target: &seismic_target::DeviceDescription<Metal>,
+    _target: &seismic_native_target::DeviceDescription<Metal>,
     _arena: &mut ExprArena,
     _signature: &IntrinsicSignature,
     _parallel_extent: NatExpr,
@@ -147,7 +147,7 @@ pub(crate) fn semantic_requirements(
 
 pub(crate) fn write_identity(
     intrinsic: &MetalIntrinsic,
-    identity: &mut seismic_ir::target::IntrinsicIdentityBuilder,
+    identity: &mut seismic_ir::physical_target::IntrinsicIdentityBuilder,
 ) {
     match intrinsic {
         MetalIntrinsic::LaneIndex => identity.variant("lane-index"),

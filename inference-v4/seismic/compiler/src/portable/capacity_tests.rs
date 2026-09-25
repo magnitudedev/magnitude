@@ -44,7 +44,7 @@ fn reached_geometry(source: &str) -> Result<Vec<Vec<Axis>>, crate::errors::Prepa
     description.limits.max_argument_bytes = 4096;
     description.limits.max_workgroup_bytes = 65536;
     description.limits.max_grid = [65536; 3];
-    let device = seismic_target::DeviceDescription::new(description).unwrap();
+    let device = seismic_native_target::DeviceDescription::new(description).unwrap();
     let registry = crate::realization::demand_driven_tests::registry();
     let domain = construct_candidate_domain(
         entry,

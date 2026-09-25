@@ -3,7 +3,7 @@ use seismic_estimator::{AnalyticalModelDefinition, OperationCost};
 use seismic_ir::kernel::{ops::ClosedOpView, Kernel};
 use seismic_ir::schedule::Launch;
 use seismic_ir::storage::LaunchLocalLayout;
-use seismic_ir::target::KernelEmissionLayout;
+use seismic_ir::physical_target::KernelEmissionLayout;
 
 pub struct CpuAnalyticalModel;
 
@@ -16,7 +16,7 @@ impl AnalyticalModelDefinition<Cpu> for CpuAnalyticalModel {
 
     fn operation_cost(
         &self,
-        _facts: &<Cpu as seismic_ir::target::PhysicalDialect>::Facts,
+        _facts: &<Cpu as seismic_ir::physical_target::PhysicalDialect>::Facts,
         _supported_intrinsics: &std::collections::BTreeSet<seismic_lang::ids::IntrinsicId>,
         arena: &mut seismic_lang::expr::ExprArena,
         kernel: &Kernel<Cpu>,

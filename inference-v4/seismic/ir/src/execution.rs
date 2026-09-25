@@ -4,7 +4,7 @@ use crate::construction::ExecutableIr;
 use crate::kernel::Kernel;
 use crate::schedule::{Launch, ParametricSchedule};
 use crate::storage::LaunchLocalLayout;
-use crate::target::PhysicalDialect;
+use crate::physical_target::PhysicalDialect;
 
 /// Resources derived together from one normalized launch and its exact kernel.
 /// Callers can inspect these facts but cannot assemble or replace them.
@@ -31,11 +31,11 @@ impl LaunchResources {
         launch: &Launch<T>,
         ordinal: usize,
         kernel: &Kernel<T>,
-        policy: crate::target::LocalRealizationPolicy,
-        abi: &impl crate::target::KernelAbiModel<T>,
+        policy: crate::physical_target::LocalRealizationPolicy,
+        abi: &impl crate::physical_target::KernelAbiModel<T>,
     ) -> Self {
         use crate::storage::{LaunchLocalKind, LaunchScratchRequirements, ScratchRequirement};
-        use crate::target::LocalRealization;
+        use crate::physical_target::LocalRealization;
         let layout = crate::storage::derive_launch_local_layout(
             arena,
             kernel.locals(),
@@ -127,8 +127,8 @@ impl<T: PhysicalDialect> ClosedExecutableIr<T> {
     pub(crate) fn new(
         ir: ExecutableIr<T>,
         arena: &mut seismic_lang::expr::ExprArena,
-        policy: crate::target::LocalRealizationPolicy,
-        abi: &impl crate::target::KernelAbiModel<T>,
+        policy: crate::physical_target::LocalRealizationPolicy,
+        abi: &impl crate::physical_target::KernelAbiModel<T>,
     ) -> Self {
         let resources = ir
             .schedule()

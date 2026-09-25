@@ -62,7 +62,7 @@ impl Analysis<'_> {
     /// index `min(p, extent)`, and only indices below the extent are active.
     /// The active lanes are the map's visits; every other lane must be
     /// provably inert.
-    pub(in crate::portable) fn physical_map<B: seismic_target::TargetFamily>(
+    pub(in crate::portable) fn physical_map<B: seismic_native_target::TargetFamily>(
         &mut self,
         launch: &seismic_ir::schedule::Launch<B>,
         kernel: &seismic_ir::kernel::Kernel<B>,

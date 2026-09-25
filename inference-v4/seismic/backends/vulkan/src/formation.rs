@@ -9,7 +9,7 @@ use crate::device::Device;
 use crate::facts::SUBGROUP_WIDTH;
 use crate::seal::{self, SEAL_VERSION};
 use ash::vk;
-use seismic_target::NativeCompilationError;
+use seismic_native_target::NativeCompilationError;
 use spirv_tools::opt::Optimizer;
 use spirv_tools::val::Validator;
 

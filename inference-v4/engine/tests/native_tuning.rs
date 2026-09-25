@@ -46,7 +46,7 @@ fn prepare_every_entry(
     let home = std::env::var("HOME").unwrap();
     let path = candidates
         .iter()
-        .map(|relative| PathBuf::from(home.clone() + relative))
+        .map(|relative| PathBuf::from(home.clone() + *relative))
         .find(|path| path.exists())
         .unwrap_or_else(|| panic!("none of {candidates:?} exists under {home}"));
     let catalog = DeviceCatalog::discover().unwrap();

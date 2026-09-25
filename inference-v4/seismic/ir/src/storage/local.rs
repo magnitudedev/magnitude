@@ -54,7 +54,7 @@ pub struct LaunchScratchRequirements {
 
 #[derive(Clone, Debug)]
 pub struct LaunchAbiRequirement {
-    pub role: crate::target::KernelAbiAllocationRole,
+    pub role: crate::physical_target::KernelAbiAllocationRole,
     pub bytes: NatExpr,
     pub alignment: u64,
 }

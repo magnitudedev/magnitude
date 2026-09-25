@@ -18,7 +18,7 @@ const SERVICE_SCALAR_READ: ServiceClassId = ServiceClassId::new("core.scalar-rea
 const SERVICE_SCALAR_MOVE: ServiceClassId = ServiceClassId::new("core.scalar-move");
 const SERVICE_DATA_CHECK: ServiceClassId = ServiceClassId::new("core.data-check");
 use seismic_ir::kernel::ops::{ClosedOpView, ValueType};
-use seismic_ir::target::KernelEmissionLayout;
+use seismic_ir::physical_target::KernelEmissionLayout;
 use seismic_lang::expr::{ExprArena, NatExpr};
 use seismic_lang::types::DType;
 use sha2::{Digest, Sha256};

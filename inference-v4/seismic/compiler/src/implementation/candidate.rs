@@ -9,7 +9,7 @@ use seismic_ir::{
     kernel::KernelArena,
     schedule::{AnyScalarSlot, ParametricSchedule},
     storage::{GlobalAllocationTopology, LocalAllocationTopology},
-    target::PhysicalDialect,
+    physical_target::PhysicalDialect,
 };
 use seismic_lang::{
     expr::{AnyExpr, BoolExpr, DecisionId, SymbolKind, TargetPredicate},

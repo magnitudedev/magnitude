@@ -11,7 +11,7 @@ impl Scope {
             Self::Workgroup => registry::IntrinsicUniformity::Workgroup,
         }
     }
-    fn barrier<B: seismic_target::TargetFamily>(self, kernel: &mut PortableBuilder<'_, B>) {
+    fn barrier<B: seismic_native_target::TargetFamily>(self, kernel: &mut PortableBuilder<'_, B>) {
         match self {
             Self::Subgroup => kernel.subgroup_barrier(),
             Self::Workgroup => kernel.workgroup_barrier(),
@@ -54,7 +54,7 @@ pub(super) struct Cohort {
     count: PortableValue,
 }
 impl Cohort {
-    pub(super) fn new<B: seismic_target::TargetFamily>(
+    pub(super) fn new<B: seismic_native_target::TargetFamily>(
         kernel: &mut PortableBuilder<'_, B>, domain: SegmentLaunchDomain,
     ) -> Self {
         let participants = kernel.expression_arena().nat_product(&domain.workgroup);
@@ -75,7 +75,7 @@ impl Cohort {
 
     /// Admission padding contains whole cohorts. It is not a stopped source
     /// participant and never writes the live table for an admitted cohort.
-    pub(super) fn membership<B: seismic_target::TargetFamily>(
+    pub(super) fn membership<B: seismic_native_target::TargetFamily>(
         &self, kernel:&mut PortableBuilder<'_,B>, scope:Scope,
         extent:NatExpr, logical_base:Option<seismic_ir::kernel::dynamic::LogicalIndexBinding>,
     ) -> PortableValue {
@@ -102,7 +102,7 @@ impl Cohort {
     /// `values` are actual source results whose successful equality has already
     /// been derived by the source value owner. This is a private construction
     /// helper, not a caller-set uniformity operation.
-    pub(super) fn gate<B: seismic_target::TargetFamily>(
+    pub(super) fn gate<B: seismic_native_target::TargetFamily>(
         &self, kernel: &mut PortableBuilder<'_, B>, scope: Scope,
         alive: PortableValue, values: &[PortableValue],
     ) -> (PortableValue, Vec<PortableValue>) {

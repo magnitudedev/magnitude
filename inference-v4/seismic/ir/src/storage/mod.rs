@@ -345,7 +345,7 @@ impl GlobalAllocationTopology {
             disjoint_arguments,
         }
     }
-    pub(crate) fn derive_reservations<B: crate::target::PhysicalDialect>(
+    pub(crate) fn derive_reservations<B: crate::physical_target::PhysicalDialect>(
         &mut self,
         arena: &mut ExprArena,
         schedule: &crate::schedule::ParametricSchedule<B>,
@@ -560,7 +560,7 @@ impl TopologyBuilder {
     }
     /// Uses actual construction storage identity and the entry alias contract.
     /// Unfinished region parameters intentionally cannot prove disjointness.
-    pub fn may_overlap_views<B: crate::target::PhysicalDialect>(
+    pub fn may_overlap_views<B: crate::physical_target::PhysicalDialect>(
         &self,
         schedule: &crate::schedule::ScheduleConstruction<B>,
         a: AnyBufferView,

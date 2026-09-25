@@ -14,7 +14,7 @@ use seismic_compiler::executable::{
 };
 use seismic_ir::schedule::{AnyScalarSlot, FillValue};
 use seismic_ir::storage::LaunchLocalKind;
-use seismic_ir::target::KernelAbiAllocationRole;
+use seismic_ir::physical_target::KernelAbiAllocationRole;
 use seismic_lang::expr::SymbolValue;
 
 pub struct MetalExecutor {

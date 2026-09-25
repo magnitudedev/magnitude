@@ -169,7 +169,7 @@ macro_rules! cost {
 /// renderer consumes. Unsupported vector operations still have semantics so
 /// adding vector support cannot create a late hole; the empty profile vector
 /// matrix prevents them from entering a Metal kernel today.
-pub fn operation_cost<B: seismic_ir::target::PhysicalDialect<Intrinsic = MetalIntrinsic>>(
+pub fn operation_cost<B: seismic_ir::physical_target::PhysicalDialect<Intrinsic = MetalIntrinsic>>(
     arena: &mut ExprArena,
     kernel: &seismic_ir::kernel::Kernel<B>,
     op: ClosedOpView<'_, B>,
@@ -466,7 +466,7 @@ mod tests {
     use seismic_ir::{
         construction::Construction,
         kernel::ops::{BinaryOp, ConstantValue},
-        target::*,
+        physical_target::*,
     };
     #[derive(Debug)]
     struct Dialect;

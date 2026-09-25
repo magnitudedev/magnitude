@@ -2,15 +2,6 @@
 /target/
 **/target/
 
-# `seismic/target` is a source crate whose name collides with Cargo's output
-# directory name. Re-include only its source tree; nested build output stays ignored.
-!seismic/target/
-!seismic/target/Cargo.toml
-!seismic/target/src/
-!seismic/target/src/**
-# `seismic-ir`'s `target` module directory is source as well.
-!seismic/ir/src/target/
-
 # Local compiler/runtime cache.
 .seismic-cache/
 

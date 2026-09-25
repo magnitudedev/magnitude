@@ -103,7 +103,7 @@ impl std::fmt::Display for PlanningError {
 
 impl std::error::Error for PlanningError {}
 
-pub(crate) fn plan<B: seismic_target::TargetFamily>(
+pub(crate) fn plan<B: seismic_native_target::TargetFamily>(
     domain: &mut crate::candidate_domain::CandidateDomain<'_, B>,
     model: AnalyticalDomainModel<B>,
     budget: &PlanningBudget,
@@ -172,7 +172,7 @@ impl SelectionPolicy {
 mod internals {
     use super::*;
 
-    pub(super) fn plan<B: seismic_target::TargetFamily>(
+    pub(super) fn plan<B: seismic_native_target::TargetFamily>(
         domain: &mut crate::candidate_domain::CandidateDomain<'_, B>,
         analytical: AnalyticalDomainModel<B>,
         budget: &PlanningBudget,
@@ -334,7 +334,7 @@ mod internals {
         pub(super) numerical_analytic: seismic_lang::expr::BoolExpr,
     }
 
-    fn exact_prune_and_order<B: seismic_target::TargetFamily>(
+    fn exact_prune_and_order<B: seismic_native_target::TargetFamily>(
         arena: &mut ExprArena,
         constants: &TargetConstants,
         universal: &crate::evaluation::EvaluatedCandidate<B>,

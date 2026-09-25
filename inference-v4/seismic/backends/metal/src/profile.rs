@@ -23,14 +23,14 @@ use seismic_compiler::target::{
     ExecutionProfileParts,
 };
 use seismic_estimator::ProfileAcquisitionMetrics;
-use seismic_ir::target::{
+use seismic_ir::physical_target::{
     DataTypeSupport, KernelAbiAllocation, KernelAbiAllocationRole, KernelAbiFootprint,
     KernelAbiLayout, KernelAbiModel, LocalRealization, LocalRealizationPolicy,
     NumericalEnvironment, TargetLimits, VectorSupport,
 };
 use seismic_lang::registry::{self, BackendName, REGISTRY_REVISION, RepresentationKind};
 use seismic_lang::types::DType;
-use seismic_target::{CompatibilityIdentity, DeviceDescription};
+use seismic_native_target::{CompatibilityIdentity, DeviceDescription};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
@@ -38,7 +38,7 @@ use std::time::Instant;
 
 pub const PROBE_SUITE_REVISION: &str = "seismic-metal-probes-v2";
 
-fn addressable_resources(_: &MetalFacts) -> Vec<seismic_ir::target::AddressableResourceClass> {
+fn addressable_resources(_: &MetalFacts) -> Vec<seismic_ir::physical_target::AddressableResourceClass> {
     Vec::new()
 }
 
@@ -178,7 +178,7 @@ impl KernelAbiModel<Metal> for MetalKernelAbi {
         let interface = kernel.interface();
         let entries = interface.bindings.len() as u64 + u64::from(RESERVED_ARGUMENT_ENTRIES);
         let word_bytes =
-            u64::from(seismic_ir::target::KernelWordLayout::for_kernel(kernel).total) * 8;
+            u64::from(seismic_ir::physical_target::KernelWordLayout::for_kernel(kernel).total) * 8;
         let result_bytes = interface.result_slots.len() as u64 * 8;
         KernelAbiLayout {
             footprint: KernelAbiFootprint {

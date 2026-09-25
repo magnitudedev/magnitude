@@ -1,5 +1,5 @@
 [package]
-name = "seismic-target"
+name = "seismic-native-target"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

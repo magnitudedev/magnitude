@@ -2,7 +2,7 @@
 //! Field extraction is a physical read; all numerical steps use scalar recipes.
 use super::internals::{PlaceEntry, PortableBuilder, PortableValue};
 use super::ops::{BinaryOp, UnaryOp, ValueType};
-use crate::target::PhysicalDialect;
+use crate::physical_target::PhysicalDialect;
 use seismic_lang::reference_math;
 use seismic_lang::registry::{self, DecodeStep};
 use seismic_lang::types::DType;
@@ -67,7 +67,7 @@ mod tests {
     use crate::construction::Construction;
     use crate::kernel::ops::Op;
     use crate::storage::GlobalBufferKind;
-    use crate::target::{IntrinsicIdentityBuilder, IntrinsicNumericalSemantics, VectorSupport};
+    use crate::physical_target::{IntrinsicIdentityBuilder, IntrinsicNumericalSemantics, VectorSupport};
     use seismic_lang::expr::ExprArena;
 
     #[derive(Debug)]

@@ -7,7 +7,7 @@ use crate::driver::{self, DriverError, Event, Handle, JitError, Module};
 use crate::executor::Device;
 use crate::nvrtc::{self, NvrtcError};
 use seismic_compiler::errors::ExecutionError;
-use seismic_target::NativeCompilationError;
+use seismic_native_target::NativeCompilationError;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

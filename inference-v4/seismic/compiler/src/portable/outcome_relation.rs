@@ -482,7 +482,7 @@ impl Analysis<'_> {
     }
 }
 
-pub(crate) fn derive<B: seismic_target::TargetFamily>(
+pub(crate) fn derive<B: seismic_native_target::TargetFamily>(
     arena: &ExprArena,
     program: &SemanticProgram,
     function: &SemanticFunction,

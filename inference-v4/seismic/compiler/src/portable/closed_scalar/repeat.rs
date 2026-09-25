@@ -45,7 +45,7 @@ impl Analysis<'_> {
                 .ok_or("loop operand is unavailable"),
         }
     }
-    pub(in crate::portable) fn scalar_schedule_repeat<B: seismic_target::TargetFamily>(
+    pub(in crate::portable) fn scalar_schedule_repeat<B: seismic_native_target::TargetFamily>(
         &mut self,
         schedule: &ParametricSchedule<B>,
         kernels: &seismic_ir::kernel::KernelArena<B>,
@@ -107,7 +107,7 @@ impl Analysis<'_> {
         }
         Ok(())
     }
-    pub(in crate::portable) fn scalar_kernel_repeat<B: seismic_target::TargetFamily>(
+    pub(in crate::portable) fn scalar_kernel_repeat<B: seismic_native_target::TargetFamily>(
         &mut self,
         kernel: &seismic_ir::kernel::Kernel<B>,
         start: Term,

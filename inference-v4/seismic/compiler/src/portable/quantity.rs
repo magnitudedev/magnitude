@@ -2,7 +2,7 @@
 //! kernels and tensor extents.
 use super::*;
 
-impl<'f, 'b, B: seismic_target::TargetFamily> Lowerer<'f, 'b, B> {
+impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
     pub(super) fn emit_host_scalar(
         &mut self,
         node: NodeId,

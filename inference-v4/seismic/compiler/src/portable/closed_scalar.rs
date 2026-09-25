@@ -693,7 +693,7 @@ impl<'a> Analysis<'a> {
         })
     }
 
-    pub(super) fn physical_block<B: seismic_target::TargetFamily>(
+    pub(super) fn physical_block<B: seismic_native_target::TargetFamily>(
         &mut self,
         kernel: &seismic_ir::kernel::Kernel<B>,
         block: seismic_ir::kernel::BlockId,
@@ -1076,7 +1076,7 @@ impl<'a> Analysis<'a> {
         Ok(Vec::new())
     }
 
-    pub(super) fn schedule<B: seismic_target::TargetFamily>(
+    pub(super) fn schedule<B: seismic_native_target::TargetFamily>(
         &mut self,
         schedule: &ParametricSchedule<B>,
         kernels: &seismic_ir::kernel::KernelArena<B>,
@@ -1220,7 +1220,7 @@ mod tests {
         let mut construction = Construction::<FakeTarget>::new(&mut arena, vec![], false, 0);
         let unknown_slot = construction.schedule_state().slot_any(&mut arena, ScalarKind::Scalar(DType::F32));
         let literal_slot = construction.schedule_state().slot_any(&mut arena, ScalarKind::Scalar(DType::U32));
-        let vectors = seismic_ir::target::VectorSupport::default();
+        let vectors = seismic_ir::physical_target::VectorSupport::default();
         let mut kernel = construction.portable_kernel(&mut arena, &(), &[], &vectors);
         let unknown_output = kernel.result_slot(unknown_slot);
         let literal_output = kernel.result_slot(literal_slot);
@@ -1256,7 +1256,7 @@ mod tests {
         let allocation = construction.storage_mut().allocate(GlobalBufferKind::Arena, bytes, 4);
         let ordinal = construction.storage_mut().dense_view(&mut arena, allocation, representation, zero, vec![extent]);
         let view = construction.view(ordinal, representation);
-        let vectors = seismic_ir::target::VectorSupport::default();
+        let vectors = seismic_ir::physical_target::VectorSupport::default();
         let mut kernel = construction.portable_kernel(&mut arena, &(), &[], &vectors);
         let place = kernel.arg_view(view, false);
         let index = kernel.index_constant(1);

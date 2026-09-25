@@ -6,7 +6,7 @@ use crate::*;
 use seismic_ir::kernel::{ops::ClosedOpView, Kernel};
 use seismic_ir::schedule::Launch;
 use seismic_ir::storage::LaunchLocalLayout;
-use seismic_ir::target::{KernelEmissionLayout, PhysicalDialect};
+use seismic_ir::physical_target::{KernelEmissionLayout, PhysicalDialect};
 use seismic_lang::expr::ExprArena;
 
 /// Pure backend analytical vocabulary. It declares the complete backend service
@@ -343,8 +343,9 @@ mod tests {
     use super::*;
     use seismic_ir::construction::{AllocationPlan, Construction};
     use seismic_ir::kernel::ops::{ConstantValue, ValueType};
-    use seismic_ir::schedule::LaunchParticipation;
-    use seismic_ir::target::{
+    use seismic_ir::region::Product;
+    use seismic_ir::schedule::RepeatVisits;
+    use seismic_ir::physical_target::{
         IntrinsicIdentityBuilder, IntrinsicNumericalSemantics, KernelWordLayout, VectorSupport,
     };
     use seismic_lang::expr::Assignment;
@@ -354,13 +355,13 @@ mod tests {
     struct Dialect;
     #[derive(Clone, Debug, PartialEq)]
     struct FixtureAbi;
-    impl seismic_ir::target::KernelAbiModel<Dialect> for FixtureAbi {
+    impl seismic_ir::physical_target::KernelAbiModel<Dialect> for FixtureAbi {
         fn layout(
             &self,
             _: &seismic_ir::kernel::Kernel<Dialect>,
-        ) -> seismic_ir::target::KernelAbiLayout {
-            seismic_ir::target::KernelAbiLayout {
-                footprint: seismic_ir::target::KernelAbiFootprint {
+        ) -> seismic_ir::physical_target::KernelAbiLayout {
+            seismic_ir::physical_target::KernelAbiLayout {
+                footprint: seismic_ir::physical_target::KernelAbiFootprint {
                     bytes: 0,
                     alignment: 1,
                 },
@@ -368,11 +369,11 @@ mod tests {
             }
         }
     }
-    fn local_policy() -> seismic_ir::target::LocalRealizationPolicy {
-        seismic_ir::target::LocalRealizationPolicy {
-            workgroup: seismic_ir::target::LocalRealization::NativeDynamic,
-            participant: seismic_ir::target::LocalRealization::NativeStatic,
-            register: seismic_ir::target::LocalRealization::NativeStatic,
+    fn local_policy() -> seismic_ir::physical_target::LocalRealizationPolicy {
+        seismic_ir::physical_target::LocalRealizationPolicy {
+            workgroup: seismic_ir::physical_target::LocalRealization::NativeDynamic,
+            participant: seismic_ir::physical_target::LocalRealization::NativeStatic,
+            register: seismic_ir::physical_target::LocalRealization::NativeStatic,
         }
     }
 
@@ -476,22 +477,26 @@ mod tests {
             let outer_start = arena.nat(0);
             let outer_end = arena.nat(2);
             let empty = arena.bool(false);
-            let mut builder = construction.schedule(&mut arena, 0);
-            builder.repeat(outer_start, outer_end, |outer, _| {
-                outer.repeat(start, end, |body, _| {
-                    let id = body.launch(Launch {
-                        kernel,
-                        descriptor: (),
-                        grid: [one; 3],
-                        workgroup: [one; 3],
-                        empty,
-                        parallel_extent: None,
-                        logical_base: None,
-                    });
-                    body.step_launch(id);
-                });
+            let outer = construction.begin_value_repeat(
+                &mut arena, 0, outer_start, outer_end, RepeatVisits::Ordered, Product::Unit,
+            );
+            let inner = construction.begin_value_repeat(
+                &mut arena, outer.body(), start, end, RepeatVisits::Ordered, Product::Unit,
+            );
+            let mut body = construction.schedule(&mut arena, inner.body());
+            let id = body.launch(Launch {
+                kernel,
+                descriptor: (),
+                grid: [one; 3],
+                workgroup: [one; 3],
+                empty,
+                parallel_extent: None,
+                logical_base: None,
             });
-            let token = builder.close();
+            body.step_launch(id);
+            construction.finish_value_repeat(inner, Product::Unit);
+            construction.finish_value_repeat(outer, Product::Unit);
+            let token = construction.schedule(&mut arena, 0).close();
             let analyzed = construction
                 .close(token)
                 .normalize_launches(&mut arena, u64::MAX, 64)
@@ -582,19 +587,21 @@ mod tests {
         let incomplete = schedule.launch(launch(incomplete_kernel));
         let complete_a = schedule.launch(launch(complete_kernel));
         let complete_b = schedule.launch(launch(complete_kernel));
-        schedule.repeat(zero, two, |body, _| {
-            body.branch(
-                condition,
-                |then| {
-                    then.step_launch(incomplete);
-                },
-                |otherwise| {
-                    otherwise.step_launch(complete_a);
-                    otherwise.step_launch(complete_b);
-                },
-            );
-        });
-        let token = schedule.close();
+        let repeat = construction.begin_value_repeat(
+            &mut arena, 0, zero, two, RepeatVisits::Ordered, Product::Unit,
+        );
+        construction.schedule(&mut arena, repeat.body()).branch(
+            condition,
+            |then| {
+                then.step_launch(incomplete);
+            },
+            |otherwise| {
+                otherwise.step_launch(complete_a);
+                otherwise.step_launch(complete_b);
+            },
+        );
+        construction.finish_value_repeat(repeat, Product::Unit);
+        let token = construction.schedule(&mut arena, 0).close();
         let analyzed = construction
             .close(token)
             .normalize_launches(&mut arena, u64::MAX, 64)

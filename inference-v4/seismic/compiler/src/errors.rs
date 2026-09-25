@@ -9,7 +9,7 @@ use seismic_lang::checked::SourceError;
 use std::fmt;
 
 pub use seismic_lang::bundle::CheckedBundleError;
-use seismic_target::NativeCompilationError;
+use seismic_native_target::NativeCompilationError;
 
 /// Target discovery/opening failures.
 #[derive(Clone, Debug, PartialEq, Eq)]

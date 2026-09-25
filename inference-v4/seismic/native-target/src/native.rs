@@ -1,6 +1,6 @@
 use crate::{CompatibilityIdentity, DeviceDescription, NativeCompilationError, TargetFamily};
 use seismic_ir::kernel::Kernel;
-use seismic_ir::target::{KernelAbiLayout, KernelEmissionLayout};
+use seismic_ir::physical_target::{KernelAbiLayout, KernelEmissionLayout};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
@@ -388,7 +388,7 @@ mod tests {
         NumericalEnvironmentIdentity, TargetDescriptionError,
     };
     use seismic_ir::kernel::ops::AddressableResourceHandle;
-    use seismic_ir::target::{
+    use seismic_ir::physical_target::{
         IntrinsicIdentityBuilder, IntrinsicNumericalSemantics, KernelAbiFootprint, KernelAbiModel,
         LocalRealization, LocalRealizationPolicy, NumericalEnvironment, TargetLimits,
     };
@@ -401,7 +401,7 @@ mod tests {
     #[derive(Clone, Debug, PartialEq)]
     struct FakeFacts;
 
-    impl seismic_ir::target::PhysicalDialect for FakeTarget {
+    impl seismic_ir::physical_target::PhysicalDialect for FakeTarget {
         type LaunchDescriptor = ();
         fn ordinary_launch() -> Self::LaunchDescriptor {
             ()
@@ -510,12 +510,12 @@ mod tests {
                 max_index_bits: 1,
                 subgroup_width: None,
             },
-            dtypes: seismic_ir::target::DataTypeSupport {
+            dtypes: seismic_ir::physical_target::DataTypeSupport {
                 scalars: BTreeSet::new(),
                 atomics: BTreeSet::new(),
                 representations: BTreeSet::new(),
             },
-            vectors: seismic_ir::target::VectorSupport::default(),
+            vectors: seismic_ir::physical_target::VectorSupport::default(),
             numerics: NumericalEnvironment {
                 contraction_available: false,
                 flush_to_zero_available: false,

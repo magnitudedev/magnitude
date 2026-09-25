@@ -33,7 +33,7 @@ const SERVICE_SCALAR_READ: ServiceClassId = ServiceClassId::new("core.scalar-rea
 const SERVICE_SCALAR_MOVE: ServiceClassId = ServiceClassId::new("core.scalar-move");
 const SERVICE_DATA_CHECK: ServiceClassId = ServiceClassId::new("core.data-check");
 use seismic_ir::kernel::Kernel;
-use seismic_ir::target::{
+use seismic_ir::physical_target::{
     DataTypeSupport, KernelAbiAllocation, KernelAbiAllocationRole, KernelAbiFootprint,
     KernelAbiLayout, KernelAbiModel, KernelWordLayout, LocalRealization, LocalRealizationPolicy,
     NumericalEnvironment, TargetLimits, VectorSupport,
@@ -41,7 +41,7 @@ use seismic_ir::target::{
 use seismic_lang::intrinsics::MathOp;
 use seismic_lang::registry::{self, BackendName};
 use seismic_lang::types::DType;
-use seismic_target::CompatibilityIdentity;
+use seismic_native_target::CompatibilityIdentity;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::ffi::{c_int, CStr};
@@ -627,7 +627,7 @@ pub(crate) fn profile_for_opened(
     ordinal: u32,
     context: &Arc<Context>,
     stream: &Arc<Stream>,
-    device: Arc<seismic_target::DeviceDescription<Cuda>>,
+    device: Arc<seismic_native_target::DeviceDescription<Cuda>>,
 ) -> Result<seismic_compiler::evaluation::AnalyticalEvaluationContext<Cuda>, TargetError> {
     let total_started = Instant::now();
     if context.ordinal()
@@ -660,7 +660,7 @@ pub(crate) fn profile_for_opened(
 
 pub(crate) fn device_for_opened(
     ordinal: u32,
-) -> Result<Arc<seismic_target::DeviceDescription<Cuda>>, TargetError> {
+) -> Result<Arc<seismic_native_target::DeviceDescription<Cuda>>, TargetError> {
     let parts = discover(ordinal)?;
     Ok(Arc::new(assemble_device_description(
         parts,

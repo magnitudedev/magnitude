@@ -2090,7 +2090,7 @@ dependencies = [
  "seismic-estimator",
  "seismic-ir",
  "seismic-lang",
- "seismic-target",
+ "seismic-native-target",
  "sha2 0.11.0",
 ]
 
@@ -2116,7 +2116,7 @@ dependencies = [
  "seismic-estimator",
  "seismic-ir",
  "seismic-lang",
- "seismic-target",
+ "seismic-native-target",
  "sha2 0.11.0",
 ]
 
@@ -2129,7 +2129,7 @@ dependencies = [
  "seismic-estimator",
  "seismic-ir",
  "seismic-lang",
- "seismic-target",
+ "seismic-native-target",
  "sha2 0.11.0",
 ]
 
@@ -2182,8 +2182,16 @@ dependencies = [
  "seismic-estimator-metal",
  "seismic-ir",
  "seismic-lang",
- "seismic-target",
+ "seismic-native-target",
  "sha2 0.11.0",
+]
+
+[[package]]
+name = "seismic-native-target"
+version = "0.1.0"
+dependencies = [
+ "seismic-ir",
+ "seismic-lang",
 ]
 
 [[package]]
@@ -2216,8 +2224,8 @@ dependencies = [
  "seismic-ir",
  "seismic-lang",
  "seismic-metal",
+ "seismic-native-target",
  "seismic-std",
- "seismic-target",
  "seismic-vulkan",
  "serde",
  "sha2 0.11.0",
@@ -2232,21 +2240,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "seismic-target"
-version = "0.1.0"
-dependencies = [
- "seismic-ir",
- "seismic-lang",
-]
-
-[[package]]
 name = "seismic-vulkan"
 version = "0.1.0"
 dependencies = [
  "ash",
  "glslang",
  "seismic-compiler",
- "seismic-target",
+ "seismic-native-target",
  "spirv-tools",
 ]
 

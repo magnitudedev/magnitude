@@ -28,7 +28,7 @@ struct ShapeInterval {
 impl SegmentTensor {
     /// This View tree is constructed by the checked source walker. A raw
     /// PortableTensor slice is deliberately not inspected for source premises.
-    fn reservation_axes<B: seismic_target::TargetFamily>(
+    fn reservation_axes<B: seismic_native_target::TargetFamily>(
         &self,
         kernel: &mut PortableBuilder<'_, B>,
     ) -> Result<Vec<NatExpr>, CapacityReason> {
@@ -87,7 +87,7 @@ impl SegmentTensor {
     }
 }
 
-impl<'s, 'k, 'f, 'r, B: seismic_target::TargetFamily> SegmentLowerer<'s, 'k, 'f, 'r, B> {
+impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 'k, 'f, 'r, B> {
     fn capacity_substitutions(
         &mut self,
     ) -> std::collections::HashMap<AnyExpr, Result<NatExpr, CapacityReason>> {
@@ -181,13 +181,13 @@ impl<'s, 'k, 'f, 'r, B: seismic_target::TargetFamily> SegmentLowerer<'s, 'k, 'f,
     }
 }
 
-struct Inference<'a, 's, 'k, 'f, 'r, B: seismic_target::TargetFamily> {
+struct Inference<'a, 's, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> {
     segment: &'a mut SegmentLowerer<'s, 'k, 'f, 'r, B>,
     substitutions: std::collections::HashMap<AnyExpr, Result<NatExpr, CapacityReason>>,
     visiting: BTreeSet<SemanticValueId>,
 }
 
-impl<B: seismic_target::TargetFamily> Inference<'_, '_, '_, '_, '_, B> {
+impl<B: seismic_native_target::TargetFamily> Inference<'_, '_, '_, '_, '_, B> {
     fn native_natural(&mut self, expression: AnyExpr) -> Result<bool, CapacityReason> {
         let (numeric, children) = match self.segment.kernel.expression_arena().view(expression) {
             NodeView::NatConst(_) | NodeView::IntConst(_) => (true, Vec::new()),

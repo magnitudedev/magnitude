@@ -2,7 +2,7 @@
 use crate::candidate_domain::{CandidateCoordinate, CandidateDomain};
 use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::{PartialAssignment, SymbolValue};
-use seismic_target::TargetFamily;
+use seismic_native_target::TargetFamily;
 
 #[derive(Clone, Debug)]
 pub(super) struct Random(pub u64);

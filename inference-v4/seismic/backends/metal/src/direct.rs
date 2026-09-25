@@ -14,7 +14,7 @@ use objc2_metal::{
     MTLStorageMode,
 };
 use seismic_compiler::errors::ExecutionError;
-use seismic_target::NativeCompilationError;
+use seismic_native_target::NativeCompilationError;
 
 /// Metal's `setBytes` limit, which bounds a direct entry's argument words.
 pub const DIRECT_WORD_BYTES_LIMIT: usize = 4096;

@@ -42,15 +42,15 @@ impl FrozenGuard {
 
 pub(crate) struct CandidateContext<'a> {
     pub(crate) invocation: Arc<InvocationContract>,
-    pub(crate) device: seismic_target::DeviceDescriptionIdentity,
+    pub(crate) device: seismic_native_target::DeviceDescriptionIdentity,
     pub(crate) arena: &'a ExprArena,
     pub(crate) constants: crate::target::TargetConstants,
 }
 
 #[derive(Debug)]
-pub(crate) struct FrozenPlan<'a, B: seismic_target::TargetFamily> {
+pub(crate) struct FrozenPlan<'a, B: seismic_native_target::TargetFamily> {
     invocation: Arc<InvocationContract>,
-    device: seismic_target::DeviceDescriptionIdentity,
+    device: seismic_native_target::DeviceDescriptionIdentity,
     identity: VariantIdentity,
     arena: &'a ExprArena,
     implementation: Arc<Implementation<B>>,
@@ -58,7 +58,7 @@ pub(crate) struct FrozenPlan<'a, B: seismic_target::TargetFamily> {
     guard: FrozenGuard,
 }
 
-impl<'a, B: seismic_target::TargetFamily> FrozenPlan<'a, B> {
+impl<'a, B: seismic_native_target::TargetFamily> FrozenPlan<'a, B> {
     pub(crate) fn into_exact_parts(self) -> FrozenPlanParts<'a, B> {
         FrozenPlanParts {
             invocation: self.invocation,
@@ -72,9 +72,9 @@ impl<'a, B: seismic_target::TargetFamily> FrozenPlan<'a, B> {
     }
 }
 
-pub(crate) struct FrozenPlanParts<'a, B: seismic_target::TargetFamily> {
+pub(crate) struct FrozenPlanParts<'a, B: seismic_native_target::TargetFamily> {
     pub invocation: Arc<InvocationContract>,
-    pub device: seismic_target::DeviceDescriptionIdentity,
+    pub device: seismic_native_target::DeviceDescriptionIdentity,
     pub identity: VariantIdentity,
     pub arena: &'a ExprArena,
     pub implementation: Arc<Implementation<B>>,
@@ -84,7 +84,7 @@ pub(crate) struct FrozenPlanParts<'a, B: seismic_target::TargetFamily> {
 
 /// The values a frozen plan fixes: target constants and the implementation's
 /// active choices.
-pub(crate) fn plan_assignment<B: seismic_target::TargetFamily>(
+pub(crate) fn plan_assignment<B: seismic_native_target::TargetFamily>(
     arena: &ExprArena,
     constants: &crate::target::TargetConstants,
     implementation: &Implementation<B>,
@@ -105,7 +105,7 @@ pub(crate) fn plan_assignment<B: seismic_target::TargetFamily>(
 /// `guard_node` is already partially evaluated under `fixed`
 /// (`plan_assignment`): a requirement that holds for every fixed target
 /// value no longer mentions the schedule values it was scoped under.
-pub(crate) fn freeze<'a, B: seismic_target::TargetFamily>(
+pub(crate) fn freeze<'a, B: seismic_native_target::TargetFamily>(
     context: &CandidateContext<'a>,
     implementation: Arc<Implementation<B>>,
     fixed: PartialAssignment,

@@ -8,7 +8,7 @@ use crate::Cuda;
 use seismic_ir::kernel::ops::*;
 use seismic_ir::kernel::{BlockId, Kernel};
 use seismic_ir::storage::LaunchLocalKind;
-use seismic_ir::target::{
+use seismic_ir::physical_target::{
     DenseRepresentationGeometry, KernelEmissionLayout, PackedRepresentationGeometry,
     ReadableRepresentationGeometry,
 };
@@ -18,7 +18,7 @@ use seismic_lang::registry::{
     RepackExpr,
 };
 use seismic_lang::types::DType;
-use seismic_target::{DeviceDescription, NativeCompilationError};
+use seismic_native_target::{DeviceDescription, NativeCompilationError};
 use std::collections::{BTreeSet, HashMap};
 
 pub(crate) struct EmittedPtx {
@@ -3456,7 +3456,7 @@ fn axis(axis: u8) -> &'static str {
     }
 }
 
-fn op_values<B: seismic_ir::target::PhysicalDialect>(op: &Op<B>) -> Vec<ErasedValue> {
+fn op_values<B: seismic_ir::physical_target::PhysicalDialect>(op: &Op<B>) -> Vec<ErasedValue> {
     match op {
         Op::Constant { out, .. }
         | Op::Geometry { out, .. }
@@ -3564,7 +3564,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "bitcast requires equal-width numeric scalar payloads")]
     fn vector_reinterpretation_is_not_a_scalar_bitcast() {
-        use seismic_ir::{construction::Construction, target::VectorSupport};
+        use seismic_ir::{construction::Construction, physical_target::VectorSupport};
 
         let facts = facts();
         let mut arena = seismic_lang::expr::ExprArena::new();
@@ -3588,7 +3588,7 @@ mod tests {
     fn repeat_carry_permutations_read_the_old_state() {
         use seismic_ir::{
             construction::Construction,
-            target::{KernelWordLayout, VectorSupport},
+            physical_target::{KernelWordLayout, VectorSupport},
         };
         use seismic_lang::registry::IntrinsicUniformity;
 
@@ -3742,7 +3742,7 @@ mod tests {
     fn fixture(run: impl FnOnce(&mut Emitter<'_>, &[ClosedValue])) -> String {
         use seismic_ir::{
             construction::Construction,
-            target::{KernelWordLayout, VectorSupport},
+            physical_target::{KernelWordLayout, VectorSupport},
         };
         let facts = facts();
         let mut arena = seismic_lang::expr::ExprArena::new();
@@ -3789,7 +3789,7 @@ mod tests {
     }
     #[test]
     fn source_float_cast_recipe_emits_word_operations_not_native_conversions() {
-        use seismic_ir::{construction::Construction, target::{KernelWordLayout, VectorSupport}};
+        use seismic_ir::{construction::Construction, physical_target::{KernelWordLayout, VectorSupport}};
         let facts = facts();
         for (from, to) in [(DType::F16,DType::F32),(DType::BF16,DType::F32),(DType::F32,DType::F16),(DType::F32,DType::BF16)] {
             let mut arena = seismic_lang::expr::ExprArena::new();
@@ -3827,7 +3827,7 @@ mod tests {
         use seismic_ir::{
             construction::{AllocationPlan, Construction},
             schedule::{Launch, LaunchParticipation},
-            target::{LocalRealization, LocalRealizationPolicy, PhysicalDialect, VectorSupport},
+            physical_target::{LocalRealization, LocalRealizationPolicy, PhysicalDialect, VectorSupport},
         };
         let mut facts = facts();
         facts.cooperative_launch = false;
@@ -3913,7 +3913,7 @@ mod tests {
                 emitter.scalar_arg(value.value, 0, seismic_ir::repr::ScalarKind::Scalar(dtype));
                 emitter.copy_value(*value, value.value);
                 let geometry =
-                    seismic_ir::target::RepresentationGeometry::of(seismic_lang::registry::dense(dtype))
+                    seismic_ir::physical_target::RepresentationGeometry::of(seismic_lang::registry::dense(dtype))
                         .dense();
                 emitter.write_address("%address", &geometry, &name);
                 emitter.store_slot(0, seismic_ir::repr::ScalarKind::Scalar(dtype), *value);

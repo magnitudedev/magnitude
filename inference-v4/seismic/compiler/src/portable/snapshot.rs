@@ -247,7 +247,7 @@ fn writes<'f>(
 }
 
 impl SegmentTensor {
-    pub(super) fn reads_overlap<B: seismic_target::TargetFamily>(
+    pub(super) fn reads_overlap<B: seismic_native_target::TargetFamily>(
         &self,
         kernel: &PortableBuilder<'_, B>,
         writes: &[PortableTensor],
@@ -270,7 +270,7 @@ impl SegmentTensor {
         }
     }
 
-    fn needs_snapshot<B: seismic_target::TargetFamily>(
+    fn needs_snapshot<B: seismic_native_target::TargetFamily>(
         &self,
         kernel: &PortableBuilder<'_, B>,
         writes: &[PortableTensor],
@@ -285,7 +285,7 @@ impl SegmentTensor {
         }
     }
 
-    fn require_snapshot_capacity<B: seismic_target::TargetFamily>(
+    fn require_snapshot_capacity<B: seismic_native_target::TargetFamily>(
         &self,
         kernel: &PortableBuilder<'_, B>,
         writes: &[PortableTensor],
@@ -309,7 +309,7 @@ impl SegmentTensor {
         }
     }
 
-    fn snapshot<B: seismic_target::TargetFamily>(
+    fn snapshot<B: seismic_native_target::TargetFamily>(
         &self,
         kernel: &mut PortableBuilder<'_, B>,
         writes: &[PortableTensor],
@@ -368,7 +368,7 @@ impl SegmentTensor {
 }
 
 impl SegmentBound {
-    fn needs_snapshot<B: seismic_target::TargetFamily>(
+    fn needs_snapshot<B: seismic_native_target::TargetFamily>(
         &self,
         kernel: &PortableBuilder<'_, B>,
         writes: &[PortableTensor],
@@ -381,7 +381,7 @@ impl SegmentBound {
             _ => false,
         }
     }
-    fn require_snapshot_capacity<B: seismic_target::TargetFamily>(
+    fn require_snapshot_capacity<B: seismic_native_target::TargetFamily>(
         &self,
         kernel: &PortableBuilder<'_, B>,
         writes: &[PortableTensor],
@@ -397,7 +397,7 @@ impl SegmentBound {
             _ => Ok(()),
         }
     }
-    fn snapshot<B: seismic_target::TargetFamily>(
+    fn snapshot<B: seismic_native_target::TargetFamily>(
         &self,
         kernel: &mut PortableBuilder<'_, B>,
         writes: &[PortableTensor],
@@ -415,7 +415,7 @@ impl SegmentBound {
     }
 }
 
-impl<'s, 'k, 'f, 'r, B: seismic_target::TargetFamily> SegmentLowerer<'s, 'k, 'f, 'r, B> {
+impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 'k, 'f, 'r, B> {
     pub(super) fn preserve_captures_before(
         &mut self,
         node: NodeId,

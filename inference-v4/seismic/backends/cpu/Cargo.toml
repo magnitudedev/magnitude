@@ -8,7 +8,7 @@ license.workspace = true
 seismic-ir.workspace = true
 seismic-estimator.workspace = true
 seismic-lang.workspace = true
-seismic-target.workspace = true
+seismic-native-target.workspace = true
 seismic-compiler.workspace = true
 sha2 = "=0.11.0"
 cranelift-codegen = "=0.125.4"

@@ -40,7 +40,7 @@ pub(super) fn checks(
     checks
 }
 
-pub(super) fn lower<B: seismic_target::TargetFamily>(
+pub(super) fn lower<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     function: &SemanticFunction,
     node: NodeId,
@@ -68,7 +68,7 @@ pub(super) fn lower<B: seismic_target::TargetFamily>(
     )
 }
 
-pub(super) fn finish<B: seismic_target::TargetFamily>(
+pub(super) fn finish<B: seismic_native_target::TargetFamily>(
     builder: &mut ImplementationBuilder<'_, B>,
     path: &str,
     checks: SourceChecks,
@@ -89,7 +89,7 @@ pub(super) fn finish<B: seismic_target::TargetFamily>(
 
 /// Ordered realization retains the participant's terminal state across every
 /// element. A stopped element does not read or evaluate the next element.
-pub(super) fn nested<B: seismic_target::TargetFamily>(
+pub(super) fn nested<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     axes: &[PortableValue],
     axis: usize,

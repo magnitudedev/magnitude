@@ -31,7 +31,7 @@ use seismic_lang::expr::{
 };
 use seismic_lang::ids::{FunctionId, ModuleHash, StableEntryId, StableFunctionId};
 use seismic_lang::precision::PrecisionPolicy;
-use seismic_target::{DeviceDescription, DeviceDescriptionIdentity};
+use seismic_native_target::{DeviceDescription, DeviceDescriptionIdentity};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -241,7 +241,7 @@ impl InvocationRegion {
 }
 
 #[derive(Debug)]
-pub struct CandidateSlice<'a, B: seismic_target::TargetFamily> {
+pub struct CandidateSlice<'a, B: seismic_native_target::TargetFamily> {
     coordinate: CandidateCoordinate,
     family: &'a Arc<ConstructedCandidate<B>>,
     constraints: &'a ConstraintSet,
@@ -249,7 +249,7 @@ pub struct CandidateSlice<'a, B: seismic_target::TargetFamily> {
     numerical: StructuralNumericalObligation,
 }
 
-pub(crate) struct ConstructedCandidateHandle<B: seismic_target::TargetFamily> {
+pub(crate) struct ConstructedCandidateHandle<B: seismic_native_target::TargetFamily> {
     coordinate: CandidateCoordinate,
     family: Arc<ConstructedCandidate<B>>,
     constraint: BoolExpr,
@@ -259,7 +259,7 @@ pub(crate) struct ConstructedCandidateHandle<B: seismic_target::TargetFamily> {
     arena: Arc<RwLock<ExprArena>>,
 }
 
-impl<B: seismic_target::TargetFamily> Clone for ConstructedCandidateHandle<B> {
+impl<B: seismic_native_target::TargetFamily> Clone for ConstructedCandidateHandle<B> {
     fn clone(&self) -> Self {
         Self {
             coordinate: self.coordinate.clone(),
@@ -273,12 +273,12 @@ impl<B: seismic_target::TargetFamily> Clone for ConstructedCandidateHandle<B> {
 
 /// A bounded read of one constructed physical member. This is neither
 /// numerical acceptance nor authority to execute the member.
-pub(crate) struct ConstructedCandidateRead<'a, B: seismic_target::TargetFamily> {
+pub(crate) struct ConstructedCandidateRead<'a, B: seismic_native_target::TargetFamily> {
     candidate: &'a ConstructedCandidateHandle<B>,
     arena: RwLockReadGuard<'a, ExprArena>,
 }
 
-impl<B: seismic_target::TargetFamily> ConstructedCandidateRead<'_, B> {
+impl<B: seismic_native_target::TargetFamily> ConstructedCandidateRead<'_, B> {
     pub(crate) fn candidate(&self) -> &ConstructedCandidateHandle<B> {
         self.candidate
     }
@@ -324,7 +324,7 @@ impl ReferenceRead<'_> {
     }
 }
 
-impl<B: seismic_target::TargetFamily> ConstructedCandidateHandle<B> {
+impl<B: seismic_native_target::TargetFamily> ConstructedCandidateHandle<B> {
     pub(crate) fn coordinate(&self) -> &CandidateCoordinate {
         &self.coordinate
     }
@@ -339,7 +339,7 @@ impl<B: seismic_target::TargetFamily> ConstructedCandidateHandle<B> {
     }
 }
 
-impl<'a, B: seismic_target::TargetFamily> CandidateSlice<'a, B> {
+impl<'a, B: seismic_native_target::TargetFamily> CandidateSlice<'a, B> {
     pub fn coordinate(&self) -> &CandidateCoordinate {
         &self.coordinate
     }
@@ -358,7 +358,7 @@ impl<'a, B: seismic_target::TargetFamily> CandidateSlice<'a, B> {
 }
 
 #[derive(Debug)]
-pub struct CandidateDomain<'ctx, B: seismic_target::TargetFamily> {
+pub struct CandidateDomain<'ctx, B: seismic_native_target::TargetFamily> {
     domain_token: u64,
     entry: StableEntryId,
     module: ModuleHash,
@@ -382,7 +382,7 @@ pub struct CandidateDomain<'ctx, B: seismic_target::TargetFamily> {
     materializations: HashMap<ConstructionCoordinate, materialization::Progress<B>>,
 }
 
-impl<'ctx, B: seismic_target::TargetFamily> CandidateDomain<'ctx, B> {
+impl<'ctx, B: seismic_native_target::TargetFamily> CandidateDomain<'ctx, B> {
     pub fn entry(&self) -> StableEntryId {
         self.entry
     }
@@ -656,11 +656,11 @@ impl<'ctx, B: seismic_target::TargetFamily> CandidateDomain<'ctx, B> {
     }
 }
 
-pub(crate) struct ConstructedCandidateView<'a, B: seismic_target::TargetFamily> {
+pub(crate) struct ConstructedCandidateView<'a, B: seismic_native_target::TargetFamily> {
     candidate: &'a DomainCandidate<B>,
 }
 
-impl<'a, B: seismic_target::TargetFamily> ConstructedCandidateView<'a, B> {
+impl<'a, B: seismic_native_target::TargetFamily> ConstructedCandidateView<'a, B> {
     pub fn identity(&self) -> &ConstructionCoordinate {
         &self.candidate.construction
     }
@@ -669,7 +669,7 @@ impl<'a, B: seismic_target::TargetFamily> ConstructedCandidateView<'a, B> {
     }
 }
 
-pub(crate) struct CandidateDomainParts<'ctx, B: seismic_target::TargetFamily> {
+pub(crate) struct CandidateDomainParts<'ctx, B: seismic_native_target::TargetFamily> {
     pub domain_token: u64,
     pub entry: StableEntryId,
     pub module: ModuleHash,
@@ -688,14 +688,14 @@ pub(crate) struct CandidateDomainParts<'ctx, B: seismic_target::TargetFamily> {
 }
 
 #[derive(Debug)]
-pub(crate) struct DomainCandidate<B: seismic_target::TargetFamily> {
+pub(crate) struct DomainCandidate<B: seismic_native_target::TargetFamily> {
     pub(crate) construction: ConstructionCoordinate,
     pub(crate) family: Arc<ConstructedCandidate<B>>,
     pub(crate) constraints: ConstraintSet,
     pub(crate) numerical: StructuralNumericalObligation,
 }
 
-impl<B: seismic_target::TargetFamily> Clone for DomainCandidate<B> {
+impl<B: seismic_native_target::TargetFamily> Clone for DomainCandidate<B> {
     fn clone(&self) -> Self {
         Self {
             family: self.family.clone(),
@@ -744,7 +744,7 @@ fn stable_physical_choices(
         .collect()
 }
 
-pub(crate) fn general_choices<B: seismic_target::TargetFamily>(
+pub(crate) fn general_choices<B: seismic_native_target::TargetFamily>(
     arena: &ExprArena,
     family: &ConstructedCandidate<B>,
 ) -> Vec<(DecisionId, i64)> {
@@ -820,7 +820,7 @@ pub(crate) fn canonical_choice_binding(
     Ok((assignment, canonical))
 }
 
-pub(crate) fn canonical_coordinate<B: seismic_target::TargetFamily>(
+pub(crate) fn canonical_coordinate<B: seismic_native_target::TargetFamily>(
     domain: u64,
     arena: &ExprArena,
     candidate: &DomainCandidate<B>,
@@ -841,7 +841,7 @@ pub fn construct_candidate_domain<'ctx, T>(
     precision: &PrecisionPolicy,
 ) -> Result<CandidateDomain<'ctx, T>, PreparationError>
 where
-    T: seismic_target::TargetFamily,
+    T: seismic_native_target::TargetFamily,
 {
     internals::candidate_domain(entry, device, registry, precision)
 }
@@ -858,7 +858,7 @@ pub(crate) mod internals {
         precision: &PrecisionPolicy,
     ) -> Result<CandidateDomain<'ctx, T>, PreparationError>
     where
-        T: seismic_target::TargetFamily,
+        T: seismic_native_target::TargetFamily,
     {
         if target.limits().max_grid[0] == 0 {
             return Err(PreparationError::UniversalClosure(
@@ -959,7 +959,7 @@ pub(crate) mod internals {
         }))
     }
 
-    fn validate_structural_universal<T: seismic_target::TargetFamily>(
+    fn validate_structural_universal<T: seismic_native_target::TargetFamily>(
         entry_name: &str,
         arena: &mut ExprArena,
         family: &ConstructedCandidate<T>,
@@ -987,7 +987,7 @@ pub(crate) mod internals {
         Ok(())
     }
 
-    pub(super) fn structural_candidate<T: seismic_target::TargetFamily>(
+    pub(super) fn structural_candidate<T: seismic_native_target::TargetFamily>(
         arena: &mut ExprArena,
         family: ConstructedCandidate<T>,
         construction: ConstructionCoordinate,
@@ -1066,7 +1066,7 @@ pub(crate) mod internals {
         }
     }
 
-    fn target_domain<B: seismic_target::TargetFamily>(
+    fn target_domain<B: seismic_native_target::TargetFamily>(
         arena: &mut ExprArena,
         schema: &CallSchema,
         entry: seismic_lang::entry::EntryDomain,

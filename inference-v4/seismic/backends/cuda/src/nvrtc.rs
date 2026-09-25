@@ -17,7 +17,7 @@
 //! dynamic loader's ambient search.
 
 use libloading::Library;
-use seismic_target::ToolchainUnavailable;
+use seismic_native_target::ToolchainUnavailable;
 use std::ffi::{c_char, c_int, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};

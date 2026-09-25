@@ -19,7 +19,7 @@ use crate::planning::{
     OptimizationCompletion, PlanningBudgetReport, PlanningLimit, PlanningReport, SelectionPolicy,
 };
 use crate::prepared::{CandidateIndex, SelectionFunction};
-use seismic_target::{NativeCompiler, TargetFamily};
+use seismic_native_target::{NativeCompiler, TargetFamily};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};

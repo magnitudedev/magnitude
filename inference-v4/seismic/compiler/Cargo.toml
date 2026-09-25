@@ -11,7 +11,7 @@ path = "src/compiler.rs"
 seismic-ir.workspace = true
 seismic-estimator.workspace = true
 seismic-lang.workspace = true
-seismic-target.workspace = true
+seismic-native-target.workspace = true
 magnitude-solver = { path = "../../solver" }
 sha2 = "=0.11.0"
 

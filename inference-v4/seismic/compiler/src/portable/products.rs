@@ -13,7 +13,7 @@ impl SegmentBound {
             Self::Unit => vec![],
         }
     }
-    pub(super) fn with_scalar_fields<B: seismic_target::TargetFamily>(
+    pub(super) fn with_scalar_fields<B: seismic_native_target::TargetFamily>(
         &self,
         kernel: &mut PortableBuilder<'_, B>,
         fields: &mut impl Iterator<Item = PortableValue>,
@@ -77,7 +77,7 @@ impl SegmentTensor {
         }
         fields
     }
-    fn with_scalar_fields<B: seismic_target::TargetFamily>(
+    fn with_scalar_fields<B: seismic_native_target::TargetFamily>(
         &self,
         kernel: &mut PortableBuilder<'_, B>,
         fields: &mut impl Iterator<Item = PortableValue>,
@@ -197,7 +197,7 @@ pub(super) fn join_fields(
     }
 }
 
-pub(super) fn joined<B: seismic_target::TargetFamily>(
+pub(super) fn joined<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     condition: PortableValue,
     then: &SegmentBound,

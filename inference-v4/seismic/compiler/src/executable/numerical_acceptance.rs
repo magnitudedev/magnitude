@@ -3,7 +3,7 @@ use super::{CompiledCandidate, NumericalAcceptance, RetainedCandidate};
 use crate::numerics::{NumericalAssessment, NumericalRegion};
 use seismic_lang::expr::{compiled::InvocationValues, ExprArena};
 use seismic_lang::precision::PrecisionPolicy;
-use seismic_target::TargetFamily;
+use seismic_native_target::TargetFamily;
 use std::sync::Arc;
 
 impl<T: TargetFamily> CompiledCandidate<T> {

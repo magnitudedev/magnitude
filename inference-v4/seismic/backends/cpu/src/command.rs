@@ -2,7 +2,7 @@
 
 use crate::workers::LaunchEntry;
 use cranelift_jit::JITModule;
-use seismic_ir::target::KernelEmissionLayout;
+use seismic_ir::physical_target::KernelEmissionLayout;
 use std::sync::Arc;
 
 /// The JIT memory of one variant, freed when its last kernel drops.

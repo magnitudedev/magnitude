@@ -13,7 +13,7 @@ use crate::storage::{
     AllocationLiveness, AnyBufferView, GlobalAllocationId, GlobalAllocationTopology,
     LocalAllocationTopology, TopologyBuilder,
 };
-use crate::target::{AddressableResourceClass, PhysicalDialect, VectorSupport};
+use crate::physical_target::{AddressableResourceClass, PhysicalDialect, VectorSupport};
 use seismic_lang::expr::{BoolExpr, DecisionId, ExprArena, NatExpr};
 use seismic_lang::ids::{ParameterId, RepresentationId};
 
@@ -886,8 +886,8 @@ impl<B: PhysicalDialect> ExecutableIr<B> {
     pub fn close_execution(
         mut self,
         arena: &mut ExprArena,
-        policy: crate::target::LocalRealizationPolicy,
-        abi: &impl crate::target::KernelAbiModel<B>,
+        policy: crate::physical_target::LocalRealizationPolicy,
+        abi: &impl crate::physical_target::KernelAbiModel<B>,
     ) -> crate::execution::ClosedExecutableIr<B> {
         self.storage.derive_reservations(arena, &self.schedule);
         crate::execution::ClosedExecutableIr::new(self, arena, policy, abi)
@@ -1058,7 +1058,7 @@ fn mutually_exclusive(a: &crate::storage::ScheduleUse, b: &crate::storage::Sched
 mod tests {
     use super::*;
     use crate::repr::{DenseF16, DenseF32, Representation};
-    use crate::target::{IntrinsicIdentityBuilder, IntrinsicNumericalSemantics};
+    use crate::physical_target::{IntrinsicIdentityBuilder, IntrinsicNumericalSemantics};
     use std::panic::{catch_unwind, AssertUnwindSafe};
     #[derive(Debug)]
     struct Dialect;

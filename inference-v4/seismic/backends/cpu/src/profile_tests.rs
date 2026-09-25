@@ -5,7 +5,7 @@
 //! here and compared with the stated table row for row.
 use crate::open::open_host;
 use seismic_ir::kernel::ops::SubgroupCombine;
-use seismic_ir::target::{NativeFloatBehavior, NativeFloatOp};
+use seismic_ir::physical_target::{NativeFloatBehavior, NativeFloatOp};
 use seismic_lang::types::DType;
 
 const FLOATS: [DType; 3] = [DType::F32, DType::F16, DType::BF16];

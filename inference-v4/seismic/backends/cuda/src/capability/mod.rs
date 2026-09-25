@@ -19,7 +19,7 @@ use seismic_compiler::target::{
     CapabilityRegistration, CompilerRegistry, CompilerRegistryParts, IntrinsicImplementation,
 };
 use seismic_ir::kernel::ops::{AddressableResourceHandle, LogicalTensorMap};
-use seismic_ir::target::{DataTypeSupport, TargetLimits};
+use seismic_ir::physical_target::{DataTypeSupport, TargetLimits};
 use seismic_lang::ids::{CapabilityId, IntrinsicId};
 use seismic_lang::intrinsics::ReduceOp;
 use seismic_lang::registry::{self, BackendName, OperandCategory};

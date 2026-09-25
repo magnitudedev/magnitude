@@ -10,7 +10,7 @@ use crate::errors::PreparationError;
 use crate::refinement::ConstructedCandidate;
 use seismic_ir::kernel::KernelId;
 use seismic_lang::expr::{AnyExpr, ExprArena, PartialAssignment, SymbolValue};
-use seismic_target::{
+use seismic_native_target::{
     CompatibilityIdentity, DeviceDescription, DeviceDescriptionIdentity, NativeArtifactMetrics,
     NativeCompiler, NativeKernelDescription, TargetFamily,
 };
@@ -204,7 +204,7 @@ pub(crate) mod demand_driven_tests {
     use seismic_lang::expr::DecisionId;
     use seismic_ir::construction::{AllocationPlan, Construction};
     use seismic_ir::kernel::{Kernel, KernelId};
-    use seismic_ir::target::{
+    use seismic_ir::physical_target::{
         IntrinsicIdentityBuilder, IntrinsicNumericalSemantics, KernelAbiFootprint, KernelAbiLayout,
         KernelAbiModel, KernelEmissionLayout, LocalRealization, LocalRealizationPolicy,
         NumericalEnvironment, TargetLimits, VectorSupport,
@@ -213,8 +213,8 @@ pub(crate) mod demand_driven_tests {
     use seismic_lang::entry::ElementBindings;
     use seismic_lang::expr::{FiniteDomain, PartialAssignment, TargetPredicate};
     use seismic_lang::registry::{BackendName, IntrinsicSignature};
-    use seismic_target::NativeKernelIdentity;
-    use seismic_target::{
+    use seismic_native_target::NativeKernelIdentity;
+    use seismic_native_target::{
         CompatibilityIdentity, DeviceDescriptionParts, NativeClusterDomain, NativeCompilationError,
         NativeKernelReflection, NativeLaunchDomain, NativeNumericalModeIdentity,
         NativeResourceUsage, NativeResources, NumericalEnvironmentIdentity,
@@ -231,7 +231,7 @@ pub(crate) mod demand_driven_tests {
     #[derive(Clone, Debug)]
     pub(crate) enum NoIntrinsic {}
 
-    impl seismic_ir::target::PhysicalDialect for FakeTarget {
+    impl seismic_ir::physical_target::PhysicalDialect for FakeTarget {
         type LaunchDescriptor = bool;
         fn ordinary_launch() -> Self::LaunchDescriptor {
             false
@@ -460,7 +460,7 @@ pub(crate) mod demand_driven_tests {
                 max_index_bits: 1,
                 subgroup_width: None,
             },
-            dtypes: seismic_ir::target::DataTypeSupport {
+            dtypes: seismic_ir::physical_target::DataTypeSupport {
                 scalars: BTreeSet::new(),
                 atomics: BTreeSet::new(),
                 representations: BTreeSet::new(),
@@ -1146,7 +1146,7 @@ fn add_metrics(
 ) -> Result<(), PreparationError> {
     let overflow = |quantity: &'static str| {
         PreparationError::NativeCompilation(
-            seismic_target::NativeCompilationError::ToolchainResourceExhausted(format!(
+            seismic_native_target::NativeCompilationError::ToolchainResourceExhausted(format!(
                 "aggregate native {quantity} exceeds u64"
             )),
         )
@@ -1191,7 +1191,7 @@ struct NativeArtifactStore<T: TargetFamily, H> {
 
 #[derive(Debug)]
 struct ResidentArtifact<T: TargetFamily, H> {
-    kernel: Arc<seismic_target::NativeKernel<T, H>>,
+    kernel: Arc<seismic_native_target::NativeKernel<T, H>>,
     metrics: NativeArtifactMetrics,
 }
 
@@ -1205,7 +1205,7 @@ impl<T: TargetFamily, H> NativeArtifactStore<T, H> {
     fn retain_one(
         &mut self,
         compatibility: &CompatibilityIdentity,
-        kernel: seismic_target::NativeKernel<T, H>,
+        kernel: seismic_native_target::NativeKernel<T, H>,
         metrics: NativeArtifactMetrics,
     ) -> Result<NativeArtifactInstanceId, PreparationError> {
         let description = kernel.description();
@@ -1225,7 +1225,7 @@ impl<T: TargetFamily, H> NativeArtifactStore<T, H> {
     fn get(
         &self,
         instance: NativeArtifactInstanceId,
-    ) -> Option<Arc<seismic_target::NativeKernel<T, H>>> {
+    ) -> Option<Arc<seismic_native_target::NativeKernel<T, H>>> {
         self.by_instance
             .get(instance.0)
             .map(|artifact| artifact.kernel.clone())
@@ -1277,7 +1277,7 @@ impl<T: TargetFamily, H> RealizationRegistry<T, H> {
         &self,
         device: &DeviceDescriptionIdentity,
         native: &RealizedNativeSet<T>,
-    ) -> Vec<Arc<seismic_target::NativeKernel<T, H>>> {
+    ) -> Vec<Arc<seismic_native_target::NativeKernel<T, H>>> {
         assert_eq!(
             device, &self.device,
             "planned policy and realization registry have different devices"

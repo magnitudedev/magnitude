@@ -24,7 +24,7 @@ use seismic_ir::kernel::ops::{
 use seismic_ir::kernel::{BlockId, Kernel};
 use seismic_ir::metal::MetalIntrinsic;
 use seismic_ir::storage::LaunchLocalKind;
-use seismic_ir::target::KernelEmissionLayout;
+use seismic_ir::physical_target::KernelEmissionLayout;
 use seismic_lang::intrinsics::{AtomicOp, MathOp, ReduceOp};
 use seismic_lang::registry::{
     CodeInterpretation, DecodeStep, FloatCodeFormat, PlaneEncoding, PlaneRepackRecipe, RepackExpr,
@@ -193,7 +193,7 @@ pub(crate) fn render(
 
 struct GlobalPlace {
     pointer: String,
-    geometry: seismic_ir::target::RepresentationGeometry,
+    geometry: seismic_ir::physical_target::RepresentationGeometry,
     rank: u32,
     /// Byte pointer name (`seismic_b{slot}`) for word-granular atomics.
     base: String,
@@ -218,7 +218,7 @@ trait MetalGeometry {
     }
 }
 
-impl MetalGeometry for seismic_ir::target::RepresentationGeometry {
+impl MetalGeometry for seismic_ir::physical_target::RepresentationGeometry {
     fn info(&self) -> &'static seismic_lang::registry::RepresentationInfo {
         self.info
     }
@@ -226,12 +226,12 @@ impl MetalGeometry for seismic_ir::target::RepresentationGeometry {
         self.decode.as_ref()
     }
 }
-impl MetalGeometry for seismic_ir::target::DenseRepresentationGeometry {
+impl MetalGeometry for seismic_ir::physical_target::DenseRepresentationGeometry {
     fn info(&self) -> &'static seismic_lang::registry::RepresentationInfo {
         self.info
     }
 }
-impl MetalGeometry for seismic_ir::target::PackedRepresentationGeometry {
+impl MetalGeometry for seismic_ir::physical_target::PackedRepresentationGeometry {
     fn info(&self) -> &'static seismic_lang::registry::RepresentationInfo {
         self.info
     }
@@ -239,7 +239,7 @@ impl MetalGeometry for seismic_ir::target::PackedRepresentationGeometry {
         Some(&self.decode)
     }
 }
-impl MetalGeometry for seismic_ir::target::ReadableRepresentationGeometry {
+impl MetalGeometry for seismic_ir::physical_target::ReadableRepresentationGeometry {
     fn info(&self) -> &'static seismic_lang::registry::RepresentationInfo {
         match self {
             Self::Dense(geometry) => geometry.info,

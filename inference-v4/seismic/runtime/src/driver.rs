@@ -39,7 +39,7 @@ use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::{EntryId, ModuleHash, RepresentationId, StableEntryId};
 use seismic_lang::precision::PrecisionPolicy;
 use seismic_lang::registry;
-use seismic_target::{DeviceDescription, TargetFamily};
+use seismic_native_target::{DeviceDescription, TargetFamily};
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -591,7 +591,7 @@ pub(crate) fn prepare<T, E, C>(
 where
     T: TargetFamily,
     E: NativeExecutor<T>,
-    C: seismic_target::NativeCompiler<T, Handle = E::Handle>,
+    C: seismic_native_target::NativeCompiler<T, Handle = E::Handle>,
 {
     let logical = module
         .entry(entry, &bindings)
@@ -659,7 +659,7 @@ where
             let analytical = opened.analytical().map_err(|error| {
                 PrepareError::Preparation(
                     seismic_compiler::errors::PreparationError::NativeCompilation(
-                        seismic_target::NativeCompilationError::ToolchainFailure(error.to_string()),
+                        seismic_native_target::NativeCompilationError::ToolchainFailure(error.to_string()),
                     ),
                 )
             })?;
@@ -750,7 +750,7 @@ pub(crate) struct FeedbackCampaign<'a, T, E, C>
 where
     T: TargetFamily,
     E: NativeExecutor<T>,
-    C: seismic_target::NativeCompiler<T, Handle = E::Handle>,
+    C: seismic_native_target::NativeCompiler<T, Handle = E::Handle>,
 {
     opened: Arc<Opened<T, E>>,
     public_device: Arc<crate::api::device::DeviceInner>,
@@ -761,7 +761,7 @@ impl<'a, T, E, C> FeedbackCampaign<'a, T, E, C>
 where
     T: TargetFamily,
     E: NativeExecutor<T>,
-    C: seismic_target::NativeCompiler<T, Handle = E::Handle>,
+    C: seismic_native_target::NativeCompiler<T, Handle = E::Handle>,
 {
     pub(crate) fn start(
         opened: &'a Arc<Opened<T, E>>,
