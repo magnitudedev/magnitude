@@ -1,19 +1,23 @@
 //! Seismic's SPIR-V seal pass (§7.2 step 3, §7.3): every floating-point
 //! arithmetic result is decorated `NoContraction`, and the entry point runs
-//! with RTE rounding and signed-zero/Inf/NaN preservation for fp16 and fp32,
-//! plus `DenormPreserve 32` where the device supports it. `RoundingModeRTE 32`
-//! is left out where the driver cannot compile it (NVIDIA proprietary, §16.1);
-//! there the device's fp32 rounding is probed at open instead.
+//! with RTE rounding and signed-zero/Inf/NaN preservation for fp32, and for
+//! fp16 on devices with fp16 arithmetic, plus `DenormPreserve 32` where the
+//! device supports it. `RoundingModeRTE 32` is left out where the driver
+//! cannot compile it (NVIDIA proprietary, §16.1); there the device's fp32
+//! rounding is probed at open instead.
 //!
 //! glslang has no global switch for this, and `precise` is per object.
 
 /// Version of these passes; part of the formation identity and SPIR-V cache
 /// key.
-pub const SEAL_VERSION: u32 = 3;
+pub const SEAL_VERSION: u32 = 4;
 
 /// The execution modes a sealed module declares beyond the fixed ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Environment {
+    /// The device has fp16 arithmetic: `RoundingModeRTE 16` and
+    /// `SignedZeroInfNanPreserve 16` are declared.
+    pub float16: bool,
     /// `RoundingModeRTE 32` is declared. When false, fp32 add, multiply and
     /// conversion rounding is the device's default, which opening verifies
     /// is round-to-nearest-even.
@@ -126,15 +130,17 @@ pub fn seal(module: &[u32], environment: Environment) -> Result<Vec<u32>, Malfor
         .map(|instruction| words(instruction)[1])
         .collect::<std::collections::HashSet<_>>();
 
-    let mut wanted_modes = vec![
-        (MODE_ROUNDING_MODE_RTE, 16),
-        (MODE_SIGNED_ZERO_INF_NAN_PRESERVE, 16),
-        (MODE_SIGNED_ZERO_INF_NAN_PRESERVE, 32),
-    ];
-    let mut wanted_capabilities = vec![
-        CAPABILITY_ROUNDING_MODE_RTE,
-        CAPABILITY_SIGNED_ZERO_INF_NAN_PRESERVE,
-    ];
+    let mut wanted_modes = Vec::new();
+    if environment.float16 {
+        wanted_modes.push((MODE_ROUNDING_MODE_RTE, 16));
+        wanted_modes.push((MODE_SIGNED_ZERO_INF_NAN_PRESERVE, 16));
+    }
+    wanted_modes.push((MODE_SIGNED_ZERO_INF_NAN_PRESERVE, 32));
+    let mut wanted_capabilities = Vec::new();
+    if environment.float16 || environment.rounding_rte_32 {
+        wanted_capabilities.push(CAPABILITY_ROUNDING_MODE_RTE);
+    }
+    wanted_capabilities.push(CAPABILITY_SIGNED_ZERO_INF_NAN_PRESERVE);
     if environment.rounding_rte_32 {
         wanted_modes.push((MODE_ROUNDING_MODE_RTE, 32));
     }
@@ -264,9 +270,9 @@ pub fn fma_khr(module: &[u32]) -> Result<Vec<u32>, MalformedModule> {
 }
 
 /// Result ids of float arithmetic lacking `NoContraction`, and whether the
-/// fp32/fp16 environment modes are present: what a sealed module must not
+/// environment modes of `widths` are present: what a sealed module must not
 /// lack (for tests).
-pub fn unsealed(module: &[u32]) -> Result<(usize, bool), MalformedModule> {
+pub fn unsealed(module: &[u32], widths: &[u32]) -> Result<(usize, bool), MalformedModule> {
     let instructions = instructions(module)?;
     let words = |instruction: &Instruction| {
         &module[instruction.start..instruction.start + instruction.words]
@@ -290,6 +296,6 @@ pub fn unsealed(module: &[u32]) -> Result<(usize, bool), MalformedModule> {
         .collect::<Vec<_>>();
     let environment = [MODE_ROUNDING_MODE_RTE, MODE_SIGNED_ZERO_INF_NAN_PRESERVE]
         .iter()
-        .all(|mode| modes.contains(&(*mode, 16)) && modes.contains(&(*mode, 32)));
+        .all(|mode| widths.iter().all(|width| modes.contains(&(*mode, *width))));
     Ok((missing, environment))
 }

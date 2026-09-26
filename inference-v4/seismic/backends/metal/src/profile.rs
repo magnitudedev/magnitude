@@ -488,10 +488,9 @@ pub(crate) fn native_language(language: LanguageVersion) -> MTLLanguageVersion {
 pub(crate) fn compile_options(language: LanguageVersion) -> objc2::rc::Retained<MTLCompileOptions> {
     let options = MTLCompileOptions::new();
     options.setLanguageVersion(native_language(language));
-    // The macOS 13 API floor; default fast math may reassociate ordered
-    // operations and erase publication casts.
-    #[allow(deprecated)]
-    options.setFastMathEnabled(false);
+    // Math mode and floating-point function selection are macOS 15 APIs and
+    // set the backend's macOS 15 floor. Default fast math may reassociate
+    // ordered operations and erase publication casts.
     options.setMathMode(MTLMathMode::Safe);
     options.setMathFloatingPointFunctions(MTLMathFloatingPointFunctions::Precise);
     options

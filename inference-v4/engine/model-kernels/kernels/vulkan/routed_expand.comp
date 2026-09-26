@@ -126,7 +126,7 @@
 #endif
 
 void routed_expand() {
-    const uint rows_per_tile = gl_NumSubgroups * SEISMIC_TUNE_ROWS;
+    const uint rows_per_tile = SEISMIC_SUBGROUPS * SEISMIC_TUNE_ROWS;
     const uint tile = gl_WorkGroupID.x;
     const uint64_t choices = SEISMIC_DIM_M * SEISMIC_DIM_K;
     const uint hidden = uint(SEISMIC_DIM_H);

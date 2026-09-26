@@ -96,13 +96,13 @@ void routed_route_stage() {
 // the rows' inverses [8].
 void routed_route_gemv() {
     const uint rows = uint(SEISMIC_DIM_M), hidden = uint(SEISMIC_DIM_H);
-    const uint sg = gl_SubgroupID, lane = gl_SubgroupInvocationID, thread = gl_LocalInvocationIndex;
+    const uint sg = SEISMIC_SUBGROUP, lane = SEISMIC_LANE, thread = gl_LocalInvocationIndex;
     const float eps = element_word_f32(SEISMIC_PARAM_EPS);
     const uint inverses = 64u;
     // The stage launch's sum order (256 strided partials, subgroup sums, then
     // the eight subgroup partials in order): item (row, part) is part `part`'s
     // subgroup sum, and the items spread over every subgroup.
-    for (uint item = sg; item < rows * ROUTE_SUBGROUPS; item += gl_NumSubgroups) {
+    for (uint item = sg; item < rows * ROUTE_SUBGROUPS; item += SEISMIC_SUBGROUPS) {
         const uint row = item / ROUTE_SUBGROUPS, part = item % ROUTE_SUBGROUPS;
         float squares = 0.0;
         for (uint source = part * 32u + lane; source < hidden; source += ROUTE_THREADS) {
@@ -128,7 +128,7 @@ void routed_route_gemv() {
                 element_round(ROUTE_ACT, route_residual(row, source) * seismic_shared_f32[inverses + row] * route_norm(source)));
         }
     }
-    const uint expert = gl_WorkGroupID.x * gl_NumSubgroups + sg;
+    const uint expert = gl_WorkGroupID.x * SEISMIC_SUBGROUPS + sg;
     if (expert > ROUTE_E)
         return;
     // Lane l owns sources 4l + 128 i .. + 3 (four independent loads per
@@ -210,8 +210,8 @@ bool route_precedes(float probability, int expert, float best, int best_expert) 
 #define ROUTE_PER_LANE (ROUTE_E / 32u)
 
 void routed_route_select() {
-    const uint lane = gl_SubgroupInvocationID;
-    const uint64_t row = uint64_t(gl_WorkGroupID.x) * gl_NumSubgroups + gl_SubgroupID;
+    const uint lane = SEISMIC_LANE;
+    const uint64_t row = uint64_t(gl_WorkGroupID.x) * SEISMIC_SUBGROUPS + SEISMIC_SUBGROUP;
     if (row >= SEISMIC_DIM_M)
         return;
     const uint64_t routes = SEISMIC_PTR(SEISMIC_BUFFER_ROUTES);
@@ -223,7 +223,7 @@ void routed_route_select() {
         probability[i] = element_f32_at(route_logit(row, lane + 32u * i));
         maximum = max(maximum, probability[i]);
     }
-    maximum = subgroupMax(maximum);
+    maximum = seismic_subgroup_max(maximum);
     float total = 0.0;
     [[unroll]] for (uint i = 0u; i < ROUTE_PER_LANE; ++i) {
         probability[i] = exp(probability[i] - maximum);
@@ -244,8 +244,8 @@ void routed_route_select() {
                 best_expert = expert;
             }
         }
-        const float winner_probability = subgroupMax(best);
-        const int winner = subgroupMax(best == winner_probability ? best_expert : -1);
+        const float winner_probability = seismic_subgroup_max(best);
+        const int winner = seismic_subgroup_max(best == winner_probability ? best_expert : -1);
         [[unroll]] for (uint i = 0u; i < ROUTE_PER_LANE; ++i)
             if (winner >= 0 && uint(winner) == lane + 32u * i)
                 probability[i] = -uintBitsToFloat(0x7f800000u);

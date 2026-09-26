@@ -1162,6 +1162,8 @@ mod tests {
     }
 
     const VULKAN_FEATURES: vulkan::VulkanFeatures = vulkan::VulkanFeatures {
+        subgroup_lanes: 32,
+        float16: true,
         matrix: false,
         wide_accumulators: true,
         mixed_dot: true,
@@ -1215,6 +1217,20 @@ mod tests {
         );
         assert!(matrix.contains("#extension GL_KHR_cooperative_matrix : require\n#"));
         assert!(matrix.contains("#define SEISMIC_HAS_MATRIX 1\n"));
+        assert!(source.contains("#define SEISMIC_SUBGROUP_LANES 32\n"));
+        assert!(source.contains("#define SEISMIC_HAS_FLOAT16 1\n"));
+        assert!(source.contains("GL_EXT_shader_subgroup_extended_types_float16"));
+        let fp32_wide = render(
+            Dialect::Vulkan(vulkan::VulkanFeatures {
+                subgroup_lanes: 64,
+                float16: false,
+                ..VULKAN_FEATURES
+            }),
+            "f32",
+        );
+        assert!(fp32_wide.contains("#define SEISMIC_SUBGROUP_LANES 64\n"));
+        assert!(fp32_wide.contains("#define SEISMIC_HAS_FLOAT16 0\n"));
+        assert!(!fp32_wide.contains("GL_EXT_shader_subgroup_extended_types_float16"));
     }
 
     #[test]
@@ -1231,7 +1247,6 @@ mod tests {
     /// The Vulkan prefix of every representation kind, with an asset using
     /// the ABI and every prelude helper, compiles, seals and validates, and
     /// takes the `OpFmaKHR` binding.
-    #[cfg(not(target_os = "macos"))]
     #[test]
     fn vulkan_prefix_compiles_for_every_representation_kind() {
         const ASSET: &str = "
@@ -1264,6 +1279,7 @@ void probe() {
             )
             .replace("\n// asset\n", ASSET);
             let environment = seismic_vulkan::seal::Environment {
+                float16: true,
                 rounding_rte_32: true,
                 denorm_preserve_32: true,
             };

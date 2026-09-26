@@ -94,15 +94,15 @@ void sample_rows_partition() {
         }
     }
     sample_subgroup_best(score, token, bad);
-    if (gl_SubgroupInvocationID == 0u) {
-        seismic_shared_u32[3u * gl_SubgroupID] = floatBitsToUint(score);
-        seismic_shared_u32[3u * gl_SubgroupID + 1u] = token;
-        seismic_shared_u32[3u * gl_SubgroupID + 2u] = bad;
+    if (SEISMIC_LANE == 0u) {
+        seismic_shared_u32[3u * SEISMIC_SUBGROUP] = floatBitsToUint(score);
+        seismic_shared_u32[3u * SEISMIC_SUBGROUP + 1u] = token;
+        seismic_shared_u32[3u * SEISMIC_SUBGROUP + 2u] = bad;
     }
     barrier();
-    if (gl_SubgroupID == 0u) {
-        const uint lane = gl_SubgroupInvocationID;
-        const bool present = lane < gl_NumSubgroups;
+    if (SEISMIC_SUBGROUP == 0u) {
+        const uint lane = SEISMIC_LANE;
+        const bool present = lane < SEISMIC_SUBGROUPS;
         score = present ? uintBitsToFloat(seismic_shared_u32[3u * lane]) : -SAMPLE_INF;
         token = present ? seismic_shared_u32[3u * lane + 1u] : SAMPLE_NO_TOKEN;
         bad = present ? seismic_shared_u32[3u * lane + 2u] : 0u;

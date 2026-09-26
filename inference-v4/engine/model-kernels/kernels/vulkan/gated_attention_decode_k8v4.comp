@@ -29,7 +29,7 @@ void gated_attention_decode_k8v4_partial() {
         SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_COEFFICIENTS), SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_CODES),
         SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_COEFFICIENTS));
     const uint W = ATTENTION_W, E = ATTENTION_E, KV = ATTENTION_KV, G = ATTENTION_G;
-    const uint simds = gl_NumSubgroups, sg = gl_SubgroupID, lane = gl_SubgroupInvocationID;
+    const uint simds = SEISMIC_SUBGROUPS, sg = SEISMIC_SUBGROUP, lane = SEISMIC_LANE;
     const uint64_t spans = SEISMIC_DIM_R;
     const uint kv_head = gl_WorkGroupID.x;
     const uint part = gl_WorkGroupID.y;

@@ -17,6 +17,8 @@ mod batch;
 pub(crate) use batch::{NativeTensorBatch, NativeTensorBatchCompletion};
 #[cfg(test)]
 mod bundle_identity_tests;
+#[cfg(test)]
+mod vulkan_formation_tests;
 pub mod cpu;
 mod cuda;
 pub mod graph;

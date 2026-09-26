@@ -298,7 +298,7 @@ reference's top-two gap exceeds 0.1 nats); CUDA keeps 275 flips above that gap
 ## V4 qualification
 
 ```
-# from validation/results/precision (CUDA: export SEISMIC_NVRTC_DIRECTORY=<CUDA toolkit>/lib64)
+# from validation/results/precision (CUDA: export SEISMIC_NVRTC_DIRECTORY=<CUDA 12.9 toolkit>/lib64)
 forward_bench qualify --model $G --reference ref-cpu-f32-b8680 --output v4-qualify/<label>.json [--chunks N]
 ```
 

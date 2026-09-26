@@ -25,9 +25,10 @@ use std::sync::{Arc, OnceLock};
 type NvrtcResult = c_int;
 type Program = *mut std::ffi::c_void;
 
-/// The NVRTC major version the backend bundles; it sets the driver
-/// requirement (CUDA minor-version compatibility within one major).
-pub const BUNDLED_MAJOR: u32 = 13;
+/// The NVRTC major version the backend bundles (release 12.9). It sets the
+/// driver floor: CUDA minor-version compatibility guarantees its CUBIN on
+/// every driver of the same major (`DriverApiVersion::MINIMUM`).
+pub const BUNDLED_MAJOR: u32 = 12;
 
 /// Environment setting naming the directory that holds NVRTC and its
 /// builtins, in place of the installation's library directory. It is a
@@ -35,9 +36,9 @@ pub const BUNDLED_MAJOR: u32 = 13;
 pub const DIRECTORY_SETTING: &str = "SEISMIC_NVRTC_DIRECTORY";
 
 #[cfg(target_os = "windows")]
-const LIBRARY: &str = "nvrtc64_130_0.dll";
+const LIBRARY: &str = "nvrtc64_120_0.dll";
 #[cfg(not(target_os = "windows"))]
-const LIBRARY: &str = "libnvrtc.so.13";
+const LIBRARY: &str = "libnvrtc.so.12";
 
 /// The builtins library NVRTC `major.minor` opens by name.
 fn builtins_library(major: u32, minor: u32) -> String {

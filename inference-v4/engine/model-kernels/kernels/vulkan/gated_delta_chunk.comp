@@ -87,12 +87,12 @@ void gated_delta_chunk_inputs() {
     const recurrent_inputs in_ = recurrent_inputs_of();
     const uint64_t inputs = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_INPUTS);
     const uint W = RECURRENT_W, C = RECURRENT_C, CPL = RECURRENT_CPL;
-    const uint channel_head = gl_WorkGroupID.y * gl_NumSubgroups + gl_SubgroupID;
+    const uint channel_head = gl_WorkGroupID.y * SEISMIC_SUBGROUPS + SEISMIC_SUBGROUP;
     const uint64_t row = gl_WorkGroupID.x;
     recurrent_slot slot;
     if (channel_head >= 2u * RECURRENT_NK + RECURRENT_NV || !chunk_row_slot(row, slot))
         return;
-    const uint lane = gl_SubgroupInvocationID;
+    const uint lane = SEISMIC_LANE;
     const int position = int(row) - slot.lo;
     float values[RECURRENT_CPL];
     float squares = 0.0;
@@ -132,10 +132,10 @@ void gated_delta_chunk_inputs() {
 }
 
 // This lane's state row (block-local) and column part.
-uint chunk_row() { return gl_SubgroupID * CHUNK_ROWS + gl_SubgroupInvocationID / CHUNK_LANES; }
-uint chunk_part() { return gl_SubgroupInvocationID % CHUNK_LANES; }
+uint chunk_row() { return SEISMIC_SUBGROUP * CHUNK_ROWS + SEISMIC_LANE / CHUNK_LANES; }
+uint chunk_part() { return SEISMIC_LANE % CHUNK_LANES; }
 // The lane's group holds one of the subgroup's ROWS state rows.
-bool chunk_active() { return gl_SubgroupInvocationID / CHUNK_LANES < CHUNK_ROWS; }
+bool chunk_active() { return SEISMIC_LANE / CHUNK_LANES < CHUNK_ROWS; }
 
 // The lane's columns of its state row in the slot's source version (the
 // bank's state advanced by its first `taped` tape rows with the step's
@@ -284,7 +284,7 @@ void gated_delta_chunk_scan() {
         // published state (their innovations feed the tape).
         memoryBarrierBuffer();
         barrier();
-        const uint first_row = block_row + gl_SubgroupID * CHUNK_ROWS;
+        const uint first_row = block_row + SEISMIC_SUBGROUP * CHUNK_ROWS;
         float rows[RECURRENT_MAX_ROWS][RECURRENT_CPL];
         recurrent_load_rows(in_, CHUNK_ROWS, slot.target, head, first_row, rows);
         recurrent_advance_rows(in_, slot, slot.lo + slot.stop, head, block_row, CHUNK_BLOCK_ROWS, CHUNK_ROWS, first_row,

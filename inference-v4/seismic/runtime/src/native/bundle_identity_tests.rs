@@ -20,6 +20,8 @@ use seismic_lang::registry::{self, BackendName, Layout};
 use std::path::PathBuf;
 
 const VULKAN: VulkanFeatures = VulkanFeatures {
+    subgroup_lanes: 32,
+    float16: true,
     matrix: true,
     wide_accumulators: true,
     mixed_dot: true,

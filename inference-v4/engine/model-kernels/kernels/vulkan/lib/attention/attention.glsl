@@ -58,7 +58,7 @@ void attention_prepare(uint64_t raw, uint64_t norm, uint64_t coordinates, uint64
     const uint partner_lane = lane < half_lanes ? lane + half_lanes : (lane < 2u * half_lanes ? lane - half_lanes : lane);
     float partner[ATTENTION_E];
     [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-        partner[i] = subgroupShuffle(x[i], partner_lane);
+        partner[i] = seismic_shuffle(x[i], partner_lane);
     if (lane >= 2u * half_lanes)
         return;
     [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
@@ -190,7 +190,7 @@ float attention_merge(uint64_t partials, uint64_t statistics, uint64_t first, ui
 void attention_publish(float maximum[ATTENTION_G], float denominator[ATTENTION_G],
     float result[ATTENTION_G][ATTENTION_E], uint states, uint columns, uint64_t partials, uint64_t statistics,
     uint64_t first, uint parts) {
-    const uint sg = gl_SubgroupID, lane = gl_SubgroupInvocationID, subgroups = gl_NumSubgroups;
+    const uint sg = SEISMIC_SUBGROUP, lane = SEISMIC_LANE, subgroups = SEISMIC_SUBGROUPS;
     const uint thread = gl_LocalInvocationIndex;
     if (lane == 0u) {
         [[unroll]] for (uint g = 0u; g < ATTENTION_G; ++g) {

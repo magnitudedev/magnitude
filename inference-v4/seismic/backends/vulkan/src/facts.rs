@@ -16,8 +16,44 @@ const FLOOR_INVOCATIONS: u32 = 1024;
 const FLOOR_GROUP_COUNT: u32 = 65_535;
 const FLOOR_GROUP_SIZE: [u32; 3] = [1024, 1024, 64];
 const FLOOR_PUSH_CONSTANT_BYTES: u32 = 128;
-/// The subgroup width every pipeline requires (§6.3).
+/// The width of the logical subgroup every kernel is written for (§6.3).
 pub const SUBGROUP_WIDTH: u32 = 32;
+
+/// How a device runs the 32-lane logical subgroup (§6.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubgroupWidth {
+    /// Pipelines require a subgroup size of 32.
+    Required32,
+    /// Every subgroup has 32 lanes; pipelines request no size (NVK).
+    Fixed32,
+    /// Every subgroup has 64 lanes and holds two logical subgroups (AMD
+    /// GCN).
+    Fixed64,
+}
+
+impl SubgroupWidth {
+    /// Lanes of one hardware subgroup.
+    pub fn lanes(self) -> u32 {
+        match self {
+            Self::Required32 | Self::Fixed32 => SUBGROUP_WIDTH,
+            Self::Fixed64 => 2 * SUBGROUP_WIDTH,
+        }
+    }
+
+    /// The width a device with subgroup sizes `min..=max` runs, where
+    /// `requirable` says whether compute pipelines may require a size.
+    fn of(min: u32, max: u32, requirable: bool) -> Option<Self> {
+        if requirable && min <= SUBGROUP_WIDTH && SUBGROUP_WIDTH <= max {
+            Some(Self::Required32)
+        } else if (min, max) == (SUBGROUP_WIDTH, SUBGROUP_WIDTH) {
+            Some(Self::Fixed32)
+        } else if (min, max) == (2 * SUBGROUP_WIDTH, 2 * SUBGROUP_WIDTH) {
+            Some(Self::Fixed64)
+        } else {
+            None
+        }
+    }
+}
 
 /// PCI vendor of AMD, whose Windows driver misreports cooperative matrix on
 /// RDNA2 (§4).
@@ -114,8 +150,15 @@ pub struct Facts {
     /// The queue family work is submitted to: compute-only when one exists.
     pub queue_family: u32,
     pub dedicated_compute_queue: bool,
+    /// How the device runs the logical subgroup; `None` fails the floor.
+    pub subgroup_width: Option<SubgroupWidth>,
+    /// fp16 arithmetic with RTE rounding and signed-zero/Inf/NaN
+    /// preservation (`SEISMIC_HAS_FLOAT16`). Without it, kernels compute in
+    /// fp32 over 16-bit storage.
+    pub float16: bool,
     /// Subgroup-scope 16x16x16 cooperative matrix with f16xf16->f32 and
-    /// s8xs8->s32 (`SEISMIC_HAS_MATRIX`), never on RDNA2.
+    /// s8xs8->s32 (`SEISMIC_HAS_MATRIX`), never on RDNA2. Requires fp16
+    /// arithmetic and 32-lane hardware subgroups.
     pub matrix: bool,
     /// The compiler handles a subgroup's cooperative-matrix accumulator
     /// arrays beyond 4 fragments in the flash-attention body
@@ -156,10 +199,12 @@ impl Facts {
     /// the sealed environment and how `seismic_fma_rn` is bound.
     pub fn formation_identity(&self) -> String {
         format!(
-            "driver {} {};cache {};matrix {};denorm {};rte32 {};fma {}",
+            "driver {} {};cache {};subgroup {:?};f16 {};matrix {};denorm {};rte32 {};fma {}",
             self.driver_id,
             self.driver_version,
             hex(&self.pipeline_cache_uuid),
+            self.subgroup_width(),
+            u8::from(self.float16),
             u8::from(self.matrix),
             if self.denorm_preserve_32 {
                 "preserve"
@@ -179,9 +224,16 @@ impl Facts {
         )
     }
 
+    /// How a device meeting the floor runs the logical subgroup.
+    pub fn subgroup_width(&self) -> SubgroupWidth {
+        self.subgroup_width
+            .expect("a device meeting the floor has a logical subgroup width")
+    }
+
     /// The environment the seal pass declares for this device.
     pub fn environment(&self) -> crate::seal::Environment {
         crate::seal::Environment {
+            float16: self.float16,
             rounding_rte_32: self.rounding_rte_32,
             denorm_preserve_32: self.denorm_preserve_32,
         }
@@ -312,7 +364,18 @@ pub(crate) fn describe(instance: &Instance, physical: vk::PhysicalDevice) -> Des
 
     let mixed_dot_accelerated =
         v13.integer_dot_product4x8_bit_packed_mixed_signedness_accelerated == vk::TRUE;
+    let subgroup_width = SubgroupWidth::of(
+        v13.min_subgroup_size,
+        v13.max_subgroup_size,
+        v13.required_subgroup_size_stages
+            .contains(vk::ShaderStageFlags::COMPUTE),
+    );
+    let float16 = f12.shader_float16 == vk::TRUE
+        && v12.shader_rounding_mode_rte_float16 == vk::TRUE
+        && v12.shader_signed_zero_inf_nan_preserve_float16 == vk::TRUE;
     let matrix = cooperative.cooperative_matrix == vk::TRUE
+        && float16
+        && subgroup_width.is_some_and(|width| width.lanes() == SUBGROUP_WIDTH)
         && matrix_shapes(instance, physical)
         // RDNA2 has no WMMA units whatever its driver reports; accelerated
         // mixed-signedness packed dot identifies RDNA3+ (§4, §16.3).
@@ -354,6 +417,8 @@ pub(crate) fn describe(instance: &Instance, physical: vk::PhysicalDevice) -> Des
         },
         queue_family: queue_family.map_or(0, |family| family as u32),
         dedicated_compute_queue: compute_only.is_some(),
+        subgroup_width,
+        float16,
         matrix,
         wide_accumulators: v12.driver_id != vk::DriverId::NVIDIA_PROPRIETARY,
         denorm_preserve_32: v12.shader_denorm_preserve_float32 == vk::TRUE,
@@ -380,14 +445,13 @@ pub(crate) fn describe(instance: &Instance, physical: vk::PhysicalDevice) -> Des
         | vk::SubgroupFeatureFlags::SHUFFLE_RELATIVE
         | vk::SubgroupFeatureFlags::CLUSTERED
         | vk::SubgroupFeatureFlags::QUAD;
-    let requirements: [(&str, bool); 38] = [
+    let requirements: [(&str, bool); 36] = [
         ("Vulkan 1.3", vk::api_version_major(base.api_version) > 1 || vk::api_version_minor(base.api_version) >= 3),
         ("a compute queue with timestamps", queue_family.is_some()),
         ("bufferDeviceAddress", on(f12.buffer_device_address)),
         ("shaderInt64", on(core.shader_int64)),
         ("shaderInt16", on(core.shader_int16)),
         ("shaderInt8", on(f12.shader_int8)),
-        ("shaderFloat16", on(f12.shader_float16)),
         ("storageBuffer16BitAccess", on(f11.storage_buffer16_bit_access)),
         ("storageBuffer8BitAccess", on(f12.storage_buffer8_bit_access)),
         ("scalarBlockLayout", on(f12.scalar_block_layout)),
@@ -401,15 +465,14 @@ pub(crate) fn describe(instance: &Instance, physical: vk::PhysicalDevice) -> Des
         ("shaderIntegerDotProduct", on(f13.shader_integer_dot_product)),
         ("subgroupSizeControl", on(f13.subgroup_size_control)),
         ("computeFullSubgroups", on(f13.compute_full_subgroups)),
-        ("compute in requiredSubgroupSizeStages", v13.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE)),
-        ("subgroup size 32", v13.min_subgroup_size <= SUBGROUP_WIDTH && SUBGROUP_WIDTH <= v13.max_subgroup_size),
+        ("a requirable subgroup size of 32, or a fixed subgroup size of 32 or 64", subgroup_width.is_some()),
         ("subgroup operations in compute", v11.subgroup_supported_stages.contains(vk::ShaderStageFlags::COMPUTE)),
         ("basic, vote, arithmetic, ballot, shuffle, shuffle-relative, clustered and quad subgroup operations", v11.subgroup_supported_operations.contains(subgroup_operations)),
         ("VK_KHR_workgroup_memory_explicit_layout", has(FLOOR_EXTENSIONS[0])),
         ("workgroupMemoryExplicitLayout (base, 8-bit, 16-bit, scalar)", on(explicit.workgroup_memory_explicit_layout) && on(explicit.workgroup_memory_explicit_layout8_bit_access) && on(explicit.workgroup_memory_explicit_layout16_bit_access) && on(explicit.workgroup_memory_explicit_layout_scalar_block_layout)),
         ("VK_EXT_memory_budget", has(FLOOR_EXTENSIONS[1])),
-        ("RTE rounding for fp16 and fp32", on(v12.shader_rounding_mode_rte_float16) && on(v12.shader_rounding_mode_rte_float32)),
-        ("SignedZeroInfNanPreserve for fp16 and fp32", on(v12.shader_signed_zero_inf_nan_preserve_float16) && on(v12.shader_signed_zero_inf_nan_preserve_float32)),
+        ("RTE rounding for fp32", on(v12.shader_rounding_mode_rte_float32)),
+        ("SignedZeroInfNanPreserve for fp32", on(v12.shader_signed_zero_inf_nan_preserve_float32)),
         ("32 KiB of shared memory", limits.max_compute_shared_memory_size >= FLOOR_SHARED_BYTES),
         ("1024 invocations per workgroup", limits.max_compute_work_group_invocations >= FLOOR_INVOCATIONS),
         ("65535 workgroups on every axis", limits.max_compute_work_group_count.iter().all(|count| *count >= FLOOR_GROUP_COUNT)),

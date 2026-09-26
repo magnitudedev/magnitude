@@ -103,14 +103,14 @@ void shape_rows_prepare() {
         else if (value != -SHAPE_INF)
             maximum = SHAPE_UNSHAPED;
     }
-    maximum = subgroupMax(maximum);
-    if (gl_SubgroupInvocationID == 0u)
-        seismic_shared_u32[recent_count + gl_SubgroupID] = maximum;
+    maximum = seismic_subgroup_max(maximum);
+    if (SEISMIC_LANE == 0u)
+        seismic_shared_u32[recent_count + SEISMIC_SUBGROUP] = maximum;
     barrier();
-    if (gl_SubgroupID == 0u) {
-        maximum = gl_SubgroupInvocationID < gl_NumSubgroups ? seismic_shared_u32[recent_count + gl_SubgroupInvocationID] : 0u;
-        maximum = subgroupMax(maximum);
-        if (gl_SubgroupInvocationID == 0u)
+    if (SEISMIC_SUBGROUP == 0u) {
+        maximum = SEISMIC_LANE < SEISMIC_SUBGROUPS ? seismic_shared_u32[recent_count + SEISMIC_LANE] : 0u;
+        maximum = seismic_subgroup_max(maximum);
+        if (SEISMIC_LANE == 0u)
             element_u32_put(shape_row_scratch(row) + uint64_t(part) * 4ul, maximum);
     }
 }
@@ -185,8 +185,8 @@ uint64_t shape_mass(shape_survivor survivor, float value) {
 // Returns SHAPE_BINS when the whole histogram stays below the target.
 uint shape_descend(uint bins, uint64_t target, inout uint64_t above) {
     // Subgroup 0: lane l owns bins [bins - (l + 1) * per, bins - l * per), highest first.
-    if (gl_SubgroupID == 0u) {
-        const uint lane = gl_SubgroupInvocationID;
+    if (SEISMIC_SUBGROUP == 0u) {
+        const uint lane = SEISMIC_LANE;
         const uint per = bins / 32u;
         uint64_t total = 0ul;
         for (uint i = 0u; i < per; ++i)
@@ -325,11 +325,11 @@ void shape_rows_select() {
                 total += shape_mass(survivor, value);
         }
         total = shape_subgroup_sum_u64(total);
-        if (gl_SubgroupInvocationID == 0u)
-            shape_shared_u64_put(SHAPE_REDUCE + 2u * gl_SubgroupID, total);
+        if (SEISMIC_LANE == 0u)
+            shape_shared_u64_put(SHAPE_REDUCE + 2u * SEISMIC_SUBGROUP, total);
         barrier();
         total = 0ul;
-        for (uint s = 0u; s < gl_NumSubgroups; ++s)
+        for (uint s = 0u; s < SEISMIC_SUBGROUPS; ++s)
             total += shape_shared_u64(SHAPE_REDUCE + 2u * s);
         const uint64_t target = shape_top_p_target(top_p, total);
         if (target == 0ul) {

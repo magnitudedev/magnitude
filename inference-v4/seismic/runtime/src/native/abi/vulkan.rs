@@ -8,6 +8,11 @@
 /// the formation and tuning identities.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct VulkanFeatures {
+    /// Lanes of one hardware subgroup: 32, or 64 holding two logical
+    /// subgroups (`SEISMIC_SUBGROUP_LANES`).
+    pub(crate) subgroup_lanes: u32,
+    /// fp16 arithmetic (`SEISMIC_HAS_FLOAT16`).
+    pub(crate) float16: bool,
     /// Subgroup 16x16x16 cooperative matrix, f16->f32 and s8->s32.
     pub(crate) matrix: bool,
     /// Accumulator arrays of more than 4 matrix fragments compile correctly.
@@ -62,7 +67,7 @@ pub(crate) fn shared_footprint(shared_bytes: u64) -> u64 {
 const PRELUDE: &str = include_str!("../vulkan_prelude.glsl");
 
 /// Extensions every Vulkan source enables: the device floor's.
-const EXTENSIONS: [&str; 22] = [
+const EXTENSIONS: [&str; 21] = [
     "GL_GOOGLE_cpp_style_line_directive",
     "GL_EXT_buffer_reference",
     "GL_EXT_buffer_reference2",
@@ -84,13 +89,16 @@ const EXTENSIONS: [&str; 22] = [
     "GL_KHR_shader_subgroup_clustered",
     "GL_KHR_shader_subgroup_quad",
     "GL_EXT_shader_subgroup_extended_types_int8",
-    "GL_EXT_shader_subgroup_extended_types_float16",
 ];
 
 /// `#version`, the extensions, the device feature macros and the prelude.
 pub(super) fn header(features: VulkanFeatures) -> String {
     let mut header = String::from("#version 460\n");
     let gated = [
+        (
+            features.float16,
+            "GL_EXT_shader_subgroup_extended_types_float16",
+        ),
         (features.matrix, "GL_KHR_cooperative_matrix"),
         (features.f32_atomic_add, "GL_EXT_shader_atomic_float"),
         (features.shared_int64_atomics, "GL_EXT_shader_atomic_int64"),
@@ -101,7 +109,12 @@ pub(super) fn header(features: VulkanFeatures) -> String {
     {
         header.push_str(&format!("#extension {extension} : require\n"));
     }
+    header.push_str(&format!(
+        "#define SEISMIC_SUBGROUP_LANES {}\n",
+        features.subgroup_lanes
+    ));
     for (name, on) in [
+        ("FLOAT16", features.float16),
         ("MATRIX", features.matrix),
         ("WIDE_ACCUMULATORS", features.wide_accumulators),
         ("MIXED_DOT", features.mixed_dot),
@@ -216,6 +229,8 @@ void main() {
         };
         let device = seismic_vulkan::Device::open(description.facts.uuid).expect("device opens");
         let features = VulkanFeatures {
+            subgroup_lanes: device.facts().subgroup_width().lanes(),
+            float16: device.facts().float16,
             matrix: false,
             wide_accumulators: false,
             mixed_dot: false,
@@ -366,6 +381,154 @@ void main() {
             "{} of {} cases differ on {}:\n{}",
             failures.len(),
             cases.len(),
+            device.facts().name,
+            failures
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    const HALVES: &str = "
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
+layout(push_constant, scalar) uniform seismic_push_t { uint64_t seismic_arguments; };
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer words_t { uint64_t w[]; };
+void halves() {
+    // [count][count f32 in][count * 2 out]: the f16 of input i, and the f32
+    // of half i & 0xffff.
+    const uint64_t base = words_t(seismic_arguments).w[0];
+    const uint count = seismic_u32(base)[0].v;
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= count)
+        return;
+    seismic_u32 data = seismic_u32(base + 4ul);
+    data[count + 2u * i].v = uint(seismic_f32_to_f16(uintBitsToFloat(data[i].v)));
+    data[count + 2u * i + 1u].v = floatBitsToUint(seismic_f16_to_f32(uint16_t(i & 0xffffu)));
+}
+void main() {
+    halves();
+}
+";
+
+    /// Without fp16 arithmetic, the prelude's integer fp16 conversions equal
+    /// the CPU library's over every half and over f32 values at, between and
+    /// around every half.
+    #[test]
+    fn integer_f16_conversions_match_the_cpu_library() {
+        use seismic_native_cpu::element::{f16_to_f32, f32_to_f16};
+        let Some(description) = seismic_vulkan::discover().ok().and_then(|devices| {
+            devices
+                .into_iter()
+                .find(|device| device.floor.is_ok() && device.facts.is_gpu())
+        }) else {
+            eprintln!("no Vulkan GPU meets the floor");
+            return;
+        };
+        let device = seismic_vulkan::Device::open(description.facts.uuid).expect("device opens");
+        let features = VulkanFeatures {
+            subgroup_lanes: device.facts().subgroup_width().lanes(),
+            float16: false,
+            matrix: false,
+            wide_accumulators: false,
+            mixed_dot: false,
+            f32_atomic_add: false,
+            shared_int64_atomics: false,
+        };
+        let source = format!("{}{HALVES}", header(features));
+        let module = DirectModule::form(
+            &device,
+            &source,
+            &[Kernel {
+                name: "halves",
+                threads: [64, 1, 1],
+                constants: &[],
+            }],
+            |_| None,
+            |_, _| {},
+        )
+        .expect("the conversion kernel forms");
+
+        let mut inputs = Vec::new();
+        for half in 0..=u16::MAX {
+            let value = f16_to_f32(half);
+            let bits = value.to_bits();
+            // The half, its f32 neighbors, and the point halfway to the next
+            // half up in magnitude (a tie) with its neighbors.
+            let next = f16_to_f32(half.wrapping_add(1) & 0x7fff | half & 0x8000).to_bits();
+            let middle = bits / 2 + next / 2 + (bits & next & 1);
+            for candidate in [
+                bits,
+                bits.wrapping_add(1),
+                bits.wrapping_sub(1),
+                middle,
+                middle + 1,
+                middle.wrapping_sub(1),
+            ] {
+                inputs.push(candidate);
+            }
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        while inputs.len() % 65536 != 0 || inputs.len() < 1 << 19 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            inputs.push(state as u32);
+        }
+        let count = inputs.len() as u32;
+        let mut bytes = count.to_le_bytes().to_vec();
+        for input in &inputs {
+            bytes.extend_from_slice(&input.to_le_bytes());
+        }
+        let total = bytes.len() + inputs.len() * 8;
+        let data = device.allocate(total as u64, 256).expect("allocation");
+        device.write(&data, 0, &bytes).expect("upload");
+        let mut batch = DirectBatch::new(&device).expect("batch");
+        batch
+            .launch(&DirectLaunch {
+                module: &module,
+                function: 0,
+                buffers: &[],
+                words: &[],
+                scalar_results: (&data, 0),
+                groups: [u64::from(count.div_ceil(64)), 1, 1],
+            })
+            .expect("launch");
+        batch
+            .commit()
+            .and_then(|submission| submission.finish())
+            .expect("run");
+        let mut results = vec![0u8; inputs.len() * 8];
+        device
+            .read(&data, bytes.len() as u64, &mut results)
+            .expect("download");
+        let word = |at: usize| {
+            u32::from_le_bytes(results[4 * at..4 * at + 4].try_into().expect("four bytes"))
+        };
+        let mut failures = Vec::new();
+        for (index, input) in inputs.iter().enumerate() {
+            let expected = u32::from(f32_to_f16(f32::from_bits(*input)));
+            if word(2 * index) != expected {
+                failures.push(format!(
+                    "f32_to_f16({input:#010x}): expected {expected:#06x}, got {:#06x}",
+                    word(2 * index)
+                ));
+            }
+            let half = (index & 0xffff) as u16;
+            let expected = f16_to_f32(half).to_bits();
+            if word(2 * index + 1) != expected {
+                failures.push(format!(
+                    "f16_to_f32({half:#06x}): expected {expected:#010x}, got {:#010x}",
+                    word(2 * index + 1)
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of {} conversions differ on {}:\n{}",
+            failures.len(),
+            2 * inputs.len(),
             device.facts().name,
             failures
                 .iter()

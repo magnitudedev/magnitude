@@ -2,11 +2,11 @@
 //! SPIRV-Tools validation and dead-code cleanup, the `OpFmaKHR` binding of
 //! `fma` on devices with `VK_KHR_shader_fma` (§16.1), then one compute
 //! pipeline per launch with its workgroup size and group-memory views as
-//! specialization constants, a required subgroup size of 32, and the
-//! device's pipeline cache.
+//! specialization constants, a required subgroup size of 32 where the device
+//! takes one, and the device's pipeline cache.
 
 use crate::device::Device;
-use crate::facts::SUBGROUP_WIDTH;
+use crate::facts::{SubgroupWidth, SUBGROUP_WIDTH};
 use crate::seal::{self, SEAL_VERSION};
 use ash::vk;
 use seismic_native_target::NativeCompilationError;
@@ -219,12 +219,13 @@ impl DirectModule {
         let specialization = vk::SpecializationInfo::default()
             .map_entries(&entries)
             .data(&data);
+        let width = self.device.facts().subgroup_width();
         let mut subgroup = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
             .required_subgroup_size(SUBGROUP_WIDTH);
         // Full subgroups are required whenever the X extent allows it (a
-        // multiple of 32); smaller groups run one partial subgroup, as a
-        // partial CUDA warp does.
-        let flags = if kernel.threads[0] % SUBGROUP_WIDTH == 0 {
+        // multiple of the hardware subgroup); smaller groups run one partial
+        // subgroup, as a partial CUDA warp does.
+        let flags = if kernel.threads[0] % width.lanes() == 0 {
             vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS
         } else {
             vk::PipelineShaderStageCreateFlags::empty()
@@ -234,8 +235,12 @@ impl DirectModule {
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader)
             .name(c"main")
-            .specialization_info(&specialization)
-            .push_next(&mut subgroup);
+            .specialization_info(&specialization);
+        let stage = if width == SubgroupWidth::Required32 {
+            stage.push_next(&mut subgroup)
+        } else {
+            stage
+        };
         let info = vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(inner.layout);

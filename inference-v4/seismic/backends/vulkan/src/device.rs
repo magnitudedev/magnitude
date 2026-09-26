@@ -605,7 +605,7 @@ impl Inner {
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(true)
             .shader_int8(true)
-            .shader_float16(true)
+            .shader_float16(facts.float16)
             .storage_buffer8_bit_access(true)
             .scalar_block_layout(true)
             .timeline_semaphore(true)

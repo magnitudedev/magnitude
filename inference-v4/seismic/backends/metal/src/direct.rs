@@ -44,8 +44,6 @@ impl DirectPipeline {
     ) -> Result<Vec<Self>, NativeCompilationError> {
         let source = NSString::from_str(source);
         let options = objc2_metal::MTLCompileOptions::new();
-        #[allow(deprecated)]
-        options.setFastMathEnabled(false);
         options.setMathMode(objc2_metal::MTLMathMode::Safe);
         options.setMathFloatingPointFunctions(objc2_metal::MTLMathFloatingPointFunctions::Precise);
         let library = device

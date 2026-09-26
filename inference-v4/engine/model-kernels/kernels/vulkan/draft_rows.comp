@@ -95,11 +95,11 @@
 // subgroup partials (at float `partials`) in index order.
 float draft_sum(float value, uint partials) {
     value = seismic_subgroup_sum_f32(value);
-    if (gl_SubgroupInvocationID == 0u)
-        seismic_shared_f32[partials + gl_SubgroupID] = value;
+    if (SEISMIC_LANE == 0u)
+        seismic_shared_f32[partials + SEISMIC_SUBGROUP] = value;
     barrier();
     float total = 0.0;
-    for (uint j = 0u; j < gl_NumSubgroups; ++j)
+    for (uint j = 0u; j < SEISMIC_SUBGROUPS; ++j)
         total += seismic_shared_f32[partials + j];
     return total;
 }
@@ -163,15 +163,15 @@ void draft_rows() {
     const uint inputs = 2u * width;
     const packets_rows16 combine_geometry = COMBINE_GEOMETRY;
     const uint64_t combine = SEISMIC_PTR(SEISMIC_BUFFER_COMBINE);
-    const uint outputs_per_group = gl_NumSubgroups * DRAFT_ROWS_PER_SUBGROUP;
+    const uint outputs_per_group = SEISMIC_SUBGROUPS * DRAFT_ROWS_PER_SUBGROUP;
     const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
     for (uint r = 0u; r < DRAFT_ROWS_PER_SUBGROUP; ++r) {
-        const uint feature = gl_WorkGroupID.x * outputs_per_group + gl_SubgroupID * DRAFT_ROWS_PER_SUBGROUP + r;
+        const uint feature = gl_WorkGroupID.x * outputs_per_group + SEISMIC_SUBGROUP * DRAFT_ROWS_PER_SUBGROUP + r;
         if (feature >= width)
             break;
         const uint64_t weight_row = combine + uint64_t(feature) * combine_geometry.stride;
         float sum = 0.0;
-        for (uint p = gl_SubgroupInvocationID; p * 32u < inputs; p += 32u) {
+        for (uint p = SEISMIC_LANE; p * 32u < inputs; p += 32u) {
             const packets_packet packet = packets_load(COMBINE_KIND, weight_row, combine_geometry, p, inputs);
             [[unroll]] for (uint step = 0u; step < 4u; ++step) {
                 vec4 even, odd;
@@ -187,7 +187,7 @@ void draft_rows() {
             }
         }
         sum = seismic_subgroup_sum_f32(sum);
-        if (gl_SubgroupInvocationID == 0u)
+        if (SEISMIC_LANE == 0u)
             element_f32_put(result + (row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(feature) * SEISMIC_RESULT_0_STRIDE_1) * 4ul,
                 sum);
     }

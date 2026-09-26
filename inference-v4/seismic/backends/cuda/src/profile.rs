@@ -11,6 +11,7 @@ use crate::driver::{
     compile_image, load_module, module_function, Allocation, Context, Driver, DriverError, Event,
     Stream,
 };
+use crate::nvrtc;
 use crate::{
     Cuda, SERVICE_ATOMIC, SERVICE_BARRIER, SERVICE_GLOBAL_READ, SERVICE_GLOBAL_WRITE,
     SERVICE_INSTRUCTION, SERVICE_MATRIX, SERVICE_REPACK, SERVICE_SHARED_READ, SERVICE_SHARED_WRITE,
@@ -161,8 +162,11 @@ impl fmt::Display for ComputeCapability {
 pub struct DriverApiVersion(pub u32);
 
 impl DriverApiVersion {
-    /// PTX 7.1 (`cvt` to/from `bf16`) requires CUDA 11.1.
-    pub const PTX_71_MINIMUM: Self = Self(11_010);
+    /// The oldest driver guaranteed to load the bundled NVRTC's CUBIN: the
+    /// first driver of the bundled CUDA major (minor-version compatibility;
+    /// R525 for CUDA 12). It also covers the PTX 7.1 of generated kernels
+    /// (CUDA 11.1).
+    pub const MINIMUM: Self = Self(nvrtc::BUNDLED_MAJOR * 1000);
     /// The 32 KiB kernel parameter space arrived with CUDA 12.1.
     pub const LARGE_PARAMETERS_MINIMUM: Self = Self(12_010);
     /// CUDA 12.9 carries PTX ISA 8.8, the first PTX revision with the
@@ -175,6 +179,31 @@ impl DriverApiVersion {
     pub fn minor(self) -> u32 {
         (self.0 % 1000) / 10
     }
+}
+
+/// The driver floor of the backend: below it, the bundled NVRTC's CUBIN is
+/// not guaranteed to load.
+fn admit_driver(driver_api: DriverApiVersion) -> Result<(), TargetError> {
+    if driver_api < DriverApiVersion::MINIMUM {
+        return Err(TargetError::UnsupportedDriver(format!(
+            "driver API {driver_api} is below {}: the bundled NVRTC {} requires a CUDA {} driver",
+            DriverApiVersion::MINIMUM,
+            nvrtc::BUNDLED_MAJOR,
+            nvrtc::BUNDLED_MAJOR,
+        )));
+    }
+    Ok(())
+}
+
+/// Whether the device takes the `sm_100f` family target: PTX ISA 8.8 defines
+/// the family for compute capabilities 10.0 and 10.3.
+fn in_blackwell_100_family(
+    compute_capability: ComputeCapability,
+    driver_api: DriverApiVersion,
+) -> bool {
+    compute_capability.major == ComputeCapability::SM100.major
+        && matches!(compute_capability.minor, 0 | 3)
+        && driver_api >= DriverApiVersion::PTX_88_MINIMUM
 }
 
 impl fmt::Display for DriverApiVersion {
@@ -464,15 +493,8 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
         DriverApiVersion(u32::try_from(version).map_err(|_| {
             TargetError::UnsupportedDriver(format!("driver API version {version}"))
         })?);
-    if driver_api < DriverApiVersion::PTX_71_MINIMUM {
-        return Err(TargetError::UnsupportedDriver(format!(
-            "driver API {driver_api} is below {} (PTX 7.1)",
-            DriverApiVersion::PTX_71_MINIMUM
-        )));
-    }
-    let blackwell_100_family = compute_capability.major == ComputeCapability::SM100.major
-        && matches!(compute_capability.minor, 0 | 3 | 7)
-        && driver_api >= DriverApiVersion::PTX_88_MINIMUM;
+    admit_driver(driver_api)?;
+    let blackwell_100_family = in_blackwell_100_family(compute_capability, driver_api);
     let ptx = if blackwell_100_family {
         PtxTarget::BLACKWELL_100_FAMILY
     } else {
@@ -2264,5 +2286,45 @@ mod acquisition_tests {
         let (_, setup) = batches[2].series.single_parts().unwrap();
         assert_eq!(setup.len(), GPU_PROBE_REPETITIONS);
         assert!(setup.iter().all(|value| *value == 200));
+    }
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use super::*;
+
+    #[test]
+    fn the_driver_floor_is_the_bundled_nvrtc_major() {
+        assert_eq!(DriverApiVersion::MINIMUM, DriverApiVersion(12_000));
+        for rejected in [11_010, 11_080, 11_090] {
+            let error = admit_driver(DriverApiVersion(rejected)).unwrap_err();
+            assert!(
+                matches!(&error, TargetError::UnsupportedDriver(reason) if reason.contains("12.0")),
+                "{error:?}"
+            );
+        }
+        for admitted in [12_000, 12_020, 12_090, 13_000] {
+            admit_driver(DriverApiVersion(admitted)).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_blackwell_family_is_10_0_and_10_3_at_driver_12_9() {
+        let capability = |minor| ComputeCapability { major: 10, minor };
+        let driver = DriverApiVersion::PTX_88_MINIMUM;
+        assert!(in_blackwell_100_family(capability(0), driver));
+        assert!(in_blackwell_100_family(capability(3), driver));
+        assert!(!in_blackwell_100_family(capability(7), driver));
+        assert!(!in_blackwell_100_family(
+            capability(0),
+            DriverApiVersion(12_080)
+        ));
+        assert!(!in_blackwell_100_family(
+            ComputeCapability {
+                major: 12,
+                minor: 0
+            },
+            driver
+        ));
     }
 }

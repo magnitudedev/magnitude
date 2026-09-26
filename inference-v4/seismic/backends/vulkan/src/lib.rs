@@ -16,7 +16,9 @@ mod probe;
 pub mod seal;
 
 pub use device::{Device, MemoryBudget, OpenError, Rounded};
-pub use facts::{Calibration, Description, DeviceType, Facts, Limits, SUBGROUP_WIDTH};
+pub use facts::{
+    Calibration, Description, DeviceType, Facts, Limits, SubgroupWidth, SUBGROUP_WIDTH,
+};
 pub use instance::LoaderError;
 pub use memory::Buffer;
 
@@ -51,11 +53,13 @@ mod tests {
         };
         for description in devices {
             eprintln!(
-                "{} ({}, {}): floor {:?}, matrix {}, denorm-preserve {}, rte32 {}, shader fma {:?}, uuid {}",
+                "{} ({}, {}): floor {:?}, subgroup {:?}, f16 {}, matrix {}, denorm-preserve {}, rte32 {}, shader fma {:?}, uuid {}",
                 description.facts.name,
                 description.facts.driver_name,
                 description.facts.driver_info,
                 description.floor,
+                description.facts.subgroup_width,
+                description.facts.float16,
                 description.facts.matrix,
                 description.facts.denorm_preserve_32,
                 description.facts.rounding_rte_32,
@@ -119,14 +123,18 @@ mod tests {
             .expect("shader")
             .compile()
             .expect("compile");
-        let (missing, environment) = seal::unsealed(&compiled).expect("module");
+        let (missing, environment) = seal::unsealed(&compiled, &[16, 32]).expect("module");
         assert!(missing >= 4 && !environment);
         let declared = seal::Environment {
+            float16: true,
             rounding_rte_32: true,
             denorm_preserve_32: true,
         };
         let sealed = seal::seal(&compiled, declared).expect("seal");
-        assert_eq!(seal::unsealed(&sealed).expect("module"), (0, true));
+        assert_eq!(
+            seal::unsealed(&sealed, &[16, 32]).expect("module"),
+            (0, true)
+        );
         // The probed environment leaves out only `RoundingModeRTE 32`
         // (4 words).
         let probed = seal::seal(
@@ -137,10 +145,27 @@ mod tests {
             },
         )
         .expect("seal");
-        assert_eq!(seal::unsealed(&probed).expect("module"), (0, false));
+        assert_eq!(
+            seal::unsealed(&probed, &[16, 32]).expect("module"),
+            (0, false)
+        );
         assert_eq!(probed.len(), sealed.len() - 4);
+        // Without fp16 arithmetic, the two fp16 modes (8 words) are left out
+        // and the fp32 environment is complete.
+        let fp32 = seal::seal(
+            &compiled,
+            seal::Environment {
+                float16: false,
+                ..declared
+            },
+        )
+        .expect("seal");
+        assert_eq!(seal::unsealed(&fp32, &[32]).expect("module"), (0, true));
+        assert_eq!(seal::unsealed(&fp32, &[16]).expect("module"), (0, false));
+        assert_eq!(fp32.len(), sealed.len() - 8);
         formation::validate(&probed).expect("a sealed module validates");
         formation::validate(&sealed).expect("a sealed module validates");
+        formation::validate(&fp32).expect("a sealed module validates");
         // `fma` becomes `OpFmaKHR` (opcode 4427, six words) with its
         // capability and extension; nothing else changes.
         let bound = seal::fma_khr(&sealed).expect("fma binding");

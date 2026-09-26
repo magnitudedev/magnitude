@@ -8,7 +8,8 @@
 //! stored tuning result (and, on CUDA, every stored image) and tunes nothing.
 //!
 //! `cargo test --release -p magnitude-engine --test native_tuning -- --ignored
-//! --test-threads 1 --nocapture` (CUDA: with `SEISMIC_NVRTC_DIRECTORY`).
+//! --test-threads 1 --nocapture` (CUDA: with `SEISMIC_NVRTC_DIRECTORY` naming
+//! a CUDA 12.9 NVRTC).
 
 use magnitude_artifacts::Package;
 use magnitude_model_executor::{

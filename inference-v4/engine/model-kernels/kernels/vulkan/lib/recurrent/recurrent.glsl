@@ -154,7 +154,7 @@ void recurrent_publish_window(recurrent_inputs in_, recurrent_slot slot, uint pa
 
 void recurrent_load_rows(recurrent_inputs in_, const uint rows, int bank, uint head, uint first_row,
     out float state[RECURRENT_MAX_ROWS][RECURRENT_CPL]) {
-    const uint lane = gl_SubgroupInvocationID;
+    const uint lane = SEISMIC_LANE;
     [[unroll]] for (uint r = 0u; r < RECURRENT_MAX_ROWS; ++r)
         if (r < rows)
             [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
@@ -163,7 +163,7 @@ void recurrent_load_rows(recurrent_inputs in_, const uint rows, int bank, uint h
 
 void recurrent_store_rows(recurrent_inputs in_, const uint rows, int bank, uint head, uint first_row,
     float state[RECURRENT_MAX_ROWS][RECURRENT_CPL]) {
-    const uint lane = gl_SubgroupInvocationID;
+    const uint lane = SEISMIC_LANE;
     [[unroll]] for (uint r = 0u; r < RECURRENT_MAX_ROWS; ++r)
         if (r < rows)
             [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
@@ -177,7 +177,7 @@ void recurrent_store_rows(recurrent_inputs in_, const uint rows, int bank, uint 
 void recurrent_load_version(recurrent_inputs in_, recurrent_slot slot, const uint rows, uint head, uint first_row,
     out float state[RECURRENT_MAX_ROWS][RECURRENT_CPL]) {
     recurrent_load_rows(in_, rows, slot.source, head, first_row, state);
-    const uint lane = gl_SubgroupInvocationID;
+    const uint lane = SEISMIC_LANE;
     const uint key = recurrent_key_head(in_, head);
     for (int entry = 0; entry < slot.taped; ++entry) {
         const uint64_t tape = recurrent_tape_row(in_, slot.source, entry);
@@ -217,7 +217,7 @@ void recurrent_advance_rows(recurrent_inputs in_, recurrent_slot slot, int begin
     const uint prepared_width = 2u * W + block_rows;
     const uint beta_at = RECURRENT_SPAN * prepared_width;
     const uint decay_at = beta_at + RECURRENT_SPAN;
-    const uint lane = gl_SubgroupInvocationID, thread = gl_LocalInvocationIndex;
+    const uint lane = SEISMIC_LANE, thread = gl_LocalInvocationIndex;
     const uint key_row = recurrent_key_head(in_, head);
     const int publish = slot.lo + slot.stop;
     const int taped = recurrent_tape_rows(slot);
@@ -342,11 +342,11 @@ void recurrent_sequential(const uint rows) {
     const recurrent_inputs in_ = recurrent_inputs_of();
     const uint64_t mixed = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
     const uint head = gl_WorkGroupID.x;
-    const uint block_rows = rows * gl_NumSubgroups;
+    const uint block_rows = rows * SEISMIC_SUBGROUPS;
     const uint block_row = gl_WorkGroupID.y * block_rows;
     const uint64_t slot_index = gl_WorkGroupID.z;
-    const uint lane = gl_SubgroupInvocationID;
-    const uint first_row = block_row + gl_SubgroupID * rows;
+    const uint lane = SEISMIC_LANE;
+    const uint first_row = block_row + SEISMIC_SUBGROUP * rows;
 
     if (slot_index == SEISMIC_DIM_B) {
         const int covered = recurrent_covered_end();

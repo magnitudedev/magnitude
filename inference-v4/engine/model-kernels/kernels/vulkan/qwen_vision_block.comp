@@ -176,13 +176,13 @@ void qwen_vision_block_qkv() {
 // query heads, key heads, value heads. Rows past M publish zeros.
 void qwen_vision_block_rotate() {
     const uint row = gl_WorkGroupID.x;
-    const uint part = gl_WorkGroupID.y * gl_NumSubgroups + gl_SubgroupID;
+    const uint part = gl_WorkGroupID.y * SEISMIC_SUBGROUPS + SEISMIC_SUBGROUP;
     if (part >= 3u * VISION_H)
         return;
     const uint64_t target = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_OPERANDS)
         + ((uint64_t(part) * VISION_PADDED + row) * VISION_W) * 2ul;
     if (row >= VISION_M) {
-        for (uint i = gl_SubgroupInvocationID; i < VISION_W; i += 32u)
+        for (uint i = SEISMIC_LANE; i < VISION_W; i += 32u)
             element_put(ELEMENT_F16, target, i, 0.0);
         return;
     }

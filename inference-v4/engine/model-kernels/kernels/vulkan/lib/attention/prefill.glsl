@@ -44,10 +44,10 @@
 
 void prefill_prepare(attention_history h) {
     const uint W = ATTENTION_W, E = ATTENTION_E, KV = ATTENTION_KV, G = ATTENTION_G;
-    const uint lane = gl_SubgroupInvocationID;
+    const uint lane = SEISMIC_LANE;
     const uint64_t rows = SEISMIC_DIM_M;
     const uint64_t padded = (rows + PREFILL_QT - 1ul) / PREFILL_QT * PREFILL_QT;
-    const uint64_t item = uint64_t(gl_WorkGroupID.x) * gl_NumSubgroups + gl_SubgroupID;
+    const uint64_t item = uint64_t(gl_WorkGroupID.x) * SEISMIC_SUBGROUPS + SEISMIC_SUBGROUP;
     const uint64_t row = item / (KV * (G + 1u));
     const uint head = uint(item % (KV * (G + 1u)));
     if (row >= padded)
@@ -112,15 +112,15 @@ void prefill_stage(attention_history h, const bool is_key, bool historical, int 
 // intersection [common_lo, common_hi) of all its row intervals, for span
 // `index` (every subgroup computes it; lanes < QT hold the tile's rows).
 ivec4 prefill_interval(uint64_t visible, uint64_t fresh, uint64_t tile_first, uint64_t rows, uint64_t spans, uint64_t index) {
-    const uint lane = gl_SubgroupInvocationID;
+    const uint lane = SEISMIC_LANE;
     const uint64_t tile_row = tile_first + lane;
     const bool row_valid = lane < PREFILL_QT && tile_row < rows;
     int lo = 0, hi = 0;
     if (row_valid)
         attention_span(visible, fresh, tile_row, spans, index, lo, hi);
     const bool nonempty = row_valid && hi > lo;
-    return ivec4(subgroupMin(nonempty ? lo : 0x7fffffff), subgroupMax(nonempty ? hi : int(0x80000000)),
-        subgroupMax(row_valid ? lo : int(0x80000000)), subgroupMin(row_valid ? hi : 0x7fffffff));
+    return ivec4(seismic_subgroup_min(nonempty ? lo : 0x7fffffff), seismic_subgroup_max(nonempty ? hi : int(0x80000000)),
+        seismic_subgroup_max(row_valid ? lo : int(0x80000000)), seismic_subgroup_min(row_valid ? hi : 0x7fffffff));
 }
 
 uint prefill_span_tiles(ivec4 interval) {
@@ -132,7 +132,7 @@ uint prefill_span_tiles(ivec4 interval) {
 // outside the common interval).
 void prefill_lane_scores(uint scratch, float scale, int first, bool inside, int row_lo, int row_hi, out float s[16]) {
     flash_lane_scores(scratch, s);
-    const uint h = gl_SubgroupInvocationID / 16u;
+    const uint h = SEISMIC_LANE / 16u;
     [[unroll]] for (uint j = 0u; j < 16u; ++j) {
         s[j] *= scale;
         const int t = first + int(16u * h + j);
@@ -149,14 +149,14 @@ void prefill_attend(attention_history h) {
     const uint64_t spans = SEISMIC_DIM_R;
     const uint64_t padded = (rows + PREFILL_QT - 1ul) / PREFILL_QT * PREFILL_QT;
     const float scale = element_word_f32(SEISMIC_PARAM_SCALE) * ATTENTION_LOG2E;
-    const uint lane = gl_SubgroupInvocationID;
+    const uint lane = SEISMIC_LANE;
     // Query tiles dispatch last-first: in a causal chunk the last tiles see
     // the most keys, and starting them first shortens the grid's tail.
     const uint tile = gl_NumWorkGroups.x - 1u - gl_WorkGroupID.x;
     const uint kv_head = gl_WorkGroupID.y;
     const uint part = gl_WorkGroupID.z;
     const uint64_t tile_first = uint64_t(tile) * PREFILL_QT;
-    const uint scratch = (FLASH_KEYS * flash_pitch(W)) / 2u + gl_SubgroupID * FLASH_SCRATCH_FLOATS;
+    const uint scratch = (FLASH_KEYS * flash_pitch(W)) / 2u + SEISMIC_SUBGROUP * FLASH_SCRATCH_FLOATS;
 
     uint total_tiles = 0u;
     for (uint64_t index = 0ul; index <= spans; ++index)
@@ -174,7 +174,7 @@ void prefill_attend(attention_history h) {
 
     // The subgroup's block: matrix rows 16 sg .. of the tile's QT x G rows;
     // the lane's softmax row is lane % 16.
-    const uint block_row = 16u * gl_SubgroupID;
+    const uint block_row = 16u * SEISMIC_SUBGROUP;
     const uint lane_row = block_row + lane % 16u;
     const uint64_t token = tile_first + lane_row / G;
     const bool valid = token < rows;
@@ -241,8 +241,8 @@ void prefill_attend(attention_history h) {
             const uint64_t out_token = tile_first + r / G;
             const uint64_t out_head = kv_head * G + r % G;
             // The row's softmax state lives on lanes r % 16 and r % 16 + 16.
-            const float row_maximum = subgroupShuffle(maximum, r % 16u);
-            const float row_denominator = subgroupShuffle(denominator, r % 16u);
+            const float row_maximum = seismic_shuffle(maximum, r % 16u);
+            const float row_denominator = seismic_shuffle(denominator, r % 16u);
             if (out_token < rows) {
                 if (used > 1u) {
                     const uint64_t slot = (uint64_t(part) * rows + out_token) * heads + out_head;

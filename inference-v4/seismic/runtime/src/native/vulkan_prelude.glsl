@@ -5,14 +5,50 @@
 //
 // Every floating-point operation of the formed module is `NoContraction`, and
 // the module runs with RTE rounding and signed-zero/Inf/NaN preservation for
-// fp16 and fp32, so `+` and `*` are single correctly rounded operations (on
-// the NVIDIA proprietary driver fp32 RTE is the probed default rather than a
-// declared mode, §16.1). Float division is always `seismic_div_rn`, never a
-// bare `/`: GLSL `/` is only 2.5 ULP, and NVIDIA's compiler traps on it
-// under `RoundingModeRTE 32`.
-// Subgroup helpers assume the subgroup width of 32 every pipeline requires,
-// and must be executed by all 32 lanes convergently.
+// fp32, and for fp16 where the device has fp16 arithmetic
+// (`SEISMIC_HAS_FLOAT16`), so `+` and `*` are single correctly rounded
+// operations (on the NVIDIA proprietary driver fp32 RTE is the probed default
+// rather than a declared mode, §16.1). Without fp16 arithmetic, fp16 is a
+// storage format only: kernels compute in fp32 and convert with the helpers
+// below. Float division is always `seismic_div_rn`, never a bare `/`: GLSL
+// `/` is only 2.5 ULP, and NVIDIA's compiler traps on it under
+// `RoundingModeRTE 32`.
+//
+// Kernels are written for a 32-lane logical subgroup (§6.3), executed by all
+// 32 lanes convergently where a helper says so. On 32-lane hardware it is the
+// hardware subgroup; on 64-lane hardware (`SEISMIC_SUBGROUP_LANES` 64, AMD
+// GCN) each hardware subgroup holds two, lanes 0-31 and 32-63. Kernels name
+// lanes and subgroups only through `SEISMIC_LANE`, `SEISMIC_SUBGROUP` and
+// `SEISMIC_SUBGROUPS`, and reduce, vote or shuffle by absolute lane only
+// through the `seismic_subgroup_*` and `seismic_shuffle` helpers. Shuffles by
+// an xor mask or an up/down delta below 32 stay within a logical subgroup,
+// and subgroup barriers cover it, on both; kernels use those directly.
 // ---------------------------------------------------------------------------
+
+#if SEISMIC_SUBGROUP_LANES == 32
+#define SEISMIC_LANE gl_SubgroupInvocationID
+#define SEISMIC_SUBGROUP gl_SubgroupID
+#define SEISMIC_SUBGROUPS gl_NumSubgroups
+#define SEISMIC_LANE_BASE 0u
+#define seismic_subgroup_add(value) subgroupAdd(value)
+#define seismic_subgroup_min(value) subgroupMin(value)
+#define seismic_subgroup_max(value) subgroupMax(value)
+#define seismic_subgroup_all(value) subgroupAll(value)
+#elif SEISMIC_SUBGROUP_LANES == 64
+#define SEISMIC_LANE (gl_SubgroupInvocationID & 31u)
+#define SEISMIC_SUBGROUP (2u * gl_SubgroupID + (gl_SubgroupInvocationID >> 5))
+#define SEISMIC_SUBGROUPS ((gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z + 31u) >> 5)
+#define SEISMIC_LANE_BASE (gl_SubgroupInvocationID & 32u)
+#define seismic_subgroup_add(value) subgroupClusteredAdd(value, 32u)
+#define seismic_subgroup_min(value) subgroupClusteredMin(value, 32u)
+#define seismic_subgroup_max(value) subgroupClusteredMax(value, 32u)
+#define seismic_subgroup_all(value) (subgroupClusteredAnd(uint(value), 32u) != 0u)
+#else
+#error "SEISMIC_SUBGROUP_LANES must be 32 or 64"
+#endif
+// The value of `value` on logical lane `lane` of the caller's logical
+// subgroup.
+#define seismic_shuffle(value, lane) subgroupShuffle(value, SEISMIC_LANE_BASE + (lane))
 
 // Element references: one element per block, so a reference indexes like a
 // pointer (`seismic_f32(address)[i].v`) and advances by the element size.
@@ -28,8 +64,10 @@ layout(buffer_reference, scalar, buffer_reference_align = 8) buffer seismic_u64 
 layout(buffer_reference, scalar, buffer_reference_align = 16) buffer seismic_uvec4 { uvec4 v; };
 
 // Conversions. bf16 rounds to nearest even in integer code (NaN becomes the
-// canonical 0x7fff, as CUDA's cvt.rn.bf16.f32); fp16 conversions round by the
-// module's RTE mode.
+// canonical 0x7fff, as CUDA's cvt.rn.bf16.f32). fp16 conversions round by the
+// module's RTE mode where the device has fp16 arithmetic, and otherwise in
+// integer code to nearest even with subnormals preserved (the CPU library's
+// `f32_to_f16` and `f16_to_f32`).
 float seismic_bf16_to_f32(uint16_t value) {
     return uintBitsToFloat(uint(value) << 16);
 }
@@ -39,12 +77,59 @@ uint16_t seismic_f32_to_bf16(float value) {
         return uint16_t(0x7fffu);
     return uint16_t((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
 }
+#if SEISMIC_HAS_FLOAT16
 float seismic_f16_to_f32(uint16_t value) {
     return float(uint16BitsToFloat16(value));
 }
 uint16_t seismic_f32_to_f16(float value) {
     return float16BitsToUint16(float16_t(value));
 }
+#else
+float seismic_f16_to_f32(uint16_t value) {
+    const uint bits = uint(value);
+    const uint sign = (bits & 0x8000u) << 16;
+    const uint exponent = (bits >> 10) & 0x1fu;
+    const uint mantissa = bits & 0x3ffu;
+    if (exponent == 0x1fu)
+        return uintBitsToFloat(sign | 0x7f800000u | (mantissa << 13));
+    if (exponent != 0u)
+        return uintBitsToFloat(sign | ((exponent + 112u) << 23) | (mantissa << 13));
+    if (mantissa == 0u)
+        return uintBitsToFloat(sign);
+    // A subnormal half, mantissa * 2^-24: its leading one becomes the
+    // implicit bit.
+    const uint shift = uint(10 - findMSB(mantissa));
+    return uintBitsToFloat(sign | ((113u - shift) << 23) | (((mantissa << shift) & 0x3ffu) << 13));
+}
+uint16_t seismic_f32_to_f16(float value) {
+    const uint bits = floatBitsToUint(value);
+    const uint sign = (bits >> 16) & 0x8000u;
+    const int exponent = int((bits >> 23) & 0xffu);
+    const uint mantissa = bits & 0x7fffffu;
+    if (exponent == 0xff)
+        return uint16_t(sign | 0x7c00u | (mantissa == 0u ? 0u : 0x200u | (mantissa >> 13)));
+    const int unbiased = exponent - 127;
+    if (unbiased > 15)
+        return uint16_t(sign | 0x7c00u);
+    if (unbiased >= -14) {
+        // Normal half: round the 13 dropped mantissa bits to nearest even.
+        const uint kept = (uint(unbiased + 15) << 10) | (mantissa >> 13);
+        const uint dropped = mantissa & 0x1fffu;
+        const bool up = dropped > 0x1000u || (dropped == 0x1000u && (kept & 1u) != 0u);
+        return uint16_t(sign | (kept + uint(up)));
+    }
+    if (unbiased < -25)
+        return uint16_t(sign);
+    // Subnormal half: the implicit bit joins the mantissa.
+    const uint full = mantissa | 0x800000u;
+    const uint shift = uint(-unbiased - 1);
+    const uint kept = full >> shift;
+    const uint dropped = full & ((1u << shift) - 1u);
+    const uint midpoint = 1u << (shift - 1u);
+    const bool up = dropped > midpoint || (dropped == midpoint && (kept & 1u) != 0u);
+    return uint16_t(sign | (kept + uint(up)));
+}
+#endif
 
 // Packed pairs: `lo` occupies bits 0..15 (the lower address in memory), `hi`
 // bits 16..31. Packing rounds to nearest even.
@@ -229,12 +314,13 @@ float seismic_tanh_approx(float x) {
     return 1.0 - seismic_div_rn(2.0, exp2(2.8853900817779268 * clamped) + 1.0);
 }
 
-// Subgroup shuffles (`subgroupShuffle*`), over the whole subgroup.
+// Subgroup shuffles within the logical subgroup (lane masks and deltas
+// below 32).
 uint seismic_shfl_xor_u32(uint value, uint lane_mask) {
     return subgroupShuffleXor(value, lane_mask);
 }
 uint seismic_shfl_idx_u32(uint value, uint source_lane) {
-    return subgroupShuffle(value, source_lane);
+    return seismic_shuffle(value, source_lane);
 }
 uint seismic_shfl_down_u32(uint value, uint delta) {
     return subgroupShuffleDown(value, delta);
@@ -246,7 +332,7 @@ float seismic_shfl_xor_f32(float value, uint lane_mask) {
     return subgroupShuffleXor(value, lane_mask);
 }
 float seismic_shfl_idx_f32(float value, uint source_lane) {
-    return subgroupShuffle(value, source_lane);
+    return seismic_shuffle(value, source_lane);
 }
 float seismic_shfl_down_f32(float value, uint delta) {
     return subgroupShuffleDown(value, delta);
@@ -269,25 +355,25 @@ float seismic_subgroup_max_f32(float value) {
     return value;
 }
 
-// Integer subgroup reductions, where the order does not matter; every lane
-// receives the result.
+// Integer logical-subgroup reductions, where the order does not matter;
+// every lane receives the result.
 uint seismic_redux_add_u32(uint value) {
-    return subgroupAdd(value);
+    return seismic_subgroup_add(value);
 }
 uint seismic_redux_min_u32(uint value) {
-    return subgroupMin(value);
+    return seismic_subgroup_min(value);
 }
 uint seismic_redux_max_u32(uint value) {
-    return subgroupMax(value);
+    return seismic_subgroup_max(value);
 }
 int seismic_redux_add_s32(int value) {
-    return subgroupAdd(value);
+    return seismic_subgroup_add(value);
 }
 int seismic_redux_min_s32(int value) {
-    return subgroupMin(value);
+    return seismic_subgroup_min(value);
 }
 int seismic_redux_max_s32(int value) {
-    return subgroupMax(value);
+    return seismic_subgroup_max(value);
 }
 
 // Four-way byte dot products accumulated into `acc` without saturation (as

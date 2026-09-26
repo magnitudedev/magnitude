@@ -1,7 +1,7 @@
 // Fixed-order reductions over a subgroup or a workgroup. The counterpart of
 // `metal/lib/core/reduce.h` and `cuda/lib/core/reduce.cuh`.
 //
-// Subgroups are 32 lanes (required on every pipeline). A subgroup sum is the
+// Subgroups are the prelude's 32-lane logical subgroups. A subgroup sum is the
 // prelude's fixed xor butterfly (`seismic_subgroup_sum_f32`: xor 16, 8, 4, 2,
 // 1), never `subgroupAdd`, whose order is implementation-defined. A workgroup
 // reduction first reduces each subgroup, then combines the subgroup partials
@@ -24,23 +24,23 @@ float reduce_lanes_sum(float value, const uint width) {
 float reduce_group_sum(float value, const uint partials) {
     value = seismic_subgroup_sum_f32(value);
     barrier();
-    if (gl_SubgroupInvocationID == 0u)
-        seismic_shared_f32[partials + gl_SubgroupID] = value;
+    if (SEISMIC_LANE == 0u)
+        seismic_shared_f32[partials + SEISMIC_SUBGROUP] = value;
     barrier();
     float total = 0.0;
-    for (uint s = 0u; s < gl_NumSubgroups; ++s)
+    for (uint s = 0u; s < SEISMIC_SUBGROUPS; ++s)
         total += seismic_shared_f32[partials + s];
     return total;
 }
 
 float reduce_group_max(float value, const uint partials) {
-    value = subgroupMax(value);
+    value = seismic_subgroup_max(value);
     barrier();
-    if (gl_SubgroupInvocationID == 0u)
-        seismic_shared_f32[partials + gl_SubgroupID] = value;
+    if (SEISMIC_LANE == 0u)
+        seismic_shared_f32[partials + SEISMIC_SUBGROUP] = value;
     barrier();
     float maximum = seismic_shared_f32[partials];
-    for (uint s = 1u; s < gl_NumSubgroups; ++s)
+    for (uint s = 1u; s < SEISMIC_SUBGROUPS; ++s)
         maximum = max(maximum, seismic_shared_f32[partials + s]);
     return maximum;
 }
@@ -53,8 +53,8 @@ float reduce_group_max(float value, const uint partials) {
 // The subgroup's maximum score (into `best`) and the index `ties` picks among
 // the lanes holding it. Every lane receives both.
 int reduce_argmax(float score, int index, const int ties, out float best) {
-    best = subgroupMax(score);
+    best = seismic_subgroup_max(score);
     if (ties == REDUCE_HIGHER_INDEX)
-        return subgroupMax(score == best ? index : -1);
-    return subgroupMin(score == best ? index : 0x7fffffff);
+        return seismic_subgroup_max(score == best ? index : -1);
+    return seismic_subgroup_min(score == best ? index : 0x7fffffff);
 }

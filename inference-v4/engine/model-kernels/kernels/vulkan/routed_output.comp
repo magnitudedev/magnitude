@@ -112,7 +112,7 @@ void routed_output() {
     const float coefficient = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_COEFFICIENT) + m * SEISMIC_COEFFICIENT_STRIDE_0 * 4ul);
     [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r) {
         const uint n = first + r;
-        if (r < OUTPUT_R && n < hidden && gl_SubgroupInvocationID == r) {
+        if (r < OUTPUT_R && n < hidden && SEISMIC_LANE == r) {
             const float residual = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)
                 + (m * SEISMIC_RESIDUAL_STRIDE_0 + uint64_t(n) * SEISMIC_RESIDUAL_STRIDE_1) * 4ul);
             element_f32_put(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)

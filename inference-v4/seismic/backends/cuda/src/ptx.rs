@@ -3685,7 +3685,7 @@ mod tests {
         CudaFacts {
             device_ordinal: 0,
             compute_capability: ComputeCapability::SM80,
-            driver_api: DriverApiVersion::PTX_71_MINIMUM,
+            driver_api: DriverApiVersion::MINIMUM,
             ptx: PtxTarget::BASELINE,
             tensor_memory: TensorMemory::Unavailable,
             warp_size: 32,

@@ -190,7 +190,7 @@ void vision_layer_norm(const int act, uint64_t x, uint64_t out_, uint64_t weight
 // values are rounded to A, then published as f16 at `target`; `rotated`
 // false copies the row (the values). The whole subgroup calls it.
 void vision_rotate(const int act, uint64_t head_row, uint64_t coordinates, const uint w, bool rotated, uint64_t target) {
-    const uint lane = gl_SubgroupInvocationID;
+    const uint lane = SEISMIC_LANE;
     const uint e = w / 32u;
     const uint p = w / 4u;
     float x[FLASH_MAX_W / 32u];
@@ -225,14 +225,14 @@ void vision_rotate(const int act, uint64_t head_row, uint64_t coordinates, const
 // FLASH_SCRATCH_FLOATS floats per subgroup.
 void vision_attend(const int act, uint64_t operands, uint64_t out_, uint rows, uint padded, uint heads, const uint w, uint tile,
     uint head) {
-    const uint lane = gl_SubgroupInvocationID;
+    const uint lane = SEISMIC_LANE;
     const uint64_t plane = uint64_t(heads) * padded * w * 2ul;   // bytes of one of Q, K, V
     const uint64_t head_rows = uint64_t(head) * padded * w * 2ul;
     const uint64_t keys = operands + plane + head_rows;
     const uint64_t values = operands + 2ul * plane + head_rows;
-    const uint block_row = tile * VISION_ATTEND_ROWS + 16u * gl_SubgroupID;
+    const uint block_row = tile * VISION_ATTEND_ROWS + 16u * SEISMIC_SUBGROUP;
     const uint64_t block_queries = operands + head_rows + uint64_t(block_row) * w * 2ul;
-    const uint scratch = (FLASH_KEYS * flash_pitch(w)) / 2u + gl_SubgroupID * FLASH_SCRATCH_FLOATS;
+    const uint scratch = (FLASH_KEYS * flash_pitch(w)) / 2u + SEISMIC_SUBGROUP * FLASH_SCRATCH_FLOATS;
     const float scale = inversesqrt(float(w)) * 1.4426950408889634;
 
     const uint64_t width = uint64_t(heads) * w;
@@ -272,7 +272,7 @@ void vision_attend(const int act, uint64_t operands, uint64_t out_, uint rows, u
                 break;
             const float value = flash_output_value(o, scratch, q);
             const uint r = flash_output_row(q);
-            const float row_denominator = subgroupShuffle(denominator, r);
+            const float row_denominator = seismic_shuffle(denominator, r);
             const uint row = block_row + r;
             if (row < rows)
                 element_put(act, out_,

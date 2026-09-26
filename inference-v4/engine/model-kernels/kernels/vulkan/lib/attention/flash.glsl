@@ -99,7 +99,7 @@ void flash_scores(uint64_t q, uint64_t q_stride, const uint w, uint k_base, uint
     subgroupMemoryBarrierShared();
     subgroupBarrier();
 #else
-    const uint lane = gl_SubgroupInvocationID;
+    const uint lane = SEISMIC_LANE;
     const uint r = lane % 16u, h = lane / 16u;
     float s[16];
     [[unroll]] for (uint j = 0u; j < 16u; ++j)
@@ -123,7 +123,7 @@ void flash_scores(uint64_t q, uint64_t q_stride, const uint w, uint k_base, uint
 
 // The lane's 16 raw scores of the last `flash_scores`.
 void flash_lane_scores(uint scratch, out float s[16]) {
-    const uint lane = gl_SubgroupInvocationID;
+    const uint lane = SEISMIC_LANE;
     [[unroll]] for (uint j = 0u; j < 16u; ++j)
         s[j] = seismic_shared_f32[scratch + (lane % 16u) * 32u + 16u * (lane / 16u) + j];
 }
@@ -132,11 +132,11 @@ void flash_lane_scores(uint scratch, out float s[16]) {
 // matrix over its scratch; returns P's shared half. Every lane must hold its
 // scores already (`flash_lane_scores`).
 uint flash_publish_probabilities(uint scratch, float p[16]) {
-    const uint lane = gl_SubgroupInvocationID;
+    const uint lane = SEISMIC_LANE;
     const uint p_half = 2u * scratch;
     subgroupBarrier();
     [[unroll]] for (uint j = 0u; j < 16u; ++j)
-        seismic_shared_f16[p_half + (lane % 16u) * 32u + 16u * (lane / 16u) + j] = float16_t(p[j]);
+        seismic_shared_u16[p_half + (lane % 16u) * 32u + 16u * (lane / 16u) + j] = seismic_f32_to_f16(p[j]);
     subgroupMemoryBarrierShared();
     subgroupBarrier();
     return p_half;
@@ -210,12 +210,12 @@ void flash_output_clear(const uint w, const uint window, inout flash_output o) {
 // `flash_online`). Skipped when no row's maximum grew. Every lane of the
 // subgroup calls it, after `flash_publish_probabilities`.
 void flash_rescale(uint scratch, float alpha, const uint w, const uint window, inout flash_output o) {
-    if (subgroupAll(alpha == 1.0))
+    if (seismic_subgroup_all(alpha == 1.0))
         return;
 #if SEISMIC_HAS_MATRIX
     // The factors as a 16 x 16 accumulator fragment, row r all alpha_r: each
     // lane writes half of its row.
-    const uint lane = gl_SubgroupInvocationID;
+    const uint lane = SEISMIC_LANE;
     [[unroll]] for (uint i = 0u; i < 8u; ++i)
         seismic_shared_f32[scratch + FLASH_FACTORS + (lane % 16u) * 16u + 8u * (lane / 16u) + i] = alpha;
     subgroupMemoryBarrierShared();
@@ -253,11 +253,11 @@ void flash_accumulate(uint p_half, uint v_base, const uint w, const uint window,
         }
     }
 #else
-    const uint lane = gl_SubgroupInvocationID;
+    const uint lane = SEISMIC_LANE;
     const uint r = lane % 16u, h = lane / 16u;
     const uint columns = width / 2u;
     for (uint j = 0u; j < FLASH_KEYS; ++j) {
-        const float p = float(seismic_shared_f16[p_half + r * 32u + j]);
+        const float p = seismic_f16_to_f32(seismic_shared_u16[p_half + r * 32u + j]);
         [[unroll]] for (uint c = 0u; c < FLASH_MAX_W / 2u; c += 2u) {
             if (c < columns) {
                 const vec2 v = unpackHalf2x16(seismic_shared_u32[(v_base + j * pitch + column0 + h * columns + c) / 2u]);
@@ -276,17 +276,17 @@ void flash_accumulate(uint p_half, uint v_base, const uint w, const uint window,
 // from every lane, after a barrier that frees the scratch.
 uint flash_output_row(uint q) {
 #if SEISMIC_HAS_MATRIX
-    return (8u * gl_SubgroupInvocationID + q % 8u) / 16u;
+    return (8u * SEISMIC_LANE + q % 8u) / 16u;
 #else
-    return gl_SubgroupInvocationID % 16u;
+    return SEISMIC_LANE % 16u;
 #endif
 }
 
 uint flash_output_column(const uint w, const uint window, uint column0, uint q) {
 #if SEISMIC_HAS_MATRIX
-    return column0 + 16u * (q / 8u) + (8u * gl_SubgroupInvocationID + q % 8u) % 16u;
+    return column0 + 16u * (q / 8u) + (8u * SEISMIC_LANE + q % 8u) % 16u;
 #else
-    return column0 + (gl_SubgroupInvocationID / 16u) * (flash_window(w, window) / 2u) + q;
+    return column0 + (SEISMIC_LANE / 16u) * (flash_window(w, window) / 2u) + q;
 #endif
 }
 
@@ -298,7 +298,7 @@ float flash_output_value(inout flash_output o, uint scratch, uint q) {
         subgroupMemoryBarrierShared();
         subgroupBarrier();
     }
-    return seismic_shared_f32[scratch + 8u * gl_SubgroupInvocationID + q % 8u];
+    return seismic_shared_f32[scratch + 8u * SEISMIC_LANE + q % 8u];
 #else
     return o.c[q];
 #endif

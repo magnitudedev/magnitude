@@ -181,15 +181,9 @@ Apple GPUs are served by Metal. MoltenVK is not a target.
 
 ## Pending conformance
 
-The contract above is ahead of the code in these places:
-
-- **CUDA:**
-  - Bundle NVRTC 12.9 instead of 13.
-  - Raise the discovery driver floor from 11.1 to R525.
-  - Re-verify the sm_107 membership of the Blackwell-family gate.
-- **Vulkan:**
-  - Logical 32-lane subgroups on hardware with a fixed width of 64.
-  - Make fp16 arithmetic optional outside cooperative matrix.
-  - Accept fixed-32 devices that advertise no required-size stages (NVK).
-- **Release configuration:** declare macOS 15 and the backend packs above in place of the
-  earlier inference packaging.
+- **Unqualified hardware:** the Vulkan paths for 64-wide hardware (AMD GCN), for devices without
+  fp16 arithmetic (NVIDIA Pascal/Maxwell), and for NVK have been validated offline but not yet run on
+  those devices.
+- **Old CUDA drivers:** the R525 floor has not yet been exercised end to end on an R525–R575 driver.
+- **Release configuration:** macOS 15 and one artifact per host have not replaced the earlier
+  inference packaging yet.

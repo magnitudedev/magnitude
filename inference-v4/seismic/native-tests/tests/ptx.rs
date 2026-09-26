@@ -208,7 +208,7 @@ fn mma_m16n8k16_matches_the_f32_reference_for_f16_and_bf16() {
                 )
             });
             let artifact = &kernel.artifact().0;
-            assert!(artifact.contains("nvrtc 13."), "{artifact}");
+            assert!(artifact.contains("nvrtc 12."), "{artifact}");
             assert!(artifact.contains("--fmad=false"), "{artifact}");
             let result = kernel
                 .call(ptx_mma_m16n8k16::Args {

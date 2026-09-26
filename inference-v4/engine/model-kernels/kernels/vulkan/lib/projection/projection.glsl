@@ -206,7 +206,7 @@ uint projection_gemv_rows(const uint sg_count, const uint r_rows, const uint lan
 
 // The first weight row of this invocation's lane group.
 uint projection_gemv_first_row(const uint r_rows, const uint lanes, uint tile) {
-    return ((tile * gl_NumSubgroups + gl_SubgroupID) * (32u / lanes) + gl_SubgroupInvocationID / lanes) * r_rows;
+    return ((tile * SEISMIC_SUBGROUPS + SEISMIC_SUBGROUP) * (32u / lanes) + SEISMIC_LANE / lanes) * r_rows;
 }
 
 // Row-norm square sums of the workgroup's rows into the shared region;
@@ -214,10 +214,10 @@ uint projection_gemv_first_row(const uint r_rows, const uint lanes, uint tile) {
 // opening barrier publishes them.
 void projection_gemv_squares(projection_prologue in_, uint m_rows) {
     const uint slots = PROJECTION_RMS_PARTS;
-    for (uint item = gl_SubgroupID; item < m_rows * slots; item += gl_NumSubgroups) {
+    for (uint item = SEISMIC_SUBGROUP; item < m_rows * slots; item += SEISMIC_SUBGROUPS) {
         const float sum = seismic_subgroup_sum_f32(
-            projection_rms_squares(in_, item / slots, item % slots, gl_SubgroupInvocationID));
-        if (gl_SubgroupInvocationID == 0u)
+            projection_rms_squares(in_, item / slots, item % slots, SEISMIC_LANE));
+        if (SEISMIC_LANE == 0u)
             seismic_shared_f32[item] = sum;
     }
 }
@@ -369,7 +369,7 @@ void projection_gemv_accumulate(const int wk, const int uk, const bool paired, c
 void projection_gemv_sums(const int wk, const int uk, const bool paired, const uint r_rows, const uint lanes,
     const uint maxm, const int norm, projection_prologue in_, projection_weights w, projection_weights u, uint m_rows,
     uint rows, uint k, uint tile, out float totals[PROJECTION_GEMV_SUMS], out float totals2[PROJECTION_GEMV_SUMS]) {
-    const uint sub = gl_SubgroupInvocationID % lanes;
+    const uint sub = SEISMIC_LANE % lanes;
     const uint first_row = projection_gemv_first_row(r_rows, lanes, tile);
     const bool owns_rows = first_row < rows;
     const uint packets = (k + 31u) / 32u;
@@ -420,7 +420,7 @@ void projection_gemv_bounded(const int wk, const int uk, const bool paired, cons
     projection_weights u, uint m_rows, uint rows, uint k, uint tile) {
     float totals[PROJECTION_GEMV_SUMS], totals2[PROJECTION_GEMV_SUMS];
     projection_gemv_sums(wk, uk, paired, r_rows, lanes, maxm, norm, in_, w, u, m_rows, rows, k, tile, totals, totals2);
-    const uint sub = gl_SubgroupInvocationID % lanes;
+    const uint sub = SEISMIC_LANE % lanes;
     const uint first_row = projection_gemv_first_row(r_rows, lanes, tile);
     [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r) {
         [[unroll]] for (uint m = 0u; m < PROJECTION_GEMV_MAX_M; ++m) {
@@ -641,8 +641,8 @@ void projection_gemm_store_b(const int kind, const uint threads, projection_gemm
 }
 
 // The subgroup's sub-tile origin in the tile.
-uint projection_gemm_row0(const uint tn, const uint wm, const uint wn) { return (gl_SubgroupID / (tn / wn)) * wm; }
-uint projection_gemm_column0(const uint tn, const uint wn) { return (gl_SubgroupID % (tn / wn)) * wn; }
+uint projection_gemm_row0(const uint tn, const uint wm, const uint wn) { return (SEISMIC_SUBGROUP / (tn / wn)) * wm; }
+uint projection_gemm_column0(const uint tn, const uint wn) { return (SEISMIC_SUBGROUP % (tn / wn)) * wn; }
 
 // The multiply of one staged step: `live` fragment rows (0 .. WM / 16) of 16.
 void projection_gemm_multiply(const uint tm, const uint tn, const uint wm, const uint wn, uint live,
@@ -667,7 +667,7 @@ void projection_gemm_multiply(const uint tm, const uint tn, const uint wm, const
         }
     }
 #else
-    const uint lane = gl_SubgroupInvocationID;
+    const uint lane = SEISMIC_LANE;
     const uint bn = wn / 32u;
     [[unroll]] for (uint block = 0u; block < (wm / 32u) * bn; ++block) {
         const uint bi = block / bn, bj = block % bn;
@@ -761,7 +761,7 @@ void projection_gemm_accumulate(const int wk, const int uk, const bool paired, c
     if (in_.act == ELEMENT_BF16) {
         // The scales of the lane's output rows, read before the pairs reuse
         // the region.
-        const uint row0 = projection_gemm_row0(tn, wm, wn), lane = gl_SubgroupInvocationID;
+        const uint row0 = projection_gemm_row0(tn, wm, wn), lane = SEISMIC_LANE;
         [[unroll]] for (uint i = 0u; i < scales; ++i) {
 #if SEISMIC_HAS_MATRIX
             const uint row = row0 + 16u * i + lane / 2u;
@@ -785,7 +785,7 @@ void projection_gemm_accumulate(const int wk, const int uk, const bool paired, c
 uint projection_gemm_pairs(const uint wm, const uint wn) { return wm * wn / 64u; }
 
 uint projection_gemm_pair_row(const uint tn, const uint wm, const uint wn, uint q) {
-    const uint lane = gl_SubgroupInvocationID;
+    const uint lane = SEISMIC_LANE;
 #if SEISMIC_HAS_MATRIX
     // Fragment q / 4 = (i, j); within it, pair 4 lane + q % 4 of 128 (8
     // pairs per row).
@@ -796,7 +796,7 @@ uint projection_gemm_pair_row(const uint tn, const uint wm, const uint wn, uint 
 }
 
 uint projection_gemm_pair_column(const uint tn, const uint wn, uint q) {
-    const uint lane = gl_SubgroupInvocationID;
+    const uint lane = SEISMIC_LANE;
 #if SEISMIC_HAS_MATRIX
     return projection_gemm_column0(tn, wn) + 16u * ((q / 4u) % (wn / 16u)) + 2u * ((4u * lane + q % 4u) % 8u);
 #else
@@ -809,8 +809,8 @@ uint projection_gemm_pair_column(const uint tn, const uint wn, uint q) {
 // from every lane of the subgroup, after a barrier that frees the tile region.
 vec2 projection_gemm_pair(inout projection_gemm_acc acc, const uint wn, uint q) {
 #if SEISMIC_HAS_MATRIX
-    const uint scratch = 256u * gl_SubgroupID;   // floats
-    const uint pair = 4u * gl_SubgroupInvocationID + q % 4u;
+    const uint scratch = 256u * SEISMIC_SUBGROUP;   // floats
+    const uint pair = 4u * SEISMIC_LANE + q % 4u;
     if (q % 4u == 0u) {
         subgroupBarrier();
         coopMatStore(acc.c[q / 4u], seismic_shared_f32, scratch, 16u, gl_CooperativeMatrixLayoutRowMajor);
