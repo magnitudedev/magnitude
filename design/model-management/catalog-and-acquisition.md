@@ -1,10 +1,11 @@
 ---
 applies_to:
   - inference/catalog/**
-  - inference/crates/icn-catalog/**
-  - inference/crates/icn-models/**
-  - inference/crates/icn-contracts/src/inventory.rs
-  - inference/crates/icn-contracts/src/models.rs
+  - inference/service/catalog-tool/**
+  - inference/service/models/**
+  - inference/service/server/src/main.rs
+  - inference/service/contracts/src/inventory.rs
+  - inference/service/contracts/src/models.rs
   - packages/icn/src/models/**
   - packages/icn/src/events/**
   - packages/acn/src/local-model-**
@@ -26,6 +27,11 @@ and do not infer command authorization or completion from cached projections.
 Catalog membership, artifact presence, download activity, package validation, assessment, provider
 offering, slot selection, and runtime residency remain separate facts.
 
+Live Hugging Face search and repository resolution are service-owned discovery queries. Search
+returns GGUF repositories with immutable commit identities; resolution returns the requested
+repository's immutable snapshot and GGUF file evidence. These queries do not change the release
+catalog or managed inventory, and catalog use does not depend on them.
+
 Catalog attribution across exact artifact or drafter changes follows
 [Intrinsic catalog target mapping](./intrinsic-target-mapping.md).
 
@@ -40,10 +46,9 @@ that date; every artifact variant inherits the model declaration's date. Each en
 `ModelServingConfiguration`, required package components, presentation, and ranking evidence.
 Published catalog rows reduce package sources to deduplicated HTTPS repository links for product
 presentation; package coordinates and bundle structure remain private.
-The reviewed context length is a local serving configuration, not a claim about the architecture's
-absolute maximum. Compact tiers may deliberately use a shorter context, such as 64K instead of
-100K, because longer context increases KV memory and decode cost and would undermine their role on
-resource-constrained machines.
+A catalog declaration names no context length. The serving profile's context is the target's
+supported maximum context from its GGUF metadata, the context the engine resolves and serves;
+memory is elastic, so a long supported context no longer reserves memory up front.
 Every active model carries one model-level intelligence assessment on a single declared Artificial
 Analysis Intelligence Index methodology version. A direct assessment records the observation date
 and canonical Artificial Analysis model URL. When no direct result exists, an estimate is a

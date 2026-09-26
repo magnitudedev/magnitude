@@ -1,0 +1,89 @@
+--- a/common/parsers/qwen3-coder.cpp
++++ b/common/parsers/qwen3-coder.cpp
+@@ -76,13 +76,19 @@
+         auto reasoning = p.eps();
+         if (supports_reasoning && extract_reasoning) {
+             reasoning = p.optional("<think>" + p.space() +
+-                                   p.reasoning(p.until_one_of({ "</think>", "<tool_call>" })) +
++                                   p.rule("reasoning-text", p.reasoning(p.until_one_of({ "</think>", "<tool_call>" }))) +
+                                    (p.literal("</think>") | p.peek(p.literal("<tool_call>"))));
+         }
+ 
+-        // Response format parser
++        // Response format parser. Without tool calls, only </think> closes
++        // reasoning: an implicit close before a tool call has no GBNF form
++        // here and would let reasoning run into the response.
+         if (has_response_format) {
+-            return generation_prompt + (reasoning << p.content(p.schema(p.json(), "response-format", inputs.json_schema)));
++            auto response_reasoning = p.eps();
++            if (supports_reasoning && extract_reasoning) {
++                response_reasoning = p.optional("<think>" + p.space() + p.reasoning(p.until("</think>")) + "</think>");
++            }
++            return generation_prompt + (response_reasoning << p.content(p.schema(p.json(), "response-format", inputs.json_schema)));
+         }
+ 
+         // Tool call parser
+@@ -105,11 +111,31 @@
+                     auto arg_open = p.tool_arg_open("<parameter=" + p.tool_arg_name(p.literal(param.name)) + ">\n");
+ 
+                     auto types = param.schema->value_types();
+-                    templates_require_unconstrained_raw_string(*param.schema);
++                    // Raw text is enforceable when strings are unconstrained
++                    // or drawn from listed values (enum, const).
++                    auto raw_values = templates_raw_string_values(*param.schema);
++                    auto raw_value  = p.choice();
++                    if (raw_values) {
++                        for (const auto & value : *raw_values) {
++                            if (value.find("\n</parameter>\n") != std::string::npos) {
++                                throw std::invalid_argument("Unsupported JSON schema: a raw string value contains the argument delimiter");
++                            }
++                            // Each value carries the close, so an ordered choice
++                            // never commits to a value that prefixes another.
++                            raw_value |= p.tool_arg_string_value(p.literal(value)) + arg_close;
++                        }
++                    }
+ 
+                     auto arg_value = p.eps();
+-                    if (!types.has(common_chat_schema::TYPE_STRING)) {
++                    if (!types.has(common_chat_schema::TYPE_STRING) || (raw_values && raw_values->empty())) {
+                         arg_value = p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", doc, *param.schema)) + arg_close;
++                    } else if (raw_values && types.is_only(common_chat_schema::TYPE_STRING)) {
++                        arg_value = raw_value;
++                    } else if (raw_values) {
++                        // JSON alternatives are tried first to type the value;
++                        // listed strings may also be written raw.
++                        arg_value = p.atomic(p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", doc, *param.schema)) + arg_close) |
++                                    raw_value;
+                     } else if (types.is_only(common_chat_schema::TYPE_STRING)) {
+                         arg_value = arg_string;
+                     } else {
+@@ -163,11 +189,26 @@
+                 p.rule("tool-call-first", p.optional(p.literal("<tool_call>\n")) + tool_call_body) :
+                 tool_call;
+ 
+-            auto calls      = inputs.parallel_tool_calls ? tool_call_first + p.zero_or_more(tool_call) : tool_call_first;
++            auto calls      = p.rule("tool-calls", inputs.parallel_tool_calls ? tool_call_first + p.zero_or_more(tool_call) : tool_call_first);
+             auto tool_calls = p.trigger_rule("tool-call-root", p.repeat(calls, min_calls, 1));
++            auto content    = p.rule("content-text", p.content(p.until_one_of(tool_call_starts)));
+ 
+-            return generation_prompt +
+-                   (reasoning << p.content(p.until_one_of(tool_call_starts)) << tool_calls);
++            auto body = reasoning << content << tool_calls;
++            if (supports_reasoning && extract_reasoning) {
++                // GBNF has no lookahead. Reasoning closed implicitly by a tool
++                // call is exactly reasoning followed directly by the calls;
++                // rendering the peek as empty would let reasoning run into
++                // content and split a tool-call opener across both. Every
++                // way to reach the first call shares one path into the calls.
++                std::string grammar =
++                    "((\"<think>\" space reasoning-text (\"</think>\" space content-text space)?"
++                    " | space content-text space) tool-calls";
++                if (min_calls == 0) {
++                    grammar += " | (\"<think>\" space reasoning-text \"</think>\")? space content-text space";
++                }
++                body = p.gbnf(body, grammar + ")");
++            }
++            return generation_prompt + body;
+         }
+ 
+         // Content only parser

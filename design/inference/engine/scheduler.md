@@ -1,11 +1,7 @@
 ---
 applies_to:
-  - inference-v2/src/magnitude_engine/engine/**
-  - inference-v2/src/magnitude_engine/generation/**
-  - inference-v2/src/magnitude_engine/models/**
-  - inference-v2/tests/engine/**
-  - inference-v2/src/magnitude_engine/worker/**
-  - inference-v2/benchmarks/**
+  - inference/engine/scheduler/**
+  - inference/engine/batching/**
 ---
 
 # Scheduler
@@ -21,11 +17,17 @@ flowchart LR
     Q[Waiting requests] -->|FIFO admission when memory permits| P[Unfinished prompts]
     P -->|Bounded compatible prompt chunks| P
     P -->|Prompt ready| D[Ready generations]
-    D -->|One step per request in a decode round| D
+    D -->|One step per selected request in a decode round| D
     D -->|Complete| F[Retain reusable prefix / release state]
 ```
 
 Admission reserves room for state growth and execution, not just existing KV.
+While an advance prepares or submits a flight that holds state storage, new
+admissions wait for its physical completion and reconciliation. Admissions
+already queued at that completion are handled before another flight is submitted,
+so bank capacity can grow without waiting for an active generation to finish.
+Status and lifecycle commands remain
+available during the flight.
 Prefix reuse reduces remaining prompt work; reclaimable cached state can make
 room for active requests. Output-blocked requests are ineligible until ready
 again. Cancellation removes future work, with resource release after in-flight
@@ -36,8 +38,9 @@ execution completes.
 The scheduler alternates **decode rounds** and **prompt chunks**, using measured
 execution time to decide how many rounds belong between chunks.
 
-- A decode round gives every ready generation one bounded step. Compatible
-  operations run together; incompatible groups run separately.
+- A decode round advances ready generations in scheduling order until its
+  aggregate token allowance is spent. Remaining generations wait for the next
+  round. Compatible operations run together; incompatible groups run separately.
 - A prompt service shares one aggregate token allowance across admitted unfinished
   prompts compatible with the oldest admitted prompt, in FIFO order. Compatibility
   comes from the live generation/model contract; an unbatchable prompt keeps the
@@ -60,7 +63,8 @@ Example: equal time shares, 40 ms prompt chunks, and 10 ms decode rounds:
 Time →  [prefill: 40 ms][D: 10][D: 10][D: 10][D: 10][prefill: 40 ms] …
          bounded stall  └──── decode receives 40 ms ────┘
 
-Each D advances all ready generations through compatible execution batches.
+Each D advances ready generations within its token allowance through compatible
+execution batches.
 ```
 
 **Two controls, two purposes:** an optional duration target limits individual interruptions;

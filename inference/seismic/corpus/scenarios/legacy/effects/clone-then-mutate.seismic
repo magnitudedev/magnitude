@@ -1,0 +1,8 @@
+# origin: test:validation:corpus/effects.seismic:clone_then_mutate
+# invoke clone_then_mutate: f32[4]=1,2,3,4
+fn clone_then_mutate[N](x: tensor[N] f32) -> (tensor[N] f32, tensor[N] f32):
+    let snapshot = to_owned(x)
+    let mut negated = x
+    for i in 0..N:
+        negated[i] = 0.0 - negated[i]
+    return snapshot, negated

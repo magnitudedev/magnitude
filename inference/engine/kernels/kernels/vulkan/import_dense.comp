@@ -1,0 +1,40 @@
+// Dense weight import over the [B, N, K] view; one invocation per element in
+// row-major order, over a grid-stride loop (the grid is capped below the
+// 65535-group floor). The Vulkan form of `metal/import_dense.metal`.
+#include <seismic/element.glsl>
+
+#if defined(SEISMIC_ELEMENT_E_REPRESENTATION_F32)
+#define IMPORT_SOURCE_KIND ELEMENT_F32
+#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_BF16)
+#define IMPORT_SOURCE_KIND ELEMENT_BF16
+#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_F16)
+#define IMPORT_SOURCE_KIND ELEMENT_F16
+#else
+#error "import_dense: the source element E must be dense f32, bf16 or f16"
+#endif
+
+#if defined(SEISMIC_ELEMENT_U_REPRESENTATION_F32)
+#define IMPORT_DESTINATION_KIND ELEMENT_F32
+#elif defined(SEISMIC_ELEMENT_U_REPRESENTATION_BF16)
+#define IMPORT_DESTINATION_KIND ELEMENT_BF16
+#elif defined(SEISMIC_ELEMENT_U_REPRESENTATION_F16)
+#define IMPORT_DESTINATION_KIND ELEMENT_F16
+#else
+#error "import_dense: the resident element U must be dense f32, bf16 or f16"
+#endif
+
+void import_dense() {
+    const uint64_t source = SEISMIC_PTR(SEISMIC_BUFFER_SOURCE);
+    const uint64_t destination = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const uint64_t count = SEISMIC_DIM_B * SEISMIC_DIM_N * SEISMIC_DIM_K;
+    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
+    for (uint64_t index = gl_GlobalInvocationID.x; index < count; index += step) {
+        const uint64_t k = index % SEISMIC_DIM_K;
+        const uint64_t n = index / SEISMIC_DIM_K % SEISMIC_DIM_N;
+        const uint64_t b = index / SEISMIC_DIM_K / SEISMIC_DIM_N;
+        element_put(IMPORT_DESTINATION_KIND, destination,
+            b * SEISMIC_RESULT_0_STRIDE_0 + n * SEISMIC_RESULT_0_STRIDE_1 + k * SEISMIC_RESULT_0_STRIDE_2,
+            element_at(IMPORT_SOURCE_KIND, source,
+                b * SEISMIC_SOURCE_STRIDE_0 + n * SEISMIC_SOURCE_STRIDE_1 + k * SEISMIC_SOURCE_STRIDE_2));
+    }
+}

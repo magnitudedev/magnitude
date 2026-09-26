@@ -1,0 +1,6 @@
+# cell: assign-element/async
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; i32[1]=2
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; i32[1]=7
+# expect: failed
+fn probe(x: &tensor[4, 8] f32, out: &mut tensor[4] f32, idx: &tensor[1] i32):
+    out[idx[0]] = x[0, 0] + 5.0

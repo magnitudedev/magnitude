@@ -1,13 +1,6 @@
 ---
 applies_to:
-  - inference-v2/performance/**
-  - inference-v2/tests/performance/**
-  - inference-v2/benchmarks/**
-  - inference-v2/tests/benchmarks/**
-  - inference-v2/src/session_bench/**
-  - inference-v2/tests/session_bench/**
-  - inference-v2/src/magnitude_engine/host_info.py
-  - inference-v2/tests/test_host_info.py
+  - inference/benchmarks/**
 ---
 
 # Inference benchmarking
@@ -24,12 +17,12 @@ better serving performance.
 | Engine | Scheduling, admission, batching, retention and delivery | Matched offered traffic through our engine and an upstream generator |
 | Serving | Rendering, HTTP, semantic output and sessions | Actual stock servers through the shared Python session client |
 
-Component and engine experiments are typed Python values. Their subject blueprint
-constructs the actual component under test; workload inputs and dependencies are
-explicit. A shared runner owns isolated child lifetime, warmup, repetitions,
-completion, validation and immutable result records. There is no separate TOML
-experiment language. [Session bench](session-bench.md) supplies canonical
-BFCL-derived serving traffic, adapters and reports within the same Python package.
+Benchmarks are one Python project under `inference/benchmarks/`: Session Bench,
+fixtures, host facts and engine adapters (the native engine, llama.cpp, mlx-vlm and
+omlx). Workload inputs and dependencies are explicit. A shared runner owns isolated
+child lifetime, warmup, repetitions, completion, validation and immutable result
+records. There is no separate TOML experiment language. [Session bench](session-bench.md) supplies canonical
+BFCL-derived serving traffic and reports within the same package.
 
 ## Valid comparisons
 

@@ -1,0 +1,8 @@
+# cell: assign-local-scalar/zero-trip
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero ; index:0
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero ; index:3
+fn probe[W](x: &tensor[4, W] f32, out: &mut tensor[4] f32, y: &mut tensor[4, W] f32, n: index[5]) where W >= 8:
+    for i in 0..n:
+        let mut v = 0.0
+        v = x[i, 2] + 1.0
+        out[i] = v

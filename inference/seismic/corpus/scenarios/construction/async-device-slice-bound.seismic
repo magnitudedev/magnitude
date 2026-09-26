@@ -1,0 +1,9 @@
+# origin: C11:async_device_slice_bound
+# invoke: i32[8]=1,2,3,4,5,6,7,8 ; i32[2]=2,5
+fn probe(input: &tensor[8] i32, visible: &tensor[2] i32) -> i32:
+    let lo = visible[0]
+    let hi = visible[1]
+    let mut r = 0
+    if hi > lo:
+        r = reduce(input[lo:hi], 0, sum)
+    return r

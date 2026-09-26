@@ -97,6 +97,14 @@ export const countAnthropicMessageTokens = HttpApiEndpoint.post(
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+    { status: 409 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+    { status: 422 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
     { status: 500 },
   )
 
@@ -123,6 +131,10 @@ export const createAnthropicMessage = HttpApiEndpoint.post("createAnthropicMessa
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
     { status: 500 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+    { status: 503 },
   )
 
 export const ensureModelInstance = HttpApiEndpoint.post("ensureModelInstance", "/api/v1/instances")

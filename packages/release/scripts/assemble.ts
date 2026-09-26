@@ -23,11 +23,10 @@ import { ACN_COORDINATION_REVISION } from "@magnitudedev/version"
 import releasePlan from "../release-plan.json"
 import {
   acnArchive,
-  backendArchive,
-  backendPacks,
   cliArchive,
   desktopInstaller,
   desktopUpdateArchive,
+  hostById,
   linuxDesktopInstaller,
   windowsDesktopInstaller,
   icnBaseArchive,
@@ -35,10 +34,12 @@ import {
 } from "../src/targets"
 import { fileSha256, run } from "./build/common"
 import { verifyLinuxElfArchives } from "./build/linux-elf"
+import { ACN_EXECUTABLE_NAME } from "../src/executables"
 import {
-  ACN_EXECUTABLE_NAME,
-  ICN_EXECUTABLE_NAME,
-} from "../src/executables"
+  INFERENCE_PLANNER_BUNDLE,
+  inferenceRequiredPaths,
+  isInferenceInstallationPath,
+} from "../src/inference-installation"
 
 const PROJECT_ROOT = resolve(import.meta.dir, "../../..")
 const input = resolve(process.argv[2] ?? "release-artifacts")
@@ -58,7 +59,6 @@ if (scopedHostId !== undefined && scopedHost === undefined) {
   throw new Error(`unknown release host ${scopedHostId}`)
 }
 const candidateHosts = scopedHost === undefined ? releaseHosts : [scopedHost]
-const candidateBackendPacks = scopedHost === undefined ? backendPacks : []
 
 const files = async (root: string): Promise<readonly string[]> => {
   const found: string[] = []
@@ -96,9 +96,6 @@ const expectedArtifacts = new Map<string, string>([
       : []),
     ...(host.id === "windows-x64-msvc" ? [[`desktop-${host.id}`, windowsDesktopInstaller(version)] as const] : []),
   ]),
-  ...candidateBackendPacks.map((pack) =>
-    [`icn-backend-${pack.id}`, backendArchive(pack)] as const
-  ),
 ])
 
 const archiveListing = async (archive: string): Promise<readonly string[]> =>
@@ -170,50 +167,15 @@ const validateLayout = async (
   )) {
     throw new Error(`${artifact.id} contains an unsafe archive path`)
   }
-  if (artifact.kind === "icn-base") {
-    for (const requiredPath of [
-      `bin/${ICN_EXECUTABLE_NAME}${extension}`,
-      "catalog/model-planner-inputs.bundle",
-    ]) {
-      if (!listing.includes(requiredPath)) {
-        throw new Error(`${artifact.id} is missing ${requiredPath}`)
-      }
+  // The one inference artifact of the host: every backend is compiled into the executable and
+  // NVRTC is the only accelerator payload, in `runtime/` on CUDA hosts.
+  for (const requiredPath of inferenceRequiredPaths(hostById(host))) {
+    if (!listing.includes(requiredPath)) {
+      throw new Error(`${artifact.id} is missing ${requiredPath}`)
     }
-    const backendNames = listing
-      .filter((entry) => entry.startsWith("backends/"))
-      .map((entry) => basename(entry).toLowerCase())
-    if (
-      !backendNames.some((name) => name.includes("cpu")) ||
-      backendNames.some((name) =>
-        name.includes("metal") || name.includes("cuda") || name.includes("vulkan")
-      )
-    ) {
-      throw new Error(`${artifact.id} does not contain exactly the CPU backend family`)
-    }
-    if (listing.some((entry) =>
-      !entry.startsWith("bin/") &&
-      !entry.startsWith("catalog/") &&
-      !entry.startsWith("runtime/") &&
-      !entry.startsWith("backends/")
-    )) {
-      throw new Error(`${artifact.id} contains an unexpected path`)
-    }
-    return
   }
-  const backend = Option.getOrThrow(artifact.backend)
-  const expectedModule = backendPacks.find(
-    (pack) => `icn-backend-${pack.id}` === artifact.id,
-  )?.module
-  if (
-    !expectedModule ||
-    !listing.includes(`backends/${expectedModule}`) ||
-    listing.filter((entry) => entry.startsWith("backends/")).length !== 1 ||
-    listing.some((entry) =>
-      !entry.startsWith("runtime/") && !entry.startsWith("backends/")
-    ) ||
-    backend === "cpu"
-  ) {
-    throw new Error(`${artifact.id} has an invalid backend-pack layout`)
+  if (listing.some((entry) => !isInferenceInstallationPath(entry))) {
+    throw new Error(`${artifact.id} contains an unexpected path`)
   }
 }
 
@@ -278,24 +240,12 @@ let plannerBundleDigest: string | undefined
 for (const host of candidateHosts) {
   const base = byId.get(`icn-base-${host.id}`)!
   const archive = archiveById.get(base.id)!
-  const bundle = await archiveEntry(archive, "catalog/model-planner-inputs.bundle")
+  const bundle = await archiveEntry(archive, INFERENCE_PLANNER_BUNDLE)
   const bundleDigest = createHash("sha256").update(bundle).digest("hex")
   if (plannerBundleDigest && plannerBundleDigest !== bundleDigest) {
     throw new Error(`${base.id} contains a different planner bundle`)
   }
   plannerBundleDigest = bundleDigest
-}
-for (const pack of candidateBackendPacks) {
-  const artifact = byId.get(`icn-backend-${pack.id}`)!
-  const base = byId.get(`icn-base-${pack.host}`)!
-  if (
-    Option.getOrThrow(artifact.requiredBaseId) !== base.id ||
-    Option.getOrThrow(artifact.nativeBuild) !== Option.getOrThrow(base.nativeBuild) ||
-    Option.getOrThrow(artifact.backendModuleAbi) !==
-      Option.getOrThrow(base.backendModuleAbi)
-  ) {
-    throw new Error(`${artifact.id} is incompatible with ${base.id}`)
-  }
 }
 
 for (const host of candidateHosts.filter((candidate) => candidate.id.startsWith("linux-"))) {
@@ -303,9 +253,6 @@ for (const host of candidateHosts.filter((candidate) => candidate.id.startsWith(
     archiveById.get(`cli-${host.id}`)!,
     archiveById.get(`acn-${host.id}`)!,
     archiveById.get(`icn-base-${host.id}`)!,
-    ...candidateBackendPacks
-      .filter((pack) => pack.host === host.id)
-      .map((pack) => archiveById.get(`icn-backend-${pack.id}`)!),
   ])
 }
 

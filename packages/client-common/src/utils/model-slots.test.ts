@@ -28,8 +28,6 @@ const descriptor = {
 }
 const allocation = {
   contextWindowTokens: 4096,
-  parallelSequences: 2,
-  physicalContextTokens: 8192,
   memoryDomains: [],
 }
 const configured = (lifecycle: {

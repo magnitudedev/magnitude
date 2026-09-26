@@ -8,12 +8,9 @@ import { LocalModels } from "../local-models/service"
 import { LOCAL_MODEL_RANKING_SCALE_VALUES } from "../local-models/options"
 import { formatLocalModelDisplayName } from "../utils/model-presentation"
 import type { DesktopUpdateState } from "./update"
+import { DesktopPage, DesktopAction, ModelTrayPresentation, DesktopApplicationInfo } from "./contracts"
 
-export const DesktopPage = Schema.Literal("discover", "catalog", "models", "connections", "usage", "status", "settings")
-export type DesktopPage = typeof DesktopPage.Type
-export const DesktopAction = Schema.Union(Schema.TaggedStruct("Navigate", { page: DesktopPage }), Schema.TaggedStruct("StopModel", {}))
-export const ModelTrayPresentation = Schema.Struct({ label: Schema.String, canStop: Schema.Boolean })
-export const DesktopApplicationInfo = Schema.Struct({ version: Schema.String })
+export { DesktopPage, DesktopAction, ModelTrayPresentation, DesktopApplicationInfo } from "./contracts"
 export class DesktopHostUnavailable extends Schema.TaggedError<DesktopHostUnavailable>()("DesktopHostUnavailable", {}) {
   override get message() { return "Desktop host unavailable" }
 }

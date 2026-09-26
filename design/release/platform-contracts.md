@@ -3,7 +3,8 @@ applies_to:
   - packages/release/**
   - packages/icn/src/lifecycle/release-installation.ts
   - packages/icn/src/lifecycle/installation-environment.ts
-  - inference/**
+  - inference/scripts/**
+  - inference/seismic/backends/cuda/src/nvrtc.rs
   - .github/workflows/release-build.yml
 ---
 
@@ -12,15 +13,19 @@ applies_to:
 A platform contract defines what a customer machine may be required to provide. Release artifacts
 must not depend on anything else.
 
+Hardware, driver and operating-system floors are defined once by the inference platform contract,
+[`inference/docs/compatibility.md`](../../inference/docs/compatibility.md). Release configuration
+and these documents apply those floors; they do not restate or independently change them.
+
 ## Dependency ownership
 
 Every native dependency belongs to exactly one class:
 
-- **Artifact-owned:** shipped in the selected archive set, integrity-covered, and resolved through
+- **Artifact-owned:** shipped in the host's artifact, integrity-covered, and resolved through
   installation-relative loader paths.
 - **Platform-owned:** part of the declared operating-system ABI for that host target.
-- **Capability-owned:** supplied by a selected accelerator environment, such as an NVIDIA driver,
-  Vulkan loader, or Metal framework.
+- **Capability-owned:** supplied by an accelerator environment, such as an NVIDIA driver, Vulkan
+  loader, or Metal framework, and loaded at runtime only when present.
 
 An unclassified dependency is a release defect. Build tools, SDKs, package-manager prefixes,
 compiler runtimes outside the declared platform ABI, ambient search paths, and files from the build
@@ -42,6 +47,28 @@ acquisition has its own network requirements.
 Customer systems do not need Rust, Bun, CMake, C/C++ compilers, CUDA toolkits, Vulkan SDKs,
 developer headers, OpenSSL packages, OpenMP packages, or build-system package-manager prefixes.
 The desktop-bundled CLI needs neither npm nor a separately installed Node.js runtime.
+
+## Inference accelerator dependencies
+
+Each host has one inference artifact with every backend of that host compiled in. There are no
+backend packs and no accelerator modules.
+
+- **NVRTC 12.9 is the entire CUDA payload.** It is artifact-owned on Linux and Windows: the two
+  standard NVRTC libraries of NVIDIA's pinned redistributable, shipped unmodified with NVIDIA's
+  license notice in the installation's `runtime/` directory. There is no CUDA runtime, cuBLAS or
+  other toolkit library; kernels are formed on the device and launched through the driver API.
+- **Seismic loads NVRTC only from the installation's `runtime/` directory** beside `bin/`. An
+  explicit engine-development setting may name another directory for work outside an
+  installation layout; it is not part of the installed contract. There is no search-path fallback.
+- **Driver and loader libraries are capability-owned.** `libcuda.so.1` / `nvcuda.dll` and
+  `libvulkan.so.1` / `vulkan-1.dll` are loaded at runtime when present and are never link-time
+  dependencies. A host without them runs the remaining backends.
+- **Seismic discovery is the only eligibility authority.** Driver, API, compute-capability and
+  feature floors are enforced when devices are discovered. Release tooling, acquisition and the
+  service never re-derive them and never select artifacts by accelerator.
+- **CPU code targets the architecture baseline.** Release builds compile for baseline `x86_64` and
+  `aarch64` with no `target-cpu`; instruction-set tiers are detected at runtime and the engine
+  enforces its x86 floor.
 
 ## GNU Linux contract
 
@@ -68,13 +95,9 @@ these platform libraries:
 - `libstdc++.so.6`
 - `libutil.so.1`
 
-A CUDA composition may additionally require driver-owned `libcuda.so.1`. A Vulkan composition may
-additionally require loader-owned `libvulkan.so.1`. CPU compositions may require neither. CUDA
-toolkit libraries required at runtime are artifact-owned and shipped in the CUDA pack.
-
-Linux executables resolve owned libraries from `../runtime`; libraries and backend modules resolve
-from their own directory or `../runtime`. Allowed loader paths are therefore `$ORIGIN` and
-`$ORIGIN/../runtime`. Releases must not require `LD_LIBRARY_PATH`.
+The inference executable resolves owned libraries from exactly `$ORIGIN/../runtime`.
+Redistributed runtime libraries carry no loader path, or only `$ORIGIN` or `$ORIGIN/../runtime`.
+Releases must not require `LD_LIBRARY_PATH`.
 
 ### Linux graphical desktop
 
@@ -89,10 +112,11 @@ loader closure and sandbox permissions; a build-host launch is insufficient.
 
 ## Windows contract
 
-Windows accelerator compositions follow the same dependency ownership: `nvcuda.dll` and
-`vulkan-1.dll` belong to their respective host capabilities, while CUDA toolkit DLLs are shipped
-in the pack and the Microsoft CRT is shipped with the base. CPU installations require neither
-accelerator capability.
+The inference artifact ships NVRTC and the Microsoft CRT required by its import graph in
+`runtime/`, which the managed parent places first on the service's DLL search path. `nvcuda.dll`
+and `vulkan-1.dll` are capability-owned and loaded at runtime. NVIDIA publishes the NVRTC
+libraries without Authenticode signatures; their integrity is the pinned archive digest verified
+at build time, and they are redistributed unmodified.
 
 ## Apple contract
 
@@ -100,26 +124,29 @@ Apple artifacts may depend on operating-system libraries and frameworks included
 macOS deployment target. Metal is capability-owned by macOS. Homebrew, MacPorts, Xcode, standalone
 SDKs, and developer-tool libraries are not platform dependencies.
 
-The supported macOS floor is macOS 13.0 for both Apple arm64 and Apple x64. Release builds use the
-newest selected SDK while compiling and linking every Apple-native image for that floor. The floor
-does not select an older Metal implementation: guarded operating-system APIs and actual GPU
-capabilities remain runtime decisions, so the same artifact uses newer facilities on newer hosts.
-macOS 12 and older are outside the platform contract because the Bun runtime embedded in the CLI and
-ACN requires macOS 13 or newer.
+The supported macOS floor is macOS 15.0 for both Apple arm64 and Apple x64. The Metal backend
+compiles every library with precise math modes that macOS 15 introduced, and the desktop bundles
+the service, so the floor applies to the whole Apple product. Release builds use the newest
+selected SDK while compiling and linking every Apple-native image for that floor. Guarded
+operating-system APIs and actual GPU capabilities remain runtime decisions, so the same artifact
+uses newer facilities on newer hosts. macOS 14 and older are outside the platform contract.
 
 Artifact-owned libraries use `@loader_path` or declared installation rpaths and must not require
-`DYLD_LIBRARY_PATH`. Every Mach-O image must match its target architecture and must not declare a
-deployment target newer than macOS 13.0. The release configuration is the authority for that floor;
-a runner label alone is not a support contract. Before packaging, the Apple build validates the
-expected architecture and deployment target of every executable and native library with Apple's
-`vtool`. Those validated files are the exact inputs to the deterministic archive builder.
+`DYLD_LIBRARY_PATH`; the Apple inference artifact has none and its executable carries no rpath. Every
+Mach-O image must match its target architecture and must not declare a deployment target newer
+than macOS 15.0. The application bundle and desktop declare the same minimum system version. The
+release configuration is the authority for that floor; a runner label alone is not a support
+contract. Before packaging, the Apple build validates the expected architecture and deployment
+target of every executable and native library with Apple's `vtool`. Those validated files are the
+exact inputs to the deterministic archive builder.
 
 ## Required guarantees
 
 - Build-host contents cannot introduce a dependency or raise a platform floor.
-- Every non-platform dependency is shipped when redistribution permits; otherwise it is an explicit
-  capability dependency checked before backend selection.
-- Base and accelerator artifacts for one host share the same platform contract.
+- Every non-platform dependency is shipped when redistribution permits; otherwise it is a
+  capability dependency loaded at runtime, whose absence only removes the backends that need it.
+- Every host's inference artifact contains every backend of that host and nothing selected per
+  machine.
 - Dynamic-loader failure remains distinct from protocol-decoding failure and retains bounded native
   diagnostics.
 

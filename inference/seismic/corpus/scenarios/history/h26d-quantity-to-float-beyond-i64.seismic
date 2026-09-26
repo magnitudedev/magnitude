@@ -1,0 +1,5 @@
+# origin: H-26
+# invoke: f32[0,9223372036854775809]=zero
+# pin: result = f32[]=0x5f000000
+fn probe[M, N](x: &tensor[M, N] f32) -> f32 where M >= 0:
+    return f32(N)

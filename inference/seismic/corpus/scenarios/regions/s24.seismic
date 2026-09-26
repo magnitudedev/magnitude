@@ -1,0 +1,8 @@
+# origin: C14:s24
+# invoke: f32[5]=rand(50)
+fn probe[N](x: &tensor[N] f32) -> f32:
+    let mut s = 0.0
+    for i in 0..N:
+        if x[i] > 2.0:
+            s = s + x[i]
+    return s

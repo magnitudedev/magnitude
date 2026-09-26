@@ -1,0 +1,12 @@
+# origin: H-53
+# invoke: f32[4]=seq
+fn first[N](x: &tensor[N] f32) -> f32:
+    return x[0]
+
+fn probe(x: &tensor[4] f32) -> f32:
+    let mut keep = tensor[2] f32
+    for k in 0..2:
+        let mut t = tensor[4] f32
+        t[:] = x * f32(i32(k) + 1)
+        keep[k] = first(t)
+    return keep[0] + keep[1]

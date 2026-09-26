@@ -1,9 +1,8 @@
 ---
 applies_to:
-  - inference-v4/engine/artifacts/**
-  - inference-v4/engine/model-contracts/**
-  - inference-v4/engine/models/**
-  - inference-v4/engine/model-executor/**
+  - inference/engine/artifacts/**
+  - inference/engine/families/**
+  - inference/engine/executor/**
 ---
 
 # Model input boundary
@@ -13,7 +12,14 @@ decoding, and bounded generic media. It may inspect a bounded header bundle
 before weight payloads exist; this validates
 metadata, tensor geometry, and declared non-overlapping ranges without claiming
 that the payloads are present. Executable package admission requires the full
-payload ranges. Artifact preparation does not assign model-family coordinates or
+payload ranges. A package component is one GGUF or every shard of a split GGUF
+(llama.cpp `gguf-split`): the first shard names the component, the remaining
+shards are found beside it by the split naming convention and must declare their
+positions, and header and payload opens both present one directory (the first
+shard's metadata, every shard's tensors) under one component identity. The header
+reader accepts every GGML tensor type a GGUF can store; whether an encoding
+executes is decided by planning, where an unsupported encoding is an unsupported
+representation, never a malformed artifact. Artifact preparation does not assign model-family coordinates or
 position-table interpolation. A family adapter consumes
 the model definition, token plan, and generic prepared media to create one closed numerical input
 contract. The contract contains the final token coordinates, media spans, patch order, attention
@@ -26,11 +32,15 @@ constructing it performs alignment checks and does not derive coordinate semanti
 Generic execution validates shapes and bounds against the model definition and consumes the
 prepared contract. It does not repeat family-specific spatial derivation or infer semantic meaning
 from artifact tensor names. Prepared input and media cross the host/worker boundary as owned,
-device-free values. Live device resources remain worker-confined.
+device-free values; a worker process re-establishes every construction invariant of a decoded
+input against its model definition before admitting it. A worker process opens exactly the package
+the host admitted (same component files and sizes and tensor directories) and carries the host's package
+identity, so both sides name one package. Live device resources remain worker-confined.
 
 ## Acceptance criteria
 
 - Artifact output contains no model-family numerical controls.
+- Any valid GGUF header, split or not, parses; a split package plans and loads as one package.
 - The family adapter computes every spatial value consumed by the vision lane.
 - A prepared numerical input cannot contain mismatched token, span, media, or patch domains.
 - Execution performs no model-family coordinate or interpolation calculation.

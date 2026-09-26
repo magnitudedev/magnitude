@@ -1,0 +1,12 @@
+# origin: H-23
+# invoke: f32[5]=seq
+fn inner[N](x: &tensor[N] f32) -> tensor[N] f32:
+    return x * 2.0
+
+fn middle[N](x: &tensor[N] f32) -> tensor[N] f32:
+    return inner(x) + x
+
+fn probe[N](x: &tensor[N] f32) -> f32:
+    let a = middle(x)
+    let b = inner(a)
+    return reduce(b, 0, sum)

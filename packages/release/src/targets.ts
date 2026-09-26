@@ -1,3 +1,5 @@
+import { Option } from "effect"
+
 export type HostId =
   | "darwin-arm64"
   | "darwin-x64"
@@ -5,9 +7,26 @@ export type HostId =
   | "linux-x64-gnu"
   | "windows-x64-msvc"
 
-export type Backend = "cpu" | "metal" | "cuda" | "vulkan"
+export const MACOS_DEPLOYMENT_TARGET = "15.0" as const
 
-export const MACOS_DEPLOYMENT_TARGET = "13.0" as const
+/** One file taken from NVIDIA's NVRTC archive and its name in the installation's `runtime/`. */
+export interface NvrtcFile {
+  readonly member: string
+  readonly name: string
+}
+
+/**
+ * NVIDIA's pinned NVRTC redistributable: the entire CUDA payload of an inference artifact.
+ * Only the two standard libraries ship (never the `.alt` variants), with NVIDIA's license notice.
+ */
+export interface NvrtcRedistributable {
+  readonly version: string
+  readonly url: string
+  readonly bytes: number
+  readonly sha256: string
+  readonly libraries: readonly [NvrtcFile, NvrtcFile]
+  readonly license: NvrtcFile
+}
 
 export interface ReleaseHost {
   readonly id: HostId
@@ -15,39 +34,29 @@ export interface ReleaseHost {
   readonly bunTarget: string
   readonly rustTarget: string
   readonly executableExtension: "" | ".exe"
-  readonly cargoFeatures: readonly string[]
+  readonly nvrtc: Option.Option<NvrtcRedistributable>
 }
 
-interface BackendPackBase {
-  readonly id: string
-  readonly host: HostId
-  readonly runner: string
-  readonly cargoFeatures: readonly string[]
-  readonly module: string
-  readonly runtimeLibraries: readonly string[]
+const NVRTC_VERSION = "12.9.86"
+const NVRTC_REDISTRIBUTABLE = "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvrtc"
+const NVRTC_LICENSE_NAME = "NVRTC-LICENSE.txt"
+
+const linuxNvrtc = (platform: "linux-x86_64" | "linux-sbsa", bytes: number, sha256: string): NvrtcRedistributable => {
+  const root = `cuda_nvrtc-${platform}-${NVRTC_VERSION}-archive`
+  return {
+    version: NVRTC_VERSION,
+    url: `${NVRTC_REDISTRIBUTABLE}/${platform}/${root}.tar.xz`,
+    bytes,
+    sha256,
+    libraries: [
+      { member: `${root}/lib/libnvrtc.so.${NVRTC_VERSION}`, name: "libnvrtc.so.12" },
+      { member: `${root}/lib/libnvrtc-builtins.so.${NVRTC_VERSION}`, name: "libnvrtc-builtins.so.12.9" },
+    ],
+    license: { member: `${root}/LICENSE`, name: NVRTC_LICENSE_NAME },
+  }
 }
 
-export type BackendPack =
-  | (BackendPackBase & {
-      readonly backend: "cuda"
-      readonly cuda: {
-        readonly toolkitVersion: string
-        readonly architectures: readonly string[]
-      }
-    })
-  | (BackendPackBase & {
-      readonly backend: "metal"
-      readonly compatibility: {
-        readonly kind: "metal"
-      }
-    })
-  | (BackendPackBase & {
-      readonly backend: "vulkan"
-      readonly compatibility: {
-        readonly kind: "vulkan"
-        readonly minimumApi: string
-      }
-    })
+const windowsNvrtcRoot = `cuda_nvrtc-windows-x86_64-${NVRTC_VERSION}-archive`
 
 // This is product configuration, not a serialized registry or extension point.
 export const releaseHosts = [
@@ -57,7 +66,7 @@ export const releaseHosts = [
     bunTarget: "bun-darwin-arm64",
     rustTarget: "aarch64-apple-darwin",
     executableExtension: "",
-    cargoFeatures: ["mtmd", "dynamic-backends"],
+    nvrtc: Option.none(),
   },
   {
     id: "darwin-x64",
@@ -65,7 +74,7 @@ export const releaseHosts = [
     bunTarget: "bun-darwin-x64",
     rustTarget: "x86_64-apple-darwin",
     executableExtension: "",
-    cargoFeatures: ["mtmd", "dynamic-backends"],
+    nvrtc: Option.none(),
   },
   {
     id: "linux-arm64-gnu",
@@ -73,7 +82,8 @@ export const releaseHosts = [
     bunTarget: "bun-linux-arm64",
     rustTarget: "aarch64-unknown-linux-gnu",
     executableExtension: "",
-    cargoFeatures: ["mtmd", "dynamic-backends"],
+    // Server-class arm64 (SBSA), including GB10; NVIDIA's linux-aarch64 archive is for Jetson.
+    nvrtc: Option.some(linuxNvrtc("linux-sbsa", 53_265_740, "fb2d50c791465f333fc2236d2419170cf7a7886f48dd9b967a10f8233c686029")),
   },
   {
     id: "linux-x64-gnu",
@@ -81,7 +91,7 @@ export const releaseHosts = [
     bunTarget: "bun-linux-x64-baseline",
     rustTarget: "x86_64-unknown-linux-gnu",
     executableExtension: "",
-    cargoFeatures: ["mtmd", "dynamic-backends"],
+    nvrtc: Option.some(linuxNvrtc("linux-x86_64", 114_231_976, "82913658363892dbc0f2638b070476234476e06e084fed60db861cb7e161a6af")),
   },
   {
     id: "windows-x64-msvc",
@@ -89,100 +99,19 @@ export const releaseHosts = [
     bunTarget: "bun-windows-x64",
     rustTarget: "x86_64-pc-windows-msvc",
     executableExtension: ".exe",
-    cargoFeatures: ["mtmd", "dynamic-backends"],
+    nvrtc: Option.some({
+      version: NVRTC_VERSION,
+      url: `${NVRTC_REDISTRIBUTABLE}/windows-x86_64/${windowsNvrtcRoot}.zip`,
+      bytes: 314_608_748,
+      sha256: "1aa0644fa53c8ca34cdc73db17bcc73530557bdd3f582c7bfdbd7916c8b48f65",
+      libraries: [
+        { member: `${windowsNvrtcRoot}/bin/nvrtc64_120_0.dll`, name: "nvrtc64_120_0.dll" },
+        { member: `${windowsNvrtcRoot}/bin/nvrtc-builtins64_129.dll`, name: "nvrtc-builtins64_129.dll" },
+      ],
+      license: { member: `${windowsNvrtcRoot}/LICENSE`, name: NVRTC_LICENSE_NAME },
+    }),
   },
 ] as const satisfies readonly ReleaseHost[]
-
-const cudaBuilds = [
-  {
-    toolkitVersion: "11.8",
-    architectures: ["80-virtual"],
-    runtimeLibraries: ["libcudart.so.11.0", "libcublas.so.11", "libcublasLt.so.11"],
-  },
-  {
-    toolkitVersion: "12.9",
-    architectures: ["80-virtual", "90-virtual", "120-virtual"],
-    runtimeLibraries: ["libcudart.so.12", "libcublas.so.12", "libcublasLt.so.12"],
-  },
-] as const
-
-const cudaHosts = [
-  {
-    host: "linux-arm64-gnu",
-    runners: { "11.8": "blacksmith-16vcpu-ubuntu-2204-arm", "12.9": "blacksmith-16vcpu-ubuntu-2204-arm" },
-  },
-  {
-    host: "linux-x64-gnu",
-    runners: { "11.8": "blacksmith-16vcpu-ubuntu-2204", "12.9": "blacksmith-16vcpu-ubuntu-2204" },
-  },
-] as const
-
-const cudaBackendPacks: readonly BackendPack[] = cudaHosts.flatMap(({ host, runners }) =>
-  cudaBuilds.map((cuda) => ({
-    id: `cuda-${cuda.toolkitVersion}-${host}`,
-    host,
-    backend: "cuda" as const,
-    runner: runners[cuda.toolkitVersion],
-    cargoFeatures: ["dynamic-backends", "cuda-no-vmm"],
-    module: "libggml-cuda.so",
-    runtimeLibraries: cuda.runtimeLibraries,
-    cuda,
-  })))
-
-export const backendPacks: readonly BackendPack[] = [
-  {
-    id: "metal-darwin-arm64",
-    host: "darwin-arm64",
-    backend: "metal",
-    runner: "blacksmith-12vcpu-macos-15",
-    cargoFeatures: ["dynamic-backends", "metal"],
-    module: "libggml-metal.so",
-    runtimeLibraries: [],
-    compatibility: { kind: "metal" },
-  },
-  ...cudaBackendPacks,
-  {
-    id: "cuda-12.9-windows-x64-msvc",
-    host: "windows-x64-msvc",
-    backend: "cuda",
-    runner: "blacksmith-16vcpu-windows-2025",
-    cargoFeatures: ["dynamic-backends", "cuda-no-vmm"],
-    module: "ggml-cuda.dll",
-    runtimeLibraries: ["cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll"],
-    // Ship cubins as well as PTX so the first model load does not JIT every kernel.
-    cuda: { toolkitVersion: "12.9", architectures: ["80", "90", "120"] },
-  },
-  {
-    id: "vulkan1-windows-x64-msvc",
-    host: "windows-x64-msvc",
-    backend: "vulkan",
-    runner: "blacksmith-16vcpu-windows-2025",
-    cargoFeatures: ["dynamic-backends", "vulkan"],
-    module: "ggml-vulkan.dll",
-    runtimeLibraries: [],
-    compatibility: { kind: "vulkan", minimumApi: "1.1.0" },
-  },
-  {
-    id: "vulkan1-linux-arm64-gnu",
-    host: "linux-arm64-gnu",
-    backend: "vulkan",
-    runner: "blacksmith-16vcpu-ubuntu-2204-arm",
-    cargoFeatures: ["dynamic-backends", "vulkan"],
-    module: "libggml-vulkan.so",
-    runtimeLibraries: [],
-    compatibility: { kind: "vulkan", minimumApi: "1.1.0" },
-  },
-  {
-    id: "vulkan1-linux-x64-gnu",
-    host: "linux-x64-gnu",
-    backend: "vulkan",
-    runner: "blacksmith-16vcpu-ubuntu-2204",
-    cargoFeatures: ["dynamic-backends", "vulkan"],
-    module: "libggml-vulkan.so",
-    runtimeLibraries: [],
-    compatibility: { kind: "vulkan", minimumApi: "1.1.0" },
-  },
-]
 
 export const hostById = (id: HostId): ReleaseHost => {
   const host = releaseHosts.find((candidate) => candidate.id === id)
@@ -211,7 +140,6 @@ export const linuxDesktopInstaller = (host: "linux-arm64-gnu" | "linux-x64-gnu",
     : `magnitude-desktop-${version}-${revision}.${host === "linux-arm64-gnu" ? "aarch64" : "x86_64"}.rpm`
 }
 export const icnBaseArchive = (host: HostId) => `magnitude-icn-base-${host}.tar.gz`
-export const backendArchive = (pack: BackendPack) => `magnitude-icn-${pack.id}.tar.gz`
 
 export const currentHost = (): HostId => {
   const key = `${process.platform}-${process.arch}`

@@ -1,17 +1,21 @@
 import { createHash } from "node:crypto"
 import { resolve } from "node:path"
+import * as Command from "@effect/platform/Command"
 import * as FileSystem from "@effect/platform/FileSystem"
+import { FetchHttpClient } from "@effect/platform"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
 import { Console, Data, Effect, Option } from "effect"
+import { resolveReleaseIcnInstallation } from "../../icn/src/lifecycle/release-installation"
+import { IcnPreparationReporter } from "../../icn/src/lifecycle/preparation"
+import { smokeInstallation } from "../../../inference/scripts/smoke"
 import { releaseUrl } from "../src/acquisition"
+import { currentHost, desktopUpdateArchive } from "../src/targets"
 import {
   buildLocalRelease,
   loadLocalRelease,
-  refreshLocalRelease,
   type LocalRelease,
 } from "./local-release"
 
-const PROJECT_ROOT = resolve(import.meta.dir, "../../..")
 const RELEASE_BASE_URL = "http://127.0.0.1"
 const TEST_DOWNLOAD_BYTES_PER_SECOND_PER_REQUEST = 2 * 1024 * 1024
 const TEST_DOWNLOAD_CHUNK_BYTES = 64 * 1024
@@ -153,61 +157,11 @@ const serveLocalRelease = (release: LocalRelease) =>
     (server) => Effect.sync(() => server.stop(true)),
   )
 
-const launchCli = (
-  release: LocalRelease,
-  baseUrl: string,
-  home: string,
-  arguments_: readonly string[],
-): Effect.Effect<number, BootstrapTestError> =>
-  Effect.async((resume) => {
-    const excluded = new Set([
-      "HOME",
-      "USERPROFILE",
-      "MAGNITUDE_ACN_VERSION",
-      "MAGNITUDE_ICN_PATH",
-      "MAGNITUDE_RELEASE_BASE_URL",
-      "MAGNITUDE_USE_LOCAL",
-    ])
-    const inherited: Record<string, string> = {}
-    for (const [name, value] of Object.entries(process.env)) {
-      const present = Option.fromNullable(value)
-      if (!excluded.has(name) && Option.isSome(present)) {
-        inherited[name] = present.value
-      }
-    }
-    const child = Bun.spawn(
-      [
-        resolve(PROJECT_ROOT, "bin", process.platform === "win32" ? "magnitude-cli.exe" : "magnitude-cli"),
-        ...arguments_,
-      ],
-      {
-        cwd: PROJECT_ROOT,
-        env: {
-          ...inherited,
-          HOME: home,
-          USERPROFILE: home,
-          MAGNITUDE_RELEASE_BASE_URL: baseUrl,
-        },
-        stdin: "inherit",
-        stdout: "inherit",
-        stderr: "inherit",
-      },
-    )
-    child.exited.then(
-      (code) => resume(Effect.succeed(code)),
-      (cause) =>
-        resume(Effect.fail(
-          failure(`unable to run the CLI: ${String(cause)}`),
-        )),
-    )
-    return Effect.sync(() => child.kill("SIGTERM"))
-  })
+const usage = `Usage: bun test:release-bootstrap [--cached]
 
-const usage = `Usage: bun test:release-bootstrap [--rebuild] [-- <CLI arguments>]
+Build this host's release and acquire its engine into an empty profile through the production installation path. Verify the installed engine's identity, readiness, authenticated hardware, and parent-loss shutdown.
 
-Build and run the current worktree through the production release acquisition path.
-
-  --rebuild  Rebuild the local release before running.
+  --cached  Reuse the last complete local release for harness iteration; this does not validate current source changes.
   --help     Show this help.
 `
 
@@ -217,23 +171,19 @@ const program = Effect.gen(function* () {
     yield* Console.log(usage)
     return
   }
-  const rebuild = arguments_.includes("--rebuild")
-  const cliArguments = arguments_.filter(
-    (argument) => argument !== "--rebuild" && argument !== "--",
-  )
+  const cached = arguments_.includes("--cached")
+  const unexpected = arguments_.filter((argument) => argument !== "--cached")
+  if (unexpected.length > 0) {
+    return yield* failure(`unsupported arguments: ${unexpected.join(" ")}`)
+  }
 
-  const loadedRelease = rebuild
-    ? yield* buildLocalRelease
-    : yield* loadLocalRelease.pipe(
-      Effect.catchTag("LocalReleaseError", () => buildLocalRelease),
-    )
-  const release = rebuild
-    ? loadedRelease
-    : yield* refreshLocalRelease(loadedRelease)
+  const release = cached ? yield* loadLocalRelease : yield* buildLocalRelease
 
   const fs = yield* FileSystem.FileSystem
   const home = yield* fs.makeTempDirectory({
     prefix: "magnitude-bootstrap-test-",
+    // The application's Unix control socket must fit macOS's 103-byte path limit.
+    ...(process.platform === "darwin" ? { directory: "/tmp" } : {}),
   }).pipe(
     Effect.mapError((cause) =>
       failure(
@@ -248,22 +198,56 @@ const program = Effect.gen(function* () {
       yield* Console.log([
         "",
         `Local release: ${release.version}`,
+        `Artifact source: ${cached ? "cached local release (source edits unverified)" : "current worktree build"}`,
         `Isolated home: ${home}`,
         `Release server: ${baseUrl}`,
         "",
-        "Starting a cold production-style bootstrap...",
+        "Downloading and installing the release engine into the empty profile...",
         "",
       ].join("\n"))
-      const exitCode = yield* launchCli(
-        release,
+      const installation = yield* resolveReleaseIcnInstallation(
+        release.version,
+        resolve(home, ".magnitude"),
         baseUrl,
-        home,
-        cliArguments,
+      ).pipe(
+        Effect.provideService(IcnPreparationReporter, { report: () => Effect.void }),
+        Effect.provide(FetchHttpClient.layer),
+        Effect.mapError((error) => failure(`engine acquisition failed at ${error.stage}: ${error.message}`)),
       )
-      yield* Console.log(`\nBootstrap state preserved at ${home}`)
-      if (exitCode !== 0) {
-        return yield* failure(`Magnitude exited with code ${exitCode}`)
+      yield* Effect.tryPromise({
+        try: () => smokeInstallation(installation.declarationPath),
+        catch: (cause) => failure(`installed engine smoke failed: ${String(cause)}`),
+      })
+      yield* Console.log(`Installed engine ready: ${installation.declarationPath}`)
+      const host = currentHost()
+      if (host === "darwin-arm64" || host === "darwin-x64") {
+        const archive = release.files.get(desktopUpdateArchive(host))
+        if (!archive) return yield* failure("local release has no desktop update archive")
+        const desktopRoot = resolve(home, "desktop")
+        yield* fs.makeDirectory(desktopRoot)
+        const extracted = yield* Command.make("/usr/bin/ditto", "-x", "-k", archive, desktopRoot).pipe(Command.exitCode)
+        if (extracted !== 0) return yield* failure(`desktop update archive extraction exited ${extracted}`)
+        const resources = resolve(desktopRoot, "Magnitude.app/Contents/Resources")
+        const acceptanceRoot = yield* fs.makeTempDirectory({ prefix: "mag-headless-", directory: "/tmp" })
+        for (const [offline, endpoint] of [[false, baseUrl], [true, "http://127.0.0.1:1"]] as const) {
+          const acceptance = yield* Command.make(process.execPath, "run", resolve(import.meta.dir, "acceptance/test-installed-headless.ts")).pipe(
+            Command.env({
+              MAGNITUDE_INSTALLED_ACCEPTANCE_OUTPUT: acceptanceRoot,
+              MAGNITUDE_INSTALLED_ACCEPTANCE_CLI: resolve(resources, "magnitude"),
+              MAGNITUDE_INSTALLED_ACCEPTANCE_ADDON: resolve(resources, "desktop-host.node"),
+              MAGNITUDE_INSTALLED_ACCEPTANCE_VERSION: release.version,
+              MAGNITUDE_INSTALLED_ACCEPTANCE_OFFLINE: String(offline),
+              MAGNITUDE_RELEASE_BASE_URL: endpoint,
+              MAGNITUDE_ICN_PATH: "",
+            }),
+            Command.stdout("inherit"), Command.stderr("inherit"), Command.exitCode,
+            Effect.timeoutFail({ duration: "2 minutes", onTimeout: () => failure("installed headless acceptance timed out") }),
+          )
+          if (acceptance !== 0) return yield* failure(`installed headless acceptance exited ${acceptance}`)
+        }
+        yield* Console.log(`Installed desktop and bundled CLI acquired the engine and restarted offline: ${acceptanceRoot}`)
       }
+      yield* Console.log(`\nBootstrap state preserved at ${home}`)
     }),
   )
 }).pipe(

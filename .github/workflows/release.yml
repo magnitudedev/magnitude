@@ -168,10 +168,6 @@ jobs:
           path: release-artifacts
       - uses: actions/download-artifact@v4
         with:
-          pattern: backend-*
-          path: release-artifacts
-      - uses: actions/download-artifact@v4
-        with:
           pattern: apple-consumer-*
           path: release-artifacts
       - run: npm install --global "npm@${NPM_VERSION}"

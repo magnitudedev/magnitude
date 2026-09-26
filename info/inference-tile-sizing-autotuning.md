@@ -1,7 +1,7 @@
 # Tile sizing and autotuning on M-series Macs
 
 Research note, 7 September 2026. This is a proposal grounded in public documentation,
-upstream source, and the current `inference-v2` implementation, not an adopted design
+upstream source, and the Python engine prototype of that time, not an adopted design
 or a report of measured speedups. No tuning benchmarks were run for this note.
 
 The recommended direction is **operation-specific candidate schedules, filtered by

@@ -10,8 +10,8 @@ applies_to:
   - packages/providers/src/magnitude/**
   - packages/icn/src/provider/**
   - packages/inference-benchmark/**
-  - inference-v2/src/session_bench/sessions.py
-  - inference-v2/src/session_bench/client.py
+  - inference/benchmarks/src/magnitude_benchmarks/session_bench/sessions.py
+  - inference/benchmarks/src/magnitude_benchmarks/session_bench/client.py
 ---
 
 # Native Chat Completions

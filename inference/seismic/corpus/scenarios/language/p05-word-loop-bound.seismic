@@ -1,0 +1,7 @@
+# origin: C1:p5
+# rejected: "range"
+fn count[N](x: &tensor[N] f32, n: i32) -> f32:
+    let mut s = f32(0.0)
+    for i in 0..n:
+        s = s + x[i]
+    return s

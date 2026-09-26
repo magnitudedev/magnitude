@@ -1,0 +1,10 @@
+[package]
+name = "seismic-estimator-metal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+seismic-ir.workspace = true
+seismic-lang.workspace = true
+seismic-estimator.workspace = true

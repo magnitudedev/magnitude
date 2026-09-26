@@ -42,6 +42,39 @@ export const AllowedToolsType = S.Literal("allowed_tools")
 export type AllowedToolsType = S.Schema.Type<typeof AllowedToolsType>
 export type AllowedToolsTypeEncoded = S.Schema.Encoded<typeof AllowedToolsType>
 
+export const AnthropicToolChoice = S.Union(
+  S.extend(
+    S.Struct({
+      disable_parallel_tool_use: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
+      type: S.Literal("auto"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      disable_parallel_tool_use: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
+      type: S.Literal("any"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      disable_parallel_tool_use: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
+      name: S.String,
+      type: S.Literal("tool"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      type: S.Literal("none"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type AnthropicToolChoice = S.Schema.Type<typeof AnthropicToolChoice>
+export type AnthropicToolChoiceEncoded = S.Schema.Encoded<typeof AnthropicToolChoice>
+
 export const ApiErrorBody = S.Struct({
   code: S.String,
   message: S.String,
@@ -96,29 +129,6 @@ export type ApplyTemplateResponseEncoded = S.Schema.Encoded<typeof ApplyTemplate
 export const AssessmentEnvironmentId = S.String
 export type AssessmentEnvironmentId = S.Schema.Type<typeof AssessmentEnvironmentId>
 export type AssessmentEnvironmentIdEncoded = S.Schema.Encoded<typeof AssessmentEnvironmentId>
-
-export const BackendEligibilityReport = S.Struct({
-  cuda: S.suspend((): S.Schema<CudaEligibility, CudaEligibilityEncoded> => CudaEligibility),
-  metal: S.suspend((): S.Schema<MetalEligibility, MetalEligibilityEncoded> => MetalEligibility),
-  schemaVersion: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1), S.lessThanOrEqualTo(1)),
-  vulkan: S.suspend((): S.Schema<VulkanEligibility, VulkanEligibilityEncoded> => VulkanEligibility),
-})
-export type BackendEligibilityReport = S.Schema.Type<typeof BackendEligibilityReport>
-export type BackendEligibilityReportEncoded = S.Schema.Encoded<typeof BackendEligibilityReport>
-
-export const CacheTypeResponse = S.Union(
-  S.Literal("f32"),
-  S.Literal("f16"),
-  S.Literal("bf16"),
-  S.Literal("q8_0"),
-  S.Literal("q4_0"),
-  S.Literal("q4_1"),
-  S.Literal("iq4_nl"),
-  S.Literal("q5_0"),
-  S.Literal("q5_1"),
-)
-export type CacheTypeResponse = S.Schema.Type<typeof CacheTypeResponse>
-export type CacheTypeResponseEncoded = S.Schema.Encoded<typeof CacheTypeResponse>
 
 export const CatalogInstallationAdmission = S.Union(
   S.extend(S.TaggedStruct("Current", {}), S.Record({ key: S.String, value: JsonValue })),
@@ -391,6 +401,7 @@ export const ChatCompletionRequest = S.Struct({
     S.extend(S.Struct({}), S.Record({ key: S.String, value: S.suspend((): S.Schema<Value, ValueEncoded> => Value) })),
     { exact: true, as: "Option" },
   ),
+  frequency_penalty: S.optionalWith(S.Number, { exact: true, as: "Option" }),
   ignore_eos: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
   max_completion_tokens: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), {
     exact: true,
@@ -398,12 +409,16 @@ export const ChatCompletionRequest = S.Struct({
   }),
   max_tokens: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
   messages: S.Array(S.suspend((): S.Schema<ChatMessageRequest, ChatMessageRequestEncoded> => ChatMessageRequest)),
+  min_p: S.optionalWith(S.Number, { exact: true, as: "Option" }),
   model: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  n: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
   parallel_tool_calls: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
+  presence_penalty: S.optionalWith(S.Number, { exact: true, as: "Option" }),
   reasoning_effort: S.optionalWith(
     S.suspend((): S.Schema<ReasoningEffortRequest, ReasoningEffortRequestEncoded> => ReasoningEffortRequest),
     { exact: true, as: "Option" },
   ),
+  repetition_penalty: S.optionalWith(S.Number, { exact: true, as: "Option" }),
   response_format: S.optionalWith(
     S.suspend((): S.Schema<ResponseFormatRequest, ResponseFormatRequestEncoded> => ResponseFormatRequest),
     { exact: true, as: "Option" },
@@ -433,6 +448,7 @@ export const ChatCompletionRequest = S.Struct({
     exact: true,
     as: "Option",
   }),
+  top_k: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
   top_p: S.optionalWith(S.Number, { exact: true, as: "Option" }),
 })
 export type ChatCompletionRequest = S.Schema.Type<typeof ChatCompletionRequest>
@@ -710,34 +726,6 @@ export const CountTokensResponse = S.extend(
 export type CountTokensResponse = S.Schema.Type<typeof CountTokensResponse>
 export type CountTokensResponseEncoded = S.Schema.Encoded<typeof CountTokensResponse>
 
-export const CudaEligibility = S.Union(
-  S.extend(
-    S.Struct({
-      architectures: S.Array(S.String).pipe(S.minItems(1)),
-      driverApi: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
-      driverLibrary: S.String.pipe(S.minLength(1)),
-      state: S.Literal("usable"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      diagnostic: S.String,
-      state: S.Literal("absent"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      diagnostic: S.String,
-      state: S.Literal("failed"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-)
-export type CudaEligibility = S.Schema.Type<typeof CudaEligibility>
-export type CudaEligibilityEncoded = S.Schema.Encoded<typeof CudaEligibility>
-
 export const DefaultGenerationSettings = S.Struct({
   n_ctx: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
@@ -882,47 +870,9 @@ export const ErrorResponse = S.Struct({
 export type ErrorResponse = S.Schema.Type<typeof ErrorResponse>
 export type ErrorResponseEncoded = S.Schema.Encoded<typeof ErrorResponse>
 
-export const ExecutionConfigResponse = S.Struct({
-  requested: S.suspend(
-    (): S.Schema<ExecutionSettingsResponse, ExecutionSettingsResponseEncoded> => ExecutionSettingsResponse,
-  ),
-  resolved: S.suspend(
-    (): S.Schema<ExecutionSettingsResponse, ExecutionSettingsResponseEncoded> => ExecutionSettingsResponse,
-  ),
-})
-export type ExecutionConfigResponse = S.Schema.Type<typeof ExecutionConfigResponse>
-export type ExecutionConfigResponseEncoded = S.Schema.Encoded<typeof ExecutionConfigResponse>
-
-export const ExecutionSettingsResponse = S.Struct({
-  cache_type_k: S.suspend((): S.Schema<CacheTypeResponse, CacheTypeResponseEncoded> => CacheTypeResponse),
-  cache_type_v: S.suspend((): S.Schema<CacheTypeResponse, CacheTypeResponseEncoded> => CacheTypeResponse),
-  flash_attention: S.suspend(
-    (): S.Schema<FlashAttentionResponse, FlashAttentionResponseEncoded> => FlashAttentionResponse,
-  ),
-  gpu_layers: S.suspend((): S.Schema<GpuLayersResponse, GpuLayersResponseEncoded> => GpuLayersResponse),
-  kv_unified: S.Boolean,
-  offload_kqv: S.Boolean,
-  operation_offload: S.Boolean,
-  split_mode: S.suspend((): S.Schema<SplitModeResponse, SplitModeResponseEncoded> => SplitModeResponse),
-  swa_full: S.Boolean,
-  tensor_split: S.optionalWith(S.Union(S.Array(S.Number), S.Null), { exact: true, as: "Option" }),
-  threads: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
-    exact: true,
-    as: "Option",
-  }),
-  threads_batch: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
-    exact: true,
-    as: "Option",
-  }),
-  use_mlock: S.Boolean,
-  use_mmap: S.Boolean,
-})
-export type ExecutionSettingsResponse = S.Schema.Type<typeof ExecutionSettingsResponse>
-export type ExecutionSettingsResponseEncoded = S.Schema.Encoded<typeof ExecutionSettingsResponse>
-
-export const FlashAttentionResponse = S.Union(S.Literal("auto"), S.Literal("disabled"), S.Literal("enabled"))
-export type FlashAttentionResponse = S.Schema.Type<typeof FlashAttentionResponse>
-export type FlashAttentionResponseEncoded = S.Schema.Encoded<typeof FlashAttentionResponse>
+export const ExecutionBackend = S.Union(S.Literal("cpu"), S.Literal("metal"), S.Literal("cuda"), S.Literal("vulkan"))
+export type ExecutionBackend = S.Schema.Type<typeof ExecutionBackend>
+export type ExecutionBackendEncoded = S.Schema.Encoded<typeof ExecutionBackend>
 
 export const FunctionCallOutput = S.Union(
   S.String,
@@ -976,30 +926,6 @@ export const FunctionType = S.Literal("function")
 export type FunctionType = S.Schema.Type<typeof FunctionType>
 export type FunctionTypeEncoded = S.Schema.Encoded<typeof FunctionType>
 
-export const GpuLayersResponse = S.Union(
-  S.extend(
-    S.Struct({
-      mode: S.Literal("auto"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      mode: S.Literal("all"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      mode: S.Literal("count"),
-      value: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-)
-export type GpuLayersResponse = S.Schema.Type<typeof GpuLayersResponse>
-export type GpuLayersResponseEncoded = S.Schema.Encoded<typeof GpuLayersResponse>
-
 export const GrammarTriggerResponse = S.Union(
   S.extend(
     S.Struct({
@@ -1035,7 +961,7 @@ export type GrammarTriggerResponse = S.Schema.Type<typeof GrammarTriggerResponse
 export type GrammarTriggerResponseEncoded = S.Schema.Encoded<typeof GrammarTriggerResponse>
 
 export const HardwareDevice = S.Struct({
-  backend: S.String,
+  backend: S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend),
   description: S.String,
   id: S.suspend((): S.Schema<HardwareDeviceId, HardwareDeviceIdEncoded> => HardwareDeviceId),
   kind: S.suspend((): S.Schema<HardwareDeviceKind, HardwareDeviceKindEncoded> => HardwareDeviceKind),
@@ -1047,8 +973,7 @@ export const HardwareDevice = S.Struct({
     { exact: true, as: "Option" },
   ),
   name: S.String,
-  native_index: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  physical_id: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
+  unavailable_reason: S.optionalWith(S.String, { exact: true, as: "Option" }),
 })
 export type HardwareDevice = S.Schema.Type<typeof HardwareDevice>
 export type HardwareDeviceEncoded = S.Schema.Encoded<typeof HardwareDevice>
@@ -1112,7 +1037,7 @@ export const HardwareSnapshot = S.Struct({
   architecture: S.String,
   captured_at: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   cpu_model: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
-  enabled_backends: S.Array(S.String),
+  enabled_backends: S.Array(S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend)),
   logical_cores: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   memory_domains: S.Array(
     S.suspend((): S.Schema<HardwareMemoryDomain, HardwareMemoryDomainEncoded> => HardwareMemoryDomain),
@@ -1230,8 +1155,9 @@ export type HuggingFaceRepositorySnapshotEncoded = S.Schema.Encoded<typeof Huggi
 
 export const IcnBinaryIdentity = S.Struct({
   api_version: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
-  backend_module_abi: S.String.pipe(S.minLength(1)),
-  backends: S.Array(S.String).pipe(S.minItems(1)),
+  backends: S.Array(S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend)).pipe(
+    S.minItems(1),
+  ),
   capabilities: S.Array(S.String).pipe(S.minItems(1)),
   native_build: S.String.pipe(S.minLength(1)),
   profile: S.String.pipe(S.minLength(1)),
@@ -1242,18 +1168,7 @@ export const IcnBinaryIdentity = S.Struct({
 export type IcnBinaryIdentity = S.Schema.Type<typeof IcnBinaryIdentity>
 export type IcnBinaryIdentityEncoded = S.Schema.Encoded<typeof IcnBinaryIdentity>
 
-export const IcnInstallationBackend = S.Union(
-  S.Literal("cpu"),
-  S.Literal("metal"),
-  S.Literal("cuda"),
-  S.Literal("vulkan"),
-)
-export type IcnInstallationBackend = S.Schema.Type<typeof IcnInstallationBackend>
-export type IcnInstallationBackendEncoded = S.Schema.Encoded<typeof IcnInstallationBackend>
-
 export const IcnInstallationDeclaration = S.Struct({
-  backend: S.suspend((): S.Schema<IcnInstallationBackend, IcnInstallationBackendEncoded> => IcnInstallationBackend),
-  backendModuleAbi: S.String.pipe(S.minLength(1)),
   nativeBuild: S.String.pipe(S.minLength(1)),
   schemaVersion: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1), S.lessThanOrEqualTo(1)),
 })
@@ -1492,7 +1407,7 @@ export const MessagesRequest = S.Struct({
     { exact: true, as: "Option" },
   ),
   tool_choice: S.optionalWith(
-    S.suspend((): S.Schema<ToolChoice, ToolChoiceEncoded> => ToolChoice),
+    S.suspend((): S.Schema<AnthropicToolChoice, AnthropicToolChoiceEncoded> => AnthropicToolChoice),
     { exact: true, as: "Option" },
   ),
   tools: S.optionalWith(S.Array(S.suspend((): S.Schema<Tool, ToolEncoded> => Tool)), { exact: true, as: "Option" }),
@@ -1504,24 +1419,6 @@ export const MessagesRequest = S.Struct({
 })
 export type MessagesRequest = S.Schema.Type<typeof MessagesRequest>
 export type MessagesRequestEncoded = S.Schema.Encoded<typeof MessagesRequest>
-
-export const MetalEligibility = S.Union(
-  S.extend(
-    S.Struct({
-      state: S.Literal("usable"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      diagnostic: S.String,
-      state: S.Literal("absent"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-)
-export type MetalEligibility = S.Schema.Type<typeof MetalEligibility>
-export type MetalEligibilityEncoded = S.Schema.Encoded<typeof MetalEligibility>
 
 export const Modalities = S.Struct({
   audio: S.Boolean,
@@ -1740,8 +1637,6 @@ export const ModelInstanceAllocation = S.Struct({
   memoryDomains: S.Array(
     S.suspend((): S.Schema<ModelInstanceMemoryDomain, ModelInstanceMemoryDomainEncoded> => ModelInstanceMemoryDomain),
   ),
-  parallelSequences: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  physicalContextTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
 export type ModelInstanceAllocation = S.Schema.Type<typeof ModelInstanceAllocation>
 export type ModelInstanceAllocationEncoded = S.Schema.Encoded<typeof ModelInstanceAllocation>
@@ -1762,8 +1657,7 @@ export const ModelInstanceFailure = S.Union(
       loadBoundaryBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       message: S.String,
       minimumAdditionalAvailableBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-      parallelSequences: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-      requiredSystemMemoryBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      requiredMemoryBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       retryable: S.Boolean,
       systemReserveBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
     }),
@@ -1845,11 +1739,17 @@ export const ModelInstancesSnapshot = S.Struct({
 export type ModelInstancesSnapshot = S.Schema.Type<typeof ModelInstancesSnapshot>
 export type ModelInstancesSnapshotEncoded = S.Schema.Encoded<typeof ModelInstancesSnapshot>
 
+export const ModelLoadDevice = S.Struct({
+  backend: S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend),
+  id: S.suspend((): S.Schema<HardwareDeviceId, HardwareDeviceIdEncoded> => HardwareDeviceId),
+})
+export type ModelLoadDevice = S.Schema.Type<typeof ModelLoadDevice>
+export type ModelLoadDeviceEncoded = S.Schema.Encoded<typeof ModelLoadDevice>
+
 export const ModelLoadPlan = S.Struct({
   contextWindowTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  parallelSequences: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  physicalContextTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  requiredSystemMemoryBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  device: S.suspend((): S.Schema<ModelLoadDevice, ModelLoadDeviceEncoded> => ModelLoadDevice),
+  requiredMemoryBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
 export type ModelLoadPlan = S.Schema.Type<typeof ModelLoadPlan>
 export type ModelLoadPlanEncoded = S.Schema.Encoded<typeof ModelLoadPlan>
@@ -2055,9 +1955,6 @@ export const PropsResponse = S.Struct({
   chat_template: S.String,
   default_generation_settings: S.suspend(
     (): S.Schema<DefaultGenerationSettings, DefaultGenerationSettingsEncoded> => DefaultGenerationSettings,
-  ),
-  execution: S.suspend(
-    (): S.Schema<ExecutionConfigResponse, ExecutionConfigResponseEncoded> => ExecutionConfigResponse,
   ),
   general_architecture: S.optionalWith(S.String, { exact: true, as: "Option" }),
   general_name: S.optionalWith(S.String, { exact: true, as: "Option" }),
@@ -2665,10 +2562,6 @@ export const SpeculativeMethod = S.Union(
 export type SpeculativeMethod = S.Schema.Type<typeof SpeculativeMethod>
 export type SpeculativeMethodEncoded = S.Schema.Encoded<typeof SpeculativeMethod>
 
-export const SplitModeResponse = S.Union(S.Literal("none"), S.Literal("layer"), S.Literal("row"), S.Literal("tensor"))
-export type SplitModeResponse = S.Schema.Type<typeof SplitModeResponse>
-export type SplitModeResponseEncoded = S.Schema.Encoded<typeof SplitModeResponse>
-
 export const StopRequest = S.Union(S.String, S.Array(S.String))
 export type StopRequest = S.Schema.Type<typeof StopRequest>
 export type StopRequestEncoded = S.Schema.Encoded<typeof StopRequest>
@@ -2763,39 +2656,6 @@ export const Tool = S.Struct({
 export type Tool = S.Schema.Type<typeof Tool>
 export type ToolEncoded = S.Schema.Encoded<typeof Tool>
 
-export const ToolChoice = S.Union(
-  S.extend(
-    S.Struct({
-      disable_parallel_tool_use: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
-      type: S.Literal("auto"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      disable_parallel_tool_use: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
-      type: S.Literal("any"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      disable_parallel_tool_use: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
-      name: S.String,
-      type: S.Literal("tool"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      type: S.Literal("none"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-)
-export type ToolChoice = S.Schema.Type<typeof ToolChoice>
-export type ToolChoiceEncoded = S.Schema.Encoded<typeof ToolChoice>
-
 export const ToolChoiceModeRequest = S.Union(S.Literal("none"), S.Literal("auto"), S.Literal("required"))
 export type ToolChoiceModeRequest = S.Schema.Type<typeof ToolChoiceModeRequest>
 export type ToolChoiceModeRequestEncoded = S.Schema.Encoded<typeof ToolChoiceModeRequest>
@@ -2862,29 +2722,3 @@ export type UsageResponseEncoded = S.Schema.Encoded<typeof UsageResponse>
 export const Value = JsonValue
 export type Value = S.Schema.Type<typeof Value>
 export type ValueEncoded = S.Schema.Encoded<typeof Value>
-
-export const VulkanEligibility = S.Union(
-  S.extend(
-    S.Struct({
-      loaderApi: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
-      state: S.Literal("usable"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      diagnostic: S.String,
-      state: S.Literal("absent"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      diagnostic: S.String,
-      state: S.Literal("failed"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-)
-export type VulkanEligibility = S.Schema.Type<typeof VulkanEligibility>
-export type VulkanEligibilityEncoded = S.Schema.Encoded<typeof VulkanEligibility>

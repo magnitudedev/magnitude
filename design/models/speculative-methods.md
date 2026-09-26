@@ -1,8 +1,8 @@
 ---
 applies_to:
   - inference/catalog/**
-  - inference/crates/icn-models/**
-  - inference/crates/icn-speculative/**
+  - inference/service/models/**
+  - inference/engine/generation/**
 ---
 
 # Catalog speculative methods

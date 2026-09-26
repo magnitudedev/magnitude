@@ -1,7 +1,7 @@
 ---
 applies_to:
-  - inference/crates/icn-contracts/src/models.rs
-  - inference/crates/icn-models/**
+  - inference/service/contracts/src/models.rs
+  - inference/service/models/**
   - packages/icn/src/models/**
   - packages/icn/src/events/**
   - packages/icn/src/instances/**

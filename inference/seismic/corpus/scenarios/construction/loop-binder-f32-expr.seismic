@@ -1,0 +1,5 @@
+# origin: C11:loop_binder_f32_expr
+# invoke: f32[4]=0,0,0,0
+fn probe(dst: &mut tensor[4] f32):
+    for k in 0..4:
+        dst[k] = f32(2 * k) + 1.0

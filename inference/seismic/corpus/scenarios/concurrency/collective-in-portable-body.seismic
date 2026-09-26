@@ -1,0 +1,5 @@
+# origin: C17:simd_in_portable_fn
+# rejected: "portable body"
+fn probe(x: &tensor[64] f32, out: &mut tensor[64] f32):
+    parallel for i in 0..64:
+        out[i] = metal.subgroup.simd_sum(x[i])

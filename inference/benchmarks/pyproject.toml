@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "magnitude-benchmarks"
+version = "0.1.0"
+description = "Session Bench and engine adapters for measuring inference serving"
+requires-python = ">=3.12"
+dependencies = [
+  "httpx==0.28.1",
+  "psutil>=7",
+  "pydantic==2.13.5",
+  "gguf==0.19.0",
+  "huggingface-hub>=1.27,<2",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=9.1.1",
+  "pytest-asyncio>=1",
+]
+
+[project.scripts]
+session-bench = "magnitude_benchmarks.session_bench.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/magnitude_benchmarks"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

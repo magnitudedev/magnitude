@@ -132,6 +132,16 @@ export const countAnthropicMessageTokensOperation = {
       mediaType: "application/json",
     },
     {
+      status: 409,
+      schema: S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+      mediaType: "application/json",
+    },
+    {
+      status: 422,
+      schema: S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+      mediaType: "application/json",
+    },
+    {
       status: 500,
       schema: S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
       mediaType: "application/json",
@@ -175,6 +185,11 @@ export const createAnthropicMessageOperation = {
     },
     {
       status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+      mediaType: "application/json",
+    },
+    {
+      status: 503,
       schema: S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
       mediaType: "application/json",
     },
@@ -229,6 +244,11 @@ export const createChatCompletionOperation = {
       schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
       mediaType: "application/json",
     },
+    {
+      status: 503,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
   ],
 } as const
 
@@ -269,6 +289,11 @@ export const createChatCompletionHttpOperation = {
     },
     {
       status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 503,
       schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
       mediaType: "application/json",
     },
@@ -330,6 +355,11 @@ export const createResponseOperation = {
       schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
       mediaType: "application/json",
     },
+    {
+      status: 503,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
   ],
 } as const
 
@@ -370,6 +400,11 @@ export const createResponseHttpOperation = {
     },
     {
       status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 503,
       schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
       mediaType: "application/json",
     },

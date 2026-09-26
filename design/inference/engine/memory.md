@@ -1,15 +1,15 @@
 ---
 applies_to:
-  - inference-v4/engine/model-executor/**
-  - inference-v4/engine/model-state/**
-  - inference-v4/engine/service/**
-  - inference-v4/engine/src/execution.rs
-  - inference-v4/engine/src/options.rs
-  - inference-v4/engine/src/service/**
-  - inference-v4/seismic/runtime/src/**
-  - inference-v4/seismic/api/src/lib.rs
-  - inference-v4/seismic/backends/cuda/src/driver.rs
-  - inference-v4/seismic/backends/cuda/src/executor.rs
+  - inference/engine/executor/**
+  - inference/engine/state/**
+  - inference/engine/scheduler/**
+  - inference/engine/src/execution.rs
+  - inference/engine/src/options.rs
+  - inference/engine/src/worker/execution.rs
+  - inference/seismic/runtime/src/**
+  - inference/seismic/api/src/**
+  - inference/seismic/backends/cuda/src/driver.rs
+  - inference/seismic/backends/cuda/src/executor.rs
 ---
 
 # Engine memory
@@ -44,12 +44,19 @@ RAM and to a dedicated device's own memory; there is no other reserve and no OS 
 
 The heap's standing reports its holdings by class, each used domain's newly observed headroom,
 and its band. Every allocation, including startup imports, optional
-components, workspace growth and numerical state growth, has a claim before it occurs. A claim
+components, workspace growth and numerical state slab growth, has a claim before it occurs.
+The heap exists from the opened device's first startup allocation: startup claims are heap
+claims, each held through its allocation, and the loaded domain inherits the same heap, so no
+separate preclaim check or capacity table decides beside it. A refused startup claim fails the load
+with `InsufficientMemory` naming the domain that refused it (the allocation domain, or host RAM
+for a dedicated device's staging), so the host reports that domain's reserve. A claim is held until Seismic's
+charge reflects its physical operation (an import and binding, or an added state slab)
+and is then released; the charged bytes join a classified holding. A claim
 names its holding class, its minimum physical peak charge and any preferred charge for useful
-headroom. A reallocation claim includes the interval when old and new backing coexist. Seismic's
+headroom. Seismic's
 charge ledger remains the byte authority: the sum of classified holdings equals its charge.
 
-Stable fit capacity bounds sealed address-space reservations and metadata-only model fit. It is
+Stable fit capacity bounds metadata-only model fit. It is
 the allocation domain's total capacity under applicable process limits and, on Metal, the device's
 recommended working set, less the planning reserve. A live claim uses fresh headroom for that same
 domain, bounded by process limits, and must leave headroom above the planning reserve; on Metal it
@@ -57,21 +64,13 @@ must also fit the working set's remaining bytes. The observation already exclude
 charges and other processes' use, so an existing charge is never subtracted again. A load onto a
 dedicated device also claims its staged uploads against host RAM under the host's reserve.
 
-Replacing committed state backing does not release its old allocation while a tensor view or
-submitted work still holds it. The state owner observes retired physical allocations without
-retaining them, and counts each still-charged allocation once until its last holder releases it.
-The holder determines whether that charge is live or in flight. Reclamation receives credit only
-for a decrease in Seismic's charge, never for the removal of a state or retention index entry.
-An exclusive in-place resize transfers the existing allocation charge: growth claims only its
-additional backed bytes, and shrink releases its tail charge only after the backend releases that
-physical tail. A held view requires separate backing and preserves the full old charge until the
-view is released. A recoverable resize failure preserves the old backing and its charge together.
-If a multi-plane growth fails after an earlier plane grew in place, discarding that unpublished
-growth restores its prior physical extent and charge before accepted state can run again.
-For a mixed multi-plane replacement, planes that need separate backing are formed before any
-in-place resize. A shrink prepares every plane but one on separate backing, retaining CUDA's
-address reservation for later growth. It unmaps at most one old tail as the final fallible step,
-since an unmapped tail cannot restore its former contents if another plane later fails.
+State is stored in fixed-size history and bank slabs on every backend. The 64 MiB slab target is
+fixed for an engine build and contributes to its build identity. A growth claim covers one
+new slab, which joins the store without copying existing rows or banks. The store releases an empty
+slab without a new claim. A slab bound by submitted work remains charged until that work and its
+binding views finish; its holding class reflects its strongest remaining holder. Reclamation
+receives credit only for a decrease in Seismic's measured charge, never for the removal of a state
+or retention index entry. A failed allocation or copy preserves the published placement and charge.
 
 The heap grants a claim only while every domain the load uses is in the Normal band. It tries the
 preferred charge first, then the minimum. It sets Seismic's enforced limit to current charges plus
@@ -149,29 +148,34 @@ kill is independent fault containment; it chooses nothing to release.
 - Threshold values exist in one policy definition; no code path reads an OS pressure signal.
 - Stable fit capacity is capacity under process limits (and the Metal working set) less the
   planning reserve.
-- Sealed history and bank reservations are bounded by stable domain capacity, while only
-  committed backing is charged against live availability.
+- State growth allocates exactly one claimed slab without copying existing history or banks.
+- Reclaim releases empty slabs and compacts referenced rows and banks into free space in held slabs
+  without a new claim, including on Metal, Vulkan, CPU and CUDA.
+- Startup, lazy component and state-growth allocations all claim from the one device heap.
 
 ## Physical state placement
 
 Logical state ownership and physical backing are separate authorities. The
-model-state subsystem owns logical histories, recurrent banks, codec planes and
-references. A placement manager owned by that subsystem maps those logical
-resources to Seismic-backed physical slots. Callers retain logical identities
-and placement snapshots; they never retain mutable physical bank indices.
+model-state subsystem owns logical histories, recurrent banks, codec components and references.
+Each store has history slabs and bank slabs. A history slab contains fixed-offset regions for every
+history component; a bank slab contains complete recurrent banks. Row numbers identify a slab and
+an offset within it. Every history span lies within one slab. Free space is tracked within each
+slab, and a freed slab index may be reused. Callers retain logical identities and published
+placement snapshots, never mutable physical bank indices.
 
-A relocation is a transaction over a source placement and a destination
-placement. It claims the complete simultaneous source/destination peak, copies
-all affected planes or banks, waits for completion, validates the destination,
-and publishes the new placement atomically. Until publication, the source is
-authoritative. On failure, the destination and claim are discarded and the
-source rows, values, placement and charge remain unchanged. Retired source
-backing is classified as in-flight or pinned until submitted work and external
-views release it.
+Compaction is the single mechanism for moving referenced rows or claimed banks. It plans
+destinations in free space of slabs already held, submits all copies, waits for completion, then
+publishes the placement with a new generation. Until publication, the source is authoritative;
+failure leaves accepted values, placement and charge unchanged. Compaction merges a history's spans
+before its next launch if fragmentation would exceed its per-model span bound. In Reclaim it empties
+the least occupied slabs so they can be freed. Empty slabs are released at once in Reclaim and,
+at idle, beyond one free slab per store. No compaction requires a memory claim.
 
 The memory heap is the sole authority for claims, bands, holding classes and
 release decisions. Seismic is the sole byte and allocation-charge authority.
 The state store does not infer global availability from row counts; retention
-does not own a second byte budget; native resource preclaims enter the same
+owns no byte budget or cached price (it bounds its entry count and names the
+least recently used victim, and the heap observes what dropping it released);
+native resource preclaims enter the same
 heap; and process supervision chooses no release, reacting only to the heap's
 typed unload outcome or to headroom at or below the emergency reserve.

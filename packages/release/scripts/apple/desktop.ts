@@ -79,7 +79,12 @@ export const validateDesktopDistribution = (options: { readonly image: string; r
   yield* appleCommand("/usr/bin/ditto", "-x", "-k", options.updateArchive, extracted)
   // Both distributions must carry the same signed app, including framework symlinks.
   yield* appleCommand("/usr/bin/diff", "-qr", join(mount, "Magnitude.app"), join(extracted, "Magnitude.app"))
-  for (const app of [join(mount, "Magnitude.app"), join(extracted, "Magnitude.app")]) {
+  // A mounted DMG is read-only; the installed app needs a writable sibling for its native lease.
+  const installed = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-dmg-installed-consumer-" })
+  const installedApp = join(installed, "Magnitude.app")
+  yield* appleCommand("/usr/bin/ditto", join(mount, "Magnitude.app"), installedApp)
+  yield* appleCommand("/usr/bin/diff", "-qr", join(mount, "Magnitude.app"), installedApp)
+  for (const app of [installedApp, join(extracted, "Magnitude.app")]) {
     yield* appleCommand("/usr/bin/codesign", "--verify", "--deep", "--strict", "-R", `=${appleRequirement("dev.magnitude.desktop", signing.team)}`, app)
     if (signing.mode === "developer-id") yield* appleCommand("/usr/bin/xcrun", "stapler", "validate", app)
     const version = yield* appleCommand(join(app, "Contents/Resources", ACN_EXECUTABLE_NAME), "version")

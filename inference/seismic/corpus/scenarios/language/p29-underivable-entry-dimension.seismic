@@ -1,0 +1,7 @@
+# origin: C1:p29
+# rejected: "underdetermined"
+fn g[R](x: &tensor[4] f32) -> f32:
+    return x[0] * f32(i32(R))
+
+fn top(x: &tensor[4] f32) -> f32:
+    return g[R = 3](x)

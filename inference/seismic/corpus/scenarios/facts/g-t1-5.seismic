@@ -1,0 +1,15 @@
+# origin: C18:G-T1-5
+# invoke: i32[8]=seq
+# pin: result = i32[]=28
+fn total[N](x: &tensor[N] i32) -> i32:
+    return reduce(x, 0, sum)
+
+fn total[N](x: &tensor[N] i32) -> i32:
+    let mut acc = 0
+    for i in 0..N:
+        acc = acc + x[i]
+    return acc
+
+fn probe(input: &tensor[8] i32) -> i32:
+    let t = to_owned(input)
+    return total(t)

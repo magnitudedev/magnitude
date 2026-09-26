@@ -1,0 +1,5 @@
+# origin: X1:P21
+# invoke: f32[4]=1,2,3,4
+# pin: result = f32[2]=2,3
+fn probe(x: tensor[4] f32) -> tensor[2] f32:
+    return x[1:3]

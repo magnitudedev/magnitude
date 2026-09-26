@@ -8,7 +8,7 @@ on:
         type: string
       model:
         type: string
-        default: 'lfm2.5-2.6b:gguf:q4'
+        default: 'qwen3.5-4b:gguf:q4'
 
 permissions:
   contents: read

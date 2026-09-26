@@ -1,7 +1,10 @@
 ---
 applies_to:
-  - inference-v4/engine/model-executor/src/residency.rs
-  - inference-v4/engine/model-executor/src/resident_weights.rs
+  - inference/engine/executor/src/residency.rs
+  - inference/engine/executor/src/resident_weights.rs
+  - inference/engine/executor/src/planning/weights.rs
+  - inference/engine/kernels/kernels/*/repack_weight.*
+  - inference/seismic/native-cpu/src/repack.rs
 ---
 
 # Device residency
@@ -15,6 +18,14 @@ differ by backend: one map picks the representation from the source format and t
 the execution path and backend (native Metal and Vulkan `rows16`, native CUDA `mma16`, native CPU and planned
 `packet`). Import converts through the weight's `[B, N, K]` view, which keeps every layout's row
 geometry; it never flattens a weight.
+Every import is exact: each resident value equals the source format's reference dequantization
+bit for bit. A source format without a representation of its own imports, through a registered
+Seismic conversion, into an existing representation that holds every value it encodes: Q3_K and
+IQ3_S into `q6k` (f16 super-scale × int8 scale per sixteen values × code in [-32, 31]), IQ4_NL
+into `iq4g32` (the same table). Such a format adds no execution class, so the assessment
+measurement basis, keyed by resident representation, covers it unchanged, and the plan charges
+the wider representation's resident bytes. A format no representation holds exactly is not
+imported; its model is `Incompatible`.
 
 Each import takes an immutable artifact source and validates its exact WeightPlan. On Metal,
 component weights are visited in source-file order. Consecutive whole tensors whose combined

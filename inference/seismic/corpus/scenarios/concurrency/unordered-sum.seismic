@@ -1,0 +1,6 @@
+# origin: C17:unordered_sum
+# cell: reduce-unordered/sl
+# undecided: reassociated
+# invoke: f32[4096]=rand(66)
+fn probe[N](x: &tensor[N] f32) -> f32:
+    return reduce(x, 0, sum, unordered=true)

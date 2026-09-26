@@ -39,7 +39,7 @@ export const makeHardware = (
   accelerators: [{
     acceleratorId: LocalInferenceAcceleratorIdSchema.make("gpu"),
     name: "Test GPU",
-    backend: "CUDA",
+    backend: "cuda",
     memoryDomainId: TEST_MEMORY_DOMAIN_ID,
   }],
   memoryDomains: [{

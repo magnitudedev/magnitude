@@ -1,9 +1,9 @@
 ---
 applies_to:
-  - inference-v4/engine/model-state/**
-  - inference-v4/engine/model-executor/**
-  - inference-v4/engine/generation/**
-  - inference-v4/engine/service/**
+  - inference/engine/state/**
+  - inference/engine/executor/**
+  - inference/engine/generation/**
+  - inference/engine/scheduler/**
 ---
 
 # Numerical state transactions
@@ -13,32 +13,34 @@ successor reservations, device binding views, and proposed extent. The advance c
 validated launch and remain in flight without borrowing a sequence record. Dropping unfinished
 work releases every tentative claim. An explicit abort recovers the unchanged accepted source
 state when the request can continue.
-Recurrent state lives in one arena per component and layer; a bank is an index into those
-arenas, claimed and returned through shared ownership exactly as a separate allocation would be.
+Recurrent state lives in bank slabs; a bank contains one conversation's recurrent-layer state
+and tape. Banks are claimed and returned through shared ownership exactly as separate allocations
+would be.
 An advance names its accepted bank and its successor bank, and the batch carries both per slot, so
 kernels read one row and write another in place. No kernel writes an accepted bank or the zero
 seed; forks and checkpoints share accepted banks by claim, never by copy.
-Attention history rows are one shared arena, and each accepted history is a list of address
-ranges (segments) in logical order; the attention entries bound the segments a row may read.
-Placement keeps that count independent of how requests interleave: an advance first grows its
-sequence in place, into the free rows that begin at its history's end, so rows released by a
-rejected tail or an abort are reused in place. Rows that cannot grow in place (a fresh sequence, a
-fork whose sibling took the rows, a neighbouring history) start at the middle of the largest free
-run, leaving the rows before them as growth room for the history that ends there; a run starting
-at row 0 has no such history and fills from its start. Only a reservation larger than every free
-run splits across runs, largest first. Segment addresses need not ascend in logical order.
-Every history plane is indexed by that same row, with one codec group per (row, kv head) vector:
-a plane is `[rows, kv heads, elements]`. Dense history has one activation plane per vector kind;
-affine history has a code plane and one coefficient plane of (scale, zero) pairs, so placement,
-compaction and conversion treat every codec's planes alike.
-Elastic backing growth is admitted before an advance. Its minimum is the rows
-and successor banks the launch needs, including relayout when fragmentation
-prevents the demanded history from growing contiguously; its preferred grant includes geometric
-headroom and optional relayout. The claim covers the peak Seismic charge,
-including the old and new backing held together during reallocation. If the
-preferred grant cannot fit, the store tries the minimum. A refused minimum
-leaves accepted numerical state intact and returns an explicit memory deficit
-to the request owner for reclamation and retry.
+Attention history rows share history slabs. Each accepted history is an ordered list of spans;
+one span is contiguous within one slab and spans need not ascend in address order. An advance
+first grows its history into free rows after its last row within that slab. Otherwise it continues
+in another free span or a new slab. A fresh history begins within the largest free span, leaving
+room for the history ending before it; a span beginning at row zero fills from its start. A free
+span never crosses a slab boundary. Per-row references preserve shared prefixes and checkpoints.
+The store compacts before a launch that would exceed its span bound, computed for the loaded model
+as `ceil(context limit / rows per slab) + 16`.
+
+Each history slab contains every component at a fixed aligned offset. Dense components hold
+activation values; affine components hold codes and scale/zero coefficients. A row has the same
+slab index and offset in every component, so placement, compaction and conversion move all parts
+of that row together. A slab targets 64 MiB: its row count is rounded down to a multiple of the
+256-row tile, with at least one tile. Bank slabs hold as many complete banks as fit in that target,
+with at least one bank.
+
+Elastic state growth is admitted before an advance. The store claims one required slab through
+the heap before adding it, without replacing or copying existing slabs. A refused claim or slab
+allocation leaves accepted numerical state, published backing, and committed charge unchanged;
+growth that needs both history and bank slabs is one fallible operation. The refusal returns an
+explicit memory deficit to the request owner for reclamation and retry. Empty slabs release their
+measured charge without a new claim.
 Every newly created sequence begins from one immutable, pristine zero recurrent bank. It may share
 that seed with other new sequences; the first and every later advance reserves a distinct writable
 successor. Returned successor banks never become the initial state of another sequence. The zero
@@ -57,16 +59,20 @@ physical reconciliation drops the staged method and grammar without changing the
 
 An interior accepted prefix with recurrent state requires numerical repair before the successor
 can be published or checkpointed. State compaction, copying, and codec conversion follow the same
-submit, complete, finish, reconcile lifecycle. Cancellation, submission failure, device failure,
-and teardown release reservations through ownership.
+submit, complete, finish, reconcile lifecycle. Compaction runs only while the store has no
+transaction, moves rows and banks into free space of slabs already held after submitted writes
+complete, and publishes the rewritten histories and bank placement only after every copy succeeds.
+It merges spans before the span bound is exceeded and empties the least occupied slabs under
+pressure. Accepted state keeps its logical identity throughout. Cancellation, submission failure,
+device failure and teardown release reservations through ownership.
 Preemption releases physical request state while preserving accepted logical tokens. Restoration
 replays only to the numerical position that existed before eviction. An accepted successor that
 has not yet been consumed numerically remains the input for the next ordinary decode; replay must
 not consume it early or advance beyond that numerical boundary.
 
 Codec conversion reserves destination history before submission. One transaction owns both
-stores' sequence claims, all source and destination plane buffers, both recurrent banks, and a
-per-layer key/value mapping between physical codec planes. The mapping names the source and
+stores' sequence claims, their source and destination slabs, both recurrent banks, and a
+per-layer key/value mapping between codec components. The mapping names the source and
 destination codecs and row addresses; it is validated against a fresh destination, compatible
 layer widths and recurrent layout, and the selected stores. Abort returns both unchanged states.
 Commit publishes the destination position and history only after the state program finishes.
@@ -74,9 +80,13 @@ Commit publishes the destination position and history only after the state progr
 ## Acceptance criteria
 
 - No in-flight state transaction borrows sequence storage.
-- Interleaved advances of concurrent sequences add no history segment while a sequence's following
-  rows are free; lock-step serving with speculative tails, completions and admissions keeps every
-  history within two segments even when the arena holds exactly one context per request.
+- Interleaved advances of concurrent sequences add no history span while the following rows in
+  the same slab are free; a span never crosses a slab boundary.
+- Every history fits the loaded model's span bound, including at full context and after a freed
+  slab index is reused.
+- Compaction publishes only after all copies complete, preserves greedy continuation, and needs
+  no new memory claim on any backend.
+- Failed joint history and bank slab growth restores both published backings and their charge.
 - A new sequence observes zero recurrent state even after prior sequences have returned dirty banks.
 - A successor bank is never the zero seed, an accepted bank a live state, checkpoint or fork can
   read, or another in-flight successor.

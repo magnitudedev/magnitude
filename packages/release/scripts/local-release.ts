@@ -12,14 +12,12 @@ import {
 import { ACN_COORDINATION_REVISION } from "@magnitudedev/version"
 import {
   acnArchive,
-  backendPacks,
   cliArchive,
   currentHost,
   hostById,
   type ReleaseHost,
 } from "../src/targets"
 import { buildAcnBinary } from "./build/acn"
-import { buildBackendArtifact } from "./build/backend"
 import { buildCliBinary } from "./build/cli"
 import { buildHostArtifacts } from "./build/host"
 import { buildArchive, run } from "./build/common"
@@ -47,11 +45,9 @@ const VERSION_FILE = resolve(
   "packages/version/src/version.generated.ts",
 )
 
-// Directory name predates the LocalRelease terminology; renaming it would
-// orphan cached ICN builds.
 export const LOCAL_RELEASE_BUILD_ROOT = resolve(
   PROJECT_ROOT,
-  "inference/target/release-bootstrap-test",
+  "inference/target/local-release",
 )
 
 const localReleaseFailure = (message: string) => new LocalReleaseError({ message })
@@ -182,11 +178,7 @@ const packageRuntimeArtifacts = (
           id: `cli-${host.id}`,
           kind: "cli",
           host: Option.some(host.id),
-          backend: Option.none(),
-          requiredBaseId: Option.none(),
           nativeBuild: Option.none(),
-          backendModuleAbi: Option.none(),
-          compatibility: Option.none(),
         }, [{
           path: `bin/magnitude-cli${host.executableExtension}`,
           source: binaries.cli,
@@ -200,11 +192,7 @@ const packageRuntimeArtifacts = (
           id: `acn-${host.id}`,
           kind: "acn",
           host: Option.some(host.id),
-          backend: Option.none(),
-          requiredBaseId: Option.none(),
           nativeBuild: Option.none(),
-          backendModuleAbi: Option.none(),
-          compatibility: Option.none(),
         }, [{
           path: `bin/${ACN_EXECUTABLE_NAME}${host.executableExtension}`,
           source: binaries.acn,
@@ -240,62 +228,29 @@ export const buildLocalRelease: Effect.Effect<
   const host = currentHost()
   const root = resolve(LOCAL_RELEASE_BUILD_ROOT, host)
   const hostRoot = resolve(root, "host")
-  const packs = backendPacks.filter(
-    (pack) => pack.host === host && pack.backend === "metal",
-  )
 
   yield* Console.log("Building model planner inputs")
-  yield* runRepoCommand("bun", "run", "icn:catalog:build-bundle")
+  yield* runRepoCommand("bun", "run", "--cwd", "inference", "catalog:build-bundle")
 
-  yield* Console.log(`Building ${host} CLI, ACN, and ICN release artifacts`)
+  yield* Console.log(`Building ${host} CLI, ACN, and inference release artifacts`)
   yield* localReleaseBuildStep(
     `unable to build ${host} release artifacts`,
     () => buildHostArtifacts(host, CATALOG_ROOT, hostRoot),
   )
 
-  for (const pack of packs) {
-    const packRoot = resolve(root, pack.id)
-    yield* Console.log(`Building ${pack.id} release artifact`)
-    yield* localReleaseBuildStep(
-      `unable to build ${pack.id}`,
-      () => buildBackendArtifact(pack.id, packRoot),
-    )
-  }
-
-  const artifactRoots = [
-    hostRoot,
-    ...packs.map((pack) => resolve(root, pack.id)),
-  ]
-  const descriptors = (
-    yield* Effect.forEach(artifactRoots, (artifactRoot) =>
-      fs.readDirectory(artifactRoot).pipe(
-        Effect.map((entries) =>
-          entries
-            .filter((entry) => entry.endsWith(".artifact.json"))
-            .map((entry) => resolve(artifactRoot, entry))
-        ),
-        Effect.mapError((cause) =>
-          localReleaseFailure(`unable to inspect ${artifactRoot}: ${String(cause)}`)
-        ),
-      )
-    )
-  ).flat()
+  const descriptors = yield* fs.readDirectory(hostRoot).pipe(
+    Effect.map((entries) =>
+      entries
+        .filter((entry) => entry.endsWith(".artifact.json"))
+        .map((entry) => resolve(hostRoot, entry))
+    ),
+    Effect.mapError((cause) =>
+      localReleaseFailure(`unable to inspect ${hostRoot}: ${String(cause)}`)
+    ),
+  )
   const artifacts = yield* Effect.forEach(descriptors, readArtifact)
-  const byId = new Map(artifacts.map((artifact) => [artifact.id, artifact]))
-  const base = byId.get(`icn-base-${host}`)
-  if (!base) return yield* localReleaseFailure(`local release has no ICN base for ${host}`)
-  for (const pack of artifacts.filter(
-    (artifact) => artifact.kind === "icn-backend",
-  )) {
-    if (
-      Option.getOrUndefined(pack.requiredBaseId) !== base.id ||
-      Option.getOrUndefined(pack.nativeBuild) !==
-        Option.getOrUndefined(base.nativeBuild) ||
-      Option.getOrUndefined(pack.backendModuleAbi) !==
-        Option.getOrUndefined(base.backendModuleAbi)
-    ) {
-      return yield* localReleaseFailure(`${pack.id} is incompatible with ${base.id}`)
-    }
+  if (!artifacts.some((artifact) => artifact.id === `icn-base-${host}`)) {
+    return yield* localReleaseFailure(`local release has no inference artifact for ${host}`)
   }
 
   const version = yield* readPackageVersion
@@ -324,13 +279,7 @@ export const buildLocalRelease: Effect.Effect<
     ["magnitude-release.json", manifestPath],
   ])
   for (const artifact of artifacts) {
-    const artifactRoot = artifactRoots.find((root) =>
-      descriptors.includes(resolve(root, `${artifact.id}.artifact.json`))
-    )
-    if (!artifactRoot) {
-      return yield* localReleaseFailure(`unable to locate ${artifact.id}`)
-    }
-    files.set(artifact.filename, resolve(artifactRoot, artifact.filename))
+    files.set(artifact.filename, resolve(hostRoot, artifact.filename))
   }
   return { version, files } satisfies LocalRelease
 })
@@ -359,25 +308,18 @@ export const loadLocalRelease: Effect.Effect<
     ["magnitude-release.json", manifestPath],
   ])
   for (const artifact of manifest.artifacts) {
-    const locations = [
-      resolve(root, "host", artifact.filename),
-      ...backendPacks
-        .filter((pack) => pack.host === host)
-        .map((pack) => resolve(root, pack.id, artifact.filename)),
-    ]
-    const existing = yield* Effect.findFirst(locations, (location) =>
-      fs.exists(location)
-    ).pipe(
+    const location = resolve(root, "host", artifact.filename)
+    const exists = yield* fs.exists(location).pipe(
       Effect.mapError((cause) =>
         localReleaseFailure(`unable to inspect local release files: ${String(cause)}`)
       ),
     )
-    if (Option.isNone(existing)) {
+    if (!exists) {
       return yield* localReleaseFailure(
         `cached local release is missing ${artifact.filename}`,
       )
     }
-    files.set(artifact.filename, existing.value)
+    files.set(artifact.filename, location)
   }
   return { version, files } satisfies LocalRelease
 })
@@ -451,7 +393,7 @@ const withStampedVersion = <A, E, R>(
 /**
  * Derives a local release at a different version from a base local release: rebuilds
  * only the version-stamped CLI and ACN binaries, and references the base's
- * version-agnostic artifacts (ICN base, backend packs) unchanged.
+ * version-agnostic inference artifact unchanged.
  */
 export const deriveLocalRelease = (
   base: LocalRelease,

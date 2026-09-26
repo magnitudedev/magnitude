@@ -1,0 +1,10 @@
+# origin: C13:p33
+# rejected: "parameter names differ"
+fn diff(a: i32, b: i32) -> i32:
+    return a - b
+
+fn diff(b: i32, a: i32) -> i32:
+    return a - b
+
+fn probe(x: i32, y: i32) -> i32:
+    return diff(a=x, b=y)

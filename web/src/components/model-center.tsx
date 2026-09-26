@@ -45,6 +45,7 @@ import {
 } from "@phosphor-icons/react"
 import {
   deriveHardwareMemoryView,
+  formatLocalInferenceBackend,
   formatLocalModelDisplayName,
   localModelRadarAxes,
   localModelIsInstalled,
@@ -1036,7 +1037,7 @@ function HardwareView(): ReactNode {
                     <div>
                       <dt>Required memory</dt>
                       <dd>
-                        {formatBytes(preview.value.requiredSystemMemoryBytes)}
+                        {formatBytes(preview.value.requiredMemoryBytes)}
                       </dd>
                     </div>
                     <div>
@@ -1046,8 +1047,8 @@ function HardwareView(): ReactNode {
                       </dd>
                     </div>
                     <div>
-                      <dt>Parallel</dt>
-                      <dd>{preview.value.parallelSequences}</dd>
+                      <dt>Device</dt>
+                      <dd>{formatLocalInferenceBackend(preview.value.device.backend)}</dd>
                     </div>
                   </dl>
                 )}
@@ -1195,7 +1196,7 @@ function HardwareView(): ReactNode {
                     <CpuIcon size={17} aria-hidden="true" />
                     <div>
                       <strong>{accelerator.name}</strong>
-                      <span>{accelerator.backend}</span>
+                      <span>{formatLocalInferenceBackend(accelerator.backend)}</span>
                     </div>
                     <span>Local inference</span>
                   </article>

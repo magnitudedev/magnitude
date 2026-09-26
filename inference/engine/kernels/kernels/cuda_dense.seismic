@@ -1,0 +1,84 @@
+# CUDA implementations of the dense feed-forward entries (K1 projection
+# family, `cuda/common/projection.cuh`) over the O `out_rows` rows.
+#
+# Every K1 CUDA entry runs the GEMV to 16 rows and the GEMM beyond, in two row
+# bands. The GEMV is the 16-bit path (the A-rounded activation in bf16/f16
+# MMAs against exact codes, rows independent of O, so each row matches O = 1
+# bit for bit): `gemv` to 8 rows, `gemv16` (two 8-row column blocks) from 9 to
+# 16; 8 warps per block in groups of KSPLIT that split K and reduce in part
+# order. The small-band GEMM (`gemm_small`, 17 to 64 rows: 64-row block tiles,
+# 3 cp.async stages) has two operand paths: the 16-bit path (weights
+# dequantized to A) and the INT8 candidate (arithmetic INT8 = 1: activations
+# quantized per 32 codes as q8_1 does, s8 MMAs); the tuner keeps INT8 only
+# where it is faster within tolerance. The large-band GEMM (`gemm`, beyond 64
+# rows: 128-row block tiles, 2 stages) is the 16-bit path. Entries with few
+# output columns split either band over K up to 128 rows (grid z: 2 shares of
+# partials that `finalize` sums in part order). Measured on GB10 (17 to 512
+# rows, both paths, split 1/2/4, tiles 32/64/128): up to 64 rows want the
+# 64-row tiles, beyond them the 128-row ones, the few-column entries the split
+# up to 128 rows. Staging launches form the rows a launch does not read in
+# place: `stage` a normalized input's A rows (at O = 1 the GEMV block forms
+# its row in its shared memory instead), `stage_s8` the INT8 candidate's q8_1
+# rows plus (d, d * sum q) groups.
+
+native dense_expand for cuda from "cuda/dense_expand.cu":
+    static (H, F)
+    params (code arithmetic INT8 in [0, 1])
+    where H % 64 == 0
+    scratch staged bytes (O * H * 2) when O > 1
+    scratch groups bytes (O * H / 4) when INT8 == 1 and O > 16 and O <= 64
+    launch dense_expand_stage when O > 1 and (O <= 16 or O > 64 or INT8 == 0):
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch dense_expand_stage_s8 when INT8 == 1 and O > 16 and O <= 64:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch dense_expand_gemv when O <= 8:
+        params (code arithmetic KSPLIT in [4, 2, 8])
+        threadgroups (ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((1 - min(1, O - 1)) * H * 2)
+    launch dense_expand_gemv16 when O > 8 and O <= 16:
+        params (code arithmetic KSPLIT in [4, 2, 8])
+        threadgroups (ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch dense_expand_gemm_small when O > 16 and O <= 64:
+        reads (INT8)
+        threadgroups (ceil_div(ceil_div(F, 16), 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (3 * (64 * 144 + 2 * 10240) + 2 * 2048)
+    launch dense_expand_gemm when O > 64:
+        threadgroups (ceil_div(ceil_div(F, 16), 8), ceil_div(O, 128), 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (2 * (128 * 144 + 2 * 10240) + 2 * 2048)
+
+native dense_output for cuda from "cuda/dense_output.cu":
+    static (H, F)
+    params (code arithmetic INT8 in [0, 1])
+    where F % 64 == 0
+    scratch staged bytes (O * F) when INT8 == 1 and O > 16 and O <= 64
+    scratch groups bytes (O * F / 4) when INT8 == 1 and O > 16 and O <= 64
+    scratch partials bytes (2 * O * H * 4) when O > 16 and O <= 128
+    launch dense_output_stage_s8 when INT8 == 1 and O > 16 and O <= 64:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch dense_output_gemv when O <= 8:
+        params (code arithmetic KSPLIT in [4, 2, 8])
+        threadgroups (ceil_div(ceil_div(H, 16), 8 / KSPLIT), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch dense_output_gemv16 when O > 8 and O <= 16:
+        params (code arithmetic KSPLIT in [4, 2, 8])
+        threadgroups (ceil_div(ceil_div(H, 16), 8 / KSPLIT), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch dense_output_gemm_small when O > 16 and O <= 64:
+        reads (INT8)
+        threadgroups (ceil_div(ceil_div(H, 16), 8), 1, 1 + min(1, 128 / O))
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (3 * (64 * 144 + 10240) + 2048)
+    launch dense_output_gemm when O > 64:
+        threadgroups (ceil_div(ceil_div(H, 16), 8), ceil_div(O, 128), 1 + min(1, 128 / O))
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (2 * (128 * 144 + 10240) + 2048)
+    launch dense_output_finalize when O > 16 and O <= 128:
+        threadgroups (ceil_div(O * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)

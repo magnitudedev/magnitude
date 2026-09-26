@@ -1,7 +1,8 @@
 ---
 applies_to:
-  - inference/crates/icn-api/**
-  - inference/crates/icn-server/**
+  - inference/service/api/**
+  - inference/service/server/src/residency/**
+  - inference/service/server/src/main.rs
   - packages/icn-protocol/**
   - packages/acn/src/service-lifecycle.ts
   - packages/acn/src/server.ts

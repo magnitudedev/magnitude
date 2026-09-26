@@ -20,7 +20,7 @@ Runtime acquisition installs only artifacts selected from the version's release 
 - The installed desktop application bundles and owns its matching ACN executable. CLI and harness
   demand locate that application; they do not acquire a standalone daemon. Desktop distribution
   validates the application signature and publisher before installation.
-- The ICN lifecycle acquires the ICN base and optional backend pack and composes their installation.
+- The ICN lifecycle acquires the host's one inference artifact and declares its installation.
 
 These responsibilities do not overlap.
 
@@ -37,11 +37,14 @@ These responsibilities do not overlap.
 - A valid cached installation remains usable offline. A missing or invalid installation that cannot
   be repaired fails explicitly.
 
-## Backend composition
+## Inference installation
 
-Apple arm64 selects Metal. Linux and Windows consider compatible CUDA, then compatible Vulkan, then CPU only
-when successful capability probes show that no supported accelerator is usable.
+Each host's release has exactly one inference artifact with every backend of that host. The size
+of an inference installation is therefore known exactly before download. Acquisition performs no
+pack selection, composition, or capability probe: the installed service selects its device at
+runtime from Seismic discovery.
 
-Authentication, acquisition, capability probing, ABI validation, module loading, and device
-registration are operational failures. They do not silently become CPU fallback. A selected pack
-must name the installed base and match its native-build identity and backend-module ABI.
+An installation is complete only when its executable, planner inputs and (on Linux and Windows)
+NVRTC are present. Its executable's `nativeBuild` identity must match the release record before the
+installation is declared; the declaration records only that identity. Acquisition, identity
+verification and declaration failures are operational failures.

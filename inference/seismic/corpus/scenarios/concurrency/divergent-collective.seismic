@@ -1,0 +1,13 @@
+# origin: C17:simd_backend_fn_divergent C17:lane_divergent
+# cell: intrinsic-subgroup-divergent/parallel
+# rejected: "Placement"
+fn lane_divergent[N](x: &tensor[N] f32, out: &mut tensor[N] f32):
+    parallel for i in 0..N:
+        out[i] = x[i]
+
+lower lane_divergent[N](x: &tensor[N] f32, out: &mut tensor[N] f32) for metal requires metal.subgroup:
+    parallel for i in 0..N:
+        if x[i] > 0.0:
+            out[i] = metal.subgroup.simd_max(x[i])
+        else:
+            out[i] = x[i]

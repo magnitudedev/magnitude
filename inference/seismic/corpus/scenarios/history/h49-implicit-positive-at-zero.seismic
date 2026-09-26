@@ -1,0 +1,6 @@
+# origin: H-49
+# invoke: f32[0]=zero
+# expect: invalid-invocation
+# invoke: f32[3]=seq
+fn probe[N](x: &tensor[N] f32) -> f32:
+    return x[0]

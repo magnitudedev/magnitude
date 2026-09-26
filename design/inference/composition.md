@@ -1,94 +1,82 @@
 ---
 applies_to:
-  - inference-v2/src/magnitude_engine/**
-  - inference-v2/tests/composition/**
-  - inference-v2/tests/worker/**
+  - inference/engine/src/composition.rs
+  - inference/engine/src/host.rs
+  - inference/engine/src/families.rs
+  - inference/engine/src/options.rs
+  - inference/engine/src/preview.rs
+  - inference/engine/src/worker/**
+  - inference/engine/families/contracts/**
+  - inference/service/server/src/worker_process.rs
+  - inference/service/server/src/residency/worker.rs
 ---
 
 # Inference composition
 
-An engine coordinates requests; a model executor advances model state. Even with
-one loaded target, these are separate responsibilities. Components receive their
-dependencies explicitly rather than looking up the containing engine.
+The engine is a library. Its root crate binds the common engine crates (artifacts, families,
+state, batching, kernels and executor, generation, scheduler, templates and chat) into one facade;
+Seismic sits below it and is the only device and byte authority. Serving (`engine/serving`) and
+the engine CLI depend on the engine; the engine depends on neither, and has no HTTP dependency.
 
 ```text
-Host: artifact acquisition, typed engine blueprint, worker client, HTTP rendering
-                       │ graph + requests / bounded results
-Worker: construction scope
-  Engine
-    Scheduler                  admission and bounded service
-    Memory budget / pressure   capacity and reclamation
-    Prefix index / retention   matching complete generation checkpoints
-    Generation
-      Target executor
-        Program                architecture and neural computation
-        State store            transactional KV and recurrent state
-        Execution owner        device completion and resource lifetime
-      Generation method        plain or proposal / verify / accept
-        Drafter executor       program and state, when required by the method
+Host process: package interpretation, chat semantics, protocol framing, worker supervision
+                       │ immutable, device-free values over the worker protocol
+Worker: one loaded model
+  Execution owner          device, weights, numerical state and release policy
+  Scheduler                admission, batching, time-shared prefill and decode, retention
+  Generation               plain or proposal / verify / accept, sampling, constraint masks
+    Executor               family program over state storage on one Seismic device
 ```
 
-## Construction and binding
+## Construction
 
-Blueprints are immutable, statically typed dependency declarations. Each concrete
-declaration uses `@component` and one lazy `implementation()` binding to its live
-contract. Declarations and implementations live together in their owning domain;
-the public blueprint namespace is a backend-free facade. There is no codegen,
-separate registration, import-order initialization, or per-component version.
+Construction is one staged progression:
 
-The serialized graph preserves shared node identity. Its bounded codec accepts
-declared scalar values, tuples and blueprint references, rejects invalid or cyclic
-graphs, and resolves only catalogued declarations. Saved graphs require matching
-source/runtime code; arbitrary implementation imports and compatibility shims are
-not part of the wire contract.
+```text
+EngineConfiguration -> resolve -> ResolvedEngineConfiguration { host, manifest }
+                    -> preview (read-only planning)   or   load -> ReadyEngine
+```
 
-The worker validates the complete constructor wiring before acquiring resources.
-It constructs dependencies once per graph identity and closes owned components
-once, in reverse dependency order. Constructors unwind their own partial failures.
-Both primary and cleanup failures remain visible.
+- **Resolve** is device-free. It opens the package, recognizes its family, interprets the model
+  definition and input adapter, and resolves the model policy and served context. Nothing opens a
+  device or imports a tensor.
+- **Host artifacts** own chat semantics: tokenizer, templates and their inspection, input adapter
+  and media placeholder policy. They stay on the host.
+- **The execution manifest** is owned and serializable; it is the only value a worker needs.
+- **Preview** plans against current devices without opening or allocating anything.
+- **Load** runs the same worker either in-process over a channel transport (engine CLI, tests) or
+  in a worker process over framed standard streams (the service). The worker protocol and the
+  worker code are identical in both cases.
+- **Readiness** binds host artifacts to the connected worker only when the worker loaded exactly
+  the package the host resolved, with the same template fingerprint and input modalities; any
+  mismatch is a typed failure, never a partial engine.
 
-An executor blueprint pairs a program source with a compatible state factory.
-Binding that pair to model resources loads weights, derives artifact geometry and
-produces the live executor. Host declarations contain neither device objects nor
-mutable request state. The automatic artifact composition uses a resident upstream
-program and native state; custom computation, streaming and drafting are explicit
-component substitutions, never execution-level flags. Upstream architecture reuse
-does not imply that every cache, media or batching capability is qualified.
+## Families
 
-## Runtime boundaries
+Model families are registered once. Recognition runs over every registered family and exactly one
+must claim a package; no match or several matches is a typed unsupported-family outcome. A family
+supplies recognition, model-definition construction, its input adapter and media placeholder
+policy, and its program inputs. Everything downstream (planning, scheduling, generation, serving
+and assessment) consumes the model definition and the adapter contract only, so adding or
+replacing a family (including a compiled-program family) changes nothing outside the engine.
 
-The engine owns scheduling and prefix policy. Executors receive a budget and an
-execution owner, not access to the scheduler or prefix index. Prefix entries hold
-opaque complete generation checkpoints, including any drafter alignment obligation.
-Physical KV placement, page mappings and recurrent images belong to state storage.
-Slab allocation is a storage choice; attention computation consumes a compatible
-view without becoming an admission or retention policy.
+## Host/worker boundary
 
-Native cache reservations distinguish retained history from the extra window needed
-by a multi-token forward. Admission reserves retained capacity through the requested
-context; transaction preparation covers query extensions and replacement peaks before
-execution. A sliding window does not grow with the entire history, but a query can
-temporarily require more than one window. A stable reservation size does not imply
-in-place execution: replacement accounting also follows the physical cache buffers.
+Only immutable, device-free values cross the worker boundary: the manifest, prepared inputs,
+generation options, a serializable constraint description and bounded output. Live tokenizers,
+parsers and device objects never cross. Every request ends in exactly one terminal outcome; end of
+stream before it is a worker failure, and partially streamed output is never replayed on another
+worker. Typed engine errors keep their cause and retry meaning across the boundary.
 
-Architecture programs compose their embedding, attention/recurrent mixing and
-feed-forward dependencies. Resident or streamed weight implementations retain
-their I/O, scratch and consumer-lifetime complexity behind those contracts.
-Replacing a component must preserve its outputs, state effects and device-lifetime
-guarantees; unsupported combinations fail during binding rather than adding engine
-branches.
-
-The generation method owns the target–drafter relationship: features, proposals,
-acceptance, repair and linked checkpoints. The scheduler sees bounded service and
-resource feedback. [Scheduling](engine/scheduler.md) and
-[speculative generation](engine/speculative-generation.md) define those contracts.
-The host owns [serving](serving.md), process supervision and bounded transport;
-the worker alone owns the live engine and neural resources.
+The service owns process spawn, framing, bounded queues, parent-death containment and crash
+handling. The engine owns the protocol values and their encoding, versioned with the engine build.
+[Serving](serving.md) defines the protocol library above this boundary;
+[scheduling](engine/scheduler.md) and [speculative generation](engine/speculative-generation.md)
+define the worker's service contracts.
 
 ## Qualification
 
-Tests must cover backend-free declaration imports, shared identity after graph
-round-trip, whole-graph preflight, partial-construction cleanup and observed worker
-disposal. Component substitution must preserve state and lifetime contracts.
-Performance qualification uses the [benchmark hierarchy](benchmarking.md), not
-construction success or a model's architecture name.
+Tests cover device-free resolution, unique family recognition, preview without allocation,
+identical in-process and worker-process behavior, readiness mismatch rejection, one terminal
+outcome per request, and worker loss without stranded work. Performance qualification uses the
+[benchmark hierarchy](benchmarking.md), not construction success or an architecture name.

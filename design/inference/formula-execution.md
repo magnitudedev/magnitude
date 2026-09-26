@@ -1,22 +1,12 @@
 ---
 applies_to:
-  - inference-v3/formula-performance/**
-  - inference-v3/roofline/**
-  - inference-v3/src/ops/**
-  - inference-v3/src/engine/**
-  - inference-v3/performance/**
-  - inference-v3/src/session_bench/**
-  - inference-v3/tests/session_bench/**
-  - inference-v3/tests/ops/**
-  - inference-v3/tests/models/**
-  - inference-v3/tests/platform/**
-  - inference-v3/tilelang/tilelang/metal/transform/**
-  - inference-v3/tilelang/src/backend/common/codegen/codegen_c_host.cc
-  - inference-v3/tilelang/3rdparty/tvm/src/runtime/metal/metal_module.mm
-  - inference-v3/tilelang/testing/python/metal/test_metal_submission_regions.py
+  - inference/validation/v3_*.py
+  - inference/validation/reference_source.py
 ---
 
 # Formula-defined execution and measurement
+
+Historical V3 design, retained for provenance. It does not govern the Seismic engine.
 
 ## Purpose
 

@@ -1,0 +1,8 @@
+# origin: X1:r2-c01
+# rejected: "does not permit exclusive writes"
+fn probe[R](x: &tensor[R, 4] f32, out: &mut tensor[R] f32):
+    parallel for r in 0..R:
+        let mut y = x[r]
+        for i in 0..2:
+            y = y * 2.0
+        out[r] = y[0] + y[3]

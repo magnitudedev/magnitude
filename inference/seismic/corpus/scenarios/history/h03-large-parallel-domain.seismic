@@ -1,0 +1,6 @@
+# origin: H-3
+# general-launches-at-most: 1
+# invoke: f32[70000]=rand(1) ; f32[70000]=zero
+fn probe[N](x: &tensor[N] f32, y: &mut tensor[N] f32):
+    parallel for i in 0..N:
+        y[i] = x[i] * 2.0

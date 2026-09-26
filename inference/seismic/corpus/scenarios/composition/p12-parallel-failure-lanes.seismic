@@ -1,0 +1,10 @@
+# origin: X1:P12
+# invoke: i32[4]=zero ; i32[4]=2,0,4,0
+# expect: failed
+# invoke: i32[4]=zero ; i32[4]=1,2,3,4
+# expect: returned
+# pin: out = i32[4]=20,10,6,5
+fn probe(out: &mut tensor[4] i32, input: &tensor[4] i32):
+    parallel for i in 0..4:
+        out[i] = 7
+        out[i] = 20 / input[i]

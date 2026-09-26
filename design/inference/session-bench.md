@@ -1,11 +1,6 @@
 ---
 applies_to:
-  - inference-v2/src/session_bench/**
-  - inference-v2/tests/session_bench/**
-  - inference-v2/pyproject.toml
-  - inference-v2/session-bench.md
-  - inference-v2/session-bench-runtimes/**
-  - inference-v4/validation/v4_sessionbench.py
+  - inference/benchmarks/**
 ---
 
 # Session bench
@@ -13,16 +8,20 @@ applies_to:
 Session bench is development tooling that measures inference serving using simulated agent sessions.
 It is not an agent evaluator, the official BFCL leaderboard, or the application's ICN lifecycle.
 It calls disposable serving processes directly and does not change first-party product ownership.
-The Python source lives under inference-v2/src/session_bench and the command is session-bench.
+It is one self-contained Python project under inference/benchmarks, with its fixtures, engine
+adapters and host evidence; the command is session-bench. It imports no inference engine
+implementation.
 
 ## Selection and identity
 
 Commands select models, engines, sections, context targets and optional repetitions. No experiment
-files are authored or loaded. Model aliases live exclusively in inference-v2/models.local.json,
+files are authored or loaded. Model aliases live exclusively in inference/benchmarks/models.local.json,
 gitignored and resolved relative to that file. Aliases map MLX/GGUF representations to local paths
 or pinned Hub references. No home-directory alias configuration or checked-in model registry exists.
-Magnitude means the Python engine; upstream llama.cpp, MLX-VLM and oMLX are comparison engines.
-The old Magnitude llama.cpp/ICN engine is not a target. Engine source directory names are not public IDs.
+Magnitude means the native engine binary serving a GGUF; upstream llama.cpp, MLX-VLM and oMLX are
+comparison engines. The old llama.cpp/ICN engine and the Python engines are not targets. Engine
+source directory names are not public IDs. The native engine's binary, device, kernel cache and
+generation method are explicit selections recorded in the reproduction command.
 
 ## Work and measurement
 
@@ -40,7 +39,8 @@ history sharing from actual retained-prefix reuse. No retention claim follows fr
 Tool requests have a fixed 32,768 completion-token allowance, prose 256 and retrieval 1,024, with no
 CLI or environment override. Engine capacity must cover rendered inputs plus that full allowance within model limits.
 Shared capacity rounds up to 256-token allocation boundaries.
-Preparation tokenization is capacity evidence, never measured token evidence. Length termination is
+Preparation tokenization is capacity evidence, never measured token evidence. It uses the target's
+own counting or rendering interface, never another engine's tokenizer. Length termination is
 truncation for tools and retrieval, including parseable partial answers. Prose may terminate normally
 at its full output budget; ending for length before that budget is truncation.
 Sampling is greedy, seed 42 where supported, and model-selected thinking is disabled.
@@ -52,6 +52,9 @@ An adapter that can configure serving context must set it to the context of the 
 require readiness to report that exact value. Host-only fixture and prompt counting may inspect larger
 rendered inputs within artifact capability without causing the numerical engine to allocate the
 artifact's maximum context.
+Optional watchdog bounds on time without progress (request start or finish, streamed events, engine
+output) and on each request's elapsed time retire the engine and fail the run with the exceeded
+bound; they are recorded in the reproduction command.
 Only one benchmark owns the machine's managed benchmark process lifetime at once. Targets run
 sequentially, with balanced fresh-process passes and cache-disjoint warmup. Within a target, requests
 follow the declared dependency graph and release schedule. Prefix policy is recorded and verified;
@@ -72,7 +75,7 @@ slower neural execution. Use fixed-work component/engine controls from the
 
 ## Persistence and lifecycle
 
-Each measured invocation creates inference-v2/runs/session-bench/<UTC-id>/ before preparation. It saves
+Each measured invocation creates inference/benchmarks/runs/session-bench/<UTC-id>/ before preparation. It saves
 the public invocation and a shell-quoted reproduction command expanded to immutable engine/artifact
 pairs. Reproduction does not read old result schemas or depend on aliases; local paths still require
 the recorded bytes, and exact historical reproduction requires recorded code/dependencies/hardware.
@@ -102,8 +105,8 @@ never enter performance summaries. Warmup and qualification are separate from me
 
 Tests demonstrate deterministic shared sessions, local alias resolution, alias-independent saved
 commands, immutable output policy, input-plus-output capacity checks, fragmented SSE handling,
-terminal consistency, non-greedy semantic matching, cancellation cleanup and persistent partial
-results. Retrieval tests additionally demonstrate reversible resizing, stable facts, depth control,
+terminal consistency, non-greedy semantic matching, cancellation cleanup, watchdog retirement and
+persistent partial results. Retrieval tests additionally demonstrate reversible resizing, stable facts, depth control,
 strict answer matching, no answer leakage and failure-inclusive accuracy denominators.
 Adapter integration is qualified against the actual serving interface, not an invented
 benchmark-only inference implementation. Unsupported capabilities fail explicitly.

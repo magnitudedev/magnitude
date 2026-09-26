@@ -2,12 +2,22 @@ import { Option } from "effect"
 import {
   formatModelDisplayName,
   localModelServingState,
+  type LocalInferenceBackend,
   type LocalModel,
   type ModelVariantLabel,
   type SpeculativeMethod,
 } from "@magnitudedev/sdk"
 
 export { formatModelDisplayName }
+
+export const formatLocalInferenceBackend = (backend: LocalInferenceBackend): string => {
+  switch (backend) {
+    case "cpu": return "CPU"
+    case "metal": return "Metal"
+    case "cuda": return "CUDA"
+    case "vulkan": return "Vulkan"
+  }
+}
 
 export const formatLocalModelDisplayName = (
   model: { readonly presentation: { readonly displayName: string; readonly variantLabel: ModelVariantLabel } },

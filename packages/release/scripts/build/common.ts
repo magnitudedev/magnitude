@@ -115,15 +115,18 @@ export const verifyAppleDeploymentTarget = async (
 
 export interface OwnedLoaderPathInputs {
   readonly host: HostId
-  readonly executable?: string
-  readonly modules: readonly string[]
+  readonly executable: string
   readonly runtime: readonly string[]
 }
 
+/**
+ * Linux executables resolve owned libraries from exactly `$ORIGIN/../runtime`; Apple executables
+ * own no libraries and carry no rpath. Redistributed runtime libraries may carry no rpath, or one
+ * that addresses only this installation's runtime directory.
+ */
 export const verifyOwnedLoaderPaths = async ({
   host,
   executable,
-  modules,
   runtime,
 }: OwnedLoaderPathInputs): Promise<void> => {
   if (host.startsWith("windows-")) return
@@ -143,7 +146,7 @@ export const verifyOwnedLoaderPaths = async ({
 
   const expectedExecutable = host.startsWith("linux-")
     ? ["$ORIGIN/../runtime"]
-    : ["@loader_path/../runtime"]
+    : []
   const expectedLibrary = host.startsWith("linux-")
     ? ["$ORIGIN", "$ORIGIN/../runtime"]
     : ["@loader_path", "@loader_path/../runtime"]
@@ -166,14 +169,7 @@ export const verifyOwnedLoaderPaths = async ({
     }
   }
 
-  if (executable !== undefined) {
-    await verify(executable, expectedExecutable, true)
-  }
-  await Promise.all(
-    modules.map((module) => verify(module, expectedLibrary, true)),
-  )
-  // Vendor runtime libraries may need no rpath. If present, it may only
-  // address this installation's runtime directory.
+  await verify(executable, expectedExecutable, true)
   await Promise.all(
     runtime.map((library) => verify(library, expectedLibrary, false)),
   )

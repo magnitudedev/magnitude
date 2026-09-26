@@ -1,0 +1,13 @@
+# origin: X1:P13
+# invoke: i32[1]=0 ; f32[4]=1,2,3,4 ; f32[1]=zero ; index:1099511627775
+# expect: failed
+# pin: out = f32[1]=0
+# invoke: i32[1]=2 ; f32[4]=1,2,3,4 ; f32[1]=zero ; index:3
+# expect: returned
+# pin: out = f32[1]=2
+# pin: result = f32[]=1
+fn probe(idx: &tensor[1] i32, x: &tensor[4] f32, out: &mut tensor[1] f32, n: index[1099511627776]) -> f32:
+    out[0] = x[idx[0] - 1]
+    let mut t = tensor[n + 1] f32
+    t[0] = 1.0
+    return t[0]

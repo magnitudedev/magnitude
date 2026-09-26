@@ -1,0 +1,4 @@
+# origin: C11:r2_reduce_full_slice
+# invoke: f32[2,3]=1,5,3,4,2,6
+fn probe(x: &tensor[2,3] f32) -> i32:
+    return reduce(x[0, :], 0, argmax)

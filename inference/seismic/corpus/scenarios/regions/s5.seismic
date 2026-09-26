@@ -1,0 +1,6 @@
+# origin: C14:s5
+# rejected: "may exceed its axis extent"
+fn probe[N](x: &mut tensor[N] f32) -> f32:
+    let v = x[0:2]
+    x[0] = 5.0
+    return reduce(v, 0, sum)

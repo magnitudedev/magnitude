@@ -1,0 +1,4 @@
+# origin: test:validation:programs/scalar-semantics.seismic:bounded_index
+# invoke bounded_index: f32[4]=1,2,3,4 ; index:2
+fn bounded_index(x: &tensor[4] f32, pos: index[4]) -> tensor[1] f32:
+    return to_owned(x[pos:pos + 1])

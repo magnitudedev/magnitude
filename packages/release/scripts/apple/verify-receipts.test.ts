@@ -6,7 +6,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
 import { verifyAppleReceipts } from "./verify-receipts"
-import { backendPacks, releaseHosts } from "../../src/targets"
+import { releaseHosts } from "../../src/targets"
 const commit = "a".repeat(40), team = "ABCDEFGHIJ"
 let root: string
 const run = () => Effect.runPromise(verifyAppleReceipts(root).pipe(Effect.withConfigProvider(ConfigProvider.fromMap(new Map([["MAGNITUDE_SOURCE_COMMIT", commit], ["APPLE_TEAM_ID", team]]))), Effect.provide(BunContext.layer)))
@@ -14,10 +14,7 @@ const write = (path: string, value: unknown) => writeFile(path, JSON.stringify(v
 const notary = (unit: string) => ({ id: `accepted-${unit}`, unit, status: "Accepted", inputSha256: "b".repeat(64) })
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "magnitude-apple-receipts-"))
-  const groups = [
-    ...releaseHosts.filter((host) => host.id.startsWith("darwin-")).map((host) => ({ directory: host.id, host: host.id, ids: [...["cli", "acn", "icn-base", "desktop"].map((kind) => ({ id: `${kind}-${host.id}`, kind })), { id: `desktop-update-${host.id}`, kind: "desktop" }], units: ["cli", "inference", "app", "desktop"], stapledApp: true })),
-    ...backendPacks.filter((pack) => pack.host.startsWith("darwin-")).map((pack) => ({ directory: pack.id, host: pack.host, ids: [{ id: `icn-backend-${pack.id}`, kind: "icn-backend" }], units: [pack.id], stapledApp: false })),
-  ]
+  const groups = releaseHosts.filter((host) => host.id.startsWith("darwin-")).map((host) => ({ directory: host.id, host: host.id, ids: [...["cli", "acn", "icn-base", "desktop"].map((kind) => ({ id: `${kind}-${host.id}`, kind })), { id: `desktop-update-${host.id}`, kind: "desktop" }], units: ["cli", "inference", "app", "desktop"], stapledApp: true }))
   for (const group of groups) {
     const directory = join(root, group.directory)
     await mkdir(directory)

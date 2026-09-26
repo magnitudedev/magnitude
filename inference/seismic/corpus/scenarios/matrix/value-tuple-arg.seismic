@@ -1,0 +1,8 @@
+# cell: value-tuple/arg
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero
+fn sum2(p: (f32, f32)) -> f32:
+    let (a, b) = p
+    return a + b
+
+fn probe(x: &tensor[4, 8] f32, out: &mut tensor[4] f32):
+    out[0] = sum2((x[0, 0], x[0, 1]))

@@ -1,0 +1,12 @@
+# SwiGLU gate and up projections of one activation row over packed weights, sharing the
+# activation value: result = silu(x·gate) * (x·up). One input traversal feeds both F32
+# accumulators; the activation window is loaded once per visit.
+fn gated_projection[N, K](x: &tensor[1, K] bf16, gate: &tensor[N, K] q4g64, up: &tensor[N, K] q4g64, result: &mut tensor[1, N] bf16):
+    parallel for cols in 0..N:
+        let mut g = f32(0.0)
+        let mut u = f32(0.0)
+        for k in 0..K:
+            let xt = f32(x[0, k])
+            g = fma(xt, f32(gate[cols, k]), g)
+            u = fma(xt, f32(up[cols, k]), u)
+        result[0, cols] = g / (1.0 + exp(-g)) * u

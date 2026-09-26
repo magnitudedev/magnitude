@@ -1,0 +1,11 @@
+# cell: value-range/arg
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; range:2..6 ; range:0..3
+fn span_sum(row: &tensor[8] f32, span: range[8]) -> f32:
+    let mut s = 0.0
+    for j in span:
+        s = s + row[j]
+    return s
+
+fn probe(x: &tensor[4, 8] f32, out: &mut tensor[4] f32, r: range[8], t: range[8]):
+    out[0] = span_sum(x[0], r)
+    out[1] = span_sum(x[1], t)

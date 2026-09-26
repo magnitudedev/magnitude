@@ -1,0 +1,8 @@
+# origin: C11:s_views
+# cell: view-transpose-reshape/sl
+# cell: extent/sl
+# invoke: f32[2,3]=1,2,3,4,5,6
+fn probe(x: &tensor[2,3] f32) -> f32:
+    let t = x.T
+    let r = reshape(x, (3, 2))
+    return t[2, 1] + r[2, 0] + f32(extent(t, 0))

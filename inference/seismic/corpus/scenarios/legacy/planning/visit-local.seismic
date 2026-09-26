@@ -1,0 +1,8 @@
+# origin: test:validation:corpus/planning.seismic:visit_local
+# invoke visit_local: f32[3,4]=rand(110) ; f32[3]=zero
+fn visit_local[M, W](x: &tensor[M, W] f32, y: &mut tensor[M] f32):
+    parallel for r in 0..M:
+        let mut local = tensor[W] f32
+        for j in 0..W:
+            local[j] = x[r, j] * x[r, j]
+        y[r] = reduce(local, 0, sum)

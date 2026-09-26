@@ -1,0 +1,10 @@
+# origin: H-19
+# invoke: f32[7]=seq
+fn probe[N](x: &tensor[N] f32) -> f32:
+    let mut t = tensor[N] f32
+    for i in 0..N:
+        t[i] = x[i]
+    let mut acc = 0.0
+    for i in 0..N:
+        acc = acc + t[i]
+    return acc

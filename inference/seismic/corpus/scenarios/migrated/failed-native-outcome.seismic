@@ -1,0 +1,35 @@
+# origin: test:seismic-runtime:runtime/src/feedback/failure_tests.rs:native_failure
+# invoke probe: i32[2]=zero ; i32:0
+# expect: failed
+# pin: dst = i32[2]=7,0
+# invoke before_alloc: i32[2]=zero ; i32:0
+# expect: failed
+# pin: dst = i32[2]=7,0
+# invoke before_store: i32[2]=zero ; i32:0
+# expect: failed
+# pin: dst = i32[2]=7,0
+# invoke returned: i32[2]=zero ; i32:0
+# expect: returned
+# pin: dst = i32[2]=7,0
+# pin: result = i32[2]=14,0
+fn probe(dst: &mut tensor[2] i32, divisor: i32):
+    dst[0] = 7
+    let unused = 42 / divisor
+    dst[1] = 9
+
+fn before_alloc(dst: &mut tensor[2] i32, divisor: i32):
+    parallel for i in 0..1:
+        dst[i] = 7
+        let stopped = 42 / divisor
+        let mut local = tensor[1] i32
+        local[0] = 29
+        dst[i+1] = local[0]
+
+fn before_store(dst: &mut tensor[2] i32, divisor: i32):
+    dst[0] = 7
+    let failed_rhs = dst / divisor
+    dst[:] = failed_rhs
+
+fn returned(dst: &mut tensor[2] i32, divisor: i32) -> tensor[2] i32:
+    dst[0] = 7
+    return dst + dst

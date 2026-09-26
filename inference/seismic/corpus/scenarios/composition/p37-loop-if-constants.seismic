@@ -1,0 +1,9 @@
+# origin: X1:P37
+# invoke: u32[6]=1,2,3,4,5,6 ; u32[6]=zero
+# pin: out = u32[6]=1,1,1,0,0,0
+fn probe[N](x: &tensor[N] u32, out: &mut tensor[N] u32):
+    for i in 0..N:
+        if x[i] > u32(3):
+            out[i] = u32(0)
+        else:
+            out[i] = u32(1)

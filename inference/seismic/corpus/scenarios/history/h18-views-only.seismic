@@ -1,0 +1,6 @@
+# origin: H-18
+# invoke: f32[2,3]=seq
+fn probe[M, N](x: &tensor[M, N] f32) -> f32:
+    let t = x.T
+    let s = t[0:1, :]
+    return s[0, 0]

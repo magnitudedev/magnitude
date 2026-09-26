@@ -1,0 +1,7 @@
+# origin: C1:p24
+# invoke half: f32[3]=5,6,7 ; f32[3]=zero
+# pin: out = f32[3]=5,0,0
+fn half[N](x: &tensor[N] f32, out: &mut tensor[N] f32):
+    let mut t = tensor[N] f32
+    t[0] = x[0]
+    out[0] = t[0]

@@ -1,6 +1,6 @@
 ---
 applies_to:
-  - inference-v4/solver/**
+  - inference/solver/**
 ---
 # Structured solving
 

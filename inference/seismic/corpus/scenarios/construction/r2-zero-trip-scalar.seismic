@@ -1,0 +1,7 @@
+# origin: C11:r2_zero_trip_scalar
+# invoke: index:0
+fn probe(n: index[8]) -> f32:
+    let mut s = 1.0
+    for k in 0..n:
+        s = s * 2.0
+    return s

@@ -1,0 +1,9 @@
+# origin: X1:q1
+# invoke: f32[4]=zero ; bool:true
+# pin: out = f32[4]=1,2,0,0
+# invoke: f32[4]=zero ; bool:false
+# pin: out = f32[4]=0,2,0,0
+fn probe(out: &mut tensor[4] f32, c: bool):
+    if c:
+        out[0] = 1.0
+    out[1] = 2.0

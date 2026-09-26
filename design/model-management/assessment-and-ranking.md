@@ -1,8 +1,8 @@
 ---
 applies_to:
-  - inference/crates/icn-hardware/**
-  - inference/crates/icn-models/**
-  - inference/crates/icn-api/**
+  - inference/service/models/**
+  - inference/service/server/src/assessment/**
+  - inference/catalog/**
   - packages/icn/src/hardware/**
   - packages/icn/src/models/**
   - packages/acn/src/local-model-**
@@ -12,23 +12,25 @@ applies_to:
 
 # Model assessment and ranking
 
-ICN owns assessment-material resolution, assessment demand, template-derived capabilities,
-compatibility, memory, placement, performance, filtering, scheduling, cache reuse, native
-concurrency, deadlines, and assessment publication. ACN owns catalog ranking and projects native
-assessment state. Clients only render the result.
+The inference service owns assessment-material resolution, assessment demand, filtering,
+scheduling, cache reuse, concurrency, deadlines, and assessment publication. The inference engine
+computes template-derived capabilities, compatibility, memory fit and performance. ACN owns catalog
+ranking and projects assessment state. Clients only render the result.
 
-Assessment Material is the compact, immutable GGUF and bundle evidence required to assess a model
-without installed tensor payloads. It preserves the effective default and named chat templates,
-BOS/EOS identities and exact token strings, add-token flags, tensor directory, component roles, and
-content identities. Companion projector material preserves its bounded GGUF metadata and tensor
-directory, so native assessment can establish modalities without an authored capability flag.
-Catalog desired, catalog effective, and discovered targets resolve this same input shape.
+Assessment Material is the immutable GGUF header evidence required to assess a model without
+installed tensor payloads: each component's exact header, through the aligned tensor-data offset,
+with its component roles and content identities. The header carries the tokenizer, chat templates,
+metadata and tensor directory the engine reads; a companion projector header lets the engine
+establish vision without an authored capability flag. Catalog desired, catalog effective, and
+discovered targets resolve this same input shape. A catalog serving profile's context is the
+target's supported maximum context, the context the engine serves and assesses; memory fit uses
+`min(context, 100_000)`.
 
 Temporary assessment files preserve the artifact's logical size without allocating its absent
 tensor payload. Windows explicitly marks these files sparse before extending them; unsupported
 filesystem operations fail that assessment rather than consuming model-sized disk space.
 
-The automatic ICN pool assesses catalog desired material when not installed, effective material
+The automatic assessment pool assesses catalog desired material when not installed, effective material
 when installed, and only `Ready` discoveries. It publishes a read-only revisioned snapshot with
 independent catalog and discovery source slices. Exact work identity guards publication, so removed
 or superseded models cannot retain stale results. Packages, bundles, and serving configurations do
@@ -37,13 +39,13 @@ backoff. Each exact target is attempted once; any target failure settles as `Dro
 retried, and is omitted by ACN. Catalog drops emit an OpenTelemetry error; discovered drops are
 silent.
 
-One planning-worker job opens the target Assessment Material once without tensor allocation. That
-same native model handle supplies effective-template/tool/reasoning analysis and every requested
-context-graph measurement. The job also establishes projector modalities and speculative-decoding
-compatibility. One deadline covers the job, and one flat assessed result publishes capabilities,
-template fingerprint, and profile evidence together while retaining the exact native runtime
-configuration required by residency. There is no template worker, template timeout, template
-cache, inventory capability state, or post-download assessment gate.
+One assessment reads the target's Assessment Material headers once, in the service process, as
+arithmetic over the environment's measurement basis. The engine's own tokenizer, template and
+reasoning inspection supplies capabilities and the template fingerprint; its method resolution
+decides speculative execution. One deadline covers the target, and one flat assessed result
+publishes capabilities, template fingerprint, and profile evidence together. There is no planning
+worker, template worker, template cache, inventory capability state, or post-download assessment
+gate.
 
 `Fits`, `DoesNotFit`, and `Incompatible` are genuine terminal evidence. Transport or operation
 failure drops the target rather than fabricating compatibility evidence. Hardware observations
@@ -51,13 +53,12 @@ that were not performed are represented as `NotObserved`; zero-valued headroom i
 
 Ranking exists only for reviewed catalog models with `Fits` evidence and the required bounded
 performance sample. Intelligence and fidelity come from authored catalog evidence; speed comes
-from native assessment. Missing evidence yields absent ranking scores, never zeros. Discovered
+from engine assessment. Missing evidence yields absent ranking scores, never zeros. Discovered
 models receive no invented intelligence or fidelity score.
 
 Provider selection requires `Fits`, current selectability, profile, and capabilities from the same
 assessed state. Package validation establishes only structural artifact validity and presence;
-assessment is the sole capability authority. Loading consumes the completed assessment's template,
-reasoning, modality, and speculative configuration. Admission recomputes only memory fit against
-current resources; it cannot rerun capability inspection or speculative preflight. The inference
-worker verifies the loaded artifact's fingerprint and modalities against the assessment rather than
-rediscovering them. Cached assessment alone never authorizes admission.
+assessment is the sole published capability authority. Loading resolves the same engine
+configuration from the installed package; the service verifies the loaded instance's template
+fingerprint and modalities against the host's resolution. Admission plans memory against current
+resources. Cached assessment alone never authorizes admission.

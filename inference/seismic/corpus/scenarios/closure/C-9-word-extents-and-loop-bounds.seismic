@@ -1,0 +1,28 @@
+# origin: X1:w19d X1:w19 X1:w08b X1:w19b X1:w06a
+# invoke: i32[3]=2,-5,11 ; f32[3]=1.0,-1.0,2.0 ; f32[3,5]=zero
+# pin: out = f32[3,5]=3,3,3,3,2,0,0,0,0,0,12,12,6,6,3
+fn probe[R](lens: &tensor[R] i32, x: &tensor[R] f32, out: &mut tensor[R, 5] f32):
+    parallel for r in 0..R:
+        let w = lens[r] + 1
+        if w >= 0:
+            let mut t = tensor[w] f32
+            t[:] = ones_like(t)
+            out[r, 0] = reduce(t, 0, sum)
+            let mut s = 0.0
+            for i in 0..w:
+                s = s + 1.0
+            out[r, 1] = s
+        let v = i32(x[r] * 3.0)
+        if v >= 0:
+            let mut u = tensor[v] f32
+            u[:] = ones_like(u)
+            out[r, 2] = reduce(u, 0, sum)
+            let mut c = 0.0
+            for i in 0..v:
+                c = c + 1.0
+            out[r, 3] = c
+        let n = lens[r]
+        if n >= 0:
+            let mut m = tensor[n % 8] f32
+            m[:] = ones_like(m)
+            out[r, 4] = reduce(m, 0, sum)

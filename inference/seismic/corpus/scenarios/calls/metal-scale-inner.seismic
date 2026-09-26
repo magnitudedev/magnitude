@@ -1,0 +1,8 @@
+# origin: test:seismic-metal:src/isolation.rs:checked_source_refines_without_a_profile_or_native_context
+# invoke scale: f32[37]=rand(41) ; f32:1.5 ; f32[37]=zero
+fn inner[N](x: &tensor[N] f32, factor: f32, output: &mut tensor[N] f32):
+    parallel for i in 0..N:
+        output[i] = x[i] * factor
+
+fn scale[N](x: &tensor[N] f32, factor: f32, output: &mut tensor[N] f32):
+    inner(x, factor, output)

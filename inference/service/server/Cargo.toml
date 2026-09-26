@@ -1,0 +1,56 @@
+[package]
+name = "magnitude-service-server"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "magnitude-inference"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+libc.workspace = true
+magnitude-engine = { path = "../../engine" }
+magnitude-executor = { path = "../../engine/executor" }
+magnitude-service-api = { path = "../api" }
+magnitude-service-contracts.workspace = true
+magnitude-service-models.workspace = true
+magnitude-service-utils.workspace = true
+magnitude-serving = { path = "../../engine/serving" }
+opentelemetry.workspace = true
+opentelemetry-appender-tracing.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
+seismic.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sysinfo.workspace = true
+tokio = { workspace = true, features = ["io-std", "io-util", "process", "time"] }
+tower-http.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
+tempfile = "3.24.0"
+tower = { workspace = true, features = ["util"] }
+tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }

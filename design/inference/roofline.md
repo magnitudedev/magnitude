@@ -1,10 +1,11 @@
 ---
 applies_to:
-  - inference-v3/formula-performance/**
-  - inference-v3/roofline/**
+  - inference/validation/reference_matrix.sh
 ---
 
 # Roofline
+
+Historical V3 design, retained for provenance. It does not govern the Seismic engine.
 
 Roofline owns performance measurement orchestration, worker operation, persistent
 evidence, queries and a read-only Textual browser. Engine integrations own workload

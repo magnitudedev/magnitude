@@ -1,0 +1,4 @@
+# origin: C12:G-C12-6
+# invoke: f32[4096]=bits(21)
+fn probe[N](x: &tensor[N] f32) -> tensor[N] f32:
+    return sqrt(x)

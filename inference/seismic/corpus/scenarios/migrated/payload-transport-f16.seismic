@@ -1,0 +1,98 @@
+# origin: test:seismic-runtime:runtime/src/feedback/payload_tests.rs:payloads
+# invoke scalar: f16:0x7c01 ; f16:0x8001 ; bool:false ; range:0..0
+# pin: result = f16[]=0x7c01
+# invoke scalar: f16:0xfc35 ; f16:0x1 ; bool:false ; range:0..0
+# pin: result = f16[]=0xfc35
+# invoke scalar: f16:0x7e01 ; f16:0x8000 ; bool:false ; range:0..0
+# pin: result = f16[]=0x7e01
+# invoke scalar: f16:0xfeab ; f16:0x0 ; bool:false ; range:0..0
+# pin: result = f16[]=0xfeab
+# invoke scalar: f16:0x0 ; f16:0xfeab ; bool:false ; range:0..0
+# pin: result = f16[]=0x0
+# invoke scalar: f16:0x8000 ; f16:0x7e01 ; bool:false ; range:0..0
+# pin: result = f16[]=0x8000
+# invoke scalar: f16:0x1 ; f16:0xfc35 ; bool:false ; range:0..0
+# pin: result = f16[]=0x1
+# invoke scalar: f16:0x8001 ; f16:0x7c01 ; bool:false ; range:0..0
+# pin: result = f16[]=0x8001
+# invoke tensor: f16[8]=0x7c01,0xfc35,0x7e01,0xfeab,0x0,0x8000,0x1,0x8001 ; f16[8]=0x8001,0x1,0x8000,0x0,0xfeab,0x7e01,0xfc35,0x7c01 ; bool:false ; range:0..0
+# pin: result.0 = f16[8]=0x7c01,0xfc35,0x7e01,0xfeab,0x0,0x8000,0x1,0x8001
+# pin: result.1 = f16[]=0x7c01
+# invoke scalar: f16:0x7c01 ; f16:0x8001 ; bool:true ; range:0..0
+# pin: result = f16[]=0x8001
+# invoke scalar: f16:0xfc35 ; f16:0x1 ; bool:true ; range:0..0
+# pin: result = f16[]=0x1
+# invoke scalar: f16:0x7e01 ; f16:0x8000 ; bool:true ; range:0..0
+# pin: result = f16[]=0x8000
+# invoke scalar: f16:0xfeab ; f16:0x0 ; bool:true ; range:0..0
+# pin: result = f16[]=0x0
+# invoke scalar: f16:0x0 ; f16:0xfeab ; bool:true ; range:0..0
+# pin: result = f16[]=0xfeab
+# invoke scalar: f16:0x8000 ; f16:0x7e01 ; bool:true ; range:0..0
+# pin: result = f16[]=0x7e01
+# invoke scalar: f16:0x1 ; f16:0xfc35 ; bool:true ; range:0..0
+# pin: result = f16[]=0xfc35
+# invoke scalar: f16:0x8001 ; f16:0x7c01 ; bool:true ; range:0..0
+# pin: result = f16[]=0x7c01
+# invoke tensor: f16[8]=0x7c01,0xfc35,0x7e01,0xfeab,0x0,0x8000,0x1,0x8001 ; f16[8]=0x8001,0x1,0x8000,0x0,0xfeab,0x7e01,0xfc35,0x7c01 ; bool:true ; range:0..0
+# pin: result.0 = f16[8]=0x8001,0x1,0x8000,0x0,0xfeab,0x7e01,0xfc35,0x7c01
+# pin: result.1 = f16[]=0x8001
+# invoke scalar: f16:0x7c01 ; f16:0x8001 ; bool:false ; range:0..2
+# pin: result = f16[]=0x7c01
+# invoke scalar: f16:0xfc35 ; f16:0x1 ; bool:false ; range:0..2
+# pin: result = f16[]=0xfc35
+# invoke scalar: f16:0x7e01 ; f16:0x8000 ; bool:false ; range:0..2
+# pin: result = f16[]=0x7e01
+# invoke scalar: f16:0xfeab ; f16:0x0 ; bool:false ; range:0..2
+# pin: result = f16[]=0xfeab
+# invoke scalar: f16:0x0 ; f16:0xfeab ; bool:false ; range:0..2
+# pin: result = f16[]=0x0
+# invoke scalar: f16:0x8000 ; f16:0x7e01 ; bool:false ; range:0..2
+# pin: result = f16[]=0x8000
+# invoke scalar: f16:0x1 ; f16:0xfc35 ; bool:false ; range:0..2
+# pin: result = f16[]=0x1
+# invoke scalar: f16:0x8001 ; f16:0x7c01 ; bool:false ; range:0..2
+# pin: result = f16[]=0x8001
+# invoke tensor: f16[8]=0x7c01,0xfc35,0x7e01,0xfeab,0x0,0x8000,0x1,0x8001 ; f16[8]=0x8001,0x1,0x8000,0x0,0xfeab,0x7e01,0xfc35,0x7c01 ; bool:false ; range:0..2
+# pin: result.0 = f16[8]=0x7c01,0xfc35,0x7e01,0xfeab,0x0,0x8000,0x1,0x8001
+# pin: result.1 = f16[]=0x7c01
+# invoke scalar: f16:0x7c01 ; f16:0x8001 ; bool:true ; range:0..2
+# pin: result = f16[]=0x8001
+# invoke scalar: f16:0xfc35 ; f16:0x1 ; bool:true ; range:0..2
+# pin: result = f16[]=0x1
+# invoke scalar: f16:0x7e01 ; f16:0x8000 ; bool:true ; range:0..2
+# pin: result = f16[]=0x8000
+# invoke scalar: f16:0xfeab ; f16:0x0 ; bool:true ; range:0..2
+# pin: result = f16[]=0x0
+# invoke scalar: f16:0x0 ; f16:0xfeab ; bool:true ; range:0..2
+# pin: result = f16[]=0xfeab
+# invoke scalar: f16:0x8000 ; f16:0x7e01 ; bool:true ; range:0..2
+# pin: result = f16[]=0x7e01
+# invoke scalar: f16:0x1 ; f16:0xfc35 ; bool:true ; range:0..2
+# pin: result = f16[]=0xfc35
+# invoke scalar: f16:0x8001 ; f16:0x7c01 ; bool:true ; range:0..2
+# pin: result = f16[]=0x7c01
+# invoke tensor: f16[8]=0x7c01,0xfc35,0x7e01,0xfeab,0x0,0x8000,0x1,0x8001 ; f16[8]=0x8001,0x1,0x8000,0x0,0xfeab,0x7e01,0xfc35,0x7c01 ; bool:true ; range:0..2
+# pin: result.0 = f16[8]=0x8001,0x1,0x8000,0x0,0xfeab,0x7e01,0xfc35,0x7c01
+# pin: result.1 = f16[]=0x8001
+fn identity(value: f16) -> f16:
+    return value
+
+fn scalar(value: f16, alternate: f16, choose: bool, times: range[3]) -> f16:
+    let mut result = identity(value)
+    if choose:
+        result = identity(alternate)
+    for iteration in times:
+        result = identity(result)
+    return result
+
+fn tensor(x: &tensor[8] f16, y: &tensor[8] f16, choose: bool, times: range[3]) -> (tensor[8] f16, f16):
+    let mut result = zeros_like(x)
+    parallel for i in 0..8:
+        let mut value = identity(x[i])
+        if choose:
+            value = identity(y[i])
+        for iteration in times:
+            value = identity(value)
+        result[i] = value
+    return (result, identity(result[0]))

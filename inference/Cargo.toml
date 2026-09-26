@@ -1,51 +1,127 @@
 [workspace]
-members = ["crates/benchmark-runner", "crates/icn-api", "crates/icn-catalog", "crates/icn-contracts", "crates/icn-engine", "crates/icn-hardware", "crates/icn-models", "crates/icn-speculative", "crates/icn-parity", "crates/icn-parity-probe", "crates/icn-reasoning", "crates/icn-server", "crates/icn-utils"]
-exclude = ["native/llama-cpp-rs"]
 resolver = "2"
+members = [
+  "solver",
+  "solver/lab",
+  "engine",
+  "engine/artifacts",
+  "engine/chat",
+  "engine/generation",
+  "engine/scheduler",
+  "engine/batching",
+  "engine/families/contracts",
+  "engine/executor",
+  "engine/kernels",
+  "engine/state",
+  "engine/families/qwen35",
+  "engine/templates",
+  "engine/serving",
+  "engine/cli",
+  "service/contracts",
+  "service/utils",
+  "service/models",
+  "service/catalog-tool",
+  "service/api",
+  "service/server",
+  "seismic-std",
+  "seismic/lang",
+  "seismic/ir",
+  "seismic/native-target",
+  "seismic/native-cpu",
+  "seismic/estimator/core",
+  "seismic/estimator/metal",
+  "seismic/backends/metal",
+  "seismic/backends/cpu",
+  "seismic/backends/cuda",
+  "seismic/backends/vulkan",
+  "seismic/cli",
+  "seismic/compiler",
+  "seismic/runtime",
+  "seismic/api",
+  "seismic/build",
+  "seismic/corpus",
+  "seismic/native-tests",
+  "seismic/frontends/python",
+]
+default-members = [
+  "solver",
+  "solver/lab",
+  "engine",
+  "engine/templates",
+  "engine/serving",
+  "engine/cli",
+  "service/contracts",
+  "service/utils",
+  "service/models",
+  "service/catalog-tool",
+  "service/api",
+  "service/server",
+  "seismic-std",
+  "seismic/lang",
+  "seismic/ir",
+  "seismic/native-target",
+  "seismic/native-cpu",
+  "seismic/estimator/core",
+  "seismic/estimator/metal",
+  "seismic/backends/metal",
+  "seismic/backends/cpu",
+  "seismic/backends/cuda",
+  "seismic/cli",
+  "seismic/compiler",
+  "seismic/runtime",
+  "seismic/api",
+  "seismic/build",
+  "seismic/corpus",
+]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2024"
-license = "MIT"
+edition = "2021"
+license = "UNLICENSED"
 
 [workspace.dependencies]
+seismic-estimator-metal = { path = "seismic/estimator/metal" }
+seismic-ir = { path = "seismic/ir" }
+seismic-native-target = { path = "seismic/native-target" }
+seismic-native-cpu = { path = "seismic/native-cpu" }
+seismic-estimator = { path = "seismic/estimator/core" }
+serde = { version = "=1.0.229", features = ["derive"] }
+postcard = { version = "=1.1.3", default-features = false, features = ["use-std"] }
+seismic-std = { path = "seismic-std" }
+seismic-lang = { path = "seismic/lang" }
+seismic-metal = { path = "seismic/backends/metal" }
+seismic-cpu = { path = "seismic/backends/cpu" }
+seismic-cuda = { path = "seismic/backends/cuda" }
+seismic-vulkan = { path = "seismic/backends/vulkan" }
+seismic-compiler = { path = "seismic/compiler" }
+seismic-runtime = { path = "seismic/runtime" }
+seismic = { path = "seismic/api" }
+seismic-build = { path = "seismic/build" }
+magnitude-service-contracts = { path = "service/contracts" }
+magnitude-service-utils = { path = "service/utils" }
+magnitude-service-models = { path = "service/models" }
 anyhow = "1.0.100"
-axum = "0.8.8"
+axum = "0.8.9"
 base64 = "0.22.1"
 bytes = "1.12.1"
 clap = { version = "4.5.54", features = ["derive", "env"] }
-encoding_rs = "0.8.35"
 flate2 = "1.1"
-futures-util = "0.3.31"
 fs2 = "0.4.3"
+futures-util = "0.3.31"
 getrandom = "0.4.3"
 hf-hub = { version = "1.0.0", features = ["rustls-tls"] }
 http-body-util = "0.1.3"
-hyper = { version = "1.10.1", features = ["client", "http1"] }
-hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "http1", "tokio"] }
-icn-api = { path = "crates/icn-api" }
-icn-contracts = { path = "crates/icn-contracts" }
-icn-engine = { path = "crates/icn-engine", default-features = false }
-icn-hardware = { path = "crates/icn-hardware", default-features = false }
-icn-models = { path = "crates/icn-models" }
-icn-speculative = { path = "crates/icn-speculative", default-features = false }
-icn-reasoning = { path = "crates/icn-reasoning" }
-icn-utils = { path = "crates/icn-utils" }
-llama-cpp-2 = { path = "native/llama-cpp-rs/llama-cpp-2", default-features = false, features = ["common"] }
 libc = "0.2.180"
 opentelemetry = { version = "0.32.0", features = ["logs", "trace"] }
 opentelemetry-appender-tracing = "0.32.0"
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["http-json", "logs", "reqwest-blocking-client", "trace"] }
 opentelemetry_sdk = { version = "0.32.0", features = ["logs", "trace"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
-serde = { version = "1.0.228", features = ["derive"] }
+same-file = "1.0.6"
 serde_json = "1.0.149"
 sha2 = "0.10.9"
-same-file = "1.0.6"
 sysinfo = { version = "0.38.4", default-features = false, features = ["system"] }
 thiserror = "2.0.17"
-unicode-normalization = "0.1.24"
-toml = "0.9.8"
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tokio-stream = "0.1.18"
 tower = "0.5.3"
@@ -53,5 +129,23 @@ tower-http = { version = "0.6.11", features = ["trace"] }
 tracing = "0.1.44"
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
+unicode-normalization = "0.1.24"
 utoipa = { version = "5.4.0", features = ["axum_extras", "preserve_order"] }
-utoipa-axum = "0.2.0"
+
+[profile.dev]
+debug = "line-tables-only"
+
+# CPU native kernels compile into the crates below; unoptimized, they are
+# unusable even in tests. The generic Seismic CPU library code is
+# instantiated in the kernel crate, so its level is the kernel crate's.
+[profile.dev.package.magnitude-kernels]
+opt-level = 3
+
+[profile.dev.package.seismic-native-cpu]
+opt-level = 3
+
+[profile.dev.package.seismic-native-tests]
+opt-level = 3
+
+[profile.release]
+debug = 1

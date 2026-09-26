@@ -1,17 +1,19 @@
 ---
 applies_to:
-  - inference-v4/engine/model-batching/**
-  - inference-v4/engine/model-state/**
-  - inference-v4/engine/model-executor/**
+  - inference/engine/batching/**
+  - inference/engine/state/**
+  - inference/engine/executor/**
 ---
 
 # Validated numerical launches
 
 Batching owns device-independent row semantics. It validates slot order, row mappings,
 coordinates, visibility, destinations, demands, selection controls, and physical capacity class
-once, then produces an opaque domain-specific batch. A row's visible history ranges keep the
-history's logical order, coalesce only logically adjacent ranges, and must not share a row; their
-addresses need not ascend. The history-segment class limit is the state store's segment bound.
+once, then produces an opaque domain-specific batch. A row's visible history spans keep the
+history's logical order and must not share a row; their addresses need not ascend. The state
+store coalesces logically adjacent spans within one slab, and batching preserves its boundaries
+so no span crosses a slab. The span class limit is the loaded store's bound,
+`ceil(context limit / rows per slab) + 16`.
 Its row tables are the only upload source;
 programs encode each graph's inputs from them directly, with no separate packed control image.
 Selection masks are shared with their producer rather than copied into the batch, and an
@@ -33,6 +35,7 @@ independent arrays to reconstruct row alignment inside a native program.
 ## Acceptance criteria
 
 - Invalid row or slot relationships cannot be represented by a validated batch.
+- No visible span crosses a slab boundary, and a batch cannot exceed the loaded model's span bound.
 - A launch cannot pair a row with another request's state or resource lease.
 - All program inputs remain owned until physical completion and reconciliation.
 - No program accepts parallel unchecked row, state, conditioning, or demand arrays.

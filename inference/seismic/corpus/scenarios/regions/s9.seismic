@@ -1,0 +1,10 @@
+# origin: C14:s9
+# invoke: f32[5]=rand(50)
+fn probe[N](x: &tensor[N] f32) -> f32:
+    let mut acc = 0.0
+    for i in 0..N:
+        let mut t = tensor[i + 1] f32
+        for j in 0..i + 1:
+            t[j] = x[j]
+        acc = acc + reduce(t, 0, sum)
+    return acc

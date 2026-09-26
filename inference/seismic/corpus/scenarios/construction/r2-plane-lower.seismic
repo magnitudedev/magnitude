@@ -1,0 +1,9 @@
+# origin: C11:r2_plane_lower
+# cell: plane-view-lower/sl
+# invoke: q4g64[128]=zero
+fn probe(w: &tensor[128] q4g64) -> f32:
+    return w[0]
+
+lower probe(w: &tensor[128] q4g64) -> f32 for cpu:
+    let words = w.words
+    return f32(words[0])

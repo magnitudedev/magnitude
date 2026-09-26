@@ -57,6 +57,17 @@ export const LocalInferenceMemoryDomainIdSchema = Schema.String.pipe(
 )
 export type LocalInferenceMemoryDomainId = typeof LocalInferenceMemoryDomainIdSchema.Type
 
+/** Stable identity of one inference execution device, including the host CPU. */
+export const LocalInferenceDeviceIdSchema = Schema.String.pipe(
+  Schema.minLength(1),
+  Schema.maxLength(512),
+  Schema.brand("LocalInferenceDeviceId"),
+)
+export type LocalInferenceDeviceId = typeof LocalInferenceDeviceIdSchema.Type
+
+export const LocalInferenceBackendSchema = Schema.Literal("cpu", "metal", "cuda", "vulkan")
+export type LocalInferenceBackend = typeof LocalInferenceBackendSchema.Type
+
 export const PercentageSchema = Schema.Number.pipe(Schema.int(), Schema.between(0, 100))
 export type Percentage = typeof PercentageSchema.Type
 
@@ -71,12 +82,11 @@ export const LowMemoryModelInstanceFailureSchema = Schema.TaggedStruct("LowMemor
   code: Schema.Literal("low_memory"),
   message: Schema.String,
   retryable: Schema.Boolean,
-  requiredSystemMemoryBytes: NonNegativeSafeInteger,
+  requiredMemoryBytes: NonNegativeSafeInteger,
   allocationHeadroomBytes: NonNegativeSafeInteger,
   systemReserveBytes: NonNegativeSafeInteger,
   loadBoundaryBytes: NonNegativeSafeInteger,
   minimumAdditionalAvailableBytes: PositiveSafeInteger,
-  parallelSequences: PositiveSafeInteger,
 })
 export type LowMemoryModelInstanceFailure =
   typeof LowMemoryModelInstanceFailureSchema.Type
@@ -102,18 +112,22 @@ export const formatModelDisplayName = (
   onSome: (label) => `${displayName} (${label})`,
 })
 
+export const ModelLoadDeviceSchema = Schema.Struct({
+  deviceId: LocalInferenceDeviceIdSchema,
+  backend: LocalInferenceBackendSchema,
+})
+export type ModelLoadDevice = typeof ModelLoadDeviceSchema.Type
+
 export const ModelLoadPlanSchema = Schema.Struct({
   contextWindowTokens: PositiveSafeInteger,
-  parallelSequences: PositiveSafeInteger,
-  physicalContextTokens: PositiveSafeInteger,
-  requiredSystemMemoryBytes: NonNegativeSafeInteger,
+  /** Startup peak claim in the selected device's allocation domain; excludes context growth. */
+  requiredMemoryBytes: NonNegativeSafeInteger,
+  device: ModelLoadDeviceSchema,
 })
 export type ModelLoadPlan = typeof ModelLoadPlanSchema.Type
 
 export const ModelInstanceAllocationSchema = Schema.Struct({
   contextWindowTokens: PositiveSafeInteger,
-  parallelSequences: PositiveSafeInteger,
-  physicalContextTokens: PositiveSafeInteger,
   memoryDomains: Schema.Array(Schema.Struct({
     memoryDomainId: LocalInferenceMemoryDomainIdSchema,
     modelBytes: NonNegativeSafeInteger,
@@ -1110,7 +1124,7 @@ export type ModelSlotsState = typeof ModelSlotsStateSchema.Type
 export const LocalInferenceAcceleratorSchema = Schema.Struct({
   acceleratorId: LocalInferenceAcceleratorIdSchema,
   name: Schema.String,
-  backend: Schema.String,
+  backend: LocalInferenceBackendSchema,
   memoryDomainId: LocalInferenceMemoryDomainIdSchema,
 })
 export const LocalInferenceMemoryDomainSchema = Schema.Struct({

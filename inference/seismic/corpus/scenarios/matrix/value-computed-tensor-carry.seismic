@@ -1,0 +1,7 @@
+# cell: value-computed-tensor/carry
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero
+fn probe(x: &tensor[4, 8] f32, out: &mut tensor[4] f32):
+    let mut t = x[0] * 1.0
+    for i in 0..3:
+        t = t * 2.0 + x[i + 1]
+    out[0] = t[1]

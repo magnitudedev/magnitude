@@ -1,0 +1,7 @@
+# CUDA matrix realization is expressed only in logical tensor values. Tile
+# shape, fragment storage, cooperative participation, and physical resources
+# are selected and accounted by the compiler-owned capability implementation.
+lower matmul[M, N, K](a: &tensor[M, K] T, b: &tensor[N, K] U,
+                      into: tensor[M, N] f32) -> tensor[M, N] f32
+    for cuda requires cuda.matrix:
+    return cuda.matrix.matmul_add(a, b.T, into)

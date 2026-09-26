@@ -1,0 +1,41 @@
+[package]
+name = "magnitude-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+magnitude-artifacts = { path = "artifacts" }
+magnitude-chat = { path = "chat" }
+magnitude-generation = { path = "generation" }
+magnitude-scheduler = { path = "scheduler" }
+magnitude-templates = { path = "templates" }
+magnitude-batching = { path = "batching" }
+magnitude-family-contracts = { path = "families/contracts" }
+magnitude-executor = { path = "executor" }
+magnitude-family-qwen35 = { path = "families/qwen35" }
+magnitude-state = { path = "state" }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+postcard.workspace = true
+sha2 = "=0.11.0"
+tokio = { version = "=1.53.0", features = ["rt", "sync", "macros", "time"] }
+seismic.workspace = true
+opentelemetry = "0.33.0"
+opentelemetry_sdk = "0.33.0"
+opentelemetry-otlp = { version = "0.33.0", features = ["http-json", "reqwest"] }
+
+[build-dependencies]
+sha2 = "=0.11.0"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "=0.2.189"
+
+[features]
+# Development-only: lets the `forward_bench` example record tuned
+# configurations and replay them in a later run (bit-exact comparisons).
+# The served `magnitude-engine` binary (engine/cli) never installs a pin.
+pinned-tuning = ["magnitude-executor/pinned-tuning"]
+# Development-only: lets the `forward_bench` example survey every admissible
+# tuning configuration (`--tuning-survey DIR`) for replaying the search.
+tuning-survey = ["magnitude-executor/tuning-survey"]

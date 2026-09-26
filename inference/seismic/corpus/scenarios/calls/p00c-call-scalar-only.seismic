@@ -1,0 +1,7 @@
+# origin: C13:p00c
+# invoke: i32:5
+fn inc(x: i32) -> i32:
+    return x + 1
+
+fn probe(x: i32) -> i32:
+    return inc(x) * 2

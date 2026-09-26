@@ -1,0 +1,10 @@
+# origin: X1:P03
+# invoke: f32[4]=1,2,3,4 ; index:0
+# pin: result = f32[4]=1,2,3,4
+# invoke: f32[4]=1,2,3,4 ; index:2
+# pin: result = f32[4]=3,6,9,12
+fn probe[N](x: &tensor[N] f32, n: index[8]) -> tensor[N] f32:
+    let mut t = to_owned(x)
+    for i in 0..n:
+        t = t + x
+    return t

@@ -1,0 +1,33 @@
+# origin: A8:G-A8-new-11
+# invoke to_i32: f32[8]=nan,0xffc00001,1.5,-2.5,3e9,-3e9,inf,-inf ; i32[8]=zero
+# expect: returned
+# pin: o = i32[8]=0,0,1,-2,2147483647,-2147483648,2147483647,-2147483648
+# invoke to_u32: f32[6]=nan,1.5,-2.5,5e9,inf,-inf ; u32[6]=zero
+# expect: returned
+# pin: o = u32[6]=0,1,0,4294967295,4294967295,0
+# invoke fma_bf16: bf16[1]=0x3fc0 ; bf16[1]=0x3f81 ; bf16[1]=0xb280 ; bf16[1]=zero
+# expect: returned
+# pin: o = bf16[1]=0x3fc1
+# invoke fma_bf16: bf16[4096]=bits(31) ; bf16[4096]=bits(32) ; bf16[4096]=bits(33) ; bf16[4096]=zero
+# expect: returned
+# invoke fma_f16: f16[4096]=bits(34) ; f16[4096]=bits(35) ; f16[4096]=bits(36) ; f16[4096]=zero
+# expect: returned
+fn to_i32[N](x: &tensor[N] f32, o: &mut tensor[N] i32):
+    # NaN converts to 0 and out-of-range values saturate, on every backend.
+    parallel for i in 0..N:
+        o[i] = i32(x[i])
+
+fn to_u32[N](x: &tensor[N] f32, o: &mut tensor[N] u32):
+    parallel for i in 0..N:
+        o[i] = u32(x[i])
+
+fn fma_bf16[N](a: &tensor[N] bf16, b: &tensor[N] bf16, c: &tensor[N] bf16, o: &mut tensor[N] bf16):
+    # Single rounding of a*b+c to bf16. CPU: f64 round-to-odd then RNE (Exact,
+    # proof). Metal: `Deviating`, so `exact` uses the recipe.
+    parallel for i in 0..N:
+        o[i] = fma(a[i], b[i], c[i])
+
+fn fma_f16[N](a: &tensor[N] f16, b: &tensor[N] f16, c: &tensor[N] f16, o: &mut tensor[N] f16):
+    # Metal F16 `Fma` is `Exact` by the f32 round-to-odd proof (A8 §2.4.3).
+    parallel for i in 0..N:
+        o[i] = fma(a[i], b[i], c[i])

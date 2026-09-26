@@ -1,10 +1,10 @@
 ---
 applies_to:
-  - inference-v4/seismic/**
-  - inference-v4/seismic-std/**
-  - inference-v4/engine/**
-  - inference-v4/validation/**
-  - inference-v4/docs/seismic/**
+  - inference/seismic/**
+  - inference/seismic-std/**
+  - inference/engine/**
+  - inference/validation/**
+  - inference/docs/seismic/**
 ---
 
 # Seismic language and target capabilities

@@ -73,7 +73,7 @@ When significant bug is being reported or a large spec is being created, place u
 `design/` contains the durable source of truth for architecture and behavior. Follow `design/AGENTS.md`: use `bun design-docs` to find applicable documents, preserve their guarantees, and update them and their applicability whenever the design or ownership changes.
 
 ```bash
-bun design-docs inference/crates/icn-engine/src/scheduler.rs
+bun design-docs inference/engine/scheduler/src/worker.rs
 bun design-docs --changed --explain
 ```
 

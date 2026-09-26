@@ -1,9 +1,10 @@
 ---
 applies_to:
-  - inference-v4/engine/model-executor/**
-  - inference-v4/engine/model-kernels/**
-  - inference-v4/engine/model-state/**
-  - inference-v4/engine/src/execution.rs
+  - inference/engine/executor/**
+  - inference/engine/kernels/**
+  - inference/engine/state/**
+  - inference/engine/src/execution.rs
+  - inference/engine/src/planning.rs
 ---
 
 # Numerical execution plan
@@ -14,11 +15,12 @@ program slots, method capabilities, service policy, and all device resources. Th
 topology is both the complete requirement set and the construction recipe. Program construction
 attests every exact slot and returns typed callable groups; execution never queries a handle map or
 coarse coverage class after readiness.
-Metadata-only model assessment derives resident weight bytes and per-token history and recurrent
+Metadata-only model assessment derives resident weight bytes and slab-rounded history and recurrent
 bank bytes from this same model load plan and state layout, for a one-conversation workload at the
 lesser of supported context and 100,000 tokens. It does not read weight payloads or open a device.
-The recurrent fit charge includes the accepted bank, one in-flight successor, the lookahead
-successor when lookahead is enabled, and the pristine seed.
+The recurrent fit charge includes the bank slabs needed for the accepted bank, one in-flight
+successor, the lookahead successor when lookahead is enabled, and the pristine seed. State startup
+includes one history slab and the zero-seed bank slab per store; later slabs are heap claims.
 Those exact model terms alone do not establish fit: prepared graph resources, workspace, startup
 transients and the device's stable fit capacity are added as upper bounds derived from the same
 header-only program plan, so a fit result never undercounts. Assessment results are complete:
@@ -34,6 +36,9 @@ The composition root prepares complete Seismic workflows for the admitted model 
 finite launch classes, imports the target component, allocates the storage reported by those
 workflows, and publishes readiness only after those steps succeed. The engine does not maintain a
 second numerical tensor-shape description.
+The largest service token allowance bounds a launch's rows, request slots, and projected output
+rows in either phase. Every request consumes at least one row, so prefill can admit more request
+slots and output rows than the decode allowance while still staying within its token budget.
 Device assessment uses the allocation domain's total capacity, bounded by
 applicable process limits and Metal's recommended working set, less the domain's planning reserve;
 a dedicated device's load also fits its staged uploads in host RAM less the host's planning
@@ -41,8 +46,13 @@ reserve. Admission of new holdings uses fresh available memory observations for 
 and must leave headroom above the planning reserve (see engine memory). Already charged
 allocations are excluded from observed availability and are not subtracted again.
 The native execution path is backend-neutral: the host names a device (a backend or an exact
-selector) or asks for automatic selection, which considers accelerators only and treats several
-fitting devices as an explicit ambiguity; the path then executes on the opened device's backend,
+selector) or asks for automatic selection, which takes backends in the fixed order Metal, CUDA,
+Vulkan, CPU and uses the first device, in Seismic's enumeration order, of the first backend with a
+usable device (available to Seismic, meeting its backend floor, with established memory backing;
+software Vulkan devices are not accelerators). Selection never ranks devices by fit or speed, so
+preview, assessment and load select the same device; a numerical worker re-resolves an exact
+selector in its own catalog and refuses a missing or ambiguous match. The path then executes on
+the opened device's backend,
 and every native entry is prepared from that backend's declarations. Preparation reports every
 entry the program plan needs that lacks an implementation for the backend together, and every
 error names the path and the backend.
@@ -59,7 +69,7 @@ precision gate could accept, so tuning never rejects a configuration the gate wo
 itself is the end-to-end qualification. Because the tuner may choose any declared option, an entry
 declares only arithmetic options that pass the gate whichever one wins: on CPU the recurrent output
 projection and the recurrent projection's alpha and beta gates stay exact F32. Every tensor an entry writes
-in place (recurrent state arenas, KV history, routing tables, selection outputs) is case-owned
+in place (recurrent bank slabs, KV history, routing tables, selection outputs) is case-owned
 state: its written region is restored before each configuration's validation run, and real state
 is never bound. An entry that declares parameters without a case fails preparation; there are no
 engine-side default parameter values. An entry prepared again with identical element bindings and
@@ -106,15 +116,14 @@ and prepared configuration, and different shape classes agree within the gate's 
 bit for bit. Speculative verification is therefore statistically, not exactly, equivalent to
 plain decoding; acceptance over the logits a verification produced remains exact.
 
-The resource plan authorizes persistent weights and state, including the permanently pristine
-recurrent zero seed, concurrent typed workspaces, outputs
-that outlive workspaces, structural retention slots bounded by service request capacity and
-the device domain, optional component residency, and the
+The resource plan authorizes persistent weights and startup state slabs, including the permanently
+pristine recurrent zero seed, concurrent typed workspaces, outputs that outlive workspaces,
+structural retention slots, optional component residency, and the
 qualification/startup peak. Persistent allocation follows planning. Qualification scratch is
 released before readiness. Execution receives plan-issued leases and cannot allocate general
 scratch outside the plan.
-Variable retained feature tensors require a fitting heap claim. Retained checkpoints occupy
-finite slots and release their physical charge when their final owner drops them.
+Per-request state and feature tensors require fitting heap claims. Retained checkpoints release
+their physical charge when their final owner drops them.
 
 Seismic composes native checked entries into prepared workflows for decoder blocks and other
 numerical units. Its checked entry contracts derive graph-local mutable scratch, host-uploaded
@@ -134,9 +143,10 @@ Other backends use a one-shot staged source upload. The engine charges Seismic's
 storage; it does not author parallel tensor recipes or look up named intermediates during a
 request.
 
-The target and head workflows cover the admitted row and history-segment ladders. Row classes are
+The target and head workflows cover the admitted row and history-span ladders. Row classes are
 powers of two up to 32 rows (decode, verification, concurrency) and multiples of 64 above, up to
-512; history segments are powers of two. Blocks whose sealed workflow would be identical apart from
+512; span classes are powers of two through the per-model bound
+`ceil(context limit / rows per slab) + 16`. Blocks whose sealed workflow would be identical apart from
 their layer (same geometry, weight representations and shapes, and state layout) share one sealed
 plan per class and bind their own weights to it; the composition root reports the class count,
 sealed graph count and sealing time. Decoder numerical
@@ -165,8 +175,11 @@ the selected rows first, so shaping and sampling read the leading logits rows. S
 exist with and without the shaping stage; a step whose selected rows all leave the logits
 unchanged under shaping (greedy or unit temperature without cuts, and no penalties) samples the
 projected logits directly. Each selected row carries a constraint flag; only a step with a
-constrained row uploads vocabulary masks, and an unconstrained row's mask is never read. The projected-row
-capacity follows the service's finite decode and request-batch bounds; prefill row capacity does
+constrained row uploads vocabulary masks, and an unconstrained row's mask is never read. Shaping
+applies a constrained row's mask before its cuts, so top-k, min-p and top-p rank and renormalize
+only admitted tokens and a row that admits a finite logit never samples an empty distribution;
+sampling applies the same mask to unshaped rows. The projected-row
+capacity follows the selected per-step token and memory allowance; prefill row capacity does
 not imply the same number of logits rows. Features, logits and selection stay inside one checked
 Seismic workflow with one owned output lifetime.
 Conditioning overlays are Seismic workflows with only external ports, sealed once per overlaid row
@@ -175,20 +188,30 @@ overlay run per contiguous range, binding the source span and the matching row v
 embedding output; the device queue orders them before the first block. Overlays add no scratch or
 result storage; the embedding result remains under its original output lease.
 The fused attention entry appends each row's key and value at its destination while other rows read
-history. This is ordered by construction: destinations are freshly reserved rows, so no row of the
-batch sees one through its visible spans, and fresh rows are read from the batch's own projections.
+history. History and recurrent state ports bind slab address tables, with each slab retained and
+ordered as a used resource until submitted work completes. The entry resolves one slab base per
+visible span, one per destination row, or one per recurrent bank; its inner loops retain their
+direct component layout. This is ordered by construction: destinations are freshly reserved rows,
+so no row of the batch sees one through its visible spans, and fresh rows are read from the batch's
+own projections. The fixed device measurement basis uses the same slab binding as served work.
 
 Vision patch capacity is the admitted merged output row limit times the merge area; input validation
 rejects a larger aggregate before reserving a vision slot. Vision attention sees every physical
 patch row, so its prepared workflow uses the exact admitted patch-row count; padding with additional
 patches would alter real outputs. Seismic's recurrent workflow derives
-the exact window and delta arena contracts from its checked entries. Each recurrent block binds
-the layer's arenas and, per run, bank tables for its exact active request slots: each slot's
+the exact window and delta state contracts from its checked entries. Each recurrent block binds
+the store's bank slabs and, per run, bank tables for its exact active request slots: each slot's
 state entry reads the slot's accepted bank and writes only its successor bank, in place, within
 the block's ordered submission. The engine does not dispatch state transfers around the block,
 copy state between banks, or bind padded request state. Workflow slots cover
-submitted concurrency, and retained outputs cover submitted and live request owners. Source-weight
-upload uses the largest admitted encoded tensor as a one-shot startup resource. Qualification and
+submitted concurrency, and retained outputs cover submitted and live request owners. Encoded
+images belong to their request, so the vision output pool holds every live request's full image
+allowance; retained checkpoints share those features and do not size the pool: an encode that
+finds every output pinned by retention releases retention through the ordinary capacity release
+order. Source-weight upload uses the largest admitted encoded tensor as a one-shot startup
+resource. Qualification holds one weight scope's fixtures at a time, at their resident
+representation: a block's weights, the target's norm and output (the embedding table is
+qualified on one row), or a head block's weights with its draft projection. Qualification and
 upload are sequential, so the startup-only addition is their maximum. Prepared native argument,
 intermediate, and result storage is charged from the prepared workflows and checked against their
 actual allocations.

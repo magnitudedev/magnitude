@@ -72,6 +72,7 @@ const server = Bun.serve({
 })
 const baseUrl = `http://127.0.0.1:${server.port}`
 const root = await mkdtemp(resolve(tmpdir(), "magnitude-candidate-"))
+const headlessRoot = await mkdtemp("/tmp/mag-candidate-headless-")
 const dataDir = resolve(root, "home-bootstrap", ".magnitude")
 let desktopApplication = "/usr/bin/magnitude-desktop"
 let cliExecutable = "/usr/bin/magnitude"
@@ -100,12 +101,11 @@ const acceptBootstrap = Effect.scoped(Effect.gen(function* () {
   if (Number(info.size) !== desktop.bytes || (yield* sha256File(image)) !== desktop.sha256) {
     return yield* new CandidateAcceptanceFailed({ message: "Desktop installer differs from the candidate manifest" })
   }
-  const base = yield* selectArtifact(manifest, "icn-base", host)
-  const installation = yield* installArtifact(baseUrl, manifest.version, base, resolve(dataDir, "inference"))
+  const inference = yield* selectArtifact(manifest, "icn-base", host)
+  const installation = yield* installArtifact(baseUrl, manifest.version, inference, resolve(dataDir, "inference"))
   const declaration = resolve(installation, "installation.json")
   yield* fs.writeFileString(declaration, yield* Schema.encode(Schema.parseJson(IcnInstallationDeclaration))({
-    schemaVersion: 1, backend: "cpu", nativeBuild: Option.getOrThrow(base.nativeBuild),
-    backendModuleAbi: Option.getOrThrow(base.backendModuleAbi),
+    schemaVersion: 1, nativeBuild: Option.getOrThrow(inference.nativeBuild),
   }))
   if (linux) {
     yield* validateLinuxDesktopInstaller({ file: image, format: "deb", arch: host === "linux-arm64-gnu" ? "arm64" : "x64",
@@ -154,11 +154,37 @@ const invoke = async (
 
 try {
   await Effect.runPromise(acceptBootstrap)
+  const headlessEnvironment = {
+    ...environment(resolve(headlessRoot, "home")),
+    MAGNITUDE_INSTALLED_ACCEPTANCE_OUTPUT: headlessRoot,
+    MAGNITUDE_INSTALLED_ACCEPTANCE_CLI: cliExecutable,
+    MAGNITUDE_INSTALLED_ACCEPTANCE_ADDON: process.platform === "darwin"
+      ? resolve(desktopApplication, "Contents/Resources/desktop-host.node")
+      : "/usr/lib/magnitude-desktop/resources/desktop-host.node",
+    MAGNITUDE_INSTALLED_ACCEPTANCE_VERSION: manifest.version,
+    MAGNITUDE_ICN_PATH: "",
+  }
+  await run([process.execPath, resolve(import.meta.dir, "../packages/release/scripts/acceptance/test-installed-headless.ts")], {
+    cwd: root,
+    env: headlessEnvironment,
+  })
+  await Effect.runPromise(Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ engineAcquired: Schema.Literal(true), rankingReady: Schema.Literal(true) })))(
+    await readFile(resolve(headlessRoot, "result.json"), "utf8"),
+  ))
+  console.log("Installed desktop acquired ICN into an empty profile and reached headless readiness")
   await invoke([cliExecutable, "--version"], root, resolve(root, "home-cli"))
   server.stop(true)
+  await run([process.execPath, resolve(import.meta.dir, "../packages/release/scripts/acceptance/test-installed-headless.ts")], {
+    cwd: root,
+    env: { ...headlessEnvironment, MAGNITUDE_RELEASE_BASE_URL: "http://127.0.0.1:1", MAGNITUDE_INSTALLED_ACCEPTANCE_OFFLINE: "true" },
+  })
+  await Effect.runPromise(Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ offlineCachedStart: Schema.Literal(true), rankingReady: Schema.Literal(true) })))(
+    await readFile(resolve(headlessRoot, "result.json"), "utf8"),
+  ))
   await invoke([cliExecutable, "--version"], root, resolve(root, "home-cli"))
-  console.log("Desktop-bundled CLI works with the candidate artifact endpoint stopped")
+  console.log("Installed service and bundled CLI work with the candidate artifact endpoint stopped")
 } finally {
   server.stop(true)
+  await rm(headlessRoot, { recursive: true, force: true })
   await rm(root, { recursive: true, force: true })
 }

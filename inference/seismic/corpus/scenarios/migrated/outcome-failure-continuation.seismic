@@ -1,0 +1,10 @@
+# origin: test:seismic-compiler:compiler/src/portable/outcome_relation.rs:actual_failure_continuation_retains_prior_writes_and_source_cause_order
+# invoke: f32[1]=zero ; i32:10 ; i32:0
+# expect: failed
+# invoke: f32[1]=zero ; i32:10 ; i32:2
+# expect: returned
+fn probe(out: &mut tensor[1] f32, numerator: i32, divisor: i32) -> i32:
+    out[0] = 7.0
+    let value = numerator / divisor
+    out[0] = 9.0
+    return value

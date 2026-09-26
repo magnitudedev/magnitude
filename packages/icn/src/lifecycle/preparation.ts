@@ -31,7 +31,6 @@ export type IcnPreparationEvent =
   | { readonly _tag: "InstallationRequired" }
   | {
       readonly _tag: "Artifact"
-      readonly artifact: "Base" | "Accelerator"
       readonly event: ArtifactInstallationEvent
     }
   | { readonly _tag: "Starting" }

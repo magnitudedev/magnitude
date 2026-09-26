@@ -6,11 +6,6 @@ import {
 } from "@magnitudedev/sdk"
 import { formatModelDisplayName } from "./model-presentation"
 
-export interface CurrentModelAllocation {
-  readonly parallelSequences: number
-  readonly physicalContextTokens: number
-}
-
 interface CurrentModelDetails {
   readonly slot: ModelSlotConfiguredLocal
   readonly displayName: string
@@ -24,28 +19,18 @@ export type CurrentLocalModel =
     })
   | (CurrentModelDetails & {
       readonly _tag: "Loading"
-      readonly allocation: Option.Option<CurrentModelAllocation>
       readonly percentage: number
     })
   | (CurrentModelDetails & {
       readonly _tag: "Running"
-      readonly allocation: CurrentModelAllocation
     })
   | (CurrentModelDetails & {
       readonly _tag: "Stopping"
-      readonly allocation: Option.Option<CurrentModelAllocation>
     })
   | (CurrentModelDetails & {
       readonly _tag: "Failed"
       readonly reason: ModelFailure
     })
-
-const allocation = (
-  value: { readonly parallelSequences: number; readonly physicalContextTokens: number },
-): CurrentModelAllocation => ({
-  parallelSequences: value.parallelSequences,
-  physicalContextTokens: value.physicalContextTokens,
-})
 
 export const deriveCurrentLocalModel = (
   slot: Option.Option<ModelSlot>,
@@ -89,32 +74,20 @@ export const deriveCurrentLocalModel = (
         return {
           _tag: "Loading",
           ...details,
-          allocation: Option.none(),
           percentage: 0,
         }
       case "Loading":
         return {
           _tag: "Loading",
           ...details,
-          allocation: Option.map(slot.residency.plannedAllocation, allocation),
           percentage: Math.round(
             Option.getOrElse(slot.residency.progress, () => 0) * 100,
           ),
         }
       case "Ready":
-        return {
-          _tag: "Running",
-          ...details,
-          allocation: allocation(slot.residency.allocation),
-        }
+        return { _tag: "Running", ...details }
       case "Stopping":
-        return {
-          _tag: "Stopping",
-          ...details,
-          allocation: slot.residency.allocation._tag === "Resident"
-            ? Option.some(allocation(slot.residency.allocation.allocation))
-            : Option.map(slot.residency.allocation.allocation, allocation),
-        }
+        return { _tag: "Stopping", ...details }
       case "Failed":
         return {
           _tag: "Failed",

@@ -1,0 +1,5 @@
+# origin: X1:r3-t01
+# invoke: i32[1]=zero ; index:7
+# invoke: i32[1]=zero ; index:4999999999
+fn probe(out: &mut tensor[1] i32, n: index[5000000000]):
+    out[0] = i32(n)

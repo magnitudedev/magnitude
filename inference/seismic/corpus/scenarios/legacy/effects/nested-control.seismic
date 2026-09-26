@@ -1,0 +1,15 @@
+# origin: test:validation:corpus/effects.seismic:nested_control
+# invoke nested_control: f32[5]=1,4,2,6,3 ; f32[5]=zero ; bool:true ; f32:2.5
+# invoke nested_control: f32[5]=1,4,2,6,3 ; f32[5]=zero ; bool:false ; f32:2.5
+fn nested_control[N](x: &tensor[N] f32, y: &mut tensor[N] f32, enabled: bool, limit: f32):
+    let mut carried = f32(0.0)
+    if enabled:
+        for i in 0..N:
+            if x[i] > limit:
+                carried = carried + x[i]
+                y[i] = carried
+            else:
+                y[i] = x[i]
+    else:
+        for i in 0..N:
+            y[i] = limit

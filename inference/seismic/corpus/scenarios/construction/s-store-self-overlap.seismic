@@ -1,0 +1,5 @@
+# origin: C11:s_store_self_overlap
+# cell: store-slice-overlapping/sl
+# invoke: f32[4]=1,2,3,4
+fn probe(dst: &mut tensor[4] f32):
+    dst[1:4] = dst[0:3] + 1.0

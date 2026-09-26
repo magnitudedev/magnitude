@@ -1,0 +1,12 @@
+# One activation row, RMS-normalized on the fly, against a packed weight matrix: the norm
+# weight scales the activation, and the row's inverse RMS scales the result. The row
+# statistic is authored inside the output scope, so it is produced once per output owner.
+fn norm_projection[N, K](x: &tensor[1, K] bf16, nw: &tensor[1, K] bf16, w: &tensor[N, K] q4g64, eps: f32, result: &mut tensor[1, N] bf16):
+    parallel for cols in 0..N:
+        let mut acc = f32(0.0)
+        let xf = f32(x[0])
+        let ss = reduce(xf * xf, 0, sum)
+        for k in 0..K:
+            let a = f32(x[0, k]) * f32(nw[0, k])
+            acc = fma(a, f32(w[cols, k]), acc)
+        result[0, cols] = acc * rsqrt(ss / f32(K) + eps)

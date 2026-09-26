@@ -1,16 +1,12 @@
 node_modules
-# Rust/CMake outputs, including temporary standalone parity-crate builds.
+# Rust outputs.
 inference/target/
 inference/**/target/
-inference/dist/
 # Per-agent Cargo target directories and scratch source mirrors.
 **/.agent-targets/
-# Optional workspace-local model cache; the default cache is under inference/target/.
-inference/.parity-models/
-# Parity evidence uses unique, immutable run directories and is never source.
-inference/results/parity/
-# Composite benchmark evidence is likewise generated and immutable.
-inference/results/benchmark/
+# Session Bench results and local model aliases are untracked.
+inference/benchmarks/runs/
+inference/benchmarks/models.local.json
 # TypeScript benchmark evidence is generated, immutable, and workspace-local.
 benchmark-results/
 .turbo

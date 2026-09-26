@@ -1,13 +1,8 @@
 ---
 applies_to:
-  - inference-v3/src/engine/inputs/**
-  - inference-v3/src/engine/models/qwen35/**
-  - inference-v3/src/engine/models/sequence.py
-  - inference-v3/src/engine/serving/**
-  - inference-v3/src/engine/service/**
-  - inference-v3/tests/generation/**
-  - inference-v3/tests/inputs/**
-  - inference-v3/tests/models/**
+  - inference/engine/src/inputs/**
+  - inference/engine/families/qwen35/**
+  - inference/engine/serving/**
 ---
 
 # Conditioned generation
@@ -19,7 +14,7 @@ identifies token inputs, conditioning spans, processor identity, rotary coordina
 and continuation semantics. Image ordering and repeated occurrences are meaningful;
 equal image content does not merge distinct positions in the prompt. Serving owns
 validated source decoding and host preparation; model formulas own numerical
-encoding and projection through the ordinary Ops execution owner.
+encoding and projection through the ordinary execution owner.
 
 Projected features replace precisely their declared decoder embedding rows. Physical
 cache positions count consumed inputs; rotary positions express model semantics.

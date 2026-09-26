@@ -1,0 +1,10 @@
+# origin: X1:r3-t16
+# invoke: f32[4]=1,2,3,4
+# pin: result = f32[4]=2,4,6,8
+# pin: a = f32[4]=101,2,3,4
+fn bump[N](a: &mut tensor[N] f32):
+    a[0] = a[0] + 100.0
+fn probe[N](a: &mut tensor[N] f32) -> tensor[N] f32:
+    let c = a * 2.0
+    bump(a)
+    return c

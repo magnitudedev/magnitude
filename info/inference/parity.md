@@ -47,8 +47,8 @@ injects a verified local artifact path only at subprocess invocation time. Model
 token vectors and upstream CTest fixtures remain explicitly pinned instead of pretending to be
 portable.
 
-Generated evidence lives under `inference/results/parity/`. Declarative inputs and the thin oracle
-live under `inference/parity/`; orchestration and comparison code lives in the fork-independent
+Generated evidence lives under `old-inference/results/parity/`. Declarative inputs and the thin oracle
+live under `old-inference/parity/`; orchestration and comparison code lives in the fork-independent
 `icn-parity` crate. The binding-dependent ICN probe is a separate executable so the core runner and
 native baseline can be built and tested while the bindings evolve.
 

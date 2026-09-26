@@ -1,5 +1,6 @@
 import {
   deriveHardwareMemoryView,
+  formatLocalInferenceBackend,
   formatLocalModelDisplayName,
   formatMemorySize,
   formatSpeculativeMethod,
@@ -551,10 +552,10 @@ const renderHardware = (hardware: LocalInferenceHardware, models: readonly Catal
     ...(current === undefined ? ["  None"] : [
       `  ${formatLocalModelDisplayName(current)} - ${residencyLabel(current)}`,
       ...Option.match(allocation, {
-        onSome: (value) => [`  Context ${formatContext(value.contextWindowTokens)} - Parallelism ${value.parallelSequences}`],
+        onSome: (value) => [`  Context ${formatContext(value.contextWindowTokens)}`],
         onNone: () => Option.match(plan, {
           onNone: () => [],
-          onSome: (value) => [`  Context ${formatContext(value.contextWindowTokens)} - Parallelism ${value.parallelSequences}`],
+          onSome: (value) => [`  Context ${formatContext(value.contextWindowTokens)} - Device ${formatLocalInferenceBackend(value.device.backend)}`],
         }),
       }),
     ]),

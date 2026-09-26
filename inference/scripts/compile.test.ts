@@ -1,79 +1,49 @@
+import { hostById } from "@magnitudedev/release/targets"
+import { Effect, Stream } from "effect"
+import { resolve } from "node:path"
 import { describe, expect, test } from "vitest"
-import {
-  developmentBuildEnvironment,
-  developmentBuildProfile,
-} from "./build-local"
-import { readCargoMessages, runCargoBuild } from "./compile"
-import { ICN_EXECUTABLE_NAME } from "@magnitudedev/release/executables"
+import { cargoExecutables, InferenceBuildFailed, readCargoMessages, releaseRustflags } from "./compile"
+import { installationEnvironment } from "./smoke"
 
-const stream = (...chunks: readonly string[]): ReadableStream<Uint8Array> => {
-  const encoder = new TextEncoder()
-  return new ReadableStream({
-    start(controller) {
-      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
-      controller.close()
-    },
-  })
-}
+const lines = (...values: readonly string[]) => Stream.fromIterable(values)
 
-describe("ICN compilation", () => {
-  test.each(["all", "errors"] as const)("retains stderr and structured diagnostics in %s mode when Cargo fails", async diagnostics => {
-    const diagnostic = JSON.stringify({ reason: "compiler-message", message: { rendered: "tensor binding failed" } })
-    await expect(runCargoBuild([process.execPath, "-e", `console.log(${JSON.stringify(diagnostic)}); process.stderr.write("native linker failed"); process.exitCode = 101`], {
-      cwd: process.cwd(), env: process.env, diagnostics,
-    })).rejects.toThrow(/native linker failed[\s\S]*tensor binding failed/)
-  })
-
-  test("targets only attached GPUs for local CUDA builds", () => {
-    expect(developmentBuildEnvironment("cuda")).toEqual({
-      CMAKE_CUDA_ARCHITECTURES: "native",
-      LLAMA_CPU_ALL_VARIANTS: "0",
-    })
-    expect(developmentBuildEnvironment("cpu")).toEqual({})
-    expect(developmentBuildEnvironment("metal")).toEqual({
-      LLAMA_CPU_ALL_VARIANTS: "0",
-    })
-    expect(developmentBuildEnvironment("vulkan")).toEqual({
-      LLAMA_CPU_ALL_VARIANTS: "0",
-    })
-    expect(developmentBuildProfile("cuda")).toBe("development-cuda-native")
-    expect(developmentBuildProfile("cpu")).toBe("development-cpu")
-  })
-
-  test("retains streamed Cargo messages and emits rendered diagnostics", async () => {
-    const rendered: string[] = []
-    const messages = await readCargoMessages(
-      stream(
-        '{"reason":"compiler-message","message":{"rendered":"warn',
-        'ing\\n"}}\n{"reason":"build-script-executed",',
-        '"package_id":"native","out_dir":"/output"}\n',
+describe("inference compilation", () => {
+  test("retains Cargo messages, forwards rendered diagnostics and finds the service executable", async () => {
+    const forwarded: string[] = []
+    const { messages, diagnostics } = await Effect.runPromise(readCargoMessages(
+      lines(
+        JSON.stringify({ reason: "compiler-message", message: { rendered: "warning: unused\n" } }),
+        "",
+        JSON.stringify({ reason: "compiler-artifact", target: { name: "magnitude_engine" }, executable: null }),
+        JSON.stringify({ reason: "compiler-artifact", target: { name: "magnitude-inference" }, executable: "/t/magnitude-inference" }),
+        JSON.stringify({ reason: "build-finished", success: true }),
       ),
-      (diagnostic) => rendered.push(diagnostic),
-    )
-
-    expect(messages).toEqual([
-      {
-        reason: "build-script-executed",
-        package_id: "native",
-        out_dir: "/output",
-      },
-    ])
-    expect(rendered).toEqual(["warning\n"])
+      (rendered) => Effect.sync(() => { forwarded.push(rendered) }),
+    ))
+    expect(forwarded).toEqual(["warning: unused\n"])
+    expect(diagnostics).toEqual(["warning: unused\n"])
+    expect(cargoExecutables(messages, "magnitude-inference")).toEqual(["/t/magnitude-inference"])
+    expect(cargoExecutables(messages, "magnitude_engine")).toEqual([])
   })
 
-  test("retains a final Cargo message without a trailing newline", async () => {
-    await expect(
-      readCargoMessages(
-        stream(
-          `{"reason":"compiler-artifact","target":{"name":"${ICN_EXECUTABLE_NAME}"}}`,
-        ),
-        () => {},
-      ),
-    ).resolves.toEqual([
-      {
-        reason: "compiler-artifact",
-        target: { name: ICN_EXECUTABLE_NAME },
-      },
-    ])
+  test("rejects a malformed Cargo message", async () => {
+    const error = await Effect.runPromise(readCargoMessages(lines("{not json"), () => Effect.void).pipe(Effect.flip))
+    expect(error).toBeInstanceOf(InferenceBuildFailed)
+  })
+
+  test("release builds fix rustflags: baseline CPU everywhere and the ../runtime rpath on Linux", () => {
+    expect(releaseRustflags(hostById("linux-x64-gnu"))).toBe("-Clink-arg=-Wl,-rpath,$ORIGIN/../runtime")
+    expect(releaseRustflags(hostById("linux-arm64-gnu"))).toBe("-Clink-arg=-Wl,-rpath,$ORIGIN/../runtime")
+    for (const host of ["darwin-arm64", "darwin-x64", "windows-x64-msvc"] as const) {
+      expect(releaseRustflags(hostById(host))).toBe("")
+    }
+  })
+})
+
+describe("installation environment", () => {
+  test("clears inherited Unix loader paths and prepends runtime/ to the Windows PATH", () => {
+    expect(installationEnvironment("/i", "linux").LD_LIBRARY_PATH).toBe("")
+    expect(installationEnvironment("/i", "darwin").DYLD_LIBRARY_PATH).toBe("")
+    expect(installationEnvironment("/i", "win32").PATH?.startsWith(resolve("/i", "runtime"))).toBe(true)
   })
 })

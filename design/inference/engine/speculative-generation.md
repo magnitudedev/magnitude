@@ -1,11 +1,6 @@
 ---
 applies_to:
-  - inference-v2/src/magnitude_engine/generation/**
-  - inference-v2/src/magnitude_engine/models/**
-  - inference-v2/src/magnitude_engine/engine/**
-  - inference-v2/tests/generation/**
-  - inference-v2/tests/models/**
-  - inference-v2/benchmarks/**
+  - inference/engine/generation/**
 ---
 
 # Batched speculative generation
@@ -52,11 +47,11 @@ its method owns that alignment.
 | Model executor | Compatible physical execution and resource lifetime | Per-request outputs and transactional state advances |
 | State implementation | KV/recurrent layout, accepted-prefix commit, rollback or replay | Independent state resolution and any required model work |
 
-Use **typed Python generators as local resumable computations**: yield a model
-operation, receive its state advance, and eventually return a proposal or a
-completed result. The runtime drives these generators on the existing execution
-owner; this adds no threads, event loop, DI framework, or serialized live tasks.
-Blueprints still construct the methods and executors in the worker.
+Rounds are **local resumable computations**: a round yields a model operation,
+receives its state advance, and eventually returns a proposal or a completed
+result. The runtime drives rounds on the existing execution owner; this adds no
+threads, event loop, DI framework, or serialized live tasks. The worker
+constructs the methods and executors.
 
 A model operation identifies the live executor and sequence, inputs and
 conditioning, requested outputs/features, and the minimum already-causal input

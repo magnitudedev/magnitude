@@ -1,8 +1,8 @@
 ---
 applies_to:
-  - inference-v4/seismic/**
-  - inference-v4/solver/**
-  - inference-v4/engine/**
+  - inference/seismic/**
+  - inference/solver/**
+  - inference/engine/**
 ---
 
 # Seismic compilation
@@ -97,6 +97,12 @@ computes a content address over the rendered source and the NVRTC formation (rel
 architecture, options), asks the store before running NVRTC, loads a stored CUBIN instead of
 compiling, and hands every newly formed CUBIN to the store; a stored image the driver refuses is a
 miss and is formed again. Metal and CPU formation do not use the store.
+NVRTC is an owned dependency of the CUDA backend, loaded from exactly one directory: the
+installation's `runtime/` beside `bin/` (`<executable>/../runtime/`), where the release, the local
+development installation and every test layout place it together with its builtins library of the
+same release. `SEISMIC_NVRTC_DIRECTORY` replaces that directory only for engine development outside
+an installation layout. There is no search-path fallback: a missing NVRTC is a typed
+toolchain-unavailable failure, never a lookup elsewhere.
 For launch-scoped CUDA formation, each guarded launch source is addressed separately with its
 requested template expression and NVRTC formation. The stored artifact carries both the CUBIN
 and NVRTC's lowered linker name, which dispatch needs on a cache hit. The factored tuner forms
@@ -173,6 +179,20 @@ That allocation retains the mapping, and submitted work retains the allocation
 through physical completion. Host writes and writable device bindings to these
 tensors are refused. A backend without the mapping capability
 uses an owned upload instead.
+One state slab is one owned allocation with disjoint, aligned component regions.
+Each component view shares that allocation and carries its lifetime through
+submitted work. Slabs and their address table share one hazard domain, so a
+submission records one fence for the table and all its slabs regardless of
+slab count; direct host access and release of any slab observe that fence.
+A fixed address table names slab allocations by stable index;
+its entries contain the component region's device address and are changed only
+after prior uses of the table complete. On Metal, each slab remains in the
+command queue's residency set until its allocation is released. A queued
+run keeps its slab placement bound until it receives a submission fence, and
+the fence then orders table writes after physical completion. A slab
+slot may be reused after release, but its old allocation
+remains charged until every view and submitted use releases it; removing a slot
+alone gives the owner no memory credit.
 Canonical upload tensors can be filled from a host reader in bounded chunks.
 An incomplete read leaves the tensor unpublished; the caller cannot bind it
 as a native input until the whole physical byte range has been written.
@@ -678,6 +698,11 @@ contract. Generated bindings embed the captured native bytes; reopening a path
 cannot silently change an existing module. Host testing uses the numerical owner's
 comparison and bounded checked-source oracle on private invocation snapshots.
 Unsupported or resource-limited observations never count as passing checks.
+
+The engine build identity covers its Rust implementation, Seismic, the Seismic
+standard library and solver implementations, authored kernel and native helper
+sources, and the workspace dependency lock and toolchain selection. A change to
+those inputs invalidates worker compatibility and the measurement basis identity.
 
 For the explicit direct-native route, runtime renders the canonical registry descriptors of those
 compile-time bindings and of every tensor ABI leaf into the Metal source prefix before compiling

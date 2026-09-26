@@ -1,9 +1,9 @@
 ---
 applies_to:
-  - inference-v4/seismic/**
-  - inference-v4/seismic-std/**
-  - inference-v4/engine/**
-  - inference-v4/docs/seismic/**
+  - inference/seismic/**
+  - inference/seismic-std/**
+  - inference/engine/**
+  - inference/docs/seismic/**
 ---
 
 # Seismic numerical precision

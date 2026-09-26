@@ -1,0 +1,5 @@
+# origin: C17:parallel_reverse_inplace
+# rejected: "independent visits"
+fn probe[N](out: &mut tensor[N] i32):
+    parallel for i in 0..N:
+        out[i] = out[N - 1 - i]
