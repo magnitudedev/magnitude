@@ -110,8 +110,9 @@ CPU, the compiled implementation's digest of its asset, its source root's CPU li
 CPU library version).
 A CPU device executes on one worker pool per process: one participant per physical performance core,
 the submitting thread among them, shared by every CPU device the process opens. A native submission
-is one pool job whatever its launch count: the participants of each launch claim its work items and
-meet the next launch's participants at a barrier, waiting by spinning briefly, then yielding, then
+is one pool job whatever its launch count: the participants of each launch claim its work items in
+contiguous chunks of about a quarter of a participant's share, so each participant streams adjacent
+weight rows while later chunks still balance the load, and meet the next launch's participants at a barrier, waiting by spinning briefly, then yielding, then
 parking. A launch uses at most as many participants as it has work items, and its participant count
 is a tuning axis. The measured interval of a CPU submission starts when it holds the pool, so a
 submission never measures another's work.

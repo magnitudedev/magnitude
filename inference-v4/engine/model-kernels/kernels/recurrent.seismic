@@ -631,10 +631,11 @@ native gated_delta_output for vulkan from "vulkan/gated_delta_output.comp":
 # CPU: the CPU projection library (`cpu/lib/projection/projection.rs`). A
 # stage launch writes each row's gated per-head RMS·SiLU(z) prologue as F32 to
 # scratch; the row launch gives each work item ROWS output weight rows,
-# projected against every staged row and added to the hidden row.
+# projected against every staged row and added to the hidden row. The
+# projection stays exact F32: quantized activations here exceeded the 4B D4
+# prose tail limit.
 native gated_delta_output for cpu from "cpu/gated_delta_output.rs":
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
-    scratch quantized bytes (M * ceil_div(NV * W, 256) * 292)
+    params (ROWS in [8, 4, 2, 1])
     scratch staged bytes (M * NV * W * 4)
     launch gated_delta_output_stage:
         threadgroups (M, 1, 1)

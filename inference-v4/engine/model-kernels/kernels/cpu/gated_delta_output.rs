@@ -4,7 +4,9 @@
 // mixed values RMS-normalized over W and scaled by the recurrent norm (A),
 // times SiLU(z) (A), published to A. `gated_delta_output_rows` gives each
 // work item ROWS output weight rows, which it projects against every staged
-// row: result = the hidden row plus the projection published to A.
+// row: result = the hidden row plus the projection published to A. The
+// projection is exact F32: quantized activations here exceeded the 4B D4
+// tail limit on prose, so the CPU declaration offers no INT8 arithmetic.
 
 use lib::core::{activation, reduce};
 use lib::projection::projection;
@@ -45,18 +47,6 @@ fn gated_delta_output_stage<L: Isa, E: Elements>(
             *target = activation::publish::<E::A>(normalized * activated);
         }
     }
-    if cx.param_int8() == 1 {
-        let blocks = seismic::cpu::quant::blocks(nv * w);
-        // SAFETY: this work item owns the corresponding quantized row.
-        let q8 = unsafe {
-            cx.scratch_quantized()
-                .slice_mut::<seismic::cpu::quant::Q8Block>(
-                    row * blocks * projection::Q8_BYTES,
-                    blocks,
-                )
-        };
-        projection::quantize(staged, q8);
-    }
 }
 
 fn gated_delta_output_rows<L: Isa, E: Elements>(
@@ -74,16 +64,11 @@ fn gated_delta_output_rows<L: Isa, E: Elements>(
     let (hidden, result) = (cx.arg_hidden(), cx.result_0());
     // SAFETY: the stage launch wrote every row before this launch.
     let staged = unsafe { cx.scratch_staged().slice::<f32>(0, m * k) };
-    let blocks = seismic::cpu::quant::blocks(k);
-    let quantized = (cx.param_int8() == 1).then(|| unsafe {
-        cx.scratch_quantized()
-            .slice::<seismic::cpu::quant::Q8Block>(0, m * blocks)
-    });
     projection::project_staged_arithmetic(
         &cx.arg_output_weight(),
         rows.clone(),
         staged,
-        quantized,
+        None,
         |row, projected| {
             let source = hidden.span([row, rows.start], rows.len());
             // SAFETY: each work item writes its own columns of every row.

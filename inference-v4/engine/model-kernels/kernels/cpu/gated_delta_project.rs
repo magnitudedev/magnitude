@@ -65,7 +65,11 @@ fn gated_delta_project_rows<L: Isa, E: Elements>(
     // SAFETY: the normalize launch wrote every row before this launch.
     let normalized = unsafe { cx.scratch_normalized().slice::<f32>(0, m * h) };
     let blocks = seismic::cpu::quant::blocks(h);
-    let quantized = (cx.param_int8() == 1).then(|| unsafe {
+    // The alpha and beta segments project exactly under either arithmetic:
+    // they set the recurrence's decay and write strength, where activation
+    // rounding compounds over the whole sequence, and they are two of the
+    // projection's (2 NK + 2 NV) W + 2 NV rows.
+    let quantized = (cx.param_int8() == 1 && segment < 2).then(|| unsafe {
         cx.scratch_quantized()
             .slice::<seismic::cpu::quant::Q8Block>(0, m * blocks)
     });

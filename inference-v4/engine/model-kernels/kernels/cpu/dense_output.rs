@@ -57,22 +57,18 @@ fn dense_output_rows<L: Isa, E: Elements>(
         cx.scratch_quantized()
             .slice::<seismic::cpu::quant::Q8Block>(0, o * blocks)
     });
-    let mut projected = [0.0f32; projection::MAX_ROWS];
-    let projected = &mut projected[..rows.len()];
-    for row in 0..o {
-        let q8 = quantized.map(|q8| &q8[row * blocks..(row + 1) * blocks]);
-        projection::project_arithmetic(
-            &down_weight,
-            rows.start,
-            &staged[row * f..(row + 1) * f],
-            q8,
-            projected,
-        );
-        let source = residual.span([out_rows.get([row]) as usize, rows.start], rows.len());
-        // SAFETY: each work item writes its own columns of every row.
-        let out = unsafe { result.span_mut([row, rows.start], rows.len()) };
-        for ((target, residual), projected) in out.iter_mut().zip(source).zip(projected.iter()) {
-            *target = residual + activation::publish::<E::A>(*projected);
-        }
-    }
+    projection::project_staged_arithmetic(
+        &down_weight,
+        rows.clone(),
+        staged,
+        quantized,
+        |row, projected| {
+            let source = residual.span([out_rows.get([row]) as usize, rows.start], rows.len());
+            // SAFETY: each work item writes its own columns of every row.
+            let out = unsafe { result.span_mut([row, rows.start], rows.len()) };
+            for ((target, residual), projected) in out.iter_mut().zip(source).zip(projected.iter()) {
+                *target = residual + activation::publish::<E::A>(*projected);
+            }
+        },
+    );
 }

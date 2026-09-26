@@ -819,11 +819,86 @@ mod tests {
         }
     }
 
+    /// Aggregate streaming rate of the eight-row quantized dot over a matrix
+    /// far larger than the caches, split across `CPU_DOT_THREADS` threads in
+    /// contiguous ranges or, with `CPU_DOT_ITEMS=1`, in eight-row items
+    /// claimed from a shared counter as the pool does.
     #[test]
-    #[ignore = "measurement; run with --release --ignored --nocapture; CPU_DOT_REPRESENTATIONS and CPU_DOT_BLOCKS narrow it"]
+    #[ignore = "measurement; run with --release --ignored --nocapture"]
+    fn parallel_dot_streaming() {
+        use crate::quant::{blocks, quantize, Q8Block};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tier = Tier::detected().unwrap();
+        let threads = std::env::var("CPU_DOT_THREADS").map_or(10, |t| t.parse().unwrap());
+        let items = std::env::var("CPU_DOT_ITEMS").is_ok_and(|v| v == "1");
+        // Items per claim when claiming; 1 is the pool's current claim.
+        let chunk: usize = std::env::var("CPU_DOT_CHUNK").map_or(1, |c| c.parse().unwrap());
+        let (rows, k) = (98304usize, 4096usize);
+        for representation in ["q4k@rows8", "q6k@rows8"] {
+            let (data, geometry) = self::rows(representation, rows, k, 9);
+            let kernels = resolve(tier, representation).unwrap();
+            let x = bytes(5, k)
+                .iter()
+                .map(|b| (*b as f32 - 128.0) / 100.0)
+                .collect::<Vec<_>>();
+            let mut xq = vec![Q8Block::ZERO; blocks(k)];
+            quantize(&x, &mut xq);
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let next = AtomicUsize::new(0);
+                let started = std::time::Instant::now();
+                std::thread::scope(|scope| {
+                    for t in 0..threads {
+                        let (data, geometry, xq, next) = (&data, &geometry, &xq, &next);
+                        scope.spawn(move || {
+                            let mut out = [0.0f32; 8];
+                            let mut run = |first: usize| unsafe {
+                                kernels.dot_q8(
+                                    data.as_ptr().add(first * geometry.stride),
+                                    geometry,
+                                    xq,
+                                    k,
+                                    &mut out,
+                                );
+                                std::hint::black_box(&out);
+                            };
+                            if items {
+                                loop {
+                                    let first = next.fetch_add(chunk, Ordering::Relaxed);
+                                    if first * 8 >= rows {
+                                        break;
+                                    }
+                                    for item in first..(first + chunk).min(rows / 8) {
+                                        run(item * 8);
+                                    }
+                                }
+                            } else {
+                                let span = rows / threads / 8 * 8;
+                                for first in (t * span..(t + 1) * span).step_by(8) {
+                                    run(first);
+                                }
+                            }
+                        });
+                    }
+                });
+                best = best.min(started.elapsed().as_secs_f64());
+            }
+            eprintln!(
+                "{representation} threads {threads} items {items}: {:.1} Gweights/s, {:.1} GB/s",
+                (rows * k) as f64 / best / 1e9,
+                (rows * geometry.stride) as f64 / best / 1e9
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "measurement; run with --release --ignored --nocapture; CPU_DOT_REPRESENTATIONS and CPU_DOT_BLOCKS narrow it, CPU_DOT_ROWS sets the matrix rows (default 4096, which caches)"]
     fn dot_component_throughput() {
         let tier = Tier::detected().unwrap();
-        let (rows, k) = (4096usize, 4096usize);
+        let rows = std::env::var("CPU_DOT_ROWS").ok().map_or(4096, |rows| {
+            rows.parse::<usize>().expect("CPU_DOT_ROWS is a row count")
+        });
+        let k = 4096usize;
         let x = bytes(5, k)
             .iter()
             .map(|byte| (*byte as f32 - 128.0) / 100.0)

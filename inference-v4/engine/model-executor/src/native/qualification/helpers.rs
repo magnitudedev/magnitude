@@ -311,10 +311,57 @@ pub(super) fn semantic_pattern(
     if element.dtype().is_some() {
         return semantic_ones(device, element, extents, entry, bindings);
     }
-    // One GGUF source packet whose every value decodes to 1.0, repeated and
-    // converted by the registry's host reference into the element's
-    // (representation, layout): the fixture follows every layout's geometry.
-    let (source, packet) = match element.representation() {
+    let (source, packet) = pattern_source(element.representation()).ok_or_else(|| {
+        qualification_dynamic(
+            entry,
+            bindings,
+            format!(
+                "no non-degenerate fixture exists for {}",
+                element.representation()
+            ),
+        )
+    })?;
+    let repack = |extents: &[u64]| {
+        pattern_bytes(element, source, &packet, extents).ok_or_else(|| {
+            qualification_dynamic(entry, bindings, "no registered fixture conversion")
+        })
+    };
+    let mut tensor = semantic_zeros(device, element, extents, entry, bindings)?;
+    let storage = usize::try_from(tensor.storage_bytes())
+        .map_err(|_| qualification_dynamic(entry, bindings, "fixture storage exceeds usize"))?;
+    // Every source packet is identical and packed layouts place whole row
+    // groups contiguously, so a large matrix is one converted row block
+    // repeated. The host reference converts bit by bit; converting a
+    // vocabulary-sized projection whole costs seconds at every load.
+    let tiled = match extents {
+        [rows, columns] if *rows > PATTERN_BLOCK_ROWS && rows % PATTERN_BLOCK_ROWS == 0 => {
+            let block = repack(&[PATTERN_BLOCK_ROWS, *columns])?;
+            let repeats = usize::try_from(rows / PATTERN_BLOCK_ROWS)
+                .map_err(|_| qualification_dynamic(entry, bindings, "fixture exceeds usize"))?;
+            (block.len().checked_mul(repeats) == Some(storage)).then(|| block.repeat(repeats))
+        }
+        _ => None,
+    };
+    let pattern = match tiled {
+        Some(pattern) => pattern,
+        None => repack(extents)?,
+    };
+    tensor
+        .write_from_host(&pattern)
+        .map_err(|error| qualification_dynamic(entry, bindings, error))?;
+    Ok(tensor)
+}
+
+/// Rows converted once for a repeated fixture matrix: a multiple of every
+/// packed layout's row group.
+const PATTERN_BLOCK_ROWS: u64 = 256;
+
+/// One GGUF source packet whose every value decodes to 1.0, for a packed
+/// representation. Repeated and converted by the registry's host reference
+/// into the element's (representation, layout), the fixture follows every
+/// layout's geometry.
+fn pattern_source(representation: &str) -> Option<(Element, Vec<u8>)> {
+    let (source, packet) = match representation {
         "q8g32s" => (
             "gguf_q8_0",
             unit_packet(34, &[(0, &[0x00, 0x3c]), (2, &[1; 32])]),
@@ -370,37 +417,30 @@ pub(super) fn semantic_pattern(
                 ],
             ),
         ),
-        name => {
-            return Err(qualification_dynamic(
-                entry,
-                bindings,
-                format!("no non-degenerate fixture exists for {name}"),
-            ));
-        }
+        _ => return None,
     };
-    let source = Element::named(source).expect("registered GGUF source representation");
-    let length = source
-        .canonical_byte_len(extents)
-        .map_err(|error| qualification_dynamic(entry, bindings, error))?;
-    let source_bytes =
-        packet
-            .iter()
-            .copied()
-            .cycle()
-            .take(usize::try_from(length).map_err(|_| {
-                qualification_dynamic(entry, bindings, "fixture storage exceeds usize")
-            })?)
-            .collect::<Vec<_>>();
-    let pattern = element
-        .repack_host(source, extents, &source_bytes)
-        .ok_or_else(|| {
-            qualification_dynamic(entry, bindings, "no registered fixture conversion")
-        })?;
-    let mut tensor = semantic_zeros(device, element, extents, entry, bindings)?;
-    tensor
-        .write_from_host(&pattern)
-        .map_err(|error| qualification_dynamic(entry, bindings, error))?;
-    Ok(tensor)
+    Some((
+        Element::named(source).expect("registered GGUF source representation"),
+        packet,
+    ))
+}
+
+/// The host-converted fixture of `extents`: `packet` repeated over the
+/// source's canonical bytes and converted into `element`.
+fn pattern_bytes(
+    element: Element,
+    source: Element,
+    packet: &[u8],
+    extents: &[u64],
+) -> Option<Vec<u8>> {
+    let length = usize::try_from(source.canonical_byte_len(extents).ok()?).ok()?;
+    let source_bytes = packet
+        .iter()
+        .copied()
+        .cycle()
+        .take(length)
+        .collect::<Vec<_>>();
+    element.repack_host(source, extents, &source_bytes)
 }
 
 /// A source packet of `size` bytes: zero except the given byte runs.
@@ -571,4 +611,42 @@ pub(super) fn f16_to_f32(value: u16) -> f32 {
         sign | ((exponent + 127 - 15) << 23) | (mantissa << 13)
     };
     f32::from_bits(bits)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use seismic::Layout;
+
+    /// A large fixture is converted as one repeated row block; the block must
+    /// reproduce the whole conversion byte for byte in every layout.
+    #[test]
+    fn repeated_pattern_block_matches_the_whole_conversion() {
+        let mut compared = Vec::new();
+        for representation in ["q8g32s", "q4k", "q5k", "q6k", "iq4g32"] {
+            let (source, packet) = pattern_source(representation).unwrap();
+            for layout in [Layout::Packet, Layout::Rows16, Layout::Rows8, Layout::Mma16] {
+                let Some(element) = Element::stored(representation, layout) else {
+                    continue;
+                };
+                let columns = 512;
+                let Some(whole) =
+                    pattern_bytes(element, source, &packet, &[2 * PATTERN_BLOCK_ROWS, columns])
+                else {
+                    continue;
+                };
+                let block = pattern_bytes(element, source, &packet, &[PATTERN_BLOCK_ROWS, columns])
+                    .unwrap();
+                assert_eq!(block.repeat(2), whole, "{representation} {layout:?}");
+                compared.push((representation, layout));
+            }
+        }
+        // Every production row layout of every fixture format was compared.
+        for representation in ["q8g32s", "q4k", "q5k", "q6k", "iq4g32"] {
+            assert!(
+                compared.contains(&(representation, Layout::Rows16)),
+                "{representation} rows16 was not compared: {compared:?}"
+            );
+        }
+    }
 }

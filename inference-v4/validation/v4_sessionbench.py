@@ -122,13 +122,17 @@ def main() -> None:
     )
     import httpx
     from benchmark_fixtures.ruler import RulerFixture
-    from session_bench import runner
+    from session_bench import policy, runner
     from session_bench.engines import base
     from session_bench.engines.base import Adapter, installed_versions
     from session_bench.models import Target
     from session_bench.results import RunStore, atomic_json
     from session_bench.suites import SECTIONS
 
+    # Older runners predate the workload table and treat any prose request as
+    # continuation, which would record a different fixture under this name.
+    if args.workload not in getattr(policy, "WORKLOADS", {}):
+        parser.error(f"the runner at {source} does not define the {args.workload} workload")
     sections = tuple(args.suite.split(","))
     if not sections or any(section not in SECTIONS for section in sections):
         parser.error(f"suite must be one or more of {SECTIONS}")

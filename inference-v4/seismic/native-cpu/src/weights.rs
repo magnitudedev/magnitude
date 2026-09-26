@@ -93,6 +93,52 @@ impl RowGeometry {
         let byte = start * 8 + offset / bytes * bytes * 8 + lane * bytes + offset % bytes;
         unsafe { (tile_base as *const u8).add(byte) }
     }
+
+    /// The first byte of storage group `index` of `plane` in the row: the
+    /// group's bytes are contiguous in every layout, so a reduction over a
+    /// group addresses it once and steps within it without the per-byte
+    /// division of [`RowGeometry::address`].
+    #[inline(always)]
+    unsafe fn group(&self, row: *const u8, plane: Plane, index: usize) -> *const u8 {
+        let (start, bytes) = match plane {
+            Plane::Codes => (self.codes, self.groups[0]),
+            Plane::High => (self.high, self.groups[1]),
+            Plane::Scales => (self.scales, self.groups[2]),
+            Plane::Supers => (self.supers, self.groups[3]),
+        };
+        if !self.rows8 {
+            return unsafe { row.add(start + index * bytes) };
+        }
+        let (tile_base, lane) = self.row_address.unwrap_or_else(|| {
+            let index = (row as usize - self.base) / self.stride;
+            let n = self.matrix_rows;
+            let stored = index / n * n.div_ceil(8) * 8 + index % n;
+            (self.base + stored / 8 * self.stride * 8, stored % 8)
+        });
+        unsafe { (tile_base as *const u8).add(start * 8 + (index * 8 + lane) * bytes) }
+    }
+
+    /// The tile of eight resolved rows `rows` when they are lanes 0..8 of
+    /// one rows8 tile, in order.
+    #[inline(always)]
+    fn tile(rows: &[RowGeometry; 8]) -> Option<*const u8> {
+        let (base, _) = rows[0].row_address.filter(|(_, lane)| *lane == 0)?;
+        (rows[0].rows8 && (1..8).all(|lane| rows[lane].row_address == Some((base, lane))))
+            .then_some(base as *const u8)
+    }
+
+    /// Storage group `index` of `plane` for the eight lanes of the rows8
+    /// tile at `tile`: lane r's group is at `r * bytes` from the result.
+    #[inline(always)]
+    unsafe fn tile_group(&self, tile: *const u8, plane: Plane, index: usize) -> *const u8 {
+        let (start, bytes) = match plane {
+            Plane::Codes => (self.codes, self.groups[0]),
+            Plane::High => (self.high, self.groups[1]),
+            Plane::Scales => (self.scales, self.groups[2]),
+            Plane::Supers => (self.supers, self.groups[3]),
+        };
+        unsafe { tile.add(start * 8 + index * 8 * bytes) }
+    }
 }
 
 fn align(bytes: usize) -> usize {
@@ -167,10 +213,43 @@ pub trait Format: Copy + Send + Sync + 'static {
     ) -> [f32; 4] {
         x.map(|block| unsafe { Self::dot_q8::<MODE>(row, geometry, b, k, block) })
     }
+
+    /// The eight rows of the rows8 tile at `tile` against block `b`, each
+    /// in exactly the arithmetic of [`Format::dot_q8`]; `None` when the
+    /// representation computes its rows one at a time.
+    ///
+    /// # Safety
+    /// `tile` is the base of a rows8 tile of this representation with
+    /// `geometry` and `k` values, and `256 b < k`.
+    #[inline(always)]
+    unsafe fn dot_q8_tile<const MODE: u8>(
+        _geometry: &RowGeometry,
+        _tile: *const u8,
+        _b: usize,
+        _k: usize,
+        _x: &Q8Block,
+    ) -> Option<[f32; 8]> {
+        None
+    }
 }
 
 pub trait Rows8Format: Format {
     const ROWS8_NAME: &'static str;
+
+    /// [`Format::dot_q8_tile`] of this representation's rows8 storage.
+    ///
+    /// # Safety
+    /// As [`Format::dot_q8_tile`].
+    #[inline(always)]
+    unsafe fn tile_dot_q8<const MODE: u8>(
+        _geometry: &RowGeometry,
+        _tile: *const u8,
+        _b: usize,
+        _k: usize,
+        _x: &Q8Block,
+    ) -> Option<[f32; 8]> {
+        None
+    }
 }
 
 /// Eight-row interleaved storage of a packed weight format. Each plane's
@@ -188,6 +267,7 @@ impl<W: Rows8Format> Format for Rows8<W> {
         geometry
     }
 
+    #[inline(always)]
     unsafe fn decode(
         row: *const u8,
         geometry: &RowGeometry,
@@ -198,6 +278,7 @@ impl<W: Rows8Format> Format for Rows8<W> {
         unsafe { W::decode(row, geometry, p, k, out) }
     }
 
+    #[inline(always)]
     unsafe fn dot_q8<const MODE: u8>(
         row: *const u8,
         geometry: &RowGeometry,
@@ -217,6 +298,17 @@ impl<W: Rows8Format> Format for Rows8<W> {
         x: [&Q8Block; 4],
     ) -> [f32; 4] {
         unsafe { W::dot_q8_four::<MODE>(row, geometry, b, k, x) }
+    }
+
+    #[inline(always)]
+    unsafe fn dot_q8_tile<const MODE: u8>(
+        geometry: &RowGeometry,
+        tile: *const u8,
+        b: usize,
+        k: usize,
+        x: &Q8Block,
+    ) -> Option<[f32; 8]> {
+        unsafe { W::tile_dot_q8::<MODE>(geometry, tile, b, k, x) }
     }
 }
 
@@ -289,8 +381,160 @@ impl<E: Dense> Format for DenseRows<E> {
     }
 }
 
+/// Register-resident packet dots for targets whose baseline includes the
+/// dot-product instructions (every Apple silicon target). A packet's codes
+/// are formed in two vectors in element order and never leave registers;
+/// its products stay in an `int32x4` until the caller's super block ends.
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+mod packed_neon {
+    use std::arch::aarch64::*;
+
+    /// `acc` plus the four-way signed byte dot products of `a` and `b`.
+    #[inline(always)]
+    pub(super) fn sdot(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+        // Rust's dot-product intrinsic is not stable yet; the target
+        // baseline guarantees the instruction.
+        unsafe {
+            std::arch::asm!(
+                "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+                acc = inout(vreg) acc,
+                a = in(vreg) a,
+                b = in(vreg) b,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+        acc
+    }
+
+    /// The four lane partials of a 32-code packet against 32 activations.
+    ///
+    /// # Safety
+    /// `activations` addresses 32 codes.
+    #[inline(always)]
+    pub(super) unsafe fn packet(weights: [int8x16_t; 2], activations: *const i8) -> int32x4_t {
+        let (first, second) = unsafe { (vld1q_s8(activations), vld1q_s8(activations.add(16))) };
+        sdot(sdot(vdupq_n_s32(0), weights[0], first), weights[1], second)
+    }
+
+    /// The 32-code dot of two signed packets.
+    ///
+    /// # Safety
+    /// Both pointers address 32 codes.
+    #[inline(always)]
+    pub(super) unsafe fn dot32(weights: *const i8, activations: *const i8) -> i32 {
+        let weights = unsafe { [vld1q_s8(weights), vld1q_s8(weights.add(16))] };
+        vaddvq_s32(unsafe { packet(weights, activations) })
+    }
+
+    /// Sixteen codes widened to F32.
+    #[inline(always)]
+    fn widen(codes: int8x16_t) -> [float32x4_t; 4] {
+        unsafe {
+            let (low, high) = (vmovl_s8(vget_low_s8(codes)), vmovl_s8(vget_high_s8(codes)));
+            [
+                vcvtq_f32_s32(vmovl_s16(vget_low_s16(low))),
+                vcvtq_f32_s32(vmovl_s16(vget_high_s16(low))),
+                vcvtq_f32_s32(vmovl_s16(vget_low_s16(high))),
+                vcvtq_f32_s32(vmovl_s16(vget_high_s16(high))),
+            ]
+        }
+    }
+
+    /// `out[i] = scale * codes[i] + bias`, fused, for sixteen codes.
+    ///
+    /// # Safety
+    /// `out` addresses 16 values.
+    #[inline(always)]
+    pub(super) unsafe fn affine_store(codes: int8x16_t, scale: f32, bias: f32, out: *mut f32) {
+        unsafe {
+            let (scale, bias) = (vdupq_n_f32(scale), vdupq_n_f32(bias));
+            for (quarter, values) in widen(codes).into_iter().enumerate() {
+                vst1q_f32(out.add(4 * quarter), vfmaq_f32(bias, values, scale));
+            }
+        }
+    }
+
+    /// `out[i] = scale * codes[i]` for sixteen codes.
+    ///
+    /// # Safety
+    /// `out` addresses 16 values.
+    #[inline(always)]
+    pub(super) unsafe fn scaled_store(codes: int8x16_t, scale: f32, out: *mut f32) {
+        unsafe {
+            let scale = vdupq_n_f32(scale);
+            for (quarter, values) in widen(codes).into_iter().enumerate() {
+                vst1q_f32(out.add(4 * quarter), vmulq_f32(scale, values));
+            }
+        }
+    }
+
+    /// Bit `i` of `mask` as the value 16 in byte `i`.
+    #[inline(always)]
+    fn high_bits(mask: u16) -> uint8x16_t {
+        const BITS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        unsafe {
+            let bytes = vcombine_u8(vdup_n_u8(mask as u8), vdup_n_u8((mask >> 8) as u8));
+            vandq_u8(vtstq_u8(bytes, vld1q_u8(BITS.as_ptr())), vdupq_n_u8(16))
+        }
+    }
+
+    /// A q4k/q5k packet's codes in element order: codes 2i and 2i + 1 are
+    /// the low and high nibble of byte i, each joined with its bit of
+    /// `high`. Codes are at most 31, so they are also signed bytes.
+    ///
+    /// # Safety
+    /// `bytes` addresses the packet's 16 code bytes.
+    #[inline(always)]
+    pub(super) unsafe fn k_weights(bytes: *const u8, high: u32) -> [int8x16_t; 2] {
+        unsafe {
+            let packed = vld1q_u8(bytes);
+            let low = vandq_u8(packed, vdupq_n_u8(15));
+            let upper = vshrq_n_u8(packed, 4);
+            let mut first = vzip1q_u8(low, upper);
+            let mut second = vzip2q_u8(low, upper);
+            if high != 0 {
+                first = vorrq_u8(first, high_bits(high as u16));
+                second = vorrq_u8(second, high_bits((high >> 16) as u16));
+            }
+            [vreinterpretq_s8_u8(first), vreinterpretq_s8_u8(second)]
+        }
+    }
+
+    /// A q6k packet's codes minus 32 in element order: codes 2i and 2i + 1
+    /// join the low and high nibble of byte i with bits 0-1 and 2-3 of the
+    /// high plane's nibble i.
+    ///
+    /// # Safety
+    /// `codes` addresses the packet's 16 code bytes and `high` its 8 high
+    /// bytes.
+    #[inline(always)]
+    pub(super) unsafe fn q6_weights(codes: *const u8, high: *const u8) -> [int8x16_t; 2] {
+        unsafe {
+            let packed = vld1q_u8(codes);
+            let high = vld1_u8(high);
+            let (low_nibbles, high_nibbles) = (vand_u8(high, vdup_n_u8(15)), vshr_n_u8(high, 4));
+            let nibbles = vcombine_u8(
+                vzip1_u8(low_nibbles, high_nibbles),
+                vzip2_u8(low_nibbles, high_nibbles),
+            );
+            let even = vorrq_u8(
+                vandq_u8(packed, vdupq_n_u8(15)),
+                vshlq_n_u8(vandq_u8(nibbles, vdupq_n_u8(3)), 4),
+            );
+            let odd = vorrq_u8(vshrq_n_u8(packed, 4), vshlq_n_u8(vshrq_n_u8(nibbles, 2), 4));
+            let offset = vdupq_n_s8(32);
+            [
+                vsubq_s8(vreinterpretq_s8_u8(vzip1q_u8(even, odd)), offset),
+                vsubq_s8(vreinterpretq_s8_u8(vzip2q_u8(even, odd)), offset),
+            ]
+        }
+    }
+}
+
 /// Decode a packet's 32 codes (codes 2i and 2i + 1 in the low and high
-/// nibble of byte i, each joined with its bit from `high`).
+/// nibble of byte i, each joined with its bit from `high`). The dot-product
+/// baseline forms codes in registers instead (`packed_neon::k_weights`).
+#[cfg(any(test, not(all(target_arch = "aarch64", target_feature = "dotprod"))))]
 #[inline(always)]
 fn nibble_codes(bytes: &[u8; 16], high: u32) -> [u8; PACKET] {
     let mut weights = [0u8; PACKET];
@@ -316,6 +560,7 @@ fn nibble_codes(bytes: &[u8; 16], high: u32) -> [u8; PACKET] {
     weights
 }
 
+#[cfg(any(test, not(all(target_arch = "aarch64", target_feature = "dotprod"))))]
 #[inline(always)]
 fn nibble_dot<const MODE: u8>(bytes: &[u8; 16], high: u32, codes: &[i8]) -> i32 {
     let weights = nibble_codes(bytes, high);
@@ -327,6 +572,7 @@ fn nibble_dot<const MODE: u8>(bytes: &[u8; 16], high: u32, codes: &[i8]) -> i32 
 /// Integer dot of 32 unsigned weight codes and signed activation codes.
 /// The mode is fixed by the component's tier, so lower tiers never execute
 /// instructions they did not advertise.
+#[cfg(any(test, not(all(target_arch = "aarch64", target_feature = "dotprod"))))]
 #[inline(always)]
 fn dot_u8_i8<const MODE: u8>(weights: &[u8; 32], activations: &[i8; 32]) -> i32 {
     #[cfg(target_arch = "x86_64")]
@@ -338,13 +584,16 @@ fn dot_u8_i8<const MODE: u8>(weights: &[u8; 32], activations: &[i8; 32]) -> i32 
             return unsafe { dot_u8_i8_avx2(weights, activations) };
         }
     }
-    #[cfg(target_arch = "aarch64")]
+    // The unsigned codes passed by k_dot_q8 are at most 31, so their
+    // two's-complement bit pattern is also the signed value.
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    return unsafe { packed_neon::dot32(weights.as_ptr().cast(), activations.as_ptr()) };
+    #[cfg(all(target_arch = "aarch64", not(target_feature = "dotprod")))]
     if std::arch::is_aarch64_feature_detected!("dotprod") {
-        // The unsigned codes passed by k_dot_q8 are at most 31, so their
-        // two's-complement bit pattern is also the signed value.
         debug_assert!(weights.iter().all(|code| *code <= i8::MAX as u8));
         return unsafe { dot_i8_i8_dotprod(weights.as_ptr().cast(), activations.as_ptr()) };
     }
+    #[allow(unreachable_code)]
     weights
         .iter()
         .zip(activations)
@@ -392,10 +641,13 @@ fn dot_i8_i8<const MODE: u8>(weights: &[i8; 32], activations: &[i8; 32]) -> i32 
             return unsafe { dot_i8_i8_avx2(weights, activations) };
         }
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    return unsafe { packed_neon::dot32(weights.as_ptr(), activations.as_ptr()) };
+    #[cfg(all(target_arch = "aarch64", not(target_feature = "dotprod")))]
     if std::arch::is_aarch64_feature_detected!("dotprod") {
         return unsafe { dot_i8_i8_dotprod(weights.as_ptr(), activations.as_ptr()) };
     }
+    #[allow(unreachable_code)]
     weights
         .iter()
         .zip(activations)
@@ -403,9 +655,10 @@ fn dot_i8_i8<const MODE: u8>(weights: &[i8; 32], activations: &[i8; 32]) -> i32 
         .sum()
 }
 
-/// Apple silicon and other ARM CPUs with dot-product instructions reduce two
-/// 16-byte signed packets without scalar widening or a temporary sum array.
-#[cfg(target_arch = "aarch64")]
+/// ARM CPUs whose target baseline lacks the dot-product instructions but
+/// that report them at run time reduce two 16-byte signed packets without
+/// scalar widening or a temporary sum array.
+#[cfg(all(target_arch = "aarch64", not(target_feature = "dotprod")))]
 #[target_feature(enable = "dotprod")]
 unsafe fn dot_i8_i8_dotprod(weights: *const i8, activations: *const i8) -> i32 {
     use std::arch::aarch64::*;
@@ -466,18 +719,38 @@ unsafe fn k_dot_q8<const MODE: u8>(
     x: &Q8Block,
     high: impl Fn(usize) -> u32,
 ) -> f32 {
-    let factors: [u16; 2] = unsafe { read(geometry.address(row, Plane::Supers, 4 * b)) };
-    let fields: [u8; 12] = unsafe { read(geometry.address(row, Plane::Scales, 12 * b)) };
-    let codes = unsafe { geometry.address(row, Plane::Codes, 128 * b) };
-    let (mut scaled, mut minimums) = (0i32, 0i32);
-    for p in block_packets(b, k) {
-        let local = p - 8 * b;
-        let (scale, minimum) = k_scale_min(&fields, local);
-        let bytes: [u8; 16] = unsafe { read(codes.add(16 * local)) };
-        let high = high(p);
-        scaled += scale * nibble_dot::<MODE>(&bytes, high, &x.codes[32 * local..]);
-        minimums += minimum * (i32::from(x.sums[2 * local]) + i32::from(x.sums[2 * local + 1]));
-    }
+    let factors: [u16; 2] = unsafe { read(geometry.group(row, Plane::Supers, b)) };
+    let fields: [u8; 12] = unsafe { read(geometry.group(row, Plane::Scales, b)) };
+    let codes = unsafe { geometry.group(row, Plane::Codes, b) };
+    let mut minimums = 0i32;
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    let scaled = {
+        use std::arch::aarch64::*;
+        let mut lanes = unsafe { vdupq_n_s32(0) };
+        for p in block_packets(b, k) {
+            let local = p - 8 * b;
+            let (scale, minimum) = k_scale_min(&fields, local);
+            let weights = unsafe { packed_neon::k_weights(codes.add(16 * local), high(p)) };
+            let products =
+                unsafe { packed_neon::packet(weights, x.codes.as_ptr().add(32 * local)) };
+            lanes = unsafe { vmlaq_n_s32(lanes, products, scale) };
+            minimums += minimum * (i32::from(x.sums[2 * local]) + i32::from(x.sums[2 * local + 1]));
+        }
+        unsafe { vaddvq_s32(lanes) }
+    };
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
+    let scaled = {
+        let mut scaled = 0i32;
+        for p in block_packets(b, k) {
+            let local = p - 8 * b;
+            let (scale, minimum) = k_scale_min(&fields, local);
+            let bytes: [u8; 16] = unsafe { read(codes.add(16 * local)) };
+            let high = high(p);
+            scaled += scale * nibble_dot::<MODE>(&bytes, high, &x.codes[32 * local..]);
+            minimums += minimum * (i32::from(x.sums[2 * local]) + i32::from(x.sums[2 * local + 1]));
+        }
+        scaled
+    };
     x.d * (f16_to_f32(factors[0]) * scaled as f32 - f16_to_f32(factors[1]) * minimums as f32)
 }
 
@@ -493,25 +766,48 @@ unsafe fn k_dot_q8_four<const MODE: u8>(
     x: [&Q8Block; 4],
     high: impl Fn(usize) -> u32,
 ) -> [f32; 4] {
-    let factors: [u16; 2] = unsafe { read(geometry.address(row, Plane::Supers, 4 * b)) };
-    let fields: [u8; 12] = unsafe { read(geometry.address(row, Plane::Scales, 12 * b)) };
-    let codes = unsafe { geometry.address(row, Plane::Codes, 128 * b) };
-    let (mut scaled, mut minimums) = ([0i32; 4], [0i32; 4]);
-    for p in block_packets(b, k) {
-        let local = p - 8 * b;
-        let (scale, minimum) = k_scale_min(&fields, local);
-        let bytes: [u8; 16] = unsafe { read(codes.add(16 * local)) };
-        let high = high(p);
-        let weights = nibble_codes(&bytes, high);
-        for m in 0..4 {
-            let activations: &[i8; PACKET] = x[m].codes[32 * local..32 * local + PACKET]
-                .try_into()
-                .expect("one packet");
-            scaled[m] += scale * dot_u8_i8::<MODE>(&weights, activations);
-            minimums[m] +=
-                minimum * (i32::from(x[m].sums[2 * local]) + i32::from(x[m].sums[2 * local + 1]));
+    let factors: [u16; 2] = unsafe { read(geometry.group(row, Plane::Supers, b)) };
+    let fields: [u8; 12] = unsafe { read(geometry.group(row, Plane::Scales, b)) };
+    let codes = unsafe { geometry.group(row, Plane::Codes, b) };
+    let mut minimums = [0i32; 4];
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    let scaled = {
+        use std::arch::aarch64::*;
+        let mut lanes = unsafe { [vdupq_n_s32(0); 4] };
+        for p in block_packets(b, k) {
+            let local = p - 8 * b;
+            let (scale, minimum) = k_scale_min(&fields, local);
+            let weights = unsafe { packed_neon::k_weights(codes.add(16 * local), high(p)) };
+            for m in 0..4 {
+                let products =
+                    unsafe { packed_neon::packet(weights, x[m].codes.as_ptr().add(32 * local)) };
+                lanes[m] = unsafe { vmlaq_n_s32(lanes[m], products, scale) };
+                minimums[m] += minimum
+                    * (i32::from(x[m].sums[2 * local]) + i32::from(x[m].sums[2 * local + 1]));
+            }
         }
-    }
+        lanes.map(|lanes| unsafe { vaddvq_s32(lanes) })
+    };
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
+    let scaled = {
+        let mut scaled = [0i32; 4];
+        for p in block_packets(b, k) {
+            let local = p - 8 * b;
+            let (scale, minimum) = k_scale_min(&fields, local);
+            let bytes: [u8; 16] = unsafe { read(codes.add(16 * local)) };
+            let high = high(p);
+            let weights = nibble_codes(&bytes, high);
+            for m in 0..4 {
+                let activations: &[i8; PACKET] = x[m].codes[32 * local..32 * local + PACKET]
+                    .try_into()
+                    .expect("one packet");
+                scaled[m] += scale * dot_u8_i8::<MODE>(&weights, activations);
+                minimums[m] += minimum
+                    * (i32::from(x[m].sums[2 * local]) + i32::from(x[m].sums[2 * local + 1]));
+            }
+        }
+        scaled
+    };
     let (scale, minimum) = (f16_to_f32(factors[0]), f16_to_f32(factors[1]));
     std::array::from_fn(|m| x[m].d * (scale * scaled[m] as f32 - minimum * minimums[m] as f32))
 }
@@ -533,15 +829,47 @@ unsafe fn nibbles(row: *const u8, geometry: &RowGeometry, p: usize) -> [u8; PACK
     codes
 }
 
+/// The 32 values of packet `p` of a q4k or q5k row, `scale * code + bias`
+/// fused, with the packet's high-bit mask `high` (zero for q4k).
+#[inline(always)]
+unsafe fn k_decode(
+    row: *const u8,
+    geometry: &RowGeometry,
+    p: usize,
+    high: u32,
+    out: &mut [f32; PACKET],
+) {
+    let (scale, bias) = unsafe { k_coefficients(row, geometry, p) };
+    let bytes = unsafe { geometry.group(row, Plane::Codes, p >> 3).add(16 * (p & 7)) };
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    unsafe {
+        let [first, second] = packed_neon::k_weights(bytes, high);
+        packed_neon::affine_store(first, scale, bias, out.as_mut_ptr());
+        packed_neon::affine_store(second, scale, bias, out.as_mut_ptr().add(16));
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
+    {
+        let codes = nibble_codes(unsafe { &*bytes.cast::<[u8; 16]>() }, high);
+        for (target, code) in out.iter_mut().zip(codes) {
+            *target = scale.mul_add(f32::from(code), bias);
+        }
+    }
+}
+
 /// The (scale, bias) of packet `p` of a q4k or q5k row: 6-bit scale and min
 /// of the packet's group of 32 and the (d, dmin) of its group of 256.
 #[inline(always)]
 unsafe fn k_coefficients(row: *const u8, geometry: &RowGeometry, p: usize) -> (f32, f32) {
     let (block, local) = (p >> 3, p & 7);
-    let fields: [u8; 2] =
-        unsafe { read(geometry.address(row, Plane::Scales, 12 * block + ((3 * local) >> 1))) };
+    let fields: [u8; 2] = unsafe {
+        read(
+            geometry
+                .group(row, Plane::Scales, block)
+                .add((3 * local) >> 1),
+        )
+    };
     let pair = (u32::from(fields[0]) | (u32::from(fields[1]) << 8)) >> ((local & 1) * 4);
-    let factors: [u16; 2] = unsafe { read(geometry.address(row, Plane::Supers, 4 * block)) };
+    let factors: [u16; 2] = unsafe { read(geometry.group(row, Plane::Supers, block)) };
     let scale = f16_to_f32(factors[0]) * (pair & 63) as f32;
     let bias = -(f16_to_f32(factors[1]) * ((pair >> 6) & 63) as f32);
     (scale, bias)
@@ -579,11 +907,7 @@ impl Format for Q4K {
         _k: usize,
         out: &mut [f32; PACKET],
     ) {
-        let codes = unsafe { nibbles(row, geometry, p) };
-        let (scale, bias) = unsafe { k_coefficients(row, geometry, p) };
-        for (target, code) in out.iter_mut().zip(codes) {
-            *target = scale.mul_add(f32::from(code), bias);
-        }
+        unsafe { k_decode(row, geometry, p, 0, out) }
     }
 
     #[inline(always)]
@@ -641,15 +965,8 @@ impl Format for Q5K {
         _k: usize,
         out: &mut [f32; PACKET],
     ) {
-        let mut codes = unsafe { nibbles(row, geometry, p) };
-        let high: u32 = unsafe { read(geometry.address(row, Plane::High, 4 * p)) };
-        for (i, code) in codes.iter_mut().enumerate() {
-            *code |= (((high >> i) & 1) as u8) << 4;
-        }
-        let (scale, bias) = unsafe { k_coefficients(row, geometry, p) };
-        for (target, code) in out.iter_mut().zip(codes) {
-            *target = scale.mul_add(f32::from(code), bias);
-        }
+        let high: u32 = unsafe { read(geometry.group(row, Plane::High, p >> 3).add(4 * (p & 7))) };
+        unsafe { k_decode(row, geometry, p, high, out) }
     }
 
     #[inline(always)]
@@ -660,9 +977,11 @@ impl Format for Q5K {
         k: usize,
         x: &Q8Block,
     ) -> f32 {
+        let masks = unsafe { geometry.group(row, Plane::High, b) };
         let high = |p: usize| {
-            // SAFETY: packet `p` of this row exists (`k_dot_q8` visits only those).
-            unsafe { read(geometry.address(row, Plane::High, 4 * p)) }
+            // SAFETY: packet `p` of this row exists (`k_dot_q8` visits only
+            // those of block `b`), and its mask is at `4 (p - 8 b)` in the group.
+            unsafe { read(masks.add(4 * (p - 8 * b))) }
         };
         unsafe { k_dot_q8::<MODE>(row, geometry, b, k, x, high) }
     }
@@ -675,7 +994,8 @@ impl Format for Q5K {
         k: usize,
         x: [&Q8Block; 4],
     ) -> [f32; 4] {
-        let high = |p: usize| unsafe { read(geometry.address(row, Plane::High, 4 * p)) };
+        let masks = unsafe { geometry.group(row, Plane::High, b) };
+        let high = |p: usize| unsafe { read(masks.add(4 * (p - 8 * b))) };
         unsafe { k_dot_q8_four::<MODE>(row, geometry, b, k, x, high) }
     }
 }
@@ -684,6 +1004,7 @@ impl Format for Q5K {
 #[derive(Clone, Copy, Debug)]
 pub struct Q6K;
 
+#[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
 #[inline(always)]
 unsafe fn q6_codes(row: *const u8, geometry: &RowGeometry, p: usize) -> [i8; PACKET] {
     let bytes: [u8; 16] = unsafe { read(geometry.address(row, Plane::Codes, 16 * p)) };
@@ -697,6 +1018,7 @@ unsafe fn q6_codes(row: *const u8, geometry: &RowGeometry, p: usize) -> [i8; PAC
     codes
 }
 
+#[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
 #[inline(always)]
 fn q6_packet_dot<const MODE: u8>(
     codes: &[i8; PACKET],
@@ -739,13 +1061,26 @@ impl Format for Q6K {
         _k: usize,
         out: &mut [f32; PACKET],
     ) {
-        let codes = unsafe { q6_codes(row, geometry, p) };
-        let local: [i8; 2] = unsafe { read(geometry.address(row, Plane::Scales, 2 * p)) };
-        let d =
-            f16_to_f32(unsafe { read::<u16>(geometry.address(row, Plane::Supers, 2 * (p >> 3))) });
-        let scales = [d * f32::from(local[0]), d * f32::from(local[1])];
-        for (i, (target, code)) in out.iter_mut().zip(codes).enumerate() {
-            *target = scales[i / 16] * f32::from(code);
+        let (block, local) = (p >> 3, p & 7);
+        let scale: [i8; 2] =
+            unsafe { read(geometry.group(row, Plane::Scales, block).add(2 * local)) };
+        let d = f16_to_f32(unsafe { read::<u16>(geometry.group(row, Plane::Supers, block)) });
+        let scales = [d * f32::from(scale[0]), d * f32::from(scale[1])];
+        #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+        unsafe {
+            let [first, second] = packed_neon::q6_weights(
+                geometry.group(row, Plane::Codes, block).add(16 * local),
+                geometry.group(row, Plane::High, block).add(8 * local),
+            );
+            packed_neon::scaled_store(first, scales[0], out.as_mut_ptr());
+            packed_neon::scaled_store(second, scales[1], out.as_mut_ptr().add(16));
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
+        {
+            let codes = unsafe { q6_codes(row, geometry, p) };
+            for (i, (target, code)) in out.iter_mut().zip(codes).enumerate() {
+                *target = scales[i / 16] * f32::from(code);
+            }
         }
     }
 
@@ -757,16 +1092,53 @@ impl Format for Q6K {
         k: usize,
         x: &Q8Block,
     ) -> f32 {
-        let d = f16_to_f32(unsafe { read::<u16>(geometry.address(row, Plane::Supers, 2 * b)) });
-        let mut scaled = 0i32;
-        for p in block_packets(b, k) {
-            let local: [i8; 2] = unsafe { read(geometry.address(row, Plane::Scales, 2 * p)) };
-            let codes = unsafe { q6_codes(row, geometry, p) };
-            let activations: &[i8; 32] = x.codes[32 * (p - 8 * b)..32 * (p - 8 * b) + 32]
-                .try_into()
-                .expect("a packet of codes");
-            scaled += q6_packet_dot::<MODE>(&codes, local, activations);
-        }
+        let d = f16_to_f32(unsafe { read::<u16>(geometry.group(row, Plane::Supers, b)) });
+        #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+        let scaled = {
+            use std::arch::aarch64::*;
+            let (codes, high, scales) = unsafe {
+                (
+                    geometry.group(row, Plane::Codes, b),
+                    geometry.group(row, Plane::High, b),
+                    geometry.group(row, Plane::Scales, b),
+                )
+            };
+            let mut lanes = unsafe { vdupq_n_s32(0) };
+            for p in block_packets(b, k) {
+                let local = p - 8 * b;
+                let scale: [i8; 2] = unsafe { read(scales.add(2 * local)) };
+                let [first, second] =
+                    unsafe { packed_neon::q6_weights(codes.add(16 * local), high.add(8 * local)) };
+                let activations = unsafe { x.codes.as_ptr().add(32 * local) };
+                let zero = unsafe { vdupq_n_s32(0) };
+                unsafe {
+                    lanes = vmlaq_n_s32(
+                        lanes,
+                        packed_neon::sdot(zero, first, vld1q_s8(activations)),
+                        i32::from(scale[0]),
+                    );
+                    lanes = vmlaq_n_s32(
+                        lanes,
+                        packed_neon::sdot(zero, second, vld1q_s8(activations.add(16))),
+                        i32::from(scale[1]),
+                    );
+                }
+            }
+            unsafe { vaddvq_s32(lanes) }
+        };
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
+        let scaled = {
+            let mut scaled = 0i32;
+            for p in block_packets(b, k) {
+                let local: [i8; 2] = unsafe { read(geometry.address(row, Plane::Scales, 2 * p)) };
+                let codes = unsafe { q6_codes(row, geometry, p) };
+                let activations: &[i8; 32] = x.codes[32 * (p - 8 * b)..32 * (p - 8 * b) + 32]
+                    .try_into()
+                    .expect("a packet of codes");
+                scaled += q6_packet_dot::<MODE>(&codes, local, activations);
+            }
+            scaled
+        };
         x.d * (d * scaled as f32)
     }
 
@@ -778,19 +1150,58 @@ impl Format for Q6K {
         k: usize,
         x: [&Q8Block; 4],
     ) -> [f32; 4] {
-        let d = f16_to_f32(unsafe { read::<u16>(geometry.address(row, Plane::Supers, 2 * b)) });
-        let mut scaled = [0i32; 4];
-        for p in block_packets(b, k) {
-            let local: [i8; 2] = unsafe { read(geometry.address(row, Plane::Scales, 2 * p)) };
-            let codes = unsafe { q6_codes(row, geometry, p) };
-            for m in 0..4 {
-                let activations: &[i8; PACKET] = x[m].codes
-                    [32 * (p - 8 * b)..32 * (p - 8 * b) + PACKET]
-                    .try_into()
-                    .expect("a packet of codes");
-                scaled[m] += q6_packet_dot::<MODE>(&codes, local, activations);
+        let d = f16_to_f32(unsafe { read::<u16>(geometry.group(row, Plane::Supers, b)) });
+        #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+        let scaled = {
+            use std::arch::aarch64::*;
+            let (codes, high, scales) = unsafe {
+                (
+                    geometry.group(row, Plane::Codes, b),
+                    geometry.group(row, Plane::High, b),
+                    geometry.group(row, Plane::Scales, b),
+                )
+            };
+            let mut lanes = unsafe { [vdupq_n_s32(0); 4] };
+            for p in block_packets(b, k) {
+                let local = p - 8 * b;
+                let scale: [i8; 2] = unsafe { read(scales.add(2 * local)) };
+                let [first, second] =
+                    unsafe { packed_neon::q6_weights(codes.add(16 * local), high.add(8 * local)) };
+                for m in 0..4 {
+                    let activations = unsafe { x[m].codes.as_ptr().add(32 * local) };
+                    let zero = unsafe { vdupq_n_s32(0) };
+                    unsafe {
+                        lanes[m] = vmlaq_n_s32(
+                            lanes[m],
+                            packed_neon::sdot(zero, first, vld1q_s8(activations)),
+                            i32::from(scale[0]),
+                        );
+                        lanes[m] = vmlaq_n_s32(
+                            lanes[m],
+                            packed_neon::sdot(zero, second, vld1q_s8(activations.add(16))),
+                            i32::from(scale[1]),
+                        );
+                    }
+                }
             }
-        }
+            lanes.map(|lanes| unsafe { vaddvq_s32(lanes) })
+        };
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
+        let scaled = {
+            let mut scaled = [0i32; 4];
+            for p in block_packets(b, k) {
+                let local: [i8; 2] = unsafe { read(geometry.address(row, Plane::Scales, 2 * p)) };
+                let codes = unsafe { q6_codes(row, geometry, p) };
+                for m in 0..4 {
+                    let activations: &[i8; PACKET] = x[m].codes
+                        [32 * (p - 8 * b)..32 * (p - 8 * b) + PACKET]
+                        .try_into()
+                        .expect("a packet of codes");
+                    scaled[m] += q6_packet_dot::<MODE>(&codes, local, activations);
+                }
+            }
+            scaled
+        };
         std::array::from_fn(|m| x[m].d * (d * scaled[m] as f32))
     }
 }
@@ -927,12 +1338,173 @@ impl Format for Iq4 {
 
 impl Rows8Format for Q4K {
     const ROWS8_NAME: &'static str = "q4k@rows8";
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[inline(always)]
+    unsafe fn tile_dot_q8<const MODE: u8>(
+        geometry: &RowGeometry,
+        tile: *const u8,
+        b: usize,
+        k: usize,
+        x: &Q8Block,
+    ) -> Option<[f32; 8]> {
+        Some(unsafe { k_tile_dot_q8(geometry, tile, b, k, x, None) })
+    }
 }
 impl Rows8Format for Q5K {
     const ROWS8_NAME: &'static str = "q5k@rows8";
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[inline(always)]
+    unsafe fn tile_dot_q8<const MODE: u8>(
+        geometry: &RowGeometry,
+        tile: *const u8,
+        b: usize,
+        k: usize,
+        x: &Q8Block,
+    ) -> Option<[f32; 8]> {
+        let masks = unsafe { geometry.tile_group(tile, Plane::High, b) };
+        Some(unsafe { k_tile_dot_q8(geometry, tile, b, k, x, Some(masks)) })
+    }
 }
 impl Rows8Format for Q6K {
     const ROWS8_NAME: &'static str = "q6k@rows8";
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[inline(always)]
+    unsafe fn tile_dot_q8<const MODE: u8>(
+        geometry: &RowGeometry,
+        tile: *const u8,
+        b: usize,
+        k: usize,
+        x: &Q8Block,
+    ) -> Option<[f32; 8]> {
+        Some(unsafe { q6_tile_dot_q8(geometry, tile, b, k, x) })
+    }
+}
+
+/// The eight rows of a q4k/q5k rows8 tile against block `b`, each in the
+/// arithmetic of `k_dot_q8`: the same exact integer sums and the same `f32`
+/// combine. The activation packets load once for the eight rows, each row's
+/// twelve coefficient bytes unpack once, and the activation pair sums of
+/// the minimum terms are shared. `masks` is the tile's q5k high-mask group
+/// of the block.
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+#[inline(always)]
+unsafe fn k_tile_dot_q8(
+    geometry: &RowGeometry,
+    tile: *const u8,
+    b: usize,
+    k: usize,
+    x: &Q8Block,
+    masks: Option<*const u8>,
+) -> [f32; 8] {
+    use std::arch::aarch64::*;
+    let (codes, fields, factors) = unsafe {
+        (
+            geometry.tile_group(tile, Plane::Codes, b),
+            geometry.tile_group(tile, Plane::Scales, b),
+            geometry.tile_group(tile, Plane::Supers, b),
+        )
+    };
+    let count = block_packets(b, k).len();
+    let pair_sums: [i32; 8] = std::array::from_fn(|local| {
+        i32::from(x.sums[2 * local]) + i32::from(x.sums[2 * local + 1])
+    });
+    let mut scales = [[0i32; 8]; 8];
+    let mut minimums = [0i32; 8];
+    for (row, (scales, minimum)) in scales.iter_mut().zip(&mut minimums).enumerate() {
+        // Pair `local` is the 12-bit field at bit 12 local of the twelve
+        // bytes: fields 0..5 lie in bytes 0..8, fields 5..8 in bytes 4..12.
+        let bytes = unsafe { fields.add(12 * row) };
+        let (low, high) = unsafe { (read::<u64>(bytes), read::<u64>(bytes.add(4))) };
+        for local in 0..count {
+            let pair = if local < 5 {
+                low >> (12 * local)
+            } else {
+                high >> (12 * local - 32)
+            };
+            scales[local] = (pair & 63) as i32;
+            *minimum += ((pair >> 6) & 63) as i32 * pair_sums[local];
+        }
+    }
+    let mut lanes = unsafe { [vdupq_n_s32(0); 8] };
+    for local in 0..count {
+        let activations = unsafe { x.codes.as_ptr().add(32 * local) };
+        let (first, second) = unsafe { (vld1q_s8(activations), vld1q_s8(activations.add(16))) };
+        for (row, lanes) in lanes.iter_mut().enumerate() {
+            let mask = masks.map_or(0, |masks| unsafe {
+                read::<u32>(masks.add(32 * row + 4 * local))
+            });
+            let [leading, trailing] =
+                unsafe { packed_neon::k_weights(codes.add(128 * row + 16 * local), mask) };
+            let products = packed_neon::sdot(
+                packed_neon::sdot(unsafe { vdupq_n_s32(0) }, leading, first),
+                trailing,
+                second,
+            );
+            *lanes = unsafe { vmlaq_n_s32(*lanes, products, scales[row][local]) };
+        }
+    }
+    std::array::from_fn(|row| {
+        let pair: [u16; 2] = unsafe { read(factors.add(4 * row)) };
+        let scaled = unsafe { vaddvq_s32(lanes[row]) };
+        x.d * (f16_to_f32(pair[0]) * scaled as f32 - f16_to_f32(pair[1]) * minimums[row] as f32)
+    })
+}
+
+/// The eight rows of a q6k rows8 tile against block `b`, each in the
+/// arithmetic of the q6k `dot_q8`, with the activation packets loaded once
+/// for the eight rows.
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+#[inline(always)]
+unsafe fn q6_tile_dot_q8(
+    geometry: &RowGeometry,
+    tile: *const u8,
+    b: usize,
+    k: usize,
+    x: &Q8Block,
+) -> [f32; 8] {
+    use std::arch::aarch64::*;
+    let (codes, high, scales, supers) = unsafe {
+        (
+            geometry.tile_group(tile, Plane::Codes, b),
+            geometry.tile_group(tile, Plane::High, b),
+            geometry.tile_group(tile, Plane::Scales, b),
+            geometry.tile_group(tile, Plane::Supers, b),
+        )
+    };
+    let mut lanes = unsafe { [vdupq_n_s32(0); 8] };
+    for local in 0..block_packets(b, k).len() {
+        let activations = unsafe { x.codes.as_ptr().add(32 * local) };
+        let (first, second) = unsafe { (vld1q_s8(activations), vld1q_s8(activations.add(16))) };
+        for (row, lanes) in lanes.iter_mut().enumerate() {
+            let scale: [i8; 2] = unsafe { read(scales.add(16 * row + 2 * local)) };
+            let [leading, trailing] = unsafe {
+                packed_neon::q6_weights(
+                    codes.add(128 * row + 16 * local),
+                    high.add(64 * row + 8 * local),
+                )
+            };
+            let zero = unsafe { vdupq_n_s32(0) };
+            unsafe {
+                *lanes = vmlaq_n_s32(
+                    *lanes,
+                    packed_neon::sdot(zero, leading, first),
+                    i32::from(scale[0]),
+                );
+                *lanes = vmlaq_n_s32(
+                    *lanes,
+                    packed_neon::sdot(zero, trailing, second),
+                    i32::from(scale[1]),
+                );
+            }
+        }
+    }
+    std::array::from_fn(|row| {
+        let d = f16_to_f32(unsafe { read::<u16>(supers.add(2 * row)) });
+        x.d * (d * unsafe { vaddvq_s32(lanes[row]) } as f32)
+    })
 }
 impl Rows8Format for Q8 {
     const ROWS8_NAME: &'static str = "q8g32s@rows8";
@@ -1031,6 +1603,27 @@ pub unsafe fn dot_q8_rows<W: Format, const R: usize, const MODE: u8>(
     let resolved = std::array::from_fn::<_, R, _>(|r| {
         geometry.for_row(unsafe { rows.add(r * geometry.stride) })
     });
+    // Eight rows forming one rows8 tile reduce together when the
+    // representation has a tile form (it has one for every block or none).
+    let tile = <&[RowGeometry; 8]>::try_from(resolved.as_slice())
+        .ok()
+        .and_then(RowGeometry::tile);
+    if let Some(tile) = tile {
+        let mut tiled = true;
+        for (b, block) in x.iter().enumerate() {
+            let Some(values) = (unsafe { W::dot_q8_tile::<MODE>(&resolved[0], tile, b, k, block) })
+            else {
+                tiled = false;
+                break;
+            };
+            for (sum, value) in sums.iter_mut().zip(values) {
+                *sum += value;
+            }
+        }
+        if tiled {
+            return sums;
+        }
+    }
     for (b, block) in x.iter().enumerate() {
         for (r, sum) in sums.iter_mut().enumerate() {
             *sum += unsafe {

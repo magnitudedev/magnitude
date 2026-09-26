@@ -246,6 +246,239 @@ impl Online<'_> {
     }
 }
 
+/// One history vector in affine storage: packed codes and (scale, zero)
+/// F16 pairs per GROUP columns.
+pub type AffineRow<'a> = (&'a [u32], &'a [u16]);
+
+impl Online<'_> {
+    /// [`Online::absorb`] over affine K8/V4 history, with the same result
+    /// bits: keys and values decode in registers straight into the score
+    /// dots and value updates. Every score is the same eight-lane fused dot
+    /// combined by the same tree, and every accumulator element takes the
+    /// same fused updates in key order; only the loops are tiled, so no row
+    /// round-trips through memory and each accumulator block stays in
+    /// registers across a block of keys.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn absorb_affine<'h>(
+        &mut self,
+        queries: &[f32],
+        scale: f32,
+        count: usize,
+        scores: &mut [f32],
+        row: &mut [f32],
+        key: impl Fn(usize) -> AffineRow<'h>,
+        value: impl Fn(usize) -> AffineRow<'h>,
+    ) {
+        #[cfg(target_arch = "aarch64")]
+        affine_neon::absorb(self, queries, scale, count, scores, row, key, value);
+        #[cfg(not(target_arch = "aarch64"))]
+        self.absorb(
+            queries,
+            scale,
+            count,
+            scores,
+            row,
+            |j, out| {
+                let (codes, coefficients) = key(j);
+                affine_decode(codes, coefficients, KEY_BITS, out)
+            },
+            |j, out| {
+                let (codes, coefficients) = value(j);
+                affine_decode(codes, coefficients, VALUE_BITS, out)
+            },
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod affine_neon {
+    use super::{math, reduce, AffineRow, Online, BLOCK, GROUP};
+    use seismic::cpu::{Dense, F16};
+    use std::arch::aarch64::*;
+
+    /// Value columns updated together.
+    const COLUMNS: usize = 16;
+
+    /// Sixteen codes as `code * scale + zero`, fused.
+    #[inline(always)]
+    unsafe fn decode16(codes: uint8x16_t, scale: float32x4_t, zero: float32x4_t) -> [float32x4_t; 4] {
+        unsafe {
+            let (low, high) = (vmovl_u8(vget_low_u8(codes)), vmovl_u8(vget_high_u8(codes)));
+            [
+                vfmaq_f32(zero, vcvtq_f32_u32(vmovl_u16(vget_low_u16(low))), scale),
+                vfmaq_f32(zero, vcvtq_f32_u32(vmovl_u16(vget_high_u16(low))), scale),
+                vfmaq_f32(zero, vcvtq_f32_u32(vmovl_u16(vget_low_u16(high))), scale),
+                vfmaq_f32(zero, vcvtq_f32_u32(vmovl_u16(vget_high_u16(high))), scale),
+            ]
+        }
+    }
+
+    /// The (scale, zero) of `group` as broadcast vectors.
+    #[inline(always)]
+    fn coefficients(pairs: &[u16], group: usize) -> (float32x4_t, float32x4_t) {
+        unsafe {
+            (
+                vdupq_n_f32(F16::widen(pairs[2 * group])),
+                vdupq_n_f32(F16::widen(pairs[2 * group + 1])),
+            )
+        }
+    }
+
+    /// `reduce::combine` of eight lanes held as (lanes 0..4, lanes 4..8).
+    #[inline(always)]
+    fn combine(low: float32x4_t, high: float32x4_t) -> f32 {
+        unsafe {
+            let pairs = vaddq_f32(low, high);
+            (vgetq_lane_f32(pairs, 0) + vgetq_lane_f32(pairs, 2))
+                + (vgetq_lane_f32(pairs, 1) + vgetq_lane_f32(pairs, 3))
+        }
+    }
+
+    /// Dispatches on the query heads per key/value head, so each head's
+    /// accumulators are registers rather than a runtime-indexed array.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn absorb<'h>(
+        state: &mut Online<'_>,
+        queries: &[f32],
+        scale: f32,
+        count: usize,
+        scores: &mut [f32],
+        row: &mut [f32],
+        key: impl Fn(usize) -> AffineRow<'h>,
+        value: impl Fn(usize) -> AffineRow<'h>,
+    ) {
+        match state.maximum.len() {
+            1 => heads::<1>(state, queries, scale, count, scores, row.len(), key, value),
+            2 => heads::<2>(state, queries, scale, count, scores, row.len(), key, value),
+            4 => heads::<4>(state, queries, scale, count, scores, row.len(), key, value),
+            8 => heads::<8>(state, queries, scale, count, scores, row.len(), key, value),
+            _ => state.absorb(
+                queries,
+                scale,
+                count,
+                scores,
+                row,
+                |j, out| {
+                    let (codes, coefficients) = key(j);
+                    super::affine_decode(codes, coefficients, super::KEY_BITS, out)
+                },
+                |j, out| {
+                    let (codes, coefficients) = value(j);
+                    super::affine_decode(codes, coefficients, super::VALUE_BITS, out)
+                },
+            ),
+        }
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn heads<'h, const G: usize>(
+        state: &mut Online<'_>,
+        queries: &[f32],
+        scale: f32,
+        count: usize,
+        scores: &mut [f32],
+        w: usize,
+        key: impl Fn(usize) -> AffineRow<'h>,
+        value: impl Fn(usize) -> AffineRow<'h>,
+    ) {
+        let g = G;
+        assert!(state.maximum.len() == G && w % GROUP == 0 && queries.len() >= g * w);
+        assert!(state.accumulator.len() >= g * w && scores.len() >= g * BLOCK);
+        let empty: AffineRow<'h> = (&[], &[]);
+        let mut first = 0;
+        while first < count {
+            let n = BLOCK.min(count - first);
+            for j in 0..n {
+                let (codes, pairs) = key(first + j);
+                assert!(codes.len() * 4 >= w && pairs.len() * GROUP >= 2 * w);
+                let bytes = codes.as_ptr().cast::<u8>();
+                // SAFETY: the assertions bound every code byte and query read
+                // below; the lanes follow `reduce::dot` element by element.
+                unsafe {
+                    let mut low = [vdupq_n_f32(0.0); G];
+                    let mut high = [vdupq_n_f32(0.0); G];
+                    for group in 0..w / GROUP {
+                        let (s, z) = coefficients(pairs, group);
+                        let packed = bytes.add(group * GROUP);
+                        let keys = [
+                            decode16(vld1q_u8(packed), s, z),
+                            decode16(vld1q_u8(packed.add(16)), s, z),
+                        ];
+                        for chunk in 0..GROUP / 8 {
+                            let column = group * GROUP + chunk * 8;
+                            let half = &keys[chunk / 2];
+                            let (a, b) = (half[(chunk % 2) * 2], half[(chunk % 2) * 2 + 1]);
+                            for head in 0..g {
+                                let q = queries.as_ptr().add(head * w + column);
+                                low[head] = vfmaq_f32(low[head], vld1q_f32(q), a);
+                                high[head] = vfmaq_f32(high[head], vld1q_f32(q.add(4)), b);
+                            }
+                        }
+                    }
+                    for head in 0..g {
+                        scores[head * BLOCK + j] = combine(low[head], high[head]) * scale;
+                    }
+                }
+            }
+            for head in 0..g {
+                let scores = &mut scores[head * BLOCK..][..n];
+                let next = state.maximum[head].max(reduce::max(scores));
+                for score in scores.iter_mut() {
+                    *score = math::exp(*score - next);
+                }
+                let carry = math::exp(state.maximum[head] - next);
+                state.denominator[head] = state.denominator[head].mul_add(carry, reduce::sum(scores));
+                for value in &mut state.accumulator[head * w..][..w] {
+                    *value *= carry;
+                }
+                state.maximum[head] = next;
+            }
+            let mut rows = [empty; BLOCK];
+            for (j, row) in rows[..n].iter_mut().enumerate() {
+                *row = value(first + j);
+                assert!(row.0.len() * 8 >= w && row.1.len() * GROUP >= 2 * w);
+            }
+            for column in (0..w).step_by(COLUMNS) {
+                let (group, half) = (column / GROUP, (column % GROUP) / COLUMNS);
+                // SAFETY: `column + COLUMNS <= w` inside every head's
+                // accumulator block, and every value row holds its w / 2
+                // code bytes (asserted above).
+                unsafe {
+                    let mut blocks = [[vdupq_n_f32(0.0); 4]; G];
+                    for head in 0..g {
+                        let at = state.accumulator.as_ptr().add(head * w + column);
+                        for r in 0..4 {
+                            blocks[head][r] = vld1q_f32(at.add(4 * r));
+                        }
+                    }
+                    for (j, (codes, pairs)) in rows[..n].iter().enumerate() {
+                        let (s, z) = coefficients(pairs, group);
+                        let nibbles = vld1_u8(codes.as_ptr().cast::<u8>().add(group * GROUP / 2 + half * 8));
+                        let (lo, hi) = (vand_u8(nibbles, vdup_n_u8(15)), vshr_n_u8(nibbles, 4));
+                        let decoded = decode16(vcombine_u8(vzip1_u8(lo, hi), vzip2_u8(lo, hi)), s, z);
+                        for head in 0..g {
+                            let weight = vdupq_n_f32(scores[head * BLOCK + j]);
+                            for r in 0..4 {
+                                blocks[head][r] = vfmaq_f32(blocks[head][r], decoded[r], weight);
+                            }
+                        }
+                    }
+                    for head in 0..g {
+                        let at = state.accumulator.as_mut_ptr().add(head * w + column);
+                        for r in 0..4 {
+                            vst1q_f32(at.add(4 * r), blocks[head][r]);
+                        }
+                    }
+                }
+            }
+            first += n;
+        }
+    }
+}
+
 /// The fresh rows of a batch as keys and values: prepared keys [M][KV][W]
 /// (F32 values of the activation element) and the projected values
 /// [M, KV * W].
@@ -285,6 +518,48 @@ pub fn attend<A: Dense>(
             row,
             |j, out| history_key(first + j, out),
             |j, out| history_value(first + j, out),
+        ),
+        Keys::Fresh => state.absorb(
+            queries,
+            scale,
+            count,
+            scores,
+            row,
+            |j, out| out.copy_from_slice(&rows.keys[((first + j) * kv + kv_head) * w..][..w]),
+            |j, out| activation::widen::<A>(rows.values.span([first + j, kv_head * w], w), out),
+        ),
+    });
+}
+
+/// [`attend`] with affine K8/V4 history rows `history_key(token)` and
+/// `history_value(token)`, absorbed by [`Online::absorb_affine`].
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn attend_affine<'h, A: Dense>(
+    state: &mut Online<'_>,
+    heads: Heads,
+    kv_head: usize,
+    queries: &[f32],
+    scale: f32,
+    scores: &mut [f32],
+    row: &mut [f32],
+    spans: impl Iterator<Item = (i32, i32)>,
+    fresh: (i32, i32),
+    range: Range<usize>,
+    rows: &Fresh<'_, A>,
+    history_key: impl Fn(usize) -> AffineRow<'h>,
+    history_value: impl Fn(usize) -> AffineRow<'h>,
+) {
+    let (kv, w) = (heads.kv, heads.w);
+    walk(spans, fresh, range, |keys, first, count| match keys {
+        Keys::History => state.absorb_affine(
+            queries,
+            scale,
+            count,
+            scores,
+            row,
+            |j| history_key(first + j),
+            |j| history_value(first + j),
         ),
         Keys::Fresh => state.absorb(
             queries,

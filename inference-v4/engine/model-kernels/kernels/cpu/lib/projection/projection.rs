@@ -134,4 +134,49 @@ pub fn project_staged_arithmetic(
     }
 }
 
+/// [`project_staged_arithmetic`] of the same weight rows of two operands
+/// (a gate and an up projection) against the same staged rows:
+/// `publish(row, first, second)` receives each activation row's two blocks.
+/// Eight-row blocks with quantized rows run four activation rows per tile,
+/// as the single-operand form does.
+#[inline(always)]
+pub fn project_pair_staged_arithmetic(
+    first: &Weights<'_>,
+    second: &Weights<'_>,
+    rows: std::ops::Range<usize>,
+    staged: &[f32],
+    quantized: Option<&[Q8Block]>,
+    mut publish: impl FnMut(usize, &[f32], &[f32]),
+) {
+    assert_eq!(first.k(), second.k(), "paired projections share their input");
+    let mut completed = 0;
+    if rows.len() == 8 {
+        if let Some(q8) = quantized {
+            let blocks = quant::blocks(first.k());
+            let total = staged.len() / first.k();
+            while completed + 4 <= total {
+                let tiles = &q8[completed * blocks..(completed + 4) * blocks];
+                let (mut first_tile, mut second_tile) = ([0.0f32; 32], [0.0f32; 32]);
+                first.gemm_q8(rows.start, tiles, &mut first_tile);
+                second.gemm_q8(rows.start, tiles, &mut second_tile);
+                for m in 0..4 {
+                    publish(completed + m, &first_tile[m * 8..(m + 1) * 8], &second_tile[m * 8..(m + 1) * 8]);
+                }
+                completed += 4;
+            }
+        }
+    }
+    let (mut first_block, mut second_block) = ([0.0f32; MAX_ROWS], [0.0f32; MAX_ROWS]);
+    let (first_block, second_block) = (&mut first_block[..rows.len()], &mut second_block[..rows.len()]);
+    for (row, x) in staged.chunks_exact(first.k()).enumerate().skip(completed) {
+        let q8 = quantized.map(|blocks| {
+            let stride = quant::blocks(first.k());
+            &blocks[row * stride..(row + 1) * stride]
+        });
+        project_arithmetic(first, rows.start, x, q8, first_block);
+        project_arithmetic(second, rows.start, x, q8, second_block);
+        publish(row, first_block, second_block);
+    }
+}
+
 pub use super::stage::{normalize, quantize, rms_row, stage};
