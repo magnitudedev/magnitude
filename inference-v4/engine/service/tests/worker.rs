@@ -1,5 +1,5 @@
 use magnitude_generation::{OutputToken, TokenId};
-use magnitude_model_executor::{DomainError, PressureLevel, RequestId};
+use magnitude_model_executor::{DomainError, RequestId};
 use magnitude_service::{
     owner::{AdmissionError, Status},
     protocol::{CapacityStatus, WorkerCommand, WorkerReply},
@@ -51,10 +51,10 @@ fn blind_admission_crosses_the_worker_as_a_typed_refusal() {
 }
 
 #[test]
-fn platform_pressure_is_a_typed_admission_refusal() {
+fn reclaim_is_a_typed_admission_refusal() {
     assert_eq!(
-        AdmissionError::from(DomainError::Pressure(PressureLevel::Emergency)),
-        AdmissionError::MemoryPressure(PressureLevel::Emergency)
+        AdmissionError::from(DomainError::Reclaim),
+        AdmissionError::MemoryReclaim
     );
 }
 

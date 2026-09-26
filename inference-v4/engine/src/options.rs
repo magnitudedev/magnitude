@@ -9,7 +9,8 @@ use magnitude_chat::wire::MethodPolicy;
 use magnitude_generation::{Method, Mtp, Plain};
 use magnitude_model_contracts::{FeedForwardGeometry, ModelDefinition};
 use magnitude_model_executor::{
-    platform::DeviceRequest, ExecutionPath, ResourcePlan, MAX_DRAFT_PROPOSALS,
+    platform::{DeviceRequest, MemoryReserves},
+    ExecutionPath, ResourcePlan, MAX_DRAFT_PROPOSALS,
 };
 
 /// Dense-target MTP width when none is requested.
@@ -17,6 +18,20 @@ const DEFAULT_PROPOSALS: u8 = 3;
 use magnitude_model_state::KvCodec;
 use magnitude_service::ServiceLimits;
 use std::{path::PathBuf, sync::Arc};
+
+/// The standalone engine's service limits for a given batch width. Loading
+/// and metadata-only assessment both use them, so an assessed plan is the
+/// plan a load with the same batch width would prepare.
+pub fn standard_service_limits(max_batch: usize) -> ServiceLimits {
+    ServiceLimits {
+        max_requests: 128,
+        max_batch,
+        prefill_tokens: 512,
+        decode_tokens: 32,
+        decode_share: 0.5,
+        locality_seconds: 1.0,
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProjectorSelection {
@@ -147,6 +162,9 @@ pub struct ExecutionManifest {
     pub device: DeviceRequest,
     /// The kernel cache directory the host names; `None` caches nothing.
     pub kernel_cache: Option<PathBuf>,
+    /// The host's threshold policy: every engine claim keeps each domain's
+    /// headroom above its planning reserve.
+    pub reserves: MemoryReserves,
 }
 
 /// Device-free readiness evidence returned only after worker construction has
@@ -213,6 +231,7 @@ impl ExecutionManifest {
         path: ExecutionPath,
         device: DeviceRequest,
         kernel_cache: Option<PathBuf>,
+        reserves: MemoryReserves,
     ) -> Result<Self, String> {
         definition.validate().map_err(|error| error.to_string())?;
         service.validate()?;
@@ -227,6 +246,7 @@ impl ExecutionManifest {
             path,
             device,
             kernel_cache,
+            reserves,
         })
     }
 }

@@ -68,7 +68,7 @@ pub use operation::{
 };
 pub use planning::{
     resident_element, resident_layout, source_element, ArtifactComponent, ArtifactComponentKind,
-    AssessmentBindingEvidence, AssessmentFit, AssessmentFitVerdict, AssessmentGraphResourceBounds,
+    AssessmentFit, AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentMemoryCharge,
     AssessmentHeaderBounds, AssessmentMemoryBounds, AssessmentMemoryTerms, AttentionBinding,
     AttentionShape, CapabilityPlan, ComponentPlan, ComponentSelection, DenseBinding,
     EmbeddingBinding, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding,
@@ -97,4 +97,3 @@ pub use resources::{
     NativeGraphOutputLease, NativeGraphPool, NativeGraphWorkspaceLease, PoolClass,
     ResourceAllocator, TargetGraphOutputLease, TargetGraphPool, TargetGraphWorkspaceLease,
 };
-pub use seismic::PressureLevel;

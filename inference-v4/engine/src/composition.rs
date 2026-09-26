@@ -11,7 +11,10 @@ use magnitude_chat::{
 use magnitude_model_contracts::{
     ModelDefinition, ModelInputAdapter, PreparedModelInput, TokenPlan,
 };
-use magnitude_model_executor::{platform::DeviceRequest, ExecutionPath};
+use magnitude_model_executor::{
+    platform::{DeviceRequest, MemoryReserves},
+    ExecutionPath,
+};
 use magnitude_model_qwen35::{
     inputs::{QwenImageTokens, QwenInputAdapter},
     inspect_package,
@@ -177,6 +180,9 @@ pub struct EngineConfiguration {
     /// (`--cache-dir`; ACN names `<dataDir>/cache/kernels`). `None` caches
     /// nothing: every load forms and tunes every entry.
     pub kernel_cache: Option<PathBuf>,
+    /// The host's threshold policy (`MemoryReserves::standard()` for the
+    /// service and CLI). The engine never defaults it.
+    pub reserves: MemoryReserves,
 }
 
 /// The two authorities produced by host resolution: local chat artifacts stay
@@ -313,6 +319,7 @@ impl EngineConfiguration {
             self.path,
             self.device,
             self.kernel_cache,
+            self.reserves,
         )?;
         Ok(ResolvedEngineConfiguration {
             artifacts,

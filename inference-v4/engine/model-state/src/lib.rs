@@ -1130,12 +1130,12 @@ pub struct StateStore {
 }
 
 /// When [`StateStore::shrink`] releases backing: at idle only once the
-/// backing is at least twice what the store needs (hysteresis), under memory
-/// pressure everything beyond it.
+/// backing is at least twice what the store needs (hysteresis); on a memory
+/// deficit or in the Reclaim band everything beyond it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShrinkPolicy {
     Idle,
-    Pressure,
+    Reclaim,
 }
 
 /// History relayouts a store performed and the rows they copied.
@@ -1173,10 +1173,10 @@ pub struct StateHoldingCensus {
     pub model_seed: u64,
 }
 
-/// Read-only shape of a pressure shrink, including the peak new charge needed
+/// Read-only shape of a reclaim shrink, including the peak new charge needed
 /// before old history or recurrent planes can be released.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StatePressureShrinkShape {
+pub struct StateReclaimShrinkShape {
     pub committed_rows: usize,
     pub referenced_rows: usize,
     pub highest_referenced_row: usize,
@@ -1193,7 +1193,7 @@ pub struct StatePressureShrinkShape {
 fn history_shrink_target(referenced: usize, policy: ShrinkPolicy) -> usize {
     let headroom = match policy {
         ShrinkPolicy::Idle => 1,
-        ShrinkPolicy::Pressure => HEADROOM_DIVISOR,
+        ShrinkPolicy::Reclaim => HEADROOM_DIVISOR,
     };
     (referenced + referenced / headroom)
         .max(HISTORY_GRANULE)
@@ -1220,14 +1220,14 @@ struct HistoryGrowthPlan {
     total: usize,
 }
 impl StateStore {
-    pub fn pressure_shrink_shape(&self) -> Result<StatePressureShrinkShape, Error> {
+    pub fn reclaim_shrink_shape(&self) -> Result<StateReclaimShrinkShape, Error> {
         let arena = self.arena.borrow();
         let backing = self.backing.borrow();
         let highest_referenced_row = arena
             .runs
             .last_key_value()
             .map_or(0, |(start, run)| start + run.count);
-        let target_rows = history_shrink_target(arena.referenced, ShrinkPolicy::Pressure);
+        let target_rows = history_shrink_target(arena.referenced, ShrinkPolicy::Reclaim);
         let committed_rows = backing.rows;
         let committed_banks = backing.banks;
         let claimed_banks = committed_banks - 1 - self.banks.available();
@@ -1256,11 +1256,11 @@ impl StateStore {
                         .checked_div(rows)
                         .and_then(|row| row.checked_mul(target as u64))
                         .ok_or_else(|| {
-                            Error::Request("pressure replacement peak overflows".into())
+                            Error::Request("reclaim replacement peak overflows".into())
                         })?;
                     total
                         .checked_add(bytes)
-                        .ok_or_else(|| Error::Request("pressure replacement peak overflows".into()))
+                        .ok_or_else(|| Error::Request("reclaim replacement peak overflows".into()))
                 })
         };
         let history_peak_bytes = if committed_rows <= target_rows {
@@ -1268,7 +1268,7 @@ impl StateStore {
         } else if highest_referenced_row > target_rows {
             (target_rows as u64)
                 .checked_mul(self.total_history_row_bytes)
-                .ok_or_else(|| Error::Request("pressure relayout peak overflows".into()))?
+                .ok_or_else(|| Error::Request("reclaim relayout peak overflows".into()))?
         } else {
             replacement_peak(&backing.history, target_rows)?
         };
@@ -1281,7 +1281,7 @@ impl StateStore {
         } else {
             0
         };
-        Ok(StatePressureShrinkShape {
+        Ok(StateReclaimShrinkShape {
             committed_rows,
             referenced_rows: arena.referenced,
             highest_referenced_row,
@@ -1869,7 +1869,7 @@ impl StateStore {
     /// the referenced rows plus growth headroom, and the claimed banks plus a
     /// successor for every owner plus a granule. Idle shrinking releases only
     /// once the backing is at least twice that, so serving never alternates
-    /// between growing and shrinking; pressure releases everything beyond it.
+    /// between growing and shrinking; reclaim releases everything beyond it.
     /// An unreferenced tail is released in place; live rows above the kept
     /// rows are relaid out downward first. Returns the physical bytes
     /// released. Nothing changes while a transaction exists.
@@ -1879,11 +1879,11 @@ impl StateStore {
         }
         let release = |committed: usize, needed: usize| match policy {
             ShrinkPolicy::Idle => committed >= 2 * needed,
-            ShrinkPolicy::Pressure => committed > needed,
+            ShrinkPolicy::Reclaim => committed > needed,
         };
         // Idle keeps the room growth would give the rows in use again (a
         // relayout copies every live row, so it must not recur as requests
-        // come and go); pressure keeps only the growth headroom.
+        // come and go); reclaim keeps only the growth headroom.
         // An earlier backing may still be pinned by a caller that holds a
         // tensor view. Only the device ledger can say how much was actually
         // released; the change in the store's current backing is insufficient.
@@ -1913,7 +1913,7 @@ impl StateStore {
         if self.has_recurrent_components() {
             let claimed = banks - 1 - self.banks.available();
             let dense_needed = 1 + claimed + self.owners.get() + BANK_GRANULE;
-            if policy == ShrinkPolicy::Pressure
+            if policy == ShrinkPolicy::Reclaim
                 && dense_needed < self.banks.required(banks)
                 && dense_needed < banks
             {
@@ -2041,7 +2041,7 @@ impl StateStore {
                 if planes.iter().all(Tensor::can_recommit_in_place) {
                     // The released bank tail is free. Publish each CUDA VMM
                     // shrink immediately, so no second plane needs a peak
-                    // replacement allocation under pressure. A driver error
+                    // replacement allocation while reclaiming. A driver error
                     // after the first publication cannot be reported as a
                     // recoverable old backing.
                     let mut published = 0;
@@ -3787,8 +3787,8 @@ mod tests {
         assert!(charged() < pinned_charge);
         assert_eq!(store.external_pinned_bytes().unwrap(), 0);
         drop(state);
-        // Idle hysteresis keeps a small backing; pressure releases it all.
-        store.shrink(ShrinkPolicy::Pressure).unwrap();
+        // Idle hysteresis keeps a small backing; reclaim releases it all.
+        store.shrink(ShrinkPolicy::Reclaim).unwrap();
         assert_eq!(store.committed(), (HISTORY_GRANULE, 3));
         assert!(store.release_idle().unwrap() > 0);
         assert_eq!(charged(), base);
@@ -3983,7 +3983,7 @@ mod tests {
         let before = (store.committed().0, device.memory_usage().charged);
         let occupied = store.occupied_rows();
         assert_eq!(occupied, 100 + 50 + 20);
-        let shape = store.pressure_shrink_shape().unwrap();
+        let shape = store.reclaim_shrink_shape().unwrap();
         assert_eq!(shape.referenced_rows, occupied);
         assert!(shape.highest_referenced_row > shape.target_rows);
         assert!(shape.history_peak_bytes > 0);
@@ -3993,7 +3993,7 @@ mod tests {
         // requires a fresh relayout backing; a tight peak charge cannot
         // perform that copy, even though the final backing would be smaller.
         device.set_memory_limit(Some(before.1));
-        assert_eq!(store.shrink(ShrinkPolicy::Pressure).unwrap(), 0);
+        assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), 0);
         assert_eq!(store.committed().0, before.0);
         assert_eq!(store.relayouts().count, relayouts);
         device.set_memory_limit(None);
@@ -4012,7 +4012,7 @@ mod tests {
     }
 
     #[test]
-    fn pressure_compacts_claimed_banks_before_releasing_the_tail() {
+    fn reclaim_compacts_claimed_banks_before_releasing_the_tail() {
         let Some(device) = cpu_device() else {
             return;
         };
@@ -4060,7 +4060,7 @@ mod tests {
         }
         let charged = device.memory_usage().charged;
         device.set_memory_limit(Some(charged));
-        assert_eq!(store.shrink(ShrinkPolicy::Pressure).unwrap(), 0);
+        assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), 0);
         assert_eq!(store.committed().1, 10);
         let remapped = kept.map(|index| claims[index - 1].as_ref().unwrap().index());
         assert_eq!(
@@ -4070,7 +4070,7 @@ mod tests {
         // The first destination plane fits, but the second does not. Its
         // failure must discard the first copy without publishing placement.
         device.set_memory_limit(Some(charged + 6 * 16));
-        assert_eq!(store.shrink(ShrinkPolicy::Pressure).unwrap(), 0);
+        assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), 0);
         assert_eq!(store.committed().1, 10);
         assert_eq!(device.memory_usage().charged, charged);
         assert_eq!(
@@ -4088,7 +4088,7 @@ mod tests {
             }
         }
         device.set_memory_limit(None);
-        assert!(store.shrink(ShrinkPolicy::Pressure).unwrap() > 0);
+        assert!(store.shrink(ShrinkPolicy::Reclaim).unwrap() > 0);
         assert_eq!(store.committed().1, 6);
         let remapped = kept.map(|index| claims[index - 1].as_ref().unwrap().index());
         assert_eq!(remapped, [1, 2, 3]);

@@ -9,7 +9,7 @@
 
 use super::{
     HeadroomBasis, HeadroomEstimate, HostCapacity, HostMeasurements, HostMemoryStatus,
-    LimitVisibility, PressureLevel, ProcessLimitKind, ProcessMemoryLimit,
+    LimitVisibility, ProcessLimitKind, ProcessMemoryLimit,
 };
 use crate::devices::{CapacityBasis, ObservationError};
 use std::path::{Path, PathBuf};
@@ -36,7 +36,7 @@ pub(super) fn status() -> Result<HostMemoryStatus, ObservationError> {
         )
     })?;
     let mut limits = resource_limits()?;
-    let (limit_visibility, pressure) = cgroup_limits(Path::new("/"), &mut limits)?;
+    let limit_visibility = cgroup_limits(Path::new("/"), &mut limits)?;
     Ok(HostMemoryStatus {
         sampled_at,
         measurements: HostMeasurements::Linux {
@@ -47,7 +47,6 @@ pub(super) fn status() -> Result<HostMemoryStatus, ObservationError> {
             bytes: mem_available_bytes,
             basis: HeadroomBasis::LinuxMemAvailable,
         },
-        pressure,
         limits,
         limit_visibility,
     })
@@ -148,12 +147,12 @@ fn memory_hierarchy(membership: &str) -> MemoryHierarchy<'_> {
 fn cgroup_limits(
     root: &Path,
     limits: &mut Vec<ProcessMemoryLimit>,
-) -> Result<(LimitVisibility, Option<PressureLevel>), ObservationError> {
+) -> Result<LimitVisibility, ObservationError> {
     let membership = read(root.join("proc/self/cgroup"))?;
     match memory_hierarchy(&membership) {
         MemoryHierarchy::V1 { path } => cgroup_v1_limits(root, path, limits),
         MemoryHierarchy::V2 { path } => cgroup_v2_limits(root, path, limits),
-        MemoryHierarchy::None => Ok((LimitVisibility::Complete, None)),
+        MemoryHierarchy::None => Ok(LimitVisibility::Complete),
     }
 }
 
@@ -161,12 +160,11 @@ fn cgroup_v2_limits(
     root: &Path,
     path: &str,
     limits: &mut Vec<ProcessMemoryLimit>,
-) -> Result<(LimitVisibility, Option<PressureLevel>), ObservationError> {
+) -> Result<LimitVisibility, ObservationError> {
     let mount =
         cgroup_mount(root, path, |filesystem, _| filesystem == "cgroup2")?.ok_or_else(|| {
             ObservationError::Unsupported("this process's cgroup2 hierarchy is not mounted".into())
         })?;
-    let mut pressure = PressureLevel::Normal;
     walk_cgroups(&mount, |directory, cgroup| {
         let max = directory.join("memory.max");
         if !max.exists() {
@@ -174,35 +172,14 @@ fn cgroup_v2_limits(
         }
         let value = read(&max)?;
         let value = value.trim();
-        let high = directory.join("memory.high");
-        let high_bytes = if high.exists() {
-            let value = read(&high)?;
-            (value.trim() != "max")
-                .then(|| parse_bytes(&high, value.trim()))
-                .transpose()?
-        } else {
-            None
-        };
-        if value == "max" && high_bytes.is_none() {
+        if value == "max" {
             return Ok(());
         }
-        let used_bytes = read_bytes(&directory.join("memory.current"))?;
-        if let Some(high_bytes) = high_bytes {
-            if used_bytes >= high_bytes {
-                pressure = pressure.max(PressureLevel::Pressure);
-            }
-        }
-        if value != "max" {
-            let limit_bytes = parse_bytes(&max, value)?;
-            if used_bytes >= limit_bytes {
-                pressure = PressureLevel::Emergency;
-            }
-            limits.push(ProcessMemoryLimit {
-                kind: ProcessLimitKind::CgroupV2 { cgroup },
-                limit_bytes,
-                used_bytes,
-            });
-        }
+        limits.push(ProcessMemoryLimit {
+            kind: ProcessLimitKind::CgroupV2 { cgroup },
+            limit_bytes: parse_bytes(&max, value)?,
+            used_bytes: read_bytes(&directory.join("memory.current"))?,
+        });
         Ok(())
     })?;
     // `cgroup.type` exists only on non-root cgroups: a visible top that has
@@ -212,14 +189,14 @@ fn cgroup_v2_limits(
     } else {
         LimitVisibility::Complete
     };
-    Ok((visibility, Some(pressure)))
+    Ok(visibility)
 }
 
 fn cgroup_v1_limits(
     root: &Path,
     path: &str,
     limits: &mut Vec<ProcessMemoryLimit>,
-) -> Result<(LimitVisibility, Option<PressureLevel>), ObservationError> {
+) -> Result<LimitVisibility, ObservationError> {
     let mount = cgroup_mount(root, path, |filesystem, options| {
         filesystem == "cgroup" && options.split(',').any(|option| option == "memory")
     })?
@@ -249,7 +226,7 @@ fn cgroup_v1_limits(
     } else {
         LimitVisibility::CgroupAncestorsHidden
     };
-    Ok((visibility, None))
+    Ok(visibility)
 }
 
 /// The v1 memory controller reports "no limit" as its page counter maximum,
@@ -394,19 +371,10 @@ mod tests {
             std::fs::write(path, contents).unwrap();
         }
 
-        fn limits(
-            &self,
-        ) -> Result<
-            (
-                Vec<ProcessMemoryLimit>,
-                LimitVisibility,
-                Option<PressureLevel>,
-            ),
-            ObservationError,
-        > {
+        fn limits(&self) -> Result<(Vec<ProcessMemoryLimit>, LimitVisibility), ObservationError> {
             let mut limits = Vec::new();
-            let (visibility, pressure) = cgroup_limits(&self.0, &mut limits)?;
-            Ok((limits, visibility, pressure))
+            let visibility = cgroup_limits(&self.0, &mut limits)?;
+            Ok((limits, visibility))
         }
     }
 
@@ -439,7 +407,7 @@ mod tests {
         fixture.write("sys/fs/cgroup/user.slice/app.scope/memory.current", "400\n");
         fixture.write("sys/fs/cgroup/user.slice/memory.max", "max\n");
         fixture.write("sys/fs/cgroup/user.slice/memory.current", "900\n");
-        let (limits, visibility, pressure) = fixture.limits().unwrap();
+        let (limits, visibility) = fixture.limits().unwrap();
         assert_eq!(
             limits,
             [limit(
@@ -451,7 +419,6 @@ mod tests {
             )]
         );
         assert_eq!(visibility, LimitVisibility::Complete);
-        assert_eq!(pressure, Some(PressureLevel::Normal));
     }
 
     #[test]
@@ -460,7 +427,7 @@ mod tests {
         fixture.write("sys/fs/cgroup/cgroup.type", "domain\n");
         fixture.write("sys/fs/cgroup/memory.max", "2000\n");
         fixture.write("sys/fs/cgroup/memory.current", "500\n");
-        let (limits, visibility, pressure) = fixture.limits().unwrap();
+        let (limits, visibility) = fixture.limits().unwrap();
         assert_eq!(
             limits,
             [limit(
@@ -470,7 +437,6 @@ mod tests {
             )]
         );
         assert_eq!(visibility, LimitVisibility::CgroupAncestorsHidden);
-        assert_eq!(pressure, Some(PressureLevel::Normal));
     }
 
     #[test]
@@ -500,7 +466,7 @@ mod tests {
         );
         fixture.write(&format!("{memory}/memory.limit_in_bytes"), &unlimited);
         fixture.write(&format!("{memory}/memory.usage_in_bytes"), "9000\n");
-        let (limits, visibility, pressure) = fixture.limits().unwrap();
+        let (limits, visibility) = fixture.limits().unwrap();
         assert_eq!(
             limits,
             [limit(
@@ -512,7 +478,6 @@ mod tests {
             )]
         );
         assert_eq!(visibility, LimitVisibility::Complete);
-        assert_eq!(pressure, None);
     }
 
     #[test]
@@ -540,7 +505,7 @@ mod tests {
         );
         fixture.write("sys/fs/cgroup/memory/memory.limit_in_bytes", &unlimited);
         fixture.write("sys/fs/cgroup/memory/memory.usage_in_bytes", "9000\n");
-        let (limits, visibility, pressure) = fixture.limits().unwrap();
+        let (limits, visibility) = fixture.limits().unwrap();
         assert_eq!(
             limits,
             [limit(
@@ -552,25 +517,32 @@ mod tests {
             )]
         );
         assert_eq!(visibility, LimitVisibility::Complete);
-        assert_eq!(pressure, None);
     }
 
     #[test]
-    fn v2_pressure_uses_high_and_max_of_visible_ancestors() {
-        let fixture = Fixture::new("v2-pressure", "0::/user.slice/app.scope\n", V2_HOST_MOUNT);
+    fn v2_limits_come_from_max_alone() {
+        // `memory.high` is a throttling threshold, not a limit: only
+        // `memory.max` bounds this process, enforced against `memory.current`.
+        let fixture = Fixture::new("v2-high", "0::/user.slice/app.scope\n", V2_HOST_MOUNT);
         fixture.write("sys/fs/cgroup/user.slice/app.scope/memory.max", "1000\n");
         fixture.write("sys/fs/cgroup/user.slice/app.scope/memory.high", "800\n");
         fixture.write("sys/fs/cgroup/user.slice/app.scope/memory.current", "810\n");
         fixture.write("sys/fs/cgroup/user.slice/memory.max", "max\n");
         fixture.write("sys/fs/cgroup/user.slice/memory.high", "700\n");
         fixture.write("sys/fs/cgroup/user.slice/memory.current", "750\n");
-        assert_eq!(fixture.limits().unwrap().2, Some(PressureLevel::Pressure));
-
-        fixture.write(
-            "sys/fs/cgroup/user.slice/app.scope/memory.current",
-            "1000\n",
+        let (limits, visibility) = fixture.limits().unwrap();
+        assert_eq!(
+            limits,
+            [limit(
+                ProcessLimitKind::CgroupV2 {
+                    cgroup: "/user.slice/app.scope".into()
+                },
+                1000,
+                810
+            )]
         );
-        assert_eq!(fixture.limits().unwrap().2, Some(PressureLevel::Emergency));
+        assert_eq!(visibility, LimitVisibility::Complete);
+        assert_eq!(limits[0].remaining_bytes(), 190);
     }
 
     #[test]
@@ -585,7 +557,7 @@ mod tests {
         );
         fixture.write("sys/fs/cgroup/memory/memory.limit_in_bytes", "4000\n");
         fixture.write("sys/fs/cgroup/memory/memory.usage_in_bytes", "1500\n");
-        let (limits, visibility, pressure) = fixture.limits().unwrap();
+        let (limits, visibility) = fixture.limits().unwrap();
         assert_eq!(
             limits,
             [limit(
@@ -595,7 +567,6 @@ mod tests {
             )]
         );
         assert_eq!(visibility, LimitVisibility::CgroupAncestorsHidden);
-        assert_eq!(pressure, None);
     }
 
     #[test]
@@ -605,10 +576,9 @@ mod tests {
             "3:cpu,cpuacct:/\n1:name=systemd:/\n",
             V1_HOST_MOUNTS,
         );
-        let (limits, visibility, pressure) = fixture.limits().unwrap();
+        let (limits, visibility) = fixture.limits().unwrap();
         assert!(limits.is_empty());
         assert_eq!(visibility, LimitVisibility::Complete);
-        assert_eq!(pressure, None);
     }
 
     #[test]

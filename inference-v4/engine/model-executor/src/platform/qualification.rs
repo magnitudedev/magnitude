@@ -1,4 +1,6 @@
-use super::policy::{assessment_capacity, refresh_allocation_ceiling, MemoryPolicyError};
+use super::policy::{
+    fit_capacities, refresh_device_ceiling, DomainRole, MemoryPolicyError, MemoryReserves,
+};
 use super::selection::{select, DeviceRequest, SelectionError};
 use crate::{CatalogError, ExecutionPath};
 use seismic::{
@@ -13,6 +15,8 @@ pub struct PlatformConfig {
     pub path: ExecutionPath,
     /// Where the device keeps formed kernels between loads.
     pub artifacts: Option<Arc<dyn ArtifactStore>>,
+    /// The host's threshold policy the opened device's ceiling keeps.
+    pub reserves: MemoryReserves,
 }
 
 /// The automatically selected device and its stable assessment capacity.
@@ -20,6 +24,8 @@ pub struct PlatformConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectedDevice {
     pub info: DeviceInfo,
+    /// The allocation domain's stable fit capacity: its capacity, bounded
+    /// by process limits and working-set advice, less its planning reserve.
     pub assessment_capacity_bytes: u64,
 }
 
@@ -81,6 +87,7 @@ pub fn select_device(
     catalog: &DeviceCatalog,
     path: ExecutionPath,
     request: DeviceRequest,
+    reserves: &MemoryReserves,
 ) -> Result<SelectedDevice, PlatformError> {
     enforce_phase_one(path)?;
     let topology = catalog.topology();
@@ -88,8 +95,13 @@ pub fn select_device(
     let host = catalog
         .host_memory_status()
         .map_err(PlatformError::Observation)?;
-    let assessment_capacity_bytes =
-        assessment_capacity(&topology, &info, &host).map_err(PlatformError::Memory)?;
+    let assessment_capacity_bytes = fit_capacities(&topology, &info, &host, reserves)
+        .map_err(PlatformError::Memory)?
+        .into_iter()
+        .find(|(role, _)| *role == DomainRole::Allocation)
+        .expect("fit capacities include the allocation domain")
+        .1
+        .fit_bytes();
     Ok(SelectedDevice {
         info,
         assessment_capacity_bytes,
@@ -97,7 +109,8 @@ pub fn select_device(
 }
 
 /// Resolve the selected identity in this process's catalog, open it, set a
-/// ceiling from fresh scoped availability, and enforce it in Seismic.
+/// ceiling from fresh scoped availability above the planning reserve, and
+/// enforce it in Seismic.
 /// Never substitutes another device.
 pub fn open_selected(
     catalog: &DeviceCatalog,
@@ -114,7 +127,7 @@ pub fn open_selected(
             },
         )
         .map_err(PlatformError::Open)?;
-    refresh_allocation_ceiling(catalog, &device).map_err(PlatformError::Memory)?;
+    refresh_device_ceiling(catalog, &device, &config.reserves).map_err(PlatformError::Memory)?;
     Ok(OpenedPlatform { selector, device })
 }
 
@@ -155,6 +168,7 @@ mod tests {
                 PlatformConfig {
                     path: ExecutionPath::Native,
                     artifacts: None,
+                    reserves: MemoryReserves::standard(),
                 },
             ),
             Err(PlatformError::Resolve(ResolveError::Missing(selector))) if selector == missing

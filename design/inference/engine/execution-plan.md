@@ -17,29 +17,29 @@ coarse coverage class after readiness.
 Metadata-only model assessment derives resident weight bytes and per-token history and recurrent
 bank bytes from this same model load plan and state layout, for a one-conversation workload at the
 lesser of supported context and 100,000 tokens. It does not read weight payloads or open a device.
-The recurrent fit charge includes the accepted bank, one in-flight successor and the pristine seed.
-Those exact model terms alone do not establish fit: prepared scratch, startup transients and the
-device's capacity must be accounted for before publishing a fit result. If the exact resident
-terms alone exceed stable capacity, assessment may reject fit immediately; passing that lower
-bound never proves fit.
-The same header-only program plan derives exact prepared native invocation storage and the
-production qualification/import startup upper bound. These remain partial bounds until Seismic
-graph resource pools have a backend-specific upper bound; assessment does not infer positive fit
-from the partial bounds. Exact invocation storage strengthens the no-fit lower bound; the startup
-upper bound does not.
-Speed assessment measures shipped native defaults on synthetic device-resident inputs separately
-from model loading. It retains the device and formed-program identity, workload geometry and raw
-timings. A missing measurement or a measured pair that does not establish a physical cost supplies
-no speed prediction; real-model validation cannot be used to fit a correction factor.
+The recurrent fit charge includes the accepted bank, one in-flight successor, the lookahead
+successor when lookahead is enabled, and the pristine seed.
+Those exact model terms alone do not establish fit: prepared graph resources, workspace, startup
+transients and the device's stable fit capacity are added as upper bounds derived from the same
+header-only program plan, so a fit result never undercounts. Assessment results are complete:
+Fits, DoesNotFit or Incompatible; there is no unconfirmed fit.
+Speed assessment uses a fixed measurement basis per device: every operation class the execution
+implementation can run, timed once with shipped default configurations on synthetic
+device-resident inputs, keeping every sample. Each model's decode speed at each requested depth is
+computed analytically from its header-derived launch and byte demand. The basis is also the
+qualified support set: a model needing a class the basis could not form or measure is
+Incompatible. A failed measurement supplies no prediction; real-model validation cannot be used to
+fit a correction factor.
 The composition root prepares complete Seismic workflows for the admitted model geometry and
 finite launch classes, imports the target component, allocates the storage reported by those
 workflows, and publishes readiness only after those steps succeed. The engine does not maintain a
 second numerical tensor-shape description.
 Device assessment uses the allocation domain's total capacity, bounded by
-applicable process limits and Metal's recommended working set. Admission of new holdings uses fresh available
-memory observations for that domain. Neither calculation subtracts a fixed
-planning reserve; already charged allocations are excluded from observed
-availability and are not subtracted again.
+applicable process limits and Metal's recommended working set, less the domain's planning reserve;
+a dedicated device's load also fits its staged uploads in host RAM less the host's planning
+reserve. Admission of new holdings uses fresh available memory observations for each used domain
+and must leave headroom above the planning reserve (see engine memory). Already charged
+allocations are excluded from observed availability and are not subtracted again.
 The native execution path is backend-neutral: the host names a device (a backend or an exact
 selector) or asks for automatic selection, which considers accelerators only and treats several
 fitting devices as an explicit ambiguity; the path then executes on the opened device's backend,

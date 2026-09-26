@@ -1,115 +1,29 @@
-//! Exact model-derived memory terms for metadata-only assessment.
+//! Model-derived memory charges for metadata-only assessment.
 //!
-//! This is deliberately a demand description, not a fit verdict: scratch,
-//! startup transients and the capacity of a particular device are separate
-//! inputs. The load planner and the state layout remain the authorities for
-//! physical representations and codec planes.
+//! The standard assessment workload is one conversation at the fit depth
+//! `min(context_limit, 100_000)` on a clean load. Its charge is composed of
+//! exact header terms (resident weights, history at the fit depth, recurrent
+//! banks, native invocation storage) and upper bounds taken from the same
+//! checked class enumeration and slot multipliers production preparation
+//! uses (graph pools and bound constants, the startup qualification/import
+//! peak). The load planner and the state layout remain the authorities for
+//! physical representations and codec planes; the platform policy owns each
+//! domain's stable capacity and reserve.
 
 use super::resources::{history_row_bytes, recurrent_bank_bytes, NativeGraphCharge};
 use super::{
     source_import_peak_bytes, weight_bytes_by_component, ComponentSelection, ModelLoadPlan,
-    PlannedMethod,
+    PlannedMethod, ResourceLimits,
 };
+use crate::assessment::DomainFit;
+use crate::platform::{DomainRole, FitCapacity};
 use crate::AttestedPrograms;
 use magnitude_model_contracts::ModelDefinition;
-use magnitude_model_kernels::{dense_expand, dense_output, import_dense, repack_weight};
 use magnitude_model_state::{BankCapacity, KvCodec, ModelStateLayout};
-use seismic::{BackendName, Element};
-use std::collections::HashSet;
+use seismic::{BackendName, MemoryPoolId};
 
-/// Header-only evidence for a native binding. Checked source can reject an
-/// exact binding; successful source checking cannot prove device formation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AssessmentBindingEvidence {
-    Unsupported { entry: &'static str, reason: String },
-    Unconfirmed,
-}
-
-impl AssessmentBindingEvidence {
-    /// Inspect import and dense feed-forward bindings from the model's one
-    /// program plan. Other slots, native source compilation and device facts
-    /// still require preparation, so a positive model verdict is unavailable.
-    pub fn inspect_dense_paths(
-        definition: &ModelDefinition,
-        load: &ModelLoadPlan,
-        codec: KvCodec,
-        backend: BackendName,
-    ) -> Result<Self, String> {
-        use super::{FeedForwardProgramSlot, ImportProgramSlot};
-
-        fn check<E: seismic::Entry>(
-            backend: BackendName,
-            elements: &[(&str, Element)],
-        ) -> Result<AssessmentBindingEvidence, String> {
-            match seismic::generated::checked_native_binding::<E>(backend, elements)
-                .map_err(|error| error.to_string())?
-            {
-                seismic::NativeBindingCheck::AcceptedByCheckedEntry => {
-                    Ok(AssessmentBindingEvidence::Unconfirmed)
-                }
-                seismic::NativeBindingCheck::Unsupported(reason) => {
-                    Ok(AssessmentBindingEvidence::Unsupported {
-                        entry: E::NAME,
-                        reason,
-                    })
-                }
-            }
-        }
-
-        let plan = load
-            .program_plan(definition, codec)
-            .map_err(|error| error.to_string())?;
-        for slot in plan.imports() {
-            let evidence = match *slot {
-                ImportProgramSlot::Dense { source, resident } => check::<import_dense::Entry>(
-                    backend,
-                    &[
-                        ("E", Element::dense(source)),
-                        ("U", Element::dense(resident)),
-                    ],
-                )?,
-                ImportProgramSlot::Repack { source, resident } => {
-                    check::<repack_weight::Entry>(backend, &[("E", source), ("U", resident)])?
-                }
-            };
-            if matches!(evidence, Self::Unsupported { .. }) {
-                return Ok(evidence);
-            }
-        }
-        let mut checked_dense = HashSet::new();
-        for block in plan.target().blocks() {
-            let FeedForwardProgramSlot::Dense(binding) = block.feed_forward() else {
-                continue;
-            };
-            if !checked_dense.insert(binding) {
-                continue;
-            }
-            let expand = check::<dense_expand::Entry>(
-                backend,
-                &[
-                    ("NW", binding.norm),
-                    ("GW", binding.gate),
-                    ("UW", binding.up),
-                    ("A", binding.activation),
-                ],
-            )?;
-            if matches!(expand, Self::Unsupported { .. }) {
-                return Ok(expand);
-            }
-            let output = check::<dense_output::Entry>(
-                backend,
-                &[("DW", binding.down), ("A", binding.activation)],
-            )?;
-            if matches!(output, Self::Unsupported { .. }) {
-                return Ok(output);
-            }
-        }
-        Ok(Self::Unconfirmed)
-    }
-}
-
-/// Exact resident and per-state terms derived without opening a device or
-/// reading tensor payloads.
+/// Exact resident and per-state terms of the standard workload, derived
+/// without opening a device or reading tensor payloads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AssessmentMemoryTerms {
     pub target_weights: u64,
@@ -117,34 +31,68 @@ pub struct AssessmentMemoryTerms {
     pub vision_weights: u64,
     pub history_per_token: u64,
     pub recurrent_per_bank: u64,
+    /// Recurrent banks one conversation holds: its accepted bank, every
+    /// in-flight successor the planned lookahead keeps, and the pristine seed.
+    pub recurrent_banks: u64,
     pub fit_depth: u64,
 }
 
-/// Conservative charges for memory that cannot yet be derived from model
-/// headers alone. The prepared-resource bound covers all nonresident steady
-/// holdings (including scratch, argument, upload and output storage); the
-/// startup bound covers additional peak bytes. Both must cover the selected
-/// backend and workload.
+/// Upper bounds for every nonresident charge of a clean load. The prepared
+/// resource bound covers all steady native holdings (invocation storage,
+/// graph workspace, output, upload regions and bound constants); the startup
+/// bound covers the additional qualification/import peak; the staging bound
+/// is the host upload peak of a dedicated device's import.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AssessmentMemoryBounds {
     pub prepared_resource_bytes: u64,
     pub startup_additional_bytes: u64,
+    pub staging_upload_bytes: u64,
 }
 
 /// Header-derived charges that are known before graph formation. Prepared
 /// native invocation storage is exact; the startup charge is the same
-/// qualification/import upper bound used by the production resource planner.
-/// Graph pools still need a backend and workload-specific upper bound.
+/// qualification/import upper bound used by the production resource planner;
+/// the staging charge is the largest selected source tensor's import window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AssessmentHeaderBounds {
     pub prepared_program_bytes: u64,
     pub startup_additional_bytes: u64,
+    pub staging_upload_bytes: u64,
+}
+
+/// The standard workload's charge in each memory role a load touches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AssessmentMemoryCharge {
+    /// Weights, history at the fit depth and recurrent banks, all exact.
+    pub exact_resident_bytes: u64,
+    pub bounds: AssessmentMemoryBounds,
+    /// Everything the device's allocation domain holds at the clean-load peak.
+    pub allocation_bytes: u64,
+    /// Host RAM a dedicated device's staged import holds at its peak.
+    pub staging_bytes: u64,
+}
+
+/// A complete fit result: every domain the load touches, and whether the
+/// workload fits all of them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssessmentFit {
+    pub verdict: AssessmentFitVerdict,
+    pub domains: Vec<DomainFit>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssessmentFitVerdict {
+    Fits,
+    /// The domain with the largest deficit limits the load.
+    DoesNotFit {
+        limiting: MemoryPoolId,
+        deficit_bytes: u64,
+    },
 }
 
 /// Checked graph-pool demand and distinct bound constants from the same class
-/// enumeration and slot multipliers as native preparation. It does not include
-/// runtime external pins or evidence that the backend forms the checked
-/// entries, so it cannot by itself authorize a positive fit verdict.
+/// enumeration and slot multipliers as native preparation: an upper bound for
+/// every graph pool a clean load commits on the selected backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AssessmentGraphResourceBounds {
     pub target: NativeGraphCharge,
@@ -345,42 +293,25 @@ impl AssessmentHeaderBounds {
         Ok(Self {
             prepared_program_bytes,
             startup_additional_bytes,
+            staging_upload_bytes: import_peak,
         })
     }
 
-    /// Complete the memory bound once the Seismic graph pools have a proven
-    /// upper bound for the same backend and one-conversation workload.
+    /// Complete the memory bounds with the graph-pool upper bound for the
+    /// same backend and workload limits.
     pub fn with_graph_resource_bound(
         self,
-        graph_resource_bytes: u64,
+        graph: &AssessmentGraphResourceBounds,
     ) -> Result<AssessmentMemoryBounds, String> {
         Ok(AssessmentMemoryBounds {
             prepared_resource_bytes: self
                 .prepared_program_bytes
-                .checked_add(graph_resource_bytes)
+                .checked_add(graph.total_bytes)
                 .ok_or("assessment prepared resource bound overflow")?,
             startup_additional_bytes: self.startup_additional_bytes,
+            staging_upload_bytes: self.staging_upload_bytes,
         })
     }
-}
-
-/// A positive fit verdict is possible only with bounds for every nonresident
-/// charge. An upper bound above capacity is inconclusive: actual use may fit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AssessmentFitVerdict {
-    DoesNotFit,
-    FitsWithinBounds,
-    Unconfirmed,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AssessmentFit {
-    pub verdict: AssessmentFitVerdict,
-    pub exact_resident_bytes: u64,
-    /// Exact resident bytes plus any separately proven fixed holdings.
-    pub exact_required_lower_bound_bytes: u64,
-    pub conservative_required_bytes: Option<u64>,
-    pub capacity_bytes: u64,
 }
 
 /// Cost of one shipped default streaming-kernel launch, inferred from two
@@ -436,13 +367,15 @@ impl StreamingCost {
 impl AssessmentMemoryTerms {
     /// The standard assessment workload is one conversation at the lesser
     /// of the supported context and 100,000 tokens. Method state and optional
-    /// components are included only when selected by the planned method.
+    /// components are included only when selected by the planned method; the
+    /// conversation's in-flight banks follow the planned lookahead.
     pub fn derive(
         definition: &ModelDefinition,
         load: &ModelLoadPlan,
         selection: ComponentSelection,
         codec: KvCodec,
         method: PlannedMethod,
+        limits: ResourceLimits,
     ) -> Result<Self, String> {
         if selection.head != matches!(method, PlannedMethod::Mtp { .. }) {
             return Err("assessment method and head selection disagree".into());
@@ -466,12 +399,24 @@ impl AssessmentMemoryTerms {
             .checked_add(history_row_bytes(&layout.head_history)?)
             .ok_or("history row bytes overflow")?;
         let recurrent_per_bank = recurrent_bank_bytes(&layout.target_recurrent)?;
+        // The state store's own capacity rule for one live conversation: its
+        // accepted bank, its in-flight step (and that step's queued successor
+        // under lookahead) and the permanently pristine zero seed.
+        let recurrent_banks = BankCapacity {
+            active: 1,
+            in_flight: 1 + usize::from(limits.lookahead),
+            retained: 0,
+        }
+        .storage_total()
+        .map_err(|error| error.to_string())?;
         Ok(Self {
             target_weights: weights[0],
             head_weights: weights[1],
             vision_weights: weights[2],
             history_per_token,
             recurrent_per_bank,
+            recurrent_banks: u64::try_from(recurrent_banks)
+                .map_err(|_| "assessment bank count exceeds u64")?,
             fit_depth: definition.geometry.context_limit.min(100_000),
         })
     }
@@ -482,26 +427,15 @@ impl AssessmentMemoryTerms {
             .ok_or_else(|| "assessment history bytes overflow".to_owned())
     }
 
-    /// One active conversation needs its accepted bank, one in-flight
-    /// successor and the permanently pristine zero seed. Use the state
-    /// store's capacity rule rather than a separate assessment constant.
     pub fn recurrent_at_fit_workload(self) -> Result<u64, String> {
-        let banks = BankCapacity {
-            active: 1,
-            in_flight: 1,
-            retained: 0,
-        }
-        .storage_total()
-        .map_err(|error| error.to_string())?;
         self.recurrent_per_bank
-            .checked_mul(u64::try_from(banks).map_err(|_| "assessment bank count exceeds u64")?)
+            .checked_mul(self.recurrent_banks)
             .ok_or_else(|| "assessment recurrent bytes overflow".to_owned())
     }
 
-    /// A definite no-fit result is possible when even these exact resident
-    /// terms exceed stable capacity. A value below capacity is not a fit
-    /// verdict: prepared scratch and startup peaks remain unaccounted for.
-    pub fn minimum_required_bytes(self) -> Result<u64, String> {
+    /// Exact resident bytes of the workload: selected weights, history at the
+    /// fit depth and the conversation's recurrent banks.
+    pub fn exact_resident_bytes(self) -> Result<u64, String> {
         [
             self.target_weights,
             self.head_weights,
@@ -513,73 +447,87 @@ impl AssessmentMemoryTerms {
         .try_fold(0u64, |total, bytes| {
             total
                 .checked_add(bytes)
-                .ok_or_else(|| "assessment minimum resident bytes overflow".to_owned())
+                .ok_or_else(|| "assessment resident bytes overflow".to_owned())
         })
     }
 
-    /// Compare against the capacity returned by `platform::assessment_capacity`.
-    /// Missing prepared-resource or startup bounds cannot establish a
-    /// positive fit.
+    /// The clean-load charge of each memory role: the allocation domain holds
+    /// the resident terms, every prepared resource and the startup peak; a
+    /// dedicated device's staging domain holds its host upload window.
+    pub fn charge(self, bounds: AssessmentMemoryBounds) -> Result<AssessmentMemoryCharge, String> {
+        let exact_resident_bytes = self.exact_resident_bytes()?;
+        let allocation_bytes = exact_resident_bytes
+            .checked_add(bounds.prepared_resource_bytes)
+            .and_then(|bytes| bytes.checked_add(bounds.startup_additional_bytes))
+            .ok_or("assessment allocation charge overflow")?;
+        Ok(AssessmentMemoryCharge {
+            exact_resident_bytes,
+            bounds,
+            allocation_bytes,
+            staging_bytes: bounds.staging_upload_bytes,
+        })
+    }
+}
+
+impl AssessmentMemoryCharge {
+    /// Compare the charge with every domain's stable fit capacity
+    /// (`platform::fit_capacities`). A domain's remaining bytes are
+    /// `capacity − reserve − required`; the workload fits when none is
+    /// negative, and otherwise the domain with the largest deficit limits it.
     pub fn assess_fit(
         self,
-        capacity_bytes: u64,
-        bounds: Option<AssessmentMemoryBounds>,
+        capacities: &[(DomainRole, FitCapacity)],
     ) -> Result<AssessmentFit, String> {
-        let exact_resident_bytes = self.minimum_required_bytes()?;
-        let conservative_required_bytes = bounds
-            .map(|bounds| {
-                exact_resident_bytes
-                    .checked_add(bounds.prepared_resource_bytes)
-                    .and_then(|bytes| bytes.checked_add(bounds.startup_additional_bytes))
-                    .ok_or_else(|| "assessment conservative memory charge overflow".to_owned())
+        if !capacities
+            .iter()
+            .any(|(role, _)| *role == DomainRole::Allocation)
+        {
+            return Err("fit capacities have no allocation domain".into());
+        }
+        let domains = capacities
+            .iter()
+            .map(|&(role, capacity)| {
+                let required_bytes = match role {
+                    DomainRole::Allocation => self.allocation_bytes,
+                    DomainRole::Staging => self.staging_bytes,
+                };
+                let signed = |bytes: u64| {
+                    i64::try_from(bytes).map_err(|_| "domain byte count exceeds i64".to_owned())
+                };
+                let remaining_bytes = signed(capacity.capacity_bytes)?
+                    .checked_sub(signed(capacity.reserve_bytes)?)
+                    .and_then(|bytes| bytes.checked_sub(signed(required_bytes).ok()?))
+                    .ok_or("domain remaining bytes overflow")?;
+                Ok(DomainFit {
+                    role,
+                    domain: capacity.domain,
+                    capacity_bytes: capacity.capacity_bytes,
+                    required_bytes,
+                    reserve_bytes: capacity.reserve_bytes,
+                    remaining_bytes,
+                })
             })
-            .transpose()?;
-        let verdict = if exact_resident_bytes > capacity_bytes {
-            AssessmentFitVerdict::DoesNotFit
-        } else if conservative_required_bytes.is_some_and(|bytes| bytes <= capacity_bytes) {
-            AssessmentFitVerdict::FitsWithinBounds
-        } else {
-            AssessmentFitVerdict::Unconfirmed
-        };
-        Ok(AssessmentFit {
-            verdict,
-            exact_resident_bytes,
-            exact_required_lower_bound_bytes: exact_resident_bytes,
-            conservative_required_bytes,
-            capacity_bytes,
-        })
-    }
-
-    /// The header also proves the exact native invocation workspace charge.
-    /// It strengthens a no-fit conclusion, while the unknown graph pools
-    /// still prevent a positive fit conclusion.
-    pub fn assess_with_header_bounds(
-        self,
-        capacity_bytes: u64,
-        header: AssessmentHeaderBounds,
-    ) -> Result<AssessmentFit, String> {
-        let exact_resident_bytes = self.minimum_required_bytes()?;
-        let lower_bound = exact_resident_bytes
-            .checked_add(header.prepared_program_bytes)
-            .ok_or("assessment exact lower bound overflow")?;
-        Ok(AssessmentFit {
-            verdict: if lower_bound > capacity_bytes {
-                AssessmentFitVerdict::DoesNotFit
-            } else {
-                AssessmentFitVerdict::Unconfirmed
+            .collect::<Result<Vec<_>, String>>()?;
+        let verdict = match domains
+            .iter()
+            .filter(|domain| domain.remaining_bytes < 0)
+            .min_by_key(|domain| domain.remaining_bytes)
+        {
+            None => AssessmentFitVerdict::Fits,
+            Some(limiting) => AssessmentFitVerdict::DoesNotFit {
+                limiting: limiting.domain,
+                deficit_bytes: limiting.remaining_bytes.unsigned_abs(),
             },
-            exact_resident_bytes,
-            exact_required_lower_bound_bytes: lower_bound,
-            conservative_required_bytes: None,
-            capacity_bytes,
-        })
+        };
+        Ok(AssessmentFit { verdict, domains })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seismic::{BackendName, Layout, NativeGraphMetadata};
+    use magnitude_model_kernels::dense_output;
+    use seismic::{BackendName, Element, Layout, NativeGraphMetadata};
 
     #[test]
     fn checked_native_declarations_are_inspectable_without_a_device() {
@@ -1377,9 +1325,22 @@ mod tests {
         assert!(family.workspace > 0 && family.output > 0 && family.upload > 0);
     }
 
+    fn fixture_limits(lookahead: bool) -> crate::ResourceLimits {
+        crate::ResourceLimits {
+            max_retained_entries: 1,
+            active_requests: 1,
+            in_flight_requests: 1,
+            branch_checkpoints: 1,
+            max_batch_rows: 2,
+            max_projected_rows: 2,
+            max_images_per_request: 1,
+            lookahead,
+        }
+    }
+
     #[test]
-    fn header_terms_include_exact_selected_weights_and_history() {
-        let definition = crate::planning::tests::fixture_definition();
+    fn header_terms_include_exact_selected_weights_history_and_bounds() {
+        let mut definition = crate::planning::tests::fixture_definition();
         let manifest = crate::planning::tests::fixture_manifest(&definition);
         let selection = ComponentSelection {
             head: false,
@@ -1387,22 +1348,14 @@ mod tests {
         };
         let load =
             ModelLoadPlan::derive(&manifest, &definition, selection, Layout::Rows16).unwrap();
-        assert_eq!(
-            AssessmentBindingEvidence::inspect_dense_paths(
-                &definition,
-                &load,
-                KvCodec::Dense,
-                BackendName::Cpu,
-            )
-            .unwrap(),
-            AssessmentBindingEvidence::Unconfirmed,
-        );
+        let limits = fixture_limits(false);
         let terms = AssessmentMemoryTerms::derive(
             &definition,
             &load,
             selection,
             KvCodec::Dense,
             PlannedMethod::Plain,
+            limits,
         )
         .unwrap();
 
@@ -1414,8 +1367,20 @@ mod tests {
         assert_eq!(terms.vision_weights, 0);
         assert_eq!(terms.history_per_token, 2 * 64 * 2);
         assert_eq!(terms.recurrent_per_bank, 0);
+        // Accepted bank, one in-flight successor, pristine seed.
+        assert_eq!(terms.recurrent_banks, 3);
         assert_eq!(terms.fit_depth, 128);
         assert_eq!(terms.history_at_fit_depth().unwrap(), 128 * 2 * 64 * 2);
+        let pipelined = AssessmentMemoryTerms::derive(
+            &definition,
+            &load,
+            selection,
+            KvCodec::Dense,
+            PlannedMethod::Plain,
+            fixture_limits(true),
+        )
+        .unwrap();
+        assert_eq!(pipelined.recurrent_banks, 4);
         assert!(AssessmentMemoryTerms::derive(
             &definition,
             &load,
@@ -1425,6 +1390,7 @@ mod tests {
                 greedy_proposals: 1,
                 sampled_proposals: 1,
             },
+            limits,
         )
         .is_err());
 
@@ -1441,21 +1407,65 @@ mod tests {
             AttestedPrograms::qualification_peak_bytes(&load)
                 .max(load.target_upload_peak_bytes().unwrap())
         );
-        let complete = header.with_graph_resource_bound(42).unwrap();
         assert_eq!(
-            complete.prepared_resource_bytes,
-            header.prepared_program_bytes + 42
+            header.staging_upload_bytes,
+            load.target_upload_peak_bytes().unwrap()
+        );
+        let state = crate::ResourcePlanner::state_plan(
+            &definition,
+            &load,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            limits,
+            crate::ResourceCapacity {
+                domain_bytes: 512 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let graph = AssessmentGraphResourceBounds::derive(
+            &definition,
+            &load,
+            &state,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            limits,
+            BackendName::Cpu,
+        )
+        .unwrap();
+        let bounds = header.with_graph_resource_bound(&graph).unwrap();
+        assert_eq!(
+            bounds.prepared_resource_bytes,
+            header.prepared_program_bytes + graph.total_bytes
         );
         assert_eq!(
-            complete.startup_additional_bytes,
+            bounds.startup_additional_bytes,
             header.startup_additional_bytes
         );
-        assert!(AssessmentHeaderBounds {
-            prepared_program_bytes: u64::MAX,
-            startup_additional_bytes: 0,
-        }
-        .with_graph_resource_bound(1)
-        .is_err());
+        let charge = terms.charge(bounds).unwrap();
+        assert_eq!(
+            charge.allocation_bytes,
+            terms.exact_resident_bytes().unwrap()
+                + bounds.prepared_resource_bytes
+                + bounds.startup_additional_bytes
+        );
+        assert_eq!(charge.staging_bytes, header.staging_upload_bytes);
+
+        // The fit depth is the context limit capped at 100,000 tokens.
+        definition.geometry.context_limit = 262_144;
+        let long = AssessmentMemoryTerms::derive(
+            &definition,
+            &load,
+            selection,
+            KvCodec::Dense,
+            PlannedMethod::Plain,
+            limits,
+        )
+        .unwrap();
+        assert_eq!(long.fit_depth, 100_000);
+        assert_eq!(
+            long.history_at_fit_depth().unwrap(),
+            100_000 * terms.history_per_token
+        );
     }
 
     #[test]
@@ -1468,59 +1478,126 @@ mod tests {
         assert!(StreamingCost::from_samples(2_000_000, f64::NAN, 30_000_000, 0.0038).is_err());
     }
 
+    fn fixture_charge(allocation_bytes: u64, staging_bytes: u64) -> AssessmentMemoryCharge {
+        AssessmentMemoryCharge {
+            exact_resident_bytes: allocation_bytes,
+            bounds: AssessmentMemoryBounds {
+                prepared_resource_bytes: 0,
+                startup_additional_bytes: 0,
+                staging_upload_bytes: staging_bytes,
+            },
+            allocation_bytes,
+            staging_bytes,
+        }
+    }
+
     #[test]
-    fn fit_requires_complete_bounds_and_only_exact_bytes_prove_no_fit() {
+    fn workload_charge_composes_exact_terms_and_upper_bounds() {
         let terms = AssessmentMemoryTerms {
             target_weights: 100,
             head_weights: 20,
-            vision_weights: 0,
+            vision_weights: 5,
             history_per_token: 2,
             recurrent_per_bank: 10,
+            recurrent_banks: 3,
             fit_depth: 10,
         };
-        let exact = terms.minimum_required_bytes().unwrap();
-        assert_eq!(exact, 170);
-        assert_eq!(
-            terms.assess_fit(169, None).unwrap().verdict,
-            AssessmentFitVerdict::DoesNotFit
-        );
-        assert_eq!(
-            terms.assess_fit(200, None).unwrap().verdict,
-            AssessmentFitVerdict::Unconfirmed
-        );
-        let header = AssessmentHeaderBounds {
-            prepared_program_bytes: 31,
-            startup_additional_bytes: 100,
+        assert_eq!(terms.exact_resident_bytes().unwrap(), 100 + 20 + 5 + 20 + 30);
+        let charge = terms
+            .charge(AssessmentMemoryBounds {
+                prepared_resource_bytes: 40,
+                startup_additional_bytes: 60,
+                staging_upload_bytes: 7,
+            })
+            .unwrap();
+        assert_eq!(charge.exact_resident_bytes, 175);
+        assert_eq!(charge.allocation_bytes, 275);
+        assert_eq!(charge.staging_bytes, 7);
+        assert!(AssessmentMemoryTerms {
+            history_per_token: u64::MAX,
+            ..terms
+        }
+        .charge(charge.bounds)
+        .is_err());
+    }
+
+    #[test]
+    fn fit_is_decided_per_domain_against_capacity_less_reserve() {
+        let host = seismic::DeviceCatalog::discover()
+            .unwrap()
+            .topology()
+            .host_pool()
+            .id;
+        let domain = |capacity_bytes, reserve_bytes| FitCapacity {
+            domain: host,
+            kind: seismic::MemoryPoolKind::HostRam,
+            capacity_bytes,
+            reserve_bytes,
         };
-        let rejected = terms.assess_with_header_bounds(200, header).unwrap();
-        assert_eq!(rejected.exact_resident_bytes, 170);
-        assert_eq!(rejected.exact_required_lower_bound_bytes, 201);
-        assert_eq!(rejected.verdict, AssessmentFitVerdict::DoesNotFit);
+        // Unified memory: one allocation domain.
+        let unified = [(DomainRole::Allocation, domain(1_000, 100))];
+        let fits = fixture_charge(900, 0).assess_fit(&unified).unwrap();
+        assert_eq!(fits.verdict, AssessmentFitVerdict::Fits);
         assert_eq!(
-            terms
-                .assess_with_header_bounds(201, header)
-                .unwrap()
-                .verdict,
-            AssessmentFitVerdict::Unconfirmed
+            fits.domains,
+            vec![DomainFit {
+                role: DomainRole::Allocation,
+                domain: host,
+                capacity_bytes: 1_000,
+                required_bytes: 900,
+                reserve_bytes: 100,
+                remaining_bytes: 0,
+            }]
         );
-        let bounds = AssessmentMemoryBounds {
-            prepared_resource_bytes: 10,
-            startup_additional_bytes: 20,
-        };
+        let short = fixture_charge(901, 0).assess_fit(&unified).unwrap();
         assert_eq!(
-            terms.assess_fit(200, Some(bounds)).unwrap().verdict,
-            AssessmentFitVerdict::FitsWithinBounds
+            short.verdict,
+            AssessmentFitVerdict::DoesNotFit {
+                limiting: host,
+                deficit_bytes: 1,
+            }
         );
+        assert_eq!(short.domains[0].remaining_bytes, -1);
+
+        // A dedicated device also charges its staged upload to host RAM.
+        let dedicated = [
+            (DomainRole::Allocation, domain(1_000, 100)),
+            (DomainRole::Staging, domain(500, 200)),
+        ];
+        let both = fixture_charge(800, 300).assess_fit(&dedicated).unwrap();
+        assert_eq!(both.verdict, AssessmentFitVerdict::Fits);
+        assert_eq!(both.domains[1].required_bytes, 300);
+        assert_eq!(both.domains[1].remaining_bytes, 0);
+        let staging = fixture_charge(800, 350).assess_fit(&dedicated).unwrap();
         assert_eq!(
-            terms.assess_fit(199, Some(bounds)).unwrap().verdict,
-            AssessmentFitVerdict::Unconfirmed
+            staging.verdict,
+            AssessmentFitVerdict::DoesNotFit {
+                limiting: host,
+                deficit_bytes: 50,
+            }
         );
+        assert_eq!(staging.domains[0].remaining_bytes, 100);
+        assert_eq!(staging.domains[1].remaining_bytes, -50);
+        // The largest deficit limits the load.
+        let worst = fixture_charge(1_000, 310).assess_fit(&dedicated).unwrap();
         assert_eq!(
-            terms
-                .assess_fit(199, Some(bounds))
-                .unwrap()
-                .conservative_required_bytes,
-            Some(200)
+            worst.verdict,
+            AssessmentFitVerdict::DoesNotFit {
+                limiting: host,
+                deficit_bytes: 100,
+            }
         );
+        // A reserve above capacity leaves a negative remainder, not an error.
+        let tiny = [(DomainRole::Allocation, domain(100, 200))];
+        assert_eq!(
+            fixture_charge(1, 0).assess_fit(&tiny).unwrap().verdict,
+            AssessmentFitVerdict::DoesNotFit {
+                limiting: host,
+                deficit_bytes: 101,
+            }
+        );
+        assert!(fixture_charge(1, 0)
+            .assess_fit(&[(DomainRole::Staging, domain(100, 0))])
+            .is_err());
     }
 }

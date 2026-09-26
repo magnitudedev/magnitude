@@ -16,7 +16,7 @@ pub use crate::memory::MemoryUsage;
 pub use catalog::Catalog;
 pub use host::{
     HeadroomBasis, HeadroomEstimate, HostMeasurements, HostMemoryStatus, LimitVisibility,
-    PressureLevel, ProcessLimitKind, ProcessMemoryLimit,
+    ProcessLimitKind, ProcessMemoryLimit,
 };
 
 use seismic_compiler::errors::TargetError;

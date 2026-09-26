@@ -12,7 +12,7 @@
 
 use magnitude_artifacts::Package;
 use magnitude_model_executor::{
-    platform::{self, DeviceRequest, PlatformConfig},
+    platform::{self, DeviceRequest, MemoryReserves, PlatformConfig},
     AttestedPrograms, ComponentSelection, ExecutionPath, ExecutionPlanner, KernelCache,
     PlannedMethod, ResourceLimits, TunedEntry, TuningContext, TuningOrigin, UnreportedTuning,
     DEFAULT_KERNEL_CACHE_BYTES,
@@ -49,9 +49,14 @@ fn prepare_every_entry(
         .find(|path| path.exists())
         .unwrap_or_else(|| panic!("none of {candidates:?} exists under {home}"));
     let catalog = DeviceCatalog::discover().unwrap();
-    let selected =
-        platform::select_device(&catalog, ExecutionPath::Native, DeviceRequest::Automatic)
-            .unwrap_or_else(|error| panic!("no accelerator: {error}"));
+    let reserves = MemoryReserves::standard();
+    let selected = platform::select_device(
+        &catalog,
+        ExecutionPath::Native,
+        DeviceRequest::Automatic,
+        &reserves,
+    )
+    .unwrap_or_else(|error| panic!("no accelerator: {error}"));
     let package = Package::open_without_projector(&path).unwrap();
     let definition = magnitude_model_qwen35::inspect_package(&package).unwrap();
     let limits = ResourceLimits {
@@ -86,6 +91,7 @@ fn prepare_every_entry(
             artifacts: cache
                 .clone()
                 .map(|cache| cache as Arc<dyn seismic::ArtifactStore>),
+            reserves,
         },
     )
     .unwrap();

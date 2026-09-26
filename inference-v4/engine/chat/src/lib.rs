@@ -18,7 +18,10 @@ pub use magnitude_templates::{Event, PreparedDescription, PreparedRequest, Termi
 pub use preparation::{ConstraintPlan, PreparedChat, PreparedChatInput};
 pub use response::{CompleteResponse, SseResponse};
 pub use stream::{ChatStream, StopText, TokenChatStream};
-pub use templates::{ChatRequest, TemplateBundle, TemplateSelection, TemplateVariant, ToolChoice};
+pub use templates::{
+    ChatRequest, TemplateBundle, TemplateInspection, TemplateSelection, TemplateVariant,
+    ToolChoice, TEMPLATE_FINGERPRINT_VERSION,
+};
 pub use tokenizer::{BpeConfig, ByteBpeTokenizer, PieceKind, SpecialTokens, TokenDecoder};
 
 /// Measured physical execution time attributed to a request. Durations are

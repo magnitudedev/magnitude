@@ -1,88 +1,115 @@
-//! One device measurement class for model assessment, with no model file.
+//! Measure the complete declared assessment basis of one backend with no
+//! model file, print each class as it completes and the total wall time, and
+//! store the basis JSON in a directory.
 //!
-//! Usage: assessment_measure <metal|cuda|vulkan|cpu> <dense_output|dense_expand> <resident-element> [activation]
-//! Example: assessment_measure metal dense_expand q4k@rows16 bf16
+//! Usage: assessment_measure <metal|cuda|vulkan|cpu> <basis-dir>
 
-use magnitude_model_executor::assessment::DeviceMeasurementRunner;
-use seismic::{BackendName, DeviceCatalog, Element};
-use serde_json::json;
+use magnitude_model_executor::assessment::{
+    basis_file_name, measure_basis_observed, measurement_plan, store_basis, BasisIdentity,
+    ClassMeasurement, CostModel,
+};
+use magnitude_model_executor::platform::MemoryReserves;
+use seismic::{BackendName, DeviceCatalog};
+use std::path::PathBuf;
+use std::time::Instant;
+
+const ENGINE_BUILD: &str = concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION"));
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if !(3..=4).contains(&args.len()) {
-        return Err(
-            "usage: assessment_measure <backend> <entry> <resident-element> [activation]".into(),
-        );
-    }
-    let backend = BackendName::parse(&args[0]).ok_or("unknown backend")?;
-    let entry = &args[1];
-    let weight = Element::named(&args[2]).ok_or("unknown resident element")?;
-    let activation = args
-        .get(3)
-        .map(|name| Element::named(name).ok_or("unknown activation element"))
-        .transpose()?
-        .unwrap_or_else(Element::bf16);
-    let device = DeviceCatalog::discover()?.open_backend(backend)?;
-    let runner = DeviceMeasurementRunner::new(&device);
-    let (device_identity, timing_protocol, small, large, cost) = match entry.as_str() {
-        "dense_output" => {
-            let result = runner.measure_dense_output(weight, activation)?;
-            (
-                result.device_identity,
-                result.timing_protocol,
-                result.small,
-                result.large,
-                result.cost,
-            )
-        }
-        "dense_expand" => {
-            let result = runner.measure_dense_expand(weight, activation)?;
-            (
-                result.device_identity,
-                result.timing_protocol,
-                result.small,
-                result.large,
-                result.cost,
-            )
-        }
-        _ => return Err("entry must be dense_output or dense_expand".into()),
+    let [backend, directory] = args.as_slice() else {
+        return Err("usage: assessment_measure <metal|cuda|vulkan|cpu> <basis-dir>".into());
     };
-    let point = |p: &magnitude_model_executor::assessment::StreamingPoint| {
-        json!({
-            "hidden": p.hidden,
-            "features": p.features,
-            "weight_bytes": p.weight_bytes,
-            "native_artifact": &p.native_artifact,
-            "median_seconds": p.timing.median,
-            "deviation_seconds": p.timing.deviation,
-            "samples_seconds": p.timing.samples,
-            "rotation_bytes": p.timing.rotation_bytes,
-        })
-    };
-    println!(
-        "{}",
-        serde_json::to_string(&json!({
-            "device": device.info().selector.to_string(),
-            "device_identity": &device_identity,
-            "backend": backend.as_str(),
-            "entry": entry,
-            "timing_protocol": {
-                "samples": timing_protocol.samples,
-                "min_sample_seconds": timing_protocol.min_sample_seconds,
-            },
-            "weight": weight.name(),
-            "activation": activation.name(),
-            "small": point(&small),
-            "large": point(&large),
-            "cost": match &cost {
-                Ok(cost) => json!({
-                    "status": "measured",
-                    "launch_seconds": cost.launch_seconds,
-                    "seconds_per_byte": cost.seconds_per_byte,
-                }),
-                Err(reason) => json!({"status": "unmeasured", "reason": reason}),
-            },
-        }))?
+    let backend = BackendName::parse(backend).ok_or("unknown backend")?;
+    let directory = PathBuf::from(directory);
+    let catalog = DeviceCatalog::discover()?;
+    let device = catalog.open_backend(backend)?;
+    let identity = BasisIdentity::for_device(&device, ENGINE_BUILD);
+    let plan = measurement_plan(backend);
+    eprintln!(
+        "measuring {} classes on {} ({})",
+        plan.len(),
+        identity.device,
+        identity.engine_build
+    );
+    let began = Instant::now();
+    let basis = measure_basis_observed(
+        &catalog,
+        &device,
+        MemoryReserves::standard(),
+        identity,
+        |key, measurement, profile| {
+            let bindings = key
+                .bindings
+                .iter()
+                .map(|element| element.name())
+                .collect::<Vec<_>>()
+                .join(",");
+            let geometry = key
+                .geometry
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let result = match measurement {
+                ClassMeasurement::Unsupported { reason } => format!("UNSUPPORTED {reason}"),
+                ClassMeasurement::Measured { points, cost } => {
+                    let model = match &cost.model {
+                        CostModel::PerLaunch { seconds } => {
+                            format!("{:.2} us/launch", seconds * 1e6)
+                        }
+                        CostModel::Linear(linear) => format!(
+                            "{:.2} us/launch + {:.3} ps/byte ({:.1} GB/s)",
+                            linear.launch_seconds * 1e6,
+                            linear.seconds_per_byte * 1e12,
+                            1e-9 / linear.seconds_per_byte
+                        ),
+                        CostModel::Curve(curve) => curve
+                            .iter()
+                            .map(|(bytes, seconds)| {
+                                format!(
+                                    "{:.1}MB {:.1}us ({:.0} GB/s)",
+                                    *bytes as f64 / 1e6,
+                                    seconds * 1e6,
+                                    *bytes as f64 / seconds / 1e9
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    };
+                    let bytes = points
+                        .iter()
+                        .map(|point| point.bytes.to_string())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    format!(
+                        "{model}; bytes {bytes}; slow {:.3} fast {:.3}",
+                        cost.slow_factor, cost.fast_factor
+                    )
+                }
+            };
+            eprintln!(
+                "{:>7.3}s (form {:.3} alloc {:.3} time {:.3}) {} [{bindings}] [{geometry}] {result}",
+                profile.total.as_secs_f64(),
+                profile.formation.as_secs_f64(),
+                profile.allocation.as_secs_f64(),
+                profile.timing.as_secs_f64(),
+                key.class.name(),
+            );
+        },
+    )?;
+    let seconds = began.elapsed().as_secs_f64();
+    let unsupported = basis
+        .classes
+        .iter()
+        .filter(|(_, measurement)| matches!(measurement, ClassMeasurement::Unsupported { .. }))
+        .count();
+    store_basis(&directory, &basis)?;
+    let name = basis_file_name(&basis.identity).ok_or("basis identity names no backend")?;
+    eprintln!(
+        "measured {} classes ({unsupported} unsupported) in {seconds:.2}s; basis {}",
+        basis.classes.len(),
+        directory.join(name).display()
     );
     Ok(())
 }

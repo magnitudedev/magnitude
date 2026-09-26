@@ -2,7 +2,7 @@
 
 use super::*;
 use magnitude_model_state::{
-    GrowthChoice, Holder, RowDemand, StateHoldingCensus, StatePressureShrinkShape,
+    GrowthChoice, Holder, RowDemand, StateHoldingCensus, StateReclaimShrinkShape,
 };
 
 /// A comparison with Seismic's live charge. `unattributed` remains explicit
@@ -29,16 +29,16 @@ impl MemoryChargeReconciliation {
 }
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
-    pub fn pressure_state_shape(
+    pub fn reclaim_state_shape(
         &self,
-    ) -> Result<(StatePressureShrinkShape, Option<StatePressureShrinkShape>), String> {
+    ) -> Result<(StateReclaimShrinkShape, Option<StateReclaimShrinkShape>), String> {
         Ok((
             self.target_store
-                .pressure_shrink_shape()
+                .reclaim_shrink_shape()
                 .map_err(|error| error.to_string())?,
             self.head_store
                 .as_ref()
-                .map(|store| store.pressure_shrink_shape())
+                .map(|store| store.reclaim_shrink_shape())
                 .transpose()
                 .map_err(|error| error.to_string())?,
         ))
@@ -262,7 +262,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let required = resident_bytes
             .checked_add(upload_peak)
             .ok_or_else(|| DomainError::Input("component import claim overflows".into()))?;
-        self.grant_device_growth(required)
+        self.grant_device_growth(required, upload_peak)
     }
 
     /// Commit state backing for a launch before its capacity check: the rows
@@ -358,7 +358,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 GrowthChoice::Minimum => claim.minimum_bytes,
             };
             if required != 0 {
-                if let Err(error) = self.grant_device_growth(required) {
+                if let Err(error) = self.grant_device_growth(required, 0) {
                     if choice == GrowthChoice::Preferred {
                         continue;
                     }
@@ -397,7 +397,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             match provisioned {
                 Ok(()) => {
-                    self.refresh_memory().map_err(DomainError::Blind)?;
+                    self.refresh_memory()?;
                     self.sync_static_holding().map_err(DomainError::Input)?;
                     return Ok(());
                 }
@@ -419,34 +419,25 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         unreachable!("minimum state growth either succeeds or returns a deficit")
     }
 
-    /// Refresh the Seismic allocation ceiling for one peak physical claim.
-    /// The observation excludes existing charges, so only the added peak is
-    /// compared with available bytes.
+    /// Observe every domain the device uses and refresh the Seismic
+    /// allocation ceiling: `Reclaim` while any domain's headroom is at or
+    /// below its planning reserve, `Blind` when an observation fails.
     pub fn probe_memory(&mut self) -> Result<(), DomainError> {
-        self.grant_device_growth(0)
+        self.grant_device_growth(0, 0)
     }
 
-    pub(super) fn grant_device_growth(&mut self, required: u64) -> Result<(), DomainError> {
-        if self.memory_catalog.is_none() {
-            let catalog = seismic::DeviceCatalog::discover().map_err(|error| {
-                let device = self.domain.device();
-                device.set_memory_limit(Some(device.memory_usage().charged));
-                DomainError::Blind(error.to_string())
-            })?;
-            self.memory_catalog = Some(catalog);
-        }
-        let device = self.domain.device();
-        crate::platform::refresh_allocation_ceiling(
-            self.memory_catalog.as_ref().expect("catalog initialized"),
-            device,
-        )
-        .map_err(|error| match error {
-            crate::platform::MemoryPolicyError::Pressure(level) => DomainError::Pressure(level),
-            other => DomainError::Blind(other.to_string()),
-        })?;
-        // Seismic enforces the ceiling; the engine heap owns the admission
-        // decision over the same observed headroom.
-        self.refresh_memory().map_err(DomainError::Blind)?;
+    /// Grant one peak physical claim of `required` device bytes, of which a
+    /// dedicated device stages `staged` bytes through host RAM. The readings
+    /// exclude existing charges, so only the added peak is compared with
+    /// each domain's ceiling above its planning reserve.
+    pub(super) fn grant_device_growth(
+        &mut self,
+        required: u64,
+        staged: u64,
+    ) -> Result<(), DomainError> {
+        // Seismic enforces the allocation ceiling; the engine heap owns the
+        // admission decision over the same readings.
+        let readings = self.refresh_memory()?;
         let action = self
             .memory
             .borrow()
@@ -457,24 +448,41 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             })
             .map_err(|error| DomainError::Blind(format!("memory policy: {error:?}")))?;
         match action {
-            crate::memory::MemoryAction::Grant { bytes } if bytes >= required => Ok(()),
-            crate::memory::MemoryAction::Reject { available, .. } => Err(crate::CapacityError {
-                resource: crate::ResourceKind::DeviceMemory,
-                required,
-                available,
+            crate::memory::MemoryAction::Grant { bytes } if bytes >= required => {}
+            crate::memory::MemoryAction::Reject { available, .. } => {
+                return Err(crate::CapacityError {
+                    resource: crate::ResourceKind::DeviceMemory,
+                    required,
+                    available,
+                }
+                .into())
             }
-            .into()),
-            crate::memory::MemoryAction::Grant { bytes } => Err(crate::CapacityError {
-                resource: crate::ResourceKind::DeviceMemory,
-                required,
-                available: bytes,
+            crate::memory::MemoryAction::Grant { bytes } => {
+                return Err(crate::CapacityError {
+                    resource: crate::ResourceKind::DeviceMemory,
+                    required,
+                    available: bytes,
+                }
+                .into())
             }
-            .into()),
-            crate::memory::MemoryAction::ReleaseRequired { .. }
-            | crate::memory::MemoryAction::Wait => {
-                Err(DomainError::Pressure(seismic::PressureLevel::Pressure))
+            crate::memory::MemoryAction::Wait => return Err(DomainError::Reclaim),
+        }
+        // A host-backed device has no staging domain: its staged bytes are
+        // part of `required` on the same host domain.
+        if let Some(staging) = readings
+            .iter()
+            .find(|reading| reading.role == DomainRole::Staging)
+        {
+            if staged > staging.ceiling_bytes {
+                return Err(crate::CapacityError {
+                    resource: crate::ResourceKind::HostStaging,
+                    required: staged,
+                    available: staging.ceiling_bytes,
+                }
+                .into());
             }
         }
+        Ok(())
     }
 
     /// Repack the target history of a request at the visible segment limit
@@ -581,8 +589,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Release committed state backing beyond what the stores need (see
-    /// [`StateStore::shrink`]): at idle with hysteresis, under memory
-    /// pressure fully. Returns the physical bytes released.
+    /// [`StateStore::shrink`]): at idle with hysteresis, under a memory
+    /// deficit or Reclaim fully. Returns the physical bytes released.
     /// A queued lookahead is released first: it holds a state transaction,
     /// under which nothing shrinks.
     pub fn shrink_state(

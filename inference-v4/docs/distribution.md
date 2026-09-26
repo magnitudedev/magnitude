@@ -37,6 +37,7 @@ Artifacts declare OS/ABI floors, CPU ISA requirements, backend features, and dri
 and target-code compatibility. Capability detection prevents unsupported instruction
 use. Supported architecture does not imply that every device or artifact combination
 has been qualified. Release matrices and measurements belong in release records.
+Per-backend floors and tiers are defined in [compatibility](compatibility.md).
 
 ## Identity and reuse
 

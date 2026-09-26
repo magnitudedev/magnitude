@@ -90,6 +90,8 @@ pub enum SubmitError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResourceKind {
     DeviceMemory,
+    /// Host RAM a dedicated device stages its uploads through.
+    HostStaging,
     StateRows,
     RecurrentBanks,
     Workspace,

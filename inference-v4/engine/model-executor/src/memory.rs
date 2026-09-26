@@ -24,23 +24,39 @@ pub enum HoldingClass {
     Model,
 }
 
+/// The heap's view of the domains its device uses. The hosting service,
+/// not the engine, acts on headroom at or below the emergency reserve, so
+/// the engine treats that as `Reclaim` too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Pressure {
+pub enum MemoryBand {
+    /// Every domain's headroom is above its planning reserve.
     Normal,
-    Pressure,
-    Emergency,
+    /// Some domain's headroom is at or below its planning reserve: growth
+    /// pauses while reclaimable holdings are released.
+    Reclaim,
+    /// A required observation failed: nothing is granted.
     Blind,
+}
+
+impl From<crate::platform::MemoryBand> for MemoryBand {
+    fn from(band: crate::platform::MemoryBand) -> Self {
+        match band {
+            crate::platform::MemoryBand::Normal => Self::Normal,
+            crate::platform::MemoryBand::Reclaim => Self::Reclaim,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryObservation {
     /// Stable domain capacity, after applicable process and device limits.
     pub capacity_bytes: u64,
-    /// Fresh bytes available to an additional allocation.
+    /// Fresh bytes an additional allocation may claim: the allocation
+    /// domain's ceiling above its planning reserve.
     pub available_bytes: u64,
     /// Current Seismic charge for this engine/device scope.
     pub charged_bytes: u64,
-    pub pressure: Pressure,
+    pub band: MemoryBand,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,7 +90,7 @@ pub struct MemoryStanding {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryAction {
     Grant { bytes: u64 },
-    ReleaseRequired { bytes: u64 },
+    /// No growth is granted in the Reclaim or Blind band.
     Wait,
     Reject { required: u64, available: u64 },
 }
@@ -171,14 +187,9 @@ impl MemoryHeap {
             return Err(MemoryError::InvalidNeed);
         }
         let standing = self.standing()?;
-        match standing.observation.pressure {
-            Pressure::Blind | Pressure::Emergency => return Ok(MemoryAction::Wait),
-            Pressure::Pressure => {
-                return Ok(MemoryAction::ReleaseRequired {
-                    bytes: need.minimum_bytes,
-                })
-            }
-            Pressure::Normal => {}
+        match standing.observation.band {
+            MemoryBand::Reclaim | MemoryBand::Blind => return Ok(MemoryAction::Wait),
+            MemoryBand::Normal => {}
         }
         let available = standing
             .observation
@@ -314,13 +325,13 @@ impl Default for MemoryHeap {
 mod tests {
     use super::*;
 
-    fn heap(charged: u64, available: u64, pressure: Pressure) -> MemoryHeap {
+    fn heap(charged: u64, available: u64, band: MemoryBand) -> MemoryHeap {
         let mut heap = MemoryHeap::new();
         heap.observe(MemoryObservation {
             capacity_bytes: charged + available,
             available_bytes: available,
             charged_bytes: charged,
-            pressure,
+            band,
         })
         .unwrap();
         heap
@@ -328,29 +339,84 @@ mod tests {
 
     #[test]
     fn classifications_reconcile_against_seismic_charge() {
-        let mut heap = heap(100, 20, Pressure::Normal);
+        let mut heap = heap(100, 20, MemoryBand::Normal);
         heap.insert(40, HoldingClass::Model).unwrap();
         heap.insert(60, HoldingClass::Live).unwrap();
         assert_eq!(heap.standing().unwrap().unattributed_bytes, 0);
     }
 
     #[test]
-    fn pressure_blocks_new_growth_until_release() {
-        let heap = heap(100, 20, Pressure::Pressure);
+    fn reclaim_and_blind_grant_nothing() {
+        for band in [MemoryBand::Reclaim, MemoryBand::Blind] {
+            let heap = heap(100, 20, band);
+            assert_eq!(
+                heap.decide(MemoryNeed {
+                    minimum_bytes: 8,
+                    preferred_bytes: 16,
+                    class: HoldingClass::Live,
+                })
+                .unwrap(),
+                MemoryAction::Wait
+            );
+            // A zero-byte probe also waits: the band, not the size, decides.
+            assert_eq!(
+                heap.decide(MemoryNeed {
+                    minimum_bytes: 0,
+                    preferred_bytes: 0,
+                    class: HoldingClass::Surplus,
+                })
+                .unwrap(),
+                MemoryAction::Wait
+            );
+        }
+    }
+
+    #[test]
+    fn claims_fail_outside_the_normal_band() {
+        let mut heap = heap(100, 20, MemoryBand::Reclaim);
+        assert_eq!(
+            heap.claim(MemoryNeed {
+                minimum_bytes: 8,
+                preferred_bytes: 8,
+                class: HoldingClass::Model,
+            }),
+            Err(MemoryError::InvalidObservation)
+        );
+        assert_eq!(heap.claims().count(), 0);
+    }
+
+    #[test]
+    fn normal_growth_is_rejected_beyond_the_ceiling() {
+        let heap = heap(100, 20, MemoryBand::Normal);
         assert_eq!(
             heap.decide(MemoryNeed {
-                minimum_bytes: 8,
-                preferred_bytes: 16,
+                minimum_bytes: 21,
+                preferred_bytes: 32,
                 class: HoldingClass::Live,
             })
             .unwrap(),
-            MemoryAction::ReleaseRequired { bytes: 8 }
+            MemoryAction::Reject {
+                required: 21,
+                available: 20,
+            }
+        );
+    }
+
+    #[test]
+    fn policy_bands_map_onto_heap_bands() {
+        assert_eq!(
+            MemoryBand::from(crate::platform::MemoryBand::Normal),
+            MemoryBand::Normal
+        );
+        assert_eq!(
+            MemoryBand::from(crate::platform::MemoryBand::Reclaim),
+            MemoryBand::Reclaim
         );
     }
 
     #[test]
     fn normal_growth_is_limited_by_fresh_availability() {
-        let heap = heap(100, 20, Pressure::Normal);
+        let heap = heap(100, 20, MemoryBand::Normal);
         assert_eq!(
             heap.decide(MemoryNeed {
                 minimum_bytes: 8,
@@ -364,7 +430,7 @@ mod tests {
 
     #[test]
     fn live_and_in_flight_holdings_cannot_be_released_directly() {
-        let mut heap = heap(20, 0, Pressure::Normal);
+        let mut heap = heap(20, 0, MemoryBand::Normal);
         let id = heap.insert(20, HoldingClass::Live).unwrap();
         assert_eq!(
             heap.remove(id),
@@ -374,7 +440,7 @@ mod tests {
 
     #[test]
     fn claims_reserve_headroom_and_commit_only_observed_charge() {
-        let mut heap = heap(80, 40, Pressure::Normal);
+        let mut heap = heap(80, 40, MemoryBand::Normal);
         let claim = heap
             .claim(MemoryNeed {
                 minimum_bytes: 20,
@@ -405,7 +471,7 @@ mod tests {
 
     #[test]
     fn peak_claim_releases_into_one_measured_existing_holding() {
-        let mut heap = heap(80, 40, Pressure::Normal);
+        let mut heap = heap(80, 40, MemoryBand::Normal);
         let model = heap.insert(80, HoldingClass::Model).unwrap();
         let peak = heap
             .claim(MemoryNeed {
@@ -419,7 +485,7 @@ mod tests {
             capacity_bytes: 120,
             available_bytes: 28,
             charged_bytes: 92,
-            pressure: Pressure::Normal,
+            band: MemoryBand::Normal,
         })
         .unwrap();
         heap.cancel_claim(peak.id).unwrap();
@@ -433,7 +499,7 @@ mod tests {
 
     #[test]
     fn rejection_reports_headroom_after_claims() {
-        let mut heap = heap(80, 40, Pressure::Normal);
+        let mut heap = heap(80, 40, MemoryBand::Normal);
         heap.claim(MemoryNeed {
             minimum_bytes: 30,
             preferred_bytes: 30,

@@ -5,14 +5,13 @@ use crate::composition::{ReadyEngine, ResolvedEngineConfiguration};
 use crate::service::EngineService;
 use magnitude_artifacts::Package;
 use magnitude_chat::PreparedVocabulary;
-use magnitude_model_batching::{Demand, MAX_CLASS_ROWS};
+use magnitude_model_batching::Demand;
 use magnitude_model_executor::{
     platform::{self, PlatformConfig},
-    AttestedPrograms, ComponentLoader, ComponentSelection, ExecutionPlanner, ExecutorDomain,
-    KernelCache, Operation, PlannedMethod, RequestId, ReservedResources, ResidencyStore,
-    ResourceAllocator, ResourceCapacity, ResourceDomainId, ResourceLimits, ResourcePlan,
-    ResourcePlanner, TokenId, TuningContext, TuningEvent, TuningObserver, TuningOrigin, WorkKind,
-    DEFAULT_KERNEL_CACHE_BYTES,
+    AttestedPrograms, ComponentLoader, ExecutorDomain, KernelCache, Operation, RequestId,
+    ReservedResources, ResidencyStore, ResourceAllocator, ResourceCapacity, ResourceDomainId,
+    ResourcePlan, ResourcePlanner, TokenId, TuningContext, TuningEvent, TuningObserver,
+    TuningOrigin, WorkKind, DEFAULT_KERNEL_CACHE_BYTES,
 };
 use magnitude_model_state::CodecIdentity;
 use magnitude_service::retention::{RetentionKey, TokenizerIdentity};
@@ -66,75 +65,20 @@ pub fn build_native_domain(
     if package.manifest() != manifest.package {
         return Err("opened package differs from the execution manifest".into());
     }
-    let head_enabled = matches!(
-        manifest.model.method,
-        crate::options::ResolvedMethod::Mtp { .. }
-    );
-    let vision_enabled = manifest.definition.vision.is_some();
-    let selection = ComponentSelection {
-        head: head_enabled,
-        vision: vision_enabled,
-    };
-    // A batch holds at most `max_batch` requests of at most the context each,
-    // so no batch exceeds their product whatever the service's token budgets.
-    let context = usize::try_from(manifest.definition.geometry.context_limit)
-        .map_err(|_| "model context limit exceeds host domain")?;
-    let max_batch_rows = manifest
-        .service
-        .prefill_tokens
-        .max(manifest.service.decode_tokens)
-        .min(manifest.service.max_batch.saturating_mul(context));
-    if max_batch_rows > MAX_CLASS_ROWS {
-        return Err(format!(
-            "service policy requires {max_batch_rows} rows but the execution contract admits at most {MAX_CLASS_ROWS}"
-        ));
-    }
     // This runs inside the numerical worker: its own Seismic catalog and its
     // own process-scoped observations decide selection and admission.
     let catalog = DeviceCatalog::discover().map_err(|error| error.to_string())?;
-    let selected = platform::select_device(&catalog, manifest.path, manifest.device)
+    let reserves = manifest.reserves;
+    let selected = platform::select_device(&catalog, manifest.path, manifest.device, &reserves)
         .map_err(|error| error.to_string())?;
-    let method = match manifest.model.method {
-        crate::options::ResolvedMethod::Plain => PlannedMethod::Plain,
-        crate::options::ResolvedMethod::Mtp {
-            greedy_proposals,
-            sampled_proposals,
-            ..
-        } => PlannedMethod::Mtp {
-            greedy_proposals,
-            sampled_proposals,
-        },
-    };
-    let limits = ResourceLimits {
-        max_retained_entries: manifest.service.max_requests,
-        active_requests: manifest.service.max_batch,
-        in_flight_requests: manifest.service.max_batch,
-        // The service exposes checkpoint/fork for plain as well as MTP
-        // requests. Reserve the bounded live-request checkpoint class.
-        branch_checkpoints: manifest.service.max_batch,
-        max_batch_rows,
-        max_projected_rows: manifest
-            .service
-            .decode_tokens
-            .max(manifest.service.max_batch)
-            .min(max_batch_rows),
-        max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
-        lookahead: manifest.model.lookahead,
-    };
     let capacity_bytes = ResourceCapacity {
         domain_bytes: selected.assessment_capacity_bytes,
     };
-    let draft = ExecutionPlanner::prepare(
-        &selected,
-        &manifest.package,
-        &manifest.definition,
-        selection,
-        manifest.path,
-        method,
-        manifest.model.kv_codec,
-        limits,
-    )
-    .map_err(|error| error.to_string())?;
+    // The same derivation metadata-only assessment plans through.
+    let draft = crate::planning::plan_execution(manifest, &selected)
+        .map_err(|error| error.to_string())?;
+    let limits = draft.policy().limits();
+    let head_enabled = draft.policy().selection().head;
     let state = ResourcePlanner::state_plan(
         &manifest.definition,
         draft.load(),
@@ -158,6 +102,7 @@ pub fn build_native_domain(
             artifacts: kernel_cache
                 .clone()
                 .map(|cache| cache as Arc<dyn seismic::ArtifactStore>),
+            reserves,
         },
     )
     .map_err(|error| error.to_string())?;
@@ -266,7 +211,12 @@ pub fn build_native_domain(
     let state_graphs = programs
         .state_graphs()
         .ok_or("qualified program set has no state graphs")?;
-    claim_startup_bytes(&catalog, &device, plan.bytes().scratch)?;
+    let startup = StartupClaims {
+        catalog: &catalog,
+        device: &device,
+        reserves: &reserves,
+    };
+    startup.claim("graph scratch", plan.bytes().scratch, 0)?;
     let resources = ResourceAllocator::allocate(
         &execution_plan,
         &device,
@@ -286,12 +236,13 @@ pub fn build_native_domain(
         resource_identity.clone(),
     )
     .map_err(|error| error.to_string())?;
+    let target_upload = execution_plan.load().target_upload_peak_bytes()?;
     let target_peak = plan
         .bytes()
         .target_weights
-        .checked_add(execution_plan.load().target_upload_peak_bytes()?)
+        .checked_add(target_upload)
         .ok_or("target import peak byte count overflow")?;
-    claim_startup_bytes(&catalog, &device, target_peak)?;
+    startup.claim("target import", target_peak, target_upload)?;
     let target = residency
         .load_target(&manifest.definition, &package)
         .map_err(|error| error.to_string())?;
@@ -333,19 +284,19 @@ pub fn build_native_domain(
         })
         .transpose()
         .map_err(|error| error.to_string())?;
-    claim_startup_bytes(
-        &catalog,
-        &device,
+    startup.claim(
+        "initial target state",
         plan.target_state().initial_committed_bytes()?,
+        0,
     )?;
     let target_state = plan.allocate_target_state(device.clone())?;
     let head_state = if let Some(state) = plan.head_state() {
-        claim_startup_bytes(&catalog, &device, state.initial_committed_bytes()?)?;
+        startup.claim("initial head state", state.initial_committed_bytes()?, 0)?;
         Some(state.allocate(device.clone())?)
     } else {
         None
     };
-    claim_startup_bytes(&catalog, &device, target_binding_constants)?;
+    startup.claim("target binding constants", target_binding_constants, 0)?;
     let domain = ExecutorDomain::new(
         Rc::new(execution_plan),
         definition,
@@ -359,7 +310,7 @@ pub fn build_native_domain(
         head_state,
     )?;
     let mut domain = domain;
-    domain.install_memory_catalog(catalog);
+    domain.install_memory_policy(catalog, reserves)?;
     domain
         .register_allocated_holdings()
         .map_err(|error| format!("register allocated memory holdings: {error}"))?;
@@ -376,20 +327,40 @@ fn report_load_phase(name: &str, started: &mut Instant) {
     *started = Instant::now();
 }
 
-fn claim_startup_bytes(
-    catalog: &DeviceCatalog,
-    device: &seismic::Device,
-    required: u64,
-) -> Result<(), String> {
-    let available = platform::refresh_allocation_ceiling(catalog, device)
-        .map_err(|error| error.to_string())?
-        .bytes;
-    if required > available {
-        return Err(format!(
-            "initial state requires {required} device bytes; {available} are available"
-        ));
+/// Startup allocations claimed against fresh readings of every domain the
+/// device uses, each keeping headroom above its planning reserve.
+struct StartupClaims<'a> {
+    catalog: &'a DeviceCatalog,
+    device: &'a seismic::Device,
+    reserves: &'a platform::MemoryReserves,
+}
+
+impl StartupClaims<'_> {
+    /// Claim `allocation` additional bytes of the device's allocation domain,
+    /// `staged` of which a dedicated device also stages through host RAM. A
+    /// host-backed device has no staging domain: its staged bytes are part
+    /// of `allocation`. Refreshes Seismic's enforced ceiling.
+    fn claim(&self, purpose: &str, allocation: u64, staged: u64) -> Result<(), String> {
+        let readings = platform::refresh_device_ceiling(self.catalog, self.device, self.reserves)
+            .map_err(|error| error.to_string())?;
+        for reading in readings {
+            let required = match reading.role {
+                platform::DomainRole::Allocation => allocation,
+                platform::DomainRole::Staging => staged,
+            };
+            if required > reading.ceiling_bytes {
+                return Err(format!(
+                    "{purpose} requires {required} bytes of {}; {} are available above the \
+                     {}-byte planning reserve ({} bytes of headroom)",
+                    reading.constraint,
+                    reading.ceiling_bytes,
+                    reading.thresholds.planning_bytes,
+                    reading.headroom_bytes,
+                ));
+            }
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Run one throwaway single-row forward before readiness, so a broken device

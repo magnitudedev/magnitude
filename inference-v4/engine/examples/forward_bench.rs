@@ -563,6 +563,7 @@ impl Bench {
             device,
             control_capacity: 256,
             kernel_cache: kernel_cache.map(std::path::Path::to_path_buf),
+            reserves: magnitude_model_executor::platform::MemoryReserves::standard(),
         }
         .resolve()?;
         let vocabulary = usize::try_from(resolved.manifest.definition.geometry.vocabulary)

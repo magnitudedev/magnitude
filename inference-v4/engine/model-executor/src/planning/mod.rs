@@ -12,8 +12,8 @@ mod resources;
 mod weights;
 
 pub use assessment::{
-    AssessmentBindingEvidence, AssessmentFit, AssessmentFitVerdict, AssessmentGraphResourceBounds,
-    AssessmentHeaderBounds, AssessmentMemoryBounds, AssessmentMemoryTerms, StreamingCost,
+    AssessmentFit, AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
+    AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, StreamingCost,
 };
 pub use capabilities::{CapabilityPlan, PlannedMethod, MAX_DRAFT_PROPOSALS};
 pub use components::{ArtifactComponent, ArtifactComponentKind, ComponentPlan, ComponentSelection};
@@ -246,6 +246,7 @@ pub(crate) mod tests {
             &catalog,
             crate::ExecutionPath::Native,
             crate::platform::DeviceRequest::Automatic,
+            &crate::platform::MemoryReserves::standard(),
         )
         .ok()?;
         let device = catalog

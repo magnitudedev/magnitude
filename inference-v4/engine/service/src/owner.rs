@@ -22,8 +22,8 @@ use magnitude_generation::{
     DetailedUsage, FinishReason, Generation, OutputToken, RoundStart, WaitReason,
 };
 use magnitude_model_executor::{
-    DomainError, DomainRequirements, InvariantError, NativeFamily, OpenRequirements, Operation,
-    Outcome, PhysicalDecision, PressureLevel, ProgramFamily, RequestId, ResourceKind, ResourcePlan,
+    platform::DomainRole, DomainError, DomainRequirements, InvariantError, NativeFamily, OpenRequirements, Operation,
+    Outcome, PhysicalDecision, ProgramFamily, RequestId, ResourceKind, ResourcePlan,
     SubmitError, WorkKind,
 };
 use magnitude_model_state::ShrinkPolicy;
@@ -121,9 +121,9 @@ fn classify_domain_error(error: DomainError) -> RequestError {
             context: "device memory observation",
             detail: message,
         }),
-        DomainError::Pressure(level) => RequestError::Invariant(InvariantError {
-            context: "platform memory pressure",
-            detail: format!("{level:?}"),
+        DomainError::Reclaim => RequestError::Invariant(InvariantError {
+            context: "memory reclaim",
+            detail: DomainError::Reclaim.to_string(),
         }),
         DomainError::Input(error) => RequestError::Input(error),
         DomainError::State(error) => RequestError::State(error),
@@ -152,7 +152,9 @@ pub enum AdmissionError {
     /// A required device-memory observation failed. The caller may retry
     /// after the platform can report availability again.
     MemoryObservationUnavailable(String),
-    MemoryPressure(PressureLevel),
+    /// A domain the model uses has headroom at or below its planning
+    /// reserve; admission pauses while memory is reclaimed. Retryable.
+    MemoryReclaim,
     ModelUnloaded {
         cause: ModelUnloadCause,
     },
@@ -168,9 +170,8 @@ impl std::fmt::Display for AdmissionError {
                     "device memory observation unavailable: {message}"
                 )
             }
-            Self::MemoryPressure(level) => {
-                write!(formatter, "platform memory pressure is {level:?}")
-            }
+            Self::MemoryReclaim => formatter
+                .write_str("memory headroom is at or below the planning reserve; reclaiming memory"),
             Self::ModelUnloaded {
                 cause: ModelUnloadCause::MemoryPressure,
             } => formatter.write_str("model unloaded due to memory pressure"),
@@ -197,7 +198,7 @@ impl From<DomainError> for AdmissionError {
     fn from(error: DomainError) -> Self {
         match error {
             DomainError::Blind(message) => Self::MemoryObservationUnavailable(message),
-            DomainError::Pressure(level) => Self::MemoryPressure(level),
+            DomainError::Reclaim => Self::MemoryReclaim,
             other => Self::Other(other.to_string()),
         }
     }
@@ -212,22 +213,35 @@ pub enum Step {
     Progress,
 }
 
+/// How long Reclaim may persist after releases are exhausted, and how long
+/// observations may fail continuously, before the model unloads.
 const MEMORY_ESCALATION_NS: u64 = 1_000_000_000;
 
+/// One probe of every domain the loaded model uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MemoryObservation {
+    /// Every domain's headroom is above its planning reserve.
     Normal,
-    Pressure,
-    Emergency,
+    /// Some domain's headroom is at or below its planning reserve.
+    Reclaim,
+    /// A required observation failed.
     Blind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MemoryCondition {
     Normal,
-    Pressure,
-    Blind { since: u64 },
-    Emergency { since: u64 },
+    /// Admission and growth pause while releases run. `since` starts the
+    /// unload clock: when the band was entered, restarted whenever a release
+    /// frees memory, so the model unloads once Reclaim persists for
+    /// [`MEMORY_ESCALATION_NS`] after releases are exhausted.
+    Reclaim {
+        since: u64,
+    },
+    /// Observations have failed continuously since `since`.
+    Blind {
+        since: u64,
+    },
     Unloading,
 }
 
@@ -238,24 +252,33 @@ impl MemoryCondition {
         }
         match observation {
             MemoryObservation::Normal => Self::Normal,
-            MemoryObservation::Pressure => Self::Pressure,
-            MemoryObservation::Emergency => match self {
-                Self::Emergency { since } => Self::Emergency { since },
-                _ => Self::Emergency { since: now },
+            MemoryObservation::Reclaim => match self {
+                Self::Reclaim { since } => Self::Reclaim { since },
+                _ => Self::Reclaim { since: now },
             },
             MemoryObservation::Blind => match self {
+                // One continuous escalation interval of Blind is Reclaim
+                // whose unload clock has already expired.
                 Self::Blind { since } if now.saturating_sub(since) >= MEMORY_ESCALATION_NS => {
-                    Self::Emergency { since: now }
+                    Self::Reclaim { since }
                 }
                 Self::Blind { since } => Self::Blind { since },
-                Self::Emergency { since } => Self::Emergency { since },
+                Self::Reclaim { since } => Self::Reclaim { since },
                 _ => Self::Blind { since: now },
             },
         }
     }
 
+    /// A release freed memory at `now`: releases are not exhausted yet.
+    fn released(self, now: u64) -> Self {
+        match self {
+            Self::Reclaim { .. } => Self::Reclaim { since: now },
+            other => other,
+        }
+    }
+
     fn should_unload(self, now: u64) -> bool {
-        matches!(self, Self::Emergency { since } if now.saturating_sub(since) >= MEMORY_ESCALATION_NS)
+        matches!(self, Self::Reclaim { since } if now.saturating_sub(since) >= MEMORY_ESCALATION_NS)
     }
 }
 
@@ -288,8 +311,17 @@ pub struct Owner<F: ProgramFamily = NativeFamily> {
     now: u64,
     fatal: Option<String>,
     retention: Retention<DomainCheckpoint>,
-    pressure_release_pending: bool,
+    reclaim_release_pending: bool,
     memory_condition: MemoryCondition,
+    memory_deficit: Option<MemoryDeficit>,
+}
+
+/// The memory a capacity-blocked batch still needs from one domain's
+/// ceiling after every release was exhausted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MemoryDeficit {
+    role: DomainRole,
+    required: u64,
 }
 
 impl<F: ProgramFamily> Owner<F> {
@@ -337,8 +369,9 @@ impl<F: ProgramFamily> Owner<F> {
             now: 0,
             fatal: None,
             retention: Retention::new(retention_capacity),
-            pressure_release_pending: false,
+            reclaim_release_pending: false,
             memory_condition: MemoryCondition::Normal,
+            memory_deficit: None,
         })
     }
 
@@ -441,6 +474,11 @@ impl<F: ProgramFamily> Owner<F> {
         Ok(())
     }
 
+    /// Observe every domain the model uses. In Reclaim, release in order
+    /// until the band is Normal; unload once Reclaim persists for the
+    /// escalation interval after releases are exhausted, or once
+    /// observations have failed for that interval. Releases and unload never
+    /// run under a flight: they wait for its completion.
     fn observe_periodic_memory(&mut self, now: u64) -> Result<(), String> {
         self.time(now)?;
         if self.memory_condition == MemoryCondition::Unloading {
@@ -448,12 +486,11 @@ impl<F: ProgramFamily> Owner<F> {
         }
         let observation = Self::memory_observation(self.domain.probe_memory())?;
         self.memory_condition = self.memory_condition.observe(observation, now);
-        if matches!(
-            observation,
-            MemoryObservation::Normal | MemoryObservation::Blind
-        ) && !matches!(self.memory_condition, MemoryCondition::Emergency { .. })
-        {
-            self.pressure_release_pending = false;
+        if !matches!(self.memory_condition, MemoryCondition::Reclaim { .. }) {
+            self.reclaim_release_pending = false;
+            if observation == MemoryObservation::Normal {
+                self.reopen_memory_deficit()?;
+            }
             return Ok(());
         }
         if self
@@ -461,14 +498,42 @@ impl<F: ProgramFamily> Owner<F> {
             .as_ref()
             .is_some_and(|batch| batch.active.is_some())
         {
-            self.pressure_release_pending = true;
+            self.reclaim_release_pending = true;
             return Ok(());
         }
-        self.release_pressure_holdings()?;
-        let after = Self::memory_observation(self.domain.probe_memory())?;
-        self.memory_condition = self.memory_condition.observe(after, now);
+        // Releases are measured against a fresh reading; a Blind escalation
+        // has none, so it goes straight to the unload decision.
+        if observation == MemoryObservation::Reclaim && self.release_for_reclaim()? {
+            self.memory_condition = self.memory_condition.released(now);
+            let after = Self::memory_observation(self.domain.probe_memory())?;
+            self.memory_condition = self.memory_condition.observe(after, now);
+        }
         if self.memory_condition.should_unload(now) {
             self.begin_memory_unload();
+        }
+        Ok(())
+    }
+
+    /// A batch blocked on a memory deficit waits for an availability change.
+    /// Memory another process frees is one: advance the epoch once the
+    /// deficit's domain ceiling covers it, so the batch retries.
+    fn reopen_memory_deficit(&mut self) -> Result<(), String> {
+        let Some(deficit) = self.memory_deficit else {
+            return Ok(());
+        };
+        let readings = match self.domain.refresh_memory() {
+            Ok(readings) => readings,
+            // A failed reading says nothing about the deficit; the next
+            // periodic observation looks again.
+            Err(DomainError::Blind(_)) => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
+        if readings
+            .iter()
+            .any(|reading| reading.role == deficit.role && reading.ceiling_bytes >= deficit.required)
+        {
+            self.memory_deficit = None;
+            self.epoch.advance()?;
         }
         Ok(())
     }
@@ -476,38 +541,73 @@ impl<F: ProgramFamily> Owner<F> {
     fn memory_observation(result: Result<(), DomainError>) -> Result<MemoryObservation, String> {
         match result {
             Ok(()) => Ok(MemoryObservation::Normal),
-            Err(DomainError::Pressure(PressureLevel::Normal)) => Ok(MemoryObservation::Normal),
-            Err(DomainError::Pressure(PressureLevel::Pressure)) => Ok(MemoryObservation::Pressure),
-            Err(DomainError::Pressure(PressureLevel::Emergency)) => {
-                Ok(MemoryObservation::Emergency)
-            }
+            Err(DomainError::Reclaim) => Ok(MemoryObservation::Reclaim),
             Err(DomainError::Blind(_)) => Ok(MemoryObservation::Blind),
             Err(error) => Err(error.to_string()),
         }
     }
 
-    fn release_pressure_holdings(&mut self) -> Result<(), String> {
-        self.relieve_platform_pressure()?;
-        while matches!(self.memory_condition, MemoryCondition::Emergency { .. }) {
-            if matches!(self.domain.probe_memory(), Ok(())) {
+    /// Whether a fresh reading is still in the Reclaim band. A failed reading
+    /// cannot measure a release, so it stops releasing.
+    fn reclaim_needed(&mut self) -> Result<bool, String> {
+        Ok(Self::memory_observation(self.domain.probe_memory())? == MemoryObservation::Reclaim)
+    }
+
+    /// Release in the Reclaim order until every domain is back above its
+    /// planning reserve: surplus state backing, retained prefixes (least
+    /// recently used first), dormant optional components, then preemption of
+    /// each eligible victim once. Preempted requests replay only after the
+    /// band is Normal again, so no victim is chosen twice. Returns whether
+    /// anything was released.
+    fn release_for_reclaim(&mut self) -> Result<bool, String> {
+        let mut released = self.release_surplus()?;
+        while self.reclaim_needed()? {
+            if self
+                .retention
+                .evict_one(DomainCheckpoint::exclusive_bytes)?
+                .is_none()
+            {
                 break;
             }
+            // Eviction drops claims, but committed rows and banks remain
+            // charged until the stores shrink.
+            self.release_surplus()?;
+            released = true;
+        }
+        if self.reclaim_needed()? {
+            released |= self.domain.release_idle_optional_components()? != 0;
+        }
+        while self.reclaim_needed()? {
             if !self.evict_victims(&[], false)? {
                 break;
             }
-            self.domain
-                .shrink_state(ShrinkPolicy::Pressure)
-                .map_err(|error| error.to_string())?;
+            self.release_surplus()?;
+            released = true;
+        }
+        // Preemption can leave the optional components dormant.
+        if self.reclaim_needed()? {
+            released |= self.domain.release_idle_optional_components()? != 0;
         }
         self.epoch.advance()?;
-        Ok(())
+        Ok(released)
     }
 
-    fn release_deferred_pressure(&mut self) -> Result<(), String> {
-        if !self.pressure_release_pending {
+    /// Release state backing beyond what the stores need, including idle
+    /// state. Returns whether any bytes were released.
+    fn release_surplus(&mut self) -> Result<bool, String> {
+        let shrunk = self
+            .domain
+            .shrink_state(ShrinkPolicy::Reclaim)
+            .map_err(|error| error.to_string())?;
+        let idle = self.domain.reclaim_idle()?;
+        Ok(shrunk != 0 || idle != 0)
+    }
+
+    fn release_deferred_reclaim(&mut self) -> Result<(), String> {
+        if !self.reclaim_release_pending {
             return Ok(());
         }
-        self.pressure_release_pending = false;
+        self.reclaim_release_pending = false;
         self.observe_periodic_memory(self.now)
     }
 
@@ -563,8 +663,8 @@ impl<F: ProgramFamily> Owner<F> {
                 cause: ModelUnloadCause::MemoryPressure,
             });
         }
-        if matches!(self.memory_condition, MemoryCondition::Emergency { .. }) {
-            return Err(AdmissionError::MemoryPressure(PressureLevel::Emergency));
+        if matches!(self.memory_condition, MemoryCondition::Reclaim { .. }) {
+            return Err(AdmissionError::MemoryReclaim);
         }
         if let Some(error) = &self.fatal {
             return Err(error.clone().into());
@@ -839,7 +939,7 @@ impl<F: ProgramFamily> Owner<F> {
         let mut current = self.open_capacity(requirements);
         if matches!(current, Err(DomainError::Capacity(_))) {
             self.domain
-                .shrink_state(ShrinkPolicy::Pressure)
+                .shrink_state(ShrinkPolicy::Reclaim)
                 .map_err(AdmissionError::from)?;
             current = self.open_capacity(requirements);
             if matches!(current, Err(DomainError::Capacity(_))) {
@@ -855,7 +955,7 @@ impl<F: ProgramFamily> Owner<F> {
                     break;
                 }
                 self.domain
-                    .shrink_state(ShrinkPolicy::Pressure)
+                    .shrink_state(ShrinkPolicy::Reclaim)
                     .map_err(AdmissionError::from)?;
                 current = self.open_capacity(requirements);
             }
@@ -868,7 +968,7 @@ impl<F: ProgramFamily> Owner<F> {
                     break;
                 }
                 self.domain
-                    .shrink_state(ShrinkPolicy::Pressure)
+                    .shrink_state(ShrinkPolicy::Reclaim)
                     .map_err(AdmissionError::from)?;
                 current = self.open_capacity(requirements);
             }
@@ -1651,7 +1751,7 @@ impl<F: ProgramFamily> Owner<F> {
         }
         if complete {
             self.reconcile_active()?;
-            self.release_deferred_pressure()?;
+            self.release_deferred_reclaim()?;
             if self.memory_condition == MemoryCondition::Unloading {
                 return Ok(Step::Idle);
             }
@@ -1712,9 +1812,7 @@ impl<F: ProgramFamily> Owner<F> {
         let first_provision = match self.domain.provision(queued.operations()) {
             Ok(()) => Ok(()),
             Err(
-                error @ (DomainError::Capacity(_)
-                | DomainError::Blind(_)
-                | DomainError::Pressure(_)),
+                error @ (DomainError::Capacity(_) | DomainError::Blind(_) | DomainError::Reclaim),
             ) => Err(error),
             Err(error) => {
                 self.fail_domain_error(error);
@@ -1738,13 +1836,13 @@ impl<F: ProgramFamily> Owner<F> {
         });
         if matches!(&current, Err(DomainError::Capacity(_))) {
             // Selection is provisional until every exact requirement is
-            // available. Memory pressure first releases state backing beyond
+            // available. A demand deficit first releases state backing beyond
             // what the stores need (another store may hold the device memory
             // this one needs to grow into); policy then releases
             // least-recently-used retention only until the requirement fits,
             // then idle residency, then eligible live victims. No launch or
             // state transaction exists while these scheduling decisions run.
-            match self.domain.shrink_state(ShrinkPolicy::Pressure) {
+            match self.domain.shrink_state(ShrinkPolicy::Reclaim) {
                 Ok(_) => current = self.provisioned_capacity(queued.operations(), &requirement),
                 Err(error) => {
                     self.fail_domain_error(error);
@@ -1763,7 +1861,7 @@ impl<F: ProgramFamily> Owner<F> {
                 {
                     break;
                 }
-                if let Err(error) = self.domain.shrink_state(ShrinkPolicy::Pressure) {
+                if let Err(error) = self.domain.shrink_state(ShrinkPolicy::Reclaim) {
                     self.fail_domain_error(error);
                     return Ok(Step::Progress);
                 }
@@ -1778,16 +1876,19 @@ impl<F: ProgramFamily> Owner<F> {
                 if !self.evict_victims(&selected, false)? {
                     break;
                 }
-                if let Err(error) = self.domain.shrink_state(ShrinkPolicy::Pressure) {
+                if let Err(error) = self.domain.shrink_state(ShrinkPolicy::Reclaim) {
                     self.fail_domain_error(error);
                     return Ok(Step::Progress);
                 }
                 current = self.provisioned_capacity(queued.operations(), &requirement);
             }
         }
-        if matches!(&current, Err(DomainError::Pressure(_))) {
-            self.relieve_platform_pressure()?;
+        if matches!(&current, Err(DomainError::Reclaim)) {
+            // Growth pauses in the Reclaim band. Keep the group, then run
+            // the Reclaim releases now rather than at the next periodic
+            // observation; no flight is active here.
             self.requeue_group(queued);
+            self.observe_periodic_memory(self.now)?;
             return Ok(Step::Waiting);
         }
         match current {
@@ -1807,7 +1908,7 @@ impl<F: ProgramFamily> Owner<F> {
                     deficit.available,
                 )
             }
-            Err(DomainError::Pressure(_)) => unreachable!("pressure handled above"),
+            Err(DomainError::Reclaim) => unreachable!("reclaim handled above"),
             Err(error) => {
                 self.fail_domain_error(error);
                 return Ok(Step::Progress);
@@ -1864,7 +1965,7 @@ impl<F: ProgramFamily> Owner<F> {
                 self.requeue_group(queued);
                 Ok(Step::Waiting)
             }
-            Err(DomainError::Pressure(_)) => {
+            Err(DomainError::Reclaim) => {
                 drop(publication_permits);
                 self.requeue_group(queued);
                 Ok(Step::Waiting)
@@ -1909,60 +2010,6 @@ impl<F: ProgramFamily> Owner<F> {
         let batch = self.batch.as_mut().expect("queued group has a batch");
         for group in regrouped.into_iter().rev() {
             batch.queued.push_front(group);
-        }
-    }
-
-    /// Pressure may discard surplus and retained reuse state, never accepted
-    /// live work. Stop as soon as the platform reports Normal or Blind.
-    /// Emergency preemption and model unload require the separate owner
-    /// lifecycle transition; this routine performs only safe release rungs.
-    fn relieve_platform_pressure(&mut self) -> Result<(), String> {
-        self.domain
-            .shrink_state(ShrinkPolicy::Pressure)
-            .map_err(|error| error.to_string())?;
-        if !self.pressure_release_needed() {
-            return Ok(());
-        }
-        self.domain.reclaim_idle()?;
-        while self.pressure_release_needed() {
-            if self
-                .retention
-                .evict_one(DomainCheckpoint::exclusive_bytes)?
-                .is_none()
-            {
-                break;
-            }
-            // Eviction drops claims, but committed rows and banks remain
-            // charged until the stores shrink. Probe the device only after
-            // that physical release has had a chance to complete.
-            self.domain
-                .shrink_state(ShrinkPolicy::Pressure)
-                .map_err(|error| error.to_string())?;
-            self.domain.reclaim_idle()?;
-        }
-        // Optional weights are dormant only after every request has left the
-        // owner. Use the device's actual charge decrease as release credit.
-        if self.records.is_empty()
-            && self.pressure_release_needed()
-            && matches!(
-                self.memory_condition,
-                MemoryCondition::Pressure | MemoryCondition::Emergency { .. }
-            )
-        {
-            self.domain.release_idle_optional_components()?;
-        }
-        Ok(())
-    }
-
-    fn pressure_release_needed(&mut self) -> bool {
-        match self.domain.probe_memory() {
-            Err(DomainError::Pressure(_)) => true,
-            Err(DomainError::Blind(_))
-                if matches!(self.memory_condition, MemoryCondition::Emergency { .. }) =>
-            {
-                true
-            }
-            _ => false,
         }
     }
 
@@ -2057,6 +2104,19 @@ impl<F: ProgramFamily> Owner<F> {
                     record.capacity = Some((self.epoch, required, available));
                 }
             }
+            // Memory can also return from outside the engine; a later
+            // observation reopens the batch once the ceiling covers it.
+            self.memory_deficit = match resource {
+                ResourceKind::DeviceMemory => Some(MemoryDeficit {
+                    role: DomainRole::Allocation,
+                    required,
+                }),
+                ResourceKind::HostStaging => Some(MemoryDeficit {
+                    role: DomainRole::Staging,
+                    required,
+                }),
+                _ => None,
+            };
             let batch = self.batch.as_mut().unwrap();
             batch.queued.push_front(queued);
             batch.blocked = Some(self.epoch);
@@ -2643,36 +2703,70 @@ mod memory_condition_tests {
     use super::{MemoryCondition, MemoryObservation, MEMORY_ESCALATION_NS};
 
     #[test]
-    fn continuous_blind_escalates_then_unloads_after_emergency_interval() {
+    fn continuous_blind_escalates_to_immediately_eligible_reclaim() {
         let blind = MemoryCondition::Normal.observe(MemoryObservation::Blind, 7);
         assert_eq!(blind, MemoryCondition::Blind { since: 7 });
         let before = blind.observe(MemoryObservation::Blind, 7 + MEMORY_ESCALATION_NS - 1);
         assert_eq!(before, blind);
-        let emergency = before.observe(MemoryObservation::Blind, 7 + MEMORY_ESCALATION_NS);
-        assert_eq!(
-            emergency,
-            MemoryCondition::Emergency {
-                since: 7 + MEMORY_ESCALATION_NS
-            }
-        );
-        assert!(!emergency.should_unload(7 + 2 * MEMORY_ESCALATION_NS - 1));
-        assert!(emergency.should_unload(7 + 2 * MEMORY_ESCALATION_NS));
-        assert_eq!(
-            emergency.observe(MemoryObservation::Normal, 7 + 2 * MEMORY_ESCALATION_NS),
-            MemoryCondition::Normal
-        );
+        assert!(!before.should_unload(7 + MEMORY_ESCALATION_NS - 1));
+        let escalated = before.observe(MemoryObservation::Blind, 7 + MEMORY_ESCALATION_NS);
+        assert_eq!(escalated, MemoryCondition::Reclaim { since: 7 });
+        assert!(escalated.should_unload(7 + MEMORY_ESCALATION_NS));
     }
 
     #[test]
-    fn emergency_timer_resets_after_pressure_recovery() {
-        let emergency = MemoryCondition::Normal.observe(MemoryObservation::Emergency, 5);
+    fn interrupted_blind_restarts_its_interval() {
+        let blind = MemoryCondition::Normal.observe(MemoryObservation::Blind, 7);
+        let normal = blind.observe(MemoryObservation::Normal, 8);
+        assert_eq!(normal, MemoryCondition::Normal);
+        let renewed = normal.observe(MemoryObservation::Blind, 7 + MEMORY_ESCALATION_NS);
         assert_eq!(
-            emergency.observe(MemoryObservation::Emergency, 9),
-            emergency
+            renewed,
+            MemoryCondition::Blind {
+                since: 7 + MEMORY_ESCALATION_NS
+            }
         );
-        let pressure = emergency.observe(MemoryObservation::Pressure, 10);
-        assert_eq!(pressure, MemoryCondition::Pressure);
-        let renewed = pressure.observe(MemoryObservation::Emergency, 11);
-        assert_eq!(renewed, MemoryCondition::Emergency { since: 11 });
+        assert!(!renewed.should_unload(7 + MEMORY_ESCALATION_NS));
+    }
+
+    #[test]
+    fn reclaim_unloads_one_interval_after_releases_are_exhausted() {
+        let reclaim = MemoryCondition::Normal.observe(MemoryObservation::Reclaim, 5);
+        assert_eq!(reclaim, MemoryCondition::Reclaim { since: 5 });
+        // Continued Reclaim keeps the clock; a release that frees memory
+        // restarts it.
+        assert_eq!(reclaim.observe(MemoryObservation::Reclaim, 9), reclaim);
+        let released = reclaim.released(100);
+        assert_eq!(released, MemoryCondition::Reclaim { since: 100 });
+        assert!(!released.should_unload(100 + MEMORY_ESCALATION_NS - 1));
+        assert!(released.should_unload(100 + MEMORY_ESCALATION_NS));
+        // A failed reading during Reclaim neither resets nor extends it.
+        assert_eq!(released.observe(MemoryObservation::Blind, 200), released);
+    }
+
+    #[test]
+    fn recovery_clears_reclaim_and_a_new_episode_starts_fresh() {
+        let reclaim = MemoryCondition::Normal.observe(MemoryObservation::Reclaim, 5);
+        let normal = reclaim.observe(MemoryObservation::Normal, 10);
+        assert_eq!(normal, MemoryCondition::Normal);
+        assert!(!normal.should_unload(10 + MEMORY_ESCALATION_NS));
+        assert_eq!(normal.released(11), MemoryCondition::Normal);
+        let renewed = normal.observe(MemoryObservation::Reclaim, 11);
+        assert_eq!(renewed, MemoryCondition::Reclaim { since: 11 });
+    }
+
+    #[test]
+    fn unloading_is_terminal() {
+        for observation in [
+            MemoryObservation::Normal,
+            MemoryObservation::Reclaim,
+            MemoryObservation::Blind,
+        ] {
+            assert_eq!(
+                MemoryCondition::Unloading.observe(observation, 1),
+                MemoryCondition::Unloading
+            );
+        }
+        assert!(!MemoryCondition::Unloading.should_unload(u64::MAX));
     }
 }

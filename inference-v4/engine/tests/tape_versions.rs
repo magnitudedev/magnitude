@@ -14,7 +14,8 @@ use magnitude_engine::{
     options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection},
 };
 use magnitude_model_executor::{
-    platform::DeviceRequest, Demand, ExecutionPath, ExecutorDomain, Operation, Outcome,
+    platform::{DeviceRequest, MemoryReserves},
+    Demand, ExecutionPath, ExecutorDomain, Operation, Outcome,
     PhysicalDecision, RequestId, RowResult, TokenId, WorkKind,
 };
 use magnitude_model_state::KvCodec;
@@ -55,6 +56,7 @@ fn open_domain() -> Option<(ExecutorDomain, usize)> {
         device: DeviceRequest::Automatic,
         control_capacity: 64,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
+        reserves: MemoryReserves::standard(),
     }
     .resolve()
     .unwrap();

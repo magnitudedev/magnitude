@@ -5,7 +5,8 @@
 use crate::batching::{
     Draw, DrawKind, Row, Select, Shaping as RowShaping, Slot, ValidatedTargetBatch,
 };
-use crate::memory::{HoldingClass, HoldingId, MemoryHeap, MemoryObservation, Pressure};
+use crate::memory::{HoldingClass, HoldingId, MemoryBand, MemoryHeap, MemoryObservation};
+use crate::platform::{DomainReading, DomainRole, MemoryReserves};
 use crate::programs::ProgramSubmission;
 use crate::{
     AllocatedResources, AttestedPrograms, CapacityError, Completion, ComponentLoader,
@@ -63,9 +64,9 @@ pub enum DomainError {
     /// A required device-memory observation failed. This is not a demand
     /// deficit: reclaiming another request cannot make the reading valid.
     Blind(String),
-    /// The platform reports actual pressure; request growth waits while
-    /// reclaimable holdings are released.
-    Pressure(seismic::PressureLevel),
+    /// A domain the device uses has headroom at or below its planning
+    /// reserve; growth waits while reclaimable holdings are released.
+    Reclaim,
     Input(String),
     State(magnitude_model_state::Error),
     Submit(crate::SubmitError),
@@ -87,7 +88,7 @@ impl std::fmt::Display for DomainError {
         match self {
             Self::Capacity(error) => error.fmt(f),
             Self::Blind(message) => write!(f, "device memory observation unavailable: {message}"),
-            Self::Pressure(level) => write!(f, "platform memory pressure is {level:?}"),
+            Self::Reclaim => f.write_str("memory headroom is at or below the planning reserve"),
             Self::Input(message) => f.write_str(message),
             Self::State(error) => error.fmt(f),
             Self::Submit(error) => error.fmt(f),
@@ -354,6 +355,15 @@ impl DomainCheckpoint {
     }
 }
 
+/// The live memory authority of one domain's device: the worker's Seismic
+/// catalog, the host's threshold policy and the allocation domain's stable
+/// capacity.
+struct DomainMemoryPolicy {
+    catalog: seismic::DeviceCatalog,
+    reserves: MemoryReserves,
+    capacity_bytes: u64,
+}
+
 /// Native executor with no erased stage or executor type parameters. The
 /// accepted map is vacant while that request's advance is in flight.
 pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
@@ -361,7 +371,7 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     definition: Rc<ModelDefinition>,
     resources: AllocatedResources,
     domain: ResourceDomain,
-    memory_catalog: Option<seismic::DeviceCatalog>,
+    memory_policy: Option<DomainMemoryPolicy>,
     memory: Rc<RefCell<MemoryHeap>>,
     static_holding: Option<HoldingId>,
     optional_holding: Option<HoldingId>,
@@ -391,17 +401,11 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
 }
 
 impl ExecutorDomain<NativeFamily> {
-    /// Reuse the worker's selected-device catalog for subsequent live memory
-    /// observations instead of rediscovering devices on the first request.
-    pub fn install_memory_catalog(&mut self, catalog: seismic::DeviceCatalog) {
-        self.memory_catalog = Some(catalog);
-    }
-
     /// Classify the allocations that are already physically committed before
     /// any request reservation begins. The byte total comes from the actual
     /// graph pools and state stores; Seismic remains the charge authority.
     pub fn register_allocated_holdings(&mut self) -> Result<HoldingId, String> {
-        self.refresh_memory()?;
+        self.refresh_memory().map_err(|error| error.to_string())?;
         let static_bytes = self.static_holding_bytes()?;
         let holding = self
             .memory
@@ -533,45 +537,73 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .map_err(|error| format!("static memory holding update rejected: {error:?}"))
     }
 
-    /// Refresh the engine policy view from the same device facts used to set
-    /// Seismic's allocation ceiling. Seismic remains the physical charge
-    /// authority; this heap only classifies ownership and issues claims.
-    pub fn refresh_memory(&mut self) -> Result<(), String> {
-        let catalog = self
-            .memory_catalog
-            .as_ref()
-            .ok_or_else(|| "memory catalog has not been installed".to_owned())?;
-        let device = self.domain.device();
-        let capacity = crate::platform::assessment_capacity(
+    /// Install the worker's selected-device catalog and the host's threshold
+    /// policy for every later live memory observation. The allocation
+    /// domain's stable capacity is fixed here.
+    pub fn install_memory_policy(
+        &mut self,
+        catalog: seismic::DeviceCatalog,
+        reserves: MemoryReserves,
+    ) -> Result<(), String> {
+        let host = catalog
+            .host_memory_status()
+            .map_err(|error| error.to_string())?;
+        let capacity_bytes = crate::platform::fit_capacities(
             &catalog.topology(),
-            device.info(),
-            &catalog
-                .host_memory_status()
-                .map_err(|error| error.to_string())?,
+            self.domain.device().info(),
+            &host,
+            &reserves,
         )
-        .map_err(|error| error.to_string())?;
-        let (available_bytes, pressure) =
-            match crate::platform::growth_availability(catalog, device) {
-                Ok(available) => (available.bytes, Pressure::Normal),
-                Err(crate::platform::MemoryPolicyError::Pressure(level)) => {
-                    let pressure = match level {
-                        seismic::PressureLevel::Emergency => Pressure::Emergency,
-                        seismic::PressureLevel::Pressure => Pressure::Pressure,
-                        _ => Pressure::Blind,
-                    };
-                    (0, pressure)
-                }
-                Err(error) => return Err(error.to_string()),
-            };
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|(role, _)| *role == DomainRole::Allocation)
+        .expect("fit capacities include the allocation domain")
+        .1
+        .capacity_bytes;
+        self.memory_policy = Some(DomainMemoryPolicy {
+            catalog,
+            reserves,
+            capacity_bytes,
+        });
+        Ok(())
+    }
+
+    /// Observe every domain the device uses, set Seismic's allocation
+    /// ceiling from the readings, and refresh the heap's view from the same
+    /// readings. Seismic remains the physical charge authority; the heap only
+    /// classifies ownership and issues claims. A failed observation revokes
+    /// unspent grants and leaves the heap Blind.
+    pub fn refresh_memory(&self) -> Result<Vec<DomainReading>, DomainError> {
+        let policy = self
+            .memory_policy
+            .as_ref()
+            .ok_or_else(|| DomainError::invariant("memory policy has not been installed"))?;
+        let device = self.domain.device();
+        let readings =
+            crate::platform::refresh_device_ceiling(&policy.catalog, device, &policy.reserves);
+        let (available_bytes, band) = match &readings {
+            Ok(readings) => (
+                readings
+                    .iter()
+                    .find(|reading| reading.role == DomainRole::Allocation)
+                    .expect("readings include the allocation domain")
+                    .ceiling_bytes,
+                MemoryBand::from(crate::platform::band_of(readings)),
+            ),
+            Err(_) => (0, MemoryBand::Blind),
+        };
         self.memory
             .borrow_mut()
             .observe(MemoryObservation {
-                capacity_bytes: capacity,
+                capacity_bytes: policy.capacity_bytes,
                 available_bytes,
                 charged_bytes: device.memory_usage().charged,
-                pressure,
+                band,
             })
-            .map_err(|error| format!("memory observation rejected: {error:?}"))
+            .map_err(|error| {
+                DomainError::invariant(format!("memory observation rejected: {error:?}"))
+            })?;
+        readings.map_err(|error| DomainError::Blind(error.to_string()))
     }
 
     pub fn memory(&self) -> std::cell::Ref<'_, MemoryHeap> {
@@ -831,9 +863,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     pub fn reserve(&mut self, operations: &[Operation]) -> Result<DomainReservation, DomainError> {
-        if self.memory_catalog.is_some() {
-            self.refresh_memory().map_err(DomainError::Input)?;
-        }
+        self.refresh_memory()?;
         let requirements = self.requirements(operations)?;
         if requirements.claim {
             let slots = self
@@ -1014,7 +1044,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             definition,
             resources,
             domain: ResourceDomain::new(id, device),
-            memory_catalog: None,
+            memory_policy: None,
             memory: Rc::new(RefCell::new(MemoryHeap::new())),
             static_holding: None,
             optional_holding: None,

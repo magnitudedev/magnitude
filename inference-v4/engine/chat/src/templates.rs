@@ -1,6 +1,7 @@
 use magnitude_templates::{PreparedRequest, Request as NativeRequest, SpecialTokens, Template};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use sha2::Digest;
 use std::collections::{BTreeMap, HashSet};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -268,6 +269,82 @@ impl TemplateBundle {
             return Err("selected template did not produce required output constraints".into());
         }
         Ok(prepared)
+    }
+}
+
+/// Version of the template fingerprint derivation. Changes whenever the
+/// digest's inputs change.
+pub const TEMPLATE_FINGERPRINT_VERSION: &str = "v4-template-fingerprint-1";
+
+/// Header-only chat facts of a bundle, established through the same
+/// preparation path requests use. Nothing is tokenized or generated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TemplateInspection {
+    /// A required-tool request prepares with tool-call constraints.
+    pub tools: bool,
+    /// A JSON-schema request prepares with output constraints.
+    pub structured_output: bool,
+    /// Reasoning controls of the default variant without template arguments.
+    pub reasoning: super::reasoning::ReasoningProfile,
+    /// SHA-256 over the fingerprint version, the default variant's name, each
+    /// variant's name and native template identity (source, special tokens
+    /// and native build) in name order, and the reasoning profile's
+    /// fingerprint. Equal fingerprints render and parse every request alike.
+    pub fingerprint: String,
+}
+
+impl TemplateBundle {
+    pub fn inspect(&self) -> Result<TemplateInspection, String> {
+        let default = self
+            .variants
+            .get(&self.default)
+            .ok_or("template bundle lost its default variant")?;
+        let template =
+            Template::new(&default.source, &self.special_tokens).map_err(|e| e.to_string())?;
+        let reasoning = super::reasoning::inspect_reasoning(&template, &Default::default())?;
+        let question = serde_json::json!({"role":"user","content":"What is the weather in Paris?"});
+        let mut tool_request = ChatRequest::new(vec![question.clone()], 946684800);
+        tool_request.tools = vec![serde_json::json!({"type":"function","function":{
+            "name":"weather","description":"Get the current weather",
+            "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}
+        }})];
+        tool_request.tool_choice = ToolChoice::Required;
+        let mut schema_request = ChatRequest::new(vec![question], 946684800);
+        schema_request.json_schema = Some(serde_json::json!({
+            "type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]
+        }));
+        // A rejected probe is the capability's absence: the engine rejects
+        // every request of that kind for this bundle.
+        let accepted = |request: &ChatRequest| {
+            self.prepare(request, &TemplateSelection::default())
+                .is_ok()
+        };
+        let identities = self
+            .variants
+            .values()
+            .map(|variant| {
+                Template::new(&variant.source, &self.special_tokens)
+                    .map(|template| {
+                        serde_json::json!({"name": variant.name, "identity": template.identity()})
+                    })
+                    .map_err(|e| e.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let digest = sha2::Sha256::digest(
+            serde_json::to_vec(&serde_json::json!({
+                "version": TEMPLATE_FINGERPRINT_VERSION,
+                "default": self.default,
+                "templates": identities,
+                "reasoning": reasoning.fingerprint(),
+            }))
+            .map_err(|e| e.to_string())?,
+        );
+        Ok(TemplateInspection {
+            tools: accepted(&tool_request),
+            structured_output: accepted(&schema_request),
+            reasoning,
+            fingerprint: digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+        })
     }
 }
 

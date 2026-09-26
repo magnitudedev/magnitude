@@ -35,10 +35,12 @@ fn tiny_manifest(definition: &ModelDefinition) -> PackageManifest {
 
 fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>> {
     let catalog = seismic::DeviceCatalog::discover().ok()?;
+    let reserves = platform::MemoryReserves::standard();
     let selected = platform::select_device(
         &catalog,
         ExecutionPath::Native,
         platform::DeviceRequest::Automatic,
+        &reserves,
     )
     .ok()?;
     let device = Rc::new(
@@ -139,7 +141,7 @@ fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>
         .target_state()
         .allocate(device.clone())
         .unwrap();
-    Some(ExecutorDomain::with_family(
+    let mut domain = ExecutorDomain::with_family(
         execution,
         definition,
         resources,
@@ -149,7 +151,9 @@ fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>
         None,
         None,
         TestFamily { control },
-    ))
+    );
+    domain.install_memory_policy(catalog, reserves).unwrap();
+    Some(domain)
 }
 
 fn forward(request: RequestId, position: usize) -> Operation {

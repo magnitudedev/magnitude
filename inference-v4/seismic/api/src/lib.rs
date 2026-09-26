@@ -96,7 +96,7 @@ pub use seismic_runtime::devices::{
     DeviceMemory, DeviceMemoryInfo, DeviceMemoryStatus, DeviceSelector, DeviceTopology,
     DiscoveryDiagnostic, DiscoveryError, HeadroomBasis, HeadroomEstimate, HostMeasurements,
     HostMemoryStatus, LimitVisibility, MemoryPoolId, MemoryPoolInfo, MemoryPoolKind, MemoryUsage,
-    ObservationError, OpenError, PressureLevel, ProcessLimitKind, ProcessMemoryLimit, ResolveError,
+    ObservationError, OpenError, ProcessLimitKind, ProcessMemoryLimit, ResolveError,
     SelectorParseError,
 };
 

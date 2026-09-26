@@ -3,12 +3,16 @@
 use magnitude_engine::{
     chat::CacheLimits,
     composition::{EngineConfiguration, MediaSourcePolicy},
-    options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection},
-    service::ServiceLimits,
+    options::{
+        standard_service_limits, ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection,
+    },
     serving::Config as ServerConfig,
     telemetry::{Telemetry, DEFAULT_TRACES_ENDPOINT},
 };
-use magnitude_model_executor::{platform::DeviceRequest, ExecutionPath};
+use magnitude_model_executor::{
+    platform::{DeviceRequest, MemoryReserves},
+    ExecutionPath,
+};
 use magnitude_model_state::KvCodec;
 use std::{
     path::PathBuf,
@@ -173,14 +177,7 @@ fn run() -> Result<(), String> {
     let load_started = Instant::now();
     let options = parse()?;
     let _telemetry = Telemetry::open(&options.telemetry_endpoint);
-    let service = ServiceLimits {
-        max_requests: 128,
-        max_batch: options.max_batch,
-        prefill_tokens: 512,
-        decode_tokens: 32,
-        decode_share: 0.5,
-        locality_seconds: 1.0,
-    };
+    let service = standard_service_limits(options.max_batch);
     let resolved = EngineConfiguration {
         package: PackageOptions {
             target: options.target,
@@ -198,6 +195,7 @@ fn run() -> Result<(), String> {
         device: options.device,
         control_capacity: 256,
         kernel_cache: options.kernel_cache,
+        reserves: MemoryReserves::standard(),
     }
     .resolve()?;
     eprintln!(
