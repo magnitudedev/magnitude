@@ -83,6 +83,35 @@ function CodeBlock({ code, lang }: { code: string; lang: string }) {
 /** Streaming cursor character */
 const STREAMING_CURSOR = "\u258D" // ▍
 
+/** Protocols a rendered link is allowed to navigate to. */
+const ALLOWED_LINK_PROTOCOLS = new Set(["http:", "https:", "mailto:"])
+
+/**
+ * Protocol of a link target as a browser reads it, or null when the target is
+ * relative. ASCII whitespace and control characters are ignored inside a
+ * protocol, so `java\tscript:` and ` JAVASCRIPT:` both read as `javascript:`.
+ */
+function linkProtocol(href: string): string | null {
+  const match = /^([a-zA-Z][a-zA-Z\d+.-]*):/.exec(
+    href.replace(/[\u0000-\u0020]/g, "")
+  )
+  return match ? `${match[1].toLowerCase()}:` : null
+}
+
+/**
+ * The href to render when its protocol is allowlisted, or undefined when the
+ * target must be rendered as text instead of a link.
+ */
+export function allowlistedLinkHref(
+  href: string | undefined,
+): string | undefined {
+  const target = href?.trim()
+  if (!target) return undefined
+  const protocol = linkProtocol(target)
+  if (protocol === null || ALLOWED_LINK_PROTOCOLS.has(protocol)) return target
+  return undefined
+}
+
 export interface MarkdownContentProps {
   readonly content: string
   readonly isStreaming?: boolean
@@ -117,9 +146,13 @@ function MarkdownContentImpl({
         return <CodeBlock code={code} lang={lang} />
       },
       a({ href, children }) {
+        const target = allowlistedLinkHref(href)
+        if (!target) {
+          return <>{children}</>
+        }
         return (
           <a
-            href={href}
+            href={target}
             target="_blank"
             rel="noopener noreferrer"
             className="text-blue-700 no-underline hover:underline dark:text-blue-400"
