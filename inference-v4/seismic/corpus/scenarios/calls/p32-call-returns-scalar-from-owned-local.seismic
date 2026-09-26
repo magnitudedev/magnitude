@@ -1,0 +1,8 @@
+# origin: C13:p32
+# invoke: i32[4]=seq
+fn seed[N](x: &tensor[N] i32) -> i32:
+    return reduce(x, 0, sum)
+
+fn probe(input: &tensor[4] i32) -> i32:
+    let local = input * 3
+    return seed(local)

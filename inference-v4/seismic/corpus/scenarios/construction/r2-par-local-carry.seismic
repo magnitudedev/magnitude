@@ -1,0 +1,8 @@
+# origin: C11:r2_par_local_carry
+# invoke: f32[2,4]=1,1,1,1,1,1,1,1 ; f32[2,4]=0,0,0,0,0,0,0,0
+fn probe[N](x: &tensor[N, 4] f32, dst: &mut tensor[N, 4] f32):
+    parallel for k in 0..N:
+        let mut acc = tensor[4] f32
+        for j in 0..4:
+            acc[j] = x[k, j]
+        dst[k, :] = acc

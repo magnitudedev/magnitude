@@ -1,0 +1,8 @@
+# origin: C26:G-T9-1
+# rejected: "return"
+fn probe(c: bool) -> f32:
+    if c:
+        let y = 1.0
+    else:
+        return 3.0
+    return 2.0

@@ -1,0 +1,6 @@
+# origin: C17:write_through_immutable_view
+# invoke: i32[4]=5,2,3,4
+# pin: out = i32[4]=1,2,3,4
+fn probe(out: &mut tensor[4] i32):
+    let view = out[0:2]
+    view[0] = 1

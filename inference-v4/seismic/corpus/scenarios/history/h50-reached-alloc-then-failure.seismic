@@ -1,0 +1,12 @@
+# origin: H-50
+# invoke: i32[4]=zero ; i32:0
+# expect: failed
+# pin: x = i32[4]=15,0,0,0
+# invoke: i32[4]=zero ; i32:2
+fn probe(x: &mut tensor[4] i32, d: i32):
+    for i in 0..16:
+        let mut t = tensor[i+1] i32
+        t[0] = i32(i)
+        x[0] = t[0]
+    let q = 10 / d
+    x[1] = q

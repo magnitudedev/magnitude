@@ -1,0 +1,8 @@
+# origin: C11:ret_partially_initialized
+# invoke: bool:true
+fn probe(c: bool) -> f32:
+    let mut t = tensor[2] f32
+    t[0] = 1.0
+    if c:
+        t[1] = 2.0
+    return t[0]

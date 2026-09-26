@@ -1,0 +1,9 @@
+# origin: test:validation:corpus/planning.seismic:copy_fill_scalar
+# invoke copy_fill_scalar: f32[5]=1,5,2,7,3 ; f32:1.5
+fn copy_fill_scalar[N](x: &tensor[N] f32, value: f32) -> (tensor[N] f32, tensor[N] f32, f32, i32):
+    let copied = to_owned(x)
+    let mut filled = ones_like(x)
+    for i in 0..N:
+        filled[i] = filled[i] * value
+    let winner = reduce(x, 0, argmax)
+    return copied, filled, value * 2.0, winner

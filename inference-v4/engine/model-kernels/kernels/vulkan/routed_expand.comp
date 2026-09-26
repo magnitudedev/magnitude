@@ -1,0 +1,166 @@
+// Decode expansion (M <= 8): the K selected experts' gate/up projections and
+// the shared expert's, each with the SiluMul epilogue, in one launch. The
+// Vulkan form of `metal/routed_expand.metal`. Workgroup row y < M * K is
+// choice (m, k): a K1 paired GEMV over the feature tile `x` of expert
+// routes[m, k]'s gate and up rows. Row y = M * K is the shared expert, whose
+// weights feed all M activation rows. Lane groups are whole subgroups.
+#include "lib/core/activation.glsl"
+#include "lib/routed/routed.glsl"
+
+#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#define ROUTED_ACT ELEMENT_ACT
+#else
+#error "routed_expand requires a bf16 or f16 activation"
+#endif
+
+#if defined(SEISMIC_EXPERT_GATE_REPRESENTATION_Q4K)
+#define EG_KIND PACKETS_Q4K
+#define EG_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_EXPERT_GATE)
+#elif defined(SEISMIC_EXPERT_GATE_REPRESENTATION_Q5K)
+#define EG_KIND PACKETS_Q5K
+#define EG_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_EXPERT_GATE)
+#elif defined(SEISMIC_EXPERT_GATE_REPRESENTATION_Q6K)
+#define EG_KIND PACKETS_Q6K
+#define EG_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_EXPERT_GATE)
+#elif defined(SEISMIC_EXPERT_GATE_REPRESENTATION_Q8G32S)
+#define EG_KIND PACKETS_Q8
+#define EG_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_EXPERT_GATE)
+#elif defined(SEISMIC_EXPERT_GATE_REPRESENTATION_BF16)
+#define EG_KIND PACKETS_BF16
+#define EG_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_EXPERT_GATE, 2)
+#elif defined(SEISMIC_EXPERT_GATE_REPRESENTATION_F16)
+#define EG_KIND PACKETS_F16
+#define EG_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_EXPERT_GATE, 2)
+#elif defined(SEISMIC_EXPERT_GATE_REPRESENTATION_F32)
+#define EG_KIND PACKETS_F32
+#define EG_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_EXPERT_GATE, 4)
+#else
+#error "unsupported routed_expand expert_gate representation"
+#endif
+#if defined(SEISMIC_EXPERT_GATE_KIND_PACKED) && !defined(SEISMIC_EXPERT_GATE_LAYOUT_ROWS16)
+#error "routed_expand requires the rows16 layout for expert_gate"
+#endif
+
+#if defined(SEISMIC_EXPERT_UP_REPRESENTATION_Q4K)
+#define EU_KIND PACKETS_Q4K
+#define EU_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_EXPERT_UP)
+#elif defined(SEISMIC_EXPERT_UP_REPRESENTATION_Q5K)
+#define EU_KIND PACKETS_Q5K
+#define EU_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_EXPERT_UP)
+#elif defined(SEISMIC_EXPERT_UP_REPRESENTATION_Q6K)
+#define EU_KIND PACKETS_Q6K
+#define EU_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_EXPERT_UP)
+#elif defined(SEISMIC_EXPERT_UP_REPRESENTATION_Q8G32S)
+#define EU_KIND PACKETS_Q8
+#define EU_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_EXPERT_UP)
+#elif defined(SEISMIC_EXPERT_UP_REPRESENTATION_BF16)
+#define EU_KIND PACKETS_BF16
+#define EU_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_EXPERT_UP, 2)
+#elif defined(SEISMIC_EXPERT_UP_REPRESENTATION_F16)
+#define EU_KIND PACKETS_F16
+#define EU_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_EXPERT_UP, 2)
+#elif defined(SEISMIC_EXPERT_UP_REPRESENTATION_F32)
+#define EU_KIND PACKETS_F32
+#define EU_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_EXPERT_UP, 4)
+#else
+#error "unsupported routed_expand expert_up representation"
+#endif
+#if defined(SEISMIC_EXPERT_UP_KIND_PACKED) && !defined(SEISMIC_EXPERT_UP_LAYOUT_ROWS16)
+#error "routed_expand requires the rows16 layout for expert_up"
+#endif
+
+#if defined(SEISMIC_SHARED_GATE_REPRESENTATION_Q4K)
+#define SG_KIND PACKETS_Q4K
+#define SG_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_SHARED_GATE)
+#elif defined(SEISMIC_SHARED_GATE_REPRESENTATION_Q5K)
+#define SG_KIND PACKETS_Q5K
+#define SG_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_SHARED_GATE)
+#elif defined(SEISMIC_SHARED_GATE_REPRESENTATION_Q6K)
+#define SG_KIND PACKETS_Q6K
+#define SG_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_SHARED_GATE)
+#elif defined(SEISMIC_SHARED_GATE_REPRESENTATION_Q8G32S)
+#define SG_KIND PACKETS_Q8
+#define SG_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_SHARED_GATE)
+#elif defined(SEISMIC_SHARED_GATE_REPRESENTATION_BF16)
+#define SG_KIND PACKETS_BF16
+#define SG_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_SHARED_GATE, 2)
+#elif defined(SEISMIC_SHARED_GATE_REPRESENTATION_F16)
+#define SG_KIND PACKETS_F16
+#define SG_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_SHARED_GATE, 2)
+#elif defined(SEISMIC_SHARED_GATE_REPRESENTATION_F32)
+#define SG_KIND PACKETS_F32
+#define SG_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_SHARED_GATE, 4)
+#else
+#error "unsupported routed_expand shared_gate representation"
+#endif
+#if defined(SEISMIC_SHARED_GATE_KIND_PACKED) && !defined(SEISMIC_SHARED_GATE_LAYOUT_ROWS16)
+#error "routed_expand requires the rows16 layout for shared_gate"
+#endif
+
+#if defined(SEISMIC_SHARED_UP_REPRESENTATION_Q4K)
+#define SU_KIND PACKETS_Q4K
+#define SU_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_SHARED_UP)
+#elif defined(SEISMIC_SHARED_UP_REPRESENTATION_Q5K)
+#define SU_KIND PACKETS_Q5K
+#define SU_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_SHARED_UP)
+#elif defined(SEISMIC_SHARED_UP_REPRESENTATION_Q6K)
+#define SU_KIND PACKETS_Q6K
+#define SU_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_SHARED_UP)
+#elif defined(SEISMIC_SHARED_UP_REPRESENTATION_Q8G32S)
+#define SU_KIND PACKETS_Q8
+#define SU_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_SHARED_UP)
+#elif defined(SEISMIC_SHARED_UP_REPRESENTATION_BF16)
+#define SU_KIND PACKETS_BF16
+#define SU_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_SHARED_UP, 2)
+#elif defined(SEISMIC_SHARED_UP_REPRESENTATION_F16)
+#define SU_KIND PACKETS_F16
+#define SU_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_SHARED_UP, 2)
+#elif defined(SEISMIC_SHARED_UP_REPRESENTATION_F32)
+#define SU_KIND PACKETS_F32
+#define SU_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_SHARED_UP, 4)
+#else
+#error "unsupported routed_expand shared_up representation"
+#endif
+#if defined(SEISMIC_SHARED_UP_KIND_PACKED) && !defined(SEISMIC_SHARED_UP_LAYOUT_ROWS16)
+#error "routed_expand requires the rows16 layout for shared_up"
+#endif
+
+void routed_expand() {
+    const uint rows_per_tile = SEISMIC_SUBGROUPS * SEISMIC_TUNE_ROWS;
+    const uint tile = gl_WorkGroupID.x;
+    const uint64_t choices = SEISMIC_DIM_M * SEISMIC_DIM_K;
+    const uint hidden = uint(SEISMIC_DIM_H);
+    const uint64_t normalized = SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED);
+
+    if (uint64_t(gl_WorkGroupID.y) < choices) {
+        if (uint64_t(tile) * rows_per_tile >= SEISMIC_DIM_F)
+            return;
+        const uint64_t m = gl_WorkGroupID.y / SEISMIC_DIM_K, k = gl_WorkGroupID.y % SEISMIC_DIM_K;
+        const uint64_t expert = uint64_t(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)
+            + (m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1) * 4ul));
+        const projection_prologue x = projection_plain(ROUTED_ACT,
+            normalized + m * SEISMIC_NORMALIZED_STRIDE_0 * uint64_t(ELEMENT_BYTES(ROUTED_ACT)), SEISMIC_NORMALIZED_STRIDE_0,
+            SEISMIC_NORMALIZED_STRIDE_1, hidden, 0ul);
+        const projection_weights gate = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), EG_GEOMETRY,
+            routed_expert_row(expert, SEISMIC_DIM_F), hidden);
+        const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), EU_GEOMETRY,
+            routed_expert_row(expert, SEISMIC_DIM_F), hidden);
+        const projection_epilogue out_ = projection_silu_mul(ROUTED_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)
+                + (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * uint64_t(ELEMENT_BYTES(ROUTED_ACT)),
+            0ul, SEISMIC_RESULT_0_STRIDE_2);
+        projection_gemv_bounded(EG_KIND, EU_KIND, true, SEISMIC_TUNE_ROWS, 32u, 1u, PROJECTION_NORM_NONE, x, out_, gate,
+            up, 1u, uint(SEISMIC_DIM_F), hidden, tile);
+        return;
+    }
+
+    if (uint64_t(tile) * rows_per_tile >= SEISMIC_DIM_S)
+        return;
+    const projection_prologue x = projection_plain(ROUTED_ACT, normalized, SEISMIC_NORMALIZED_STRIDE_0,
+        SEISMIC_NORMALIZED_STRIDE_1, hidden, 0ul);
+    const projection_weights gate = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE), SG_GEOMETRY, 0ul, hidden);
+    const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP), SU_GEOMETRY, 0ul, hidden);
+    const projection_epilogue out_ = projection_silu_mul(ROUTED_ACT, SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER),
+        SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1);
+    projection_gemv(SG_KIND, SU_KIND, true, SEISMIC_TUNE_ROWS, 32u, PROJECTION_NORM_NONE, x, out_, gate, up,
+        uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_S), hidden, tile);
+}

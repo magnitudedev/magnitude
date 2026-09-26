@@ -1,0 +1,4 @@
+# origin: H-13
+# invoke: f32[0,4294967296]=zero
+fn probe[M, N](x: &tensor[M, N] f32) -> f32 where M >= 0:
+    return reduce(reduce(x, 1, sum), 0, sum)

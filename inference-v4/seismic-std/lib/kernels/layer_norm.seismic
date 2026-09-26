@@ -1,0 +1,12 @@
+# Two-pass centered FP32 statistics; affine output publishes exactly once at V.
+# The caller supplies finite positive epsilon.
+fn layer_norm[R, W](x: &tensor[R, W] T, weight: &tensor[W] U, bias: &tensor[W] B,
+    result: &mut tensor[R, W] V, epsilon: f32):
+    parallel for rows in 0..R:
+        let scale = f32(weight)
+        let shift = f32(bias)
+        let source = f32(x[rows])
+        let mean = reduce(source, 0, sum) / f32(W)
+        let centered = source - mean
+        let inverse = rsqrt(reduce(centered * centered, 0, sum) / f32(W) + epsilon)
+        result[rows] = centered * inverse * scale + shift

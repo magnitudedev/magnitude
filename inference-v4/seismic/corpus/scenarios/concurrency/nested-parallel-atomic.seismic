@@ -1,0 +1,6 @@
+# origin: C17:nested_parallel_atomic
+# invoke: i32[64,64]=rand(65) ; i32[1]=zero
+fn probe[M, N](x: &tensor[M, N] i32, out: &mut tensor[1] i32):
+    parallel for i in 0..M:
+        parallel for j in 0..N:
+            atomic(add, out[0], x[i, j])

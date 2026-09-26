@@ -1,0 +1,7 @@
+# origin: C11:loop_view_carry
+# rejected: "does not permit exclusive writes"
+fn probe(x: &tensor[4,4] f32) -> f32:
+    let mut v = x[0]
+    for k in 1..4:
+        v = x[k]
+    return reduce(v, 0, sum)

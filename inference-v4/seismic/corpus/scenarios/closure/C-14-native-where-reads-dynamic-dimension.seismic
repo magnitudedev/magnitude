@@ -1,0 +1,14 @@
+# origin: native-route-performance NR1
+# rejected: "which is not static; its value is unknown at preparation"
+fn probe[N](x: &tensor[N] f32, factor: f32, out: &mut tensor[N] f32):
+    # A native `where` filters configurations when an implementation is
+    # prepared, so it may read only static dimensions and parameters.
+    parallel for i in 0..N:
+        out[i] = x[i] * factor
+
+native probe for cuda from "probe.cu":
+    params (WIDTH in [64, 128])
+    where WIDTH <= N
+    launch probe:
+        threadgroups (ceil_div(N, WIDTH), 1, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)

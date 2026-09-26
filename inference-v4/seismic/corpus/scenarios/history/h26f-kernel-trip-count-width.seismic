@@ -1,0 +1,10 @@
+# origin: H-26
+# invoke: f32[65536]=zero ; f32[1]=zero
+# expect: refused-index-width
+# invoke: f32[4]=zero ; f32[1]=zero
+# expect: returned
+# pin: y = f32[1]=256
+fn probe[N](x: &tensor[N] f32, y: &mut tensor[1] f32):
+    parallel for i in 0..1:
+        for j in 0..N*N*N*N:
+            y[0] = y[0] + 1.0

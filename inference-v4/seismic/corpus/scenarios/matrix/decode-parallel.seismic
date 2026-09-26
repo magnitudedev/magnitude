@@ -1,0 +1,6 @@
+# cell: decode/parallel
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero ; q4g64[4,64]=rand(171)
+fn probe[W](x: &tensor[4, W] f32, out: &mut tensor[4] f32, y: &mut tensor[4, W] f32, w: &tensor[4, 64] q4g64) where W >= 8:
+    parallel for i in 0..4:
+        let d = f32(w[i])
+        out[i] = d[5]

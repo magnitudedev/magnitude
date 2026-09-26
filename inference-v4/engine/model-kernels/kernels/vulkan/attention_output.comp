@@ -1,0 +1,85 @@
+// attention_output: the output projection of the Q gated attention
+// heads plus the F32 residual. The Vulkan form of
+// `metal/attention_output.metal` over `lib/projection/projection.glsl`; the
+// GEMM class may split K.
+#include "lib/core/activation.glsl"
+#include "lib/projection/projection.glsl"
+
+#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#define OUTPUT_ACT ELEMENT_ACT
+#else
+#error "attention_output requires a bf16 or f16 activation"
+#endif
+
+#if defined(SEISMIC_OUTPUT_WEIGHT_REPRESENTATION_Q4K)
+#define OUTPUT_KIND PACKETS_Q4K
+#define OUTPUT_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_OUTPUT_WEIGHT)
+#elif defined(SEISMIC_OUTPUT_WEIGHT_REPRESENTATION_Q5K)
+#define OUTPUT_KIND PACKETS_Q5K
+#define OUTPUT_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_OUTPUT_WEIGHT)
+#elif defined(SEISMIC_OUTPUT_WEIGHT_REPRESENTATION_Q6K)
+#define OUTPUT_KIND PACKETS_Q6K
+#define OUTPUT_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_OUTPUT_WEIGHT)
+#elif defined(SEISMIC_OUTPUT_WEIGHT_REPRESENTATION_Q8G32S)
+#define OUTPUT_KIND PACKETS_Q8
+#define OUTPUT_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_OUTPUT_WEIGHT)
+#elif defined(SEISMIC_OUTPUT_WEIGHT_REPRESENTATION_BF16)
+#define OUTPUT_KIND PACKETS_BF16
+#define OUTPUT_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_OUTPUT_WEIGHT, 2)
+#elif defined(SEISMIC_OUTPUT_WEIGHT_REPRESENTATION_F16)
+#define OUTPUT_KIND PACKETS_F16
+#define OUTPUT_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_OUTPUT_WEIGHT, 2)
+#elif defined(SEISMIC_OUTPUT_WEIGHT_REPRESENTATION_F32)
+#define OUTPUT_KIND PACKETS_F32
+#define OUTPUT_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_OUTPUT_WEIGHT, 4)
+#else
+#error "unsupported attention_output output_weight representation"
+#endif
+#if defined(SEISMIC_OUTPUT_WEIGHT_KIND_PACKED) && !defined(SEISMIC_OUTPUT_WEIGHT_LAYOUT_ROWS16)
+#error "attention_output requires the rows16 layout for output_weight"
+#endif
+
+#define OUTPUT_K uint(SEISMIC_DIM_Q * SEISMIC_DIM_W)
+
+// The gated heads [M, Q, W] are read as rows of Q * W (contiguous heads).
+projection_prologue attention_output_input() {
+    return projection_plain(OUTPUT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_GATED), SEISMIC_GATED_STRIDE_0,
+        SEISMIC_GATED_STRIDE_2, OUTPUT_K, 0ul);
+}
+
+projection_epilogue attention_output_output() {
+    return projection_residual(OUTPUT_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
+        SEISMIC_RESULT_0_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN), SEISMIC_HIDDEN_STRIDE_0,
+        SEISMIC_HIDDEN_STRIDE_1, 0ul);
+}
+
+projection_weights attention_output_weight() {
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_OUTPUT_WEIGHT), OUTPUT_GEOMETRY, OUTPUT_K, 0ul);
+}
+
+void attention_output_gemv() {
+    const projection_weights w = attention_output_weight();
+    projection_gemv(OUTPUT_KIND, OUTPUT_KIND, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, PROJECTION_NORM_NONE,
+        attention_output_input(), attention_output_output(), w, w, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_D),
+        OUTPUT_K, gl_WorkGroupID.x);
+}
+
+void attention_output_gemm() {
+    const uint m = uint(SEISMIC_DIM_M), n = uint(SEISMIC_DIM_D);
+#if SEISMIC_TUNE_SPLIT == 1
+    projection_gemm(OUTPUT_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
+        attention_output_input(),
+        attention_output_output(), attention_output_weight(), m, n, OUTPUT_K, gl_WorkGroupID.y, gl_WorkGroupID.x,
+        0xffffffffu);
+#else
+    projection_gemm_part(OUTPUT_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
+        attention_output_input(),
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), attention_output_weight(), m, n, OUTPUT_K, SEISMIC_TUNE_SPLIT,
+        gl_WorkGroupID.z, gl_WorkGroupID.y, gl_WorkGroupID.x);
+#endif
+}
+
+void attention_output_finalize() {
+    projection_gemm_finalize(attention_output_output(), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS),
+        uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_D), SEISMIC_TUNE_SPLIT, gl_GlobalInvocationID.x);
+}

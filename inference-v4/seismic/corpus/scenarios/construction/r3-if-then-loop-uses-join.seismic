@@ -1,0 +1,10 @@
+# origin: C11:r3_if_then_loop_uses_join
+# invoke: f32:1
+fn probe(x: f32) -> f32:
+    let mut v = 0.0
+    if x > 0.0:
+        v = x
+    let mut s = 0.0
+    for k in 0..3:
+        s = s + v
+    return s

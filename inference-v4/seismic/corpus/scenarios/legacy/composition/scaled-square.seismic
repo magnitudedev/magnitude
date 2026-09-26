@@ -1,0 +1,7 @@
+# origin: test:validation:corpus/composition.seismic:scaled_square
+# invoke scaled_square: f32[5]=seq ; f32:2
+fn scaled_square[N](x: &tensor[N] f32, scale: f32) -> tensor[N] f32:
+    let mut out = zeros_like(x)
+    for i in 0..N:
+        out[i] = x[i] * x[i] * scale
+    return out

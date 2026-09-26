@@ -1,0 +1,9 @@
+# origin: C13:p30c
+# invoke: i32[2,4]=seq ; i32[2,4]=zero
+fn sq(v: i32) -> i32:
+    return v * v
+
+fn probe(x: &tensor[2, 4] i32, y: &mut tensor[2, 4] i32):
+    parallel for r in 0..2:
+        for c in 0..4:
+            y[r, c] = sq(x[r, c])

@@ -1,0 +1,11 @@
+# origin: C20:G-T3-4
+# invoke: f32[4,8]=zero
+# pin: dst = f32[4,8]=4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4
+fn probe(dst: &mut tensor[4, 8] f32):
+    parallel for k in 0..4:
+        let mut t = tensor[8] f32
+        for j in 0..8:
+            t[j] = 1.0
+        for r in 0..2:
+            t = t * 2.0
+        dst[k, :] = t

@@ -1,0 +1,9 @@
+# origin: C11:if_device_condition
+# cell: if/async
+# cell: value-scalar/async
+# invoke: f32[1]=1 ; f32:3
+fn probe(flag: &tensor[1] f32, x: f32) -> f32:
+    let mut y = x
+    if flag[0] > 0.0:
+        y = x * 2.0
+    return y

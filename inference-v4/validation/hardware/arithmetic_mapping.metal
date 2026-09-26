@@ -1,0 +1,7 @@
+#include <metal_stdlib>
+using namespace metal;
+struct Params { uint iterations; float a; float b; };
+kernel void fma1(device const float* input [[buffer(0)]], device float* output [[buffer(1)]], constant Params& p [[buffer(2)]], uint id [[thread_position_in_grid]]) { float x = input[id]; for (uint i=0; i<p.iterations; ++i) {x = fma(x, p.a, p.b);} output[id]=x; }
+kernel void fma8(device const float* input [[buffer(0)]], device float* output [[buffer(1)]], constant Params& p [[buffer(2)]], uint id [[thread_position_in_grid]]) { float x = input[id]; for (uint i=0; i<p.iterations; ++i) {x = fma(x, p.a, p.b); x = fma(x, p.a, p.b); x = fma(x, p.a, p.b); x = fma(x, p.a, p.b); x = fma(x, p.a, p.b); x = fma(x, p.a, p.b); x = fma(x, p.a, p.b); x = fma(x, p.a, p.b);} output[id]=x; }
+kernel void max1(device const float* input [[buffer(0)]], device float* output [[buffer(1)]], constant Params& p [[buffer(2)]], uint id [[thread_position_in_grid]]) { float x = input[id]; for (uint i=0; i<p.iterations; ++i) {x = max(x, p.a);} output[id]=x; }
+kernel void max8(device const float* input [[buffer(0)]], device float* output [[buffer(1)]], constant Params& p [[buffer(2)]], uint id [[thread_position_in_grid]]) { float x = input[id]; for (uint i=0; i<p.iterations; ++i) {x = max(x, p.a); x = max(x, p.a); x = max(x, p.a); x = max(x, p.a); x = max(x, p.a); x = max(x, p.a); x = max(x, p.a); x = max(x, p.a);} output[id]=x; }

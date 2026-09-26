@@ -1,0 +1,11 @@
+--- a/common/json-schema-to-grammar.cpp
++++ b/common/json-schema-to-grammar.cpp
+@@ -976,7 +976,7 @@
+             throw std::invalid_argument("JSON schema conversion failed:\n" + string_join(_errors, "\n"));
+         }
+         if (!_warnings.empty()) {
+-            fprintf(stderr, "WARNING: JSON schema conversion was incomplete: %s\n", string_join(_warnings, "; ").c_str());
++            throw std::invalid_argument("Unsupported JSON schema conversion: " + string_join(_warnings, "; "));
+         }
+     }
+ 

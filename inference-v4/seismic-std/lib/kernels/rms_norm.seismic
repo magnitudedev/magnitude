@@ -1,0 +1,32 @@
+# Row RMS normalization in F32; publication rounds to the output element type. The square
+# sum uses the `sum_any_order` alternatives below: its reference body keeps the ascending F32
+# sum, its reassociating body lets a backend combine lane partials.
+fn rms_norm[R, W](x: &tensor[R, W] T, weight: &tensor[W] U, y: &mut tensor[R, W] V, eps: f32):
+    parallel for rows in 0..R:
+        let w = f32(weight)
+        let t = f32(x[rows])
+        let ss = sum_any_order(t * t)
+        y[rows] = t * rsqrt(ss / f32(W) + eps) * w
+
+
+# The same normalization with the square sum folded by a scalar loop over the row: the
+# identical ascending F32 sum of the identical products, with no tensor to reduce. Every
+# cooperating participant folds the whole row itself.
+fn rms_norm[R, W](x: &tensor[R, W] T, weight: &tensor[W] U, y: &mut tensor[R, W] V, eps: f32):
+    parallel for rows in 0..R:
+        let w = f32(weight)
+        let mut ss = f32(0.0)
+        for i in 0..W:
+            let v = f32(x[rows, i])
+            ss = ss + v * v
+        let t = f32(x[rows])
+        y[rows] = t * rsqrt(ss / f32(W) + eps) * w
+
+# F32 sum of a tensor's elements. The first body is the reference ascending sum; the second
+# permits a backend to combine partial sums (`unordered=true`). Selection of the second body
+# requires numerical evidence accepted by the compilation precision policy.
+fn sum_any_order[N](t: tensor[N] f32) -> f32:
+    return reduce(t, 0, sum)
+
+fn sum_any_order[N](t: tensor[N] f32) -> f32:
+    return reduce(t, 0, sum, unordered=true)

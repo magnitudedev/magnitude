@@ -1,0 +1,47 @@
+# origin: H-45 test:seismic-runtime:runtime/src/feedback/binding_tests.rs:cpu_stored_logical_views_preserve_reshape_aliases_calls_and_publication
+# invoke transposed: f32[2,3]=1,2,3,4,5,6
+# pin: result = f32[3,2]=1,4,2,5,3,6
+# invoke owned: f32[2,3]=1,2,3,4,5,6
+# pin: result = f32[6]=1,4,2,5,3,6
+# invoke write: f32[2,3]=1,2,3,4,5,6
+# pin: result = f32[6]=1,9,2,5,3,6
+# pin: x = f32[2,3]=1,2,3,9,5,6
+# invoke empty: f32[2,3]=1,2,3,4,5,6
+# expect: returned
+# invoke captured: f32[3,4]=1,2,3,4,5,6,7,8,9,10,11,12
+# pin: result = f32[6]=5,9,6,10,7,11
+# invoke failure_prefix: f32[2,3]=1,2,3,4,5,6 ; i32:2
+# expect: failed
+# pin: x = f32[2,3]=7,2,3,4,5,6
+fn edit(x: &mut tensor[6] f32):
+    x[1] = 9.0
+
+fn copy_view(x: &tensor[6] f32) -> tensor[6] f32:
+    return to_owned(x)
+
+fn transposed(x: &tensor[2,3] f32) -> tensor[3,2] f32:
+    let y = to_owned(x)
+    return y.T
+
+fn owned(x: &tensor[2,3] f32) -> tensor[6] f32:
+    let y = to_owned(x)
+    return reshape(y.T, (6,))
+
+fn write(x: &mut tensor[2,3] f32) -> tensor[6] f32:
+    let mut y = reshape(x.T, (6,))
+    edit(y)
+    return to_owned(y)
+
+fn empty(x: &tensor[2,3] f32) -> tensor[0] f32:
+    let y = tensor[0,2] f32
+    return reshape(y.T, (0,))
+
+fn failure_prefix(x: &mut tensor[2,3] f32, index: i32) -> tensor[6] f32:
+    let y = to_owned(x)
+    x[0,0] = 7.0
+    let checked = x[index,0]
+    return reshape(y.T, (6,))
+
+fn captured(x: &tensor[3,4] f32) -> tensor[6] f32:
+    let y = x[1:3,0:3]
+    return copy_view(reshape(y.T, (6,)))

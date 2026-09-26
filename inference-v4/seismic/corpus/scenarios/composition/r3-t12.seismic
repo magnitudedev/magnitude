@@ -1,0 +1,7 @@
+# origin: X1:r3-t12
+# invoke: f32[4]=1,2,3,4 ; f32[3]=1,2,3 ; f32[3]=zero
+# pin: out = f32[3]=11,12,13
+fn probe[R, N](x: &tensor[N] f32, s: &tensor[R] f32, out: &mut tensor[R] f32):
+    for i in 0..R:
+        let t = to_owned(x)
+        out[i] = reduce(t, 0, sum) + s[i]

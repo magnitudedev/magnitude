@@ -1,0 +1,51 @@
+# origin: test:seismic-runtime:runtime/src/feedback.rs:metal_feedback_shares_status_storage_without_dropping_checks
+# invoke checked_sum: f32[2,64]=zero ; i32[2]=32,32
+# expect: failed
+# invoke checked_sum: f32[2,64]=rand(151) ; i32[2]=0,24
+# expect: returned
+fn checked_sum[N,W](x: &tensor[N,W] f32, indices: &tensor[N] i32) -> tensor[N] f32:
+    let mut result = tensor[N] f32
+    parallel for row in 0..N:
+        let mut total = f32(0.0)
+        total = total + x[row, indices[row] + 0]
+        total = total + x[row, indices[row] + 1]
+        total = total + x[row, indices[row] + 2]
+        total = total + x[row, indices[row] + 3]
+        total = total + x[row, indices[row] + 4]
+        total = total + x[row, indices[row] + 5]
+        total = total + x[row, indices[row] + 6]
+        total = total + x[row, indices[row] + 7]
+        total = total + x[row, indices[row] + 8]
+        total = total + x[row, indices[row] + 9]
+        total = total + x[row, indices[row] + 10]
+        total = total + x[row, indices[row] + 11]
+        total = total + x[row, indices[row] + 12]
+        total = total + x[row, indices[row] + 13]
+        total = total + x[row, indices[row] + 14]
+        total = total + x[row, indices[row] + 15]
+        total = total + x[row, indices[row] + 16]
+        total = total + x[row, indices[row] + 17]
+        total = total + x[row, indices[row] + 18]
+        total = total + x[row, indices[row] + 19]
+        total = total + x[row, indices[row] + 20]
+        total = total + x[row, indices[row] + 21]
+        total = total + x[row, indices[row] + 22]
+        total = total + x[row, indices[row] + 23]
+        total = total + x[row, indices[row] + 24]
+        total = total + x[row, indices[row] + 25]
+        total = total + x[row, indices[row] + 26]
+        total = total + x[row, indices[row] + 27]
+        total = total + x[row, indices[row] + 28]
+        total = total + x[row, indices[row] + 29]
+        total = total + x[row, indices[row] + 30]
+        total = total + x[row, indices[row] + 31]
+        total = total + x[row, indices[row] + 32]
+        total = total + x[row, indices[row] + 33]
+        total = total + x[row, indices[row] + 34]
+        total = total + x[row, indices[row] + 35]
+        total = total + x[row, indices[row] + 36]
+        total = total + x[row, indices[row] + 37]
+        total = total + x[row, indices[row] + 38]
+        total = total + x[row, indices[row] + 39]
+        result[row] = total
+    return result

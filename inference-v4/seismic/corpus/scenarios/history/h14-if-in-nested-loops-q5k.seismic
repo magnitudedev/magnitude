@@ -1,0 +1,10 @@
+# origin: H-14
+# invoke: q5k[2,256]=rand(6) ; f32[2,256]=zero
+fn probe[R, K](w: &tensor[R, K] q5k, y: &mut tensor[R, K] f32) where K % 256 == 0:
+    for r in 0..R:
+        for k in 0..K:
+            let v = f32(w[r, k])
+            if v > 0.0:
+                y[r, k] = v
+            else:
+                y[r, k] = 0.0

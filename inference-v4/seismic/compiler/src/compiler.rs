@@ -1,0 +1,55 @@
+//! The Seismic compiler core (spec §2.3).
+//!
+//! Owns: semantic refinement, implementation builders, the candidate
+//! domain, total evaluation, transient solver adapter, numerical analysis,
+//! freezing, exact coverage and portfolio construction, the executable
+//! representation, the backend contract, and the complete error taxonomy.
+//!
+//! The only artifact progression is
+//! `CheckedModule -> LogicalEntry -> CandidateDomain<'_, B>
+//!  -> CandidateEvaluator -> SelectionPolicy -> PreparedKernel<B, H>`.
+//! Evaluator-internal estimation and solver state are not artifact boundaries.
+//!
+//! Planning authority and raw solver witnesses are intentionally absent from
+//! the public API:
+//!
+//! ```compile_fail
+//! use seismic_compiler::expression::PlanningExpr;
+//! ```
+//!
+//! ```compile_fail
+//! use seismic_compiler::solve::RawAssignment;
+//! ```
+
+pub mod candidate_domain;
+pub mod errors;
+pub mod evaluation;
+pub mod executable;
+pub mod feedback;
+pub mod implementation;
+pub mod numerics;
+pub mod planning;
+pub mod preparation_budget;
+pub mod prepare;
+pub mod prepared;
+pub mod refinement;
+pub mod solve;
+pub mod target;
+
+mod content_classes;
+mod evaluation_session;
+mod expression;
+mod frozen;
+mod portable;
+mod preparation;
+mod ranking;
+mod realization;
+mod selection;
+
+pub use planning::{
+    OptimizationCompletion, PlanningBudgetReport, PlanningBudgetResource, PlanningError,
+    PlanningInfeasibleReport, PlanningLimit, PlanningReport, SelectionPolicy,
+};
+pub use preparation_budget::{PlanningBudget, PreparationBudget};
+pub use prepare::{prepare_analytically, prepare_with_evaluator};
+pub use prepared::{CandidateIndex, SelectionFunction};

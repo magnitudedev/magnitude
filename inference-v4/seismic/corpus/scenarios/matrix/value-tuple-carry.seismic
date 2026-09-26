@@ -1,0 +1,10 @@
+# cell: value-tuple/carry
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero
+fn probe(x: &tensor[4, 8] f32, out: &mut tensor[4] f32):
+    let mut p = (0.0, 1.0)
+    for i in 0..4:
+        let (a, b) = p
+        p = (a + x[i, 0], b * 2.0)
+    let (s, m) = p
+    out[0] = s
+    out[1] = m

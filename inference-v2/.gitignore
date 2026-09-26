@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.hypothesis/
+.ruff_cache/
+build/
+dist/
+runs/
+models.local.json
+.session-bench/
+
+# Built by the package installation hook.
+src/magnitude_engine/kernels/core/_graph*.so

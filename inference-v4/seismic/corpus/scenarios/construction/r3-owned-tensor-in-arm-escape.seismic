@@ -1,0 +1,9 @@
+# origin: C11:r3_owned_tensor_in_arm_escape
+# invoke: bool:true
+fn probe(c: bool) -> f32:
+    let mut t = tensor[2] f32
+    t[0] = 1.0
+    t[1] = 1.0
+    if c:
+        t[0] = 5.0
+    return t[0] + t[1]

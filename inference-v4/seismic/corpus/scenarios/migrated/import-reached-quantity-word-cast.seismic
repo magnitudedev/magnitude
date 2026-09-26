@@ -1,0 +1,6 @@
+# origin: test:seismic-compiler:compiler/src/portable/import_tests.rs:reached_quantity_arithmetic_and_word_cast_share_the_source_schedule
+# invoke: index:1000
+# invoke: index:2000
+fn probe(i: index[1000000000]) -> i32:
+    let q = i * i * i
+    return i32(q)

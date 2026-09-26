@@ -1,0 +1,6 @@
+# origin: A5:I-18
+# policies: exact unconstrained
+# invoke: f32[4096]=bits(22) ; f32[4096]=bits(23) ; f32[4096]=zero
+fn probe[N](x: &tensor[N] f32, y: &tensor[N] f32, z: &mut tensor[N] f32):
+    parallel for i in 0..N:
+        z[i] = x[i] / y[i]

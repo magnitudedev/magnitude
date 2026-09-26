@@ -1,0 +1,111 @@
+# Engine entries (`engine/model-kernels/kernels`) through the public API (design A9 §2.9.1,
+# Tier 0; lines owned by A9). Every exported engine entry that is not also a std entry has
+# at least one line. Shapes are small but non-degenerate; arguments follow parameter order
+# and dimensions are inferred from shapes. Generic elements bind dense float representations
+# (L11); `copy_rows` also moves an integer plane, which its slice store copies bit for bit.
+# Where an entry has a native with a static shape condition (k8v4 attention: W in {32, 64,
+# 128, 256}; recurrent step/chunk: W % 32 == 0), its line meets it so the native is admissible.
+
+# attention.seismic: M = 2, T = 4, KV = 1, G = 2, P = 1, S = 2 (W = 2P + S = 4), R = 1. Both rows
+# see history rows [0, 2); row 0's fresh span is batch row 0, row 1's rows 0..2; destinations
+# are rows no row sees (-1 appends nothing).
+norm_rotary_table[A=f32]: f32[4]=rand(300) ; f32[4]=rand(301) ; i32[4]=1,2,3,0 ; i32[1]=2 ; f32[1]=0.5 ; f32:0.000001
+gated_attention[A=f32]: f32[2,16]=rand(302) ; f32[2,4]=rand(303) ; f32[2,4]=rand(304) ; f32[4]=rand(305) ; f32[4]=rand(306) ; i32[1]=1 ; f32[1]=0.5 ; i32[2,4]=0,0,0,0,1,1,2,0 ; i32[2,1,2]=0,2,0,2 ; i32[2,2]=0,1,0,2 ; i32[2]=2,3 ; f32[4,1,4]=rand(307) ; f32[4,1,4]=rand(308) ; f32:0.000001 ; f32:0.5
+gated_attention_decode[A=f32]: f32[2,16]=rand(309) ; f32[2,4]=rand(310) ; f32[2,4]=rand(311) ; f32[4]=rand(312) ; f32[4]=rand(313) ; i32[1]=1 ; f32[1]=0.5 ; i32[2,4]=0,0,0,0,1,1,2,0 ; i32[2,1,2]=0,2,0,2 ; i32[2,2]=0,1,0,2 ; i32[2]=3,-1 ; f32[4,1,4]=rand(314) ; f32[4,1,4]=rand(315) ; f32:0.000001 ; f32:0.5
+gated_attention_prefill[A=f32]: f32[2,16]=rand(316) ; f32[2,4]=rand(317) ; f32[2,4]=rand(318) ; f32[4]=rand(319) ; f32[4]=rand(320) ; i32[1]=1 ; f32[1]=0.5 ; i32[2,4]=0,0,0,0,1,1,2,0 ; i32[2,1,2]=0,2,0,2 ; i32[2,2]=0,1,0,2 ; i32[2]=2,3 ; f32[4,1,4]=rand(321) ; f32[4,1,4]=rand(322) ; f32:0.000001 ; f32:0.5
+# Affine K8/V4 codec: W = 8 with 8-bit codes (N = 2 words) and 4-bit codes (N = 1 word).
+affine_encode: f32[8]=rand(323) ; u32[2]=zero ; f16[2]=zero
+affine_encode: f32[8]=rand(324) ; u32[1]=zero ; f16[2]=zero
+affine_decode: u32[2]=bits(325) ; f16[2]=0.0625,-0.5 ; f32[8]=zero
+affine_decode: u32[1]=bits(326) ; f16[2]=0.125,-1 ; f32[8]=zero
+# One absorbed key/value over G = 2 heads, W = 4, from a running softmax state.
+attention_absorb[A=f32]: f32[2,4]=rand(327) ; f32[4]=rand(328) ; f32[4]=rand(329) ; f32[2]=0.5,-0.25 ; f32[2]=1.5,2 ; f32[2,4]=rand(330) ; f32:0.5
+# The k8v4 reference at W = 8 (P = 2, S = 4); decode and prefill at W = 32 (P = 8, S = 16),
+# the smallest head width their Metal natives admit. History codes are arbitrary words.
+gated_attention_k8v4[A=f32]: f32[2,32]=rand(331) ; f32[2,8]=rand(332) ; f32[2,8]=rand(333) ; f32[8]=rand(334) ; f32[8]=rand(335) ; i32[2]=1,2 ; f32[2]=0.5,0.25 ; i32[2,4]=0,0,0,0,1,1,2,0 ; i32[2,1,2]=0,2,0,2 ; i32[2,2]=0,1,0,2 ; i32[2]=2,3 ; u32[4,1,2]=bits(336) ; f16[4,1,2]=rand(337) ; u32[4,1,1]=bits(338) ; f16[4,1,2]=rand(339) ; f32:0.000001 ; f32:0.35
+gated_attention_decode_k8v4[A=f32]: f32[2,128]=rand(340) ; f32[2,32]=rand(341) ; f32[2,32]=rand(342) ; f32[32]=rand(343) ; f32[32]=rand(344) ; i32[8]=0,1,2,0,1,2,0,1 ; f32[8]=rand(345) ; i32[2,4]=0,0,0,0,1,1,2,0 ; i32[2,1,2]=0,2,0,2 ; i32[2,2]=0,1,0,2 ; i32[2]=3,-1 ; u32[4,1,8]=bits(346) ; f16[4,1,2]=rand(347) ; u32[4,1,4]=bits(348) ; f16[4,1,2]=rand(349) ; f32:0.000001 ; f32:0.18
+gated_attention_prefill_k8v4[A=f32]: f32[2,128]=rand(350) ; f32[2,32]=rand(351) ; f32[2,32]=rand(352) ; f32[32]=rand(353) ; f32[32]=rand(354) ; i32[8]=0,1,2,0,1,2,0,1 ; f32[8]=rand(355) ; i32[2,4]=0,0,0,0,1,1,2,0 ; i32[2,1,2]=0,2,0,2 ; i32[2,2]=0,1,0,2 ; i32[2]=2,3 ; u32[4,1,8]=bits(356) ; f16[4,1,2]=rand(357) ; u32[4,1,4]=bits(358) ; f16[4,1,2]=rand(359) ; f32:0.000001 ; f32:0.18
+
+# attention.seismic (projection stages): M = 2, D = 4, KV = 1, G = 2, W = 4 (Q = KV * G = 2).
+gated_attention_project[NW=f32,QW=f32,KW=f32,VW=f32,A=f32]: f32[2,4]=rand(105) ; f32[4]=rand(106) ; f32[4]=rand(360) ; f32[16,4]=rand(107) ; f32[4,4]=rand(108) ; f32[4,4]=rand(109) ; f32:0.000001
+attention_output[A=f32,OW=f32]: f32[2,4]=rand(120) ; f32[2,2,4]=rand(121) ; f32[4,8]=rand(124)
+
+# dense_rows.seismic: M = 3, O = 2, H = 4, F = 6.
+dense_expand[NW=f32,GW=f32,UW=f32,A=f32]: f32[3,4]=rand(142) ; f32[4]=rand(143) ; f32[6,4]=rand(144) ; f32[6,4]=rand(145) ; i32[2]=1,2 ; f32:0.000001
+dense_output[A=f32,DW=f32]: f32[3,4]=rand(146) ; f32[2,6]=rand(147) ; f32[4,6]=rand(148) ; i32[2]=0,2
+
+# draft.seismic: M = 2, V = 5, D = 4, O = 2.
+draft_rows[EW=f32,A=f32,EN=f32,HN=f32,CW=f32]: i32[2]=1,3 ; f32[5,4]=rand(149) ; f32[2,4]=rand(150) ; f32[4]=rand(151) ; f32[4]=rand(152) ; f32[4,8]=rand(153) ; f32:0.000001
+head_logits_rows[A=f32,OW=f32]: f32[2,4]=rand(154) ; f32[5,4]=rand(155)
+
+# import.seismic: [B, N, K] weight views. Dense import at 1 x 4 x 16 and 2 x 4 x 8; one repack
+# line per registered external conversion (packet, rows16, mma16), two rows of two k-quant
+# packets (or four q8_0 packets); mma16 tiles take 16 rows.
+import_dense[E=bf16,U=f32]: bf16[1,4,16]=rand(156)
+import_dense[E=f32,U=bf16]: f32[2,4,8]=rand(157)
+repack_weight[E=gguf_q4_k,U=q4k]: gguf_q4_k[1,2,512]=rand(361)
+repack_weight[E=gguf_q4_k,U=q4k@rows16]: gguf_q4_k[1,2,512]=rand(362)
+repack_weight[E=gguf_q4_k,U=q4k@mma16]: gguf_q4_k[1,16,256]=rand(363)
+repack_weight[E=gguf_q5_k,U=q5k]: gguf_q5_k[1,2,512]=rand(364)
+repack_weight[E=gguf_q5_k,U=q5k@rows16]: gguf_q5_k[1,2,512]=rand(365)
+repack_weight[E=gguf_q5_k,U=q5k@mma16]: gguf_q5_k[1,16,256]=rand(366)
+repack_weight[E=gguf_q6_k,U=q6k]: gguf_q6_k[1,2,512]=rand(367)
+repack_weight[E=gguf_q6_k,U=q6k@rows16]: gguf_q6_k[1,2,512]=rand(368)
+repack_weight[E=gguf_q6_k,U=q6k@mma16]: gguf_q6_k[1,16,256]=rand(369)
+repack_weight[E=gguf_q8_0,U=q8g32s]: gguf_q8_0[1,2,128]=rand(370)
+repack_weight[E=gguf_q8_0,U=q8g32s@rows16]: gguf_q8_0[1,2,128]=rand(371)
+repack_weight[E=gguf_q8_0,U=q8g32s@mma16]: gguf_q8_0[1,16,64]=rand(372)
+repack_weight[E=gguf_iq4_xs,U=iq4g32]: gguf_iq4_xs[1,2,512]=rand(373)
+repack_weight[E=gguf_iq4_xs,U=iq4g32@rows16]: gguf_iq4_xs[1,2,512]=rand(374)
+repack_weight[E=gguf_iq4_xs,U=iq4g32@mma16]: gguf_iq4_xs[1,16,256]=rand(375)
+
+# readout.seismic: M = 3, O = 2, V = 5, D = 4, Sv = 2.
+readout_head_rows[NW=f32,OW=f32,A=f32]: f32[3,4]=rand(158) ; f32[4]=rand(159) ; f32[5,4]=rand(160) ; i32[2]=2,0 ; f32:0.000001
+readout_features_rows[NW=f32,A=f32]: f32[3,4]=rand(161) ; f32[4]=rand(162) ; i32[2]=1,2 ; f32:0.000001
+readout_selected_rows[NW=f32,OW=f32,A=f32]: f32[3,4]=rand(163) ; f32[4]=rand(164) ; f32[5,4]=rand(165) ; i32[2]=0,2 ; i32[2]=4,1 ; f32:0.000001
+
+# recurrent.seismic: M = 3, H = 4, NK = 1, NV = 2, W = 4, C = 3 (CH = (2NK + NV)W = 16,
+# projection columns CH + NV * W + 2NV = 28). The state reference runs two slots (B = 2, S = 5
+# banks: rows [0, 2) publishing after both rows, rows [2, 3) publishing its incoming state),
+# ungrouped and grouped. Step and chunk run at W = 32 (CH = 128, 196 columns), which their
+# Metal natives require, with one and two slots.
+gated_delta_project[NW=f32,QW=f32,GW=f32,AW=f32,BW=f32,A=f32]: f32[3,4]=rand(168) ; f32[4]=rand(167) ; f32[16,4]=rand(169) ; f32[8,4]=rand(170) ; f32[2,4]=rand(171) ; f32[2,4]=rand(172) ; f32:0.000001
+gated_delta_rows[A=f32]: f32[3,28]=rand(376) ; f32[16,3]=rand(377) ; f32[2]=-0.5,-1 ; f32[2]=rand(378) ; i32[3,2]=0,2,2,3,3,3 ; i32[2]=2,0 ; i32[2]=1,2 ; i32[2]=3,4 ; f32[5,2,16]=rand(379) ; f32[5,2,4,4]=rand(380) ; f32:0.000001 ; bool:false
+gated_delta_rows[A=f32]: f32[3,28]=rand(381) ; f32[16,3]=rand(382) ; f32[2]=-0.5,-1 ; f32[2]=rand(383) ; i32[3,2]=0,2,2,3,3,3 ; i32[2]=1,1 ; i32[2]=1,2 ; i32[2]=3,4 ; f32[5,2,16]=rand(384) ; f32[5,2,4,4]=rand(385) ; f32:0.000001 ; bool:true
+gated_delta_step[A=f32]: f32[3,196]=rand(386) ; f32[128,3]=rand(387) ; f32[2]=-0.5,-1 ; f32[2]=rand(388) ; i32[2,2]=0,3,3,3 ; i32[1]=2 ; i32[1]=1 ; i32[1]=2 ; f32[3,2,128]=rand(389) ; f32[3,2,32,32]=rand(390) ; f32:0.000001 ; bool:false
+gated_delta_chunk[A=f32]: f32[3,196]=rand(391) ; f32[128,3]=rand(392) ; f32[2]=-0.5,-1 ; f32[2]=rand(393) ; i32[3,2]=0,1,1,3,3,3 ; i32[2]=1,2 ; i32[2]=1,2 ; i32[2]=3,4 ; f32[5,2,128]=rand(394) ; f32[5,2,32,32]=rand(395) ; f32:0.000001 ; bool:true
+gated_delta_output[A=f32,RN=f32,OW=f32]: f32[3,4]=rand(188) ; f32[3,2,4]=rand(186) ; f32[3,28]=rand(185) ; f32[4]=rand(187) ; f32[4,8]=rand(190) ; f32:0.000001
+
+# routed.seismic: M = 3, H = 4, E = 4, K = 2, F = 3, S = 2 (shared width). Grouping: T = 2 tile
+# rows, B = ceil((M * K + E * (T - 1)) / T) = 5 blocks; the expert and combine lines use the
+# grouping of routes 3,1 / 0,2 / 1,3 (experts 0..3 own 1, 2, 1, 2 choices).
+routed_route[NW=f32,RW=f32,A=f32]: f32[3,4]=rand(191) ; f32[4]=rand(192) ; f32[4,4]=rand(193) ; f32[4]=rand(194) ; i32[3,2]=zero ; f32[3,2]=zero ; f32:0.000001 ; i32:1
+routed_route[NW=f32,RW=f32,A=f32]: f32[3,4]=rand(201) ; f32[4]=rand(202) ; f32[4,4]=rand(203) ; f32[4]=rand(204) ; i32[3,2]=zero ; f32[3,2]=zero ; f32:0.000001 ; i32:0
+routed_expand[A=f32,EGW=f32,EUW=f32,SGW=f32,SUW=f32]: f32[2,4]=rand(216) ; i32[2,2]=3,1,0,2 ; f32[4,3,4]=rand(217) ; f32[4,3,4]=rand(218) ; f32[2,4]=rand(219) ; f32[2,4]=rand(220)
+routed_output[A=f32,EDW=f32,SDW=f32]: f32[2,4]=rand(222) ; f32[2,2,3]=rand(223) ; f32[2,2]=rand(224) ; i32[2,2]=3,1,0,2 ; f32[2,2]=0.75,0.25,0.5,0.5 ; f32[2]=0.25,0.75 ; f32[4,4,3]=rand(226) ; f32[4,2]=rand(227)
+routed_group: i32[3,2]=3,1,0,2,1,3 ; i32[4]=zero ; i32[5,2]=zero ; i32[3,2]=zero ; i32[5]=zero
+routed_experts[A=f32,EGW=f32,EUW=f32,EDW=f32]: f32[3,4]=rand(396) ; i32[5,2]=1,-1,0,2,1,-1,0,2,-1,-1 ; i32[5]=0,1,2,3,-1 ; f32[4,3,4]=rand(397) ; f32[4,3,4]=rand(398) ; f32[4,4,3]=rand(399)
+routed_combine[A=f32,SGW=f32,SUW=f32,SDW=f32]: f32[3,4]=rand(400) ; f32[5,2,4]=rand(401) ; i32[3,2]=6,2,0,4,3,7 ; f32[3,2]=0.75,0.25,0.5,0.5,0.4,0.6 ; f32[3,4]=rand(402) ; f32[3]=0.25,0.5,0.75 ; f32[2,4]=rand(403) ; f32[2,4]=rand(404) ; f32[4,2]=rand(405)
+
+# sampling.seismic: Sx = 2, V = 6, Hn = 3. Row 0 is greedy with penalties; row 1 samples with top-k 3, top-p 0.9 and min-p 0.05.
+shape_rows: f32[2,6]=rand(229) ; f32[2,8]=0,0,1,0,1.2,0.1,0.2,0,0.8,3,0.9,0.05,1,0,0,0 ; i32[2,3]=1,1,4,0,5,2 ; f32[2,6]=zero
+
+# state.seismic: copy_rows N = 2, TS = 4, TD = 5, KV = 2, W = 3.
+copy_rows[A=u32]: u32[4,2,3]=bits(231) ; u32[5,2,3]=zero ; i32[2]=3,1 ; i32[2]=0,4
+copy_rows[A=bf16]: bf16[4,2,3]=rand(232) ; bf16[5,2,3]=zero ; i32[2]=0,2 ; i32[2]=1,3
+
+# target.seismic: M = 2, D = 4, V = 5.
+embedding_rows[EW=f32,A=f16]: f32[5,4]=rand(234) ; i32[2]=0,4
+conditioning_overlay: f32[2,4]=rand(235) ; f32[2,4]=zero
+
+# vision.seismic: M = 2, H = 2, L = 3, C = 2, P = 2 (4P = 8), W = 4, F = 6, G = 2, D = 3; linear K = 4, N = 3.
+qwen_vision_position_add[A=f32,PE=f32]: f32[2,2]=rand(244) ; f32[2,3]=rand(245) ; i32[2,4]=0,1,1,2,2,0,1,1 ; f32[2,4]=0.25,0.25,0.25,0.25,0.5,0.1,0.2,0.2 ; f32[2,2]=zero
+qwen_vision_stem[W0=f32,W1=f32,B=f32,PE=f32,A=f32]: f32[2,2,2,2,2]=rand(247) ; f32[2,2,2,2]=rand(248) ; f32[2,2,2,2]=rand(249) ; f32[2]=rand(250) ; f32[2,3]=rand(251) ; i32[2,4]=0,1,1,2,2,0,1,1 ; f32[2,4]=0.25,0.25,0.25,0.25,0.5,0.1,0.2,0.2
+qwen_vision_linear_bias_transposed[T=f32,W=f32,B=f32,V=f32]: f32[2,4]=rand(253) ; f32[4,3]=rand(254) ; f32[3]=rand(255) ; f32[2,3]=zero
+qwen_vision_rotate[A=f32]: f32[8]=rand(256) ; i32[2]=3,1 ; f32[8]=zero
+qwen_vision_qkv[A=f32]: f32[2,3,2,8]=rand(257) ; i32[2,2]=0,1,2,3 ; f32[2,2,8]=zero ; f32[2,2,8]=zero ; f32[2,2,8]=zero
+qwen_vision_full_attention[A=f32]: f32[2,2,4]=rand(258) ; f32[2,2,4]=rand(259) ; f32[2,2,4]=rand(260) ; f32[2,2,4]=zero
+qwen_vision_attention[A=f32]: f32[2,3,2,8]=rand(261) ; i32[2,2]=0,1,2,3 ; f32[2,2,8]=zero
+qwen_vision_block[A=f32,N1W=f32,N1B=f32,QW=f32,QB=f32,PW=f32,PB=f32,N2W=f32,N2B=f32,UW=f32,UB=f32,DW=f32,DB=f32]: f32[2,1,4,2]=rand(262) ; i32[2,2]=0,1,2,3 ; f32[8]=rand(263) ; f32[8]=rand(264) ; f32[8,24]=rand(265) ; f32[24]=rand(266) ; f32[8,8]=rand(267) ; f32[8]=rand(268) ; f32[8]=rand(269) ; f32[8]=rand(270) ; f32[8,6]=rand(271) ; f32[6]=rand(272) ; f32[6,8]=rand(273) ; f32[8]=rand(274) ; f32:0.000001
+qwen_vision_merger[A=f32,NW=f32,NB=f32,UW=f32,UB=f32,DW=f32,DB=f32]: f32[4,2]=rand(275) ; f32[2]=rand(276) ; f32[2]=rand(277) ; f32[4,4]=rand(278) ; f32[4]=rand(279) ; f32[4,3]=rand(280) ; f32[3]=rand(281) ; f32:0.000001
+qwen_vision_feature_output[A=f32]: f32[2,3]=rand(282)

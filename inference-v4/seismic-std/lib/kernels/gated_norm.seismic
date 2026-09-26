@@ -1,0 +1,10 @@
+# Per-head RMS norm of the recurrence output, gated: y[h] = norm(result[h]) * w * silu(z[h]).
+# `result` is this kernel's read-only input name; the written result is `y`.
+fn gated_norm[NV, W](result: &tensor[NV, W] bf16, w: &tensor[W] bf16, z: &tensor[1, NV * W] bf16, eps: f32, y: &mut tensor[1, NV * W] bf16):
+    parallel for heads in 0..NV:
+        let wt = f32(w)
+        let x = f32(result[heads])
+        let g = f32(z[0, heads * W : (heads + 1) * W])
+        let ss = sum_any_order(x * x)
+        let inv = rsqrt(ss / f32(W) + eps)
+        y[0, heads * W : (heads + 1) * W] = x * inv * wt * (g / (1.0 + exp(-g)))

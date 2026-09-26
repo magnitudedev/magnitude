@@ -1,0 +1,5 @@
+# origin: C11:par_binder_f32
+# invoke: f32[4]=0,0,0,0
+fn probe[N](dst: &mut tensor[N] f32):
+    parallel for k in 0..N:
+        dst[k] = f32(k)

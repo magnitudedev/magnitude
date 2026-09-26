@@ -1,0 +1,4 @@
+# origin: C11:r2_store_fixed
+# invoke: f32[4]=0,0,0,0 ; f32[4]=1,1,1,1
+fn probe(dst: &mut tensor[4] f32, src: &tensor[4] f32):
+    dst[0:4] = src * 2.0

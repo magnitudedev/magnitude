@@ -1,0 +1,5 @@
+# origin: A1:idx_fn
+# rejected: "`index` needs its bound: `index[B](w)`"
+fn probe(x: &tensor[8] i32, y: &tensor[8] f32) -> f32:
+    let r = index(x[0])
+    return y[r]

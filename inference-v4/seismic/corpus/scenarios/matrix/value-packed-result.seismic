@@ -1,0 +1,8 @@
+# cell: value-packed/result
+# invoke: q4g64[4,64]=rand(171) ; f32[4]=zero ; index:3
+fn row(w: &tensor[4, 64] q4g64, r: index[4]) -> tensor[64] q4g64:
+    return to_owned(w[r])
+
+fn probe(w: &tensor[4, 64] q4g64, out: &mut tensor[4] f32, r: index[4]):
+    let p = row(w, r)
+    out[0] = p[1]

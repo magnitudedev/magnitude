@@ -1,0 +1,8 @@
+# cell: value-view/result
+# rejected: "cannot cross an owned boundary"
+fn first_half(r: &tensor[8] f32) -> tensor[4] f32:
+    return r[0:4]
+
+fn probe(x: &tensor[4, 8] f32) -> f32:
+    let v = first_half(x[0])
+    return v[0]

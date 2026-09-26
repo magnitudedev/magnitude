@@ -1,0 +1,254 @@
+# CUDA device-library fixtures: one entry per helper group of the CUDA
+# prelude. Each body is the helper group's exact logical meaning; the CUDA
+# implementation computes it with the inline-PTX helpers, so a matching result
+# validates the helpers' semantics and fragment layouts on the device.
+
+# One 16x8 output tile over K = 16 * steps: A rows by B rows (B given as its
+# 8 columns), f32 accumulation. `E` is f16 or bf16.
+fn ptx_mma_m16n8k16[K](a: &tensor[16, K] E, b: &tensor[8, K] E) -> tensor[16, 8] f32:
+    let mut result = tensor[16, 8] f32
+    for i in 0..16:
+        for j in 0..8:
+            let mut s = f32(0.0)
+            for k in 0..K:
+                s = fma(f32(a[i, k]), f32(b[j, k]), s)
+            result[i, j] = s
+    return result
+
+native ptx_mma_m16n8k16 for cuda from "cuda/ptx_mma_m16n8k16.cu":
+    static (K)
+    launch ptx_mma_m16n8k16:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+
+# The same tile over K = 32 * steps with signed 8-bit operands, one value in
+# [-128, 127] per i32 element.
+fn ptx_mma_m16n8k32_s8[K](a: &tensor[16, K] i32, b: &tensor[8, K] i32) -> tensor[16, 8] i32:
+    let mut result = tensor[16, 8] i32
+    for i in 0..16:
+        for j in 0..8:
+            let mut s = i32(0)
+            for k in 0..K:
+                s = s + a[i, k] * b[j, k]
+            result[i, j] = s
+    return result
+
+native ptx_mma_m16n8k32_s8 for cuda from "cuda/ptx_mma_m16n8k32_s8.cu":
+    static (K)
+    launch ptx_mma_m16n8k32_s8:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+
+# Four 8x8 16-bit matrices read through `ldmatrix` (COUNT matrices per
+# instruction) and written back from the fragments: the identity.
+fn ptx_ldmatrix(x: &tensor[4, 8, 8] E) -> tensor[4, 8, 8] E:
+    let mut result = tensor[4, 8, 8] E
+    for m in 0..4:
+        for r in 0..8:
+            for c in 0..8:
+                result[m, r, c] = x[m, r, c]
+    return result
+
+native ptx_ldmatrix for cuda from "cuda/ptx_ldmatrix.cu":
+    params (COUNT in [1, 2, 4])
+    launch ptx_ldmatrix:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+
+# The same through `ldmatrix.trans`: each matrix transposed.
+fn ptx_ldmatrix_trans(x: &tensor[4, 8, 8] E) -> tensor[4, 8, 8] E:
+    let mut result = tensor[4, 8, 8] E
+    for m in 0..4:
+        for r in 0..8:
+            for c in 0..8:
+                result[m, r, c] = x[m, c, r]
+    return result
+
+native ptx_ldmatrix_trans for cuda from "cuda/ptx_ldmatrix.cu":
+    params (COUNT in [1, 2, 4])
+    launch ptx_ldmatrix_trans:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+
+# A copy staged through shared memory by a STAGES-deep `cp.async` pipeline,
+# with a zero-filled partial tail.
+fn ptx_cp_async[N](x: &tensor[N] f32) -> tensor[N] f32:
+    let mut result = tensor[N] f32
+    for i in 0..N:
+        result[i] = x[i]
+    return result
+
+native ptx_cp_async for cuda from "cuda/ptx_cp_async.cu":
+    params (STAGES in [1, 2, 3])
+    launch ptx_cp_async:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+        shared_bytes (STAGES * 2048)
+
+# A copy through non-coherent vector loads with L2 prefetch of the next block.
+fn ptx_load_nc[N](x: &tensor[N] f32) -> tensor[N] f32:
+    let mut result = tensor[N] f32
+    for i in 0..N:
+        result[i] = x[i]
+    return result
+
+native ptx_load_nc for cuda from "cuda/ptx_load_nc.cu":
+    params (NO_ALLOCATE in [0, 1])
+    launch ptx_load_nc:
+        threadgroups (ceil_div(N, 512), 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+
+# Per 32-lane row: [0] lane 31 - l (idx), [1] down 3, [2] up 3 (out-of-range
+# lanes keep their own value), [3] butterfly sum, [4] butterfly max.
+fn ptx_shuffle[W](x: &tensor[W, 32] f32) -> tensor[5, W, 32] f32:
+    let mut result = tensor[5, W, 32] f32
+    for w in 0..W:
+        let mut total = f32(0.0)
+        let mut largest = x[w, 0]
+        for l in 0..32:
+            total = total + x[w, l]
+            largest = max(largest, x[w, l])
+        for l in 0..32:
+            result[0, w, l] = x[w, 31 - l]
+            result[1, w, l] = x[w, l]
+            if l + 3 < 32:
+                result[1, w, l] = x[w, l + 3]
+            result[2, w, l] = x[w, l]
+            if l >= 3:
+                result[2, w, l] = x[w, l - 3]
+            result[3, w, l] = total
+            result[4, w, l] = largest
+    return result
+
+native ptx_shuffle for cuda from "cuda/ptx_shuffle.cu":
+    launch ptx_shuffle:
+        threadgroups (W, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+
+# Per 32-lane row: sum, minimum and maximum, signed and unsigned.
+fn ptx_redux_s32[W](x: &tensor[W, 32] i32) -> tensor[W, 3] i32:
+    let mut result = tensor[W, 3] i32
+    for w in 0..W:
+        let mut total = x[w, 0]
+        let mut smallest = x[w, 0]
+        let mut largest = x[w, 0]
+        for l in 1..32:
+            total = total + x[w, l]
+            smallest = min(smallest, x[w, l])
+            largest = max(largest, x[w, l])
+        result[w, 0] = total
+        result[w, 1] = smallest
+        result[w, 2] = largest
+    return result
+
+native ptx_redux_s32 for cuda from "cuda/ptx_redux.cu":
+    launch ptx_redux_s32:
+        threadgroups (W, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+
+fn ptx_redux_u32[W](x: &tensor[W, 32] u32) -> tensor[W, 3] u32:
+    let mut result = tensor[W, 3] u32
+    for w in 0..W:
+        let mut total = x[w, 0]
+        let mut smallest = x[w, 0]
+        let mut largest = x[w, 0]
+        for l in 1..32:
+            total = total + x[w, l]
+            smallest = min(smallest, x[w, l])
+            largest = max(largest, x[w, l])
+        result[w, 0] = total
+        result[w, 1] = smallest
+        result[w, 2] = largest
+    return result
+
+native ptx_redux_u32 for cuda from "cuda/ptx_redux.cu":
+    launch ptx_redux_u32:
+        threadgroups (W, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+
+# Four-way byte dot products plus an accumulator: `a` and `b` hold one byte
+# value per i32 element, signed ([-128, 127]) for `b`; `a` is signed for
+# `ptx_dp4a_s8` and unsigned ([0, 255]) for `ptx_dp4a_u8s8`.
+fn ptx_dp4a_s8[N](a: &tensor[N, 4] i32, b: &tensor[N, 4] i32, acc: &tensor[N] i32) -> tensor[N] i32:
+    let mut result = tensor[N] i32
+    for i in 0..N:
+        let mut s = acc[i]
+        for j in 0..4:
+            s = s + a[i, j] * b[i, j]
+        result[i] = s
+    return result
+
+native ptx_dp4a_s8 for cuda from "cuda/ptx_dp4a.cu":
+    launch ptx_dp4a_s8:
+        threadgroups (ceil_div(N, 128), 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+
+fn ptx_dp4a_u8s8[N](a: &tensor[N, 4] i32, b: &tensor[N, 4] i32, acc: &tensor[N] i32) -> tensor[N] i32:
+    let mut result = tensor[N] i32
+    for i in 0..N:
+        let mut s = acc[i]
+        for j in 0..4:
+            s = s + a[i, j] * b[i, j]
+        result[i] = s
+    return result
+
+native ptx_dp4a_u8s8 for cuda from "cuda/ptx_dp4a.cu":
+    launch ptx_dp4a_u8s8:
+        threadgroups (ceil_div(N, 128), 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+
+# Round-to-nearest-even narrowing of pairs; `E` is f16 or bf16, N is even.
+fn ptx_pack[N](x: &tensor[N] f32) -> tensor[N] E:
+    let mut result = tensor[N] E
+    for i in 0..N:
+        result[i] = x[i]
+    return result
+
+native ptx_pack for cuda from "cuda/ptx_convert.cu":
+    launch ptx_pack:
+        threadgroups (ceil_div(N, 256), 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+
+# Exact widening of pairs; `E` is f16 or bf16, N is even.
+fn ptx_unpack[N](x: &tensor[N] E) -> tensor[N] f32:
+    let mut result = tensor[N] f32
+    for i in 0..N:
+        result[i] = f32(x[i])
+    return result
+
+native ptx_unpack for cuda from "cuda/ptx_convert.cu":
+    launch ptx_unpack:
+        threadgroups (ceil_div(N, 256), 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+
+# Correctly rounded fused multiply-add, product and sum.
+fn ptx_rounded[N](a: &tensor[N] f32, b: &tensor[N] f32, c: &tensor[N] f32) -> tensor[3, N] f32:
+    let mut result = tensor[3, N] f32
+    for i in 0..N:
+        result[0, i] = fma(a[i], b[i], c[i])
+        result[1, i] = a[i] * b[i]
+        result[2, i] = a[i] + b[i]
+    return result
+
+native ptx_rounded for cuda from "cuda/ptx_rounded.cu":
+    launch ptx_rounded:
+        threadgroups (ceil_div(N, 128), 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+
+# The functions the approximate helpers compute: 2^x, log2 x, 1/x, 1/sqrt x
+# and tanh x (x > 0).
+fn ptx_approximate[N](x: &tensor[N] f32) -> tensor[5, N] f32:
+    let mut result = tensor[5, N] f32
+    for i in 0..N:
+        let e = exp(2.0 * x[i])
+        result[0, i] = exp(x[i] * 0.6931471805599453)
+        result[1, i] = log(x[i]) / 0.6931471805599453
+        result[2, i] = 1.0 / x[i]
+        result[3, i] = rsqrt(x[i])
+        result[4, i] = (e - 1.0) / (e + 1.0)
+    return result
+
+native ptx_approximate for cuda from "cuda/ptx_approximate.cu":
+    launch ptx_approximate:
+        threadgroups (ceil_div(N, 128), 1, 1)
+        threads_per_threadgroup (128, 1, 1)

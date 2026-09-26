@@ -1,0 +1,27 @@
+# Returns the ascending F32 FMA chain over K, seeded by `into`. Packed operands decode
+# at consumption. Successive calls over ordered K windows pass the accumulator on,
+# so windowing never changes a result bit.
+fn matmul[M, N, K](a: &tensor[M, K] T, b: &tensor[N, K] U,
+                   into: tensor[M, N] f32) -> tensor[M, N] f32:
+    let mut result = into
+    for i in 0..M:
+        for j in 0..N:
+            let mut s = result[i, j]
+            for k in 0..K:
+                s = fma(f32(a[i, k]), f32(b[j, k]), s)
+            result[i, j] = s
+    return result
+
+# The association of the sum is unspecified: this body lets a backend combine partial products
+# (tiles, lanes, partitions). Selection of this second body requires numerical evidence accepted
+# by the compilation policy, exactly like the reassociating bodies of `linear` and `sum_any_order`.
+fn matmul[M, N, K](a: &tensor[M, K] T, b: &tensor[N, K] U,
+                   into: tensor[M, N] f32) -> tensor[M, N] f32:
+    let mut result = into
+    for i in 0..M:
+        for j in 0..N:
+            let mut s = f32(0.0)
+            for k in 0..K:
+                s = s + f32(a[i, k]) * f32(b[j, k])
+            result[i, j] = result[i, j] + s
+    return result

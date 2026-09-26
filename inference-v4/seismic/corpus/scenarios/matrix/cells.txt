@@ -1,0 +1,84 @@
+# Construct x context matrix (design A10 §2.5).
+# Columns: sl if-arm join ordered carry zero-trip parallel arg result exit after-failure async
+# Marks: `+` an Executes scenario tagged `# cell: row/column` is required;
+#        `!` a Rejected scenario is required; `.` no scenario is required.
+# statements
+let                      + + . + . . + . . . + .
+assign-local-scalar      + + + + + + + . . . + .
+assign-local-tensor      + + + + + + + . . . + .
+compound-local-scalar    + + + + + + + . . . + .
+compound-local-tensor    + + + + + + + . . . + .
+compound-local-quantity  ! . . . . . . . . . . .
+assign-element           + + + + + + + . . . + +
+store-slice              + + . + . . + . . . + .
+store-slice-overlapping  + + . + . . . . . . . .      # H-41; X1 R-X1-8, X3 R-X3-24
+compound-element         + + . + . . + . . . + .
+compound-slice           ! . . . . . . . . . . .
+assign-tuple             + + + + + + + . + + + .
+assign-view-local        + + . + . . . . . . . .      # view of a &mut place: a Store (A1 L23, X1 F-a, P07/P08)
+assign-view-local-borrow ! . . . . . . . . . . .      # view of a read-only borrow (X1 q3/q5)
+loop-ordered             + + . + + + + . . . + !
+loop-parallel            + + . + ! + . . . . + .
+if                       + + + + + . + + + + + +
+evaluate                 + + . + . . + . . . . .
+return                   + ! . . . . . . . + . .      # if-arm: early return rejected (A1 L5)
+# primitives (only sl, if-arm, ordered, parallel, after-failure, plus zero-trip where noted)
+constant                 + + . + . . + . . . + .
+symbolic                 + + . + . . + . . . + .
+tuple-pack-get           + + . + . . + . . . + .
+range-make               + + . + . . + . . . + .
+scalar-op                + + . + . . + . . . + .
+scalar-op-quantity       + + . + . . + . . . + .
+quantity-to-float        + + . + . . + . . . + .      # A1 L6
+tensor-elementwise       + + . + . . + . . . + .
+tensor-elementwise-fail  + + . + . . + . . . + .      # integer division
+alloc                    + + . + . . + . . . + .
+alloc-participant-extent . . . . . . + . . . . .      # H-42, X1 R-X1-6, X2 R-X2-28, X4 R-X4-1
+fill                     + + . + . . + . . . + .
+copy-dense               + + . + . . + . . . + .
+copy-packed              + + . + . . + . . . + .
+copy-packed-unaligned    ! . . . . . . . . . . .      # A1 L22 (R-PACK, X3 R-X3-19)
+repr-convert             + + . + . . + . . . + .
+decode                   + + . + . . + . . . + .
+view-transpose-reshape   + + . + . . + . . . + .
+slice-full-rank          + + . + . . + . . . + .
+slice-partial-rank       + + . + . . + . . . + .      # A1 C8-11 pads trailing Full
+slice-packed-stored      + + . + . . + . . . + .
+element-read             + + . + . . + . . . + .
+element-read-packed      + + . + . . + . . . + .
+extent                   + + . + . . + . . . + .
+atomic                   + + . + . . + . . . + .
+atomic-mixed-ops         . . . . . . ! . . . . .      # A1 L12 (C17-1)
+atomic-scalar-local      ! . . . . . ! . . . . .      # A1 L12 (C17-2)
+reduce                   + + . + . . + . . . + .
+reduce-empty             . . . . . + . . . . . .
+reduce-unordered         + + . + . . + . . . + .
+intrinsic-matrix         + . . . . . + . . . . .      # backends: metal
+intrinsic-subgroup       + . . . . . + . . . . .      # sl: lowering filtered at a non-parallel site (A1 L13); backends: metal
+intrinsic-subgroup-divergent . . . . . . ! . . . . .  # A1 L13 (C17-5)
+plane-view-lower         + . . . . . + . . . . .
+# value kinds (all 12 columns)
+value-scalar             + + + + + + + + + + + +
+value-owned-tensor       + + + + + + + + + + + .
+value-borrowed-tensor    + + ! + . . + + . ! + .
+value-view               + + ! + + . + + ! ! + +
+value-packed             + + + + + + + + + + + .
+value-tuple              + + + + + + + + + + + .
+value-range              + + + + + + + + + + . .
+value-computed-tensor    + + + + + . + + + + + .
+# calls (sl, if-arm, ordered, parallel, after-failure)
+call-portable            + + . + . . + . . . + .
+call-alternatives        + + . + . . + . . . + .
+call-explicit-dims       + + . + . . + . . . + .
+call-named-args          + + . + . . + . . . + .
+call-effect-only         + + . + . . + . . . + .
+call-nested-depth-3      + + . + . . + . . . + .
+call-same-helper-twice   + . . + . . + . . . . .      # X1 R-X1-13 (one helper, two demand contexts)
+call-target-helper       ! . . . . . . . . . . .      # A1 L4: `fn … for B` rejected
+call-dimension-from-view + . . + . . + . . . . .      # R2-X1-2: callee dimension = Extent of a binder/data slice (r2-x01)
+# round-2 composition rows (X1 round 2)
+fallible-quantity-in-run + + . . . . + . . . + .      # R2-X1-1: host-operand Div/Check inside a run (r2-n01..n05); I-41 (r3-t11)
+write-computed-value     + . . . + . + + . . . .      # R2-X1-3: in-place write / &mut to a computed value (r2-s01..s03, r2-c02)
+# round-4 rows (X1 round 3, IF I-39, I-45)
+quantity-carry           + . . + . . + . . . . .      # I-39: counting carry through an If join; k = k*2 (r3-t02, r3-t05, r3-t03)
+index-from-word          ! . . . . . . . . . . .      # I-45: no word -> index conversion (A1 §2.1 rule)

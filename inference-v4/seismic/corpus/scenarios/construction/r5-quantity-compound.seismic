@@ -1,0 +1,9 @@
+# origin: C11:r5_quantity_compound
+# cell: compound-local-quantity/sl
+# rejected: "needs numeric operands"
+fn probe(n: index[8]) -> i32:
+    let mut q = n + 0
+    q += 3
+    q *= 2
+    q -= 1
+    return i32(q)

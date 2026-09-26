@@ -1,0 +1,21 @@
+# origin: X1:w19c A1:idxconv_guarded
+# invoke: i32[3]=2,-5,6 ; f32[8]=seq ; f32[3,4]=zero
+# pin: out = f32[3,4]=3,2,2,2,0,0,0,7,7,6,6,6
+fn pick(y: &tensor[8] f32, k: index[8]) -> f32:
+    return y[k]
+
+fn probe[R](lens: &tensor[R] i32, y: &tensor[8] f32, out: &mut tensor[R, 4] f32):
+    parallel for r in 0..R:
+        let n = lens[r]
+        let w = lens[r] + 1
+        if w >= 0:
+            if w < 8:
+                out[r, 0] = y[w]
+        let mut k = index[8](7)
+        if n >= 0:
+            if n < 8:
+                let j = index[8](n)
+                out[r, 1] = y[j]
+                out[r, 2] = pick(y, n)
+                k = n
+        out[r, 3] = y[k]

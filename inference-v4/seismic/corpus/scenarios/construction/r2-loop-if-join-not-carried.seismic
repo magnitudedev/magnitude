@@ -1,0 +1,8 @@
+# origin: C11:r2_loop_if_join_not_carried
+# invoke: f32[4]=1,2,3,4 ; f32[4]=0,0,0,0
+fn probe(x: &tensor[4] f32, dst: &mut tensor[4] f32):
+    for k in 0..4:
+        let mut v = 0.0
+        if x[k] > 2.0:
+            v = x[k]
+        dst[k] = v

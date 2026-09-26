@@ -1,0 +1,4 @@
+# origin: C12:G-C12-5
+# invoke: f32:0x4116cbe4
+fn probe(a: f32) -> (f32, f32):
+    return (sin(a), cos(a))

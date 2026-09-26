@@ -1,0 +1,6 @@
+# origin: test:seismic-runtime:runtime/src/feedback/payload_tests.rs:packed_reference_boundary test:seismic-compiler:compiler/src/portable/outcome_relation.rs:q4g64_fields_and_bf16_activations_follow_ordered_f32_fma_reference
+# invoke: bf16[128]=rand(142) ; q4g64[128]=rand(143)
+# invoke: bf16[128]=rand(144) ; q4g64[128]=bits(145)
+fn probe(a: &tensor[128] bf16, w: &tensor[128] q4g64) -> f32:
+    let first = fma(f32(a[63]), w[63], 0.0)
+    return fma(f32(a[64]), w[64], first)

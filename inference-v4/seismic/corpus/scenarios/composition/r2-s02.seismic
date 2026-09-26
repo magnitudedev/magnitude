@@ -1,0 +1,8 @@
+# origin: X1:r2-s02
+# cell: write-computed-value/sl
+# invoke: f32[4]=1,2,3,4
+# pin: result = f32[4]=7,4,6,8
+fn probe(x: &tensor[4] f32) -> tensor[4] f32:
+    let mut a = x + x
+    a[0] = 7.0
+    return a

@@ -1,0 +1,131 @@
+use crate::{
+    completion::{Completed, Completion, DeviceCompletion},
+    error::DeviceError,
+};
+
+/// A program owns its launch, state reconciliation payload, workspace, and
+/// outputs until completion is observed and physical work is finished.
+pub trait ProgramSubmission {
+    type CompletedWork;
+
+    fn completion(&mut self) -> &mut dyn Completion;
+    fn finish(self) -> Result<Self::CompletedWork, DeviceError>;
+}
+
+/// A target submission's launch and outputs, readable while it executes: a
+/// following step is formed from the launch's advances and binds its
+/// selection before this one completes.
+pub trait SubmittedTarget {
+    fn launch(&self) -> &crate::TargetLaunchCore;
+    fn output(&self) -> &crate::TargetOutput;
+}
+
+impl<S> SubmittedTarget for DeviceSubmission<crate::TargetLaunchCore, S, crate::TargetOutput> {
+    fn launch(&self) -> &crate::TargetLaunchCore {
+        &self.launch
+    }
+    fn output(&self) -> &crate::TargetOutput {
+        &self.output
+    }
+}
+
+impl<S> SubmittedTarget for ReadySubmission<crate::TargetLaunchCore, S, crate::TargetOutput> {
+    fn launch(&self) -> &crate::TargetLaunchCore {
+        &self.launch
+    }
+    fn output(&self) -> &crate::TargetOutput {
+        &self.output
+    }
+}
+
+/// Physical output plus the launch's owned reconciliation payload. The launch
+/// remains unavailable to callers until `finish` consumes its submission.
+pub struct CompletedWork<L, O> {
+    launch: L,
+    output: O,
+}
+
+impl<L, O> CompletedWork<L, O> {
+    pub fn new(launch: L, output: O) -> Self {
+        Self { launch, output }
+    }
+
+    pub fn into_parts(self) -> (L, O) {
+        (self.launch, self.output)
+    }
+}
+
+/// Native work submitted without waiting. The launch, its device leases and
+/// its output stay owned here until completion is observed; `finish` before
+/// completion blocks on the device.
+pub struct DeviceSubmission<L, S, O> {
+    completion: DeviceCompletion,
+    launch: L,
+    workspace: S,
+    output: O,
+}
+
+impl<L, S, O> DeviceSubmission<L, S, O> {
+    pub(crate) fn new(completion: DeviceCompletion, launch: L, workspace: S, output: O) -> Self {
+        Self {
+            completion,
+            launch,
+            workspace,
+            output,
+        }
+    }
+}
+
+impl<L, S, O> ProgramSubmission for DeviceSubmission<L, S, O> {
+    type CompletedWork = CompletedWork<L, O>;
+
+    fn completion(&mut self) -> &mut dyn Completion {
+        &mut self.completion
+    }
+
+    fn finish(mut self) -> Result<Self::CompletedWork, DeviceError> {
+        self.completion.result()?;
+        drop(self.workspace);
+        Ok(CompletedWork {
+            launch: self.launch,
+            output: self.output,
+        })
+    }
+}
+
+/// Work that has already completed when the program returns this value.
+/// Both forms retain the launch and leases until `finish`.
+pub struct ReadySubmission<L, S, O> {
+    completion: Completed,
+    launch: L,
+    workspace: S,
+    output: O,
+}
+
+impl<L, S, O> ReadySubmission<L, S, O> {
+    pub fn new(launch: L, workspace: S, output: O) -> Self {
+        Self {
+            completion: Completed::success(),
+            launch,
+            workspace,
+            output,
+        }
+    }
+}
+
+impl<L, S, O> ProgramSubmission for ReadySubmission<L, S, O> {
+    type CompletedWork = CompletedWork<L, O>;
+
+    fn completion(&mut self) -> &mut dyn Completion {
+        &mut self.completion
+    }
+
+    fn finish(mut self) -> Result<Self::CompletedWork, DeviceError> {
+        self.completion.result()?;
+        drop(self.workspace);
+        Ok(CompletedWork {
+            launch: self.launch,
+            output: self.output,
+        })
+    }
+}

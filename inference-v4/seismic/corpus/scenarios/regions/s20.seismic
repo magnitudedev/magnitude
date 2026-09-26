@@ -1,0 +1,13 @@
+# origin: C14:s20
+# invoke: f32[5]=rand(50) ; f32[3]=rand(51) ; f32[5]=zero
+fn probe[N, K](x: &tensor[N] f32, y: &tensor[K] f32, out: &mut tensor[N] f32):
+    let mut t = tensor[N] f32
+    for i in 0..N:
+        t[i] = x[i]
+    for k in 0..K:
+        let mut u = tensor[N] f32
+        for i in 0..N:
+            u[i] = t[i] + y[k]
+        t = u
+    for i in 0..N:
+        out[i] = t[i]

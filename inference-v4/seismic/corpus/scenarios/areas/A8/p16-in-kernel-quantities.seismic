@@ -1,0 +1,27 @@
+# origin: A8:G-T3-1 X1:x01
+# invoke prefix_totals: f32[4]=1,2,3,4 ; f32[4]=zero
+# expect: returned
+# pin: out = f32[4]=1,3,6,10
+# invoke prefix_totals: f32[33]=seq ; f32[33]=zero
+# expect: returned
+# pin: out = f32[33]=0,1,3,6,10,15,21,28,36,45,55,66,78,91,105,120,136,153,171,190,210,231,253,276,300,325,351,378,406,435,465,496,528
+# invoke shifted_prefix_totals: f32[4]=1,2,3,4 ; index:1099511627776 ; f32[4]=zero
+# expect: returned
+# pin: out = f32[4]=1,3,6,10
+fn total[K](x: &tensor[K] f32) -> f32:
+    let mut s = f32(0.0)
+    for k in 0..K:
+        s = s + x[k]
+    return s
+
+fn prefix_totals[N](x: &tensor[N] f32, out: &mut tensor[N] f32):
+    # The callee's extent `i + 1` mentions the parallel binder, so it is an
+    # in-kernel quantity (`ValueType::Integer`), never a host value.
+    parallel for i in 0..N:
+        out[i] = total(x[0:i + 1])
+
+fn shifted_prefix_totals[N](x: &tensor[N] f32, n: index[1099511627777], out: &mut tensor[N] f32):
+    # The same extent reached through `+ n - n` with n = 2^40: the in-kernel
+    # quantity arithmetic is 64-bit and never wraps at 32 bits.
+    parallel for i in 0..N:
+        out[i] = total(x[0:i + 1 + n - n])

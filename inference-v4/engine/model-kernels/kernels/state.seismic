@@ -1,0 +1,36 @@
+# Dense plane row movement used by state compaction. Packed codecs bind their
+# individual dense planes to this entry; packed logical representations are not
+# accepted by the native implementation. Each row moves as one same-element
+# tensor store, so every plane element (integer planes included) is copied
+# bit for bit rather than decoded and re-encoded.
+fn copy_rows[N, TS, TD, KV, W](src: &tensor[TS, KV, W] A,
+    dst: &mut tensor[TD, KV, W] A, from: &tensor[N] i32,
+    to: &tensor[N] i32):
+    for item in 0..N:
+        parallel for head in 0..KV:
+            dst[to[item], head, :] = src[from[item], head, :]
+
+native copy_rows for metal from "metal/copy_rows.metal":
+    launch copy_rows:
+        threadgroups (ceil_div(N * KV * W, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native copy_rows for cuda from "cuda/copy_rows.cu":
+    launch copy_rows:
+        threadgroups (ceil_div(N * KV * W, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# Vulkan: a grid-stride loop over every copied element; the x grid is capped
+# at the 65535-group floor (Vulkan spec §5.3).
+native copy_rows for vulkan from "vulkan/copy_rows.comp":
+    launch copy_rows:
+        threadgroups (min(ceil_div(N * KV * W, 256), 65535), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CPU: one work item per copied item moves its KV rows as storage words, so
+# every dense plane element, integer planes included, is covered.
+native copy_rows for cpu from "cpu/copy_rows.rs":
+    elements (A in [f32, bf16, f16, u32, i32])
+    launch copy_rows:
+        threadgroups (N, 1, 1)
+        threads_per_threadgroup (1, 1, 1)

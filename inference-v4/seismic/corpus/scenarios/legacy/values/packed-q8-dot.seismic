@@ -1,0 +1,8 @@
+# origin: test:validation:corpus/values.seismic:packed_q8_dot
+# invoke packed_q8_dot: q8g32[3,64]=rand(123) ; f32[64]=rand(124) ; f32[3]=zero
+fn packed_q8_dot[R, K](w: &tensor[R, K] q8g32, x: &tensor[K] f32, y: &mut tensor[R] f32) where K % 32 == 0:
+    parallel for r in 0..R:
+        let mut acc = f32(0.0)
+        for k in 0..K:
+            acc = fma(w[r, k], x[k], acc)
+        y[r] = acc

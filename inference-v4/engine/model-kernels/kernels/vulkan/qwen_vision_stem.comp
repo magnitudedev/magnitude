@@ -1,0 +1,107 @@
+// qwen_vision_stem: the patch projection as two GEMMs over the projection
+// library, one per temporal frame (K = C * P * P each). The Vulkan form of
+// `metal/qwen_vision_stem.metal`, with the CUDA form's conversion launch:
+// L1 converts the F32 pixels to f16 rows [M][2][K] (the GEMM's A operand, as
+// on Metal and CUDA), L2 stores the first frame's F32 product, L3 adds it, the
+// bias and the bilinear position-table blend (`lib/vision/vision.glsl`, the Stem
+// epilogue) into the F32 result.
+#include "lib/vision/vision.glsl"
+
+#if defined(SEISMIC_TEMPORAL_WEIGHT_0_REPRESENTATION_BF16)
+#define WEIGHT_0_KIND PACKETS_BF16
+#define WEIGHT_0_BYTES 2
+#elif defined(SEISMIC_TEMPORAL_WEIGHT_0_REPRESENTATION_F16)
+#define WEIGHT_0_KIND PACKETS_F16
+#define WEIGHT_0_BYTES 2
+#elif defined(SEISMIC_TEMPORAL_WEIGHT_0_REPRESENTATION_F32)
+#define WEIGHT_0_KIND PACKETS_F32
+#define WEIGHT_0_BYTES 4
+#else
+#error "unsupported qwen_vision_stem temporal_weight_0 representation"
+#endif
+
+#if defined(SEISMIC_TEMPORAL_WEIGHT_1_REPRESENTATION_BF16)
+#define WEIGHT_1_KIND PACKETS_BF16
+#define WEIGHT_1_BYTES 2
+#elif defined(SEISMIC_TEMPORAL_WEIGHT_1_REPRESENTATION_F16)
+#define WEIGHT_1_KIND PACKETS_F16
+#define WEIGHT_1_BYTES 2
+#elif defined(SEISMIC_TEMPORAL_WEIGHT_1_REPRESENTATION_F32)
+#define WEIGHT_1_KIND PACKETS_F32
+#define WEIGHT_1_BYTES 4
+#else
+#error "unsupported qwen_vision_stem temporal_weight_1 representation"
+#endif
+
+#if defined(SEISMIC_BIAS_REPRESENTATION_BF16)
+#define BIAS_KIND ELEMENT_BF16
+#elif defined(SEISMIC_BIAS_REPRESENTATION_F16)
+#define BIAS_KIND ELEMENT_F16
+#elif defined(SEISMIC_BIAS_REPRESENTATION_F32)
+#define BIAS_KIND ELEMENT_F32
+#else
+#error "unsupported qwen_vision_stem bias representation"
+#endif
+
+#if defined(SEISMIC_TABLE_REPRESENTATION_BF16)
+#define TABLE_KIND ELEMENT_BF16
+#elif defined(SEISMIC_TABLE_REPRESENTATION_F16)
+#define TABLE_KIND ELEMENT_F16
+#elif defined(SEISMIC_TABLE_REPRESENTATION_F32)
+#define TABLE_KIND ELEMENT_F32
+#else
+#error "unsupported qwen_vision_stem table representation"
+#endif
+
+#define STEM_AREA uint(SEISMIC_DIM_P * SEISMIC_DIM_P)
+#define STEM_K (uint(SEISMIC_DIM_C) * STEM_AREA)
+
+// L1: grid-stride over pieces of 8 converted values (one channel's
+// consecutive pixels; the area is a multiple of 8).
+void qwen_vision_stem_convert() {
+    const uint64_t pixels = SEISMIC_PTR(SEISMIC_BUFFER_PIXELS);
+    const uint64_t converted = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_CONVERTED);
+    const uint64_t pieces = SEISMIC_DIM_M * 2ul * STEM_K / 8ul;
+    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
+    for (uint64_t piece = gl_GlobalInvocationID.x; piece < pieces; piece += step) {
+        const uint64_t index = piece * 8ul;
+        const uint64_t row = index / (2ul * STEM_K);
+        const uint frame = uint((index / STEM_K) % 2ul);
+        const uint k = uint(index % STEM_K);
+        const uint channel = k / STEM_AREA, within = k % STEM_AREA;
+        const uint64_t at = pixels
+            + (row * SEISMIC_PIXELS_STRIDE_0 + (uint64_t(channel) * 2ul + frame) * STEM_AREA + within) * 4ul;
+        const vec4 a = element_vec4_at(at), b = element_vec4_at(at + 16ul);
+        element_uvec4_put(converted + index * 2ul,
+            element_pack8(ELEMENT_F16, vec4(a.x, a.z, b.x, b.z), vec4(a.y, a.w, b.y, b.w)));
+    }
+}
+
+projection_prologue stem_frame(uint frame) {
+    return projection_plain(ELEMENT_F16, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_CONVERTED) + uint64_t(frame) * STEM_K * 2ul,
+        2ul * STEM_K, 1ul, STEM_K, 0ul);
+}
+
+// L2: the first frame's F32 product into the partial [M, H].
+void qwen_vision_stem_first() {
+    const uint h = uint(SEISMIC_DIM_H);
+    const projection_weights w = vision_weights(SEISMIC_PTR(SEISMIC_BUFFER_TEMPORAL_WEIGHT_0),
+        SEISMIC_TEMPORAL_WEIGHT_0_STRIDE_0, WEIGHT_0_BYTES, STEM_K);
+    const projection_epilogue out_ = projection_store(ELEMENT_F32, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIAL),
+        uint64_t(h), 1ul, 0ul);
+    projection_gemm(WEIGHT_0_KIND, VISION_TILE_M, VISION_TILE_N, VISION_SUB, VISION_SUB, stem_frame(0u), out_, w, uint(SEISMIC_DIM_M), h,
+        STEM_K, gl_WorkGroupID.y, gl_WorkGroupID.x, uint(SEISMIC_DIM_M));
+}
+
+// L3: the second frame, the partial, the bias and the position blend.
+void qwen_vision_stem_second() {
+    const uint h = uint(SEISMIC_DIM_H);
+    const projection_weights w = vision_weights(SEISMIC_PTR(SEISMIC_BUFFER_TEMPORAL_WEIGHT_1),
+        SEISMIC_TEMPORAL_WEIGHT_1_STRIDE_0, WEIGHT_1_BYTES, STEM_K);
+    const vision_epilogue out_ = vision_stem(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
+        SEISMIC_PTR(SEISMIC_BUFFER_BIAS), BIAS_KIND, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIAL), uint64_t(h),
+        SEISMIC_PTR(SEISMIC_BUFFER_TABLE), TABLE_KIND, SEISMIC_PTR(SEISMIC_BUFFER_INDICES),
+        SEISMIC_PTR(SEISMIC_BUFFER_COEFFICIENTS));
+    vision_gemm(WEIGHT_1_KIND, stem_frame(1u), out_, w, uint(SEISMIC_DIM_M), h, STEM_K, gl_WorkGroupID.y,
+        gl_WorkGroupID.x);
+}

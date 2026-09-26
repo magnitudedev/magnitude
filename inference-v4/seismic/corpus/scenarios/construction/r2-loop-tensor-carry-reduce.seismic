@@ -1,0 +1,7 @@
+# origin: C11:r2_loop_tensor_carry_reduce
+# invoke: f32[4]=1,1,1,1
+fn probe(x: &tensor[4] f32) -> f32:
+    let mut t = to_owned(x)
+    for k in 0..3:
+        t = t * 2.0
+    return reduce(t, 0, sum)

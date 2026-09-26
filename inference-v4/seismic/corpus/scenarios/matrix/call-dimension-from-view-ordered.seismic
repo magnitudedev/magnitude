@@ -1,0 +1,12 @@
+# cell: call-dimension-from-view/ordered
+# invoke: f32[4]=1,2,3,4 ; f32[4]=zero
+# pin: out = f32[4]=1,3,6,10
+fn total[K](x: &tensor[K] f32) -> f32:
+    let mut s = 0.0
+    for j in 0..K:
+        s = s + x[j]
+    return s
+
+fn probe(x: &tensor[4] f32, out: &mut tensor[4] f32):
+    for i in 0..4:
+        out[i] = total(x[0:i + 1])

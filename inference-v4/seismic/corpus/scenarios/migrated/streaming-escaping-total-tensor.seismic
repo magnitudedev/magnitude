@@ -1,0 +1,5 @@
+# origin: test:seismic-compiler:compiler/src/portable/streaming.rs:escaping_total_tensor_remains_a_complete_computed_product
+# invoke: f32[4]=1,2,3,4
+fn probe[N](x: &tensor[N] f32) -> (tensor[N] f32, f32):
+    let a = x + x
+    return (a, reduce(a, 0, sum))

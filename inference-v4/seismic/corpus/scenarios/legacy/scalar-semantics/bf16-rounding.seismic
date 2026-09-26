@@ -1,0 +1,6 @@
+# origin: test:validation:programs/scalar-semantics.seismic:bf16_rounding
+# invoke bf16_rounding: bf16[1]=0x3fc1 ; f32[1]=zero
+fn bf16_rounding(x: &tensor[1] bf16, result: tensor[1] f32) -> tensor[1] f32:
+    let mut output = result
+    output[0] = f32(x[0] * x[0])
+    return output

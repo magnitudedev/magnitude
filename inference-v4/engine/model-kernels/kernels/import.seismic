@@ -1,0 +1,68 @@
+# Weight import over the [B, N, K] view of a weight: B leading matrices of N
+# rows of K values (a rank-2 weight is [1, N, K], a rank-1 weight [1, 1, K]).
+
+# Dense import between every qualified dense source/destination representation.
+fn import_dense[B, N, K](source: &tensor[B, N, K] E) -> tensor[B, N, K] U:
+    let mut destination = tensor[B, N, K] U
+    parallel for b in 0..B:
+        for n in 0..N:
+            for k in 0..K:
+                destination[b, n, k] = f32(source[b, n, k])
+    return destination
+
+native import_dense for metal from "metal/import_dense.metal":
+    launch import_dense:
+        threadgroups (ceil_div(B * N * K, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native import_dense for cuda from "cuda/import_dense.cu":
+    launch import_dense:
+        threadgroups (ceil_div(B * N * K, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+
+# The registered exact conversion of an external GGUF source into resident
+# storage U = (representation, layout). One threadgroup converts one 16-row by
+# 32-column tile; the grid covers every stored column of every k-quant packet.
+fn repack_weight[B, N, K](source: &tensor[B, N, K] E) -> tensor[B, N, K] U:
+    return repack[U = U](source)
+
+native repack_weight for metal from "metal/repack_weight.metal":
+    launch repack_weight:
+        threadgroups (ceil_div(K, 256) * 8, ceil_div(N, 16), B)
+        threads_per_threadgroup (32, 1, 1)
+
+native repack_weight for cuda from "cuda/repack_weight.cu":
+    launch repack_weight:
+        threadgroups (ceil_div(K, 256) * 8, ceil_div(N, 16), B)
+        threads_per_threadgroup (32, 1, 1)
+
+# CPU: each work item converts one eight-row tile within one [N, K]
+# matrix. This tile is the physical write unit of interleaved rows8 storage.
+native repack_weight for cpu from "cpu/repack_weight.rs":
+    launch repack_weight:
+        threadgroups (ceil_div(N, 8), B, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# Vulkan: a grid-stride loop over every element; the x grid is capped at the
+# 65535-group floor (Vulkan spec §5.3).
+native import_dense for vulkan from "vulkan/import_dense.comp":
+    launch import_dense:
+        threadgroups (min(ceil_div(B * N * K, 256), 65535), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CPU: each work item decodes 16 source rows of the [B, N, K] view to F32
+# (its private bytes) and stores them rounded to U.
+native import_dense for cpu from "cpu/import_dense.rs":
+    launch import_dense:
+        threadgroups (ceil_div(B * N, 16), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (K * 4)
+
+# Vulkan: one workgroup converts one 16-row by 32-column tile into rows16 (the
+# Vulkan resident layout). N / 16 stays below 65535 for every model weight
+# (the largest, the 248320-row head, gives 15520).
+native repack_weight for vulkan from "vulkan/repack_weight.comp":
+    launch repack_weight:
+        threadgroups (ceil_div(K, 256) * 8, ceil_div(N, 16), B)
+        threads_per_threadgroup (32, 1, 1)

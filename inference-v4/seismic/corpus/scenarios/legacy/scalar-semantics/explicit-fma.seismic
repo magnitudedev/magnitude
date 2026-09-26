@@ -1,0 +1,8 @@
+# origin: test:validation:programs/scalar-semantics.seismic:explicit_fma
+# invoke explicit_fma: f32[3]=1.5,2.25,-3 ; f32[2]=zero
+# invoke explicit_fma: f32[3]=bits(138) ; f32[2]=zero
+fn explicit_fma(x: &tensor[3] f32, result: tensor[2] f32) -> tensor[2] f32:
+    let mut output = result
+    output[0] = x[0] * x[1] + x[2]
+    output[1] = fma(x[0], x[1], x[2])
+    return output

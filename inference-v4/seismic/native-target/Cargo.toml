@@ -1,0 +1,10 @@
+[package]
+name = "seismic-native-target"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+seismic-ir.workspace = true
+seismic-lang.workspace = true
+

@@ -1,0 +1,33 @@
+[package]
+name = "magnitude-model-executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc = "0.2"
+magnitude-artifacts = { path = "../artifacts" }
+magnitude-model-batching = { path = "../model-batching" }
+magnitude-model-contracts = { path = "../model-contracts" }
+magnitude-model-kernels = { path = "../model-kernels" }
+magnitude-model-state = { path = "../model-state" }
+seismic.workspace = true
+serde_json = "=1.0.151"
+sha2 = "=0.11.0"
+
+[features]
+# Development-only tuning pin for bit-exact measurement runs
+# (`native::tuning::pinned`). Enabled only through `magnitude-engine`'s
+# `pinned-tuning` feature by the `forward_bench` example; never by a served
+# engine.
+pinned-tuning = []
+# Development-only tuning survey (`native::tuning::survey`): every admissible
+# configuration of every tuned entry is measured and recorded for replaying
+# the search. Enabled only through `magnitude-engine`'s `tuning-survey`
+# feature by `forward_bench`; never by a served engine.
+tuning-survey = []
+
+# Development-only: replays the tuning search against survey records.
+[[example]]
+name = "tuning_replay"
+required-features = ["tuning-survey"]

@@ -1,0 +1,10 @@
+# origin: test:seismic-compiler:compiler/src/portable/import_tests.rs:mixed_quantity_comparison_uses_the_checked_explicit_cast
+# invoke word: index:2147483648 ; i32:0
+# pin: result = bool[]=true
+# invoke quantity: index:2147483648 ; i32:0
+# pin: result = bool[]=false
+fn word(i: index[4294967296], x: i32) -> bool:
+    return i < x
+
+fn quantity(i: index[4294967296], x: i32) -> bool:
+    return i < 0

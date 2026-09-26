@@ -1,0 +1,31 @@
+# The gated delta rule over M ordered steps for every value head, one state row per
+# work item: row *= decay; remembered = row . key; row += (value - remembered) * beta * key;
+# result = row . query. The row carried across steps is a private copy of the accepted
+# state; the successor state is published once after the last step. Grouped value heads
+# use key head h / GV; tiled heads use h % NK. The engine binds this semantic mapping
+# from the artifact description.
+fn delta_steps[M, NK, GV, W](qkv: &tensor[M, 2 * NK + NK * GV, W] A, beta: &tensor[M, NK * GV] A, decay: &tensor[M, NK * GV] f32,
+                             state: &tensor[NK * GV, W, W] f32, next_state: &mut tensor[NK * GV, W, W] f32,
+                             result: &mut tensor[M, NK * GV, W] A, grouped: bool):
+    parallel for heads in 0..(NK * GV):
+        parallel for rows in 0..W:
+            let mut key_head = heads % NK
+            if grouped:
+                key_head = heads / GV
+            let mut row = to_owned(state[heads, rows])
+            for t in 0..M:
+                let key = qkv[t, NK + key_head]
+                let query = qkv[t, key_head]
+                let remembered = sum_any_order(row * decay[t, heads] * f32(key))
+                let residual = (f32(qkv[t, 2 * NK + heads, rows]) - remembered) * f32(beta[t, heads])
+                for j in 0..W:
+                    row[j] = fma(residual, f32(key[j]), row[j] * decay[t, heads])
+                result[t, heads, rows] = sum_any_order(row * f32(query))
+            next_state[heads, rows] = row
+
+# One step: the M = 1 case of `delta_steps`.
+fn delta_step[NK, GV, W](qkv: &tensor[2 * NK + NK * GV, W] A, beta: &tensor[NK * GV] A, decay: &tensor[NK * GV] f32,
+                         state: &tensor[NK * GV, W, W] f32, next_state: &mut tensor[NK * GV, W, W] f32,
+                         result: &mut tensor[NK * GV, W] A, grouped: bool):
+    delta_steps[NK = NK, GV = GV](reshape(qkv, (1, 2 * NK + NK * GV, W)), reshape(beta, (1, NK * GV)), reshape(decay, (1, NK * GV)),
+                                  state, next_state, reshape(result, (1, NK * GV, W)), grouped)

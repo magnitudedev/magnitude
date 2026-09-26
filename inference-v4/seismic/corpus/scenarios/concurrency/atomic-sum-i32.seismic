@@ -1,0 +1,5 @@
+# origin: C17:atomic_sum_i32
+# invoke: i32[4096]=rand(60) ; i32[1]=zero
+fn probe[N](x: &tensor[N] i32, out: &mut tensor[1] i32):
+    parallel for i in 0..N:
+        atomic(add, out[0], x[i])

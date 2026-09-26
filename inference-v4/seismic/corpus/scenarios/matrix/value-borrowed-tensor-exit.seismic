@@ -1,0 +1,4 @@
+# cell: value-borrowed-tensor/exit
+# rejected: "cannot cross an owned boundary"
+fn probe(x: &tensor[4, 8] f32) -> tensor[4, 8] f32:
+    return x

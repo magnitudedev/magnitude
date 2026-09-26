@@ -1,0 +1,10 @@
+# origin: C1:p9
+# rejected: "CallContract"
+fn g[N](x: &tensor[N] f32) -> f32 where N % 2 == 0:
+    return x[0] + 100.0
+
+fn g[N](x: &tensor[N] f32) -> f32 where N % 2 == 1:
+    return x[0] + 200.0
+
+fn top[N](x: &tensor[N] f32) -> f32:
+    return g(x)

@@ -1,0 +1,16 @@
+# The feed-forward norm folded into the SwiGLU gate and up projections of one activation
+# row: result = silu(norm(x)·gate) * (norm(x)·up), with both dot products sharing the normalized activation.
+# The inverse RMS scales the completed accumulators, never the input elements.
+fn norm_gated_projection[N, K](x: &tensor[1, K] bf16, nw: &tensor[1, K] bf16, gate: &tensor[N, K] q4g64, up: &tensor[N, K] q4g64, eps: f32, result: &mut tensor[1, N] bf16):
+    parallel for cols in 0..N:
+        let mut g = f32(0.0)
+        let mut u = f32(0.0)
+        let xf = f32(x[0])
+        let ss = reduce(xf * xf, 0, sum)
+        for k in 0..K:
+            let a = f32(x[0, k]) * f32(nw[0, k])
+            g = fma(a, f32(gate[cols, k]), g)
+            u = fma(a, f32(up[cols, k]), u)
+        let inv = rsqrt(ss / f32(K) + eps)
+        let gs = g * inv
+        result[0, cols] = gs / (1.0 + exp(-gs)) * (u * inv)

@@ -1,0 +1,5 @@
+# origin: test:validation:corpus/values.seismic:packed_q4_decode
+# invoke packed_q4_decode: q4g64[2,128]=rand(122) ; f32[2,128]=zero
+fn packed_q4_decode[R, K](w: &tensor[R, K] q4g64, y: &mut tensor[R, K] f32) where K % 64 == 0:
+    parallel for r in 0..R:
+        y[r] = f32(w[r])

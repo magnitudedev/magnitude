@@ -1,0 +1,4 @@
+# origin: C11:s_f32_of_index_expr
+# invoke: index:7
+fn probe(i: index[100]) -> f32:
+    return f32(2 * i) + 1.0

@@ -1,0 +1,198 @@
+--- a/tests/testing.h
++++ b/tests/testing.h
+@@ -1,6 +1,6 @@
+ #pragma once
+ 
+-#include "common.h"
++#include "templates-support.h"
+ 
+ #include <chrono>
+ #include <exception>
+--- a/tests/test-chat-peg-parser.cpp
++++ b/tests/test-chat-peg-parser.cpp
+@@ -1,6 +1,6 @@
+ #include "chat-peg-parser.h"
+ #include "chat.h"
+-#include "common.h"
++#include "templates-support.h"
+ #include "json-schema-to-grammar.h"
+ #include "peg-parser.h"
+ #include "testing.h"
+--- a/tests/test-chat-analysis.cpp
++++ b/tests/test-chat-analysis.cpp
+@@ -1,7 +1,7 @@
+ #include "chat-auto-parser.h"
+ #include "chat-auto-parser-helpers.h"
+ #include "chat.h"
+-#include "log.h"
++#include "templates-log.h"
+ #include "jinja/caps.h"
+ #include "jinja/runtime.h"
+ 
+@@ -585,7 +585,7 @@
+ 
+ int main(int argc, char ** argv) {
+     // Set log level to capture all output
+-    common_log_set_verbosity_thold(99);
++    
+ 
+     analysis_options opts;
+     if (!parse_options(argc, argv, opts)) {
+--- a/tests/test-chat-auto-parser.cpp
++++ b/tests/test-chat-auto-parser.cpp
+@@ -2,9 +2,9 @@
+ #include "chat-auto-parser.h"
+ #include "chat-peg-parser.h"
+ #include "chat.h"
+-#include "gguf.h"
++
+ #include "jinja/runtime.h"
+-#include "log.h"
++#include "templates-log.h"
+ #include "peg-parser.h"
+ #include "testing.h"
+ 
+@@ -147,31 +147,7 @@
+ }
+ 
+ static std::string read_gguf_chat_template(const std::string & path) {
+-    struct gguf_init_params params = { /*no_alloc =*/true,  // We only need metadata, not tensor data
+-                                       /*ctx=*/nullptr };
+-
+-    struct gguf_context * ctx = gguf_init_from_file(path.c_str(), params);
+-    if (ctx == nullptr) {
+-        throw std::runtime_error("Could not open GGUF file: " + path);
+-    }
+-
+-    const char * key    = "tokenizer.chat_template";
+-    int64_t      key_id = gguf_find_key(ctx, key);
+-
+-    if (key_id == -1) {
+-        gguf_free(ctx);
+-        throw std::runtime_error("GGUF file does not contain chat template key: " + std::string(key));
+-    }
+-
+-    const char * template_str = gguf_get_val_str(ctx, key_id);
+-    if (template_str == nullptr) {
+-        gguf_free(ctx);
+-        throw std::runtime_error("GGUF file contains chat template key but value is null");
+-    }
+-
+-    std::string result = template_str;
+-    gguf_free(ctx);
+-    return result;
++    throw std::runtime_error("Use a template source fixture; GGUF loading belongs to the host: " + path);
+ }
+ 
+ static void print_usage(const char * program_name) {
+@@ -516,14 +492,14 @@
+     if (argc > 1) {
+         std::string arg = argv[1];
+         if (arg == "-h" || arg == "--help") {
+-            common_log_set_verbosity_thold(99);
++            
+             print_usage(argv[0]);
+             return 0;
+         }
+ 
+         // debug mode: if the first argument is an existing file, analyze that template instead of running the automated tests
+         if (std::filesystem::is_regular_file(arg)) {
+-            common_log_set_verbosity_thold(99);
++            
+ 
+             debug_options opts;
+             if (!parse_debug_options(argc, argv, opts)) {
+--- a/tests/test-chat-template.cpp
++++ b/tests/test-chat-template.cpp
+@@ -12,8 +12,8 @@
+ #undef NDEBUG
+ #include <cassert>
+ 
+-#include "llama.h"
+-#include "common.h"
++
++#include "templates-support.h"
+ #include "chat.h"
+ #include "jinja/runtime.h"
+ #include "jinja/parser.h"
+@@ -238,7 +238,7 @@
+             const std::string & eos_token,
+             std::vector<common_chat_msg> & messages,
+             std::vector<common_chat_tool> tools = {}) {
+-    auto tmpls = common_chat_templates_init(/* model= */ nullptr, template_str, bos_token, eos_token);
++    auto tmpls = common_chat_templates_init(template_str, bos_token, eos_token);
+     common_chat_templates_inputs inputs;
+     inputs.use_jinja = true;
+     inputs.messages = messages;
+@@ -349,10 +349,11 @@
+     return msg;
+ }
+ 
++struct fixture_message { const char * role; const char * content; };
+ int main_automated_tests(void) {
+     // jinja::enable_debug(true);
+ 
+-    std::vector<llama_chat_message> conversation {
++    std::vector<fixture_message> conversation {
+         {"system", "You are a helpful assistant"},
+         {"user", "Hello"},
+         {"assistant", "Hi there"},
+@@ -370,7 +371,7 @@
+         std::string bos_token = "";
+         std::string eos_token = "";
+         bool supported_with_jinja = true;
+-        std::vector<llama_chat_message> extra_conversation = {};
++        std::vector<fixture_message> extra_conversation = {};
+     };
+     std::vector<TestCase> test_cases {
+         {
+@@ -653,49 +654,6 @@
+             /* .extra_conversation= */ {{"user", "What is the weather?"}, {"assistant_tool_call", "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"NYC\"}}\n</tool_call>"}, {"tool_response", "{\"temperature\": 72}"}},
+         }
+     };
+-    std::vector<char> formatted_chat(1024);
+-    int32_t res;
+-
+-    // list all supported templates
+-    std::vector<const char *> supported_tmpl;
+-    res = llama_chat_builtin_templates(nullptr, 0);
+-    assert(res > 0);
+-    supported_tmpl.resize(res);
+-    res = llama_chat_builtin_templates(supported_tmpl.data(), supported_tmpl.size());
+-    std::cout << "Built-in chat templates:\n";
+-    for (const auto *tmpl : supported_tmpl) {
+-        std::cout << "  " << tmpl << "\n";
+-    }
+-
+-    // test invalid chat template
+-    res = llama_chat_apply_template("INVALID TEMPLATE", conversation.data(), conversation.size(), true, formatted_chat.data(), formatted_chat.size());
+-    assert(res < 0);
+-    const auto add_generation_prompt = true;
+-
+-    for (const auto & test_case : test_cases) {
+-        std::cout << "\n\n=== " << test_case.name << " ===\n\n";
+-        auto conv = conversation;
+-        conv.insert(conv.end(), test_case.extra_conversation.begin(), test_case.extra_conversation.end());
+-        formatted_chat.resize(2048);
+-        res = llama_chat_apply_template(
+-            test_case.template_str.c_str(),
+-            conv.data(),
+-            conv.size(),
+-            add_generation_prompt,
+-            formatted_chat.data(),
+-            formatted_chat.size()
+-        );
+-        formatted_chat.resize(res);
+-        std::string output(formatted_chat.data(), formatted_chat.size());
+-        if (output != test_case.expected_output) {
+-            std::cout << "Expected:\n" << test_case.expected_output << "\n";
+-            std::cout << "-------------------------\n";
+-            std::cout << "Actual:\n" << output << "\n";
+-            std::cout.flush();
+-            assert(output == test_case.expected_output);
+-        }
+-    }
+-
+     std::vector<common_chat_msg> messages;
+     messages.reserve(conversation.size());
+     for (const auto & msg : conversation) {

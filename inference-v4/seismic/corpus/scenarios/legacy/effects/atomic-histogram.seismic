@@ -1,0 +1,7 @@
+# origin: test:validation:corpus/effects.seismic:atomic_histogram
+# invoke atomic_histogram: i32[8]=0,1,1,3,2,3,3,3 ; i32[4]=zero
+# invoke atomic_histogram: i32[8]=0,1,1,4,2,3,3,3 ; i32[4]=zero
+# expect: failed
+fn atomic_histogram[N, E](routes: &tensor[N] i32, counts: &mut tensor[E] i32):
+    parallel for i in 0..N:
+        atomic(add, counts[routes[i]], 1)

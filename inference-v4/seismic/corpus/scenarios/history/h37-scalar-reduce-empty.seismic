@@ -1,0 +1,6 @@
+# origin: H-37
+# invoke: f32[0]=zero
+# pin: result = f32[]=0
+# invoke: f32[5]=seq
+fn probe[N](x: &tensor[N] f32) -> f32 where N >= 0:
+    return reduce(x, 0, sum)

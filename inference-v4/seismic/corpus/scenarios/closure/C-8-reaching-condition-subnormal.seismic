@@ -1,0 +1,17 @@
+# origin: X1:R6-X1-5
+# policies: exact unconstrained
+# invoke: f32[4]=0x00000001,0x80000001,0x3f800000,0xbf800000 ; i32[4]=zero ; index:8
+# expect: returned
+# pin: out = i32[4]=8,0,2,0
+fn probe[N](x: &tensor[N] f32, out: &mut tensor[N] i32, n: index[64]):
+    # C-8 (after D12): the float compare decides whether the visit reaches its
+    # launch-scratch allocation. It feeds a predicate, so it is demanded and
+    # realized Exact under every policy: 0x00000001 * 3.0 is the subnormal
+    # 0x00000003 > 0.0 (a flushing native multiply would give 0.0 and skip the
+    # visit). The kernel reserves the envelope 4 * 63 bytes per participant
+    # whatever the condition evaluates to.
+    parallel for i in 0..N:
+        if x[i] * 3.0 > 0.0:
+            let mut t = tensor[n / (i + 1)] i32
+            t[:] = ones_like(t)
+            out[i] = reduce(t, 0, sum)

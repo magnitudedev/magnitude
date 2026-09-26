@@ -1,0 +1,49 @@
+# Adds `x` into `state` in place. `BIAS` is declared a mapping parameter, but
+# a value of 1 changes the bits written to `state`: tuning reports it as a
+# misclassified-parameter defect, found only by validating the `&mut`
+# parameter (the entry has no results).
+fn accumulate[N](state: &mut tensor[N] f32, x: &tensor[N] f32):
+    parallel for i in 0..N:
+        state[i] = state[i] + x[i]
+
+native accumulate for metal from "metal/accumulate.metal":
+    params (BIAS in [0, 1], WIDTH in [32, 64])
+    launch accumulate:
+        threadgroups (ceil_div(N, WIDTH), 1, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)
+
+native accumulate for cuda from "cuda/accumulate.cu":
+    params (BIAS in [0, 1], WIDTH in [32, 64])
+    launch accumulate:
+        threadgroups (ceil_div(N, WIDTH), 1, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)
+
+native accumulate for vulkan from "vulkan/accumulate.comp":
+    params (BIAS in [0, 1], WIDTH in [32, 64])
+    launch accumulate:
+        threadgroups (ceil_div(N, WIDTH), 1, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)
+
+native accumulate for cpu from "cpu/accumulate.rs":
+    params (BIAS in [0, 1], WIDTH in [32, 64])
+    launch accumulate:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# Two row bands with independently named code and runtime parameters. The
+# same parameter names in both launches address distinct tuning choices.
+fn scoped_scale[N](x: &tensor[N] f32) -> tensor[N] f32:
+    let mut output = tensor[N] f32
+    parallel for i in 0..N:
+        output[i] = x[i] * 2.0
+    return output
+
+native scoped_scale for metal from "metal/scoped_scale.metal":
+    launch scoped_scale_small when N <= 16:
+        params (WIDTH in [32, 64], code ROWS in [1, 2])
+        threadgroups (ceil_div(N, WIDTH * ROWS), 1, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)
+    launch scoped_scale_large when N > 16:
+        params (WIDTH in [64, 128], code ROWS in [4, 8])
+        threadgroups (ceil_div(N, WIDTH * ROWS), 1, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)

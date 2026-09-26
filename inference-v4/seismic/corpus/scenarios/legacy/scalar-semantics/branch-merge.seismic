@@ -1,0 +1,12 @@
+# origin: test:validation:programs/scalar-semantics.seismic:branch_merge
+# invoke branch_merge: f32[1]=zero ; bool:true
+# invoke branch_merge: f32[1]=zero ; bool:false
+fn branch_merge(result: tensor[1] f32, choose: bool) -> tensor[1] f32:
+    let mut output = result
+    let mut value = f32(3.0)
+    if choose:
+        value = 7.0
+    else:
+        value = 11.0
+    output[0] = value
+    return output

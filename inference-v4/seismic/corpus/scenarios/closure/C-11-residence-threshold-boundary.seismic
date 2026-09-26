@@ -1,0 +1,35 @@
+# origin: X4:R6-X4-1
+# invoke: f32[2,2,2,1536]=rand(31) ; f32[2,2,2]=rand(32) ; f32[2,2,1536]=rand(33) ; f32[2,2,1]=rand(34) ; f32[2,2,1536]=rand(35) ; f32[2,2,1536]=zero
+# expect: returned
+# invoke: f32[2,2,2,1537]=rand(31) ; f32[2,2,2]=rand(32) ; f32[2,2,1537]=rand(33) ; f32[2,2,1]=rand(34) ; f32[2,2,1537]=rand(35) ; f32[2,2,1537]=zero
+# expect: returned
+# invoke: f32[2,1,2,2]=1,2,3,4,5,6,7,8 ; f32[2,1,2]=1,0.5,2,-1 ; f32[2,1,2]=10,20,30,40 ; f32[2,1,1]=0.5,2 ; f32[2,1,2]=100,200,300,400 ; f32[2,1,2]=zero
+# expect: returned
+fn routed_merge[M, K, H](experts: &tensor[M, K, H] A, scores: &tensor[M, K] f32,
+                         shared: &tensor[M, H] A, coefficient: &tensor[M, 1] A,
+                         residual: &tensor[M, H] f32, out: &mut tensor[M, H] f32):
+    parallel for row in 0..M:
+        let mut selected = tensor[H] f32
+        for i in 0..H:
+            selected[i] = 0.0
+        for choice in 0..K:
+            for i in 0..H:
+                selected[i] = selected[i] + scores[row, choice] * f32(experts[row, choice, i])
+        for i in 0..H:
+            let gated_shared = f32(shared[row, i]) * f32(coefficient[row, 0])
+            selected[i] = residual[row, i] + selected[i] + gated_shared
+        out[row] = selected
+
+
+fn probe[C, M, K, H](experts: &tensor[C, M, K, H] f32, scores: &tensor[C, M, K] f32,
+                     shared: &tensor[C, M, H] f32, coefficient: &tensor[C, M, 1] f32,
+                     residual: &tensor[C, M, H] f32, out: &mut tensor[C, M, H] f32):
+    for chunk in 0..C:
+        routed_merge(experts[chunk], scores[chunk], shared[chunk], coefficient[chunk], residual[chunk], out[chunk])
+
+# C-11 (IF I-93): the threshold boundary of one promotable site launched once per chunk.
+# `routed_merge` (verbatim, `engine/lib/routed_suffix.seismic`) has W_s = 4H of cohort-context
+# locals over the Invocation envelope. On Metal (threshold 3*32768/16 = 6144 B, inclusive):
+# H=1536 gives 6144 B (promoted iff derive_launch_local_layout adds no bytes beyond `selected`),
+# H=1537 gives 6148 B (unpromoted). `promoted_when` reads only invocation symbols, so both
+# launches of the host loop take the same twin. Every outcome is the interpreter's.

@@ -1,0 +1,10 @@
+# origin: C11:r3_if_join_call_arg
+# invoke: f32:1
+fn helper(a: f32) -> f32:
+    return a + 1.0
+
+fn probe(x: f32) -> f32:
+    let mut v = 0.0
+    if x > 0.0:
+        v = x
+    return helper(v)

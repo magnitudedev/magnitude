@@ -1,0 +1,13 @@
+# origin: H-17
+# invoke: f32[6]=seq
+fn bump[N](state: tensor[N] f32, x: &tensor[N] f32) -> tensor[N] f32:
+    let mut s = state
+    parallel for i in 0..N:
+        s[i] = s[i] + x[i]
+    return s
+
+fn probe[N](x: &tensor[N] f32) -> tensor[N] f32:
+    let mut s = to_owned(x)
+    s = bump(s, x)
+    s = bump(s, x)
+    return s

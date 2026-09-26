@@ -1,0 +1,5 @@
+# origin: test:seismic-compiler:compiler/src/portable/streaming.rs:closed_views_and_elementwise_values_stream_into_their_reduction
+# invoke: bf16[6]=rand(154)
+fn probe[N](x: &tensor[N] bf16) -> tensor[1] f32:
+    let a = f32(reshape(x, (N, 1)))
+    return reduce(a * a, 0, sum)

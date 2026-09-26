@@ -1,0 +1,5 @@
+# Index of the largest value of a row. Ties go to the smaller index. Reduction
+# decomposition and scratch storage are compiler-owned physical decisions.
+fn argmax_row[V](x: &tensor[1, V] f32, result: &mut tensor[1] i32):
+    parallel for ones in 0..1:
+        result[ones] = reduce(x[0], 0, argmax)

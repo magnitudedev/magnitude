@@ -1,0 +1,11 @@
+# origin: C13:p26
+# invoke: i32[4]=zero
+fn fill[N](x: &mut tensor[N] i32, v: i32):
+    for i in 0..N:
+        x[i] = v
+
+fn probe(out: &mut tensor[4] i32):
+    let mut local = tensor[4] i32
+    fill(local, 7)
+    fill(out[0:2], local[3] + 1)
+    fill(out[2:4], local[0])

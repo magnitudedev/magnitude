@@ -1,0 +1,4 @@
+# origin: test:validation:corpus/shape.seismic:static_slice
+# invoke static_slice: f32[6]=seq ; f32[3]=zero
+fn static_slice[N](x: &tensor[N] f32, y: &mut tensor[3] f32) where N >= 5:
+    y[:] = x[2:5]

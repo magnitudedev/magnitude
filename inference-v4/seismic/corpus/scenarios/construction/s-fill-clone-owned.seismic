@@ -1,0 +1,10 @@
+# origin: C11:s_fill_clone_owned
+# cell: fill/sl
+# cell: copy-dense/sl
+# invoke: f32[4]=1,2,3,4
+fn probe(x: &tensor[4] f32) -> tensor[4] f32:
+    let z = zeros_like(x)
+    let o = ones_like(x)
+    let c = to_owned(x)
+    let d = to_owned(c)
+    return z + o + d

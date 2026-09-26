@@ -1,0 +1,7 @@
+# origin: C11:r2_index_escape_loop
+# rejected: "returns index"
+fn probe(n: index[8]) -> index[64]:
+    let mut q = n + 0
+    for k in 0..n:
+        q = q + k
+    return q

@@ -1,0 +1,8 @@
+# Metal matrix realization is expressed only in logical tensor values. Fragment shape,
+# transfers, subgroup participation, and physical storage are compiler-controlled.
+# This lowering serves both `matmul` bodies: the reference body under accepted intrinsic
+# evidence, and the reassociating body under its contract.
+lower matmul[M, N, K](a: &tensor[M, K] T, b: &tensor[N, K] U,
+                      into: tensor[M, N] f32) -> tensor[M, N] f32
+    for metal requires metal.matrix:
+    return metal.matrix.matmul_add(a, b.T, into)

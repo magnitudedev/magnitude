@@ -1,0 +1,9 @@
+# origin: test:validation:corpus/planning.seismic:windowed_sum
+# invoke windowed_sum: f32[6,3]=seq ; i32[2]=1,4 ; f32[3]=zero
+# invoke windowed_sum: f32[6,3]=seq ; i32[2]=2,2 ; f32[3]=zero
+fn windowed_sum[T, W](history: &tensor[T, W] f32, bounds: &tensor[2] i32, y: &mut tensor[W] f32):
+    let lo = bounds[0]
+    let hi = bounds[1]
+    let window = history[lo:hi]
+    parallel for j in 0..W:
+        y[j] = reduce(window[:, j], 0, sum)

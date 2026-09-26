@@ -1,0 +1,10 @@
+# origin: H-34
+# invoke: f32[70000]=rand(11) ; f32[70000]=zero
+fn child[N](x: &tensor[N] f32, y: &mut tensor[N] f32):
+    parallel for i in 0..N:
+        y[i] = x[i] + 1.0
+
+fn probe[N](x: &tensor[N] f32, y: &mut tensor[N] f32):
+    child(x, y)
+    parallel for i in 0..N:
+        y[i] = y[i] * 2.0

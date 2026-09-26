@@ -1,0 +1,5 @@
+# origin: test:validation:corpus/planning.seismic:range_window
+# invoke range_window: f32[6]=seq ; f32[6]=9,9,9,9,9,9 ; range:2..5
+fn range_window[N](x: &tensor[N] f32, y: &mut tensor[N] f32, span: range[N]):
+    for i in span:
+        y[i] = x[i] * 2.0

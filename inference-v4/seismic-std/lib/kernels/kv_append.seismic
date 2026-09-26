@@ -1,0 +1,9 @@
+# Persist one prepared decode row after its fresh-value attention consumption.
+# Destination admission and logical sequence advancement belong to the engine.
+# Only the destination row of each history is written, so both histories are exclusive borrows.
+fn kv_append[T, KV, W](key: &tensor[1, KV, W] A, value: &tensor[1, KV, W] A,
+                             history_key: &mut tensor[T, KV, W] A, history_value: &mut tensor[T, KV, W] A,
+                             destination: index[T]):
+    parallel for heads in 0..KV:
+        history_key[destination, heads] = key[0, heads]
+        history_value[destination, heads] = value[0, heads]

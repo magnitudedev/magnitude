@@ -1,0 +1,181 @@
+--- a/common/peg-parser.h
++++ b/common/peg-parser.h
+@@ -176,13 +176,19 @@
+     // Opt-in only for an immutable arena and an append-only input. Cache complete
+     // scanner prefixes, never PEG choices/results or provisional delimiters.
+     bool append_only = false;
++    // Generic chat mapping consumes tags, whereas specialized mappers also use
++    // named rule nodes. Never suppress those nodes without an explicit opt-in.
++    bool tags_only = false;
++    size_t boundary_reads = 0;
+     struct scan_progress { size_t position; int count; };
+     std::map<std::pair<common_peg_parser_id, size_t>, scan_progress> scans;
+     scan_progress * scan(common_peg_parser_id parser, size_t start) {
+         if (!append_only) { return nullptr; }
+         const auto key = std::make_pair(parser, start);
+         if (auto found = scans.find(key); found != scans.end()) { return &found->second; }
+-        if (scans.size() >= 65536) { scans.clear(); }
++        // Keep early (outer) prefixes when full. Clearing would repeatedly lose
++        // the enclosing repetition's progress on large structured arguments.
++        if (scans.size() >= 65536) { return nullptr; }
+         return &scans.emplace(key, scan_progress{start, 0}).first->second;
+     }
+ 
+--- a/common/peg-parser.cpp
++++ b/common/peg-parser.cpp
+@@ -250,6 +250,7 @@
+     }
+ 
+     common_peg_parse_result operator()(const common_peg_end_parser & /* p */) const {
++        if (start_pos >= ctx.input.size()) { ++ctx.boundary_reads; }
+         return common_peg_parse_result(
+             start_pos >= ctx.input.size() ? COMMON_PEG_PARSE_RESULT_SUCCESS : COMMON_PEG_PARSE_RESULT_FAIL,
+             start_pos
+@@ -260,6 +261,7 @@
+         auto pos = start_pos;
+         for (auto i = 0u; i < p.literal.size(); ++i) {
+             if (pos >= ctx.input.size()) {
++                ++ctx.boundary_reads;
+                 if (!ctx.is_lenient()) {
+                     return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_FAIL, start_pos);
+                 }
+@@ -368,20 +370,25 @@
+         }
+         ctx.parse_depth++;
+ 
+-        auto pos = start_pos;
+-        int match_count = 0;
++        auto progress = ctx.scan(parser_id, start_pos);
++        auto pos = progress ? progress->position : start_pos;
++        int match_count = progress ? progress->count : 0;
++        bool stable = true;
+         std::vector<common_peg_ast_id> nodes;
+ 
+         // Try to match up to max_count times (or unlimited if max_count is -1)
+         while (p.max_count == -1 || match_count < p.max_count) {
+             if (pos >= ctx.input.size()) {
++                ++ctx.boundary_reads;
+                 if (ctx.is_debug()) {
+                     fprintf(stderr, "%sREPEAT: at end of input, count=%d\n", debug_indent().c_str(), match_count);
+                 }
+                 break;
+             }
+ 
++            const auto boundary_reads = ctx.boundary_reads;
+             auto result = arena.parse(p.child, ctx, pos);
++            stable &= result.nodes.empty() && ctx.boundary_reads == boundary_reads;
+ 
+             if (ctx.is_debug()) {
+                 fprintf(stderr, "%sREPEAT iter %d: %s at %zu->%zu, nodes=%zu\n", debug_indent().c_str(), match_count,
+@@ -404,6 +411,9 @@
+ 
+                 pos = result.end;
+                 match_count++;
++                // Only omit iterations with no observable AST and no EOF-dependent
++                // decision. Provisional choices must be reevaluated after append.
++                if (stable && progress) { *progress = {pos, match_count}; }
+                 continue;
+             }
+ 
+@@ -480,6 +490,7 @@
+         auto result = common_parse_utf8_codepoint(ctx.input, start_pos);
+ 
+         if (result.status == utf8_parse_result::INCOMPLETE) {
++            ++ctx.boundary_reads;
+             if (!ctx.is_lenient()) {
+                 return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_FAIL, start_pos);
+             }
+@@ -492,16 +503,19 @@
+     }
+ 
+     common_peg_parse_result operator()(const common_peg_space_parser & /* p */) {
+-        auto pos = start_pos;
++        auto progress = ctx.scan(parser_id, start_pos);
++        auto pos = progress ? progress->position : start_pos;
+         while (pos < ctx.input.size()) {
+             auto c = static_cast<unsigned char>(ctx.input[pos]);
+             if (std::isspace(c)) {
+                 ++pos;
++                if (progress) { progress->position = pos; }
+             } else {
+                 break;
+             }
+         }
+ 
++        if (pos == ctx.input.size()) { ++ctx.boundary_reads; }
+         return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_SUCCESS, start_pos, pos);
+     }
+ 
+@@ -515,6 +529,7 @@
+             auto result = common_parse_utf8_codepoint(ctx.input, pos);
+ 
+             if (result.status == utf8_parse_result::INCOMPLETE) {
++            ++ctx.boundary_reads;
+                 if (match_count >= p.min_count) {
+                     // We have enough matches, succeed with what we have
+                     return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_SUCCESS, start_pos, pos);
+@@ -576,6 +591,7 @@
+ 
+         ++pos; // consume '\'
+         if (pos >= ctx.input.size()) {
++                ++ctx.boundary_reads;
+             if (!ctx.is_lenient()) {
+                 return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_FAIL, start);
+             }
+@@ -606,6 +622,7 @@
+         ++pos; // consume 'u'
+         for (int i = 0; i < 4; ++i) {
+             if (pos >= ctx.input.size()) {
++                ++ctx.boundary_reads;
+                 if (!ctx.is_lenient()) {
+                     return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_FAIL, start);
+                 }
+@@ -641,6 +658,7 @@
+                 auto utf8_result = common_parse_utf8_codepoint(ctx.input, pos);
+ 
+                 if (utf8_result.status == utf8_parse_result::INCOMPLETE) {
++                ++ctx.boundary_reads;
+                     if (!ctx.is_lenient()) {
+                         return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_FAIL, start_pos);
+                     }
+@@ -656,6 +674,7 @@
+             if (progress) { progress->position = pos; }
+         }
+ 
++        ++ctx.boundary_reads;
+         // Reached end without finding closing quote
+         if (!ctx.is_lenient()) {
+             return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_FAIL, start_pos, pos);
+@@ -675,6 +694,7 @@
+             auto utf8_result = common_parse_utf8_codepoint(ctx.input, pos);
+ 
+             if (utf8_result.status == utf8_parse_result::INCOMPLETE) {
++                ++ctx.boundary_reads;
+                 // Incomplete UTF-8 sequence
+                 if (!ctx.is_lenient()) {
+                     // Input is complete but UTF-8 is incomplete = malformed
+@@ -697,6 +717,7 @@
+                 return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_SUCCESS, start_pos, pos);
+             }
+ 
++            if (match == common_trie::PARTIAL_MATCH) { ++ctx.boundary_reads; }
+             if (match == common_trie::PARTIAL_MATCH && ctx.is_lenient()) {
+                 // Found a partial match extending to end of input, return everything before it
+                 return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_SUCCESS, start_pos, pos);
+@@ -707,6 +728,7 @@
+             if (progress) { progress->position = pos; }
+         }
+ 
++        if (last_valid_pos == ctx.input.size()) { ++ctx.boundary_reads; }
+         if (last_valid_pos == ctx.input.size() && ctx.is_lenient()) {
+             // Reached the end of a partial stream, there might still be more input that we need to consume.
+             return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_NEED_MORE_INPUT, start_pos, last_valid_pos);
+@@ -721,6 +743,8 @@
+     common_peg_parse_result operator()(const common_peg_rule_parser & p) {
+         // Parse the child
+         auto result = arena.parse(p.child, ctx, start_pos);
++
++        if (ctx.tags_only) { return result; }
+ 
+         if (!result.fail()) {
+             std::string_view text;

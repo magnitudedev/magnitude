@@ -1,0 +1,20 @@
+# Batched row-major linear projection: y = x . transpose(weight), accumulated in F32 for
+# every output; publication rounds to the output type. The first body is the reference ordered
+# F32 FMA chain over K (`matmul`'s reference body); the second contracts the whole K extent
+# under `matmul`'s reassociating body and requires a derived whole-entry numerical
+# relation that satisfies the compilation policy.
+fn linear[M, N, K](x: &tensor[M, K] T, weight: &tensor[N, K] U, y: &mut tensor[M, N] V):
+    parallel for rows in 0..M:
+        parallel for cols in 0..N:
+            let mut acc = f32(0.0)
+            for k in 0..K:
+                acc = fma(f32(x[rows, k]), f32(weight[cols, k]), acc)
+            y[rows, cols] = acc
+
+fn linear[M, N, K](x: &tensor[M, K] T, weight: &tensor[N, K] U, y: &mut tensor[M, N] V):
+    parallel for rows in 0..M:
+        parallel for cols in 0..N:
+            let mut acc = f32(0.0)
+            for k in 0..K:
+                acc = acc + f32(x[rows, k]) * f32(weight[cols, k])
+            y[rows, cols] = acc

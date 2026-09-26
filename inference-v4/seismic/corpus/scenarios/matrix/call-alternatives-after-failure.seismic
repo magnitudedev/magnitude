@@ -1,0 +1,17 @@
+# cell: call-alternatives/after-failure
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero ; i32:2
+# expect: returned
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero ; i32:0
+# expect: failed
+fn total[V](r: &tensor[V] f32) -> f32:
+    return reduce(r, 0, sum)
+
+fn total[V](r: &tensor[V] f32) -> f32:
+    let mut s = 0.0
+    for j in 0..V:
+        s = s + r[j]
+    return s
+
+fn probe[W](x: &tensor[4, W] f32, out: &mut tensor[4] f32, y: &mut tensor[4, W] f32, d: i32) where W >= 8:
+    let q = 10 / d
+    out[0] = total(x[0])

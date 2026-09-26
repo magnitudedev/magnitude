@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.10,<2"]
+build-backend = "maturin"
+
+[project]
+name = "magnitude-seismic"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["numpy>=2", "ml_dtypes>=0.5"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+demo = ["torch>=2.5"]
+mnist-data = ["pyarrow>=18", "pillow>=11"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "seismic._native"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,6 @@
+# origin: test:validation:corpus/shape.seismic:scalar_broadcast
+# invoke scalar_broadcast: f32[2,3]=seq ; f32[2,3]=zero ; f32:2 ; f32:0.5
+# invoke scalar_broadcast: f32[0,3]=zero ; f32[0,3]=zero ; f32:2 ; f32:0.5
+fn scalar_broadcast[M, N](x: &tensor[M, N] f32, y: &mut tensor[M, N] f32, scale: f32, bias: f32) where M >= 0 and N >= 0:
+    parallel for r in 0..M:
+        y[r] = x[r] * scale + bias

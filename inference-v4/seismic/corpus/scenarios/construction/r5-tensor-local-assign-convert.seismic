@@ -1,0 +1,6 @@
+# origin: C11:r5_tensor_local_assign_convert
+# invoke: f32[2]=1,1
+fn probe(x: &tensor[2] f32) -> f32:
+    let mut y = tensor[2] f16
+    y = to_owned(x)
+    return f32(y[0])

@@ -1,0 +1,8 @@
+# origin: H-7
+# invoke: f32[3,5]=rand(3)
+fn probe[M, N](x: &tensor[M, N] f32) -> f32:
+    let mut t = tensor[M, N] f32
+    for i in 0..M:
+        for j in 0..N:
+            t[i, j] = x[i, j] + 1.0
+    return reduce(reduce(t, 1, sum), 0, sum)

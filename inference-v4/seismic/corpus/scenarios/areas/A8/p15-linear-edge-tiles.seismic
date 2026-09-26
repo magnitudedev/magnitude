@@ -1,0 +1,21 @@
+# origin: A8:G-A8-new-13 X1:R2-X1-5
+# std: yes
+# undecided: reassociated
+# invoke: f32[1,15]=rand(40) ; f32[5,15]=rand(41) ; f32[1,5]=zero
+# expect: returned
+# invoke: f32[1,17]=rand(42) ; f32[5,17]=rand(43) ; f32[1,5]=zero
+# expect: returned
+# invoke: f32[63,15]=rand(44) ; f32[5,15]=rand(45) ; f32[63,5]=zero
+# expect: returned
+# invoke: f32[63,17]=rand(46) ; f32[5,17]=rand(47) ; f32[63,5]=zero
+# expect: returned
+# invoke: f32[65,15]=rand(48) ; f32[5,15]=rand(49) ; f32[65,5]=zero
+# expect: returned
+# invoke: f32[65,17]=rand(50) ; f32[5,17]=rand(51) ; f32[65,5]=zero
+# expect: returned
+fn probe[M, N, K](x: &tensor[M, K] f32, weight: &tensor[N, K] f32, y: &mut tensor[M, N] f32):
+    # std `linear` at edge-tile shapes: M and K straddle every tile width, so
+    # each staged and fragment load of a partial tile is predicated. On Metal
+    # this scenario also runs under shader validation
+    # (`tests/metal_shader_validation.rs`), where an unpredicated load panics.
+    linear(x, weight, y)

@@ -1,0 +1,40 @@
+[package]
+name = "seismic-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+seismic-ir.workspace = true
+seismic-lang.workspace = true
+seismic-compiler.workspace = true
+seismic-native-target.workspace = true
+seismic-metal.workspace = true
+seismic-cpu.workspace = true
+seismic-native-cpu.workspace = true
+seismic-cuda.workspace = true
+opentelemetry = "0.33.0"
+serde.workspace = true
+sha2 = "=0.11.0"
+
+[dev-dependencies]
+seismic-std.workspace = true
+# Vulkan formation (glslang, SPIRV-Tools) is tested offline on every host.
+seismic-vulkan.workspace = true
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Vulkan is built on Linux and Windows only.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+seismic-vulkan.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_JobObjects",
+  "Win32_System_ProcessStatus",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+] }

@@ -1,0 +1,11 @@
+# origin: C1:p6
+# cell: loop-ordered/zero-trip
+# invoke count: f32[5]=seq ; index:3
+# pin: result = f32[]=3
+# invoke count: f32[5]=seq ; index:0
+# pin: result = f32[]=0
+fn count[N](x: &tensor[N] f32, n: index[N]) -> f32:
+    let mut s = f32(0.0)
+    for i in 0..n:
+        s = s + x[i]
+    return s

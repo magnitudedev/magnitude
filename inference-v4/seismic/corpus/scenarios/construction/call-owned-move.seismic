@@ -1,0 +1,10 @@
+# origin: C11:call_owned_move
+# invoke: f32[4]=1,2,3,4
+fn helper(a: tensor[4] f32) -> tensor[4] f32:
+    let mut b = a
+    b[0] = 5.0
+    return b
+
+fn probe(x: &tensor[4] f32) -> tensor[4] f32:
+    let t = to_owned(x)
+    return helper(t)

@@ -1,0 +1,128 @@
+// gated_delta_output: gated per-head RMS·SiLU(z) prologue over the mixed
+// recurrence output, the output projection, and the F32 residual.
+#define KERNEL_W0 SEISMIC_OUTPUT_WEIGHT
+#include "lib/projection/projection.h"
+
+typedef element::Act activation;
+typedef ELEMENT_OF(SEISMIC_RECURRENT_NORM) norm_element;
+// The GEMV and batched launches reduce each head's norm across the staging
+// lanes that load it (projection::LaneNorm): W / 8 lanes, a power of two.
+static_assert(SEISMIC_DIM_W % 8 == 0 && SEISMIC_DIM_W <= 256 && ((SEISMIC_DIM_W / 8) & (SEISMIC_DIM_W / 8 - 1)) == 0,
+    "gated_delta_output reduces a head over W / 8 lanes, a power of two up to 32");
+
+#define RECURRENT_OUTPUT_ARGUMENTS                                                      \
+    device const float *hidden [[buffer(SEISMIC_BUFFER_HIDDEN)]],                       \
+    device const uchar *projected [[buffer(SEISMIC_BUFFER_PROJECTION)]],                \
+    device const uchar *mixed [[buffer(SEISMIC_BUFFER_MIXED)]],                         \
+    device const uchar *recurrent_norm [[buffer(SEISMIC_BUFFER_RECURRENT_NORM)]],       \
+    device const uchar *output_weight [[buffer(SEISMIC_BUFFER_OUTPUT_WEIGHT)]],         \
+    device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
+    device uchar *normalized [[buffer(SEISMIC_BUFFER_SCRATCH_NORMALIZED)]],             \
+    device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],                 \
+    device float *small_partials [[buffer(SEISMIC_BUFFER_SCRATCH_SMALL_PARTIALS)]],     \
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
+
+#define RECURRENT_OUTPUT_OPERANDS                                                       \
+    const uint k = uint(SEISMIC_DIM_NV * SEISMIC_DIM_W);                                \
+    projection::GatedRms<activation, norm_element, projection::AllRows> in{mixed, SEISMIC_MIXED_STRIDE_0, \
+        SEISMIC_MIXED_STRIDE_1, SEISMIC_MIXED_STRIDE_2, projected,                      \
+        SEISMIC_PROJECTION_STRIDE_0, SEISMIC_PROJECTION_STRIDE_1,                       \
+        ulong((2 * SEISMIC_DIM_NK + SEISMIC_DIM_NV) * SEISMIC_DIM_W), recurrent_norm,   \
+        SEISMIC_RECURRENT_NORM_STRIDE_0, as_type<float>(uint(SEISMIC_PARAM_EPSILON)),   \
+        uint(SEISMIC_DIM_NV), uint(SEISMIC_DIM_W), {}};                                 \
+    projection::Residual<activation, projection::AllRows> out{result, SEISMIC_RESULT_0_STRIDE_0, \
+        SEISMIC_RESULT_0_STRIDE_1, hidden, SEISMIC_HIDDEN_STRIDE_0,                     \
+        SEISMIC_HIDDEN_STRIDE_1, {}};                                                   \
+    projection::Weights<packets::W0> w{output_weight, KERNEL_W0_LAYOUT(k), k}
+
+#ifdef SEISMIC_FORMING_GATED_DELTA_OUTPUT_GEMV
+template <uint ROWS, uint LANES>
+kernel void gated_delta_output_gemv(RECURRENT_OUTPUT_ARGUMENTS,
+    threadgroup uchar *shared [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    RECURRENT_OUTPUT_OPERANDS;
+    uint rows = uint(SEISMIC_DIM_M);
+    projection::LaneNorm<decltype(in)> x{in};
+    PROJECTION_FOR_ROWS(rows,
+        projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>(
+            x, out, w, rows, uint(SEISMIC_DIM_H), k, tile, shared, simdgroups, sg, lane));
+}
+#endif
+
+#ifdef SEISMIC_FORMING_GATED_DELTA_OUTPUT_BATCH
+template <uint BATCH_ROWS>
+kernel void gated_delta_output_batch(RECURRENT_OUTPUT_ARGUMENTS,
+    threadgroup uchar *shared [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    RECURRENT_OUTPUT_OPERANDS;
+    projection::LaneNorm<decltype(in)> x{in};
+    projection::gemv_batch_runtime<packets::W0, BATCH_ROWS>(x, out, w,
+        uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_H), k, tile, shared, simdgroups, sg, lane);
+}
+#endif
+
+#ifdef SEISMIC_FORMING_GATED_DELTA_OUTPUT_STAGE
+kernel void gated_delta_output_stage(RECURRENT_OUTPUT_ARGUMENTS,
+    uint item [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    PROJECTION_NORMALIZE_SHARED(norms);
+    RECURRENT_OUTPUT_OPERANDS;
+    projection::device_normalize<32>(in, item, normalized, k, norms, thread_index);
+}
+#endif
+
+#define RECURRENT_OUTPUT_GEMM(TM, TN, SPLIT, PARTIALS)                                  \
+    PROJECTION_GEMM_SHARED(shared, TM, TN);                                             \
+    RECURRENT_OUTPUT_OPERANDS;                                                          \
+    projection::Plain<activation, projection::AllRows> x{normalized, k, 1, k, {}};      \
+    const uint m = uint(SEISMIC_DIM_M), n = uint(SEISMIC_DIM_H);                        \
+    if (SPLIT == 1)                                                                     \
+        projection::gemm<packets::W0, TM, TN>(x, out, w, m, n, k, tile.y, tile.x, shared, sg, lane); \
+    else                                                                                \
+        projection::gemm_part<packets::W0, TM, TN>(x, PARTIALS, w, m, n, k, SPLIT, tile.z, tile.y, tile.x, \
+            shared, sg, lane)
+
+// 17..64 rows: the fixed small-row tile and split.
+#ifdef SEISMIC_FORMING_GATED_DELTA_OUTPUT_GEMM_SMALL
+kernel void gated_delta_output_gemm_small(RECURRENT_OUTPUT_ARGUMENTS,
+    uint3 tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    RECURRENT_OUTPUT_GEMM(projection::small_tile_m, projection::small_tile_n, projection::small_split,
+        small_partials);
+}
+#endif
+
+#ifdef SEISMIC_FORMING_GATED_DELTA_OUTPUT_FINALIZE_SMALL
+kernel void gated_delta_output_finalize_small(RECURRENT_OUTPUT_ARGUMENTS,
+    uint index [[thread_position_in_grid]]) {
+    RECURRENT_OUTPUT_OPERANDS;
+    projection::gemm_reduce(out, small_partials, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_H), projection::small_split,
+        index);
+}
+#endif
+
+#ifdef SEISMIC_FORMING_GATED_DELTA_OUTPUT_GEMM
+template <uint TILE_M, uint TILE_N>
+kernel void gated_delta_output_gemm(RECURRENT_OUTPUT_ARGUMENTS,
+    uint3 tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    RECURRENT_OUTPUT_GEMM(TILE_M, TILE_N, uint(SEISMIC_RUNTIME_SPLIT), partials);
+}
+#endif
+
+#ifdef SEISMIC_FORMING_GATED_DELTA_OUTPUT_FINALIZE
+kernel void gated_delta_output_finalize(RECURRENT_OUTPUT_ARGUMENTS,
+    uint index [[thread_position_in_grid]]) {
+    RECURRENT_OUTPUT_OPERANDS;
+    projection::gemm_reduce(out, partials, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_H),
+        uint(SEISMIC_RUNTIME_SPLIT), index);
+}
+#endif

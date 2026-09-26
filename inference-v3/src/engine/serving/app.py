@@ -1,0 +1,114 @@
+"""HTTP routes adapt validated chat work; the worker owns all model execution."""
+
+import asyncio
+import logging
+from contextlib import aclosing, asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from engine.platform.host.worker import WorkerUnavailable
+from engine.serving.requests import ChatRequest
+from engine.serving.responses import ChatResponse, sse
+from engine.serving.runtime import Config
+from engine.serving.session import ChatFinished, ChatService
+from templates import NativeError
+
+logger = logging.getLogger(__name__)
+
+
+def error_payload(message: str, kind="invalid_request_error") -> dict:
+    return dict(error=dict(message=message, type=kind))
+
+
+def create_app(config: Config) -> FastAPI:
+    @asynccontextmanager
+    async def lifetime(app):
+        service = await ChatService.open(config)
+        app.state.service = service
+        try:
+            yield
+        finally:
+            await service.close()
+
+    app = FastAPI(title="Magnitude inference", lifespan=lifetime)
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid_input(request, error):
+        return JSONResponse(error_payload(str(error)), status_code=422)
+
+    @app.exception_handler(WorkerUnavailable)
+    async def unavailable(request, error):
+        return JSONResponse(error_payload(str(error), "server_error"), status_code=503)
+
+    def ready() -> ChatService:
+        return app.state.service
+
+    @app.get("/health")
+    async def health():
+        service = ready()
+        await asyncio.wrap_future(service.worker.call(lambda owner: None))
+        return {
+            **service.properties.model_dump(mode="json"),
+            "templates": await asyncio.to_thread(service.template.describe),
+        }
+
+    @app.get("/v1/models")
+    async def models():
+        return dict(
+            object="list",
+            data=[dict(id=ready().model, object="model", created=0, owned_by="magnitude")],
+        )
+
+    @app.post("/v1/chat/completions")
+    async def completions(body: ChatRequest):
+        service = ready()
+        if body.model != service.model:
+            return JSONResponse(error_payload("requested model is not loaded"), status_code=404)
+        try:
+            prompt = await service.prepare_async(body)
+        except (ValueError, TypeError, NativeError) as error:
+            return JSONResponse(error_payload(str(error)), status_code=400)
+        response = ChatResponse(body.model)
+
+        async def stream():
+            try:
+                yield sse(response.chunk({"role": "assistant"}))
+                async with aclosing(service.events(body, prompt)) as events:
+                    async for event in events:
+                        if isinstance(event, ChatFinished):
+                            yield sse(response.chunk({}, event.reason))
+                            if body.stream_options.include_usage:
+                                yield sse(response.terminal(event))
+                            yield sse("[DONE]")
+                        else:
+                            yield sse(response.semantic(event, retain=False))
+            except (ValueError, TypeError, RuntimeError) as error:
+                logger.exception("streaming generation failed")
+                yield sse(error_payload(str(error), "server_error"))
+                yield sse("[DONE]")
+            finally:
+                prompt.close()
+
+        if body.stream:
+            return StreamingResponse(
+                stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        try:
+            async with aclosing(service.events(body, prompt)) as events:
+                async for event in events:
+                    if isinstance(event, ChatFinished):
+                        return JSONResponse(response.complete(event))
+                    response.semantic(event, retain=True)
+        except (ValueError, TypeError) as error:
+            return JSONResponse(error_payload(str(error)), status_code=400)
+        except RuntimeError as error:
+            return JSONResponse(error_payload(str(error), "server_error"), status_code=500)
+        finally:
+            prompt.close()
+        return JSONResponse(error_payload("generation ended without completion"), status_code=500)
+
+    return app

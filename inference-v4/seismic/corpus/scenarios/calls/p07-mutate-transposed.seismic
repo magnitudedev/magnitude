@@ -1,0 +1,9 @@
+# origin: C13:p07
+# invoke: i32[2,3]=zero
+fn fill_coords[M, N](x: &mut tensor[M, N] i32):
+    for i in 0..M:
+        for j in 0..N:
+            x[i, j] = i32(i) * 10 + i32(j)
+
+fn probe(out: &mut tensor[2, 3] i32):
+    fill_coords(out.T)

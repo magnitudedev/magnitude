@@ -1,0 +1,13 @@
+# origin: C14:s14
+# invoke: f32[5]=rand(50) ; bool:true
+# invoke: f32[5]=rand(50) ; bool:false
+fn probe[N](x: &tensor[N] f32, c: bool) -> tensor[N] f32:
+    let mut t = tensor[N] f32
+    for i in 0..N:
+        t[i] = x[i]
+    if c:
+        let mut u = tensor[N] f32
+        for i in 0..N:
+            u[i] = x[i] * x[i]
+        t = u
+    return t

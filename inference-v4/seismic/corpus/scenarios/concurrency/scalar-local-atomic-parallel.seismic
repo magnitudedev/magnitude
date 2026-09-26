@@ -1,0 +1,8 @@
+# origin: C17:scalar_local_atomic
+# cell: atomic-scalar-local/parallel
+# rejected: "Atomic"
+fn probe[N](x: &tensor[N] i32) -> i32:
+    let mut s = 0
+    parallel for i in 0..N:
+        atomic(add, s, x[i])
+    return s

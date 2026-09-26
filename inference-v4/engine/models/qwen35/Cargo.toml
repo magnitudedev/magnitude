@@ -1,0 +1,10 @@
+[package]
+name = "magnitude-model-qwen35"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+magnitude-artifacts = { path = "../../artifacts" }
+magnitude-model-contracts = { path = "../../model-contracts" }
+sha2 = "=0.11.0"

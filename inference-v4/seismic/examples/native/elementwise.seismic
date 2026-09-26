@@ -1,0 +1,58 @@
+# Native versions of representative elementwise operations from seismic-std.
+# The portable bodies remain the operation contracts and remain available via
+# `for_device`; callers opt into these implementations with
+# `native_for_device`.
+
+fn add_f32[M, N](x: &tensor[M, N] f32, y: &tensor[M, N] f32, result: &mut tensor[M, N] f32):
+    parallel for row in 0..M:
+        parallel for column in 0..N:
+            result[row, column] = x[row, column] + y[row, column]
+
+native add_f32 for metal from "metal/add_f32.metal":
+    launch add_f32:
+        threadgroups (ceil_div(M * N, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+fn add_owned_f32[M, N](x: &tensor[M, N] f32, y: &tensor[M, N] f32) -> tensor[M, N] f32:
+    let mut result = zeros_like(x)
+    parallel for row in 0..M:
+        parallel for column in 0..N:
+            result[row, column] = x[row, column] + y[row, column]
+    return result
+
+native add_owned_f32 for metal from "metal/add_owned_f32.metal":
+    launch add_owned_f32:
+        threadgroups (ceil_div(M * N, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+fn scale_f32[M, N](x: &tensor[M, N] f32, factor: f32, result: &mut tensor[M, N] f32):
+    parallel for row in 0..M:
+        parallel for column in 0..N:
+            result[row, column] = x[row, column] * factor
+
+native scale_f32 for metal from "metal/scale_f32.metal":
+    launch scale_f32:
+        threadgroups (ceil_div(M * N, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+fn silu_f32[M, N](x: &tensor[M, N] f32, result: &mut tensor[M, N] f32):
+    parallel for row in 0..M:
+        parallel for column in 0..N:
+            let value = x[row, column]
+            result[row, column] = value / (1.0 + exp(-value))
+
+native silu_f32 for metal from "metal/silu_f32.metal":
+    launch silu_f32:
+        threadgroups (ceil_div(M * N, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# One checked operation prepared under different concrete element bindings.
+# Its native implementation uses the generated representation descriptors
+# rather than assuming a storage type from the logical shape.
+fn read_first[N](x: &tensor[N] E, result: &mut tensor[1] f32):
+    result[0] = f32(x[0])
+
+native read_first for metal from "metal/read_first.metal":
+    launch read_first:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)

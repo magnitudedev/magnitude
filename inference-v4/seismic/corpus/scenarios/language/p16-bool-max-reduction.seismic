@@ -1,0 +1,4 @@
+# origin: C1:p16
+# rejected: "i32("
+fn s[N](x: &tensor[N] f32) -> bool:
+    return reduce(x > 2.0, 0, max)

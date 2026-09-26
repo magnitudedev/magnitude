@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "magnitude-roofline"
+version = "0.1.0"
+description = "Persistent model performance measurement and evidence browser"
+requires-python = ">=3.12"
+dependencies = ["magnitude-formula-performance", "pydantic>=2.13,<3", "textual>=1,<9"]
+
+[tool.uv.sources]
+magnitude-formula-performance = { path = "../formula-performance", editable = true }
+
+[project.scripts]
+roofline = "roofline.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/roofline"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "../src", "../formula-performance/src"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pyright]
+include = ["src"]
+extraPaths = ["src", "../src"]
+typeCheckingMode = "basic"

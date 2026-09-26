@@ -1,0 +1,10 @@
+# origin: test:validation:programs/scalar-semantics.seismic:changed_source
+# invoke changed_source: f32[4]=1,2,3,4 ; f32[4]=zero
+fn changed_source(x: tensor[4] f32, result: tensor[4] f32) -> tensor[4] f32:
+    let snapshot = to_owned(x)
+    let mut source = x
+    let mut output = result
+    for i in 0..4:
+        output[i] = snapshot[i] * 2.0 + 1.0
+        source[i] = 0.0
+    return output

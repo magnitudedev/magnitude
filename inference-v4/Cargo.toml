@@ -1,0 +1,101 @@
+[workspace]
+resolver = "2"
+members = [
+  "solver",
+  "solver/lab",
+  "engine",
+  "engine/artifacts",
+  "engine/chat",
+  "engine/generation",
+  "engine/service",
+  "engine/model-batching",
+  "engine/model-contracts",
+  "engine/model-executor",
+  "engine/model-kernels",
+  "engine/model-state",
+  "engine/models/qwen35",
+  "engine/templates",
+  "seismic-std",
+  "seismic/lang",
+  "seismic/ir",
+  "seismic/native-target",
+  "seismic/native-cpu",
+  "seismic/estimator/core",
+  "seismic/estimator/metal",
+  "seismic/backends/metal",
+  "seismic/backends/cpu",
+  "seismic/backends/cuda",
+  "seismic/backends/vulkan",
+  "seismic/cli",
+  "seismic/compiler",
+  "seismic/runtime",
+  "seismic/api",
+  "seismic/build",
+  "seismic/corpus",
+  "seismic/native-tests",
+  "seismic/frontends/python",
+]
+default-members = [
+  "solver",
+  "solver/lab",
+  "engine",
+  "engine/templates",
+  "seismic-std",
+  "seismic/lang",
+  "seismic/ir",
+  "seismic/native-target",
+  "seismic/native-cpu",
+  "seismic/estimator/core",
+  "seismic/estimator/metal",
+  "seismic/backends/metal",
+  "seismic/backends/cpu",
+  "seismic/backends/cuda",
+  "seismic/cli",
+  "seismic/compiler",
+  "seismic/runtime",
+  "seismic/api",
+  "seismic/build",
+  "seismic/corpus",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+seismic-estimator-metal = { path = "seismic/estimator/metal" }
+seismic-ir = { path = "seismic/ir" }
+seismic-native-target = { path = "seismic/native-target" }
+seismic-native-cpu = { path = "seismic/native-cpu" }
+seismic-estimator = { path = "seismic/estimator/core" }
+serde = { version = "=1.0.229", features = ["derive"] }
+postcard = { version = "=1.1.3", default-features = false, features = ["use-std"] }
+seismic-std = { path = "seismic-std" }
+seismic-lang = { path = "seismic/lang" }
+seismic-metal = { path = "seismic/backends/metal" }
+seismic-cpu = { path = "seismic/backends/cpu" }
+seismic-cuda = { path = "seismic/backends/cuda" }
+seismic-vulkan = { path = "seismic/backends/vulkan" }
+seismic-compiler = { path = "seismic/compiler" }
+seismic-runtime = { path = "seismic/runtime" }
+seismic = { path = "seismic/api" }
+seismic-build = { path = "seismic/build" }
+
+[profile.dev]
+debug = "line-tables-only"
+
+# CPU native kernels compile into the crates below; unoptimized, they are
+# unusable even in tests. The generic Seismic CPU library code is
+# instantiated in the kernel crate, so its level is the kernel crate's.
+[profile.dev.package.magnitude-model-kernels]
+opt-level = 3
+
+[profile.dev.package.seismic-native-cpu]
+opt-level = 3
+
+[profile.dev.package.seismic-native-tests]
+opt-level = 3
+
+[profile.release]
+debug = 1

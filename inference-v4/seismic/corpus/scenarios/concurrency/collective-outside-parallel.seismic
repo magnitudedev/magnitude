@@ -1,0 +1,9 @@
+# origin: C17:simd_outside_parallel C17:lane_serial
+# cell: intrinsic-subgroup/sl
+# invoke lane_serial: f32[1]=1.5 ; f32[1]=zero
+# pin: out = f32[1]=1.5
+fn lane_serial(x: &tensor[1] f32, out: &mut tensor[1] f32):
+    out[0] = x[0]
+
+lower lane_serial(x: &tensor[1] f32, out: &mut tensor[1] f32) for metal requires metal.subgroup:
+    out[0] = metal.subgroup.simd_max(x[0])

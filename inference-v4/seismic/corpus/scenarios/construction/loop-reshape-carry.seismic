@@ -1,0 +1,7 @@
+# origin: C11:loop_reshape_carry
+# invoke: f32[2,3]=1,2,3,4,5,6
+fn probe(x: &tensor[2,3] f32) -> tensor[2,3] f32:
+    let mut y = to_owned(x)
+    for k in 0..2:
+        y = reshape(y.T, (2,3))
+    return y

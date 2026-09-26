@@ -1,0 +1,38 @@
+# V3 Qwen attention preparation, including interleaved temporal/height/width
+# rotary coordinates. Projection output is interleaved [head][query,gate][width].
+# Normalization and rotation compute in F32 and write compact query/key tensors.
+# Shared tensor equation; ordinary function composition, no new realization choice.
+fn norm_rotary[P, S](x: &tensor[2 * P + S] A, wt: &tensor[2 * P + S] f32,
+    coordinates: &tensor[4] i32, components: &tensor[P] i32,
+    base: f32, epsilon: f32) -> tensor[2 * P + S] f32:
+    let xf = f32(x)
+    let ss = sum_any_order(xf * xf)
+    let inv = rsqrt(ss / f32(2 * P + S) + epsilon)
+    let normalized = xf * inv * wt
+    let mut rotated = zeros_like(x, dtype=f32)
+    for i in 0..2 * P + S:
+        if i < 2 * P:
+            let pair = i % P
+            let angle = f32(coordinates[components[pair]]) * exp(-log(base) * f32(2 * pair) / f32(2 * P))
+            if i < P:
+                rotated[i] = normalized[i] * cos(angle) - normalized[i + P] * sin(angle)
+            else:
+                rotated[i] = normalized[i] * cos(angle) + normalized[i - P] * sin(angle)
+        else:
+            rotated[i] = normalized[i]
+    return rotated
+
+fn rotary_prepare[Q, H, KV, P, S](query_gate: &tensor[Q, H * 2 * (2 * P + S)] A,
+    key: &tensor[Q, KV * (2 * P + S)] A, query_norm: &tensor[2 * P + S] f32, key_norm: &tensor[2 * P + S] f32,
+    coordinates: &tensor[Q, 4] i32, query: &mut tensor[Q, H, 2 * P + S] A,
+    prepared_key: &mut tensor[Q, KV, 2 * P + S] A, gate: &mut tensor[Q, H * (2 * P + S)] A,
+    components: &tensor[P] i32, base: f32, epsilon: f32):
+    parallel for rows in 0..Q:
+        parallel for heads in 0..H:
+            let x = query_gate[rows, heads * 2 * (2 * P + S) : heads * 2 * (2 * P + S) + (2 * P + S)]
+            query[rows, heads] = norm_rotary(x, query_norm, coordinates[rows], components, base, epsilon)
+            gate[rows, heads * (2 * P + S) : (heads + 1) * (2 * P + S)] = query_gate[rows, heads * 2 * (2 * P + S) + (2 * P + S) : (heads + 1) * 2 * (2 * P + S)]
+    parallel for rows in 0..Q:
+        parallel for heads in 0..KV:
+            let x = key[rows, heads * (2 * P + S) : (heads + 1) * (2 * P + S)]
+            prepared_key[rows, heads] = norm_rotary(x, key_norm, coordinates[rows], components, base, epsilon)

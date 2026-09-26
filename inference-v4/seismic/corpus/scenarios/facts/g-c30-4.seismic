@@ -1,0 +1,7 @@
+# origin: C30:G-C30-4
+# invoke: i32[2]=seq ; i32[3]=seq ; index:0
+# expect: invalid-invocation
+# invoke: i32[4]=seq ; i32[1]=seq ; index:2
+# pin: result = i32[]=2
+fn probe[N, M](x: &tensor[N] i32, y: &tensor[M] i32, i: index[N - M]) -> i32:
+    return x[i]

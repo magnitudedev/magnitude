@@ -1,0 +1,103 @@
+// gated_delta_output: the gated per-head RMS·SiLU(z) prologue over the
+// mixed rows, the output projection, and the F32 residual. The Vulkan form of
+// `metal/gated_delta_output.metal` over `lib/projection/projection.glsl`: the GEMV
+// class reduces each head's norm across the lanes that stage it; the GEMM
+// class runs a pre-pass (one subgroup per row and head) that writes the
+// prologue output to scratch, then the GEMM with split-K.
+#include "lib/core/activation.glsl"
+#include "lib/projection/projection.glsl"
+
+#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#define OUTPUT_ACT ELEMENT_ACT
+#else
+#error "gated_delta_output requires a bf16 or f16 activation"
+#endif
+#if defined(SEISMIC_RECURRENT_NORM_REPRESENTATION_F32)
+#define OUTPUT_NORM ELEMENT_F32
+#elif defined(SEISMIC_RECURRENT_NORM_REPRESENTATION_F16)
+#define OUTPUT_NORM ELEMENT_F16
+#elif defined(SEISMIC_RECURRENT_NORM_REPRESENTATION_BF16)
+#define OUTPUT_NORM ELEMENT_BF16
+#else
+#error "gated_delta_output requires a dense recurrent_norm"
+#endif
+
+#if defined(SEISMIC_OUTPUT_WEIGHT_REPRESENTATION_Q4K)
+#define OUTPUT_KIND PACKETS_Q4K
+#define OUTPUT_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_OUTPUT_WEIGHT)
+#elif defined(SEISMIC_OUTPUT_WEIGHT_REPRESENTATION_Q5K)
+#define OUTPUT_KIND PACKETS_Q5K
+#define OUTPUT_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_OUTPUT_WEIGHT)
+#elif defined(SEISMIC_OUTPUT_WEIGHT_REPRESENTATION_Q6K)
+#define OUTPUT_KIND PACKETS_Q6K
+#define OUTPUT_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_OUTPUT_WEIGHT)
+#elif defined(SEISMIC_OUTPUT_WEIGHT_REPRESENTATION_Q8G32S)
+#define OUTPUT_KIND PACKETS_Q8
+#define OUTPUT_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_OUTPUT_WEIGHT)
+#elif defined(SEISMIC_OUTPUT_WEIGHT_REPRESENTATION_BF16)
+#define OUTPUT_KIND PACKETS_BF16
+#define OUTPUT_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_OUTPUT_WEIGHT, 2)
+#elif defined(SEISMIC_OUTPUT_WEIGHT_REPRESENTATION_F16)
+#define OUTPUT_KIND PACKETS_F16
+#define OUTPUT_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_OUTPUT_WEIGHT, 2)
+#elif defined(SEISMIC_OUTPUT_WEIGHT_REPRESENTATION_F32)
+#define OUTPUT_KIND PACKETS_F32
+#define OUTPUT_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_OUTPUT_WEIGHT, 4)
+#else
+#error "unsupported gated_delta_output output_weight representation"
+#endif
+#if defined(SEISMIC_OUTPUT_WEIGHT_KIND_PACKED) && !defined(SEISMIC_OUTPUT_WEIGHT_LAYOUT_ROWS16)
+#error "gated_delta_output requires the rows16 layout for output_weight"
+#endif
+
+#define OUTPUT_K uint(SEISMIC_DIM_NV * SEISMIC_DIM_W)
+
+projection_prologue recurrent_output_input() {
+    return projection_gated_rms(OUTPUT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_MIXED), SEISMIC_MIXED_STRIDE_0,
+        SEISMIC_MIXED_STRIDE_1, SEISMIC_MIXED_STRIDE_2, SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION),
+        SEISMIC_PROJECTION_STRIDE_0, SEISMIC_PROJECTION_STRIDE_1, (2ul * SEISMIC_DIM_NK + SEISMIC_DIM_NV) * SEISMIC_DIM_W,
+        SEISMIC_PTR(SEISMIC_BUFFER_RECURRENT_NORM), SEISMIC_RECURRENT_NORM_STRIDE_0, OUTPUT_NORM,
+        element_word_f32(SEISMIC_PARAM_EPSILON), uint(SEISMIC_DIM_NV), uint(SEISMIC_DIM_W), 0ul);
+}
+
+projection_epilogue recurrent_output_output() {
+    return projection_residual(OUTPUT_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
+        SEISMIC_RESULT_0_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN), SEISMIC_HIDDEN_STRIDE_0,
+        SEISMIC_HIDDEN_STRIDE_1, 0ul);
+}
+
+projection_weights recurrent_output_weight() {
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_OUTPUT_WEIGHT), OUTPUT_GEOMETRY, OUTPUT_K, 0ul);
+}
+
+void gated_delta_output_gemv() {
+    const projection_weights w = recurrent_output_weight();
+    projection_gemv(OUTPUT_KIND, OUTPUT_KIND, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, PROJECTION_NORM_LANES,
+        recurrent_output_input(), recurrent_output_output(), w, w, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_H),
+        OUTPUT_K, gl_WorkGroupID.x);
+}
+
+void gated_delta_output_stage() {
+    // Workgroup (head, row).
+    projection_stage(recurrent_output_input(), gl_WorkGroupID.y * uint(SEISMIC_DIM_NV) + gl_WorkGroupID.x,
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED), OUTPUT_K);
+}
+
+void gated_delta_output_gemm() {
+    const projection_prologue x = projection_plain(OUTPUT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED),
+        uint64_t(OUTPUT_K), 1ul, OUTPUT_K, 0ul);
+    const uint m = uint(SEISMIC_DIM_M), n = uint(SEISMIC_DIM_H);
+#if SEISMIC_TUNE_SPLIT == 1
+    projection_gemm(OUTPUT_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, recurrent_output_output(),
+        recurrent_output_weight(), m, n, OUTPUT_K, gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
+#else
+    projection_gemm_part(OUTPUT_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x,
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), recurrent_output_weight(), m, n, OUTPUT_K, SEISMIC_TUNE_SPLIT,
+        gl_WorkGroupID.z, gl_WorkGroupID.y, gl_WorkGroupID.x);
+#endif
+}
+
+void gated_delta_output_finalize() {
+    projection_gemm_finalize(recurrent_output_output(), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS),
+        uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_H), SEISMIC_TUNE_SPLIT, gl_GlobalInvocationID.x);
+}

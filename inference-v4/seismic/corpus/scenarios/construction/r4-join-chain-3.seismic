@@ -1,0 +1,12 @@
+# origin: C11:r4_join_chain_3
+# invoke: f32:1.5 ; bool:true ; bool:false ; bool:true
+fn probe(x: f32, c0: bool, c1: bool, c2: bool) -> f32:
+    let mut v = x
+    if c0:
+        v = v + 1.0
+    if c1:
+        v = v + 1.0
+    if c2:
+        v = v + 1.0
+    let w = v * 2.0
+    return w
