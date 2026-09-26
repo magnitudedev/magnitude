@@ -39,7 +39,7 @@ pub use isa::Neon;
 pub use isa::{X86V4Vnni, X86V2, X86V3, X86V4};
 
 /// The version of this library, part of every CPU implementation digest.
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+cpu-library-2");
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+cpu-library-3");
 
 /// A bound weight operand: a tensor of a weight representation whose rows
 /// are read through its resolved components.

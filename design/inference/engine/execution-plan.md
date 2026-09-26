@@ -56,7 +56,9 @@ control tables packed by the batch builder. Every entry is validated with one en
 tolerance, a defect guard derived from an error model, not the precision gate: it admits every arithmetic option an
 entry declares (down to q8_1 activations) with margin, and is looser than anything the end-to-end
 precision gate could accept, so tuning never rejects a configuration the gate would pass; the gate
-itself is the end-to-end qualification. Every tensor an entry writes
+itself is the end-to-end qualification. Because the tuner may choose any declared option, an entry
+declares only arithmetic options that pass the gate whichever one wins: on CPU the recurrent output
+projection and the recurrent projection's alpha and beta gates stay exact F32. Every tensor an entry writes
 in place (recurrent state arenas, KV history, routing tables, selection outputs) is case-owned
 state: its written region is restored before each configuration's validation run, and real state
 is never bound. An entry that declares parameters without a case fails preparation; there are no

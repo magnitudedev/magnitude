@@ -387,6 +387,62 @@ fn prefill_matches_portable_body_on(device: &Device, case: &Case) {
     }
 }
 
+/// Qwen3.5-35B-A3B: two key/value heads of eight query heads each. The
+/// target stores its history in k8v4; the draft head's dense history is the
+/// only dense attention at this group size.
+const QWEN35B: Geometry = Geometry {
+    kv: 2,
+    g: 8,
+    p: 32,
+    s: 192,
+};
+
+#[test]
+fn eight_query_group_decode_matches_host_model() {
+    let case = Case::new(QWEN35B, 128, 2, &decode_rows(40), 13);
+    let expected = case.expected();
+    for device in devices() {
+        for (config, specialization) in decode_specializations_on(
+            &device,
+            QWEN35B,
+            &[(32, 16, 4), (64, 8, 8), (128, 16, 4), (32, 16, 8)],
+        ) {
+            let kernel = decode_kernel(&device, &specialization);
+            let mut bound = Bound::new(&device, &case);
+            let gated = run_decode(&kernel, &mut bound, &case);
+            check(
+                &format!("group-8 decode {config}"),
+                &case,
+                &gated,
+                &bound,
+                &expected,
+            );
+        }
+    }
+}
+
+#[test]
+fn eight_query_group_prefill_matches_host_model() {
+    let case = Case::new(QWEN35B, 400, 2, &prefill_rows(20, 300), 29);
+    let expected = case.expected();
+    for device in devices() {
+        for (config, specialization) in
+            prefill_specializations_on(&device, QWEN35B, &[(16, 1), (8, 256), (16, 256)])
+        {
+            let kernel = prefill_kernel(&device, &specialization);
+            let mut bound = Bound::new(&device, &case);
+            let gated = run_prefill(&kernel, &mut bound, &case);
+            check(
+                &format!("group-8 prefill {config}"),
+                &case,
+                &gated,
+                &bound,
+                &expected,
+            );
+        }
+    }
+}
+
 /// Device time of one decode layer's attention at Qwen3.5-4B geometry
 /// (indicative only on a shared development GPU): `cargo test --release
 /// --test attention -- --ignored --nocapture decode_timing`. Context 1 (the

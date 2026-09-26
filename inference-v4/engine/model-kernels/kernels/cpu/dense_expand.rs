@@ -62,20 +62,20 @@ fn dense_expand_rows<L: Isa, E: Elements>(
         cx.scratch_quantized()
             .slice::<seismic::cpu::quant::Q8Block>(0, o * blocks)
     });
-    let mut gate = [0.0f32; projection::MAX_ROWS];
-    let mut up = [0.0f32; projection::MAX_ROWS];
-    let (gate, up) = (&mut gate[..rows.len()], &mut up[..rows.len()]);
-    for row in 0..o {
-        let x = &normalized[row * h..(row + 1) * h];
-        let q8 = quantized.map(|q8| &q8[row * blocks..(row + 1) * blocks]);
-        projection::project_arithmetic(&gate_weight, rows.start, x, q8, gate);
-        projection::project_arithmetic(&up_weight, rows.start, x, q8, up);
-        // SAFETY: each work item writes its own columns of every row.
-        let out = unsafe { result.span_mut([row, rows.start], rows.len()) };
-        for ((target, gate), up) in out.iter_mut().zip(gate.iter()).zip(up.iter()) {
-            let gate = activation::publish::<E::A>(*gate);
-            let activated = activation::publish::<E::A>(activation::silu(gate));
-            *target = E::A::narrow(activated * activation::publish::<E::A>(*up));
-        }
-    }
+    projection::project_pair_staged_arithmetic(
+        &gate_weight,
+        &up_weight,
+        rows.clone(),
+        normalized,
+        quantized,
+        |row, gate, up| {
+            // SAFETY: each work item writes its own columns of every row.
+            let out = unsafe { result.span_mut([row, rows.start], rows.len()) };
+            for ((target, gate), up) in out.iter_mut().zip(gate.iter()).zip(up.iter()) {
+                let gate = activation::publish::<E::A>(*gate);
+                let activated = activation::publish::<E::A>(activation::silu(gate));
+                *target = E::A::narrow(activated * activation::publish::<E::A>(*up));
+            }
+        },
+    );
 }

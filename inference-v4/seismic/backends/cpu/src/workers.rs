@@ -31,6 +31,10 @@ use std::thread::Thread;
 use crate::buffer::{AllocationFailure, Buffer};
 use crate::profile::SCRATCH_ALIGNMENT;
 
+/// Chunks each active participant's share of a native step's items is split
+/// into: fewer, larger chunks keep a participant streaming adjacent rows;
+/// more chunks let faster participants take over a slower one's work.
+const CLAIMS_PER_PARTICIPANT: u64 = 4;
 /// Iterations a waiting participant spins on the condition.
 const SPIN_LIMIT: u32 = 1 << 10;
 /// Further checks, each after yielding the core, before it parks. Yielding
@@ -515,13 +519,22 @@ impl Job for NativeJob<'_> {
                         step.shared_bytes as usize,
                     )
                 };
-                // Participant `ordinal` owns item `ordinal`; the items past
-                // the first `active` are claimed. A step with no more items
-                // than participants touches no shared counter.
-                let mut item = ordinal as u64;
-                while item < step.items && !shared.cancelled() {
-                    self.steps.run(index, item, bytes);
-                    item =
+                // Items run in contiguous chunks of about a quarter of a
+                // participant's share: consecutive items stream adjacent
+                // weight rows, which a participant's prefetchers follow,
+                // while later chunks still balance the load. Participant
+                // `ordinal` owns chunk `ordinal`; the chunks past the first
+                // `active` are claimed. A step with no more chunks than
+                // participants touches no shared counter.
+                let chunk = (step.items / (active as u64 * CLAIMS_PER_PARTICIPANT)).max(1);
+                let chunks = step.items.div_ceil(chunk);
+                let mut claim = ordinal as u64;
+                while claim < chunks && !shared.cancelled() {
+                    let first = claim * chunk;
+                    for item in first..(first + chunk).min(step.items) {
+                        self.steps.run(index, item, bytes);
+                    }
+                    claim =
                         active as u64 + self.state[index].claimed.fetch_add(1, Ordering::Relaxed);
                 }
             }

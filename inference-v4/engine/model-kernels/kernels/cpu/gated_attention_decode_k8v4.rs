@@ -110,7 +110,7 @@ fn gated_attention_decode_k8v4_attend<L: Isa, E: Elements>(
     let rows = Fresh { keys, values: cx.arg_value() };
     let (key_codes, key_coefficients) = (cx.arg_history_key_codes(), cx.arg_history_key_coefficients());
     let (value_codes, value_coefficients) = (cx.arg_history_value_codes(), cx.arg_history_value_coefficients());
-    attention::attend(
+    attention::attend_affine(
         &mut state,
         heads,
         kv_head,
@@ -122,22 +122,8 @@ fn gated_attention_decode_k8v4_attend<L: Isa, E: Elements>(
         fresh,
         range,
         &rows,
-        |token, out| {
-            attention::affine_decode(
-                key_codes.row([token, kv_head, 0]),
-                key_coefficients.row([token, kv_head, 0]),
-                KEY_BITS,
-                out,
-            )
-        },
-        |token, out| {
-            attention::affine_decode(
-                value_codes.row([token, kv_head, 0]),
-                value_coefficients.row([token, kv_head, 0]),
-                VALUE_BITS,
-                out,
-            )
-        },
+        |token| (key_codes.row([token, kv_head, 0]), key_coefficients.row([token, kv_head, 0])),
+        |token| (value_codes.row([token, kv_head, 0]), value_coefficients.row([token, kv_head, 0])),
     );
 }
 

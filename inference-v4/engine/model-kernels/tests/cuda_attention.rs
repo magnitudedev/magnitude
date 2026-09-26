@@ -124,6 +124,55 @@ fn cuda_qwen_geometry_decode_and_prefill_match_host_model() {
     }
 }
 
+#[test]
+fn cuda_eight_query_group_decode_and_prefill_match_host_model() {
+    let Some(device) = cuda() else { return };
+    for context in [256, 4096] {
+        let case = Case::new(
+            QWEN35B,
+            context + 128,
+            2,
+            &decode_rows(context as i32 - 40),
+            5,
+        );
+        let expected = case.expected();
+        for config in DECODE_CONFIGS {
+            let kernel = cuda_decode(&device, QWEN35B, config);
+            let mut bound = Bound::new(&device, &case);
+            let gated = run_decode(&kernel, &mut bound, &case);
+            check(
+                &format!("cuda group-8 decode context {context} {config:?}"),
+                &case,
+                &gated,
+                &bound,
+                &expected,
+            );
+        }
+    }
+    for (rows, history) in [(40, 300), (128, 1000)] {
+        let case = Case::new(
+            QWEN35B,
+            history as usize + 256,
+            2,
+            &prefill_rows(rows, history),
+            7,
+        );
+        let expected = case.expected();
+        for warps in [4, 2] {
+            let kernel = cuda_prefill(&device, QWEN35B, warps);
+            let mut bound = Bound::new(&device, &case);
+            let gated = run_prefill(&kernel, &mut bound, &case);
+            check(
+                &format!("cuda group-8 prefill {rows} rows WARPS={warps}"),
+                &case,
+                &gated,
+                &bound,
+                &expected,
+            );
+        }
+    }
+}
+
 /// Device time per call at the 4B geometry: decode of one row at contexts
 /// 256 / 4k / 16k and a 128-row prefill chunk after 1k of history. Each
 /// rotation entry owns its histories, so rotations exceed the 24 MiB L2 at
