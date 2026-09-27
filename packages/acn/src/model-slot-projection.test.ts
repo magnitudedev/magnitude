@@ -22,8 +22,8 @@ describe("model slot projection", () => {
     expect(modelSlotActions(available, { _tag: "Unloaded" })).toEqual(["Load"])
     expect(modelSlotActions(available, {
       _tag: "Loading",
-      stage: "loading",
-      progress: Option.none(),
+      stage: "loading_weights",
+      fraction: 0,
       plannedAllocation: Option.none(),
     })).toEqual(["Stop"])
     expect(modelSlotActions(available, {

@@ -1,0 +1,10 @@
+# origin: H-39
+# invoke: f32[4]=seq ; range:1..4
+fn element(x: &tensor[4] f32, i: index[4]) -> f32:
+    return x[i]
+
+fn probe(x: &tensor[4] f32, times: range[4]) -> f32:
+    let mut total = 0.0
+    for i in times:
+        total = total + element(x, i)
+    return total

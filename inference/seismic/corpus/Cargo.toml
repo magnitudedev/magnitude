@@ -1,0 +1,21 @@
+[package]
+name = "seismic-corpus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+# One test target: generated scenario tests and the corpus-wide suites share
+# the public runner, and their module paths are the filters of the interim
+# checkpoints (`cargo test -p seismic-corpus library`, `... hygiene`).
+autotests = false
+
+[dependencies]
+seismic-lang.workspace = true
+
+[dev-dependencies]
+seismic.workspace = true
+seismic-std.workspace = true
+
+[[test]]
+name = "public"
+path = "tests/public.rs"

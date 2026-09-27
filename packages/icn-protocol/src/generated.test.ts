@@ -1,38 +1,23 @@
 import { describe, expect, it } from "vitest"
 import { Schema } from "effect"
 import {
-  BackendEligibilityReport,
   IcnInstallationDeclaration,
   IcnStartupRecord,
+  ModelLoadPlan,
 } from "./generated/schemas.js"
 
 describe("generated ICN bootstrap protocol", () => {
-  it("decodes the Rust eligibility discriminator and rejects the former duplicate", () => {
-    const decode = Schema.decodeUnknownSync(
-      Schema.parseJson(BackendEligibilityReport),
-    )
-    const report = decode(JSON.stringify({
-      schemaVersion: 1,
-      cuda: {
-        state: "usable",
-        driverApi: 12_000,
-        architectures: ["90"],
-        driverLibrary: "/host/libcuda.so.1",
-      },
-      vulkan: { state: "absent", diagnostic: "unavailable" },
-      metal: { state: "absent", diagnostic: "unavailable" },
+  it("decodes a load plan only with its execution device", () => {
+    const decode = Schema.decodeUnknownSync(Schema.parseJson(ModelLoadPlan))
+    const plan = decode(JSON.stringify({
+      contextWindowTokens: 262_144,
+      requiredMemoryBytes: 3_204_000_000,
+      device: { id: "metal:0000000100000abc", backend: "metal" },
     }))
-    expect(report.cuda.state).toBe("usable")
+    expect(plan.device.backend).toBe("metal")
     expect(() => decode(JSON.stringify({
-      schemaVersion: 1,
-      cuda: {
-        _tag: "usable",
-        driverApi: 12_000,
-        architectures: ["90"],
-        driverLibrary: "/host/libcuda.so.1",
-      },
-      vulkan: { _tag: "absent", diagnostic: "unavailable" },
-      metal: { _tag: "absent", diagnostic: "unavailable" },
+      contextWindowTokens: 262_144,
+      requiredMemoryBytes: 3_204_000_000,
     }))).toThrow()
   })
 
@@ -54,15 +39,11 @@ describe("generated ICN bootstrap protocol", () => {
       Schema.parseJson(IcnInstallationDeclaration),
     )({
       schemaVersion: 1,
-      backend: "cpu",
       nativeBuild: "native",
-      backendModuleAbi: "abi",
     })
     expect(JSON.parse(installation)).toEqual({
       schemaVersion: 1,
-      backend: "cpu",
       nativeBuild: "native",
-      backendModuleAbi: "abi",
     })
   })
 })

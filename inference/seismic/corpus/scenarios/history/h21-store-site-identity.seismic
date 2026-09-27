@@ -1,0 +1,11 @@
+# origin: H-21
+# invoke: f32[4]=seq
+fn store_into[N](dst: &mut tensor[N] f32, x: &tensor[N] f32):
+    dst[:] = x + 1.0
+
+fn probe[N](x: &tensor[N] f32) -> tensor[N] f32:
+    let mut a = tensor[N] f32
+    let mut b = tensor[N] f32
+    store_into(a, x)
+    store_into(b, a)
+    return b

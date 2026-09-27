@@ -1,0 +1,4 @@
+# origin: C11:r2_copy_param_symbolic
+# invoke: f32[4]=1,1,1,1
+fn probe[N](x: &tensor[N] f32) -> tensor[N] f32:
+    return to_owned(x)

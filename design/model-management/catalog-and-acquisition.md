@@ -1,14 +1,22 @@
 ---
 applies_to:
   - inference/catalog/**
-  - inference/crates/icn-catalog/**
-  - inference/crates/icn-models/**
-  - inference/crates/icn-contracts/src/inventory.rs
-  - inference/crates/icn-contracts/src/models.rs
+  - inference/service/catalog-tool/**
+  - inference/service/models/**
+  - inference/service/server/src/main.rs
+  - inference/service/contracts/src/inventory.rs
+  - inference/service/contracts/src/models.rs
   - packages/icn/src/models/**
   - packages/icn/src/events/**
   - packages/acn/src/local-model-**
   - packages/acn-protocol/src/schemas/model-state.ts
+  - packages/acn-protocol/src/schemas/local-model-projection.ts
+  - packages/ai/src/provider/model.ts
+  - packages/client-common/src/local-models/**
+  - packages/client-common/src/utils/model-presentation.ts
+  - cli/src/commands/inference-runtime.ts
+  - desktop/src/renderer.tsx
+  - web/src/components/model-center.tsx
 ---
 
 # Model catalog and acquisition
@@ -26,6 +34,11 @@ and do not infer command authorization or completion from cached projections.
 Catalog membership, artifact presence, download activity, package validation, assessment, provider
 offering, slot selection, and runtime residency remain separate facts.
 
+Live Hugging Face search and repository resolution are service-owned discovery queries. Search
+returns GGUF repositories with immutable commit identities; resolution returns the requested
+repository's immutable snapshot and GGUF file evidence. These queries do not change the release
+catalog or managed inventory, and catalog use does not depend on them.
+
 Catalog attribution across exact artifact or drafter changes follows
 [Intrinsic catalog target mapping](./intrinsic-target-mapping.md).
 
@@ -40,11 +53,10 @@ that date; every artifact variant inherits the model declaration's date. Each en
 `ModelServingConfiguration`, required package components, presentation, and ranking evidence.
 Published catalog rows reduce package sources to deduplicated HTTPS repository links for product
 presentation; package coordinates and bundle structure remain private.
-The reviewed context length is a local serving configuration, not a claim about the architecture's
-absolute maximum. Compact tiers may deliberately use a shorter context, such as 64K instead of
-100K, because longer context increases KV memory and decode cost and would undermine their role on
-resource-constrained machines.
-Every active model carries one model-level intelligence assessment on a single declared Artificial
+A catalog declaration names no context length. The serving profile's context is the target's
+supported maximum context from its GGUF metadata, the context the engine resolves and serves;
+memory is elastic, so a long supported context no longer reserves memory up front.
+Every active model carries one model-level intelligence assessment with its own declared Artificial
 Analysis Intelligence Index methodology version. A direct assessment records the observation date
 and canonical Artificial Analysis model URL. When no direct result exists, an estimate is a
 structurally distinct value that records its target scale, methodology, confidence, observation
@@ -79,6 +91,30 @@ Removing a model from the release catalog removes all its variants, revision pin
 inputs. Its former catalog IDs no longer resolve; removal does not alias them to a replacement
 model or delete downloaded artifacts. Catalog membership and physical artifact presence remain
 separate. Runtime catalog use performs no upstream discovery and does not follow mutable revisions.
+Deprecation, not removal, is how a release withdraws a model that users may have installed.
+
+### Support lifecycle
+
+Every model declaration states one reviewed support level, shared by all its variants:
+
+- **Supported**: intended to be available as a supported catalog model. Qualification evidence and
+  optimization status are tracked separately from this declaration.
+- **Disabled** with a non-empty reason: temporarily unavailable or not yet supported. A disabled
+  model is never recommended, offered, installed, or loaded. Its installed files remain identifiable
+  and removable.
+- **Deprecated** with a calendar date, a non-empty reason, and one required exact replacement
+  catalog configuration of a supported model. A deprecated model is never
+  recommended, offered as a provider model, admitted for installation, or loaded; ICN rejects
+  installation and serving with a typed deprecation failure that names the replacement. Its
+  declaration, planner inputs, and locked revisions stay in the release catalog, so an existing
+  installation remains identifiable. Clients report an installed copy as unsupported, name the
+  replacement, offer a one-step switch to it, and remove its files through ordinary catalog
+  removal. A lock update never advances a deprecated model's revisions.
+
+Support level and assessment are independent facts. Support is what the release promises for a
+model; assessment is what this device can do with it. A supported model can be `DoesNotFit`, and a
+model whose family the engine does not implement assesses `Incompatible` whatever its level. Such
+a catalog declaration is disabled until support is implemented and qualified.
 
 ## Package resolution
 
@@ -297,8 +333,12 @@ artifact mutations update the same materialized derivation.
 - Issued catalog configurations remain resolvable after deprecation.
 - Every catalog variant publishes the valid ISO calendar date inherited from its model declaration.
 - Every active catalog model publishes exactly one finite, non-negative intelligence assessment
-  with valid direct or estimated provenance on the catalog's declared Intelligence Index version.
+  with valid direct or estimated provenance and its own Intelligence Index methodology version.
 - Model intelligence and artifact-variant fidelity remain separate catalog authorities.
+- Every catalog model declares one support level; a deprecation's required replacement is an exact
+  configuration of a supported catalog model.
+- A deprecated model is never recommended, offered, installed, or loaded, keeps its locked
+  revisions, and its installed files remain removable.
 - Independently callable external Hugging Face packages without catalog attribution publish under
   their canonical `hf:` identity; other unattributed packages remain inventory only.
 - Installed inventory is derived without network access or hardware assessment.

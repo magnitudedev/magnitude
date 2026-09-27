@@ -33,24 +33,14 @@ import { resolveHuggingFaceCacheRoots } from "./hugging-face-cache";
 import { AcnServiceLifecycle } from "../service-lifecycle";
 
 const artifactProgress = (
-  artifact: "Base" | "Accelerator",
   event: Extract<ArtifactInstallationEvent, { readonly _tag: "Downloading" }>,
   plan: AcnInstallationPlan
-): AcnStartupProgress => {
-  const completedBeforeArtifact =
-    artifact === "Accelerator"
-      ? plan.inferenceEngineBytes - event.progress.totalBytes
-      : 0;
-  return {
-    completed: Math.min(
-      plan.inferenceEngineBytes,
-      completedBeforeArtifact + event.progress.acceptedBytes
-    ),
-    totalBytes: plan.inferenceEngineBytes,
-    unit: "Bytes",
-    attempt: Option.some(event.progress.attempt),
-  };
-};
+): AcnStartupProgress => ({
+  completed: Math.min(plan.inferenceEngineBytes, event.progress.acceptedBytes),
+  totalBytes: plan.inferenceEngineBytes,
+  unit: "Bytes",
+  attempt: Option.some(event.progress.attempt),
+});
 const defaultDataDir = () => join(homedir(), ".magnitude");
 
 const binarySource = (dataDir: string) => {
@@ -208,11 +198,7 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
                     plan: current.plan.value,
                   },
                   Option.some(
-                    artifactProgress(
-                      event.artifact,
-                      event.event,
-                      current.plan.value
-                    )
+                    artifactProgress(event.event, current.plan.value)
                   )
                 );
               }

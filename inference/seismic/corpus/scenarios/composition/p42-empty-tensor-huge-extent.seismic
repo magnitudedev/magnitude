@@ -1,0 +1,6 @@
+# origin: X1:P42
+# invoke: index:8589934591
+# pin: result = i32[]=3
+fn probe(n: index[8589934592]) -> i32:
+    let t = tensor[0, (n+1)*(n+1)] i32
+    return 3

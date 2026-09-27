@@ -1,397 +1,200 @@
-import {
-  readdir,
-  rm,
-  stat,
-} from "node:fs/promises"
-import { basename, delimiter, dirname, parse, resolve } from "node:path"
-import { createHash } from "node:crypto"
-import { tmpdir } from "node:os"
-import { fileURLToPath } from "node:url"
+import * as Command from "@effect/platform/Command"
+import * as CommandExecutor from "@effect/platform/CommandExecutor"
+import * as FileSystem from "@effect/platform/FileSystem"
+import * as Path from "@effect/platform/Path"
+import { BunContext } from "@effect/platform-bun"
 import { IcnBinaryIdentity } from "@magnitudedev/icn-protocol"
 import { ICN_EXECUTABLE_NAME } from "@magnitudedev/release/executables"
-import { Effect, Schema } from "effect"
+import { releaseBuildEnvironment, type ReleaseHost } from "@magnitudedev/release/targets"
+import { Effect, Option, Schema, Stream } from "effect"
+import { dirname, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
+import { stageNvrtc } from "../../packages/release/scripts/build/nvrtc"
 import { collectWindowsRuntime } from "../../packages/release/scripts/build/windows-runtime"
-import { getTargetInfo } from "../../scripts/release-target"
 
-const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..")
-const CARGO_MANIFEST = resolve(PROJECT_ROOT, "inference/Cargo.toml")
+export const INFERENCE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..")
+const NVRTC_CACHE = resolve(INFERENCE_ROOT, "target/nvrtc")
 
-const run = async (
-  command: readonly string[],
-  options: {
-    readonly cwd?: string
-    readonly env?: Readonly<Record<string, string | undefined>>
-  } = {},
-): Promise<string> => {
-  const child = Bun.spawn([...command], {
-    cwd: options.cwd,
-    env: options.env,
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-  })
-  const [code, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ])
-  if (code !== 0) {
-    const diagnostics = [stderr, stdout]
-      .filter((value) => value.trim().length > 0)
-      .join("\n")
-      .trim()
-    throw new Error(
-      `${command[0]} failed with exit ${code}: ${diagnostics}`,
-    )
-  }
-  return stdout
+/**
+ * `release` is the clean, locked, baseline-CPU build of the host's release target;
+ * `development` is an incremental debug build for this machine sharing the workspace target directory.
+ */
+export type InferenceBuildProfile = "release" | "development"
+
+export interface BuildInferenceInput {
+  readonly host: ReleaseHost
+  readonly profile: InferenceBuildProfile
+  /** Print successful compiler diagnostics, or retain them only for a failed build. */
+  readonly diagnostics: "all" | "errors"
 }
 
-export interface IcnBuild {
+/** The service binary and the files of its installation's `runtime/` directory. */
+export interface InferenceBuild {
   readonly binary: string
   readonly identity: IcnBinaryIdentity
-  readonly backendModules: readonly string[]
+  /** NVRTC on CUDA hosts; the MSVC CRT closure on Windows. */
   readonly runtimeLibraries: readonly string[]
+  /** License notices of redistributed runtime libraries (NVRTC). */
+  readonly runtimeNotices: readonly string[]
 }
 
-interface CargoMetadata {
-  readonly packages: readonly {
-    readonly id: string
-    readonly name: string
-  }[]
-}
-
-interface CargoMessage {
-  readonly reason?: string
-  readonly package_id?: string
-  readonly out_dir?: string
-  readonly executable?: string
-  readonly target?: { readonly name?: string }
-  readonly message?: { readonly rendered?: string | null }
-}
-
-export const readCargoMessages = async (
-  stream: ReadableStream<Uint8Array>,
-  writeDiagnostic: (rendered: string) => void = (rendered) =>
-    process.stderr.write(rendered),
-): Promise<readonly CargoMessage[]> => {
-  const reader = stream.getReader()
-  const decoder = new TextDecoder()
-  const messages: CargoMessage[] = []
-  let pending = ""
-
-  const accept = (line: string): void => {
-    if (line.trim().length === 0) return
-    const message = JSON.parse(line) as CargoMessage
-    if (
-      message.reason === "compiler-message" &&
-      typeof message.message?.rendered === "string"
-    ) writeDiagnostic(message.message.rendered)
-    if (
-      message.reason === "build-script-executed" ||
-      message.reason === "compiler-artifact"
-    ) messages.push(message)
-  }
-
-  try {
-    while (true) {
-      const next = await reader.read()
-      if (next.done) break
-      const lines = `${pending}${decoder.decode(next.value, { stream: true })}`
-        .split("\n")
-      pending = lines.pop() ?? ""
-      for (const line of lines) accept(line)
-    }
-    pending += decoder.decode()
-    accept(pending)
-    return messages
-  } finally {
-    reader.releaseLock()
-  }
-}
-
-export const runCargoBuild = (
-  command: readonly string[],
-  options: {
-    readonly cwd: string
-    readonly env: Readonly<Record<string, string | undefined>>
-    readonly diagnostics: "all" | "errors"
-  },
-): Promise<readonly CargoMessage[]> => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-  const child = yield* Effect.acquireRelease(Effect.try(() => Bun.spawn([...command], {
-    cwd: options.cwd,
-    env: options.env,
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-  })), child => Effect.promise(async () => { await child[Symbol.asyncDispose]() }))
-  const renderedDiagnostics: string[] = []
-  const [capturedStderr, displayedStderr] = child.stderr.tee()
-  const [code, messages, stderr] = yield* Effect.tryPromise(() => Promise.all([
-    child.exited,
-    readCargoMessages(child.stdout, rendered => {
-      renderedDiagnostics.push(rendered)
-      if (options.diagnostics === "all") process.stderr.write(rendered)
-    }),
-    new Response(capturedStderr).text(),
-    displayedStderr.pipeTo(new WritableStream({
-      async write(chunk) {
-        if (options.diagnostics === "all") await Bun.write(Bun.stderr, chunk)
-      },
-    })),
-  ]))
-  if (code !== 0) {
-    const diagnostics = [stderr, ...renderedDiagnostics]
-      .filter(value => value.trim().length > 0)
-      .join("\n")
-      .trim()
-    return yield* new CargoBuildFailed({ command: command[0] ?? "cargo", code, diagnostics })
-  }
-  return messages
-})))
-
-class CargoBuildFailed extends Schema.TaggedError<CargoBuildFailed>()("CargoBuildFailed", {
-  command: Schema.String,
-  code: Schema.Number,
-  diagnostics: Schema.String,
+export class InferenceBuildFailed extends Schema.TaggedError<InferenceBuildFailed>()("InferenceBuildFailed", {
+  message: Schema.String,
 }) {}
 
-const rustTarget = (target: string): string => {
-  const { platform, arch } = getTargetInfo(target)
-  const mapped: Record<string, string> = {
-    "darwin-arm64": "aarch64-apple-darwin",
-    "darwin-x64": "x86_64-apple-darwin",
-    "linux-arm64": "aarch64-unknown-linux-gnu",
-    "linux-x64": "x86_64-unknown-linux-gnu",
-    "windows-x64": "x86_64-pc-windows-msvc",
-  }
-  const value = mapped[`${platform}-${arch}`]
-  if (!value) throw new Error(`No ICN Rust target for ${target}`)
-  return value
-}
+const CargoMessage = Schema.Struct({
+  reason: Schema.String,
+  executable: Schema.optionalWith(Schema.NullOr(Schema.String), { as: "Option", exact: true }),
+  target: Schema.optionalWith(Schema.Struct({ name: Schema.String }), { as: "Option", exact: true }),
+  message: Schema.optionalWith(
+    Schema.Struct({ rendered: Schema.optionalWith(Schema.NullOr(Schema.String), { as: "Option", exact: true }) }),
+    { as: "Option", exact: true },
+  ),
+})
+type CargoMessage = typeof CargoMessage.Type
+const decodeCargoMessage = Schema.decodeUnknown(Schema.parseJson(CargoMessage))
 
-const nativeBuildEnvironment = (
-  target: string,
-): Readonly<Record<string, string>> => {
-  const { platform } = getTargetInfo(target)
-  if (platform === "linux") {
-    return {
-      CMAKE_BUILD_RPATH_USE_ORIGIN: "ON",
-      CMAKE_INSTALL_RPATH: "$ORIGIN;$ORIGIN/../runtime",
-    }
-  }
-  if (platform === "darwin") {
-    return {
-      CMAKE_INSTALL_RPATH: "@loader_path;@loader_path/../runtime",
-    }
-  }
-  if (platform === "windows") {
-    return {
-      // Follow the x64 artifact target even on Windows ARM running x64 tools.
-      CMAKE_SYSTEM_NAME: "Windows",
-      CMAKE_SYSTEM_PROCESSOR: "AMD64",
-      // The fit wrapper uses C++ entry points, as does llama-common's existing Windows build.
-      CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS: "ON",
-    }
-  }
-  return {}
-}
+const renderedDiagnostic = (message: CargoMessage): Option.Option<string> =>
+  message.reason === "compiler-message"
+    ? message.message.pipe(Option.flatMap((value) => value.rendered), Option.flatMap(Option.fromNullable))
+    : Option.none()
 
-const filesIn = async (directory: string): Promise<readonly string[]> => {
-  try {
-    const entries = await readdir(directory, { withFileTypes: true })
-    return entries
-      .filter((entry) => entry.isFile() || entry.isSymbolicLink())
-      .map((entry) => resolve(directory, entry.name))
-      .sort()
-  } catch (cause) {
-    if (
-      cause instanceof Error &&
-      "code" in cause &&
-      cause.code === "ENOENT"
-    ) return []
-    throw cause
-  }
-}
+/** The executables Cargo reports for `name`. */
+export const cargoExecutables = (messages: readonly CargoMessage[], name: string): readonly string[] =>
+  messages.flatMap((message) =>
+    message.reason === "compiler-artifact" && Option.exists(message.target, (target) => target.name === name)
+      ? message.executable.pipe(Option.flatMap(Option.fromNullable), Option.toArray)
+      : [])
 
-const isRuntimeLibrary = (file: string): boolean => {
-  const name = basename(file)
-  return name.endsWith(".dylib") ||
-    name.endsWith(".dll") ||
-    name.includes(".so")
-}
-
-const isBackendModule = (file: string): boolean => {
-  const name = basename(file).toLowerCase()
-  return [
-    "libggml-cpu",
-    "libggml-metal",
-    "libggml-cuda",
-    "libggml-vulkan",
-    "ggml-cpu",
-    "ggml-metal",
-    "ggml-cuda",
-    "ggml-vulkan",
-  ].some((prefix) => name.startsWith(prefix))
-}
-
-const readIdentity = async (
-  binary: string,
-  runtimeDirectories: readonly string[],
-): Promise<IcnBinaryIdentity> => {
-  const loader = process.platform === "win32"
-    ? "PATH"
-    : process.platform === "darwin"
-      ? "DYLD_LIBRARY_PATH"
-      : "LD_LIBRARY_PATH"
-  const stdout = await run([binary, "version", "--json"], {
-    env: {
-      ...process.env,
-      [loader]: [...runtimeDirectories, process.env[loader]]
-        .filter(Boolean)
-        .join(delimiter),
-    },
-  })
-  const value = Schema.decodeUnknownSync(
-    Schema.parseJson(IcnBinaryIdentity),
-  )(stdout)
-  if (value.api_version !== 1) {
-    throw new Error("ICN identity probe returned an invalid contract")
-  }
-  return value
-}
-
-export interface BuildIcnInput {
-  readonly target: string
-  readonly profile: string
-  readonly features: readonly string[]
-  readonly release?: boolean
-  readonly clean?: boolean
-  readonly buildEnvironment?: Readonly<Record<string, string>>
-  /** Print successful compiler diagnostics, or retain them only for a failed build. */
-  readonly diagnostics?: "all" | "errors"
-  /** Explicit redistributable inputs needed to close a Windows accelerator's import graph. */
-  readonly extraRuntimeLibraries?: readonly string[]
-}
-
-export const buildIcnBinary = async ({
-  target,
-  profile,
-  features,
-  release = true,
-  clean = true,
-  buildEnvironment = {},
-  diagnostics = "all",
-  extraRuntimeLibraries = [],
-}: BuildIcnInput): Promise<IcnBuild> => {
-  const cargoTarget = rustTarget(target)
-  // Cargo and CMake append deeply nested paths; MSVC still fails on long PDB/object paths.
-  const targetDirectory = process.platform === "win32"
-    ? resolve(parse(tmpdir()).root, createHash("sha256")
-      .update(`${tmpdir()}:${PROJECT_ROOT}:${profile}`).digest("hex").slice(0, 8))
-    : resolve(PROJECT_ROOT, "inference/target", `release-${profile}`)
-  if (clean) await rm(targetDirectory, { recursive: true, force: true })
-
-  const metadata = JSON.parse(await run([
-    "cargo",
-    "metadata",
-    "--format-version",
-    "1",
-    "--manifest-path",
-    CARGO_MANIFEST,
-  ], { cwd: PROJECT_ROOT })) as CargoMetadata
-  const nativePackage = metadata.packages.find(
-    (candidate) => candidate.name === "llama-cpp-sys-2",
+/** Decodes Cargo's JSON message stream, forwarding rendered diagnostics as they arrive. */
+export const readCargoMessages = (
+  lines: Stream.Stream<string, InferenceBuildFailed>,
+  writeDiagnostic: (rendered: string) => Effect.Effect<void>,
+): Effect.Effect<{ readonly messages: readonly CargoMessage[]; readonly diagnostics: readonly string[] }, InferenceBuildFailed> =>
+  lines.pipe(
+    Stream.filter((line) => line.trim().length > 0),
+    Stream.mapEffect((line) => decodeCargoMessage(line).pipe(
+      Effect.mapError(() => new InferenceBuildFailed({ message: `Cargo emitted a malformed message: ${line.slice(0, 200)}` })),
+    )),
+    Stream.tap((message) => Option.match(renderedDiagnostic(message), { onNone: () => Effect.void, onSome: writeDiagnostic })),
+    Stream.runCollect,
+    Effect.map((chunk) => {
+      const messages = [...chunk]
+      return { messages, diagnostics: messages.flatMap((message) => Option.toArray(renderedDiagnostic(message))) }
+    }),
   )
-  if (!nativePackage) {
-    throw new Error("Cargo metadata has no llama-cpp-sys-2 package")
-  }
 
-  const messages = await runCargoBuild([
-    "cargo",
-    "build",
-    ...(release ? ["--release"] : []),
-    "--manifest-path",
-    CARGO_MANIFEST,
-    "-p",
-    "icn-server",
-    "--target",
-    cargoTarget,
-    "--no-default-features",
-    "--features",
-    [...new Set(features)].join(","),
-    "--message-format",
-    "json-render-diagnostics",
-  ], {
-    cwd: PROJECT_ROOT,
-    diagnostics,
-    env: {
-      ...process.env,
-      ...buildEnvironment,
-      ...nativeBuildEnvironment(target),
-      CARGO_TARGET_DIR: targetDirectory,
-    },
-  })
-  const outDirectories = messages
-    .filter((message) =>
-      message.reason === "build-script-executed" &&
-      message.package_id === nativePackage.id &&
-      typeof message.out_dir === "string"
+const writeStderr = (text: string) => Effect.sync(() => { process.stderr.write(text) })
+
+const runCargoBuild = (
+  arguments_: readonly string[],
+  /** Added to the inherited environment. */
+  environment: Readonly<Record<string, string>>,
+  diagnostics: BuildInferenceInput["diagnostics"],
+): Effect.Effect<readonly CargoMessage[], InferenceBuildFailed, CommandExecutor.CommandExecutor> =>
+  Effect.scoped(Effect.gen(function* () {
+    const child = yield* Command.make("cargo", ...arguments_).pipe(
+      Command.workingDirectory(INFERENCE_ROOT),
+      Command.env(environment),
+      Command.start,
     )
-    .map((message) => message.out_dir!)
-  if (outDirectories.length !== 1) {
-    throw new Error(`Cargo reported ${outDirectories.length} native output directories`)
-  }
-  const binaryMessages = messages.filter((message) =>
-    message.reason === "compiler-artifact" &&
-    message.target?.name === ICN_EXECUTABLE_NAME &&
-    typeof message.executable === "string"
+    const [cargo, stderr, exitCode] = yield* Effect.all([
+      readCargoMessages(
+        child.stdout.pipe(Stream.decodeText(), Stream.splitLines, Stream.mapError(() => new InferenceBuildFailed({ message: "Cargo output failed" }))),
+        (rendered) => diagnostics === "all" ? writeStderr(rendered) : Effect.void,
+      ),
+      child.stderr.pipe(
+        Stream.decodeText(),
+        Stream.tap((text) => diagnostics === "all" ? writeStderr(text) : Effect.void),
+        Stream.runFold("", (all, text) => all + text),
+      ),
+      child.exitCode,
+    ], { concurrency: "unbounded" })
+    if (exitCode !== 0) {
+      return yield* new InferenceBuildFailed({
+        message: `cargo build failed with exit ${exitCode}:\n${[stderr, ...cargo.diagnostics].join("\n").trim().slice(-8_000)}`,
+      })
+    }
+    return cargo.messages
+  })).pipe(Effect.mapError((cause) =>
+    cause instanceof InferenceBuildFailed ? cause : new InferenceBuildFailed({ message: `cargo build failed: ${String(cause)}` })))
+
+/**
+ * Release rustflags are fixed so ambient configuration cannot raise the CPU baseline (no
+ * `target-cpu`). Linux executables resolve owned libraries from `../runtime`.
+ */
+export const releaseRustflags = (host: ReleaseHost): string =>
+  host.id.startsWith("linux-") ? "-Clink-arg=-Wl,-rpath,$ORIGIN/../runtime" : ""
+
+const readIdentity = (binary: string) =>
+  Command.make(binary, "version", "--json").pipe(
+    Command.env({ LD_LIBRARY_PATH: "", DYLD_LIBRARY_PATH: "" }),
+    Command.string,
+    Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(IcnBinaryIdentity))),
+    Effect.mapError((cause) => new InferenceBuildFailed({ message: `the identity probe of ${binary} failed: ${String(cause)}` })),
   )
-  if (binaryMessages.length !== 1) {
-    throw new Error(`Cargo reported ${binaryMessages.length} ICN executables`)
+
+const windowsRuntime = (files: readonly string[]) => Effect.gen(function* () {
+  const redistributable = process.env.VCToolsRedistDir
+  if (!redistributable) {
+    return yield* new InferenceBuildFailed({ message: "Windows builds require the Visual Studio compiler environment (VCToolsRedistDir)" })
   }
-  const binary = binaryMessages[0]!.executable!
-  const nativeOutput = outDirectories[0]!
-  const backendModules = await filesIn(resolve(nativeOutput, "backends"))
-  if (backendModules.length === 0) {
-    throw new Error("ICN build emitted no dynamic backend modules")
-  }
-  const installedRuntimeLibraries = (
-    await filesIn(resolve(nativeOutput, "lib"))
-  ).filter((file) => isRuntimeLibrary(file) && !isBackendModule(file))
-  const installedNames = new Set(
-    installedRuntimeLibraries.map((file) => basename(file)),
-  )
-  const supplementalRuntimeLibraries = (
-    await filesIn(resolve(nativeOutput, "build", "bin"))
-  ).filter((file) =>
-    isRuntimeLibrary(file) &&
-    !isBackendModule(file) &&
-    !installedNames.has(basename(file))
-  )
-  const runtimeLibraries = [
-    ...installedRuntimeLibraries,
-    ...supplementalRuntimeLibraries,
-    ...extraRuntimeLibraries,
-  ]
-  if (getTargetInfo(target).platform === "windows") {
-    const redist = process.env.VCToolsRedistDir
-    if (!redist) throw new Error("Windows engine builds require the Visual Studio compiler environment (VCToolsRedistDir)")
-    runtimeLibraries.push(...await Effect.runPromise(collectWindowsRuntime({
-      files: [binary, ...backendModules, ...runtimeLibraries],
-      redistributable: resolve(redist, "x64", "Microsoft.VC143.CRT"),
-      capabilities: [
-        ...(features.some(feature => feature === "cuda" || feature === "cuda-no-vmm") ? ["cuda" as const] : []),
-        ...(features.includes("vulkan") ? ["vulkan" as const] : []),
-      ],
-    })))
-  }
-  const identity = await readIdentity(
-    binary,
-    [...new Set(runtimeLibraries.map(dirname))],
-  )
-  for (const file of [binary, ...backendModules, ...runtimeLibraries]) {
-    if (!(await stat(file)).isFile()) throw new Error(`missing ICN output ${file}`)
-  }
-  return { binary, identity, backendModules, runtimeLibraries }
-}
+  // Seismic loads nvcuda.dll and vulkan-1.dll at runtime; neither may be an import.
+  return yield* collectWindowsRuntime({
+    files,
+    redistributable: resolve(redistributable, "x64", "Microsoft.VC143.CRT"),
+  }).pipe(Effect.mapError((cause) => new InferenceBuildFailed({ message: `Windows runtime closure failed: ${cause.message}` })))
+})
+
+export const buildInference = ({
+  host,
+  profile,
+  diagnostics,
+}: BuildInferenceInput): Effect.Effect<InferenceBuild, InferenceBuildFailed, CommandExecutor.CommandExecutor | FileSystem.FileSystem | Path.Path> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    const release = profile === "release"
+    const targetDirectory = resolve(INFERENCE_ROOT, "target", `release-${host.id}`)
+    if (release) {
+      yield* fs.remove(targetDirectory, { recursive: true, force: true }).pipe(
+        Effect.mapError((cause) => new InferenceBuildFailed({ message: `unable to clean ${targetDirectory}: ${String(cause)}` })),
+      )
+    }
+    const messages = yield* runCargoBuild([
+      "build",
+      ...(release ? ["--release", "--locked", "--target", host.rustTarget] : []),
+      "-p",
+      "magnitude-service-server",
+      "--bin",
+      ICN_EXECUTABLE_NAME,
+      "--message-format",
+      "json-render-diagnostics",
+    ], release
+      ? {
+        ...releaseBuildEnvironment(host),
+        CARGO_TARGET_DIR: targetDirectory,
+        CARGO_ENCODED_RUSTFLAGS: releaseRustflags(host),
+      }
+      : {}, diagnostics)
+    const executables = cargoExecutables(messages, ICN_EXECUTABLE_NAME)
+    if (executables.length !== 1) {
+      return yield* new InferenceBuildFailed({ message: `Cargo reported ${executables.length} ${ICN_EXECUTABLE_NAME} executables` })
+    }
+    const binary = executables[0]!
+    const identity = yield* readIdentity(binary)
+    const nvrtc = yield* Option.match(host.nvrtc, {
+      onNone: () => Effect.succeed({ libraries: [], notices: [] }),
+      onSome: (redistributable) => stageNvrtc(redistributable, NVRTC_CACHE).pipe(
+        Effect.map((staged) => ({ libraries: staged.libraries, notices: [staged.license] })),
+        Effect.mapError((cause) => new InferenceBuildFailed({ message: cause.message })),
+      ),
+    })
+    const crt = host.id.startsWith("windows-")
+      ? yield* windowsRuntime([binary, ...nvrtc.libraries])
+      : []
+    return { binary, identity, runtimeLibraries: [...nvrtc.libraries, ...crt], runtimeNotices: nvrtc.notices }
+  })
+
+/** Promise entry point for the release build scripts. */
+export const buildInferenceBinary = (input: BuildInferenceInput): Promise<InferenceBuild> =>
+  Effect.runPromise(buildInference(input).pipe(Effect.provide(BunContext.layer)))

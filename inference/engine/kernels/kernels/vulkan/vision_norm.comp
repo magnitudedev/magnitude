@@ -1,0 +1,50 @@
+// vision_norm: one workgroup per result row r = cell * G + member, which
+// normalizes source row r (or order[r] when NO = 1) and publishes it to Y at
+// member * H (side by side) or, with `interleave`, channel by channel at
+// stride G. Body in lib/vision/vision.glsl.
+#include "lib/vision/vision.glsl"
+
+#if defined(SEISMIC_ELEMENT_Y_REPRESENTATION_BF16)
+#define Y_KIND ELEMENT_BF16
+#elif defined(SEISMIC_ELEMENT_Y_REPRESENTATION_F16)
+#define Y_KIND ELEMENT_F16
+#elif defined(SEISMIC_ELEMENT_Y_REPRESENTATION_F32)
+#define Y_KIND ELEMENT_F32
+#else
+#error "unsupported vision_norm Y representation"
+#endif
+
+#if defined(SEISMIC_WEIGHT_REPRESENTATION_BF16)
+#define WEIGHT_KIND ELEMENT_BF16
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_F16)
+#define WEIGHT_KIND ELEMENT_F16
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_F32)
+#define WEIGHT_KIND ELEMENT_F32
+#else
+#error "unsupported vision_norm weight representation"
+#endif
+
+#if defined(SEISMIC_BIAS_REPRESENTATION_BF16)
+#define BIAS_KIND ELEMENT_BF16
+#elif defined(SEISMIC_BIAS_REPRESENTATION_F16)
+#define BIAS_KIND ELEMENT_F16
+#elif defined(SEISMIC_BIAS_REPRESENTATION_F32)
+#define BIAS_KIND ELEMENT_F32
+#else
+#error "unsupported vision_norm bias representation"
+#endif
+
+void vision_norm() {
+    const uint g = uint(SEISMIC_DIM_G), h = uint(SEISMIC_DIM_H);
+    const uint row = gl_WorkGroupID.x;
+    const uint from = SEISMIC_DIM_NO == 1 ? uint(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ORDER) + uint64_t(row) * 4ul))
+                                          : row;
+    const uint cell = row / g, member = row % g;
+    const bool interleave = int(SEISMIC_PARAM_INTERLEAVE) != 0;
+    const uint64_t first = uint64_t(cell) * SEISMIC_RESULT_0_STRIDE_0 + (interleave ? member : uint64_t(member) * h);
+    vision_row_norm(Y_KIND, SEISMIC_PTR(SEISMIC_BUFFER_SOURCE) + uint64_t(from) * h * 4ul,
+        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + first * ELEMENT_BYTES(Y_KIND), interleave ? uint64_t(g) : 1ul,
+        SEISMIC_DIM_NW == 1, SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), WEIGHT_KIND, SEISMIC_DIM_NB == 1,
+        SEISMIC_PTR(SEISMIC_BUFFER_BIAS), BIAS_KIND, h, int(SEISMIC_PARAM_CENTERED) != 0,
+        element_word_f32(SEISMIC_PARAM_EPSILON));
+}

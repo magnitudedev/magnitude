@@ -1,0 +1,5 @@
+# origin: H-32
+# undecided: reassociated
+# invoke: f32[1000]=rand(10)
+fn probe[N](x: &tensor[N] f32) -> f32:
+    return reduce(x, 0, sum, unordered=true)

@@ -1,0 +1,5 @@
+# origin: C11:s_tensor_int_div
+# cell: tensor-elementwise-fail/sl
+# invoke: i32[3]=6,8,9 ; i32[3]=2,4,3
+fn probe(x: &tensor[3] i32, y: &tensor[3] i32) -> tensor[3] i32:
+    return x / y

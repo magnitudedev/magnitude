@@ -7,7 +7,7 @@ export const hardware = (processor: string, memory: number, cores: number, accel
   platform: processor.startsWith("Apple") ? "MacOS" : "Linux", architecture: processor.startsWith("Apple") || processor === "NVIDIA GB10" ? "Arm64" : "X64", processor,
   ...(physicalCores === undefined ? {} : { physicalCores }), logicalCores: cores, totalSystemMemoryBytes: memory * GiB, availableSystemMemoryBytes: memory * GiB / 2,
   systemAllocationCapacityBytes: memory * GiB, systemAllocationHeadroomBytes: memory * GiB / 2, abortReserveBytes: GiB,
-  accelerators: accelerators.map((gpu, i) => ({ acceleratorId: `gpu-${i}`, name: gpu.name, backend: processor.startsWith("Apple") ? "Metal" : "CUDA", memoryDomainId: gpu.shared ? "system" : `gpu-${i}` })),
+  accelerators: accelerators.map((gpu, i) => ({ acceleratorId: `gpu-${i}`, name: gpu.name, backend: processor.startsWith("Apple") ? "metal" : "cuda", memoryDomainId: gpu.shared ? "system" : `gpu-${i}` })),
   memoryDomains: [{ memoryDomainId: "system", kind: accelerators.some(gpu => gpu.shared) ? "UnifiedMemory" : "System", totalBytes: memory * GiB, stableCapacityBytes: memory * GiB, sharesSystemMemory: true },
     ...accelerators.flatMap((gpu, i) => gpu.shared ? [] : [{ memoryDomainId: `gpu-${i}`, kind: "PhysicalDevice", totalBytes: gpu.memory * GiB, stableCapacityBytes: gpu.memory * GiB, sharesSystemMemory: false }])],
 })

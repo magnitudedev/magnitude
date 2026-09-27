@@ -1,0 +1,8 @@
+# origin: X1:r2-f01
+# invoke: i32[1]=1 ; i32[4]=1,2,3,4 ; index:3
+# pin: o = i32[1]=31
+fn bump(o: &mut tensor[1] i32, x: &tensor[4] i32):
+    o[0] = o[0] + 10 / x[0]
+fn probe(o: &mut tensor[1] i32, x: &tensor[4] i32, n: index[1000000000]):
+    for t in 0..n:
+        bump(o, x)

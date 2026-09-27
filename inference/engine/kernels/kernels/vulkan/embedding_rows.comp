@@ -1,0 +1,123 @@
+// embedding_rows: gather one table row per token and decode it with the
+// packet decoders, times `scale` and, with `normalize`, its weightless RMS
+// (`embedding_rows_inverse` reduces the square sum first); published in the
+// activation type and as F32 of that value. One workgroup per token row. The
+// Vulkan form of `metal/embedding_rows.metal`.
+#include "lib/core/activation.glsl"
+#include "lib/core/reduce.glsl"
+#include <seismic/packets.glsl>
+
+#if !defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) && !defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#error "embedding_rows requires a bf16 or f16 activation"
+#endif
+
+#if defined(SEISMIC_TABLE_REPRESENTATION_Q4K)
+#define TABLE_KIND PACKETS_Q4K
+#define TABLE_LAYOUT packets_rows16(SEISMIC_TABLE_ROW_STRIDE_BYTES, SEISMIC_TABLE_PLANE_CODES_LO_ROW_OFFSET, 0ul, SEISMIC_TABLE_PLANE_SCALES_ROW_OFFSET, SEISMIC_TABLE_PLANE_SUPERS_ROW_OFFSET)
+#elif defined(SEISMIC_TABLE_REPRESENTATION_Q5K)
+#define TABLE_KIND PACKETS_Q5K
+#define TABLE_LAYOUT packets_rows16(SEISMIC_TABLE_ROW_STRIDE_BYTES, SEISMIC_TABLE_PLANE_CODES_LO_ROW_OFFSET, SEISMIC_TABLE_PLANE_CODES_HI_ROW_OFFSET, SEISMIC_TABLE_PLANE_SCALES_ROW_OFFSET, SEISMIC_TABLE_PLANE_SUPERS_ROW_OFFSET)
+#elif defined(SEISMIC_TABLE_REPRESENTATION_Q6K)
+#define TABLE_KIND PACKETS_Q6K
+#define TABLE_LAYOUT packets_rows16(SEISMIC_TABLE_ROW_STRIDE_BYTES, SEISMIC_TABLE_PLANE_CODES_LO_ROW_OFFSET, SEISMIC_TABLE_PLANE_CODES_HI_ROW_OFFSET, SEISMIC_TABLE_PLANE_SCALES_ROW_OFFSET, SEISMIC_TABLE_PLANE_SUPERS_ROW_OFFSET)
+#elif defined(SEISMIC_TABLE_REPRESENTATION_Q8G32S)
+#define TABLE_KIND PACKETS_Q8
+#define TABLE_LAYOUT packets_rows16(SEISMIC_TABLE_ROW_STRIDE_BYTES, SEISMIC_TABLE_PLANE_CODES_ROW_OFFSET, 0ul, 0ul, SEISMIC_TABLE_PLANE_SUPERS_ROW_OFFSET)
+#elif defined(SEISMIC_TABLE_REPRESENTATION_IQ4G32)
+#define TABLE_KIND PACKETS_IQ4
+#define TABLE_LAYOUT PACKETS_ROWS16_C4(SEISMIC_TABLE)
+#elif defined(SEISMIC_TABLE_REPRESENTATION_Q4G32S)
+#define TABLE_KIND PACKETS_Q4G32S
+#define TABLE_LAYOUT PACKETS_ROWS16_C4(SEISMIC_TABLE)
+#elif defined(SEISMIC_TABLE_REPRESENTATION_MXFP4G32)
+#define TABLE_KIND PACKETS_MXFP4
+#define TABLE_LAYOUT PACKETS_ROWS16_C4(SEISMIC_TABLE)
+#elif defined(SEISMIC_TABLE_REPRESENTATION_NVFP4G16)
+#define TABLE_KIND PACKETS_NVFP4
+#define TABLE_LAYOUT PACKETS_ROWS16_C4(SEISMIC_TABLE)
+#elif defined(SEISMIC_TABLE_REPRESENTATION_Q5G32S)
+#define TABLE_KIND PACKETS_Q5G32S
+#define TABLE_LAYOUT PACKETS_ROWS16_Q5(SEISMIC_TABLE)
+#elif defined(SEISMIC_TABLE_REPRESENTATION_Q5G32)
+#define TABLE_KIND PACKETS_Q5G32
+#define TABLE_LAYOUT PACKETS_ROWS16_Q5(SEISMIC_TABLE)
+#elif defined(SEISMIC_TABLE_REPRESENTATION_BF16)
+#define TABLE_KIND PACKETS_BF16
+#define TABLE_LAYOUT packets_rows16(SEISMIC_TABLE_STRIDE_0 * 2ul, 0ul, 0ul, 0ul, 0ul)
+#elif defined(SEISMIC_TABLE_REPRESENTATION_F16)
+#define TABLE_KIND PACKETS_F16
+#define TABLE_LAYOUT packets_rows16(SEISMIC_TABLE_STRIDE_0 * 2ul, 0ul, 0ul, 0ul, 0ul)
+#elif defined(SEISMIC_TABLE_REPRESENTATION_F32)
+#define TABLE_KIND PACKETS_F32
+#define TABLE_LAYOUT packets_rows16(SEISMIC_TABLE_STRIDE_0 * 4ul, 0ul, 0ul, 0ul, 0ul)
+#else
+#error "unsupported embedding_rows table representation"
+#endif
+#if defined(SEISMIC_TABLE_KIND_PACKED) && !defined(SEISMIC_TABLE_LAYOUT_ROWS16)
+#error "embedding_rows requires the rows16 layout for table"
+#endif
+
+// With `normalize`, the weightless-RMS inverse of each row's scaled decode
+// (the square sum reduced in a fixed order), stored to the `inverses`
+// scratch. It is a launch of its own: a conditional reduction in the decode
+// launch changes how this driver compiles the F16 round trip there, and with
+// it the unnormalized entry's bits.
+void embedding_rows_inverse() {
+    if (SEISMIC_PARAM_NORMALIZE == 0ul)
+        return;
+    const uint width = uint(SEISMIC_DIM_D);
+    const uint64_t row = gl_WorkGroupID.x;
+    const packets_rows16 geometry = TABLE_LAYOUT;
+    const uint64_t token = uint64_t(max(element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS),
+        row * SEISMIC_TOKENS_STRIDE_0), 0));
+    const uint64_t table_row = SEISMIC_PTR(SEISMIC_BUFFER_TABLE) + token * geometry.stride;
+    const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
+    float squares = 0.0;
+    for (uint p = gl_LocalInvocationID.x; p * 32u < width; p += gl_WorkGroupSize.x) {
+        const packets_packet packet = packets_load(TABLE_KIND, table_row, geometry, p, width);
+        for (uint i = 0u; i < 32u && 32u * p + i < width; ++i) {
+            const float value = packets_value_at(TABLE_KIND, packet, i) * scale;
+            squares = seismic_fma_rn(value, value, squares);
+        }
+    }
+    squares = reduce_group_sum(squares, 0u);
+    if (gl_LocalInvocationID.x == 0u)
+        element_f32_put(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_INVERSES) + row * 4ul,
+            inversesqrt(seismic_div_rn(squares, float(width)) + element_word_f32(SEISMIC_PARAM_EPSILON)));
+}
+
+void embedding_rows() {
+    const uint64_t table = SEISMIC_PTR(SEISMIC_BUFFER_TABLE);
+    const uint64_t tokens = SEISMIC_PTR(SEISMIC_BUFFER_TOKENS);
+    const uint64_t embedded = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const uint64_t widened = SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER);
+    const uint width = uint(SEISMIC_DIM_D);
+    const uint64_t row = gl_WorkGroupID.x;
+    const packets_rows16 geometry = TABLE_LAYOUT;
+    // A failed selection (token -1) embeds token 0 (the contract).
+    const uint64_t token = uint64_t(max(element_i32_index(tokens, row * SEISMIC_TOKENS_STRIDE_0), 0));
+    const uint64_t table_row = table + token * geometry.stride;
+    const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
+    for (uint p = gl_LocalInvocationID.x; p * 32u < width; p += gl_WorkGroupSize.x) {
+        const packets_packet packet = packets_load(TABLE_KIND, table_row, geometry, p, width);
+        [[unroll]] for (uint step = 0u; step < 4u; ++step) {
+            vec4 even, odd;
+            packets_codes(TABLE_KIND, packet, step, even, odd);
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                const uint column = 32u * p + 8u * step + i;
+                if (column < width) {
+                    const float code = (i & 1u) != 0u ? odd[i >> 1] : even[i >> 1];
+                    const float decoded = packets_value(TABLE_KIND, packet, step, code) * scale;
+                    const float value = element_round(ELEMENT_ACT, SEISMIC_PARAM_NORMALIZE != 0ul
+                        ? decoded * element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_INVERSES) + row * 4ul)
+                        : decoded);
+                    element_put(ELEMENT_ACT, embedded,
+                        row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(column) * SEISMIC_RESULT_0_STRIDE_1, value);
+                    element_f32_put(widened
+                            + (row * SEISMIC_RESULT_1_STRIDE_0 + uint64_t(column) * SEISMIC_RESULT_1_STRIDE_1) * 4ul,
+                        value);
+                }
+            }
+        }
+    }
+}

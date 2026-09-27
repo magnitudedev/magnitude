@@ -1,115 +1,70 @@
 ---
 applies_to:
-  - inference/crates/icn-contracts/src/inventory.rs
-  - inference/crates/icn-hardware/**
-  - inference/crates/icn-models/**
-  - inference/crates/icn-api/**
-  - inference/crates/icn-server/**
-  - inference/native/llama-cpp-rs/llama-cpp-2/src/model/params/fit.rs
-  - inference/native/llama-cpp-rs/llama-cpp-sys-2/wrapper_common_fit.h
-  - inference/native/llama-cpp-rs/llama-cpp-sys-2/wrapper_common_fit.cpp
+  - inference/engine/executor/src/assessment/**
+  - inference/engine/src/assessment.rs
+  - inference/service/server/src/assessment/**
 ---
 
 # Generation-performance estimation
 
 ## Contract
 
-ICN estimates single-user decode throughput at several occupied-context depths for one exact
-assessed profile. The ordered estimates are advisory ranking inputs. They never change
-capacity, authorize loading, or replace observed runtime timing.
+The engine estimates single-user decode throughput at several occupied-context depths for one exact
+assessed model. The ordered estimates are advisory ranking inputs. They never change capacity,
+authorize loading, or replace observed runtime timing.
 
 | Layer | Responsibility |
 |---|---|
-| Native bindings | Exact workload, placement, and model-free calibration facts |
-| `icn-hardware` | Formula, uncertainty, confidence, and failure policy |
-| ICN model service | Assessment lifecycle, identity, and caching |
+| Engine | Measurement basis, planned decode demand, formula, bounds, confidence |
+| Service | Requested depths, assessment lifecycle, identity, caching |
 | ACN | Local model ranking only |
 
-Performance estimation is part of model assessment. On an exact cache miss, obtaining its workload
-requires the same native model open and profile-specific context graph as memory assessment. The
-final arithmetic is cheap; obtaining exact inputs is not.
+Estimation is analytical: the model's planned decode demand multiplied by the environment's
+measured generic operation costs. It runs no model, no per-model benchmark and no tuning.
 
 ## Scope
 
-Each sample models baseline autoregressive decode for one sequence and one generated token at its
-requested occupied-context depth. It excludes prompt processing, sampling, transport, speculative
-acceptance, and concurrent scheduling. The serving profile still owns capacity and fit; performance
-samples do not create additional serving configurations.
+Each sample models plain autoregressive decode of one conversation producing one token at its
+requested depth. It excludes prompt processing, speculative acceptance and concurrent scheduling.
+The serving profile owns capacity and fit; performance samples create no serving configurations.
 
-No tensor payload is read and no inference or model benchmark runs.
+## Measurement basis
 
-## Native evidence
-
-The no-allocation planner reports:
-
-- each stored tensor once: type, storage, operation bytes, access class, execution role, placement;
-- routed/shared expert counts and roles;
-- architecture-specific attention storage as either conventional K/V rows, one MLA latent row, or
-  no attention row;
-- sliding-window, recurrent, compressed-attention, and sparse-index facts; and
-- exact native device identity for every operation.
-
-These are facts, not token-rate estimates. Malformed or internally inconsistent shapes are request
-defects. MLA never fabricates a V row; conventional attention never accepts a partial K/V pair.
+The basis times every operation class of a plain decode step that some known target needs, at the
+representations its load plan binds (dense and paired projections, attention, recurrent steps,
+routed experts, row ops such as post-norms and per-layer inputs, readout, sampling, and the host
+gather and upload of a host-resident table's rows), plus the launch dependency between consecutive
+calls and the fixed per-step submission, with shipped default configurations at fixed sizes. The
+arithmetic parameters that move production speed most (`INT8`, `PARTS`, `SLICES`) are each varied
+alone from the default, screened by one sample, and the fastest is timed. Every repeated sample is
+kept. A class that does not grow with size, or a nonphysical fit, is a measurement error, never a
+guessed coefficient.
 
 ## Calculation
 
-`icn-hardware` calculates per-token traffic from the exact workload:
+- Demand comes from the same allocation-free execution plan a load prepares: the exact resident
+  representation, bytes and launches of every term at each depth. History reads grow with depth,
+  up to the window of a window-domain layer; a layer sharing another layer's history reads the
+  source's.
+- The step time sums each class's median cost; the estimate is its reciprocal.
+- Bounds come from measured variation only: each class's slowest and fastest sample relative to its
+  median scale its time for the lower and upper rates. No fixed band is applied.
+- Confidence comes from the relative range `(upper − lower) / estimated` with thresholds fixed once
+  in the estimator: high ≤ 5%, moderate ≤ 15%, low otherwise.
 
-- always-active tensors and row lookups use native operation bytes;
-- routed pools apply selected/total expert ratios with checked round-up arithmetic;
-- attention traffic uses each layer's exact row shape and occupied depth;
-- sliding windows cap depth;
-- recurrent layers charge fixed state once per token;
-- compressed and sparse attention apply their native compression and index/gather terms; and
-- every term uses calibration for its actual fitted device.
-
-Time is derived from calibrated operation throughput and dispatch cost. The reciprocal of total
-predicted seconds is the expected rate. The same exact native workload is evaluated at each requested
-depth, so additional samples require no additional context graph. Versioned efficiency factors cover
-unmeasured elementwise, selection, gather, compression, and cross-domain work.
-
-Every result contains finite positive lower, expected, and upper rates with
-`lower <= expected <= upper`, plus `high`, `moderate`, or `low` confidence. Calibration dispersion,
-fallback evidence, routed uncertainty, unusual architecture work, and cross-physical-domain
-placement widen bounds or lower confidence. Unified CPU/Metal ownership alone does not.
-
-## Calibration interaction
-
-Hardware calibration measures bounded synthetic dense and routed operations for enabled backends.
-It is model-free and established by the persistent planning-worker pool before ICN readiness. Untimed
-warm-up proves synchronized backend execution and may trigger CUDA PTX JIT before timed samples.
-
-Assessment never calibrates lazily. Missing exact operation calibration may use a conservative
-same-device fallback with lower confidence. Missing all applicable evidence, invalid metrics, or
-invalid arithmetic fails the exact assessment target.
+Every result has finite positive rates with `lower <= estimated <= upper`, one per requested depth
+in ascending order. A demand term outside the basis makes the model `Incompatible`; a missing
+measurement or invalid arithmetic fails the assessment. Neither is a partial result.
 
 ## Identity and caching
 
-Performance evidence from a stable-topology-validated `Fits` result is cached with its exact
-assessment. Identity covers:
-
-- target content and workload schema;
-- exact profile and ordered performance sample depths;
-- calibration method and concrete metric digest;
-- native build, enabled backends, topology, stable capacity, placement, and execution policy; and
-- estimator method.
-
-Hardware-calibration elapsed wall time and live free memory are excluded. A warm exact-assessment
-cache hit performs no native workload extraction or estimation. Native `DoesNotFit` evidence is not
-reused while fallback placement can observe process-local free memory.
+Estimates are cached with their exact assessment under the assessment environment identity, which
+includes the basis digest and the engine build. A warm exact-cache hit performs no estimation.
 
 ## Conformance
 
-- Preview and assessment read no tensor payload and run no model decode.
-- Performance failure never changes native capacity evidence into another domain result.
-- Bindings contain no token-rate formula, confidence, profile, or ranking policy.
-- Dense, routed, recurrent, conventional-attention, MLA, compressed, sparse, unified-memory, and
-  cross-domain paths have deterministic fixture coverage.
-- Increasing active traffic cannot improve an otherwise identical estimate.
-- Performance samples are strictly ordered by context and end at the configured context.
-- Multiple performance depths for one profile reuse one exact native workload.
-- Recurrent state is never multiplied by context depth.
-- MTP/NextN storage does not affect baseline target decode unless explicitly executed.
-- One same-target assessment batch reuses its native model across all missing profiles.
-- Warm exact-cache reads perform no native planning.
+- Estimation reads no tensor payload and runs no model decode.
+- Increasing planned traffic cannot improve an otherwise identical estimate.
+- Samples are strictly ordered, one per requested depth, ending at the served context.
+- Recurrent state is charged once per token, never multiplied by depth.
+- Speculative heads do not change the plain-decode estimate.

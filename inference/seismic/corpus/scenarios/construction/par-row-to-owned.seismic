@@ -1,0 +1,8 @@
+# origin: C11:par_row_to_owned
+# invoke: f32[2,4]=1,1,1,1,1,1,1,1 ; f32[2,4]=0,0,0,0,0,0,0,0
+fn probe[N](x: &tensor[N, 4] f32, dst: &mut tensor[N, 4] f32):
+    parallel for k in 0..N:
+        let mut row = to_owned(x[k])
+        for j in 0..4:
+            row[j] = row[j] + 1.0
+        dst[k] = row

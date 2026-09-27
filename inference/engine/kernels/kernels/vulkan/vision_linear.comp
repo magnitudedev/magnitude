@@ -1,0 +1,59 @@
+// vision_linear: one 64 x 64 GEMM tile of y = x . transpose(weight) over the
+// projection library with the Linear epilogue (`lib/vision/vision.glsl`): the
+// bias, the clamp, then the activation, the gate or the F32 residual.
+#include "lib/core/activation.glsl"
+#include "lib/vision/vision.glsl"
+
+#if !defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) && !defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#error "vision_linear requires a bf16 or f16 activation"
+#endif
+
+#if defined(SEISMIC_WEIGHT_REPRESENTATION_BF16)
+#define WEIGHT_KIND PACKETS_BF16
+#define WEIGHT_BYTES 2
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_F16)
+#define WEIGHT_KIND PACKETS_F16
+#define WEIGHT_BYTES 2
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_F32)
+#define WEIGHT_KIND PACKETS_F32
+#define WEIGHT_BYTES 4
+#else
+#error "unsupported vision_linear weight representation"
+#endif
+
+#if defined(SEISMIC_BIAS_REPRESENTATION_BF16)
+#define BIAS_KIND ELEMENT_BF16
+#elif defined(SEISMIC_BIAS_REPRESENTATION_F16)
+#define BIAS_KIND ELEMENT_F16
+#elif defined(SEISMIC_BIAS_REPRESENTATION_F32)
+#define BIAS_KIND ELEMENT_F32
+#else
+#error "unsupported vision_linear bias representation"
+#endif
+
+#if defined(SEISMIC_ELEMENT_Y_REPRESENTATION_BF16)
+#define Y_KIND ELEMENT_BF16
+#elif defined(SEISMIC_ELEMENT_Y_REPRESENTATION_F16)
+#define Y_KIND ELEMENT_F16
+#elif defined(SEISMIC_ELEMENT_Y_REPRESENTATION_F32)
+#define Y_KIND ELEMENT_F32
+#else
+#error "unsupported vision_linear Y representation"
+#endif
+
+void vision_linear() {
+    const uint n = uint(SEISMIC_DIM_N), k = uint(SEISMIC_DIM_K);
+    const projection_prologue in_ = projection_plain(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_X), SEISMIC_X_STRIDE_0, 1ul,
+        k, 0ul);
+    const bool clamped = SEISMIC_DIM_NC == 1;
+    const vision_epilogue out_ = vision_linear_epilogue(ELEMENT_ACT, Y_KIND, int(SEISMIC_PARAM_ACTIVATION),
+        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_DIM_NB == 1,
+        SEISMIC_PTR(SEISMIC_BUFFER_BIAS), BIAS_KIND, SEISMIC_DIM_NR == 1 ? SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL) : 0ul,
+        SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_DIM_NG == 1 ? SEISMIC_PTR(SEISMIC_BUFFER_GATE) : 0ul,
+        SEISMIC_GATE_STRIDE_1, clamped,
+        clamped ? element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_MINIMUM)) : 0.0,
+        clamped ? element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_MAXIMUM)) : 0.0);
+    const projection_weights w = vision_weights(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), SEISMIC_WEIGHT_STRIDE_0,
+        WEIGHT_BYTES, k);
+    vision_gemm(WEIGHT_KIND, in_, out_, w, uint(SEISMIC_DIM_M), n, k, gl_WorkGroupID.y, gl_WorkGroupID.x);
+}

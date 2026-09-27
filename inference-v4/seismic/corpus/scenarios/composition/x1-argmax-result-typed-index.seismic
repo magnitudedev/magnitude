@@ -1,0 +1,9 @@
+# origin: X1:scratch_p49
+# rejected: "returns index"
+fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:
+    return x * 3.0
+fn probe[N](x: &tensor[N] f32, out: &mut tensor[N] f32) -> index[N]:
+    let a = scale(x)
+    let b = scale(x)
+    out[0:N] = b
+    return reduce(a, 0, argmax)

@@ -1,0 +1,7 @@
+# origin: test:validation:corpus/values.seismic:rank_three
+# invoke rank_three: f32[2,3,2]=seq ; f32[2,3,2]=zero
+fn rank_three[A, B, C](x: &tensor[A, B, C] f32, y: &mut tensor[A, B, C] f32):
+    parallel for a in 0..A:
+        parallel for b in 0..B:
+            parallel for c in 0..C:
+                y[a, b, c] = x[a, b, c] + 1.0

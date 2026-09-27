@@ -1,0 +1,19 @@
+# origin: test:seismic-runtime:runtime/src/feedback/binding_tests.rs:exclusive_carried_borrow_rejects_simultaneous_access_to_its_root
+# rejected: "exclusive tensor borrow"
+fn first_one(x: &tensor[2] f32) -> f32:
+    return x[1]
+
+fn main() -> f32:
+    let mut x = tensor[2] f32
+    x[0] = 1.0
+    let mut y = x[0:2]
+    let mut observed = 0.0
+    for i in 0..2:
+        y[1] = 7.0
+        observed = first_one(x)
+        if i == 0:
+            let mut fresh = tensor[2] f32
+            fresh[0] = 0.0
+            fresh[1] = 0.0
+            y = fresh
+    return observed + first_one(y)

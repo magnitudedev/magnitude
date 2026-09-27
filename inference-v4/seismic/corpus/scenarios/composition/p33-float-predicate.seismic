@@ -1,0 +1,11 @@
+# origin: X1:P33
+# invoke: f32[4]=1,2,3,4 ; f32[2]=zero
+# pin: out = f32[2]=0,1
+# invoke: f32[4]=3,2,1,0 ; f32[2]=zero
+# pin: out = f32[2]=1,0
+fn probe(x: &tensor[4] f32, out: &mut tensor[2] f32):
+    let s = x[0] * x[1] - x[2]
+    if s > 0.0:
+        out[0] = 1.0
+    else:
+        out[1] = 1.0

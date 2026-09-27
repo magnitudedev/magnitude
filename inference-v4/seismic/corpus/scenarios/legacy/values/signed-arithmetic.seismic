@@ -1,0 +1,8 @@
+# origin: test:validation:corpus/values.seismic:signed_arithmetic
+# invoke signed_arithmetic: i32[6]=-7,-1,0,3,9,100 ; i32[6]=zero ; i32:5
+fn signed_arithmetic[N](x: &tensor[N] i32, y: &mut tensor[N] i32, k: i32) where N >= 0:
+    parallel for i in 0..N:
+        let v = x[i]
+        let scaled = (v * 3 + k) / 2 - v % 4
+        let bits = ((v & 15) | 1) ^ (v << 2)
+        y[i] = scaled + bits + (v >> 1)

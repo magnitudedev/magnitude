@@ -1,0 +1,4 @@
+# cell: value-packed/exit
+# invoke: q4g64[4,64]=rand(171)
+fn probe(w: &tensor[4, 64] q4g64) -> tensor[64] q4g64:
+    return to_owned(w[1])

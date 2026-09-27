@@ -17,7 +17,6 @@ $InstallationDirectory = [IO.Path]::GetFullPath($InstallationDirectory)
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
 $declaration = Get-Content (Join-Path $InstallationDirectory 'installation.json') -Raw | ConvertFrom-Json
-if ($declaration.backend -ne $Backend) { throw 'Installation backend does not match the requested test' }
 $headers = @{Authorization="Bearer $AuthToken"}
 $results=New-Object System.Collections.Generic.List[object]
 function Record($name,$detail) { $results.Add(@{test=$name;detail=$detail}); Write-Output "PASS $name" }
@@ -39,8 +38,10 @@ function AssertResponse($response) {
 try {
  $hardware=Request GET '/api/v1/hardware' $null
  if ($hardware.native_build -ne $declaration.nativeBuild) { throw 'Running engine identity differs from the installation' }
- $domains=@($hardware.memory_domains | Where-Object {@($_.devices | Where-Object {$_.backend -eq $Backend -and $_.kind -ne 'cpu'}).Count -gt 0})
- if ($domains.Count -eq 0) { throw "No $Backend GPU hardware domain" }
+ if (@($hardware.enabled_backends) -notcontains $Backend) { throw "The engine build does not include $Backend" }
+ # Seismic discovery is the eligibility authority: a device below its backend floor carries unavailable_reason.
+ $domains=@($hardware.memory_domains | Where-Object {@($_.devices | Where-Object {$_.backend -eq $Backend -and $_.kind -ne 'cpu' -and !$_.unavailable_reason}).Count -gt 0})
+ if ($domains.Count -eq 0) { throw "No usable $Backend GPU hardware domain: $(@($hardware.memory_domains.devices | Where-Object {$_.backend -eq $Backend} | ForEach-Object {"$($_.name): $($_.unavailable_reason)"}) -join '; ')" }
  Record 'hardware' $hardware
  for ($i=0;$i -lt 60;$i++) {
   $models=Request GET '/v1/models' $null
@@ -64,8 +65,12 @@ try {
  $allocations=@($ready | ForEach-Object {$_.lifecycle.allocation.memoryDomains} | Where-Object {$_.memoryDomainId -in $domains.id -and $_.modelBytes -gt 0})
  if ($allocations.Count -eq 0) { throw 'Model weights were not allocated on the GPU' }
  Record 'gpu-allocation' $instances
- $modules=@(Get-Process magnitude-inference | ForEach-Object {$_.Modules} | Where-Object {$_.ModuleName -match 'ggml|cublas|cudart'} | Select-Object ModuleName,FileName -Unique)
- if (!($modules | Where-Object {$_.ModuleName -eq "ggml-$Backend.dll" -and $_.FileName -like "$InstallationDirectory\backends\*"})) { throw 'Expected owned GPU module was not loaded' }
+ # The service and its workers load the driver (nvcuda.dll or vulkan-1.dll) at runtime; CUDA also
+ # loads the artifact-owned NVRTC, which must come from the installation's runtime directory.
+ $modules=@(Get-Process magnitude-inference | ForEach-Object {$_.Modules} | Where-Object {$_.ModuleName -match '^(nvcuda|vulkan-1|nvrtc)'} | Select-Object ModuleName,FileName -Unique)
+ $driver=if ($Backend -eq 'cuda') { 'nvcuda.dll' } else { 'vulkan-1.dll' }
+ if (!($modules | Where-Object {$_.ModuleName -eq $driver})) { throw "Expected $driver was not loaded" }
+ if ($Backend -eq 'cuda' -and !($modules | Where-Object {$_.ModuleName -eq 'nvrtc64_120_0.dll' -and $_.FileName -like "$InstallationDirectory\runtime\*"})) { throw 'NVRTC was not loaded from the installation runtime directory' }
  Record 'loaded-modules' $modules
  if ($selected.architecture.input_modalities -contains 'image') {
   # A deterministic 64x64 RGB red PNG exercises the catalog's required projector.

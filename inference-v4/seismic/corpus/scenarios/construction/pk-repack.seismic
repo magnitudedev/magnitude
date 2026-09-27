@@ -1,0 +1,4 @@
+# origin: C11:pk_repack
+# rejected: "registered external representation source"
+fn probe(x: &tensor[128] f32) -> tensor[128] q8g32:
+    return repack[U = q8g32](x)

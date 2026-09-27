@@ -1,0 +1,6 @@
+# origin: test:validation:corpus/shape.seismic:transpose_rows
+# invoke transpose_rows: f32[2,3]=seq ; f32[3,2]=zero
+fn transpose_rows[M, N](x: &tensor[M, N] f32, y: &mut tensor[N, M] f32):
+    let xt = x.T
+    parallel for i in 0..N:
+        y[i] = xt[i]

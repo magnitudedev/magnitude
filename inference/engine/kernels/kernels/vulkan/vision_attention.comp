@@ -1,0 +1,52 @@
+// vision_attention: the prepare launch publishes the attention operands as
+// f16 rows [3][H][padded rows][WP] (W = 4P, WP = W rounded up to 16; queries
+// and keys head-normalized with NQ and rotated, values normalized with NV,
+// each rounded to A; zero past W and past the last row); the attend launch
+// runs 64 query rows of one head per workgroup, 16 per subgroup, over the
+// keys of their spans in 32-key tiles. Bodies in lib/vision/vision.glsl.
+#include "lib/core/activation.glsl"
+#include "lib/vision/vision.glsl"
+
+#if !defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) && !defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#error "vision_attention requires a bf16 or f16 activation"
+#endif
+
+#define VISION_W uint(4ul * SEISMIC_DIM_P)
+#define VISION_WP ((VISION_W + 15u) / 16u * 16u)
+#define VISION_H uint(SEISMIC_DIM_H)
+#define VISION_M uint(SEISMIC_DIM_M)
+#define VISION_PADDED ((VISION_M + VISION_ATTEND_ROWS - 1u) / VISION_ATTEND_ROWS * VISION_ATTEND_ROWS)
+
+// Workgroup (padded row, 8 of the 3H head rows), one subgroup per head row:
+// query heads, key heads, value heads. Rows past M publish zeros.
+void vision_attention_prepare() {
+    const uint row = gl_WorkGroupID.x;
+    const uint part = gl_WorkGroupID.y * SEISMIC_SUBGROUPS + SEISMIC_SUBGROUP;
+    if (part >= 3u * VISION_H)
+        return;
+    const uint64_t target = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_OPERANDS)
+        + ((uint64_t(part) * VISION_PADDED + row) * VISION_WP) * 2ul;
+    if (row >= VISION_M) {
+        for (uint i = SEISMIC_LANE; i < VISION_WP; i += 32u)
+            element_put(ELEMENT_F16, target, i, 0.0);
+        return;
+    }
+    const uint plane = part / VISION_H, head = part % VISION_H;
+    const uint64_t source = plane == 0u ? SEISMIC_PTR(SEISMIC_BUFFER_QUERY)
+        : plane == 1u ? SEISMIC_PTR(SEISMIC_BUFFER_KEY) : SEISMIC_PTR(SEISMIC_BUFFER_VALUE);
+    const uint64_t norm = plane == 0u ? SEISMIC_PTR(SEISMIC_BUFFER_QUERY_NORM)
+        : plane == 1u ? SEISMIC_PTR(SEISMIC_BUFFER_KEY_NORM) : 0ul;
+    const bool normed = plane < 2u ? SEISMIC_DIM_NQ == 1 : SEISMIC_DIM_NV == 1;
+    vision_prepare_head(ELEMENT_ACT, source + (uint64_t(row) * VISION_H + head) * VISION_W * 2ul, target, normed,
+        norm, element_word_f32(SEISMIC_PARAM_EPSILON), plane < 2u,
+        SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + uint64_t(row) * 8ul, element_word_f32(SEISMIC_PARAM_LOG_BASE),
+        VISION_W, VISION_WP);
+}
+
+// Workgroup (64-row query tile, head).
+void vision_attention_attend() {
+    const float scale = int(SEISMIC_PARAM_UNIT_SCALE) != 0 ? 1.0 : inversesqrt(float(VISION_W));
+    vision_attend(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_OPERANDS), SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
+        VISION_M, VISION_PADDED, VISION_H, VISION_W, VISION_WP, scale,
+        SEISMIC_DIM_WS == 1 ? SEISMIC_PTR(SEISMIC_BUFFER_SPANS) : 0ul, gl_WorkGroupID.x, gl_WorkGroupID.y);
+}

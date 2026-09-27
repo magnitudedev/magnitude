@@ -1,0 +1,5 @@
+# origin: C1:p14
+# undecided: reassociated
+# invoke s: f32[64]=rand(70)
+fn s[N](x: &tensor[N] f32) -> f32:
+    return reduce(x, 0, sum, unordered=true)

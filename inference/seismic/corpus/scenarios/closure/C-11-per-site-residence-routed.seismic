@@ -1,0 +1,78 @@
+# origin: X4:R6-X4-1
+# invoke: f32[1,256]=rand(11) ; i32[1,8]=zero ; f32[1,8]=zero ; f32[1,8,2048]=rand(12) ; f32[1,2048]=rand(13) ; f32[1,1]=0.5 ; f32[1,2048]=rand(14) ; f32[1,2048]=zero ; i32:1
+# expect: returned
+# invoke: f32[3,256]=rand(15) ; i32[3,8]=zero ; f32[3,8]=zero ; f32[3,8,2048]=rand(16) ; f32[3,2048]=rand(17) ; f32[3,1]=0.5,0.25,-1 ; f32[3,2048]=rand(18) ; f32[3,2048]=zero ; i32:1
+# expect: returned
+# invoke: f32[2,256]=rand(19) ; i32[2,8]=zero ; f32[2,8]=zero ; f32[2,8,1024]=rand(20) ; f32[2,1024]=rand(21) ; f32[2,1]=1,2 ; f32[2,1024]=rand(22) ; f32[2,1024]=zero ; i32:0
+# expect: returned
+# invoke: f32[1,4]=0.5,2,1,-1 ; i32[1,2]=zero ; f32[1,2]=zero ; f32[1,2,2]=1,2,3,4 ; f32[1,2]=10,20 ; f32[1,1]=0.5 ; f32[1,2]=100,200 ; f32[1,2]=zero ; i32:0
+# expect: returned
+# V3 stable ascending top-k: larger expert IDs win cutoff ties; selected routes
+# are published in ascending (probability, ID) order.
+fn route_topk[M, E, K](logits: &tensor[M, E] f32, routes: &mut tensor[M, K] i32,
+                       scores: &mut tensor[M, K] f32, normalize: i32):
+    parallel for row in 0..M:
+        let values = f32(logits[row])
+        let maximum = reduce(values, 0, max)
+        let mut probabilities = exp(values - maximum)
+        let total = reduce(probabilities, 0, sum)
+        probabilities = probabilities / total
+        let mut selected = tensor[K] f32
+        let mut indices = tensor[K] i32
+        for i in 0..K:
+            selected[i] = 0.0
+            indices[i] = 0
+        for rank in 0..K:
+            let best = reduce(probabilities, 0, max)
+            let mut candidates = tensor[E] i32
+            for i in 0..E:
+                candidates[i] = -1
+                if probabilities[i] == best:
+                    candidates[i] = i32(i)
+            let winner = reduce(i32(candidates), 0, max)
+            for i in 0..K:
+                if i == K - 1 - rank:
+                    selected[i] = best
+                    indices[i] = winner
+            for i in 0..E:
+                if i == winner:
+                    probabilities[i] = -inf
+        let mut denominator = f32(1.0)
+        if normalize != 0:
+            denominator = reduce(f32(selected), 0, sum)
+        for i in 0..K:
+            selected[i] = f32(selected[i]) / denominator
+        routes[row] = indices
+        scores[row] = selected
+
+
+fn routed_merge[M, K, H](experts: &tensor[M, K, H] A, scores: &tensor[M, K] f32,
+                         shared: &tensor[M, H] A, coefficient: &tensor[M, 1] A,
+                         residual: &tensor[M, H] f32, out: &mut tensor[M, H] f32):
+    parallel for row in 0..M:
+        let mut selected = tensor[H] f32
+        for i in 0..H:
+            selected[i] = 0.0
+        for choice in 0..K:
+            for i in 0..H:
+                selected[i] = selected[i] + scores[row, choice] * f32(experts[row, choice, i])
+        for i in 0..H:
+            let gated_shared = f32(shared[row, i]) * f32(coefficient[row, 0])
+            selected[i] = residual[row, i] + selected[i] + gated_shared
+        out[row] = selected
+
+
+fn probe[M, E, K, H](logits: &tensor[M, E] f32, routes: &mut tensor[M, K] i32,
+                     scores: &mut tensor[M, K] f32, experts: &tensor[M, K, H] f32,
+                     shared: &tensor[M, H] f32, coefficient: &tensor[M, 1] f32,
+                     residual: &tensor[M, H] f32, out: &mut tensor[M, H] f32, normalize: i32):
+    route_topk(logits, routes, scores, normalize)
+    routed_merge(experts, scores, shared, coefficient, residual, out)
+
+# C-11 (IF I-93): two promotable cohort sites of one entry, decided independently.
+# `route_topk` and `routed_merge` are verbatim from `engine/lib/routed_suffix.seismic`.
+# On Metal (threshold 6144 B) `route_topk` (E=256, K=8: about 2.1 KB of cohort-context locals)
+# is promoted, and `routed_merge` (W_s = 4H) is unpromoted at H=2048 (8192 B, the 35B shape,
+# invocations 1 and 2) and promoted at H=1024 (4096 B, invocation 3). Under revision 7's
+# class R the H=2048 entry forced `route_topk` unpromoted too; under I-93 it stays promoted.
+# Every outcome is the interpreter's, whichever twin each site runs.

@@ -1,0 +1,8 @@
+# origin: C32:G-T15-3
+# invoke v5: f32[3,3]=seq ; f32[1]=zero
+# pin: y = f32[1]=0
+fn take[K](x: &tensor[K] f32, y: &mut tensor[1] f32):
+    y[0] = x[0]
+
+fn v5[P](x: &tensor[P, P] f32, y: &mut tensor[1] f32):
+    take(reshape(x, (P * P,)), y)

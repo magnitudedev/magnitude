@@ -1,0 +1,29 @@
+// draft_confidence: one workgroup per row reduces weight · [features ;
+// memory] + bias and marks the row's selection declined (status 3) when its
+// sigmoid is below the threshold. The Vulkan form of
+// `metal/draft_confidence.metal`.
+#include "lib/core/activation.glsl"
+#include "lib/core/reduce.glsl"
+
+// Shared: one partial per subgroup (reduce_group_sum at float 0).
+void draft_confidence() {
+    const uint64_t features = SEISMIC_PTR(SEISMIC_BUFFER_FEATURES);
+    const uint64_t memory = SEISMIC_PTR(SEISMIC_BUFFER_MEMORY);
+    const uint64_t weight = SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT);
+    const uint64_t selection = SEISMIC_PTR(SEISMIC_BUFFER_SELECTION);
+    const uint64_t row = gl_WorkGroupID.x;
+    const uint64_t width = SEISMIC_DIM_D, rank = SEISMIC_DIM_R;
+    float partial = 0.0;
+    for (uint64_t i = gl_LocalInvocationIndex; i < width; i += gl_WorkGroupSize.x)
+        partial = seismic_fma_rn(
+            element_at(ELEMENT_ACT, features, row * SEISMIC_FEATURES_STRIDE_0 + i * SEISMIC_FEATURES_STRIDE_1),
+            element_f32_at(weight + i * SEISMIC_WEIGHT_STRIDE_0 * 4ul), partial);
+    for (uint64_t i = gl_LocalInvocationIndex; i < rank; i += gl_WorkGroupSize.x)
+        partial = seismic_fma_rn(
+            element_at(ELEMENT_ACT, memory, row * SEISMIC_MEMORY_STRIDE_0 + i * SEISMIC_MEMORY_STRIDE_1),
+            element_f32_at(weight + (width + i) * SEISMIC_WEIGHT_STRIDE_0 * 4ul), partial);
+    const float score = reduce_group_sum(partial, 0u) + element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_BIAS));
+    if (gl_LocalInvocationIndex == 0u
+        && 1.0 / (1.0 + exp(-score)) < element_word_f32(SEISMIC_PARAM_THRESHOLD))
+        element_i32_put(selection + (row * SEISMIC_SELECTION_STRIDE_0 + SEISMIC_SELECTION_STRIDE_1) * 4ul, 3);
+}

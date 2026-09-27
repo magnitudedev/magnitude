@@ -1,0 +1,4 @@
+# origin: C18:G-T1-6
+# rejected: "i32("
+fn probe(b: &tensor[4] bool) -> bool:
+    return reduce(b, 0, max)

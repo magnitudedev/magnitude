@@ -5,7 +5,7 @@ import { resolve, dirname } from "node:path"
 import { AppleConsumerReceipt, AppleDistributionReceipt } from "./distribution"
 import { AppleDistributionFailed } from "./signing"
 import { ReleaseArtifactSchema, ReleaseManifestSchema } from "../../src/contracts"
-import { backendPacks, releaseHosts } from "../../src/targets"
+import { releaseHosts } from "../../src/targets"
 import { sha256File } from "../../src/macos-app"
 
 export const verifyAppleReceipts = (root: string, candidate?: string) => Effect.gen(function* () {
@@ -27,9 +27,7 @@ export const verifyAppleReceipts = (root: string, candidate?: string) => Effect.
     const receipt = yield* fs.readFileString(file).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(AppleDistributionReceipt))))
     if (receipt.sourceCommit !== expectedCommit || receipt.team !== team) return yield* fail("Apple receipt does not match the selected commit and publisher")
     const units = receipt.notarizations.map((value) => value.unit)
-    const requiredUnits = receipt.artifacts.some((value) => value.id.startsWith("acn-"))
-      ? ["cli", "inference", "app", "desktop"]
-      : receipt.artifacts.map((value) => value.id.replace(/^icn-backend-/, ""))
+    const requiredUnits = ["cli", "inference", "app", "desktop"]
     if (units.length !== requiredUnits.length || requiredUnits.some((unit) => !units.includes(unit))) return yield* fail("Apple receipt is missing a native software submission")
     for (const artifact of receipt.artifacts) {
       if (accepted.has(artifact.id)) return yield* fail(`Duplicate Apple receipt for ${artifact.id}`)
@@ -40,10 +38,8 @@ export const verifyAppleReceipts = (root: string, candidate?: string) => Effect.
       accepted.set(artifact.id, artifact.sha256)
     }
   }
-  const expected = [
-    ...releaseHosts.filter((host) => host.id.startsWith("darwin-")).flatMap((host) => [`cli-${host.id}`, `acn-${host.id}`, `icn-base-${host.id}`, `desktop-${host.id}`, `desktop-update-${host.id}`]),
-    ...backendPacks.filter((pack) => pack.host.startsWith("darwin-")).map((pack) => `icn-backend-${pack.id}`),
-  ]
+  const expected = releaseHosts.filter((host) => host.id.startsWith("darwin-")).flatMap((host) =>
+    [`cli-${host.id}`, `acn-${host.id}`, `icn-base-${host.id}`, `desktop-${host.id}`, `desktop-update-${host.id}`])
   if (expected.some((id) => !accepted.has(id)) || accepted.size !== expected.length) return yield* fail("Publication requires the complete Developer ID and notarization receipt graph")
   const consumed = new Set<string>()
   for (const file of files.filter((path) => path.endsWith("/apple-consumer.receipt.json"))) {
@@ -54,8 +50,7 @@ export const verifyAppleReceipts = (root: string, candidate?: string) => Effect.
       consumed.add(artifact.id)
     }
   }
-  const hostArtifacts = expected.filter((id) => !id.startsWith("icn-backend-"))
-  if (hostArtifacts.some((id) => !consumed.has(id)) || consumed.size !== hostArtifacts.length) return yield* fail("Publication requires independent Apple host consumer acceptance")
+  if (expected.some((id) => !consumed.has(id)) || consumed.size !== expected.length) return yield* fail("Publication requires independent Apple host consumer acceptance")
   if (candidate !== undefined) {
     const manifest = yield* fs.readFileString(resolve(candidate, "magnitude-release.json")).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(ReleaseManifestSchema))))
     if (manifest.sourceCommit !== expectedCommit) return yield* fail("Candidate and Apple receipts name different commits")

@@ -7,8 +7,8 @@ applies_to:
   - packages/acn/src/provider-model-catalog.ts
   - packages/agent/src/**
   - packages/acn-protocol/src/schemas/model-state.ts
-  - inference/crates/icn-api/**
-  - inference/crates/icn-server/**
+  - inference/service/api/**
+  - inference/service/server/**
 ---
 
 # ICN provider contract

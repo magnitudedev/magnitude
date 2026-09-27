@@ -1,0 +1,10 @@
+# origin: X1:P07 X1:q2
+# invoke: f32[4]=1,2,3,4 ; bool:true
+# pin: out = f32[4]=5,4,3,4
+# invoke: f32[4]=1,2,3,4 ; bool:false
+# pin: out = f32[4]=5,2,3,4
+fn probe(out: &mut tensor[4] f32, c: bool):
+    let mut v = out[0:2]
+    if c:
+        v = out[2:4]
+    v[0] = 5.0

@@ -1,35 +1,27 @@
 {
   "name": "@magnitudedev/inference",
   "private": true,
+  "type": "module",
   "dependencies": {
+    "@effect/platform": "^0.96.0",
+    "@effect/platform-bun": "^0.90.0",
     "@magnitudedev/icn-protocol": "workspace:*",
+    "@magnitudedev/release": "workspace:*",
+    "@magnitudedev/utils": "workspace:*",
     "effect": "3.21.2"
   },
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "vitest": "^3.2.4"
+  },
   "scripts": {
-    "build": "bun run scripts/build-local.ts",
-    "build:reference": "bun run scripts/build-reference.ts",
-    "build:candidate": "bun run scripts/build-candidate.ts",
-    "benchmark": "cargo run -p benchmark-runner --",
-    "benchmark:validate": "cargo run -p benchmark-runner -- validate --root benchmark",
     "check": "cargo check --workspace",
     "test": "cargo test --workspace",
-    "test:upstream": "bun run scripts/test-upstream.ts",
-    "assess-model": "cargo run -p icn-hardware --bin icn-model-assessment --",
-    "parity": "cargo run -p icn-parity -- run --root parity --profile pr",
-    "parity:validate": "cargo run -p icn-parity -- validate --root parity",
-    "parity:list": "cargo run -p icn-parity -- list --root parity",
-    "parity:models": "cargo run -p icn-parity -- models --root parity list",
-    "parity:models:verify": "cargo run -p icn-parity -- models --root parity verify",
-    "parity:models:fetch": "cargo run -p icn-parity -- models --root parity fetch",
-    "parity:test": "cargo test -p icn-parity",
-    "parity:test:ts": "bunx --bun vitest run scripts/*.test.ts",
-    "parity:typecheck": "bunx tsc -p tsconfig.json",
-    "dev": "cargo run -p icn-server -- serve --fake",
+    "build": "bun run scripts/build-local.ts",
     "serve": "bun run scripts/build-local.ts --serve",
-    "doctor": "cargo run -p icn-server -- doctor",
-    "version": "cargo run -p icn-server -- version --json",
-    "verify:native-pin": "bun run scripts/verify-native-pin.ts",
-    "verify:bridge": "bun run scripts/verify-bridge-manifest.ts",
-    "verify:safe-bindings": "bun run scripts/verify-safe-binding-boundary.ts"
+    "smoke": "bun run scripts/smoke.ts",
+    "catalog:build-bundle": "cargo run -p magnitude-service-catalog-tool -- build-bundle --output target/catalog-inputs/model-planner-inputs.bundle --model-store ~/.magnitude/models --cache-root ~/.magnitude/cache",
+    "scripts:test": "bunx --bun vitest run scripts",
+    "scripts:typecheck": "bunx tsc --noEmit -p tsconfig.json"
   }
 }

@@ -1,0 +1,9 @@
+# origin: C11:par_if
+# cell: if/parallel
+# invoke: f32[4]=1,2,3,4 ; f32[4]=9,9,9,9
+fn probe[N](x: &tensor[N] f32, dst: &mut tensor[N] f32):
+    parallel for k in 0..N:
+        if x[k] > 1.5:
+            dst[k] = x[k]
+        else:
+            dst[k] = 0.0

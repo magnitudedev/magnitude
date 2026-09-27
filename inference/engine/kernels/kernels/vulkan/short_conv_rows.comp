@@ -1,0 +1,78 @@
+// short_conv_rows (contract and portable body in short_conv.seismic): the
+// gated causal depthwise convolution of one short-convolution layer. The
+// Vulkan form of `cuda/short_conv_rows.cu`: an invocation owns one channel of
+// one item, item y < M computes row y (zero past the slots), item M + b
+// publishes slot b's successor window, and the y grid visits the items with a
+// stride (it is capped at the 65535-group floor). Each output is the body's
+// tap-ascending F32 FMA chain times the gate, so every row class and backend
+// gives the same bits.
+#include "lib/core/activation.glsl"
+#include "lib/recurrent/versions.glsl"
+
+// Publishes channel `channel` of slot `index`'s successor window.
+void short_conv_publish(uint64_t index, uint64_t channel) {
+    const uint64_t projection = SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION);
+    const uint64_t window = SEISMIC_PTR(SEISMIC_BUFFER_WINDOW);
+    const int taps = int(SEISMIC_DIM_C) - 1;
+    const uint64_t bank_bytes = SEISMIC_WINDOW_STRIDE_0 * 4ul;
+    const versions_slot slot = versions_slot_of(index);
+    const uint64_t source = versions_bank(window, slot.source, bank_bytes);
+    const uint64_t target = versions_bank(window, slot.target, bank_bytes);
+    const int published = taps + versions_tape_rows(slot);
+    for (int tap = 0; tap < published; ++tap) {
+        const int position = slot.stop + tap - taps;
+        const float value = position < 0
+            ? element_f32_at(source + (uint64_t(slot.taped + slot.stop + tap) * SEISMIC_WINDOW_STRIDE_1
+                + channel * SEISMIC_WINDOW_STRIDE_2) * 4ul)
+            : element_f32_at(projection + (uint64_t(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0
+                + channel * SEISMIC_PROJECTION_STRIDE_1) * 4ul);
+        element_f32_put(target + (uint64_t(tap) * SEISMIC_WINDOW_STRIDE_1 + channel * SEISMIC_WINDOW_STRIDE_2) * 4ul,
+            value);
+    }
+}
+
+// Channel `channel` of row `row`'s gated convolution.
+void short_conv_convolve(int row, uint64_t channel) {
+    const uint64_t projection = SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION);
+    const uint64_t convolution = SEISMIC_PTR(SEISMIC_BUFFER_CONVOLUTION);
+    const uint64_t window = SEISMIC_PTR(SEISMIC_BUFFER_WINDOW);
+    const uint64_t gated = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const int taps = int(SEISMIC_DIM_C) - 1;
+    const uint64_t slot_index = versions_slot_index_of_row(row);
+    const uint64_t element = uint64_t(row) * SEISMIC_RESULT_0_STRIDE_0 + channel * SEISMIC_RESULT_0_STRIDE_1;
+    if (slot_index == SEISMIC_DIM_B) {
+        element_put(ELEMENT_ACT, gated, element, 0.0);
+        return;
+    }
+    const versions_slot slot = versions_slot_of(slot_index);
+    const uint64_t source = versions_bank(window, slot.source, SEISMIC_WINDOW_STRIDE_0 * 4ul);
+    const int local = row - slot.lo;
+    float sum = 0.0;
+    for (int tap = 0; tap <= taps; ++tap) {
+        const int position = local + tap - taps;
+        const float value = position < 0
+            ? element_f32_at(source + (uint64_t(slot.taped + taps + position) * SEISMIC_WINDOW_STRIDE_1
+                + channel * SEISMIC_WINDOW_STRIDE_2) * 4ul)
+            : element_f32_at(projection + (uint64_t(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0
+                + channel * SEISMIC_PROJECTION_STRIDE_1) * 4ul);
+        const float weight = element_f32_at(convolution
+            + (channel * SEISMIC_CONVOLUTION_STRIDE_0 + uint64_t(tap) * SEISMIC_CONVOLUTION_STRIDE_1) * 4ul);
+        sum = seismic_fma_rn(weight, value, sum);
+    }
+    const float gate = element_f32_at(projection
+        + (uint64_t(row) * SEISMIC_PROJECTION_STRIDE_0 + (SEISMIC_DIM_CH + channel) * SEISMIC_PROJECTION_STRIDE_1) * 4ul);
+    element_put(ELEMENT_ACT, gated, element, seismic_mul_rn(gate, sum));
+}
+
+void short_conv_rows() {
+    const uint64_t channel = uint64_t(gl_WorkGroupID.x) * gl_WorkGroupSize.x + gl_LocalInvocationIndex;
+    if (channel >= SEISMIC_DIM_CH)
+        return;
+    const uint64_t rows = SEISMIC_DIM_M;
+    for (uint64_t item = gl_WorkGroupID.y; item < rows + SEISMIC_DIM_B; item += gl_NumWorkGroups.y) {
+        if (item >= rows)
+            short_conv_publish(item - rows, channel);
+        else
+            short_conv_convolve(int(item), channel);
+    }
+}

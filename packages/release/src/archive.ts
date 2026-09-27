@@ -10,10 +10,9 @@ import type { ReleaseArtifact } from "./contracts"
 import { ReleaseAcquisitionError } from "./errors"
 import type { ArtifactByteProgress } from "./installation-progress"
 import { MACOS_APP_NAME, MACOS_REQUIRED_FILES } from "./macos-app"
-import {
-  ACN_EXECUTABLE_NAME,
-  ICN_EXECUTABLE_NAME,
-} from "./executables"
+import { ACN_EXECUTABLE_NAME } from "./executables"
+import { inferenceRequiredPaths, isInferenceInstallationPath } from "./inference-installation"
+import { hostById } from "./targets"
 
 const EXPANDED_LIMIT = 8 * 1024 * 1024 * 1024
 const ENTRY_LIMIT = 65_536
@@ -84,33 +83,16 @@ const validateLayout = (
     return Effect.void
   }
   if (artifact.kind === "icn-base") {
-    for (const required of [
-      `bin/${ICN_EXECUTABLE_NAME}${extension}`,
-      "catalog/model-planner-inputs.bundle",
-    ]) {
+    if (Option.isNone(artifact.host)) {
+      return archiveError(`${artifact.id} names no host`)
+    }
+    for (const required of inferenceRequiredPaths(hostById(artifact.host.value))) {
       if (!paths.has(required)) {
         return archiveError(`${artifact.id} is missing ${required}`)
       }
     }
-    if (![...paths].some((path) => path.startsWith("backends/"))) {
-      return archiveError(`${artifact.id} has no CPU backend`)
-    }
-    if ([...paths].some((path) =>
-      !path.startsWith("bin/") &&
-      !path.startsWith("runtime/") &&
-      !path.startsWith("backends/") &&
-      !path.startsWith("catalog/")
-    )) {
+    if ([...paths].some((path) => !isInferenceInstallationPath(path))) {
       return archiveError(`${artifact.id} has an unexpected path`)
-    }
-    return Effect.void
-  }
-  if (artifact.kind === "icn-backend") {
-    if (
-      ![...paths].some((path) => path.startsWith("backends/")) ||
-      [...paths].some((path) => !path.startsWith("runtime/") && !path.startsWith("backends/"))
-    ) {
-      return archiveError(`${artifact.id} has an invalid backend-pack layout`)
     }
   }
   return Effect.void

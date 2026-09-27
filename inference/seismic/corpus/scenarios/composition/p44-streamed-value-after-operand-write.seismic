@@ -1,0 +1,8 @@
+# origin: X1:P44
+# invoke: f32[4]=1,2,3,4
+# pin: result = f32[4]=2,4,6,8
+fn probe(x: &tensor[4] f32) -> tensor[4] f32:
+    let mut a = to_owned(x)
+    let c = a + a
+    a[0] = 7.0
+    return c

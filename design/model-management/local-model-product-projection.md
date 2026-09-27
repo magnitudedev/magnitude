@@ -1,7 +1,7 @@
 ---
 applies_to:
-  - inference/crates/icn-contracts/src/models.rs
-  - inference/crates/icn-models/**
+  - inference/service/contracts/src/models.rs
+  - inference/service/models/**
   - packages/icn/src/models/**
   - packages/icn/src/events/**
   - packages/icn/src/instances/**
@@ -86,6 +86,8 @@ remain authoritative.
 - Every callable external Hugging Face artifact appears once under its `hf:` identity.
 - Native `Incompatible` assessment outcomes remain visible but never become offerings; targets
   whose assessment attempt fails are omitted.
+- Catalog rows carry their catalog support level unchanged; support and assessment stay separate
+  facts in the projection.
 - An externally owned discovery can be selected and loaded but cannot be installed, updated, or
   removed through catalog commands.
 - Provider offerings contain no fallback profile, capability, ranking, package, or bundle data.

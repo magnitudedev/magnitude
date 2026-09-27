@@ -2,10 +2,9 @@
 applies_to:
   - packages/storage/src/**
   - packages/ai/src/provider/file-catalog.ts
-  - inference/crates/icn-models/**
-  - inference/crates/icn-hardware/**
-  - inference/crates/icn-utils/**
-  - inference/crates/icn-server/src/load_progress.rs
+  - inference/service/models/**
+  - inference/service/utils/**
+  - inference/service/server/src/assessment/**
   - inference/catalog/**
   - packages/icn/src/lifecycle/**
   - packages/acn/src/icn/layer.ts
@@ -158,12 +157,12 @@ Cache deletion and garbage collection are always safe. Size and age policies may
 the next access regenerates it. Negative or operational results are cached only when they are stable
 domain facts with complete validity evidence; transient failures are never persisted as facts.
 
-Model hardware-assessment entries are interpreted only with the normalized physical-memory
-topology captured for the current assessment environment. Domain identities must be unique,
-reference that topology, include the canonical system domain, and satisfy their aggregate and
-per-domain byte-accounting invariants. Domain usable capacity and canonically identified device
-constraints must exactly match current stable topology limits. Live available/free memory is not
-cached assessment evidence. Failure of any such check is an entry-level miss; readers do not
+Model-assessment entries are keyed by the complete assessment identity: the assessment environment
+(engine build, device and toolchain, normalized stable topology and process limits, measurement
+basis, reserve policy and serving configuration), the exact bundle, and the profile with its
+performance depths. A measurement basis is keyed by its measurement identity (engine build,
+backend, device tuning identity and protocol). Live available/free memory is not cached assessment
+evidence. An absent or unreadable entry is an entry-level miss; readers do not
 recognize historical aliases or add a cache-format revision to force invalidation.
 
 Model inventory indexes, content hashes, GGUF inspection, source resolution, package construction,
@@ -224,7 +223,7 @@ richer recovery report, preservation, and catastrophic-error behavior. A cache m
 single all-or-nothing decode when its schema contains independent entries.
 
 The Rust side uses Serde and `serde_json`, with the common file mechanics and small recovery
-combinators owned by `icn-utils`. The shared layer provides bounded no-fail reads, object/root
+combinators owned by `magnitude-service-utils`. The shared layer provides bounded no-fail reads, object/root
 fallback, independent map and array entry decoding, best-effort directory creation, bounded binary
 and JSON publication, restrictive temporary files, and same-directory atomic replacement. Cache
 callers receive `Option`, an empty/default value, or a hit/miss type without an I/O or decode error
@@ -238,9 +237,9 @@ behavior. An explicit `serde_json::Value` boundary remains preferable when ident
 cross-field invariants, unknown-field preservation, or custom recovery decisions are required.
 
 `serde_with` is a convenience, not a required layer in every cache and not an abstraction to wrap or
-reimplement in `icn-utils`. The Rust design deliberately excludes a runtime schema algebra, a
+reimplement in `magnitude-service-utils`. The Rust design deliberately excludes a runtime schema algebra, a
 generic recursive schema walker, and automatic mutation-and-retry of arbitrary decode-error paths.
-New recovery helpers are added to `icn-utils` only after the same mechanically correct pattern is
+New recovery helpers are added to `magnitude-service-utils` only after the same mechanically correct pattern is
 needed by more than one consumer or is required to keep file I/O no-fail.
 
 Disposable-cache reads may silently return misses. A bounded recovery report is optional and is

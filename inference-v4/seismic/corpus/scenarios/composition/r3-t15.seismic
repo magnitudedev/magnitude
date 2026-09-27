@@ -1,0 +1,12 @@
+# origin: X1:r3-t15
+# invoke: f32[4]=1,2,3,4
+# pin: result = f32[4]=2,4,6,8
+# pin: a = f32[4]=7,2,3,4
+fn twice[N](a: &tensor[N] f32) -> tensor[N] f32:
+    return a * 2.0
+fn wrap[N](a: &tensor[N] f32) -> tensor[N] f32:
+    return twice(a)
+fn probe[N](a: &mut tensor[N] f32) -> tensor[N] f32:
+    let c = wrap(a)
+    a[0] = 7.0
+    return c

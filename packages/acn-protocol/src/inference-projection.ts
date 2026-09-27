@@ -5,13 +5,12 @@ import type {
   ModelLoadPlan,
   ModelResidency,
 } from "@magnitudedev/acn-protocol"
+import { LocalInferenceDeviceIdSchema } from "./schemas/model-state"
 
 export const projectInferenceAllocation = (
   allocation: InferenceSchema.ModelInstanceAllocation,
 ): ModelInstanceAllocation => ({
   contextWindowTokens: allocation.contextWindowTokens,
-  parallelSequences: allocation.parallelSequences,
-  physicalContextTokens: allocation.physicalContextTokens,
   memoryDomains: allocation.memoryDomains.map((domain) => ({
     memoryDomainId: domain.memoryDomainId as ModelInstanceAllocation["memoryDomains"][number]["memoryDomainId"],
     modelBytes: domain.modelBytes,
@@ -25,9 +24,11 @@ export const projectInferenceLoadPlan = (
   plan: InferenceSchema.ModelLoadPlan,
 ): ModelLoadPlan => ({
   contextWindowTokens: plan.contextWindowTokens,
-  parallelSequences: plan.parallelSequences,
-  physicalContextTokens: plan.physicalContextTokens,
-  requiredSystemMemoryBytes: plan.requiredSystemMemoryBytes,
+  requiredMemoryBytes: plan.requiredMemoryBytes,
+  device: {
+    deviceId: LocalInferenceDeviceIdSchema.make(plan.device.id),
+    backend: plan.device.backend,
+  },
 })
 
 export const projectInferenceResidency = (
@@ -37,7 +38,7 @@ export const projectInferenceResidency = (
     case "Loading": return {
       _tag: "Loading",
       stage: instance.lifecycle.stage,
-      progress: Option.flatMap(instance.lifecycle.progress, Option.fromNullable),
+      fraction: instance.lifecycle.fraction,
       plannedAllocation: Option.map(instance.lifecycle.plannedAllocation, projectInferenceLoadPlan),
     }
     case "Ready": return {

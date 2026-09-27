@@ -1,0 +1,5 @@
+# origin: H-26
+# invoke: f32[65536]=zero
+# pin: result = f32[]=0x5f800000
+fn probe[N](x: &tensor[N] f32) -> f32:
+    return f32(N*N*N*N)

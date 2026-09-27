@@ -1,0 +1,11 @@
+# origin: X1:P02
+# invoke: f32[4]=1,2,3,4 ; index:0
+# pin: result = f32[4]=1,2,3,4
+fn sq[N](x: &tensor[N] f32) -> tensor[N] f32:
+    return x * x
+fn probe[N](x: &tensor[N] f32, n: index[8]) -> tensor[N] f32:
+    let mut acc = to_owned(x)
+    for i in 0..n:
+        if acc[0] > 1.0:
+            acc = sq(acc)
+    return acc

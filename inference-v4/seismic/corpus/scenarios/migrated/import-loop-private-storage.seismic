@@ -1,0 +1,12 @@
+# origin: test:seismic-compiler:compiler/src/portable/import_tests.rs:loop_private_storage_does_not_escape_scalar_result
+# invoke:
+fn scratch() -> f32:
+    let mut total = 0.0
+    for i in 0..2:
+        let mut local = tensor[1] f32
+        local[0] = 3.0
+        total = total + local[0]
+    return total
+
+fn probe() -> f32:
+    return scratch()

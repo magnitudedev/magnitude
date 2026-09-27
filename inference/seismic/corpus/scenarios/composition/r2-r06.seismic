@@ -1,0 +1,6 @@
+# origin: X1:r2-r06
+# rejected: "tensor borrow is live"
+fn probe(t: &mut tensor[4] f32):
+    for i in 0..3:
+        let v = t[1:4]
+        t[i] = v[i]

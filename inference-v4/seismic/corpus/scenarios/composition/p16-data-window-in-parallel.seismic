@@ -1,0 +1,16 @@
+# origin: X1:P16
+# invoke: f32[8]=1,2,3,4,5,6,7,1 ; i32[3,2]=1,2,3,4,5,6 ; f32[3]=zero
+# pin: out = f32[3]=4,8,12
+# invoke: f32[8]=1,2,3,4,5,6,7,1 ; i32[3,2]=0,8,4,4,6,2 ; f32[3]=zero
+fn window_sum[K](x: &tensor[K] f32) -> f32:
+    let mut s = tensor[K] f32
+    for j in 0..K:
+        s[j] = x[j] * 2.0
+    return reduce(s, 0, sum)
+fn probe[Q, T](x: &tensor[T] f32, visible: &tensor[Q, 2] i32, out: &mut tensor[Q] f32):
+    parallel for r in 0..Q:
+        let lo = visible[r, 0]
+        let hi = visible[r, 1]
+        out[r] = 0.0
+        if hi > lo:
+            out[r] = window_sum(x[lo:hi])

@@ -1,0 +1,5 @@
+# origin: C11:s_select_math
+# cell: tensor-elementwise/sl
+# invoke: f32[4]=1,-2,0.5,-0.1
+fn probe(x: &tensor[4] f32) -> tensor[4] f32:
+    return select(x > 0.0, exp(x), -x)

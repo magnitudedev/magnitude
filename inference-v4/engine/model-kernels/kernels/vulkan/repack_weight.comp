@@ -1,0 +1,240 @@
+// Exact GGUF -> resident conversion (the Seismic registry's registered
+// `repack`) into `rows16` storage, the Vulkan resident layout (spec §10.1).
+// E is the GGUF source, U the resident (representation, layout); the entry
+// sees every weight as a [B, N, K] view. The Vulkan form of
+// `metal/repack_weight.metal`'s rows16 path.
+//
+// Each workgroup (32 invocations) converts one row tile: 16 rows x 32
+// columns. Every format's group (256 or 32) is a multiple of 32, so a tile
+// covers whole q8 packets or one eighth of a k-quant packet; the tile at a
+// group's first column also writes that group's coefficients. Code stores
+// are 4- or 16-byte words. Stored-but-unoccupied bytes (plane alignment
+// tails, groups beyond K) are written as zero, so the result is fully defined.
+#include <seismic/element.glsl>
+
+#if !defined(SEISMIC_ELEMENT_E_KIND_EXTERNAL) || !defined(SEISMIC_ELEMENT_U_LAYOUT_ROWS16)
+#error "repack_weight converts an external GGUF source into rows16 resident storage"
+#endif
+
+#if defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_Q4_K) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_Q4K)
+#define REPACK_KQUANT 1
+#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_Q5_K) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_Q5K)
+#define REPACK_KQUANT 1
+#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_Q6_K) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_Q6K)
+#define REPACK_Q6K 1
+#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_Q8_0) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_Q8G32S)
+#define REPACK_Q8 1
+#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ4_XS) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ4G32)
+#define REPACK_IQ4 1
+#else
+#error "repack_weight binding is not a registered GGUF-to-resident conversion"
+#endif
+
+#define REPACK_GROUP uint(SEISMIC_ELEMENT_E_LOGICAL_GROUP)
+#define REPACK_TILE_ROWS 16u
+#define REPACK_TILE_COLUMNS 32u
+
+// ---- GGUF source packet readers ------------------------------------------
+
+uint repack_byte(uint64_t packet, uint offset) { return element_u8_at(packet + offset); }
+
+// Raw code of position `p` (0 <= p < REPACK_GROUP) of the GGUF source packet at `gp`.
+uint repack_source_code(uint64_t gp, uint p) {
+#if defined(REPACK_KQUANT) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_Q4K)
+    return (repack_byte(gp, 16u + (p / 64u) * 32u + p % 32u) >> ((p % 64u / 32u) * 4u)) & 15u;
+#elif defined(REPACK_KQUANT)
+    const uint low = (repack_byte(gp, 48u + (p / 64u) * 32u + p % 32u) >> ((p % 64u / 32u) * 4u)) & 15u;
+    const uint high = (repack_byte(gp, 16u + p % 32u) >> (p / 32u)) & 1u;
+    return low | (high << 4);
+#elif defined(REPACK_Q6K)
+    const uint low = (repack_byte(gp, (p / 128u) * 64u + p % 64u) >> ((p % 128u / 64u) * 4u)) & 15u;
+    const uint high = (repack_byte(gp, 128u + (p / 128u) * 32u + p % 32u) >> ((p % 128u / 32u) * 2u)) & 3u;
+    return low | (high << 4);
+#elif defined(REPACK_Q8)
+    return repack_byte(gp, 2u + p);
+#else
+    return (repack_byte(gp, 8u + (p / 32u) * 16u + p % 16u) >> ((p % 32u / 16u) * 4u)) & 15u;
+#endif
+}
+
+// Four little-endian source bytes from `offset` (any alignment).
+uint repack_word(uint64_t gp, uint offset) {
+    return repack_byte(gp, offset) | (repack_byte(gp, offset + 1u) << 8) | (repack_byte(gp, offset + 2u) << 16)
+        | (repack_byte(gp, offset + 3u) << 24);
+}
+
+#if defined(REPACK_KQUANT)
+// Six-bit local coefficient `field` (0 scale, 1 minimum) of sub-block `j`.
+uint repack_kquant_local(uint64_t gp, uint j, uint field) {
+    const uint index = j % 4u;
+    const uint low = repack_byte(gp, 4u + field * 4u + index);
+    const uint high = repack_byte(gp, 12u + index);
+    return j < 4u ? (low & 63u) : (((high >> (4u * field)) & 15u) | ((low >> 6) << 4));
+}
+
+// Word `w` of the packed local coefficients: 16 six-bit fields, field
+// `2j + f` of sub-block j at bit 12j + 6f (the registry `scales` plane).
+uint repack_kquant_locals_word(uint64_t gp, uint w) {
+    uint value = 0u;
+    for (uint field = 0u; field < 16u; ++field) {
+        const int shift = int(field * 6u) - int(w * 32u);
+        if (shift <= -6 || shift >= 32)
+            continue;
+        const uint local = repack_kquant_local(gp, field / 2u, field % 2u);
+        value |= shift >= 0 ? local << uint(shift) : local >> uint(-shift);
+    }
+    return value;
+}
+#endif
+
+#if defined(REPACK_IQ4)
+// Resident f32 scale of IQ4_XS sub-block `j` (32 values).
+float repack_iq4_scale(uint64_t gp, uint j) {
+    const float base = seismic_f16_to_f32(uint16_t(repack_byte(gp, 0u) | (repack_byte(gp, 1u) << 8)));
+    const uint low = (repack_byte(gp, 4u + j / 2u) >> ((j % 2u) * 4u)) & 15u;
+    const uint high = ((repack_byte(gp, 2u) | (repack_byte(gp, 3u) << 8)) >> (2u * j)) & 3u;
+    return seismic_mul_rn(base, float(int(low | (high << 4)) - 32));
+}
+#endif
+
+// The per-group coefficient planes of one packet, in registry byte order:
+// `scales` (the packed locals) and `supers` (the per-group factors).
+void repack_write_scales(uint64_t gp, uint64_t to) {
+#if defined(REPACK_KQUANT)
+    for (uint w = 0u; w < 3u; ++w)
+        element_u32_put(to + 4ul * w, repack_kquant_locals_word(gp, w));
+#elif defined(REPACK_Q6K)
+    for (uint w = 0u; w < 4u; ++w)
+        element_u32_put(to + 4ul * w, repack_word(gp, 192u + 4u * w));
+#endif
+}
+
+void repack_write_supers(uint64_t gp, uint64_t to) {
+#if defined(REPACK_KQUANT)
+    element_u32_put(to, repack_word(gp, 0u));
+#elif defined(REPACK_Q6K)
+    element_u16_put(to, repack_byte(gp, 208u) | (repack_byte(gp, 209u) << 8));
+#elif defined(REPACK_Q8)
+    element_u16_put(to, repack_byte(gp, 0u) | (repack_byte(gp, 1u) << 8));
+#else
+    for (uint j = 0u; j < 8u; ++j)
+        element_f32_put(to + 4ul * j, repack_iq4_scale(gp, j));
+#endif
+}
+
+// Eight consecutive `bits`-wide slices (code >> shift) of codes
+// `first .. first + 8`, packed little-endian.
+uint repack_pack_eight(uint64_t gp, uint first, uint shift, uint bits) {
+    uint value = 0u;
+    for (uint i = 0u; i < 8u; ++i)
+        value |= ((repack_source_code(gp, first + i) >> shift) & ((1u << bits) - 1u)) << (i * bits);
+    return value;
+}
+
+// Four consecutive eight-bit codes `first .. first + 4`.
+uint repack_pack_four_bytes(uint64_t gp, uint first) {
+    uint value = 0u;
+    for (uint i = 0u; i < 4u; ++i)
+        value |= repack_source_code(gp, first + i) << (8u * i);
+    return value;
+}
+
+void repack_zero_bytes(uint64_t to, uint64_t count) {
+    for (uint64_t i = 0ul; i < count; ++i)
+        element_u8_put(to + i, 0u);
+}
+
+// Source packet `packet` of row `n` of matrix `b`.
+uint64_t repack_source_packet(uint64_t source, uint64_t b, uint64_t n, uint64_t packet) {
+    return source
+        + (b * SEISMIC_SOURCE_STRIDE_0 + n * SEISMIC_SOURCE_STRIDE_1 + packet * SEISMIC_SOURCE_STRIDE_2)
+        * uint64_t(SEISMIC_ELEMENT_E_PACKET_SIZE);
+}
+
+// Start of stored row `n` of matrix `b`.
+uint64_t repack_row_base(uint64_t destination, uint64_t b, uint64_t n) {
+    return destination + (b * SEISMIC_RESULT_0_STRIDE_0 + n * SEISMIC_RESULT_0_STRIDE_1) * SEISMIC_RESULT_0_ROW_STRIDE_BYTES;
+}
+
+void repack_weight() {
+    const uint64_t source = SEISMIC_PTR(SEISMIC_BUFFER_SOURCE);
+    const uint64_t destination = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const uint lane = gl_LocalInvocationID.x;
+    const uint64_t b = gl_WorkGroupID.z;
+    const uint64_t row0 = uint64_t(gl_WorkGroupID.y) * REPACK_TILE_ROWS;
+    const uint column0 = gl_WorkGroupID.x * REPACK_TILE_COLUMNS;
+    const uint64_t packets = (SEISMIC_DIM_K + REPACK_GROUP - 1u) / REPACK_GROUP;
+    const uint64_t stored_columns = SEISMIC_RESULT_0_ROW_GROUPS * REPACK_GROUP;
+    if (column0 >= stored_columns)
+        return;
+    const bool occupied = column0 < packets * REPACK_GROUP;
+    const uint within = column0 % REPACK_GROUP;
+    const uint64_t rows = min(uint64_t(REPACK_TILE_ROWS), SEISMIC_DIM_N - row0);
+
+    // Code planes: the code of column c sits at bit `c * bits` of the plane.
+    // Columns of stored groups beyond K (none today: rows16 has no group
+    // multiple) would read past the source row, so only occupied tiles store.
+    if (lane < rows && occupied) {
+        const uint64_t n = row0 + lane;
+        const uint64_t gp = repack_source_packet(source, b, n, column0 / REPACK_GROUP);
+        const uint64_t row = repack_row_base(destination, b, n);
+#if defined(SEISMIC_ELEMENT_U_PLANE_CODES)
+        const uint64_t codes = row + SEISMIC_RESULT_0_PLANE_CODES_ROW_OFFSET + column0;
+        element_uvec4_put(codes, uvec4(repack_pack_four_bytes(gp, within), repack_pack_four_bytes(gp, within + 4u),
+            repack_pack_four_bytes(gp, within + 8u), repack_pack_four_bytes(gp, within + 12u)));
+        element_uvec4_put(codes + 16ul, uvec4(repack_pack_four_bytes(gp, within + 16u),
+            repack_pack_four_bytes(gp, within + 20u), repack_pack_four_bytes(gp, within + 24u),
+            repack_pack_four_bytes(gp, within + 28u)));
+#else
+        element_uvec4_put(row + SEISMIC_RESULT_0_PLANE_CODES_LO_ROW_OFFSET + column0 / 2u,
+            uvec4(repack_pack_eight(gp, within, 0u, 4u), repack_pack_eight(gp, within + 8u, 0u, 4u),
+                repack_pack_eight(gp, within + 16u, 0u, 4u), repack_pack_eight(gp, within + 24u, 0u, 4u)));
+#if defined(SEISMIC_ELEMENT_U_PLANE_CODES_HI) && SEISMIC_ELEMENT_U_PLANE_CODES_HI_CODE_BITS == 1
+        element_u32_put(row + SEISMIC_RESULT_0_PLANE_CODES_HI_ROW_OFFSET + column0 / 8u,
+            repack_pack_eight(gp, within, 4u, 1u) | (repack_pack_eight(gp, within + 8u, 4u, 1u) << 8)
+                | (repack_pack_eight(gp, within + 16u, 4u, 1u) << 16)
+                | (repack_pack_eight(gp, within + 24u, 4u, 1u) << 24));
+#elif defined(SEISMIC_ELEMENT_U_PLANE_CODES_HI)
+        const uint64_t high = row + SEISMIC_RESULT_0_PLANE_CODES_HI_ROW_OFFSET + column0 / 4u;
+        element_u32_put(high, repack_pack_eight(gp, within, 4u, 2u) | (repack_pack_eight(gp, within + 8u, 4u, 2u) << 16));
+        element_u32_put(high + 4ul,
+            repack_pack_eight(gp, within + 16u, 4u, 2u) | (repack_pack_eight(gp, within + 24u, 4u, 2u) << 16));
+#endif
+#endif
+    }
+
+    // Coefficient planes, once per group (at its first tile), per row.
+    if (within == 0u && lane < rows) {
+        const uint64_t n = row0 + lane;
+        const uint64_t row = repack_row_base(destination, b, n);
+        const uint64_t group = column0 / REPACK_GROUP;
+#if defined(SEISMIC_ELEMENT_U_PLANE_SCALES)
+        const uint64_t scales = row + SEISMIC_RESULT_0_PLANE_SCALES_ROW_OFFSET
+            + group * uint64_t(SEISMIC_ELEMENT_U_PLANE_SCALES_BYTES_PER_GROUP);
+        if (occupied)
+            repack_write_scales(repack_source_packet(source, b, n, group), scales);
+        else
+            repack_zero_bytes(scales, SEISMIC_ELEMENT_U_PLANE_SCALES_BYTES_PER_GROUP);
+#endif
+        const uint64_t supers = row + SEISMIC_RESULT_0_PLANE_SUPERS_ROW_OFFSET
+            + group * uint64_t(SEISMIC_ELEMENT_U_PLANE_SUPERS_BYTES_PER_GROUP);
+        if (occupied)
+            repack_write_supers(repack_source_packet(source, b, n, group), supers);
+        else
+            repack_zero_bytes(supers, SEISMIC_ELEMENT_U_PLANE_SUPERS_BYTES_PER_GROUP);
+    }
+
+    // Alignment tails of the coefficient planes and of the row, at the row's
+    // last stored tile. Code planes are whole multiples of 16 bytes.
+    if (column0 + REPACK_TILE_COLUMNS == stored_columns && lane < rows) {
+        const uint64_t row = repack_row_base(destination, b, row0 + lane);
+#if defined(SEISMIC_ELEMENT_U_PLANE_SCALES)
+        repack_zero_bytes(row + SEISMIC_RESULT_0_PLANE_SCALES_ROW_OFFSET + SEISMIC_RESULT_0_PLANE_SCALES_BYTES_PER_ROW,
+            SEISMIC_RESULT_0_PLANE_SUPERS_ROW_OFFSET - SEISMIC_RESULT_0_PLANE_SCALES_ROW_OFFSET
+                - SEISMIC_RESULT_0_PLANE_SCALES_BYTES_PER_ROW);
+#endif
+        repack_zero_bytes(row + SEISMIC_RESULT_0_PLANE_SUPERS_ROW_OFFSET + SEISMIC_RESULT_0_PLANE_SUPERS_BYTES_PER_ROW,
+            SEISMIC_RESULT_0_ROW_STRIDE_BYTES - SEISMIC_RESULT_0_PLANE_SUPERS_ROW_OFFSET
+                - SEISMIC_RESULT_0_PLANE_SUPERS_BYTES_PER_ROW);
+    }
+}

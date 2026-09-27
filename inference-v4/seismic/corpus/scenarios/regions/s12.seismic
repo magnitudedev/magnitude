@@ -1,0 +1,7 @@
+# origin: C14:s12
+# invoke: f32[5]=zero ; f32[3]=rand(51)
+fn probe[N, K](x: &mut tensor[N] f32, y: &tensor[K] f32) -> f32:
+    let a = x + x
+    for k in 0..K:
+        x[0] = x[0] + 1.0
+    return reduce(a, 0, sum)

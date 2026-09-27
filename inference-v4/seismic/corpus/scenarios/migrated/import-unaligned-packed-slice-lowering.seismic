@@ -1,0 +1,8 @@
+# origin: test:seismic-compiler:compiler/src/portable/import_tests.rs:stored_unaligned_packed_slice_is_unresolved_but_logical_reads_construct
+# invoke: q4g64[128]=rand(155)
+fn probe(w: &tensor[128] q4g64) -> f32:
+    return w[1]
+
+lower probe(w: &tensor[128] q4g64) -> f32 for cpu:
+    let view = w[1:65]
+    return view[0]

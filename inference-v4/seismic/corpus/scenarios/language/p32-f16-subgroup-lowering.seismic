@@ -1,0 +1,9 @@
+# origin: C1:p32
+# invoke s: f16[64]=rand(71) ; f16[64]=zero
+fn s[N](x: &tensor[N] f16, out: &mut tensor[N] f16):
+    parallel for i in 0..N:
+        out[i] = x[i]
+
+lower s[N](x: &tensor[N] f16, out: &mut tensor[N] f16) for metal requires metal.subgroup:
+    parallel for i in 0..N:
+        out[i] = metal.subgroup.simd_sum(x[i])

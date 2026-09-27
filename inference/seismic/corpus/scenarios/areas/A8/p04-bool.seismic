@@ -1,0 +1,10 @@
+# origin: A8:C4a-13
+# invoke: bool[3]=true,false,true ; bool[3]=false,false,false
+# expect: returned
+# pin: o = bool[3]=false,true,false
+# invoke: bool[67]=zero ; bool[67]=zero
+# expect: returned
+fn probe[N](x: &tensor[N] bool, o: &mut tensor[N] bool):
+    # Bool elements are loaded as `byte != 0` and stored as 0 or 1.
+    parallel for i in 0..N:
+        o[i] = not x[i]

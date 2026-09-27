@@ -1,0 +1,15 @@
+# origin: test:validation:programs/scalar-semantics.seismic:ordered_large_sum
+# invoke ordered_large_sum: f32[65]=rand(135) ; bf16[65]=rand(136) ; f16[65]=rand(137) ; f32[3]=zero
+fn ordered_large_sum(x: &tensor[65] f32, b: &tensor[65] bf16, h: &tensor[65] f16, result: tensor[3] f32) -> tensor[3] f32:
+    let mut xs = f32(0.0)
+    let mut bs = bf16(0.0)
+    let mut hs = f16(0.0)
+    for i in 0..65:
+        xs = xs + x[i]
+        bs = bs + b[i]
+        hs = hs + h[i]
+    let mut output = result
+    output[0] = xs
+    output[1] = f32(bs)
+    output[2] = f32(hs)
+    return output

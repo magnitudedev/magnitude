@@ -1,0 +1,12 @@
+# origin: A1:G-IF3-new-1
+# invoke u: f32[8]=1,2,3,4,5,6,7,1 ; f32[8]=1,2,3,4,5,6,7,1
+fn u(x: &tensor[8] f32, y: &tensor[8] f32) -> f32:
+    let mut acc = 0.0
+    for i in 0..8:
+        for t in 0..8:
+            let mut j = i
+            if x[t] > 3.0:
+                j = t
+            let w = tensor[j] f32
+            acc = acc + y[j]
+    return acc

@@ -1,0 +1,6 @@
+# origin: C25:G-C25-4
+# rejected: "Atomic"
+fn p(x: i32) -> i32:
+    let mut s = 0
+    atomic(add, s, x)
+    return s

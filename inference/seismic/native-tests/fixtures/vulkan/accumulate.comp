@@ -1,0 +1,11 @@
+void accumulate() {
+    seismic_f32 state = seismic_f32(SEISMIC_PTR(SEISMIC_BUFFER_STATE));
+    seismic_f32 x = seismic_f32(SEISMIC_PTR(SEISMIC_BUFFER_X));
+    const uint index = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (index < SEISMIC_DIM_N) {
+        const uint at = uint(index * SEISMIC_STATE_STRIDE_0);
+        state[at].v = seismic_add_rn(
+            state[at].v,
+            seismic_add_rn(x[uint(index * SEISMIC_X_STRIDE_0)].v, float(SEISMIC_TUNE_BIAS) * 0.5));
+    }
+}

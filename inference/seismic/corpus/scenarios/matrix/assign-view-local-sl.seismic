@@ -1,0 +1,6 @@
+# cell: assign-view-local/sl
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero
+fn probe[W](x: &tensor[4, W] f32, out: &mut tensor[4] f32, y: &mut tensor[4, W] f32) where W >= 8:
+    let mut v = y[0, 0:4]
+    v = x[0, 4:8]
+    out[0] = v[1]

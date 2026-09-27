@@ -1,0 +1,7 @@
+# origin: C1:p8
+# invoke count: f32[5]=seq ; i32:2
+# pin: result = f32[]=2
+# invoke count: f32[5]=seq ; i32:9
+# expect: failed
+fn count[N](x: &tensor[N] f32, k: i32) -> f32:
+    return x[k]

@@ -1,0 +1,31 @@
+[package]
+name = "magnitude-service-models"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+flate2.workspace = true
+fs2.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+hf-hub.workspace = true
+magnitude-artifacts = { path = "../../engine/artifacts" }
+magnitude-service-contracts.workspace = true
+magnitude-service-utils.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+same-file.workspace = true
+sha2-state = { package = "sha2", version = "0.11.0" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "time"] }
+tracing.workspace = true
+tempfile = "3.24.0"
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

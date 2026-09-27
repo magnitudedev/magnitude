@@ -1,0 +1,7 @@
+# origin: test:validation:corpus/values.seismic:computed_expression
+# invoke computed_expression: f32[2,3]=rand(125) ; f32[2,3]=rand(126) ; f32[2,3]=zero ; f32:1.5
+fn computed_expression[M, N](x: &tensor[M, N] f32, y: &tensor[M, N] f32, z: &mut tensor[M, N] f32, scale: f32):
+    parallel for r in 0..M:
+        let a = x[r]
+        let b = y[r]
+        z[r] = select(a > b, a * scale, exp(b) - 1.0)

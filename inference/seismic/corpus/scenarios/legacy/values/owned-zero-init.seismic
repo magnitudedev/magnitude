@@ -1,0 +1,7 @@
+# origin: test:validation:corpus/values.seismic:owned_zero_init
+# invoke owned_zero_init: f32[4]=1,2,3,4
+fn owned_zero_init[N](x: &tensor[N] f32) -> tensor[N] f32:
+    let mut acc = zeros_like(x)
+    for i in 0..N:
+        acc[i] = acc[i] + x[i]
+    return acc

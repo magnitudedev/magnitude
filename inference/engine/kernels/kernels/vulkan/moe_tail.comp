@@ -1,0 +1,65 @@
+// moe_tail: the tail of a feed-forward with a dense branch beside the routed
+// experts, all F32:
+//   f = rms(dense) * dense_norm + rms(routed) * routed_norm
+//   result = (residual + rms(f) * norm) * scale
+// One workgroup per row; the combined row is formed again by the pass that
+// publishes. The Vulkan form of `metal/moe_tail.metal`.
+#include <seismic/element.glsl>
+#include "lib/core/reduce.glsl"
+
+#if defined(SEISMIC_NORM_REPRESENTATION_F32)
+#define TAIL_NORM ELEMENT_F32
+#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
+#define TAIL_NORM ELEMENT_F16
+#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
+#define TAIL_NORM ELEMENT_BF16
+#else
+#error "moe_tail requires dense norms"
+#endif
+
+// f[i] of one row: both branches normalized with their inverses and norms.
+float moe_tail_combined(const uint64_t dense, const uint64_t routed, const float dense_inverse,
+    const float routed_inverse, const uint64_t i) {
+    const float from_dense = element_f32_at(dense + i * SEISMIC_DENSE_STRIDE_1 * 4ul) * dense_inverse
+        * element_at(TAIL_NORM, SEISMIC_PTR(SEISMIC_BUFFER_DENSE_NORM), i * SEISMIC_DENSE_NORM_STRIDE_0);
+    const float from_routed = element_f32_at(routed + i * SEISMIC_ROUTED_STRIDE_1 * 4ul) * routed_inverse
+        * element_at(TAIL_NORM, SEISMIC_PTR(SEISMIC_BUFFER_ROUTED_NORM), i * SEISMIC_ROUTED_NORM_STRIDE_0);
+    return from_dense + from_routed;
+}
+
+// Shared: one partial per subgroup (reduce_group_sum at float 0).
+void moe_tail() {
+    const uint64_t width = SEISMIC_DIM_D;
+    const uint64_t row = gl_WorkGroupID.x;
+    const uint thread = gl_LocalInvocationIndex;
+    const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
+    const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
+    const uint64_t dense = SEISMIC_PTR(SEISMIC_BUFFER_DENSE) + row * SEISMIC_DENSE_STRIDE_0 * 4ul;
+    const uint64_t routed = SEISMIC_PTR(SEISMIC_BUFFER_ROUTED) + row * SEISMIC_ROUTED_STRIDE_0 * 4ul;
+    float dense_squares = 0.0, routed_squares = 0.0;
+    for (uint64_t i = thread; i < width; i += gl_WorkGroupSize.x) {
+        const float dv = element_f32_at(dense + i * SEISMIC_DENSE_STRIDE_1 * 4ul);
+        const float rv = element_f32_at(routed + i * SEISMIC_ROUTED_STRIDE_1 * 4ul);
+        dense_squares = seismic_fma_rn(dv, dv, dense_squares);
+        routed_squares = seismic_fma_rn(rv, rv, routed_squares);
+    }
+    dense_squares = reduce_group_sum(dense_squares, 0u);
+    routed_squares = reduce_group_sum(routed_squares, 0u);
+    const float dense_inverse = inversesqrt(seismic_div_rn(dense_squares, float(width)) + epsilon);
+    const float routed_inverse = inversesqrt(seismic_div_rn(routed_squares, float(width)) + epsilon);
+    float squares = 0.0;
+    for (uint64_t i = thread; i < width; i += gl_WorkGroupSize.x) {
+        const float f = moe_tail_combined(dense, routed, dense_inverse, routed_inverse, i);
+        squares = seismic_fma_rn(f, f, squares);
+    }
+    squares = reduce_group_sum(squares, 0u);
+    const float inverse = inversesqrt(seismic_div_rn(squares, float(width)) + epsilon);
+    const uint64_t residual = SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL) + row * SEISMIC_RESIDUAL_STRIDE_0 * 4ul;
+    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul;
+    for (uint64_t i = thread; i < width; i += gl_WorkGroupSize.x) {
+        const float normalized = moe_tail_combined(dense, routed, dense_inverse, routed_inverse, i) * inverse
+            * element_at(TAIL_NORM, SEISMIC_PTR(SEISMIC_BUFFER_NORM), i * SEISMIC_NORM_STRIDE_0);
+        element_f32_put(result + i * SEISMIC_RESULT_0_STRIDE_1 * 4ul,
+            (element_f32_at(residual + i * SEISMIC_RESIDUAL_STRIDE_1 * 4ul) + normalized) * scale);
+    }
+}

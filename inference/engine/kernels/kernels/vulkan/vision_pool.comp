@@ -1,0 +1,44 @@
+// vision_pool: one invocation per output value (grid-stride): the G member
+// rows times `weight`, summed in order, times `scale`, then standardized
+// with the NS rows.
+#include <seismic/element.glsl>
+
+#if defined(SEISMIC_STANDARD_BIAS_REPRESENTATION_BF16)
+#define STANDARD_BIAS_KIND ELEMENT_BF16
+#elif defined(SEISMIC_STANDARD_BIAS_REPRESENTATION_F16)
+#define STANDARD_BIAS_KIND ELEMENT_F16
+#elif defined(SEISMIC_STANDARD_BIAS_REPRESENTATION_F32)
+#define STANDARD_BIAS_KIND ELEMENT_F32
+#else
+#error "unsupported vision_pool standard_bias representation"
+#endif
+
+#if defined(SEISMIC_STANDARD_SCALE_REPRESENTATION_BF16)
+#define STANDARD_SCALE_KIND ELEMENT_BF16
+#elif defined(SEISMIC_STANDARD_SCALE_REPRESENTATION_F16)
+#define STANDARD_SCALE_KIND ELEMENT_F16
+#elif defined(SEISMIC_STANDARD_SCALE_REPRESENTATION_F32)
+#define STANDARD_SCALE_KIND ELEMENT_F32
+#else
+#error "unsupported vision_pool standard_scale representation"
+#endif
+
+void vision_pool() {
+    const uint64_t columns = SEISMIC_DIM_H;
+    const uint64_t total = SEISMIC_DIM_M * columns;
+    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
+    const float weight = element_word_f32(SEISMIC_PARAM_WEIGHT);
+    const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
+    for (uint64_t index = gl_GlobalInvocationID.x; index < total; index += step) {
+        const uint64_t row = index / columns, column = index % columns;
+        float sum = 0.0;
+        for (uint member = 0u; member < uint(SEISMIC_DIM_G); ++member)
+            sum = sum + element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SOURCE)
+                + (row * SEISMIC_SOURCE_STRIDE_0 + uint64_t(member) * SEISMIC_SOURCE_STRIDE_1 + column) * 4ul) * weight;
+        float value = sum * scale;
+        if (SEISMIC_DIM_NS == 1)
+            value = (value - element_at(STANDARD_BIAS_KIND, SEISMIC_PTR(SEISMIC_BUFFER_STANDARD_BIAS), column))
+                * element_at(STANDARD_SCALE_KIND, SEISMIC_PTR(SEISMIC_BUFFER_STANDARD_SCALE), column);
+        element_f32_put(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + (row * SEISMIC_RESULT_0_STRIDE_0 + column) * 4ul, value);
+    }
+}

@@ -1,0 +1,6 @@
+# origin: test:validation:corpus/effects.seismic:atomic_extrema
+# invoke atomic_extrema: f32[6]=rand(103) ; i32[6]=0,1,0,2,1,0 ; f32[3]=-100,-100,-100 ; f32[3]=100,100,100
+fn atomic_extrema[N, E](values: &tensor[N] f32, routes: &tensor[N] i32, top: &mut tensor[E] f32, low: &mut tensor[E] f32):
+    parallel for i in 0..N:
+        atomic(max, top[routes[i]], values[i])
+        atomic(min, low[routes[i]], values[i])

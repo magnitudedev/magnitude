@@ -3,7 +3,7 @@ import { buildMacApp } from "../apple/build-app"
 import { buildDesktopApplication, DesktopBuildFailed } from "./desktop"
 import { buildLinuxDesktopInstaller } from "./desktop-linux"
 import { buildWindowsDesktopInstaller } from "./desktop-windows"
-import { isWindowsEngineLibrary, signWindowsCode } from "./windows-signing"
+import { signWindowsCode } from "./windows-signing"
 import { BunContext } from "@effect/platform-bun"
 import { buildDesktopDmg, validateDesktopDistribution } from "../apple/desktop"
 import { appleSigning, signAppleCode, appleCommand } from "../apple/signing"
@@ -18,15 +18,9 @@ import {
   writeFile,
 } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { basename, delimiter, dirname, resolve } from "node:path"
+import { basename, dirname, resolve } from "node:path"
 import { Effect, Option, Schedule, Schema } from "effect"
-import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native"
-import { mergeWindowsEnvironment } from "@magnitudedev/utils/windows-native"
-import {
-  BackendEligibilityReport,
-  IcnInstallationDeclaration,
-  IcnStartupRecord,
-} from "@magnitudedev/icn-protocol"
+import { IcnInstallationDeclaration } from "@magnitudedev/icn-protocol"
 import {
   type ReleaseArtifact,
 } from "../../src/contracts"
@@ -38,8 +32,8 @@ import {
   currentHost,
   hostById,
   icnBaseArchive,
-  releaseBuildEnvironment,
   type HostId,
+  type ReleaseHost,
 } from "../../src/targets"
 import { buildAcnBinary } from "./acn"
 import { buildCliBinary } from "./cli"
@@ -50,144 +44,22 @@ import {
   verifyAppleDeploymentTarget,
   verifyOwnedLoaderPaths,
 } from "./common"
-import { buildIcnBinary } from "../../../../inference/scripts/compile"
+import { buildInferenceBinary, type InferenceBuild } from "../../../../inference/scripts/compile"
+import { smokeInstallation } from "../../../../inference/scripts/smoke"
 import { ACN_COORDINATION_REVISION } from "@magnitudedev/version"
 import { MAGNITUDE_RPC_VERSION } from "@magnitudedev/acn-protocol"
 import { appleRequirement } from "../../src/trust"
+import { ACN_EXECUTABLE_NAME } from "../../src/executables"
 import {
-  ACN_EXECUTABLE_NAME,
-  ICN_EXECUTABLE_NAME,
-} from "../../src/executables"
+  INFERENCE_PLANNER_BUNDLE,
+  inferenceExecutablePath,
+  inferenceRequiredPaths,
+} from "../../src/inference-installation"
 
 const PROJECT_ROOT = resolve(import.meta.dir, "../../../..")
 
-const smokeIcnServer = async (
-  binary: string,
-  installation: string,
-  root: string,
-  environment: Readonly<Record<string, string | undefined>>,
-): Promise<void> => {
-  const modelStore = resolve(root, "model-store")
-  const cacheRoot = resolve(root, "cache")
-  await Promise.all([
-    mkdir(modelStore, { recursive: true, mode: 0o700 }),
-    mkdir(cacheRoot, { recursive: true, mode: 0o700 }),
-  ])
-  const token = crypto.randomUUID()
-  const instance = `release-smoke-${crypto.randomUUID()}`
-  const child = Bun.spawn([
-    binary,
-    "serve",
-    "--bind",
-    "127.0.0.1:0",
-    "--instance-id",
-    instance,
-    "--exit-on-stdin-eof",
-    "--installation",
-    installation,
-    "--model-store",
-    modelStore,
-    "--cache-root",
-    cacheRoot,
-  ], {
-    cwd: root,
-    // Managed ICN lifetime guards require it to lead its own process group.
-    detached: process.platform !== "win32",
-    env: { ...environment, MAGNITUDE_ICN_AUTH_TOKEN: token },
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "inherit",
-  })
-  let reaped = false
-  try {
-    const reader = child.stdout.getReader()
-    const decoder = new TextDecoder()
-    const readiness = async (): Promise<{ readonly origin: string }> => {
-      let pending = ""
-      while (pending.length <= 64 * 1024) {
-        const next = await reader.read()
-        if (next.done) break
-        pending += decoder.decode(next.value, { stream: true })
-        let newline = pending.indexOf("\n")
-        while (newline >= 0) {
-          const line = pending.slice(0, newline).trimEnd()
-          pending = pending.slice(newline + 1)
-          const prefix = "MAGNITUDE_ICN_READY "
-          if (line.startsWith(prefix)) {
-            const value = Schema.decodeUnknownSync(
-              Schema.parseJson(IcnStartupRecord),
-            )(line.slice(prefix.length))
-            if (value.instanceId !== instance || !value.origin) {
-              throw new Error("ICN readiness record has the wrong identity")
-            }
-            return { origin: value.origin }
-          }
-          newline = pending.indexOf("\n")
-        }
-      }
-      throw new Error("ICN exited without a bounded readiness record")
-    }
-    const ready = await Promise.race([
-      readiness(),
-      Bun.sleep(30_000).then(() => {
-        throw new Error("ICN startup smoke timed out")
-      }),
-    ])
-    const health = await fetch(`${ready.origin}/health`, {
-      signal: AbortSignal.timeout(10_000),
-    })
-    if (!health.ok) throw new Error(`ICN health returned HTTP ${health.status}`)
-    const healthBody = await health.json() as {
-      readonly ready?: boolean
-      readonly instanceId?: string
-    }
-    if (!healthBody.ready || healthBody.instanceId !== instance) {
-      throw new Error("ICN health returned the wrong identity")
-    }
-    const hardware = await fetch(`${ready.origin}/api/v1/hardware`, {
-      headers: { authorization: `Bearer ${token}` },
-      signal: AbortSignal.timeout(10_000),
-    })
-    if (!hardware.ok) {
-      throw new Error(`ICN authenticated hardware returned HTTP ${hardware.status}`)
-    }
-    const owned = process.platform === "win32" ? Option.none() : await Effect.runPromise(ProcessGroupControllerLive.inspect(child.pid))
-    if (process.platform !== "win32" && Option.isNone(owned)) throw new Error("ICN disappeared before parent-loss acceptance")
-    child.stdin.end()
-    const exitCode = await Promise.race<number | undefined>([
-      child.exited,
-      Bun.sleep(5_000).then(() => undefined),
-    ])
-    if (exitCode === undefined) {
-      throw new Error("ICN did not exit after its managed parent pipe closed")
-    }
-    reaped = true
-    // EOF means owner loss, so the watchdog kills its group rather than exiting gracefully.
-    if (exitCode !== 91 && child.signalCode !== "SIGKILL") {
-      throw new Error(`ICN parent-loss watchdog exited with unexpected code ${exitCode} and signal ${child.signalCode}`)
-    }
-    if (Option.isSome(owned) && !await Effect.runPromise(ProcessGroupControllerLive.waitForGroupExit({ leader: owned.value }, "5 seconds"))) {
-      throw new Error("ICN parent-loss watchdog left process-group members alive")
-    }
-  } finally {
-    if (!reaped) {
-      child.kill("SIGTERM")
-      child.stdin.end()
-      const exited = await Promise.race([
-        child.exited.then(() => true),
-        Bun.sleep(5_000).then(() => false),
-      ])
-      if (!exited) {
-        child.kill("SIGKILL")
-        await child.exited
-      }
-    }
-    await child[Symbol.asyncDispose]()
-  }
-}
-
 export const smokeHostArchives = async (
-  host: ReturnType<typeof hostById>,
+  host: ReleaseHost,
   cliArchivePath: string,
   acnArchivePath: string,
   icnArchivePath: string,
@@ -241,24 +113,9 @@ export const smokeHostArchives = async (
       Schema.parseJson(IcnInstallationDeclaration),
     )({
       schemaVersion: 1,
-      backend: "cpu",
       nativeBuild: Option.getOrThrow(icnArtifact.nativeBuild),
-      backendModuleAbi: Option.getOrThrow(icnArtifact.backendModuleAbi),
     })}\n`)
-    const environment = host.id.startsWith("windows-")
-      ? mergeWindowsEnvironment(process.env, {
-        PATH: [resolve(icnRoot, "runtime"), process.env.PATH]
-          .filter(Boolean)
-          .join(delimiter),
-      })
-      : {
-        ...process.env,
-        ...(host.id.startsWith("darwin-")
-          ? { DYLD_LIBRARY_PATH: "" }
-          : { LD_LIBRARY_PATH: "" }),
-      }
-    const icnBinary = resolve(icnRoot, `bin/${ICN_EXECUTABLE_NAME}${extension}`)
-    await smokeIcnServer(icnBinary, declaration, icnRoot, environment)
+    await smokeInstallation(declaration)
     if (host.id.startsWith("darwin-")) {
       await runAppleBuild(validateDesktopDistribution({
         image: resolve(dirname(acnArchivePath), desktopInstaller(Schema.decodeUnknownSync(Schema.Literal("darwin-arm64", "darwin-x64"))(host.id))),
@@ -280,19 +137,23 @@ export const smokeHostArchives = async (
   }
 }
 
-const regularSources = (
-  directory: "runtime" | "backends",
-  files: readonly string[],
+/** The one inference artifact of a host: the service, its runtime directory and the planner inputs. */
+export const inferenceArchiveSources = (
+  host: ReleaseHost,
+  inference: InferenceBuild,
+  plannerBundle: string,
 ): readonly ArchiveSource[] => {
-  const seen = new Set<string>()
-  return files.map((source) => {
-    const name = basename(source)
-    if (seen.has(name)) {
-      throw new Error(`duplicate ${directory} output ${name}`)
-    }
-    seen.add(name)
-    return { path: `${directory}/${name}`, source, mode: 0o755 }
-  })
+  const sources: readonly ArchiveSource[] = [
+    { path: inferenceExecutablePath(host), source: inference.binary, mode: 0o755 },
+    { path: INFERENCE_PLANNER_BUNDLE, source: plannerBundle, mode: 0o644 },
+    ...inference.runtimeLibraries.map((source) => ({ path: `runtime/${basename(source)}`, source, mode: 0o755 })),
+    ...inference.runtimeNotices.map((source) => ({ path: `runtime/${basename(source)}`, source, mode: 0o644 })),
+  ]
+  const paths = new Set(sources.map((source) => source.path))
+  if (paths.size !== sources.length) throw new Error(`${host.id} inference artifact has duplicate files`)
+  const missing = inferenceRequiredPaths(host).filter((path) => !paths.has(path))
+  if (missing.length > 0) throw new Error(`${host.id} inference artifact is missing ${missing.join(", ")}`)
+  return sources
 }
 
 export const buildHostArtifacts = async (
@@ -312,78 +173,36 @@ export const buildHostArtifacts = async (
   ], { cwd: PROJECT_ROOT })
   const cli = await buildCliBinary(host.bunTarget)
   const acn = await buildAcnBinary(host.bunTarget)
-  const icn = await buildIcnBinary({
-    target: host.bunTarget,
-    profile: `base-${host.id}`,
-    features: host.cargoFeatures,
-    buildEnvironment: releaseBuildEnvironment(host),
-  })
-  const cpuModules = icn.backendModules.filter((file) =>
-    basename(file).toLowerCase().includes("cpu")
-  )
-  if (cpuModules.length === 0) {
-    throw new Error(`${host.id} ICN base emitted no CPU module`)
-  }
+  const inference = await buildInferenceBinary({ host, profile: "release", diagnostics: "all" })
   await verifyOwnedLoaderPaths({
     host: host.id,
-    executable: icn.binary,
-    modules: cpuModules,
-    runtime: icn.runtimeLibraries,
+    executable: inference.binary,
+    runtime: inference.runtimeLibraries,
   })
-  await verifyAppleDeploymentTarget(host.id, [
-    cli,
-    acn,
-    icn.binary,
-    ...icn.runtimeLibraries,
-    ...cpuModules,
-  ])
+  await verifyAppleDeploymentTarget(host.id, [cli, acn, inference.binary])
 
   if (host.id.startsWith("darwin-")) {
     for (const kind of ["cli", "acn"]) {
       const embedded = await runAppleBuild(regularAppleFiles(resolve(PROJECT_ROOT, "bin/apple-inputs", kind)))
       await verifyAppleDeploymentTarget(host.id, embedded.map((file) => file.source))
     }
-    for (const file of [icn.binary, ...icn.runtimeLibraries, ...cpuModules]) {
-      await runAppleBuild(signAppleCode(file, `dev.magnitude.inference.${basename(file)}`, file === icn.binary ? "native" : "library"))
-    }
+    await runAppleBuild(signAppleCode(inference.binary, `dev.magnitude.inference.${basename(inference.binary)}`, "native"))
   }
   await chmod(cli, 0o755)
   await chmod(acn, 0o755)
-  await chmod(icn.binary, 0o755)
-
-  const loader = host.id.startsWith("windows-")
-    ? "PATH"
-    : host.id.startsWith("darwin-")
-      ? "DYLD_LIBRARY_PATH"
-      : "LD_LIBRARY_PATH"
-  const eligibility = await run([
-    icn.binary,
-    "backend-eligibility",
-    "--json",
-  ], {
-    env: {
-      ...process.env,
-      [loader]: [...icn.runtimeLibraries.map(dirname), process.env[loader]]
-        .filter(Boolean)
-        .join(delimiter),
-    },
-  })
-  Schema.decodeUnknownSync(
-    Schema.parseJson(BackendEligibilityReport),
-  )(eligibility)
+  await chmod(inference.binary, 0o755)
 
   const cliArchivePath = resolve(output, cliArchive(host.id))
   if (host.id === "windows-x64-msvc") {
-    await Effect.runPromise(Effect.forEach([cli, acn, icn.binary, ...cpuModules,
-      ...icn.runtimeLibraries.filter(file => isWindowsEngineLibrary(basename(file))),
-    ], signWindowsCode, { discard: true }).pipe(Effect.provide(BunContext.layer)))
+    // NVIDIA's NVRTC and Microsoft's CRT are redistributed unmodified.
+    await Effect.runPromise(Effect.forEach([cli, acn, inference.binary], signWindowsCode, { discard: true }).pipe(Effect.provide(BunContext.layer)))
   }
   const acnArchivePath = resolve(output, acnArchive(host.id))
   const icnArchivePath = resolve(output, icnBaseArchive(host.id))
   const cliNotary = host.id.startsWith("darwin-")
     ? await runAppleBuild(notarizeAppleUnit("cli", output, [cli, resolve(PROJECT_ROOT, "bin/apple-inputs/cli")])) : Option.none()
   const icnNotary = host.id.startsWith("darwin-")
-    ? await runAppleBuild(notarizeAppleUnit("inference", output, [icn.binary, ...icn.runtimeLibraries, ...cpuModules])) : Option.none()
+    ? await runAppleBuild(notarizeAppleUnit("inference", output, [inference.binary])) : Option.none()
   const cliArtifact = await buildArchive(
     cliArchivePath,
     resolve(output, `cli-${host.id}.artifact.json`),
@@ -391,11 +210,7 @@ export const buildHostArtifacts = async (
       id: `cli-${host.id}`,
       kind: "cli",
       host: Option.some(host.id),
-      backend: Option.none(),
-      requiredBaseId: Option.none(),
       nativeBuild: Option.none(),
-      backendModuleAbi: Option.none(),
-      compatibility: Option.none(),
     },
     [{
       path: `bin/magnitude-cli${host.executableExtension}`,
@@ -468,11 +283,7 @@ export const buildHostArtifacts = async (
       id: `acn-${host.id}`,
       kind: "acn",
       host: Option.some(host.id),
-      backend: Option.none(),
-      requiredBaseId: Option.none(),
       nativeBuild: Option.none(),
-      backendModuleAbi: Option.none(),
-      compatibility: Option.none(),
     },
     acnSources,
   )
@@ -483,26 +294,9 @@ export const buildHostArtifacts = async (
       id: `icn-base-${host.id}`,
       kind: "icn-base",
       host: Option.some(host.id),
-      backend: Option.some("cpu"),
-      requiredBaseId: Option.none(),
-      nativeBuild: Option.some(icn.identity.native_build),
-      backendModuleAbi: Option.some(icn.identity.backend_module_abi),
-      compatibility: Option.none(),
+      nativeBuild: Option.some(inference.identity.native_build),
     },
-    [
-      {
-        path: `bin/${ICN_EXECUTABLE_NAME}${host.executableExtension}`,
-        source: icn.binary,
-        mode: 0o755,
-      },
-      {
-        path: "catalog/model-planner-inputs.bundle",
-        source: resolve(catalogRoot, "model-planner-inputs.bundle"),
-        mode: 0o644,
-      },
-      ...regularSources("runtime", icn.runtimeLibraries),
-      ...regularSources("backends", cpuModules),
-    ],
+    inferenceArchiveSources(host, inference, resolve(catalogRoot, "model-planner-inputs.bundle")),
   )
   await smokeHostArchives(
     host,

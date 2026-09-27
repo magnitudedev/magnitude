@@ -1,0 +1,10 @@
+# cell: if/join
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; bool:true
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; bool:false
+fn probe(x: &tensor[4, 8] f32, out: &mut tensor[4] f32, c: bool):
+    let mut v = 0.0
+    if c:
+        v = x[0, 0]
+    else:
+        v = x[0, 1] * 2.0
+    out[0] = v + 1.0

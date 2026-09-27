@@ -1,0 +1,12 @@
+# origin: X1:P04
+# invoke: f32[4]=1,2,3,4 ; bool:true
+# pin: result = f32[2]=9,3
+# invoke: f32[4]=1,2,3,4 ; bool:false
+# pin: result = f32[2]=9,2
+fn probe(x: &tensor[4] f32, c: bool) -> tensor[2] f32:
+    let mut a = to_owned(x)
+    let mut t = to_owned(x[0:2])
+    if c:
+        t = a[1:3]
+    t[0] = 9.0
+    return t

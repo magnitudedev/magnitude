@@ -1,0 +1,7 @@
+# cell: value-borrowed-tensor/join
+# rejected: "does not permit exclusive writes"
+fn probe(x: &tensor[4, 8] f32, z: &tensor[4, 8] f32, c: bool) -> f32:
+    let mut b = x
+    if c:
+        b = z
+    return b[0, 0]

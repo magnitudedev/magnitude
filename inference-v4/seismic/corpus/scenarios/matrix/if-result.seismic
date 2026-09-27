@@ -1,0 +1,12 @@
+# cell: if/result
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero
+fn choose(r: &tensor[8] f32) -> f32:
+    let mut v = 0.0
+    if r[0] > 0.0:
+        v = r[1]
+    else:
+        v = r[2]
+    return v
+
+fn probe(x: &tensor[4, 8] f32, out: &mut tensor[4] f32):
+    out[0] = choose(x[0]) + choose(x[1])

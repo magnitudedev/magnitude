@@ -3,10 +3,6 @@ name: Release build
 on:
   workflow_call:
     inputs:
-      windows_backends_only:
-        required: false
-        default: false
-        type: boolean
       source_commit:
         required: true
         type: string
@@ -37,7 +33,6 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       hosts: ${{ steps.matrix.outputs.hosts }}
-      backends: ${{ steps.matrix.outputs.backends }}
       linuxHosts: ${{ steps.matrix.outputs.linuxHosts }}
       appleHosts: ${{ steps.matrix.outputs.appleHosts }}
       version: ${{ steps.version.outputs.version }}
@@ -50,19 +45,17 @@ jobs:
           bun-version: ${{ env.BUN_VERSION }}
       - run: bun install --frozen-lockfile
       - id: matrix
-        run: bun run packages/release/scripts/matrix.ts ${{ inputs.windows_backends_only && '--windows-backends-only' || '' }}
+        run: bun run packages/release/scripts/matrix.ts
       - id: version
         shell: bash
         run: echo "version=$(jq -r '.version' packages/launcher/package.json)" >> "$GITHUB_OUTPUT"
 
   catalog:
-    if: ${{ !inputs.windows_backends_only }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.source_commit }}
-          submodules: recursive
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
@@ -81,7 +74,6 @@ jobs:
           if-no-files-found: error
 
   host:
-    if: ${{ !inputs.windows_backends_only }}
     permissions:
       contents: read
       id-token: write
@@ -95,7 +87,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.source_commit }}
-          submodules: recursive
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -113,12 +104,7 @@ jobs:
         if: runner.os == 'Linux'
         uses: ./.github/actions/linux-build-tools
         with:
-          packages: build-essential cmake libclang-dev fakeroot rpm libgtk-3-0 libnss3 libasound2 libgbm1 libxss1 libxtst6 ${{ matrix.id == 'linux-arm64-gnu' && 'clang' || '' }}
-      - name: Install Linux ARM64 compiler
-        if: runner.os == 'Linux' && matrix.id == 'linux-arm64-gnu'
-        run: |
-          echo "CC=clang" >> "$GITHUB_ENV"
-          echo "CXX=clang++" >> "$GITHUB_ENV"
+          packages: build-essential fakeroot rpm libgtk-3-0 libnss3 libasound2 libgbm1 libxss1 libxtst6
       - name: Install Windows native build components
         if: runner.os == 'Windows'
         shell: pwsh
@@ -126,10 +112,10 @@ jobs:
           $installerRoot = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer'
           $installation = & (Join-Path $installerRoot 'vswhere.exe') -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (!$installation) { throw 'Visual Studio C++ Build Tools are required.' }
-          $arguments = @('modify', '--installPath', "`"$installation`"", '--add', 'Microsoft.VisualStudio.Component.VC.Llvm.Clang', '--add', 'Microsoft.VisualStudio.Component.VC.CMake.Project', '--quiet', '--norestart')
+          $arguments = @('modify', '--installPath', "`"$installation`"", '--add', 'Microsoft.VisualStudio.Component.VC.CMake.Project', '--quiet', '--norestart')
           $setup = Start-Process -FilePath (Join-Path $installerRoot 'setup.exe') -ArgumentList $arguments -Wait -PassThru
           if ($setup.ExitCode -notin @(0, 3010)) { throw "Visual Studio component installation failed ($($setup.ExitCode))." }
-          if (!(Test-Path (Join-Path $installation 'VC\Tools\Llvm\x64\bin\libclang.dll'))) { throw 'Visual Studio Clang installation is incomplete.' }
+          if (!(Test-Path (Join-Path $installation 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'))) { throw 'Visual Studio CMake installation is incomplete.' }
       - name: Install Windows installer tools
         if: runner.os == 'Windows'
         shell: pwsh
@@ -195,193 +181,7 @@ jobs:
         if: always() && runner.os == 'macOS' && inputs.apple_distribution
         run: bash packages/release/scripts/apple/cleanup-credentials.sh
 
-  backend:
-    permissions:
-      contents: read
-      id-token: write
-    environment: ${{ matrix.host == 'windows-x64-msvc' && inputs.windows_distribution && 'windows-signing' || startsWith(matrix.host, 'darwin-') && inputs.apple_distribution && 'apple-release' || 'release-validation' }}
-    needs: matrix
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.matrix.outputs.backends) }}
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.source_commit }}
-          submodules: recursive
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: ${{ env.BUN_VERSION }}
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-      - uses: ./.github/actions/build-cache
-        with:
-          scope: ${{ matrix.id }}
-      - name: Install Linux build tools
-        if: runner.os == 'Linux'
-        uses: ./.github/actions/linux-build-tools
-        with:
-          packages: build-essential cmake libclang-dev ${{ matrix.host == 'linux-arm64-gnu' && 'clang' || '' }} ${{ matrix.backend == 'vulkan' && 'libvulkan-dev spirv-headers ninja-build python3' || '' }}
-      - name: Install Linux ARM64 compiler
-        if: runner.os == 'Linux' && matrix.host == 'linux-arm64-gnu'
-        run: |
-          echo "CC=clang" >> "$GITHUB_ENV"
-          echo "CXX=clang++" >> "$GITHUB_ENV"
-      - name: Cache Linux Vulkan tools
-        if: runner.os == 'Linux' && matrix.backend == 'vulkan'
-        id: vulkan-cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}/vulkan-sdk-1.4.313
-          key: vulkan-tools-jammy-${{ runner.arch }}-headers-409c16be502e39fe70dd6fe2d9ad4842ef2c9a53-shaderc-e6edd6d48fa5bdd9d176794c6810fae7f8e938e1
-      - name: Install Linux Vulkan tools
-        if: runner.os == 'Linux' && matrix.backend == 'vulkan'
-        shell: bash
-        run: |
-          vulkan_root="$RUNNER_TEMP/vulkan-sdk-1.4.313"
-          if [ "${{ steps.vulkan-cache.outputs.cache-hit }}" != "true" ]; then
-          headers_root="$RUNNER_TEMP/vulkan-headers-1.4.313"
-          shaderc_root="$RUNNER_TEMP/shaderc-v2023.8"
-          git clone --filter=blob:none https://github.com/google/shaderc.git "$shaderc_root"
-          git -C "$shaderc_root" checkout --detach e6edd6d48fa5bdd9d176794c6810fae7f8e938e1
-          python3 "$shaderc_root/utils/git-sync-deps"
-          cmake \
-            -S "$shaderc_root" \
-            -B "$shaderc_root/build" \
-            -G Ninja \
-            -D CMAKE_BUILD_TYPE=Release \
-            -D SHADERC_SKIP_TESTS=ON \
-            -D SHADERC_SKIP_EXAMPLES=ON
-          cmake --build "$shaderc_root/build" --target glslc_exe
-          test -x "$shaderc_root/build/glslc/glslc"
-          git clone --filter=blob:none https://github.com/KhronosGroup/Vulkan-Headers.git "$headers_root"
-          git -C "$headers_root" checkout --detach 409c16be502e39fe70dd6fe2d9ad4842ef2c9a53
-          cmake \
-            -S "$headers_root" \
-            -B "$headers_root/build" \
-            -D CMAKE_INSTALL_PREFIX="$vulkan_root"
-          cmake --build "$headers_root/build" --target install
-          mkdir -p "$vulkan_root/bin"
-          cp "$shaderc_root/build/glslc/glslc" "$vulkan_root/bin/glslc"
-          fi
-          "$vulkan_root/bin/glslc" --version
-          test -f "$vulkan_root/include/vulkan/vulkan.hpp"
-          echo "VULKAN_SDK=$vulkan_root" >> "$GITHUB_ENV"
-          echo "$vulkan_root/bin" >> "$GITHUB_PATH"
-      - name: Install Windows native build components
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $installerRoot = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer'
-          $installation = & (Join-Path $installerRoot 'vswhere.exe') -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          if (!$installation) { throw 'Visual Studio C++ Build Tools are required.' }
-          $arguments = @('modify', '--installPath', "`"$installation`"", '--add', 'Microsoft.VisualStudio.Component.VC.Llvm.Clang', '--add', 'Microsoft.VisualStudio.Component.VC.CMake.Project', '--quiet', '--norestart')
-          $setup = Start-Process -FilePath (Join-Path $installerRoot 'setup.exe') -ArgumentList $arguments -Wait -PassThru
-          if ($setup.ExitCode -notin @(0, 3010)) { throw "Visual Studio component installation failed ($($setup.ExitCode))." }
-          if (!(Test-Path (Join-Path $installation 'VC\Tools\Llvm\x64\bin\libclang.dll'))) { throw 'Visual Studio Clang installation is incomplete.' }
-      - name: Install Windows Vulkan SDK
-        if: runner.os == 'Windows' && matrix.backend == 'vulkan'
-        shell: pwsh
-        run: |
-          choco install vulkan-sdk --no-progress -y
-          $sdk = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment').VULKAN_SDK
-          if (-not $sdk) { throw "Vulkan SDK installation did not publish VULKAN_SDK" }
-          "VULKAN_SDK=$sdk" >> $env:GITHUB_ENV
-          "$sdk\Bin" >> $env:GITHUB_PATH
-      - name: Install Linux CUDA toolkit
-        if: runner.os == 'Linux' && matrix.backend == 'cuda'
-        shell: bash
-        run: |
-          case "$(uname -m)" in
-            x86_64) repository_arch=x86_64 ;;
-            aarch64) repository_arch=sbsa ;;
-            *) exit 1 ;;
-          esac
-          . /etc/os-release
-          repository_distribution="ubuntu${VERSION_ID//./}"
-          toolkit="${{ matrix.toolkit }}"
-          package_version="${toolkit/./-}"
-          curl --fail --location --silent --show-error \
-            --output cuda-keyring.deb \
-            "https://developer.download.nvidia.com/compute/cuda/repos/${repository_distribution}/${repository_arch}/cuda-keyring_1.1-1_all.deb"
-          sudo dpkg -i cuda-keyring.deb
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            "cuda-compiler-${package_version}" \
-            "libcublas-dev-${package_version}"
-          cuda_path="/usr/local/cuda-${toolkit}"
-          test -x "${cuda_path}/bin/nvcc"
-          test -x "${cuda_path}/bin/cuobjdump"
-          test -f "${cuda_path}/include/cublas_v2.h"
-          echo "CUDA_PATH=${cuda_path}" >> "$GITHUB_ENV"
-          echo "${cuda_path}/bin" >> "$GITHUB_PATH"
-          sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
-          rm -f cuda-keyring.deb
-      - uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
-        if: runner.os == 'Windows' && matrix.backend == 'cuda'
-        with:
-          cuda: "${{ matrix.toolkit }}.0"
-          method: network
-      - run: bun install --frozen-lockfile
-      - name: Import Apple release credentials
-        if: runner.os == 'macOS' && inputs.apple_distribution
-        run: bash packages/release/scripts/apple/credentials.sh
-        env:
-          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
-          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
-          APPLE_NOTARY_API_KEY_P8: ${{ secrets.APPLE_NOTARY_API_KEY_P8 }}
-          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
-          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
-          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
-      - name: Build Unix backend
-        if: runner.os != 'Windows'
-        run: bun run packages/release/scripts/build/backend.ts "${{ matrix.id }}" "release/${{ matrix.id }}"
-      - name: Install Windows signing runtime
-        if: runner.os == 'Windows' && inputs.windows_distribution
-        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
-        with:
-          dotnet-version: '8.0.x'
-      - name: Authenticate Windows Artifact Signing
-        if: runner.os == 'Windows' && inputs.windows_distribution
-        uses: azure/login@8216e11d8cd9b42fe925c852af8e76311ff067ac # v2
-        with:
-          client-id: ${{ vars.AZURE_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-      - name: Build Windows backend
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./packages/release/scripts/build/windows-backend.ps1 -PackId "${{ matrix.id }}" -OutputDirectory "release/${{ matrix.id }}"
-        env:
-          MAGNITUDE_WINDOWS_DISTRIBUTION: ${{ inputs.windows_distribution && 'artifact-signing' || 'unsigned' }}
-          MAGNITUDE_WINDOWS_PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
-          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
-          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
-          AZURE_SIGNING_CERTIFICATE_PROFILE: ${{ vars.AZURE_SIGNING_CERTIFICATE_PROFILE }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: backend-${{ matrix.id }}
-          path: release/${{ matrix.id }}/
-          if-no-files-found: error
-      - name: Retain Apple notarization diagnostics
-        if: always() && runner.os == 'macOS' && inputs.apple_distribution
-        uses: actions/upload-artifact@v4
-        with:
-          name: apple-diagnostics-${{ matrix.id }}
-          path: release/${{ matrix.id }}/.apple/*.json
-          include-hidden-files: true
-          retention-days: 14
-          if-no-files-found: ignore
-      - name: Remove temporary Apple credentials
-        if: always() && runner.os == 'macOS' && inputs.apple_distribution
-        run: bash packages/release/scripts/apple/cleanup-credentials.sh
-
   linux-consumer:
-    if: ${{ !inputs.windows_backends_only }}
     needs: [matrix, host]
     strategy:
       fail-fast: false
@@ -451,7 +251,6 @@ jobs:
             '
 
   apple-consumer:
-    if: ${{ !inputs.windows_backends_only }}
     needs: [matrix, host]
     environment: ${{ inputs.apple_distribution && 'apple-release' || 'release-validation' }}
     strategy:
@@ -484,7 +283,6 @@ jobs:
           if-no-files-found: error
 
   windows-consumer:
-    if: ${{ !inputs.windows_backends_only }}
     needs: [matrix, host]
     environment: ${{ inputs.windows_distribution && 'windows-signing' || 'release-validation' }}
     runs-on: blacksmith-8vcpu-windows-2025
@@ -512,8 +310,8 @@ jobs:
           MAGNITUDE_WINDOWS_PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
 
   candidate:
-    needs: [matrix, host, backend, linux-consumer, apple-consumer, windows-consumer]
-    if: inputs.validate_candidate && !inputs.windows_backends_only
+    needs: [matrix, host, linux-consumer, apple-consumer, windows-consumer]
+    if: inputs.validate_candidate
     runs-on: blacksmith-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
@@ -532,10 +330,6 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: host-*
-          path: release-artifacts
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: backend-*
           path: release-artifacts
       - run: bun run packages/release/scripts/assemble.ts release-artifacts release-candidate
         env:

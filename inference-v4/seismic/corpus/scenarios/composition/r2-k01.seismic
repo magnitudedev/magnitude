@@ -1,0 +1,9 @@
+# origin: X1:r2-k01
+# invoke: f32[1,3]=rand(35) ; f32[5,3]=rand(36) ; f32[1,5]=zero
+fn probe[M, N, K](a: &tensor[M, K] f32, b: &tensor[N, K] f32, y: &mut tensor[M, N] f32):
+    parallel for i in 0..M:
+        parallel for j in 0..N:
+            let mut acc = 0.0
+            for k in 0..K:
+                acc = fma(a[i, k], b[j, k], acc)
+            y[i, j] = acc

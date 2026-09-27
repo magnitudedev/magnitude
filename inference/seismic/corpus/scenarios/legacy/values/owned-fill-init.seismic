@@ -1,0 +1,9 @@
+# origin: test:validation:corpus/values.seismic:owned_fill_init
+# invoke owned_fill_init: f32[4]=1,2,3,4 ; f32:0.5
+fn owned_fill_init[N](x: &tensor[N] f32, value: f32) -> tensor[N] f32:
+    let mut filled = tensor[N] f32
+    for i in 0..N:
+        filled[i] = value
+    for i in 0..N:
+        filled[i] = filled[i] * x[i]
+    return filled

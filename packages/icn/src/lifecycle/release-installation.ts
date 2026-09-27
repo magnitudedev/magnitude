@@ -1,11 +1,9 @@
-import { createHash } from "node:crypto"
 import * as Command from "@effect/platform/Command"
 import * as CommandExecutor from "@effect/platform/CommandExecutor"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as Path from "@effect/platform/Path"
 import {
-  BackendEligibilityReport,
   IcnBinaryIdentity,
   IcnInstallationDeclaration,
 } from "@magnitudedev/icn-protocol"
@@ -14,25 +12,22 @@ import {
   currentHost,
   installArtifact,
   ICN_EXECUTABLE_NAME,
+  hostById,
+  inferenceRequiredPaths,
+  type HostId,
   NodeArchiveExtractor,
   releaseBundleSizes,
   selectArtifact,
   type ReleaseArtifact,
-  type ReleaseManifest,
 } from "@magnitudedev/release"
 import { IcnPreparationReporter } from "./preparation.js"
 import { installationLoaderEnvironment, installationNativePath } from "./installation-environment.js"
-import { selectCudaArtifact } from "./cuda-compatibility.js"
 import { Data, Effect, Fiber, Option, Schema, Stream } from "effect"
-type SelectedBackend = {
-  readonly backend: "cpu" | "metal" | "cuda" | "vulkan"
-  readonly pack: Option.Option<ReleaseArtifact>
-}
 
 export class ReleaseIcnInstallationError extends Data.TaggedError(
   "ReleaseIcnInstallationError"
 )<{
-  readonly stage: "acquire" | "probe" | "compose" | "verify"
+  readonly stage: "acquire" | "probe" | "declare" | "verify"
   readonly message: string
 }> {}
 
@@ -51,9 +46,6 @@ const executableName = () =>
   `${ICN_EXECUTABLE_NAME}${process.platform === "win32" ? ".exe" : ""}`
 
 const MAXIMUM_COMMAND_OUTPUT = 64 * 1024
-
-export const finalOutputRecord = (output: string): string =>
-  output.trimEnd().split(/\r?\n/).at(-1) ?? ""
 
 const outputTail = (stream: Stream.Stream<Uint8Array, unknown>): Effect.Effect<string, unknown> =>
   stream.pipe(
@@ -121,39 +113,27 @@ const isNonEmptyFile = (
     )
   })
 
-const validateArtifactDirectory = (
-  artifact: ReleaseArtifact,
-  directory: string
+/** The inference artifact is one complete installation layout with every backend of its host. */
+export const isCompleteArtifact = (
+  directory: string,
+  host: HostId,
 ): Effect.Effect<boolean, never, FileSystem.FileSystem | Path.Path> =>
   Effect.gen(function* () {
-    const fs = yield* FileSystem.FileSystem
     const path = yield* Path.Path
-    const directoryInfo = yield* fs.stat(directory).pipe(Effect.option)
-    if (
-      Option.isNone(directoryInfo) ||
-      directoryInfo.value.type !== "Directory"
+    const files = yield* Effect.all(
+      inferenceRequiredPaths(hostById(host)).map((required) =>
+        isNonEmptyFile(path.join(directory, required))
+      )
     )
-      return false
-    if (artifact.kind === "icn-base") {
-      const files = yield* Effect.all([
-        isNonEmptyFile(path.join(directory, "bin", executableName())),
-        isNonEmptyFile(
-          path.join(directory, "catalog", "model-planner-inputs.bundle")
-        ),
-      ])
-      if (files.some((present) => !present)) return false
-    }
-    const backends = yield* fs
-      .readDirectory(path.join(directory, "backends"))
-      .pipe(Effect.option)
-    return Option.isSome(backends) && backends.value.length > 0
+    return files.every((present) => present)
   })
 
 const ensureArtifact = (
   baseUrl: string,
   version: string,
   artifact: ReleaseArtifact,
-  root: string
+  root: string,
+  host: HostId,
 ): Effect.Effect<
   string,
   ReleaseIcnInstallationError,
@@ -167,7 +147,7 @@ const ensureArtifact = (
     const fs = yield* FileSystem.FileSystem
     const path = yield* Path.Path
     const destination = path.join(root, artifact.id, artifact.sha256)
-    if (!(yield* validateArtifactDirectory(artifact, destination))) {
+    if (!(yield* isCompleteArtifact(destination, host))) {
       yield* reporter.report({ _tag: "InstallationRequired" })
       yield* fs
         .remove(destination, { recursive: true, force: true })
@@ -178,20 +158,14 @@ const ensureArtifact = (
         )
       yield* installArtifact(baseUrl, version, artifact, destination, {
         observer: Option.some({
-          report: (event) =>
-            reporter.report({
-              _tag: "Artifact",
-              artifact:
-                artifact.kind === "icn-base" ? "Base" : "Accelerator",
-              event,
-            }),
+          report: (event) => reporter.report({ _tag: "Artifact", event }),
         }),
       }).pipe(
         Effect.provide(NodeArchiveExtractor),
         Effect.mapError((cause) => installationError("acquire", cause.message))
       )
     }
-    if (!(yield* validateArtifactDirectory(artifact, destination))) {
+    if (!(yield* isCompleteArtifact(destination, host))) {
       return yield* installationError(
         "verify",
         `${artifact.id} did not produce a complete installation`
@@ -201,7 +175,7 @@ const ensureArtifact = (
   })
 
 const readIdentity = (
-  base: string,
+  root: string,
   artifact: ReleaseArtifact
 ): Effect.Effect<
   IcnBinaryIdentity,
@@ -211,348 +185,75 @@ const readIdentity = (
   Effect.gen(function* () {
     const path = yield* Path.Path
     const output = yield* run(
-      [path.join(base, "bin", executableName()), "version", "--json"],
-      installationLoaderEnvironment(path.join(base, "runtime"))
+      [path.join(root, "bin", executableName()), "version", "--json"],
+      installationLoaderEnvironment(path.join(root, "runtime"))
     )
     const value = yield* Schema.decodeUnknown(Schema.parseJson(IcnBinaryIdentity))(
       output,
     ).pipe(
       Effect.mapError(() =>
-        installationError("verify", "ICN base identity is malformed")
+        installationError("verify", "ICN identity is malformed")
       )
     )
-    if (
-      Option.getOrUndefined(artifact.nativeBuild) !== value.native_build ||
-      Option.getOrUndefined(artifact.backendModuleAbi) !==
-        value.backend_module_abi
-    ) {
+    if (Option.getOrUndefined(artifact.nativeBuild) !== value.native_build) {
       return yield* installationError(
         "verify",
-        "ICN base identity differs from the release manifest"
+        "ICN identity differs from the release manifest"
       )
     }
     return value
   })
 
-const vulkanVersionAtLeast = (encoded: number, required: string): boolean => {
-  const [requiredMajor = 0, requiredMinor = 0] = required.split(".").map(Number)
-  const major = (encoded >>> 22) & 0x7f
-  const minor = (encoded >>> 12) & 0x3ff
-  return (
-    major > requiredMajor || (major === requiredMajor && minor >= requiredMinor)
-  )
-}
-
-const compatibleVulkan = (
-  manifest: ReleaseManifest,
-  loaderApi: number
-): Option.Option<ReleaseArtifact> =>
-  Option.fromNullable(
-    manifest.artifacts.find(
-      (artifact) =>
-        artifact.kind === "icn-backend" &&
-        Option.getOrUndefined(artifact.host) === currentHost() &&
-        Option.getOrUndefined(artifact.backend) === "vulkan" &&
-        Option.isSome(artifact.compatibility) &&
-        artifact.compatibility.value.kind === "vulkan" &&
-        vulkanVersionAtLeast(loaderApi, artifact.compatibility.value.minimumApi)
-    )
-  )
-
-const selectBackend = (
-  manifest: ReleaseManifest,
-  base: string
-): Effect.Effect<
-  SelectedBackend,
-  ReleaseIcnInstallationError,
-  CommandExecutor.CommandExecutor | Path.Path
-> =>
-  Effect.gen(function* () {
-    const path = yield* Path.Path
-    const output = yield* run(
-      [
-        path.join(base, "bin", executableName()),
-        "backend-eligibility",
-        "--json",
-      ],
-      installationLoaderEnvironment(path.join(base, "runtime"))
-    )
-    const report = yield* Schema.decodeUnknown(
-      Schema.parseJson(BackendEligibilityReport),
-    )(finalOutputRecord(output)).pipe(
-      Effect.mapError(() =>
-        installationError(
-          "probe",
-          "ICN backend eligibility report is malformed"
-        )
-      )
-    )
-
-    if (currentHost() === "darwin-arm64") {
-      if (report.metal.state !== "usable") {
-        return yield* installationError("probe", report.metal.diagnostic)
-      }
-      const pack = yield* selectArtifact(
-        manifest,
-        "icn-backend",
-        currentHost(),
-        "metal"
-      ).pipe(
-        Effect.mapError((cause) => installationError("acquire", cause.message))
-      )
-      return { backend: "metal", pack: Option.some(pack) }
-    }
-
-    if (report.cuda.state === "failed") {
-      return yield* installationError("probe", report.cuda.diagnostic)
-    }
-    if (report.cuda.state === "usable") {
-      const pack = selectCudaArtifact(
-        manifest,
-        currentHost(),
-        report.cuda.driverApi,
-        report.cuda.architectures
-      )
-      if (Option.isSome(pack)) return { backend: "cuda", pack }
-    }
-
-    if (report.vulkan.state === "failed") {
-      return yield* installationError("probe", report.vulkan.diagnostic)
-    }
-    if (report.vulkan.state === "usable") {
-      const pack = compatibleVulkan(manifest, report.vulkan.loaderApi)
-      if (Option.isSome(pack)) return { backend: "vulkan", pack }
-    }
-    return { backend: "cpu", pack: Option.none() }
-  })
-
-const compositionId = (
-  manifestSha256: string,
-  base: ReleaseArtifact,
-  selected: SelectedBackend,
-  native: IcnBinaryIdentity
-): string =>
-  createHash("sha256")
-    .update(
-      JSON.stringify({
-        manifestSha256,
-        base: base.sha256,
-        pack: Option.match(selected.pack, {
-          onNone: () => null,
-          onSome: (artifact) => artifact.sha256,
-        }),
-        backend: selected.backend,
-        nativeBuild: native.native_build,
-        backendModuleAbi: native.backend_module_abi,
-      })
-    )
-    .digest("hex")
-
-const inspectComposition = (
-  root: string,
-  selected: SelectedBackend,
-  native: IcnBinaryIdentity,
-): Effect.Effect<
-  ReleaseIcnInstallation,
-  ReleaseIcnInstallationError,
-  FileSystem.FileSystem | Path.Path
-> =>
+const readDeclaration = (
+  declarationPath: string
+): Effect.Effect<Option.Option<IcnInstallationDeclaration>, never, FileSystem.FileSystem> =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
-    const path = yield* Path.Path
-    const binaryPath = path.join(root, "bin", executableName())
-    const declarationPath = path.join(root, "installation.json")
-    const environment = installationLoaderEnvironment(path.join(root, "runtime"))
-    const declaration = yield* fs.readFileString(declarationPath).pipe(
+    return yield* fs.readFileString(declarationPath).pipe(
       Effect.flatMap(
         Schema.decodeUnknown(Schema.parseJson(IcnInstallationDeclaration))
       ),
-      Effect.mapError(() =>
-        installationError(
-          "verify",
-          "ICN installation declaration is invalid"
-        )
-      )
+      Effect.option,
     )
-    if (
-      declaration.backend !== selected.backend ||
-      declaration.nativeBuild !== native.native_build ||
-      declaration.backendModuleAbi !== native.backend_module_abi
-    ) {
-      return yield* installationError(
-        "verify",
-        "ICN installation declaration does not match its release"
-      )
-    }
-    const requiredFiles = yield* Effect.all([
-      isNonEmptyFile(binaryPath),
-      isNonEmptyFile(
-        path.join(root, "catalog", "model-planner-inputs.bundle")
-      ),
-    ])
-    const backends = yield* fs
-      .readDirectory(path.join(root, "backends"))
-      .pipe(Effect.option)
-    if (
-      requiredFiles.some((present) => !present) ||
-      Option.isNone(backends) ||
-      backends.value.length === 0
-    ) {
-      return yield* installationError(
-        "verify",
-        "ICN installation is structurally incomplete"
-      )
-    }
-    return { binaryPath, declarationPath, environment }
   })
 
-const copyDirectoryContents = (
-  source: string,
-  destination: string
+/** Writes the installation declaration that binds the installed layout to its engine build. */
+const declareInstallation = (
+  root: string,
+  native: IcnBinaryIdentity
 ): Effect.Effect<
-  void,
+  ReleaseIcnInstallation,
   ReleaseIcnInstallationError,
   FileSystem.FileSystem | Path.Path
 > =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
     const path = yield* Path.Path
-    yield* fs.makeDirectory(destination, { recursive: true, mode: 0o700 })
-    const entries = yield* fs.readDirectory(source)
-    yield* Effect.forEach(
-      entries,
-      (entry) =>
-        fs.copy(path.join(source, entry), path.join(destination, entry), {
-          overwrite: false,
-          preserveTimestamps: true,
-        }),
-      { concurrency: 4 }
-    )
-  }).pipe(
-    Effect.mapError(() =>
-      installationError("compose", "unable to compose ICN release files")
-    )
-  )
-
-const publishComposition = (
-  root: string,
-  base: string,
-  pack: Option.Option<string>,
-  selected: SelectedBackend,
-  native: IcnBinaryIdentity
-): Effect.Effect<
-  ReleaseIcnInstallation,
-  ReleaseIcnInstallationError,
-  | FileSystem.FileSystem
-  | Path.Path
-  | CommandExecutor.CommandExecutor
-  | IcnPreparationReporter
-> =>
-  Effect.gen(function* () {
-    const fs = yield* FileSystem.FileSystem
-    const path = yield* Path.Path
-    const reporter = yield* IcnPreparationReporter
-      const parent = path.dirname(root)
-    yield* fs
-      .makeDirectory(parent, { recursive: true, mode: 0o700 })
-      .pipe(
-        Effect.mapError(() =>
-          installationError(
-            "compose",
-            "unable to create ICN release directory"
-          )
-        )
+    const declarationPath = path.join(root, "installation.json")
+    const installation = {
+      binaryPath: path.join(root, "bin", executableName()),
+      declarationPath,
+      environment: installationLoaderEnvironment(path.join(root, "runtime")),
+    }
+    const existing = yield* readDeclaration(declarationPath)
+    if (Option.isSome(existing) && existing.value.nativeBuild === native.native_build) {
+      return installation
+    }
+    const serialized = yield* Schema.encode(
+      Schema.parseJson(IcnInstallationDeclaration)
+    )({ schemaVersion: 1, nativeBuild: native.native_build }).pipe(
+      Effect.mapError(() =>
+        installationError("declare", "unable to encode ICN installation")
       )
-    return yield* Effect.acquireUseRelease(
-      fs
-        .makeTempDirectory({
-          directory: parent,
-          prefix: ".composition-",
-        })
-        .pipe(
-          Effect.mapError(() =>
-            installationError("compose", "unable to stage ICN composition")
-          )
-        ),
-      (staging) =>
-        Effect.gen(function* () {
-          for (const directory of ["bin", "catalog", "runtime", "backends"]) {
-            yield* copyDirectoryContents(
-              path.join(base, directory),
-              path.join(staging, directory)
-            )
-          }
-          if (Option.isSome(pack)) {
-            const runtime = path.join(pack.value, "runtime")
-            if (
-              yield* fs.exists(runtime).pipe(Effect.orElseSucceed(() => false))
-            ) {
-              yield* copyDirectoryContents(
-                runtime,
-                path.join(staging, "runtime")
-              )
-            }
-            yield* copyDirectoryContents(
-              path.join(pack.value, "backends"),
-              path.join(staging, "backends")
-            )
-          }
-          const declaration = {
-            schemaVersion: 1 as const,
-            backend: selected.backend,
-            nativeBuild: native.native_build,
-            backendModuleAbi: native.backend_module_abi,
-          }
-          const serialized = yield* Schema.encode(
-            Schema.parseJson(IcnInstallationDeclaration)
-          )(declaration).pipe(
-            Effect.mapError(() =>
-              installationError("compose", "unable to encode ICN installation")
-            )
-          )
-          yield* fs
-            .writeFileString(
-              path.join(staging, "installation.json"),
-              `${serialized}\n`,
-              {
-                flag: "wx",
-                mode: 0o600,
-              }
-            )
-            .pipe(
-              Effect.mapError(() =>
-                installationError(
-                  "compose",
-                  "unable to write ICN installation"
-                )
-              )
-            )
-          yield* inspectComposition(staging, selected, native)
-          yield* fs.rename(staging, root).pipe(
-            Effect.catchAll((renameError) =>
-              inspectComposition(root, selected, native).pipe(
-                Effect.asVoid,
-                Effect.mapError(() => renameError)
-              )
-            ),
-            Effect.mapError(() =>
-              installationError(
-                "compose",
-                "unable to publish ICN composition"
-              )
-            )
-          )
-          return {
-            binaryPath: path.join(root, "bin", executableName()),
-            declarationPath: path.join(root, "installation.json"),
-            environment: installationLoaderEnvironment(path.join(root, "runtime")),
-          }
-        }),
-      (staging) =>
-        fs
-          .remove(staging, { recursive: true, force: true })
-          .pipe(Effect.ignore)
     )
+    const staged = path.join(root, `.installation-${process.pid}.json`)
+    yield* fs.writeFileString(staged, `${serialized}\n`, { mode: 0o600 }).pipe(
+      Effect.zipRight(fs.rename(staged, declarationPath)),
+      Effect.mapError(() =>
+        installationError("declare", "unable to write ICN installation")
+      ),
+    )
+    return installation
   })
 
 export const resolveReleaseIcnInstallation = (
@@ -588,79 +289,24 @@ export const resolveReleaseIcnInstallation = (
       Effect.mapError((cause) => installationError("acquire", cause.message)),
     )
     yield* reporter.report({ _tag: "Planned", plan: bundleSizes })
-    const baseArtifact = yield* selectArtifact(
+    const artifact = yield* selectArtifact(
       release.manifest,
       "icn-base",
       host,
-      "cpu"
     ).pipe(
       Effect.mapError((cause) => installationError("acquire", cause.message))
     )
     const artifactRoot = path.join(releaseRoot, "artifacts", version, host)
     const prepare = Effect.suspend(() =>
       Effect.gen(function* () {
-        const base = yield* ensureArtifact(
-          baseUrl,
-          version,
-          baseArtifact,
-          artifactRoot
-        )
-        const native = yield* readIdentity(base, baseArtifact)
-        const selected = yield* selectBackend(release.manifest, base)
-        yield* reporter.report({
-          _tag: "Planned",
-          plan: {
-            daemonBytes: bundleSizes.daemonBytes,
-            inferenceEngineBytes:
-              baseArtifact.bytes +
-              Option.match(selected.pack, {
-                onNone: () => 0,
-                onSome: (artifact) => artifact.bytes,
-              }),
-            inferenceEngineBytesExact: true,
-          },
-        })
-        const pack = yield* Option.match(selected.pack, {
-          onNone: () => Effect.succeed(Option.none<string>()),
-          onSome: (artifact) =>
-            ensureArtifact(baseUrl, version, artifact, artifactRoot).pipe(
-              Effect.map(Option.some)
-            ),
-        })
-        const id = compositionId(
-          release.manifestSha256,
-          baseArtifact,
-          selected,
-          native
-        )
-        const root = path.join(releaseRoot, "icn", version, host, id)
-        const existing = yield* inspectComposition(
-          root,
-          selected,
-          native,
-        ).pipe(Effect.option)
-        return Option.isSome(existing)
-          ? existing.value
-          : yield* reporter.report({ _tag: "InstallationRequired" }).pipe(
-              Effect.zipRight(
-                fs.remove(root, { recursive: true, force: true }).pipe(
-                  Effect.mapError(() =>
-                    installationError(
-                      "compose",
-                      "unable to replace invalid ICN composition"
-                    )
-                  ),
-                  Effect.zipRight(
-                    publishComposition(root, base, pack, selected, native)
-                  )
-                )
-              )
-            )
+        const root = yield* ensureArtifact(baseUrl, version, artifact, artifactRoot, host)
+        const native = yield* readIdentity(root, artifact)
+        return yield* declareInstallation(root, native)
       })
     )
     return yield* prepare.pipe(
       Effect.catchAll((cause) =>
-        cause.stage === "verify" || cause.stage === "compose"
+        cause.stage === "verify"
           ? fs.remove(artifactRoot, { recursive: true, force: true }).pipe(
               Effect.mapError(() =>
                 installationError(

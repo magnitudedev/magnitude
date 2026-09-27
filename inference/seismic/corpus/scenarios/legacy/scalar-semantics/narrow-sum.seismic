@@ -1,0 +1,13 @@
+# origin: test:validation:programs/scalar-semantics.seismic:narrow_sum
+# invoke narrow_sum: bf16[4]=rand(132) ; f16[4]=rand(133) ; f32[2]=zero
+fn narrow_sum(x: &tensor[4] bf16, h: &tensor[4] f16, result: tensor[2] f32) -> tensor[2] f32:
+    let mut s = bf16(0.0)
+    for i in 0..4:
+        s = s + x[i]
+    let mut r = f16(0.0)
+    for i in 0..4:
+        r = r + h[i]
+    let mut output = result
+    output[0] = f32(s)
+    output[1] = f32(r)
+    return output

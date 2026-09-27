@@ -1,0 +1,5 @@
+# origin: C17:alias_parallel_write
+# rejected: "no longer part"
+fn probe[N](a: &mut tensor[N] i32, b: &mut tensor[N] i32) alias(a, b):
+    parallel for i in 0..N:
+        a[i] = b[i] + 1

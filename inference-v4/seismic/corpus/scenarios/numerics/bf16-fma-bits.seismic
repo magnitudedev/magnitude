@@ -1,0 +1,6 @@
+# origin: A5:I-19
+# policies: exact unconstrained
+# invoke: bf16[4096]=bits(24) ; bf16[4096]=bits(25) ; bf16[4096]=bits(26) ; bf16[4096]=zero
+fn probe[N](a: &tensor[N] bf16, b: &tensor[N] bf16, c: &tensor[N] bf16, z: &mut tensor[N] bf16):
+    parallel for i in 0..N:
+        z[i] = fma(a[i], b[i], c[i])

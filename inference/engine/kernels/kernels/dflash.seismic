@@ -1,0 +1,116 @@
+# Separate draft models (DFlash, DSpark). The draft's layers, its readout and
+# its selection reuse the decoder's attention, feed-forward, readout and
+# sampling entries; these entries own the only draft-specific equations.
+
+# One tap of the target residual stream: the residual rows entering a tapped
+# block (or leaving the last one), rounded to A, into the tap's column block
+# `index[0]` of the concatenated draft input rows `[M, T·D]`. The readout
+# fuses those rows with one projection (`project_rows`). The tap index is a
+# run input, so tapped blocks of one shape share their sealed graphs.
+fn tap_rows[M, D, T](residual: &tensor[M, D] f32, index: &tensor[1] i32,
+    taps: &mut tensor[M, T * D] A):
+    parallel for row in 0..M:
+        for column in 0..D:
+            taps[row, index[0] * D + column] = residual[row, column]
+
+# Metal, CUDA: one thread per copied element.
+native tap_rows for metal from "metal/tap_rows.metal":
+    launch tap_rows:
+        threadgroups (ceil_div(M * D, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native tap_rows for cuda from "cuda/tap_rows.cu":
+    launch tap_rows:
+        threadgroups (ceil_div(M * D, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# Vulkan: a grid-stride loop over every element; the x grid is capped at the
+# 65535-group floor (Vulkan spec §5.3).
+native tap_rows for vulkan from "vulkan/tap_rows.comp":
+    launch tap_rows:
+        threadgroups (min(ceil_div(M * D, 256), 65535), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CPU: one work item per row.
+native tap_rows for cpu from "cpu/tap_rows.rs":
+    launch tap_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+
+# The fused taps of the rows the readout publishes (`out_rows`), rounded to
+# A: a separate draft's conditioning features. The draft normalizes them
+# itself (its context projections read RMS(features) * fusion norm).
+fn feature_rows[M, O, D](fused: &tensor[M, D] f32, out_rows: &tensor[O] i32) -> tensor[O, D] A:
+    let mut features = tensor[O, D] A
+    parallel for row in 0..O:
+        parallel for column in 0..D:
+            features[row, column] = fused[out_rows[row], column]
+    return features
+
+# Metal, CUDA: one thread per copied element.
+native feature_rows for metal from "metal/feature_rows.metal":
+    launch feature_rows:
+        threadgroups (ceil_div(O * D, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native feature_rows for cuda from "cuda/feature_rows.cu":
+    launch feature_rows:
+        threadgroups (ceil_div(O * D, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# Vulkan: a grid-stride loop over every element; the x grid is capped at the
+# 65535-group floor (Vulkan spec §5.3).
+native feature_rows for vulkan from "vulkan/feature_rows.comp":
+    launch feature_rows:
+        threadgroups (min(ceil_div(O * D, 256), 65535), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CPU: one work item per output row.
+native feature_rows for cpu from "cpu/feature_rows.rs":
+    launch feature_rows:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+
+# DSpark's confidence of one drafted slot per row:
+# sigmoid(weight · [features ; memory] + bias), where `features` is the
+# slot's output-normed row and `memory` the Markov embedding of the token the
+# slot conditions on. A row whose confidence is below `threshold` declines
+# its proposal: its selection status becomes 3 (its token stays, so a chained
+# step still embeds it; the host keeps proposals up to the first nonzero
+# status).
+fn draft_confidence[S, D, R](features: &tensor[S, D] A, memory: &tensor[S, R] A,
+    weight: &tensor[D + R] f32, bias: &tensor[1] f32, threshold: f32,
+    selection: &mut tensor[S, 2] i32):
+    parallel for row in 0..S:
+        let hidden = sum_any_order(f32(features[row]) * weight[0 : D])
+        let markov = sum_any_order(f32(memory[row]) * weight[D : D + R])
+        let score = hidden + markov + bias[0]
+        if 1.0 / (1.0 + exp(-score)) < threshold:
+            selection[row, 1] = 3
+
+# Metal, CUDA, Vulkan: one threadgroup of 256 threads per row reduces the
+# dot product.
+native draft_confidence for metal from "metal/draft_confidence.metal":
+    launch draft_confidence:
+        threadgroups (S, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native draft_confidence for cuda from "cuda/draft_confidence.cu":
+    launch draft_confidence:
+        threadgroups (S, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native draft_confidence for vulkan from "vulkan/draft_confidence.comp":
+    launch draft_confidence:
+        threadgroups (S, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
+
+# CPU: one work item per row.
+native draft_confidence for cpu from "cpu/draft_confidence.rs":
+    launch draft_confidence:
+        threadgroups (S, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes ((D + R) * 4)

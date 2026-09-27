@@ -1,0 +1,179 @@
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -76,7 +76,7 @@
+               inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
+ 
+     if (include_grammar) {
+-        data.grammar_lazy = !has_response_format && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
++        data.grammar_lazy = false;  // Enforce the whole completion, including trigger bytes.
+         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+             parser.build_grammar(builder, data.grammar_lazy);
+         });
+--- a/common/parsers/cohere2moe.cpp
++++ b/common/parsers/cohere2moe.cpp
+@@ -127,7 +127,7 @@
+     data.parser = parser.save();
+ 
+     if (include_grammar) {
+-        data.grammar_lazy = !has_response_format && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
++        data.grammar_lazy = false;  // Enforce the whole completion, including trigger bytes.
+         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+             parser.build_grammar(builder, data.grammar_lazy);
+         });
+--- a/common/parsers/deepseek.cpp
++++ b/common/parsers/deepseek.cpp
+@@ -253,7 +253,7 @@
+     data.parser = parser.save();
+ 
+     if (include_grammar) {
+-        data.grammar_lazy = has_tools && !require_tools;
++        data.grammar_lazy = false;  // Enforce the whole completion, including trigger bytes.
+         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+             parser.build_grammar(builder, data.grammar_lazy);
+         });
+--- a/common/parsers/functionary-v3-2.cpp
++++ b/common/parsers/functionary-v3-2.cpp
+@@ -79,7 +79,7 @@
+     data.parser = parser.save();
+ 
+     if (include_grammar) {
+-        data.grammar_lazy = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
++        data.grammar_lazy = false;  // Enforce the whole completion, including trigger bytes.
+ 
+         data.grammar = build_grammar([&](const common_grammar_builder & builder) {
+             parser.build_grammar(builder, data.grammar_lazy);
+--- a/common/parsers/gemma4.cpp
++++ b/common/parsers/gemma4.cpp
+@@ -289,7 +289,7 @@
+     data.parser = parser.save();
+ 
+     if (include_grammar) {
+-        data.grammar_lazy = !(has_response_format || (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
++        data.grammar_lazy = false;  // Enforce the whole completion, including trigger bytes.
+         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+             parser.build_grammar(builder, data.grammar_lazy);
+         });
+--- a/common/parsers/gigachat-v3.cpp
++++ b/common/parsers/gigachat-v3.cpp
+@@ -62,7 +62,7 @@
+     data.parser = parser.save();
+ 
+     if (include_grammar) {
+-        data.grammar_lazy = has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
++        data.grammar_lazy = false;  // Enforce the whole completion, including trigger bytes.
+ 
+         data.grammar = build_grammar([&](const common_grammar_builder & builder) {
+             parser.build_grammar(builder, data.grammar_lazy);
+--- a/common/parsers/gpt-oss.cpp
++++ b/common/parsers/gpt-oss.cpp
+@@ -141,7 +141,7 @@
+     data.parser = parser.save();
+ 
+     if (include_grammar) {
+-        data.grammar_lazy = !(has_response_format || (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
++        data.grammar_lazy = false;  // Enforce the whole completion, including trigger bytes.
+         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+             parser.build_grammar(builder, data.grammar_lazy);
+         });
+--- a/common/parsers/kimi-k2.cpp
++++ b/common/parsers/kimi-k2.cpp
+@@ -114,7 +114,7 @@
+     data.parser = parser.save();
+ 
+     if (include_grammar) {
+-        data.grammar_lazy = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
++        data.grammar_lazy = false;  // Enforce the whole completion, including trigger bytes.
+         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+             parser.build_grammar(builder, data.grammar_lazy);
+         });
+--- a/common/parsers/kimi-k3.cpp
++++ b/common/parsers/kimi-k3.cpp
+@@ -153,7 +153,7 @@
+     data.parser = parser.save();
+ 
+     if (include_grammar) {
+-        data.grammar_lazy = inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED;
++        data.grammar_lazy = false;  // Enforce the whole completion, including trigger bytes.
+         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+             parser.build_grammar(builder, data.grammar_lazy);
+         });
+--- a/common/parsers/lfm2.cpp
++++ b/common/parsers/lfm2.cpp
+@@ -96,7 +96,7 @@
+     data.parser = parser.save();
+ 
+     if (include_grammar) {
+-        data.grammar_lazy = !(has_response_format || (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
++        data.grammar_lazy = false;  // Enforce the whole completion, including trigger bytes.
+         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+             parser.build_grammar(builder, data.grammar_lazy);
+         });
+--- a/common/parsers/minicpm5.cpp
++++ b/common/parsers/minicpm5.cpp
+@@ -116,7 +116,7 @@
+     data.parser = parser.save();
+ 
+     if (include_grammar) {
+-        data.grammar_lazy = !(has_response_format || (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
++        data.grammar_lazy = false;  // Enforce the whole completion, including trigger bytes.
+         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+             parser.build_grammar(builder, data.grammar_lazy);
+         });
+--- a/common/parsers/minimax-m3.cpp
++++ b/common/parsers/minimax-m3.cpp
+@@ -215,7 +215,7 @@
+     data.parser = parser.save();
+ 
+     if (include_grammar) {
+-        data.grammar_lazy = !(has_response_format || (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
++        data.grammar_lazy = false;  // Enforce the whole completion, including trigger bytes.
+         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+             parser.build_grammar(builder, data.grammar_lazy);
+         });
+--- a/common/parsers/ministral3.cpp
++++ b/common/parsers/ministral3.cpp
+@@ -111,7 +111,7 @@
+     data.parser = parser.save();
+ 
+     if (include_grammar) {
+-        data.grammar_lazy = has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
++        data.grammar_lazy = false;  // Enforce the whole completion, including trigger bytes.
+ 
+         data.grammar = build_grammar([&](const common_grammar_builder & builder) {
+             parser.build_grammar(builder, data.grammar_lazy);
+--- a/common/parsers/muse-glimmer.cpp
++++ b/common/parsers/muse-glimmer.cpp
+@@ -124,7 +124,7 @@
+     data.parser = parser.save();
+ 
+     if (include_grammar) {
+-        data.grammar_lazy = inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED;
++        data.grammar_lazy = false;  // Enforce the whole completion, including trigger bytes.
+         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+             parser.build_grammar(builder, data.grammar_lazy);
+         });
+--- a/common/parsers/qwen3-coder.cpp
++++ b/common/parsers/qwen3-coder.cpp
+@@ -176,7 +176,7 @@
+     data.parser = parser.save();
+ 
+     if (include_grammar) {
+-        data.grammar_lazy = has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
++        data.grammar_lazy = false;  // Enforce the whole completion, including trigger bytes.
+ 
+         data.grammar = build_grammar([&](const common_grammar_builder & builder) {
+             parser.build_grammar(builder, data.grammar_lazy);
+--- a/common/peg-parser.cpp
++++ b/common/peg-parser.cpp
+@@ -1653,6 +1653,11 @@
+             } else if constexpr (std::is_same_v<T, common_peg_repetition_parser>) {
+                 auto child_gbnf = to_gbnf(p.child);
+                 const auto & child_parser = effective_parser(p.child);
++                // Name nested repetitions so converters cannot flatten their
++                // grouping into an ambiguous consecutive quantifier (e.g. +?).
++                if (std::holds_alternative<common_peg_repetition_parser>(child_parser)) {
++                    child_gbnf = builder.add_rule("repeat-" + std::to_string(id), child_gbnf);
++                }
+                 if (std::holds_alternative<common_peg_choice_parser>(child_parser) ||
+                     std::holds_alternative<common_peg_sequence_parser>(child_parser)) {
+                     child_gbnf = "(" + child_gbnf + ")";

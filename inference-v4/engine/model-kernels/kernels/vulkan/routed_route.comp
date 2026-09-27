@@ -1,0 +1,274 @@
+// Routing for M rows in four launches. The Vulkan form of
+// `metal/routed_route.metal`.
+//   routed_route_stage (M > 8, one workgroup per row): the row's RMS and
+//     its normalized values (rounded to the activation dtype), published once.
+//   routed_route_gemv (M <= 8): one subgroup per logit column reads the
+//     column's weights once and dots them with every row, normalizing on the
+//     fly from RMS partials shared across the workgroup (in the stage
+//     launch's sum order); workgroup 0 publishes the normalized rows.
+//   routed_route_gemm (M > 8): 32 rows x 32 columns per workgroup over
+//     staged F32 tiles, each invocation 8 outputs in ascending-K FMAs.
+//   Logits are [M, E + 1]: column E is the shared-expert gate.
+//   routed_route_select (one subgroup per row): the softmax over every
+//     expert (E / 32 experts per lane), K rounds of subgroup argmax (ties to the
+//     higher expert index), the optional renormalization and the shared-expert
+//     coefficient from column E.
+// Every logit accumulates over the hidden axis in the same order for every
+// expert, so experts with equal router rows tie exactly.
+#include "lib/core/activation.glsl"
+#include "lib/core/reduce.glsl"
+
+#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16) \
+    || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F32)
+#define ROUTE_ACT ELEMENT_ACT
+#else
+#error "routed activation must be dense"
+#endif
+#if defined(SEISMIC_NORM_REPRESENTATION_F32)
+#define ROUTE_NORM ELEMENT_F32
+#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
+#define ROUTE_NORM ELEMENT_F16
+#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
+#define ROUTE_NORM ELEMENT_BF16
+#else
+#error "routed norm must be dense"
+#endif
+#if defined(SEISMIC_ROUTER_REPRESENTATION_F32)
+#define ROUTE_ROUTER ELEMENT_F32
+#elif defined(SEISMIC_ROUTER_REPRESENTATION_F16)
+#define ROUTE_ROUTER ELEMENT_F16
+#elif defined(SEISMIC_ROUTER_REPRESENTATION_BF16)
+#define ROUTE_ROUTER ELEMENT_BF16
+#else
+#error "routed router must be dense"
+#endif
+
+#define ROUTE_THREADS 256u
+#define ROUTE_SUBGROUPS 8u
+#define ROUTE_E uint(SEISMIC_DIM_E)
+#define ROUTE_K uint(SEISMIC_DIM_K)
+
+float route_residual(uint64_t row, uint source) {
+    return element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)
+        + (row * SEISMIC_RESIDUAL_STRIDE_0 + uint64_t(source) * SEISMIC_RESIDUAL_STRIDE_1) * 4ul);
+}
+
+float route_norm(uint source) {
+    return element_at(ROUTE_NORM, SEISMIC_PTR(SEISMIC_BUFFER_NORM), uint64_t(source) * SEISMIC_NORM_STRIDE_0);
+}
+
+void route_publish(uint64_t row, uint source, float value) {
+    element_put(ROUTE_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
+        row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(source) * SEISMIC_RESULT_0_STRIDE_1, value);
+}
+
+// The router logits scratch is [M, E + 1]: column E holds the shared-expert
+// gate logit (normalized . shared_router), formed like an expert's logit.
+uint64_t route_logit(uint64_t row, uint expert) {
+    return SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS) + (row * (ROUTE_E + 1u) + expert) * 4ul;
+}
+
+// The weight of logit column `expert` at hidden coordinate `source`.
+float route_column_weight(uint expert, uint source) {
+    return expert < ROUTE_E
+        ? element_at(ROUTE_ROUTER, SEISMIC_PTR(SEISMIC_BUFFER_ROUTER),
+            uint64_t(expert) * SEISMIC_ROUTER_STRIDE_0 + uint64_t(source) * SEISMIC_ROUTER_STRIDE_1)
+        : element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_ROUTER) + uint64_t(source) * SEISMIC_SHARED_ROUTER_STRIDE_0 * 4ul);
+}
+
+// Shared: one partial per subgroup.
+void routed_route_stage() {
+    const uint64_t row = gl_WorkGroupID.x;
+    const uint thread = gl_LocalInvocationIndex;
+    const uint hidden = uint(SEISMIC_DIM_H);
+    const float eps = element_word_f32(SEISMIC_PARAM_EPS);
+    float squares = 0.0;
+    for (uint source = thread; source < hidden; source += ROUTE_THREADS) {
+        const float value = route_residual(row, source);
+        squares = seismic_fma_rn(value, value, squares);
+    }
+    const float inverse = inversesqrt(seismic_div_rn(reduce_group_sum(squares, 0u), float(hidden)) + eps);
+    for (uint source = thread; source < hidden; source += ROUTE_THREADS)
+        route_publish(row, source, element_round(ROUTE_ACT, route_residual(row, source) * inverse * route_norm(source)));
+}
+
+// M <= 8, one launch before the selection. Shared floats: parts [8][8], then
+// the rows' inverses [8].
+void routed_route_gemv() {
+    const uint rows = uint(SEISMIC_DIM_M), hidden = uint(SEISMIC_DIM_H);
+    const uint sg = SEISMIC_SUBGROUP, lane = SEISMIC_LANE, thread = gl_LocalInvocationIndex;
+    const float eps = element_word_f32(SEISMIC_PARAM_EPS);
+    const uint inverses = 64u;
+    // The stage launch's sum order (256 strided partials, subgroup sums, then
+    // the eight subgroup partials in order): item (row, part) is part `part`'s
+    // subgroup sum, and the items spread over every subgroup.
+    for (uint item = sg; item < rows * ROUTE_SUBGROUPS; item += SEISMIC_SUBGROUPS) {
+        const uint row = item / ROUTE_SUBGROUPS, part = item % ROUTE_SUBGROUPS;
+        float squares = 0.0;
+        for (uint source = part * 32u + lane; source < hidden; source += ROUTE_THREADS) {
+            const float value = route_residual(row, source);
+            squares = seismic_fma_rn(value, value, squares);
+        }
+        squares = seismic_subgroup_sum_f32(squares);
+        if (lane == 0u)
+            seismic_shared_f32[row * ROUTE_SUBGROUPS + part] = squares;
+    }
+    barrier();
+    if (thread < rows) {
+        float total = 0.0;
+        for (uint part = 0u; part < ROUTE_SUBGROUPS; ++part)
+            total += seismic_shared_f32[thread * ROUTE_SUBGROUPS + part];
+        seismic_shared_f32[inverses + thread] = inversesqrt(seismic_div_rn(total, float(hidden)) + eps);
+    }
+    barrier();
+    if (gl_WorkGroupID.x == 0u) {
+        for (uint item = thread; item < rows * hidden; item += gl_WorkGroupSize.x) {
+            const uint row = item / hidden, source = item % hidden;
+            route_publish(row, source,
+                element_round(ROUTE_ACT, route_residual(row, source) * seismic_shared_f32[inverses + row] * route_norm(source)));
+        }
+    }
+    const uint expert = gl_WorkGroupID.x * SEISMIC_SUBGROUPS + sg;
+    if (expert > ROUTE_E)
+        return;
+    // Lane l owns sources 4l + 128 i .. + 3 (four independent loads per
+    // step), accumulated in source order within the lane.
+    float sums[8];
+    [[unroll]] for (uint row = 0u; row < 8u; ++row)
+        sums[row] = 0.0;
+    for (uint base = 4u * lane; base < hidden; base += 128u) {
+        float weight[4], scale[4];
+        [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+            weight[j] = route_column_weight(expert, base + j);
+            scale[j] = route_norm(base + j);
+        }
+        [[unroll]] for (uint row = 0u; row < 8u; ++row) {
+            if (row < rows) {
+                const float inverse = seismic_shared_f32[inverses + row];
+                [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                    sums[row] = seismic_fma_rn(element_round(ROUTE_ACT, route_residual(row, base + j) * inverse * scale[j]),
+                        weight[j], sums[row]);
+            }
+        }
+    }
+    [[unroll]] for (uint row = 0u; row < 8u; ++row) {
+        if (row < rows) {
+            const float sum = seismic_subgroup_sum_f32(sums[row]);
+            if (lane == 0u)
+                element_f32_put(route_logit(row, expert), sum);
+        }
+    }
+}
+
+// M > 8: 32 rows x 32 logit columns per workgroup of 128 invocations; each
+// invocation owns row t / 4 and columns 8 (t % 4) .., accumulated in
+// ascending hidden order. Shared floats: the row tile [32][36], then the
+// column tile [32][36] (k-major).
+#define ROUTE_TILE 32u
+#define ROUTE_PITCH 36u
+
+void routed_route_gemm() {
+    const uint thread = gl_LocalInvocationIndex;
+    const uint hidden = uint(SEISMIC_DIM_H);
+    const uint expert0 = gl_WorkGroupID.x * ROUTE_TILE;
+    const uint64_t row0 = uint64_t(gl_WorkGroupID.y) * ROUTE_TILE;
+    const uint columns_tile = ROUTE_TILE * ROUTE_PITCH;
+    const uint r = thread / 4u, e0 = 8u * (thread % 4u);
+    float acc[8];
+    [[unroll]] for (uint j = 0u; j < 8u; ++j)
+        acc[j] = 0.0;
+    for (uint k0 = 0u; k0 < hidden; k0 += ROUTE_TILE) {
+        barrier();
+        for (uint item = thread; item < ROUTE_TILE * ROUTE_TILE; item += gl_WorkGroupSize.x) {
+            const uint i = item / ROUTE_TILE, k = item % ROUTE_TILE;
+            const uint64_t row = row0 + i;
+            const uint expert = expert0 + i;
+            seismic_shared_f32[i * ROUTE_PITCH + k] = row < SEISMIC_DIM_M
+                ? element_at(ROUTE_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
+                    row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(k0 + k) * SEISMIC_RESULT_0_STRIDE_1)
+                : 0.0;
+            seismic_shared_f32[columns_tile + k * ROUTE_PITCH + i] = expert <= ROUTE_E ? route_column_weight(expert, k0 + k) : 0.0;
+        }
+        barrier();
+        for (uint k = 0u; k < ROUTE_TILE; ++k) {
+            const float a = seismic_shared_f32[r * ROUTE_PITCH + k];
+            [[unroll]] for (uint j = 0u; j < 8u; ++j)
+                acc[j] = seismic_fma_rn(a, seismic_shared_f32[columns_tile + k * ROUTE_PITCH + e0 + j], acc[j]);
+        }
+    }
+    const uint64_t row = row0 + r;
+    [[unroll]] for (uint j = 0u; j < 8u; ++j)
+        if (row < SEISMIC_DIM_M && expert0 + e0 + j <= ROUTE_E)
+            element_f32_put(route_logit(row, expert0 + e0 + j), acc[j]);
+}
+
+// Descending probability, ties to the higher expert index.
+bool route_precedes(float probability, int expert, float best, int best_expert) {
+    return probability > best || (probability == best && expert > best_expert);
+}
+
+#define ROUTE_PER_LANE (ROUTE_E / 32u)
+
+void routed_route_select() {
+    const uint lane = SEISMIC_LANE;
+    const uint64_t row = uint64_t(gl_WorkGroupID.x) * SEISMIC_SUBGROUPS + SEISMIC_SUBGROUP;
+    if (row >= SEISMIC_DIM_M)
+        return;
+    const uint64_t routes = SEISMIC_PTR(SEISMIC_BUFFER_ROUTES);
+    const uint64_t scores = SEISMIC_PTR(SEISMIC_BUFFER_SCORES);
+    // Lane `lane` holds experts lane + 32 i.
+    float probability[ROUTE_PER_LANE];
+    float maximum = -uintBitsToFloat(0x7f800000u);
+    [[unroll]] for (uint i = 0u; i < ROUTE_PER_LANE; ++i) {
+        probability[i] = element_f32_at(route_logit(row, lane + 32u * i));
+        maximum = max(maximum, probability[i]);
+    }
+    maximum = seismic_subgroup_max(maximum);
+    float total = 0.0;
+    [[unroll]] for (uint i = 0u; i < ROUTE_PER_LANE; ++i) {
+        probability[i] = exp(probability[i] - maximum);
+        total += probability[i];
+    }
+    total = seismic_subgroup_sum_f32(total);
+    [[unroll]] for (uint i = 0u; i < ROUTE_PER_LANE; ++i)
+        probability[i] = seismic_div_rn(probability[i], total);
+
+    float chosen[ROUTE_K];
+    for (uint rank = 0u; rank < ROUTE_K; ++rank) {
+        float best = -uintBitsToFloat(0x7f800000u);
+        int best_expert = -1;
+        [[unroll]] for (uint i = 0u; i < ROUTE_PER_LANE; ++i) {
+            const int expert = int(lane + 32u * i);
+            if (route_precedes(probability[i], expert, best, best_expert)) {
+                best = probability[i];
+                best_expert = expert;
+            }
+        }
+        const float winner_probability = seismic_subgroup_max(best);
+        const int winner = seismic_subgroup_max(best == winner_probability ? best_expert : -1);
+        [[unroll]] for (uint i = 0u; i < ROUTE_PER_LANE; ++i)
+            if (winner >= 0 && uint(winner) == lane + 32u * i)
+                probability[i] = -uintBitsToFloat(0x7f800000u);
+        chosen[rank] = winner_probability;
+        if (lane == 0u) {
+            const uint64_t slot = uint64_t(ROUTE_K - 1u - rank);
+            element_i32_put(routes + (row * SEISMIC_ROUTES_STRIDE_0 + slot * SEISMIC_ROUTES_STRIDE_1) * 4ul, winner);
+            element_f32_put(scores + (row * SEISMIC_SCORES_STRIDE_0 + slot * SEISMIC_SCORES_STRIDE_1) * 4ul,
+                winner_probability);
+        }
+    }
+    if (SEISMIC_PARAM_NORMALIZE != 0ul) {
+        // The slot-order sum: slot s holds rank K - 1 - s.
+        float denominator = 0.0;
+        for (uint slot = 0u; slot < ROUTE_K; ++slot)
+            denominator += chosen[ROUTE_K - 1u - slot];
+        if (lane == 0u) {
+            for (uint slot = 0u; slot < ROUTE_K; ++slot)
+                element_f32_put(scores + (row * SEISMIC_SCORES_STRIDE_0 + uint64_t(slot) * SEISMIC_SCORES_STRIDE_1) * 4ul,
+                    seismic_div_rn(chosen[ROUTE_K - 1u - slot], denominator));
+        }
+    }
+    if (lane == 0u)
+        element_f32_put(SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER) + row * SEISMIC_RESULT_1_STRIDE_0 * 4ul,
+            seismic_div_rn(1.0, 1.0 + exp(-element_f32_at(route_logit(row, ROUTE_E)))));
+}

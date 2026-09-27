@@ -8,14 +8,14 @@ const hardware = (available: number | null = 8 * GiB, discrete = false) => Schem
   platform: discrete ? "Linux" : "MacOS", architecture: discrete ? "X64" : "Arm64",
   logicalCores: 8, totalSystemMemoryBytes: 16 * GiB, availableSystemMemoryBytes: 8 * GiB,
   systemAllocationCapacityBytes: 14 * GiB, systemAllocationHeadroomBytes: 6 * GiB, abortReserveBytes: GiB,
-  accelerators: [{ acceleratorId: "gpu", name: "Test GPU", backend: discrete ? "CUDA" : "Metal", memoryDomainId: discrete ? "gpu" : "system" }],
+  accelerators: [{ acceleratorId: "gpu", name: "Test GPU", backend: discrete ? "cuda" : "metal", memoryDomainId: discrete ? "gpu" : "system" }],
   memoryDomains: [
     { memoryDomainId: "system", kind: discrete ? "System" : "UnifiedMemory", totalBytes: 16 * GiB, stableCapacityBytes: 14 * GiB, sharesSystemMemory: true, ...(available === null ? {} : { availableBytes: available }) },
     ...(discrete ? [{ memoryDomainId: "gpu", kind: "PhysicalDevice", totalBytes: 16 * GiB, stableCapacityBytes: 16 * GiB, availableBytes: 8 * GiB, sharesSystemMemory: false }] : []),
   ],
 })
 const allocation = (domain = "system", modelBytes = 3 * GiB) => Option.some(Schema.decodeUnknownSync(ModelInstanceAllocationSchema)({
-  contextWindowTokens: 4096, parallelSequences: 1, physicalContextTokens: 4096,
+  contextWindowTokens: 4096,
   memoryDomains: [{ memoryDomainId: domain, modelBytes, contextBytes: 2 * GiB, computeBytes: GiB / 2, auxiliaryBytes: GiB / 2 }],
 }))
 

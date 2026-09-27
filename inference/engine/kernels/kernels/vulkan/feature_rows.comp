@@ -1,0 +1,20 @@
+// feature_rows: features[row, column] = A(fused[out_rows[row], column]); one
+// invocation per element over a grid-stride loop (the grid is capped below
+// the 65535-group floor).
+#include "lib/core/activation.glsl"
+
+void feature_rows() {
+    const uint64_t fused = SEISMIC_PTR(SEISMIC_BUFFER_FUSED);
+    const uint64_t out_rows = SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS);
+    const uint64_t features = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const uint64_t width = SEISMIC_DIM_D;
+    const uint64_t count = SEISMIC_DIM_O * width;
+    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
+    for (uint64_t index = gl_GlobalInvocationID.x; index < count; index += step) {
+        const uint64_t row = index / width;
+        const uint64_t column = index % width;
+        const uint64_t source = uint64_t(element_i32_index(out_rows, row * SEISMIC_OUT_ROWS_STRIDE_0));
+        element_put(ELEMENT_ACT, features, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
+            element_f32_at(fused + (source * SEISMIC_FUSED_STRIDE_0 + column * SEISMIC_FUSED_STRIDE_1) * 4ul));
+    }
+}

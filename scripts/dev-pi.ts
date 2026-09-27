@@ -15,7 +15,7 @@ import {
 import { Console, Effect, Option, Schema } from "effect"
 import { dirname, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
-import { buildLocalIcn } from "../inference/scripts/build-local"
+import { buildLocalInference } from "../inference/scripts/build-local"
 import { existingAcnConnection } from "../cli/src/server/acn-connection"
 import { desktopServiceOrigin, startDesktopApplication } from "../cli/src/server/application"
 import { BunSqliteDriverLayer } from "@magnitudedev/daemon-management/bun"
@@ -52,7 +52,7 @@ const requireSuccess = (operation: string, termination: InteractiveProcessTermin
 }
 
 const buildDevelopmentIcn = Effect.tryPromise({
-  try: () => buildLocalIcn({ diagnostics: "errors" }),
+  try: () => buildLocalInference({ diagnostics: "errors" }),
   catch: (error) => new PiDevelopmentFailed({
     message: `Could not build the development inference runtime: ${String(error)}`,
   }),

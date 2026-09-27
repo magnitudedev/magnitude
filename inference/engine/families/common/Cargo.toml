@@ -1,0 +1,27 @@
+[package]
+name = "magnitude-family-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# The catalog header loader for family tests.
+catalog-headers = ["dep:serde_json"]
+
+[dependencies]
+magnitude-artifacts = { path = "../../artifacts" }
+magnitude-family-contracts = { path = "../contracts" }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+magnitude-family-common = { path = ".", features = ["catalog-headers"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "=0.11.0"
+magnitude-family-dflash = { path = "../dflash" }
+magnitude-family-gemma4 = { path = "../gemma4" }
+magnitude-family-lfm2 = { path = "../lfm2" }
+magnitude-family-llama = { path = "../llama" }
+magnitude-family-muse-glimmer = { path = "../muse_glimmer" }
+magnitude-family-nemotron-h = { path = "../nemotron_h" }
+magnitude-family-qwen35 = { path = "../qwen35" }

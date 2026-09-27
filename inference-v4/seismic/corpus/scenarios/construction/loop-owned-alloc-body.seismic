@@ -1,0 +1,9 @@
+# origin: C11:loop_owned_alloc_body
+# cell: alloc/ordered
+# invoke: f32[3]=0,0,0
+fn probe(dst: &mut tensor[3] f32):
+    for k in 0..3:
+        let mut t = tensor[2] f32
+        t[0] = f32(k)
+        t[1] = 1.0
+        dst[k] = t[0] + t[1]

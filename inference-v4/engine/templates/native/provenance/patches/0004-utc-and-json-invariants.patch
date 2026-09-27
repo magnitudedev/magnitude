@@ -1,0 +1,39 @@
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -35,8 +35,10 @@
+ 
+ static std::string format_time(const std::chrono::system_clock::time_point & now, const std::string & format) {
+     auto               time       = std::chrono::system_clock::to_time_t(now);
+-    auto               local_time = *std::localtime(&time);
++    std::tm local_time{};
++    if (!gmtime_r(&time, &local_time)) { throw std::invalid_argument("Timestamp outside UTC calendar range"); }
+     std::ostringstream ss;
++    ss.imbue(std::locale::classic());
+     ss << std::put_time(&local_time, format.c_str());
+     auto res = ss.str();
+     return res;
+--- a/common/jinja/value.cpp
++++ b/common/jinja/value.cpp
+@@ -373,7 +373,9 @@
+             // get current time
+             // TODO: make sure this is the same behavior as Python's strftime
+             char buf[100];
+-            if (std::strftime(buf, sizeof(buf), format.c_str(), std::localtime(&args.ctx.current_time))) {
++            std::tm utc_time{};
++            if (!gmtime_r(&args.ctx.current_time, &utc_time)) { throw raised_exception("Timestamp outside UTC calendar range"); }
++            if (std::strftime(buf, sizeof(buf), format.c_str(), &utc_time)) {
+                 return mk_val<value_string>(std::string(buf));
+             } else {
+                 throw raised_exception("strftime_now: failed to format time");
+--- a/common/json.cpp
++++ b/common/json.cpp
+@@ -2,7 +2,8 @@
+ 
+ #include "templates-support.h"
+ 
+-#define JSON_ASSERT TEMPLATES_ASSERT
++// Keep nlohmann internal noexcept invariants separate from recoverable
++// extraction assertions. Public JSON accesses use checked at()/get() operations.
+ #include <nlohmann/json.hpp>
+ 
+ #include <iterator>

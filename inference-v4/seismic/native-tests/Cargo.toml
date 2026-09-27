@@ -1,0 +1,15 @@
+[package]
+name = "seismic-native-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+seismic.workspace = true
+
+[dev-dependencies]
+seismic-lang.workspace = true
+
+[build-dependencies]
+seismic-build.workspace = true

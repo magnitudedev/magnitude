@@ -252,14 +252,11 @@ export const selectArtifact = (
   manifest: ReleaseManifest,
   kind: ReleaseArtifact["kind"],
   host?: string,
-  backend?: string
 ): Effect.Effect<ReleaseArtifact, ReleaseAcquisitionError> => {
   const matches = manifest.artifacts.filter(
     (artifact) =>
       artifact.kind === kind &&
-      (host === undefined || Option.getOrUndefined(artifact.host) === host) &&
-      (backend === undefined ||
-        Option.getOrUndefined(artifact.backend) === backend)
+      (host === undefined || Option.getOrUndefined(artifact.host) === host)
   )
   return matches.length === 1
     ? Effect.succeed(matches[0]!)
@@ -271,44 +268,18 @@ export const selectArtifact = (
       )
 }
 
+/** Each host has one inference artifact with every backend, so its size is known before download. */
 export const releaseBundleSizes = (
   manifest: ReleaseManifest,
   host: string,
 ): Effect.Effect<ReleaseBundleSizes, ReleaseAcquisitionError> =>
   Effect.gen(function* () {
     const daemon = yield* selectArtifact(manifest, "acn", host)
-    const base = yield* selectArtifact(manifest, "icn-base", host, "cpu")
-    const acceleratorCandidates = manifest.artifacts.filter(
-      (artifact) =>
-        artifact.kind === "icn-backend" &&
-        Option.getOrUndefined(artifact.host) === host,
-    )
-    const accelerator =
-      host === "darwin-arm64"
-        ? yield* selectArtifact(manifest, "icn-backend", host, "metal").pipe(
-            Effect.map(Option.some),
-          )
-        : acceleratorCandidates.reduce<Option.Option<ReleaseArtifact>>(
-            (largest, candidate) =>
-              Option.some(
-                Option.match(largest, {
-                  onNone: () => candidate,
-                  onSome: (current) =>
-                    candidate.bytes > current.bytes ? candidate : current,
-                }),
-              ),
-            Option.none(),
-          )
+    const inference = yield* selectArtifact(manifest, "icn-base", host)
     return {
       daemonBytes: daemon.bytes,
-      inferenceEngineBytes:
-        base.bytes +
-        Option.match(accelerator, {
-          onNone: () => 0,
-          onSome: (artifact) => artifact.bytes,
-        }),
-      inferenceEngineBytesExact:
-        host === "darwin-arm64" || acceleratorCandidates.length === 0,
+      inferenceEngineBytes: inference.bytes,
+      inferenceEngineBytesExact: true,
     }
   })
 

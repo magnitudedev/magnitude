@@ -1,0 +1,11 @@
+# origin: C11:if_sequential_joins
+# invoke: f32[4]=1,2,3,4 ; bool:true ; bool:false
+fn probe(a: &tensor[4] f32, c: bool, d: bool) -> tensor[4] f32:
+    let mut t = to_owned(a)
+    if c:
+        t = t + 1.0
+    if d:
+        t = t * 2.0
+    let u = t + t
+    let v = u + t
+    return v

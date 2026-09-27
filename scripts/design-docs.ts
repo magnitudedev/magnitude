@@ -32,8 +32,8 @@ Options:
   -h, --help  Show this help
 
 Examples:
-  bun design-docs inference/crates/icn-engine/src/scheduler.rs
-  bun design-docs inference/crates/icn-engine
+  bun design-docs inference/engine/scheduler/src/worker.rs
+  bun design-docs inference/engine/scheduler
   bun design-docs --changed
   bun design-docs --all`;
 

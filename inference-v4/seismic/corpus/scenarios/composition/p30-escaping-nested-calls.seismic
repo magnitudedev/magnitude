@@ -1,0 +1,20 @@
+# origin: X1:P30
+# invoke: f32[4]=1,2,3,4 ; index:2
+# pin: result = f32[4]=5,6,7,8
+# invoke: f32[4]=1,2,3,4 ; index:0
+# pin: result = f32[4]=3,4,5,6
+fn inner[N](x: &tensor[N] f32) -> tensor[N] f32:
+    let mut t = tensor[N] f32
+    for i in 0..N:
+        t[i] = x[i] + 1.0
+    return t
+fn outer[N](x: &tensor[N] f32, c: bool) -> tensor[N] f32:
+    let mut r = inner(x)
+    if c:
+        r = inner(r)
+    return r
+fn probe[N](x: &tensor[N] f32, n: index[4]) -> tensor[N] f32:
+    let mut acc = outer(x, true)
+    for k in 0..n:
+        acc = outer(acc, false)
+    return acc

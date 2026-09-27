@@ -1,0 +1,17 @@
+[package]
+name = "seismic-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/compiler.rs"
+
+[dependencies]
+seismic-ir.workspace = true
+seismic-estimator.workspace = true
+seismic-lang.workspace = true
+seismic-native-target.workspace = true
+magnitude-solver = { path = "../../solver" }
+sha2 = "=0.11.0"
+

@@ -1,0 +1,17 @@
+#include <seismic/slab.glsl>
+
+void slab_scale() {
+    const uint64_t row = gl_WorkGroupID.x;
+    const uint64_t slab_rows = SEISMIC_PARAM_SLAB_ROWS;
+    seismic_f32 source = seismic_f32(slab_region(
+        SEISMIC_PTR(SEISMIC_BUFFER_X), row / slab_rows));
+    seismic_f32 result = seismic_f32(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
+    const float factor = uintBitsToFloat(uint(SEISMIC_PARAM_FACTOR));
+    const uint64_t local = row % slab_rows;
+    for (uint64_t column = gl_LocalInvocationID.x; column < SEISMIC_DIM_N;
+         column += gl_WorkGroupSize.x) {
+        result[uint(row * SEISMIC_RESULT_0_STRIDE_0
+            + column * SEISMIC_RESULT_0_STRIDE_1)].v =
+            source[uint(local * SEISMIC_DIM_N + column)].v * factor;
+    }
+}

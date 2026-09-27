@@ -1,0 +1,20 @@
+# origin: test:seismic-runtime:runtime/src/feedback.rs:metal_feedback_inlines_portable_reference_calls_in_parallel_segments
+# invoke row_sums: f32[2,4]=rand(150)
+fn sum_values[W](row: tensor[W] f32) -> f32:
+    return reduce(row, 0, sum)
+
+fn row_sums[N,W](x: &tensor[N,W] f32) -> (tensor[N] f32, tensor[N,W] bf16):
+    let mut result = tensor[N] f32
+    let mut copied = tensor[N,W] bf16
+    parallel for row in 0..N:
+        let mut local = to_owned(x[row])
+        let mut total = f32(0.0)
+        for column in 0..W:
+            if local[column] > 0.0:
+                total = total + local[column]
+            else:
+                total = total - local[column]
+            local[column] = local[column] + 1.0
+        copied[row] = local
+        result[row] = sum_values(local) + total
+    return result, copied

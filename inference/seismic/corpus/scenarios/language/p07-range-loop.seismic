@@ -1,0 +1,9 @@
+# origin: C1:p7
+# cell: value-range/ordered
+# invoke count: f32[5]=seq ; range:1..4
+# pin: result = f32[]=6
+fn count[N](x: &tensor[N] f32, r: range[N]) -> f32:
+    let mut s = f32(0.0)
+    for i in r:
+        s = s + x[i]
+    return s

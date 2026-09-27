@@ -1,0 +1,17 @@
+# origin: C13:p28
+# invoke: i32[4]=seq ; i32:0
+fn pair[N](x: &tensor[N] i32, k: i32) -> (i32, tensor[N] i32):
+    return reduce(x, 0, sum) * k, x * k
+
+fn probe(input: &tensor[4] i32, flag: i32) -> (i32, tensor[4] i32):
+    let mut s = 0
+    let mut t = input * 0
+    if flag > 0:
+        let (a, b) = pair(input, 2)
+        s = a
+        t = b
+    else:
+        let (a, b) = pair(input, 3)
+        s = a
+        t = b
+    return s, t

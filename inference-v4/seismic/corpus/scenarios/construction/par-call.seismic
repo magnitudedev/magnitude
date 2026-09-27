@@ -1,0 +1,9 @@
+# origin: C11:par_call
+# cell: call-portable/parallel
+# invoke: f32[2,4]=1,1,1,1,1,1,1,1 ; f32[2]=0,0
+fn helper(x: &tensor[4] f32) -> f32:
+    return reduce(x, 0, sum)
+
+fn probe[N](x: &tensor[N, 4] f32, dst: &mut tensor[N] f32):
+    parallel for k in 0..N:
+        dst[k] = helper(x[k])

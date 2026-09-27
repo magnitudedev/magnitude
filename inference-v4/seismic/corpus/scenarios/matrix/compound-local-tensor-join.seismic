@@ -1,0 +1,10 @@
+# cell: compound-local-tensor/join
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; bool:true
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; bool:false
+fn probe(x: &tensor[4, 8] f32, out: &mut tensor[4] f32, c: bool):
+    let mut t = to_owned(x[0])
+    if c:
+        t += x[1]
+    else:
+        t *= 2.0
+    out[0] = t[2]

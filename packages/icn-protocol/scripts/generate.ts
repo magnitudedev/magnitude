@@ -16,6 +16,7 @@ class GeneratedOutputMismatch extends Data.TaggedError(
 
 const packageRoot = resolve(import.meta.dirname, "..");
 const repositoryRoot = resolve(packageRoot, "../..");
+const inferenceRoot = resolve(repositoryRoot, "inference");
 const generatedRoot = resolve(packageRoot, "src/generated");
 
 const exportOpenApi = Effect.tryPromise({
@@ -26,13 +27,13 @@ const exportOpenApi = Effect.tryPromise({
         "run",
         "--quiet",
         "--manifest-path",
-        resolve(repositoryRoot, "inference/Cargo.toml"),
+        resolve(inferenceRoot, "Cargo.toml"),
         "-p",
-        "icn-api",
+        "magnitude-service-api",
         "--bin",
         "export-openapi",
       ],
-      { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" }
+      { cwd: inferenceRoot, stdout: "pipe", stderr: "pipe" }
     );
     const [status, stdout, stderr] = await Promise.all([
       process.exited,

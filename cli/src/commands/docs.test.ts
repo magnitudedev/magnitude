@@ -30,7 +30,7 @@ describe("Magnitude documentation", () => {
     expect(resolveDocumentationCommand("onboarding")._tag).toBe("Failure")
     const result = resolveDocumentationCommand("cli")
     expect(result._tag).toBe("Success")
-    if (result._tag === "Success") expect(result.output).toContain("Onboarding lives in the Magnitude desktop app")
+    if (result._tag === "Success") expect(result.output).toContain("Use Desktop or `magnitude serve` to run inference.")
   })
 
   it("publishes self-contained speculative method guidance", () => {

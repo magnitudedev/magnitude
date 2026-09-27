@@ -1,0 +1,5 @@
+# origin: C11:par_repack_inside
+# rejected: "decode-only"
+fn probe[N](x: &tensor[N, 64] f32, dst: &mut tensor[N, 64] q8g32):
+    parallel for k in 0..N:
+        dst[k] = repack[U = q8g32](x[k])

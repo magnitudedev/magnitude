@@ -1,0 +1,9 @@
+[package]
+name = "magnitude-model-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+magnitude-model-contracts = { path = "../model-contracts" }
+seismic.workspace = true

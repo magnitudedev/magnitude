@@ -1,0 +1,6 @@
+# origin: C17:atomic_add_f16
+# invoke: f16[64]=zero ; f16[1]=zero
+# pin: out = f16[1]=0
+fn probe[N](x: &tensor[N] f16, out: &mut tensor[1] f16):
+    parallel for i in 0..N:
+        atomic(add, out[0], x[i])

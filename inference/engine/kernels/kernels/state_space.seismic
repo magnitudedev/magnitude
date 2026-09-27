@@ -1,0 +1,359 @@
+# State-space (Mamba-2) mixer execution: the state advance over the normed
+# input projection's rows, and the gated, group-normalized output projection.
+#
+# Projection column contract (the `ssm_in` row order), consumed by the state
+# entries and the output projection: `z (NH * P) | x (NH * P) | B (G * N) |
+# C (G * N) | dt (NH)`, head h's channels h * P + p and group g's g * N + n.
+# Head h reads group g = h * G / NH (contiguous groups of NH / G heads). The
+# convolved channels are `x | B | C`, CH = NH * P + 2 * G * N; z and dt are
+# not convolved.
+#
+# State contract: each state-space layer owns three arenas,
+# `window[S, C - 1 + T, CH] A` (raw pre-convolution x | B | C rows),
+# `state[S, NH, P, N] f32` (rows by head channel, columns by state
+# coordinate) and `tape[S, T, NH * P + G * N + NH] f32` (T >= 0, the planned
+# speculative width). A bank holds a state and the tape of up to T rows past
+# it; a version is (bank, j <= T): the bank's state advanced by its first j
+# tape rows. Tape row i is (u [NH, P], B [G, N], d [NH]) of one row: the
+# input u = delta x, the convolved B and the decay, so S <- d S + u B^T
+# replays it (the step's own update). The bank's window holds the C - 1 raw
+# rows before its state, then the raw rows of its tape.
+#
+# Slots, versions, `stop` and the successor publication follow the
+# gated-delta contract (recurrent.seismic): slot `b` reads version
+# (`previous_bank[b]`, `previous_tape[b]`) and publishes to bank
+# `following_bank[b]` the state after its first `stop[b]` rows, the C - 1
+# raw rows before it and the tape of the next t = min(T, rows - stop) rows;
+# an entry never writes a `previous_bank` row or bank 0, and successors are
+# distinct. Mixed outputs are produced for every row of the slot regardless
+# of `stop`.
+#
+# Mixed output contract: `mixed[M, NH, P] A` holds S C + D x per row and head
+# channel with the updated state, rounded to A; rows outside every slot are
+# zero. The SiLU(z) gate and the grouped RMS belong to `state_space_output`.
+
+
+# The sequential semantic oracle shared by both state entries. Per slot, rows
+# advance in order: the causal depthwise convolution over the window and the
+# slot's earlier rows plus the channel bias, SiLU; delta = softplus(dt +
+# time_bias) and decay = exp(rate * delta); then S <- decay S + (delta x) B^T
+# and the output S C + D x. The slot starts from its version's state and
+# window rows; the rows after `stop` (up to T) are recorded in the
+# successor's tape.
+fn state_space_rows[M, B, S, NH, P, G, N, C, T](
+    projection: &tensor[M, 2 * NH * P + 2 * G * N + NH] A,
+    convolution: &tensor[NH * P + 2 * G * N, C] f32,
+    convolution_bias: &tensor[NH * P + 2 * G * N] f32,
+    rate: &tensor[NH] f32, time_bias: &tensor[NH] f32, skip: &tensor[NH] f32,
+    segments: &tensor[B + 1, 2] i32, stop: &tensor[B] i32,
+    previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
+    window: &mut tensor[S, C - 1 + T, NH * P + 2 * G * N] A,
+    state: &mut tensor[S, NH, P, N] f32,
+    tape: &mut tensor[S, T, NH * P + G * N + NH] f32) -> tensor[M, NH, P] A where T >= 0:
+    let mut mixed = tensor[M, NH, P] A
+    for row in 0..M:
+        for head in 0..NH:
+            for channel in 0..P:
+                mixed[row, head, channel] = 0.0
+    for slot in 0..B:
+        let lo = segments[slot, 0]
+        let hi = segments[slot, 1]
+        let source = previous_bank[slot]
+        let taped = previous_tape[slot]
+        let target = following_bank[slot]
+        let publish = lo + stop[slot]
+        let mut current = tensor[NH, P, N] f32
+        for head in 0..NH:
+            for channel in 0..P:
+                for column in 0..N:
+                    current[head, channel, column] = state[source, head, channel, column]
+        for entry in 0..T:
+            if entry < taped:
+                for head in 0..NH:
+                    let group = head * G / NH
+                    let factor = tape[source, entry, NH * P + G * N + head]
+                    for channel in 0..P:
+                        let input = tape[source, entry, head * P + channel]
+                        for column in 0..N:
+                            current[head, channel, column] = fma(input,
+                                tape[source, entry, NH * P + group * N + column],
+                                current[head, channel, column] * factor)
+        if publish == lo:
+            for head in 0..NH:
+                for channel in 0..P:
+                    for column in 0..N:
+                        state[target, head, channel, column] = current[head, channel, column]
+        for row in 0..M:
+            if row >= lo and row < hi:
+                let local = row - lo
+                let mut prepared = tensor[NH * P + 2 * G * N] f32
+                for channel in 0..NH * P + 2 * G * N:
+                    let mut sum = convolution[channel, C - 1] * f32(projection[row, NH * P + channel])
+                    for tap in 0..C - 1:
+                        let mut previous = f32(0.0)
+                        if local + tap < C - 1:
+                            previous = f32(window[source, taped + local + tap, channel])
+                        else:
+                            previous = f32(projection[lo + local + tap - (C - 1), NH * P + channel])
+                        sum = fma(convolution[channel, tap], previous, sum)
+                    sum = sum + convolution_bias[channel]
+                    prepared[channel] = sum / (1.0 + exp(-sum))
+                for head in 0..NH:
+                    let group = head * G / NH
+                    let shifted = f32(projection[row, 2 * NH * P + 2 * G * N + head]) + time_bias[head]
+                    let delta = max(shifted, 0.0) + log(1.0 + exp(-abs(shifted)))
+                    let factor = exp(rate[head] * delta)
+                    if row >= publish and row - publish < T:
+                        tape[target, row - publish, NH * P + G * N + head] = factor
+                    for channel in 0..P:
+                        let value = prepared[head * P + channel]
+                        let input = delta * value
+                        if row >= publish and row - publish < T:
+                            tape[target, row - publish, head * P + channel] = input
+                        let mut output = f32(0.0)
+                        for column in 0..N:
+                            current[head, channel, column] = fma(input,
+                                prepared[NH * P + group * N + column],
+                                current[head, channel, column] * factor)
+                            output = fma(current[head, channel, column],
+                                prepared[NH * P + G * N + group * N + column], output)
+                        mixed[row, head, channel] = fma(skip[head], value, output)
+                if row >= publish and row - publish < T:
+                    for group in 0..G:
+                        for column in 0..N:
+                            let recorded = prepared[NH * P + group * N + column]
+                            tape[target, row - publish, NH * P + group * N + column] = recorded
+                if row + 1 == publish:
+                    for head in 0..NH:
+                        for channel in 0..P:
+                            for column in 0..N:
+                                state[target, head, channel, column] = current[head, channel, column]
+        for tap in 0..C - 1 + T:
+            if tap < C - 1 or publish + tap - (C - 1) < hi:
+                for channel in 0..NH * P + 2 * G * N:
+                    if stop[slot] + tap < C - 1:
+                        window[target, tap, channel] = window[source, taped + stop[slot] + tap, channel]
+                    else:
+                        window[target, tap, channel] = projection[publish + tap - (C - 1), NH * P + channel]
+    return mixed
+
+
+# Row-sequential state advance for small row classes (decode, speculative
+# verify). Its native launches own (head, block of state rows, slot); the
+# convolved B and C of the head's group are staged per row, and a state row's
+# N columns are held in registers for the whole slot.
+fn state_space_step[M, B, S, NH, P, G, N, C, T](
+    projection: &tensor[M, 2 * NH * P + 2 * G * N + NH] A,
+    convolution: &tensor[NH * P + 2 * G * N, C] f32,
+    convolution_bias: &tensor[NH * P + 2 * G * N] f32,
+    rate: &tensor[NH] f32, time_bias: &tensor[NH] f32, skip: &tensor[NH] f32,
+    segments: &tensor[B + 1, 2] i32, stop: &tensor[B] i32,
+    previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
+    window: &mut tensor[S, C - 1 + T, NH * P + 2 * G * N] A,
+    state: &mut tensor[S, NH, P, N] f32,
+    tape: &mut tensor[S, T, NH * P + G * N + NH] f32,
+    slab_banks: u32) -> tensor[M, NH, P] A where T >= 0:
+    return state_space_rows(projection, convolution, convolution_bias, rate, time_bias, skip, segments,
+        stop, previous_bank, previous_tape, following_bank, window, state, tape)
+
+# Metal: a threadgroup of four simdgroups per (head, ROWS state rows, slot),
+# grid z = B zeroing the mixed rows no slot covers; each simdgroup holds
+# ROWS / 4 state rows, N / 32 columns per lane. A span of 2048 / N rows' B, C
+# and x is staged at once. `ROWS` never changes result bits.
+native state_space_step for metal from "metal/state_space_step.metal":
+    static (NH, P, G, N, C)
+    params (ROWS in [32, 16, 64])
+    where N % 32 == 0 and N <= 256 and P % ROWS == 0 and G <= NH and 2048 / N * (2 * N + ROWS + 2) <= 8192
+    launch state_space_step:
+        threadgroups (NH, P / ROWS, B + 1)
+        threads_per_threadgroup (128, 1, 1)
+
+# CUDA: the Metal geometry, a block of four warps.
+native state_space_step for cuda from "cuda/state_space_step.cu":
+    static (NH, P, G, N, C)
+    params (code ROWS in [32, 16, 64])
+    where N % 32 == 0 and N <= 256 and P % ROWS == 0 and G <= NH and 2048 / N * (2 * N + ROWS + 2) <= 8192
+    launch state_space_step:
+        reads (ROWS)
+        threadgroups (NH, P / ROWS, B + 1)
+        threads_per_threadgroup (128, 1, 1)
+
+# Vulkan: the CUDA step over four logical subgroups; shared: the staged span.
+native state_space_step for vulkan from "vulkan/state_space_step.comp":
+    static (NH, P, G, N, C)
+    params (ROWS in [32, 16, 64])
+    where N % 32 == 0 and N <= 256 and P % ROWS == 0 and G <= NH and 2048 / N * (2 * N + ROWS + 2) <= 8192
+    launch state_space_step:
+        threadgroups (NH, P / ROWS, B + 1)
+        threads_per_threadgroup (128, 1, 1)
+        shared_bytes ((2048 / N * (2 * N + ROWS) + 2 * (2048 / N)) * 4)
+
+# CPU: a work item per (head, ROWS state rows, slot) holds its state rows
+# privately for the whole slot and computes each row's prologue itself; grid
+# z = B zeroes the mixed rows no slot covers. ROWS never changes result bits.
+# Private bytes: the state rows, the group's B and C, the rows' x.
+native state_space_step for cpu from "cpu/state_space_step.rs":
+    params (ROWS in [64, 32, 16])
+    launch state_space_step:
+        threadgroups (NH, ceil_div(P, ROWS), B + 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes ((min(ROWS, P) * N + 2 * N + min(ROWS, P)) * 4)
+
+
+# Chunked state advance for large row classes (prefill): the same contract
+# as `state_space_step`, computed in the state-space dual (SSD) form over
+# pieces of rows. With gamma the cumulative decay within a piece, the outputs
+# are diag(gamma) C S^T + (C B^T o D_gamma) U + D x with U = diag(delta) X,
+# and S <- gamma_last S + U^T diag(gamma_last / gamma) B: no triangular solve,
+# and C B^T is shared by the NH / G heads of a group. Slots of at most 16
+# rows (speculative verify) are not chunked and get the step's bits; in a
+# longer slot the rows after `stop` (whose inputs feed the tape) advance
+# row-sequentially from the published state.
+fn state_space_chunk[M, B, S, NH, P, G, N, C, T](
+    projection: &tensor[M, 2 * NH * P + 2 * G * N + NH] A,
+    convolution: &tensor[NH * P + 2 * G * N, C] f32,
+    convolution_bias: &tensor[NH * P + 2 * G * N] f32,
+    rate: &tensor[NH] f32, time_bias: &tensor[NH] f32, skip: &tensor[NH] f32,
+    segments: &tensor[B + 1, 2] i32, stop: &tensor[B] i32,
+    previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
+    window: &mut tensor[S, C - 1 + T, NH * P + 2 * G * N] A,
+    state: &mut tensor[S, NH, P, N] f32,
+    tape: &mut tensor[S, T, NH * P + G * N + NH] f32,
+    slab_banks: u32) -> tensor[M, NH, P] A where T >= 0:
+    return state_space_rows(projection, convolution, convolution_bias, rate, time_bias, skip, segments,
+        stop, previous_bank, previous_tape, following_bank, window, state, tape)
+
+# Metal, CUDA, Vulkan: `inputs` convolves the B and C channels of every row
+# once into scratch with the step sizes and log decays (a threadgroup per row
+# and 256 channels); `products` forms C_i . B_j per piece of 32 rows and
+# group from B and C staged in shared memory (pieces number at most
+# ceil(M / 32) + B); `scan` has the step's geometry and bits for the
+# unchunked rows, and for the pieces convolves the x channels of its state
+# rows, reduce-scatters the S C_i sums over each simdgroup and applies the
+# dual form.
+native state_space_chunk for metal from "metal/state_space_chunk.metal":
+    static (NH, P, G, N, C)
+    params (ROWS in [32, 16, 64])
+    where N % 32 == 0 and N <= 256 and P % ROWS == 0 and G <= NH and 2048 / N * (2 * N + ROWS + 2) <= 8192
+    scratch inputs bytes (M * (2 * G * N + 2 * NH) * 4)
+    scratch products bytes ((ceil_div(M, 32) + B) * G * 32 * 32 * 4)
+    launch state_space_chunk_inputs:
+        threadgroups (M, ceil_div(2 * G * N + NH, 256), 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch state_space_chunk_products:
+        threadgroups (ceil_div(M, 32) + B, G, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch state_space_chunk_scan:
+        threadgroups (NH, P / ROWS, B + 1)
+        threads_per_threadgroup (128, 1, 1)
+
+native state_space_chunk for cuda from "cuda/state_space_chunk.cu":
+    static (NH, P, G, N, C)
+    params (code ROWS in [32, 16, 64])
+    where N % 32 == 0 and N <= 256 and P % ROWS == 0 and G <= NH and 2048 / N * (2 * N + ROWS + 2) <= 8192
+    scratch inputs bytes (M * (2 * G * N + 2 * NH) * 4)
+    scratch products bytes ((ceil_div(M, 32) + B) * G * 32 * 32 * 4)
+    launch state_space_chunk_inputs:
+        threadgroups (M, ceil_div(2 * G * N + NH, 256), 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch state_space_chunk_products:
+        threadgroups (ceil_div(M, 32) + B, G, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch state_space_chunk_scan:
+        reads (ROWS)
+        threadgroups (NH, P / ROWS, B + 1)
+        threads_per_threadgroup (128, 1, 1)
+
+native state_space_chunk for vulkan from "vulkan/state_space_chunk.comp":
+    static (NH, P, G, N, C)
+    params (ROWS in [32, 16, 64])
+    where N % 32 == 0 and N <= 256 and P % ROWS == 0 and G <= NH and 2048 / N * (2 * N + ROWS + 2) <= 8192
+    scratch inputs bytes (M * (2 * G * N + 2 * NH) * 4)
+    scratch products bytes ((ceil_div(M, 32) + B) * G * 32 * 32 * 4)
+    launch state_space_chunk_inputs:
+        threadgroups (M, ceil_div(2 * G * N + NH, 256), 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch state_space_chunk_products:
+        threadgroups (ceil_div(M, 32) + B, G, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (2 * 32 * 33 * 4)
+    launch state_space_chunk_scan:
+        threadgroups (NH, P / ROWS, B + 1)
+        threads_per_threadgroup (128, 1, 1)
+        shared_bytes (max(2048 / N * (2 * N + ROWS) + 2 * (2048 / N), 32 * ROWS + 32 * 33 + 4 * 32) * 4)
+
+# CPU: `inputs` convolves each slot row once into scratch (a work item per
+# row) with the step's functions; the scan advances every slot
+# row-sequentially from the staged rows, a work item per (head, ROWS state
+# rows, slot), so every slot gets the step's bits (on the CPU the sequential
+# rule is the cheapest schedule; there is no dual form). Grid z = B zeroes
+# the mixed rows no slot covers.
+native state_space_chunk for cpu from "cpu/state_space_chunk.rs":
+    params (ROWS in [64, 32, 16])
+    scratch inputs bytes (M * (NH * P + 2 * G * N + 2 * NH) * 4)
+    launch state_space_chunk_inputs:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch state_space_chunk_scan:
+        threadgroups (NH, ceil_div(P, ROWS), B + 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (min(ROWS, P) * N * 4)
+
+
+# The gated, group-normalized output rows: per row, the mixed values are
+# gated by SiLU(z) in F32, RMS-normalized over each of the G groups of U heads
+# (U * P channels) and scaled by the state norm, rounded to A. The gate comes
+# before the norm (Mamba-2's norm_before_gate = false). The projection is the
+# state entries' (column contract above, NH = G * U); only its z segment is
+# read. The output projection `ssm_out` with the residual is the plain
+# projection over these rows (`attention_output` with Q = NH, W = P).
+fn state_space_gate[M, G, U, P, J](mixed: &tensor[M, G * U, P] A, projection: &tensor[M, J] A,
+    state_norm: &tensor[G, U, P] f32, epsilon: f32) -> tensor[M, G * U, P] A where J >= G * U * P:
+    let mut gated = tensor[M, G * U, P] f32
+    let mut normalized = tensor[M, G * U, P] A
+    for row in 0..M:
+        for head in 0..G * U:
+            for channel in 0..P:
+                gated[row, head, channel] = 0.0
+                normalized[row, head, channel] = 0.0
+    for row in 0..M:
+        for group in 0..G:
+            let mut squares = f32(0.0)
+            for local in 0..U:
+                let head = group * U + local
+                for channel in 0..P:
+                    let gate = f32(projection[row, head * P + channel])
+                    let value = f32(mixed[row, head, channel]) * (gate / (1.0 + exp(-gate)))
+                    gated[row, head, channel] = value
+                    squares = fma(value, value, squares)
+            let inverse = rsqrt(squares / f32(U * P) + epsilon)
+            for local in 0..U:
+                let head = group * U + local
+                for channel in 0..P:
+                    normalized[row, head, channel] = gated[row, head, channel] * inverse * state_norm[group, local, channel]
+    return normalized
+
+# Metal, CUDA, Vulkan: a threadgroup of 256 threads per (row, group) sums the
+# group's squared gated values (lane chains, a simdgroup reduction, then the
+# eight simdgroup sums in order) and writes the group's normalized values.
+native state_space_gate for metal from "metal/state_space_gate.metal":
+    launch state_space_gate:
+        threadgroups (M, G, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native state_space_gate for cuda from "cuda/state_space_gate.cu":
+    launch state_space_gate:
+        threadgroups (M, G, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native state_space_gate for vulkan from "vulkan/state_space_gate.comp":
+    launch state_space_gate:
+        threadgroups (M, G, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (32)
+
+# CPU: a work item per (row, group), the body's sequential sum of squares.
+native state_space_gate for cpu from "cpu/state_space_gate.rs":
+    launch state_space_gate:
+        threadgroups (M, G, 1)
+        threads_per_threadgroup (1, 1, 1)

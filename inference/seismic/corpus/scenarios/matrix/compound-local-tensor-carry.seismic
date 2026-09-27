@@ -1,0 +1,7 @@
+# cell: compound-local-tensor/carry
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero
+fn probe(x: &tensor[4, 8] f32, out: &mut tensor[4] f32):
+    let mut t = to_owned(x[0])
+    for i in 1..4:
+        t += x[i]
+    out[0] = t[5]

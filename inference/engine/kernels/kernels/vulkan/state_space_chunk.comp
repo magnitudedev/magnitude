@@ -1,0 +1,251 @@
+// state_space_chunk (prefill): the chunked state-space advance in the
+// state-space dual form, the Vulkan form of `cuda/state_space_chunk.cu`.
+// `inputs` convolves the B and C channels of every row once into scratch with
+// each head's step size and log decay. `products` forms, once per piece and
+// group, C_i . B_j (j <= i) of the piece's rows from B and C staged in shared
+// memory. In `scan` a workgroup of four logical subgroups owns (head, block
+// of ROWS state rows, slot) with the step's geometry. Per piece of at most
+// STATE_SPACE_PIECE rows before the stop row, with gamma_i = exp(sum of the
+// piece's log decays to row i) and u_j = delta_j x_j (x convolved in the
+// scan):
+//   y_i = gamma_i (S C_i) + sum_{j <= i} (gamma_i / gamma_j) (C_i . B_j) u_j + D x_i
+//   S  <- gamma_last S + sum_j (gamma_last / gamma_j) u_j B_j^T
+// The S C_i sums of 32 / LANE_ROWS rows at a time are reduce-scattered over
+// the subgroup, so each lane finishes one (row, state row) output with the
+// butterfly's bits. Slots of at most STATE_SPACE_SEQUENTIAL_ROWS rows are not
+// chunked, and the rows after a stop row advance row-sequentially from the
+// published state, both with `state_space_step`'s bits. ROWS never changes
+// result bits.
+#include "lib/recurrent/state_space.glsl"
+
+// Shared floats of a piece: x rows of the workgroup's state rows, the weights
+// (gamma_i / gamma_j) (C_i . B_j), the cumulative log decays, gamma, the tail
+// factors gamma_last / gamma_j, the step sizes. They reuse the sequential
+// advance's region. Weight rows are padded so the lanes reading different
+// rows at one column hit different banks.
+#define SSC_PIECE uint(STATE_SPACE_PIECE)
+#define SSC_WEIGHT_STRIDE (SSC_PIECE + 1u)
+#define SSC_X 0u
+#define SSC_WEIGHTS (SSC_PIECE * SS_BLOCK_ROWS)
+#define SSC_LOG_GAMMA (SSC_WEIGHTS + SSC_PIECE * SSC_WEIGHT_STRIDE)
+#define SSC_GAMMA (SSC_LOG_GAMMA + SSC_PIECE)
+#define SSC_TAIL (SSC_GAMMA + SSC_PIECE)
+#define SSC_DELTA (SSC_TAIL + SSC_PIECE)
+// Rows of a piece whose S C sums one reduce-scatter finishes.
+#define SSC_GROUP (32u / SS_LANE_ROWS)
+// The products launch: B and C rows staged 32 state columns at a time, and
+// the lower-triangle pairs a thread owns.
+#define SSC_PAIRS (SSC_PIECE * (SSC_PIECE + 1u) / 2u)
+#define SSC_OWNED ((SSC_PAIRS + 255u) / 256u)
+#define SSC_STAGED_C 0u
+#define SSC_STAGED_B (SSC_PIECE * 33u)
+
+// Byte address of staged input `index` of row `row`.
+uint64_t ssc_staged(uint64_t inputs, int row, uint index) {
+    return inputs + (uint64_t(row) * SS_INPUT_WIDTH + index) * 4ul;
+}
+
+// One row per workgroup x, 256 of its B and C channels and step sizes per
+// workgroup y. Rows no slot covers are no slot's input.
+void state_space_chunk_inputs() {
+    const uint64_t inputs = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_INPUTS);
+    const int row = int(gl_WorkGroupID.x);
+    const uint64_t slot_index = versions_slot_index_of_row(row);
+    if (slot_index == SEISMIC_DIM_B)
+        return;
+    const versions_slot slot = versions_slot_of(slot_index);
+    const uint item = gl_WorkGroupID.y * 256u + gl_LocalInvocationIndex;
+    if (item < 2u * SS_G * SS_N) {
+        element_f32_put(ssc_staged(inputs, row, SS_INPUT_B + item), ss_convolve(slot, row - slot.lo, SS_B_CHANNEL + item));
+    } else if (item < 2u * SS_G * SS_N + SS_NH) {
+        const uint head = item - 2u * SS_G * SS_N;
+        float delta, log_decay;
+        ss_step_of(row, head, delta, log_decay);
+        element_f32_put(ssc_staged(inputs, row, SS_INPUT_DELTA + head), delta);
+        element_f32_put(ssc_staged(inputs, row, SS_INPUT_LOG_DECAY + head), log_decay);
+    }
+}
+
+// Piece x (numbered over the slots), group y: C_i . B_j for j <= i, an F32 FMA
+// chain over the state coordinate, B and C staged in shared memory 32 state
+// columns at a time.
+void state_space_chunk_products() {
+    const uint64_t inputs = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_INPUTS);
+    const uint64_t products = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCTS);
+    const uint thread = gl_LocalInvocationIndex;
+    versions_slot slot;
+    int local;
+    if (!ss_piece_at(int(gl_WorkGroupID.x), slot, local))
+        return;
+    const int first = slot.lo + local * STATE_SPACE_PIECE;
+    const uint count = uint(min(STATE_SPACE_PIECE, slot.stop - local * STATE_SPACE_PIECE));
+    const uint g = gl_WorkGroupID.y;
+    uint rows[SSC_OWNED];
+    uint columns[SSC_OWNED];
+    float sums[SSC_OWNED];
+    [[unroll]] for (uint k = 0u; k < SSC_OWNED; ++k) {
+        // Pair p = i (i + 1) / 2 + j of the lower triangle.
+        const uint pair = thread + 256u * k;
+        uint i = 0u;
+        while ((i + 1u) * (i + 2u) / 2u <= pair)
+            ++i;
+        rows[k] = pair < SSC_PAIRS ? i : SSC_PIECE;
+        columns[k] = pair - i * (i + 1u) / 2u;
+        sums[k] = 0.0;
+    }
+    for (uint base = 0u; base < SS_N; base += 32u) {
+        for (uint item = thread; item < count * 32u; item += gl_WorkGroupSize.x) {
+            const uint i = item / 32u;
+            seismic_shared_f32[SSC_STAGED_C + i * 33u + item % 32u] =
+                element_f32_at(ssc_staged(inputs, first + int(i), SS_INPUT_C + g * SS_N + base + item % 32u));
+            seismic_shared_f32[SSC_STAGED_B + i * 33u + item % 32u] =
+                element_f32_at(ssc_staged(inputs, first + int(i), SS_INPUT_B + g * SS_N + base + item % 32u));
+        }
+        barrier();
+        [[unroll]] for (uint k = 0u; k < SSC_OWNED; ++k) {
+            if (rows[k] < count)
+                for (uint n = 0u; n < 32u; ++n)
+                    sums[k] = seismic_fma_rn(seismic_shared_f32[SSC_STAGED_C + rows[k] * 33u + n],
+                        seismic_shared_f32[SSC_STAGED_B + columns[k] * 33u + n], sums[k]);
+        }
+        barrier();
+    }
+    const uint64_t out_base = products + (uint64_t(gl_WorkGroupID.x) * SS_G + g) * SSC_PIECE * SSC_PIECE * 4ul;
+    [[unroll]] for (uint k = 0u; k < SSC_OWNED; ++k)
+        if (rows[k] < count)
+            element_f32_put(out_base + uint64_t(rows[k] * SSC_PIECE + columns[k]) * 4ul, sums[k]);
+}
+
+// Sums each of `values`' 32 elements over the logical subgroup and leaves
+// lane l with element l's total (recursive halving: at mask m a lane keeps
+// the half its bit m selects and adds its partner's copy). Every total
+// combines the lanes in the order of `seismic_subgroup_sum_f32`.
+float ssc_reduce_scatter(inout float values[32], uint lane) {
+    [[unroll]] for (uint mask = 16u; mask > 0u; mask >>= 1) {
+        const bool upper = (lane & mask) != 0u;
+        [[unroll]] for (uint m = 0u; m < mask; ++m) {
+            const float send = upper ? values[m] : values[m + mask];
+            const float keep = upper ? values[m + mask] : values[m];
+            values[m] = keep + subgroupShuffleXor(send, mask);
+        }
+    }
+    return values[0];
+}
+
+// Advances this subgroup's `rows` over piece `piece` (the slot's `local`-th)
+// in the state-space dual form and writes the piece's mixed outputs.
+void ssc_advance_piece(uint64_t inputs, uint64_t products, versions_slot slot, int piece, int local, uint head,
+    uint block_row0, uint row0, inout float rows[SS_LANE_ROWS][SS_COLUMNS]) {
+    const uint lane = SEISMIC_LANE, thread = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
+    const uint g = ss_group_of(head);
+    const int first = slot.lo + local * STATE_SPACE_PIECE;
+    const uint count = uint(min(STATE_SPACE_PIECE, slot.stop - local * STATE_SPACE_PIECE));
+    for (uint item = thread; item < count * SS_BLOCK_ROWS; item += threads) {
+        const uint i = item / SS_BLOCK_ROWS;
+        seismic_shared_f32[SSC_X + item] =
+            ss_convolve(slot, first + int(i) - slot.lo, head * SS_P + block_row0 + item % SS_BLOCK_ROWS);
+    }
+    for (uint i = thread; i < count; i += threads)
+        seismic_shared_f32[SSC_DELTA + i] = element_f32_at(ssc_staged(inputs, first + int(i), SS_INPUT_DELTA + head));
+    if (thread == 0u) {
+        float sum = 0.0;
+        for (uint i = 0u; i < count; ++i) {
+            sum = seismic_add_rn(sum, element_f32_at(ssc_staged(inputs, first + int(i), SS_INPUT_LOG_DECAY + head)));
+            seismic_shared_f32[SSC_LOG_GAMMA + i] = sum;
+        }
+    }
+    barrier();
+    const uint64_t piece_products = products + (uint64_t(piece) * SS_G + g) * SSC_PIECE * SSC_PIECE * 4ul;
+    for (uint item = thread; item < count * count; item += threads) {
+        const uint i = item / count;
+        const uint j = item % count;
+        seismic_shared_f32[SSC_WEIGHTS + i * SSC_WEIGHT_STRIDE + j] = j <= i
+            ? seismic_mul_rn(exp(seismic_shared_f32[SSC_LOG_GAMMA + i] - seismic_shared_f32[SSC_LOG_GAMMA + j]),
+                element_f32_at(piece_products + uint64_t(i * SSC_PIECE + j) * 4ul))
+            : 0.0;
+    }
+    for (uint i = thread; i < count; i += threads) {
+        seismic_shared_f32[SSC_GAMMA + i] = exp(seismic_shared_f32[SSC_LOG_GAMMA + i]);
+        seismic_shared_f32[SSC_TAIL + i] =
+            exp(seismic_shared_f32[SSC_LOG_GAMMA + count - 1u] - seismic_shared_f32[SSC_LOG_GAMMA + i]);
+    }
+    barrier();
+
+    const uint local_row = row0 - block_row0;
+    const float skip = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SKIP) + uint64_t(head) * SEISMIC_SKIP_STRIDE_0 * 4ul);
+    const uint64_t mixed = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    // Lane l finishes row first + i0 + l / LANE_ROWS, state row l % LANE_ROWS.
+    const uint r = lane % SS_LANE_ROWS;
+    for (uint i0 = 0u; i0 < count; i0 += SSC_GROUP) {
+        float sums[32];
+        [[unroll]] for (uint k = 0u; k < SSC_GROUP; ++k) {
+            const uint i = min(i0 + k, count - 1u);
+            const uint64_t c = ssc_staged(inputs, first + int(i), SS_INPUT_C + g * SS_N + lane * SS_COLUMNS);
+            float cs[SS_COLUMNS];
+            [[unroll]] for (uint j = 0u; j < SS_COLUMNS; ++j)
+                cs[j] = element_f32_at(c + uint64_t(j) * 4ul);
+            [[unroll]] for (uint s = 0u; s < SS_LANE_ROWS; ++s) {
+                float sum = 0.0;
+                [[unroll]] for (uint j = 0u; j < SS_COLUMNS; ++j)
+                    sum = seismic_fma_rn(rows[s][j], cs[j], sum);
+                sums[k * SS_LANE_ROWS + s] = sum;
+            }
+        }
+        const float inter = ssc_reduce_scatter(sums, lane);
+        const uint i = i0 + lane / SS_LANE_ROWS;
+        if (i < count) {
+            float sum = 0.0;
+            for (uint j = 0u; j <= i; ++j)
+                sum = seismic_fma_rn(seismic_shared_f32[SSC_WEIGHTS + i * SSC_WEIGHT_STRIDE + j],
+                    seismic_mul_rn(seismic_shared_f32[SSC_DELTA + j],
+                        seismic_shared_f32[SSC_X + j * SS_BLOCK_ROWS + local_row + r]),
+                    sum);
+            const float value = seismic_shared_f32[SSC_X + i * SS_BLOCK_ROWS + local_row + r];
+            const float result = seismic_fma_rn(skip, value,
+                seismic_fma_rn(seismic_shared_f32[SSC_GAMMA + i], inter, sum));
+            element_put(ELEMENT_ACT, mixed,
+                uint64_t(first + int(i)) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(head) * SEISMIC_RESULT_0_STRIDE_1
+                    + uint64_t(row0 + r) * SEISMIC_RESULT_0_STRIDE_2,
+                result);
+        }
+    }
+    // S <- gamma_last S + sum_j (gamma_last / gamma_j) u_j B_j^T.
+    const float last = seismic_shared_f32[SSC_GAMMA + count - 1u];
+    [[unroll]] for (uint s = 0u; s < SS_LANE_ROWS; ++s)
+        [[unroll]] for (uint j = 0u; j < SS_COLUMNS; ++j)
+            rows[s][j] = seismic_mul_rn(rows[s][j], last);
+    for (uint j = 0u; j < count; ++j) {
+        const uint64_t b = ssc_staged(inputs, first + int(j), SS_INPUT_B + g * SS_N + lane * SS_COLUMNS);
+        float bs[SS_COLUMNS];
+        [[unroll]] for (uint c = 0u; c < SS_COLUMNS; ++c)
+            bs[c] = element_f32_at(b + uint64_t(c) * 4ul);
+        [[unroll]] for (uint s = 0u; s < SS_LANE_ROWS; ++s) {
+            const float coefficient = seismic_mul_rn(seismic_shared_f32[SSC_TAIL + j],
+                seismic_mul_rn(seismic_shared_f32[SSC_DELTA + j], seismic_shared_f32[SSC_X + j * SS_BLOCK_ROWS + local_row + s]));
+            [[unroll]] for (uint c = 0u; c < SS_COLUMNS; ++c)
+                rows[s][c] = seismic_fma_rn(coefficient, bs[c], rows[s][c]);
+        }
+    }
+    barrier();
+}
+
+void state_space_chunk_scan() {
+    const uint64_t inputs = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_INPUTS);
+    const uint64_t products = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCTS);
+    const uint head = gl_WorkGroupID.x;
+    const uint block_row0 = gl_WorkGroupID.y * SS_BLOCK_ROWS;
+    const uint row0 = block_row0 + SEISMIC_SUBGROUP * SS_LANE_ROWS;
+    if (uint64_t(gl_WorkGroupID.z) == SEISMIC_DIM_B) {
+        ss_zero_uncovered(head, row0);
+        return;
+    }
+    const versions_slot slot = versions_slot_of(gl_WorkGroupID.z);
+    float rows[SS_LANE_ROWS][SS_COLUMNS];
+    ss_load_version(slot, head, row0, rows);
+    ss_publish_window(slot, head, gl_WorkGroupID.y, gl_NumWorkGroups.y);
+    const int pieces = ss_pieces_of(slot);
+    const int base = ss_first_piece(gl_WorkGroupID.z);
+    for (int piece = 0; piece < pieces; ++piece)
+        ssc_advance_piece(inputs, products, slot, base + piece, piece, head, block_row0, row0, rows);
+    ss_advance_rows(slot, pieces == 0 ? slot.lo : slot.lo + slot.stop, head, block_row0, row0, rows);
+}

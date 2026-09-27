@@ -1,0 +1,7 @@
+# origin: C12:G-C12-1
+# invoke: f32[2]=0.3,0.7
+# pin: result = i32[]=1
+# invoke: f32[2]=0.7,0.3
+# pin: result = i32[]=0
+fn probe(x: &tensor[2] f32) -> i32:
+    return reduce(x, 0, argmax)

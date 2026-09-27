@@ -4,7 +4,8 @@ import { ApplicationUpdateControlFailed } from "@magnitudedev/sdk/desktop-host"
 import { makeRendererRecovery } from "./renderer-recovery"
 import { resolveQuitFailure } from "./quit-failure"
 import { buildApplicationMenu } from "./application-menu"
-import { buildTrayMenu } from "./tray-menu"
+import { buildTrayMenu, MODEL_STATUS_ITEM } from "./tray-menu"
+import { loadTrayStatusRow } from "./tray-status"
 import { initializeLoginStartup, makeLoginStartup, WINDOWS_APPLICATION_ID } from "./login-startup"
 import { ApplicationUpdateFailed, ApplicationUpdateSource, makeApplicationUpdate, unavailableApplicationUpdate, readLinuxUpdateMetadata, makeUpdateIdentity, makeUpdateSchedule, makeLinuxUpdateSource, makeWindowsUpdateSource, hostedUpdateSource, startMacForegroundInstallation, macStartupUpdateOperation } from "@magnitudedev/daemon-management/application-update"
 import { PreparedUpdateInstaller, reconcilePreparedUpdate, installPreparedUpdate, type UpdateInstallationIntent } from "@magnitudedev/daemon-management/application-update"
@@ -12,7 +13,7 @@ import { isNewerVersion } from "@magnitudedev/release"
 import { ReleaseTarget, UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
 import { makeAppearancePreferences, makeModelStoragePreferences, makeNetworkPreferences, listNetworkInterfaces, networkAccessEquals, LOOPBACK_ONLY, makeUpdatePreferences, UpdatePreferences } from "@magnitudedev/daemon-management/desktop-native"
 import { readUpdateConfiguration, isUpdateAcceptanceBuild } from "./update-config"
-import { NativeTrayFactory, NativeTrayFailed, TrayOwner, TrayOwnerLive } from "./tray-owner"
+import { NativeTrayFactory, NativeTrayFailed, TrayOwner, TrayOwnerLive, type TrayMenu } from "./tray-owner"
 import { CommandExecutor, FetchHttpClient } from "@effect/platform"
 import { NodeContext } from "@effect/platform-node"
 import { NodeSqliteDriverLayer } from "@magnitudedev/daemon-management/node"
@@ -40,7 +41,7 @@ import { ProcessGroupController } from "@magnitudedev/utils/process-groups"
 import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native"
 import { nativeWindowsPrivatePipesLayer, WindowsPipeName } from "@magnitudedev/utils/windows-native"
 import { type ApplicationSnapshot, type OwnedServiceState } from "@magnitudedev/sdk/desktop-host"
-import { HostError, ApplicationAction, InferenceHostRpcs, type Page } from "./desktop-rpc"
+import { HostError, ApplicationAction, InferenceHostRpcs, ModelTrayPresentation, type Page } from "./desktop-rpc"
 import { makeElectronRpcServerLayer } from "./electron-rpc"
 import { resolveHarnessEnvironment, harnessCommandExecutor } from "./shell-env"
 import { MAGNITUDE_VERSION } from "@magnitudedev/version"
@@ -124,7 +125,8 @@ const program = Effect.scoped(Effect.gen(function* () {
   const actions = yield* PubSub.unbounded<typeof ApplicationAction.Type>()
   const quit = yield* Queue.sliding<"Quit" | "RestartUpdate" | "Relaunch">(1)
   const state = yield* Ref.make<OwnedServiceState | null>(null)
-  const model = yield* Ref.make({ label: "Model status unavailable", canStop: false })
+  const unavailableModel = (label: string): typeof ModelTrayPresentation.Type => ({ label, status: Option.none(), canStop: false })
+  const model = yield* Ref.make(unavailableModel("Model status unavailable"))
   const runtime = yield* Effect.runtime<never>()
   const run = (effect: Effect.Effect<unknown>) => { Runtime.runFork(runtime)(effect) }
   requestQuit = () => run(Queue.offer(quit, "Quit"))
@@ -201,6 +203,9 @@ const program = Effect.scoped(Effect.gen(function* () {
   powerMonitor.on("resume", resumeUpdates)
   yield* Effect.addFinalizer(() => Effect.sync(() => powerMonitor.removeListener("resume", resumeUpdates)))
 
+  const statusRow = yield* loadTrayStatusRow(app.isPackaged
+    ? join(process.resourcesPath, "tray-status.node")
+    : join(root, `desktop/dist/native/${process.platform}-${process.arch}/tray-status.node`))
   const nativeTray = Layer.succeed(NativeTrayFactory, { create: Effect.acquireRelease(Effect.try({ try: () => {
     // A monochrome template works in either macOS menu-bar appearance.
     const iconDirectory = app.isPackaged ? process.resourcesPath : join(root, "assets/brand")
@@ -217,13 +222,31 @@ const program = Effect.scoped(Effect.gen(function* () {
       result.on("click", () => run(show()))
       result.on("double-click", () => run(show()))
     }
-    return { tray: result, syncTheme }
+    // With the live model row the tray pops its menu up itself: Electron keeps running
+    // JavaScript during a menu it pops up, so the row updates while the menu is open.
+    let shown: { readonly template: TrayMenu, readonly menu: Menu } | undefined
+    if (Option.isSome(statusRow)) {
+      const popUp = () => {
+        if (!shown) return
+        const index = shown.template.findIndex(item => item.id === MODEL_STATUS_ITEM)
+        if (index >= 0) statusRow.value.expect(index)
+        result.popUpContextMenu(shown.menu)
+      }
+      result.on("click", popUp)
+      result.on("right-click", popUp)
+    }
+    const setMenu = (template: TrayMenu) => {
+      const menu = Menu.buildFromTemplate([...template])
+      if (Option.isSome(statusRow)) shown = { template, menu }
+      else result.setContextMenu(menu)
+    }
+    return { tray: result, syncTheme, setMenu }
   }, catch: () => new NativeTrayFailed({ message: "Magnitude could not register its tray icon." }) }), value => Effect.sync(() => {
     nativeTheme.removeListener("updated", value.syncTheme)
     value.tray.destroy()
   })).pipe(
-    Effect.map(({ tray: value }) => ({ setMenu: (menu: readonly Electron.MenuItemConstructorOptions[]) => Effect.try({
-      try: () => value.setContextMenu(Menu.buildFromTemplate([...menu])),
+    Effect.map(({ setMenu }) => ({ setMenu: (menu: TrayMenu) => Effect.try({
+      try: () => setMenu(menu),
       catch: () => new NativeTrayFailed({ message: "Magnitude could not update its tray menu." }),
     }) })),
   ) })
@@ -260,6 +283,7 @@ const program = Effect.scoped(Effect.gen(function* () {
       quit: requestQuit,
       restartUpdate: () => run(updates.requireReady.pipe(Effect.zipRight(Queue.offer(quit, "RestartUpdate")), Effect.catchAll(() => Effect.void))),
     }))
+    if (Option.isSome(statusRow) && Option.isSome(presentation.status)) statusRow.value.present(presentation.status.value)
   })
   yield* refreshTray
   yield* updates.changes.pipe(Stream.map(value => (value.transfer._tag === "Ready" || value.transfer._tag === "InstallationFailed")), Stream.changes,
@@ -364,18 +388,18 @@ const program = Effect.scoped(Effect.gen(function* () {
     value.once("closed", () => nativeTheme.removeListener("updated", syncWindowAppearance))
     value.on("close", event => { if (!exiting) { event.preventDefault(); value.hide() } })
     value.webContents.on("render-process-gone", () => run(Effect.gen(function* () {
-      yield* Ref.set(model, { label: "Model status unavailable", canStop: false })
+      yield* Ref.set(model, unavailableModel("Model status unavailable"))
       const current = yield* Ref.get(state)
       if (exiting || current?._tag === "Stopping" || current?._tag === "Stopped") return
       const retry = yield* rendererRecovery.crashed
-      if (!retry) yield* Ref.set(model, { label: "Window unavailable · Open Magnitude to retry", canStop: false })
+      if (!retry) yield* Ref.set(model, unavailableModel("Window unavailable · Open Magnitude to retry"))
       yield* refreshTray
       if (retry) yield* loadRenderer()
     })))
     value.webContents.on("did-fail-load", (_event, code, _description, _url, isMainFrame) => {
       if (!isMainFrame || code === -3 || exiting) return
       run(rendererRecovery.loadFailed.pipe(
-        Effect.zipRight(Ref.set(model, { label: "Window unavailable · Open Magnitude to retry", canStop: false })),
+        Effect.zipRight(Ref.set(model, unavailableModel("Window unavailable · Open Magnitude to retry"))),
         Effect.zipRight(refreshTray),
       ))
     })

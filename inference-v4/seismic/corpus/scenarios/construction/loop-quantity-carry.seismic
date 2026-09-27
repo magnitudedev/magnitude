@@ -1,0 +1,7 @@
+# origin: C11:loop_quantity_carry
+# invoke: index:5
+fn probe(n: index[16]) -> i32:
+    let mut q = 0
+    for k in 0..n:
+        q = q + k
+    return i32(q)

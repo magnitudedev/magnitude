@@ -6,7 +6,7 @@ import { MemoryFigures } from "./memory-breakdown"
 
 const GiB = 1024 ** 3
 const allocation = Schema.decodeUnknownSync(ModelInstanceAllocationSchema)({
-  contextWindowTokens: 4096, parallelSequences: 1, physicalContextTokens: 4096,
+  contextWindowTokens: 4096,
   memoryDomains: [
     { memoryDomainId: "system", modelBytes: GiB, contextBytes: 0, computeBytes: GiB / 4, auxiliaryBytes: GiB / 4 },
     { memoryDomainId: "gpu", modelBytes: 2 * GiB, contextBytes: 2 * GiB, computeBytes: GiB / 4, auxiliaryBytes: GiB / 4 },

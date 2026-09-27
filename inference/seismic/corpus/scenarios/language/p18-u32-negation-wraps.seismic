@@ -1,0 +1,5 @@
+# origin: C1:p18
+# invoke s: u32:3
+# pin: result = u32[]=4294967293
+fn s(a: u32) -> u32:
+    return -a

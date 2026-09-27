@@ -1,0 +1,7 @@
+# origin: C14:s8
+# rejected: "may exceed its axis extent"
+fn probe[N](x: &mut tensor[N] f32, d: i32) -> i32:
+    x[0] = 7.0
+    let q = 10 / d
+    x[1] = 8.0
+    return q

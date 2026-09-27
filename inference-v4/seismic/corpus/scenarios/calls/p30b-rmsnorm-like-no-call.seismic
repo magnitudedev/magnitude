@@ -1,0 +1,7 @@
+# origin: C13:p30b
+# invoke: i32[2,4]=seq ; i32[2,4]=zero
+fn probe(x: &tensor[2, 4] i32, y: &mut tensor[2, 4] i32):
+    parallel for r in 0..2:
+        let t = x[r]
+        let s = reduce(t * t, 0, sum)
+        y[r] = t + s

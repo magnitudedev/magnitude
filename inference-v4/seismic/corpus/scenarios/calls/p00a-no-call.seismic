@@ -1,0 +1,4 @@
+# origin: C13:p00a
+# invoke: i32[8]=seq
+fn probe(input: &tensor[8] i32) -> i32:
+    return reduce(input[2:5], 0, sum)

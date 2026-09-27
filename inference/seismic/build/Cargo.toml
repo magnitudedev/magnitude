@@ -1,0 +1,11 @@
+[package]
+name = "seismic-build"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+seismic-lang.workspace = true
+seismic-std.workspace = true
+seismic-native-cpu.workspace = true
+sha2 = "=0.11.0"

@@ -1,0 +1,76 @@
+# origin: test:seismic-runtime:runtime/src/feedback/binding_tests.rs:cpu_helper_products_preserve_captured_contents_and_unit_effects
+# invoke chained: f32[4]=1,2,3,4
+# pin: result = f32[]=20
+# invoke captured: f32[4]=1,2,3,4
+# pin: result = f32[]=20
+# invoke unit_effect: f32[4]=1,2,3,4
+# pin: result = f32[]=0
+# invoke selected_product: f32[4]=1,2,3,4
+# pin: result = f32[]=30
+# invoke unselected_product: f32[4]=1,2,3,4
+# pin: result = f32[]=20
+# invoke partial_unit: f32[4]=1,2,3,4
+# pin: result = f32[]=7
+# invoke loop_prefix: f32[4]=1,2,3,4
+# pin: result = f32[]=21
+# invoke selected_stored: f32[4]=1,2,3,4
+# pin: result = f32[]=10
+fn twice(x: &tensor[4] f32) -> tensor[4] f32:
+    return x + x
+
+fn total(x: &tensor[4] f32) -> f32:
+    return reduce(x, 0, sum)
+
+fn clear(x: &mut tensor[4] f32):
+    for i in 0..4:
+        x[i] = 0.0
+
+fn chained(x: &tensor[4] f32) -> f32:
+    return total(twice(x))
+
+fn captured(x: &mut tensor[4] f32) -> f32:
+    let snapshot = twice(x)
+    clear(x)
+    return total(snapshot)
+
+fn selected_product(x: &tensor[4] f32) -> f32:
+    let mut y = twice(x)
+    if x[0] > 0.0:
+        y = x + x + x
+    return total(y)
+
+fn unselected_product(x: &tensor[4] f32) -> f32:
+    let mut y = twice(x)
+    if x[0] < 0.0:
+        y = x + x + x
+    return total(y)
+
+fn first(x: &tensor[4] f32) -> f32:
+    return x[0]
+
+fn seed_first(x: &mut tensor[4] f32):
+    x[0] = 7.0
+
+fn partial_unit(x: &tensor[4] f32) -> f32:
+    let mut y = tensor[4] f32
+    seed_first(y)
+    return first(y)
+
+fn loop_prefix(x: &tensor[4] f32) -> f32:
+    let mut y = tensor[4] f32
+    let mut result = 0.0
+    for i in 0..4:
+        if i > 0:
+            result = result + first(y)
+        seed_first(y)
+    return result
+
+fn selected_stored(x: &tensor[4] f32) -> f32:
+    let mut y = zeros_like(x)
+    if x[0] > 0.0:
+        y = to_owned(x)
+    return total(y)
+
+fn unit_effect(x: &mut tensor[4] f32) -> f32:
+    clear(x)
+    return total(x)

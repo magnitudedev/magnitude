@@ -1,0 +1,12 @@
+# origin: C13:p11b
+# rejected: "`seed`"
+fn seed[M](x: &tensor[2 * M + 1] i32) -> i32:
+    return i32(M)
+
+fn probe(input: &tensor[8] i32, bounds: &tensor[2] i32) -> i32:
+    let lo = bounds[0]
+    let hi = bounds[1]
+    let mut r = 0
+    if hi > lo:
+        r = seed(input[lo:hi])
+    return r

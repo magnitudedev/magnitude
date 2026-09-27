@@ -1,0 +1,7 @@
+# cell: scalar-op-quantity/if-arm
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero ; bool:true
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero ; bool:false
+fn probe[W](x: &tensor[4, W] f32, out: &mut tensor[4] f32, y: &mut tensor[4, W] f32, c: bool) where W >= 8:
+    if c:
+        let q = W * 2 + 0
+        out[0] = f32(i32(q))

@@ -1,0 +1,7 @@
+# origin: C11:call_view_result_of_transpose
+# rejected: "cannot cross an owned boundary"
+fn helper(a: &tensor[2,3] f32) -> tensor[3,2] f32:
+    return a.T
+
+fn probe(x: &tensor[2,3] f32) -> tensor[3,2] f32:
+    return helper(x) + 0.0

@@ -1,0 +1,7 @@
+# origin: C13:p02
+# invoke: i32[2,3]=seq
+fn corner[M, N](x: &tensor[M, N] i32) -> i32:
+    return x[0, N - 1] + i32(M) * 100 + i32(N) * 10
+
+fn probe(input: &tensor[2, 3] i32) -> i32:
+    return corner(input.T)

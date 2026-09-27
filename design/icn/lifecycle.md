@@ -3,7 +3,9 @@ applies_to:
   - packages/icn-protocol/**
   - packages/icn/**
   - packages/openapi-effect/**
-  - inference/**
+  - inference/service/contracts/**
+  - inference/service/api/**
+  - inference/service/server/**
   - packages/acn/src/server.ts
   - packages/acn/src/icn/**
   - packages/acn/src/model-*.ts
@@ -38,12 +40,13 @@ observes both root exit and zero job members through retained handles; a deadlin
 those handles and does not authorize a replacement. Environment blocks use Windows ordinal name
 comparison, reject duplicate names, preserve inherited per-drive current-directory entries,
 and preserve UTF-16 arguments without shell interpretation.
-Both planning and inference workers use this acquisition boundary. Planning pipes are transferred
-through owned Windows handles into Tokio's standard child-stream adapters; dropping the planning
-owner closes its job before disposing of the adapters, so pending pipe reads can finish on child
-exit. Inference-worker ownership begins immediately after spawn, before any fallible handshake or
-IPC initialization. Its writer holds a weak client reference and terminates on Shutdown; an idle
-writer cannot keep its own command sender alive after the client is dropped.
+Both measurement and inference workers use this acquisition boundary. Measurement pipes are
+transferred through owned Windows handles into Tokio's standard child-stream adapters; dropping the
+measurement owner closes its job before disposing of the adapters, so pending pipe reads can finish
+on child exit. Inference-worker ownership begins immediately after spawn, before the load
+handshake. The engine protocol runs over the worker's standard input and output as blocking
+handles; its standard error is drained into ICN's log and a bounded tail accompanies load
+failures. Dropping the last engine client closes the transport, and the worker exits.
 No independent ICN discovery or durable owner store exists.
 Platform child acquisition is a scoped capability supplied by ACN's host composition. It owns exact
 process identity, separate standard streams, exit observation and single-flight tree retirement.
@@ -71,17 +74,18 @@ adopt an ICN started by another process. A model is not a public process resourc
 service starts without a loaded model and privately creates or destroys a disposable inference
 worker behind model-centric load, replace, and unload operations.
 
-Model assessment is bounded work in a supervised, demand-created pool of persistent planning
-workers. Startup creates only the calibration worker. Cold backend initialization is serialized;
-initialized workers run distinct target batches concurrently and retain process-local backend
-state. A worker is replaced after a deadline, protocol, or process failure. The
+Model assessment is header arithmetic on a bounded blocking pool in the ICN process. Its
+measurement basis comes from one contained measurement child of the same executable, which alone
+opens the selected device, and never runs while a model is loading or resident. The
 private inference worker owns one resident model topology and lives only
 for that residency generation. It uses the same verified executable, communicates only with ICN
 over private standard I/O, exposes no listener or public lifecycle, and terminates with its
-residency or parent. ICN passes its verified installation authority to the worker, which registers
-and validates backend modules from that exact installation before native initialization, request
-decoding, or inference handshake. Executable-relative, current-directory, and compiled build-tree
-discovery cannot satisfy installed-worker readiness. Explicit development tooling may name
+residency or parent. ICN passes its verified installation authority to the worker, which loads the
+engine runtime from that exact installation before native initialization, request decoding, or
+inference handshake. The installation carries every backend of its host; the engine selects the
+execution device at runtime, so there are no separately registered backend modules.
+Executable-relative, current-directory, and compiled build-tree discovery cannot satisfy
+installed-worker readiness. Explicit development tooling may name
 build-tree authority, but it is never inferred by an installed worker. ACN still owns and observes
 exactly one ICN service child.
 
@@ -114,10 +118,12 @@ endpoint-specific transport error mapper.
 
 The native ICN process owns hardware discovery, model acquisition and inventory, artifact
 inspection, model assessment, the pinned inference runtime, active-model state, and inference request
-execution. `@magnitudedev/icn` acquires a release-manifest base plus an optional concrete accelerator
-pack; ICN is not downloaded from a model repository or selected from a user-installed runtime.
+execution. `@magnitudedev/icn` acquires the host's one release-manifest inference artifact; ICN is
+not downloaded from a model repository or selected from a user-installed runtime.
 The installation carries one hardware-independent planner-input bundle. Native startup validates
-its integrity and exact catalog coverage before becoming ready. Ordinary startup and setup
+its structure, manifest and exact catalog coverage before becoming ready. Each exact header is
+decompressed and digest-verified before it contributes assessment evidence; release construction
+and distribution validation verify the entire bundle before publication. Ordinary startup and setup
 therefore do not contact a catalog service, fetch model headers, or depend on a user cache.
 Development generation and release CI build it explicitly from immutable catalog revisions;
 ordinary TypeScript and Cargo builds perform no catalog network access.
@@ -146,8 +152,8 @@ emits:
 - generated client service/tag and construction APIs; and
 - a manifest binding every emitted artifact and operation to the source protocol.
 
-The ICN bootstrap protocol comprises non-HTTP records for binary identity, backend eligibility,
-installation declaration, process readiness and preparation, plus private parent commands. These are canonical serializable Rust
+The ICN bootstrap protocol comprises non-HTTP records for binary identity, installation
+declaration, process readiness and preparation, plus private parent commands. These are canonical serializable Rust
 types whose OpenAPI components generate the Effect Schemas consumed by Bun lifecycle, development,
 and release tooling. Producers construct the canonical Rust types and TypeScript consumers decode
 or encode only through the generated schemas; independently authored wire shapes, compatibility
@@ -229,8 +235,9 @@ progress, and model-domain failure does not make the otherwise operational ICN u
 Per-request context length belongs to an explicit model serving configuration supplied to
 assessment and load. ACN resolves that configuration from catalog authority and projects its
 provider offering without persisting either. The canonical model ID is callable identity; ICN owns
-ephemeral instance identity and residency. Native sequence capacity, physical context allocation, batching, GPU
-placement, KV policy, projector, and speculative-decoding selection are ICN-owned plan resolution. This
+ephemeral instance identity and residency. Device selection, batching, elastic context state,
+projector, and speculative-decoding selection are engine-owned plan resolution beneath ICN; no
+fixed sequence slots or physical context allocation appear in the contract. This
 separation lets one ICN live for one ACN lifetime while models and configurations change
 independently.
 
@@ -248,32 +255,24 @@ inference, and model-resource release do not extend this deadline.
 
 ## Binary resolution and compatibility
 
-Production releases publish a CPU-capable ICN base per host and distinct accelerator packs. The ICN
-package shares release-manifest validation, bounded download, safe extraction, and digest-addressed
-artifact installation with CLI and SDK acquisition. It alone owns native
-eligibility probing, concrete backend resolution, base/pack composition, installation declaration,
-and native validation.
+Production releases publish one inference artifact per host with every backend of that host
+compiled in; there are no accelerator packs. The ICN package shares release-manifest validation,
+bounded download, safe extraction, and digest-addressed artifact installation with CLI and SDK
+acquisition. It alone owns installation declaration and identity validation. It performs no
+eligibility probe, backend selection, or composition: the engine selects the execution device at
+runtime, and Seismic discovery is the only authority on whether a device is usable.
 
-Production has no requested or cached `auto` policy. Apple arm64 requires Metal. Other hosts prefer
-compatible CUDA, then compatible Vulkan, and select CPU only after successful probes establish
-that no supported accelerator is usable. Probe or operational failure fails ACN startup rather than
-changing backend. Every supervised start probes again before deriving the concrete composition
-identity, so installing a driver can change the next composition without manual cache repair.
-
-An installation is immutable and identified by the release manifest, base, optional pack, concrete
-backend, native build, and backend-module ABI. Its fixed layout contains executable,
-runtime, backend modules, the planner-input bundle, and a minimal declaration. Native validation proves the
-running executable belongs to that installation, the selected backend directory contains only the
-declared accelerator family, required devices register, and planner inputs are complete.
+An installation is identified by its release artifact and native build. Its fixed layout contains
+the executable, `runtime/` (NVRTC on Linux and Windows), the planner-input bundle, and a minimal
+declaration `{schemaVersion, nativeBuild}` written by the installer or the local build. There is
+no `backends/` directory and no declared backend. Validation proves the executable's
+`version --json` identity reports the release's native build and the declaration names the same
+native build; `nativeBuild` is the engine build identity (engine version plus kernel bundle
+identity).
 
 `bun dev` prepares the same fixed layout at
 `inference/target/development/installation.json` before starting the client. `MAGNITUDE_ICN_PATH`
 may instead name another `installation.json`; no separate executable or runtime path exists.
-Development preparation may accept an explicit backend override, but that policy is not part of
-production release coordinates. An accelerator-backed local development installation builds one
-baseline CPU companion and compiles CUDA only for GPUs attached to the development host. Portable
-CPU and accelerator architecture matrices declared by release backend packs are exclusively
-release concerns.
 
 Compatibility is established by a versioned ICN API protocol identity plus the release's expected
 native build identity. It is not inferred merely because `/health` returned 200, and it need not
@@ -320,12 +319,10 @@ Startup is one scoped acquisition:
 9. Publish `IcnProcess`, construct `IcnClient` from it, and begin continuous exit supervision.
 
 ICN's HTTP listener is created before it emits the startup record. Its readiness response is
-successful only after storage, inventory recovery, native runtime registration, normalized
-topology, an operational planning-worker pool, complete hardware calibration for every enabled assessment
-backend, and API state are usable. Hardware calibration is loaded from validated disposable evidence
-or measured by the bounded pool before readiness; it is never deferred to model assessment. After
-the server state is constructed, ICN starts inventory discovery and the automatic assessment pool
-without awaiting either. Startup retry applies only to
+successful only after storage, inventory recovery and API state are usable. After the server
+state is constructed, ICN starts inventory discovery and the automatic assessment pool without
+awaiting either; the pool reports `Preparing` until the measurement job has established the
+environment's measurement basis, and assessment never measures lazily. Startup retry applies only to
 transient connection/unready outcomes. Authentication failure, instance mismatch, incompatible
 identity, malformed response, and child exit fail immediately.
 
@@ -398,42 +395,36 @@ an ICN resource and carries no physical lifecycle.
 
 Explicit load accepts a canonical model ID and options. ICN resolves the serving configuration,
 creates the Instance identity, and admits it through the same residency coordinator used by
-inference. After proving the exact one-sequence baseline, load selects the largest
-native sequence capacity from one through four whose full-context allocation fits stable and live
-memory policy. That resolved capacity belongs to residency execution evidence and may differ across
-cold loads of the same configuration.
+inference. The load is admitted by the engine's preview on ICN's device catalog, which names the
+device and the startup memory claim; the worker loads exactly that device and its own startup
+claims are the authoritative admission. There is no parallel-sequence search or fixed-slot
+allocation.
 Load does not accept a planner name, planner version, capacity-policy identifier, or native flags.
-ICN resolves the exact allocation plan and publishes typed Instance progress through loading and
-ready or failed termination. Loading percentage
-begins only after the exact native plan is prepared and prior residency is released. ICN estimates
-total progress from the prepared plan's semantic phase sequence and phase-duration estimates,
-keeps it monotonic, and caps it below completion; only Ready means complete. Loading, progress,
+ICN publishes typed Instance progress through loading and ready or failed termination. Loading
+reports a stage and a fraction measured from the worker's tuning and weight import after prior
+residency is released (see `design/model-management/instance-lifecycle.md`); the fraction is
+monotonic, and only Ready means complete. Loading, its stage and fraction,
 Ready, Stopping, Stopped, and Failed are published in the revisioned
 `ModelInstancesSnapshot`. Equivalent concurrent demand joins the same admitted load and receives
 the ICN-created Instance; a later load after terminalization uses a new identity. Concurrent
 incompatible mutations are serialized by `ModelInstanceController`; they
-never rely on ACN-side locking. Ready state carries the actual selected parallelism, physical
-context allocation, and memory-domain allocation. Hardware snapshots do not own that evidence.
-The ICN composition root initializes native discovery and the calibration planning worker before
-hardware calibration and readiness. One pool actor owns the actual initialized planning-worker
-processes; unused capacity is numeric and additional workers are activated one at a time on demand.
-Only warm workers execute concurrently. A canceled waiter cannot return a still-running worker to
-the pool, and a failed worker is retired before replacement capacity is admitted.
-If planning-worker retirement fails or reaches its deadline, the pool retains that exact worker
-and continues counting it against capacity. Healthy workers remain usable and queued requests
-retain their own deadlines. Pool shutdown retries retained retirements; a failed retirement task
-cannot silently become an available worker slot.
-Each resident load creates one private `inference-worker` child; that child initializes its own process-lifetime
-native-backend capability, prepares and loads exactly one topology, and owns the executor until it
-exits. Persistent ICN exposes the loaded backend through a bounded framed-IPC proxy. Template
-inspection remains a separate metadata-only child. Worker kinds receive native-runtime authority
-from the same immutable worker-launch capability. An inference-worker handshake proves that its
-native runtime has already initialized.
+never rely on ACN-side locking. Ready state carries the serving context and the engine's
+per-domain allocation census. Hardware snapshots do not own that evidence.
+The measurement job is one contained `measurement-worker` child with one absolute deadline; a
+failed or timed-out job is killed, reported as a retryable assessment-pool failure and retried with
+bounded backoff.
+Each resident load creates one private `inference-worker` child running the engine's worker: it
+opens its own device catalog, loads exactly one model on the device it is given, and owns the
+device, weights, state and scheduler until it exits. ICN keeps the model's chat semantics and
+reaches the worker only through the engine's versioned framed protocol with per-request output
+credit; both ends must be the same engine build. Worker kinds receive native-runtime authority
+from the same immutable worker-launch capability.
 
-The persistent process uses the exact assessment-environment snapshot for resident planning and
-supplies an inference worker with the exact snapshot used for load selection. A worker validates
-and consumes that snapshot's memory topology; it does not rediscover memory sharing or reinterpret
-native allocation locations independently.
+ICN resolves the model once, device-free, and gives the worker the resulting execution manifest
+with the exact device selector its preview chose, its kernel cache directory and its reserve
+policy. The worker re-resolves that selector in its own catalog and rejects a missing or ambiguous
+match; readiness reports the package identity, device and allocation census ICN verifies and
+publishes.
 
 Inference-worker lifetime is subordinate to ICN even on abrupt failure. Unix children disable
 core dumps and run a dedicated process-parent-liveness watchdog. Retirement of a thread that
@@ -472,13 +463,15 @@ Every inference request holds an exact model-instance lease through stream end o
 Explicit load, replacement, and Stop share controller mutation authority. Stop and replacement
 close new inference admission. Replacement waits for existing leases to drain; explicit Stop
 terminates those requests. Memory-pressure
-eviction is deliberately different: persistent ICN observes whole-system available memory every
-100 milliseconds while a worker exists, and every second while idle. It immediately terminates
-the inference worker when availability reaches the configured system reserve. After eviction,
-one-second observations must remain above the recovery threshold for the full recovery interval
-before load admission reopens. Eviction does not wait for leases or native cleanup. Worker exit, protocol
-loss, or unavailable memory supervision terminalizes the affected instance and fails its streams
-without terminating persistent ICN. There is no automatic reload.
+eviction is deliberately different. The engine releases memory itself and unloads when other
+programs hold system headroom at or below its planning reserve. Persistent ICN is the independent
+guard: it observes limit-bounded system-RAM headroom through Seismic every 100 milliseconds while
+a worker is resident and every second otherwise, and kills the inference worker on the first sample
+at or below the emergency reserve. Either path publishes `memory_pressure` and closes load
+admission until headroom has stayed above the planning reserve for five seconds; a failed sample
+restarts that interval. Eviction does not wait for leases or native cleanup. Worker exit, protocol
+loss, or one continuous second of unavailable memory supervision terminalizes the affected
+instance and fails its streams without terminating persistent ICN. There is no automatic reload.
 
 ICN's pinned runtime is part of the ICN build, so ACN has no separate native-runtime install,
 discovery, refresh, instance registry, endpoint lease, or selection lifecycle.
@@ -538,7 +531,7 @@ The lifecycle conforms when:
 - constructing `IcnClient` without `IcnProcess` is impossible in the Effect dependency graph;
 - ACN cannot become ready when its ICN binary is absent, incompatible, or unready;
 - launch is model-free and changing the active model never replaces the ICN process;
-- ICN readiness proves an operational planning-worker pool and complete hardware calibration for every enabled assessment backend;
+- ICN readiness never waits for measurement; the assessment pool is `Preparing` until its basis exists;
 - loopback binding has no probe-then-bind race and readiness proves child instance identity;
 - every bootstrap record produced by ICN is accepted by its generated Bun schema, and generated
   contract drift fails validation;

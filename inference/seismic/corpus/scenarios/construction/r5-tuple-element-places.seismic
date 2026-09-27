@@ -1,0 +1,4 @@
+# origin: C11:r5_tuple_element_places
+# rejected: "installs whole"
+fn probe(dst: &mut tensor[2] f32, a: f32, b: f32):
+    (dst[0], dst[1]) = (b, a)

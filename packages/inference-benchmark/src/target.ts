@@ -166,7 +166,6 @@ const provisionIcnModel = (
 ): Effect.Effect<{
   readonly servedModel: string
   readonly instanceId: string
-  readonly parallelSequences: number
 }, TargetError, HttpClient.HttpClient | Scope.Scope> =>
   Effect.gen(function* () {
     const load = target.modelLoad
@@ -189,22 +188,12 @@ const provisionIcnModel = (
         message: `ICN returned a non-ready instance: ${instance.lifecycle._tag}`,
       })
     }
-    const allocation = instance.lifecycle.allocation
-    if (allocation.parallelSequences !== target.parallelSequences) {
-      return yield* new TargetError({
-        targetId: target.id,
-        operation: "validate-capacity",
-        message: `requested ${target.parallelSequences} parallel sequences but ICN allocated ${allocation.parallelSequences}`,
-      })
-    }
-
     yield* Effect.addFinalizer(() =>
       client.models.stopModelInstance({ path: { instance_id: instance.id } }).pipe(Effect.ignore),
     )
     return {
       servedModel: target.servedModel,
       instanceId: instance.id,
-      parallelSequences: allocation.parallelSequences,
     }
   })
 
@@ -285,7 +274,6 @@ const acquireTarget = (
     const sessionTarget: ManagedTarget = {
       ...target,
       servedModel: provisioned.servedModel,
-      parallelSequences: provisioned.parallelSequences,
     }
     return {
       target: sessionTarget,
@@ -366,7 +354,6 @@ export const resolveIcnExecutable = (
     explicit,
     process.env.MAGNITUDE_ICN_SERVER,
     Bun.which(ICN_EXECUTABLE_NAME),
-    `inference/target/benchmark-release/bin/${ICN_EXECUTABLE_NAME}`,
     `inference/target/development/bin/${ICN_EXECUTABLE_NAME}`,
   ]).pipe(Effect.flatMap(Option.match({
     onSome: Effect.succeed,
@@ -408,8 +395,6 @@ export const resolveLlamaCppExecutable = (
       process.env.MAGNITUDE_LLAMA_SERVER,
       Option.getOrUndefined(marker),
       Bun.which("llama-server"),
-      "inference/native/llama.cpp/build/bin/llama-server",
-      "inference/native/llama-cpp-rs/llama-cpp-sys-2/llama.cpp/build/bin/llama-server",
     ])
     return yield* Option.match(found, {
       onSome: Effect.succeed,

@@ -1,0 +1,10 @@
+# origin: X1:P14
+# invoke: f32[4]=zero ; index:3
+# pin: out = f32[4]=2,2,2,0
+# invoke: f32[4]=zero ; index:0
+# pin: out = f32[4]=0,0,0,0
+fn probe(out: &mut tensor[4] f32, n: index[4]):
+    for i in 0..n:
+        let mut t = tensor[i + 1] f32
+        t[i] = 2.0
+        out[i] = t[i]

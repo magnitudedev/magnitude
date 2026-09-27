@@ -1,0 +1,8 @@
+# origin: H-30
+# invoke: f32[4]=seq
+# invoke second: f32[4]=seq
+fn probe[N](x: &tensor[N] f32) -> f32:
+    return x[0]
+
+fn second[N](x: &tensor[N] f32) -> f32 where N >= 2:
+    return x[1] + x[0]

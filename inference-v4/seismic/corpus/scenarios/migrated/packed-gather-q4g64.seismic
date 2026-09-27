@@ -1,0 +1,10 @@
+# origin: test:seismic-runtime:runtime/src/feedback.rs:metal_feedback_observes_checked_content_addressing_of_packed_inputs
+# invoke gather: q4g64[3,64]=rand(152) ; i32[2]=2,0
+# invoke gather: q4g64[3,64]=rand(152) ; i32[2]=2,3
+# expect: failed
+fn gather[M,V,D](table: &tensor[V,D] q4g64, indices: &tensor[M] i32) -> tensor[M,D] f32:
+    let mut result = tensor[M,D] f32
+    parallel for row in 0..M:
+        parallel for col in 0..D:
+            result[row,col] = f32(table[indices[row],col])
+    return result

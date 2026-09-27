@@ -1,0 +1,5 @@
+# origin: test:validation:corpus/values.seismic:rank_one
+# invoke rank_one: f32[5]=seq ; f32[5]=zero
+fn rank_one[A](x: &tensor[A] f32, y: &mut tensor[A] f32) where A >= 0:
+    parallel for a in 0..A:
+        y[a] = x[a] + 1.0

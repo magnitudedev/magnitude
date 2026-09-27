@@ -1,0 +1,5 @@
+# origin: test:seismic-runtime:runtime/src/feedback.rs:metal_validation_collects_complete_mutated_input_state
+# invoke update: f32[4]=seq ; f32[4]=zero
+fn update[N](x: &tensor[N] f32, output: &mut tensor[N] f32):
+    parallel for i in 0..N:
+        output[i] = x[i] + 1.0

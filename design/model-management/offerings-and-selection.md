@@ -19,8 +19,9 @@ Generic provider code sees `(ProviderId, ProviderModelId)` and a bound model. Fo
 `ProviderModelId` is the canonical `ModelId` unchanged for both catalog and `hf:` discovery rows.
 ACN creates no alias, configuration identity, package identity, or bundle identity.
 
-ACN publishes an offering only when the exact effective model is assessed `Fits` and its availability
-is `Selectable`. The offering carries the assessed profile and capabilities. Models without that
+ACN publishes an offering only when the exact effective model is assessed `Fits`, its availability
+is `Selectable`, and it is not a deprecated catalog model; a deprecated model's provider entry is
+disabled as deprecated. The offering carries the assessed profile and capabilities. Models without that
 evidence may remain visible in the model center but are absent from selectable provider offerings;
 ACN never fills required provider fields with zero or false placeholders.
 

@@ -1,0 +1,22 @@
+# origin: X1:P11
+# invoke: i32[4]=zero ; bool:true ; i32:0
+# expect: failed
+# pin: out = i32[4]=7,0,0,0
+# invoke: i32[4]=zero ; bool:true ; i32:2
+# expect: returned
+# pin: out = i32[4]=7,5,0,3
+# pin: result = i32[]=5
+# invoke: i32[4]=zero ; bool:false ; i32:0
+# expect: returned
+# pin: out = i32[4]=0,0,0,3
+# pin: result = i32[]=0
+fn fill_then_fail(out: &mut tensor[4] i32, d: i32) -> i32:
+    out[0] = 7
+    out[1] = 10 / d
+    return out[1]
+fn probe(out: &mut tensor[4] i32, c: bool, d: i32) -> i32:
+    let mut r = 0
+    if c:
+        r = fill_then_fail(out, d)
+    out[3] = 3
+    return r

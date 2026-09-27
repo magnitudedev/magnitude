@@ -28,14 +28,12 @@ const descriptor = {
 }
 const allocation = {
   contextWindowTokens: 4096,
-  parallelSequences: 2,
-  physicalContextTokens: 8192,
   memoryDomains: [],
 }
 const configured = (lifecycle: {
   readonly _tag: "Loading"
-  readonly stage: "loading"
-  readonly progress: Option.Option<number>
+  readonly stage: "loading_weights"
+  readonly fraction: number
   readonly plannedAllocation: Option.Option<never>
 } | {
   readonly _tag: "Ready"
@@ -54,8 +52,8 @@ describe("canonical model-slot helpers", () => {
     expect(isModelSlotConfigured(new ModelSlotUnassigned({ slotId: PRIMARY_SLOT_ID }))).toBe(false)
     expect(isModelSlotConfigured(configured({
       _tag: "Loading",
-      stage: "loading",
-      progress: Option.some(0.4),
+      stage: "loading_weights",
+      fraction: 0.4,
       plannedAllocation: Option.none(),
     }))).toBe(true)
   })
@@ -63,8 +61,8 @@ describe("canonical model-slot helpers", () => {
   it("derives activity from the selected slot's embedded instance", () => {
     const primary = configured({
       _tag: "Loading",
-      stage: "loading",
-      progress: Option.some(0.4),
+      stage: "loading_weights",
+      fraction: 0.4,
       plannedAllocation: Option.none(),
     })
     const state = {
@@ -104,8 +102,8 @@ describe("canonical model-slot helpers", () => {
     expect(Option.getOrThrow(modelSlotResidentAllocation(ready))).toStrictEqual(allocation)
     expect(Option.isNone(modelSlotResidentAllocation(configured({
       _tag: "Loading",
-      stage: "loading",
-      progress: Option.none(),
+      stage: "loading_weights",
+      fraction: 0,
       plannedAllocation: Option.none(),
     })))).toBe(true)
   })

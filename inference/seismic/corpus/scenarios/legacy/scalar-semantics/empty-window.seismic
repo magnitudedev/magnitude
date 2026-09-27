@@ -1,0 +1,6 @@
+# origin: test:validation:programs/scalar-semantics.seismic:empty_window
+# invoke empty_window: f32[1]=zero ; f32[1]=zero
+fn empty_window(x: &tensor[1] f32, result: tensor[1] f32) -> tensor[1] f32:
+    let mut output = result
+    output[0] = 0.0
+    return output

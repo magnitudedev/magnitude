@@ -1,0 +1,6 @@
+# origin: C1:p26
+# invoke s: i32:4
+# pin: result.0 = i32[]=5
+# pin: result.1 = i32[]=8
+fn s(a: i32) -> (i32, i32):
+    return a + 1, a * 2

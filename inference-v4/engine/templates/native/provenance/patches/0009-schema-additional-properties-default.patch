@@ -1,0 +1,14 @@
+--- a/common/json-schema.cpp
++++ b/common/json-schema.cpp
+@@ -163,8 +163,9 @@
+             } else {
+                 fail(path, "additionalProperties must be a boolean or a schema");
+             }
+-        } else if (!schema.contains("properties")) {
+-            // {"type": "object"} on its own accepts any object
++        } else {
++            // JSON Schema defaults additionalProperties to true, including
++            // objects that also declare named properties.
+             node->additional_properties = std::make_unique<common_chat_schema_any>();
+         }
+ 

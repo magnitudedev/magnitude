@@ -1,0 +1,19 @@
+# origin: A8:G-A8-new-4
+# backends: metal
+# undecided: reassociated
+# invoke row_sum: f32[4,1024]=seq ; f32[4]=zero
+# expect: returned
+# pin: out = f32[4]=523776,1572352,2620928,3669504
+# invoke row_sum: f32[3,1000]=rand(7) ; f32[3]=zero
+# expect: returned
+fn row_sum[R, C](x: &tensor[R, C] f32, out: &mut tensor[R] f32):
+    # A row reduction whose tree fold may use a 1 024-thread workgroup: the
+    # kernel's `max_total_threads_per_threadgroup` is fixed before native
+    # compilation, never read back from the pipeline. With `seq` every
+    # partial sum is an integer below 2^24, so every association is exact.
+    parallel for r in 0..R:
+        out[r] = reduce(x[r], 0, sum)
+
+fn row_sum[R, C](x: &tensor[R, C] f32, out: &mut tensor[R] f32):
+    parallel for r in 0..R:
+        out[r] = reduce(x[r], 0, sum, unordered=true)

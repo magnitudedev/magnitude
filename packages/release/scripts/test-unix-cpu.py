@@ -20,7 +20,7 @@ import zlib
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--artifact-directory', type=pathlib.Path, required=True)
 parser.add_argument('--output-directory', type=pathlib.Path, required=True)
-parser.add_argument('--model', choices=['lfm2.5-2.6b:gguf:q4', 'qwen3.5-4b:gguf:q4'], default='lfm2.5-2.6b:gguf:q4')
+parser.add_argument('--model', choices=['qwen3.5-4b:gguf:q4'], default='qwen3.5-4b:gguf:q4')
 args = parser.parse_args()
 assert platform.system() == 'Darwin', 'This consumer currently validates macOS CPU artifacts'
 host = {'arm64': 'darwin-arm64', 'x86_64': 'darwin-x64'}[platform.machine()]
@@ -37,7 +37,7 @@ def digest(path):
 
 metadata = json.loads((args.artifact_directory / f'icn-base-{host}.artifact.json').read_text())
 assert metadata['id'] == f'icn-base-{host}' and metadata['host'] == host
-assert metadata['kind'] == 'icn-base' and metadata['backend'] == 'cpu'
+assert metadata['kind'] == 'icn-base'
 assert metadata['filename'] == f'magnitude-icn-base-{host}.tar.gz'
 archive = args.artifact_directory / metadata['filename']
 assert archive.stat().st_size == metadata['bytes'] and digest(archive) == metadata['sha256']
@@ -46,7 +46,7 @@ installation = root / 'installation'
 installation.mkdir()
 with tarfile.open(archive) as files:
     files.extractall(installation, filter='data')
-declaration = dict(schemaVersion=1, backend='cpu', nativeBuild=metadata['nativeBuild'], backendModuleAbi=metadata['backendModuleAbi'])
+declaration = dict(schemaVersion=1, nativeBuild=metadata['nativeBuild'])
 (installation / 'installation.json').write_text(json.dumps(declaration))
 binary = installation / 'bin/magnitude-inference'
 architecture = subprocess.check_output(['/usr/bin/lipo', '-archs', str(binary)], text=True).strip()
@@ -93,12 +93,16 @@ with (root / 'server.log').open('w') as log:
         record('health', health)
         hardware = request('/api/v1/hardware')
         assert hardware['native_build'] == metadata['nativeBuild']
-        assert hardware['enabled_backends'] == ['cpu']
+        # The artifact compiles in every backend of its host; Seismic discovery decides usability.
+        assert sorted(hardware['enabled_backends']) == {'darwin-arm64': ['cpu', 'metal'], 'darwin-x64': ['cpu']}[host], hardware
+        devices = [device for domain in hardware['memory_domains'] for device in domain['devices']]
+        assert any(device['backend'] == 'cpu' and 'unavailable_reason' not in device for device in devices), hardware
         record('hardware-identity', hardware)
         catalog_model = request(catalog_path)
         assert catalog_model['id'] == model
         assert catalog_model['localState']['_tag'] == 'NotInstalled'
-        assert catalog_model['desired']['profile']['contextLength'] == 64000
+        # A catalog serving profile's context is the target's supported maximum (Qwen3.5: 256K).
+        assert catalog_model['desired']['profile']['contextLength'] == 262144, catalog_model
         record('catalog-model', catalog_model)
         admission = request(catalog_path + '/install', {})
         assert admission['_tag'] == 'Admitted', admission

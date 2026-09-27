@@ -1,0 +1,4 @@
+# origin: C26:G-T9-5
+# invoke: f16[3]=1.5,2,3 ; f32[1]=zero
+fn probe[N](x: &tensor[N] f16, result: &mut tensor[1] f32):
+    result[0] = f32(x[0])

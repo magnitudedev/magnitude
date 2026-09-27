@@ -1,0 +1,10 @@
+[package]
+name = "magnitude-family-contracts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+magnitude-artifacts = { path = "../../artifacts" }
+serde.workspace = true
+sha2 = "=0.11.0"

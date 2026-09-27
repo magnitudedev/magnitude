@@ -1,0 +1,108 @@
+---
+applies_to:
+  - inference/engine/serving/**
+  - inference/engine/cli/**
+  - inference/service/server/src/serving.rs
+  - inference/engine/src/chat/**
+  - inference/engine/src/composition.rs
+  - inference/engine/src/invocation.rs
+  - inference/engine/chat/src/request.rs
+  - inference/engine/chat/src/output.rs
+  - inference/engine/chat/src/stream.rs
+  - inference/engine/chat/src/generation.rs
+  - inference/engine/generation/src/controls.rs
+---
+
+# Inference serving
+
+The engine's protocol library is the one implementation of Chat Completions,
+Responses (HTTP, SSE and WebSocket) and Anthropic Messages with `count_tokens`.
+The service mounts it beside its management routes; the standalone engine
+binary mounts it for its one explicit model. Handlers never load models or
+choose catalog entries: they name a model to a model source and receive either
+a generation binding (which may load the model and holds its release guard) or
+its host chat semantics (which never lease or load). A binding is to exactly
+one model generation.
+
+Every protocol adapts into one protocol-neutral request: a conversation (one
+leading system prompt and ordered user and assistant entries with complete tool
+exchanges), offered tools with their selection and parallelism, a reasoning
+intent, an output format, caller template arguments and generation controls.
+Rendering that request is the only path to template input, so counting,
+template application and generation see identical prompts and counts agree
+with generation. JSON mode constrains output to a JSON object; a JSON schema or
+caller grammar constrains output to that language. Enforcement accepts exactly the
+grammar's language, admits end of generation only where it accepts, and a schema
+object listing properties is closed unless it explicitly allows more. Image sources are validated
+and decoded by the protocol layer (base64 data URLs only, bounded); network URLs
+are never fetched. The standalone binary additionally reports readiness identity
+(`/health`: model, served context, vocabulary) and exposes counting at
+`/v1/count` for benchmark preparation.
+
+The host owns request validation, prompt rendering, tokenization, reasoning
+resolution, constraint description, text/tool parsing, protocol framing and
+transport lifetime. The worker builds the engine blueprint and owns model
+execution, state, scheduling, sampling and token constraints. Rendered tokens,
+generation options and a constraint description cross the worker boundary; live
+tokenizers, parsers and device objects do not.
+
+The host resolves one explicit served-context bound within the artifact's declared capability.
+That bound is part of the resolved model definition shared by input preparation, numerical planning,
+state allocation, readiness, and request validation. A prompt must leave at least one served
+position for generation. Counting is a host-only sizing operation: it renders and counts inputs up to
+the artifact capability through a separate input-preparation authority, but it neither enlarges the
+served bound nor allocates numerical state at the counted size.
+
+Tool selection has one meaning in both the prompt and the output language. An
+automatic selection offers the supplied tools. A named selection offers the
+selected function; a required selection tells the model to call an available
+function; an allowed-subset selection offers only that subset, optionally
+required. A selection of none omits tools. Rendering communicates required/named
+selection without mutating the caller's history; exact instruction wording is
+not a performance guarantee. The checkpoint still owns chat and argument syntax.
+Prompt instructions communicate intent; request-local grammar enforces it.
+Template keyword overrides cannot replace request-owned tool selection or other
+rendering inputs.
+
+Reasoning requests resolve against the model's detected profile: an exact
+effort is preserved; an unsupported ordinal effort rounds up to the nearest
+declared enabled level and clamps to the highest; a named mode without a rank
+falls back to the enabled default; disabling a model that cannot disable
+reasoning is an error. The model default renders exactly as the template's own
+default. A reasoning budget is a hard engine cap: once the budget of reasoning
+tokens is spent without the model closing reasoning, selection is restricted to
+the template's reasoning end tag. No budget is ever derived from an effort.
+Ignoring end of generation removes the model's stop tokens from every selection.
+Prompt caching allowed retains exact prompt prefixes; disallowed requests are
+transient.
+
+Stream parsing emits semantic text, reasoning and complete validated tool calls
+in one ordered stream that non-streaming responses also assemble from. A
+caller stop sequence ends output with a stop-sequence termination; tool calls
+terminate as tool calls; the output limit or context end is a length
+termination. Terminal usage and timings come from actual engine execution;
+progressive per-token timings are host-observed. Client disconnection cancels
+its request; one request's cancellation does not retire shared device work
+still used by peers.
+
+An ordinary stream commits its HTTP response only after the engine admitted the
+request, so preparation and admission failures keep their HTTP status. A
+progress stream (`Magnitude-Include-Progress`) commits immediately, reports
+model loading (its stage and fraction, named as the service's Instance status names
+them) and request stages (preparing, queued, prefill, generating; prefill
+reports completed, total and prefix-reused prompt tokens), and
+reports every later failure in-stream. Engine outcomes keep their typed meaning
+on the wire: memory, observation and capacity refusals are retryable 503s, an
+unsupported model is a non-retryable conflict, and device loss is a retryable
+server error. A failure of an admitted request is an engine failure, never a
+client error.
+
+The Responses WebSocket keeps per-connection logical history: a request marked
+not to generate is recorded without generation, and a later request naming it
+as its predecessor appends its input to that history.
+
+Qualification covers immutable input history, automatic/required/named/allowed/disabled
+tools, reasoning resolution and budgets, grammar and schema enforcement,
+fragmented streams, backpressure, cancellation, replay closure of every emitted
+output shape, and consistency of terminal timing and token counts between
+counting and generation.

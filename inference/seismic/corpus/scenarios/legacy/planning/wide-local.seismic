@@ -1,0 +1,10 @@
+# origin: test:validation:corpus/planning.seismic:wide_local
+# invoke wide_local: f32[2,40]=rand(111) ; f32[2,40]=zero
+fn wide_local[M, W](x: &tensor[M, W] f32, y: &mut tensor[M, W] f32):
+    parallel for r in 0..M:
+        let mut local = tensor[W] f32
+        for j in 0..W:
+            local[j] = exp(x[r, j])
+        let total = reduce(local, 0, sum)
+        for j in 0..W:
+            y[r, j] = local[j] / total

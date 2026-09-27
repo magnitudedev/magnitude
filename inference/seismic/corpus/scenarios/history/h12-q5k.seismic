@@ -1,0 +1,8 @@
+# origin: H-12
+# invoke: q5k[512]=rand(5)
+# invoke: q5k[512]=bits(5)
+fn probe[K](w: &tensor[K] q5k) -> f32 where K % 256 == 0:
+    let mut total = 0.0
+    for k in 0..K:
+        total = total + f32(w[k])
+    return total

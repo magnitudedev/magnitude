@@ -1,0 +1,5 @@
+# origin: H-48
+# invoke: f32[33]=rand(15) ; f32[33]=zero
+fn probe[N](x: &tensor[N] f32, dst: &mut tensor[N] f32):
+    parallel for k in 0..N:
+        dst[k] = x[k] * 2.0

@@ -1,0 +1,6 @@
+# origin: C11:fail_div_zero_prefix
+# invoke: i32[1]=0 ; i32:0
+# expect: failed
+fn probe(dst: &mut tensor[1] i32, d: i32) -> i32:
+    dst[0] = 7
+    return 5 / d

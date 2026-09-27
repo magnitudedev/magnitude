@@ -52,13 +52,15 @@ The ordinary shell contains a dedicated Settings surface for local inference:
   only artifact-level actions: reveal the daemon-published installed target path or remove the
   download. Externally managed Hugging Face cache artifacts may be revealed but do not expose a
   removal action. Slot selection, residency, favorites, transfer activity, and load controls do not belong
-  on this surface.
+  on this surface. A deprecated installed model is labeled, names its replacement, and offers one
+  switch action that downloads the replacement until it is installed; best-effort models are
+  labeled wherever they appear.
 - Catalog presents the unified assessed local catalog. Its index may be searched by model identity,
   filtered to installed models, and sorted by intelligence (the default), release date, download
   size, or name. Onboarding preference is not applied to this general catalog. Ordinary
   downloadable rows do not repeat an `Available` label; non-default lifecycle and compatibility
-  states remain visible while completed `DoesNotFit` and `Incompatible` assessments are excluded
-  from the browsable catalog. Catalog owns
+  states remain visible while completed `DoesNotFit` and `Incompatible` assessments and deprecated
+  models are excluded from the browsable catalog. Catalog owns
   install, update, and transfer cancellation; active-model selection remains in the composer and
   installed-artifact removal remains in Models.
 - Hardware presents server-reported topology and a labeled physical-memory breakdown alongside

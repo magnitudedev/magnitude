@@ -155,7 +155,7 @@ it("requires exact fact identities and retains primary source URLs", () => {
 it("counts dedicated memory once when two backends expose one physical domain", () => {
   const value = hardware("AMD", 64, 16, [{ name: "RTX 4090", memory: 24 }])
   const accelerator = value.accelerators[0]!
-  const result = hardwareDetails(null, { ...value, accelerators: [accelerator, { ...accelerator, acceleratorId: "vulkan-alias" as typeof accelerator.acceleratorId, backend: "Vulkan" }] })
+  const result = hardwareDetails(null, { ...value, accelerators: [accelerator, { ...accelerator, acceleratorId: "vulkan-alias" as typeof accelerator.acceleratorId, backend: "vulkan" }] })
   expect(result.accelerators.map(gpu => gpu.detail)).toEqual(["24 GB VRAM", "Local acceleration"])
 })
 it("keeps ordinary shared system RAM distinct from unified memory in mixed systems", () => {

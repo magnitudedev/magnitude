@@ -1,6 +1,7 @@
-import { Option } from "effect"
+import { Option, Schema } from "effect"
 import { describe, expect, it } from "vitest"
-import type { CatalogLocalModel, LocalInferenceHardware, LocalModel, ProviderModelId } from "@magnitudedev/sdk"
+import { CatalogSupportSchema } from "@magnitudedev/sdk"
+import type { CatalogLocalModel, CatalogSupport, LocalInferenceHardware, LocalModel, ProviderModelId } from "@magnitudedev/sdk"
 import {
   localModelRankingUtility,
   featuredCatalogModels,
@@ -14,12 +15,14 @@ const option = (
   totalRequiredBytes: number,
   scores: { intelligence: number; speed: number; fidelity: number },
   kind: LocalModelOption["kind"] = "downloadable",
+  support: CatalogSupport = { _tag: "Supported" },
 ): LocalModelOption => ({
   id: `${kind}:${modelId}`,
   kind,
   model: {
     _tag: "Catalog",
     modelId: modelId as ProviderModelId,
+    catalogData: { support },
     servingState: {
       _tag: "Assessed",
       assessment: {
@@ -84,6 +87,22 @@ describe("local model ranking", () => {
       [downloadable, stored],
       { fastToSmart: 0.5, memoryBudgetBytes: 1 },
     )).toEqual([stored, downloadable])
+  })
+
+  it("never ranks a disabled or deprecated model", () => {
+    const scores = { intelligence: 1, speed: 1, fidelity: 1 }
+    const disabled = option("disabled", 1, scores, "downloadable",
+      { _tag: "Disabled", reason: "not yet qualified" })
+    const deprecated = option("deprecated", 1, scores, "stored", Schema.decodeUnknownSync(CatalogSupportSchema)({
+      _tag: "Deprecated",
+      since: "2026-09-27",
+      replacement: "supported:gguf:q4",
+      reason: "unsupported architecture",
+    }))
+    expect(rankedLocalModelOptions(
+      [deprecated, disabled],
+      { fastToSmart: 0.5, memoryBudgetBytes: 1 },
+    )).toEqual([])
   })
 
   it("sums distinct normalized physical memory domains without adding system memory twice", () => {

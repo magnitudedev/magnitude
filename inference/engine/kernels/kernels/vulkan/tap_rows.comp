@@ -1,0 +1,19 @@
+// tap_rows: taps[row, index[0] * D + column] = A(residual[row, column]); one
+// invocation per element over a grid-stride loop (the grid is capped below
+// the 65535-group floor).
+#include "lib/core/activation.glsl"
+
+void tap_rows() {
+    const uint64_t residual = SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL);
+    const uint64_t taps = SEISMIC_PTR(SEISMIC_BUFFER_TAPS);
+    const uint64_t width = SEISMIC_DIM_D;
+    const uint64_t count = SEISMIC_DIM_M * width;
+    const uint64_t tap = uint64_t(element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_INDEX), 0ul));
+    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
+    for (uint64_t index = gl_GlobalInvocationID.x; index < count; index += step) {
+        const uint64_t row = index / width;
+        const uint64_t column = index % width;
+        element_put(ELEMENT_ACT, taps, row * SEISMIC_TAPS_STRIDE_0 + (tap * width + column) * SEISMIC_TAPS_STRIDE_1,
+            element_f32_at(residual + (row * SEISMIC_RESIDUAL_STRIDE_0 + column * SEISMIC_RESIDUAL_STRIDE_1) * 4ul));
+    }
+}

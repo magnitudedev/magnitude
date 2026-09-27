@@ -1,0 +1,5 @@
+# origin: A1:G-A10-new-8
+# cell: index-from-word/sl
+# rejected: "`index` is not declared"
+fn probe(x: &tensor[8] i32) -> index[8]:
+    return index(x[0])

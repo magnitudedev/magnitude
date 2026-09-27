@@ -1,0 +1,19 @@
+# origin: test:validation:corpus/composition.seismic:small_product
+# invoke small_product: f32[3,4]=rand(94) ; f32[4,5]=rand(95)
+fn small_product[M, N, K](a: &tensor[M, K] f32, b: &tensor[K, N] f32) -> tensor[M, N] f32:
+    let mut out = tensor[M, N] f32
+    for i in 0..M:
+        for j in 0..N:
+            let mut s = f32(0.0)
+            for k in 0..K:
+                s = fma(a[i, k], b[k, j], s)
+            out[i, j] = s
+    return out
+
+lower small_product[M, N, K](a: &tensor[M, K] f32, b: &tensor[K, N] f32) -> tensor[M, N] f32
+    for metal requires metal.matrix:
+    return metal.matrix.matmul(a, b)
+
+lower small_product[M, N, K](a: &tensor[M, K] f32, b: &tensor[K, N] f32) -> tensor[M, N] f32
+    for cuda requires cuda.matrix:
+    return cuda.matrix.matmul(a, b)

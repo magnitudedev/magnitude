@@ -14,6 +14,10 @@
       "types": "./src/platform/embedded-browser.ts",
       "import": "./src/platform/embedded-browser.ts"
     },
+    "./desktop/contracts": {
+      "types": "./src/desktop/contracts.ts",
+      "import": "./src/desktop/contracts.ts"
+    },
     "./types/menu-action": {
       "types": "./src/types/menu-action.ts",
       "import": "./src/types/menu-action.ts"

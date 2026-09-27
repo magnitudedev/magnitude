@@ -1,5 +1,5 @@
 import { Option } from "effect"
-import { formatMemorySize } from "@magnitudedev/client-common"
+import { formatLocalInferenceBackend, formatMemorySize } from "@magnitudedev/client-common"
 import type { LocalInferenceHardware, LocalInferenceMemoryDomainId } from "@magnitudedev/sdk"
 
 export const formatContext = (tokens: number): string => tokens < 1_000
@@ -22,7 +22,7 @@ const localHardwareTopology = (hardware: LocalInferenceHardware) => {
   const discrete = hardware.memoryDomains.filter((domain) => domain.kind === "PhysicalDevice")
   const backendsFor = (memoryDomainId: LocalInferenceMemoryDomainId) => unique(hardware.accelerators
     .filter((accelerator) => accelerator.memoryDomainId === memoryDomainId)
-    .map((accelerator) => accelerator.backend))
+    .map((accelerator) => formatLocalInferenceBackend(accelerator.backend)))
   const namesFor = (memoryDomainId: LocalInferenceMemoryDomainId) => unique(hardware.accelerators
     .filter((accelerator) => accelerator.memoryDomainId === memoryDomainId)
     .map((accelerator) => accelerator.name))

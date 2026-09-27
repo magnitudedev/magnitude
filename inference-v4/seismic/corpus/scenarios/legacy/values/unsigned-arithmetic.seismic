@@ -1,0 +1,6 @@
+# origin: test:validation:corpus/values.seismic:unsigned_arithmetic
+# invoke unsigned_arithmetic: u32[6]=0,1,7,100,65535,4294967295 ; u32[6]=zero ; u32:3
+fn unsigned_arithmetic[N](x: &tensor[N] u32, y: &mut tensor[N] u32, k: u32) where N >= 0:
+    parallel for i in 0..N:
+        let v = x[i]
+        y[i] = (v * u32(2654435761) + k) ^ (v >> 3) ^ (v << 5)

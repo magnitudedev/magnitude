@@ -1,0 +1,12 @@
+# origin: X1:P23
+# undecided: atomic-subset
+# invoke: i32[4]=1,2,3,4 ; f32[1]=zero ; i32[4]=zero
+# expect: failed
+# invoke: i32[4]=1,2,4,5 ; f32[1]=zero ; i32[4]=zero
+# expect: returned
+# pin: acc = f32[1]=4
+# pin: out = i32[4]=-6,-12,12,6
+fn probe[N](x: &tensor[N] i32, acc: &mut tensor[1] f32, out: &mut tensor[N] i32):
+    parallel for i in 0..N:
+        atomic(add, acc[0], 1.0)
+        out[i] = 12 / (x[i] - 3)

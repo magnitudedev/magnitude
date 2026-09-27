@@ -1,0 +1,11 @@
+# origin: X1:P36
+# invoke: f32[4]=1,2,3,4 ; f32[4]=zero
+# pin: result = i32[]=3
+# pin: out = f32[4]=3,6,9,12
+fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:
+    return x * 3.0
+fn probe[N](x: &tensor[N] f32, out: &mut tensor[N] f32) -> i32:
+    let a = scale(x)
+    let b = scale(x)
+    out[0:N] = b
+    return reduce(a, 0, argmax)

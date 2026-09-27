@@ -1,0 +1,43 @@
+// post_norm_residual: a sandwich-norm tail over the `out_rows` rows,
+// (residual + rms(projected) * norm) * scale, all F32. One workgroup per
+// output row: the square sum of the projected row, then the update. The
+// Vulkan form of `metal/post_norm_residual.metal`.
+#include <seismic/element.glsl>
+#include "lib/core/reduce.glsl"
+
+#if defined(SEISMIC_NORM_REPRESENTATION_F32)
+#define RESIDUAL_NORM ELEMENT_F32
+#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
+#define RESIDUAL_NORM ELEMENT_F16
+#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
+#define RESIDUAL_NORM ELEMENT_BF16
+#else
+#error "post_norm_residual requires a dense norm"
+#endif
+
+// Shared: one partial per subgroup (reduce_group_sum at float 0).
+void post_norm_residual() {
+    const uint64_t width = SEISMIC_DIM_D;
+    const uint64_t row = gl_WorkGroupID.x;
+    const uint thread = gl_LocalInvocationIndex;
+    const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
+    const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
+    const uint64_t projected = SEISMIC_PTR(SEISMIC_BUFFER_PROJECTED) + row * SEISMIC_PROJECTED_STRIDE_0 * 4ul;
+    float squares = 0.0;
+    for (uint64_t i = thread; i < width; i += gl_WorkGroupSize.x) {
+        const float v = element_f32_at(projected + i * SEISMIC_PROJECTED_STRIDE_1 * 4ul);
+        squares = seismic_fma_rn(v, v, squares);
+    }
+    squares = reduce_group_sum(squares, 0u);
+    const float inverse = inversesqrt(seismic_div_rn(squares, float(width)) + epsilon);
+    const uint64_t source = uint64_t(element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS), row * SEISMIC_OUT_ROWS_STRIDE_0));
+    const uint64_t residual = SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL) + source * SEISMIC_RESIDUAL_STRIDE_0 * 4ul;
+    const uint64_t norm = SEISMIC_PTR(SEISMIC_BUFFER_NORM);
+    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul;
+    for (uint64_t i = thread; i < width; i += gl_WorkGroupSize.x) {
+        const float normalized = element_f32_at(projected + i * SEISMIC_PROJECTED_STRIDE_1 * 4ul) * inverse
+            * element_at(RESIDUAL_NORM, norm, i * SEISMIC_NORM_STRIDE_0);
+        element_f32_put(result + i * SEISMIC_RESULT_0_STRIDE_1 * 4ul,
+            (element_f32_at(residual + i * SEISMIC_RESIDUAL_STRIDE_1 * 4ul) + normalized) * scale);
+    }
+}

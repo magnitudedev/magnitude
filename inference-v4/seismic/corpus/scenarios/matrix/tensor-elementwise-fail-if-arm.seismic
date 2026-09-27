@@ -1,0 +1,6 @@
+# cell: tensor-elementwise-fail/if-arm
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero ; i32[4,8]=1,2,3,4,5,6,7,1,2,3,4,5,6,7,1,2,3,4,5,6,7,1,2,3,4,5,6,7,1,2,3,4 ; i32[4,8]=zero ; bool:true
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero ; i32[4,8]=1,2,3,4,5,6,7,1,2,3,4,5,6,7,1,2,3,4,5,6,7,1,2,3,4,5,6,7,1,2,3,4 ; i32[4,8]=zero ; bool:false
+fn probe[W](x: &tensor[4, W] f32, out: &mut tensor[4] f32, y: &mut tensor[4, W] f32, a: &tensor[4, W] i32, z: &mut tensor[4, W] i32, c: bool) where W >= 8:
+    if c:
+        z[0] = 12 / a[0]

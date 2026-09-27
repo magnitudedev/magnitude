@@ -1,0 +1,6 @@
+# origin: X1:r2-i02
+# invoke: f32[16]=rand(37) ; f32[1024]=rand(38) ; f32[1024]=zero
+fn probe[N](x: &tensor[N] f32, s: &tensor[1024] f32, out: &mut tensor[1024] f32):
+    for i in 0..1024:
+        let t = to_owned(x)
+        out[i] = reduce(t, 0, sum) + s[i]

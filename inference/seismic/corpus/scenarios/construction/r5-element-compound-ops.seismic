@@ -1,0 +1,5 @@
+# origin: C11:r5_element_compound_ops
+# invoke: i32[2]=10,2
+fn probe(dst: &mut tensor[2] i32):
+    dst[0] -= 3
+    dst[1] *= 5

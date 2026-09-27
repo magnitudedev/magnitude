@@ -1,0 +1,8 @@
+# origin: C11:loop_element_writes
+# cell: assign-element/ordered
+# invoke: f32[4]=1,2,3,4
+fn probe[N](x: &tensor[N] f32) -> tensor[N] f32:
+    let mut t = tensor[N] f32
+    for k in 0..N:
+        t[k] = x[k] * 3.0
+    return t

@@ -1,0 +1,1783 @@
+use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use futures_util::future::BoxFuture;
+use futures_util::StreamExt;
+use magnitude_service_contracts::{
+    ComponentRelationship, ComponentRole, ContentIdentity, HuggingFaceModelCatalog,
+    HuggingFaceModelSearchRequest, HuggingFaceModelSearchResult, HuggingFaceModelSearchResults,
+    HuggingFaceRepositoryFile, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
+    Integrity, InventoryEntryId, InventoryError, ModelComponent, ModelLocation,
+    ModelPreviewSource, ModelSource, ResolvedComponent, ResolvedModel,
+};
+use reqwest::header::{CONTENT_RANGE, ETAG, IF_NONE_MATCH, RANGE};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::cache::{ModelBlobKind, ModelCacheWorkspace, ModelIndexKind};
+use crate::hugging_face::{require_requested_revision, revision_metadata_url};
+use crate::identity::content_id;
+use crate::inventory::{ManagedModelStore, build_model, now};
+
+const INITIAL_HEADER_BYTES: usize = 1024 * 1024;
+const MAX_HEADER_BYTES: usize = 128 * 1024 * 1024;
+const MAX_HUB_METADATA_BYTES: usize = 16 * 1024 * 1024;
+const MAX_HUB_SIBLINGS: usize = 100_000;
+const MAX_HUB_SEARCH_RESULTS: u32 = 50;
+const MAX_HUB_SEARCH_QUERY_BYTES: usize = 200;
+const HUB_SEARCH_TTL: Duration = Duration::from_secs(60);
+const MAX_HUB_SEARCH_CACHE_ENTRIES: usize = 256;
+const MAX_MODEL_COMPONENTS: u32 = 256;
+const MAX_COMPONENT_LOGICAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+const HUB_REQUEST_ATTEMPTS: usize = 3;
+const HUB_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+
+/// Live Hub discovery for the service's search and immutable-resolution API.
+/// Catalog publication and managed inventory do not depend on these queries.
+pub struct HuggingFaceDiscovery {
+    models: Arc<ManagedModelStore>,
+    searches: tokio::sync::Mutex<BTreeMap<String, (Instant, HuggingFaceModelSearchResults)>>,
+}
+
+impl HuggingFaceDiscovery {
+    #[must_use]
+    pub fn new(models: Arc<ManagedModelStore>) -> Self {
+        Self {
+            models,
+            searches: tokio::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+}
+
+impl HuggingFaceModelCatalog for HuggingFaceDiscovery {
+    fn search(&self, request: HuggingFaceModelSearchRequest) -> BoxFuture<'_, Result<HuggingFaceModelSearchResults, InventoryError>> {
+        Box::pin(async move {
+            let query = request.query.trim();
+            if query.is_empty()
+                || query.len() > MAX_HUB_SEARCH_QUERY_BYTES
+                || request.limit == 0
+                || request.limit > MAX_HUB_SEARCH_RESULTS
+            {
+                return Err(InventoryError::InvalidRequest(format!(
+                    "Hugging Face search requires a non-empty query of at most {MAX_HUB_SEARCH_QUERY_BYTES} bytes and a limit between 1 and {MAX_HUB_SEARCH_RESULTS}"
+                )));
+            }
+            let cache_key = format!("{}:{}", query.to_lowercase(), request.limit);
+            {
+                let mut searches = self.searches.lock().await;
+                searches.retain(|_, (captured, _)| captured.elapsed() <= HUB_SEARCH_TTL);
+                if let Some((_, result)) = searches.get(&cache_key) {
+                    return Ok(result.clone());
+                }
+            }
+            let mut url = reqwest::Url::parse(self.models.client.endpoint())
+                .map_err(|error| InventoryError::Internal(error.to_string()))?;
+            url.path_segments_mut()
+                .map_err(|()| InventoryError::Internal("invalid hub endpoint".to_owned()))?
+                .pop_if_empty()
+                .push("api")
+                .push("models");
+            url.query_pairs_mut()
+                .append_pair("search", query)
+                .append_pair("filter", "gguf")
+                .append_pair("sort", "downloads")
+                .append_pair("direction", "-1")
+                .append_pair("limit", &request.limit.to_string())
+                .append_pair("expand", "sha")
+                .append_pair("expand", "lastModified")
+                .append_pair("expand", "downloads")
+                .append_pair("expand", "likes")
+                .append_pair("expand", "tags")
+                .append_pair("expand", "private")
+                .append_pair("expand", "gated");
+            let mut outbound = self.models.http.get(url);
+            if let Some(token) = hub_token() {
+                outbound = outbound.bearer_auth(token);
+            }
+            let response = outbound.send().await
+                .map_err(|error| InventoryError::Upstream(error.to_string()))?;
+            if !response.status().is_success() {
+                return Err(InventoryError::Upstream(format!(
+                    "Hugging Face search returned HTTP {}", response.status()
+                )));
+            }
+            let metadata: Vec<HubSearchModel> = serde_json::from_slice(
+                &bounded_response_bytes(response, MAX_HUB_METADATA_BYTES).await?,
+            ).map_err(|error| InventoryError::Upstream(error.to_string()))?;
+            let result = HuggingFaceModelSearchResults {
+                models: metadata.into_iter().filter_map(HubSearchModel::into_contract).collect(),
+            };
+            let mut searches = self.searches.lock().await;
+            searches.insert(cache_key, (Instant::now(), result.clone()));
+            if searches.len() > MAX_HUB_SEARCH_CACHE_ENTRIES {
+                if let Some(oldest) = searches.iter()
+                    .min_by_key(|(_, (captured, _))| *captured)
+                    .map(|(key, _)| key.clone())
+                {
+                    searches.remove(&oldest);
+                }
+            }
+            Ok(result)
+        })
+    }
+
+    fn resolve(&self, request: HuggingFaceRepositoryRequest) -> BoxFuture<'_, Result<HuggingFaceRepositorySnapshot, InventoryError>> {
+        Box::pin(refresh_hugging_face_repository(&self.models, request))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CachedHuggingFaceRepositorySnapshot {
+    captured_at: u64,
+    #[serde(default)]
+    etag: Option<String>,
+    snapshot: HuggingFaceRepositorySnapshot,
+}
+
+pub async fn refresh_hugging_face_repository(
+    models: &Arc<ManagedModelStore>,
+    request: HuggingFaceRepositoryRequest,
+) -> Result<HuggingFaceRepositorySnapshot, InventoryError> {
+    validate_repository_request(&request)?;
+    let cache_key = repository_cache_key(models.client.endpoint(), &request);
+    let cached = models
+        .cache
+        .read_index::<CachedHuggingFaceRepositorySnapshot>(
+            ModelIndexKind::HuggingFaceRepositorySnapshot,
+            &cache_key,
+        );
+    refresh_hub_repository_snapshot(
+        models,
+        &models.http,
+        models.client.endpoint(),
+        request,
+        cache_key,
+        cached,
+    )
+    .await
+}
+
+fn validate_repository_request(
+    request: &HuggingFaceRepositoryRequest,
+) -> Result<(), InventoryError> {
+    if !valid_repository(&request.repository) {
+        return Err(InventoryError::InvalidRequest(
+            "Hugging Face repository must use owner/repository form".to_owned(),
+        ));
+    }
+    if !valid_hub_revision(&request.revision) {
+        return Err(InventoryError::InvalidRequest(
+            "Hugging Face revision contains unsupported characters".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn repository_cache_key(endpoint: &str, request: &HuggingFaceRepositoryRequest) -> String {
+    format!("{endpoint}:{}@{}", request.repository, request.revision)
+}
+
+pub struct PreparedPreview {
+    pub model: ResolvedModel,
+    pub repository: String,
+    pub commit: String,
+    pub components: Vec<ModelComponent>,
+    pub headers: Vec<PreparedPreviewHeader>,
+    pub artifact_fingerprint: String,
+    _workspace: ModelCacheWorkspace,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedPreviewHeader {
+    pub path: PathBuf,
+    pub digest: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CachedArtifact {
+    repository: String,
+    commit: String,
+    primary_gguf: PathBuf,
+    components: Vec<CachedComponent>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CachedComponent {
+    component: ModelComponent,
+    header_digest: String,
+    #[serde(skip)]
+    acquired_header: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HubModel {
+    #[serde(default)]
+    id: Option<String>,
+    sha: Option<String>,
+    #[serde(default, rename = "lastModified")]
+    last_modified: Option<String>,
+    #[serde(default)]
+    downloads: Option<u64>,
+    #[serde(default)]
+    likes: Option<u64>,
+    #[serde(default)]
+    gated: Option<serde_json::Value>,
+    #[serde(default)]
+    private: Option<bool>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default, rename = "cardData")]
+    card_data: Option<serde_json::Value>,
+    #[serde(default)]
+    siblings: Vec<HubSibling>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HubSearchModel {
+    id: String,
+    sha: Option<String>,
+    #[serde(default, rename = "lastModified")]
+    last_modified: Option<String>,
+    #[serde(default)]
+    downloads: Option<u64>,
+    #[serde(default)]
+    likes: Option<u64>,
+    #[serde(default)]
+    gated: Option<serde_json::Value>,
+    #[serde(default)]
+    private: Option<bool>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+impl HubSearchModel {
+    fn into_contract(self) -> Option<HuggingFaceModelSearchResult> {
+        Some(HuggingFaceModelSearchResult {
+            repository: self.id,
+            commit: immutable_commit(self.sha?)?,
+            last_modified: self.last_modified,
+            downloads: self.downloads,
+            likes: self.likes,
+            gated: hub_gated(self.gated.as_ref()),
+            private: self.private.unwrap_or(false),
+            tags: self.tags,
+        })
+    }
+}
+
+impl HubModel {
+    fn into_snapshot(
+        self,
+        requested_repository: String,
+        requested_revision: &str,
+    ) -> Result<HuggingFaceRepositorySnapshot, InventoryError> {
+        if self.siblings.len() > MAX_HUB_SIBLINGS {
+            return Err(InventoryError::Integrity(
+                "Hugging Face metadata contains too many files".to_owned(),
+            ));
+        }
+        let commit = self.sha.and_then(immutable_commit).ok_or_else(|| {
+            InventoryError::Integrity(
+                "Hugging Face repository did not resolve to an immutable commit".to_owned(),
+            )
+        })?;
+        validate_snapshot_revision(requested_revision, &commit)
+            .map_err(InventoryError::Integrity)?;
+        let mut gguf_files = self
+            .siblings
+            .iter()
+            .filter(|sibling| valid_gguf_path(Path::new(&sibling.rfilename)))
+            .map(|sibling| {
+                let (size_bytes, content) = sibling_identity(sibling)?;
+                Ok(HuggingFaceRepositoryFile {
+                    path: PathBuf::from(&sibling.rfilename),
+                    size_bytes,
+                    content,
+                })
+            })
+            .collect::<Result<Vec<_>, InventoryError>>()?;
+        gguf_files.sort_by(|left, right| left.path.cmp(&right.path));
+        if gguf_files.is_empty() {
+            return Err(InventoryError::Unsupported(format!(
+                "{} does not contain GGUF artifacts",
+                requested_repository
+            )));
+        }
+        let card = self.card_data.as_ref();
+        let license = card
+            .and_then(|value| value.get("license"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| tag_value(&self.tags, "license:"));
+        let license_url = card
+            .and_then(|value| value.get("license_link"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        let mut base_models = card
+            .and_then(|value| value.get("base_model"))
+            .map(json_strings)
+            .unwrap_or_default();
+        if base_models.is_empty() {
+            base_models = self
+                .tags
+                .iter()
+                .filter_map(|tag| {
+                    tag.strip_prefix("base_model:quantized:")
+                        .or_else(|| tag.strip_prefix("base_model:"))
+                        .map(ToOwned::to_owned)
+                })
+                .collect();
+        }
+        base_models.sort();
+        base_models.dedup();
+        Ok(HuggingFaceRepositorySnapshot {
+            repository: self.id.unwrap_or(requested_repository),
+            commit,
+            last_modified: self.last_modified,
+            downloads: self.downloads,
+            likes: self.likes,
+            gated: hub_gated(self.gated.as_ref()),
+            private: self.private.unwrap_or(false),
+            license,
+            license_url,
+            base_models,
+            tags: self.tags,
+            gguf_files,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct HubSibling {
+    rfilename: String,
+    size: Option<u64>,
+    #[serde(rename = "blobId")]
+    blob_id: Option<String>,
+    lfs: Option<HubLfs>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HubLfs {
+    sha256: String,
+    size: u64,
+}
+
+enum HubModelFetch {
+    NotModified,
+    Modified {
+        model: HubModel,
+        etag: Option<String>,
+    },
+}
+
+async fn refresh_hub_repository_snapshot(
+    models: &ManagedModelStore,
+    http: &reqwest::Client,
+    endpoint: &str,
+    request: HuggingFaceRepositoryRequest,
+    cache_key: String,
+    cached: Option<CachedHuggingFaceRepositorySnapshot>,
+) -> Result<HuggingFaceRepositorySnapshot, InventoryError> {
+    let fetched = fetch_hub_model(
+        http,
+        endpoint,
+        &request.repository,
+        request.revision.as_str(),
+        cached.as_ref().and_then(|cached| cached.etag.as_deref()),
+    )
+    .await?;
+    let (snapshot, etag) = match fetched {
+        HubModelFetch::NotModified => {
+            let cached = cached.ok_or_else(|| {
+                InventoryError::Upstream(
+                    "Hugging Face returned not modified without cached metadata".to_owned(),
+                )
+            })?;
+            (cached.snapshot, cached.etag)
+        }
+        HubModelFetch::Modified { model, etag } => (
+            model.into_snapshot(request.repository, request.revision.as_str())?,
+            etag,
+        ),
+    };
+    models.cache.write_index(
+        ModelIndexKind::HuggingFaceRepositorySnapshot,
+        &cache_key,
+        &CachedHuggingFaceRepositorySnapshot {
+            captured_at: now(),
+            etag,
+            snapshot: snapshot.clone(),
+        },
+    );
+    Ok(snapshot)
+}
+
+async fn fetch_hub_model(
+    http: &reqwest::Client,
+    endpoint: &str,
+    repository: &str,
+    revision: &str,
+    etag: Option<&str>,
+) -> Result<HubModelFetch, InventoryError> {
+    let url =
+        revision_metadata_url(endpoint, repository, revision).map_err(InventoryError::Internal)?;
+    let token = hub_token();
+    let response = send_hub_request(|| {
+        let mut request = http.get(url.clone()).query(&[("blobs", "true")]);
+        if let Some(token) = &token {
+            request = request.bearer_auth(token);
+        }
+        if let Some(etag) = etag {
+            request = request.header(IF_NONE_MATCH, etag);
+        }
+        request
+    })
+    .await?;
+    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok(HubModelFetch::NotModified);
+    }
+    if !response.status().is_success() {
+        return Err(InventoryError::Upstream(format!(
+            "Hugging Face metadata returned HTTP {}",
+            response.status()
+        )));
+    }
+    let etag = response
+        .headers()
+        .get(ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let model =
+        serde_json::from_slice(&bounded_response_bytes(response, MAX_HUB_METADATA_BYTES).await?)
+            .map_err(|error| InventoryError::Upstream(error.to_string()))?;
+    Ok(HubModelFetch::Modified { model, etag })
+}
+
+fn retryable_hub_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+async fn send_hub_request(
+    mut request: impl FnMut() -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response, InventoryError> {
+    let mut last_failure = None;
+    for attempt in 0..HUB_REQUEST_ATTEMPTS {
+        match request().send().await {
+            Ok(response)
+                if retryable_hub_status(response.status())
+                    && attempt + 1 < HUB_REQUEST_ATTEMPTS =>
+            {
+                last_failure = Some(format!("HTTP {}", response.status()));
+            }
+            Ok(response) => return Ok(response),
+            Err(error) if attempt + 1 < HUB_REQUEST_ATTEMPTS => {
+                last_failure = Some(error.to_string());
+            }
+            Err(error) => return Err(InventoryError::Upstream(error.to_string())),
+        }
+        let multiplier = u32::try_from(attempt + 1).unwrap_or(u32::MAX);
+        tokio::time::sleep(HUB_RETRY_BASE_DELAY.saturating_mul(multiplier)).await;
+    }
+    Err(InventoryError::Upstream(last_failure.unwrap_or_else(
+        || "Hugging Face request failed".to_owned(),
+    )))
+}
+
+fn immutable_commit(value: String) -> Option<String> {
+    ((40..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some(value)
+}
+
+fn validate_snapshot_revision(requested: &str, commit: &str) -> Result<(), String> {
+    if immutable_commit(requested.to_owned()).is_some() {
+        require_requested_revision(requested, Some(commit))?;
+    }
+    Ok(())
+}
+
+fn hub_gated(value: Option<&serde_json::Value>) -> bool {
+    value.is_some_and(|value| {
+        !matches!(
+            value,
+            serde_json::Value::Bool(false) | serde_json::Value::Null
+        )
+    })
+}
+
+fn tag_value(tags: &[String], prefix: &str) -> Option<String> {
+    tags.iter()
+        .find_map(|tag| tag.strip_prefix(prefix).map(ToOwned::to_owned))
+}
+
+fn json_strings(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::String(value) => vec![value.clone()],
+        serde_json::Value::Array(values) => values
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+struct SelectedComponent<'a> {
+    sibling: &'a HubSibling,
+    role: ComponentRole,
+    shard_index: Option<u32>,
+    relationship: Option<ComponentRelationship>,
+}
+
+impl ManagedModelStore {
+    fn cached_preview_artifact(&self, source: &ModelPreviewSource) -> Option<CachedArtifact> {
+        let evidence = serde_json::to_string(source).ok()?;
+        self.cache
+            .read_index::<CachedArtifact>(ModelIndexKind::Artifact, &evidence)
+            .filter(|artifact| artifact_matches_source(artifact, source))
+    }
+
+    pub async fn prepare_preview(
+        &self,
+        source: &ModelPreviewSource,
+    ) -> Result<PreparedPreview, InventoryError> {
+        validate_source(source)?;
+        let evidence = serde_json::to_string(source)
+            .map_err(|error| InventoryError::Internal(error.to_string()))?;
+        let cached = self.cached_preview_artifact(source).filter(|artifact| {
+            artifact.components.iter().all(|component| {
+                self.cache
+                    .read_blob(ModelBlobKind::GgufHeader, &component.header_digest)
+                    .is_some()
+            })
+        });
+        let artifact = match cached {
+            Some(artifact) => artifact,
+            None => {
+                let artifact = self.acquire_preview_artifact(source).await?;
+                self.cache
+                    .write_index(ModelIndexKind::Artifact, &evidence, &artifact);
+                artifact
+            }
+        };
+        self.materialize_preview(artifact)
+    }
+
+    pub async fn prepare_preview_from_repository_snapshot(
+        &self,
+        source: &ModelPreviewSource,
+        snapshot: &HuggingFaceRepositorySnapshot,
+    ) -> Result<PreparedPreview, InventoryError> {
+        validate_source(source)?;
+        if snapshot.repository != source.repository || snapshot.commit != source.revision {
+            return Err(InventoryError::Integrity(
+                "repository snapshot does not match the preview source".to_owned(),
+            ));
+        }
+        let evidence = serde_json::to_string(source)
+            .map_err(|error| InventoryError::Internal(error.to_string()))?;
+        let cached = self.cached_preview_artifact(source).filter(|artifact| {
+            artifact.components.iter().all(|component| {
+                self.cache
+                    .read_blob(ModelBlobKind::GgufHeader, &component.header_digest)
+                    .is_some()
+            })
+        });
+        let artifact = match cached {
+            Some(artifact) => artifact,
+            None => {
+                let artifact = self
+                    .acquire_preview_artifact_from_repository_snapshot(source, snapshot)
+                    .await?;
+                self.cache
+                    .write_index(ModelIndexKind::Artifact, &evidence, &artifact);
+                artifact
+            }
+        };
+        self.materialize_preview(artifact)
+    }
+
+    async fn acquire_preview_artifact(
+        &self,
+        source: &ModelPreviewSource,
+    ) -> Result<CachedArtifact, InventoryError> {
+        let metadata = fetch_hub_model(
+            &self.http,
+            self.client.endpoint(),
+            &source.repository,
+            &source.revision,
+            None,
+        )
+        .await?;
+        let HubModelFetch::Modified {
+            model: metadata, ..
+        } = metadata
+        else {
+            return Err(InventoryError::Upstream(
+                "Hugging Face returned not modified without cached metadata".to_owned(),
+            ));
+        };
+        if metadata.siblings.len() > MAX_HUB_SIBLINGS {
+            return Err(InventoryError::Integrity(
+                "Hugging Face metadata contains too many files".to_owned(),
+            ));
+        }
+        let commit = metadata
+            .sha
+            .filter(|commit| commit == &source.revision)
+            .ok_or_else(|| {
+                InventoryError::Integrity(
+                    "preview revision did not resolve to the requested immutable commit".to_owned(),
+                )
+            })?;
+        let selected = select_artifact_components(&metadata.siblings, source)?;
+        let mut components = Vec::with_capacity(selected.len());
+        for selected in selected {
+            let sibling = selected.sibling;
+            let (size, content) = sibling_identity(sibling)?;
+            let component = ModelComponent {
+                path: PathBuf::from(&sibling.rfilename),
+                role: selected.role,
+                size_bytes: size,
+                content,
+                shard_index: selected.shard_index,
+                relationship: selected.relationship,
+            };
+            let header = fetch_header(
+                &self.http,
+                self.client.endpoint(),
+                &source.repository,
+                &commit,
+                &component.path,
+                size,
+            )
+            .await?;
+            let header_digest = format!("{:x}", Sha256::digest(&header));
+            self.cache
+                .write_blob(ModelBlobKind::GgufHeader, &header_digest, &header);
+            components.push(CachedComponent {
+                component,
+                header_digest,
+                acquired_header: Some(header),
+            });
+        }
+        Ok(CachedArtifact {
+            repository: source.repository.clone(),
+            commit,
+            primary_gguf: source.primary_gguf.clone(),
+            components,
+        })
+    }
+
+    async fn acquire_preview_artifact_from_repository_snapshot(
+        &self,
+        source: &ModelPreviewSource,
+        snapshot: &HuggingFaceRepositorySnapshot,
+    ) -> Result<CachedArtifact, InventoryError> {
+        let selected = select_repository_snapshot_components(&snapshot.gguf_files, source)?;
+        let fetched = futures_util::stream::iter(selected.into_iter().enumerate())
+            .map(|(index, component)| async move {
+                let header = fetch_header(
+                    &self.http,
+                    self.client.endpoint(),
+                    &source.repository,
+                    &snapshot.commit,
+                    &component.path,
+                    component.size_bytes,
+                )
+                .await?;
+                let header_digest = format!("{:x}", Sha256::digest(&header));
+                Ok::<_, InventoryError>((
+                    index,
+                    CachedComponent {
+                        component,
+                        header_digest,
+                        acquired_header: Some(header),
+                    },
+                ))
+            })
+            .buffer_unordered(6)
+            .collect::<Vec<_>>()
+            .await;
+        let mut components = fetched
+            .into_iter()
+            .collect::<Result<Vec<_>, InventoryError>>()?;
+        components.sort_by_key(|(index, _)| *index);
+        for (_, component) in &components {
+            if let Some(header) = &component.acquired_header {
+                self.cache
+                    .write_blob(ModelBlobKind::GgufHeader, &component.header_digest, header);
+            }
+        }
+        Ok(CachedArtifact {
+            repository: source.repository.clone(),
+            commit: snapshot.commit.clone(),
+            primary_gguf: source.primary_gguf.clone(),
+            components: components
+                .into_iter()
+                .map(|(_, component)| component)
+                .collect(),
+        })
+    }
+
+    fn materialize_preview(
+        &self,
+        artifact: CachedArtifact,
+    ) -> Result<PreparedPreview, InventoryError> {
+        let workspace = self
+            .cache
+            .workspace()
+            .map_err(|error| InventoryError::Io(error.to_string()))?;
+        for cached in &artifact.components {
+            let bytes = self
+                .cache
+                .read_blob(ModelBlobKind::GgufHeader, &cached.header_digest)
+                .or_else(|| cached.acquired_header.clone())
+                .ok_or_else(|| InventoryError::Internal("preview header cache miss".to_owned()))?;
+            let path = workspace.path().join(&cached.component.path);
+            let parent = path.parent().ok_or_else(|| {
+                InventoryError::InvalidRequest("preview component has no parent".to_owned())
+            })?;
+            fs::create_dir_all(parent).map_err(|error| InventoryError::Io(error.to_string()))?;
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+                .map_err(|error| InventoryError::Io(error.to_string()))?;
+            file.write_all(&bytes)
+                .and_then(|()| {
+                    magnitude_service_utils::sparse_file::set_sparse_len(&file, cached.component.size_bytes)
+                })
+                .map_err(|error| InventoryError::Io(error.to_string()))?;
+        }
+        let components = artifact
+            .components
+            .iter()
+            .map(|component| component.component.clone())
+            .collect::<Vec<_>>();
+        let content = content_id(&components);
+        let source_fingerprint =
+            format!("{}:{}:{}", artifact.repository, artifact.commit, content.0);
+        let id = InventoryEntryId(format!(
+            "mdl_{:x}",
+            Sha256::digest(source_fingerprint.as_bytes())
+        ));
+        let timestamp = now();
+        let location = ModelLocation::Directory {
+            source_id: "remote_preview".to_owned(),
+            root: workspace.path().to_path_buf(),
+            components: components.clone(),
+            total_bytes: components
+                .iter()
+                .map(|component| component.size_bytes)
+                .sum(),
+            integrity: Integrity::Verified {
+                method: "immutable_huggingface_revision_and_header_digest".to_owned(),
+            },
+        };
+        let source = ModelSource::HuggingFace {
+            repository: artifact.repository.clone(),
+            requested_revision: artifact.commit.clone(),
+            commit: artifact.commit.clone(),
+            metadata: None,
+        };
+        let primary = workspace.path().join(&artifact.primary_gguf);
+        let model = build_model(
+            id,
+            content,
+            timestamp,
+            timestamp,
+            source,
+            location,
+            &primary,
+            false,
+            &self.cache,
+        )?;
+        let resolved = ResolvedModel {
+            model,
+            components: components
+                .iter()
+                .map(|component| ResolvedComponent {
+                    path: workspace.path().join(&component.path),
+                    role: component.role.clone(),
+                    shard_index: component.shard_index,
+                    relationship: component.relationship.clone(),
+                })
+                .collect(),
+        };
+        Ok(PreparedPreview {
+            model: resolved,
+            repository: artifact.repository,
+            commit: artifact.commit,
+            components,
+            headers: artifact
+                .components
+                .iter()
+                .map(|component| PreparedPreviewHeader {
+                    path: component.component.path.clone(),
+                    digest: component.header_digest.clone(),
+                })
+                .collect(),
+            artifact_fingerprint: source_fingerprint,
+            _workspace: workspace,
+        })
+    }
+}
+
+fn validate_source(source: &ModelPreviewSource) -> Result<(), InventoryError> {
+    let valid_repository = valid_repository(&source.repository);
+    let valid_revision = (40..=64).contains(&source.revision.len())
+        && source
+            .revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    let valid_path = valid_gguf_path(&source.primary_gguf);
+    let mut selected_paths = std::collections::BTreeSet::from([&source.primary_gguf]);
+    let valid_additional = source.additional_components.len() < MAX_MODEL_COMPONENTS as usize
+        && source.additional_components.iter().all(|component| {
+            valid_gguf_path(&component.path)
+                && !is_split_path(&component.path)
+                && selected_paths.insert(&component.path)
+        });
+    if valid_repository && valid_revision && valid_path && valid_additional {
+        Ok(())
+    } else {
+        Err(InventoryError::InvalidRequest(
+            "preview requires owner/repository, an immutable hexadecimal commit, and unique relative GGUF components with supported execution roles"
+                .to_owned(),
+        ))
+    }
+}
+
+fn valid_repository(repository: &str) -> bool {
+    let mut parts = repository.split('/');
+    parts.next().is_some_and(valid_repository_part)
+        && parts.next().is_some_and(valid_repository_part)
+        && parts.next().is_none()
+}
+
+fn valid_repository_part(part: &str) -> bool {
+    !part.is_empty()
+        && part != "."
+        && part != ".."
+        && part
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_hub_revision(revision: &str) -> bool {
+    !revision.is_empty()
+        && revision.len() <= 200
+        && revision != "."
+        && revision != ".."
+        && revision
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
+        && revision
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+fn valid_gguf_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && path.is_relative()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+}
+
+fn artifact_matches_source(artifact: &CachedArtifact, source: &ModelPreviewSource) -> bool {
+    if artifact.repository != source.repository
+        || artifact.commit != source.revision
+        || artifact.primary_gguf != source.primary_gguf
+    {
+        return false;
+    }
+    let primary_paths = if let Some((prefix, total)) = split_parts(&source.primary_gguf) {
+        let parent = source
+            .primary_gguf
+            .parent()
+            .unwrap_or_else(|| Path::new(""));
+        (1..=total)
+            .map(|index| parent.join(format!("{prefix}-{index:05}-of-{total:05}.gguf")))
+            .collect::<Vec<_>>()
+    } else {
+        vec![source.primary_gguf.clone()]
+    };
+    if artifact.components.len() != primary_paths.len() + source.additional_components.len() {
+        return false;
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    let structurally_valid = artifact.components.iter().all(|cached| {
+        cached.component.size_bytes > 0
+            && valid_hex_digest(&cached.header_digest, 64, 64)
+            && valid_published_identity(&cached.component.content)
+            && paths.insert(&cached.component.path)
+    });
+    let primary_valid = primary_paths.iter().enumerate().all(|(index, path)| {
+        artifact.components.iter().any(|cached| {
+            cached.component.path == *path
+                && if primary_paths.len() == 1 {
+                    cached.component.role == ComponentRole::Weights
+                        && cached.component.shard_index.is_none()
+                } else {
+                    cached.component.role == ComponentRole::Shard
+                        && cached.component.shard_index == Some(index as u32 + 1)
+                }
+        })
+    });
+    let additional_valid = source.additional_components.iter().all(|expected| {
+        artifact.components.iter().any(|cached| {
+            cached.component.path == expected.path
+                && cached.component.role == expected.role.component_role()
+                && cached.component.shard_index.is_none()
+                && cached.component.relationship
+                    == Some(component_relationship(expected, &source.primary_gguf))
+        })
+    });
+    structurally_valid && primary_valid && additional_valid
+}
+
+fn is_split_path(path: &Path) -> bool {
+    split_parts(path).is_some()
+}
+
+fn split_parts(path: &Path) -> Option<(String, u32)> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".gguf")?;
+    let (left, total) = stem.rsplit_once("-of-")?;
+    let (prefix, index) = left.rsplit_once('-')?;
+    if index != "00001" || total.len() != 5 {
+        return None;
+    }
+    let total = total.parse().ok()?;
+    (1..=MAX_MODEL_COMPONENTS)
+        .contains(&total)
+        .then(|| (prefix.to_owned(), total))
+}
+
+fn select_components<'a>(
+    siblings: &'a [HubSibling],
+    primary: &Path,
+) -> Result<Vec<&'a HubSibling>, InventoryError> {
+    if let Some((prefix, total)) = split_parts(primary) {
+        let parent = primary.parent().unwrap_or_else(|| Path::new(""));
+        return (1..=total)
+            .map(|index| {
+                let path = parent.join(format!("{prefix}-{index:05}-of-{total:05}.gguf"));
+                siblings
+                    .iter()
+                    .find(|sibling| Path::new(&sibling.rfilename) == path)
+                    .ok_or_else(|| {
+                        InventoryError::Integrity(format!(
+                            "missing preview shard {}",
+                            path.display()
+                        ))
+                    })
+            })
+            .collect();
+    }
+    siblings
+        .iter()
+        .find(|sibling| Path::new(&sibling.rfilename) == primary)
+        .map(|sibling| vec![sibling])
+        .ok_or_else(|| InventoryError::Integrity("preview GGUF does not exist".to_owned()))
+}
+
+fn select_artifact_components<'a>(
+    siblings: &'a [HubSibling],
+    source: &ModelPreviewSource,
+) -> Result<Vec<SelectedComponent<'a>>, InventoryError> {
+    let split = is_split_path(&source.primary_gguf);
+    let mut selected = select_components(siblings, &source.primary_gguf)?
+        .into_iter()
+        .enumerate()
+        .map(|(index, sibling)| SelectedComponent {
+            sibling,
+            role: if split {
+                ComponentRole::Shard
+            } else {
+                ComponentRole::Weights
+            },
+            shard_index: split.then_some(index as u32 + 1),
+            relationship: None,
+        })
+        .collect::<Vec<_>>();
+    for additional in &source.additional_components {
+        let sibling = siblings
+            .iter()
+            .find(|sibling| Path::new(&sibling.rfilename) == additional.path)
+            .ok_or_else(|| {
+                InventoryError::Integrity(format!(
+                    "preview component {} does not exist",
+                    additional.path.display()
+                ))
+            })?;
+        selected.push(SelectedComponent {
+            sibling,
+            role: additional.role.component_role(),
+            shard_index: None,
+            relationship: Some(component_relationship(additional, &source.primary_gguf)),
+        });
+    }
+    if selected.len() > MAX_MODEL_COMPONENTS as usize {
+        return Err(InventoryError::Integrity(
+            "preview artifact contains too many selected components".to_owned(),
+        ));
+    }
+    Ok(selected)
+}
+
+fn select_repository_snapshot_components(
+    files: &[HuggingFaceRepositoryFile],
+    source: &ModelPreviewSource,
+) -> Result<Vec<ModelComponent>, InventoryError> {
+    let primary_paths = if let Some((prefix, total)) = split_parts(&source.primary_gguf) {
+        let parent = source
+            .primary_gguf
+            .parent()
+            .unwrap_or_else(|| Path::new(""));
+        (1..=total)
+            .map(|index| parent.join(format!("{prefix}-{index:05}-of-{total:05}.gguf")))
+            .collect::<Vec<_>>()
+    } else {
+        vec![source.primary_gguf.clone()]
+    };
+    let mut selected = primary_paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let file = files
+                .iter()
+                .find(|file| file.path == *path)
+                .ok_or_else(|| {
+                    InventoryError::Integrity(format!(
+                        "preview GGUF {} does not exist in the repository snapshot",
+                        path.display()
+                    ))
+                })?;
+            Ok(ModelComponent {
+                path: file.path.clone(),
+                role: if primary_paths.len() == 1 {
+                    ComponentRole::Weights
+                } else {
+                    ComponentRole::Shard
+                },
+                size_bytes: file.size_bytes,
+                content: file.content.clone(),
+                shard_index: (primary_paths.len() > 1).then_some(index as u32 + 1),
+                relationship: None,
+            })
+        })
+        .collect::<Result<Vec<_>, InventoryError>>()?;
+    for additional in &source.additional_components {
+        let file = files
+            .iter()
+            .find(|file| file.path == additional.path)
+            .ok_or_else(|| {
+                InventoryError::Integrity(format!(
+                    "preview component {} does not exist in the repository snapshot",
+                    additional.path.display()
+                ))
+            })?;
+        selected.push(ModelComponent {
+            path: file.path.clone(),
+            role: additional.role.component_role(),
+            size_bytes: file.size_bytes,
+            content: file.content.clone(),
+            shard_index: None,
+            relationship: Some(component_relationship(additional, &source.primary_gguf)),
+        });
+    }
+    if selected.len() > MAX_MODEL_COMPONENTS as usize {
+        return Err(InventoryError::Integrity(
+            "preview artifact contains too many selected components".to_owned(),
+        ));
+    }
+    Ok(selected)
+}
+
+fn component_relationship(
+    component: &magnitude_service_contracts::ModelPreviewComponentSource,
+    primary: &Path,
+) -> ComponentRelationship {
+    match &component.role {
+        magnitude_service_contracts::ModelPreviewComponentRole::Projector => {
+            ComponentRelationship::ProjectorFor {
+                projector: component.path.clone(),
+                model: primary.to_path_buf(),
+            }
+        }
+        magnitude_service_contracts::ModelPreviewComponentRole::Draft { method } => {
+            ComponentRelationship::DraftFor {
+                draft: component.path.clone(),
+                model: primary.to_path_buf(),
+                method: method.clone(),
+            }
+        }
+        magnitude_service_contracts::ModelPreviewComponentRole::Mtp => ComponentRelationship::MtpFor {
+            mtp: component.path.clone(),
+            model: primary.to_path_buf(),
+        },
+    }
+}
+
+fn sibling_identity(sibling: &HubSibling) -> Result<(u64, ContentIdentity), InventoryError> {
+    if let Some(lfs) = sibling.lfs.as_ref() {
+        validate_component_size(&sibling.rfilename, lfs.size)?;
+        if sibling.size.is_some_and(|size| size != lfs.size)
+            || !valid_hex_digest(&lfs.sha256, 64, 64)
+        {
+            return Err(InventoryError::Integrity(format!(
+                "{} has inconsistent LFS identity metadata",
+                sibling.rfilename
+            )));
+        }
+        return Ok((
+            lfs.size,
+            ContentIdentity::Sha256 {
+                value: lfs.sha256.to_ascii_lowercase(),
+            },
+        ));
+    }
+    let size = sibling.size.ok_or_else(|| {
+        InventoryError::Integrity(format!("{} has no published size", sibling.rfilename))
+    })?;
+    validate_component_size(&sibling.rfilename, size)?;
+    let oid = sibling.blob_id.clone().ok_or_else(|| {
+        InventoryError::Integrity(format!("{} has no content identity", sibling.rfilename))
+    })?;
+    if !valid_hex_digest(&oid, 40, 64) {
+        return Err(InventoryError::Integrity(format!(
+            "{} has an invalid Git object identity",
+            sibling.rfilename
+        )));
+    }
+    Ok((size, ContentIdentity::GitOid { value: oid }))
+}
+
+fn valid_hex_digest(value: &str, minimum: usize, maximum: usize) -> bool {
+    (minimum..=maximum).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_published_identity(identity: &ContentIdentity) -> bool {
+    match identity {
+        ContentIdentity::Sha256 { value } => valid_hex_digest(value, 64, 64),
+        ContentIdentity::GitOid { value } => valid_hex_digest(value, 40, 64),
+        _ => false,
+    }
+}
+
+fn validate_component_size(path: &str, size: u64) -> Result<(), InventoryError> {
+    if size == 0 || size > MAX_COMPONENT_LOGICAL_BYTES {
+        return Err(InventoryError::Integrity(format!(
+            "{path} has an invalid logical size"
+        )));
+    }
+    Ok(())
+}
+
+async fn bounded_response_bytes(
+    mut response: reqwest::Response,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>, InventoryError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum_bytes as u64)
+    {
+        return Err(InventoryError::Upstream(
+            "upstream metadata response exceeds its size bound".to_owned(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or(0),
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| InventoryError::Upstream(error.to_string()))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > maximum_bytes {
+            return Err(InventoryError::Upstream(
+                "upstream metadata response exceeds its size bound".to_owned(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn fetch_header(
+    http: &reqwest::Client,
+    endpoint: &str,
+    repository: &str,
+    commit: &str,
+    path: &Path,
+    logical_size: u64,
+) -> Result<Vec<u8>, InventoryError> {
+    let mut url = reqwest::Url::parse(endpoint)
+        .map_err(|error| InventoryError::Internal(error.to_string()))?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|()| InventoryError::Internal("invalid hub endpoint".to_owned()))?;
+        segments.pop_if_empty();
+        for segment in repository.split('/') {
+            segments.push(segment);
+        }
+        segments.push("resolve").push(commit);
+        for component in path.components() {
+            if let std::path::Component::Normal(segment) = component {
+                segments.push(&segment.to_string_lossy());
+            }
+        }
+    }
+
+    let mut target_length =
+        INITIAL_HEADER_BYTES.min(usize::try_from(logical_size).unwrap_or(usize::MAX));
+    let mut bytes = Vec::with_capacity(target_length);
+    loop {
+        let range_start = bytes.len();
+        let range_length = target_length.saturating_sub(range_start);
+        let range = format!("bytes={range_start}-{}", target_length.saturating_sub(1));
+        let token = hub_token();
+        let mut response = send_hub_request(|| {
+            let mut request = http.get(url.clone()).header(RANGE, &range);
+            if let Some(token) = &token {
+                request = request.bearer_auth(token);
+            }
+            request
+        })
+        .await?;
+        if !response.status().is_success() {
+            return Err(InventoryError::Upstream(format!(
+                "GGUF header request returned HTTP {}",
+                response.status()
+            )));
+        }
+        let expected_start = u64::try_from(range_start)
+            .map_err(|_| InventoryError::Internal("range length overflow".to_owned()))?;
+        let expected_length = u64::try_from(range_length)
+            .map_err(|_| InventoryError::Internal("range length overflow".to_owned()))?;
+        let expected_end = u64::try_from(target_length)
+            .map_err(|_| InventoryError::Internal("range length overflow".to_owned()))?;
+        let complete_response = expected_start == 0
+            && expected_end == logical_size
+            && response.status().as_u16() == 200;
+        let valid_partial = response.status().as_u16() == 206
+            && response
+                .headers()
+                .get(CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| {
+                    valid_content_range(value, expected_start, expected_end, logical_size)
+                });
+        if !complete_response && !valid_partial {
+            return Err(InventoryError::Upstream(
+                "GGUF source did not honor the exact bounded range request".to_owned(),
+            ));
+        }
+        if response.content_length() != Some(expected_length) {
+            return Err(InventoryError::Upstream(
+                "GGUF header response length did not match its content range".to_owned(),
+            ));
+        }
+        let previous_length = bytes.len();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| InventoryError::Upstream(error.to_string()))?
+        {
+            if bytes.len().saturating_add(chunk.len()) > target_length {
+                return Err(InventoryError::Upstream(
+                    "GGUF header response exceeded its requested range".to_owned(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.len().saturating_sub(previous_length) != range_length {
+            return Err(InventoryError::Upstream(
+                "GGUF header response ended before its requested range".to_owned(),
+            ));
+        }
+        let temporary = tempfile::NamedTempFile::new()
+            .map_err(|error| InventoryError::Io(error.to_string()))?;
+        fs::write(temporary.path(), &bytes)
+            .map_err(|error| InventoryError::Io(error.to_string()))?;
+        match crate::gguf::inspect(temporary.path()) {
+            Ok(inspection) => {
+                let header_length = usize::try_from(inspection.header_bytes).map_err(|_| {
+                    InventoryError::Integrity("GGUF header is too large".to_owned())
+                })?;
+                if header_length > bytes.len() {
+                    return Err(InventoryError::Integrity(
+                        "GGUF header response ended before its aligned data offset".to_owned(),
+                    ));
+                }
+                bytes.truncate(header_length);
+                return Ok(bytes);
+            }
+            Err(_)
+                if target_length < MAX_HEADER_BYTES
+                    && u64::try_from(target_length).is_ok_and(|value| value < logical_size) =>
+            {
+                target_length = target_length
+                    .saturating_mul(2)
+                    .min(MAX_HEADER_BYTES)
+                    .min(usize::try_from(logical_size).unwrap_or(usize::MAX));
+            }
+            Err(error) => return Err(InventoryError::Integrity(error.to_string())),
+        }
+    }
+}
+
+fn valid_content_range(
+    value: &str,
+    expected_start: u64,
+    expected_end: u64,
+    logical_size: u64,
+) -> bool {
+    let Some(value) = value.strip_prefix("bytes ") else {
+        return false;
+    };
+    let Some((range, total)) = value.split_once('/') else {
+        return false;
+    };
+    let Some((start, end)) = range.split_once('-') else {
+        return false;
+    };
+    start.parse::<u64>().ok() == Some(expected_start)
+        && end.parse::<u64>().ok() == expected_end.checked_sub(1)
+        && total.parse::<u64>().ok() == Some(logical_size)
+}
+
+fn hub_token() -> Option<String> {
+    std::env::var("HF_TOKEN")
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use magnitude_service_contracts::LocalDeclaration;
+
+    #[test]
+    fn hub_coordinates_reject_path_traversal_but_allow_branch_names() {
+        assert!(valid_repository("owner/model.gguf"));
+        assert!(!valid_repository("../model"));
+        assert!(!valid_repository("owner/model/extra"));
+        assert!(valid_hub_revision("refs/pr/123"));
+        assert!(valid_hub_revision("feature/catalog-v2"));
+        assert!(!valid_hub_revision("../main"));
+        assert!(!valid_hub_revision("main?blobs=true"));
+    }
+
+    #[test]
+    fn hub_snapshot_pins_symbolic_revisions_and_preserves_immutable_requests() {
+        let commit = "a".repeat(40);
+        assert!(validate_snapshot_revision("main", &commit).is_ok());
+        assert!(validate_snapshot_revision(&commit, &commit).is_ok());
+        assert!(validate_snapshot_revision(&"b".repeat(40), &commit).is_err());
+    }
+
+    #[test]
+    fn hub_snapshot_keeps_only_identified_gguf_files_and_live_metadata() {
+        let snapshot = HubModel {
+            id: Some("owner/model-gguf".to_owned()),
+            sha: Some("b".repeat(40)),
+            last_modified: None,
+            downloads: Some(11),
+            likes: Some(3),
+            gated: Some(serde_json::Value::String("manual".to_owned())),
+            private: Some(false),
+            tags: vec![
+                "gguf".to_owned(),
+                "license:apache-2.0".to_owned(),
+                "base_model:quantized:owner/base".to_owned(),
+            ],
+            card_data: Some(serde_json::json!({
+                "license": "apache-2.0",
+                "license_link": "https://example.invalid/license",
+                "base_model": ["owner/base"]
+            })),
+            siblings: vec![
+                HubSibling {
+                    rfilename: "model-Q4_K_M.gguf".to_owned(),
+                    size: Some(123),
+                    blob_id: Some("c".repeat(40)),
+                    lfs: Some(HubLfs {
+                        sha256: "d".repeat(64),
+                        size: 123,
+                    }),
+                },
+                HubSibling {
+                    rfilename: "README.md".to_owned(),
+                    size: Some(5),
+                    blob_id: Some("e".repeat(40)),
+                    lfs: None,
+                },
+            ],
+        }
+        .into_snapshot("owner/model-gguf".to_owned(), &"b".repeat(40))
+        .unwrap();
+
+        assert_eq!(snapshot.commit, "b".repeat(40));
+        assert!(snapshot.gated);
+        assert_eq!(snapshot.license.as_deref(), Some("apache-2.0"));
+        assert_eq!(snapshot.base_models, vec!["owner/base"]);
+        assert_eq!(snapshot.gguf_files.len(), 1);
+        assert_eq!(snapshot.gguf_files[0].size_bytes, 123);
+        assert!(matches!(
+            snapshot.gguf_files[0].content,
+            ContentIdentity::Sha256 { .. }
+        ));
+    }
+
+    #[test]
+    fn repository_snapshot_supplies_exact_preview_components_without_metadata_refetch() {
+        let source = ModelPreviewSource {
+            repository: "owner/model-gguf".to_owned(),
+            revision: "a".repeat(40),
+            primary_gguf: PathBuf::from("model-00001-of-00002.gguf"),
+            additional_components: Vec::new(),
+        };
+        let files = vec![
+            HuggingFaceRepositoryFile {
+                path: PathBuf::from("model-00001-of-00002.gguf"),
+                size_bytes: 10,
+                content: ContentIdentity::Sha256 {
+                    value: "b".repeat(64),
+                },
+            },
+            HuggingFaceRepositoryFile {
+                path: PathBuf::from("model-00002-of-00002.gguf"),
+                size_bytes: 20,
+                content: ContentIdentity::Sha256 {
+                    value: "c".repeat(64),
+                },
+            },
+        ];
+
+        let selected = select_repository_snapshot_components(&files, &source).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].role, ComponentRole::Shard);
+        assert_eq!(selected[0].shard_index, Some(1));
+        assert_eq!(selected[1].shard_index, Some(2));
+        assert_eq!(selected[1].size_bytes, 20);
+    }
+
+    fn sibling(path: &str, size: u64) -> HubSibling {
+        HubSibling {
+            rfilename: path.to_owned(),
+            size: Some(size),
+            blob_id: Some("a".repeat(40)),
+            lfs: None,
+        }
+    }
+
+    #[test]
+    fn source_validation_requires_an_immutable_commit_and_safe_gguf_path() {
+        let valid = ModelPreviewSource {
+            repository: "owner/repository".to_owned(),
+            revision: "a".repeat(40),
+            primary_gguf: PathBuf::from("models/model.gguf"),
+            additional_components: Vec::new(),
+        };
+        assert!(validate_source(&valid).is_ok());
+        assert!(
+            validate_source(&ModelPreviewSource {
+                revision: "main".to_owned(),
+                ..valid.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_source(&ModelPreviewSource {
+                primary_gguf: PathBuf::from("../model.gguf"),
+                ..valid
+            })
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_preview_survives_an_unusable_persistent_cache() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("model-store");
+        let cache_root = temporary.path().join("cache");
+        let mut config =
+            crate::inventory::InventoryConfig::with_roots(store.clone(), cache_root.clone())
+                .unwrap();
+        config.hf_cache_dirs.clear();
+        let manager = ManagedModelStore::open(config).await.unwrap();
+        let _ = fs::remove_dir_all(&cache_root);
+        fs::write(&cache_root, b"not a directory").unwrap();
+
+        let mut header = Vec::new();
+        header.extend_from_slice(b"GGUF");
+        header.extend_from_slice(&3_u32.to_le_bytes());
+        header.extend_from_slice(&0_u64.to_le_bytes());
+        header.extend_from_slice(&0_u64.to_le_bytes());
+        header.resize(32, 0);
+        let header_digest = format!("{:x}", Sha256::digest(&header));
+        let prepared = manager
+            .materialize_preview(CachedArtifact {
+                repository: "owner/repository".to_owned(),
+                commit: "a".repeat(40),
+                primary_gguf: PathBuf::from("model.gguf"),
+                components: vec![CachedComponent {
+                    component: ModelComponent {
+                        path: PathBuf::from("model.gguf"),
+                        role: ComponentRole::Weights,
+                        size_bytes: header.len() as u64,
+                        content: ContentIdentity::Sha256 {
+                            value: header_digest.clone(),
+                        },
+                        shard_index: None,
+                        relationship: None,
+                    },
+                    header_digest,
+                    acquired_header: Some(header),
+                }],
+            })
+            .unwrap();
+        assert!(matches!(
+            prepared.model.model.properties,
+            magnitude_service_contracts::InventoryProperties::Inspected { .. }
+        ));
+    }
+
+    #[test]
+    fn sharded_preview_resolves_the_complete_ordered_set() {
+        let siblings = vec![
+            sibling("weights/model-00002-of-00003.gguf", 2),
+            sibling("weights/model-00001-of-00003.gguf", 1),
+            sibling("weights/model-00003-of-00003.gguf", 3),
+            sibling("weights/unrelated.gguf", 4),
+        ];
+        let selected =
+            select_components(&siblings, Path::new("weights/model-00001-of-00003.gguf")).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|item| item.rfilename.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "weights/model-00001-of-00003.gguf",
+                "weights/model-00002-of-00003.gguf",
+                "weights/model-00003-of-00003.gguf",
+            ]
+        );
+
+        let incomplete = vec![
+            sibling("model-00001-of-00002.gguf", 1),
+            sibling("other.gguf", 2),
+        ];
+        assert!(select_components(&incomplete, Path::new("model-00001-of-00002.gguf")).is_err());
+    }
+
+    #[test]
+    fn preview_selects_explicit_execution_companions_with_typed_relationships() {
+        let siblings = vec![
+            sibling("model.gguf", 1),
+            sibling("projector.gguf", 2),
+            sibling("draft.gguf", 3),
+        ];
+        let source = ModelPreviewSource {
+            repository: "owner/repository".to_owned(),
+            revision: "a".repeat(40),
+            primary_gguf: PathBuf::from("model.gguf"),
+            additional_components: vec![
+                magnitude_service_contracts::ModelPreviewComponentSource {
+                    path: PathBuf::from("projector.gguf"),
+                    role: magnitude_service_contracts::ModelPreviewComponentRole::Projector,
+                },
+                magnitude_service_contracts::ModelPreviewComponentSource {
+                    path: PathBuf::from("draft.gguf"),
+                    role: magnitude_service_contracts::ModelPreviewComponentRole::Draft {
+                        method: magnitude_service_contracts::models::SpeculativeMethod::DFlash,
+                    },
+                },
+            ],
+        };
+        validate_source(&source).unwrap();
+        let selected = select_artifact_components(&siblings, &source).unwrap();
+        assert_eq!(selected.len(), 3);
+        assert_eq!(selected[0].role, ComponentRole::Weights);
+        assert!(matches!(
+            selected[1].relationship,
+            Some(ComponentRelationship::ProjectorFor { .. })
+        ));
+        assert!(matches!(
+            selected[2].relationship,
+            Some(ComponentRelationship::DraftFor { .. })
+        ));
+
+        let duplicate = ModelPreviewSource {
+            additional_components: vec![magnitude_service_contracts::ModelPreviewComponentSource {
+                path: PathBuf::from("model.gguf"),
+                role: magnitude_service_contracts::ModelPreviewComponentRole::Mtp,
+            }],
+            ..source
+        };
+        assert!(validate_source(&duplicate).is_err());
+    }
+
+    #[test]
+    fn content_identity_prefers_published_lfs_digest() {
+        let sibling = HubSibling {
+            rfilename: "model.gguf".to_owned(),
+            size: Some(42),
+            blob_id: Some("git-oid".to_owned()),
+            lfs: Some(HubLfs {
+                sha256: "a".repeat(64),
+                size: 42,
+            }),
+        };
+        assert_eq!(
+            sibling_identity(&sibling).unwrap(),
+            (
+                42,
+                ContentIdentity::Sha256 {
+                    value: "a".repeat(64)
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn content_range_must_cover_the_exact_prefix_and_logical_file() {
+        assert!(valid_content_range("bytes 0-1023/4096", 0, 1024, 4096));
+        assert!(valid_content_range(
+            "bytes 1024-2047/4096",
+            1024,
+            2048,
+            4096
+        ));
+        assert!(!valid_content_range("bytes 1-1024/4096", 0, 1024, 4096));
+        assert!(!valid_content_range("bytes 0-1024/4096", 0, 1024, 4096));
+        assert!(!valid_content_range("bytes 0-1023/8192", 0, 1024, 4096));
+    }
+
+    #[test]
+    fn retries_only_rate_limits_and_server_failures() {
+        assert!(retryable_hub_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(retryable_hub_status(reqwest::StatusCode::BAD_GATEWAY));
+        assert!(!retryable_hub_status(reqwest::StatusCode::NOT_FOUND));
+        assert!(!retryable_hub_status(reqwest::StatusCode::UNAUTHORIZED));
+    }
+
+    #[tokio::test]
+    async fn sparse_preview_headers_produce_the_same_properties_as_complete_models() {
+        use std::io::Read;
+
+        let inference_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let fixtures = [
+            inference_root.join("target/parity-models/tinyllamas/stories15M-q4_0.gguf"),
+            inference_root
+                .join("target/parity-models/qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"),
+        ];
+        let fixtures = fixtures
+            .into_iter()
+            .filter(|path| path.is_file())
+            .collect::<Vec<_>>();
+        if fixtures.is_empty() {
+            return;
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let mut config = crate::inventory::InventoryConfig::with_roots(
+            temporary.path().join("model-store"),
+            temporary.path().join("cache"),
+        )
+        .unwrap();
+        config.hf_cache_dirs.clear();
+        let manager = ManagedModelStore::open(config).await.unwrap();
+
+        for (index, fixture) in fixtures.into_iter().enumerate() {
+            let inspection = crate::gguf::inspect(&fixture).unwrap();
+            let mut header = vec![0_u8; usize::try_from(inspection.header_bytes).unwrap()];
+            std::fs::File::open(&fixture)
+                .unwrap()
+                .read_exact(&mut header)
+                .unwrap();
+            let header_digest = format!("{:x}", Sha256::digest(&header));
+            manager
+                .cache
+                .write_blob(ModelBlobKind::GgufHeader, &header_digest, &header);
+            let relative =
+                PathBuf::from(fixture.file_name().and_then(|name| name.to_str()).unwrap());
+            let preview_component = ModelComponent {
+                path: relative.clone(),
+                role: ComponentRole::Weights,
+                size_bytes: fixture.metadata().unwrap().len(),
+                content: ContentIdentity::FileIdentity {
+                    value: format!("fixture-{index}"),
+                },
+                shard_index: None,
+                relationship: None,
+            };
+            let prepared = manager
+                .materialize_preview(CachedArtifact {
+                    repository: "test/fixtures".to_owned(),
+                    commit: format!("{index:040x}"),
+                    primary_gguf: relative,
+                    components: vec![CachedComponent {
+                        component: preview_component.clone(),
+                        header_digest,
+                        acquired_header: None,
+                    }],
+                })
+                .unwrap();
+
+            let full_component = ModelComponent {
+                path: fixture.clone(),
+                ..preview_component
+            };
+            let full = build_model(
+                InventoryEntryId(format!("mdl_{index:064x}")),
+                content_id(std::slice::from_ref(&full_component)),
+                1,
+                1,
+                ModelSource::Local {
+                    declared_by: LocalDeclaration::Discovery,
+                },
+                ModelLocation::File {
+                    path: fixture.clone(),
+                    component: full_component,
+                    integrity: Integrity::Unverified {
+                        reason: "test fixture".to_owned(),
+                    },
+                },
+                &fixture,
+                false,
+                &manager.cache,
+            )
+            .unwrap();
+            assert_eq!(
+                prepared.model.model.properties,
+                full.properties,
+                "preview metadata diverged for {}",
+                fixture.display()
+            );
+        }
+    }
+}

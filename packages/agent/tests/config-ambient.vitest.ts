@@ -41,8 +41,8 @@ describe('agent model configuration boundary', () => {
     ['not loaded', { _tag: 'Unloaded' as const }],
     ['loading', {
       _tag: 'Loading' as const,
-      stage: 'loading' as const,
-      progress: Option.some(0.42),
+      stage: 'loading_weights' as const,
+      fraction: 0.42,
       plannedAllocation: Option.none(),
     }],
     ['stopping', {

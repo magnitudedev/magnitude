@@ -22,8 +22,6 @@ const descriptor = {
 }
 const allocation = {
   contextWindowTokens: 200_000,
-  parallelSequences: 3,
-  physicalContextTokens: 600_000,
   memoryDomains: [],
 }
 
@@ -45,7 +43,7 @@ describe("current local model derivation", () => {
     })
   })
 
-  it("uses only the allocation owned by the exact ready instance", () => {
+  it("reads the context window from the exact ready instance", () => {
     const current = deriveCurrentLocalModel(Option.some(new ModelSlotConfiguredLocal({
       slotId: PRIMARY_SLOT_ID,
       selection,
@@ -60,7 +58,7 @@ describe("current local model derivation", () => {
 
     expect(current).toMatchObject({
       _tag: "Running",
-      allocation: { parallelSequences: 3, physicalContextTokens: 600_000 },
+      contextWindow: { _tag: "Some", value: 200_000 },
     })
   })
 })
