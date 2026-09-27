@@ -440,15 +440,22 @@ export const ModelReleaseReasonSchema = Schema.Literal(
 )
 export type ModelReleaseReason = typeof ModelReleaseReasonSchema.Type
 
+export const ModelLoadStageSchema = Schema.Literal(
+  "queued",
+  "preparing",
+  "optimizing",
+  "loading_weights",
+  "finalizing",
+)
+export type ModelLoadStage = typeof ModelLoadStageSchema.Type
+
 export const ModelResidencySchema = Schema.Union(
   Schema.TaggedStruct("Unloaded", {}),
   Schema.TaggedStruct("Requested", {}),
   Schema.TaggedStruct("Loading", {
-    stage: Schema.Literal("queued", "resolving", "unloading", "loading", "verifying"),
-    progress: Schema.optionalWith(Schema.Number.pipe(Schema.finite(), Schema.between(0, 1)), {
-      as: "Option",
-      exact: true,
-    }),
+    stage: ModelLoadStageSchema,
+    /** Completed fraction by measured work: tuning (when the load tunes) fills the first half. */
+    fraction: Schema.Number.pipe(Schema.finite(), Schema.between(0, 1)),
     plannedAllocation: Schema.optionalWith(ModelLoadPlanSchema, { as: "Option", exact: true }),
   }),
   Schema.TaggedStruct("Ready", {

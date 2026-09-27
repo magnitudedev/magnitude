@@ -28,7 +28,7 @@ use magnitude_family_contracts::{
 use magnitude_kernels::embedding_rows;
 use seismic::{
     BackendName, BoundNativeGraphPlan, Device, Element, NativeGraphFamily, NativeGraphMetadata,
-    NativeGraphPlan, NativeGraphStorageBytes, NativePort, WorkflowTensor,
+    NativeGraphPlan, NativeGraphResourceTemplate, NativeGraphStorageBytes, NativePort, WorkflowTensor,
 };
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -61,6 +61,23 @@ fn block_class(mixer: &MixerGeometry, rows: u64, segments: u64, slots: u64) -> B
         MixerGeometry::Attention(_) => (rows, segments, 1),
         MixerGeometry::Recurrent(_) => (rows, 1, slots),
     }
+}
+
+fn recurrent_scoped_dimensions(
+    feedforward: &FeedForwardGeometry,
+    rows: u64,
+) -> Result<Vec<(&'static str, &'static str, u64)>, String> {
+    let FeedForwardGeometry::Routed(shape) = feedforward else {
+        return Ok(Vec::new());
+    };
+    if rows <= super::graph::routed::DECODE_ROWS {
+        return Ok(Vec::new());
+    }
+    let blocks = super::graph::routed::grouped_blocks(rows, shape.count, shape.selected)?;
+    Ok(["routed_group", "routed_experts", "routed_combine"]
+        .into_iter()
+        .map(|entry| (entry, "B", blocks))
+        .collect())
 }
 
 #[derive(Clone)]
@@ -793,8 +810,8 @@ impl PreparedTargetBlockGraph {
 /// without forming kernels or allocating device storage. Both routes call the
 /// same attention, recurrent, dense and routed graph constructors.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn checked_block_graph_resources(
-    backend: BackendName,
+fn checked_block_graph_draft(
+    mut graph: NativeGraphMetadata,
     load: &ModelLoadPlan,
     geometry: &DecoderGeometry,
     state: &StateResourcePlan,
@@ -804,7 +821,7 @@ pub(crate) fn checked_block_graph_resources(
     segments: u64,
     slots: u64,
     history_rows: u64,
-) -> Result<(NativeGraphStorageBytes, Vec<GraphConstant>), String> {
+) -> Result<(NativeGraphMetadata, Vec<GraphConstant>), String> {
     let block = geometry
         .blocks
         .get(block_index)
@@ -812,10 +829,15 @@ pub(crate) fn checked_block_graph_resources(
     let scope = WeightScope::TargetBlock(
         u32::try_from(block_index).map_err(|_| "target block index exceeds u32")?,
     );
-    let mut graph = NativeGraphMetadata::new(backend);
     let mut weights = Vec::new();
     let mut constants = Vec::new();
-    let hidden = GraphDraft::port(&mut graph, Element::f32(), &[rows, geometry.hidden])?;
+    let hidden = GraphDraft::port_with_class_extent(
+        &mut graph,
+        Element::f32(),
+        &[rows, geometry.hidden],
+        0,
+        "M",
+    )?;
     let component_index = geometry.blocks[..block_index]
         .iter()
         .filter(|block| matches!(block.mixer, MixerGeometry::Recurrent(_)))
@@ -917,6 +939,26 @@ pub(crate) fn checked_block_graph_resources(
         _ => return Err("target block geometry and planned feed-forward disagree".into()),
     };
     GraphDraft::export(&mut graph, &output)?;
+    Ok((graph, constants))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn checked_block_graph_resources(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    geometry: &DecoderGeometry,
+    state: &StateResourcePlan,
+    slot: TargetBlockProgramSlot,
+    block_index: usize,
+    rows: u64,
+    segments: u64,
+    slots: u64,
+    history_rows: u64,
+) -> Result<(NativeGraphStorageBytes, Vec<GraphConstant>), String> {
+    let (graph, constants) = checked_block_graph_draft(
+        NativeGraphMetadata::new(backend), load, geometry, state, slot,
+        block_index, rows, segments, slots, history_rows,
+    )?;
     Ok((GraphDraft::seal(graph)?, constants))
 }
 
@@ -946,6 +988,11 @@ pub(crate) fn checked_target_family_storage(
         .filter(|&index| !(0..index).any(|earlier| shapes[earlier] == shapes[index]))
         .collect::<Vec<_>>();
     let mut family = CheckedGraphFamilyResources::new();
+    // A recurrent graph's references and liveness change only at the step/
+    // chunk and routed decode/grouped boundaries. Reuse that checked topology
+    // while the generated contracts evaluate every exact row/slot class.
+    let mut recurrent_templates: BTreeMap<(usize, u8), NativeGraphResourceTemplate> =
+        BTreeMap::new();
     for rows in magnitude_batching::row_classes(limits.max_launch_rows)
         .into_iter()
         .map(|rows| rows as u64)
@@ -961,21 +1008,167 @@ pub(crate) fn checked_target_family_storage(
             for (rows, segments, slots) in
                 block_classes(&geometry.blocks[index].mixer, rows, max_slots, max_segments)
             {
-                let (storage, constants) = checked_block_graph_resources(
-                    backend,
-                    load,
-                    geometry,
-                    state,
-                    slot,
-                    index,
-                    rows,
-                    segments,
-                    slots,
-                    history_rows,
-                )?;
+                let (storage, constants) = if matches!(geometry.blocks[index].mixer, MixerGeometry::Recurrent(_)) {
+                    let regime = if rows <= super::graph::routed::DECODE_ROWS {
+                        0
+                    } else if rows < super::graph::recurrent::CHUNKED_ROWS {
+                        1
+                    } else {
+                        2
+                    };
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        recurrent_templates.entry((index, regime))
+                    {
+                        let (graph, _) = checked_block_graph_draft(
+                            NativeGraphMetadata::new_template(backend), load, geometry, state,
+                            slot, index, rows, segments, slots, history_rows,
+                        )?;
+                        entry.insert(graph.seal_template().map_err(|error| error.to_string())?);
+                    }
+                    let scoped = recurrent_scoped_dimensions(
+                        &geometry.blocks[index].feedforward,
+                        rows,
+                    )?;
+                    let storage = recurrent_templates[&(index, regime)]
+                        .evaluate(&[("M", rows), ("O", rows), ("B", slots)], &scoped)
+                        .map_err(|error| format!(
+                            "target graph row class {rows}, request slots {slots}, block {index}: {error}"
+                        ))?;
+                    let constants = if slots == 1
+                        && matches!(geometry.blocks[index].feedforward, FeedForwardGeometry::Dense { .. })
+                    {
+                        let mut graph = NativeGraphMetadata::new(backend);
+                        vec![GraphConstant::identity(&mut graph, rows)?]
+                    } else {
+                        Vec::new()
+                    };
+                    (storage, constants)
+                } else {
+                    checked_block_graph_resources(
+                        backend, load, geometry, state, slot, index,
+                        rows, segments, slots, history_rows,
+                    )?
+                };
                 family.include(storage, constants);
             }
         }
     }
     family.finish()
+}
+
+#[cfg(test)]
+mod resource_template_tests {
+    use super::*;
+    use crate::{
+        assessment::plan::{tests::declared_model, QWEN35_CONFIGURATIONS},
+        resident_layout, ComponentSelection, ExecutionPath, PlannedMethod, ResourceCapacity,
+        ResourcePlanner,
+    };
+    use magnitude_state::KvCodec;
+
+    #[test]
+    fn recurrent_templates_match_every_exact_class_and_family_constant() {
+        let limits = ResourceLimits {
+            max_launch_rows: 64,
+            max_launch_slots: 64,
+            max_projected_rows: 64,
+            max_images_per_request: 1,
+            lookahead: false,
+        };
+        for mut configuration in [QWEN35_CONFIGURATIONS[0], QWEN35_CONFIGURATIONS[3]] {
+        configuration.blocks = 1;
+        let (definition, manifest) = declared_model(&configuration);
+        for backend in [
+            BackendName::Cpu,
+            BackendName::Metal,
+            BackendName::Cuda,
+            BackendName::Vulkan,
+        ] {
+            let load = ModelLoadPlan::derive(
+                &manifest,
+                &definition,
+                ComponentSelection { head: false, vision: false },
+                resident_layout(ExecutionPath::Native, backend),
+            )
+            .unwrap();
+            let state = ResourcePlanner::state_plan(
+                &definition,
+                &load,
+                PlannedMethod::Plain,
+                KvCodec::Dense,
+                limits,
+                ResourceCapacity { domain_bytes: 64 * 1024 * 1024 * 1024 },
+            )
+            .unwrap();
+            let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
+            let slot = plan.target().blocks()[0];
+            let history_rows = state.target_state().history_rows as u64;
+            let mut templates = BTreeMap::new();
+            let mut exhaustive = CheckedGraphFamilyResources::new();
+            for rows in magnitude_batching::row_classes(limits.max_launch_rows)
+                .into_iter()
+                .map(|rows| rows as u64)
+            {
+                for uploaded in [true, false] {
+                    exhaustive.include(
+                        checked_entry_graph_storage(
+                            backend, &load, &definition.geometry, rows, uploaded,
+                        )
+                        .unwrap(),
+                        [],
+                    );
+                }
+                for slots in 1..=rows.min(limits.max_launch_slots as u64) {
+                    let regime = if rows <= super::super::graph::routed::DECODE_ROWS {
+                        0
+                    } else if rows < super::super::graph::recurrent::CHUNKED_ROWS {
+                        1
+                    } else {
+                        2
+                    };
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        templates.entry(regime)
+                    {
+                        let (graph, _) = checked_block_graph_draft(
+                            NativeGraphMetadata::new_template(backend),
+                            &load, &definition.geometry, &state, slot, 0,
+                            rows, 1, slots, history_rows,
+                        )
+                        .unwrap();
+                        entry.insert(graph.seal_template().unwrap());
+                    }
+                    let scoped = recurrent_scoped_dimensions(
+                        &definition.geometry.blocks[0].feedforward,
+                        rows,
+                    )
+                    .unwrap();
+                    let templated = templates[&regime]
+                        .evaluate(&[("M", rows), ("O", rows), ("B", slots)], &scoped)
+                        .unwrap_or_else(|error| panic!(
+                            "{} {backend:?} rows={rows} slots={slots}: {error}",
+                            configuration.model
+                        ));
+                    let (exact, constants) = checked_block_graph_resources(
+                        backend, &load, &definition.geometry, &state, slot, 0,
+                        rows, 1, slots, history_rows,
+                    )
+                    .unwrap();
+                    assert_eq!(templated, exact, "{backend:?} rows={rows} slots={slots}");
+                    exhaustive.include(exact, constants);
+                }
+            }
+            let actual = checked_target_family_storage(
+                backend, &load, &definition.geometry, &state, plan.target(), limits,
+            )
+            .unwrap();
+            let expected = exhaustive.finish().unwrap();
+            assert_eq!(actual.storage, expected.storage, "{backend:?}");
+            assert_eq!(
+                actual.binding_constant_bytes,
+                expected.binding_constant_bytes,
+                "{} {backend:?} constants", configuration.model
+            );
+        }
+        }
+    }
 }

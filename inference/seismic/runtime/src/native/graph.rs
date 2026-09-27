@@ -264,6 +264,14 @@ pub struct NativeGraphMetadataDraft {
     exports: Vec<WorkflowResultRef>,
 }
 
+/// Checked numeric shapes for one class of a previously validated graph
+/// topology. The entry contract, rather than the caller, supplies these.
+pub struct NativeGraphNodeShape {
+    pub parameters: Vec<Option<(RepresentationId, Vec<u64>)>>,
+    pub results: Vec<Option<(RepresentationId, Vec<u64>)>>,
+    pub scratch: Vec<u64>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeGraphStorageBytes {
     pub workspace: u64,
@@ -323,34 +331,7 @@ impl NativeGraphMetadataDraft {
         let node = u32::try_from(self.nodes.len()).expect("native graph node ordinal exhausted");
         validate_node_references(self.identity, self.ports.len(), node, &args)
             .map_err(CallError::Workflow)?;
-        if parameter_shapes.len() != args.arguments().len() {
-            return Err(CallError::Workflow(
-                WorkflowError::NativeGraphArgumentMismatch { parameter: 0 },
-            ));
-        }
-        for (ordinal, (argument, expected)) in args
-            .arguments()
-            .iter()
-            .zip(parameter_shapes.iter())
-            .enumerate()
-        {
-            match (argument, expected) {
-                (EncodedWorkflowArgument::Tensor(argument), Some((representation, extents))) => {
-                    let actual = metadata_argument_shape(argument, &self.ports, &self.results)?;
-                    if actual.0 != *representation || actual.1 != *extents {
-                        return Err(CallError::Workflow(
-                            WorkflowError::NativeGraphArgumentMismatch { parameter: ordinal },
-                        ));
-                    }
-                }
-                (EncodedWorkflowArgument::Scalar(_), None) => {}
-                _ => {
-                    return Err(CallError::Workflow(
-                        WorkflowError::NativeGraphArgumentMismatch { parameter: ordinal },
-                    ));
-                }
-            }
-        }
+        validate_metadata_arguments(&args, &parameter_shapes, &self.ports, &self.results)?;
         let results = result_shapes
             .into_iter()
             .map(|shape| {
@@ -382,6 +363,18 @@ impl NativeGraphMetadataDraft {
     }
 
     pub fn seal(self) -> Result<NativeGraphStorageBytes, WorkflowError> {
+        self.validate_topology()?;
+        let storage = plan_storage(&self.ports, &self.nodes, &self.results, &self.exports);
+        Ok(NativeGraphStorageBytes {
+            workspace: storage.scratch_bytes,
+            output: storage.output_bytes,
+            upload: storage.upload_bytes,
+        })
+    }
+
+    /// Validate a graph once before using its ordered edges and exports as a
+    /// resource template for other exact shape classes.
+    pub fn validate_topology(&self) -> Result<(), WorkflowError> {
         if self.nodes.is_empty() {
             return Err(WorkflowError::Empty);
         }
@@ -395,13 +388,115 @@ impl NativeGraphMetadataDraft {
                 return Err(WorkflowError::MissingProducerResult);
             }
         }
-        let storage = plan_storage(&self.ports, &self.nodes, &self.results, &self.exports);
+        Ok(())
+    }
+
+    /// Evaluate exact checked sizes against an already validated topology.
+    /// No graph nodes or edges are constructed for this class. Argument shape
+    /// equality is checked again because a new class can change an edge's
+    /// tensor shape even when its references stay fixed.
+    pub fn rebound_storage(
+        &self,
+        port_shapes: &[(RepresentationId, Vec<u64>)],
+        node_shapes: Vec<NativeGraphNodeShape>,
+    ) -> Result<NativeGraphStorageBytes, CallError> {
+        if port_shapes.len() != self.ports.len() || node_shapes.len() != self.nodes.len() {
+            return Err(CallError::Workflow(WorkflowError::NativeGraphArgumentMismatch {
+                parameter: 0,
+            }));
+        }
+        let mut ports = Vec::with_capacity(port_shapes.len());
+        for (original, (representation, extents)) in self.ports.iter().zip(port_shapes) {
+            let canonical = layout::canonical(*representation, extents).map_err(CallError::Execution)?;
+            ports.push(PortSpec {
+                representation: *representation,
+                extents: extents.clone(),
+                strides: canonical.strides,
+                byte_len: canonical.byte_len,
+                local: original.local,
+                owned_input: original.owned_input,
+                prewritten: original.prewritten,
+            });
+        }
+        let mut results = Vec::with_capacity(node_shapes.len());
+        let mut planned = Vec::with_capacity(node_shapes.len());
+        for (original, shape) in self.nodes.iter().zip(node_shapes) {
+            if shape.parameters.len() != original.args.arguments().len()
+                || shape.results.len() != self.results[results.len()].len()
+                || shape.scratch.len() != original.scratch.len()
+            {
+                return Err(CallError::Workflow(WorkflowError::NativeGraphArgumentMismatch {
+                    parameter: 0,
+                }));
+            }
+            validate_metadata_arguments(&original.args, &shape.parameters, &ports, &results)?;
+            let row = shape
+                .results
+                .into_iter()
+                .map(|shape| {
+                    let Some((representation, extents)) = shape else {
+                        return Err(CallError::Workflow(WorkflowError::HostBoundaryRequired));
+                    };
+                    let canonical = layout::canonical(representation, &extents)
+                        .map_err(CallError::Execution)?;
+                    Ok(Some(NativeTensorSpec {
+                        representation,
+                        extents,
+                        strides: canonical.strides,
+                        byte_len: canonical.byte_len,
+                    }))
+                })
+                .collect::<Result<Vec<_>, CallError>>()?;
+            results.push(row);
+            planned.push(PlannedNode {
+                args: original.args.clone(),
+                scratch: shape.scratch,
+            });
+        }
+        let storage = plan_storage(&ports, &planned, &results, &self.exports);
         Ok(NativeGraphStorageBytes {
             workspace: storage.scratch_bytes,
             output: storage.output_bytes,
             upload: storage.upload_bytes,
         })
     }
+}
+
+fn validate_metadata_arguments(
+    args: &EncodedWorkflowArgs,
+    parameter_shapes: &[Option<(RepresentationId, Vec<u64>)>],
+    ports: &[PortSpec],
+    results: &[Vec<Option<NativeTensorSpec>>],
+) -> Result<(), CallError> {
+    if parameter_shapes.len() != args.arguments().len() {
+        return Err(CallError::Workflow(
+            WorkflowError::NativeGraphArgumentMismatch { parameter: 0 },
+        ));
+    }
+    for (ordinal, (argument, expected)) in args
+        .arguments()
+        .iter()
+        .zip(parameter_shapes)
+        .enumerate()
+    {
+        match (argument, expected) {
+            (EncodedWorkflowArgument::Tensor(argument), Some((representation, extents))) => {
+                let actual = metadata_argument_shape(argument, ports, results)?;
+                if actual.0 != *representation || actual.1 != *extents {
+                    return Err(CallError::Workflow(
+                        WorkflowError::NativeGraphArgumentMismatch { parameter: ordinal },
+                    ));
+                }
+            }
+            (EncodedWorkflowArgument::Scalar(_), None) => {}
+            _ => {
+                return Err(CallError::Workflow(
+                    WorkflowError::NativeGraphArgumentMismatch { parameter: ordinal },
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn metadata_argument_shape(

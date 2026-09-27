@@ -258,8 +258,14 @@ fn run() -> Result<(), String> {
     let geometry = &resolved.host.definition().geometry;
     let (context_tokens, vocabulary) = (geometry.context_limit, geometry.vocabulary);
     let worker_started = Instant::now();
-    let ready = start_in_process(resolved, |phase| {
-        eprintln!("magnitude-engine: load phase {phase:?}")
+    let mut reported = None;
+    let ready = start_in_process(resolved, |progress| {
+        // Each step once; its measured progress repeats per unit and weight.
+        let step = std::mem::discriminant(&progress);
+        if reported != Some(step) {
+            reported = Some(step);
+            eprintln!("magnitude-engine: load {progress:?}");
+        }
     })
     .map_err(|error| error.to_string())?;
     eprintln!(

@@ -52,7 +52,7 @@ fn main() -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     println!("preview {preview:?}");
     let started = Instant::now();
-    let engine = start_in_process(resolved, |phase| eprintln!("load: {phase:?}"))
+    let engine = start_in_process(resolved, |progress| eprintln!("load: {progress:?}"))
         .map_err(|error| error.to_string())?;
     println!("ready in {:.2} s", started.elapsed().as_secs_f64());
     println!("resources {:?}", engine.ready_info().resources);

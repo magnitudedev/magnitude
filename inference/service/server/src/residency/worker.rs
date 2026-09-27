@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use magnitude_engine::error::{LoadError, UnloadCause};
 use magnitude_engine::options::ExecutionManifest;
-use magnitude_engine::worker::protocol::LoadPhase;
+use magnitude_engine::worker::protocol::LoadProgress;
 use magnitude_engine::worker::transport::{FramedTransport, stdio_worker_transport};
 use magnitude_engine::worker::{EngineClient, WorkerConnection, WorkerExit, connect_worker, serve_worker};
 
@@ -138,14 +138,14 @@ impl EngineWorker {
 }
 
 impl SpawnedWorker {
-    /// Send `Hello` and `Load{manifest}` and wait for readiness, reporting each load phase.
-    /// Blocking: the worker reports load phases until it is ready or fails.
+    /// Send `Hello` and `Load{manifest}` and wait for readiness, reporting load progress.
+    /// Blocking: the worker reports its progress until it is ready or fails.
     pub fn connect(
         self,
         manifest: ExecutionManifest,
-        phase: impl FnMut(LoadPhase),
+        progress: impl FnMut(LoadProgress),
     ) -> Result<(Arc<EngineWorker>, WorkerConnection), (Arc<EngineWorker>, LoadError)> {
-        match connect_worker(self.transport, Some(manifest), phase) {
+        match connect_worker(self.transport, Some(manifest), progress) {
             Ok(connection) => {
                 self.worker
                     .client

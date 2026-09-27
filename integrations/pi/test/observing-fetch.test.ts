@@ -44,7 +44,7 @@ describe("makeObservingFetch", () => {
   })
   it("opts into progress while returning the original response body untouched", async () => {
     const events = [
-      'data: {"progress":{"phase":"model_loading","fraction":0.47}}\n\n',
+      'data: {"progress":{"phase":"model_loading","stage":"loading_weights","fraction":0.47}}\n\n',
       'data: {"progress":{"phase":"prefill","completed_tokens":14020,"total_tokens":14300,"cached_tokens":13200}}\n\n',
       'data: {"timings":{"prompt_ms":500,"time_to_first_token_ms":3400,"predicted_n":17,"predicted_ms":247.38,"predicted_per_second":68.72}}\n\n',
       "data: [DONE]\n\n",
@@ -63,7 +63,7 @@ describe("makeObservingFetch", () => {
     })
     expect(await response.text()).toBe(events)
     await settle()
-    expect(observe).toHaveBeenCalledWith({ progress: { phase: "model_loading", fraction: 0.47 } })
+    expect(observe).toHaveBeenCalledWith({ progress: { phase: "model_loading", stage: "loading_weights", fraction: 0.47 } })
     expect(observe).toHaveBeenCalledWith({
       progress: { phase: "prefill", completed_tokens: 14_020, total_tokens: 14_300, cached_tokens: 13_200 },
     })

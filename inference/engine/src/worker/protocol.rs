@@ -86,16 +86,17 @@ pub enum HostMessage {
     Shutdown,
 }
 
-/// Engine load progress, in order.
+/// Engine load progress, in order. Each measured step counts work done, never time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LoadPhase {
-    /// Device resolution and execution planning.
-    Planning,
-    OpeningDevice,
-    /// Program attestation, tuning and graph preparation.
-    PreparingPrograms,
-    /// Resource allocation and target weight import.
-    ImportingWeights,
+pub enum LoadProgress {
+    /// Device selection, planning, opening the device and program preparation.
+    Preparing,
+    /// Tuning kernels for the device. Reported only when this load searches: `total` is the
+    /// configuration budget of the units without a stored result, `completed` the budget of
+    /// those finished. It starts at zero before any search.
+    Tuning { completed: u64, total: u64 },
+    /// Target weight import, in resident bytes. It starts at zero before any import.
+    ImportingWeights { completed_bytes: u64, total_bytes: u64 },
     /// State allocation, memory policy and warm-up.
     Finalizing,
 }
@@ -156,7 +157,7 @@ pub struct DomainHeadroom {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum WorkerMessage {
     Hello { build: EngineBuild },
-    LoadPhase { phase: LoadPhase },
+    LoadProgress { progress: LoadProgress },
     Ready { ready: ReadyInfo },
     LoadFailed { error: LoadError },
     Admitted { request_id: HostRequestId },

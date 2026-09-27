@@ -3,9 +3,9 @@
 //!
 //! A load resolves the model through the shared resolved-configuration cache (§8.5), waits for
 //! memory admission, previews the load on the service's device catalog (the admission check and
-//! the load plan), and loads exactly the previewed device in a worker. The worker's load phases
-//! drive `LoadProgress`; readiness is verified against the host's resolution before the instance
-//! is Ready.
+//! the load plan), and loads exactly the previewed device in a worker. The worker's measured load
+//! progress drives the instance's stage and fraction; readiness is verified against the host's
+//! resolution before the instance is Ready.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,7 +19,7 @@ use magnitude_engine::error::{LoadError, PreviewError};
 use magnitude_engine::host::HostArtifacts;
 use magnitude_engine::preview::LoadPreview;
 use magnitude_engine::worker::EngineClient;
-use magnitude_engine::worker::protocol::{LoadPhase, MemoryObservation};
+use magnitude_engine::worker::protocol::{LoadProgress, MemoryObservation};
 use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
 use magnitude_service_contracts::models::{
     CatalogPackageRemover, InstalledModelPackages as _, ModelId, ModelInstance, ModelInstanceId,
@@ -414,15 +414,61 @@ fn planning_reserve(catalog: &DeviceCatalog, domain: &MemoryDomain, reserves: &M
     reserves.for_domain(capacity).planning_bytes
 }
 
-/// Load progress by phase: each phase starts at its share of the load.
-fn phase_progress(phase: LoadPhase) -> f32 {
-    match phase {
-        LoadPhase::Planning => 0.0,
-        LoadPhase::OpeningDevice => 0.1,
-        LoadPhase::PreparingPrograms => 0.2,
-        LoadPhase::ImportingWeights => 0.4,
-        LoadPhase::Finalizing => 0.9,
+/// The share of a tuning load's fraction that tuning fills; weight import fills the rest, or all
+/// of a load that does not tune.
+const TUNING_SHARE: f32 = 0.5;
+/// The least fraction a stage reports again after, so a load publishes a bounded number of
+/// snapshots however many weights it imports.
+const REPORT_STEP: f32 = 0.005;
+
+/// A load's stage and fraction from its worker's progress, by measured work. Monotonic.
+#[derive(Default)]
+struct LoadProgression {
+    tuned: bool,
+    reported: Option<(ModelLoadStage, f32)>,
+}
+
+impl LoadProgression {
+    /// The stage and fraction `progress` advances the load to, or `None` when it is too little
+    /// to report.
+    fn advance(&mut self, progress: LoadProgress) -> Option<(ModelLoadStage, f32)> {
+        let previous = self.reported.map_or(0.0, |(_, fraction)| fraction);
+        let (stage, fraction) = match progress {
+            LoadProgress::Preparing => (ModelLoadStage::Preparing, 0.0),
+            LoadProgress::Tuning { completed, total } => {
+                self.tuned = true;
+                (ModelLoadStage::Optimizing, TUNING_SHARE * ratio(completed, total))
+            }
+            LoadProgress::ImportingWeights {
+                completed_bytes,
+                total_bytes,
+            } => {
+                let start = if self.tuned { TUNING_SHARE } else { 0.0 };
+                (
+                    ModelLoadStage::LoadingWeights,
+                    start + (1.0 - start) * ratio(completed_bytes, total_bytes),
+                )
+            }
+            LoadProgress::Finalizing => (ModelLoadStage::Finalizing, previous),
+        };
+        let fraction = fraction.max(previous);
+        let reported = self.reported.is_some_and(|(reported, _)| reported == stage)
+            && fraction < 1.0
+            && fraction - previous < REPORT_STEP;
+        if reported {
+            return None;
+        }
+        self.reported = Some((stage, fraction));
+        self.reported
     }
+}
+
+/// `completed` of `total`, in `[0, 1]`; nothing to do is complete.
+fn ratio(completed: u64, total: u64) -> f32 {
+    if total == 0 {
+        return 1.0;
+    }
+    (completed as f64 / total as f64).min(1.0) as f32
 }
 
 impl EngineResidency {
@@ -430,7 +476,6 @@ impl EngineResidency {
         &self,
         instance_id: &ModelInstanceId,
         stage: ModelLoadStage,
-        progress: Option<f32>,
         plan: Option<&ModelLoadPlan>,
     ) {
         self.client
@@ -438,7 +483,7 @@ impl EngineResidency {
             .send(ResidencyNotification::LoadProgress {
                 instance_id: instance_id.clone(),
                 stage,
-                progress,
+                fraction: 0.0,
                 planned_allocation: plan.cloned(),
             });
     }
@@ -449,16 +494,16 @@ impl EngineResidency {
         configuration: ModelServingConfiguration,
     ) -> Result<PreparedResidency<ResidentEngine>, ModelOperationFailure> {
         let environment = &self.environment;
-        self.progress(instance_id, ModelLoadStage::Resolving, None, None);
         let resolved = environment.configurations.resolve(&configuration).await?;
         if !self.supervisor.admission_open() {
-            self.progress(instance_id, ModelLoadStage::Queued, None, None);
+            self.progress(instance_id, ModelLoadStage::Queued, None);
             tracing::info!("load waits for system memory to recover from pressure");
             self.supervisor.admission().await;
+            self.progress(instance_id, ModelLoadStage::Preparing, None);
         }
         let preview = preview(&environment.catalog, &resolved).await?;
         let plan = load_plan(&preview)?;
-        self.progress(instance_id, ModelLoadStage::Loading, Some(0.0), Some(&plan));
+        self.progress(instance_id, ModelLoadStage::Preparing, Some(&plan));
 
         let device = environment.device_exclusion.residency().await;
         let spawned = EngineWorker::spawn(&environment.launcher, device).map_err(|error| {
@@ -474,16 +519,19 @@ impl EngineResidency {
         let mut manifest = resolved.manifest.clone();
         manifest.device = DeviceRequest::Selector(preview.device);
         let notifier = self.client.notifier();
-        let phase_instance = instance_id.clone();
-        let phase_plan = plan.clone();
+        let progress_instance = instance_id.clone();
+        let progress_plan = plan.clone();
         let connected = crate::spawn_blocking_traced(move || {
-            spawned.connect(manifest, move |phase| {
-                notifier.send(ResidencyNotification::LoadProgress {
-                    instance_id: phase_instance.clone(),
-                    stage: ModelLoadStage::Loading,
-                    progress: Some(phase_progress(phase)),
-                    planned_allocation: Some(phase_plan.clone()),
-                });
+            let mut progression = LoadProgression::default();
+            spawned.connect(manifest, move |progress| {
+                if let Some((stage, fraction)) = progression.advance(progress) {
+                    notifier.send(ResidencyNotification::LoadProgress {
+                        instance_id: progress_instance.clone(),
+                        stage,
+                        fraction,
+                        planned_allocation: Some(progress_plan.clone()),
+                    });
+                }
             })
         })
         .await
@@ -499,8 +547,8 @@ impl EngineResidency {
         })?;
 
         // The worker read its own package: it must agree with the host's resolution on the
-        // package identity, the chat templates and the input modalities.
-        self.progress(instance_id, ModelLoadStage::Verifying, Some(1.0), Some(&plan));
+        // package identity, the chat templates and the input modalities. This is the end of the
+        // worker's finalizing stage.
         let ready = ReadyEngine::new(Arc::clone(&resolved.host), connection).map_err(|mismatch| {
             let code = match &mismatch {
                 ReadinessMismatch::Package { .. } => "worker_package_mismatch",
@@ -669,16 +717,81 @@ impl From<ModelOperationFailure> for InventoryError {
 mod tests {
     use super::*;
 
+    fn weights(completed_bytes: u64, total_bytes: u64) -> LoadProgress {
+        LoadProgress::ImportingWeights {
+            completed_bytes,
+            total_bytes,
+        }
+    }
+
     #[test]
-    fn load_phases_advance_progress() {
-        let phases = [
-            LoadPhase::Planning,
-            LoadPhase::OpeningDevice,
-            LoadPhase::PreparingPrograms,
-            LoadPhase::ImportingWeights,
-            LoadPhase::Finalizing,
+    fn a_tuning_load_fills_half_tuning_then_half_weights() {
+        let mut progression = LoadProgression::default();
+        let steps = [
+            LoadProgress::Preparing,
+            LoadProgress::Tuning {
+                completed: 0,
+                total: 100,
+            },
+            LoadProgress::Tuning {
+                completed: 50,
+                total: 100,
+            },
+            weights(0, 1000),
+            weights(500, 1000),
+            weights(1000, 1000),
+            LoadProgress::Finalizing,
         ];
-        assert!(phases.windows(2).all(|pair| phase_progress(pair[0]) < phase_progress(pair[1])));
-        assert!(phases.iter().all(|phase| (0.0..1.0).contains(&phase_progress(*phase))));
+        let reported = steps
+            .into_iter()
+            .map(|progress| progression.advance(progress).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reported,
+            [
+                (ModelLoadStage::Preparing, 0.0),
+                (ModelLoadStage::Optimizing, 0.0),
+                (ModelLoadStage::Optimizing, 0.25),
+                (ModelLoadStage::LoadingWeights, 0.5),
+                (ModelLoadStage::LoadingWeights, 0.75),
+                (ModelLoadStage::LoadingWeights, 1.0),
+                (ModelLoadStage::Finalizing, 1.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_load_without_tuning_fills_with_weights() {
+        let mut progression = LoadProgression::default();
+        progression.advance(LoadProgress::Preparing);
+        assert_eq!(
+            progression.advance(weights(250, 1000)),
+            Some((ModelLoadStage::LoadingWeights, 0.25))
+        );
+    }
+
+    #[test]
+    fn progress_reports_in_bounded_steps_and_never_regresses() {
+        let mut progression = LoadProgression::default();
+        progression.advance(weights(0, 100_000));
+        // Less than a report step within the same stage is not reported.
+        assert_eq!(progression.advance(weights(100, 100_000)), None);
+        assert_eq!(
+            progression.advance(weights(1000, 100_000)),
+            Some((ModelLoadStage::LoadingWeights, 0.01))
+        );
+        // A unit found unexpectedly to search raises the tuning total; the fraction holds.
+        let mut progression = LoadProgression::default();
+        progression.advance(LoadProgress::Tuning {
+            completed: 50,
+            total: 100,
+        });
+        assert_eq!(
+            progression.advance(LoadProgress::Tuning {
+                completed: 60,
+                total: 200,
+            }),
+            None
+        );
     }
 }

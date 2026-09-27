@@ -128,7 +128,7 @@ use seismic::{
     Strategy, Tensor, TensorError, TuneError, TuningInitializer, TuningMethod, TuningPoint,
     TuningResult, TuningTime, Validation,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -505,6 +505,13 @@ pub(crate) trait EntryTuning {
 /// Progress of tuning at load, for readiness reporting.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TuningEvent {
+    /// The configuration budget of the units searched so far, of the units
+    /// that search at this load. Reported when tuning begins (none searched)
+    /// and after each searched unit; a total of zero means nothing searches.
+    Progress {
+        completed: usize,
+        total: usize,
+    },
     Started {
         entry: &'static str,
         bindings: String,
@@ -909,15 +916,47 @@ fn share(total: usize, sizes: &[usize]) -> Vec<usize> {
 
 /// How the tuner treats each unit it is asked for.
 enum Allocation {
-    /// Counting the model's tuning units and their admissible sizes: nothing
-    /// is formed or measured.
-    Census(Vec<(TuningKey, usize)>),
+    /// Counting the model's tuning units, their admissible sizes and whether
+    /// each will search: nothing is formed or measured.
+    Census(Vec<CensusUnit>),
     /// Tuning, each unit within its share of [`MODEL_BUDGET`].
     Budgets(HashMap<TuningKey, usize>),
 }
 
-/// The configurations each tuning unit of a model may evaluate.
-pub(crate) struct TuningBudgets(HashMap<TuningKey, usize>);
+/// One tuning unit a census counted.
+struct CensusUnit {
+    key: TuningKey,
+    /// Admissible configurations.
+    size: usize,
+    search: CensusSearch,
+}
+
+/// Whether a counted unit will search at this load.
+enum CensusSearch {
+    /// Nothing can hold its result (no cache, or a survey): it searches.
+    Always,
+    /// A pinned choice: it never searches.
+    #[cfg_attr(not(feature = "pinned-tuning"), allow(dead_code))]
+    Never,
+    /// It searches unless the cache holds a result of its key, whose budget
+    /// is known once the census is complete.
+    UnlessStored(StoredProbe),
+}
+
+/// The key material of a unit's stored result, except its budget.
+struct StoredProbe {
+    statics: NativeSpecialization,
+    digest: String,
+    shapes: Vec<PointShape>,
+    screening: Vec<ScreeningPoint>,
+}
+
+/// The configurations each tuning unit of a model may evaluate, and the units
+/// that search at this load.
+pub(crate) struct TuningBudgets {
+    budgets: HashMap<TuningKey, usize>,
+    searching: HashSet<TuningKey>,
+}
 
 /// Resolves every native entry's specialization for the opened device:
 /// static values, tuned parameters, and missing implementations.
@@ -934,6 +973,11 @@ pub(crate) struct Tuner<'a> {
     /// The latest choice for each parameter declaration of an entry, a start
     /// for the next unit with the same declaration.
     winners: HashMap<String, ParameterValues>,
+    /// The units the census expected to search.
+    searching: HashSet<TuningKey>,
+    /// The budget of the units searched so far, of `searching_total`.
+    searched: usize,
+    searching_total: usize,
 }
 
 impl<'a> Tuner<'a> {
@@ -950,9 +994,12 @@ impl<'a> Tuner<'a> {
             limits,
             weights,
             Allocation::Census(Vec::new()),
+            HashSet::new(),
         )
     }
 
+    /// A tuner within `budgets`. It reports tuning progress from the start:
+    /// the budget of the units that search, none searched yet.
     pub fn new(
         device: &'a Device,
         context: TuningContext<'a>,
@@ -960,13 +1007,16 @@ impl<'a> Tuner<'a> {
         weights: TuningWeights<'a>,
         budgets: TuningBudgets,
     ) -> Self {
-        Self::with(
+        let tuner = Self::with(
             device,
             context,
             limits,
             weights,
-            Allocation::Budgets(budgets.0),
-        )
+            Allocation::Budgets(budgets.budgets),
+            budgets.searching,
+        );
+        tuner.report_progress();
+        tuner
     }
 
     fn with(
@@ -975,7 +1025,12 @@ impl<'a> Tuner<'a> {
         limits: TuningLimits,
         weights: TuningWeights<'a>,
         allocation: Allocation,
+        searching: HashSet<TuningKey>,
     ) -> Self {
+        let searching_total = match &allocation {
+            Allocation::Census(_) => 0,
+            Allocation::Budgets(budgets) => searching.iter().map(|key| budgets[key]).sum(),
+        };
         Self {
             device,
             context,
@@ -986,22 +1041,58 @@ impl<'a> Tuner<'a> {
             tuned: Vec::new(),
             chosen: HashMap::new(),
             winners: HashMap::new(),
+            searching,
+            searched: 0,
+            searching_total,
         }
     }
 
-    /// [`MODEL_BUDGET`] shared among the units a census counted.
+    /// [`MODEL_BUDGET`] shared among the units a census counted, and the
+    /// units among them that will search: those without a stored result of
+    /// their key at its budget.
     pub fn budgets(self) -> TuningBudgets {
         let Allocation::Census(units) = self.allocation else {
             unreachable!("budgets come from a census");
         };
-        let sizes = units.iter().map(|(_, size)| *size).collect::<Vec<_>>();
-        TuningBudgets(
-            units
-                .into_iter()
-                .map(|(key, _)| key)
-                .zip(allocate(MODEL_BUDGET, &sizes))
-                .collect(),
-        )
+        let sizes = units.iter().map(|unit| unit.size).collect::<Vec<_>>();
+        let mut budgets = HashMap::new();
+        let mut searching = HashSet::new();
+        for (unit, budget) in units.into_iter().zip(allocate(MODEL_BUDGET, &sizes)) {
+            let searches = match &unit.search {
+                CensusSearch::Always => true,
+                CensusSearch::Never => false,
+                CensusSearch::UnlessStored(probe) => {
+                    let cache = self
+                        .context
+                        .cache
+                        .expect("a census probes stored results only with a cache");
+                    let key = TuningCacheKey::of(&tuning_key_material(
+                        self.device,
+                        unit.key.0,
+                        &unit.key.1,
+                        &probe.statics,
+                        &probe.digest,
+                        budget,
+                        &probe.shapes,
+                        &probe.screening,
+                    ));
+                    cache.tuning(&key).is_none()
+                }
+            };
+            if searches {
+                searching.insert(unit.key.clone());
+            }
+            budgets.insert(unit.key, budget);
+        }
+        TuningBudgets { budgets, searching }
+    }
+
+    /// Report the budget of the units searched so far, of those that search.
+    fn report_progress(&self) {
+        self.context.observer.event(&TuningEvent::Progress {
+            completed: self.searched,
+            total: self.searching_total,
+        });
     }
 
     pub fn tuned(self) -> Vec<TunedEntry> {
@@ -1033,10 +1124,15 @@ impl<'a> Tuner<'a> {
                 .map(|admissible| admissible.len())
                 .map_err(|error| failure(error.to_string()))
         };
-        let budget = match &mut self.allocation {
+        let budget = match &self.allocation {
             Allocation::Census(units) => {
-                if !units.iter().any(|(counted, _)| *counted == key) {
-                    units.push((key, configurations()?));
+                if !units.iter().any(|unit| unit.key == key) {
+                    let search = self.census_search(case, implementation, statics, &key)?;
+                    let size = configurations()?;
+                    let Allocation::Census(units) = &mut self.allocation else {
+                        unreachable!("a census stays a census");
+                    };
+                    units.push(CensusUnit { key, size, search });
                 }
                 return implementation
                     .default_specialization(statics)
@@ -1169,7 +1265,51 @@ impl<'a> Tuner<'a> {
             }
         }
         let tuned = tuned_entry(entry, bindings, &result, TuningOrigin::Searched, began);
-        Ok(self.finish(key, declaration, tuned))
+        // A unit the census expected to have a stored result (one that proved
+        // invalid) adds its budget to the search when it searches.
+        if !self.searching.contains(&key) {
+            self.searching_total += budget;
+        }
+        self.searched += budget;
+        let chosen = self.finish(key, declaration, tuned);
+        self.report_progress();
+        Ok(chosen)
+    }
+
+    /// Whether the unit `key` names will search at this load, and what finds
+    /// its stored result once its budget is known. Mirrors [`Tuner::tune`].
+    fn census_search<T: EntryTuning>(
+        &self,
+        case: &T,
+        implementation: &NativeImplementation,
+        statics: &NativeSpecialization,
+        key: &TuningKey,
+    ) -> Result<CensusSearch, CatalogFailure> {
+        let failure = |outcome: String| CatalogFailure::Tuning {
+            entry: key.0,
+            bindings: key.1.clone(),
+            outcome,
+        };
+        #[cfg(feature = "pinned-tuning")]
+        if let pinned::Pinned::Chosen(_) = pinned::lookup(key, implementation).map_err(failure)? {
+            return Ok(CensusSearch::Never);
+        }
+        #[cfg(not(feature = "pinned-tuning"))]
+        let _ = implementation;
+        if self.context.cache.is_none() || survey_plan(key.0).is_some() {
+            return Ok(CensusSearch::Always);
+        }
+        let shapes = case.points(self.limits);
+        let screening = case.screening(self.device, &shapes);
+        let digest = case
+            .digest(self.device, statics)
+            .map_err(|error| failure(error.to_string()))?;
+        Ok(CensusSearch::UnlessStored(StoredProbe {
+            statics: statics.clone(),
+            digest,
+            shapes,
+            screening,
+        }))
     }
 
     /// Record a unit's outcome and report it.

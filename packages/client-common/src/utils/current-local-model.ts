@@ -80,9 +80,7 @@ export const deriveCurrentLocalModel = (
         return {
           _tag: "Loading",
           ...details,
-          percentage: Math.round(
-            Option.getOrElse(slot.residency.progress, () => 0) * 100,
-          ),
+          percentage: Math.floor(slot.residency.fraction * 100),
         }
       case "Ready":
         return { _tag: "Running", ...details }

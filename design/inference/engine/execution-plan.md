@@ -75,7 +75,9 @@ is never bound. An entry that declares parameters without a case fails preparati
 engine-side default parameter values. An entry prepared again with identical element bindings and
 static values reuses the load's first tuning result. Entry-wide declarations still use a
 configuration budget: a census counts the model's tuning units (entry, element bindings, static
-values) and their admissible configurations, and shares a per-model budget among them. A
+values) and their admissible configurations, shares a per-model budget among them, and then finds
+which units have a stored result at their budget, so the load knows the budget it will search
+before any tuning. A
 launch-scoped declaration instead searches every candidate of each independent launch group;
 its boundary choices and group candidates do not spend that budget. A safety stop on the whole
 preparation's tuning (a wall-clock limit for pathological machines) ends every search early with
@@ -96,8 +98,11 @@ content addresses, so nothing is invalidated: changed inputs give new keys. Writ
 temporary file renamed into place; an entry that cannot be read or parsed, or whose configuration
 the implementation does not admit, is a miss and is rewritten; opening the cache evicts the least
 recently used entries beyond its capacity. Stored results are local measurements; nothing is
-shipped. Tuning progress, total tuning time and how many units were searched or stored are
-reported before readiness; no tuning or preparation occurs after readiness. Two development
+shipped. Tuning progress (the budget of the units searched so far over that of the units that
+search, reported when tuning begins and after each searched unit; nothing when every unit is
+stored), total tuning time and how many units were searched or stored are reported before
+readiness. The load also reports its target weight import in resident bytes; no tuning or
+preparation occurs after readiness. Two development
 measurement tools, enabled only by the forward bench and never by a served engine, change this:
 the executor's `pinned-tuning` build feature records the configuration chosen per entry (entry,
 bindings, static values) and replays exactly those configurations in a later run, so two runs can
@@ -130,6 +135,11 @@ numerical units. Its checked entry contracts derive graph-local mutable scratch,
 inputs, intermediate and result tensors' representations, extents, alias conditions, and lifetimes.
 It reports exact storage charges and owns bounded concurrent execution slots. Compatible launch
 classes share one physical scratch arena per concurrent slot, charged at their maximum footprint.
+Metadata assessment reuses a validated graph topology within each structural regime, evaluates
+checked entry shapes and scratch for every admitted class, and places those exact sizes with the
+same Seismic storage planner used by prepared workflows. Its family charge takes independent
+workspace, output, and upload maxima and counts each distinct bound constant once. A class that
+fails a checked contract fails assessment rather than producing a fit estimate.
 Each slot also holds a fixed set of host-upload regions, allocated and charged with the slot: one
 per graph run its lease keeps in flight at once (a target step queues its embedding entry and
 every block before any completes). Upload regions are host-visible (CUDA: mapped pinned host

@@ -399,8 +399,9 @@ claims are the authoritative admission. There is no parallel-sequence search or 
 allocation.
 Load does not accept a planner name, planner version, capacity-policy identifier, or native flags.
 ICN publishes typed Instance progress through loading and ready or failed termination. Loading
-progress follows the worker's engine load phases after prior residency is released, stays
-monotonic and below completion; only Ready means complete. Loading, progress,
+reports a stage and a fraction measured from the worker's tuning and weight import after prior
+residency is released (see `design/model-management/instance-lifecycle.md`); the fraction is
+monotonic, and only Ready means complete. Loading, its stage and fraction,
 Ready, Stopping, Stopped, and Failed are published in the revisioned
 `ModelInstancesSnapshot`. Equivalent concurrent demand joins the same admitted load and receives
 the ICN-created Instance; a later load after terminalization uses a new identity. Concurrent

@@ -30,7 +30,9 @@ use utoipa::openapi::schema::AnyOfBuilder;
 use utoipa::{PartialSchema, ToSchema};
 
 use crate::error::{ApiError, ApiErrorBody, ErrorResponse, ServingError};
-use crate::source::{GenerationEvent, GenerationStream, LoadProgress};
+use crate::source::{
+    GenerationEvent, GenerationStream, LoadProgress, ModelLoadProgress, ModelLoadStage,
+};
 use magnitude_engine::chat::AppliedTemplate;
 use crate::{Serving, include_progress, media, unix_timestamp, with_request_id};
 
@@ -420,6 +422,7 @@ impl ToSchema for ChatCompletionStreamEvent {
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub enum ChatCompletionProgress {
     ModelLoading {
+        stage: ModelLoadStage,
         fraction: f32,
     },
     Queued,
@@ -430,6 +433,16 @@ pub enum ChatCompletionProgress {
         cached_tokens: u64,
     },
     Generating,
+}
+
+impl ChatCompletionProgress {
+    /// Model loading progress, as every streaming protocol reports it.
+    pub(crate) fn model_loading(load: ModelLoadProgress) -> Self {
+        Self::ModelLoading {
+            stage: load.stage,
+            fraction: load.fraction.clamp(0.0, 1.0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -751,7 +764,7 @@ fn choice_chunk(
     }
 }
 
-fn progress_value(progress: Progress) -> ChatCompletionProgress {
+pub(crate) fn progress_value(progress: Progress) -> ChatCompletionProgress {
     match progress {
         Progress::Preparing => ChatCompletionProgress::Preparing,
         Progress::Queued => ChatCompletionProgress::Queued,
@@ -1542,11 +1555,9 @@ pub async fn chat_completions(
         let progress_sender = sender.clone();
         let progress_id = id.clone();
         let progress_model = adapted.model.clone();
-        let progress: LoadProgress = std::sync::Arc::new(move |fraction| {
+        let progress: LoadProgress = std::sync::Arc::new(move |load| {
             let chunk = ChatCompletionChunk {
-                progress: Some(ChatCompletionProgress::ModelLoading {
-                    fraction: fraction.clamp(0.0, 1.0),
-                }),
+                progress: Some(ChatCompletionProgress::model_loading(load)),
                 ..chunk(&progress_id, created, &progress_model)
             };
             if let Ok(data) = serde_json::to_string(&chunk) {

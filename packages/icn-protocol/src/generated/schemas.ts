@@ -361,6 +361,7 @@ export const ChatCompletionProgress = S.Union(
     S.Struct({
       fraction: S.Number,
       phase: S.Literal("model_loading"),
+      stage: S.suspend((): S.Schema<ModelLoadStage, ModelLoadStageEncoded> => ModelLoadStage),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
@@ -1674,11 +1675,11 @@ export type ModelInstanceIdEncoded = S.Schema.Encoded<typeof ModelInstanceId>
 export const ModelInstanceLifecycle = S.Union(
   S.extend(
     S.TaggedStruct("Loading", {
+      fraction: S.Number,
       plannedAllocation: S.optionalWith(
         S.suspend((): S.Schema<ModelLoadPlan, ModelLoadPlanEncoded> => ModelLoadPlan),
         { exact: true, as: "Option" },
       ),
-      progress: S.optionalWith(S.Number, { exact: true, as: "Option" }),
       stage: S.suspend((): S.Schema<ModelLoadStage, ModelLoadStageEncoded> => ModelLoadStage),
     }),
     S.Record({ key: S.String, value: JsonValue }),
@@ -1756,10 +1757,10 @@ export type ModelLoadPlanEncoded = S.Schema.Encoded<typeof ModelLoadPlan>
 
 export const ModelLoadStage = S.Union(
   S.Literal("queued"),
-  S.Literal("resolving"),
-  S.Literal("unloading"),
-  S.Literal("loading"),
-  S.Literal("verifying"),
+  S.Literal("preparing"),
+  S.Literal("optimizing"),
+  S.Literal("loading_weights"),
+  S.Literal("finalizing"),
 )
 export type ModelLoadStage = S.Schema.Type<typeof ModelLoadStage>
 export type ModelLoadStageEncoded = S.Schema.Encoded<typeof ModelLoadStage>

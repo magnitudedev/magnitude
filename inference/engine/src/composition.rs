@@ -9,7 +9,7 @@ use crate::options::{ExecutionManifest, InputModalities, ModelPolicy, PackageOpt
 use magnitude_artifacts::PackageIdentity;
 use std::fmt;
 use crate::worker::{
-    connect_worker, protocol::LoadPhase, run_worker, transport::channel_pair, EngineClient,
+    connect_worker, protocol::LoadProgress, run_worker, transport::channel_pair, EngineClient,
     WorkerConnection,
 };
 use magnitude_executor::{
@@ -182,7 +182,7 @@ impl ReadyEngine {
 /// transport: the same worker and protocol a worker process runs.
 pub fn start_in_process(
     resolved: ResolvedEngineConfiguration,
-    phase: impl FnMut(LoadPhase),
+    progress: impl FnMut(LoadProgress),
 ) -> Result<ReadyEngine, LoadError> {
     let ResolvedEngineConfiguration { host, manifest } = resolved;
     let (host_end, worker_end) = channel_pair();
@@ -195,7 +195,7 @@ pub fn start_in_process(
         .map_err(|error| LoadError::Internal {
             reason: error.to_string(),
         })?;
-    let connection = connect_worker(host_end, None, phase)?;
+    let connection = connect_worker(host_end, None, progress)?;
     ReadyEngine::new(Arc::new(host), connection).map_err(|mismatch| LoadError::Internal {
         reason: mismatch.to_string(),
     })

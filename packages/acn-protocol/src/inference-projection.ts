@@ -38,7 +38,7 @@ export const projectInferenceResidency = (
     case "Loading": return {
       _tag: "Loading",
       stage: instance.lifecycle.stage,
-      progress: Option.flatMap(instance.lifecycle.progress, Option.fromNullable),
+      fraction: instance.lifecycle.fraction,
       plannedAllocation: Option.map(instance.lifecycle.plannedAllocation, projectInferenceLoadPlan),
     }
     case "Ready": return {

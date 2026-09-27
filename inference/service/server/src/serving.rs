@@ -9,11 +9,14 @@ use futures_util::future::BoxFuture;
 use magnitude_engine::chat::SessionLimits;
 use magnitude_engine::invocation::{Invocation, ReleaseGuard};
 use magnitude_service_contracts::InventoryError;
+use magnitude_service_contracts::models::ModelLoadStage;
 use magnitude_serving::engine::{EngineHost, EngineInvocation};
 use magnitude_serving::{
-    HostChat, LoadProgress, ModelInvocation, ModelUnavailable, ServedModels, ServingError,
+    HostChat, LoadProgress, ModelInvocation, ModelLoadProgress,
+    ModelLoadStage as ProtocolLoadStage, ModelUnavailable, ServedModels, ServingError,
 };
 
+use crate::residency::LoadingObserver;
 use crate::residency::controller::ModelInstances;
 
 /// Output batches buffered per request on each side of the worker, and the parsed output bound.
@@ -40,10 +43,18 @@ impl ServedModels for ServiceModels {
         progress: Option<LoadProgress>,
     ) -> BoxFuture<'_, Result<Box<dyn ModelInvocation>, ServingError>> {
         let model = model.to_owned();
+        let observer = progress.map(|progress| -> LoadingObserver {
+            Arc::new(move |stage, fraction| {
+                progress(ModelLoadProgress {
+                    stage: protocol_stage(stage),
+                    fraction,
+                })
+            })
+        });
         Box::pin(async move {
             let lease = self
                 .instances
-                .acquire_for_inference(&model, progress)
+                .acquire_for_inference(&model, observer)
                 .await
                 .map_err(unavailable)?;
             let (resident, release) = lease.into_parts();
@@ -62,6 +73,17 @@ impl ServedModels for ServiceModels {
             let host = self.instances.host(&model).await.map_err(unavailable)?;
             Ok(Arc::new(EngineHost::new(host)) as Arc<dyn HostChat>)
         })
+    }
+}
+
+/// An instance's load stage as the protocols report it: the same stage under the same name.
+fn protocol_stage(stage: ModelLoadStage) -> ProtocolLoadStage {
+    match stage {
+        ModelLoadStage::Queued => ProtocolLoadStage::Queued,
+        ModelLoadStage::Preparing => ProtocolLoadStage::Preparing,
+        ModelLoadStage::Optimizing => ProtocolLoadStage::Optimizing,
+        ModelLoadStage::LoadingWeights => ProtocolLoadStage::LoadingWeights,
+        ModelLoadStage::Finalizing => ProtocolLoadStage::Finalizing,
     }
 }
 
@@ -128,5 +150,21 @@ mod tests {
             unavailable(InventoryError::NotFound("absent".to_owned())),
             ServingError::Model(ModelUnavailable::NotFound("absent".to_owned()))
         );
+    }
+
+    #[test]
+    fn protocol_progress_names_each_load_stage_as_instance_status_does() {
+        for stage in [
+            ModelLoadStage::Queued,
+            ModelLoadStage::Preparing,
+            ModelLoadStage::Optimizing,
+            ModelLoadStage::LoadingWeights,
+            ModelLoadStage::Finalizing,
+        ] {
+            assert_eq!(
+                serde_json::to_value(stage).unwrap(),
+                serde_json::to_value(protocol_stage(stage)).unwrap()
+            );
+        }
     }
 }

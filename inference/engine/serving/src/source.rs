@@ -11,11 +11,35 @@ use magnitude_chat::{
     ChatInput, GenerationRequest,
 };
 use magnitude_engine::chat::{AppliedTemplate, ModelProperties};
+use serde::Serialize;
 use std::sync::Arc;
+use utoipa::ToSchema;
 use tokio::sync::mpsc;
 
-/// Observes model loading as a completed fraction in `[0, 1]`.
-pub type LoadProgress = Arc<dyn Fn(f32) + Send + Sync>;
+/// Where a model load is. The service's model instance status names the same stages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelLoadStage {
+    /// Waiting for memory admission.
+    Queued,
+    /// Resolving, planning, opening the device and preparing programs.
+    Preparing,
+    /// Tuning kernels for the device; only a load that tunes enters it.
+    Optimizing,
+    LoadingWeights,
+    /// State allocation, warm-up and readiness verification.
+    Finalizing,
+}
+
+/// A model load's stage and completed fraction in `[0, 1]`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelLoadProgress {
+    pub stage: ModelLoadStage,
+    pub fraction: f32,
+}
+
+/// Observes model loading.
+pub type LoadProgress = Arc<dyn Fn(ModelLoadProgress) + Send + Sync>;
 
 /// The models a router serves.
 pub trait ServedModels: Send + Sync + 'static {

@@ -143,7 +143,7 @@ pub fn assess_execution(
                 .fit_state_bytes(terms.fit_depth, terms.recurrent_banks)
                 .and_then(|state_bytes| terms.charge(bounds, state_bytes))
         })
-        .map_err(AssessmentError::Memory)?;
+    .map_err(AssessmentError::Memory)?;
     let device = topology
         .devices()
         .iter()

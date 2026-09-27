@@ -40,12 +40,13 @@ import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "rea
 import { Atom, RegistryProvider, Result, useAtomValue, useAtomSet, useAtomRefresh } from "@effect-atom/atom-react"
 import { Cause, Effect, Exit, Layer, Option, Runtime, Schema, Scope, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
-import { MagnitudeClient, ProviderModelIdSchema, type ProviderModelId, type CatalogLocalModel } from "@magnitudedev/sdk"
+import { MagnitudeClient, ProviderModelIdSchema, type ProviderModelId, type CatalogLocalModel, type LocalInferenceHardware, type ModelResidency } from "@magnitudedev/sdk"
 import { ApplicationSnapshot, LoginStartupState, type NetworkAccessChange } from "@magnitudedev/sdk/desktop-host"
 import {
   DesktopApplicationInfo, DesktopUpdateState, DesktopConnectRequest, DesktopHostUnavailable, DesktopSession, DesktopConnectionsSnapshot, activeLocalModel, modelDownloadFailureMessage,
   createAgentClient, AgentClientProvider, useAgentClient, makeFirstPartyConnection,
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, localModelFailureMessage, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
+  describeModelLoadStage, formatModelLoadPercentage, formatModelMemory,
   formatStorageSize, formatTransferRate, formatMemorySize, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes,
   LOCAL_MODEL_RANKING_SCALE_VALUES,
 } from "@magnitudedev/client-common"
@@ -379,8 +380,28 @@ function ConnectionsView({ service, serviceReady, selectedModel }: { service: De
           onConnect={harness => connect({ harness, model: selectedModel })} onDisconnect={harness => disconnect(harness)} />}
   </>
 }
+/** The model row's status: the load stage in full while loading, the memory in use once loaded. */
+const modelStatusText = (residency: ModelResidency, hardware: Option.Option<LocalInferenceHardware>): string => {
+  switch (residency._tag) {
+    case "Requested": return describeModelLoadStage("preparing", Option.none(), hardware)
+    case "Loading": return describeModelLoadStage(residency.stage, residency.plannedAllocation, hardware)
+    case "Ready": return `Loaded · ${formatModelMemory(residency.allocation)}`
+    case "Stopping": return "Stopping…"
+    case "Unloaded":
+    case "Failed": return "Not loaded"
+  }
+}
+/** A load's completed fraction; a requested load has not started. */
+const loadFraction = (residency: ModelResidency): Option.Option<number> => {
+  switch (residency._tag) {
+    case "Requested": return Option.some(0)
+    case "Loading": return Option.some(residency.fraction)
+    default: return Option.none()
+  }
+}
 function ModelStatus() {
   const models = useLocalModels()
+  const hardware = useLocalInferenceHardware()
   const { stop } = useLocalModelMutations()
   const stopping = useLocalModelStopStatus()
   const presentation = Result.isSuccess(models) ? modelTrayPresentation(models.value) : null
@@ -393,12 +414,18 @@ function ModelStatus() {
         {active ? <ModelLogo model={active.model} className="size-6 shrink-0" /> : <CubeIcon aria-hidden="true" className="size-5 shrink-0 text-slate-400 dark:text-slate-500" />}
         <div className="flex min-w-0 items-baseline gap-2">
           <p title={active ? formatLocalModelDisplayName(active.model) : undefined} className={`m-0 min-w-0 truncate ${active ? "text-base font-medium text-slate-800 dark:text-slate-200" : "text-sm text-slate-500 dark:text-slate-400"}`}>{active ? formatLocalModelDisplayName(active.model) : presentation?.label ?? (Result.isFailure(models) ? "Model status unavailable" : "Reading model status…")}</p>
-          {active && <><span aria-hidden="true" className="text-slate-400 dark:text-slate-500">·</span><span className={`shrink-0 text-xs ${active.residency._tag === "Ready" ? "text-green-700 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>{active.residency._tag === "Ready" ? "Loaded" : active.residency._tag === "Requested" ? "Queued" : `${active.residency._tag}…`}</span></>}
+          {active && <><span aria-hidden="true" className="text-slate-400 dark:text-slate-500">·</span><span className={`shrink-0 text-xs ${active.residency._tag === "Ready" ? "text-green-700 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>{modelStatusText(active.residency, Result.isSuccess(hardware) ? Option.some(hardware.value) : Option.none())}</span></>}
         </div>
       </div>
       {presentation?.canStop && <Button variant="outline" className="hover:border-red-300 hover:text-red-600 dark:hover:border-red-800 dark:hover:text-red-400" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button>}
     </div>
-    {active?.residency._tag === "Loading" && <div className="mt-4"><Progress aria-label="Model loading progress" indicatorClassName="bg-blue-700 dark:bg-blue-500" value={Option.match(active.residency.progress, { onNone: () => null, onSome: fraction => fraction * 100 })} /></div>}
+    {active && Option.match(loadFraction(active.residency), {
+      onNone: () => null,
+      onSome: fraction => <div className="mt-4 flex items-center gap-3">
+        <Progress aria-label="Model loading progress" className="flex-1" indicatorClassName="bg-blue-700 dark:bg-blue-500" value={fraction * 100} />
+        <span className="w-9 shrink-0 text-right text-xs tabular-nums text-slate-500 dark:text-slate-400">{formatModelLoadPercentage(fraction)}</span>
+      </div>,
+    })}
     {Result.isFailure(models) && <p role="alert" className="mt-2 text-sm text-slate-500">{localModelFailureMessage(models.cause, "Could not read model status. Check Status and try again.")}</p>}
     {Option.isSome(stopping.failure) && <p role="alert" className="mt-2 text-sm">{stopping.failure.value}</p>}
   </div>

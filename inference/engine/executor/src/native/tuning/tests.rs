@@ -499,10 +499,10 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
     );
     assert!(case.seen.borrow().is_empty() && recorder.0.borrow().is_empty());
     let budgets = census.budgets();
-    assert_eq!(
-        budgets.0.values().copied().collect::<Vec<_>>(),
-        [MODEL_BUDGET.min(configurations)]
-    );
+    let budget = MODEL_BUDGET.min(configurations);
+    assert_eq!(budgets.budgets.values().copied().collect::<Vec<_>>(), [budget]);
+    // Without a cache, every unit searches.
+    assert_eq!(budgets.searching.len(), 1);
     let mut tuner = Tuner::new(
         &device,
         context,
@@ -523,8 +523,16 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
         .iter()
         .all(|(_, _, rotation)| *rotation == ROTATION_LAYERS));
     let events = recorder.0.borrow();
+    // Progress is reported before the search and after it, in budget.
+    assert_eq!(
+        events[0],
+        TuningEvent::Progress {
+            completed: 0,
+            total: budget
+        }
+    );
     assert!(matches!(
-        &events[0],
+        &events[1],
         TuningEvent::Started {
             entry: "dense_output",
             configurations: count,
@@ -532,9 +540,16 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
             ..
         } if *count == configurations
     ));
-    let TuningEvent::Finished(tuned) = &events[1] else {
+    let TuningEvent::Finished(tuned) = &events[2] else {
         panic!("tuning reports completion");
     };
+    assert_eq!(
+        events[3],
+        TuningEvent::Progress {
+            completed: budget,
+            total: budget
+        }
+    );
     assert_eq!((tuned.measured, tuned.excluded, tuned.defects), (1, 1, 1));
     assert_eq!(tuner.tuned(), [tuned.clone()]);
 }
@@ -570,8 +585,9 @@ fn a_stored_tuning_result_is_used_without_tuning_and_a_changed_key_misses() {
         context_tokens: 256,
     };
     // One load: a census, then tuning within its budgets. Returns the unit's
-    // outcome and whether tuning started.
-    let load_once = |case: &FakeCase, limits: TuningLimits| -> (TunedEntry, bool) {
+    // outcome, whether tuning started, and the search budget the census
+    // planned before tuning.
+    let load_once = |case: &FakeCase, limits: TuningLimits| -> (TunedEntry, bool, usize) {
         let recorder = Recorder::default();
         let context = TuningContext {
             definition: &definition,
@@ -586,28 +602,36 @@ fn a_stored_tuning_result_is_used_without_tuning_and_a_changed_key_misses() {
         let chosen = tuner.tune(case, &implementation, &statics).unwrap();
         let tuned = tuner.tuned().pop().unwrap();
         assert_eq!(chosen, tuned.overall.specialization());
-        let started = recorder
-            .0
-            .borrow()
+        let events = recorder.0.borrow();
+        let started = events
             .iter()
             .any(|event| matches!(event, TuningEvent::Started { .. }));
-        (tuned, started)
+        let TuningEvent::Progress {
+            completed: 0,
+            total: planned,
+        } = events[0]
+        else {
+            panic!("tuning reports its plan first");
+        };
+        (tuned, started, planned)
     };
     let stored_results = || std::fs::read_dir(root.join("tuning")).unwrap().count();
 
     let first = FakeCase::new(&implementation, &statics, "implementation a");
-    let (searched, started) = load_once(&first, limits);
+    let (searched, started, planned) = load_once(&first, limits);
     assert_eq!(searched.origin, TuningOrigin::Searched);
     assert!(started && !first.seen.borrow().is_empty());
+    assert!(planned > 0, "the census plans a search it has no result for");
     assert_eq!(stored_results(), 1);
 
     let again = FakeCase::new(&implementation, &statics, "implementation a");
-    let (stored, started) = load_once(&again, limits);
+    let (stored, started, planned) = load_once(&again, limits);
     assert_eq!(stored.origin, TuningOrigin::Stored);
     assert!(
         !started && again.seen.borrow().is_empty(),
         "a stored result is not tuned"
     );
+    assert_eq!(planned, 0, "the census finds the stored result before tuning");
     assert_eq!(stored.overall, searched.overall);
     assert_eq!(stored.overall.launches[0]["ROWS"], 2);
     assert_eq!(
@@ -673,7 +697,10 @@ fn tuning_a_weight_without_its_import_entry_is_a_typed_failure() {
         },
         LIMITS,
         TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
-        TuningBudgets([(key, 4)].into_iter().collect()),
+        TuningBudgets {
+            budgets: [(key.clone(), 4)].into_iter().collect(),
+            searching: [key].into_iter().collect(),
+        },
     );
     assert!(matches!(
         tuner.tune(&case, &implementation, &statics),

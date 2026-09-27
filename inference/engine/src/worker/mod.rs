@@ -34,6 +34,7 @@ use magnitude_state::CodecIdentity;
 use protocol::{EngineBuild, HostMessage, WorkerMessage};
 use seismic::DeviceCatalog;
 use session::{Loaded, Outbound, Session, Signal};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use transport::{MessageReceiver, MessageSender, WorkerTransport};
 
@@ -188,17 +189,22 @@ fn load(
     let ready_path = manifest.path;
     let codec = manifest.model.kv_codec;
     let host_package = package.clone();
-    let phases = outbound.clone();
+    let progress_outbound = outbound.clone();
     let owner_notice = notice.clone();
     let factory = move || -> Result<(Box<dyn Driven>, (ExecutionReady, u64, MemoryDomain)), LoadError> {
         let catalog = DeviceCatalog::discover().map_err(|error| internal(error.to_string()))?;
-        let built = crate::execution::build(catalog, &manifest, package, &mut |phase| {
-            // A host that is gone is noticed by the session reader.
-            let _ = phases
-                .lock()
-                .unwrap()
-                .send(WorkerMessage::LoadPhase { phase });
-        })?;
+        let built = crate::execution::build(
+            catalog,
+            &manifest,
+            package,
+            Rc::new(move |progress| {
+                // A host that is gone is noticed by the session reader.
+                let _ = progress_outbound
+                    .lock()
+                    .unwrap()
+                    .send(WorkerMessage::LoadProgress { progress });
+            }),
+        )?;
         if built.domain.execution_path() != manifest.path {
             return Err(internal("executor domain differs from the planned execution path"));
         }

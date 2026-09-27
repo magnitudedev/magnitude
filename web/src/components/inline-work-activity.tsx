@@ -1,11 +1,11 @@
 import { useSyncExternalStore, type ReactNode } from "react"
-import { Option } from "effect"
 import type { DisplayRootStatus } from "@magnitudedev/sdk"
 import {
   displayRootStatusElapsedMs,
   formatElapsedMs,
   formatTokenCount,
   getTickSnapshot,
+  isMeasuredModelLoadStage,
   subscribeNoop,
   subscribeTick,
   useStabilizedRootDetail,
@@ -45,11 +45,8 @@ function ModelLoadingActivity({
 }): ReactNode {
   const residency = activity.residency
   if (residency._tag !== "Requested" && residency._tag !== "Loading") return null
-  const percentage = residency._tag === "Loading"
-    ? Option.match(residency.progress, {
-        onNone: () => null,
-        onSome: (progress) => Math.min(100, Math.max(0, Math.round(progress * 100))),
-      })
+  const percentage = residency._tag === "Loading" && isMeasuredModelLoadStage(residency.stage)
+    ? Math.floor(residency.fraction * 100)
     : null
   const label = modelName === null ? "Loading model" : `Loading ${modelName}`
   return (

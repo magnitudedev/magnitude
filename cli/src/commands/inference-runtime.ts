@@ -3,8 +3,11 @@ import {
   formatLocalInferenceBackend,
   formatLocalModelDisplayName,
   formatMemorySize,
+  formatModelLoadPercentage,
+  formatModelLoadStage,
   formatSpeculativeMethod,
   formatStorageSize,
+  isMeasuredModelLoadStage,
   LOCAL_MODEL_RANKING_SCALE_LABELS,
   LOCAL_MODEL_RANKING_SCALE_VALUES,
   localModelIsInstalled,
@@ -401,10 +404,9 @@ const residencyLabel = (model: CatalogLocalModel): string => {
   if (residency === undefined) return "Unloaded"
   switch (residency._tag) {
     case "Requested": return "Loading"
-    case "Loading": return Option.match(residency.progress, {
-      onNone: () => "Loading",
-      onSome: (progress) => `Loading ${Math.round(progress * 100)}%`,
-    })
+    case "Loading": return isMeasuredModelLoadStage(residency.stage)
+      ? `${formatModelLoadStage(residency.stage)} ${formatModelLoadPercentage(residency.fraction)}`
+      : formatModelLoadStage(residency.stage)
     case "Failed": return `Failed - ${residency.failure.message}`
     default: return residency._tag
   }

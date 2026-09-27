@@ -263,6 +263,17 @@ pub struct MappedImportReport {
     pub publishing: Duration,
 }
 
+/// Observes a component import in resident bytes: completed, then total.
+pub type ImportObserver = Box<dyn Fn(u64, u64)>;
+
+/// The resident bytes of the component import in progress and where they are
+/// reported.
+struct ImportProgress {
+    completed: u64,
+    total: u64,
+    observer: ImportObserver,
+}
+
 /// Sole cache and importer for one planned device. Resident components are
 /// assembled from this store before their numerical programs are bound.
 pub struct ResidencyStore {
@@ -272,6 +283,7 @@ pub struct ResidencyStore {
     domain: ResourceDomainId,
     resident: HashMap<ResidencyKey, ResidentWeight>,
     mapped_import: MappedImportReport,
+    import_progress: Option<ImportProgress>,
 }
 
 
@@ -297,7 +309,22 @@ impl ResidencyStore {
             domain,
             resident: HashMap::new(),
             mapped_import: MappedImportReport::default(),
+            import_progress: None,
         })
+    }
+
+    /// Cache a completed import, counting it toward the import in progress.
+    fn publish(&mut self, key: ResidencyKey, weight: ResidentWeight) {
+        if let Some(progress) = &mut self.import_progress {
+            // Planned and allocated storage agree; the bound keeps a
+            // disagreement from reporting past completion.
+            progress.completed = progress
+                .completed
+                .saturating_add(weight.tensor.storage_bytes())
+                .min(progress.total);
+            (progress.observer)(progress.completed, progress.total);
+        }
+        self.resident.insert(key, weight);
     }
 
     pub fn device(&self) -> &Device {
@@ -376,7 +403,7 @@ impl ResidencyStore {
             descriptor,
             tensor: destination.into_tensor(),
         };
-        self.resident.insert(key, weight.clone());
+        self.publish(key, weight.clone());
         Ok(weight)
     }
 
@@ -624,7 +651,7 @@ impl ResidencyStore {
                 for (key, descriptor, launch) in pending {
                     let (_, workspace, destination) = launch.into_submission_parts();
                     drop(workspace);
-                    self.resident.insert(
+                    self.publish(
                         key,
                         ResidentWeight {
                             descriptor,
@@ -640,19 +667,44 @@ impl ResidencyStore {
         Ok(())
     }
 
+    /// Import the target, reporting its resident bytes to `observer` from
+    /// none to all of them.
     pub fn load_target(
         &mut self,
         definition: &magnitude_family_contracts::ModelDefinition,
         package: &magnitude_artifacts::Package,
+        observer: ImportObserver,
     ) -> Result<crate::ResidentTarget, crate::ResidencyError> {
         crate::resident_weights::validate_definition_package(definition, package)?;
         let weights = self.execution.load().target().to_vec();
-        self.preload_component(
-            package.target(),
-            &weights,
-            crate::resident_weights::activation_dtype(definition.geometry.activation_dtype),
-        )?;
-        crate::resident_weights::import_target(definition, package, self)
+        let mut storage = HashSet::new();
+        let total = weights
+            .iter()
+            .filter(|weight| storage.insert(weight.storage_identity()))
+            .map(|weight| weight.resident_bytes)
+            .sum();
+        observer(0, total);
+        self.import_progress = Some(ImportProgress {
+            completed: 0,
+            total,
+            observer,
+        });
+        let target = self
+            .preload_component(
+                package.target(),
+                &weights,
+                crate::resident_weights::activation_dtype(definition.geometry.activation_dtype),
+            )
+            .map_err(crate::ResidencyError::from)
+            .and_then(|()| crate::resident_weights::import_target(definition, package, self));
+        let progress = self
+            .import_progress
+            .take()
+            .expect("the target import owns its progress");
+        if target.is_ok() && progress.completed < progress.total {
+            (progress.observer)(progress.total, progress.total);
+        }
+        target
     }
 
     pub fn load_head(

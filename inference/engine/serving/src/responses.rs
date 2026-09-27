@@ -30,9 +30,12 @@ use utoipa::openapi::Ref;
 use utoipa::openapi::schema::AnyOfBuilder;
 use utoipa::{PartialSchema, ToSchema};
 
-use crate::chat::{ReasoningEffortRequest, admitted, collect, ended_without_outcome};
+use crate::chat::{
+    ChatCompletionProgress, ReasoningEffortRequest, admitted, collect, ended_without_outcome,
+    progress_value,
+};
 use crate::error::{ApiError, ApiErrorBody, ErrorResponse, ServingError};
-use crate::source::{GenerationEvent, GenerationStream, LoadProgress};
+use crate::source::{GenerationEvent, GenerationStream, LoadProgress, ModelLoadProgress};
 use crate::{Serving, include_progress, media, unix_timestamp, with_request_id};
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -430,22 +433,9 @@ impl StreamProjector {
     }
 
     async fn progress(&self, progress: Progress) -> Result<(), Disconnected> {
-        let progress = match progress {
-            Progress::Queued => serde_json::json!({ "phase": "queued" }),
-            Progress::Preparing => serde_json::json!({ "phase": "preparing" }),
-            Progress::Prefill {
-                completed_tokens,
-                total_tokens,
-                cached_tokens,
-            } => serde_json::json!({
-                "phase": "prefill", "completed_tokens": completed_tokens,
-                "total_tokens": total_tokens, "cached_tokens": cached_tokens,
-            }),
-            Progress::Generating => serde_json::json!({ "phase": "generating" }),
-        };
         self.send(
             "response.magnitude_progress",
-            serde_json::json!({ "response_id": self.id, "progress": progress }),
+            serde_json::json!({ "response_id": self.id, "progress": progress_value(progress) }),
         )
         .await
     }
@@ -686,13 +676,13 @@ fn send_loading_progress(
     sender: &mpsc::Sender<Value>,
     sequence: &AtomicU64,
     response_id: &str,
-    fraction: f32,
+    load: ModelLoadProgress,
 ) {
     let value = serde_json::json!({
         "type": "response.magnitude_progress",
         "sequence_number": sequence.fetch_add(1, Ordering::Relaxed),
         "response_id": response_id,
-        "progress": { "phase": "model_loading", "fraction": fraction },
+        "progress": ChatCompletionProgress::model_loading(load),
     });
     let _ = sender.try_send(value);
 }
@@ -1574,8 +1564,8 @@ async fn start_response_stream(
     );
     if include_progress {
         let progress_id = id.clone();
-        let progress: LoadProgress = Arc::new(move |fraction| {
-            send_loading_progress(&sender, &sequence, &progress_id, fraction);
+        let progress: LoadProgress = Arc::new(move |load| {
+            send_loading_progress(&sender, &sequence, &progress_id, load);
         });
         tokio::spawn(async move {
             if projector.created().await.is_err() {

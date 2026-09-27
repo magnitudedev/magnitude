@@ -5,7 +5,7 @@
 use crate::census::MemoryDomain;
 use crate::error::{classify_plan, classify_platform, ArtifactError, InsufficientMemory, LoadError};
 use crate::options::ExecutionManifest;
-use crate::worker::protocol::LoadPhase;
+use crate::worker::protocol::LoadProgress;
 use magnitude_artifacts::Package;
 use magnitude_batching::Demand;
 use magnitude_executor::{
@@ -46,14 +46,14 @@ pub fn build_native_domain(
     package: Arc<Package>,
 ) -> Result<(ExecutorDomain, ResourcePlan), LoadError> {
     let catalog = DeviceCatalog::discover().map_err(|error| internal(error.to_string()))?;
-    build(catalog, manifest, package, &mut |_| {}).map(|built| (built.domain, built.plan))
+    build(catalog, manifest, package, Rc::new(|_| {})).map(|built| (built.domain, built.plan))
 }
 
 pub(crate) fn build(
     catalog: DeviceCatalog,
     manifest: &ExecutionManifest,
     package: Arc<Package>,
-    phase: &mut dyn FnMut(LoadPhase),
+    progress: Rc<dyn Fn(LoadProgress)>,
 ) -> Result<NativeDomain, LoadError> {
     let mut phase_started = Instant::now();
     if package.manifest() != manifest.package {
@@ -61,7 +61,7 @@ pub(crate) fn build(
             reason: "opened package differs from the execution manifest".into(),
         }));
     }
-    phase(LoadPhase::Planning);
+    progress(LoadProgress::Preparing);
     // This runs inside the numerical worker: its own Seismic catalog and its
     // own process-scoped observations decide selection and admission. An
     // exact selector from the host is re-resolved here; a missing or
@@ -104,7 +104,6 @@ pub(crate) fn build(
         .transpose()
         .map_err(|error| internal(error.to_string()))?;
     report_load_phase("device selection and planning", &mut phase_started);
-    phase(LoadPhase::OpeningDevice);
     let opened = platform::open_selected(
         &catalog,
         draft.device().selector(),
@@ -118,7 +117,6 @@ pub(crate) fn build(
     )
     .map_err(platform_error)?;
     report_load_phase("device open", &mut phase_started);
-    phase(LoadPhase::PreparingPrograms);
     let preparing = Instant::now();
     let mut programs = AttestedPrograms::prepare_draft(
         &draft,
@@ -126,7 +124,9 @@ pub(crate) fn build(
         TuningContext {
             definition: &manifest.definition,
             weights: package.as_ref(),
-            observer: &LoadProgress,
+            observer: &TuningReport {
+                progress: progress.clone(),
+            },
             cache: kernel_cache.as_deref(),
         },
     )
@@ -222,7 +222,6 @@ pub(crate) fn build(
         opened.selector(),
     ))
     .map_err(internal)?;
-    phase(LoadPhase::ImportingWeights);
     let device = Rc::new(opened.into_device());
     let programs = Rc::new(programs);
     let target_graphs = programs
@@ -271,8 +270,18 @@ pub(crate) fn build(
         .checked_add(target_upload)
         .ok_or_else(|| internal("target import peak byte count overflow"))?;
     startup.claim("target import", target_peak, target_upload)?;
+    let import_progress = progress.clone();
     let target = residency
-        .load_target(&manifest.definition, &package)
+        .load_target(
+            &manifest.definition,
+            &package,
+            Box::new(move |completed_bytes, total_bytes| {
+                import_progress(LoadProgress::ImportingWeights {
+                    completed_bytes,
+                    total_bytes,
+                })
+            }),
+        )
         .map_err(|error| internal(error.to_string()))?;
     eprintln!(
         "magnitude-engine: resident target imported in {:.2} s ({} distinct weights)",
@@ -293,7 +302,7 @@ pub(crate) fn build(
         );
     }
     phase_started = Instant::now();
-    phase(LoadPhase::Finalizing);
+    progress(LoadProgress::Finalizing);
     let definition = Rc::new(manifest.definition.clone());
     let head_loader = head_enabled
         .then(|| ComponentLoader::head(residency, definition.clone(), package.clone()))
@@ -488,13 +497,24 @@ fn warm_up(domain: &mut ExecutorDomain) -> Result<(), LoadError> {
     Ok(())
 }
 
-/// Reports tuning at load on the engine's diagnostic stream while the worker
-/// is not yet ready.
-struct LoadProgress;
+/// Reports tuning at load: its progress to the host, and each unit on the
+/// engine's diagnostic stream while the worker is not yet ready.
+struct TuningReport {
+    progress: Rc<dyn Fn(LoadProgress)>,
+}
 
-impl TuningObserver for LoadProgress {
+impl TuningObserver for TuningReport {
     fn event(&self, event: &TuningEvent) {
         match event {
+            // A load whose every unit has a stored result does not tune.
+            TuningEvent::Progress { completed, total } => {
+                if *total > 0 {
+                    (self.progress)(LoadProgress::Tuning {
+                        completed: *completed as u64,
+                        total: *total as u64,
+                    });
+                }
+            }
             TuningEvent::Started {
                 entry,
                 bindings,

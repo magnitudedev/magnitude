@@ -106,11 +106,21 @@ process keeps the model's chat semantics.
 A load resolves the model's installed material through the service's single resolved-configuration
 cache, which host-only operations (counting, template application, properties) share, so no second
 tokenizer, template or properties path exists and those operations never lease or load. The load
-then waits while memory admission is closed (stage `Queued`), previews itself on the service's
+then waits while memory admission is closed (stage `queued`), previews itself on the service's
 device catalog (the same engine preview the load-plan endpoint returns), and has the worker load
-exactly the previewed device with the service's kernel cache and reserve policy. The worker's load
-phases (planning, opening the device, preparing programs, importing weights, finalizing) drive
-`Loading` progress; there is no timing estimate. Readiness is verified before the Instance is
+exactly the previewed device with the service's kernel cache and reserve policy.
+
+`Loading` carries a `stage` and a `fraction`, both measured from the worker's work and never from
+time. The stages are `queued`, `preparing` (resolution, planning, opening the device, preparing
+programs), `optimizing` (kernel tuning), `loading_weights` and `finalizing` (state allocation,
+warm-up, readiness verification). Before tuning begins the worker counts its tuning units and
+finds each one's stored result, so a load enters `optimizing` only when it will search, and knows
+this before any tuning or weight import starts. Tuning progress is the configuration budget of
+the searched units over that of every unit that searches; weight progress is resident bytes
+imported over the target's. A load that tunes fills the fraction's first half with tuning and the
+second with weights; one that does not fills it with weights. The fraction is monotonic, stays at
+zero until measured work starts, and holds through `finalizing`; only `Ready` means the load is
+complete. Progress is published in bounded steps rather than per unit or weight. Readiness is verified before the Instance is
 Ready: the worker must report the package identity the host resolved, the chat-template
 fingerprint and input modalities it read from its own opened package equal to the host's, and the
 previewed device. The
@@ -136,7 +146,8 @@ and atomically acquire a request lease before invoking the backend. There is no 
 slot load request, or caller-supplied instance identity.
 
 When `Magnitude-Include-Progress: true` is present, streaming endpoints begin their SSE response
-before acquisition and publish meaningful model-loading progress on the same response stream.
+before acquisition and publish model-loading progress on the same response stream: the Instance's
+`stage` and `fraction` under the same names and values as the Instance status.
 Ordinary consumers wait through acquisition and inference admission before opening a successful
 stream. They receive only the standard inference stream.
 

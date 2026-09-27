@@ -28,7 +28,8 @@ use axum::routing::{get, post};
 pub use error::{ApiError, ApiErrorBody, ErrorResponse, ModelUnavailable, ServingError};
 pub use media::MAX_HTTP_BODY_BYTES;
 pub use source::{
-    GenerationEvent, GenerationStream, HostChat, LoadProgress, ModelInvocation, ServedModels,
+    GenerationEvent, GenerationStream, HostChat, LoadProgress, ModelInvocation, ModelLoadProgress,
+    ModelLoadStage, ServedModels,
 };
 
 /// Protocol handler state: the model source and response identities.

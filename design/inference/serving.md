@@ -88,7 +88,8 @@ still used by peers.
 An ordinary stream commits its HTTP response only after the engine admitted the
 request, so preparation and admission failures keep their HTTP status. A
 progress stream (`Magnitude-Include-Progress`) commits immediately, reports
-model loading and request stages (preparing, queued, prefill, generating; prefill
+model loading (its stage and fraction, named as the service's Instance status names
+them) and request stages (preparing, queued, prefill, generating; prefill
 reports completed, total and prefix-reused prompt tokens), and
 reports every later failure in-stream. Engine outcomes keep their typed meaning
 on the wire: memory, observation and capacity refusals are retryable 503s, an

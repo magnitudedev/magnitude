@@ -1106,6 +1106,40 @@ pub struct NativeGraph {
 pub struct NativeGraphMetadata {
     backend: BackendName,
     inner: seismic_runtime::native::graph::NativeGraphMetadataDraft,
+    template: Option<MetadataTemplateRecorder>,
+}
+
+struct MetadataTemplateRecorder {
+    ports: Vec<MetadataPortSource>,
+    nodes: Vec<MetadataNodeSource>,
+}
+
+enum MetadataPortSource {
+    Direct {
+        element: Element,
+        extents: Vec<u64>,
+        class_extent: Option<(usize, &'static str)>,
+    },
+    Checked {
+        checked: generated::NativeGraphCheckedEntry,
+        entry_name: &'static str,
+        parameter: String,
+        dimensions: Vec<(String, u64)>,
+    },
+}
+
+struct MetadataNodeSource {
+    checked: generated::NativeGraphCheckedEntry,
+    entry_name: &'static str,
+    dimensions: Vec<(String, u64)>,
+}
+
+/// One checked graph topology reused across numeric shape classes. Each
+/// evaluation asks the generated entry contracts for exact shapes and scratch
+/// before Seismic places the graph's original edges and lifetimes.
+pub struct NativeGraphResourceTemplate {
+    inner: seismic_runtime::native::graph::NativeGraphMetadataDraft,
+    recorder: MetadataTemplateRecorder,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1132,6 +1166,101 @@ impl fmt::Display for NativeGraphMetadataError {
 impl std::error::Error for NativeGraphMetadataError {}
 
 pub use seismic_runtime::native::graph::NativeGraphStorageBytes;
+
+fn owned_dimensions(dimensions: &[(&str, u64)]) -> Vec<(String, u64)> {
+    dimensions.iter().map(|(name, value)| ((*name).to_owned(), *value)).collect()
+}
+
+fn class_dimensions<'a>(
+    entry_name: &str,
+    dimensions: &'a [(String, u64)],
+    overrides: &[(&str, u64)],
+    scoped_overrides: &[(&str, &str, u64)],
+) -> Vec<(&'a str, u64)> {
+    dimensions
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str(),
+                scoped_overrides
+                    .iter()
+                    .find_map(|(entry, axis, value)| {
+                        (*entry == entry_name && *axis == name).then_some(*value)
+                    })
+                    .or_else(|| overrides
+                    .iter()
+                    .find_map(|(axis, value)| (*axis == name).then_some(*value)))
+                    .unwrap_or(*value),
+            )
+        })
+        .collect()
+}
+
+impl NativeGraphResourceTemplate {
+    pub fn evaluate(
+        &self,
+        overrides: &[(&str, u64)],
+        scoped_overrides: &[(&str, &str, u64)],
+    ) -> Result<NativeGraphStorageBytes, NativeGraphMetadataError> {
+        let mut ports = Vec::with_capacity(self.recorder.ports.len());
+        for source in &self.recorder.ports {
+            let (element, extents) = match source {
+                MetadataPortSource::Direct { element, extents, class_extent } => {
+                    let mut extents = extents.clone();
+                    if let Some((axis, name)) = class_extent {
+                        extents[*axis] = overrides
+                            .iter()
+                            .find_map(|(candidate, value)| (*candidate == *name).then_some(*value))
+                            .ok_or_else(|| NativeGraphMetadataError::Unsupported(format!(
+                                "graph resource class omitted dimension `{name}`"
+                            )))?;
+                    }
+                    (*element, extents)
+                }
+                MetadataPortSource::Checked {
+                    checked,
+                    entry_name,
+                    parameter,
+                    dimensions,
+                } => {
+                    let dimensions = class_dimensions(entry_name, dimensions, overrides, scoped_overrides);
+                    let metadata = checked.parameter(parameter, &dimensions)
+                        .map_err(NativeGraphMetadataError::Unsupported)?;
+                    (metadata.element, metadata.extents)
+                }
+            };
+            ports.push((element.id(), extents));
+        }
+        let mut nodes = Vec::with_capacity(self.recorder.nodes.len());
+        for source in &self.recorder.nodes {
+            let dimensions = class_dimensions(source.entry_name, &source.dimensions, overrides, scoped_overrides);
+            let (parameters, results) = source.checked.shapes(&dimensions)
+                .map_err(NativeGraphMetadataError::Unsupported)?;
+            let scratch = checked_native_scratch_bound(
+                &source.checked.implementation().scratch,
+                &source.checked.implementation().params,
+                &dimensions,
+            )
+            .map_err(|reason| NativeGraphMetadataError::Unsupported(format!(
+                "`{}` scratch bound: {reason}", source.entry_name
+            )))?;
+            nodes.push(seismic_runtime::native::graph::NativeGraphNodeShape {
+                parameters: parameters
+                    .into_iter()
+                    .map(|shape| shape.map(|metadata| (metadata.element.id(), metadata.extents)))
+                    .collect(),
+                results: results
+                    .into_iter()
+                    .map(|shape| shape.map(|metadata| (metadata.element.id(), metadata.extents)))
+                    .collect(),
+                scratch,
+            });
+        }
+        self.inner
+            .rebound_storage(&ports, nodes)
+            .map_err(NativeGraphMetadataError::Call)
+    }
+}
 
 fn checked_native_scratch_bound(
     scratch_buffers: &[NativeScratch],
@@ -1254,6 +1383,18 @@ impl NativeGraphMetadata {
         Self {
             backend,
             inner: seismic_runtime::native::graph::NativeGraphMetadataDraft::new(),
+            template: None,
+        }
+    }
+
+    pub fn new_template(backend: BackendName) -> Self {
+        Self {
+            backend,
+            inner: seismic_runtime::native::graph::NativeGraphMetadataDraft::new(),
+            template: Some(MetadataTemplateRecorder {
+                ports: Vec::new(),
+                nodes: Vec::new(),
+            }),
         }
     }
 
@@ -1266,12 +1407,43 @@ impl NativeGraphMetadata {
             .inner
             .port(element.id(), extents, false, false)
             .map_err(NativeGraphMetadataError::Tensor)?;
+        if let Some(template) = &mut self.template {
+            template.ports.push(MetadataPortSource::Direct {
+                element,
+                extents: extents.to_vec(),
+                class_extent: None,
+            });
+        }
         Ok(NativePort {
             tensor: WorkflowTensor {
                 inner: inner.reference(),
             },
             inner,
         })
+    }
+
+    /// Mark one direct port extent as a graph-class dimension. Checked entry
+    /// ports already carry named dimensions in their declarations.
+    pub fn port_with_class_extent(
+        &mut self,
+        element: Element,
+        extents: &[u64],
+        extent_axis: usize,
+        class_dimension: &'static str,
+    ) -> Result<NativePort, NativeGraphMetadataError> {
+        let port = self.port(element, extents)?;
+        if let Some(template) = &mut self.template {
+            let Some(MetadataPortSource::Direct { class_extent, .. }) = template.ports.last_mut() else {
+                unreachable!("direct port was just recorded")
+            };
+            if extent_axis >= extents.len() {
+                return Err(NativeGraphMetadataError::Unsupported(format!(
+                    "graph port extent axis {extent_axis} is absent"
+                )));
+            }
+            *class_extent = Some((extent_axis, class_dimension));
+        }
+        Ok(port)
     }
 
     pub fn input_for<E: Entry>(
@@ -1297,6 +1469,17 @@ impl NativeGraphMetadata {
             .inner
             .port(metadata.element.id(), &metadata.extents, true, true)
             .map_err(NativeGraphMetadataError::Tensor)?;
+        if let Some(template) = &mut self.template {
+            let checked = generated::NativeGraphCheckedEntry::bind::<E>(self.backend, elements)
+                .map_err(NativeGraphMetadataError::Bundle)?
+                .map_err(NativeGraphMetadataError::Unsupported)?;
+            template.ports.push(MetadataPortSource::Checked {
+                checked,
+                entry_name: E::NAME,
+                parameter: parameter.to_owned(),
+                dimensions: owned_dimensions(dimensions),
+            });
+        }
         Ok(NativePort {
             tensor: WorkflowTensor {
                 inner: inner.reference(),
@@ -1328,6 +1511,17 @@ impl NativeGraphMetadata {
             .inner
             .port(metadata.element.id(), &metadata.extents, true, false)
             .map_err(NativeGraphMetadataError::Tensor)?;
+        if let Some(template) = &mut self.template {
+            let checked = generated::NativeGraphCheckedEntry::bind::<E>(self.backend, elements)
+                .map_err(NativeGraphMetadataError::Bundle)?
+                .map_err(NativeGraphMetadataError::Unsupported)?;
+            template.ports.push(MetadataPortSource::Checked {
+                checked,
+                entry_name: E::NAME,
+                parameter: parameter.to_owned(),
+                dimensions: owned_dimensions(dimensions),
+            });
+        }
         Ok(NativePort {
             tensor: WorkflowTensor {
                 inner: inner.reference(),
@@ -1348,14 +1542,19 @@ impl NativeGraphMetadata {
         dimensions: &[(&str, u64)],
         args: E::WorkflowArgs<'_>,
     ) -> Result<E::WorkflowResults, NativeGraphMetadataError> {
-        let implementation = generated::native_implementation_for_backend::<E>(self.backend)
-            .map_err(NativeGraphMetadataError::Bundle)?
-            .ok_or_else(|| {
-                NativeGraphMetadataError::Unsupported(format!(
-                    "`{}` has no native implementation",
-                    E::NAME
-                ))
-            })?;
+        let (implementation, parameters, results) =
+            match generated::checked_native_graph_call::<E>(self.backend, elements, dimensions)
+                .map_err(NativeGraphMetadataError::Bundle)?
+            {
+                generated::CheckedNativeGraphCall::Checked {
+                    implementation,
+                    parameters,
+                    results,
+                } => (implementation, parameters, results),
+                generated::CheckedNativeGraphCall::Unsupported(reason) => {
+                    return Err(NativeGraphMetadataError::Unsupported(reason));
+                }
+            };
         let scratch = checked_native_scratch_bound(
             &implementation.scratch,
             &implementation.params,
@@ -1364,31 +1563,10 @@ impl NativeGraphMetadata {
         .map_err(|reason| {
             NativeGraphMetadataError::Unsupported(format!("`{}` scratch bound: {reason}", E::NAME))
         })?;
-        let results =
-            match generated::checked_native_tensor_results::<E>(self.backend, elements, dimensions)
-                .map_err(NativeGraphMetadataError::Bundle)?
-            {
-                NativeTensorResultsCheck::Checked(results) => results,
-                NativeTensorResultsCheck::Unsupported(reason) => {
-                    return Err(NativeGraphMetadataError::Unsupported(reason));
-                }
-            };
         let shapes = results
             .into_iter()
             .map(|result| result.map(|metadata| (metadata.element.id(), metadata.extents)))
             .collect();
-        let parameters = match generated::checked_native_tensor_parameters::<E>(
-            self.backend,
-            elements,
-            dimensions,
-        )
-        .map_err(NativeGraphMetadataError::Bundle)?
-        {
-            NativeTensorResultsCheck::Checked(parameters) => parameters,
-            NativeTensorResultsCheck::Unsupported(reason) => {
-                return Err(NativeGraphMetadataError::Unsupported(reason));
-            }
-        };
         let parameter_shapes = parameters
             .into_iter()
             .map(|parameter| parameter.map(|metadata| (metadata.element.id(), metadata.extents)))
@@ -1397,6 +1575,16 @@ impl NativeGraphMetadata {
             .inner
             .enqueue(E::encode_workflow(args), parameter_shapes, shapes, scratch)
             .map_err(NativeGraphMetadataError::Call)?;
+        if let Some(template) = &mut self.template {
+            let checked = generated::NativeGraphCheckedEntry::bind::<E>(self.backend, elements)
+                .map_err(NativeGraphMetadataError::Bundle)?
+                .map_err(NativeGraphMetadataError::Unsupported)?;
+            template.nodes.push(MetadataNodeSource {
+                checked,
+                entry_name: E::NAME,
+                dimensions: owned_dimensions(dimensions),
+            });
+        }
         Ok(E::decode_workflow(pending))
     }
 
@@ -1410,6 +1598,19 @@ impl NativeGraphMetadata {
         self.inner
             .seal()
             .map_err(NativeGraphMetadataError::Workflow)
+    }
+
+    pub fn seal_template(self) -> Result<NativeGraphResourceTemplate, NativeGraphMetadataError> {
+        self.inner
+            .validate_topology()
+            .map_err(NativeGraphMetadataError::Workflow)?;
+        let recorder = self.template.ok_or_else(|| {
+            NativeGraphMetadataError::Unsupported("graph was not built as a resource template".into())
+        })?;
+        Ok(NativeGraphResourceTemplate {
+            inner: self.inner,
+            recorder,
+        })
     }
 }
 
@@ -2027,6 +2228,7 @@ pub mod generated {
         entry: seismic_lang::ids::EntryId,
         bindings: seismic_lang::entry::ElementBindings,
         logical: Arc<seismic_lang::entry::LogicalEntry>,
+        compiled_shapes: Arc<OnceLock<Arc<seismic_lang::entry::CompiledEntryShapes>>>,
     }
 
     const LOGICAL_ENTRY_CACHE_CAPACITY: usize = 64;
@@ -2108,8 +2310,28 @@ pub mod generated {
                 entry,
                 bindings: bindings.clone(),
                 logical: logical.clone(),
+                compiled_shapes: Arc::new(OnceLock::new()),
             });
             Ok(logical)
+        }
+
+        fn compiled_entry_shapes(
+            &self,
+            entry: seismic_lang::ids::EntryId,
+            bindings: &seismic_lang::entry::ElementBindings,
+        ) -> Result<Arc<seismic_lang::entry::CompiledEntryShapes>, seismic_lang::checked::SourceError> {
+            let logical = self.logical_entry(entry, bindings)?;
+            let cell = self
+                .logical_entries
+                .lock()
+                .expect("checked-entry cache mutex poisoned")
+                .iter()
+                .find(|item| item.entry == entry && item.bindings == *bindings)
+                .map(|item| item.compiled_shapes.clone());
+            Ok(match cell {
+                Some(cell) => cell.get_or_init(|| Arc::new(logical.compile_tensor_shapes())).clone(),
+                None => Arc::new(logical.compile_tensor_shapes()),
+            })
         }
 
         #[cfg(test)]
@@ -2366,6 +2588,126 @@ pub mod generated {
             .checked()
             .native_implementation(entry.id(), backend)
             .cloned())
+    }
+
+    /// Resolve one metadata graph call from one checked entry and one set of
+    /// element bindings. The graph still validates every argument edge and
+    /// Seismic still places its storage when the graph seals.
+    pub enum CheckedNativeGraphCall {
+        Checked {
+            implementation: NativeImplementation,
+            parameters: Vec<Option<NativeTensorMetadata>>,
+            results: Vec<Option<NativeTensorMetadata>>,
+        },
+        Unsupported(String),
+    }
+
+    /// A checked entry and its backend declaration resolved once for a graph
+    /// resource template. Numeric dimensions can then be evaluated without
+    /// repeating module resolution or element monomorphization.
+    pub struct NativeGraphCheckedEntry {
+        shapes: Arc<seismic_lang::entry::CompiledEntryShapes>,
+        implementation: NativeImplementation,
+    }
+
+    impl NativeGraphCheckedEntry {
+        pub fn bind<E: Entry>(
+            backend: BackendName,
+            elements: &[(&str, Element)],
+        ) -> Result<Result<Self, String>, CheckedBundleError> {
+            let module = E::module()?;
+            let entry = E::resolve(module)?;
+            let Some(implementation) = module
+                .checked()
+                .native_implementation(entry.id(), backend)
+                .cloned()
+            else {
+                return Ok(Err(format!(
+                    "`{}` has no native implementation for `{}`",
+                    E::NAME,
+                    backend.as_str()
+                )));
+            };
+            let shapes = match module.compiled_entry_shapes(entry.id(), &element_bindings(elements)) {
+                Ok(shapes) => shapes,
+                Err(error) => return Ok(Err(error.to_string())),
+            };
+            Ok(Ok(Self {
+                shapes,
+                implementation,
+            }))
+        }
+
+        pub fn implementation(&self) -> &NativeImplementation {
+            &self.implementation
+        }
+
+        pub fn parameter(
+            &self,
+            name: &str,
+            dimensions: &[(&str, u64)],
+        ) -> Result<NativeTensorMetadata, String> {
+            self.shapes
+                .parameter_shape(name, dimensions)
+                .map_err(|error| error.to_string())
+                .and_then(tensor_metadata)
+        }
+
+        pub fn shapes(
+            &self,
+            dimensions: &[(&str, u64)],
+        ) -> Result<(
+            Vec<Option<NativeTensorMetadata>>,
+            Vec<Option<NativeTensorMetadata>>,
+        ), String> {
+            let (parameters, results) = self
+                .shapes
+                .all_shapes(dimensions)
+                .map_err(|error| error.to_string())?;
+            let parameters = parameters
+                .into_iter()
+                .map(|shape| shape.map(tensor_metadata).transpose())
+                .collect::<Result<Vec<_>, _>>()?;
+            let results = results
+                .into_iter()
+                .map(|shape| shape.map(tensor_metadata).transpose())
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((parameters, results))
+        }
+    }
+
+    fn tensor_metadata(
+        shape: seismic_lang::entry::CheckedTensorShape,
+    ) -> Result<NativeTensorMetadata, String> {
+        let element = Element(shape.representation);
+        let canonical_bytes = element
+            .canonical_byte_len(&shape.extents)
+            .map_err(|error| error.to_string())?;
+        Ok(NativeTensorMetadata {
+            element,
+            extents: shape.extents,
+            canonical_bytes,
+        })
+    }
+
+    pub fn checked_native_graph_call<E: Entry>(
+        backend: BackendName,
+        elements: &[(&str, Element)],
+        dimensions: &[(&str, u64)],
+    ) -> Result<CheckedNativeGraphCall, CheckedBundleError> {
+        let checked = match NativeGraphCheckedEntry::bind::<E>(backend, elements)? {
+            Ok(checked) => checked,
+            Err(reason) => return Ok(CheckedNativeGraphCall::Unsupported(reason)),
+        };
+        let (parameters, results) = match checked.shapes(dimensions) {
+            Ok(shapes) => shapes,
+            Err(reason) => return Ok(CheckedNativeGraphCall::Unsupported(reason)),
+        };
+        Ok(CheckedNativeGraphCall::Checked {
+            implementation: checked.implementation.clone(),
+            parameters,
+            results,
+        })
     }
 
     /// Check an entry's exact element bindings with the same checked-module

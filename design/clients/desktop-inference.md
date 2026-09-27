@@ -5,6 +5,8 @@ applies_to:
   - desktop/src/*.ts
   - desktop/src/*.tsx
   - packages/daemon-management/src/desktop-native/*-preferences.ts
+  - desktop/native/**
+  - desktop/scripts/build-native.ts
   - packages/storage/src/types/config.ts
   - packages/sdk/src/desktop-host.ts
   - packages/client-common/src/desktop/**
@@ -101,6 +103,16 @@ mutations used by the window. Window and tray model commands pass through the sh
 service; hooks expose actions and command status without exposing mutation atoms to the renderer.
 Tray model text is a disposable projection of the canonical model
 query. Loss of renderer observation disables model actions; it cannot imply no model is loaded.
+An active model's tray line is `<model> · <phase>` with, on the right, a spinner for work without a
+measure of its own, the percentage and a filling ring while tuning or importing weights, or the
+memory a loaded model holds. Phases are single words from a fixed set (Waiting, Preparing,
+Optimizing, Loading, Finalizing, Loaded, Stopping). On macOS the line is a native view on the menu
+item, drawn by the desktop's own tray addon (built with the desktop and shipped in its resources,
+separate from the desktop host addon), so it updates while the menu is open; main pops the menu up
+itself because Electron keeps running JavaScript only during a menu it pops up. Like a plain menu
+item the line fits the full model name, never truncating it: it holds room for the widest phase
+and detail so that only a model change alters its width, and an open menu never narrows. Other
+platforms show the same line as the item's plain label, current each time the menu opens.
 Main independently displays owned-service startup, recovery, failure, and shutdown.
 Stop remains available for an observed Stopping model, allowing explicit escalation or retry after
 cleanup failure. Window actions suppress duplicate requests while their mutation is pending and
@@ -157,6 +169,10 @@ also suppresses stale model controls. Model stopping uses the same canonical mut
 and model library.
 Status displays observed model-loading progress and current download, update, and removal activity.
 Unknown progress stays indeterminate; service or query unavailability cannot become an idle claim.
+While a model loads, its residency text names the stage in full (for example "Optimizing for
+<accelerator>…", "Loading weights…") and the bar below shows the load's measured fraction with its
+percentage to the bar's right; a requested load is preparing at zero, so nothing snaps back when it
+starts. A loaded model's residency text includes the memory it holds.
 
 Connection observations refresh after mutations and periodically while observed, so edits made by
 other tools become visible. Unrelated user fields do not invalidate a connection. Development profiles

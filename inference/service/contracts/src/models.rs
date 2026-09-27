@@ -635,9 +635,10 @@ pub enum ModelInstanceLifecycle {
     #[serde(rename_all = "camelCase")]
     Loading {
         stage: ModelLoadStage,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "openapi", schema(nullable = false))]
-        progress: Option<f32>,
+        /// The load's completed fraction in `[0, 1]`, by measured work: tuning, when the load
+        /// tunes, is the first half and weight import the rest. Monotonic within a load; only
+        /// `Ready` means the load is complete.
+        fraction: f32,
         #[serde(skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "openapi", schema(nullable = false))]
         planned_allocation: Option<ModelLoadPlan>,
@@ -1570,11 +1571,15 @@ pub struct ModelLoadDevice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelLoadStage {
+    /// Waiting for memory admission.
     Queued,
-    Resolving,
-    Unloading,
-    Loading,
-    Verifying,
+    /// Resolving, planning, opening the device and preparing programs.
+    Preparing,
+    /// Tuning kernels for the device; only a load that tunes enters it.
+    Optimizing,
+    LoadingWeights,
+    /// State allocation, warm-up and readiness verification.
+    Finalizing,
 }
 
 #[derive(Clone)]

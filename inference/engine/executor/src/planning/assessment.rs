@@ -569,6 +569,28 @@ mod tests {
                 canonical_bytes: 2 * 16 * 4,
             })])
         );
+        let call = seismic::generated::checked_native_graph_call::<dense_output::Entry>(
+            BackendName::Cpu,
+            &[("DW", Element::f32()), ("A", Element::f32())],
+            &[("M", 4), ("O", 2), ("H", 16), ("F", 32)],
+        )
+        .unwrap();
+        let seismic::generated::CheckedNativeGraphCall::Checked {
+            parameters,
+            results: call_results,
+            ..
+        } = call
+        else {
+            panic!("checked dense output call is supported on CPU");
+        };
+        let seismic::NativeTensorParameterCheck::Checked(weight) = weight else {
+            unreachable!()
+        };
+        assert!(parameters.contains(&Some(weight)));
+        assert_eq!(
+            seismic::NativeTensorResultsCheck::Checked(call_results),
+            results
+        );
     }
 
     #[test]

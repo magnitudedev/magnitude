@@ -24,7 +24,8 @@ use tower::ServiceExt;
 use crate::chat::{ChatCompletionRequest, adapt_request, validate_request};
 use crate::error::{ModelUnavailable, ServingError};
 use crate::source::{
-    GenerationEvent, GenerationStream, HostChat, LoadProgress, ModelInvocation, ServedModels,
+    GenerationEvent, GenerationStream, HostChat, LoadProgress, ModelInvocation, ModelLoadProgress,
+    ModelLoadStage, ServedModels,
 };
 use crate::{Serving, anthropic, responses, router};
 
@@ -221,7 +222,10 @@ impl ServedModels for Scripted {
                 ))));
             }
             if let Some(progress) = progress {
-                progress(0.5);
+                progress(ModelLoadProgress {
+                    stage: ModelLoadStage::LoadingWeights,
+                    fraction: 0.5,
+                });
             }
             if self.pending {
                 let _flag = DropFlag(self.observed.clone());
@@ -1711,8 +1715,8 @@ async fn chat_progress_is_present_only_when_explicitly_requested() {
     )
     .await;
     let chunks = stream_json(&reply.body);
-    assert!(chunks.iter().any(|chunk| chunk["progress"]["phase"] == "model_loading"
-        && chunk["progress"]["fraction"] == 0.5));
+    assert!(chunks.iter().any(|chunk| chunk["progress"]
+        == json!({ "phase": "model_loading", "stage": "loading_weights", "fraction": 0.5 })));
     assert!(chunks
         .iter()
         .any(|chunk| chunk["progress"]["phase"] == "queued" && chunk["choices"] == json!([])));
@@ -1729,7 +1733,10 @@ async fn responses_progress_reports_loading_and_queue_events() {
         json!({ "model": "test-model", "input": "hi", "stream": true }),
     )
     .await;
-    assert!(reply.body.contains("\"phase\":\"model_loading\""));
+    // The same loading progress as Chat Completions.
+    assert!(reply
+        .body
+        .contains(r#""progress":{"phase":"model_loading","stage":"loading_weights","fraction":0.5}"#));
     assert!(reply.body.contains("\"phase\":\"queued\""));
     assert!(reply.body.contains("event: response.completed"));
 }

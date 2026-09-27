@@ -21,8 +21,8 @@ use magnitude_service_contracts::models::{
 /// The failure code of a load refused for lack of memory.
 pub const LOW_MEMORY_FAILURE_CODE: &str = "low_memory";
 
-/// Observes model loading as a completed fraction in `[0, 1]`.
-pub type LoadingObserver = Arc<dyn Fn(f32) + Send + Sync>;
+/// Observes model loading: its stage and completed fraction in `[0, 1]`.
+pub type LoadingObserver = Arc<dyn Fn(ModelLoadStage, f32) + Send + Sync>;
 
 pub enum ResidencyAcquisition {
     Inference { progress: Option<LoadingObserver> },
@@ -210,7 +210,7 @@ pub enum ResidencyNotification {
     LoadProgress {
         instance_id: ModelInstanceId,
         stage: ModelLoadStage,
-        progress: Option<f32>,
+        fraction: f32,
         planned_allocation: Option<ModelLoadPlan>,
     },
     LoadingStopCompleted {
@@ -677,9 +677,9 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             ResidencyNotification::LoadProgress {
                 instance_id,
                 stage,
-                progress,
+                fraction,
                 planned_allocation,
-            } => self.load_progress(instance_id, stage, progress, planned_allocation),
+            } => self.load_progress(instance_id, stage, fraction, planned_allocation),
             ResidencyNotification::AllocationObserved {
                 instance_id,
                 allocation,
@@ -828,8 +828,8 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             id: instance_id.clone(),
             model_id: first.target.model_id.clone(),
             lifecycle: ModelInstanceLifecycle::Loading {
-                stage: ModelLoadStage::Queued,
-                progress: None,
+                stage: ModelLoadStage::Preparing,
+                fraction: 0.0,
                 planned_allocation: None,
             },
         };
@@ -1053,7 +1053,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         &mut self,
         instance_id: ModelInstanceId,
         stage: ModelLoadStage,
-        progress: Option<f32>,
+        fraction: f32,
         planned_allocation: Option<ModelLoadPlan>,
     ) {
         let ResidencyState::Loading(loading) = &mut self.state else {
@@ -1064,7 +1064,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         }
         let lifecycle = ModelInstanceLifecycle::Loading {
             stage,
-            progress,
+            fraction,
             planned_allocation,
         };
         if loading.instance.lifecycle == lifecycle {
@@ -1575,17 +1575,15 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         else {
             return;
         };
-        let fraction = match lifecycle {
+        let (stage, fraction) = match lifecycle {
             ModelInstanceLifecycle::Loading {
-                stage: ModelLoadStage::Loading | ModelLoadStage::Verifying,
-                progress,
-                ..
-            } => progress.unwrap_or(0.0).clamp(0.0, 1.0),
-            ModelInstanceLifecycle::Loading { .. } => 0.0,
-            ModelInstanceLifecycle::Ready { .. } => 1.0,
+                stage, fraction, ..
+            } => (*stage, *fraction),
+            // The load's last report: its final stage, complete.
+            ModelInstanceLifecycle::Ready { .. } => (ModelLoadStage::Finalizing, 1.0),
             _ => return,
         };
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer(fraction)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer(stage, fraction)));
     }
 
     fn inventory_failure(failure: &ModelOperationFailure) -> InventoryError {

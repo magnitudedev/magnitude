@@ -627,6 +627,84 @@ pub struct CheckedTensorShape {
     pub extents: Vec<u64>,
 }
 
+struct CompiledTensorShape {
+    representation: RepresentationId,
+    axes: Vec<CompiledNat>,
+}
+
+/// The checked entry's tensor shape expressions compiled once for repeated
+/// numeric graph classes. It is derived from the same schema and expression
+/// arena as ordinary checked shape evaluation.
+pub struct CompiledEntryShapes {
+    dimensions: Vec<(String, SymbolId)>,
+    parameters: Vec<(String, Option<CompiledTensorShape>)>,
+    results: Vec<Option<CompiledTensorShape>>,
+}
+
+impl CompiledEntryShapes {
+    fn values(&self, dimensions: &[(&str, u64)]) -> Result<InvocationValues, CheckedTensorShapeError> {
+        let mut values = InvocationValues::new();
+        for (name, symbol) in &self.dimensions {
+            let value = dimensions
+                .iter()
+                .find(|(candidate, _)| *candidate == name)
+                .map(|(_, value)| *value)
+                .ok_or_else(|| CheckedTensorShapeError::MissingDimension(name.clone()))?;
+            values.bind(*symbol, SymbolValue::Nat(value.into()));
+        }
+        Ok(values)
+    }
+
+    fn shape(
+        shape: &CompiledTensorShape,
+        values: &InvocationValues,
+    ) -> Result<CheckedTensorShape, CheckedTensorShapeError> {
+        let extents = shape
+            .axes
+            .iter()
+            .map(|axis| axis.evaluate_u64(values).map_err(CheckedTensorShapeError::Evaluation))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(CheckedTensorShape {
+            representation: shape.representation,
+            extents,
+        })
+    }
+
+    pub fn parameter_shape(
+        &self,
+        name: &str,
+        dimensions: &[(&str, u64)],
+    ) -> Result<CheckedTensorShape, CheckedTensorShapeError> {
+        let (_, shape) = self
+            .parameters
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .ok_or_else(|| CheckedTensorShapeError::UnknownParameter(name.to_owned()))?;
+        let shape = shape
+            .as_ref()
+            .ok_or_else(|| CheckedTensorShapeError::NotTensor(name.to_owned()))?;
+        Self::shape(shape, &self.values(dimensions)?)
+    }
+
+    pub fn all_shapes(
+        &self,
+        dimensions: &[(&str, u64)],
+    ) -> Result<(Vec<Option<CheckedTensorShape>>, Vec<Option<CheckedTensorShape>>), CheckedTensorShapeError> {
+        let values = self.values(dimensions)?;
+        let parameters = self
+            .parameters
+            .iter()
+            .map(|(_, shape)| shape.as_ref().map(|shape| Self::shape(shape, &values)).transpose())
+            .collect::<Result<Vec<_>, _>>()?;
+        let results = self
+            .results
+            .iter()
+            .map(|shape| shape.as_ref().map(|shape| Self::shape(shape, &values)).transpose())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((parameters, results))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CheckedTensorShapeError {
     UnknownParameter(String),
@@ -693,6 +771,46 @@ impl<'a> LogicalEntryView<'a> {
 }
 
 impl LogicalEntry {
+    pub fn compile_tensor_shapes(&self) -> CompiledEntryShapes {
+        let compile = |representation: RepresentationId, axes: &[NatExpr]| CompiledTensorShape {
+            representation,
+            axes: axes.iter().map(|axis| self.arena.compile_nat(*axis)).collect(),
+        };
+        CompiledEntryShapes {
+            dimensions: self
+                .schema
+                .dimensions()
+                .iter()
+                .map(|dimension| (dimension.name.clone(), dimension.symbol))
+                .collect(),
+            parameters: self
+                .schema
+                .parameters()
+                .iter()
+                .map(|parameter| {
+                    let shape = match &parameter.kind {
+                        ParameterKind::Tensor { representation, axes, .. } => {
+                            Some(compile(*representation, axes))
+                        }
+                        _ => None,
+                    };
+                    (parameter.name.clone(), shape)
+                })
+                .collect(),
+            results: self
+                .schema
+                .results()
+                .iter()
+                .map(|result| match &result.kind {
+                    ResultKind::Tensor { representation, axes } => {
+                        Some(compile(*representation, axes))
+                    }
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
     fn tensor_dimension_values(
         &self,
         dimensions: &[(&str, u64)],

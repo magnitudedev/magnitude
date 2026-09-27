@@ -1,16 +1,17 @@
 import { Atom, Registry, Result } from "@effect-atom/atom-react"
 import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import type { LoginStartupState, ApplicationMemoryObservation, MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
-import type { LocalModelsState } from "@magnitudedev/sdk"
+import { ModelLoadStageSchema, type LocalModelsState, type ModelResidency } from "@magnitudedev/sdk"
 import type { DesktopConnectRequest, DesktopConnectionsSnapshot } from "./connections"
 import type { HarnessId } from "../harness-connections/service"
 import { LocalModels } from "../local-models/service"
 import { LOCAL_MODEL_RANKING_SCALE_VALUES } from "../local-models/options"
 import { formatLocalModelDisplayName } from "../utils/model-presentation"
+import { formatModelLoadPercentage, formatModelLoadStage, formatModelMemory, isMeasuredModelLoadStage } from "../utils/model-load"
 import type { DesktopUpdateState } from "./update"
-import { DesktopPage, DesktopAction, ModelTrayPresentation, DesktopApplicationInfo } from "./contracts"
+import { DesktopPage, DesktopAction, ModelTrayPresentation, ModelTrayStatus, DesktopApplicationInfo } from "./contracts"
 
-export { DesktopPage, DesktopAction, ModelTrayPresentation, DesktopApplicationInfo } from "./contracts"
+export { DesktopPage, DesktopAction, ModelTrayPresentation, ModelTrayStatus, DesktopApplicationInfo } from "./contracts"
 export class DesktopHostUnavailable extends Schema.TaggedError<DesktopHostUnavailable>()("DesktopHostUnavailable", {}) {
   override get message() { return "Desktop host unavailable" }
 }
@@ -42,13 +43,47 @@ export const activeLocalModel = (models: LocalModelsState) => {
   }
   return Option.none()
 }
+/** Every phase word the tray's model row shows, so it can hold room for the widest. */
+export const MODEL_TRAY_PHASES: ReadonlyArray<string> = [
+  ...ModelLoadStageSchema.literals.map(formatModelLoadStage),
+  "Loaded",
+  "Stopping",
+]
+const modelTrayStatus = (
+  model: string,
+  residency: Exclude<ModelResidency, { readonly _tag: "Unloaded" | "Failed" }>,
+): typeof ModelTrayStatus.Type => {
+  switch (residency._tag) {
+    case "Requested": return { model, phase: formatModelLoadStage("preparing"), detail: { _tag: "Working" } }
+    case "Loading": return {
+      model,
+      phase: formatModelLoadStage(residency.stage),
+      detail: isMeasuredModelLoadStage(residency.stage)
+        ? { _tag: "Progress", fraction: residency.fraction }
+        : { _tag: "Working" },
+    }
+    case "Ready": return { model, phase: "Loaded", detail: { _tag: "Memory", text: formatModelMemory(residency.allocation) } }
+    case "Stopping": return { model, phase: "Stopping", detail: { _tag: "Working" } }
+  }
+}
+const modelTrayLabel = (status: typeof ModelTrayStatus.Type): string => {
+  switch (status.detail._tag) {
+    case "Working": return `${status.model} · ${status.phase}`
+    case "Progress": return `${status.model} · ${status.phase} ${formatModelLoadPercentage(status.detail.fraction)}`
+    case "Memory": return `${status.model} · ${status.phase} · ${status.detail.text}`
+  }
+}
 export const modelTrayPresentation = (models: LocalModelsState): typeof ModelTrayPresentation.Type => {
   const active = activeLocalModel(models)
   if (Option.isSome(active)) {
-    const { model, residency } = active.value
-    return { label: `${formatLocalModelDisplayName(model)} · ${residency._tag === "Ready" ? "Loaded" : residency._tag === "Requested" ? "Loading" : residency._tag}`, canStop: true }
+    const status = modelTrayStatus(formatLocalModelDisplayName(active.value.model), active.value.residency)
+    return { label: modelTrayLabel(status), status: Option.some(status), canStop: true }
   }
-  return { label: models.models.length === 0 && !models.preparation.assessment.complete ? "Reading model status…" : "No model loaded", canStop: false }
+  return {
+    label: models.models.length === 0 && !models.preparation.assessment.complete ? "Reading model status…" : "No model loaded",
+    status: Option.none(),
+    canStop: false,
+  }
 }
 const makeDesktopSession = Effect.gen(function* () {
   const registry = yield* Registry.AtomRegistry
@@ -64,7 +99,7 @@ const makeDesktopSession = Effect.gen(function* () {
     const models = yield* LocalModels
     yield* host.actions.pipe(Stream.runForEach(action => action._tag === "Navigate" ? navigate(action.page) : models.stop.pipe(Effect.asVoid, Effect.catchAll(Effect.logError))), Effect.forkScoped)
     yield* Registry.toStream(registry, models.state).pipe(
-      Stream.map(result => Result.isSuccess(result) ? modelTrayPresentation(result.value) : { label: "Model status unavailable", canStop: false }),
+      Stream.map(result => Result.isSuccess(result) ? modelTrayPresentation(result.value) : { label: "Model status unavailable", status: Option.none(), canStop: false }),
       Stream.changesWith((a, b) => a.label === b.label && a.canStop === b.canStop),
       Stream.runForEach(value => host.presentModel(value).pipe(Effect.catchAll(Effect.logError))), Effect.forkScoped,
     )

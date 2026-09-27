@@ -90,7 +90,7 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
     let gate = weight(graph, load, scope, WeightKind::DenseGate, weights)?;
     let up = weight(graph, load, scope, WeightKind::DenseUp, weights)?;
     let down = weight(graph, load, scope, WeightKind::DenseDown, weights)?;
-    let out_rows = GraphConstant::identity(graph, rows)?;
+    let out_rows = GraphConstant::identity_for_class(graph, rows, Some("M"))?;
     let product = graph
         .enqueue(
             kernels.expand,

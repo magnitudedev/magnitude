@@ -2344,10 +2344,14 @@
           {
             "type": "object",
             "required": [
+              "stage",
               "fraction",
               "phase"
             ],
             "properties": {
+              "stage": {
+                "$ref": "#/components/schemas/ModelLoadStage"
+              },
               "fraction": {
                 "type": "number",
                 "format": "float"
@@ -5518,15 +5522,17 @@
             "type": "object",
             "required": [
               "stage",
+              "fraction",
               "_tag"
             ],
             "properties": {
               "stage": {
                 "$ref": "#/components/schemas/ModelLoadStage"
               },
-              "progress": {
+              "fraction": {
                 "type": "number",
-                "format": "float"
+                "format": "float",
+                "description": "The load's completed fraction in `[0, 1]`, by measured work: tuning, when the load\ntunes, is the first half and weight import the rest. Monotonic within a load; only\n`Ready` means the load is complete."
               },
               "plannedAllocation": {
                 "$ref": "#/components/schemas/ModelLoadPlan"
@@ -5734,12 +5740,13 @@
       },
       "ModelLoadStage": {
         "type": "string",
+        "description": "Where a model load is. The service's model instance status names the same stages.",
         "enum": [
           "queued",
-          "resolving",
-          "unloading",
-          "loading",
-          "verifying"
+          "preparing",
+          "optimizing",
+          "loading_weights",
+          "finalizing"
         ]
       },
       "ModelMetadata": {

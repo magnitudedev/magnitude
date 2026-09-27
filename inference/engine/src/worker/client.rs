@@ -7,7 +7,7 @@
 
 use super::protocol::{
     Admission, EngineBuild, ExecutionTimings, HostMessage, HostRequestId,
-    LoadPhase, MemoryObservation, RequestProgress, RetentionPolicy, WorkerMessage,
+    LoadProgress, MemoryObservation, RequestProgress, RetentionPolicy, WorkerMessage,
 };
 use super::transport::{HostTransport, MessageReceiver, MessageSender};
 use crate::error::{LoadError, RequestError};
@@ -174,7 +174,7 @@ impl State {
                 self.close(RequestError::ModelUnloaded { cause });
             }
             WorkerMessage::Hello { .. }
-            | WorkerMessage::LoadPhase { .. }
+            | WorkerMessage::LoadProgress { .. }
             | WorkerMessage::Ready { .. }
             | WorkerMessage::LoadFailed { .. } => {
                 return Err("load message after readiness".into())
@@ -236,11 +236,11 @@ pub struct WorkerConnection {
 /// With `load`, this is a worker process that has not yet been told what to
 /// load: the host sends `Hello` and `Load`. Without it, the worker was given
 /// its manifest directly (in-process). Either way the worker's `Hello` must
-/// carry this build, and its `LoadPhase` events reach `phase` until `Ready`.
+/// carry this build, and its `LoadProgress` events reach `progress` until `Ready`.
 pub fn connect_worker(
     transport: impl HostTransport,
     load: Option<ExecutionManifest>,
-    mut phase: impl FnMut(LoadPhase),
+    mut progress: impl FnMut(LoadProgress),
 ) -> Result<WorkerConnection, LoadError> {
     let (mut receiver, mut sender) = transport.split();
     let lost = |reason: String| LoadError::WorkerLost { reason };
@@ -269,7 +269,7 @@ pub fn connect_worker(
     }
     let ready = loop {
         match next()? {
-            WorkerMessage::LoadPhase { phase: current } => phase(current),
+            WorkerMessage::LoadProgress { progress: current } => progress(current),
             WorkerMessage::Ready { ready } => break ready,
             WorkerMessage::LoadFailed { error } => return Err(error),
             _ => return Err(lost("unexpected message during load".into())),

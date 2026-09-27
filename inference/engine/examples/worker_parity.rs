@@ -183,7 +183,7 @@ fn in_process(arguments: &Arguments) -> Result<(Vec<TokenId>, FinishReason), Str
         .resolve()
         .map_err(|error| error.to_string())?;
     let started = Instant::now();
-    let engine = start_in_process(resolved, |phase| eprintln!("in-process: {phase:?}"))
+    let engine = start_in_process(resolved, |progress| eprintln!("in-process: {progress:?}"))
         .map_err(|error| error.to_string())?;
     eprintln!("in-process: ready in {:.2} s", started.elapsed().as_secs_f64());
     let result = generate(&engine, arguments.tokens);
@@ -215,8 +215,8 @@ fn worker_process(arguments: &Arguments) -> Result<(Vec<TokenId>, FinishReason),
         child.stdout.take().ok_or("worker stdout")?,
         child.stdin.take().ok_or("worker stdin")?,
     );
-    let connection = connect_worker(transport, Some(resolved.manifest), |phase| {
-        eprintln!("worker process: {phase:?}")
+    let connection = connect_worker(transport, Some(resolved.manifest), |progress| {
+        eprintln!("worker process: {progress:?}")
     })
     .map_err(|error| error.to_string())?;
     let engine =
