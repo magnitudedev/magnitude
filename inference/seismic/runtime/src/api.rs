@@ -90,6 +90,7 @@ pub enum WorkflowError {
         port: usize,
     },
     NativeGraphSlotMismatch,
+    NativeGraphLayoutMismatch,
     NativeOutputLeaseConsumed,
     NativeExportStillLive,
     /// Every upload region a family slot was created with is still read by
@@ -146,6 +147,9 @@ impl fmt::Display for CallError {
             }
             Self::Workflow(WorkflowError::NativeGraphSlotMismatch) => {
                 f.write_str("native graph slot belongs to another graph")
+            }
+            Self::Workflow(WorkflowError::NativeGraphLayoutMismatch) => {
+                f.write_str("native graph shape or topology exceeds its certified layout")
             }
             Self::Workflow(WorkflowError::NativeOutputLeaseConsumed) => {
                 f.write_str("native graph output lease was already used")

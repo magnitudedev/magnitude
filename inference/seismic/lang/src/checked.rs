@@ -98,11 +98,7 @@ fn canonical_path(path: &str) -> String {
         }
     }
     let body = components.join("/");
-    if absolute {
-        format!("/{body}")
-    } else {
-        body
-    }
+    if absolute { format!("/{body}") } else { body }
 }
 
 /// The language rule a diagnostic reports.
@@ -1011,6 +1007,74 @@ impl NativeCondition {
     }
 }
 
+impl NativeScratch {
+    /// The largest charge of this buffer at exact dimension values over
+    /// every declared tuning choice it reads. A buffer whose guard does not
+    /// hold keeps its ABI slot at the minimum charge of one byte.
+    pub fn maximum_bytes(
+        &self,
+        tuning_parameters: &[NativeParameter],
+        dimension: &impl Fn(&str) -> Option<u64>,
+    ) -> Result<u64, NativeEvalError> {
+        fn largest(
+            scratch: &NativeScratch,
+            dimension: &impl Fn(&str) -> Option<u64>,
+            parameters: &[&NativeParameter],
+            values: &mut Vec<u64>,
+        ) -> Result<u64, NativeEvalError> {
+            if let Some(parameter) = parameters.get(values.len()) {
+                let mut maximum = 0;
+                for &value in &parameter.values {
+                    values.push(value);
+                    maximum = maximum.max(largest(scratch, dimension, parameters, values)?);
+                    values.pop();
+                }
+                return Ok(maximum);
+            }
+            let parameter = |name: &str| {
+                parameters
+                    .iter()
+                    .position(|parameter| parameter.name == name)
+                    .map(|index| values[index])
+            };
+            if let Some(condition) = &scratch.when {
+                if !condition.holds(dimension, &parameter)? {
+                    return Ok(1);
+                }
+            }
+            scratch
+                .bytes
+                .evaluate(dimension, &parameter)
+                .map(|bytes| bytes.max(1))
+        }
+        let mut names = Vec::new();
+        self.bytes.parameters(&mut names);
+        if let Some(condition) = &self.when {
+            condition.parameters(&mut names);
+        }
+        let parameters = names
+            .iter()
+            .map(|name| {
+                tuning_parameters
+                    .iter()
+                    .find(|parameter| &parameter.name == name && !parameter.values.is_empty())
+                    .ok_or_else(|| NativeEvalError::Unbound(name.clone()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        largest(self, dimension, &parameters, &mut Vec::new())
+    }
+
+    /// Every dimension name the charge or its guard reads.
+    pub fn dimensions(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        self.bytes.dimensions(&mut names);
+        if let Some(condition) = &self.when {
+            condition.dimensions(&mut names);
+        }
+        names
+    }
+}
+
 impl NativeImplementation {
     /// Whether preparation must choose any declared tuning parameter, either
     /// for the entry as a whole or for an individual launch.
@@ -1540,6 +1604,46 @@ pub(crate) mod internals {
 mod native_tests {
     use super::*;
 
+    #[test]
+    fn scratch_maximum_evaluates_guards_and_charges_exactly() {
+        let rows = || NativeNatExpr::Dimension("M".into());
+        let scratch = NativeScratch {
+            name: "groups".into(),
+            bytes: NativeNatExpr::Mul(Box::new(rows()), Box::new(NativeNatExpr::Constant(4))),
+            when: Some(NativeCondition::And(
+                Box::new(NativeCondition::Compare {
+                    comparison: NativeComparison::Gt,
+                    left: rows(),
+                    right: NativeNatExpr::Constant(16),
+                }),
+                Box::new(NativeCondition::Compare {
+                    comparison: NativeComparison::Le,
+                    left: rows(),
+                    right: NativeNatExpr::Constant(64),
+                }),
+            )),
+        };
+        let at = |value: u64| {
+            scratch
+                .maximum_bytes(&[], &|name| (name == "M").then_some(value))
+                .unwrap()
+        };
+        assert_eq!([at(16), at(32), at(64), at(128)], [1, 128, 256, 1]);
+        assert_eq!(scratch.dimensions(), vec!["M".to_owned()]);
+        let overflow = NativeScratch {
+            name: "overflow".into(),
+            bytes: NativeNatExpr::Mul(
+                Box::new(rows()),
+                Box::new(NativeNatExpr::Constant(u64::MAX)),
+            ),
+            when: None,
+        };
+        assert_eq!(
+            overflow.maximum_bytes(&[], &|_| Some(2)),
+            Err(NativeEvalError::Arithmetic)
+        );
+    }
+
     fn source(native: &str) -> SourceSet {
         let mut sources = SourceSet::default();
         sources.push(SourceFile {
@@ -1571,12 +1675,13 @@ mod native_tests {
         let mut values = crate::expr::compiled::InvocationValues::new();
         plan.infer(&[40, 6, 4], &mut values)
             .expect("all dimensions solve before checking original equations");
-        assert!(plan
-            .infer(
+        assert!(
+            plan.infer(
                 &[41, 6, 4],
                 &mut crate::expr::compiled::InvocationValues::new()
             )
-            .is_err());
+            .is_err()
+        );
     }
 
     #[test]
@@ -1684,8 +1789,8 @@ mod native_tests {
     fn where_conjuncts_keep_launch_ownership() {
         let source_text = |condition: &str| {
             format!(
-            "native scale for metal from \"scale.metal\":\n    where {condition}\n    launch small:\n        params (ROWS in [1, 2])\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large:\n        params (TILE in [4, 8])\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
-        )
+                "native scale for metal from \"scale.metal\":\n    where {condition}\n    launch small:\n        params (ROWS in [1, 2])\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large:\n        params (TILE in [4, 8])\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
+            )
         };
         let module = check_source(source(&source_text("ROWS == 1 and TILE >= 4"))).unwrap();
         let native = module
@@ -1708,9 +1813,11 @@ mod native_tests {
         let admissible = native.admissible(&statics).expect("statics are complete");
         // PARTS * WIDTH <= 256 admits (1,64) (1,128) (2,64) (2,128) (4,64).
         assert_eq!(admissible.len(), 5);
-        assert!(admissible
-            .iter()
-            .all(|configuration| configuration.static_value("N") == Some(256)));
+        assert!(
+            admissible
+                .iter()
+                .all(|configuration| configuration.static_value("N") == Some(256))
+        );
         let default = native.default_specialization(&statics).unwrap();
         assert_eq!(default.param("PARTS"), Some(1));
         assert_eq!(default.param("WIDTH"), Some(64));
@@ -1835,7 +1942,9 @@ mod native_tests {
         let source = |target: &str| {
             SourceSet::new(vec![SourceFile {
                 path: "copy.seismic".to_owned(),
-                text: format!("fn copy[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nlower copy[N](x: &tensor[N] f32) -> tensor[N] f32\n    for {target}:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n"),
+                text: format!(
+                    "fn copy[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nlower copy[N](x: &tensor[N] f32) -> tensor[N] f32\n    for {target}:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n"
+                ),
             }])
         };
         check_source(source("cpu")).expect("a lowering for a compiler target is admitted");
@@ -1853,9 +1962,11 @@ mod native_tests {
         let declaration = "native scale for metal from \"scale.metal\":\n    launch scale:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
         let error = check_source(source(&format!("{declaration}\n{declaration}")))
             .expect_err("duplicate implementation must fail");
-        assert!(error
-            .to_string()
-            .contains("already has a native implementation"));
+        assert!(
+            error
+                .to_string()
+                .contains("already has a native implementation")
+        );
     }
 
     /// `elements` lists the dense types a CPU form compiles a stored element
@@ -1889,13 +2000,48 @@ mod native_tests {
         );
         let widen = "    launch widen:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
         for (native, message) in [
-            (format!("native copy for metal from \"copy.metal\":\n    elements (A in [f32])\n{launch}"), "other backends compile each binding"),
-            (format!("native copy for cpu from \"copy.rs\":\n    elements (B in [f32])\n{launch}"), "`B` is not an element parameter"),
-            (format!("native copy for cpu from \"copy.rs\":\n    elements (W in [f32])\n{launch}"), "`W` is not stored"),
-            (format!("native widen for cpu from \"widen.rs\":\n    elements (U in [f32])\n{widen}"), "`U` is not stored"),
-            (format!("native copy for cpu from \"copy.rs\":\n    elements (A in [f32, f32])\n{launch}"), "`f32` is listed twice"),
-            (format!("native copy for cpu from \"copy.rs\":\n    elements (A in [bool])\n{launch}"), "`bool` is not a CPU element type"),
-            (format!("native copy for cpu from \"copy.rs\":\n    elements (A in [f32], A in [u32])\n{launch}"), "declared twice"),
+            (
+                format!(
+                    "native copy for metal from \"copy.metal\":\n    elements (A in [f32])\n{launch}"
+                ),
+                "other backends compile each binding",
+            ),
+            (
+                format!(
+                    "native copy for cpu from \"copy.rs\":\n    elements (B in [f32])\n{launch}"
+                ),
+                "`B` is not an element parameter",
+            ),
+            (
+                format!(
+                    "native copy for cpu from \"copy.rs\":\n    elements (W in [f32])\n{launch}"
+                ),
+                "`W` is not stored",
+            ),
+            (
+                format!(
+                    "native widen for cpu from \"widen.rs\":\n    elements (U in [f32])\n{widen}"
+                ),
+                "`U` is not stored",
+            ),
+            (
+                format!(
+                    "native copy for cpu from \"copy.rs\":\n    elements (A in [f32, f32])\n{launch}"
+                ),
+                "`f32` is listed twice",
+            ),
+            (
+                format!(
+                    "native copy for cpu from \"copy.rs\":\n    elements (A in [bool])\n{launch}"
+                ),
+                "`bool` is not a CPU element type",
+            ),
+            (
+                format!(
+                    "native copy for cpu from \"copy.rs\":\n    elements (A in [f32], A in [u32])\n{launch}"
+                ),
+                "declared twice",
+            ),
         ] {
             let error = check(&native).expect_err(message).to_string();
             assert!(error.contains(message), "{message}: {error}");

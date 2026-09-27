@@ -286,7 +286,6 @@ pub struct ResidencyStore {
     import_progress: Option<ImportProgress>,
 }
 
-
 impl ResidencyStore {
     pub fn new(
         device: Rc<Device>,
@@ -1014,7 +1013,6 @@ fn validate_dense(stored: &StoredTensor) -> Result<usize, WeightImportError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn catalog_encoding_map_is_exact() {

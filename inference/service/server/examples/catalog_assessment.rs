@@ -62,6 +62,14 @@ fn required(arguments: &[String], name: &str) -> PathBuf {
 }
 
 fn main() -> anyhow::Result<()> {
+    let process_started = Instant::now();
+    if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .try_init()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    }
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     if arguments.first().map(String::as_str) == Some("measurement-worker") {
         install_parent_watchdog()?;
@@ -78,10 +86,10 @@ fn main() -> anyhow::Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(assess_catalog(arguments))
+        .block_on(assess_catalog(arguments, process_started))
 }
 
-async fn assess_catalog(arguments: Vec<String>) -> anyhow::Result<()> {
+async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> anyhow::Result<()> {
     let bundle = required(&arguments, "--bundle");
     let started = Instant::now();
     let release = Arc::new(load_release_catalog(&bundle)?);
@@ -202,6 +210,7 @@ async fn assess_catalog(arguments: Vec<String>) -> anyhow::Result<()> {
             "openSeconds": opened.as_secs_f64(),
             "environmentReadySeconds": ready_after.expect("ready").as_secs_f64(),
             "catalogSettledSeconds": settled.as_secs_f64(),
+            "processTotalSeconds": process_started.elapsed().as_secs_f64(),
         })
     );
     if let Some(path) = flag(&arguments, "--snapshot") {

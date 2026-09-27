@@ -3,8 +3,8 @@
 //! Inputs are split at content-defined boundaries and every distinct chunk is stored once,
 //! compressed, with its SHA-256 digest. Variants of one model share their tokenizer and template
 //! metadata byte for byte, so they share those chunks whatever their tensor directories.
-//! [`PlannerBundle::verify`] checks every chunk once; an input is reassembled exactly and verified
-//! against its own digest on every read.
+//! Release validation uses [`PlannerBundle::verify`] to check every chunk once. Runtime reads
+//! reassemble an input exactly and verify its digest before using it.
 //!
 //! ```text
 //! MAGIC | u64 manifest length | manifest

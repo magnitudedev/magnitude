@@ -135,11 +135,18 @@ numerical units. Its checked entry contracts derive graph-local mutable scratch,
 inputs, intermediate and result tensors' representations, extents, alias conditions, and lifetimes.
 It reports exact storage charges and owns bounded concurrent execution slots. Compatible launch
 classes share one physical scratch arena per concurrent slot, charged at their maximum footprint.
-Metadata assessment reuses a validated graph topology within each structural regime, evaluates
-checked entry shapes and scratch for every admitted class, and places those exact sizes with the
-same Seismic storage planner used by prepared workflows. Its family charge takes independent
-workspace, output, and upload maxima and counts each distinct bound constant once. A class that
-fails a checked contract fails assessment rather than producing a fit estimate.
+Metadata assessment projects a resource schedule from the one parameterized graph program that
+also constructs executable graphs. A regime is the set of admitted classes that select the same
+structure: the row form (the attention-decode, recurrent-chunked and routed-decode predicates the
+topology code itself branches on) plus any other class field that changes node order, edges or
+exports. Seismic charges every port, result and scratch buffer of a regime the exact maximum of
+its checked size over the admitted classes, evaluating each size expression only at the
+combinations of the class dimensions it reads, never across whole graphs. It places those
+capacities once and certifies fixed offsets that production reuses for every exact class of the
+regime. A class whose topology or checked size exceeds its certified layout fails preparation.
+The family charge takes independent workspace, output, and upload maxima across the certified
+layouts and counts each distinct bound constant once. A checked contract that cannot be evaluated
+fails assessment rather than producing a fit estimate.
 Each slot also holds a fixed set of host-upload regions, allocated and charged with the slot: one
 per graph run its lease keeps in flight at once (a target step queues its embedding entry and
 every block before any completes). Upload regions are host-visible (CUDA: mapped pinned host

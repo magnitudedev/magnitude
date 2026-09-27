@@ -237,7 +237,10 @@ mod tests {
             let request: DeviceRequest = text.parse().unwrap();
             assert_eq!(request.to_string(), text);
             let encoded = serde_json::to_string(&request).unwrap();
-            assert_eq!(serde_json::from_str::<DeviceRequest>(&encoded).unwrap(), request);
+            assert_eq!(
+                serde_json::from_str::<DeviceRequest>(&encoded).unwrap(),
+                request
+            );
         }
         assert_eq!(
             "metal".parse::<DeviceRequest>(),
@@ -275,8 +278,12 @@ mod tests {
     #[test]
     fn automatic_selection_prefers_metal_on_apple_silicon() {
         let catalog = seismic::DeviceCatalog::discover().unwrap();
-        let selected =
-            select(&catalog.topology(), ExecutionPath::Native, DeviceRequest::Automatic).unwrap();
+        let selected = select(
+            &catalog.topology(),
+            ExecutionPath::Native,
+            DeviceRequest::Automatic,
+        )
+        .unwrap();
         assert_eq!(selected.backend, BackendName::Metal);
     }
 

@@ -98,6 +98,11 @@ impl CheckedRoutedEntries {
 /// The largest row class the decode form serves: the K1 GEMV row bound.
 pub(crate) const DECODE_ROWS: u64 = 8;
 
+/// Whether a `rows`-row class runs the decode form.
+pub(crate) fn decodes(rows: u64) -> bool {
+    rows <= DECODE_ROWS
+}
+
 /// Rows of one expert tile of the grouped form.
 pub(crate) const TILE_ROWS: u64 = 32;
 
@@ -178,7 +183,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
         .map_err(failed)?;
     let (normalized, coefficient) = (routed.r0, routed.r1);
 
-    if rows <= DECODE_ROWS {
+    if decodes(rows) {
         let expanded = graph
             .enqueue(
                 handle.expand,

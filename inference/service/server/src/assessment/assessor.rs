@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use magnitude_engine::assessment::{
-    ModelAssessment as EngineAssessment, ModelCapabilities as EngineCapabilities,
-    ModelPackagePaths, assess_model,
+    AssessmentSetup, ModelAssessment as EngineAssessment, ModelCapabilities as EngineCapabilities,
+    ModelPackagePaths, PreparedModelAssessment, finish_model_assessment, prepare_model_assessment,
 };
 use magnitude_engine::error::UnsupportedModel;
 use magnitude_executor::assessment::{
@@ -51,7 +51,10 @@ pub struct AssessmentWork {
     pub key: AssessmentWorkKey,
     pub profile: ModelAssessmentProfile,
     pub configuration: ModelServingConfiguration,
+    pub preparation: Arc<tokio::sync::OnceCell<PreparationResult>>,
 }
+
+pub type PreparationResult = Result<Arc<PreparedModelAssessment>, ModelFailure>;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AssessmentWorkKey(pub String);
@@ -104,27 +107,73 @@ impl ModelAssessor {
         }
     }
 
-    pub async fn establish_environment(&self) -> Result<AssessmentEnvironment, EnvironmentError> {
-        AssessmentEnvironment::establish(Arc::clone(&self.catalog), &self.measurement).await
+    pub async fn select_setup(&self) -> Result<Arc<AssessmentSetup>, EnvironmentError> {
+        AssessmentEnvironment::select(Arc::clone(&self.catalog)).await
+    }
+
+    pub async fn establish_with_setup(
+        &self,
+        setup: Arc<AssessmentSetup>,
+    ) -> Result<AssessmentEnvironment, EnvironmentError> {
+        AssessmentEnvironment::establish(setup, &self.measurement).await
+    }
+
+    pub fn configuration_for(
+        &self,
+        subject: &magnitude_service_contracts::models::ModelAssessmentSubject,
+    ) -> Result<ModelServingConfiguration, InventoryError> {
+        self.model_domains.assessment_configuration(subject)
     }
 
     pub fn work_for(
         &self,
         environment: &AssessmentEnvironmentId,
-        subject: &magnitude_service_contracts::models::ModelAssessmentSubject,
+        configuration: ModelServingConfiguration,
         profile: magnitude_service_contracts::models::ServingProfile,
+        preparation: Arc<tokio::sync::OnceCell<PreparationResult>>,
     ) -> Result<AssessmentWork, InventoryError> {
         let profile = ModelAssessmentProfile {
             performance_context_tokens: performance_depths(profile.context_length),
             profile,
         };
-        let configuration = self.model_domains.assessment_configuration(subject)?;
         let bundle = servable_model_bundle_key_for_bundle(&configuration.bundle);
         Ok(AssessmentWork {
             key: AssessmentWorkKey::new(environment, &bundle, &profile),
             profile,
             configuration,
+            preparation,
         })
+    }
+
+    pub async fn prepare_bundle(
+        &self,
+        configuration: ModelServingConfiguration,
+        setup: Arc<AssessmentSetup>,
+    ) -> PreparationResult {
+        let bundle_key = servable_model_bundle_key_for_bundle(&configuration.bundle);
+        let resolved = self
+            .resolve(&bundle_key, configuration.bundle)
+            .await
+            .map_err(assessment_drop_failure)?;
+        let package = engine_material(&resolved).map_err(assessment_drop_failure)?;
+        let prepared = crate::spawn_blocking_traced(move || {
+            let _material = resolved;
+            prepare_model_assessment(&package, &setup)
+        })
+        .await
+        .map_err(|error| {
+            inventory_model_failure(InventoryError::Internal(format!(
+                "model preparation task failed: {error}"
+            )))
+        })?
+        .map_err(|error| {
+            inventory_model_failure(InventoryError::ModelOperation {
+                code: "assessment_failed".to_owned(),
+                message: error.to_string(),
+                retryable: true,
+            })
+        })?;
+        Ok(Arc::new(prepared))
     }
 
     /// One attempt at `work`. `Ok` carries the target's terminal disposition; `Err` is an
@@ -138,6 +187,7 @@ impl ModelAssessor {
             key,
             profile,
             configuration,
+            preparation,
         } = work;
         let bundle_key = servable_model_bundle_key_for_bundle(&configuration.bundle);
         // The exact work identity is the whole assessment identity, so it keys the cache.
@@ -159,16 +209,21 @@ impl ModelAssessor {
                 result: Ok(cached),
             });
         }
-        let resolved = match self.resolve(&bundle_key, configuration.bundle).await {
-            Ok(resolved) => resolved,
-            Err(error) => {
+        let prepared = preparation
+            .get_or_init(|| {
+                self.prepare_bundle(configuration, Arc::clone(&environment.engine.setup))
+            })
+            .await;
+        let prepared = match prepared {
+            Ok(prepared) => Arc::clone(prepared),
+            Err(failure) => {
                 return Ok(AssessmentOutcome {
                     key,
-                    result: Err(assessment_drop_failure(error)),
+                    result: Err(failure.clone()),
                 });
             }
         };
-        let assessed = assess_resolved(resolved, &bundle_key, profile, environment).await?;
+        let assessed = assess_prepared(prepared, &bundle_key, profile, environment).await?;
         self.models.write_model_assessment(&evidence, &assessed);
         Ok(AssessmentOutcome {
             key,
@@ -247,20 +302,17 @@ pub(crate) fn engine_material(
     Ok(ModelPackagePaths { target, projector })
 }
 
-async fn assess_resolved(
-    resolved: ResolvedServableModelBundle,
+async fn assess_prepared(
+    prepared: Arc<PreparedModelAssessment>,
     bundle_key: &ServableModelBundleKey,
     profile: ModelAssessmentProfile,
     environment: Arc<AssessmentEnvironment>,
 ) -> Result<CachedModelAssessment, InventoryError> {
-    let package = engine_material(&resolved)?;
     let depths = profile.performance_context_tokens.clone();
     let engine_environment = Arc::clone(&environment);
     let started = std::time::Instant::now();
-    // The resolution guard keeps header-only material alive for the engine's header reads.
     let assessed = crate::spawn_blocking_traced(move || {
-        let _material = resolved;
-        assess_model(&package, &engine_environment.engine, &depths)
+        finish_model_assessment(&prepared, &engine_environment.engine, &depths)
     })
     .await
     .map_err(|error| InventoryError::Internal(format!("model assessment task failed: {error}")))?;
@@ -270,6 +322,13 @@ async fn assess_resolved(
         outcome = if assessed.is_ok() { "assessed" } else { "failed" },
         "engine model assessment completed"
     );
+    if let Err(error) = &assessed {
+        tracing::warn!(
+            target.id = %bundle_key.0,
+            %error,
+            "engine model assessment failed"
+        );
+    }
     let assessed = assessed.map_err(|error| InventoryError::ModelOperation {
         code: "assessment_failed".to_owned(),
         message: error.to_string(),
@@ -448,7 +507,7 @@ fn capabilities(capabilities: EngineCapabilities) -> ModelCapabilities {
 }
 
 fn domain_id(domain: seismic::MemoryPoolId, environment: &AssessmentEnvironment) -> MemoryDomainId {
-    crate::memory_domains::pool_domain_id(&environment.engine.topology, domain)
+    crate::memory_domains::pool_domain_id(&environment.engine.setup.topology, domain)
 }
 
 fn memory_assessments(

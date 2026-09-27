@@ -258,8 +258,7 @@ pub(crate) mod tests {
     use crate::{source_element, ComponentSelection, ModelLoadPlan};
     use magnitude_artifacts::{
         gguf::TensorDescriptor, ArtifactIdentity, ComponentFile, ComponentManifest,
-        PackageIdentity,
-        PackageManifest,
+        PackageIdentity, PackageManifest,
     };
     use magnitude_family_contracts::{
         ActivationDType, AttentionGeometry, AttentionWeights, BlockGeometry, BlockWeights,

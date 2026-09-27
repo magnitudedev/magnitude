@@ -122,14 +122,14 @@ impl Kernel {
         ) {
             Ok(r) => r,
             Err(e @ (OracleError::WorkLimit { .. } | OracleError::MemoryLimit { .. })) => {
-                return Ok(CheckReport::new("resource_limit", e))
+                return Ok(CheckReport::new("resource_limit", e));
             }
             Err(OracleError::InterpreterDefect(e)) => return Err(Error::new("InternalError", e)),
             Err(OracleError::InvalidInvocation(e)) => {
                 return Ok(CheckReport::new(
                     "unsupported",
                     format!("reference did not produce a comparable complete outcome: {e}"),
-                ))
+                ));
             }
         };
         let mut live = base.saturating_add(reference.retained_payload_bytes());
@@ -154,7 +154,7 @@ impl Kernel {
         let result = match self.call_outcome_limited(&private, Some(memory_bytes - live)) {
             Ok(v) => v,
             Err(e) if e.kind == "ResourceLimit" => {
-                return Ok(CheckReport::new("resource_limit", e))
+                return Ok(CheckReport::new("resource_limit", e));
             }
             Err(e) => return Err(e),
         };

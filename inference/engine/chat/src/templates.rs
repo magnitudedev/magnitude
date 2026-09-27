@@ -3,8 +3,8 @@ use super::ChatError;
 use magnitude_templates::{PreparedRequest, Request as NativeRequest, SpecialTokens, Template};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
-use std::sync::Mutex;
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Mutex;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,9 +98,11 @@ fn apply_tool_selection_instruction(
         ToolChoice::Required | ToolChoice::Allowed { required: true, .. } => {
             "Call one of the supplied tools to answer this request.".into()
         }
-        ToolChoice::Auto | ToolChoice::None | ToolChoice::Allowed { required: false, .. } => {
-            return Ok(())
-        }
+        ToolChoice::Auto
+        | ToolChoice::None
+        | ToolChoice::Allowed {
+            required: false, ..
+        } => return Ok(()),
     };
     if let Some(system) = request
         .messages
@@ -272,7 +274,9 @@ impl TemplateBundle {
         apply_tool_selection_instruction(&mut request, choice)?;
         let required = matches!(
             choice,
-            ToolChoice::Required | ToolChoice::Named(_) | ToolChoice::Allowed { required: true, .. }
+            ToolChoice::Required
+                | ToolChoice::Named(_)
+                | ToolChoice::Allowed { required: true, .. }
         );
         request.tool_choice = if required {
             magnitude_templates::ToolChoice::Required
@@ -382,6 +386,27 @@ pub struct TemplateInspection {
 }
 
 impl TemplateBundle {
+    /// Reuse exact header inspection for bundles with identical literal
+    /// variants and special tokens. Preparation still uses this bundle's own
+    /// sources; the cache contains only the immutable inspection result.
+    pub fn inspect_cached(&self) -> Result<TemplateInspection, String> {
+        static INSPECTIONS: std::sync::OnceLock<
+            Mutex<std::collections::HashMap<Vec<u8>, Result<TemplateInspection, String>>>,
+        > = std::sync::OnceLock::new();
+        let sources = self
+            .variants
+            .values()
+            .map(|variant| (&variant.name, &variant.source))
+            .collect::<Vec<_>>();
+        let key = serde_json::to_vec(&(&sources, &self.default, &self.special_tokens))
+            .map_err(|error| error.to_string())?;
+        let cache = INSPECTIONS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.entry(key).or_insert_with(|| self.inspect()).clone()
+    }
+
     /// The default variant's source text.
     pub fn default_source(&self) -> &str {
         &self.variants[&self.default].source
@@ -415,10 +440,8 @@ impl TemplateBundle {
         }));
         // A rejected probe is the capability's absence: the engine rejects
         // every request of that kind for this bundle.
-        let accepted = |request: &ChatRequest| {
-            self.prepare(request, &TemplateSelection::default())
-                .is_ok()
-        };
+        let accepted =
+            |request: &ChatRequest| self.prepare(request, &TemplateSelection::default()).is_ok();
         let identities = self
             .variants
             .values()

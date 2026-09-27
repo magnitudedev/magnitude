@@ -7,12 +7,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use magnitude_engine::assessment::{
-    AssessmentEnvironment as EngineEnvironment, ModelAssessmentError,
+    AssessmentEnvironment as EngineEnvironment, AssessmentSetup, ModelAssessmentError,
 };
 use magnitude_engine::options::{ModelPolicy, standard_service_limits};
-use magnitude_executor::ExecutionPath;
 use magnitude_executor::assessment::{MeasurementBasis, basis_json};
-use magnitude_executor::platform::{self, DeviceRequest, MemoryReserves, PlatformError};
+use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
 use magnitude_service_contracts::models::AssessmentEnvironmentId;
 use seismic::{DeviceCatalog, DeviceMemory, DeviceSelector, DeviceTopology, HostMemoryStatus};
 use serde_json::json;
@@ -35,7 +34,6 @@ pub struct AssessmentEnvironment {
 
 #[derive(Debug)]
 pub enum EnvironmentError {
-    Selection(PlatformError),
     Measurement(MeasurementJobError),
     Environment(ModelAssessmentError),
     Task(String),
@@ -44,7 +42,6 @@ pub enum EnvironmentError {
 impl fmt::Display for EnvironmentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Selection(error) => write!(formatter, "device selection: {error}"),
             Self::Measurement(error) => error.fmt(formatter),
             Self::Environment(error) => write!(formatter, "assessment environment: {error}"),
             Self::Task(error) => write!(formatter, "assessment environment task: {error}"),
@@ -55,26 +52,31 @@ impl fmt::Display for EnvironmentError {
 impl std::error::Error for EnvironmentError {}
 
 impl AssessmentEnvironment {
-    /// Select the device of `catalog` automatically (§5.5), establish its measurement basis
-    /// through the measurement job, and bind the engine environment and its identity.
-    pub async fn establish(
+    /// Select once, before the measurement and model-preparation branches diverge.
+    pub async fn select(
         catalog: Arc<DeviceCatalog>,
-        measurement: &MeasurementJob,
-    ) -> Result<Self, EnvironmentError> {
-        let reserves = MemoryReserves::standard();
-        let selecting = Arc::clone(&catalog);
-        let device = crate::spawn_blocking_traced(move || {
-            platform::select_device(
-                &selecting,
-                ExecutionPath::Native,
+    ) -> Result<Arc<AssessmentSetup>, EnvironmentError> {
+        crate::spawn_blocking_traced(move || {
+            AssessmentSetup::discover(
+                &catalog,
                 DeviceRequest::Automatic,
-                &reserves,
+                MemoryReserves::standard(),
+                serving_policy(),
+                standard_service_limits(),
             )
-            .map(|selected| selected.info.selector)
-            .map_err(EnvironmentError::Selection)
+            .map(Arc::new)
+            .map_err(EnvironmentError::Environment)
         })
         .await
-        .map_err(|error| EnvironmentError::Task(error.to_string()))??;
+        .map_err(|error| EnvironmentError::Task(error.to_string()))?
+    }
+
+    /// Add the measured basis to the one selected setup and derive its cache identity.
+    pub async fn establish(
+        setup: Arc<AssessmentSetup>,
+        measurement: &MeasurementJob,
+    ) -> Result<Self, EnvironmentError> {
+        let device = setup.selected.info.selector;
         let established = measurement
             .establish(device)
             .await
@@ -86,15 +88,9 @@ impl AssessmentEnvironment {
             &established.basis,
         );
         crate::spawn_blocking_traced(move || {
-            let engine = EngineEnvironment::discover(
-                &catalog,
-                DeviceRequest::Selector(device),
-                reserves,
-                established.basis,
-                serving_policy(),
-                standard_service_limits(),
-            )
-            .map_err(EnvironmentError::Environment)?;
+            let engine = setup
+                .with_basis(established.basis)
+                .map_err(EnvironmentError::Environment)?;
             Ok(Self {
                 id: environment_id(&engine),
                 engine,
@@ -136,13 +132,13 @@ fn environment_id(engine: &EngineEnvironment) -> AssessmentEnvironmentId {
         "backend": engine.basis.identity.backend,
         "toolchain": engine.basis.identity.device,
         "measurement_protocol": engine.basis.identity.protocol_version,
-        "device": engine.selected.info.selector,
-        "topology": normalized_topology(&engine.topology),
-        "process_limits": process_limits(&engine.host),
+        "device": engine.setup.selected.info.selector,
+        "topology": normalized_topology(&engine.setup.topology),
+        "process_limits": process_limits(&engine.setup.host),
         "basis": format!("{:x}", Sha256::digest(basis_json(&engine.basis).to_string().as_bytes())),
-        "reserves": format!("{:?}", engine.reserves),
-        "policy": format!("{:?}", engine.policy),
-        "service": format!("{:?}", engine.service),
+        "reserves": format!("{:?}", engine.setup.reserves),
+        "policy": format!("{:?}", engine.setup.policy),
+        "service": format!("{:?}", engine.setup.service),
     });
     AssessmentEnvironmentId(format!(
         "environment_{:x}",

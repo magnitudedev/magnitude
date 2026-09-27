@@ -121,7 +121,9 @@ inspection, model assessment, the pinned inference runtime, active-model state, 
 execution. `@magnitudedev/icn` acquires the host's one release-manifest inference artifact; ICN is
 not downloaded from a model repository or selected from a user-installed runtime.
 The installation carries one hardware-independent planner-input bundle. Native startup validates
-its integrity and exact catalog coverage before becoming ready. Ordinary startup and setup
+its structure, manifest and exact catalog coverage before becoming ready. Each exact header is
+decompressed and digest-verified before it contributes assessment evidence; release construction
+and distribution validation verify the entire bundle before publication. Ordinary startup and setup
 therefore do not contact a catalog service, fetch model headers, or depend on a user cache.
 Development generation and release CI build it explicitly from immutable catalog revisions;
 ordinary TypeScript and Cargo builds perform no catalog network access.

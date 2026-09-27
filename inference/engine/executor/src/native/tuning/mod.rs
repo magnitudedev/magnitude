@@ -733,20 +733,26 @@ impl TuningInputs<'_, '_> {
         )
         .map_err(|error| error.to_string())?;
         slab.add_slab().map_err(|error| error.to_string())?;
-        let bytes = source.slice_leading(0, view)
+        let bytes = source
+            .slice_leading(0, view)
             .map_err(|error| error.to_string())?
-            .read_to_host().map_err(|error| error.to_string())?;
+            .read_to_host()
+            .map_err(|error| error.to_string())?;
         slab.region_rows(0, 0, view)
             .map_err(|error| error.to_string())?
             .write_from_host(&bytes)
             .map_err(|error| error.to_string())?;
-        let initial = slab.region_rows(0, written.start, written.end - written.start)
+        let initial = slab
+            .region_rows(0, written.start, written.end - written.start)
             .map_err(|error| error.to_string())?;
         let tensor = slab.logical_region(0).map_err(|error| error.to_string())?;
         Ok(CaseState {
             tensor,
             written: initial.clone(),
-            initial: initial.read_to_host().map_err(|error| error.to_string())?.into(),
+            initial: initial
+                .read_to_host()
+                .map_err(|error| error.to_string())?
+                .into(),
             _slab: Some(Arc::new(slab)),
         })
     }

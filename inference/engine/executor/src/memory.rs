@@ -89,10 +89,15 @@ pub struct MemoryStanding {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryAction {
-    Grant { bytes: u64 },
+    Grant {
+        bytes: u64,
+    },
     /// No growth is granted in the Reclaim or Blind band.
     Wait,
-    Reject { required: u64, available: u64 },
+    Reject {
+        required: u64,
+        available: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

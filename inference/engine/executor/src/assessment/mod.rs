@@ -15,7 +15,8 @@ pub mod persist;
 pub mod plan;
 
 pub use assess::{
-    assess_execution, AssessmentRequest, DomainFit, ExecutionAssessment, IncompatibleReason,
+    assess_execution, finish_execution_assessment, prepare_execution_assessment, AssessmentRequest,
+    DomainFit, ExecutionAssessment, IncompatibleReason, PreparedExecutionAssessment,
 };
 pub use basis::{
     BasisIdentity, ClassCost, ClassMeasurement, CostModel, MeasuredPoint, MeasurementBasis,

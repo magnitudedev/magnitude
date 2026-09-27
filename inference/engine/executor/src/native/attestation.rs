@@ -152,6 +152,7 @@ impl AttestedPrograms {
         device: &Device,
         load: &crate::ModelLoadPlan,
         definition: &magnitude_family_contracts::ModelDefinition,
+        vision_plan: Option<&crate::VisionProgramPlan>,
         target_state: &crate::StateStorePlan,
         head_state: Option<&crate::StateStorePlan>,
         limits: crate::ResourceLimits,
@@ -161,9 +162,17 @@ impl AttestedPrograms {
             .into_iter()
             .map(|rows| rows as u64)
             .collect::<Vec<_>>();
-        let max_rows = *row_classes
-            .last()
-            .ok_or_else(|| format!("launch row bound {} has no row class", limits.max_launch_rows))?;
+        let max_rows = *row_classes.last().ok_or_else(|| {
+            format!(
+                "launch row bound {} has no row class",
+                limits.max_launch_rows
+            )
+        })?;
+        if self.vision.is_some() != vision_plan.is_some()
+            || self.vision.is_some() != definition.vision.is_some()
+        {
+            return Err("attested vision, program plan and model definition disagree".into());
+        }
         if let (Some(handles), Some(state)) = (&self.head, head_state) {
             let attention = definition
                 .geometry
@@ -171,14 +180,21 @@ impl AttestedPrograms {
                 .iter()
                 .rev()
                 .find_map(|block| match &block.mixer {
-                    magnitude_family_contracts::MixerGeometry::Attention(geometry) => Some(geometry),
+                    magnitude_family_contracts::MixerGeometry::Attention(geometry) => {
+                        Some(geometry)
+                    }
                     _ => None,
                 })
                 .ok_or("head graph requires target attention geometry")?;
             let history_rows =
                 u64::try_from(state.history_rows).map_err(|_| "head history rows exceed u64")?;
-            let classes =
-                crate::programs::native_head::head_graph_classes(limits, history_rows, state.history_slab_rows()?, state.context_rows, proposals)?;
+            let classes = crate::programs::native_head::head_graph_classes(
+                limits,
+                history_rows,
+                state.history_slab_rows()?,
+                state.context_rows,
+                proposals,
+            )?;
             self.head_graphs = Some(Rc::new(
                 crate::programs::native_head::PreparedHeadGraphs::prepare(
                     device,
@@ -191,7 +207,9 @@ impl AttestedPrograms {
                 .map_err(|error| error.to_string())?,
             ));
         }
-        if let (Some(handles), Some(vision)) = (&self.vision, definition.vision.as_ref()) {
+        if let (Some(handles), Some(vision), Some(vision_plan)) =
+            (&self.vision, definition.vision.as_ref(), vision_plan)
+        {
             let merge = vision
                 .geometry
                 .merge
@@ -209,6 +227,7 @@ impl AttestedPrograms {
                     load,
                     &vision.geometry,
                     definition.geometry.hidden,
+                    vision_plan,
                     patch_classes,
                 )
                 .map_err(|error| error.to_string())?,
@@ -260,6 +279,7 @@ impl AttestedPrograms {
         load: &crate::ModelLoadPlan,
         geometry: &magnitude_family_contracts::DecoderGeometry,
         state: &crate::StateResourcePlan,
+        plan: &crate::TargetProgramPlan,
         limits: crate::ResourceLimits,
     ) -> Result<crate::PreparedTargetGraphs, String> {
         crate::programs::native_target_graph::PreparedTargetGraphs::prepare(
@@ -268,6 +288,7 @@ impl AttestedPrograms {
             load,
             geometry,
             state,
+            plan,
             limits,
         )
     }

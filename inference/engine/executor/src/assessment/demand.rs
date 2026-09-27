@@ -221,7 +221,7 @@ impl DecodeDemand {
                         KvCodec::RotatedK4V4 => {
                             return Err(demand_error(
                                 "rotated K4/V4 history has no native attention entry",
-                            ))
+                            ));
                         }
                     };
                     let history = layout

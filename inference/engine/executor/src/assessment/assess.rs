@@ -14,7 +14,8 @@ use super::AssessmentError;
 use crate::platform::{fit_capacities, DomainRole, MemoryReserves};
 use crate::{
     AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
-    AssessmentMemoryTerms, ExecutionPlanDraft, ResourceCapacity, ResourcePlanner,
+    AssessmentMemoryCharge, AssessmentMemoryTerms, ExecutionPlanDraft, ResourceCapacity,
+    ResourcePlanner,
 };
 use magnitude_family_contracts::ModelDefinition;
 use seismic::{DeviceTopology, HostMemoryStatus, MemoryPoolId};
@@ -70,36 +71,37 @@ pub enum ExecutionAssessment {
     },
 }
 
-/// Assess one planned model against stable capacity and the basis. Opens no
-/// device, reads no weight payload and allocates nothing.
-pub fn assess_execution(
+/// Basis-independent decode demand and the standard workload's checked memory charge.
+/// The memory result is retained separately so an unsupported basis class keeps its
+/// `Incompatible` verdict even when this model's resource certification also fails.
+pub struct PreparedExecutionAssessment {
+    demand: DecodeDemand,
+    memory: Result<(u32, AssessmentMemoryCharge), AssessmentError>,
+}
+
+/// Perform model-specific arithmetic while the fixed generic basis is measured.
+pub fn prepare_execution_assessment(
     definition: &ModelDefinition,
     draft: &ExecutionPlanDraft,
-    topology: &DeviceTopology,
-    host: &HostMemoryStatus,
-    basis: &MeasurementBasis,
-    request: &AssessmentRequest,
-) -> Result<ExecutionAssessment, AssessmentError> {
-    if definition.geometry.context_limit != u64::from(request.context_limit) {
+    context_limit: u32,
+) -> Result<PreparedExecutionAssessment, AssessmentError> {
+    if definition.geometry.context_limit != u64::from(context_limit) {
         return Err(AssessmentError::Plan(format!(
             "assessed context limit {} differs from the planned model's {}",
-            request.context_limit, definition.geometry.context_limit
+            context_limit, definition.geometry.context_limit
         )));
     }
     let policy = draft.policy();
     let demand = DecodeDemand::from_model(definition, draft.load(), policy.codec())?;
-    let unmeasured = demand.unmeasured(basis);
-    if !unmeasured.is_empty() {
-        return Ok(ExecutionAssessment::Incompatible {
-            reason: IncompatibleReason::OutsideBasis {
-                classes: unmeasured
-                    .into_iter()
-                    .map(|(key, reason)| (key.clone(), reason.map(str::to_owned)))
-                    .collect(),
-            },
-        });
-    }
+    let memory = prepare_memory_charge(definition, draft);
+    Ok(PreparedExecutionAssessment { demand, memory })
+}
 
+fn prepare_memory_charge(
+    definition: &ModelDefinition,
+    draft: &ExecutionPlanDraft,
+) -> Result<(u32, AssessmentMemoryCharge), AssessmentError> {
+    let policy = draft.policy();
     let terms = AssessmentMemoryTerms::derive(
         definition,
         draft.load(),
@@ -113,8 +115,6 @@ pub fn assess_execution(
         .map_err(|_| AssessmentError::Memory("fit depth exceeds u32".into()))?;
     let header = AssessmentHeaderBounds::derive(definition, draft.load(), policy.codec())
         .map_err(AssessmentError::Memory)?;
-    // The same state plan production derives before sealing its graphs, so
-    // the graph classes and slot multipliers are the production ones.
     let state = ResourcePlanner::state_plan(
         definition,
         draft.load(),
@@ -143,7 +143,32 @@ pub fn assess_execution(
                 .fit_state_bytes(terms.fit_depth, terms.recurrent_banks)
                 .and_then(|state_bytes| terms.charge(bounds, state_bytes))
         })
-    .map_err(AssessmentError::Memory)?;
+        .map_err(AssessmentError::Memory)?;
+    Ok((fit_context_tokens, charge))
+}
+
+/// Join one prepared model with the basis and stable capacity. No graph or
+/// model material is constructed here.
+pub fn finish_execution_assessment(
+    prepared: &PreparedExecutionAssessment,
+    draft: &ExecutionPlanDraft,
+    topology: &DeviceTopology,
+    host: &HostMemoryStatus,
+    basis: &MeasurementBasis,
+    request: &AssessmentRequest,
+) -> Result<ExecutionAssessment, AssessmentError> {
+    let unmeasured = prepared.demand.unmeasured(basis);
+    if !unmeasured.is_empty() {
+        return Ok(ExecutionAssessment::Incompatible {
+            reason: IncompatibleReason::OutsideBasis {
+                classes: unmeasured
+                    .into_iter()
+                    .map(|(key, reason)| (key.clone(), reason.map(str::to_owned)))
+                    .collect(),
+            },
+        });
+    }
+    let &(fit_context_tokens, charge) = prepared.memory.as_ref().map_err(Clone::clone)?;
     let device = topology
         .devices()
         .iter()
@@ -171,7 +196,7 @@ pub fn assess_execution(
         }),
         AssessmentFitVerdict::Fits => {
             let depths = performance_depths(request.context_limit, &request.performance_depths);
-            let performance = estimate_performance(&demand, basis, &depths)?;
+            let performance = estimate_performance(&prepared.demand, basis, &depths)?;
             Ok(ExecutionAssessment::Fits {
                 fit_context_tokens,
                 domains: fit.domains,
@@ -179,6 +204,20 @@ pub fn assess_execution(
             })
         }
     }
+}
+
+/// Assess one planned model against stable capacity and the basis. Opens no
+/// device, reads no weight payload and allocates nothing.
+pub fn assess_execution(
+    definition: &ModelDefinition,
+    draft: &ExecutionPlanDraft,
+    topology: &DeviceTopology,
+    host: &HostMemoryStatus,
+    basis: &MeasurementBasis,
+    request: &AssessmentRequest,
+) -> Result<ExecutionAssessment, AssessmentError> {
+    let prepared = prepare_execution_assessment(definition, draft, request.context_limit)?;
+    finish_execution_assessment(&prepared, draft, topology, host, basis, request)
 }
 
 #[cfg(test)]

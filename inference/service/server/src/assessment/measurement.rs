@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 use magnitude_engine::worker::protocol::EngineBuild;
 use magnitude_executor::assessment::{
-    BasisIdentity, MeasurementBasis, MeasurementError, load_basis, measure_basis, store_basis,
+    BasisIdentity, MeasurementBasis, MeasurementError, load_basis, measure_basis_observed,
+    store_basis,
 };
 use magnitude_executor::platform::{self, MemoryReserves, PlatformConfig, PlatformError};
 use magnitude_executor::{DEFAULT_KERNEL_CACHE_BYTES, ExecutionPath, KernelCache};
@@ -131,8 +132,30 @@ pub fn run_measurement_worker(args: MeasurementWorkerArgs) -> Result<(), Measure
         BasisSource::Cached
     } else {
         let started = Instant::now();
-        let basis = measure_basis(&catalog, opened.device(), reserves, identity.clone())
-            .map_err(MeasurementWorkerError::Measurement)?;
+        let basis = measure_basis_observed(
+            &catalog,
+            opened.device(),
+            reserves,
+            identity.clone(),
+            |key, _, profile| {
+                tracing::debug!(
+                    ?key,
+                    formation.seconds = profile.formation.as_secs_f64(),
+                    allocation.seconds = profile.allocation.as_secs_f64(),
+                    timing.seconds = profile.timing.as_secs_f64(),
+                    sealing.seconds = profile.sealing.as_secs_f64(),
+                    submission.seconds = profile.submission.as_secs_f64(),
+                    encoding.seconds = profile.encoding.as_secs_f64(),
+                    dispatch.seconds = profile.dispatch.as_secs_f64(),
+                    device.seconds = profile.device.as_secs_f64(),
+                    waiting.seconds = profile.waiting.as_secs_f64(),
+                    tracing.seconds = profile.tracing.as_secs_f64(),
+                    total.seconds = profile.total.as_secs_f64(),
+                    "generic measurement class completed"
+                );
+            },
+        )
+        .map_err(MeasurementWorkerError::Measurement)?;
         let seconds = started.elapsed().as_secs_f64();
         store_basis(&args.basis_directory, &basis).map_err(MeasurementWorkerError::Store)?;
         BasisSource::Measured { seconds }
@@ -247,6 +270,12 @@ impl MeasurementJob {
             .launcher
             .command(WorkerRole::Measurement)
             .map_err(|error| MeasurementJobError::Spawn(format!("{error:#}")))?;
+        if std::env::var_os("MAGNITUDE_MEASUREMENT_PROFILE").is_some() {
+            command.env(
+                "RUST_LOG",
+                "magnitude_service_server::assessment::measurement=debug",
+            );
+        }
         args.append_to(&mut command);
         let mut child = self
             .launcher
@@ -280,6 +309,12 @@ impl MeasurementJob {
                 status,
                 diagnostics: String::from_utf8_lossy(&diagnostics).trim().to_owned(),
             });
+        }
+        if !diagnostics.is_empty() {
+            tracing::debug!(
+                worker.diagnostics = %String::from_utf8_lossy(&diagnostics),
+                "measurement worker diagnostics"
+            );
         }
         let report: MeasurementReport = serde_json::from_slice(&report)
             .map_err(|error| MeasurementJobError::MalformedReport(error.to_string()))?;

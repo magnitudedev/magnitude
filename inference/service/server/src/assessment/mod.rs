@@ -9,17 +9,21 @@ pub mod measurement;
 use std::sync::{Arc, Mutex};
 
 use futures_util::{StreamExt, future::BoxFuture, stream::BoxStream};
+use magnitude_engine::assessment::AssessmentSetup;
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
-    CatalogModelSelection, CatalogModelState, CatalogModels, DiscoveredModelState,
-    DiscoveredModels, EffectiveModel, ModelAssessmentDomainSnapshot, ModelAssessmentEntry,
-    ModelAssessmentEntryState, ModelAssessmentPoolState, ModelAssessments,
-    ModelAssessmentsInvalidation, ModelAssessmentsSnapshot, ModelFailure as DomainModelFailure,
-    ModelId,
+    CatalogModel, CatalogModelSelection, CatalogModelState, CatalogModels, DiscoveredModel,
+    DiscoveredModelState, DiscoveredModels, EffectiveModel, ModelAssessmentDomainSnapshot,
+    ModelAssessmentEntry, ModelAssessmentEntryState, ModelAssessmentPoolState,
+    ModelAssessmentSubject, ModelAssessments, ModelAssessmentsInvalidation,
+    ModelAssessmentsSnapshot, ModelFailure as DomainModelFailure, ModelId,
+    ModelServingConfiguration, ServingProfile,
 };
+use magnitude_service_models::{ServableModelBundleKey, servable_model_bundle_key_for_bundle};
 
 use assessor::{
-    AssessmentOutcome, AssessmentWork, AssessmentWorkKey, ModelAssessor, inventory_model_failure,
+    AssessmentOutcome, AssessmentWork, AssessmentWorkKey, ModelAssessor, PreparationResult,
+    inventory_model_failure,
 };
 use environment::AssessmentEnvironment;
 
@@ -37,10 +41,173 @@ struct AssessmentTarget {
     work: Option<AssessmentWork>,
 }
 
+/// One setup-scoped preparation authority shared by both source domains and the final join.
+struct PreparationCoordinator {
+    cells: Mutex<
+        std::collections::BTreeMap<
+            ServableModelBundleKey,
+            std::sync::Weak<tokio::sync::OnceCell<PreparationResult>>,
+        >,
+    >,
+    primed: Mutex<Vec<Arc<tokio::sync::OnceCell<PreparationResult>>>>,
+    tasks: Mutex<Vec<tokio::task::AbortHandle>>,
+    permits: Arc<tokio::sync::Semaphore>,
+    assessor: Arc<ModelAssessor>,
+    setup: Arc<AssessmentSetup>,
+}
+
+impl PreparationCoordinator {
+    fn new(assessor: Arc<ModelAssessor>, setup: Arc<AssessmentSetup>) -> Self {
+        Self {
+            cells: Mutex::new(std::collections::BTreeMap::new()),
+            primed: Mutex::new(Vec::new()),
+            tasks: Mutex::new(Vec::new()),
+            permits: Arc::new(tokio::sync::Semaphore::new(assessment_concurrency())),
+            assessor,
+            setup,
+        }
+    }
+
+    fn prepare(
+        &self,
+        configuration: ModelServingConfiguration,
+        eager: bool,
+    ) -> Arc<tokio::sync::OnceCell<PreparationResult>> {
+        let key = servable_model_bundle_key_for_bundle(&configuration.bundle);
+        let mut cells = self.cells.lock().expect("preparation cells lock poisoned");
+        cells.retain(|_, cell| cell.strong_count() > 0);
+        if let Some(cell) = cells.get(&key).and_then(std::sync::Weak::upgrade) {
+            return cell;
+        }
+        let cell = Arc::new(tokio::sync::OnceCell::new());
+        cells.insert(key, Arc::downgrade(&cell));
+        drop(cells);
+        if !eager {
+            return cell;
+        }
+        self.primed
+            .lock()
+            .expect("primed cells lock poisoned")
+            .push(Arc::clone(&cell));
+        let assessor = Arc::clone(&self.assessor);
+        let setup = Arc::clone(&self.setup);
+        let permits = Arc::clone(&self.permits);
+        let task_cell = Arc::clone(&cell);
+        let task = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            task_cell
+                .get_or_init(|| async move {
+                    tokio::time::timeout(MODEL_ASSESSMENT_TIMEOUT, async {
+                        let _permit = permits.acquire_owned().await.map_err(|error| {
+                            inventory_model_failure(InventoryError::Internal(format!(
+                                "preparation admission failed: {error}"
+                            )))
+                        })?;
+                        assessor.prepare_bundle(configuration, setup).await
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(inventory_model_failure(InventoryError::ModelOperation {
+                            code: "assessment_deadline".to_owned(),
+                            message: "model assessment target deadline expired".to_owned(),
+                            retryable: true,
+                        }))
+                    })
+                })
+                .await;
+            tracing::info!(
+                preparation.seconds = started.elapsed().as_secs_f64(),
+                "model preparation finished"
+            );
+        });
+        self.tasks
+            .lock()
+            .expect("preparation tasks lock poisoned")
+            .push(task.abort_handle());
+        cell
+    }
+
+    fn prime(
+        &self,
+        candidates: impl IntoIterator<Item = (ModelAssessmentSubject, ServingProfile)>,
+    ) {
+        for (subject, _) in candidates {
+            if let Ok(configuration) = self.assessor.configuration_for(&subject) {
+                self.prepare(configuration, true);
+            }
+        }
+    }
+
+    fn release_primed(&self) {
+        self.primed
+            .lock()
+            .expect("primed cells lock poisoned")
+            .clear();
+    }
+}
+
+impl Drop for PreparationCoordinator {
+    fn drop(&mut self) {
+        for task in self
+            .tasks
+            .lock()
+            .expect("preparation tasks lock poisoned")
+            .drain(..)
+        {
+            task.abort();
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum AssessmentDomain {
     Catalog,
     Discovered,
+}
+
+fn catalog_candidates(models: Vec<CatalogModel>) -> Vec<(ModelAssessmentSubject, ServingProfile)> {
+    models
+        .into_iter()
+        .filter_map(|model| {
+            let (selection, profile) = match model.local_state {
+                CatalogModelState::NotInstalled => {
+                    (CatalogModelSelection::Desired, model.desired.profile)
+                }
+                CatalogModelState::Installed {
+                    effective: EffectiveModel::Ready { model },
+                    ..
+                } => (CatalogModelSelection::Effective, model.profile),
+                CatalogModelState::Installed {
+                    effective: EffectiveModel::Unavailable { .. },
+                    ..
+                } => return None,
+            };
+            Some((
+                ModelAssessmentSubject::Catalog {
+                    model_id: model.id,
+                    selection,
+                },
+                profile,
+            ))
+        })
+        .collect()
+}
+
+fn discovered_candidates(
+    models: Vec<DiscoveredModel>,
+) -> Vec<(ModelAssessmentSubject, ServingProfile)> {
+    models
+        .into_iter()
+        .filter_map(|model| {
+            let DiscoveredModelState::Ready { model: ready, .. } = model.state else {
+                return None;
+            };
+            Some((
+                ModelAssessmentSubject::Discovery { model_id: model.id },
+                ready.profile,
+            ))
+        })
+        .collect()
 }
 
 struct AssessmentPoolCurrent {
@@ -468,8 +635,9 @@ impl ManagedModelAssessments {
         &self,
         domain: AssessmentDomain,
         environment: &AssessmentEnvironment,
-        subject: magnitude_service_contracts::models::ModelAssessmentSubject,
-        profile: magnitude_service_contracts::models::ServingProfile,
+        preparations: &PreparationCoordinator,
+        subject: ModelAssessmentSubject,
+        profile: ServingProfile,
     ) -> AssessmentTarget {
         let unresolved_key = AssessmentWorkKey(
             serde_json::to_string(&(&environment.id, &subject, &profile, "unresolved"))
@@ -490,7 +658,15 @@ impl ManagedModelAssessments {
                 work: None,
             };
         }
-        match self.assessor.work_for(&environment.id, &subject, profile) {
+        let work = self
+            .assessor
+            .configuration_for(&subject)
+            .and_then(|configuration| {
+                let preparation = preparations.prepare(configuration.clone(), false);
+                self.assessor
+                    .work_for(&environment.id, configuration, profile, preparation)
+            });
+        match work {
             Ok(work) => AssessmentTarget {
                 entry: ModelAssessmentEntry {
                     subject,
@@ -524,33 +700,15 @@ impl ManagedModelAssessments {
     async fn reconcile_catalog(
         self: &Arc<Self>,
         environment: &Arc<AssessmentEnvironment>,
+        preparations: &PreparationCoordinator,
     ) -> Result<(), InventoryError> {
         let source = self.catalog.list_catalog().await?;
         let mut targets = Vec::new();
-        for model in source.models {
-            let selected = match model.local_state {
-                CatalogModelState::NotInstalled => {
-                    Some((CatalogModelSelection::Desired, model.desired.profile))
-                }
-                CatalogModelState::Installed {
-                    effective: EffectiveModel::Ready { model },
-                    ..
-                } => Some((CatalogModelSelection::Effective, model.profile)),
-                CatalogModelState::Installed {
-                    effective: EffectiveModel::Unavailable { .. },
-                    ..
-                } => None,
-            };
-            let Some((selection, profile)) = selected else {
-                continue;
-            };
-            let subject = magnitude_service_contracts::models::ModelAssessmentSubject::Catalog {
-                model_id: model.id,
-                selection,
-            };
+        for (subject, profile) in catalog_candidates(source.models) {
             targets.push(self.target_entry(
                 AssessmentDomain::Catalog,
                 environment,
+                preparations,
                 subject,
                 profile,
             ));
@@ -567,6 +725,7 @@ impl ManagedModelAssessments {
     async fn reconcile_discovered(
         self: &Arc<Self>,
         environment: &Arc<AssessmentEnvironment>,
+        preparations: &PreparationCoordinator,
     ) -> Result<(), InventoryError> {
         let source = self.discovery.list_discovered().await?;
         if !source.reconciliation_complete {
@@ -577,18 +736,13 @@ impl ManagedModelAssessments {
             return Ok(());
         }
         let mut targets = Vec::new();
-        for model in source.models {
-            let DiscoveredModelState::Ready { model: ready, .. } = model.state else {
-                continue;
-            };
-            let subject = magnitude_service_contracts::models::ModelAssessmentSubject::Discovery {
-                model_id: model.id,
-            };
+        for (subject, profile) in discovered_candidates(source.models) {
             targets.push(self.target_entry(
                 AssessmentDomain::Discovered,
                 environment,
+                preparations,
                 subject,
-                ready.profile,
+                profile,
             ));
         }
         let work = targets
@@ -712,14 +866,65 @@ impl ManagedModelAssessments {
 
     async fn run(self: Arc<Self>) {
         let mut retry = ENVIRONMENT_RETRY_INITIAL;
-        let environment = loop {
-            match self.assessor.establish_environment().await {
-                Ok(environment) => break Arc::new(environment),
+        let (environment, preparations) = loop {
+            let setup = match self.assessor.select_setup().await {
+                Ok(setup) => setup,
                 Err(error) => {
-                    tracing::error!(%error, "assessment environment unavailable");
+                    tracing::error!(%error, "assessment setup unavailable");
                     self.publish_pool_failure(InventoryError::ModelOperation {
                         code: "assessment_environment_unavailable".to_owned(),
                         message: error.to_string(),
+                        retryable: true,
+                    });
+                    tokio::time::sleep(retry).await;
+                    retry = (retry * 2).min(ENVIRONMENT_RETRY_MAXIMUM);
+                    continue;
+                }
+            };
+            let assessor = Arc::clone(&self.assessor);
+            let measurement_setup = Arc::clone(&setup);
+            let measurement =
+                tokio::spawn(async move { assessor.establish_with_setup(measurement_setup).await });
+            let preparations =
+                PreparationCoordinator::new(Arc::clone(&self.assessor), Arc::clone(&setup));
+            let preparing_started = std::time::Instant::now();
+            tokio::join!(
+                async {
+                    match self.catalog.list_catalog().await {
+                        Ok(source) => preparations.prime(catalog_candidates(source.models)),
+                        Err(error) => {
+                            tracing::warn!(%error, "initial catalog preparation source unavailable")
+                        }
+                    }
+                },
+                async {
+                    match self.discovery.list_discovered().await {
+                        Ok(source) if source.reconciliation_complete => {
+                            preparations.prime(discovered_candidates(source.models))
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "initial discovery preparation source unavailable")
+                        }
+                    }
+                }
+            );
+            tracing::info!(
+                preparation_admission.seconds = preparing_started.elapsed().as_secs_f64(),
+                "initial model preparation admitted"
+            );
+            match measurement.await {
+                Ok(Ok(environment)) => break (Arc::new(environment), preparations),
+                result => {
+                    let message = match result {
+                        Ok(Err(error)) => error.to_string(),
+                        Err(error) => error.to_string(),
+                        Ok(Ok(_)) => unreachable!(),
+                    };
+                    tracing::error!(%message, "assessment environment unavailable");
+                    self.publish_pool_failure(InventoryError::ModelOperation {
+                        code: "assessment_environment_unavailable".to_owned(),
+                        message,
                         retryable: true,
                     });
                     tokio::time::sleep(retry).await;
@@ -739,28 +944,29 @@ impl ManagedModelAssessments {
         // entering the select loop is buffered and reconciled rather than missed.
         let mut catalog = self.catalog.watch_catalog().skip(1);
         let mut discovered = self.discovery.watch_discovery().skip(1);
-        if let Err(error) = self.reconcile_catalog(&environment).await {
+        if let Err(error) = self.reconcile_catalog(&environment, &preparations).await {
             tracing::warn!(%error, "catalog assessment reconciliation failed");
             self.publish_domain_failure(AssessmentDomain::Catalog, error);
         }
-        if let Err(error) = self.reconcile_discovered(&environment).await {
+        if let Err(error) = self.reconcile_discovered(&environment, &preparations).await {
             tracing::warn!(%error, "discovered-model assessment reconciliation failed");
             self.publish_domain_failure(AssessmentDomain::Discovered, error);
         }
+        preparations.release_primed();
         let mut source_retry = tokio::time::interval(MODEL_ASSESSMENT_SOURCE_RETRY_DELAY);
         source_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         source_retry.tick().await;
         loop {
             tokio::select! {
                 event = catalog.next() => match event {
-                    Some(_) => if let Err(error) = self.reconcile_catalog(&environment).await {
+                    Some(_) => if let Err(error) = self.reconcile_catalog(&environment, &preparations).await {
                         tracing::warn!(%error, "catalog assessment reconciliation failed");
                         self.publish_domain_failure(AssessmentDomain::Catalog, error);
                     },
                     None => return,
                 },
                 event = discovered.next() => match event {
-                    Some(_) => if let Err(error) = self.reconcile_discovered(&environment).await {
+                    Some(_) => if let Err(error) = self.reconcile_discovered(&environment, &preparations).await {
                         tracing::warn!(%error, "discovered-model assessment reconciliation failed");
                         self.publish_domain_failure(AssessmentDomain::Discovered, error);
                     },
@@ -775,13 +981,13 @@ impl ManagedModelAssessments {
                         )
                     };
                     if catalog_retry
-                        && let Err(error) = self.reconcile_catalog(&environment).await
+                        && let Err(error) = self.reconcile_catalog(&environment, &preparations).await
                     {
                         tracing::warn!(%error, "catalog assessment reconciliation retry failed");
                         self.publish_domain_failure(AssessmentDomain::Catalog, error);
                     }
                     if discovered_retry
-                        && let Err(error) = self.reconcile_discovered(&environment).await
+                        && let Err(error) = self.reconcile_discovered(&environment, &preparations).await
                     {
                         tracing::warn!(%error, "discovered-model assessment reconciliation retry failed");
                         self.publish_domain_failure(AssessmentDomain::Discovered, error);
@@ -902,6 +1108,7 @@ mod tests {
                     performance_context_tokens: vec![configuration.profile.context_length],
                 },
                 configuration,
+                preparation: Arc::new(tokio::sync::OnceCell::new()),
             }),
         }
     }

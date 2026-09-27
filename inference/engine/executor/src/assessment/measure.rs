@@ -88,13 +88,13 @@ const VARIED_PARAMETERS: [&str; 2] = ["INT8", "PARTS"];
 /// The most launches one timed graph holds.
 const MAX_LAUNCHES: u64 = 256;
 /// Timed samples of every point, after one discarded sample.
-const RUNS: usize = 5;
+const RUNS: usize = 3;
 /// Device time the device is kept busy before the first timed run.
 const WARM_SECONDS: f64 = 0.2;
 /// Device time of one sample: runs of a point's graph queued as one
 /// submission. On Metal, short submissions of one run each read 10–40%
 /// slower and vary between runs of the measurement (2026-09-25).
-const SAMPLE_SECONDS: f64 = 0.002;
+const SAMPLE_SECONDS: f64 = 0.003;
 /// The most runs one sample queues.
 const MAX_PASSES: usize = 256;
 /// Every synthetic extent a size search chooses is a multiple of this: it is
@@ -188,6 +188,15 @@ pub struct ClassProfile {
     pub allocation: Duration,
     /// Graph sealing, the timed runs and waiting for them.
     pub timing: Duration,
+    /// Breakdown of `timing` for diagnosing cold measurement cost.
+    pub sealing: Duration,
+    pub submission: Duration,
+    pub encoding: Duration,
+    pub dispatch: Duration,
+    /// Sum of traced device intervals, which may overlap host work.
+    pub device: Duration,
+    pub waiting: Duration,
+    pub tracing: Duration,
     pub total: Duration,
 }
 
@@ -640,7 +649,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                         return Formation::Unsupported(format!(
                             "{} does not form: {error}",
                             E::NAME
-                        ))
+                        ));
                     }
                     Err(_) => {}
                 }
@@ -895,11 +904,15 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         let began = Instant::now();
         let plan = timed.graph.seal().map_err(failed)?;
         let mut slot = plan.new_slot().map_err(failed)?;
+        self.charge(|profile| &mut profile.sealing, began);
         let mut submit = |samples: usize, passes: usize| -> Step<Vec<f64>> {
             // Work outside these samples (pool fills) is not a sample.
+            let trace_began = Instant::now();
             self.session.trace.collect().map_err(failed)?;
+            self.charge(|profile| &mut profile.tracing, trace_began);
             let mut completions = Vec::with_capacity(samples);
             for _ in 0..samples {
+                let submission_began = Instant::now();
                 let mut sequence = self.device().native_sequence();
                 for _ in 0..passes {
                     let mut bindings = plan.bindings();
@@ -912,18 +925,33 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                         .queue(&mut sequence)
                         .map_err(failed)?;
                 }
+                self.charge(|profile| &mut profile.encoding, submission_began);
+                let dispatch_began = Instant::now();
                 completions.push(sequence.submit().map_err(failed)?);
+                self.charge(|profile| &mut profile.dispatch, dispatch_began);
+                self.charge(|profile| &mut profile.submission, submission_began);
             }
+            let waiting_began = Instant::now();
             for completion in completions {
                 completion.wait().map_err(failed)?;
             }
+            self.charge(|profile| &mut profile.waiting, waiting_began);
+            let trace_began = Instant::now();
             let traced = self.session.trace.collect().map_err(failed)?;
+            self.charge(|profile| &mut profile.tracing, trace_began);
             if traced.len() != samples {
                 return Err(failed(format!(
                     "{samples} timed samples recorded {} submissions",
                     traced.len()
                 )));
             }
+            let device_seconds: f64 = traced
+                .iter()
+                .map(|submission| submission.device.1 - submission.device.0)
+                .sum();
+            let mut profile = self.profile.get();
+            profile.device += Duration::from_secs_f64(device_seconds);
+            self.profile.set(profile);
             Ok(traced
                 .iter()
                 .map(|submission| (submission.device.1 - submission.device.0) / passes as f64)
@@ -2571,9 +2599,8 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         }
         let (choice, chained_call, chained) =
             fastest.ok_or_else(|| failed("no chained variant was timed"))?;
-        let submission = (0..CHAIN_SAMPLES)
-            .map(|_| self.submission(chain(choice)?, chained_call * calls as f64))
-            .collect::<Step<Vec<_>>>()?;
+        let submission =
+            self.submissions(chain(choice)?, chained_call * calls as f64, CHAIN_SAMPLES)?;
         Ok(Chained {
             dependency: MeasuredPoint {
                 bytes: 0,
@@ -2591,28 +2618,32 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         })
     }
 
-    /// Host seconds of submitting one run of `timed` and waiting for it,
-    /// beyond `device_seconds` of its device work. The difference cannot be
-    /// negative; a device whose submission is free measures zero.
-    fn submission(&self, timed: Timed, device_seconds: f64) -> Step<f64> {
+    /// Host seconds of submitting and waiting for the same sealed chain,
+    /// beyond its measured device work. Reusing the plan keeps graph formation
+    /// outside the samples, as it is for a served step.
+    fn submissions(&self, timed: Timed, device_seconds: f64, count: usize) -> Step<Vec<f64>> {
         let plan = timed.graph.seal().map_err(failed)?;
         let mut slot = plan.new_slot().map_err(failed)?;
-        let mut bindings = plan.bindings();
-        for (port, tensor) in &timed.bindings {
-            bindings.set(port, tensor).map_err(failed)?;
-        }
-        let outputs = plan.new_outputs().map_err(failed)?;
-        self.session.trace.collect().map_err(failed)?;
-        let began = Instant::now();
-        let (_, completion) = slot
-            .attach(bindings, outputs)
-            .map_err(failed)?
-            .submit()
-            .map_err(failed)?;
-        completion.wait().map_err(failed)?;
-        let wall = began.elapsed().as_secs_f64();
-        self.session.trace.collect().map_err(failed)?;
-        Ok((wall - device_seconds).max(0.0))
+        (0..count)
+            .map(|_| {
+                let mut bindings = plan.bindings();
+                for (port, tensor) in &timed.bindings {
+                    bindings.set(port, tensor).map_err(failed)?;
+                }
+                let outputs = plan.new_outputs().map_err(failed)?;
+                self.session.trace.collect().map_err(failed)?;
+                let began = Instant::now();
+                let (_, completion) = slot
+                    .attach(bindings, outputs)
+                    .map_err(failed)?
+                    .submit()
+                    .map_err(failed)?;
+                completion.wait().map_err(failed)?;
+                let wall = began.elapsed().as_secs_f64();
+                self.session.trace.collect().map_err(failed)?;
+                Ok((wall - device_seconds).max(0.0))
+            })
+            .collect()
     }
 }
 

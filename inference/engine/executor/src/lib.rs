@@ -30,11 +30,10 @@ pub use device_resources::{
     ResourceError,
 };
 pub use domain::{
-    ClaimRefusal, DeviceHeap, DomainCheckpoint, DomainError, DomainRequirements,
-    DomainReservation, ExecutorDomain, HeadFlight, MemoryChargeReconciliation, NativeFamily,
-    OpenRequirements, OpenReservation,
-    PendingOperationOutcome, PhysicalDecision, ProgramFamily, ReservedResources, TargetFlight,
-    TargetHostTiming, VisionFlight,
+    ClaimRefusal, DeviceHeap, DomainCheckpoint, DomainError, DomainRequirements, DomainReservation,
+    ExecutorDomain, HeadFlight, MemoryChargeReconciliation, NativeFamily, OpenRequirements,
+    OpenReservation, PendingOperationOutcome, PhysicalDecision, ProgramFamily, ReservedResources,
+    TargetFlight, TargetHostTiming, VisionFlight,
 };
 pub use error::{CapacityError, DeviceError, InvariantError, PlanError, ResourceKind, SubmitError};
 pub use execution_path::ExecutionPath;
@@ -69,8 +68,8 @@ pub use operation::{
 };
 pub use planning::{
     resident_element, resident_layout, source_element, ArtifactComponent, ArtifactComponentKind,
-    AssessmentFit, AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentMemoryCharge,
-    AssessmentHeaderBounds, AssessmentMemoryBounds, AssessmentMemoryTerms, AttentionBinding,
+    AssessmentFit, AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
+    AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, AttentionBinding,
     AttentionShape, CapabilityPlan, ComponentPlan, ComponentSelection, DenseBinding,
     EmbeddingBinding, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding,
     FeedForwardProgramSlot, GraphSlots, HeadBinding, HeadProgramPlan, ImportProgramSlot,

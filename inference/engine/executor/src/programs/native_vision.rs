@@ -10,8 +10,9 @@ use crate::{
 use magnitude_family_contracts::{VisionGeometry, WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{qwen_vision_block, qwen_vision_merger, qwen_vision_stem};
 use seismic::{
-    BackendName, BoundNativeGraphPlan, Device, NativeGraphFamily, NativeGraphFamilySlot,
-    NativeGraphMetadata, NativeGraphPlan, NativeGraphStorageBytes, NativePort, WorkflowTensor,
+    BackendName, BoundNativeGraphPlan, Device, Entry, NativeGraphClassSlice, NativeGraphFamily,
+    NativeGraphFamilySlot, NativeGraphLayout, NativeGraphMetadata, NativeGraphPlan,
+    NativeGraphStorageBytes, NativePort, WorkflowTensor,
 };
 use std::rc::Rc;
 
@@ -62,13 +63,25 @@ struct VisionGraphPorts {
 }
 
 fn vision_graph_topology<'a, G: GraphDraft + 'a>(
-    mut graph: G,
+    graph: G,
     entries: VisionEntries<'a, G>,
     load: &ModelLoadPlan,
     geometry: &VisionGeometry,
     decoder_hidden: u64,
     rows: u64,
 ) -> Result<(G::Plan, VisionGraphPorts), SubmitError> {
+    let (graph, ports) = vision_graph_draft(graph, entries, load, geometry, decoder_hidden, rows)?;
+    Ok((graph.seal().map_err(device)?, ports))
+}
+
+fn vision_graph_draft<'a, G: GraphDraft + 'a>(
+    mut graph: G,
+    entries: VisionEntries<'a, G>,
+    load: &ModelLoadPlan,
+    geometry: &VisionGeometry,
+    decoder_hidden: u64,
+    rows: u64,
+) -> Result<(G, VisionGraphPorts), SubmitError> {
     let merge = geometry
         .merge
         .checked_mul(geometry.merge)
@@ -273,9 +286,8 @@ fn vision_graph_topology<'a, G: GraphDraft + 'a>(
         .map_err(device)?
         .value;
     graph.export(&features).map_err(device)?;
-    let plan = graph.seal().map_err(device)?;
     Ok((
-        plan,
+        graph,
         VisionGraphPorts {
             pixels,
             positions,
@@ -295,76 +307,160 @@ pub(crate) fn checked_vision_family_storage(
     plan: &VisionProgramPlan,
     patch_rows: impl IntoIterator<Item = u64>,
 ) -> Result<NativeGraphStorageBytes, String> {
-    let patch = plan.patch();
-    let stem_elements = [
-        ("W0", patch.temporal_weight_0),
-        ("W1", patch.temporal_weight_1),
-        ("B", patch.bias),
-        ("PE", patch.position),
-    ];
-    let block_elements = plan
-        .blocks()
+    let patch_rows = patch_rows.into_iter().collect::<Vec<_>>();
+    certify_vision_family(backend, load, geometry, decoder_hidden, plan, &patch_rows)
+        .map(|(storage, _)| storage)
+}
+
+struct CheckedVisionBindings {
+    stem: [(&'static str, seismic::Element); 4],
+    blocks: Vec<Vec<(&'static str, seismic::Element)>>,
+    merger: [(&'static str, seismic::Element); 7],
+}
+
+impl CheckedVisionBindings {
+    fn new(plan: &VisionProgramPlan) -> Self {
+        let patch = plan.patch();
+        let stem = [
+            ("W0", patch.temporal_weight_0),
+            ("W1", patch.temporal_weight_1),
+            ("B", patch.bias),
+            ("PE", patch.position),
+        ];
+        let blocks = plan
+            .blocks()
+            .iter()
+            .map(|block| {
+                vec![
+                    ("A", block.activation),
+                    ("N1W", block.input_norm_weight),
+                    ("N1B", block.input_norm_bias),
+                    ("QW", block.qkv_weight),
+                    ("QB", block.qkv_bias),
+                    ("PW", block.attention_output),
+                    ("PB", block.attention_output_bias),
+                    ("N2W", block.feedforward_norm_weight),
+                    ("N2B", block.feedforward_norm_bias),
+                    ("UW", block.up),
+                    ("UB", block.up_bias),
+                    ("DW", block.down),
+                    ("DB", block.down_bias),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let merger = plan.merger();
+        let merger = [
+            ("A", merger.activation),
+            ("NW", merger.output_norm_weight),
+            ("NB", merger.output_norm_bias),
+            ("UW", merger.hidden),
+            ("UB", merger.hidden_bias),
+            ("DW", merger.output),
+            ("DB", merger.output_bias),
+        ];
+        Self {
+            stem,
+            blocks,
+            merger,
+        }
+    }
+
+    fn entries(&self) -> VisionEntries<'_, NativeGraphMetadata> {
+        VisionEntries {
+            stem: &self.stem,
+            blocks: self.blocks.iter().map(Vec::as_slice).collect(),
+            merger: &self.merger,
+        }
+    }
+}
+
+fn certify_vision_family(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    geometry: &VisionGeometry,
+    decoder_hidden: u64,
+    plan: &VisionProgramPlan,
+    patch_rows: &[u64],
+) -> Result<(NativeGraphStorageBytes, Vec<NativeGraphLayout>), String> {
+    let merge = geometry
+        .merge
+        .checked_mul(geometry.merge)
+        .ok_or("vision merge area overflow")?;
+    let &largest = patch_rows
         .iter()
-        .map(|block| {
-            vec![
-                ("A", block.activation),
-                ("N1W", block.input_norm_weight),
-                ("N1B", block.input_norm_bias),
-                ("QW", block.qkv_weight),
-                ("QB", block.qkv_bias),
-                ("PW", block.attention_output),
-                ("PB", block.attention_output_bias),
-                ("N2W", block.feedforward_norm_weight),
-                ("N2B", block.feedforward_norm_bias),
-                ("UW", block.up),
-                ("UB", block.up_bias),
-                ("DW", block.down),
-                ("DB", block.down_bias),
-            ]
+        .max()
+        .ok_or("vision graph family has no exact patch class")?;
+    if patch_rows
+        .iter()
+        .any(|&rows| rows == 0 || rows % merge != 0)
+        || patch_rows
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != patch_rows.len()
+    {
+        return Err("vision graph patch classes are invalid or duplicated".into());
+    }
+    let bindings = CheckedVisionBindings::new(plan);
+    let (graph, _) = vision_graph_draft(
+        NativeGraphMetadata::new_template(backend),
+        bindings.entries(),
+        load,
+        geometry,
+        decoder_hidden,
+        largest,
+    )
+    .map_err(|error| error.to_string())?;
+    // The merger reads the merged row count of each patch class.
+    let slices = patch_rows
+        .iter()
+        .map(|&rows| {
+            NativeGraphClassSlice::new().dimension("M", [rows]).scoped(
+                qwen_vision_merger::Entry::NAME,
+                "M",
+                [rows / merge],
+            )
         })
         .collect::<Vec<_>>();
-    let merger = plan.merger();
-    let merger_elements = [
-        ("A", merger.activation),
-        ("NW", merger.output_norm_weight),
-        ("NB", merger.output_norm_bias),
-        ("UW", merger.hidden),
-        ("UB", merger.hidden_bias),
-        ("DW", merger.output),
-        ("DB", merger.output_bias),
-    ];
-    let mut seen = Vec::new();
-    let mut family: Option<NativeGraphStorageBytes> = None;
-    for rows in patch_rows {
-        if seen.contains(&rows) {
-            return Err("vision graph patch class is duplicated".into());
-        }
-        seen.push(rows);
-        let entries = VisionEntries {
-            stem: &stem_elements[..],
-            blocks: block_elements.iter().map(Vec::as_slice).collect(),
-            merger: &merger_elements[..],
-        };
-        let (storage, _) = vision_graph_topology(
+    let layout = graph
+        .seal_template()
+        .and_then(|template| template.certify(&slices))
+        .map_err(|error| error.to_string())?;
+    Ok((layout.storage_bytes(), vec![layout; patch_rows.len()]))
+}
+
+#[cfg(test)]
+pub(crate) fn verify_vision_family_certificates(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    geometry: &VisionGeometry,
+    decoder_hidden: u64,
+    plan: &VisionProgramPlan,
+    patch_rows: &[u64],
+) -> Result<(), String> {
+    let (_, layouts) =
+        certify_vision_family(backend, load, geometry, decoder_hidden, plan, patch_rows)?;
+    let bindings = CheckedVisionBindings::new(plan);
+    for (&rows, layout) in patch_rows.iter().zip(&layouts) {
+        let (graph, _) = vision_graph_draft(
             NativeGraphMetadata::new(backend),
-            entries,
+            bindings.entries(),
             load,
             geometry,
             decoder_hidden,
             rows,
         )
         .map_err(|error| error.to_string())?;
-        match &mut family {
-            Some(maximum) => {
-                maximum.workspace = maximum.workspace.max(storage.workspace);
-                maximum.output = maximum.output.max(storage.output);
-                maximum.upload = maximum.upload.max(storage.upload);
-            }
-            None => family = Some(storage),
+        let charged = graph
+            .seal_with_layout(layout)
+            .map_err(|error| format!("vision class {rows}: {error}"))?;
+        if charged != layout.storage_bytes() {
+            return Err(format!("vision class {rows} charged a different layout"));
         }
     }
-    family.ok_or_else(|| "vision graph family has no exact patch class".into())
+    Ok(())
 }
+
 pub struct NativeVisionProgram {
     graphs: BoundVisionGraphs,
 }
@@ -460,10 +556,21 @@ impl PreparedVisionGraphs {
         load: &ModelLoadPlan,
         geometry: &VisionGeometry,
         decoder_hidden: u64,
+        program: &VisionProgramPlan,
         patch_rows: impl IntoIterator<Item = u64>,
     ) -> Result<Self, SubmitError> {
+        let patch_rows = patch_rows.into_iter().collect::<Vec<_>>();
+        let (_, layouts) = certify_vision_family(
+            target_device.backend(),
+            load,
+            geometry,
+            decoder_hidden,
+            program,
+            &patch_rows,
+        )
+        .map_err(invalid)?;
         let mut variants = Vec::new();
-        for rows in patch_rows {
+        for (rows, layout) in patch_rows.into_iter().zip(layouts) {
             if variants
                 .iter()
                 .any(|variant: &PreparedVisionGraph| variant.patch_rows == rows)
@@ -476,7 +583,7 @@ impl PreparedVisionGraphs {
                 merger: &handles.merger,
             };
             let (plan, ports) = vision_graph_topology(
-                target_device.native_graph(),
+                target_device.native_graph_with_layout(&layout),
                 entries,
                 load,
                 geometry,

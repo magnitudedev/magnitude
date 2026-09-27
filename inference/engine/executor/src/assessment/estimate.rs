@@ -95,7 +95,11 @@ pub fn estimate_performance(
                                 term.key.class.name()
                             ))
                         })?;
-                    Ok::<_, AssessmentError>(step.plus(cost.seconds(term.launches, bytes, term.launch_bytes)))
+                    Ok::<_, AssessmentError>(step.plus(cost.seconds(
+                        term.launches,
+                        bytes,
+                        term.launch_bytes,
+                    )))
                 })?;
             if ![step.fast, step.median, step.slow]
                 .iter()

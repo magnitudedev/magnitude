@@ -45,7 +45,9 @@ the compatibility set.
 ### Measurement job
 
 ```text
-service start -> device discovery -> automatic device selection -> measurement job -> Ready pool
+service start -> device discovery -> automatic device selection
+                                                    ├── measurement job ───┐
+                                                    └── model preparation ──┴── complete assessment
 ```
 
 - One contained child process of the service executable opens exactly the selected device, reuses
@@ -54,6 +56,10 @@ service start -> device discovery -> automatic device selection -> measurement j
   opens a device, forms kernels or times them.
 - The assessment pool is `Preparing` until the basis is available. A failed job publishes a
   retryable pool failure and is retried with bounded backoff; it never blocks service health.
+- Exact model preparation starts while the measurement job runs. It can read headers, inspect
+  tokenizer and template capabilities, plan execution and certify resources using the selected
+  execution configuration. The basis is needed only for support and performance evaluation and
+  final assessment publication. A basis-dependent cache identity does not delay preparation.
 - Measurement and model residency exclude each other on the device: measurement waits for no
   instance to be loading or resident, and loads wait for measurement to finish.
 - Measurement allocations are engine claims above the planning reserve.
@@ -88,8 +94,8 @@ One assessment is header arithmetic on the service's bounded blocking pool:
    tokenizer, template and reasoning inspection;
 3. it resolves the serving configuration (method, codec, limits) exactly as a load does and plans
    the allocation-free execution plan on the selected device; and
-4. it computes memory fit, compatibility against the basis and decode speed at every requested
-   depth.
+4. after the basis is ready, it computes memory fit, compatibility against the basis and decode
+   speed at every requested depth.
 
 It reads no tensor payload, opens no device, allocates nothing and decodes nothing. A target split
 across several GGUF files is assessed as one package: the engine is given its first shard and

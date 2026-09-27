@@ -15,9 +15,9 @@ use magnitude_batching::TargetBatchUpload;
 use magnitude_family_contracts::{DecoderGeometry, WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{readout_features_rows, readout_head_rows, sample_rows, shape_rows};
 use seismic::{
-    BackendName, BoundNativeGraphPlan, Device, Element, NativeGraphFamily, NativeGraphMetadata,
-    NativeGraphPlan, NativeGraphStorageBytes, NativePort, WorkflowTensor, WorkflowTensorMut,
-    WorkflowTensorRef,
+    BackendName, BoundNativeGraphPlan, Device, Element, Entry, NativeGraphClassSlice,
+    NativeGraphFamily, NativeGraphLayout, NativeGraphMetadata, NativeGraphPlan,
+    NativeGraphStorageBytes, NativePort, WorkflowTensor, WorkflowTensorMut, WorkflowTensorRef,
 };
 use std::collections::BTreeMap;
 
@@ -159,11 +159,16 @@ impl PreparedTargetReadoutGraphs {
             .weights()
             .find(|weight| weight.role == role(WeightKind::Output))
             .ok_or("readout output projection weight is absent")?;
+        let regimes =
+            certify_readout_regimes(device.backend(), geometry, norm, projection, limits)?;
         let mut classes = BTreeMap::new();
         let mut plans = Vec::new();
         let mut add = |class: ReadoutClass| -> Result<(), String> {
+            let layout = regimes
+                .get(&readout_regime(class))
+                .ok_or("readout class has no resource regime")?;
             let variant = PreparedTargetReadoutGraph::prepare(
-                device, target, geometry, norm, projection, class,
+                device, target, geometry, norm, projection, class, layout,
             )?;
             plans.push(variant.plan.clone());
             classes.insert(class, variant);
@@ -267,9 +272,10 @@ impl PreparedTargetReadoutGraph {
         norm_plan: &crate::WeightPlan,
         weight_plan: &crate::WeightPlan,
         class: ReadoutClass,
+        layout: &NativeGraphLayout,
     ) -> Result<Self, String> {
         let (mut graph, hidden, norm, out_rows, features) = feature_topology(
-            device.native_graph(),
+            device.native_graph_with_layout(layout),
             &target.readout.features,
             geometry,
             norm_plan,
@@ -333,7 +339,8 @@ fn feature_topology<'a, G: GraphDraft + 'a>(
     norm_plan: &crate::WeightPlan,
     class: ReadoutClass,
 ) -> Result<(G, NativePort, NativePort, NativePort, WorkflowTensor), String> {
-    let hidden = graph.port(Element::f32(), &[class.rows, geometry.hidden])?;
+    let hidden =
+        graph.port_with_class_extent(Element::f32(), &[class.rows, geometry.hidden], 0, "M")?;
     let norm = graph.port(norm_plan.resident, &norm_plan.shape)?;
     let dimensions = [
         ("M", class.rows),
@@ -422,6 +429,7 @@ fn selected_topology<'a, G: GraphDraft + 'a>(
     Ok((graph, ports, result.tensor().clone()))
 }
 
+#[cfg(test)]
 fn checked_readout_class_storage(
     backend: BackendName,
     geometry: &DecoderGeometry,
@@ -429,18 +437,31 @@ fn checked_readout_class_storage(
     weight_plan: Option<&crate::WeightPlan>,
     class: ReadoutClass,
 ) -> Result<NativeGraphStorageBytes, String> {
+    checked_readout_class_draft(
+        NativeGraphMetadata::new(backend),
+        geometry,
+        norm_plan,
+        weight_plan,
+        class,
+    )?
+    .seal()
+    .map_err(error)
+}
+
+fn checked_readout_class_draft(
+    graph: NativeGraphMetadata,
+    geometry: &DecoderGeometry,
+    norm_plan: &crate::WeightPlan,
+    weight_plan: Option<&crate::WeightPlan>,
+    class: ReadoutClass,
+) -> Result<NativeGraphMetadata, String> {
     let activation = match geometry.activation_dtype {
         magnitude_family_contracts::ActivationDType::F16 => Element::f16(),
         magnitude_family_contracts::ActivationDType::BF16 => Element::bf16(),
     };
     let feature_elements = [("NW", norm_plan.resident), ("A", activation)];
-    let (graph, hidden, norm, _, _) = feature_topology(
-        NativeGraphMetadata::new(backend),
-        &feature_elements,
-        geometry,
-        norm_plan,
-        class,
-    )?;
+    let (graph, hidden, norm, _, _) =
+        feature_topology(graph, &feature_elements, geometry, norm_plan, class)?;
     let graph = if class.kind == ReadoutKind::Features {
         graph
     } else {
@@ -474,7 +495,7 @@ fn checked_readout_class_storage(
             graph
         }
     };
-    graph.seal().map_err(error)
+    Ok(graph)
 }
 
 #[cfg(test)]
@@ -549,20 +570,90 @@ pub(crate) fn checked_readout_family_storage(
     };
     let norm = weight(WeightKind::OutputNorm)?;
     let projection = weight(WeightKind::Output)?;
-    let mut family: Option<NativeGraphStorageBytes> = None;
-    for class in readout_classes(limits)? {
-        let storage =
-            checked_readout_class_storage(backend, geometry, norm, Some(projection), class)?;
-        match &mut family {
-            Some(maximum) => {
-                maximum.workspace = maximum.workspace.max(storage.workspace);
-                maximum.output = maximum.output.max(storage.output);
-                maximum.upload = maximum.upload.max(storage.upload);
-            }
-            None => family = Some(storage),
-        }
+    let regimes = certify_readout_regimes(backend, geometry, norm, projection, limits)?;
+    regimes
+        .values()
+        .map(NativeGraphLayout::storage_bytes)
+        .reduce(|previous, bytes| NativeGraphStorageBytes {
+            workspace: previous.workspace.max(bytes.workspace),
+            output: previous.output.max(bytes.output),
+            upload: previous.upload.max(bytes.upload),
+        })
+        .ok_or_else(|| "readout graph family has no classes".into())
+}
+
+/// The structure a readout class selects: its kind and, for a selection,
+/// the selected-row count its sampling view is built from.
+type ReadoutRegime = (ReadoutKind, u64);
+
+fn readout_regime(class: ReadoutClass) -> ReadoutRegime {
+    match class.kind {
+        ReadoutKind::Selection { .. } => (class.kind, class.selected),
+        kind => (kind, 0),
     }
-    family.ok_or_else(|| "readout graph family has no classes".into())
+}
+
+fn certify_readout_regimes(
+    backend: BackendName,
+    geometry: &DecoderGeometry,
+    norm: &crate::WeightPlan,
+    projection: &crate::WeightPlan,
+    limits: ResourceLimits,
+) -> Result<BTreeMap<ReadoutRegime, NativeGraphLayout>, String> {
+    let mut regimes: BTreeMap<ReadoutRegime, Vec<ReadoutClass>> = BTreeMap::new();
+    for class in readout_classes(limits)? {
+        regimes
+            .entry(readout_regime(class))
+            .or_default()
+            .push(class);
+    }
+    regimes
+        .into_iter()
+        .map(|((kind, selected), classes)| {
+            let largest = |field: fn(&ReadoutClass) -> u64| {
+                classes
+                    .iter()
+                    .map(field)
+                    .max()
+                    .expect("a regime holds a class")
+            };
+            let template = ReadoutClass {
+                rows: largest(|class| class.rows),
+                outputs: largest(|class| class.outputs),
+                projected: largest(|class| class.projected),
+                selected,
+                kind,
+            };
+            let slices = classes
+                .iter()
+                .map(|class| {
+                    let slice = NativeGraphClassSlice::new()
+                        .dimension("M", [class.rows])
+                        .scoped(readout_features_rows::Entry::NAME, "O", [class.outputs]);
+                    match class.kind {
+                        ReadoutKind::Features => slice,
+                        ReadoutKind::Logits => {
+                            slice.scoped(readout_head_rows::Entry::NAME, "O", [class.projected])
+                        }
+                        ReadoutKind::Selection { .. } => slice
+                            .scoped(readout_head_rows::Entry::NAME, "O", [class.projected])
+                            .scoped(sample_rows::Entry::NAME, "M", [class.selected]),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let layout = checked_readout_class_draft(
+                NativeGraphMetadata::new_template(backend),
+                geometry,
+                norm,
+                Some(projection),
+                template,
+            )?
+            .seal_template()
+            .and_then(|template| template.certify(&slices))
+            .map_err(error)?;
+            Ok(((kind, selected), layout))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -742,4 +833,75 @@ pub(crate) fn write_selection(
         .flat_map(|word| word.to_le_bytes())
         .collect::<Vec<_>>();
     active.write_input(&ports.mask, &bytes).map_err(device)
+}
+
+#[cfg(test)]
+mod resource_regime_tests {
+    use super::*;
+    use crate::ComponentSelection;
+    use seismic::Layout;
+
+    #[test]
+    fn every_readout_class_fits_its_shared_regime_layout() {
+        let definition = crate::planning::tests::fixture_definition();
+        let manifest = crate::planning::tests::fixture_manifest(&definition);
+        let load = ModelLoadPlan::derive(
+            &manifest,
+            &definition,
+            ComponentSelection {
+                head: false,
+                vision: false,
+            },
+            Layout::Rows16,
+        )
+        .unwrap();
+        let weight = |kind| {
+            load.weights()
+                .find(|weight| {
+                    weight.role
+                        == WeightRole {
+                            scope: WeightScope::Target,
+                            kind,
+                        }
+                })
+                .unwrap()
+        };
+        let limits = ResourceLimits {
+            max_launch_rows: 512,
+            max_launch_slots: 32,
+            max_projected_rows: 32,
+            max_images_per_request: 0,
+            lookahead: false,
+        };
+        let classes = readout_classes(limits).unwrap();
+        for backend in [
+            BackendName::Cpu,
+            BackendName::Metal,
+            BackendName::Cuda,
+            BackendName::Vulkan,
+        ] {
+            let regimes = certify_readout_regimes(
+                backend,
+                &definition.geometry,
+                weight(WeightKind::OutputNorm),
+                weight(WeightKind::Output),
+                limits,
+            )
+            .unwrap();
+            for &class in &classes {
+                let layout = &regimes[&readout_regime(class)];
+                let bytes = checked_readout_class_draft(
+                    NativeGraphMetadata::new(backend),
+                    &definition.geometry,
+                    weight(WeightKind::OutputNorm),
+                    Some(weight(WeightKind::Output)),
+                    class,
+                )
+                .unwrap()
+                .seal_with_layout(layout)
+                .unwrap();
+                assert_eq!(bytes, layout.storage_bytes(), "{backend:?} {class:?}");
+            }
+        }
+    }
 }

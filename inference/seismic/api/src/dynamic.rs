@@ -713,7 +713,7 @@ fn decode(
                     return Err(Error::new(
                         "InternalError",
                         "scalar result contract mismatch",
-                    ))
+                    ));
                 }
             })
         }

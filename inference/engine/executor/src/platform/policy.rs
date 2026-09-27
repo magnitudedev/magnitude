@@ -522,22 +522,37 @@ mod tests {
 
     #[test]
     fn host_ram_band_and_ceiling_follow_the_planning_reserve() {
-        let normal = readings(&host(5 * GIB, vec![]), 16 * GIB, None, DeviceMeasurements::Host)
-            .unwrap();
+        let normal = readings(
+            &host(5 * GIB, vec![]),
+            16 * GIB,
+            None,
+            DeviceMeasurements::Host,
+        )
+        .unwrap();
         assert_eq!(normal.len(), 1);
         assert_eq!(normal[0].role, DomainRole::Allocation);
         assert_eq!(normal[0].band, MemoryBand::Normal);
         assert_eq!(normal[0].ceiling_bytes, 3 * GIB);
         assert_eq!(normal[0].constraint, MemoryConstraint::HostRam);
         // Exactly at the planning reserve is already Reclaim.
-        let at_line = readings(&host(2 * GIB, vec![]), 16 * GIB, None, DeviceMeasurements::Host)
-            .unwrap();
+        let at_line = readings(
+            &host(2 * GIB, vec![]),
+            16 * GIB,
+            None,
+            DeviceMeasurements::Host,
+        )
+        .unwrap();
         assert_eq!(at_line[0].band, MemoryBand::Reclaim);
         assert_eq!(at_line[0].ceiling_bytes, 0);
         // Below the emergency reserve the engine still reports Reclaim; the
         // kill belongs to the service.
-        let below = readings(&host(GIB / 2, vec![]), 16 * GIB, None, DeviceMeasurements::Host)
-            .unwrap();
+        let below = readings(
+            &host(GIB / 2, vec![]),
+            16 * GIB,
+            None,
+            DeviceMeasurements::Host,
+        )
+        .unwrap();
         assert_eq!(below[0].band, MemoryBand::Reclaim);
         assert_eq!(below[0].ceiling_bytes, 0);
     }
@@ -613,8 +628,13 @@ mod tests {
             free_bytes: free,
             total_bytes: 24 * GIB,
         };
-        let normal = readings(&host(8 * GIB, vec![]), 64 * GIB, Some(24 * GIB), cuda(10 * GIB))
-            .unwrap();
+        let normal = readings(
+            &host(8 * GIB, vec![]),
+            64 * GIB,
+            Some(24 * GIB),
+            cuda(10 * GIB),
+        )
+        .unwrap();
         assert_eq!(normal.len(), 2);
         let (allocation, staging) = (normal[0], normal[1]);
         assert_eq!(allocation.role, DomainRole::Allocation);
@@ -630,8 +650,13 @@ mod tests {
         assert_eq!(staging.band, MemoryBand::Normal);
         assert_eq!(band_of(&normal), MemoryBand::Normal);
 
-        let card_reclaim =
-            readings(&host(8 * GIB, vec![]), 64 * GIB, Some(24 * GIB), cuda(2 * GIB)).unwrap();
+        let card_reclaim = readings(
+            &host(8 * GIB, vec![]),
+            64 * GIB,
+            Some(24 * GIB),
+            cuda(2 * GIB),
+        )
+        .unwrap();
         assert_eq!(card_reclaim[0].band, MemoryBand::Reclaim);
         assert_eq!(card_reclaim[0].ceiling_bytes, 0);
         assert_eq!(band_of(&card_reclaim), MemoryBand::Reclaim);
@@ -662,18 +687,33 @@ mod tests {
             heap_budget_bytes: 14 * GIB,
             heap_usage_bytes: usage,
         };
-        let normal =
-            readings(&host(8 * GIB, vec![]), 32 * GIB, Some(16 * GIB), vulkan(6 * GIB)).unwrap();
+        let normal = readings(
+            &host(8 * GIB, vec![]),
+            32 * GIB,
+            Some(16 * GIB),
+            vulkan(6 * GIB),
+        )
+        .unwrap();
         assert_eq!(normal[0].headroom_bytes, 8 * GIB);
         assert_eq!(normal[0].ceiling_bytes, 6 * GIB);
         assert_eq!(normal[0].band, MemoryBand::Normal);
-        let reclaim =
-            readings(&host(8 * GIB, vec![]), 32 * GIB, Some(16 * GIB), vulkan(13 * GIB)).unwrap();
+        let reclaim = readings(
+            &host(8 * GIB, vec![]),
+            32 * GIB,
+            Some(16 * GIB),
+            vulkan(13 * GIB),
+        )
+        .unwrap();
         assert_eq!(reclaim[0].band, MemoryBand::Reclaim);
         assert_eq!(reclaim[0].ceiling_bytes, 0);
         // Usage past the budget saturates rather than wrapping.
-        let over =
-            readings(&host(8 * GIB, vec![]), 32 * GIB, Some(16 * GIB), vulkan(15 * GIB)).unwrap();
+        let over = readings(
+            &host(8 * GIB, vec![]),
+            32 * GIB,
+            Some(16 * GIB),
+            vulkan(15 * GIB),
+        )
+        .unwrap();
         assert_eq!(over[0].headroom_bytes, 0);
     }
 
@@ -687,7 +727,12 @@ mod tests {
             },
         ] {
             assert!(matches!(
-                readings(&host(8 * GIB, vec![]), 32 * GIB, Some(16 * GIB), measurements),
+                readings(
+                    &host(8 * GIB, vec![]),
+                    32 * GIB,
+                    Some(16 * GIB),
+                    measurements
+                ),
                 Err(MemoryPolicyError::MismatchedObservation { .. })
             ));
         }

@@ -200,6 +200,15 @@ impl Device {
             inner: seismic_runtime::native::graph::NativeGraphDraft::new(&self.inner),
         }
     }
+    /// Begin an exact graph using a certified Seismic placement.
+    pub fn native_graph_with_layout(&self, layout: &NativeGraphLayout) -> NativeGraph {
+        NativeGraph {
+            inner: seismic_runtime::native::graph::NativeGraphDraft::with_layout(
+                &self.inner,
+                layout.inner.clone(),
+            ),
+        }
+    }
     /// An empty sequence of graph runs to submit together.
     pub fn native_sequence(&self) -> NativeGraphSequence {
         NativeGraphSequence {
@@ -1107,6 +1116,7 @@ pub struct NativeGraphMetadata {
     backend: BackendName,
     inner: seismic_runtime::native::graph::NativeGraphMetadataDraft,
     template: Option<MetadataTemplateRecorder>,
+    class_scope: Option<&'static str>,
 }
 
 struct MetadataTemplateRecorder {
@@ -1123,6 +1133,7 @@ enum MetadataPortSource {
     Checked {
         checked: generated::NativeGraphCheckedEntry,
         entry_name: &'static str,
+        class_scope: Option<&'static str>,
         parameter: String,
         dimensions: Vec<(String, u64)>,
     },
@@ -1131,15 +1142,89 @@ enum MetadataPortSource {
 struct MetadataNodeSource {
     checked: generated::NativeGraphCheckedEntry,
     entry_name: &'static str,
+    class_scope: Option<&'static str>,
     dimensions: Vec<(String, u64)>,
 }
 
-/// One checked graph topology reused across numeric shape classes. Each
-/// evaluation asks the generated entry contracts for exact shapes and scratch
-/// before Seismic places the graph's original edges and lifetimes.
+/// One checked graph topology reused across the numeric shape classes of a
+/// structural regime. Certification asks the generated entry contracts for
+/// exact shapes and scratch before Seismic places the graph's original edges
+/// and lifetimes.
 pub struct NativeGraphResourceTemplate {
     inner: seismic_runtime::native::graph::NativeGraphMetadataDraft,
     recorder: MetadataTemplateRecorder,
+}
+
+/// One slice of the admitted classes of a structural graph regime: every
+/// combination of its listed dimension values. A regime's classes are the
+/// union of its slices, so correlated dimensions (slots bounded by rows) are
+/// fixed together per slice. Every slice of a regime names the same
+/// dimensions.
+#[derive(Clone, Debug, Default)]
+pub struct NativeGraphClassSlice {
+    dimensions: Vec<(&'static str, Vec<u64>)>,
+    scoped: Vec<(&'static str, &'static str, Vec<u64>)>,
+}
+
+impl NativeGraphClassSlice {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The values of a class dimension for every node that declares it.
+    pub fn dimension(mut self, name: &'static str, values: impl IntoIterator<Item = u64>) -> Self {
+        self.dimensions.push((name, values.into_iter().collect()));
+        self
+    }
+
+    /// The values of a dimension for nodes of one class scope or entry name.
+    /// A class scope takes precedence over an entry name, and both over an
+    /// unscoped dimension of the same name.
+    pub fn scoped(
+        mut self,
+        scope: &'static str,
+        name: &'static str,
+        values: impl IntoIterator<Item = u64>,
+    ) -> Self {
+        self.scoped
+            .push((scope, name, values.into_iter().collect()));
+        self
+    }
+
+    fn names(&self) -> Vec<(Option<&'static str>, &'static str)> {
+        let mut names = self
+            .dimensions
+            .iter()
+            .map(|(name, _)| (None, *name))
+            .chain(
+                self.scoped
+                    .iter()
+                    .map(|(scope, name, _)| (Some(*scope), *name)),
+            )
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn global(&self, name: &str) -> Option<&[u64]> {
+        self.dimensions
+            .iter()
+            .find(|(candidate, _)| *candidate == name)
+            .map(|(_, values)| values.as_slice())
+    }
+
+    fn values(&self, entry_name: &str, class_scope: Option<&str>, name: &str) -> Option<&[u64]> {
+        let scoped = |scope: &str| {
+            self.scoped
+                .iter()
+                .find(|(candidate, axis, _)| *candidate == scope && *axis == name)
+                .map(|(_, _, values)| values.as_slice())
+        };
+        class_scope
+            .and_then(scoped)
+            .or_else(|| scoped(entry_name))
+            .or_else(|| self.global(name))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1167,98 +1252,239 @@ impl std::error::Error for NativeGraphMetadataError {}
 
 pub use seismic_runtime::native::graph::NativeGraphStorageBytes;
 
-fn owned_dimensions(dimensions: &[(&str, u64)]) -> Vec<(String, u64)> {
-    dimensions.iter().map(|(name, value)| ((*name).to_owned(), *value)).collect()
+#[derive(Clone)]
+pub struct NativeGraphLayout {
+    inner: Arc<seismic_runtime::native::graph::NativeGraphLayout>,
 }
 
-fn class_dimensions<'a>(
-    entry_name: &str,
-    dimensions: &'a [(String, u64)],
-    overrides: &[(&str, u64)],
-    scoped_overrides: &[(&str, &str, u64)],
-) -> Vec<(&'a str, u64)> {
+impl NativeGraphLayout {
+    pub fn storage_bytes(&self) -> NativeGraphStorageBytes {
+        self.inner.storage_bytes()
+    }
+}
+
+fn owned_dimensions(dimensions: &[(&str, u64)]) -> Vec<(String, u64)> {
     dimensions
         .iter()
-        .map(|(name, value)| {
-            (
-                name.as_str(),
-                scoped_overrides
-                    .iter()
-                    .find_map(|(entry, axis, value)| {
-                        (*entry == entry_name && *axis == name).then_some(*value)
-                    })
-                    .or_else(|| overrides
-                    .iter()
-                    .find_map(|(axis, value)| (*axis == name).then_some(*value)))
-                    .unwrap_or(*value),
-            )
-        })
+        .map(|(name, value)| ((*name).to_owned(), *value))
         .collect()
 }
 
+/// The largest value `measure` takes over every admitted class. A buffer's
+/// size is a function of the dimensions its expression reads, so it is
+/// evaluated once per distinct combination of those dimensions across all
+/// slices; every other dimension of the node keeps its recorded value.
+fn class_maximum(
+    slices: &[NativeGraphClassSlice],
+    entry_name: &str,
+    class_scope: Option<&str>,
+    recorded: &[(String, u64)],
+    reads: &[&str],
+    measure: impl Fn(&[(&str, u64)]) -> Result<u64, String>,
+) -> Result<u64, String> {
+    // Every slice names the same dimensions, so the class dimensions this
+    // buffer reads are the same in each.
+    let varying = recorded
+        .iter()
+        .enumerate()
+        .filter(|(_, (name, _))| {
+            reads.contains(&name.as_str())
+                && slices[0].values(entry_name, class_scope, name).is_some()
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut combinations = std::collections::HashSet::<Vec<u64>>::new();
+    let mut combination = vec![0; varying.len()];
+    for slice in slices {
+        let lists = varying
+            .iter()
+            .map(|&index| {
+                let name = &recorded[index].0;
+                slice
+                    .values(entry_name, class_scope, name)
+                    .ok_or_else(|| format!("class slice omits dimension `{name}`"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut digits = vec![0; varying.len()];
+        'combinations: loop {
+            for ((value, values), &digit) in combination.iter_mut().zip(&lists).zip(&digits) {
+                *value = values[digit];
+            }
+            if !combinations.contains(combination.as_slice()) {
+                combinations.insert(combination.clone());
+            }
+            for (digit, values) in digits.iter_mut().zip(&lists) {
+                *digit += 1;
+                if *digit < values.len() {
+                    continue 'combinations;
+                }
+                *digit = 0;
+            }
+            break;
+        }
+    }
+    let mut point = recorded
+        .iter()
+        .map(|(name, value)| (name.as_str(), *value))
+        .collect::<Vec<_>>();
+    let mut maximum = 0;
+    for combination in &combinations {
+        for (&index, &value) in varying.iter().zip(combination) {
+            point[index].1 = value;
+        }
+        maximum = maximum.max(measure(&point)?);
+    }
+    Ok(maximum)
+}
+
 impl NativeGraphResourceTemplate {
-    pub fn evaluate(
+    /// Place one layout for every admitted class of this structural regime.
+    /// Each port, result and scratch buffer is charged the exact maximum of
+    /// its checked size over the classes, evaluated at the combinations of
+    /// the dimensions its size expression reads. Seismic places those
+    /// capacities once; production seals each exact class into the same
+    /// offsets and rejects any class that does not fit.
+    pub fn certify(
         &self,
-        overrides: &[(&str, u64)],
-        scoped_overrides: &[(&str, &str, u64)],
-    ) -> Result<NativeGraphStorageBytes, NativeGraphMetadataError> {
-        let mut ports = Vec::with_capacity(self.recorder.ports.len());
-        for source in &self.recorder.ports {
-            let (element, extents) = match source {
-                MetadataPortSource::Direct { element, extents, class_extent } => {
+        slices: &[NativeGraphClassSlice],
+    ) -> Result<NativeGraphLayout, NativeGraphMetadataError> {
+        let unsupported = NativeGraphMetadataError::Unsupported;
+        let Some(first) = slices.first() else {
+            return Err(unsupported("graph regime has no admitted classes".into()));
+        };
+        let names = first.names();
+        let valid = names.windows(2).all(|pair| pair[0] != pair[1])
+            && slices.iter().all(|slice| {
+                slice.names() == names
+                    && slice
+                        .dimensions
+                        .iter()
+                        .all(|(_, values)| !values.is_empty())
+                    && slice.scoped.iter().all(|(_, _, values)| !values.is_empty())
+            });
+        if !valid {
+            return Err(unsupported(
+                "graph regime slices must name the same dimensions once, each with values".into(),
+            ));
+        }
+        let ports = self
+            .recorder
+            .ports
+            .iter()
+            .map(|source| match source {
+                MetadataPortSource::Direct {
+                    element,
+                    extents,
+                    class_extent,
+                } => {
+                    let Some((axis, name)) = class_extent else {
+                        return element
+                            .canonical_byte_len(extents)
+                            .map_err(NativeGraphMetadataError::Tensor);
+                    };
                     let mut extents = extents.clone();
-                    if let Some((axis, name)) = class_extent {
-                        extents[*axis] = overrides
-                            .iter()
-                            .find_map(|(candidate, value)| (*candidate == *name).then_some(*value))
-                            .ok_or_else(|| NativeGraphMetadataError::Unsupported(format!(
-                                "graph resource class omitted dimension `{name}`"
-                            )))?;
+                    let mut maximum = 0;
+                    for slice in slices {
+                        let values = slice.global(name).ok_or_else(|| {
+                            unsupported(format!("graph regime omits class dimension `{name}`"))
+                        })?;
+                        for &value in values {
+                            extents[*axis] = value;
+                            maximum = maximum.max(
+                                element
+                                    .canonical_byte_len(&extents)
+                                    .map_err(NativeGraphMetadataError::Tensor)?,
+                            );
+                        }
                     }
-                    (*element, extents)
+                    Ok(maximum)
                 }
                 MetadataPortSource::Checked {
                     checked,
                     entry_name,
+                    class_scope,
                     parameter,
                     dimensions,
                 } => {
-                    let dimensions = class_dimensions(entry_name, dimensions, overrides, scoped_overrides);
-                    let metadata = checked.parameter(parameter, &dimensions)
-                        .map_err(NativeGraphMetadataError::Unsupported)?;
-                    (metadata.element, metadata.extents)
+                    let reads = checked
+                        .parameter_dimensions(parameter)
+                        .map_err(unsupported)?;
+                    class_maximum(
+                        slices,
+                        entry_name,
+                        *class_scope,
+                        dimensions,
+                        &reads,
+                        |point| {
+                            checked
+                                .parameter(parameter, point)
+                                .map(|metadata| metadata.canonical_bytes)
+                        },
+                    )
+                    .map_err(|error| unsupported(format!("`{entry_name}.{parameter}`: {error}")))
                 }
-            };
-            ports.push((element.id(), extents));
-        }
-        let mut nodes = Vec::with_capacity(self.recorder.nodes.len());
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut results = Vec::with_capacity(self.recorder.nodes.len());
+        let mut scratch = Vec::with_capacity(self.recorder.nodes.len());
         for source in &self.recorder.nodes {
-            let dimensions = class_dimensions(source.entry_name, &source.dimensions, overrides, scoped_overrides);
-            let (parameters, results) = source.checked.shapes(&dimensions)
-                .map_err(NativeGraphMetadataError::Unsupported)?;
-            let scratch = checked_native_scratch_bound(
-                &source.checked.implementation().scratch,
-                &source.checked.implementation().params,
-                &dimensions,
-            )
-            .map_err(|reason| NativeGraphMetadataError::Unsupported(format!(
-                "`{}` scratch bound: {reason}", source.entry_name
-            )))?;
-            nodes.push(seismic_runtime::native::graph::NativeGraphNodeShape {
-                parameters: parameters
-                    .into_iter()
-                    .map(|shape| shape.map(|metadata| (metadata.element.id(), metadata.extents)))
-                    .collect(),
-                results: results
-                    .into_iter()
-                    .map(|shape| shape.map(|metadata| (metadata.element.id(), metadata.extents)))
-                    .collect(),
-                scratch,
-            });
+            let entry = source.entry_name;
+            let maximum =
+                |reads: &[&str], measure: &dyn Fn(&[(&str, u64)]) -> Result<u64, String>| {
+                    class_maximum(
+                        slices,
+                        entry,
+                        source.class_scope,
+                        &source.dimensions,
+                        reads,
+                        measure,
+                    )
+                    .map_err(|error| unsupported(format!("`{entry}`: {error}")))
+                };
+            results.push(
+                (0..source.checked.result_count())
+                    .map(|ordinal| {
+                        let reads = source
+                            .checked
+                            .result_dimensions(ordinal)
+                            .map_err(unsupported)?;
+                        maximum(&reads, &|point| {
+                            source
+                                .checked
+                                .result(ordinal, point)
+                                .map(|metadata| metadata.canonical_bytes)
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            let implementation = source.checked.implementation();
+            scratch.push(
+                implementation
+                    .scratch
+                    .iter()
+                    .map(|buffer| {
+                        let reads = buffer.dimensions();
+                        let reads = reads.iter().map(String::as_str).collect::<Vec<_>>();
+                        maximum(&reads, &|point| {
+                            buffer
+                                .maximum_bytes(&implementation.params, &|name| {
+                                    point
+                                        .iter()
+                                        .find(|(candidate, _)| *candidate == name)
+                                        .map(|(_, value)| *value)
+                                })
+                                .map_err(|error| format!("scratch `{}`: {error}", buffer.name))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
         }
         self.inner
-            .rebound_storage(&ports, nodes)
-            .map_err(NativeGraphMetadataError::Call)
+            .capacity_layout(&ports, &results, scratch)
+            .map(|inner| NativeGraphLayout {
+                inner: Arc::new(inner),
+            })
+            .map_err(NativeGraphMetadataError::Workflow)
     }
 }
 
@@ -1267,82 +1493,18 @@ fn checked_native_scratch_bound(
     tuning_parameters: &[NativeParameter],
     dimensions: &[(&str, u64)],
 ) -> Result<Vec<u64>, String> {
-    fn maximum(
-        scratch: &NativeScratch,
-        dimensions: &[(&str, u64)],
-        parameters: &[&NativeParameter],
-        values: &mut Vec<u64>,
-        index: usize,
-    ) -> Result<u64, String> {
-        if let Some(parameter) = parameters.get(index) {
-            let mut largest = 0;
-            for &value in &parameter.values {
-                values.push(value);
-                largest = largest.max(maximum(scratch, dimensions, parameters, values, index + 1)?);
-                values.pop();
-            }
-            return Ok(largest);
-        }
-        let dimension = |name: &str| {
-            dimensions
-                .iter()
-                .find(|(candidate, _)| *candidate == name)
-                .map(|(_, value)| *value)
-        };
-        let parameter = |name: &str| {
-            parameters
-                .iter()
-                .position(|candidate| candidate.name == name)
-                .map(|index| values[index])
-        };
-        let active = scratch
-            .when
-            .as_ref()
-            .map(|condition| condition.holds(&dimension, &parameter))
-            .transpose()
-            .map_err(|error| error.to_string())?
-            .unwrap_or(true);
-        if !active {
-            return Ok(1);
-        }
-        scratch
-            .bytes
-            .evaluate(&dimension, &parameter)
-            .map(|bytes| bytes.max(1))
-            .map_err(|error| error.to_string())
-    }
-
     scratch_buffers
         .iter()
         .map(|scratch| {
-            let mut names = Vec::new();
-            scratch.bytes.parameters(&mut names);
-            if let Some(condition) = &scratch.when {
-                condition.parameters(&mut names);
-            }
-            let parameters = names
-                .iter()
-                .map(|name| {
-                    tuning_parameters
-                        .iter()
-                        .find(|parameter| &parameter.name == name)
-                        .ok_or_else(|| {
-                            format!("scratch `{}` has unknown parameter `{name}`", scratch.name)
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            if parameters
-                .iter()
-                .any(|parameter| parameter.values.is_empty())
-            {
-                return Err(format!(
-                    "scratch `{}` has an empty tuning domain",
-                    scratch.name
-                ));
-            }
-            maximum(scratch, dimensions, &parameters, &mut Vec::new(), 0)
+            scratch.maximum_bytes(tuning_parameters, &|name| {
+                dimensions
+                    .iter()
+                    .find(|(candidate, _)| *candidate == name)
+                    .map(|(_, value)| *value)
+            })
         })
-        .collect()
+        .collect::<Result<_, _>>()
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -1384,6 +1546,7 @@ impl NativeGraphMetadata {
             backend,
             inner: seismic_runtime::native::graph::NativeGraphMetadataDraft::new(),
             template: None,
+            class_scope: None,
         }
     }
 
@@ -1395,7 +1558,14 @@ impl NativeGraphMetadata {
                 ports: Vec::new(),
                 nodes: Vec::new(),
             }),
+            class_scope: None,
         }
+    }
+
+    /// Tag following checked ports and nodes with a semantic class extent
+    /// scope. A scoped override distinguishes repeated calls to one entry.
+    pub fn set_class_scope(&mut self, scope: Option<&'static str>) {
+        self.class_scope = scope;
     }
 
     pub fn port(
@@ -1433,7 +1603,8 @@ impl NativeGraphMetadata {
     ) -> Result<NativePort, NativeGraphMetadataError> {
         let port = self.port(element, extents)?;
         if let Some(template) = &mut self.template {
-            let Some(MetadataPortSource::Direct { class_extent, .. }) = template.ports.last_mut() else {
+            let Some(MetadataPortSource::Direct { class_extent, .. }) = template.ports.last_mut()
+            else {
                 unreachable!("direct port was just recorded")
             };
             if extent_axis >= extents.len() {
@@ -1446,36 +1617,35 @@ impl NativeGraphMetadata {
         Ok(port)
     }
 
-    pub fn input_for<E: Entry>(
+    fn bind_checked<E: Entry>(
+        &self,
+        elements: &[(&str, Element)],
+    ) -> Result<generated::NativeGraphCheckedEntry, NativeGraphMetadataError> {
+        generated::NativeGraphCheckedEntry::bind::<E>(self.backend, elements)
+            .map_err(NativeGraphMetadataError::Bundle)?
+            .map_err(NativeGraphMetadataError::Unsupported)
+    }
+
+    fn checked_port<E: Entry>(
         &mut self,
         elements: &[(&str, Element)],
         parameter: &str,
         dimensions: &[(&str, u64)],
+        owned_input: bool,
     ) -> Result<NativePort, NativeGraphMetadataError> {
-        let metadata = match generated::checked_native_tensor_parameter::<E>(
-            self.backend,
-            elements,
-            parameter,
-            dimensions,
-        )
-        .map_err(NativeGraphMetadataError::Bundle)?
-        {
-            NativeTensorParameterCheck::Checked(metadata) => metadata,
-            NativeTensorParameterCheck::Unsupported(reason) => {
-                return Err(NativeGraphMetadataError::Unsupported(reason));
-            }
-        };
+        let checked = self.bind_checked::<E>(elements)?;
+        let metadata = checked
+            .parameter(parameter, dimensions)
+            .map_err(NativeGraphMetadataError::Unsupported)?;
         let inner = self
             .inner
-            .port(metadata.element.id(), &metadata.extents, true, true)
+            .port(metadata.element.id(), &metadata.extents, true, owned_input)
             .map_err(NativeGraphMetadataError::Tensor)?;
         if let Some(template) = &mut self.template {
-            let checked = generated::NativeGraphCheckedEntry::bind::<E>(self.backend, elements)
-                .map_err(NativeGraphMetadataError::Bundle)?
-                .map_err(NativeGraphMetadataError::Unsupported)?;
             template.ports.push(MetadataPortSource::Checked {
                 checked,
                 entry_name: E::NAME,
+                class_scope: self.class_scope,
                 parameter: parameter.to_owned(),
                 dimensions: owned_dimensions(dimensions),
             });
@@ -1488,46 +1658,22 @@ impl NativeGraphMetadata {
         })
     }
 
+    pub fn input_for<E: Entry>(
+        &mut self,
+        elements: &[(&str, Element)],
+        parameter: &str,
+        dimensions: &[(&str, u64)],
+    ) -> Result<NativePort, NativeGraphMetadataError> {
+        self.checked_port::<E>(elements, parameter, dimensions, true)
+    }
+
     pub fn local_for<E: Entry>(
         &mut self,
         elements: &[(&str, Element)],
         parameter: &str,
         dimensions: &[(&str, u64)],
     ) -> Result<NativePort, NativeGraphMetadataError> {
-        let metadata = match generated::checked_native_tensor_parameter::<E>(
-            self.backend,
-            elements,
-            parameter,
-            dimensions,
-        )
-        .map_err(NativeGraphMetadataError::Bundle)?
-        {
-            NativeTensorParameterCheck::Checked(metadata) => metadata,
-            NativeTensorParameterCheck::Unsupported(reason) => {
-                return Err(NativeGraphMetadataError::Unsupported(reason));
-            }
-        };
-        let inner = self
-            .inner
-            .port(metadata.element.id(), &metadata.extents, true, false)
-            .map_err(NativeGraphMetadataError::Tensor)?;
-        if let Some(template) = &mut self.template {
-            let checked = generated::NativeGraphCheckedEntry::bind::<E>(self.backend, elements)
-                .map_err(NativeGraphMetadataError::Bundle)?
-                .map_err(NativeGraphMetadataError::Unsupported)?;
-            template.ports.push(MetadataPortSource::Checked {
-                checked,
-                entry_name: E::NAME,
-                parameter: parameter.to_owned(),
-                dimensions: owned_dimensions(dimensions),
-            });
-        }
-        Ok(NativePort {
-            tensor: WorkflowTensor {
-                inner: inner.reference(),
-            },
-            inner,
-        })
+        self.checked_port::<E>(elements, parameter, dimensions, false)
     }
 
     pub fn prewrite(&mut self, port: &NativePort) -> Result<(), NativeGraphMetadataError> {
@@ -1542,19 +1688,11 @@ impl NativeGraphMetadata {
         dimensions: &[(&str, u64)],
         args: E::WorkflowArgs<'_>,
     ) -> Result<E::WorkflowResults, NativeGraphMetadataError> {
-        let (implementation, parameters, results) =
-            match generated::checked_native_graph_call::<E>(self.backend, elements, dimensions)
-                .map_err(NativeGraphMetadataError::Bundle)?
-            {
-                generated::CheckedNativeGraphCall::Checked {
-                    implementation,
-                    parameters,
-                    results,
-                } => (implementation, parameters, results),
-                generated::CheckedNativeGraphCall::Unsupported(reason) => {
-                    return Err(NativeGraphMetadataError::Unsupported(reason));
-                }
-            };
+        let checked = self.bind_checked::<E>(elements)?;
+        let (parameters, results) = checked
+            .shapes(dimensions)
+            .map_err(NativeGraphMetadataError::Unsupported)?;
+        let implementation = checked.implementation();
         let scratch = checked_native_scratch_bound(
             &implementation.scratch,
             &implementation.params,
@@ -1576,12 +1714,10 @@ impl NativeGraphMetadata {
             .enqueue(E::encode_workflow(args), parameter_shapes, shapes, scratch)
             .map_err(NativeGraphMetadataError::Call)?;
         if let Some(template) = &mut self.template {
-            let checked = generated::NativeGraphCheckedEntry::bind::<E>(self.backend, elements)
-                .map_err(NativeGraphMetadataError::Bundle)?
-                .map_err(NativeGraphMetadataError::Unsupported)?;
             template.nodes.push(MetadataNodeSource {
                 checked,
                 entry_name: E::NAME,
+                class_scope: self.class_scope,
                 dimensions: owned_dimensions(dimensions),
             });
         }
@@ -1600,12 +1736,23 @@ impl NativeGraphMetadata {
             .map_err(NativeGraphMetadataError::Workflow)
     }
 
+    pub fn seal_with_layout(
+        self,
+        layout: &NativeGraphLayout,
+    ) -> Result<NativeGraphStorageBytes, NativeGraphMetadataError> {
+        self.inner
+            .seal_with_layout(&layout.inner)
+            .map_err(NativeGraphMetadataError::Workflow)
+    }
+
     pub fn seal_template(self) -> Result<NativeGraphResourceTemplate, NativeGraphMetadataError> {
         self.inner
             .validate_topology()
             .map_err(NativeGraphMetadataError::Workflow)?;
         let recorder = self.template.ok_or_else(|| {
-            NativeGraphMetadataError::Unsupported("graph was not built as a resource template".into())
+            NativeGraphMetadataError::Unsupported(
+                "graph was not built as a resource template".into(),
+            )
         })?;
         Ok(NativeGraphResourceTemplate {
             inner: self.inner,
@@ -2319,7 +2466,8 @@ pub mod generated {
             &self,
             entry: seismic_lang::ids::EntryId,
             bindings: &seismic_lang::entry::ElementBindings,
-        ) -> Result<Arc<seismic_lang::entry::CompiledEntryShapes>, seismic_lang::checked::SourceError> {
+        ) -> Result<Arc<seismic_lang::entry::CompiledEntryShapes>, seismic_lang::checked::SourceError>
+        {
             let logical = self.logical_entry(entry, bindings)?;
             let cell = self
                 .logical_entries
@@ -2329,7 +2477,9 @@ pub mod generated {
                 .find(|item| item.entry == entry && item.bindings == *bindings)
                 .map(|item| item.compiled_shapes.clone());
             Ok(match cell {
-                Some(cell) => cell.get_or_init(|| Arc::new(logical.compile_tensor_shapes())).clone(),
+                Some(cell) => cell
+                    .get_or_init(|| Arc::new(logical.compile_tensor_shapes()))
+                    .clone(),
                 None => Arc::new(logical.compile_tensor_shapes()),
             })
         }
@@ -2628,7 +2778,8 @@ pub mod generated {
                     backend.as_str()
                 )));
             };
-            let shapes = match module.compiled_entry_shapes(entry.id(), &element_bindings(elements)) {
+            let shapes = match module.compiled_entry_shapes(entry.id(), &element_bindings(elements))
+            {
                 Ok(shapes) => shapes,
                 Err(error) => return Ok(Err(error.to_string())),
             };
@@ -2640,6 +2791,35 @@ pub mod generated {
 
         pub fn implementation(&self) -> &NativeImplementation {
             &self.implementation
+        }
+
+        /// The entry dimensions a tensor parameter's checked shape reads.
+        pub fn parameter_dimensions(&self, name: &str) -> Result<Vec<&str>, String> {
+            self.shapes
+                .parameter_dimensions(name)
+                .map_err(|error| error.to_string())
+        }
+
+        /// The entry dimensions a tensor result's checked shape reads.
+        pub fn result_dimensions(&self, ordinal: usize) -> Result<Vec<&str>, String> {
+            self.shapes
+                .result_dimensions(ordinal)
+                .map_err(|error| error.to_string())
+        }
+
+        pub fn result_count(&self) -> usize {
+            self.shapes.result_count()
+        }
+
+        pub fn result(
+            &self,
+            ordinal: usize,
+            dimensions: &[(&str, u64)],
+        ) -> Result<NativeTensorMetadata, String> {
+            self.shapes
+                .result_shape(ordinal, dimensions)
+                .map_err(|error| error.to_string())
+                .and_then(tensor_metadata)
         }
 
         pub fn parameter(
@@ -2656,10 +2836,13 @@ pub mod generated {
         pub fn shapes(
             &self,
             dimensions: &[(&str, u64)],
-        ) -> Result<(
-            Vec<Option<NativeTensorMetadata>>,
-            Vec<Option<NativeTensorMetadata>>,
-        ), String> {
+        ) -> Result<
+            (
+                Vec<Option<NativeTensorMetadata>>,
+                Vec<Option<NativeTensorMetadata>>,
+            ),
+            String,
+        > {
             let (parameters, results) = self
                 .shapes
                 .all_shapes(dimensions)

@@ -76,7 +76,9 @@ async fn open_catalog_models(
     Ok(Arc::new(ManagedModelStore::open(config).await?))
 }
 
-fn ensure_catalog_resolved(generated: &magnitude_service_models::GeneratedReleaseCatalog) -> anyhow::Result<()> {
+fn ensure_catalog_resolved(
+    generated: &magnitude_service_models::GeneratedReleaseCatalog,
+) -> anyhow::Result<()> {
     for diagnostic in &generated.catalog.diagnostics {
         eprintln!(
             "Catalog resolution failed for {} variant {}: {}",
@@ -97,7 +99,11 @@ async fn build_bundle(
     cache_root: PathBuf,
     hf_caches: Vec<PathBuf>,
 ) -> anyhow::Result<()> {
-    if output.is_file() && load_release_catalog(&output).is_ok() {
+    if output.is_file()
+        && load_release_catalog(&output)
+            .and_then(|catalog| catalog.verify_all_headers())
+            .is_ok()
+    {
         eprintln!("Model catalog bundle is already current.");
         return Ok(());
     }
@@ -116,6 +122,9 @@ async fn build_bundle(
     eprintln!("Validating published planner input bundle...");
     let published = load_release_catalog(&output)
         .context("built planner inputs do not satisfy the runtime contract")?;
+    published
+        .verify_all_headers()
+        .context("built planner inputs contain a corrupt header chunk")?;
     anyhow::ensure!(
         serde_json::to_vec(published.catalog())? == serde_json::to_vec(&generated.catalog)?,
         "built planner inputs changed the resolved catalog"

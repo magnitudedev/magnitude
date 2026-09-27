@@ -630,6 +630,9 @@ pub struct CheckedTensorShape {
 struct CompiledTensorShape {
     representation: RepresentationId,
     axes: Vec<CompiledNat>,
+    /// Indices of the entry dimensions any axis reads. The shape's value is
+    /// a function of these dimensions alone.
+    dimensions: Vec<usize>,
 }
 
 /// The checked entry's tensor shape expressions compiled once for repeated
@@ -642,6 +645,61 @@ pub struct CompiledEntryShapes {
 }
 
 impl CompiledEntryShapes {
+    fn tensor_dimensions(&self, shape: &CompiledTensorShape) -> Vec<&str> {
+        shape
+            .dimensions
+            .iter()
+            .map(|&index| self.dimensions[index].0.as_str())
+            .collect()
+    }
+
+    fn parameter_tensor(
+        &self,
+        name: &str,
+    ) -> Result<&CompiledTensorShape, CheckedTensorShapeError> {
+        let (_, shape) = self
+            .parameters
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .ok_or_else(|| CheckedTensorShapeError::UnknownParameter(name.to_owned()))?;
+        shape
+            .as_ref()
+            .ok_or_else(|| CheckedTensorShapeError::NotTensor(name.to_owned()))
+    }
+
+    fn result_tensor(
+        &self,
+        ordinal: usize,
+    ) -> Result<&CompiledTensorShape, CheckedTensorShapeError> {
+        self.results
+            .get(ordinal)
+            .ok_or(CheckedTensorShapeError::UnknownResult(ordinal))?
+            .as_ref()
+            .ok_or_else(|| CheckedTensorShapeError::NotTensor(format!("result {ordinal}")))
+    }
+
+    /// The entry dimensions a tensor parameter's shape reads.
+    pub fn parameter_dimensions(&self, name: &str) -> Result<Vec<&str>, CheckedTensorShapeError> {
+        Ok(self.tensor_dimensions(self.parameter_tensor(name)?))
+    }
+
+    /// The entry dimensions a tensor result's shape reads.
+    pub fn result_dimensions(&self, ordinal: usize) -> Result<Vec<&str>, CheckedTensorShapeError> {
+        Ok(self.tensor_dimensions(self.result_tensor(ordinal)?))
+    }
+
+    pub fn result_count(&self) -> usize {
+        self.results.len()
+    }
+
+    pub fn result_shape(
+        &self,
+        ordinal: usize,
+        dimensions: &[(&str, u64)],
+    ) -> Result<CheckedTensorShape, CheckedTensorShapeError> {
+        Self::shape(self.result_tensor(ordinal)?, &self.values(dimensions)?)
+    }
+
     fn values(&self, dimensions: &[(&str, u64)]) -> Result<InvocationValues, CheckedTensorShapeError> {
         let mut values = InvocationValues::new();
         for (name, symbol) in &self.dimensions {
@@ -675,15 +733,7 @@ impl CompiledEntryShapes {
         name: &str,
         dimensions: &[(&str, u64)],
     ) -> Result<CheckedTensorShape, CheckedTensorShapeError> {
-        let (_, shape) = self
-            .parameters
-            .iter()
-            .find(|(candidate, _)| candidate == name)
-            .ok_or_else(|| CheckedTensorShapeError::UnknownParameter(name.to_owned()))?;
-        let shape = shape
-            .as_ref()
-            .ok_or_else(|| CheckedTensorShapeError::NotTensor(name.to_owned()))?;
-        Self::shape(shape, &self.values(dimensions)?)
+        Self::shape(self.parameter_tensor(name)?, &self.values(dimensions)?)
     }
 
     pub fn all_shapes(
@@ -708,6 +758,7 @@ impl CompiledEntryShapes {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CheckedTensorShapeError {
     UnknownParameter(String),
+    UnknownResult(usize),
     NotTensor(String),
     MissingDimension(String),
     Evaluation(crate::expr::EvalError),
@@ -717,6 +768,7 @@ impl std::fmt::Display for CheckedTensorShapeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownParameter(name) => write!(f, "checked entry has no parameter `{name}`"),
+            Self::UnknownResult(ordinal) => write!(f, "checked entry has no result {ordinal}"),
             Self::NotTensor(name) => write!(f, "checked parameter `{name}` is not a tensor"),
             Self::MissingDimension(name) => {
                 write!(f, "checked tensor shape omitted dimension `{name}`")
@@ -772,9 +824,26 @@ impl<'a> LogicalEntryView<'a> {
 
 impl LogicalEntry {
     pub fn compile_tensor_shapes(&self) -> CompiledEntryShapes {
-        let compile = |representation: RepresentationId, axes: &[NatExpr]| CompiledTensorShape {
-            representation,
-            axes: axes.iter().map(|axis| self.arena.compile_nat(*axis)).collect(),
+        let compile = |representation: RepresentationId, axes: &[NatExpr]| {
+            let free = axes
+                .iter()
+                .flat_map(|axis| self.arena.free_symbols((*axis).into()))
+                .collect::<Vec<_>>();
+            CompiledTensorShape {
+                representation,
+                axes: axes
+                    .iter()
+                    .map(|axis| self.arena.compile_nat(*axis))
+                    .collect(),
+                dimensions: self
+                    .schema
+                    .dimensions()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, dimension)| free.contains(&dimension.symbol))
+                    .map(|(index, _)| index)
+                    .collect(),
+            }
         };
         CompiledEntryShapes {
             dimensions: self

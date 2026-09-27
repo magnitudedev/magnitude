@@ -500,7 +500,10 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
     assert!(case.seen.borrow().is_empty() && recorder.0.borrow().is_empty());
     let budgets = census.budgets();
     let budget = MODEL_BUDGET.min(configurations);
-    assert_eq!(budgets.budgets.values().copied().collect::<Vec<_>>(), [budget]);
+    assert_eq!(
+        budgets.budgets.values().copied().collect::<Vec<_>>(),
+        [budget]
+    );
     // Without a cache, every unit searches.
     assert_eq!(budgets.searching.len(), 1);
     let mut tuner = Tuner::new(
@@ -621,7 +624,10 @@ fn a_stored_tuning_result_is_used_without_tuning_and_a_changed_key_misses() {
     let (searched, started, planned) = load_once(&first, limits);
     assert_eq!(searched.origin, TuningOrigin::Searched);
     assert!(started && !first.seen.borrow().is_empty());
-    assert!(planned > 0, "the census plans a search it has no result for");
+    assert!(
+        planned > 0,
+        "the census plans a search it has no result for"
+    );
     assert_eq!(stored_results(), 1);
 
     let again = FakeCase::new(&implementation, &statics, "implementation a");
@@ -631,7 +637,10 @@ fn a_stored_tuning_result_is_used_without_tuning_and_a_changed_key_misses() {
         !started && again.seen.borrow().is_empty(),
         "a stored result is not tuned"
     );
-    assert_eq!(planned, 0, "the census finds the stored result before tuning");
+    assert_eq!(
+        planned, 0,
+        "the census finds the stored result before tuning"
+    );
     assert_eq!(stored.overall, searched.overall);
     assert_eq!(stored.overall.launches[0]["ROWS"], 2);
     assert_eq!(

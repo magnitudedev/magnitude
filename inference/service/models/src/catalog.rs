@@ -15,10 +15,10 @@ use magnitude_service_contracts::models::{
     SpeculativeMethod,
 };
 use magnitude_service_contracts::{
-    ContentId, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
-    Integrity, InventoryEntryId, InventoryError, InventoryModel, InventoryProperties,
-    ModelAvailability, ModelComponent, ModelLocation, ModelPreviewComponentRole,
-    ModelPreviewComponentSource, ModelPreviewSource, ModelSource, ResolvedComponent, ResolvedModel,
+    ContentId, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot, Integrity,
+    InventoryEntryId, InventoryError, InventoryModel, InventoryProperties, ModelAvailability,
+    ModelComponent, ModelLocation, ModelPreviewComponentRole, ModelPreviewComponentSource,
+    ModelPreviewSource, ModelSource, ResolvedComponent, ResolvedModel,
 };
 use serde::{Deserialize, Serialize};
 
@@ -603,8 +603,6 @@ pub fn load_release_catalog(planner_bundle_path: &Path) -> Result<ReleaseCatalog
             )));
         }
     }
-    // Every stored byte is verified once here; each input is verified again as it is read.
-    planner_bundle.verify().map_err(InventoryError::Integrity)?;
     Ok(ReleaseCatalog {
         catalog,
         planner_inputs: Arc::new(manifest.planner_inputs),
@@ -822,6 +820,14 @@ impl GeneratedReleaseCatalog {
 }
 
 impl ReleaseCatalog {
+    /// Validate all stored chunks when publishing a release artifact. Runtime assessment verifies
+    /// each exact input digest when that header is read instead of scanning unrelated headers.
+    pub fn verify_all_headers(&self) -> Result<(), InventoryError> {
+        self.planner_bundle
+            .verify()
+            .map_err(InventoryError::Integrity)
+    }
+
     #[must_use]
     pub fn catalog(&self) -> &RecommendableModelCatalog {
         &self.catalog
@@ -846,11 +852,15 @@ impl ReleaseCatalog {
                     bundle_key.0
                 ))
             })?;
-        Ok(Some(materialize_planner_bundle(artifact, bundle, |component| {
-            self.planner_bundle
-                .input(&component.header_digest)
-                .map_err(InventoryError::Integrity)
-        })?))
+        Ok(Some(materialize_planner_bundle(
+            artifact,
+            bundle,
+            |component| {
+                self.planner_bundle
+                    .input(&component.header_digest)
+                    .map_err(InventoryError::Integrity)
+            },
+        )?))
     }
 }
 
@@ -942,7 +952,10 @@ fn materialize_planner_package(
             .map_err(|error| InventoryError::Io(error.to_string()))?;
         file.write_all(&header)
             .and_then(|()| {
-                magnitude_service_utils::sparse_file::set_sparse_len(&file, component.component.size_bytes)
+                magnitude_service_utils::sparse_file::set_sparse_len(
+                    &file,
+                    component.component.size_bytes,
+                )
             })
             .map_err(|error| InventoryError::Io(error.to_string()))?;
     }
@@ -1285,8 +1298,14 @@ impl ResolvingRecommendableCatalog {
         declaration: &CatalogModel,
         variant: &CatalogVariant,
         snapshots: &BTreeMap<String, HuggingFaceRepositorySnapshot>,
-    ) -> Result<(RecommendableModel, ReleasePlannerInput, BTreeMap<String, Vec<u8>>), InventoryError>
-    {
+    ) -> Result<
+        (
+            RecommendableModel,
+            ReleasePlannerInput,
+            BTreeMap<String, Vec<u8>>,
+        ),
+        InventoryError,
+    > {
         let snapshot = snapshots.get(&declaration.repository).ok_or_else(|| {
             InventoryError::Integrity(format!(
                 "target repository {} was not resolved",
@@ -1755,11 +1774,13 @@ mod tests {
             tags: Vec::new(),
             gguf_files: paths
                 .iter()
-                .map(|path| magnitude_service_contracts::HuggingFaceRepositoryFile {
-                    path: PathBuf::from(path),
-                    size_bytes: 1,
-                    content: magnitude_service_contracts::ContentIdentity::Unknown,
-                })
+                .map(
+                    |path| magnitude_service_contracts::HuggingFaceRepositoryFile {
+                        path: PathBuf::from(path),
+                        size_bytes: 1,
+                        content: magnitude_service_contracts::ContentIdentity::Unknown,
+                    },
+                )
                 .collect(),
         }
     }

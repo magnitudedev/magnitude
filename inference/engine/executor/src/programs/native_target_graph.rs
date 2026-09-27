@@ -13,6 +13,7 @@ use crate::{
         recurrent, CheckedRecurrentEntries, RecurrentBlock, RecurrentControlPorts,
         RecurrentStatePorts, RECURRENT_COMPONENTS,
     },
+    programs::graph::RowForm,
     programs::native_constants::{
         distinct_storage_bytes, CheckedGraphFamilyResources, CheckedGraphResources,
         ConstantTensors, GraphConstant,
@@ -22,13 +23,14 @@ use crate::{
     TargetBlockProgramSlot, TargetProgramPlan,
 };
 use magnitude_family_contracts::{
-    DecoderGeometry, FeedForwardGeometry, MixerGeometry, RecurrentHeadMapping, WeightKind,
-    WeightRole, WeightScope,
+    BlockGeometry, DecoderGeometry, FeedForwardGeometry, MixerGeometry, RecurrentHeadMapping,
+    WeightKind, WeightRole, WeightScope,
 };
 use magnitude_kernels::embedding_rows;
 use seismic::{
-    BackendName, BoundNativeGraphPlan, Device, Element, NativeGraphFamily, NativeGraphMetadata,
-    NativeGraphPlan, NativeGraphResourceTemplate, NativeGraphStorageBytes, NativePort, WorkflowTensor,
+    BackendName, BoundNativeGraphPlan, Device, Element, NativeGraphClassSlice, NativeGraphFamily,
+    NativeGraphLayout, NativeGraphMetadata, NativeGraphPlan, NativeGraphStorageBytes, NativePort,
+    WorkflowTensor,
 };
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -41,10 +43,17 @@ type BlockClass = (u64, u64, u64);
 /// slots; a recurrent block binds exact per-slot bank tables (every slot
 /// count a launch of `rows` rows can serve, up to the launch slot bound) and
 /// is independent of segments. Everything else is per row.
-fn block_classes(mixer: &MixerGeometry, rows: u64, max_slots: u64, max_segments: u64) -> Vec<BlockClass> {
+fn block_classes(
+    mixer: &MixerGeometry,
+    rows: u64,
+    max_slots: u64,
+    max_segments: u64,
+) -> Vec<BlockClass> {
     match mixer {
         MixerGeometry::Attention(_) => std::iter::successors(Some(1u64), |segments| {
-            segments.checked_mul(2).filter(|segments| *segments <= max_segments)
+            segments
+                .checked_mul(2)
+                .filter(|segments| *segments <= max_segments)
         })
         .map(|segments| (rows, segments, 1))
         .collect(),
@@ -63,21 +72,37 @@ fn block_class(mixer: &MixerGeometry, rows: u64, segments: u64, slots: u64) -> B
     }
 }
 
-fn recurrent_scoped_dimensions(
-    feedforward: &FeedForwardGeometry,
+/// The admitted classes of one block for a `rows`-row launch, as one slice:
+/// the row count, and every history segment count (attention) or request
+/// slot count (recurrent) that launch can serve. A routed feed-forward's
+/// grouped entries size their tile table from the row count alone.
+fn block_class_slice(
+    block: &BlockGeometry,
     rows: u64,
-) -> Result<Vec<(&'static str, &'static str, u64)>, String> {
-    let FeedForwardGeometry::Routed(shape) = feedforward else {
-        return Ok(Vec::new());
+    max_slots: u64,
+    max_segments: u64,
+) -> Result<NativeGraphClassSlice, String> {
+    let classes = block_classes(&block.mixer, rows, max_slots, max_segments);
+    let slice = NativeGraphClassSlice::new()
+        .dimension("M", [rows])
+        .dimension("O", [rows]);
+    let mut slice = match block.mixer {
+        MixerGeometry::Attention(_) => {
+            slice.dimension("R", classes.iter().map(|&(_, segments, _)| segments))
+        }
+        MixerGeometry::Recurrent(_) => {
+            slice.dimension("B", classes.iter().map(|&(_, _, slots)| slots))
+        }
     };
-    if rows <= super::graph::routed::DECODE_ROWS {
-        return Ok(Vec::new());
+    if let FeedForwardGeometry::Routed(shape) = &block.feedforward {
+        if !super::graph::routed::decodes(rows) {
+            let blocks = super::graph::routed::grouped_blocks(rows, shape.count, shape.selected)?;
+            for entry in ["routed_group", "routed_experts", "routed_combine"] {
+                slice = slice.scoped(entry, "B", [blocks]);
+            }
+        }
     }
-    let blocks = super::graph::routed::grouped_blocks(rows, shape.count, shape.selected)?;
-    Ok(["routed_group", "routed_experts", "routed_combine"]
-        .into_iter()
-        .map(|entry| (entry, "B", blocks))
-        .collect())
+    Ok(slice)
 }
 
 #[derive(Clone)]
@@ -167,8 +192,11 @@ impl PreparedTargetGraphs {
         load: &ModelLoadPlan,
         geometry: &DecoderGeometry,
         state: &StateResourcePlan,
+        plan: &TargetProgramPlan,
         limits: ResourceLimits,
     ) -> Result<Self, String> {
+        let certificate =
+            certify_target_family(device.backend(), load, geometry, state, plan, limits)?;
         let row_classes = magnitude_batching::row_classes(limits.max_launch_rows);
         if row_classes.is_empty() {
             return Err(format!(
@@ -178,9 +206,14 @@ impl PreparedTargetGraphs {
         }
         let max_slots = u64::try_from(limits.max_launch_slots)
             .map_err(|_| "target request slot bound exceeds u64")?;
-        let max_segments = u64::try_from(state.target_state().max_visible_spans()?
-            .checked_next_power_of_two().ok_or("target segment class overflows")?)
-            .map_err(|_| "target segment class exceeds u64")?;
+        let max_segments = u64::try_from(
+            state
+                .target_state()
+                .max_visible_spans()?
+                .checked_next_power_of_two()
+                .ok_or("target segment class overflows")?,
+        )
+        .map_err(|_| "target segment class exceeds u64")?;
         let history_rows = u64::try_from(state.target_state().history_rows)
             .map_err(|_| "target history row bound exceeds u64")?;
         // Blocks whose sealed graph would be identical share one plan per
@@ -205,6 +238,7 @@ impl PreparedTargetGraphs {
                     geometry,
                     rows,
                     source,
+                    &certificate.entries[&source],
                 )?;
                 sealed_graphs += 1;
                 max_output_bytes = max_output_bytes.max(entry.plan.output_bytes());
@@ -214,7 +248,9 @@ impl PreparedTargetGraphs {
             for (index, handle) in handles.blocks.iter().enumerate() {
                 let mixer = &geometry.blocks[index].mixer;
                 let shared = (0..index).find(|&first| shapes[first] == shapes[index]);
-                for class @ (rows, segments, slots) in block_classes(mixer, rows, max_slots, max_segments) {
+                for class @ (rows, segments, slots) in
+                    block_classes(mixer, rows, max_slots, max_segments)
+                {
                     launch_classes.insert(class);
                     if let Some(first) = shared {
                         let graph = blocks_by_class[first][&class].clone();
@@ -223,7 +259,8 @@ impl PreparedTargetGraphs {
                     }
                     let began = Instant::now();
                     let block = PreparedTargetBlockGraph::prepare(device, handle,
-                        load, geometry, state, index, rows, segments, slots, history_rows)
+                        load, geometry, state, index, rows, segments, slots, history_rows,
+                        &certificate.blocks[index][&RowForm::of(rows)])
                         .map_err(|error| format!(
                             "target graph row class {rows}, history segments {segments}, request slots {slots}, block {index}: {error}"
                         ))?;
@@ -250,7 +287,11 @@ impl PreparedTargetGraphs {
         Ok(Self {
             entries,
             blocks_by_class,
-            mixers: geometry.blocks.iter().map(|block| block.mixer.clone()).collect(),
+            mixers: geometry
+                .blocks
+                .iter()
+                .map(|block| block.mixer.clone())
+                .collect(),
             classes: launch_classes.len(),
             family,
             max_output_bytes,
@@ -430,16 +471,18 @@ impl PreparedTargetEntryGraph {
         geometry: &DecoderGeometry,
         rows: u64,
         source: EntryTokens,
+        layout: &NativeGraphLayout,
     ) -> Result<Self, String> {
         let weight = embedding_weight(load)?;
-        let (plan, table, tokens, hidden) = entry_graph_topology(
-            device.native_graph(),
+        let (graph, table, tokens, hidden) = entry_graph_topology(
+            device.native_graph_with_layout(layout),
             embedding,
             weight,
             geometry,
             rows,
             source,
         )?;
+        let plan = GraphDraft::seal(graph)?;
         Ok(Self {
             plan,
             table,
@@ -466,7 +509,7 @@ fn entry_graph_topology<'a, G: GraphDraft + 'a>(
     geometry: &DecoderGeometry,
     rows: u64,
     source: EntryTokens,
-) -> Result<(G::Plan, NativePort, NativePort, WorkflowTensor), String> {
+) -> Result<(G, NativePort, NativePort, WorkflowTensor), String> {
     let table = graph.port(weight.resident, &weight.shape)?;
     let dimensions = [
         ("M", rows),
@@ -475,7 +518,9 @@ fn entry_graph_topology<'a, G: GraphDraft + 'a>(
     ];
     let tokens = match source {
         EntryTokens::Uploaded => graph.input_for(embedding, "tokens", &dimensions)?,
-        EntryTokens::Selected => graph.port(Element::i32(), &[rows, 2])?,
+        EntryTokens::Selected => {
+            graph.port_with_class_extent(Element::i32(), &[rows, 2], 0, "M")?
+        }
     };
     let result = graph.enqueue::<embedding_rows::Entry>(
         embedding,
@@ -486,10 +531,10 @@ fn entry_graph_topology<'a, G: GraphDraft + 'a>(
         },
     )?;
     graph.export(&result.r1)?;
-    let plan = graph.seal()?;
-    Ok((plan, table, tokens, result.r1))
+    Ok((graph, table, tokens, result.r1))
 }
 
+#[cfg(test)]
 pub(crate) fn checked_entry_graph_storage(
     backend: BackendName,
     load: &ModelLoadPlan,
@@ -499,7 +544,7 @@ pub(crate) fn checked_entry_graph_storage(
 ) -> Result<NativeGraphStorageBytes, String> {
     let weight = embedding_weight(load)?;
     let elements = [("EW", weight.resident), ("A", activation(geometry))];
-    let (storage, _, _, _) = entry_graph_topology(
+    let (graph, _, _, _) = entry_graph_topology(
         NativeGraphMetadata::new(backend),
         &elements,
         weight,
@@ -511,7 +556,7 @@ pub(crate) fn checked_entry_graph_storage(
             EntryTokens::Selected
         },
     )?;
-    Ok(storage)
+    GraphDraft::seal(graph)
 }
 
 fn block_weight(block: &ResidentBlockWeights, kind: WeightKind) -> Result<&ResidentWeight, String> {
@@ -670,6 +715,7 @@ impl PreparedTargetBlockGraph {
         segments: u64,
         slots: u64,
         history_rows: u64,
+        layout: &NativeGraphLayout,
     ) -> Result<Self, String> {
         let block = geometry
             .blocks
@@ -678,7 +724,7 @@ impl PreparedTargetBlockGraph {
         let scope = WeightScope::TargetBlock(
             u32::try_from(block_index).map_err(|_| "target block index exceeds u32")?,
         );
-        let mut graph = device.native_graph();
+        let mut graph = device.native_graph_with_layout(layout);
         let mut weights = Vec::new();
         let mut constants = Vec::new();
         let hidden = graph
@@ -942,6 +988,7 @@ fn checked_block_graph_draft(
     Ok((graph, constants))
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn checked_block_graph_resources(
     backend: BackendName,
@@ -956,8 +1003,16 @@ pub(crate) fn checked_block_graph_resources(
     history_rows: u64,
 ) -> Result<(NativeGraphStorageBytes, Vec<GraphConstant>), String> {
     let (graph, constants) = checked_block_graph_draft(
-        NativeGraphMetadata::new(backend), load, geometry, state, slot,
-        block_index, rows, segments, slots, history_rows,
+        NativeGraphMetadata::new(backend),
+        load,
+        geometry,
+        state,
+        slot,
+        block_index,
+        rows,
+        segments,
+        slots,
+        history_rows,
     )?;
     Ok((GraphDraft::seal(graph)?, constants))
 }
@@ -973,87 +1028,134 @@ pub(crate) fn checked_target_family_storage(
     plan: &TargetProgramPlan,
     limits: ResourceLimits,
 ) -> Result<CheckedGraphResources, String> {
+    certify_target_family(backend, load, geometry, state, plan, limits)
+        .map(|certificate| certificate.resources)
+}
+
+struct TargetFamilyCertificate {
+    resources: CheckedGraphResources,
+    entries: BTreeMap<EntryTokens, NativeGraphLayout>,
+    blocks: Vec<BTreeMap<RowForm, NativeGraphLayout>>,
+}
+
+fn certify_target_family(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    geometry: &DecoderGeometry,
+    state: &StateResourcePlan,
+    plan: &TargetProgramPlan,
+    limits: ResourceLimits,
+) -> Result<TargetFamilyCertificate, String> {
     if plan.blocks().len() != geometry.blocks.len() {
         return Err("planned target block count disagrees with geometry".into());
     }
     let max_slots = u64::try_from(limits.max_launch_slots)
         .map_err(|_| "target request slot bound exceeds u64")?;
-    let max_segments = u64::try_from(state.target_state().max_visible_spans()?
-        .checked_next_power_of_two().ok_or("target segment class overflows")?)
-        .map_err(|_| "target segment class exceeds u64")?;
+    let max_segments = u64::try_from(
+        state
+            .target_state()
+            .max_visible_spans()?
+            .checked_next_power_of_two()
+            .ok_or("target segment class overflows")?,
+    )
+    .map_err(|_| "target segment class exceeds u64")?;
     let history_rows = u64::try_from(state.target_state().history_rows)
         .map_err(|_| "target history row bound exceeds u64")?;
     let shapes = block_graph_shapes(load, geometry, state)?;
     let distinct_blocks = (0..shapes.len())
         .filter(|&index| !(0..index).any(|earlier| shapes[earlier] == shapes[index]))
         .collect::<Vec<_>>();
-    let mut family = CheckedGraphFamilyResources::new();
-    // A recurrent graph's references and liveness change only at the step/
-    // chunk and routed decode/grouped boundaries. Reuse that checked topology
-    // while the generated contracts evaluate every exact row/slot class.
-    let mut recurrent_templates: BTreeMap<(usize, u8), NativeGraphResourceTemplate> =
-        BTreeMap::new();
-    for rows in magnitude_batching::row_classes(limits.max_launch_rows)
+    let row_classes = magnitude_batching::row_classes(limits.max_launch_rows)
         .into_iter()
         .map(|rows| rows as u64)
-    {
-        for uploaded in [true, false] {
-            family.include(
-                checked_entry_graph_storage(backend, load, geometry, rows, uploaded)?,
-                [],
-            );
+        .collect::<Vec<_>>();
+    if row_classes.is_empty() {
+        return Err("target batch row bound has no row class".into());
+    }
+    let mut family = CheckedGraphFamilyResources::new();
+    let mut entries = BTreeMap::new();
+    let largest_rows = *row_classes.last().expect("row classes are nonempty");
+    for source in [EntryTokens::Uploaded, EntryTokens::Selected] {
+        let weight = embedding_weight(load)?;
+        let elements = [("EW", weight.resident), ("A", activation(geometry))];
+        let (graph, _, _, _) = entry_graph_topology(
+            NativeGraphMetadata::new_template(backend),
+            &elements,
+            weight,
+            geometry,
+            largest_rows,
+            source,
+        )?;
+        let layout = graph
+            .seal_template()
+            .and_then(|template| {
+                template.certify(&[
+                    NativeGraphClassSlice::new().dimension("M", row_classes.iter().copied())
+                ])
+            })
+            .map_err(|error| format!("target entry graph: {error}"))?;
+        family.include(layout.storage_bytes(), []);
+        entries.insert(source, layout);
+    }
+    let mut blocks = vec![BTreeMap::new(); geometry.blocks.len()];
+    for &index in &distinct_blocks {
+        let slot = plan.blocks()[index];
+        let block = &geometry.blocks[index];
+        let mut regimes: BTreeMap<RowForm, Vec<u64>> = BTreeMap::new();
+        for &rows in &row_classes {
+            regimes.entry(RowForm::of(rows)).or_default().push(rows);
         }
-        for &index in &distinct_blocks {
-            let slot = plan.blocks()[index];
-            for (rows, segments, slots) in
-                block_classes(&geometry.blocks[index].mixer, rows, max_slots, max_segments)
-            {
-                let (storage, constants) = if matches!(geometry.blocks[index].mixer, MixerGeometry::Recurrent(_)) {
-                    let regime = if rows <= super::graph::routed::DECODE_ROWS {
-                        0
-                    } else if rows < super::graph::recurrent::CHUNKED_ROWS {
-                        1
-                    } else {
-                        2
-                    };
-                    if let std::collections::btree_map::Entry::Vacant(entry) =
-                        recurrent_templates.entry((index, regime))
-                    {
-                        let (graph, _) = checked_block_graph_draft(
-                            NativeGraphMetadata::new_template(backend), load, geometry, state,
-                            slot, index, rows, segments, slots, history_rows,
-                        )?;
-                        entry.insert(graph.seal_template().map_err(|error| error.to_string())?);
-                    }
-                    let scoped = recurrent_scoped_dimensions(
-                        &geometry.blocks[index].feedforward,
-                        rows,
-                    )?;
-                    let storage = recurrent_templates[&(index, regime)]
-                        .evaluate(&[("M", rows), ("O", rows), ("B", slots)], &scoped)
-                        .map_err(|error| format!(
-                            "target graph row class {rows}, request slots {slots}, block {index}: {error}"
-                        ))?;
-                    let constants = if slots == 1
-                        && matches!(geometry.blocks[index].feedforward, FeedForwardGeometry::Dense { .. })
-                    {
-                        let mut graph = NativeGraphMetadata::new(backend);
-                        vec![GraphConstant::identity(&mut graph, rows)?]
-                    } else {
-                        Vec::new()
-                    };
-                    (storage, constants)
-                } else {
-                    checked_block_graph_resources(
-                        backend, load, geometry, state, slot, index,
-                        rows, segments, slots, history_rows,
-                    )?
-                };
-                family.include(storage, constants);
+        for (form, rows) in regimes {
+            let largest = *rows.last().expect("a regime holds a row class");
+            let (graph, constants) = checked_block_graph_draft(
+                NativeGraphMetadata::new_template(backend),
+                load,
+                geometry,
+                state,
+                slot,
+                index,
+                largest,
+                1,
+                1,
+                history_rows,
+            )?;
+            let slices = rows
+                .iter()
+                .map(|&rows| block_class_slice(block, rows, max_slots, max_segments))
+                .collect::<Result<Vec<_>, _>>()?;
+            let layout = graph
+                .seal_template()
+                .and_then(|template| template.certify(&slices))
+                .map_err(|error| format!("target block {index}: {error}"))?;
+            family.include(layout.storage_bytes(), constants);
+            blocks[index].insert(form, layout);
+        }
+        if matches!(
+            geometry.blocks[index].feedforward,
+            FeedForwardGeometry::Dense { .. }
+        ) {
+            for &rows in &row_classes {
+                family.include(
+                    NativeGraphStorageBytes {
+                        workspace: 0,
+                        output: 0,
+                        upload: 0,
+                    },
+                    [GraphConstant::identity_value(rows)?],
+                );
             }
         }
     }
-    family.finish()
+    for index in 0..blocks.len() {
+        if let Some(first) = (0..index).find(|&first| shapes[first] == shapes[index]) {
+            blocks[index] = blocks[first].clone();
+        }
+    }
+    Ok(TargetFamilyCertificate {
+        resources: family.finish()?,
+        entries,
+        blocks,
+    })
 }
 
 #[cfg(test)]
@@ -1066,8 +1168,11 @@ mod resource_template_tests {
     };
     use magnitude_state::KvCodec;
 
+    /// Every exact entry and block class seals into the layout certified for
+    /// its structural regime and is charged that layout, and the family
+    /// charges exactly the binding constants the exact classes bind.
     #[test]
-    fn recurrent_templates_match_every_exact_class_and_family_constant() {
+    fn every_exact_target_class_seals_into_its_certified_layout() {
         let limits = ResourceLimits {
             max_launch_rows: 64,
             max_launch_slots: 64,
@@ -1076,99 +1181,131 @@ mod resource_template_tests {
             lookahead: false,
         };
         for mut configuration in [QWEN35_CONFIGURATIONS[0], QWEN35_CONFIGURATIONS[3]] {
-        configuration.blocks = 1;
-        let (definition, manifest) = declared_model(&configuration);
-        for backend in [
-            BackendName::Cpu,
-            BackendName::Metal,
-            BackendName::Cuda,
-            BackendName::Vulkan,
-        ] {
-            let load = ModelLoadPlan::derive(
-                &manifest,
-                &definition,
-                ComponentSelection { head: false, vision: false },
-                resident_layout(ExecutionPath::Native, backend),
-            )
-            .unwrap();
-            let state = ResourcePlanner::state_plan(
-                &definition,
-                &load,
-                PlannedMethod::Plain,
-                KvCodec::Dense,
-                limits,
-                ResourceCapacity { domain_bytes: 64 * 1024 * 1024 * 1024 },
-            )
-            .unwrap();
-            let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
-            let slot = plan.target().blocks()[0];
-            let history_rows = state.target_state().history_rows as u64;
-            let mut templates = BTreeMap::new();
-            let mut exhaustive = CheckedGraphFamilyResources::new();
-            for rows in magnitude_batching::row_classes(limits.max_launch_rows)
-                .into_iter()
-                .map(|rows| rows as u64)
-            {
-                for uploaded in [true, false] {
-                    exhaustive.include(
-                        checked_entry_graph_storage(
-                            backend, &load, &definition.geometry, rows, uploaded,
+            // One recurrent and one attention block shape.
+            configuration.blocks = configuration.attention_interval;
+            let (definition, manifest) = declared_model(&configuration);
+            for backend in [
+                BackendName::Cpu,
+                BackendName::Metal,
+                BackendName::Cuda,
+                BackendName::Vulkan,
+            ] {
+                let load = ModelLoadPlan::derive(
+                    &manifest,
+                    &definition,
+                    ComponentSelection {
+                        head: false,
+                        vision: false,
+                    },
+                    resident_layout(ExecutionPath::Native, backend),
+                )
+                .unwrap();
+                let state = ResourcePlanner::state_plan(
+                    &definition,
+                    &load,
+                    PlannedMethod::Plain,
+                    KvCodec::Dense,
+                    limits,
+                    ResourceCapacity {
+                        domain_bytes: 64 * 1024 * 1024 * 1024,
+                    },
+                )
+                .unwrap();
+                let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
+                let certificate = certify_target_family(
+                    backend,
+                    &load,
+                    &definition.geometry,
+                    &state,
+                    plan.target(),
+                    limits,
+                )
+                .unwrap();
+                let geometry = &definition.geometry;
+                let history_rows = state.target_state().history_rows as u64;
+                let max_segments = state
+                    .target_state()
+                    .max_visible_spans()
+                    .unwrap()
+                    .next_power_of_two() as u64;
+                let weight = embedding_weight(&load).unwrap();
+                let elements = [("EW", weight.resident), ("A", activation(geometry))];
+                let fits =
+                    |graph: NativeGraphMetadata, layout: &NativeGraphLayout, class: String| {
+                        let charged = graph.seal_with_layout(layout).unwrap_or_else(|error| {
+                            panic!(
+                            "{} {backend:?} {class} cannot seal into its certified layout: {error}",
+                            configuration.model
                         )
-                        .unwrap(),
-                        [],
-                    );
-                }
-                for slots in 1..=rows.min(limits.max_launch_slots as u64) {
-                    let regime = if rows <= super::super::graph::routed::DECODE_ROWS {
-                        0
-                    } else if rows < super::super::graph::recurrent::CHUNKED_ROWS {
-                        1
-                    } else {
-                        2
+                        });
+                        assert_eq!(charged, layout.storage_bytes(), "{backend:?} {class}");
                     };
-                    if let std::collections::btree_map::Entry::Vacant(entry) =
-                        templates.entry(regime)
-                    {
-                        let (graph, _) = checked_block_graph_draft(
-                            NativeGraphMetadata::new_template(backend),
-                            &load, &definition.geometry, &state, slot, 0,
-                            rows, 1, slots, history_rows,
+                let mut constants = CheckedGraphFamilyResources::new();
+                for rows in magnitude_batching::row_classes(limits.max_launch_rows)
+                    .into_iter()
+                    .map(|rows| rows as u64)
+                {
+                    for source in [EntryTokens::Uploaded, EntryTokens::Selected] {
+                        let (graph, _, _, _) = entry_graph_topology(
+                            NativeGraphMetadata::new(backend),
+                            &elements,
+                            weight,
+                            geometry,
+                            rows,
+                            source,
                         )
                         .unwrap();
-                        entry.insert(graph.seal_template().unwrap());
+                        fits(
+                            graph,
+                            &certificate.entries[&source],
+                            format!("entry rows={rows}"),
+                        );
                     }
-                    let scoped = recurrent_scoped_dimensions(
-                        &definition.geometry.blocks[0].feedforward,
-                        rows,
-                    )
-                    .unwrap();
-                    let templated = templates[&regime]
-                        .evaluate(&[("M", rows), ("O", rows), ("B", slots)], &scoped)
-                        .unwrap_or_else(|error| panic!(
-                            "{} {backend:?} rows={rows} slots={slots}: {error}",
-                            configuration.model
-                        ));
-                    let (exact, constants) = checked_block_graph_resources(
-                        backend, &load, &definition.geometry, &state, slot, 0,
-                        rows, 1, slots, history_rows,
-                    )
-                    .unwrap();
-                    assert_eq!(templated, exact, "{backend:?} rows={rows} slots={slots}");
-                    exhaustive.include(exact, constants);
+                    for (index, block) in geometry.blocks.iter().enumerate() {
+                        for (rows, segments, slots) in block_classes(
+                            &block.mixer,
+                            rows,
+                            limits.max_launch_slots as u64,
+                            max_segments,
+                        ) {
+                            let (graph, block_constants) = checked_block_graph_draft(
+                                NativeGraphMetadata::new(backend),
+                                &load,
+                                geometry,
+                                &state,
+                                plan.target().blocks()[index],
+                                index,
+                                rows,
+                                segments,
+                                slots,
+                                history_rows,
+                            )
+                            .unwrap();
+                            fits(
+                                graph,
+                                &certificate.blocks[index][&RowForm::of(rows)],
+                                format!(
+                                    "block {index} rows={rows} segments={segments} slots={slots}"
+                                ),
+                            );
+                            constants.include(
+                                NativeGraphStorageBytes {
+                                    workspace: 0,
+                                    output: 0,
+                                    upload: 0,
+                                },
+                                block_constants,
+                            );
+                        }
+                    }
                 }
+                assert_eq!(
+                    certificate.resources.binding_constant_bytes,
+                    constants.finish().unwrap().binding_constant_bytes,
+                    "{} {backend:?} constants",
+                    configuration.model
+                );
             }
-            let actual = checked_target_family_storage(
-                backend, &load, &definition.geometry, &state, plan.target(), limits,
-            )
-            .unwrap();
-            let expected = exhaustive.finish().unwrap();
-            assert_eq!(actual.storage, expected.storage, "{backend:?}");
-            assert_eq!(
-                actual.binding_constant_bytes,
-                expected.binding_constant_bytes,
-                "{} {backend:?} constants", configuration.model
-            );
-        }
         }
     }
 }

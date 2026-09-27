@@ -73,6 +73,11 @@ impl CheckedRecurrentEntries {
 /// class of at most 16 rows gains nothing from it and takes the step.
 pub(crate) const CHUNKED_ROWS: u64 = 17;
 
+/// Whether a `rows`-row class advances state with the chunked entry.
+pub(crate) fn chunked(rows: u64) -> bool {
+    rows >= CHUNKED_ROWS
+}
+
 /// State components of one recurrent layer, consecutive in the store's
 /// recurrent components: window, delta, tape.
 pub(crate) const RECURRENT_COMPONENTS: usize = 3;
@@ -222,7 +227,7 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
     };
     // The L2-norm epsilon of the q/k prologue, scaled as the model defines it.
     let norm_epsilon = block.epsilon * block.width as f32;
-    let mixed = if block.rows >= CHUNKED_ROWS {
+    let mixed = if chunked(block.rows) {
         graph
             .enqueue(
                 kernels.chunk,

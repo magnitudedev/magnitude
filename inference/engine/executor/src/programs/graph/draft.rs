@@ -14,6 +14,7 @@ pub(crate) trait GraphDraft: Sized {
         Self: 'a;
 
     fn port(&mut self, element: Element, extents: &[u64]) -> Result<NativePort, String>;
+    fn set_class_scope(&mut self, _scope: Option<&'static str>) {}
     fn port_with_class_extent(
         &mut self,
         element: Element,
@@ -94,6 +95,9 @@ impl GraphDraft for NativeGraphMetadata {
     fn port(&mut self, element: Element, extents: &[u64]) -> Result<NativePort, String> {
         self.port(element, extents)
             .map_err(|error| error.to_string())
+    }
+    fn set_class_scope(&mut self, scope: Option<&'static str>) {
+        self.set_class_scope(scope);
     }
     fn port_with_class_extent(
         &mut self,

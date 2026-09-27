@@ -95,7 +95,14 @@ fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>
     )
     .unwrap();
     let target_graphs = programs
-        .prepare_target_graphs(&device, draft.load(), &definition.geometry, &state, limits)
+        .prepare_target_graphs(
+            &device,
+            draft.load(),
+            &definition.geometry,
+            &state,
+            draft.programs().target(),
+            limits,
+        )
         .unwrap();
     let target_readout_graphs = programs
         .prepare_target_readout_graphs(&device, draft.load(), &definition.geometry, limits)
@@ -105,6 +112,7 @@ fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>
             &device,
             draft.load(),
             &definition,
+            draft.programs().vision(),
             state.target_state(),
             state.head_state(),
             limits,

@@ -135,16 +135,23 @@ The checked entry is also the source of tensor-port and result-leaf extents for
 metadata-only planning; the representation registry supplies canonical storage
 bytes. Such tensor facts alone do not establish a graph storage bound or backend
 formation.
-For a graph whose nodes have complete checked storage facts, a backend-free
-draft can follow the same topology and interval placement rules as sealing to
-derive workspace, exported output and upload bytes. A missing native scratch
-choice leaves that draft unsupported. When the declaration gives each scratch
-buffer a complete finite tuning domain, the draft may charge the maximum over
-those choices; this is a safe bound even when the prepared graph selects a
-smaller choice. Resource evidence never establishes that the device can form
-the native implementation.
-Consumers bind each graph entry through a prepared kernel or its exact checked
-element bindings while following that one topology.
+For a graph whose nodes have complete checked storage facts, one parameterized
+program owns the topology used by both resource certification and executable
+preparation. Its backend-free resource projection takes a structural regime's
+admitted classes as a union of slices, each a product of finite dimension
+values. Every buffer's capacity is the exact maximum of its checked size over
+those classes: a tensor's size depends only on the dimensions its shape reads,
+and a scratch buffer's only on the dimensions its charge and guard read, so
+each is evaluated at the combinations of just those dimensions. Guards are
+evaluated exactly. Seismic places the capacities once per regime and
+certifies their offsets; an exact graph seals into one certified layout only
+when its checked topology and every buffer fit. The certificate charges the
+declared maximum over finite native scratch tuning choices, and production
+reserves that charge even when its selected choice uses less. A missing
+scratch choice or an empty tuning domain is unsupported. Resource evidence
+does not establish that the device can form the native implementation.
+Consumers bind entries through prepared kernels or exact checked element
+bindings while following one composition.
 Direct native workflow nodes execute in their checked dependency order within one Metal command
 buffer, or one CUDA stream submission, per workflow submission. Sealing validates each node
 against its entry contract once and fixes its argument words, launch geometry and the storage

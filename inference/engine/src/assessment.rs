@@ -11,19 +11,20 @@
 
 use crate::error::UnsupportedModel;
 use crate::options::{ExecutionManifest, ModelPolicy};
-use crate::planning::{plan_execution, ExecutionPlanningError};
+use crate::planning::{ExecutionPlanningError, plan_execution};
 use magnitude_artifacts::PackageHeaders;
 use magnitude_chat::{
-    artifacts::{gguf_byte_bpe, gguf_templates},
     ByteBpeTokenizer, TemplateInspection,
+    artifacts::{gguf_byte_bpe, gguf_templates},
 };
 use magnitude_executor::{
+    ExecutionPath, ExecutionPlanDraft, PlanError,
     assessment::{
-        assess_execution, AssessmentError, AssessmentRequest, ExecutionAssessment,
-        IncompatibleReason, MeasurementBasis,
+        AssessmentError, AssessmentRequest, ExecutionAssessment, IncompatibleReason,
+        MeasurementBasis, PreparedExecutionAssessment, finish_execution_assessment,
+        prepare_execution_assessment,
     },
     platform::{self, DeviceRequest, MemoryReserves, PlatformError, SelectedDevice},
-    ExecutionPath, PlanError,
 };
 use magnitude_scheduler::ServiceLimits;
 use seismic::{DeviceCatalog, DeviceTopology, HostMemoryStatus};
@@ -40,19 +41,59 @@ pub struct ModelPackagePaths {
     pub projector: Option<PathBuf>,
 }
 
-/// Everything one execution environment contributes to every assessment:
-/// the selected device, its topology and host observation, the host's
-/// reserve policy, the environment's measurement basis, and the engine
-/// configuration a load of any model would use.
+/// The selected execution configuration paired with its generic measurement basis.
 pub struct AssessmentEnvironment {
+    pub setup: Arc<AssessmentSetup>,
+    pub basis: MeasurementBasis,
+}
+
+/// Device and serving facts available before generic measurements finish.
+pub struct AssessmentSetup {
     pub topology: Arc<DeviceTopology>,
     pub host: HostMemoryStatus,
     pub device: DeviceRequest,
     pub selected: SelectedDevice,
     pub reserves: MemoryReserves,
-    pub basis: MeasurementBasis,
     pub policy: ModelPolicy,
     pub service: ServiceLimits,
+}
+
+impl AssessmentSetup {
+    pub fn discover(
+        catalog: &DeviceCatalog,
+        device: DeviceRequest,
+        reserves: MemoryReserves,
+        policy: ModelPolicy,
+        service: ServiceLimits,
+    ) -> Result<Self, ModelAssessmentError> {
+        let selected = platform::select_device(catalog, ExecutionPath::Native, device, &reserves)
+            .map_err(ModelAssessmentError::Platform)?;
+        let host = catalog
+            .host_memory_status()
+            .map_err(|error| ModelAssessmentError::Platform(PlatformError::Observation(error)))?;
+        Ok(Self {
+            topology: catalog.topology(),
+            host,
+            device,
+            selected,
+            reserves,
+            policy,
+            service,
+        })
+    }
+
+    pub fn with_basis(
+        self: Arc<Self>,
+        basis: MeasurementBasis,
+    ) -> Result<AssessmentEnvironment, ModelAssessmentError> {
+        if basis.identity.backend != self.selected.info.backend.as_str() {
+            return Err(ModelAssessmentError::BasisBackend {
+                basis: basis.identity.backend.clone(),
+                selected: self.selected.info.backend.as_str().to_owned(),
+            });
+        }
+        Ok(AssessmentEnvironment { setup: self, basis })
+    }
 }
 
 impl AssessmentEnvironment {
@@ -65,27 +106,10 @@ impl AssessmentEnvironment {
         policy: ModelPolicy,
         service: ServiceLimits,
     ) -> Result<Self, ModelAssessmentError> {
-        let selected = platform::select_device(catalog, ExecutionPath::Native, device, &reserves)
-            .map_err(ModelAssessmentError::Platform)?;
-        if basis.identity.backend != selected.info.backend.as_str() {
-            return Err(ModelAssessmentError::BasisBackend {
-                basis: basis.identity.backend.clone(),
-                selected: selected.info.backend.as_str().to_owned(),
-            });
-        }
-        let host = catalog
-            .host_memory_status()
-            .map_err(|error| ModelAssessmentError::Platform(PlatformError::Observation(error)))?;
-        Ok(Self {
-            topology: catalog.topology(),
-            host,
-            device,
-            selected,
-            reserves,
-            basis,
-            policy,
-            service,
-        })
+        Arc::new(AssessmentSetup::discover(
+            catalog, device, reserves, policy, service,
+        )?)
+        .with_basis(basis)
     }
 }
 
@@ -150,7 +174,10 @@ pub enum ModelAssessmentError {
     Planning(ExecutionPlanningError),
     Platform(PlatformError),
     /// The basis was measured on a different backend than the selected device.
-    BasisBackend { basis: String, selected: String },
+    BasisBackend {
+        basis: String,
+        selected: String,
+    },
     Assessment(AssessmentError),
 }
 
@@ -159,7 +186,10 @@ impl fmt::Display for ModelAssessmentError {
         match self {
             Self::Artifact(error) => write!(formatter, "artifact header: {error}"),
             Self::ContextLimit(limit) => {
-                write!(formatter, "model context limit {limit} exceeds the assessment domain")
+                write!(
+                    formatter,
+                    "model context limit {limit} exceeds the assessment domain"
+                )
             }
             Self::Configuration(error) => write!(formatter, "engine configuration: {error}"),
             Self::Planning(error) => write!(formatter, "execution planning: {error}"),
@@ -175,32 +205,125 @@ impl fmt::Display for ModelAssessmentError {
 
 impl std::error::Error for ModelAssessmentError {}
 
+/// Basis-independent evidence from the exact package and selected execution configuration.
+pub enum PreparedModelAssessment {
+    Unsupported(UnsupportedModel),
+    Incompatible {
+        facts: ModelFacts,
+        reason: String,
+    },
+    Planned {
+        facts: ModelFacts,
+        draft: ExecutionPlanDraft,
+        execution: PreparedExecutionAssessment,
+    },
+}
+
+/// Complete a prepared model using only the fixed measurement basis and stable capacity.
+pub fn finish_model_assessment(
+    prepared: &PreparedModelAssessment,
+    environment: &AssessmentEnvironment,
+    performance_depths: &[u32],
+) -> Result<ModelAssessment, ModelAssessmentError> {
+    let (facts, draft, preparation) = match prepared {
+        PreparedModelAssessment::Unsupported(unsupported) => {
+            return Ok(ModelAssessment::Unsupported(unsupported.clone()));
+        }
+        PreparedModelAssessment::Incompatible { facts, reason } => {
+            return Ok(ModelAssessment::Assessed {
+                facts: facts.clone(),
+                execution: ExecutionAssessment::Incompatible {
+                    reason: IncompatibleReason::Unsupported {
+                        reason: reason.clone(),
+                    },
+                },
+            });
+        }
+        PreparedModelAssessment::Planned {
+            facts,
+            draft,
+            execution,
+        } => (facts, draft, execution),
+    };
+    let execution = finish_execution_assessment(
+        preparation,
+        draft,
+        &environment.setup.topology,
+        &environment.setup.host,
+        &environment.basis,
+        &AssessmentRequest {
+            context_limit: facts.context_limit,
+            performance_depths: performance_depths.to_vec(),
+            reserves: environment.setup.reserves,
+        },
+    )
+    .map_err(ModelAssessmentError::Assessment)?;
+    Ok(ModelAssessment::Assessed {
+        facts: facts.clone(),
+        execution,
+    })
+}
+
+/// Prepare one package while the environment's generic measurements run.
+pub fn prepare_model_assessment(
+    package: &ModelPackagePaths,
+    setup: &AssessmentSetup,
+) -> Result<PreparedModelAssessment, ModelAssessmentError> {
+    prepare_model_with_configuration(
+        package,
+        setup.device,
+        &setup.selected,
+        setup.reserves,
+        &setup.policy,
+        &setup.service,
+    )
+}
+
 /// Assess one package on the environment's selected device.
 pub fn assess_model(
     package: &ModelPackagePaths,
     environment: &AssessmentEnvironment,
     performance_depths: &[u32],
 ) -> Result<ModelAssessment, ModelAssessmentError> {
+    let prepared = prepare_model_with_configuration(
+        package,
+        environment.setup.device,
+        &environment.setup.selected,
+        environment.setup.reserves,
+        &environment.setup.policy,
+        &environment.setup.service,
+    )?;
+    finish_model_assessment(&prepared, environment, performance_depths)
+}
+
+fn prepare_model_with_configuration(
+    package: &ModelPackagePaths,
+    device: DeviceRequest,
+    selected: &SelectedDevice,
+    reserves: MemoryReserves,
+    policy: &ModelPolicy,
+    service: &ServiceLimits,
+) -> Result<PreparedModelAssessment, ModelAssessmentError> {
     let headers = PackageHeaders::open(&package.target, package.projector.as_deref())
         .map_err(ModelAssessmentError::Artifact)?;
     let family = match crate::families::recognize(headers.target()) {
         Ok(family) => family,
-        Err(unsupported) => return Ok(ModelAssessment::Unsupported(unsupported)),
+        Err(unsupported) => return Ok(PreparedModelAssessment::Unsupported(unsupported)),
     };
-    let definition =
-        match family.inspect(headers.target(), headers.projector(), headers.identity()) {
-            Ok(definition) => definition,
-            Err(error) => {
-                return Ok(ModelAssessment::Unsupported(
-                    UnsupportedModel::Representation { reason: error.0 },
-                ))
-            }
-        };
+    let definition = match family.inspect(headers.target(), headers.projector(), headers.identity())
+    {
+        Ok(definition) => definition,
+        Err(error) => {
+            return Ok(PreparedModelAssessment::Unsupported(
+                UnsupportedModel::Representation { reason: error.0 },
+            ));
+        }
+    };
     let context_limit = u32::try_from(definition.geometry.context_limit)
         .map_err(|_| ModelAssessmentError::ContextLimit(definition.geometry.context_limit))?;
     let chat = match inspect_chat(&headers, package, &definition) {
         Ok(chat) => chat,
-        Err(unsupported) => return Ok(ModelAssessment::Unsupported(unsupported)),
+        Err(unsupported) => return Ok(PreparedModelAssessment::Unsupported(unsupported)),
     };
     let facts = ModelFacts {
         capabilities: ModelCapabilities {
@@ -220,49 +343,37 @@ pub fn assess_model(
         template_fingerprint: chat.fingerprint,
         context_limit,
     };
-    let model = environment
-        .policy
+    let model = policy
         .resolve(&definition)
         .map_err(ModelAssessmentError::Configuration)?;
     let manifest = ExecutionManifest::new(
         headers.manifest(),
         definition,
         model,
-        environment.service.clone(),
+        service.clone(),
         ExecutionPath::Native,
-        environment.device,
+        device,
         None,
-        environment.reserves,
+        reserves,
     )
     .map_err(ModelAssessmentError::Configuration)?;
-    let draft = match plan_execution(&manifest, &environment.selected) {
+    let draft = match plan_execution(&manifest, selected) {
         Ok(draft) => draft,
         Err(ExecutionPlanningError::Plan(error)) if is_unsupported(&error) => {
-            return Ok(ModelAssessment::Assessed {
+            return Ok(PreparedModelAssessment::Incompatible {
                 facts,
-                execution: ExecutionAssessment::Incompatible {
-                    reason: IncompatibleReason::Unsupported {
-                        reason: error.to_string(),
-                    },
-                },
+                reason: error.to_string(),
             });
         }
         Err(error) => return Err(ModelAssessmentError::Planning(error)),
     };
-    let execution = assess_execution(
-        &manifest.definition,
-        &draft,
-        &environment.topology,
-        &environment.host,
-        &environment.basis,
-        &AssessmentRequest {
-            context_limit,
-            performance_depths: performance_depths.to_vec(),
-            reserves: environment.reserves,
-        },
-    )
-    .map_err(ModelAssessmentError::Assessment)?;
-    Ok(ModelAssessment::Assessed { facts, execution })
+    let execution = prepare_execution_assessment(&manifest.definition, &draft, context_limit)
+        .map_err(ModelAssessmentError::Assessment)?;
+    Ok(PreparedModelAssessment::Planned {
+        facts,
+        draft,
+        execution,
+    })
 }
 
 /// Planner rejections of a recognized, validated definition are properties
@@ -273,9 +384,7 @@ fn is_unsupported(error: &PlanError) -> bool {
         PlanError::Unsupported(_) | PlanError::InvalidDefinition(_) | PlanError::Topology(_) => {
             true
         }
-        PlanError::Arithmetic(_) | PlanError::ResourcePlanning(_) | PlanError::Resource(_) => {
-            false
-        }
+        PlanError::Arithmetic(_) | PlanError::ResourcePlanning(_) | PlanError::Resource(_) => false,
     }
 }
 
@@ -290,13 +399,31 @@ fn inspect_chat(
 ) -> Result<TemplateInspection, UnsupportedModel> {
     let unsupported = |reason: String| UnsupportedModel::Representation { reason };
     let tokenizer_payload = magnitude_artifacts::TokenizerPayload::from_directory(headers.target());
-    let tokenizer = gguf_byte_bpe(
+    let mut config = gguf_byte_bpe(
         &tokenizer_payload,
         definition.artifact_identity.target.to_string(),
     )
-    .and_then(ByteBpeTokenizer::new)
     .map_err(unsupported)?;
-    if u64::try_from(tokenizer.vocabulary()).ok() != Some(definition.geometry.vocabulary) {
+    // Only the vocabulary and support verdict are needed for metadata assessment.
+    // The artifact identity affects the tokenizer's identity, but not its
+    // construction or support checks. Equal literal tokenizer configurations
+    // across quantizations therefore share one exact construction verdict.
+    config.artifact_identity = "assessment-validation".into();
+    let key = serde_json::to_vec(&config).map_err(|error| unsupported(error.to_string()))?;
+    static VALIDATED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<Vec<u8>, Result<usize, String>>>,
+    > = std::sync::OnceLock::new();
+    let cache = VALIDATED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let vocabulary = cache
+        .entry(key)
+        .or_insert_with(|| ByteBpeTokenizer::new(config).map(|tokenizer| tokenizer.vocabulary()))
+        .clone()
+        .map_err(unsupported)?;
+    drop(cache);
+    if u64::try_from(vocabulary).ok() != Some(definition.geometry.vocabulary) {
         return Err(unsupported(
             "tokenizer vocabulary differs from model vocabulary".into(),
         ));
@@ -307,6 +434,6 @@ fn inspect_chat(
     )
     .map_err(|error| unsupported(error.to_string()))?;
     gguf_templates(&templates, &tokenizer_payload)
-        .and_then(|bundle| bundle.inspect())
+        .and_then(|bundle| bundle.inspect_cached())
         .map_err(unsupported)
 }

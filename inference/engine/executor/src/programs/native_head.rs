@@ -21,6 +21,7 @@ use crate::{
         graph::draft::GraphDraft,
         graph::readout::{self, shapes, SelectionPorts},
         graph::routed::{self, CheckedRoutedEntries, RoutedGraphEntries},
+        graph::RowForm,
         native_constants::{
             distinct_storage_bytes, CheckedGraphFamilyResources, CheckedGraphResources,
             ConstantTensors, GraphConstant,
@@ -41,8 +42,9 @@ use magnitude_kernels::{
 };
 use magnitude_state::LayerRef;
 use seismic::{
-    BackendName, BoundNativeGraphPlan, Device, Element, NativeGraph, NativeGraphFamily,
-    NativeGraphMetadata, NativeGraphPlan, NativePort, Tensor, WorkflowTensor,
+    BackendName, BoundNativeGraphPlan, Device, Element, NativeGraph, NativeGraphClassSlice,
+    NativeGraphFamily, NativeGraphLayout, NativeGraphMetadata, NativeGraphPlan,
+    NativeGraphStorageBytes, NativePort, Tensor, WorkflowTensor,
 };
 use std::{collections::BTreeMap, rc::Rc};
 
@@ -103,9 +105,12 @@ pub(crate) fn head_graph_classes(
         .into_iter()
         .map(|rows| rows as u64)
         .collect::<Vec<_>>();
-    let max_rows = *row_classes
-        .last()
-        .ok_or_else(|| format!("launch row bound {} has no row class", limits.max_launch_rows))?;
+    let max_rows = *row_classes.last().ok_or_else(|| {
+        format!(
+            "launch row bound {} has no row class",
+            limits.max_launch_rows
+        )
+    })?;
     let slot_bound = limits.max_launch_slots.min(limits.max_launch_rows);
     let slot_classes = magnitude_batching::row_classes(slot_bound)
         .into_iter()
@@ -286,6 +291,25 @@ struct HeadGraphParts<P> {
 
 type PreparedHeadGraph = HeadGraphParts<NativeGraphPlan>;
 
+impl<P> HeadGraphParts<P> {
+    fn map_plan<Q>(
+        self,
+        map: impl FnOnce(P) -> Result<Q, String>,
+    ) -> Result<HeadGraphParts<Q>, String> {
+        Ok(HeadGraphParts {
+            plan: map(self.plan)?,
+            tokens: self.tokens,
+            conditioning: self.conditioning,
+            out_rows: self.out_rows,
+            passes: self.passes,
+            constants: self.constants,
+            weights: self.weights,
+            projection: self.projection,
+            output: self.output,
+        })
+    }
+}
+
 pub struct PreparedHeadGraphs {
     classes: BTreeMap<HeadGraphClass, PreparedHeadGraph>,
     family: NativeGraphFamily,
@@ -314,7 +338,7 @@ fn planned_weight<G: GraphDraft>(
 }
 
 fn head_graph_topology<'a, G: GraphDraft + 'a>(
-    mut graph: G,
+    graph: G,
     entries: HeadGraphEntries<'a, G>,
     load: &ModelLoadPlan,
     geometry: &DecoderGeometry,
@@ -322,6 +346,27 @@ fn head_graph_topology<'a, G: GraphDraft + 'a>(
     feed_forward: FeedForwardProgramSlot,
     class: HeadGraphClass,
 ) -> Result<HeadGraphParts<G::Plan>, String> {
+    head_graph_draft(
+        graph,
+        entries,
+        load,
+        geometry,
+        attention,
+        feed_forward,
+        class,
+    )?
+    .map_plan(|graph| graph.seal())
+}
+
+fn head_graph_draft<'a, G: GraphDraft + 'a>(
+    mut graph: G,
+    entries: HeadGraphEntries<'a, G>,
+    load: &ModelLoadPlan,
+    geometry: &DecoderGeometry,
+    attention: &AttentionGeometry,
+    feed_forward: FeedForwardProgramSlot,
+    class: HeadGraphClass,
+) -> Result<HeadGraphParts<G>, String> {
     if class.entry_rows == 0
         || class.slots == 0
         || class.slots > class.entry_rows
@@ -380,6 +425,7 @@ fn head_graph_topology<'a, G: GraphDraft + 'a>(
         .transpose()?;
 
     let entry_dims = [("M", class.entry_rows), ("V", vocabulary), ("D", hidden)];
+    graph.set_class_scope(Some("head-entry"));
     let tokens = graph.input_for(entries.input, "tokens", &entry_dims)?;
     let conditioning = graph.input_for(entries.input, "conditioning", &entry_dims)?;
     let out_rows = graph.input_for(
@@ -387,6 +433,7 @@ fn head_graph_topology<'a, G: GraphDraft + 'a>(
         "out_rows",
         &[("M", class.entry_rows), ("O", class.slots), ("D", hidden)],
     )?;
+    graph.set_class_scope(None);
     let mut selections = (class.steps > 0)
         .then(|| {
             graph.local_for(
@@ -401,6 +448,7 @@ fn head_graph_topology<'a, G: GraphDraft + 'a>(
     let mut entry_features = None;
     let mut previous: Option<WorkflowTensor> = None;
     for pass in 0..class.steps.max(1) {
+        graph.set_class_scope((pass == 0).then_some("head-entry"));
         let rows = if pass == 0 {
             class.entry_rows
         } else {
@@ -469,11 +517,16 @@ fn head_graph_topology<'a, G: GraphDraft + 'a>(
         )?;
         let advanced = match (&entries.feed_forward, feed_forward) {
             (HeadFeedForwardEntries::Dense(entries), FeedForwardProgramSlot::Dense(_)) => {
+                graph.set_class_scope((pass == 0).then_some("head-entry-dense"));
                 let feedforward_norm = weight!(head, WeightKind::FeedForwardNorm);
                 let gate_weight = weight!(head, WeightKind::DenseGate);
                 let up_weight = weight!(head, WeightKind::DenseUp);
                 let down_weight = weight!(head, WeightKind::DenseDown);
-                let dense_rows = GraphConstant::identity(&mut graph, rows)?;
+                let dense_rows = GraphConstant::identity_for_class(
+                    &mut graph,
+                    rows,
+                    (pass == 0).then_some("head_entry_rows"),
+                )?;
                 let dense_dims = dense_dimensions(load, head, rows)?;
                 let product = graph
                     .enqueue(
@@ -502,6 +555,7 @@ fn head_graph_topology<'a, G: GraphDraft + 'a>(
                     )?
                     .value;
                 constants.push(dense_rows);
+                graph.set_class_scope((pass == 0).then_some("head-entry"));
                 output
             }
             (HeadFeedForwardEntries::Routed(entries), FeedForwardProgramSlot::Routed(binding)) => {
@@ -554,6 +608,7 @@ fn head_graph_topology<'a, G: GraphDraft + 'a>(
                 },
             )?
             .value;
+        graph.set_class_scope(None);
         constants.extend(chained_rows);
         let selection = match (&projection, selections.as_mut()) {
             (Some(projection), Some(selections)) => {
@@ -601,9 +656,8 @@ fn head_graph_topology<'a, G: GraphDraft + 'a>(
         None => entry_features.ok_or_else(|| "head graph has no entry pass".to_owned())?,
     };
     graph.export(&output)?;
-    let plan = graph.seal()?;
     Ok(HeadGraphParts {
-        plan,
+        plan: graph,
         tokens,
         conditioning,
         out_rows,
@@ -623,10 +677,130 @@ pub(crate) fn checked_head_family_storage(
     binding: HeadBinding,
     classes: impl IntoIterator<Item = HeadGraphClass>,
 ) -> Result<CheckedGraphResources, String> {
+    let classes = classes.into_iter().collect::<Vec<_>>();
+    certify_head_family(backend, load, geometry, attention, binding, &classes)
+        .map(|(resources, _)| resources)
+}
+
+fn certify_head_family(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    geometry: &DecoderGeometry,
+    attention: &AttentionGeometry,
+    binding: HeadBinding,
+    classes: &[HeadGraphClass],
+) -> Result<
+    (
+        CheckedGraphResources,
+        BTreeMap<HeadGraphClass, NativeGraphLayout>,
+    ),
+    String,
+> {
     let checked = CheckedHeadEntries::new(binding);
     let mut family = CheckedGraphFamilyResources::new();
-    for class in classes {
-        let graph = head_graph_topology(
+    let mut layouts = BTreeMap::new();
+    // Every field but the entry row count fixes the graph's structure; the
+    // entry pass branches only through the row form of its row count.
+    let mut groups: BTreeMap<(u64, u64, bool, u64, u32, u64, RowForm), Vec<HeadGraphClass>> =
+        BTreeMap::new();
+    for &class in classes {
+        if groups.values().any(|group| group.contains(&class)) {
+            return Err("head graph class is duplicated".into());
+        }
+        groups
+            .entry((
+                class.slots,
+                class.steps,
+                class.shaped,
+                class.history_rows,
+                class.slab_rows,
+                class.segments,
+                RowForm::of(class.entry_rows),
+            ))
+            .or_default()
+            .push(class);
+    }
+    for group in groups.into_values() {
+        let largest = *group.iter().max_by_key(|class| class.entry_rows).unwrap();
+        let draft = head_graph_draft(
+            NativeGraphMetadata::new_template(backend),
+            checked.entries()?,
+            load,
+            geometry,
+            attention,
+            binding.feed_forward,
+            largest,
+        )?;
+        let template = draft
+            .plan
+            .seal_template()
+            .map_err(|error| error.to_string())?;
+        family.include(
+            NativeGraphStorageBytes {
+                workspace: 0,
+                output: 0,
+                upload: 0,
+            },
+            draft.constants,
+        );
+        let slices = group
+            .iter()
+            .map(|class| {
+                let rows = [class.entry_rows];
+                let slice = NativeGraphClassSlice::new()
+                    .dimension("head_entry_rows", rows)
+                    .scoped("head-entry", "M", rows);
+                Ok::<_, String>(match binding.feed_forward {
+                    FeedForwardProgramSlot::Dense(_) => slice
+                        .scoped("head-entry-dense", "M", rows)
+                        .scoped("head-entry-dense", "O", rows),
+                    FeedForwardProgramSlot::Routed(_) if routed::decodes(class.entry_rows) => slice,
+                    FeedForwardProgramSlot::Routed(shape) => slice.scoped(
+                        "head-entry",
+                        "B",
+                        [routed::grouped_blocks(
+                            class.entry_rows,
+                            shape.experts,
+                            shape.selected,
+                        )?],
+                    ),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let layout = template
+            .certify(&slices)
+            .map_err(|error| error.to_string())?;
+        family.include(layout.storage_bytes(), []);
+        for &class in &group {
+            if matches!(binding.feed_forward, FeedForwardProgramSlot::Dense(_)) {
+                family.include(
+                    NativeGraphStorageBytes {
+                        workspace: 0,
+                        output: 0,
+                        upload: 0,
+                    },
+                    [GraphConstant::identity_value(class.entry_rows)?],
+                );
+            }
+            layouts.insert(class, layout.clone());
+        }
+    }
+    Ok((family.finish()?, layouts))
+}
+
+#[cfg(test)]
+pub(crate) fn verify_head_family_certificates(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    geometry: &DecoderGeometry,
+    attention: &AttentionGeometry,
+    binding: HeadBinding,
+    classes: &[HeadGraphClass],
+) -> Result<(), String> {
+    let (_, layouts) = certify_head_family(backend, load, geometry, attention, binding, classes)?;
+    let checked = CheckedHeadEntries::new(binding);
+    for &class in classes {
+        let exact = head_graph_draft(
             NativeGraphMetadata::new(backend),
             checked.entries()?,
             load,
@@ -635,9 +809,15 @@ pub(crate) fn checked_head_family_storage(
             binding.feed_forward,
             class,
         )?;
-        family.include(graph.plan, graph.constants);
+        let charged = exact
+            .plan
+            .seal_with_layout(&layouts[&class])
+            .map_err(|error| format!("head class {class:?}: {error}"))?;
+        if charged != layouts[&class].storage_bytes() {
+            return Err(format!("head class {class:?} charged a different layout"));
+        }
     }
-    family.finish()
+    Ok(())
 }
 
 impl PreparedHeadGraphs {
@@ -657,13 +837,35 @@ impl PreparedHeadGraphs {
         attention: &AttentionGeometry,
         classes: impl IntoIterator<Item = HeadGraphClass>,
     ) -> Result<Self, SubmitError> {
+        let classes = classes.into_iter().collect::<Vec<_>>();
+        let binding = kernels
+            .blocks
+            .first()
+            .ok_or_else(|| invalid("attested head block is absent"))?
+            .binding;
+        let (_, layouts) = certify_head_family(
+            target_device.backend(),
+            load,
+            geometry,
+            attention,
+            binding,
+            &classes,
+        )
+        .map_err(invalid)?;
         let mut prepared = BTreeMap::new();
         for class in classes {
             if prepared.contains_key(&class) {
                 return Err(invalid("head graph class is duplicated"));
             }
-            let graph =
-                Self::prepare_class(target_device, kernels, load, geometry, attention, class)?;
+            let graph = Self::prepare_class(
+                target_device,
+                kernels,
+                load,
+                geometry,
+                attention,
+                class,
+                &layouts[&class],
+            )?;
             prepared.insert(class, graph);
         }
         if prepared.is_empty() {
@@ -687,13 +889,14 @@ impl PreparedHeadGraphs {
         geometry: &DecoderGeometry,
         attention: &AttentionGeometry,
         class: HeadGraphClass,
+        layout: &NativeGraphLayout,
     ) -> Result<PreparedHeadGraph, SubmitError> {
         let block = kernels
             .blocks
             .first()
             .ok_or_else(|| invalid("attested head block is absent"))?;
         head_graph_topology(
-            target_device.native_graph(),
+            target_device.native_graph_with_layout(layout),
             HeadGraphEntries::prepared(block, kernels),
             load,
             geometry,
@@ -842,7 +1045,11 @@ struct PassControls {
 }
 
 impl PassControls {
-    fn new(pass: &TargetBatchUpload<'_>, rows: usize, segments: usize) -> Result<Self, SubmitError> {
+    fn new(
+        pass: &TargetBatchUpload<'_>,
+        rows: usize,
+        segments: usize,
+    ) -> Result<Self, SubmitError> {
         let actual = pass.actual_rows;
         if actual > rows {
             return Err(invalid("head pass has more rows than its graph class"));
@@ -945,8 +1152,14 @@ impl NativeHeadProgram {
             .filter(|plane| plane.layer == LayerRef::Head(0))
             .cloned()
             .collect::<Vec<_>>();
-        let slab_rows = history.first().ok_or_else(|| invalid("head history has no plane"))?.slab_rows;
-        let planes = history.iter().map(|plane| plane.buffer.clone()).collect::<Vec<Tensor>>();
+        let slab_rows = history
+            .first()
+            .ok_or_else(|| invalid("head history has no plane"))?
+            .slab_rows;
+        let planes = history
+            .iter()
+            .map(|plane| plane.buffer.clone())
+            .collect::<Vec<Tensor>>();
         let history_rows = planes
             .first()
             .and_then(|plane| plane.extents().first().copied())
@@ -1020,7 +1233,11 @@ impl NativeHeadProgram {
             .zip(std::iter::once(&entry).chain(&chain))
             .enumerate()
         {
-            let controls = PassControls::new(pass, if index == 0 { entry_rows } else { slots }, class.segments as usize)?;
+            let controls = PassControls::new(
+                pass,
+                if index == 0 { entry_rows } else { slots },
+                class.segments as usize,
+            )?;
             active
                 .write_input(&ports.coordinates, &controls.coordinates)
                 .map_err(device)?;

@@ -67,6 +67,7 @@ pub struct NativeGraphDraft {
     ports: Vec<PortSpec>,
     nodes: Vec<NodeDraft>,
     exports: Vec<WorkflowResultRef>,
+    layout: Option<Arc<NativeGraphLayout>>,
 }
 
 impl NativeGraphDraft {
@@ -77,7 +78,14 @@ impl NativeGraphDraft {
             ports: Vec::new(),
             nodes: Vec::new(),
             exports: Vec::new(),
+            layout: None,
         }
+    }
+
+    pub fn with_layout(device: &Arc<DeviceInner>, layout: Arc<NativeGraphLayout>) -> Self {
+        let mut draft = Self::new(device);
+        draft.layout = Some(layout);
+        draft
     }
 
     /// Declare one externally owned tensor from artifact/model dimensions.
@@ -225,7 +233,13 @@ impl NativeGraphDraft {
                 return Err(CallError::Workflow(WorkflowError::MissingProducerResult));
             }
         }
-        let storage = plan_storage(&self.ports, &planned, &results, &self.exports);
+        let storage = if let Some(layout) = &self.layout {
+            layout
+                .storage_for(&self.ports, &planned, &results, &self.exports)
+                .map_err(CallError::Workflow)?
+        } else {
+            plan_storage(&self.ports, &planned, &results, &self.exports)
+        };
         let mut executable = Executable {
             nodes: Vec::with_capacity(planned.len()),
             external_writes: vec![false; self.ports.len()],
@@ -264,12 +278,123 @@ pub struct NativeGraphMetadataDraft {
     exports: Vec<WorkflowResultRef>,
 }
 
-/// Checked numeric shapes for one class of a previously validated graph
-/// topology. The entry contract, rather than the caller, supplies these.
-pub struct NativeGraphNodeShape {
-    pub parameters: Vec<Option<(RepresentationId, Vec<u64>)>>,
-    pub results: Vec<Option<(RepresentationId, Vec<u64>)>>,
-    pub scratch: Vec<u64>,
+/// A Seismic placement for a dominating graph class. Exact graphs with the
+/// same edges and smaller checked buffers can seal directly into its offsets.
+pub struct NativeGraphLayout {
+    storage: StoragePlan,
+    signature: StorageSignature,
+    port_capacity: Vec<u64>,
+    result_capacity: Vec<Vec<Option<u64>>>,
+    scratch_capacity: Vec<Vec<u64>>,
+}
+
+impl NativeGraphLayout {
+    pub fn storage_bytes(&self) -> NativeGraphStorageBytes {
+        NativeGraphStorageBytes {
+            workspace: self.storage.scratch_bytes,
+            output: self.storage.output_bytes,
+            upload: self.storage.upload_bytes,
+        }
+    }
+
+    fn storage_for(
+        &self,
+        ports: &[PortSpec],
+        nodes: &[PlannedNode],
+        results: &[Vec<Option<NativeTensorSpec>>],
+        exports: &[WorkflowResultRef],
+    ) -> Result<StoragePlan, WorkflowError> {
+        let valid = storage_signature(ports, nodes, results, exports) == self.signature
+            && ports.len() == self.port_capacity.len()
+            && ports
+                .iter()
+                .zip(&self.port_capacity)
+                .all(|(port, capacity)| port.byte_len <= *capacity)
+            && results.len() == self.result_capacity.len()
+            && results
+                .iter()
+                .zip(&self.result_capacity)
+                .all(|(row, capacities)| {
+                    row.len() == capacities.len()
+                        && row.iter().zip(capacities).all(|(result, capacity)| {
+                            match (result, capacity) {
+                                (Some(result), Some(capacity)) => result.byte_len <= *capacity,
+                                (None, None) => true,
+                                _ => false,
+                            }
+                        })
+                })
+            && nodes.len() == self.scratch_capacity.len()
+            && nodes
+                .iter()
+                .zip(&self.scratch_capacity)
+                .all(|(node, capacities)| {
+                    node.scratch.len() == capacities.len()
+                        && node
+                            .scratch
+                            .iter()
+                            .zip(capacities)
+                            .all(|(bytes, capacity)| bytes <= capacity)
+                });
+        if !valid {
+            return Err(WorkflowError::NativeGraphLayoutMismatch);
+        }
+        Ok(self.storage.clone())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct StorageSignature {
+    ports: Vec<(RepresentationId, bool, bool, bool)>,
+    results: Vec<Vec<Option<RepresentationId>>>,
+    edges: Vec<Vec<Option<(u32, u32)>>>,
+    exports: Vec<(u32, u32)>,
+}
+
+fn storage_signature(
+    ports: &[PortSpec],
+    nodes: &[PlannedNode],
+    results: &[Vec<Option<NativeTensorSpec>>],
+    exports: &[WorkflowResultRef],
+) -> StorageSignature {
+    StorageSignature {
+        ports: ports
+            .iter()
+            .map(|port| {
+                (
+                    port.representation,
+                    port.local,
+                    port.owned_input,
+                    port.prewritten,
+                )
+            })
+            .collect(),
+        results: results
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|result| result.as_ref().map(|result| result.representation))
+                    .collect()
+            })
+            .collect(),
+        edges: nodes
+            .iter()
+            .map(|node| {
+                node.args
+                    .arguments()
+                    .iter()
+                    .map(|argument| {
+                        argument_reference(argument)
+                            .map(|reference| (reference.node, reference.result))
+                    })
+                    .collect()
+            })
+            .collect(),
+        exports: exports
+            .iter()
+            .map(|reference| (reference.node, reference.result))
+            .collect(),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -372,6 +497,21 @@ impl NativeGraphMetadataDraft {
         })
     }
 
+    /// Verify an exact checked metadata graph against the storage certificate
+    /// used by executable preparation, without placing it again.
+    pub fn seal_with_layout(
+        self,
+        layout: &NativeGraphLayout,
+    ) -> Result<NativeGraphStorageBytes, WorkflowError> {
+        self.validate_topology()?;
+        let storage = layout.storage_for(&self.ports, &self.nodes, &self.results, &self.exports)?;
+        Ok(NativeGraphStorageBytes {
+            workspace: storage.scratch_bytes,
+            output: storage.output_bytes,
+            upload: storage.upload_bytes,
+        })
+    }
+
     /// Validate a graph once before using its ordered edges and exports as a
     /// resource template for other exact shape classes.
     pub fn validate_topology(&self) -> Result<(), WorkflowError> {
@@ -391,74 +531,89 @@ impl NativeGraphMetadataDraft {
         Ok(())
     }
 
-    /// Evaluate exact checked sizes against an already validated topology.
-    /// No graph nodes or edges are constructed for this class. Argument shape
-    /// equality is checked again because a new class can change an edge's
-    /// tensor shape even when its references stay fixed.
-    pub fn rebound_storage(
+    /// Place this validated topology once with every buffer at its supplied
+    /// byte capacity: the largest size it takes in any class the layout is
+    /// certified for. Placement reads only sizes, lifetimes and regions, so
+    /// any exact class of the same topology whose buffers fit these
+    /// capacities seals into the resulting offsets.
+    pub fn capacity_layout(
         &self,
-        port_shapes: &[(RepresentationId, Vec<u64>)],
-        node_shapes: Vec<NativeGraphNodeShape>,
-    ) -> Result<NativeGraphStorageBytes, CallError> {
-        if port_shapes.len() != self.ports.len() || node_shapes.len() != self.nodes.len() {
-            return Err(CallError::Workflow(WorkflowError::NativeGraphArgumentMismatch {
-                parameter: 0,
-            }));
+        ports: &[u64],
+        results: &[Vec<u64>],
+        scratch: Vec<Vec<u64>>,
+    ) -> Result<NativeGraphLayout, WorkflowError> {
+        self.validate_topology()?;
+        let shaped = ports.len() == self.ports.len()
+            && results.len() == self.results.len()
+            && results
+                .iter()
+                .zip(&self.results)
+                .all(|(capacities, row)| capacities.len() == row.len())
+            && scratch.len() == self.nodes.len()
+            && scratch
+                .iter()
+                .zip(&self.nodes)
+                .all(|(capacities, node)| capacities.len() == node.scratch.len());
+        if !shaped {
+            return Err(WorkflowError::NativeGraphLayoutMismatch);
         }
-        let mut ports = Vec::with_capacity(port_shapes.len());
-        for (original, (representation, extents)) in self.ports.iter().zip(port_shapes) {
-            let canonical = layout::canonical(*representation, extents).map_err(CallError::Execution)?;
-            ports.push(PortSpec {
-                representation: *representation,
-                extents: extents.clone(),
-                strides: canonical.strides,
-                byte_len: canonical.byte_len,
-                local: original.local,
-                owned_input: original.owned_input,
-                prewritten: original.prewritten,
-            });
-        }
-        let mut results = Vec::with_capacity(node_shapes.len());
-        let mut planned = Vec::with_capacity(node_shapes.len());
-        for (original, shape) in self.nodes.iter().zip(node_shapes) {
-            if shape.parameters.len() != original.args.arguments().len()
-                || shape.results.len() != self.results[results.len()].len()
-                || shape.scratch.len() != original.scratch.len()
-            {
-                return Err(CallError::Workflow(WorkflowError::NativeGraphArgumentMismatch {
-                    parameter: 0,
-                }));
-            }
-            validate_metadata_arguments(&original.args, &shape.parameters, &ports, &results)?;
-            let row = shape
-                .results
-                .into_iter()
-                .map(|shape| {
-                    let Some((representation, extents)) = shape else {
-                        return Err(CallError::Workflow(WorkflowError::HostBoundaryRequired));
-                    };
-                    let canonical = layout::canonical(representation, &extents)
-                        .map_err(CallError::Execution)?;
-                    Ok(Some(NativeTensorSpec {
-                        representation,
-                        extents,
-                        strides: canonical.strides,
-                        byte_len: canonical.byte_len,
-                    }))
-                })
-                .collect::<Result<Vec<_>, CallError>>()?;
-            results.push(row);
-            planned.push(PlannedNode {
-                args: original.args.clone(),
-                scratch: shape.scratch,
-            });
-        }
-        let storage = plan_storage(&ports, &planned, &results, &self.exports);
-        Ok(NativeGraphStorageBytes {
-            workspace: storage.scratch_bytes,
-            output: storage.output_bytes,
-            upload: storage.upload_bytes,
-        })
+        let ports = self
+            .ports
+            .iter()
+            .zip(ports)
+            .map(|(port, &byte_len)| PortSpec {
+                byte_len,
+                ..port.clone()
+            })
+            .collect::<Vec<_>>();
+        let results = self
+            .results
+            .iter()
+            .zip(results)
+            .map(|(row, capacities)| {
+                row.iter()
+                    .zip(capacities)
+                    .map(|(result, &byte_len)| {
+                        result.as_ref().map(|result| NativeTensorSpec {
+                            byte_len,
+                            ..result.clone()
+                        })
+                    })
+                    .collect()
+            })
+            .collect::<Vec<_>>();
+        let nodes = self
+            .nodes
+            .iter()
+            .zip(scratch)
+            .map(|(node, scratch)| PlannedNode {
+                args: node.args.clone(),
+                scratch,
+            })
+            .collect::<Vec<_>>();
+        Ok(make_layout(&ports, &nodes, &results, &self.exports))
+    }
+}
+
+fn make_layout(
+    ports: &[PortSpec],
+    nodes: &[PlannedNode],
+    results: &[Vec<Option<NativeTensorSpec>>],
+    exports: &[WorkflowResultRef],
+) -> NativeGraphLayout {
+    NativeGraphLayout {
+        storage: plan_storage(ports, nodes, results, exports),
+        signature: storage_signature(ports, nodes, results, exports),
+        port_capacity: ports.iter().map(|port| port.byte_len).collect(),
+        result_capacity: results
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|result| result.as_ref().map(|result| result.byte_len))
+                    .collect()
+            })
+            .collect(),
+        scratch_capacity: nodes.iter().map(|node| node.scratch.clone()).collect(),
     }
 }
 
@@ -473,11 +628,7 @@ fn validate_metadata_arguments(
             WorkflowError::NativeGraphArgumentMismatch { parameter: 0 },
         ));
     }
-    for (ordinal, (argument, expected)) in args
-        .arguments()
-        .iter()
-        .zip(parameter_shapes)
-        .enumerate()
+    for (ordinal, (argument, expected)) in args.arguments().iter().zip(parameter_shapes).enumerate()
     {
         match (argument, expected) {
             (EncodedWorkflowArgument::Tensor(argument), Some((representation, extents))) => {
@@ -960,6 +1111,7 @@ enum StorageKey {
     NodeScratch(usize, usize),
 }
 
+#[derive(Clone)]
 struct StoragePlan {
     port_placements: Vec<Option<Placement>>,
     placements: Vec<Vec<Placement>>,
@@ -1991,5 +2143,64 @@ impl NativeGraphCompletion {
     /// Wait for the run and report its outcome.
     pub fn wait(self) -> Result<(), CallError> {
         self.submission.wait()
+    }
+}
+
+#[cfg(test)]
+mod layout_certificate_tests {
+    use super::*;
+
+    fn class(
+        rows: u64,
+    ) -> (
+        Vec<PortSpec>,
+        Vec<PlannedNode>,
+        Vec<Vec<Option<NativeTensorSpec>>>,
+    ) {
+        let representation = seismic_lang::registry::representation("f32").unwrap();
+        let canonical = layout::canonical(representation, &[rows]).unwrap();
+        let port = PortSpec {
+            representation,
+            extents: vec![rows],
+            strides: canonical.strides.clone(),
+            byte_len: canonical.byte_len,
+            local: true,
+            owned_input: false,
+            prewritten: false,
+        };
+        let mut args = EncodedWorkflowArgs::new();
+        args.push_result_tensor(WorkflowResultRef {
+            workflow: 1,
+            node: INPUT_NODE,
+            result: 0,
+        });
+        let node = PlannedNode {
+            args,
+            scratch: vec![rows * 4],
+        };
+        let result = NativeTensorSpec {
+            representation,
+            extents: vec![rows],
+            strides: canonical.strides,
+            byte_len: canonical.byte_len,
+        };
+        (vec![port], vec![node], vec![vec![Some(result)]])
+    }
+
+    #[test]
+    fn dominating_layout_accepts_smaller_exact_graph_and_rejects_larger_one() {
+        let (ports, nodes, results) = class(16);
+        let certified = make_layout(&ports, &nodes, &results, &[]);
+        let charge = certified.storage_bytes();
+        let (ports, nodes, results) = class(8);
+        let exact = certified
+            .storage_for(&ports, &nodes, &results, &[])
+            .unwrap();
+        assert_eq!(exact.scratch_bytes, charge.workspace);
+        let (ports, nodes, results) = class(32);
+        assert!(matches!(
+            certified.storage_for(&ports, &nodes, &results, &[]),
+            Err(WorkflowError::NativeGraphLayoutMismatch)
+        ));
     }
 }

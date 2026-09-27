@@ -37,7 +37,16 @@ pub fn gguf_templates(
             },
         );
     }
-    let pieces = strings(tokenizer, "tokenizer.ggml.tokens")?;
+    let pieces = match tokenizer.value("tokenizer.ggml.tokens") {
+        Some(GgufValue::Array(pieces)) => pieces,
+        _ => return Err("missing string array tokenizer.ggml.tokens".into()),
+    };
+    if !pieces
+        .iter()
+        .all(|piece| matches!(piece, Scalar::String(_)))
+    {
+        return Err("tokenizer.ggml.tokens requires strings".into());
+    }
     let mut tokens = BTreeMap::new();
     for (native, name) in [
         ("bos", "bos_token"),
@@ -53,13 +62,12 @@ pub fn gguf_templates(
                 .unsigned()
                 .and_then(|n| usize::try_from(n).ok())
                 .ok_or("invalid special-token ID")?;
-            tokens.insert(
-                name.into(),
-                pieces
-                    .get(id)
-                    .ok_or("special-token ID outside vocabulary")?
-                    .clone(),
-            );
+            let piece = match pieces.get(id) {
+                Some(Scalar::String(piece)) => piece,
+                Some(_) => return Err("tokenizer.ggml.tokens requires strings".into()),
+                None => return Err("special-token ID outside vocabulary".into()),
+            };
+            tokens.insert(name.into(), piece.clone());
         }
     }
     TemplateBundle::new(variants.into_values().collect(), "default".into(), tokens)

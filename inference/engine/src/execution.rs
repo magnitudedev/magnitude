@@ -3,7 +3,9 @@
 //! worker that runs this.
 
 use crate::census::MemoryDomain;
-use crate::error::{classify_plan, classify_platform, ArtifactError, InsufficientMemory, LoadError};
+use crate::error::{
+    classify_plan, classify_platform, ArtifactError, InsufficientMemory, LoadError,
+};
 use crate::options::ExecutionManifest;
 use crate::worker::protocol::LoadProgress;
 use magnitude_artifacts::Package;
@@ -11,7 +13,8 @@ use magnitude_batching::Demand;
 use magnitude_executor::{
     memory::{ClaimId, HoldingClass},
     platform::{self, DomainRole, PlatformConfig, PlatformError},
-    AttestedPrograms, ClaimRefusal, ComponentLoader, DeviceHeap, ExecutorDomain, KernelCache, Operation, RequestId, ReservedResources, ResidencyStore, ResourceAllocator, ResourceCapacity,
+    AttestedPrograms, ClaimRefusal, ComponentLoader, DeviceHeap, ExecutorDomain, KernelCache,
+    Operation, RequestId, ReservedResources, ResidencyStore, ResourceAllocator, ResourceCapacity,
     ResourceDomainId, ResourcePlan, ResourcePlanner, TokenId, TuningContext, TuningEvent,
     TuningObserver, TuningOrigin, WorkKind, DEFAULT_KERNEL_CACHE_BYTES,
 };
@@ -72,20 +75,25 @@ pub(crate) fn build(
     let backend = selected.info.backend;
     let topology = catalog.topology();
     let pool = match &selected.info.memory {
-        DeviceMemory::Established(memory) => topology
-            .pool(memory.allocation_pool)
-            .ok_or_else(|| internal("the selected device's pool is not in its topology"))?
-            .kind,
+        DeviceMemory::Established(memory) => {
+            topology
+                .pool(memory.allocation_pool)
+                .ok_or_else(|| internal("the selected device's pool is not in its topology"))?
+                .kind
+        }
         DeviceMemory::Unsupported { reason } => return Err(internal(reason.clone())),
     };
     let capacity_bytes = ResourceCapacity {
         domain_bytes: selected.assessment_capacity_bytes,
     };
     // The same derivation metadata-only assessment and preview plan through.
-    let draft = crate::planning::plan_execution(manifest, &selected).map_err(|error| match error {
-        crate::planning::ExecutionPlanningError::Plan(error) => classify_plan(error, backend).into(),
-        error => internal(error.to_string()),
-    })?;
+    let draft =
+        crate::planning::plan_execution(manifest, &selected).map_err(|error| match error {
+            crate::planning::ExecutionPlanningError::Plan(error) => {
+                classify_plan(error, backend).into()
+            }
+            error => internal(error.to_string()),
+        })?;
     let limits = draft.policy().limits();
     let head_enabled = draft.policy().selection().head;
     let state = ResourcePlanner::state_plan(
@@ -166,6 +174,7 @@ pub(crate) fn build(
             draft.load(),
             &manifest.definition.geometry,
             &state,
+            draft.programs().target(),
             limits,
         )
         .map_err(internal)?;
@@ -182,6 +191,7 @@ pub(crate) fn build(
             opened.device(),
             draft.load(),
             &manifest.definition,
+            draft.programs().vision(),
             state.target_state(),
             state.head_state(),
             limits,
@@ -213,7 +223,9 @@ pub(crate) fn build(
     let plan = execution_plan.resources().clone();
     report_load_phase("graph and resource planning", &mut phase_started);
     if opened.selector() != execution_plan.device().selector() {
-        return Err(internal("opened device differs from the selected execution plan"));
+        return Err(internal(
+            "opened device differs from the selected execution plan",
+        ));
     }
     let device_selector = opened.selector();
     let resource_identity = ResourceDomainId::new(format!(

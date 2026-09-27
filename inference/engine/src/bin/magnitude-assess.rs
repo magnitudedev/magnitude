@@ -6,21 +6,21 @@
 //! model's capabilities and template fingerprint alongside.
 
 use magnitude_engine::{
-    assessment::{assess_model, AssessmentEnvironment, ModelAssessment, ModelPackagePaths},
+    assessment::{AssessmentEnvironment, ModelAssessment, ModelPackagePaths, assess_model},
     error::UnsupportedModel,
-    options::{standard_service_limits, ModelPolicy},
+    options::{ModelPolicy, standard_service_limits},
     worker::protocol::EngineBuild,
 };
 use magnitude_executor::{
+    DEFAULT_KERNEL_CACHE_BYTES, ExecutionPath, KernelCache,
     assessment::{
-        load_basis, measure_basis, store_basis, BasisIdentity, DomainFit, ExecutionAssessment,
-        IncompatibleReason, MeasurementBasis, PerformanceConfidence,
+        BasisIdentity, DomainFit, ExecutionAssessment, IncompatibleReason, MeasurementBasis,
+        PerformanceConfidence, load_basis, measure_basis, store_basis,
     },
     platform::{self, DeviceRequest, MemoryReserves, PlatformConfig},
-    ExecutionPath, KernelCache, DEFAULT_KERNEL_CACHE_BYTES,
 };
 use seismic::DeviceCatalog;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -73,7 +73,7 @@ fn parse() -> Result<Options, String> {
                 std::process::exit(0);
             }
             flag if flag.starts_with("--") => {
-                return Err(format!("unknown flag: {flag} (try --help)"))
+                return Err(format!("unknown flag: {flag} (try --help)"));
             }
             model => {
                 let mut components = model.splitn(2, ',');
@@ -131,7 +131,10 @@ fn basis(
     let identity = BasisIdentity::for_device(opened.device(), &EngineBuild::current().0);
     let directory = cache_dir.join("assessment-basis");
     if let Some(basis) = load_basis(&directory, &identity) {
-        eprintln!("magnitude-assess: using the stored basis for {}", identity.device);
+        eprintln!(
+            "magnitude-assess: using the stored basis for {}",
+            identity.device
+        );
         return Ok(basis);
     }
     let started = Instant::now();
@@ -301,9 +304,9 @@ fn incompatible(code: &str, message: String) -> Value {
 /// Host RAM is the `system` domain; a dedicated device's memory is named by
 /// the device's selector.
 fn domain_id(environment: &AssessmentEnvironment, domain: seismic::MemoryPoolId) -> String {
-    if domain == environment.topology.host_pool().id {
+    if domain == environment.setup.topology.host_pool().id {
         "system".to_owned()
     } else {
-        environment.selected.info.selector.to_string()
+        environment.setup.selected.info.selector.to_string()
     }
 }

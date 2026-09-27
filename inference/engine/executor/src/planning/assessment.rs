@@ -639,11 +639,7 @@ mod tests {
         let mut invalid = NativeGraphMetadata::new(BackendName::Cpu);
         let wrong_table = invalid.port(Element::f32(), &[1, 1]).unwrap();
         let tokens = invalid
-            .input_for::<magnitude_kernels::embedding_rows::Entry>(
-                &elements,
-                "tokens",
-                &dimensions,
-            )
+            .input_for::<magnitude_kernels::embedding_rows::Entry>(&elements, "tokens", &dimensions)
             .unwrap();
         let mismatch = invalid.enqueue::<magnitude_kernels::embedding_rows::Entry>(
             &elements,
@@ -784,7 +780,8 @@ mod tests {
             output_norm: descriptor("output_norm", &[128]),
         };
         let mut manifest = crate::planning::tests::fixture_manifest(&definition);
-        let magnitude_family_contracts::FeedForwardWeights::Dense(dense) = &block.feedforward else {
+        let magnitude_family_contracts::FeedForwardWeights::Dense(dense) = &block.feedforward
+        else {
             unreachable!()
         };
         let descriptors = [
@@ -876,7 +873,16 @@ mod tests {
             &definition.geometry,
             attention,
             plan.head().unwrap().blocks()[0],
-            classes,
+            classes.clone(),
+        )
+        .unwrap();
+        crate::programs::native_head::verify_head_family_certificates(
+            BackendName::Cpu,
+            &load,
+            &definition.geometry,
+            attention,
+            plan.head().unwrap().blocks()[0],
+            &classes,
         )
         .unwrap();
         assert!(family.storage.workspace > 0);
@@ -1326,6 +1332,15 @@ mod tests {
             [4, 8],
         )
         .unwrap();
+        crate::programs::native_vision::verify_vision_family_certificates(
+            BackendName::Cpu,
+            &load,
+            &geometry,
+            128,
+            &plan,
+            &[4, 8],
+        )
+        .unwrap();
         assert_eq!(family.workspace, single.workspace.max(double.workspace));
         assert_eq!(family.output, single.output.max(double.output));
         assert_eq!(family.upload, single.upload.max(double.upload));
@@ -1450,9 +1465,9 @@ mod tests {
             .fit_state_bytes(terms.fit_depth, terms.recurrent_banks)
             .unwrap();
         let history_layout = state.target_state().history_slab_layout().unwrap().unwrap();
-        let history_slabs = terms.fit_depth.div_ceil(
-            u64::from(state.target_state().history_slab_rows().unwrap()),
-        );
+        let history_slabs = terms
+            .fit_depth
+            .div_ceil(u64::from(state.target_state().history_slab_rows().unwrap()));
         assert_eq!(
             state_bytes,
             history_layout.address_table_bytes + history_slabs * history_layout.slab_bytes
@@ -1521,19 +1536,25 @@ mod tests {
         };
         assert_eq!(terms.exact_resident_bytes(50).unwrap(), 100 + 20 + 5 + 50);
         let charge = terms
-            .charge(AssessmentMemoryBounds {
-                prepared_resource_bytes: 40,
-                startup_additional_bytes: 60,
-                staging_upload_bytes: 7,
-            }, 50)
+            .charge(
+                AssessmentMemoryBounds {
+                    prepared_resource_bytes: 40,
+                    startup_additional_bytes: 60,
+                    staging_upload_bytes: 7,
+                },
+                50,
+            )
             .unwrap();
         assert_eq!(charge.exact_resident_bytes, 175);
         assert_eq!(charge.allocation_bytes, 275);
         assert_eq!(charge.staging_bytes, 7);
         assert!(terms.charge(charge.bounds, u64::MAX).is_err());
-        assert!(AssessmentMemoryTerms { history_per_token: u64::MAX, ..terms }
-            .history_at_fit_depth()
-            .is_err());
+        assert!(AssessmentMemoryTerms {
+            history_per_token: u64::MAX,
+            ..terms
+        }
+        .history_at_fit_depth()
+        .is_err());
     }
 
     #[test]

@@ -239,8 +239,10 @@ impl StateStorePlan {
     }
 
     pub fn history_slab_rows(&self) -> Result<u32, String> {
-        u32::try_from(magnitude_state::history_rows_per_slab(self.history_row_bytes)?)
-            .map_err(|_| "history slab rows exceed u32".into())
+        u32::try_from(magnitude_state::history_rows_per_slab(
+            self.history_row_bytes,
+        )?)
+        .map_err(|_| "history slab rows exceed u32".into())
     }
 
     pub fn bank_slab_banks(&self) -> Result<u32, String> {
@@ -633,11 +635,10 @@ impl ResourcePlanner {
             .checked_add(recurrent_bank_bytes)
             .ok_or("minimum request byte count overflow")?
             .max(1);
-        let possible_requests = usize::try_from(
-            capacity_bytes.domain_bytes / minimum_request_bytes,
-        )
-        .unwrap_or(usize::MAX)
-        .max(1);
+        let possible_requests =
+            usize::try_from(capacity_bytes.domain_bytes / minimum_request_bytes)
+                .unwrap_or(usize::MAX)
+                .max(1);
         let bank_capacity = BankCapacity {
             active: possible_requests,
             in_flight: possible_requests
@@ -944,7 +945,10 @@ mod slab_plan_tests {
                 .unwrap(),
         );
         let store = plan.allocate(device).unwrap();
-        assert_eq!(store.committed_bytes(), plan.initial_committed_bytes().unwrap());
+        assert_eq!(
+            store.committed_bytes(),
+            plan.initial_committed_bytes().unwrap()
+        );
 
         let history_depth = u64::from(plan.history_slab_rows().unwrap()) + 1;
         assert_eq!(

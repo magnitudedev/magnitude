@@ -156,17 +156,19 @@ pub(crate) mod tests {
                 context_limit: 128,
                 epsilon: 1e-6,
                 blocks: vec![BlockGeometry {
-                    mixer: magnitude_family_contracts::MixerGeometry::Attention(AttentionGeometry {
-                        heads: 1,
-                        kv_heads: 1,
-                        width: WIDTH,
-                        rotary: RotarySemantics::Interleaved {
-                            width: WIDTH / 2,
-                            base: 10_000.0,
-                            sections: vec![WIDTH / 4],
-                            axis_pattern: vec![0],
+                    mixer: magnitude_family_contracts::MixerGeometry::Attention(
+                        AttentionGeometry {
+                            heads: 1,
+                            kv_heads: 1,
+                            width: WIDTH,
+                            rotary: RotarySemantics::Interleaved {
+                                width: WIDTH / 2,
+                                base: 10_000.0,
+                                sections: vec![WIDTH / 4],
+                                axis_pattern: vec![0],
+                            },
                         },
-                    }),
+                    ),
                     feedforward: FeedForwardGeometry::Dense {
                         intermediate: FEATURES,
                     },
@@ -301,16 +303,58 @@ pub(crate) mod tests {
         )
         .unwrap();
         let target = programs
-            .prepare_target_graphs(&device, draft.load(), &definition.geometry, &state, limits)
+            .prepare_target_graphs(
+                &device,
+                draft.load(),
+                &definition.geometry,
+                &state,
+                draft.programs().target(),
+                limits,
+            )
             .unwrap();
         let readout = programs
             .prepare_target_readout_graphs(&device, draft.load(), &definition.geometry, limits)
             .unwrap();
+        let assessed_target = crate::programs::native_target_graph::checked_target_family_storage(
+            device.backend(),
+            draft.load(),
+            &definition.geometry,
+            &state,
+            draft.programs().target(),
+            limits,
+        )
+        .unwrap();
+        assert_eq!(
+            target.family().workspace_bytes(),
+            assessed_target.storage.workspace
+        );
+        assert_eq!(
+            target.family().output_bytes(),
+            assessed_target.storage.output
+        );
+        assert_eq!(
+            target.family().upload_bytes(),
+            assessed_target.storage.upload
+        );
+        let assessed_readout = crate::programs::graph::readout::checked_readout_family_storage(
+            device.backend(),
+            draft.load(),
+            &definition.geometry,
+            limits,
+        )
+        .unwrap();
+        assert_eq!(
+            readout.family().workspace_bytes(),
+            assessed_readout.workspace
+        );
+        assert_eq!(readout.family().output_bytes(), assessed_readout.output);
+        assert_eq!(readout.family().upload_bytes(), assessed_readout.upload);
         programs
             .prepare_auxiliary_graphs(
                 &device,
                 draft.load(),
                 &definition,
+                draft.programs().vision(),
                 state.target_state(),
                 state.head_state(),
                 limits,

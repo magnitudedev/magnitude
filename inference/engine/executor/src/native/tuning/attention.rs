@@ -547,8 +547,7 @@ impl AttentionMix {
                     fresh: inputs.i32s(&[rows, 2], &fresh)?,
                     destinations: inputs.i32s(&[rows], &tables.destinations)?,
                     history: history.share(),
-                    slab_rows: u32::try_from(view)
-                        .map_err(|_| "tuning history rows exceed u32")?,
+                    slab_rows: u32::try_from(view).map_err(|_| "tuning history rows exceed u32")?,
                     epsilon: self.epsilon,
                     scale: 1.0 / (shape.width as f32).sqrt(),
                 })

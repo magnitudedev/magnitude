@@ -13,7 +13,7 @@ use seismic::Element;
 /// Changes whenever the measured classes, key rules, sizes or timing rules
 /// change, so a cached basis from an older protocol is never reused. The
 /// declared plan itself is part of the cache key (`persist`).
-pub const MEASUREMENT_PROTOCOL_VERSION: u32 = 7;
+pub const MEASUREMENT_PROTOCOL_VERSION: u32 = 8;
 
 /// One native entry a plain target decode step launches. A plain step is one
 /// row through the embedding entry graph, every decoder block graph (decode
@@ -531,7 +531,7 @@ impl ClassCost {
                     "{} has {} measured points",
                     class.name(),
                     points.len()
-                ))
+                ));
             }
         };
         let mut slow_factor = 1.0f64;

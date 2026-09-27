@@ -17,7 +17,10 @@ impl Pending {
             || end < start
             || self.slice.is_some()
         {
-            return Err(Error::new("TypeError","pending slices require a rank-positive tensor and explicit nonnegative bounds; nested slices are unsupported"));
+            return Err(Error::new(
+                "TypeError",
+                "pending slices require a rank-positive tensor and explicit nonnegative bounds; nested slices are unsupported",
+            ));
         }
         let mut result = self.clone();
         result.slice = Some((start, end));

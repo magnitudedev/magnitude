@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub(crate) struct GraphConstant {
-    port: NativePort,
+    port: Option<NativePort>,
     element: Element,
     extents: Vec<u64>,
     bytes: Arc<[u8]>,
@@ -56,25 +56,36 @@ impl GraphConstant {
         Self::identity_for_class(graph, count, None)
     }
 
+    /// Identity constant value for resource accounting without a graph port.
+    pub(crate) fn identity_value(count: u64) -> Result<Self, String> {
+        let values = (0..count)
+            .map(|index| i32::try_from(index).map_err(|_| "identity index exceeds i32".to_owned()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            port: None,
+            element: Element::i32(),
+            extents: vec![count],
+            bytes: values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        })
+    }
+
     pub(crate) fn identity_for_class<G: GraphDraft>(
         graph: &mut G,
         count: u64,
         class_dimension: Option<&'static str>,
     ) -> Result<Self, String> {
-        let values = (0..count)
-            .map(|index| i32::try_from(index).map_err(|_| "identity index exceeds i32".to_owned()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let extents = vec![count];
+        let mut constant = Self::identity_value(count)?;
         let port = match class_dimension {
-            Some(name) => graph.port_with_class_extent(Element::i32(), &extents, 0, name)?,
-            None => graph.port(Element::i32(), &extents)?,
+            Some(name) => {
+                graph.port_with_class_extent(Element::i32(), &constant.extents, 0, name)?
+            }
+            None => graph.port(Element::i32(), &constant.extents)?,
         };
-        Ok(Self {
-            port,
-            element: Element::i32(),
-            extents,
-            bytes: values.iter().flat_map(|value| value.to_le_bytes()).collect(),
-        })
+        constant.port = Some(port);
+        Ok(constant)
     }
 
     fn rank1<G: GraphDraft>(
@@ -88,7 +99,7 @@ impl GraphConstant {
             .port(element, &extents)
             .map_err(|error| error.to_string())?;
         Ok(Self {
-            port,
+            port: Some(port),
             element,
             extents,
             bytes,
@@ -96,7 +107,9 @@ impl GraphConstant {
     }
 
     pub(crate) fn port(&self) -> &NativePort {
-        &self.port
+        self.port
+            .as_ref()
+            .expect("a bound graph constant has a port")
     }
 }
 

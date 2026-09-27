@@ -124,6 +124,11 @@ impl CheckedAttentionEntries {
 /// use the prefill entry.
 pub(crate) const DECODE_ROWS: u64 = 8;
 
+/// Whether a `rows`-row class attends with the decode entry.
+pub(crate) fn decodes(rows: u64) -> bool {
+    rows <= DECODE_ROWS
+}
+
 /// F16 elements of one head vector's affine (scale, zero) pairs: one pair per
 /// codec group of a `width`-wide head.
 pub(crate) const fn affine_coefficients(width: u64) -> u64 {
@@ -283,7 +288,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                 .value
         }};
     }
-    let decode = block.rows <= DECODE_ROWS;
+    let decode = decodes(block.rows);
     let gated = match &kernels.history {
         AttentionHistoryEntries::Dense { decode: kernel, .. } if decode => {
             mix!(kernel, gated_attention_decode, history_key, history_value)

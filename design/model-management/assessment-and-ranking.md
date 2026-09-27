@@ -39,13 +39,16 @@ backoff. Each exact target is attempted once; any target failure settles as `Dro
 retried, and is omitted by ACN. Catalog drops emit an OpenTelemetry error; discovered drops are
 silent.
 
-One assessment reads the target's Assessment Material headers once, in the service process, as
-arithmetic over the environment's measurement basis. The engine's own tokenizer, template and
-reasoning inspection supplies capabilities and the template fingerprint; its method resolution
-decides speculative execution. One deadline covers the target, and one flat assessed result
+One assessment reads the target's Assessment Material headers once, in the service process.
+Header, tokenizer, template, reasoning, execution-plan and resource preparation proceeds alongside
+the fixed generic measurement job. The engine's own tokenizer, template and reasoning inspection
+supplies capabilities and the template fingerprint; its method resolution decides speculative
+execution. Only the final support, memory-fit and performance calculation waits for the basis.
+One deadline covers the target, and one flat assessed result
 publishes capabilities, template fingerprint, and profile evidence together. There is no planning
-worker, template worker, template cache, inventory capability state, or post-download assessment
-gate.
+worker, template worker, inventory capability state, or post-download assessment gate. Equal
+immutable tokenizer and template content may share derived preparation within the process without
+becoming a separate capability authority.
 
 `Fits`, `DoesNotFit`, and `Incompatible` are genuine terminal evidence. Transport or operation
 failure drops the target rather than fabricating compatibility evidence. Hardware observations
