@@ -43,7 +43,7 @@ import { FetchHttpClient } from "@effect/platform"
 import { MagnitudeClient, ProviderModelIdSchema, type ProviderModelId, type CatalogLocalModel, type LocalInferenceHardware, type ModelResidency } from "@magnitudedev/sdk"
 import { ApplicationSnapshot, LoginStartupState, type NetworkAccessChange } from "@magnitudedev/sdk/desktop-host"
 import {
-  DesktopApplicationInfo, DesktopUpdateState, DesktopConnectRequest, DesktopHostUnavailable, DesktopSession, DesktopConnectionsSnapshot, activeLocalModel, modelDownloadFailureMessage,
+  DesktopApplicationInfo, DesktopUpdateState, DesktopConnectRequest, DesktopHostUnavailable, DesktopSession, ModelTrayPresentation, DesktopConnectionsSnapshot, activeLocalModel, modelDownloadFailureMessage,
   createAgentClient, AgentClientProvider, useAgentClient, makeFirstPartyConnection,
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, localModelFailureMessage, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
   describeModelLoadStage, formatModelLoadPercentage, formatModelMemory,
@@ -758,7 +758,7 @@ const boot = Effect.gen(function* () {
     connect: input => hostCommand(() => host.connect(Schema.encodeSync(DesktopConnectRequest)(input))),
     disconnect: harness => hostCommand(() => host.disconnect(harness)),
     actions: Stream.asyncPush(emit => Effect.acquireRelease(Effect.sync(() => host.actions(action => emit.single(action))), unsubscribe => Effect.sync(unsubscribe)).pipe(Effect.asVoid)),
-    presentModel: value => Effect.tryPromise(() => host.presentModel(value)),
+    presentModel: value => Effect.tryPromise(() => host.presentModel(Schema.encodeSync(ModelTrayPresentation)(value))),
   } })
   root.render(<RegistryProvider initialValues={[[appearanceReadError, appearance._tag === "Left" ? "The saved appearance could not be read. Using System appearance." : null]]}><AgentClientProvider tag={client}><App /></AgentClientProvider></RegistryProvider>)
 })

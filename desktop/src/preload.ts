@@ -1,4 +1,4 @@
-import { DesktopConnectRequest, DesktopConnectionsSnapshot } from "@magnitudedev/client-common/desktop/contracts"
+import { DesktopConnectRequest, DesktopConnectionsSnapshot, ModelTrayPresentation } from "@magnitudedev/client-common/desktop/contracts"
 import { contextBridge, ipcRenderer } from "electron"
 import { RpcClient } from "@effect/rpc"
 import { Cause, Context, Effect, Exit, Fiber, Layer, ManagedRuntime, Option, Schema, Stream } from "effect"
@@ -44,7 +44,7 @@ const api: DesktopApi = {
   platform: process.platform,
   observe: (value, error) => observe(client => client.Observe({}), state => value(Schema.encodeSync(ApplicationSnapshot)(state)), error),
   actions: value => observe(client => client.Actions({}), value, message => console.error(message)),
-  presentModel: value => command(client => client.PresentModel(value)),
+  presentModel: value => command(client => client.PresentModel(Schema.decodeUnknownSync(ModelTrayPresentation)(value))),
   getAppearance: () => runtime.runPromise(Effect.flatMap(HostClient, client => client.GetAppearance({}))),
   setAppearance: preference => command(client => client.SetAppearance({ preference })),
   getModelStorage: () => query(client => client.GetModelStorage({})),
